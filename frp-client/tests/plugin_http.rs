@@ -1214,9 +1214,12 @@ async fn assert_conflicting_cl_rejects(plugin_type: &str) {
         );
     }
     let forwarded = rx.await.expect("backend task finished");
+    // F8: Some(0) would mean the plugin DIALED the backend and closed
+    // without bytes — both faces reject in the head classification BEFORE
+    // any dial, so the backend accept must never fire at all.
     assert!(
-        forwarded == Some(0) || forwarded.is_none(),
-        "backend must receive no bytes on a rejected request, got: {forwarded:?}"
+        forwarded.is_none(),
+        "backend must receive NO connection on a rejected request, got: {forwarded:?}"
     );
 }
 
@@ -1333,9 +1336,12 @@ async fn assert_list_form_cl_rejects(plugin_type: &str, chunked: bool) {
         );
     }
     let forwarded = rx.await.expect("backend task finished");
+    // F8: Some(0) would mean the plugin DIALED the backend and closed
+    // without bytes — both faces reject in the head classification BEFORE
+    // any dial, so the backend accept must never fire at all.
     assert!(
-        forwarded == Some(0) || forwarded.is_none(),
-        "backend must receive no bytes on a rejected request, got: {forwarded:?}"
+        forwarded.is_none(),
+        "backend must receive NO connection on a rejected request, got: {forwarded:?}"
     );
 }
 
@@ -2192,5 +2198,387 @@ async fn test_http_proxy_http12_request_line_forwarded() {
     assert!(
         rx.try_recv().is_ok(),
         "the HTTP/1.2 request must reach the backend"
+    );
+}
+
+/// Round-17 audit F10 (F2 pin matrix): on the http_proxy CONNECT face —
+/// Go frp http_proxy.go sniffs the method and calls package
+/// http.ReadRequest DIRECTLY, with NO http.Server in the path — every
+/// readRequest error class closes the conn with ZERO bytes (the handler
+/// has no response writer for a head it never parsed; probe vs go1.25.12
+/// modeB: dup-Host / TE / CL / CTL-value / escape / raw-byte CONNECT
+/// heads all answer 0 bytes). The plain face renders the same classes;
+/// the CONNECT face must stay silent.
+#[tokio::test]
+async fn test_http_proxy_connect_readrequest_error_classes_close_silently() {
+    let refused = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let refused_addr = refused.local_addr().unwrap();
+    drop(refused);
+
+    let cfg = PluginConfig {
+        plugin_type: "http_proxy".into(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http_proxy(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+
+    // One fresh conn per row against the same plugin listener.
+    let silent_rows: Vec<Vec<u8>> = [
+        // dup Host (fires before TE/CL, at every version).
+        format!("CONNECT {refused_addr} HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"),
+        // Case-folded dup (one canonical key, two entries).
+        format!("CONNECT {refused_addr} HTTP/1.1\r\nHost: a\r\nHOST: b\r\n\r\n"),
+        // dup Host under a parseable HTTP/2.0 (dup precedes any version
+        // question — still silent here).
+        format!("CONNECT {refused_addr} HTTP/2.0\r\nHost: a\r\nHost: b\r\n\r\n"),
+        // Transfer-Encoding: not a single "chunked".
+        format!("CONNECT {refused_addr} HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n"),
+        // dup Transfer-Encoding lines.
+        format!(
+            "CONNECT {refused_addr} HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n"
+        ),
+        // Content-Length parse failures.
+        format!("CONNECT {refused_addr} HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n"),
+        format!(
+            "CONNECT {refused_addr} HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n"
+        ),
+        format!("CONNECT {refused_addr} HTTP/1.1\r\nHost: x\r\nContent-Length: 5, 5\r\n\r\n"),
+        format!(
+            "CONNECT {refused_addr} HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999999999999999999\r\n\r\n"
+        ),
+        // textproto read shapes (CTL value, colonless line).
+        format!("CONNECT {refused_addr} HTTP/1.1\r\nHost: x\r\nX-A: ok\x01bad\r\n\r\n"),
+        format!("CONNECT {refused_addr} HTTP/1.1\r\nNoColonHere\r\n\r\n"),
+        // CTL in the authority.
+        format!("CONNECT {refused_addr}\x01 HTTP/1.1\r\nHost: x\r\n\r\n"),
+        // Host-mode %-escapes: well-formed decode to an ASCII byte is an
+        // error outside the RFC 6874 %25 carve-out; malformed %zz too.
+        "CONNECT h%41st:80 HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+        "CONNECT h%5Est:80 HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+        "CONNECT h%2Fst:80 HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+        "CONNECT h%31st:80 HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+        "CONNECT h%zzt:80 HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+        "CONNECT h%2:80 HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+        // Raw non-safe ASCII in the authority (F6).
+        "CONNECT h^st:80 HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+        "CONNECT h|st:80 HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+        "CONNECT h{st:80 HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+        "CONNECT h st:80 HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+        // Unparseable version token / missing token.
+        "CONNECT h:80 HTTP/1.10\r\nHost: x\r\n\r\n".to_string(),
+        "CONNECT h:80 HTTP/1.1.1\r\nHost: x\r\n\r\n".to_string(),
+        "CONNECT h:80\r\n\r\n".to_string(),
+    ]
+    .into_iter()
+    .map(String::into_bytes)
+    .collect();
+
+    for row in &silent_rows {
+        let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+        client.write_all(row).await.unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut resp),
+        )
+        .await
+        .expect("conn must close on a CONNECT readRequest error (regression)")
+        .unwrap();
+        assert!(
+            resp.is_empty(),
+            "CONNECT face readRequest error must close with ZERO bytes, \
+             got {} bytes for head: {:?}",
+            resp.len(),
+            String::from_utf8_lossy(&row[..row.len().min(90)])
+        );
+    }
+}
+
+/// Round-17 audit F10: readRequest-clean CONNECT heads on the CONNECT
+/// face are SERVED at every parseable version and land in the dial
+/// failure 400 arm when the target refuses — byte-exact Go raw response
+/// `HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n` (no Connection
+/// header; probe vs go1.25.12: clean CONNECT HTTP/2.0 and HTTP/1.9 heads
+/// answer the same 400 as HTTP/1.1; the CONNECT face has NO version gate
+/// — package http.ReadRequest knows nothing of http1ServerSupportsRequest
+/// — and NO conn gates, so a no-Host, space-in-name, or chunked-TE head
+/// is served too).
+#[tokio::test]
+async fn test_http_proxy_connect_clean_heads_answer_dial_400() {
+    let refused = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let refused_addr = refused.local_addr().unwrap();
+    drop(refused);
+
+    let cfg = PluginConfig {
+        plugin_type: "http_proxy".into(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http_proxy(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+
+    let served_rows: Vec<Vec<u8>> = [
+        format!("CONNECT {refused_addr} HTTP/1.1\r\nHost: {refused_addr}\r\n\r\n"),
+        // Parseable non-1.x versions: served, dial fails.
+        format!("CONNECT {refused_addr} HTTP/2.0\r\nHost: x\r\n\r\n"),
+        format!("CONNECT {refused_addr} HTTP/1.9\r\nHost: x\r\n\r\n"),
+        format!("CONNECT {refused_addr} HTTP/0.9\r\nHost: x\r\n\r\n"),
+        // No Host: the missing-Host conn gate is server-side only.
+        format!("CONNECT {refused_addr} HTTP/1.1\r\n\r\n"),
+        // SPACE in a header name survives ReadMIMEHeader; only the
+        // server-side invalid-name gate catches it — not present here.
+        format!("CONNECT {refused_addr} HTTP/1.1\r\nHost: x\r\nBad Name: y\r\n\r\n"),
+        // Single legal chunked TE + valid CL: framing parses clean.
+        format!(
+            "CONNECT {refused_addr} HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
+        ),
+        // Empty Host value is legal on this face either way.
+        format!("CONNECT {refused_addr} HTTP/1.1\r\nHost: \r\n\r\n"),
+    ]
+    .into_iter()
+    .map(String::into_bytes)
+    .collect();
+
+    for row in &served_rows {
+        let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+        client.write_all(row).await.unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_to_end(&mut resp),
+        )
+        .await
+        .expect("conn must close after the dial-failure 400")
+        .unwrap();
+        assert_eq!(
+            resp.as_slice(),
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
+            "clean CONNECT head to a refused target must answer Go's raw \
+             dial 400 (no Connection header), got {} bytes for head: {:?}",
+            resp.len(),
+            String::from_utf8_lossy(&row[..row.len().min(90)])
+        );
+    }
+}
+
+/// Round-17 audit F4: tunnel data a client pipelines in the SAME TCP
+/// segment as the CONNECT head must reach the backend — the head read
+/// loop stops at the terminator but its last chunk can carry bytes past
+/// it, and Go's tee drains exactly those over-read bytes to the remote
+/// before relaying fresh client bytes. The old path dropped the tail: the
+/// backend never saw the client's early bytes and the echo lost them.
+#[tokio::test]
+async fn test_http_proxy_connect_pipelined_tail_reaches_backend() {
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+    // Echo backend.
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            let mut buf = [0u8; 64];
+            loop {
+                match conn.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if conn.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: "http_proxy".into(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http_proxy(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+    // Head AND pipelined tunnel data in one write: the read loop's first
+    // chunk carries both, so the tail is over-read into the head buffer.
+    client
+        .write_all(
+            format!("CONNECT {backend_addr} HTTP/1.1\r\nHost: {backend_addr}\r\n\r\nearly-")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let phrase = b"HTTP/1.1 200 OK\r\n\r\n";
+    let mut got = Vec::new();
+    let mut chunk = [0u8; 64];
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while got.len() < phrase.len() {
+            let n = client.read(&mut chunk).await.expect("read");
+            assert!(n > 0, "plugin closed before the CONNECT success phrase");
+            got.extend_from_slice(&chunk[..n]);
+        }
+    })
+    .await
+    .expect("CONNECT success phrase never arrived");
+    assert!(got.starts_with(phrase), "got: {:?}", got);
+
+    // Bytes past the phrase may already include the echoed tail (the
+    // plugin queues the phrase, flushes the tail to the backend, and the
+    // backend's echo can arrive before the client's next read) — carry
+    // them over instead of discarding.
+    let mut rest: Vec<u8> = if got.len() > phrase.len() {
+        got[phrase.len()..].to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut chunk = [0u8; 16];
+    while rest.len() < 6 {
+        let n = client.read(&mut chunk).await.expect("read");
+        assert!(n > 0, "plugin closed before the pipelined tail echoed");
+        rest.extend_from_slice(&chunk[..n]);
+    }
+    assert_eq!(
+        &rest[..6],
+        b"early-",
+        "pipelined tail must reach the backend and echo back FIRST"
+    );
+
+    // A second payload after the tunnel is live; the backend's echo order
+    // (tail bytes before later bytes) proves the plugin flushed the tail
+    // before relaying anything fresh.
+    client.write_all(b"late").await.unwrap();
+    while rest.len() < 10 {
+        let n = client.read(&mut chunk).await.expect("read");
+        assert!(n > 0, "plugin closed before the later payload echoed");
+        rest.extend_from_slice(&chunk[..n]);
+    }
+    assert_eq!(
+        &rest[..10],
+        b"early-late",
+        "echo must arrive in tunnel order: pipelined tail, then late payload"
+    );
+}
+
+/// Round-17 audit F9: the plugin head read must clamp to Go's
+/// `initialReadLimitSize` = MaxHeaderBytes (1 MiB) + 4096 bufio slop —
+/// 1,049,600 bytes exactly. A TERMINATED head whose terminator ends at
+/// byte 1,049,600 serves (dial fails against the refused target → 500);
+/// one byte more errors with Go's 431 render. RED on the pre-fix loop
+/// (unclamped 4 KiB chunks served terminated heads up to ~1 MiB + 8192,
+/// so the 1,049,601-byte head answered 500 instead of 431).
+#[tokio::test]
+async fn test_http_proxy_read_limit_exact_boundary_rows() {
+    let refused = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let refused_addr = refused.local_addr().unwrap();
+    drop(refused);
+
+    let cfg = PluginConfig {
+        plugin_type: "http_proxy".into(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http_proxy(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+
+    let limit = 1024 * 1024 + 4096;
+
+    // Row 1: terminator ends AT the limit — must be served.
+    let mut head: Vec<u8> =
+        format!("GET http://{refused_addr}/ HTTP/1.1\r\nHost: x\r\nX-Big: ").into_bytes();
+    head.resize(limit - 4, b'A');
+    head.extend_from_slice(b"\r\n\r\n");
+    assert_eq!(head.len(), limit, "row 1 head must total exactly the limit");
+
+    let client = TcpStream::connect(handle.local_addr).await.unwrap();
+    let (mut rd, mut wr) = tokio::io::split(client);
+    tokio::spawn(async move {
+        let _ = wr.write_all(&head).await;
+    });
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        rd.read_to_end(&mut resp),
+    )
+    .await
+    .expect("no response before the conn closed")
+    .unwrap();
+    let text = String::from_utf8_lossy(&resp);
+    assert!(
+        text.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+        "head terminated exactly AT the 1,049,600 boundary must SERVE \
+         (dial-failure 500), got {} bytes: {:?}",
+        resp.len(),
+        &text[..text.len().min(80)]
+    );
+
+    // Row 2: one byte past the limit — Go 431 render, byte-exact.
+    let mut head: Vec<u8> =
+        format!("GET http://{refused_addr}/ HTTP/1.1\r\nHost: x\r\nX-Big: ").into_bytes();
+    head.resize(limit - 3, b'A');
+    head.extend_from_slice(b"\r\n\r\n");
+    assert_eq!(head.len(), limit + 1, "row 2 head must total limit + 1");
+
+    let client = TcpStream::connect(handle.local_addr).await.unwrap();
+    let (mut rd, mut wr) = tokio::io::split(client);
+    tokio::spawn(async move {
+        let _ = wr.write_all(&head).await;
+        // Half-close: the plugin's bounded drain then sees EOF the moment
+        // it has consumed the 1 over-cap byte, so its close sends a clean
+        // FIN instead of burning the full 250 ms drain wait.
+        let _ = wr.shutdown().await;
+    });
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        rd.read_to_end(&mut resp),
+    )
+    .await
+    .expect("no response before the conn closed")
+    .unwrap();
+    assert_eq!(
+        resp.as_slice(),
+        b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n431 Request Header Fields Too Large",
+        "one byte past the boundary must render Go's 431 byte-exact \
+         (was served 500 pre-fix), got {} bytes",
+        resp.len()
     );
 }

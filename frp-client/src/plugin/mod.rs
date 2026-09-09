@@ -794,12 +794,14 @@ pub(super) fn request_target_has_invalid_escape(method: &str, target: &str) -> b
 ///   - host region — encodeHost-mode escape gate: a well-formed escape
 ///     decoding to an ASCII byte (first hex digit < 8) is an error
 ///     unless it is the literal "%25" (case-invariant — 2 and 5 are
-///     digits); a malformed escape is an error. Raw ASCII bytes in the
-///     host region are NOT charset-validated (Go's unescape default arm
-///     additionally rejects bytes that shouldEscape under encodeHost,
-///     e.g. a raw '^' — such heads here pass the gate and fail at the
-///     dial instead, a documented divergence; the gate mirrors C's
-///     %-escape rules).
+///     digits); a malformed escape is an error. Raw ASCII bytes are
+///     swept with the same charset rule as the decoded escapes (Go's
+///     unescape default arm: `s[i] < 0x80 && shouldEscape(s[i],
+///     encodeHost)` → InvalidHostError — a raw '^', '|', DEL or any
+///     other byte outside the host-legal set rejects in ReadRequest
+///     before the dial; see [`should_escape_encode_host`]). Raw
+///     obs-text (>= 0x80) is legal in the host region, exactly like Go
+///     (the < 0x80 gate).
 ///
 ///   - port region — Go validOptionalPort over the RAW text: bracketed
 ///     hosts split after the last ']', unbracketed hosts at the LAST ':'
@@ -926,7 +928,12 @@ fn valid_optional_port(port: &[u8]) -> bool {
 /// escape is an error when it decodes to an ASCII byte (first hex digit
 /// < 8) unless it is the literal "%25" (RFC 6874 zone exemption —
 /// case-invariant, since 2 and 5 are digits); a malformed escape is an
-/// error. Mirrors Go unescape's encodeHost arms (url.go).
+/// error. Raw ASCII bytes are swept with the same charset rule (the
+/// `s[i] < 0x80 && shouldEscape(s[i], encodeHost)` default arm of Go's
+/// unescape — audit round-17 finding F6: a raw '^' in a CONNECT
+/// authority previously passed the gate and rendered a dial 400 where
+/// Go rejects the head in ReadRequest, silent close on the http_proxy
+/// CONNECT arm). Mirrors Go unescape's encodeHost arms (url.go).
 fn encode_host_escape_invalid(s: &[u8]) -> bool {
     let mut i = 0;
     while i < s.len() {
@@ -940,6 +947,11 @@ fn encode_host_escape_invalid(s: &[u8]) -> bool {
             }
             i += 3;
         } else {
+            // Go's default arm: only sub-0x80 bytes are swept; raw
+            // obs-text is legal in the host region.
+            if s[i] < 0x80 && should_escape_encode_host(s[i]) {
+                return true;
+            }
             i += 1;
         }
     }
@@ -951,7 +963,12 @@ fn encode_host_escape_invalid(s: &[u8]) -> bool {
 /// error; a well-formed one is an error only when it is not the literal
 /// "%25" and its decoded byte is not a space and would need escaping in
 /// encodeHost mode ("%41" inside a zone is legal — redundant escaping of
-/// a host-legal byte).
+/// a host-legal byte; "%2D" is legal too — '-', '_', '.' and '~' are
+/// exempt from shouldEscape under the unreserved-marks switch, so their
+/// redundant escapes decode to host-legal bytes — probe: CONNECT
+/// [fe80::1%25en%2D0]:80 parses in go1.25). Raw ASCII bytes are swept
+/// like the host region (Go's default arm gates both encodeHost and
+/// encodeZone modes).
 fn encode_zone_escape_invalid(s: &[u8]) -> bool {
     let mut i = 0;
     while i < s.len() {
@@ -965,21 +982,34 @@ fn encode_zone_escape_invalid(s: &[u8]) -> bool {
             }
             i += 3;
         } else {
+            if s[i] < 0x80 && should_escape_encode_host(s[i]) {
+                return true;
+            }
             i += 1;
         }
     }
     false
 }
 
-/// Go shouldEscape(c, encodeHost) (url.go): alphanumerics plus the
-/// host-allowed set (sub-delims, ':', '[', ']', '<', '>', '"').
+/// Go shouldEscape(c, encodeHost|encodeZone) (net/url/url.go, go1.25):
+/// alphanumerics never escape; the host/zone-mode switch exempts the
+/// sub-delims plus ':', '[', ']', '<', '>', '"'; the UNCONDITIONAL
+/// second switch (reserved-character switch §2.3 "mark" — runs for
+/// host/zone modes too) exempts the unreserved marks '-', '_', '.', '~'
+/// (audit round-17 finding F5: the pre-fix set lacked the four marks, so
+/// a raw '~' or a zone escape like "%2D" was rejected where Go accepts
+/// it). Every other byte needs escaping.
 fn should_escape_encode_host(c: u8) -> bool {
     if c.is_ascii_alphanumeric() {
         return false;
     }
     !matches!(
         c,
-        b'!' | b'$'
+        b'-' | b'_'
+            | b'.'
+            | b'~'
+            | b'!'
+            | b'$'
             | b'&'
             | b'\''
             | b'('
@@ -1069,7 +1099,9 @@ fn target_has_invalid_escape(target: &str) -> bool {
 /// TCP read as the head are returned in [`ForwardedRequest::body_prefix`] so
 /// nothing is lost — Go's http.Server streams request bodies, and discarding
 /// pre-read bytes made backends hang forever on POST/PUT.
-pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unpin>(
+pub(super) async fn read_request_and_build_forward<
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+>(
     stream: &mut S,
     host_rewrite: &str,
     request_headers: &std::collections::HashMap<String, String>,
@@ -1148,23 +1180,71 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     // is the acknowledged divergence for this operator-local listener
     // class, same rationale as the 64 KiB cap above.
     let request_line = lines.next().ok_or("empty request")?;
-    let Some((method, path, version)) = parse_request_line(request_line) else {
-        return Err(format!("bad request line: {request_line}"));
+    // Round-17 audit F7: parse_request_line's gate admits only HTTP/1.x
+    // version tokens, but a token Go's ParseHTTPVersion parses with ANY
+    // single-digit major (HTTP/2.0, HTTP/0.9, HTTP/9.9 — request.go
+    // lenient 8-char shape) is not a malformed line here: such a head may
+    // clear every read gate below and then answer Go's detailed 505 render,
+    // or — the h2c-preface "PRI * HTTP/2.0" — be SERVED through the version
+    // gate. Re-run the same line-shape checks minus the 1.x restriction so
+    // the classification sees those tokens; every other failure stays on
+    // the bare-close Err arm (acknowledged divergence for this
+    // operator-local listener class, see the doc at parse_request_line).
+    let (method, path, version) = match parse_request_line(request_line) {
+        Some(ok) => ok,
+        None => {
+            let mut parts = request_line.splitn(3, ' ');
+            let (m, t, v) = (parts.next(), parts.next(), parts.next());
+            match (m, t, v) {
+                (Some(m), Some(t), Some(v))
+                    if !t.is_empty()
+                        && !request_target_has_invalid_escape(m, t)
+                        && go_valid_method_ok(m)
+                        && http::parseable_version(v).is_some_and(|(maj, _)| maj != 1) =>
+                {
+                    (m, t, v)
+                }
+                _ => return Err(format!("bad request line: {request_line}")),
+            }
+        }
     };
+    // Every head that reaches the gates below has a ParseHTTPVersion-able
+    // token (both admission paths above guarantee it).
+    let (v_maj, v_min) =
+        http::parseable_version(version).expect("admission gates admit only parseable versions");
+
+    // Round-17 audit F7: the Go conn.readRequest ladder (server.go
+    // c.readRequest + package readRequest, go1.25.12) — walk the terminated
+    // header block in textproto readMIMEHeader shape FIRST. Any read-time
+    // shape error is a ProtocolError-ish failure whose render Go's
+    // http.Server face answers with the no-detail 400 (GO_400_RENDER).
+    let walk = match walk_leg_head(&headers_str) {
+        Ok(w) => w,
+        Err(why) => return reject_head(stream, GO_400_RENDER, why).await,
+    };
+    // dup-Host fires INSIDE package readRequest, before readTransfer
+    // (request.go: two canonical-Host records — "too many Host headers"):
+    // a plain error, hence the no-detail render. (Read-time walk errors
+    // likewise precede the TE/CL gates below, matching Go's order.)
+    if walk.host_groups > 1 {
+        return reject_head(stream, GO_400_RENDER, "too many Host headers").await;
+    }
 
     // Round-17 audit E: Go readTransfer gates the whole Transfer-Encoding
     // read on protoAtLeast(1, 1) (transfer.go, Issue 12785) — an
     // HTTP/1.0 request IGNORES its Transfer-Encoding (the header is
-    // dropped silently, never chunked-framed). For every parseable >=1.1
-    // head (parse_request_line accepts HTTP/1.1..1.9), the TE group must
-    // be exactly one header line whose value is EqualFold-"chunked" — a
+    // dropped silently, never chunked-framed). The TE group must be
+    // exactly one header line whose value is EqualFold-"chunked" — a
     // different count ("too many transfer-encoding values") or a
     // different value ("unsupported transfer encoding") is a readRequest
     // error: 501 on the Go http.Server faces of the sibling plugins, the
     // established Err-to-bare-close policy of this operator-local
-    // listener class here. The old code forwarded such heads (the TE line
-    // was stripped hop-by-hop and the body CL-framed) where Go rejects.
-    let te_checked = version != "HTTP/1.0";
+    // listener class here (deliberate divergence, unchanged by F7). The
+    // old code forwarded such heads (the TE line was stripped hop-by-hop
+    // and the body CL-framed) where Go rejects. F7 widened the gate to
+    // the parsed (major, minor) pair: parseable non-1.x heads (HTTP/2.0
+    // class) also clear readTransfer before the 505 gate below.
+    let te_checked = (v_maj, v_min) >= (1, 1);
     if te_checked && !transfer_encoding_group_ok(lines.clone()) {
         return Err("unsupported transfer encoding".into());
     }
@@ -1198,6 +1278,64 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     // the canonical-line append keys on `framing != Chunked`, so a valid
     // resolution is never forwarded under chunked — matching Go's delete.
     let content_length = resolve_content_length(lines.clone())?;
+
+    // Round-17 audit F7: the Go conn.readRequest tail (server.go
+    // c.readRequest — runs AFTER package readRequest cleared the
+    // line/MIME/dup/transfer gates above): the http1ServerSupportsRequest
+    // 505 gate first, then the conn gates. These heads are NOT malformed —
+    // they are complete, well-shaped requests whose version or Host shape
+    // Go's http.Server face answers with a DETAILED render; unlike the
+    // bare-close Err arms above, each writes Go's own byte-exact response
+    // before the caller's Err handling closes the connection.
+    let is_pri_upgrade = method == "PRI" && path == "*" && (v_maj, v_min) == (2, 0);
+    if v_maj != 1 && !is_pri_upgrade {
+        // http1ServerSupportsRequest false: statusError{505} — the
+        // detailed 193B render (probe-verified, plugin/http.rs GO_505).
+        return reject_head(stream, http::GO_505_RENDER, "unsupported protocol version").await;
+    }
+    // isH2Upgrade (request.go:529-531): PRI + "*" + HTTP/2.0 AND a
+    // zero-header map. Only the missing-Host gate exempts it; the
+    // malformed-Host and invalid-name gates below it have no exemption.
+    let h2_upgrade_zero_headers = is_pri_upgrade && walk.header_groups == 0;
+    if (v_maj, v_min) >= (1, 1)
+        && walk.host_groups == 0
+        && !h2_upgrade_zero_headers
+        && method != "CONNECT"
+    {
+        // missing-Host badRequestError: detailed 163B render.
+        return reject_head(
+            stream,
+            GO_400_MISSING_HOST_RENDER,
+            "missing required Host header",
+        )
+        .await;
+    }
+    if walk.host_groups == 1 && !http::valid_host_header(walk.host_value.as_deref().unwrap_or("")) {
+        // malformed-Host badRequestError (no version gate in Go): detailed
+        // 149B render.
+        return reject_head(
+            stream,
+            GO_400_MALFORMED_HOST_RENDER,
+            "malformed Host header",
+        )
+        .await;
+    }
+    if walk.name_has_space {
+        // invalid-header-name badRequestError (issue 34540: a SPACE is the
+        // one bad key byte textproto lets through uncanonicalized):
+        // detailed 145B render.
+        return reject_head(
+            stream,
+            GO_400_INVALID_HEADER_NAME_RENDER,
+            "invalid header name",
+        )
+        .await;
+    }
+    // Go also runs an invalid-header-VALUE gate here — it is UNREACHABLE:
+    // textproto kills every CTL value byte at read time, so such a head
+    // already answered the generic GO_400_RENDER above (probe-verified
+    // against go1.25.12; the F7 value gate therefore has no detailed arm,
+    // deviation reported to the round-17 audit).
 
     // Build forwarded request with optional Host rewrite.
     // Strip hop-by-hop headers per RFC 2616 Section 13.5.1 (matches Go's
@@ -1366,6 +1504,189 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     })
 }
 
+/// Round-17 audit F7: write a Go render for a head the caller then rejects.
+/// `read_request_and_build_forward` returns Err for the connection close;
+/// the render itself must be flushed before the close, so every F7 gate
+/// writes its byte-exact Go response through this helper and THEN returns
+/// the Err (the four http2http-family legs treat any Err as a bare close —
+/// the render is the only bytes the client sees, matching what Go's
+/// http.Server face would have answered on the same head).
+async fn reject_head<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    render: &str,
+    why: &str,
+) -> Result<ForwardedRequest, String> {
+    let _ = stream.write_all(render.as_bytes()).await;
+    Err(format!("{why}: rejected after writing Go render"))
+}
+
+/// Round-17 audit F7: header-block facts from the terminated head of the
+/// four http2http-family plugin legs, computed in Go textproto
+/// readMIMEHeader shape (reader.go) so the conn gates in
+/// [`read_request_and_build_forward`] mirror server.go exactly.
+#[derive(Debug, Default)]
+struct LegHeadWalk {
+    /// Header records (non-empty, non-continuation lines with a colon) —
+    /// Go's header-map size, used by the isH2Upgrade zero-header test
+    /// (request.go:529-531: the exemption applies only to a head with NO
+    /// headers at all).
+    header_groups: usize,
+    /// Records whose key canonicalizes to "Host": an all-token key with
+    /// no SPACE, case-insensitive. Go's dup-Host test is
+    /// `len(req.Header["Host"]) > 1` — textproto merges duplicates into
+    /// one canonical key, so two Host LINES are two entries but
+    /// "Host" + "HOST" are two lines merged under one key too (request.go
+    /// counts the merged slice, and merge happens at read: the key is
+    /// lowercased for storage, so both land in the same slice — two
+    /// records, one canonical key, dup-Host fires).
+    host_groups: usize,
+    /// Stored value of the FIRST Host record in Go stored-value shape:
+    /// each physical line is SP/HTAB-trimmed at BOTH ends before the colon
+    /// cut (readContinuedLineSlice `trim(line)`, reader.go), the stored
+    /// value is TrimLeft'd once more after the cut, and continuation folds
+    /// join with a single space.
+    host_value: Option<String>,
+    /// Any record key holding SPACE — issue 34540: of all the bytes that
+    /// are not valid header-field bytes, only SPACE survives
+    /// ReadMIMEHeader (every other bad key byte errors at read); Go's conn
+    /// invalid-header-name gate is the sole catcher of the surviving
+    /// noCanon key, and it answers the DETAILED 400.
+    name_has_space: bool,
+}
+
+/// Round-17 audit F7: walk one terminated header block (request line
+/// already consumed) in Go textproto readMIMEHeader shape. `Err(why)`
+/// mirrors the read-time failures Go's conn.serve face answers with the
+/// no-detail GO_400_RENDER: colonless records, empty or invalid key bytes
+/// (CTL, HTAB, obs-text — SPACE is NOT an error, it sets
+/// `name_has_space`), CTL bytes anywhere in a record value (HTAB legal),
+/// and a leading-SP/HTAB first header line ("malformed MIME header initial
+/// line"). Continuation folds (following lines starting with SP/HTAB) join
+/// the current record's value with a single space after both-end trimming.
+fn walk_leg_head(headers: &str) -> Result<LegHeadWalk, &'static str> {
+    let mut walk = LegHeadWalk::default();
+    let mut cur_is_host = false;
+    let mut cur_value: Option<String> = None; // None = no record open
+    let mut saw_record = false;
+    for line in headers.lines().skip(1) {
+        // The head terminator never produces a record (it is the empty
+        // line the read loop stopped at). A space-only line is NOT a
+        // terminator — it is an obs-fold continuation of the open record
+        // and joins it below; only a zero-length line ends the block.
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with([' ', '\t']) {
+            // readContinuedLineSlice continuation of the current record.
+            // A fold before any record is the readMIMEHeader
+            // initial-line error.
+            if !saw_record {
+                return Err("malformed MIME header initial line");
+            }
+            if let Some(v) = cur_value.as_mut() {
+                // Go joins each continuation with an UNCONDITIONAL ' '
+                // appended before the trimmed piece — even when the fold
+                // line is all whitespace and trims to "" (reader.go:
+                // "r.buf = append(r.buf, ' ')" then trim(line)). The
+                // first physical line's trailing WS is trimmed, but
+                // fold-created trailing WS is not: ReadMIMEHeader stores
+                // TrimLeft(v), never a right trim — so "Host: b" + " "
+                // folds to stored "b ", which httpguts ValidHostHeader
+                // rejects (conn: 149B "malformed Host header").
+                let piece = line.trim_matches([' ', '\t']);
+                if value_has_ctl(piece) {
+                    return Err("malformed MIME header: CTL byte in folded value");
+                }
+                v.push(' ');
+                v.push_str(piece);
+            }
+            continue;
+        }
+        // Close the previous record into the walk before opening the next.
+        if let Some(v) = cur_value.take() {
+            if cur_is_host {
+                walk.host_groups += 1;
+                if walk.host_value.is_none() {
+                    walk.host_value = Some(v);
+                }
+            }
+        }
+        // ReadContinuedLineSlice trimmed each physical line at BOTH ends
+        // before the colon cut; a trimmed-away line never reaches a
+        // record.
+        let trimmed = line.trim_matches([' ', '\t']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            return Err("malformed MIME header line: missing colon");
+        };
+        if key.is_empty() {
+            // canonicalMIMEHeaderKey on an empty key errors.
+            return Err("malformed MIME header line: empty key");
+        }
+        if key
+            .bytes()
+            .any(|b| b != b' ' && !header_field_name_byte_ok(b))
+        {
+            // canonicalMIMEHeaderKey: any invalid byte other than SPACE
+            // (CTL, HTAB, obs-text, ...) errors the whole read.
+            return Err("malformed MIME header line: invalid key byte");
+        }
+        if value_has_ctl(value) {
+            // Go validates the value over the RAW post-colon bytes before
+            // the TrimLeft storage — a leading CTL errors too.
+            return Err("malformed MIME header line: CTL byte in value");
+        }
+        let stored = value.trim_start_matches([' ', '\t']);
+        let key_has_space = key.contains(' ');
+        let is_host = !key_has_space && key.eq_ignore_ascii_case("host");
+        walk.header_groups += 1;
+        walk.name_has_space |= key_has_space;
+        cur_is_host = is_host;
+        cur_value = Some(stored.to_string());
+        saw_record = true;
+    }
+    if let Some(v) = cur_value.take() {
+        if cur_is_host {
+            walk.host_groups += 1;
+            if walk.host_value.is_none() {
+                walk.host_value = Some(v);
+            }
+        }
+    }
+    Ok(walk)
+}
+
+/// textproto value CTL scan (validHeaderFieldByte): every byte below
+/// SPACE except HTAB is illegal in a header value, plus DEL.
+fn value_has_ctl(v: &str) -> bool {
+    v.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f)
+}
+
+/// textproto validHeaderFieldByte for record KEYS (the token set of
+/// RFC 7230 §3.2.6); SPACE is handled by the caller, not here.
+fn header_field_name_byte_ok(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
 /// Max length of a chunk-size / trailer line in a chunked request body
 /// (matches the 64 KiB request-head cap). Shared with the h2 plugin's
 /// response-side chunked reader (plugin/h2.rs), which enforces the same
@@ -1388,6 +1709,35 @@ pub(super) const PLUGIN_HEADER_READ_TIMEOUT: std::time::Duration =
 /// after the body). Used where the plugins render what Go's http.Server
 /// would for a malformed request head (audit: 400/431 arms).
 pub(super) const GO_400_RENDER: &str = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request";
+/// Go conn.serve `badRequestError` render for the missing-Host conn gate
+/// (server.go — "missing required Host header"; wire shape probe-verified
+/// against go1.25.12, 163 bytes): a DETAILED statusError render (reason
+/// echoed in the status line AND the body), same shape family as
+/// [`GO_505_RENDER`] (round-17 audit F1: the conn gates fire after the
+/// version gate on the plain http.Server face).
+pub(super) const GO_400_MISSING_HOST_RENDER: &str =
+    "HTTP/1.1 400 Bad Request: missing required Host header\r\n\
+    Content-Type: text/plain; charset=utf-8\r\n\
+    Connection: close\r\n\
+    \r\n\
+    400 Bad Request: missing required Host header";
+/// Same shape family, for the malformed-Host conn gate (server.go
+/// ValidHostHeader on the stored Host value; probe-verified, 149 bytes).
+pub(super) const GO_400_MALFORMED_HOST_RENDER: &str =
+    "HTTP/1.1 400 Bad Request: malformed Host header\r\n\
+    Content-Type: text/plain; charset=utf-8\r\n\
+    Connection: close\r\n\
+    \r\n\
+    400 Bad Request: malformed Host header";
+/// Same shape family, for the invalid-header-name conn gate (issue 34540:
+/// a header name containing SPACE survives the textproto read and fires
+/// this detailed 400 at the conn; probe-verified, 145 bytes).
+pub(super) const GO_400_INVALID_HEADER_NAME_RENDER: &str =
+    "HTTP/1.1 400 Bad Request: invalid header name\r\n\
+    Content-Type: text/plain; charset=utf-8\r\n\
+    Connection: close\r\n\
+    \r\n\
+    400 Bad Request: invalid header name";
 /// Same shape as [`GO_400_RENDER`], for request-header-block overflow (Go
 /// MaxHeaderBytes breach).
 pub(super) const GO_431_RENDER: &str = "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n431 Request Header Fields Too Large";
@@ -2354,6 +2704,90 @@ mod tests {
         );
     }
 
+    /// Round-17 audit finding F6: the raw-ASCII sweep. Go's unescape
+    /// default arm rejects `s[i] < 0x80 && shouldEscape(s[i], mode)` in
+    /// host and zone modes (InvalidHostError — ReadRequest → silent close
+    /// on the http_proxy CONNECT arm). The pre-fix gate charset-validated
+    /// only %-escaped bytes, so raw '^'/'|'/'{' authorities passed and
+    /// died at the dial with a 400 render where Go closes silently.
+    #[test]
+    fn test_parse_request_line_connect_host_raw_ascii_sweep() {
+        // Raw non-legal ASCII in the authority host region → reject
+        // (Go InvalidHostError; probe vs go1.25: "CONNECT h^st:80" /
+        // "h|st" answer 0 bytes on the http_proxy CONNECT arm).
+        assert_eq!(parse_request_line("CONNECT h^st:443 HTTP/1.1"), None);
+        assert_eq!(parse_request_line("CONNECT h|st:443 HTTP/1.1"), None);
+        assert_eq!(parse_request_line("CONNECT h{st:443 HTTP/1.1"), None);
+        assert_eq!(parse_request_line("CONNECT h`st:443 HTTP/1.1"), None);
+        assert_eq!(parse_request_line("CONNECT h\\st:443 HTTP/1.1"), None);
+        assert_eq!(parse_request_line("CONNECT h#st:443 HTTP/1.1"), None);
+        // Raw DEL is swept by the CTL pass (b == 0x7f) even before F6.
+        assert_eq!(parse_request_line("CONNECT h\u{7f}st:443 HTTP/1.1"), None);
+        // A raw space in the authority never survives the 3-part
+        // request-line split — the second space makes "st:443" the
+        // version token, which fails the version shape (Go: the line
+        // parses to a 2-part request line → malformed 400; same class).
+        assert_eq!(parse_request_line("CONNECT h st:443 HTTP/1.1"), None);
+        // Raw obs-text is LEGAL (the sweep gates on < 0x80) — Go parses
+        // it and dies at the dial.
+        assert_eq!(
+            parse_request_line("CONNECT h\u{ff}st:443 HTTP/1.1"),
+            Some(("CONNECT", "h\u{ff}st:443", "HTTP/1.1"))
+        );
+    }
+
+    /// Round-17 audit finding F5: the unreserved-marks switch. Go's
+    /// shouldEscape has an UNCONDITIONAL second switch exempting '-', '_',
+    /// '.' and '~' that runs for host/zone modes too — the pre-fix set
+    /// lacked the four marks, so a raw '~' host passed only by accident
+    /// (no raw sweep existed) but a zone escape like "%2D" was rejected
+    /// where Go accepts it (probe: CONNECT [fe80::1%25en%2D0]:80 parses in
+    /// go1.25 — redundant escaping of a zone-legal byte).
+    #[test]
+    fn test_parse_request_line_connect_host_unreserved_marks() {
+        // Raw marks in the authority host region stay legal under the F6
+        // sweep (they must — the sweep calls should_escape_encode_host).
+        assert_eq!(
+            parse_request_line("CONNECT h-st:443 HTTP/1.1"),
+            Some(("CONNECT", "h-st:443", "HTTP/1.1"))
+        );
+        assert_eq!(
+            parse_request_line("CONNECT h_st:443 HTTP/1.1"),
+            Some(("CONNECT", "h_st:443", "HTTP/1.1"))
+        );
+        assert_eq!(
+            parse_request_line("CONNECT h.st:443 HTTP/1.1"),
+            Some(("CONNECT", "h.st:443", "HTTP/1.1"))
+        );
+        assert_eq!(
+            parse_request_line("CONNECT h~st:443 HTTP/1.1"),
+            Some(("CONNECT", "h~st:443", "HTTP/1.1"))
+        );
+        // Zone redundant escapes of the marks decode to host-legal bytes:
+        // %2D / %7E inside a zone pass (Go probe row above); the host-mode
+        // %2D (outside any zone) stays rejected (escapes of host-legal
+        // bytes are still invalid under the ASCII-escape rule).
+        assert_eq!(
+            parse_request_line("CONNECT [fe80::1%25en%2D0]:80 HTTP/1.1"),
+            Some(("CONNECT", "[fe80::1%25en%2D0]:80", "HTTP/1.1"))
+        );
+        assert_eq!(
+            parse_request_line("CONNECT [fe80::1%25en-0]:80 HTTP/1.1"),
+            Some(("CONNECT", "[fe80::1%25en-0]:80", "HTTP/1.1"))
+        );
+        assert_eq!(
+            parse_request_line("CONNECT [fe80::1%25en%7E0]:80 HTTP/1.1"),
+            Some(("CONNECT", "[fe80::1%25en%7E0]:80", "HTTP/1.1"))
+        );
+        assert_eq!(parse_request_line("CONNECT h%2Dst:443 HTTP/1.1"), None);
+        // Zone raw-ASCII sweep (F6 in zone mode): a raw '^' inside the
+        // zone region rejects like the host region.
+        assert_eq!(
+            parse_request_line("CONNECT [fe80::1%25en^0]:80 HTTP/1.1"),
+            None
+        );
+    }
+
     /// Go conn.readRequest `validMethod` (request.go go1.25): non-empty +
     /// tchar-only (alnum and `!#$%&'*+-.^_`|~`). No case rule — lowercase
     /// "get" passes, exactly like Go (gorilla's Method("GET") route check
@@ -2887,5 +3321,284 @@ mod tests {
                 "per-read deadline re-arms on every byte: 1 B/59 s trickle beat the 60 s bound"
             ),
         }
+    }
+
+    /// Drive `read_request_and_build_forward` over a duplex stream and
+    /// return the bytes the REJECTING side wrote before its Err (the F7
+    /// render) plus the Err text. Reading the render back requires the
+    /// writer half to drop first (duplex EOF), so the caller's Err borrow
+    /// must be released before the read — the helper owns that order.
+    async fn reject_bytes(raw_head: &[u8]) -> (Vec<u8>, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client_io, mut server_io) = tokio::io::duplex(8192);
+        client_io.write_all(raw_head).await.unwrap();
+        client_io.flush().await.unwrap();
+        let err =
+            match read_request_and_build_forward(&mut server_io, "", &Default::default(), None)
+                .await
+            {
+                Ok(fwd) => panic!("head must be rejected, built forward: {}", fwd.head),
+                Err(e) => e,
+            };
+        drop(server_io);
+        let mut render = Vec::new();
+        client_io.read_to_end(&mut render).await.unwrap();
+        (render, err)
+    }
+
+    /// Round-17 audit F7: Go conn.readRequest gates on the http2http-family
+    /// legs — every rejected class answers the byte-exact render Go's
+    /// http.Server face writes on the same head (probe-verified against
+    /// go1.25.12), instead of the old bare close.
+    #[tokio::test]
+    async fn f7_conn_gates_render_go_byte_exact_shapes() {
+        // dup-Host fires inside package readRequest (before readTransfer):
+        // plain error, no-detail 400.
+        let (render, err) = reject_bytes(b"GET /x HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n").await;
+        assert_eq!(
+            render,
+            GO_400_RENDER.as_bytes(),
+            "dup-Host render must be the generic 400"
+        );
+        assert!(
+            err.contains("too many Host headers"),
+            "dup-Host Err must name the class, got: {err}"
+        );
+        // Same class through case-folded duplicate keys (canonical merge).
+        let (render, _) = reject_bytes(b"GET /x HTTP/1.1\r\nHost: a\r\nHOST: b\r\n\r\n").await;
+        assert_eq!(
+            render,
+            GO_400_RENDER.as_bytes(),
+            "case-folded dup Host keys merge under one canonical key in Go"
+        );
+        // Missing Host on >=1.1 non-CONNECT, non-PRI heads: detailed 400
+        // ("missing required Host header").
+        let (render, err) = reject_bytes(b"GET /x HTTP/1.1\r\nUser-Agent: t\r\n\r\n").await;
+        assert_eq!(
+            render,
+            GO_400_MISSING_HOST_RENDER.as_bytes(),
+            "missing-Host must render the detailed 163B 400"
+        );
+        assert!(err.contains("missing required Host header"), "got: {err}");
+        // Malformed Host value: detailed 149B (no version gate in Go).
+        let (render, _) = reject_bytes(b"GET /x HTTP/1.1\r\nHost: h/x\r\n\r\n").await;
+        assert_eq!(
+            render,
+            GO_400_MALFORMED_HOST_RENDER.as_bytes(),
+            "malformed-Host must render the detailed 149B 400"
+        );
+        // SPACE in a header NAME (issue 34540 noCanon survivor): detailed
+        // 145B.
+        let (render, _) = reject_bytes(b"GET /x HTTP/1.1\r\nHost: h\r\nBad Name: y\r\n\r\n").await;
+        assert_eq!(
+            render,
+            GO_400_INVALID_HEADER_NAME_RENDER.as_bytes(),
+            "space-in-name must render the detailed 145B 400"
+        );
+        // CTL in a header VALUE: Go's detailed invalid-value conn gate is
+        // UNREACHABLE (textproto errors at read) — the generic 400 answers.
+        let (render, err) =
+            reject_bytes(b"GET /x HTTP/1.1\r\nHost: h\r\nX-A: ok\x01bad\r\n\r\n").await;
+        assert_eq!(
+            render,
+            GO_400_RENDER.as_bytes(),
+            "CTL value byte dies at textproto read: generic 400, NOT the detailed arm"
+        );
+        assert!(err.contains("CTL byte in value"), "got: {err}");
+        // Colonless header line: textproto missing-colon read error →
+        // generic 400.
+        let (render, _) = reject_bytes(b"GET /x HTTP/1.1\r\nHost: h\r\nNoColonHere\r\n\r\n").await;
+        assert_eq!(
+            render,
+            GO_400_RENDER.as_bytes(),
+            "colonless record renders the generic 400"
+        );
+        // Leading-SP first header line: "malformed MIME header initial
+        // line" → generic 400.
+        let (render, _) = reject_bytes(b"GET /x HTTP/1.1\r\n Bad\r\n\r\n").await;
+        assert_eq!(
+            render,
+            GO_400_RENDER.as_bytes(),
+            "initial-line leading whitespace renders the generic 400"
+        );
+        // Parseable non-1.x version (HTTP/2.0) past every read gate:
+        // detailed 505 (http1ServerSupportsRequest).
+        let (render, err) = reject_bytes(b"GET /x HTTP/2.0\r\nHost: h\r\n\r\n").await;
+        assert_eq!(
+            render,
+            http::GO_505_RENDER.as_bytes(),
+            "HTTP/2.0 head must render the detailed 505"
+        );
+        assert!(err.contains("unsupported protocol version"), "got: {err}");
+        // PRI * HTTP/2.0 WITH headers and no Host is NOT the h2-upgrade
+        // zero-header exemption: missing-Host fires.
+        let (render, _) = reject_bytes(b"PRI * HTTP/2.0\r\nX-A: b\r\n\r\n").await;
+        assert_eq!(
+            render,
+            GO_400_MISSING_HOST_RENDER.as_bytes(),
+            "PRI-with-headers has no missing-Host exemption"
+        );
+    }
+
+    /// Round-17 audit F7 rows that must still FORWARD (Go serves them):
+    /// HTTP/1.0 has no Host requirement, CONNECT is exempt from the
+    /// missing-Host gate, and the h2c-preface "PRI * HTTP/2.0" zero-header
+    /// head clears every gate (its scheme-500 fate is decided later, at
+    /// the handler — as in Go, where the request is served to the handler
+    /// and the plugin's RoundTrip errors on the empty scheme).
+    #[tokio::test]
+    async fn f7_gates_spare_served_classes() {
+        // HTTP/1.0 without Host: protoAtLeast(1,1) false — no gate.
+        let head = build_forward(b"GET /x HTTP/1.0\r\n\r\n", &Default::default(), None).await;
+        assert!(
+            head.starts_with("GET /x HTTP/1.1"),
+            "1.0 head forwards: {head}"
+        );
+        // HTTP/1.0 ignores Transfer-Encoding (Issue 12785).
+        let head = build_forward(
+            b"GET /x HTTP/1.0\r\nTransfer-Encoding: gzip\r\n\r\n",
+            &Default::default(),
+            None,
+        )
+        .await;
+        assert!(
+            head.starts_with("GET /x HTTP/1.1"),
+            "1.0 TE head forwards: {head}"
+        );
+        // CONNECT heads are exempt from the missing-Host gate.
+        let head = build_forward(b"CONNECT h:80 HTTP/1.1\r\n\r\n", &Default::default(), None).await;
+        assert!(
+            head.starts_with("CONNECT h:80 HTTP/1.1"),
+            "CONNECT no-Host forwards: {head}"
+        );
+        // The h2c preface: zero headers → isH2Upgrade → the missing-Host
+        // gate skips it (only the malformed/name gates could catch it).
+        let head = build_forward(b"PRI * HTTP/2.0\r\n\r\n", &Default::default(), None).await;
+        assert!(
+            head.starts_with("PRI * HTTP/1.1"),
+            "zero-header PRI * HTTP/2.0 clears the conn gates (outbound line always 1.1): {head}"
+        );
+        // An empty Host VALUE passes Go's ValidHostHeader (empty is legal)
+        // — forwarded, not 400'd.
+        let head = build_forward(
+            b"GET /x HTTP/1.1\r\nHost: \r\n\r\n",
+            &Default::default(),
+            None,
+        )
+        .await;
+        assert!(
+            head.starts_with("GET /x HTTP/1.1"),
+            "empty Host value forwards: {head}"
+        );
+        // HTAB inside a header value is legal (only CTL < 0x20 minus HTAB
+        // dies at read).
+        let head = build_forward(
+            b"GET /x HTTP/1.1\r\nHost: h\r\nX-A: y \tz\r\n\r\n",
+            &Default::default(),
+            None,
+        )
+        .await;
+        assert!(
+            head.starts_with("GET /x HTTP/1.1"),
+            "HTAB in value forwards: {head}"
+        );
+    }
+
+    /// Round-17 audit F7: `walk_leg_head` textproto-shape facts feeding
+    /// the gates — Host record counting (incl. fold continuation joining
+    /// and case-folded keys), value shape, and every read-time error
+    /// class the generic 400 render answers.
+    #[test]
+    fn f7_walk_leg_head_textproto_shapes() {
+        // Host line + a folded header: the fold joins X-A's value with one
+        // space; Host counts once with the TrimLeft'd value.
+        let w = walk_leg_head("GET / HTTP/1.1\r\nX-A: b\r\n \t c\r\nHost:  h\r\n\r\n").unwrap();
+        assert_eq!(w.header_groups, 2, "two records, got: {w:?}");
+        assert_eq!(w.host_groups, 1, "one Host record, got: {w:?}");
+        assert_eq!(
+            w.host_value.as_deref(),
+            Some("h"),
+            "Host value TrimLeft'd, got: {w:?}"
+        );
+        // Case-folded keys are one canonical Host (Go lowercases at read).
+        let w = walk_leg_head("GET / HTTP/1.1\r\nHOST: a\r\nhost: b\r\n\r\n").unwrap();
+        assert_eq!(w.host_groups, 2, "two canonical-Host records, got: {w:?}");
+        assert_eq!(
+            w.host_value.as_deref(),
+            Some("a"),
+            "first Host value wins, got: {w:?}"
+        );
+        // SPACE in a key sets the flag but is not a read error.
+        let w = walk_leg_head("GET / HTTP/1.1\r\nHost: h\r\nBad Name: y\r\n\r\n").unwrap();
+        assert!(w.name_has_space, "space key survives the read, got: {w:?}");
+        assert_eq!(w.host_groups, 1);
+        // "Host " (trailing space) is NOT the Host key — canonical merge
+        // keeps it separate.
+        let w = walk_leg_head("GET / HTTP/1.1\r\nHost : h\r\n\r\n").unwrap();
+        assert_eq!(w.host_groups, 0, "'Host ' never canonicalizes to Host");
+        assert!(w.name_has_space);
+        // A space-only line between records is an obs-fold continuation
+        // of the OPEN record — it never starts a record, and it joins
+        // with a ' ' that survives (reader.go appends the join space
+        // before trimming the piece): Host "h" + " \t " folds to stored
+        // "h ", which the consumer's ValidHostHeader gate rejects (the
+        // 149B malformed-Host render). The round-17 code skipped
+        // empty-piece folds and stored "h" (served/forwarded).
+        let w = walk_leg_head("GET / HTTP/1.1\r\nHost: h\r\n \t \r\nX-A: b\r\n\r\n").unwrap();
+        assert_eq!(w.header_groups, 2);
+        assert_eq!(
+            w.host_value.as_deref(),
+            Some("h "),
+            "all-WS fold appends the join space, got: {w:?}"
+        );
+        // PR-review R1 pin: "Host: b" + a single all-whitespace fold
+        // (" ") — stored "b " (space join unconditional, not "b").
+        let w = walk_leg_head("GET / HTTP/1.1\r\nHost: b\r\n \r\n\r\n").unwrap();
+        assert_eq!(
+            w.host_value.as_deref(),
+            Some("b "),
+            "single-space fold appends the join space, got: {w:?}"
+        );
+        // Read-time error classes (each answers the generic 400 e2e).
+        assert!(
+            walk_leg_head("GET / HTTP/1.1\r\n Bad\r\n\r\n").is_err(),
+            "initial-line fold"
+        );
+        assert!(
+            walk_leg_head("GET / HTTP/1.1\r\nNoColon\r\n\r\n").is_err(),
+            "colonless"
+        );
+        assert!(
+            walk_leg_head("GET / HTTP/1.1\r\n: v\r\n\r\n").is_err(),
+            "empty key"
+        );
+        assert!(
+            walk_leg_head("GET / HTTP/1.1\r\nX-B\x01d: v\r\n\r\n").is_err(),
+            "CTL in key"
+        );
+        assert!(
+            walk_leg_head("GET / HTTP/1.1\r\nHost: h\r\nX-A: ok\x01bad\r\n\r\n").is_err(),
+            "CTL in value"
+        );
+        assert!(
+            walk_leg_head("GET / HTTP/1.1\r\nHost: h\r\nX-A: v\x7fz\r\n\r\n").is_err(),
+            "DEL in value"
+        );
+        // Leading CTL in a value errors too (Go validates the raw
+        // post-colon bytes before TrimLeft).
+        assert!(
+            walk_leg_head("GET / HTTP/1.1\r\nHost: h\r\nX-A: \x01v\r\n\r\n").is_err(),
+            "leading CTL in value"
+        );
+        // Folded content is CTL-scanned.
+        assert!(
+            walk_leg_head("GET / HTTP/1.1\r\nHost: h\r\nX-A: b\r\n \x01c\r\n\r\n").is_err(),
+            "CTL in folded piece"
+        );
+        // HTAB is legal in values; the head-terminator "" and whitespace
+        // lines never count as records.
+        let w = walk_leg_head("GET / HTTP/1.1\r\nHost: h\r\nX-A: y \tz\r\n\r\n").unwrap();
+        assert_eq!(w.header_groups, 2);
+        assert_eq!(w.host_groups, 1);
     }
 }

@@ -46,12 +46,32 @@ async fn http_req(
     path: &str,
     user: Option<(&str, &str)>,
 ) -> (u16, String) {
-    let mut s = TcpStream::connect(addr).await.unwrap();
-    let auth = match user {
-        Some((u, p)) => format!("Authorization: Basic {}\r\n", b64(&format!("{u}:{p}"))),
-        None => String::new(),
+    let headers = match user {
+        Some((u, p)) => vec![(
+            "Authorization".to_string(),
+            format!("Basic {}", b64(&format!("{u}:{p}"))),
+        )],
+        None => Vec::new(),
     };
-    let req = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth}\r\n");
+    http_req_headers(addr, method, path, &headers).await
+}
+
+/// `http_req` with arbitrary extra request header lines.
+async fn http_req_headers(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+) -> (u16, String) {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
+    for (k, v) in headers {
+        req.push_str(k);
+        req.push_str(": ");
+        req.push_str(v);
+        req.push_str("\r\n");
+    }
+    req.push_str("\r\n");
     s.write_all(req.as_bytes()).await.unwrap();
 
     let mut raw = Vec::new();
@@ -269,6 +289,112 @@ async fn test_static_file_plugin_dir_listing() {
     assert!(
         body.contains("Location: sub/\r\n"),
         "relative Location, got: {body:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Audit finding D3 pins: the documented serve-path gaps of static_file.rs
+// (see the comment at the serve_open_file body stream) each get one
+// full-200 regression pin. Go oracle for all three:
+//   * Range:      net/http fs.go serveContent honors Range with a 206
+//                 partial body + Content-Range, and stamps every response
+//                 "Accept-Ranges: bytes". frp-rs deliberately ignores
+//                 Range → full 200, no Accept-Ranges (divergence pinned).
+//   * gzip:       Go frp wraps the FileServer in netpkg.MakeHTTPGzipHandler
+//                 (pkg/plugin/client/static_file.go, pkg/util/net/http.go:
+//                 62-91) — "gzip" in Accept-Encoding compresses EVERY
+//                 response (no type/size/q=0 gates); net/http FileServer
+//                 itself never gzips and serves no precompressed ".gz"
+//                 variant. frp-rs serves the ".gz" FILE raw (divergence
+//                 pinned — no Content-Encoding, no double compression).
+//   * If-None-Match: FileServer sets no ETag, so Go checkIfNoneMatch
+//                 (fs.go:519-544) 304s only on "*"; a non-matching token
+//                 is condTrue → the file serves 200. frp-rs has no INM
+//                 handling and answers the same 200 (parity pinned).
+
+#[tokio::test]
+async fn test_static_file_plugin_range_request_gets_full_200() {
+    let dir = temp_dir_with_index("range");
+    std::fs::write(dir.join("data.txt"), b"0123456789abcdef").unwrap();
+    let cfg = PluginConfig {
+        plugin_type: "static_file".into(),
+        local_path: dir.to_str().unwrap().into(),
+        ..Default::default()
+    };
+    let handle = frp_client::plugin::start_static_file_proxy(&cfg)
+        .await
+        .expect("start static_file plugin");
+    let (status, body) = http_req_headers(
+        handle.local_addr,
+        "GET",
+        "/data.txt",
+        &[("Range".to_string(), "bytes=0-3".to_string())],
+    )
+    .await;
+    assert_eq!(status, 200, "Range must be ignored (no 206): {body}");
+    assert!(
+        body.starts_with("HTTP/1.1 200 OK\r\n")
+            && !body.contains("Content-Range")
+            && !body.contains("Accept-Ranges")
+            && body.ends_with("\r\n\r\n0123456789abcdef"),
+        "full-body 200, no partial-content headers, got: {body:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_static_file_plugin_accept_encoding_gzip_served_raw() {
+    let dir = temp_dir_with_index("gz");
+    std::fs::write(dir.join("data.gz"), b"raw-gz-bytes-not-compressed").unwrap();
+    let cfg = PluginConfig {
+        plugin_type: "static_file".into(),
+        local_path: dir.to_str().unwrap().into(),
+        ..Default::default()
+    };
+    let handle = frp_client::plugin::start_static_file_proxy(&cfg)
+        .await
+        .expect("start static_file plugin");
+    let (status, body) = http_req_headers(
+        handle.local_addr,
+        "GET",
+        "/data.gz",
+        &[("Accept-Encoding".to_string(), "gzip".to_string())],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "gzip-accepting request must still serve: {body}"
+    );
+    assert!(
+        !body.contains("Content-Encoding") && body.ends_with("\r\n\r\nraw-gz-bytes-not-compressed"),
+        ".gz file served raw (no gzip wrapper, no precompressed handling), got: {body:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_static_file_plugin_if_none_match_nonmatching_token() {
+    let dir = temp_dir_with_index("inm");
+    std::fs::write(dir.join("data.txt"), b"0123456789abcdef").unwrap();
+    let cfg = PluginConfig {
+        plugin_type: "static_file".into(),
+        local_path: dir.to_str().unwrap().into(),
+        ..Default::default()
+    };
+    let handle = frp_client::plugin::start_static_file_proxy(&cfg)
+        .await
+        .expect("start static_file plugin");
+    let (status, body) = http_req_headers(
+        handle.local_addr,
+        "GET",
+        "/data.txt",
+        &[("If-None-Match".to_string(), "\"xyz\"".to_string())],
+    )
+    .await;
+    assert_eq!(status, 200, "non-matching INM must not 304: {body}");
+    assert!(
+        body.starts_with("HTTP/1.1 200 OK\r\n") && body.ends_with("\r\n\r\n0123456789abcdef"),
+        "full 200 body (no ETag is ever set, Go parity), got: {body:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

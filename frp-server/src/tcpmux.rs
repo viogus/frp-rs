@@ -369,11 +369,18 @@ pub async fn run_tcpmux_listener(
                     // http.ReadRequest (pkg/util/tcpmux/httpconnect.go) has
                     // no header cap, so Go frp would tunnel a client whose
                     // head overran the buffer as-is. frp-rs caps the head at
-                    // 4096 bytes (the h2c/vhost split-surface policy) and
-                    // answers oversized heads with 431 instead of silently
-                    // closing — an oversized head that answered nothing
-                    // would read as a dead proxy to a well-behaved client
-                    // that merely pipelined a large chunk.
+                    // 4096 bytes and answers oversized heads with 431
+                    // instead of silently closing — an oversized head that
+                    // answered nothing would read as a dead proxy to a
+                    // well-behaved client that merely pipelined a large
+                    // chunk. This tcpmux front and the vhost HTTP/1.1 front
+                    // (vhost.rs handle_http1_request) share the 4096 + 431
+                    // client-facing cap — Go's analog there is http.Server
+                    // defaultMaxHeaderBytes = 1 MiB (net/http server.go),
+                    // while the backend-response/plugin faces read with the
+                    // 1 MiB + 4096 readLimit model and Go's Transport caps
+                    // a backend head at 10 MiB; the full three-surface
+                    // matrix is on the vhost front (audit round 18 C4).
                     if let Err(e) = stream
                         .write_all(
                             b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",

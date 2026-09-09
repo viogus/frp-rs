@@ -39,10 +39,12 @@ pub async fn start_static_file_proxy(cfg: &PluginConfig) -> Result<PluginHandle,
         Some(cfg.strip_prefix.trim_matches('/').to_string())
     };
     // The base directory is canonicalized PER REQUEST inside
-    // `handle_static_file_conn` (see the audit-F comment there) — a startup
-    // cache went stale when a base-dir symlink retargeted after startup
-    // (versioned deploys like /var/www/current), 403ing every file
-    // (round-17 review LOW).
+    // `handle_static_file_conn` (see the audit finding D4 comment there) —
+    // a startup cache went stale when a base-dir symlink retargeted after
+    // startup (versioned deploys like /var/www/current), 403ing every file
+    // (round-17 review LOW). Audit finding D4 reviewed hoisting the walk
+    // to plugin start / reload and refused (mutable filesystem state,
+    // false-ACCEPT direction) — the per-request cost is deliberate.
     let state = (auth, local_path, strip_prefix);
     serve_plugin(
         "static_file",
@@ -332,7 +334,10 @@ async fn handle_static_file_conn(
     // so a symlink-to-outside-directory 301'd and then dirListed outside
     // `local_path`. The one arm the guard does not precede is the
     // index.html-suffix redirect below — it does no file I/O and leaks
-    // nothing (its refetch of the directory is itself guarded).
+    // nothing (its refetch of the directory is itself guarded). The open
+    // itself also precedes the guard (audit finding D4) — an open that
+    // fails answers a serveError page and an open that succeeds is
+    // verified via its fd before any arm can serve from it.
     // ----------------------------------------------------------------
 
     // Round-16 FIX 3 + round-17 finding I: Go serveFile's FIRST arm
@@ -379,39 +384,16 @@ async fn handle_static_file_conn(
         return Err(format!("index.html suffix redirect: {url_path}"));
     }
 
-    // Rust-only hardening (Go's http.Dir cleans the joined name — path.Clean
-    // clamps "..", so traversal cannot escape — then deliberately FOLLOWS
-    // symlinks wherever they point; escaping the root is a documented Go
-    // footgun this plugin declines to copy): canonicalize the base directory
-    // per request (a startup cache went stale when a base-dir symlink
-    // retargeted — versioned deploys — and 403'd every file; round-17
-    // review LOW), open the target, then verify via the ALREADY-OPEN handle
-    // that it stays within the base. The verification must resolve the open
-    // fd's inode, not re-resolve the path: re-canonicalizing the path after
-    // open() lets a symlink swap between the two make the check disagree
-    // with the opened inode (TOCTOU). Cost: a short path walk per request,
-    // not per byte.
-    let base = match std::fs::canonicalize(local_path) {
-        Ok(b) => b,
-        Err(e) => {
-            // Round-17 finding G: an unresolvable base directory (deleted or
-            // renamed under the plugin while serving) previously closed the
-            // connection without a response. Go's own open of the joined name
-            // ENOENTs on the same condition and serveError/toHTTPError maps
-            // that to the 404 page — render the same page before closing.
-            if let Err(we) = client
-                .write_all(super::GO_404_NOT_FOUND_RENDER.as_bytes())
-                .await
-            {
-                tracing::debug!(error = %we, "plugin relay error: {}", we);
-            }
-            return Err(format!(
-                "failed to resolve base directory '{}': {e}",
-                local_path
-            ));
-        }
-    };
-
+    // Audit finding D4 (the base canonicalize moved BELOW the open): the
+    // open-failure arms answer Go's serveError → toHTTPError pages without
+    // paying the base-directory walk (~4-8 syscalls saved per
+    // open-failure request — the walk exists only to verify an open that
+    // never happened). A base that vanished under the plugin now answers
+    // 404 through Go's own ENOENT arm below (fs.go:680-696), and an
+    // unreadable base answers 403 like Go's IsPermission arm — the old
+    // pre-open walk collapsed both to a blanket 404. The Rust-only
+    // containment guard still precedes every content-serve arm; it needs
+    // the base only once the open SUCCEEDED (next block).
     let file = match std::fs::File::open(&full_path) {
         Ok(f) => f,
         Err(e) => {
@@ -437,6 +419,47 @@ async fn handle_static_file_conn(
             return Err(format!("failed to open {}: {e}", full_path.display()));
         }
     };
+
+    // Rust-only hardening (Go's http.Dir cleans the joined name — path.Clean
+    // clamps "..", so traversal cannot escape — then deliberately FOLLOWS
+    // symlinks wherever they point; escaping the root is a documented Go
+    // footgun this plugin declines to copy): canonicalize the base directory
+    // PER REQUEST and verify via the ALREADY-OPEN handle above that the
+    // target stays within the base. A startup cache of the base realpath
+    // went stale when a base-dir symlink retargeted (versioned deploys like
+    // /var/www/current) and 403'd every file (round-17 review LOW) — audit
+    // finding D4 reviewed hoisting the walk to plugin start / reload and
+    // refused: the realpath is mutable filesystem state with a
+    // false-ACCEPT direction too (a retargeted base would sail the stale
+    // starts_with check and serve OUTSIDE the new root), so the walk stays
+    // per-request — the deliberate cost that replaces the staleable cache.
+    // The verification must resolve the open fd's inode, not re-resolve the
+    // path: re-canonicalizing the path after open() lets a symlink swap
+    // between the two make the check disagree with the opened inode
+    // (TOCTOU). Cost: a short path walk per request, not per byte.
+    let base = match std::fs::canonicalize(local_path) {
+        Ok(b) => b,
+        Err(e) => {
+            // Round-17 finding G — reachable only as a post-open race now
+            // (audit finding D4 moved the walk below the open): the open
+            // above succeeded, so the base existed moments ago; a concurrent
+            // rename/retarget between the open and this walk fails here.
+            // Go's serveError/toHTTPError maps the same condition (its own
+            // open of the joined name ENOENTs) to the 404 page — render the
+            // same page before closing.
+            if let Err(we) = client
+                .write_all(super::GO_404_NOT_FOUND_RENDER.as_bytes())
+                .await
+            {
+                tracing::debug!(error = %we, "plugin relay error: {}", we);
+            }
+            return Err(format!(
+                "failed to resolve base directory '{}': {e}",
+                local_path
+            ));
+        }
+    };
+
     let resolved = open_handle_canonical(&file, &full_path)?;
     if !resolved.starts_with(&base) {
         // Escaping target — 403, redirects and listings included
@@ -770,9 +793,25 @@ async fn serve_open_file(
         .await
         .map_err(|e| format!("write headers: {e}"))?;
 
-    // (Documented gaps vs Go FileServer: no gzip compression of served
-    // files, no Range/206 handling, no If-None-Match — the audit scoped
-    // Last-Modified/304 only.)
+    // Documented gaps vs Go frp's handler stack (audit finding D3; each
+    // pinned e2e in frp-client/tests/plugin_static_file.rs):
+    // * gzip — Go frp wraps the FileServer in
+    //   netpkg.MakeHTTPGzipHandler (pkg/plugin/client/static_file.go,
+    //   pkg/util/net/http.go:62-91): when Accept-Encoding contains "gzip"
+    //   (no q=0 or type/size gate) EVERY response is compressed with
+    //   Content-Encoding: gzip. net/http's FileServer itself never gzips
+    //   and serves no precompressed ".gz" variants. frp-rs serves raw
+    //   bytes — deliberate divergence, the wrapper is not replicated.
+    // * Range — Go serveContent honors Range with a 206 + Content-Range
+    //   and stamps every response "Accept-Ranges: bytes" (fs.go
+    //   serveContent). frp-rs ignores Range and serves the full 200 —
+    //   deliberate divergence, no partial content, no Accept-Ranges.
+    // * If-None-Match — FileServer sets no ETag, so Go's checkIfNoneMatch
+    //   (fs.go:519-544) only 304s on "*"; a non-matching token is condTrue
+    //   and skips the If-Modified-Since gate (fs.go:649-665), so a stale
+    //   IMS under a non-matching INM answers 200 in Go where frp-rs (no
+    //   INM handling) answers 304. Token-less requests are parity; "*" is
+    //   Go-304 / frp-rs-200. The audit scoped Last-Modified/304 only.
     let mut file = tokio::fs::File::from_std(file);
     let mut chunk = [0u8; 64 * 1024];
     loop {
@@ -981,6 +1020,13 @@ fn http_error_render(status: &str, body: &str) -> String {
 /// swap between open() and canonicalize() making the check disagree with
 /// the opened inode) is accepted; the check remains defense-in-depth on
 /// top of the component-level clean.
+///
+/// The /proc/self/fd walk is PER-OPEN on purpose (audit finding D4): it
+/// verifies the inode that open() actually pinned, so no path-based cache
+/// can replace it without reopening the race it closes. This syscall cost
+/// on every served request is the accepted price of the guard (the
+/// per-request base walk in `handle_static_file_conn` is the other half;
+/// both deliberately uncached — see the round-17 stale-base note there).
 fn open_handle_canonical(
     file: &std::fs::File,
     _path: &std::path::Path,
@@ -1134,28 +1180,52 @@ fn html_escape_text(s: &str) -> String {
 /// Linux distros (Go consults the builtin first, then the OS table, so a
 /// system whose mime.types overrides gets the OS value — frp-rs pins the
 /// Go builtin; documented divergence).
+///
+/// Audit finding D2: the extension lookup is ASCII case-insensitive — Go
+/// mime.TypeByExtension checks the case-sensitive table first, then folds
+/// the extension to lowercase for the mimeTypesLower table (mime/type.go:
+/// 104-133; probe vs go1.25.12: ".JPG" and ".Jpg" answer image/jpeg). The
+/// rows cover the whole Go builtin set — .avif/.mjs/.webp were missing
+/// and are added with the builtin values; the extra non-Go rows
+/// (ico/txt/zip/woff/woff2/ttf/mp3/mp4/webm) are a deliberate superset.
+/// Fallback: Go returns "" for an unknown extension and http.FileServer
+/// then SNIFFS the first 512 bytes (DetectContentType, fs.go serveContent)
+/// — frp-rs deliberately does NOT sniff, serving
+/// "application/octet-stream" instead (documented divergence).
 fn mime_from_path(path: &std::path::Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("html") | Some("htm") => "text/html; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("js") => "text/javascript; charset=utf-8",
-        Some("json") => "application/json",
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("svg") => "image/svg+xml",
-        Some("ico") => "image/x-icon",
-        Some("txt") => "text/plain; charset=utf-8",
-        Some("xml") => "text/xml; charset=utf-8",
-        Some("pdf") => "application/pdf",
-        Some("zip") => "application/zip",
-        Some("wasm") => "application/wasm",
-        Some("woff") => "font/woff",
-        Some("woff2") => "font/woff2",
-        Some("ttf") => "font/ttf",
-        Some("mp3") => "audio/mpeg",
-        Some("mp4") => "video/mp4",
-        Some("webm") => "video/webm",
+    // Cow: the all-lowercase common case borrows; only an extension
+    // containing an ASCII uppercase byte allocates the folded copy (a
+    // match over `extension()` cannot fold in place).
+    let ext: std::borrow::Cow<'_, str> = match path.extension().and_then(|e| e.to_str()) {
+        Some(e) if e.bytes().any(|b| b.is_ascii_uppercase()) => {
+            std::borrow::Cow::Owned(e.to_ascii_lowercase())
+        }
+        Some(e) => std::borrow::Cow::Borrowed(e),
+        None => return "application/octet-stream",
+    };
+    match ext.as_ref() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "txt" => "text/plain; charset=utf-8",
+        "xml" => "text/xml; charset=utf-8",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "wasm" => "application/wasm",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
         _ => "application/octet-stream",
     }
 }
@@ -1275,12 +1345,14 @@ fn parse_if_modified_since(value: &str) -> Option<u64> {
 /// IMF-fixdate / RFC 1123 — "Weekday, day month year clock GMT": comma
 /// after the (short) weekday, space-separated day / 3-letter month /
 /// 4-digit year / clock / zone. The 3-letter month lookup is
-/// case-insensitive (Go). One documented leniency: a space-padded
-/// single-digit day is accepted ("Mon,  2 Jan 2006 ...") — Go's RFC1123
-/// layout element is '02', which requires TWO digits, so that shape errors
-/// in Go and Go re-serves 200 where frp-rs answers 304. The divergence is
-/// RFC 7232-safe (a 304 only ever revalidates a copy the client holds) and
-/// answers stale only for clients that never see Go servers.
+/// case-insensitive (Go). The day token must be EXACTLY two digits —
+/// Go's RFC1123 layout element is '02' (stdZeroDay), which time.Parse's
+/// getnum parses with fixed=true, i.e. exactly two digits (time/format.go:
+/// 923-938): a single-digit day ("Sat, 2 Jan 2006 ...") and a three-digit
+/// day ("Sat, 007 Jan 2006 ...") both error in Go (probe vs go1.25.12) →
+/// condNone → Go re-serves 200. (Audit finding D1: the pre-fix code
+/// accepted the space-padded single-digit shape as a "documented
+/// leniency" — probe-verified false parity; the shape now fails like Go.)
 fn parse_imf_fixdate(v: &str) -> Option<u64> {
     // The weekday must be one of the seven abbreviated names (Go's layout
     // needs a real name: time.Parse does a case-insensitive lookup and
@@ -1304,8 +1376,17 @@ fn parse_imf_fixdate(v: &str) -> Option<u64> {
     if parts.next().is_some() || zone != "GMT" {
         return None;
     }
-    // Go layout "2006": exactly four ASCII digits.
-    if year_tok.len() != 4 || !ascii_digits(year_tok) || !ascii_digits(day_tok) {
+    // Go layout "2006": exactly four ASCII digits. The layout element
+    // "02" (stdZeroDay) is getnum(value, fixed=true) — exactly TWO
+    // digits (time/format.go:923-938); a 1- or 3-digit day token errors
+    // in Go (probe vs go1.25.12: "Sat, 1 Jan 2000 ..." and
+    // "Sat, 007 Jan 2000 ..." both ERR → condNone → 200; audit
+    // finding D1).
+    if year_tok.len() != 4
+        || !ascii_digits(year_tok)
+        || day_tok.len() != 2
+        || !ascii_digits(day_tok)
+    {
         return None;
     }
     let year: i64 = year_tok.parse().ok()?;
@@ -1504,8 +1585,14 @@ fn parse_ansic(v: &str) -> Option<u64> {
     {
         return None;
     }
-    // Go layout "2006": exactly four ASCII digits.
-    if year_tok.len() != 4 || !ascii_digits(year_tok) || !ascii_digits(day_tok) {
+    // Go layout "2006": exactly four ASCII digits. The layout element
+    // "_2" (stdUnderDay) is a space-padded day: time.Parse runs cutspace
+    // then getnum(value, fixed=false) (time/format.go:923-938), so ONE or
+    // TWO digits are legal but a 3-digit token errors (probe vs go1.25.12:
+    // "Sat Jan 007 00:00:00 2000" ERR → condNone → 200 — the ANSIC
+    // sibling of audit finding D1).
+    if year_tok.len() != 4 || !ascii_digits(year_tok) || day_tok.len() > 2 || !ascii_digits(day_tok)
+    {
         return None;
     }
     let year: i64 = year_tok.parse().ok()?;
@@ -1634,6 +1721,26 @@ mod tests {
         );
         assert_eq!(mime_from_path(Path::new("image.png")), "image/png");
         assert_eq!(mime_from_path(Path::new("photo.jpg")), "image/jpeg");
+        // Audit finding D2: TypeByExtension folds the extension to
+        // lowercase before the mimeTypesLower lookup (mime/type.go:
+        // 104-133) — probe vs go1.25.12: ".JPG"/".Jpg" answer image/jpeg.
+        assert_eq!(mime_from_path(Path::new("photo.JPG")), "image/jpeg");
+        assert_eq!(mime_from_path(Path::new("photo.Jpg")), "image/jpeg");
+        assert_eq!(mime_from_path(Path::new("IMAGE.PNG")), "image/png");
+        assert_eq!(
+            mime_from_path(Path::new("INDEX.HTML")),
+            "text/html; charset=utf-8"
+        );
+        // The remaining Go builtin rows (mime/type.go builtinTypesLower) —
+        // .avif/.mjs/.webp were missing from the pre-fix table.
+        assert_eq!(mime_from_path(Path::new("pic.avif")), "image/avif");
+        assert_eq!(
+            mime_from_path(Path::new("app.mjs")),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(mime_from_path(Path::new("pic.webp")), "image/webp");
+        // Unknown extension → octet-stream, no content sniffing (D2
+        // fallback comment — Go would DetectContentType-sniff here).
         assert_eq!(
             mime_from_path(Path::new("unknown.xyz")),
             "application/octet-stream"
@@ -1702,13 +1809,24 @@ mod tests {
             parse_if_modified_since("Sat, 01 Jan 2000 00:00:00 GMT"),
             Some(946684800)
         );
-        // Space-padded single-digit day. Documented leniency divergence:
-        // Go's RFC1123 layout element is '02' (two digits), so Go
-        // time.Parse errors on this shape → condNone → Go re-serves 200;
-        // frp-rs answers 304 (RFC 7232-safe — a 304 only revalidates).
+        // Audit finding D1: the IMF day token must be exactly two digits —
+        // Go's RFC1123 element '02' is getnum(fixed=true) (time/format.go:
+        // 923-938), so single- AND three-digit days error in Go (probe vs
+        // go1.25.12) → condNone → 200. The pre-fix code accepted the
+        // space-padded single-digit shape as a "documented leniency" and
+        // answered 304 where Go re-serves 200 — wrong, flipped here.
         assert_eq!(
             parse_if_modified_since("Sat,  1 Jan 2000 00:00:00 GMT"),
-            Some(946684800)
+            None
+        );
+        assert_eq!(
+            parse_if_modified_since("Sat, 007 Jan 2000 00:00:00 GMT"),
+            None
+        );
+        // Exactly two digits parses (2000-01-07 = 946684800 + 6 days).
+        assert_eq!(
+            parse_if_modified_since("Sat, 07 Jan 2000 00:00:00 GMT"),
+            Some(947203200)
         );
         // Wrong-but-valid weekday → accepted: Go time.Parse validates the
         // weekday NAME only ("ignore weekday except for error checking")
@@ -1816,6 +1934,14 @@ mod tests {
             parse_if_modified_since("Sat Jan  1 00:00:00 2000"),
             Some(946684800)
         );
+        // Audit finding D1 (ANSIC sibling): layout "_2" is
+        // getnum(fixed=false) — a 1- OR 2-digit day is legal, a 3-digit
+        // day errors in Go (probe vs go1.25.12: "Sat Jan 007 ..." ERR).
+        assert_eq!(
+            parse_if_modified_since("Sat Jan  7 00:00:00 2000"),
+            Some(947203200)
+        );
+        assert_eq!(parse_if_modified_since("Sat Jan 007 00:00:00 2000"), None);
         assert_eq!(
             parse_if_modified_since("Mon Jan  2 22:04:05 2006 GMT"),
             None
