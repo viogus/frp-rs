@@ -184,9 +184,10 @@ struct VisitorTransportConfig {
 impl VisitorTransportConfig {}
 
 /// Result of visitor dial planning: the DialOptions to pass to
-/// dial_server, together with an optional yamux keepalive interval.
-/// When `yamux_keepalive_secs` is `Some(n)`, the caller must wrap
-/// the raw stream in yamux via `wrap_client_mux(raw, n)`.
+/// dial_server, together with an optional yamux keepalive interval
+/// and idle-dead-timeout. When `yamux_keepalive_secs` is `Some(n)`
+/// (paired with `yamux_idle_dead_timeout_secs: Some(t)`), the caller
+/// must wrap the raw stream in yamux via `wrap_client_mux(raw, n, t)`.
 #[derive(Debug)]
 struct VisitorDialPlan {
     opts: DialOptions,
@@ -197,8 +198,9 @@ struct VisitorDialPlan {
 /// Build the DialOptions and yamux decision for a visitor→server
 /// connection.  Pure — no I/O, no spawn, no network.  The caller
 /// is responsible for calling `dial_server(&plan.opts)` and, when
-/// `plan.yamux_keepalive_secs` is `Some(n)`, wrapping the result
-/// with `crate::control::wrap_client_mux(raw_stream, n)`.
+/// `plan.yamux_keepalive_secs` is `Some(n)` (paired with
+/// `plan.yamux_idle_dead_timeout_secs: Some(t)`), wrapping the
+/// result with `crate::control::wrap_client_mux(raw_stream, n, t)`.
 fn plan_visitor_dial(
     server_addr: &str,
     server_port: u16,
