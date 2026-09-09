@@ -959,7 +959,22 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
 
     // Case-insensitive CONNECT match: Go frp http_proxy.go uses
     // strings.EqualFold(string(firstBytes), http.MethodConnect) — a
-    // lowercase "connect" is accepted.
+    // lowercase "connect" is accepted into ITS connect arm too. That
+    // sniff only picks the arm; what tunnels is decided by
+    // http.ReadRequest's justAuthority gate, which is EXACT
+    // (request.go: `req.Method == "CONNECT"` — case-sensitive). Under a
+    // non-exact method an authority-form target is NOT justAuthority:
+    // ParseRequestURI("h:80") yields Scheme "h" + Opaque "80" →
+    // URL.Host = "" — and handleConnectReq dials req.URL.Host, so
+    // net.Dial("tcp", "") ALWAYS fails: Go answers its bare 400 for
+    // every lowercase/mixed-case connect authority head, even when the
+    // host resolves (probe-verified, PR-review R1). frp-rs tunneled it
+    // verbatim. Blank the target under a non-exact method: the dial
+    // fails into the same Go-parity 400 arm handle_connect already
+    // renders (byte-identical). An absolute-form target under a
+    // non-exact method ("connect http://host/") is the one shape where
+    // Go's URI parse DOES yield a Host and tunnels — frp-rs answers the
+    // 400 there too: fail-closed, and no real client emits the shape.
     if is_connect {
         // Round-17 audit F4: the head read loop stops at the terminator
         // but a read chunk can carry bytes PAST it — tunnel data a client
@@ -971,7 +986,8 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
         // bytes, losing the client's early tunnel data.
         let head_end = frp_core::textproto::head_end(&buf).unwrap_or(buf.len());
         let connect_tail = buf[head_end.min(buf.len())..].to_vec();
-        handle_connect(client, url, &connect_tail).await
+        let connect_target = if method == "CONNECT" { url } else { "" };
+        handle_connect(client, connect_target, &connect_tail).await
     } else {
         handle_http_forward(client, &buf, method, url, version).await
     }

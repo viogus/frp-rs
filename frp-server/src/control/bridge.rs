@@ -168,33 +168,44 @@ struct ResponseHeaderInjector<R> {
     /// feeds). MUST be reset wherever `buffer` is REPLACED rather than
     /// grown — the scanner's `line_start`/`scanned` watermarks belong to
     /// the old content. Replacement sites: `raw_head_fully_served` (tail
-    /// handback), the C3b discard handoff in `emission_drained`, and the
-    /// inject branch (`buffer = injected`).
+    /// handback), the C3b discard handoff in `emission_drained`, the
+    /// inject branch (`buffer = injected`), and the discard
+    /// done-branch (`buffer = mem::take(&mut skip.pending)` — served
+    /// via `raw_pass` or `complete`, never rescanned, so the scanner
+    /// stays dormant there; listed for any edit that adds a scan
+    /// after a discard).
     head_scanner: frp_core::textproto::HeadEndScanner,
     /// Persistent read buffer to avoid per-poll_read allocation.
     read_buf: [u8; 4096],
     /// Absolute deadline for the FIRST injectable head (Go
     /// ResponseHeaderTimeout analog, A2). Armed once at construction; an
     /// interim 1xx raw serve does NOT extend it. When it fires while a head
-    /// is still being gathered, poll_read errors with TimedOut. It also
-    /// bounds the round-18 C3b discard phase (a trickling lying backend
-    /// must not park the bridge past the deadline) — there a fire ends the
-    /// stream cleanly instead (see `abort_after_discard_failure`; an
-    /// Err(TimedOut) after the head went out would make frp-core answer a
-    /// SECOND gateway head). Boxed-pinned Sleep registered once (no
-    /// per-poll wheel churn); `Pin<Box<T>>` is Unpin regardless of `T`, so
-    /// the manual Unpin impl above stays valid.
+    /// is still being gathered, poll_read errors with TimedOut. (It does
+    /// NOT bound the round-18 C3b discard — that phase never reads the
+    /// inner reader, so no park exists to bound.) Boxed-pinned Sleep
+    /// registered once (no per-poll wheel churn); `Pin<Box<T>>` is Unpin
+    /// regardless of `T`, so the manual Unpin impl above stays valid.
     deadline_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
     /// A declared entity body behind an injected 204/304 head, being
     /// consumed so the shared stream lands at the next-response boundary
     /// (round-18 C3b; full model in the inject branch). While armed, the
     /// emission drain hands the split-off body bytes back to `buffer` and
-    /// the discard section consumes them (in-hand bytes first, then inner
-    /// reads) — NOTHING in the declared body is ever relayed. Once the
-    /// declared framing is fully consumed the stream resumes raw:
-    /// `complete` when the boundary was exact, `raw_pass` when bytes past
-    /// it are already in hand. A discard that cannot complete ends the
-    /// stream permanently (`abort_after_discard_failure`).
+    /// the discard section consumes them — in-hand bytes only; the inner
+    /// reader is never touched (a legal 304 + Content-Length cannot be
+    /// told apart from a lying backend's split junk once the in-hand
+    /// bytes are spent, and consuming wire bytes would eat a pipelined
+    /// next response or park a keep-alive bridge to the A2 deadline).
+    /// Only in-hand bytes are ever consumed as the declared body. What
+    /// the single in-hand pass does not reach — a lying backend's later
+    /// junk, or the stream's real continuation — passes through raw below
+    /// (deliberate fail-open window: a clean wire-eat is
+    /// byte-indistinguishable from eating a legal pipelined response).
+    /// Once the declared framing is fully consumed from in-hand bytes the
+    /// stream resumes raw: `complete` when the boundary was exact,
+    /// `raw_pass` when bytes past it are already in hand. In-hand bytes
+    /// spent before the framing completed → `complete` immediately,
+    /// silently. Chunked framing errors end the stream permanently
+    /// (`abort_after_discard_failure`).
     discard: Option<Discard>,
     /// Pass-through content already in hand when a discard completed —
     /// the bytes a lying backend wrote past its declared framing, or a
@@ -591,18 +602,21 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
         (n < 1 << 63).then_some(n)
     }
 
-    /// Round-18 C3b: a declared body behind an injected 204/304 head could
-    /// not be fully consumed — the backend closed mid-body, the chunked
-    /// framing is malformed (or never terminates before the response-head
-    /// deadline), or an InvalidData read error hit the discard. The head is
-    /// already out, so frp-core must never answer a gateway head, and the
-    /// stream position is unknowable mid-junk — end the pair with
-    /// PERMANENT clean EOF (the `complete` + `malformed_raw` state never
-    /// polls the inner reader again). That is exactly where Go lands too:
-    /// its Transport reads no bytes for a no-body status and the pooled
-    /// conn is DISCARDED with the junk still in its buffer (persistConn
-    /// readLoop closes conns whose body was not fully consumed). The WARN
-    /// is rate-limited — a hostile backend fleet must not flood the log.
+    /// Round-18 C3b: in-hand junk behind an injected 204/304 head failed
+    /// the declared chunked framing (the only failing arm left — the
+    /// discard never reads the inner reader, so truncation and deadline
+    /// arms are unreachable by construction). The head is already out, so
+    /// frp-core must never answer a gateway head, and the stream position
+    /// is unknowable mid-junk — end the pair with PERMANENT clean EOF
+    /// (the `complete` + `malformed_raw` state never polls the inner
+    /// reader again). Go abandons no-body bodies without reading them
+    /// (chunked-on-204/304 and CL:0 → Body = NoBody, transfer.go:570-574;
+    /// the pooled conn is then closed at the next reuse with the junk
+    /// still in its buffer — persistConn readLoop) and for a declared
+    /// CL > 0 it reads exactly N junk bytes (LimitReader) then errors the
+    /// next ReadResponse on whatever follows — either way the response
+    /// stream ends, as it does here. The WARN is rate-limited — a hostile
+    /// backend fleet must not flood the log.
     fn abort_after_discard_failure(this: &mut Self, why: &'static str) {
         this.discard = None;
         this.tail = None;
@@ -645,10 +659,19 @@ static DISCARD_WARN_THROTTLE: std::sync::atomic::AtomicU64 = std::sync::atomic::
 
 /// A declared entity body a backend wrote after a 204/304 head that HTTP
 /// forbids from carrying one (RFC 9112 §3.3.3; Go readTransfer answers
-/// Body = NoBody for every framing on these statuses). The injected head
-/// the user saw was stripped of the framing headers (see
-/// `suppressed_headers_for_status`) — the junk below is real bytes on the
-/// shared stream and is consumed, never relayed (round-18 C3b).
+/// Body = NoBody on these statuses — but ONLY when the framing is chunked,
+/// CL: 0, or absent: a `Content-Length: N` with N > 0 still arms a body
+/// (transfer.go:565-578 realLength arm), so Go READS exactly N junk bytes
+/// before its pooled conn is reusable). The injected head the user saw was
+/// stripped of the framing headers (see `suppressed_headers_for_status`)
+/// — the junk below is real bytes on the shared stream; the in-hand ones
+/// are consumed, never relayed, and what the single in-hand pass does not
+/// reach passes through raw as the stream's real continuation (round-18
+/// C3b fail-open window — documented at the `discard` field). The
+/// consumption is IN-HAND ONLY — see the
+/// discard section in `poll_read` for why the inner reader is never
+/// touched (a legal 304 whose Content-Length declared the would-be-200
+/// length is byte-indistinguishable from a lying backend's split junk).
 enum Discard {
     /// `Content-Length: N`, N > 0 — consume N junk bytes. Bytes are
     /// counted, never inspected.
@@ -955,125 +978,107 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
         // it) and the backend DECLARED a body that HTTP forbids the status
         // from carrying — the emission never relayed the framing headers,
         // and the declared body must not be relayed either (model in the
-        // inject branch). Consume exactly the declared framing so the
-        // shared stream lands on the next-response boundary: in-hand bytes
-        // first (the split-off tail from the drain), inner reads only when
-        // they run out. Nothing consumed here is ever served. The section
-        // leaves the injector in one of three states: `complete` (exact
-        // boundary, or an abort — see `abort_after_discard_failure`),
-        // `raw_pass` + buffered leftovers (bytes past the declared
-        // framing — served raw below), or Pending on an inner read.
+        // inject branch). Consume exactly the declared framing from the
+        // bytes already IN HAND (the split-off tail from the drain); the
+        // discard never reads the inner reader (see the section below for
+        // why). The section leaves the injector in one of two states:
+        // `complete` (exact boundary, in-hand bytes spent before the
+        // framing completed, or an abort — see
+        // `abort_after_discard_failure`) or `raw_pass` + buffered
+        // leftovers (bytes past the declared framing — served raw below).
         if this.discard.is_some() {
-            while this.discard.is_some() {
-                // Consume the in-hand buffer. A Length discard drains only
-                // up to its remaining count (bytes past it are leftovers,
-                // not junk); a Chunked discard feeds the WHOLE buffer into
-                // its machine, which keeps what it cannot classify.
-                let mut done = false;
-                if !this.buffer.is_empty() {
-                    match this.discard.as_mut().unwrap() {
-                        Discard::Length { left } => {
-                            let take = (this.buffer.len() as u64).min(*left) as usize;
-                            this.buffer.drain(..take);
-                            *left -= take as u64;
-                            done = *left == 0;
-                        }
-                        Discard::Chunked(skip) => {
-                            // The machine copies everything it cannot
-                            // classify into its own pending buffer, so the
-                            // fed bytes are spent either way — clear them
-                            // here or the same bytes would re-feed forever
-                            // on the next iteration.
-                            match skip.feed(&this.buffer) {
-                                Ok(d) => {
-                                    this.buffer.clear();
-                                    done = d;
-                                }
-                                Err(why) => {
-                                    this.buffer.clear();
-                                    Self::abort_after_discard_failure(this, why);
-                                }
+            // Single pass only: every arm below aborts or completes the
+            // discard, so no iteration is reachable. Consume the in-hand
+            // buffer. A Length discard drains only up to its remaining
+            // count (bytes past it are leftovers, not junk); a Chunked
+            // discard feeds the WHOLE buffer into its machine, which
+            // keeps what it cannot classify. A LEGAL 304 whose
+            // Content-Length declared the would-be-200 length sends no
+            // body, so post-head in-hand bytes behind it are the next
+            // response — the Length arm's first <=left in-hand bytes eat
+            // that coalesced-pipelined shape too (byte-indistinguishable
+            // from junk; deliberate R2 model, same as the not-in-hand
+            // pass-through below).
+            let mut done = false;
+            if !this.buffer.is_empty() {
+                match this.discard.as_mut().unwrap() {
+                    Discard::Length { left } => {
+                        let take = (this.buffer.len() as u64).min(*left) as usize;
+                        this.buffer.drain(..take);
+                        *left -= take as u64;
+                        done = *left == 0;
+                    }
+                    Discard::Chunked(skip) => {
+                        // The machine copies everything it cannot classify
+                        // into its own pending buffer, so the fed bytes
+                        // are spent either way — clear them here or the
+                        // same bytes would re-feed forever.
+                        match skip.feed(&this.buffer) {
+                            Ok(d) => {
+                                this.buffer.clear();
+                                done = d;
+                            }
+                            Err(why) => {
+                                this.buffer.clear();
+                                Self::abort_after_discard_failure(this, why);
                             }
                         }
                     }
                 }
-                if this.discard.is_none() {
-                    // Abort path — the stream ended permanently (clean EOF
-                    // state raised by the abort helper).
-                    break;
+            }
+            if this.discard.is_none() {
+                // Abort path — the stream ended permanently (clean EOF
+                // state raised by the abort helper). Nothing further to
+                // do here: fall through to the EOF gate below.
+            } else if done {
+                // Declared framing fully consumed. Bytes in hand past
+                // the boundary are the stream's real continuation
+                // (Length leftovers stay in `buffer`; the chunked
+                // machine held them in its pending buffer).
+                let finished = this.discard.take().unwrap();
+                if let Discard::Chunked(mut skip) = finished {
+                    this.buffer = std::mem::take(&mut skip.pending);
                 }
-                if done {
-                    // Declared framing fully consumed. Bytes in hand past
-                    // the boundary are the stream's real continuation
-                    // (Length leftovers stay in `buffer`; the chunked
-                    // machine held them in its pending buffer).
-                    let finished = this.discard.take().unwrap();
-                    if let Discard::Chunked(mut skip) = finished {
-                        this.buffer = std::mem::take(&mut skip.pending);
-                    }
-                    this.buffer_offset = 0;
-                    if this.buffer.is_empty() {
-                        // Exact boundary: the shared stream sits on the
-                        // next response. The response (204/304) is fully
-                        // out — clean EOF; `complete` pass-through covers
-                        // whatever the backend sends later.
-                        this.complete = true;
-                    } else {
-                        this.raw_pass = true;
-                    }
-                    break;
+                this.buffer_offset = 0;
+                if this.buffer.is_empty() {
+                    // Exact boundary: the shared stream sits on the next
+                    // response. The response (204/304) is fully out —
+                    // clean EOF; `complete` pass-through covers whatever
+                    // the backend sends later.
+                    this.complete = true;
+                } else {
+                    this.raw_pass = true;
                 }
+            } else {
                 // Not done and the in-hand bytes are spent (a Length
                 // discard drains the buffer to zero when it is not done; a
                 // chunked feed consumed the whole fed buffer into its
-                // machine) — read more junk. Reads are bounded: a Length
-                // discard never over-reads past its remaining count (an
-                // unbounded read would swallow the next response as junk),
-                // and chunked discards read at 4096 (the machine's
-                // size-line and trailer-block rules cap what it holds).
-                debug_assert!(this.buffer.is_empty());
-                if let Some(deadline_sleep) = this.deadline_sleep.as_mut() {
-                    if deadline_sleep.as_mut().poll(cx).is_ready() {
-                        // The A2 deadline bounds the discard too (a lying
-                        // backend trickling junk must not park the bridge
-                        // past it). A fire here ends the stream CLEANLY —
-                        // not with Err(TimedOut): frp-core would answer a
-                        // SECOND gateway head after the 204/304 already
-                        // went out.
-                        Self::abort_after_discard_failure(
-                            this,
-                            "response-head deadline fired while discarding a declared body after a served 204/304 head",
-                        );
-                        break;
-                    }
-                }
-                let cap = match this.discard.as_ref().unwrap() {
-                    Discard::Length { left } => (*left).min(4096) as usize,
-                    Discard::Chunked(_) => 4096,
-                };
-                let mut temp_buf = ReadBuf::new(&mut this.read_buf[..cap]);
-                match Pin::new(&mut this.inner).poll_read(cx, &mut temp_buf) {
-                    Poll::Ready(Ok(())) => {
-                        let n = temp_buf.filled().len();
-                        if n == 0 {
-                            Self::abort_after_discard_failure(
-                                this,
-                                "backend closed before the declared body after a served 204/304 head was consumed",
-                            );
-                            break;
-                        }
-                        this.buffer.extend_from_slice(&this.read_buf[..n]);
-                    }
-                    Poll::Ready(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
-                        Self::abort_after_discard_failure(
-                            this,
-                            "invalid data while discarding a declared body after a served 204/304 head",
-                        );
-                        break;
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
+                // machine). READ NO FURTHER JUNK. From here the stream is
+                // byte-indistinguishable between a LEGAL 304 whose
+                // Content-Length declared the would-be-200 entity length
+                // (RFC 9110 §15.4.5 — the backend never sends a body) and
+                // a lying backend's junk split across writes; whatever
+                // arrives next is the shared stream's real continuation
+                // and must not be consumed as a phantom body (a pipelined
+                // second response would lose its first N bytes, and a
+                // keep-alive legal 304 would park the bridge to the A2
+                // deadline). Go reads nothing only on the chunked /
+                // CL-absent / CL:0 arms (Body = NoBody); a declared
+                // CL:N > 0 arms io.LimitReader(N) and Go READS exactly N
+                // wire bytes (transfer.go:565-578) — a junk-eat for the
+                // hostile shape, a stall for the legal keep-alive 304
+                // (its body never comes), first-N-bytes-eaten for the
+                // pipelined one. No clean Go parity exists for the CL>0
+                // arm; the fail-open below is a deliberate frp-rs
+                // divergence — INSTANT clean completion, no inner read,
+                // no WARN (nothing failed — this is the legal shape as
+                // often as the hostile one). Any partial junk the machine
+                // held is dropped with it; whatever the backend sends
+                // later passes through raw as the stream's real
+                // continuation.
+                this.buffer.clear();
+                this.discard = None;
+                this.complete = true;
             }
             // Discard ended (any state). Serve leftovers in hand now —
             // returning Ready without serving would read as premature EOF
@@ -1089,12 +1094,39 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                 }
                 return Poll::Ready(Ok(()));
             }
-            // Exact-boundary or abort: the 204/304 response is over.
-            // Returning Ready with nothing filled is the clean EOF — the
-            // caller ends the bridge; `complete` pass-through (or the
-            // malformed-raw permanent EOF) covers the rest on later polls
-            // if the caller keeps reading.
-            return Poll::Ready(Ok(()));
+            // Exact-boundary or instant-complete: the 204/304 response is
+            // over and the shared stream sits at its real continuation.
+            // NOT an EOF — a Ready with nothing filled reads as
+            // end-of-stream and the bridge caller ends the connection,
+            // which would kill a legal keep-alive 304 whose
+            // Content-Length declared the would-be-200 entity length
+            // (RFC 9110 §15.4.5 — such a backend sends no body, and its
+            // next bytes ARE the next response; the emission already
+            // stripped the CL, so the user-facing wire expects exactly
+            // that). Round-18 pin: 304 + declared CL + zero in-hand junk
+            // → response 2 must arrive byte-exact, no stall. The
+            // `complete` arm at the top of the next poll passes the
+            // continuation through raw; poll the inner reader HERE so
+            // this poll either serves it or parks on the inner read's
+            // registered waker (a bare return would leave the caller with
+            // no waker). Only the abort path — `malformed_raw`, raised by
+            // `abort_after_discard_failure` — is terminal: permanent EOF,
+            // never pass-through (a discard-grammar failure means the
+            // stream position is unknowable and every later byte would be
+            // served as a phantom second response).
+            if this.malformed_raw {
+                return Poll::Ready(Ok(()));
+            }
+            return match Pin::new(&mut this.inner).poll_read(cx, buf) {
+                Poll::Ready(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    tracing::debug!(
+                        error = %e,
+                        "response injector: mid-body decode failure after 204/304 head served, ending stream"
+                    );
+                    Poll::Ready(Ok(()))
+                }
+                other => other,
+            };
         }
 
         // Buffer empty and the injectable head has not ended yet — gather
@@ -1261,32 +1293,40 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                     }
                     if matches!(status, Some(204) | Some(304)) {
                         // Round-18 C3b: bytes a backend writes after a
-                        // 204/304 head. Go's Transport NEVER reads them —
-                        // readTransfer answers Body = NoBody on these
-                        // statuses for EVERY framing (transfer.go:570-574:
-                        // chunked + !bodyAllowedForStatus → NoBody;
-                        // realLength 0 → NoBody) — the junk stays in the
-                        // pooled conn's buffer and the conn is DISCARDED
-                        // at the next reuse (persistConn drops conns whose
-                        // body was not fully consumed). frp-rs's 204/304
-                        // head is already out, so the stream position is
-                        // what it is; the user-facing wire stays parseable
-                        // by never relaying the junk either. When the
-                        // backend DECLARED a bounded body (Content-Length:
-                        // N > 0, or chunked — the framing survives in the
-                        // head region above even though the emission
+                        // 204/304 head. Go's Transport abandons them per
+                        // framing (transfer.go:565-578: chunked +
+                        // !bodyAllowedForStatus and CL:0/absent → Body =
+                        // NoBody, nothing read, pooled conn closed at the
+                        // next reuse with the junk still buffered; a
+                        // declared CL: N > 0 → Body = LimitReader(N), so
+                        // Go READS exactly N junk bytes before the conn is
+                        // reusable). frp-rs's 204/304 head is already out,
+                        // so the stream position is what it is; the
+                        // user-facing wire stays parseable by never
+                        // relaying the junk either. When the backend
+                        // DECLARED a bounded body (Content-Length: N > 0,
+                        // or chunked — the framing survives in the head
+                        // region above even though the emission
                         // suppressed its header lines), consume exactly
                         // that much so the shared stream lands clean on
                         // whatever follows (a pipelined next response, or
                         // the backend close): the split-off tail is the
-                        // discard input and `discard` arms the consumption
-                        // phase. With no declared framing (absent CL,
-                        // CL: 0, or an unparseable value — no head
-                        // validation is added here, audit carve-out) the
-                        // tail relays raw as before: no body parser runs
-                        // on a no-body status in Go either, and the
-                        // emission's suppressed CL is what keeps the
-                        // user-facing wire parseable.
+                        // discard input and `discard` arms the
+                        // consumption phase. The consumption never reads
+                        // the inner reader (see the discard section): once
+                        // the in-hand bytes are spent the stream is
+                        // byte-indistinguishable between a legal 304 whose
+                        // CL declared the would-be-200 length and a lying
+                        // backend's split junk, and a wire read would eat
+                        // a pipelined next response or park the bridge —
+                        // both mirror Go's abandon-and-close with an
+                        // instant clean completion instead. With no
+                        // declared framing (absent CL, CL: 0, or an
+                        // unparseable value — no head validation is added
+                        // here, audit carve-out) the tail relays raw as
+                        // before: no body parser runs on a no-body status
+                        // in Go either, and the emission's suppressed CL
+                        // is what keeps the user-facing wire parseable.
                         match Self::declared_body_framing(&this.buffer[..blank_start]) {
                             DeclaredFraming::None => {
                                 injected.extend_from_slice(&this.buffer[blank_start..]);
@@ -4010,10 +4050,13 @@ mod tests {
     /// 204 with `Content-Length: 16` goes out without CL — AND (round-18
     /// C3b) the declared body a lying backend wrote after the head is
     /// withheld, never relayed: the backend DECLARED 16 bytes, exactly 16
-    /// junk bytes are consumed (Go's Transport reads NO body on a 204 —
-    /// transfer.go:570-574 — and discards the poisoned conn; frp-rs's head
-    /// is already out, so the discard keeps the shared stream clean
-    /// instead). Byte-exact pin: the stripped head only — junk withheld.
+    /// junk bytes are consumed from the in-hand tail (Go's per-framing
+    /// abandon: chunked-on-204 and CL:0/absent → Body = NoBody, nothing
+    /// read and the pooled conn discarded with the junk buffered
+    /// (transfer.go:570-574); CL: N > 0 → LimitReader reads exactly N —
+    /// this test's shape). frp-rs's head is already out, so the discard
+    /// keeps the shared stream clean instead. Byte-exact pin: the
+    /// stripped head only — junk withheld.
     /// `injector_read_all`'s 7-byte caller chunks push the emission-drain
     /// discard handoff across many polls.
     #[tokio::test]
@@ -4150,11 +4193,13 @@ mod tests {
         );
     }
 
-    /// Round-18 C3b fail-closed arm: the backend declared `Content-Length:
-    /// 16` but closed after 8 junk bytes — the discard cannot complete,
-    /// and the stream must end cleanly at the stripped head (no junk
-    /// relayed, no second gateway head; the rate-limited WARN fires
-    /// instead — Go's Transport would discard the poisoned pooled conn).
+    /// Round-18 C3b: the backend declared `Content-Length: 16` but only 8
+    /// junk bytes were in hand before the stream ended — the discard eats
+    /// the 8 in-hand junk bytes, hits the spent-in-hand state, and ends
+    /// cleanly at the stripped head (no junk relayed, no second gateway
+    /// head, no deadline park, no WARN — nothing after the in-hand bytes
+    /// is ever read or classified; Go's Transport, reading exactly N on a
+    /// declared CL, would sit on the short read until the conn closes).
     #[tokio::test]
     async fn injector_204_truncated_declared_body_ends_stream() {
         use tokio::io::AsyncWriteExt;
@@ -4177,6 +4222,64 @@ mod tests {
             &out[..],
             &b"HTTP/1.1 204 No Content\r\n\r\n"[..],
             "truncated declared junk must end the stream cleanly at the stripped head"
+        );
+    }
+
+    /// R2 (independent PR review) pin: a LEGAL 304 whose Content-Length
+    /// declared the would-be-200 entity length (RFC 9110 §15.4.5 — the
+    /// backend never sends the body) must not arm a wire-reading discard.
+    /// Pre-fix the Length arm parked the bridge until the A2 deadline
+    /// fired (false WARN, a long stall on legal keep-alive traffic) and,
+    /// when a second response arrived on the keep-alive connection, ate
+    /// the first 16 bytes of ITS head as phantom "junk". The discard is
+    /// in-hand only: the stripped head is served, the stream completes
+    /// instantly, and a response written later arrives byte-exact. A
+    /// 200 ms response-head deadline is armed to prove no poll waits on
+    /// it — every read here completes immediately, so a stall would fail
+    /// the test outright.
+    #[tokio::test]
+    async fn injector_304_legal_content_length_junk_absent_no_eat_no_stall() {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector = ResponseHeaderInjector::<tokio::io::DuplexStream>::new(
+            inner_r,
+            Default::default(),
+            Some(std::time::Duration::from_millis(200)),
+        );
+
+        inner_w
+            .write_all(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 16\r\nETag: \"v1\"\r\n\r\n")
+            .await
+            .expect("write 304 head");
+
+        let mut head = [0u8; 256];
+        let n = injector.read(&mut head).await.expect("read 304 head");
+        assert_eq!(
+            &head[..n],
+            &b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\n\r\n"[..],
+            "the 304 head must be served promptly, stripped of Content-Length — never \
+             parked on a phantom 16-byte junk body"
+        );
+
+        // The keep-alive backend later answers the connection's next
+        // request. Its bytes must not be consumed as the 304's phantom
+        // body: pre-fix the Length discard ate the first 16 bytes of this
+        // very head (or stalled to the deadline first and aborted).
+        let next = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone";
+        inner_w.write_all(next).await.expect("write next response");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        let mut rest = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut injector, &mut rest)
+            .await
+            .expect("read next response");
+        assert_eq!(
+            &rest[..],
+            &next[..],
+            "the keep-alive next response must arrive byte-exact — the discard must not \
+             eat its first bytes and must not stall on the response-head deadline"
         );
     }
 

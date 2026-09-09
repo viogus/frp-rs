@@ -1570,28 +1570,35 @@ fn walk_leg_head(headers: &str) -> Result<LegHeadWalk, &'static str> {
     let mut saw_record = false;
     for line in headers.lines().skip(1) {
         // The head terminator never produces a record (it is the empty
-        // line the read loop stopped at); space-only lines inside the
-        // block are Go-trimmed to nothing and never start a record.
+        // line the read loop stopped at). A space-only line is NOT a
+        // terminator — it is an obs-fold continuation of the open record
+        // and joins it below; only a zero-length line ends the block.
         if line.is_empty() {
             continue;
         }
         if line.starts_with([' ', '\t']) {
-            // readContinuedLineSlice continuation of the current record:
-            // leading WS removed, trailing WS elided, joined with one
-            // space. A fold before any record is the readMIMEHeader
+            // readContinuedLineSlice continuation of the current record.
+            // A fold before any record is the readMIMEHeader
             // initial-line error.
             if !saw_record {
                 return Err("malformed MIME header initial line");
             }
             if let Some(v) = cur_value.as_mut() {
+                // Go joins each continuation with an UNCONDITIONAL ' '
+                // appended before the trimmed piece — even when the fold
+                // line is all whitespace and trims to "" (reader.go:
+                // "r.buf = append(r.buf, ' ')" then trim(line)). The
+                // first physical line's trailing WS is trimmed, but
+                // fold-created trailing WS is not: ReadMIMEHeader stores
+                // TrimLeft(v), never a right trim — so "Host: b" + " "
+                // folds to stored "b ", which httpguts ValidHostHeader
+                // rejects (conn: 149B "malformed Host header").
                 let piece = line.trim_matches([' ', '\t']);
-                if !piece.is_empty() {
-                    if value_has_ctl(piece) {
-                        return Err("malformed MIME header: CTL byte in folded value");
-                    }
-                    v.push(' ');
-                    v.push_str(piece);
+                if value_has_ctl(piece) {
+                    return Err("malformed MIME header: CTL byte in folded value");
                 }
+                v.push(' ');
+                v.push_str(piece);
             }
             continue;
         }
@@ -3530,10 +3537,28 @@ mod tests {
         let w = walk_leg_head("GET / HTTP/1.1\r\nHost : h\r\n\r\n").unwrap();
         assert_eq!(w.host_groups, 0, "'Host ' never canonicalizes to Host");
         assert!(w.name_has_space);
-        // A space-only line between records is trimmed away, never a
-        // record nor an error.
+        // A space-only line between records is an obs-fold continuation
+        // of the OPEN record — it never starts a record, and it joins
+        // with a ' ' that survives (reader.go appends the join space
+        // before trimming the piece): Host "h" + " \t " folds to stored
+        // "h ", which the consumer's ValidHostHeader gate rejects (the
+        // 149B malformed-Host render). The round-17 code skipped
+        // empty-piece folds and stored "h" (served/forwarded).
         let w = walk_leg_head("GET / HTTP/1.1\r\nHost: h\r\n \t \r\nX-A: b\r\n\r\n").unwrap();
         assert_eq!(w.header_groups, 2);
+        assert_eq!(
+            w.host_value.as_deref(),
+            Some("h "),
+            "all-WS fold appends the join space, got: {w:?}"
+        );
+        // PR-review R1 pin: "Host: b" + a single all-whitespace fold
+        // (" ") — stored "b " (space join unconditional, not "b").
+        let w = walk_leg_head("GET / HTTP/1.1\r\nHost: b\r\n \r\n\r\n").unwrap();
+        assert_eq!(
+            w.host_value.as_deref(),
+            Some("b "),
+            "single-space fold appends the join space, got: {w:?}"
+        );
         // Read-time error classes (each answers the generic 400 e2e).
         assert!(
             walk_leg_head("GET / HTTP/1.1\r\n Bad\r\n\r\n").is_err(),
