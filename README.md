@@ -234,6 +234,7 @@ password = ""
 [transport]
 tcp_mux = true
 tcp_mux_keepalive_interval = 30
+tcp_mux_keepalive_timeout = 0
 ```
 
 | Field | Default | Description |
@@ -273,6 +274,7 @@ tcp_mux_keepalive_interval = 30
 | `web_server.assets_dir` | `""` | Custom dashboard `index.html` directory (read once at startup; empty = built-in page) |
 | `transport.tcp_mux` | `true` | Enable TCP multiplexing |
 | `transport.tcp_mux_keepalive_interval` | `30` | Keepalive interval (seconds) for mux |
+| `transport.tcp_mux_keepalive_timeout` | `0` | Dead-session reaper silence bound (seconds): `0` = auto, `>0` = explicit (floored 30s), `<0` = disable |
 | `transport.heartbeat_timeout` | `-1` | Heartbeat timeout in seconds; `-1` disables it under tcp_mux (Go v0.71.0 default) |
 | `allow_port_start` | `1` | Start of auto-assigned port range |
 | `allow_port_end` | `65535` | End of auto-assigned port range |
@@ -324,6 +326,7 @@ use_compression = false
 | `login_fail_exit` | `true` | Exit on login failure; false to keep retrying |
 | `pool_count` | `1` | Number of pre-established work connections (pooled on the server) |
 | `tcp_mux` | `true` | Enable TCP multiplexing |
+| `tcp_mux_keepalive_timeout` | `0` | Dead-session reaper silence bound (seconds): `0` = auto, `>0` = explicit (floored 30s), `<0` = disable |
 | `web_server.addr` | `"127.0.0.1"` | Admin API bind address |
 | `web_server.port` | `0` | Admin API port (0 = disabled) |
 | `web_server.user` | `""` | Admin API Basic Auth username |

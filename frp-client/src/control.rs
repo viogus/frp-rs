@@ -51,10 +51,12 @@ fn propose_mux_for_transport(tcp_mux: bool, protocol: &TransportProtocol) -> boo
 pub(crate) async fn wrap_client_mux(
     raw_stream: IoStream,
     keepalive_interval: i64,
+    idle_dead_timeout: i64,
 ) -> Result<(IoStream, Option<YamuxSession>), frp_core::Error> {
     let mux_cfg = mux::TcpMuxConfig {
         keepalive_interval: Duration::from_secs(keepalive_interval.max(1) as u64),
         max_stream_window_size: 6 * 1024 * 1024,
+        idle_dead_timeout: mux::idle_dead_timeout_from_secs(idle_dead_timeout),
     };
     // Go frp v0.70.1 wraps every non-QUIC transport in yamux; QUIC never
     // gets wrapped (the QUIC connection itself multiplexes streams).
@@ -90,6 +92,7 @@ pub struct ControlConnection {
     disable_custom_tls_first_byte: bool,
     keepalive_secs: u64,
     tcp_mux_keepalive_interval: i64,
+    tcp_mux_keepalive_timeout: i64,
     bind_addr: Option<String>,
     v2: bool,
     /// SO_SNDBUF (0 = OS default). frp-rs extension.
@@ -134,6 +137,7 @@ impl ControlConnection {
         disable_custom_tls_first_byte: bool,
         keepalive_secs: u64,
         tcp_mux_keepalive_interval: i64,
+        tcp_mux_keepalive_timeout: i64,
         bind_addr: Option<String>,
         v2: bool,
         tcp_send_buffer_size: u32,
@@ -166,6 +170,7 @@ impl ControlConnection {
             disable_custom_tls_first_byte,
             keepalive_secs,
             tcp_mux_keepalive_interval,
+            tcp_mux_keepalive_timeout,
             bind_addr,
             v2,
             tcp_send_buffer_size,
@@ -247,8 +252,12 @@ impl ControlConnection {
                 // The server wraps its side on accept, so the client must wrap
                 // before sending ClientHello.
                 if propose_mux {
-                    let (io_stream, session) =
-                        wrap_client_mux(raw_stream, self.tcp_mux_keepalive_interval).await?;
+                    let (io_stream, session) = wrap_client_mux(
+                        raw_stream,
+                        self.tcp_mux_keepalive_interval,
+                        self.tcp_mux_keepalive_timeout,
+                    )
+                    .await?;
                     (io_stream, session, None)
                 } else {
                     // No yamux: raw stream directly (V2 handshake happens below).
@@ -264,8 +273,12 @@ impl ControlConnection {
             // The server wraps its side on accept, so the client must wrap
             // before sending ClientHello.
             if propose_mux {
-                let (io_stream, session) =
-                    wrap_client_mux(raw_stream, self.tcp_mux_keepalive_interval).await?;
+                let (io_stream, session) = wrap_client_mux(
+                    raw_stream,
+                    self.tcp_mux_keepalive_interval,
+                    self.tcp_mux_keepalive_timeout,
+                )
+                .await?;
                 (io_stream, session)
             } else {
                 // No yamux: raw stream directly (V2 handshake happens below).

@@ -14,6 +14,7 @@ token = ""                       # Must match server's token
 user = ""                        # Multi-tenant user identity
 protocol = "tcp"                 # tcp, websocket/ws, wss (maps to transport_protocol)
 tcp_mux = true
+tcp_mux_keepalive_timeout = 0    # 0 = auto; >0 = explicit seconds; <0 = disable dead-session reaper
 login_fail_exit = false          # true = exit on login failure; false = keep retrying
 pool_count = 1                   # Pre-established work connections
 

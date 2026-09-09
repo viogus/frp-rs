@@ -339,6 +339,7 @@ impl Service {
                 oidc_client: self.oidc_client.clone(),
                 tcp_mux: current_cfg.tcp_mux,
                 tcp_mux_keepalive_interval: current_cfg.tcp_mux_keepalive_interval,
+                tcp_mux_keepalive_timeout: current_cfg.tcp_mux_keepalive_timeout,
                 proxy_url: opt_if_empty!(current_cfg.proxy_url.clone()),
                 dns_server: opt_if_empty!(current_cfg.dns_server.clone()),
                 dial_timeout_secs: current_cfg.dial_server_timeout.max(1) as u64,

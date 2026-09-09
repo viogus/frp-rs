@@ -699,6 +699,7 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
             &[
                 "tcp_mux",
                 "tcp_mux_keepalive_interval",
+                "tcp_mux_keepalive_timeout",
                 "heartbeat_timeout",
                 "max_pool_count",
             ],
@@ -849,6 +850,7 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
             const RENAMES: &[(&str, &str)] = &[
                 ("tcpMux", "tcp_mux"),
                 ("tcpMuxKeepaliveInterval", "tcp_mux_keepalive_interval"),
+                ("tcpMuxKeepaliveTimeout", "tcp_mux_keepalive_timeout"),
                 ("heartbeatTimeout", "heartbeat_timeout"),
                 ("maxPoolCount", "max_pool_count"),
                 ("tcpKeepalive", "tcp_keepalive"),

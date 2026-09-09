@@ -1530,6 +1530,78 @@ tcpMuxKeepaliveInterval = 45
 }
 
 #[test]
+fn test_tcp_mux_keepalive_timeout_defaults_to_zero() {
+    // 0 = auto (default): omitted on both sides resolves to 0, and 0 must
+    // NOT be normalized away to 30 like the keepalive interval is.
+    let server = load_server_config_from_str("bindPort = 7000").unwrap();
+    assert_eq!(server.transport.tcp_mux_keepalive_timeout, 0);
+    let client = load_client_config_from_str("serverAddr = '127.0.0.1'").unwrap();
+    assert_eq!(client.tcp_mux_keepalive_timeout, 0);
+}
+
+#[test]
+fn test_tcp_mux_keepalive_timeout_positive_negative_zero_parse() {
+    // Positive: explicit bound, preserved as-is (no floor here — the floor
+    // is applied at the mux layer via idle_dead_bound).
+    let positive = load_server_config_from_str(
+        r#"
+bindPort = 7000
+[transport]
+tcpMuxKeepaliveTimeout = 3600
+"#,
+    )
+    .unwrap();
+    assert_eq!(positive.transport.tcp_mux_keepalive_timeout, 3600);
+
+    // Negative: disable the reaper.
+    let negative = load_server_config_from_str(
+        r#"
+bindPort = 7000
+[transport]
+tcpMuxKeepaliveTimeout = -1
+"#,
+    )
+    .unwrap();
+    assert_eq!(negative.transport.tcp_mux_keepalive_timeout, -1);
+
+    // Zero: auto (explicit 0 stays 0 — no EmptyOr normalization).
+    let zero = load_server_config_from_str(
+        r#"
+bindPort = 7000
+[transport]
+tcpMuxKeepaliveTimeout = 0
+"#,
+    )
+    .unwrap();
+    assert_eq!(zero.transport.tcp_mux_keepalive_timeout, 0);
+}
+
+#[test]
+fn test_tcp_mux_keepalive_timeout_camel_case_alias_maps() {
+    // camelCase `tcpMuxKeepaliveTimeout` must map to the snake_case field
+    // on both server and client.
+    let server = load_server_config_from_str(
+        r#"
+bindPort = 7000
+[transport]
+tcpMuxKeepaliveTimeout = 120
+"#,
+    )
+    .unwrap();
+    assert_eq!(server.transport.tcp_mux_keepalive_timeout, 120);
+
+    let client = load_client_config_from_str(
+        r#"
+serverAddr = "127.0.0.1"
+[transport]
+tcpMuxKeepaliveTimeout = 120
+"#,
+    )
+    .unwrap();
+    assert_eq!(client.tcp_mux_keepalive_timeout, 120);
+}
+
+#[test]
 fn test_explicit_server_heartbeat_timeout_90_is_preserved_with_tcp_mux() {
     let cfg = load_server_config_from_str(
         r#"

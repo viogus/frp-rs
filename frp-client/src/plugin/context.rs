@@ -16,6 +16,7 @@ pub struct PluginContext {
     // Transport options matching DialOptions / Go frp connector.
     pub tcp_mux: bool,
     pub tcp_mux_keepalive_interval: i64,
+    pub tcp_mux_keepalive_timeout: i64,
     pub proxy_url: Option<String>,
     pub dns_server: Option<String>,
     pub dial_timeout_secs: u64,
