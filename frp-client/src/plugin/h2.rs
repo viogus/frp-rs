@@ -143,6 +143,12 @@ async fn handle_stream(
     backend: Backend,
     real_peer: std::net::IpAddr,
 ) -> Result<(), h2::Error> {
+    // Captured before the body is consumed: a HEAD response never carries a
+    // DATA body (RFC 9113 §8.1), and the no-body statuses 204/304 never do
+    // either — `stream_h2_response` ends those streams at the response head
+    // instead of running a body leg against bytes that can never come
+    // (round-18 FIX 1, mirroring the server twin vhost_h2c's `is_head`).
+    let is_head = request.method() == http::Method::HEAD;
     let has_content_length = request.headers().contains_key("content-length");
     // Declared Content-Length for the request body. The h2 crate validates
     // content-length per RFC 7540 §8.1.2.6 before delivering the request, so
@@ -231,7 +237,7 @@ async fn handle_stream(
     // response is fully relayed the body forwarder has served its purpose —
     // stop it so the h2 stream can wind down even if the client is still
     // trickling request bytes (same as vhost_h2c).
-    let result = stream_h2_response(&mut remote_r, respond).await;
+    let result = stream_h2_response(&mut remote_r, respond, is_head).await;
     body_task.abort();
     result
 }
@@ -398,16 +404,24 @@ fn build_http1_request_head<B>(
         head.extend_from_slice(b"\r\n");
     }
     // Append the real tunnel peer to the client's X-Forwarded-For chain (Go
-    // SetXForwarded: `strings.Join(prior, ", ") + ", " + clientIP`). Skipped
-    // when a configured x-forwarded-for replaced the chain above.
+    // SetXForwarded: `strings.Join(prior, ", ") + ", " + clientIP`, the
+    // prior chain being the SLICE of inbound row values). Skipped when a
+    // configured x-forwarded-for replaced the chain above.
+    //
+    // The presence test is on the ROW LIST, not on the joined string
+    // (round-18 FIX 4): an EMPTY-value inbound row is a real (empty) chain
+    // element — `strings.Join(["", peer], ", ")` is ", <peer>" with the
+    // leading comma — while only the NO-row case (nil slice) emits the bare
+    // peer. The old `xff.is_empty()` string check conflated the two and
+    // dropped the row; same semantics as the h1 twin
+    // (plugin/mod.rs `l3_empty_xff_row_kept_in_chain`) and the vhost.rs
+    // round-13 empty-XFF pin.
     if !configured_xff {
         let mut xff = client_xff.join(", ");
-        if xff.is_empty() {
-            xff = real_peer.to_string();
-        } else {
+        if !client_xff.is_empty() {
             xff.push_str(", ");
-            xff.push_str(&real_peer.to_string());
         }
+        xff.push_str(&real_peer.to_string());
         head.extend_from_slice(b"X-Forwarded-For: ");
         head.extend_from_slice(xff.as_bytes());
         head.extend_from_slice(b"\r\n");
@@ -517,6 +531,12 @@ struct ParsedHead {
     /// (TrimLeft storage) — re-parsing the raw row would reject the legal
     /// padded form "5 " that this value was trimmed from.
     content_length: Option<u64>,
+    /// Go `parseTransferEncoding` verdict (net/http/transfer.go): true only
+    /// for EXACTLY one Transfer-Encoding row whose trimmed value
+    /// EqualFolds "chunked". Carried out of the head parse so the body leg
+    /// never re-derives the framing from the raw row (round-18 FIX 2) — a
+    /// head whose TE shape Go refuses never reaches the body leg at all.
+    chunked: bool,
     /// Offset into the original head buffer where the body begins.
     body_offset: usize,
 }
@@ -697,8 +717,18 @@ fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
     // `ParsedHead` so the body leg consumes what was TrimString'ed here.
     let mut content_length: Option<u64> = None;
     if let Some(idx) = cl_row {
-        let value = trim_ascii_ws(headers[idx].1.as_bytes());
-        let parsed = std::str::from_utf8(value).ok().and_then(|s| {
+        // h2 value hygiene (round-18 follow-up, mirroring the server twin
+        // vhost_h2c.rs): the stored row KEEPS its trailing SP/HTAB (TrimLeft
+        // storage; an all-whitespace obs-fold appends a bare ' ', so
+        // "Content-Length: 5\r\n \r\n" stores "5 "), and a field value with
+        // leading/trailing whitespace must not reach the h2 HEADERS frame
+        // (RFC 9113 §8.2.1) — the h2 client resets the stream with
+        // PROTOCOL_ERROR at the head, so the body leg below never runs.
+        // Normalize the row to exactly the bytes this gate validated, at the
+        // one place that both trims the value and knows the row is a
+        // Content-Length; the parsed count still rides out on `ParsedHead`.
+        let value = trim_ascii_ws(headers[idx].1.as_bytes()).to_vec();
+        let parsed = std::str::from_utf8(&value).ok().and_then(|s| {
             if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
                 s.parse::<i64>().ok()
             } else {
@@ -708,12 +738,36 @@ fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
         let Some(n) = parsed else {
             return None; // parseContentLength failure (Go ParseUint bitSize 63)
         };
+        headers[idx].1 = http::HeaderValue::from_bytes(&value).ok()?;
         content_length = Some(n as u64);
+    }
+    // Go parseTransferEncoding parity (net/http/transfer.go, round-18 FIX
+    // 2): a missing row is not chunked; EXACTLY one row whose trimmed value
+    // EqualFolds "chunked" wins chunked framing; ANY other shape — a
+    // different coding ("gzip"), a list ("chunked, gzip"), or two rows —
+    // fails readTransfer, so the WHOLE head is malformed (the caller's 502)
+    // rather than a body Go refuses being chunk-decoded or read to EOF. The
+    // Content-Length gates above run FIRST for the same reason Go validates
+    // CL before the TE framing decision (a garbage CL under chunked still
+    // fails the head — round-8 F9 for the request faces).
+    let mut chunked = false;
+    let mut te_rows = headers
+        .iter()
+        .filter(|(n, _)| n.as_str().eq_ignore_ascii_case("transfer-encoding"));
+    if let Some((_, value)) = te_rows.next() {
+        if te_rows.next().is_none()
+            && trim_ascii_ws(value.as_bytes()).eq_ignore_ascii_case(b"chunked")
+        {
+            chunked = true;
+        } else {
+            return None; // unsupported / duplicated Transfer-Encoding
+        }
     }
     Some(ParsedHead {
         status,
         headers,
         content_length,
+        chunked,
         body_offset: head_end,
     })
 }
@@ -759,6 +813,11 @@ fn value_bytes_have_ctl(b: &[u8]) -> bool {
     b.iter().any(|&c| (c < 0x20 && c != b'\t') || c == 0x7f)
 }
 
+/// First row matching `name` (case-insensitive). The production paths carry
+/// the values they need out of [`parse_response_head`] (Content-Length,
+/// `chunked`) instead of re-reading the rows, so this helper serves the
+/// head-parse tests only.
+#[cfg(test)]
 fn header_value<'a>(
     headers: &'a [(http::HeaderName, http::HeaderValue)],
     name: &str,
@@ -933,7 +992,7 @@ async fn stream_chunked_body(
     loop {
         let line = match reader.read_line().await {
             Ok(l) => l,
-            Err(_) => return abort_stream(send),
+            Err(_) => return abort_stream(send).await,
         };
         let mut line = line.as_slice();
         if line.ends_with(b"\r\n") {
@@ -949,7 +1008,7 @@ async fn stream_chunked_body(
         let size_part = line.split(|&b| b == b';').next().unwrap_or(line);
         let size = match parse_hex(trim_ascii_ws(size_part)) {
             Ok(s) => s,
-            Err(_) => return abort_stream(send),
+            Err(_) => return abort_stream(send).await,
         };
         if size == 0 {
             // Trailing headers until the final blank line (RFC 7230 §4.1.2).
@@ -959,7 +1018,7 @@ async fn stream_chunked_body(
                 match reader.read_line().await {
                     Ok(t) if !is_blank_line(&t) => continue,
                     Ok(_) => return Ok(false),
-                    Err(_) => return abort_stream(send),
+                    Err(_) => return abort_stream(send).await,
                 }
             }
         }
@@ -974,13 +1033,13 @@ async fn stream_chunked_body(
             let n = remaining.min(MAX_CHUNK_SIZE);
             let data = match reader.read_exact(n).await {
                 Ok(d) => d,
-                Err(_) => return abort_stream(send), // chunk cut short
+                Err(_) => return abort_stream(send).await, // chunk cut short
             };
             send.send_data(Bytes::from(data), false)?;
             remaining -= n;
         }
         if reader.read_exact(2).await.is_err() {
-            return abort_stream(send); // missing trailing CRLF
+            return abort_stream(send).await; // missing trailing CRLF
         }
     }
 }
@@ -994,7 +1053,19 @@ async fn stream_chunked_body(
 /// visible to the client as a stream error instead of a clean END_STREAM
 /// that reads like a complete response. Returns the `Ok(true)` marker so
 /// it can plug into the body-stream callers' error positions.
-fn abort_stream(send: &mut SendStream<Bytes>) -> Result<bool, h2::Error> {
+///
+/// The response head must be on the wire BEFORE the reset: h2's `send_reset`
+/// drops every frame still queued on the stream
+/// (proto/streams/send.rs `clear_queue`, and the server side of a stream is
+/// never `is_pending_open`), so a reset issued in the same poll as
+/// `send_response` would make RST_STREAM the client's FIRST frame — the
+/// already-valid response head (status included) is lost and the h2 client
+/// errors on the response future instead of yielding the head and failing
+/// only the body. Go writes the HEADERS first and resets after the
+/// handler-panic (h2_bundle.go handlerPanicRST), so yield once to let the
+/// connection task flush the queued HEADERS before queueing the reset.
+async fn abort_stream(send: &mut SendStream<Bytes>) -> Result<bool, h2::Error> {
+    tokio::task::yield_now().await;
     send.send_reset(h2::Reason::INTERNAL_ERROR);
     Ok(true)
 }
@@ -1006,6 +1077,7 @@ fn abort_stream(send: &mut SendStream<Bytes>) -> Result<bool, h2::Error> {
 async fn stream_h2_response<R: AsyncRead + Unpin>(
     r: &mut R,
     mut respond: SendResponse<Bytes>,
+    is_head: bool,
 ) -> Result<(), h2::Error> {
     // Interim 1xx heads (100 Continue / 102 / 103) are swallowed and the
     // read continues to the FINAL head — Go's Transport readResponse loop
@@ -1106,6 +1178,7 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
         status,
         headers,
         content_length,
+        chunked,
         body_offset,
     } = parsed;
 
@@ -1131,14 +1204,41 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
         resp.headers_mut().append(n.clone(), v.clone());
     }
 
-    let chunked = header_value(&headers, "transfer-encoding")
-        .map(|v| {
-            v.to_str()
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .contains("chunked")
-        })
-        .unwrap_or(false);
+    // Round-18 FIX 1: responses to HEAD requests and the no-body statuses
+    // 204/304 never carry a DATA body — Go's net/http suppress gate is
+    // server.go:1513 (`req.Method == "HEAD" || !bodyAllowedForStatus(code)`
+    // || code == StatusNoContent) with `bodyAllowedForStatus`
+    // (transfer.go:459-461) false for 204/304/1xx, and `fixLength` returns 0
+    // for those shapes (transfer.go:250-252, 700-703). The h2 relay must
+    // therefore end the stream with the response head: the body legs below
+    // would otherwise wait on a backend that DECLARES a body length (or
+    // holds the connection open with no framing at all) and never sends
+    // bytes that, for these responses, can never come — the pre-fix hang,
+    // and behind it the round-18 M3 CL-arm RST on the backend's clean EOF
+    // (a truthful HEAD Content-Length read as a truncated body).
+    //
+    // Content-Length is stripped for 204/304 (mirror of the server twin
+    // vhost_h2c and of the h1 net/http write layer: suppressedHeadersNoBody
+    // = {Content-Length, TE} for 204, suppressedHeaders304 = {Content-Type,
+    // Content-Length, TE} for 304 — go1.25 server.go:1483-1497); a HEAD
+    // answer to a body-bearing status KEEPS it (it truthfully describes the
+    // GET the client would receive — RFC 9110 §8.6).
+    if is_head || status == 204 || status == 304 {
+        if status == 204 || status == 304 {
+            resp.headers_mut().remove("content-length");
+        }
+        respond.send_response(resp, true)?;
+        return Ok(());
+    }
+    // A chunked response must not forward the backend's Content-Length row
+    // (RFC 9113 §8.1.1: a declared length need not equal the decoded DATA
+    // length, and an h2 peer may fail the stream on the mismatch) — Go
+    // deletes it once Transfer-Encoding: chunked wins the framing
+    // (net/http/transfer.go). Round-18 FIX 3; the row is still validated
+    // above (a garbage value under chunked fails the whole head).
+    if chunked {
+        resp.headers_mut().remove("content-length");
+    }
 
     let mut send = respond.send_response(resp, false)?;
     let mut reader = BodyReader::new(r, head[body_offset..].to_vec());
@@ -1165,7 +1265,7 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
                         "https plugin backend truncated a Content-Length-bounded body, \
                          resetting the stream"
                     );
-                    return abort_stream(&mut send).map(|_| ());
+                    return abort_stream(&mut send).await.map(|_| ());
                 }
             };
             remaining -= data.len() as u64;
@@ -1182,7 +1282,7 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
                     Ok(false) => break,
                     Err(_) => {
                         debug!("https plugin backend body read error, resetting the stream");
-                        return abort_stream(&mut send).map(|_| ());
+                        return abort_stream(&mut send).await.map(|_| ());
                     }
                 }
             }
@@ -1393,6 +1493,30 @@ mod tests {
             !head.contains("198.51.100.23"),
             "peer must not leak: {head}"
         );
+    }
+
+    /// Round-18 FIX 4 pin (mirror of the h1 twin's
+    /// `l3_empty_xff_row_kept_in_chain` and the vhost.rs round-13 empty-XFF
+    /// pin): an EMPTY-value X-Forwarded-For row is a real chain element —
+    /// Go `strings.Join(prior, ", ")` keeps empty elements, so a sole empty
+    /// row emits ", {peer}" with the leading comma. Only the NO-row case
+    /// emits the bare peer (`h2_head_appends_real_peer_when_no_client_xff`
+    /// above). RED pre-fix: the `xff.is_empty()` STRING check conflated the
+    /// two and dropped the row.
+    #[test]
+    fn h2_head_empty_client_xff_row_kept_in_chain() {
+        let head = head_lines(&build_http1_request_head(
+            &build_req(Some(&[""])),
+            "",
+            &HashMap::new(),
+            real_ip(),
+            true,
+        ));
+        assert!(
+            head.contains("X-Forwarded-For: , 198.51.100.23\r\n"),
+            "an empty inbound XFF row must contribute an empty chain element, head:\n{head}"
+        );
+        assert_eq!(head.matches("X-Forwarded-For").count(), 1);
     }
 
     /// Audit round-7 S1 pin (mirrors the frp-server vhost_h2c
@@ -1627,6 +1751,19 @@ mod tests {
                 "carried Content-Length wrong for {:?}",
                 String::from_utf8_lossy(head)
             );
+            // The stored row must ALSO reach the h2 head trimmed (h2 value
+            // hygiene, RFC 9113 §8.2.1): a verbatim "5 " is rejected by the
+            // h2 client with PROTOCOL_ERROR at the head, so the body leg
+            // never runs.
+            if let Some(v) = header_value(&parsed.headers, "content-length") {
+                let bytes = v.as_bytes();
+                assert!(
+                    !matches!(bytes.first(), Some(b' ' | b'\t'))
+                        && !matches!(bytes.last(), Some(b' ' | b'\t')),
+                    "padded Content-Length row must be normalized: {:?}",
+                    String::from_utf8_lossy(head)
+                );
+            }
         }
         // parseContentLength failures: empty (both spellings), non-digit,
         // sign-prefixed (the digit gate rejects "+5" the way Go's ParseUint
@@ -1650,6 +1787,67 @@ mod tests {
         let head = b"HTTP/1.1 200 OK\r\nContent-Length: 9223372036854775807\r\n\r\n";
         let parsed = parse_response_head(head).expect("2^63-1 is legal");
         assert_eq!(parsed.content_length, Some(i64::MAX as u64));
+    }
+
+    // --- Round-18 FIX 2: Transfer-Encoding resolution is Go
+    // parseTransferEncoding (net/http/transfer.go): no row → not chunked;
+    // EXACTLY one row whose trimmed value EqualFolds "chunked" → chunked;
+    // anything else ("gzip", a list, two rows) fails readTransfer → the
+    // WHOLE head is malformed (the caller's 502). RED pre-fix: the
+    // `contains("chunked")` scan chunk-decoded "chunked, gzip" and read
+    // every other shape to EOF, forwarding bodies Go refuses.
+    #[test]
+    fn parse_response_head_transfer_encoding_go_strictness() {
+        // Chunked spellings Go accepts: one row, EqualFold, padded value
+        // legal (textproto TrimString storage).
+        for ok in [
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding:  chunked \r\n\r\n"[..],
+        ] {
+            let parsed = parse_response_head(ok).expect("Go-legal chunked row parses");
+            assert!(
+                parsed.chunked,
+                "single EqualFold chunked row must enable chunked framing: {:?}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        // No TE row at all → not chunked (the CL/EOF framings stay).
+        let parsed = parse_response_head(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .expect("head without TE parses");
+        assert!(!parsed.chunked);
+        // Shapes Go's parseTransferEncoding refuses → whole-head failure.
+        for bad in [
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n"[..], // other coding
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"[..], // list
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"[..], // list
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n"[..], // two rows
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: \r\n\r\n"[..], // empty value
+        ] {
+            assert!(
+                parse_response_head(bad).is_none(),
+                "unsupported Transfer-Encoding must fail the whole head: {:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // A garbage Content-Length under chunked still fails the head: the
+        // CL gates run BEFORE the framing decision, like Go's readTransfer
+        // (round-8 F9 semantics on the response face too).
+        assert!(
+            parse_response_head(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5x\r\n\r\n"
+            )
+            .is_none(),
+            "garbage Content-Length must fail the head even under chunked"
+        );
+        // A VALID Content-Length under chunked parses (Go deletes the row
+        // with the chunked framing — the wire-side strip is pinned by the
+        // e2e below).
+        let parsed = parse_response_head(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
+        )
+        .expect("valid CL under chunked parses");
+        assert!(parsed.chunked);
     }
 
     // --- Audit FIX 2: interim 1xx heads are swallowed, the FINAL head is
@@ -1688,6 +1886,43 @@ mod tests {
         addr
     }
 
+    /// Scripted backend that reads the forwarded request head, writes
+    /// `head` and then HOLDS the connection open. The FIX 1 pins need a
+    /// backend that never sends the body it declared (and never EOFs): the
+    /// pre-fix body leg parks on it forever and only the plugin's 10 s drain
+    /// deadline turns the regression into a failure — with a clean-EOF
+    /// backend the CL arm would instead RST (round-18 M3), a different
+    /// failure mode than the hang these pins target.
+    fn spawn_held_open_backend(listener: TcpListener, head: &'static [u8]) -> std::net::SocketAddr {
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut conn, _) = match listener.accept().await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf).await;
+            if conn.write_all(head).await.is_err() {
+                return;
+            }
+            // Hold the conn open: the body the response declared can never
+            // come. Dropped when the test runtime shuts down.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        addr
+    }
+
+    /// Bind an ephemeral listener, or report the sandbox and skip.
+    async fn bind_or_skip() -> Option<TcpListener> {
+        match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+                None
+            }
+        }
+    }
+
     /// One request/response round through the real h2 plugin chain. Returns
     /// (status, body bytes) and asserts the body stream ended CLEAN — a
     /// backend-body truncation is exactly what the round-18 M3 pins must
@@ -1708,6 +1943,20 @@ mod tests {
         backend_addr: std::net::SocketAddr,
     ) -> (http::StatusCode, Vec<(String, String)>, Vec<u8>) {
         let (status, headers, out, err) = h2_round_trip_core(backend_addr).await;
+        assert!(
+            err.is_none(),
+            "clean-backend rounds must end with END_STREAM, got a stream error: {err:?}"
+        );
+        (status, headers, out)
+    }
+
+    /// [`h2_round_trip_full`] with an explicit request method — the round-18
+    /// FIX 1 pins drive HEAD through the same clean-end assertion.
+    async fn h2_round_trip_full_method(
+        method: &str,
+        backend_addr: std::net::SocketAddr,
+    ) -> (http::StatusCode, Vec<(String, String)>, Vec<u8>) {
+        let (status, headers, out, err) = h2_round_trip_core_method(method, backend_addr).await;
         assert!(
             err.is_none(),
             "clean-backend rounds must end with END_STREAM, got a stream error: {err:?}"
@@ -1738,6 +1987,20 @@ mod tests {
         Vec<u8>,
         Option<h2::Error>,
     ) {
+        h2_round_trip_core_method("GET", backend_addr).await
+    }
+
+    /// [`h2_round_trip_core`] with an explicit request method — the round-18
+    /// FIX 1 pins drive a HEAD request through the same machinery.
+    async fn h2_round_trip_core_method(
+        method: &str,
+        backend_addr: std::net::SocketAddr,
+    ) -> (
+        http::StatusCode,
+        Vec<(String, String)>,
+        Vec<u8>,
+        Option<h2::Error>,
+    ) {
         let (client_io, plugin_io) = tokio::io::duplex(1 << 17);
         let backend_host = backend_addr.ip().to_string();
         let backend_port = backend_addr.port();
@@ -1760,7 +2023,7 @@ mod tests {
             let _ = connection.await;
         });
         let req = http::Request::builder()
-            .method("GET")
+            .method(method)
             .uri("/probe")
             .body(())
             .unwrap();
@@ -2166,5 +2429,125 @@ mod tests {
         let (status, body) = h2_round_trip(addr).await;
         assert_eq!(status, http::StatusCode::OK, "HTTP/9.9 head must forward");
         assert_eq!(body, b"ok");
+    }
+
+    // --- Round-18 FIX 1 e2e: HEAD / 204 / 304 responses end the h2 stream at
+    // the response head. The backend declares a body length (or omits all
+    // framing) and then HOLDS the connection open without ever sending the
+    // bytes — a HEAD response has no body by definition, 204/304 none by RFC
+    // — so the pre-fix body legs park on it (the drain deadline below turns
+    // that into a failure) and, on a backend EOF, the round-18 M3 CL arm
+    // would instead RST a truthful HEAD Content-Length as a truncated body.
+    #[tokio::test]
+    async fn h2_head_and_nobody_statuses_end_stream_at_the_head() {
+        // HEAD → 200 keeps its truthful Content-Length: it describes the GET
+        // the client would receive (RFC 9110 §8.6).
+        let Some(listener) = bind_or_skip().await else {
+            return;
+        };
+        let addr = spawn_held_open_backend(
+            listener,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n",
+        );
+        let (status, headers, body) = h2_round_trip_full_method("HEAD", addr).await;
+        assert_eq!(status, http::StatusCode::OK);
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+                .map(|(_, v)| v.as_str()),
+            Some("100"),
+            "a HEAD response keeps the declared Content-Length: {headers:?}"
+        );
+        assert!(body.is_empty(), "a HEAD response must carry no DATA body");
+
+        // GET → 204 with a declared (lying) Content-Length: the CL body-leg
+        // shape, and the CL row must be stripped (RFC 9110 §8.6).
+        let Some(listener) = bind_or_skip().await else {
+            return;
+        };
+        let addr = spawn_held_open_backend(
+            listener,
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 50\r\n\r\n",
+        );
+        let (status, headers, body) = h2_round_trip_full_method("GET", addr).await;
+        assert_eq!(status, http::StatusCode::NO_CONTENT);
+        assert!(
+            !headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("content-length")),
+            "204 must not carry Content-Length: {headers:?}"
+        );
+        assert!(body.is_empty(), "204 must carry no DATA body");
+
+        // GET → 304 with NO length framing: the read-to-EOF body-leg shape
+        // (the pre-fix leg blocks on the held-open conn).
+        let Some(listener) = bind_or_skip().await else {
+            return;
+        };
+        let addr = spawn_held_open_backend(listener, b"HTTP/1.1 304 Not Modified\r\n\r\n");
+        let (status, headers, body) = h2_round_trip_full_method("GET", addr).await;
+        assert_eq!(status, http::StatusCode::NOT_MODIFIED);
+        assert!(
+            !headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("content-length")),
+            "304 must not carry Content-Length: {headers:?}"
+        );
+        assert!(body.is_empty(), "304 must carry no DATA body");
+    }
+
+    // --- Round-18 FIX 2 e2e: a Transfer-Encoding Go's parseTransferEncoding
+    // refuses ("gzip") fails the WHOLE head — the same 502 class as every
+    // other malformed backend head. RED pre-fix: not chunked and no CL meant
+    // the body leg read to EOF and forwarded a 200 with the backend's bytes.
+    #[tokio::test]
+    async fn h2_backend_unsupported_transfer_encoding_answers_502() {
+        let Some(listener) = bind_or_skip().await else {
+            return;
+        };
+        let addr = spawn_scripted_backend(
+            listener,
+            vec![b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nJUNK".to_vec()],
+            0,
+        );
+        let (status, body) = h2_round_trip(addr).await;
+        assert_eq!(
+            status,
+            http::StatusCode::BAD_GATEWAY,
+            "an unsupported Transfer-Encoding must answer 502"
+        );
+        assert!(body.is_empty(), "502 carries no body: {body:?}");
+    }
+
+    // --- Round-18 FIX 3 e2e: a chunked response must not forward the
+    // backend's Content-Length row. Go deletes it once chunked framing wins
+    // (net/http/transfer.go); RFC 9113 §8.1.1 lets an h2 peer fail the
+    // stream on a declared length that disagrees with the decoded DATA
+    // length. RED pre-fix: the copy loop kept the row (only hop-by-hop
+    // names were skipped).
+    #[tokio::test]
+    async fn h2_backend_chunked_response_strips_content_length() {
+        let Some(listener) = bind_or_skip().await else {
+            return;
+        };
+        let addr = spawn_scripted_backend(
+            listener,
+            vec![
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n\
+                  5\r\nhello\r\n0\r\n\r\n"
+                    .to_vec(),
+            ],
+            0,
+        );
+        let (status, headers, body) = h2_round_trip_full(addr).await;
+        assert_eq!(status, http::StatusCode::OK);
+        assert_eq!(body, b"hello", "the chunked body still decodes");
+        assert!(
+            !headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("content-length")),
+            "a chunked response must drop the backend Content-Length row: {headers:?}"
+        );
     }
 }

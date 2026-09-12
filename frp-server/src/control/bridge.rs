@@ -1437,23 +1437,27 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                         // end-of-stream (round-14 review fix), and the old
                         // partial-byte relay put half a head on the wire.
                         //
-                        // Defensive invariant guard: `malformed_raw` is
-                        // UNREACHABLE here. Both raise sites also set
-                        // `complete` — `abort_after_discard_failure` (the
-                        // discard section returns the permanent EOF in
-                        // that same poll) and the raw serve of a
-                        // malformed head (whose emission drains only
-                        // through the flag gate into
-                        // `raw_head_fully_served`, which raises
+                        // A `malformed_raw` stream is UNREACHABLE here:
+                        // both raise sites also set `complete` —
+                        // `abort_after_discard_failure` (the discard
+                        // section returns the permanent EOF in that same
+                        // poll) and the raw serve of a malformed head
+                        // (whose emission drains only through the flag
+                        // gate into `raw_head_fully_served`, which raises
                         // `complete` before the gather loop can run
                         // again) — and the top-of-poll `complete` gate
-                        // serves that EOF. Kept so a future raise site
-                        // cannot turn an unterminated head into a
-                        // "clean" end-of-stream.
-                        if this.malformed_raw {
-                            this.complete = true;
-                            return Poll::Ready(Ok(()));
-                        }
+                        // serves that EOF first. Round-18 4c: the old
+                        // guard answered a bare Ok(()) for this shape (a
+                        // fail-OPEN clean end-of-stream) while its comment
+                        // claimed fail-closed. Removed — fail-closed now
+                        // holds unconditionally, so a future raise site
+                        // cannot turn an unterminated head into a "clean"
+                        // end-of-stream. Go parity: an EOF before the
+                        // head terminator is an unterminated response
+                        // head; http.Transport ReadResponse errors on it
+                        // and the vhost ErrorHandler answers 404
+                        // (frp-core/src/bridge.rs:506-532 renders that
+                        // page from this Err arm).
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
                             "backend closed before completing response head",
@@ -4443,8 +4447,9 @@ mod tests {
             // The emission was fully served; the discard runs on the poll
             // AFTER the final drain (M1 — the drain's own poll must
             // return Ready). That poll instant-completes the legal 304
-            // and parks on the inner reader with an EMPTY caller buffer:
-            // the correct, waker-registered park.
+            // (nothing in-hand to serve) and parks on the inner reader
+            // with a fresh 1 KiB caller buffer: the correct,
+            // waker-registered park.
             match injector_poll_read_small(&mut injector, &mut chunk).await {
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => parked = true,
                 Ok(0) => panic!("clean EOF where the discard's keep-alive park was expected"),
@@ -4525,18 +4530,73 @@ mod tests {
             .await
             .expect("write later garbage");
 
-        let out = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            injector_read_all(&mut injector),
-        )
-        .await
-        .expect("abort must end the stream promptly, never park");
+        // Poll-level oracle: the terminal state must be a CLEAN EOF
+        // (`Ok(0)`) — no Err, and no park. `injector_read_all` would hide
+        // both (it `expect`s on Err and would hang on a park until the
+        // outer timeout). Each poll is internally 1 s-bounded and reports
+        // a park as `Err(TimedOut)`.
+        let mut out: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut ended_clean = false;
+        while std::time::Instant::now() < deadline {
+            match injector_poll_read_small(&mut injector, &mut chunk).await {
+                Ok(0) => {
+                    ended_clean = true;
+                    break;
+                }
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    panic!("abort must end the stream promptly, it parked instead")
+                }
+                Err(e) => panic!("the abort must end the stream with a clean EOF, got {e}"),
+            }
+        }
+        assert!(
+            ended_clean,
+            "the injector's terminal state must serve a clean Ok(0) EOF"
+        );
         assert_eq!(
             &out[..],
             &b"HTTP/1.1 204 No Content\r\n\r\n"[..],
             "the stripped 204 head is the whole response — malformed chunked junk must \
              never be relayed and no second head may follow"
         );
+    }
+
+    /// Round-18 4c pin: an EOF before the head terminator is ALWAYS
+    /// fail-closed. `malformed_raw` is normally unreachable at that arm
+    /// (both raise sites set `complete` first), so the guard's state is
+    /// driven directly here: a flag-set stream whose backend closes with
+    /// no head must surface `Err(UnexpectedEof)`, which frp-core answers
+    /// with Go's vhost ErrorHandler 404 page
+    /// (frp-core/src/bridge.rs:506-532) — never a clean end-of-stream.
+    /// The pre-fix guard returned `Ok(())` (fail-open), so this is RED on
+    /// that code.
+    #[tokio::test]
+    async fn injector_malformed_raw_eof_before_head_stays_fail_closed() {
+        let (inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector = ResponseHeaderInjector::<tokio::io::DuplexStream>::new(
+            inner_r,
+            Default::default(),
+            None,
+        );
+        injector.malformed_raw = true;
+        drop(inner_w);
+
+        let mut chunk = [0u8; 1024];
+        match injector_poll_read_small(&mut injector, &mut chunk).await {
+            Err(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof,
+                "an unterminated head must surface UnexpectedEof (Go readResponse \
+                 error -> vhost ErrorHandler 404), got {e}"
+            ),
+            Ok(n) => panic!(
+                "an EOF before the head terminator must never read as a clean \
+                 end-of-stream (served {n} bytes)"
+            ),
+        }
     }
 
     /// G2 pin (round-18): the 304 suppressed-headers table {Content-Type,

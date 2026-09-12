@@ -949,10 +949,23 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
         let Some(colon) = line.find(':') else {
             continue;
         };
-        if !line[..colon]
-            .trim_end_matches([' ', '\t'])
-            .eq_ignore_ascii_case("proxy-authorization")
-        {
+        // Round-18 LOW: Go's textproto stores a field name holding SP/HTAB
+        // uncanonicalized (reader.go:742-765 — CanonicalMIMEHeaderKey bails
+        // out on any non-token byte, issue 34540), so
+        // `req.Header.Get("Proxy-Authorization")` (http_proxy.go:143) can
+        // never see `Proxy-Authorization : Basic x` — the row is simply not
+        // credentials and the request stays a 407. The old
+        // trim_end_matches([' ', '\t']) made the spaced name match and its
+        // value authenticate. A spaced row is a SEPARATE key, not a
+        // malformed head: skip it and keep scanning (a later canonical row
+        // still counts, exactly like Go's Get). Same gate as the sibling
+        // walkers (static_file.rs `key_has_space`; the conn-head walker
+        // above).
+        let name = &line[..colon];
+        if name.bytes().any(|b| b == b' ' || b == b'\t') {
+            continue;
+        }
+        if !name.eq_ignore_ascii_case("proxy-authorization") {
             continue;
         }
         // First matching record wins; its folds are part of the stored

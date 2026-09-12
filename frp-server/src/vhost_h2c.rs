@@ -50,12 +50,24 @@ use crate::service::{AppState, InternalMsg};
 pub(crate) const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// Hop-by-hop headers dropped when converting between HTTP/1.1 and HTTP/2
-/// (RFC 7540 §8.1.2.2 forbids them; Go's net/http drops them too).
+/// (RFC 7540 §8.1.2.2 forbids the connection-specific fields of RFC 7230
+/// §6.1; Go's net/http drops them too). The entries are Go
+/// `httputil.hopHeaders`' full list and mirror the client twin
+/// (frp-client/src/plugin/h2.rs `is_hop_by_hop`) exactly: the server twin
+/// carried only the first five until the round-18 review, so a client's
+/// `proxy-authorization` (Go's ReverseProxy removes it from `outreq.Header`
+/// before the RoundTrip — httputil/reverseproxy.go `removeHopByHopHeaders`)
+/// plus `proxy-authenticate` / `te` / `trailer` reached the provider
+/// backend on the forwarded HTTP/1.1 head.
 fn is_hop_by_hop(name: &str) -> bool {
-    const HOP: [&str; 5] = [
+    const HOP: [&str; 9] = [
         "connection",
         "keep-alive",
         "proxy-connection",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
         "transfer-encoding",
         "upgrade",
     ];
@@ -904,6 +916,15 @@ async fn read_until_head_from(
 struct ParsedHead {
     status: u16,
     headers: Vec<(http::HeaderName, http::HeaderValue)>,
+    /// Validated Content-Length value (Go `parseContentLength`), carried out
+    /// of the head parse because the stored header keeps trailing SP/HTAB
+    /// (TrimLeft storage) — re-parsing the raw row would reject the legal
+    /// padded form "5 " that this value was trimmed from, and an
+    /// unparseable re-read degrades the body leg to read-to-EOF (which parks
+    /// the stream on a backend that then holds the connection open). The
+    /// client https2http twin carries the same value
+    /// (frp-client/src/plugin/h2.rs `ParsedHead`).
+    content_length: Option<u64>,
     /// Offset into the original head buffer where the body begins.
     body_offset: usize,
 }
@@ -1071,7 +1092,12 @@ fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
     // ("Content-Length: abc"), empty ("Content-Length:"), or overflowing
     // value fails readTransfer → the WHOLE head errors (the old code
     // forwarded the garbage row and read the body to EOF); padded values
-    // ("5 ") are legal.
+    // ("5 ") are legal, and the validated count rides out on `ParsedHead`
+    // so the body leg consumes what was TrimString'ed here — the stored row
+    // keeps its trailing space (the all-whitespace obs-fold above appends a
+    // bare ' '), so re-parsing the raw row in the body leg would reject a
+    // value this gate just accepted (round-18 review fix, client twin
+    // parity).
     let mut cl_row: Option<usize> = None;
     let mut i = 0;
     while i < headers.len() {
@@ -1091,18 +1117,35 @@ fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
         }
         i += 1;
     }
+    let mut content_length: Option<u64> = None;
     if let Some(idx) = cl_row {
-        let value = trim_ascii_ws(headers[idx].1.as_bytes());
-        let value_ok = std::str::from_utf8(value).is_ok_and(|s| {
-            !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<i64>().is_ok()
+        // h2 value hygiene (round-18 follow-up): the stored row KEEPS its
+        // trailing SP/HTAB (TrimLeft storage; an all-whitespace obs-fold
+        // appends a bare ' ', so "Content-Length: 5\r\n \r\n" stores "5 "),
+        // and a field value with leading/trailing whitespace must not reach
+        // the h2 HEADERS frame (RFC 9113 §8.2.1) — the h2 client resets the
+        // stream with PROTOCOL_ERROR at the head, so the body leg below never
+        // runs. Normalize the row to exactly the bytes this gate validated,
+        // at the one place that both trims the value and knows the row is a
+        // Content-Length; the parsed count still rides out on `ParsedHead`.
+        let value = trim_ascii_ws(headers[idx].1.as_bytes()).to_vec();
+        let parsed = std::str::from_utf8(&value).ok().and_then(|s| {
+            if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+                s.parse::<i64>().ok()
+            } else {
+                None
+            }
         });
-        if !value_ok {
+        let Some(n) = parsed else {
             return None; // parseContentLength failure (Go ParseUint bitSize 63)
-        }
+        };
+        headers[idx].1 = http::HeaderValue::from_bytes(&value).ok()?;
+        content_length = Some(n as u64);
     }
     Some(ParsedHead {
         status,
         headers,
+        content_length,
         body_offset: head_end,
     })
 }
@@ -1301,7 +1344,19 @@ fn is_blank_line(b: &[u8]) -> bool {
 /// error instead of a clean END_STREAM that reads like a complete response.
 /// Returns `Ok(None)` — the caller treats None as "stream already reset, do
 /// NOT write the clean END_STREAM".
-fn abort_stream(send: &mut SendStream<Bytes>) -> Result<Option<http::HeaderMap>, h2::Error> {
+///
+/// The `yield_now` before the reset is load-bearing (round-18 follow-up;
+/// Go orders the same way — HEADERS goes out before handlerPanicRST): the
+/// response HEADERS frame is only QUEUED by `send_response`, and h2's
+/// `send_reset` calls `clear_queue` unless the stream is locally
+/// initiated and still `is_pending_open` — never true for this
+/// server-side stream — so resetting in the same poll DROPS the queued
+/// head and RST_STREAM becomes the client's first frame (the response head
+/// never arrives, at all). One yield lets the connection task drain the
+/// queue to the wire (it is woken by `queue_frame` and re-registered every
+/// poll), then the reset follows the head.
+async fn abort_stream(send: &mut SendStream<Bytes>) -> Result<Option<http::HeaderMap>, h2::Error> {
+    tokio::task::yield_now().await;
     send.send_reset(h2::Reason::INTERNAL_ERROR);
     Ok(None)
 }
@@ -1330,7 +1385,7 @@ async fn stream_chunked_body(
     loop {
         let line = match reader.read_line().await {
             Ok(l) => l,
-            Err(_) => return abort_stream(send), // died mid-chunk-size-line
+            Err(_) => return abort_stream(send).await, // died mid-chunk-size-line
         };
         let mut line = line.as_slice();
         if line.ends_with(b"\r\n") {
@@ -1346,7 +1401,7 @@ async fn stream_chunked_body(
         let size_part = line.split(|&b| b == b';').next().unwrap_or(line);
         let size = match parse_hex(trim_ascii_ws(size_part)) {
             Ok(s) => s,
-            Err(_) => return abort_stream(send), // malformed chunk size line
+            Err(_) => return abort_stream(send).await, // malformed chunk size line
         };
         if size == 0 {
             // Trailer section: trailer fields run from after the terminating
@@ -1366,7 +1421,7 @@ async fn stream_chunked_body(
                 let line = match reader.read_line().await {
                     Ok(l) if !is_blank_line(&l) => l,
                     Ok(_) => break, // blank line: trailer section done
-                    Err(_) => return abort_stream(send), // died mid-trailer
+                    Err(_) => return abort_stream(send).await, // died mid-trailer
                 };
                 let mut field = line.as_slice();
                 if field.ends_with(b"\r\n") {
@@ -1412,7 +1467,7 @@ async fn stream_chunked_body(
             let n = remaining.min(MAX_CHUNK_SIZE);
             match reader.read_exact_into(scratch, n).await {
                 Ok(()) => {}
-                Err(_) => return abort_stream(send), // chunk data cut short
+                Err(_) => return abort_stream(send).await, // chunk data cut short
             }
             send.send_data(Bytes::copy_from_slice(scratch), false)?;
             remaining -= n;
@@ -1428,7 +1483,7 @@ async fn stream_chunked_body(
         let mut terminator = [0u8; 2];
         match reader.fill_exact(&mut terminator).await {
             Ok(()) if terminator == *b"\r\n" => {}
-            _ => return abort_stream(send),
+            _ => return abort_stream(send).await,
         }
     }
 }
@@ -1575,6 +1630,7 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     let ParsedHead {
         status,
         headers,
+        content_length,
         body_offset,
     } = parsed;
 
@@ -1591,7 +1647,17 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
         }
     };
     for (n, v) in &headers {
-        if is_hop_by_hop(n.as_str()) {
+        // `Trailer` is in the hop set, but a backend DECLARATION is re-emitted
+        // rather than dropped: Go's Transport moves the announced keys out of
+        // `res.Header` into `res.Trailer` (fixTrailer, net/http/transfer.go)
+        // and httputil.ReverseProxy writes them back as a `Trailer` response
+        // field before WriteHeader — a Go front's client-facing response does
+        // carry the announcement. The backend's verbatim line holds exactly
+        // the names Go re-synthesizes, and the trailer SECTION is delivered as
+        // real h2 trailers below, so the round-8 G1 pin
+        // (frp-server/tests/vhost_h2c.rs, announce field + delivered
+        // trailers) keeps holding while every other hop field is dropped.
+        if is_hop_by_hop(n.as_str()) && !n.as_str().eq_ignore_ascii_case("trailer") {
             continue;
         }
         // `append`, not `insert`: a backend emitting duplicate response
@@ -1641,9 +1707,15 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
         return Ok(());
     }
 
-    let content_length = header_value(&headers, "content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<usize>().ok());
+    // Content-Length framing is the head parse's VALIDATED value
+    // (`ParsedHead`), never a re-parse of the stored row: the parser is
+    // legal for all-whitespace obs-folds that append a bare ' ' (see the
+    // record walk above), so "Content-Length: 5\r\n \r\n\r\n" stores "5 "
+    // — legal per textproto.TrimString — which `parse::<usize>()` on the
+    // raw row rejects, silently degrading a length-bounded body to
+    // read-to-EOF (a backend that then holds the connection open parked
+    // the stream). The client https2http twin h2.rs consumes the same
+    // carried value.
     let chunked = header_value(&headers, "transfer-encoding")
         .map(|v| {
             v.to_str()
@@ -1686,7 +1758,7 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     }
     if let Some(mut remaining) = content_length {
         while remaining > 0 {
-            let n = remaining.min(8192);
+            let n = remaining.min(8192) as usize;
             match reader.read_exact_into(&mut scratch, n).await {
                 Ok(()) => {}
                 Err(_) => {
@@ -1699,10 +1771,10 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
                     tracing::debug!(
                         "h2c backend truncated a Content-Length-bounded body, resetting the stream"
                     );
-                    return abort_stream(&mut send).map(|_| ());
+                    return abort_stream(&mut send).await.map(|_| ());
                 }
             }
-            remaining -= scratch.len();
+            remaining -= scratch.len() as u64;
             send.send_data(Bytes::copy_from_slice(&scratch), false)?;
         }
     } else {
@@ -1717,7 +1789,7 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
                     Ok(false) => break, // clean EOF: body complete
                     Err(_) => {
                         tracing::debug!("h2c backend body read error, resetting the stream");
-                        return abort_stream(&mut send).map(|_| ());
+                        return abort_stream(&mut send).await.map(|_| ());
                     }
                 }
             }
@@ -1739,12 +1811,18 @@ mod tests {
 
     #[test]
     fn test_is_hop_by_hop() {
-        // RFC 7540 §8.1.2.2 forbids these on the HTTP/2 side; they must be
-        // dropped when re-encoding to HTTP/1.1 (Go net/http drops them too).
+        // RFC 7540 §8.1.2.2 / RFC 7230 §6.1 list, and Go httputil.hopHeaders
+        // in full (round-18 review: the server twin had only the first five
+        // while the client twin carried all nine) — all must be dropped when
+        // re-encoding to HTTP/1.1.
         for name in [
             "connection",
             "keep-alive",
             "proxy-connection",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
             "transfer-encoding",
             "upgrade",
         ] {
@@ -1755,7 +1833,7 @@ mod tests {
             );
         }
         // End-to-end headers pass through.
-        for name in ["content-length", "host", "authorization", "x-custom", "te"] {
+        for name in ["content-length", "host", "authorization", "x-custom"] {
             assert!(!is_hop_by_hop(name), "{name} must NOT be hop-by-hop");
         }
     }
@@ -2317,7 +2395,23 @@ mod tests {
         with_h2_request(
             "GET",
             "http://h2c.example.com/",
-            &[("x-custom", "v1"), ("x-second", "two")],
+            &[
+                ("x-custom", "v1"),
+                ("x-second", "two"),
+                // Round-18 review pin (Go httputil.hopHeaders): a client's
+                // hop-by-hop fields must never reach the provider backend —
+                // pre-fix the server list had only 5 entries, so
+                // proxy-authorization (Go's ReverseProxy strips it from
+                // `outreq.Header` before the RoundTrip), proxy-authenticate,
+                // te and trailer were all forwarded (RED pre-fix). The h2
+                // client accepts `te` only with the exactly-"trailers" value
+                // (h2 0.4 streams/send.rs check_headers), so all four are
+                // sendable.
+                ("proxy-authorization", "Basic dXNlcjpwYXNz"),
+                ("proxy-authenticate", "Basic realm=\"Restricted\""),
+                ("te", "trailers"),
+                ("trailer", "X-Checksum"),
+            ],
             true,
             |req| {
                 let head = build_http1_request_head(req);
@@ -2336,6 +2430,17 @@ mod tests {
                     head_text.contains("Content-Length: 0\r\n"),
                     "end_stream request needs Content-Length: 0: {head_text}"
                 );
+                for line in [
+                    "\r\nproxy-authorization: Basic dXNlcjpwYXNz",
+                    "\r\nproxy-authenticate: Basic realm=\"Restricted\"",
+                    "\r\nte: trailers",
+                    "\r\ntrailer: X-Checksum",
+                ] {
+                    assert!(
+                        !head_text.contains(line),
+                        "hop-by-hop line {line:?} must not reach the backend: {head_text}"
+                    );
+                }
                 assert!(
                     head_text.ends_with("\r\n"),
                     "head must end with the blank line: {head_text}"
@@ -3034,20 +3139,35 @@ mod tests {
                 String::from_utf8_lossy(staged)
             );
         }
-        // A padded numeric value ("5 ") stays legal (TrimString) and
-        // serves its body.
+        // A padded numeric value stays legal (TrimString, Go fixLength) and
+        // its body leg must deliver EXACTLY the declared bytes — the round-18
+        // review fix: drive the store shape the padded value actually comes
+        // from. An all-whitespace obs-fold appends a bare ' ' to the value
+        // (the record walk above), so the backend head
+        // "Content-Length: 5\r\n \r\n" stores "5 " — the parse gate accepts
+        // it (TrimString → "5") and the VALIDATED count must ride out on
+        // `ParsedHead`; re-parsing the stored row in the body leg saw "5 ",
+        // failed, and read the body to EOF. The trailing "EXTRA" bytes make
+        // that degradation visible: read-to-EOF delivers them, the
+        // length-bounded read does not (RED pre-fix: body is
+        // "helloEXTRA").
         let (status, _headers, body, err) =
             h2c_test_roundtrip_body_err("GET", |respond| async move {
                 let mut respond = respond;
-                let mut backend =
-                    SliceMock::new(b"HTTP/1.1 200 OK\r\nContent-Length: 5 \r\n\r\nhello");
+                let mut backend = SliceMock::new(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n \r\n\r\nhelloEXTRA",
+                );
                 let page = h2c_not_found_body("");
                 stream_h2_response(&mut backend, &mut respond, None, false, &page).await
             })
             .await;
-        assert_eq!(status, 200, "padded Content-Length stays legal");
+        assert_eq!(status, 200, "fold-padded Content-Length stays legal");
         assert!(err.is_none());
-        assert_eq!(body, b"hello");
+        assert_eq!(
+            body, b"hello",
+            "the declared 5 bytes are the whole body — a re-parsed \"5 \" row would \
+             fall back to read-to-EOF and leak the bytes past the declaration"
+        );
     }
 
     #[tokio::test]
