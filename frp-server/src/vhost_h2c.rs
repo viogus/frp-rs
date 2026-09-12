@@ -872,9 +872,13 @@ async fn read_until_head_from(
     // the seed — is safe across reads.
     let mut scanner = frp_core::textproto::HeadEndScanner::new();
     loop {
-        // Terminator scan before the cap check (round-16 readLimit model:
-        // a terminated head up to ~1 MiB + 4096 serves; only an
-        // unterminated one errors TooLarge).
+        // Terminator scan before the cap check (round-16 readLimit model;
+        // round-18 L1 precision): the cap fires when buf.len() > 1 MiB at
+        // a feed-check with no terminator found, and reads are
+        // 4096-quantized — a terminated head up to ~1 MiB always serves;
+        // up to ~1 MiB + 4096 serves when the terminator tail arrives in
+        // the single read that crosses 1 MiB (chunk-quantized, not a hard
+        // +4096 bound); a terminator beyond that errors TooLarge.
         if scanner.feed(&buf).is_some() {
             return Ok(buf);
         }
@@ -943,11 +947,14 @@ fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
     // (multi-space between version and code stays legal, like Go's
     // TrimLeft).
     let mut parts = status_line.split(' ');
-    // Go http.ReadResponse gates (response.go — round-3 review): the
-    // version token must be one of ParseHTTPVersion's exact-match set and
-    // the code token exactly 3 digits BEFORE conversion, so "HTTP/9.9 200"
-    // / "HTTP/1.1 0200 OK" / "FOO 200 OK" are all malformed → 404 (the
-    // ErrorHandler non-timeout class), never forwarded.
+    // Go http.ReadResponse gates (net/http/response.go): the version token
+    // must pass ParseHTTPVersion's LENIENT shape — exact rows HTTP/1.0/1.1,
+    // else exactly-8-char `HTTP/X.Y` single-digit tokens, so HTTP/9.9 200
+    // parses and forwards (round-18 M1: the round-7 "exact-match set"
+    // reading was a Go-source misreading) — and the code token exactly 3
+    // digits BEFORE conversion, so "HTTP/1.1 0200 OK" / "FOO 200 OK" are
+    // malformed → 404 (the ErrorHandler non-timeout class), never
+    // forwarded.
     let version = parts.next()?;
     if !frp_core::textproto::is_valid_http_version(version) {
         return None;
@@ -958,25 +965,139 @@ fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
     }
     let status: u16 = code_token.parse().ok()?;
 
-    let mut headers = Vec::new();
-    // Header lines run from after the status line to head_end (which includes
-    // the terminating blank line); splitting on '\n' with a single trailing
-    // '\r' strip makes the final blank line split into an empty entry that
-    // the empty check below skips — uniform for CRLF and LF heads alike.
+    let mut headers: Vec<(http::HeaderName, http::HeaderValue)> = Vec::new();
+    // Go textproto ReadMIMEHeader semantics (net/textproto/reader.go, the
+    // engine behind ReadResponse) — round-18 M4 mirror of the client
+    // https2http plugin fix (frp-client/src/plugin/h2.rs), applied to this
+    // server h2c twin: ANY malformed record fails the WHOLE head (→ the
+    // caller's 404 ErrorHandler arm), never a forwarded response missing
+    // rows. The old code diverged in both directions: it trimmed every
+    // line FIRST, so a legal obs-fold continuation (" two" under
+    // "X-A: one") lost its leading space, read as a colonless new record,
+    // and failed the whole head (404) where Go merges the fold and
+    // forwards "one two"; and records whose name/value failed conversion
+    // were silently dropped, forwarding the degraded head where Go fails
+    // the whole read. Per record, in Go order:
+    //   - the block's first line must not start with SP/HTAB (initial-line
+    //     error);
+    //   - a record's first line must contain a colon
+    //     (mustHaveFieldNameColon);
+    //   - a line whose RAW first byte is SP/HTAB continues the OPEN record
+    //     (readContinuedLineSlice): its both-trimmed content joins the
+    //     value as ' ' + content — an all-whitespace fold contributes a
+    //     bare ' ' (round-17 R1); a fold with no open record (block start
+    //     only) is the initial-line error above;
+    //   - the name is the bytes before the record's first colon: empty or
+    //     containing any non-token byte fails (canonicalMIMEHeaderKey).
+    //     Go tolerates SPACE-in-name stored uncanonicalized (issue 34540)
+    //     — http::HeaderName cannot represent it, so frp-rs fails the head
+    //     here (fail-closed 404 vs Go forwarding a wire-invalid name for
+    //     the h2 peer to reject);
+    //   - every value line is CTL-checked (validHeaderValueByte:
+    //     VCHAR/SP/HTAB/obs-text only; CTL incl. DEL fails the head) — the
+    //     check runs on the SP/HTAB-trimmed span, which is equivalent to
+    //     Go's raw-span check because the trim removes only legal bytes;
+    //     obs-text values are legal and now survive (the old from_str
+    //     UTF-8 gate silently dropped those rows);
+    //   - the record's first line is end-trimmed and each fold is
+    //     both-trimmed (Go trims every physical line); the stored value is
+    //     the merged value with leading SP/HTAB stripped (readMIMEHeader
+    //     TrimLeft) — trailing spaces survive, so "X: a" + " " folds
+    //     store "a ".
+    let mut record: Option<(Vec<u8>, Vec<u8>)> = None; // (name, value)
     for line in head_bytes[first_nl + 1..head_end].split(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let line = trim_ascii_ws(line);
         if line.is_empty() {
+            continue; // head terminator (already cut by head_end)
+        }
+        if line[0] == b' ' || line[0] == b'\t' {
+            // Continuation of the open record.
+            let Some((_, value)) = record.as_mut() else {
+                return None; // leading-space first line: Go initial-line error
+            };
+            let piece = trim_ascii_ws(line);
+            if value_bytes_have_ctl(piece) {
+                return None; // CTL byte in a folded value line
+            }
+            value.push(b' ');
+            value.extend_from_slice(piece);
             continue;
         }
-        let colon = line.iter().position(|&b| b == b':')?;
-        let name = std::str::from_utf8(&line[..colon]).ok()?;
-        let value = std::str::from_utf8(trim_ascii_ws(&line[colon + 1..])).ok()?;
-        if let (Ok(n), Ok(v)) = (
-            http::HeaderName::from_bytes(name.as_bytes()),
-            http::HeaderValue::from_str(value),
-        ) {
+        // New record: flush the completed one before opening the next.
+        if let Some((name, value)) = record.take() {
+            let Some((n, v)) = header_row(name, value) else {
+                return None; // unreachable: the gates below already passed
+            };
             headers.push((n, v));
+        }
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            return None; // colonless line: mustHaveFieldNameColon fails
+        };
+        let name = &line[..colon];
+        if name.is_empty() || !name.iter().all(|&b| name_byte_ok(b)) {
+            return None; // empty or non-token name: canonicalMIMEHeaderKey
+        }
+        // Raw value bytes run to the physical line's end; the record-level
+        // end-trim (Go trims the whole first line) drops trailing SP/HTAB
+        // before the merge, and leading SP/HTAB are stripped only at
+        // storage (TrimLeft) — so the merged value below starts trimmed.
+        let raw_value = trim_ascii_ws(&line[colon + 1..]);
+        if value_bytes_have_ctl(raw_value) {
+            return None; // CTL byte in a value: validHeaderValueByte fails
+        }
+        record = Some((name.to_vec(), raw_value.to_vec()));
+    }
+    if let Some((name, value)) = record.take() {
+        let Some((n, v)) = header_row(name, value) else {
+            return None; // unreachable: the gates above already passed
+        };
+        headers.push((n, v));
+    }
+    // Go fixLength + parseContentLength parity (net/http/transfer.go —
+    // round-18 M2 + deviation-3 mirrors of the client h2.rs fix):
+    // readTransfer runs on EVERY head ReadResponse draws (interim 1xx and
+    // final alike), and two+ Content-Length rows whose TrimString'ed
+    // values differ make it fail — the WHOLE head is malformed (404),
+    // never a response whose copied rows disagree with the body count
+    // that framed it (smuggling-adjacent). Identical values dedupe to ONE
+    // row (Go Issue 16490: fixLength deletes the duplicates and re-adds
+    // the first trimmed value), so the h2 emission carries one row — the
+    // copy loop below appends every parsed row verbatim, and two identical
+    // CL rows would otherwise both reach the h2 client. Stored values keep
+    // trailing spaces (TrimLeft storage), so rows compare like
+    // textproto.TrimString — SP/HTAB trimmed at both ends. The surviving
+    // row's TrimString'ed value must then satisfy parseContentLength:
+    // non-empty, all-ASCII-digits, within 63 bits — a garbage
+    // ("Content-Length: abc"), empty ("Content-Length:"), or overflowing
+    // value fails readTransfer → the WHOLE head errors (the old code
+    // forwarded the garbage row and read the body to EOF); padded values
+    // ("5 ") are legal.
+    let mut cl_row: Option<usize> = None;
+    let mut i = 0;
+    while i < headers.len() {
+        if headers[i].0.as_str().eq_ignore_ascii_case("content-length") {
+            match cl_row {
+                None => cl_row = Some(i),
+                Some(first) => {
+                    if trim_ascii_ws(headers[first].1.as_bytes())
+                        != trim_ascii_ws(headers[i].1.as_bytes())
+                    {
+                        return None; // conflicting duplicate Content-Length
+                    }
+                    headers.remove(i); // identical: keep the first row only
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    if let Some(idx) = cl_row {
+        let value = trim_ascii_ws(headers[idx].1.as_bytes());
+        let value_ok = std::str::from_utf8(value).is_ok_and(|s| {
+            !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<i64>().is_ok()
+        });
+        if !value_ok {
+            return None; // parseContentLength failure (Go ParseUint bitSize 63)
         }
     }
     Some(ParsedHead {
@@ -984,6 +1105,47 @@ fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
         headers,
         body_offset: head_end,
     })
+}
+
+/// Convert one validated header record into a row. The name/value gates in
+/// [`parse_response_head`] run first, so both conversions are total; a
+/// failure here still fails the whole head (fail-closed, never a silently
+/// dropped row).
+fn header_row(name: Vec<u8>, value: Vec<u8>) -> Option<(http::HeaderName, http::HeaderValue)> {
+    Some((
+        http::HeaderName::from_bytes(&name).ok()?,
+        http::HeaderValue::from_bytes(&value).ok()?,
+    ))
+}
+
+/// RFC 7230 token byte (Go `validHeaderFieldByte`, net/textproto/reader.go)
+/// — the only byte set a header NAME may use.
+fn name_byte_ok(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Go `validHeaderValueByte` parity (net/textproto/reader.go): a field
+/// value may hold VCHAR (0x21-0x7E), SP, HTAB and obs-text (0x80-0xFF);
+/// CTL bytes — 0x00-0x08, 0x0A-0x1F and DEL (0x7F) — fail ReadMIMEHeader.
+fn value_bytes_have_ctl(b: &[u8]) -> bool {
+    b.iter().any(|&c| (c < 0x20 && c != b'\t') || c == 0x7f)
 }
 
 fn header_value<'a>(
@@ -1129,25 +1291,46 @@ fn is_blank_line(b: &[u8]) -> bool {
     b.iter().all(|&c| matches!(c, b'\r' | b'\n' | b' ' | b'\t'))
 }
 
+/// Abort the response stream with INTERNAL_ERROR — the server-side mirror
+/// of the client plugin's `abort_stream` (frp-client/src/plugin/h2.rs,
+/// round-18 M3): Go's ReverseProxy copyResponse panics http.ErrAbortHandler
+/// on any mid-body error (httputil/reverseproxy.go) and the net/http h2
+/// server answers that panic with RST_STREAM + ErrCodeInternal
+/// (h2_bundle.go handlerPanicRST → WriteRSTStream). The abort makes a
+/// backend body that died mid-response visible to the h2 client as a stream
+/// error instead of a clean END_STREAM that reads like a complete response.
+/// Returns `Ok(None)` — the caller treats None as "stream already reset, do
+/// NOT write the clean END_STREAM".
+fn abort_stream(send: &mut SendStream<Bytes>) -> Result<Option<http::HeaderMap>, h2::Error> {
+    send.send_reset(h2::Reason::INTERNAL_ERROR);
+    Ok(None)
+}
+
 /// Decode a chunked response body and stream it as HTTP/2 DATA frames,
 /// returning the trailer section (RFC 7230 §4.1.2) the backend sent after
 /// the terminating 0-chunk, if any.
 ///
-/// Read errors truncate the body (Go treats an aborted backend body as EOF)
-/// and yield no trailers; a MALFORMED chunk terminator is an explicit
-/// framing error (Go chunkedReader: "malformed chunked encoding") that
-/// drops the stream instead of delivering a truncated 200. `scratch` is the
+/// `Ok(Some(trailers))` is a CLEAN end (empty map = no trailer section);
+/// `Ok(None)` means the body was truncated and the stream was already reset
+/// by [`abort_stream`] — the caller must not write END_STREAM. Every
+/// mid-body error path aborts (round-18 M3 mirror): the old code returned an
+/// empty trailer map on truncation and the caller ended the stream cleanly,
+/// presenting a truncated body as complete — Go copyResponse aborts instead
+/// (see [`abort_stream`]). That includes a MALFORMED chunk terminator, an
+/// explicit framing error (Go chunkedReader: "malformed chunked encoding")
+/// — the old code reset with CANCEL, which is the h2-layer fallback when a
+/// SendResponse is dropped, not Go's handlerPanicRST code. `scratch` is the
 /// caller-owned buffer reused for every chunk (see
 /// `BodyReader::read_exact_into`).
 async fn stream_chunked_body(
     reader: &mut BodyReader<'_, impl AsyncRead + Unpin>,
     send: &mut SendStream<Bytes>,
     scratch: &mut Vec<u8>,
-) -> Result<http::HeaderMap, h2::Error> {
+) -> Result<Option<http::HeaderMap>, h2::Error> {
     loop {
         let line = match reader.read_line().await {
             Ok(l) => l,
-            Err(_) => return Ok(http::HeaderMap::new()),
+            Err(_) => return abort_stream(send), // died mid-chunk-size-line
         };
         let mut line = line.as_slice();
         if line.ends_with(b"\r\n") {
@@ -1163,7 +1346,7 @@ async fn stream_chunked_body(
         let size_part = line.split(|&b| b == b';').next().unwrap_or(line);
         let size = match parse_hex(trim_ascii_ws(size_part)) {
             Ok(s) => s,
-            Err(_) => return Ok(http::HeaderMap::new()),
+            Err(_) => return abort_stream(send), // malformed chunk size line
         };
         if size == 0 {
             // Trailer section: trailer fields run from after the terminating
@@ -1174,7 +1357,7 @@ async fn stream_chunked_body(
             // loop keeps it) — the h2c client was PROMISED trailers that
             // never arrived and then got bare END_STREAM. Collect the
             // fields; the caller delivers them as h2 trailers before
-            // END_STREAM. Go semantics (pkg/util/vhost/http.go:57 —
+            // END_STREAM. Go semantics (pkg/util/vhost/http.go —
             // httputil.ReverseProxy): what the chunked body carries is
             // delivered, announced or not; the `Trailer:` head field is the
             // pre-announce only.
@@ -1182,7 +1365,8 @@ async fn stream_chunked_body(
             loop {
                 let line = match reader.read_line().await {
                     Ok(l) if !is_blank_line(&l) => l,
-                    Ok(_) | Err(_) => break,
+                    Ok(_) => break, // blank line: trailer section done
+                    Err(_) => return abort_stream(send), // died mid-trailer
                 };
                 let mut field = line.as_slice();
                 if field.ends_with(b"\r\n") {
@@ -1213,7 +1397,7 @@ async fn stream_chunked_body(
                 // value, like the response-head forward loop.
                 trailers.append(name, value);
             }
-            return Ok(trailers);
+            return Ok(Some(trailers));
         }
         // Round 10 (MEDIUM): `size` comes from the backend's chunk-size
         // line — buffering it in one `read_exact(size)` allocates
@@ -1228,7 +1412,7 @@ async fn stream_chunked_body(
             let n = remaining.min(MAX_CHUNK_SIZE);
             match reader.read_exact_into(scratch, n).await {
                 Ok(()) => {}
-                Err(_) => return Ok(http::HeaderMap::new()),
+                Err(_) => return abort_stream(send), // chunk data cut short
             }
             send.send_data(Bytes::copy_from_slice(scratch), false)?;
             remaining -= n;
@@ -1238,17 +1422,13 @@ async fn stream_chunked_body(
         // the chunk data are not CRLF. Verify instead of silently discarding
         // whatever two bytes arrived — mis-parsing the framing could let
         // garbage past as a chunk line, and a missing/malformed terminator
-        // must not deliver a truncated 200. Returning Err drops the stream
-        // (the h2 layer resets it with CANCEL); the caller logs the error.
+        // must not deliver a truncated 200. A missing terminator after
+        // delivered chunk data is the same truncation as a mid-chunk EOF:
+        // reset with INTERNAL_ERROR rather than deliver END_STREAM.
         let mut terminator = [0u8; 2];
         match reader.fill_exact(&mut terminator).await {
             Ok(()) if terminator == *b"\r\n" => {}
-            _ => {
-                // Explicit reset with CANCEL — the same reason the h2 layer
-                // would use if the SendResponse were dropped. PROTOCOL_ERROR
-                // would blame the client; the violation is the backend's.
-                return Err(h2::Reason::CANCEL.into());
-            }
+            _ => return abort_stream(send),
         }
     }
 }
@@ -1481,18 +1661,26 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     let mut scratch: Vec<u8> = Vec::new();
 
     if chunked {
-        let trailers = stream_chunked_body(&mut reader, &mut send, &mut scratch).await?;
-        if trailers.is_empty() {
-            send.send_data(Bytes::new(), true)?;
-        } else {
-            // Audit round 8 (G1): the backend sent a trailer section after
-            // its terminating 0-chunk — deliver it as real h2 trailers.
-            // `send_trailers` ends the stream with a HEADERS frame
-            // (END_STREAM), replacing the bare empty-DATA end. The values
-            // were announced to the client already via the forwarded
-            // `Trailer:` head field (and unannounced fields arrive too —
-            // Go delivers what arrives).
-            send.send_trailers(trailers)?;
+        // `Ok(None)` = the backend body was truncated mid-stream and
+        // [`abort_stream`] already reset it — no clean END_STREAM, which
+        // would present the truncated body as complete (round-18 M3
+        // mirror).
+        match stream_chunked_body(&mut reader, &mut send, &mut scratch).await? {
+            None => return Ok(()),
+            Some(trailers) => {
+                if trailers.is_empty() {
+                    send.send_data(Bytes::new(), true)?;
+                } else {
+                    // Audit round 8 (G1): the backend sent a trailer section after
+                    // its terminating 0-chunk — deliver it as real h2 trailers.
+                    // `send_trailers` ends the stream with a HEADERS frame
+                    // (END_STREAM), replacing the bare empty-DATA end. The values
+                    // were announced to the client already via the forwarded
+                    // `Trailer:` head field (and unannounced fields arrive too —
+                    // Go delivers what arrives).
+                    send.send_trailers(trailers)?;
+                }
+            }
         }
         return Ok(());
     }
@@ -1501,19 +1689,36 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
             let n = remaining.min(8192);
             match reader.read_exact_into(&mut scratch, n).await {
                 Ok(()) => {}
-                Err(_) => break, // truncated body
+                Err(_) => {
+                    // Truncated Content-Length-bounded body: the declared
+                    // length was never delivered — reset the stream rather
+                    // than end it cleanly (round-18 M3 mirror; the old
+                    // `break` fell to the clean END_STREAM below and the
+                    // h2 client read a complete response out of a
+                    // truncated one — Go copyResponse aborts instead).
+                    tracing::debug!(
+                        "h2c backend truncated a Content-Length-bounded body, resetting the stream"
+                    );
+                    return abort_stream(&mut send).map(|_| ());
+                }
             }
             remaining -= scratch.len();
             send.send_data(Bytes::copy_from_slice(&scratch), false)?;
         }
     } else {
         // No length framing: read to EOF (the work conn is closed by frpc
-        // once the provider finishes).
+        // once the provider finishes). A genuine EOF is the natural end of
+        // a close-delimited body; an io error mid-body aborts like every
+        // other truncated backend body (round-18 M3 mirror).
         loop {
             if reader.available().is_empty() {
                 match reader.read_more().await {
                     Ok(true) => {}
-                    Ok(false) | Err(_) => break,
+                    Ok(false) => break, // clean EOF: body complete
+                    Err(_) => {
+                        tracing::debug!("h2c backend body read error, resetting the stream");
+                        return abort_stream(&mut send).map(|_| ());
+                    }
                 }
             }
             if reader.available().is_empty() {
@@ -1731,6 +1936,199 @@ mod tests {
                 .unwrap(),
             "3"
         );
+    }
+
+    #[test]
+    fn test_parse_response_head_version_token_lenient_like_go() {
+        // Round-18 M1 mirror of the client plugin pin: Go ParseHTTPVersion
+        // is LENIENT (request.go:819-838) — exact rows HTTP/1.0/1.1, else
+        // exactly-8-char `HTTP/X.Y` single ASCII digits. HTTP/9.9, HTTP/0.9,
+        // HTTP/1.2 all PARSE (and the round-7-era exact-switch rejection of
+        // HTTP/9.9 was a Go-source misreading — RED here). The round-7
+        // "HTTP/1.10 is rejected" shape still holds (9th char), as do
+        // case/prefix failures.
+        for ok in [
+            "HTTP/1.0", "HTTP/1.1", "HTTP/9.9", "HTTP/0.9", "HTTP/4.0", "HTTP/1.2", "HTTP/0.0",
+        ] {
+            let head = format!("{ok} 200 OK\r\n\r\n");
+            assert_eq!(
+                parse_response_head(head.as_bytes()).unwrap().status,
+                200,
+                "{ok} must parse (Go ParseHTTPVersion lenient shape)"
+            );
+        }
+        for bad in [
+            "HTTP/1.10",
+            "HTTP/10.0",
+            "HTTP/9.10",
+            "FOO",
+            "http/1.1",
+            "XXXXX9.9",
+        ] {
+            let head = format!("{bad} 200 OK\r\n\r\n");
+            assert!(
+                parse_response_head(head.as_bytes()).is_none(),
+                "{bad} must fail the whole head (Go ParseHTTPVersion)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_response_head_textproto_record_semantics() {
+        // Round-18 M4 mirror of the client plugin fix: Go textproto
+        // ReadMIMEHeader record semantics (net/textproto/reader.go) now
+        // drive the header block — obs-folds merge into the open record
+        // instead of failing the head.
+        //
+        // Legal fold: "X-A: one" + SP-continuation " two" → "one two".
+        // RED pre-fix: the old parse trimmed the fold's leading space,
+        // read it as a colonless NEW record and returned None (404).
+        let head = b"HTTP/1.1 200 OK\r\nX-A: one\r\n two\r\nX-B: y\r\n\r\n";
+        let parsed = parse_response_head(head).expect("obs-fold head must parse");
+        assert_eq!(parsed.status, 200);
+        assert_eq!(
+            header_value(&parsed.headers, "x-a")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "one two",
+            "folded continuation joins the value with a single space"
+        );
+        assert_eq!(
+            header_value(&parsed.headers, "x-b")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "y",
+            "a non-fold record after a fold still parses"
+        );
+        // All-whitespace fold: Go joins ' ' + both-trimmed piece — an empty
+        // piece still contributes the ' ' (round-17 R1 semantics), and
+        // TrimLeft storage keeps the trailing space.
+        let head = b"HTTP/1.1 200 OK\r\nX-A: one\r\n \r\n\r\n";
+        let parsed = parse_response_head(head).expect("all-space fold head must parse");
+        assert_eq!(
+            header_value(&parsed.headers, "x-a")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "one ",
+            "fold of an all-space line stores a trailing space"
+        );
+        // HTAB-leading fold folds too.
+        let head = b"HTTP/1.1 200 OK\r\nX-A: one\r\n\ttwo\r\n\r\n";
+        let parsed = parse_response_head(head).expect("HTAB fold head must parse");
+        assert_eq!(
+            header_value(&parsed.headers, "x-a")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "one two"
+        );
+        // The record's own continuation lines and the trailing row keep the
+        // value CTL-checked per physical line (fold with CTL → whole-head
+        // fail).
+        let head = b"HTTP/1.1 200 OK\r\nX-A: one\r\n t\x01wo\r\n\r\n";
+        assert!(
+            parse_response_head(head).is_none(),
+            "CTL byte inside a folded line fails the whole head"
+        );
+    }
+
+    #[test]
+    fn test_parse_response_head_malformed_rows_fail_whole_head() {
+        // Round-18 M4 mirror: ANY malformed record fails the WHOLE head
+        // (Go ReadMIMEHeader read-time errors) — the old parse silently
+        // dropped the bad row and forwarded the degraded head (RED on every
+        // shape below: pre-fix each returned Some with the row missing).
+        for bad in [
+            &b"HTTP/1.1 200 OK\r\nX-No-Colon here\r\n\r\n"[..], // colonless record
+            &b"HTTP/1.1 200 OK\r\n: empty-name\r\n\r\n"[..],    // empty name
+            &b"HTTP/1.1 200 OK\r\nX@Y: bad name byte\r\n\r\n"[..], // non-token name
+            &b"HTTP/1.1 200 OK\r\nX-Y: a\x01b\r\n\r\n"[..],     // CTL in value
+            &b"HTTP/1.1 200 OK\r\nX-Y: a\x0bb\r\n\r\n"[..],     // vertical tab in value
+            &b"HTTP/1.1 200 OK\r\nX-Y: a\x7fb\r\n\r\n"[..],     // DEL in value
+        ] {
+            assert!(
+                parse_response_head(bad).is_none(),
+                "malformed record must fail the whole head: {:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // Fold-first-line (SP/HTAB after the status line with no open
+        // record) = Go's initial-line error → whole-head fail.
+        let head = b"HTTP/1.1 200 OK\r\n X-Y: leading fold\r\n\r\n";
+        assert!(
+            parse_response_head(head).is_none(),
+            "SP-leading block line fails the head"
+        );
+        // SPACE-in-name: Go tolerates it stored uncanonicalized (issue
+        // 34540) but http::HeaderName cannot represent it — frp-rs fails
+        // the head, a documented fail-closed divergence (forwarding a
+        // wire-invalid name would only make the h2 peer reject it).
+        let head = b"HTTP/1.1 200 OK\r\nX Y: v\r\n\r\n";
+        assert!(
+            parse_response_head(head).is_none(),
+            "SPACE-in-name fails the head (fail-closed)"
+        );
+        // obs-text (0x80-0xFF) value bytes are legal (Go
+        // validHeaderValueByte) and now survive as raw bytes — the old
+        // from_str UTF-8 gate silently dropped such rows (RED pre-fix: the
+        // head parsed with the row gone).
+        let head = b"HTTP/1.1 200 OK\r\nX-Y: caf\xe9\r\n\r\n";
+        let parsed = parse_response_head(head).expect("obs-text value must parse");
+        assert_eq!(parsed.headers.len(), 1, "obs-text row is kept, not dropped");
+        assert_eq!(parsed.headers[0].1.as_bytes(), b"caf\xe9");
+    }
+
+    #[test]
+    fn test_parse_response_head_content_length_gates() {
+        // Round-18 M2 mirror + deviation-3 fix (client plugin parity):
+        // fixLength + parseContentLength semantics from net/http/transfer.go.
+        //
+        // Identical duplicate CL rows (case-variant names included) dedupe
+        // to ONE row keeping the FIRST value (Go Issue 16490) — the h2
+        // emission copy loop appends parsed rows verbatim, so two rows
+        // here would both reach the client.
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\ncontent-length: 5\r\n\r\nbody";
+        let parsed = parse_response_head(head).expect("identical dup CL dedupes");
+        assert_eq!(parsed.headers.len(), 1, "duplicate CL rows collapse to one");
+        assert_eq!(parsed.headers[0].1.to_str().unwrap(), "5");
+        // Differing values fail the whole head → the caller's 404 arm.
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nbody";
+        assert!(
+            parse_response_head(head).is_none(),
+            "conflicting duplicate Content-Length fails the whole head"
+        );
+        // TrimString compare: padded values ("5 " ≡ "5") dedupe cleanly.
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 5 \r\nContent-Length: 5\r\n\r\nbody";
+        let parsed = parse_response_head(head).expect("padded dup CL stays legal (TrimString)");
+        assert_eq!(parsed.headers.len(), 1);
+        // parseContentLength gate (deviation-3): non-numeric, empty, and
+        // overflowing values fail the whole head like Go ParseUint
+        // (bitSize 63; sign prefixes are NOT legal — the digit gate
+        // rejects "+5" the way Go's ParseUint does).
+        for bad in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 5x\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 9223372036854775808\r\n\r\n"[..], // 2^63
+        ] {
+            assert!(
+                parse_response_head(bad).is_none(),
+                "garbage Content-Length must fail the whole head: {:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // A padded single row stays legal and parses to the numeric value.
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 5 \r\n\r\nbody";
+        let parsed = parse_response_head(head).expect("padded CL stays legal");
+        assert_eq!(parsed.headers[0].1.to_str().unwrap(), "5");
+        // Duplicate NON-CL rows keep both (only fixLength dedupes).
+        let head = b"HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\n";
+        let parsed = parse_response_head(head).expect("dup non-CL rows keep both");
+        assert_eq!(parsed.headers.len(), 2);
     }
 
     #[test]
@@ -2121,9 +2519,13 @@ mod tests {
     async fn test_chunked_body_eof_mid_chunk() {
         // A backend chunk stream that ends mid-chunk (declared size larger
         // than the remaining bytes) must fail with UnexpectedEof — never
-        // hang, loop, or panic (round-15 review flagged missing coverage;
-        // stream_chunked_body truncates the body on this error, Go treats
-        // an aborted backend body as EOF).
+        // hang, loop, or panic (round-15 review flagged missing coverage).
+        // This pin drives the BodyReader directly; the WALKER-level
+        // consequence of this error is the round-18 M3 abort (the walker
+        // used to swallow it as a clean end — Go copyResponse aborts mid-
+        // body: httputil/reverseproxy.go ErrAbortHandler, h2_bundle.go
+        // handlerPanicRST), pinned e2e by
+        // `test_h2_backend_truncated_chunked_body_resets_stream` below.
         let data: &[u8] = b"5\r\nabc";
         let mut src = data;
         let mut reader = BodyReader::new(&mut src, Vec::new());
@@ -2192,12 +2594,63 @@ mod tests {
         }
     }
 
+    /// Slice-then-EOF backend: serves `data` then a clean 0 — the staged
+    /// "backend died after N bytes" shape the round-18 M3 truncation pins
+    /// need (HeadThenPanicMock panics on any post-head poll and EofMock
+    /// carries no bytes at all).
+    struct SliceMock {
+        data: &'static [u8],
+    }
+
+    impl SliceMock {
+        fn new(data: &'static [u8]) -> Self {
+            Self { data }
+        }
+    }
+
+    impl tokio::io::AsyncRead for SliceMock {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.data.is_empty() {
+                return std::task::Poll::Ready(Ok(())); // clean EOF
+            }
+            let n = self.data.len().min(buf.remaining());
+            buf.put_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     /// Drive one h2 request/response exchange: `serve` runs server-side with
     /// the accepted request's `respond` handle and returns the
     /// client-observed (status, headers, body). The h2 connection lives in a
     /// driver task so the send side flushes while `serve` answers — the
     /// `with_h2_request` pattern, extended to full responses.
     async fn h2c_test_roundtrip<F, Fut>(method: &str, serve: F) -> (u16, http::HeaderMap, Vec<u8>)
+    where
+        F: FnOnce(SendResponse<Bytes>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), h2::Error>> + Send + 'static,
+    {
+        let (status, headers, body, err) = h2c_test_roundtrip_body_err(method, serve).await;
+        assert!(
+            err.is_none(),
+            "clean-backend rounds must end with END_STREAM, got a stream error: {err:?}"
+        );
+        (status, headers, body)
+    }
+
+    /// Round like [`h2c_test_roundtrip`] but also returns the body-stream
+    /// error: None = the stream ended cleanly (END_STREAM); Some = the
+    /// stream was reset — the round-18 M3 mirror pins must SEE the reset,
+    /// where the 3-tuple roundtrip drain (`while let Some(Ok(chunk))`)
+    /// treats an aborted stream identically to a clean end.
+    async fn h2c_test_roundtrip_body_err<F, Fut>(
+        method: &str,
+        serve: F,
+    ) -> (u16, http::HeaderMap, Vec<u8>, Option<h2::Error>)
     where
         F: FnOnce(SendResponse<Bytes>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<(), h2::Error>> + Send + 'static,
@@ -2246,14 +2699,24 @@ mod tests {
         let headers = response.headers().clone();
         let mut body = Vec::new();
         let mut recv = response.into_body();
-        while let Some(Ok(chunk)) = recv.data().await {
-            body.extend_from_slice(&chunk);
+        // Error-distinguishing drain: Some(Err) = the server reset the
+        // stream (the M3 pins); None = clean END_STREAM.
+        let mut stream_err: Option<h2::Error> = None;
+        loop {
+            match recv.data().await {
+                Some(Ok(chunk)) => body.extend_from_slice(&chunk),
+                Some(Err(e)) => {
+                    stream_err = Some(e);
+                    break;
+                }
+                None => break,
+            }
         }
         server_task
             .await
             .expect("server task panicked")
             .expect("serve returned an error");
-        (status, headers, body)
+        (status, headers, body, stream_err)
     }
 
     #[tokio::test]
@@ -2441,5 +2904,195 @@ mod tests {
             Some("text/html")
         );
         assert_eq!(body, frp_core::bridge::GO_404_NOT_FOUND_BODY.as_bytes());
+    }
+
+    // --- Round-18 wave mirrors (the client plugin h2.rs M2/M3/M4 +
+    // deviation-3 fixes, applied to this server h2c twin): obs-fold heads
+    // merge and serve, dup/garbage Content-Length heads behave like Go's
+    // transport, and truncated bodies reset the stream instead of ending
+    // clean.
+
+    #[tokio::test]
+    async fn test_h2_backend_obs_fold_head_merges_and_forwards() {
+        // M4 mirror e2e: a legal obs-fold backend head now SERVES (200,
+        // merged value) — RED pre-fix: the fold lost its leading space,
+        // read as a colonless record, and the whole head failed → 404.
+        let (status, headers, body, err) =
+            h2c_test_roundtrip_body_err("GET", |respond| async move {
+                let mut respond = respond;
+                let mut backend = SliceMock::new(
+                    b"HTTP/1.1 200 OK\r\nX-A: one\r\n two\r\nContent-Length: 2\r\n\r\nok",
+                );
+                let page = h2c_not_found_body("");
+                stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+            })
+            .await;
+        assert_eq!(status, 200, "obs-fold head must serve, not 404");
+        assert!(err.is_none());
+        assert_eq!(
+            headers.get("x-a").and_then(|v| v.to_str().ok()),
+            Some("one two"),
+            "the merged fold value reaches the h2 client"
+        );
+        assert_eq!(body, b"ok");
+    }
+
+    #[tokio::test]
+    async fn test_h2_backend_duplicate_rows_all_reach_the_client() {
+        // M2 mirror e2e (pin): duplicate Set-Cookie rows both survive the
+        // head→h2 copy (the append loop was already correct — this pins it
+        // against a regression to `insert`).
+        let (status, headers, body, err) = h2c_test_roundtrip_body_err("GET", |respond| async move {
+            let mut respond = respond;
+            let mut backend = SliceMock::new(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\nok",
+            );
+            let page = h2c_not_found_body("");
+            stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+        })
+        .await;
+        assert_eq!(status, 200);
+        assert!(err.is_none());
+        let cookies: Vec<&str> = headers
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(
+            cookies,
+            ["a=1", "b=2"],
+            "duplicate rows must ALL reach the client"
+        );
+        assert_eq!(body, b"ok");
+    }
+
+    #[tokio::test]
+    async fn test_h2_backend_duplicate_content_length_go_fixlength_parity() {
+        // Identical dup CL rows → 200 with ONE content-length row on the
+        // h2 wire (RED pre-fix: the parse kept both rows and the copy loop
+        // forwarded both — fixLength dedupes, Go Issue 16490).
+        let (status, headers, body, err) =
+            h2c_test_roundtrip_body_err("GET", |respond| async move {
+                let mut respond = respond;
+                let mut backend = SliceMock::new(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok",
+                );
+                let page = h2c_not_found_body("");
+                stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+            })
+            .await;
+        assert_eq!(status, 200);
+        assert!(err.is_none());
+        assert_eq!(body, b"ok");
+        assert_eq!(
+            headers.get_all("content-length").iter().count(),
+            1,
+            "identical duplicate CL rows collapse to one on the wire"
+        );
+        // Differing dup CL values fail the whole head → the Go 404 class
+        // (RED pre-fix: 200 forwarded, its body framing matching neither
+        // row).
+        let (status, _headers, _body, _err) =
+            h2c_test_roundtrip_body_err("GET", |respond| async move {
+                let mut respond = respond;
+                let mut backend = SliceMock::new(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello",
+                );
+                let page = h2c_not_found_body("");
+                stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+            })
+            .await;
+        assert_eq!(
+            status, 404,
+            "conflicting duplicate Content-Length fails the whole head → Go 404 class"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_h2_backend_garbage_content_length_go_404_class() {
+        // Deviation-3 e2e: a garbage or empty Content-Length row fails the
+        // whole head → the Go 404 class (RED pre-fix: 200 forwarded with
+        // the garbage row and the body read to EOF).
+        for staged in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\nhi"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\nhi"[..],
+        ] {
+            let (status, _headers, _body, _err) =
+                h2c_test_roundtrip_body_err("GET", move |respond| {
+                    let mut backend = SliceMock::new(staged);
+                    async move {
+                        let mut respond = respond;
+                        let page = h2c_not_found_body("");
+                        stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+                    }
+                })
+                .await;
+            assert_eq!(
+                status,
+                404,
+                "garbage Content-Length row fails the whole head: {:?}",
+                String::from_utf8_lossy(staged)
+            );
+        }
+        // A padded numeric value ("5 ") stays legal (TrimString) and
+        // serves its body.
+        let (status, _headers, body, err) =
+            h2c_test_roundtrip_body_err("GET", |respond| async move {
+                let mut respond = respond;
+                let mut backend =
+                    SliceMock::new(b"HTTP/1.1 200 OK\r\nContent-Length: 5 \r\n\r\nhello");
+                let page = h2c_not_found_body("");
+                stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+            })
+            .await;
+        assert_eq!(status, 200, "padded Content-Length stays legal");
+        assert!(err.is_none());
+        assert_eq!(body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_h2_backend_truncated_cl_body_resets_stream() {
+        // M3 mirror e2e: declared 10 body bytes, backend delivers 2 then
+        // EOFs. Go copyResponse aborts mid-body → RST_STREAM
+        // INTERNAL_ERROR; the old CL arm `Err(_) => break` fell to the
+        // clean END_STREAM and the client read the truncated body as a
+        // complete 200 (RED pre-fix: err is None).
+        let (status, _headers, _body, err) =
+            h2c_test_roundtrip_body_err("GET", |respond| async move {
+                let mut respond = respond;
+                let mut backend =
+                    SliceMock::new(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhi");
+                let page = h2c_not_found_body("");
+                stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+            })
+            .await;
+        assert_eq!(status, 200, "the head itself is valid and served");
+        assert!(
+            err.is_some(),
+            "a Content-Length-bounded body cut short must reset the stream, not end clean"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_h2_backend_truncated_chunked_body_resets_stream() {
+        // M3 mirror e2e — the chunked leg: declared 5 bytes, delivers 2,
+        // then EOF. The old walker returned an empty trailer map on the
+        // mid-chunk EOF and the caller ended the stream cleanly (RED
+        // pre-fix: err is None — the walker arms and the CRLF-mismatch
+        // CANCEL path all used to swallow or reset-with-wrong-code).
+        let (status, _headers, _body, err) =
+            h2c_test_roundtrip_body_err("GET", |respond| async move {
+                let mut respond = respond;
+                let mut backend =
+                    SliceMock::new(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhe");
+                let page = h2c_not_found_body("");
+                stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+            })
+            .await;
+        assert_eq!(status, 200, "the head itself is valid and served");
+        assert!(
+            err.is_some(),
+            "a chunked body cut mid-chunk must reset the stream, not end clean"
+        );
     }
 }

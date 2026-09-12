@@ -208,18 +208,35 @@ pub fn canonicalize_head_crlf(pre_read: Vec<u8>) -> Vec<u8> {
     out
 }
 
-/// Go net/http `ParseHTTPVersion` — an exact-match switch on the version
-/// token (net/http/request.go): only `HTTP/1.0`, `HTTP/1.1`, `HTTP/2.0` and
-/// `HTTP/3.0` parse; every other shape is malformed — multi-digit versions
-/// (`HTTP/1.10`), digit lookalikes (`HTTP/9.9`), missing suffix (`HTTP/1`),
-/// garbage (`FOO`). The pre-round-7 approximation (single ASCII digit each
-/// side of the dot) accepted `HTTP/9.9`, which Go's `http.ReadResponse`
-/// rejects before any status handling (audit round 7, round-3 review
-/// finding). Callers: the CONNECT proxy status gate, the health
-/// response-head parse, and both h2 backend-head parses (server h2c + the
-/// client https2http plugin).
+/// Go net/http `ParseHTTPVersion` (net/http/request.go) — LENIENT, not an
+/// exact-match switch: `HTTP/1.0` and `HTTP/1.1` are exact rows, and every
+/// other parseable token is exactly 8 chars, `HTTP/`-prefixed, with `.` at
+/// [6] and single ASCII digits at [5] and [7]. So `HTTP/0.0`-`HTTP/9.9`
+/// parse on both sides of the dot (`HTTP/9.9`, `HTTP/1.2`, `HTTP/0.9`,
+/// `HTTP/4.0` all pass) and `http.ReadResponse` accepts every parseable
+/// proto. Failing shapes: any length other than 8 (`HTTP/1.10`,
+/// `HTTP/10.0`, `HTTP/1`), no `.` at [6] (`HTTP/01.1`), non-digit minor
+/// (`HTTP/1.x`), non-`HTTP/` prefix (`http/1.1`, `FOO`) and trailing bytes
+/// (`HTTP/1.1 `). (Audit round 7 pinned the reverse — an exact switch
+/// rejecting `HTTP/9.9` as "digit lookalikes" — a misreading of the Go
+/// source; the pre-round-7 single-digit approximation was correct, and
+/// round 18 restores it with the 8-char shape check added. Request faces
+/// keep their own major-1 gates on top when they need
+/// `http1ServerSupportsRequest` semantics.) Callers (all RESPONSE faces,
+/// where ReadResponse's gate is exactly this): the CONNECT proxy status
+/// gate, the health response-head parse, and both h2 backend-head parses
+/// (server h2c + the client https2http plugin).
 pub fn is_valid_http_version(vers: &str) -> bool {
-    matches!(vers, "HTTP/1.0" | "HTTP/1.1" | "HTTP/2.0" | "HTTP/3.0")
+    match vers {
+        "HTTP/1.0" | "HTTP/1.1" => return true,
+        _ => {}
+    }
+    let b = vers.as_bytes();
+    b.len() == 8
+        && b.starts_with(b"HTTP/")
+        && b[5].is_ascii_digit()
+        && b[6] == b'.'
+        && b[7].is_ascii_digit()
 }
 
 #[cfg(test)]
@@ -482,24 +499,34 @@ mod tests {
     }
 
     #[test]
-    fn is_valid_http_version_go_parse_http_version_switch() {
-        // Go ParseHTTPVersion is an exact-match switch — these parse.
-        for ok in ["HTTP/1.0", "HTTP/1.1", "HTTP/2.0", "HTTP/3.0"] {
+    fn is_valid_http_version_go_parse_http_version_lenient() {
+        // Go ParseHTTPVersion: exact rows 1.0/1.1, else exactly-8-char
+        // `HTTP/X.Y` with single ASCII digits and '.' at [6]. The exact
+        // rows parse, and every 8-char single-digit shape parses too —
+        // HTTP/9.9 and HTTP/0.0 are legal (ReadResponse accepts any
+        // parseable proto). The round-7 exact-switch pin was a misreading
+        // of the Go source; corrected in round 18.
+        for ok in [
+            "HTTP/1.0", "HTTP/1.1", "HTTP/2.0", "HTTP/3.0", "HTTP/9.9", "HTTP/0.0", "HTTP/1.2",
+            "HTTP/0.9",
+        ] {
             assert!(is_valid_http_version(ok), "{ok} must pass");
         }
-        // The single-digit approximation accepted these; Go rejects them.
+        // Shape violations: wrong length, no '.' at [6], non-digit minor,
+        // wrong prefix, trailing bytes.
         for bad in [
-            "HTTP/9.9",
-            "HTTP/0.0",
             "HTTP/1.10",
             "HTTP/10.0",
+            "HTTP/9.10",
             "HTTP/1",
             "HTTP/1.",
+            "HTTP/1.x",
             "FOO",
             "HTTP",
             "http/1.1",
             "HTTP/1.1 ",
             "HTTP/01.1",
+            "XXXXX9.9",
         ] {
             assert!(!is_valid_http_version(bad), "{bad} must fail");
         }

@@ -1001,18 +1001,31 @@ async fn handle_http1_request<S>(
     // a space-containing name reaches the http layer and answers the
     // DETAILED "invalid header name"; an invalid single Host value (e.g.
     // "Host: a.com b.com") answers the DETAILED "malformed Host header".
-    // Residual ordering nuance (documented, not fixed): Go's read-time
-    // classes fire BEFORE the dup-Host/505/missing-Host gates, so a
-    // multi-defect head that trips one of those arms can take that arm's
-    // render here where Go's read-time error would win (both 400s, except
-    // an HTTP/2.0 + read-time-defect head: 505 vs Go's 400). The arm order
-    // here otherwise mirrors Go conn.readRequest's classification chain
-    // (net/http server.go:1043-1073): the head-cap error — hitReadLimit →
-    // errTooLarge at 1043-1047, the analog of the unterminated-at-cap 431
-    // arm above — is classified before the version gate
-    // (http1ServerSupportsRequest, 1049-1052) and the missing-Host /
-    // malformed-Host / name-value gates (1057-1073) that the parse arms
-    // above mirror in the same order.
+    // Residual ordering nuances (documented, not fixed):
+    // (1) Go's read-time header classes fire BEFORE the dup-Host/505/
+    // missing-Host gates, so a multi-defect head that trips one of those
+    // arms can take that arm's render here where Go's read-time error
+    // would win (both 400s, except an HTTP/2.0 + read-time-defect head:
+    // 505 vs Go's 400).
+    // (2) The 431 cap arm and the unterminated-head silent close above
+    // fire BEFORE the request-line parse (go1.25 conn.readRequest reads
+    // and parses line 1 first — setReadLimit then readRequest — and the
+    // errTooLarge special-case only runs AFTER readRequest returns, i.e.
+    // after a line-1 parse success). Two multi-defect shapes therefore
+    // answer differently from Go: {unparseable request line} × {head ≥
+    // 4096 without a blank line} → 431 here where Go's line-1 parse
+    // failure answers its generic 400 first, and {unparseable line,
+    // terminated} × {peer EOF mid-head, < 4096 total} → silent close here
+    // where Go's line-1 parse already failed and answered 400. Both fail
+    // closed (431/0-byte vs Go 400); kept because the cap and EOF arms
+    // decide from buffer size alone, before any parse.
+    // (3) The arm order here otherwise mirrors Go conn.readRequest's
+    // classification chain (go1.25 net/http server.go, conn.readRequest):
+    // the head-cap error — hitReadLimit → errTooLarge — the analog of the
+    // unterminated-at-cap 431 arm above — is classified before the
+    // version gate (http1ServerSupportsRequest) and the missing-Host /
+    // malformed-Host / name-value gates that the parse arms above mirror
+    // in the same order.
     match validate_vhost_head_lines(request_text) {
         HeadLineVerdict::Ok => {}
         HeadLineVerdict::Malformed => {

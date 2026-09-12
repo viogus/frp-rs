@@ -2582,3 +2582,100 @@ async fn test_http_proxy_read_limit_exact_boundary_rows() {
         resp.len()
     );
 }
+
+/// Round-18 audit G4 (R1 LOW regression pin): a LOWERCASE `connect` method
+/// token must NOT tunnel. Go http_proxy.go sniffs the CONNECT face with an
+/// EqualFold 7-byte compare, but the request-line gate is EXACT-case
+/// (package http.ReadRequest, request.go:1118 `justAuthority`):
+/// `connect host:port` parses as absolute-form-ish (Scheme "connect",
+/// Opaque "host:port") with URL.Host == "" — and Go frp dials
+/// `r.URL.Host` unconditionally, so `net.Dial("tcp", "")` fails and the
+/// request answers the bare 47-byte dial 400 with the backend NEVER
+/// reached. The pre-fix (round-17) code dialed the verbatim target for any
+/// EqualFold-CONNECT method, so a lowercase connect to a LIVE backend
+/// established a tunnel instead of failing — RED here. (Target is a live
+/// capture backend, not a refused port, so the pre-fix tunnel path really
+/// differs: a refused target would answer the same 400 both ways and the
+/// pin would be vacuous.)
+#[tokio::test]
+async fn test_http_proxy_lowercase_connect_answers_dial_400_never_reaches_backend() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let (a1, c1) = (accepted.clone(), captured.clone());
+    tokio::spawn(async move {
+        // Keep accepting for the whole test; a tunnel dial lands here.
+        loop {
+            match backend.accept().await {
+                Ok((mut conn, _)) => {
+                    a1.fetch_add(1, Ordering::SeqCst);
+                    let mut buf = vec![0u8; 1024];
+                    let _ = conn.read(&mut buf).await;
+                    c1.lock().unwrap().extend_from_slice(&buf);
+                    // Never reply: a tunneled client would hang/EOF with
+                    // zero bytes — not the 400 this pin demands.
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: "http_proxy".into(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http_proxy(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+    client
+        .write_all(
+            format!("connect {backend_addr} HTTP/1.1\r\nHost: {backend_addr}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("conn must close after the dial-failure 400")
+    .unwrap();
+    assert_eq!(
+        resp.as_slice(),
+        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
+        "lowercase connect must answer Go's byte-exact dial 400, got {} bytes: {:?}",
+        resp.len(),
+        String::from_utf8_lossy(&resp)
+    );
+
+    // Let any (wrong) tunnel dial land before asserting the backend saw
+    // nothing. Post-fix the plugin never dials (empty target), so this is
+    // deterministic; the pre-fix tunnel path fails the 400 assert above
+    // regardless.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        0,
+        "backend must receive ZERO connections (no tunnel dial)"
+    );
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "backend must receive ZERO bytes"
+    );
+}
