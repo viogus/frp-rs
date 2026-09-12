@@ -924,6 +924,35 @@ async fn handle_http1_request<S>(
         write_go_server_error(&mut stream, "400 Bad Request").await;
         return;
     }
+    // Round-18 (Go conn.serve parity): the read-time header-block classes
+    // end the head HERE — before the dup-Host / 505 / missing-Host gates
+    // below. Go's flow is conn.readRequest → package readRequest, which
+    // parses the request line, then runs ReadMIMEHeader over the header
+    // lines, then rejects duplicate Host (request.go:1139) — all of that
+    // BEFORE conn.readRequest's http1ServerSupportsRequest 505 gate and
+    // its wire-Host "missing required Host header" gate (server.go). A
+    // textproto read-time rejection — the "malformed MIME header initial
+    // line" class (a FIRST header line starting with SP/HTAB,
+    // textproto/reader.go:536-544), a colonless group-first line, a
+    // non-tchar/empty name, a CTL/DEL in a value or fold — makes Go's
+    // ReadMIMEHeader return the error, so conn.serve renders its generic
+    // 103-byte 400 and none of the later gates ever run: a multi-defect
+    // head that also lacks a Host, or carries a major-2 version, answers
+    // the GENERIC 400 — never "missing required Host header", never 505
+    // (probes: a fold-first head under 1.1-without-Host and under
+    // HTTP/2.0 both answered the bare 400). The client-plugin face
+    // already validated the header block before its 505 classification
+    // (frp-client/src/plugin/http.rs
+    // `http_proxy_505_classified_head_validates_header_block_first`);
+    // both faces now agree on the order.
+    // Only the `Malformed` class moves up: the statusError DETAILS
+    // (malformed Host value / invalid header name) keep their Go position
+    // AFTER the three gates, in the match at the end of this block.
+    let head_verdict = validate_vhost_head_lines(request_text);
+    if matches!(head_verdict, HeadLineVerdict::Malformed) {
+        write_go_server_error(&mut stream, "400 Bad Request").await;
+        return;
+    }
     // Go ServeHTTP (pkg/util/vhost/http.go:282-285): a request whose METHOD
     // is CONNECT is handed to connectHandler, which forwards the head RAW —
     // the Rewrite hook (X-Forwarded-*) and rc.Headers (requestHeaders) never
@@ -992,9 +1021,11 @@ async fn handle_http1_request<S>(
     // FIX 6 (audit round 14): Go conn.readRequest's server-layer head
     // validation (server.go:1061-1072) — dup-Host → 505 → missing-Host
     // keep their Go order above, then Go validates the Host value
-    // (ValidHostHeader) and the per-header name bytes. Runs for EVERY
+    // (ValidHostHeader) and the per-header name bytes. Applies to EVERY
     // parse-Ok request — CONNECT and absolute-form included (Go validates
-    // the wire headers regardless of routing). Render classes verified
+    // the wire headers regardless of routing); only the read-time
+    // `Malformed` class returned earlier (round-18), so this match carries
+    // the statusError DETAILS only. Render classes verified
     // byte-for-byte with probes vs go1.25.0: textproto read-time classes
     // (CTL in a value, non-token non-space name bytes) answer the GENERIC
     // 400 (e.g. "Host: a.co\x01m" never reaches the malformed-Host gate);
@@ -1002,12 +1033,7 @@ async fn handle_http1_request<S>(
     // DETAILED "invalid header name"; an invalid single Host value (e.g.
     // "Host: a.com b.com") answers the DETAILED "malformed Host header".
     // Residual ordering nuances (documented, not fixed):
-    // (1) Go's read-time header classes fire BEFORE the dup-Host/505/
-    // missing-Host gates, so a multi-defect head that trips one of those
-    // arms can take that arm's render here where Go's read-time error
-    // would win (both 400s, except an HTTP/2.0 + read-time-defect head:
-    // 505 vs Go's 400).
-    // (2) The 431 cap arm and the unterminated-head silent close above
+    // (1) The 431 cap arm and the unterminated-head silent close above
     // fire BEFORE the request-line parse (go1.25 conn.readRequest reads
     // and parses line 1 first — setReadLimit then readRequest — and the
     // errTooLarge special-case only runs AFTER readRequest returns, i.e.
@@ -1019,19 +1045,18 @@ async fn handle_http1_request<S>(
     // where Go's line-1 parse already failed and answered 400. Both fail
     // closed (431/0-byte vs Go 400); kept because the cap and EOF arms
     // decide from buffer size alone, before any parse.
-    // (3) The arm order here otherwise mirrors Go conn.readRequest's
+    // (2) The arm order otherwise mirrors Go conn.readRequest's
     // classification chain (go1.25 net/http server.go, conn.readRequest):
-    // the head-cap error — hitReadLimit → errTooLarge — the analog of the
-    // unterminated-at-cap 431 arm above — is classified before the
-    // version gate (http1ServerSupportsRequest) and the missing-Host /
-    // malformed-Host / name-value gates that the parse arms above mirror
-    // in the same order.
-    match validate_vhost_head_lines(request_text) {
-        HeadLineVerdict::Ok => {}
-        HeadLineVerdict::Malformed => {
-            write_go_server_error(&mut stream, "400 Bad Request").await;
-            return;
-        }
+    // the read-time header-block classes (`Malformed`, round-18 above) →
+    // dup-Host → the http1ServerSupportsRequest 505 gate → the missing-
+    // Host gate → the ValidHostHeader / header-name statusError details
+    // (the match below); the head-cap error — hitReadLimit → errTooLarge,
+    // the analog of the unterminated-at-cap 431 arm above — is classified
+    // before the version gate.
+    match head_verdict {
+        // `Malformed` was answered above — Go's read-time classes precede
+        // every gate and detail render.
+        HeadLineVerdict::Ok | HeadLineVerdict::Malformed => {}
         HeadLineVerdict::Detailed(text) => {
             write_go_server_error(&mut stream, text).await;
             return;
@@ -1840,8 +1865,9 @@ enum HeadLineVerdict {
     /// No defect in the prescribed classes.
     Ok,
     /// Generic 400 render ("400 Bad Request") — Go textproto read-time
-    /// classes (they precede the dup-Host/505/missing-Host gates in Go;
-    /// see the caller comment for the residual ordering nuance).
+    /// classes. They precede the dup-Host/505/missing-Host gates in Go,
+    /// and the round-18 caller dispatch runs this arm before those gates
+    /// too (see the caller comment).
     Malformed,
     /// Go statusError — carries the FULL status text (detail appended on
     /// the status line AND the body: "400 Bad Request: malformed Host
@@ -1851,9 +1877,10 @@ enum HeadLineVerdict {
 
 /// FIX 6 (audit round 14): Go conn.readRequest's post-gate head
 /// validation (server.go:1061-1072), verified byte-for-byte with probes
-/// against go1.25.0. The caller keeps the Go order of the earlier arms
-/// (dup-Host → 505 → missing-Host); this function covers the classes that
-/// follow them in Go's flow, over the RAW wire lines (textproto merges
+/// against go1.25.0. The caller emits the `Malformed` verdict BEFORE the
+/// earlier arms (dup-Host → 505 → missing-Host — Go's read-time parse
+/// errors precede all three; round 18) and emits the `Detailed` verdicts
+/// after them, over the RAW wire lines (textproto merges
 /// obs-fold continuations into the preceding header's value with a single
 /// SP per fold after a SP/HTAB-only trim of each physical line — reader.go
 /// trim, see the value-scan comment below for the edge-CTL consequence):
@@ -1882,10 +1909,9 @@ enum HeadLineVerdict {
 /// Render precedence inside this function mirrors Go: the read-time
 /// generic classes (1/2) beat the statusError details (3/4), and the Host
 /// check (3) precedes the name check (4). The textproto read-time classes
-/// actually fire BEFORE Go's dup-Host/505/missing-Host gates — the
-/// prescription keeps those arms' earlier order, so a multi-defect head
-/// that also trips a gate can take the gate's render here where Go's
-/// read-time error would win (both 400s except the 505 class).
+/// fire BEFORE Go's dup-Host/505/missing-Host gates — the caller dispatch
+/// matches that order since round 18 (its `Malformed` arm returns before
+/// those gates); the `Detailed` classes keep their Go position after them.
 fn validate_vhost_head_lines(request: &str) -> HeadLineVerdict {
     let mut lines = request.lines().skip(1).peekable();
     let mut malformed = false;
@@ -5694,6 +5720,50 @@ mod tests {
             b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
             "tab-joined request line must answer Go's malformed-request 400"
         );
+
+        // Round-18 ordering pins (Go conn.serve): the read-time header-block
+        // classes are classified BEFORE the dup-Host / 505 / missing-Host
+        // gates, so a multi-defect head takes the GENERIC 400 — Go's
+        // ReadMIMEHeader error returns before conn.readRequest reaches those
+        // gates. RED pre-fix: the fold-first head without a Host answered
+        // "missing required Host header" and the HTTP/2.0 one answered 505.
+        let generic_400: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request";
+
+        // obs-fold FIRST header line (no header to continue) + no Host line:
+        // textproto "malformed MIME header initial line" → generic 400, NOT
+        // the missing-Host gate's detailed 400.
+        let fold_no_host = respond(state.clone(), b"GET / HTTP/1.1\r\n fold: x\r\n\r\n").await;
+        assert_eq!(
+            fold_no_host, generic_400,
+            "a fold-first head read-time error precedes the missing-Host gate (Go conn.serve)"
+        );
+
+        // The same head under a 505-classified version: the read-time error
+        // precedes http1ServerSupportsRequest too → generic 400, NOT 505.
+        let fold_505 = respond(state.clone(), b"GET / HTTP/2.0\r\n fold: x\r\n\r\n").await;
+        assert_eq!(
+            fold_505, generic_400,
+            "a fold-first head read-time error precedes the 505 version gate (Go conn.serve)"
+        );
+
+        // A fold whose content LOOKS like a Host header is still a fold —
+        // Go's textproto fails the initial line before any Host line is
+        // stored, so this stays the same generic 400 class (never the
+        // missing-Host render, never a route on the folded value).
+        let fold_host = respond(state.clone(), b"GET / HTTP/1.1\r\n Host: a.com\r\n\r\n").await;
+        assert_eq!(
+            fold_host, generic_400,
+            "a fold-wrapped \"Host: a.com\" line is never a Host header (Go textproto initial-line error)"
+        );
+
+        // Non-malformed flow unchanged: a well-formed head still routes
+        // (unregistered host → Go's 404 route-miss page).
+        let ok_head = respond(state.clone(), b"GET / HTTP/1.1\r\nHost: a.com\r\n\r\n").await;
+        assert!(
+            ok_head.starts_with(b"HTTP/1.1 404 Not Found\r\n"),
+            "a well-formed head must keep routing (404 route miss), got: {:?}",
+            String::from_utf8_lossy(&ok_head)
+        );
     }
 
     /// Registers a route for `hop.example.com` and resolves a raw head
@@ -6135,6 +6205,17 @@ mod tests {
         // "malformed MIME header initial line" → generic.
         assert_eq!(
             validate_vhost_head_lines("GET / HTTP/1.1\r\n Host: a.com\r\n\r\n"),
+            HeadLineVerdict::Malformed
+        );
+        // Round-18: the fold-first class is Host- and version-independent —
+        // the verdict feeding the caller's early generic-400 arm (before
+        // the dup-Host / 505 / missing-Host gates) is Malformed either way.
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/1.1\r\n fold: x\r\n\r\n"),
+            HeadLineVerdict::Malformed
+        );
+        assert_eq!(
+            validate_vhost_head_lines("GET / HTTP/2.0\r\n fold: x\r\n\r\n"),
             HeadLineVerdict::Malformed
         );
         // Round-15 W1: a group-first line without a colon is Go
