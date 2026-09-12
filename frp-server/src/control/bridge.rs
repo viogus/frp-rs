@@ -3716,7 +3716,7 @@ mod tests {
             std::time::Duration::from_secs(1),
             poll_fn(|cx| {
                 let mut buf = ReadBuf::new(chunk);
-                match Pin::new(injector).poll_read(cx, &mut buf) {
+                match Pin::new(&mut *injector).poll_read(cx, &mut buf) {
                     Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.filled().len())),
                     Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
                     Poll::Pending => Poll::Pending,

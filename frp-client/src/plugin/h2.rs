@@ -512,6 +512,11 @@ async fn read_until_head(
 struct ParsedHead {
     status: u16,
     headers: Vec<(http::HeaderName, http::HeaderValue)>,
+    /// Validated Content-Length value (Go `parseContentLength`), carried out
+    /// of the head parse because the stored header keeps trailing SP/HTAB
+    /// (TrimLeft storage) — re-parsing the raw row would reject the legal
+    /// padded form "5 " that this value was trimmed from.
+    content_length: Option<u64>,
     /// Offset into the original head buffer where the body begins.
     body_offset: usize,
 }
@@ -681,9 +686,34 @@ fn parse_response_head(head: &[u8]) -> Option<ParsedHead> {
         }
         i += 1;
     }
+    // The surviving row's TrimString'ed value must then satisfy
+    // parseContentLength (Go net/http/transfer.go, mirroring the server twin
+    // vhost_h2c.rs): non-empty, all-ASCII-digits, within 63 bits — a garbage
+    // ("Content-Length: abc"), empty ("Content-Length:"), or overflowing
+    // value fails readTransfer → the WHOLE head is malformed (502), never a
+    // response whose body is read to EOF past a declared length. Padded
+    // values ("5 ") are legal; the digit gate rejects sign prefixes ("+5")
+    // the way Go's ParseUint does. The validated value rides out on
+    // `ParsedHead` so the body leg consumes what was TrimString'ed here.
+    let mut content_length: Option<u64> = None;
+    if let Some(idx) = cl_row {
+        let value = trim_ascii_ws(headers[idx].1.as_bytes());
+        let parsed = std::str::from_utf8(value).ok().and_then(|s| {
+            if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+                s.parse::<i64>().ok()
+            } else {
+                None
+            }
+        });
+        let Some(n) = parsed else {
+            return None; // parseContentLength failure (Go ParseUint bitSize 63)
+        };
+        content_length = Some(n as u64);
+    }
     Some(ParsedHead {
         status,
         headers,
+        content_length,
         body_offset: head_end,
     })
 }
@@ -1075,6 +1105,7 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     let ParsedHead {
         status,
         headers,
+        content_length,
         body_offset,
     } = parsed;
 
@@ -1100,9 +1131,6 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
         resp.headers_mut().append(n.clone(), v.clone());
     }
 
-    let content_length = header_value(&headers, "content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<usize>().ok());
     let chunked = header_value(&headers, "transfer-encoding")
         .map(|v| {
             v.to_str()
@@ -1126,7 +1154,7 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
         }
     } else if let Some(mut remaining) = content_length {
         while remaining > 0 {
-            let n = remaining.min(8192);
+            let n = remaining.min(8192) as usize;
             let data = match reader.read_exact(n).await {
                 Ok(d) => d,
                 Err(_) => {
@@ -1140,7 +1168,7 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
                     return abort_stream(&mut send).map(|_| ());
                 }
             };
-            remaining -= data.len();
+            remaining -= data.len() as u64;
             send.send_data(Bytes::from(data), false)?;
         }
     } else {
@@ -1496,12 +1524,12 @@ mod tests {
         // errors). The old code silently skipped each bad row and forwarded
         // the rest — RED on every shape below.
         for bad in [
-            b"HTTP/1.1 200 OK\r\nX-No-Colon here\r\n\r\n", // colonless record
-            b"HTTP/1.1 200 OK\r\n: empty-name\r\n\r\n",    // empty name
-            b"HTTP/1.1 200 OK\r\nX@Y: bad name byte\r\n\r\n", // non-token name
-            b"HTTP/1.1 200 OK\r\nX-Y: a\x01b\r\n\r\n",     // CTL 0x01 in value
-            b"HTTP/1.1 200 OK\r\nX-Y: a\x7fb\r\n\r\n",     // DEL in value
-            b"HTTP/1.1 200 OK\r\n X-Y: leading fold\r\n\r\n", // SP-leading block line
+            &b"HTTP/1.1 200 OK\r\nX-No-Colon here\r\n\r\n"[..], // colonless record
+            &b"HTTP/1.1 200 OK\r\n: empty-name\r\n\r\n"[..],    // empty name
+            &b"HTTP/1.1 200 OK\r\nX@Y: bad name byte\r\n\r\n"[..], // non-token name
+            &b"HTTP/1.1 200 OK\r\nX-Y: a\x01b\r\n\r\n"[..],     // CTL 0x01 in value
+            &b"HTTP/1.1 200 OK\r\nX-Y: a\x7fb\r\n\r\n"[..],     // DEL in value
+            &b"HTTP/1.1 200 OK\r\n X-Y: leading fold\r\n\r\n"[..], // SP-leading block line
         ] {
             assert!(
                 parse_response_head(bad).is_none(),
@@ -1559,6 +1587,69 @@ mod tests {
             "a=1"
         );
         assert_eq!(parsed.headers[1].1.to_str().unwrap(), "b=2");
+    }
+
+    // --- Round-18 deviation-3: parseContentLength value gate (Go
+    // net/http/transfer.go, server twin vhost_h2c.rs). readTransfer fails the
+    // WHOLE head on a garbage / empty / overflowing Content-Length, so the
+    // body leg must never fall back to read-body-to-EOF past a declared
+    // length (RED pre-fix: the garbage row was forwarded and the body read to
+    // EOF). The validated count rides out on ParsedHead because the stored
+    // row keeps its trailing SP/HTAB — re-parsing the raw row would reject
+    // the legal padded form "5 " this gate just TrimString'ed.
+    #[test]
+    fn parse_response_head_content_length_value_gate() {
+        // Legal values carry the parsed count, padded row included
+        // (textproto.TrimString: "5 " ≡ "5"); no CL row at all → None.
+        for (head, want) in [
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nbody"[..],
+                Some(5u64),
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 5 \r\n\r\nbody"[..],
+                Some(5u64),
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 07\r\n\r\nbody"[..],
+                Some(7u64),
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"[..],
+                Some(0u64),
+            ),
+            (&b"HTTP/1.1 200 OK\r\nNo-Length: 5\r\n\r\nbody"[..], None),
+        ] {
+            let parsed = parse_response_head(head).expect("legal head parses");
+            assert_eq!(
+                parsed.content_length,
+                want,
+                "carried Content-Length wrong for {:?}",
+                String::from_utf8_lossy(head)
+            );
+        }
+        // parseContentLength failures: empty (both spellings), non-digit,
+        // sign-prefixed (the digit gate rejects "+5" the way Go's ParseUint
+        // does — leading zeros ARE legal), and anything past 2^63-1.
+        for bad in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: \r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 5x\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: -5\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 9223372036854775808\r\n\r\n"[..], // 2^63
+        ] {
+            assert!(
+                parse_response_head(bad).is_none(),
+                "parseContentLength failure must fail the whole head: {:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // The largest legal value (2^63-1) is accepted and carried verbatim.
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 9223372036854775807\r\n\r\n";
+        let parsed = parse_response_head(head).expect("2^63-1 is legal");
+        assert_eq!(parsed.content_length, Some(i64::MAX as u64));
     }
 
     // --- Audit FIX 2: interim 1xx heads are swallowed, the FINAL head is
