@@ -303,7 +303,7 @@ async fn handle_static_file_conn(
     // captured first row.
     let mut cur_is_auth = false;
     let mut cur_is_ims = false;
-    while let Some(line) = lines.next() {
+    for line in lines {
         if line.is_empty() {
             break;
         }

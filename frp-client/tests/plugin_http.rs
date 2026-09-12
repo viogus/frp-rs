@@ -2722,18 +2722,13 @@ async fn test_http_proxy_lowercase_connect_answers_dial_400_never_reaches_backen
     let (a1, c1) = (accepted.clone(), captured.clone());
     tokio::spawn(async move {
         // Keep accepting for the whole test; a tunnel dial lands here.
-        loop {
-            match backend.accept().await {
-                Ok((mut conn, _)) => {
-                    a1.fetch_add(1, Ordering::SeqCst);
-                    let mut buf = vec![0u8; 1024];
-                    let _ = conn.read(&mut buf).await;
-                    c1.lock().unwrap().extend_from_slice(&buf);
-                    // Never reply: a tunneled client would hang/EOF with
-                    // zero bytes — not the 400 this pin demands.
-                }
-                Err(_) => break,
-            }
+        while let Ok((mut conn, _)) = backend.accept().await {
+            a1.fetch_add(1, Ordering::SeqCst);
+            let mut buf = vec![0u8; 1024];
+            let _ = conn.read(&mut buf).await;
+            c1.lock().unwrap().extend_from_slice(&buf);
+            // Never reply: a tunneled client would hang/EOF with
+            // zero bytes — not the 400 this pin demands.
         }
     });
 
