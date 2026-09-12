@@ -668,7 +668,11 @@ fn build_http1_request_head(request: &http::Request<RecvStream>) -> Vec<u8> {
             // leg, immediately after the Transfer-Encoding line
             // (transfer.go:310-332). The inbound hop-by-hop `trailer`
             // declaration row is still dropped by the header loop above —
-            // this canonical line is its only egress form.
+            // this canonical line is its only egress form. The announcement
+            // is NEVER backed by values on the wire: Go's Request.Clone gives
+            // the outgoing request a nil-valued Trailer map (request.go:395),
+            // so the body ends with an EMPTY trailer block (`0\r\n\r\n`) —
+            // exact Go parity, not a bug.
             if let Some(keys) = frp_core::textproto::go_trailer_announcement(
                 request
                     .headers()

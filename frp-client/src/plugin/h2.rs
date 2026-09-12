@@ -440,8 +440,13 @@ fn build_http1_request_head<B>(
             xff.push_str(", ");
         }
         xff.push_str(&real_peer.to_string());
+        // Go's Header.WriteSubset trims EVERY value at egress
+        // (textproto.TrimString), the synthesized chain included — outer
+        // padding only; inner row padding and the ", " joins survive (a
+        // padded inbound row " 192.0.2.1 " yields "192.0.2.1 , <peer>").
+        let xff = trim_ascii_ws(xff.as_bytes());
         head.extend_from_slice(b"X-Forwarded-For: ");
-        head.extend_from_slice(xff.as_bytes());
+        head.extend_from_slice(xff);
         head.extend_from_slice(b"\r\n");
     }
     if !has_content_length {
@@ -462,7 +467,11 @@ fn build_http1_request_head<B>(
             // leg, immediately after the Transfer-Encoding line
             // (transfer.go:310-332). The inbound hop-by-hop `trailer`
             // declaration row is still dropped by the header loop above — the
-            // canonical line emitted here is its only egress form.
+            // canonical line emitted here is its only egress form. The
+            // announcement is NEVER backed by values on the wire: Go's
+            // Request.Clone gives the outgoing request a nil-valued Trailer
+            // map (request.go:395), so the body ends with an EMPTY trailer
+            // block (`0\r\n\r\n`) — exact Go parity, not a bug.
             if let Some(keys) = frp_core::textproto::go_trailer_announcement(
                 request
                     .headers()
@@ -1558,6 +1567,27 @@ mod tests {
         assert!(
             head.contains("X-Forwarded-For: , 198.51.100.23\r\n"),
             "an empty inbound XFF row must contribute an empty chain element, head:\n{head}"
+        );
+        assert_eq!(head.matches("X-Forwarded-For").count(), 1);
+    }
+
+    /// Go's Header.WriteSubset trims the whole synthesized XFF value at
+    /// egress (textproto.TrimString) — OUTER padding only, so a padded
+    /// inbound row keeps its tail padding (before the ", " join) while the
+    /// chain's leading space is dropped. RED pre-fix: the joined string was
+    /// emitted verbatim (`X-Forwarded-For:  192.0.2.1 , ...`).
+    #[test]
+    fn h2_head_padded_client_xff_row_outer_trimmed() {
+        let head = head_lines(&build_http1_request_head(
+            &build_req(Some(&[" 192.0.2.1 "])),
+            "",
+            &HashMap::new(),
+            real_ip(),
+            true,
+        ));
+        assert!(
+            head.contains("X-Forwarded-For: 192.0.2.1 , 198.51.100.23\r\n"),
+            "outer padding of the joined chain must be trimmed, head:\n{head}"
         );
         assert_eq!(head.matches("X-Forwarded-For").count(), 1);
     }
