@@ -306,9 +306,15 @@ fn is_hop_by_hop(name: &str) -> bool {
 
 /// Re-encode an h2 request as an HTTP/1.1 request head with the plugin's
 /// `request_headers` injected (Go `Header.Set` semantics: an existing header
-/// with the same name is replaced) and `host_header_rewrite` applied. A body
-/// without Content-Length is forwarded with `Transfer-Encoding: chunked` (Go
-/// http.Transport behavior for unknown-length bodies).
+/// with the same name is replaced) and `host_header_rewrite` applied.
+///
+/// The egress framing and hygiene follow Go `http.Transport`
+/// (`transferWriter` + `Header.WriteSubset`): every forwarded value is
+/// trimmed of ASCII SP/HTAB on both ends; a body without Content-Length is
+/// forwarded with `Transfer-Encoding: chunked`, and its declared trailer keys
+/// are re-announced on a canonical `Trailer:` line right after it; a
+/// body-less request emits `Content-Length: 0` unless the method is GET or
+/// HEAD, which omit the line (shouldSendContentLength, transfer.go:254-276).
 ///
 /// Generic over the body so tests can drive it with a body-less request
 /// (h2's `RecvStream` has no public constructor); `body_end_stream` is the
@@ -367,14 +373,22 @@ fn build_http1_request_head<B>(
         if !configured_xff && n.eq_ignore_ascii_case("x-forwarded-for") {
             continue;
         }
+        // Go's http.Transport writes every forwarded value through
+        // textproto.TrimString (Request.write → Header.WriteSubset), so a
+        // padded inbound value reaches the backend trimmed
+        // (`x-pad:  abc ` → `X-Pad: abc`). Copied verbatim pre-round-18.
+        // Header NAMES are still forwarded verbatim — name canonicalization
+        // is a separate divergence, deliberately not part of this change.
+        let value = trim_ascii_ws(value.as_bytes());
         // Guard against HTTP header injection via h2 header values — Go's
-        // http.Transport rejects CR/LF in header values.
-        if value.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
+        // http.Transport rejects CR/LF in header values. (Trimming only
+        // ASCII SP/HTAB cannot introduce one.)
+        if value.iter().any(|&b| b == b'\r' || b == b'\n') {
             continue;
         }
         head.extend_from_slice(n.as_bytes());
         head.extend_from_slice(b": ");
-        head.extend_from_slice(value.as_bytes());
+        head.extend_from_slice(value);
         head.extend_from_slice(b"\r\n");
     }
     // Host: host_header_rewrite wins; "host" in request_headers is skipped
@@ -390,17 +404,21 @@ fn build_http1_request_head<B>(
         head.extend_from_slice(h);
         head.extend_from_slice(b"\r\n");
     }
-    // Inject configured request headers (Go rewriteHTTPPluginRequest).
+    // Inject configured request headers (Go rewriteHTTPPluginRequest). These
+    // land in `outreq.Header` too, so the same TrimString pass applies on the
+    // way out (Go Header.WriteSubset trims EVERY value it writes, configured
+    // ones included).
     for (k, v) in request_headers {
         if k.eq_ignore_ascii_case("host") || is_hop_by_hop(k) {
             continue;
         }
-        if v.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
+        let v = trim_ascii_ws(v.as_bytes());
+        if v.iter().any(|&b| b == b'\r' || b == b'\n') {
             continue;
         }
         head.extend_from_slice(k.as_bytes());
         head.extend_from_slice(b": ");
-        head.extend_from_slice(v.as_bytes());
+        head.extend_from_slice(v);
         head.extend_from_slice(b"\r\n");
     }
     // Append the real tunnel peer to the client's X-Forwarded-For chain (Go
@@ -427,10 +445,35 @@ fn build_http1_request_head<B>(
         head.extend_from_slice(b"\r\n");
     }
     if !has_content_length {
+        // Go http.Transport egress framing (transferWriter): an open stream of
+        // unknown length is chunked-framed; a body-less request emits
+        // `Content-Length: 0` — except for GET and HEAD, which omit the line
+        // entirely (shouldSendContentLength, transfer.go:254-276: a zero
+        // length with identity coding is announced for POST/PUT/PATCH and for
+        // every other method, but NOT for GET/HEAD).
         if body_end_stream {
-            head.extend_from_slice(b"Content-Length: 0\r\n");
+            let m = request.method();
+            if m != http::Method::GET && m != http::Method::HEAD {
+                head.extend_from_slice(b"Content-Length: 0\r\n");
+            }
         } else {
             head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+            // Go transferWriter re-announces the trailer keys on the chunked
+            // leg, immediately after the Transfer-Encoding line
+            // (transfer.go:310-332). The inbound hop-by-hop `trailer`
+            // declaration row is still dropped by the header loop above — the
+            // canonical line emitted here is its only egress form.
+            if let Some(keys) = frp_core::textproto::go_trailer_announcement(
+                request
+                    .headers()
+                    .get_all("trailer")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok()),
+            ) {
+                head.extend_from_slice(b"Trailer: ");
+                head.extend_from_slice(keys.as_bytes());
+                head.extend_from_slice(b"\r\n");
+            }
         }
     }
     head.extend_from_slice(b"Connection: close\r\n\r\n");
@@ -1517,6 +1560,135 @@ mod tests {
             "an empty inbound XFF row must contribute an empty chain element, head:\n{head}"
         );
         assert_eq!(head.matches("X-Forwarded-For").count(), 1);
+    }
+
+    // -- Round-18 egress parity (Go http.Transport / transferWriter):
+    //    forwarded values are TrimString'd, a body-less GET/HEAD omits
+    //    Content-Length, and the chunked arm re-announces declared trailers.
+
+    fn req_with(method: &str, headers: &[(&str, &str)]) -> http::Request<bytes::Bytes> {
+        let mut b = http::Request::builder()
+            .method(method)
+            .uri("http://backend.example.com/path")
+            .header("user-agent", "test");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(bytes::Bytes::new()).expect("valid request")
+    }
+
+    fn head_of(request: &http::Request<bytes::Bytes>, body_end_stream: bool) -> String {
+        head_lines(&build_http1_request_head(
+            request,
+            "",
+            &HashMap::new(),
+            real_ip(),
+            body_end_stream,
+        ))
+    }
+
+    /// Go `Header.WriteSubset` runs every forwarded value through
+    /// `textproto.TrimString` (ASCII SP/HTAB at both ends). RED pre-fix: the
+    /// inbound value was copied byte-for-byte, so `  abc  ` reached the
+    /// backend padded.
+    #[test]
+    fn h2_head_trims_forwarded_values() {
+        let head = head_of(
+            &req_with("GET", &[("x-pad", "  abc  "), ("x-tab", "\tabc\t")]),
+            true,
+        );
+        assert!(
+            head.contains("x-pad: abc\r\n"),
+            "SP-padded value must be trimmed, head:\n{head}"
+        );
+        assert!(
+            head.contains("x-tab: abc\r\n"),
+            "HTAB-padded value must be trimmed, head:\n{head}"
+        );
+        assert!(
+            !head.contains("  abc") && !head.contains("abc  "),
+            "no padding may survive, head:\n{head}"
+        );
+    }
+
+    /// Go `shouldSendContentLength` (transfer.go:254-276): a body-less GET
+    /// emits NO Content-Length line. RED pre-fix: `Content-Length: 0` was
+    /// synthesized unconditionally on the end-stream arm.
+    #[test]
+    fn h2_head_get_end_stream_omits_content_length() {
+        let head = head_of(&req_with("GET", &[]), true);
+        assert!(
+            !head.contains("Content-Length"),
+            "body-less GET must omit Content-Length, head:\n{head}"
+        );
+        assert!(!head.contains("Transfer-Encoding"), "head:\n{head}");
+        // Same for HEAD.
+        let head = head_of(&req_with("HEAD", &[]), true);
+        assert!(
+            !head.contains("Content-Length"),
+            "body-less HEAD must omit Content-Length, head:\n{head}"
+        );
+        // The end-stream arm never declares trailers.
+        let head = head_of(&req_with("GET", &[("trailer", "X-Checksum")]), true);
+        assert!(
+            !head.contains("Trailer:"),
+            "no trailer announcement without a body, head:\n{head}"
+        );
+    }
+
+    /// The complement of the GET/HEAD arm: every other method still gets
+    /// `Content-Length: 0` for a body-less request.
+    #[test]
+    fn h2_head_non_get_end_stream_keeps_content_length_zero() {
+        for method in ["POST", "PUT", "PATCH", "DELETE", "OPTIONS", "PROPFIND"] {
+            let head = head_of(&req_with(method, &[]), true);
+            assert!(
+                head.contains("Content-Length: 0\r\n"),
+                "{method} must announce Content-Length: 0, head:\n{head}"
+            );
+            assert!(
+                !head.contains("Transfer-Encoding"),
+                "{method} must not be chunked, head:\n{head}"
+            );
+        }
+    }
+
+    /// Go `transferWriter` re-announces declared trailer keys on the chunked
+    /// leg, right after the Transfer-Encoding line: split on ',', trimmed,
+    /// canonicalized, sorted, deduped, comma-joined WITHOUT a space. The raw
+    /// lowercase `trailer` declaration row stays dropped (hop-by-hop).
+    #[test]
+    fn h2_head_chunked_announces_trailers() {
+        let head = head_of(&req_with("POST", &[("trailer", "X-T, b-key")]), false);
+        assert!(
+            head.contains("Transfer-Encoding: chunked\r\nTrailer: B-Key,X-T\r\n"),
+            "canonical trailer line must follow the Transfer-Encoding line, head:\n{head}"
+        );
+        assert!(
+            !head.contains("\r\ntrailer:"),
+            "raw lowercase declaration must not be forwarded, head:\n{head}"
+        );
+    }
+
+    /// Framing headers are never announced as trailers (Go skips
+    /// Transfer-Encoding/Trailer/Content-Length in the announcement loop).
+    #[test]
+    fn h2_head_trailer_framing_names_dropped() {
+        let head = head_of(
+            &req_with(
+                "POST",
+                &[("trailer", "Content-Length, Trailer, Transfer-Encoding")],
+            ),
+            false,
+        );
+        assert!(
+            head.contains("Transfer-Encoding: chunked\r\n"),
+            "chunked arm still frames the body, head:\n{head}"
+        );
+        assert!(
+            !head.contains("Trailer:"),
+            "framing names must not be announced, head:\n{head}"
+        );
     }
 
     /// Audit round-7 S1 pin (mirrors the frp-server vhost_h2c

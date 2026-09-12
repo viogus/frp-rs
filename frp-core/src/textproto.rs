@@ -239,9 +239,137 @@ pub fn is_valid_http_version(vers: &str) -> bool {
         && b[7].is_ascii_digit()
 }
 
+/// RFC 7230 `tchar` — the byte class Go's `validHeaderFieldByte`
+/// (net/textproto) tests: ALPHA / DIGIT / `!#$%&'*+-.^_`|~`.
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// RFC 7230 `token = 1*tchar`: non-empty and every byte a `tchar`.
+///
+/// This is the injection guard for any header key/value frp-rs SYNTHESIZES
+/// from untrusted input — a CR, LF, space, colon or obs-text byte fails the
+/// test, so a line built only from `is_token`-passing pieces can never carry
+/// a smuggled CRLF.
+pub fn is_token(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(is_token_byte)
+}
+
+/// Go `net/textproto.CanonicalMIMEHeaderKey` — the canonical spelling
+/// `textproto.MIMEHeader`/`http.Header` store names under, applied
+/// empirically per the Go rule (`canonicalMIMEHeaderKey`): walk the bytes
+/// with an `upper` flag that starts true and is set to "the previous byte
+/// was a dash" after every byte, uppercasing an ASCII letter while `upper`
+/// is set and lowercasing one while it is not.
+///
+/// Consequences the rule pins (all verified against the Go function):
+/// only `-` re-arms the uppercase state, so a non-dash separator does NOT
+/// reset it (`x_underscore` → `X_underscore`, not `X_Underscore`); a token
+/// that STARTS with a non-letter keeps its leading bytes and never
+/// uppercases them (`9digit` → `9digit`); a `-` after a letter lowercases
+/// the glyph that follows (`X-Low` → `X-Low`, `X-lOW` → `X-Low`).
+///
+/// Go's quick check returns the input UNCHANGED when any byte is outside
+/// the RFC 7230 token class (`validHeaderFieldByte` == `tchar`); that branch
+/// is mirrored here, so a hostile name is echoed rather than rewritten.
+pub fn go_canonical_header_key(name: &str) -> String {
+    if name.bytes().any(|b| !is_token_byte(b)) {
+        return name.to_string();
+    }
+    let mut out = String::with_capacity(name.len());
+    let mut upper = true;
+    for &b in name.as_bytes() {
+        // Every byte of a token is ASCII, so the cast is lossless and the
+        // push can never panic.
+        let b = if upper {
+            b.to_ascii_uppercase()
+        } else {
+            b.to_ascii_lowercase()
+        };
+        out.push(b as char);
+        upper = b == b'-';
+    }
+    out
+}
+
+/// The `Trailer:` announcement Go's `http.Transport` re-emits on the
+/// chunked egress leg — `transferWriter.writeHeader`'s "Write Trailer
+/// header" block (net/http/transfer.go:310-332): the outbound trailer keys
+/// are canonicalized, sorted, joined with `,` (NO space) and written as one
+/// `Trailer: <keys>` line right after `Transfer-Encoding: chunked`.
+///
+/// `values` are the raw inbound `trailer` declaration rows (Go's h2 server
+/// turns the `trailer` header into `req.Trailer` keys; the comma list is
+/// this project's stand-in for that map). Each row is split on `,`, each
+/// element trimmed of ASCII SP/HTAB, and an element is skipped when it is:
+///
+/// * empty — Go fails the whole request there (`net/http: invalid trailer
+///   field name ""`, the parsed key failing `ValidHeaderFieldName`);
+/// * not an RFC 7230 token — Go fails the request too (transfer.go:315-318
+///   `badStringError("invalid Trailer key", k)` for a name it cannot
+///   canonicalize, and its own name validation otherwise).
+///
+/// Both skips are deliberate FAIL-CLOSED stand-ins for Go's request error:
+/// the announcement is built only from vetted token bytes, so no CR/LF or
+/// other hostile octet can reach the emitted line, and the request is
+/// served rather than refused. `Transfer-Encoding`, `Trailer` and
+/// `Content-Length` are dropped (Go errors on them as trailer keys — a
+/// trailer may not describe the framing). Returns `None` when nothing
+/// survives, which is the "no Trailer line at all" case (Go writes the
+/// line only when `len(keys) > 0`).
+pub fn go_trailer_announcement<'a>(values: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for value in values {
+        for piece in value.split(',') {
+            let key = piece.trim_matches([' ', '\t']);
+            if key.is_empty() {
+                continue;
+            }
+            if !is_token(key) {
+                continue;
+            }
+            let canonical = go_canonical_header_key(key);
+            if matches!(
+                canonical.as_str(),
+                "Transfer-Encoding" | "Trailer" | "Content-Length"
+            ) {
+                continue;
+            }
+            if !keys.contains(&canonical) {
+                keys.push(canonical);
+            }
+        }
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    keys.sort_unstable();
+    Some(keys.join(","))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{canonicalize_eol_crlf, head_end, is_valid_http_version};
+    use super::{
+        canonicalize_eol_crlf, go_canonical_header_key, go_trailer_announcement, head_end,
+        is_token, is_valid_http_version,
+    };
 
     /// Build a head from header lines (each gets one `\n`) plus a blank
     /// line (the `\r\n`/`\n` terminator) and optional body bytes past it;
@@ -547,5 +675,90 @@ mod tests {
         assert_eq!(canonicalize_eol_crlf(b""), b"");
         // A lone \r with no \n is payload, not a line terminator.
         assert_eq!(canonicalize_eol_crlf(b"X: y\r"), b"X: y\r\r\n");
+    }
+
+    /// Round 18: the canonical spelling rule is `upper` starts true and
+    /// becomes "previous byte was a dash" — so only `-` re-arms it.
+    #[test]
+    fn go_canonical_header_key_matches_go_rule() {
+        for (input, want) in [
+            ("content-length", "Content-Length"),
+            ("X-Checksum", "X-Checksum"),
+            ("x-cHECKSUM", "X-Checksum"),
+            // Non-dash separators do NOT reset the uppercase state.
+            ("x_underscore", "X_underscore"),
+            ("x.y", "X.y"),
+            // A leading non-letter consumes the `upper` state.
+            ("9digit", "9digit"),
+            ("9-digit", "9-Digit"),
+            // Trailing dash arms nothing after it.
+            ("x-", "X-"),
+            ("", ""),
+            // Go's quick check: a byte outside the token class echoes the
+            // input unchanged (canonicalization is not even attempted).
+            ("x y", "x y"),
+            ("x:y", "x:y"),
+            ("x\ty", "x\ty"),
+        ] {
+            assert_eq!(go_canonical_header_key(input), want, "input {input:?}");
+        }
+    }
+
+    /// RFC 7230 `token = 1*tchar` — the injection guard for synthesized
+    /// header lines.
+    #[test]
+    fn is_token_is_exactly_rfc7230_tchar() {
+        for ok in ["x", "X-T", "b-key", "9", "!#$%&'*+-.^_`|~", "a1"] {
+            assert!(is_token(ok), "{ok:?} must be a token");
+        }
+        for bad in [
+            "", " ", "a b", "a\tb", "a\r\nb", "a:b", "a,b", "a;b", "a\"b", "a(b)", "é", "\u{7f}",
+            "a\n", "\r",
+        ] {
+            assert!(!is_token(bad), "{bad:?} must not be a token");
+        }
+    }
+
+    /// The `Trailer:` announcement (Go transferWriter.writeHeader): split on
+    /// `,`, trim, drop empties and non-tokens, canonicalize, drop the three
+    /// framing names, dedup, sort, join WITHOUT a space.
+    #[test]
+    fn go_trailer_announcement_transfer_writer_parity() {
+        // Sorted + canonicalized, no space after the comma.
+        assert_eq!(
+            go_trailer_announcement(["X-T, b-key"].into_iter()),
+            Some("B-Key,X-T".to_string())
+        );
+        // Whitespace-separated list, duplicates collapse after
+        // canonicalization (Go's map keys are already unique).
+        assert_eq!(
+            go_trailer_announcement(["x-t , X-T ,\tx-t\t"].into_iter()),
+            Some("X-T".to_string())
+        );
+        // Repeated declaration rows accumulate into one line.
+        assert_eq!(
+            go_trailer_announcement(["X-T", "Zed"].into_iter()),
+            Some("X-T,Zed".to_string())
+        );
+        // The framing names never get announced (Go errors on them).
+        assert_eq!(
+            go_trailer_announcement(["Content-Length, Trailer, Transfer-Encoding"].into_iter()),
+            None
+        );
+        assert_eq!(
+            go_trailer_announcement(["content-length"].into_iter()),
+            None,
+            "the skip is on the CANONICAL spelling"
+        );
+        // Nothing to announce: no rows, empty rows, empty elements only.
+        assert_eq!(go_trailer_announcement(std::iter::empty::<&str>()), None);
+        assert_eq!(go_trailer_announcement([""].into_iter()), None);
+        assert_eq!(go_trailer_announcement([" , , "].into_iter()), None);
+        // Hostile / malformed keys are dropped, never echoed (the fail-closed
+        // stand-in for Go's request error — the emitted line stays clean).
+        assert_eq!(
+            go_trailer_announcement(["X-T, a b, a:b, a\r\nX: y, é"].into_iter()),
+            Some("X-T".to_string())
+        );
     }
 }
