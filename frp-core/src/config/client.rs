@@ -310,6 +310,12 @@ pub struct ClientConfig {
     /// Go frp compat: transport.tcpMuxKeepaliveInterval.
     #[serde(default, alias = "tcpMuxKeepaliveInterval")]
     pub tcp_mux_keepalive_interval: i64,
+    /// Idle-dead silence bound for the yamux dead-session reaper, in seconds.
+    /// `0` = auto (3 × keepalive, floored 30s); `>0` = explicit bound
+    /// (floored 30s); `<0` = disable the reaper. Default: 0. Not reloadable
+    /// (restart-only, like the keepalive interval).
+    #[serde(default, alias = "tcpMuxKeepaliveTimeout")]
+    pub tcp_mux_keepalive_timeout: i64,
     /// TCP send-buffer size in bytes on outbound connections (SO_SNDBUF).
     /// 0 = OS default. frp-rs extension for high-BDP links.
     #[serde(default, alias = "tcpSendBuffer")]
@@ -391,6 +397,7 @@ impl Default for ClientConfig {
             connect_server_local_ip: String::new(),
             tcp_mux: default_tcp_mux(),
             tcp_mux_keepalive_interval: 30,
+            tcp_mux_keepalive_timeout: 0,
             tcp_send_buffer_size: 0,
             tcp_recv_buffer_size: 0,
             v2: false,

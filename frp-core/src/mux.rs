@@ -156,6 +156,13 @@ pub struct TcpMuxConfig {
     /// dynamic BDP-based growth. This value is used to set the
     /// connection-level receive window cap to allow growth to this size.
     pub max_stream_window_size: u32,
+    /// Idle-dead silence bound for the dead-session reaper.
+    /// `None` = auto (3 × keepalive, floored 30s — default); `Some(d)` with
+    /// `d.is_zero()` = reaper disabled; `Some(d)` with `d > 0` = explicit
+    /// bound (floored 30s). Mapped from the `tcp_mux_keepalive_timeout`
+    /// config (0/negative/positive seconds) via
+    /// `idle_dead_timeout_from_secs`.
+    pub idle_dead_timeout: Option<Duration>,
 }
 
 impl Default for TcpMuxConfig {
@@ -163,7 +170,21 @@ impl Default for TcpMuxConfig {
         Self {
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
             max_stream_window_size: 6 * 1024 * 1024,
+            idle_dead_timeout: None,
         }
+    }
+}
+
+/// Map the user-facing `tcp_mux_keepalive_timeout` (seconds) to the mux
+/// session's idle-dead timeout:
+///   - `<0`  => `Some(Duration::ZERO)`  (reaper disabled)
+///   - `0`   => `None`                  (auto: 3 × keepalive, floored 30s)
+///   - `>0`  => `Some(d)`               (explicit bound, floored 30s)
+pub fn idle_dead_timeout_from_secs(secs: i64) -> Option<Duration> {
+    match secs {
+        n if n < 0 => Some(Duration::ZERO),
+        0 => None,
+        n => Some(Duration::from_secs(n as u64)),
     }
 }
 
@@ -252,6 +273,17 @@ fn normalized_keepalive_interval(configured: Duration) -> Duration {
         DEFAULT_KEEPALIVE_INTERVAL
     } else {
         configured
+    }
+}
+
+/// Final dead-session silence bound: `None` disables the reaper, `Some(d)`
+/// is the wall-clock silence threshold before the session is closed.
+#[cfg(feature = "tcp-mux")]
+fn idle_dead_bound(keepalive: Duration, idle_dead_timeout: Option<Duration>) -> Option<Duration> {
+    match idle_dead_timeout {
+        None => Some(MIN_IDLE_DEAD_TIME.max(keepalive.saturating_mul(MAX_IDLE_KEEPALIVE_TICKS))),
+        Some(d) if d.is_zero() => None,
+        Some(d) => Some(MIN_IDLE_DEAD_TIME.max(d)),
     }
 }
 
@@ -509,7 +541,7 @@ where
     // sets the scan cadence — yamux-rs's actual PING period is a hardcoded
     // 10s — so floor the bound at MIN_IDLE_DEAD_TIME to never kill a healthy
     // peer when the configured interval is small (see const docs).
-    let dead_after = MIN_IDLE_DEAD_TIME.max(keepalive.saturating_mul(MAX_IDLE_KEEPALIVE_TICKS));
+    let dead_after = idle_dead_bound(keepalive, mux_cfg.idle_dead_timeout);
     let mut consecutive_idle = 0u32;
     tokio::task::spawn(async move {
         loop {
@@ -538,14 +570,16 @@ where
                     } else {
                         consecutive_idle += 1;
                     }
-                    if keepalive.saturating_mul(consecutive_idle) >= dead_after {
-                        warn!(
-                            ticks = consecutive_idle,
-                            keepalive_secs = keepalive.as_secs(),
-                            dead_after_secs = dead_after.as_secs(),
-                            "yamux server: no transport I/O for too many keepalive intervals; closing dead session"
-                        );
-                        break;
+                    if let Some(dead_after) = dead_after {
+                        if keepalive.saturating_mul(consecutive_idle) >= dead_after {
+                            warn!(
+                                ticks = consecutive_idle,
+                                keepalive_secs = keepalive.as_secs(),
+                                dead_after_secs = dead_after.as_secs(),
+                                "yamux server: no transport I/O for too many keepalive intervals; closing dead session"
+                            );
+                            break;
+                        }
                     }
                     // Check if the control handler was replaced/dropped
                     // (Go frp compat: interruptReadAndClose on old control).
@@ -697,7 +731,7 @@ where
     let keepalive = normalized_keepalive_interval(mux_cfg.keepalive_interval);
     // Dead-session bound in wall-clock time — see server_mux for why the
     // configured interval cannot be used alone as the dead bound.
-    let dead_after = MIN_IDLE_DEAD_TIME.max(keepalive.saturating_mul(MAX_IDLE_KEEPALIVE_TICKS));
+    let dead_after = idle_dead_bound(keepalive, mux_cfg.idle_dead_timeout);
     let mut consecutive_idle = 0u32;
 
     tokio::task::spawn(async move {
@@ -852,15 +886,17 @@ where
                     } else {
                         consecutive_idle += 1;
                     }
-                    if keepalive.saturating_mul(consecutive_idle) >= dead_after {
-                        warn!(
-                            ticks = consecutive_idle,
-                            keepalive_secs = keepalive.as_secs(),
-                            dead_after_secs = dead_after.as_secs(),
-                            "yamux client: no transport I/O for too many keepalive intervals; closing dead session"
-                        );
-                        bg_alive.store(false, Ordering::Release);
-                        break;
+                    if let Some(dead_after) = dead_after {
+                        if keepalive.saturating_mul(consecutive_idle) >= dead_after {
+                            warn!(
+                                ticks = consecutive_idle,
+                                keepalive_secs = keepalive.as_secs(),
+                                dead_after_secs = dead_after.as_secs(),
+                                "yamux client: no transport I/O for too many keepalive intervals; closing dead session"
+                            );
+                            bg_alive.store(false, Ordering::Release);
+                            break;
+                        }
                     }
                 }
                 // Exit when the last YamuxSession is dropped (shutdown_tx
@@ -906,6 +942,57 @@ where
 mod tests {
     use super::*;
     use futures_util::{AsyncReadExt, AsyncWriteExt};
+
+    /// `idle_dead_timeout_from_secs` maps the user-facing seconds value to
+    /// the mux idle-dead timeout: negative disables the reaper, zero is
+    /// auto, positive is an explicit bound.
+    #[test]
+    fn idle_dead_timeout_from_secs_maps_all_three_states() {
+        assert_eq!(
+            idle_dead_timeout_from_secs(-1),
+            Some(Duration::ZERO),
+            "negative seconds must disable the reaper"
+        );
+        assert_eq!(
+            idle_dead_timeout_from_secs(0),
+            None,
+            "zero seconds must mean auto"
+        );
+        assert_eq!(
+            idle_dead_timeout_from_secs(30),
+            Some(Duration::from_secs(30)),
+            "positive seconds must be an explicit bound"
+        );
+        assert_eq!(
+            idle_dead_timeout_from_secs(3600),
+            Some(Duration::from_secs(3600)),
+            "positive seconds must be an explicit bound"
+        );
+    }
+
+    /// `idle_dead_bound` resolves the final wall-clock silence bound from
+    /// the keepalive interval and the mapped idle-dead timeout.
+    #[test]
+    fn idle_dead_bound_auto_disabled_explicit_floor() {
+        let keepalive = Duration::from_secs(30);
+        // Auto: 3 × keepalive, floored at MIN_IDLE_DEAD_TIME.
+        assert_eq!(
+            idle_dead_bound(keepalive, None),
+            Some(MIN_IDLE_DEAD_TIME.max(keepalive.saturating_mul(MAX_IDLE_KEEPALIVE_TICKS)))
+        );
+        // Disabled: reaper off, never close on idle.
+        assert_eq!(idle_dead_bound(keepalive, Some(Duration::ZERO)), None);
+        // Explicit bound above the floor: honored as-is.
+        assert_eq!(
+            idle_dead_bound(keepalive, Some(Duration::from_secs(3600))),
+            Some(Duration::from_secs(3600))
+        );
+        // Explicit bound below the floor: floored to MIN_IDLE_DEAD_TIME.
+        assert_eq!(
+            idle_dead_bound(keepalive, Some(Duration::from_secs(10))),
+            Some(MIN_IDLE_DEAD_TIME)
+        );
+    }
 
     /// P2 pin: Go frp pins `MaxStreamWindowSize = 6 MiB` per yamux stream
     /// (hashicorp/yamux); frp-rs must carry the same default AND hand it to

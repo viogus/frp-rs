@@ -61,6 +61,7 @@ pub(crate) struct VisitorListenerConfig {
     // --- Transport options matching DialOptions / Go frp connector ---
     pub tcp_mux: bool,
     pub tcp_mux_keepalive_interval: i64,
+    pub tcp_mux_keepalive_timeout: i64,
     pub proxy_url: Option<String>,
     pub dns_server: Option<String>,
     pub dial_timeout_secs: u64,
@@ -147,6 +148,7 @@ pub(crate) struct VirtualNetVisitorConfig {
     // --- Transport options matching DialOptions / Go frp connector ---
     pub tcp_mux: bool,
     pub tcp_mux_keepalive_interval: i64,
+    pub tcp_mux_keepalive_timeout: i64,
     pub proxy_url: Option<String>,
     pub dns_server: Option<String>,
     pub dial_timeout_secs: u64,
@@ -167,6 +169,7 @@ pub(crate) struct VirtualNetVisitorConfig {
 struct VisitorTransportConfig {
     pub tcp_mux: bool,
     pub tcp_mux_keepalive_interval: i64,
+    pub tcp_mux_keepalive_timeout: i64,
     pub proxy_url: Option<String>,
     pub dns_server: Option<String>,
     pub dial_timeout_secs: u64,
@@ -181,20 +184,23 @@ struct VisitorTransportConfig {
 impl VisitorTransportConfig {}
 
 /// Result of visitor dial planning: the DialOptions to pass to
-/// dial_server, together with an optional yamux keepalive interval.
-/// When `yamux_keepalive_secs` is `Some(n)`, the caller must wrap
-/// the raw stream in yamux via `wrap_client_mux(raw, n)`.
+/// dial_server, together with an optional yamux keepalive interval
+/// and idle-dead-timeout. When `yamux_keepalive_secs` is `Some(n)`
+/// (paired with `yamux_idle_dead_timeout_secs: Some(t)`), the caller
+/// must wrap the raw stream in yamux via `wrap_client_mux(raw, n, t)`.
 #[derive(Debug)]
 struct VisitorDialPlan {
     opts: DialOptions,
     yamux_keepalive_secs: Option<i64>,
+    yamux_idle_dead_timeout_secs: Option<i64>,
 }
 
 /// Build the DialOptions and yamux decision for a visitor→server
 /// connection.  Pure — no I/O, no spawn, no network.  The caller
 /// is responsible for calling `dial_server(&plan.opts)` and, when
-/// `plan.yamux_keepalive_secs` is `Some(n)`, wrapping the result
-/// with `crate::control::wrap_client_mux(raw_stream, n)`.
+/// `plan.yamux_keepalive_secs` is `Some(n)` (paired with
+/// `plan.yamux_idle_dead_timeout_secs: Some(t)`), wrapping the
+/// result with `crate::control::wrap_client_mux(raw_stream, n, t)`.
 fn plan_visitor_dial(
     server_addr: &str,
     server_port: u16,
@@ -229,9 +235,15 @@ fn plan_visitor_dial(
     } else {
         None
     };
+    let yamux_idle_dead_timeout_secs = if transport.tcp_mux {
+        Some(transport.tcp_mux_keepalive_timeout)
+    } else {
+        None
+    };
     VisitorDialPlan {
         opts,
         yamux_keepalive_secs,
+        yamux_idle_dead_timeout_secs,
     }
 }
 
@@ -1157,6 +1169,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
         run_id,
         tcp_mux,
         tcp_mux_keepalive_interval,
+        tcp_mux_keepalive_timeout,
         proxy_url,
         dns_server,
         dial_timeout_secs,
@@ -1280,6 +1293,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
         transport: VisitorTransportConfig {
             tcp_mux,
             tcp_mux_keepalive_interval,
+            tcp_mux_keepalive_timeout,
             proxy_url,
             dns_server,
             dial_timeout_secs,
@@ -1355,6 +1369,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                     let plan = plan_visitor_dial(sa, sp, pt, tls_enable, tls_sn, tls_ca, transport);
                     let opts = plan.opts;
                     let yamux_keepalive = plan.yamux_keepalive_secs;
+                    let yamux_idle_dead_timeout = plan.yamux_idle_dead_timeout_secs;
 
                     if vt == "xtcp" {
                         // --- XTCP persistent tunnel session (Go frp v0.71) ---
@@ -1475,8 +1490,11 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         };
                         // Wrap in yamux when tcp_mux is enabled (Go frp compat).
                         let mut _yamux_sess_fb: Option<YamuxSession> = None;
-                        let mut server_conn = if let Some(ka) = yamux_keepalive {
-                            match crate::control::wrap_client_mux(raw_stream, ka).await {
+                        let mut server_conn = if let (Some(ka), Some(ka_timeout)) =
+                            (yamux_keepalive, yamux_idle_dead_timeout)
+                        {
+                            match crate::control::wrap_client_mux(raw_stream, ka, ka_timeout).await
+                            {
                                 Ok((io, session)) => {
                                     _yamux_sess_fb = session;
                                     io
@@ -1614,8 +1632,11 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         };
                         // Wrap in yamux when tcp_mux is enabled (Go frp compat).
                         let mut _yamux_sess_stcp: Option<YamuxSession> = None;
-                        let mut server_conn = if let Some(ka) = yamux_keepalive {
-                            match crate::control::wrap_client_mux(raw_stream, ka).await {
+                        let mut server_conn = if let (Some(ka), Some(ka_timeout)) =
+                            (yamux_keepalive, yamux_idle_dead_timeout)
+                        {
+                            match crate::control::wrap_client_mux(raw_stream, ka, ka_timeout).await
+                            {
                                 Ok((io, session)) => {
                                     _yamux_sess_stcp = session;
                                     io
@@ -1793,6 +1814,7 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
         run_id,
         tcp_mux,
         tcp_mux_keepalive_interval,
+        tcp_mux_keepalive_timeout,
         proxy_url,
         dns_server,
         dial_timeout_secs,
@@ -1937,6 +1959,7 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
     let transport = VisitorTransportConfig {
         tcp_mux,
         tcp_mux_keepalive_interval,
+        tcp_mux_keepalive_timeout,
         proxy_url,
         dns_server,
         dial_timeout_secs,
@@ -2081,8 +2104,10 @@ async fn connect_sudp_visitor_stream(
             return None;
         }
     };
-    let mut server_conn = if let Some(ka) = plan.yamux_keepalive_secs {
-        match crate::control::wrap_client_mux(raw_stream, ka).await {
+    let mut server_conn = if let (Some(ka), Some(ka_timeout)) =
+        (plan.yamux_keepalive_secs, plan.yamux_idle_dead_timeout_secs)
+    {
+        match crate::control::wrap_client_mux(raw_stream, ka, ka_timeout).await {
             Ok((io, _session)) => io,
             Err(e) => {
                 warn!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': yamux wrap failed: {}", visitor_name, e);
@@ -2452,6 +2477,7 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         shutdown,
         tcp_mux,
         tcp_mux_keepalive_interval,
+        tcp_mux_keepalive_timeout,
         proxy_url,
         dns_server,
         dial_timeout_secs,
@@ -2471,6 +2497,7 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         let transport = VisitorTransportConfig {
             tcp_mux,
             tcp_mux_keepalive_interval,
+            tcp_mux_keepalive_timeout,
             proxy_url: proxy_url.clone(),
             dns_server: dns_server.clone(),
             dial_timeout_secs,
@@ -2502,9 +2529,12 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         };
         // Wrap in yamux when tcp_mux is enabled (Go frp compat).
         let yamux_keepalive = plan.yamux_keepalive_secs;
+        let yamux_idle_dead_timeout = plan.yamux_idle_dead_timeout_secs;
         let mut _yamux_sess_vnet: Option<YamuxSession> = None;
-        let mut server_conn = if let Some(ka) = yamux_keepalive {
-            match crate::control::wrap_client_mux(raw_stream, ka).await {
+        let mut server_conn = if let (Some(ka), Some(ka_timeout)) =
+            (yamux_keepalive, yamux_idle_dead_timeout)
+        {
+            match crate::control::wrap_client_mux(raw_stream, ka, ka_timeout).await {
                 Ok((io, session)) => {
                     _yamux_sess_vnet = session;
                     io
@@ -2994,6 +3024,7 @@ mod transport_tests {
         VisitorTransportConfig {
             tcp_mux: true,
             tcp_mux_keepalive_interval: 30,
+            tcp_mux_keepalive_timeout: 0,
             proxy_url: Some("socks5://proxy:1080".into()),
             dns_server: Some("8.8.8.8".into()),
             dial_timeout_secs: 15,
@@ -3076,6 +3107,7 @@ mod transport_tests {
         let transport = VisitorTransportConfig {
             tcp_mux: true,
             tcp_mux_keepalive_interval: 45,
+            tcp_mux_keepalive_timeout: 0,
             proxy_url: Some("http://p:8080".into()),
             dns_server: Some("1.1.1.1".into()),
             dial_timeout_secs: 25,

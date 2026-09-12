@@ -46,6 +46,7 @@ web_server_password = "admin"
 ## Transport
 tcp_mux = true
 tcp_mux_keepalive_interval = 30
+tcp_mux_keepalive_timeout = 0      # 0 = auto; >0 = explicit seconds; <0 = disable dead-session reaper
 
 # =============================================================================
 # frp-rs native format (alternative to [common] above)
@@ -74,3 +75,4 @@ tcp_mux_keepalive_interval = 30
 # [transport]
 # tcp_mux = true
 # tcp_mux_keepalive_interval = 30
+# tcp_mux_keepalive_timeout = 0

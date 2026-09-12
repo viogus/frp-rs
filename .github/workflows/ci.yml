@@ -12,12 +12,16 @@ env:
   CARGO_INCREMENTAL: 0
 
 # The former single Check job ran clippy, tests, bench and feature checks
-# sequentially (25m wall). Split into three independent lanes that share the
-# same cargo cache key: only the tests lane SAVES the cache (the others
+# sequentially (25m wall). Split into independent lanes that share the same
+# cargo cache key: only the tests-server lane SAVES the cache (the others
 # restore-only, so parallel lanes never race the cache write); on a warm
-# cache the wall time drops to the tests lane (~15m, e2e-runtime-bound).
-# On a cache miss every lane pays its own cold dep compile, so a split run
-# is slower than the old single job — acceptable, misses are rare.
+# cache the wall time drops to the slowest tests lane (e2e-runtime-bound).
+# The tests job itself is further split into unit / server-integration /
+# client-integration: each runs on its own runner, so the wall clock is the
+# max of the three instead of a single job paying compile + full `-j 1` e2e
+# serially (which timed out at 35m on cold caches). On a cache miss every
+# lane pays its own cold dep compile, so a split run is slower in total CPU
+# than the old single job — acceptable, misses are rare and wall clock wins.
 jobs:
   lint:
     name: Lint (fmt + clippy)
@@ -40,16 +44,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-  tests:
-    name: Tests (lib + integration + dashboard)
+  tests-unit:
+    name: Tests (unit)
     runs-on: ubuntu-latest
-    # 1505 tests with `-j 1` serial integration suites runs ~24.5 min on a
-    # cold runner (measured 2026-08-30: 24m39s green run) — 25 left no
-    # headroom and cancelled the job at the limit twice in one day.
-    timeout-minutes: 35
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry/
@@ -71,31 +72,73 @@ jobs:
         # silently drop the gate. --lib: the vnet-gated tests are unit
         # tests in nathole.rs (no vnet-gated integration bins exist).
         run: cargo test -p frp-server --features vnet --lib
-      - name: Build binaries (needed for integration tests)
-        run: cargo build --bin frps --bin frpc
-      - name: Build frps with dashboard feature (for dashboard integration tests)
+      - name: Run frp-core lib + integration tests (kcp/mux/xtcp_p2p/yamux_rst)
+        # frp-core's tests/ are pure Rust<->Rust (no frps/frpc binaries), so
+        # they belong with the unit lane and don't need the integration build.
+        run: cargo test -p frp-core
+
+  tests-server:
+    name: Tests (server integration)
+    runs-on: ubuntu-latest
+    # Heavy e2e lane: builds frps (dashboard) + frpc, then runs every
+    # frp-server integration bin serially. This is the only lane that SAVES
+    # the cargo cache (a second saver would race the write + double the
+    # ~5 GB post-run upload).
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Install Rust stable
+        run: rustup default stable
+      - name: Build frpc (server integration tests spawn it as the bridge end)
+        run: cargo build --bin frpc
+      - name: Build frps with dashboard feature
+        # The dashboard-enabled frps also serves plain proxies (dashboard is
+        # additive), so one binary covers both the dashboard integration tests
+        # and the rest of the server integration suite.
         run: cargo build --bin frps --features dashboard
-      - name: Run dashboard integration tests
-        # dashboard_integration.rs / dashboard_v2_integration.rs are cfg-gated
-        # on the `dashboard` feature and never compile under default features;
-        # run them here so the only opt-in business feature has CI coverage.
-        # -j 1: both bins bind ephemeral ports and parallel execution lets the
-        # two *processes* collide on the same 127.0.0.1 port (each test bin is
-        # a separate process with its own port bookkeeping), flaking as
-        # "dashboard_port not ready". Serialize them. The common::allocate_port
-        # flock lock narrows the window; -j 1 removes it entirely.
-        run: cargo test -p frp-server --features dashboard --test dashboard_integration --test dashboard_v2_integration -j 1
+      - name: Run frp-server integration + dashboard tests
+        # `--features dashboard` also enables the cfg-gated
+        # dashboard_integration.rs / dashboard_v2_integration.rs so the only
+        # opt-in business feature keeps CI coverage.
+        # -j 1: each test bin binds ephemeral 127.0.0.1 ports as a separate
+        # process; parallel bins can grab the same port and flake. The
+        # common::allocate_port flock lock narrows the window; -j 1 removes it.
+        run: cargo test -p frp-server --features dashboard -j 1
         env:
           FRPS_BIN: ${{ github.workspace }}/target/debug/frps
-      - name: Run tests
-        # -j 1: frp-server/frp-client integration bins each spawn their own
-        # frps/frpc and bind ephemeral 127.0.0.1 ports. Cargo runs test *bins*
-        # as separate processes in parallel, and each process re-allocates
-        # ports independently, so parallel bins can grab the same port and
-        # flake (observed reload_integration / dashboard_integration). The
-        # common::allocate_port flock lock narrows the window; `-j 1` runs the
-        # bins one at a time and removes it entirely.
-        run: cargo test --workspace -j 1
+          FRPC_BIN: ${{ github.workspace }}/target/debug/frpc
+
+  tests-client:
+    name: Tests (client integration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Install Rust stable
+        run: rustup default stable
+      - name: Build binaries (needed for integration tests)
+        run: cargo build --bin frps --bin frpc
+      - name: Run frp-client integration tests
+        # -j 1: same ephemeral-port collision rationale as the server lane;
+        # client-side only here (frp-server bins run on their own runner, so
+        # cross-crate port collision is gone).
+        run: cargo test -p frp-client -j 1
         env:
           FRPS_BIN: ${{ github.workspace }}/target/debug/frps
           FRPC_BIN: ${{ github.workspace }}/target/debug/frpc
@@ -126,7 +169,7 @@ jobs:
   build:
     name: Build (release)
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
-    needs: [lint, tests, verify]
+    needs: [lint, tests-unit, tests-server, tests-client, verify]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

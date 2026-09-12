@@ -123,6 +123,7 @@ pub async fn start_visitor_plugin(
     let oidc_client = ctx.oidc_client.clone();
     let ctx_tcp_mux = ctx.tcp_mux;
     let ctx_tcp_mux_keepalive = ctx.tcp_mux_keepalive_interval;
+    let ctx_tcp_mux_keepalive_timeout = ctx.tcp_mux_keepalive_timeout;
     let ctx_dns = ctx.dns_server.clone();
     let ctx_keepalive = ctx.keepalive_secs;
     let ctx_bind = ctx.connect_bind_addr.clone();
@@ -175,6 +176,7 @@ pub async fn start_visitor_plugin(
                                     user_conn, &sn, &sk, &at, &sa, sp, te, &tsn,
                                     tcf.as_deref(), ue, uc, &tp, oidc,
                                     ctx_tcp_mux, ctx_tcp_mux_keepalive,
+                                    ctx_tcp_mux_keepalive_timeout,
                                     &dns, ctx_keepalive, &bind,
                                     &tls_cert, &tls_key, &proxy,
                                     ctx_nocustomtls, ctx_dial_timeout,
@@ -234,6 +236,7 @@ async fn handle_visitor_conn(
     // Transport options
     tcp_mux: bool,
     tcp_mux_keepalive_interval: i64,
+    tcp_mux_keepalive_timeout: i64,
     dns_server: &Option<String>,
     keepalive_secs: u64,
     bind_addr: &Option<String>,
@@ -280,7 +283,13 @@ async fn handle_visitor_conn(
     // Wrap in yamux when tcp_mux is enabled (Go frp compat).
     let mut _yamux_sess: Option<YamuxSession> = None;
     let mut server_stream = if tcp_mux {
-        match crate::control::wrap_client_mux(raw_stream, tcp_mux_keepalive_interval).await {
+        match crate::control::wrap_client_mux(
+            raw_stream,
+            tcp_mux_keepalive_interval,
+            tcp_mux_keepalive_timeout,
+        )
+        .await
+        {
             Ok((io, session)) => {
                 _yamux_sess = session;
                 io

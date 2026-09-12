@@ -312,6 +312,7 @@ pub(crate) async fn handle_tls_connection(
                         keepalive_interval: std::time::Duration::from_secs(
                             state.tcp_mux_keepalive.max(1) as u64,
                         ),
+                        idle_dead_timeout: state.tcp_mux_keepalive_timeout,
 
                         ..Default::default()
                     };
@@ -429,6 +430,7 @@ pub(crate) async fn handle_tls_connection(
             keepalive_interval: std::time::Duration::from_secs(
                 state.tcp_mux_keepalive.max(1) as u64
             ),
+            idle_dead_timeout: state.tcp_mux_keepalive_timeout,
 
             ..Default::default()
         };
@@ -771,6 +773,7 @@ pub(crate) async fn handle_websocket_connection(
                             keepalive_interval: std::time::Duration::from_secs(
                                 state.tcp_mux_keepalive.max(1) as u64,
                             ),
+                            idle_dead_timeout: state.tcp_mux_keepalive_timeout,
 
                             ..Default::default()
                         };
@@ -964,6 +967,7 @@ pub(crate) async fn handle_websocket_connection(
                     keepalive_interval: std::time::Duration::from_secs(
                         state.tcp_mux_keepalive.max(1) as u64,
                     ),
+                    idle_dead_timeout: state.tcp_mux_keepalive_timeout,
 
                     ..Default::default()
                 };
@@ -1168,6 +1172,7 @@ pub(crate) async fn handle_v2_connection(
             keepalive_interval: std::time::Duration::from_secs(
                 state.tcp_mux_keepalive.max(1) as u64
             ),
+            idle_dead_timeout: state.tcp_mux_keepalive_timeout,
 
             ..Default::default()
         };
@@ -1365,6 +1370,7 @@ pub(crate) async fn handle_v1_connection(
             keepalive_interval: std::time::Duration::from_secs(
                 state.tcp_mux_keepalive.max(1) as u64
             ),
+            idle_dead_timeout: state.tcp_mux_keepalive_timeout,
 
             ..Default::default()
         };
