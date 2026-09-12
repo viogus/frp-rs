@@ -3154,9 +3154,8 @@ mod tests {
         let (status, _headers, body, err) =
             h2c_test_roundtrip_body_err("GET", |respond| async move {
                 let mut respond = respond;
-                let mut backend = SliceMock::new(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n \r\n\r\nhelloEXTRA",
-                );
+                let mut backend =
+                    SliceMock::new(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n \r\n\r\nhelloEXTRA");
                 let page = h2c_not_found_body("");
                 stream_h2_response(&mut backend, &mut respond, None, false, &page).await
             })

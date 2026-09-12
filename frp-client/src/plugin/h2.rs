@@ -1821,8 +1821,9 @@ mod tests {
             &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n"[..], // other coding
             &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"[..], // list
             &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"[..], // list
-            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n"[..], // two rows
-            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: \r\n\r\n"[..], // empty value
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n"
+                [..], // two rows
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: \r\n\r\n"[..],     // empty value
         ] {
             assert!(
                 parse_response_head(bad).is_none(),
@@ -2445,10 +2446,8 @@ mod tests {
         let Some(listener) = bind_or_skip().await else {
             return;
         };
-        let addr = spawn_held_open_backend(
-            listener,
-            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n",
-        );
+        let addr =
+            spawn_held_open_backend(listener, b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n");
         let (status, headers, body) = h2_round_trip_full_method("HEAD", addr).await;
         assert_eq!(status, http::StatusCode::OK);
         assert_eq!(
