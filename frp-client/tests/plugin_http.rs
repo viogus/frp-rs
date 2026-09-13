@@ -1666,6 +1666,113 @@ async fn test_http_proxy_auth_fail_wire_arms() {
     );
 }
 
+/// Round-18 LOW pin: a SP/HTAB-bearing `Proxy-Authorization ` field name
+/// never canonicalizes in Go's textproto reader (reader.go:742-765 —
+/// CanonicalMIMEHeaderKey bails on any non-token byte, issue 34540), so
+/// `req.Header.Get("Proxy-Authorization")` (http_proxy.go:143) misses the
+/// row and the CONNECT face answers 407 — even when the value holds VALID
+/// credentials. The old walker trimmed trailing SP/HTAB off the name, so the
+/// spaced row matched and authenticated. A spaced row is a SEPARATE key, not
+/// a malformed head: the walk must skip it and keep scanning, so a later
+/// canonical row still authenticates (second half below).
+#[tokio::test]
+async fn test_http_proxy_spaced_proxy_authorization_name_is_not_credentials() {
+    let mut cfg = plugin_cfg("http_proxy", "127.0.0.1:1".into());
+    cfg.http_user = "u1".into();
+    cfg.http_password = "p1".into();
+    let handle = frp_client::plugin::start_http_proxy(&cfg)
+        .await
+        .expect("start http_proxy plugin");
+
+    // Valid creds (base64("u1:p1") = dTE6cDE=) under a spaced name → 407,
+    // exactly as if no credentials were sent. RED pre-fix: the row matched,
+    // the plugin dialed example.com:443 and its dial failure rendered the
+    // bare Go 400 — never the 407.
+    let mut c = TcpStream::connect(handle.local_addr).await.unwrap();
+    c.write_all(
+        b"CONNECT example.com:443 HTTP/1.1\r\n\
+          Host: example.com:443\r\n\
+          Proxy-Authorization : Basic dTE6cDE=\r\n\
+          \r\n",
+    )
+    .await
+    .unwrap();
+    let mut resp = Vec::new();
+    c.read_to_end(&mut resp).await.unwrap();
+    let text = String::from_utf8_lossy(&resp);
+    assert!(
+        text.starts_with("HTTP/1.1 407 Not authorized\r\n"),
+        "a spaced Proxy-Authorization name is not credentials (Go Header.Get misses the row), got: {text:?}"
+    );
+
+    // Second half: the spaced row is its own key — a LATER canonical row
+    // still authenticates and the CONNECT tunnels (Go's Get reads the
+    // canonical key; last-wins/truncation would answer 407 instead).
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut conn, _)) = backend.accept().await {
+            let mut buf = [0u8; 64];
+            loop {
+                match conn.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if conn.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    let mut c = TcpStream::connect(handle.local_addr).await.unwrap();
+    c.write_all(
+        format!(
+            "CONNECT {backend_addr} HTTP/1.1\r\n\
+             Host: {backend_addr}\r\n\
+             Proxy-Authorization : Basic Z2FyYmFnZQ==\r\n\
+             Proxy-Authorization: Basic dTE6cDE=\r\n\
+             \r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let phrase = b"HTTP/1.1 200 OK\r\n\r\n";
+    let mut got = Vec::new();
+    let mut chunk = [0u8; 64];
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while got.len() < phrase.len() {
+            let n = c.read(&mut chunk).await.expect("read");
+            assert!(n > 0, "plugin closed before the CONNECT success phrase");
+            got.extend_from_slice(&chunk[..n]);
+        }
+    })
+    .await
+    .expect("CONNECT success phrase never arrived");
+    assert!(
+        got.starts_with(phrase),
+        "the later canonical row must authenticate the tunnel, got: {:?}",
+        String::from_utf8_lossy(&got)
+    );
+    c.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        c.read_exact(&mut echoed),
+    )
+    .await
+    .expect("tunneled round trip never completed")
+    .expect("read_exact");
+    assert_eq!(&echoed, b"ping", "echo backend via CONNECT tunnel");
+}
+
 /// Successful CONNECT through the http_proxy plugin: the FIRST bytes the
 /// user socket receives must be byte-exactly `HTTP/1.1 200 OK\r\n\r\n` —
 /// Go frp answers CONNECT with reason phrase "200 OK" (http_proxy.go:188
@@ -2580,5 +2687,97 @@ async fn test_http_proxy_read_limit_exact_boundary_rows() {
         "one byte past the boundary must render Go's 431 byte-exact \
          (was served 500 pre-fix), got {} bytes",
         resp.len()
+    );
+}
+
+/// Round-18 audit G4 (R1 LOW regression pin): a LOWERCASE `connect` method
+/// token must NOT tunnel. Go http_proxy.go sniffs the CONNECT face with an
+/// EqualFold 7-byte compare, but the request-line gate is EXACT-case
+/// (package http.ReadRequest, request.go:1118 `justAuthority`):
+/// `connect host:port` parses as absolute-form-ish (Scheme "connect",
+/// Opaque "host:port") with URL.Host == "" — and Go frp dials
+/// `r.URL.Host` unconditionally, so `net.Dial("tcp", "")` fails and the
+/// request answers the bare 47-byte dial 400 with the backend NEVER
+/// reached. The pre-fix (round-17) code dialed the verbatim target for any
+/// EqualFold-CONNECT method, so a lowercase connect to a LIVE backend
+/// established a tunnel instead of failing — RED here. (Target is a live
+/// capture backend, not a refused port, so the pre-fix tunnel path really
+/// differs: a refused target would answer the same 400 both ways and the
+/// pin would be vacuous.)
+#[tokio::test]
+async fn test_http_proxy_lowercase_connect_answers_dial_400_never_reaches_backend() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let backend = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Skipping test: cannot bind (sandboxed): {e}");
+            return;
+        }
+    };
+    let backend_addr = backend.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let (a1, c1) = (accepted.clone(), captured.clone());
+    tokio::spawn(async move {
+        // Keep accepting for the whole test; a tunnel dial lands here.
+        while let Ok((mut conn, _)) = backend.accept().await {
+            a1.fetch_add(1, Ordering::SeqCst);
+            let mut buf = vec![0u8; 1024];
+            let _ = conn.read(&mut buf).await;
+            c1.lock().unwrap().extend_from_slice(&buf);
+            // Never reply: a tunneled client would hang/EOF with
+            // zero bytes — not the 400 this pin demands.
+        }
+    });
+
+    let cfg = PluginConfig {
+        plugin_type: "http_proxy".into(),
+        ..Default::default()
+    };
+    let handle = match frp_client::plugin::start_http_proxy(&cfg).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Skipping test: cannot start plugin (sandboxed): {e}");
+            return;
+        }
+    };
+    let mut client = TcpStream::connect(handle.local_addr).await.unwrap();
+    client
+        .write_all(
+            format!("connect {backend_addr} HTTP/1.1\r\nHost: {backend_addr}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_to_end(&mut resp),
+    )
+    .await
+    .expect("conn must close after the dial-failure 400")
+    .unwrap();
+    assert_eq!(
+        resp.as_slice(),
+        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
+        "lowercase connect must answer Go's byte-exact dial 400, got {} bytes: {:?}",
+        resp.len(),
+        String::from_utf8_lossy(&resp)
+    );
+
+    // Let any (wrong) tunnel dial land before asserting the backend saw
+    // nothing. Post-fix the plugin never dials (empty target), so this is
+    // deterministic; the pre-fix tunnel path fails the 400 assert above
+    // regardless.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        0,
+        "backend must receive ZERO connections (no tunnel dial)"
+    );
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "backend must receive ZERO bytes"
     );
 }

@@ -273,8 +273,12 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
     ///   and its backend DECLARED a body that HTTP forbids the status from
     ///   carrying (round-18 C3b): the split-off `tail` holds the discard
     ///   input. NOT complete — hand it to `buffer` so the discard section
-    ///   (next poll, or this one when the gate falls through) consumes
-    ///   exactly the declared framing instead of relaying it.
+    ///   consumes exactly the declared framing instead of relaying it.
+    ///   Always the NEXT poll (round-18 M1): the drain's own poll filled
+    ///   the caller's ReadBuf and must return Ready — falling through to
+    ///   the discard's inner poll could end that poll in Pending, and a
+    ///   Pending return with a filled buffer silently drops the drain's
+    ///   bytes (tokio's `Read` future builds a fresh ReadBuf per poll).
     /// - `injected` alone — the head is out; the rest of the response
     ///   passes through raw.
     fn emission_drained(&mut self) {
@@ -719,6 +723,14 @@ struct ChunkedSkip {
     pending: Vec<u8>,
     /// Remaining bytes of the current chunk's data run.
     left: u64,
+    /// Trailers-block scan offset within `pending` (L6 NIT, round 18): the
+    /// block is never drained line-by-line (a partial last line must wait
+    /// for more bytes), so a feed that ends mid-trailer re-scanned every
+    /// complete trailer line from 0 on the next call — O(lines × feeds)
+    /// under a drip. Persisted so re-entry resumes past the lines already
+    /// scanned; reset when the block completes. Bounded by the same 4096
+    /// cap as before (the `pos > 4096` check runs per line).
+    trailer_scanned: usize,
 }
 
 enum ChunkedState {
@@ -740,6 +752,7 @@ impl ChunkedSkip {
             state: ChunkedState::Size,
             pending: Vec::new(),
             left: 0,
+            trailer_scanned: 0,
         }
     }
 
@@ -826,7 +839,10 @@ impl ChunkedSkip {
                     // (seeUpcomingDoubleCRLF + Peek(2) single-CRLF fast
                     // path, transfer.go:843-870) — mirror: scan lines to
                     // the first empty one, cap the BLOCK at 4096 bytes.
-                    let mut pos = 0;
+                    // Resume from the persisted offset so previously
+                    // scanned complete lines are not re-scanned on a
+                    // partial-last-line feed (see `trailer_scanned`).
+                    let mut pos = self.trailer_scanned;
                     loop {
                         if pos > 4096 {
                             return Err("suspiciously long trailer after chunked body");
@@ -836,10 +852,12 @@ impl ChunkedSkip {
                             // the pending block here too: an unterminated
                             // trickle must not grow past the 4096 window
                             // Go's bufio-based trailer read would error
-                            // on.
+                            // on. Persist the progress made this call
+                            // (lines scanned before the partial one).
                             if self.pending.len() > 4096 + 2 {
                                 return Err("suspiciously long trailer after chunked body");
                             }
+                            self.trailer_scanned = pos;
                             return Ok(false);
                         };
                         let mut line = &self.pending[pos..pos + rel];
@@ -849,6 +867,7 @@ impl ChunkedSkip {
                         pos += rel + 1;
                         if line.is_empty() {
                             self.pending.drain(..pos);
+                            self.trailer_scanned = 0;
                             return Ok(true);
                         }
                     }
@@ -949,8 +968,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
         // buffer falls through to the gather loop, which re-resolves the
         // head boundary and re-enters classification. A drained injected
         // 204/304 whose backend declared a body (discard armed) hands the
-        // split-off junk to `buffer` the same way and falls through to the
-        // discard section below (never to the gather loop — the junk is
+        // split-off junk to `buffer` the same way, and the drain poll
+        // RETURNS like every other drain (see below — a poll that filled
+        // the caller's buffer must never end in Pending); the NEXT poll
+        // runs the discard section — never the gather loop (the junk is
         // post-response bytes and must not be re-classified as a head).
         if (this.injected || this.raw_head || this.raw_pass)
             && this.buffer_offset < this.buffer.len()
@@ -964,13 +985,27 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
             if fully_drained {
                 this.emission_drained();
             }
-            // Every drain except the C3b discard handoff returns here with
-            // >= 1 byte served. The handoff fell through instead: discard
-            // input in `buffer`, `discard` armed — the section below
-            // consumes it.
-            if !fully_drained || this.discard.is_none() {
-                return Poll::Ready(Ok(()));
-            }
+            // Every drain returns here having served >= 1 byte (the gate
+            // above only runs while `buffer_offset < buffer.len()`), and
+            // it must ALWAYS return — ReadBuf contract: a poll that filled
+            // the caller's buffer must never go on to return
+            // Poll::Pending, because tokio's `Read` future builds a FRESH
+            // ReadBuf per poll and bytes filled by a Pending poll are
+            // never reported to the caller (silently dropped from the
+            // user-facing wire). The C3b discard handoff — a fully
+            // drained injected 204/304 whose backend declared a body
+            // (round-18 M1) — must therefore NOT fall through into the
+            // discard section on this poll: when the in-hand tail is
+            // empty the discard instant-completes and polls the inner
+            // reader below, which returns Pending for a keep-alive
+            // backend that has not yet sent its next response — that
+            // Pending would discard this drain's final chunk (the tail of
+            // an injected head larger than the caller's buffer, up to the
+            // ~64 KiB gather cap under frp-core's 32 KiB PoolGuard). The
+            // discard section runs on the NEXT poll, whose caller ReadBuf
+            // starts unfilled; the post-boundary serve below already
+            // returns the same way.
+            return Poll::Ready(Ok(()));
         }
 
         // Round-18 C3b: the injected 204/304 head is fully out (drained
@@ -1070,12 +1105,16 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                 // (its body never comes), first-N-bytes-eaten for the
                 // pipelined one. No clean Go parity exists for the CL>0
                 // arm; the fail-open below is a deliberate frp-rs
-                // divergence — INSTANT clean completion, no inner read,
-                // no WARN (nothing failed — this is the legal shape as
-                // often as the hostile one). Any partial junk the machine
-                // held is dropped with it; whatever the backend sends
-                // later passes through raw as the stream's real
-                // continuation.
+                // divergence — INSTANT clean completion with no further
+                // wire read FOR THE DISCARD (the in-hand bytes were the
+                // whole consumption; the inner poll a few lines below
+                // only serves the real continuation if it is already in
+                // hand, or parks the caller on that read's registered
+                // waker — never a phantom body read), no WARN (nothing
+                // failed — this is the legal shape as often as the
+                // hostile one). Any partial junk the machine held is
+                // dropped with it; whatever the backend sends later
+                // passes through raw as the stream's real continuation.
                 this.buffer.clear();
                 this.discard = None;
                 this.complete = true;
@@ -1386,10 +1425,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                 Poll::Ready(Ok(())) => {
                     let n = temp_buf.filled().len();
                     if n == 0 {
-                        // EOF before a head terminator. If the last unit
-                        // served raw was a MALFORMED head, that relayed
-                        // unit is the response and the stream ends cleanly
-                        // (see `malformed_raw`). Otherwise the backend
+                        // EOF before a head terminator. The backend
                         // closed without completing a usable head (nothing
                         // relayed; interim 1xx heads may have been). Go
                         // readResponse errors on an unterminated head
@@ -1400,10 +1436,28 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                         // A bare Ok(0) here would read as clean
                         // end-of-stream (round-14 review fix), and the old
                         // partial-byte relay put half a head on the wire.
-                        if this.malformed_raw {
-                            this.complete = true;
-                            return Poll::Ready(Ok(()));
-                        }
+                        //
+                        // A `malformed_raw` stream is UNREACHABLE here:
+                        // both raise sites also set `complete` —
+                        // `abort_after_discard_failure` (the discard
+                        // section returns the permanent EOF in that same
+                        // poll) and the raw serve of a malformed head
+                        // (whose emission drains only through the flag
+                        // gate into `raw_head_fully_served`, which raises
+                        // `complete` before the gather loop can run
+                        // again) — and the top-of-poll `complete` gate
+                        // serves that EOF first. Round-18 4c: the old
+                        // guard answered a bare Ok(()) for this shape (a
+                        // fail-OPEN clean end-of-stream) while its comment
+                        // claimed fail-closed. Removed — fail-closed now
+                        // holds unconditionally, so a future raise site
+                        // cannot turn an unterminated head into a "clean"
+                        // end-of-stream. Go parity: an EOF before the
+                        // head terminator is an unterminated response
+                        // head; http.Transport ReadResponse errors on it
+                        // and the vhost ErrorHandler answers 404
+                        // (frp-core/src/bridge.rs:506-532 renders that
+                        // page from this Err arm).
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
                             "backend closed before completing response head",
@@ -3644,6 +3698,45 @@ mod tests {
         out
     }
 
+    /// Drive ONE `poll_read` into a fresh 1 KiB caller ReadBuf — the M1
+    /// tests need a caller buffer smaller than the injected emission and
+    /// per-poll control over which poll parks (a tokio `read` future
+    /// hides both: it drains as much as fits and re-polls transparently).
+    /// Each call uses a FRESH ReadBuf exactly like tokio's `Read` future
+    /// does — bytes filled by a poll that then returns Pending are lost,
+    /// which is the M1 bug under test. `Ok(n)` served n bytes, `Ok(0)`
+    /// clean EOF; `Err(TimedOut)` the poll PARKED (returned Pending and
+    /// registered the inner read's waker; the 1 s budget turns an
+    /// unexpected park into a test failure instead of a hang);
+    /// `Err(other)` the read failed.
+    async fn injector_poll_read_small(
+        injector: &mut ResponseHeaderInjector<tokio::io::DuplexStream>,
+        chunk: &mut [u8; 1024],
+    ) -> std::io::Result<usize> {
+        use std::future::poll_fn;
+        use std::pin::Pin;
+        use std::task::Poll;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            poll_fn(|cx| {
+                let mut buf = ReadBuf::new(chunk);
+                match Pin::new(&mut *injector).poll_read(cx, &mut buf) {
+                    Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.filled().len())),
+                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                    Poll::Pending => Poll::Pending,
+                }
+            }),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "injector poll parked",
+            )),
+        }
+    }
+
     /// #3a: a response header longer than one internal 4 KiB buffer, whose
     /// `\r\n\r\n` terminator spans two inner reads, must still be injected.
     #[tokio::test]
@@ -4280,6 +4373,308 @@ mod tests {
             &next[..],
             "the keep-alive next response must arrive byte-exact — the discard must not \
              eat its first bytes and must not stall on the response-head deadline"
+        );
+    }
+
+    /// Round-18 M1 regression (RED on the pre-fix flag gate): the drain
+    /// of the FINAL chunk of an injected head must return
+    /// `Poll::Ready` even when the C3b discard handoff leaves the
+    /// discard armed. Pre-fix, that drain fell through into the discard
+    /// section on the SAME poll; a LEGAL 304 (declared Content-Length,
+    /// zero in-hand junk) instant-completed there and polled the inner
+    /// reader, which returned Pending for the keep-alive backend
+    /// (response 2 not yet staged). poll_read thus returned Pending with
+    /// the caller's ReadBuf already filled — tokio's `Read` future
+    /// builds a FRESH ReadBuf per poll, so the drain's final chunk was
+    /// silently dropped from the user-facing wire (any injected 204/304
+    /// head larger than the caller buffer loses its tail: > 32 KiB
+    /// emissions under frp-core's 32 KiB PoolGuard). Drive poll_read
+    /// with a 1 KiB caller buffer over a ~2.5 KiB injected 304 emission:
+    /// the full head must arrive byte-exact across the polls, then a
+    /// staged keep-alive response 2 byte-exact.
+    #[tokio::test]
+    async fn injector_flag_gate_final_drain_never_parks_with_a_filled_buf() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut headers = std::collections::HashMap::new();
+        for i in 0..8 {
+            headers.insert(format!("X-Big-{i}"), "v".repeat(300));
+        }
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers, None);
+
+        // A LEGAL 304: `Content-Length: 16` declares the would-be-200
+        // entity length (RFC 9110 §15.4.5) and the backend sends no body —
+        // zero in-hand junk behind the head. The declaration still arms
+        // the discard; with no in-hand junk it instant-completes once the
+        // emission is out.
+        inner_w
+            .write_all(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 16\r\n\r\n")
+            .await
+            .expect("write 304 head");
+
+        // Expected emission: the status line (the backend Content-Length
+        // is stripped), the configured headers in sorted order, the blank
+        // line — over two 1 KiB caller buffers, so the drain spans polls.
+        let value = "v".repeat(300);
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(b"HTTP/1.1 304 Not Modified\r\n");
+        for i in 0..8 {
+            expected.extend_from_slice(format!("X-Big-{i}: {value}\r\n").as_bytes());
+        }
+        expected.extend_from_slice(b"\r\n");
+        assert!(
+            expected.len() > 2 * 1024,
+            "emission must exceed two 1 KiB caller buffers so the drain spans polls \
+             (got {} bytes)",
+            expected.len()
+        );
+
+        let mut got: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let mut parked = false;
+        while got.len() < expected.len() {
+            match injector_poll_read_small(&mut injector, &mut chunk).await {
+                Ok(0) => panic!("clean EOF while the injected 304 head was still draining"),
+                Ok(n) => got.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    parked = true;
+                    break;
+                }
+                Err(e) => panic!("injector read failed: {e}"),
+            }
+        }
+        if !parked {
+            // The emission was fully served; the discard runs on the poll
+            // AFTER the final drain (M1 — the drain's own poll must
+            // return Ready). That poll instant-completes the legal 304
+            // (nothing in-hand to serve) and parks on the inner reader
+            // with a fresh 1 KiB caller buffer: the correct,
+            // waker-registered park.
+            match injector_poll_read_small(&mut injector, &mut chunk).await {
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => parked = true,
+                Ok(0) => panic!("clean EOF where the discard's keep-alive park was expected"),
+                Ok(n) => panic!(
+                    "expected the post-drain discard poll to park on the inner reader, \
+                     it served {n} bytes (response 2 is not staged yet)"
+                ),
+                Err(e) => panic!("injector read failed: {e}"),
+            }
+        }
+        assert!(
+            parked,
+            "the injector must end phase 1 parked on the keep-alive inner read"
+        );
+        assert_eq!(
+            &got[..],
+            &expected[..],
+            "the full injected 304 head must cross the 1 KiB reads byte-exact — the \
+             final-drain poll must never lose its bytes to a Pending return (M1)"
+        );
+
+        // The keep-alive backend answers the connection's next request.
+        // Its bytes must pass through raw behind the stripped 304 head.
+        let next = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone";
+        inner_w.write_all(next).await.expect("write next response");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        let mut rest = Vec::new();
+        loop {
+            match injector_poll_read_small(&mut injector, &mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => rest.extend_from_slice(&chunk[..n]),
+                Err(e) => panic!("keep-alive response 2 read failed: {e}"),
+            }
+        }
+        assert_eq!(
+            &rest[..],
+            &next[..],
+            "response 2 must arrive byte-exact after the stripped 304 head"
+        );
+    }
+
+    /// G1 pin (round-18 C3b abort arm, first coverage): a lying backend
+    /// declares `Transfer-Encoding: chunked` on a 204 and writes a
+    /// MALFORMED chunk line (`ZZ` is not hex — Go parseHexUint rejects,
+    /// internal/chunked.go:278-298) in the same in-hand segment as the
+    /// head. The chunked discard feed errors, so the stream ends with
+    /// PERMANENT clean EOF (`abort_after_discard_failure`): the user saw
+    /// exactly the stripped 204 head, no junk is relayed, no second
+    /// gateway head can follow, and the EOF comes from the injector's
+    /// terminal state — never from the inner reader — so bytes staged
+    /// later (inner writer kept alive) are never served. (The abort WARN
+    /// is rate-limited to one line per 5 s across all bridges.) RED on
+    /// any code that relays the garbage, parks on it, or answers a
+    /// second head.
+    #[tokio::test]
+    async fn injector_204_chunked_malformed_junk_ends_stream_permanently() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector = ResponseHeaderInjector::<tokio::io::DuplexStream>::new(
+            inner_r,
+            Default::default(),
+            None,
+        );
+
+        // Head + malformed junk in ONE segment: the junk is the discard
+        // input the moment the head boundary is found.
+        inner_w
+            .write_all(b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\n")
+            .await
+            .expect("write head + malformed junk");
+        // Garbage staged AFTER the abort point; the writer stays alive so
+        // a clean EOF can only come from the injector's terminal state,
+        // not from duplex EOF.
+        inner_w
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO")
+            .await
+            .expect("write later garbage");
+
+        // Poll-level oracle: the terminal state must be a CLEAN EOF
+        // (`Ok(0)`) — no Err, and no park. `injector_read_all` would hide
+        // both (it `expect`s on Err and would hang on a park until the
+        // outer timeout). Each poll is internally 1 s-bounded and reports
+        // a park as `Err(TimedOut)`.
+        let mut out: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut ended_clean = false;
+        while std::time::Instant::now() < deadline {
+            match injector_poll_read_small(&mut injector, &mut chunk).await {
+                Ok(0) => {
+                    ended_clean = true;
+                    break;
+                }
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    panic!("abort must end the stream promptly, it parked instead")
+                }
+                Err(e) => panic!("the abort must end the stream with a clean EOF, got {e}"),
+            }
+        }
+        assert!(
+            ended_clean,
+            "the injector's terminal state must serve a clean Ok(0) EOF"
+        );
+        assert_eq!(
+            &out[..],
+            &b"HTTP/1.1 204 No Content\r\n\r\n"[..],
+            "the stripped 204 head is the whole response — malformed chunked junk must \
+             never be relayed and no second head may follow"
+        );
+    }
+
+    /// Round-18 4c pin: an EOF before the head terminator is ALWAYS
+    /// fail-closed. `malformed_raw` is normally unreachable at that arm
+    /// (both raise sites set `complete` first), so the guard's state is
+    /// driven directly here: a flag-set stream whose backend closes with
+    /// no head must surface `Err(UnexpectedEof)`, which frp-core answers
+    /// with Go's vhost ErrorHandler 404 page
+    /// (frp-core/src/bridge.rs:506-532) — never a clean end-of-stream.
+    /// The pre-fix guard returned `Ok(())` (fail-open), so this is RED on
+    /// that code.
+    #[tokio::test]
+    async fn injector_malformed_raw_eof_before_head_stays_fail_closed() {
+        let (inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector = ResponseHeaderInjector::<tokio::io::DuplexStream>::new(
+            inner_r,
+            Default::default(),
+            None,
+        );
+        injector.malformed_raw = true;
+        drop(inner_w);
+
+        let mut chunk = [0u8; 1024];
+        match injector_poll_read_small(&mut injector, &mut chunk).await {
+            Err(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof,
+                "an unterminated head must surface UnexpectedEof (Go readResponse \
+                 error -> vhost ErrorHandler 404), got {e}"
+            ),
+            Ok(n) => panic!(
+                "an EOF before the head terminator must never read as a clean \
+                 end-of-stream (served {n} bytes)"
+            ),
+        }
+    }
+
+    /// G2 pin (round-18): the 304 suppressed-headers table {Content-Type,
+    /// Content-Length, Transfer-Encoding} filters the CONFIGURED emission
+    /// too. The backend-side 304 strip is pinned by
+    /// `injector_304_strips_content_type_and_content_length_withholds_declared_body`;
+    /// this is the separate config-emission site — Go's ModifyResponse
+    /// `Header.Set` runs BEFORE chunkWriter.writeHeader's delHeader sweep
+    /// (server.go:1483-1497), so a configured suppressed name never
+    /// reaches the wire either.
+    #[tokio::test]
+    async fn injector_304_suppresses_configured_content_type_and_length() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "Content-Type".to_string(),
+            String::from("text/x-configured"),
+        );
+        headers.insert("Content-Length".to_string(), String::from("77"));
+        headers.insert("X-Injected".to_string(), String::from("yes"));
+        let mut injector = ResponseHeaderInjector::new(inner_r, headers, None);
+
+        // No body framing on the wire, so no discard is armed — the strip
+        // sites under test are purely the emission filters.
+        inner_w
+            .write_all(b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\n\r\n")
+            .await
+            .expect("write");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        let out = injector_read_all(&mut injector).await;
+        assert_eq!(
+            &out[..],
+            &b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nX-Injected: yes\r\n\r\n"[..],
+            "configured Content-Type and Content-Length must be suppressed on a 304 like \
+             backend lines; other configured headers still inject"
+        );
+    }
+
+    /// G3 pin (round-18): a 204 with NO declared body framing (no
+    /// Content-Length, no Transfer-Encoding) followed in the SAME
+    /// in-hand segment by a pipelined next response. Go's Transport
+    /// answers Body = NoBody on a no-framing 204 — nothing is read
+    /// (transfer.go:565-578) and the pooled connection continues — so
+    /// the bytes behind the head are the next response, never junk, and
+    /// must reach the user raw behind the stripped head. The
+    /// DeclaredFraming::None arm attaches the in-hand tail to the
+    /// emission verbatim (no body parser runs on a no-body status in Go
+    /// either). Byte-exact pin — eating or withholding the pipelined
+    /// tail is RED.
+    #[tokio::test]
+    async fn injector_204_no_framing_pipelined_next_response_passes_raw() {
+        use tokio::io::AsyncWriteExt;
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector = ResponseHeaderInjector::<tokio::io::DuplexStream>::new(
+            inner_r,
+            Default::default(),
+            None,
+        );
+
+        inner_w
+            .write_all(
+                b"HTTP/1.1 204 No Content\r\nX-Keep: yes\r\n\r\n\
+                  HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone",
+            )
+            .await
+            .expect("write");
+        inner_w.shutdown().await.expect("shutdown");
+        drop(inner_w);
+
+        let out = injector_read_all(&mut injector).await;
+        assert_eq!(
+            &out[..],
+            &b"HTTP/1.1 204 No Content\r\nX-Keep: yes\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone"[..],
+            "a no-framing 204's in-hand tail is the pipelined next response — relayed \
+             raw behind the stripped head, byte-exact"
         );
     }
 

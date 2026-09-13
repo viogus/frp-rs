@@ -1170,7 +1170,7 @@ pub(super) async fn read_request_and_build_forward<
     // \r\n\r\n scan).
     let header_end = frp_core::textproto::head_end(&buf).unwrap_or(buf.len());
     let headers_str = String::from_utf8_lossy(&buf[..header_end]);
-    let mut lines = headers_str.lines();
+    let mut lines = headers_str.lines().peekable();
 
     // Parse request line: METHOD URL HTTP/1.x — strict Go parseRequestLine
     // semantics via the shared helper (literal-space splitn(3), every part
@@ -1210,9 +1210,14 @@ pub(super) async fn read_request_and_build_forward<
         }
     };
     // Every head that reaches the gates below has a ParseHTTPVersion-able
-    // token (both admission paths above guarantee it).
-    let (v_maj, v_min) =
-        http::parseable_version(version).expect("admission gates admit only parseable versions");
+    // token (both admission paths above guarantee it), so the re-parse can
+    // only fail on invariant drift. Round-18 audit L4: the old `expect`
+    // was an abort under `panic=abort` on that drift; a guarded arm now
+    // falls to the same bare-close Err the lenient path takes for an
+    // unparseable version — no behavior change for any reachable head.
+    let Some((v_maj, v_min)) = http::parseable_version(version) else {
+        return Err(format!("bad request line: {request_line}"));
+    };
 
     // Round-17 audit F7: the Go conn.readRequest ladder (server.go
     // c.readRequest + package readRequest, go1.25.12) — walk the terminated
@@ -1383,29 +1388,81 @@ pub(super) async fn read_request_and_build_forward<
     // serves one request and closes after the response (Go sends close
     // whenever the connection closes after the response).
     let mut fwd = format!("{method} {path} HTTP/1.1\r\n");
-    for line in lines {
+    // Round-18 audit L2: Go textproto folds obs-continuation lines
+    // (leading SP/HTAB) into the PRECEDING record's value (reader.go
+    // readContinuedLineSlice); this raw per-line re-emission must therefore
+    // route each fold by the previous line's disposition. A fold whose
+    // record was dropped or replaced above would otherwise be emitted as a
+    // bare line and obs-fold onto the preceding EMITTED record at the
+    // backend — worst case appended to the "Host:" line, which sits
+    // directly below the stripped hop headers in the canonical head shape.
+    // Folds of KEPT records stay raw and contiguous with their head line
+    // (byte-preserving round trip) and skip the record-head arms below (a
+    // folded value piece may contain a colon — the request_headers
+    // override arm must not misread it as its own record).
+    let mut prev_record_dropped = false;
+    while let Some(line) = lines.next() {
         if line.is_empty() {
             continue;
         }
+        if line.starts_with([' ', '\t']) {
+            if prev_record_dropped {
+                // The fold belongs to a dropped/replaced record — swallow
+                // it (and any following folds; the flag stays set until a
+                // fresh record head arrives).
+                continue;
+            }
+            if line.contains(['\r', '\n']) {
+                let safe_line: String = line.chars().filter(|&c| c != '\r' && c != '\n').collect();
+                fwd.push_str(&safe_line);
+            } else {
+                fwd.push_str(line);
+            }
+            fwd.push_str("\r\n");
+            continue;
+        }
+        // A fresh record head — folds following it route by the disposition
+        // this iteration sets.
+        prev_record_dropped = false;
         // When appending the peer IP (https plugins) OR replacing the chain
-        // with a configured value, the inbound X-Forwarded-For line is
+        // with a configured value, the inbound X-Forwarded-For record is
         // collected here and re-emitted canonically after the loop — the
         // original line must not pass through as well, or the backend sees
         // two X-Forwarded-For headers.
         if (x_forwarded_for.is_some() || configured_xff.is_some())
             && starts_with_ignore_ascii_case(line, "x-forwarded-for:")
         {
-            if let Some(v) = line.split_once(':').map(|(_, v)| v.trim().to_string()) {
-                if !v.is_empty() {
-                    prior_xff.push(v);
-                }
+            // Round-18 audit L3: the prior chain is Go's per-ROW stored
+            // value joined by ", " (reverseproxy.go setXForwarded —
+            // `strings.Join(prior, ", ")`; mirrored server-side by the
+            // round-13 vhost injector), so an EMPTY-value row contributes
+            // an empty element, never a dropped row: a sole empty row
+            // emits ", {peer}", byte-identical to Go. Stored shape
+            // reconstructed from the raw line — readMIMEHeader stores the
+            // after-colon value of the OWS-trimmed first physical line,
+            // TrimLeft'd once, with each obs-fold appended as ' ' + its
+            // OWS-trimmed piece, unconditionally (an all-whitespace fold
+            // included). The old ASCII `trim()` + non-empty gate dropped
+            // empty rows and trimmed Unicode whitespace Go keeps.
+            let mut value = line
+                .split_once(':')
+                .map(|(_, v)| v.trim_matches([' ', '\t']).to_string())
+                .unwrap_or_default();
+            // The record's folds are part of the row value — consume them
+            // here so they neither leak as bare lines nor route to the
+            // record-head arms below.
+            while let Some(fold) = lines.next_if(|l| l.starts_with([' ', '\t'])) {
+                value.push(' ');
+                value.push_str(fold.trim_matches([' ', '\t']));
             }
+            prior_xff.push(value);
             continue;
         }
         if hop_by_hop
             .iter()
             .any(|h| starts_with_ignore_ascii_case(line, h))
         {
+            prev_record_dropped = true;
             continue;
         }
         // Drop every original Content-Length line: when the body is chunked
@@ -1418,14 +1475,17 @@ pub(super) async fn read_request_and_build_forward<
         if starts_with_ignore_ascii_case(line, "content-length:")
             && (framing == Some(BodyFraming::Chunked) || content_length.is_some())
         {
+            prev_record_dropped = true;
             continue;
         }
-        // Skip headers that request_headers will override (Go Header.Set).
+        // Skip headers that request_headers will override — Go Header.Set
+        // replaces the WHOLE record, folded value included.
         if let Some((name, _)) = line.split_once(':') {
             if request_headers
                 .keys()
                 .any(|k| k.eq_ignore_ascii_case(name.trim()))
             {
+                prev_record_dropped = true;
                 continue;
             }
         }
@@ -1435,6 +1495,10 @@ pub(super) async fn read_request_and_build_forward<
                 .filter(|&c| c != '\r' && c != '\n')
                 .collect();
             fwd.push_str(&format!("Host: {safe_host}\r\n"));
+            // The rewrite REPLACES the original record — its folds must
+            // not obs-fold onto the rewritten line (Go never re-emits
+            // them; req.Host is written from the rewrite alone).
+            prev_record_dropped = true;
         } else {
             // Strip CR/LF from forwarded header lines: header injection /
             // request-smuggling defense (the h2 plugin path rejects CR/LF
@@ -1564,10 +1628,10 @@ struct LegHeadWalk {
 /// and a leading-SP/HTAB first header line ("malformed MIME header initial
 /// line"). Continuation folds (following lines starting with SP/HTAB) join
 /// the current record's value with a single space after both-end trimming.
-fn walk_leg_head(headers: &str) -> Result<LegHeadWalk, &'static str> {
+fn walk_leg_head<'a>(headers: &'a str) -> Result<LegHeadWalk, &'static str> {
     let mut walk = LegHeadWalk::default();
     let mut cur_is_host = false;
-    let mut cur_value: Option<String> = None; // None = no record open
+    let mut cur_value: Option<std::borrow::Cow<'a, str>> = None; // None = no record open
     let mut saw_record = false;
     for line in headers.lines().skip(1) {
         // The head terminator never produces a record (it is the empty
@@ -1598,6 +1662,11 @@ fn walk_leg_head(headers: &str) -> Result<LegHeadWalk, &'static str> {
                 if value_has_ctl(piece) {
                     return Err("malformed MIME header: CTL byte in folded value");
                 }
+                // Round-18 audit L6: a fold-free record holds a Borrowed
+                // slice of the head (zero alloc); to_mut upgrades to an
+                // owned String only here, on the first fold (clones once,
+                // later folds push in place).
+                let v = v.to_mut();
                 v.push(' ');
                 v.push_str(piece);
             }
@@ -1608,7 +1677,11 @@ fn walk_leg_head(headers: &str) -> Result<LegHeadWalk, &'static str> {
             if cur_is_host {
                 walk.host_groups += 1;
                 if walk.host_value.is_none() {
-                    walk.host_value = Some(v);
+                    // into_owned: the first Host record's fold-free
+                    // Borrowed slice becomes the owned field value here —
+                    // one alloc, the same as the pre-Cow String (a folded
+                    // record's Owned moves out with no copy).
+                    walk.host_value = Some(v.into_owned());
                 }
             }
         }
@@ -1645,14 +1718,18 @@ fn walk_leg_head(headers: &str) -> Result<LegHeadWalk, &'static str> {
         walk.header_groups += 1;
         walk.name_has_space |= key_has_space;
         cur_is_host = is_host;
-        cur_value = Some(stored.to_string());
+        // Cow::Borrowed of the head slice — zero alloc for fold-free
+        // records (upgraded at the first fold above, into_owned at the
+        // closes below).
+        cur_value = Some(std::borrow::Cow::Borrowed(stored));
         saw_record = true;
     }
     if let Some(v) = cur_value.take() {
         if cur_is_host {
             walk.host_groups += 1;
             if walk.host_value.is_none() {
-                walk.host_value = Some(v);
+                // Same into_owned as the mid-loop close above.
+                walk.host_value = Some(v.into_owned());
             }
         }
     }
@@ -3601,5 +3678,93 @@ mod tests {
         let w = walk_leg_head("GET / HTTP/1.1\r\nHost: h\r\nX-A: y \tz\r\n\r\n").unwrap();
         assert_eq!(w.header_groups, 2);
         assert_eq!(w.host_groups, 1);
+    }
+
+    /// Round-18 audit L2 pin: an obs-fold under a STRIPPED hop-by-hop
+    /// record must be swallowed with it — never emitted as a bare line
+    /// that obs-folds onto the preceding EMITTED record at the backend
+    /// (worst case appending " folded" to the "Host:" line that follows
+    /// the stripped Proxy-Authorization in Go's canonical head order).
+    /// RED on the pre-fix loop: the fold re-emitted raw, byte-exact
+    /// compare fails with "Host: a folded".
+    #[tokio::test]
+    async fn l2_hop_stripped_record_fold_swallowed() {
+        let head = build_forward(
+            b"GET /p HTTP/1.1\r\nHost: a\r\nProxy-Authorization: secret\r\n \tfolded\r\nUser-Agent: t\r\n\r\n",
+            &Default::default(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            head, "GET /p HTTP/1.1\r\nHost: a\r\nUser-Agent: t\r\nConnection: close\r\n\r\n",
+            "stripped hop record AND its fold must vanish from the forwarded head"
+        );
+    }
+
+    /// Round-18 audit L2 pin, request_headers-override arm: a fold under a
+    /// record that request_headers will REPLACE (Go Header.Set replaces
+    /// the whole record, folded value included) must be swallowed too —
+    /// the pre-fix loop emitted it as an orphan line that obs-folded onto
+    /// whatever the override re-injection emitted above it.
+    #[tokio::test]
+    async fn l2_overridden_record_fold_swallowed() {
+        let mut request_headers = std::collections::HashMap::new();
+        request_headers.insert("x-a".to_string(), "2".to_string());
+        let head = build_forward(
+            b"GET /p HTTP/1.1\r\nHost: a\r\nX-A: 1\r\n folded\r\n\r\n",
+            &request_headers,
+            None,
+        )
+        .await;
+        assert_eq!(
+            head, "GET /p HTTP/1.1\r\nHost: a\r\nx-a: 2\r\nConnection: close\r\n\r\n",
+            "overridden record's fold must vanish; only the injected value reaches the backend"
+        );
+    }
+
+    /// Round-18 audit L3 pin (server-side vhost mirror: vhost.rs round-13
+    /// empty-XFF pin): an EMPTY-value X-Forwarded-For row is a real chain
+    /// element — Go `strings.Join(prior, ", ")` (reverseproxy.go
+    /// setXForwarded) keeps empty elements, so a sole empty row emits
+    /// ", {peer}" with the leading comma. The old ASCII-trim +
+    /// non-empty gate dropped the row and emitted a bare peer line.
+    #[tokio::test]
+    async fn l3_empty_xff_row_kept_in_chain() {
+        let head = build_forward(
+            b"GET /p HTTP/1.1\r\nHost: a\r\nX-Forwarded-For: \r\nUser-Agent: t\r\n\r\n",
+            &Default::default(),
+            Some("203.0.113.9".parse().unwrap()),
+        )
+        .await;
+        let lines = xff_lines(&head);
+        assert_eq!(lines.len(), 1, "exactly one XFF line, got: {lines:?}");
+        assert_eq!(
+            lines[0], "X-Forwarded-For: , 203.0.113.9",
+            "empty row contributes an empty chain element (leading comma)"
+        );
+    }
+
+    /// Round-18 audit L3 pin: obs-fold continuations are part of their
+    /// row's STORED value (Go textproto joins ' ' + trimmed piece), so an
+    /// inbound folded XFF row must merge into one chain element, then join
+    /// the following rows — `1.2.3.4 5.6.7.8, 9.9.9.9, {peer}`.
+    #[tokio::test]
+    async fn l3_xff_fold_merges_into_row_value() {
+        let head = build_forward(
+            b"GET /p HTTP/1.1\r\nHost: a\r\nX-Forwarded-For: 1.2.3.4\r\n 5.6.7.8\r\nX-Forwarded-For: 9.9.9.9\r\n\r\n",
+            &Default::default(),
+            Some("203.0.113.9".parse().unwrap()),
+        )
+        .await;
+        let lines = xff_lines(&head);
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one canonical XFF line, got: {lines:?}"
+        );
+        assert_eq!(
+            lines[0], "X-Forwarded-For: 1.2.3.4 5.6.7.8, 9.9.9.9, 203.0.113.9",
+            "fold merges into its row's value with a single space; rows join with ', '"
+        );
     }
 }

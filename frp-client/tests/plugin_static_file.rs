@@ -398,3 +398,52 @@ async fn test_static_file_plugin_if_none_match_nonmatching_token() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Audit round-18 G6 pin: an UNREADABLE base directory answers Go's
+/// serveError → toHTTPError IsPermission 403 page (fs.go:680-696) —
+/// `http.Error` shape, text/plain body "403 Forbidden\n" + nosniff +
+/// exact Content-Length — NOT the shared 404 page the pre-fix arms
+/// collapsed every open failure to (the kind-less default 500 arm exists
+/// for non-ENOENT/non-EACCES errors only). chmod 0o000 the base dir so
+/// `File::open` fails with PermissionDenied. Running as euid 0 (root) or
+/// with CAP_DAC_OVERRIDE bypasses mode bits entirely and the open would
+/// SUCCEED — skip like the ssh_gateway.rs:764 precedent
+/// (`unsafe { libc::geteuid() } == 0`), with permissions restored before
+/// the assertions so cleanup always works.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_static_file_plugin_unreadable_base_is_403() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir_with_index("no-read");
+    std::fs::write(dir.join("secret.txt"), b"hidden").unwrap();
+    let cfg = PluginConfig {
+        plugin_type: "static_file".into(),
+        local_path: dir.to_str().unwrap().into(),
+        ..Default::default()
+    };
+    let handle = frp_client::plugin::start_static_file_proxy(&cfg)
+        .await
+        .expect("start static_file plugin");
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping 403 test: running as root (mode bits bypassed)");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (status, body) = http_get(handle.local_addr, "/secret.txt", None).await;
+    // Restore before asserting so a failure still leaves a cleanable dir.
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+    assert_eq!(
+        status, 403,
+        "unreadable base must answer Go's 403 page: {body}"
+    );
+    assert!(
+        body.starts_with("HTTP/1.1 403 Forbidden\r\n")
+            && body.contains("Content-Type: text/plain; charset=utf-8\r\n")
+            && body.contains("X-Content-Type-Options: nosniff\r\n")
+            && body.ends_with("\r\n\r\n403 Forbidden\n"),
+        "Go http.Error 403 wire (status-text body, nosniff, no 404 page), got: {body:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -331,7 +331,7 @@ enum GoConnHeadClass<'a> {
 /// error-class model (see the type doc). Every terminated head is
 /// classified — parse success and failure alike. `connect_face` selects
 /// the http_proxy CONNECT arm semantics (see the type doc's face split).
-fn go_conn_head_class(head: &str, connect_face: bool) -> GoConnHeadClass<'_> {
+fn go_conn_head_class<'a>(head: &'a str, connect_face: bool) -> GoConnHeadClass<'a> {
     let mut lines = head.lines();
     let Some(request_line) = lines.next() else {
         return GoConnHeadClass::BadRequest400;
@@ -381,9 +381,11 @@ fn go_conn_head_class(head: &str, connect_face: bool) -> GoConnHeadClass<'_> {
     // The textproto-stored value of the single Host group (OWS-free:
     // both ends trimmed per physical line, folds joined single-space —
     // see the walker doc). Only meaningful when `host_groups == 1`.
-    let mut host_value: Option<String> = None;
-    let mut te_values: Vec<String> = Vec::new();
-    let mut cl_values: Vec<String> = Vec::new();
+    // Cow: the common no-fold case borrows the head slice; only a
+    // fold-merged record allocates (L6 NIT — per-conn faces).
+    let mut host_value: Option<std::borrow::Cow<'a, str>> = None;
+    let mut te_values: Vec<std::borrow::Cow<'a, str>> = Vec::new();
+    let mut cl_values: Vec<std::borrow::Cow<'a, str>> = Vec::new();
 
     let mut lines = lines.peekable();
     let mut first_header = true;
@@ -447,7 +449,6 @@ fn go_conn_head_class(head: &str, connect_face: bool) -> GoConnHeadClass<'_> {
         // letter upper-cased — case-insensitive equality here is the
         // same merge). Names containing SPACE skip canonicalization
         // (noCanon) and can never equal these keys.
-        let record_value = merged.as_deref().unwrap_or(value_trimmed);
         header_groups += 1;
         if name.bytes().any(|b| b == b' ') {
             // Conn gate "invalid header name" (issue 34540): SPACE in a
@@ -458,6 +459,12 @@ fn go_conn_head_class(head: &str, connect_face: bool) -> GoConnHeadClass<'_> {
             // errored the read in shape (c) above.
             name_has_space = true;
         }
+        // Fold-merged records own a String (the merge above); plain
+        // records borrow the head slice — allocate only in the fold case.
+        let stored_value = match &merged {
+            Some(m) => std::borrow::Cow::Owned(m.trim_start_matches([' ', '\t']).to_string()),
+            None => std::borrow::Cow::Borrowed(value_trimmed.trim_start_matches([' ', '\t'])),
+        };
         if name.eq_ignore_ascii_case("host") {
             host_groups += 1;
             if host_value.is_none() {
@@ -465,16 +472,16 @@ fn go_conn_head_class(head: &str, connect_face: bool) -> GoConnHeadClass<'_> {
                 // colon cut (the per-line end trim already killed the
                 // trailing OWS), so the first Host record's value is the
                 // gate's `hosts[0]`.
-                host_value = Some(record_value.trim_start_matches([' ', '\t']).to_string());
+                host_value = Some(stored_value);
             }
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             // Leading OWS only (Go stores TrimLeft of the value part; a
             // TRAILING space never survives — textproto trim() strips it
             // per physical line before the merge, so "chunked " reaches
             // EqualFold as "chunked").
-            te_values.push(record_value.trim_start_matches([' ', '\t']).to_string());
+            te_values.push(stored_value);
         } else if name.eq_ignore_ascii_case("content-length") {
-            cl_values.push(record_value.trim_start_matches([' ', '\t']).to_string());
+            cl_values.push(stored_value);
         }
     }
 
@@ -912,16 +919,65 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
     // segment as the CONNECT head — and those bytes must never be read as
     // headers; Go reads auth from the parsed head only).
     lines.next();
+    // Round-18 audit L1: Go frp reads `req.Header.Get("Proxy-Authorization")`
+    // (http_proxy.go:143) — the FIRST record's textproto-stored value, an
+    // empty-value first row included (duplicate rows accumulate under one
+    // canonical key; Get returns v[0]). The old scan took the LAST row
+    // (last-wins mirrored nothing in Go: a garbage first row + valid second
+    // row is a 407 in Go but tunneled here) and never merged obs-folds —
+    // an obs-folded credential ("Proxy-Authorization: Basic\n  <payload>",
+    // legal Go: the fold joins the stored value with a single space) lost
+    // its payload and 407'd where Go serves. The record walk below mirrors
+    // the storage shape of the sibling walkers: stored value = the
+    // after-colon slice of the OWS-trimmed first physical line, TrimLeft'd
+    // once, with each fold appended as ' ' + its OWS-trimmed piece
+    // (unconditional — an all-whitespace fold appends the join space).
+    // Folds under any other record cannot false-match (their leading
+    // SP/HTAB keeps the name off the canonical key).
+    let mut lines = lines.peekable();
     let mut proxy_auth = String::new();
-    for line in lines {
+    while let Some(line) = lines.next() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if line.is_empty() {
+            // The head's terminating blank line (round-17 F4: the buffer
+            // may carry PIPELINED bytes past the head — tunnel data a
+            // client wrote in the same TCP segment as the CONNECT head —
+            // and those bytes must never be read as headers; Go reads auth
+            // from the parsed head only).
             break;
         }
-        if let Some((key, value)) = line.split_once(':') {
-            if key.trim().eq_ignore_ascii_case("proxy-authorization") {
-                proxy_auth = value.trim().to_string();
-            }
+        let Some(colon) = line.find(':') else {
+            continue;
+        };
+        // Round-18 LOW: Go's textproto stores a field name holding SP/HTAB
+        // uncanonicalized (reader.go:742-765 — CanonicalMIMEHeaderKey bails
+        // out on any non-token byte, issue 34540), so
+        // `req.Header.Get("Proxy-Authorization")` (http_proxy.go:143) can
+        // never see `Proxy-Authorization : Basic x` — the row is simply not
+        // credentials and the request stays a 407. The old
+        // trim_end_matches([' ', '\t']) made the spaced name match and its
+        // value authenticate. A spaced row is a SEPARATE key, not a
+        // malformed head: skip it and keep scanning (a later canonical row
+        // still counts, exactly like Go's Get). Same gate as the sibling
+        // walkers (static_file.rs `key_has_space`; the conn-head walker
+        // above).
+        let name = &line[..colon];
+        if name.bytes().any(|b| b == b' ' || b == b'\t') {
+            continue;
         }
+        if !name.eq_ignore_ascii_case("proxy-authorization") {
+            continue;
+        }
+        // First matching record wins; its folds are part of the stored
+        // value.
+        let mut value = line[colon + 1..].trim_matches([' ', '\t']).to_string();
+        while let Some(fold) = lines.next_if(|l| l.starts_with(' ') || l.starts_with('\t')) {
+            let fold = fold.strip_suffix('\r').unwrap_or(fold);
+            value.push(' ');
+            value.push_str(fold.trim_matches([' ', '\t']));
+        }
+        proxy_auth = value;
+        break;
     }
 
     // Check auth. Response arms verified byte-for-byte against Go v0.71.0

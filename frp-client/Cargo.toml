@@ -17,6 +17,10 @@ tempfile = "3"
 # the socks5 handshake-deadline audit test — same pattern as frp-server's
 # dev-dependencies; never compiled into non-test builds.
 tokio = { workspace = true, features = ["test-util"] }
+# geteuid(2) for the static_file unreadable-base 403 test's root skip
+# (plugin_static_file.rs, ssh_gateway.rs precedent). Already a workspace dep
+# pulled in transitively by frp-core — only the direct test reference is new.
+libc.workspace = true
 
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false }

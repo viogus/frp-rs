@@ -274,21 +274,80 @@ async fn handle_static_file_conn(
     // auth — one pass, one trim, same result). Runs after the route and
     // method gates (Go: the middleware wraps only fully-matched routes) and
     // before every FileServer-internal response below.
+    // Audit round-18 L6: the header pass runs in Go textproto
+    // readMIMEHeader stored-value shape. An obs-fold continuation line
+    // (leading SP/HTAB) is part of the PRECEDING record — "Authorization:
+    // Basic\n  <payload>" IS one credential in Go — where the old walker
+    // re-split fold lines into bogus records (a fold after the captured
+    // record simply vanished from its value) and trimmed with Unicode
+    // whitespace where Go strips SP/HTAB only (textproto `trim`). Stored
+    // value per record: the after-colon slice of the OWS-trimmed first
+    // physical line, TrimLeft'd once, with each fold appended as ' ' + its
+    // OWS-trimmed piece — unconditionally, an all-whitespace fold included.
+    // The scan also stops at the head's blank line (round-17 F4 mirror):
+    // the read chunk can carry PIPELINED bytes past the terminator, and
+    // those bytes belong to the next request, never to this head. The
+    // missing Host/TE/CL/505 conn gates are deliberately NOT rebuilt here —
+    // documented defense-in-depth: the frps vhost front fully validates
+    // every head before the tunnel hands it to this operator-local
+    // 127.0.0.1 listener, and the gorilla route + method gates above
+    // already narrowed the request class.
     let mut authorization: Option<String> = None;
-    let mut if_modified_since = None;
+    let mut if_modified_since: Option<String> = None;
+    // The record currently open for fold merging: exactly one of these is
+    // true for the last-seen record, and only when that record was the
+    // FIRST of its key (Go Header.Get FIRST-value semantics — net/
+    // textproto duplicate rows accumulate into a slice; Get returns v[0],
+    // an empty-value first row included (round-16 FIX 7). A later
+    // duplicate's folds belong to THAT row and must not bleed into the
+    // captured first row.
+    let mut cur_is_auth = false;
+    let mut cur_is_ims = false;
     for line in lines {
-        if let Some((key, value)) = line.split_once(':') {
-            let key = key.trim();
-            let value = value.trim();
-            // Go Header.Get FIRST-value semantics (net/textproto: duplicate
-            // rows accumulate into a slice; Header.Get returns v[0]) — the
-            // first row wins, an empty-value row included (round-16 FIX 7;
-            // the old last-wins assignment mirrored nothing in Go).
-            if key.eq_ignore_ascii_case("authorization") && authorization.is_none() {
-                authorization = Some(value.to_string());
-            } else if key.eq_ignore_ascii_case("if-modified-since") && if_modified_since.is_none() {
-                if_modified_since = Some(value.to_string());
+        if line.is_empty() {
+            break;
+        }
+        if line.starts_with([' ', '\t']) {
+            if cur_is_auth {
+                if let Some(v) = authorization.as_mut() {
+                    v.push(' ');
+                    v.push_str(line.trim_matches([' ', '\t']));
+                }
+            } else if cur_is_ims {
+                if let Some(v) = if_modified_since.as_mut() {
+                    v.push(' ');
+                    v.push_str(line.trim_matches([' ', '\t']));
+                }
             }
+            continue;
+        }
+        // A fresh record: textproto trims the physical line at BOTH ends
+        // (SP/HTAB) before the colon cut (readContinuedLineSlice
+        // `trim(line)`).
+        let trimmed = line.trim_matches([' ', '\t']);
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        // Stored value = TrimLeft once after the cut (reader.go
+        // ReadMIMEHeader); the line trim above already removed the first
+        // line's trailing OWS, but fold-created trailing OWS survives.
+        let stored = value.trim_start_matches([' ', '\t']);
+        // Keys holding SPACE never canonicalize (noCanon) and cannot match
+        // (mirrors the `name_has_space` gate of the sibling walkers).
+        let key_has_space = key.contains(' ');
+        let is_auth = !key_has_space && key.eq_ignore_ascii_case("authorization");
+        let is_ims = !key_has_space && key.eq_ignore_ascii_case("if-modified-since");
+        if is_auth && authorization.is_none() {
+            authorization = Some(stored.to_string());
+            cur_is_auth = true;
+            cur_is_ims = false;
+        } else if is_ims && if_modified_since.is_none() {
+            if_modified_since = Some(stored.to_string());
+            cur_is_ims = true;
+            cur_is_auth = false;
+        } else {
+            cur_is_auth = false;
+            cur_is_ims = false;
         }
     }
 
@@ -1127,6 +1186,7 @@ fn render_dir_listing(dir: &std::path::Path) -> Result<String, String> {
 /// bytes, so any caller passing a Rust &str slices its UTF-8 bytes first
 /// (s.as_bytes()) — byte-exact for every valid-UTF-8 input.
 fn url_escape_bytes(s: &[u8]) -> String {
+    const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len());
     for &b in s {
         match b {
@@ -1148,7 +1208,15 @@ fn url_escape_bytes(s: &[u8]) -> String {
             | b'@' => {
                 out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            // Audit round-18 L7: manual nibble write into the existing
+            // String — the old per-byte `format!("%{b:02X}")` allocation
+            // is gone (a 200-entry directory listing escaped a fresh
+            // String per non-literal byte).
+            _ => {
+                out.push('%');
+                out.push(HEX_UPPER[(b >> 4) as usize] as char);
+                out.push(HEX_UPPER[(b & 0x0f) as usize] as char);
+            }
         }
     }
     out
@@ -1336,10 +1404,15 @@ fn format_http_date(unix_secs: u64) -> String {
 /// client echoing a server-emitted date — the established, documented
 /// divergence.
 fn parse_if_modified_since(value: &str) -> Option<u64> {
-    let v = value.trim();
-    parse_imf_fixdate(v)
-        .or_else(|| parse_rfc850(v))
-        .or_else(|| parse_ansic(v))
+    // Audit round-18 L5: the value arrives in textproto stored shape from
+    // the head walker (physical-line OWS stripped at read time), and Go's
+    // http.ParseTime parses the stored value VERBATIM — the old Unicode
+    // `trim()` here stripped whitespace Go keeps: an obs-fold-created
+    // trailing space fails Go's layout match (condNone → 200), and a
+    // leading one can never survive readMIMEHeader's TrimLeft anyway.
+    parse_imf_fixdate(value)
+        .or_else(|| parse_rfc850(value))
+        .or_else(|| parse_ansic(value))
 }
 
 /// IMF-fixdate / RFC 1123 — "Weekday, day month year clock GMT": comma

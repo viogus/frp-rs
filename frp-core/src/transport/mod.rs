@@ -2020,6 +2020,13 @@ pub async fn accept_websocket_from_peeked(
 
     let mut buf = peeked;
     let mut read_more = false;
+    // `buf` is monotonic here (seeded with the peeked bytes, only extended;
+    // the terminal `split_off` happens right after the terminating feed), so
+    // one scanner created at entry is safe across reads — its first feed
+    // scans the seed, later feeds resume past the scanned watermark (round-17
+    // finding D): a 1-byte drip no longer re-scans the full accumulated
+    // buffer per iteration.
+    let mut scanner = crate::textproto::HeadEndScanner::new();
     let extra: Vec<u8> = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         loop {
             // Go textproto.ReadLine semantics (textproto::head_end): the head
@@ -2027,7 +2034,7 @@ pub async fn accept_websocket_from_peeked(
             // optional trailing '\r' stripped — LF-only/mixed-EOL heads are
             // legal and terminate here, not at the 64 KiB cap. CRLF heads
             // land at the same byte as the old "\r\n\r\n" window scan.
-            if let Some(end) = crate::textproto::head_end(&buf) {
+            if let Some(end) = scanner.feed(&buf) {
                 let tail = buf.split_off(end);
                 buf.truncate(end);
                 return Ok::<_, crate::Error>(tail);
@@ -2786,6 +2793,7 @@ mod tests {
             "HTTP/1.1 200 OK\r\n",  // standard
             "HTTP/1.1 200\r\n",     // no reason phrase — ReadLine strips the CRLF
             "HTTP/1.1  200 OK\r\n", // double space — TrimLeft(status, " ")
+            "HTTP/9.9 200 OK\r\n", // ParseHTTPVersion lenient 8-char shape (round-18 M1) — every exactly-8-char `HTTP/X.Y` single-digit token parses
         ];
         let reject: &[&str] = &[
             "HTTP/1.1 201 OK\r\n",  // StatusCode != 200 (golib hook check)
