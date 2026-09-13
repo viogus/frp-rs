@@ -2,17 +2,18 @@
 
 All notable changes to frp-rs.
 
-## v0.71.0 — re-release (2026-09-01)
+## v0.71.0 — re-release (2026-09-13)
 
 Supersedes the 2026-08-16 v0.71.0 build (PR #246 era). Same version number,
 per the Go-alignment rule — Go frp has not released a newer number. All
-assets re-built and re-published from commit `5464adf`.
+assets re-built and re-published from commit `41c3ad6`.
 
-32 PRs (#248-#279), 175 files, +46296/−4364: five full code reviews (4
-finders + adversarial verifiers), 18 pre-release hardening rounds, 2
-data-corruption BLOCKERs, 2 leak-fix batches, Go frp v0.71.0 divergence
-closure, yamux vendor patches, and +380 tests (1149 → 1529, 0 failed).
-Version stays aligned at 0.71.0.
+205 commits, PRs #248–#322: five full code reviews (4 finders + adversarial
+verifiers), 18 pre-release hardening rounds, 4-dimension audit rounds 3–5,
+plugin-face audit rounds 6–18, 2 data-corruption BLOCKERs, 2 leak-fix
+batches, Go frp v0.71.0 divergence closure, yamux vendor patches, dependency
+pruning, and +929 tests (1149 → 2078, 0 failed). Version stays aligned at
+0.71.0.
 
 ### Features
 - **SUDP wire protocol v2 + mixed-codec message bridge** (Go frp v0.71.0
@@ -154,7 +155,7 @@ Version stays aligned at 0.71.0.
   PR #260 review cycle).
 
 ### Tests
-- **1149 → 1529 (+380, 0 failed)**: round-9 test-gap filling alone added
+- **1149 → 2078 (+929, 0 failed)**: round-9 test-gap filling alone added
   114 (incl. yamux work-conn auth-chain e2e regression for the round-8
   auth-bypass fix, login replay × throttle interaction, h2c preface
   determinism, pool replenishment, relay integrity); rounds 13-18 added
@@ -201,6 +202,52 @@ Version stays aligned at 0.71.0.
   CLAUDE.md Current Health + round 17/18 history, developing.md dep
   tables; optional UPX compression section added to deployment.md
   (measured, not recommended by default).
+
+### Post-#279: 4-dimension audit rounds 3–5 + plugin-face rounds 6–18
+- **4-dimension audit round 3 (PR #284)**: per-proxy `SharedBandwidthLimiter`
+  (Go parity — single bucket shared bidirectionally and across concurrent
+  connections); vhost forwarded-header injection (X-Forwarded-Host/Proto +
+  XFF chaining, request-header overrides after forwarded); UDP session idle
+  timeout 60s→30s; TCP group param-mismatch rejection (Go `ErrGroup*` text);
+  unknown multiplexer rejection; SSH gateway per-IP login throttle
+  (Rust-only hardening); OIDC jti replay precheck moved before `verify_login`.
+- **4-dimension audit round 4 (PR #288)**: tcpmux group fan-out teardown order;
+  vnet NewProxy admission + route-cap enforcement at registration; reload
+  `config_snapshot` covers all 9 NewProxy wire fields (deterministic
+  BTreeMap/serde_json ordering); socks5 auth AND→OR (Go parity); XFF real
+  tunnel peer (`real_tunnel_peer_map`, https2http/https2https only);
+  dashboard/admin field redaction; nathole clamps.
+- **4-dimension audit round 5 (PR #290)**: 52 CONFIRMED findings in 4 waves —
+  vhost/vhost_h2c deadline clamp (hostile `<=0`/`u64::MAX` no longer
+  `panic=abort`; 60s floor + 24h cap) + OIDC `sanitize_expires_in`; client
+  control-loop half-frame mirror of the round-14 server fix; dashboard DELETE
+  vs CloseProxy double-decrement race; SSH gateway exec_request + Go
+  `createSuccessInfo` banner + pflag-style parser; Go port-error text parity
+  (`PortError` enum); UDP work-conn keepalive 30s; health probe origin-form +
+  ≤10 redirect hops; `PluginPeerGuard` paired cleanup; UDP session table 1024
+  cap (documented divergence); `/api/serverinfo` Go 18-key camelCase; KCP
+  read-side buffer pool; configured XFF single-line canonical; prom
+  `LAST_TRAFFIC` stale-baseline fix; tcpmux `extract_proxy_auth` verbatim;
+  XFF registry guard lifecycle hoist; `xtcp_pair_e2e` (first frp-client
+  service-layer XTCP e2e).
+- **Plugin-face audit rounds 6–18 (PRs #292–#322)**: Go conn.readRequest
+  ladder, textproto head-end semantics, injector terminal drain +
+  declared-body discard, h2c no-body/404 family, absolute response-head
+  parsing, vhost X-Forwarded strip parity, http-leg nil dst parity, SSH
+  throttle deny, work-conn auth, KCP FEC panic fix, https-group SNI fan-out,
+  plugin readLimit/505/escape/static_file hardening, h2 egress + vhost
+  head-validation Go parity.
+- **`tcp_mux_keepalive_timeout` (PR #319)**: tune/disable the yamux
+  dead-session reaper.
+
+### Dependencies (post-#279)
+- russh dead features dropped (ssh-key encryption/ppk, pkcs8/scrypt/salsa20/
+  sha3); RustCrypto generation unified; tracing-subscriber env-filter removed
+  (drops matchers/regex); rand 0.8 → 0.10 unified with russh.
+
+### CI & Tooling (post-#279)
+- tests job split into unit / server / client lanes (#320); protocol-matrix
+  runner-contention hardening; TCP auto-assign port-flake elimination.
 
 ## v0.71.0 (2026-08-16)
 
