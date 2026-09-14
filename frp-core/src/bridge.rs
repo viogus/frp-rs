@@ -625,9 +625,18 @@ async fn bridge_work_to_user(
                 tracing::debug!(error = %e, "bridge work_to_user: write error (batch)");
                 break 'read_loop;
             }
-            if let Err(e) = user_w.flush().await {
-                tracing::debug!(error = %e, "bridge work_to_user: flush error (batch)");
-                break 'read_loop;
+            // Flush on a SHORT work-side read only, mirroring the plaintext
+            // arm above: a full-size read means the peer is still streaming,
+            // and flushing there re-armed a syscall (and, for a buffered
+            // transport, an extra write) on every outer read iteration —
+            // negating the batch buffer entirely. A short read means the
+            // burst ended, so push what we have; a full batch already
+            // flushed above; EOF flushes at the end of this function.
+            if n < cap {
+                if let Err(e) = user_w.flush().await {
+                    tracing::debug!(error = %e, "bridge work_to_user: flush error (batch)");
+                    break 'read_loop;
+                }
             }
             batch_buf.clear();
         }

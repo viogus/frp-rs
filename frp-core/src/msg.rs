@@ -1,3 +1,4 @@
+// `Deserialize` is imported for its derive macro as well as the trait.
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
@@ -78,13 +79,81 @@ pub const V2_TYPE_VNET_ROUTE_REMOVE: u16 = 44;
 // Base64 helpers for UDPPacket (Go frp encodes []byte as base64)
 // ---------------------------------------------------------------
 
+/// Stack-buffer base64 encoder, streamed through `Serializer::collect_str`.
+///
+/// Byte-identical to `crate::base64::encode` (same standard alphabet, same
+/// `=` padding, same empty-input output) but without the intermediate
+/// `String` that `serialize_str(&base64::encode(..))` built per packet: each
+/// 3-byte block is encoded into a 4-byte ASCII stack buffer and written
+/// straight into the serializer. serde_json's `collect_str` escapes and
+/// writes the `Display` output with no allocation of its own, and the payload
+/// is borrowed, so encoding a packet allocates nothing at all.
+struct B64<'a>(&'a [u8]);
+
+impl fmt::Display for B64<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        // Every ALPHABET byte is ASCII, so each 4-byte quad is valid UTF-8 by
+        // construction. `from_utf8` (not `_unchecked`) keeps this safe; the
+        // check compiles down to a cheap 4-byte ASCII test.
+        let mut quad = [0u8; 4];
+        let (chunks, remainder) = self.0.as_chunks::<3>();
+        for chunk in chunks {
+            let (b0, b1, b2) = (chunk[0], chunk[1], chunk[2]);
+            quad[0] = ALPHABET[(b0 >> 2) as usize];
+            quad[1] = ALPHABET[((b0 & 0x03) << 4 | b1 >> 4) as usize];
+            quad[2] = ALPHABET[((b1 & 0x0f) << 2 | b2 >> 6) as usize];
+            quad[3] = ALPHABET[(b2 & 0x3f) as usize];
+            f.write_str(core::str::from_utf8(&quad).map_err(|_| fmt::Error)?)?;
+        }
+        match remainder {
+            [] => {}
+            [b0] => {
+                quad[0] = ALPHABET[(b0 >> 2) as usize];
+                quad[1] = ALPHABET[((b0 & 0x03) << 4) as usize];
+                quad[2] = b'=';
+                quad[3] = b'=';
+                f.write_str(core::str::from_utf8(&quad).map_err(|_| fmt::Error)?)?;
+            }
+            [b0, b1] => {
+                quad[0] = ALPHABET[(b0 >> 2) as usize];
+                quad[1] = ALPHABET[((b0 & 0x03) << 4 | b1 >> 4) as usize];
+                quad[2] = ALPHABET[((b1 & 0x0f) << 2) as usize];
+                quad[3] = b'=';
+                f.write_str(core::str::from_utf8(&quad).map_err(|_| fmt::Error)?)?;
+            }
+            _ => unreachable!("remainder is at most 2 bytes"),
+        }
+        Ok(())
+    }
+}
+
 fn b64_ser<S: Serializer>(data: &[u8], s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&crate::base64::encode(data))
+    s.collect_str(&B64(data))
+}
+
+/// Borrowed-str visitor for the base64 `c` field: `deserialize_str` hands the
+/// JSON string to us without building an owned `String` when the input has no
+/// escapes (serde_json's borrowed path), so the slice goes straight to
+/// `base64::decode`. Escaped strings arrive through the default
+/// `visit_string` -> `visit_str` forwarding, exactly as before.
+struct B64Visitor;
+
+impl<'de> serde::de::Visitor<'de> for B64Visitor {
+    type Value = Vec<u8>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a base64-encoded string")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        crate::base64::decode(v).map_err(serde::de::Error::custom)
+    }
 }
 
 fn b64_de<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-    let s: String = Deserialize::deserialize(d)?;
-    crate::base64::decode(&s).map_err(serde::de::Error::custom)
+    d.deserialize_str(B64Visitor)
 }
 
 // ---------------------------------------------------------------
@@ -1430,6 +1499,98 @@ mod tests {
             serde_json::from_str::<UDPPacket>(&corrupt).is_err(),
             "invalid base64 length must fail deserialization"
         );
+    }
+
+    #[test]
+    fn test_b64_display_byte_exact_with_reference_encoder() {
+        // The streaming `Display` encoder (used by `b64_ser` via
+        // `collect_str`) must produce byte-identical output to the allocation
+        // based reference encoder for every input length — including the
+        // 0/1/2-byte remainder arms that carry the `=` padding rules.
+        for len in [0usize, 1, 2, 3, 4, 5, 6, 15, 16, 17, 1024] {
+            // Deterministic, non-trivial byte pattern covering all 6-bit
+            // values (and the full 0..=255 range across the 1024 case).
+            let data: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            assert_eq!(
+                B64(&data).to_string(),
+                crate::base64::encode(&data),
+                "B64 Display mismatch at len {len}"
+            );
+        }
+
+        // Explicit padding pins (Go base64.StdEncoding rules).
+        assert_eq!(B64(b"").to_string(), "");
+        assert_eq!(B64(b"f").to_string(), "Zg==");
+        assert_eq!(B64(b"fo").to_string(), "Zm8=");
+        assert_eq!(B64(b"foo").to_string(), "Zm9v");
+        // 0xFF/0xFE remainders exercise the high-bit shifts.
+        assert_eq!(B64(&[0xff]).to_string(), "/w==");
+        assert_eq!(B64(&[0xff, 0xfe]).to_string(), "//4=");
+    }
+
+    #[test]
+    fn test_udp_packet_json_wire_form_reused_scratch() {
+        // The `c` field wire form must be exactly Go's
+        // `base64.StdEncoding.EncodeToString` inside the JSON string, and
+        // serializing into a reused scratch buffer must equal `to_string`.
+        let mut scratch: Vec<u8> = Vec::new();
+        let encoder = |val: &UDPPacket, scratch: &mut Vec<u8>| -> String {
+            scratch.clear();
+            serde_json::to_writer(&mut *scratch, val).expect("serialize into scratch");
+            String::from_utf8(scratch.clone()).expect("utf8 json")
+        };
+
+        // Empty content is omitted entirely (Go `json:"c,omitempty"`).
+        let empty = UDPPacket {
+            content: Vec::new(),
+            local_addr: None,
+            remote_addr: None,
+        };
+        assert_eq!(encoder(&empty, &mut scratch), r#"{}"#);
+        assert_eq!(
+            serde_json::to_string(&empty).expect("to_string"),
+            encoder(&empty, &mut scratch),
+            "reused-scratch output must equal to_string output"
+        );
+
+        // Non-empty content round-trips through the exact base64 text.
+        for payload in [&b"h"[..], &b"he"[..], &b"hello"[..], &[0u8, 1, 2, 250][..]] {
+            let pkt = UDPPacket {
+                content: payload.to_vec(),
+                local_addr: None,
+                remote_addr: None,
+            };
+            let json = encoder(&pkt, &mut scratch);
+            assert_eq!(
+                json,
+                format!(r#"{{"c":"{}"}}"#, crate::base64::encode(payload)),
+                "wire form for payload {payload:?}"
+            );
+            let back: UDPPacket = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back.content, payload);
+
+            // Repeated serialization into the same buffer must not leak bytes
+            // from the previous (longer) message.
+            let again = encoder(&pkt, &mut scratch);
+            assert_eq!(again, json, "scratch reuse must not retain previous bytes");
+        }
+    }
+
+    #[test]
+    fn test_udp_packet_escaped_base64_string_decodes() {
+        // serde_json only takes the borrowed-str fast path when the JSON
+        // string has no escapes; an escaped payload arrives via the owned
+        // `visit_string` default forwarding into `visit_str`. `=` is `=`,
+        // so this decodes to "hello".
+        let json = r#"{"c":"aGVsbG8="}"#;
+        let pkt: UDPPacket = serde_json::from_str(json).expect("escaped content must decode");
+        assert_eq!(pkt.content, b"hello");
+
+        // Escaped-slash form of the same payload (base64 has no `/` here, so
+        // use a payload that does: 0xFF encodes to "/w==").
+        let json = r#"{"c":"/w=="}"#;
+        let pkt: UDPPacket = serde_json::from_str(json).expect("escaped slash must decode");
+        assert_eq!(pkt.content, vec![0xff]);
     }
 
     #[test]

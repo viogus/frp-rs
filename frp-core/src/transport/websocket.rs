@@ -319,14 +319,24 @@ fn dispatch_raw_frame(
                 // same hazard the zero-length-frame arm above guards.
                 // Stash the whole payload for the next poll and return
                 // wake + Pending so it is delivered then.
-                *read_buf = payload.to_vec();
+                // `clear` + `extend_from_slice` (not `= payload.to_vec()`):
+                // the stash keeps `read_buf`'s allocation across stashes
+                // instead of dropping it and allocating a fresh Vec every
+                // time the caller's buffer is smaller than the frame. The
+                // buffer is fully drained on entry to this path (the
+                // cursor-served prefix at the top of `poll_read` clears it
+                // once `read_pos` reaches the end), so `clear` never discards
+                // undelivered bytes.
+                read_buf.clear();
+                read_buf.extend_from_slice(payload);
                 *read_pos = 0;
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
             buf.put_slice(&payload[..n]);
             if n < payload.len() {
-                *read_buf = payload[n..].to_vec();
+                read_buf.clear();
+                read_buf.extend_from_slice(&payload[n..]);
                 *read_pos = 0;
             }
             Poll::Ready(Ok(()))

@@ -747,6 +747,21 @@ where
         let mut pending_opens: std::collections::VecDeque<
             oneshot::Sender<std::result::Result<Stream, yamux::ConnectionError>>,
         > = std::collections::VecDeque::new();
+        // Persistent keepalive timer: the former per-iteration
+        // `tokio::time::sleep(keepalive)` re-registered (and re-allocated a
+        // timer entry for) the same deadline on every loop pass — including
+        // every pass that completed on the I/O branch. One interval, armed
+        // once, replaces the churn. `interval_at(now + keepalive, keepalive)`
+        // preserves the original first-fire semantics (a full interval of
+        // quiet before the first idle probe, never an immediate tick), and
+        // `MissedTickBehavior::Delay` preserves the per-iteration `sleep`
+        // semantics after a busy stretch (next fire one full period later)
+        // instead of the default `Burst` replay of every missed tick. The
+        // interval is non-zero: `normalized_keepalive_interval` maps 0 to the
+        // default, and `interval_at` panics on a zero period.
+        let mut keepalive_timer =
+            tokio::time::interval_at(tokio::time::Instant::now() + keepalive, keepalive);
+        keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 // Drive connection I/O and serve queued open requests in the
@@ -853,7 +868,7 @@ where
                 // fires even on idle connections. Application-level heartbeat
                 // provides the timeout because yamux 0.14 does not time out
                 // while awaiting a PONG.
-                _ = tokio::time::sleep(keepalive) => {
+                _ = keepalive_timer.tick() => {
                     // Drive I/O to allow yamux internal PING/PONG processing.
                     // yamux-rs 0.14's RTT module sends PING every 10s and
                     // expects PONG, but does NOT timeout on AwaitingPong.
