@@ -21,8 +21,8 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::YamuxSession;
 use frp_core::protocol::{
     read_msg_v1, read_msg_v2_udp_binary_socket, read_msg_v2_with_udp_codec, write_msg_v1,
-    write_msg_v2, write_msg_v2_with_udp_codec, write_v2_frame_raw, UdpBinaryRead,
-    V2_FRAME_TYPE_MESSAGE,
+    write_msg_v2, write_msg_v2_with_udp_codec, write_v1_frame_scratch, write_v2_frame_raw,
+    UdpBinaryRead, V2_FRAME_TYPE_MESSAGE,
 };
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
@@ -1209,7 +1209,12 @@ async fn run_udp_work_conn(
         let mut local_udp_addr: Option<msg::UdpAddr> = Some(udp_addr_of(&local_addr));
         // Ping-pong scratch for the per-packet compress chain (per-session).
         let mut scratch_c: Vec<u8> = Vec::new();
-        // Reused binary-codec wire buffer: type ID + encoded packet.
+        // Reused binary-codec wire buffer: type ID + encoded packet. The V1
+        // JSON arm below shares it (the two arms are mutually exclusive per
+        // packet, and both writers clear it first), so the per-packet
+        // `serde_json` Vec allocation is gone on the V1 path too (perf audit
+        // TOP 2; `write_v1_frame_scratch` is byte-identical to
+        // `write_v1_frame`).
         let mut wire_scratch: Vec<u8> = Vec::new();
         // Per-remote IP-string cache. UDPPacket.remote_addr.ip is a String
         // (Go msg.UDPPacket.RemoteAddr parity), so the IpAddr would be
@@ -1281,9 +1286,15 @@ async fn run_udp_work_conn(
                         wire_scratch
                             .extend_from_slice(&msg::V2_TYPE_UDP_PACKET_BINARY.to_be_bytes());
                         let result =
-                            match frp_core::udp_binary::encode_udp_packet_binary_socket_addr(
+                            match frp_core::udp_binary::encode_udp_packet_binary_socket_addr_local(
                                 &payload,
-                                local_udp_addr.as_ref(),
+                                // Audit item 6: `local_addr` is the resolved
+                                // loop-invariant SocketAddr; encode it
+                                // straight from its octets — the per-datagram
+                                // ip String re-parse of the UdpAddr form is
+                                // gone (that form stays only for the JSON
+                                // arm below). Byte-identical output.
+                                Some(&local_addr),
                                 &remote,
                                 &mut wire_scratch,
                             ) {
@@ -1360,7 +1371,10 @@ async fn run_udp_work_conn(
                             )
                             .await
                         } else {
-                            write_msg_v1(&mut w_w, &pkt).await
+                            // V1 JSON: serialize into the loop's shared
+                            // scratch (`wire_scratch`) instead of letting the
+                            // writer allocate a fresh Vec per datagram.
+                            write_v1_frame_scratch(&mut w_w, &pkt, &mut wire_scratch).await
                         };
                         // Return the invariant UdpAddr for the next packet and
                         // hand the content buffer back to the session (P1) —

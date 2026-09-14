@@ -862,14 +862,18 @@ pub(crate) async fn handle_nat_hole_visitor(
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
-    // Send to visitor via writer
-    {
-        let mut writer_guard = session.visitor_writer.lock().await;
-        if let Some(ref mut w) = *writer_guard {
-            if let Err(e) = write_msg(w, &FrpMessage::NatHoleResp(Box::new(v_resp)), v2).await {
-                warn!(error = %e, "failed to write NatHoleResp to visitor");
-            }
+    // Send to visitor via writer. Same take/release/return shape as the
+    // provider-timeout arm above: `write_msg` is a network write, so it must
+    // not run while the session's writer mutex is held (audit §3 item 2 —
+    // holding it here serialized every other user of the session, and
+    // multiplied with the nathole controller's own lock nesting).
+    let mut taken_writer = session.visitor_writer.lock().await.take();
+    if let Some(ref mut w) = taken_writer {
+        if let Err(e) = write_msg(w, &FrpMessage::NatHoleResp(Box::new(v_resp)), v2).await {
+            warn!(error = %e, "failed to write NatHoleResp to visitor");
         }
+        // Return the writer to the session
+        *session.visitor_writer.lock().await = taken_writer;
     }
 
     // Go frp dev compat: if the provider has the "sender" role, wait 1s

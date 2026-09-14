@@ -563,17 +563,33 @@ pub(crate) struct HttpGroup {
 }
 
 pub(crate) struct HttpGroupController {
-    /// Keyed by (group name, is_https): Go keeps HTTP and HTTPS groups in
-    /// separate controllers, so the same group NAME may exist in both kinds
-    /// at once (server/group/http.go + https.go, wired in server/service.go
-    /// on the httpVhostRouter and the httpsMuxer respectively).
-    groups: RwLock<HashMap<(String, bool), Arc<HttpGroup>>>,
+    /// HTTP-kind groups, keyed by group name. Go keeps HTTP and HTTPS groups
+    /// in separate controllers, so the same group NAME may exist in both
+    /// kinds at once (server/group/http.go + https.go, wired in
+    /// server/service.go on the httpVhostRouter and the httpsMuxer
+    /// respectively) — mirrored here as one map per kind rather than one map
+    /// keyed by a `(name, is_https)` tuple, which allocated a String on every
+    /// lookup (audit §3 item 7; the sibling TcpMuxGroupController is already
+    /// a plain `RwLock<HashMap<String, Arc<..>>>`).
+    http_groups: RwLock<HashMap<String, Arc<HttpGroup>>>,
+    /// HTTPS-kind groups, keyed by group name.
+    https_groups: RwLock<HashMap<String, Arc<HttpGroup>>>,
 }
 
 impl HttpGroupController {
     pub fn new() -> Self {
         Self {
-            groups: RwLock::new(HashMap::new()),
+            http_groups: RwLock::new(HashMap::new()),
+            https_groups: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// The kind registry a lookup should consult (Go's per-muxer controller).
+    fn kind_groups(&self, is_https: bool) -> &RwLock<HashMap<String, Arc<HttpGroup>>> {
+        if is_https {
+            &self.https_groups
+        } else {
+            &self.http_groups
         }
     }
 
@@ -600,8 +616,8 @@ impl HttpGroupController {
         route_by_http_user: &str,
         proxy_name: &str,
     ) -> Result<(Arc<HttpGroup>, bool), String> {
-        let mut groups = self.groups.write().await;
-        if let Some(g) = groups.get(&(group.to_string(), false)) {
+        let mut groups = self.http_groups.write().await;
+        if let Some(g) = groups.get(group) {
             // Existing http-kind group: validate the routing params (Go
             // ErrGroupParamsInvalid).
             if g.domain != domain
@@ -629,7 +645,7 @@ impl HttpGroupController {
             index: AtomicU64::new(0),
             route_owner: proxy_name.to_string(),
         });
-        groups.insert((group.to_string(), false), g.clone());
+        groups.insert(group.to_string(), g.clone());
         Ok((g, true))
     }
 
@@ -652,8 +668,8 @@ impl HttpGroupController {
         domain: &str,
         proxy_name: &str,
     ) -> Result<(Arc<HttpGroup>, bool), String> {
-        let mut groups = self.groups.write().await;
-        if let Some(g) = groups.get(&(group.to_string(), true)) {
+        let mut groups = self.https_groups.write().await;
+        if let Some(g) = groups.get(group) {
             // Go HTTPSGroup.Listen (https.go): route config in the same
             // group must be equal — and ONLY the domain is part of it.
             if g.domain != domain {
@@ -677,7 +693,7 @@ impl HttpGroupController {
             index: AtomicU64::new(0),
             route_owner: proxy_name.to_string(),
         });
-        groups.insert((group.to_string(), true), g.clone());
+        groups.insert(group.to_string(), g.clone());
         Ok((g, true))
     }
 
@@ -693,9 +709,8 @@ impl HttpGroupController {
         proxy_name: &str,
         is_https: bool,
     ) -> Option<String> {
-        let mut groups = self.groups.write().await;
-        let key = (group.to_string(), is_https);
-        let g = groups.get(&key)?;
+        let mut groups = self.kind_groups(is_https).write().await;
+        let g = groups.get(group)?;
         let empty = {
             let mut members = g.members.write().await;
             members.retain(|m| m != proxy_name);
@@ -703,7 +718,7 @@ impl HttpGroupController {
         };
         if empty {
             let owner = g.route_owner.clone();
-            groups.remove(&key);
+            groups.remove(group);
             Some(owner)
         } else {
             None
@@ -714,8 +729,15 @@ impl HttpGroupController {
     /// HTTPSGroup listener dispatch). Returns None when the group has no
     /// members. `is_https` selects the kind registry.
     pub async fn choose_endpoint(&self, group: &str, is_https: bool) -> Option<String> {
-        let groups = self.groups.read().await;
-        let g = groups.get(&(group.to_string(), is_https))?;
+        // Clone the Arc out and drop the registry read guard before taking
+        // the members lock (audit §3 item 7): the registry lock used to be
+        // held across the nested `members.read()`. The Arc keeps the group
+        // alive for the duration, so a concurrent removal (which needs the
+        // registry WRITE lock) cannot tear it down mid-pick.
+        let g = {
+            let groups = self.kind_groups(is_https).read().await;
+            Arc::clone(groups.get(group)?)
+        };
         let members = g.members.read().await;
         if members.is_empty() {
             return None;

@@ -2845,7 +2845,35 @@ impl Service {
             Pin<Box<dyn Future<Output = Result<FrpMessage, frp_core::Error>> + Send>>;
         let mut pending_read: Option<PendingRead> = None;
 
+        // Persistent heartbeat-watchdog timer (perf audit LOW): one `Sleep`
+        // lives for the whole message loop instead of a fresh
+        // `sleep(hb_timeout_dur - last_pong.elapsed())` built on every select
+        // iteration — the per-iteration form paid an `Instant::now()` plus a
+        // timer construction on every control frame, while the deadline is
+        // fully determined by `last_pong` + `hb_timeout_dur`. The deadline is
+        // absolute, so the timer is re-armed at the loop top only when a Pong
+        // moved `last_pong` or after it has fired (an elapsed `Sleep` polls
+        // Ready immediately — the same guard shape as the Wave-1
+        // xtcp_session ticker). Cadence is unchanged: the first fire is one
+        // full `hb_timeout` after login, and no tick is ever replayed or
+        // coalesced, because the reset target is the absolute deadline
+        // `last_pong + hb_timeout_dur`, never `now + interval`.
+        let mut hb_armed_pong = ctx.last_pong;
+        let mut hb_sleep = Box::pin(tokio::time::sleep_until(
+            tokio::time::Instant::from_std(ctx.last_pong) + ctx.hb_timeout_dur,
+        ));
+
         loop {
+            // Re-arm the watchdog only when its deadline moved or the timer
+            // already fired. A disabled watchdog (heartbeat interval <= 0,
+            // hb_watchdog_active false) is never armed at all — its select
+            // arm below is gated off, so the timer would never be polled.
+            if ctx.hb_watchdog_active && (ctx.last_pong != hb_armed_pong || hb_sleep.is_elapsed()) {
+                hb_armed_pong = ctx.last_pong;
+                hb_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::from_std(ctx.last_pong) + ctx.hb_timeout_dur);
+            }
             // Recreate the control-read future when the previous frame
             // completed (the arm body detached it). Starts a fresh read at
             // the next frame boundary. The async block owns an Arc clone
@@ -3771,14 +3799,15 @@ impl Service {
 
                 // Heartbeat timeout watchdog: triggers reconnect if no Pong
                 // received within heartbeat_timeout seconds (Go frp compat).
-                // Event-driven: sleeps until the deadline (last_pong +
-                // hb_timeout_dur) instead of polling every second, so each
-                // Pong arrival naturally reschedules the wakeup. Uses sleep
+                // Event-driven: the persistent timer armed at the loop top
+                // (hb_sleep) waits until the absolute deadline (last_pong +
+                // hb_timeout_dur), so each Pong arrival re-arms it there
+                // instead of rebuilding a `Sleep` per iteration. Uses sleep
                 // so the timer is only active when hb_timeout > 0. Explicit
                 // negative values disable it independently of tcp_mux.
                 // Gated on the ping loop being active (hb_watchdog_active):
                 // with heartbeat_interval <= 0 no Pong can ever arrive.
-                _ = tokio::time::sleep(ctx.hb_timeout_dur.saturating_sub(ctx.last_pong.elapsed())), if ctx.hb_watchdog_active => {
+                _ = &mut hb_sleep, if ctx.hb_watchdog_active => {
                     warn!("Heartbeat timeout ({}s), reconnecting...", ctx.hb_timeout);
                     return LoopExit::Reconnect;
                 }

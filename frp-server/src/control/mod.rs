@@ -471,6 +471,24 @@ pub(crate) async fn handle_control_inner<S>(
     // clients.
     let stall = Arc::new(StallState::new());
 
+    // Arm-1 timer cache (audit §3 item 7). The earliest pending-request
+    // deadline only moves when a queue head changes, but the select rebuilds
+    // every branch future per iteration — so the old `async { sleep_until(d) }`
+    // arm registered and deregistered a timer on every loop iteration (the
+    // loop iterates once per internal message and per control frame) to learn
+    // nothing. The `Sleep` now lives outside the loop and is re-armed only
+    // when the computed deadline actually moves.
+    //
+    // `PENDING_TIMER_IDLE` stands in for the old `pending()` arm: `Sleep` has
+    // no cancel, so "nothing pending" arms the timer a day out. It is not a
+    // busy-loop risk — the arm body is a no-op and the re-arm check below
+    // resets it again on the next iteration that finds a deadline.
+    const PENDING_TIMER_IDLE: std::time::Duration = std::time::Duration::from_secs(86_400);
+    let mut armed_deadline: Option<tokio::time::Instant> = None;
+    let mut pending_timer = Box::pin(tokio::time::sleep_until(
+        tokio::time::Instant::now() + PENDING_TIMER_IDLE,
+    ));
+
     loop {
         // Superseded by a newer login (same run_id) whose Shutdown message
         // could not be delivered through a full channel (round-7 review
@@ -574,15 +592,23 @@ pub(crate) async fn handle_control_inner<S>(
                     .and_then(|(_, _, ts)| ts.checked_add(pending_timeout))
             });
 
+        // Re-arm the wake timer only when the deadline moved — or when the
+        // armed `Sleep` already fired (loop-top expiry above removes the
+        // entries it fired for, so a changed deadline is the normal case; the
+        // `is_elapsed` guard keeps a same-deadline round from leaving a
+        // completed timer in the select, which would spin the loop).
+        if pending_deadline != armed_deadline || pending_timer.is_elapsed() {
+            armed_deadline = pending_deadline;
+            pending_timer.as_mut().reset(match pending_deadline {
+                Some(deadline) => deadline,
+                None => tokio::time::Instant::now() + PENDING_TIMER_IDLE,
+            });
+        }
+
         tokio::select! {
             // Wake when the earliest pending request expires (loop-top
             // cleanup handles the actual expiry).
-            _ = async {
-                match pending_deadline {
-                    Some(d) => tokio::time::sleep_until(d).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => {}
+            _ = &mut pending_timer => {}
 
             // Heartbeat watchdog: an idle control connection must not hold
             // its conn_semaphore permit / task / fd forever. The check above

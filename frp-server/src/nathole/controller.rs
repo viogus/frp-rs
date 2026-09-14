@@ -314,24 +314,30 @@ impl Controller {
     }
 
     /// Complete a session and clean up.
+    ///
+    /// The session leaves the table under the write lock, but the per-session
+    /// locks are taken only AFTER it is released (audit §3 item 2 / HIGH #3):
+    /// awaiting another task's `visitor_writer` mutex while holding the table
+    /// lock parked every other session operation behind this one. A concurrent
+    /// task can only hold the removed session's `Arc` from an earlier lookup;
+    /// the fields it touches are still individually mutex-protected, and the
+    /// end state (writer dropped, connection closed) is unchanged.
     pub async fn complete(&self, sid: &str) -> Option<String> {
-        let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.remove(sid) {
-            // Drop visitor writer (closes connection)
-            let mut guard = session.visitor_writer.lock().await;
-            drop(guard.take());
-            drop(guard);
+        let session = self.sessions.write().await.remove(sid)?;
 
-            // Signal report
-            if let Some(tx) = session.report_tx.lock().await.take() {
-                let _ = tx.send(msg::NatHoleReport {
-                    sid: Some(sid.to_string()),
-                    success: false,
-                });
-            }
-            return Some(session.proxy_name.clone());
+        // Drop visitor writer (closes connection)
+        let mut guard = session.visitor_writer.lock().await;
+        drop(guard.take());
+        drop(guard);
+
+        // Signal report
+        if let Some(tx) = session.report_tx.lock().await.take() {
+            let _ = tx.send(msg::NatHoleReport {
+                sid: Some(sid.to_string()),
+                success: false,
+            });
         }
-        None
+        Some(session.proxy_name.clone())
     }
 
     /// Remove a session without signalling.
@@ -340,13 +346,28 @@ impl Controller {
     }
 
     /// Remove expired sessions.
+    ///
+    /// Expired ids are collected under a READ lock and removed one by one
+    /// (audit §3 item 2): the scan needs no exclusive access, and the
+    /// removals do not depend on each other. Expiry is monotonic —
+    /// `last_activity` only ever advances — so a session that was stale at
+    /// scan time is still stale when its removal runs.
     pub async fn expire_sessions(&self, timeout: Duration) {
         let now = Instant::now();
-        let mut sessions = self.sessions.write().await;
-        sessions.retain(|_sid, s| {
-            let last = *s.last_activity.lock().unwrap_or_else(|e| e.into_inner());
-            now.duration_since(last) < timeout
-        });
+        let expired: Vec<String> = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .iter()
+                .filter(|(_sid, s)| {
+                    let last = *s.last_activity.lock().unwrap_or_else(|e| e.into_inner());
+                    now.duration_since(last) >= timeout
+                })
+                .map(|(sid, _)| sid.clone())
+                .collect()
+        };
+        for sid in expired {
+            self.remove(&sid).await;
+        }
     }
 
     // --- Backward-compat methods matching old NatHoleCoordinator API ---
@@ -694,5 +715,80 @@ mod tests {
             "rejection task should still be writing"
         );
         handle.abort();
+    }
+
+    /// Regression (audit §3 item 2 / HIGH #3): `complete` must drop the
+    /// `sessions` write lock BEFORE it awaits the per-session locks. Holding
+    /// it across them parked every other session operation in the table — and
+    /// compounded with the visitor-writer lock being taken for network writes
+    /// elsewhere.
+    #[tokio::test]
+    async fn complete_releases_sessions_lock_before_per_session_lock() {
+        let controller = Arc::new(Controller::new(Duration::from_secs(3600)));
+        let session = dummy_session("sid-1");
+        controller
+            .sessions
+            .write()
+            .await
+            .insert("sid-1".to_string(), session.clone());
+
+        // Park the session's writer lock the way a bridge write would.
+        let held = session.visitor_writer.lock().await;
+
+        let ctl = controller.clone();
+        let handle = tokio::spawn(async move { ctl.complete("sid-1").await });
+
+        // The entry must be gone while the completion is still parked on the
+        // writer lock — proof the table lock was released first. On the old
+        // shape (write lock held across the per-session await) this poll times
+        // out.
+        let removed = tokio::time::timeout(Duration::from_secs(5), async {
+            while controller.sessions.read().await.contains_key("sid-1") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            removed.is_ok(),
+            "sessions write lock held across the per-session lock"
+        );
+        assert!(
+            !handle.is_finished(),
+            "completion should still be waiting on the writer lock"
+        );
+
+        // Releasing it lets the completion finish and report the session.
+        drop(held);
+        assert_eq!(handle.await.unwrap(), Some("filler".to_string()));
+    }
+
+    /// `expire_sessions` drops stale sessions and keeps fresh ones (the scan
+    /// runs under a read lock, the removals one by one under the write lock).
+    #[tokio::test]
+    async fn expire_sessions_removes_stale_keeps_fresh() {
+        let controller = Controller::new(Duration::from_secs(3600));
+        let stale = dummy_session("stale");
+        {
+            let mut sessions = controller.sessions.write().await;
+            sessions.insert("stale".to_string(), stale.clone());
+            sessions.insert("fresh".to_string(), dummy_session("fresh"));
+        }
+        // Scope the std-Mutex guard: it must be released before the await.
+        // `expire_sessions` locks the same `last_activity` mutex synchronously
+        // while scanning, so leaving the guard alive across the await parks the
+        // current-thread test runtime forever.
+        {
+            let mut last = stale
+                .last_activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *last = Instant::now() - Duration::from_secs(120);
+        }
+
+        controller.expire_sessions(Duration::from_secs(60)).await;
+
+        let sessions = controller.sessions.read().await;
+        assert!(!sessions.contains_key("stale"), "stale session must expire");
+        assert!(sessions.contains_key("fresh"), "fresh session must survive");
     }
 }

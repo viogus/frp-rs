@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::YamuxSession;
 use frp_core::protocol::{
-    read_msg_v1, read_msg_v2_with_udp_codec, write_msg_v1, write_msg_v2_with_udp_codec,
+    read_msg_v1, read_msg_v2_with_udp_codec, write_msg_v2_with_udp_codec, write_v1_frame_scratch,
 };
 use frp_core::transport::{
     dial_server, split_work_conn_halves, BoxedReadHalf, BoxedWriteHalf, DialOptions, IoStream,
@@ -2277,8 +2277,11 @@ async fn run_sudp_worker(
     };
     // Buffer frame reads: read_msg_v1 issues two read_exact calls per message.
     let srv_r = tokio::io::BufReader::with_capacity(16 * 1024, srv_r);
-    // Reused binary-codec wire buffer (write side; the `scratch` inside the
-    // loop is the read side).
+    // Reused wire buffer (write side; the `scratch` inside the loop is the
+    // read side). Shared by the V2 binary-codec body and the V1 JSON payload
+    // below — the two writes are mutually exclusive per packet and both
+    // writers clear it first, so the V1 path no longer allocates a fresh
+    // `serde_json` Vec per datagram (perf audit TOP 2).
     let mut wire_scratch: Vec<u8> = Vec::new();
     // The first packet (which triggered the connect) is written immediately.
     let first_write = if v2 {
@@ -2291,7 +2294,12 @@ async fn run_sudp_worker(
         )
         .await
     } else {
-        write_msg_v1(&mut srv_w, &FrpMessage::UDPPacket(first_pkt)).await
+        write_v1_frame_scratch(
+            &mut srv_w,
+            &FrpMessage::UDPPacket(first_pkt),
+            &mut wire_scratch,
+        )
+        .await
     };
     if let Err(e) = first_write {
         warn!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': write first UDPPacket failed: {}", visitor_name, e);
@@ -2383,7 +2391,13 @@ async fn run_sudp_worker(
                             )
                             .await
                         } else {
-                            write_msg_v1(&mut srv_w, &FrpMessage::UDPPacket(p)).await
+                            // V1 JSON: reuse the loop's shared scratch.
+                            write_v1_frame_scratch(
+                                &mut srv_w,
+                                &FrpMessage::UDPPacket(p),
+                                &mut wire_scratch,
+                            )
+                            .await
                         };
                         if let Err(e) = write {
                             debug!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': write UDPPacket failed: {}", visitor_name, e);

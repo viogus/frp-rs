@@ -313,8 +313,14 @@ pub fn encode_udp_packet_binary_into(packet: &UDPPacket, out: &mut Vec<u8>) -> R
 ///
 /// Zero heap allocations per datagram (audit P1): the remote is pre-encoded
 /// straight from its octets and neither address ever builds a Vec/String
-/// intermediate. The message-form `local` (loop-invariant in the callers) is
-/// parsed in place and its zone, if any, is borrowed — nothing cloned.
+/// intermediate. The message-form `local` is parsed in place and its zone,
+/// if any, is borrowed — nothing cloned.
+///
+/// Callers whose local address is loop-invariant should hoist that parse
+/// entirely: build a [`PreEncodedUdpAddr`] once (config-sourced local) and
+/// use [`encode_udp_packet_binary_local_pre`], or pass the resolved
+/// `SocketAddr` straight to [`encode_udp_packet_binary_socket_addr_local`]
+/// (frpc's writer) — both are byte-identical to this function (audit item 6).
 pub fn encode_udp_packet_binary_socket_addr(
     content: &[u8],
     local: Option<&UdpAddr>,
@@ -328,6 +334,108 @@ pub fn encode_udp_packet_binary_socket_addr(
         ));
     }
     let local_b = local.map(udp_addr_to_enc).transpose()?;
+    let remote_b = socket_addr_to_enc(remote);
+    encode_body(content, local_b.as_ref(), &remote_b, out)
+}
+
+/// Owned pre-encoded form of one local `binaryUDPAddr`, built once per UDP
+/// bridge from the loop-invariant local address (audit item 6): the binary
+/// codec writer no longer re-parses the `UdpAddr` ip `String` on every
+/// datagram. The ip octets sit in a fixed 16-byte array; the zone is owned
+/// only when the source carries one (empty `String` = no allocation), so the
+/// steady state is exactly the bytes the wire needs.
+#[derive(Clone, Debug)]
+pub struct PreEncodedUdpAddr {
+    family: u8,
+    /// 4 (family 4) or 16 (family 6) octets, at the front of the array.
+    ip: [u8; 16],
+    ip_len: usize,
+    port: u16,
+    /// Zone bytes; empty for family 4 and every zone-less source.
+    zone: String,
+}
+
+impl PreEncodedUdpAddr {
+    fn as_enc(&self) -> EncAddr<'_> {
+        EncAddr {
+            family: self.family,
+            ip: self.ip,
+            ip_len: self.ip_len,
+            port: self.port,
+            zone: &self.zone,
+        }
+    }
+}
+
+/// Validate a message-form [`UdpAddr`] into its owned pre-encoded form
+/// ([`PreEncodedUdpAddr`]), to be built once per bridge and reused per
+/// datagram via [`encode_udp_packet_binary_local_pre`]. Same Go-parity rules
+/// and error strings as the per-call [`encode_udp_packet_binary_socket_addr`]
+/// local parse ([`udp_addr_to_enc`]); only the timing of the validation
+/// moves (once per bridge instead of once per datagram).
+pub fn pre_encode_udp_addr(addr: &UdpAddr) -> Result<PreEncodedUdpAddr, String> {
+    let enc = udp_addr_to_enc(addr)?;
+    Ok(PreEncodedUdpAddr {
+        family: enc.family,
+        ip: enc.ip,
+        ip_len: enc.ip_len,
+        port: enc.port,
+        zone: enc.zone.to_string(),
+    })
+}
+
+/// Encode a UDP packet whose local address is a [`PreEncodedUdpAddr`] and
+/// whose remote address is a `SocketAddr` directly into the binary codec
+/// body, appending after any existing content of `out`.
+///
+/// The local half of [`encode_udp_packet_binary_socket_addr`] with the
+/// per-datagram `UdpAddr` ip parse hoisted out (audit item 6): the caller
+/// builds the pre-encoded local ONCE (e.g. at bridge start, from the
+/// loop-invariant proxy config) and reuses it for every datagram. The remote
+/// stays a `SocketAddr` per call — it genuinely changes per datagram on the
+/// server (each sender) and per reply on the client. Output is byte-identical
+/// to the string round trip; error behavior matches the pre-encode (built
+/// eagerly) plus the shared remote/size checks.
+pub fn encode_udp_packet_binary_local_pre(
+    content: &[u8],
+    local: Option<&PreEncodedUdpAddr>,
+    remote: &std::net::SocketAddr,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    if content.len() > MAX_UDP_PAYLOAD_SIZE {
+        return Err(format!(
+            "UDP payload length {} exceeds limit {MAX_UDP_PAYLOAD_SIZE}",
+            content.len()
+        ));
+    }
+    let local_b = local.map(PreEncodedUdpAddr::as_enc);
+    let remote_b = socket_addr_to_enc(remote);
+    encode_body(content, local_b.as_ref(), &remote_b, out)
+}
+
+/// Encode a UDP packet whose BOTH addresses are `SocketAddr`s directly into
+/// the binary codec body, appending after any existing content of `out`.
+///
+/// The client-side variant of [`encode_udp_packet_binary_local_pre`] (audit
+/// item 6): frpc's UDP writer already holds the resolved local `SocketAddr`
+/// (loop-invariant), so the local is encoded straight from its octets — no
+/// `UdpAddr` String round trip and no per-datagram parse at all. Output is
+/// byte-identical to the message-form encode of the same addresses (same
+/// To4() mapped-v4 normalization, same empty zone; a `SocketAddr` cannot
+/// carry a zone, and `Ipv6Addr` never renders a numeric scope id).
+pub fn encode_udp_packet_binary_socket_addr_local(
+    content: &[u8],
+    local: Option<&std::net::SocketAddr>,
+    remote: &std::net::SocketAddr,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    if content.len() > MAX_UDP_PAYLOAD_SIZE {
+        return Err(format!(
+            "UDP payload length {} exceeds limit {MAX_UDP_PAYLOAD_SIZE}",
+            content.len()
+        ));
+    }
+    let local_b = local.map(socket_addr_to_enc);
     let remote_b = socket_addr_to_enc(remote);
     encode_body(content, local_b.as_ref(), &remote_b, out)
 }
@@ -1093,6 +1201,118 @@ mod tests {
             .unwrap();
             assert_eq!(direct, via_string, "address {addr}");
         }
+    }
+
+    /// Audit item 6 pins: the hoisted-local variants
+    /// (`pre_encode_udp_addr` + `encode_udp_packet_binary_local_pre`,
+    /// `encode_udp_packet_binary_socket_addr_local`) must produce exactly
+    /// the bytes the per-call message-form parse would — v4, plain v6,
+    /// mapped v6, and a zoned local (zone owned by the pre-encoded form).
+    #[test]
+    fn hoisted_local_encodes_are_byte_identical_to_message_form() {
+        let remote: std::net::SocketAddr = "10.0.0.2:53".parse().unwrap();
+        let content = b"ping";
+
+        // (a) SocketAddr local (frpc's resolved local): byte-identical to
+        // the UdpAddr-local per-call encoder for the same address.
+        for local in [
+            Some("127.0.0.1:53001".parse::<std::net::SocketAddr>().unwrap()),
+            Some("[::1]:8080".parse::<std::net::SocketAddr>().unwrap()),
+            Some(
+                "[::ffff:192.168.0.1]:12345"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap(),
+            ),
+            None,
+        ] {
+            let udp_local = local.as_ref().map(|sa| UdpAddr {
+                ip: sa.ip().to_string(),
+                port: sa.port(),
+                zone: String::new(),
+            });
+            let mut via_udp = Vec::new();
+            encode_udp_packet_binary_socket_addr(
+                content,
+                udp_local.as_ref(),
+                &remote,
+                &mut via_udp,
+            )
+            .unwrap();
+            let mut direct = Vec::new();
+            encode_udp_packet_binary_socket_addr_local(
+                content,
+                local.as_ref(),
+                &remote,
+                &mut direct,
+            )
+            .unwrap();
+            assert_eq!(direct, via_udp, "local {local:?}");
+        }
+
+        // (b) Pre-encoded UdpAddr local (server's config-sourced local):
+        // byte-identical to the per-call encoder, zone preserved.
+        let zoned_local = UdpAddr {
+            ip: "fe80::1".into(),
+            port: 53001,
+            zone: "eth0".into(),
+        };
+        let pre = pre_encode_udp_addr(&zoned_local).expect("zoned local pre-encodes");
+        let mut via_udp = Vec::new();
+        encode_udp_packet_binary_socket_addr(content, Some(&zoned_local), &remote, &mut via_udp)
+            .unwrap();
+        let mut hoisted = Vec::new();
+        encode_udp_packet_binary_local_pre(content, Some(&pre), &remote, &mut hoisted).unwrap();
+        assert_eq!(hoisted, via_udp, "pre-encoded zoned local must match");
+        let zone_at = hoisted
+            .windows(4)
+            .position(|w| w == *b"eth0")
+            .expect("zone bytes must be on the wire");
+        assert_eq!(hoisted[zone_at - 1] as usize, 4, "zone-length byte");
+
+        // None local: flags carry only the remote bit.
+        let mut none_local = Vec::new();
+        encode_udp_packet_binary_local_pre(content, None, &remote, &mut none_local).unwrap();
+        assert_eq!(none_local[0], UDP_PACKET_FLAG_REMOTE_ADDR);
+    }
+
+    /// The pre-encode performs the same validation as the per-call local
+    /// parse, eagerly: empty address and IPv4-with-zone are rejected with
+    /// the same error texts.
+    #[test]
+    fn pre_encode_udp_addr_validates_like_the_per_call_parse() {
+        let empty = UdpAddr {
+            ip: String::new(),
+            port: 0,
+            zone: String::new(),
+        };
+        let err = pre_encode_udp_addr(&empty).unwrap_err();
+        assert!(err.contains("empty UDP address"), "got {err:?}");
+
+        let v4_zone = UdpAddr {
+            ip: "192.168.0.1".into(),
+            port: 53,
+            zone: "eth0".into(),
+        };
+        let err = pre_encode_udp_addr(&v4_zone).unwrap_err();
+        assert!(err.contains("IPv4 zone is forbidden"), "got {err:?}");
+
+        let big_zone = UdpAddr {
+            ip: "fe80::1".into(),
+            port: 8080,
+            zone: "a".repeat(256),
+        };
+        let err = pre_encode_udp_addr(&big_zone).unwrap_err();
+        assert!(err.contains("zone exceeds 255 bytes"), "got {err:?}");
+
+        // Mapped-v6 text normalizes to family 4 (Go To4 parity), same as the
+        // per-call parse.
+        let mapped = UdpAddr {
+            ip: "::ffff:192.168.0.1".into(),
+            port: 53,
+            zone: String::new(),
+        };
+        let pre = pre_encode_udp_addr(&mapped).unwrap();
+        assert_eq!(pre.family, 4, "mapped address must pre-encode as family 4");
     }
 
     #[test]
