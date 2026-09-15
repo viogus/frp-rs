@@ -319,21 +319,26 @@ fn build_quic_transport_config(params: &QuicTransportParams) -> quinn::Transport
     // `DEFAULT_STREAM_RECEIVE_WINDOW` (6 MiB, Go parity).
     transport.stream_receive_window(params.effective_stream_receive_window().into());
     // Connection-level receive window (`initial_max_data`): left at quinn's
-    // default (VarInt::MAX) here for the DIAL paths — the frps LISTENER is
-    // the only pre-auth surface, and it overrides this value with
-    // [`PREAUTH_CONNECTION_RECEIVE_WINDOW`] in `QuicListener::new_with_tls_config`,
-    // raising it after frp login. In quinn-proto 0.11.x the default is
-    // `VarInt::MAX` (the "10 MiB" figure belongs to older quinn releases):
-    // connection-wide flow control starts fully open and is only ever
-    // changed if the application calls `Connection::set_receive_window` —
-    // there is no internal auto-tuning. Pinning a finite value (e.g. Go's
-    // quic-go default of 15 MiB) on the dial side would throttle the
-    // aggregate of all streams sharing a connection on a high-BDP link,
-    // which is precisely what the per-stream window above exists to avoid.
-    // Worst-case receive buffering stays bounded by
-    // `max_concurrent_bidi_streams * stream_receive_window` (quinn's own
-    // documented bound) once authenticated; pre-auth it is bounded by the
-    // listener-side cap above instead.
+    // default (VarInt::MAX) here for the DIAL paths and for the XTCP
+    // hole-punched accept path (`quic_accept_on_socket`) — the frps LISTENER
+    // is the only surface an UNAUTHENTICATED peer can reach, and it
+    // overrides this value with [`PREAUTH_CONNECTION_RECEIVE_WINDOW`] in
+    // `QuicListener::new_with_tls_config`, raising it after frp login. An
+    // XTCP punched connection is already control-authenticated (only the
+    // proxy holder who completed the NAT-hole session can reach the
+    // ephemeral socket), so it deliberately keeps quinn's open default —
+    // capping the P2P tunnel would throttle it for no pre-auth gain. In
+    // quinn-proto 0.11.x the default is `VarInt::MAX` (the "10 MiB" figure
+    // belongs to older quinn releases): connection-wide flow control starts
+    // fully open and is only ever changed if the application calls
+    // `Connection::set_receive_window` — there is no internal auto-tuning.
+    // Pinning a finite value (e.g. Go's quic-go default of 15 MiB) on the
+    // dial side would throttle the aggregate of all streams sharing a
+    // connection on a high-BDP link, which is precisely what the per-stream
+    // window above exists to avoid. Worst-case receive buffering stays
+    // bounded by `max_concurrent_bidi_streams * stream_receive_window`
+    // (quinn's own documented bound) once authenticated; pre-auth it is
+    // bounded by the listener-side cap above instead.
     transport
 }
 

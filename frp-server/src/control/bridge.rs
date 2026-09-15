@@ -3711,8 +3711,13 @@ mod tests {
         header.push(packet.v1_type_byte());
         header.extend_from_slice(&(payload.len() as u64).to_be_bytes());
         peer.write_all(&header).await.unwrap();
-        // Let the reader consume the header and block on the payload.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Let the reader consume the header and block on the payload. Two
+        // yields: the peer write wakes the bridge task, and on the
+        // current-thread scheduler a yielded test task runs only after the
+        // already-woken reader, so the header is consumed deterministically
+        // (no wall-clock sleep, no vacuous-pass window).
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
 
         // Competing wakeup: true then false, no yield in between. The
         // reader must resume the SAME frame read, not restart it.

@@ -35,9 +35,14 @@ vlog() { $VERBOSE && echo "[matrix] $*" || true; }
 cleanup() {
     # Kill any stragglers from an interrupted run. frps/frpc pid files live
     # per-row under $TEST_DIR/<name>/, echo pid files at the top level.
-    local pid_file
+    # Guard on both file existence AND non-empty content: a zero-byte pid
+    # file would make `kill ""` fail on its first (invalid) argument and
+    # abort the whole command, leaking the remaining stragglers.
+    local pid_file pid
     for pid_file in "$TEST_DIR"/*.pid "$TEST_DIR"/*/*.pid; do
-        [[ -f "$pid_file" ]] && kill "$(cat "$pid_file")" 2>/dev/null
+        [[ -f "$pid_file" ]] || continue
+        pid="$(cat "$pid_file" 2>/dev/null)" || continue
+        [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
     done
     rm -rf "$TEST_DIR"
 }
@@ -190,8 +195,8 @@ run_row() {
         return
     fi
 
-    # Clean up this row's processes.
-    kill "$(cat "$row_dir/frpc.pid")" "$(cat "$row_dir/frps.pid")" "$(cat "$TEST_DIR/echo-$echo_port.pid")" 2>/dev/null
+    # Clean up this row's processes (same guarded path as every failure arm).
+    kill_row_processes
     rm -f "$row_dir/frpc.pid" "$row_dir/frps.pid" "$TEST_DIR/echo-$echo_port.pid"
     sleep 0.5
 }
