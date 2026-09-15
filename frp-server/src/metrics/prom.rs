@@ -168,7 +168,6 @@ pub async fn sync_from_state(state: &AppState) {
 
     let proxies = state.proxy_manager.list().await;
     let mut type_counts: HashMap<String, i64> = HashMap::new();
-    let mut last_traffic = LAST_TRAFFIC.lock().await;
 
     for p in &proxies {
         *type_counts.entry(p.proxy_type.clone()).or_default() += 1;
@@ -198,18 +197,33 @@ pub async fn sync_from_state(state: &AppState) {
         // values but broke Prometheus counter monotonicity — counters would
         // drop to 0 between scrapes, making rate() return garbage.
         let key = (pn.clone(), pt.clone());
-        let (prev_in, prev_out) = last_traffic.remove(&key).unwrap_or((0, 0));
-        let delta_in = snap.bytes_in.saturating_sub(prev_in);
-        let delta_out = snap.bytes_out.saturating_sub(prev_out);
+        // The baseline map lock used to be held for the ENTIRE per-proxy
+        // loop, awaits included (audit §3 item 7). It is now a single short
+        // critical section per proxy. The guarantee is exactly
+        // pair-atomicity of the remove+conditional-insert: no OTHER holder
+        // of the lock (`proxy_removed`, a concurrent scrape) can interleave
+        // between them, so a baseline can never be lost or double-counted
+        // mid-pair (the round-18 E1 false-delta shape). The guard release
+        // is itself a boundary — a `proxy_removed` landing right after it
+        // leaves the next scrape of this key without a baseline, reporting
+        // the current cumulative as its first delta.
+        let (delta_in, delta_out) = {
+            let mut last_traffic = LAST_TRAFFIC.lock().await;
+            let (prev_in, prev_out) = last_traffic.remove(&key).unwrap_or((0, 0));
+            // Store cumulative values for the next scrape's delta calculation.
+            if snap.bytes_in > 0 || snap.bytes_out > 0 {
+                last_traffic.insert(key, (snap.bytes_in, snap.bytes_out));
+            }
+            (
+                snap.bytes_in.saturating_sub(prev_in),
+                snap.bytes_out.saturating_sub(prev_out),
+            )
+        };
         if delta_in > 0 {
             TRAFFIC_IN.with_label_values(&[pn, pt]).inc_by(delta_in);
         }
         if delta_out > 0 {
             TRAFFIC_OUT.with_label_values(&[pn, pt]).inc_by(delta_out);
-        }
-        // Store cumulative values for the next scrape's delta calculation.
-        if snap.bytes_in > 0 || snap.bytes_out > 0 {
-            last_traffic.insert(key, (snap.bytes_in, snap.bytes_out));
         }
     }
     // Proxies absent from this scrape leave no trace: their baselines were

@@ -15,7 +15,8 @@ use frp_core::metrics::ConnGuard;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{
     read_msg_v1, read_msg_v2_udp_binary_socket, read_msg_v2_with_udp_codec, write_msg_v1,
-    write_msg_v2_with_udp_codec, write_v2_frame_raw, UdpBinaryRead, V2_FRAME_TYPE_MESSAGE,
+    write_msg_v2_with_udp_codec, write_v1_frame_scratch, write_v2_frame_raw, UdpBinaryRead,
+    V2_FRAME_TYPE_MESSAGE,
 };
 use frp_core::snappy_stream::{SnappyStreamReader, SnappyStreamWriter};
 use frp_core::transport::{split_work_conn_halves, IoStream};
@@ -1542,6 +1543,51 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
     }
 }
 
+/// Reader half of a UDP work conn plus the reusable payload buffer the V2 read
+/// decoders fill (one heap alloc per UDP packet saved). The pair moves into
+/// [`UdpFrameFut`] while a frame is in flight and comes back with the frame, so
+/// exactly one of the two places holds it at any moment.
+struct UdpFrameReader {
+    r: tokio::io::BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+    scratch: Vec<u8>,
+}
+
+/// Persistent read future for ONE UDP frame (audit M1 / §4 示例 A).
+///
+/// Created once per frame and kept across `select!` wakeups that turn out not
+/// to be a frame (cancel-token tick, idle-deadline slide), so a partially-read
+/// frame survives instead of being dropped and restarted. It takes the reader
+/// and payload buffer by value rather than borrowing them: a loop-outer
+/// `Pin<Box<dyn Future + '_>>` holding `&mut w_r` / `&mut scratch` would freeze
+/// both for the whole loop (E0502).
+type UdpFrameFut<'a> = Pin<
+    Box<dyn Future<Output = (UdpFrameReader, Result<UdpBinaryRead, frp_core::Error>)> + Send + 'a>,
+>;
+
+/// Arm [`UdpFrameFut`] for the current round. `codec` borrows the bridge's
+/// negotiated-codec string, which outlives the reader task.
+fn udp_frame_fut<'a>(state: UdpFrameReader, v2: bool, codec: Option<&'a str>) -> UdpFrameFut<'a> {
+    Box::pin(async move {
+        let UdpFrameReader { mut r, mut scratch } = state;
+        let result = if v2 {
+            if codec.is_some() {
+                // Binary UDP codec negotiated (Go v0.71.0): type-19 frames
+                // decode to native SocketAddr form, skipping the per-packet
+                // String alloc + reparse that the message path performs
+                // (audit LOW: decode formats then re-parses).
+                read_msg_v2_udp_binary_socket(&mut r, &mut scratch).await
+            } else {
+                read_msg_v2_with_udp_codec(&mut r, codec, &mut scratch)
+                    .await
+                    .map(UdpBinaryRead::Message)
+            }
+        } else {
+            read_msg_v1(&mut r).await.map(UdpBinaryRead::Message)
+        };
+        (UdpFrameReader { r, scratch }, result)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_udp_work_conn(
     work_conn: IoStream,
@@ -1570,6 +1616,14 @@ async fn run_udp_work_conn(
     // completed frame — a Ping included — starts a fresh 60s), so an
     // active conn is never reaped.
     read_timeout: std::time::Duration,
+    // Test-only injection point for the reader's cancel watch SENDER
+    // (round-19 test-gap fix). `None` in production. When set, the reader
+    // subscribes to the injected channel instead of the internal one, so a
+    // test can fire the reader-cancel tick directly. The reader select
+    // treats a true value as a break; a false-to-false tick (two
+    // back-to-back sends) is a benign wakeup that MUST NOT strand a
+    // partially-read frame — the persisted `read_fut` (M1) survives it.
+    reader_cancel_override: Option<tokio::sync::watch::Sender<bool>>,
 ) {
     // write_msg_v2_nof skips the flush syscall. That is only safe for a raw
     // TcpStream: TLS/mux/WS-wrapped streams buffer internally and would leave
@@ -1612,8 +1666,17 @@ async fn run_udp_work_conn(
     // syscall per packet — and one syscall for several small packets. The
     // write half is untouched (separate object), so no flush semantics
     // change.
-    let mut w_r = tokio::io::BufReader::with_capacity(16 * 1024, w_r);
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let w_r = tokio::io::BufReader::with_capacity(16 * 1024, w_r);
+    let (cancel_tx, cancel_rx) = match reader_cancel_override {
+        // Subscribe to the injected channel so the reader's cancel watch
+        // observes the same sender the test fires (and the writer below
+        // still reaches the reader with its exit signal).
+        Some(tx) => {
+            let rx = tx.subscribe();
+            (tx, rx)
+        }
+        None => tokio::sync::watch::channel(false),
+    };
 
     let sock_reader = sock.clone();
     let reader_name = proxy_name.clone();
@@ -1628,9 +1691,22 @@ async fn run_udp_work_conn(
     let reader_lim = bw_limiter.clone();
     let reader = async move {
         debug!(proxy_name = %reader_name, "UDP work conn reader task started for '{}'", reader_name);
-        // Reusable payload buffer for the V2 UDP read path (avoids a heap
-        // alloc per UDP packet).
-        let mut scratch: Vec<u8> = Vec::new();
+        // Reader half + payload buffer for the V2 UDP read path travel
+        // together inside `UdpFrameReader`: parked here between frames, owned
+        // by `read_fut` while a frame is in flight.
+        let mut frame_state: Option<UdpFrameReader> = Some(UdpFrameReader {
+            r: w_r,
+            scratch: Vec::new(),
+        });
+        // M1 (audit §4 示例 A): the frame read is ONE persistent future rather
+        // than a per-iteration `tokio::time::timeout(read_timeout, ..)` wrapper,
+        // so a select wakeup that is not a frame (cancel tick, deadline slide)
+        // no longer drops a partially-read frame or rebuilds the read future
+        // and its timer entry. `idle` is the single watchdog for the same 60s
+        // deadline, slid only when a frame actually lands.
+        let mut read_fut: Option<UdpFrameFut<'_>> = None;
+        let mut last_activity = tokio::time::Instant::now();
+        let mut idle = Box::pin(tokio::time::sleep_until(last_activity + read_timeout));
         loop {
             let result = tokio::select! {
                 biased;
@@ -1639,40 +1715,45 @@ async fn run_udp_work_conn(
                     if changed.is_err() || *reader_cancel.borrow() { break; }
                     continue;
                 }
-                result = async {
-                    match tokio::time::timeout(read_timeout, async {
-                        if v2 {
-                            if udp_codec_opt.is_some() {
-                                // Binary UDP codec negotiated (Go v0.71.0):
-                                // type-19 frames decode to native SocketAddr
-                                // form, skipping the per-packet String alloc +
-                                // reparse that the message path performs
-                                // (audit LOW: decode formats then re-parses).
-                                read_msg_v2_udp_binary_socket(&mut w_r, &mut scratch).await
-                            } else {
-                                read_msg_v2_with_udp_codec(&mut w_r, udp_codec_opt, &mut scratch)
-                                    .await
-                                    .map(UdpBinaryRead::Message)
-                            }
-                        } else {
-                            read_msg_v1(&mut w_r).await.map(UdpBinaryRead::Message)
+                (state, frame) = async {
+                    if read_fut.is_none() {
+                        // Arm on first use; the reader + payload buffer are
+                        // parked in `frame_state` while no frame is in flight.
+                        if let Some(state) = frame_state.take() {
+                            read_fut = Some(udp_frame_fut(state, v2, udp_codec_opt));
                         }
-                    })
-                    .await
-                    {
-                        Ok(r) => r,
-                        // M1: 60s of frame silence (Go udp.go read-deadline
-                        // parity) = dead/half-open peer. Folds into the Err
-                        // arm below: log + break, and the supervisor
-                        // re-requests a replacement work conn.
-                        Err(_) => Err(frp_core::Error::Protocol(
-                            format!(
-                                "UDP work conn read deadline ({read_timeout:?}) expired with no frame from the client"
-                            )
-                            .into(),
-                        )),
                     }
-                } => result,
+                    match read_fut.as_mut() {
+                        Some(fut) => fut.await,
+                        // Unreachable — the two Options are never both None.
+                        // `pending` keeps a future armed without a panic path,
+                        // and the idle arm still bounds the wait.
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // A real frame (Ping/Pong included) — the only event that
+                    // slides the deadline, mirroring the Go SetReadDeadline
+                    // issued after every completed read.
+                    read_fut = None;
+                    frame_state = Some(state);
+                    last_activity = tokio::time::Instant::now();
+                    idle.as_mut().reset(last_activity + read_timeout);
+                    frame
+                }
+                // M1: 60s of frame silence (Go udp.go read-deadline parity) =
+                // dead/half-open peer. Same error shape as the per-read
+                // deadline it replaces — the Err arm below logs + breaks, and
+                // the supervisor re-requests a replacement work conn.
+                // Listed AFTER the read arm (biased select): the old
+                // `tokio::time::timeout` polled the inner read future first,
+                // so a frame ready exactly at deadline expiry was DELIVERED;
+                // polling this arm first would drop it and reap a live conn.
+                _ = &mut idle => Err(frp_core::Error::Protocol(
+                    format!(
+                        "UDP work conn read deadline ({read_timeout:?}) expired with no frame from the client"
+                    )
+                    .into(),
+                )),
             };
             match result {
                 // Native-address form (binary codec): the destination is
@@ -1755,12 +1836,30 @@ async fn run_udp_work_conn(
         // Option<UdpAddr> String heap allocs happen once per bridge instead
         // of once per packet. Single-task writer: no concurrency risk.
         let mut local_addr = local_addr;
+        // Audit item 6: pre-encode the loop-invariant local once per bridge
+        // for the V2 binary codec — the per-datagram `UdpAddr` ip String
+        // re-parse is gone. Validation happens here instead of on the first
+        // datagram; a bad config local fails the bridge the same way (writer
+        // exits, supervisor requests a replacement) but without the loop.
+        let local_enc: Option<frp_core::udp_binary::PreEncodedUdpAddr> = match local_addr
+            .as_ref()
+            .map(frp_core::udp_binary::pre_encode_udp_addr)
+            .transpose()
+        {
+            Ok(enc) => enc,
+            Err(e) => {
+                warn!(proxy_name = %writer_name, error = %e,
+                        "UDP work conn writer for '{}': invalid local address: {}", writer_name, e);
+                return;
+            }
+        };
         // Spare Vec for the packet content: the wire format base64-encodes
         // UDPPacket.content, and the memcpy of `buf[..n]` is inherent — but
         // the per-packet Vec *allocation* is not. take/return keeps the
         // capacity across packets (audit D1-4).
         let mut spare: Vec<u8> = Vec::with_capacity(udp_packet_size);
-        // Reused binary-codec wire buffer: type ID + encoded packet.
+        // Reused wire buffer for the V2 binary codec (type ID + encoded
+        // packet) and for the V1 frame serializer of the JSON path.
         let mut wire_scratch: Vec<u8> = Vec::with_capacity(udp_packet_size + 48);
         loop {
             let received = tokio::select! {
@@ -1789,14 +1888,15 @@ async fn run_udp_work_conn(
                         // identical to the string round trip
                         // (`encode_udp_packet_binary_socket_addr`). `content`
                         // is borrowed here and returned to `spare` below;
-                        // `local_addr` is loop-invariant and only borrowed.
+                        // `local_enc` is the bridge-invariant pre-encoded
+                        // local (audit item 6 — no per-datagram parse).
                         let encode = async {
                             wire_scratch.clear();
                             wire_scratch
                                 .extend_from_slice(&msg::V2_TYPE_UDP_PACKET_BINARY.to_be_bytes());
-                            frp_core::udp_binary::encode_udp_packet_binary_socket_addr(
+                            frp_core::udp_binary::encode_udp_packet_binary_local_pre(
                                 &content,
-                                local_addr.as_ref(),
+                                local_enc.as_ref(),
                                 &src,
                                 &mut wire_scratch,
                             )
@@ -1849,7 +1949,11 @@ async fn run_udp_work_conn(
                             )
                             .await
                         } else {
-                            write_msg_v1(&mut w_w, &pkt).await
+                            // Same scratch on the V1 path: `write_v1_frame`
+                            // allocates one Vec per frame, this reuses the
+                            // loop's buffer (wire bytes identical — the
+                            // scratch is cleared per call; audit §3 item 1).
+                            write_v1_frame_scratch(&mut w_w, &pkt, &mut wire_scratch).await
                         };
                         // Return the invariant values to their locals for the
                         // next packet before checking the write result.
@@ -2056,6 +2160,7 @@ pub(crate) async fn assign_udp_work_conn(
             bridge_cancel,
             udp_packet_codec,
             UDP_WORK_CONN_READ_TIMEOUT,
+            None,
         ));
         if let Err(e) = handle.await {
             if e.is_panic() {
@@ -3285,6 +3390,7 @@ mod tests {
             // M1: keep the 60s production read deadline; these tests end
             // the bridge via EOF/cancel, not frame silence.
             UDP_WORK_CONN_READ_TIMEOUT,
+            None,
         ));
         drop(peer);
 
@@ -3327,6 +3433,7 @@ mod tests {
             // M1: keep the 60s production read deadline; these tests end
             // the bridge via EOF/cancel, not frame silence.
             UDP_WORK_CONN_READ_TIMEOUT,
+            None,
         ));
         sender.send_to(b"force-write", socket_addr).await.unwrap();
 
@@ -3363,6 +3470,7 @@ mod tests {
             // M1: keep the 60s production read deadline; these tests end
             // the bridge via EOF/cancel, not frame silence.
             UDP_WORK_CONN_READ_TIMEOUT,
+            None,
         ));
 
         peer.write_v1_frame(&FrpMessage::UDPPacket(msg::UDPPacket {
@@ -3434,6 +3542,7 @@ mod tests {
             // M1: keep the 60s production read deadline; the cancel arm
             // below ends this bridge, not frame silence.
             UDP_WORK_CONN_READ_TIMEOUT,
+            None,
         ));
 
         // Let both bridge tasks reach their blocking points.
@@ -3471,6 +3580,7 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
             String::new(),
             std::time::Duration::from_millis(150),
+            None,
         ));
         // Keep `peer` alive and silent: no EOF, no frames.
         std::mem::forget(peer);
@@ -3496,6 +3606,141 @@ mod tests {
         .expect("stopped writer must not consume a later datagram")
         .unwrap();
         assert_eq!(&buf[..n], b"after-stop");
+    }
+
+    #[tokio::test]
+    async fn udp_work_reader_frame_activity_slides_the_read_deadline() {
+        // M1 (§4 示例 A): the read deadline is per completed FRAME (Go issues
+        // SetReadDeadline after every read), so frames arriving inside the
+        // window must slide the watchdog — and the re-armed timer must still
+        // reap the conn once the frames stop.
+        let (work, mut peer) = tcp_pair().await;
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        let bridge = tokio::spawn(run_udp_work_conn(
+            IoStream::Tcp(work),
+            socket,
+            "udp-test".to_string(),
+            None,
+            false,
+            [0u8; 16],
+            false,
+            1500,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            String::new(),
+            std::time::Duration::from_millis(400),
+            None,
+        ));
+
+        // 5 pings 100ms apart span 500ms — longer than ONE deadline, so a
+        // watchdog that was not slid per frame would already have reaped the
+        // conn by the assertion below.
+        for _ in 0..5 {
+            write_msg_v1(
+                &mut peer,
+                &FrpMessage::Ping(msg::Ping {
+                    privilege_key: None,
+                    timestamp: Some(1),
+                }),
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            !bridge.is_finished(),
+            "frames inside the window must slide the read deadline"
+        );
+
+        // Silence now reaps it on the re-armed timer.
+        tokio::time::timeout(std::time::Duration::from_secs(2), bridge)
+            .await
+            .expect("silence after activity must still reap the bridge")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_work_reader_partial_frame_survives_competing_wakeup() {
+        // M1 (§4 示例 A) against its nastiest wakeup shape: a competing
+        // reader-cancel tick landing MID-FRAME (header consumed, payload
+        // outstanding). The pre-M1 loop rebuilt the frame read per
+        // iteration, so any wakeup dropped the read future WITH the header
+        // already consumed — the next iteration read the payload bytes as a
+        // fresh header (garbage length → protocol error → conn death). The
+        // persisted `read_fut` survives the wakeup and finishes the SAME
+        // frame. Two back-to-back watch sends with no await in between: the
+        // current-thread runtime polls the reader only after both, so it
+        // observes the final false and takes the benign `continue` arm.
+        use tokio::io::AsyncWriteExt;
+        let (work, mut peer) = tcp_pair().await;
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let remote = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote.local_addr().unwrap();
+        let (cancel_override, _cancel_rx) = tokio::sync::watch::channel(false);
+
+        let bridge = tokio::spawn(run_udp_work_conn(
+            IoStream::Tcp(work),
+            socket,
+            "udp-test".to_string(),
+            None,
+            false,
+            [0u8; 16],
+            false,
+            1500,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            String::new(),
+            UDP_WORK_CONN_READ_TIMEOUT,
+            Some(cancel_override.clone()),
+        ));
+
+        let packet = FrpMessage::UDPPacket(msg::UDPPacket {
+            content: b"split-frame".to_vec(),
+            local_addr: None,
+            remote_addr: Some(msg::UdpAddr {
+                ip: remote_addr.ip().to_string(),
+                port: remote_addr.port(),
+                zone: String::new(),
+            }),
+        });
+        let payload = serde_json::to_vec(&packet).unwrap();
+        // V1 header only (1 type byte + 8-byte BE length): the reader
+        // consumes it and parks on the payload read — the mid-frame state.
+        let mut header = Vec::with_capacity(9);
+        header.push(packet.v1_type_byte());
+        header.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        peer.write_all(&header).await.unwrap();
+        // Let the reader consume the header and block on the payload. Two
+        // yields: the peer write wakes the bridge task, and on the
+        // current-thread scheduler a yielded test task runs only after the
+        // already-woken reader, so the header is consumed deterministically
+        // (no wall-clock sleep, no vacuous-pass window).
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Competing wakeup: true then false, no yield in between. The
+        // reader must resume the SAME frame read, not restart it.
+        cancel_override.send(true).unwrap();
+        cancel_override.send(false).unwrap();
+
+        peer.write_all(&payload).await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            remote.recv_from(&mut buf),
+        )
+        .await
+        .expect("the split frame must still be delivered after the competing wakeup")
+        .unwrap();
+        assert_eq!(&buf[..n], b"split-frame");
+
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(1), bridge)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

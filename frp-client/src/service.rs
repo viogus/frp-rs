@@ -117,11 +117,12 @@ use crate::vnet::{
     add_os_route, advertise_vnet_visitor_route, local_vnet_set, remove_os_route, remove_vnet_tun,
     send_vnet_route_advertise, spawn_vnet_tun_controller, virtual_net_visitor_route_adv,
     vnet_proxy_snapshot, vnet_tun_params, VnetPeerRoute, VnetTunCancelMap, VnetTunMap,
+    VnetTunSubnetMap, VnetTunTxMap,
 };
-// register_vnet_tun, vnet_tun_cidr, VnetTunTxMap are used only by vnet tests,
-// so their imports are test-cfg'd to keep plain builds warning-free.
+// register_vnet_tun and vnet_tun_cidr are used only by vnet tests, so their
+// imports are test-cfg'd to keep plain builds warning-free.
 #[cfg(all(feature = "vnet", test))]
-use crate::vnet::{register_vnet_tun, vnet_tun_cidr, VnetTunTxMap};
+use crate::vnet::{register_vnet_tun, vnet_tun_cidr};
 use crate::work_conn::XtcpNotification;
 
 /// Go frp v0.70.1 visitor plugin type for virtual-net host routes.
@@ -484,18 +485,21 @@ pub struct Service {
     #[cfg(feature = "vnet")]
     vnet_controller: Arc<frp_vnet::controller::ClientVnetController>,
     /// Per-proxy TX channels for forwarding received VnetPackets to TUN devices.
-    /// Keyed by proxy name.
+    /// Keyed by proxy name. Elements are `Arc<[u8]>` so a fan-out shares one
+    /// packet buffer by refcount instead of copying per peer.
     #[cfg(feature = "vnet")]
-    vnet_tun_tx: Arc<std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>>>,
+    vnet_tun_tx: VnetTunTxMap,
     /// Per-proxy cancellation senders for running vnet controllers.
     #[cfg(feature = "vnet")]
     vnet_tun_cancels: VnetTunCancelMap,
     /// Per-proxy TUN device names for OS route injection.
     #[cfg(feature = "vnet")]
     pub(crate) vnet_tun_names: Arc<Mutex<HashMap<String, String>>>,
-    /// Per-proxy subnet CIDR for directing virtual_net visitor return traffic.
+    /// Per-proxy subnet for directing virtual_net visitor return traffic.
+    /// Registered precompiled (see `vnet_tun_subnets` insert at
+    /// `open_vnet_tun_for_proxy`) so the per-packet fan-out never parses a CIDR.
     #[cfg(feature = "vnet")]
-    pub(crate) vnet_tun_subnets: Arc<Mutex<HashMap<String, String>>>,
+    pub(crate) vnet_tun_subnets: VnetTunSubnetMap,
     /// Peer proxy name → (advertised subnet, TUN interface, virtual net) for
     /// OS routes injected from VnetRouteAdvertise. The vnet is stored so route
     /// table entries can be removed in the right partition on VnetRouteRemove
@@ -1629,6 +1633,11 @@ impl Service {
                     .as_ref()
                     .map(|q| q.max_incoming_streams)
                     .unwrap_or(0),
+                cfg_local
+                    .quic_options
+                    .as_ref()
+                    .map(|q| q.stream_receive_window)
+                    .unwrap_or(0),
             ),
         );
 
@@ -2647,6 +2656,11 @@ impl Service {
                     .as_ref()
                     .map(|q| q.max_incoming_streams)
                     .unwrap_or(0),
+                cfg_local
+                    .quic_options
+                    .as_ref()
+                    .map(|q| q.stream_receive_window)
+                    .unwrap_or(0),
             );
             let handle = tokio::spawn(async move {
                 crate::visitor::run_visitor_listener(crate::visitor::VisitorListenerConfig {
@@ -2845,7 +2859,53 @@ impl Service {
             Pin<Box<dyn Future<Output = Result<FrpMessage, frp_core::Error>> + Send>>;
         let mut pending_read: Option<PendingRead> = None;
 
+        // Persistent heartbeat-watchdog timer (perf audit LOW): one `Sleep`
+        // lives for the whole message loop instead of a fresh
+        // `sleep(hb_timeout_dur - last_pong.elapsed())` built on every select
+        // iteration — the per-iteration form paid an `Instant::now()` plus a
+        // timer construction on every control frame, while the deadline is
+        // fully determined by `last_pong` + `hb_timeout_dur`. The deadline is
+        // absolute, so the timer is re-armed at the loop top only when a Pong
+        // moved `last_pong` or after it has fired (an elapsed `Sleep` polls
+        // Ready immediately — the same guard shape as the Wave-1
+        // xtcp_session ticker). Cadence is unchanged: the first fire is one
+        // full `hb_timeout` after login, and no tick is ever replayed or
+        // coalesced, because the reset target is the absolute deadline
+        // `last_pong + hb_timeout_dur`, never `now + interval`.
+        let mut hb_armed_pong = ctx.last_pong;
+        // A hostile heartbeat_timeout (the config preserves i64::MAX raw)
+        // makes `last_pong + hb_timeout_dur` overflow `Instant` — a panic
+        // that aborts the process under panic=abort. Degrade to never-fire:
+        // an absurd interval means "no watchdog", and the deadline is
+        // unreachable (round-13 dropped the 3600s clamp on both sides).
+        let mut hb_deadline: Option<std::time::Instant> =
+            ctx.last_pong.checked_add(ctx.hb_timeout_dur);
+        // The timer holds a placeholder deadline while `hb_deadline` is None
+        // (overflow); the select arm below is gated off in that state, so
+        // the placeholder is never polled and never fires.
+        let mut hb_sleep = Box::pin(tokio::time::sleep_until(
+            hb_deadline
+                .map(tokio::time::Instant::from_std)
+                .unwrap_or_else(tokio::time::Instant::now),
+        ));
+
         loop {
+            // Re-arm the watchdog only when its deadline moved or the timer
+            // already fired. A disabled watchdog (heartbeat interval <= 0,
+            // hb_watchdog_active false) is never armed at all — its select
+            // arm below is gated off, so the timer would never be polled.
+            if ctx.hb_watchdog_active && (ctx.last_pong != hb_armed_pong || hb_sleep.is_elapsed()) {
+                hb_armed_pong = ctx.last_pong;
+                hb_deadline = ctx.last_pong.checked_add(ctx.hb_timeout_dur);
+                // Overflow degrades to never-fire (see the initial arm); the
+                // placeholder timer is left alone — the gated select arm
+                // never polls it.
+                if let Some(deadline) = hb_deadline {
+                    hb_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::from_std(deadline));
+                }
+            }
             // Recreate the control-read future when the previous frame
             // completed (the arm body detached it). Starts a fresh read at
             // the next frame boundary. The async block owns an Arc clone
@@ -3212,7 +3272,9 @@ impl Service {
                                                 .lock()
                                                 .unwrap_or_else(|e| e.into_inner());
                                             if let Some(tx) = txs.get(&vpkt.proxy_name) {
-                                                if tx.try_send(packet).is_err() {
+                                                // Single destination: the Vec
+                                                // moves into the Arc (no copy).
+                                                if tx.try_send(Arc::from(packet)).is_err() {
                                                     warn!(proxy_name = %vpkt.proxy_name, "vnet TUN channel closed");
                                                 }
                                             } else {
@@ -3771,14 +3833,18 @@ impl Service {
 
                 // Heartbeat timeout watchdog: triggers reconnect if no Pong
                 // received within heartbeat_timeout seconds (Go frp compat).
-                // Event-driven: sleeps until the deadline (last_pong +
-                // hb_timeout_dur) instead of polling every second, so each
-                // Pong arrival naturally reschedules the wakeup. Uses sleep
+                // Event-driven: the persistent timer armed at the loop top
+                // (hb_sleep) waits until the absolute deadline (last_pong +
+                // hb_timeout_dur), so each Pong arrival re-arms it there
+                // instead of rebuilding a `Sleep` per iteration. Uses sleep
                 // so the timer is only active when hb_timeout > 0. Explicit
                 // negative values disable it independently of tcp_mux.
                 // Gated on the ping loop being active (hb_watchdog_active):
-                // with heartbeat_interval <= 0 no Pong can ever arrive.
-                _ = tokio::time::sleep(ctx.hb_timeout_dur.saturating_sub(ctx.last_pong.elapsed())), if ctx.hb_watchdog_active => {
+                // with heartbeat_interval <= 0 no Pong can ever arrive. Also
+                // gated on hb_deadline (Some): an overflowing timeout
+                // degrades the watchdog to never-fire, so its placeholder
+                // timer must never be polled here.
+                _ = &mut hb_sleep, if ctx.hb_watchdog_active && hb_deadline.is_some() => {
                     warn!("Heartbeat timeout ({}s), reconnecting...", ctx.hb_timeout);
                     return LoopExit::Reconnect;
                 }
@@ -5484,10 +5550,10 @@ mod tests {
 
         // Pre-populate every map the removal path must clean up.
         names.lock().await.insert("vnet-a".into(), "tun0".into());
-        subnets
-            .lock()
-            .await
-            .insert("vnet-a".into(), "10.0.0.0/24".into());
+        subnets.lock().await.insert(
+            "vnet-a".into(),
+            frp_vnet::router::PrecompiledSubnet::new("10.0.0.0/24"),
+        );
         route_table
             .write()
             .await

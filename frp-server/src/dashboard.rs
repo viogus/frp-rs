@@ -1098,7 +1098,7 @@ async fn handle_store_proxy_create(
     // Persist to disk
     if let Some(ref p) = state.store_path {
         let snapshot = state.proxy_config_store.read().await.clone();
-        crate::store::save_store(p, &snapshot);
+        crate::store::save_store(p, snapshot).await;
     }
 
     Ok(Json(serde_json::json!({"status": "created", "name": name})))
@@ -1231,7 +1231,7 @@ async fn handle_store_proxy_delete(
     // Persist to disk
     if let Some(ref p) = state.store_path {
         let snapshot = state.proxy_config_store.read().await.clone();
-        crate::store::save_store(p, &snapshot);
+        crate::store::save_store(p, snapshot).await;
     }
 
     // Notify the client to close the proxy on its side (Go frp compat).
@@ -1314,7 +1314,7 @@ async fn handle_proxies_delete(
     // Persist to disk
     if let Some(ref p) = state.store_path {
         let snapshot = state.proxy_config_store.read().await.clone();
-        crate::store::save_store(p, &snapshot);
+        crate::store::save_store(p, snapshot).await;
     }
     Json(serde_json::json!({
         "deleted": deleted.len(),

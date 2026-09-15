@@ -700,13 +700,11 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
             return;
         }
 
-        let client_msg_opt = {
-            let session_ref = nat_hole.sessions.read().await;
-            if let Some(s) = session_ref.get(&tid) {
-                s.client_msg.lock().await.take()
-            } else {
-                None
-            }
+        // Shard lookup clones the Arc and releases the shard lock before the
+        // per-session `client_msg` lock is awaited.
+        let client_msg_opt = match nat_hole.sessions.get(&tid).await {
+            Some(s) => s.client_msg.lock().await.take(),
+            None => None,
         };
         let client_msg = match client_msg_opt {
             Some(m) => m,
@@ -742,12 +740,14 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
         let analysis_index;
         let (v_resp, c_resp) = if let (Some(ref vf), Some(ref cf)) = (&v_feature, &c_feature) {
             let key = nathole_ctrl::gen_analysis_key(cf, vf, &client_mapped, &visitor_mapped);
-            {
-                let sessions = nat_hole.sessions.read().await;
-                if let Some(s) = sessions.get(&tid) {
+            // `with_session` keeps the shard read lock for this synchronous
+            // std-Mutex write (same window the old table read lock covered).
+            nat_hole
+                .sessions
+                .with_session(&tid, |s| {
                     *s.analysis_key.lock().unwrap_or_else(|e| e.into_inner()) = Some(key.clone());
-                }
-            }
+                })
+                .await;
             let (mode, index, c_behavior, v_behavior) =
                 nat_hole.analyzer.get_recommend_behaviors(&key, cf, vf);
             analysis_index = Some(index);
@@ -845,17 +845,16 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
         // (C15, C16). The accept-loop path stores these in
         // handlers.rs; the Go frp compat control-path did not,
         // so report_success always used index=0 with no features.
-        {
-            let sessions = nat_hole.sessions.read().await;
-            if let Some(s) = sessions.get(&tid) {
-                *s.v_resp.lock().await = Some(v_resp.clone());
-                *s.selected_index.lock().await = analysis_index;
-                if let Some(ref vf) = v_feature {
-                    *s.v_nat_feature.lock().await = Some(vf.clone());
-                }
-                if let Some(ref cf) = c_feature {
-                    *s.c_nat_feature.lock().await = Some(cf.clone());
-                }
+        // Shard lookup clones the Arc and releases the shard lock before the
+        // per-session locks below are awaited.
+        if let Some(s) = nat_hole.sessions.get(&tid).await {
+            *s.v_resp.lock().await = Some(v_resp.clone());
+            *s.selected_index.lock().await = analysis_index;
+            if let Some(ref vf) = v_feature {
+                *s.v_nat_feature.lock().await = Some(vf.clone());
+            }
+            if let Some(ref cf) = c_feature {
+                *s.c_nat_feature.lock().await = Some(cf.clone());
             }
         }
 
@@ -1092,10 +1091,8 @@ pub(crate) async fn handle_vnet_route_advertise(
         // Route-count cap: reject new keys once this client owns the cap.
         // Re-advertising an already-owned key stays allowed (normal update).
         if !routes.contains_key(&key) {
-            let owned = routes
-                .iter()
-                .filter(|(_, (rid, _))| rid == &ctx.run_id)
-                .count();
+            // Precomputed per-run_id route count — O(1), no table scan.
+            let owned = routes.run_route_count(&ctx.run_id);
             if owned >= MAX_VNET_ROUTES_PER_CLIENT {
                 warn!(
                     run_id = %ctx.run_id,
@@ -1161,13 +1158,31 @@ pub(crate) async fn handle_vnet_packet(
     _writer: &mut (impl AsyncWriteExt + Unpin),
     pkt: msg::VnetPacket,
 ) {
-    // Isolation: the packet's source run_id must be in the target route's
-    // virtual net, otherwise drop it (different virtual nets are isolated).
-    if !ctx
-        .state
-        .vnet_packet_source_allowed(&ctx.run_id, &pkt.proxy_name)
-        .await
-    {
+    // Isolation + visitor resolution in ONE read guard.
+    //
+    // Both answers come from the pre-grouped indexes on `VnetRoutes`
+    // (`source_allowed` = "source owns a route in some vnet where a route
+    // named `proxy_name` lives"; `visitor_route_target` = "smallest
+    // (vnet, run_id) owner of that name among the source's vnets"), so this
+    // is a handful of hash lookups with no clone of the table — the previous
+    // shape took the lock twice and scanned the table (O(n²)) per packet.
+    // The returned run_id is an `Arc<str>` refcount bump, so the visitor
+    // branch below clones nothing either.
+    //
+    // Snapshot note: the old code re-read the table after `proxy_manager.get`
+    // awaited, so the visitor target could reflect a route registered during
+    // that await. Using one coherent snapshot means such a race drops (or
+    // delivers) a single packet against a slightly earlier view — the same
+    // class of race, resolved consistently instead of split across two
+    // different table states.
+    let (source_allowed, visitor_target) = {
+        let routes = ctx.state.vnet_routes.read().await;
+        (
+            routes.source_allowed(&ctx.run_id, &pkt.proxy_name),
+            routes.visitor_route_target(&ctx.run_id, &pkt.proxy_name),
+        )
+    };
+    if !source_allowed {
         debug!(
             run_id = %ctx.run_id,
             proxy_name = %pkt.proxy_name,
@@ -1195,17 +1210,12 @@ pub(crate) async fn handle_vnet_packet(
                 });
             }
         }
-    } else {
-        let routes = ctx.state.vnet_routes.read().await;
-        if let Some(target_run_id) =
-            vnet_visitor_route_target_run_id(&routes, &ctx.run_id, &pkt.proxy_name)
-        {
-            if let Some(ctl_tx) = ctx.state.run_id_to_ctl_tx.get(&target_run_id) {
-                let _ = ctl_tx.tx.try_send(InternalMsg::VnetPacketForward {
-                    proxy_name: Arc::from(pkt.proxy_name.as_str()),
-                    data: Arc::from(pkt.data.as_str()),
-                });
-            }
+    } else if let Some(target_run_id) = visitor_target {
+        if let Some(ctl_tx) = ctx.state.run_id_to_ctl_tx.get(target_run_id.as_ref()) {
+            let _ = ctl_tx.tx.try_send(InternalMsg::VnetPacketForward {
+                proxy_name: Arc::from(pkt.proxy_name.as_str()),
+                data: Arc::from(pkt.data.as_str()),
+            });
         }
     }
 }
@@ -1223,9 +1233,8 @@ pub(crate) async fn handle_vnet_route_remove(
         let mut routes = ctx.state.vnet_routes.write().await;
         // Only the run_id that advertised the route may remove it. A stale or
         // replayed remove from an older control must not clobber a newer one.
-        let existed = routes.iter().any(|((vn_k, _), (run_id, name))| {
-            run_id == &ctx.run_id && vn_k == &vn && name == &rem.proxy_name
-        });
+        // Index lookup instead of a pre-scan of the table.
+        let existed = routes.has_route(&ctx.run_id, &vn, &rem.proxy_name);
         routes.retain(|(vn_k, _), (run_id, name)| {
             !(run_id == &ctx.run_id && vn_k == &vn && name == &rem.proxy_name)
         });
@@ -1244,36 +1253,10 @@ pub(crate) async fn handle_vnet_route_remove(
         .await;
 }
 
-/// Resolve the run_id that advertised `proxy_name` as a virtual_net visitor
-/// route reachable from `source_run_id`. Returns `None` when no such route
-/// exists. The candidate route must live in a virtual net the source
-/// participates in (the source owns at least one route in that vnet) — this
-/// mirrors `vnet_packet_source_allowed` so the isolation check and the actual
-/// target resolution can never disagree. Same-named visitors in other virtual
-/// nets are invisible to the source.
-#[cfg(feature = "vnet")]
-fn vnet_visitor_route_target_run_id(
-    routes: &std::collections::HashMap<(String, String), (String, String)>,
-    source_run_id: &str,
-    proxy_name: &str,
-) -> Option<String> {
-    // Pick deterministically: collect every qualifying candidate (the source
-    // owns a route in the candidate's vnet) and take the lexicographically
-    // smallest vnet. HashMap iteration order is process-dependent, so a plain
-    // `.find()` would make the choice nondeterministic when the source
-    // participates in several vnets that each advertise a same-named visitor.
-    routes
-        .iter()
-        .filter(|((vn, _), (_, name))| {
-            name == proxy_name
-                && routes
-                    .iter()
-                    .any(|((vn2, _), (rid2, _))| vn2 == vn && rid2 == source_run_id)
-        })
-        .map(|((vn, _), (run_id, _))| (vn.clone(), run_id.clone()))
-        .min()
-        .map(|(_, run_id)| run_id)
-}
+// Visitor route resolution now lives on `crate::state::VnetRoutes` as
+// `visitor_route_target` (pre-grouped `virtual_net → proxy_name → run_ids`
+// index instead of a nested table scan; see that method for the determinism
+// rule, which is unchanged: smallest (virtual_net, run_id) wins).
 
 #[cfg(test)]
 mod identity_binding_tests {
@@ -1327,9 +1310,9 @@ mod identity_binding_tests {
     #[cfg(feature = "vnet")]
     #[test]
     fn vnet_visitor_route_resolves_advertising_run_id() {
-        use std::collections::HashMap;
+        use crate::state::VnetRoutes;
 
-        let mut routes = HashMap::new();
+        let mut routes = VnetRoutes::new();
         routes.insert(
             (String::new(), "10.0.0.1/32".to_string()),
             ("run-a".to_string(), "vnet-visitor".to_string()),
@@ -1342,32 +1325,30 @@ mod identity_binding_tests {
         // The source owns a route in the default vnet, so same-vnet visitors
         // resolve; the target route itself counts as the source's membership.
         assert_eq!(
-            super::vnet_visitor_route_target_run_id(&routes, "run-a", "vnet-visitor"),
-            Some("run-a".to_string())
+            routes.visitor_route_target("run-a", "vnet-visitor"),
+            Some(std::sync::Arc::from("run-a"))
         );
         // Route advertisements from regular vnet proxies also appear in the
         // table; proxy_manager remains the primary resolver for those names.
         assert_eq!(
-            super::vnet_visitor_route_target_run_id(&routes, "run-b", "vnet-proxy-b"),
-            Some("run-b".to_string())
+            routes.visitor_route_target("run-b", "vnet-proxy-b"),
+            Some(std::sync::Arc::from("run-b"))
         );
         // A source with no route in the visitor's vnet cannot resolve it.
-        assert_eq!(
-            super::vnet_visitor_route_target_run_id(&routes, "run-z", "vnet-visitor"),
-            None
-        );
-        assert_eq!(
-            super::vnet_visitor_route_target_run_id(&routes, "run-a", "missing"),
-            None
-        );
+        assert_eq!(routes.visitor_route_target("run-z", "vnet-visitor"), None);
+        assert_eq!(routes.visitor_route_target("run-a", "missing"), None);
+        // The isolation gate must agree with the resolution above.
+        assert!(routes.source_allowed("run-a", "vnet-visitor"));
+        assert!(!routes.source_allowed("run-z", "vnet-visitor"));
+        assert!(!routes.source_allowed("run-a", "missing"));
     }
 
     #[cfg(feature = "vnet")]
     #[test]
     fn vnet_visitor_route_same_name_other_vnet_not_resolved() {
-        use std::collections::HashMap;
+        use crate::state::VnetRoutes;
 
-        let mut routes = HashMap::new();
+        let mut routes = VnetRoutes::new();
         // Same visitor name in two virtual nets, advertised by two run_ids.
         routes.insert(
             ("vnet-a".to_string(), "10.0.0.1/32".to_string()),
@@ -1385,22 +1366,21 @@ mod identity_binding_tests {
 
         // run-c must resolve the vnet-a visitor (run-a), never the vnet-b one.
         assert_eq!(
-            super::vnet_visitor_route_target_run_id(&routes, "run-c", "visitor"),
-            Some("run-a".to_string())
+            routes.visitor_route_target("run-c", "visitor"),
+            Some(std::sync::Arc::from("run-a"))
         );
+        assert!(routes.source_allowed("run-c", "visitor"));
         // A client with no route in either vnet cannot resolve it at all.
-        assert_eq!(
-            super::vnet_visitor_route_target_run_id(&routes, "run-z", "visitor"),
-            None
-        );
+        assert_eq!(routes.visitor_route_target("run-z", "visitor"), None);
+        assert!(!routes.source_allowed("run-z", "visitor"));
     }
 
     #[cfg(feature = "vnet")]
     #[test]
     fn vnet_visitor_route_deterministic_when_source_in_multiple_vnets() {
-        use std::collections::HashMap;
+        use crate::state::VnetRoutes;
 
-        let mut routes = HashMap::new();
+        let mut routes = VnetRoutes::new();
         // Same visitor name in two virtual nets, advertised by two run_ids.
         routes.insert(
             ("vnet-a".to_string(), "10.0.0.1/32".to_string()),
@@ -1426,8 +1406,8 @@ mod identity_binding_tests {
         // guards the determinism guarantee.
         for _ in 0..25 {
             assert_eq!(
-                super::vnet_visitor_route_target_run_id(&routes, "run-c", "visitor"),
-                Some("run-a".to_string())
+                routes.visitor_route_target("run-c", "visitor"),
+                Some(std::sync::Arc::from("run-a"))
             );
         }
     }

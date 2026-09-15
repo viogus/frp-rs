@@ -21,8 +21,8 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::YamuxSession;
 use frp_core::protocol::{
     read_msg_v1, read_msg_v2_udp_binary_socket, read_msg_v2_with_udp_codec, write_msg_v1,
-    write_msg_v2, write_msg_v2_with_udp_codec, write_v2_frame_raw, UdpBinaryRead,
-    V2_FRAME_TYPE_MESSAGE,
+    write_msg_v2, write_msg_v2_with_udp_codec, write_v1_frame_scratch, write_v2_frame_raw,
+    UdpBinaryRead, V2_FRAME_TYPE_MESSAGE,
 };
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
@@ -35,6 +35,11 @@ use crate::proxy_runtime::{ProxyPhase, ProxyRuntimeInfo};
 
 #[cfg(feature = "vnet")]
 type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;
+
+/// Per-proxy TUN delivery channels (shared type — `Arc<[u8]>` elements so a
+/// fanned-out packet is shared by refcount rather than copied per peer).
+#[cfg(feature = "vnet")]
+type VnetTunTxMap = crate::vnet::VnetTunTxMap;
 
 /// Maximum framed vnet message size, matching Go frp `maxMessageSize`.
 #[cfg(feature = "vnet")]
@@ -302,7 +307,7 @@ pub(crate) struct WorkConnConfig {
     #[cfg(feature = "vnet")]
     pub vnet_controller: Arc<frp_vnet::controller::ClientVnetController>,
     #[cfg(feature = "vnet")]
-    pub vnet_tun_tx: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+    pub vnet_tun_tx: VnetTunTxMap,
 }
 
 /// Bundled parameters for work connection transport acquisition.
@@ -1209,7 +1214,12 @@ async fn run_udp_work_conn(
         let mut local_udp_addr: Option<msg::UdpAddr> = Some(udp_addr_of(&local_addr));
         // Ping-pong scratch for the per-packet compress chain (per-session).
         let mut scratch_c: Vec<u8> = Vec::new();
-        // Reused binary-codec wire buffer: type ID + encoded packet.
+        // Reused binary-codec wire buffer: type ID + encoded packet. The V1
+        // JSON arm below shares it (the two arms are mutually exclusive per
+        // packet, and both writers clear it first), so the per-packet
+        // `serde_json` Vec allocation is gone on the V1 path too (perf audit
+        // TOP 2; `write_v1_frame_scratch` is byte-identical to
+        // `write_v1_frame`).
         let mut wire_scratch: Vec<u8> = Vec::new();
         // Per-remote IP-string cache. UDPPacket.remote_addr.ip is a String
         // (Go msg.UDPPacket.RemoteAddr parity), so the IpAddr would be
@@ -1281,9 +1291,15 @@ async fn run_udp_work_conn(
                         wire_scratch
                             .extend_from_slice(&msg::V2_TYPE_UDP_PACKET_BINARY.to_be_bytes());
                         let result =
-                            match frp_core::udp_binary::encode_udp_packet_binary_socket_addr(
+                            match frp_core::udp_binary::encode_udp_packet_binary_socket_addr_local(
                                 &payload,
-                                local_udp_addr.as_ref(),
+                                // Audit item 6: `local_addr` is the resolved
+                                // loop-invariant SocketAddr; encode it
+                                // straight from its octets — the per-datagram
+                                // ip String re-parse of the UdpAddr form is
+                                // gone (that form stays only for the JSON
+                                // arm below). Byte-identical output.
+                                Some(&local_addr),
                                 &remote,
                                 &mut wire_scratch,
                             ) {
@@ -1360,7 +1376,10 @@ async fn run_udp_work_conn(
                             )
                             .await
                         } else {
-                            write_msg_v1(&mut w_w, &pkt).await
+                            // V1 JSON: serialize into the loop's shared
+                            // scratch (`wire_scratch`) instead of letting the
+                            // writer allocate a fresh Vec per datagram.
+                            write_v1_frame_scratch(&mut w_w, &pkt, &mut wire_scratch).await
                         };
                         // Return the invariant UdpAddr for the next packet and
                         // hand the content buffer back to the session (P1) —
@@ -1433,7 +1452,7 @@ async fn run_virtual_net_plugin_work_conn(
     work: IoStream,
     proxy_name: String,
     vnet_controller: Arc<frp_vnet::controller::ClientVnetController>,
-    vnet_tun_tx: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+    vnet_tun_tx: VnetTunTxMap,
     use_encryption: bool,
     use_compression: bool,
     enc_key: [u8; 16],
@@ -1522,7 +1541,10 @@ async fn run_virtual_net_plugin_work_conn(
                                     registered_ips.push(src_ip);
                                 }
                             }
-                            if let Err(e) = reader_tun.try_send(packet) {
+                            // Single destination: the decoded Vec moves into
+                            // the shared buffer type (no copy on an exact-fit
+                            // allocation, one copy otherwise).
+                            if let Err(e) = reader_tun.try_send(Arc::from(packet)) {
                                 match e {
                                     mpsc::error::TrySendError::Full(_) => {
                                         warn!(
@@ -2717,7 +2739,7 @@ mod tests {
 
         let controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
         let tun_txs = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (tun_tx, mut tun_rx) = mpsc::channel::<Arc<[u8]>>(16);
         tun_txs
             .lock()
             .unwrap()
@@ -2742,7 +2764,7 @@ mod tests {
         framed.extend_from_slice(&(inbound.len() as u32).to_le_bytes());
         framed.extend_from_slice(&inbound);
         peer.write_all(&framed).await.unwrap();
-        assert_eq!(tun_rx.recv().await, Some(inbound.clone()));
+        assert_eq!(tun_rx.recv().await.as_deref(), Some(&inbound[..]));
 
         let src = std::net::IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1));
         let return_tx = controller
@@ -2774,7 +2796,7 @@ mod tests {
         let key = frp_core::encryption::derive_key("vnet-test-secret");
         let controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
         let tun_txs = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (tun_tx, mut tun_rx) = mpsc::channel::<Arc<[u8]>>(16);
         tun_txs
             .lock()
             .unwrap()
@@ -2803,7 +2825,7 @@ mod tests {
         frp_core::encryption::compress_into(&framed, &mut compressed).unwrap();
         let wire = frp_core::encryption::encrypt(&compressed, &key).unwrap();
         peer.write_all(&wire).await.unwrap();
-        assert_eq!(tun_rx.recv().await, Some(inbound.clone()));
+        assert_eq!(tun_rx.recv().await.as_deref(), Some(&inbound[..]));
 
         let src: IpAddr = "2001:db8::2".parse().unwrap();
         let return_tx = controller

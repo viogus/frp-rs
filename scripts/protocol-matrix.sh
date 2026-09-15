@@ -33,9 +33,16 @@ log() { echo "[matrix] $*"; }
 vlog() { $VERBOSE && echo "[matrix] $*" || true; }
 
 cleanup() {
-    # Kill any stragglers from an interrupted run.
-    for pid_file in "$TEST_DIR"/*.pid; do
-        [[ -f "$pid_file" ]] && kill "$(cat "$pid_file")" 2>/dev/null
+    # Kill any stragglers from an interrupted run. frps/frpc pid files live
+    # per-row under $TEST_DIR/<name>/, echo pid files at the top level.
+    # Guard on both file existence AND non-empty content: a zero-byte pid
+    # file would make `kill ""` fail on its first (invalid) argument and
+    # abort the whole command, leaking the remaining stragglers.
+    local pid_file pid
+    for pid_file in "$TEST_DIR"/*.pid "$TEST_DIR"/*/*.pid; do
+        [[ -f "$pid_file" ]] || continue
+        pid="$(cat "$pid_file" 2>/dev/null)" || continue
+        [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
     done
     rm -rf "$TEST_DIR"
 }
@@ -73,6 +80,25 @@ run_row() {
     local extra_port=$((base + 3))
     local row_dir="$TEST_DIR/$name"
     mkdir -p "$row_dir"
+
+    # Kill this row's processes on ANY exit path. A failed row that skips
+    # cleanup leaks frps/frpc/echo, and since the port block is derived from
+    # PASS + FAIL, the next run reuses the same ports and silently tests the
+    # leaked processes instead of its own (observed cascade: one failed row
+    # under load left stragglers that failed the same row in every later run).
+    kill_row_processes() {
+        # Build the pid list from files that EXIST: the first failure path
+        # runs before frpc is started (no frpc.pid yet), and bash's `kill`
+        # aborts the whole command on an invalid first argument — a single
+        # missing file used to leak frps AND echo on that path.
+        local f pid pids=()
+        for f in "$row_dir/frpc.pid" "$row_dir/frps.pid" "$TEST_DIR/echo-$echo_port.pid"; do
+            [[ -f "$f" ]] || continue
+            pid="$(cat "$f" 2>/dev/null)" || continue
+            [[ -n "$pid" ]] && pids+=("$pid")
+        done
+        ((${#pids[@]} > 0)) && kill "${pids[@]}" 2>/dev/null
+    }
 
     log "=== $name (proto=$proto tls=$tls mux=$mux) ==="
 
@@ -127,6 +153,7 @@ run_row() {
     RUST_LOG=warn "$FRPS_BIN" -c "$row_dir/frps.toml" > "$row_dir/frps.log" 2>&1 &
     echo $! > "$row_dir/frps.pid"
     wait_for_port 127.0.0.1 "$srv_port" 20 || {
+        kill_row_processes
         fail_row "$name" "frps did not start"
         return
     }
@@ -137,6 +164,7 @@ run_row() {
     # heavy) can take tens of seconds to start frps+frpc, do the TLS
     # handshake, and register the proxy.
     wait_for_port 127.0.0.1 "$proxy_port" 45 || {
+        kill_row_processes
         fail_row "$name" "proxy port not reachable"
         return
     }
@@ -162,12 +190,13 @@ run_row() {
         PASS=$((PASS + 1))
         log "PASS $name: $mbps MB/s"
     else
+        kill_row_processes
         fail_row "$name" "zero throughput (mbps=$mbps)"
         return
     fi
 
-    # Clean up this row's processes.
-    kill "$(cat "$row_dir/frpc.pid")" "$(cat "$row_dir/frps.pid")" "$(cat "$TEST_DIR/echo-$echo_port.pid")" 2>/dev/null
+    # Clean up this row's processes (same guarded path as every failure arm).
+    kill_row_processes
     rm -f "$row_dir/frpc.pid" "$row_dir/frps.pid" "$TEST_DIR/echo-$echo_port.pid"
     sleep 0.5
 }

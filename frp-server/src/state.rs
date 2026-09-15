@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use std::collections::HashMap;
 #[cfg(feature = "vnet")]
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{
     AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
@@ -28,7 +28,276 @@ use crate::tcpmux::TcpMuxManager;
 use crate::vhost::VhostManager;
 
 #[cfg(feature = "vnet")]
-type VnetRouteMap = Arc<RwLock<HashMap<(String, String), (String, String)>>>;
+type VnetRouteMap = Arc<RwLock<VnetRoutes>>;
+/// (virtual_net, run_id) ownership-tally key for [`VnetRoutes`].
+#[cfg(feature = "vnet")]
+type VnetRunCountKey = (Arc<str>, Arc<str>);
+/// (virtual_net, proxy_name, run_id) ownership-tally key for [`VnetRoutes`].
+#[cfg(feature = "vnet")]
+type VnetNameCountKey = (Arc<str>, Arc<str>, Arc<str>);
+
+/// Virtual-net route table: the authoritative flat map plus derived indexes.
+///
+/// The authoritative map is `(virtual_net, subnet) -> (run_id, proxy_name)`.
+/// Without the derived indexes every `VnetPacket` had to scan (and clone) the
+/// whole table twice — once for the isolation gate and once to resolve a
+/// visitor route — which is O(routes) per packet and O(routes^2) for the
+/// visitor resolution. The indexes below are pre-grouped at registration
+/// (they are maintained by the inherent [`VnetRoutes::insert`] /
+/// [`VnetRoutes::retain`]) so the send path resolves both questions with a
+/// couple of hash lookups and no allocation.
+///
+/// Reads are served through `Deref` to the flat map, so iteration/lookup call
+/// sites are unchanged.
+///
+/// Index shapes:
+/// - `vnet_members`: virtual_net → run_ids owning at least one route there
+///   (membership / broadcast-scope)
+/// - `run_vnets`: run_id → virtual nets it owns routes in (isolation gate)
+/// - `run_route_counts`: run_id → owned route count (per-client cap, O(1))
+/// - `vnet_names`: virtual_net → proxy_name → run_ids advertising that name
+///   (visitor route resolution)
+/// - `vnet_run_counts` / `vnet_name_counts`: per-owner route tallies backing
+///   the shared set entries above — a set entry leaves only when the count
+///   for its (vnet, run_id) / (vnet, name, run_id) hits zero, since one
+///   run_id can own several routes that share them
+///
+/// Determinism note: `run_vnets` holds `BTreeSet<String>` and `vnet_names`
+/// holds `BTreeSet<Arc<str>>`, so resolution picks the smallest virtual net
+/// and then the smallest run_id — the exact `min()` order the previous
+/// nested-scan implementation used, but independent of hash order.
+#[cfg(feature = "vnet")]
+#[derive(Debug, Default)]
+pub struct VnetRoutes {
+    routes: HashMap<(String, String), (String, String)>,
+    /// virtual_net → run_ids owning at least one route in it.
+    vnet_members: HashMap<String, HashSet<Arc<str>>>,
+    /// run_id → virtual nets the run_id owns routes in.
+    run_vnets: HashMap<Arc<str>, BTreeSet<String>>,
+    /// run_id → number of routes owned (per-client route cap check).
+    run_route_counts: HashMap<Arc<str>, usize>,
+    /// virtual_net → proxy_name → run_ids advertising that name.
+    vnet_names: HashMap<String, HashMap<String, BTreeSet<Arc<str>>>>,
+    /// (virtual_net, run_id) → routes the run_id owns in that vnet. A run_id
+    /// can own several subnets in one vnet, so `vnet_members` / `run_vnets`
+    /// entries are shared across routes and leave only when this count hits
+    /// zero — not on the first unindex.
+    vnet_run_counts: HashMap<VnetRunCountKey, usize>,
+    /// (virtual_net, proxy_name, run_id) → routes the run_id owns with that
+    /// name; drives the shared `vnet_names` owner-set removal the same way.
+    vnet_name_counts: HashMap<VnetNameCountKey, usize>,
+}
+
+#[cfg(feature = "vnet")]
+impl VnetRoutes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert or update a route. The derived indexes are updated incrementally
+    /// (never rebuilt) so this stays cheap on the registration path.
+    pub fn insert(
+        &mut self,
+        key: (String, String),
+        value: (String, String),
+    ) -> Option<(String, String)> {
+        if let Some((old_run_id, old_proxy)) = self.routes.get(&key) {
+            // Drop the displaced route's index entries first: the same
+            // (vnet, subnet) key re-registered by a different run_id (a
+            // dead-owner takeover) must not leave the old owner indexed.
+            let (old_run_id, old_proxy) = (old_run_id.clone(), old_proxy.clone());
+            self.unindex(&key.0, &old_run_id, &old_proxy);
+        }
+        self.index(&key.0, &value.0, &value.1);
+        self.routes.insert(key, value)
+    }
+
+    /// Retain only the routes matching `f`, dropping the index entries of the
+    /// routes that leave. Only the removed entries are cloned, so a retain
+    /// that removes nothing (or one route) costs what the flat map costs and
+    /// the indexes stay exact — no full rebuild.
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&(String, String), &(String, String)) -> bool,
+    {
+        let mut removed: Vec<((String, String), (String, String))> = Vec::new();
+        self.routes.retain(|k, v| {
+            if f(k, v) {
+                true
+            } else {
+                removed.push((k.clone(), v.clone()));
+                false
+            }
+        });
+        for ((vnet, _), (run_id, proxy_name)) in removed {
+            self.unindex(&vnet, &run_id, &proxy_name);
+        }
+    }
+
+    /// Whether `run_id` owns a route with this (virtual_net, proxy_name).
+    pub fn has_route(&self, run_id: &str, vnet: &str, proxy_name: &str) -> bool {
+        self.vnet_names
+            .get(vnet)
+            .and_then(|names| names.get(proxy_name))
+            .is_some_and(|owners| owners.contains(run_id))
+    }
+
+    /// Number of routes owned by `run_id` across every virtual net.
+    pub fn run_route_count(&self, run_id: &str) -> usize {
+        self.run_route_counts.get(run_id).copied().unwrap_or(0)
+    }
+
+    /// Run_ids owning at least one route in `vnet`.
+    pub fn vnet_members_of(&self, vnet: &str) -> Option<&HashSet<Arc<str>>> {
+        self.vnet_members.get(vnet)
+    }
+
+    /// Isolation gate: whether `run_id` may address `proxy_name` — that is,
+    /// whether some virtual net holds both a route owned by `run_id` and a
+    /// route named `proxy_name`.
+    pub fn source_allowed(&self, run_id: &str, proxy_name: &str) -> bool {
+        self.run_vnets.get(run_id).is_some_and(|vnets| {
+            vnets.iter().any(|vnet| {
+                self.vnet_names
+                    .get(vnet)
+                    .is_some_and(|names| names.contains_key(proxy_name))
+            })
+        })
+    }
+
+    /// Resolve the run_id that advertised `proxy_name` as a virtual_net
+    /// visitor route reachable from `source_run_id`, or `None` when no such
+    /// route exists. The candidate route must live in a virtual net the source
+    /// participates in (owns at least one route), mirroring
+    /// [`Self::source_allowed`] so the isolation gate and the target
+    /// resolution can never disagree.
+    ///
+    /// Deterministic: the smallest (virtual_net, run_id) pair wins, matching
+    /// the previous `.min()` over cloned candidates.
+    ///
+    /// Allocation-free on the hit path — the returned `Arc<str>` is a
+    /// refcount bump of the indexed run_id.
+    pub fn visitor_route_target(&self, source_run_id: &str, proxy_name: &str) -> Option<Arc<str>> {
+        let vnets = self.run_vnets.get(source_run_id)?;
+        let mut best: Option<(&String, &Arc<str>)> = None;
+        for vnet in vnets {
+            let Some(owner) = self
+                .vnet_names
+                .get(vnet)
+                .and_then(|names| names.get(proxy_name))
+                .and_then(|owners| owners.iter().next())
+            else {
+                continue;
+            };
+            if best.is_none_or(|(best_vnet, _)| vnet < best_vnet) {
+                best = Some((vnet, owner));
+            }
+        }
+        best.map(|(_, owner)| owner.clone())
+    }
+
+    /// Add one route's index entries.
+    fn index(&mut self, vnet: &str, run_id: &str, proxy_name: &str) {
+        let rid: Arc<str> = Arc::from(run_id);
+        let vnet_a: Arc<str> = Arc::from(vnet);
+        self.vnet_members
+            .entry(vnet.to_string())
+            .or_default()
+            .insert(rid.clone());
+        self.run_vnets
+            .entry(rid.clone())
+            .or_default()
+            .insert(vnet.to_string());
+        *self.run_route_counts.entry(rid.clone()).or_default() += 1;
+        self.vnet_names
+            .entry(vnet.to_string())
+            .or_default()
+            .entry(proxy_name.to_string())
+            .or_default()
+            .insert(rid.clone());
+        *self
+            .vnet_run_counts
+            .entry((vnet_a.clone(), rid.clone()))
+            .or_default() += 1;
+        *self
+            .vnet_name_counts
+            .entry((vnet_a, Arc::from(proxy_name), rid))
+            .or_default() += 1;
+    }
+
+    /// Remove one route's index entries (inverse of [`Self::index`]).
+    fn unindex(&mut self, vnet: &str, run_id: &str, proxy_name: &str) {
+        let rid: Arc<str> = Arc::from(run_id);
+        let vnet_a: Arc<str> = Arc::from(vnet);
+
+        // A run_id can own several subnets in one vnet and several
+        // same-named routes: the member / vnet / name-set entries are shared
+        // across routes, so each leaves only when the LAST route it covers
+        // does. The per-route count entry always decrements.
+        let vr_key = (vnet_a.clone(), rid.clone());
+        let last_in_vnet = match self.vnet_run_counts.get_mut(&vr_key) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                *count == 0
+            }
+            None => false,
+        };
+        if last_in_vnet {
+            self.vnet_run_counts.remove(&vr_key);
+            if let Some(members) = self.vnet_members.get_mut(vnet) {
+                members.remove(run_id);
+                if members.is_empty() {
+                    self.vnet_members.remove(vnet);
+                }
+            }
+            if let Some(vnets) = self.run_vnets.get_mut(run_id) {
+                vnets.remove(vnet);
+                if vnets.is_empty() {
+                    self.run_vnets.remove(run_id);
+                }
+            }
+        }
+
+        let nk = (vnet_a, Arc::from(proxy_name), rid.clone());
+        let last_with_name = match self.vnet_name_counts.get_mut(&nk) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                *count == 0
+            }
+            None => false,
+        };
+        if last_with_name {
+            self.vnet_name_counts.remove(&nk);
+            if let Some(names) = self.vnet_names.get_mut(vnet) {
+                if let Some(owners) = names.get_mut(proxy_name) {
+                    owners.remove(run_id);
+                    if owners.is_empty() {
+                        names.remove(proxy_name);
+                    }
+                }
+                if names.is_empty() {
+                    self.vnet_names.remove(vnet);
+                }
+            }
+        }
+
+        if let Some(count) = self.run_route_counts.get_mut(run_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.run_route_counts.remove(run_id);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "vnet")]
+impl std::ops::Deref for VnetRoutes {
+    type Target = HashMap<(String, String), (String, String)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.routes
+    }
+}
 
 // ---------------------------------------------------------------
 // Shared state for cross-task communication
@@ -563,17 +832,33 @@ pub(crate) struct HttpGroup {
 }
 
 pub(crate) struct HttpGroupController {
-    /// Keyed by (group name, is_https): Go keeps HTTP and HTTPS groups in
-    /// separate controllers, so the same group NAME may exist in both kinds
-    /// at once (server/group/http.go + https.go, wired in server/service.go
-    /// on the httpVhostRouter and the httpsMuxer respectively).
-    groups: RwLock<HashMap<(String, bool), Arc<HttpGroup>>>,
+    /// HTTP-kind groups, keyed by group name. Go keeps HTTP and HTTPS groups
+    /// in separate controllers, so the same group NAME may exist in both
+    /// kinds at once (server/group/http.go + https.go, wired in
+    /// server/service.go on the httpVhostRouter and the httpsMuxer
+    /// respectively) — mirrored here as one map per kind rather than one map
+    /// keyed by a `(name, is_https)` tuple, which allocated a String on every
+    /// lookup (audit §3 item 7; the sibling TcpMuxGroupController is already
+    /// a plain `RwLock<HashMap<String, Arc<..>>>`).
+    http_groups: RwLock<HashMap<String, Arc<HttpGroup>>>,
+    /// HTTPS-kind groups, keyed by group name.
+    https_groups: RwLock<HashMap<String, Arc<HttpGroup>>>,
 }
 
 impl HttpGroupController {
     pub fn new() -> Self {
         Self {
-            groups: RwLock::new(HashMap::new()),
+            http_groups: RwLock::new(HashMap::new()),
+            https_groups: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// The kind registry a lookup should consult (Go's per-muxer controller).
+    fn kind_groups(&self, is_https: bool) -> &RwLock<HashMap<String, Arc<HttpGroup>>> {
+        if is_https {
+            &self.https_groups
+        } else {
+            &self.http_groups
         }
     }
 
@@ -600,8 +885,8 @@ impl HttpGroupController {
         route_by_http_user: &str,
         proxy_name: &str,
     ) -> Result<(Arc<HttpGroup>, bool), String> {
-        let mut groups = self.groups.write().await;
-        if let Some(g) = groups.get(&(group.to_string(), false)) {
+        let mut groups = self.http_groups.write().await;
+        if let Some(g) = groups.get(group) {
             // Existing http-kind group: validate the routing params (Go
             // ErrGroupParamsInvalid).
             if g.domain != domain
@@ -629,7 +914,7 @@ impl HttpGroupController {
             index: AtomicU64::new(0),
             route_owner: proxy_name.to_string(),
         });
-        groups.insert((group.to_string(), false), g.clone());
+        groups.insert(group.to_string(), g.clone());
         Ok((g, true))
     }
 
@@ -652,8 +937,8 @@ impl HttpGroupController {
         domain: &str,
         proxy_name: &str,
     ) -> Result<(Arc<HttpGroup>, bool), String> {
-        let mut groups = self.groups.write().await;
-        if let Some(g) = groups.get(&(group.to_string(), true)) {
+        let mut groups = self.https_groups.write().await;
+        if let Some(g) = groups.get(group) {
             // Go HTTPSGroup.Listen (https.go): route config in the same
             // group must be equal — and ONLY the domain is part of it.
             if g.domain != domain {
@@ -677,7 +962,7 @@ impl HttpGroupController {
             index: AtomicU64::new(0),
             route_owner: proxy_name.to_string(),
         });
-        groups.insert((group.to_string(), true), g.clone());
+        groups.insert(group.to_string(), g.clone());
         Ok((g, true))
     }
 
@@ -693,9 +978,8 @@ impl HttpGroupController {
         proxy_name: &str,
         is_https: bool,
     ) -> Option<String> {
-        let mut groups = self.groups.write().await;
-        let key = (group.to_string(), is_https);
-        let g = groups.get(&key)?;
+        let mut groups = self.kind_groups(is_https).write().await;
+        let g = groups.get(group)?;
         let empty = {
             let mut members = g.members.write().await;
             members.retain(|m| m != proxy_name);
@@ -703,7 +987,7 @@ impl HttpGroupController {
         };
         if empty {
             let owner = g.route_owner.clone();
-            groups.remove(&key);
+            groups.remove(group);
             Some(owner)
         } else {
             None
@@ -714,8 +998,15 @@ impl HttpGroupController {
     /// HTTPSGroup listener dispatch). Returns None when the group has no
     /// members. `is_https` selects the kind registry.
     pub async fn choose_endpoint(&self, group: &str, is_https: bool) -> Option<String> {
-        let groups = self.groups.read().await;
-        let g = groups.get(&(group.to_string(), is_https))?;
+        // Clone the Arc out and drop the registry read guard before taking
+        // the members lock (audit §3 item 7): the registry lock used to be
+        // held across the nested `members.read()`. The Arc keeps the group
+        // alive for the duration, so a concurrent removal (which needs the
+        // registry WRITE lock) cannot tear it down mid-pick.
+        let g = {
+            let groups = self.kind_groups(is_https).read().await;
+            Arc::clone(groups.get(group)?)
+        };
         let members = g.members.read().await;
         if members.is_empty() {
             return None;
@@ -1351,7 +1642,7 @@ impl AppState {
             active_connections: AtomicU64::new(0),
             pool: PoolMetrics::default(),
             #[cfg(feature = "vnet")]
-            vnet_routes: Arc::new(RwLock::new(HashMap::new())),
+            vnet_routes: Arc::new(RwLock::new(VnetRoutes::new())),
             server_config_snapshot,
             #[cfg(feature = "dashboard")]
             event_tx: broadcast::channel(1024).0,
@@ -1612,23 +1903,34 @@ impl AppState {
     /// Senders for every online control (other than `exclude_run_id`) that has
     /// at least one route in `vnet`. Used to scope vnet route broadcasts to
     /// peers on the same virtual net.
+    ///
+    /// Reads the pre-grouped membership index — no table scan. The member ids
+    /// are cloned under the routes guard and the guard is DROPPED before the
+    /// `run_id_to_ctl_tx` shard lookups: holding it across N DashMap lookups
+    /// created a vnet_routes→DashMap-shard lock-order edge (audit review LOW).
     async fn control_txs_in_vnet(
         &self,
         exclude_run_id: &str,
         vnet: &str,
     ) -> Vec<mpsc::Sender<InternalMsg>> {
-        let mut run_ids: HashSet<String> = HashSet::new();
-        {
+        let member_ids: Vec<String> = {
             let routes = self.vnet_routes.read().await;
-            for ((vn, _), (rid, _)) in routes.iter() {
-                if vn == vnet && rid != exclude_run_id {
-                    run_ids.insert(rid.clone());
-                }
+            match routes.vnet_members_of(vnet) {
+                Some(members) => members
+                    .iter()
+                    .filter(|rid| rid.as_ref() != exclude_run_id)
+                    .map(|rid| rid.to_string())
+                    .collect(),
+                None => return Vec::new(),
             }
-        }
-        run_ids
+        };
+        member_ids
             .iter()
-            .filter_map(|rid| self.run_id_to_ctl_tx.get(rid).map(|ctl| ctl.tx.clone()))
+            .filter_map(|rid| {
+                self.run_id_to_ctl_tx
+                    .get(rid.as_str())
+                    .map(|ctl| ctl.tx.clone())
+            })
             .collect()
     }
 
@@ -1674,23 +1976,14 @@ impl AppState {
     /// virtual net (i.e. it must own at least one route in that vnet). Unknown
     /// target routes are denied — drop by default. Different virtual nets have
     /// isolated routing tables (design spec).
+    ///
+    /// Thin wrapper over [`VnetRoutes::source_allowed`]; the packet hot path
+    /// (control/nathole.rs `handle_vnet_packet`) reads the table directly so it
+    /// can answer this and the visitor-route resolution from one lock guard.
+    #[cfg(test)]
     pub(crate) async fn vnet_packet_source_allowed(&self, run_id: &str, proxy_name: &str) -> bool {
         let routes = self.vnet_routes.read().await;
-        // Existence check: the source is allowed iff there is *some* virtual
-        // net in which both the source has a route and the target route lives.
-        // (A multi-homed proxy may be reached by members of any of its vnets;
-        // a `find`-then-verify would depend on HashMap iteration order.)
-        // Single-pass variant for the per-packet hot path: collect the virtual
-        // nets the source participates in, then verify the target route lives
-        // in one of them — O(n) instead of the previous O(n²) nested scan.
-        let source_vnets: std::collections::HashSet<&String> = routes
-            .iter()
-            .filter(|(_, (rid, _))| rid == run_id)
-            .map(|((vn, _), _)| vn)
-            .collect();
-        routes
-            .iter()
-            .any(|((vn, _), (_, name))| name == proxy_name && source_vnets.contains(vn))
+        routes.source_allowed(run_id, proxy_name)
     }
 }
 
@@ -1918,6 +2211,294 @@ mod tests {
         assert!(!state.vnet_packet_source_allowed("run-b", "target-c").await);
         // Unknown target routes are denied.
         assert!(!state.vnet_packet_source_allowed("run-a", "missing").await);
+    }
+
+    // --- VnetRoutes index tests (TOP-4: pre-grouped route table) ---
+
+    #[cfg(feature = "vnet")]
+    type FlatRoutes = HashMap<(String, String), (String, String)>;
+
+    /// Reference implementation of the visitor resolution, with the original
+    /// nested-scan semantics (the code the pre-grouped index replaced).
+    #[cfg(feature = "vnet")]
+    fn reference_visitor_route_target(
+        routes: &FlatRoutes,
+        source_run_id: &str,
+        proxy_name: &str,
+    ) -> Option<String> {
+        routes
+            .iter()
+            .filter(|((vn, _), (_, name))| {
+                name == proxy_name
+                    && routes
+                        .iter()
+                        .any(|((vn2, _), (rid2, _))| vn2 == vn && rid2 == source_run_id)
+            })
+            .map(|((vn, _), (run_id, _))| (vn.clone(), run_id.clone()))
+            .min()
+            .map(|(_, run_id)| run_id)
+    }
+
+    /// Reference implementation of the isolation gate (original two-pass
+    /// scan).
+    #[cfg(feature = "vnet")]
+    fn reference_source_allowed(routes: &FlatRoutes, run_id: &str, proxy_name: &str) -> bool {
+        let source_vnets: HashSet<&String> = routes
+            .iter()
+            .filter(|(_, (rid, _))| rid == run_id)
+            .map(|((vn, _), _)| vn)
+            .collect();
+        routes
+            .iter()
+            .any(|((vn, _), (_, name))| name == proxy_name && source_vnets.contains(vn))
+    }
+
+    /// Exhaustively compare every derived index against the reference
+    /// implementations over the current flat table: route counts, per-route
+    /// existence, vnet membership, the isolation gate and the visitor target
+    /// resolution — for every known run_id / vnet / proxy_name plus one
+    /// unknown of each.
+    #[cfg(feature = "vnet")]
+    fn assert_indexes_match_reference(routes: &VnetRoutes) {
+        let flat: FlatRoutes = routes.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        let mut run_ids: Vec<String> = flat.values().map(|(r, _)| r.clone()).collect();
+        run_ids.sort();
+        run_ids.dedup();
+        run_ids.push("run-absent".to_string());
+        let mut names: Vec<String> = flat.values().map(|(_, n)| n.clone()).collect();
+        names.sort();
+        names.dedup();
+        names.push("name-absent".to_string());
+        let mut vnets: Vec<String> = flat.keys().map(|(v, _)| v.clone()).collect();
+        vnets.sort();
+        vnets.dedup();
+        // A vnet key whose routes were all removed must behave as empty
+        // against every index — the count maps drop their keys at zero and
+        // absent = empty everywhere (audit review NIT).
+        vnets.push("vnet-absent".to_string());
+
+        for run_id in &run_ids {
+            let expected_count = flat.values().filter(|(r, _)| r == run_id).count();
+            assert_eq!(
+                routes.run_route_count(run_id),
+                expected_count,
+                "route count for {run_id}"
+            );
+
+            for vnet in &vnets {
+                let expected_members: Vec<String> = {
+                    let mut m: Vec<String> = flat
+                        .iter()
+                        .filter(|((v, _), _)| v == vnet)
+                        .map(|(_, (r, _))| r.clone())
+                        .collect();
+                    m.sort();
+                    m.dedup();
+                    m
+                };
+                let actual_members: Vec<String> = match routes.vnet_members_of(vnet) {
+                    Some(m) => {
+                        let mut m: Vec<String> = m.iter().map(|r| r.to_string()).collect();
+                        m.sort();
+                        m
+                    }
+                    // An empty member set is dropped from the index
+                    // (absent = empty).
+                    None => Vec::new(),
+                };
+                assert_eq!(actual_members, expected_members, "members of {vnet:?}");
+
+                for name in &names {
+                    let expected_has = flat
+                        .iter()
+                        .any(|((v, _), (r, n))| v == vnet && r == run_id && n == name);
+                    assert_eq!(
+                        routes.has_route(run_id, vnet, name),
+                        expected_has,
+                        "has_route({run_id}, {vnet:?}, {name})"
+                    );
+                }
+            }
+
+            for name in &names {
+                assert_eq!(
+                    routes.source_allowed(run_id, name),
+                    reference_source_allowed(&flat, run_id, name),
+                    "source_allowed({run_id}, {name})"
+                );
+                assert_eq!(
+                    routes.visitor_route_target(run_id, name).as_deref(),
+                    reference_visitor_route_target(&flat, run_id, name).as_deref(),
+                    "visitor_route_target({run_id}, {name})"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "vnet")]
+    #[test]
+    fn vnet_routes_index_matches_reference_across_insert_and_remove() {
+        let mut routes = VnetRoutes::new();
+        // Two vnets, a multi-homed client, a same-named visitor in both vnets,
+        // and a same-subnet key in two different vnets.
+        routes.insert(
+            ("vnet-a".to_string(), "10.0.0.0/24".to_string()),
+            ("run-a".to_string(), "peer-a".to_string()),
+        );
+        routes.insert(
+            ("vnet-a".to_string(), "10.99.0.0/24".to_string()),
+            ("run-c".to_string(), "peer-a".to_string()), // same name, other run
+        );
+        routes.insert(
+            ("vnet-b".to_string(), "10.0.0.0/24".to_string()),
+            ("run-a".to_string(), "peer-b".to_string()),
+        );
+        routes.insert(
+            ("vnet-b".to_string(), "10.1.0.0/24".to_string()),
+            ("run-b".to_string(), "visitor".to_string()),
+        );
+        routes.insert(
+            ("vnet-a".to_string(), "10.2.0.0/24".to_string()),
+            ("run-b".to_string(), "visitor".to_string()),
+        );
+        // Default net (empty virtual_net) is a real key, not a wildcard.
+        routes.insert(
+            (String::new(), "10.3.0.0/24".to_string()),
+            ("run-d".to_string(), "peer-d".to_string()),
+        );
+        assert_indexes_match_reference(&routes);
+        // run-a advertises "peer-a" in vnet-a (run-c does too) and run-a is
+        // itself the source here. The pre-index min() scan never excluded the
+        // source's own route, so the smallest (vnet, run_id) candidate is
+        // (vnet-a, run-a): self-target parity pinned.
+        assert_eq!(
+            routes.visitor_route_target("run-a", "peer-a").as_deref(),
+            Some("run-a")
+        );
+
+        // Remove one route of a run_id that still owns others, then a whole
+        // vnet's worth, then everything.
+        routes.retain(|_, (run_id, _)| run_id != "run-c");
+        assert_indexes_match_reference(&routes);
+        assert_eq!(routes.run_route_count("run-c"), 0);
+        assert!(!routes.has_route("run-c", "vnet-a", "peer-a"));
+        assert!(!routes.source_allowed("run-c", "peer-a"));
+        assert_eq!(routes.visitor_route_target("run-c", "peer-a"), None);
+
+        routes.retain(|(vnet, _), _| vnet != "vnet-a");
+        assert_indexes_match_reference(&routes);
+        assert!(routes.vnet_members_of("vnet-a").is_none());
+        assert!(!routes.has_route("run-a", "vnet-a", "peer-a"));
+        // run-a survives in vnet-b.
+        assert!(routes.has_route("run-a", "vnet-b", "peer-b"));
+        assert_eq!(routes.run_route_count("run-a"), 1);
+
+        routes.retain(|_, _| false);
+        assert_indexes_match_reference(&routes);
+        assert!(routes.is_empty());
+        assert_eq!(routes.run_route_count("run-a"), 0);
+        assert!(routes.visitor_route_target("run-a", "peer-a").is_none());
+    }
+
+    #[cfg(feature = "vnet")]
+    #[test]
+    fn vnet_routes_index_handles_takeover_and_name_change() {
+        let mut routes = VnetRoutes::new();
+        routes.insert(
+            ("vnet-a".to_string(), "10.0.0.0/24".to_string()),
+            ("run-old".to_string(), "proxy-old".to_string()),
+        );
+        routes.insert(
+            ("vnet-a".to_string(), "10.0.1.0/24".to_string()),
+            ("run-old".to_string(), "proxy-old".to_string()),
+        );
+        assert_eq!(routes.run_route_count("run-old"), 2);
+
+        // Dead-owner takeover: the same (vnet, subnet) key re-registered by a
+        // different run_id must move every index entry of THAT key to the new
+        // owner — the stale owner must not keep counting the key. Its OTHER
+        // routes (same vnet, same name) keep their shared index entries.
+        let previous = routes.insert(
+            ("vnet-a".to_string(), "10.0.0.0/24".to_string()),
+            ("run-new".to_string(), "proxy-new".to_string()),
+        );
+        assert_eq!(
+            previous,
+            Some(("run-old".to_string(), "proxy-old".to_string())),
+            "insert must return the displaced value (HashMap contract)"
+        );
+        assert_indexes_match_reference(&routes);
+        assert_eq!(routes.run_route_count("run-old"), 1);
+        assert_eq!(routes.run_route_count("run-new"), 1);
+        // run-old still owns ("vnet-a", "10.0.1.0/24") under "proxy-old", so
+        // its member and name entries survive the takeover.
+        assert!(routes.has_route("run-old", "vnet-a", "proxy-old"));
+        assert!(routes.has_route("run-new", "vnet-a", "proxy-new"));
+        assert_eq!(
+            routes
+                .visitor_route_target("run-new", "proxy-new")
+                .as_deref(),
+            Some("run-new")
+        );
+        // "proxy-old" is still advertised (by run-old) in the vnet run-new
+        // participates in.
+        assert_eq!(
+            routes
+                .visitor_route_target("run-new", "proxy-old")
+                .as_deref(),
+            Some("run-old")
+        );
+
+        // Name change on the same key by the same run_id: the old proxy_name
+        // must vanish from the name index.
+        routes.insert(
+            ("vnet-a".to_string(), "10.0.1.0/24".to_string()),
+            ("run-old".to_string(), "renamed".to_string()),
+        );
+        assert_indexes_match_reference(&routes);
+        assert_eq!(routes.run_route_count("run-old"), 1);
+        assert!(!routes.has_route("run-old", "vnet-a", "proxy-old"));
+        assert!(routes.has_route("run-old", "vnet-a", "renamed"));
+        assert_eq!(
+            routes.visitor_route_target("run-old", "renamed").as_deref(),
+            Some("run-old")
+        );
+        assert_eq!(routes.visitor_route_target("run-old", "proxy-old"), None);
+
+        // Removing the last route of a vnet drops the vnet's member set.
+        routes.retain(|(vnet, subnet), _| !(vnet == "vnet-a" && subnet == "10.0.1.0/24"));
+        assert_indexes_match_reference(&routes);
+        assert_eq!(routes.run_route_count("run-old"), 0);
+        assert!(routes.vnet_members_of("vnet-a").is_some()); // run-new still there
+        routes.retain(|_, _| false);
+        assert!(routes.vnet_members_of("vnet-a").is_none());
+    }
+
+    #[cfg(feature = "vnet")]
+    #[test]
+    fn vnet_routes_cap_count_survives_large_table() {
+        // The per-client cap check is an O(1) counter now; pin that it tracks
+        // a table far larger than the cap and stays correct after removals.
+        let mut routes = VnetRoutes::new();
+        for i in 0..300u32 {
+            let run = format!("run-{}", i % 3);
+            routes.insert(
+                (
+                    "vnet-a".to_string(),
+                    format!("10.{}.{}.0/24", i / 256, i % 256),
+                ),
+                (run, format!("proxy-{i}")),
+            );
+        }
+        assert_eq!(routes.run_route_count("run-0"), 100);
+        assert_eq!(routes.run_route_count("run-1"), 100);
+        assert_eq!(routes.run_route_count("run-2"), 100);
+        assert_indexes_match_reference(&routes);
+        routes.retain(|_, (run_id, _)| run_id != "run-1");
+        assert_indexes_match_reference(&routes);
+        assert_eq!(routes.run_route_count("run-1"), 0);
+        assert_eq!(routes.len(), 200);
     }
 
     // --- ReplayTable tests (F3/F4) ---

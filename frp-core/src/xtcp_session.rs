@@ -601,6 +601,20 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ReadActivity<S>
 /// INDIVIDUAL open request instead. Go's fatedier fork has no stream cap and
 /// fails per-open; the vendored inbound path already RSTs per-stream at the
 /// cap, and this mirror gives the outbound direction the same survival.
+/// Which event woke the tunnel driver's `select!` when the connection poll
+/// produced no event of its own: a queued open-stream request (`Open`) or the
+/// tick timer (`Tick`). Both used to arrive as one `None` (open wake) /
+/// `Err(Elapsed)` (timer) pair out of the `timeout`-wrapped poll; the driver
+/// still needs them apart, because they take different adaptive-tick
+/// decisions.
+#[cfg(feature = "tcp-mux")]
+enum DriverWake {
+    /// An open request was queued by `open_stream` between driver passes.
+    Open,
+    /// The tick timer elapsed with no I/O event.
+    Tick,
+}
+
 #[cfg(feature = "tcp-mux")]
 fn spawn_tunnel_driver<T>(
     mut conn: yamux::Connection<T>,
@@ -676,6 +690,22 @@ where
         // driver immediately via the poll wakers — the idle tick only paces
         // the nothing-at-all case.
         let mut tick_ms = tick_ms;
+        // Persistent tick timer (round-18 perf): the former shape wrapped the
+        // I/O poll in `tokio::time::timeout(Duration::from_millis(tick_ms), ..)`
+        // — a fresh `Sleep` (timer entry allocated, registered, deregistered)
+        // on EVERY loop pass, i.e. up to 100 timer registrations per second on
+        // an active tunnel and one per idle wake. One `Sleep` now lives for
+        // the whole session and is reset only when the adaptive tick length
+        // actually changes (or after it has fired), so steady-state ticks cost
+        // a single poll of an already-armed timer. The I/O poll moved to its
+        // own `select!` arm with the timer as a sibling arm, which is the same
+        // race the timeout wrapper produced: whichever resolves first wins,
+        // the loser is dropped, and the tick arm only fires when the tick
+        // length elapses with no I/O event (the arm that ran previously is
+        // reported by `DriverWake` so the adaptive fast/idle decision below is
+        // unchanged).
+        let mut tick_sleep = Box::pin(tokio::time::sleep(Duration::from_millis(tick_ms)));
+        let mut armed_tick_ms = tick_ms;
         loop {
             // M10 idle watchdog: close the session after ~90s of no inbound
             // KCP input (see TUNNEL_IDLE_CLOSE_MS). Checked per iteration —
@@ -694,11 +724,22 @@ where
                 );
                 break;
             }
-            // Timeout-driven I/O poll: the timeout both keeps KCP ticking
-            // (via poll_read → maybe_tick → drive_kcp inside
-            // poll_next_inbound) and bounds every iteration, so open
-            // requests queued outside the poll are served within one tick
-            // (or immediately — the `open_wake` arm below).
+            // Re-arm the shared tick timer: only when the adaptive length
+            // changed, or after the timer fired (an elapsed `Sleep` polls
+            // Ready immediately — leaving it armed-but-elapsed would spin the
+            // loop at full CPU). `armed_tick_ms` tracks the length the timer
+            // currently holds.
+            if tick_ms != armed_tick_ms || tick_sleep.is_elapsed() {
+                armed_tick_ms = tick_ms;
+                tick_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_millis(tick_ms));
+            }
+            // Tick-driven I/O poll: the tick both keeps KCP ticking (via
+            // poll_read → maybe_tick → drive_kcp inside poll_next_inbound)
+            // and bounds every iteration, so open requests queued outside the
+            // poll are served within one tick (or immediately — the
+            // `open_wake` arm below).
             let mut had_activity = false;
             let result = tokio::select! {
                 _ = driver_drop_rx.changed() => break,
@@ -707,8 +748,8 @@ where
                 // idle tick. The stored permit makes the wake loss-proof; the
                 // drain happens on the next loop pass (this arm breaks out of
                 // the select, the loop body then re-enters with a fast tick).
-                _ = driver_open_wake.notified() => None,
-                r = tokio::time::timeout(Duration::from_millis(tick_ms), poll_fn(|cx| {
+                _ = driver_open_wake.notified() => Err(DriverWake::Open),
+                r = poll_fn(|cx| {
                     // (1) Drain enqueued open requests (visitor role). Stop at
                     // the cap: a stalled peer must make open_stream fail fast
                     // instead of growing this queue without bound.
@@ -890,16 +931,18 @@ where
                         had_activity = true;
                     }
                     inbound
-                })) => Some(r),
-            };
-            // Open-request wake: the queued request is served next pass —
-            // snap back to the fast tick so a burst of opens is not paced by
-            // the idle tick, then loop (the drain runs in the next select).
-            let Some(result) = result else {
-                tick_ms = KCP_TICK_MS as u64;
-                continue;
+                }) => Ok(r),
+                _ = tick_sleep.as_mut() => Err(DriverWake::Tick),
             };
             match result {
+                // Open-request wake: the queued request is served next pass —
+                // snap back to the fast tick so a burst of opens is not paced
+                // by the idle tick, then loop (the drain runs in the next
+                // select, where the tick timer is re-armed to the fast length).
+                Err(DriverWake::Open) => {
+                    tick_ms = KCP_TICK_MS as u64;
+                    continue;
+                }
                 Ok(Some(Ok(stream))) => {
                     // Activity (inbound stream admitted): keep the fast tick.
                     tick_ms = KCP_TICK_MS as u64;
@@ -969,7 +1012,7 @@ where
                     tracing::debug!("XTCP P2P: tunnel session connection closed, exiting");
                     break;
                 }
-                Err(_elapsed) => {
+                Err(DriverWake::Tick) => {
                     // KCP tick — no I/O event this pass. Adaptive idle tick
                     // (round-13): any activity (open served, request drained,
                     // inbound stream) keeps the fast KCP tick; a completely

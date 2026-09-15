@@ -296,12 +296,10 @@ pub fn decompress(_data: &[u8]) -> Result<Vec<u8>, String> {
 /// `read()` boundary does not align with a snappy frame boundary.
 #[cfg(feature = "compression")]
 pub struct SnappyDecompressor {
+    /// Buffered compressed input (partial frames + co-delivered payload).
     buf: Vec<u8>,
+    /// Read offset into [`Self::buf`] for the frame being drained.
     offset: usize,
-    /// Reusable decompressed-output scratch. Kept at the largest frame size
-    /// seen so far so `decompress` overwrites it in place instead of paying
-    /// a per-frame zero-fill or allocation.
-    scratch: Vec<u8>,
 }
 
 /// State returned by [`SnappyDecompressor::feed_into_progress`].
@@ -326,7 +324,6 @@ impl SnappyDecompressor {
         Self {
             buf: Vec::new(),
             offset: 0,
-            scratch: Vec::new(),
         }
     }
 
@@ -489,22 +486,43 @@ impl SnappyDecompressor {
                             "snappy: decompressed output {decompressed_len} exceeds per-chunk {MAX_SNAPPY_CHUNK} byte limit"
                         ));
                     }
-                    if self.scratch.len() < decompressed_len {
-                        self.scratch.resize(decompressed_len, 0);
-                    }
+                    // Decode straight into the caller's output buffer (audit
+                    // F: the former path decompressed into a reusable
+                    // `scratch` and then `extend_from_slice`d it into `out` —
+                    // a full extra read+write pass over every decompressed
+                    // byte). The pre-sizes `out` by `decompressed_len`, writes
+                    // the decode into that exact tail slice, and truncates
+                    // back to the pre-call length on every failure path, so
+                    // `out` is left untouched by a failed frame exactly as
+                    // before. Only the `decompress` length is known up front
+                    // (`snap::raw::decompress_len`), and the CRC is verified
+                    // over the same bytes after decoding — Go frp's
+                    // `crc(r.decoded[:n]) != checksum` order.
+                    let out_start = out.len();
+                    out.resize(out_start + decompressed_len, 0);
                     let mut decoder = snap::raw::Decoder::new();
-                    let written = decoder
-                        .decompress(compressed, &mut self.scratch[..decompressed_len])
-                        .map_err(|e| format!("snappy decompress: {e}"))?;
+                    let written = match decoder.decompress(
+                        compressed,
+                        &mut out[out_start..out_start + decompressed_len],
+                    ) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            out.truncate(out_start);
+                            return Err(format!("snappy decompress: {e}"));
+                        }
+                    };
                     if written != decompressed_len {
+                        out.truncate(out_start);
                         return Err("snappy: decompressed output length changed".into());
                     }
-                    if crate::crc32c::crc32c_masked(&self.scratch[..written]) != checksum {
+                    if crate::crc32c::crc32c_masked(&out[out_start..out_start + written])
+                        != checksum
+                    {
+                        out.truncate(out_start);
                         return Err(format!(
                             "snappy: crc32c checksum mismatch (expected {checksum:08x}): corrupt input"
                         ));
                     }
-                    out.extend_from_slice(&self.scratch[..written]);
                     self.offset += total;
                     return Ok(());
                 }
@@ -968,6 +986,95 @@ mod tests {
         let mut dec = SnappyDecompressor::new();
         let output = dec.feed(&compressed).unwrap();
         assert_eq!(output, plaintext);
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_direct_decode_matches_reference_byte_for_byte() {
+        // The 0x00 (compressed) arm decodes straight into the caller's `out`
+        // tail slice instead of into an intermediate scratch buffer. The bytes
+        // produced must be identical to the reference `decompress()` for every
+        // payload shape — including the >64 KiB multi-chunk case and the
+        // incompressible case (snappy then emits an uncompressed 0x01 chunk).
+        let mut payloads: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"a".to_vec(),
+            b"hello world".to_vec(),
+            (0..64 * 1024u32).map(|i| (i % 251) as u8).collect(),
+        ];
+        payloads.push(
+            (0..8192u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+                .collect(),
+        );
+
+        for payload in &payloads {
+            let compressed = compress(payload).expect("compress");
+            let reference = decompress(&compressed).expect("reference decompress");
+            assert_eq!(&reference, payload, "reference decode mismatch");
+
+            // Append variant with a pre-existing prefix: the prefix must
+            // survive untouched and the decoded tail must equal the reference.
+            let mut out = b"prefix:".to_vec();
+            let mut dec = SnappyDecompressor::new();
+            let mut status = dec
+                .feed_into_append_progress(&compressed, &mut out)
+                .expect("append decode");
+            while status.has_more_complete {
+                status = dec
+                    .feed_into_append_progress(&[], &mut out)
+                    .expect("append drain");
+            }
+            assert_eq!(&out[..7], b"prefix:", "prefix clobbered");
+            assert_eq!(
+                &out[7..],
+                reference.as_slice(),
+                "direct-into-out output differs from the reference at payload len {}",
+                payload.len()
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_failed_frame_leaves_out_untouched() {
+        // Failure paths pre-size `out` then truncate back, so a rejected frame
+        // must leave the caller's buffer byte-identical to how it was found.
+        // Highly compressible so the frame encoder really emits a 0x00 chunk
+        // (a short payload would be stored uncompressed as 0x01).
+        let payload = b"transactional-output-must-not-change".repeat(64);
+        let compressed = compress(&payload).expect("compress");
+        // Layout: 10-byte stream identifier, then a 1-byte chunk type + 3-byte
+        // little-endian length + payload (4-byte masked CRC first for data
+        // chunks). Pin the arm we are corrupting so this test cannot silently
+        // exercise nothing.
+        assert_eq!(compressed[10], 0x00, "expected a compressed 0x00 chunk");
+
+        // (a) CRC mismatch after a successful decode.
+        let mut corrupt = compressed.clone();
+        corrupt[14] ^= 0xff;
+        let mut out = b"existing-bytes".to_vec();
+        let snapshot = out.clone();
+        let mut dec = SnappyDecompressor::new();
+        let err = dec
+            .feed_into_append_progress(&corrupt, &mut out)
+            .expect_err("corrupt CRC must be rejected");
+        assert!(err.contains("crc32c"), "unexpected error: {err}");
+        assert_eq!(out, snapshot, "failed frame modified out (CRC arm)");
+
+        // (b) `decompress_len` succeeds but `decompress` fails: raw header
+        // declares 4 output bytes, then a literal tag asking for 2 more bytes
+        // that are not present.
+        let mut bad_chunk = vec![0x00, 6, 0, 0, 0xde, 0xad, 0xbe, 0xef];
+        bad_chunk.extend_from_slice(&[0x04, 0x04]);
+        let mut out = b"existing-bytes".to_vec();
+        let snapshot = out.clone();
+        let mut dec = SnappyDecompressor::new();
+        let err = dec
+            .feed_into_append_progress(&bad_chunk, &mut out)
+            .expect_err("undecodable payload must be rejected");
+        assert!(err.contains("snappy decompress"), "unexpected error: {err}");
+        assert_eq!(out, snapshot, "failed frame modified out (decode arm)");
     }
 
     #[test]

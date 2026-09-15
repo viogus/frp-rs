@@ -61,7 +61,24 @@ pub fn load_store(path: &Path) -> HashMap<String, ProxyConfig> {
 ///
 /// Writes to a temporary file then renames it in place, so a crash or
 /// disk-full error never leaves a partially-written store.
-pub fn save_store(path: &Path, configs: &HashMap<String, ProxyConfig>) {
+///
+/// Takes the config map by value (the dashboard handlers already hold a
+/// snapshot clone) and does the JSON serialization plus the file write on
+/// the blocking pool (audit §3 item 7): `to_string_pretty` + `fs::write` +
+/// `rename` are all synchronous syscalls that used to run directly on an
+/// axum worker thread.
+pub async fn save_store(path: &Path, configs: HashMap<String, ProxyConfig>) {
+    let path = path.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || save_store_blocking(&path, &configs)).await;
+    if let Err(e) = result {
+        // The blocking task panicked (or was cancelled at shutdown) — the
+        // inner function logs its own I/O errors.
+        error!(error = %e, "store save task failed");
+    }
+}
+
+/// Blocking body of [`save_store`].
+fn save_store_blocking(path: &Path, configs: &HashMap<String, ProxyConfig>) {
     let json_str = match serde_json::to_string_pretty(configs) {
         Ok(s) => s,
         Err(e) => {
@@ -146,8 +163,8 @@ mod tests {
         assert!(map.is_empty());
     }
 
-    #[test]
-    fn save_and_load_roundtrip() {
+    #[tokio::test]
+    async fn save_and_load_roundtrip() {
         let tmp = std::env::temp_dir().join(format!("frps_test_store_{}.json", std::process::id()));
         let mut map = HashMap::new();
         map.insert(
@@ -162,7 +179,7 @@ mod tests {
             },
         );
 
-        save_store(&tmp, &map);
+        save_store(&tmp, map).await;
         assert!(tmp.exists());
 
         let loaded = load_store(&tmp);
@@ -174,12 +191,12 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
-    #[test]
-    fn save_empty_store() {
+    #[tokio::test]
+    async fn save_empty_store() {
         let tmp = std::env::temp_dir().join(format!("frps_test_empty_{}.json", std::process::id()));
         let map: HashMap<String, ProxyConfig> = HashMap::new();
 
-        save_store(&tmp, &map);
+        save_store(&tmp, map).await;
         assert!(tmp.exists());
 
         let loaded = load_store(&tmp);

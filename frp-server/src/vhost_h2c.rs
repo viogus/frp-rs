@@ -489,9 +489,22 @@ async fn handle_stream(
                 if has_content_length {
                     let _ = client_w.write_all(&data).await;
                 } else {
-                    let _ = client_w
-                        .write_all(format!("{:X}\r\n", data.len()).as_bytes())
-                        .await;
+                    use std::io::Write;
+                    // Chunk-size line, formatted on the stack (audit §3 item
+                    // 5): `format!("{:X}\r\n")` allocated a String per DATA
+                    // frame just to be copied out. The 16-byte buffer is
+                    // ample — len is one h2 DATA frame (hex of the maximum
+                    // 2^24-1 frame is 6 digits) plus CRLF, far under 16.
+                    // `io::Write` on `&mut [u8]` advances the slice, so the
+                    // written length is what the slice lost. The discard is
+                    // safe: writing into a byte slice only fails when it is
+                    // too short.
+                    const SIZE_BUF_LEN: usize = 16;
+                    let mut size_buf = [0u8; SIZE_BUF_LEN];
+                    let mut sink: &mut [u8] = &mut size_buf;
+                    let _ = write!(sink, "{:X}\r\n", data.len());
+                    let size_len = SIZE_BUF_LEN - sink.len();
+                    let _ = client_w.write_all(&size_buf[..size_len]).await;
                     let _ = client_w.write_all(&data).await;
                     let _ = client_w.write_all(b"\r\n").await;
                 }
@@ -1334,19 +1347,31 @@ impl<'a, R: AsyncRead + Unpin> BodyReader<'a, R> {
         Ok(())
     }
 
-    /// Read exactly `n` bytes, appending to `out` after clearing it. The
-    /// caller owns the buffer, so its allocation is REUSED across calls —
-    /// chunked streaming no longer allocates (and re-grows) a fresh Vec per
-    /// chunk (a 64 KiB chunk used to cost ~8 reallocations via
-    /// `with_capacity(n.min(8192))` growth). The capacity grows to exactly
-    /// `n` on the first call and is kept for subsequent calls.
+    /// Read exactly `n` bytes into `out`. The caller owns the buffer, so its
+    /// allocation is REUSED across calls — chunked streaming no longer
+    /// allocates (and re-grows) a fresh Vec per chunk (a 64 KiB chunk used
+    /// to cost ~8 reallocations via `with_capacity(n.min(8192))` growth).
+    /// The capacity grows to exactly `n` on the first call and is kept for
+    /// subsequent calls.
+    ///
+    /// `out` keeps its LENGTH high-water mark instead of being cleared and
+    /// re-filled with zeros (audit §3 item 4): `clear()` + `resize(n, 0)`
+    /// zeroed the whole slice on every chunk even though `fill_exact`
+    /// immediately overwrites all of it — the streaming loops call this
+    /// back-to-back with the same `n`, so the zero fill was pure waste.
+    /// Only a GROWTH past the previous length zero-fills (once, on the
+    /// first call); a shrink truncates, which writes nothing. The
+    /// post-condition is unchanged: on `Ok(())` at least the first `n`
+    /// bytes are freshly filled by `fill_exact` (a short read is an
+    /// `UnexpectedEof` error, and every caller aborts on `Err`), so stale
+    /// bytes are never exposed.
     async fn read_exact_into(&mut self, out: &mut Vec<u8>, n: usize) -> std::io::Result<()> {
-        out.clear();
-        out.try_reserve_exact(n).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::OutOfMemory, "response body too large")
-        })?;
+        out.try_reserve_exact(n.saturating_sub(out.len()))
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::OutOfMemory, "response body too large")
+            })?;
         out.resize(n, 0); // no realloc: capacity already >= n
-        self.fill_exact(out).await
+        self.fill_exact(&mut out[..n]).await
     }
 
     /// Read one CRLF (or LF) terminated line including its terminator.
@@ -1810,7 +1835,12 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     }
     if let Some(mut remaining) = content_length {
         while remaining > 0 {
-            let n = remaining.min(8192) as usize;
+            // 32 KiB slices (audit §3 item 5): the old 8192-byte slice made
+            // every byte of a Content-Length body travel in four times as
+            // many read+frame iterations as the chunked path's 64 KiB cap
+            // (h2 splits DATA frames at its own negotiated max frame size
+            // regardless, so this is not a wire-shape change).
+            let n = remaining.min(32 * 1024) as usize;
             match reader.read_exact_into(&mut scratch, n).await {
                 Ok(()) => {}
                 Err(_) => {

@@ -11,12 +11,38 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &FrpMessage,
 ) -> Result<(), crate::Error> {
+    let mut scratch = Vec::new();
+    write_v1_frame_scratch(writer, msg, &mut scratch).await
+}
+
+/// [`write_v1_frame`] with a caller-owned serialization scratch buffer.
+///
+/// The JSON payload is serialized straight into `scratch` (cleared per call),
+/// so a task that sends frame after frame reuses one allocation instead of
+/// paying for a fresh `Vec` on every control message — [`write_v1_frame`]
+/// allocates one per call. Wire bytes are identical: same serializer, same
+/// 9-byte header, same vectored write.
+///
+/// The caller owns the buffer, so the scratch is only ever touched by one
+/// task; a partially-serialized buffer left by a serialization error is
+/// cleared before the error is returned.
+pub async fn write_v1_frame_scratch<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: &FrpMessage,
+    scratch: &mut Vec<u8>,
+) -> Result<(), crate::Error> {
     // NOTE: V1 type bytes 7 (CloseProxyResp) and 8 (Error) are Rust-only
     // extensions. Go frp v0.70.0 treats unknown type bytes as errors.
     // These MUST NOT be sent to Go peers. See msg.rs lines 26-29.
     let type_byte = msg.v1_type_byte();
-    let buf = serde_json::to_vec(msg)
-        .map_err(|e| crate::Error::Protocol(format!("serialize V1 msg: {e}").into()))?;
+    scratch.clear();
+    if let Err(e) = serde_json::to_writer(&mut *scratch, msg) {
+        scratch.clear();
+        return Err(crate::Error::Protocol(
+            format!("serialize V1 msg: {e}").into(),
+        ));
+    }
+    let buf: &[u8] = scratch;
 
     if buf.len() as u64 > V1_MAX_MSG_LENGTH as u64 {
         return Err(crate::Error::Protocol("V1 message too large".into()));
@@ -1117,6 +1143,69 @@ mod tests {
         assert!(
             err.is_err(),
             "payload one byte above V1_MAX_MSG_LENGTH must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v1_frame_scratch_reuse_is_byte_identical() {
+        // `write_v1_frame_scratch` streams the JSON into a caller-owned buffer
+        // instead of a fresh `Vec` per call. The wire bytes must stay identical
+        // across repeated calls on one buffer — including a shrinking frame
+        // (the previous, longer payload must not leak into the shorter frame).
+        let msg = |n: usize| FrpMessage::UDPPacket(udp_packet_with_content(n));
+        let large = msg(2048);
+        let small = msg(4);
+        let pong = FrpMessage::Pong(crate::msg::Pong {
+            error: Some("boom".into()),
+        });
+
+        let mut scratch = Vec::new();
+        for (idx, m) in [&large, &small, &pong, &large, &small].iter().enumerate() {
+            // Reference bytes: the allocating entry point, on a fresh read end.
+            let mut expected = Vec::new();
+            write_v1_frame(&mut expected, m)
+                .await
+                .expect("reference write");
+
+            // Scratch variant writes into a duplex pair, read back raw.
+            let (mut client, mut server) = duplex(65536);
+            write_v1_frame_scratch(&mut client, m, &mut scratch)
+                .await
+                .expect("scratch write");
+            drop(client);
+            let mut got = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut server, &mut got)
+                .await
+                .expect("read raw frame");
+
+            assert_eq!(
+                got, expected,
+                "scratch frame {idx} differs from the allocating writer"
+            );
+            // Header sanity: 1 type byte + 8-byte BE length equals `expected`.
+            assert_eq!(got[0], m.v1_type_byte());
+            assert_eq!(
+                u64::from_be_bytes(got[1..9].try_into().expect("8-byte length")),
+                (got.len() - V1_HEADER_LEN) as u64
+            );
+        }
+
+        // The buffer really was reused (capacity retained across calls), and
+        // the final frame still carries only its own payload.
+        assert!(scratch.capacity() > 0, "scratch must have been reused");
+        let (mut client, mut server) = duplex(65536);
+        write_v1_frame_scratch(&mut client, &small, &mut scratch)
+            .await
+            .expect("write after reuse");
+        drop(client);
+        let mut got = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut server, &mut got)
+            .await
+            .expect("read raw frame");
+        assert_eq!(
+            &got[V1_HEADER_LEN..],
+            serde_json::to_string(&small).expect("serialize").as_bytes(),
+            "scratch buffer retained bytes from an earlier (longer) frame"
         );
     }
 

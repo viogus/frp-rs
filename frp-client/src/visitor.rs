@@ -1,4 +1,4 @@
-#[cfg(feature = "vnet")]
+#[cfg(all(feature = "vnet", test))]
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::YamuxSession;
 use frp_core::protocol::{
-    read_msg_v1, read_msg_v2_with_udp_codec, write_msg_v1, write_msg_v2_with_udp_codec,
+    read_msg_v1, read_msg_v2_with_udp_codec, write_msg_v2_with_udp_codec, write_v1_frame_scratch,
 };
 use frp_core::transport::{
     dial_server, split_work_conn_halves, BoxedReadHalf, BoxedWriteHalf, DialOptions, IoStream,
@@ -20,7 +20,10 @@ use frp_core::transport::{
 };
 
 #[cfg(feature = "vnet")]
-type VnetTunTxMap = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
+type VnetTunTxMap = crate::vnet::VnetTunTxMap;
+
+#[cfg(feature = "vnet")]
+type VnetTunSubnetMap = crate::vnet::VnetTunSubnetMap;
 
 /// Configuration for an STCP/XTCP visitor listener.
 pub(crate) struct VisitorListenerConfig {
@@ -139,9 +142,11 @@ pub(crate) struct VirtualNetVisitorConfig {
     /// forwarded into the local TUN-backed vnet proxy so return traffic from
     /// a remote `virtual_net` plugin reaches the local TUN.
     pub vnet_tun_tx: VnetTunTxMap,
-    /// Proxy name → subnet CIDR used to direct tunnel ingress packets to the
-    /// correct local TUN instead of broadcasting to every TUN.
-    pub tun_subnets: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    /// Proxy name → precompiled subnet used to direct tunnel ingress packets
+    /// to the correct local TUN instead of broadcasting to every TUN. The
+    /// prefix set is compiled once at registration, so the per-packet check
+    /// is a mask+compare with no CIDR parsing.
+    pub tun_subnets: VnetTunSubnetMap,
     /// Graceful shutdown signal. When true, the tunnel exits and the route is
     /// unregistered.
     pub shutdown: Arc<AtomicBool>,
@@ -1023,7 +1028,7 @@ async fn run_virtual_net_tunnel_io(
     name: String,
     packet_rx: mpsc::Receiver<Vec<u8>>,
     vnet_tun_tx: VnetTunTxMap,
-    tun_subnets: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    tun_subnets: VnetTunSubnetMap,
     shutdown: Arc<AtomicBool>,
     use_encryption: bool,
     use_compression: bool,
@@ -2277,8 +2282,11 @@ async fn run_sudp_worker(
     };
     // Buffer frame reads: read_msg_v1 issues two read_exact calls per message.
     let srv_r = tokio::io::BufReader::with_capacity(16 * 1024, srv_r);
-    // Reused binary-codec wire buffer (write side; the `scratch` inside the
-    // loop is the read side).
+    // Reused wire buffer (write side; the `scratch` inside the loop is the
+    // read side). Shared by the V2 binary-codec body and the V1 JSON payload
+    // below — the two writes are mutually exclusive per packet and both
+    // writers clear it first, so the V1 path no longer allocates a fresh
+    // `serde_json` Vec per datagram (perf audit TOP 2).
     let mut wire_scratch: Vec<u8> = Vec::new();
     // The first packet (which triggered the connect) is written immediately.
     let first_write = if v2 {
@@ -2291,7 +2299,12 @@ async fn run_sudp_worker(
         )
         .await
     } else {
-        write_msg_v1(&mut srv_w, &FrpMessage::UDPPacket(first_pkt)).await
+        write_v1_frame_scratch(
+            &mut srv_w,
+            &FrpMessage::UDPPacket(first_pkt),
+            &mut wire_scratch,
+        )
+        .await
     };
     if let Err(e) = first_write {
         warn!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': write first UDPPacket failed: {}", visitor_name, e);
@@ -2383,7 +2396,13 @@ async fn run_sudp_worker(
                             )
                             .await
                         } else {
-                            write_msg_v1(&mut srv_w, &FrpMessage::UDPPacket(p)).await
+                            // V1 JSON: reuse the loop's shared scratch.
+                            write_v1_frame_scratch(
+                                &mut srv_w,
+                                &FrpMessage::UDPPacket(p),
+                                &mut wire_scratch,
+                            )
+                            .await
                         };
                         if let Err(e) = write {
                             debug!(visitor_name = %visitor_name, error = %e, "SUDP visitor '{}': write UDPPacket failed: {}", visitor_name, e);
@@ -2664,7 +2683,7 @@ async fn deliver_tunnel_ingress(
     visitor_name: &str,
     packet: Vec<u8>,
     vnet_tun_tx: &VnetTunTxMap,
-    tun_subnets: &Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    tun_subnets: &VnetTunSubnetMap,
 ) -> bool {
     // Take the tokio lock first so the std Mutex guard never spans an await
     // point (the guarded section below is fully synchronous).
@@ -2672,17 +2691,23 @@ async fn deliver_tunnel_ingress(
     let txs = vnet_tun_tx.lock().unwrap_or_else(|e| e.into_inner());
     let dst = frp_vnet::router::packet_dst_ip(&packet);
     let mut delivered = false;
+    // The packet is converted into the shared `Arc<[u8]>` form at most once
+    // for the whole fan-out: every matching TUN channel then receives the same
+    // buffer by refcount instead of a deep copy per peer. A packet that
+    // matches nothing pays nothing — the `Vec` is moved into the fallback
+    // send below.
+    let mut shared: Option<Arc<[u8]>> = None;
     for (proxy, tx) in txs.iter() {
-        let matched = dst.as_ref().is_some_and(|ip| {
-            subnets.get(proxy).is_some_and(|cidr| {
-                let mut rt = frp_vnet::router::RouteTable::new();
-                // Single-route match; the vnet dimension is not relevant here.
-                rt.insert("", proxy, cidr)
-                    .is_ok_and(|_| rt.lookup("", ip) == Some(proxy))
-            })
-        });
+        // Precompiled prefix membership (compiled at registration): a
+        // mask+compare, no per-packet CIDR parse.
+        let matched = dst
+            .as_ref()
+            .is_some_and(|ip| subnets.get(proxy).is_some_and(|subnet| subnet.contains(ip)));
         if matched {
-            match tx.try_send(packet.clone()) {
+            let pkt = shared
+                .get_or_insert_with(|| Arc::from(packet.as_slice()))
+                .clone();
+            match tx.try_send(pkt) {
                 Ok(()) => delivered = true,
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     warn!(
@@ -2701,10 +2726,29 @@ async fn deliver_tunnel_ingress(
 
     // No subnet matched. A single local TUN is unambiguous and receives the
     // packet; multiple TUNs would make the target ambiguous, so drop instead
-    // of broadcasting (the pre-fix behavior).
-    let open: Vec<&mpsc::Sender<Vec<u8>>> = txs.values().filter(|tx| !tx.is_closed()).collect();
-    if open.len() == 1 {
-        match open[0].try_send(packet) {
+    // of broadcasting (the pre-fix behavior). One pass, no allocation — the
+    // old `Vec<&Sender>` collect allocated per packet.
+    let mut open: Option<&mpsc::Sender<Arc<[u8]>>> = None;
+    let mut ambiguous = false;
+    for tx in txs.values() {
+        if tx.is_closed() {
+            continue;
+        }
+        if open.is_some() {
+            ambiguous = true;
+            break;
+        }
+        open = Some(tx);
+    }
+    if let Some(tx) = open {
+        if ambiguous {
+            warn!(
+                visitor_name = %visitor_name,
+                "virtual_net visitor ingress packet has no subnet match; dropping instead of broadcasting"
+            );
+            return false;
+        }
+        match tx.try_send(Arc::from(packet)) {
             Ok(()) => return true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 warn!(
@@ -2715,12 +2759,6 @@ async fn deliver_tunnel_ingress(
             }
             Err(mpsc::error::TrySendError::Closed(_)) => return false,
         }
-    }
-    if open.len() > 1 {
-        warn!(
-            visitor_name = %visitor_name,
-            "virtual_net visitor ingress packet has no subnet match; dropping instead of broadcasting"
-        );
     }
     false
 }
@@ -2871,29 +2909,28 @@ mod tests {
     #[tokio::test]
     async fn tunnel_ingress_delivers_to_local_tun_channels() {
         let txs: VnetTunTxMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let subnets: Arc<tokio::sync::Mutex<HashMap<String, String>>> =
-            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(16);
+        let subnets: VnetTunSubnetMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::channel::<Arc<[u8]>>(16);
         txs.lock().unwrap().insert("tun-proxy".to_string(), tx);
-        subnets
-            .lock()
-            .await
-            .insert("tun-proxy".to_string(), "10.0.0.0/24".to_string());
+        subnets.lock().await.insert(
+            "tun-proxy".to_string(),
+            frp_vnet::router::PrecompiledSubnet::new("10.0.0.0/24"),
+        );
 
         assert!(
             deliver_tunnel_ingress("vnet-visitor", vec![0x45], &txs, &subnets).await,
             "single open TUN channel must accept an unmatched packet as fallback"
         );
-        assert_eq!(rx.recv().await, Some(vec![0x45]));
+        assert_eq!(rx.recv().await.as_deref(), Some(&[0x45u8][..]));
 
-        let (closed_tx, closed_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (closed_tx, closed_rx) = mpsc::channel::<Arc<[u8]>>(16);
         txs.lock()
             .unwrap()
             .insert("gone-tun".to_string(), closed_tx);
-        subnets
-            .lock()
-            .await
-            .insert("gone-tun".to_string(), "10.0.1.0/24".to_string());
+        subnets.lock().await.insert(
+            "gone-tun".to_string(),
+            frp_vnet::router::PrecompiledSubnet::new("10.0.1.0/24"),
+        );
         drop(closed_rx);
         assert!(
             deliver_tunnel_ingress("vnet-visitor", vec![0x46], &txs, &subnets).await,
@@ -2901,8 +2938,7 @@ mod tests {
         );
 
         let empty: VnetTunTxMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let empty_subnets: Arc<tokio::sync::Mutex<HashMap<String, String>>> =
-            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let empty_subnets: VnetTunSubnetMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         assert!(
             !deliver_tunnel_ingress("vnet-visitor", vec![0x47], &empty, &empty_subnets).await,
             "no TUN target must report undelivered"
@@ -2912,20 +2948,19 @@ mod tests {
     #[tokio::test]
     async fn tunnel_ingress_directs_by_ip_family_subnet() {
         let txs: VnetTunTxMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let subnets: Arc<tokio::sync::Mutex<HashMap<String, String>>> =
-            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        let (tx4, mut rx4) = mpsc::channel::<Vec<u8>>(16);
-        let (tx6, mut rx6) = mpsc::channel::<Vec<u8>>(16);
+        let subnets: VnetTunSubnetMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (tx4, mut rx4) = mpsc::channel::<Arc<[u8]>>(16);
+        let (tx6, mut rx6) = mpsc::channel::<Arc<[u8]>>(16);
         txs.lock().unwrap().insert("tun-v4".to_string(), tx4);
         txs.lock().unwrap().insert("tun-v6".to_string(), tx6);
-        subnets
-            .lock()
-            .await
-            .insert("tun-v4".to_string(), "10.0.0.0/24".to_string());
-        subnets
-            .lock()
-            .await
-            .insert("tun-v6".to_string(), "2001:db8::/64".to_string());
+        subnets.lock().await.insert(
+            "tun-v4".to_string(),
+            frp_vnet::router::PrecompiledSubnet::new("10.0.0.0/24"),
+        );
+        subnets.lock().await.insert(
+            "tun-v6".to_string(),
+            frp_vnet::router::PrecompiledSubnet::new("2001:db8::/64"),
+        );
 
         let v4 = vec![
             0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 10, 0, 0, 2,
@@ -2938,7 +2973,7 @@ mod tests {
         ];
 
         assert!(deliver_tunnel_ingress("vnet-visitor", v4.clone(), &txs, &subnets).await);
-        assert_eq!(rx4.recv().await, Some(v4));
+        assert_eq!(rx4.recv().await.as_deref(), Some(&v4[..]));
         assert!(
             tokio::time::timeout(Duration::from_millis(50), rx6.recv())
                 .await
@@ -2947,12 +2982,103 @@ mod tests {
         );
 
         assert!(deliver_tunnel_ingress("vnet-visitor", v6.clone(), &txs, &subnets).await);
-        assert_eq!(rx6.recv().await, Some(v6));
+        assert_eq!(rx6.recv().await.as_deref(), Some(&v6[..]));
         assert!(
             tokio::time::timeout(Duration::from_millis(50), rx4.recv())
                 .await
                 .is_err(),
             "IPv6 packet must not be broadcast to the IPv4 TUN"
+        );
+    }
+
+    /// Fan-out must copy the packet at most once: every matching TUN channel
+    /// receives the *same* `Arc<[u8]>` buffer by refcount, so the peer count
+    /// never multiplies the bytes copied.
+    #[tokio::test]
+    async fn tunnel_ingress_fan_out_shares_one_packet_buffer() {
+        let txs: VnetTunTxMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let subnets: VnetTunSubnetMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (tx_a, mut rx_a) = mpsc::channel::<Arc<[u8]>>(16);
+        let (tx_b, mut rx_b) = mpsc::channel::<Arc<[u8]>>(16);
+        let (tx_c, mut rx_c) = mpsc::channel::<Arc<[u8]>>(16);
+        txs.lock().unwrap().insert("tun-a".to_string(), tx_a);
+        txs.lock().unwrap().insert("tun-b".to_string(), tx_b);
+        txs.lock().unwrap().insert("tun-c".to_string(), tx_c);
+        // Three TUNs on the same subnet: one packet matches all three.
+        for name in ["tun-a", "tun-b", "tun-c"] {
+            subnets.lock().await.insert(
+                name.to_string(),
+                frp_vnet::router::PrecompiledSubnet::new("10.0.0.0/24"),
+            );
+        }
+
+        let packet = vec![
+            0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 10, 0, 0, 2,
+            10, 0, 0, 5,
+        ];
+        assert!(deliver_tunnel_ingress("vnet-visitor", packet.clone(), &txs, &subnets).await);
+
+        let a = rx_a.recv().await.expect("tun-a received the packet");
+        let b = rx_b.recv().await.expect("tun-b received the packet");
+        let c = rx_c.recv().await.expect("tun-c received the packet");
+        assert_eq!(&*a, &packet[..], "bytes must be identical per peer");
+        assert_eq!(&*b, &packet[..], "bytes must be identical per peer");
+        assert_eq!(&*c, &packet[..], "bytes must be identical per peer");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "peers must share one buffer, not a copy each"
+        );
+        assert!(
+            Arc::ptr_eq(&b, &c),
+            "peers must share one buffer, not a copy each"
+        );
+        assert_eq!(
+            Arc::strong_count(&a),
+            3,
+            "exactly one buffer for three channels"
+        );
+    }
+
+    /// Two open TUNs and no subnet match: the target is ambiguous, so the
+    /// packet is dropped rather than broadcast (unchanged fallback semantics;
+    /// the scan is now allocation-free).
+    #[tokio::test]
+    async fn tunnel_ingress_ambiguous_fallback_drops_instead_of_broadcasting() {
+        let txs: VnetTunTxMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let subnets: VnetTunSubnetMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (tx_a, mut rx_a) = mpsc::channel::<Arc<[u8]>>(16);
+        let (tx_b, mut rx_b) = mpsc::channel::<Arc<[u8]>>(16);
+        txs.lock().unwrap().insert("tun-a".to_string(), tx_a);
+        txs.lock().unwrap().insert("tun-b".to_string(), tx_b);
+        // Subnets registered, but neither covers the packet's destination.
+        subnets.lock().await.insert(
+            "tun-a".to_string(),
+            frp_vnet::router::PrecompiledSubnet::new("10.9.0.0/24"),
+        );
+        subnets.lock().await.insert(
+            "tun-b".to_string(),
+            frp_vnet::router::PrecompiledSubnet::new("10.9.1.0/24"),
+        );
+
+        let packet = vec![
+            0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 10, 0, 0, 2,
+            10, 0, 0, 5,
+        ];
+        assert!(
+            !deliver_tunnel_ingress("vnet-visitor", packet, &txs, &subnets).await,
+            "an ambiguous target must report undelivered"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx_a.recv())
+                .await
+                .is_err(),
+            "ambiguous fallback must not broadcast to tun-a"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx_b.recv())
+                .await
+                .is_err(),
+            "ambiguous fallback must not broadcast to tun-b"
         );
     }
 
@@ -2963,15 +3089,14 @@ mod tests {
         let (server, mut peer) = tokio::io::duplex(8192);
         let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(16);
         let txs: VnetTunTxMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let subnets: Arc<tokio::sync::Mutex<HashMap<String, String>>> =
-            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(16);
+        let subnets: VnetTunSubnetMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (tun_tx, mut tun_rx) = mpsc::channel::<Arc<[u8]>>(16);
         let shutdown = Arc::new(AtomicBool::new(false));
         txs.lock().unwrap().insert("tun-v4".to_string(), tun_tx);
-        subnets
-            .lock()
-            .await
-            .insert("tun-v4".to_string(), "10.0.0.0/24".to_string());
+        subnets.lock().await.insert(
+            "tun-v4".to_string(),
+            frp_vnet::router::PrecompiledSubnet::new("10.0.0.0/24"),
+        );
 
         let task = tokio::spawn(run_virtual_net_tunnel_io(
             frp_core::transport::IoStream::SshChannel(Box::new(server)),
@@ -2996,7 +3121,7 @@ mod tests {
         frp_core::encryption::compress_into(&framed, &mut compressed).unwrap();
         let wire = frp_core::encryption::encrypt(&compressed, &key).unwrap();
         peer.write_all(&wire).await.unwrap();
-        assert_eq!(tun_rx.recv().await, Some(inbound.clone()));
+        assert_eq!(tun_rx.recv().await.as_deref(), Some(&inbound[..]));
 
         packet_tx.send(inbound.clone()).await.unwrap();
         let mut raw = vec![0u8; wire.len()];

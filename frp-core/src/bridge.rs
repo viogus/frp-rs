@@ -252,17 +252,25 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
                 tracing::warn!(error = %e, "bridge user_to_work: pre_read write failed");
                 return;
             }
+            // Same as the compressed arm: flush now. A GET whose entire
+            // request lives in the pre-read may never produce another user
+            // read, and with had_pre_read the shutdown flush is skipped —
+            // without this the head would sit in a buffered transport
+            // (TLS/WS/yamux) forever.
+            if let Err(e) = writer.flush_bridge().await {
+                tracing::debug!(error = %e, "bridge user_to_work: pre_read flush error");
+                return;
+            }
         }
     }
 
-    // Compressed path batching: accumulate written (compressed) bytes and only
-    // flush when the accumulated batch reaches MAX_WORK_TO_USER_BATCH (256 KiB)
-    // or a short read indicates interactive traffic. This mirrors the
-    // work->user batching (bridge_work_to_user): raw TCP under TCP_NODELAY sees
-    // no change (flush is a no-op there), but buffered transports (TLS/WS/yamux)
-    // save one flush syscall + waker round-trip per ~256 KiB instead of per
-    // 32 KiB chunk. The plaintext path is unchanged (flush on short read).
-    let mut pending = 0usize;
+    // Flush every read, in both the compressed and plaintext paths (mirroring
+    // bridge_work_to_user's unconditional tail flush). Raw TCP under
+    // TCP_NODELAY sees no change (flush is a no-op there), but on a buffered
+    // transport (TLS/WS/yamux) a flush gated on `n < cap` stranded an
+    // exact-size burst (n == cap): the bytes sat in the buffered writer until
+    // more data or EOF happened to arrive — a deadlock for a request whose
+    // size lands exactly on the read buffer boundary.
     loop {
         let n = match user_r.read(buf.as_mut_slice()).await {
             Ok(0) => break,
@@ -295,15 +303,10 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
             }
             // comp_buf is cleared and refilled on each compress call, so its
             // capacity is retained across chunks.
-            // Batch the flush: accumulate compressed bytes; flush when the
-            // batch cap is hit OR the read was short (interactive latency).
-            pending += comp_buf.len();
-            if n < cap || pending >= MAX_WORK_TO_USER_BATCH {
-                if let Err(e) = writer.flush_bridge().await {
-                    tracing::debug!(error = %e, "bridge user_to_work: flush error");
-                    break;
-                }
-                pending = 0;
+            // Flush unconditionally — see the note above the loop.
+            if let Err(e) = writer.flush_bridge().await {
+                tracing::debug!(error = %e, "bridge user_to_work: flush error");
+                break;
             }
         } else {
             let slice = &mut buf.as_mut_slice()[..n];
@@ -314,13 +317,10 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
                 tracing::debug!(error = %e, "bridge user_to_work: write error");
                 break;
             }
-            // Conditional flush: batch on full reads (plaintext path — flush
-            // on short reads for interactive latency).
-            if n < cap {
-                if let Err(e) = writer.flush_bridge().await {
-                    tracing::debug!(error = %e, "bridge user_to_work: flush error");
-                    break;
-                }
+            // Flush unconditionally — see the note above the loop.
+            if let Err(e) = writer.flush_bridge().await {
+                tracing::debug!(error = %e, "bridge user_to_work: flush error");
+                break;
             }
         }
     }
@@ -597,8 +597,11 @@ async fn bridge_work_to_user(
                     batch_buf.clear();
                 }
             } else {
-                // Plaintext passthrough: write immediately, flushing on short
-                // reads for interactive latency.
+                // Plaintext passthrough: write immediately and ALWAYS flush.
+                // The flush is a no-op on a raw TcpStream; on a buffered
+                // transport (yamux/WS-wrapped user side) it is what pushes the
+                // bytes out — a flush gated on `n < cap` stranded an exact-size
+                // burst (n == cap) until more data happened to arrive.
                 let plaintext = compressed_input;
                 if let Some(lim) = limiter {
                     BandwidthLimiter::consume_shared(lim, plaintext.len()).await;
@@ -611,11 +614,9 @@ async fn bridge_work_to_user(
                     tracing::debug!(error = %e, "bridge work_to_user: write error");
                     break 'read_loop;
                 }
-                if n < cap {
-                    if let Err(e) = user_w.flush().await {
-                        tracing::debug!(error = %e, "bridge work_to_user: flush error");
-                        break 'read_loop;
-                    }
+                if let Err(e) = user_w.flush().await {
+                    tracing::debug!(error = %e, "bridge work_to_user: flush error");
+                    break 'read_loop;
                 }
                 break;
             }
@@ -625,6 +626,11 @@ async fn bridge_work_to_user(
                 tracing::debug!(error = %e, "bridge work_to_user: write error (batch)");
                 break 'read_loop;
             }
+            // Always flush, as in the plaintext arm: the mid-batch write
+            // above (>= MAX_WORK_TO_USER_BATCH) flushed itself, but the tail
+            // must not wait for more data — a flush gated on `n < cap`
+            // stranded an exact-size final batch in a buffered transport
+            // until the next burst (or EOF) happened to arrive.
             if let Err(e) = user_w.flush().await {
                 tracing::debug!(error = %e, "bridge work_to_user: flush error (batch)");
                 break 'read_loop;
@@ -1699,7 +1705,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bridge_plain_batches_flushes_on_full_reads() {
+    async fn bridge_plain_flushes_per_read_full_or_short() {
         use std::pin::Pin;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -1755,17 +1761,21 @@ mod tests {
 
         bridge_plain(user_r, user_w, work_r, work_w, false, Vec::new(), None).await;
 
-        // Two full-capacity reads => no per-chunk flush; exactly one final flush.
+        // Two full-capacity reads => one flush per read plus the final
+        // shutdown flush (Plain's shutdown_bridge flushes): 3 total. A flush
+        // gated on `n < cap` would strand an exact-size burst in a buffered
+        // transport (TLS/WS/yamux) — the unconditional flush is what pushes
+        // each read's bytes out.
         assert_eq!(
             flushes.load(Ordering::SeqCst),
-            1,
-            "expected batched flush, got per-chunk"
+            3,
+            "expected per-read flush plus final flush, got batched"
         );
     }
 
     #[tokio::test]
     #[cfg(feature = "compression")]
-    async fn bridge_user_to_work_batches_compressed_flushes_on_full_reads() {
+    async fn bridge_user_to_work_compressed_flushes_on_full_reads() {
         use std::pin::Pin;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -1806,9 +1816,9 @@ mod tests {
                 } // EOF
                 self.0 -= 1;
                 let n = buf.remaining();
-                // Repeated bytes — snappy-compressible, so the compressed output
-                // per chunk is tiny and `pending` stays far below the 256 KiB
-                // batch cap: with full reads the batch must NOT flush per chunk.
+                // Repeated bytes — snappy-compressible, so the compressed
+                // output per chunk is tiny. Flush is unconditional per read
+                // (see the loop note), so full reads must flush too.
                 buf.put_slice(&vec![0x41u8; n]);
                 Poll::Ready(Ok(()))
             }
@@ -1829,16 +1839,15 @@ mod tests {
         )
         .await;
 
-        // All reads are full capacity; none is short, so the compressed path
-        // must NOT flush per chunk. It flushes only when the accumulated batch
-        // reaches MAX_WORK_TO_USER_BATCH (unreached here given high
-        // compressibility) or the final shutdown flush. Assert it flushed far
-        // fewer times than it read chunks (batching effective) and at least
-        // once total (final flush happened).
+        // All reads are full capacity; the compressed path must still flush
+        // per chunk — an exact-size burst (n == cap) in a buffered transport
+        // would otherwise sit unflushed until more data or EOF. Expect one
+        // flush per read (plus the final shutdown flush from Plain's
+        // shutdown_bridge): at least `reads` total.
         let f = flushes.load(Ordering::SeqCst);
         assert!(
-            f < reads,
-            "expected batched (non-per-chunk) flush on compressed full reads, got {f} flushes for {reads} reads"
+            f >= reads,
+            "expected per-read flush on compressed full reads, got {f} flushes for {reads} reads"
         );
         assert!(f >= 1, "expected at least the final flush, got {f}");
     }
@@ -1906,8 +1915,9 @@ mod tests {
         )
         .await;
 
-        // Every read is short (n < cap), so the compressed path MUST flush on
-        // each one: interactive latency is preserved even under compression.
+        // Flush is unconditional in bridge_user_to_work, so every read —
+        // short or full — gets exactly one flush. This test pins the
+        // interactive (short-read) case end to end.
         let f = flushes.load(Ordering::SeqCst);
         assert!(
             f >= reads,

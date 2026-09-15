@@ -862,13 +862,25 @@ pub(crate) async fn handle_nat_hole_visitor(
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
-    // Send to visitor via writer
-    {
-        let mut writer_guard = session.visitor_writer.lock().await;
-        if let Some(ref mut w) = *writer_guard {
-            if let Err(e) = write_msg(w, &FrpMessage::NatHoleResp(Box::new(v_resp)), v2).await {
-                warn!(error = %e, "failed to write NatHoleResp to visitor");
-            }
+    // Send to visitor via writer. Same take/release/return shape as the
+    // provider-timeout arm above: `write_msg` is a network write, so it must
+    // not run while the session's writer mutex is held (audit §3 item 2 —
+    // holding it here serialized every other user of the session, and
+    // multiplied with the nathole controller's own lock nesting).
+    let mut taken_writer = session.visitor_writer.lock().await.take();
+    if let Some(ref mut w) = taken_writer {
+        if let Err(e) = write_msg(w, &FrpMessage::NatHoleResp(Box::new(v_resp)), v2).await {
+            warn!(error = %e, "failed to write NatHoleResp to visitor");
+        }
+        // Return the writer to the session
+        *session.visitor_writer.lock().await = taken_writer;
+        // The slot was None for the whole network write, so a concurrent
+        // `Controller::complete` that grabbed the mutex observed None and
+        // skipped dropping the visitor writer — the socket would then stay
+        // open until this handler's Arc dropped (audit review LOW). If the
+        // session has left the table in the meantime, that drop is ours now.
+        if state.xtcp.nat_hole.sessions.get(&sid).await.is_none() {
+            drop(session.visitor_writer.lock().await.take());
         }
     }
 
@@ -1543,7 +1555,7 @@ mod nat_hole_visitor_bounded_send_tests {
              visitor fd + session forever"
         );
         assert!(
-            state.xtcp.nat_hole.sessions.read().await.is_empty(),
+            state.xtcp.nat_hole.sessions.is_empty(),
             "F14: session must be expired after the bounded send times out"
         );
 

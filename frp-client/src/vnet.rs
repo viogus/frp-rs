@@ -27,7 +27,15 @@ pub(crate) type VnetPeerRoute = (String, String, String);
 pub(crate) type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;
 
 /// Per-proxy TX channels for forwarding received VnetPackets to TUN devices.
-pub(crate) type VnetTunTxMap = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
+///
+/// The channel element is `Arc<[u8]>` so one received packet can be fanned out
+/// to several TUN channels by refcount instead of a per-peer deep copy.
+pub(crate) type VnetTunTxMap = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<Arc<[u8]>>>>>;
+
+/// Per-proxy subnet as registered: the CIDR string plus its precompiled prefix
+/// set, so the per-packet fan-out in `visitor::deliver_tunnel_ingress` never
+/// parses a CIDR.
+pub(crate) type VnetTunSubnetMap = Arc<Mutex<HashMap<String, frp_vnet::router::PrecompiledSubnet>>>;
 
 /// Per-proxy cancellation senders for running vnet controllers.
 pub(crate) type VnetTunCancelMap = Arc<Mutex<HashMap<String, watch::Sender<bool>>>>;
@@ -96,10 +104,13 @@ impl Service {
         )
         .await?;
         if let Some(cidr) = vnet_tun_cidr(proxy, &cfg.virtual_net.address) {
-            self.vnet_tun_subnets
-                .lock()
-                .await
-                .insert(proxy.name.clone(), cidr);
+            // Precompile the prefix set once, here, at registration: the
+            // per-packet fan-out then does a mask+compare instead of a CIDR
+            // parse per registered TUN proxy per packet.
+            self.vnet_tun_subnets.lock().await.insert(
+                proxy.name.clone(),
+                frp_vnet::router::PrecompiledSubnet::new(cidr),
+            );
         }
         Ok(())
     }
@@ -235,7 +246,7 @@ pub(crate) async fn spawn_vnet_tun_controller(
         let mut tuns = vnet_tuns.lock().await;
         tuns.get_mut(proxy_name)?.take()
     }?;
-    let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (tun_tx, tun_rx) = mpsc::channel::<Arc<[u8]>>(256);
     vnet_tun_tx
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -304,7 +315,7 @@ pub(crate) async fn remove_vnet_tun(
     vnet_tun_tx: &VnetTunTxMap,
     vnet_tun_cancels: &VnetTunCancelMap,
     vnet_tun_names: &Arc<Mutex<HashMap<String, String>>>,
-    vnet_tun_subnets: &Arc<Mutex<HashMap<String, String>>>,
+    vnet_tun_subnets: &VnetTunSubnetMap,
     route_table: &Arc<tokio::sync::RwLock<frp_vnet::router::RouteTable>>,
     vnet_peer_routes: &Arc<Mutex<HashMap<String, VnetPeerRoute>>>,
     writer: &Arc<ControlWriter>,
@@ -323,9 +334,9 @@ pub(crate) async fn remove_vnet_tun(
     let tun_name = vnet_tun_names.lock().await.remove(proxy_name);
     // Remove the OS route for the local TUN subnet (the kernel also cleans it
     // up on TUN teardown, but explicit removal keeps add/remove symmetric).
-    if let Some(cidr) = vnet_tun_subnets.lock().await.remove(proxy_name) {
+    if let Some(subnet) = vnet_tun_subnets.lock().await.remove(proxy_name) {
         if let Some(ref tun_name) = tun_name {
-            remove_os_route(&cidr, tun_name);
+            remove_os_route(subnet.cidr(), tun_name);
         }
     }
     // Defensively drop any peer route recorded under this proxy name so a

@@ -51,6 +51,14 @@ pub struct VhostRoute {
     pub locations: Vec<String>,
     /// Rewrite Host header to this value before forwarding (Go frp compat).
     pub host_header_rewrite: Arc<str>,
+    /// `host_header_rewrite` with CR/LF stripped, precomputed at registration
+    /// (audit §3 item 4): the sanitized rewrite value is immutable per route,
+    /// so the request path appends it to the forwarded head with no
+    /// per-request filter walk or `format!` String. The rewrite GATE still
+    /// tests the raw `host_header_rewrite` above — a raw value that
+    /// sanitizes to empty still emits `Host: \r\n`, byte-identical to the
+    /// old per-request filter.
+    pub host_header_rewrite_sanitized: Arc<str>,
     /// HTTP Basic Auth credentials (empty = no auth).
     pub http_user: Arc<str>,
     pub http_pwd: Arc<str>,
@@ -78,6 +86,8 @@ pub struct VhostRouteMatch {
     /// request must be dispatched round-robin across the group members.
     pub group: Arc<str>,
     pub host_header_rewrite: Arc<str>,
+    /// Pre-sanitized rewrite value — see `VhostRoute::host_header_rewrite_sanitized`.
+    pub host_header_rewrite_sanitized: Arc<str>,
     pub http_user: Arc<str>,
     pub http_pwd: Arc<str>,
     pub route_by_http_user: Arc<str>,
@@ -92,6 +102,7 @@ impl VhostRouteMatch {
             run_id: Arc::clone(&route.run_id),
             group: Arc::clone(&route.group),
             host_header_rewrite: Arc::clone(&route.host_header_rewrite),
+            host_header_rewrite_sanitized: Arc::clone(&route.host_header_rewrite_sanitized),
             http_user: Arc::clone(&route.http_user),
             http_pwd: Arc::clone(&route.http_pwd),
             route_by_http_user: Arc::clone(&route.route_by_http_user),
@@ -295,6 +306,9 @@ impl VhostManager {
             group: group.into(),
             locations: locations.to_vec(),
             host_header_rewrite: host_header_rewrite.into(),
+            // Sanitize ONCE here instead of per request (audit §3 item 4).
+            // \r and \n are stripped to prevent HTTP header injection.
+            host_header_rewrite_sanitized: sanitize_rewrite_host(host_header_rewrite).into(),
             http_user: http_user.into(),
             http_pwd: http_pwd.into(),
             route_by_http_user: route_by_http_user.into(),
@@ -716,7 +730,11 @@ async fn serve_vhost_request<S>(
         _ => return,
     };
 
-    let pre_read = buf[..n].to_vec();
+    // Capacity hint (audit §3 item 4): the head buffer can grow to the 4096
+    // read cap below, so allocate that once instead of letting `to_vec()`'s
+    // exact-size Vec realloc its way up one drip read at a time.
+    let mut pre_read = Vec::with_capacity(4096);
+    pre_read.extend_from_slice(&buf[..n]);
 
     // HTTP/2 prior-knowledge preface (h2c): binary frames, no text Host
     // header. The listener's single read may return a partial preface (TCP
@@ -831,13 +849,27 @@ async fn handle_http1_request<S>(
     // https legs raw-forward with neither, as does this window's Go
     // literal. The config-on-client-head divergence is documented on
     // clamp_vhost_timeout.)
-    while pre_read.len() < 4096 && frp_core::textproto::head_end(&pre_read).is_none() {
+
+    // Head-end scan, incremental (audit §3 item 4), owning the reads too:
+    // `HeadEndScanner` carries the line offset across feeds (the buffer
+    // only ever grows here) and reports the FIRST blank line exactly as a
+    // whole-buffer `head_end` rescan does, so the verdicts below are
+    // byte-identical; the vhost_h2c and bridge head loops already work this
+    // way. Keeping the old rescan loop alongside it would have re-scanned
+    // every earlier chunk per read (O(n²) for a drip-fed head) AND made
+    // this loop unreachable (it can only be entered once the cap or EOF
+    // was already hit). One scan serves all three consumers: the 431 cap
+    // gate, the unterminated-head gate, and the head slice.
+    let mut head_scanner = frp_core::textproto::HeadEndScanner::new();
+    let mut head_end = head_scanner.feed(&pre_read);
+    while pre_read.len() < 4096 && head_end.is_none() {
         let mut buf = [0u8; 4096];
         let m = match tokio::time::timeout_at(head_deadline, stream.read(&mut buf)).await {
             Ok(Ok(m)) if m > 0 => m,
             _ => break,
         };
         pre_read.extend_from_slice(&buf[..m]);
+        head_end = head_scanner.feed(&pre_read);
     }
 
     // The head is capped at 4096 bytes. If the cap fills without a blank
@@ -847,7 +879,7 @@ async fn handle_http1_request<S>(
     // instead of forwarding a truncated head — forwarding it makes the
     // backend block waiting for the rest of the head, tying up a work-conn
     // slot (limited DoS on shared vhosts).
-    if pre_read.len() >= 4096 && frp_core::textproto::head_end(&pre_read).is_none() {
+    if pre_read.len() >= 4096 && head_end.is_none() {
         // Go's errTooLarge render (conn.serve: status line + charset +
         // Connection: close + body text — NO Content-Length; the old CL:0
         // shape was audit-round-9 F5 divergence, probe OVERSIZE).
@@ -868,7 +900,7 @@ async fn handle_http1_request<S>(
     // the 431 arm above is the frp-rs cap analog of Go's errTooLarge 431.
     // Close silently: the same 0-byte precedent as the malformed-request-
     // line silent closes elsewhere in this module.
-    if frp_core::textproto::head_end(&pre_read).is_none() {
+    if head_end.is_none() {
         debug!(
             peer = %peer, scheme = %scheme, len = pre_read.len(),
             "closing vhost connection: unterminated request head (deadline expiry or mid-head close)"
@@ -889,7 +921,7 @@ async fn handle_http1_request<S>(
     // Zero-allocation parse for the common ASCII case; fall back to lossy
     // replacement for non-UTF-8 heads. A 400 here would diverge from Go frp,
     // which tolerates obs-text (0x80-0xFF) bytes in header values.
-    let head_end = frp_core::textproto::head_end(&pre_read).unwrap_or(pre_read.len());
+    let head_end = head_end.unwrap_or(pre_read.len());
     let head = &pre_read[..head_end];
     let request_text_cow;
     let request_text: &str = match std::str::from_utf8(head) {
@@ -973,7 +1005,11 @@ async fn handle_http1_request<S>(
     // duplicate Host headers before the 505 gate — probe DUPHOST11:
     // generic 400; a "HTTP/2.0" + duplicate-Host request answers this 400
     // in Go, where the 505 gate runs after the header parse).
-    if count_host_headers(request_text) > 1 {
+    // Single scan (audit §3 item 4): the dup-Host 400 gate and the
+    // missing-Host 400 gate below both consume this count, so the head is
+    // walked once per request instead of twice.
+    let host_header_count = count_host_headers(request_text);
+    if host_header_count > 1 {
         write_go_server_error(&mut stream, "400 Bad Request").await;
         return;
     }
@@ -1011,10 +1047,7 @@ async fn handle_http1_request<S>(
     // probe 1.0NOHOST: served with Host=""). CONNECT is exempt by method
     // (case-sensitive — Go compares the literal "CONNECT", so lowercase
     // "connect" is NOT exempt).
-    if !is_connect
-        && count_host_headers(request_text) == 0
-        && request_line_minor_gte_1(request_text)
-    {
+    if !is_connect && host_header_count == 0 && request_line_minor_gte_1(request_text) {
         write_go_server_error(&mut stream, "400 Bad Request: missing required Host header").await;
         return;
     }
@@ -1429,7 +1462,7 @@ pub(crate) async fn resolve_vhost_request(
     // runs BEFORE the method gate, so a CONNECT to an auth-protected route is
     // still 407/401 before any byte is forwarded.
     let request_head = if !is_connect && !route.host_header_rewrite.is_empty() {
-        rewrite_host_header(request_head, &route.host_header_rewrite)
+        rewrite_host_header(request_head, &route.host_header_rewrite_sanitized)
     } else {
         request_head
     };
@@ -2281,11 +2314,22 @@ fn split_path_and_query(path: &str) -> &str {
     }
 }
 
+/// Strip CR/LF from a configured `host_header_rewrite` value to prevent HTTP
+/// header injection. Called ONCE per route at registration
+/// (`VhostManager::register`); the request path uses the stored
+/// `VhostRoute::host_header_rewrite_sanitized` directly (audit §3 item 4).
+fn sanitize_rewrite_host(host: &str) -> String {
+    host.chars().filter(|&c| c != '\r' && c != '\n').collect()
+}
+
 /// Rewrite the Host header in an HTTP request's raw bytes.
 /// Finds the first `Host:` or `host:` line and replaces it with the given value.
 /// Byte-oriented to avoid mangling non-UTF-8 request data.
 /// Returns a new Vec<u8> with the rewritten header. When no Host header is
 /// present, the input is returned unchanged (ownership transferred, no copy).
+///
+/// `new_host` must already be CR/LF-sanitized — every caller passes the
+/// route's registration-time `host_header_rewrite_sanitized`.
 fn rewrite_host_header(data: Vec<u8>, new_host: &str) -> Vec<u8> {
     // Only the header block up to the first blank line is scanned (audit
     // fix): bytes past the terminator are entity body / pipelined requests
@@ -2326,15 +2370,17 @@ fn rewrite_host_header(data: Vec<u8>, new_host: &str) -> Vec<u8> {
         .map(|p| host_start + p + 2)
         .unwrap_or(data.len());
 
-    // Sanitize \r and \n to prevent HTTP header injection.
-    let safe_host: String = new_host
-        .chars()
-        .filter(|&c| c != '\r' && c != '\n')
-        .collect();
-    let new_header = format!("Host: {}\r\n", safe_host);
-    let mut result = Vec::with_capacity(data.len() + new_header.len());
+    // The rewrite value is pre-sanitized at registration (audit §3 item 4),
+    // so the header line is framed straight into the result buffer — the
+    // per-request `chars().filter().collect()` String and the
+    // `format!("Host: {}\r\n")` intermediate are gone. Byte-identical to
+    // the old framing for every input: same "Host: " prefix, same
+    // stripped value, same CRLF.
+    let mut result = Vec::with_capacity(data.len() + 6 + new_host.len() + 2);
     result.extend_from_slice(&data[..host_start]);
-    result.extend_from_slice(new_header.as_bytes());
+    result.extend_from_slice(b"Host: ");
+    result.extend_from_slice(new_host.as_bytes());
+    result.extend_from_slice(b"\r\n");
     result.extend_from_slice(&data[line_end..]);
     result
 }
@@ -2731,8 +2777,14 @@ fn inject_vhost_request_headers(
         .any(|p| &p[..p.len() - 1] == b"x-forwarded-proto");
     // X-Forwarded-For: append peer (Go ReverseProxy appends to prior value).
     if !overrides_xff {
+        use std::io::Write;
         let mut xff = existing_xff;
-        xff.extend_from_slice(peer.ip().to_string().as_bytes());
+        // Format the peer address straight into the chain (audit §3 item 4):
+        // `peer.ip().to_string()` allocated a String per request just to be
+        // copied into the output. Same bytes for every address family, no
+        // heap allocation. The discard is safe — writing to a Vec cannot
+        // fail — and is commented per project convention.
+        let _ = write!(xff, "{}", peer.ip());
         out.extend_from_slice(b"X-Forwarded-For: ");
         out.extend_from_slice(&xff);
         out.extend_from_slice(b"\r\n");
@@ -4417,6 +4469,7 @@ mod tests {
             group: "".into(),
             locations: locations.to_vec(),
             host_header_rewrite: "".into(),
+            host_header_rewrite_sanitized: "".into(),
             http_user: "".into(),
             http_pwd: "".into(),
             route_by_http_user: "".into(),

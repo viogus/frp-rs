@@ -230,6 +230,21 @@ pub fn select_aead_algorithm(client_algorithms: &[Cow<'static, str>]) -> Option<
 // Constructors
 // ---------------------------------------------------------------------------
 
+/// UDPPacket codecs every frp-rs ClientHello advertises — `binary-v1` is the
+/// DEFAULT, matching Go frp v0.71.0 (`clientHelloWithCryptoRandom`,
+/// pkg/proto/wire/wire.go). There is no opt-in and no config knob: a V2
+/// session always offers the compact type-19 codec, and the peer selects it
+/// whenever it understands the capability.
+///
+/// The JSON `UDPPacket` (type 13) form therefore only survives as the compat
+/// fallback for a peer that does not advertise `binary-v1` (Go frp ≤ 0.70 and
+/// any other older peer). Such a peer selects nothing, the ServerHello carries
+/// `udpPacketCodec: ""`, and both ends keep speaking JSON — see
+/// [`select_udp_packet_codec`] and [`CryptoContext::udp_packet_codec`].
+pub fn default_udp_packet_codecs() -> Vec<Cow<'static, str>> {
+    vec![crate::udp_binary::UDP_PACKET_CODEC_BINARY.into()]
+}
+
 impl ClientHello {
     /// Build a ClientHello with crypto capabilities.
     /// Generates 32 random bytes for client_random.
@@ -250,9 +265,9 @@ impl ClientHello {
             capabilities: ClientCapabilities {
                 message: MessageCapabilities {
                     codecs: vec!["json".into()],
-                    // Advertise the UDP packet binary codec, matching Go frp
-                    // v0.71.0's clientHelloWithCryptoRandom.
-                    udp_packet_codecs: vec![crate::udp_binary::UDP_PACKET_CODEC_BINARY.into()],
+                    // Advertise the UDP packet binary codec by default,
+                    // matching Go frp v0.71.0's clientHelloWithCryptoRandom.
+                    udp_packet_codecs: default_udp_packet_codecs(),
                 },
                 crypto: CryptoCapabilities {
                     algorithms: preferred_aead_algorithms(),
@@ -273,7 +288,7 @@ impl ClientHello {
             capabilities: ClientCapabilities {
                 message: MessageCapabilities {
                     codecs: vec!["json".into()],
-                    udp_packet_codecs: vec![crate::udp_binary::UDP_PACKET_CODEC_BINARY.into()],
+                    udp_packet_codecs: default_udp_packet_codecs(),
                 },
                 crypto: CryptoCapabilities {
                     algorithms: vec![],
@@ -341,6 +356,12 @@ impl ServerHello {
 
 /// Select a UDPPacket codec from the client's advertised list, mirroring Go
 /// frp v0.71.0 `selectUDPPacketCodec`: `binary-v1` if advertised, else "".
+///
+/// Every frp-rs peer advertises `binary-v1` by default
+/// ([`default_udp_packet_codecs`]) and Go frp v0.71.0 does the same, so this
+/// returns the binary codec for any two peers of those builds — the JSON
+/// `UDPPacket` path is reached only by a peer that predates the capability
+/// (or does not implement it), which is exactly the compat fallback.
 pub fn select_udp_packet_codec(codecs: &[Cow<'static, str>]) -> &'static str {
     if codecs
         .iter()
@@ -892,6 +913,245 @@ mod tests {
             udp_packet_codec: String::new(),
         };
         assert!(ctx.udp_packet_codec.is_empty());
+    }
+
+    #[test]
+    fn default_negotiation_selects_binary_udp_codec() {
+        // Perf audit Phase 2 item 4: `binary-v1` is the DEFAULT outcome of
+        // capability negotiation — the stock ClientHello advertises the
+        // default list and the server's selection over that list is
+        // `binary-v1`, with no config knob and no opt-in on either side.
+        let hello = ClientHello::new("tcp", false, true).unwrap();
+        assert_eq!(
+            hello.capabilities.message.udp_packet_codecs,
+            default_udp_packet_codecs()
+        );
+        let negotiated = select_udp_packet_codec(&hello.capabilities.message.udp_packet_codecs);
+        assert_eq!(negotiated, crate::udp_binary::UDP_PACKET_CODEC_BINARY);
+
+        // The selection reaches the client inside the ServerHello.
+        let server_hello = ServerHello::with_crypto_and_udp(
+            AeadAlgorithm::Aes256Gcm,
+            vec![0u8; CRYPTO_RANDOM_SIZE],
+            negotiated,
+        );
+        assert_eq!(
+            server_hello.selected.message.udp_packet_codec,
+            crate::udp_binary::UDP_PACKET_CODEC_BINARY
+        );
+        let json = serde_json::to_string(&server_hello).unwrap();
+        assert!(
+            json.contains("\"udpPacketCodec\":\"binary-v1\""),
+            "got: {json}"
+        );
+
+        // Both ClientHello constructors advertise the same default (the
+        // no-crypto form is used by Rust↔Rust plain V2).
+        assert_eq!(
+            ClientHello::new_without_crypto("tcp", false, true)
+                .capabilities
+                .message
+                .udp_packet_codecs,
+            default_udp_packet_codecs()
+        );
+    }
+
+    #[test]
+    fn peer_without_udp_codec_capability_falls_back_to_json() {
+        // Go frp <= 0.70 (and any build without the capability) sends a
+        // ClientHello with no `udpPacketCodecs` key at all. It must deserialize
+        // to an empty list and select nothing, keeping JSON UDPPacket (type 13)
+        // on both ends — the compat fallback.
+        let legacy = r#"{
+            "bootstrap": {"transport": "tcp", "tls": true, "tcpMux": true},
+            "capabilities": {
+                "message": {"codecs": ["json"]},
+                "crypto": {"algorithms": ["aes-256-gcm"]}
+            }
+        }"#;
+        let hello: ClientHello = serde_json::from_str(legacy).unwrap();
+        assert!(
+            hello.capabilities.message.udp_packet_codecs.is_empty(),
+            "legacy ClientHello must deserialize to an empty codec list"
+        );
+        assert_eq!(
+            select_udp_packet_codec(&hello.capabilities.message.udp_packet_codecs),
+            ""
+        );
+        // An unknown (never-negotiated) codec name is also a fallback, never a
+        // selection — the server only ever picks `binary-v1`.
+        assert_eq!(select_udp_packet_codec(&[Cow::Borrowed("json-v9")]), "");
+    }
+
+    #[tokio::test]
+    async fn negotiated_default_drives_binary_frames_and_legacy_drives_json() {
+        // The negotiated value is what the V2 UDP/SUDP data plane consumes:
+        // the default negotiation (both sides advertise) yields type-19 binary
+        // frames, while the legacy fallback writes JSON UDPPacket (type 13)
+        // that an old peer's plain V2 message reader still decodes.
+        use crate::msg::{self, FrpMessage, UdpAddr};
+        let packet = FrpMessage::UDPPacket(msg::UDPPacket {
+            content: b"datagram".to_vec(),
+            local_addr: None,
+            remote_addr: Some(UdpAddr {
+                ip: "127.0.0.1".to_string(),
+                port: 4242,
+                zone: String::new(),
+            }),
+        });
+        let hello = ClientHello::new("tcp", false, true).unwrap();
+        let negotiated = select_udp_packet_codec(&hello.capabilities.message.udp_packet_codecs);
+
+        // Default (binary-v1): the message body carries type ID 19.
+        let (mut w, mut r) = tokio::io::duplex(8192);
+        let mut scratch = Vec::new();
+        crate::protocol::write_msg_v2_with_udp_codec(
+            &mut w,
+            &packet,
+            Some(negotiated),
+            false,
+            &mut scratch,
+        )
+        .await
+        .unwrap();
+        let (frame_type, _flags, payload) =
+            crate::protocol::read_v2_frame_raw(&mut r).await.unwrap();
+        assert_eq!(frame_type, crate::protocol::V2_FRAME_TYPE_MESSAGE);
+        assert_eq!(
+            u16::from_be_bytes([payload[0], payload[1]]),
+            msg::V2_TYPE_UDP_PACKET_BINARY,
+            "default negotiation must write the type-19 binary codec"
+        );
+        // Decode roundtrip: both `read_msg_v2*` variants consume the frame
+        // header themselves (they are the production read path over a raw
+        // stream), so they must see a fresh stream — the payload Cursor above
+        // starts past the header.
+        let (mut w, mut r) = tokio::io::duplex(8192);
+        let mut scratch = Vec::new();
+        crate::protocol::write_msg_v2_with_udp_codec(
+            &mut w,
+            &packet,
+            Some(negotiated),
+            false,
+            &mut scratch,
+        )
+        .await
+        .unwrap();
+        let decoded =
+            crate::protocol::read_msg_v2_with_udp_codec(&mut r, Some(negotiated), &mut scratch)
+                .await
+                .unwrap();
+        assert_eq!(decoded, packet);
+
+        // Legacy fallback (empty codec): type ID 13 (JSON UDPPacket), decodable
+        // by a plain V2 reader (read_msg_v2 = a peer with no codec logic).
+        let (mut w, mut r) = tokio::io::duplex(8192);
+        let mut scratch = Vec::new();
+        crate::protocol::write_msg_v2_with_udp_codec(&mut w, &packet, None, false, &mut scratch)
+            .await
+            .unwrap();
+        let (_frame_type, _flags, payload) =
+            crate::protocol::read_v2_frame_raw(&mut r).await.unwrap();
+        assert_eq!(
+            u16::from_be_bytes([payload[0], payload[1]]),
+            msg::V2_TYPE_UDP_PACKET,
+            "legacy fallback must write the JSON type-13 UDPPacket"
+        );
+        let (mut w, mut r) = tokio::io::duplex(8192);
+        crate::protocol::write_msg_v2_with_udp_codec(&mut w, &packet, None, false, &mut scratch)
+            .await
+            .unwrap();
+        let decoded = crate::protocol::read_msg_v2(&mut r).await.unwrap();
+        assert_eq!(decoded, packet);
+    }
+
+    #[tokio::test]
+    async fn v2_handshake_defaults_both_ends_to_binary_udp_codec() {
+        // End-to-end over a real socket: the stock handshake (no config) makes
+        // BOTH ends agree on `binary-v1` for the UDP/SUDP data planes.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut io = IoStream::Tcp(stream);
+            v2_handshake_server(&mut io).await
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client_io = IoStream::Tcp(client);
+        let hello_json = v2_handshake_client_send_hello(&mut client_io, "tcp", false, true, true)
+            .await
+            .unwrap();
+        let client_ctx =
+            v2_handshake_client_recv_hello(&mut client_io, &hello_json, "tcp", false, true, true)
+                .await
+                .unwrap()
+                .expect("client must get a crypto context");
+        assert_eq!(
+            client_ctx.udp_packet_codec,
+            crate::udp_binary::UDP_PACKET_CODEC_BINARY
+        );
+
+        let (first_msg, server_ctx) = server.await.unwrap().unwrap();
+        assert!(first_msg.is_none(), "first frame was a ClientHello");
+        let server_ctx = server_ctx.expect("server must get a crypto context");
+        assert_eq!(
+            server_ctx.udp_packet_codec,
+            crate::udp_binary::UDP_PACKET_CODEC_BINARY
+        );
+        // Same handshake transcript and same codec on both ends: the data
+        // plane gate (`udp_packet_codec == Some("binary-v1")`) fires on both.
+        assert_eq!(server_ctx.transcript_hash, client_ctx.transcript_hash);
+    }
+
+    #[tokio::test]
+    async fn legacy_peer_handshake_negotiates_empty_codec() {
+        // Server-side view of the compat fallback: a pre-0.71 peer's
+        // ClientHello (no `udpPacketCodecs`) negotiates successfully with an
+        // empty codec, i.e. the JSON UDPPacket data plane, not an error.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut io = IoStream::Tcp(stream);
+            v2_handshake_server(&mut io).await
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client_io = IoStream::Tcp(client);
+        // Same shape as the legacy JSON above; client_random is required
+        // because the ClientHello still offers AEAD algorithms.
+        let legacy = serde_json::json!({
+            "bootstrap": {"transport": "tcp", "tls": false, "tcpMux": true},
+            "capabilities": {
+                "message": {"codecs": ["json"]},
+                "crypto": {
+                    "algorithms": ["aes-256-gcm"],
+                    "clientRandom": b64_encode(&[7u8; CRYPTO_RANDOM_SIZE]),
+                }
+            }
+        });
+        client_io
+            .write_raw_v2_frame(
+                V2_FRAME_TYPE_CLIENT_HELLO,
+                0,
+                &serde_json::to_vec(&legacy).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let (frame_type, _flags, payload) = client_io.read_raw_v2_frame().await.unwrap();
+        assert_eq!(frame_type, V2_FRAME_TYPE_SERVER_HELLO);
+        let server_hello: ServerHello = serde_json::from_slice(&payload).unwrap();
+        assert!(
+            server_hello.selected.message.udp_packet_codec.is_empty(),
+            "legacy peer must be answered with an empty (JSON fallback) codec"
+        );
+        assert!(server_hello.selected.crypto.is_some());
+
+        let (first_msg, server_ctx) = server.await.unwrap().unwrap();
+        assert!(first_msg.is_none());
+        assert!(server_ctx.unwrap().udp_packet_codec.is_empty());
     }
 
     #[tokio::test]

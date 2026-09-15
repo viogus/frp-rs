@@ -3,6 +3,7 @@
 //! recommend hole-punch behaviors. Go frp v0.69.1 compat: pkg/nathole/controller.go
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,8 @@ use crate::service::InternalMsg;
 
 /// Maximum concurrent NAT hole punch sessions.
 /// Prevents unbounded memory growth under load or attack.
+/// Enforced table-wide by `SessionTable`'s atomic reservation (the sharded
+/// table has no single lock to check a length under).
 const MAX_SESSIONS: usize = 256;
 
 /// Provider registration for XTCP.
@@ -57,10 +60,166 @@ pub struct Session {
     pub analysis_key: std::sync::Mutex<Option<String>>,
 }
 
+/// Number of shards the session table is split into (audit Phase 2 item 5).
+///
+/// 16 is enough to make a single shard's lock a non-issue at the table's
+/// 256-session cap (16 sessions per shard on average) while keeping the
+/// janitor's per-shard sweep cheap.
+pub const SESSION_SHARDS: usize = 16;
+
+/// Shard index for a session id.
+///
+/// `sid` is a client-generated UUID, so any decent hash spreads it uniformly;
+/// `DefaultHasher` is std (no new dependency) and uses fixed keys, i.e. it is
+/// deterministic for a given sid both within and across processes — a sid
+/// always maps to the same shard, which is what makes every lookup routable
+/// without consulting the other shards.
+fn shard_index(sid: &str) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sid.hash(&mut hasher);
+    (hasher.finish() % SESSION_SHARDS as u64) as usize
+}
+
+/// Sharded session table: `sid` → session, split across `SESSION_SHARDS`
+/// independently locked maps.
+///
+/// The single `RwLock<HashMap<..>>` this replaces was one contention point for
+/// every XTCP session operation (audit TOP 3): a scan on one side of the table
+/// serialized with a removal on the other, and vice versa. Sharding keeps the
+/// same operations and the same end state, but a lookup/insert/remove now only
+/// ever waits on its own shard.
+///
+/// The global `MAX_SESSIONS` cap is preserved exactly by `total`, an atomic
+/// reservation counter: the slot is taken (CAS) *before* the shard insert, so
+/// two concurrent inserts can never both slip past the cap, and the counter is
+/// released only when a removal actually took an entry out of a shard.
+pub struct SessionTable {
+    shards: [RwLock<HashMap<String, Arc<Session>>>; SESSION_SHARDS],
+    /// Live reservations (sessions in a shard, plus inserts in flight between
+    /// their CAS and their shard lock). O(1) global count without a global
+    /// lock.
+    total: AtomicUsize,
+}
+
+impl SessionTable {
+    pub fn new() -> Self {
+        SessionTable {
+            shards: std::array::from_fn(|_| RwLock::new(HashMap::new())),
+            total: AtomicUsize::new(0),
+        }
+    }
+
+    /// The owning shard of `sid` — the only shard any `sid`-addressed
+    /// operation touches.
+    fn shard(&self, sid: &str) -> &RwLock<HashMap<String, Arc<Session>>> {
+        &self.shards[shard_index(sid)]
+    }
+
+    /// All shards, for the janitor's sweep (and lock-shape tests).
+    pub(crate) fn shards(&self) -> &[RwLock<HashMap<String, Arc<Session>>>] {
+        &self.shards
+    }
+
+    /// Reserved session count. O(1); may briefly count an insert that has
+    /// reserved its slot but not yet taken its shard lock.
+    pub fn count(&self) -> usize {
+        self.total.load(Ordering::Acquire)
+    }
+
+    /// True when no session is live (nothing reserved, nothing inserted).
+    pub fn is_empty(&self) -> bool {
+        self.total.load(Ordering::Acquire) == 0
+    }
+
+    /// Look up a session, cloning its `Arc` under the shard read lock. The
+    /// shard lock is released before the caller touches any per-session lock.
+    pub async fn get(&self, sid: &str) -> Option<Arc<Session>> {
+        self.shard(sid).read().await.get(sid).cloned()
+    }
+
+    /// Run `f` with the session, holding the shard read lock for the duration.
+    /// `f` must be synchronous (no await): the shard lock is a table lock and
+    /// must never be held across a per-session await.
+    pub async fn with_session<R>(
+        &self,
+        sid: &str,
+        f: impl FnOnce(&Arc<Session>) -> R,
+    ) -> Option<R> {
+        let shard = self.shard(sid).read().await;
+        shard.get(sid).map(f)
+    }
+
+    /// Reserve a slot against the global cap and insert the session into its
+    /// shard. Returns `false` when the table is at `MAX_SESSIONS` — nothing is
+    /// inserted and the caller owns rejection.
+    pub async fn insert(&self, sid: String, session: Arc<Session>) -> bool {
+        if self
+            .total
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_SESSIONS).then_some(n + 1)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        // Armed until the entry lands: a create cancelled while waiting for
+        // the shard lock must not leak a permanent slot against the cap.
+        let mut slot = ReservedSlot {
+            total: &self.total,
+            consumed: false,
+        };
+        // Insert under the owning shard's write lock only.
+        let replaced = self
+            .shard(&sid)
+            .write()
+            .await
+            .insert(sid, session)
+            .is_some();
+        // A landed insert is what the reservation now counts — unless it
+        // replaced an existing sid, where the entry count did not change and
+        // the extra reservation has to go back.
+        slot.consumed = !replaced;
+        true
+    }
+
+    /// Remove a session. The shard write lock is released before this returns,
+    /// so callers may await per-session locks afterwards (audit §3 item 2).
+    pub async fn remove(&self, sid: &str) -> Option<Arc<Session>> {
+        let removed = self.shard(sid).write().await.remove(sid);
+        if removed.is_some() {
+            self.total.fetch_sub(1, Ordering::AcqRel);
+        }
+        removed
+    }
+}
+
+impl Default for SessionTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Releases a `MAX_SESSIONS` reservation unless a landed insert consumed it.
+/// The drop path covers an insert future cancelled while it waited for its
+/// shard lock.
+struct ReservedSlot<'a> {
+    total: &'a AtomicUsize,
+    consumed: bool,
+}
+
+impl Drop for ReservedSlot<'_> {
+    fn drop(&mut self) {
+        if !self.consumed {
+            self.total.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 /// Central XTCP NAT hole punch controller.
 pub struct Controller {
     pub client_cfgs: RwLock<HashMap<String, ClientCfg>>,
-    pub sessions: RwLock<HashMap<String, Arc<Session>>>,
+    pub sessions: SessionTable,
     pub analyzer: Analyzer,
 }
 
@@ -68,7 +227,7 @@ impl Controller {
     pub fn new(analysis_data_reserve_duration: Duration) -> Self {
         Controller {
             client_cfgs: RwLock::new(HashMap::new()),
-            sessions: RwLock::new(HashMap::new()),
+            sessions: SessionTable::new(),
             analyzer: Analyzer::new(analysis_data_reserve_duration),
         }
     }
@@ -147,30 +306,24 @@ impl Controller {
             selected_index: Mutex::new(None),
             analysis_key: std::sync::Mutex::new(None),
         });
-        // Check-and-insert atomically under write lock (fixes TOCTOU).
-        let rejection = {
-            let mut sessions = self.sessions.write().await;
-            if sessions.len() >= MAX_SESSIONS {
-                warn!(
-                    max_sessions = MAX_SESSIONS,
-                    "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session"
-                );
-                Some(FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
-                    transaction_id: session.visitor_msg.transaction_id.clone(),
-                    sid: Some(sid.clone()),
-                    error: Some("NAT hole session limit reached".into()),
-                    ..Default::default()
-                })))
-            } else {
-                sessions.insert(sid.clone(), session.clone());
-                None
-            }
-        };
-        // Send the error response to the visitor so it doesn't hang, but only
-        // AFTER releasing the sessions lock: a wedged visitor TCP buffer must
-        // not stall all other XTCP session operations while blocked on this
-        // write.
-        if let Some(rejection) = rejection {
+        // Reserve-and-insert stays atomic (TOCTOU-free) without a table-wide
+        // lock: the slot is CAS-reserved against the global cap, then the
+        // session goes into its own shard.
+        if !self.sessions.insert(sid.clone(), session.clone()).await {
+            warn!(
+                max_sessions = MAX_SESSIONS,
+                "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session"
+            );
+            // Send the error response to the visitor so it doesn't hang. No
+            // table lock is held here at all, so a wedged visitor TCP buffer
+            // cannot stall any other XTCP session operation while blocked on
+            // this write.
+            let rejection = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
+                transaction_id: session.visitor_msg.transaction_id.clone(),
+                sid: Some(sid.clone()),
+                error: Some("NAT hole session limit reached".into()),
+                ..Default::default()
+            }));
             let mut guard = session.visitor_writer.lock().await;
             if let Some(ref mut w) = *guard {
                 // Best-effort: the session is rejected either way, so a failed
@@ -214,29 +367,27 @@ impl Controller {
             selected_index: Mutex::new(None),
             analysis_key: std::sync::Mutex::new(None),
         });
-        // Check-and-insert atomically under write lock (fixes TOCTOU).
-        {
-            let mut sessions = self.sessions.write().await;
-            if sessions.len() >= MAX_SESSIONS {
-                warn!(
-                    max_sessions = MAX_SESSIONS,
-                    "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session"
-                );
-                // Send error response via control channel so visitor doesn't hang.
-                if let Some(ref tx) = session.visitor_ctl_tx {
-                    let _ = tx.try_send(InternalMsg::WriteNatHoleResp {
-                        transaction_id: session.visitor_msg.transaction_id.clone(),
-                        error: Some("NAT hole session limit reached".into()),
-                        sid: Some(sid.clone()),
-                        protocol: None,
-                        candidate_addrs: None,
-                        assisted_addrs: None,
-                        detect_behavior: None,
-                    });
-                }
-                return Err(format!("NAT hole session limit reached ({MAX_SESSIONS})"));
+        // Reserve-and-insert stays atomic (TOCTOU-free) without a table-wide
+        // lock: the slot is CAS-reserved against the global cap, then the
+        // session goes into its own shard.
+        if !self.sessions.insert(sid.clone(), session.clone()).await {
+            warn!(
+                max_sessions = MAX_SESSIONS,
+                "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session"
+            );
+            // Send error response via control channel so visitor doesn't hang.
+            if let Some(ref tx) = session.visitor_ctl_tx {
+                let _ = tx.try_send(InternalMsg::WriteNatHoleResp {
+                    transaction_id: session.visitor_msg.transaction_id.clone(),
+                    error: Some("NAT hole session limit reached".into()),
+                    sid: Some(sid.clone()),
+                    protocol: None,
+                    candidate_addrs: None,
+                    assisted_addrs: None,
+                    detect_behavior: None,
+                });
             }
-            sessions.insert(sid.clone(), session.clone());
+            return Err(format!("NAT hole session limit reached ({MAX_SESSIONS})"));
         }
         Ok((session, report_rx))
     }
@@ -246,12 +397,10 @@ impl Controller {
     #[instrument(skip(self, msg), fields(transaction_id = %msg.transaction_id, sid = ?msg.sid))]
     pub async fn handle_client(&self, msg: msg::NatHoleClient) {
         if let Some(ref sid) = msg.sid {
-            // Clone Arc<Session> while holding read lock, then drop the lock
-            // before acquiring per-session mutexes to avoid blocking writers.
-            let session = {
-                let sessions = self.sessions.read().await;
-                sessions.get(sid).cloned()
-            };
+            // Clone Arc<Session> while holding the shard read lock, then drop
+            // it before acquiring per-session mutexes to avoid blocking
+            // writers.
+            let session = self.sessions.get(sid).await;
             if let Some(session) = session {
                 trace!(
                     sid = %sid,
@@ -276,12 +425,10 @@ impl Controller {
     /// Handle NatHoleReport from provider.
     pub async fn handle_report(&self, msg: &msg::NatHoleReport) {
         if let Some(sid) = msg.sid.as_deref() {
-            // Clone Arc<Session> while holding read lock, then drop the lock
-            // before acquiring per-session mutexes to avoid blocking writers.
-            let session = {
-                let sessions = self.sessions.read().await;
-                sessions.get(sid).cloned()
-            };
+            // Clone Arc<Session> while holding the shard read lock, then drop
+            // it before acquiring per-session mutexes to avoid blocking
+            // writers.
+            let session = self.sessions.get(sid).await;
             if let Some(session) = session {
                 *session
                     .last_activity
@@ -314,55 +461,90 @@ impl Controller {
     }
 
     /// Complete a session and clean up.
+    ///
+    /// The session leaves its shard under that shard's write lock, but the
+    /// per-session locks are taken only AFTER it is released (audit §3 item 2
+    /// / HIGH #3): awaiting another task's `visitor_writer` mutex while
+    /// holding a table lock parked every other session operation behind this
+    /// one. Sharding narrows that to the session's own shard, and the lock is
+    /// still dropped before the first per-session await. A concurrent task can
+    /// only hold the removed session's `Arc` from an earlier lookup; the
+    /// fields it touches are still individually mutex-protected, and the end
+    /// state (writer dropped, connection closed) is unchanged.
     pub async fn complete(&self, sid: &str) -> Option<String> {
-        let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.remove(sid) {
-            // Drop visitor writer (closes connection)
-            let mut guard = session.visitor_writer.lock().await;
-            drop(guard.take());
-            drop(guard);
+        let session = self.sessions.remove(sid).await?;
 
-            // Signal report
-            if let Some(tx) = session.report_tx.lock().await.take() {
-                let _ = tx.send(msg::NatHoleReport {
-                    sid: Some(sid.to_string()),
-                    success: false,
-                });
-            }
-            return Some(session.proxy_name.clone());
+        // Drop visitor writer (closes connection)
+        let mut guard = session.visitor_writer.lock().await;
+        drop(guard.take());
+        drop(guard);
+
+        // Signal report
+        if let Some(tx) = session.report_tx.lock().await.take() {
+            let _ = tx.send(msg::NatHoleReport {
+                sid: Some(sid.to_string()),
+                success: false,
+            });
         }
-        None
+        Some(session.proxy_name.clone())
     }
 
     /// Remove a session without signalling.
     pub async fn remove(&self, sid: &str) {
-        self.sessions.write().await.remove(sid);
+        self.sessions.remove(sid).await;
     }
 
     /// Remove expired sessions.
+    ///
+    /// Expired ids are collected under a READ lock and removed one by one
+    /// (audit §3 item 2): the scan needs no exclusive access, and the
+    /// removals do not depend on each other. Expiry is monotonic —
+    /// `last_activity` only ever advances — so a session that was stale at
+    /// scan time is still stale when its removal runs.
+    ///
+    /// Sharded (audit Phase 2 item 5): the sweep walks one shard at a time and
+    /// never holds more than one shard lock, so the 60s janitor cannot stall
+    /// the whole table. Each shard keeps the same scan-then-remove shape — its
+    /// read guard is released before its removals run, which route back to
+    /// that same shard. A session inserted into an already-swept shard during
+    /// this pass survives to the next one, exactly as a session inserted after
+    /// the old single scan did.
     pub async fn expire_sessions(&self, timeout: Duration) {
         let now = Instant::now();
-        let mut sessions = self.sessions.write().await;
-        sessions.retain(|_sid, s| {
-            let last = *s.last_activity.lock().unwrap_or_else(|e| e.into_inner());
-            now.duration_since(last) < timeout
-        });
+        for shard in self.sessions.shards() {
+            let expired: Vec<String> = {
+                let sessions = shard.read().await;
+                sessions
+                    .iter()
+                    .filter(|(_sid, s)| {
+                        let last = *s.last_activity.lock().unwrap_or_else(|e| e.into_inner());
+                        now.duration_since(last) >= timeout
+                    })
+                    .map(|(sid, _)| sid.clone())
+                    .collect()
+            };
+            for sid in expired {
+                self.remove(&sid).await;
+            }
+        }
     }
 
     // --- Backward-compat methods matching old NatHoleCoordinator API ---
 
     /// Take the visitor writer for a session (accept-loop path).
+    ///
+    /// The shard read lock is dropped before the per-session writer lock is
+    /// awaited (audit TOP 3): holding the table lock across it turned every
+    /// bridge write into table-wide write starvation.
     pub async fn take_writer(&self, sid: &str) -> Option<Box<dyn AsyncWrite + Send + Unpin>> {
-        let sessions = self.sessions.read().await;
-        let session = sessions.get(sid)?;
+        let session = self.sessions.get(sid).await?;
         let mut guard = session.visitor_writer.lock().await;
         guard.take()
     }
 
     /// Return the writer back to the session after use.
     pub async fn return_writer(&self, sid: &str, writer: Box<dyn AsyncWrite + Send + Unpin>) {
-        let sessions = self.sessions.read().await;
-        if let Some(session) = sessions.get(sid) {
+        if let Some(session) = self.sessions.get(sid).await {
             *session.visitor_writer.lock().await = Some(writer);
         }
     }
@@ -370,10 +552,11 @@ impl Controller {
     /// Forward NatHoleSid to the visitor via control channel.
     /// Returns true if forwarded via ctl path.
     pub async fn forward_sid_via_ctl(&self, sid: &str) -> bool {
-        let tx = {
-            let sessions = self.sessions.read().await;
-            sessions.get(sid).and_then(|s| s.visitor_ctl_tx.clone())
-        };
+        let tx = self
+            .sessions
+            .get(sid)
+            .await
+            .and_then(|s| s.visitor_ctl_tx.clone());
         if let Some(tx) = tx {
             // Protocol-critical one-shot message: use send().await for
             // reliable delivery. try_send Full would silently drop the
@@ -400,10 +583,11 @@ impl Controller {
         assisted_addrs: Option<Vec<String>>,
         detect_behavior: Option<msg::NatHoleDetectBehavior>,
     ) -> bool {
-        let tx = {
-            let sessions = self.sessions.read().await;
-            sessions.get(sid).and_then(|s| s.visitor_ctl_tx.clone())
-        };
+        let tx = self
+            .sessions
+            .get(sid)
+            .await
+            .and_then(|s| s.visitor_ctl_tx.clone());
         if let Some(tx) = tx {
             let _ = tx
                 .send(InternalMsg::WriteNatHoleResp {
@@ -423,10 +607,11 @@ impl Controller {
 
     /// Forward NatHoleReport to the visitor via control channel.
     pub async fn forward_report_via_ctl(&self, sid: &str) -> bool {
-        let tx = {
-            let sessions = self.sessions.read().await;
-            sessions.get(sid).and_then(|s| s.visitor_ctl_tx.clone())
-        };
+        let tx = self
+            .sessions
+            .get(sid)
+            .await
+            .and_then(|s| s.visitor_ctl_tx.clone());
         if let Some(tx) = tx {
             let _ = tx
                 .send(InternalMsg::WriteNatHoleReport {
@@ -651,20 +836,47 @@ mod tests {
         })
     }
 
-    /// Regression: rejecting a session at MAX_SESSIONS must not hold the
-    /// `sessions` write lock across the rejection write to the visitor — a
-    /// wedged visitor TCP buffer must not stall all other XTCP session
-    /// operations. The rejection frame is written after the lock is released.
+    /// A sid that lands on `target` shard. `shard_index` is a pure hash of the
+    /// sid, so tests can pin sessions to chosen shards without knowing it.
+    fn sid_for_shard(target: usize, salt: &str) -> String {
+        for i in 0..10_000 {
+            let sid = format!("sid-{salt}-{target}-{i}");
+            if shard_index(&sid) == target {
+                return sid;
+            }
+        }
+        panic!("no sid landed on shard {target}");
+    }
+
+    /// Is `sid` present in the shard it hashes to?
+    async fn table_contains(controller: &Controller, sid: &str) -> bool {
+        controller
+            .sessions
+            .shard(sid)
+            .read()
+            .await
+            .contains_key(sid)
+    }
+
+    /// Regression: rejecting a session at MAX_SESSIONS must not hold a
+    /// `sessions` lock across the rejection write to the visitor — a wedged
+    /// visitor TCP buffer must not stall all other XTCP session operations.
+    /// The rejection frame is written after the cap check, and the cap check
+    /// itself is an atomic reservation, so no shard lock exists to hold.
     #[tokio::test]
     async fn max_sessions_rejection_does_not_hold_lock_across_write() {
         let controller = Arc::new(Controller::new(Duration::from_secs(3600)));
         // Fill the session table to the cap.
-        {
-            let mut sessions = controller.sessions.write().await;
-            for i in 0..MAX_SESSIONS {
-                sessions.insert(format!("filler-{i}"), dummy_session(&format!("filler-{i}")));
-            }
+        for i in 0..MAX_SESSIONS {
+            let sid = format!("filler-{i}");
+            assert!(
+                controller
+                    .sessions
+                    .insert(sid.clone(), dummy_session(&sid))
+                    .await
+            );
         }
+        assert_eq!(controller.sessions.count(), MAX_SESSIONS);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let writer: Box<dyn AsyncWrite + Send + Unpin> = Box::new(WedgedWriter {
             started: Some(started_tx),
@@ -683,16 +895,309 @@ mod tests {
         started_rx
             .await
             .expect("rejection write to wedged visitor started");
-        // The sessions lock must be acquirable while the write is blocked.
-        let guard = tokio::time::timeout(Duration::from_millis(500), controller.sessions.read())
-            .await
-            .expect("sessions lock held across the rejection write");
-        drop(guard);
+        // Every shard lock must be acquirable while the write is blocked.
+        tokio::time::timeout(Duration::from_millis(500), async {
+            for shard in controller.sessions.shards() {
+                let _held = shard.read().await;
+            }
+        })
+        .await
+        .expect("a sessions shard lock held across the rejection write");
         // The create call is still stuck on the wedged write (not completed).
         assert!(
             !handle.is_finished(),
             "rejection task should still be writing"
         );
         handle.abort();
+    }
+
+    /// Regression (audit §3 item 2 / HIGH #3): `complete` must drop its shard
+    /// write lock BEFORE it awaits the per-session locks. Holding the table
+    /// lock across them parked every other session operation in the table —
+    /// and compounded with the visitor-writer lock being taken for network
+    /// writes elsewhere.
+    #[tokio::test]
+    async fn complete_releases_sessions_lock_before_per_session_lock() {
+        let controller = Arc::new(Controller::new(Duration::from_secs(3600)));
+        let session = dummy_session("sid-1");
+        assert!(
+            controller
+                .sessions
+                .insert("sid-1".to_string(), session.clone())
+                .await
+        );
+
+        // Park the session's writer lock the way a bridge write would.
+        let held = session.visitor_writer.lock().await;
+
+        let ctl = controller.clone();
+        let handle = tokio::spawn(async move { ctl.complete("sid-1").await });
+
+        // The entry must be gone while the completion is still parked on the
+        // writer lock — proof the shard lock was released first. On the old
+        // shape (table lock held across the per-session await) this poll times
+        // out.
+        let removed = tokio::time::timeout(Duration::from_secs(5), async {
+            while table_contains(&controller, "sid-1").await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            removed.is_ok(),
+            "sessions shard lock held across the per-session lock"
+        );
+        assert!(
+            !handle.is_finished(),
+            "completion should still be waiting on the writer lock"
+        );
+
+        // Releasing it lets the completion finish and report the session.
+        drop(held);
+        assert_eq!(handle.await.unwrap(), Some("filler".to_string()));
+    }
+
+    /// `expire_sessions` drops stale sessions and keeps fresh ones (the scan
+    /// runs under a shard read lock, the removals one by one under that
+    /// shard's write lock).
+    #[tokio::test]
+    async fn expire_sessions_removes_stale_keeps_fresh() {
+        let controller = Controller::new(Duration::from_secs(3600));
+        let stale = dummy_session("stale");
+        assert!(
+            controller
+                .sessions
+                .insert("stale".to_string(), stale.clone())
+                .await
+        );
+        assert!(
+            controller
+                .sessions
+                .insert("fresh".to_string(), dummy_session("fresh"))
+                .await
+        );
+        // Scope the std-Mutex guard: it must be released before the await.
+        // `expire_sessions` locks the same `last_activity` mutex synchronously
+        // while scanning, so leaving the guard alive across the await parks the
+        // current-thread test runtime forever.
+        {
+            let mut last = stale
+                .last_activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *last = Instant::now() - Duration::from_secs(120);
+        }
+
+        controller.expire_sessions(Duration::from_secs(60)).await;
+
+        assert!(
+            !table_contains(&controller, "stale").await,
+            "stale session must expire"
+        );
+        assert!(
+            table_contains(&controller, "fresh").await,
+            "fresh session must survive"
+        );
+    }
+
+    /// Sharding sanity (audit Phase 2 item 5): UUID-shaped ids must spread
+    /// across every shard, and a stored session must be reachable through the
+    /// shard its hash predicts. A degenerate hash would quietly put every
+    /// session back behind one lock — the exact contention point the sharded
+    /// table exists to remove.
+    #[tokio::test]
+    async fn session_table_spreads_sids_across_shards() {
+        // Deterministic UUID-shaped ids: `shard_index` is a fixed hash, so the
+        // distribution below is deterministic too (no rng, no flake).
+        let sids: Vec<String> = (0..512u32)
+            .map(|i| format!("{i:08x}-{i:04x}-{i:04x}-{i:04x}-{i:012x}"))
+            .collect();
+        let mut per_shard = [0usize; SESSION_SHARDS];
+        for sid in &sids {
+            per_shard[shard_index(sid)] += 1;
+        }
+        let occupied = per_shard.iter().filter(|n| **n > 0).count();
+        assert_eq!(
+            occupied, SESSION_SHARDS,
+            "every shard must be used, got {per_shard:?}"
+        );
+        // 512 ids over 16 shards: 32 expected per shard. The band only has to
+        // catch a hash that piles sessions onto a few shards.
+        let max = *per_shard.iter().max().unwrap();
+        assert!(max <= 96, "poor shard balance: {per_shard:?}");
+
+        // Insert routes to the owning shard and nowhere else.
+        let controller = Controller::new(Duration::from_secs(3600));
+        let sid = sids[0].clone();
+        assert!(
+            controller
+                .sessions
+                .insert(sid.clone(), dummy_session(&sid))
+                .await
+        );
+        let owner = shard_index(&sid);
+        assert!(controller
+            .sessions
+            .shards()
+            .get(owner)
+            .unwrap()
+            .read()
+            .await
+            .contains_key(&sid));
+        for (i, shard) in controller.sessions.shards().iter().enumerate() {
+            if i != owner {
+                assert!(
+                    shard.read().await.get(&sid).is_none(),
+                    "sid must live in exactly one shard ({owner}), found in {i}"
+                );
+            }
+        }
+        assert_eq!(controller.sessions.count(), 1);
+    }
+
+    /// Sharding (audit Phase 2 item 5): `complete` drops the session from its
+    /// OWN shard and releases that shard's lock before it awaits the
+    /// per-session locks, so a session parked on a bridge write cannot block
+    /// the rest of the table. Pinned by expiring a stale session on a
+    /// DIFFERENT shard while the completion is still parked.
+    #[tokio::test]
+    async fn complete_removes_from_owning_shard_and_releases_shard_lock() {
+        let controller = Arc::new(Controller::new(Duration::from_secs(3600)));
+        let parked_sid = sid_for_shard(0, "parked");
+        let stale_sid = sid_for_shard(1, "stale");
+        assert_ne!(shard_index(&parked_sid), shard_index(&stale_sid));
+
+        let parked = dummy_session(&parked_sid);
+        assert!(
+            controller
+                .sessions
+                .insert(parked_sid.clone(), parked.clone())
+                .await
+        );
+        let stale = dummy_session(&stale_sid);
+        assert!(
+            controller
+                .sessions
+                .insert(stale_sid.clone(), stale.clone())
+                .await
+        );
+        // Age the other-shard session past the janitor timeout, scoping the
+        // std-Mutex guard so it is released before any await.
+        {
+            let mut last = stale
+                .last_activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *last = Instant::now() - Duration::from_secs(120);
+        }
+        assert!(table_contains(&controller, &stale_sid).await);
+
+        // Park the session's writer lock the way a bridge write would.
+        let held = parked.visitor_writer.lock().await;
+
+        let ctl = controller.clone();
+        let sid = parked_sid.clone();
+        let handle = tokio::spawn(async move { ctl.complete(&sid).await });
+
+        // The entry must be gone from its own shard while the completion is
+        // still parked on the writer lock — proof the shard lock was released
+        // first.
+        let removed = tokio::time::timeout(Duration::from_secs(5), async {
+            while table_contains(&controller, &parked_sid).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            removed.is_ok(),
+            "shard write lock held across the per-session lock"
+        );
+        assert!(
+            !handle.is_finished(),
+            "completion should still be waiting on the writer lock"
+        );
+
+        // The shard's write lock is free too (not held across the await)...
+        {
+            let guard = tokio::time::timeout(
+                Duration::from_millis(500),
+                controller.sessions.shard(&parked_sid).write(),
+            )
+            .await
+            .expect("shard write lock held across the per-session await");
+            assert!(!guard.contains_key(&parked_sid));
+        }
+
+        // ... and the janitor keeps making progress on the other shards.
+        controller.expire_sessions(Duration::from_secs(60)).await;
+        assert!(
+            !table_contains(&controller, &stale_sid).await,
+            "expiry must proceed on other shards while complete() is parked"
+        );
+
+        // Releasing it lets the completion finish and report the session.
+        drop(held);
+        assert_eq!(handle.await.unwrap(), Some("filler".to_string()));
+        assert!(!table_contains(&controller, &parked_sid).await);
+    }
+
+    /// Sharding (audit Phase 2 item 5): the janitor sweeps every shard — one
+    /// stale session per shard expires, and the fresh sibling sharing its
+    /// shard survives.
+    #[tokio::test]
+    async fn expire_sessions_removes_expired_across_all_shards() {
+        let controller = Controller::new(Duration::from_secs(3600));
+        let mut stale_sids = Vec::new();
+        let mut fresh_sids = Vec::new();
+        for shard in 0..SESSION_SHARDS {
+            let stale_sid = sid_for_shard(shard, "stale");
+            let fresh_sid = sid_for_shard(shard, "fresh");
+            assert_eq!(shard_index(&stale_sid), shard);
+            assert_eq!(shard_index(&fresh_sid), shard);
+            let stale = dummy_session(&stale_sid);
+            assert!(
+                controller
+                    .sessions
+                    .insert(stale_sid.clone(), stale.clone())
+                    .await
+            );
+            assert!(
+                controller
+                    .sessions
+                    .insert(fresh_sid.clone(), dummy_session(&fresh_sid))
+                    .await
+            );
+            {
+                let mut last = stale
+                    .last_activity
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                *last = Instant::now() - Duration::from_secs(120);
+            }
+            stale_sids.push(stale_sid);
+            fresh_sids.push(fresh_sid);
+        }
+        // One stale + one fresh session in every shard.
+        assert_eq!(controller.sessions.count(), 2 * SESSION_SHARDS);
+
+        controller.expire_sessions(Duration::from_secs(60)).await;
+
+        assert_eq!(
+            controller.sessions.count(),
+            SESSION_SHARDS,
+            "exactly the stale half of every shard must expire"
+        );
+        for sid in &stale_sids {
+            assert!(
+                !table_contains(&controller, sid).await,
+                "stale {sid} must expire from its shard"
+            );
+        }
+        for sid in &fresh_sids {
+            assert!(
+                table_contains(&controller, sid).await,
+                "fresh {sid} must survive in its shard"
+            );
+        }
     }
 }

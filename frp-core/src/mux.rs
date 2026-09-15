@@ -331,6 +331,14 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     // cap matters for the few-stream case, which is the idle-control and
     // low-concurrency work-conn case.
     cfg.set_max_stream_receive_window(Some(tcp_mux_cfg.max_stream_window_size));
+    // Window-growth warm-up (perf audit Phase 2-2, option b) rides in on
+    // `Config::default()` — the vendored fork's default
+    // `window_growth_seed_rtt = Some(100 ms)` (vendor/yamux/README-FRP-RS.md,
+    // patch #5). Without it a stream's receive window cannot double until the
+    // connection has an RTT sample of its own, pinning a fresh stream at
+    // `DEFAULT_CREDIT` (256 KiB) for its first round-trip — at 100 ms RTT
+    // ~20 Mbit/s per stream. Nothing here overrides it (see the
+    // `yamux_config_carries_window_growth_seed_rtt` test).
     // 32 KiB data frames (yamux-rs default 16 KiB): halves the frame
     // count for the bridge's 64 KiB chunks, i.e. halves per-frame
     // header writes/reads and waker round trips. Go's hashicorp yamux
@@ -747,6 +755,31 @@ where
         let mut pending_opens: std::collections::VecDeque<
             oneshot::Sender<std::result::Result<Stream, yamux::ConnectionError>>,
         > = std::collections::VecDeque::new();
+        // Persistent keepalive timer: the former per-iteration
+        // `tokio::time::sleep(keepalive)` re-registered (and re-allocated a
+        // timer entry for) the same deadline on every loop pass — including
+        // every pass that completed on the I/O branch. One interval, armed
+        // once, replaces the churn. `interval_at(now + keepalive, keepalive)`
+        // preserves the original first-fire semantics (a full interval of
+        // quiet before the first idle probe, never an immediate tick), and
+        // `MissedTickBehavior::Delay` preserves the per-iteration `sleep`
+        // semantics after a busy stretch (next fire one full period later)
+        // instead of the default `Burst` replay of every missed tick. The
+        // interval is non-zero: `normalized_keepalive_interval` maps 0 to the
+        // default, and `interval_at` panics on a zero period. The FIRST fire
+        // target is overflow-guarded: a hostile keepalive (raw i64 config,
+        // `Duration::from_secs(x.max(1))`) makes `now + keepalive` overflow
+        // `Instant` — a panic that aborts under panic=abort. Degrade to
+        // never-fire (no idle probes), the only sane reading of an absurd
+        // interval: `keepalive_overflowed` gates the tick arm off below, so
+        // the placeholder interval is never polled.
+        let keepalive_now = tokio::time::Instant::now();
+        let keepalive_overflowed = keepalive_now.checked_add(keepalive).is_none();
+        let keepalive_start = keepalive_now
+            .checked_add(keepalive)
+            .unwrap_or(keepalive_now);
+        let mut keepalive_timer = tokio::time::interval_at(keepalive_start, keepalive);
+        keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 // Drive connection I/O and serve queued open requests in the
@@ -852,8 +885,11 @@ where
                 // Keepalive: periodically drive I/O so yamux's next_ping()
                 // fires even on idle connections. Application-level heartbeat
                 // provides the timeout because yamux 0.14 does not time out
-                // while awaiting a PONG.
-                _ = tokio::time::sleep(keepalive) => {
+                // while awaiting a PONG. Gated off when the first-fire target
+                // overflowed (hostile keepalive): the placeholder interval
+                // must never be polled — an absurd interval means no idle
+                // probes at all.
+                _ = keepalive_timer.tick(), if !keepalive_overflowed => {
                     // Drive I/O to allow yamux internal PING/PONG processing.
                     // yamux-rs 0.14's RTT module sends PING every 10s and
                     // expects PONG, but does NOT timeout on AwaitingPong.
@@ -1032,6 +1068,25 @@ mod tests {
             ..Default::default()
         };
         let _ = yamux_config(&_big);
+    }
+
+    /// Perf audit Phase 2-2 / TOP 5 (option b): a fresh yamux stream must not
+    /// stay pinned at the 256 KiB initial credit for the connection's first
+    /// round-trip. The frp-rs yamux fork's `Config::default()` carries a
+    /// conservative 100 ms window-growth seed RTT, used to gate the first
+    /// window doubling while the connection has no RTT sample of its own
+    /// (vendor/yamux/README-FRP-RS.md, patch #5); every config this builder
+    /// hands to `Connection::new` must still carry it.
+    #[test]
+    fn yamux_config_carries_window_growth_seed_rtt() {
+        let cfg = yamux_config(&TcpMuxConfig::default());
+        assert_eq!(
+            cfg.window_growth_seed_rtt(),
+            Some(Duration::from_millis(100)),
+            "tcp-mux streams must be able to grow their receive window during \
+             the first round-trip (100 ms seed), not only after the first \
+             ping/pong sample lands"
+        );
     }
 
     /// Regression: a stalled peer (ACK backlog permanently full) leaves the

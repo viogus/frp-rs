@@ -595,7 +595,14 @@ impl ProxyManager {
                     .group_counters
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                let counter = counters.entry(group.to_string()).or_insert(0);
+                // Key precomputation (audit §3 item 7): `entry(group.to_string())`
+                // allocated a String on EVERY connection. `get_mut` takes the
+                // borrowed key, so the allocation happens only the first time a
+                // group is seen.
+                let counter = match counters.get_mut(group) {
+                    Some(c) => c,
+                    None => counters.entry(group.to_string()).or_insert(0),
+                };
                 let idx = (*counter as usize) % members.len();
                 *counter += 1;
                 Some(members[idx].clone())
@@ -654,7 +661,14 @@ impl ProxyManager {
                 .group_counters
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let counter = counters.entry(group.to_string()).or_insert(0);
+            // Key precomputation (audit §3 item 7): `entry(group.to_string())`
+            // allocated a String on EVERY connection. `get_mut` takes the
+            // borrowed key, so the allocation happens only the first time a
+            // group is seen.
+            let counter = match counters.get_mut(group) {
+                Some(c) => c,
+                None => counters.entry(group.to_string()).or_insert(0),
+            };
             let idx = pool_indices[(*counter as usize) % pool_indices.len()];
             *counter += 1;
             Some(members[idx].clone())

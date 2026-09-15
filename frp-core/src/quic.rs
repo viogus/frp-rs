@@ -24,19 +24,81 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
+/// Default per-stream QUIC receive window, in bytes (6 MiB).
+///
+/// This is the value Go frp effectively runs with: Go frp never configures
+/// quic-go's `MaxStreamReceiveWindow`, whose default is 6 MiB — the same
+/// figure Go frp pins for the yamux path (`MaxStreamWindowSize = 6 MiB`).
+///
+/// quinn-proto's own default is `STREAM_RWND = 12.5 MB/s * 100 ms` =
+/// 1,250,000 B, sized for a 100 Mbit/s / 100 ms path, and it is **not**
+/// auto-tuned afterwards (`connection/streams/recv.rs` reads the configured
+/// value verbatim; only the connection-level window has
+/// `Connection::set_receive_window`). A single stream therefore caps at
+/// `window / RTT`: ~100 Mbit/s at 100 ms RTT, ~200 Mbit/s at 50 ms. Raising
+/// it makes a single frp stream (control, work conn, XTCP tunnel) able to
+/// fill a high-BDP link.
+///
+/// 6 MiB costs at most `max_concurrent_bidi_streams * 6 MiB` of receive
+/// buffering per connection in the worst case, and only for bytes actually
+/// in flight (quinn buffers lazily, per stream).
+pub const DEFAULT_STREAM_RECEIVE_WINDOW: u32 = 6 * 1024 * 1024;
+
+/// Lower clamp for a configured stream receive window (16 KiB).
+///
+/// A window this small hard-caps a stream at `window / RTT` — ~1.3 Mbit/s at
+/// 100 ms RTT — so a config typo (or a literal `1`) must not be able to go
+/// lower. The QUIC flow-control update threshold is `window / 8`
+/// (`connection/streams/recv.rs`), so 16 KiB still emits a window update every
+/// 2 KiB of progress.
+pub const MIN_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024;
+
+/// Upper clamp for a configured stream receive window (64 MiB).
+///
+/// 4x the largest value in the audit's window sweep (16 MiB) and ~10x Go's
+/// 6 MiB: generous for any real link, while keeping a fat-fingered config
+/// (or a hostile one) from advertising a multi-gigabyte window per stream.
+pub const MAX_STREAM_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
+
+/// Connection-level receive window (`initial_max_data`) advertised by the
+/// frps QUIC listener BEFORE frp login, in bytes.
+///
+/// The per-stream windows stay at the configured value so an authenticated
+/// connection never re-negotiates per-stream credit, but the CONNECTION cap
+/// (the aggregate over all streams) starts at this value and is raised after
+/// login (frp-server `handle_quic_conn`). With the default open connection
+/// window (VarInt::MAX) an unauthenticated peer — QUIC+TLS only, no frp
+/// auth — could open `QUIC_PREAUTH_STREAM_LIMIT` (32) streams and park
+/// 32 × 6 MiB = ~192 MiB of receive buffering per connection. 2 MiB serves
+/// the pre-auth control stream (V2 handshake + Login are a few KiB) with
+/// room to spare while bounding the amplification.
+pub const PREAUTH_CONNECTION_RECEIVE_WINDOW: u64 = 2 * 1024 * 1024;
+
 /// Configurable QUIC transport parameters, matching Go frp's `quic` config block.
 ///
-/// Defaults match Go frp v0.69.1 `QUICOptions.Complete()` except
-/// `max_incoming_streams`, which we cap at 4096 (Go's 100_000 default lets an
-/// unauthenticated peer open a huge number of streams on one connection after
-/// TLS handshake but before frp auth, amplifying memory). 4096 is far above
-/// any realistic frp concurrency (one control + pooled work streams) while
-/// bounding per-connection resource use.
+/// Defaults match Go frp v0.69.1 `QUICOptions.Complete()` except for two
+/// fields. `max_incoming_streams` is capped at 4096 (Go's 100_000 default lets
+/// an unauthenticated peer open a huge number of streams on one connection
+/// after TLS handshake but before frp auth, amplifying memory; 4096 is far
+/// above any realistic frp concurrency — one control + pooled work streams —
+/// while bounding per-connection resource use). `stream_receive_window` is a
+/// Rust-only extension with no Go config counterpart: Go simply inherits
+/// quic-go's 6 MiB `MaxStreamReceiveWindow`, which is why the default here is
+/// also 6 MiB (see [`DEFAULT_STREAM_RECEIVE_WINDOW`]).
 #[derive(Debug, Clone)]
 pub struct QuicTransportParams {
     pub max_idle_timeout_secs: u32,
     pub keepalive_period_secs: u32,
     pub max_incoming_streams: u32,
+    /// Per-stream receive window advertised to the peer, in bytes — QUIC's
+    /// `initial_max_stream_data_bidi_*` transport parameter, i.e. how much
+    /// unacknowledged data one stream may have in flight towards us. See
+    /// [`DEFAULT_STREAM_RECEIVE_WINDOW`]. Wire-invisible to frp's own
+    /// protocol layer: it only changes the flow-control credit the peer
+    /// receives, never the framing. Values outside
+    /// [`MIN_STREAM_RECEIVE_WINDOW`]..=[`MAX_STREAM_RECEIVE_WINDOW`] are
+    /// clamped by [`QuicTransportParams::effective_stream_receive_window`].
+    pub stream_receive_window: u32,
 }
 
 impl Default for QuicTransportParams {
@@ -45,6 +107,7 @@ impl Default for QuicTransportParams {
             max_idle_timeout_secs: 30,
             keepalive_period_secs: 10,
             max_incoming_streams: 4096,
+            stream_receive_window: DEFAULT_STREAM_RECEIVE_WINDOW,
         }
     }
 }
@@ -53,16 +116,34 @@ impl QuicTransportParams {
     fn effective_max_incoming_streams(&self) -> u32 {
         self.max_incoming_streams.max(1)
     }
+
+    /// Per-stream receive window to advertise, clamped to
+    /// [`MIN_STREAM_RECEIVE_WINDOW`]..=[`MAX_STREAM_RECEIVE_WINDOW`].
+    ///
+    /// The config layer already normalizes non-positive values to the default;
+    /// this is the belt-and-braces bound for programmatic callers (XTCP P2P
+    /// paths build params directly), so a nonsensical value can never reach
+    /// the QUIC transport parameters. `u32` cannot exceed quinn's `VarInt`
+    /// range, so the conversion at the call site is infallible.
+    fn effective_stream_receive_window(&self) -> u32 {
+        self.stream_receive_window
+            .clamp(MIN_STREAM_RECEIVE_WINDOW, MAX_STREAM_RECEIVE_WINDOW)
+    }
 }
 
-/// Normalize zero-valued options to Go frp defaults.
+/// Normalize zero-valued options to defaults.
 ///
-/// Go frp's `QUICOptions.Complete()` treats `0` as "use default":
-/// keepalive 10s, idle timeout 30s, and 100_000 incoming streams.
+/// The first three mirror Go frp's `QUICOptions.Complete()`, which treats `0`
+/// as "use default": keepalive 10s, idle timeout 30s, and 100_000 incoming
+/// streams (capped to 4096 here, see [`QuicTransportParams`]).
+/// `stream_receive_window` is a Rust-only extension — Go frp has no such
+/// option, it just inherits quic-go's 6 MiB — and follows the same `0` =
+/// "use default" convention ([`DEFAULT_STREAM_RECEIVE_WINDOW`]).
 pub fn quic_params_from_option_values(
     keepalive_period_secs: i64,
     max_idle_timeout_secs: i64,
     max_incoming_streams: i64,
+    stream_receive_window: i64,
 ) -> QuicTransportParams {
     let defaults = QuicTransportParams::default();
     QuicTransportParams {
@@ -80,6 +161,16 @@ pub fn quic_params_from_option_values(
             max_incoming_streams as u32
         } else {
             defaults.max_incoming_streams
+        },
+        // A value above u32::MAX would truncate under `as`; clamping the
+        // i64 side here keeps the cast honest, and
+        // `effective_stream_receive_window` bounds it again on the way into
+        // quinn (`MAX_STREAM_RECEIVE_WINDOW` is far below u32::MAX, so the
+        // cast is lossless for everything that survives this line).
+        stream_receive_window: if stream_receive_window > 0 {
+            stream_receive_window.min(u32::MAX as i64) as u32
+        } else {
+            defaults.stream_receive_window
         },
     }
 }
@@ -189,13 +280,23 @@ impl QuicConnection {
     pub fn set_max_concurrent_bi_streams(&self, count: u32) {
         self.conn.set_max_concurrent_bi_streams(count.max(1).into());
     }
+
+    /// Set the connection-level receive window (`initial_max_data`) — the
+    /// aggregate credit across all streams for the peer's data towards us.
+    /// Used by the frps QUIC accept path to raise the
+    /// [`PREAUTH_CONNECTION_RECEIVE_WINDOW`] cap to quinn's open default
+    /// (VarInt::MAX) once the peer's Login has been authenticated.
+    pub fn set_receive_window(&self, bytes: u64) {
+        self.conn
+            .set_receive_window(quinn::VarInt::from_u64(bytes).unwrap_or(quinn::VarInt::MAX));
+    }
 }
 
 /// Build a quinn `TransportConfig` from Go-frp-compatible parameters.
 ///
 /// Shared by the listener, dial, and on-socket (XTCP P2P) code paths:
-/// max_idle_timeout, keep_alive_interval and max_concurrent_bidi_streams
-/// all come from the same `QuicTransportParams`.
+/// max_idle_timeout, keep_alive_interval, max_concurrent_bidi_streams and
+/// stream_receive_window all come from the same `QuicTransportParams`.
 fn build_quic_transport_config(params: &QuicTransportParams) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     // Round 10 (LOW): a hostile/legacy config value (negative or near
@@ -210,6 +311,34 @@ fn build_quic_transport_config(params: &QuicTransportParams) -> quinn::Transport
         params.keepalive_period_secs as u64,
     )));
     transport.max_concurrent_bidi_streams(params.effective_max_incoming_streams().into());
+    // Per-stream receive window → the `initial_max_stream_data_bidi_*` /
+    // `initial_max_stream_data_uni` transport parameters we advertise. quinn's
+    // 1.25 MB default is never auto-tuned (audit TOP 1): without this call a
+    // single frp stream is hard-capped at window/RTT — ~100 Mbit/s on a
+    // 100 ms path, however fat the link is. Defaults to
+    // `DEFAULT_STREAM_RECEIVE_WINDOW` (6 MiB, Go parity).
+    transport.stream_receive_window(params.effective_stream_receive_window().into());
+    // Connection-level receive window (`initial_max_data`): left at quinn's
+    // default (VarInt::MAX) here for the DIAL paths and for the XTCP
+    // hole-punched accept path (`quic_accept_on_socket`) — the frps LISTENER
+    // is the only surface an UNAUTHENTICATED peer can reach, and it
+    // overrides this value with [`PREAUTH_CONNECTION_RECEIVE_WINDOW`] in
+    // `QuicListener::new_with_tls_config`, raising it after frp login. An
+    // XTCP punched connection is already control-authenticated (only the
+    // proxy holder who completed the NAT-hole session can reach the
+    // ephemeral socket), so it deliberately keeps quinn's open default —
+    // capping the P2P tunnel would throttle it for no pre-auth gain. In
+    // quinn-proto 0.11.x the default is `VarInt::MAX` (the "10 MiB" figure
+    // belongs to older quinn releases): connection-wide flow control starts
+    // fully open and is only ever changed if the application calls
+    // `Connection::set_receive_window` — there is no internal auto-tuning.
+    // Pinning a finite value (e.g. Go's quic-go default of 15 MiB) on the
+    // dial side would throttle the aggregate of all streams sharing a
+    // connection on a high-BDP link, which is precisely what the per-stream
+    // window above exists to avoid. Worst-case receive buffering stays
+    // bounded by `max_concurrent_bidi_streams * stream_receive_window`
+    // (quinn's own documented bound) once authenticated; pre-auth it is
+    // bounded by the listener-side cap above instead.
     transport
 }
 
@@ -276,7 +405,16 @@ impl QuicListener {
             .map_err(|e| io::Error::other(format!("QUIC TLS config: {e}")))?;
 
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_tls));
-        server_config.transport_config(Arc::new(build_quic_transport_config(&params)));
+        let mut transport = build_quic_transport_config(&params);
+        // Pre-auth receive cap (audit review MEDIUM): the listener is the
+        // only surface an unauthenticated peer can reach, so the
+        // connection-level window starts small and is raised by the accept
+        // path after frp login — see [`PREAUTH_CONNECTION_RECEIVE_WINDOW`].
+        transport.receive_window(
+            quinn::VarInt::from_u64(PREAUTH_CONNECTION_RECEIVE_WINDOW)
+                .expect("pre-auth receive window fits a VarInt"),
+        );
+        server_config.transport_config(Arc::new(transport));
 
         let socket = std::net::UdpSocket::bind(addr)?;
         let endpoint = quinn::Endpoint::new(
@@ -643,26 +781,119 @@ mod tests {
 
     #[test]
     fn zero_option_values_normalize_to_defaults() {
-        let params = quic_params_from_option_values(0, 0, 0);
+        let params = quic_params_from_option_values(0, 0, 0, 0);
         assert_eq!(params.keepalive_period_secs, 10);
         assert_eq!(params.max_idle_timeout_secs, 30);
         assert_eq!(params.max_incoming_streams, 4096);
+        assert_eq!(params.stream_receive_window, DEFAULT_STREAM_RECEIVE_WINDOW);
     }
 
     #[test]
     fn negative_option_values_also_normalize_to_defaults() {
-        let params = quic_params_from_option_values(-1, -5, -100);
+        let params = quic_params_from_option_values(-1, -5, -100, -6_291_456);
         assert_eq!(params.keepalive_period_secs, 10);
         assert_eq!(params.max_idle_timeout_secs, 30);
         assert_eq!(params.max_incoming_streams, 4096);
+        assert_eq!(params.stream_receive_window, DEFAULT_STREAM_RECEIVE_WINDOW);
     }
 
     #[test]
     fn positive_option_values_are_preserved() {
-        let params = quic_params_from_option_values(20, 60, 2_048);
+        let params = quic_params_from_option_values(20, 60, 2_048, 16 * 1024 * 1024);
         assert_eq!(params.keepalive_period_secs, 20);
         assert_eq!(params.max_idle_timeout_secs, 60);
         assert_eq!(params.max_incoming_streams, 2_048);
+        assert_eq!(params.stream_receive_window, 16 * 1024 * 1024);
+    }
+
+    /// Audit TOP 1: the per-stream receive window must leave quinn's
+    /// 1,250,000 B default and land on Go frp's effective 6 MiB, on every
+    /// builder path (they all funnel through `build_quic_transport_config`).
+    #[test]
+    fn stream_receive_window_defaults_to_six_mib_and_reaches_the_transport() {
+        let params = QuicTransportParams::default();
+        assert_eq!(params.stream_receive_window, 6 * 1024 * 1024);
+        assert_eq!(params.effective_stream_receive_window(), 6 * 1024 * 1024);
+
+        // quinn exposes no getter for the window and `TransportConfig` has no
+        // `PartialEq`, so the built value is pinned through its `Debug`
+        // rendering, which prints `stream_receive_window: <bytes>` verbatim
+        // (quinn-proto config/transport.rs). This is the only read-path the
+        // public API offers, and it covers the exact value that becomes the
+        // `initial_max_stream_data_*` transport parameter.
+        let dbg = format!("{:?}", build_quic_transport_config(&params));
+        assert!(
+            dbg.contains("stream_receive_window: 6291456"),
+            "built transport must carry the 6 MiB window: {dbg}"
+        );
+        // Sanity: the default really did move off quinn's own 1,250,000 B.
+        assert!(!dbg.contains("stream_receive_window: 1250000"));
+    }
+
+    /// A hostile or fat-fingered value must not produce a useless 1-byte
+    /// window (throughput collapse) or an absurd multi-gigabyte one; the
+    /// clamp is applied on the way into quinn, not just in the config layer.
+    #[test]
+    fn stream_receive_window_is_clamped_on_the_way_into_quinn() {
+        let tiny = QuicTransportParams {
+            stream_receive_window: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            tiny.effective_stream_receive_window(),
+            MIN_STREAM_RECEIVE_WINDOW
+        );
+        let dbg = format!("{:?}", build_quic_transport_config(&tiny));
+        assert!(
+            dbg.contains("stream_receive_window: 16384"),
+            "1-byte window must be floored at 16 KiB: {dbg}"
+        );
+
+        let huge = QuicTransportParams {
+            stream_receive_window: u32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(
+            huge.effective_stream_receive_window(),
+            MAX_STREAM_RECEIVE_WINDOW
+        );
+        let dbg = format!("{:?}", build_quic_transport_config(&huge));
+        assert!(
+            dbg.contains("stream_receive_window: 67108864"),
+            "u32::MAX window must be capped at 64 MiB: {dbg}"
+        );
+
+        // In-range values pass through untouched.
+        let exact = QuicTransportParams {
+            stream_receive_window: 32 * 1024 * 1024,
+            ..Default::default()
+        };
+        assert_eq!(exact.effective_stream_receive_window(), 32 * 1024 * 1024);
+    }
+
+    /// The config-layer default (`[transport.quic] stream_receive_window`) must
+    /// stay equal to the transport-layer default — they are two literals in
+    /// two files, and a drift would silently halve the advertised window.
+    #[test]
+    fn config_default_matches_transport_default() {
+        let cfg = crate::config::QuicOptions::default();
+        assert_eq!(
+            cfg.stream_receive_window, DEFAULT_STREAM_RECEIVE_WINDOW as i64,
+            "QuicOptions::default() must agree with DEFAULT_STREAM_RECEIVE_WINDOW"
+        );
+
+        // And the deserialized (wire-config) default agrees too.
+        let parsed: crate::config::QuicOptions =
+            serde_json::from_str("{}").expect("empty quic table parses");
+        assert_eq!(
+            parsed.stream_receive_window,
+            DEFAULT_STREAM_RECEIVE_WINDOW as i64
+        );
+        // camelCase alias, matching the other quic options.
+        let camel: crate::config::QuicOptions =
+            serde_json::from_str(r#"{"streamReceiveWindow": 33554432}"#)
+                .expect("camelCase quic window parses");
+        assert_eq!(camel.stream_receive_window, 32 * 1024 * 1024);
     }
 
     #[tokio::test]

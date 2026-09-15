@@ -37,7 +37,7 @@ pub struct TcpMuxManager {
     /// domain can carry several route_by_http_user buckets; lookup tries
     /// the request's user bucket, then the `""` (all-users) bucket, then
     /// moves on to wildcard levels.
-    routes: RwLock<HashMap<String, HashMap<String, TcpMuxRoute>>>,
+    routes: RwLock<HashMap<String, HashMap<String, Arc<TcpMuxRoute>>>>,
     /// proxy_name → domains (for unregister)
     by_proxy: RwLock<HashMap<String, Vec<String>>>,
     /// Live count of registered `*.` wildcard routes (one per distinct
@@ -94,14 +94,18 @@ impl TcpMuxManager {
         _headers: &[(String, String)],
         group: &str,
     ) -> Result<(), String> {
-        let route = TcpMuxRoute {
+        // `Arc` so a (domain, route_by_http_user) lookup clone is a
+        // refcount bump instead of a deep copy of all six String fields —
+        // and so the multi-domain insert loop below shares one route
+        // instead of cloning it per domain (audit §3 item 7).
+        let route = Arc::new(TcpMuxRoute {
             proxy_name: proxy_name.to_string(),
             run_id: run_id.to_string(),
             http_user: http_user.to_string(),
             http_pwd: http_pwd.to_string(),
             route_by_http_user: route_by_http_user.to_string(),
             group: group.to_string(),
-        };
+        });
 
         let mut routes = self.routes.write().await;
         let mut by_proxy = self.by_proxy.write().await;
@@ -236,7 +240,7 @@ impl TcpMuxManager {
     /// request's Proxy-Authorization username bucket first, then the ""
     /// (all-users) bucket. Port-stripped, trailing-dot-trimmed,
     /// case-insensitive.
-    pub async fn lookup(&self, host: &str, http_user: &str) -> Option<TcpMuxRoute> {
+    pub async fn lookup(&self, host: &str, http_user: &str) -> Option<Arc<TcpMuxRoute>> {
         // Strip port if present: example.com:443 → example.com; bracketed
         // IPv6: [::1]:443 → ::1; then exactly one trailing dot (Go frp
         // CanonicalHost, pkg/util/http/http.go).
@@ -262,12 +266,13 @@ impl TcpMuxManager {
         // getExactOrAllUsersLocked. A route registered with a
         // route_by_http_user only matches requests carrying that exact
         // Proxy-Authorization username.
-        let try_buckets = |user_map: &HashMap<String, TcpMuxRoute>| -> Option<TcpMuxRoute> {
-            user_map
-                .get(http_user)
-                .or_else(|| user_map.get(""))
-                .cloned()
-        };
+        let try_buckets =
+            |user_map: &HashMap<String, Arc<TcpMuxRoute>>| -> Option<Arc<TcpMuxRoute>> {
+                user_map
+                    .get(http_user)
+                    .or_else(|| user_map.get(""))
+                    .cloned()
+            };
         // 1. Exact match
         if let Some(user_map) = routes.get(host_key) {
             if let Some(route) = try_buckets(user_map) {
@@ -2002,14 +2007,14 @@ mod tests {
                 .or_default()
                 .insert(
                     String::new(),
-                    TcpMuxRoute {
+                    Arc::new(TcpMuxRoute {
                         proxy_name: "p2".to_string(),
                         run_id: "run-2".to_string(),
                         http_user: String::new(),
                         http_pwd: String::new(),
                         route_by_http_user: String::new(),
                         group: String::new(),
-                    },
+                    }),
                 );
             mgr.by_proxy
                 .write()
@@ -2116,14 +2121,14 @@ mod tests {
                 .or_default()
                 .insert(
                     String::new(),
-                    TcpMuxRoute {
+                    Arc::new(TcpMuxRoute {
                         proxy_name: "p2".to_string(),
                         run_id: "run-2".to_string(),
                         http_user: String::new(),
                         http_pwd: String::new(),
                         route_by_http_user: String::new(),
                         group: String::new(),
-                    },
+                    }),
                 );
         }
         mgr.unregister("p1").await;
