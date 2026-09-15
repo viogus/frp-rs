@@ -1904,22 +1904,31 @@ impl AppState {
     /// at least one route in `vnet`. Used to scope vnet route broadcasts to
     /// peers on the same virtual net.
     ///
-    /// Reads the pre-grouped membership index — no table scan.
+    /// Reads the pre-grouped membership index — no table scan. The member ids
+    /// are cloned under the routes guard and the guard is DROPPED before the
+    /// `run_id_to_ctl_tx` shard lookups: holding it across N DashMap lookups
+    /// created a vnet_routes→DashMap-shard lock-order edge (audit review LOW).
     async fn control_txs_in_vnet(
         &self,
         exclude_run_id: &str,
         vnet: &str,
     ) -> Vec<mpsc::Sender<InternalMsg>> {
-        let routes = self.vnet_routes.read().await;
-        let Some(members) = routes.vnet_members_of(vnet) else {
-            return Vec::new();
+        let member_ids: Vec<String> = {
+            let routes = self.vnet_routes.read().await;
+            match routes.vnet_members_of(vnet) {
+                Some(members) => members
+                    .iter()
+                    .filter(|rid| rid.as_ref() != exclude_run_id)
+                    .map(|rid| rid.to_string())
+                    .collect(),
+                None => return Vec::new(),
+            }
         };
-        members
+        member_ids
             .iter()
-            .filter(|rid| rid.as_ref() != exclude_run_id)
             .filter_map(|rid| {
                 self.run_id_to_ctl_tx
-                    .get(rid.as_ref())
+                    .get(rid.as_str())
                     .map(|ctl| ctl.tx.clone())
             })
             .collect()
@@ -2264,6 +2273,10 @@ mod tests {
         let mut vnets: Vec<String> = flat.keys().map(|(v, _)| v.clone()).collect();
         vnets.sort();
         vnets.dedup();
+        // A vnet key whose routes were all removed must behave as empty
+        // against every index — the count maps drop their keys at zero and
+        // absent = empty everywhere (audit review NIT).
+        vnets.push("vnet-absent".to_string());
 
         for run_id in &run_ids {
             let expected_count = flat.values().filter(|(r, _)| r == run_id).count();

@@ -2873,8 +2873,20 @@ impl Service {
         // coalesced, because the reset target is the absolute deadline
         // `last_pong + hb_timeout_dur`, never `now + interval`.
         let mut hb_armed_pong = ctx.last_pong;
+        // A hostile heartbeat_timeout (the config preserves i64::MAX raw)
+        // makes `last_pong + hb_timeout_dur` overflow `Instant` — a panic
+        // that aborts the process under panic=abort. Degrade to never-fire:
+        // an absurd interval means "no watchdog", and the deadline is
+        // unreachable (round-13 dropped the 3600s clamp on both sides).
+        let mut hb_deadline: Option<std::time::Instant> =
+            ctx.last_pong.checked_add(ctx.hb_timeout_dur);
+        // The timer holds a placeholder deadline while `hb_deadline` is None
+        // (overflow); the select arm below is gated off in that state, so
+        // the placeholder is never polled and never fires.
         let mut hb_sleep = Box::pin(tokio::time::sleep_until(
-            tokio::time::Instant::from_std(ctx.last_pong) + ctx.hb_timeout_dur,
+            hb_deadline
+                .map(tokio::time::Instant::from_std)
+                .unwrap_or_else(tokio::time::Instant::now),
         ));
 
         loop {
@@ -2884,9 +2896,15 @@ impl Service {
             // arm below is gated off, so the timer would never be polled.
             if ctx.hb_watchdog_active && (ctx.last_pong != hb_armed_pong || hb_sleep.is_elapsed()) {
                 hb_armed_pong = ctx.last_pong;
-                hb_sleep
-                    .as_mut()
-                    .reset(tokio::time::Instant::from_std(ctx.last_pong) + ctx.hb_timeout_dur);
+                hb_deadline = ctx.last_pong.checked_add(ctx.hb_timeout_dur);
+                // Overflow degrades to never-fire (see the initial arm); the
+                // placeholder timer is left alone — the gated select arm
+                // never polls it.
+                if let Some(deadline) = hb_deadline {
+                    hb_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::from_std(deadline));
+                }
             }
             // Recreate the control-read future when the previous frame
             // completed (the arm body detached it). Starts a fresh read at
@@ -3822,8 +3840,11 @@ impl Service {
                 // so the timer is only active when hb_timeout > 0. Explicit
                 // negative values disable it independently of tcp_mux.
                 // Gated on the ping loop being active (hb_watchdog_active):
-                // with heartbeat_interval <= 0 no Pong can ever arrive.
-                _ = &mut hb_sleep, if ctx.hb_watchdog_active => {
+                // with heartbeat_interval <= 0 no Pong can ever arrive. Also
+                // gated on hb_deadline (Some): an overflowing timeout
+                // degrades the watchdog to never-fire, so its placeholder
+                // timer must never be polled here.
+                _ = &mut hb_sleep, if ctx.hb_watchdog_active && hb_deadline.is_some() => {
                     warn!("Heartbeat timeout ({}s), reconnecting...", ctx.hb_timeout);
                     return LoopExit::Reconnect;
                 }

@@ -1616,6 +1616,14 @@ async fn run_udp_work_conn(
     // completed frame — a Ping included — starts a fresh 60s), so an
     // active conn is never reaped.
     read_timeout: std::time::Duration,
+    // Test-only injection point for the reader's cancel watch SENDER
+    // (round-19 test-gap fix). `None` in production. When set, the reader
+    // subscribes to the injected channel instead of the internal one, so a
+    // test can fire the reader-cancel tick directly. The reader select
+    // treats a true value as a break; a false-to-false tick (two
+    // back-to-back sends) is a benign wakeup that MUST NOT strand a
+    // partially-read frame — the persisted `read_fut` (M1) survives it.
+    reader_cancel_override: Option<tokio::sync::watch::Sender<bool>>,
 ) {
     // write_msg_v2_nof skips the flush syscall. That is only safe for a raw
     // TcpStream: TLS/mux/WS-wrapped streams buffer internally and would leave
@@ -1659,7 +1667,16 @@ async fn run_udp_work_conn(
     // write half is untouched (separate object), so no flush semantics
     // change.
     let w_r = tokio::io::BufReader::with_capacity(16 * 1024, w_r);
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let (cancel_tx, cancel_rx) = match reader_cancel_override {
+        // Subscribe to the injected channel so the reader's cancel watch
+        // observes the same sender the test fires (and the writer below
+        // still reaches the reader with its exit signal).
+        Some(tx) => {
+            let rx = tx.subscribe();
+            (tx, rx)
+        }
+        None => tokio::sync::watch::channel(false),
+    };
 
     let sock_reader = sock.clone();
     let reader_name = proxy_name.clone();
@@ -2143,6 +2160,7 @@ pub(crate) async fn assign_udp_work_conn(
             bridge_cancel,
             udp_packet_codec,
             UDP_WORK_CONN_READ_TIMEOUT,
+            None,
         ));
         if let Err(e) = handle.await {
             if e.is_panic() {
@@ -3372,6 +3390,7 @@ mod tests {
             // M1: keep the 60s production read deadline; these tests end
             // the bridge via EOF/cancel, not frame silence.
             UDP_WORK_CONN_READ_TIMEOUT,
+            None,
         ));
         drop(peer);
 
@@ -3414,6 +3433,7 @@ mod tests {
             // M1: keep the 60s production read deadline; these tests end
             // the bridge via EOF/cancel, not frame silence.
             UDP_WORK_CONN_READ_TIMEOUT,
+            None,
         ));
         sender.send_to(b"force-write", socket_addr).await.unwrap();
 
@@ -3450,6 +3470,7 @@ mod tests {
             // M1: keep the 60s production read deadline; these tests end
             // the bridge via EOF/cancel, not frame silence.
             UDP_WORK_CONN_READ_TIMEOUT,
+            None,
         ));
 
         peer.write_v1_frame(&FrpMessage::UDPPacket(msg::UDPPacket {
@@ -3521,6 +3542,7 @@ mod tests {
             // M1: keep the 60s production read deadline; the cancel arm
             // below ends this bridge, not frame silence.
             UDP_WORK_CONN_READ_TIMEOUT,
+            None,
         ));
 
         // Let both bridge tasks reach their blocking points.
@@ -3558,6 +3580,7 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
             String::new(),
             std::time::Duration::from_millis(150),
+            None,
         ));
         // Keep `peer` alive and silent: no EOF, no frames.
         std::mem::forget(peer);
@@ -3607,6 +3630,7 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
             String::new(),
             std::time::Duration::from_millis(400),
+            None,
         ));
 
         // 5 pings 100ms apart span 500ms — longer than ONE deadline, so a
@@ -3633,6 +3657,84 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), bridge)
             .await
             .expect("silence after activity must still reap the bridge")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_work_reader_partial_frame_survives_competing_wakeup() {
+        // M1 (§4 示例 A) against its nastiest wakeup shape: a competing
+        // reader-cancel tick landing MID-FRAME (header consumed, payload
+        // outstanding). The pre-M1 loop rebuilt the frame read per
+        // iteration, so any wakeup dropped the read future WITH the header
+        // already consumed — the next iteration read the payload bytes as a
+        // fresh header (garbage length → protocol error → conn death). The
+        // persisted `read_fut` survives the wakeup and finishes the SAME
+        // frame. Two back-to-back watch sends with no await in between: the
+        // current-thread runtime polls the reader only after both, so it
+        // observes the final false and takes the benign `continue` arm.
+        use tokio::io::AsyncWriteExt;
+        let (work, mut peer) = tcp_pair().await;
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let remote = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote.local_addr().unwrap();
+        let (cancel_override, _cancel_rx) = tokio::sync::watch::channel(false);
+
+        let bridge = tokio::spawn(run_udp_work_conn(
+            IoStream::Tcp(work),
+            socket,
+            "udp-test".to_string(),
+            None,
+            false,
+            [0u8; 16],
+            false,
+            1500,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            String::new(),
+            UDP_WORK_CONN_READ_TIMEOUT,
+            Some(cancel_override.clone()),
+        ));
+
+        let packet = FrpMessage::UDPPacket(msg::UDPPacket {
+            content: b"split-frame".to_vec(),
+            local_addr: None,
+            remote_addr: Some(msg::UdpAddr {
+                ip: remote_addr.ip().to_string(),
+                port: remote_addr.port(),
+                zone: String::new(),
+            }),
+        });
+        let payload = serde_json::to_vec(&packet).unwrap();
+        // V1 header only (1 type byte + 8-byte BE length): the reader
+        // consumes it and parks on the payload read — the mid-frame state.
+        let mut header = Vec::with_capacity(9);
+        header.push(packet.v1_type_byte());
+        header.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        peer.write_all(&header).await.unwrap();
+        // Let the reader consume the header and block on the payload.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Competing wakeup: true then false, no yield in between. The
+        // reader must resume the SAME frame read, not restart it.
+        cancel_override.send(true).unwrap();
+        cancel_override.send(false).unwrap();
+
+        peer.write_all(&payload).await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            remote.recv_from(&mut buf),
+        )
+        .await
+        .expect("the split frame must still be delivered after the competing wakeup")
+        .unwrap();
+        assert_eq!(&buf[..n], b"split-frame");
+
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(1), bridge)
+            .await
+            .unwrap()
             .unwrap();
     }
 

@@ -766,9 +766,19 @@ where
         // semantics after a busy stretch (next fire one full period later)
         // instead of the default `Burst` replay of every missed tick. The
         // interval is non-zero: `normalized_keepalive_interval` maps 0 to the
-        // default, and `interval_at` panics on a zero period.
-        let mut keepalive_timer =
-            tokio::time::interval_at(tokio::time::Instant::now() + keepalive, keepalive);
+        // default, and `interval_at` panics on a zero period. The FIRST fire
+        // target is overflow-guarded: a hostile keepalive (raw i64 config,
+        // `Duration::from_secs(x.max(1))`) makes `now + keepalive` overflow
+        // `Instant` — a panic that aborts under panic=abort. Degrade to
+        // never-fire (no idle probes), the only sane reading of an absurd
+        // interval: `keepalive_overflowed` gates the tick arm off below, so
+        // the placeholder interval is never polled.
+        let keepalive_now = tokio::time::Instant::now();
+        let keepalive_overflowed = keepalive_now.checked_add(keepalive).is_none();
+        let keepalive_start = keepalive_now
+            .checked_add(keepalive)
+            .unwrap_or(keepalive_now);
+        let mut keepalive_timer = tokio::time::interval_at(keepalive_start, keepalive);
         keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -875,8 +885,11 @@ where
                 // Keepalive: periodically drive I/O so yamux's next_ping()
                 // fires even on idle connections. Application-level heartbeat
                 // provides the timeout because yamux 0.14 does not time out
-                // while awaiting a PONG.
-                _ = keepalive_timer.tick() => {
+                // while awaiting a PONG. Gated off when the first-fire target
+                // overflowed (hostile keepalive): the placeholder interval
+                // must never be polled — an absurd interval means no idle
+                // probes at all.
+                _ = keepalive_timer.tick(), if !keepalive_overflowed => {
                     // Drive I/O to allow yamux internal PING/PONG processing.
                     // yamux-rs 0.14's RTT module sends PING every 10s and
                     // expects PONG, but does NOT timeout on AwaitingPong.

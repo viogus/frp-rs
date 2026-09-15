@@ -60,6 +60,20 @@ pub const MIN_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024;
 /// (or a hostile one) from advertising a multi-gigabyte window per stream.
 pub const MAX_STREAM_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
 
+/// Connection-level receive window (`initial_max_data`) advertised by the
+/// frps QUIC listener BEFORE frp login, in bytes.
+///
+/// The per-stream windows stay at the configured value so an authenticated
+/// connection never re-negotiates per-stream credit, but the CONNECTION cap
+/// (the aggregate over all streams) starts at this value and is raised after
+/// login (frp-server `handle_quic_conn`). With the default open connection
+/// window (VarInt::MAX) an unauthenticated peer — QUIC+TLS only, no frp
+/// auth — could open `QUIC_PREAUTH_STREAM_LIMIT` (32) streams and park
+/// 32 × 6 MiB = ~192 MiB of receive buffering per connection. 2 MiB serves
+/// the pre-auth control stream (V2 handshake + Login are a few KiB) with
+/// room to spare while bounding the amplification.
+pub const PREAUTH_CONNECTION_RECEIVE_WINDOW: u64 = 2 * 1024 * 1024;
+
 /// Configurable QUIC transport parameters, matching Go frp's `quic` config block.
 ///
 /// Defaults match Go frp v0.69.1 `QUICOptions.Complete()` except for two
@@ -266,6 +280,16 @@ impl QuicConnection {
     pub fn set_max_concurrent_bi_streams(&self, count: u32) {
         self.conn.set_max_concurrent_bi_streams(count.max(1).into());
     }
+
+    /// Set the connection-level receive window (`initial_max_data`) — the
+    /// aggregate credit across all streams for the peer's data towards us.
+    /// Used by the frps QUIC accept path to raise the
+    /// [`PREAUTH_CONNECTION_RECEIVE_WINDOW`] cap to quinn's open default
+    /// (VarInt::MAX) once the peer's Login has been authenticated.
+    pub fn set_receive_window(&self, bytes: u64) {
+        self.conn
+            .set_receive_window(quinn::VarInt::from_u64(bytes).unwrap_or(quinn::VarInt::MAX));
+    }
 }
 
 /// Build a quinn `TransportConfig` from Go-frp-compatible parameters.
@@ -294,18 +318,22 @@ fn build_quic_transport_config(params: &QuicTransportParams) -> quinn::Transport
     // 100 ms path, however fat the link is. Defaults to
     // `DEFAULT_STREAM_RECEIVE_WINDOW` (6 MiB, Go parity).
     transport.stream_receive_window(params.effective_stream_receive_window().into());
-    // Connection-level receive window (`initial_max_data`): deliberately left
-    // at quinn's default, i.e. NOT overridden here. In quinn-proto 0.11.x that
-    // default is `VarInt::MAX` (the "10 MiB" figure belongs to older quinn
-    // releases): connection-wide flow control starts fully open and is only
-    // ever changed if the application calls `Connection::set_receive_window`
-    // — there is no internal auto-tuning. Pinning a finite value (e.g. Go's
-    // quic-go default of 15 MiB) would throttle the aggregate of all streams
-    // sharing a connection on a high-BDP link, which is precisely what the
-    // per-stream window above exists to avoid. Worst-case receive buffering
-    // stays bounded by `max_concurrent_bidi_streams * stream_receive_window`
-    // (quinn's own documented bound); the frps listener advertises 32
-    // pre-auth streams and only raises the limit after login.
+    // Connection-level receive window (`initial_max_data`): left at quinn's
+    // default (VarInt::MAX) here for the DIAL paths — the frps LISTENER is
+    // the only pre-auth surface, and it overrides this value with
+    // [`PREAUTH_CONNECTION_RECEIVE_WINDOW`] in `QuicListener::new_with_tls_config`,
+    // raising it after frp login. In quinn-proto 0.11.x the default is
+    // `VarInt::MAX` (the "10 MiB" figure belongs to older quinn releases):
+    // connection-wide flow control starts fully open and is only ever
+    // changed if the application calls `Connection::set_receive_window` —
+    // there is no internal auto-tuning. Pinning a finite value (e.g. Go's
+    // quic-go default of 15 MiB) on the dial side would throttle the
+    // aggregate of all streams sharing a connection on a high-BDP link,
+    // which is precisely what the per-stream window above exists to avoid.
+    // Worst-case receive buffering stays bounded by
+    // `max_concurrent_bidi_streams * stream_receive_window` (quinn's own
+    // documented bound) once authenticated; pre-auth it is bounded by the
+    // listener-side cap above instead.
     transport
 }
 
@@ -372,7 +400,16 @@ impl QuicListener {
             .map_err(|e| io::Error::other(format!("QUIC TLS config: {e}")))?;
 
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_tls));
-        server_config.transport_config(Arc::new(build_quic_transport_config(&params)));
+        let mut transport = build_quic_transport_config(&params);
+        // Pre-auth receive cap (audit review MEDIUM): the listener is the
+        // only surface an unauthenticated peer can reach, so the
+        // connection-level window starts small and is raised by the accept
+        // path after frp login — see [`PREAUTH_CONNECTION_RECEIVE_WINDOW`].
+        transport.receive_window(
+            quinn::VarInt::from_u64(PREAUTH_CONNECTION_RECEIVE_WINDOW)
+                .expect("pre-auth receive window fits a VarInt"),
+        );
+        server_config.transport_config(Arc::new(transport));
 
         let socket = std::net::UdpSocket::bind(addr)?;
         let endpoint = quinn::Endpoint::new(

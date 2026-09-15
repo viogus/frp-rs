@@ -849,23 +849,17 @@ async fn handle_http1_request<S>(
     // https legs raw-forward with neither, as does this window's Go
     // literal. The config-on-client-head divergence is documented on
     // clamp_vhost_timeout.)
-    while pre_read.len() < 4096 && frp_core::textproto::head_end(&pre_read).is_none() {
-        let mut buf = [0u8; 4096];
-        let m = match tokio::time::timeout_at(head_deadline, stream.read(&mut buf)).await {
-            Ok(Ok(m)) if m > 0 => m,
-            _ => break,
-        };
-        pre_read.extend_from_slice(&buf[..m]);
-    }
 
-    // Head-end scan, incremental (audit §3 item 4): the loop above re-ran a
-    // whole-buffer `head_end` per read, re-scanning every earlier chunk —
-    // O(n²) for a drip-fed head. `HeadEndScanner` carries the line offset
-    // across feeds (the buffer only ever grows here) and reports the FIRST
-    // blank line exactly as the full rescan does, so the verdicts below are
+    // Head-end scan, incremental (audit §3 item 4), owning the reads too:
+    // `HeadEndScanner` carries the line offset across feeds (the buffer
+    // only ever grows here) and reports the FIRST blank line exactly as a
+    // whole-buffer `head_end` rescan does, so the verdicts below are
     // byte-identical; the vhost_h2c and bridge head loops already work this
-    // way. One scan serves all three consumers: the 431 cap gate, the
-    // unterminated-head gate, and the head slice.
+    // way. Keeping the old rescan loop alongside it would have re-scanned
+    // every earlier chunk per read (O(n²) for a drip-fed head) AND made
+    // this loop unreachable (it can only be entered once the cap or EOF
+    // was already hit). One scan serves all three consumers: the 431 cap
+    // gate, the unterminated-head gate, and the head slice.
     let mut head_scanner = frp_core::textproto::HeadEndScanner::new();
     let mut head_end = head_scanner.feed(&pre_read);
     while pre_read.len() < 4096 && head_end.is_none() {

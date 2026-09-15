@@ -874,6 +874,14 @@ pub(crate) async fn handle_nat_hole_visitor(
         }
         // Return the writer to the session
         *session.visitor_writer.lock().await = taken_writer;
+        // The slot was None for the whole network write, so a concurrent
+        // `Controller::complete` that grabbed the mutex observed None and
+        // skipped dropping the visitor writer — the socket would then stay
+        // open until this handler's Arc dropped (audit review LOW). If the
+        // session has left the table in the meantime, that drop is ours now.
+        if state.xtcp.nat_hole.sessions.get(&sid).await.is_none() {
+            drop(session.visitor_writer.lock().await.take());
+        }
     }
 
     // Go frp dev compat: if the provider has the "sender" role, wait 1s

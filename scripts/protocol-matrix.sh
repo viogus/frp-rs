@@ -33,8 +33,10 @@ log() { echo "[matrix] $*"; }
 vlog() { $VERBOSE && echo "[matrix] $*" || true; }
 
 cleanup() {
-    # Kill any stragglers from an interrupted run.
-    for pid_file in "$TEST_DIR"/*.pid; do
+    # Kill any stragglers from an interrupted run. frps/frpc pid files live
+    # per-row under $TEST_DIR/<name>/, echo pid files at the top level.
+    local pid_file
+    for pid_file in "$TEST_DIR"/*.pid "$TEST_DIR"/*/*.pid; do
         [[ -f "$pid_file" ]] && kill "$(cat "$pid_file")" 2>/dev/null
     done
     rm -rf "$TEST_DIR"
@@ -80,9 +82,17 @@ run_row() {
     # leaked processes instead of its own (observed cascade: one failed row
     # under load left stragglers that failed the same row in every later run).
     kill_row_processes() {
-        kill "$(cat "$row_dir/frpc.pid" 2>/dev/null)" \
-            "$(cat "$row_dir/frps.pid" 2>/dev/null)" \
-            "$(cat "$TEST_DIR/echo-$echo_port.pid" 2>/dev/null)" 2>/dev/null
+        # Build the pid list from files that EXIST: the first failure path
+        # runs before frpc is started (no frpc.pid yet), and bash's `kill`
+        # aborts the whole command on an invalid first argument — a single
+        # missing file used to leak frps AND echo on that path.
+        local f pid pids=()
+        for f in "$row_dir/frpc.pid" "$row_dir/frps.pid" "$TEST_DIR/echo-$echo_port.pid"; do
+            [[ -f "$f" ]] || continue
+            pid="$(cat "$f" 2>/dev/null)" || continue
+            [[ -n "$pid" ]] && pids+=("$pid")
+        done
+        ((${#pids[@]} > 0)) && kill "${pids[@]}" 2>/dev/null
     }
 
     log "=== $name (proto=$proto tls=$tls mux=$mux) ==="

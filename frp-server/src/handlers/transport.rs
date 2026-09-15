@@ -1699,6 +1699,11 @@ pub(crate) async fn handle_quic_stream(
                 conn.set_max_concurrent_bi_streams(
                     authenticated_stream_limit.min(u32::MAX as usize) as u32,
                 );
+                // Raise the pre-auth connection receive window (2 MiB,
+                // PREAUTH_CONNECTION_RECEIVE_WINDOW) to quinn's open default
+                // (VarInt::MAX) — the per-stream 6 MiB windows now apply in
+                // full. Unauthenticated conns never reach this arm.
+                conn.set_receive_window(u64::MAX);
                 let cancel = spawn_quic_drain(
                     conn,
                     Arc::clone(&state),
@@ -1745,6 +1750,8 @@ pub(crate) async fn handle_quic_stream(
                             conn.set_max_concurrent_bi_streams(
                                 authenticated_stream_limit.min(u32::MAX as usize) as u32,
                             );
+                            // Pre-auth receive cap off, as in the V2 arm above.
+                            conn.set_receive_window(u64::MAX);
                             let cancel = spawn_quic_drain(
                                 conn,
                                 Arc::clone(&state),

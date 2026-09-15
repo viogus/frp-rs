@@ -597,8 +597,11 @@ async fn bridge_work_to_user(
                     batch_buf.clear();
                 }
             } else {
-                // Plaintext passthrough: write immediately, flushing on short
-                // reads for interactive latency.
+                // Plaintext passthrough: write immediately and ALWAYS flush.
+                // The flush is a no-op on a raw TcpStream; on a buffered
+                // transport (yamux/WS-wrapped user side) it is what pushes the
+                // bytes out — a flush gated on `n < cap` stranded an exact-size
+                // burst (n == cap) until more data happened to arrive.
                 let plaintext = compressed_input;
                 if let Some(lim) = limiter {
                     BandwidthLimiter::consume_shared(lim, plaintext.len()).await;
@@ -611,11 +614,9 @@ async fn bridge_work_to_user(
                     tracing::debug!(error = %e, "bridge work_to_user: write error");
                     break 'read_loop;
                 }
-                if n < cap {
-                    if let Err(e) = user_w.flush().await {
-                        tracing::debug!(error = %e, "bridge work_to_user: flush error");
-                        break 'read_loop;
-                    }
+                if let Err(e) = user_w.flush().await {
+                    tracing::debug!(error = %e, "bridge work_to_user: flush error");
+                    break 'read_loop;
                 }
                 break;
             }
@@ -625,18 +626,14 @@ async fn bridge_work_to_user(
                 tracing::debug!(error = %e, "bridge work_to_user: write error (batch)");
                 break 'read_loop;
             }
-            // Flush on a SHORT work-side read only, mirroring the plaintext
-            // arm above: a full-size read means the peer is still streaming,
-            // and flushing there re-armed a syscall (and, for a buffered
-            // transport, an extra write) on every outer read iteration —
-            // negating the batch buffer entirely. A short read means the
-            // burst ended, so push what we have; a full batch already
-            // flushed above; EOF flushes at the end of this function.
-            if n < cap {
-                if let Err(e) = user_w.flush().await {
-                    tracing::debug!(error = %e, "bridge work_to_user: flush error (batch)");
-                    break 'read_loop;
-                }
+            // Always flush, as in the plaintext arm: the mid-batch write
+            // above (>= MAX_WORK_TO_USER_BATCH) flushed itself, but the tail
+            // must not wait for more data — a flush gated on `n < cap`
+            // stranded an exact-size final batch in a buffered transport
+            // until the next burst (or EOF) happened to arrive.
+            if let Err(e) = user_w.flush().await {
+                tracing::debug!(error = %e, "bridge work_to_user: flush error (batch)");
+                break 'read_loop;
             }
             batch_buf.clear();
         }

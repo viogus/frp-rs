@@ -199,13 +199,14 @@ pub async fn sync_from_state(state: &AppState) {
         let key = (pn.clone(), pt.clone());
         // The baseline map lock used to be held for the ENTIRE per-proxy
         // loop, awaits included (audit §3 item 7). It is now a single short
-        // critical section per proxy: the remove+insert pair is atomic with
-        // respect to every other holder (`proxy_removed`, a concurrent
-        // scrape), which a take-the-map / release / republish-later snapshot
-        // would NOT be — that window can resurrect a baseline that
-        // `proxy_removed` deleted concurrently, the round-18 E1 false-delta
-        // bug (a same-name re-register then stalls against a pre-removal
-        // total or double-counts).
+        // critical section per proxy. The guarantee is exactly
+        // pair-atomicity of the remove+conditional-insert: no OTHER holder
+        // of the lock (`proxy_removed`, a concurrent scrape) can interleave
+        // between them, so a baseline can never be lost or double-counted
+        // mid-pair (the round-18 E1 false-delta shape). The guard release
+        // is itself a boundary — a `proxy_removed` landing right after it
+        // leaves the next scrape of this key without a baseline, reporting
+        // the current cumulative as its first delta.
         let (delta_in, delta_out) = {
             let mut last_traffic = LAST_TRAFFIC.lock().await;
             let (prev_in, prev_out) = last_traffic.remove(&key).unwrap_or((0, 0));
