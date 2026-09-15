@@ -1255,6 +1255,7 @@ impl Service {
                 quic_options.keepalive_period,
                 quic_options.max_idle_timeout,
                 quic_options.max_incoming_streams,
+                quic_options.stream_receive_window,
             );
             let authenticated_stream_limit = quic_params.max_incoming_streams as usize;
             let mut listener_quic_params = quic_params.clone();

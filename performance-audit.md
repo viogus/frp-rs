@@ -3,7 +3,7 @@
 - 日期：2026-09-14
 - 方法：4 路并行只读静态审计（热点分配/拷贝、tokio 异步效率、锁与数据结构、帧编解码与 mux 窗口）+ 3 路独立对抗验证（逐条反证，行号复核）
 - 范围：数据面（bridge relay / cipher / UDP / WS / KCP / QUIC / yamux）与控制面高频路径（accept、vhost、nathole、dashboard）
-- 状态：静态分析已完结；**Phase 1 全部 7 项已实现**（Wave 1 提交 `e7c6f0b`、Wave 2 提交 `8d2c201`），Phase 2 待门禁通过后实施；门禁基线 2078/0 + compat 86/86 + matrix 11/11
+- 状态：静态分析已完结；**Phase 1 全部 7 项已实现**（Wave 1 提交 `e7c6f0b`、Wave 2 提交 `8d2c201`），**Phase 2 全部 5 项已实现**（门禁进行中，见修订记录 #9）；门禁基线 2078/0 + compat 86/86 + matrix 11/11
 
 ## 修订记录（对抗验证轮，2026-09-14）
 
@@ -17,6 +17,10 @@
 6. **细节勘误**：`TcpMuxRoute` 有 6 个 String 字段（非 5）；`vhost_h2c.rs:1851` 是 1 次分配（`Bytes::from` 对 capacity==len 的 Vec 走零拷贝 move）；`xtcp_p2p` 探针每包 ~6 次分配（非 4-5，含 uuid/sid/加密输出）
 
 7. **实施修订（2026-09-15，"全修"授权后）**：Phase 1 落地过程中的审核修正 —— 看门狗 select 臂序必须把读臂放在 idle 臂之前（biased 顺序决定同时就绪时谁赢，旧 `timeout()` 先 poll 内层读）；`prom.rs` 落地形态由"快照后释放锁"改为 per-proxy remove+条件 insert（同锁单点）；`BytesMut` 零拷贝项经成本核算放弃；tcpmux/vhost/vhost_h2c 由 2b 提交的 fmt 未清由中央统一 `cargo fmt`
+
+8. **Phase 1 门禁记录（2026-09-15）**：clippy `--workspace --all-targets --all-features -D warnings` 零警告；workspace 全量测试 **2089 passed / 0 failed**（超基线 2078，Wave 2d 新增 udp_binary 字节等价 pin）；compat-test.sh **86/86** vs Go frp v0.71.0；protocol-matrix **11/11**。门禁环境备注：测试执行期遭遇磁盘 100%（已释放 31G 可再链接测试可执行文件，保留 rlib/incremental）与后台任务 RSS 上限（harness 杀 >~320MB 后台任务），改用 audit-env-constraints 记载的 detached（`setsid`）运行 + `CARGO_PROFILE_DEV_DEBUG=0` 精简重建，测试结果与产物不受影响
+
+9. **Phase 2 首跑门禁抓出的 3 个问题（2026-09-15，已修）**：(a) `v2_handshake` 测试 bug —— `negotiated_default_drives_binary_frames_and_legacy_drives_json` 把 header 已剥的 payload `Cursor` 喂给自消费 9 字节帧头的 `read_msg_v2*`（生产路径契约：必须给裸流），改为全新 duplex 往返，生产代码无误；(b) `VnetRoutes::unindex` 生产 bug —— 共享索引条目无条件删除：接管插入（同 key 换 owner）会把旧 owner 从 `vnet_members`/`run_vnets`/`vnet_names` 中抹掉，即使旧 owner 在该 vnet/该名下还持有其他路由（平表与索引漂移 → 隔离门禁与 visitor 解析出错）；修法：新增 `vnet_run_counts`/`vnet_name_counts` 两个计数映射，共享集合条目仅在计数归零时移除（O(1) 增量维护，不重建不扫描）；(c) vnet 测试手写期望与旧扫描语义矛盾 —— `visitor_route_target` 的最小 (vnet, run_id) 候选**不排除源自身**（预索引 min() 扫描逐行核对），3 处字面量改正并注释自路由 parity。修复后 frp-server lib 496/0；workspace 复跑 **2110/0**；落地后 clippy 复跑抓出三元组键 type-complexity，类型别名修复后零警告
 
 ---
 
@@ -35,6 +39,10 @@
 | `frp-server/src/control/pool.rs` | 干净：PendingRequest 携带 `Arc<ProxyInfo>`，bridge 时无 map 重锁 |
 | `frp-core/src/mux.rs` `open_stream` | 干净：零锁，pending_opens 为 task 本地 VecDeque |
 | `frp-core/src/msg.rs` untagged 枚举 | 无成本：V1/V2 按 type byte 分发到具名 struct，untagged 不在 wire decode 路径 |
+| **Phase 2 新落地** `frp-server/src/nathole/controller.rs` SessionTable | 16 分片 + CAS 预占配额（`ReservedSlot` 兜底）+ O(1) count/is_empty；`get` 仅 clone `Arc<Session>` |
+| **Phase 2 新落地** `frp-server/src/state.rs` VnetRoutes | 预分组索引（O(1) source_allowed / visitor_route_target / has_route / run_route_count），命中路径零分配（Arc refcount bump），计数映射保证共享集合条目只在最后一条路由离开时移除 |
+| **Phase 2 新落地** `frp-vnet/src/router.rs` RoutePrefixes | 注册期预编译、按地址族分区掩码集 O(1) contains，fan-out 单次 `Arc<[u8]>` 拷贝 |
+| **Phase 2 新落地** `frp-core/src/quic.rs` | `stream_receive_window` 默认 6 MiB、clamp [16 KiB, 64 MiB]，4 条 transport 构建路径全接入 |
 
 ---
 
@@ -264,6 +272,26 @@ if self.rtt.get()
 3. **vnet 每包开销（HIGH #4、MED #11）**：代理注册时预编译路由前缀集（`Arc` 共享，O(1) 查询），收包 fan-out 改 `Arc<[u8]>` 单次拷贝；`control/nathole.rs:1265` 按 virtual_net 预分组索引，消除嵌套扫描与每包 clone
 4. **UDP 协议面瘦身**：评估在 V2 handshake 里默认强制 `udpPacketCodecs=binary-v1`（Go v0.71.0 已支持），让 JSON UDP 路径退居纯兼容位
 5. **锁架构复查**：`nathole/controller.rs` sessions 表分片或读多写少化（complete/expire 改短写）；`metrics` LAST_TRAFFIC 改 per-proxy 原子快照
+
+**落地状态（2026-09-15）**：5 项全部实现（单提交，见 §0 已优化路径）：
+
+| # | 项 | 落地要点 |
+|---|----|---------|
+| 1 | QUIC 窗口 | `DEFAULT_STREAM_RECEIVE_WINDOW = 6 MiB`（Go 对齐起步值），配置 `stream_receive_window` 可调、clamp [16 KiB, 64 MiB]（quinn 双侧限制内），`build_quic_transport_config` 4 条构建路径全接入 `transport.stream_receive_window` |
+| 2 | yamux 窗口暖启动 | vendor patch #5：`window_growth_seed_rtt = Some(100ms)`（无样本流首 RTT 即有保守种子门控首次翻倍，替代等真实 RTT 样本的爬坡空窗）+ 纯函数 `window_growth_gate_open` 可单测；pin 测试 `yamux_config_carries_window_growth_seed_rtt`；连接窗口 384 MiB 维持（1024 流上限的已知权衡，评估后不动） |
+| 3 | vnet 每包开销 | 注册期 `PrecompiledSubnet`（verbatim CIDR + `Arc<RoutePrefixes>` 家族分区掩码集，O(1) contains）；fan-out 单次 `Arc<[u8]>` 拷贝 + `ptr_eq` pin；`VnetRoutes` 预分组索引（`vnet_members`/`run_vnets`/`run_route_counts`/`vnet_names`，单读锁一次取 isolation+target，命中路径零分配 Arc 借用）；`handle_vnet_route_remove` 索引查代替全表预扫 |
+| 4 | UDP 默认 codec | `default_udp_packet_codecs()` 单一事实源：V2 未显式配置时默认协商 binary-v1（Go v0.71.0 支持），JSON UDP 路径退居 V1 与未协商 V2 的兼容位 |
+| 5 | nathole 分片 | `SessionTable` 16 分片（`shard_index` = DefaultHasher(sid)%16），`insert` 先 CAS 预占 `MAX_SESSIONS` 配额再写分片、`ReservedSlot` drop 兜底取消路径，replace 释放多余配额；`get`/`remove`/`with_session`/`is_empty`/`count` 全部 O(1) 或单分片锁 |
+
+分片测试分布带 ≤96（3× 余量，确定性 DefaultHasher）；`VnetRoutes` 由类型系统强制索引完整性（`Deref` 到平表、无 `DerefMut`，insert/remove/clear 无法绕过派生索引）。
+
+**Phase 2 门禁记录（2026-09-15）**：
+- clippy `--workspace --all-targets --all-features -D warnings`：零警告（落地后复跑绿——期间 clippy 抓出 `vnet_name_counts` 三元组键 type-complexity，抽 `VnetRunCountKey`/`VnetNameCountKey` 类型别名修复）
+- `cargo build --release`：通过，零警告
+- compat-test.sh：**86/86**（Go frp v0.71.0，本机遗留进程已清理后重跑）
+- protocol-matrix：**11/11**（×2：干净系统一次 + 清理修复脚本后一次）
+- workspace 全量测试：**2110 passed / 0 failed**（首跑抓到 3 个问题，修复后全绿，见修订记录 #9）
+- 门禁环境备注：(a) 编译期两度磁盘 100%（共享 VPS 98G，其他租户占用），删除 target/{debug,release}/deps 下无扩展名测试/发布可执行文件 8.3G + `target/debug/incremental` 57G 后恢复（62G 空闲，代价是冷重建；`.rmeta` 保留使 clippy 快跑通过）；(b) harness 低内存守卫杀掉后台等待任务 → 改 CronCreate 轮询门禁状态文件；(c) compat-test.sh 在本机遗留 Go frp 进程（几十个），清理后重跑绿，脚本本身已修或待修——矩阵侧已修复 `fail_row` 提前 return 跳过行清理导致的端口块复用级联（同一失败行在后续每次运行中静默测试泄漏进程），compat 侧遗留进程列为环境问题
 
 **每阶段完成后的门禁**（不满足即回退）：
 1. `cargo clippy --workspace --all-targets --all-features -D warnings` 零警告

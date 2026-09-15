@@ -104,7 +104,7 @@ impl VnetController {
         &self,
         mut tun: Box<dyn TunDevice>,
         ctl_writer: Arc<dyn frp_core::ControlSink>,
-        mut tun_packet_rx: mpsc::Receiver<Vec<u8>>,
+        mut tun_packet_rx: mpsc::Receiver<Arc<[u8]>>,
     ) -> anyhow::Result<()> {
         let mut tun_buf = vec![0u8; tun_read_buf_len(tun.mtu())];
         // Rate-limits "dropping packet" warnings (oversized TUN writes, full
@@ -640,7 +640,7 @@ mod tests {
         let (tun_stream, mut tun_peer) = tokio::io::duplex(4096);
         let tun = Box::new(FakeTun { inner: tun_stream });
         let writer = test_sink();
-        let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Arc<[u8]>>(16);
         let ctrl = VnetController::new(
             "plugin-proxy".to_string(),
             client.clone(),
@@ -660,7 +660,7 @@ mod tests {
         assert_eq!(work_rx.recv().await, Some(packet.clone()));
 
         // Work conn → TUN: packets injected through the channel reach the TUN.
-        tun_packet_tx.send(packet.clone()).await.unwrap();
+        tun_packet_tx.send(Arc::from(packet.clone())).await.unwrap();
         let mut buf = vec![0u8; 64];
         let n = tun_peer.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], &packet[..]);
@@ -680,7 +680,7 @@ mod tests {
         let (tun_stream, mut tun_peer) = tokio::io::duplex(4096);
         let tun = Box::new(FakeTun { inner: tun_stream });
         let writer = test_sink();
-        let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Arc<[u8]>>(16);
         let ctrl = VnetController::new(
             "plugin-proxy".to_string(),
             client.clone(),
@@ -717,7 +717,7 @@ mod tests {
         let tun = Box::new(FakeTun { inner: tun_stream });
         let writer = test_sink();
         let writer_for_task = writer.clone();
-        let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Arc<[u8]>>(16);
         let ctrl = VnetController::new(
             "plugin-proxy".to_string(),
             client.clone(),
@@ -776,7 +776,7 @@ mod tests {
         let (tun_stream, mut tun_peer) = tokio::io::duplex(4096);
         let tun = Box::new(FakeTun { inner: tun_stream });
         let writer = test_sink();
-        let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Arc<[u8]>>(16);
         let ctrl = VnetController::new(
             "plugin-proxy".to_string(),
             client.clone(),
@@ -838,7 +838,7 @@ mod tests {
         let (tun_stream, mut tun_peer) = tokio::io::duplex(4096);
         let tun = Box::new(FakeTun { inner: tun_stream });
         let writer = test_sink_with(true, true); // send fails AND writer failed
-        let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Arc<[u8]>>(16);
         let ctrl = VnetController::new(
             "plugin-proxy".to_string(),
             client.clone(),
@@ -880,7 +880,7 @@ mod tests {
         let tun = Box::new(FakeTun { inner: tun_stream });
         let writer = test_sink_with(true, false); // send fails, writer alive
         let writer_for_task = writer.clone();
-        let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Arc<[u8]>>(16);
         let ctrl = VnetController::new(
             "plugin-proxy".to_string(),
             client.clone(),

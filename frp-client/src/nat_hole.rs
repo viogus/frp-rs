@@ -533,6 +533,10 @@ impl Service {
                     .as_ref()
                     .map(|q| q.max_incoming_streams)
                     .unwrap_or(0),
+                cfg.quic_options
+                    .as_ref()
+                    .map(|q| q.stream_receive_window)
+                    .unwrap_or(0),
             )
         };
         tokio::spawn(async move {

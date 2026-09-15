@@ -74,6 +74,17 @@ run_row() {
     local row_dir="$TEST_DIR/$name"
     mkdir -p "$row_dir"
 
+    # Kill this row's processes on ANY exit path. A failed row that skips
+    # cleanup leaks frps/frpc/echo, and since the port block is derived from
+    # PASS + FAIL, the next run reuses the same ports and silently tests the
+    # leaked processes instead of its own (observed cascade: one failed row
+    # under load left stragglers that failed the same row in every later run).
+    kill_row_processes() {
+        kill "$(cat "$row_dir/frpc.pid" 2>/dev/null)" \
+            "$(cat "$row_dir/frps.pid" 2>/dev/null)" \
+            "$(cat "$TEST_DIR/echo-$echo_port.pid" 2>/dev/null)" 2>/dev/null
+    }
+
     log "=== $name (proto=$proto tls=$tls mux=$mux) ==="
 
     start_echo "$echo_port" || {
@@ -127,6 +138,7 @@ run_row() {
     RUST_LOG=warn "$FRPS_BIN" -c "$row_dir/frps.toml" > "$row_dir/frps.log" 2>&1 &
     echo $! > "$row_dir/frps.pid"
     wait_for_port 127.0.0.1 "$srv_port" 20 || {
+        kill_row_processes
         fail_row "$name" "frps did not start"
         return
     }
@@ -137,6 +149,7 @@ run_row() {
     # heavy) can take tens of seconds to start frps+frpc, do the TLS
     # handshake, and register the proxy.
     wait_for_port 127.0.0.1 "$proxy_port" 45 || {
+        kill_row_processes
         fail_row "$name" "proxy port not reachable"
         return
     }
@@ -162,6 +175,7 @@ run_row() {
         PASS=$((PASS + 1))
         log "PASS $name: $mbps MB/s"
     else
+        kill_row_processes
         fail_row "$name" "zero throughput (mbps=$mbps)"
         return
     fi

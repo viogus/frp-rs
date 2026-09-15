@@ -331,6 +331,14 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     // cap matters for the few-stream case, which is the idle-control and
     // low-concurrency work-conn case.
     cfg.set_max_stream_receive_window(Some(tcp_mux_cfg.max_stream_window_size));
+    // Window-growth warm-up (perf audit Phase 2-2, option b) rides in on
+    // `Config::default()` — the vendored fork's default
+    // `window_growth_seed_rtt = Some(100 ms)` (vendor/yamux/README-FRP-RS.md,
+    // patch #5). Without it a stream's receive window cannot double until the
+    // connection has an RTT sample of its own, pinning a fresh stream at
+    // `DEFAULT_CREDIT` (256 KiB) for its first round-trip — at 100 ms RTT
+    // ~20 Mbit/s per stream. Nothing here overrides it (see the
+    // `yamux_config_carries_window_growth_seed_rtt` test).
     // 32 KiB data frames (yamux-rs default 16 KiB): halves the frame
     // count for the bridge's 64 KiB chunks, i.e. halves per-frame
     // header writes/reads and waker round trips. Go's hashicorp yamux
@@ -1047,6 +1055,25 @@ mod tests {
             ..Default::default()
         };
         let _ = yamux_config(&_big);
+    }
+
+    /// Perf audit Phase 2-2 / TOP 5 (option b): a fresh yamux stream must not
+    /// stay pinned at the 256 KiB initial credit for the connection's first
+    /// round-trip. The frp-rs yamux fork's `Config::default()` carries a
+    /// conservative 100 ms window-growth seed RTT, used to gate the first
+    /// window doubling while the connection has no RTT sample of its own
+    /// (vendor/yamux/README-FRP-RS.md, patch #5); every config this builder
+    /// hands to `Connection::new` must still carry it.
+    #[test]
+    fn yamux_config_carries_window_growth_seed_rtt() {
+        let cfg = yamux_config(&TcpMuxConfig::default());
+        assert_eq!(
+            cfg.window_growth_seed_rtt(),
+            Some(Duration::from_millis(100)),
+            "tcp-mux streams must be able to grow their receive window during \
+             the first round-trip (100 ms seed), not only after the first \
+             ping/pong sample lands"
+        );
     }
 
     /// Regression: a stalled peer (ACK backlog permanently full) leaves the

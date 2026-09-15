@@ -36,6 +36,11 @@ use crate::proxy_runtime::{ProxyPhase, ProxyRuntimeInfo};
 #[cfg(feature = "vnet")]
 type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;
 
+/// Per-proxy TUN delivery channels (shared type — `Arc<[u8]>` elements so a
+/// fanned-out packet is shared by refcount rather than copied per peer).
+#[cfg(feature = "vnet")]
+type VnetTunTxMap = crate::vnet::VnetTunTxMap;
+
 /// Maximum framed vnet message size, matching Go frp `maxMessageSize`.
 #[cfg(feature = "vnet")]
 const MAX_VNET_MESSAGE: u32 = 1024 * 1024;
@@ -302,7 +307,7 @@ pub(crate) struct WorkConnConfig {
     #[cfg(feature = "vnet")]
     pub vnet_controller: Arc<frp_vnet::controller::ClientVnetController>,
     #[cfg(feature = "vnet")]
-    pub vnet_tun_tx: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+    pub vnet_tun_tx: VnetTunTxMap,
 }
 
 /// Bundled parameters for work connection transport acquisition.
@@ -1447,7 +1452,7 @@ async fn run_virtual_net_plugin_work_conn(
     work: IoStream,
     proxy_name: String,
     vnet_controller: Arc<frp_vnet::controller::ClientVnetController>,
-    vnet_tun_tx: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+    vnet_tun_tx: VnetTunTxMap,
     use_encryption: bool,
     use_compression: bool,
     enc_key: [u8; 16],
@@ -1536,7 +1541,10 @@ async fn run_virtual_net_plugin_work_conn(
                                     registered_ips.push(src_ip);
                                 }
                             }
-                            if let Err(e) = reader_tun.try_send(packet) {
+                            // Single destination: the decoded Vec moves into
+                            // the shared buffer type (no copy on an exact-fit
+                            // allocation, one copy otherwise).
+                            if let Err(e) = reader_tun.try_send(Arc::from(packet)) {
                                 match e {
                                     mpsc::error::TrySendError::Full(_) => {
                                         warn!(
@@ -2731,7 +2739,7 @@ mod tests {
 
         let controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
         let tun_txs = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (tun_tx, mut tun_rx) = mpsc::channel::<Arc<[u8]>>(16);
         tun_txs
             .lock()
             .unwrap()
@@ -2756,7 +2764,7 @@ mod tests {
         framed.extend_from_slice(&(inbound.len() as u32).to_le_bytes());
         framed.extend_from_slice(&inbound);
         peer.write_all(&framed).await.unwrap();
-        assert_eq!(tun_rx.recv().await, Some(inbound.clone()));
+        assert_eq!(tun_rx.recv().await.as_deref(), Some(&inbound[..]));
 
         let src = std::net::IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1));
         let return_tx = controller
@@ -2788,7 +2796,7 @@ mod tests {
         let key = frp_core::encryption::derive_key("vnet-test-secret");
         let controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
         let tun_txs = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (tun_tx, mut tun_rx) = mpsc::channel::<Arc<[u8]>>(16);
         tun_txs
             .lock()
             .unwrap()
@@ -2817,7 +2825,7 @@ mod tests {
         frp_core::encryption::compress_into(&framed, &mut compressed).unwrap();
         let wire = frp_core::encryption::encrypt(&compressed, &key).unwrap();
         peer.write_all(&wire).await.unwrap();
-        assert_eq!(tun_rx.recv().await, Some(inbound.clone()));
+        assert_eq!(tun_rx.recv().await.as_deref(), Some(&inbound[..]));
 
         let src: IpAddr = "2001:db8::2".parse().unwrap();
         let return_tx = controller

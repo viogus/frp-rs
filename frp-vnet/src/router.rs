@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 /// A CIDR routing table mapping subnet strings to target proxy names,
 /// partitioned by virtual net.
@@ -259,6 +260,120 @@ impl RouteTable {
     /// Check if routing table is empty.
     pub fn is_empty(&self) -> bool {
         self.routes.values().all(Vec::is_empty)
+    }
+}
+
+/// A CIDR prefix set precompiled into masked `(network, mask)` pairs.
+///
+/// [`RouteTable`] re-parses a CIDR string on every `insert`, which is far too
+/// expensive for a per-packet path. `RoutePrefixes` is compiled once — at
+/// proxy registration — and answers membership tests with one mask + compare
+/// per prefix: no parsing, no allocation, no hashing.
+///
+/// A `RoutePrefixes` is cheap to share behind an `Arc`, so one compiled set
+/// can back every packet of every fan-out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoutePrefixes {
+    v4: Vec<(u32, u32)>,
+    v6: Vec<(u128, u128)>,
+}
+
+impl RoutePrefixes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Compile a single CIDR (for example `10.0.0.0/24` or `2001:db8::/64`).
+    /// Returns `None` when the string is not a valid CIDR — exactly the
+    /// inputs [`RouteTable::insert`] rejects.
+    pub fn from_cidr(cidr: &str) -> Option<Self> {
+        let mut prefixes = Self::new();
+        prefixes.insert_cidr(cidr).then_some(prefixes)
+    }
+
+    /// Add a CIDR to the set. Returns `false` (leaving the set unchanged) when
+    /// the CIDR does not parse, mirroring [`RouteTable::insert`]'s error arm.
+    pub fn insert_cidr(&mut self, cidr: &str) -> bool {
+        match Net::parse(cidr) {
+            Some(Net::V4(net)) => {
+                self.v4.push((net.addr, net.mask));
+                true
+            }
+            Some(Net::V6(net)) => {
+                self.v6.push((net.addr, net.mask));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether `ip` falls inside any prefix of the set.
+    ///
+    /// Address families are never mixed: an IPv4 address is only tested
+    /// against IPv4 prefixes, and vice versa.
+    pub fn contains(&self, ip: &IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(ip) => {
+                let ip = u32::from(*ip);
+                self.v4.iter().any(|(net, mask)| (ip & mask) == *net)
+            }
+            IpAddr::V6(ip) => {
+                let ip = u128::from(*ip);
+                self.v6.iter().any(|(net, mask)| (ip & mask) == *net)
+            }
+        }
+    }
+
+    /// Number of compiled prefixes.
+    pub fn len(&self) -> usize {
+        self.v4.len() + self.v6.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.v4.is_empty() && self.v6.is_empty()
+    }
+}
+
+/// A registered subnet: the CIDR string as configured (kept verbatim for
+/// OS route add/remove) plus its precompiled prefix set, shared behind an
+/// `Arc` so fanning a packet out to N peers clones a pointer, not a prefix
+/// list.
+#[derive(Debug, Clone)]
+pub struct PrecompiledSubnet {
+    cidr: String,
+    prefixes: Arc<RoutePrefixes>,
+}
+
+impl PrecompiledSubnet {
+    /// Precompile `cidr` for the per-packet path.
+    ///
+    /// A CIDR that does not parse yields an empty prefix set that never
+    /// matches — identical to the pre-precompile behavior, where the
+    /// per-packet `RouteTable::insert` failed and the route never matched.
+    pub fn new(cidr: impl Into<String>) -> Self {
+        let cidr = cidr.into();
+        let mut prefixes = RoutePrefixes::new();
+        prefixes.insert_cidr(&cidr);
+        Self {
+            cidr,
+            prefixes: Arc::new(prefixes),
+        }
+    }
+
+    /// The CIDR exactly as registered.
+    pub fn cidr(&self) -> &str {
+        &self.cidr
+    }
+
+    /// The precompiled prefix set. Cloning the returned `Arc` is a refcount
+    /// bump, not a copy.
+    pub fn prefixes(&self) -> &Arc<RoutePrefixes> {
+        &self.prefixes
+    }
+
+    /// Whether `ip` is inside this subnet.
+    pub fn contains(&self, ip: &IpAddr) -> bool {
+        self.prefixes.contains(ip)
     }
 }
 
@@ -545,5 +660,132 @@ mod tests {
         rt.remove("net", "host");
         assert_eq!(rt.len(), 64);
         assert_eq!(rt.lookup("net", &host_ip), Some("proxy-7"));
+    }
+
+    /// The precompiled prefix set must answer exactly what the old
+    /// per-packet `RouteTable::new() + insert + lookup` chain answered, for
+    /// every CIDR/IP combination — including the CIDRs it refuses.
+    #[test]
+    fn precompiled_lookup_matches_per_packet_route_table() {
+        let cidrs = [
+            "10.0.0.0/24",
+            "10.0.0.0/8",
+            "10.0.7.7/32",
+            "0.0.0.0/0",
+            "192.168.1.0/31",
+            "172.16.0.0/12",
+            "2001:db8::/64",
+            "2001:db8::1/128",
+            "::/0",
+            "fe80::/10",
+            // Unparsable / out-of-range: the reference table refuses these
+            // (insert is Err), so the precompiled set must never match.
+            "10.0.0.0",
+            "10.0.0.0/33",
+            "10.0.0.0/-1",
+            "",
+            "not-a-cidr",
+            "2001:db8::/129",
+        ];
+        let ips: Vec<IpAddr> = [
+            "10.0.0.1",
+            "10.0.7.7",
+            "10.1.2.3",
+            "11.0.0.1",
+            "192.168.1.1",
+            "172.31.255.255",
+            "0.0.0.1",
+            "255.255.255.255",
+            "2001:db8::5",
+            "2001:db8::1",
+            "fe80::1",
+            "::1",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+
+        for cidr in cidrs {
+            // Reference: the pre-optimization per-packet path.
+            let mut rt = RouteTable::new();
+            let inserted = rt.insert("", "proxy", cidr).is_ok();
+            let compiled = PrecompiledSubnet::new(cidr);
+
+            assert_eq!(
+                !compiled.prefixes().is_empty(),
+                inserted,
+                "compiled emptiness must track insert success for {cidr:?}"
+            );
+            for ip in &ips {
+                let reference = inserted && rt.lookup("", ip) == Some("proxy");
+                assert_eq!(
+                    compiled.contains(ip),
+                    reference,
+                    "precompiled contains({ip}) disagreed with the reference for {cidr:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn precompiled_subnet_keeps_cidr_verbatim_and_never_matches_invalid() {
+        let subnet = PrecompiledSubnet::new("10.0.0.0/24");
+        assert_eq!(subnet.cidr(), "10.0.0.0/24");
+        assert_eq!(subnet.prefixes().len(), 1);
+        assert!(subnet.contains(&"10.0.0.9".parse().unwrap()));
+        assert!(!subnet.contains(&"10.0.1.9".parse().unwrap()));
+        assert!(
+            !subnet.contains(&"2001:db8::1".parse().unwrap()),
+            "an IPv6 address must never match an IPv4 subnet"
+        );
+
+        // A rejected CIDR keeps the configured string (the OS route removal
+        // path needs it) but matches nothing.
+        let bogus = PrecompiledSubnet::new("10.0.0.0/33");
+        assert_eq!(bogus.cidr(), "10.0.0.0/33");
+        assert!(bogus.prefixes().is_empty());
+        assert!(!bogus.contains(&"10.0.0.9".parse().unwrap()));
+    }
+
+    /// Sharing one compiled subnet across peers must not duplicate the prefix
+    /// list: `Arc::clone` is a refcount bump and every clone sees the same
+    /// prefixes and the same answers.
+    #[test]
+    fn precompiled_subnet_arc_is_shared_not_copied() {
+        let subnet = PrecompiledSubnet::new("2001:db8::/64");
+        let shared = subnet.prefixes().clone();
+        assert!(Arc::ptr_eq(subnet.prefixes(), &shared));
+        assert_eq!(Arc::strong_count(subnet.prefixes()), 2);
+
+        let clone = subnet.clone();
+        assert!(
+            Arc::ptr_eq(subnet.prefixes(), clone.prefixes()),
+            "cloning a registered subnet must share the compiled prefixes"
+        );
+        let ip: IpAddr = "2001:db8::7".parse().unwrap();
+        assert_eq!(subnet.contains(&ip), clone.contains(&ip));
+        assert!(clone.contains(&ip));
+    }
+
+    /// Multi-prefix sets: a vnet proxy may own one IPv4 and one IPv6 route,
+    /// and `RoutePrefixes` must resolve both without cross-family bleed.
+    #[test]
+    fn route_prefixes_multi_family_membership() {
+        let mut prefixes = RoutePrefixes::new();
+        assert!(prefixes.insert_cidr("10.0.0.0/24"));
+        assert!(prefixes.insert_cidr("2001:db8::/64"));
+        assert!(!prefixes.insert_cidr("garbage"));
+        assert_eq!(prefixes.len(), 2);
+
+        assert!(prefixes.contains(&"10.0.0.5".parse().unwrap()));
+        assert!(prefixes.contains(&"2001:db8::5".parse().unwrap()));
+        assert!(!prefixes.contains(&"10.0.1.5".parse().unwrap()));
+        assert!(!prefixes.contains(&"2001:db9::5".parse().unwrap()));
+
+        // A full-coverage /0 set (both families) matches everything.
+        let all = RoutePrefixes::from_cidr("0.0.0.0/0").expect("valid CIDR");
+        assert!(all.contains(&"8.8.8.8".parse().unwrap()));
+        assert!(!all.contains(&"2001:db8::1".parse().unwrap()));
+        assert!(RoutePrefixes::from_cidr("nope").is_none());
     }
 }

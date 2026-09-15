@@ -31,6 +31,8 @@ mod frame;
 pub(crate) mod connection;
 mod tagged_stream;
 
+use web_time::Duration;
+
 pub use crate::connection::{Connection, Mode, Packet, Stream};
 pub use crate::error::ConnectionError;
 pub use crate::frame::{
@@ -43,6 +45,22 @@ const MIB: usize = KIB * 1024;
 const GIB: usize = MIB * 1024;
 
 pub const DEFAULT_CREDIT: u32 = 256 * KIB as u32; // as per yamux specification
+
+/// frp-rs patch: presumed round-trip time used to gate the auto-tuning growth
+/// of a stream's receive window while the connection has no RTT sample yet
+/// (the default of `Config::window_growth_seed_rtt`; see
+/// `connection::stream::flow_control::next_window_update`).
+///
+/// crates.io yamux only doubles a stream's window once a PING/PONG sample
+/// exists, so a fresh stream is pinned at `DEFAULT_CREDIT` (256 KiB) for its
+/// first round-trip — at 100 ms RTT that caps a single stream at ~20 Mbit/s
+/// until the sample lands. 100 ms is the conservative end of the
+/// public-internet RTT range: a peer that drains half of `DEFAULT_CREDIT`
+/// within `2 * 100 ms` is already provably running at >= 5.2 Mbit/s, i.e. its
+/// bandwidth-delay-product exceeds the current window — the very condition
+/// the RTT-based gate encodes — so growth may start during the first
+/// round-trip instead of after it.
+const WINDOW_GROWTH_SEED_RTT: Duration = Duration::from_millis(100);
 
 pub type Result<T> = std::result::Result<T, ConnectionError>;
 
@@ -76,6 +94,8 @@ const DEFAULT_SPLIT_SEND_SIZE: usize = 16 * KIB;
 /// - read after close = true
 /// - split send size = 16 KiB
 /// - per-stream receive window cap = none (crates.io auto-tuning)
+/// - window growth seed RTT = 100 ms (frp-rs patch; crates.io has no seed and
+///   gates growth on a real RTT sample only)
 #[derive(Debug, Clone)]
 pub struct Config {
     max_connection_receive_window: Option<usize>,
@@ -88,6 +108,11 @@ pub struct Config {
     /// independently of the connection-wide limit (Go frp pins
     /// `MaxStreamWindowSize=6MiB` on its XTCP data plane).
     max_stream_receive_window: Option<u32>,
+    /// frp-rs patch: RTT presumed for receive-window auto-tuning while the
+    /// connection has no sample of its own. `Some(seed)` lets a stream's
+    /// window start growing during its first round-trip (see
+    /// [`Config::set_window_growth_seed_rtt`]); `None` is crates.io behavior.
+    window_growth_seed_rtt: Option<Duration>,
 }
 
 impl Default for Config {
@@ -98,6 +123,7 @@ impl Default for Config {
             read_after_close: true,
             split_send_size: DEFAULT_SPLIT_SEND_SIZE,
             max_stream_receive_window: None,
+            window_growth_seed_rtt: Some(WINDOW_GROWTH_SEED_RTT),
         }
     }
 }
@@ -172,6 +198,36 @@ impl Config {
         self
     }
 
+    /// Set the RTT presumed for receive-window auto-tuning while the
+    /// connection has no RTT sample of its own (frp-rs patch).
+    ///
+    /// yamux doubles a stream's receive window when the peer has drained half
+    /// of its credit in less than two round-trips; without a sample that
+    /// condition cannot be evaluated and upstream crates.io yamux leaves the
+    /// window at `DEFAULT_CREDIT` (256 KiB) for the connection's first
+    /// round-trip. `Some(seed)` substitutes the seed for the missing sample,
+    /// so the window can start growing immediately; `None` restores the
+    /// upstream behavior (growth only after the first PING/PONG sample).
+    ///
+    /// The seed only widens the "fast enough to double" test to
+    /// `2 * seed` — growth still requires the peer to demonstrably drain half
+    /// of the current window, and stays bounded by
+    /// `max_connection_receive_window` and `max_stream_receive_window`.
+    ///
+    /// Default: `Some(100 ms)` (frp-rs fork default; the rationale is on
+    /// `WINDOW_GROWTH_SEED_RTT`).
+    pub fn set_window_growth_seed_rtt(&mut self, seed: Option<Duration>) -> &mut Self {
+        self.window_growth_seed_rtt = seed;
+        self
+    }
+
+    /// The RTT presumed for receive-window auto-tuning while the connection
+    /// has no sample (frp-rs patch; see
+    /// [`Config::set_window_growth_seed_rtt`]).
+    pub fn window_growth_seed_rtt(&self) -> Option<Duration> {
+        self.window_growth_seed_rtt
+    }
+
     /// Set the max. number of streams per connection.
     pub fn set_max_num_streams(&mut self, n: usize) -> &mut Self {
         self.max_num_streams = n;
@@ -229,6 +285,11 @@ impl quickcheck::Arbitrary for Config {
             split_send_size: g.gen_range(DEFAULT_SPLIT_SEND_SIZE..usize::MAX),
             max_stream_receive_window: if bool::arbitrary(g) {
                 Some(g.gen_range(DEFAULT_CREDIT..=u32::MAX))
+            } else {
+                None
+            },
+            window_growth_seed_rtt: if bool::arbitrary(g) {
+                Some(Duration::from_millis(g.gen_range(0..1_000u64)))
             } else {
                 None
             },

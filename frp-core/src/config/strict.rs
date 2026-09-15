@@ -399,6 +399,9 @@ fn section_known_keys(section: &str) -> Option<&'static [&'static str]> {
             "maxIdleTimeout",
             "max_incoming_streams",
             "maxIncomingStreams",
+            // frp-rs extension (no Go equivalent): per-stream receive window.
+            "stream_receive_window",
+            "streamReceiveWindow",
         ],
         "ssh_tunnel_gateway" => &[
             "bind_port",

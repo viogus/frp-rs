@@ -2144,7 +2144,7 @@ pub(crate) async fn handle_new_proxy(
                         // owner-conflict refusal — and silently overwrote
                         // a live owner's (virtual_net, subnet) route,
                         // redirecting the displaced proxy's visitor
-                        // packets here (vnet_visitor_route_target_run_id).
+                        // packets here (VnetRoutes::visitor_route_target).
                         // The registering proxy itself IS the membership
                         // (proxy_type == "vnet" in `vn`), so no
                         // membership check applies on this path.
@@ -2170,8 +2170,9 @@ pub(crate) async fn handle_new_proxy(
                                 // allowed (normal update — reload keeps the
                                 // run_id). Mirror the advertise path.
                                 if !routes.contains_key(&key) {
-                                    let owned =
-                                        routes.iter().filter(|(_, (rid, _))| rid == run_id).count();
+                                    // O(1) precomputed count (index on
+                                    // `VnetRoutes`), not a table scan.
+                                    let owned = routes.run_route_count(run_id);
                                     if owned >= super::nathole::MAX_VNET_ROUTES_PER_CLIENT {
                                         rejection = Some(format!(
                                             "vnet proxy '{}' rejected: per-client route cap ({}) reached",

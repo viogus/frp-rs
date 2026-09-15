@@ -893,6 +893,21 @@ pub struct QuicOptions {
         alias = "maxIncomingStreams"
     )]
     pub max_incoming_streams: i64,
+    /// Per-stream QUIC receive window in bytes. Default: 6291456 (6 MiB).
+    ///
+    /// frp-rs extension for high-BDP links — Go frp has no equivalent option
+    /// (it inherits quic-go's `MaxStreamReceiveWindow` default of 6 MiB, which
+    /// is why 6 MiB is the default here too). quinn's own default is
+    /// 1,250,000 B, sized for 12.5 MB/s at 100 ms RTT and never auto-tuned,
+    /// so a single stream is hard-capped at `window / RTT` — ~100 Mbit/s at
+    /// 100 ms RTT regardless of link capacity. Rule of thumb: at least the
+    /// link's bandwidth-delay product; `0` (or negative) = the 6 MiB default.
+    /// Values are clamped to [16 KiB, 64 MiB] on the way into quinn.
+    #[serde(
+        default = "default_quic_stream_receive_window",
+        alias = "streamReceiveWindow"
+    )]
+    pub stream_receive_window: i64,
 }
 
 impl Default for QuicOptions {
@@ -901,6 +916,7 @@ impl Default for QuicOptions {
             keepalive_period: default_quic_keepalive_period(),
             max_idle_timeout: default_quic_max_idle_timeout(),
             max_incoming_streams: default_quic_max_incoming_streams(),
+            stream_receive_window: default_quic_stream_receive_window(),
         }
     }
 }
@@ -913,6 +929,13 @@ fn default_quic_max_idle_timeout() -> i64 {
 }
 fn default_quic_max_incoming_streams() -> i64 {
     100000
+}
+/// 6 MiB, matching Go frp's effective quic-go window (`MaxStreamReceiveWindow`)
+/// and the yamux path's `MaxStreamWindowSize`. Kept in sync with
+/// `crate::quic::DEFAULT_STREAM_RECEIVE_WINDOW` by a unit test in `quic.rs`
+/// (the `quic` module is feature-gated, so the value cannot be imported here).
+fn default_quic_stream_receive_window() -> i64 {
+    6 * 1024 * 1024
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

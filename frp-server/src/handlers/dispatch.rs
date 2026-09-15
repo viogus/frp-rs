@@ -1547,7 +1547,7 @@ mod nat_hole_visitor_bounded_send_tests {
              visitor fd + session forever"
         );
         assert!(
-            state.xtcp.nat_hole.sessions.read().await.is_empty(),
+            state.xtcp.nat_hole.sessions.is_empty(),
             "F14: session must be expired after the bounded send times out"
         );
 

@@ -1,7 +1,7 @@
 # Vendored yamux 0.14.0 (frp-rs)
 
 This directory vendors `yamux` 0.14.0 (crates.io, Parity Technologies)
-with four patches, wired in via `[patch.crates-io]` in the workspace
+with five patches, wired in via `[patch.crates-io]` in the workspace
 root `Cargo.toml` (`yamux = { path = "vendor/yamux" }`).
 
 ## License
@@ -160,6 +160,73 @@ change, and Go peers are unaffected.
 When bumping yamux upstream: re-apply the `Config` field + setter and
 the `flow_control.rs` clamp, or carry the patch upstream.
 
+## Patch: window-growth seed RTT (warm-start of the per-stream window ramp)
+
+crates.io yamux doubles a stream's receive window only when the peer has
+drained half of its credit in less than two round-trips (QUIC-style BDP
+auto-tuning), and it evaluates that condition **only when a PING/PONG RTT
+sample exists** — the gate is literally
+`.rtt.get().map(|rtt| elapsed < rtt * 2).unwrap_or(false)`
+(`src/connection/stream/flow_control.rs`). The first ping is sent as soon
+as the connection is polled (`Rtt::new` arms `next`, so `next_ping` fires
+on the first iteration — `src/connection/rtt.rs`), but the sample still
+arrives a full RTT later. For that first round-trip the `.unwrap_or(false)`
+arm wins and the window never grows, so a fresh stream is pinned at
+`DEFAULT_CREDIT` (256 KiB): at 100 ms RTT a single tcp-mux stream is
+capped at ~20 Mbit/s until the sample lands, then ramps. Go frp's yamux
+fork sidesteps this by pinning 6 MiB per stream outright
+(`util/conn.go` `MaxStreamWindowSize`) with no growth gate at all.
+
+frp-rs keeps the auto-tuning (it is the only bound that adapts to the
+actual BDP) but removes the dead first round-trip: while the connection
+has no sample of its own, a **conservative seed RTT (100 ms)** is
+substituted for the missing measurement. Growth then requires what the
+real gate requires anyway — the peer drained half of `DEFAULT_CREDIT`
+that is 128 KiB within `2 * 100 ms`, i.e. it is running at >= 5.2 Mbit/s,
+which is exactly "the BDP exceeds the current window" for any link with
+RTT <= 100 ms. Nothing else changes: the seed is only consulted when
+`Rtt::get()` is `None`, it never widens a measured RTT, growth is still
+bounded by `max_connection_receive_window` / `max_stream_receive_window`
+(the second patch), and a peer that drains its credit slower than the seed
+window keeps the 256 KiB window. This is perf-audit TOP 5 / Phase 2-2,
+option (b).
+
+### What changed
+
+- `Config` gains `window_growth_seed_rtt: Option<Duration>` and
+  `Config::set_window_growth_seed_rtt` / `Config::window_growth_seed_rtt`
+  (`src/lib.rs`). **The fork's `Config::default()` is `Some(100 ms)`** —
+  a deliberate deviation from crates.io (documented in the `Config` doc
+  header); `None` restores upstream gating exactly. Because the seed rides
+  in on the default, every frp-rs yamux user gets it without opting in:
+  the tcp-mux config builder (`frp-core/src/mux.rs`, pinned by
+  `yamux_config_carries_window_growth_seed_rtt`) and the XTCP tunnel
+  session (`frp-core/src/xtcp_session.rs`), both of which start from
+  `Config::default()`.
+- `FlowController::next_window_update` evaluates
+  `self.rtt.get().or(self.config.window_growth_seed_rtt)` through the new
+  pure `window_growth_gate_open(assumed_rtt, since_last_window_update)`
+  helper (`src/connection/stream/flow_control.rs`); the multiplication is
+  `saturating_mul` so a nonsensical configured seed cannot overflow.
+- `assert_invariants`'s "the maximum is only increased iff an rtt
+  measurement is available" check now applies only when no seed is
+  configured, i.e. it still pins the upstream configuration.
+- Tests: `mod window_growth_tests` in `flow_control.rs` (gate matrix
+  including the `None`/upstream row, no-sample doubling, slow-consumption
+  no-growth, and "a sample wins over the seed"), plus the frp-core wiring
+  pin above. Note that this vendored crate is not a workspace member, so
+  its unit tests are not part of `cargo test --workspace`; run them with a
+  standalone checkout of the crate (`mod tests` there is quickcheck-based
+  and needs a `quickcheck` dev-dependency added, which the normalized
+  `Cargo.toml` does not carry).
+
+### Upgrade note
+
+When bumping yamux upstream: re-apply the `Config` field + accessors +
+default, the `assumed_rtt` fallback in `next_window_update` (and the
+`saturating_mul`), and the `assert_invariants` guard, or carry the patch
+upstream. `WINDOW_GROWTH_SEED_RTT` (`src/lib.rs`) holds the value.
+
 ## Patch: send-side body-buffer pool (no per-chunk `Vec` allocation)
 
 Every data frame on the write path built its body with
@@ -223,5 +290,5 @@ upstream.
 ## Diff from crates.io yamux 0.14.0
 
 Everything else in this tree is byte-identical to crates.io yamux
-0.14.0; the full delta is the four patches above plus the two
+0.14.0; the full delta is the five patches above plus the two
 `#[allow(dead_code)]` annotations.

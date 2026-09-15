@@ -117,11 +117,12 @@ use crate::vnet::{
     add_os_route, advertise_vnet_visitor_route, local_vnet_set, remove_os_route, remove_vnet_tun,
     send_vnet_route_advertise, spawn_vnet_tun_controller, virtual_net_visitor_route_adv,
     vnet_proxy_snapshot, vnet_tun_params, VnetPeerRoute, VnetTunCancelMap, VnetTunMap,
+    VnetTunSubnetMap, VnetTunTxMap,
 };
-// register_vnet_tun, vnet_tun_cidr, VnetTunTxMap are used only by vnet tests,
-// so their imports are test-cfg'd to keep plain builds warning-free.
+// register_vnet_tun and vnet_tun_cidr are used only by vnet tests, so their
+// imports are test-cfg'd to keep plain builds warning-free.
 #[cfg(all(feature = "vnet", test))]
-use crate::vnet::{register_vnet_tun, vnet_tun_cidr, VnetTunTxMap};
+use crate::vnet::{register_vnet_tun, vnet_tun_cidr};
 use crate::work_conn::XtcpNotification;
 
 /// Go frp v0.70.1 visitor plugin type for virtual-net host routes.
@@ -484,18 +485,21 @@ pub struct Service {
     #[cfg(feature = "vnet")]
     vnet_controller: Arc<frp_vnet::controller::ClientVnetController>,
     /// Per-proxy TX channels for forwarding received VnetPackets to TUN devices.
-    /// Keyed by proxy name.
+    /// Keyed by proxy name. Elements are `Arc<[u8]>` so a fan-out shares one
+    /// packet buffer by refcount instead of copying per peer.
     #[cfg(feature = "vnet")]
-    vnet_tun_tx: Arc<std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>>>,
+    vnet_tun_tx: VnetTunTxMap,
     /// Per-proxy cancellation senders for running vnet controllers.
     #[cfg(feature = "vnet")]
     vnet_tun_cancels: VnetTunCancelMap,
     /// Per-proxy TUN device names for OS route injection.
     #[cfg(feature = "vnet")]
     pub(crate) vnet_tun_names: Arc<Mutex<HashMap<String, String>>>,
-    /// Per-proxy subnet CIDR for directing virtual_net visitor return traffic.
+    /// Per-proxy subnet for directing virtual_net visitor return traffic.
+    /// Registered precompiled (see `vnet_tun_subnets` insert at
+    /// `open_vnet_tun_for_proxy`) so the per-packet fan-out never parses a CIDR.
     #[cfg(feature = "vnet")]
-    pub(crate) vnet_tun_subnets: Arc<Mutex<HashMap<String, String>>>,
+    pub(crate) vnet_tun_subnets: VnetTunSubnetMap,
     /// Peer proxy name → (advertised subnet, TUN interface, virtual net) for
     /// OS routes injected from VnetRouteAdvertise. The vnet is stored so route
     /// table entries can be removed in the right partition on VnetRouteRemove
@@ -1629,6 +1633,11 @@ impl Service {
                     .as_ref()
                     .map(|q| q.max_incoming_streams)
                     .unwrap_or(0),
+                cfg_local
+                    .quic_options
+                    .as_ref()
+                    .map(|q| q.stream_receive_window)
+                    .unwrap_or(0),
             ),
         );
 
@@ -2647,6 +2656,11 @@ impl Service {
                     .as_ref()
                     .map(|q| q.max_incoming_streams)
                     .unwrap_or(0),
+                cfg_local
+                    .quic_options
+                    .as_ref()
+                    .map(|q| q.stream_receive_window)
+                    .unwrap_or(0),
             );
             let handle = tokio::spawn(async move {
                 crate::visitor::run_visitor_listener(crate::visitor::VisitorListenerConfig {
@@ -3240,7 +3254,9 @@ impl Service {
                                                 .lock()
                                                 .unwrap_or_else(|e| e.into_inner());
                                             if let Some(tx) = txs.get(&vpkt.proxy_name) {
-                                                if tx.try_send(packet).is_err() {
+                                                // Single destination: the Vec
+                                                // moves into the Arc (no copy).
+                                                if tx.try_send(Arc::from(packet)).is_err() {
                                                     warn!(proxy_name = %vpkt.proxy_name, "vnet TUN channel closed");
                                                 }
                                             } else {
@@ -5513,10 +5529,10 @@ mod tests {
 
         // Pre-populate every map the removal path must clean up.
         names.lock().await.insert("vnet-a".into(), "tun0".into());
-        subnets
-            .lock()
-            .await
-            .insert("vnet-a".into(), "10.0.0.0/24".into());
+        subnets.lock().await.insert(
+            "vnet-a".into(),
+            frp_vnet::router::PrecompiledSubnet::new("10.0.0.0/24"),
+        );
         route_table
             .write()
             .await
