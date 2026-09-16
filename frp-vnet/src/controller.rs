@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -319,6 +320,28 @@ impl ClientVnetController {
         Ok(())
     }
 
+    /// Register a `virtual_net` visitor route only while `shutdown` is unset.
+    ///
+    /// Go frp #5512 (`registerControllerConn`) refuses to register a route once
+    /// the plugin is cancelled, so a stale visitor's late registration cannot
+    /// clobber a replacement route under the same name. Returns `Ok(false)`
+    /// (registering nothing) when `shutdown` is already set — the caller then
+    /// exits its reconnect loop instead of overwriting the successor's route.
+    /// `Ok(true)` means the route was registered.
+    pub async fn register_visitor_route_if_active(
+        &self,
+        name: &str,
+        cidr: &str,
+        packet_tx: mpsc::Sender<Vec<u8>>,
+        shutdown: &AtomicBool,
+    ) -> anyhow::Result<bool> {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        self.register_visitor_route(name, cidr, packet_tx).await?;
+        Ok(true)
+    }
+
     /// Remove a `virtual_net` visitor route and its delivery channel.
     pub async fn unregister_visitor_route(&self, name: &str) {
         self.routes.write().await.remove("", name);
@@ -327,6 +350,39 @@ impl ClientVnetController {
             .unwrap_or_else(|e| e.into_inner())
             .remove(name);
         tracing::info!(visitor_name = %name, "virtual_net visitor route removed");
+    }
+
+    /// Remove a `virtual_net` visitor route and its delivery channel only when
+    /// they still belong to `packet_tx`.
+    ///
+    /// Go frp #5512 makes client route unregistration connection-owned
+    /// (`UnregisterClientRoute(name, conn)`): a stale visitor task's deferred
+    /// cleanup must not clobber a replacement route registered under the same
+    /// name. The channel is the ownership token — `same_channel` distinguishes
+    /// an old registration from its successor even when both use the same
+    /// visitor name.
+    ///
+    /// Returns `true` when the route was removed.
+    pub async fn unregister_visitor_route_if_matches(
+        &self,
+        name: &str,
+        packet_tx: &mpsc::Sender<Vec<u8>>,
+    ) -> bool {
+        let matches = {
+            let mut txs = self.visitor_txs.lock().unwrap_or_else(|e| e.into_inner());
+            match txs.get(name) {
+                Some(tx) if tx.same_channel(packet_tx) => {
+                    txs.remove(name);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if matches {
+            self.routes.write().await.remove("", name);
+            tracing::info!(visitor_name = %name, "virtual_net visitor route removed");
+        }
+        matches
     }
 
     /// Deliver an inbound packet to a visitor tunnel.
@@ -554,6 +610,121 @@ mod tests {
                 .lookup("", &IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1))),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn visitor_route_owner_cleanup_removes_own_route() {
+        let ctrl = ClientVnetController::new();
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(16);
+        ctrl.register_visitor_route("vnet-visitor", "100.86.0.1/32", tx.clone())
+            .await
+            .unwrap();
+
+        assert!(
+            ctrl.unregister_visitor_route_if_matches("vnet-visitor", &tx)
+                .await
+        );
+
+        let routes = ctrl.route_table();
+        assert_eq!(
+            routes
+                .read()
+                .await
+                .lookup("", &IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1))),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_visitor_cleanup_does_not_clobber_replacement_route() {
+        let ctrl = ClientVnetController::new();
+
+        // Old visitor instance registers the route.
+        let (old_tx, _old_rx) = mpsc::channel::<Vec<u8>>(16);
+        ctrl.register_visitor_route("vnet-visitor", "100.86.0.1/32", old_tx.clone())
+            .await
+            .unwrap();
+
+        // Replacement instance re-registers the same name with a new channel.
+        let (new_tx, _new_rx) = mpsc::channel::<Vec<u8>>(16);
+        ctrl.register_visitor_route("vnet-visitor", "100.86.0.1/32", new_tx)
+            .await
+            .unwrap();
+
+        // The stale old instance's deferred cleanup must not remove the
+        // replacement route (Go frp #5512 connection-ownership semantics).
+        assert!(
+            !ctrl
+                .unregister_visitor_route_if_matches("vnet-visitor", &old_tx)
+                .await
+        );
+
+        let routes = ctrl.route_table();
+        assert_eq!(
+            routes
+                .read()
+                .await
+                .lookup("", &IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1))),
+            Some("vnet-visitor")
+        );
+        assert!(ctrl
+            .deliver_visitor_packet("vnet-visitor", vec![0x45])
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn visitor_route_registration_refused_after_shutdown() {
+        let ctrl = ClientVnetController::new();
+        let shutdown = AtomicBool::new(true);
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(16);
+
+        assert!(!ctrl
+            .register_visitor_route_if_active("vnet-visitor", "100.86.0.1/32", tx, &shutdown)
+            .await
+            .unwrap());
+
+        let routes = ctrl.route_table();
+        assert_eq!(
+            routes
+                .read()
+                .await
+                .lookup("", &IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1))),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_register_after_shutdown_keeps_replacement_route() {
+        let ctrl = ClientVnetController::new();
+        let shutdown = AtomicBool::new(false);
+
+        // Replacement instance registers first.
+        let (new_tx, _new_rx) = mpsc::channel::<Vec<u8>>(16);
+        ctrl.register_visitor_route("vnet-visitor", "100.86.0.1/32", new_tx)
+            .await
+            .unwrap();
+
+        // Shutdown is signaled before the stale visitor's register lands.
+        shutdown.store(true, Ordering::Relaxed);
+
+        let (old_tx, _old_rx) = mpsc::channel::<Vec<u8>>(16);
+        assert!(!ctrl
+            .register_visitor_route_if_active("vnet-visitor", "100.86.0.1/32", old_tx, &shutdown)
+            .await
+            .unwrap());
+
+        // The replacement's route and delivery channel survive.
+        let routes = ctrl.route_table();
+        assert_eq!(
+            routes
+                .read()
+                .await
+                .lookup("", &IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1))),
+            Some("vnet-visitor")
+        );
+        assert!(ctrl
+            .deliver_visitor_packet("vnet-visitor", vec![0x45])
+            .is_ok());
     }
 
     #[tokio::test]

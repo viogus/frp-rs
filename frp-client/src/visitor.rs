@@ -2631,15 +2631,22 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         }
 
         let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(256);
-        if let Err(e) = controller
-            .register_visitor_route(&name, &destination_cidr, packet_tx)
+        let route_owner = packet_tx.clone();
+        match controller
+            .register_visitor_route_if_active(&name, &destination_cidr, packet_tx, &shutdown)
             .await
         {
-            warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': route registration failed: {}", name, e);
-            if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
-                return;
+            Ok(true) => {}
+            // Shutdown was signaled before registration: exit rather than
+            // clobber a replacement route (Go frp #5512).
+            Ok(false) => return,
+            Err(e) => {
+                warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': route registration failed: {}", name, e);
+                if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                    return;
+                }
+                continue 'reconnect;
             }
-            continue 'reconnect;
         }
         info!(
             visitor_name = %name,
@@ -2663,7 +2670,9 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         )
         .await;
 
-        controller.unregister_visitor_route(&name).await;
+        controller
+            .unregister_visitor_route_if_matches(&name, &route_owner)
+            .await;
         info!(visitor_name = %name, "Virtual net visitor '{}' tunnel closed, route removed", name);
         if shutdown.load(Ordering::Relaxed) {
             return;
