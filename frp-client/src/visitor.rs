@@ -2631,6 +2631,7 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         }
 
         let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(256);
+        let route_owner = packet_tx.clone();
         if let Err(e) = controller
             .register_visitor_route(&name, &destination_cidr, packet_tx)
             .await
@@ -2663,7 +2664,9 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         )
         .await;
 
-        controller.unregister_visitor_route(&name).await;
+        controller
+            .unregister_visitor_route_if_matches(&name, &route_owner)
+            .await;
         info!(visitor_name = %name, "Virtual net visitor '{}' tunnel closed, route removed", name);
         if shutdown.load(Ordering::Relaxed) {
             return;

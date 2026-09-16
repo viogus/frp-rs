@@ -329,6 +329,39 @@ impl ClientVnetController {
         tracing::info!(visitor_name = %name, "virtual_net visitor route removed");
     }
 
+    /// Remove a `virtual_net` visitor route and its delivery channel only when
+    /// they still belong to `packet_tx`.
+    ///
+    /// Go frp #5512 makes client route unregistration connection-owned
+    /// (`UnregisterClientRoute(name, conn)`): a stale visitor task's deferred
+    /// cleanup must not clobber a replacement route registered under the same
+    /// name. The channel is the ownership token — `same_channel` distinguishes
+    /// an old registration from its successor even when both use the same
+    /// visitor name.
+    ///
+    /// Returns `true` when the route was removed.
+    pub async fn unregister_visitor_route_if_matches(
+        &self,
+        name: &str,
+        packet_tx: &mpsc::Sender<Vec<u8>>,
+    ) -> bool {
+        let matches = {
+            let mut txs = self.visitor_txs.lock().unwrap_or_else(|e| e.into_inner());
+            match txs.get(name) {
+                Some(tx) if tx.same_channel(packet_tx) => {
+                    txs.remove(name);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if matches {
+            self.routes.write().await.remove("", name);
+            tracing::info!(visitor_name = %name, "virtual_net visitor route removed");
+        }
+        matches
+    }
+
     /// Deliver an inbound packet to a visitor tunnel.
     ///
     /// Returns `Ok(())` when the visitor route exists (including when the
@@ -554,6 +587,66 @@ mod tests {
                 .lookup("", &IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1))),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn visitor_route_owner_cleanup_removes_own_route() {
+        let ctrl = ClientVnetController::new();
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(16);
+        ctrl.register_visitor_route("vnet-visitor", "100.86.0.1/32", tx.clone())
+            .await
+            .unwrap();
+
+        assert!(
+            ctrl.unregister_visitor_route_if_matches("vnet-visitor", &tx)
+                .await
+        );
+
+        let routes = ctrl.route_table();
+        assert_eq!(
+            routes
+                .read()
+                .await
+                .lookup("", &IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1))),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_visitor_cleanup_does_not_clobber_replacement_route() {
+        let ctrl = ClientVnetController::new();
+
+        // Old visitor instance registers the route.
+        let (old_tx, _old_rx) = mpsc::channel::<Vec<u8>>(16);
+        ctrl.register_visitor_route("vnet-visitor", "100.86.0.1/32", old_tx.clone())
+            .await
+            .unwrap();
+
+        // Replacement instance re-registers the same name with a new channel.
+        let (new_tx, _new_rx) = mpsc::channel::<Vec<u8>>(16);
+        ctrl.register_visitor_route("vnet-visitor", "100.86.0.1/32", new_tx)
+            .await
+            .unwrap();
+
+        // The stale old instance's deferred cleanup must not remove the
+        // replacement route (Go frp #5512 connection-ownership semantics).
+        assert!(
+            !ctrl
+                .unregister_visitor_route_if_matches("vnet-visitor", &old_tx)
+                .await
+        );
+
+        let routes = ctrl.route_table();
+        assert_eq!(
+            routes
+                .read()
+                .await
+                .lookup("", &IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1))),
+            Some("vnet-visitor")
+        );
+        assert!(ctrl
+            .deliver_visitor_packet("vnet-visitor", vec![0x45])
+            .is_ok());
     }
 
     #[tokio::test]
