@@ -19,6 +19,90 @@ If this guide states how the code is structured, it must point at the relevant
 the symbol name). The process sections below — build, debug, test, release,
 dependency policy — are this document's own domain and need no citation.
 
+## Review protocol (mandatory)
+
+A green gate proves a command exited zero; it does not prove the change does what
+its author says. Review is what stands between a plausible diff and a merged one,
+and this repository has a single author, so an unreviewed change has no second
+reader at all.
+
+**Every change gets at least two independent reviews, and at least one of them is
+adversarial.** "Independent" means the reviewer did not write the change — an
+author reviewing their own work counts as neither. Both are recorded in the pull
+request; an unrecorded review did not happen.
+
+### Reviewer 1 — the claim
+
+Read the diff against the claim in the PR description and ask whether the claim is
+*earned*. Concretely:
+
+- **Recompute, do not read.** Every number, count and ratio in the diff or the PR
+  is recomputed from its source. If a doc says 86 scenarios, run the thing that
+  counts them.
+- **Open every citation.** Each `file:line` and each quoted upstream claim is
+  opened at that line, in this tree, at this commit. A citation nobody opened is a
+  rumour with a line number.
+- **Check the evidence class.** A passing unit test is not Go-parity evidence; a
+  probe of the real binary or a Go source citation is. See
+  [§ What a green test run does and does not prove](#what-a-green-test-run-does-and-does-not-prove).
+- **Look for what is missing** as hard as for what is wrong: an untested branch, a
+  case named in the description but absent from the tests, a claim with no gate
+  behind it.
+
+### Reviewer 2 — adversarial
+
+The adversarial reviewer's brief is to **falsify the change**, not to confirm it.
+"Looks good" is not a review. A useful adversarial review tries to construct the
+world in which the change is wrong, and reports either the construction or the
+attempt:
+
+- **Run the opposite direction.** If the author proved "fails when violated", try
+  to make it fail *without* violating the thing it claims to catch — a gate that
+  passes because it matches nothing, a test that passes because its assertion is
+  unreachable, a check whose pattern silently never fires.
+- **Attack the negative case.** Feed the fix the input it does not expect: the
+  empty value, the malformed value, both channels at once, the concurrent case,
+  the value that is *almost* the one it special-cases.
+- **Inspect the diff for weakenings.** Removed assertions, loosened assertions,
+  widened timeouts, new `#[allow]`/`#[ignore]`/`#[cfg]`, retries, deleted tests,
+  or a claim quietly reworded to match what the code does. Each needs a stated
+  reason; "to make CI green" is not one.
+- **Check the blast radius.** What else reads the thing that changed? For features,
+  what happens when it is *off*? For a shared helper, who else calls it?
+- **Say what would change your mind.** If the review cannot state the observation
+  that would falsify the change, it is not adversarial.
+
+### What a review must refuse
+
+Reject, or send back with a question, a change that: has no evidence for its
+central claim; substitutes a passing test for the real check the repo uses; adds a
+retry or an allow where the cause is unknown; states a number nobody measured;
+cites a `file:line` that does not say what it is quoted for; or is described in the
+PR more strongly than the diff supports.
+
+### Finding a defect
+
+A review that finds a defect is a success, not a delay — record it. The fix is
+re-reviewed (both reviewers), because a fix is a change too and is the most
+common place for a second defect to hide. If two reviews disagree, the
+disagreement is resolved with evidence, not by seniority or by whichever reading
+is more convenient.
+
+### Recording it
+
+The pull request carries a short block, so the next reader can tell what was
+actually checked:
+
+```
+## Reviews
+- Reviewer 1 (<what they did>): <findings, or "no findings">
+- Reviewer 2 adversarial (<what they attacked>): <findings, or "no findings">
+```
+
+A claim of "reviewed" with no method named is not a review. Where a review could
+not check something — a Linux-only path on macOS, a VPS-only XTCP matrix — it says
+so, because an unstated gap reads as coverage.
+
 ## 1. Workspace at a glance
 
 Six crates in a layered graph; dependencies flow **upward** (binaries → logic

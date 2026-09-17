@@ -121,7 +121,7 @@ Feature-surface maintenance policy — which surfaces keep Go parity, which are 
 
 ## Development Workflow (mandatory)
 
-Every feature, fix, and test change follows three rules:
+Every feature, fix, and test change follows five rules:
 
 1. **Worktree** — create a git worktree (`EnterWorktree`) before any file modification. Never edit directly on the main branch.
 2. **Subagents** — dispatch work to subagents (`Agent` or `Workflow` tool). One subagent per logical task, review between tasks.
@@ -133,6 +133,12 @@ Every feature, fix, and test change follows three rules:
    ```bash
    bash scripts/download-go-frp.sh
    ```
+4. **Two reviews, at least one adversarial** — no change lands on its author's word. Every change gets **≥2 independent reviews by agents that did not write it**, and **≥1 of them must be adversarial**: its brief is to *falsify* the change, not to confirm it. Self-review counts as neither. The reviews are recorded in the PR (**Reviewer 1 / Reviewer 2**: method, what was checked, findings, disposition) — an unrecorded review did not happen.
+5. **Pair, do not solo** — for anything non-trivial, work as author + reviewer from the start: state the claim before building it, and have someone try to break it while it is still cheap to change. A finding before the diff is finished costs a comment; the same finding after merge costs a revert.
+
+The full protocol — what a review must cover, what makes one adversarial, and what
+a review must refuse to accept — is in
+[docs/developing.md § Review protocol](docs/developing.md#review-protocol-mandatory).
 
 ## Current Health
 
