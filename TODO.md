@@ -340,6 +340,23 @@ nothing about whether the described behaviour still holds.
   `docs/developing.md` tells readers to re-run a red compat result before believing
   it, and not to treat green as absolute.
 
+  **Done (partial) — ETXTBSY case only.** The exec-token test now names its script
+  per invocation (`pid` + an atomic sequence + nanoseconds; `pid` alone was not
+  unique) and resolves it through a test-local `retry_on_etxtbsy` helper in
+  `frp-core/src/auth.rs` that retries **only** the ETXTBSY class, bounded to 5
+  attempts × 10 ms (worst case ~40 ms), with the exit-status assertion unchanged;
+  the script is removed on every path by a drop guard. Proven deterministically
+  off Linux by feeding the helper `io::Error::from_raw_os_error(26)`: 2 busy
+  attempts then success retries, a non-ETXTBSY error (ENOENT) is not retried, and
+  the loop is bounded to 5 attempts. Evidence:
+  `cargo test -p frp-core --lib auth::` green 5× back to back (68 passed, 0 failed
+  each), `cargo test -p frp-core` (850 lib tests) green, `cargo fmt --all --
+  --check` and `cargo clippy -p frp-core --all-targets --all-features -- -D
+  warnings` clean; forcing a non-exit-status failure (script `exit 0`, then an
+  ENOENT path) still fails the test loudly. The compat-scenario flakes
+  (zero-throughput `tcp-tls`/`tcp-tls-mux`, unreachable `ws-plain`,
+  `go-to-rust-quic` timeout) are **not** touched and this item stays open.
+
 - [x] **`Tests (server integration)` fails intermittently, and it turns `main` red.**
   Evidence: on 2026-09-17 the CI run for the merge commit `d9ca98b` failed on
   `Tests (server integration)` — **13 passed, 1 failed** —

@@ -149,7 +149,7 @@ binaries). This matters: the table used to claim 17 `unsafe` blocks in
 | **Version alignment (mandatory)** | `bash scripts/repo-health.sh` — gate; exits 1 on drift. All 5 crates + `VERSION` + download script + README at `0.71.0` (frp-vnet `0.1.0` by design) |
 | `cargo fmt --all -- --check` | zero diffs |
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
-| `cargo test --workspace --all-features` | must pass — needs an all-features `frps` binary, see Testing & Tooling. **The pass count is a runtime fact; do not quote a stored number here.** 2058 test functions exist in-tree and are re-counted by `repo-health.sh` ("Tests"), which fails if this figure drifts |
+| `cargo test --workspace --all-features` | must pass — needs an all-features `frps` binary, see Testing & Tooling. **The pass count is a runtime fact; do not quote a stored number here.** 2061 test functions exist in-tree and are re-counted by `repo-health.sh` ("Tests"), which fails if this figure drifts |
 | `cargo build --release` | all 4 profiles pass — sizes in [Binary Variants](#binary-variants) |
 | `unsafe` (`repo-health.sh`) | frp-core: 21 blocks + 3 `unsafe fn` + 2 `unsafe impl`; frp-vnet: 38 blocks. Every block carries a `// SAFETY:` comment |
 | `scripts/compat-test.sh` vs Go frp v0.71.0 | 86 passed, 0 failed |

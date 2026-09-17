@@ -306,6 +306,9 @@ have been responsible — its only compiled change was inside a
 So: a **red** compat run should be re-run before it is believed, and a **green**
 one is strong but not absolute. Flakiness in the one gate the project treats as
 authoritative is a defect in its own right — see [`../TODO.md`](../TODO.md).
+A flaky test is a bug in the test's timing assumptions, not a re-run button:
+fix it (per-invocation names, a retry bounded to the specific transient, the
+original assertion kept) instead of learning to ignore it.
 
 **The practical rules:**
 
