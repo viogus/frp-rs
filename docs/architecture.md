@@ -1,0 +1,126 @@
+# frp-rs Architecture
+
+> Long-form architecture notes extracted from `CLAUDE.md`, which now keeps only
+> the invariants and rules an agent must not break. Companions:
+> [`technical-details.md`](technical-details.md) (wire format and project
+> structure) and [`developing.md`](developing.md) (developer guide).
+
+The README gives a solid overview. The sections below cover details that reading a single file won't reveal.
+
+## Wire Protocol
+
+**V1** (fully implemented): 9-byte header — 1 byte type + 8 bytes big-endian payload length (max 10 KiB; the 64 KiB cap belongs to V2 framing) — followed by UTF-8 JSON payload. Defined in `frp-core/src/protocol.rs`.
+
+**V2** (fully implemented): 7-byte magic `FRP\0\x02\r\n` + different framing. V2 frame read/write (`write_v2_frame_raw`/`read_v2_frame_raw`), message dispatch (`write_msg_v2`/`read_msg_v2`), AEAD encryption (`v2_handshake.rs`: ClientHello/ServerHello, HKDF key derivation, `crypto.rs`: AeadAlgorithm trait for AES-256-GCM/ChaCha20-Poly1305), and capability negotiation all implemented. V2 compat tests run against the Go frp v0.71.0 pre-built binary.
+
+**UDP packet binary codec (V2, Go frp v0.71.0)**: UDPPacket payloads use a compact binary codec (`binary-v1`) when negotiated via the V2 handshake's `udpPacketCodecs` capability; V1 stays JSON, V2 falls back to JSON UDPPacket (type 13) when not negotiated. Codec: `frp-core/src/udp_binary.rs` (EncodeUDPPacketBinary/DecodeUDPPacketBinary), frame type 19 `V2_TYPE_UDP_PACKET_BINARY`, negotiated in `v2_handshake.rs` and carried on V2 UDP/SUDP work-conn data planes (`read_msg_v2_with_udp_codec`/`write_msg_v2_with_udp_codec` in `protocol.rs`). The Rust-only V2 extension types were renumbered to 21/22 to stay clear of Go's new type 19.
+
+Message type bytes and structs live in `frp-core/src/msg.rs`. The `FrpMessage` enum is `#[serde(untagged)]` — serde matches the first variant whose fields intersect the JSON, which means ordering of the enum variants matters.
+
+## Authentication
+
+Auth uses **MD5(token + timestamp)** → hex string. Matches Go frp v0.70.1 behavior — Go frp switched from HMAC-SHA256 to MD5 in commit `78f9394`. See `frp-core/src/auth.rs`.
+
+## Encryption Key Derivation
+
+Uses **PBKDF2-SHA1(token, salt="frp", iterations=64, keylen=16)** for AES-128-CFB control encryption. Go frp v0.70.1 pre-built binary uses PBKDF2 salt `"frp"` (NOT `"crypto"` — the golib source says `"crypto"` but the Go frp binary was compiled with salt `"frp"`). See `frp-core/src/encryption.rs`.
+
+## Server Architecture: The InternalMsg Channel
+
+The server's core is a pattern of cross-task message passing (`frp-server/src/service.rs`):
+
+```
+AppState
+  ├── run_id_to_ctl_tx: DashMap<run_id, ControlTx>  // routes work conns to correct handler (lock-free reads)
+  ├── proxy_manager: ProxyManager                     // global proxy registry
+  ├── used_ports: HashSet<u16>                        // port allocation tracking
+  ├── sk_index: HashMap<sk, proxy_name>              // STCP/XTCP secret-key → proxy lookup
+  ├── vhost_manager: VhostManager                     // HTTP VHost routing
+  ├── nat_hole: Arc<NatHoleCoordinator>              // XTCP NAT hole punch session mgmt
+  ├── oidc_verifier: Option<Arc<OidcVerifier>>       // OIDC token verification
+  └── oidc_subjects: HashMap<sub, proxy_name>        // OIDC subject → proxy routing
+```
+
+**Connection dispatch** (`service.rs`, accept loop):
+- Every new TCP connection reads one frame. Dispatch by message type:
+  - `Login` → `handle_control()` (new control connection)
+  - `NewWorkConn` → `handle_work_conn_inner()` (routes to control handler via `run_id`)
+  - `NewVisitorConn` → `handle_visitor_conn_inner()` (STCP visitor, looks up `sk_index`)
+  - `NatHoleVisitor` → `handle_nat_hole_visitor()` (XTCP hole punch, fresh-connection path)
+- WebSocket connections on main port also dispatch the same message types after upgrade.
+
+**Control handler** (`control/mod.rs`): the most complex file. Runs a `tokio::select!` loop with:
+1. **Fair** `internal_rx.recv()` — deliberately NOT biased: an always-ready internal queue must not starve control reads (heartbeat pings) or shutdown. A regression test in `mod.rs` enforces this (asserts no `biased;` in the loop and bounded control p99 under internal pressure).
+2. `read_msg_v1(&mut reader)` — inbound messages from the client
+
+Internal message variants drive the work connection lifecycle:
+- `ProxyUserConn` / `VisitorConn` → check `work_pool` → if empty, send `ReqWorkConn` and push to `pending_requests`
+- `NewWorkConn` → if `pending_requests` is non-empty, pop and bridge immediately; otherwise push to `work_pool`
+- `UdpNeedsWorkConn` → triggers work connection creation for UDP proxy
+- `NatHoleSidOnWorkConn` → sends StartWorkConn+NatHoleSid on pooled work conn to notify provider of XTCP visitor; if pool empty, queues in `pending_nat_hole_sids` + sends `ReqWorkConn` (Go frp compat: server coordinates control-plane only — NAT classify + behavior recommend, never relays XTCP data; provider does its own STUN)
+- `WriteNatHoleSid` / `WriteNatHoleResp` / `WriteNatHoleReport` → forwarded to visitor via control channel (Go frp compat path)
+- `Shutdown` → old control handler stops when superseded by new connection with same run_id
+
+**Bridging** (`assign_work_to_proxy` in `frp-server/src/control/bridge.rs`): sends `StartWorkConn` over the work connection, writes any pre-read bytes (from HTTP VHost parsing), then either uses `tokio::io::copy_bidirectional_with_sizes` (plain, 32 KiB per direction) or `bridge::bridge_encrypted` (AES-128-CFB + Snappy, streaming — a single 16-byte IV then continuous ciphertext, no per-frame length prefix). The client-side plain relay mirrors this (`relay_plain_fast` with splice(2) on Linux, `copy_bidirectional_with_sizes` fallback elsewhere).
+
+## Encryption
+
+**Control connection:** AES-128-CFB. Key derived via PBKDF2-SHA1(token, salt="frp", iterations=64, keylen=16). See `frp-core/src/encryption.rs`.
+
+**Encrypted bridge (data plane):** AES-128-CFB streaming with Snappy compression (applied first: compress → encrypt). Framing: one random 16-byte IV written before the first ciphertext block, then a continuous CFB stream (no per-frame length prefix) — `CipherWriter`/`CipherReader` in `frp-core/src/cipher_stream.rs`. See `frp-core/src/bridge.rs`.
+
+`derive_key` is called in `Service::new()` with `auth_cfg.token` — the encryption key derives from the auth token, not a separate secret.
+
+**XTCP P2P encryption:** Go frp encrypts hole-punched P2P connections with PBKDF2-SHA1(SecretKey, salt="frp", iter=64, keylen=16) → AES-128-CFB. Both provider and visitor P2P paths use `bridge_encrypted` with `derive_key(&sk)` when `use_encryption` is true. The `sk` (secret key) is the proxy's `sk` field from `ProxyConfig`, NOT the auth token — this is stored in `ProxyRuntimeInfo` for access in NAT hole punch handler paths.
+
+Note: Go frp v0.70.1 golib source says salt `"crypto"` but the pre-built binary uses salt `"frp"`. This codebase uses `"frp"` for binary compatibility.
+
+## Transport Abstraction
+
+`IoStream` (`frp-core/src/transport/`) is a type-erased `Box<dyn Transport>` (newtype over the boxed trait object). The old 11-variant enum is gone: each variant is now a `Transport` implementor in its own file under `frp-core/src/transport/` — `tcp.rs` (`TcpStream`), `tls.rs` (`TlsTransport`), `kcp.rs` (`KcpStream`), `quic.rs` (`QuicStream`), `websocket.rs` (`WsByteStream`), `yamux.rs` (`YamuxStream`), `cipher.rs` (`CipherStream<S>`), `aead.rs` (`AeadStream`), `ssh_channel.rs` (`SshChannelTransport`), `pre_read.rs` (`PreReadTransport`), `buffered_read.rs` (`BufferedReadTransport`). The `WebSocket` adapter wraps WebSocket binary messages into `AsyncRead`/`AsyncWrite` so the V1 protocol can operate over WebSocket without changes.
+
+The `Transport` trait bundles `AsyncRead + AsyncWrite + Unpin + Send + 'static` plus the consuming methods that used to be per-variant matches: `into_encrypted(self: Box<Self>)` (default wraps in `CipherStream`; Aead returns itself), `into_split(self: Box<Self>) -> (BoxedReadHalf, BoxedWriteHalf)` (default `tokio::io::split`; QUIC uses quinn's native halves), `into_tcp`/`try_tcp`/`try_tcp_mut` (splice(2) fast-path downcasts), `into_parts` (peels PreRead for the TLS/V1 accept paths), `is_yamux_wrappable` (false for QUIC only), and `bridge_split_err` (the `Cipher`/`Aead`-in-bridge guard). The old `ReadHalf`/`WriteHalf` enums are deleted — `into_split` returns the boxed halves directly, and `split_work_conn_halves` is a thin wrapper over it. `IoStream`'s constructors are named after the old variants (`IoStream::Tcp(stream)`, `IoStream::Yamux(stream)`, …) so construction sites read identically; per-transport files each own their `#[cfg]` gates.
+
+**TCP_NODELAY:** every raw-`TcpStream` on the data path (client control/work dials via `connect_direct`/`connect_via_proxy`, server control/work/visitor + user-proxy + vhost + tcpmux accepts, client local-service dials, SSH gateway, plugin forwarders) calls `frp_core::transport::set_nodelay` — matches Go frp's `net.TCPConn` default (`NoDelay(true)`). For TLS/mux/WS-wrapped streams it is set on the underlying `TcpStream` before wrapping. Errors are logged at debug and ignored (a failed socket option must not kill a connection). KCP sets its own nodelay; QUIC/UDP are excluded. Wire-invisible.
+
+**Bridge buffer size:** `frp_core::buffer_pool::BUFFER_SIZE` defaults to **32 KiB** (matches Go frp `io.Copy`; was 64 KiB — halved for per-connection footprint). Override with `FRP_BRIDGE_BUF_KB` (4–1024). The plain bridge copies with `copy_bidirectional_with_sizes(a, b, *BUFFER_SIZE, *BUFFER_SIZE)` (tokio ≥ 1.52), so `BUFFER_SIZE` applies to the plain path too; the encrypted/compressed path uses the `PoolGuard` buffer pool (also `BUFFER_SIZE`).
+
+## Config Normalization
+
+`frp-core/src/config/` (directory: `mod.rs`/`client.rs`/`server.rs`/`normalize.rs`/`loader.rs`/`strict.rs`) includes a full Go→Rust config compatibility layer:
+
+- `[common]` sections are flattened to the top level
+- `auth_method` / `auth_token` → nested under `[auth]`
+- `log_file` / `log_level` → nested under `[log]`
+- `web_server_*` → nested under `[web_server]`
+- `tcp_mux` → nested under `[transport]`
+- Client-side: `protocol` → `transport_protocol`, `serverAddr` → `server_addr`, `auth.token` → top-level `token`
+- TOML values are converted via `toml_to_json()` to `serde_json::Value`, then deserialized into config structs
+
+## XTCP NAT Hole Punching
+
+`frp-server/src/nathole/`: `NatHoleCoordinator` manages hole-punch sessions. Module structure:
+- `mod.rs` — module root, `NAT_HOLE_TIMEOUT = 10s`
+- `controller.rs` — session management, provider registration, `build_nat_hole_response()`
+- `classify.rs` — NAT feature classification (EasyNAT vs HardNAT, behavior detection)
+- `analysis.rs` — 5-mode behavior table, score-based `Analyzer` with success feedback
+
+Two paths for visitor connections:
+1. **Fresh TCP connection** (accept loop): visitor sends `NatHoleVisitor` on a new TCP connection. Server creates session, sends `NatHoleSidOnWorkConn` internal msg → provider control handler writes `StartWorkConn`+`NatHoleSid` on work conn. Provider does STUN, sends `NatHoleClient` on control, server runs NAT analysis, sends `NatHoleResp` to both sides.
+2. **Control connection** (Go frp compat): Go frpc v0.70.1 sends `NatHoleVisitor` on its existing control channel. Server creates session with `create_session_with_ctl`, spawns task that waits for provider's `NatHoleClient` on control, runs NAT analysis (classify + analyzer), and sends `NatHoleResp` to both sides via `InternalMsg::WriteNatHoleSid`/`WriteNatHoleResp`/`WriteNatHoleReport`.
+
+Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkConn → StartWorkConn+NatHoleSid on work conn) → Provider does STUN → Provider→Server(NatHoleClient on control) → Server NAT analysis (classify + 5-mode behavior recommend) → Server→Visitor(NatHoleResp) + Server→Provider(NatHoleResp, sender side delayed 1s) → both sides run MakeHole UDP probing per DetectBehavior → winner socket carries the KCP+yamux P2P data plane → bridge to local → Provider→Server(NatHoleReport) → session complete.
+
+**Status:** Fully implemented (cross-compat verified: 17/17 XTCP pairwise scenarios with Go frp v0.71.0 (re-verified locally 2026-08-23; daily `xtcp-compat.yml` VPS matrix)). The server is a control-plane coordinator — it classifies NAT features, recommends a 5-mode `DetectBehavior`, and manages sessions — but never relays XTCP data nor sends probe packets (provider and visitor each do their own STUN). Hole punching is UDP-based: both sides run Go-style `MakeHole` probing (`punch_udp_hole_makehole_owned` in `frp-core/src/xtcp_p2p.rs`) and the KCP+yamux data plane runs on the socket that received the peer's detect reply (Go `result.lConn` semantics). Provider-side (`frp-client/src/service.rs`) reads StartWorkConn+NatHoleSid from work conn, does STUN, sends NatHoleClient on control, reads NatHoleResp, then `xtcp_p2p_connect_yamux` → bridge to local. Visitor-side (`frp-client/src/visitor.rs`) handles `NatHoleVisitor` → PreCheck + STUN + full NatHoleVisitor → `xtcp_p2p_connect_yamux` → bridge to user. STCP fallback if hole punch fails (uses `fallback_to` config field to point at separate STCP proxy, matching Go frp architecture). e2e test in `frp-server/tests/xtcp_hole_punch.rs`, loopback MakeHole tests in `frp-core/tests/xtcp_p2p.rs`.
+
+**XTCP P2P bridging:** After successful hole punch, the P2P KCP-over-UDP stream (`XtcpP2pStream`, wrapped in yamux) is bridged to the local service with conditional `bridge_encrypted` (when `use_encryption=true` + `sk` non-empty) or `bridge_plain` (otherwise). Encryption key derived from proxy's `sk` (SecretKey) via `derive_key()` — same derivation as control connection but uses SecretKey instead of auth token. Probe packets (NatHoleSid) are AES-128-CFB encrypted with the same key; without a secret key Rust↔Rust probes fall back to the `"frp"` magic. `ProxyRuntimeInfo.sk` stores the SecretKey for access in NAT hole punch handler paths (`NatHoleClient` and `NatHoleResp` handlers in service.rs, visitor P2P path in visitor.rs). Both sides derive the same key from the shared SecretKey, matching Go frp.
+
+## Transport Status
+
+- **TCP**: fully implemented (control + work connections, TLS, WebSocket upgrade)
+- **WebSocket**: fully implemented — dial, accept, message dispatch (control + work connections)
+- **KCP**: fully implemented — dial, accept, TLS, yamux, message dispatch. Architecture: `KcpSocket` driver (UDP event loop), `KcpSession` per-peer (in-tree Kcp protocol + FEC), `KcpStream` (AsyncRead/AsyncWrite). The KCP state machine is implemented in-tree (`kcp/protocol.rs`, aligned with kcp-go v5.6.13 wire behavior) — the vendored `kcp` crate and its `[patch.crates-io]` entry are gone. `conv_index: HashMap<u32, SocketAddr>` provides O(1) write-path lookup. Write backpressure via `Arc<AtomicUsize>` shared between `KcpSocket` and `KcpStream` (gates `poll_write` at 200 unprocessed messages, `KCP_WRITE_BACKLOG_THRESHOLD` — pre-full gate for the 256-cap channel). Go frps dispatch order (service.go:670-710): read 1 byte → TLS detect (0x17=strip, 0x16=replay) → TLS accept → if tcpMux: yamux wrap → V2/V1 detection. frp-rs's KCP handler is functionally equivalent but checks the V2 magic first (7-byte read → V2? → TLS detect → TLS accept → tcpMux → V2/V1); both orders interop with Go frpc v0.70.1. Verified: KCP+TLS+tcpMux+CipherStream all working (RTT ~76ms). Integration test in `frp-core/tests/kcp.rs` (real UDP sockets).
+- **QUIC**: fully implemented — dial, accept, message dispatch (requires TLS cert on server)
+- **TcpMux** (`frp-core/src/mux.rs`, ~699 lines): full yamux implementation — server and client mode, keepalive, stream accept/spawn via `server_mux`/`client_mux`. Double-poll pattern flushes pending frames to socket. A zero keepalive interval is normalized to the 30s default instead of causing an immediate timeout or spin. Dead-conn detection: `MAX_IDLE_KEEPALIVE_TICKS = 3` (~90s idle). `open_stream` is wakeup-loss-proof (`watch` channel, not `Notify`) and fails fast once the driver has died (`alive` flag).
+- **Dashboard** (`frp-server/src/dashboard.rs`, ~2757 lines): basic status API with axum (version, uptime, client/proxy counts)
+- **VHost** (`frp-server/src/vhost.rs`, ~1300 lines): HTTP/HTTPS VHost routing with Host header parsing, SNI, pre-read byte forwarding
