@@ -27,8 +27,15 @@ read the [main README](../README.md) first, then pick from the tables below.
 |---|---|
 | [Go frp Compatibility Audit](go-frp-compat-audit.md) | Full cross-compat analysis against Go frp v0.71.0 |
 | [Development Log](history/development-log.md) | Round-by-round hardening / audit history (findings and fixes) |
+| [Feature Backlog (historical)](history/feature-backlog.md) | The former root `TODO.md` — parity/feature tracking, fully resolved |
 | [Audit reports](audit/) | Dated point-in-time audit reports |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | User-facing release notes |
+
+## Open work
+
+| Document | What it covers |
+|---|---|
+| [`../TODO.md`](../TODO.md) | **Live backlog**: repo hygiene, documentation correctness, structural debt — each item with evidence and an acceptance test |
 
 ## `archive/` — archived working artifacts
 
@@ -57,3 +64,8 @@ example:
 - Put **history** in [`history/development-log.md`](history/development-log.md)
   or [`../CHANGELOG.md`](../CHANGELOG.md) — not in reference docs. `CLAUDE.md`
   in particular is loaded into every agent context and has a hard 64 KB budget.
+- **Do not hand-maintain numbers.** Countable figures (LOC, test counts, `unsafe`
+  blocks, vendored versions) come from `bash scripts/repo-health.sh`. A figure typed
+  into prose goes stale silently — the health table once claimed 17 `unsafe` blocks
+  in `frp-core` while the tree had 21.
+- Keep open work in [`../TODO.md`](../TODO.md), with evidence and a done-when.

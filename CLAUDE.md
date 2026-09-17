@@ -12,6 +12,7 @@ must stay small; anything longer belongs elsewhere:
 | Round-by-round hardening / audit history | [`docs/history/development-log.md`](docs/history/development-log.md) |
 | User-facing release notes | [`CHANGELOG.md`](CHANGELOG.md) |
 | Config / proxies / plugins / deployment references | [`docs/README.md`](docs/README.md) |
+| Open work / known debt (evidence + done-when per item) | [`TODO.md`](TODO.md) |
 
 **Rule: do not append history to this file.** When a hardening or audit round lands,
 append it to `docs/history/development-log.md` and update only the snapshot table
@@ -133,18 +134,24 @@ Every feature, fix, and test change follows three rules:
 
 ## Current Health
 
-Snapshot of `main` — full round-by-round history is in
+**Last verified: 2026-09-17 at `89951ae`.** Round-by-round history is in
 [`docs/history/development-log.md`](docs/history/development-log.md).
 
-| Metric | Current state |
-|--------|---------------|
+Countable figures are **generated, not hand-maintained** — run
+`bash scripts/repo-health.sh` (add `--sizes` to also build and measure the
+binaries). This matters: the table used to claim 17 `unsafe` blocks in
+`frp-core` while the tree actually had 21.
+
+| Metric | State / how to check |
+|--------|----------------------|
+| **Version alignment (mandatory)** | `bash scripts/repo-health.sh` — gate; exits 1 on drift. All 5 crates + `VERSION` + download script + README at `0.71.0` (frp-vnet `0.1.0` by design) |
 | `cargo fmt --all -- --check` | zero diffs |
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
-| `cargo test --workspace --all-features` | 2078 passed, 0 failed (needs an all-features `frps` binary — see Testing & Tooling) |
-| `cargo build --release` | all 4 profiles pass, zero warnings — sizes in [Binary Variants](#binary-variants) |
+| `cargo test --workspace --all-features` | must pass — needs an all-features `frps` binary, see Testing & Tooling. **The pass count is a runtime fact; do not quote a stored number here.** 2055 test functions exist in-tree at the date above |
+| `cargo build --release` | all 4 profiles pass — sizes in [Binary Variants](#binary-variants) |
+| `unsafe` (`repo-health.sh`) | frp-core: 21 blocks + 3 `unsafe fn` + 2 `unsafe impl`; frp-vnet: 38 blocks. Every block carries a `// SAFETY:` comment |
 | `scripts/compat-test.sh` vs Go frp v0.71.0 | 86 passed, 0 failed |
 | `scripts/protocol-matrix.sh` | 11/11 transport rows move data |
-| `unsafe` blocks | 17 in `frp-core`, ~38 in `frp-vnet` (each with `// SAFETY:`) |
 | Security audit | `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071` + `cargo deny check` before release |
 | Vendored crates | `rustls`, `yamux`, `russh` under `[patch.crates-io]` — **each has an exit condition, see [Vendored crates](README.md#vendored-crates)** |
 
@@ -228,6 +235,8 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 - `hkdf` — replaced by ring (HKDF-SHA256)
 - `hickory-resolver` — replaced by custom DNS-over-UDP client
 - `lazy_static` — replaced by `std::sync::LazyLock` (stable since Rust 1.80)
+- `hex` — replaced by inline `frp_core::hex_encode`
+- `tokio-tungstenite` — replaced by in-tree manual RFC 6455 framing (`frp-core/src/transport/websocket.rs`)
 - `libc` — active direct dependency (frp-core Linux splice(2), frp-vnet TUN ioctl)
 
 > Note: "banned" means no **direct** dependency. Several still exist **transitively** in the default frps dependency tree via the SSH feature chain (russh 0.62.7 → ssh-key 0.7.0-rc): `data-encoding`, `aes-gcm`, `sha2`, `hkdf`, `hmac` (and `base64`/`lazy_static` via dev-only pprof/tracing paths). They cannot be removed without replacing russh; only direct use is forbidden.

@@ -584,27 +584,19 @@ a vendored crypto/TLS tree is a maintenance liability, not a resting state.
 
 ## Documentation
 
-Start from the **[documentation index](docs/README.md)** for everything under `docs/`.
+Full index — architecture, developer guide, compatibility audit, history and
+archive: **[docs/README.md](docs/README.md)**.
 
-**Using frp-rs**
+**Reference — using frp-rs**
 
-- **[Configuration Reference](docs/config.md)** — Every config field with types, defaults, and Go frp equivalents
-- **[Proxy Type Guide](docs/proxies.md)** — When and how to use each proxy type (TCP, UDP, HTTP, STCP, XTCP, etc.)
-- **[Client Plugins](docs/client-plugins.md)** — HTTP proxy, SOCKS5, static file, TLS termination, and more
-- **[Deployment Guide](docs/deployment.md)** — Systemd, Docker, TLS, monitoring, performance tuning
+- **[Configuration Reference](docs/config.md)** — every config field with types, defaults, and Go frp equivalents
+- **[Proxy Type Guide](docs/proxies.md)** — when and how to use each proxy type (TCP, UDP, HTTP, STCP, XTCP, …)
+- **[Client Plugins](docs/client-plugins.md)** — HTTP proxy, SOCKS5, static file, TLS termination, `virtual_net`, …
+- **[Deployment Guide](docs/deployment.md)** — systemd, Docker, TLS, monitoring, performance tuning
 
-**Working on frp-rs**
-
-- **[Architecture](docs/architecture.md)** — **Canonical.** Wire protocol and message types, control plane, work-connection lifecycle, auth/encryption, transports, XTCP hole punching, project structure
-- **[Developer Guide](docs/developing.md)** — Adding a proxy type, building and feature flags, debugging, testing, and release process
-- **[Technical Details](docs/technical-details.md)** — *Moved* into the Architecture guide; this path is a redirect stub kept for old links
-- **[CLAUDE.md](CLAUDE.md)** — Contributor/agent rules: build matrix, versioning, required workflow, dependency policy, invariants
-
-**Compatibility & history**
-
-- **[Go frp Compatibility Audit](docs/go-frp-compat-audit.md)** — Full cross-compat analysis against Go frp v0.71.0
-- **[Development Log](docs/history/development-log.md)** — Round-by-round hardening and audit history
-- **[CHANGELOG](CHANGELOG.md)** — User-facing release notes
+**Contributing** — start with [CLAUDE.md](CLAUDE.md) (rules, invariants, dependency
+policy) and [docs/architecture.md](docs/architecture.md) (how it works).
+Release history: [CHANGELOG.md](CHANGELOG.md).
 
 ---
 

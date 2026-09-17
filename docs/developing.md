@@ -1,42 +1,34 @@
 # Developer Guide
 
-frp-rs is a native Rust implementation of [frp](https://github.com/fatedier/frp), a reverse proxy that exposes services on private networks to the public internet. This guide covers the codebase architecture and development workflow for contributors.
+frp-rs is a native Rust implementation of [frp](https://github.com/fatedier/frp), a reverse proxy that exposes services on private networks to the public internet. This guide covers the development workflow for contributors.
 
-## 1. Workspace Overview
+Topic map — this guide deliberately does **not** restate the others:
 
-The project is a Cargo workspace with six crates arranged in a layered dependency graph:
+| You want | Go to |
+|---|---|
+| How the system works (wire protocol, control plane, transports, XTCP) | [architecture.md](architecture.md) |
+| Workspace layout, crate responsibilities, project tree | [architecture.md § Overview](architecture.md#overview) |
+| Build matrix, feature flags, binary tiers | [CLAUDE.md § Binary Variants](../CLAUDE.md#binary-variants) and [README § Binary Variants](../README.md#binary-variants) |
+| Dependency policy (allowed/banned crates) | [CLAUDE.md § Dependency Policy](../CLAUDE.md#dependency-policy-mandatory) |
+| Rules, invariants and gotchas an agent must not break | [CLAUDE.md](../CLAUDE.md) |
+| Config / proxies / plugins / deployment references | [documentation index](README.md) |
+| Historical design docs and audits | [archive/](archive/README.md) |
+
+## 1. Workspace at a glance
+
+Six crates in a layered graph; dependencies flow **upward** (binaries → logic
+crates → `frp-core`, which has no internal workspace dependencies):
 
 ```
-frps ──────────────► frp-server ──────► frp-core
-(server binary)      (server logic)      (shared library)
-                       │                   ▲
-                       └──► frp-vnet ──────┘
-                            (virtual net)
-
-frpc ──────────────► frp-client ──────► frp-core
-(client binary)      (client logic)      (shared library)
-                       │                   ▲
-                       └──► frp-vnet ──────┘
-                            (virtual net)
+frps ──► frp-server ──► frp-core        frpc ──► frp-client ──► frp-core
+             │                                              │
+             └──► frp-vnet ─────────────────────────────────►┘
 ```
 
-Dependencies flow **upward** through this diagram (binaries depend on logic crates, which depend on the shared library):
-
-| Crate | Purpose | Key Modules |
-|-------|---------|-------------|
-| **frp-core** | Shared library with no internal workspace dependencies | Protocol framing (`protocol.rs`), message types (`msg.rs`), config parsing (`config/`), transport abstraction (`transport/`), auth (`auth.rs`), encryption (`encryption.rs`), bridge (`bridge.rs`), mux (`mux.rs`), QUIC (`quic.rs`), KCP (`kcp/`), STUN (`stun.rs`), V2 handshake (`v2_handshake.rs`), cipher streams (`cipher_stream.rs`) |
-| **frp-server** | Server logic -- control handler, proxy registration, connection bridging | Service + accept loop (`service.rs`), control handler (`control/mod.rs`), proxy management (`proxy.rs`), bridge assignment (`control/bridge.rs`), proxy registration (`control/proxy_ops.rs`), NAT hole punching (`nathole/`), VHost routing (`vhost.rs`), dashboard + admin API (`dashboard.rs`), SSH gateway (`ssh_gateway.rs`), TCPMux (`tcpmux.rs`), config reload (SIGUSR1, `service.rs`), state (`state.rs`), handlers (`handlers.rs`) |
-| **frp-client** | Client logic -- service lifecycle, control connection, local bridging | Client service (`service.rs`), work connections (`work_conn.rs`), visitor mode (`visitor.rs`), admin API (`admin.rs`), health checks (`health.rs`), client plugins (`plugin/`) |
-| **frps** | Server binary | CLI argument parsing (`frp_core::cli`), logging setup, calls `frp_server::Service::run()` |
-| **frpc** | Client binary | CLI argument parsing (`frp_core::cli`), logging setup, calls `frp_client::Service::run()` |
-
-`frp-core` has no dependencies on other workspace crates -- it defines the wire protocol, message types, and transport primitives that both server and client use. The `frp-server` and `frp-client` crates contain the protocol logic but no `main()` functions; binaries live in `frps/` and `frpc/`.
-
-**Architecture internals** (wire protocol, control plane, transports, XTCP)
-live in [architecture.md](architecture.md). The rules and gotchas an agent or
-contributor must not break are in [CLAUDE.md](../CLAUDE.md#gotchas). For the
-reference docs (config, proxies, plugins, deployment) see the
-[documentation index](README.md).
+`frp-server` / `frp-client` hold the protocol logic but no `main()`; the
+binaries live in `frps/` and `frpc/`. Full crate-by-crate responsibilities and
+the annotated module tree: [architecture.md § Overview](architecture.md#overview)
+and [§ Project Structure](architecture.md#project-structure).
 
 ## 2. Adding a New Proxy Type
 
@@ -114,30 +106,13 @@ named `frps`/`frpc` (default/full), `frps-tiny`/`frpc-tiny`, and
 
 ### Feature Flags
 
-| Feature | Crate | What it removes |
-|---------|-------|-----------------|
-| `quic` | frp-core | QUIC transport (quinn) — **default ON** (was opt-in) |
-| `kcp` | frp-core | KCP transport (in-tree, kcp-go v5.6.13 aligned) |
-| `websocket` | frp-core/server | WebSocket transport (manual RFC 6455 framing, no tungstenite since 2026-08-09) |
-| `oidc` | frp-core | OIDC auth (jsonwebtoken, hyper via `http-client`) |
-| `ssh` | frp-server | SSH gateway (russh, rand 0.10) |
-| `dashboard` | frp-server | Metrics/status API (prometheus, axum) |
-| `admin` | frp-client | frpc admin API (axum) — opt-in since 2026-08-09 |
-| `http2http` | frp-client | HTTP/2 (h2) support for the https2http/https2https plugins; implies `tls` |
-| `tls` | frp-core/server/client | TLS encryption (rustls — **vendored** at `vendor/rustls` 0.23.43 with an SNI patch, see below) |
-| `compression` | frp-core | Snappy bridge compression (snap) |
-| `chacha20` | frp-core | XChaCha20-Poly1305 V2 cipher (AES-256-GCM stays) |
-| `http-proxy` | frp-server | HTTP proxy plugin (hyper/http-client) — server-side opt-in |
-| `tcp-mux` | frp-core/server/client | yamux stream multiplexing (**vendored** at `vendor/yamux`, see below) |
-| `vnet` | frp-core/server/client | L3 VPN / TUN device routing — opt-in |
-| `admin-auth` | frp-core | shared admin auth helpers (token/basic) |
-| `mimalloc` | frps/frpc | mimalloc global allocator — opt-in |
-| `mem-profile` | frp-core/server/client | CountingAlloc + MEMPROFILE emitter (dev only; **exclusive with `mimalloc`**) |
-| `profiling` | frp-core | profiling gate (dev only) |
-| `otel` | frp-core/server/client | OpenTelemetry tracing + OTLP export — opt-in |
-| `debug-logs` | frp-core | debug/trace logging (dev only) |
+The authoritative flag table — every feature, the crate it belongs to, what it
+removes, which are default-ON, and which are opt-in/dev-only — is
+[**CLAUDE.md § Binary Variants**](../CLAUDE.md#binary-variants). It is not
+duplicated here.
 
-frps default ON: `websocket`, `kcp`, `quic`, `oidc`, `tls`, `http-proxy`, `compression`, `chacha20`, `tcp-mux`, `ssh`. frpc default ON: `websocket`, `kcp`, `quic`, `oidc`, `tls`, `compression`, `chacha20`, `tcp-mux`, `http2http` (**no `admin`** since 2026-08-09). Opt-in: `admin`, `dashboard`, `vnet`, `otel`, `mimalloc`, dev-only flags (`debug-logs`, `mem-profile`, `profiling`). `quic` implies `tls`. `oidc` implies `http-client` (hyper). `ssh` implies `rand`. `mem-profile` is mutually exclusive with `mimalloc` (cfg-exclusive global-allocator guards).
+Which crates are vendored (and why, and when each can be dropped) is in
+[**README § Vendored crates**](../README.md#vendored-crates).
 
 ### Release Profile
 
@@ -434,37 +409,15 @@ The Docker workflow runs separately (`.github/workflows/docker.yml`) and can be 
 
 ## Dependency Policy
 
-**No new dependencies without explicit justification.** Every new crate must document:
+The dependency policy — the pre-approved tech stack table, the banned list and
+the justification each new crate must carry — is maintained in exactly one
+place: [**CLAUDE.md § Dependency Policy**](../CLAUDE.md#dependency-policy-mandatory).
 
-1. **Why it is needed** -- what problem it solves that existing deps cannot
-2. **Why the alternative was rejected** -- why an existing dep cannot be used
-3. **Binary size impact** -- approximate cost to frps/frpc release binary
+It is not duplicated here because a second copy drifts: the copy that used to
+live in this file had already fallen behind (it listed four vendored `yamux`
+patches when there are five, and its TLS row omitted the pointer to
+`vendor/rustls/README-FRP-RS.md`).
 
-**Pre-approved tech stack** (use these unless strong reason to deviate):
-
-| Domain | Crate |
-|--------|-------|
-| Async runtime | `tokio` |
-| Serialization | `serde` + `serde_json` |
-| Config | `toml` 0.8 |
-| Crypto (general) | `ring` 0.17 |
-| Crypto (Go compat) | `aes` + `cfb-mode`, `pbkdf2` + `sha1`, `md-5` |
-| Crypto (V2 XChaCha20) | `chacha20poly1305` |
-| TLS | `rustls` + `tokio-rustls` + `rustls-platform-verifier` — **vendored** at `vendor/rustls` 0.23.43 via `[patch.crates-io]` with a one-line SNI patch (`ServerNamePayload::Invalid` → treat as no-SNI) for Go XTCP QUIC visitor compat; delete the vendored copy when upgrading to rustls ≥0.24 (native `invalid_sni_policy`) |
-| SSH | `russh` (ring backend, NOT aws-lc-rs) |
-| HTTP client | `hyper` + `hyper-rustls` + `hyper-util` (inline `frp_core::http_client`; OIDC/proxy/plugin — no reqwest) |
-| HTTP server | `axum` |
-| WebSocket | manual RFC 6455 framing (in-tree `websocket.rs`; `tokio-tungstenite` removed 2026-08-09) |
-| Encoding | inline `frp_core::base64` (encode/decode) + `frp_core::hex_encode` |
-| Compression | `snap` |
-| QUIC | `quinn` |
-| TcpMux | `yamux` 0.14 — **vendored** at `vendor/yamux` via `[patch.crates-io]` with four patches (per-stream RST on stream-cap hit, lost-wakeup `sender_wu` fix, receive-window cap, body-buffer pools) |
-| OIDC/JWT | `jsonwebtoken` |
-| Logging | `tracing` + `tracing-subscriber` + `tracing-appender` |
-| Error handling | `anyhow` + `thiserror` |
-| Random | `rand` 0.10 (0.8.7 remains in the lock only via the opt-in `otel` chain: opentelemetry_sdk → … → tonic → tower — third-party pins, latest releases) |
-| Misc | `bytes`, `uuid`, `futures-util`, `tokio-util`, `socket2`, `prometheus` |
-
-**Banned** (do not reintroduce without approval): `aws-lc-sys`, `aws-lc-rs`, `hmac`, `base64`, `sha2`, `aes-gcm`, `hkdf`, `hickory-resolver`, `lazy_static`, `data-encoding`, `hex`, `tokio-tungstenite`. Note: `libc` is an **active** direct dependency (frp-core Linux `splice(2)`, frp-vnet TUN ioctl), not banned. "Banned" means no direct dependency — several still exist transitively via the SSH feature chain (russh → ssh-key).
-
-Workspace dependencies use `resolver = "2"` with `[workspace.dependencies]` for all crates. To add a new dependency: add to the workspace level, then reference by name (no version) in sub-crates.
+Adding a dependency: declare it in the workspace `[workspace.dependencies]`
+table in the root `Cargo.toml`, then reference it by name (no version) from the
+sub-crate.
