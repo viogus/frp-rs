@@ -261,7 +261,12 @@ single easiest mistake to make in this repository.
 | `scripts/protocol-matrix.sh` — 11 transport rows | Data actually moves through frps+frpc for every transport / encryption / mux combination |
 | Daily `xtcp-compat.yml` on a VPS | XTCP hole punching against Go frpc across a real NAT |
 
-**Proxy evidence — the ~2000 unit and integration tests:**
+Every count in that table is re-measured from the scripts by `bash
+scripts/repo-health.sh` (it prints each claim next to the source that produces
+it) — the figures are cross-checked, not remembered.
+
+**Proxy evidence — the unit and integration tests (`repo-health.sh` counts the
+in-tree test functions; the number that *pass* is a runtime fact):**
 
 They pin *frp-rs's own* behaviour. That is genuinely valuable (they catch
 regressions, and most were written by reading Go's source), but a passing suite
@@ -340,7 +345,7 @@ cargo test -- --ignored
 The compat test suite verifies Go frp <-> Rust frp interop across all proxy types and transport protocols:
 
 ```bash
-# Full suite (86 run_test scenarios, 2 of which are gated on Go frp V2)
+# Full suite (86 run_test scenarios, 5 of which are gated on Go frp V2)
 bash scripts/compat-test.sh --verbose
 
 # Filter by proxy type and direction
@@ -365,10 +370,13 @@ them. Override the location with `GO_FRP_DIR=/path/to/dir`. The CI gate is
 `.github/workflows/compat.yml`.
 
 > Do **not** commit the downloaded Go binaries. They are platform- and
-> version-specific, they are ~16–20 MB each, and a stale copy is worse than none:
-> `scripts/go-frp/` used to hold v0.69.1 macOS x86_64 binaries while the project
-> targeted v0.71.0, and any size/memory comparison against them was meaningless.
-> Use [`scripts/compare-go-frp.sh`](../scripts/compare-go-frp.sh), which verifies
+> version-specific and a stale copy is worse than none: `scripts/go-frp/` used to
+> hold v0.69.1 macOS x86_64 binaries while the project targeted v0.71.0, and any
+> size/memory comparison against them was meaningless. (For scale, the v0.71.0 Go
+> binaries measured 17.7 MB (`frps`) / 14.2 MB (`frpc`) — see the generated table
+> in [`../README.md`](../README.md#technical-differences-vs-go-frp), reproduced by
+> `scripts/compare-go-frp.sh`.) Use
+> [`scripts/compare-go-frp.sh`](../scripts/compare-go-frp.sh), which verifies
 > platform and version before it compares anything.
 
 ### XTCP CI Tests
@@ -427,9 +435,10 @@ Monitors memory, connection counts, and throughput. Runs weekly in CI via `.gith
 
 ### Property & Fuzz Tests
 
-Proptest-based tests verify correctness under adversarial inputs:
-- **Config normalization** (`frp-core/src/config/`): 9 proptest! blocks — idempotency, flat↔nested equivalence, camelCase→snake_case
-- **Protocol fuzzing** (`frp-core/src/protocol.rs`): 6 fuzz tests + 35 regular tests — all 256 V1 type bytes × arbitrary payloads, V2 arbitrary type IDs, truncated frames, magic detection
+Proptest-based tests verify correctness under adversarial inputs (`repo-health.sh`
+re-measures both figures below from the source on every run):
+- **Config normalization** (`frp-core/src/config/tests.rs`): 11 proptest! blocks — idempotency, flat↔nested equivalence, camelCase→snake_case
+- **Protocol fuzzing** (`frp-core/src/protocol.rs`): 6 fuzz tests + 40 regular tests — all 256 V1 type bytes × arbitrary payloads, V2 arbitrary type IDs, truncated frames, magic detection
 
 ### Repository Invariants (`repo-health.sh`)
 
@@ -445,6 +454,17 @@ detected (existence is all that can be checked mechanically). Historical records
 (`docs/archive/`, `docs/history/`, dated audits, `CHANGELOG.md`) are out of
 scope; see [`../TODO.md`](../TODO.md).
 
+The same run also cross-checks the **quantitative claims the live docs make**
+against the source that produces each number, and prints the whole inventory with
+a witness line (`file:line`) for every entry. It is a curated list, not a regex
+sweep over "numbers in docs" — a general sweep reports every port, buffer size
+and version in the tree. Each entry pins (file, exact claim wording, source); the
+expected value is recomputed from that source on every run, so two stale copies
+can never agree with each other. If you add a count to `README.md`, `CLAUDE.md`
+or a reference doc, add it here in the same change — or, better, point at this
+script instead of typing the number. The inventory is meant to be read at
+release time; a claim that no longer matches fails the `health` CI job.
+
 ## 6. Release Process
 
 ### Pre-release checklist
@@ -455,6 +475,12 @@ covered by any gate and are the ones that have actually been missed before.
 - [ ] **Version alignment** — `bash scripts/repo-health.sh` exits 0. This is a CI
       gate (the `health` job), but check it locally first: it covers the 5 crates,
       the `VERSION` constant, `scripts/download-frp-rs.sh` and the README.
+- [ ] **Doc figures reconciled** — read the `Docs` section of the same
+      `repo-health.sh` run and reconcile every `claimed … measured …` line with
+      its witness `file:line`; the run already fails on any figure the tree no
+      longer matches, so a green run only needs the witness lines skimmed for a
+      claim that has drifted in *meaning* (a stale number usually means the
+      sentence around it is stale too).
 - [ ] **Gates green on `main`** — `cargo fmt --all -- --check`,
       `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
       `cargo test --workspace --all-features`, the two `RUSTFLAGS="-D warnings"`
