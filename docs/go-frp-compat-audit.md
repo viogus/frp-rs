@@ -170,3 +170,69 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 | PROXY protocol v1+v2 | Both text and binary HAProxy PROXY protocol support |
 | SSH tunnel gateway | ✅ SSH proxy-registration commands; `ssh -R` reverse forwarding (tcpip-forward/forwarded-tcpip) since 0.7.1 parity pass |
 | Rust type safety | Memory safety, no data races, compile-time guarantees |
+
+---
+
+## Go frp Compatibility Notes
+
+frp-rs targets protocol compatibility with Go frp v0.71.0. The full Go frp
+v0.71.0 cross-compatibility suite runs in CI (including the XTCP pairwise
+matrix on VPS and V2 over the v0.71.0 pre-built binaries). Coverage is broad
+but not literally 100% — see [Known Limitations](#known-limitations) below.
+
+The per-surface parity details are in the tables above: V1/V2 wire protocol
+under [Protocol](#protocol), transports under
+[Transport Compatibility](#transport-compatibility), and the ten client
+plugins under [Client Plugins](#client-plugins). The remaining Go-compat
+specifics that are not already tabulated:
+
+- **XTCP**: Cross-compat with Go frp (requires public internet for STUN/NAT
+  probes). Both P2P data planes are supported — KCP+yamux and QUIC
+  (`protocol="quic"`, the default; an empty `protocol` normalizes to `"quic"`,
+  and the `quic` feature is default ON). Go visitors using the default
+  `protocol="quic"` interoperate with Rust providers: Go frp v0.71.0 sends the
+  peer `"ip:port"` as the QUIC TLS SNI, which upstream rustls 0.23 rejects as
+  an invalid server name — frp-rs vendors rustls with a one-line server-side
+  patch treating an invalid SNI as "no SNI" (equivalent to the upstream
+  `invalid_sni_policy = IgnoreAll` added in rustls 0.24; see
+  [audit note §6](archive/notes/2026-08-04-mimalloc-throughput-ab.md); full
+  plan + maintenance notes in
+  [2026-08-04-xtcp-quic-sni-compat.md](archive/notes/2026-08-04-xtcp-quic-sni-compat.md)).
+
+---
+
+## Known Limitations
+
+Current limitations as of frp-rs 0.71.0:
+
+- **HTTP vhost reverse-proxy semantics**: frps forwards HTTP vhost traffic at
+  the byte level (X-Forwarded-For and requestHeaders are injected, Host
+  rewriting works). `responseHeaders` (ResponseHeaderInjector), per-request
+  `vhost_http_timeout` 504s, and HTTP/2 cleartext (h2c) are implemented: h2c
+  clients are decoded with the `h2` crate, forwarded to providers as plain
+  HTTP/1.1, and backend HTTP/1.1 responses (including chunked bodies) are
+  re-encoded as HTTP/2 — matching Go's `httputil.ReverseProxy` semantics.
+- **HTTP plugin `enableHTTP2`**: honored on `https2http` / `https2https` (Go
+  parity: defaults to true, advertises ALPN `h2` on the TLS listener; inbound
+  h2 requests are decoded with the `h2` crate and forwarded to the backend as
+  plain HTTP/1.1 — matching Go's `http.Server` + `httputil.ReverseProxy`
+  semantics; `false` restricts the listener to HTTP/1.1). `http2http` /
+  `http2https` are plaintext HTTP/1.1 only and have no such field (Go parity).
+- **`pprof` endpoints**: `/debug/pprof/*` is a placeholder (no Go-style CPU
+  profiles); `/healthz` and pprof are outside auth, matching Go.
+- **UDP bandwidth limiting**: frp-rs extension — Go v0.71.0's UDP forwarder
+  has no limiter. `bandwidthLimit` / `bandwidthLimitMode` now throttle the
+  UDP data plane too, with the same direction semantics as the TCP bridge
+  ("server" limits both directions on frps; "client" limits upload on frpc;
+  "both" is enforced on the client only — the server does not recognize it,
+  same as TCP). Default stays unlimited: a limiter is only active when a
+  rate is explicitly configured.
+- **SSH gateway anonymity**: when no `authorized_keys` file and no server
+  token are configured, the SSH tunnel gateway **fails to start** by default
+  (fail-closed). Set `ssh_tunnel_gateway.allowNoneAuth = true` to explicitly
+  accept anonymous connections (Go parity) on a trusted network; otherwise
+  always set a token or `authorized_keys`.
+- **Windows vnet (TUN)**: the `vnet` (L3 VPN) feature runs on Linux and macOS
+  only — Windows TUN is a stub (`frp-vnet/src/tun_windows.rs`), every op
+  errors out, pending a Wintun (`wintun.dll`) integration. Not a Go-compat
+  gap; Go frp's vnet is Linux-focused too.

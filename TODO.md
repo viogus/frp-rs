@@ -143,6 +143,23 @@ nothing about whether the described behaviour still holds.
   written) was already dangling before the rename and is named in
   `docs/archive/README.md` rather than rewritten to point elsewhere.
 
+- [ ] **`frpc`'s `GET /api/reload` diverges from Go frp — it requires a JSON body.**
+  Evidence: the handler is
+  `async fn handle_reload(State(state), Json(body): Json<ReloadBody>)`
+  (`frp-client/src/admin.rs:155-161`), and the route deliberately registers `get`
+  for Go compatibility (`admin.rs:585-586`: "Go frp compat: GET /api/reload (Go uses
+  GET; keep POST too)"). axum's `Json` extractor requires
+  `Content-Type: application/json` and rejects a body-less request with **415**, so
+  the Go-compatible call `curl -u user:pass http://127.0.0.1:7400/api/reload` —
+  which works against Go frp — does not reload here. Anything driving the endpoint
+  from Go's route table hits this.
+  Found while completing the endpoint tables in `docs/deployment.md`; documented
+  there as a caveat rather than left implicit.
+  **Done-when:** a body-less `GET /api/reload` returns 200 and reloads in
+  non-strict mode (optional extractor or an empty-body default), with a test pinning
+  all three cases: body-less GET → 200, `{"strict_config": true}` → strict mode,
+  malformed body → 400.
+
 - [ ] **The `tiny`/`micro` feature builds emit warnings, and CI does not deny them.**
   Evidence: `cargo build --release --no-default-features --features tiny|micro`
   on `main` reports (macOS arm64, rustc 1.96.0):
