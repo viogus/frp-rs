@@ -75,6 +75,51 @@ fn ssh_test_config(ssh_port: u16, bind_port: u16) -> ServerConfig {
     cfg
 }
 
+/// Readiness budget for the SSH gateway in these tests.
+///
+/// The old shape retried 20 times with a 100 ms sleep — a fixed ~2 s window —
+/// then panicked with a bare `expect`. On a loaded runner frps can take longer
+/// than that to start accepting on the gateway, which is what made
+/// `test_ssh_gateway_exec_go_parity_errors_and_stcp_accept` flake. This is a
+/// wall-clock deadline, not an attempt count, so the budget does not shrink
+/// when each failed attempt itself takes time. 10 s matches the file's existing
+/// budget for a completed authenticated handshake (the `from_secs(10)` waits in
+/// `test_ssh_gateway_preauth_released_on_auth_success_ninth_concurrent`) and
+/// still fails a genuine hang quickly rather than never.
+const SSH_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Poll `russh::client::connect` — which completes the SSH handshake, not just
+/// the TCP accept — until it succeeds or `SSH_READY_TIMEOUT` elapses. Panics
+/// with the **last** connect error, so a real failure is diagnosable instead of
+/// surfacing as a bare "SSH client should connect".
+async fn connect_ssh_ready(
+    addr: SocketAddr,
+    local_target: Option<String>,
+) -> russh::client::Handle<TestSshClient> {
+    let deadline = tokio::time::Instant::now() + SSH_READY_TIMEOUT;
+    loop {
+        match russh::client::connect(
+            Arc::new(russh::client::Config::default()),
+            addr,
+            TestSshClient {
+                local_target: local_target.clone(),
+            },
+        )
+        .await
+        {
+            Ok(c) => return c,
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "SSH client should connect within {SSH_READY_TIMEOUT:?}; last error: {e:?}"
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Read the SSH banner from a TcpStream, returning it as a String.
 /// Times out after 2 seconds.
 async fn read_ssh_banner(stream: &mut tokio::net::TcpStream) -> String {
@@ -97,16 +142,14 @@ async fn test_ssh_gateway_startup_and_banner() {
 
     let (_handle, _port) = start_test_server(cfg).await;
 
-    // Retry: SSH gateway may not be listening immediately after server start.
-    let mut ssh_stream = None;
-    for _ in 0..20 {
-        if let Ok(s) = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", ssh_port)).await {
-            ssh_stream = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let mut ssh_stream = ssh_stream.expect("SSH port should accept connections");
+    // The SSH gateway may not be listening immediately after server start;
+    // wait on a wall-clock deadline sized for CI, then connect once.
+    common::wait_tcp_port(ssh_port, SSH_READY_TIMEOUT)
+        .await
+        .expect("SSH port should accept connections");
+    let mut ssh_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", ssh_port))
+        .await
+        .expect("SSH port should accept connections after readiness wait");
 
     let banner = read_ssh_banner(&mut ssh_stream).await;
     println!("SSH banner received: {:?}", banner.trim_end());
@@ -219,16 +262,12 @@ async fn test_ssh_gateway_rejects_non_ssh_data() {
     let cfg = ssh_test_config(ssh_port, bind_port);
     let (_handle, _port) = start_test_server(cfg).await;
 
-    // Retry connect
-    let mut stream = None;
-    for _ in 0..20 {
-        if let Ok(s) = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", ssh_port)).await {
-            stream = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let mut stream = stream.expect("SSH port should accept connections");
+    common::wait_tcp_port(ssh_port, SSH_READY_TIMEOUT)
+        .await
+        .expect("SSH port should accept connections");
+    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", ssh_port))
+        .await
+        .expect("SSH port should accept connections after readiness wait");
 
     // Read banner first (SSH protocol sends banner before client data)
     let mut buf = [0u8; 256];
@@ -278,15 +317,12 @@ async fn test_ssh_gateway_starts_with_port_limit_config() {
 
     let (_handle, _port) = start_test_server(cfg).await;
 
-    let mut stream = None;
-    for _ in 0..20 {
-        if let Ok(s) = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", ssh_port)).await {
-            stream = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let mut ssh_stream = stream.expect("SSH port should accept connections");
+    common::wait_tcp_port(ssh_port, SSH_READY_TIMEOUT)
+        .await
+        .expect("SSH port should accept connections");
+    let mut ssh_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", ssh_port))
+        .await
+        .expect("SSH port should accept connections after readiness wait");
 
     let banner = read_ssh_banner(&mut ssh_stream).await;
     assert!(banner.starts_with("SSH-"));
@@ -341,23 +377,7 @@ async fn test_ssh_gateway_reverse_forwarding_roundtrip() {
     });
 
     let addr: SocketAddr = format!("127.0.0.1:{}", ssh_port).parse().unwrap();
-    let mut client = None;
-    for _ in 0..20 {
-        if let Ok(c) = russh::client::connect(
-            Arc::new(russh::client::Config::default()),
-            addr,
-            TestSshClient {
-                local_target: Some(format!("127.0.0.1:{local_port}")),
-            },
-        )
-        .await
-        {
-            client = Some(c);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let mut client = client.expect("SSH client should connect");
+    let mut client = connect_ssh_ready(addr, Some(format!("127.0.0.1:{local_port}"))).await;
 
     let auth = client
         .authenticate_password("v0", common::TEST_TOKEN)
@@ -449,23 +469,6 @@ async fn test_ssh_gateway_password_throttle_cuts_off_fresh_connection() {
     let (_handle, _port) = start_test_server(cfg).await;
 
     let addr: SocketAddr = format!("127.0.0.1:{}", ssh_port).parse().unwrap();
-    let connect = || async {
-        let mut last_err = None;
-        for _ in 0..20 {
-            match russh::client::connect(
-                Arc::new(russh::client::Config::default()),
-                addr,
-                TestSshClient { local_target: None },
-            )
-            .await
-            {
-                Ok(c) => return Some(c),
-                Err(e) => last_err = Some(e),
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        panic!("SSH client should connect; last error: {last_err:?}");
-    };
 
     // Connection A: 5 wrong passwords. Each consumes a throttle slot; the
     // throttle slot for attempt N is consumed at attempt ARRIVAL (the
@@ -487,7 +490,7 @@ async fn test_ssh_gateway_password_throttle_cuts_off_fresh_connection() {
     // all got their round-trips (an Err before attempt 4 would need the
     // deadline to fire at <9.2s, outside any realistic schedule), so break
     // with the landed slots and let conn B's retry loop discriminate.
-    let mut client_a = connect().await.expect("connection A should connect");
+    let mut client_a = connect_ssh_ready(addr, None).await;
     let mut slots_landed = 0usize;
     for i in 0..5 {
         let auth = match client_a.authenticate_password("v0", "wrong-password").await {
@@ -544,7 +547,7 @@ async fn test_ssh_gateway_password_throttle_cuts_off_fresh_connection() {
     // the late path exactly as round-10's design intended.
     let mut cutoff_seen = false;
     for _round in 0..4 {
-        let mut client_b = connect().await.expect("fresh connection should connect");
+        let mut client_b = connect_ssh_ready(addr, None).await;
         let start = tokio::time::Instant::now();
         let result = client_b.authenticate_password("v0", "wrong-password").await;
         let elapsed = start.elapsed();
@@ -586,16 +589,25 @@ async fn test_ssh_gateway_preauth_per_ip_cap_drops_overflow_conn() {
 
     let (_handle, _port) = start_test_server(cfg).await;
 
+    // NOTE: this test counts concurrent pre-auth slots, so it cannot use
+    // `wait_tcp_port` (whose probe connection would transiently hold one of the
+    // 8 permits). The connect loop is therefore deadline-driven itself and
+    // reports the last error.
     let connect_raw = || async {
-        let mut last_err = None;
-        for _ in 0..20 {
+        let deadline = tokio::time::Instant::now() + SSH_READY_TIMEOUT;
+        loop {
             match tokio::net::TcpStream::connect(format!("127.0.0.1:{ssh_port}")).await {
                 Ok(s) => return s,
-                Err(e) => last_err = Some(e),
+                Err(e) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        panic!(
+                            "raw SSH connect failed within {SSH_READY_TIMEOUT:?}; last error: {e:?}"
+                        );
+                    }
+                }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("raw SSH connect failed; last error: {last_err:?}");
     };
 
     // Phase 1: hold 8 unauthenticated conns from one IP. Reading the
@@ -692,26 +704,8 @@ async fn test_ssh_gateway_authorized_keys_accept_and_deny_e2e() {
 
     let (_handle, _port) = start_test_server(cfg).await;
     let addr: SocketAddr = format!("127.0.0.1:{}", ssh_port).parse().unwrap();
-    let connect = || async {
-        let mut last_err = None;
-        for _ in 0..20 {
-            match russh::client::connect(
-                Arc::new(russh::client::Config::default()),
-                addr,
-                TestSshClient { local_target: None },
-            )
-            .await
-            {
-                Ok(c) => return c,
-                Err(e) => last_err = Some(e),
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        panic!("SSH client should connect; last error: {last_err:?}");
-    };
-
     // Key NOT in the allow-list: denied.
-    let mut denied = connect().await;
+    let mut denied = connect_ssh_ready(addr, None).await;
     let auth = denied
         .authenticate_publickey(
             "v0",
@@ -726,7 +720,7 @@ async fn test_ssh_gateway_authorized_keys_accept_and_deny_e2e() {
         .ok();
 
     // Key IN the allow-list: accepted.
-    let mut accepted = connect().await;
+    let mut accepted = connect_ssh_ready(addr, None).await;
     let auth = accepted
         .authenticate_publickey(
             "v0",
@@ -741,7 +735,7 @@ async fn test_ssh_gateway_authorized_keys_accept_and_deny_e2e() {
         .ok();
 
     // The token password path still works alongside the allow-list.
-    let mut by_password = connect().await;
+    let mut by_password = connect_ssh_ready(addr, None).await;
     let auth = by_password
         .authenticate_password("v0", common::TEST_TOKEN)
         .await
@@ -792,27 +786,9 @@ async fn test_ssh_gateway_unreadable_authorized_keys_file_fails_closed() {
 
     let (_handle, _port) = start_test_server(cfg).await;
     let addr: SocketAddr = format!("127.0.0.1:{}", ssh_port).parse().unwrap();
-    let connect = || async {
-        let mut last_err = None;
-        for _ in 0..20 {
-            match russh::client::connect(
-                Arc::new(russh::client::Config::default()),
-                addr,
-                TestSshClient { local_target: None },
-            )
-            .await
-            {
-                Ok(c) => return c,
-                Err(e) => last_err = Some(e),
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        panic!("SSH client should connect; last error: {last_err:?}");
-    };
-
     // The gateway is up (token set — no refuse-to-start), but the key that
     // WOULD have allowed this client is invisible: denied.
-    let mut denied = connect().await;
+    let mut denied = connect_ssh_ready(addr, None).await;
     let auth = denied
         .authenticate_publickey(
             "v0",
@@ -826,7 +802,7 @@ async fn test_ssh_gateway_unreadable_authorized_keys_file_fails_closed() {
     );
 
     // Token password auth is unaffected.
-    let mut by_password = connect().await;
+    let mut by_password = connect_ssh_ready(addr, None).await;
     let auth = by_password
         .authenticate_password("v0", common::TEST_TOKEN)
         .await
@@ -857,31 +833,13 @@ async fn test_ssh_gateway_preauth_released_on_auth_success_ninth_concurrent() {
     let (_handle, _port) = start_test_server(cfg).await;
     let addr: SocketAddr = format!("127.0.0.1:{}", ssh_port).parse().unwrap();
 
-    let connect = || async {
-        let mut last_err = None;
-        for _ in 0..20 {
-            match russh::client::connect(
-                Arc::new(russh::client::Config::default()),
-                addr,
-                TestSshClient { local_target: None },
-            )
-            .await
-            {
-                Ok(c) => return c,
-                Err(e) => last_err = Some(e),
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        panic!("SSH client should connect; last error: {last_err:?}");
-    };
-
     // Phase 1: 8 authenticated sessions from one IP (127.0.0.1), held open.
     // Each starts by holding one per-IP pre-auth slot through its handshake,
     // then must release it on USERAUTH_SUCCESS. If a session kept its slot,
     // the 8 sessions below would pin all 8 permits.
     let mut held: Vec<russh::client::Handle<TestSshClient>> = Vec::new();
     for i in 0..8 {
-        let mut client = connect().await;
+        let mut client = connect_ssh_ready(addr, None).await;
         let auth = timeout(
             Duration::from_secs(10),
             client.authenticate_password("v0", common::TEST_TOKEN),
@@ -900,7 +858,7 @@ async fn test_ssh_gateway_preauth_released_on_auth_success_ninth_concurrent() {
     // Pre-fix it was dropped at the accept gate (no handshake, like the
     // overflow conn in test_ssh_gateway_preauth_per_ip_cap_drops_overflow_conn);
     // post-fix the 8 earlier sessions released their slots on auth success.
-    let mut ninth = connect().await;
+    let mut ninth = connect_ssh_ready(addr, None).await;
     let auth = timeout(
         Duration::from_secs(10),
         ninth.authenticate_password("v0", common::TEST_TOKEN),
@@ -926,21 +884,7 @@ async fn test_ssh_gateway_preauth_released_on_auth_success_ninth_concurrent() {
 /// Connect to the SSH gateway, authenticate with the shared test token
 /// (username "v0"), and return the ready client Handle.
 async fn connect_ssh_auth(addr: SocketAddr) -> russh::client::Handle<TestSshClient> {
-    let mut client = None;
-    for _ in 0..20 {
-        if let Ok(c) = russh::client::connect(
-            Arc::new(russh::client::Config::default()),
-            addr,
-            TestSshClient { local_target: None },
-        )
-        .await
-        {
-            client = Some(c);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let mut client = client.expect("SSH client should connect");
+    let mut client = connect_ssh_ready(addr, None).await;
     let auth = client
         .authenticate_password("v0", common::TEST_TOKEN)
         .await

@@ -684,7 +684,6 @@ impl Drop for FrpsHandle {
 }
 
 /// Wait for a TCP port to accept connections.
-#[allow(dead_code)]
 pub async fn wait_tcp_port(port: u16, timeout: Duration) -> Result<(), String> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
