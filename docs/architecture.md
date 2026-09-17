@@ -810,7 +810,7 @@ parity):
   vendors rustls (0.23.43 at `vendor/rustls`) with a server-side patch treating an
   invalid SNI as "no SNI" (see
   [`vendor/rustls/README-FRP-RS.md`](../vendor/rustls/README-FRP-RS.md) and
-  `docs/superpowers/notes/2026-08-04-xtcp-quic-sni-compat.md`; drop the patch when
+  `docs/archive/notes/2026-08-04-xtcp-quic-sni-compat.md`; drop the patch when
   the workspace moves past rustls 0.23).
 - **KCP + yamux** (`protocol="kcp"`): the punched UDP socket runs KCP
   (`XtcpP2pStream`) with yamux on top.

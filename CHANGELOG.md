@@ -212,6 +212,12 @@ pruning, and +929 tests (1149 → 2078, 0 failed). Version stays aligned at
   as archived artifacts), documented the three vendored crates' exit
   conditions in the new README "Vendored crates" section, and added the
   missing `vendor/rustls/README-FRP-RS.md` for the TLS SNI patch.
+- **Archive rename**: `docs/superpowers/` → `docs/archive/`, so 81 dated
+  plan/spec/note/audit artifacts (1.7 MB) are marked as historical by their
+  path instead of only by a note in `docs/README.md`. All links into the
+  archive from live docs were updated; paths *inside* the archived documents
+  were deliberately left as written (they are historical records), and
+  `docs/archive/README.md` documents the translation.
 
 ### Post-#279: 4-dimension audit rounds 3–5 + plugin-face rounds 6–18
 - **4-dimension audit round 3 (PR #284)**: per-proxy `SharedBandwidthLimiter`

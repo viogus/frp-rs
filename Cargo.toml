@@ -89,7 +89,7 @@ mimalloc = "0.1.52"
 # send "ip:port" as the TLS SNI, which upstream rustls 0.23 rejects with a
 # fatal alert (ServerNamePayload::Invalid). The patch treats invalid SNI as
 # "no SNI" (upstream 0.24 `invalid_sni_policy = IgnoreAll`). See
-# docs/superpowers/notes/2026-08-04-mimalloc-throughput-ab.md §6. Drop when
+# docs/archive/notes/2026-08-04-mimalloc-throughput-ab.md §6. Drop when
 # the workspace moves past rustls 0.23.
 [patch.crates-io]
 rustls = { path = "vendor/rustls" }
