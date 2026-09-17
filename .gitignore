@@ -18,6 +18,12 @@ scripts/frp-stress/Cargo.lock
 .claude/
 .reasonix/
 .superpowers/
+# SSH tunnel gateway host key. frps writes this to the CURRENT WORKING DIRECTORY
+# by default (`sshTunnelGateway.autoGenPrivateKeyPath` defaults to
+# "./.autogen_ssh_key", matching Go frp), so running frps from the repo root
+# drops a real private key here. It is a throwaway LOCAL host key — not a
+# credential to anything — but it must never be committed. Set
+# `auto_gen_private_key_path` to a path outside the repo if you prefer.
 .autogen_ssh_key
 go-reference/
 scripts/frp-stress/target/
