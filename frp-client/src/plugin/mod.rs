@@ -150,6 +150,12 @@ pub(crate) fn clear_plugin_peers() {
 /// dialer registers a few microseconds after `connect()` returns, so an
 /// accept handler that wins the scheduling race retries briefly before
 /// falling back to the loopback peer (status quo behavior).
+///
+/// Only the TLS-terminating https2http/https2https plugins take from this
+/// registry, so the take side is `tls`-gated: in `micro` (no TLS) it would
+/// be dead code. The register side stays unconditional — `work_conn.rs`
+/// registers for those plugin names in every build.
+#[cfg(feature = "tls")]
 fn take_plugin_peer(dialer_port: u16) -> Option<SocketAddr> {
     real_tunnel_peer_map()
         .lock()
@@ -157,6 +163,7 @@ fn take_plugin_peer(dialer_port: u16) -> Option<SocketAddr> {
         .remove(&dialer_port)
 }
 
+#[cfg(feature = "tls")]
 pub(crate) async fn plugin_peer_ip(peer: SocketAddr) -> std::net::IpAddr {
     for _ in 0..8 {
         if let Some(real) = take_plugin_peer(peer.port()) {
@@ -2235,6 +2242,7 @@ mod tests {
     /// M9 pin: the real-tunnel-peer registry is take-once per dialer port,
     /// newest registration wins on port reuse (a stale entry from an earlier
     /// conn must not shadow the current dial), and unknown ports miss.
+    #[cfg(feature = "tls")] // take_plugin_peer/plugin_peer_ip are tls-only
     #[test]
     fn real_tunnel_peer_registry_take_once() {
         let dialer = SocketAddr::from(([127, 0, 0, 1], 44444));
@@ -2259,6 +2267,7 @@ mod tests {
 
     /// F5 pin: a dropped guard removes its own registry entry, so every
     /// work-conn exit path (normal end, early return, abort) cleans up.
+    #[cfg(feature = "tls")] // take_plugin_peer is tls-only
     #[test]
     fn plugin_peer_guard_drop_removes_entry() {
         let dialer = SocketAddr::from(([127, 0, 0, 1], 44445));
@@ -2278,6 +2287,7 @@ mod tests {
 
     /// F5 pin: a guard from a SUPERSEDED registration must not delete its
     /// successor's live entry (newest-registration-wins on port recycle).
+    #[cfg(feature = "tls")] // take_plugin_peer is tls-only
     #[test]
     fn plugin_peer_guard_drop_keeps_newer_entry() {
         let dialer = SocketAddr::from(([127, 0, 0, 1], 44446));
@@ -2294,6 +2304,7 @@ mod tests {
 
     /// F5 pin: serve_plugin teardown's wholesale clear empties the registry
     /// (defense in depth for connections whose guard never ran).
+    #[cfg(feature = "tls")] // take_plugin_peer is tls-only
     #[test]
     fn clear_plugin_peers_empties_registry() {
         let dialer = SocketAddr::from(([127, 0, 0, 1], 44447));
@@ -2313,6 +2324,7 @@ mod tests {
 
     /// Sync resolution for the test above (plugin_peer_ip's retry loop would
     /// add 8 ms per miss; here the entry always exists on the first attempt).
+    #[cfg(feature = "tls")] // take_plugin_peer is tls-only
     fn plugin_peer_ip_now(peer: SocketAddr) -> std::net::IpAddr {
         take_plugin_peer(peer.port())
             .map(|a| a.ip())

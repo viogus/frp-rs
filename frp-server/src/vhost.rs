@@ -1,6 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
+// `AsyncWriteExt`'s only direct method use in this file is the TLS-alert
+// write in the `tls`-gated HTTPS vhost listener; the two response writers
+// take `impl AsyncWriteExt` bounds, which resolve their own method calls.
+// Gating on `http-proxy` instead would warn in an `http-proxy`-only build.
+#[cfg(feature = "tls")]
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
