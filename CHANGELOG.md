@@ -9,6 +9,18 @@ User-facing release notes for frp-rs.
 > write the same detail in both; see the
 > [docs conventions](docs/README.md#conventions-for-these-docs).
 
+## Unreleased
+
+### Changed
+- **`frpc reload` now honours `--strict-config` — a behaviour change.** The
+  reload subcommand parses the flag like `run`/`verify`: absent and bare
+  `--strict_config` are strict (`true`, matching Go frp's persistent
+  `rootCmd` flag), `--strict_config=false` is non-strict. Previously the
+  flag was silently ignored on `reload`, so every reload ran non-strict. A
+  reload of a config containing unknown fields therefore now **fails** (the
+  running proxies are left as they were) where it used to succeed; pass
+  `--strict-config=false` to keep the old lenient behaviour.
+
 ## v0.71.0 — re-release (2026-09-13)
 
 Supersedes the 2026-08-16 v0.71.0 build (PR #246 era). Same version number,
