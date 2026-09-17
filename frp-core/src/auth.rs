@@ -3526,18 +3526,154 @@ mod tests {
         );
     }
 
+    /// `ETXTBSY` is errno 26 on Linux (it is 26 on the BSDs/macOS too, but only
+    /// Linux makes `execve` refuse a file another process holds open for
+    /// writing). Hardcode the number with this comment rather than importing
+    /// `libc`, so the helper compiles — and its unit tests run — on every
+    /// platform.
+    const ETXTBSY: i32 = 26;
+
+    /// Bound on ETXTBSY retries. The window is simply another process's writer
+    /// fd being closed, i.e. sub-millisecond in practice, so 5 attempts with a
+    /// 10 ms pause (worst case ~40 ms added latency) is far more than a real
+    /// transient needs while staying strictly bounded. A genuine spawn failure
+    /// (ENOENT/EACCES/…) is not ETXTBSY and is not retried at all — see
+    /// `retry_on_etxtbsy_does_not_retry_other_errors`.
+    const ETXTBSY_MAX_ATTEMPTS: u32 = 5;
+    const ETXTBSY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+
+    /// Run `attempt` again while — and only while — it fails with ETXTBSY, up
+    /// to [`ETXTBSY_MAX_ATTEMPTS`] calls. Any other error is returned on the
+    /// first call, so the retry cannot mask a real spawn failure.
+    fn retry_on_etxtbsy<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+        let mut attempt_no = 1;
+        loop {
+            match attempt() {
+                Err(e)
+                    if e.raw_os_error() == Some(ETXTBSY) && attempt_no < ETXTBSY_MAX_ATTEMPTS =>
+                {
+                    attempt_no += 1;
+                    std::thread::sleep(ETXTBSY_RETRY_DELAY);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// `resolve_dynamic_token_checked` deliberately flattens a spawn failure
+    /// into a redacted `String` (the command line must not leak), so recover
+    /// just the errno class the retry needs: only the ETXTBSY message becomes a
+    /// raw-os `io::Error`; every other failure — including the exit-status
+    /// error this test asserts — stays non-retryable.
+    fn io_error_from_token_error(msg: String) -> std::io::Error {
+        if msg.contains("(os error 26)") {
+            std::io::Error::from_raw_os_error(ETXTBSY)
+        } else {
+            std::io::Error::other(msg)
+        }
+    }
+
+    /// A script name unique **per invocation**. The pid alone is not enough: a
+    /// multi-threaded run, a shared `$TMPDIR` across CI jobs, and pid reuse can
+    /// each collide. The atomic sequence separates concurrent calls in this
+    /// process; nanoseconds separate processes and re-runs; the pid keeps two
+    /// processes that happen to sample the same instant apart.
+    fn unique_token_script_path() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "frp-token-script-{}-{}-{}.sh",
+            std::process::id(),
+            seq,
+            nanos
+        ))
+    }
+
+    /// Remove the temporary token script on every exit path, including a panic
+    /// inside an assertion. The old code removed it before asserting; a guard
+    /// keeps that guarantee and also covers the retry path.
+    struct RemoveOnDrop(std::path::PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn retry_on_etxtbsy_retries_a_busy_script_and_succeeds() {
+        // Deterministic stand-in for the Linux-only behaviour: the first two
+        // attempts report a busy script file, the third succeeds. The helper
+        // must retry rather than give up.
+        let attempts = std::cell::Cell::new(0u32);
+        let result = retry_on_etxtbsy(|| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 3 {
+                Err(std::io::Error::from_raw_os_error(ETXTBSY))
+            } else {
+                Ok("resolved")
+            }
+        });
+        assert_eq!(result.unwrap(), "resolved");
+        assert_eq!(
+            attempts.get(),
+            3,
+            "helper must retry ETXTBSY until the exec succeeds"
+        );
+    }
+
+    #[test]
+    fn retry_on_etxtbsy_does_not_retry_other_errors() {
+        // A real spawn failure must surface on the first call — the retry must
+        // not be able to hide it.
+        let attempts = std::cell::Cell::new(0u32);
+        let result = retry_on_etxtbsy::<()>(|| {
+            attempts.set(attempts.get() + 1);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No such file or directory",
+            ))
+        });
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            attempts.get(),
+            1,
+            "only ETXTBSY may be retried; a genuine spawn error surfaces immediately"
+        );
+    }
+
+    #[test]
+    fn retry_on_etxtbsy_is_bounded() {
+        // A permanently busy script must not hang the test forever.
+        let attempts = std::cell::Cell::new(0u32);
+        let result = retry_on_etxtbsy::<()>(|| {
+            attempts.set(attempts.get() + 1);
+            Err(std::io::Error::from_raw_os_error(ETXTBSY))
+        });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(ETXTBSY));
+        assert_eq!(
+            attempts.get(),
+            ETXTBSY_MAX_ATTEMPTS,
+            "retry must be bounded, not infinite"
+        );
+    }
+
     #[test]
     fn test_resolve_dynamic_token_exec_failure_redacts_stderr() {
         // Regression: a token script that fails must not leak its stderr
         // output (which may carry secrets) into the error — only the
         // exit-status error class is surfaced.
-        let dir = std::env::temp_dir();
-        let script = dir.join(format!("frp-token-script-{}.sh", std::process::id()));
+        let script = unique_token_script_path();
         std::fs::write(
             &script,
             "#!/bin/sh\necho SECRET_STDERR_MARKER_XYZ >&2\nexit 7\n",
         )
         .unwrap();
+        let _guard = RemoveOnDrop(script.clone());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3547,9 +3683,18 @@ mod tests {
         let uf = crate::unsafe_features::UnsafeFeatures::new(
             crate::unsafe_features::CLIENT_UNSAFE_FEATURES,
         );
-        let result = resolve_dynamic_token_checked(&token, &uf);
-        std::fs::remove_file(&script).ok();
-        let err = result.expect_err("failing token script must be an error");
+        // On Linux a concurrent writer holding the script open makes `execve`
+        // fail with ETXTBSY. The per-invocation name above removes the known
+        // collision source; the bounded retry absorbs a residual transient
+        // ETXTBSY so the run cannot fail as a *spawn* error. It cannot mask a
+        // real spawn failure (non-ETXTBSY → no retry), and the exit-status
+        // assertion below is deliberately unchanged.
+        let result = retry_on_etxtbsy(|| {
+            resolve_dynamic_token_checked(&token, &uf).map_err(io_error_from_token_error)
+        });
+        let err = result
+            .expect_err("failing token script must be an error")
+            .to_string();
         assert!(
             !err.contains("SECRET_STDERR_MARKER_XYZ"),
             "error must not leak stderr: {err}"
