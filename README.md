@@ -595,9 +595,9 @@ Start from the **[documentation index](docs/README.md)** for everything under `d
 
 **Working on frp-rs**
 
-- **[Architecture](docs/architecture.md)** — Wire protocol, auth/encryption, transport abstraction, control-plane design, XTCP hole punching
-- **[Technical Details](docs/technical-details.md)** — V1/V2 framing, message types, work-connection lifecycle, and project structure
-- **[Developer Guide](docs/developing.md)** — Debugging, testing, and release process
+- **[Architecture](docs/architecture.md)** — **Canonical.** Wire protocol and message types, control plane, work-connection lifecycle, auth/encryption, transports, XTCP hole punching, project structure
+- **[Developer Guide](docs/developing.md)** — Adding a proxy type, building and feature flags, debugging, testing, and release process
+- **[Technical Details](docs/technical-details.md)** — *Moved* into the Architecture guide; this path is a redirect stub kept for old links
 - **[CLAUDE.md](CLAUDE.md)** — Contributor/agent rules: build matrix, versioning, required workflow, dependency policy, invariants
 
 **Compatibility & history**

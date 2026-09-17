@@ -16,10 +16,10 @@ read the [main README](../README.md) first, then pick from the tables below.
 
 | Document | What it covers |
 |---|---|
-| [Architecture](architecture.md) | Wire protocol, auth/encryption, transport abstraction, `InternalMsg` control-plane design, XTCP hole punching |
-| [Technical Details](technical-details.md) | V1/V2 frame formats, message types, work-connection lifecycle, project/crate layout |
-| [Developer Guide](developing.md) | Architecture deep-dive, debugging, testing, release process |
+| [Architecture](architecture.md) | **Canonical.** Wire protocol and message types, server accept loop and control plane, work-connection lifecycle, auth, encryption, transports, config normalization, XTCP hole punching, project/crate layout |
+| [Developer Guide](developing.md) | Adding a proxy type, building and feature flags, debugging, testing, release process |
 | [`../CLAUDE.md`](../CLAUDE.md) | Agent/contributor **rules**: build matrix, versioning, workflow, dependency policy, invariants |
+| [Technical Details](technical-details.md) | *Moved* — redirect stub to [Architecture](architecture.md), kept so old links keep working |
 
 ## Compatibility & audits
 
