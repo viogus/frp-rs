@@ -133,6 +133,14 @@ connection is requested).
 | `authorized_keys_file` | `string` | `""` | `sshTunnelGateway.authorizedKeysFile` | Path to SSH `authorized_keys` for optional public key auth. Empty = password auth only. |
 | `ssh_session_idle_timeout` | `u64` | `0` | — (frp-rs extension) | Authenticated-session idle timeout in seconds. 0 = disabled (Go frp parity). When enabled, an idle authenticated session is disconnected so it cannot hold a connection slot forever. |
 
+> **About `.autogen_ssh_key`:** the default `auto_gen_private_key_path` is
+> **relative to the working directory**, so running `frps` from the repository
+> root creates a real Ed25519 host private key at `./.autogen_ssh_key`. It is a
+> throwaway key for that local run — it authenticates nothing outside your
+> machine — but it must never be committed. The repo's `.gitignore` already
+> covers it. Point `auto_gen_private_key_path` at a path outside the repo if you
+> would rather it never appear here.
+
 ### `[[http_plugins]]` Section (Array)
 
 Server-side HTTP plugins. Each entry is an external HTTP service called on lifecycle events.

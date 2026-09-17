@@ -44,6 +44,24 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  # Cheapest job in the matrix (~seconds: no Rust toolchain, no cache, reads
+  # files with grep/find only). It turns a rule that was previously enforced by
+  # memory into a machine gate: frp-rs versions must stay aligned with the Go frp
+  # release number across 5 crates + the VERSION constant + the download script +
+  # the README (see "Versioning (mandatory)" in CLAUDE.md).
+  # scripts/repo-health.sh exits 1 on drift, and also prints the repo stats that
+  # CLAUDE.md's Current Health table points at, so those numbers stop being
+  # hand-maintained (the table once claimed 17 unsafe blocks in frp-core when the
+  # tree had 21).
+  health:
+    name: Health (version alignment + repo stats)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Repo health — gates version alignment
+        run: bash scripts/repo-health.sh
+
   tests-unit:
     name: Tests (unit)
     runs-on: ubuntu-latest

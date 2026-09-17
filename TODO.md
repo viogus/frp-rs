@@ -52,13 +52,21 @@ Priority is by *risk removed per unit of effort*, not by size:
   and `tokio-tungstenite`, which the canonical list lacked; they were merged in
   before the duplicate was deleted.
 
-- [ ] **A real SSH private key lives in the repo root.**
-  Evidence: `.autogen_ssh_key` begins `-----BEGIN OPENSSH PRIVATE KEY-----`.
-  It is **not** committed (`git ls-files` → 0 entries; gitignored), so this is not
-  a leak — but a key in the working tree root is one `git add -f` away from being one,
-  and it appears to be test material that would be better generated on demand.
-  **Done-when:** the key is generated into a temp dir by whatever test needs it, or
-  the file's purpose is documented in `scripts/README.md`.
+- [x] **A real SSH private key lives in the repo root.**
+  Evidence: `.autogen_ssh_key` begins `-----BEGIN OPENSSH PRIVATE KEY-----`
+  (Ed25519, SHA256:a8zw/whUpgVrIf7ytF5yQKisZyssRjaMEyEuHEDJIC8).
+  **The original characterization in this item was wrong** — it is not test
+  material. It is the *runtime* default host key path for the SSH tunnel
+  gateway (`sshTunnelGateway.autoGenPrivateKeyPath` defaults to
+  `"./.autogen_ssh_key"`, `frp-core/src/config/server.rs:443,469-470`, matching
+  Go frp), so it appears whenever `frps` runs with the gateway enabled from the
+  repo root. It authenticates nothing outside the local machine and was never
+  committed (gitignored, `git ls-files` → 0).
+  Done: documented in `.gitignore` (naming what the file is and why it must not
+  be committed) and in `docs/config.md § ssh_tunnel_gateway`, including the
+  option to point `auto_gen_private_key_path` outside the repo. No code change:
+  the relative default is Go frp parity and changing it would be a divergence for
+  a dev convenience.
 
 - [x] **Orphaned worktree directory.**
   Evidence: `.claude/worktrees/vnet-route-ownership/` (46 MB) existed on disk but was
@@ -72,11 +80,14 @@ Priority is by *risk removed per unit of effort*, not by size:
   because squash rewrites history — the same reason this backlog's own PRs are not.)
   Note: local-only cleanup, not part of any PR.
 
-- [ ] **`repo-health.sh` is not wired into CI.**
+- [x] **`repo-health.sh` is not wired into CI.**
   Evidence: the version-alignment check is a documented *mandatory* rule
-  (`CLAUDE.md § Versioning`) that has so far been enforced by memory only.
-  **Done-when:** a `ci.yml` job runs `bash scripts/repo-health.sh` and fails the
-  build on drift.
+  (`CLAUDE.md § Versioning`) that had been enforced by memory only.
+  Done: added a `health` job to `ci.yml` (no Rust toolchain, no cache — reads
+  files with grep/find, so it costs seconds) that runs
+  `bash scripts/repo-health.sh` and fails the build on drift. A version bump that
+  misses `VERSION`, the download script or the README now fails CI instead of
+  being noticed at release time.
 
 ---
 
