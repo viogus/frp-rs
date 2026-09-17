@@ -134,6 +134,31 @@ nothing about whether the described behaviour still holds.
   **Done-when:** `developing.md` contains no statement a reader could act on that
   is not either in `architecture.md` or referenced `file:line`.
 
+- [x] **A source comment pointed at a path that no longer held code.**
+  Evidence: `frp-core/src/kcp/protocol.rs` opened with "the frp-rs in-tree
+  replacement for the vendored `kcp` crate (`frp-core/vendored/kcp-0.6.0`)" — but
+  that directory had been emptied when the KCP state machine moved in-tree
+  (`docs/archive/specs/2026-07-06-replace-rust-tokio-kcp-design.md:145,153`;
+  `CHANGELOG.md`, "KCP self-implementation"). What remained was
+  `frp-core/vendored/kcp-0.6.0/Cargo.lock` and nothing else, so a reader
+  following the comment found no source.
+  Done: the comment now records that the crate was removed and points at the
+  changelog instead of a path that cannot be opened; the orphaned
+  `frp-core/vendored/` directory was deleted locally (untracked, so not part of
+  any commit).
+
+- [ ] **No automated check for stale path references — and a naive one does not work.**
+  Evidence: a regex sweep for repo-looking paths that do not resolve produced
+  **135 hits, essentially all false positives**: `Cargo.toml` feature syntax
+  (`frp-core/tls` is a feature, not a path), and crate-relative paths in
+  per-crate READMEs and `Cargo.toml` (`src/lib.rs`, `tests/kcp.rs` resolve
+  relative to that crate, not the repo root). It also **missed the one real
+  finding above**, because the stale path was a directory that still existed.
+  **Done-when:** either a check that resolves each path relative to the
+  referencing file's own directory and distinguishes `Cargo.toml` feature syntax
+  — or an explicit decision that this class stays a manual review item.
+  Do not ship the naive regex as a CI gate: it fails on a clean tree.
+
 - [ ] **Documentation index is manual.**
   Evidence: `docs/README.md` lists docs by hand, so a new doc is invisible until
   someone remembers to add it.
