@@ -222,7 +222,141 @@ PY
   printf '  info  archive path refs: %s, resolvable via the docs/archive/ prefix: %s\n' "${1:-0}" "${2:-0}"
   printf '        (the remainder point at specs that were never written — pre-existing)\n'
 
-  # (c) Report: the archive inventory size quoted in docs/README.md.
+  # (c) Gate: a path a doc or source comment names must still open. The naive
+  # sweep that produced 135 hits in TODO.md failed because it resolved every
+  # path from the repo root and could not tell `frp-core/tls` (a Cargo feature)
+  # from a path. This one is precise because it (i) only checks spans anchored
+  # at a known repo root, (ii) tries the *referencing file's* directory first
+  # and the repo root second, and (iii) models `[features]` plus implicit
+  # features from optional dependencies instead of carrying an exclusion list.
+  # Locator-less spans (`mux.rs`, `control/mod.rs`) have no recoverable base and
+  # are counted, not checked — they are the naive sweep's false positives.
+  # Point-in-time documents (history, dated audits, changelog, the refactor
+  # proposal, and the backlog that quotes removed paths as evidence) describe an
+  # older tree on purpose and are out of scope; the archive has check (b).
+  paths=$(python3 - <<'PY'
+import os, re
+
+ROOTS = ('src/', 'tests/', 'benches/', 'examples/',
+         'docs/', 'scripts/', 'vendor/', 'docker/', '.github/',
+         'frp-core/', 'frp-server/', 'frp-client/', 'frp-vnet/', 'frps/', 'frpc/')
+MANIFEST = re.compile(r'^(Cargo\.toml|Cargo\.lock)$')
+EXTS = ('.rs', '.toml', '.md', '.sh', '.yml', '.yaml', '.json', '.lock')
+SKIP_DIRS = ('docs/archive/', 'docs/history/', 'docs/audit/')
+SKIP_FILES = ('CHANGELOG.md', 'TODO.md', 'performance-audit.md',
+              'docs/refactor-large-modules.md')
+BANNED = ' \t{}*<>|'
+
+def cargo_features(crate):
+    path = os.path.join(crate, 'Cargo.toml')
+    if not os.path.isfile(path):
+        return None
+    feats, section = set(), ''
+    for line in open(path, encoding='utf8', errors='ignore'):
+        line = line.strip()
+        if line.startswith('['):
+            section = line.strip('[]').strip()
+            continue
+        m = re.match(r'([A-Za-z0-9_-]+)\s*=', line)
+        if not m:
+            continue
+        if section == 'features':
+            feats.add(m.group(1))
+        elif 'dependencies' in section and re.search(r'optional\s*=\s*true', line):
+            feats.add(m.group(1))     # implicit feature of an optional dependency
+    return feats
+
+SPAN = re.compile(r'`([^`\n]+)`')
+
+def normalize(span):
+    s = span.strip()
+    if not s or '...' in s or any(c in s for c in BANNED) or s[0] in '/~$':
+        return None
+    s = re.sub(r'::[A-Za-z_][A-Za-z0-9_:]*$', '', s)           # file.rs::symbol
+    s = re.sub(r'#[A-Za-z0-9_.-]+$', '', s)                    # file.md#anchor
+    s = re.sub(r':~?\d+([-\u2013]\d+)?([/,]\d+)*\+?$', '', s)  # file.rs:12-20,30
+    return s or None
+
+def classify(span, base):
+    p = normalize(span)
+    if p is None:
+        return 'ignore'
+    if p.startswith('docs/superpowers'):
+        return 'superpowers'      # documented old name of docs/archive/
+    has_slash = '/' in p.rstrip('/')
+    manifest = bool(MANIFEST.match(os.path.basename(p.rstrip('/'))))
+    if not has_slash and not manifest:
+        return 'bare' if os.path.splitext(p)[1] in EXTS else 'ignore'
+    if not (p.startswith(ROOTS) or manifest):
+        return 'shorthand' if os.path.splitext(p)[1] in EXTS else 'ignore'
+    if has_slash:             # `crate/feature` (or `dir/crate/feature`) is not a path
+        left, right = p.rsplit('/', 1)
+        feats = cargo_features(left)
+        if feats is not None and right in feats:
+            return 'feature'
+    for cand in (os.path.normpath(os.path.join(base, p)), os.path.normpath(p)):
+        if os.path.exists(cand):
+            return 'ok'
+    return 'stale'
+
+def spans(lines):
+    for lineno, line in lines:
+        for m in SPAN.finditer(line):
+            yield lineno, m.group(1)
+
+def md(path):
+    return enumerate(open(path, encoding='utf8', errors='ignore'), 1)
+
+def rs(path):
+    return [(i, l) for i, l in enumerate(open(path, encoding='utf8', errors='ignore'), 1)
+            if l.lstrip().startswith(('//', '/*', '*'))]
+
+counts = {k: 0 for k in ('ok', 'stale', 'feature', 'shorthand', 'bare',
+                         'superpowers', 'ignore')}
+hits = []
+for root, dirs, files in os.walk('.'):
+    dirs[:] = [d for d in dirs if d not in ('.git', 'target')]
+    for fn in sorted(files):
+        p = os.path.join(root, fn)[2:]
+        is_md, is_rs = fn.endswith('.md'), fn.endswith('.rs')
+        if not (is_md or is_rs):
+            continue
+        if is_md and (p.startswith(SKIP_DIRS) or p in SKIP_FILES):
+            continue
+        if is_rs and p.startswith('vendor/'):   # third-party source, pinned
+            continue
+        base = os.path.dirname(p)
+        for lineno, span in spans(md(p) if is_md else rs(p)):
+            verdict = classify(span, base)
+            counts[verdict] += 1
+            if verdict == 'stale':
+                hits.append('%s:%d: `%s`' % (p, lineno, normalize(span)))
+print('%d %d %d %d %d %d' % (counts['ok'], counts['stale'], counts['feature'],
+                             counts['shorthand'], counts['bare'], counts['superpowers']))
+for h in hits:
+    print(h)
+PY
+)
+  summary=$(printf '%s\n' "$paths" | head -1)
+  read -r p_ok p_stale p_feat p_short p_bare _ <<EOF
+$summary
+EOF
+  if [ -z "$p_ok" ]; then
+    printf '  skip  path-reference scan produced no result\n'
+  else
+    if [ "$p_stale" -gt 0 ]; then
+      printf '%s\n' "$paths" | tail -n +2 | sed '/^$/d' | sed 's/^/    stale: /'
+      printf '  FAIL  %s path reference(s) do not resolve from the referencing file\n' "$p_stale"
+      fail=1
+    else
+      printf '  ok    %s repo path references resolve (file-relative, then repo root)\n' "$p_ok"
+    fi
+    printf '  info  skipped %s locator-less refs (no recoverable base) and %s `crate/feature` spans\n' \
+      "$((p_short + p_bare))" "$p_feat"
+    printf '        the locator-less refs are the false positives a naive sweep reports; see TODO.md\n'
+  fi
+
+  # (d) Report: the archive inventory size quoted in docs/README.md.
   # Hand-maintained counts go stale silently (it said 81 while the tree had a
   # different number), so measure it here and keep the doc's figure sourced.
   n_arch=$(find docs/archive -type f -name '*.md' ! -name 'README.md' | wc -l | tr -d ' ')

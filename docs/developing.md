@@ -391,6 +391,20 @@ Proptest-based tests verify correctness under adversarial inputs:
 - **Config normalization** (`frp-core/src/config/`): 9 proptest! blocks — idempotency, flat↔nested equivalence, camelCase→snake_case
 - **Protocol fuzzing** (`frp-core/src/protocol.rs`): 6 fuzz tests + 35 regular tests — all 256 V1 type bytes × arbitrary payloads, V2 arbitrary type IDs, truncated frames, magic detection
 
+### Repository Invariants (`repo-health.sh`)
+
+`bash scripts/repo-health.sh` mirrors the `health` CI job. On top of version
+alignment it gates the `Docs` section: every `docs/*.md` and `docs/*/` must be
+reachable from `docs/README.md`, and every repo path named in a backtick span in
+current docs or source comments must still resolve — against the directory of
+the file that names it first, then the repo root. A `crate/feature` span such as
+`frp-core/tls` is recognised as Cargo feature syntax, not a path. Two limits are
+deliberate: spans with no locating root (`mux.rs`, `control/mod.rs`) are counted
+and left to review, and a directory that still exists but has been emptied is not
+detected (existence is all that can be checked mechanically). Historical records
+(`docs/archive/`, `docs/history/`, dated audits, `CHANGELOG.md`) are out of
+scope; see [`../TODO.md`](../TODO.md).
+
 ## 6. Release Process
 
 ### Pre-release checklist
