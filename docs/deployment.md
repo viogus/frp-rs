@@ -615,16 +615,22 @@ Client endpoints:
 | `PUT /api/config` | Update config + trigger reload (body limit 1 MiB) |
 | `GET /api/proxy/{name}/config` | Effective config of one proxy |
 | `GET /api/visitor/{name}/config` | Effective config of one visitor |
-| `GET /api/reload` / `POST /api/reload` | Reload proxies from config file (strict mode via JSON body `{"strict_config": true}`) |
+| `GET /api/reload` / `POST /api/reload` | Reload proxies from config file. Go-compatible strict mode via `?strictConfig=true`; the JSON body form is a frp-rs extension |
 | `POST /api/stop` | Gracefully stop the client |
 | `GET` / `POST /api/store/proxies`, `GET` / `PUT` / `DELETE /api/store/proxies/{name}` | Runtime proxy store CRUD — only when `store.path` is set; **frp-rs-only** (Go frp's admin API uses a different nested body shape, so this is not wire-compatible with a Go admin client) |
 | `GET` / `POST /api/store/visitors`, `GET` / `PUT` / `DELETE /api/store/visitors/{name}` | Runtime visitor store CRUD — same conditions |
 
-`/api/reload` reads its body with axum's `Json` extractor, so both methods must
-send `Content-Type: application/json` and a JSON body (`{}` for a normal reload,
-`{"strict_config": true}` for strict mode); a request without a JSON body is
-rejected with 415. Note this differs from Go frp, whose `GET /api/reload` takes no
-body — see [TODO.md](../TODO.md).
+`GET /api/reload` needs no body and no `Content-Type` — the Go-compatible call
+`curl -u user:pass http://127.0.0.1:7400/api/reload` reloads in non-strict mode.
+Strict mode is selected with Go's query parameter: `?strictConfig=true` (the
+full `strconv.ParseBool` true set is `1 t T TRUE true True`; `0 f F FALSE false
+False` are non-strict). With no parameter the reload is non-strict. Any other
+value — including an empty `?strictConfig=` — is `ParseBool`'s error case, which
+Go frp **discards**, so it is a 200 non-strict reload, never a 400.
+`POST /api/reload` additionally accepts the frp-rs extension body
+`{"strict_config": true}` (also accepted as `"strictConfig"`, the spelling
+frpc's own CLI sends); when both channels are present the query parameter wins.
+A body that is present but malformed JSON is rejected with 400.
 
 ### Health Checks
 

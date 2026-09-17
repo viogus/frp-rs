@@ -143,7 +143,7 @@ nothing about whether the described behaviour still holds.
   written) was already dangling before the rename and is named in
   `docs/archive/README.md` rather than rewritten to point elsewhere.
 
-- [ ] **`frpc`'s `GET /api/reload` diverges from Go frp — it requires a JSON body.**
+- [x] **`frpc`'s `GET /api/reload` diverges from Go frp — it requires a JSON body.**
   Evidence: the handler is
   `async fn handle_reload(State(state), Json(body): Json<ReloadBody>)`
   (`frp-client/src/admin.rs:155-161`), and the route deliberately registers `get`
@@ -159,6 +159,28 @@ nothing about whether the described behaviour still holds.
   non-strict mode (optional extractor or an empty-body default), with a test pinning
   all three cases: body-less GET → 200, `{"strict_config": true}` → strict mode,
   malformed body → 400.
+  **Correction — the framing above was wrong:** Go frp reads **no request body at
+  all** on this route (`ctx.Body()` is never called by `Reload`), and
+  `client/api_router.go` registers it **GET only**. Strict mode comes from the
+  query parameter `?strictConfig=`, parsed with `strconv.ParseBool` and the parse
+  error **discarded** (`strictConfigMode, _ = strconv.ParseBool(strictStr)`,
+  `client/http/controller.go` at commit `4a23aa18`), so a garbage value (`yes`,
+  `garbage`, empty `?strictConfig=`) is a **200 non-strict reload, never a 400**.
+  The body/malformed-400 cases describe frp-rs's own JSON extension, not Go.
+  Done: `handle_reload` (`frp-client/src/admin.rs:178-206`) now takes
+  `Query<ReloadQuery>` plus raw `axum::body::Bytes` (`Option<Json<..>>` would
+  swallow a malformed body as `None`) and picks strict mode query-first, falling
+  back to the JSON body; `parse_strict_config` mirrors `strconv.ParseBool` with
+  Go's error→false handling. Body-less GET → 200 non-strict,
+  `?strictConfig=true` → strict, `?strictConfig=<unparseable>` → 200 non-strict,
+  malformed JSON body → 400. The JSON extension is kept for frpc's own CLI and now
+  also accepts the camelCase `strictConfig` spelling that CLI actually sends
+  (`frpc/src/main.rs:630`) — previously serde ignored it, so `frpc reload
+  --strict_config` silently ran non-strict. Pinned by
+  `reload_admin_go_query_parity_and_body_extension` in
+  `frp-client/tests/reload_malformed_config.rs` and the
+  `parse_strict_config_matches_strconv_parse_bool` unit test; `docs/deployment.md`
+  updated.
 
 - [ ] **The `tiny`/`micro` feature builds emit warnings, and CI does not deny them.**
   Evidence: `cargo build --release --no-default-features --features tiny|micro`
