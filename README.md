@@ -564,16 +564,47 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 ---
 
+## Vendored crates
+
+Three crates are patched via `[patch.crates-io]` in the workspace `Cargo.toml`.
+Each exists for a concrete, documented reason and **each has an exit condition** —
+a vendored crypto/TLS tree is a maintenance liability, not a resting state.
+
+| Crate | Version | Why it is vendored | Exit condition |
+|---|---|---|---|
+| [`rustls`](vendor/rustls/README-FRP-RS.md) | 0.23.43 | Go frp XTCP QUIC visitors send the peer `"ip:port"` as the TLS SNI; rustls 0.23 rejects it as invalid. Patch treats invalid SNI as *no SNI* (server-side only). | **Delete when the workspace moves to rustls ≥ 0.24** — `invalid_sni_policy = IgnoreAll` is native there. Until then, track 0.23.x `RUSTSEC` advisories manually on every release. |
+| [`yamux`](vendor/yamux/README-FRP-RS.md) | 0.14.0 | 5 patches: per-stream RST at the inbound stream cap (instead of a session-killing GoAway, matching Go frp's fork), a read-side lost-wakeup deadlock fix, a per-stream receive-window cap, window-growth RTT seeding, and a send-side body-buffer pool. | Upstream each patch, or re-apply on every yamux bump (each patch section lists its own upgrade note). The deadlock fix is the one to upstream first. |
+| [`russh`](vendor/russh/README-FRP-RS.md) | 0.62.7 | 2 patches dropping the `ssh-key` `encryption` + `ppk` and `pkcs8` `encryption` chains, which the SSH gateway never uses (`load_secret_key(path, None)` only). Removes 7 pre-release packages and ~48.5 KiB from frps. | Drop when upstream makes those `ssh-key` features optional. |
+
+> The rustls patch is the security-sensitive one. `vendor/rustls` has no
+> automated upstream tracking because `[patch.crates-io]` pins it — the release
+> checklist in [`CLAUDE.md`](CLAUDE.md) covers the manual advisory check.
+
+---
+
 ## Documentation
+
+Start from the **[documentation index](docs/README.md)** for everything under `docs/`.
+
+**Using frp-rs**
 
 - **[Configuration Reference](docs/config.md)** — Every config field with types, defaults, and Go frp equivalents
 - **[Proxy Type Guide](docs/proxies.md)** — When and how to use each proxy type (TCP, UDP, HTTP, STCP, XTCP, etc.)
 - **[Client Plugins](docs/client-plugins.md)** — HTTP proxy, SOCKS5, static file, TLS termination, and more
 - **[Deployment Guide](docs/deployment.md)** — Systemd, Docker, TLS, monitoring, performance tuning
-- **[Developer Guide](docs/developing.md)** — Architecture deep-dive, debugging, testing, release process
 
-- **[Technical Details](docs/technical-details.md)** — Architecture, wire protocol (V1/V2 framing, message types, lifecycle, auth, encryption, compression), and project structure
+**Working on frp-rs**
+
+- **[Architecture](docs/architecture.md)** — Wire protocol, auth/encryption, transport abstraction, control-plane design, XTCP hole punching
+- **[Technical Details](docs/technical-details.md)** — V1/V2 framing, message types, work-connection lifecycle, and project structure
+- **[Developer Guide](docs/developing.md)** — Debugging, testing, and release process
+- **[CLAUDE.md](CLAUDE.md)** — Contributor/agent rules: build matrix, versioning, required workflow, dependency policy, invariants
+
+**Compatibility & history**
+
 - **[Go frp Compatibility Audit](docs/go-frp-compat-audit.md)** — Full cross-compat analysis against Go frp v0.71.0
+- **[Development Log](docs/history/development-log.md)** — Round-by-round hardening and audit history
+- **[CHANGELOG](CHANGELOG.md)** — User-facing release notes
 
 ---
 

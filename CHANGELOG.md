@@ -202,6 +202,16 @@ pruning, and +929 tests (1149 → 2078, 0 failed). Version stays aligned at
   CLAUDE.md Current Health + round 17/18 history, developing.md dep
   tables; optional UPX compression section added to deployment.md
   (measured, not recommended by default).
+- **Documentation restructure**: `CLAUDE.md` was 143 KB with 76% of it a
+  single-line round-history table, so it exceeded its 64 KB agent-instruction
+  budget and was silently truncated on load. The history moved verbatim to
+  `docs/history/development-log.md` and the architecture chapters to
+  `docs/architecture.md` (no content removed); `CLAUDE.md` is now a ~20 KB
+  rules-and-invariants file with a scope table and a "do not append history
+  here" rule. Added `docs/README.md` (docs index, marks `docs/superpowers/`
+  as archived artifacts), documented the three vendored crates' exit
+  conditions in the new README "Vendored crates" section, and added the
+  missing `vendor/rustls/README-FRP-RS.md` for the TLS SNI patch.
 
 ### Post-#279: 4-dimension audit rounds 3–5 + plugin-face rounds 6–18
 - **4-dimension audit round 3 (PR #284)**: per-proxy `SharedBandwidthLimiter`

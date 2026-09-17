@@ -8,8 +8,10 @@
 >
 > **Status 2026-09-01**: historical record — this backlog is fully resolved.
 > Current version alignment is **Go frp v0.71.0** (tracked since 2026-08-16);
-> post-0.71.0 hardening rounds 1-18 live in the CHANGELOG "Unreleased"
-> section and the Current Health table in CLAUDE.md.
+> post-0.71.0 hardening rounds live in
+> [`docs/history/development-log.md`](docs/history/development-log.md) and the
+> CHANGELOG release sections. `CLAUDE.md` now keeps only a current-state
+> snapshot plus the rules/invariants, so it fits the 64 KB agent budget.
 
 ---
 
