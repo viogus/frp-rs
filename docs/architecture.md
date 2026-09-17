@@ -807,7 +807,7 @@ parity):
   and the provider the QUIC server. Requires the `quic` feature (default ON). Go
   visitors with `protocol="quic"` interoperate: Go frp v0.71.0 sends the peer
   `"ip:port"` as the QUIC SNI, which upstream rustls 0.23 rejects, so frp-rs
-  vendors rustls (0.23.43 at `vendor/rustls`) with a server-side patch treating an
+  vendors rustls (0.23.45 at `vendor/rustls`) with a server-side patch treating an
   invalid SNI as "no SNI" (see
   [`vendor/rustls/README-FRP-RS.md`](../vendor/rustls/README-FRP-RS.md) and
   `docs/archive/notes/2026-08-04-xtcp-quic-sni-compat.md`; drop the patch when

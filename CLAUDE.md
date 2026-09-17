@@ -219,7 +219,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 | Crypto (general) | `ring` | 0.17 — SHA256, AES-256-GCM, HKDF, HMAC |
 | Crypto (Go compat) | `aes` + `cfb-mode`, `pbkdf2` + `sha1`, `md-5` | AES-128-CFB, PBKDF2-SHA1, MD5 — ring lacks these |
 | Crypto (V2 XChaCha20) | `chacha20poly1305` | ring only has ChaCha20 (96-bit nonce), V2 needs XChaCha20 (192-bit) |
-| TLS | `rustls` + `tokio-rustls` + `rustls-platform-verifier` | ring backend, tls12, native cert verifier. **Vendored** at `vendor/rustls` 0.23.43 with a one-line SNI patch (`ServerNamePayload::Invalid` → treat as no-SNI) for Go XTCP QUIC visitor compat; delete the vendored copy when upgrading to rustls ≥0.24 (native `invalid_sni_policy`) and keep tracking 0.23.x security updates manually |
+| TLS | `rustls` + `tokio-rustls` + `rustls-platform-verifier` | ring backend, tls12, native cert verifier. **Vendored** at `vendor/rustls` 0.23.45 with a one-line SNI patch (`ServerNamePayload::Invalid` → treat as no-SNI) for Go XTCP QUIC visitor compat; delete the vendored copy when upgrading to rustls ≥0.24 (native `invalid_sni_policy`) and keep tracking 0.23.x security updates manually |
 | SSH | `russh` | ring backend (NOT aws-lc-rs), features: ring+rsa only |
 | HTTP client | inline `frp_core::http_client` | hyper + tokio-rustls direct (not reqwest — size-pruned); OIDC + http-proxy + dashboard health use it |
 | HTTP server | `axum` | dashboard, admin auth |

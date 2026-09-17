@@ -480,8 +480,11 @@ covered by any gate and are the ones that have actually been missed before.
       - confirm the `health` job still reports a README for every vendored crate.
       *Exit condition to watch:* `vendor/rustls` can be deleted as soon as the
       workspace moves to rustls ≥ 0.24, which has `invalid_sni_policy` natively.
-      Nothing currently blocks that upgrade; it is tracked in
-      [`../TODO.md`](../TODO.md).
+      As of 2026-09-17 that upgrade is **blocked upstream**: crates.io's
+      `max_stable_version` is `0.23.45` and the only 0.24 artifact is the
+      `0.24.0-dev.1` prerelease, so the trigger and plan are tracked in
+      [`../TODO.md`](../TODO.md). The vendored line is current in the meantime
+      (`0.23.45`, the GHSA-2mjx-qc3c-rqvc fix).
       *Owner:* the sole maintainer — there is no second reviewer for this repo
       (see the bus-factor item in the backlog), so this checklist line **is** the
       control.
