@@ -29,15 +29,32 @@ CA_KEY=/tmp/baseline-ca.key
 CERT=/tmp/baseline-srv.crt
 KEY=/tmp/baseline-srv.key
 
-echo "=== Building release binaries ==="
-# frps/frpc are the shipped workspace; frp-stress is a standalone workspace
-# under scripts/, built separately (keeps its deps out of the release lock).
-cargo build --release -p frps -p frpc 2>&1 | tail -2
+# frps/frpc default to this tree's release build, but can be pointed anywhere —
+# including a Go frp release — so the same harness can measure a different
+# implementation. Use scripts/compare-go-frp.sh to fetch and verify the Go
+# binaries first (it checks platform and version), then, for example:
+#
+#   GO=/tmp/frp_0.71.0_$(uname -s | tr 'A-Z' 'a-z')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+#   FRPS_BIN=$GO/frps FRPC_BIN=$GO/frpc bash scripts/throughput-baseline.sh
+#
+# The harness itself (frp-stress) is always built from this tree.
+echo "=== Building the frp-stress harness ==="
 (cd scripts/frp-stress && cargo build --release 2>&1 | tail -2)
 
-FRPS=./target/release/frps
-FRPC=./target/release/frpc
+if [ -z "${FRPS_BIN:-}" ] || [ -z "${FRPC_BIN:-}" ]; then
+  echo "=== Building release binaries (set FRPS_BIN/FRPC_BIN to skip) ==="
+  cargo build --release -p frps -p frpc 2>&1 | tail -2
+fi
+FRPS="${FRPS_BIN:-./target/release/frps}"
+FRPC="${FRPC_BIN:-./target/release/frpc}"
 STRESS=./scripts/frp-stress/target/release/frp-stress
+
+for bin in "$FRPS" "$FRPC" "$STRESS"; do
+  if [ ! -x "$bin" ]; then
+    echo "error: not executable: $bin" >&2
+    exit 1
+  fi
+done
 
 # TLS row certs: a CA plus a CA-signed end-entity leaf. rustls (webpki) rejects
 # a self-signed CA cert used directly as the server leaf (CaUsedAsEndEntity), and

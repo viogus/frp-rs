@@ -306,7 +306,17 @@ The compat tests require Go frp binaries. Download them first:
 bash scripts/download-go-frp.sh
 ```
 
-This downloads Go frp v0.71.0 binaries to `scripts/go-frp/`. The CI gate is `.github/workflows/compat.yml`.
+This downloads Go frp v0.71.0 binaries to `/tmp/frp_<version>_<os>_<arch>/` (for
+example `/tmp/frp_0.71.0_linux_amd64/`) — that is where `compat-test.sh` looks for
+them. Override the location with `GO_FRP_DIR=/path/to/dir`. The CI gate is
+`.github/workflows/compat.yml`.
+
+> Do **not** commit the downloaded Go binaries. They are platform- and
+> version-specific, they are ~16–20 MB each, and a stale copy is worse than none:
+> `scripts/go-frp/` used to hold v0.69.1 macOS x86_64 binaries while the project
+> targeted v0.71.0, and any size/memory comparison against them was meaningless.
+> Use [`scripts/compare-go-frp.sh`](../scripts/compare-go-frp.sh), which verifies
+> platform and version before it compares anything.
 
 ### XTCP CI Tests
 
@@ -406,6 +416,12 @@ covered by any gate and are the ones that have actually been missed before.
       *Owner:* the sole maintainer — there is no second reviewer for this repo
       (see the bus-factor item in the backlog), so this checklist line **is** the
       control.
+- [ ] **Regenerate the Go-frp comparison table** —
+      `bash scripts/compare-go-frp.sh --build --memory`, then replace the table in
+      the README's "Why frp-rs?" section. The script verifies platform *and*
+      version against the current `VERSION` and aborts on a mismatch, so it cannot
+      produce the apples-to-oranges table the old hand-written one was: a
+      cross-platform or cross-version comparison is not a measurement.
 - [ ] **All four size tiers build**, and record the sizes with the platform and
       rustc version — the numbers in the README are meaningless without them.
 - [ ] **Release binaries are built with the declared profile.** CI overrides

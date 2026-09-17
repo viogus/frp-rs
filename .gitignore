@@ -28,3 +28,11 @@ scripts/frp-stress/Cargo.lock
 go-reference/
 scripts/frp-stress/target/
 .cargo/
+
+# Downloaded Go frp release binaries (scripts/download-go-frp.sh). Never commit
+# these: they are platform- and version-specific (~16-20 MB each) and a stale
+# copy silently produces meaningless comparisons. compat-test.sh reads them from
+# /tmp/frp_<version>_<os>_<arch>/, overridable with GO_FRP_DIR.
+scripts/go-frp/frps
+scripts/go-frp/frpc
+scripts/go-frp/*.toml
