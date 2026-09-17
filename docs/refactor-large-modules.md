@@ -25,10 +25,10 @@ lines), yet it contains the largest production function in the repository:
 | 4 | `authenticate` | `frp-server/src/control/login.rs:617` | 510 |
 | 5 | `run_visitor_listener` | `frp-client/src/visitor.rs:1141` | 502 |
 | 6 | `spawn_work_conn` | `frp-client/src/work_conn.rs:1634` | 469 |
-| 7 | `handle_tls_connection` | `frp-server/src/handlers/transport.rs:42` | 463 |
+| 7 | `handle_tls_connection` | `frp-server/src/handlers/transport.rs:42` | 461 |
 | 8 | `handle_nat_hole_visitor` | `frp-server/src/handlers/dispatch.rs:368` | 447 |
-| 9 | `run_udp_work_conn` | `frp-client/src/work_conn.rs:754` | 419 |
-| 10 | `handle_websocket_connection` | `frp-server/src/handlers/transport.rs:674` | 412 |
+| 9 | `run_udp_work_conn` | `frp-client/src/work_conn.rs:754` | 418 |
+| 10 | `handle_websocket_connection` | `frp-server/src/handlers/transport.rs:674` | 411 |
 
 `run` is **1.85× larger than the next function** and is the single best
 refactoring target in the codebase — and, unusually, also the **safest** (see
@@ -63,11 +63,31 @@ bash scripts/large-functions.sh          # per-file production LOC + top 12 func
 bash scripts/large-functions.sh --top 25
 ```
 
-Every number in this document comes from that script. The script itself also had
-a bug worth recording: a whole-file test module (`frp-core/src/config/tests.rs`)
-carries no `#[cfg(test)]` inside it — the attribute is on the `mod` declaration
-that includes it — so it was counted as **6005 lines of production code** until
-files named `tests.rs` and directories named `tests/` were excluded.
+Every number in this document comes from that script, and the script is
+**cross-checked against an independent line-by-line read** of the files (5
+functions agree exactly). That check was necessary, because the tool was wrong
+four times before it was right — each bug produced numbers that looked plausible:
+
+1. A whole-file test module (`frp-core/src/config/tests.rs`) carries no
+   `#[cfg(test)]` inside it — the attribute is on the `mod` that includes it — so
+   it counted as **6005 lines of production code**. Fixed by excluding `tests.rs`
+   and `tests/` directories.
+2. Function size was "distance to the next `fn`", which charges intervening
+   `struct`/`enum`/`const` definitions to the preceding function. It reported
+   `health_check_monitored` (really **3** lines) as **434**, and a nested 19-line
+   `record_plugin` as **212**. Fixed by brace-matching the body.
+3. That brace matcher then treated Rust **lifetimes** (`'static`, `'a`) as char
+   literals, swallowing everything to the next `'` and corrupting the brace count
+   — `run` came out as 940 lines instead of 1642, and `frp-core`'s `debug_name`
+   appeared as a 1042-line function.
+4. An off-by-one: the end index is *just past* the closing brace, so an inclusive
+   "is this line inside a test module" test dropped any function whose body ends
+   on the line before a test module — which silently hid `authenticate`, the 4th
+   largest function in the repository, from the ranking entirely.
+
+None of these four would have been noticed without an independent read. That is
+the argument for treating this document's tables as *generated*, and for
+re-running the script before acting on them.
 
 ---
 
@@ -94,14 +114,14 @@ XTCP/STCP/SUDP/vnet data plane.
 
 | Function | Total | Comments | **Code** | Code % |
 |---|---:|---:|---:|---:|
-| `run_message_loop` (`service.rs`) | 1116 | 401 | **697** | 62% |
-| `handle_new_proxy` (`proxy_ops.rs`) | 779 | 211 | **546** | 70% |
-| `run_visitor_listener` (`visitor.rs`) | 650 | 124 | **502** | 77% |
-| `register_proxies` (`service.rs`) | 607 | 205 | **394** | 65% |
-| `reload_from_sources` (`service.rs`) | 516 | 139 | **351** | 68% |
-| `run_udp_work_conn` (`bridge.rs`) | 421 | 130 | **291** | 69% |
-| `poll_read` (`bridge.rs`) | 664 | **419** | **236** | **36%** |
-| `handle_http1_request` (`vhost.rs`) | 505 | **306** | **189** | **37%** |
+| `run_message_loop` (`service.rs`) | 1109 | 412 | **697** | 63% |
+| `handle_new_proxy` (`proxy_ops.rs`) | 771 | 225 | **546** | 71% |
+| `run_visitor_listener` (`visitor.rs`) | 631 | 129 | **502** | 80% |
+| `register_proxies` (`service.rs`) | 594 | 200 | **394** | 66% |
+| `reload_from_sources` (`service.rs`) | 503 | 153 | **350** | 70% |
+| `run_udp_work_conn` (`control/bridge.rs`) | 415 | 124 | **291** | 70% |
+| `poll_read` (`control/bridge.rs`) | 639 | **411** | **228** | **36%** |
+| `handle_http1_request` (`vhost.rs`) | 469 | **291** | **178** | **38%** |
 
 The heavy commentary is deliberate and valuable — it carries the Go-parity
 reasoning that makes this code reviewable. **It is not the problem.** But it does
@@ -283,37 +303,84 @@ and KCP rows would catch a listener that stops starting), and the `health` CI jo
 
 ### P2 — `frp-client/src/service.rs` (4930 production lines, 34 production fns)
 
-The crate already has a modular intent (`health.rs` 1530, `work_conn.rs` 2910,
-`nat_hole.rs` 1060, `admin.rs` 1046, `reload.rs` 421) — `service.rs` has become
-the orchestration dumping ground. The function names alone expose five seams:
+**The layout question is settled, and empirically.** A scratch crate was used to
+verify the module rules rather than assume them:
 
-| Proposed module | Functions to move (line) | Notes |
-|---|---|---|
-| `service/health.rs` | `health_check_monitored` (157), `spawn_health_checks` (4124), `healthy_resets_error_count` (4837) | `health.rs` already owns the probe mechanics; this is the monitoring/verdict half. Same responsibility, currently in two files. |
-| `service/reload.rs` | `reload_from_sources` (4321), `request_reload` (1133), `try_reload` (4307), `close_wire_name_for_reload` (755), `filter_active_proxies` (4873), `filter_active_visitors` (4903) | `reload.rs` today holds only the snapshot types; this moves the logic next to them. |
-| `service/registration.rs` | `register_proxies` (1798), `reg_frame_header_read` (591), `reg_frame_payload_read` (674) | Self-contained: frame-by-frame registration with its own retry/backoff. |
-| `service/session.rs` | `run` (1166), `connect_and_login` (1553), `spawn_session_tasks` (2405), `teardown_session` (3868), `shutdown_visitor_tasks` (728), `cancel_detached_tasks` (4224), `spawn_admin_server` (4250), `record_plugin` (921) | The per-connection lifecycle. |
-| *(stays)* | `run_message_loop` (2752) | The control-plane state machine. See below. |
+- a **child** module (`frp-client/src/service/x.rs` declared as `mod x;` in
+  `service.rs`) **can** read the parent's private fields and call its private
+  methods;
+- a **flat sibling** (a new top-level `service_registration.rs`) **cannot** —
+  `E0603` — and would force ~60 `SessionCtx` fields plus ~20 `Service` fields to
+  become `pub(crate)`.
 
-**`run_message_loop` is the real target and it is a `select!` loop, not a pile of
-unrelated code.** Its leading ~150 lines are comments documenting the persisted
-read future (audit S3) and the heartbeat-watchdog timer. Recommended treatment is
-**not** to move it but to extract its arms' bodies into named methods on a small
-`SessionCtx`-carrying type, one arm per PR, leaving the `select!` skeleton in
-place. Ordering and fairness (`no biased;`) are load-bearing here and are pinned
-by a regression test — do not restructure the `select!` itself.
+So: use a `frp-client/src/service/` **directory of children** and **keep
+`SessionCtx` and `Service` in `service.rs`**. This mirrors what `frp-server`
+already does (`service.rs` + `control/*.rs` re-opening `impl Service`; see
+`control/proxy_ops.rs:3565`) — except the server's `AppState` fields happen to be
+`pub` already, so that precedent does not cover the privacy point.
 
-*Interface exposed:* each seam needs the fields its functions read from `Service`
-and the session context. Expect to pass a `&mut` session struct rather than many
-individual fields.
+Corrected spans (the earlier table in this document used distance-to-next-`fn`,
+which inflated several entries): `run_message_loop` 1109, `register_proxies` 594,
+`reload_from_sources` 503, `run` 373, `spawn_session_tasks` 316,
+`connect_and_login` 231 — and two entries were **badly** wrong:
+`health_check_monitored` is **3** lines (not 434) and `record_plugin` is a nested
+**19**-line fn (not 212).
 
-*Risk:* **medium-high** — 84 cfg gates, task-spawn ordering, shutdown/cancellation
-semantics. Mitigation: pure moves only, one seam per PR, tiny/micro builds checked.
+| Order | New module | Moves | Risk |
+|---|---|---|---|
+| **S0** | `service/tests.rs` | the inline test module (4930–6381, 1452 LOC) + the two test-only imports that become dead in the parent (`tokio::sync::watch`, `crate::vnet::{register_vnet_tun, vnet_tun_cidr}`) | **very low** — no production line changes, but the imports must move or clippy's `unused_imports` fires |
+| S1 | `service/reload_apply.rs` | `request_reload`, `close_wire_name_for_reload`, `try_reload`, `reload_from_sources` (4321–4823), `filter_active_proxies`, `filter_active_visitors` (~570 LOC) | low — **zero `tokio::spawn`, no `select!`** in range; only a phase-A/commit ordering to preserve. Needs `pub(crate) use reload_apply::{filter_active_proxies, ...}` — mandatory, `store.rs:592` spells the path |
+| S2 | `service/registration.rs` | the registration frame plumbing (511–693) + `register_proxies` (1798–2391, ~590 LOC) | low–medium — the response loop is a cancellation-sensitive state machine and the `Arc<Mutex<IoStream>>` → `Arc::try_unwrap` handoff is subtle, but a verbatim move changes neither |
+| S3 | `service/message_loop.rs` | `run_message_loop` (2752–3860) + `SessionChannels`, `LoopExit`, `StunResult`, the retry statics (~1180 LOC) | medium — pure relocation; 4 vnet gates, 3 spawns and 5 `expect` sites must land unchanged |
+| **S3b** | *(same file)* | **the arm bodies** of `run_message_loop`, one per PR — see below | medium each |
+| S4 | `service/session.rs` | `run` (1166–1538), `connect_and_login`, `spawn_session_tasks`, `teardown_session`, `request_stop`, `shutdown_visitor_tasks`, `cancel_detached_tasks`, `spawn_admin_server` (~1500 LOC) | medium — load-bearing spawn order and a 5-step teardown |
+| S5 | `service/health.rs` | `health_check_monitored` (3 lines), `spawn_health_checks`, `healthy_resets_error_count` (~100 LOC) | low — **lowest value; may be skipped** |
 
-*Validation:* `cargo check --no-default-features --features tiny|micro` for every
-seam; `cargo test --workspace --all-features`; `scripts/compat-test.sh`;
-`scripts/protocol-matrix.sh`; and specifically the client integration tests that
-exercise reload (`frp-client/tests/`) since reload is a seam here.
+**S3b is the real answer for the repository's 2nd-largest function.**
+`run_message_loop` is one `select!` state machine whose **loop skeleton must stay**
+(persisted partial-frame read, persistent heartbeat timer, deliberately no
+`biased;` — all pinned by `partial_frame_survives_competing_ping_tick.rs`). But its
+**arm bodies are separable**, and this was verified rather than assumed:
+`tokio::select!` ends the polling scope before running handlers (tokio 1.53.1
+`src/macros/select.rs:638–749`, "Create a scope to separate polling from handling
+the output"), so a handler may take `&mut SessionCtx`; and each inbound arm is
+terminal, so its `continue` becomes a plain `return`.
+
+| Arm (lines) | LOC | Coupling to pass |
+|---|---:|---|
+| `CloseProxy` 2956–3071 | 116 | `&SessionCtx`, `proxy_info_map`, `health_cancels`, `p2p_bridge_tokens`, vnet fields, `plugin_handles`, writer |
+| proxy retry tick 3422–3551 | 130 | `&mut SessionCtx` (`waitstart_seen`), `&mut last_start_err`, `proxies`, `cfg`, `proxy_info_map`, writer |
+| ping tick 3335–3420 | 86 | `&mut SessionCtx` (ping fields, scopes, `v2`), `oidc_client`, `auth_cfg`, writer |
+| XTCP notify → STUN 3631–3733 | 103 | `xtcp_sockets`, `stun_result_tx`, `nat_hole_stun_server`; spawns |
+| health event 3553–3613 | 61 | `p2p_bridge_tokens`, `proxy_info_map`, `health_proxy_configs`, `v2`, `cfg_user`, writer |
+| `NewProxyResp` 3142–3183 | 42 | `proxy_info_map` + `&mut last_start_err` |
+| `NatHoleResp` 3103–3141 | 39 | `&mut pending_xtcp`, `xtcp_sockets`, `&mut visitor_pending`, `p2p_bridge_tokens`, writer |
+| visitor request 3792–3826 | 35 | `&mut visitor_pending`, `xtcp_cleanup_tx`, `v2`, writer; spawns |
+| STUN result 3737–3767 | 31 | `&mut pending_xtcp`, `xtcp_sockets`, `stun_result_rx`, writer; spawns |
+| `NatHoleClient` 3081–3102 | 22 | `punch_proxy_still_live`, `p2p_bridge_tokens`, `session_alive`, writer |
+| vnet trio 3184–3324 | 141 | `cfg`, `vnet_controller`, `vnet_tun_names`, `vnet_peer_routes`, `vnet_tun_tx`; 3 gates |
+| `xtcp_cleanup` 3775–3787 | 13 | `&mut pending_xtcp`, `&mut visitor_pending`, `xtcp_cleanup_rx` |
+
+Order: `CloseProxy` → retry → ping → STUN spawn → health → `NewProxyResp` →
+`NatHoleResp` → visitor → STUN result → `NatHoleClient` → vnet trio. Leave the
+3–11-line arms inline. **Handlers must be `.await`ed inline, never spawned** — the
+retry arm's own comment records that "both locks' writers run only in this
+message-loop task", which holds only while that is true.
+
+**Do not split** the `select!` skeleton or its two persisted futures; the
+registration response loop inside `register_proxies` (1960–2355, one
+cancellation-sensitive state machine); `ControlWriter` (60 lines, imported by
+`vnet.rs` and `nat_hole.rs`); the nested `record_plugin`; `with_unsafe_features`
+(a 363-line linear constructor and the densest cfg area, 16 gates). Do not create
+a `util.rs` grab-bag — move each helper with its primary caller.
+
+Hazards beyond the layout rule: three literal `SessionCtx` constructions in the
+tests (~150 lines) mean the struct must stay put; `ctx.control_rx.is_none()` doubles
+as the "writer task active" probe (do not reorder the take); `spawn_session_tasks`
+and `teardown_session` have load-bearing spawn/teardown order; **84
+`cfg(feature)` sites** mean `cargo check -p frp-client --no-default-features
+--features tiny|micro` is mandatory per seam; and the error/`expect` text is
+contract (27 `expect` sites listed in the analysis). No `unsafe` in the file.
 
 ### P3 — `frp-client/src/visitor.rs` (3685 production lines, 36 production fns, 165 test lines)
 
@@ -676,10 +743,12 @@ Every seam is a **pure move**. The bar:
 
 1. **Is the `pub` surface deliberately minimal, or accidental?** Seams can stay
    crate-private, but only if nothing outside needs them today.
-2. **`service.rs` seams: new `service/` subdirectory, or extend the existing flat
-   modules** (`health.rs`, `reload.rs`)? Both work; the flat layout is the current
-   convention and keeps `frp-client/src/*.rs` uniform, but a `service/` directory
-   would signal that these are parts of one orchestrator.
+2. ~~`service.rs` seams: `service/` subdirectory, or flat sibling modules?~~
+   **Settled by evidence, not preference.** Only a `service/` **child** module can
+   reach the parent's private fields; a flat sibling gets `E0603` and would force
+   ~80 field-visibility widenings. So: `frp-client/src/service/` children, with
+   `SessionCtx`/`Service` staying in `service.rs`. (Verified in a scratch crate —
+   see P2.)
 3. **`visitor.rs` has almost no tests (165 lines for 3685 production lines).** Is
    adding coverage a prerequisite for splitting it, or is a pure move acceptable?
    I lean towards: pure move now, coverage as its own item.

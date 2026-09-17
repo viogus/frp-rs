@@ -73,6 +73,75 @@ def is_test(idx, blocks):
     return any(a <= idx <= b for a, b in blocks)
 
 
+def fn_body_end(lines, start):
+    """Index just past the `}` that closes the fn starting at `start`.
+
+    Measuring a function as "distance to the next `fn`" is wrong: type and const
+    definitions between two functions get charged to the first one. That reported
+    `health_check_monitored` (really 3 lines) as 434, and a nested 19-line
+    `record_plugin` as 212. Brace-matching the body is the honest measure.
+
+    Skips `//`, `/* */`, and string/char literals so braces inside them do not
+    count. Returns None if the body never closes.
+    """
+    depth, seen_open = 0, False
+    i, n = start, len(lines)
+    in_block_comment = False
+    while i < n:
+        line = lines[i]
+        j = 0
+        while j < len(line):
+            c = line[j]
+            if in_block_comment:
+                if c == '*' and j + 1 < len(line) and line[j + 1] == '/':
+                    in_block_comment = False
+                    j += 2
+                    continue
+                j += 1
+                continue
+            if c == '/' and j + 1 < len(line) and line[j + 1] == '/':
+                break                      # rest of line is a comment
+            if c == '/' and j + 1 < len(line) and line[j + 1] == '*':
+                in_block_comment = True
+                j += 2
+                continue
+            if c == '"':
+                j += 1
+                while j < len(line):
+                    if line[j] == '\\':
+                        j += 2
+                        continue
+                    if line[j] == '"':
+                        break
+                    j += 1
+                j += 1
+                continue
+            if c == "'":
+                # Rust has lifetimes (`'static`, `'a`) as well as char literals.
+                # Treating every `'` as a char literal swallows everything up to
+                # the next `'`, which corrupts brace counting — it made
+                # `frp-server/src/service.rs::run` look like 940 lines, and
+                # `frp-core/src/transport/mod.rs`'s `debug_name` like 1042.
+                if j + 2 < len(line) and line[j + 1] == '\\':
+                    j += 3                      # '\n'-style escape
+                    continue
+                if j + 2 < len(line) and line[j + 2] == "'":
+                    j += 3                      # 'x'-style char literal
+                    continue
+                j += 1                          # lifetime — ordinary code
+                continue
+            if c == '{':
+                depth += 1
+                seen_open = True
+            elif c == '}':
+                depth -= 1
+                if seen_open and depth == 0:
+                    return i + 1
+            j += 1
+        i += 1
+    return None
+
+
 files = []
 for root in ROOTS:
     for dirpath, _dirs, names in os.walk(root):
@@ -102,13 +171,14 @@ for path in sorted(files):
 
     starts = [(m.group(2), i) for i in prod_idx
               for m in [FN.match(lines[i])] if m]
-    tstarts = [a for a, _ in blocks]
-    for k, (name, st) in enumerate(starts):
-        end = starts[k + 1][1] if k + 1 < len(starts) else len(lines)
-        # clamp at the next inline-test module, else the last fn swallows it
-        nxt = [t for t in tstarts if t > st]
-        if nxt:
-            end = min(end, nxt[0])
+    for name, st in starts:
+        end = fn_body_end(lines, st)          # brace-matched, see below
+        # Test the body's LAST line, not `end`: `end` is the index just past the
+        # closing brace, so when a `#[cfg(test)] mod` starts on the very next
+        # line an inclusive test on `end` silently drops the function. That hid
+        # `login.rs::authenticate` (510 code lines, the 4th largest in the repo).
+        if end is None or is_test(end - 1, blocks):
+            continue
         seg = lines[st:end]
         code = sum(1 for l in seg if l.strip() and not l.strip().startswith('//'))
         fns.append((code, end - st, name, path, st + 1))
