@@ -187,14 +187,25 @@ nothing about whether the described behaviour still holds.
 
 ## P2 — structural
 
-- [ ] **Very large source files.**
-  Evidence: `frp-server/src/control/proxy_ops.rs` 8043 lines,
-  `frp-client/src/service.rs` 6381, `frp-server/src/vhost.rs` 6311.
-  These are the files most likely to hide an ordering bug — the project's own
-  history shows ordering/lifecycle defects concentrated there (round 8 auth-bypass,
-  round 10 TOCTOU, round 14 half-frame loss).
-  **Done-when:** at least one of them is split along a seam with no behaviour change
-  and the compat + protocol-matrix gates stay green.
+- [ ] **Very large *functions* (not files).** — **[plan written](docs/refactor-large-modules.md)**
+  Evidence: the original item ranked files by raw `wc -l`, which was wrong twice
+  over. Measured properly (`scripts/large-functions.sh`, production code only):
+  30–55% of the "large" files are inline tests and 36–77% of the "giant" functions
+  are comments. By production lines the worst file is `frp-client/src/service.rs`
+  (4930), not `control/proxy_ops.rs` (3612, of which 4432 of its 8044 raw lines are
+  tests). And **file size hides the real problem**: the largest production function
+  in the repository is `run` in `frp-server/src/service.rs` — **1291 code lines**,
+  in a file that ranks only 11th by size. Churn agrees: `frp-client/src/service.rs`
+  is #1 for commits touching it (53/400) and #1 for touches in `fix`/`audit`
+  commits (230).
+  **Done-when:** one seam extracted per PR, each a pure move with the diff visibly
+  mechanical. Recommended first: `frp-server/src/service.rs::run`, a linear
+  startup sequence of ~10 independent "if configured, start this listener" blocks
+  — the lowest-risk large extraction available, and the connection-handling half
+  of the same file was already split into `frp-server/src/handlers/`, so it
+  finishes an existing job. Then `frp-client/src/service.rs` (5 seams). Full
+  ranking, block inventory, validation bar and hazards:
+  [`docs/refactor-large-modules.md`](docs/refactor-large-modules.md).
 
 - [x] **Three vendored crates are a standing maintenance liability.**
   Evidence: `vendor/rustls` (TLS, patched), `vendor/yamux` (5 patches),
