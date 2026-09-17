@@ -14,21 +14,20 @@ Topic map — this guide deliberately does **not** restate the others:
 | Config / proxies / plugins / deployment references | [documentation index](README.md) |
 | Historical design docs and audits | [archive/](archive/README.md) |
 
+If this guide states how the code is structured, it must point at the relevant
+[architecture.md](architecture.md) section or carry a verified `file:line` (and
+the symbol name). The process sections below — build, debug, test, release,
+dependency policy — are this document's own domain and need no citation.
+
 ## 1. Workspace at a glance
 
 Six crates in a layered graph; dependencies flow **upward** (binaries → logic
-crates → `frp-core`, which has no internal workspace dependencies):
-
-```
-frps ──► frp-server ──► frp-core        frpc ──► frp-client ──► frp-core
-             │                                              │
-             └──► frp-vnet ─────────────────────────────────►┘
-```
-
-`frp-server` / `frp-client` hold the protocol logic but no `main()`; the
-binaries live in `frps/` and `frpc/`. Full crate-by-crate responsibilities and
-the annotated module tree: [architecture.md § Overview](architecture.md#overview)
-and [§ Project Structure](architecture.md#project-structure).
+crates → `frp-core`, which has no internal workspace dependencies). The graph
+and the crate-by-crate responsibilities are canonical in
+[architecture.md § Overview](architecture.md#overview): `frp-server` /
+`frp-client` hold the protocol logic but no `main()`, and the binaries live in
+`frps/` and `frpc/`. The annotated module tree is
+[§ Project Structure](architecture.md#project-structure).
 
 ## 2. Adding a New Proxy Type
 
@@ -36,25 +35,47 @@ This section walks through adding a new proxy type called `myproxy`:
 
 ### Step 1: Config Parsing (if needed)
 
-If the new proxy type requires new config fields, add them to the proxy config struct in `frp-core/src/config/`. Existing proxy config fields are shared across all proxy types in `ProxyConfig` -- if your proxy type reuses those fields, no config changes are needed.
+If the new proxy type requires new config fields, add them to `ProxyConfig`
+(`frp-core/src/config/client.rs:585`, in `frp-core/src/config/`). Existing proxy
+config fields are shared across all proxy types in `ProxyConfig` -- if your proxy
+type reuses those fields, no config changes are needed.
 
 ### Step 2: Register in ProxyManager
 
-In `frp-server/src/control/proxy_ops.rs`, the `handle_new_proxy` function registers proxies in `ProxyManager`. Most proxy types reuse the existing registration logic. If your proxy type needs special registration:
+`handle_new_proxy` (`frp-server/src/control/proxy_ops.rs:1849`) is the NewProxy
+entry point and delegates to `register_proxy_entry` (`proxy_ops.rs:794`), which
+inserts into `ProxyManager` (`frp-server/src/proxy.rs:116`); most proxy types
+reuse that existing registration logic. If your proxy type needs special
+registration:
 
-- **Port allocation**: the function already handles port allocation via `allocate_port_multi()`. SUDP proxies get special shared-port handling.
-- **sk_index**: STCP/XTCP proxies register in `sk_index` for secret-key routing. Add your proxy type here if it uses sk-based routing.
-- **VHost routing**: HTTP/HTTPS proxies register in `VhostManager`. Add your proxy type here if it uses domain-based routing.
-- **TcpMux routing**: TCPMux proxies register in `TcpMuxManager`.
+- **Port allocation**: `register_proxy_entry` allocates via
+  `allocate_port_multi()` (`frp-server/src/proxy.rs:821`). SUDP proxies get
+  special shared-port handling.
+- **sk_index**: STCP/XTCP/SUDP proxies register in `sk_index`
+  (`register_sk_index`, `proxy_ops.rs:493`) for secret-key routing. Add your
+  proxy type to that predicate if it uses sk-based routing.
+- **VHost routing**: HTTP/HTTPS proxies register in `VhostManager`
+  (`frp-server/src/vhost.rs:265`). Add your proxy type here if it uses
+  domain-based routing.
+- **TcpMux routing**: TCPMux proxies register in `TcpMuxManager`
+  (`frp-server/src/tcpmux.rs:34`).
 
 ### Step 3: Add Listener Setup
 
-In `frp-server/src/control/proxy_ops.rs`, after proxy registration, the function spawns a listener task. The existing `listen_and_proxy()` helper starts TCP listeners for tcp/http/https/stcp/tcpmux proxy types. UDP proxies use `listen_and_proxy_udp()`.
+Listener setup/invocation is `setup_proxy_listeners`
+(`frp-server/src/control/proxy_ops.rs:1456`). Its branches: `udp`/`sudp` bind an
+`Arc<UdpSocket>` directly and request work connections with
+`InternalMsg::UdpNeedsWorkConn`; `stcp`/`xtcp`/`tcpmux` start **no** per-proxy
+listener (NAT hole punch and shared listeners respectively); `tcp` binds a
+per-proxy listener and spawns `listen_and_proxy`
+(`frp-server/src/control/proxy_ops.rs:2781`) as its accept loop. HTTP/HTTPS use
+the shared VHost listeners.
 
 For a new proxy type that needs a different listener pattern:
-1. Add a branch in the proxy type match after registration
+1. Add a branch in `setup_proxy_listeners` for the proxy type
 2. Spawn a `tokio::spawn` task that binds a `TcpListener` on the allocated port
-3. On accept, send `InternalMsg::ProxyUserConn` with the user connection and pre-read bytes
+3. On accept, send `InternalMsg::ProxyUserConn` (`frp-server/src/state.rs:344`)
+   with the user connection and pre-read bytes
 
 Example pattern (simplified from existing code):
 
@@ -79,11 +100,20 @@ tokio::spawn(async move {
 
 ### Step 4: Implement Bridging Logic
 
-The bridging is handled automatically by the control handler's `InternalMsg::ProxyUserConn` path -- it pops a work connection from the pool, sends `StartWorkConn`, and bridges. No special bridging code is needed for basic TCP-like proxy types.
+The bridging is handled automatically by the control handler's
+`InternalMsg::ProxyUserConn` path -- it pops a work connection from the pool,
+sends `StartWorkConn`, and bridges. No special bridging code is needed for basic
+TCP-like proxy types.
 
-If your proxy type needs special bridging (e.g., HTTP host header rewriting, protocol-specific framing), add the logic in `frp-server/src/control/bridge.rs`. The existing `assign_work_to_proxy` function handles plain vs encrypted bridging and pre-read byte forwarding.
+If your proxy type needs special bridging (e.g., HTTP host header rewriting,
+protocol-specific framing), add the logic in `frp-server/src/control/bridge.rs`.
+`assign_work_to_proxy` (`bridge.rs:3117`) prepares the assignment and
+`run_work_bridge` (`bridge.rs:2430`) chooses plain vs encrypted/compressed
+bridging and forwards the pre-read bytes.
 
-For the client side, proxy type handling is in `frp-client/src/service.rs` and `frp-client/src/work_conn.rs` -- the client reads `StartWorkConn` to know which local service to connect to.
+For the client side, proxy type handling is in `frp-client/src/service.rs` and
+`frp-client/src/work_conn.rs` (proxy registration; `work_conn.rs` reads
+`StartWorkConn` to know which local service to connect to).
 
 ## 3. Building and Feature Flags
 

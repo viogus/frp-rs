@@ -247,12 +247,39 @@ nothing about whether the described behaviour still holds.
   unchanged code cannot distinguish a regression from noise, and rerunning until
   green is how a real failure eventually gets merged.
 
-- [ ] **`docs/developing.md` and `docs/architecture.md` can still drift.**
+- [x] **`docs/developing.md` and `docs/architecture.md` can still drift.**
   Evidence: after the merge they no longer duplicate sections, but both describe
   transports and encryption at some level, with nothing linking a claim to its
   source of truth.
   **Done-when:** `developing.md` contains no statement a reader could act on that
   is not either in `architecture.md` or referenced `file:line`.
+  Done: §1/§2 are the only sections that make structural claims; §3-§6 and the
+  dependency policy are process/tooling and were left alone. Measured: **9
+  in-scope code-location statements** — §1's workspace/dependency description;
+  §2's config struct, NewProxy entry point, registration-into-ProxyManager,
+  port allocation, sk_index/vhost/tcpmux routing, listener setup,
+  `InternalMsg::ProxyUserConn` construction, and bridging dispatch.
+  **1 became a pointer** — §1's six-crate graph and ASCII diagram now defer to
+  [architecture.md § Overview](docs/architecture.md#overview), which already
+  carried the authoritative version. The other **8 carry 13 `file:line` anchors
+  naming the symbol**, each verified by opening that exact line in this worktree
+  (`ProxyConfig` at `frp-core/src/config/client.rs:585`; `handle_new_proxy`
+  `proxy_ops.rs:1849`; `register_proxy_entry` `proxy_ops.rs:794`;
+  `allocate_port_multi` `proxy.rs:821`; `register_sk_index` `proxy_ops.rs:493`;
+  `setup_proxy_listeners` `proxy_ops.rs:1456`; `listen_and_proxy`
+  `proxy_ops.rs:2781`; `ProxyManager` `proxy.rs:116`; `VhostManager`
+  `vhost.rs:265`; `TcpMuxManager` `tcpmux.rs:34`; `InternalMsg::ProxyUserConn`
+  `state.rs:344`; `assign_work_to_proxy` `bridge.rs:3117`;
+  `run_work_bridge` `bridge.rs:2430`). **Two live errors were found and fixed en
+  route**: `listen_and_proxy()` does not start listeners for
+  http/https/stcp/tcpmux — only `tcp` binds a per-proxy listener — and
+  `listen_and_proxy_udp()` does not exist anywhere in the tree (UDP/SUDP bind an
+  `Arc<UdpSocket>` inside `setup_proxy_listeners`). A short rule near the top of
+  `developing.md` now states the invariant for future editors. Residue, stated
+  explicitly: §3's feature-flag/binary-tier claims and §5's "86 run_test
+  scenarios" figure are hand-maintained numbers that can go stale, but they are
+  process facts owned by the separate hand-maintained-numbers item, not
+  architecture drift; nothing outside §1/§2 was changed.
 
 - [x] **A source comment pointed at a path that no longer held code.**
   Evidence: `frp-core/src/kcp/protocol.rs` opened with "the frp-rs in-tree
