@@ -197,11 +197,28 @@ nothing about whether the described behaviour still holds.
   a health number. A gate that fails ~2/3 of the time cannot be used to distinguish
   a regression from noise, and the habit of rerunning until green is how a real
   failure eventually gets merged.
+
+  **Recurrence (2026-09-17, PR #338 — a `TODO.md`-only diff, so nothing compiled
+  could have changed):** `compat` failed not in the compat scenarios but in its
+  `Run Rust unit tests` step — **851 passed, 1 failed**:
+  `auth::tests::test_resolve_dynamic_token_exec_failure_redacts_stderr` panicked at
+  `frp-core/src/auth.rs:3561` with
+  `Failed to exec dynamic token command: Text file busy (os error 26)`. That is
+  **ETXTBSY**: `execve` refuses a file that is open for writing in some process.
+  The test writes a shell script to `$TMPDIR/frp-token-script-{pid}.sh`, chmods it,
+  execs it and removes it (`auth.rs:3530-3570`); it asserts the error retains the
+  *exit-status* class, and on this run got a *spawn* error instead. The name is
+  keyed only on the process id, and the exact mechanism (pid reuse, a shared
+  `$TMPDIR` on the runner, or fs behaviour under CI) is **not** confirmed — this
+  records the symptom, not a diagnosis.
   **Done-when:** the flaky scenarios are identified by running the failing subset
   in a loop (`compat-test.sh --test <display-name>` makes this cheap), the cause is
   fixed or the scenario is documented as timing-sensitive with a bounded retry, and
-  the reason is recorded. Until then, `docs/developing.md` tells readers to re-run
-  a red compat result before believing it, and not to treat green as absolute.
+  the reason is recorded. For the ETXTBSY case specifically: the exec-token test
+  gets a name that is unique per invocation and is made robust to a busy script
+  file, keeping the exit-status assertion rather than loosening it. Until then,
+  `docs/developing.md` tells readers to re-run a red compat result before believing
+  it, and not to treat green as absolute.
 
 - [ ] **`docs/developing.md` and `docs/architecture.md` can still drift.**
   Evidence: after the merge they no longer duplicate sections, but both describe
