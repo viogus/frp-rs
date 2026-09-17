@@ -302,8 +302,8 @@ All 10 tests use raw V1 TCP protocol messages against in-process frps — no act
 | `frp-server/tests/xtcp_hole_punch.rs` | Server message routing tests |
 | `frp-server/tests/xtcp_fallback.rs` | Error/timeout server tests |
 | `frp-server/tests/xtcp_edge.rs` | Concurrency/encryption server tests |
-| `docs/superpowers/specs/2026-06-28-xtcp-testing-design.md` | Design spec |
-| `docs/superpowers/plans/2026-06-28-xtcp-testing.md` | Implementation plan |
+| `docs/archive/specs/2026-06-28-xtcp-testing-design.md` | Design spec |
+| `docs/archive/plans/2026-06-28-xtcp-testing.md` | Implementation plan |
 
 ## Troubleshooting
 

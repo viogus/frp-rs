@@ -30,20 +30,26 @@ read the [main README](../README.md) first, then pick from the tables below.
 | [Audit reports](audit/) | Dated point-in-time audit reports |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | User-facing release notes |
 
-## `superpowers/` — archived working artifacts
+## `archive/` — archived working artifacts
 
-> **Not current documentation.** `docs/superpowers/{plans,specs,notes,audit}/`
-> holds ~90 dated design documents and audit outputs (≈1.9 MB) captured *while*
-> the corresponding work was in flight. They are kept as a historical record and
-> for the raw evidence behind decisions, but they describe the state of the tree
-> at their date, not today.
+> **Not current documentation.** `docs/archive/{plans,specs,notes,audit}/` holds
+> 81 dated design documents and audit outputs (1.7 MB) captured *while* the
+> corresponding work was in flight. They are kept as a historical record and for
+> the raw evidence behind decisions, but they describe the state of the tree at
+> their date, not today.
+>
+> This directory was named `docs/superpowers/` until it was moved to
+> `docs/archive/` so its status is obvious from the path. Paths *inside* these
+> documents still say `docs/superpowers/…` — they are deliberately left as
+> written, since they are historical artifacts. See
+> [`archive/README.md`](archive/README.md).
 
 Read them only when you need the *reasoning* behind a past decision — for
 example:
 
-- [`superpowers/notes/2026-08-04-mimalloc-throughput-ab.md`](superpowers/notes/2026-08-04-mimalloc-throughput-ab.md) — why `mimalloc` stays opt-in, and §6 on the rustls SNI patch
-- [`superpowers/notes/2026-08-04-xtcp-quic-sni-compat.md`](superpowers/notes/2026-08-04-xtcp-quic-sni-compat.md) — the XTCP QUIC SNI compatibility plan
-- [`superpowers/notes/2026-08-size-optimization-analysis.md`](superpowers/notes/2026-08-size-optimization-analysis.md) — binary-size tier analysis
+- [`archive/notes/2026-08-04-mimalloc-throughput-ab.md`](archive/notes/2026-08-04-mimalloc-throughput-ab.md) — why `mimalloc` stays opt-in, and §6 on the rustls SNI patch
+- [`archive/notes/2026-08-04-xtcp-quic-sni-compat.md`](archive/notes/2026-08-04-xtcp-quic-sni-compat.md) — the XTCP QUIC SNI compatibility plan
+- [`archive/notes/2026-08-size-optimization-analysis.md`](archive/notes/2026-08-size-optimization-analysis.md) — binary-size tier analysis
 
 ## Conventions for these docs
 

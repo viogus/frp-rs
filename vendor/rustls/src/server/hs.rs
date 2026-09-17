@@ -736,7 +736,7 @@ pub(super) fn process_client_hello<'m>(
             // (SNI is advisory for cert selection) and frp's XTCP QUIC runs
             // on self-signed certs with InsecureSkipVerify, so there is no
             // authentication regression. See
-            // docs/superpowers/notes/2026-08-04-mimalloc-throughput-ab.md §6.
+            // docs/archive/notes/2026-08-04-mimalloc-throughput-ab.md §6.
             None
         }
         None => None,

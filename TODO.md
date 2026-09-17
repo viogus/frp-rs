@@ -168,12 +168,12 @@ Closed known gaps (documented, architectural):
   copy (`vendor/rustls`, pinned 0.23.41) treats invalid SNI as no-SNI,
   equivalent to upstream 0.24 `invalid_sni_policy = IgnoreAll`. Go visitors
   with the default `protocol="quic"` now connect to Rust providers. See
-  `docs/superpowers/notes/2026-08-04-xtcp-quic-sni-compat.md` (incl.
+  `docs/archive/notes/2026-08-04-xtcp-quic-sni-compat.md` (incl.
   maintenance: drop `vendor/` + `[patch.crates-io]` when upgrading past
   rustls 0.23). Remaining validation gap: real-public-NAT e2e of the QUIC
   data plane is covered by the daily VPS `xtcp-compat.yml`, not locally.
   (See plan
-  `docs/superpowers/plans/2026-08-02-go-parity-all-fixes.md`.)
+  `docs/archive/plans/2026-08-02-go-parity-all-fixes.md`.)
 - VirtualNet isolation/routing reload — **implemented**: `RouteTable` is now
   partitioned per virtual net (same subnet may coexist in different vnets,
   lookups are vnet-scoped); removing/updating a vnet proxy cleans its OS routes
@@ -182,7 +182,7 @@ Closed known gaps (documented, architectural):
   drops `VnetPacket`s whose source run_id is not in the target route's virtual
   net; clients ignore advertisements for virtual nets they do not participate
   in. (See plan
-  `docs/superpowers/plans/2026-08-02-go-parity-all-fixes.md`.)
+  `docs/archive/plans/2026-08-02-go-parity-all-fixes.md`.)
 
 Remaining known gaps (verified against code 2026-08):
 
@@ -195,5 +195,5 @@ Remaining known gaps (verified against code 2026-08):
 - OIDC `authorization_code` grant — `OidcClient` implements the
   `client_credentials` grant only (`frp-core/src/auth.rs`);
   `authorization_code` remains a design TODO
-  (`docs/superpowers/specs/2026-06-26-oidc-auth-design.md`). Not a Go-compat
+  (`docs/archive/specs/2026-06-26-oidc-auth-design.md`). Not a Go-compat
   gap — Go frp v0.70.1 has client_credentials + tokenSource only.

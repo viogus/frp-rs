@@ -27,7 +27,7 @@ as if the client had sent no `server_name` extension at all.
 SNI. An `ip:port` string is not a legal DNS `host_name`, so a stock rustls
 server fails the handshake and Go↔Rust XTCP QUIC interop is impossible. See
 [`docs/go-frp-compat-audit.md`](../../docs/go-frp-compat-audit.md) and
-[`docs/superpowers/notes/2026-08-04-xtcp-quic-sni-compat.md`](../../docs/superpowers/notes/2026-08-04-xtcp-quic-sni-compat.md)
+[`docs/archive/notes/2026-08-04-xtcp-quic-sni-compat.md`](../../docs/archive/notes/2026-08-04-xtcp-quic-sni-compat.md)
 for the full plan and the compat matrix.
 
 **Security argument** (why this is not an auth regression):
