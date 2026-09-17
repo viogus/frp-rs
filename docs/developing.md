@@ -370,6 +370,47 @@ Proptest-based tests verify correctness under adversarial inputs:
 
 ## 6. Release Process
 
+### Pre-release checklist
+
+Run through this before tagging. Most of it is automated, but two items are not
+covered by any gate and are the ones that have actually been missed before.
+
+- [ ] **Version alignment** — `bash scripts/repo-health.sh` exits 0. This is a CI
+      gate (the `health` job), but check it locally first: it covers the 5 crates,
+      the `VERSION` constant, `scripts/download-frp-rs.sh` and the README.
+- [ ] **Gates green on `main`** — `cargo fmt --all -- --check`,
+      `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+      `cargo test --workspace --all-features`, `bash scripts/compat-test.sh`
+      against the matching Go frp release, `bash scripts/protocol-matrix.sh`, and
+      the daily XTCP VPS matrix.
+- [ ] **Notes written in the right place** — the user-facing summary in
+      [`CHANGELOG.md`](../CHANGELOG.md), the detailed round record in
+      [`docs/history/development-log.md`](history/development-log.md). Do not write
+      the same detail twice (see the [docs conventions](README.md#conventions-for-these-docs)).
+- [ ] **Security audit** —
+      `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071`
+      and `cargo deny check`.
+- [ ] **Vendored crates — the step no tool covers.** `[patch.crates-io]` pins
+      `rustls`, `yamux` and `russh`, so **`cargo update` will not pick up upstream
+      security releases for them**. Before every release:
+      - check <https://github.com/rustls/rustls/releases> for 0.23.x security
+        backports and re-vendor if needed (frp-rs patches TLS code — this is the
+        highest-risk item on this list);
+      - re-read each `vendor/*/README-FRP-RS.md` and confirm the patches still
+        match the code and the exit condition has not arrived;
+      - confirm the `health` job still reports a README for every vendored crate.
+      *Exit condition to watch:* `vendor/rustls` can be deleted as soon as the
+      workspace moves to rustls ≥ 0.24, which has `invalid_sni_policy` natively.
+      Nothing currently blocks that upgrade; it is tracked in
+      [`../TODO.md`](../TODO.md).
+      *Owner:* the sole maintainer — there is no second reviewer for this repo
+      (see the bus-factor item in the backlog), so this checklist line **is** the
+      control.
+- [ ] **All four size tiers build**, and record the sizes with the platform and
+      rustc version — the numbers in the README are meaningless without them.
+- [ ] **Release binaries are built with the declared profile.** CI overrides
+      LTO/opt-level for speed; CI artifact sizes do not reflect the release.
+
 ### Version Bumping
 
 **frp-rs 自身版本号严格对齐 Go frp 的发布号** (mandatory): the version

@@ -39,5 +39,13 @@ contents would falsify the record. Translate a path by replacing
 (`plans/`, `specs/`, `notes/`, `audit/`) is preserved exactly, so relative links
 between these files still resolve.
 
+That claim is **measured, not asserted**: `bash scripts/repo-health.sh` reports
+how many `docs/superpowers/…` references exist inside the archive and how many
+resolve under the new prefix. Currently **20 references, 19 resolvable**. The one
+exception is in `plans/2026-06-28-v2-protocol-implementation.md`, which points at
+`specs/2026-06-28-v2-protocol-design.md` — a design doc that was never written.
+It was already dangling before the rename, so it is left as written rather than
+rewritten to point at a different document.
+
 Links pointing *into* the archive from current docs were updated, so nothing in
 the live documentation is broken by the move.
