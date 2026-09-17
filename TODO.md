@@ -453,15 +453,31 @@ nothing about whether the described behaviour still holds.
   checklist line *is* the control. The rustls exit is now its own tracked item
   below.
 
-- [ ] **Upgrade to rustls ≥ 0.24 and delete `vendor/rustls`.**
+- [ ] **Upgrade to rustls ≥ 0.24 and delete `vendor/rustls` — blocked upstream,
+  no stable 0.24 exists.**
+  Re-checked on crates.io 2026-09-17 (`https://crates.io/api/v1/crates/rustls`):
+  `max_stable_version` = `0.23.45`, `newest_version` = `0.23.45`,
+  `max_version` = `0.24.0-dev.1`. The only 0.24 artifact is a **prerelease**
+  (`0.24.0-dev.1`, published 2026-07-23, `edition = "2024"`,
+  `rust_version = "1.85"`); `[patch.crates-io]` pins a path, so a prerelease is
+  not an option for the shipped TLS stack. The migration below is unchanged and
+  still correct — it just has no target release yet, so this item is not
+  actionable today and must not be closed.
   Evidence: the vendored tree exists only to treat an invalid TLS SNI as "no SNI"
   so Go frp's XTCP QUIC visitors interoperate (`ip:port` as SNI). rustls ≥ 0.24 has
   `invalid_sni_policy = IgnoreAll` natively, which is exactly this behaviour.
-  Until then, `[patch.crates-io]` means 0.23.x security releases must be tracked
-  by hand — the highest-risk item on the release checklist.
-  **Done-when:** the workspace is on rustls ≥ 0.24, the patch is expressed as
-  `ServerConfig::invalid_sni_policy`, `vendor/rustls` and its `[patch.crates-io]`
-  entry are deleted, and the XTCP QUIC compat scenarios still pass.
+  Interim risk retired: the 0.23.x line was brought current to **0.23.45** (from
+  0.23.43) — the fix for **GHSA-2mjx-qc3c-rqvc** (medium: TLS 1.3 handshake
+  messages accepted across encryption-level boundaries; affects 0.23.13–0.23.44
+  inclusive, so the previously vendored 0.23.43 *was* affected; same bug as Go
+  `GO-2026-4340`). That re-vendor re-applied the SNI patch and is covered by
+  `frp-core/tests/xtcp_quic_sni.rs`. The standing obligation is unchanged: while
+  the patch exists, 0.23.x security releases arrive only by hand.
+  **Done-when (trigger-gated):** *when `max_stable_version` ≥ `0.24`*, upgrade the
+  workspace to that stable release, express the patch as
+  `ServerConfig::invalid_sni_policy = InvalidSniPolicy::IgnoreAll` on the XTCP QUIC
+  server config, delete `vendor/rustls` and its `[patch.crates-io]` entry, and
+  confirm the XTCP QUIC compat scenarios still pass.
 
 - [x] **`unsafe` has no automated guard.**
   Evidence: 21 blocks + 3 `unsafe fn` + 2 `unsafe impl` in `frp-core`; 38 blocks in
