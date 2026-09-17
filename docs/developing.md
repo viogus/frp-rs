@@ -249,6 +249,19 @@ This is not hypothetical. The project's own history records it, repeatedly:
   `authentication_timeout = 0`, so replay protection — the thing under test —
   was never exercised at all.
 
+**A caveat about the hard evidence itself.** The compat gate is the strongest
+evidence available here, but it is not perfectly reliable *as a signal*: on
+2026-09-17 the `compat` CI job failed **2 of 3 consecutive runs on the same
+commit**, with **different** scenarios each time (`go-to-rust-quic:
+FAIL:CONNECT_TIMEOUT`, then `tcp-tls`/`tcp-tls-mux` zero throughput and `ws-plain`
+proxy port unreachable), and passed on the third. The diff under test could not
+have been responsible — its only compiled change was inside a
+`#[cfg(not(target_os = "linux"))]` block, absent from Linux CI entirely.
+
+So: a **red** compat run should be re-run before it is believed, and a **green**
+one is strong but not absolute. Flakiness in the one gate the project treats as
+authoritative is a defect in its own right — see [`../TODO.md`](../TODO.md).
+
 **The practical rules:**
 
 1. A green suite means "no *known* regression", not "compatible with Go frp".

@@ -166,6 +166,26 @@ nothing about whether the described behaviour still holds.
   `static_file.rs:1090` because `file` is only read in the `target_os="linux"`
   branch — fixed, `let _ = file;` in the non-Linux arm.)
 
+- [ ] **The compat gate is flaky, which weakens the project's strongest claim.**
+  Evidence: on 2026-09-17 the `compat` CI job failed **2 of 3 consecutive runs on
+  the same commit**, with different scenarios each time —
+  `go-to-rust-quic: FAIL:CONNECT_TIMEOUT`, then `tcp-tls` and `tcp-tls-mux` at zero
+  throughput plus `ws-plain` "proxy port not reachable" — and passed on the third.
+  The diff was provably not the cause (its only compiled change sat inside a
+  `#[cfg(not(target_os = "linux"))]` block, so the Linux binary was byte-identical),
+  and the repo's history already records similar flakes that were "rerun 过"
+  (ETXTBSY during a compat unit test; a VPS disk-full in `ab-matrix`).
+  This matters more than a normal flake: `compat-test.sh` is the evidence the
+  project treats as authoritative, and `CLAUDE.md` quotes "86 passed, 0 failed" as
+  a health number. A gate that fails ~2/3 of the time cannot be used to distinguish
+  a regression from noise, and the habit of rerunning until green is how a real
+  failure eventually gets merged.
+  **Done-when:** the flaky scenarios are identified by running the failing subset
+  in a loop (`compat-test.sh --test <display-name>` makes this cheap), the cause is
+  fixed or the scenario is documented as timing-sensitive with a bounded retry, and
+  the reason is recorded. Until then, `docs/developing.md` tells readers to re-run
+  a red compat result before believing it, and not to treat green as absolute.
+
 - [ ] **`docs/developing.md` and `docs/architecture.md` can still drift.**
   Evidence: after the merge they no longer duplicate sections, but both describe
   transports and encryption at some level, with nothing linking a claim to its
