@@ -78,7 +78,10 @@ example:
 - **Do not hand-maintain numbers.** Countable figures (LOC, test counts, `unsafe`
   blocks, vendored versions) come from `bash scripts/repo-health.sh`. A figure typed
   into prose goes stale silently — the health table once claimed 17 `unsafe` blocks
-  in `frp-core` while the tree had 21.
+  in `frp-core` while the tree had 21. If a count must appear in prose at all, it
+  goes into that script's curated doc-figure table on the same change: the entry
+  pins the exact wording and the source, the expected value is re-measured on every
+  run, and `health` CI fails when the two disagree.
 - **Test counts are not evidence of Go parity.** See
   [developing.md § What a green test run does and does not prove](developing.md#what-a-green-test-run-does-and-does-not-prove).
 - Keep open work in [`../TODO.md`](../TODO.md), with evidence and a done-when.

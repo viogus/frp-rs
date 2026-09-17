@@ -29,13 +29,17 @@ version number is deliberately not independent (see
   files, encryption and authentication. This is a CI gate rather than a claim:
   `scripts/compat-test.sh` runs 86 scenarios plus a 17-case XTCP pairwise matrix
   against the **real Go frp v0.71.0 release** in both directions on every push, and
-  `scripts/protocol-matrix.sh` asserts that all 11 transport rows actually move bytes.
+  `scripts/protocol-matrix.sh` asserts that all 11 transport rows actually move
+  bytes. Each of those counts is re-measured by `scripts/repo-health.sh`, which
+  fails if this line drifts.
 - **3.5× smaller and 2.7× lighter** at the default tier, and 1.9 MB of frps plus
   2.1 MB of frpc at `micro` — small enough for OpenWrt routers, IoT devices and
-  size-capped images where a 17 MB Go binary does not fit at all. Measured, generated
-  table: [Technical Differences](#technical-differences-vs-go-frp).
-- **No garbage collector** — 9.9 MB vs 26.3 MB idle RSS for frps, no heap growing to
-  ~2× live, and no stop-the-world component in the tail. Long-uptime head-to-head RSS
+  size-capped images where a 17 MB Go binary does not fit at all. Every figure in
+  this bullet is read off the measured, generated table in
+  [Technical Differences](#technical-differences-vs-go-frp) (produced by
+  `scripts/compare-go-frp.sh`, its only copy): 17.7/5.1 = 3.5×, 26.3/9.9 = 2.7×.
+- **No garbage collector** — a stable heap instead of one that grows to roughly 2×
+  live, and no stop-the-world component in the tail. Long-uptime head-to-head RSS
   is still an open measurement: see [TODO.md](TODO.md).
 - **Operational knobs Go frp does not have** — UDP bandwidth limiting, SSH gateway
   per-IP login throttling with `ssh_session_idle_timeout`, and
@@ -250,7 +254,7 @@ The full argument, including what frp-rs is *not*, is in
    by putting the old file back. Evidence rather than promise — 86 `compat-test.sh`
    scenarios plus a 17-case XTCP pairwise matrix against the real Go frp v0.71.0, both
    directions, on every push; 11/11 transport rows moving bytes in
-   `protocol-matrix.sh`.
+   `protocol-matrix.sh`. `scripts/repo-health.sh` re-measures each of those counts.
 2. **It runs where a 17 MB binary does not fit.** The `tiny` and `micro` tiers are a
    *new deployment* rather than a replacement: OpenWrt, IoT, size-capped images.
 3. **No GC.** A stable heap instead of one that grows to roughly 2× live, and no
@@ -344,7 +348,7 @@ Release history: [CHANGELOG.md](CHANGELOG.md).
 cargo build --release                  # frps + frpc → target/release/
 cargo test --workspace --all-features  # needs an all-features frps binary
 cargo clippy --workspace --all-targets --all-features -D warnings
-bash scripts/repo-health.sh            # version alignment, unsafe audit, doc index
+bash scripts/repo-health.sh            # invariants: version, unsafe, doc paths and figures
 bash scripts/compat-test.sh            # Go↔Rust cross-compat suite (needs Go frp)
 ```
 
