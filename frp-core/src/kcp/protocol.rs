@@ -1,8 +1,10 @@
 //! Self-implemented KCP protocol state machine.
 //!
-//! This is the frp-rs in-tree replacement for the vendored `kcp` crate
-//! (`frp-core/vendored/kcp-0.6.0`). It implements the same wire protocol and
-//! the same three kcp-go v5.6.13 compatibility patches as the vendored crate:
+//! This is the frp-rs in-tree replacement for the vendored `kcp` 0.6.0 crate,
+//! which was removed from the tree together with `rust_tokio_kcp` (see
+//! `CHANGELOG.md`, "KCP self-implementation"). It implements the same wire
+//! protocol and the same three kcp-go v5.6.13 compatibility patches that the
+//! vendored crate carried:
 //!
 //! 1. RTO **linear** backoff (`rto += rx_rto / 2`) instead of the original
 //!    exponential `rto += rto / 2` when `nodelay` is enabled.
