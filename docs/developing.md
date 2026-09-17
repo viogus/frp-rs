@@ -394,6 +394,7 @@ Follow these conventions:
 3. **Use `test_utils`**: each crate may provide test helpers for spawning servers/clients
 4. **Avoid port conflicts**: use port `0` for auto-allocation or pick unique ports
 5. **Clean up**: ensure spawned tasks/processes are killed on test completion
+6. **Wait on a deadline, not an attempt count**: a readiness/retry loop should poll against a wall-clock deadline (`Instant::now() + timeout`) rather than a fixed `for _ in 0..N` plus sleep — the attempt count is a hidden, load-dependent time budget that flakes on CI — and it must report the last error on exhaustion, not a bare `expect`.
 
 ### Benchmarks
 

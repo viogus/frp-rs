@@ -296,7 +296,7 @@ nothing about whether the described behaviour still holds.
   `docs/developing.md` tells readers to re-run a red compat result before believing
   it, and not to treat green as absolute.
 
-- [ ] **`Tests (server integration)` fails intermittently, and it turns `main` red.**
+- [x] **`Tests (server integration)` fails intermittently, and it turns `main` red.**
   Evidence: on 2026-09-17 the CI run for the merge commit `d9ca98b` failed on
   `Tests (server integration)` — **13 passed, 1 failed** —
   `test_ssh_gateway_exec_go_parity_errors_and_stcp_accept` panicking at
@@ -322,6 +322,37 @@ nothing about whether the described behaviour still holds.
   Same class as the compat-gate item above: a gate that fails intermittently on
   unchanged code cannot distinguish a regression from noise, and rerunning until
   green is how a real failure eventually gets merged.
+
+  Done: all 10 sites in `frp-server/tests/ssh_gateway.rs` now wait on a
+  wall-clock deadline. The three bare-TCP readiness sites (lines 102, 224, 282)
+  call the already-existing `common::wait_tcp_port(port, SSH_READY_TIMEOUT)`;
+  the six `russh::client::connect` sites (345, 454, 697, 797, 862, 930 — 930 is
+  `connect_ssh_auth`, the one that flaked) share a new `connect_ssh_ready`
+  helper; and the pre-auth-cap test's raw `connect_raw` (591) keeps its own
+  deadline loop because `wait_tcp_port`'s probe connection would transiently hold
+  one of the 8 per-IP permits that test counts. Timeout: **10 s** for both,
+  matching the file's existing `Duration::from_secs(10)` authenticated-handshake
+  waits (886/905) and well above the old fixed 20 × 100 ms (~2 s) window, while
+  still failing a real hang in 10 s rather than never. Failures are loud: the
+  russh helper panics with the **last** connect error
+  (forced probe: `SSH client should connect within 10s; last error: IO(Os { code:
+  61, kind: ConnectionRefused, ... })`) instead of a bare
+  `expect("SSH client should connect")`, and `wait_tcp_port` reports port +
+  elapsed budget (`port 1 not ready after 10s`). The underlying gap: `start_test_server` waits for the FRP
+  `bind_port` and the dashboard port (`common/mod.rs:644,649`) but never for the
+  SSH gateway port, so every SSH test grew its own readiness loop — and those
+  loops, not any missing helper, were the ~2 s ceiling. (`wait_tcp_port` carried a
+  stale `#[allow(dead_code)]` while already being called twice from
+  `start_test_server`; that allow is now removed and the helper is used at the SSH
+  sites too. Report of "no caller" from the dispatching agent was wrong — it came
+  from a grep that excluded `common/mod.rs` itself.) Evidence: `cargo test -p frp-server --test ssh_gateway`
+  green **5× back to back**, 14 passed each (~15.2 s each), plus the two
+  forced-failure runs above. Honest limit: five green runs do not *prove* an
+  intermittent flake is gone; they show the ~2 s ceiling named as the cause is no
+  longer the budget. Site 644 (raw connection with a 2 s per-attempt read
+  timeout) was left unchanged, as the item excluded it. Also added "wait on a
+  deadline, not an attempt count" to `docs/developing.md`'s Writing New Tests
+  list, since this is the second flakiness item in this backlog.
 
 - [x] **`docs/developing.md` and `docs/architecture.md` can still drift.**
   Evidence: after the merge they no longer duplicate sections, but both describe
