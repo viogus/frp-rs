@@ -220,6 +220,33 @@ nothing about whether the described behaviour still holds.
   `docs/developing.md` tells readers to re-run a red compat result before believing
   it, and not to treat green as absolute.
 
+- [ ] **`Tests (server integration)` fails intermittently, and it turns `main` red.**
+  Evidence: on 2026-09-17 the CI run for the merge commit `d9ca98b` failed on
+  `Tests (server integration)` — **13 passed, 1 failed** —
+  `test_ssh_gateway_exec_go_parity_errors_and_stcp_accept` panicking at
+  `frp-server/tests/ssh_gateway.rs:943` with `SSH client should connect`. The
+  **identical tree had passed that same job** minutes earlier on the PR head
+  (`e75c637`, run 35244274080), and the re-run passed, so this is the test and not
+  the diff.
+  The mechanism is visible in the code: `connect_ssh_auth` retries
+  `russh::client::connect` only `for _ in 0..20` with a 100 ms sleep
+  (`ssh_gateway.rs:928-943`), a fixed window of roughly **2 seconds**, and then
+  `expect`s success — so a loaded runner that takes longer than that to start
+  accepting on the gateway panics. It is not a one-off: the same `0..20` + 100 ms
+  pairing is repeated at lines 102, 224, 282, 345, 454, 591, 697, 797, 862 and 930,
+  so those SSH-gateway tests share the same under-sized readiness budget. (A further
+  `for _ in 0..20` at line 644 retries raw connections with its own 2 s per-attempt
+  read timeout, so it is a different shape.)
+  **Done-when:** readiness is a shared helper that polls against a wall-clock
+  deadline sized for CI instead of a fixed ~2 s, applied at every site above, and a
+  genuine connect failure still fails loudly with the last error rather than a bare
+  `expect`. Other waits in this file already work at that scale
+  (`Duration::from_secs(5)` at lines 250 and 406, `from_secs(10)` at 886 and 905),
+  so there is a precedent to match rather than a new convention to invent.
+  Same class as the compat-gate item above: a gate that fails intermittently on
+  unchanged code cannot distinguish a regression from noise, and rerunning until
+  green is how a real failure eventually gets merged.
+
 - [ ] **`docs/developing.md` and `docs/architecture.md` can still drift.**
   Evidence: after the merge they no longer duplicate sections, but both describe
   transports and encryption at some level, with nothing linking a claim to its
