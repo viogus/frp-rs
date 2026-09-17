@@ -161,6 +161,70 @@ done
 printf '\n  Each vendored crate must document WHY and its EXIT CONDITION.\n'
 printf '  A vendored copy pins the crate: track upstream advisories by hand.\n'
 
+# ---------------------------------------------------------------- docs
+hdr "Docs"
+
+if command -v python3 >/dev/null 2>&1; then
+  # (a) Gate: every doc is reachable from the index. A doc nobody links to is a
+  # doc nobody reads, and the index is edited by hand, so it drifts.
+  index_misses=$(python3 - <<'PY'
+import os
+
+INDEX = os.path.join('docs', 'README.md')
+try:
+    index = open(INDEX, encoding='utf8').read()
+except OSError:
+    print('docs/README.md is missing')
+    raise SystemExit
+for name in sorted(os.listdir('docs')):
+    if name == 'README.md':
+        continue
+    path = os.path.join('docs', name)
+    if os.path.isfile(path) and name.endswith('.md'):
+        if name not in index:
+            print('docs/%s' % name)
+    elif os.path.isdir(path) and name not in index:
+        print('docs/%s/' % name)
+PY
+)
+  if [ -n "$index_misses" ]; then
+    printf '%s\n' "$index_misses" | sed 's/^/    not in docs\/README.md: /'
+    n=$(printf '%s\n' "$index_misses" | wc -l | tr -d ' ')
+    printf '  FAIL  %s doc(s)/dir(s) unreachable from the index\n' "$n"
+    fail=1
+  else
+    printf '  ok    every docs/*.md and docs/*/ is reachable from docs/README.md\n'
+  fi
+
+  # (b) Report: paths inside docs/archive/** still say `docs/superpowers/...`,
+  # deliberately (historical records are not rewritten). Verify the documented
+  # translation still holds, so the claim in docs/archive/README.md stays true.
+  archive=$(python3 - <<'PY'
+import os, re
+
+pat = re.compile(r'docs/superpowers/([A-Za-z0-9_./-]+)')
+total = resolved = 0
+for root, _dirs, files in os.walk(os.path.join('docs', 'archive')):
+    for fn in files:
+        if not fn.endswith(('.md', '.json')):
+            continue
+        p = os.path.join(root, fn)
+        for line in open(p, encoding='utf8', errors='ignore'):
+            for m in pat.finditer(line):
+                total += 1
+                rel = m.group(1).rstrip('.,;:)`')
+                if os.path.exists(os.path.join('docs', 'archive', rel)):
+                    resolved += 1
+print('%d %d' % (total, resolved))
+PY
+)
+  set -- $archive
+  printf '  info  archive path refs: %s, resolvable via the docs/archive/ prefix: %s\n' "${1:-0}" "${2:-0}"
+  printf '        (the remainder point at specs that were never written — pre-existing)\n'
+else
+  printf '  skip  python3 not found — docs checks not evaluated\n'
+fi
+
 # ---------------------------------------------------------------- sizes
 if [ "${1:-}" = "--sizes" ]; then
   hdr "Release binary sizes (slow — builds)"

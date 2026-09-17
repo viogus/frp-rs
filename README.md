@@ -576,9 +576,11 @@ a vendored crypto/TLS tree is a maintenance liability, not a resting state.
 | [`yamux`](vendor/yamux/README-FRP-RS.md) | 0.14.0 | 5 patches: per-stream RST at the inbound stream cap (instead of a session-killing GoAway, matching Go frp's fork), a read-side lost-wakeup deadlock fix, a per-stream receive-window cap, window-growth RTT seeding, and a send-side body-buffer pool. | Upstream each patch, or re-apply on every yamux bump (each patch section lists its own upgrade note). The deadlock fix is the one to upstream first. |
 | [`russh`](vendor/russh/README-FRP-RS.md) | 0.62.7 | 2 patches dropping the `ssh-key` `encryption` + `ppk` and `pkcs8` `encryption` chains, which the SSH gateway never uses (`load_secret_key(path, None)` only). Removes 7 pre-release packages and ~48.5 KiB from frps. | Drop when upstream makes those `ssh-key` features optional. |
 
-> The rustls patch is the security-sensitive one. `vendor/rustls` has no
-> automated upstream tracking because `[patch.crates-io]` pins it — the release
-> checklist in [`CLAUDE.md`](CLAUDE.md) covers the manual advisory check.
+> The rustls patch is the security-sensitive one, and **`cargo update` will not
+> pick up upstream security releases for any of these three** — `[patch.crates-io]`
+> pins them. The manual advisory check is a step in the
+> [pre-release checklist](docs/developing.md#pre-release-checklist), not something
+> a tool will remind you about.
 
 ---
 

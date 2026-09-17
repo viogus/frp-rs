@@ -132,11 +132,16 @@ nothing about whether the described behaviour still holds.
   Stated in `docs/README.md § Conventions`, at the top of `CHANGELOG.md`, and at
   the top of the development log. Historical entries are left as written.
 
-- [ ] **Paths inside `docs/archive/**` still read `docs/superpowers/`.**
-  Evidence: deliberate (historical records must not be rewritten) and documented in
-  `docs/archive/README.md`, but a reader following one hits a dead path.
-  **Done-when:** either accepted as documented, or a one-line note is added to the
-  archive index listing the highest-traffic files and their current paths.
+- [x] **Paths inside `docs/archive/**` still read `docs/superpowers/`.**
+  Evidence: deliberate (historical records must not be rewritten), but a reader
+  following one hits a dead path.
+  Done: rather than hand-listing "high-traffic" files, the translation is now
+  **measured** — `scripts/repo-health.sh` reports how many `docs/superpowers/…`
+  references exist inside the archive and how many resolve under the new prefix.
+  Current: **20 references, 19 resolvable**. The single exception
+  (`plans/2026-06-28-v2-protocol-implementation.md` → a spec that was never
+  written) was already dangling before the rename and is named in
+  `docs/archive/README.md` rather than rewritten to point elsewhere.
 
 - [ ] **`docs/developing.md` and `docs/architecture.md` can still drift.**
   Evidence: after the merge they no longer duplicate sections, but both describe
@@ -170,11 +175,13 @@ nothing about whether the described behaviour still holds.
   — or an explicit decision that this class stays a manual review item.
   Do not ship the naive regex as a CI gate: it fails on a clean tree.
 
-- [ ] **Documentation index is manual.**
-  Evidence: `docs/README.md` lists docs by hand, so a new doc is invisible until
-  someone remembers to add it.
-  **Done-when:** either a CI check that every `docs/*.md` (excluding `archive/`)
-  appears in the index, or the index is generated.
+- [x] **Documentation index is manual.**
+  Evidence: `docs/README.md` lists docs by hand, so a new doc was invisible until
+  someone remembered to add it.
+  Done: `scripts/repo-health.sh` (the `health` CI job) now **fails** if any
+  `docs/*.md` (except the index itself) or any `docs/*/` directory is not named in
+  `docs/README.md`. Verified both ways: the tree passes today; removing a filename
+  from the index fails the gate.
 
 ---
 
@@ -189,15 +196,29 @@ nothing about whether the described behaviour still holds.
   **Done-when:** at least one of them is split along a seam with no behaviour change
   and the compat + protocol-matrix gates stay green.
 
-- [ ] **Three vendored crates are a standing maintenance liability.**
+- [x] **Three vendored crates are a standing maintenance liability.**
   Evidence: `vendor/rustls` (TLS, patched), `vendor/yamux` (5 patches),
   `vendor/russh` (2 patches). `[patch.crates-io]` pins them: upstream security
   releases do **not** arrive via `cargo update`.
-  The audit added the missing `vendor/rustls/README-FRP-RS.md` with its exit
-  condition, but the obligation is still manual.
-  **Done-when:** the rustls exit (upgrade to ≥0.24 for native `invalid_sni_policy`)
-  is a tracked item with an owner, and the release checklist explicitly includes
-  checking rustls 0.23.x advisories.
+  Done: the obligation now has a home instead of living in prose. A
+  **pre-release checklist** in
+  [`docs/developing.md § 6`](docs/developing.md#pre-release-checklist) makes the
+  vendored-crate review an explicit release step (check 0.23.x rustls advisories,
+  re-read each `vendor/*/README-FRP-RS.md`, confirm the exit condition has not
+  arrived), and the README's vendored table points at it. The checklist notes
+  honestly that with a single maintainer there is no second reviewer and the
+  checklist line *is* the control. The rustls exit is now its own tracked item
+  below.
+
+- [ ] **Upgrade to rustls ≥ 0.24 and delete `vendor/rustls`.**
+  Evidence: the vendored tree exists only to treat an invalid TLS SNI as "no SNI"
+  so Go frp's XTCP QUIC visitors interoperate (`ip:port` as SNI). rustls ≥ 0.24 has
+  `invalid_sni_policy = IgnoreAll` natively, which is exactly this behaviour.
+  Until then, `[patch.crates-io]` means 0.23.x security releases must be tracked
+  by hand — the highest-risk item on the release checklist.
+  **Done-when:** the workspace is on rustls ≥ 0.24, the patch is expressed as
+  `ServerConfig::invalid_sni_policy`, `vendor/rustls` and its `[patch.crates-io]`
+  entry are deleted, and the XTCP QUIC compat scenarios still pass.
 
 - [x] **`unsafe` has no automated guard.**
   Evidence: 21 blocks + 3 `unsafe fn` + 2 `unsafe impl` in `frp-core`; 38 blocks in
