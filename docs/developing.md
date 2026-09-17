@@ -32,349 +32,13 @@ Dependencies flow **upward** through this diagram (binaries depend on logic crat
 
 `frp-core` has no dependencies on other workspace crates -- it defines the wire protocol, message types, and transport primitives that both server and client use. The `frp-server` and `frp-client` crates contain the protocol logic but no `main()` functions; binaries live in `frps/` and `frpc/`.
 
-**External documentation:** The project also maintains:
-- [`docs/config.md`](config.md) -- full configuration reference
-- [`docs/proxies.md`](proxies.md) -- proxy type guide (TCP, UDP, HTTP, HTTPS, STCP, XTCP, SUDP, TCPMux)
-- [`docs/client-plugins.md`](client-plugins.md) -- client plugin reference (http_proxy, socks5, static_file, unix_domain_socket, http2https, https2http, https2https, http2http, tls2raw)
-- [`docs/deployment.md`](deployment.md) -- deployment guide (systemd, Docker, VPS)
-- [`docs/go-frp-compat-audit.md`](go-frp-compat-audit.md) -- full Go frp compatibility audit
-
-## 2. Architecture Deep-Dive
-
-### Server Connection Lifecycle
-
-The server's accept loop (`frp-server/src/service.rs`, `Service::run()`) is a mixed-mode dispatcher that handles all supported transports on a single port:
-
-```
-                   ┌──────────┐
-                   │ listener │  (TcpListener on bind_port)
-                   └────┬─────┘
-                        │ accept()
-                        ▼
-              ┌──────────────────┐
-              │ detect_and_strip │  (MSG_PEEK-based: TLS 0x17/0x16,
-              │ _magic()         │   WebSocket GET, or plain V1)
-              └────────┬─────────┘
-                       │
-         ┌─────────────┼─────────────┐
-         ▼             ▼             ▼
-    ConnectionType  ConnectionType  ConnectionType
-       ::Tls           ::WebSocket    ::Plain
-         │                 │              │
-         ▼                 ▼              ▼
-    TLS handshake     WebSocket       read_msg_v1()
-    (optional         upgrade            │
-    yamux wrap)          │          dispatch by
-         │            read_msg_v1()  type byte:
-         │               │           ┌─────────────────┐
-         │          dispatch by      │ Login            │──► handle_control()
-         │          type byte:       │ NewWorkConn      │──► handle_work_conn_inner()
-         │          (same as plain)  │ NewVisitorConn   │──► handle_visitor_conn_inner()
-         │                           │ NatHoleVisitor   │──► handle_nat_hole_visitor()
-         ▼                           └─────────────────┘
-    (same dispatch)
-```
-
-Each accepted connection spawns a `tokio::spawn` task. `detect_and_strip_magic()` peeks at the first bytes to classify the connection type without consuming data -- bytes are replayed via `PreReadStream`. The function also detects V2 magic (`FRP\0\x02\r\n`) for QUIC streams.
-
-**TLS connections** get additional processing:
-- **TLS-only mode** (`tls_only: true`): non-TLS connections are rejected
-- **SNI-based HTTPS proxy routing** happens only on the **`vhost_https_port` listener** (`vhost.rs`, `extract_sni_from_client_hello`): the server peeks at the ClientHello for the SNI hostname, looks up the VHostManager, and routes the raw TLS stream directly to the HTTPS proxy handler. The **main port does NOT sniff SNI** — round-13 Go parity: it reads only the 0x17/0x16 TLS marker to detect TLS vs plain (a wildcard https route must not hijack frpc TLS control logins)
-- **TCPMux over TLS** (`tcp_mux: true`): after TLS handshake, the stream is wrapped in a yamux multiplexer. The first yamux stream is the control channel; subsequent streams carry work connections
-
-**Additional listeners** are started alongside the main accept loop when their ports are configured:
-- WebSocket listener (separate port, `websocket_port`)
-- KCP listener (`kcp_bind_port`)
-- QUIC listener (`quic_bind_port`, requires `tls_enable`)
-- HTTP VHost listener (`vhost_http_port`)
-- HTTPS VHost listener (`vhost_https_port`)
-- TCPMux HTTP CONNECT listener (`tcpmux_httpconnect_port`)
-- SSH tunnel gateway (`ssh_tunnel_gateway.bind_port`)
-- Dashboard HTTP server (`web_server.port`)
-
-Each listener follows the same pattern: accept connection, read one frame, dispatch by message type.
-
-### InternalMsg Channel
-
-The server's core is cross-task message passing via `InternalMsg` channels. The state is shared through `AppState`:
-
-```
-AppState
-  ├── run_id_to_ctl_tx: DashMap<run_id, ControlTx>  // routes work conns to correct handler (lock-free reads)
-  ├── proxy_manager: ProxyManager                     // global proxy registry
-  ├── used_ports: HashSet<u16>                        // port allocation tracking
-  ├── sk_index: HashMap<sk, proxy_name>              // STCP/XTCP secret-key to proxy lookup
-  ├── vhost_manager: VhostManager                     // HTTP VHost routing
-  ├── nat_hole: Arc<NatHoleCoordinator>              // XTCP NAT hole punch session mgmt
-  ├── oidc_verifier: Option<Arc<OidcVerifier>>       // OIDC token verification
-  └── oidc_subjects: HashMap<sub, proxy_name>        // OIDC subject to proxy routing
-```
-
-`ControlTx` contains an `mpsc::UnboundedSender<InternalMsg>` -- when a proxy listener accepts a user connection, it sends an `InternalMsg::ProxyUserConn` through this channel. The control handler's `select!` loop receives it and dispatches it to the right work connection.
-
-**InternalMsg variants** and their flow:
-
-```
-ProxyUserConn      ──► work_pool empty? ──yes──► ReqWorkConn + push to pending_requests
-  (proxy listener                     ──no───► pop work_conn, send StartWorkConn, bridge
-   accepted user)
-
-NewWorkConn        ──► pending_requests non-empty? ──yes──► pop request, bridge immediately
-  (client sent new                      ──no───► push to work_pool (up to pool_cap)
-   work connection)
-
-NatHoleSidOnWorkConn ──► pending_nat_hole_sids? ──yes──► pop, write StartWorkConn+NatHoleSid on work_conn
-  (XTCP visitor     ──► work_pool empty? ──yes──► push to pending_nat_hole_sids + ReqWorkConn
-   arrived, notify                     ──no───► pop work_conn, write StartWorkConn+NatHoleSid
-   provider)
-
-UdpNeedsWorkConn   ──► work_pool empty? ──yes──► push to pending_udp + ReqWorkConn
-  (UDP proxy needs                     ──no───► pop work_conn, assign_udp_work_conn
-   work connection)
-
-VisitorConn        ──► work_pool empty? ──yes──► ReqWorkConn + push to pending_requests
-  (STCP visitor                       ──no───► pop work_conn, send StartWorkConn, bridge
-   arrived)
-
-Shutdown           ──► old control handler stops (superseded by new connection with same run_id)
-```
-
-### Control Handler select! Loop
-
-The control handler (`frp-server/src/control/mod.rs`, `handle_control()`) is the most complex file. After login, it enters a `tokio::select!` loop:
-
-```rust
-tokio::select! {
-    internal = internal_rx.recv() => {
-        // Process InternalMsg variants:
-        // - NewWorkConn: defer to pending_nat_hole_sids → pending_udp → pending_requests → work_pool
-        // - VisitorConn: pop work_pool or queue
-        // - ProxyUserConn: pop work_pool or ReqWorkConn
-        // - Shutdown: break loop
-        // - UdpNeedsWorkConn: pop work_pool or queue
-        // - NatHoleSidOnWorkConn: deliver sid or queue
-        // - WriteNatHoleSid/WriteNatHoleResp/WriteNatHoleReport: forwarded to visitor via control
-    }
-
-    msg = read_ctl_msg(&mut reader, v2) => {
-        // Process inbound client messages:
-        // - NewProxy: register proxy, start listeners
-        // - CloseProxy: unregister proxy, stop listeners
-        // - Ping: update last_ping, send Pong
-        // - NewWorkConn: same as internal NewWorkConn (client proactively sent)
-        // - UDPPacket: route to correct UDP socket
-        // - NatHoleClient: NAT analysis → NatHoleResp to both sides
-        // - NatHoleReport: session complete
-        // - VisitorConn: STCP visitor on control channel (Go frp compat)
-        // - NatHoleVisitor: XTCP visitor on control channel (Go frp compat)
-    }
-}
-```
-
-The loop is deliberately **FAIR** — no `biased` keyword: an always-ready
-internal queue must not starve control reads (heartbeat pings, Shutdown).
-Internal messages represent real user traffic, so they get priority via the
-queue discipline itself; fairness is pinned by a regression test in
-`control/mod.rs` (asserts no `biased;` in the loop and bounded control p99
-under internal pressure).
-
-### Work Connection Pooling
-
-The server maintains a work connection pool per client:
-
-- **`pool_cap`**: `login.pool_count + 10` (extra 10 from `WORK_POOL_EXTRA`)
-- **`work_pool`**: `VecDeque<IoStream>` -- idle work connections
-- **`pending_requests`**: `VecDeque<PendingRequest>` -- user connections waiting for a work conn
-
-When a proxy listener accepts a user:
-1. Pop from `work_pool` if non-empty -- send `StartWorkConn` + bridge immediately
-2. If `work_pool` is empty, send `ReqWorkConn` to client + push to `pending_requests` (timeout: 10s)
-
-When a new work connection arrives:
-1. Pop from `pending_requests` if non-empty -- bridge immediately
-2. If no pending requests, push to `work_pool` (if below `pool_cap`)
-
-**Bridging** (`control/bridge.rs`, `assign_work_to_proxy`): after sending `StartWorkConn` with proxy metadata (encryption flag, compression flag), the server bridges the user connection to the work connection using either `tokio::io::copy_bidirectional_with_sizes` with the 32 KiB `BUFFER_SIZE` (plain, overridable via `FRP_BRIDGE_BUF_KB`) or `bridge::bridge_encrypted` (AES-128-CFB + Snappy, streaming — a single 16-byte IV then continuous ciphertext, no per-frame length prefix).
-
-### NAT Hole Punching (XTCP)
-
-XTCP enables direct peer-to-peer connections between two frpc clients behind NAT. The server coordinates the control plane (NAT classification, 5-mode behavior recommendation, session management) but never relays XTCP data and sends no probe packets — provider and visitor each do their own STUN.
-
-```
-Visitor                Server                    Provider
-   │                      │                          │
-   │──NatHoleVisitor─────►│                          │
-   │                      │─NatHoleSidOnWorkConn────►│  (via internal channel)
-   │                      │  (StartWorkConn+NHSid    │
-   │                      │   on work connection)    │
-   │                      │                          │──STUN────► STUN servers
-   │                      │                          │◄────────── (discovers external addr)
-   │                      │◄──NatHoleClient─────────│  (reports STUN results)
-   │                      │                          │
-   │                      │──NAT analysis───────────│  (classify + analyzer)
-   │                      │                          │
-   │◄──NatHoleResp───────│                          │
-   │                      │──NatHoleResp────────────►│
-   │                      │                          │
-   │◄══ MakeHole UDP probing ══►│  (5-mode DetectBehavior: sender probes
-   │   (sender/receiver roles,   │   assisted+candidate addrs, TTL, port
-   │    candidate/random ports)  │   scanning; winner socket selected)
-   │                      │                          │
-   │◄══ KCP+yamux P2P data plane ═►│  (runs on the winning socket)
-   │   (encrypted bridge to local) │
-   │                      │                          │
-   │                      │◄──NatHoleReport─────────│  (session complete)
-```
-
-Two paths for visitor connections:
-
-1. **Fresh TCP connection** (primary): visitor sends `NatHoleVisitor` on a new TCP connection. Server creates session, sends `NatHoleSidOnWorkConn` internal msg. Provider control handler writes `StartWorkConn`+`NatHoleSid` on work conn. Provider does STUN, sends `NatHoleClient` on control, server runs NAT analysis, sends `NatHoleResp` to both sides.
-
-2. **Control connection** (Go frp compat): Go frpc v0.71.0 sends `NatHoleVisitor` on its existing control channel. Server creates session with `create_session_with_ctl`, spawns task waiting for provider's `NatHoleClient` on control, runs NAT analysis, and sends `NatHoleResp` to both sides.
-
-**NAT analysis** (`frp-server/src/nathole/analysis.rs`): 5-mode behavior table with score-based `Analyzer`. Each mode tests how the NAT behaves for different address/port combinations. The analyzer learns from success feedback -- successful hole punches increase the score for the modes that predicted the correct behavior.
-
-**STCP fallback**: if hole punch fails (e.g., both sides behind symmetric NAT), the visitor falls back to an STCP proxy specified by the `fallback_to` config field.
-
-**XTCP P2P data plane**: after the hole punch, the P2P stream runs on the
-socket that received the peer's detect reply (Go `result.lConn` semantics —
-only that socket has a working NAT mapping). Two transports are supported,
-selected by the `protocol` field (visitor decides; empty protocol is
-normalized to `"quic"` — Go `EmptyOr` parity; **`"quic"` is the default**):
-- **QUIC** (`protocol="quic"`, default): the punched socket is handed
-  directly to quinn (`xtcp_p2p_connect_quic` — no yamux, QUIC multiplexes
-  streams itself), self-signed TLS + InsecureSkipVerify, ALPN `frp`. The
-  visitor is the QUIC client, the provider the QUIC server. Requires the
-  `quic` feature (default ON). Go visitors with `protocol="quic"`
-  interoperate: Go frp v0.71.0 sends `"ip:port"` as the QUIC SNI, which
-  upstream rustls 0.23 rejects — frp-rs vendors rustls (0.23.43 at
-  `vendor/rustls`) with a server-side patch that treats an invalid SNI as
-  "no SNI" (see `docs/superpowers/notes/2026-08-04-xtcp-quic-sni-compat.md`
-  §6; drop the patch when the workspace moves past rustls 0.23).
-- **KCP + yamux** (`protocol="kcp"`): the punched UDP socket runs KCP
-  (`XtcpP2pStream`) with yamux on top.
-
-The persistent XTCP tunnel session (`frp-core/src/xtcp_session.rs`,
-round-11 keepTunnelOpenWorker parity): one hole-punched QUIC/yamux session
-per proxy is reused across user connections instead of re-punching per
-connection; the visitor re-signals `startTunnel` on every error path, and
-the budget clamps to `min(20s, fallbackTimeoutMs)`.
-
-**XTCP P2P encryption**: after hole punch, the P2P stream is bridged to the
-local service with `bridge_encrypted` when `use_encryption=true` and `sk` is
-non-empty. The key is derived via `PBKDF2-SHA1(sk, salt="frp", iter=64,
-keylen=16)` -- using the proxy's SecretKey (not the auth token). Probe
-packets (NatHoleSid) use the same derivation; without a secret key, Rust↔Rust
-probes use the `"frp"` magic. Both sides derive the same key from the shared
-SecretKey.
-
-**Module structure** (`frp-server/src/nathole/`):
-- `mod.rs` -- module root, `NAT_HOLE_TIMEOUT = 10s`
-- `controller.rs` -- session management, provider registration, `build_nat_hole_response()`
-- `classify.rs` -- NAT feature classification (EasyNAT vs HardNAT, behavior detection)
-- `analysis.rs` -- 5-mode behavior table, score-based `Analyzer` with success feedback
-
-### Wire Protocol
-
-**V1** (fully implemented in `frp-core/src/protocol.rs`):
-
-```
-┌───────────┬────────────────────────────────┬──────────────────────┐
-│ 1 byte    │ 8 bytes (big-endian)           │ N bytes (max 10 KiB) │
-│ type      │ payload length (i64)           │ UTF-8 JSON           │
-└───────────┴────────────────────────────────┴──────────────────────┘
-```
-
-9-byte header followed by JSON payload. `read_v1_frame()` reads the header, validates length <= 10 KiB (10_240, matching Go frp), then reads the payload. `deserialize_v1()` dispatches by type byte to the correct `FrpMessage` variant.
-
-Message type bytes (from `frp-core/src/msg.rs`):
-
-| Byte | Constant | Message |
-|------|----------|---------|
-| `o` | `TYPE_LOGIN` | Login |
-| `1` | `TYPE_LOGIN_RESP` | LoginResp |
-| `p` | `TYPE_NEW_PROXY` | NewProxy |
-| `2` | `TYPE_NEW_PROXY_RESP` | NewProxyResp |
-| `c` | `TYPE_CLOSE_PROXY` | CloseProxy |
-| `w` | `TYPE_NEW_WORK_CONN` | NewWorkConn |
-| `r` | `TYPE_REQ_WORK_CONN` | ReqWorkConn |
-| `s` | `TYPE_START_WORK_CONN` | StartWorkConn |
-| `v` | `TYPE_NEW_VISITOR_CONN` | NewVisitorConn |
-| `3` | `TYPE_NEW_VISITOR_CONN_RESP` | NewVisitorConnResp |
-| `h` | `TYPE_PING` | Ping |
-| `4` | `TYPE_PONG` | Pong |
-| `u` | `TYPE_UDP_PACKET` | UDPPacket |
-| `i` | `TYPE_NAT_HOLE_VISITOR` | NatHoleVisitor |
-| `n` | `TYPE_NAT_HOLE_CLIENT` | NatHoleClient |
-| `m` | `TYPE_NAT_HOLE_RESP` | NatHoleResp |
-| `5` | `TYPE_NAT_HOLE_SID` | NatHoleSid |
-| `6` | `TYPE_NAT_HOLE_REPORT` | NatHoleReport |
-| `7` | `TYPE_CLOSE_PROXY_RESP` | CloseProxyResp |
-| `8` | `TYPE_ERROR` | Error |
-
-The `FrpMessage` enum is `#[serde(untagged)]` -- serde matches the first variant whose fields intersect the JSON. In wire deserialization this is not an issue because the type byte is matched first via `deserialize_v1()`, which dispatches to the correct struct before deserialization.
-
-**V2** (fully implemented in `frp-core/src/protocol.rs`):
-
-V2 uses 7-byte magic `FRP\0\x02\r\n` + different framing with numeric type IDs (u16). Full AEAD encryption with capability negotiation via `frp-core/src/v2_handshake.rs` and `frp-core/src/crypto.rs` (AES-256-GCM or ChaCha20-Poly1305, HKDF-SHA256 key derivation). V2 frame read/write (`read_v2_frame_raw`/`write_v2_frame_raw`), message dispatch (`read_msg_v2`/`write_msg_v2`), and `deserialize_v2()` all fully operational. V2 compat tests run against the Go frp v0.71.0 pre-built binary.
-
-Encryption in the control handler is protocol-aware: V1 uses AES-128-CFB (`CipherStream`), V2 with AEAD keys wraps the stream in `AeadStream` after LoginResp.
-
-### Encryption
-
-**Control connection:** AES-128-CFB. Key derived via `PBKDF2-SHA1(token, salt="frp", iterations=64, keylen=16)`. Implemented in `frp-core/src/encryption.rs`.
-
-**Encrypted bridge (data plane):** AES-128-CFB streaming with Snappy compression (compress first, then encrypt). Framing: one random 16-byte IV written before the first ciphertext block, then a continuous CFB stream (no per-frame length prefix). Implemented in `frp-core/src/bridge.rs`.
-
-**V2 control:** AEAD (AES-256-GCM or ChaCha20-Poly1305). Keys derived via HKDF-SHA256 from the transcript hash. Implemented in `frp-core/src/crypto.rs`.
-
-**Important:** Go frp golib source says PBKDF2 salt `"crypto"` but the pre-built binary uses salt `"frp"` (verified against the v0.70.1 and v0.71.0 binaries). This codebase uses `"frp"` for binary compatibility.
-
-### Authentication
-
-Auth uses `MD5(token + timestamp)` -> hex string. Matches Go frp v0.71.0 behavior (Go frp switched from HMAC-SHA256 to MD5 in commit `78f9394`). See `frp-core/src/auth.rs`.
-
-OIDC authentication is also supported when the `oidc` feature is enabled. The server verifies JWTs against an OIDC provider and maps subjects to proxy names.
-
-### Transport Abstraction
-
-`IoStream` (`frp-core/src/transport/`) is a type-erased newtype over a
-boxed trait object — the 11-variant enum is gone:
-
-```rust
-pub struct IoStream(Box<dyn Transport>);
-```
-
-Each transport implements the `Transport` trait (`AsyncRead + AsyncWrite +
-Unpin + Send + 'static` plus the consuming methods) in its own file under
-`frp-core/src/transport/`: `tcp.rs` (`TcpStream`), `tls.rs`
-(`TlsTransport`), `kcp.rs` (`KcpStream`), `quic.rs` (`QuicStream`),
-`websocket.rs` (`WsByteStream`, manual RFC 6455 framing — tungstenite was
-removed 2026-08-09), `yamux.rs` (`YamuxStream`), `cipher.rs`
-(`CipherStream<S>`), `aead.rs` (`AeadStream`), `ssh_channel.rs`
-(`SshChannelTransport`), `pre_read.rs` (`PreReadTransport`),
-`buffered_read.rs` (`BufferedReadTransport`). IoStream's constructors are
-named after the old variants (`IoStream::Tcp(stream)`, …) so construction
-sites read identically.
-
-`into_split()` returns the boxed `(BoxedReadHalf, BoxedWriteHalf)` halves
-(the old static `ReadHalf`/`WriteHalf` enums are deleted; QUIC uses quinn's
-native halves). The `WebSocket` wrapper exposes binary messages as
-`AsyncRead`/`AsyncWrite` so the V1 protocol operates over WebSocket
-without changes. `try_tcp`/`try_tcp_mut` downcast to the raw `TcpStream`
-for the Linux `splice(2)` fast path; `is_yamux_wrappable` is false for QUIC
-only.
-
-**Config normalization** (`frp-core/src/config/`): full Go to Rust config compatibility layer. TOML values are converted via `toml_to_json()` to `serde_json::Value`, then deserialized into config structs. Legacy fields like `[common]`, `auth_method`, `log_file`, `web_server_*` are normalized.
-
-### Gotchas
-
-- `login_fail_exit` defaults to `true` in `ClientConfig::default()` but README example shows `false`
-- `#[serde(untagged)]` on `FrpMessage` enum -- ordering matters for serde matching, but V1 protocol dispatches by type byte first, so it is not involved in wire deserialization
-- `ProxyRuntimeInfo` must include `sk: String` field -- XTCP P2P encryption derives its AES-128 key from the proxy's SecretKey. Adding new fields to `ProxyRuntimeInfo` requires updating all construction sites
-- **No new dependencies without explicit justification** -- see the dependency policy in CLAUDE.md for the pre-approved tech stack and banned crates
-
-## 3. Adding a New Proxy Type
+**Architecture internals** (wire protocol, control plane, transports, XTCP)
+live in [architecture.md](architecture.md). The rules and gotchas an agent or
+contributor must not break are in [CLAUDE.md](../CLAUDE.md#gotchas). For the
+reference docs (config, proxies, plugins, deployment) see the
+[documentation index](README.md).
+
+## 2. Adding a New Proxy Type
 
 This section walks through adding a new proxy type called `myproxy`:
 
@@ -429,7 +93,7 @@ If your proxy type needs special bridging (e.g., HTTP host header rewriting, pro
 
 For the client side, proxy type handling is in `frp-client/src/service.rs` and `frp-client/src/work_conn.rs` -- the client reads `StartWorkConn` to know which local service to connect to.
 
-## 4. Building and Feature Flags
+## 3. Building and Feature Flags
 
 ### Quick Reference
 
@@ -442,36 +106,11 @@ cargo clippy                 # Lint
 
 ### Binary Variants
 
-Four size tiers via feature flags. QUIC and SSH are default; dashboard is opt-in:
-
-```bash
-# Default (SSH + QUIC included; no dashboard; keeps TLS, KCP, WS, compression)
-cargo build --release -p frps -p frpc
-# → frps (~8.5MB), frpc (~6.8MB)
-
-# Full (all features; dashboard the main opt-in on top of default)
-cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
-# → frps (~9.2MB), frpc (~6.8MB)
-
-# Tiny (no QUIC/KCP/WS/SSH/OIDC/dashboard/compression; keeps TLS)
-cargo build --release -p frps -p frpc --no-default-features --features tiny
-# → frps-tiny (~5.2MB), frpc-tiny (~4.6MB)
-
-# Micro (core only: no TLS, compression, chacha20, HTTP proxy, tcp-mux)
-cargo build --release -p frps -p frpc --no-default-features --features micro
-# → frps-micro (~3.2MB), frpc-micro (~3.5MB)
-```
-
-> Sizes measured 2026-09-01 (Linux x86_64, glibc, rustc 1.98.0) with the
-> declared release profile (fat-LTO, opt-level=z, codegen-units=1,
-> strip=symbols, panic=abort) — rustc flags verified via `cargo build -v`.
-> Platform-dependent: the same profile on macOS arm64 measured ~5.3/4.5MB on
-> 2026-08-08. The local `.cargo/config.toml` override was removed 2026-08-09
-> — local release builds use the declared profile. Only CI workflows write
-> `lto=false opt-level=2` on runners (build speed) and come out larger
-> (frps ~9.1MB measured 2026-08-09).
-
-The binaries are named `frps`/`frpc` (default/full), `frps-tiny`/`frpc-tiny`, and `frps-micro`/`frpc-micro` respectively.
+Four size tiers via feature flags. The authoritative tier list, exact commands
+and measured binary sizes live in the README —
+[**Binary Variants**](../README.md#binary-variants). The resulting binaries are
+named `frps`/`frpc` (default/full), `frps-tiny`/`frpc-tiny`, and
+`frps-micro`/`frpc-micro`.
 
 ### Feature Flags
 
@@ -518,7 +157,7 @@ After `cargo build --release`, further compress with UPX:
 upx --best --lzma target/release/frps target/release/frpc
 ```
 
-## 5. Debugging
+## 4. Debugging
 
 ### RUST_LOG Levels
 
@@ -592,7 +231,7 @@ sudo tcpdump -i lo -X -s 0 port 7000
 - Symmetric NAT on both sides usually prevents hole punching -- STCP fallback is needed
 - Check that `sk` is set and identical on both provider and visitor proxies
 
-## 6. Testing
+## 5. Testing
 
 ### Unit Tests
 
@@ -703,7 +342,7 @@ Proptest-based tests verify correctness under adversarial inputs:
 - **Config normalization** (`frp-core/src/config/`): 9 proptest! blocks — idempotency, flat↔nested equivalence, camelCase→snake_case
 - **Protocol fuzzing** (`frp-core/src/protocol.rs`): 6 fuzz tests + 35 regular tests — all 256 V1 type bytes × arbitrary payloads, V2 arbitrary type IDs, truncated frames, magic detection
 
-## 7. Release Process
+## 6. Release Process
 
 ### Version Bumping
 
