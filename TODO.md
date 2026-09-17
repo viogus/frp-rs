@@ -370,7 +370,7 @@ nothing about whether the described behaviour still holds.
   `frp-core/vendored/` directory was deleted locally (untracked, so not part of
   any commit).
 
-- [ ] **No automated check for stale path references — and a naive one does not work.**
+- [x] **No automated check for stale path references — and a naive one does not work.**
   Evidence: a regex sweep for repo-looking paths that do not resolve produced
   **135 hits, essentially all false positives**: `Cargo.toml` feature syntax
   (`frp-core/tls` is a feature, not a path), and crate-relative paths in
@@ -381,6 +381,31 @@ nothing about whether the described behaviour still holds.
   referencing file's own directory and distinguishes `Cargo.toml` feature syntax
   — or an explicit decision that this class stays a manual review item.
   Do not ship the naive regex as a CI gate: it fails on a clean tree.
+  Done: `scripts/repo-health.sh` (the `health` CI job) gained a third `Docs`
+  gate. Measured on the clean tree: **0 stale path references** — so it is a
+  **gate** (`fail=1` on a hit), not a report. The script prints the current
+  counts (198 references checked; 216 skipped as locator-less: 171 bare
+  filenames like `mux.rs`/`store.rs` + 45 crate-`src/` shorthands like
+  `control/mod.rs`/`plugin/h2.rs`).
+  Each candidate resolves against the directory of the file that names it first
+  and the repo root second, and Rust source comments are scanned as well as
+  markdown, so the deleted-directory case from the item above is caught in both
+  media. `crate/feature` spans are classified from each member's `[features]`
+  table plus the implicit features of its optional dependencies (`frp-core/tls`
+  is not a path), not from a hard-coded list. The check deliberately does *not*
+  flag spans with no locating root: those are exactly the naive sweep's false
+  positives, and their base cannot be recovered mechanically, so they are
+  counted in the output and left to review. Historical records
+  (`docs/archive/**`, `docs/history/**`, dated `docs/audit/**`, `CHANGELOG.md`),
+  the dated root `performance-audit.md`, the forward-looking
+  `docs/refactor-large-modules.md`, and this backlog — which quotes removed
+  paths as evidence — are out of scope by design.
+  It does **not** catch a directory that still exists with its contents emptied:
+  recreating `frp-core/vendored/kcp-0.6.0/` holding only a `Cargo.lock` passes
+  the gate. Existence is all that is mechanically checkable; "this directory no
+  longer holds what the text claims" is semantic, and a "non-empty directory"
+  heuristic would false-positive on the accurate `scripts/go-frp/` reference
+  (it holds only a `LICENSE` today). That residue stays a manual review item.
 
 - [x] **Documentation index is manual.**
   Evidence: `docs/README.md` lists docs by hand, so a new doc was invisible until
