@@ -13,6 +13,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use frp_core::config::PluginConfig;
+// Only referenced by the `tls`-gated https2https test below (API-surface
+// sanity); without TLS this import is dead and `-D warnings` rejects it.
+#[cfg(feature = "tls")]
 use frp_core::transport::IoStream;
 
 fn plugin_cfg(plugin_type: &str, local_addr: String) -> PluginConfig {

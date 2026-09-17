@@ -395,7 +395,7 @@ async fn test_tcpmux_connect_lf_head_passthrough_raw_bytes() {
     let mut forwarded = Vec::new();
     let mut chunk = [0u8; 256];
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while !frp_core::textproto::head_end(&forwarded).is_some() {
+        while frp_core::textproto::head_end(&forwarded).is_none() {
             let m = work_conn
                 .read(&mut chunk)
                 .await

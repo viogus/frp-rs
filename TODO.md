@@ -182,11 +182,15 @@ nothing about whether the described behaviour still holds.
   `parse_strict_config_matches_strconv_parse_bool` unit test; `docs/deployment.md`
   updated.
 
-- [ ] **The `tiny`/`micro` feature builds emit warnings, and CI does not deny them.**
+- [x] **The `tiny`/`micro` feature builds emit warnings, and CI does not deny them.**
   Evidence: `cargo build --release --no-default-features --features tiny|micro`
-  on `main` reports (macOS arm64, rustc 1.96.0):
-  - `frp-server/src/vhost.rs:3` — unused import `AsyncWriteExt` (its method call
-    sites are feature-gated out of the small tiers)
+  on `main` reports (macOS arm64, rustc 1.96.0). Measured precisely on the same
+  host: **`tiny` is clean; all three warnings are `micro`-only** — the original
+  `tiny|micro` phrasing was imprecise, because `tiny` keeps `tls` and each site
+  is live in a TLS build:
+  - `frp-server/src/vhost.rs:3` — unused import `AsyncWriteExt` (its remaining
+    direct method use is the TLS-alert write in the `tls`-gated HTTPS vhost
+    listener; the two response writers take `impl AsyncWriteExt` bounds)
   - `frp-client/src/plugin/mod.rs:153` `take_plugin_peer` — never used once the
     TLS plugins are compiled out
   - `frp-client/src/plugin/mod.rs:160` `plugin_peer_ip` — same
@@ -204,6 +208,56 @@ nothing about whether the described behaviour still holds.
   (Also found on the same run: `cargo build -p frpc` warned on
   `static_file.rs:1090` because `file` is only read in the `target_os="linux"`
   branch — fixed, `let _ = file;` in the non-Linux arm.)
+  **Done:** reproduced on macOS arm64 / rustc 1.96.0 — `tiny` 0 warnings,
+  `micro` exactly the three sites above. Fixed by cfg-gating, no `allow`s:
+  `vhost.rs:3` split into `use tokio::io::AsyncReadExt;` plus
+  `#[cfg(feature = "tls")] use tokio::io::AsyncWriteExt;`; `take_plugin_peer`,
+  `plugin_peer_ip`, the four registry tests and the `plugin_peer_ip_now` helper
+  are `#[cfg(feature = "tls")]`. Correction to this item's guess: the import
+  gate is `tls`, not `http-proxy` — on the pre-fix tree
+  `cargo check -p frp-server --no-default-features --features http-proxy` warns
+  while `--features tls` is clean, and a `tls`-only build is exactly the one
+  that needs the trait. `register_plugin_peer`/`clear_plugin_peers`/
+  `PluginPeerGuard` stay unconditional (`work_conn.rs` registers them in every
+  build), so `micro` behaviour is unchanged. CI: both `verify`-job tier steps in
+  `ci.yml` now set `env: RUSTFLAGS: "-D warnings"` (this changes the compiler
+  fingerprint, so the restored `target/` cache is not reused for those two
+  steps — accepted). Two-direction proof of the gate:
+  `RUSTFLAGS="-D warnings" cargo check --workspace --no-default-features
+  --features micro` exits 0 with the fix; removing the `vhost.rs` import cfg
+  exits 101 with `error: unused import: AsyncWriteExt`, and removing the
+  `take_plugin_peer` cfg exits 101 with `error: function take_plugin_peer is
+  never used`. All four profiles pass `-D warnings` on macOS (default,
+  `--all-features`, `tiny`, `micro`; 0 warnings each). The gated test module is
+  verified by `RUSTFLAGS="-D warnings" cargo check -p frp-client
+  --no-default-features --all-targets` (exit 0) — a *workspace* `--all-targets`
+  run cannot test this, because `frp-server`'s dev-dependency on `frp-client`
+  re-enables frp-client's default features. That same sweep found and fixed one
+  more site of this class: the `IoStream` import in
+  `frp-client/tests/plugin_http.rs`, used only by its `tls`-gated https2https
+  test, now `#[cfg(feature = "tls")]`. Linux is delegated to the edited `verify`
+  CI job — macOS cannot run the Linux `#[cfg]` paths here.
+
+- [ ] **The `Lint` gate depends on the unpinned runner toolchain, so it can go red on unchanged code.**
+  Evidence: on `rustc 1.96.0` / `clippy 0.1.96` the documented gate
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings` failed
+  on unmodified base content:
+  `error: this boolean expression can be simplified` at
+  `frp-server/tests/tcpmux.rs:398` (`clippy::nonminimal_bool` on
+  `while !…is_some()`, exit 101); the lint is new in 1.96.0, so the same command
+  is green on the older stable a CI image happens to ship. No workflow pins a
+  toolchain — every job runs `rustup default stable`
+  (`.github/workflows/ci.yml`), so `Lint`'s result is a function of the runner
+  image, not the commit. `CLAUDE.md`'s "zero warnings" health line was false on
+  1.96.0 until this round. (The `is_some()`→`is_none()` fix landed with the
+  tiny/micro tier-warning item above; this item is the structural hazard, not
+  that one line.)
+  **Done-when:** the toolchain is pinned (a `rust-toolchain.toml`, or an explicit
+  `rustup toolchain install <version>` + `rustup default <version>` in CI) so a
+  rustc/clippy bump is a deliberate, reviewable change rather than a
+  runner-image race, and the `Lint` gate is verified green on that pinned
+  version. A `rust-toolchain.toml` would also make the local/CI lint result
+  identical, which is the property the health table currently assumes.
 
 - [ ] **The compat gate is flaky, which weakens the project's strongest claim.**
   Evidence: on 2026-09-17 the `compat` CI job failed **2 of 3 consecutive runs on

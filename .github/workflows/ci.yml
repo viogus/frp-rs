@@ -180,9 +180,17 @@ jobs:
       - name: Check benchmarks compile
         run: cargo bench --workspace --no-run
       - name: Check tiny feature set compiles
+        # RUSTFLAGS is part of the compiler fingerprint, so the restored
+        # target/ cache (built without it) is not reused for these two steps;
+        # they recompile the tier graphs. That cost is the point: the tier
+        # builds must not warn, and these steps are what enforce it.
         run: cargo check --workspace --no-default-features --features tiny
+        env:
+          RUSTFLAGS: "-D warnings"
       - name: Check micro feature set compiles
         run: cargo check --workspace --no-default-features --features micro
+        env:
+          RUSTFLAGS: "-D warnings"
 
   build:
     name: Build (release)

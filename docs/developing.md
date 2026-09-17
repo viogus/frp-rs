@@ -134,6 +134,16 @@ and measured binary sizes live in the README —
 named `frps`/`frpc` (default/full), `frps-tiny`/`frpc-tiny`, and
 `frps-micro`/`frpc-micro`.
 
+CI compiles the tiny and micro tiers with `RUSTFLAGS="-D warnings"` (the
+`verify` job in `.github/workflows/ci.yml`). A feature-gated item whose `#[cfg]`
+gate is missing therefore fails CI instead of only emitting a warning locally;
+run the same two commands before pushing a change that touches `#[cfg]` code:
+
+```bash
+RUSTFLAGS="-D warnings" cargo check --workspace --no-default-features --features tiny
+RUSTFLAGS="-D warnings" cargo check --workspace --no-default-features --features micro
+```
+
 ### Feature Flags
 
 The authoritative flag table — every feature, the crate it belongs to, what it
@@ -433,7 +443,8 @@ covered by any gate and are the ones that have actually been missed before.
       the `VERSION` constant, `scripts/download-frp-rs.sh` and the README.
 - [ ] **Gates green on `main`** — `cargo fmt --all -- --check`,
       `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
-      `cargo test --workspace --all-features`, `bash scripts/compat-test.sh`
+      `cargo test --workspace --all-features`, the two `RUSTFLAGS="-D warnings"`
+      tiny/micro tier checks, `bash scripts/compat-test.sh`
       against the matching Go frp release, `bash scripts/protocol-matrix.sh`, and
       the daily XTCP VPS matrix.
 - [ ] **Notes written in the right place** — the user-facing summary in
