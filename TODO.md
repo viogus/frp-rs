@@ -509,11 +509,39 @@ nothing about whether the described behaviour still holds.
   expressions sharing a single justification comment, so the second block carried
   none of its own — it now has one (comment-only change).
 
-- [ ] **Feature surface is wide for a single maintainer.**
+- [x] **Feature surface is wide for a single maintainer.**
   Evidence: SSH gateway, L3 VPN/TUN, OIDC, dashboard, h2c, 10 client plugins,
   SUDP, V2 protocol, and two XTCP data planes — each with its own parity debt.
   **Done-when:** an explicit keep/opt-in/drop decision per surface is recorded, so
   effort stops spreading by default.
+  Done: the decision is recorded as a **tiered maintenance policy, not a deletion
+  plan**, in
+  [`docs/developing.md § Maintenance policy: feature surface`](docs/developing.md#maintenance-policy-feature-surface)
+  (with a one-line pointer from `CLAUDE.md`). Tiers: **Keep** (full parity, Go
+  work welcome) = the default surface — TCP/UDP/HTTP/HTTPS/STCP/XTCP, V1+V2 wire
+  protocol, encryption/compression, tcp-mux, the five transports, OIDC, the
+  dashboard, the SSH gateway, the 10 client plugins, and the server-side
+  `[[httpPlugins]]` manager; **Opt-in** (best-effort, out of the default build on
+  purpose) = `vnet`, `mimalloc`, `otel`, frpc `admin`; **Freeze** (bug-fix only,
+  no new Go-parity work, nothing removed) = SUDP, h2c, Windows TUN, and the
+  non-default XTCP KCP+yamux plane. Every frozen surface carries an explicit
+  "unfreeze if" condition (a user report of real use, a Go-side change, or a case
+  the QUIC plane cannot serve), and the section states how a surface moves tiers:
+  the maintainer decides, in a commit naming the evidence, with no second
+  reviewer.
+  This item's own evidence needed one correction, and two of its framings were
+  verified rather than trusted. The **server-side `http-proxy` plugin is
+  default-on, not opt-in** (`frp-server/Cargo.toml:43`; also in `tiny` at
+  `frps/Cargo.toml:24`), so it is recorded under Keep, and the contrary
+  "server-side opt-in" clause in `CLAUDE.md` was fixed. h2c is real and distinct
+  (`frp-server/src/vhost_h2c.rs`, 3414 lines) but rides that default-on
+  `http-proxy` feature (`frp-server/src/vhost.rs:23`), so its freeze is a
+  code-review rule rather than a build gate; the Windows TUN stub errors on every
+  operation (`frp-vnet/src/tun_windows.rs:1,24,34`); and the **default XTCP data
+  plane is QUIC**, not KCP (`frp-core/src/config/client.rs:823`,
+  `docs/config.md:659`) — the live docs already agreed, so no correction was
+  needed there. SUDP is confirmed as a distinct proxy type, not a UDP variant
+  (`frp-core/src/config/loader.rs:219`).
 
 ---
 

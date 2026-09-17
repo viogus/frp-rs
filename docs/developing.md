@@ -584,6 +584,76 @@ The release workflow:
 
 The Docker workflow runs separately (`.github/workflows/docker.yml`) and can be triggered manually or on release.
 
+## Maintenance policy: feature surface
+
+frp-rs has one maintainer and more surface than one maintainer can hold at full
+Go parity. The policy is **tiered by maintenance effort, not by deletion**:
+every surface below has an explicit decision and none is removed. The parity
+debt behind each decision is in [`../TODO.md`](../TODO.md); the per-surface Go
+comparison is in [`go-frp-compat-audit.md`](go-frp-compat-audit.md), and the
+end-to-end evidence is [`scripts/compat-test.sh`](../scripts/compat-test.sh)
+(see [§ Cross-Compatibility Tests](#cross-compatibility-tests)).
+
+This is a **single-maintainer decision with no second reviewer** — the same
+posture as the vendored-crate release check
+([§ Pre-release checklist](#pre-release-checklist)) and the bus-factor item in
+[`../TODO.md`](../TODO.md). It is recorded so a contributor can tell, for a
+given surface, whether new Go-parity work is welcome, tolerated, or out of
+scope.
+
+| Tier | What a change means | Surfaces |
+|---|---|---|
+| **Keep** — full parity maintained | Go-parity work and cross-compat coverage are welcome; a regression is a bug. | TCP, UDP, HTTP, HTTPS, STCP, XTCP; V1 and V2 wire protocol; encryption and compression; TCP multiplexing; the transports (TCP, WebSocket, TLS, KCP, QUIC); OIDC; the dashboard; the SSH gateway; the 10 client plugins; the server-side `[[httpPlugins]]` manager. |
+| **Opt-in** — best-effort | Fixes when a user needs them; no proactive parity investment. Staying out of the default build is intentional. | `vnet` (L3 VPN/TUN), `mimalloc`, `otel`, the frpc `admin` API. |
+| **Freeze** — bug-fix only | No new Go-parity work, no Go-parity-only tests, no refactor. Not removed. | SUDP; h2c; Windows TUN; the non-default XTCP data plane (KCP+yamux). |
+
+Three build-tier facts the tier names alone would hide. The dashboard is
+**Keep** even though it is an opt-in Cargo feature (`frp-server/Cargo.toml:45`)
+— it is part of the product, just not of every binary — while the SSH gateway
+is default-on (`frp-server/Cargo.toml:44`). The `http-proxy` feature is
+**default-on** (`frp-server/Cargo.toml:43`), so the server-side
+`[[httpPlugins]]` manager is Keep; that same feature gates the frozen h2c module
+(`frp-server/src/vhost.rs:23`), so h2c's freeze is a code-review rule rather
+than a build gate — the frozen code still compiles into the default and tiny
+tiers, and splitting the feature is not part of this policy. Finally, one of
+the 10 client plugins, `virtual_net`, is the TUN-backed path with no listener
+of its own (`frp-client/src/plugin/mod.rs:331`), so it follows the opt-in
+`vnet` tier.
+
+### Frozen surfaces, and what would unfreeze each
+
+A freeze is a recorded decision, not neglect: each one names the evidence that
+would lift it. Unfreezing moves the surface to **Keep** and resumes full parity
+work; a bug fix on a frozen surface never needs an unfreeze.
+
+- **SUDP** (`type = "sudp"`) — a distinct proxy type, not a UDP variant
+  (`frp-core/src/config/loader.rs:219`), with frp-rs-specific shared-port
+  handling. Unfreeze if a deployment is shown to use it (a user report — the
+  repo carries no usage telemetry) or if Go frp changes its SUDP/VisitorManager
+  behaviour and compat breaks beyond what a fix can cover.
+- **h2c** (`frp-server/src/vhost_h2c.rs`) — HTTP/2-cleartext decode/re-encode
+  on the server vhost path. Unfreeze if Go frp changes its h2c handling (its
+  `net/http` upgrade path or `pkg/util/vhost`) or a user report shows an h2c
+  interop failure that must be re-derived from Go source.
+- **Windows TUN** (`frp-vnet/src/tun_windows.rs`) — an explicit stub whose
+  `open()` and `configure()` always error. Unfreeze if someone commits to the
+  Wintun (`wintun.dll`) integration *and* can test on a Windows host; this
+  repo's CI does not exercise vnet on Windows.
+- **Non-default XTCP data plane (KCP+yamux)** — selected by `protocol = "kcp"`;
+  the default is QUIC (`frp-core/src/config/client.rs:823`,
+  `docs/config.md:659`). Unfreeze if a case is reported that the QUIC plane
+  cannot serve (for example a hole punch where the QUIC handshake never
+  completes but KCP does).
+
+### How a surface moves between tiers
+
+The maintainer makes the move in a commit that edits this section and the
+matching item in [`../TODO.md`](../TODO.md), and the commit must name the
+evidence: a user report of real use, a Go frp release-note or source change, or
+a compat-matrix failure on that surface. Moving a surface into **Keep** means
+deleting its "unfreeze if" line; that edit plus the reason is the whole change.
+There is no second reviewer, so the recorded reason **is** the control.
+
 ## Dependency Policy
 
 The dependency policy — the pre-approved tech stack table, the banned list and
