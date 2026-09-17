@@ -153,10 +153,19 @@ jobs:
       - name: Build binaries (needed for integration tests)
         run: cargo build --bin frps --bin frpc
       - name: Run frp-client integration tests
+        # `--features admin`: admin is opt-in, so frp-client's default
+        # features exclude it. These admin-gated tests are COMPILED in CI
+        # (Lint lane: clippy --workspace --all-targets --all-features) but
+        # were never EXECUTED: this lane's default-feature `cargo test`
+        # skipped them, and the all-features test lane is `--lib` only
+        # (integration bins excluded). Pin the feature here so they run.
+        # NB: they cover the admin handler (body-less GET /api/reload,
+        # `?strictConfig=` ParseBool parity, malformed-body 400), not the
+        # `frpc reload` CLI path.
         # -j 1: same ephemeral-port collision rationale as the server lane;
         # client-side only here (frp-server bins run on their own runner, so
         # cross-crate port collision is gone).
-        run: cargo test -p frp-client -j 1
+        run: cargo test -p frp-client --features admin -j 1
         env:
           FRPS_BIN: ${{ github.workspace }}/target/debug/frps
           FRPC_BIN: ${{ github.workspace }}/target/debug/frpc
