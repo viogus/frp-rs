@@ -87,6 +87,66 @@ for c in frp-core frp-server frp-client frp-vnet; do
 done
 printf '\n  Convention: every unsafe block carries a `// SAFETY:` comment.\n'
 
+# Gate: an `unsafe {` block with no `// SAFETY:` justification. The convention was
+# previously enforced by review alone.
+#
+# Getting this right matters more than it looks. A first attempt used a fixed
+# 3-line look-behind and reported 14 violations on a clean tree — every one a
+# false positive, because the justification is usually a multi-line comment block
+# (4-9 lines) or sits inside the block. So: walk up over the whole contiguous
+# comment/attribute block, and also look a few lines into the block itself.
+if command -v python3 >/dev/null 2>&1; then
+  unsafe_misses=$(python3 - <<'PY'
+import os, re
+
+INNER = 4  # lines into the block to also scan (catches `let n = unsafe {` + comment inside)
+MARKER = re.compile(r'//\s*SAFETY')
+
+
+def justified(lines, i):
+    seen = []
+    j = i - 1
+    while j >= 0:  # contiguous comment / attribute block immediately above
+        s = lines[j].strip()
+        if s.startswith('//') or s.startswith('#['):
+            seen.append(s)
+            j -= 1
+            continue
+        break
+    seen.extend(l.strip() for l in lines[i:i + INNER])
+    return any(MARKER.search(s) for s in seen)
+
+
+for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
+    src = os.path.join(crate, 'src')
+    if not os.path.isdir(src):
+        continue
+    for root, _dirs, files in os.walk(src):
+        for fn in files:
+            if not fn.endswith('.rs'):
+                continue
+            path = os.path.join(root, fn)
+            try:
+                lines = open(path, encoding='utf8', errors='ignore').read().split('\n')
+            except OSError:
+                continue
+            for i, line in enumerate(lines):
+                if re.search(r'unsafe\s*\{', line) and not justified(lines, i):
+                    print('%s:%d' % (path, i + 1))
+PY
+)
+  if [ -n "$unsafe_misses" ]; then
+    printf '%s\n' "$unsafe_misses" | sed 's/^/    /'
+    n=$(printf '%s\n' "$unsafe_misses" | wc -l | tr -d ' ')
+    printf '  FAIL  %s unsafe block(s) with no `// SAFETY:` justification\n' "$n"
+    fail=1
+  else
+    printf '  ok    every unsafe block has a `// SAFETY:` justification\n'
+  fi
+else
+  printf '  skip  python3 not found — unsafe/SAFETY gate not evaluated\n'
+fi
+
 # ---------------------------------------------------------------- vendored
 hdr "Vendored crates ([patch.crates-io])"
 for v in vendor/*/; do

@@ -1,6 +1,13 @@
 # Changelog
 
-All notable changes to frp-rs.
+User-facing release notes for frp-rs.
+
+> **Scope.** This file is for users: what changed and why it matters, a few lines
+> per item. The round-by-round record — findings, review outcomes, gate results,
+> commit hashes — lives in
+> [`docs/history/development-log.md`](docs/history/development-log.md). Do not
+> write the same detail in both; see the
+> [docs conventions](docs/README.md#conventions-for-these-docs).
 
 ## v0.71.0 — re-release (2026-09-13)
 

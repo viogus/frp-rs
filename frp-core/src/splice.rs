@@ -38,6 +38,7 @@ fn create_pipe_pair() -> io::Result<(AsyncFd<OwnedFd>, AsyncFd<OwnedFd>, usize)>
     }
     // SAFETY: pipe2 returned 0, so fds[0] and fds[1] are valid open fds.
     let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: as above — pipe2 returned 0, so fds[1] is a valid open fd.
     let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
     // Grow both ends to PIPE_CAPACITY. F_SETPIPE_SZ fails with EPERM when the
     // requested size exceeds the kernel's pipe-max-size (or the process's
