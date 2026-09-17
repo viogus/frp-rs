@@ -878,4 +878,16 @@ RUST_LOG=debug ./frps -c frps.toml
 RUST_LOG=frp_core=trace,frp_server=debug ./frps -c frps.toml
 ```
 
-Both the config file `log.level` and the `RUST_LOG` environment variable control log verbosity. See the `tracing-subscriber` documentation for precedence rules.
+Log level resolves in this order (first match wins):
+
+1. **`RUST_LOG`** — overrides everything, and accepts the full
+   [`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)
+   syntax (`RUST_LOG=frp_server=debug,info`).
+2. **`log.level` in the config file**, or the `--log-level` CLI flag —
+   `trace`, `debug`, `info`, `warn` or `error`.
+3. Default: `info`.
+
+Per-connection events (`Bridging user conn…`, `bridge completed`) log at
+**`debug`**, not `info` — a busy proxy would otherwise emit a line per
+connection into the default output. Enable them with `RUST_LOG=debug` or
+`log.level = "debug"`.

@@ -7,6 +7,7 @@ read the [main README](../README.md) first, then pick from the tables below.
 
 | Document | What it covers |
 |---|---|
+| [Why frp-rs?](why-frp-rs.md) | The positioning argument against Go frp — what it buys you, what it does not, and which binary tier to pick |
 | [Configuration Reference](config.md) | Every config field, with types, defaults and Go frp equivalents |
 | [Proxy Type Guide](proxies.md) | When and how to use each proxy type (TCP, UDP, HTTP, STCP, XTCP, …) |
 | [Client Plugins](client-plugins.md) | `http_proxy`, `socks5`, `static_file`, TLS termination, `virtual_net`, … |
@@ -41,10 +42,12 @@ read the [main README](../README.md) first, then pick from the tables below.
 ## `archive/` — archived working artifacts
 
 > **Not current documentation.** `docs/archive/{plans,specs,notes,audit}/` holds
-> 81 dated design documents and audit outputs (1.7 MB) captured *while* the
+> dozens of dated design documents and audit outputs captured *while* the
 > corresponding work was in flight. They are kept as a historical record and for
 > the raw evidence behind decisions, but they describe the state of the tree at
-> their date, not today.
+> their date, not today. The exact inventory is counted by
+> `bash scripts/repo-health.sh` ("archive inventory") rather than quoted here —
+> this line said "81 documents" long after the number had moved.
 >
 > This directory was named `docs/superpowers/` until it was moved to
 > `docs/archive/` so its status is obvious from the path. Paths *inside* these

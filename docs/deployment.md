@@ -533,14 +533,32 @@ The dashboard provides:
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /` | HTML dashboard (version, uptime, client/proxy counts) |
+| `GET /` | HTML dashboard (version, uptime, client/proxy counts) — auth-protected |
 | `GET /api/status` | JSON status |
+| `GET /api/serverinfo` | Server info (Go frp dashboard parity) |
 | `GET /api/proxies` | List all proxies with traffic stats |
-| `GET /api/proxies/{name}` | Single proxy detail (also `GET /api/proxy/{type}/{name}`) |
-| `GET /api/proxy/:name/traffic` | Traffic counters for a proxy |
+| `DELETE /api/proxies` | Bulk delete; JSON body `{"proxies": ["name", …]}` |
+| `GET /api/proxies/{name}` | Single proxy detail |
+| `GET /api/proxy/{type}` | List proxies of one type |
+| `GET /api/proxy/{type}/{name}` | Single proxy, scoped by type |
+| `GET /api/traffic/{name}` | Proxy traffic counters (the Go v1 route, `api_router.go:46`) |
+| `GET /api/proxy/{name}/traffic` | Same body as `/api/traffic/{name}` — frp-rs alias; Go's v1 route table has no such path |
+| `GET /api/clients` / `GET /api/clients/{run_id}` | Connected clients |
+| `GET /api/events` | WebSocket stream of live dashboard events |
+| `GET /api/store/proxies` / `POST /api/store/proxies` | List / create dashboard-managed (stored) proxies |
+| `DELETE /api/store/proxy/{name}` | Delete a stored proxy |
 | `GET /api/v2/config` | Sanitized server config (the `auth` section carries only the method name; dashboard `user`/`password` are omitted) |
 | `PUT /api/v2/proxy/{name}/update` | Hot-update a live proxy's server-side bandwidth settings |
-| `GET /metrics` | Prometheus text format (if enabled) |
+| `GET /api/v2/system/info` | Version, config summary and status (Go `V2SystemInfoResp` parity) |
+| `POST /api/v2/system/prune` | Clear offline-proxy statistics; requires `?type=offline_proxies`, the only accepted value (Go `V2SystemPruneResp` parity) |
+| `GET /api/v2/users` | User list (Go `APIV2UserList` parity) |
+| `GET /api/v2/clients` / `GET /api/v2/clients/{key}` | Connected clients, v2 shape |
+| `GET /api/v2/proxies` / `GET /api/v2/proxies/{name}` / `GET /api/v2/proxies/{name}/traffic` | Proxies and per-proxy traffic, v2 shape |
+| `GET /metrics` | Prometheus text format (only if `enable_prometheus = true`; still requires Basic auth) |
+
+Outside auth, matching Go frp (`server.go:125-129`): `GET /healthz`,
+`GET /debug/pprof` and `GET /debug/pprof/{*path}` — the pprof handlers are
+placeholders that serve no Go-style CPU profiles.
 
 `PUT /api/v2/proxy/{name}/update` accepts a JSON body such as
 `{"bandwidthLimit": "2MB", "bandwidthLimitMode": "server"}`. Only
@@ -573,6 +591,11 @@ server {
 
 **Client admin API** (`frpc`):
 
+> The frpc admin API is behind the **opt-in `admin` feature** (it was a default
+> until the 2026-08-09 audit round). A default `frpc` build ignores
+> `web_server.port` entirely — build with `--features admin` to get it:
+> `cargo build --release -p frpc --features admin`.
+
 ```toml
 # frpc.toml
 [web_server]
@@ -587,10 +610,21 @@ Client endpoints:
 | Endpoint | Description |
 |----------|-------------|
 | `GET /api/status` | Proxy status grouped by type |
+| `GET /api/metrics` | Prometheus text format |
 | `GET /api/config` | Current config (sensitive values redacted) |
-| `PUT /api/config` | Update config + trigger reload |
-| `GET /api/reload` | Reload proxies from config file |
+| `PUT /api/config` | Update config + trigger reload (body limit 1 MiB) |
+| `GET /api/proxy/{name}/config` | Effective config of one proxy |
+| `GET /api/visitor/{name}/config` | Effective config of one visitor |
+| `GET /api/reload` / `POST /api/reload` | Reload proxies from config file (strict mode via JSON body `{"strict_config": true}`) |
 | `POST /api/stop` | Gracefully stop the client |
+| `GET` / `POST /api/store/proxies`, `GET` / `PUT` / `DELETE /api/store/proxies/{name}` | Runtime proxy store CRUD — only when `store.path` is set; **frp-rs-only** (Go frp's admin API uses a different nested body shape, so this is not wire-compatible with a Go admin client) |
+| `GET` / `POST /api/store/visitors`, `GET` / `PUT` / `DELETE /api/store/visitors/{name}` | Runtime visitor store CRUD — same conditions |
+
+`/api/reload` reads its body with axum's `Json` extractor, so both methods must
+send `Content-Type: application/json` and a JSON body (`{}` for a normal reload,
+`{"strict_config": true}` for strict mode); a request without a JSON body is
+rejected with 415. Note this differs from Go frp, whose `GET /api/reload` takes no
+body — see [TODO.md](../TODO.md).
 
 ### Health Checks
 
@@ -741,6 +775,24 @@ pool_count = 5    # keep up to 5 idle work connections ready
 Start with `pool_count = 1` and increase if you observe latency spikes on
 first connections to infrequently-used proxies. Each pooled connection
 consumes negligible resources when idle.
+
+Measured connection-setup latency (64 B probe, 2000 samples, loopback):
+
+| `pool_count` | setup p50 | setup p99 |
+|--------------|-----------|-----------|
+| `0` (cold)   | 251 µs    | 633 µs    |
+| `4` (warm)   | 191 µs    | 372 µs    |
+
+Warming the pool cut setup p50 by ~24% and p99 by ~41% on loopback.
+Latency-sensitive deployments can raise `pool_count` further.
+
+`TCP_NODELAY` is enabled on every data-path TCP connection automatically
+(matching Go frp), so small request/response and interactive traffic is not
+delayed by Nagle's algorithm — no configuration needed.
+
+For memory-constrained or high-fan-out servers, the per-connection bridge buffer
+defaults to 32 KiB (matching Go frp) and can be tuned via the `FRP_BRIDGE_BUF_KB`
+environment variable (range 4–1024).
 
 **Heartbeat intervals:**
 

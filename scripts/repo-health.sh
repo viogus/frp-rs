@@ -221,6 +221,13 @@ PY
   set -- $archive
   printf '  info  archive path refs: %s, resolvable via the docs/archive/ prefix: %s\n' "${1:-0}" "${2:-0}"
   printf '        (the remainder point at specs that were never written — pre-existing)\n'
+
+  # (c) Report: the archive inventory size quoted in docs/README.md.
+  # Hand-maintained counts go stale silently (it said 81 while the tree had a
+  # different number), so measure it here and keep the doc's figure sourced.
+  n_arch=$(find docs/archive -type f -name '*.md' ! -name 'README.md' | wc -l | tr -d ' ')
+  sz_arch=$(du -sh docs/archive 2>/dev/null | cut -f1)
+  printf '  info  archive inventory: %s dated documents (%s)\n' "$n_arch" "$sz_arch"
 else
   printf '  skip  python3 not found — docs checks not evaluated\n'
 fi
