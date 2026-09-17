@@ -24,13 +24,25 @@ ECHO_PORT=18002
 TOKEN="latency-token"
 OUT="scripts/frp-stress/baselines/latency-$(hostname -s).jsonl"
 
-echo "=== Building release binaries ==="
-cargo build --release -p frps -p frpc 2>&1 | tail -2
+echo "=== Building the frp-stress harness ==="
 (cd scripts/frp-stress && cargo build --release 2>&1 | tail -2)
 
-FRPS=./target/release/frps
-FRPC=./target/release/frpc
+# frps/frpc default to this tree's release build; set FRPS_BIN/FRPC_BIN to
+# measure a different implementation (see scripts/compare-go-frp.sh).
+if [ -z "${FRPS_BIN:-}" ] || [ -z "${FRPC_BIN:-}" ]; then
+  echo "=== Building release binaries (set FRPS_BIN/FRPC_BIN to skip) ==="
+  cargo build --release -p frps -p frpc 2>&1 | tail -2
+fi
+FRPS="${FRPS_BIN:-./target/release/frps}"
+FRPC="${FRPC_BIN:-./target/release/frpc}"
 STRESS=./scripts/frp-stress/target/release/frp-stress
+
+for bin in "$FRPS" "$FRPC" "$STRESS"; do
+  if [ ! -x "$bin" ]; then
+    echo "error: not executable: $bin" >&2
+    exit 1
+  fi
+done
 
 PIDS=()
 cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; }

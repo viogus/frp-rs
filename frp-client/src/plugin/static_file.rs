@@ -1098,6 +1098,11 @@ fn open_handle_canonical(
     }
     #[cfg(not(target_os = "linux"))]
     {
+        // `file` is only consulted on Linux (the /proc/self/fd walk above), so on
+        // other platforms it is genuinely unused here. Without this, `cargo build`
+        // warns on macOS/Windows while Linux CI stays clean — the warning is real,
+        // it is just platform-specific.
+        let _ = file;
         std::fs::canonicalize(_path).map_err(|e| format!("failed to resolve path: {e}"))
     }
 }

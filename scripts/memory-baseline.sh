@@ -21,13 +21,27 @@ ECHO_PORT=18002
 TOKEN="memory-token"
 OUT="scripts/frp-stress/baselines/memory-$(hostname -s).jsonl"
 
-echo "=== Building mem-profile binaries + harness ==="
-cargo build --release -p frps -p frpc --features mem-profile 2>&1 | tail -2
+echo "=== Building the frp-stress harness ==="
 (cd scripts/frp-stress && cargo build --release 2>&1 | tail -2)
 
-FRPS=./target/release/frps
-FRPC=./target/release/frpc
+# frps/frpc default to a mem-profile build of this tree. Set FRPS_BIN/FRPC_BIN to
+# measure a different implementation — e.g. a Go frp release — in which case the
+# MEMPROFILE allocator counters are absent and are reported as `null` rather than
+# 0 (see the block that emits the JSON below).
+if [ -z "${FRPS_BIN:-}" ] || [ -z "${FRPC_BIN:-}" ]; then
+  echo "=== Building mem-profile binaries (set FRPS_BIN/FRPC_BIN to skip) ==="
+  cargo build --release -p frps -p frpc --features mem-profile 2>&1 | tail -2
+fi
+FRPS="${FRPS_BIN:-./target/release/frps}"
+FRPC="${FRPC_BIN:-./target/release/frpc}"
 STRESS=./scripts/frp-stress/target/release/frp-stress
+
+for bin in "$FRPS" "$FRPC" "$STRESS"; do
+  if [ ! -x "$bin" ]; then
+    echo "error: not executable: $bin" >&2
+    exit 1
+  fi
+done
 
 PIDS=()
 cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; }
@@ -92,15 +106,24 @@ run_case() {
   kill "$sampler" 2>/dev/null || true
 
   local live_idle live_peak total rss_s rss_c per_conn
-  live_idle=$(base_live /tmp/mem-frps.log)
-  live_peak=$(peak_live /tmp/mem-frps.log)
-  total=$(max_total /tmp/mem-frps.log)
   rss_s=$(awk 'BEGIN{m=0}{if($1>m)m=$1}END{print m+0}' /tmp/mem-rss.log)
   rss_c=$(awk 'BEGIN{m=0}{if($2>m)m=$2}END{print m+0}' /tmp/mem-rss.log)
-  if [ "$mode" = "idle_hold" ] && [ "$CONNS" -gt 0 ]; then
-    per_conn=$(( (live_peak - live_idle) / CONNS ))
+  if grep -q 'live=' /tmp/mem-frps.log 2>/dev/null; then
+    live_idle=$(base_live /tmp/mem-frps.log)
+    live_peak=$(peak_live /tmp/mem-frps.log)
+    total=$(max_total /tmp/mem-frps.log)
+    if [ "$mode" = "idle_hold" ] && [ "$CONNS" -gt 0 ]; then
+      per_conn=$(( (live_peak - live_idle) / CONNS ))
+    else
+      per_conn=0
+    fi
   else
-    per_conn=0
+    # No MEMPROFILE output: frps is not a mem-profile build of frp-rs (a plain
+    # release build, or a foreign implementation such as Go frp). RSS above is
+    # still measured; the allocator counters are *not measured*, so report null
+    # rather than 0 — a 0 here would read as "allocates nothing", which is a
+    # different and false claim.
+    live_idle=null; live_peak=null; total=null; per_conn=null
   fi
 
   printf '{"label":"%s","mode":"%s","connections":%s,"encrypt":%s,"live_bytes_idle":%s,"live_bytes_peak":%s,"total_alloc":%s,"rss_kb_frps":%s,"rss_kb_frpc":%s,"live_per_conn":%s}\n' \
