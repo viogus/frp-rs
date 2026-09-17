@@ -5,10 +5,19 @@
 .DS_Store
 *.bak
 *.toml.bak
-Cargo.lock
+
+# Cargo.lock is intentionally COMMITTED — frp-rs ships binaries, so the lock file
+# is part of the reproducible build. It used to be listed here, which was
+# misleading (gitignore has no effect on a tracked file) and invited someone to
+# "fix" it by untracking the lock.
+# scripts/frp-stress/ is a separate throwaway workspace; its lock is not tracked.
+scripts/frp-stress/Cargo.lock
+
+# Local tool state and scratch dirs — never part of the repo.
 .worktrees/
 .claude/
 .reasonix/
+.superpowers/
 .autogen_ssh_key
 go-reference/
 scripts/frp-stress/target/
