@@ -1,7 +1,8 @@
 #![cfg(feature = "admin")]
 
 use axum::{
-    extract::{DefaultBodyLimit, Path as AxumPath, State},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
     http::{header, StatusCode},
     routing::get,
     Json, Router,
@@ -50,7 +51,29 @@ pub struct AdminState {
 
 #[derive(Deserialize)]
 struct ReloadBody {
+    /// frp-rs's CLI sends the camelCase spelling (`strictConfig`,
+    /// `frpc/src/main.rs run_reload`); the documented JSON form and the tests
+    /// use snake_case. Accept both so the CLI's flag is not silently ignored.
+    #[serde(alias = "strictConfig")]
     strict_config: Option<bool>,
+}
+
+/// Go's strict-mode channel: the `strictConfig` query parameter of
+/// `GET /api/reload`. Kept as a raw string because Go parses it itself.
+#[derive(Deserialize)]
+struct ReloadQuery {
+    #[serde(rename = "strictConfig")]
+    strict_config: Option<String>,
+}
+
+/// Mirror Go's `strconv.ParseBool` accept set (https://pkg.go.dev/strconv#ParseBool)
+/// with the error handling Go's `Reload` handler applies: it discards the parse
+/// error (`strictConfigMode, _ = strconv.ParseBool(strictStr)`,
+/// `client/http/controller.go` at commit 4a23aa18), so an unrecognised value --
+/// including the empty string an absent/empty parameter yields -- is `false`,
+/// never a 400. Only `1 t T TRUE true True` select strict mode.
+fn parse_strict_config(s: &str) -> bool {
+    matches!(s, "1" | "t" | "T" | "TRUE" | "true" | "True")
 }
 
 // --- Handlers ---
@@ -154,9 +177,31 @@ async fn handle_status(State(state): State<AdminState>) -> Json<serde_json::Valu
 
 async fn handle_reload(
     State(state): State<AdminState>,
-    Json(body): Json<ReloadBody>,
+    Query(query): Query<ReloadQuery>,
+    body: Bytes,
 ) -> Result<String, (StatusCode, String)> {
-    let strict = body.strict_config.unwrap_or(false);
+    // Read the optional body FIRST, whichever method was used: a body that is
+    // present but not well-formed JSON must be a 400 on every method. Go reads
+    // no body at all (`ctx.Body()` is never called by `Reload`); the body is a
+    // frp-rs extension kept for frpc's own CLI (`frpc/src/main.rs run_reload`).
+    let body_strict = if body.is_empty() {
+        None
+    } else {
+        serde_json::from_slice::<ReloadBody>(&body)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")))?
+            .strict_config
+    };
+
+    // Precedence: an explicit `?strictConfig=...` wins over the JSON body.
+    // Go's handler only ever reads the query (`client/http/controller.go` at
+    // commit 4a23aa18), so the query is the Go-faithful source when the two
+    // disagree; the CLI sends the body and no query, so in practice the
+    // channels never conflict. With neither present the reload is non-strict,
+    // matching Go's absent/empty parameter.
+    let strict = match query.strict_config.as_deref() {
+        Some(v) => parse_strict_config(v),
+        None => body_strict.unwrap_or(false),
+    };
     reload_and_wait(&state, strict).await
 }
 
@@ -852,6 +897,38 @@ passwd = "socks-pass"
         // Non-secret camelCase keys must survive redaction intact.
         assert!(out.contains("serverAddr"));
         assert!(out.contains("localPort"));
+    }
+
+    #[test]
+    fn parse_strict_config_matches_strconv_parse_bool() {
+        // Go's full accept set: `1 t T TRUE true True` -> true,
+        // `0 f F FALSE false False` -> false.
+        for s in ["1", "t", "T", "TRUE", "true", "True"] {
+            assert!(parse_strict_config(s), "ParseBool({s:?}) must be true");
+        }
+        for s in ["0", "f", "F", "FALSE", "false", "False"] {
+            assert!(!parse_strict_config(s), "ParseBool({s:?}) must be false");
+        }
+        // Everything else is a ParseBool error; Go discards it, so the reload
+        // stays non-strict and still answers 200 (never 400).
+        for s in ["", "yes", "no", "garbage", "2", "TRue", " true", "true "] {
+            assert!(
+                !parse_strict_config(s),
+                "ParseBool({s:?}) errors -> discarded -> false"
+            );
+        }
+    }
+
+    #[test]
+    fn reload_body_accepts_both_strict_spellings() {
+        let snake: ReloadBody = serde_json::from_str(r#"{"strict_config": true}"#).unwrap();
+        assert_eq!(snake.strict_config, Some(true));
+        // frpc's CLI sends this spelling (frpc/src/main.rs run_reload).
+        let camel: ReloadBody = serde_json::from_str(r#"{"strictConfig": true}"#).unwrap();
+        assert_eq!(camel.strict_config, Some(true));
+        let empty: ReloadBody = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.strict_config, None);
+        assert!(serde_json::from_str::<ReloadBody>("{oops").is_err());
     }
 
     fn test_state() -> (AdminState, mpsc::Receiver<ReloadRequest>) {

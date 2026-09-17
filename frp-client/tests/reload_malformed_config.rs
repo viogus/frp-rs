@@ -132,6 +132,48 @@ remotePort = {remote_port}
     .expect("write semantically invalid config");
 }
 
+/// A valid config plus a top-level key frp does not know. Non-strict loads
+/// ignore it (serde's default); a strict load rejects it in
+/// `run_strict_check` (frp-core/src/config/strict.rs) with
+/// `unknown field "notAKnownFrpKey"`. That makes strict vs non-strict
+/// observable from the HTTP status alone: strict -> 400, non-strict -> 200.
+#[cfg(feature = "admin")]
+fn write_unknown_key_config(
+    path: &std::path::Path,
+    server_port: u16,
+    echo_port: u16,
+    remote_port: u16,
+    web_server_port: Option<u16>,
+) {
+    let web_server = match web_server_port {
+        Some(p) => format!("\n[webServer]\naddr = \"127.0.0.1\"\nport = {p}\n"),
+        None => String::new(),
+    };
+    std::fs::write(
+        path,
+        format!(
+            r#"serverAddr = "127.0.0.1"
+serverPort = {server_port}
+loginFailExit = false
+token = "reload-malformed-token"
+
+notAKnownFrpKey = "strict-mode-probe"
+
+[transport]
+tcpMux = false
+
+[[proxies]]
+name = "main"
+type = "tcp"
+localIp = "127.0.0.1"
+localPort = {echo_port}
+remotePort = {remote_port}
+{web_server}"#
+        ),
+    )
+    .expect("write unknown-key config");
+}
+
 // ---------------------------------------------------------------------------
 // Small traffic helpers.
 // ---------------------------------------------------------------------------
@@ -266,31 +308,46 @@ async fn reload_malformed_config_rejected_keeps_old_proxy_serving() {
 // with the exact Err-arm text, and the old proxy must keep serving.
 // ---------------------------------------------------------------------------
 
-/// Raw HTTP POST /api/reload with an empty JSON body (`{}`). Returns the
+/// Raw HTTP request to the frpc admin API. `body`, when `Some`, is sent as a
+/// JSON body with the matching `Content-Type`/`Content-Length`. Returns the
 /// status line and the response body text.
 #[cfg(feature = "admin")]
-async fn post_admin_reload(admin_port: u16) -> (String, String) {
+async fn admin_request(
+    admin_port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> (String, String) {
     let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", admin_port))
         .await
         .expect("connect frpc admin server");
-    conn.write_all(
-        b"POST /api/reload HTTP/1.1\r\n\
-          Host: 127.0.0.1\r\n\
-          Content-Type: application/json\r\n\
-          Content-Length: 2\r\n\
-          Connection: close\r\n\r\n\
-          {}",
-    )
-    .await
-    .expect("write reload request");
+    let mut request =
+        format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+    match body {
+        Some(body) => request.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )),
+        None => request.push_str("\r\n"),
+    }
+    conn.write_all(request.as_bytes())
+        .await
+        .expect("write admin request");
     let mut raw = Vec::new();
     conn.read_to_end(&mut raw)
         .await
-        .expect("read reload response");
+        .expect("read admin response");
     let text = String::from_utf8_lossy(&raw).to_string();
     let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
     let status_line = head.lines().next().unwrap_or("").to_string();
     (status_line, body.to_string())
+}
+
+/// Raw HTTP POST /api/reload with an empty JSON body (`{}`). Returns the
+/// status line and the response body text.
+#[cfg(feature = "admin")]
+async fn post_admin_reload(admin_port: u16) -> (String, String) {
+    admin_request(admin_port, "POST", "/api/reload", Some("{}")).await
 }
 
 #[cfg(feature = "admin")]
@@ -400,6 +457,227 @@ async fn reload_malformed_config_admin_api_reports_400_keeps_old_proxy() {
     assert_echo_serving(
         p1_addr,
         "old proxy still serving after the 200 control reload",
+    )
+    .await;
+
+    client.request_stop();
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("client did not shut down after request_stop")
+        .expect("client run() panicked");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test 3 — the Go-parity reload channel. Go frp v0.71.0 registers GET only
+// (`client/api_router.go` at commit 4a23aa18) and its handler reads NO body:
+// strict mode comes from `?strictConfig=`, parsed with strconv.ParseBool and
+// with the parse error discarded (`client/http/controller.go`), so a garbage
+// value is a 200 non-strict, never a 400. frp-rs keeps its JSON-body
+// extension (used by frpc's own CLI) and adds the query channel.
+//
+// Strictness is made observable by an unknown top-level config key: a strict
+// reload rejects it with 400 (`unknown field "notAKnownFrpKey"`), a
+// non-strict reload ignores it and answers 200 — proving the flag took
+// effect rather than only that the request was answered.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "admin")]
+#[tokio::test]
+async fn reload_admin_go_query_parity_and_body_extension() {
+    init_tracing();
+    let echo_port = allocate_port();
+    let server_port = allocate_port();
+    let admin_port = allocate_port();
+    let p1 = allocate_port();
+
+    // 1. Echo backend + in-process frps + client with an admin [webServer].
+    let _echo = start_echo_server(echo_port);
+    let _server = common::start_frps(server_port, "reload-malformed-token").await;
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
+    wait_for_port(server_addr, Duration::from_secs(5))
+        .await
+        .expect("server ready");
+
+    let dir = std::env::temp_dir().join(format!("frp-reload-admin-parity-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let cfg_path = dir.join("frpc.toml");
+    write_valid_config(&cfg_path, server_port, echo_port, p1, Some(admin_port));
+
+    let cfg = load_client_config(cfg_path.to_str().unwrap(), false).expect("load initial config");
+    let client = Arc::new(
+        ClientService::new(cfg, Some(cfg_path.to_string_lossy().into()))
+            .await
+            .expect("create client service"),
+    );
+    let runner = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let _ = client.run().await;
+        })
+    };
+    let p1_addr: std::net::SocketAddr = format!("127.0.0.1:{p1}").parse().unwrap();
+    wait_for_port(p1_addr, Duration::from_secs(15))
+        .await
+        .expect("initial proxy port ready");
+
+    let admin_addr: std::net::SocketAddr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    wait_for_port(admin_addr, Duration::from_secs(10))
+        .await
+        .expect("frpc admin server never came up");
+
+    // Every reload below reads this one file: valid except for the unknown key.
+    write_unknown_key_config(&cfg_path, server_port, echo_port, p1, Some(admin_port));
+
+    // 2. Go's exact call shape — GET, no body, no query. Must be a 200
+    //    non-strict reload (previously a 415 from axum's Json extractor).
+    let (status, body) = admin_request(admin_port, "GET", "/api/reload", None).await;
+    assert!(
+        status.contains("200"),
+        "body-less GET /api/reload must answer 200, got: {status} / {body}"
+    );
+
+    // 3. Go's strict channel: ?strictConfig=true must reach the loader as
+    //    strict=true, so the unknown key is rejected with 400.
+    let (status, body) =
+        admin_request(admin_port, "GET", "/api/reload?strictConfig=true", None).await;
+    assert!(
+        status.contains("400"),
+        "?strictConfig=true must be strict (400 on the unknown key), got: {status} / {body}"
+    );
+    assert!(
+        body.contains(r#"unknown field "notAKnownFrpKey""#),
+        "strict rejection must name the unknown key, got: {body}"
+    );
+
+    // 4. The full strconv.ParseBool true accept set -> strict (400).
+    for v in ["1", "t", "T", "TRUE", "true", "True"] {
+        let (status, body) = admin_request(
+            admin_port,
+            "GET",
+            &format!("/api/reload?strictConfig={v}"),
+            None,
+        )
+        .await;
+        assert!(
+            status.contains("400"),
+            "?strictConfig={v} must be strict, got: {status} / {body}"
+        );
+    }
+
+    // 5. The false accept set AND ParseBool errors -> non-strict (200). The
+    //    error case is the parity point: Go discards the error, so
+    //    `yes`/`garbage`/empty must be a 200 non-strict, NOT a 400.
+    for v in [
+        "0", "f", "F", "FALSE", "false", "False", "yes", "garbage", "",
+    ] {
+        let (status, body) = admin_request(
+            admin_port,
+            "GET",
+            &format!("/api/reload?strictConfig={v}"),
+            None,
+        )
+        .await;
+        assert!(
+            status.contains("200"),
+            "?strictConfig={v} must be a non-strict 200, got: {status} / {body}"
+        );
+    }
+
+    // 6. Preserved frp-rs extension: POST + JSON body (snake_case).
+    let (status, body) = admin_request(
+        admin_port,
+        "POST",
+        "/api/reload",
+        Some(r#"{"strict_config": true}"#),
+    )
+    .await;
+    assert!(
+        status.contains("400"),
+        "POST {{\"strict_config\": true}} must be strict, got: {status} / {body}"
+    );
+
+    // 7. frpc's own CLI sends the camelCase spelling (`frpc/src/main.rs`
+    //    run_reload), so it must select strict mode too rather than being
+    //    silently ignored as an unknown JSON field.
+    let (status, body) = admin_request(
+        admin_port,
+        "POST",
+        "/api/reload",
+        Some(r#"{"strictConfig": true}"#),
+    )
+    .await;
+    assert!(
+        status.contains("400"),
+        "POST {{\"strictConfig\": true}} (frpc CLI spelling) must be strict, got: {status} / {body}"
+    );
+
+    // 8. Explicit false in the body -> non-strict 200.
+    let (status, body) = admin_request(
+        admin_port,
+        "POST",
+        "/api/reload",
+        Some(r#"{"strict_config": false}"#),
+    )
+    .await;
+    assert!(
+        status.contains("200"),
+        "POST {{\"strict_config\": false}} must be non-strict, got: {status} / {body}"
+    );
+
+    // 9. Precedence: the query wins over a conflicting body, both ways.
+    let (status, body) = admin_request(
+        admin_port,
+        "POST",
+        "/api/reload?strictConfig=true",
+        Some(r#"{"strict_config": false}"#),
+    )
+    .await;
+    assert!(
+        status.contains("400"),
+        "query true must win over body false (strict 400), got: {status} / {body}"
+    );
+    let (status, body) = admin_request(
+        admin_port,
+        "POST",
+        "/api/reload?strictConfig=false",
+        Some(r#"{"strict_config": true}"#),
+    )
+    .await;
+    assert!(
+        status.contains("200"),
+        "query false must win over body true (non-strict 200), got: {status} / {body}"
+    );
+
+    // 10. A body that is present but malformed is a 400 on every method —
+    //     `Option<Json<..>>` would have swallowed it as "no body".
+    for method in ["POST", "GET"] {
+        let (status, body) = admin_request(
+            admin_port,
+            method,
+            "/api/reload",
+            Some(r#"{"strict_config": "#),
+        )
+        .await;
+        assert!(
+            status.contains("400"),
+            "malformed JSON body on {method} must answer 400, got: {status} / {body}"
+        );
+        assert!(
+            body.contains("invalid JSON body"),
+            "malformed-body 400 must say so, got: {body}"
+        );
+    }
+
+    // 11. None of the rejected reloads disturbed the running proxy or the
+    //     client run loop.
+    assert!(
+        !runner.is_finished(),
+        "client run task ended after the admin reload matrix"
+    );
+    assert_echo_serving(
+        p1_addr,
+        "proxy keeps serving across the admin reload matrix",
     )
     .await;
 
