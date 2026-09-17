@@ -64,8 +64,17 @@ example:
 - Put **history** in [`history/development-log.md`](history/development-log.md)
   or [`../CHANGELOG.md`](../CHANGELOG.md) — not in reference docs. `CLAUDE.md`
   in particular is loaded into every agent context and has a hard 64 KB budget.
+- **`CHANGELOG.md` is for users; `history/development-log.md` is the record.**
+  A changelog entry says what changed and why it matters, in a few lines, and
+  does not grow into a narrative. The round-by-round detail — every finding,
+  adversarial review outcome, gate result and commit hash — belongs in the
+  development log. When one change would be described in both, the changelog gets
+  the summary and the log gets the detail; **do not write the detail twice**,
+  because two copies drift and then neither can be trusted.
 - **Do not hand-maintain numbers.** Countable figures (LOC, test counts, `unsafe`
   blocks, vendored versions) come from `bash scripts/repo-health.sh`. A figure typed
   into prose goes stale silently — the health table once claimed 17 `unsafe` blocks
   in `frp-core` while the tree had 21.
+- **Test counts are not evidence of Go parity.** See
+  [developing.md § What a green test run does and does not prove](developing.md#what-a-green-test-run-does-and-does-not-prove).
 - Keep open work in [`../TODO.md`](../TODO.md), with evidence and a done-when.

@@ -171,6 +171,14 @@ context and has a 64 KB instruction budget; keep it under ~25 KB.
 
 ## Testing & Tooling
 
+> **A green test suite does not prove Go parity.** The hard evidence is
+> `scripts/compat-test.sh` against a real Go binary plus `scripts/protocol-matrix.sh`;
+> the unit/integration suite pins *frp-rs's own* behaviour and has historically
+> encoded wrong Go semantics (a whole round once rested on a test that was
+> failing). Never claim a compatibility fix on the strength of a passing test —
+> cite Go source `file:line` or a probe of the real binary. Reasoning and the
+> history: [docs/developing.md § What a green test run does and does not prove](docs/developing.md#what-a-green-test-run-does-and-does-not-prove).
+
 - **Benchmarks**: `cargo bench -p frp-core` (8 groups: key derivation, compression, cipher stream, STUN, V1+V2 protocol all-types, bridge plain/encrypted/compressed, bandwidth limiter) + `cargo bench -p frp-server` (`nathole` classify + analysis; `proxy_registration` register throughput + ProxyInfo construct). CI: `cargo bench --workspace --no-run` build-check in `ci.yml`. Note: connection-accept/setup latency is measured e2e by `scripts/latency-baseline.sh` (setup mode), NOT criterion — a real TCP+TLS+yamux accept is dominated by kernel/handshake noise, not code-path cost.
 - **Property/fuzz tests**: proptest-based config normalization (`frp-core/src/config/tests.rs`, 11 proptest! blocks) and V1/V2 protocol frame fuzzing (`frp-core/src/protocol.rs`, 6 fuzz tests + 35 regular tests, 0 panics found).
 - **Integration tests**: KCP real-UDP-socket test (`frp-core/tests/kcp.rs`), XTCP hole-punch e2e (`frp-server/tests/xtcp_hole_punch.rs`), plus 13+ server integration tests covering control handler, vhost, proxy registration, OIDC, reload, graceful drain.

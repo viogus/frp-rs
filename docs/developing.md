@@ -208,6 +208,57 @@ sudo tcpdump -i lo -X -s 0 port 7000
 
 ## 5. Testing
 
+### What a green test run does and does not prove
+
+Read this before quoting a test count as evidence of compatibility. It is the
+single easiest mistake to make in this repository.
+
+**Hard evidence — these compare frp-rs against a real Go frp binary:**
+
+| Gate | What it establishes |
+|---|---|
+| `scripts/compat-test.sh` — 86 scenarios + 17 XTCP pairwise, vs Go frp v0.71.0 | Wire and behavioural parity with the reference implementation |
+| `scripts/protocol-matrix.sh` — 11 transport rows | Data actually moves through frps+frpc for every transport / encryption / mux combination |
+| Daily `xtcp-compat.yml` on a VPS | XTCP hole punching against Go frpc across a real NAT |
+
+**Proxy evidence — the ~2000 unit and integration tests:**
+
+They pin *frp-rs's own* behaviour. That is genuinely valuable (they catch
+regressions, and most were written by reading Go's source), but a passing suite
+does **not** establish Go parity, because a test encodes the author's *model* of
+Go's behaviour — and that model can be wrong.
+
+This is not hypothetical. The project's own history records it, repeatedly:
+
+- **Round 4**: "the slowloris ponging test was RED — the round-3 claim was
+  wrong". The test assumed yamux's ping frame tag was `4`; it is `2`. A whole
+  round's confidence rested on a test that was failing.
+- **Round 16**: the round-15 suite "encoded a **FALSE `SplitHostPort` claim**".
+  All three oracles in `vhost.rs` and `vhost_h2c.rs` had to be flipped once Go's
+  `net/ipsock.go:216` was actually read.
+- **Round 16**: "two round-14/15-era tests that pinned the trim behaviour [were]
+  flipped".
+- **Round 6**: a stale pin in `server_protocol.rs:81` — a target-only test run
+  was blind to the integration file that held the real expectation.
+- **Round 7**: a round-9-era "established reject policy" pin turned out to rest
+  on a false premise; the expectation was flipped after probing the real
+  Go 1.25.12 binary.
+- **Round 9** returned a verdict of "production code healthy, **test
+  completeness below standard**" while **1253 tests were green**.
+- **Round 9** also surfaced that the shared test fixture kept
+  `authentication_timeout = 0`, so replay protection — the thing under test —
+  was never exercised at all.
+
+**The practical rules:**
+
+1. A green suite means "no *known* regression", not "compatible with Go frp".
+2. Before claiming a compatibility fix, cite Go source (`file:line`) or a probe
+   of the real binary — not a passing test.
+3. When a test expectation is the *only* thing asserting a behaviour, say so.
+   That is a hypothesis, not evidence.
+4. For a parity claim, prefer adding a `compat-test.sh` scenario over another
+   unit test.
+
 ### Unit Tests
 
 Unit tests live inline in `#[cfg(test)] mod tests` blocks within source files. Integration tests live in the `frp-server/tests/` and `frp-client/tests/` directories (see "Writing New Tests" below).

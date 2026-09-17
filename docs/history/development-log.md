@@ -10,6 +10,12 @@
 > - Current state (metrics, invariants): [`../../CLAUDE.md`](../../CLAUDE.md)
 > - Architecture: [`../architecture.md`](../architecture.md)
 >
+> **This file is the detailed record.** Findings, adversarial review outcomes,
+> gate results and commit hashes live here rather than in the changelog, which
+> carries the user-facing summary. Do not duplicate the same detail in both — two
+> copies drift and then neither can be trusted. See the
+> [docs conventions](../README.md#conventions-for-these-docs).
+>
 > Newest rounds are appended at the bottom of the table.
 
 ## Hardening & audit rounds

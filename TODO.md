@@ -105,21 +105,32 @@ nothing about whether the described behaviour still holds.
   `repo-health.sh` or carries a `file:line` that a reviewer can check. Add a
   periodic (release-checklist) pass that re-verifies them.
 
-- [ ] **The docs do not tell the reader how little a green test suite proves.**
+- [x] **The docs did not tell the reader how little a green test suite proves.**
   Evidence: `docs/history/development-log.md` records the project's own tests
   encoding **wrong** behaviour and later being flipped (round 15→16 `SplitHostPort`
-  premise; round 6 "stale pin"; round 4 "the round-3 claim was wrong — the test was RED").
-  Most tests pin *frp-rs's* behaviour at the time, not *Go frp's*.
-  **Done-when:** `docs/architecture.md` (or the README) states plainly that
-  `scripts/compat-test.sh` against a real Go binary is the only hard compatibility
-  evidence, and that test counts are a proxy.
+  premise; round 6 "stale pin"; round 4 "the round-3 claim was wrong — the test was
+  RED"; round 9 returned "test completeness below standard" while 1253 tests were
+  green, and its fixture kept `authentication_timeout = 0` so the replay protection
+  under test was never exercised). Most tests pin *frp-rs's* behaviour at the time,
+  not *Go frp's*.
+  Done: new authoritative section
+  [docs/developing.md § What a green test run does and does not prove](docs/developing.md#what-a-green-test-run-does-and-does-not-prove)
+  — it separates hard evidence (compat suite, protocol matrix, XTCP VPS matrix)
+  from proxy evidence, lists seven concrete cases from this project's history, and
+  gives four practical rules (notably: cite Go source `file:line` or a probe of the
+  real binary, never a passing test). A rule box in `CLAUDE.md § Testing & Tooling`
+  and a convention in `docs/README.md` point at it.
 
-- [ ] **`CHANGELOG.md` and `docs/history/development-log.md` overlap.**
+- [x] **`CHANGELOG.md` and `docs/history/development-log.md` overlap.**
   Evidence: "audit round" appears 10× in `CHANGELOG.md` (91 KB) and 17× in
-  `development-log.md` (109 KB); the same rounds are described in both, at
+  `development-log.md` (109 KB); the same rounds were described in both, at
   different levels of detail, with no rule about which wins.
-  **Done-when:** boundary decided and written down. Proposal: `CHANGELOG.md` =
-  user-visible release notes only; all round detail lives in `development-log.md`.
+  Done: the boundary is decided and written where the conflict would arise —
+  `CHANGELOG.md` = user-facing release notes (a few lines per item);
+  `development-log.md` = the detailed record (findings, review outcomes, gate
+  results, commit hashes); never the same detail twice, because two copies drift.
+  Stated in `docs/README.md § Conventions`, at the top of `CHANGELOG.md`, and at
+  the top of the development log. Historical entries are left as written.
 
 - [ ] **Paths inside `docs/archive/**` still read `docs/superpowers/`.**
   Evidence: deliberate (historical records must not be rewritten) and documented in
@@ -188,11 +199,20 @@ nothing about whether the described behaviour still holds.
   is a tracked item with an owner, and the release checklist explicitly includes
   checking rustls 0.23.x advisories.
 
-- [ ] **`unsafe` has no automated guard.**
+- [x] **`unsafe` has no automated guard.**
   Evidence: 21 blocks + 3 `unsafe fn` + 2 `unsafe impl` in `frp-core`; 38 blocks in
-  `frp-vnet`; 64 `// SAFETY:` comments. The convention is enforced by review.
-  **Done-when:** a CI check fails if an `unsafe` block lacks a nearby `// SAFETY:`
-  (the counting logic already exists in `scripts/repo-health.sh`).
+  `frp-vnet`; 64 `// SAFETY:` comments. The convention was enforced by review.
+  Done: `scripts/repo-health.sh` now fails if an `unsafe {` block has no
+  `// SAFETY:` justification, and that script is a CI gate (the `health` job).
+  The check walks up over the whole contiguous comment/attribute block and also
+  scans a few lines *into* the block — a first attempt using a fixed 3-line
+  look-behind reported **14 false positives** on a clean tree, because the
+  justification is usually a multi-line comment block or sits inside the block.
+  Verified in both directions: clean tree passes; deleting one marker fails.
+  One genuine gap was found and fixed rather than papered over:
+  `frp-core/src/splice.rs` had two adjacent `unsafe { OwnedFd::from_raw_fd(..) }`
+  expressions sharing a single justification comment, so the second block carried
+  none of its own — it now has one (comment-only change).
 
 - [ ] **Feature surface is wide for a single maintainer.**
   Evidence: SSH gateway, L3 VPN/TUN, OIDC, dashboard, h2c, 10 client plugins,
