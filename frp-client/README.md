@@ -28,7 +28,7 @@ Service::run()
 | `control` | `ControlConnection`, login handshake, V2 negotiation, hostname resolution |
 | `proxy` | `NewProxy` message builder, local TCP connect, bridge to IoStream |
 | `work_conn` | `WorkConnConfig`, `spawn_work_conn`, V2 protocol write, XTCP notification |
-| `plugin` | Plugin dispatch: 9 plugin types + visitor plugin |
+| `plugin` | Plugin dispatch for the client plugin types — see [docs/client-plugins.md](../docs/client-plugins.md); `virtual_net` is handled by the vnet path |
 | `admin` | Admin REST API server (status, config, reload, stop) |
 | `health` | TCP/HTTP health checks for proxies |
 | `visitor` | `tcp_simultaneous_open`, STCP/XTCP visitor listener |

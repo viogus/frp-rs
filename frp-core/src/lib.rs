@@ -116,7 +116,7 @@ pub mod xtcp_p2p {
     /// Mirror of the real `DEFAULT_HOLE_PUNCH_TIMEOUT_MS` (Go MakeHole 5s).
     pub const DEFAULT_HOLE_PUNCH_TIMEOUT_MS: u64 = 5000;
     /// Mirror of the real `MAX_HOLE_PUNCH_TIMEOUT_MS` (60s cap on the
-    /// server-supplied detect-wait timeout; frp-client/visitor.rs clamps
+    /// server-supplied detect-wait timeout; `frp-client/src/visitor.rs` clamps
     /// against it unconditionally).
     pub const MAX_HOLE_PUNCH_TIMEOUT_MS: u64 = 60_000;
     pub fn conv_from_sid(_sid: &str) -> u32 {

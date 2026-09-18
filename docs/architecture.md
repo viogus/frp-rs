@@ -56,7 +56,7 @@ frpc ──────────────► frp-client ──────
 | Crate | Purpose | Key Modules |
 |-------|---------|-------------|
 | **frp-core** | Shared library with no internal workspace dependencies | Protocol framing (`protocol.rs`), message types (`msg.rs`), config parsing (`config/`), transport abstraction (`transport/`), auth (`auth.rs`), encryption (`encryption.rs`), bridge (`bridge.rs`), mux (`mux.rs`), QUIC (`quic.rs`), KCP (`kcp/`), STUN (`stun.rs`), V2 handshake (`v2_handshake.rs`), cipher streams (`cipher_stream.rs`) |
-| **frp-server** | Server logic — control handler, proxy registration, connection bridging | Service + accept loop (`service.rs`), control handler (`control/mod.rs`), proxy management (`proxy.rs`), bridge assignment (`control/bridge.rs`), proxy registration (`control/proxy_ops.rs`), NAT hole punching (`nathole/`), VHost routing (`vhost.rs`), dashboard + admin API (`dashboard.rs`), SSH gateway (`ssh_gateway.rs`), TCPMux (`tcpmux.rs`), config reload (SIGUSR1, `service.rs`), state (`state.rs`), handlers (`handlers.rs`) |
+| **frp-server** | Server logic — control handler, proxy registration, connection bridging | Service + accept loop (`service.rs`), control handler (`control/mod.rs`), proxy management (`proxy.rs`), bridge assignment (`control/bridge.rs`), proxy registration (`control/proxy_ops.rs`), NAT hole punching (`nathole/`), VHost routing (`vhost.rs`), dashboard + admin API (`dashboard.rs`), SSH gateway (`ssh_gateway.rs`), TCPMux (`tcpmux.rs`), config reload (SIGUSR1, `service.rs`), state (`state.rs`), handlers (`frp-server/src/handlers/`) |
 | **frps** | Server binary | CLI argument parsing (`frp_core::cli`), logging setup, calls `frp_server::Service::run()` |
 | **frp-client** | Client logic — service lifecycle, control connection, local bridging | Client service (`service.rs`), work connections (`work_conn.rs`), visitor mode (`visitor.rs`), admin API (`admin.rs`), health checks (`health.rs`), client plugins (`plugin/`) |
 | **frpc** | Client binary | CLI argument parsing (`frp_core::cli`), logging setup, calls `frp_client::Service::run()` |
@@ -120,7 +120,7 @@ frp-rs/
       lib.rs
       service.rs          Accept loop, connection dispatch, SIGUSR1 reload
       state.rs            AppState, InternalMsg, run_id → control routing
-      handlers.rs         Connection dispatch helpers (work/visitor/NAT hole)
+      handlers/           Connection dispatch helpers (work/visitor/NAT hole)
       registry.rs         ProxyManager registry + port allocation
       proxy.rs            ProxyInfo, proxy registration
       control/
