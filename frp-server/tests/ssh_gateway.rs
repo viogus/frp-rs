@@ -90,34 +90,216 @@ const SSH_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Poll `russh::client::connect` — which completes the SSH handshake, not just
 /// the TCP accept — until it succeeds or `SSH_READY_TIMEOUT` elapses. Panics
-/// with the **last** connect error, so a real failure is diagnosable instead of
-/// surfacing as a bare "SSH client should connect".
+/// with the **last** connect error (or the stall description), so a real failure
+/// is diagnosable instead of surfacing as a bare "SSH client should connect".
+///
+/// `SSH_READY_TIMEOUT` is a real wall-clock bound: `russh::client::connect` has
+/// no handshake timeout of its own, so a peer that accepts TCP and then stalls
+/// would block this future forever. Each attempt is therefore bounded by the
+/// budget remaining at the time it starts (see [`try_connect_ssh`]); the sum of
+/// the attempts cannot exceed `SSH_READY_TIMEOUT`. The aggregate bound is
+/// measured by `connect_ssh_ready_bounds_a_stalled_peer_in_aggregate`.
 async fn connect_ssh_ready(
     addr: SocketAddr,
     local_target: Option<String>,
 ) -> russh::client::Handle<TestSshClient> {
-    let deadline = tokio::time::Instant::now() + SSH_READY_TIMEOUT;
-    loop {
-        match russh::client::connect(
-            Arc::new(russh::client::Config::default()),
-            addr,
-            TestSshClient {
-                local_target: local_target.clone(),
-            },
-        )
+    connect_ssh_ready_within(addr, local_target, SSH_READY_TIMEOUT)
         .await
-        {
-            Ok(c) => return c,
-            Err(e) => {
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Budget-parameterised core of [`connect_ssh_ready`].
+///
+/// Kept separate (and returning `Err` rather than panicking) so the aggregate
+/// wall-clock bound can be **measured** with a short budget in
+/// `connect_ssh_ready_bounds_a_stalled_peer_in_aggregate`, without paying the
+/// 10 s production budget or spawning a panicking task. Every failure carries
+/// the last error / stall reason, so the wrapper's panic message is never the
+/// bare "SSH client should connect" its docstring promises to avoid.
+async fn connect_ssh_ready_within(
+    addr: SocketAddr,
+    local_target: Option<String>,
+    budget: Duration,
+) -> Result<russh::client::Handle<TestSshClient>, String> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut last_error: Option<String> = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "SSH client did not connect within {budget:?}; last error: {}",
+                last_error.as_deref().unwrap_or("<none>")
+            ));
+        }
+        match try_connect_ssh(addr, local_target.clone(), remaining).await {
+            Some(Ok(c)) => return Ok(c),
+            Some(Err(e)) => {
+                last_error = Some(format!("{e:?}"));
                 if tokio::time::Instant::now() >= deadline {
-                    panic!(
-                        "SSH client should connect within {SSH_READY_TIMEOUT:?}; last error: {e:?}"
-                    );
+                    return Err(format!(
+                        "SSH client did not connect within {budget:?}; last error: {}",
+                        last_error.as_deref().unwrap_or("<none>")
+                    ));
                 }
+            }
+            None => {
+                return Err(format!(
+                    "SSH handshake with {addr} stalled: an attempt did not finish within \
+                     {remaining:?} (total budget {budget:?}) — the peer accepted TCP but \
+                     stopped speaking SSH"
+                ));
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// One `russh::client::connect` attempt, hard-bounded by `budget`.
+///
+/// Returns `None` when the attempt exceeded `budget` — i.e. the peer accepted
+/// the TCP connection but stalled the SSH handshake. This is the primitive that
+/// makes [`connect_ssh_ready`]'s deadline a genuine bound rather than just a
+/// bound on how many times the loop retries.
+async fn try_connect_ssh(
+    addr: SocketAddr,
+    local_target: Option<String>,
+    budget: Duration,
+) -> Option<Result<russh::client::Handle<TestSshClient>, russh::Error>> {
+    timeout(
+        budget,
+        russh::client::connect(
+            Arc::new(russh::client::Config::default()),
+            addr,
+            TestSshClient { local_target },
+        ),
+    )
+    .await
+    .ok()
+}
+
+/// Start a listener that accepts one TCP connection and then goes silent: the
+/// SSH banner never arrives, so any unbounded handshake against it hangs.
+///
+/// Shared by the two stalled-peer probes below; the returned task owns the
+/// accepted stream for as long as it lives (abort it at the end of the test).
+async fn spawn_stalled_ssh_peer() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled-peer listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let task = tokio::spawn(async move {
+        // Hold the accepted stream open (and send nothing) until the test ends.
+        let (_stream, _peer) = listener.accept().await.expect("accept");
+        std::future::pending::<()>().await;
+    });
+    (addr, task)
+}
+
+/// Prove the per-attempt primitive bounds a stalled handshake: a peer that
+/// accepts TCP and then never sends its SSH banner must make a single bounded
+/// attempt return within the budget instead of hanging.
+///
+/// If the `tokio::time::timeout` inside `try_connect_ssh` is removed this test
+/// hangs (and the process must be killed) — i.e. it fails by exceeding the
+/// budget rather than passing silently.
+#[tokio::test]
+async fn stalled_ssh_handshake_attempt_is_bounded() {
+    let (addr, stalled_peer) = spawn_stalled_ssh_peer().await;
+
+    const BUDGET: Duration = Duration::from_millis(500);
+    let started = tokio::time::Instant::now();
+    let outcome = try_connect_ssh(addr, None, BUDGET).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        outcome.is_none(),
+        "a peer that accepts TCP then stalls must hit the attempt budget"
+    );
+    assert!(
+        elapsed >= BUDGET && elapsed < BUDGET + Duration::from_secs(2),
+        "stalled attempt must fail in roughly the {BUDGET:?} budget, took {elapsed:?}"
+    );
+
+    stalled_peer.abort();
+}
+
+/// Prove the aggregate bound for the **stalled-attempt** path: the whole
+/// `connect_ssh_ready_within` retry loop (the code every `connect[*]_ready` call
+/// site actually runs) must give up within its budget when the peer accepts TCP
+/// and then stalls. Measured with a short budget so the proof is cheap; the
+/// production wrapper passes `SSH_READY_TIMEOUT`.
+///
+/// A stalled attempt consumes all of the remaining budget, so this peer can
+/// only ever produce one attempt: this test measures that the *first* stalled
+/// attempt is bounded by the loop's budget (and that the loop does not ignore
+/// it). The **multi-attempt** path is measured separately by
+/// `connect_ssh_ready_retries_within_budget_on_fast_failures`, which uses a peer
+/// that fails fast so the loop retries. If the per-attempt timeout is removed
+/// this test hangs (killed by the harness).
+#[tokio::test]
+async fn connect_ssh_ready_bounds_a_stalled_peer_in_aggregate() {
+    let (addr, stalled_peer) = spawn_stalled_ssh_peer().await;
+
+    const BUDGET: Duration = Duration::from_millis(750);
+    let started = tokio::time::Instant::now();
+    let outcome = connect_ssh_ready_within(addr, None, BUDGET).await;
+    let elapsed = started.elapsed();
+
+    let err = match outcome {
+        Ok(_) => panic!("a stalled peer must never yield a connected handle"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("stalled"),
+        "aggregate failure must name the stall, got: {err}"
+    );
+    assert!(
+        elapsed >= BUDGET && elapsed < BUDGET + Duration::from_secs(2),
+        "connect_ssh_ready must give up within its {BUDGET:?} aggregate budget, took {elapsed:?}"
+    );
+
+    stalled_peer.abort();
+}
+
+/// Prove the **multi-attempt** retry path stays inside the aggregate budget.
+/// A peer that is not listening at all makes every `russh::client::connect`
+/// fail fast, so the loop retries repeatedly (unlike the stalled peer, which
+/// consumes the whole budget in one attempt). The elapsed floor is the
+/// discriminator: with a 350 ms budget and a 100 ms inter-attempt sleep, a loop
+/// that attempted only once would finish in ~0 ms, so `elapsed >= BUDGET`
+/// fails unless the loop actually retried to the deadline.
+#[tokio::test]
+async fn connect_ssh_ready_retries_within_budget_on_fast_failures() {
+    // Bind an ephemeral port, learn its address, then drop the listener: nothing
+    // is listening, so connects are refused immediately.
+    let addr = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        listener.local_addr().expect("listener addr")
+    };
+
+    const BUDGET: Duration = Duration::from_millis(350);
+    let started = tokio::time::Instant::now();
+    let outcome = connect_ssh_ready_within(addr, None, BUDGET).await;
+    let elapsed = started.elapsed();
+
+    let err = match outcome {
+        Ok(_) => panic!("a closed port must never yield a connected handle"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("did not connect within"),
+        "non-stall failure must report the exhausted budget, got: {err}"
+    );
+    assert!(
+        elapsed >= BUDGET && elapsed < BUDGET + Duration::from_secs(2),
+        "multi-attempt loop must stop at its {BUDGET:?} budget, took {elapsed:?}"
+    );
+    assert!(
+        err.contains("last error:"),
+        "exhausted-budget failure must report the last connect error, got: {err}"
+    );
 }
 
 /// Read the SSH banner from a TcpStream, returning it as a String.
@@ -184,9 +366,16 @@ async fn test_ssh_gateway_disabled_by_default() {
     let (_handle, _port) = start_test_server(cfg).await;
 
     // Connect to the server's main FRP port and verify it does NOT serve SSH.
-    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", bind_port))
+    // `start_test_server` already waits for this port, but wait again with the
+    // file's deadline so this connect is not the one bare site left without a
+    // readiness budget. Unlike the SSH port there is no pre-auth permit to
+    // perturb, so `wait_tcp_port`'s probe is free here.
+    common::wait_tcp_port(bind_port, SSH_READY_TIMEOUT)
         .await
         .expect("FRP port should accept connections");
+    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", bind_port))
+        .await
+        .expect("FRP port should accept connections after readiness wait");
 
     // FRP doesn't send data unsolicited — a read will time out.
     // The key assertion: the response must NOT start with "SSH-".
@@ -218,12 +407,17 @@ async fn test_ssh_gateway_multiple_connections() {
 
     let (_handle, _port) = start_test_server(cfg).await;
 
+    // Same readiness budget as the rest of the file: the gateway may not be
+    // accepting yet right after server start.
+    common::wait_tcp_port(ssh_port, SSH_READY_TIMEOUT)
+        .await
+        .expect("SSH port should accept connections");
     let mut stream1 = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", ssh_port))
         .await
-        .unwrap();
+        .expect("SSH port should accept connections after readiness wait");
     let mut stream2 = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", ssh_port))
         .await
-        .unwrap();
+        .expect("SSH port should accept connections after readiness wait");
 
     let banner1 = read_ssh_banner(&mut stream1).await;
     let banner2 = read_ssh_banner(&mut stream2).await;
@@ -242,9 +436,14 @@ async fn test_ssh_gateway_with_auth_token() {
 
     let (_handle, _port) = start_test_server(cfg).await;
 
+    // Same readiness budget as the rest of the file: the gateway may not be
+    // accepting yet right after server start.
+    common::wait_tcp_port(ssh_port, SSH_READY_TIMEOUT)
+        .await
+        .expect("SSH port should accept connections");
     let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", ssh_port))
         .await
-        .unwrap();
+        .expect("SSH port should accept connections after readiness wait");
 
     let banner = read_ssh_banner(&mut stream).await;
     assert!(banner.starts_with("SSH-"));
@@ -411,15 +610,25 @@ async fn test_ssh_gateway_reverse_forwarding_roundtrip() {
         .expect("exec accepted");
 
     // Connect through the frps proxy port and verify the echo round-trip.
+    // Retain the last connect error so a failure names the cause instead of a
+    // bare "should accept".
     let mut proxy_stream = None;
+    let mut last_connect_error = None;
     for _ in 0..50 {
-        if let Ok(s) = tokio::net::TcpStream::connect(format!("127.0.0.1:{remote_port}")).await {
-            proxy_stream = Some(s);
-            break;
+        match tokio::net::TcpStream::connect(format!("127.0.0.1:{remote_port}")).await {
+            Ok(s) => {
+                proxy_stream = Some(s);
+                break;
+            }
+            Err(e) => last_connect_error = Some(e),
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let mut proxy_stream = proxy_stream.expect("frps proxy port should accept");
+    let mut proxy_stream = proxy_stream.unwrap_or_else(|| {
+        panic!(
+            "frps proxy port should accept within 5s; last error: {last_connect_error:?}"
+        )
+    });
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     proxy_stream.write_all(b"ping-over-ssh-r").await.unwrap();
     let mut buf = [0u8; 64];
