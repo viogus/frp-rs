@@ -436,6 +436,23 @@ nothing about whether the described behaviour still holds.
   a regression from noise, and the habit of rerunning until green is how a real
   failure eventually gets merged.
 
+  **Recurrence (2026-09-17, PR #351 — a `CHANGELOG.md` + one CI-lane feature-flag diff,
+  so nothing on the data plane changed):** the `compat` job failed twice in a row on the
+  same commit with a **different failing scenario each time** — first the
+  `kcp-rust-to-rust` scenario reporting `proxy port 20403 not reachable`, then the
+  `rust-to-go-tcp-tls` scenario reporting `FAIL:CONNECT_TIMEOUT` (both 85 passed / 1 failed)
+  — and passed on the third attempt (the second re-run).
+  What this establishes, and no more: the failure is **not** caused by the diff, because the
+  diff cannot reach the data plane. It does **not** establish a mechanism. Note the suites are
+  not interchangeable and must not be pooled: `kcp-rust-to-rust` and `rust-to-go-tcp-tls` are
+  `compat-test.sh` scenarios, whereas `tcp-plain`, `tcp-tls`, `tcp-tls-mux` and `ws-plain` were
+  reported by the **protocol-matrix** step of the same job, and `go-to-rust-quic` was a
+  `compat-test.sh` scenario. `tcp-plain` is listed above only because it was part of the
+  original #341 report; it is not part of this reproduction.
+  Also worth separating: the #338 recurrence below is a different phenomenon — a single
+  **ETXTBSY unit-test** failure inside the same job, not a scenario that moved between runs.
+  Both matter, but "the failure moves around" is a claim about the scenario failures only.
+
   **Recurrence (2026-09-17, PR #338 — a `TODO.md`-only diff, so nothing compiled
   could have changed):** `compat` failed not in the compat scenarios but in its
   `Run Rust unit tests` step — **851 passed, 1 failed**:
