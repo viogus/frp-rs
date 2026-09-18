@@ -2683,14 +2683,14 @@ impl From<TokenResolveError> for std::io::Error {
     }
 }
 
-/// Test-only record of which `exec://` arm the most recent
-/// `resolve_dynamic_token_inner` call on this thread took. Thread-local so
-/// parallel tests cannot race on it; compiled out of every non-test build.
-///
-/// It exists so the two arm tests can *distinguish* the arms: both arms report
-/// the same ENOENT for a missing command, so without this a test named for the
-/// async arm would still pass if a regression routed the call to the sync
-/// fallback. With it, a mis-routed call flips the flag and fails the test.
+// Test-only record of which `exec://` arm the most recent
+// `resolve_dynamic_token_inner` call on this thread took. Thread-local so
+// parallel tests cannot race on it; compiled out of every non-test build.
+//
+// It exists so the two arm tests can *distinguish* the arms: both arms report
+// the same ENOENT for a missing command, so without this a test named for the
+// async arm would still pass if a regression routed the call to the sync
+// fallback. With it, a mis-routed call flips the flag and fails the test.
 #[cfg(test)]
 thread_local! {
     static LAST_EXEC_USED_ASYNC_ARM: std::cell::Cell<bool> =
