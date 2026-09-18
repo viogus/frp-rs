@@ -436,6 +436,16 @@ nothing about whether the described behaviour still holds.
   a regression from noise, and the habit of rerunning until green is how a real
   failure eventually gets merged.
 
+  **Recurrence (2026-09-17, PR #351 — a `CHANGELOG.md` + one CI-lane feature-flag diff,
+  so nothing on the data plane changed):** the `compat` job failed **twice in a row on the
+  same commit**, with a **different scenario each time** — first
+  `kcp-rust-to-rust: proxy port 20403 not reachable`, then
+  `rust-to-go-tcp-tls: FAIL:CONNECT_TIMEOUT` (both 85 passed / 1 failed) — and passed on the
+  third re-run. That is the same signature as the PR #338 recurrence recorded above and as the
+  original 2-of-3 report: the failure moves around between runs, which is what rules out a
+  deterministic cause in the diff and points at readiness/timing in the harness. Two more
+  scenario names are now on the record (`kcp-rust-to-rust`, `rust-to-go-tcp-tls`), alongside
+  `go-to-rust-quic`, `tcp-plain`, `tcp-tls`, `tcp-tls-mux` and `ws-plain`.
   **Recurrence (2026-09-17, PR #338 — a `TODO.md`-only diff, so nothing compiled
   could have changed):** `compat` failed not in the compat scenarios but in its
   `Run Rust unit tests` step — **851 passed, 1 failed**:
