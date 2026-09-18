@@ -2601,13 +2601,106 @@ pub fn resolve_dynamic_token_checked(
     token: &str,
     unsafe_features: &crate::unsafe_features::UnsafeFeatures,
 ) -> Result<String, String> {
-    resolve_dynamic_token_inner(token, Some(unsafe_features))
+    resolve_dynamic_token_inner(token, Some(unsafe_features)).map_err(|e| e.message)
+}
+
+/// A dynamic-token resolution failure, carrying both the redacted message and —
+/// when the failure was a syscall — the errno that caused it.
+///
+/// # Why the errno is carried out of band
+///
+/// `message` is the user-visible text: it must never contain the command line,
+/// the script path, or the script's captured stderr (that is why every error
+/// below is reworded rather than passed through verbatim). Because the message
+/// is deliberately redacted, human-readable prose, it is **not** a machine
+/// channel: nothing may recover control-flow information (such as an errno) by
+/// scanning it. The errno is captured next to the `io::Error` that produced it
+/// and stays available structurally, so the ETXTBSY retry reads
+/// `raw_os_error` instead of parsing `message`.
+///
+/// # Who consumes `raw_os_error` (read before deleting or "wiring up")
+///
+/// `raw_os_error` is consumed **only by the ETXTBSY retry in this file's
+/// `#[cfg(test)] mod tests`** (see `retry_on_etxtbsy` /
+/// `io_error_from_token_error`), which collapses the residual `exec://` timing
+/// flake in `test_resolve_dynamic_token_exec_failure_redacts_stderr`.
+///
+/// Production deliberately does **not** retry ETXTBSY, and this is a decision,
+/// not an oversight: the condition is another process holding the
+/// operator-owned token script open for writing, which is a real, fixable
+/// startup misconfiguration. Silently retrying it would add latency to a real
+/// error and hide the misconfiguration from the operator.
+/// `resolve_dynamic_token_checked` keeps its `Result<String, String>` public
+/// signature and hands callers only the redacted message.
+///
+/// So the field is intentionally test-consumed. Do not delete it as unused (the
+/// `From<TokenResolveError> for io::Error` impl below keeps it read), and do not
+/// add a production retry without first revisiting the no-retry decision above —
+/// this struct is not half-way to one.
+#[derive(Debug)]
+struct TokenResolveError {
+    /// Redacted, user-facing error text.
+    message: String,
+    /// `raw_os_error()` of the failing syscall, or `None` for a non-syscall
+    /// failure (bad config, non-zero exit status, timeout).
+    raw_os_error: Option<i32>,
+}
+
+impl TokenResolveError {
+    /// A failure with no syscall errno: bad configuration, a non-zero exit
+    /// status, or a timeout.
+    fn plain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            raw_os_error: None,
+        }
+    }
+
+    /// A failure caused by a syscall. Formats `context: {e}` for the redacted
+    /// message and keeps `e.raw_os_error()` alongside it.
+    fn from_io(context: &str, e: std::io::Error) -> Self {
+        Self {
+            message: format!("{context}: {e}"),
+            raw_os_error: e.raw_os_error(),
+        }
+    }
+}
+
+/// Convert a resolution failure back into an [`std::io::Error`] for callers
+/// that classify on errno. Uses the errno that was stored alongside the
+/// message; the message text is never inspected.
+///
+/// This impl is what makes the stored errno useful to the test-only ETXTBSY
+/// retry (see `retry_on_etxtbsy`) while keeping it read in every build, so the
+/// field is not `dead_code`. It has no production caller by design — see the
+/// `TokenResolveError` docs.
+impl From<TokenResolveError> for std::io::Error {
+    fn from(e: TokenResolveError) -> Self {
+        match e.raw_os_error {
+            Some(errno) => std::io::Error::from_raw_os_error(errno),
+            None => std::io::Error::other(e.message),
+        }
+    }
+}
+
+/// Test-only record of which `exec://` arm the most recent
+/// `resolve_dynamic_token_inner` call on this thread took. Thread-local so
+/// parallel tests cannot race on it; compiled out of every non-test build.
+///
+/// It exists so the two arm tests can *distinguish* the arms: both arms report
+/// the same ENOENT for a missing command, so without this a test named for the
+/// async arm would still pass if a regression routed the call to the sync
+/// fallback. With it, a mis-routed call flips the flag and fails the test.
+#[cfg(test)]
+thread_local! {
+    static LAST_EXEC_USED_ASYNC_ARM: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 fn resolve_dynamic_token_inner(
     token: &str,
     unsafe_features: Option<&crate::unsafe_features::UnsafeFeatures>,
-) -> Result<String, String> {
+) -> Result<String, TokenResolveError> {
     if let Some(path) = token.strip_prefix("file://") {
         // Go frp v0.70.1: only exec token sources require the unsafe-features
         // gate (validation/client.go validateOIDCConfig + token.go); file
@@ -2618,23 +2711,25 @@ fn resolve_dynamic_token_inner(
             // Redact the token-file path: this error is surfaced at startup
             // failure level and must not leak where the token file lives.
             // Only the error class (the io error) is retained.
-            Err(e) => Err(format!(
-                "Failed to read dynamic token from file source: {e}"
+            Err(e) => Err(TokenResolveError::from_io(
+                "Failed to read dynamic token from file source",
+                e,
             )),
         }
     } else if let Some(cmd) = token.strip_prefix("exec://") {
         if unsafe_features
             .is_some_and(|uf| !uf.is_enabled(crate::unsafe_features::TOKEN_SOURCE_EXEC))
         {
-            return Err(
+            return Err(TokenResolveError::plain(
                 "exec:// token source blocked: TokenSourceExec not in UnsafeFeatures allowlist. \
-                 Set [common].unsafe_features = [\"TokenSourceExec\"] to enable."
-                    .into(),
-            );
+                 Set [common].unsafe_features = [\"TokenSourceExec\"] to enable.",
+            ));
         }
         let parts: Vec<&str> = cmd.split_whitespace().collect();
         if parts.is_empty() {
-            return Err("Dynamic token exec:// with empty command".into());
+            return Err(TokenResolveError::plain(
+                "Dynamic token exec:// with empty command",
+            ));
         }
         // Prefer the async path (tokio::process::Command) when running on a
         // multi-thread tokio runtime so no worker thread is parked on
@@ -2653,6 +2748,8 @@ fn resolve_dynamic_token_inner(
         const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let output = match tokio::runtime::Handle::try_current() {
             Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                #[cfg(test)]
+                LAST_EXEC_USED_ASYNC_ARM.with(|arm| arm.set(true));
                 tokio::task::block_in_place(|| {
                     handle.block_on(async {
                         tokio::time::timeout(EXEC_TIMEOUT, exec_token_command_async(&parts))
@@ -2669,7 +2766,11 @@ fn resolve_dynamic_token_inner(
                     })
                 })
             }
-            _ => exec_token_command_sync_timeout(&parts, EXEC_TIMEOUT),
+            _ => {
+                #[cfg(test)]
+                LAST_EXEC_USED_ASYNC_ARM.with(|arm| arm.set(false));
+                exec_token_command_sync_timeout(&parts, EXEC_TIMEOUT)
+            }
         };
         match output {
             // Redact the command line and the script's captured stderr (both
@@ -2677,10 +2778,16 @@ fn resolve_dynamic_token_inner(
             // the spawn io error below — is surfaced to the startup log.
             Ok(o) => {
                 let status = o.status;
-                finish_exec_output(cmd, o)
-                    .map_err(|_| format!("Dynamic token exec command exited with {status}"))
+                finish_exec_output(cmd, o).map_err(|_| {
+                    TokenResolveError::plain(format!(
+                        "Dynamic token exec command exited with {status}"
+                    ))
+                })
             }
-            Err(e) => Err(format!("Failed to exec dynamic token command: {e}")),
+            Err(e) => Err(TokenResolveError::from_io(
+                "Failed to exec dynamic token command",
+                e,
+            )),
         }
     } else {
         Ok(token.to_string())
@@ -3545,6 +3652,13 @@ mod tests {
     /// Run `attempt` again while — and only while — it fails with ETXTBSY, up
     /// to [`ETXTBSY_MAX_ATTEMPTS`] calls. Any other error is returned on the
     /// first call, so the retry cannot mask a real spawn failure.
+    ///
+    /// **Test-only, deliberately.** Production does not retry ETXTBSY: the
+    /// condition is an operator-owned token script held open for writing, which
+    /// is a real, fixable startup misconfiguration, and a silent retry would add
+    /// latency and hide it. This helper exists so the test that execs a script
+    /// it just wrote cannot flake on the Linux ETXTBSY window. See the
+    /// `TokenResolveError` docs for the full decision.
     fn retry_on_etxtbsy<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
         let mut attempt_no = 1;
         loop {
@@ -3560,17 +3674,248 @@ mod tests {
         }
     }
 
-    /// `resolve_dynamic_token_checked` deliberately flattens a spawn failure
-    /// into a redacted `String` (the command line must not leak), so recover
-    /// just the errno class the retry needs: only the ETXTBSY message becomes a
-    /// raw-os `io::Error`; every other failure — including the exit-status
-    /// error this test asserts — stays non-retryable.
-    fn io_error_from_token_error(msg: String) -> std::io::Error {
-        if msg.contains("(os error 26)") {
-            std::io::Error::from_raw_os_error(ETXTBSY)
-        } else {
-            std::io::Error::other(msg)
+    /// Build the classification-facing [`std::io::Error`] from a resolution
+    /// failure the same way the retry does: via the errno captured next to the
+    /// message, never by scanning the message text.
+    fn io_error_from_token_error(e: TokenResolveError) -> std::io::Error {
+        e.into()
+    }
+
+    /// The ETXTBSY retry fires on errno 26, and the errno is read from the
+    /// error **structure** -- not recovered by scanning the redacted,
+    /// human-readable message. A string-matching classifier is exactly what
+    /// this test refuses to accept: it must break if classification ever
+    /// listens to the message text instead of the stored errno.
+    #[test]
+    fn io_error_from_token_error_classifies_etxtbsy_by_errno() {
+        // Built exactly as the spawn path builds it: an ETXTBSY `io::Error`
+        // wrapped in the redacted context message.
+        let busy = TokenResolveError::from_io(
+            "Failed to exec dynamic token command",
+            std::io::Error::from_raw_os_error(ETXTBSY),
+        );
+        // The redacted message happens to still contain the marker the old
+        // classifier looked for...
+        assert!(
+            busy.message.contains("(os error 26)"),
+            "expected the errno marker in the redacted message, got: {}",
+            busy.message
+        );
+        // ...but classification is by the errno kept alongside it.
+        assert_eq!(busy.raw_os_error, Some(ETXTBSY));
+        let classified = io_error_from_token_error(busy);
+        assert_eq!(
+            classified.raw_os_error(),
+            Some(ETXTBSY),
+            "ETXTBSY must survive into the error the retry classifies"
+        );
+    }
+
+    /// The complementary direction: a failure that is *not* a syscall — hence
+    /// errno `None` — is not retryable, **even when its redacted message
+    /// mentions an errno**. `(os error 2)` and `(os error 260)` are the
+    /// near-misses that separate "only a real 26" from "any error whose text
+    /// mentions an errno" (note `(os error 260)` even contains `(os error 26`
+    /// as a prefix).
+    #[test]
+    fn io_error_from_token_error_ignores_errno_lookalikes_in_message() {
+        for lookalike in ["(os error 2)", "(os error 260)"] {
+            let e = TokenResolveError::plain(format!(
+                "Failed to exec dynamic token command: Text file busy {lookalike}"
+            ));
+            assert!(
+                e.message.contains(lookalike),
+                "test fixture must mention {lookalike}"
+            );
+            assert_eq!(
+                e.raw_os_error, None,
+                "{lookalike} in a message must not become a syscall errno"
+            );
+            let classified = io_error_from_token_error(e);
+            assert_eq!(
+                classified.raw_os_error(),
+                None,
+                "{lookalike} must classify as non-retryable"
+            );
         }
+    }
+
+    /// End-to-end property that actually matters: feed the classified errors
+    /// through the retry and show the ETXTBSY one is retried while every
+    /// non-ETXTBSY one — including the errno-text near-misses — is not.
+    #[test]
+    fn classified_errors_are_retried_only_when_etxtbsy() {
+        // ETXTBSY: retried, then succeeds.
+        let attempts = std::cell::Cell::new(0u32);
+        let retried = retry_on_etxtbsy(|| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 3 {
+                Err(io_error_from_token_error(TokenResolveError::from_io(
+                    "Failed to exec dynamic token command",
+                    std::io::Error::from_raw_os_error(ETXTBSY),
+                )))
+            } else {
+                Ok("resolved")
+            }
+        });
+        assert_eq!(retried.unwrap(), "resolved");
+        assert_eq!(attempts.get(), 3, "ETXTBSY must be retried");
+
+        // A lookalike message that is not a syscall failure: never retried.
+        let attempts = std::cell::Cell::new(0u32);
+        let not_retried = retry_on_etxtbsy::<()>(|| {
+            attempts.set(attempts.get() + 1);
+            Err(io_error_from_token_error(TokenResolveError::plain(
+                "Failed to exec dynamic token command: Text file busy (os error 260)",
+            )))
+        });
+        assert!(not_retried.is_err());
+        assert_eq!(
+            attempts.get(),
+            1,
+            "a message that merely mentions an errno must not be retried"
+        );
+    }
+
+    /// The decisive pair: classification must follow the **stored errno**, never
+    /// the message text. A regression to `message.contains("(os error 26)")`
+    /// flips both halves of this test, so — unlike the `from_io`-built fixtures
+    /// above, whose messages also contain the marker — it cannot pass on the
+    /// outcome alone.
+    #[test]
+    fn etxtbsy_classification_follows_errno_not_message_text() {
+        // (1) Stored errno 26, message carries NO marker: must still be
+        // retryable. A prose scanner would return non-retryable here.
+        let errno_only = TokenResolveError {
+            message: "Failed to exec dynamic token command: file busy".into(),
+            raw_os_error: Some(ETXTBSY),
+        };
+        assert!(
+            !errno_only.message.contains("(os error 26)"),
+            "discriminating fixture must have no marker in its message"
+        );
+        assert_eq!(
+            io_error_from_token_error(errno_only).raw_os_error(),
+            Some(ETXTBSY),
+            "a stored ETXTBSY must stay retryable even without the marker text"
+        );
+
+        // (2) Message carries the exact marker, stored errno absent: must NOT be
+        // retryable. A prose scanner would return retryable here.
+        let prose_only = TokenResolveError {
+            message: "Failed to exec dynamic token command: Text file busy (os error 26)".into(),
+            raw_os_error: None,
+        };
+        assert!(prose_only.message.contains("(os error 26)"));
+        assert_eq!(
+            io_error_from_token_error(prose_only).raw_os_error(),
+            None,
+            "marker text alone must not be classified as ETXTBSY"
+        );
+
+        // And the retry itself follows that classification, both directions.
+        let attempts = std::cell::Cell::new(0u32);
+        let retried = retry_on_etxtbsy(|| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 2 {
+                Err(io_error_from_token_error(TokenResolveError {
+                    message: "Failed to exec dynamic token command: file busy".into(),
+                    raw_os_error: Some(ETXTBSY),
+                }))
+            } else {
+                Ok("resolved")
+            }
+        });
+        assert_eq!(retried.unwrap(), "resolved");
+        assert_eq!(attempts.get(), 2, "a stored ETXTBSY must be retried");
+
+        let attempts = std::cell::Cell::new(0u32);
+        let not_retried = retry_on_etxtbsy::<()>(|| {
+            attempts.set(attempts.get() + 1);
+            Err(io_error_from_token_error(TokenResolveError {
+                message: "Failed to exec dynamic token command: Text file busy (os error 26)"
+                    .into(),
+                raw_os_error: None,
+            }))
+        });
+        assert!(not_retried.is_err());
+        assert_eq!(
+            attempts.get(),
+            1,
+            "marker text without a stored errno must not be retried"
+        );
+    }
+
+    /// The real production failure path must carry the errno out of band: a
+    /// missing exec command fails `execve` with ENOENT (2), and the structured
+    /// error must expose that, while the user-visible message stays redacted.
+    ///
+    /// This covers the **synchronous fallback** arm: a plain `#[test]` has no
+    /// tokio runtime, so `Handle::try_current()` fails and the sync
+    /// `exec_token_command_sync_timeout` path runs — asserted via the test-only
+    /// arm record, so this fails if the call is mis-routed to the async arm. The
+    /// multi-thread async arm that frpc/frps actually use is covered by
+    /// `exec_spawn_failure_carries_real_errno_async_arm`.
+    #[test]
+    fn exec_spawn_failure_carries_real_errno_sync_arm() {
+        let uf = crate::unsafe_features::UnsafeFeatures::new(
+            crate::unsafe_features::CLIENT_UNSAFE_FEATURES,
+        );
+        let e = resolve_dynamic_token_inner("exec:///nonexistent/frp-token-cmd-xyz", Some(&uf))
+            .expect_err("missing exec command must fail");
+        assert!(
+            !LAST_EXEC_USED_ASYNC_ARM.with(|arm| arm.get()),
+            "a plain #[test] must take the sync exec arm"
+        );
+        assert_eq!(
+            e.raw_os_error,
+            Some(2),
+            "sync-arm spawn failure must carry the real errno (ENOENT=2), got: {e:?}"
+        );
+        assert!(
+            !e.message.contains("frp-token-cmd-xyz"),
+            "message must stay redacted: {}",
+            e.message
+        );
+    }
+
+    /// The same errno-capture guarantee on the **async arm** — the
+    /// `tokio::process::Command` path frpc/frps take at startup, since both run
+    /// on a multi-thread tokio runtime. Executed from a spawned worker (not the
+    /// `block_on` entry point) so `block_in_place` + `Handle::block_on` is the
+    /// arm exercised.
+    ///
+    /// Crucially this compares the test-only arm record taken **on the same
+    /// thread immediately after the call**, so it fails if a regression routes
+    /// the multi-thread context to the sync fallback — both arms would otherwise
+    /// report the identical ENOENT.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exec_spawn_failure_carries_real_errno_async_arm() {
+        let uf = crate::unsafe_features::UnsafeFeatures::new(
+            crate::unsafe_features::CLIENT_UNSAFE_FEATURES,
+        );
+        let (used_async_arm, e) = tokio::spawn(async move {
+            let e = resolve_dynamic_token_inner("exec:///nonexistent/frp-token-cmd-xyz", Some(&uf))
+                .expect_err("missing exec command must fail");
+            // Read the arm back on this same worker before yielding.
+            (LAST_EXEC_USED_ASYNC_ARM.with(|arm| arm.get()), e)
+        })
+        .await
+        .expect("task must not panic");
+        assert!(
+            used_async_arm,
+            "a spawned multi-thread runtime task must take the async exec arm"
+        );
+        assert_eq!(
+            e.raw_os_error,
+            Some(2),
+            "async-arm spawn failure must carry the real errno (ENOENT=2), got: {e:?}"
+        );
+        assert!(
+            !e.message.contains("frp-token-cmd-xyz"),
+            "message must stay redacted: {}",
+            e.message
+        );
     }
 
     /// A script name unique **per invocation**. The pid alone is not enough: a
@@ -3690,7 +4035,7 @@ mod tests {
         // real spawn failure (non-ETXTBSY → no retry), and the exit-status
         // assertion below is deliberately unchanged.
         let result = retry_on_etxtbsy(|| {
-            resolve_dynamic_token_checked(&token, &uf).map_err(io_error_from_token_error)
+            resolve_dynamic_token_inner(&token, Some(&uf)).map_err(io_error_from_token_error)
         });
         let err = result
             .expect_err("failing token script must be an error")
