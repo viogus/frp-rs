@@ -523,17 +523,19 @@ Monitors memory, connection counts, and throughput. Runs weekly in CI via `.gith
 
 ### Property & Fuzz Tests
 
-Proptest-based tests verify correctness under adversarial inputs (`repo-health.sh`
-re-measures the gated figure below from the source on every run):
+Proptest-based tests verify correctness under adversarial inputs:
 - **Config normalization** (`frp-core/src/config/tests.rs`): proptest blocks covering idempotency, flat↔nested equivalence, camelCase→snake_case
-- **Protocol fuzzing** (`frp-core/src/protocol.rs`): 6 fuzz tests — all 256 V1 type bytes × arbitrary payloads, V2 arbitrary type IDs, truncated frames, magic detection
+- **Protocol fuzzing** (`frp-core/src/protocol.rs`): all 256 V1 type bytes × arbitrary payloads, V2 arbitrary type IDs, truncated frames, magic detection
 
-> Raw test counts (proptest blocks, protocol `#[test]` functions, the workspace
-> total, `frp-server/tests`) are deliberately **not** curated: adding a test
-> would otherwise fail the `health` job, and the aggregate totals were observed
-> to differ between environments on the *same* tree (215/2069 locally vs
-> 216/2071 in CI, PR #353 — cause not established). Read them from the `Tests`
-> section of `bash scripts/repo-health.sh`.
+> Raw test counts are deliberately **not** curated: adding a test would otherwise
+> fail the `health` job, and the workspace total was observed to differ between
+> environments on the *same* tree (215/2069 locally vs 216/2071 in CI, PR #353 —
+> cause not established). The `Tests` section of `bash scripts/repo-health.sh`
+> prints `test functions`, `files with tests`, `frp-server/tests` and
+> `proptest blocks`; per-file counts are read from the tree when needed. Fuzz
+> *targets* are not curated either — a text grep cannot tell a live target from
+> a `#[cfg]`-disabled one — so their count and enablement are covered by the test
+> suite, not by the gate.
 
 ### Repository Invariants (`repo-health.sh`)
 
@@ -572,9 +574,15 @@ claim and counter cannot drift: "test function" is one `#[test]`/`#[tokio::test]
 attribute that starts a line after optional indentation, parameterised or not
 (comment mentions do not count). Raw test counts are deliberately **not** in the
 curated set — they change whenever a test is added, so gating them would make
-"add a test" fail the `health` job; the script prints them instead. The
-inventory is meant to be read at release time; a claim that no longer matches
-fails the `health` CI job.
+"add a test" fail the `health` job; the script prints them instead. Two further
+things are deliberately **not** gated because a text match cannot establish them:
+**client-plugin wiring** (whether the `virtual_net` start-up skip and the
+work-conn handoff actually compile and run) and **fuzz-target enablement** (a
+`#[cfg]`-disabled target reads the same as a live one). Both are covered by the
+plugin/compat test suite and `scripts/compat-test.sh`, not by a grep — a gate
+that claimed them would be certifying text, not behaviour. The inventory is meant
+to be read at release time; a claim that no longer matches fails the `health` CI
+job.
 
 ## 6. Release Process
 

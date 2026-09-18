@@ -88,6 +88,8 @@ printf '  test functions      : %s\n' \
   "$(grep -rhoE "$TEST_ATTR" --include=*.rs frp-core frp-server frp-client frp-vnet frps frpc | wc -l | tr -d ' ')"
 printf '  files with tests    : %s\n' \
   "$(grep -rlE "$TEST_ATTR" --include=*.rs frp-core frp-server frp-client frp-vnet frps frpc | wc -l | tr -d ' ')"
+printf '  frp-server/tests    : %s\n' \
+  "$(grep -hoE "$TEST_ATTR" frp-server/tests/*.rs 2>/dev/null | wc -l | tr -d ' ')"
 printf '  proptest blocks     : %s\n' \
   "$(grep -rho 'proptest!' --include=*.rs frp-core frp-server frp-client frp-vnet | wc -l | tr -d ' ')"
 printf '  integration test dirs: %s\n' \
@@ -105,53 +107,10 @@ hdr "Unsafe usage"
 # text.
 printf '  %-12s %8s %10s %12s %10s\n' "crate" "blocks" "unsafe fn" "unsafe impl" "SAFETY cmts"
 if [ "$have_python" = 1 ]; then
-  unsafe_table=$(python3 - <<'PY'
-import os, re
-
-
-def strip_rust_comments(text):
-    """Remove // and /* */ comments, preserving string literals, so a marker in
-    comment text does not count as code (kept identical to the copy in the
-    doc-figure gate below). Block comments NEST in Rust, so track depth.
-    Limits: char literals and raw strings are not modelled — a `//` or `/*`
-    inside one could still be mis-parsed (none known in the scanned trees)."""
-    out = []
-    i, n = 0, len(text)
-    while i < n:
-        if text.startswith('//', i):
-            j = text.find('\n', i)
-            i = n if j < 0 else j
-            continue
-        if text.startswith('/*', i):
-            depth, i = 1, i + 2
-            while i < n and depth:
-                if text.startswith('/*', i):
-                    depth += 1
-                    i += 2
-                elif text.startswith('*/', i):
-                    depth -= 1
-                    i += 2
-                else:
-                    i += 1
-            continue
-        if text[i] == '"':
-            out.append(text[i])
-            i += 1
-            while i < n:
-                out.append(text[i])
-                if text[i] == '\\' and i + 1 < n:
-                    out.append(text[i + 1])
-                    i += 2
-                    continue
-                if text[i] == '"':
-                    i += 1
-                    break
-                i += 1
-            continue
-        out.append(text[i])
-        i += 1
-    return ''.join(out)
-
+  unsafe_table=$(python3 -B - <<'PY'
+import os, re, sys
+sys.path.insert(0, 'scripts')
+from rust_comments import code_only   # shared: comments removed, literals blanked
 
 for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
     src = os.path.join(crate, 'src')
@@ -161,10 +120,10 @@ for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
     for root, _d, files in os.walk(src):
         for fn in files:
             if fn.endswith('.rs'):
-                text = strip_rust_comments(open(os.path.join(root, fn),
-                                                 encoding='utf8',
-                                                 errors='ignore').read())
-                blocks += len(re.findall(r'unsafe *\{', text))
+                text = code_only(open(os.path.join(root, fn),
+                                      encoding='utf8',
+                                      errors='ignore').read())
+                blocks += len(re.findall(r'unsafe\s*\{', text))
                 fns += len(re.findall(r'unsafe fn', text))
                 impls += len(re.findall(r'unsafe impl', text))
     print('%s %d %d %d' % (crate, blocks, fns, impls))
@@ -191,8 +150,10 @@ printf '\n  Convention: every unsafe block carries a `// SAFETY:` comment.\n'
 # (4-9 lines) or sits inside the block. So: walk up over the whole contiguous
 # comment/attribute block, and also look a few lines into the block itself.
 if [ "$have_python" = 1 ]; then
-  unsafe_misses=$(python3 - <<'PY'
+  unsafe_misses=$(python3 -B - <<'PY'
 import os, re, sys
+sys.path.insert(0, 'scripts')
+from rust_comments import code_only
 
 INNER = 4  # lines into the block to also scan (catches `let n = unsafe {` + comment inside)
 MARKER = re.compile(r'//\s*SAFETY')
@@ -231,11 +192,16 @@ for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
                 continue
             path = os.path.join(root, fn)
             try:
-                lines = open(path, encoding='utf8', errors='ignore').read().split('\n')
+                raw = open(path, encoding='utf8', errors='ignore').read()
             except OSError as e:
                 note('%s: %s' % (path, e.strerror or e))
                 continue
-            for i, line in enumerate(lines):
+            lines = raw.split('\n')
+            # Detect `unsafe {` on the comment/literal-stripped view, so the
+            # gate and the reported "blocks" column use the same definition; the
+            # SAFETY justification is still read from the raw lines above/below.
+            code_lines = code_only(raw).split('\n')
+            for i, line in enumerate(code_lines):
                 if re.search(r'unsafe\s*\{', line) and not justified(lines, i):
                     print('%s:%d' % (path, i + 1))
 if errors:  # an unreadable file/directory is not "no violations"
@@ -282,7 +248,7 @@ hdr "Docs"
 if [ "$have_python" = 1 ]; then
   # (a) Gate: every doc is reachable from the index. A doc nobody links to is a
   # doc nobody reads, and the index is edited by hand, so it drifts.
-  index_misses=$(python3 - <<'PY'
+  index_misses=$(python3 -B - <<'PY'
 import os
 
 INDEX = os.path.join('docs', 'README.md')
@@ -319,7 +285,7 @@ PY
   # (b) Report: paths inside docs/archive/** still say `docs/superpowers/...`,
   # deliberately (historical records are not rewritten). Verify the documented
   # translation still holds, so the claim in docs/archive/README.md stays true.
-  archive=$(python3 - <<'PY'
+  archive=$(python3 -B - <<'PY'
 import os, re, sys
 
 pat = re.compile(r'docs/superpowers/([A-Za-z0-9_./-]+)')
@@ -377,7 +343,7 @@ PY
   # Point-in-time documents (history, dated audits, changelog, the refactor
   # proposal, and the backlog that quotes removed paths as evidence) describe an
   # older tree on purpose and are out of scope; the archive has check (b).
-  path_report=$(python3 - <<'PY'
+  path_report=$(python3 -B - <<'PY'
 import os, re, sys
 
 ROOTS = ('src/', 'tests/', 'benches/', 'examples/',
@@ -547,52 +513,12 @@ EOF
   # caught — there is no general "numbers in docs" sweep by design. The rule is
   # therefore: when you add or reword a count in a live doc, add/adjust its entry
   # here in the same change (or delete the copy in favour of a pointer).
-  doc_claims=$(python3 - <<'PY'
+  doc_claims=$(python3 -B - <<'PY'
 import os, re, subprocess, sys
 
 
-def strip_rust_comments(text):
-    """Remove // and /* */ comments, preserving string literals. Source markers
-    must not be satisfied by comment text — a commented-out branch is not
-    code. Kept identical to the copy in the Unsafe usage section above. Block
-    comments nest in Rust, so track depth. Limits: char literals and raw
-    strings are not modelled — a `//` or `/*` inside one could be mis-parsed."""
-    out = []
-    i, n = 0, len(text)
-    while i < n:
-        if text.startswith('//', i):
-            j = text.find('\n', i)
-            i = n if j < 0 else j
-            continue
-        if text.startswith('/*', i):
-            depth, i = 1, i + 2
-            while i < n and depth:
-                if text.startswith('/*', i):
-                    depth += 1
-                    i += 2
-                elif text.startswith('*/', i):
-                    depth -= 1
-                    i += 2
-                else:
-                    i += 1
-            continue
-        if text[i] == '"':
-            out.append(text[i])
-            i += 1
-            while i < n:
-                out.append(text[i])
-                if text[i] == '\\' and i + 1 < n:
-                    out.append(text[i + 1])
-                    i += 2
-                    continue
-                if text[i] == '"':
-                    i += 1
-                    break
-                i += 1
-            continue
-        out.append(text[i])
-        i += 1
-    return ''.join(out)
+sys.path.insert(0, 'scripts')
+from rust_comments import code_only   # shared: comments removed, literals blanked
 
 # The measurable claims the live docs make, with the source that produces each
 # number. Only entries whose claim wording is unambiguous live here: adding one
@@ -607,20 +533,21 @@ def strip_rust_comments(text):
 #   V2-gated scenarios      `run_test` under `if ensure_go_frp_v2`, plus
 #                           scenarios that self-guard `ensure_go_frp_v2 || return 0`
 #   transport rows          `run_row` calls in protocol-matrix.sh
-#   protocol fuzz targets   `fn fuzz_` in frp-core/src/protocol.rs
 #   bench groups            `bench_*` ids inside a file's `criterion_group!`
-#   client plugin types     documented Go types implemented (arm or virtual_net path)
-#   unsafe block/fn/impl    comment-stripped counts, as the Unsafe usage section
+#   unsafe block/fn/impl    comment/literal-stripped code counts (Unsafe usage)
+#   (client plugin types and fuzz targets are NOT curated — see below)
 #   vendored crate versions `version` in vendor/<crate>/Cargo.toml
 #   frp-rs version          `version` in frp-core/Cargo.toml (prose restatements)
 #
-# NOT curated (printed by the script, stored nowhere): the aggregate test-function
-# total, frp-server/tests count, `proptest!` count, and protocol.rs regular-test
-# count — all change whenever a test is added, so gating them makes "add a test"
+# NOT curated: the aggregate test-function total, frp-server/tests count,
+# `proptest!` count, and protocol.rs regular-test count (all change whenever a
+# test is added, so gating them makes "add a test"
 # a cross-PR collision, and the aggregate totals were observed to differ between
 # environments on the same tree (215/2069 local vs 216/2071 CI on PR #353; cause
-# not established). Those stay visible in the Tests section of the report. See the
-# longer note next to the counters for why a claim must not be re-added.
+# not established). They stay visible in the Tests section of the report. Also NOT
+# curated: client plugin types and fuzz targets, which can only be pinned as
+# source text and so cannot establish compilation/enablement. See the longer notes
+# next to the counters for why these claims must not be re-added.
 #
 # "Test function" everywhere here means one `#[test]` / `#[tokio::test]`
 # attribute that starts a line after optional indentation, parameterised (e.g.
@@ -652,8 +579,7 @@ n_rows = len(re.findall(r'^\s*run_row ', open('scripts/protocol-matrix.sh',
 # NOTE: `proptest!` and protocol.rs "regular tests" counts are NOT curated either
 # — they are test-function counts that change whenever someone adds a test, the
 # same chore as the aggregate totals above. `repo-health.sh` still prints
-# `proptest blocks` in the Tests section, and the fuzz-target count below stays
-# curated because it is a structural enumeration, not a test-run total.
+# `proptest blocks` in the Tests section.
 # Scenarios gated on Go frp V2 in compat-test.sh. Two shapes gate a scenario:
 # (i) `run_test NAME` inside the `if ensure_go_frp_v2` block, and (ii) a scenario
 # function that self-guards with `ensure_go_frp_v2 || return 0` (the two UDP V2
@@ -680,10 +606,6 @@ for _l in _compat:
         _guarded.add(_cur)
 n_v2gated = len(_in_if | _guarded)
 
-# frp-core/src/protocol.rs `mod tests`: the fuzz-target count (structural).
-_pf = open('frp-core/src/protocol.rs', encoding='utf8').read()
-_fuzz = len(re.findall(r'fn fuzz_', _pf))
-
 def n_group(path):
     m = re.search(r'criterion_group!\(([^)]*)\)', open(path, encoding='utf8').read())
     return len(re.findall(r'\bbench_[a-z0-9_]+', m.group(1))) if m else 0
@@ -700,53 +622,13 @@ def n_group(path):
 # still prints both in the Tests section (they stay visible/checkable), and
 # CLAUDE.md points at the script instead of storing them.
 
-# Client plugin types: the docs count the **Go frp v0.71.0 client plugin types**
-# (9 local-server types + `virtual_net`). That is NOT the same set as the
-# `dispatch_plugin_start` match arms, which are those 9 plus the Rust-only
-# `visitor_plugin`; the two only happen to both number 10. So measure the
-# documented set by name, from **comment-stripped** source (a commented-out
-# branch is not an implementation):
-#   * each of the 9 local types must be an arm of the dispatch match;
-#   * `virtual_net` requires BOTH the service.rs *startup* skip branch (the
-#     `if ... { continue; }` whose enclosing startup loop goes on to dispatch
-#     tls2raw) AND the work_conn.rs handoff block that routes
-#     `info.plugin == "virtual_net"` to `run_virtual_net_plugin_work_conn`
-#     (the TUN bridge). The two conditions are combined per type with `and`, so
-#     removing either one — or commenting both out — drops the count. The
-#     reload-time `virtual_net` skip further down service.rs is NOT part of
-#     this check.
-# WHAT THIS PINS, PRECISELY: the handoff/dispatch *expressions are present in
-# the source text* (comments stripped). It is a text check. It does NOT establish
-# that the code compiles, that the `#[cfg(feature = "vnet")]` guard is enabled,
-# that a `#[cfg(any())]`/otherwise-unreachable branch is live, or that the TUN
-# bridge is correct — cargo is not run here. A present-but-compiled-out or
-# present-but-broken handoff is outside what this can see.
-GO_PLUGIN_LOCAL = ('http_proxy', 'socks5', 'static_file', 'unix_domain_socket',
-                   'http2http', 'http2https', 'https2http', 'https2https',
-                   'tls2raw')
-_plugin = strip_rust_comments(open('frp-client/src/plugin/mod.rs', encoding='utf8').read())
-_service = strip_rust_comments(open('frp-client/src/service.rs', encoding='utf8').read())
-_work_conn = strip_rust_comments(open('frp-client/src/work_conn.rs', encoding='utf8').read())
-_m = re.search(r'match plugin_cfg\.plugin_type\.as_str\(\) \{(.*?)\n    \}', _plugin, re.S)
-_arms = set(re.findall(r'^\s*"([a-z0-9_]+)"\s*=>', _m.group(1), re.M)) if _m else set()
-_implemented = {t for t in GO_PLUGIN_LOCAL if t in _arms}
-# The service.rs marker must be the *startup* skip branch, not the reload-time
-# skip further down. Anchor it to the enclosing startup loop by requiring the
-# tls2raw dispatch to follow within a short window — semantic, not a local
-# binding name, so renaming e.g. `let result` keeps this green.
-_vnet_service = re.search(
-    r'if plugin_cfg\.plugin_type\s*==\s*"virtual_net"\s*\{\s*\n\s*continue;'
-    r'\s*\n\s*\}[\s\S]{0,400}?if plugin_cfg\.plugin_type\s*==\s*"tls2raw"',
-    _service) is not None
-_vnet_cond = re.search(r'if info\.plugin == "virtual_net"', _work_conn)
-# The handoff call must follow the dispatch condition (within a small window, so
-# a cosmetic reindent does not break the check but deleting the call does).
-_vnet_handoff = bool(_vnet_cond) and 'run_virtual_net_plugin_work_conn(' in \
-    _work_conn[_vnet_cond.end():_vnet_cond.end() + 800]
-if _vnet_service and _vnet_handoff:   # conjunctive: BOTH markers, per type
-    _implemented.add('virtual_net')
-n_plugin = len(_implemented)
-n_plugin_doc = len(GO_PLUGIN_LOCAL) + 1
+# Client plugin types and fuzz targets are NOT curated. Both can only be checked
+# as source text (an expression is present / an `fn fuzz_` exists), which cannot
+# establish that the plugin wiring compiles or that the fuzz target is enabled —
+# a `#[cfg]`-disabled or broken one still reads the same. Coverage there is
+# established by the plugin/compat test suite (`scripts/compat-test.sh`), not by
+# a text grep. Attempts to gate them were defeated in review by comment text,
+# commented-out lines, binding-name coupling and string/char-literal desync.
 
 # Unsafe counts, computed exactly as the "Unsafe usage" section above does:
 # comment-stripped raw occurrence counts, so a doc comment that merely mentions
@@ -760,9 +642,9 @@ def unsafe_counts(crate):
     for root, _d, files in os.walk(src, onerror=walk_error):
         for fn in files:
             if fn.endswith('.rs'):
-                text = strip_rust_comments(open(os.path.join(root, fn), encoding='utf8',
+                text = code_only(open(os.path.join(root, fn), encoding='utf8',
                                                  errors='ignore').read())
-                blocks += len(re.findall(r'unsafe *\{', text))
+                blocks += len(re.findall(r'unsafe\s*\{', text))
                 fns += len(re.findall(r'unsafe fn', text))
                 impls += len(re.findall(r'unsafe impl', text))
     return (blocks, fns, impls)
@@ -825,20 +707,12 @@ CLAIMS = [
     ('docs/why-frp-rs.md',     r'([0-9]+) 条传输链路',                       n_rows,     'protocol-matrix.sh `run_row`'),
     ('docs/go-frp-compat-audit.md', r'^> ([0-9]+)/[0-9]+\)',               n_rows,     'protocol-matrix.sh `run_row`'),
     ('docs/developing.md',     r'([0-9]+) of which are gated on Go frp V2', n_v2gated, 'V2-gated scenarios in compat-test.sh'),
-    ('CLAUDE.md',              r'([0-9]+) fuzz tests',                     _fuzz,      '`fn fuzz_` in frp-core/src/protocol.rs'),
-    ('docs/developing.md',     r'([0-9]+) fuzz tests',                     _fuzz,      '`fn fuzz_` in frp-core/src/protocol.rs'),
     ('CLAUDE.md',              r'\(([0-9]+) groups:',                      n_group('frp-core/benches/crypto_bridge.rs'),
                                                                                         'criterion_group! in crypto_bridge.rs'),
     ('docs/developing.md',     r'crypto_bridge\.rs.[^(]*\(([0-9]+) groups', n_group('frp-core/benches/crypto_bridge.rs'),
                                                                                         'criterion_group! in crypto_bridge.rs'),
     ('docs/developing.md',     r'nathole\.rs.[^(]*\(([0-9]+) groups',      n_group('frp-server/benches/nathole.rs'),
                                                                                         'criterion_group! in nathole.rs'),
-    ('docs/go-frp-compat-audit.md', r'([0-9]+) of [0-9]+ client plugin types', n_plugin_doc,
-                                                                                        'documented Go frp client plugin types'),
-    ('docs/go-frp-compat-audit.md', r'of ([0-9]+) client plugin types',    n_plugin,   'documented Go types with handler expression present in source text'),
-    ('docs/go-frp-compat-audit.md', r'all ([0-9]+) client plugins',        n_plugin,   'documented Go types with handler expression present in source text'),
-    ('docs/client-plugins.md', r'([0-9]+) client-side plugin types',       n_plugin,   'documented Go types with handler expression present in source text'),
-    ('docs/developing.md',     r'the ([0-9]+) client plugins',             n_plugin,   'documented Go types with handler expression present in source text'),
     # Unsafe counts — the same numbers the "Unsafe usage" section prints.
     ('CLAUDE.md',              r'frp-core: ([0-9]+) blocks',               u_core[0],  'unsafe-block count, Unsafe usage section'),
     ('CLAUDE.md',              r'\+ ([0-9]+) `unsafe fn`',                 u_core[1],  'unsafe-fn count, Unsafe usage section'),
@@ -855,21 +729,21 @@ CLAIMS = [
     ('docs/architecture.md',   r'vendors rustls \(([0-9.]+) at',           v_rustls,   'vendor/rustls/Cargo.toml'),
     ('docs/developing.md',     r'\(`([0-9.]+)`, the GHSA-2mjx',            v_rustls,   'vendor/rustls/Cargo.toml'),
     # The frp-rs-authored vendored notes restate their version several times;
-    # one entry per file checks every `<crate>[`] X.Y.Z` occurrence in it (the
-    # optional backtick covers "vendors `crate` X.Y.Z"), plus the "Diff from
-    # crates.io" continuation line. The crate name is anchored by a leading
-    # non-identifier boundary so an unrelated project's version on the same
-    # line cannot satisfy or trip the pattern. Deliberately OUT OF SCOPE, with
-    # reasons:
+    # one entry per file checks every frp-rs statement of it (the optional
+    # backtick covers "vendors `crate` X.Y.Z"), plus the "Diff from crates.io"
+    # continuation line. Each pattern is scoped by the preceding keyword
+    # (`Vendored` / `vendors` / `crates.io`), so an unrelated upstream version
+    # in the same file (e.g. "hashicorp yamux v0.1.1") cannot satisfy or trip
+    # it. Deliberately OUT OF SCOPE, with reasons:
     #   vendor/rustls/README-FRP-RS.md:66  — the 0.23.43 -> 0.23.45 bump history
     #                                        (a historical version, not current)
     #   vendor/rustls/README-FRP-RS.md:93  — crates.io `max_stable_version` /
     #                                        `newest_version`, which move
     #                                        independently of this vendored copy
     #   docs/developing.md:612             — the same crates.io fact
-    ('vendor/rustls/README-FRP-RS.md', r'(?<![A-Za-z0-9_-])rustls`?\s*([0-9]+\.[0-9]+\.[0-9]+)', v_rustls, 'vendor/rustls/Cargo.toml'),
-    ('vendor/yamux/README-FRP-RS.md',  r'(?<![A-Za-z0-9_-])yamux`?\s*([0-9]+\.[0-9]+\.[0-9]+)',  v_yamux,  'vendor/yamux/Cargo.toml'),
-    ('vendor/russh/README-FRP-RS.md',  r'(?<![A-Za-z0-9_-])russh`?\s*([0-9]+\.[0-9]+\.[0-9]+)',  v_russh,  'vendor/russh/Cargo.toml'),
+    ('vendor/rustls/README-FRP-RS.md', r'(?:Vendored|vendors|crates\.io)\s+`?rustls`?\s*([0-9]+\.[0-9]+\.[0-9]+)', v_rustls, 'vendor/rustls/Cargo.toml'),
+    ('vendor/yamux/README-FRP-RS.md',  r'(?:Vendored|vendors|crates\.io)\s+`?yamux`?\s*([0-9]+\.[0-9]+\.[0-9]+)',  v_yamux,  'vendor/yamux/Cargo.toml'),
+    ('vendor/russh/README-FRP-RS.md',  r'(?:Vendored|vendors|crates\.io)\s+`?russh`?\s*([0-9]+\.[0-9]+\.[0-9]+)',  v_russh,  'vendor/russh/Cargo.toml'),
     ('vendor/yamux/README-FRP-RS.md',  r'^([0-9]+\.[0-9]+\.[0-9]+); the full delta', v_yamux, 'vendor/yamux/Cargo.toml'),
     ('vendor/russh/README-FRP-RS.md',  r'^([0-9]+\.[0-9]+\.[0-9]+) \(the normalized', v_russh, 'vendor/russh/Cargo.toml'),
     # frp-rs's own version, as restated in prose (the version gate covers the
