@@ -32,7 +32,7 @@ Findings are listed by the change they came from. Each carries the reviewer's ev
 where the reviewer's claim was mechanical I re-ran it myself and say so.
 
 **The path-reference gate (#341) was wrong in both directions.**
-- [ ] **False positive: a crate-relative reference in a Rust comment is reported stale.**
+- [x] **False positive: a crate-relative reference in a Rust comment is reported stale.**
   Evidence (confirmed by re-running the logic): `frp-core/tests/v2_handshake_round14.rs:3`
   names `src/v2_handshake.rs`. The gate tries only `frp-core/tests/src/v2_handshake.rs` and
   `src/v2_handshake.rs`; both are absent, while `frp-core/src/v2_handshake.rs` exists. The
@@ -40,11 +40,13 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   clean tree. **Done-when:** the nearest ancestor containing a `Cargo.toml` is tried as a
   third base, with a test proving a crate-relative reference passes and a genuinely missing
   one still fails.
-- [ ] **The counts quoted in the commit message and in this file do not reproduce.** The
+  Done: fixed in #354. See that PR for the evidence and the residue it records.
+- [x] **The counts quoted in the commit message and in this file do not reproduce.** The
   shipped script prints 207 references / 177 bare / 45 shorthands / 222 skipped; the commit
   says 198 / 171 / 45 / 216, and no revision the reviewer could materialise yields those.
   **Done-when:** re-measure on the final tree and correct both places.
-- [ ] **The coverage claim is stronger than the gate.** `CLAUDE.md` says the gate asserts
+  Done: fixed in #354. See that PR for the evidence and the residue it records.
+- [x] **The coverage claim is stronger than the gate.** `CLAUDE.md` says the gate asserts
   "every repo path named in current docs or source comments resolves", but it reads only
   backtick spans anchored at one of 15 roots. Two live stale references are therefore missed:
   `handlers.rs` in `docs/architecture.md:59` and `CLAUDE.md:168` (the file is now
@@ -52,16 +54,19 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   file is `frp-client/src/visitor.rs`) — stale, and skipped only because it is not backticked.
   **Done-when:** either resolve bare filenames that match nothing anywhere in the tree and
   scan unbackticked path-like tokens, or narrow the wording to what is actually checked.
-- [ ] **The gate fails open.** A scanner exception prints `skip … produced no result` and the
+  Done: fixed in #354. See that PR for the evidence and the residue it records.
+- [x] **The gate fails open.** A scanner exception prints `skip … produced no result` and the
   script exits 0 (demonstrated by `chmod 000` on a scanned file). **Done-when:** empty or
   failed scan output sets `fail=1`.
-- [ ] Lower severity: `vendor/**/*.md` is scanned, so an upstream dependency bump can redden
+  Done: fixed in #354. See that PR for the evidence and the residue it records.
+- [x] Lower severity: `vendor/**/*.md` is scanned, so an upstream dependency bump can redden
   CI on prose frp-rs cannot edit; the new doc section omits three of the script's
   `SKIP_FILES` and the root-anchoring rule; the "700 misses" figure has no committed script
   and three plausible reconstructions give 139 / 534 / 1076.
 
 **The `/api/reload` fix (#342) changed default CLI behaviour without saying so.**
-- [ ] **Every default `frpc reload` is now strict.** `reload_cmd()` builds `strict_config`
+  Done: fixed in #354. See that PR for the evidence and the residue it records.
+- [x] **Every default `frpc reload` is now strict.** `reload_cmd()` builds `strict_config`
   with `flag(true, true)` — absent → `true` (`frp-core/src/cli.rs:1010-1045`, comment
   "absent → true"). Before this change serde ignored the camelCase key, so the CLI's value
   was discarded and reloads were always non-strict; now it is honoured, so a reload of a
@@ -69,11 +74,13 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   Go's `cmd/frpc/sub/reload.go` at the v0.71.0 commit and either match it exactly or record
   the divergence; if Go's reload is non-strict by default, fix the CLI default rather than
   the alias.
-- [ ] **The test that is cited as the proof never runs in CI.** The parity test is gated
+  Done: fixed in #351. See that PR for the evidence and the residue it records.
+- [x] **The test that is cited as the proof never runs in CI.** The parity test is gated
   `#[cfg(feature = "admin")]`; `ci.yml:159` runs `cargo test -p frp-client -j 1` without
   `--features admin`, and the only all-features test step (`ci.yml:82`) is `--lib`, which
   excludes integration tests. **Done-when:** the client integration lane runs with
   `--features admin`, or the test moves to a target that does.
+  Done: fixed in #351. See that PR for the evidence and the residue it records.
 - [ ] Lower severity: `?strictConfig=a&strictConfig=b` returns 400 here and 200 in Go (Go
   reads the first value), which falsifies the documented "never a 400"; the
   `Option<Json<..>>` rationale is wrong (axum yields `None` only when `Content-Type` is
@@ -87,31 +94,37 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   (and re-check the cost) or state plainly in `docs/developing.md` which targets are covered.
 
 **The SSH readiness fix (#344) left two sites and one unbounded case.**
-- [ ] Two SSH-gateway tests still connect with a bare `.unwrap()` and no readiness wait.
-- [ ] `SSH_READY_TIMEOUT` bounds the retry loop, not a stalled handshake: a peer that accepts
+- [x] Two SSH-gateway tests still connect with a bare `.unwrap()` and no readiness wait.
+  Done: fixed in #353. See that PR for the evidence and the residue it records.
+- [x] `SSH_READY_TIMEOUT` bounds the retry loop, not a stalled handshake: a peer that accepts
   TCP and then stalls can still hang the helper past the deadline. **Done-when:** wrap the
   attempt in a timeout so the bound is real.
 
 **The doc-figure gate (#346) can be bypassed and mis-measures.**
-- [ ] **A doc line containing the literal `DOC-FIGURES: ok` makes the gate exit 0.** (The
+  Done: fixed in #353. See that PR for the evidence and the residue it records.
+- [x] **A doc line containing the literal `DOC-FIGURES: ok` makes the gate exit 0.** (The
   gate's own output is what is grepped, so a doc that quotes it satisfies the check.)
   **Done-when:** the pass/fail decision does not depend on scanning its own printed output.
-- [ ] **The measurement undercounts, so it certifies wrong numbers.** Parameterised
+  Done: fixed in #354. See that PR for the evidence and the residue it records.
+- [x] **The measurement undercounts, so it certifies wrong numbers.** Parameterised
   `#[tokio::test(...)]` attributes are not counted: the tree has 2111 test functions, not the
   gated 2058; `protocol.rs` has 49 regular tests, not 40; `frp-server/tests` has 218, not 213;
   and 7 compat scenarios are gated on Go frp V2, not 5. **Done-when:** the counters match an
   independent count (`grep -c` of every attribute form), and the five figures are corrected.
-- [ ] Live docs quoting those figures are not all gated, so the gate can be green while a
+  Done: fixed in #354. See that PR for the evidence and the residue it records.
+- [x] Live docs quoting those figures are not all gated, so the gate can be green while a
   duplicate is wrong. **Done-when:** every live-doc copy of a gated quantity is either gated
   or deleted in favour of a pointer.
 
 **The ETXTBSY fix (#347) leaves its own detection untested.**
-- [ ] `io_error_from_token_error` — the function that decides "is this errno 26" — has no
+  Done: fixed in #354. See that PR for the evidence and the residue it records.
+- [x] `io_error_from_token_error` — the function that decides "is this errno 26" — has no
   test. A mutation that never matches keeps every test green and silently restores the flake
   it was written to stop. **Done-when:** a test drives that classifier directly (a matching
   error retries, a non-matching one does not), so the branch cannot rot unnoticed.
 
 **The feature-surface policy (#348) contradicts itself on one surface.**
+  Done: fixed in #353. See that PR for the evidence and the residue it records.
 - [ ] `virtual_net` appears in **Keep** (inside "the 10 client plugins") and in **Opt-in**
   (the TUN-backed path) in the same section, and the "10 client plugins" set does not match
   the dispatch arms. **Done-when:** one tier per surface, and the plugin count reconciled
