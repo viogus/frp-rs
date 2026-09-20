@@ -154,8 +154,10 @@ Invariants), not a general "numbers in docs" sweep: a count restated in new
 words, or added to a new doc, is not caught until its entry is added. Two things
 are deliberately **not** gated because a text match cannot establish them —
 client-plugin wiring and fuzz-target enablement (a `#[cfg]`-disabled target
-reads the same as a live one); they are covered by the test suite and
-`scripts/compat-test.sh`.
+reads the same as a live one). **No gate covers these**: fuzz targets are
+exercised by the unit suite in `frp-core/src/protocol.rs`, and plugin wiring by
+the client plugin tests; `scripts/compat-test.sh` exercises neither, so it must
+not be cited for them.
 
 | Metric | State / how to check |
 |--------|----------------------|
@@ -195,7 +197,7 @@ context and has a 64 KB instruction budget; keep it under ~25 KB.
 > history: [docs/developing.md § What a green test run does and does not prove](docs/developing.md#what-a-green-test-run-does-and-does-not-prove).
 
 - **Benchmarks**: `cargo bench -p frp-core` (8 groups: key derivation, compression, cipher stream, STUN, V1+V2 protocol all-types, bridge plain/encrypted/compressed, bandwidth limiter) + `cargo bench -p frp-server` (`nathole` classify + analysis; `proxy_registration` register throughput + ProxyInfo construct). CI: `cargo bench --workspace --no-run` build-check in `ci.yml`. Note: connection-accept/setup latency is measured e2e by `scripts/latency-baseline.sh` (setup mode), NOT criterion — a real TCP+TLS+yamux accept is dominated by kernel/handshake noise, not code-path cost.
-- **Property/fuzz tests**: proptest-based config normalization (`frp-core/src/config/tests.rs`) and V1/V2 protocol frame fuzzing (`frp-core/src/protocol.rs`, 0 panics found). Counts and `#[cfg]` enablement of fuzz targets are **not** gated — a text grep cannot tell a live fuzz target from a disabled one — they are covered by the test suite; `repo-health.sh` prints the totals for reference.
+- **Property/fuzz tests**: proptest-based config normalization (`frp-core/src/config/tests.rs`) and V1/V2 protocol frame fuzzing (`frp-core/src/protocol.rs`, 0 panics found). Counts and `#[cfg]` enablement of fuzz targets are **not** gated — a text grep cannot tell a live fuzz target from a disabled one — and the script does **not** print an enablement or fuzz-target total, so there is nothing here to read as coverage. The targets themselves are exercised by the unit suite in `frp-core/src/protocol.rs`.
 - **Integration tests**: KCP real-UDP-socket test (`frp-core/tests/kcp.rs`), XTCP hole-punch e2e (`frp-server/tests/xtcp_hole_punch.rs`), plus a growing server-integration suite covering control handler, vhost, proxy registration, OIDC, reload, graceful drain — the count is volatile and is printed by `repo-health.sh` (`frp-server/tests`) rather than stored here.
 - **Stress tests**: `scripts/stress-test.sh` runs frps + frpc under load with connection churn, monitored via `scripts/frp-stress/`. Weekly CI run in `stress-test.yml`.
 - **Perf baselines** (4-axis program, host-specific JSONL committed under `scripts/frp-stress/baselines/`): `scripts/throughput-baseline.sh` (MB/s per cipher/transport config), `scripts/latency-baseline.sh` (steady-state RTT + connection-setup percentiles), `scripts/memory-baseline.sh` (idle-hold + churn footprint via the `mem-profile` counting allocator + `ps` RSS). Run manually before/after a data-plane change; not blocking CI gates. Gate rule: a change to one axis must not regress the others (>5% throughput/MB/s, or RTT p99).

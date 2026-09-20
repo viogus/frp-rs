@@ -536,6 +536,15 @@ from rust_comments import code_only   # shared: comments removed, literals blank
 #   bench groups            `bench_*` ids inside a file's `criterion_group!`
 #   unsafe block/fn/impl    comment/literal-stripped code counts (Unsafe usage)
 #   (client plugin types and fuzz targets are NOT curated — see below)
+#
+# NOTE on the kept structural counts (bench groups, transport rows, scenario
+# counts): these are also matched in source text, so they inherit the same
+# limit that disqualified the two dropped claims. Comments and string literals
+# are stripped first (scripts/rust_comments.py), so a commented-out entry does
+# not satisfy them — but a `#[cfg]`-disabled entry reads identically to a live
+# one, and no text check can see that. They are curated because their VALUES
+# are stable and drift silently otherwise; they are not proof that the code
+# they name is compiled or reachable.
 #   vendored crate versions `version` in vendor/<crate>/Cargo.toml
 #   frp-rs version          `version` in frp-core/Cargo.toml (prose restatements)
 #
