@@ -37,8 +37,8 @@ Read the diff against the claim in the PR description and ask whether the claim 
 *earned*. Concretely:
 
 - **Recompute, do not read.** Every number, count and ratio in the diff or the PR
-  is recomputed from its source. If a doc says 86 scenarios, run the thing that
-  counts them.
+  is recomputed from its source. If a doc quotes a scenario count, run the thing
+  that counts them.
 - **Open every citation.** Each `file:line` and each quoted upstream claim is
   opened at that line, in this tree, at this commit. A citation nobody opened is a
   rumour with a line number.
@@ -432,7 +432,7 @@ cargo test -- --ignored
 The compat test suite verifies Go frp <-> Rust frp interop across all proxy types and transport protocols:
 
 ```bash
-# Full suite (86 run_test scenarios, 5 of which are gated on Go frp V2)
+# Full suite (86 run_test scenarios, 7 of which are gated on Go frp V2)
 bash scripts/compat-test.sh --verbose
 
 # Filter by proxy type and direction
@@ -523,24 +523,41 @@ Monitors memory, connection counts, and throughput. Runs weekly in CI via `.gith
 
 ### Property & Fuzz Tests
 
-Proptest-based tests verify correctness under adversarial inputs (`repo-health.sh`
-re-measures both figures below from the source on every run):
-- **Config normalization** (`frp-core/src/config/tests.rs`): 11 proptest! blocks — idempotency, flat↔nested equivalence, camelCase→snake_case
-- **Protocol fuzzing** (`frp-core/src/protocol.rs`): 6 fuzz tests + 40 regular tests — all 256 V1 type bytes × arbitrary payloads, V2 arbitrary type IDs, truncated frames, magic detection
+Proptest-based tests verify correctness under adversarial inputs:
+- **Config normalization** (`frp-core/src/config/tests.rs`): proptest blocks covering idempotency, flat↔nested equivalence, camelCase→snake_case
+- **Protocol fuzzing** (`frp-core/src/protocol.rs`): all 256 V1 type bytes × arbitrary payloads, V2 arbitrary type IDs, truncated frames, magic detection
+
+> Raw test counts are deliberately **not** curated: adding a test would otherwise
+> fail the `health` job, and the workspace total was observed to differ between
+> environments on the *same* tree (215/2069 locally vs 216/2071 in CI, PR #353 —
+> cause not established). The `Tests` section of `bash scripts/repo-health.sh`
+> prints `test functions`, `files with tests`, `frp-server/tests` and
+> `proptest blocks`; per-file counts are read from the tree when needed. Fuzz
+> *targets* are not curated either — a text grep cannot tell a live target from
+> a `#[cfg]`-disabled one — so their count and enablement are covered by the test
+> suite, not by the gate.
 
 ### Repository Invariants (`repo-health.sh`)
 
 `bash scripts/repo-health.sh` mirrors the `health` CI job. On top of version
 alignment it gates the `Docs` section: every `docs/*.md` and `docs/*/` must be
-reachable from `docs/README.md`, and every repo path named in a backtick span in
-current docs or source comments must still resolve — against the directory of
-the file that names it first, then the repo root. A `crate/feature` span such as
-`frp-core/tls` is recognised as Cargo feature syntax, not a path. Two limits are
-deliberate: spans with no locating root (`mux.rs`, `control/mod.rs`) are counted
-and left to review, and a directory that still exists but has been emptied is not
-detected (existence is all that can be checked mechanically). Historical records
-(`docs/archive/`, `docs/history/`, dated audits, `CHANGELOG.md`) are out of
-scope; see [`../TODO.md`](../TODO.md).
+reachable from `docs/README.md`, and **backtick-delimited** repo paths anchored
+at a known root (`src/`, `tests/`, `docs/`, `frp-core/`, …) in current docs or
+source comments must still resolve — against the directory of the file that
+names it first, then the nearest ancestor holding a `Cargo.toml` (the owning
+crate root — so a test that names src/v2_handshake.rs means
+frp-core/src/v2_handshake.rs), then the repo root. A `crate/feature` span such
+as `frp-core/tls` is recognised as Cargo feature syntax, not a path. This is
+deliberately **not** "every repo path named resolves": un-backticked prose and
+tree diagrams are not scanned, spans with no locating root (`mux.rs`,
+`control/mod.rs`) are counted and left to review, and a directory that still
+exists but has been emptied is not detected (existence is all that can be
+checked mechanically). Third-party vendored markdown (`vendor/*/README.md`) is
+out of scope; the frp-rs-authored `vendor/*/README-FRP-RS.md` notes stay in.
+Historical records (`docs/archive/`, `docs/history/`, dated audits) and the
+point-in-time files `CHANGELOG.md`, `TODO.md`, `performance-audit.md` and
+`docs/refactor-large-modules.md` are out of scope because they quote an older
+tree on purpose; see [`../TODO.md`](../TODO.md).
 
 The same run also cross-checks the **quantitative claims the live docs make**
 against the source that produces each number, and prints the whole inventory with
@@ -548,10 +565,24 @@ a witness line (`file:line`) for every entry. It is a curated list, not a regex
 sweep over "numbers in docs" — a general sweep reports every port, buffer size
 and version in the tree. Each entry pins (file, exact claim wording, source); the
 expected value is recomputed from that source on every run, so two stale copies
-can never agree with each other. If you add a count to `README.md`, `CLAUDE.md`
-or a reference doc, add it here in the same change — or, better, point at this
-script instead of typing the number. The inventory is meant to be read at
-release time; a claim that no longer matches fails the `health` CI job.
+can never agree with each other. The list is **curated, not exhaustive**: it
+catches only the claim wordings it enumerates, so a quantity restated in new
+words, or stated in a new doc, is **not** detected. When you add or reword a
+count in a live doc, add the matching entry in the same change — or, better,
+point at the source instead of typing the number. One definition is shared so
+claim and counter cannot drift: "test function" is one `#[test]`/`#[tokio::test]`
+attribute that starts a line after optional indentation, parameterised or not
+(comment mentions do not count). Raw test counts are deliberately **not** in the
+curated set — they change whenever a test is added, so gating them would make
+"add a test" fail the `health` job; the script prints them instead. Two further
+things are deliberately **not** gated because a text match cannot establish them:
+**client-plugin wiring** (whether the `virtual_net` start-up skip and the
+work-conn handoff actually compile and run) and **fuzz-target enablement** (a
+`#[cfg]`-disabled target reads the same as a live one). Both are covered by the
+plugin/compat test suite and `scripts/compat-test.sh`, not by a grep — a gate
+that claimed them would be certifying text, not behaviour. The inventory is meant
+to be read at release time; a claim that no longer matches fails the `health` CI
+job.
 
 ## 6. Release Process
 
@@ -565,10 +596,11 @@ covered by any gate and are the ones that have actually been missed before.
       the `VERSION` constant, `scripts/download-frp-rs.sh` and the README.
 - [ ] **Doc figures reconciled** — read the `Docs` section of the same
       `repo-health.sh` run and reconcile every `claimed … measured …` line with
-      its witness `file:line`; the run already fails on any figure the tree no
-      longer matches, so a green run only needs the witness lines skimmed for a
-      claim that has drifted in *meaning* (a stale number usually means the
-      sentence around it is stale too).
+      its witness `file:line`; the run already fails on any *enumerated* claim
+      whose figure no longer matches, but a count reworded or added since the
+      last pass is not covered, so skim the witness lines for a claim that has
+      drifted in *meaning* (a stale number usually means the sentence around it
+      is stale too).
 - [ ] **Gates green on `main`** — `cargo fmt --all -- --check`,
       `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
       `cargo test --workspace --all-features`, the two `RUSTFLAGS="-D warnings"`
