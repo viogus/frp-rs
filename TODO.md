@@ -98,10 +98,20 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   **infallible, lossy** iterator (`percent_decode` leaves invalid escapes literal and
   `decode_utf8_lossy` cannot error), so `Query<ReloadQuery>` could only 400 on a serde
   *structural* error. Measured on the pre-change extractor (temporary probe, `Query` +
-  the removed struct): `%zz` -> 200, `%ff` -> 200, `%` -> 200, and only
-  `true&strictConfig=false` -> 400 `duplicate field`. The single genuine behaviour change in
-  this round is therefore the **repeated parameter**. The raw-query rewrite is still kept,
-  but justified as the explicit Go-faithful contract rather than as a bug fix: it encodes
+  the removed struct) on **body-less** requests: `%zz` -> 200, `%ff` -> 200, `%` -> 200, and
+  only `true&strictConfig=false` -> 400 `duplicate field`. That list is precisely the
+  configuration in which the reduced "no malformed-escape change" claim holds; Reviewer 2's
+  re-review found the second change it misses. With a JSON body present, the old extractor
+  kept the key *present* with the literal `%zz`, so `parse_strict_config` was false and the
+  query suppressed the body; the new parser drops the pair, so the parameter is absent and
+  the body fallback applies: `POST /api/reload?strictConfig=%zz` +
+  `{"strict_config": true}` was 200 non-strict and is now 400 strict (same for `%`, `%2`,
+  `a;b`). `%ff` is genuinely unchanged — a well-formed escape is kept lossily, so the key
+  stays present and still suppresses the body. So this round has **two** behaviour changes:
+  the repeated parameter, and the dropped-pair/body interaction. Both follow from encoding
+  Go's rules explicitly; the second is pinned by an HTTP-level case that carries a body.
+  The raw-query rewrite is kept, but justified as the explicit Go-faithful contract rather
+  than as a bug fix: it encodes
   `url.Values.Get` / `url.ParseQuery` rules (first value wins, an un-unescapable pair is
   dropped, `+`/`%XX` decode) instead of depending on a dependency's incidental leniency, and
   it is pinned against real Go (`net/url.ParseQuery` + `Values.Get` + `strconv.ParseBool`,
@@ -110,7 +120,8 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `Get("")` non-strict; `strictConfig=a;b` -> `Get("")` non-strict (Go 1.17+ rejects `;`).
   Done: `first_strict_config_param`/`query_unescape` in `frp-client/src/admin.rs`,
   unit-tested against the Go table above and exercised at HTTP level in
-  `frp-client/tests/reload_malformed_config.rs` and the `reload_*` unit tests.
+  `frp-client/tests/reload_malformed_config.rs` and the `reload_*` unit tests, including the
+  query-dropped-plus-body case.
 
 **The tier-warning gate (#343) does not cover what was fixed.**
 - [x] The two CI steps are `cargo check` without `--all-targets`, so that change's own cfg
@@ -243,15 +254,21 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `-p frp-client --no-default-features --features tls,tcp-mux --all-targets` step can be
   added.
 - [ ] **Pre-existing: no query-parameter-count guard, so >10000 params diverge from Go.**
-  Go 1.25+/1.27 `parseQuery` opens with
+  Go's `parseQuery` opens with
   `if !urlParamsWithinMax(strings.Count(query, "&") + 1) { return Values{}, err }`
   (`net/url/url.go:980`, `defaultMaxParams = 10000`), so an over-limit query yields empty
-  `Values` and the reload is non-strict. Real Go frp v0.71.0 measured on
+  `Values` and the reload is non-strict. Precision measured by Reviewer 2: `defaultMaxParams`
+  is present in **go1.25.12** (the toolchain that built the shipped Go frp v0.71.0 binary) and
+  **absent in go1.25.0** — a 1.25.x backport, not a 1.25.0 feature. That version comparison
+  is a **single** successful fetch; the reviewer's retries returned empty bodies, so it is
+  recorded as unconfirmed-by-repetition. Real Go frp v0.71.0 measured on
   `?strictConfig=true` + N×`&`: N=9999 → **400** (within the limit, strict), N=10000 →
-  **200** (guard trips, non-strict). Rust has no such guard and is always strict. Note the
-  differential oracle cannot see this: the limit lives inside the Go function used as the
-  oracle. **Done-when:** the parser mirrors Go's parameter-count guard (or the divergence is
-  documented at the endpoint), with both N cases pinned.
+  **200** (guard trips, non-strict). Rust has no such guard and is always strict. Why the
+  differential oracle did not flag it (Reviewer 2's correction of its own earlier wording):
+  an oracle built on `url.ParseQuery` sees the limit by construction — a corpus that never
+  emits more than 10000 parameters simply never reaches it. **Done-when:** the parser mirrors
+  Go's parameter-count guard (or the divergence is documented at the endpoint), with both N
+  cases pinned.
 - [ ] **Pre-existing: `#` in the request target changes strictness.** Go parses request URIs
   with `viaRequest=true`, which never splits a fragment, so `#` stays inside `RawQuery` and
   `GET /api/reload?strictConfig=true#strictConfig=false` is a **200** non-strict reload (the

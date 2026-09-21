@@ -647,12 +647,30 @@ async fn reload_admin_go_query_parity_and_body_extension() {
         "bare ?strictConfig must be the empty value -> non-strict 200, got: {status} / {body}"
     );
     // `%ff` unescapes fine (Go does not validate UTF-8) but ParseBool rejects
-    // the byte -> non-strict 200. axum's `Query` 400'd on the decode instead.
+    // the byte -> non-strict 200. `%ff` is unchanged from base: a well-formed
+    // escape is kept lossily, so the key stays present.
     let (status, body) =
         admin_request(admin_port, "GET", "/api/reload?strictConfig=%ff", None).await;
     assert!(
         status.contains("200"),
         "?strictConfig=%ff must be a non-strict 200, got: {status} / {body}"
+    );
+
+    // 5d. A pair dropped for a malformed escape is *absent*, so the frp-rs
+    //     JSON-body extension applies: `%zz` + body true is strict (400 on the
+    //     unknown key). The old extractor kept the key present with the literal
+    //     "%zz" (ParseBool error -> false) and ignored the body, so this pins
+    //     the second, body-dependent behaviour change end-to-end.
+    let (status, body) = admin_request(
+        admin_port,
+        "POST",
+        "/api/reload?strictConfig=%zz",
+        Some(r#"{"strict_config": true}"#),
+    )
+    .await;
+    assert!(
+        status.contains("400"),
+        "a dropped query pair must let the JSON body select strict (400), got: {status} / {body}"
     );
 
     // 6. Preserved frp-rs extension: POST + JSON body (snake_case).

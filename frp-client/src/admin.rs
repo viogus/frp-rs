@@ -70,12 +70,15 @@ struct ReloadBody {
 ///   the observed defect: deserializing into a struct made axum's `Query`
 ///   reject the repeated field with serde's `duplicate_field` error, so the
 ///   handler never ran and the request answered 400 where Go reloads.
-/// * `?strictConfig=%zz` -> the pair is skipped, so the parameter is *absent*
-///   and the reload is non-strict. The old extractor also ended up
-///   non-strict here (`form_urlencoded` is infallible and leaves an invalid
-///   escape literal, which `ParseBool` then rejects), so this is not a bug fix:
-///   the explicit parser replaces reliance on that incidental leniency with
-///   Go's documented rules, pinned against real `net/url` by the tests below.
+/// * `?strictConfig=%zz` -> the pair is skipped, so the parameter is *absent*.
+///   For a **body-less** request that is the same non-strict answer the old
+///   extractor gave (`form_urlencoded` left the invalid escape literal, which
+///   `ParseBool` then rejected), so the parser is not a fix there — it
+///   replaces reliance on that incidental leniency with Go's documented rules,
+///   pinned against real `net/url` below. With a **JSON body** it *is* a
+///   behaviour change: the parameter is now absent, so the body fallback
+///   applies and `{"strict_config": true}` can select strict mode, whereas the
+///   old extractor kept the key present and ignored the body.
 ///
 /// Returns the first `strictConfig` value, or `None` when no pair carries it.
 fn first_strict_config_param(raw_query: Option<&str>) -> Option<String> {
@@ -1134,6 +1137,7 @@ passwd = "socks-pass"
         // A bare key (no `=`) is the empty value -> ParseBool error ->
         // non-strict, not a missing parameter and not a 400.
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/reload?strictConfig")
@@ -1144,6 +1148,28 @@ passwd = "socks-pass"
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(seen_rx.recv().await, Some(false));
+
+        // A pair dropped for a malformed escape makes the parameter *absent*,
+        // so the JSON body fallback applies: `%zz` + body true selects strict.
+        // This is the second, body-dependent behaviour change — the old
+        // extractor kept the key present with the literal "%zz" (-> false) and
+        // the body was ignored. Pinned here so the drop is discriminating.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/reload?strictConfig=%zz")
+                    .body(Body::from(r#"{"strict_config": true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            seen_rx.recv().await,
+            Some(true),
+            "a dropped query pair must let the JSON body select strict"
+        );
     }
 
     #[test]
