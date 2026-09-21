@@ -626,7 +626,13 @@ Strict mode is selected with Go's query parameter: `?strictConfig=true` (the
 full `strconv.ParseBool` true set is `1 t T TRUE true True`; `0 f F FALSE false
 False` are non-strict). With no parameter the reload is non-strict. Any other
 value — including an empty `?strictConfig=` — is `ParseBool`'s error case, which
-Go frp **discards**, so it is a 200 non-strict reload, never a 400.
+Go frp **discards**, so it is a 200 non-strict reload, never a 400. A repeated
+parameter (`?strictConfig=true&strictConfig=false`) takes the **first** value,
+matching Go's `url.Values.Get`, and a pair whose percent-escape is malformed
+(`?strictConfig=%zz`) is dropped — again like `url.ParseQuery` — which leaves
+the parameter absent and the reload non-strict. The only 400s this endpoint
+returns are a body that is present but not valid JSON and a reload the loader
+itself rejects (a strict-mode unknown key).
 `POST /api/reload` additionally accepts the frp-rs extension body
 `{"strict_config": true}` (also accepted as `"strictConfig"`, the spelling
 frpc's own CLI sends); when both channels are present the query parameter wins.

@@ -21,6 +21,13 @@ User-facing release notes for frp-rs.
   running proxies are left as they were) where it used to succeed; pass
   `--strict-config=false` to keep the old lenient behaviour.
 
+### Fixed
+- **`/api/reload` accepts a repeated or malformed `?strictConfig=` the way Go frp does.**
+  `?strictConfig=true&strictConfig=false` now takes the first value (Go's `url.Values.Get`)
+  and `?strictConfig=%zz` now reloads non-strict (Go discards `url.ParseQuery`'s error),
+  where both previously answered 400 without reloading. Go-parity fix; no other endpoint
+  behaviour changed.
+
 ## v0.71.0 — re-release (2026-09-13)
 
 Supersedes the 2026-08-16 v0.71.0 build (PR #246 era). Same version number,

@@ -193,11 +193,41 @@ jobs:
         # target/ cache (built without it) is not reused for these two steps;
         # they recompile the tier graphs. That cost is the point: the tier
         # builds must not warn, and these steps are what enforce it.
+        #
+        # NO --all-targets here, deliberately. On a --workspace invocation every
+        # member is a root, so all dev-dependency edges enter the graph, and
+        # frp-server's dev-dependency on frp-client (default features,
+        # frp-server/Cargo.toml:67) plus frp-client's on frp-server re-enable
+        # both crates' `default` sets. Measured with --all-targets: the micro
+        # step compiles frp-client as
+        # chacha20,compression,default,http2http,kcp,oidc,quic,tcp-mux,tls,websocket
+        # instead of [] (and frp-server likewise gains default+ssh) — so
+        # --all-targets would silently drop the tier check for those two crates,
+        # not extend it. The tier *test* targets are covered by the isolated
+        # step below instead.
         run: cargo check --workspace --no-default-features --features tiny
         env:
           RUSTFLAGS: "-D warnings"
       - name: Check micro feature set compiles
         run: cargo check --workspace --no-default-features --features micro
+        env:
+          RUSTFLAGS: "-D warnings"
+      - name: Check tier test targets compile (isolated, tls OFF)
+        # `-p frp-client` makes frp-client the only root, so the sibling
+        # dev-dependency edge that re-enables its `default` features is out of
+        # the graph and the crate is genuinely compiled with tls OFF. This is
+        # the run that compiles frp-client's test targets — the lib test module
+        # and tests/plugin_http.rs — with -D warnings and tls OFF, so a missing
+        # #[cfg(feature = "tls")] gate on a tls-only item is a compile error
+        # here instead of a warning nothing promotes.
+        #
+        # The symmetric `-p frp-server --no-default-features --all-targets` does
+        # not compile at all: feature unification gives frp-core the WebSocket
+        # variant while frp-server's own `websocket` feature is off, so
+        # frp-server/src/service.rs:1842 is a non-exhaustive match (E0004).
+        # frp-server's tls-off test targets therefore have no gate; TODO.md
+        # records the gap and what would close it.
+        run: cargo check -p frp-client --no-default-features --all-targets
         env:
           RUSTFLAGS: "-D warnings"
 
