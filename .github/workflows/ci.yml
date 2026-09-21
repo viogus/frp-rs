@@ -244,17 +244,21 @@ jobs:
         # OFF under -D warnings — a missing #[cfg(feature = ...)] gate on an
         # optional item is a compile error here.
         #
-        # Caveat, measured: 7 of frp-server's 35 test targets are
-        # whole-file-cfg'd *empty* in this configuration, so nothing inside them
-        # is checked — dashboard_integration.rs and dashboard_v2_integration.rs
+        # Caveat, measured — the bound is on the code that is *compiled*, not on
+        # the targets. A whole-file-cfg'd target compiles to nothing, and inside
+        # a target that does compile, any #[cfg]-excluded item is unchecked the
+        # same way. 7 of frp-server's 35 test targets are whole-file-cfg'd
+        # *empty* here: dashboard_integration.rs and dashboard_v2_integration.rs
         # (#![cfg(feature = "dashboard")]), ssh_gateway.rs (#![cfg(feature =
         # "ssh")]), transport_e2e_kcp.rs (#![cfg(feature = "kcp")]),
         # transport_e2e_quic.rs and v2_quic_r2r.rs (#![cfg(feature = "quic")]),
         # vhost_h2c.rs (#![cfg(feature = "http-proxy")], the gate this change
         # added). `cargo test -p frp-server --no-default-features --test <t> --
-        # --list` reports 0 tests for each; a missing gate *inside* one of them
-        # would not be caught here. (mock_oidc.rs also reports 0 tests but is
-        # compiled — it is a helper `mod`'d by oidc_integration.rs.)
+        # --list` reports 0 tests for each. Item-by-item escapes exist too:
+        # vhost_audit_fixes.rs declares 21 tests, 2 tls-gated per item, so 19 are
+        # compiled and those 2 are not. (mock_oidc.rs also reports 0 tests but is
+        # not whole-file-cfg'd empty — no inner #[cfg], compiled as its own test
+        # target, simply declaring no tests.)
         #
         # Note that frp-core is *not* feature-off in this graph: frp-server's
         # dev-dependency on frp-client (default features, frp-server/Cargo.toml)

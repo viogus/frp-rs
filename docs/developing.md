@@ -285,18 +285,22 @@ and test targets is complete for that configuration: an optional item referenced
 without its gate is a compile error (or an unused import) under `-D warnings`
 here instead of a warning nothing promotes.
 
-Measured bound on that guarantee: **7 of `frp-server`'s 35 test targets are
+Measured bound on that guarantee — it is a bound on the **code that is compiled**,
+not on the targets. A whole-file-cfg'd target compiles to nothing, and inside a
+target that does compile, any `#[cfg]`-excluded item is unchecked in exactly the
+same way. Concretely: **7 of `frp-server`'s 35 test targets are
 whole-file-cfg'd *empty* in this configuration**, so nothing inside them is
 checked at all — `dashboard_integration.rs` and `dashboard_v2_integration.rs`
 (`dashboard`), `ssh_gateway.rs` (`ssh`), `transport_e2e_kcp.rs` (`kcp`),
 `transport_e2e_quic.rs` and `v2_quic_r2r.rs` (`quic`), and `vhost_h2c.rs`
 (`http-proxy`; that whole-file gate is one this change added). `cargo test
 -p frp-server --no-default-features --test <t> -- --list` reports 0 tests for
-each of the seven, versus 19 for `vhost_audit_fixes.rs` (whose two TLS-driving
-cases are gated per item, so its other 19 are still compiled and checked). A
-missing `#[cfg]` *inside* one of the seven would not be caught by this step —
-`mock_oidc.rs` also reports 0 tests but is not in that set: it is a helper
-`mod`'d by `oidc_integration.rs`, which has 7 tests, so its body is compiled.
+each of the seven. The same escape exists item-by-item inside a target that does
+compile: `vhost_audit_fixes.rs` declares 21 tests, 2 of them `tls`-gated per
+item, so 19 are compiled and checked and those 2 are not. `mock_oidc.rs` also
+reports 0 tests but is not one of the seven: it has no inner `#[cfg]`, so it is
+not whole-file-cfg'd empty — it is compiled as its own test target and simply
+declares no tests.
 
 What it does **not** prove, and why it is still meaningful: `frp-core` in that
 graph is compiled with *most* of its features, not with them off.

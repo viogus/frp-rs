@@ -277,8 +277,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
 **person** exists, not that no second author does.
 
 - [ ] **`frp-core`'s test targets do not compile with no features.** Evidence:
-  `cargo check -p frp-core --no-default-features --all-targets` exits 101 —
-  `could not compile frp-core (lib test) due to 2 previous errors`, `(test "kcp") due to 3`,
+  `RUSTFLAGS="-D warnings" cargo check -p frp-core --no-default-features --all-targets` exits
+  101 — `could not compile frp-core (lib test) due to 2 previous errors`, `(test "kcp") due to 3`,
   `(test "xtcp_p2p") due to 20`, `(test "protocol_round14") due to 1`; sample errors `E0425 cannot find function 'connect_ws_raw'
   in this scope`, `E0432 unresolved imports frp_core::kcp::{dial_kcp, dial_kcp_with_driver,
   KcpListener}`, `E0425 cannot find function 'punch_udp_hole' in module frp_core::xtcp_p2p`.
@@ -299,12 +299,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   provides `h2`/`http` (`http2http`), so the tiny test targets build and a
   `-p frp-client --no-default-features --features tls,tcp-mux --all-targets` step can be
   added.
-- [ ] **Three measured isolated `-p` configurations are red under `-D warnings`.** These three
-  are red; single-feature `-p` runs are **not** uniformly red — 7 of the 8 measured
-  `frp-client` ones exit 0 (`chacha20`, `compression`, `tcp-mux`, `websocket`, `oidc`,
-  `admin`, `profiling`), only `quic` is red among them, and
-  `--features chacha20 --all-targets` exits 0 too, identical in shape to the two isolated CI
-  steps. Measured:
+- [ ] **Measured `-p` configurations that are red under `-D warnings`.** Measured:
   - `RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --features vnet --all-targets`
     exits 101: `error: method 'remove_run_id_vnet_routes' is never used` at
     `frp-server/src/state.rs:1876` — its only caller, `frp-server/src/ssh_gateway.rs:1987`,
