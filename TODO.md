@@ -141,7 +141,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `cargo check -p frp-client --no-default-features --all-targets`, where `-p` makes the crate
   the only root so the dev-dependency edge cannot reopen its defaults, and
   `docs/developing.md § Binary Variants` states exactly which targets each step covers.
-- [ ] `frp-server`'s `tls`-off test targets still have no gate: the symmetric
+- [x] `frp-server`'s `tls`-off test targets still have no gate: the symmetric
   `cargo check -p frp-server --no-default-features --all-targets` does not compile.
   `error[E0004]` at `frp-server/src/service.rs:1842` — `ConnectionType::WebSocket` is not
   covered, because feature unification gives `frp-core` the variant (through frp-client's
@@ -150,6 +150,49 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   the unbuilt transport (or the variant is otherwise made unreachable under feature
   unification), and the isolated `-p frp-server` step joins the `-p frp-client` one in
   `ci.yml`.
+  Done: `ConnectionType::WebSocket` is no longer feature-gated in
+  `frp-core/src/transport/mod.rs`, so the variant always exists and frp-server's `match` is
+  exhaustive by construction. The `b'G' => ConnectionType::WebSocket` *detection* arm keeps
+  its `#[cfg(feature = "websocket")]`, so a websocket-off frp-core still classifies `G` as
+  `V1(b'G')`: shipped micro/tiny byte behaviour is unchanged, and that build cannot
+  construct the variant. `service.rs`'s arm is now unconditional with a
+  `#[cfg(feature = "websocket")]` call to `handle_websocket_connection` and a
+  `#[cfg(not(feature = "websocket"))]` warn-and-drop body. The blanket `_ =>` alternative
+  was rejected: it would silently swallow any *future* `ConnectionType` variant in a
+  websocket-off build. `ci.yml`'s `verify` job now runs
+  `RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --all-targets`
+  beside the `-p frp-client` step. The E0004 was the only error that configuration
+  reported — but also the only one it *reached*; with it closed the run exposed two more,
+  now fixed: `frp-server/tests/vhost_audit_fixes.rs` needed per-item `tls` gates (the two
+  rustls-driving tests, the `https_proxy`/`NoVerify` helpers they share, and the
+  `Read`/`Write`/`Arc` imports) and `frp-server/tests/vhost_h2c.rs` a whole-file
+  `#![cfg(feature = "http-proxy")]` (it is entirely driven by `dep:h2`).
+  `docs/developing.md § Binary Variants` states what the new step does and does not prove.
+- [ ] **The same feature-unification defect class survives elsewhere: `AuthMethod::Oidc` in
+  `dashboard.rs`.** `frp-core`'s `AuthMethod::Oidc` carries `#[cfg(feature = "oidc")]`
+  (`frp-core/src/auth.rs:206`) while `frp-server/src/dashboard.rs:2344` matches it under
+  `#[cfg(feature = "oidc")]` — frp-server's own feature. With frp-core's `oidc` on and
+  frp-server's off the `match` is non-exhaustive. Evidence:
+  `RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --features dashboard --all-targets`
+  exits 101 with `error[E0004]: non-exhaustive patterns: 'AuthMethod::Oidc' not covered` at
+  `frp-server/src/dashboard.rs:2344:28`, plus four unrelated pre-existing errors in the same
+  configuration: `E0425 cannot find type 'TcpListener'` (`dashboard.rs:185`), `E0425 cannot
+  find type 'TcpStream'` (`dashboard.rs:189`), `E0433 cannot find module or crate 'io'`
+  (`dashboard.rs:206`) and `unused import: 'AtomicU64'` (`dashboard.rs:21`) — all five must
+  be fixed before any CI step can gate this configuration. **Not reachable from a shipped
+  binary:** the three `[[bin]]` targets require `full`, `tiny` or `micro`; `full`/default
+  include `oidc` and tiny/micro both exclude `dashboard`, so no `frps` artifact has
+  frp-core/oidc on with frp-server/oidc off. It *is* reachable from that `-p` invocation and
+  from any downstream workspace that enables `frp-core/oidc` while leaving frp-server's
+  `oidc` off — and that downstream must also enable frp-server's `dashboard` feature, since
+  the module itself is gated (`frp-server/src/lib.rs:5-6`). Measured counterexample to the
+  looser phrasing: `-p frp-server --no-default-features --all-targets` has frp-core's `oidc`
+  **on** (via the dev-dependency edge) with frp-server's own features at none, and exits 0,
+  because frp-server's `dashboard` is off so the `match` is not compiled at all. **Done-when:** the gate on the `Oidc` variant is keyed to the same crate
+  feature that gates its construction (or the variant stops being feature-gated the way
+  `ConnectionType::WebSocket` was), the four unrelated errors are fixed, and the command
+  above exits 0. Note this is the second instance of the class fixed in
+  `frp-core/src/transport/mod.rs` — the fix there was per-variant, not systematic.
 
 **The SSH readiness fix (#344) left two sites and one unbounded case.**
 - [x] Two SSH-gateway tests still connect with a bare `.unwrap()` and no readiness wait.
@@ -234,14 +277,17 @@ agent commits), which matters because the *reason* for two reviewers is that no 
 **person** exists, not that no second author does.
 
 - [ ] **`frp-core`'s test targets do not compile with no features.** Evidence:
-  `cargo check -p frp-core --no-default-features --all-targets` exits 101 —
-  `could not compile frp-core (lib test) due to 2 previous errors`, `(test "kcp") due to 3`,
-  `(test "xtcp_p2p") due to 20`; sample errors `E0425 cannot find function 'connect_ws_raw'
+  `RUSTFLAGS="-D warnings" cargo check -p frp-core --no-default-features --all-targets` exits
+  101 — `could not compile frp-core (lib test) due to 2 previous errors`, `(test "kcp") due to 3`,
+  `(test "xtcp_p2p") due to 20`, `(test "protocol_round14") due to 1`; sample errors `E0425 cannot find function 'connect_ws_raw'
   in this scope`, `E0432 unresolved imports frp_core::kcp::{dial_kcp, dial_kcp_with_driver,
   KcpListener}`, `E0425 cannot find function 'punch_udp_hole' in module frp_core::xtcp_p2p`.
   The `kcp`/`xtcp_p2p` integration tests and some lib tests have no `#[cfg]` gate for the
-  features they need. **Done-when:** each such test carries its gate, so the command exits 0
-  and the run can join the `-p frp-client` isolated CI step.
+  features they need. `protocol_round14` is a different case — a lint-only failure:
+  `unused_mut` at `frp-core/tests/protocol_round14.rs:24`, because the only mutation of that
+  binding, `v.extend(...)` at `:198`, is `vnet`-gated and `-D warnings` promotes the unused
+  `mut` to an error. **Done-when:** each such test carries its gate, so the command exits 0
+  and the run can join the sibling isolated CI steps.
 - [ ] **`frpc-tiny`'s test targets do not compile either.** Evidence:
   `cargo check -p frp-client --no-default-features --features tls,tcp-mux --all-targets`
   — exactly the tiny tier for frp-client, measured `['tcp-mux','tls']` — exits 101 with
@@ -253,6 +299,24 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   provides `h2`/`http` (`http2http`), so the tiny test targets build and a
   `-p frp-client --no-default-features --features tls,tcp-mux --all-targets` step can be
   added.
+- [ ] **Measured `-p` configurations that are red under `-D warnings`.** Measured:
+  - `RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --features vnet --all-targets`
+    exits 101: `error: method 'remove_run_id_vnet_routes' is never used` at
+    `frp-server/src/state.rs:1876` — its only caller, `frp-server/src/ssh_gateway.rs:1987`,
+    is `ssh`-gated, so `vnet` without `ssh` leaves it dead.
+  - `RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --features quic`
+    exits 101 with two errors: `error: unused variable: 'quic_params'` at
+    `frp-client/src/nat_hole.rs:521` and `error: field 'quic_params' is never read` at
+    `frp-client/src/visitor.rs:371`.
+  - `RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --features vnet --all-targets`
+    exits 101 with two `unused import` errors (`tokio::io::AsyncReadExt`,
+    `tokio::io::AsyncWriteExt`) at `frp-client/src/visitor.rs:2900-2901`. `--all-targets` is
+    required: those imports live in `#[cfg(all(test, feature = "vnet"))] mod tests`, and the
+    bare command without it exits 0.
+  These three are **intra-crate** feature combinations — a different class from the
+  feature-unification defect fixed in `ConnectionType`, which was cross-crate. **Done-when:**
+  each of the three either compiles clean under `-D warnings` or the configuration is
+  documented as unsupported.
 - [ ] **Pre-existing: no query-parameter-count guard, so >10000 params diverge from Go.**
   Go's `parseQuery` opens with
   `if !urlParamsWithinMax(strings.Count(query, "&") + 1) { return Values{}, err }`

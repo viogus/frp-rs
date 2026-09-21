@@ -205,7 +205,7 @@ jobs:
         # chacha20,compression,default,http-proxy,kcp,oidc,quic,ssh,tcp-mux,tls,websocket
         # instead of [] — so --all-targets would silently drop the tier check for
         # those two crates, not extend it. The tier *test* targets are covered by
-        # the isolated step below instead.
+        # the two isolated steps below instead.
         run: cargo check --workspace --no-default-features --features tiny
         env:
           RUSTFLAGS: "-D warnings"
@@ -217,18 +217,69 @@ jobs:
         # `-p frp-client` makes frp-client the only root, so the sibling
         # dev-dependency edge that re-enables its `default` features is out of
         # the graph and the crate is genuinely compiled with tls OFF. This is
-        # the run that compiles frp-client's test targets — the lib test module
-        # and tests/plugin_http.rs — with -D warnings and tls OFF, so a missing
+        # the run that compiles frp-client's test targets — all 40 of
+        # frp-client/tests/*.rs — with -D warnings and tls OFF, so a missing
         # #[cfg(feature = "tls")] gate on a tls-only item is a compile error
         # here instead of a warning nothing promotes.
         #
-        # The symmetric `-p frp-server --no-default-features --all-targets` does
-        # not compile at all: feature unification gives frp-core the WebSocket
-        # variant while frp-server's own `websocket` feature is off, so
-        # frp-server/src/service.rs:1842 is a non-exhaustive match (E0004).
-        # frp-server's tls-off test targets therefore have no gate; TODO.md
-        # records the gap and what would close it.
+        # Caveat, measured: 4 of those 40 targets are whole-file-cfg'd *empty*
+        # in this configuration, so nothing inside them is checked —
+        # plugin_h2.rs and peer_xff_registry_e2e.rs (#![cfg(feature = "tls")]),
+        # xtcp_pair_e2e.rs and xtcp_visitor_failure_e2e.rs
+        # (#![cfg(all(feature = "quic", feature = "kcp"))]). `cargo test
+        # -p frp-client --no-default-features --test <t> -- --list` reports 0
+        # tests for each of the four, versus 38 for plugin_http. A missing gate
+        # *inside* those four would not be caught here — which is exactly how
+        # plugin_h2's tls-vs-http2http bug hid (TODO.md).
+        #
+        # The rationale for why the two --workspace tier steps above cannot
+        # carry --all-targets is recorded there, not duplicated here.
         run: cargo check -p frp-client --no-default-features --all-targets
+        env:
+          RUSTFLAGS: "-D warnings"
+      - name: Check frp-server tier test targets compile (isolated, tls OFF)
+        # The frp-server sibling of the step above: `-p frp-server` makes it
+        # the only root, so frp-server's own features are at the micro set
+        # (none) and its test targets are compiled with tls/websocket/ssh/...
+        # OFF under -D warnings — a missing #[cfg(feature = ...)] gate on an
+        # optional item is a compile error here.
+        #
+        # Caveat, measured — the bound is on the code that is *compiled*, not on
+        # the targets. A whole-file-cfg'd target compiles to nothing, and inside
+        # a target that does compile, any #[cfg]-excluded item is unchecked the
+        # same way. 7 of frp-server's 35 test targets are whole-file-cfg'd
+        # *empty* here: dashboard_integration.rs and dashboard_v2_integration.rs
+        # (#![cfg(feature = "dashboard")]), ssh_gateway.rs (#![cfg(feature =
+        # "ssh")]), transport_e2e_kcp.rs (#![cfg(feature = "kcp")]),
+        # transport_e2e_quic.rs and v2_quic_r2r.rs (#![cfg(feature = "quic")]),
+        # vhost_h2c.rs (#![cfg(feature = "http-proxy")], the gate this change
+        # added). `cargo test -p frp-server --no-default-features --test <t> --
+        # --list` reports 0 tests for each. Item-by-item escapes exist too:
+        # vhost_audit_fixes.rs declares 21 tests, 2 tls-gated per item, so 19 are
+        # compiled and those 2 are not. (mock_oidc.rs also reports 0 tests but is
+        # not whole-file-cfg'd empty — no inner #[cfg], compiled as its own test
+        # target, simply declaring no tests.)
+        #
+        # Note that frp-core is *not* feature-off in this graph: frp-server's
+        # dev-dependency on frp-client (default features, frp-server/Cargo.toml)
+        # pulls frp-client's defaults, which forward frp-core/websocket, tls,
+        # kcp, ... — measured, frp-core has 10 features on here (chacha20,
+        # compression, http-client, kcp, oidc, quic, stun, tcp-mux, tls,
+        # websocket), six further features off (vnet, admin-auth, mem-profile,
+        # profiling, debug-logs, otel), and `default` itself off too (both
+        # frp-server and frp-client take frp-core with default-features = false).
+        # That is precisely why it is a useful gate for *frp-server's own*
+        # #[cfg] gates: frp-core can hand frp-server a type/variant that
+        # frp-server's matching feature does not know about, so every `match`
+        # on such a type must stay exhaustive by construction rather than by
+        # feature coincidence (see ConnectionType::WebSocket in
+        # frp-core/src/transport/mod.rs). websocket is the one that bit because
+        # it is the only frp-core feature that gated a ConnectionType variant
+        # (the WebSocket variant was the enum's only #[cfg] item before this
+        # change); the other nine features frp-core has on here disagree with
+        # frp-server's empty set just as much, but cannot change
+        # `ConnectionType`'s shape.
+        run: cargo check -p frp-server --no-default-features --all-targets
         env:
           RUSTFLAGS: "-D warnings"
 

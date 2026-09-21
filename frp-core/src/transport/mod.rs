@@ -92,8 +92,24 @@ pub enum ConnectionType {
     /// First byte: 0x17 (Go frp prefix) or 0x16 (standard TLS ClientHello).
     /// The caller must check the byte to decide whether to skip it before TLS handshake.
     Tls(u8),
-    /// 'G' (GET) → HTTP WebSocket upgrade
-    #[cfg(feature = "websocket")]
+    /// 'G' (GET) → HTTP WebSocket upgrade.
+    ///
+    /// Deliberately **not** feature-gated, unlike the `b'G'` arm in
+    /// [`detect_and_strip_magic`] that constructs it: `frp-core` can be
+    /// compiled with `feature = "websocket"` on even when the *dependent*
+    /// crate's own `websocket` feature is off (Cargo feature unification —
+    /// e.g. `frp-server`'s dev-dependency on `frp-client` pulls
+    /// `frp-core/websocket` in), and a variant that exists only in the
+    /// feature-on build makes every `match` in such a dependent crate
+    /// non-exhaustive in the feature-off build. That is exactly the E0004
+    /// at `frp-server/src/service.rs` that
+    /// `cargo check -p frp-server --no-default-features --all-targets`
+    /// used to hit; do not "tidy" the `#[cfg]` back on.
+    ///
+    /// Only ever constructed when `frp-core`'s `websocket` feature is on: with
+    /// it off, `detect_and_strip_magic` classifies `b'G'` as
+    /// [`ConnectionType::V1`] instead, so the byte-for-byte behaviour of a
+    /// websocket-off build is unchanged.
     WebSocket,
     /// V1 type byte → plain frp protocol (the byte is the V1 message type)
     V1(u8),

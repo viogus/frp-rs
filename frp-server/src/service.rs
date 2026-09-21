@@ -1862,15 +1862,52 @@ impl Service {
                                     )
                                     .await;
                                 }
-                                #[cfg(feature = "websocket")]
                                 ConnectionType::WebSocket => {
-                                    crate::handlers::handle_websocket_connection(
-                                        state,
-                                        addr,
-                                        accept_deadline,
-                                        stream_io,
-                                    )
-                                    .await;
+                                    #[cfg(feature = "websocket")]
+                                    {
+                                        crate::handlers::handle_websocket_connection(
+                                            state,
+                                            addr,
+                                            accept_deadline,
+                                            stream_io,
+                                        )
+                                        .await;
+                                    }
+                                    #[cfg(not(feature = "websocket"))]
+                                    {
+                                        // `not(feature = "websocket")` here is
+                                        // *this crate's* feature. The variant
+                                        // exists in the match because frp-core
+                                        // may be compiled with its own
+                                        // `websocket` feature ON through Cargo
+                                        // feature unification even then — e.g.
+                                        // in this crate's
+                                        // `cargo check -p frp-server
+                                        // --no-default-features --all-targets`
+                                        // run, frp-server's dev-dependency on
+                                        // frp-client (default features) pulls
+                                        // frp-core/websocket in.
+                                        //
+                                        // Two graphs satisfy this cfg, and they
+                                        // differ in whether the arm is taken:
+                                        //  - frp-core's `websocket` *also* off:
+                                        //    `detect_and_strip_magic`'s `b'G'`
+                                        //    arm is off too, so 'G' is
+                                        //    classified `V1(b'G')` and this arm
+                                        //    is never taken.
+                                        //  - frp-core's `websocket` on (the
+                                        //    --all-targets run above, and any
+                                        //    other graph with frp-client in
+                                        //    it): the `b'G'` detection arm is
+                                        //    compiled, `ConnectionType::WebSocket`
+                                        //    *is* returned, and this is the live
+                                        //    path — a 'G' connection is warned
+                                        //    about and dropped, which is the
+                                        //    intended behaviour for a build with
+                                        //    no WebSocket handler.
+                                        let _ = (state, accept_deadline, stream_io);
+                                        warn!(addr = %addr, "WebSocket connection from {} but WebSocket feature not enabled, dropping", addr);
+                                    }
                                 }
                                 ConnectionType::V2 => {
                                     crate::handlers::handle_v2_connection(
