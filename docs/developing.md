@@ -95,13 +95,17 @@ actually checked:
 
 ```
 ## Reviews
-- Reviewer 1 (<what they did>): <findings, or "no findings">
-- Reviewer 2 adversarial (<what they attacked>): <findings, or "no findings">
+- Reviewer 1 — method: <how>; checked: <what, with evidence>; findings: <...| none>;
+  disposition: <fixed in <sha> | rejected: <reason> | follow-up: <where>>
+- Reviewer 2 adversarial — method: <how it tried to falsify>; checked: <claim attacked>;
+  findings: <...| none>; disposition: <...>
 ```
 
-A claim of "reviewed" with no method named is not a review. Where a review could
-not check something — a Linux-only path on macOS, a VPS-only XTCP matrix — it says
-so, because an unstated gap reads as coverage.
+The four fields are the ones rule 4 requires — **method, what was checked,
+findings, disposition**. A claim of "reviewed" with no method named is not a
+review. Where a review could not check something — a Linux-only path on macOS, a
+VPS-only XTCP matrix — it says so, because an unstated gap reads as coverage.
+`.github/PULL_REQUEST_TEMPLATE.md` carries the same block.
 
 ## 1. Workspace at a glance
 
@@ -219,14 +223,57 @@ named `frps`/`frpc` (default/full), `frps-tiny`/`frpc-tiny`, and
 `frps-micro`/`frpc-micro`.
 
 CI compiles the tiny and micro tiers with `RUSTFLAGS="-D warnings"` (the
-`verify` job in `.github/workflows/ci.yml`). A feature-gated item whose `#[cfg]`
-gate is missing therefore fails CI instead of only emitting a warning locally;
-run the same two commands before pushing a change that touches `#[cfg]` code:
+`verify` job in `.github/workflows/ci.yml`). Two workspace checks cover the
+tier **library and binary** graphs:
 
 ```bash
 RUSTFLAGS="-D warnings" cargo check --workspace --no-default-features --features tiny
 RUSTFLAGS="-D warnings" cargo check --workspace --no-default-features --features micro
 ```
+
+They deliberately omit `--all-targets`. On a `--workspace` invocation every
+member is a root, so the dev-dependency edges enter the graph, and
+`frp-server`'s dev-dependency on `frp-client` (`frp-server/Cargo.toml:67`,
+default features) plus `frp-client`'s on `frp-server` re-enable both crates'
+`default` sets — measured, the micro graph flips from `frp-client = []` to
+`frp-client = [chacha20, compression, default, http2http, kcp, oidc, quic,
+tcp-mux, tls, websocket]`, and `frp-server` from `[]` to
+`[chacha20, compression, default, http-proxy, kcp, oidc, quic, ssh, tcp-mux,
+tls, websocket]`.
+`--all-targets` there would therefore drop the tier coverage for those two
+crates, not extend it.
+
+The tier **test** targets are compiled by one isolated check instead, where
+`-p` makes the crate the only root and the dev-dependency edge cannot reopen
+its defaults:
+
+```bash
+RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --all-targets
+```
+
+This is the **no-features** configuration for frp-client — the micro tier — not the
+tiny one. frp-client's tiny set is `tls,tcp-mux`, and its test targets do not
+currently build (`plugin_h2` is gated on `tls` alone but needs `http2http`'s
+`h2`/`http`); [`../TODO.md`](../TODO.md) records that gap.
+
+That run compiles frp-client's test targets with `tls` off, which is what makes
+a missing gate fail: the 5 `tls`-gated items in the
+`frp-client/src/plugin/mod.rs` test module (four tests plus the
+`plugin_peer_ip_now` helper) and the `tls`-gated import plus two tests in
+`frp-client/tests/plugin_http.rs` reference tls-only items, so dropping their
+`#[cfg(feature = "tls")]` turns those references into compile errors (or an
+unused import) under `-D warnings`. With the gates present they are excluded
+and the run is clean — the `tls`-on path of the same tests is compiled by the
+`Lint` lane's `--all-targets --all-features` clippy.
+
+Not covered by any CI step: `frp-server`'s `tls`-off test targets. The
+symmetric `cargo check -p frp-server --no-default-features --all-targets` does
+not compile at all — `error[E0004]` at `frp-server/src/service.rs:1842`,
+because feature unification gives `frp-core` the `WebSocket` variant while
+frp-server's own `websocket` feature is off, leaving the `match`
+non-exhaustive. [`../TODO.md`](../TODO.md) records the gap and what would close
+it; `frp-server`'s tier library graph is still covered by the two workspace
+checks above.
 
 ### Feature Flags
 
@@ -739,8 +786,14 @@ Go parity. The policy is **tiered by maintenance effort, not by deletion**:
 every surface below has an explicit decision and none is removed. The parity
 debt behind each decision is in [`../TODO.md`](../TODO.md); the per-surface Go
 comparison is in [`go-frp-compat-audit.md`](go-frp-compat-audit.md), and the
-end-to-end evidence is [`scripts/compat-test.sh`](../scripts/compat-test.sh)
-(see [§ Cross-Compatibility Tests](#cross-compatibility-tests)).
+end-to-end evidence for the surfaces its scenarios actually cover is
+[`scripts/compat-test.sh`](../scripts/compat-test.sh)
+(see [§ Cross-Compatibility Tests](#cross-compatibility-tests)). That suite
+does **not** cover every surface below: the frozen ones — SUDP, h2c, Windows
+TUN, the non-default XTCP KCP+yamux plane — have no compatible scenario, and
+`virtual_net` has none either. Their unfreeze conditions therefore rest on a
+user report, an upstream Go change, or someone committing to test the surface —
+never on a compat-matrix failure.
 
 This is a **single-maintainer decision with no second reviewer** — the same
 posture as the vendored-crate release check
@@ -751,8 +804,8 @@ scope.
 
 | Tier | What a change means | Surfaces |
 |---|---|---|
-| **Keep** — full parity maintained | Go-parity work and cross-compat coverage are welcome; a regression is a bug. | TCP, UDP, HTTP, HTTPS, STCP, XTCP; V1 and V2 wire protocol; encryption and compression; TCP multiplexing; the transports (TCP, WebSocket, TLS, KCP, QUIC); OIDC; the dashboard; the SSH gateway; the 10 client plugins; the server-side `[[httpPlugins]]` manager. |
-| **Opt-in** — best-effort | Fixes when a user needs them; no proactive parity investment. Staying out of the default build is intentional. | `vnet` (L3 VPN/TUN), `mimalloc`, `otel`, the frpc `admin` API. |
+| **Keep** — full parity maintained | Go-parity work and cross-compat coverage are welcome; a regression is a bug. | TCP, UDP, HTTP, HTTPS, STCP, XTCP; V1 and V2 wire protocol; encryption and compression; TCP multiplexing; the transports (TCP, WebSocket, TLS, KCP, QUIC); OIDC; the dashboard; the SSH gateway; 9 of the 10 client plugins; the server-side `[[httpPlugins]]` manager. |
+| **Opt-in** — best-effort | Fixes when a user needs them; no proactive parity investment. Staying out of the default build is intentional. | `vnet` (L3 VPN/TUN) and the `virtual_net` client plugin that rides it, `mimalloc`, `otel`, the frpc `admin` API. |
 | **Freeze** — bug-fix only | No new Go-parity work, no Go-parity-only tests, no refactor. Not removed. | SUDP; h2c; Windows TUN; the non-default XTCP data plane (KCP+yamux). |
 
 Three build-tier facts the tier names alone would hide. The dashboard is
@@ -766,7 +819,8 @@ than a build gate — the frozen code still compiles into the default and tiny
 tiers, and splitting the feature is not part of this policy. Finally, one of
 the 10 client plugins, `virtual_net`, is the TUN-backed path with no listener
 of its own (`frp-client/src/plugin/mod.rs:331`), so it follows the opt-in
-`vnet` tier.
+`vnet` tier: it is named in the Opt-in row above and is the one client plugin
+not counted in Keep.
 
 ### Frozen surfaces, and what would unfreeze each
 

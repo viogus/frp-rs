@@ -584,6 +584,95 @@ async fn reload_admin_go_query_parity_and_body_extension() {
         );
     }
 
+    // 5b. A REPEATED parameter is not an error: Go's `url.Values.Get` reads
+    //     the first value, so `?strictConfig=true&strictConfig=false` is a
+    //     strict reload (400 on the unknown key), and the reverse order is a
+    //     non-strict 200. axum's typed `Query<Struct>` used to reject the
+    //     duplicate with serde's `duplicate_field` -> 400 before the handler.
+    let (status, body) = admin_request(
+        admin_port,
+        "GET",
+        "/api/reload?strictConfig=true&strictConfig=false",
+        None,
+    )
+    .await;
+    assert!(
+        status.contains("400"),
+        "duplicate ?strictConfig must take the FIRST value (true -> strict 400), got: {status} / {body}"
+    );
+    let (status, body) = admin_request(
+        admin_port,
+        "GET",
+        "/api/reload?strictConfig=false&strictConfig=true",
+        None,
+    )
+    .await;
+    assert!(
+        status.contains("200"),
+        "duplicate ?strictConfig must take the FIRST value (false -> non-strict 200), got: {status} / {body}"
+    );
+
+    // 5c. Go discards `url.ParseQuery`'s error and keeps every pair it could
+    //     unescape, so a malformed escape makes `strictConfig` *absent*
+    //     (non-strict 200), not a 400. Real Go v0.71.0-equivalent behaviour
+    //     (`net/url.ParseQuery`, verified with go1.27.1):
+    //       strictConfig=%zz            -> Get("") -> non-strict 200
+    //       strictConfig=%ff            -> Get("\xff") -> non-strict 200
+    //       foo=%zz&strictConfig=true   -> Get("true") -> strict 400
+    //     These are Go-parity pins, not regression pins: the previous
+    //     `Query<..>` extractor answered 200 here too (`form_urlencoded` is
+    //     infallible and leaves invalid escapes literal); only the repeated
+    //     parameter in 5b was a genuine base 400.
+    let (status, body) =
+        admin_request(admin_port, "GET", "/api/reload?strictConfig=%zz", None).await;
+    assert!(
+        status.contains("200"),
+        "?strictConfig=%zz drops only its own pair (Go) -> non-strict 200, got: {status} / {body}"
+    );
+    let (status, body) = admin_request(
+        admin_port,
+        "GET",
+        "/api/reload?foo=%zz&strictConfig=true",
+        None,
+    )
+    .await;
+    assert!(
+        status.contains("400"),
+        "a malformed pair elsewhere must not hide strictConfig=true, got: {status} / {body}"
+    );
+    // A bare key (no `=`) is the empty value -> ParseBool error -> non-strict.
+    let (status, body) = admin_request(admin_port, "GET", "/api/reload?strictConfig", None).await;
+    assert!(
+        status.contains("200"),
+        "bare ?strictConfig must be the empty value -> non-strict 200, got: {status} / {body}"
+    );
+    // `%ff` unescapes fine (Go does not validate UTF-8) but ParseBool rejects
+    // the byte -> non-strict 200. `%ff` is unchanged from base: a well-formed
+    // escape is kept lossily, so the key stays present.
+    let (status, body) =
+        admin_request(admin_port, "GET", "/api/reload?strictConfig=%ff", None).await;
+    assert!(
+        status.contains("200"),
+        "?strictConfig=%ff must be a non-strict 200, got: {status} / {body}"
+    );
+
+    // 5d. A pair dropped for a malformed escape is *absent*, so the frp-rs
+    //     JSON-body extension applies: `%zz` + body true is strict (400 on the
+    //     unknown key). The old extractor kept the key present with the literal
+    //     "%zz" (ParseBool error -> false) and ignored the body, so this pins
+    //     the second, body-dependent behaviour change end-to-end.
+    let (status, body) = admin_request(
+        admin_port,
+        "POST",
+        "/api/reload?strictConfig=%zz",
+        Some(r#"{"strict_config": true}"#),
+    )
+    .await;
+    assert!(
+        status.contains("400"),
+        "a dropped query pair must let the JSON body select strict (400), got: {status} / {body}"
+    );
+
     // 6. Preserved frp-rs extension: POST + JSON body (snake_case).
     let (status, body) = admin_request(
         admin_port,

@@ -2,7 +2,7 @@
 
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, RawQuery, State},
     http::{header, StatusCode},
     routing::get,
     Json, Router,
@@ -58,12 +58,90 @@ struct ReloadBody {
     strict_config: Option<bool>,
 }
 
-/// Go's strict-mode channel: the `strictConfig` query parameter of
-/// `GET /api/reload`. Kept as a raw string because Go parses it itself.
-#[derive(Deserialize)]
-struct ReloadQuery {
-    #[serde(rename = "strictConfig")]
-    strict_config: Option<String>,
+/// Go's strict-mode query channel, reimplemented the way Go reads it.
+///
+/// `client/http/controller.go` (commit 4a23aa18) calls
+/// `r.URL.Query().Get("strictConfig")`. `URL.Query()` runs `url.ParseQuery`
+/// and **discards** its error; `parseQuery` drops only the pair it could not
+/// unescape and keeps the rest, and `Values.Get` returns the **first** value
+/// of a repeated key. Parsing the raw string here keeps those rules explicit:
+///
+/// * `?strictConfig=true&strictConfig=false` -> `"true"` (first wins). This is
+///   the observed defect: deserializing into a struct made axum's `Query`
+///   reject the repeated field with serde's `duplicate_field` error, so the
+///   handler never ran and the request answered 400 where Go reloads.
+/// * `?strictConfig=%zz` -> the pair is skipped, so the parameter is *absent*.
+///   For a **body-less** request that is the same non-strict answer the old
+///   extractor gave (`form_urlencoded` left the invalid escape literal, which
+///   `ParseBool` then rejected), so the parser is not a fix there — it
+///   replaces reliance on that incidental leniency with Go's documented rules,
+///   pinned against real `net/url` below. With a **JSON body** it *is* a
+///   behaviour change: the parameter is now absent, so the body fallback
+///   applies and `{"strict_config": true}` can select strict mode, whereas the
+///   old extractor kept the key present and ignored the body.
+///
+/// Returns the first `strictConfig` value, or `None` when no pair carries it.
+fn first_strict_config_param(raw_query: Option<&str>) -> Option<String> {
+    let raw = raw_query?;
+    for segment in raw.split('&') {
+        // Go: an empty segment is skipped; a segment containing ';' is a
+        // parse error since Go 1.17, so the pair is dropped.
+        if segment.is_empty() || segment.contains(';') {
+            continue;
+        }
+        let (key, value) = match segment.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (segment, ""),
+        };
+        let (Ok(key), Ok(value)) = (query_unescape(key), query_unescape(value)) else {
+            continue;
+        };
+        if key == "strictConfig" {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Go `url.QueryUnescape`: `+` -> space, `%XX` -> byte, and an invalid escape
+/// is an error (the caller drops that pair). Go does not validate UTF-8 here;
+/// the result is only ever compared against the ASCII `ParseBool` set, so a
+/// lossy decode of invalid bytes cannot change the strict decision.
+fn query_unescape(s: &str) -> Result<String, ()> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                if i + 2 >= bytes.len() {
+                    return Err(());
+                }
+                let hi = hex_digit(bytes[i + 1]).ok_or(())?;
+                let lo = hex_digit(bytes[i + 2]).ok_or(())?;
+                out.push((hi << 4) | lo);
+                i += 3;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
 }
 
 /// Mirror Go's `strconv.ParseBool` accept set (https://pkg.go.dev/strconv#ParseBool)
@@ -177,7 +255,7 @@ async fn handle_status(State(state): State<AdminState>) -> Json<serde_json::Valu
 
 async fn handle_reload(
     State(state): State<AdminState>,
-    Query(query): Query<ReloadQuery>,
+    RawQuery(raw_query): RawQuery,
     body: Bytes,
 ) -> Result<String, (StatusCode, String)> {
     // Read the optional body FIRST, whichever method was used: a body that is
@@ -197,9 +275,11 @@ async fn handle_reload(
     // commit 4a23aa18), so the query is the Go-faithful source when the two
     // disagree; the CLI sends the body and no query, so in practice the
     // channels never conflict. With neither present the reload is non-strict,
-    // matching Go's absent/empty parameter.
-    let strict = match query.strict_config.as_deref() {
-        Some(v) => parse_strict_config(v),
+    // matching Go's absent/empty parameter. The raw string goes through
+    // `first_strict_config_param` so a repeated parameter takes the first
+    // value and a malformed escape drops only its own pair -- both like Go.
+    let strict = match first_strict_config_param(raw_query.as_deref()) {
+        Some(v) => parse_strict_config(&v),
         None => body_strict.unwrap_or(false),
     };
     reload_and_wait(&state, strict).await
@@ -917,6 +997,179 @@ passwd = "socks-pass"
                 "ParseBool({s:?}) errors -> discarded -> false"
             );
         }
+    }
+
+    #[test]
+    fn first_strict_config_param_matches_go_url_query() {
+        // Cases cross-checked against real Go (`net/url.ParseQuery` +
+        // `Values.Get` + `strconv.ParseBool`): the parse error Go discards is
+        // reproduced here so the endpoint keeps Go's rules explicitly rather
+        // than relying on `form_urlencoded`'s incidental leniency.
+        let cases: &[(&str, Option<&str>)] = &[
+            // Values.Get takes the first value; order decides, not truthiness.
+            ("strictConfig=true&strictConfig=false", Some("true")),
+            ("strictConfig=false&strictConfig=true", Some("false")),
+            // An un-unescapable pair is dropped, so the parameter is absent
+            // (Go: ParseQuery error discarded -> Get("") -> non-strict 200).
+            ("strictConfig=%zz", None),
+            ("%zz=1&strictConfig=true", Some("true")),
+            ("strictConfig=%zz&strictConfig=true", Some("true")),
+            ("strictConfig=a;b", None),
+            // A bare key is the empty value, not an absent parameter.
+            ("strictConfig", Some("")),
+            ("strictConfig=", Some("")),
+            ("other=1", None),
+            ("", None),
+            // `+` decodes to space and `%XX` to its byte, as Go does; neither
+            // is a ParseBool true spelling.
+            ("strictConfig=+%74rue", Some(" true")),
+            ("strictConfig=%74rue", Some("true")),
+            ("strictConfig=%ff", Some("\u{FFFD}")),
+        ];
+        for (query, want) in cases {
+            let got = first_strict_config_param(Some(query));
+            assert_eq!(got.as_deref(), *want, "Go url.Query() on {query:?}");
+        }
+        assert_eq!(first_strict_config_param(None), None);
+        // The %ff value decodes lossily but ParseBool still rejects it.
+        assert!(!parse_strict_config(
+            &first_strict_config_param(Some("strictConfig=%ff")).unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn reload_duplicate_strict_config_takes_first_like_go() {
+        // The defect this pins: `Query<ReloadQuery>` (a struct) made axum
+        // reject `?strictConfig=a&strictConfig=b` with serde's
+        // `duplicate_field` error -> 400 *before* the handler, while Go's
+        // `url.Values.Get` reads the first value and reloads. Drive the real
+        // handler so the assertion is about HTTP status, not just the helper.
+        let (state, mut reload_rx) = test_state();
+        let (seen_tx, mut seen_rx) = mpsc::channel::<bool>(8);
+        tokio::spawn(async move {
+            while let Some(req) = reload_rx.recv().await {
+                let _ = seen_tx.send(req.strict).await;
+                let _ = req.reply.send(Ok("reload success".into()));
+            }
+        });
+        let app = Router::new()
+            .route("/api/reload", get(handle_reload).post(handle_reload))
+            .with_state(state);
+
+        // First value wins: true -> strict, even though false follows.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/reload?strictConfig=true&strictConfig=false")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "duplicate parameter must not 400 (Go reloads with the first value)"
+        );
+        assert_eq!(seen_rx.recv().await, Some(true));
+
+        // Order decides, not truthiness: false first -> non-strict.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/reload?strictConfig=false&strictConfig=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(seen_rx.recv().await, Some(false));
+
+        // A garbage first value is ParseBool's error case -> non-strict 200,
+        // even when a later duplicate says true.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/reload?strictConfig=garbage&strictConfig=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(seen_rx.recv().await, Some(false));
+
+        // Go discards ParseQuery's error and keeps the pairs it could
+        // unescape: a malformed escape drops only its own pair. These are
+        // Go-parity pins, not regression pins -- the old `Query` extractor
+        // answered 200 here too (`form_urlencoded` is infallible and lossy);
+        // only the repeated-field cases above were a genuine base 400.
+        for uri in [
+            "/api/reload?strictConfig=%zz",
+            "/api/reload?strictConfig=a;b",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri} must not 400");
+            assert_eq!(seen_rx.recv().await, Some(false), "{uri}");
+        }
+        // A malformed pair elsewhere does not hide a well-formed one.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/reload?foo=%zz&strictConfig=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(seen_rx.recv().await, Some(true));
+
+        // A bare key (no `=`) is the empty value -> ParseBool error ->
+        // non-strict, not a missing parameter and not a 400.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/reload?strictConfig")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(seen_rx.recv().await, Some(false));
+
+        // A pair dropped for a malformed escape makes the parameter *absent*,
+        // so the JSON body fallback applies: `%zz` + body true selects strict.
+        // This is the second, body-dependent behaviour change — the old
+        // extractor kept the key present with the literal "%zz" (-> false) and
+        // the body was ignored. Pinned here so the drop is discriminating.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/reload?strictConfig=%zz")
+                    .body(Body::from(r#"{"strict_config": true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            seen_rx.recv().await,
+            Some(true),
+            "a dropped query pair must let the JSON body select strict"
+        );
     }
 
     #[test]

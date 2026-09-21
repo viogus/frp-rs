@@ -86,12 +86,70 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `Option<Json<..>>` rationale is wrong (axum yields `None` only when `Content-Type` is
   absent, not for a malformed JSON body with the header set); `HEAD /api/reload` now
   performs a real reload because axum serves HEAD through the `get` handler.
+  The duplicate-parameter half and the doc claim are fixed in this change (raw-query parse,
+  first value wins). The `Option<Json<..>>` rationale is **already** fixed: `handle_reload`
+  takes `body: Bytes` and its comment gives the correct reason ("a body that is present but
+  not well-formed JSON must be a 400 on every method"), so no `Option<Json<..>>` remains to
+  mis-explain. The `HEAD`-performs-a-reload half is still open.
+- [x] **Corrected record: the hypothesised "malformed escape also 400'd" class did
+  not exist.** The claim was that `?strictConfig=%zz`/`%ff` answered 400 through axum's
+  `Query` extractor. It is false, and it was never measured before being written down:
+  `axum::extract::Query` is `serde_urlencoded::from_str`, and `form_urlencoded` 1.2.2 is an
+  **infallible, lossy** iterator (`percent_decode` leaves invalid escapes literal and
+  `decode_utf8_lossy` cannot error), so `Query<ReloadQuery>` could only 400 on a serde
+  *structural* error. Measured on the pre-change extractor (temporary probe, `Query` +
+  the removed struct) on **body-less** requests: `%zz` -> 200, `%ff` -> 200, `%` -> 200, and
+  only `true&strictConfig=false` -> 400 `duplicate field`. That list is precisely the
+  configuration in which the reduced "no malformed-escape change" claim holds; Reviewer 2's
+  re-review found the second change it misses. With a JSON body present, the old extractor
+  kept the key *present* with the literal `%zz`, so `parse_strict_config` was false and the
+  query suppressed the body; the new parser drops the pair, so the parameter is absent and
+  the body fallback applies: `POST /api/reload?strictConfig=%zz` +
+  `{"strict_config": true}` was 200 non-strict and is now 400 strict (same for `%`, `%2`,
+  `a;b`). `%ff` is genuinely unchanged — a well-formed escape is kept lossily, so the key
+  stays present and still suppresses the body. So this round has **two** behaviour changes:
+  the repeated parameter, and the dropped-pair/body interaction. Both follow from encoding
+  Go's rules explicitly; the second is pinned by an HTTP-level case that carries a body.
+  The raw-query rewrite is kept, but justified as the explicit Go-faithful contract rather
+  than as a bug fix: it encodes
+  `url.Values.Get` / `url.ParseQuery` rules (first value wins, an un-unescapable pair is
+  dropped, `+`/`%XX` decode) instead of depending on a dependency's incidental leniency, and
+  it is pinned against real Go (`net/url.ParseQuery` + `Values.Get` + `strconv.ParseBool`,
+  go1.27.1): `strictConfig=%zz` -> `Get("")` non-strict; `%ff` -> `Get("\xff")` non-strict;
+  `foo=%zz&strictConfig=true` -> `Get("true")` strict; `strictConfig` / `strictConfig=` ->
+  `Get("")` non-strict; `strictConfig=a;b` -> `Get("")` non-strict (Go 1.17+ rejects `;`).
+  Done: `first_strict_config_param`/`query_unescape` in `frp-client/src/admin.rs`,
+  unit-tested against the Go table above and exercised at HTTP level in
+  `frp-client/tests/reload_malformed_config.rs` and the `reload_*` unit tests, including the
+  query-dropped-plus-body case.
 
 **The tier-warning gate (#343) does not cover what was fixed.**
-- [ ] The two CI steps are `cargo check` without `--all-targets`, so five of that change's
-  own cfg fixes — the four gated tests and `frp-client/tests/plugin_http.rs` — are not
-  compiled by the gate that was added to enforce them. **Done-when:** add `--all-targets`
-  (and re-check the cost) or state plainly in `docs/developing.md` which targets are covered.
+- [x] The two CI steps are `cargo check` without `--all-targets`, so that change's own cfg
+  fixes — the `tls`-gated items in `frp-client/src/plugin/mod.rs` (four tests plus the
+  `plugin_peer_ip_now` helper) and `frp-client/tests/plugin_http.rs` (one import plus two
+  tests) — were not compiled by the gate added to enforce them. **Done-when:** add
+  `--all-targets` (and re-check the cost) or state plainly in `docs/developing.md` which
+  targets are covered.
+  Done: the second branch, plus a new isolated gate. `--all-targets` was measured and
+  rejected: on a `--workspace` run it activates the dev-dependency edges, and
+  `frp-server`'s dev-dependency on `frp-client` (default features, `frp-server/Cargo.toml:67`)
+  plus frp-client's on frp-server re-enable both crates' `default` sets — the micro step then
+  compiles `frp-client = [chacha20,compression,default,http2http,kcp,oidc,quic,tcp-mux,tls,websocket]`
+  instead of `[]` and `frp-server` gains `default`+`ssh`. That is a tier-coverage loss, not a
+  gain, so the workspace steps stay as they are (with a `ci.yml` comment recording why). The
+  tier test targets are now compiled by
+  `cargo check -p frp-client --no-default-features --all-targets`, where `-p` makes the crate
+  the only root so the dev-dependency edge cannot reopen its defaults, and
+  `docs/developing.md § Binary Variants` states exactly which targets each step covers.
+- [ ] `frp-server`'s `tls`-off test targets still have no gate: the symmetric
+  `cargo check -p frp-server --no-default-features --all-targets` does not compile.
+  `error[E0004]` at `frp-server/src/service.rs:1842` — `ConnectionType::WebSocket` is not
+  covered, because feature unification gives `frp-core` the variant (through frp-client's
+  default features, frp-client being frp-server's dev-dependency) while frp-server's own
+  `websocket` feature is off. **Done-when:** `service.rs`'s `match` has a defensive arm for
+  the unbuilt transport (or the variant is otherwise made unreachable under feature
+  unification), and the isolated `-p frp-server` step joins the `-p frp-client` one in
+  `ci.yml`.
 
 **The SSH readiness fix (#344) left two sites and one unbounded case.**
 - [x] Two SSH-gateway tests still connect with a bare `.unwrap()` and no readiness wait.
@@ -125,22 +183,48 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
 
 **The feature-surface policy (#348) contradicts itself on one surface.**
   Done: fixed in #353. See that PR for the evidence and the residue it records.
-- [ ] `virtual_net` appears in **Keep** (inside "the 10 client plugins") and in **Opt-in**
+- [x] `virtual_net` appears in **Keep** (inside "the 10 client plugins") and in **Opt-in**
   (the TUN-backed path) in the same section, and the "10 client plugins" set does not match
   the dispatch arms. **Done-when:** one tier per surface, and the plugin count reconciled
   with `frp-client/src/plugin/mod.rs`.
-- [ ] h2c's unfreeze condition is "a compat failure on that surface", but no compat scenario
-  covers h2c, so it can never fire; the section cites `compat-test.sh` as end-to-end evidence
-  for a surface it does not test.
+  Done: fixed in this change — Keep now says "9 of the 10 client plugins" and the Opt-in row
+  names the `virtual_net` client plugin. The count reconciles with
+  `frp-client/src/plugin/mod.rs:278-294`: nine dispatched user-facing plugin types
+  (`http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `tls2raw`, `http2http`,
+  `http2https`, `https2http`, `https2https`) plus the TUN-backed `virtual_net` (special-cased
+  at `mod.rs:331` because it has no listener) = 10. The `visitor_plugin` dispatch arm is the
+  internal visitor path, not one of the ten client plugins.
+- [x] (corrected record — the original entry misquoted the document) The h2c bullet does
+  **not** cite "a compat failure on that surface": `docs/developing.md` gives it two triggers,
+  a Go-side change to its h2c handling (`net/http` upgrade path or `pkg/util/vhost`) and a
+  user-reported h2c interop failure, neither of which needs a compat scenario — so the
+  original claim that the condition "can never fire" was false. The real, unfixed defect was
+  the section's opening citation: it presents `scripts/compat-test.sh` as the end-to-end
+  evidence for the whole feature-surface policy, but the frozen surfaces the policy governs
+  (SUDP, h2c, Windows TUN, the non-default XTCP KCP+yamux plane) and `virtual_net` have no
+  compat scenario at all (grep of `scripts/` and `.github/` is empty). The original entry was
+  a reviewer paraphrase of the policy written as a quotation and never checked against the
+  file; the "defect report" was less accurate than the document it accused. **Done-when:**
+  the citation is scoped to the surfaces compat scenarios cover, and the document says
+  plainly which surfaces have none.
+  Done: fixed in this change (`docs/developing.md § Maintenance policy: feature surface`,
+  opening paragraph).
 
 **The review protocol itself (#349) needs the same scrutiny.**
-- [ ] The record template shows `Reviewer 1 (<what they did>)` and `Reviewer 2 adversarial
+- [x] The record template shows `Reviewer 1 (<what they did>)` and `Reviewer 2 adversarial
   (<what they attacked>)`, but `CLAUDE.md` rule 4 mandates four things — method, what was
   checked, findings, **disposition**. The template omits two of them.
-- [ ] Rule 4 has no enforcement surface: no PR template, no CI check, nothing that notices a
+  Done: fixed in this change — `docs/developing.md § Recording it` now asks for all four per
+  reviewer (method / checked / findings / disposition), and
+  `.github/PULL_REQUEST_TEMPLATE.md` carries the same block.
+- [x] Rule 4 has no enforcement surface: no PR template, no CI check, nothing that notices a
   pull request with no review record. It is self-attestation, which is the weakest form of
   the thing it asks for. **Done-when:** either a PR template carrying the block, or an
   explicit note that the rule is convention-only and why that is acceptable here.
+  Done: fixed in this change — `.github/PULL_REQUEST_TEMPLATE.md` (new) puts the
+  `## Reviews` block in every new PR body, so the record is the default rather than something
+  a contributor must remember. Still convention-only (nothing red happens without it); the
+  template is the prompt, and the reviewers themselves remain the control.
 
 **Lower severity, recorded so it is not lost.** The rustls change (#345) says "the only 0.24
 artifact is `0.24.0-dev.1`" (`0.24.0-dev.0` also exists), and its README names a CI command
@@ -148,6 +232,51 @@ that skips the SNI integration test it is cited for; the review-protocol commit'
 "this repository has a single author" is contradicted by its own history (1231 human / 219
 agent commits), which matters because the *reason* for two reviewers is that no second
 **person** exists, not that no second author does.
+
+- [ ] **`frp-core`'s test targets do not compile with no features.** Evidence:
+  `cargo check -p frp-core --no-default-features --all-targets` exits 101 —
+  `could not compile frp-core (lib test) due to 2 previous errors`, `(test "kcp") due to 3`,
+  `(test "xtcp_p2p") due to 20`; sample errors `E0425 cannot find function 'connect_ws_raw'
+  in this scope`, `E0432 unresolved imports frp_core::kcp::{dial_kcp, dial_kcp_with_driver,
+  KcpListener}`, `E0425 cannot find function 'punch_udp_hole' in module frp_core::xtcp_p2p`.
+  The `kcp`/`xtcp_p2p` integration tests and some lib tests have no `#[cfg]` gate for the
+  features they need. **Done-when:** each such test carries its gate, so the command exits 0
+  and the run can join the `-p frp-client` isolated CI step.
+- [ ] **`frpc-tiny`'s test targets do not compile either.** Evidence:
+  `cargo check -p frp-client --no-default-features --features tls,tcp-mux --all-targets`
+  — exactly the tiny tier for frp-client, measured `['tcp-mux','tls']` — exits 101 with
+  `could not compile frp-client (test "plugin_h2") due to 5 previous errors`: `E0433 cannot
+  find module or crate 'h2'`, `'http'`, plus an `E0277`. `plugin_h2.rs` is gated
+  `#![cfg(feature = "tls")]` only, but its `h2`/`http` imports come from `http2http`. The
+  new isolated CI step uses `--no-default-features` (no features), so it does not reach this
+  configuration. **Done-when:** the `plugin_h2` test target is gated on the feature that
+  provides `h2`/`http` (`http2http`), so the tiny test targets build and a
+  `-p frp-client --no-default-features --features tls,tcp-mux --all-targets` step can be
+  added.
+- [ ] **Pre-existing: no query-parameter-count guard, so >10000 params diverge from Go.**
+  Go's `parseQuery` opens with
+  `if !urlParamsWithinMax(strings.Count(query, "&") + 1) { return Values{}, err }`
+  (`net/url/url.go:980`, `defaultMaxParams = 10000`), so an over-limit query yields empty
+  `Values` and the reload is non-strict. Precision measured by Reviewer 2: `defaultMaxParams`
+  is present in **go1.25.12** (the toolchain that built the shipped Go frp v0.71.0 binary) and
+  **absent in go1.25.0** — a 1.25.x backport, not a 1.25.0 feature. Reproduced on two
+  independent successful fetches (`go1.25.0` 0 hits, `go1.25.12` 2 hits for `defaultMaxParams`
+  in `net/url/url.go`). Real Go frp v0.71.0 measured on
+  `?strictConfig=true` + N×`&`: N=9999 → **400** (within the limit, strict), N=10000 →
+  **200** (guard trips, non-strict). Rust has no such guard and is always strict. Why the
+  differential oracle did not flag it (the parent agent's — Reviewer 1's — wording error,
+  refuted by Reviewer 2): an oracle built on `url.ParseQuery` sees the limit by construction,
+  so only a corpus that never emits more than 10000 parameters fails to reach it.
+  **Done-when:** the parser mirrors
+  Go's parameter-count guard (or the divergence is documented at the endpoint), with both N
+  cases pinned.
+- [ ] **Pre-existing: `#` in the request target changes strictness.** Go parses request URIs
+  with `viaRequest=true`, which never splits a fragment, so `#` stays inside `RawQuery` and
+  `GET /api/reload?strictConfig=true#strictConfig=false` is a **200** non-strict reload (the
+  value becomes `true#strictConfig=false`, which `ParseBool` rejects). `axum::extract::RawQuery`
+  comes from `http::Uri`, which strips the fragment, so frp-rs reads `strictConfig=true` and
+  is strict — same endpoint, opposite strictness. **Done-when:** the raw request target is
+  used (or the divergence documented at the endpoint), with the `#` case pinned.
 
 ---
 

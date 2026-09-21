@@ -21,6 +21,15 @@ User-facing release notes for frp-rs.
   running proxies are left as they were) where it used to succeed; pass
   `--strict-config=false` to keep the old lenient behaviour.
 
+### Fixed
+- **`/api/reload` now reads `?strictConfig=` the way Go frp does — two behaviour changes.**
+  A repeated parameter (`?strictConfig=true&strictConfig=false`) reloads with the first value
+  (Go's `url.Values.Get`); it previously failed serde deserialization and answered 400. And a
+  parameter whose percent-escape is malformed (`?strictConfig=%zz`) is now treated as
+  *absent*, so a `POST` body (`{"strict_config": true}`) takes effect where the old handling
+  kept the broken value and ignored the body. Malformed escapes without a body are unchanged
+  (still a non-strict 200), as is every other endpoint.
+
 ## v0.71.0 — re-release (2026-09-13)
 
 Supersedes the 2026-08-16 v0.71.0 build (PR #246 era). Same version number,
