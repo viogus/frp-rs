@@ -3143,6 +3143,8 @@ fn test_parse_dns_response_malformed_never_panics() {
     // below is still parsed; the pointer target is never dereferenced.
     assert!(ok.is_ok(), "pointer is not followed; got: {ok:?}");
 }
+// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (transport/mod.rs:2187).
+#[cfg(feature = "websocket")]
 #[tokio::test]
 async fn test_connect_ws_raw_rejects_accept_mismatch() {
     // A server that answers the upgrade with a WRONG Sec-WebSocket-Accept
@@ -3197,6 +3199,8 @@ async fn test_connect_ws_raw_rejects_accept_mismatch() {
     srv.await.unwrap();
 }
 
+// See the gate note on `test_connect_ws_raw_rejects_accept_mismatch`.
+#[cfg(feature = "websocket")]
 #[tokio::test]
 async fn test_connect_ws_raw_rejects_missing_accept_header() {
     // A server answering 101 WITHOUT the Sec-WebSocket-Accept header must

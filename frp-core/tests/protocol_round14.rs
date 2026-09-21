@@ -21,7 +21,7 @@ fn duplex() -> (DuplexStream, DuplexStream) {
 
 /// One fully-populated instance of every FrpMessage variant.
 fn all_message_variants() -> Vec<FrpMessage> {
-    let mut v = vec![
+    let v = vec![
         FrpMessage::Login(Box::new(msg::Login {
             version: Some("0.71.0".into()),
             hostname: Some("h1".into()),
@@ -194,22 +194,31 @@ fn all_message_variants() -> Vec<FrpMessage> {
             success: true,
         }),
     ];
+    // The three `Vnet*` variants carry `#[cfg(feature = "vnet")]`
+    // (frp-core/src/msg.rs:694-699), so this extend is the base binding's
+    // only mutation and disappears without the feature. Rebuilding into a
+    // `mut` local inside the gate keeps `mut` present exactly where it is
+    // used, instead of leaving an unused `mut` that `-D warnings` rejects.
     #[cfg(feature = "vnet")]
-    v.extend([
-        FrpMessage::VnetRouteAdvertise(msg::VnetRouteAdvertise {
-            proxy_name: "vnet-adv".into(),
-            subnet: "10.0.0.0/8".into(),
-            virtual_net: Some("vn1".into()),
-        }),
-        FrpMessage::VnetRouteRemove(msg::VnetRouteRemove {
-            proxy_name: "vnet-rm".into(),
-            virtual_net: Some("vn1".into()),
-        }),
-        FrpMessage::VnetPacket(msg::VnetPacket {
-            proxy_name: "vnet-pkt".into(),
-            data: "AQID".into(),
-        }),
-    ]);
+    let v = {
+        let mut extended = v;
+        extended.extend([
+            FrpMessage::VnetRouteAdvertise(msg::VnetRouteAdvertise {
+                proxy_name: "vnet-adv".into(),
+                subnet: "10.0.0.0/8".into(),
+                virtual_net: Some("vn1".into()),
+            }),
+            FrpMessage::VnetRouteRemove(msg::VnetRouteRemove {
+                proxy_name: "vnet-rm".into(),
+                virtual_net: Some("vn1".into()),
+            }),
+            FrpMessage::VnetPacket(msg::VnetPacket {
+                proxy_name: "vnet-pkt".into(),
+                data: "AQID".into(),
+            }),
+        ]);
+        extended
+    };
     v
 }
 

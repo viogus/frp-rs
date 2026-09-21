@@ -276,7 +276,7 @@ that skips the SNI integration test it is cited for; the review-protocol commit'
 agent commits), which matters because the *reason* for two reviewers is that no second
 **person** exists, not that no second author does.
 
-- [ ] **`frp-core`'s test targets do not compile with no features.** Evidence:
+- [x] **`frp-core`'s test targets do not compile with no features.** Evidence:
   `RUSTFLAGS="-D warnings" cargo check -p frp-core --no-default-features --all-targets` exits
   101 — `could not compile frp-core (lib test) due to 2 previous errors`, `(test "kcp") due to 3`,
   `(test "xtcp_p2p") due to 20`, `(test "protocol_round14") due to 1`; sample errors `E0425 cannot find function 'connect_ws_raw'
@@ -288,6 +288,26 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   binding, `v.extend(...)` at `:198`, is `vnet`-gated and `-D warnings` promotes the unused
   `mut` to an error. **Done-when:** each such test carries its gate, so the command exits 0
   and the run can join the sibling isolated CI steps.
+  Done: fixed in this change. `RUSTFLAGS="-D warnings" cargo check -p frp-core
+  --no-default-features --all-targets` exits 0 (was 101). The four failing units were closed
+  as follows, and closing them surfaced three further lib-test errors that the first two had
+  masked (the same "only error reached" effect as the `ConnectionType` fix): two lib tests
+  gated `#[cfg(feature = "websocket")]` (`frp-core/src/transport/mod.rs`), `TokenEndpointCapture`
+  gated `#[cfg(feature = "oidc")]` (`frp-core/src/auth.rs:3044`) and `TEST_KEY`
+  `#[cfg(feature = "compression")]` (`frp-core/src/snappy_stream.rs:430`); `frp-core/tests/kcp.rs`
+  and `frp-core/tests/xtcp_p2p.rs` carry whole-file `#![cfg(feature = "kcp")]` — measured, the
+  file's floor is `kcp` alone: `--features kcp,tcp-mux --all-targets` exits 0, and with a
+  throwaway `tcp-mux` gate on the two `AtomicU64`/`AtomicUsize` imports at
+  `frp-core/src/xtcp_session.rs:40` (the sole other blocker in that configuration)
+  `--features kcp --all-targets` also exits 0, so `tcp-mux`/`quic` are not folded into the
+  gate; `protocol_round14.rs` was restructured, not `allow`ed — the base vector is immutable
+  and the `vnet`-gated extend rebuilds it into a `mut` local, so `mut` exists exactly where
+  the mutation does. New CI step `Check frp-core tier test targets compile (isolated, no
+  features)` in `.github/workflows/ci.yml`, and `docs/developing.md § Binary Variants`
+  describes what it does and does not prove. Not covered by that step: 6 of frp-core's 10 test
+  targets are whole-file-cfg'd *empty* in the no-features configuration (`kcp.rs`,
+  `xtcp_p2p.rs`; `mux.rs`, `yamux_rst.rs` under `tcp-mux`; `xtcp_quic_sni.rs` under `tls`;
+  `ws_tls_stall.rs` under `tls`+`websocket`), measured at 0 listed tests there.
 - [ ] **`frpc-tiny`'s test targets do not compile either.** Evidence:
   `cargo check -p frp-client --no-default-features --features tls,tcp-mux --all-targets`
   — exactly the tiny tier for frp-client, measured `['tcp-mux','tls']` — exits 101 with

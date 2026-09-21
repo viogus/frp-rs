@@ -243,24 +243,37 @@ tls, websocket]`.
 `--all-targets` there would therefore drop the tier coverage for those two
 crates, not extend it.
 
-The tier **test** targets are compiled by two sibling isolated checks instead,
+The tier **test** targets are compiled by three sibling isolated checks instead,
 where `-p` makes the crate the only root and the dev-dependency edge cannot
 reopen its defaults:
 
 ```bash
 RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --all-targets
 RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --all-targets
+RUSTFLAGS="-D warnings" cargo check -p frp-core   --no-default-features --all-targets
 ```
 
-**Scope: those two cover `frp-client`'s and `frp-server`'s test targets only.**
-No CI step compiles `frp-core`'s test targets in the **no-features**
-configuration, and they do not compile there — `RUSTFLAGS="-D warnings" cargo
-check -p frp-core --no-default-features --all-targets` exits 101: the `kcp` and
-`xtcp_p2p` integration tests reference feature-gated items without a `#[cfg]`
-gate, the `frp-core` lib tests fail likewise, and `protocol_round14` fails on a
-lint alone (an unused `mut` whose only mutation, `v.extend(...)`, is
-`vnet`-gated, so `-D warnings` promotes `unused_mut` to an error).
-[`../TODO.md`](../TODO.md) tracks that gap and what would close it.
+The `frp-core` step was added after the first two. `frp-core` is the only root
+there, so its own features are off — measured with `cargo check -p frp-core
+--no-default-features --all-targets -v`, every `frp-core` rustc invocation in
+that run (the lib, the lib test, and all 10 `frp-core/tests/*.rs` targets)
+carries zero `--cfg feature=` flags. `frp-core`'s dev-dependencies are all
+external crates (`frp-core/Cargo.toml`), none of which can depend back on it, so
+no dev-dependency edge re-enables a feature of the crate under test. The run
+exits 0; before the gates landed it exited 101 with four failing units (lib test,
+`kcp`, `xtcp_p2p`, `protocol_round14`). It checks the same property as its two
+siblings: a feature-gated item referenced without its gate is a compile error —
+or, under `-D warnings`, a `dead_code` / `unused_imports` / `unused_mut` error.
+
+Measured bound on the `frp-core` step, the same bound as the other two: it
+covers the code that is *compiled*, not the targets. 6 of `frp-core`'s 10 test
+targets are whole-file-cfg'd *empty* here — `kcp.rs` and `xtcp_p2p.rs` (`kcp`),
+`mux.rs` and `yamux_rst.rs` (`tcp-mux`), `xtcp_quic_sni.rs` (`tls`),
+`ws_tls_stall.rs` (`tls` + `websocket`). `cargo test -p frp-core
+--no-default-features --test <t> -- --list` reports 0 tests for each, versus
+4/12/13/3/2/1 with default features. The other 4 targets — `config_round14.rs`
+(2 tests), `protocol_round14.rs` (4), `proxy_auth.rs` (3),
+`v2_handshake_round14.rs` (3) — are compiled and checked in full.
 
 This is the **no-features** configuration for frp-client — the micro tier — not the
 tiny one. frp-client's tiny set is `tls,tcp-mux`, and its test targets do not
@@ -349,8 +362,10 @@ feature-gated variant exists.
 The step therefore checks frp-server's **own** gates, not frp-core's: a missing
 `#[cfg(feature = "tls")]` on a tls-only item in frp-server is caught, while
 frp-core's feature-off configuration is not compiled by this step at all (the
-two `--workspace` tier checks above are what cover frp-core in a genuinely
-small graph). The two TLS-driving cases in `frp-server/tests/vhost_audit_fixes.rs`
+`-p frp-core` step above is what covers frp-core's test targets with its own
+features off; the two `--workspace` tier checks cover frp-core's lib and the
+tier binaries in a genuinely small graph). The two TLS-driving cases in
+`frp-server/tests/vhost_audit_fixes.rs`
 and the whole of `frp-server/tests/vhost_h2c.rs` carry `#[cfg(feature = "tls")]`
 / `#![cfg(feature = "http-proxy")]` respectively, so the rest of the first file
 stays compiled — and therefore checked — with `tls` off; the `tls`-on path of

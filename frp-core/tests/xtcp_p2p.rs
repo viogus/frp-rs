@@ -5,6 +5,20 @@
 //! - `xtcp_p2p_connect` end-to-end (hole punch + KCP + data transfer)
 //! - FEC-enabled KCP transport
 //! - KCP dead link detection
+//!
+//! The real `frp_core::xtcp_p2p` module only exists under frp-core's `kcp`
+//! feature (frp-core/src/lib.rs:101); the feature-off stub (lib.rs:114)
+//! provides none of `punch_udp_hole`, `xtcp_p2p_connect`,
+//! `punch_udp_hole_makehole_owned` or `xtcp_p2p_connect_quic`, and its
+//! `conv_from_sid` returns 0, which the two `test_conv_from_sid_*`
+//! assertions (`> 0`) would fail on. Every test here drives one of those.
+//! The yamux tests carry their own `#[cfg(feature = "tcp-mux")]` and the QUIC
+//! test its own `#[cfg(feature = "quic")]`, so those two features are
+//! deliberately *not* folded into this gate: `kcp` is the only feature this
+//! target needs. (Measured by adding the missing `tcp-mux` gate on the two
+//! imports at `frp-core/src/xtcp_session.rs:40`, the sole blocker in the
+//! `--features kcp --all-targets` run: with it, that run is green.)
+#![cfg(feature = "kcp")]
 
 use std::net::SocketAddr;
 
