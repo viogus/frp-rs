@@ -346,15 +346,19 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   covers. Neither step covers the 6 of frp-core's 10 test
   targets that are whole-file-cfg'd *empty* in the no-features configuration (`kcp.rs`,
   `xtcp_p2p.rs`; `mux.rs`, `yamux_rst.rs` under `tcp-mux`; `xtcp_quic_sni.rs` under `tls`;
-  `ws_tls_stall.rs` under `tls`+`websocket`): each reports 0 tests in both the compile step's
-  `--list` and the runtime step's `running 0 tests`.
+  `ws_tls_stall.rs` under `tls`+`websocket`): each reports 0 tests in this configuration
+  (`cargo test -p frp-core --no-default-features --test <t> -- --list` reports 0) and `running
+  0 tests` in the runtime step's output.
 - [ ] **The same no-features runtime class is live in `frp-server` and `frp-client`, and no
   step runs their test targets in that configuration.** Measured in this worktree (macOS
   arm64); the `verify` lane's compile-only siblings
   (`cargo check -p frp-server --no-default-features --all-targets` and the `frp-client` one)
   both exit 0 on the same targets, so nothing gates this:
-  - `cargo test -p frp-server --no-default-features --all-targets --no-fail-fast` exits 101
-    with 432 passed / 40 failed across 8 targets. 34 of the 40 are feature-gated behaviour:
+  - `cargo test -p frp-server --no-default-features --all-targets --no-fail-fast` exits 101.
+    The totals are run-dependent because one of the failures below is a flake: two runs here
+    measured 432 passed / 40 failed across 8 targets and 433 / 39 / 7, and the two reviewers
+    measured one sample each of those same two shapes. 39 failures are deterministic:
+    34 are feature-gated behaviour:
     27 are the `http-proxy` stub — `tests/http_plugin.rs` 22 failed / 1 passed and
     `tests/http_plugin_ping.rs` 4 failed / 1 passed (both files contain zero `cfg(feature ...)`,
     measured), plus the lib test `control::proxy_ops::unregister_generation_tests::
@@ -373,9 +377,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     - 5 `tests/oidc_integration.rs` failures are environmental, not this class: `failed to
       start frps: Os { code: 2, kind: NotFound, message: "No such file or directory" }`
       (`frp-server/tests/common/mod.rs:640`) — this worktree has no `target/debug/frps`.
-    - 1 not attributed: `tests/tcpmux_httpconnect.rs` `test_tcpmux_proxy_auth_interior_space_
-      rejected_407` (`:368`, assertion at `:418`) fails with that same message when run with
-      `--no-default-features --features tls,http-proxy,tcp-mux` (3 passed / 1 failed).
+    - The 40th failure in the larger sample is not a feature residue at all: it is the
+      load-dependent flake in `tests/tcpmux_httpconnect.rs` tracked as its own item below,
+      which also fails with every feature on. It is why this breakdown says 39 deterministic
+      failures, not 40.
   - `cargo test -p frp-client --no-default-features --all-targets --no-fail-fast` exits 101
     with 313 passed / 2 failed: `test_e2e_tcp_proxy_over_websocket`
     (`frp-client/tests/end_to_end.rs:105`, file contains zero `cfg(feature ...)`) fails on the
@@ -387,6 +392,22 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   Gating these and adding sibling runtime steps is its own change. **Done-when:** each
   runtime-failing target carries its gate (or the configuration is documented as unsupported)
   and a step runs it.
+- [ ] **`test_tcpmux_proxy_auth_interior_space_rejected_407` is a load-dependent flake,
+  independent of features, and can turn the default-feature suite red.** Assertion:
+  `frp-server/tests/tcpmux_httpconnect.rs:418` — `double-space credentials must be rejected:
+  200 (successHook) then 407, got: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"`. Measured
+  here: the single test run in isolation (`cargo test -p frp-server [--no-default-features
+  [--features tls,http-proxy,tcp-mux]] --test tcpmux_httpconnect
+  test_tcpmux_proxy_auth_interior_space_rejected_407`, 20 runs each) passed 20/20 in all three
+  configurations; the whole 4-test target (`... --test tcpmux_httpconnect`, 15 runs each)
+  failed 1/15 with `--no-default-features`, 3/15 with `--features tls,http-proxy,tcp-mux`, and
+  3/15 with **default features** (every feature on). Root cause: `frp-server/src/tcpmux.rs:569`
+  writes the 200 and `:592` the 407 in two separate `write_all` calls, while the helper
+  `read_full_response` (`frp-server/tests/tcpmux_httpconnect.rs:58-75`) stops after the first
+  `\r\n\r\n` and the 200 declares `Content-Length: 0`, so when the two responses land in
+  separate reads the buffer holds only the 200. Pre-existing. **Done-when:** the test tolerates
+  the split (or the server writes both responses in one buffer), so the default-feature suite
+  cannot go red on scheduling.
 - [ ] **`frpc-tiny`'s test targets do not compile either.** Evidence:
   `cargo check -p frp-client --no-default-features --features tls,tcp-mux --all-targets`
   — exactly the tiny tier for frp-client, measured `['tcp-mux','tls']` — exits 101 with

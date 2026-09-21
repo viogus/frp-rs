@@ -300,12 +300,16 @@ was not measured.
 
 Both `frp-core` steps inherit the same bound: neither checks nor runs anything
 inside the 6 whole-file-cfg'd *empty* test targets listed in the paragraph above
-(each reports 0 tests in this configuration, in the compile step's `--list` and
-in the runtime step's `running 0 tests`). They differ in what they do with the
+(each reports 0 tests in this configuration — `cargo test -p frp-core
+--no-default-features --test <t> -- --list` reports 0, and the runtime step's
+output shows `running 0 tests`). They differ in what they do with the
 code that is present — the `verify` step type-checks it, the unit-lane step links
-and runs it. Neither *executes* the compression criterion group: the group is
-compiled by the `verify` lane's `cargo bench --workspace --no-run`, which does not
-run benchmarks, and `cargo test -p frp-core` does not run benches either. The
+and runs it. Neither *executes* the compression criterion group: the runtime step
+does run the bench binary (measured `Running benches/crypto_bridge.rs`, 124
+criterion cases), but the group's body is `#[cfg(feature = "compression")]`-gated,
+so it is absent in the no-features configuration; the `verify` lane compiles the
+group with default features (`cargo bench --workspace --no-run`) but runs no
+benchmark. The
 `--all-targets` flag drops the doctest target, which for `frp-core` contains 2
 tests and both are `ignore`-marked (`frp-core/src/buffer_pool.rs:54`,
 `frp-core/src/feature_gate.rs:9`), so nothing is lost.
