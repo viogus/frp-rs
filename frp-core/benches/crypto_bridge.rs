@@ -48,8 +48,9 @@ fn bench_compression(c: &mut Criterion) {
     // the `compression` feature (frp-core/src/encryption.rs:218), and the
     // `.unwrap()` below runs at registration time — outside `b.iter` — so it
     // panics the whole bench binary. The body is gated instead of the function
-    // because `criterion_group!` (line 532) lists this function by name and it
-    // must exist. No other group here needs the feature: without it
+    // because the `criterion_group!` invocation at the end of this file lists
+    // this function by name and it must exist. No other group here needs the
+    // feature: without it
     // `make_compressor`/`make_decompressor` return `None`
     // (frp-core/src/bridge.rs:68,87; feature-off branches at :77-81 and
     // :96-100), so `encrypted_compressed_bridge` runs the uncompressed path

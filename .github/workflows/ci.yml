@@ -94,11 +94,16 @@ jobs:
         # frp-core's tests/ are pure Rust<->Rust (no frps/frpc binaries), so
         # they belong with the unit lane and don't need the integration build.
         run: cargo test -p frp-core
-      - name: Run frp-core's tests and benches with no features (runtime half of the tier gates)
+      - name: Run frp-core's tests and benches with no features (runtime half of frp-core's tier gate)
         # The `verify` lane's `cargo check -p frp-core --no-default-features
-        # --all-targets` is compile-only: it cannot see a runtime failure in a
-        # test or bench that still compiles. This step is the runtime half, and
-        # it is the only gate for two measured classes:
+        # --all-targets` is compile-only: it type-checks the test targets but
+        # does not link or run them, so it cannot see a runtime failure in a
+        # test or bench that still compiles. This step is the runtime half **for
+        # frp-core** — not for the tier gates in general: the same class is live
+        # in frp-server's and frp-client's no-features test targets right now,
+        # measured and recorded in TODO.md, and neither crate has a runtime step.
+        #
+        # For frp-core this step is the only gate for two measured classes:
         #   - eight frp-core lib tests (all in the compression path) failed with
         #     `"compression not compiled"` while compiling clean — 597 passed /
         #     8 failed;
@@ -110,14 +115,15 @@ jobs:
         #     compiled"`.
         # Both now carry their `#[cfg(feature = ...)]` gates; this step keeps
         # them gated. It lives in the unit lane rather than `verify` because
-        # that lane already pays the test-harness cost and has a 25-minute
-        # budget (the `verify` step needs no test harness at all).
+        # that lane already pays the test-harness cost (it links and runs the
+        # same targets) and has a 25-minute budget.
         #
         # Measured after the gates: exits 0 with 609 tests passed / 0 failed and
         # 124 criterion bench cases run (default features: 903 tests / 130 bench
-        # cases; --all-features: 917 / 130). Local wall clock, macOS arm64 with a
-        # warm build: 5.51 s and 5.39 s on two consecutive runs. Not measured on
-        # the CI runner.
+        # cases; --all-features: 917 / 130). Wall clock, macOS arm64: 5.39 s /
+        # 5.42 s / 5.51 s warm on three runs, 19.84 s with frp-core's lib, its
+        # 10 test targets and the bench touched (forced rebuild). The runner's
+        # cost — Linux, cold cache — was not measured.
         run: cargo test -p frp-core --no-default-features --all-targets
 
   tests-server:

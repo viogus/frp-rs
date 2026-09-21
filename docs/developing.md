@@ -276,9 +276,11 @@ targets are whole-file-cfg'd *empty* here — `kcp.rs` and `xtcp_p2p.rs` (`kcp`)
 (2 tests), `protocol_round14.rs` (4), `proxy_auth.rs` (3),
 `v2_handshake_round14.rs` (3) — are compiled and checked in full.
 
-That step is compile-only, so it cannot see a missing `#[cfg]` on a test or bench
-that still *compiles*. The `Tests (unit)` job carries the runtime half, in the
-same no-features configuration:
+That step is compile-only: it type-checks the test targets but does not link or
+run them, so it cannot see a missing `#[cfg]` on a test or bench that still
+*compiles*. The `Tests (unit)` job carries the runtime half **for `frp-core`** —
+not for the tier gates in general; see the sibling-crate note below — in the same
+no-features configuration:
 
 ```bash
 cargo test -p frp-core --no-default-features --all-targets
@@ -286,13 +288,33 @@ cargo test -p frp-core --no-default-features --all-targets
 
 Measured: it exits 0 with 609 tests passed / 0 failed and 124 criterion bench
 cases run (default features: 903 tests / 130 bench cases; `--all-features`: 917 /
-130). It is the only gate for the two failures of that class found here: eight
-`frp-core` lib tests failed with `"compression not compiled"` (597 passed / 8
+130). It is the only gate for the two `frp-core` failures of that class found
+here: eight lib tests failed with `"compression not compiled"` (597 passed / 8
 failed), and `frp-core/benches/crypto_bridge.rs` panicked the bench binary at
 registration time — `thread 'main' panicked at
 frp-core/benches/crypto_bridge.rs:60:64: called `Result::unwrap()` on an `Err`
-value: "compression not compiled"`. Local wall clock, macOS arm64 with a warm
-build: 5.51 s and 5.39 s on two consecutive runs; not measured on the CI runner.
+value: "compression not compiled"`. Wall clock, macOS arm64: 5.39 s / 5.42 s /
+5.51 s warm on three runs, and 19.84 s with `frp-core`'s lib, its 10 test targets
+and the bench touched (forced rebuild). The runner's cost — Linux, cold cache —
+was not measured.
+
+Both `frp-core` steps inherit the same bound: neither checks nor runs anything
+inside the 6 whole-file-cfg'd *empty* test targets listed in the paragraph above
+(each reports 0 tests in this configuration, in the compile step's `--list` and
+in the runtime step's `running 0 tests`). They differ in what they do with the
+code that is present — the `verify` step type-checks it, the unit-lane step links
+and runs it. Neither *executes* the compression criterion group: the group is
+compiled by the `verify` lane's `cargo bench --workspace --no-run`, which does not
+run benchmarks, and `cargo test -p frp-core` does not run benches either. The
+`--all-targets` flag drops the doctest target, which for `frp-core` contains 2
+tests and both are `ignore`-marked (`frp-core/src/buffer_pool.rs:54`,
+`frp-core/src/feature_gate.rs:9`), so nothing is lost.
+
+The same runtime class is live in the sibling crates and is **not** covered by any
+step: [`../TODO.md`](../TODO.md) records the measured `cargo test -p frp-server
+--no-default-features --all-targets --no-fail-fast` and `cargo test -p frp-client
+--no-default-features --all-targets --no-fail-fast` failures, while the
+compile-only siblings of this step exit 0 on the same targets.
 
 This is the **no-features** configuration for frp-client — the micro tier — not the
 tiny one. frp-client's tiny set is `tls,tcp-mux`, and its test targets do not

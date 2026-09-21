@@ -331,22 +331,62 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     feature (`make_compressor`/`make_decompressor` return `None`, `frp-core/src/bridge.rs:68,87`
     with the feature-off branches at `:77-81` and `:96-100`; measured,
     `bridge/encrypted_compressed_bridge_*` runs `Success` in the no-features run).
-    The function itself stays unconditional because `criterion_group!`
-    (`frp-core/benches/crypto_bridge.rs:518`) lists it by name and it must exist.
+    The function itself stays unconditional because the `criterion_group!` invocation in
+    `frp-core/benches/crypto_bridge.rs` lists it by name and it must exist.
   Measured after: `cargo test -p frp-core --no-default-features --all-targets` exits 0 (609
   tests passed, 0 failed, 124 criterion bench cases run); the same command with default
   features is 903 passed / 130 bench cases and with `--all-features` 917 / 130, so the
   compression group's 6 cases (3 sizes × compress/decompress) are the only bench cases the
   gate removes. `cargo test -p frp-core --no-default-features` (without `--all-targets`) also
   exits 0: 609 passed / 2 ignored. `--no-default-features --features compression` exits 0 with
-  664 passed. Two CI steps now cover this: `Check frp-core tier test targets compile (isolated,
-  no features)` in the `verify` lane (compile half) and `Run frp-core's tests and benches with
-  no features (runtime half of the tier gates)` in the `Tests (unit)` lane (runtime half);
-  `docs/developing.md § Binary Variants` states which configuration each covers. Not covered by
-  the compile step: 6 of frp-core's 10 test
-  targets are whole-file-cfg'd *empty* in the no-features configuration (`kcp.rs`,
+  664 passed. Two CI steps now cover frp-core: `Check frp-core tier test targets compile
+  (isolated, no features)` in the `verify` lane (compile half) and `Run frp-core's tests and
+  benches with no features (runtime half of frp-core's tier gate)` in the `Tests (unit)` lane
+  (runtime half); `docs/developing.md § Binary Variants` states which configuration each
+  covers. Neither step covers the 6 of frp-core's 10 test
+  targets that are whole-file-cfg'd *empty* in the no-features configuration (`kcp.rs`,
   `xtcp_p2p.rs`; `mux.rs`, `yamux_rst.rs` under `tcp-mux`; `xtcp_quic_sni.rs` under `tls`;
-  `ws_tls_stall.rs` under `tls`+`websocket`), measured at 0 listed tests there.
+  `ws_tls_stall.rs` under `tls`+`websocket`): each reports 0 tests in both the compile step's
+  `--list` and the runtime step's `running 0 tests`.
+- [ ] **The same no-features runtime class is live in `frp-server` and `frp-client`, and no
+  step runs their test targets in that configuration.** Measured in this worktree (macOS
+  arm64); the `verify` lane's compile-only siblings
+  (`cargo check -p frp-server --no-default-features --all-targets` and the `frp-client` one)
+  both exit 0 on the same targets, so nothing gates this:
+  - `cargo test -p frp-server --no-default-features --all-targets --no-fail-fast` exits 101
+    with 432 passed / 40 failed across 8 targets. 34 of the 40 are feature-gated behaviour:
+    27 are the `http-proxy` stub — `tests/http_plugin.rs` 22 failed / 1 passed and
+    `tests/http_plugin_ping.rs` 4 failed / 1 passed (both files contain zero `cfg(feature ...)`,
+    measured), plus the lib test `control::proxy_ops::unregister_generation_tests::
+    stale_unregister_keeps_fresh_user_record` (`frp-server/src/control/proxy_ops.rs:3783`,
+    assertion at `:3803`) which expects `plugin_manager.user_info(...)` to be `Some` while the
+    `#[cfg(not(feature = "http-proxy"))]` stub (`frp-server/src/plugin/mod.rs:8-34`) makes
+    `record_login_user` a no-op (`:29`) and `user_info` return `None` (`:30-32`); the real impl
+    is `frp-server/src/plugin/http.rs:132` (`record_login_user` `:200`, `user_info` `:209`).
+    The other 7: 2 `tests/server_protocol.rs` WS/TLS dials (`:667`, `:738`), 2
+    `tests/slowloris.rs` TLS dials (`:317`, `:359`), 3 `tests/vhost_https_sni.rs` connects
+    (`:185`, `:294`, `:431`). Controls with the feature on, measured: `--test http_plugin`
+    23 passed / 0 failed, `--test http_plugin_ping` 5/0, `--lib unregister_generation_tests`
+    49/0, `--no-default-features --features websocket,tls --test server_protocol test_login_via`
+    2/0, `--no-default-features --features tls,http-proxy --test slowloris` 5/0 and
+    `--test vhost_https_sni` 4/0.
+    - 5 `tests/oidc_integration.rs` failures are environmental, not this class: `failed to
+      start frps: Os { code: 2, kind: NotFound, message: "No such file or directory" }`
+      (`frp-server/tests/common/mod.rs:640`) — this worktree has no `target/debug/frps`.
+    - 1 not attributed: `tests/tcpmux_httpconnect.rs` `test_tcpmux_proxy_auth_interior_space_
+      rejected_407` (`:368`, assertion at `:418`) fails with that same message when run with
+      `--no-default-features --features tls,http-proxy,tcp-mux` (3 passed / 1 failed).
+  - `cargo test -p frp-client --no-default-features --all-targets --no-fail-fast` exits 101
+    with 313 passed / 2 failed: `test_e2e_tcp_proxy_over_websocket`
+    (`frp-client/tests/end_to_end.rs:105`, file contains zero `cfg(feature ...)`) fails on the
+    proxy-port wait (`:203`) and passes with `--no-default-features --features websocket`
+    (control: `--test end_to_end` with default features 7 passed / 0 failed); the other is
+    `plugin::static_file::tests::test_static_file_e2e_non_ascii_round_trip`
+    (`frp-client/src/plugin/static_file.rs:3420`, `EILSEQ`), which also fails with default
+    features (0 passed / 1 failed) — macOS-only, not this class.
+  Gating these and adding sibling runtime steps is its own change. **Done-when:** each
+  runtime-failing target carries its gate (or the configuration is documented as unsupported)
+  and a step runs it.
 - [ ] **`frpc-tiny`'s test targets do not compile either.** Evidence:
   `cargo check -p frp-client --no-default-features --features tls,tcp-mux --all-targets`
   — exactly the tiny tier for frp-client, measured `['tcp-mux','tls']` — exits 101 with
