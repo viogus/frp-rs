@@ -276,6 +276,24 @@ targets are whole-file-cfg'd *empty* here — `kcp.rs` and `xtcp_p2p.rs` (`kcp`)
 (2 tests), `protocol_round14.rs` (4), `proxy_auth.rs` (3),
 `v2_handshake_round14.rs` (3) — are compiled and checked in full.
 
+That step is compile-only, so it cannot see a missing `#[cfg]` on a test or bench
+that still *compiles*. The `Tests (unit)` job carries the runtime half, in the
+same no-features configuration:
+
+```bash
+cargo test -p frp-core --no-default-features --all-targets
+```
+
+Measured: it exits 0 with 609 tests passed / 0 failed and 124 criterion bench
+cases run (default features: 903 tests / 130 bench cases; `--all-features`: 917 /
+130). It is the only gate for the two failures of that class found here: eight
+`frp-core` lib tests failed with `"compression not compiled"` (597 passed / 8
+failed), and `frp-core/benches/crypto_bridge.rs` panicked the bench binary at
+registration time — `thread 'main' panicked at
+frp-core/benches/crypto_bridge.rs:60:64: called `Result::unwrap()` on an `Err`
+value: "compression not compiled"`. Local wall clock, macOS arm64 with a warm
+build: 5.51 s and 5.39 s on two consecutive runs; not measured on the CI runner.
+
 This is the **no-features** configuration for frp-client — the micro tier — not the
 tiny one. frp-client's tiny set is `tls,tcp-mux`, and its test targets do not
 currently build (`plugin_h2` is gated on `tls` alone but needs `http2http`'s

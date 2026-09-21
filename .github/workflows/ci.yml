@@ -94,6 +94,31 @@ jobs:
         # frp-core's tests/ are pure Rust<->Rust (no frps/frpc binaries), so
         # they belong with the unit lane and don't need the integration build.
         run: cargo test -p frp-core
+      - name: Run frp-core's tests and benches with no features (runtime half of the tier gates)
+        # The `verify` lane's `cargo check -p frp-core --no-default-features
+        # --all-targets` is compile-only: it cannot see a runtime failure in a
+        # test or bench that still compiles. This step is the runtime half, and
+        # it is the only gate for two measured classes:
+        #   - eight frp-core lib tests (all in the compression path) failed with
+        #     `"compression not compiled"` while compiling clean — 597 passed /
+        #     8 failed;
+        #   - `frp-core/benches/crypto_bridge.rs` had no compression gate and
+        #     `bench_compression` unwraps `encryption::compress` at registration
+        #     time (outside `b.iter`), panicking the whole bench binary:
+        #     `thread 'main' panicked at frp-core/benches/crypto_bridge.rs:60:64:
+        #     called `Result::unwrap()` on an `Err` value: "compression not
+        #     compiled"`.
+        # Both now carry their `#[cfg(feature = ...)]` gates; this step keeps
+        # them gated. It lives in the unit lane rather than `verify` because
+        # that lane already pays the test-harness cost and has a 25-minute
+        # budget (the `verify` step needs no test harness at all).
+        #
+        # Measured after the gates: exits 0 with 609 tests passed / 0 failed and
+        # 124 criterion bench cases run (default features: 903 tests / 130 bench
+        # cases; --all-features: 917 / 130). Local wall clock, macOS arm64 with a
+        # warm build: 5.51 s and 5.39 s on two consecutive runs. Not measured on
+        # the CI runner.
+        run: cargo test -p frp-core --no-default-features --all-targets
 
   tests-server:
     name: Tests (server integration)

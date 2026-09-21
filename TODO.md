@@ -303,25 +303,47 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   entry below), so `tcp-mux`/`quic` are not folded into the gate; `protocol_round14.rs` was
   restructured, not `allow`ed — the base vector is immutable
   and the `vnet`-gated extend rebuilds it into a `mut` local, so `mut` exists exactly where
-  the mutation does. The same missing-gate class then showed up at **runtime**: `cargo test
-  -p frp-core --no-default-features` exited 101 with 597 passed / 8 failed, every failure
-  `"compression not compiled"` — eight tests drive the compression path but had no gate, and
-  now carry `#[cfg(feature = "compression")]`: seven in `frp-core/src/bridge.rs`
-  (`test_bridge_plain_compressed_pre_read_stream_integrity`,
-  `test_bridge_plain_decompressed_read_direction_split`,
-  `test_bridge_encrypted_decompressed_read_direction_split`,
-  `test_bridge_encrypted_compressed_pre_read_stream_integrity`,
-  `test_bridge_work_to_user_decompressor_flush`,
-  `test_bridge_compressed_charges_compressed_size_not_raw`,
-  `test_bridge_compressed_rate_limited_throttles_incompressible`) and
-  `test_compress_decompress_into_wire_equiv` in `frp-core/src/encryption.rs`. Each calls a
-  compression API that returns `Err("compression not compiled")` without the feature, so the
-  gate is intrinsic rather than a way to silence a flake. Measured after: that command exits 0
-  (597 lib tests passed, 0 failed; 609 passed / 2 ignored across all targets), and
-  `--no-default-features --features compression` exits 0 with 652 lib tests passed (664
-  across all targets). New CI step `Check frp-core tier test targets compile (isolated, no
-  features)` in `.github/workflows/ci.yml`, and `docs/developing.md § Binary Variants`
-  describes what it does and does not prove. Not covered by that step: 6 of frp-core's 10 test
+  the mutation does. The same missing-gate class then showed up at **runtime**, in two places
+  the compile-only `cargo check` above cannot see:
+  - `cargo test -p frp-core --no-default-features` exited 101 with 597 passed / 8 failed, every
+    failure `"compression not compiled"`. The eight that failed all call a compression API that
+    returns `Err("compression not compiled")` without the feature, so each gate is intrinsic
+    rather than a way to silence a flake (other tests pass the flag and fall back instead of
+    failing — e.g. `bridge::tests::test_encrypted_bridge_compression_smoke`
+    (`frp-core/src/bridge.rs:1518`) passes `use_compression = true` and passes vacuously). The
+    gates: seven in `frp-core/src/bridge.rs`
+    (`test_bridge_plain_compressed_pre_read_stream_integrity`,
+    `test_bridge_plain_decompressed_read_direction_split`,
+    `test_bridge_encrypted_decompressed_read_direction_split`,
+    `test_bridge_encrypted_compressed_pre_read_stream_integrity`,
+    `test_bridge_work_to_user_decompressor_flush`,
+    `test_bridge_compressed_charges_compressed_size_not_raw`,
+    `test_bridge_compressed_rate_limited_throttles_incompressible`) and
+    `test_compress_decompress_into_wire_equiv` in `frp-core/src/encryption.rs`.
+  - `cargo test -p frp-core --no-default-features --all-targets` exited 101 while
+    `cargo check -p frp-core --no-default-features --all-targets` exited 0:
+    `frp-core/benches/crypto_bridge.rs` carried no compression gate and `bench_compression`
+    unwraps `frp_core::encryption::compress` at registration time, outside `b.iter` —
+    `thread 'main' panicked at frp-core/benches/crypto_bridge.rs:60:64: called
+    Result::unwrap() on an Err value: "compression not compiled"`, then
+    `error: test failed, to rerun pass -p frp-core --bench crypto_bridge`. Only that body
+    carries `#[cfg(feature = "compression")]` — the bench's other groups do not need the
+    feature (`make_compressor`/`make_decompressor` return `None`, `frp-core/src/bridge.rs:68,87`
+    with the feature-off branches at `:77-81` and `:96-100`; measured,
+    `bridge/encrypted_compressed_bridge_*` runs `Success` in the no-features run).
+    The function itself stays unconditional because `criterion_group!`
+    (`frp-core/benches/crypto_bridge.rs:518`) lists it by name and it must exist.
+  Measured after: `cargo test -p frp-core --no-default-features --all-targets` exits 0 (609
+  tests passed, 0 failed, 124 criterion bench cases run); the same command with default
+  features is 903 passed / 130 bench cases and with `--all-features` 917 / 130, so the
+  compression group's 6 cases (3 sizes × compress/decompress) are the only bench cases the
+  gate removes. `cargo test -p frp-core --no-default-features` (without `--all-targets`) also
+  exits 0: 609 passed / 2 ignored. `--no-default-features --features compression` exits 0 with
+  664 passed. Two CI steps now cover this: `Check frp-core tier test targets compile (isolated,
+  no features)` in the `verify` lane (compile half) and `Run frp-core's tests and benches with
+  no features (runtime half of the tier gates)` in the `Tests (unit)` lane (runtime half);
+  `docs/developing.md § Binary Variants` states which configuration each covers. Not covered by
+  the compile step: 6 of frp-core's 10 test
   targets are whole-file-cfg'd *empty* in the no-features configuration (`kcp.rs`,
   `xtcp_p2p.rs`; `mux.rs`, `yamux_rst.rs` under `tcp-mux`; `xtcp_quic_sni.rs` under `tls`;
   `ws_tls_stall.rs` under `tls`+`websocket`), measured at 0 listed tests there.

@@ -44,29 +44,44 @@ fn bench_key_derivation(c: &mut Criterion) {
 // ── Snappy compression ─────────────────────────────────────────────────────
 
 fn bench_compression(c: &mut Criterion) {
-    let sizes = [64, 1024, 65536];
+    // `encryption::compress` returns `Err("compression not compiled")` without
+    // the `compression` feature (frp-core/src/encryption.rs:218), and the
+    // `.unwrap()` below runs at registration time — outside `b.iter` — so it
+    // panics the whole bench binary. The body is gated instead of the function
+    // because `criterion_group!` (line 532) lists this function by name and it
+    // must exist. No other group here needs the feature: without it
+    // `make_compressor`/`make_decompressor` return `None`
+    // (frp-core/src/bridge.rs:68,87; feature-off branches at :77-81 and
+    // :96-100), so `encrypted_compressed_bridge` runs the uncompressed path
+    // rather than panicking.
+    #[cfg(feature = "compression")]
+    {
+        let sizes = [64, 1024, 65536];
 
-    let mut group = c.benchmark_group("compression");
-    for size in sizes {
-        let data = bench_data(size);
-        group.throughput(Throughput::Bytes(size as u64));
+        let mut group = c.benchmark_group("compression");
+        for size in sizes {
+            let data = bench_data(size);
+            group.throughput(Throughput::Bytes(size as u64));
 
-        group.bench_function(format!("snappy_compress_{}_bytes", size), |b| {
-            b.iter(|| {
-                let _ = frp_core::encryption::compress(black_box(&data));
+            group.bench_function(format!("snappy_compress_{}_bytes", size), |b| {
+                b.iter(|| {
+                    let _ = frp_core::encryption::compress(black_box(&data));
+                });
             });
-        });
 
-        let compressed = frp_core::encryption::compress(&data).unwrap();
-        group.bench_function(format!("snappy_decompress_{}_bytes", size), |b| {
-            b.iter(|| {
-                let mut dec = frp_core::encryption::SnappyDecompressor::new();
-                let _ = dec.feed(black_box(&compressed));
-                let _ = dec.flush();
+            let compressed = frp_core::encryption::compress(&data).unwrap();
+            group.bench_function(format!("snappy_decompress_{}_bytes", size), |b| {
+                b.iter(|| {
+                    let mut dec = frp_core::encryption::SnappyDecompressor::new();
+                    let _ = dec.feed(black_box(&compressed));
+                    let _ = dec.flush();
+                });
             });
-        });
+        }
+        group.finish();
     }
-    group.finish();
+    #[cfg(not(feature = "compression"))]
+    let _ = c;
 }
 
 // ── AES-128-CFB streaming (tokio async — spawned in runtime) ───────────────
