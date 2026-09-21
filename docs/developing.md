@@ -253,12 +253,16 @@ RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --all-ta
 ```
 
 **Scope: those two cover `frp-client`'s and `frp-server`'s test targets only.**
-`frp-core`'s test targets are covered by **no** CI step and do not compile in
-that configuration — `RUSTFLAGS="-D warnings" cargo check -p frp-core
---no-default-features --all-targets` exits 101 (the `kcp`, `xtcp_p2p` and
-`protocol_round14` integration tests and some lib tests have no `#[cfg]` gate
-for the features they need). [`../TODO.md`](../TODO.md) tracks that gap and what
-would close it.
+No CI step compiles `frp-core`'s test targets in the **no-features**
+configuration, and they do not compile there — `RUSTFLAGS="-D warnings" cargo
+check -p frp-core --no-default-features --all-targets` exits 101: the `kcp` and
+`xtcp_p2p` integration tests reference feature-gated items without a `#[cfg]`
+gate, the `frp-core` lib tests fail likewise, and `protocol_round14` fails on a
+lint alone (an unused `mut` whose only mutation, `v.extend(...)`, is
+`vnet`-gated, so `-D warnings` promotes `unused_mut` to an error).
+[`../TODO.md`](../TODO.md) tracks that gap and what would close it. (Compiling
+`frp-core`'s test targets in *feature-on* configurations is covered elsewhere —
+the clippy, `--lib` test and bench steps.)
 
 This is the **no-features** configuration for frp-client — the micro tier — not the
 tiny one. frp-client's tiny set is `tls,tcp-mux`, and its test targets do not
@@ -310,13 +314,22 @@ non-exhaustive patterns, `ConnectionType::WebSocket` not covered.
 Why this broke on `websocket` and not on the other nine features `frp-core` has
 on: `websocket` is the only `frp-core` feature that gated a variant of
 `ConnectionType` — before this change the `WebSocket` variant was the only
-`#[cfg]`-gated item inside that enum. The
-other features on in this graph (`tls`, `kcp`, `quic`, `oidc`, `compression`,
-`chacha20`, `tcp-mux`, `http-client`, `stun`) disagree with frp-server's empty
-set just as much, but none of them changes the shape of the enum a dependent
-crate matches on, so none of them can make a `match` non-exhaustive. That is why
-the fix belongs on the type — the variant now always exists, so exhaustiveness
-no longer depends on the two crates' feature sets agreeing.
+`#[cfg]`-gated item inside that enum. The other features on in this graph
+(`tls`, `kcp`, `quic`, `oidc`, `compression`, `chacha20`, `tcp-mux`,
+`http-client`, `stun`) disagree with frp-server's empty set just as much, but
+none of them changes the shape of `ConnectionType`, so none of them can make a
+`match` **on `ConnectionType`** non-exhaustive. That is why the fix belongs on
+the type — the variant now always exists, so exhaustiveness of `ConnectionType`
+matches no longer depends on the two crates' feature sets agreeing.
+
+**That guarantee is scoped to `ConnectionType` and is not a systematic property
+of the workspace.** `oidc` — one of the nine features named just above — has a
+live sibling of exactly this class: `AuthMethod::Oidc` is gated in `frp-core`
+and matched in `frp-server`, so
+`cargo check -p frp-server --no-default-features --features dashboard --all-targets`
+still fails with `E0004` at `frp-server/src/dashboard.rs:2344`. [`../TODO.md`](../TODO.md)
+records it; the fix here was per-variant, not a guarantee that no other
+feature-gated variant exists.
 
 The step therefore checks frp-server's **own** gates, not frp-core's: a missing
 `#[cfg(feature = "tls")]` on a tls-only item in frp-server is caught, while
