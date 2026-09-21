@@ -276,7 +276,7 @@ that skips the SNI integration test it is cited for; the review-protocol commit'
 agent commits), which matters because the *reason* for two reviewers is that no second
 **person** exists, not that no second author does.
 
-- [ ] **`frp-core`'s test targets do not compile with no features.** Evidence:
+- [x] **`frp-core`'s test targets do not compile with no features.** Evidence:
   `RUSTFLAGS="-D warnings" cargo check -p frp-core --no-default-features --all-targets` exits
   101 — `could not compile frp-core (lib test) due to 2 previous errors`, `(test "kcp") due to 3`,
   `(test "xtcp_p2p") due to 20`, `(test "protocol_round14") due to 1`; sample errors `E0425 cannot find function 'connect_ws_raw'
@@ -288,6 +288,128 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   binding, `v.extend(...)` at `:198`, is `vnet`-gated and `-D warnings` promotes the unused
   `mut` to an error. **Done-when:** each such test carries its gate, so the command exits 0
   and the run can join the sibling isolated CI steps.
+  Done: fixed in this change. `RUSTFLAGS="-D warnings" cargo check -p frp-core
+  --no-default-features --all-targets` exits 0 (was 101). The four failing units were closed
+  as follows, and closing them surfaced three further lib-test errors that the first two had
+  masked (the same "only error reached" effect as the `ConnectionType` fix): two lib tests
+  gated `#[cfg(feature = "websocket")]` (`frp-core/src/transport/mod.rs`), `TokenEndpointCapture`
+  gated `#[cfg(feature = "oidc")]` (`frp-core/src/auth.rs:3044`) and `TEST_KEY`
+  `#[cfg(feature = "compression")]` (`frp-core/src/snappy_stream.rs:430`); `frp-core/tests/kcp.rs`
+  and `frp-core/tests/xtcp_p2p.rs` carry whole-file `#![cfg(feature = "kcp")]` — measured, the
+  file's floor is `kcp` alone: `--features kcp,tcp-mux --all-targets` exits 0, and
+  `--features kcp --all-targets` also exits 0 once the two `AtomicU64`/`AtomicUsize` imports
+  at `frp-core/src/xtcp_session.rs:40` are gated — that import error is the only thing that
+  makes `--features kcp --all-targets` red in-tree (it is listed under the measured-red `-p`
+  entry below), so `tcp-mux`/`quic` are not folded into the gate; `protocol_round14.rs` was
+  restructured, not `allow`ed — the base vector is immutable
+  and the `vnet`-gated extend rebuilds it into a `mut` local, so `mut` exists exactly where
+  the mutation does. The same missing-gate class then showed up at **runtime**, in two places
+  the compile-only `cargo check` above cannot see:
+  - `cargo test -p frp-core --no-default-features` exited 101 with 597 passed / 8 failed, every
+    failure `"compression not compiled"`. The eight that failed all call a compression API that
+    returns `Err("compression not compiled")` without the feature, so each gate is intrinsic
+    rather than a way to silence a flake (other tests pass the flag and fall back instead of
+    failing — e.g. `bridge::tests::test_encrypted_bridge_compression_smoke`
+    (`frp-core/src/bridge.rs:1518`) passes `use_compression = true` and passes vacuously). The
+    gates: seven in `frp-core/src/bridge.rs`
+    (`test_bridge_plain_compressed_pre_read_stream_integrity`,
+    `test_bridge_plain_decompressed_read_direction_split`,
+    `test_bridge_encrypted_decompressed_read_direction_split`,
+    `test_bridge_encrypted_compressed_pre_read_stream_integrity`,
+    `test_bridge_work_to_user_decompressor_flush`,
+    `test_bridge_compressed_charges_compressed_size_not_raw`,
+    `test_bridge_compressed_rate_limited_throttles_incompressible`) and
+    `test_compress_decompress_into_wire_equiv` in `frp-core/src/encryption.rs`.
+  - `cargo test -p frp-core --no-default-features --all-targets` exited 101 while
+    `cargo check -p frp-core --no-default-features --all-targets` exited 0:
+    `frp-core/benches/crypto_bridge.rs` carried no compression gate and `bench_compression`
+    unwraps `frp_core::encryption::compress` at registration time, outside `b.iter` —
+    `thread 'main' panicked at frp-core/benches/crypto_bridge.rs:60:64: called
+    Result::unwrap() on an Err value: "compression not compiled"`, then
+    `error: test failed, to rerun pass -p frp-core --bench crypto_bridge`. Only that body
+    carries `#[cfg(feature = "compression")]` — the bench's other groups do not need the
+    feature (`make_compressor`/`make_decompressor` return `None`, `frp-core/src/bridge.rs:68,87`
+    with the feature-off branches at `:77-81` and `:96-100`; measured,
+    `bridge/encrypted_compressed_bridge_*` runs `Success` in the no-features run).
+    The function itself stays unconditional because the `criterion_group!` invocation in
+    `frp-core/benches/crypto_bridge.rs` lists it by name and it must exist.
+  Measured after: `cargo test -p frp-core --no-default-features --all-targets` exits 0 (609
+  tests passed, 0 failed, 124 criterion bench cases run); the same command with default
+  features is 903 passed / 130 bench cases and with `--all-features` 917 / 130, so the
+  compression group's 6 cases (3 sizes × compress/decompress) are the only bench cases the
+  gate removes. `cargo test -p frp-core --no-default-features` (without `--all-targets`) also
+  exits 0: 609 passed / 2 ignored. `--no-default-features --features compression` exits 0 with
+  664 passed. Two CI steps now cover frp-core: `Check frp-core tier test targets compile
+  (isolated, no features)` in the `verify` lane (compile half) and `Run frp-core's tests and
+  benches with no features (runtime half of frp-core's tier gate)` in the `Tests (unit)` lane
+  (runtime half); `docs/developing.md § Binary Variants` states which configuration each
+  covers. Neither step covers the 6 of frp-core's 10 test
+  targets that are whole-file-cfg'd *empty* in the no-features configuration (`kcp.rs`,
+  `xtcp_p2p.rs`; `mux.rs`, `yamux_rst.rs` under `tcp-mux`; `xtcp_quic_sni.rs` under `tls`;
+  `ws_tls_stall.rs` under `tls`+`websocket`): each reports 0 tests in this configuration
+  (`cargo test -p frp-core --no-default-features --test <t> -- --list` reports 0) and `running
+  0 tests` in the runtime step's output.
+- [ ] **The same no-features runtime class is live in `frp-server` and `frp-client`, and no
+  step runs their test targets in that configuration.** Measured in this worktree (macOS
+  arm64); the `verify` lane's compile-only siblings
+  (`cargo check -p frp-server --no-default-features --all-targets` and the `frp-client` one)
+  both exit 0 on the same targets, so nothing gates this:
+  - `cargo test -p frp-server --no-default-features --all-targets --no-fail-fast` exits 101.
+    The totals are run-dependent because one of the failures below is a flake: two runs here
+    measured 432 passed / 40 failed across 8 targets and 433 / 39 / 7, and a reviewer sample
+    also reproduced the 433 / 39 / 7 shape. 39 failures are deterministic:
+    34 are feature-gated behaviour:
+    27 are the `http-proxy` stub — `tests/http_plugin.rs` 22 failed / 1 passed and
+    `tests/http_plugin_ping.rs` 4 failed / 1 passed (both files contain zero `cfg(feature ...)`,
+    measured), plus the lib test `control::proxy_ops::unregister_generation_tests::
+    stale_unregister_keeps_fresh_user_record` (`frp-server/src/control/proxy_ops.rs:3783`,
+    assertion at `:3803`) which expects `plugin_manager.user_info(...)` to be `Some` while the
+    `#[cfg(not(feature = "http-proxy"))]` stub (`frp-server/src/plugin/mod.rs:8-34`) makes
+    `record_login_user` a no-op (`:29`) and `user_info` return `None` (`:30-32`); the real impl
+    is `frp-server/src/plugin/http.rs:132` (`record_login_user` `:200`, `user_info` `:209`).
+    The other 7: 2 `tests/server_protocol.rs` WS/TLS dials (`:667`, `:738`), 2
+    `tests/slowloris.rs` TLS dials (`:317`, `:359`), 3 `tests/vhost_https_sni.rs` connects
+    (`:185`, `:294`, `:431`). Controls with the feature on, measured: `--test http_plugin`
+    23 passed / 0 failed, `--test http_plugin_ping` 5/0, `--lib unregister_generation_tests`
+    49/0, `--no-default-features --features websocket,tls --test server_protocol test_login_via`
+    2/0, `--no-default-features --features tls,http-proxy --test slowloris` 5/0 and
+    `--test vhost_https_sni` 4/0.
+    - 5 `tests/oidc_integration.rs` failures are environmental, not this class: `failed to
+      start frps: Os { code: 2, kind: NotFound, message: "No such file or directory" }`
+      (`frp-server/tests/common/mod.rs:640`) — this worktree has no `target/debug/frps`.
+    - The 40th failure in the larger sample is not a feature residue at all: it is the
+      load-dependent flake in `tests/tcpmux_httpconnect.rs` tracked as its own item below,
+      which also fails with default features. It is why this breakdown says 39 deterministic
+      failures, not 40.
+  - `cargo test -p frp-client --no-default-features --all-targets --no-fail-fast` exits 101
+    with 313 passed / 2 failed: `test_e2e_tcp_proxy_over_websocket`
+    (`frp-client/tests/end_to_end.rs:105`, file contains zero `cfg(feature ...)`) fails on the
+    proxy-port wait (`:203`) and passes with `--no-default-features --features websocket`
+    (control: `--test end_to_end` with default features 7 passed / 0 failed); the other is
+    `plugin::static_file::tests::test_static_file_e2e_non_ascii_round_trip`
+    (`frp-client/src/plugin/static_file.rs:3420`, `EILSEQ`), which also fails with default
+    features (0 passed / 1 failed) — macOS-only, not this class.
+  Gating these and adding sibling runtime steps is its own change. **Done-when:** each
+  runtime-failing target carries its gate (or the configuration is documented as unsupported)
+  and a step runs it.
+- [ ] **`test_tcpmux_proxy_auth_interior_space_rejected_407` is a load-dependent flake,
+  independent of features, and can turn the default-feature suite red.** Assertion:
+  `frp-server/tests/tcpmux_httpconnect.rs:418` — `double-space credentials must be rejected:
+  200 (successHook) then 407, got: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"`. Measured
+  here: the single test run in isolation (`cargo test -p frp-server [--no-default-features
+  [--features tls,http-proxy,tcp-mux]] --test tcpmux_httpconnect
+  test_tcpmux_proxy_auth_interior_space_rejected_407`, 20 runs each) passed 20/20 in all three
+  configurations; the whole 4-test target (`... --test tcpmux_httpconnect`, 15 runs each)
+  failed in single-sample runs with `--no-default-features` (1/15), `--features
+  tls,http-proxy,tcp-mux` (3/15) and default features (3/15) — single samples under one load
+  state, not a ranking. What reproduces is qualitative: it fires in all three configurations
+  and never in isolation. Root cause: `frp-server/src/tcpmux.rs:569`
+  writes the 200 and `:592` the 407 in two separate `write_all` calls, while the helper
+  `read_full_response` (`frp-server/tests/tcpmux_httpconnect.rs:58-75`) stops after the first
+  `\r\n\r\n` and the 200 declares `Content-Length: 0`, so when the two responses land in
+  separate reads the buffer holds only the 200. Pre-existing. **Done-when:** the test tolerates
+  the split (or the server writes both responses in one buffer), so the default-feature suite
+  cannot go red on scheduling.
 - [ ] **`frpc-tiny`'s test targets do not compile either.** Evidence:
   `cargo check -p frp-client --no-default-features --features tls,tcp-mux --all-targets`
   — exactly the tiny tier for frp-client, measured `['tcp-mux','tls']` — exits 101 with
@@ -313,9 +435,15 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `tokio::io::AsyncWriteExt`) at `frp-client/src/visitor.rs:2900-2901`. `--all-targets` is
     required: those imports live in `#[cfg(all(test, feature = "vnet"))] mod tests`, and the
     bare command without it exits 0.
-  These three are **intra-crate** feature combinations — a different class from the
+  - `RUSTFLAGS="-D warnings" cargo check -p frp-core --no-default-features --features kcp --all-targets`
+    exits 101: `error: unused imports: 'AtomicU64' and 'AtomicUsize'` at
+    `frp-core/src/xtcp_session.rs:40` — every use of those two imports is inside `tcp-mux`-gated
+    code. Measured family: `--features kcp,stun`, `--features kcp,quic` and `--features vnet,kcp`
+    exit 101 with that same error, while `--features kcp,tcp-mux`, `--features kcp,stun,tcp-mux`
+    and `--features tcp-mux` exit 0.
+  These four are **intra-crate** feature combinations — a different class from the
   feature-unification defect fixed in `ConnectionType`, which was cross-crate. **Done-when:**
-  each of the three either compiles clean under `-D warnings` or the configuration is
+  each of the four either compiles clean under `-D warnings` or the configuration is
   documented as unsupported.
 - [ ] **Pre-existing: no query-parameter-count guard, so >10000 params diverge from Go.**
   Go's `parseQuery` opens with

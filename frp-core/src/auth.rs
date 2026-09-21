@@ -3038,6 +3038,9 @@ mod tests {
 
     /// Local capture server for OIDC token-endpoint requests. Parses the
     /// application/x-www-form-urlencoded body and exposes the form fields.
+    ///
+    /// Used only by the two `#[cfg(feature = "oidc")]` tests below.
+    #[cfg(feature = "oidc")]
     struct TokenEndpointCapture {
         _addr: std::net::SocketAddr,
         /// oneshot receiver receiving the form fields when the server
@@ -3045,6 +3048,7 @@ mod tests {
         rx: tokio::sync::oneshot::Receiver<std::collections::HashMap<String, String>>,
     }
 
+    #[cfg(feature = "oidc")]
     impl TokenEndpointCapture {
         async fn start() -> TokenEndpointCapture {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

@@ -1522,6 +1522,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compression")]
     fn test_compress_decompress_into_wire_equiv() {
         let data = b"compressible compressible compressible compressible data";
         // compress is deterministic → _into output must be byte-identical.

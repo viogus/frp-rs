@@ -425,6 +425,8 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    // Used only by `roundtrip_encrypted_compressed_wire_order` below.
+    #[cfg(feature = "compression")]
     const TEST_KEY: [u8; 16] = *b"0123456789abcdef";
 
     /// Roundtrip a large compressible payload through

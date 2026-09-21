@@ -1155,6 +1155,7 @@ mod tests {
     /// header and the whole proxy direction dies. Regression pin for the
     /// compressed-vhost pre_read bypass (H1).
     #[tokio::test]
+    #[cfg(feature = "compression")]
     async fn test_bridge_plain_compressed_pre_read_stream_integrity() {
         let (mut u_w_test, u_r_bridge) = tokio::io::duplex(256 * 1024);
         let (w_w_bridge, mut w_r_test) = tokio::io::duplex(256 * 1024);
@@ -1232,6 +1233,7 @@ mod tests {
     /// (Regression shape: a single `use_compression` bool would either
     /// double-decode the read side or stop compressing the write side.)
     #[tokio::test]
+    #[cfg(feature = "compression")]
     async fn test_bridge_plain_decompressed_read_direction_split() {
         let (mut u_w_test, u_r_bridge) = tokio::io::duplex(256 * 1024);
         let (w_w_bridge, mut w_r_test) = tokio::io::duplex(256 * 1024);
@@ -1309,6 +1311,7 @@ mod tests {
     /// decrypt/decompress it again, while its user→work write direction
     /// still compresses AND encrypts.
     #[tokio::test]
+    #[cfg(feature = "compression")]
     async fn test_bridge_encrypted_decompressed_read_direction_split() {
         let key = crate::encryption::derive_key("enc_decomp_read_key_a1");
 
@@ -1399,6 +1402,7 @@ mod tests {
     /// integrity through the full server-side stack (compress → encrypt).
     /// Same H1 pin as the plain variant, through bridge_encrypted.
     #[tokio::test]
+    #[cfg(feature = "compression")]
     async fn test_bridge_encrypted_compressed_pre_read_stream_integrity() {
         let key = crate::encryption::derive_key("enc_comp_pre_read_key_1");
 
@@ -2073,6 +2077,7 @@ mod tests {
 
     /// bridge_work_to_user: decompressor flush residual data.
     #[tokio::test]
+    #[cfg(feature = "compression")]
     async fn test_bridge_work_to_user_decompressor_flush() {
         use crate::encryption;
 
@@ -2442,6 +2447,7 @@ mod tests {
     /// burst), but raw-size charging would stall ~7 s. Limiter-accounting
     /// pin (T5): the compressed-chunk charge site.
     #[tokio::test]
+    #[cfg(feature = "compression")]
     async fn test_bridge_compressed_charges_compressed_size_not_raw() {
         let (mut u_w_test, u_r_bridge) = tokio::io::duplex(65536);
         let (w_w_bridge, mut w_r_test) = tokio::io::duplex(65536);
@@ -2522,6 +2528,7 @@ mod tests {
     /// ~the raw length). Limiter-accounting pin (T5): compressed path is
     /// rate-limited at all.
     #[tokio::test]
+    #[cfg(feature = "compression")]
     async fn test_bridge_compressed_rate_limited_throttles_incompressible() {
         let (mut u_w_test, u_r_bridge) = tokio::io::duplex(65536);
         let (w_w_bridge, mut w_r_test) = tokio::io::duplex(65536);

@@ -1,4 +1,10 @@
 //! Integration test: KCP dial → send → recv round-trip.
+//!
+//! The whole file is driven by `frp-core`'s `kcp` feature: it uses
+//! `dial_kcp`/`dial_kcp_with_driver`/`KcpListener` and the `data_shards`/
+//! `parity_shards` fields of `KcpConfig`, none of which exist in the
+//! feature-off stub module `frp_core::kcp` (frp-core/src/lib.rs:106).
+#![cfg(feature = "kcp")]
 
 use std::time::Duration;
 

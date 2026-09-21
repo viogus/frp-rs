@@ -94,6 +94,37 @@ jobs:
         # frp-core's tests/ are pure Rust<->Rust (no frps/frpc binaries), so
         # they belong with the unit lane and don't need the integration build.
         run: cargo test -p frp-core
+      - name: Run frp-core's tests and benches with no features (runtime half of frp-core's tier gate)
+        # The `verify` lane's `cargo check -p frp-core --no-default-features
+        # --all-targets` is compile-only: it type-checks the test targets but
+        # does not link or run them, so it cannot see a runtime failure in a
+        # test or bench that still compiles. This step is the runtime half **for
+        # frp-core** — not for the tier gates in general: the same class is live
+        # in frp-server's and frp-client's no-features test targets right now,
+        # measured and recorded in TODO.md, and neither crate has a runtime step.
+        #
+        # For frp-core this step is the only gate for two measured classes:
+        #   - eight frp-core lib tests (all in the compression path) failed with
+        #     `"compression not compiled"` while compiling clean — 597 passed /
+        #     8 failed;
+        #   - `frp-core/benches/crypto_bridge.rs` had no compression gate and
+        #     `bench_compression` unwraps `encryption::compress` at registration
+        #     time (outside `b.iter`), panicking the whole bench binary:
+        #     `thread 'main' panicked at frp-core/benches/crypto_bridge.rs:60:64:
+        #     called `Result::unwrap()` on an `Err` value: "compression not
+        #     compiled"`.
+        # Both now carry their `#[cfg(feature = ...)]` gates; this step keeps
+        # them gated. It lives in the unit lane rather than `verify` because
+        # that lane already pays the test-harness cost (it links and runs the
+        # same targets) and has a 25-minute budget.
+        #
+        # Measured after the gates: exits 0 with 609 tests passed / 0 failed and
+        # 124 criterion bench cases run (default features: 903 tests / 130 bench
+        # cases; --all-features: 917 / 130). Wall clock, macOS arm64: 5.39 s /
+        # 5.42 s / 5.51 s warm on three runs, 19.84 s with frp-core's lib, its
+        # 10 test targets and the bench touched (forced rebuild). The runner's
+        # cost — Linux, cold cache — was not measured.
+        run: cargo test -p frp-core --no-default-features --all-targets
 
   tests-server:
     name: Tests (server integration)
@@ -205,7 +236,7 @@ jobs:
         # chacha20,compression,default,http-proxy,kcp,oidc,quic,ssh,tcp-mux,tls,websocket
         # instead of [] — so --all-targets would silently drop the tier check for
         # those two crates, not extend it. The tier *test* targets are covered by
-        # the two isolated steps below instead.
+        # the three isolated steps below instead.
         run: cargo check --workspace --no-default-features --features tiny
         env:
           RUSTFLAGS: "-D warnings"
@@ -280,6 +311,49 @@ jobs:
         # frp-server's empty set just as much, but cannot change
         # `ConnectionType`'s shape.
         run: cargo check -p frp-server --no-default-features --all-targets
+        env:
+          RUSTFLAGS: "-D warnings"
+      - name: Check frp-core tier test targets compile (isolated, no features)
+        # The frp-core sibling of the two steps above: `-p frp-core` makes it
+        # the only root and frp-core's own features are at the micro set
+        # (none). Measured with `cargo check -p frp-core --no-default-features
+        # --all-targets -v`: every frp-core rustc invocation (the lib, the lib
+        # test, all 10 frp-core/tests/*.rs targets, and the
+        # frp-core/benches/crypto_bridge.rs bench) carries zero
+        # `--cfg feature=` flags, so nothing in this graph re-enables a
+        # frp-core feature. frp-core's dev-dependencies are all external
+        # crates (tokio with `test-util`, tower, criterion, proptest,
+        # tempfile — frp-core/Cargo.toml) and none depends back on frp-core,
+        # which is why `--all-targets` is safe here but not on the two
+        # `--workspace` tier steps above.
+        #
+        # What it proves: a feature-gated item referenced from frp-core's lib
+        # or test targets without its gate is a hard error under -D warnings —
+        # E0432/E0425 when the item is absent, unused_imports/dead_code when
+        # it is only conditionally used, and unused_mut for a binding whose
+        # only mutation is gated. Before this change the run exited 101 with 4
+        # failing units (lib test, kcp, xtcp_p2p, protocol_round14). What
+        # closes it: per-item `websocket` gates on the two `connect_ws_raw`
+        # lib tests (frp-core/src/transport/mod.rs), `oidc` on
+        # `TokenEndpointCapture` (frp-core/src/auth.rs), `compression` on
+        # `TEST_KEY` (frp-core/src/snappy_stream.rs), whole-file `kcp` gates on
+        # frp-core/tests/kcp.rs and frp-core/tests/xtcp_p2p.rs, and a
+        # restructured `all_message_variants` binding in
+        # frp-core/tests/protocol_round14.rs.
+        #
+        # Caveat, measured — the bound is on the code that is *compiled*, not
+        # on the targets. A whole-file-cfg'd target compiles to nothing: 6 of
+        # frp-core's 10 test targets are empty here — kcp.rs and xtcp_p2p.rs
+        # (#![cfg(feature = "kcp")]), mux.rs and yamux_rst.rs
+        # (#![cfg(feature = "tcp-mux")]), xtcp_quic_sni.rs
+        # (#![cfg(feature = "tls")]), ws_tls_stall.rs (#![cfg(all(feature =
+        # "tls", feature = "websocket"))]). `cargo test -p frp-core
+        # --no-default-features --test <t> -- --list` reports 0 tests for each,
+        # versus 4/12/13/3/2/1 with default features. A missing gate *inside*
+        # those six is not caught here; the other 4 targets (config_round14.rs
+        # 2 tests, protocol_round14.rs 4, proxy_auth.rs 3,
+        # v2_handshake_round14.rs 3) are compiled and checked in full.
+        run: cargo check -p frp-core --no-default-features --all-targets
         env:
           RUSTFLAGS: "-D warnings"
 
