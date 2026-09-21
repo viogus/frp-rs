@@ -218,9 +218,19 @@ jobs:
         # dev-dependency edge that re-enables its `default` features is out of
         # the graph and the crate is genuinely compiled with tls OFF. This is
         # the run that compiles frp-client's test targets — all 40 of
-        # frp-client/tests/*.rs, the tls-gated ones included — with -D warnings
-        # and tls OFF, so a missing #[cfg(feature = "tls")] gate on a tls-only
-        # item is a compile error here instead of a warning nothing promotes.
+        # frp-client/tests/*.rs — with -D warnings and tls OFF, so a missing
+        # #[cfg(feature = "tls")] gate on a tls-only item is a compile error
+        # here instead of a warning nothing promotes.
+        #
+        # Caveat, measured: 4 of those 40 targets are whole-file-cfg'd *empty*
+        # in this configuration, so nothing inside them is checked —
+        # plugin_h2.rs and peer_xff_registry_e2e.rs (#![cfg(feature = "tls")]),
+        # xtcp_pair_e2e.rs and xtcp_visitor_failure_e2e.rs
+        # (#![cfg(all(feature = "quic", feature = "kcp"))]). `cargo test
+        # -p frp-client --no-default-features --test <t> -- --list` reports 0
+        # tests for each of the four, versus 38 for plugin_http. A missing gate
+        # *inside* those four would not be caught here — which is exactly how
+        # plugin_h2's tls-vs-http2http bug hid (TODO.md).
         #
         # The rationale for why the two --workspace tier steps above cannot
         # carry --all-targets is recorded there, not duplicated here.
@@ -251,8 +261,8 @@ jobs:
         # it is the only frp-core feature that gated a ConnectionType variant
         # (the WebSocket variant was the enum's only #[cfg] item before this
         # change); the other nine features frp-core has on here disagree with
-        # frp-server's empty set just as much, but cannot change the enum's
-        # shape.
+        # frp-server's empty set just as much, but cannot change
+        # `ConnectionType`'s shape.
         run: cargo check -p frp-server --no-default-features --all-targets
         env:
           RUSTFLAGS: "-D warnings"

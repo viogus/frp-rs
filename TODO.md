@@ -184,7 +184,10 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   include `oidc` and tiny/micro both exclude `dashboard`, so no `frps` artifact has
   frp-core/oidc on with frp-server/oidc off. It *is* reachable from that `-p` invocation and
   from any downstream workspace that enables `frp-core/oidc` while leaving frp-server's
-  `oidc` off. **Done-when:** the gate on the `Oidc` variant is keyed to the same crate
+  `oidc` off — and that downstream must also enable frp-server's `dashboard` feature, since
+  the module itself is gated (`frp-server/src/lib.rs:5-6`). Measured counterexample to the
+  looser phrasing: `-p frps --no-default-features --features "tiny,dashboard"` has frp-core's
+  `oidc` off and frp-server's `oidc` off, and exits 0. **Done-when:** the gate on the `Oidc` variant is keyed to the same crate
   feature that gates its construction (or the variant stops being feature-gated the way
   `ConnectionType::WebSocket` was), the four unrelated errors are fixed, and the command
   above exits 0. Note this is the second instance of the class fixed in
@@ -279,7 +282,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   in this scope`, `E0432 unresolved imports frp_core::kcp::{dial_kcp, dial_kcp_with_driver,
   KcpListener}`, `E0425 cannot find function 'punch_udp_hole' in module frp_core::xtcp_p2p`.
   The `kcp`/`xtcp_p2p` integration tests and some lib tests have no `#[cfg]` gate for the
-  features they need. **Done-when:** each such test carries its gate, so the command exits 0
+  features they need. `protocol_round14` is a different case — a lint-only failure:
+  `unused_mut` at `frp-core/tests/protocol_round14.rs:24`, because the only mutation of that
+  binding, `v.extend(...)` at `:198`, is `vnet`-gated and `-D warnings` promotes the unused
+  `mut` to an error. **Done-when:** each such test carries its gate, so the command exits 0
   and the run can join the sibling isolated CI steps.
 - [ ] **`frpc-tiny`'s test targets do not compile either.** Evidence:
   `cargo check -p frp-client --no-default-features --features tls,tcp-mux --all-targets`
@@ -292,6 +298,30 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   provides `h2`/`http` (`http2http`), so the tiny test targets build and a
   `-p frp-client --no-default-features --features tls,tcp-mux --all-targets` step can be
   added.
+- [ ] **Other isolated `-p` configurations are red under `-D warnings` for an intra-crate
+  reason.** The two isolated CI steps are green only for the exact configurations they run.
+  Single-feature `-p` runs fail because an item gated on one feature is referenced only from
+  code gated on a *different* one, so enabling the first without the second leaves the item
+  dead — and `-D warnings` promotes dead code, unused imports and unused `mut` to errors.
+  Measured:
+  - `RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --features vnet --all-targets`
+    exits 101: `error: method 'remove_run_id_vnet_routes' is never used` at
+    `frp-server/src/state.rs:1876` — its only caller, `frp-server/src/ssh_gateway.rs:1987`,
+    is `ssh`-gated, so `vnet` without `ssh` leaves it dead.
+  - `RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --features quic`
+    exits 101 with two errors: `error: unused variable: 'quic_params'` at
+    `frp-client/src/nat_hole.rs:521` and `error: field 'quic_params' is never read` at
+    `frp-client/src/visitor.rs:371`.
+  - `RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --features vnet --all-targets`
+    exits 101 with two `unused import` errors (`tokio::io::AsyncReadExt`,
+    `tokio::io::AsyncWriteExt`) at `frp-client/src/visitor.rs:2900-2901`. `--all-targets` is
+    required: those imports live in `#[cfg(all(test, feature = "vnet"))] mod tests`, and the
+    bare command without it exits 0.
+  These are **intra-crate** feature combinations — a different class from the
+  feature-unification defect fixed in `ConnectionType`, which was cross-crate. **Done-when:**
+  each combination either compiles clean under `-D warnings` or the configuration is
+  documented as unsupported, so the "the isolated step checks the crate's own gates" doctrine
+  is not silently true of one configuration only.
 - [ ] **Pre-existing: no query-parameter-count guard, so >10000 params diverge from Go.**
   Go's `parseQuery` opens with
   `if !urlParamsWithinMax(strings.Count(query, "&") + 1) { return Values{}, err }`

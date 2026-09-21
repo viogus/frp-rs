@@ -260,9 +260,7 @@ check -p frp-core --no-default-features --all-targets` exits 101: the `kcp` and
 gate, the `frp-core` lib tests fail likewise, and `protocol_round14` fails on a
 lint alone (an unused `mut` whose only mutation, `v.extend(...)`, is
 `vnet`-gated, so `-D warnings` promotes `unused_mut` to an error).
-[`../TODO.md`](../TODO.md) tracks that gap and what would close it. (Compiling
-`frp-core`'s test targets in *feature-on* configurations is covered elsewhere —
-the clippy, `--lib` test and bench steps.)
+[`../TODO.md`](../TODO.md) tracks that gap and what would close it.
 
 This is the **no-features** configuration for frp-client — the micro tier — not the
 tiny one. frp-client's tiny set is `tls,tcp-mux`, and its test targets do not
