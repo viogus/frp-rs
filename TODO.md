@@ -356,8 +356,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   both exit 0 on the same targets, so nothing gates this:
   - `cargo test -p frp-server --no-default-features --all-targets --no-fail-fast` exits 101.
     The totals are run-dependent because one of the failures below is a flake: two runs here
-    measured 432 passed / 40 failed across 8 targets and 433 / 39 / 7, and the two reviewers
-    measured one sample each of those same two shapes. 39 failures are deterministic:
+    measured 432 passed / 40 failed across 8 targets and 433 / 39 / 7, and a reviewer sample
+    also reproduced the 433 / 39 / 7 shape. 39 failures are deterministic:
     34 are feature-gated behaviour:
     27 are the `http-proxy` stub — `tests/http_plugin.rs` 22 failed / 1 passed and
     `tests/http_plugin_ping.rs` 4 failed / 1 passed (both files contain zero `cfg(feature ...)`,
@@ -379,7 +379,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
       (`frp-server/tests/common/mod.rs:640`) — this worktree has no `target/debug/frps`.
     - The 40th failure in the larger sample is not a feature residue at all: it is the
       load-dependent flake in `tests/tcpmux_httpconnect.rs` tracked as its own item below,
-      which also fails with every feature on. It is why this breakdown says 39 deterministic
+      which also fails with default features. It is why this breakdown says 39 deterministic
       failures, not 40.
   - `cargo test -p frp-client --no-default-features --all-targets --no-fail-fast` exits 101
     with 313 passed / 2 failed: `test_e2e_tcp_proxy_over_websocket`
@@ -400,8 +400,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   [--features tls,http-proxy,tcp-mux]] --test tcpmux_httpconnect
   test_tcpmux_proxy_auth_interior_space_rejected_407`, 20 runs each) passed 20/20 in all three
   configurations; the whole 4-test target (`... --test tcpmux_httpconnect`, 15 runs each)
-  failed 1/15 with `--no-default-features`, 3/15 with `--features tls,http-proxy,tcp-mux`, and
-  3/15 with **default features** (every feature on). Root cause: `frp-server/src/tcpmux.rs:569`
+  failed in single-sample runs with `--no-default-features` (1/15), `--features
+  tls,http-proxy,tcp-mux` (3/15) and default features (3/15) — single samples under one load
+  state, not a ranking. What reproduces is qualitative: it fires in all three configurations
+  and never in isolation. Root cause: `frp-server/src/tcpmux.rs:569`
   writes the 200 and `:592` the 407 in two separate `write_all` calls, while the helper
   `read_full_response` (`frp-server/tests/tcpmux_httpconnect.rs:58-75`) stops after the first
   `\r\n\r\n` and the 200 declares `Content-Length: 0`, so when the two responses land in
