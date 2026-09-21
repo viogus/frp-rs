@@ -256,9 +256,10 @@ RUSTFLAGS="-D warnings" cargo check -p frp-core   --no-default-features --all-ta
 The `frp-core` step was added after the first two. `frp-core` is the only root
 there, so its own features are off — measured with `cargo check -p frp-core
 --no-default-features --all-targets -v`, every `frp-core` rustc invocation in
-that run (the lib, the lib test, and all 10 `frp-core/tests/*.rs` targets)
-carries zero `--cfg feature=` flags. `frp-core`'s dev-dependencies are all
-external crates (`frp-core/Cargo.toml`), none of which can depend back on it, so
+that run (the lib, the lib test, all 10 `frp-core/tests/*.rs` targets, and the
+`frp-core/benches/crypto_bridge.rs` bench) carries zero `--cfg feature=` flags.
+`frp-core`'s dev-dependencies are all external crates
+(`frp-core/Cargo.toml`), none of which can depend back on it, so
 no dev-dependency edge re-enables a feature of the crate under test. The run
 exits 0; before the gates landed it exited 101 with four failing units (lib test,
 `kcp`, `xtcp_p2p`, `protocol_round14`). It checks the same property as its two

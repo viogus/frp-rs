@@ -296,13 +296,30 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   gated `#[cfg(feature = "oidc")]` (`frp-core/src/auth.rs:3044`) and `TEST_KEY`
   `#[cfg(feature = "compression")]` (`frp-core/src/snappy_stream.rs:430`); `frp-core/tests/kcp.rs`
   and `frp-core/tests/xtcp_p2p.rs` carry whole-file `#![cfg(feature = "kcp")]` — measured, the
-  file's floor is `kcp` alone: `--features kcp,tcp-mux --all-targets` exits 0, and with a
-  throwaway `tcp-mux` gate on the two `AtomicU64`/`AtomicUsize` imports at
-  `frp-core/src/xtcp_session.rs:40` (the sole other blocker in that configuration)
-  `--features kcp --all-targets` also exits 0, so `tcp-mux`/`quic` are not folded into the
-  gate; `protocol_round14.rs` was restructured, not `allow`ed — the base vector is immutable
+  file's floor is `kcp` alone: `--features kcp,tcp-mux --all-targets` exits 0, and
+  `--features kcp --all-targets` also exits 0 once the two `AtomicU64`/`AtomicUsize` imports
+  at `frp-core/src/xtcp_session.rs:40` are gated — that import error is the only thing that
+  makes `--features kcp --all-targets` red in-tree (it is listed under the measured-red `-p`
+  entry below), so `tcp-mux`/`quic` are not folded into the gate; `protocol_round14.rs` was
+  restructured, not `allow`ed — the base vector is immutable
   and the `vnet`-gated extend rebuilds it into a `mut` local, so `mut` exists exactly where
-  the mutation does. New CI step `Check frp-core tier test targets compile (isolated, no
+  the mutation does. The same missing-gate class then showed up at **runtime**: `cargo test
+  -p frp-core --no-default-features` exited 101 with 597 passed / 8 failed, every failure
+  `"compression not compiled"` — eight tests drive the compression path but had no gate, and
+  now carry `#[cfg(feature = "compression")]`: seven in `frp-core/src/bridge.rs`
+  (`test_bridge_plain_compressed_pre_read_stream_integrity`,
+  `test_bridge_plain_decompressed_read_direction_split`,
+  `test_bridge_encrypted_decompressed_read_direction_split`,
+  `test_bridge_encrypted_compressed_pre_read_stream_integrity`,
+  `test_bridge_work_to_user_decompressor_flush`,
+  `test_bridge_compressed_charges_compressed_size_not_raw`,
+  `test_bridge_compressed_rate_limited_throttles_incompressible`) and
+  `test_compress_decompress_into_wire_equiv` in `frp-core/src/encryption.rs`. Each calls a
+  compression API that returns `Err("compression not compiled")` without the feature, so the
+  gate is intrinsic rather than a way to silence a flake. Measured after: that command exits 0
+  (597 lib tests passed, 0 failed; 609 passed / 2 ignored across all targets), and
+  `--no-default-features --features compression` exits 0 with 652 lib tests passed (664
+  across all targets). New CI step `Check frp-core tier test targets compile (isolated, no
   features)` in `.github/workflows/ci.yml`, and `docs/developing.md § Binary Variants`
   describes what it does and does not prove. Not covered by that step: 6 of frp-core's 10 test
   targets are whole-file-cfg'd *empty* in the no-features configuration (`kcp.rs`,
@@ -333,9 +350,15 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `tokio::io::AsyncWriteExt`) at `frp-client/src/visitor.rs:2900-2901`. `--all-targets` is
     required: those imports live in `#[cfg(all(test, feature = "vnet"))] mod tests`, and the
     bare command without it exits 0.
-  These three are **intra-crate** feature combinations — a different class from the
+  - `RUSTFLAGS="-D warnings" cargo check -p frp-core --no-default-features --features kcp --all-targets`
+    exits 101: `error: unused imports: 'AtomicU64' and 'AtomicUsize'` at
+    `frp-core/src/xtcp_session.rs:40` — every use of those two imports is inside `tcp-mux`-gated
+    code. Measured family: `--features kcp,stun`, `--features kcp,quic` and `--features vnet,kcp`
+    exit 101 with that same error, while `--features kcp,tcp-mux`, `--features kcp,stun,tcp-mux`
+    and `--features tcp-mux` exit 0.
+  These four are **intra-crate** feature combinations — a different class from the
   feature-unification defect fixed in `ConnectionType`, which was cross-crate. **Done-when:**
-  each of the three either compiles clean under `-D warnings` or the configuration is
+  each of the four either compiles clean under `-D warnings` or the configuration is
   documented as unsupported.
 - [ ] **Pre-existing: no query-parameter-count guard, so >10000 params diverge from Go.**
   Go's `parseQuery` opens with

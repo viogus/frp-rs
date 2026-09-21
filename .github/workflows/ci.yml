@@ -205,7 +205,7 @@ jobs:
         # chacha20,compression,default,http-proxy,kcp,oidc,quic,ssh,tcp-mux,tls,websocket
         # instead of [] — so --all-targets would silently drop the tier check for
         # those two crates, not extend it. The tier *test* targets are covered by
-        # the two isolated steps below instead.
+        # the three isolated steps below instead.
         run: cargo check --workspace --no-default-features --features tiny
         env:
           RUSTFLAGS: "-D warnings"
@@ -287,7 +287,8 @@ jobs:
         # the only root and frp-core's own features are at the micro set
         # (none). Measured with `cargo check -p frp-core --no-default-features
         # --all-targets -v`: every frp-core rustc invocation (the lib, the lib
-        # test, and all 10 frp-core/tests/*.rs targets) carries zero
+        # test, all 10 frp-core/tests/*.rs targets, and the
+        # frp-core/benches/crypto_bridge.rs bench) carries zero
         # `--cfg feature=` flags, so nothing in this graph re-enables a
         # frp-core feature. frp-core's dev-dependencies are all external
         # crates (tokio with `test-util`, tower, criterion, proptest,
