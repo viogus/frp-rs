@@ -10,11 +10,23 @@
 //! - an unterminated (truncated) request head — head-deadline expiry or
 //!   mid-head close — is never parsed or forwarded: the connection closes
 //!   with no response bytes (audit round 8 F7)
+//!
+//! Two cases here drive a real rustls handshake
+//! (`test_tls_sni_peek_short_read_replays_bytes` and
+//! `test_https_declared_response_headers_tls_handshake_completes`), so those
+//! tests plus the `https_proxy` / `NoVerify` helpers they share are gated on
+//! this crate's `tls` feature — the remaining (plain-HTTP) cases stay
+//! compiled, and therefore checked, with `tls` off.
 
 mod common;
 
+// `Read`/`Write` (the rustls `Reader`/`Writer` std traits) and `Arc` are
+// referenced only by the tls-gated cases below; gating the imports keeps this
+// file warning-free with `tls` off as well as on.
+#[cfg(feature = "tls")]
 use std::io::{Read, Write};
 use std::net::SocketAddr;
+#[cfg(feature = "tls")]
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -66,6 +78,7 @@ fn http_proxy(
     }
 }
 
+#[cfg(feature = "tls")]
 fn https_proxy(name: &str, domains: Vec<String>) -> NewProxy {
     NewProxy {
         proxy_type: "https".into(),
@@ -482,9 +495,11 @@ async fn test_vhost_body_cannot_carry_authorization() {
 
 /// TLS certificate verifier that accepts any certificate (the server uses
 /// an auto-generated self-signed cert).
+#[cfg(feature = "tls")]
 #[derive(Debug)]
 struct NoVerify;
 
+#[cfg(feature = "tls")]
 impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerify {
     fn verify_server_cert(
         &self,
@@ -529,6 +544,7 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 }
 
+#[cfg(feature = "tls")]
 #[tokio::test]
 async fn test_tls_sni_peek_short_read_replays_bytes() {
     // The rustls crypto provider must be installed for this test binary
@@ -1635,6 +1651,7 @@ async fn test_vhost_connect_response_headers_not_injected_into_tunnel() {
 /// established. The pin: a full rustls handshake through the https leg
 /// (backend = real rustls server on the pooled work conn) plus a plaintext
 /// echo.
+#[cfg(feature = "tls")]
 #[tokio::test]
 async fn test_https_declared_response_headers_tls_handshake_completes() {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();

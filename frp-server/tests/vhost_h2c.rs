@@ -8,6 +8,10 @@
 //! - chunked backend responses decoded before reaching the h2 client
 //! - POST bodies forwarded (chunked framing when there is no Content-Length)
 //! - unmapped hosts get an HTTP/2 404
+//!
+//! The h2 client used to drive these tests is `dep:h2`, which only enters the
+//! build under this crate's `http-proxy` feature.
+#![cfg(feature = "http-proxy")]
 
 mod common;
 

@@ -243,12 +243,13 @@ tls, websocket]`.
 `--all-targets` there would therefore drop the tier coverage for those two
 crates, not extend it.
 
-The tier **test** targets are compiled by one isolated check instead, where
-`-p` makes the crate the only root and the dev-dependency edge cannot reopen
-its defaults:
+The tier **test** targets are compiled by two sibling isolated checks instead,
+where `-p` makes the crate the only root and the dev-dependency edge cannot
+reopen its defaults:
 
 ```bash
 RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --all-targets
+RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --all-targets
 ```
 
 This is the **no-features** configuration for frp-client — the micro tier — not the
@@ -266,13 +267,55 @@ unused import) under `-D warnings`. With the gates present they are excluded
 and the run is clean — the `tls`-on path of the same tests is compiled by the
 `Lint` lane's `--all-targets --all-features` clippy.
 
-Not covered by any CI step: `frp-server`'s `tls`-off test targets. The
-symmetric `cargo check -p frp-server --no-default-features --all-targets` does
-not compile at all — `error[E0004]` at `frp-server/src/service.rs:1842`,
-because feature unification gives `frp-core` the `WebSocket` variant while
-frp-server's own `websocket` feature is off, leaving the `match`
-non-exhaustive. [`../TODO.md`](../TODO.md) records the gap and what would close
-it; `frp-server`'s tier library graph is still covered by the two workspace
+The frp-server sibling compiles `frp-server`'s test targets with **frp-server's
+own features at the micro set — none of `tls`, `websocket`, `ssh`, `kcp`,
+`quic`, `oidc`, `http-proxy`, `compression`, `chacha20`, `tcp-mux`**. What it
+proves is that every `#[cfg(feature = ...)]` in `frp-server`'s lib and test
+targets is complete for that configuration: an optional item referenced without
+its gate is a compile error (or an unused import) under `-D warnings` here
+instead of a warning nothing promotes.
+
+What it does **not** prove, and why it is still meaningful: `frp-core` in that
+graph is compiled with *most* of its features, not with them off.
+`frp-server`'s dev-dependency on `frp-client` (default features,
+`frp-server/Cargo.toml`) pulls `frp-client`'s `default` set in, and that
+forwards `frp-core/websocket`, `frp-core/tls`, and the rest — measured,
+`frp-core`'s enabled set in that graph is exactly
+
+```
+chacha20 compression http-client kcp oidc quic stun tcp-mux tls websocket
+```
+
+ten features; `vnet`, `admin-auth`, `mem-profile`, `profiling`, `debug-logs`
+and `otel` are off. So `frp-core` can hand `frp-server` a type, variant or
+function that frp-server's matching feature does not know about. That mismatch
+is exactly what this step exercises: `ConnectionType::WebSocket` exists in
+`frp-core` regardless of frp-server's feature set (it is deliberately **not**
+feature-gated — see the doc comment on the variant in
+`frp-core/src/transport/mod.rs`), so `frp-server/src/service.rs`'s `match` has
+an unconditional arm whose body is gated per feature. Before that fix the run
+failed with `error[E0004]` — non-exhaustive patterns,
+`ConnectionType::WebSocket` not covered.
+
+That asymmetry between the two crates' features is why this class of bug is
+configuration-specific rather than systematic. `frp-client`'s `default` does
+forward `frp-core/websocket`, so the variant exists in `frp-core` while
+frp-server's own `websocket` is off — but it does **not** forward
+`frp-core/vnet` (`frp-client`'s `vnet` is opt-in), so frp-core's `vnet` and
+frp-server's `vnet` are off in lockstep and cannot disagree. `websocket` is the
+feature frp-client enables by default and frp-server does not, which is why
+`ConnectionType::WebSocket` is the variant that broke.
+
+The step therefore checks frp-server's **own** gates, not frp-core's: a missing
+`#[cfg(feature = "tls")]` on a tls-only item in frp-server is caught, while
+frp-core's feature-off configuration is not compiled by this step at all (the
+two `--workspace` tier checks above are what cover frp-core in a genuinely
+small graph). The two TLS-driving cases in `frp-server/tests/vhost_audit_fixes.rs`
+and the whole of `frp-server/tests/vhost_h2c.rs` carry `#[cfg(feature = "tls")]`
+/ `#![cfg(feature = "http-proxy")]` respectively, so the rest of the first file
+stays compiled — and therefore checked — with `tls` off; the `tls`-on path of
+all of them is compiled by the `Lint` lane's `--all-targets --all-features`
+clippy. `frp-server`'s tier library graph is also covered by the two workspace
 checks above.
 
 ### Feature Flags

@@ -141,7 +141,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `cargo check -p frp-client --no-default-features --all-targets`, where `-p` makes the crate
   the only root so the dev-dependency edge cannot reopen its defaults, and
   `docs/developing.md § Binary Variants` states exactly which targets each step covers.
-- [ ] `frp-server`'s `tls`-off test targets still have no gate: the symmetric
+- [x] `frp-server`'s `tls`-off test targets still have no gate: the symmetric
   `cargo check -p frp-server --no-default-features --all-targets` does not compile.
   `error[E0004]` at `frp-server/src/service.rs:1842` — `ConnectionType::WebSocket` is not
   covered, because feature unification gives `frp-core` the variant (through frp-client's
@@ -150,6 +150,24 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   the unbuilt transport (or the variant is otherwise made unreachable under feature
   unification), and the isolated `-p frp-server` step joins the `-p frp-client` one in
   `ci.yml`.
+  Done: `ConnectionType::WebSocket` is no longer feature-gated in
+  `frp-core/src/transport/mod.rs`, so the variant always exists and frp-server's `match` is
+  exhaustive by construction. The `b'G' => ConnectionType::WebSocket` *detection* arm keeps
+  its `#[cfg(feature = "websocket")]`, so a websocket-off frp-core still classifies `G` as
+  `V1(b'G')`: shipped micro/tiny byte behaviour is unchanged, and that build cannot
+  construct the variant. `service.rs`'s arm is now unconditional with a
+  `#[cfg(feature = "websocket")]` call to `handle_websocket_connection` and a
+  `#[cfg(not(feature = "websocket"))]` warn-and-drop body. The blanket `_ =>` alternative
+  was rejected: it would silently swallow any *future* `ConnectionType` variant in a
+  websocket-off build. `ci.yml`'s `verify` job now runs
+  `RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --all-targets`
+  beside the `-p frp-client` step. The E0004 was the only error that configuration
+  reported — but also the only one it *reached*; with it closed the run exposed two more,
+  now fixed: `frp-server/tests/vhost_audit_fixes.rs` needed per-item `tls` gates (the two
+  rustls-driving tests, the `https_proxy`/`NoVerify` helpers they share, and the
+  `Read`/`Write`/`Arc` imports) and `frp-server/tests/vhost_h2c.rs` a whole-file
+  `#![cfg(feature = "http-proxy")]` (it is entirely driven by `dep:h2`).
+  `docs/developing.md § Binary Variants` states what the new step does and does not prove.
 
 **The SSH readiness fix (#344) left two sites and one unbounded case.**
 - [x] Two SSH-gateway tests still connect with a bare `.unwrap()` and no readiness wait.
