@@ -252,6 +252,14 @@ RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --all-ta
 RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --all-targets
 ```
 
+**Scope: those two cover `frp-client`'s and `frp-server`'s test targets only.**
+`frp-core`'s test targets are covered by **no** CI step and do not compile in
+that configuration — `RUSTFLAGS="-D warnings" cargo check -p frp-core
+--no-default-features --all-targets` exits 101 (the `kcp`, `xtcp_p2p` and
+`protocol_round14` integration tests and some lib tests have no `#[cfg]` gate
+for the features they need). [`../TODO.md`](../TODO.md) tracks that gap and what
+would close it.
+
 This is the **no-features** configuration for frp-client — the micro tier — not the
 tiny one. frp-client's tiny set is `tls,tcp-mux`, and its test targets do not
 currently build (`plugin_h2` is gated on `tls` alone but needs `http2http`'s
@@ -286,25 +294,29 @@ forwards `frp-core/websocket`, `frp-core/tls`, and the rest — measured,
 chacha20 compression http-client kcp oidc quic stun tcp-mux tls websocket
 ```
 
-ten features; `vnet`, `admin-auth`, `mem-profile`, `profiling`, `debug-logs`
-and `otel` are off. So `frp-core` can hand `frp-server` a type, variant or
-function that frp-server's matching feature does not know about. That mismatch
-is exactly what this step exercises: `ConnectionType::WebSocket` exists in
-`frp-core` regardless of frp-server's feature set (it is deliberately **not**
-feature-gated — see the doc comment on the variant in
-`frp-core/src/transport/mod.rs`), so `frp-server/src/service.rs`'s `match` has
-an unconditional arm whose body is gated per feature. Before that fix the run
-failed with `error[E0004]` — non-exhaustive patterns,
-`ConnectionType::WebSocket` not covered.
+ten features; six further features are off (`vnet`, `admin-auth`,
+`mem-profile`, `profiling`, `debug-logs`, `otel`), `default` aside — `default`
+itself is not activated either, since both `frp-server` and `frp-client` depend
+on `frp-core` with `default-features = false`. So `frp-core` can hand
+`frp-server` a type, variant or function that frp-server's matching feature does
+not know about. That mismatch is exactly what this step exercises:
+`ConnectionType::WebSocket` exists in `frp-core` regardless of frp-server's
+feature set (it is deliberately **not** feature-gated — see the doc comment on
+the variant in `frp-core/src/transport/mod.rs`), so
+`frp-server/src/service.rs`'s `match` has an unconditional arm whose body is
+gated per feature. Before that fix the run failed with `error[E0004]` —
+non-exhaustive patterns, `ConnectionType::WebSocket` not covered.
 
-That asymmetry between the two crates' features is why this class of bug is
-configuration-specific rather than systematic. `frp-client`'s `default` does
-forward `frp-core/websocket`, so the variant exists in `frp-core` while
-frp-server's own `websocket` is off — but it does **not** forward
-`frp-core/vnet` (`frp-client`'s `vnet` is opt-in), so frp-core's `vnet` and
-frp-server's `vnet` are off in lockstep and cannot disagree. `websocket` is the
-feature frp-client enables by default and frp-server does not, which is why
-`ConnectionType::WebSocket` is the variant that broke.
+Why this broke on `websocket` and not on the other nine features `frp-core` has
+on: `websocket` is the only `frp-core` feature that gated a variant of
+`ConnectionType` — before this change the `WebSocket` variant was the only
+`#[cfg]`-gated item inside that enum. The
+other features on in this graph (`tls`, `kcp`, `quic`, `oidc`, `compression`,
+`chacha20`, `tcp-mux`, `http-client`, `stun`) disagree with frp-server's empty
+set just as much, but none of them changes the shape of the enum a dependent
+crate matches on, so none of them can make a `match` non-exhaustive. That is why
+the fix belongs on the type — the variant now always exists, so exhaustiveness
+no longer depends on the two crates' feature sets agreeing.
 
 The step therefore checks frp-server's **own** gates, not frp-core's: a missing
 `#[cfg(feature = "tls")]` on a tls-only item in frp-server is caught, while

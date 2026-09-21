@@ -217,10 +217,10 @@ jobs:
         # `-p frp-client` makes frp-client the only root, so the sibling
         # dev-dependency edge that re-enables its `default` features is out of
         # the graph and the crate is genuinely compiled with tls OFF. This is
-        # the run that compiles frp-client's test targets — the lib test module
-        # and tests/plugin_http.rs — with -D warnings and tls OFF, so a missing
-        # #[cfg(feature = "tls")] gate on a tls-only item is a compile error
-        # here instead of a warning nothing promotes.
+        # the run that compiles frp-client's test targets — all 40 of
+        # frp-client/tests/*.rs, the tls-gated ones included — with -D warnings
+        # and tls OFF, so a missing #[cfg(feature = "tls")] gate on a tls-only
+        # item is a compile error here instead of a warning nothing promotes.
         #
         # The rationale for why the two --workspace tier steps above cannot
         # carry --all-targets is recorded there, not duplicated here.
@@ -239,16 +239,20 @@ jobs:
         # pulls frp-client's defaults, which forward frp-core/websocket, tls,
         # kcp, ... — measured, frp-core has 10 features on here (chacha20,
         # compression, http-client, kcp, oidc, quic, stun, tcp-mux, tls,
-        # websocket) and 6 off (vnet, admin-auth, mem-profile, profiling,
-        # debug-logs, otel).
+        # websocket), six further features off (vnet, admin-auth, mem-profile,
+        # profiling, debug-logs, otel), and `default` itself off too (both
+        # frp-server and frp-client take frp-core with default-features = false).
         # That is precisely why it is a useful gate for *frp-server's own*
         # #[cfg] gates: frp-core can hand frp-server a type/variant that
         # frp-server's matching feature does not know about, so every `match`
         # on such a type must stay exhaustive by construction rather than by
         # feature coincidence (see ConnectionType::WebSocket in
-        # frp-core/src/transport/mod.rs). The asymmetry is configuration-
-        # specific: frp-client's defaults forward frp-core/websocket but not
-        # frp-core/vnet, so only websocket can disagree between the two crates.
+        # frp-core/src/transport/mod.rs). websocket is the one that bit because
+        # it is the only frp-core feature that gated a ConnectionType variant
+        # (the WebSocket variant was the enum's only #[cfg] item before this
+        # change); the other nine features frp-core has on here disagree with
+        # frp-server's empty set just as much, but cannot change the enum's
+        # shape.
         run: cargo check -p frp-server --no-default-features --all-targets
         env:
           RUSTFLAGS: "-D warnings"

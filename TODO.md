@@ -168,6 +168,27 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `Read`/`Write`/`Arc` imports) and `frp-server/tests/vhost_h2c.rs` a whole-file
   `#![cfg(feature = "http-proxy")]` (it is entirely driven by `dep:h2`).
   `docs/developing.md § Binary Variants` states what the new step does and does not prove.
+- [ ] **The same feature-unification defect class survives elsewhere: `AuthMethod::Oidc` in
+  `dashboard.rs`.** `frp-core`'s `AuthMethod::Oidc` carries `#[cfg(feature = "oidc")]`
+  (`frp-core/src/auth.rs:206`) while `frp-server/src/dashboard.rs:2344` matches it under
+  `#[cfg(feature = "oidc")]` — frp-server's own feature. With frp-core's `oidc` on and
+  frp-server's off the `match` is non-exhaustive. Evidence:
+  `RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --features dashboard --all-targets`
+  exits 101 with `error[E0004]: non-exhaustive patterns: 'AuthMethod::Oidc' not covered` at
+  `frp-server/src/dashboard.rs:2344:28`, plus four unrelated pre-existing errors in the same
+  configuration: `E0425 cannot find type 'TcpListener'` (`dashboard.rs:185`), `E0425 cannot
+  find type 'TcpStream'` (`dashboard.rs:189`), `E0433 cannot find module or crate 'io'`
+  (`dashboard.rs:206`) and `unused import: 'AtomicU64'` (`dashboard.rs:21`) — all five must
+  be fixed before any CI step can gate this configuration. **Not reachable from a shipped
+  binary:** the three `[[bin]]` targets require `full`, `tiny` or `micro`; `full`/default
+  include `oidc` and tiny/micro both exclude `dashboard`, so no `frps` artifact has
+  frp-core/oidc on with frp-server/oidc off. It *is* reachable from that `-p` invocation and
+  from any downstream workspace that enables `frp-core/oidc` while leaving frp-server's
+  `oidc` off. **Done-when:** the gate on the `Oidc` variant is keyed to the same crate
+  feature that gates its construction (or the variant stops being feature-gated the way
+  `ConnectionType::WebSocket` was), the four unrelated errors are fixed, and the command
+  above exits 0. Note this is the second instance of the class fixed in
+  `frp-core/src/transport/mod.rs` — the fix there was per-variant, not systematic.
 
 **The SSH readiness fix (#344) left two sites and one unbounded case.**
 - [x] Two SSH-gateway tests still connect with a bare `.unwrap()` and no readiness wait.
@@ -254,12 +275,12 @@ agent commits), which matters because the *reason* for two reviewers is that no 
 - [ ] **`frp-core`'s test targets do not compile with no features.** Evidence:
   `cargo check -p frp-core --no-default-features --all-targets` exits 101 —
   `could not compile frp-core (lib test) due to 2 previous errors`, `(test "kcp") due to 3`,
-  `(test "xtcp_p2p") due to 20`; sample errors `E0425 cannot find function 'connect_ws_raw'
+  `(test "xtcp_p2p") due to 20`, `(test "protocol_round14") due to 1`; sample errors `E0425 cannot find function 'connect_ws_raw'
   in this scope`, `E0432 unresolved imports frp_core::kcp::{dial_kcp, dial_kcp_with_driver,
   KcpListener}`, `E0425 cannot find function 'punch_udp_hole' in module frp_core::xtcp_p2p`.
   The `kcp`/`xtcp_p2p` integration tests and some lib tests have no `#[cfg]` gate for the
   features they need. **Done-when:** each such test carries its gate, so the command exits 0
-  and the run can join the `-p frp-client` isolated CI step.
+  and the run can join the sibling isolated CI steps.
 - [ ] **`frpc-tiny`'s test targets do not compile either.** Evidence:
   `cargo check -p frp-client --no-default-features --features tls,tcp-mux --all-targets`
   — exactly the tiny tier for frp-client, measured `['tcp-mux','tls']` — exits 101 with
