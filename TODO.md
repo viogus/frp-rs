@@ -186,8 +186,9 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   from any downstream workspace that enables `frp-core/oidc` while leaving frp-server's
   `oidc` off — and that downstream must also enable frp-server's `dashboard` feature, since
   the module itself is gated (`frp-server/src/lib.rs:5-6`). Measured counterexample to the
-  looser phrasing: `-p frps --no-default-features --features "tiny,dashboard"` has frp-core's
-  `oidc` off and frp-server's `oidc` off, and exits 0. **Done-when:** the gate on the `Oidc` variant is keyed to the same crate
+  looser phrasing: `-p frp-server --no-default-features --all-targets` has frp-core's `oidc`
+  **on** (via the dev-dependency edge) with frp-server's own features at none, and exits 0,
+  because frp-server's `dashboard` is off so the `match` is not compiled at all. **Done-when:** the gate on the `Oidc` variant is keyed to the same crate
   feature that gates its construction (or the variant stops being feature-gated the way
   `ConnectionType::WebSocket` was), the four unrelated errors are fixed, and the command
   above exits 0. Note this is the second instance of the class fixed in
@@ -298,12 +299,12 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   provides `h2`/`http` (`http2http`), so the tiny test targets build and a
   `-p frp-client --no-default-features --features tls,tcp-mux --all-targets` step can be
   added.
-- [ ] **Other isolated `-p` configurations are red under `-D warnings` for an intra-crate
-  reason.** The two isolated CI steps are green only for the exact configurations they run.
-  Single-feature `-p` runs fail because an item gated on one feature is referenced only from
-  code gated on a *different* one, so enabling the first without the second leaves the item
-  dead — and `-D warnings` promotes dead code, unused imports and unused `mut` to errors.
-  Measured:
+- [ ] **Three measured isolated `-p` configurations are red under `-D warnings`.** These three
+  are red; single-feature `-p` runs are **not** uniformly red — 7 of the 8 measured
+  `frp-client` ones exit 0 (`chacha20`, `compression`, `tcp-mux`, `websocket`, `oidc`,
+  `admin`, `profiling`), only `quic` is red among them, and
+  `--features chacha20 --all-targets` exits 0 too, identical in shape to the two isolated CI
+  steps. Measured:
   - `RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --features vnet --all-targets`
     exits 101: `error: method 'remove_run_id_vnet_routes' is never used` at
     `frp-server/src/state.rs:1876` — its only caller, `frp-server/src/ssh_gateway.rs:1987`,
@@ -317,11 +318,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `tokio::io::AsyncWriteExt`) at `frp-client/src/visitor.rs:2900-2901`. `--all-targets` is
     required: those imports live in `#[cfg(all(test, feature = "vnet"))] mod tests`, and the
     bare command without it exits 0.
-  These are **intra-crate** feature combinations — a different class from the
+  These three are **intra-crate** feature combinations — a different class from the
   feature-unification defect fixed in `ConnectionType`, which was cross-crate. **Done-when:**
-  each combination either compiles clean under `-D warnings` or the configuration is
-  documented as unsupported, so the "the isolated step checks the crate's own gates" doctrine
-  is not silently true of one configuration only.
+  each of the three either compiles clean under `-D warnings` or the configuration is
+  documented as unsupported.
 - [ ] **Pre-existing: no query-parameter-count guard, so >10000 params diverge from Go.**
   Go's `parseQuery` opens with
   `if !urlParamsWithinMax(strings.Count(query, "&") + 1) { return Values{}, err }`
