@@ -31,15 +31,21 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use common::{allocate_port, test_auth_cfg};
 use frp_core::config::ServerConfig;
+// `dial_server`/`DialOptions`, `PathBuf` and `test_cert_dir` are referenced
+// only by the two `tls`-gated cases at the end of the file; gating them keeps
+// this file warning-free with `tls` off as well as on.
+#[cfg(feature = "tls")]
 use frp_core::transport::{dial_server, DialOptions};
 use frp_server::service::Service;
+#[cfg(feature = "tls")]
+use std::path::PathBuf;
 use tokio::io::AsyncReadExt;
 
+#[cfg(feature = "tls")]
 fn test_cert_dir() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop(); // workspace root
@@ -285,6 +291,18 @@ async fn yamux_ponging_client_still_dropped_at_post_handshake_deadline() {
 /// TLS handshake completes and the yamux stream opens (tcp_mux on),
 /// then silence: the post-yamux V2-magic read on the TLS+yamux path
 /// must be bounded by the 30s post-handshake deadline.
+///
+/// `tls` floor, measured: with this gate removed, `cargo test -p frp-server
+/// --no-default-features --test slowloris` exits 101 with `TLS dial:
+/// Transport(Other("TLS connect: Connection reset by peer (os error 54)"))`
+/// from the `expect("TLS dial")` this gate guards
+/// (frp-server/tests/slowloris.rs:335 in this tree), because frp-server's `tls`
+/// feature is what builds the acceptor (frp-server/src/service.rs:312) and the
+/// `not(feature = "tls")` handler only warns `TLS connection from {} but TLS
+/// feature not enabled` and drops (frp-server/src/handlers/transport.rs:669).
+/// With `--no-default-features --features tls`, this target is 5 passed /
+/// 0 failed.
+#[cfg(feature = "tls")]
 #[tokio::test]
 async fn tls_yamux_client_silent_after_stream_open_dropped_at_post_handshake_deadline() {
     let bind_port = allocate_port();
@@ -327,6 +345,12 @@ async fn tls_yamux_client_silent_after_stream_open_dropped_at_post_handshake_dea
 /// TLS handshake completes (tcp_mux off), then silence: the post-TLS
 /// V2-magic `read_exact` must be bounded by the 30s post-handshake
 /// deadline.
+///
+/// `tls` floor: same TLS dial as the case above; measured with this gate
+/// removed, `TLS dial: Transport(Other("TLS connect: Connection reset by peer
+/// (os error 54)"))` from the `expect("TLS dial")` this gate guards
+/// (frp-server/tests/slowloris.rs:383 in this tree).
+#[cfg(feature = "tls")]
 #[tokio::test]
 async fn tls_client_silent_after_handshake_dropped_at_post_handshake_deadline() {
     let bind_port = allocate_port();

@@ -10,10 +10,21 @@ use common::{
     allocate_port, login_with_test_token, raw_login_resp, start_test_server, test_auth_cfg,
     TEST_TOKEN,
 };
-use frp_core::transport::{dial_server, DialOptions, IoStream, TransportProtocol};
+// `dial_server`/`DialOptions` are referenced only by the `tls`- and
+// `websocket`-gated dial cases at the end of the file, `TransportProtocol` and
+// `PathBuf`/`test_cert_dir` by exactly one of them each; gating the imports
+// and the helper keeps this file warning-free with those features off as well
+// as on.
+use frp_core::transport::IoStream;
+#[cfg(feature = "websocket")]
+use frp_core::transport::TransportProtocol;
+#[cfg(any(feature = "tls", feature = "websocket"))]
+use frp_core::transport::{dial_server, DialOptions};
 use frp_server::service::Service;
+#[cfg(feature = "tls")]
 use std::path::PathBuf;
 
+#[cfg(feature = "tls")]
 fn test_cert_dir() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop(); // workspace root
@@ -646,6 +657,19 @@ Connection: close\r\n\
 // WebSocket transport
 // ---------------------------------------------------------------
 
+// `websocket` floor, measured: with this gate removed, `cargo test
+// -p frp-server --no-default-features --test server_protocol` exits 101 with
+// `WS dial: Transport(Other("WS raw connect read: Connection reset by peer
+// (os error 54)"))` from the `expect("WS dial")` this gate guards
+// (frp-server/tests/server_protocol.rs:691 in this tree). The gate is on
+// frp-server's own `websocket`: frp-core's is ON in this graph (frp-server's
+// dev-dependency on frp-client pulls it in), so `detect_and_strip_magic`
+// returns `ConnectionType::WebSocket` and the `not(feature = "websocket")` arm
+// warns `WebSocket connection from {} but WebSocket feature not enabled,
+// dropping` and drops the connection (frp-server/src/service.rs:1909, arm at
+// :1876). With `--no-default-features --features websocket`, this case is
+// 1 passed / 0 failed.
+#[cfg(feature = "websocket")]
 #[tokio::test]
 async fn test_login_via_websocket() {
     let port = allocate_port();
@@ -710,6 +734,17 @@ async fn test_login_via_websocket() {
 // TLS transport
 // ---------------------------------------------------------------
 
+// `tls` floor, measured: with this gate removed, `cargo test -p frp-server
+// --no-default-features --test server_protocol` exits 101 with `TLS dial:
+// Transport(Other("TLS connect: Connection reset by peer (os error 54)"))`
+// from the `expect("TLS dial")` this gate guards
+// (frp-server/tests/server_protocol.rs:773 in this tree), because frp-server's
+// `tls` feature is what builds the acceptor (frp-server/src/service.rs:312) and
+// the `not(feature = "tls")` handler only warns `TLS connection from {} but TLS
+// feature not enabled` and drops (frp-server/src/handlers/transport.rs:669).
+// With `--no-default-features --features tls`, this case is 1 passed / 0
+// failed.
+#[cfg(feature = "tls")]
 #[tokio::test]
 async fn test_login_via_tls() {
     let port = allocate_port();

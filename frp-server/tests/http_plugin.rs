@@ -2,6 +2,21 @@
 //! - POST {url}?version=0.1.0&op=Login with X-Frp-Reqid header
 //! - HTTP 200 required; transport/status errors fail closed (login rejected)
 //! - reject:true rejects with rejectReason
+//!
+//! The whole file needs `http-proxy`: every test configures
+//! `ServerConfig::http_plugins` and asserts a hook fired (or that its
+//! mutation took effect), while the `#[cfg(not(feature = "http-proxy"))]`
+//! stub at frp-server/src/plugin/mod.rs:8-34 makes `notify` return
+//! `Ok(None)`, `record_login_user` a no-op and `user_info` return `None`.
+//! Measured in that configuration: 22 of the file's 23 tests fail
+//! (`cargo test -p frp-server --no-default-features --test http_plugin` ->
+//! 1 passed, 22 failed); the one that passes,
+//! `test_plugin_ops_filtering`, asserts a plugin was NOT called, which the
+//! stub satisfies trivially. Feature floor, measured:
+//! `cargo test -p frp-server --no-default-features --features http-proxy
+//! --test http_plugin` -> 23 passed / 0 failed, so `http-proxy` alone is
+//! the floor.
+#![cfg(feature = "http-proxy")]
 
 mod common;
 

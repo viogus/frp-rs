@@ -101,6 +101,26 @@ async fn test_e2e_tcp_proxy_encrypted() {
 /// Client connects to the server's main port via WebSocket (server detects
 /// WS via the 'G' byte in peek_connection_type). Data flows through
 /// a plain TCP proxy tunnel over WebSocket transport.
+///
+/// `websocket` floor, measured: with this gate removed, `cargo test
+/// -p frp-client --no-default-features --test end_to_end
+/// test_e2e_tcp_proxy_over_websocket` exits 101, panicking at the
+/// `await.expect("proxy port ready")` this gate guards
+/// (frp-client/tests/end_to_end.rs:223 in this tree); with
+/// `--no-default-features --features websocket` the target is 7 passed /
+/// 0 failed. The gate is on frp-client's own `websocket`, not frp-core's:
+/// measured with `cargo check -p frp-client --no-default-features --test
+/// end_to_end -v`, frp-core is compiled with `--cfg feature="websocket"` on
+/// (the `frp-server` dev-dependency's default features forward
+/// `frp-core/websocket`), so
+/// `TransportProtocol::WebSocket` exists and `"websocket"` parses; frp-client's
+/// `websocket` gates the `WebSocket`/`Wss` arms of `propose_mux_for_transport`
+/// (frp-client/src/control.rs:39-42) and of the V2 `transport_name` maps
+/// (frp-client/src/control.rs:309-311, :401-403, :429-431). This test leaves
+/// `tcp_mux` at its default, on (frp-core/src/config/client.rs:566). Gated, the
+/// target is 6 passed / 0 failed with no features, and 7 passed / 0 failed with
+/// default features.
+#[cfg(feature = "websocket")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_e2e_tcp_proxy_over_websocket() {
     init_tracing();

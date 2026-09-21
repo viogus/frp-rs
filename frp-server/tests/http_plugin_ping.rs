@@ -15,6 +15,19 @@
 //!   Ping BEFORE VerifyPing sees it (Go handleMutableContent order);
 //! - ops filtering (plugin/http.rs ops_match) applies to "Ping" like every
 //!   other op: an unsubscribed plugin never fires.
+//!
+//! The whole file needs `http-proxy`: every test configures
+//! `ServerConfig::http_plugins` and asserts the Ping hook fired (or did
+//! not), while the `#[cfg(not(feature = "http-proxy"))]` stub at
+//! frp-server/src/plugin/mod.rs:8-34 makes `notify` return `Ok(None)`.
+//! Measured in that configuration: 4 of the file's 5 tests fail
+//! (`cargo test -p frp-server --no-default-features --test
+//! http_plugin_ping` -> 1 passed, 4 failed); the one that passes,
+//! `test_plugin_unsubscribed_from_ping_never_fires`, asserts a plugin was
+//! NOT called, which the stub satisfies trivially. Feature floor, measured:
+//! `cargo test -p frp-server --no-default-features --features http-proxy
+//! --test http_plugin_ping` -> 5 passed / 0 failed.
+#![cfg(feature = "http-proxy")]
 
 mod common;
 

@@ -3779,6 +3779,17 @@ pub(crate) mod unregister_generation_tests {
     /// a no-op regardless of interleaving. (This test exercises the atomic
     /// remove_if gate; the generation-exact user record itself is covered by
     /// `remove_user_is_generation_exact` in plugin/http.rs.)
+    ///
+    /// Needs `http-proxy`: the test seeds `plugin_manager.record_login_user`
+    /// and asserts `plugin_manager.user_info` is `Some`, but the
+    /// `#[cfg(not(feature = "http-proxy"))]` stub at
+    /// frp-server/src/plugin/mod.rs:8-34 makes the first a no-op (:29) and
+    /// the second return `None` (:30-32), so the `assert_eq!` at :3814 cannot
+    /// hold in that configuration. Measured: `cargo test -p frp-server
+    /// --no-default-features --lib unregister_generation_tests` ->
+    /// `48 passed; 1 failed` (`left: None`, `right: Some("fresh")`); with
+    /// `--features http-proxy` -> `49 passed; 0 failed`.
+    #[cfg(feature = "http-proxy")]
     #[tokio::test]
     async fn stale_unregister_keeps_fresh_user_record() {
         let state = test_state();
