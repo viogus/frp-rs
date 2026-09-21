@@ -259,14 +259,15 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   (`net/url/url.go:980`, `defaultMaxParams = 10000`), so an over-limit query yields empty
   `Values` and the reload is non-strict. Precision measured by Reviewer 2: `defaultMaxParams`
   is present in **go1.25.12** (the toolchain that built the shipped Go frp v0.71.0 binary) and
-  **absent in go1.25.0** — a 1.25.x backport, not a 1.25.0 feature. That version comparison
-  is a **single** successful fetch; the reviewer's retries returned empty bodies, so it is
-  recorded as unconfirmed-by-repetition. Real Go frp v0.71.0 measured on
+  **absent in go1.25.0** — a 1.25.x backport, not a 1.25.0 feature. Reproduced on two
+  independent successful fetches (`go1.25.0` 0 hits, `go1.25.12` 2 hits for `defaultMaxParams`
+  in `net/url/url.go`). Real Go frp v0.71.0 measured on
   `?strictConfig=true` + N×`&`: N=9999 → **400** (within the limit, strict), N=10000 →
   **200** (guard trips, non-strict). Rust has no such guard and is always strict. Why the
-  differential oracle did not flag it (Reviewer 2's correction of its own earlier wording):
-  an oracle built on `url.ParseQuery` sees the limit by construction — a corpus that never
-  emits more than 10000 parameters simply never reaches it. **Done-when:** the parser mirrors
+  differential oracle did not flag it (the parent agent's — Reviewer 1's — wording error,
+  refuted by Reviewer 2): an oracle built on `url.ParseQuery` sees the limit by construction,
+  so only a corpus that never emits more than 10000 parameters fails to reach it.
+  **Done-when:** the parser mirrors
   Go's parameter-count guard (or the divergence is documented at the endpoint), with both N
   cases pinned.
 - [ ] **Pre-existing: `#` in the request target changes strictness.** Go parses request URIs
