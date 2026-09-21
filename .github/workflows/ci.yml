@@ -201,10 +201,11 @@ jobs:
         # both crates' `default` sets. Measured with --all-targets: the micro
         # step compiles frp-client as
         # chacha20,compression,default,http2http,kcp,oidc,quic,tcp-mux,tls,websocket
-        # instead of [] (and frp-server likewise gains default+ssh) — so
-        # --all-targets would silently drop the tier check for those two crates,
-        # not extend it. The tier *test* targets are covered by the isolated
-        # step below instead.
+        # instead of [], and frp-server as
+        # chacha20,compression,default,http-proxy,kcp,oidc,quic,ssh,tcp-mux,tls,websocket
+        # instead of [] — so --all-targets would silently drop the tier check for
+        # those two crates, not extend it. The tier *test* targets are covered by
+        # the isolated step below instead.
         run: cargo check --workspace --no-default-features --features tiny
         env:
           RUSTFLAGS: "-D warnings"

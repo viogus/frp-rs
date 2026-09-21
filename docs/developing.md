@@ -237,7 +237,9 @@ member is a root, so the dev-dependency edges enter the graph, and
 default features) plus `frp-client`'s on `frp-server` re-enable both crates'
 `default` sets — measured, the micro graph flips from `frp-client = []` to
 `frp-client = [chacha20, compression, default, http2http, kcp, oidc, quic,
-tcp-mux, tls, websocket]` (and `frp-server` likewise gains `default` + `ssh`).
+tcp-mux, tls, websocket]`, and `frp-server` from `[]` to
+`[chacha20, compression, default, http-proxy, kcp, oidc, quic, ssh, tcp-mux,
+tls, websocket]`.
 `--all-targets` there would therefore drop the tier coverage for those two
 crates, not extend it.
 

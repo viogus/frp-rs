@@ -619,7 +619,10 @@ async fn reload_admin_go_query_parity_and_body_extension() {
     //       strictConfig=%zz            -> Get("") -> non-strict 200
     //       strictConfig=%ff            -> Get("\xff") -> non-strict 200
     //       foo=%zz&strictConfig=true   -> Get("true") -> strict 400
-    //     axum's `Query` extractor rejected the whole query with 400 instead.
+    //     These are Go-parity pins, not regression pins: the previous
+    //     `Query<..>` extractor answered 200 here too (`form_urlencoded` is
+    //     infallible and leaves invalid escapes literal); only the repeated
+    //     parameter in 5b was a genuine base 400.
     let (status, body) =
         admin_request(admin_port, "GET", "/api/reload?strictConfig=%zz", None).await;
     assert!(

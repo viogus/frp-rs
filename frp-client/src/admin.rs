@@ -64,17 +64,20 @@ struct ReloadBody {
 /// `r.URL.Query().Get("strictConfig")`. `URL.Query()` runs `url.ParseQuery`
 /// and **discards** its error; `parseQuery` drops only the pair it could not
 /// unescape and keeps the rest, and `Values.Get` returns the **first** value
-/// of a repeated key. Two consequences the extractor must not lose:
+/// of a repeated key. Parsing the raw string here keeps those rules explicit:
 ///
-/// * `?strictConfig=true&strictConfig=false` -> `"true"` (first wins), not a
-///   400. Deserializing into a struct made axum's `Query` reject a repeated
-///   field with serde's `duplicate_field` error before the handler ran.
-/// * `?strictConfig=%zz` -> the pair is skipped, the parameter is *absent*,
-///   and the reload is non-strict 200 -- not a 400. axum's `Query` rejects
-///   any un-unescapable query string outright.
+/// * `?strictConfig=true&strictConfig=false` -> `"true"` (first wins). This is
+///   the observed defect: deserializing into a struct made axum's `Query`
+///   reject the repeated field with serde's `duplicate_field` error, so the
+///   handler never ran and the request answered 400 where Go reloads.
+/// * `?strictConfig=%zz` -> the pair is skipped, so the parameter is *absent*
+///   and the reload is non-strict. The old extractor also ended up
+///   non-strict here (`form_urlencoded` is infallible and leaves an invalid
+///   escape literal, which `ParseBool` then rejects), so this is not a bug fix:
+///   the explicit parser replaces reliance on that incidental leniency with
+///   Go's documented rules, pinned against real `net/url` by the tests below.
 ///
-/// So the raw query string is parsed here with Go's rules. Returns the first
-/// `strictConfig` value, or `None` when no pair carries that key.
+/// Returns the first `strictConfig` value, or `None` when no pair carries it.
 fn first_strict_config_param(raw_query: Option<&str>) -> Option<String> {
     let raw = raw_query?;
     for segment in raw.split('&') {
@@ -997,7 +1000,8 @@ passwd = "socks-pass"
     fn first_strict_config_param_matches_go_url_query() {
         // Cases cross-checked against real Go (`net/url.ParseQuery` +
         // `Values.Get` + `strconv.ParseBool`): the parse error Go discards is
-        // the one that would otherwise become a 400.
+        // reproduced here so the endpoint keeps Go's rules explicitly rather
+        // than relying on `form_urlencoded`'s incidental leniency.
         let cases: &[(&str, Option<&str>)] = &[
             // Values.Get takes the first value; order decides, not truthiness.
             ("strictConfig=true&strictConfig=false", Some("true")),
@@ -1097,8 +1101,10 @@ passwd = "socks-pass"
         assert_eq!(seen_rx.recv().await, Some(false));
 
         // Go discards ParseQuery's error and keeps the pairs it could
-        // unescape: a malformed escape drops only its own pair. axum's `Query`
-        // extractor rejected the whole request with 400 here instead.
+        // unescape: a malformed escape drops only its own pair. These are
+        // Go-parity pins, not regression pins -- the old `Query` extractor
+        // answered 200 here too (`form_urlencoded` is infallible and lossy);
+        // only the repeated-field cases above were a genuine base 400.
         for uri in [
             "/api/reload?strictConfig=%zz",
             "/api/reload?strictConfig=a;b",
