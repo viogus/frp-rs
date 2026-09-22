@@ -37,7 +37,14 @@
 //! Wire-visible behavior is identical to the per-stream path: KCP over the
 //! winning hole-punch socket, yamux framing, `conv` from the session id.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+// `AtomicU64`/`AtomicUsize` are used only by the yamux tunnel driver and its
+// stream/idle-watch structs, all of which are `#[cfg(feature = "tcp-mux")]`
+// (`ReadActivity`, `LiveP2pStream`, `spawn_tunnel_driver`, the driver tests).
+// `AtomicBool` stays unconditional — the QUIC session's `alive` flag is not
+// tcp-mux-gated.
+#[cfg(feature = "tcp-mux")]
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use std::time::Duration;
 

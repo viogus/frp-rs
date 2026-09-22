@@ -500,6 +500,33 @@ jobs:
         run: cargo check -p frp-core --no-default-features --all-targets
         env:
           RUSTFLAGS: "-D warnings"
+      - name: Check the four measured-red intra-crate feature combinations (curated list, NOT the full 2^N space)
+        # A CURATED, CLOSED list — these four `-p`-isolated configurations were
+        # measured red under -D warnings at `846c1b9` and fixed in the change
+        # that added this step (TODO.md: "Measured `-p` configurations that are
+        # red under `-D warnings`"). It is NOT the 2^N intra-crate feature
+        # space: a combination that is not spelled out below is unchecked by
+        # this step and by every other step in this lane. Extend the list when
+        # the next one is measured red, and keep the count in this step name in
+        # sync with the number of lines.
+        #
+        # Every line carries `-p`, so the named crate is the only root and gets
+        # exactly the features listed. `cargo check --workspace` cannot see any
+        # of these failures: feature unification across members re-enables each
+        # crate's `default` set (rationale on the two --workspace tier steps
+        # above), which is precisely how these four combinations stayed
+        # unmeasured until a manual `-p` sweep found them.
+        #
+        # `set -e` short-circuits, so the first red configuration fails the
+        # step and prints its own compiler output.
+        run: |
+          set -e
+          cargo check -p frp-server --no-default-features --features vnet --all-targets
+          cargo check -p frp-client --no-default-features --features quic
+          cargo check -p frp-client --no-default-features --features vnet --all-targets
+          cargo check -p frp-core --no-default-features --features kcp --all-targets
+        env:
+          RUSTFLAGS: "-D warnings"
 
   build:
     name: Build (release)

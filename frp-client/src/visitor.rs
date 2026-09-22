@@ -79,11 +79,19 @@ pub(crate) struct VisitorListenerConfig {
     /// so the visitor segment matches the provider segment's packet codec
     /// when wire protocol v2 is negotiated; empty means JSON framing.
     pub udp_packet_codec: String,
-    #[cfg(feature = "quic")]
     /// Client-configured QUIC transport params for the XTCP tunnel session
     /// (Go `clientCfg.Transport.QUIC` — both the visitor's
     /// `NewQUICTunnelSession(sv.clientCfg)` and the provider's
     /// `listenByQUIC` read `clientCfg.Transport.QUIC`).
+    ///
+    /// Gated on `kcp` as well as `quic`: the only consumer is the QUIC
+    /// tunnel session, and `frp_core::xtcp_p2p::QuicTunnelSession` (with its
+    /// `xtcp_p2p_connect_quic_session*` constructors) is re-exported by
+    /// frp-core only under `#[cfg(all(feature = "kcp", feature = "quic"))]`
+    /// (`frp-core/src/xtcp_p2p.rs`). Under `quic` without `kcp` nothing on
+    /// this chain — config field, punch config, session call — exists, so the
+    /// field must not either, or it reads as dead under `-D warnings`.
+    #[cfg(all(feature = "quic", feature = "kcp"))]
     pub quic_params: frp_core::quic::QuicTransportParams,
 }
 
@@ -364,7 +372,7 @@ struct XtcpPunchConfig {
     /// milliseconds instead of lingering through the full punch sequence
     /// (pre_check 5s + NatHoleResp 15s + punch up to ~35s ≈ 50s).
     cancel: CancellationToken,
-    #[cfg(feature = "quic")]
+    #[cfg(all(feature = "quic", feature = "kcp"))]
     /// Client-configured QUIC transport params for the tunnel session (Go
     /// `clientCfg.Transport.QUIC` — both the visitor and provider tunnel
     /// sessions read it).
@@ -1189,7 +1197,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
         udp_packet_codec: _,
         // Client QUIC transport params for the XTCP tunnel session (Go
         // clientCfg.Transport.QUIC).
-        #[cfg(feature = "quic")]
+        #[cfg(all(feature = "quic", feature = "kcp"))]
         quic_params,
     } = config;
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
@@ -1240,7 +1248,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
             daa: disable_assisted_addrs,
             vtx: visitor_tx.clone(),
             cancel: listener_cancel.clone(),
-            #[cfg(feature = "quic")]
+            #[cfg(all(feature = "quic", feature = "kcp"))]
             quic_params,
         };
         // processTunnelStartEvents (Go parity): re-punch on demand, ≥10s
@@ -1831,7 +1839,7 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
         v2,
         udp_packet_codec,
         // SUDP: no NAT traversal / tunnel session.
-        #[cfg(feature = "quic")]
+        #[cfg(all(feature = "quic", feature = "kcp"))]
             quic_params: _,
     } = config;
 
@@ -2897,7 +2905,14 @@ fn list_local_ips() -> Vec<String> {
 #[cfg(all(test, feature = "vnet"))]
 mod tests {
     use super::*;
+    // Only `virtual_net_tunnel_io_wraps_encrypted_compressed_bytes` drives a
+    // duplex peer through these extension traits, and it is
+    // `#[cfg(feature = "compression")]` — so with `vnet` on and `compression`
+    // off the imports have no user and trip `unused_imports` under
+    // `-D warnings`. Gate the imports exactly where the methods are called.
+    #[cfg(feature = "compression")]
     use tokio::io::AsyncReadExt;
+    #[cfg(feature = "compression")]
     use tokio::io::AsyncWriteExt;
 
     #[test]
@@ -3710,7 +3725,7 @@ mod tunnel_session_tests {
             daa: true,
             vtx,
             cancel: CancellationToken::new(),
-            #[cfg(feature = "quic")]
+            #[cfg(all(feature = "quic", feature = "kcp"))]
             quic_params: frp_core::quic::QuicTransportParams::default(),
         };
         let cancel = CancellationToken::new();
@@ -3753,7 +3768,7 @@ mod tunnel_session_tests {
             daa: true,
             vtx,
             cancel: CancellationToken::new(),
-            #[cfg(feature = "quic")]
+            #[cfg(all(feature = "quic", feature = "kcp"))]
             quic_params: frp_core::quic::QuicTransportParams::default(),
         };
         let cancel = CancellationToken::new();
