@@ -253,13 +253,15 @@ tls, websocket]`.
 `--all-targets` there would therefore drop the tier coverage for those two
 crates, not extend it.
 
-The tier **test** targets are compiled by three sibling isolated checks instead,
+The tier **test** targets are compiled by five sibling isolated checks instead,
 where `-p` makes the crate the only root and the dev-dependency edge cannot
 reopen its defaults:
 
 ```bash
 RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --all-targets
+RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --features tls,tcp-mux --all-targets
 RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --all-targets
+RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --features tls,http-proxy,tcp-mux --all-targets
 RUSTFLAGS="-D warnings" cargo check -p frp-core   --no-default-features --all-targets
 ```
 
@@ -386,9 +388,11 @@ default-feature build), and neither says anything about the whole-file-cfg'd
 configuration and so cannot fail in it.
 
 This is the **no-features** configuration for frp-client — the micro tier — not the
-tiny one. frp-client's tiny set is `tls,tcp-mux`, and its test targets do not
-currently build (`plugin_h2` is gated on `tls` alone but needs `http2http`'s
-`h2`/`http`); [`../TODO.md`](../TODO.md) records that gap.
+tiny one. frp-client's tiny set is `tls,tcp-mux`, and it has its own isolated check
+(the `frp-client` tiny-targets step above). That step exists because
+`plugin_h2.rs` was gated on `tls` alone while its `h2`/`http` imports come from
+`http2http` — so in tiny it was selected in and failed to compile (5 errors). It
+is now gated on `http2http`; see [`../TODO.md`](../TODO.md).
 
 That run compiles frp-client's test targets with `tls` off, which is what makes
 a missing gate fail: the 5 `tls`-gated items in the

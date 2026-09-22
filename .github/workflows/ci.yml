@@ -361,7 +361,8 @@ jobs:
         #
         # Caveat, measured: 4 of those 40 targets are whole-file-cfg'd *empty*
         # in this configuration, so nothing inside them is checked —
-        # plugin_h2.rs and peer_xff_registry_e2e.rs (#![cfg(feature = "tls")]),
+        # plugin_h2.rs (#![cfg(feature = "http2http")], which is off here),
+        # peer_xff_registry_e2e.rs (#![cfg(feature = "tls")]),
         # xtcp_pair_e2e.rs and xtcp_visitor_failure_e2e.rs
         # (#![cfg(all(feature = "quic", feature = "kcp"))]). `cargo test
         # -p frp-client --no-default-features --test <t> -- --list` reports 0
@@ -372,6 +373,20 @@ jobs:
         # The rationale for why the two --workspace tier steps above cannot
         # carry --all-targets is recorded there, not duplicated here.
         run: cargo check -p frp-client --no-default-features --all-targets
+        env:
+          RUSTFLAGS: "-D warnings"
+      - name: Check frp-client tiny test targets compile (isolated, tls+tcp-mux)
+        # frp-client's tiny tier is exactly `tls,tcp-mux` (frpc/Cargo.toml:23
+        # `tiny = ["frp-client/tls", "frp-client/tcp-mux"]`), so `http2http` is
+        # OFF here while `tls` is ON. Any test target whose imports come from
+        # `http2http` but whose gate only names `tls` therefore fails to compile
+        # in this configuration — which is how plugin_h2.rs (gated
+        # `#![cfg(feature = "tls")]`, importing `h2`/`http`) broke: 5 errors,
+        # E0433 `h2`/`http` plus E0277. It is now gated on `http2http`, and this
+        # step is what keeps the next such target from hiding: without it the
+        # tiny test targets are checked nowhere, because the `--workspace` tiny
+        # step above does not carry --all-targets (see its comment for why).
+        run: cargo check -p frp-client --no-default-features --features tls,tcp-mux --all-targets
         env:
           RUSTFLAGS: "-D warnings"
       - name: Check frp-server tier test targets compile (isolated, tls OFF)
@@ -419,6 +434,19 @@ jobs:
         # frp-server's empty set just as much, but cannot change
         # `ConnectionType`'s shape.
         run: cargo check -p frp-server --no-default-features --all-targets
+        env:
+          RUSTFLAGS: "-D warnings"
+      - name: Check frp-server tiny test targets compile (isolated, tls+http-proxy+tcp-mux)
+        # The frp-server sibling of the frp-client tiny step above. frps's tiny
+        # tier is `["frp-server/tls", "frp-server/http-proxy",
+        # "frp-server/tcp-mux"]` (frps/Cargo.toml:24), a non-empty feature set
+        # that no other step compiles frp-server's test targets with — the step
+        # immediately above is tls OFF and http-proxy OFF. Without this, a future
+        # frp-server test whose gate names one of these three but whose imports
+        # come from a feature that is off here (dashboard, ssh, quic, kcp,
+        # websocket) would hide exactly as frp-client's plugin_h2 did. Measured
+        # clean when added (exit 0 with -D warnings); it is a gate, not a fix.
+        run: cargo check -p frp-server --no-default-features --features tls,http-proxy,tcp-mux --all-targets
         env:
           RUSTFLAGS: "-D warnings"
       - name: Check frp-core tier test targets compile (isolated, no features)
