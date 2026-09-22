@@ -636,19 +636,32 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   deliberately does not touch them. `is_peer_close` accepts `BrokenPipe`, which no probe on
   this host could produce from a `read` (EPIPE is a write-side error) — kept for the pin's
   contract and documented as unverified on a read path. All measurements are macOS arm64.
-- [ ] **`plugin::static_file::tests::test_static_file_e2e_non_ascii_round_trip` fails on macOS,
+- [x] **`plugin::static_file::tests::test_static_file_e2e_non_ascii_round_trip` failed on macOS,
   at default features.** Measured: `cargo test -p frp-client --lib
   test_static_file_e2e_non_ascii_round_trip` → `panicked at
   frp-client/src/plugin/static_file.rs:3420:72: called Result::unwrap() on an Err value: Os {
-  code: 92, kind: Uncategorized, message: "Illegal byte sequence" }`. The line writes a file
+  code: 92, kind: Uncategorized, message: "Illegal byte sequence" }`. The line wrote a file
   whose name contains byte `0xFF` (`OsString::from_vec(b"raw\xff.txt".to_vec())`), which this
-  host's filesystem rejects with `EILSEQ`. Not measured on Linux; it is an `frp-client` **lib**
-  test, so of the two new steps only `Run frp-client's tests with no features` runs it (the
-  `-p frp-server` step runs no `frp_client` test target). It also runs in the
-  default-feature `Tests (client integration)` lane,
-  so it is the one local `frp-client` failure expected not to appear on the ubuntu-latest
-  runner. **Done-when:** the non-UTF-8-name half of the test is skipped where the filesystem
-  cannot store such a name, or it is platform-conditional.
+  host's filesystem rejects with `EILSEQ`. It is an `frp-client` **lib** test, so of the two
+  no-features steps only `Run frp-client's tests with no features` runs it (the `-p frp-server`
+  step runs no `frp_client` test target); it also runs in the default-feature
+  `Tests (client integration)` lane.
+  **Fixed** by skipping only the non-UTF-8-name **half** where the filesystem cannot store such
+  a name — the property under test is frp-rs's byte-exact escaping and round-trip, not the
+  host's filesystem capability. The write is now `if let Err(e)` and returns early only when
+  `e.raw_os_error()` is `EILSEQ` (`92` on macOS/BSD, `84` on Linux); every other error still
+  panics, so a genuine failure cannot be swallowed. It matches on `raw_os_error` rather than
+  `ErrorKind` because the measured kind for `EILSEQ` on this toolchain is `Uncategorized`, not
+  `InvalidData` — using the kind would either miss it or over-match.
+  Verified: the test now passes and prints
+  `skipping the non-UTF-8 filename half: this filesystem cannot store such a name (Illegal byte
+  sequence (os error 92))`, i.e. the skip branch is the one that fires (not a silent pass), and
+  the other 30 `static_file` tests still pass (`31 passed; 0 failed`).
+  **Residue:** nothing here proves the *other* half of the test still has teeth on a filesystem
+  that **can** store the name (Linux/ext4), because this host cannot exercise it — the escaping
+  assertion for `%FF` is therefore unverified locally and rests on the `Tests (client
+  integration)` lane on ubuntu-latest, which is exactly where the item expected the failure not
+  to appear.
 - [x] **`frpc-tiny`'s test targets did not compile.** Evidence:
   `cargo check -p frp-client --no-default-features --features tls,tcp-mux --all-targets`
   — exactly the tiny tier for frp-client, measured `['tcp-mux','tls']` — exited 101 with

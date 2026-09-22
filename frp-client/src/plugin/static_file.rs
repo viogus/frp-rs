@@ -3417,7 +3417,26 @@ mod tests {
         {
             use std::os::unix::ffi::OsStringExt;
             let raw_name = std::ffi::OsString::from_vec(b"raw\xff.txt".to_vec());
-            std::fs::write(dir.path().join(&raw_name), b"raw-ff-body").unwrap();
+            // Not every filesystem can represent a non-UTF-8 name at all: APFS
+            // rejects byte 0xFF with EILSEQ — measured on macOS arm64 as
+            // `Os { code: 92, kind: Uncategorized, message: "Illegal byte
+            // sequence" }`, hence the raw_os_error match rather than an
+            // ErrorKind one (the kind is `Uncategorized`, not InvalidData, on
+            // the toolchain that produced that reading). The property under
+            // test is frp-rs's byte-exact escaping and round-trip, not the
+            // host filesystem's capability, so skip only this half — and only
+            // for that error, so a genuine failure still fails.
+            // EILSEQ is 92 on macOS/BSD and 84 on Linux.
+            if let Err(e) = std::fs::write(dir.path().join(&raw_name), b"raw-ff-body") {
+                if matches!(e.raw_os_error(), Some(92) | Some(84)) {
+                    eprintln!(
+                        "skipping the non-UTF-8 filename half: this filesystem cannot \
+                         store such a name ({e})"
+                    );
+                    return;
+                }
+                panic!("writing the non-UTF-8 name failed unexpectedly: {e}");
+            }
             let listing2 = raw_get(addr, b"GET / HTTP/1.1\r\nHost: t\r\n\r\n").await;
             let ls2 = String::from_utf8_lossy(&listing2);
             assert!(
