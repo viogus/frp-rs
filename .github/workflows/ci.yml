@@ -256,9 +256,10 @@ jobs:
         # 0 failed (2m08s warm on macOS arm64 — the runner was not measured); the
         # other two were 435 passed / 1 failed, the single failure being the
         # pre-existing, feature-independent
-        # `test_tcpmux_proxy_auth_interior_space_rejected_407` flake, which has
-        # its own TODO.md entry and also fails with default features — it is the
-        # only measured pre-existing failure in those five samples. Measured
+        # `test_tcpmux_proxy_auth_interior_space_rejected_407` flake, since
+        # fixed (it has its own TODO.md entry); it also failed with default
+        # features and was the only measured pre-existing failure in those five
+        # samples. Measured
         # without an frps binary, the same command adds 5 environmental
         # `oidc_integration` failures; that is why it is not in the unit lane.
         #

@@ -204,7 +204,7 @@ pub const GO_404_NOT_FOUND_RESPONSE: &str = concat!(
 /// are followed by the server dropping the conn, so EOF is the reliable
 /// end-of-response marker for byte-exact assertions. Each read is bounded —
 /// a peer that never closes fails the test fast instead of hanging it.
-#[allow(dead_code)] // used by the tcpmux and vhost_audit_fixes bins only
+#[allow(dead_code)] // used by the tcpmux, tcpmux_httpconnect and vhost_audit_fixes bins
 pub async fn read_until_eof(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
     use tokio::io::AsyncReadExt;
     let mut out = Vec::new();

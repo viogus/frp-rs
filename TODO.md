@@ -453,7 +453,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   Measured after the gates: `cargo test -p frp-server --no-default-features --all-targets -j 1
   --no-fail-fast` exited 0 with 436 passed / 0 failed in three of five samples (2m08s, macOS
   arm64 warm build); the other two were 435 passed / 1 failed, the single failure being the
-  tcpmux flake tracked below, which also fails with default features. `cargo test -p
+  `test_tcpmux_proxy_auth_interior_space_rejected_407` flake (fixed since — see below), which also
+  failed with default features. `cargo test -p
   frp-client --no-default-features
   --all-targets -j 1 --no-fail-fast` exits 101 on this macOS host with 312-313 passed and
   1-2 failed — the failures are the two non-class ones recorded below (the `start_paused`
@@ -466,24 +467,98 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   two non-class reasons below, so a Linux-green run there is an inference from the existing
   default-feature lane being green, not a measurement; (c) `frpc-tiny`'s test targets, which are
   their own item below.
-- [ ] **`test_tcpmux_proxy_auth_interior_space_rejected_407` is a load-dependent flake,
+- [x] **`test_tcpmux_proxy_auth_interior_space_rejected_407` is a load-dependent flake,
   independent of features, and can turn the default-feature suite red.** Assertion:
-  `frp-server/tests/tcpmux_httpconnect.rs:418` — `double-space credentials must be rejected:
-  200 (successHook) then 407, got: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"`. Measured
-  here: the single test run in isolation (`cargo test -p frp-server [--no-default-features
-  [--features tls,http-proxy,tcp-mux]] --test tcpmux_httpconnect
-  test_tcpmux_proxy_auth_interior_space_rejected_407`, 20 runs each) passed 20/20 in all three
-  configurations; the whole 4-test target (`... --test tcpmux_httpconnect`, 15 runs each)
-  failed in single-sample runs with `--no-default-features` (1/15), `--features
-  tls,http-proxy,tcp-mux` (3/15) and default features (3/15) — single samples under one load
-  state, not a ranking. What reproduces is qualitative: it fires in all three configurations
-  and never in isolation. Root cause: `frp-server/src/tcpmux.rs:569`
-  writes the 200 and `:592` the 407 in two separate `write_all` calls, while the helper
-  `read_full_response` (`frp-server/tests/tcpmux_httpconnect.rs:58-75`) stops after the first
-  `\r\n\r\n` and the 200 declares `Content-Length: 0`, so when the two responses land in
-  separate reads the buffer holds only the 200. Pre-existing. **Done-when:** the test tolerates
-  the split (or the server writes both responses in one buffer), so the default-feature suite
-  cannot go red on scheduling.
+  `double-space credentials must be rejected: 200 (successHook) then 407, got: "HTTP/1.1 200
+  OK\r\nContent-Length: 0\r\n\r\n"`. Root cause confirmed at the source: `frp-server/src/tcpmux.rs:569`
+  writes the 200 and `:591` the 407 in two separate `write_all` calls (Go successHook-before-checkAuth
+  order, probe-verified against Go v0.71.0), while the helper `read_full_response`
+  (`frp-server/tests/tcpmux_httpconnect.rs`) returns at the first `\r\n\r\n` — but returns *every
+  byte a read happened to deliver*, so it sees the 407 only if that first read happens to deliver
+  the 200 head **and** the whole 42-byte `HTTP/1.1 407 Proxy Authentication Required` status line —
+  80 bytes in total (the assertion uses `find`, so a read that stops inside the status line still
+  fails). Measured pre-fix on macOS arm64 by three agents independently: across the six
+  default-test-threads samples the whole 4-test target failed **43/352** runs — the author 13/72
+  (5/40 single-process, 8/32 at 4-way concurrency), the adversarial reviewer 6/72 (4/40, 2/32), the
+  independent reviewer 24/208 (9/80, 15/128) — and every one of the 43 failures carried exactly the
+  200 in the buffer. The spread between samples is part of the finding: this is a load-dependent
+  rate, not a constant, so no single sample is *the* rate. **Concurrency from any source triggers it,
+  not only in-process test threads:** a *serialized* `--test-threads=1` run does not flake (0/60),
+  but `--test-threads=1` alone does not prevent it — 4 concurrent serialized processes failed 12/32
+  and 8/32 (adversarial reviewer) and 5/32 and 6/32 (independent reviewer), and 8 concurrent failed
+  5/32. Those `--test-threads=1` arms are a separate measurement and are **not** part of the 43/352,
+  which counts only the default-test-threads samples.
+  A temporary in-process probe (240 CONNECTs across 8 concurrent instances) measured the split
+  directly: the first read carried only the 200 in **34/240 (14.2%)** of connections. **Fixed** on
+  the test side only: the reject arm now uses `send_connect_reject` → `common::read_until_eof`, the
+  read-to-EOF pattern the sibling `test_tcpmux_proxy_auth` already uses for the same 200-then-407
+  pair. The server is untouched, so the wire bytes are unchanged. Measured post-fix: **0/516** runs
+  across the three agents (single-process, 4-way and 8-way concurrency; 108 of them counted at
+  `--no-default-features`, a deliberately conservative figure — the reviewers' own retained logs
+  contain more than that (135 and 148 identified independently), so treat 516 as a floor rather
+  than an exact count; the difference is bookkeeping, not failures), same assertion unchanged. The full `cargo test -p frp-server` green was
+  re-measured on a quiet tree after both reviewers stopped. One further run during the fix round
+  reported
+  `3 passed; 1 failed` at `--no-default-features` with the old 200-only signature; its binary was
+  overwritten by a concurrent `cargo` rebuild, so the provenance is unrecoverable and it is recorded
+  as residue rather than explained away. Adversarial review
+  measured the change as **strictly stronger, not weaker**: deleting the server's post-407
+  `return;` so the conn is never closed makes the new reader fail 4/4, while the old reader passed
+  that mutant 20/20. Reading to EOF is what makes *this* target pin close — it is not the only such
+  check in the suite: the sibling `test_tcpmux_proxy_auth` catches the same mutant 3/3 at
+  `tcpmux.rs:679`. The done-when's alternative — have the server write both responses in one buffer —
+  was rejected: a single `write_all` is not guaranteed to arrive in a single read (TCP is a byte
+  stream), so coalescing would not be a guarantee against the split. It would very likely have
+  removed the observed split on loopback at this size, but that was reasoned rather than measured;
+  and it would have changed the write boundaries of code whose bytes are already probe-verified Go
+  parity.
+  **Go parity verified end-to-end**, against the real Go frp v0.71.0 binaries (`frps -v` → `0.71.0`;
+  the same ones `scripts/compat-test.sh` uses — confirmed independently by two reviewers). A
+  double-space CONNECT is answered with the 200 head and then the 407 head on the same connection —
+  **149 bytes total = the 38-byte 200 head + the 111-byte 407 head**: `HTTP/1.1 200 OK\r\nContent-
+  Length: 0\r\n\r\n` then `HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic
+  realm="Restricted"\r\nContent-Length: 0\r\n\r\n` — while correct credentials get a single 38-byte
+  200. The recv *chunk boundaries* are timing-dependent and are not the finding: they were observed
+  as `[82, 20, 24, 23]` and as `[36, 2, 44, 18, 2, 24, 2, 21]`. Only the 149 = 38 + 111 split and
+  the 200-head-first order reproduce. Go v0.71.0 `pkg/util/vhost/vhost.go`'s `handle()` likewise runs
+  `successHook` before `checkAuth`.
+  **Residue:** the one unreproducible `--no-default-features` failure noted above, whose binary
+  provenance a concurrent rebuild destroyed; and the fact that the probe pins the wire order and the
+  Go source hook order, not Go's internal write-syscall count.
+
+- [ ] **Two observations of `test_tcpmux_proxy_auth` failing are unusable: both fall inside windows
+  when a reviewing agent had `frp-server/src/tcpmux.rs` mutants in this same worktree.** They are
+  kept here only as a contaminated-measurement record — the test is **not** established as flaky.
+  - Observation 1: a full `cargo test -p frp-server` run failed at `tcpmux.rs:698:9`, the byte-exact
+    407-head assertion — the `200` arrived (the `:687` `starts_with` assertion passed) and the
+    `407 ... Proxy-Authenticate ... Content-Length: 0` head did not.
+  - Observation 2: at host load 61-77, 2 of 4 runs of `cargo test -p frp-server --test
+    tcpmux_httpconnect --test tcpmux` failed in the untouched `tcpmux` target at `tcpmux.rs:679:18`,
+    `timeout waiting for the auth response + close: Elapsed(())` — the 2 s first-read timeout.
+  Why neither counts: a reviewing agent mutated `frp-server/src/tcpmux.rs` in this worktree and
+  relinked `target/debug/deps/tcpmux-*` during the relevant windows. Observation 2's window is
+  bracketed by the artifacts to [16:55:01, 16:58:04] — the `/tmp/r1b` directory mtime at 16:55:01
+  and `/tmp/r1_nod` at 16:58:04; more tightly, the gap between `/tmp/r1b`'s last log at 16:55:37 and
+  `/tmp/r1_nod`'s first at 16:57:55 — which is **inside** the 16:55 and 16:56 mutation activity.
+  Observation 1's own window was not retained: it is inferred from when it was recorded, which is the
+  same period, so it is *consistent with* that activity rather than timestamp-linked to it. Deleting that `return;` makes this test fail **3/3 at `:679`** — exactly
+  observation 2's message — and **stripping the 407's headers** (measured) makes it fail **3/3 at
+  `:698`** — exactly observation 1's site; suppressing the 407 write reaches the same assertion but
+  was measured only against the rejection test, so that half is reasoned rather than measured. These
+  tests run frps **in-process**, so the binary under test *is* whatever is in `target/`; a mutant
+  present at build time is measured as the product. Clean-tree evidence points the other way:
+  **0/48** runs of the sibling target under 8-way concurrency (independently reproduced by the
+  adversarial reviewer), 0/40 and 0/12 clean runs earlier, and a full `cargo test -p frp-server`
+  green re-measured after both reviewers stopped, against a `src/tcpmux.rs` md5-verified pristine.
+  **The independent reviewer has since withdrawn its `:679` claim in as many words**, on exactly
+  these grounds: unretained logs, unrecoverable provenance, a shared target dir, and a window
+  coincident with disclosed mutation of the crate under test.
+  **Done-when:** to treat this test as flaky at all, reproduce it on a quiet worktree with no
+  concurrent mutation builds and capture the received bytes; otherwise close this as a
+  contaminated-measurement record. **Process lesson — the actual finding:** mutating a server in the
+  same worktree another agent is measuring contaminates both, silently and in the direction of
+  looking like a real flake. Review agents need their own checkout or a frozen revision, and a
+  mutation must be reverted *and* the target rebuilt before any measurement resumes.
 - [ ] **`frp-client`'s `start_paused` socket-deadline tests are flaky on this host at *default*
   features — they can turn the existing default-feature lanes red.** Found while measuring the
   new no-features runtime step; none of them is a feature gate, and none is touched by the
