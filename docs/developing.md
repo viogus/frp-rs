@@ -278,9 +278,10 @@ targets are whole-file-cfg'd *empty* here — `kcp.rs` and `xtcp_p2p.rs` (`kcp`)
 
 That step is compile-only: it type-checks the test targets but does not link or
 run them, so it cannot see a missing `#[cfg]` on a test or bench that still
-*compiles*. The `Tests (unit)` job carries the runtime half **for `frp-core`** —
-not for the tier gates in general; see the sibling-crate note below — in the same
-no-features configuration:
+*compiles*. The runtime half lives in the test lanes: `Tests (unit)` runs the
+no-features command for `frp-core` and for `frp-client`, and
+`Tests (server integration)` runs it for `frp-server`; the two sibling steps are
+spelled out below. For `frp-core`, in the same no-features configuration:
 
 ```bash
 cargo test -p frp-core --no-default-features --all-targets

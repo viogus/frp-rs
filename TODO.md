@@ -362,14 +362,16 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     27 are the `http-proxy` stub — `tests/http_plugin.rs` 22 failed / 1 passed and
     `tests/http_plugin_ping.rs` 4 failed / 1 passed (both files contain zero `cfg(feature ...)`,
     measured), plus the lib test `control::proxy_ops::unregister_generation_tests::
-    stale_unregister_keeps_fresh_user_record` (`frp-server/src/control/proxy_ops.rs:3783`,
-    assertion at `:3803`) which expects `plugin_manager.user_info(...)` to be `Some` while the
+    stale_unregister_keeps_fresh_user_record` (in `frp-server/src/control/proxy_ops.rs`; its
+    `assert_eq!` on `plugin_manager.user_info(...)`) which expects that to be `Some` while the
     `#[cfg(not(feature = "http-proxy"))]` stub (`frp-server/src/plugin/mod.rs:8-34`) makes
     `record_login_user` a no-op (`:29`) and `user_info` return `None` (`:30-32`); the real impl
     is `frp-server/src/plugin/http.rs:132` (`record_login_user` `:200`, `user_info` `:209`).
-    The other 7: 2 `tests/server_protocol.rs` WS/TLS dials (`:667`, `:738`), 2
-    `tests/slowloris.rs` TLS dials (`:317`, `:359`), 3 `tests/vhost_https_sni.rs` connects
-    (`:185`, `:294`, `:431`). Controls with the feature on, measured: `--test http_plugin`
+    The other 7: `test_login_via_websocket` and `test_login_via_tls` in
+    `tests/server_protocol.rs`, the two `tls_*` TLS-dial cases in `tests/slowloris.rs`, and
+    `test_https_vhost_sni_passthrough`, `test_tls_control_login_not_hijacked_by_https_wildcard`
+    and `test_https_group_sni_fan_out_round_robin` in `tests/vhost_https_sni.rs`.
+    Controls with the feature on, measured: `--test http_plugin`
     23 passed / 0 failed, `--test http_plugin_ping` 5/0, `--lib unregister_generation_tests`
     49/0, `--no-default-features --features websocket,tls --test server_protocol test_login_via`
     2/0, `--no-default-features --features tls,http-proxy --test slowloris` 5/0 and
@@ -509,8 +511,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   frp-client/src/plugin/static_file.rs:3420:72: called Result::unwrap() on an Err value: Os {
   code: 92, kind: Uncategorized, message: "Illegal byte sequence" }`. The line writes a file
   whose name contains byte `0xFF` (`OsString::from_vec(b"raw\xff.txt".to_vec())`), which this
-  host's filesystem rejects with `EILSEQ`. Not measured on Linux; the test runs in the
-  default-feature `Tests (client integration)` lane and in both new no-features runtime steps,
+  host's filesystem rejects with `EILSEQ`. Not measured on Linux; it is an `frp-client` **lib**
+  test, so of the two new steps only `Run frp-client's tests with no features` runs it (the
+  `-p frp-server` step runs no `frp_client` test target). It also runs in the
+  default-feature `Tests (client integration)` lane,
   so it is the one local `frp-client` failure expected not to appear on the ubuntu-latest
   runner. **Done-when:** the non-UTF-8-name half of the test is skipped where the filesystem
   cannot store such a name, or it is platform-conditional.
