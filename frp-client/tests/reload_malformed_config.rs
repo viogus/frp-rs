@@ -967,9 +967,11 @@ async fn admin_head_is_405_and_never_runs_a_get_handler() {
 }
 
 /// (d) Wire-level max-parameter boundary. Go's `parseQuery` guard
-/// (`net/url/url.go:979-980`, `defaultMaxParams = 10000`) makes an over-limit
-/// query parse as empty, so `strictConfig` is absent and the reload is
-/// non-strict. The limit is inclusive and counts `&`s + 1.
+/// (`net/url/url.go:1019-1020` in go1.25.12 — line numbers drift between Go
+/// releases, `:979-980` in go1.27.1; `defaultMaxParams = 10000`, `:1001` in
+/// go1.25.12) makes an over-limit query parse as empty, so `strictConfig` is
+/// absent and the reload is non-strict. The limit is inclusive and counts
+/// `&`s + 1.
 #[cfg(feature = "admin")]
 #[tokio::test]
 async fn admin_max_query_params_boundary_matches_go() {
@@ -1027,7 +1029,7 @@ async fn admin_max_query_params_boundary_matches_go() {
 ///
 /// Reason it cannot be fixed here: `RawQuery` comes from `http::Uri`, which
 /// truncates the request target at the first `#` inside hyper's request-line
-/// parsing (`http-1.5.0/src/uri/path.rs:27-29`), before any frp-rs code runs.
+/// parsing (`http-1.5.0/src/uri/path.rs:28-29`), before any frp-rs code runs.
 #[cfg(feature = "admin")]
 #[tokio::test]
 async fn admin_hash_fragment_divergence_is_pinned() {

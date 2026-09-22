@@ -60,10 +60,13 @@ struct ReloadBody {
 
 /// Go's `net/url` default maximum URL query parameter count.
 ///
-/// `parseQuery` (`net/url/url.go:979-980`) opens with
+/// `parseQuery` (`net/url/url.go:1019-1020` in go1.25.12 — the line numbers
+/// drift between Go releases, `:979-980` in the go1.27.1 toolchain installed
+/// here) opens with
 /// `if !urlParamsWithinMax(strings.Count(query, "&") + 1) { return Values{}, err }`,
-/// where `defaultMaxParams = 10000` (`net/url/url.go:961`) and
-/// `urlParamsWithinMax(n) = n <= defaultMaxParams` — the limit is
+/// where `defaultMaxParams = 10000` (`:1001` in go1.25.12, `:961` in go1.27.1)
+/// and `urlParamsWithinMax(n) = n <= defaultMaxParams` (`:1003` in go1.25.12,
+/// `:963` in go1.27.1) — the limit is
 /// **inclusive** and the count is `&`s + 1 (so an empty query is one
 /// parameter). `URL.Query()` discards the returned error together with the
 /// empty `Values`, so an over-limit query leaves `Get("strictConfig")` at `""`
@@ -79,9 +82,9 @@ struct ReloadBody {
 /// backport, not a 1.25.0 feature (two successful fetches of
 /// `net/url/url.go`: 0 hits for `defaultMaxParams` on go1.25.0, 2 on
 /// go1.25.12). It is also GODEBUG-gated: `urlmaxqueryparams`
-/// (`net/url/url.go:958`) can raise the limit, or set it to `0` for
-/// unlimited. The parity target is therefore the shipped binary's default,
-/// not "Go in general".
+/// (`:998` in go1.25.12, `:958` in go1.27.1) can raise the limit, or set it
+/// to `0` for unlimited. The parity target is therefore the shipped binary's
+/// default, not "Go in general".
 const GO_DEFAULT_MAX_PARAMS: usize = 10000;
 
 /// Go's strict-mode query channel, reimplemented the way Go reads it.
@@ -122,7 +125,7 @@ const GO_DEFAULT_MAX_PARAMS: usize = 10000;
 ///
 /// This is unrecoverable at this layer: `RawQuery` comes from `http::Uri`,
 /// whose parser truncates the target at the first `#`
-/// (`http-1.5.0/src/uri/path.rs:27-29`:
+/// (`http-1.5.0/src/uri/path.rs:28-29`:
 /// `if let Some(i) = fragment { src.truncate(i as usize); }`), and that
 /// truncation happens inside hyper's request-line parsing, before any frp-rs
 /// code runs. Recovering the raw target would mean replacing the HTTP stack.
@@ -1190,11 +1193,13 @@ passwd = "socks-pass"
 
     #[test]
     fn first_strict_config_param_mirrors_go_max_param_guard() {
-        // Go `parseQuery` (`net/url/url.go:979-980`):
+        // Go `parseQuery` (`net/url/url.go:1019-1020` in go1.25.12 — line
+        // numbers drift between Go releases, `:979-980` in go1.27.1):
         //   if !urlParamsWithinMax(strings.Count(query, "&") + 1) { return err }
-        // with `defaultMaxParams = 10000` and `urlParamsWithinMax(n) =
-        // n <= 10000`. The count is `&`s + 1 and the limit is INCLUSIVE, so
-        // 9999 `&` (10000 parameters) parses and 10000 `&` (10001) does not.
+        // with `defaultMaxParams = 10000` (`:1001` in go1.25.12) and
+        // `urlParamsWithinMax(n) = n <= 10000`. The count is `&`s + 1 and the
+        // limit is INCLUSIVE, so 9999 `&` (10000 parameters) parses and
+        // 10000 `&` (10001) does not.
         // Cross-checked on the shipped Go frp v0.71.0 binary:
         // `?strictConfig=true` + 9999 `&` -> 400 strict; + 10000 `&` -> 200
         // non-strict.

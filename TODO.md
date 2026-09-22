@@ -857,7 +857,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
 - [x] **Pre-existing: no query-parameter-count guard, so >10000 params diverge from Go.**
   Go's `parseQuery` opens with
   `if !urlParamsWithinMax(strings.Count(query, "&") + 1) { return Values{}, err }`
-  (`net/url/url.go:980`, `defaultMaxParams = 10000`), so an over-limit query yields empty
+  (`net/url/url.go:1019-1020` in go1.25.12, the shipped binary's toolchain — line numbers
+  drift between Go releases, `:980` in go1.27.1; `defaultMaxParams = 10000` at `:1001` in
+  go1.25.12), so an over-limit query yields empty
   `Values` and the reload is non-strict. Precision measured by Reviewer 2: `defaultMaxParams`
   is present in **go1.25.12** (the toolchain that built the shipped Go frp v0.71.0 binary) and
   **absent in go1.25.0** — a 1.25.x backport, not a 1.25.0 feature. Reproduced on two
@@ -893,7 +895,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   used (or the divergence documented at the endpoint), with the `#` case pinned.
   Done: documented and pinned, **not fixed** — the divergence is unrecoverable at this layer.
   `RawQuery` comes from `http::Uri`, which truncates the target at the first `#`
-  (`http-1.5.0/src/uri/path.rs:27-29`:
+  (`http-1.5.0/src/uri/path.rs:28-29`:
   `if let Some(i) = fragment { src.truncate(i as usize); }`) inside hyper's request-line
   parsing, before any frp-rs code runs; recovering the raw target would mean replacing the
   HTTP stack. Both manifestations are recorded on `first_strict_config_param` (which has the
@@ -929,6 +931,28 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   maintenance story for new proxy types and their aliases), or state the exemption and its
   rationale in the strict-mode prose in `docs/deployment.md`, so a user knows a proxy-block
   typo will not be caught. No sha.
+- [ ] **`frpc reload` / `frpc status` silently ignore a config that fails to load, and talk to
+  `127.0.0.1:7400` instead.** `resolve_admin_connection` (`frpc/src/main.rs:29`) loads the
+  config with `load_client_config(path, true)` at `:46` and, on **any** error, falls through to
+  the `127.0.0.1:7400` default at `:54-59` with the error discarded (the `if let Ok(cfg)` drops
+  it). Call sites: `run_reload` (`:623`) and `run_status` (`:641`). Measured with identical
+  config text — a valid config plus one unknown top-level key, with an admin server actually
+  listening on the configured `webServer.port`:
+  * Go v0.71.0: `frpc reload -c <config>` and `frpc status -c <config>` each print
+    `json: unknown field "notAKnownFrpKey"` and exit **1** — no address is ever contacted.
+  * frp-rs: both silently retarget `127.0.0.1:7400`
+    (`reload failed: connect 127.0.0.1:7400: Connection refused (os error 61)` /
+    `status query failed: connect 127.0.0.1:7400: Connection refused (os error 61)`), exit 1,
+    and never mention the config error — so a different admin server on 7400 would be driven
+    instead, and the user is not told their config did not load.
+  `strict = true` here is **Go-faithful** (Go's `frpc reload --help`: "strict config parsing
+  mode, unknown fields will cause an errors (default true)"), so the divergence is the silent
+  fallback, not the strictness. The daemon's own startup load is strict in both Go and frp-rs
+  (measured), so the fallback is reachable whenever the on-disk config changes after the daemon
+  has started — exactly the situation `frpc reload` is used in.
+  **Done-when:** propagate the load error (Go's exit 1 plus the parse message) instead of
+  falling back, or warn and fall back only when the config genuinely has no `[web_server]`
+  section, with both cases pinned. No sha.
 
 ---
 
