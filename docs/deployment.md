@@ -640,13 +640,18 @@ frpc's own CLI sends); when both channels are present the query parameter wins.
 A body that is present but malformed JSON is rejected with 400.
 
 Three request-target rules follow from Go and are worth knowing. Go's admin
-router matches methods exactly, so every admin `GET` route answers `HEAD` with
-`405 Method Not Allowed` — `HEAD /api/reload` never reloads, whatever the query
-says (an *unauthenticated* `HEAD` on a registered route is still `401` here,
-where Go answers `405`, because the auth middleware runs before method routing
-— and an unauthenticated request to an unknown path is `401` here where Go
-answers `404`). More than 10000 query parameters disable `strictConfig`: Go's
-`net/url.parseQuery` opens with a parameter-count guard (`defaultMaxParams =
+router matches methods exactly, so every `GET` route *Go registers* answers
+`HEAD` with `405 Method Not Allowed` (`/api/metrics` is frp-rs-only — Go has no
+such route and answers 404 for every method), and `HEAD /api/reload` never
+reloads, whatever the query says. An *unauthenticated* `HEAD` on a registered
+route is still `401` here, where Go answers `405` — and an unauthenticated
+request to an unknown path is `401` here where Go answers `404` — because the
+auth middleware runs before method routing. A measured alternative (`route_layer`
+for auth plus a route-aware outer HEAD layer) matches Go on both, but it would
+stop the auth layer from protecting unmatched paths, letting an unauthenticated
+client tell which paths exist; not adopting it is a deliberate scope choice
+tracked in `TODO.md`. More than 10000 query parameters disable `strictConfig`:
+Go's `net/url.parseQuery` opens with a parameter-count guard (`defaultMaxParams =
 10000`, inclusive, counting `&`s + 1) and its error leaves the query empty, so
 `?strictConfig=true` plus 9999 `&` is a strict 400 and plus 10000 `&` is a
 non-strict 200; frp-rs mirrors the guard, and because an over-limit query means

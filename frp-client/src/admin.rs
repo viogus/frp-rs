@@ -773,28 +773,29 @@ impl axum::serve::Listener for TlsListener {
 ///
 /// The `/api/reload` case is not cosmetic: the GET handler *reloads the
 /// config*, so a HEAD there was a real, unrequested side effect, and with
-/// `?strictConfig=true` the reload is strict and can reject the config — the
-/// pre-change tree answered **400** to `HEAD /api/reload?strictConfig=true`
-/// where Go answers 405.
+/// `?strictConfig=true` the reload is strict. Measured on the pre-change tree:
+/// with a config that strict mode rejects (the tests' unknown-key oracle) the
+/// HEAD answered **400**; with a valid config the strict reload succeeded and
+/// it answered **200**. Go answers 405 either way.
 async fn handle_head_not_allowed() -> StatusCode {
     StatusCode::METHOD_NOT_ALLOWED
 }
 
 /// The frpc admin route table.
 ///
-/// Split out of [`run_admin_server`] so the unit tests drive the exact routes
+/// Split out of [`run_admin_server`] so tests can drive the same route table
 /// the server serves, including the per-route HEAD handlers below.
 /// `store_enabled` mirrors `state.store.is_some()`.
 ///
 /// Every route that registers `get(...)` also registers
-/// `.head(handle_head_not_allowed)`. A blanket HEAD-rejection *layer* was
-/// rejected on measurement, not on the axum docs (`Router::layer` is often
+/// `.head(handle_head_not_allowed)`. An *unconditional* HEAD-rejection layer
+/// was rejected on measurement, not on the axum docs (`Router::layer` is often
 /// read as applying only to existing routes, which does not mean unmatched
 /// paths skip it — measured, they do not):
 ///
-/// * a layer OUTERMOST (before auth) answers 405 for
+/// * such a layer OUTERMOST (before auth) answers 405 for
 ///   `HEAD /api/nonexistent`, where Go answers 404 — a new divergence;
-/// * a layer INNERMOST (inside the auth layer) lets auth win on a matched
+/// * such a layer INNERMOST (inside the auth layer) lets auth win on a matched
 ///   path, so an unauthenticated `HEAD /api/reload` would be 401 — the very
 ///   divergence such a layer was meant to avoid. Go answers 405 with *and*
 ///   without credentials: its router resolves path+method before auth
@@ -811,17 +812,48 @@ async fn handle_head_not_allowed() -> StatusCode {
 /// *unauthenticated* HEAD on a registered route is still 401 where Go is 405
 /// (measured on both with `webServer.user`/`password` set); an unauthenticated
 /// request to an unknown path is likewise 401 here where Go is 404, for GET as
-/// well as HEAD. Those requests are already 401 today; matching Go there needs
-/// routing-before-auth, a router-wide change.
+/// well as HEAD. Those requests are already 401 today.
+///
+/// Matching Go on those cells is reachable, and was measured, but is NOT
+/// adopted here as a deliberate scope choice. Reviewer 2 built
+/// `.route_layer(auth)` (which on its own fixes the two unknown-path cells,
+/// because middleware added that way runs only when a route matches — axum
+/// `docs/routing/route_layer.md`) plus a *route-aware* outermost HEAD layer
+/// (which fixes the unauthenticated-HEAD cell): 8/8 rows on an isolated axum
+/// 0.8.9 probe and 14/14 rows on the real admin router over the wire matched
+/// Go, and the coordinator reproduced the mechanism. It is not taken here
+/// because:
+///
+/// 1. `.route_layer` lets unmatched paths bypass auth, so an unauthenticated
+///    client gets 404/405 for an unknown path instead of 401 — it reveals
+///    which paths and methods exist. axum's own `route_layer` doc names this
+///    trade-off ("might otherwise convert a `404 Not Found` into a `401
+///    Unauthorized`"). That is a security-posture change, and this repo
+///    already deviates from Go for security elsewhere (the admin server binds
+///    localhost-only even when auth is configured).
+/// 2. The HEAD half needs a production route-pattern predicate that matches
+///    `{name}` segments without over-matching (`/api/proxy/a/b/config`);
+///    Reviewer 2's prototype over-matched. axum 0.8.9 exposes no route
+///    introspection (only `has_routes() -> bool`), so the predicate would be a
+///    hand-maintained path list — exactly the maintenance hazard
+///    `frp-core/src/config/strict.rs:280-285` refuses.
+/// 3. `apply_admin_auth` is shared (`frp-core/src/admin_auth.rs:36`), called
+///    from this file and from `frp-server/src/dashboard.rs:3610/3626/3650`, so
+///    switching it to `route_layer` is not scoped to the frpc admin API.
 ///
 /// The rule is applied uniformly to `/api/metrics` and the `/api/store/*`
-/// routes too, but no Go parity is claimed for them: Go v0.71.0's client admin
-/// has no `/api/metrics` route at all (404 for GET and HEAD — measured) and the
-/// store API is a frp-rs-only extension, so parity is undefined there. POST is
-/// unchanged: `frpc/src/main.rs:630-631` sends `POST` with a JSON body
-/// (`admin_post_json`), and the comment on the `/api/reload` route documents
-/// POST as a deliberate frp-rs extension. `OPTIONS /api/reload` is already 405
-/// on both, and `POST`/`HEAD /api/stop` already agree; only HEAD changes.
+/// routes too. `/api/metrics` is the genuinely frp-rs-only one: Go v0.71.0's
+/// client admin has no such route at all (404 for GET and HEAD — measured), so
+/// no Go parity is claimed for it. The `/api/store/*` routes are **not**
+/// frp-rs-only: Go ships the same paths and, with `store.path` set, answers GET
+/// 200 / HEAD 405 / OPTIONS 405 — identical to this tree after the change
+/// (measured; `main` answered 200 to HEAD on all four, so this change also
+/// repairs them). Only the request/response *payload shape* is frp-rs-specific,
+/// as `docs/deployment.md` states. POST is unchanged: `frpc/src/main.rs:630-631`
+/// sends `POST` with a JSON body (`admin_post_json`), and the comment on the
+/// `/api/reload` route documents POST as a deliberate frp-rs extension.
+/// `OPTIONS /api/reload` is already 405 on both, and `POST`/`HEAD /api/stop`
+/// already agree; only HEAD changes.
 fn admin_router(store_enabled: bool) -> Router<AdminState> {
     let app = Router::new()
         .route(
@@ -1243,9 +1275,10 @@ passwd = "socks-pass"
                 let _ = req.reply.send(Ok("reload success".into()));
             }
         });
-        let app = Router::new()
-            .route("/api/reload", get(handle_reload).post(handle_reload))
-            .with_state(state);
+        // Drive the real route table rather than a copy of it, so a change to
+        // `admin_router` cannot leave this test exercising a hand-rolled
+        // subset.
+        let app = admin_router(true).with_state(state);
 
         // First value wins: true -> strict, even though false follows.
         let resp = app
@@ -1438,9 +1471,17 @@ passwd = "socks-pass"
         // drives the REAL route table (`admin_router`) to prove every GET
         // route registers an explicit `.head(...)`.
         //
+        // The path list below is hand-maintained: axum 0.8.9 exposes no route
+        // introspection (only `has_routes() -> bool`), so a route added to
+        // `admin_router` must be added here too. The integration test
+        // `admin_head_is_405_and_never_runs_a_get_handler` probes the
+        // corresponding live-server routes.
+        //
         // No reload-forwarding task is spawned for the HEAD phase on purpose:
-        // `reload_rx` stays owned here, so `try_recv` is a direct proof that
-        // no request reached the service run loop.
+        // `reload_rx` stays owned here, and its sender is still alive (`app`
+        // holds `reload_tx`), so `TryRecvError::Empty` is the only way the
+        // channel can report "nothing was enqueued" — asserting the variant
+        // distinguishes that from `Disconnected`.
         let (state, mut reload_rx) = test_state();
         let app = admin_router(true).with_state(state);
 
@@ -1479,10 +1520,12 @@ passwd = "socks-pass"
         // The proof that the /api/reload GET handler did not run and that the
         // strict query was never even evaluated: no reload request was
         // enqueued. A handler run would have queued one and then waited on the
-        // reply oneshot.
+        // reply oneshot. The explicit `Empty` variant matters — `is_err()` is
+        // also true for `Disconnected`, which would prove nothing.
         assert!(
-            reload_rx.try_recv().is_err(),
-            "HEAD /api/reload must not enqueue a reload request"
+            matches!(reload_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "HEAD /api/reload must not enqueue a reload request (channel must be \
+             Empty, not Disconnected)"
         );
 
         // An unknown path keeps axum's natural 404, matching Go — this is why
@@ -1565,18 +1608,9 @@ passwd = "socks-pass"
     }
 
     fn test_app(state: AdminState) -> Router {
-        Router::new()
-            .route(
-                "/api/store/proxies",
-                get(handle_list_store_proxies).post(handle_create_store_proxy),
-            )
-            .route(
-                "/api/store/proxies/{name}",
-                get(handle_get_store_proxy)
-                    .put(handle_update_store_proxy)
-                    .delete(handle_delete_store_proxy),
-            )
-            .with_state(state)
+        // The real route table (store routes included, since `test_state` has a
+        // store) rather than a hand-rolled subset.
+        admin_router(true).with_state(state)
     }
 
     #[tokio::test]

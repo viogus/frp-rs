@@ -901,7 +901,9 @@ async fn admin_head_is_405_and_never_runs_a_get_handler() {
     // The discriminating case: HEAD /api/reload?strictConfig=true is 405, NOT
     // 400. A 400 would prove axum ran the GET handler and performed a strict
     // reload (a real, unrequested side effect for a HEAD); 405 proves it did
-    // not. Before the fix this was 400.
+    // not. Before the fix this was 400 *with the armed oracle*; with a valid
+    // config the strict reload succeeded and the pre-change HEAD answered 200
+    // (measured on the pre-change binary).
     let (status, body) = admin_request(
         oracle.admin_port,
         "HEAD",
@@ -923,14 +925,25 @@ async fn admin_head_is_405_and_never_runs_a_get_handler() {
         "HEAD /api/reload must be 405, got: {status} / {body}"
     );
 
-    // Uniform across the registered GET routes (Go measured 405 on each of
-    // /api/status, /api/config, /api/proxy/{name}/config and
-    // /api/visitor/{name}/config).
+    // Uniform across every GET route this harness registers. Go measured 405
+    // on /api/status, /api/config, /api/proxy/{name}/config and
+    // /api/visitor/{name}/config. The `/api/store/*` routes are NOT registered
+    // here (this config sets no `store.path`), so they are covered by the
+    // `admin_router(true)` unit test instead.
+    //
+    // This list is hand-maintained: axum exposes no route introspection, so a
+    // GET route added to `admin_router` must be added here (and to the unit
+    // test's list) or the "every GET route" property silently stops holding.
+    // Reviewer 2 showed exactly that: removing `.head()` from
+    // `/api/visitor/{name}/config` was caught by the unit test but not by an
+    // earlier, shorter version of this loop.
     for path in [
         "/api/status",
         "/api/metrics",
+        "/api/reload",
         "/api/config",
-        "/api/proxy/p1/config",
+        "/api/proxy/main/config",
+        "/api/visitor/main/config",
     ] {
         let (status, body) = admin_request(oracle.admin_port, "HEAD", path, None).await;
         assert!(
@@ -938,6 +951,17 @@ async fn admin_head_is_405_and_never_runs_a_get_handler() {
             "HEAD {path} must be 405, got: {status} / {body}"
         );
     }
+
+    // Non-vacuous control: the proxy route is live (GET 200), so the 405 above
+    // is the method check rather than a missing route. GET on the visitor route
+    // is 404 (no visitor named `main`), which itself distinguishes it from an
+    // unregistered path only via the 405 HEAD above.
+    let (status, body) =
+        admin_request(oracle.admin_port, "GET", "/api/proxy/main/config", None).await;
+    assert!(
+        status.contains("200"),
+        "GET /api/proxy/main/config control must be 200, got: {status} / {body}"
+    );
 
     // An unknown path keeps axum's natural 404 — Go answers 404 there too.
     // This is exactly why a blanket router-level HEAD layer was not used.
