@@ -71,6 +71,16 @@ attempt:
   what happens when it is *off*? For a shared helper, who else calls it?
 - **Say what would change your mind.** If the review cannot state the observation
   that would falsify the change, it is not adversarial.
+- **Mutate in your own checkout, never the tree being measured.** If you edit a
+  crate under test to build a mutant, do it in a separate worktree and rebuild
+  from the restored source before measuring anything else in the shared tree.
+  The server integration tests mostly run frps *in-process*, and the rest spawn
+  the `target/` frps binary, so in both cases the code under test is whatever was
+  compiled into `target/` at build time: a mutant left in a shared tree is
+  silently measured as the product by every other agent, and it surfaces as a
+  plausible-looking flake in whichever test the mutant happens to break. That is
+  worse than no measurement — it is a false positive someone else has to
+  disprove, and it looks exactly like a real finding.
 
 ### What a review must refuse
 
@@ -358,9 +368,10 @@ features, which forward `frp-core/websocket`, `frp-core/tls`, …), so
 Measured after the gates: `frp-server`'s step exited 0 with 436 passed /
 0 failed in three of five samples, with an `frps` binary present (2m08s warm);
 the other two were 435 passed / 1 failed on the pre-existing
-`test_tcpmux_proxy_auth_interior_space_rejected_407` flake, which also fails
-with default features and is the only measured pre-existing failure in those
-five samples. Without an `frps` binary the same command adds 5 environmental
+`test_tcpmux_proxy_auth_interior_space_rejected_407` flake, since fixed (it has
+its own `TODO.md` entry); it also failed with default features and was the only
+measured pre-existing failure in those five samples. Without an `frps` binary
+the same command adds 5 environmental
 `oidc_integration` failures — that is why it is not in the unit lane.
 `frp-client`'s step exits 101 **on this macOS host** with 312-313 passed
 and 1-2 failed, both failures not this class and recorded in

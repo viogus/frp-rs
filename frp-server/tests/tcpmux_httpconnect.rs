@@ -9,7 +9,9 @@ mod common;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use common::{allocate_port, login_with_test_token, start_test_server, test_auth_cfg};
+use common::{
+    allocate_port, login_with_test_token, read_until_eof, start_test_server, test_auth_cfg,
+};
 use frp_core::config::ServerConfig;
 use frp_core::msg::{self, FrpMessage, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
@@ -55,6 +57,15 @@ fn tcpmux_proxy(name: &str, domains: Vec<String>, local: &str) -> NewProxy {
 /// bytes — the audit-r7 Go-shape 404 carries the 489-byte builtin HTML, so a
 /// head-only stop would return before the response is complete. Loopback
 /// reads of small responses can arrive split.
+///
+/// It stops after the FIRST response, but returns **every byte a read
+/// happened to deliver**. That is only sound where the server sends exactly
+/// one response: on the tcpmux reject path the server writes the successHook
+/// `200` and then the `407` as two `write_all` calls on one conn (Go
+/// successHook-before-checkAuth order), and whether the second one rides
+/// along in the first read is a scheduling accident. Use
+/// [`send_connect_reject`] there, which reads to EOF — the server closes
+/// after the `407`, so EOF is the reliable end-of-response marker.
 async fn read_full_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 128];
@@ -127,15 +138,41 @@ async fn open_work_conn(addr: SocketAddr, run_id: &str) -> tokio::net::TcpStream
     work
 }
 
-/// Send one CONNECT to the tcpmux listener and read the full status response.
-async fn send_connect(tcpmux_addr: SocketAddr, request: &[u8]) -> (tokio::net::TcpStream, String) {
+/// Open a connection to the tcpmux listener and send one CONNECT request.
+async fn open_connect(tcpmux_addr: SocketAddr, request: &[u8]) -> tokio::net::TcpStream {
     let mut client = tokio::net::TcpStream::connect(tcpmux_addr)
         .await
         .expect("connect to tcpmux port");
     client.write_all(request).await.expect("send CONNECT");
+    client
+}
+
+/// Send one CONNECT to the tcpmux listener and read the full status response.
+/// Single-response paths only — see [`read_full_response`].
+async fn send_connect(tcpmux_addr: SocketAddr, request: &[u8]) -> (tokio::net::TcpStream, String) {
+    let mut client = open_connect(tcpmux_addr, request).await;
     let response = read_full_response(&mut client).await;
-    let text = String::from_utf8_lossy(&response).into_owned();
-    (client, text)
+    (client, String::from_utf8_lossy(&response).into_owned())
+}
+
+/// Send one CONNECT whose answer is the reject pair — in non-passthrough mode
+/// the matched route's successHook `200 OK` and then the fail-closed `407`, in
+/// passthrough mode the `407` alone (`tcpmux.rs` skips the 200 there) — and
+/// read until the server closes.
+///
+/// Reading one response instead would make the outcome depend on how the two
+/// writes were segmented: measured on macOS arm64, the whole 4-test target
+/// failed 19 of 144 single-process and concurrent runs pre-fix, every failure
+/// with exactly `"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"` and no `407`
+/// in the buffer. The sibling `tcpmux.rs` auth test reads to EOF for the same
+/// pair.
+async fn send_connect_reject(
+    tcpmux_addr: SocketAddr,
+    request: &[u8],
+) -> (tokio::net::TcpStream, String) {
+    let mut client = open_connect(tcpmux_addr, request).await;
+    let response = read_until_eof(&mut client).await;
+    (client, String::from_utf8_lossy(&response).into_owned())
 }
 
 /// Read the StartWorkConn frame the server sends on a pooled work conn when a
@@ -404,8 +441,10 @@ async fn test_tcpmux_proxy_auth_interior_space_rejected_407() {
     // StdEncoding → the route's http_user check fails → 407 (fail-closed),
     // but AFTER the matched route's successHook 200 (Go write-order —
     // vhost.go handle: successHook runs before checkAuth). Assert both
-    // statuses on the same conn, in Go order.
-    let (_, response) = send_connect(
+    // statuses on the same conn, in Go order. Read to EOF, not one response:
+    // the two writes are separately segmented, so a single-response read
+    // sees only the 200 whenever they land in different reads.
+    let (_, response) = send_connect_reject(
         tcpmux_addr,
         b"CONNECT auth-strict.example.com:443 HTTP/1.1\r\n\
           Host: auth-strict.example.com:443\r\n\
