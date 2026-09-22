@@ -809,8 +809,12 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `quic,kcp`, `vnet,compression`, `quic --all-targets`; frp-server `vnet,ssh`, `ssh`. Tests over
   the edited code: `cargo test -p frp-core --lib xtcp_session` → 2 passed / 0 failed / 854
   filtered out, exit 0; `cargo test -p frp-client --features tcp-mux --lib visitor` → 25 passed
-  / 0 failed / 244 filtered out, exit 0; `cargo test -p frp-client --features vnet --lib
-  virtual_net` (the re-gated imports' module) → 5 passed / 0 failed / 283 filtered out, exit 0.
+  / 0 failed / 246 filtered out, exit 0; `cargo test -p frp-client --features vnet --lib
+  virtual_net` (the re-gated imports' module) → 5 passed / 0 failed / 285 filtered out, exit 0.
+  The two frp-client `filtered out` counts are relative to **271** lib tests in this tree, and the
+  total is quoted with them deliberately: they were first written as 244/283 — measured before
+  #363 added 2 lib tests — and moved by exactly 2. **Nothing gates a `filtered out` value**, so a
+  bare count in durable prose cannot be checked later and silently rots; quote the total instead.
   **Gate added** (`.github/workflows/ci.yml:495`, `verify` lane): `Check the four measured-red
   intra-crate feature combinations (curated list, NOT the full 2^N space)` runs exactly those
   four commands in one `set -e` block under `env: RUSTFLAGS: "-D warnings"`, in the isolated `-p`
