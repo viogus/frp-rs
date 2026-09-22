@@ -1134,7 +1134,8 @@ fn open_handle_canonical(
 /// percent-encoded byte-wise with uppercase hex. Link-text escaping =
 /// htmlReplacer (net/http server.go): & < > " ' -> &amp; &lt; &gt; &#34;
 /// &#39;. Entries are sorted byte-wise over the RAW names — Go dirList runs
-/// sort.Slice itself (fs.go:156), with the same byte comparison over
+/// sort.Slice itself (fs.go:160 in go1.25.12 — the line drifts between Go
+/// releases; :156 was stale), with the same byte comparison over
 /// Name() strings, so this sort matches Go's and lossy-string sorting
 /// would misorder invalid UTF-8 names. Round-16 FIX 2: the href escapes
 /// the RAW name bytes, so a
@@ -1143,22 +1144,48 @@ fn open_handle_canonical(
 /// raw bytes into the HTML body; the body is a UTF-8 String here).
 fn render_dir_listing(dir: &std::path::Path) -> Result<String, String> {
     let rd = std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
-    let mut entries: Vec<(Vec<u8>, bool)> = Vec::new();
+    let mut entries: Vec<(std::ffi::OsString, bool)> = Vec::new();
     for ent in rd {
         let ent = ent.map_err(|e| format!("read_dir entry in {}: {e}", dir.display()))?;
         let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        // Raw name BYTES — cfg(unix) without any lossy hop (OsStringExt);
-        // elsewhere names decode lossily at the platform boundary
-        // (compile-time-only path — same rule as join_components).
-        #[cfg(unix)]
-        let name_bytes = {
-            use std::os::unix::ffi::OsStringExt;
-            ent.file_name().into_vec()
-        };
-        #[cfg(not(unix))]
-        let name_bytes = ent.file_name().to_string_lossy().as_bytes().to_vec();
-        entries.push((name_bytes, is_dir));
+        // The name stays an OsString here: the raw-bytes hop lives in the
+        // pure `render_listing` below, where it is unit-testable with a name
+        // the host filesystem may refuse to store at all (APFS/EILSEQ — see
+        // the e2e test's runtime-capability skip).
+        entries.push((ent.file_name(), is_dir));
     }
+    Ok(render_listing(&entries))
+}
+
+/// Pure half of `render_dir_listing`: takes the already-collected
+/// `(name, is_dir)` entries, converts each name to bytes, sorts byte-wise and
+/// renders the Go dirList body. No filesystem access, so it runs — and can be
+/// asserted byte-exactly — on a host whose filesystem cannot store the
+/// non-UTF-8 name at all: restoring the pre-round-16 lossy hop
+/// (`to_string_lossy()`) HERE turns `raw%FF.txt` into `raw%EF%BF%BD.txt` and
+/// moves the byte-wise sort order with it — both pinned by
+/// `test_render_listing_non_utf8_name_escapes_byte_exact`, whose lossy-sort-key
+/// mutation the first three entries alone cannot catch. The `#[cfg(unix)]` e2e
+/// half cannot observe any of this on APFS because the write of the 0xFF name
+/// itself fails there (EILSEQ). The name→bytes hop deliberately lives in this
+/// pure half for that reason.
+fn render_listing(entries: &[(std::ffi::OsString, bool)]) -> String {
+    let mut entries: Vec<(Vec<u8>, bool)> = entries
+        .iter()
+        .map(|(name, is_dir)| {
+            // Raw name BYTES — cfg(unix) without any lossy hop (OsStringExt);
+            // elsewhere names decode lossily at the platform boundary
+            // (compile-time-only path — same rule as join_components).
+            #[cfg(unix)]
+            let name_bytes = {
+                use std::os::unix::ffi::OsStringExt;
+                name.clone().into_vec()
+            };
+            #[cfg(not(unix))]
+            let name_bytes = name.to_string_lossy().as_bytes().to_vec();
+            (name_bytes, *is_dir)
+        })
+        .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let mut out = String::from(
         "<!doctype html>\n<meta name=\"viewport\" content=\"width=device-width\">\n<pre>\n",
@@ -1175,7 +1202,7 @@ fn render_dir_listing(dir: &std::path::Path) -> Result<String, String> {
         out.push_str("</a>\n");
     }
     out.push_str("</pre>\n");
-    Ok(out)
+    out
 }
 
 /// Percent-encode a URL path exactly like Go's url.URL{Path: p}.String()
@@ -3372,7 +3399,11 @@ mod tests {
     /// UTF-8 request path serves the same file. (The old Latin-1 `as char`
     /// decode re-encoded %C3%AF as C3 83 C2 AF — a mojibake name that
     /// 404'd. cfg(unix): names that are not valid UTF-8 at all round-trip
-    /// byte-exactly too.)
+    /// byte-exactly too — except that the `#[cfg(unix)]` half skips itself at
+    /// runtime on a filesystem that cannot store a 0xFF name (APFS/EILSEQ;
+    /// see the skip block below). The pure `render_listing` and
+    /// `join_components` unit tests cover those two hops unconditionally,
+    /// including on such a filesystem.)
     #[tokio::test]
     async fn test_static_file_e2e_non_ascii_round_trip() {
         let dir = tempfile::tempdir().unwrap();
@@ -3417,7 +3448,39 @@ mod tests {
         {
             use std::os::unix::ffi::OsStringExt;
             let raw_name = std::ffi::OsString::from_vec(b"raw\xff.txt".to_vec());
-            std::fs::write(dir.path().join(&raw_name), b"raw-ff-body").unwrap();
+            // Runtime-capability skip: not every filesystem can represent a
+            // non-UTF-8 name at all. APFS rejects byte 0xFF with EILSEQ —
+            // measured on macOS arm64 as `Os { code: 92, kind: Uncategorized,
+            // message: "Illegal byte sequence" }`.
+            //
+            // The match is on `raw_os_error` because NO stable `ErrorKind`
+            // matches: the measured kind is `Uncategorized`, and
+            // `ErrorKind::Uncategorized` is `#[unstable]`/`#[doc(hidden)]`, so
+            // it cannot be named on stable — there is no viable kind match to
+            // reject here, `raw_os_error` was the only option.
+            //
+            // EILSEQ is not one value: 92 on macOS, 86 on FreeBSD, 85 on
+            // NetBSD, 84 on Linux and OpenBSD (88 on MIPS, 122 on SPARC, per
+            // libc's constants). The two arms matched below cover the
+            // platforms this repo runs on. They collide with unrelated errnos
+            // — 84 is EOVERFLOW on macOS and 92 is ENOPROTOOPT on Linux — but
+            // neither is reachable from `std::fs::write` on a regular path, so
+            // the collision cannot mask a real failure.
+            //
+            // Failure direction is fail-loud: only EILSEQ returns early; every
+            // other error still panics. The property under test is frp-rs's
+            // byte-exact escaping and round-trip, not the host filesystem's
+            // capability.
+            if let Err(e) = std::fs::write(dir.path().join(&raw_name), b"raw-ff-body") {
+                if matches!(e.raw_os_error(), Some(92) | Some(84)) {
+                    eprintln!(
+                        "skipping the non-UTF-8 filename half: this filesystem cannot \
+                         store such a name ({e})"
+                    );
+                    return;
+                }
+                panic!("writing the non-UTF-8 name failed unexpectedly: {e}");
+            }
             let listing2 = raw_get(addr, b"GET / HTTP/1.1\r\nHost: t\r\n\r\n").await;
             let ls2 = String::from_utf8_lossy(&listing2);
             assert!(
@@ -3606,5 +3669,74 @@ mod tests {
                 "symlink-to-dir must not get '/': {l3}"
             );
         }
+    }
+
+    /// Round-16 FIX 2, pure half: the name→bytes hop must keep a name that is
+    /// NOT valid UTF-8 byte-exact, so the dirList href is `%FF`, and the
+    /// byte-wise sort key must be the RAW bytes. Synthetic entries only — no
+    /// filesystem, so this runs on APFS, where the `#[cfg(unix)]` half of
+    /// `test_static_file_e2e_non_ascii_round_trip` skips because a 0xFF name
+    /// cannot be created at all (EILSEQ).
+    ///
+    /// Two mutations this pins, each checked by mutation:
+    /// * the pre-round-16 lossy hop (`into_vec()` →
+    ///   `to_string_lossy().as_bytes().to_vec()`) renders `raw%EF%BF%BD.txt`
+    ///   instead of `raw%FF.txt`. Before this test nothing in the suite
+    ///   observed that on macOS.
+    /// * a lossy SORT key (`from_utf8_lossy` in the comparator) is invisible
+    ///   to the first three entries, whose raw and lossy orders agree — hence
+    ///   `a\xff` and `a\xf0\x90\x80\x80` (U+10000): raw sorts `F0 90 80 80`
+    ///   before `FF`, while a lossy key collapses `a\xff` to `61 EF BF BD` and
+    ///   moves it *ahead*. The two keys stay distinct, so the flip does **not**
+    ///   depend on sort stability. Go compares Go strings, i.e. raw bytes
+    ///   (`net/http/fs.go` `dirList` sorts `Name()` with `sort.Slice`), so the
+    ///   raw key is the faithful one — and for a genuinely tied key Go's
+    ///   *unstable* `sort.Slice` (sort/slice.go:15-17) has no fixed expectation
+    ///   to match, which is why the pair here is chosen to be tie-free.
+    ///   The input array is deliberately NOT in rendered order, so the order
+    ///   in the expected body also proves a sort happened at all.
+    #[cfg(unix)]
+    #[test]
+    fn test_render_listing_non_utf8_name_escapes_byte_exact() {
+        use std::os::unix::ffi::OsStringExt;
+        let name = |b: &[u8]| std::ffi::OsString::from_vec(b.to_vec());
+        let entries = [
+            (name(b"sub\xff"), true),
+            (name(b"plain.txt"), false),
+            (name(b"a\xff"), false),
+            (name(b"raw\xff.txt"), false),
+            (name(b"a\xf0\x90\x80\x80"), false),
+        ];
+        assert_eq!(
+            render_listing(&entries),
+            "<!doctype html>\n\
+             <meta name=\"viewport\" content=\"width=device-width\">\n\
+             <pre>\n\
+             <a href=\"a%F0%90%80%80\">a\u{10000}</a>\n\
+             <a href=\"a%FF\">a\u{fffd}</a>\n\
+             <a href=\"plain.txt\">plain.txt</a>\n\
+             <a href=\"raw%FF.txt\">raw\u{fffd}.txt</a>\n\
+             <a href=\"sub%FF/\">sub\u{fffd}/</a>\n\
+             </pre>\n"
+        );
+    }
+
+    /// `join_components` (unix) must carry a non-UTF-8 component byte-exactly
+    /// to the open; a lossy hop (`String::from_utf8_lossy`) would replace the
+    /// 0xFF with EF BF BD and 404. This is the only test of the unix arm —
+    /// the e2e arm that exercises it cannot create such a name on APFS.
+    #[cfg(unix)]
+    #[test]
+    fn test_join_components_non_utf8_component_byte_exact() {
+        use std::os::unix::ffi::OsStrExt;
+        // The byte-exact assertion already rules out the exact mojibake a lossy
+        // hop would produce (`/base/raw` + bytes `EF BF BD` + `.txt`). A
+        // separate `assert_ne!` against that string would be dead code — this
+        // assertion fails first, so the negative one could never be the
+        // detector.
+        let one = join_components("/base", &[b"raw\xff.txt".to_vec()]);
+        assert_eq!(one.as_os_str().as_bytes(), b"/base/raw\xff.txt");
+        let two = join_components("/base", &[b"sub".to_vec(), b"raw\xff.txt".to_vec()]);
+        assert_eq!(two.as_os_str().as_bytes(), b"/base/sub/raw\xff.txt");
     }
 }

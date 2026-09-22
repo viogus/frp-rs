@@ -392,8 +392,11 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     --features websocket` (control: `--test end_to_end` with default features 7 passed /
     0 failed); the other is
     `plugin::static_file::tests::test_static_file_e2e_non_ascii_round_trip`
-    (`frp-client/src/plugin/static_file.rs:3420`, `EILSEQ`), which also fails with default
-    features (0 passed / 1 failed) — macOS-only, not this class.
+    (`frp-client/src/plugin/static_file.rs:3471` is the `EILSEQ` write; the line
+    moved with the fixes below, and that test now skips the half at runtime and
+    passes at default features — see its own `- [x]` entry), which also failed
+    with default features (0 passed / 1 failed) at the time of this sample —
+    macOS-only, not this class.
   Gating these and adding sibling runtime steps is its own change. **Done-when:** each
   runtime-failing target carries its gate (or the configuration is documented as unsupported)
   and a step runs it.
@@ -636,19 +639,75 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   deliberately does not touch them. `is_peer_close` accepts `BrokenPipe`, which no probe on
   this host could produce from a `read` (EPIPE is a write-side error) — kept for the pin's
   contract and documented as unverified on a read path. All measurements are macOS arm64.
-- [ ] **`plugin::static_file::tests::test_static_file_e2e_non_ascii_round_trip` fails on macOS,
+- [x] **`plugin::static_file::tests::test_static_file_e2e_non_ascii_round_trip` failed on macOS,
   at default features.** Measured: `cargo test -p frp-client --lib
   test_static_file_e2e_non_ascii_round_trip` → `panicked at
   frp-client/src/plugin/static_file.rs:3420:72: called Result::unwrap() on an Err value: Os {
-  code: 92, kind: Uncategorized, message: "Illegal byte sequence" }`. The line writes a file
+  code: 92, kind: Uncategorized, message: "Illegal byte sequence" }` — that write is now at
+  `frp-client/src/plugin/static_file.rs:3471`, the line having moved with the fixes below. The
+  line wrote a file
   whose name contains byte `0xFF` (`OsString::from_vec(b"raw\xff.txt".to_vec())`), which this
-  host's filesystem rejects with `EILSEQ`. Not measured on Linux; it is an `frp-client` **lib**
-  test, so of the two new steps only `Run frp-client's tests with no features` runs it (the
-  `-p frp-server` step runs no `frp_client` test target). It also runs in the
-  default-feature `Tests (client integration)` lane,
-  so it is the one local `frp-client` failure expected not to appear on the ubuntu-latest
-  runner. **Done-when:** the non-UTF-8-name half of the test is skipped where the filesystem
-  cannot store such a name, or it is platform-conditional.
+  host's filesystem rejects with `EILSEQ`. It is an `frp-client` **lib** test, so of the three
+  no-features *runtime* test steps (`ci.yml:97` frp-core, `:129` frp-client, `:220` frp-server)
+  only `Run frp-client's tests with no features` runs it — the other two are `-p frp-core` /
+  `-p frp-server` and build no `frp_client` test target; it also runs in the default-feature
+  `Tests (client integration)` lane.
+  **Fixed** by skipping only the non-UTF-8-name **half** where the filesystem cannot store such
+  a name — the property under test is frp-rs's byte-exact escaping and round-trip, not the
+  host's filesystem capability. The write is now `if let Err(e)` and returns early only when
+  `e.raw_os_error()` is `EILSEQ`. The earlier "`92` on macOS/BSD, `84` on Linux" wording was
+  **wrong for BSD**: per libc's constants EILSEQ is 92 on macOS, 86 on FreeBSD, 85 on NetBSD, 84
+  on Linux and OpenBSD (88 on MIPS, 122 on SPARC), so the two matched arms serve macOS and
+  Linux/OpenBSD. The arms collide with unrelated errnos (84 = `EOVERFLOW` on macOS, 92 =
+  `ENOPROTOOPT` on Linux) but neither is reachable from `std::fs::write` on a regular path — now
+  stated in the code comment instead of left implicit. Every other error still
+  panics, so a genuine failure cannot be swallowed: the direction is fail-loud (panic), not a
+  silent skip. It matches on `raw_os_error` because **no stable `ErrorKind` matches at all** —
+  the measured kind is `Uncategorized`, and `ErrorKind::Uncategorized` is
+  `#[unstable]`/`#[doc(hidden)]` and cannot be named on stable, so `raw_os_error` was the only
+  option rather than a choice against a viable kind match.
+  Verified: the test now passes and prints
+  `skipping the non-UTF-8 filename half: this filesystem cannot store such a name (Illegal byte
+  sequence (os error 92))`, i.e. the skip branch is the one that fires (not a silent pass).
+  **Coverage of the skipped hops (this change; both run on APFS, no filesystem capability
+  needed):** the `DirEntry` name→bytes hop was extracted into a pure
+  `render_listing(entries: &[(OsString, bool)]) -> String` that `render_dir_listing` now calls,
+  and `test_render_listing_non_utf8_name_escapes_byte_exact` feeds it a synthetic
+  `b"raw\xff.txt"` (plus a `sub\xff` directory) and asserts the whole HTML body byte-exactly,
+  including `<a href="raw%FF.txt">`; it also pins the byte-wise **sort key** with the tie-free
+  pair `b"a\xff"` / `b"a\xf0\x90\x80\x80"` — raw order puts `F0 90 80 80` before `FF`, a lossy
+  comparator collapses `a\xff` to `61 EF BF BD` and moves it ahead (the two keys stay distinct, so
+  the flip does not depend on sort stability), and the other three names cannot tell the two keys
+  apart (Reviewer 1 F7 / Reviewer 2 N1; the input array is deliberately not in rendered order, so
+  the order in the expected body also proves a sort happened at all);
+  `test_join_components_non_utf8_component_byte_exact` pins `join_components`'s unix arm on
+  `b"raw\xff.txt"` — its only call site is this path and it had **no direct** test before
+  (existing e2e tests reached it indirectly, with valid-UTF-8 names only).
+  Mutation-checked: restoring the pre-round-16 lossy hop in `render_listing`
+  (`name.clone().into_vec()` → `name.to_string_lossy().as_bytes().to_vec()`) makes the new
+  `render_listing` test fail, where before this change the entire `frp-client` lib suite stayed
+  green under that mutation on macOS (`269 passed; 0 failed`).
+  Counts after this change: `cargo test -p frp-client --lib static_file` **33 passed / 0 failed**
+  (was 31), `cargo test -p frp-client --lib` **271 passed / 0 failed** (was 269).
+  **Still NOT covered on a filesystem that cannot store the name:** the *e2e* half itself. The
+  `%FF` request → decode → `join_components` → open → serve chain is unexercised here, as is
+  collecting a **non-UTF-8** `DirEntry` — the `read_dir` loop itself does run on APFS for the
+  UTF-8 `naïve.txt` entry, and after the split that hop is `ent.file_name()`, an `OsString` →
+  `OsString` move with no lossy step in it to get wrong. The new tests pin the pure escaping and
+  joining hops they *call*, not the socket-level round trip, so a regression *between*
+  `render_listing` and the file open — in the caller, in the request decoder's wiring into this
+  handler (`urlencoding_decode("%FF")` is itself unit-pinned at
+  `frp-client/src/plugin/mod.rs:2588`), or in the collection loop — remains invisible on this
+  host and rests on the `Tests (client integration)` lane on ubuntu-latest, which is exactly
+  where the item expected the failure not to appear.
+  **Deliberately not done (Reviewer 2 N5, NIT):** `render_listing` borrows `&[(OsString, bool)]`
+  and therefore clones each name (`name.clone().into_vec()` at the hop) where the pre-change
+  code was zero-copy (`ent.file_name().into_vec()`). Passing the `Vec` by value and iterating
+  with `into_iter()` removes that clone and keeps the hop reachable by a synthetic test, so this
+  is a viable follow-up. It was left alone because the item is about *coverage*, not listing
+  throughput: the saving is one allocation per directory entry, no measurement shows the listing
+  path is hot, and the change would re-open a production signature that has already been reviewed
+  twice. Recorded here so a later round can do it with a measurement.
 - [x] **`frpc-tiny`'s test targets did not compile.** Evidence:
   `cargo check -p frp-client --no-default-features --features tls,tcp-mux --all-targets`
   — exactly the tiny tier for frp-client, measured `['tcp-mux','tls']` — exited 101 with

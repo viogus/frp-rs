@@ -151,19 +151,27 @@ jobs:
         # frp-client/ references FRPS_BIN/FRPC_BIN), so no env is set here.
         #
         # Caveat, measured on macOS arm64 and NOT on the runner: this whole
-        # command also fails two pre-existing, timing/platform-sensitive lib
-        # tests that are not this class and carry their own TODO.md entry —
+        # command also fails one pre-existing, timing/platform-sensitive lib
+        # test that is not this class and carries its own TODO.md entry —
         # `plugin::http::tests::http_proxy_head_read_absolute_window_releases_trickler`
         # (6 of 10 isolated no-features runs failed; 3 of 3 with default
-        # features) and `plugin::static_file::tests::
-        # test_static_file_e2e_non_ascii_round_trip` (`Os { code: 92, kind:
-        # Uncategorized, message: "Illegal byte sequence" }` writing a file name
-        # containing byte 0xFF, rejected by this host's filesystem); in one
+        # features); in one
         # sample the two `plugin::https2http/https2https` `start_paused`
         # handshake-deadline tests failed too. Every one of them is also run by
         # the existing default-features `Tests (client integration)` lane
         # (`cargo test -p frp-client --features admin -j 1`), measured red on
         # this host in the same way, so nothing here is introduced by this step.
+        #
+        # The set is one smaller than when this step was written:
+        # `plugin::static_file::tests::test_static_file_e2e_non_ascii_round_trip`
+        # no longer fails. It writes a file name containing byte 0xFF, which
+        # this host's filesystem rejects with `Os { code: 92, kind:
+        # Uncategorized, message: "Illegal byte sequence" }`, and now skips
+        # only that half at runtime for EILSEQ; the name→bytes hop and the
+        # bytes→path hop it would have exercised are pinned instead by the pure,
+        # filesystem-independent `render_listing` / `join_components` unit tests
+        # in the same module. (Two different directions: `render_listing` is the
+        # name→bytes hop, `join_components` is the bytes→path hop.)
         #
         # Wall clock, macOS arm64 warm build: 1m12s to 3m07s on four runs (the
         # shortest aborted at the first failing lib target). `--no-fail-fast`
