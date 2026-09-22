@@ -359,10 +359,10 @@ Measured after the gates: `frp-server`'s step exited 0 with 436 passed /
 0 failed in three of five samples, with an `frps` binary present (2m08s warm);
 the other two were 435 passed / 1 failed on the pre-existing
 `test_tcpmux_proxy_auth_interior_space_rejected_407` flake, which also fails
-with default features and is the only thing that step can go red on. Without an
-`frps` binary the same command adds
-5 environmental `oidc_integration` failures — that is why it is not in the unit
-lane. `frp-client`'s step exits 101 **on this macOS host** with 312-313 passed
+with default features and is the only measured pre-existing failure in those
+five samples. Without an `frps` binary the same command adds 5 environmental
+`oidc_integration` failures — that is why it is not in the unit lane.
+`frp-client`'s step exits 101 **on this macOS host** with 312-313 passed
 and 1-2 failed, both failures not this class and recorded in
 [`../TODO.md`](../TODO.md) (a `start_paused` deadline flake and a
 filename-containing-`0xFF` `EILSEQ`); both also run in the existing

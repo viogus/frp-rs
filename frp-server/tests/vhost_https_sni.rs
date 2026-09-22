@@ -14,12 +14,13 @@
 // (frp-server/src/vhost.rs:1586) while the `not(feature = "tls")` stub
 // (frp-server/src/vhost.rs:1829) never binds and returns
 // `Err("TLS feature not enabled")`; the call site in the service is not itself
-// gated (frp-server/src/service.rs:673). Measured with no features:
+// gated (the `crate::vhost::run_vhost_https_listener(...)` call is at
+// frp-server/src/service.rs:685). Measured with no features:
 // `connect to https vhost port: Os { code: 61, kind: ConnectionRefused,
 // message: "Connection refused" }` from the `expect("connect to https vhost
-// port")` at vhost_https_sni.rs:220 and :468 in this tree, and
+// port")` at vhost_https_sni.rs:221 and :469 in this tree, and
 // `TLS control dial: Transport(Other("TLS connect: Connection reset by peer
-// (os error 54)"))` at :330. Gating the file wholesale would drop
+// (os error 54)"))` at :331. Gating the file wholesale would drop
 // `test_hello_construction_extracts_sni` from the very run whose purpose is
 // that configuration.
 // The `tls` gates on the imports and helpers below are required, not

@@ -360,8 +360,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     also reproduced the 433 / 39 / 7 shape. 39 failures are deterministic:
     34 are feature-gated behaviour:
     27 are the `http-proxy` stub — `tests/http_plugin.rs` 22 failed / 1 passed and
-    `tests/http_plugin_ping.rs` 4 failed / 1 passed (both files contain zero `cfg(feature ...)`,
-    measured), plus the lib test `control::proxy_ops::unregister_generation_tests::
+    `tests/http_plugin_ping.rs` 4 failed / 1 passed (both files carried no
+    `cfg(feature ...)` before this change, measured), plus the lib test
+    `control::proxy_ops::unregister_generation_tests::
     stale_unregister_keeps_fresh_user_record` (in `frp-server/src/control/proxy_ops.rs`; its
     `assert_eq!` on `plugin_manager.user_info(...)`) which expects that to be `Some` while the
     `#[cfg(not(feature = "http-proxy"))]` stub (`frp-server/src/plugin/mod.rs:8-34`) makes
@@ -385,7 +386,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
       failures, not 40.
   - `cargo test -p frp-client --no-default-features --all-targets --no-fail-fast` exits 101
     with 313 passed / 2 failed: `test_e2e_tcp_proxy_over_websocket`
-    (`frp-client/tests/end_to_end.rs`, file contains zero `cfg(feature ...)`) fails on the
+    (`frp-client/tests/end_to_end.rs`; the file carried no `cfg(feature ...)` before this change)
+    fails on the
     proxy-port wait (`await.expect("proxy port ready")`) and passes with `--no-default-features
     --features websocket` (control: `--test end_to_end` with default features 7 passed /
     0 failed); the other is
@@ -395,10 +397,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   Gating these and adding sibling runtime steps is its own change. **Done-when:** each
   runtime-failing target carries its gate (or the configuration is documented as unsupported)
   and a step runs it.
-  Done: fixed in this change. Every runtime-failing target in the no-features configuration now
-  carries its gate, and both crates have a runtime step. Per file, with the **minimal** feature
-  floor each gate needs (measured: the passing run enables that one feature and nothing else,
-  and removing the gate reproduces the failure below):
+  Done: fixed in this change. Every runtime failure in the no-features configuration **caused by
+  a missing feature gate** now carries that gate, and both crates have a runtime step. Per file,
+  with the **minimal** feature floor each gate needs (measured: the passing run enables that one
+  feature and nothing else, and removing the gate reproduces the failure below):
   - `frp-server/tests/http_plugin.rs` — whole-file `#![cfg(feature = "http-proxy")]`. Ungated in
     this configuration: 1 passed / 22 failed. Gated: 0 tests here, `cargo test -p frp-server
     --no-default-features --features http-proxy --test http_plugin` 23 passed / 0 failed.

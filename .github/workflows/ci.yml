@@ -151,17 +151,17 @@ jobs:
         # frp-client/ references FRPS_BIN/FRPC_BIN), so no env is set here.
         #
         # Caveat, measured on macOS arm64 and NOT on the runner: this whole
-        # command also fails three pre-existing, timing/platform-sensitive lib
+        # command also fails two pre-existing, timing/platform-sensitive lib
         # tests that are not this class and carry their own TODO.md entry —
         # `plugin::http::tests::http_proxy_head_read_absolute_window_releases_trickler`
         # (6 of 10 isolated no-features runs failed; 3 of 3 with default
         # features) and `plugin::static_file::tests::
         # test_static_file_e2e_non_ascii_round_trip` (`Os { code: 92, kind:
         # Uncategorized, message: "Illegal byte sequence" }` writing a file name
-        # containing byte 0xFF, rejected by this host's filesystem), plus on one
+        # containing byte 0xFF, rejected by this host's filesystem); in one
         # sample the two `plugin::https2http/https2https` `start_paused`
-        # handshake-deadline tests. Every one of them is also run by the
-        # existing default-features `Tests (client integration)` lane
+        # handshake-deadline tests failed too. Every one of them is also run by
+        # the existing default-features `Tests (client integration)` lane
         # (`cargo test -p frp-client --features admin -j 1`), measured red on
         # this host in the same way, so nothing here is introduced by this step.
         #
@@ -258,9 +258,9 @@ jobs:
         # pre-existing, feature-independent
         # `test_tcpmux_proxy_auth_interior_space_rejected_407` flake, which has
         # its own TODO.md entry and also fails with default features — it is the
-        # only thing this step can go red on. Measured without an frps binary,
-        # the same command adds 5 environmental `oidc_integration` failures;
-        # that is why it is not in the unit lane.
+        # only measured pre-existing failure in those five samples. Measured
+        # without an frps binary, the same command adds 5 environmental
+        # `oidc_integration` failures; that is why it is not in the unit lane.
         #
         # Caveat: the runner (Linux, cache restored from a default-feature
         # build) was not measured; the restored cache does not contain this
