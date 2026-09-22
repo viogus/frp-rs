@@ -818,19 +818,23 @@ async fn handle_head_not_allowed() -> StatusCode {
 /// adopted here as a deliberate scope choice. Reviewer 2 built
 /// `.route_layer(auth)` (which on its own fixes the two unknown-path cells,
 /// because middleware added that way runs only when a route matches — axum
-/// `docs/routing/route_layer.md`) plus a *route-aware* outermost HEAD layer
-/// (which fixes the unauthenticated-HEAD cell): 8/8 rows on an isolated axum
-/// 0.8.9 probe and 14/14 rows on the real admin router over the wire matched
-/// Go, and the coordinator reproduced the mechanism. It is not taken here
-/// because:
+/// `axum-0.8.9/src/docs/routing/route_layer.md`) plus a *route-aware* outermost
+/// HEAD layer (which fixes the unauthenticated-HEAD cell): 8/8 rows on an
+/// isolated axum 0.8.9 probe and 14/14 rows on the real admin router over the
+/// wire matched Go, and the coordinator reproduced the mechanism. It is not
+/// taken here because:
 ///
 /// 1. `.route_layer` lets unmatched paths bypass auth, so an unauthenticated
 ///    client gets 404/405 for an unknown path instead of 401 — it reveals
 ///    which paths and methods exist. axum's own `route_layer` doc names this
 ///    trade-off ("might otherwise convert a `404 Not Found` into a `401
-///    Unauthorized`"). That is a security-posture change, and this repo
-///    already deviates from Go for security elsewhere (the admin server binds
-///    localhost-only even when auth is configured).
+///    Unauthorized`"). Reviewer 2 measured the sharper form: an unauthenticated
+///    `GET /api/store/proxies` would answer 401 when the store is enabled and
+///    404 when it is not, disclosing *configuration state*, not merely path
+///    existence. That is a security-posture change, and this repo already
+///    deviates from Go for security elsewhere: a wildcard/unspecified
+///    `web_server.addr` is forced to `127.0.0.1` regardless of auth, and an
+///    explicit non-loopback address is honoured only when auth is set.
 /// 2. The HEAD half needs a production route-pattern predicate that matches
 ///    `{name}` segments without over-matching (`/api/proxy/a/b/config`);
 ///    Reviewer 2's prototype over-matched. axum 0.8.9 exposes no route
@@ -845,13 +849,17 @@ async fn handle_head_not_allowed() -> StatusCode {
 /// routes too. `/api/metrics` is the genuinely frp-rs-only one: Go v0.71.0's
 /// client admin has no such route at all (404 for GET and HEAD — measured), so
 /// no Go parity is claimed for it. The `/api/store/*` routes are **not**
-/// frp-rs-only: Go ships the same paths and, with `store.path` set, answers GET
-/// 200 / HEAD 405 / OPTIONS 405 — identical to this tree after the change
-/// (measured; `main` answered 200 to HEAD on all four, so this change also
-/// repairs them). Only the request/response *payload shape* is frp-rs-specific,
-/// as `docs/deployment.md` states. POST is unchanged: `frpc/src/main.rs:630-631`
-/// sends `POST` with a JSON body (`admin_post_json`), and the comment on the
-/// `/api/reload` route documents POST as a deliberate frp-rs extension.
+/// frp-rs-only: Go ships the same paths and, with `store.path` set, matches this
+/// tree after the change — HEAD 405 and OPTIONS 405 on all four, and GET 200 on
+/// the two collection routes with 404 on the two `{name}` routes while the store
+/// is empty (measured on both). Before the change `main` forwarded HEAD to the
+/// GET handler, so with an empty store HEAD answered 200 on the two collection
+/// routes and 404 on the two `{name}` routes (measured 200/404/200/404); all
+/// four now answer 405, so this change also repairs them. Only the
+/// request/response *payload shape* is frp-rs-specific, as `docs/deployment.md`
+/// states. POST is unchanged: `frpc/src/main.rs:630-631` sends `POST` with a
+/// JSON body (`admin_post_json`), and the comment on the `/api/reload` route
+/// documents POST as a deliberate frp-rs extension.
 /// `OPTIONS /api/reload` is already 405 on both, and `POST`/`HEAD /api/stop`
 /// already agree; only HEAD changes.
 fn admin_router(store_enabled: bool) -> Router<AdminState> {
@@ -889,9 +897,12 @@ fn admin_router(store_enabled: bool) -> Router<AdminState> {
         );
 
     // Store CRUD uses the Rust-native typed JSON body (full ProxyConfig /
-    // VisitorConfig objects). Go frp v0.70.1's admin API uses nested typed
-    // blocks (`ProxyDefinition` with tcp/udp/stcp...), so this endpoint is
-    // intentionally frp-rs-only and is not wire-compatible with Go clients.
+    // VisitorConfig objects). Go frp's admin API registers the same paths and
+    // its method behaviour matches this tree (GET 200 on the collections,
+    // 404 on `{name}` while empty, HEAD/OPTIONS 405 -- measured), but it uses
+    // nested typed blocks (`ProxyDefinition` with tcp/udp/stcp...), so the
+    // request/response *payload shape* is frp-rs-specific and is not
+    // wire-compatible with a Go admin client.
     if store_enabled {
         app.route(
             "/api/store/proxies",

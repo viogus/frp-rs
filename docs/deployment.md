@@ -617,8 +617,8 @@ Client endpoints:
 | `GET /api/visitor/{name}/config` | Effective config of one visitor |
 | `GET /api/reload` / `POST /api/reload` | Reload proxies from config file. Go-compatible strict mode via `?strictConfig=true`; the JSON body form is a frp-rs extension |
 | `POST /api/stop` | Gracefully stop the client |
-| `GET` / `POST /api/store/proxies`, `GET` / `PUT` / `DELETE /api/store/proxies/{name}` | Runtime proxy store CRUD — only when `store.path` is set; **frp-rs-only** (Go frp's admin API uses a different nested body shape, so this is not wire-compatible with a Go admin client) |
-| `GET` / `POST /api/store/visitors`, `GET` / `PUT` / `DELETE /api/store/visitors/{name}` | Runtime visitor store CRUD — same conditions |
+| `GET` / `POST /api/store/proxies`, `GET` / `PUT` / `DELETE /api/store/proxies/{name}` | Runtime proxy store CRUD — only when `store.path` is set; the same paths as Go frp (GET 200 / HEAD 405 / OPTIONS 405), but the body/payload shape is **frp-rs-specific** (Go frp's admin API uses a different nested body shape), so it is not wire-compatible with a Go admin client |
+| `GET` / `POST /api/store/visitors`, `GET` / `PUT` / `DELETE /api/store/visitors/{name}` | Runtime visitor store CRUD — same conditions and the same frp-rs-specific payload shape |
 
 `GET /api/reload` needs no body and no `Content-Type` — the Go-compatible call
 `curl -u user:pass http://127.0.0.1:7400/api/reload` reloads in non-strict mode.

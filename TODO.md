@@ -919,9 +919,12 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   1. `.route_layer` makes unmatched paths bypass auth, so an unauthenticated client gets
      404/405 for an unknown path instead of 401 — it reveals which paths and methods exist.
      axum's own `route_layer` doc names this trade-off ("might otherwise convert a
-     `404 Not Found` into a `401 Unauthorized`"). That is a security-posture change, and this
-     repo already deviates from Go for security elsewhere (the admin server binds
-     localhost-only even when auth is configured).
+     `404 Not Found` into a `401 Unauthorized`"). Reviewer 2 measured the sharper form: an
+     unauthenticated `GET /api/store/proxies` would answer 401 when the store is enabled and
+     404 when it is not, disclosing *configuration state*, not merely path existence. That is
+     a security-posture change, and this repo already deviates from Go for security elsewhere:
+     a wildcard/unspecified `web_server.addr` is forced to `127.0.0.1` regardless of auth (an
+     explicit non-loopback address is honoured only when auth is set).
   2. The HEAD half needs a production route-pattern predicate that matches `{name}` segments
      without over-matching (`/api/proxy/a/b/config`); Reviewer 2's prototype over-matched.
      axum 0.8.9 exposes no route introspection (only `has_routes() -> bool`), so the predicate
@@ -931,7 +934,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
      `frp-client/src/admin.rs` and `frp-server/src/dashboard.rs:3610/3626/3650`, so switching
      it to `route_layer` is not scoped to the frpc admin API.
   **Done-when:** either adopt the alternative with a production route predicate and the
-  dashboard's auth posture re-reviewed (accepting the path-existence disclosure), or record in
+  dashboard's auth posture re-reviewed (accepting the path-existence and configuration-state
+  disclosure), or record in
   `docs/deployment.md` that the 401-vs-404/405 unauthenticated divergence is permanent. No sha.
 - [ ] **Strict mode accepts unknown fields inside `[[proxies]]` / `[[visitors]]`, where Go
   rejects them — a deliberate, documented divergence that is not in this list and not in the
