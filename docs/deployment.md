@@ -617,8 +617,8 @@ Client endpoints:
 | `GET /api/visitor/{name}/config` | Effective config of one visitor |
 | `GET /api/reload` / `POST /api/reload` | Reload proxies from config file. Go-compatible strict mode via `?strictConfig=true`; the JSON body form is a frp-rs extension |
 | `POST /api/stop` | Gracefully stop the client |
-| `GET` / `POST /api/store/proxies`, `GET` / `PUT` / `DELETE /api/store/proxies/{name}` | Runtime proxy store CRUD — only when `store.path` is set; **frp-rs-only** (Go frp's admin API uses a different nested body shape, so this is not wire-compatible with a Go admin client) |
-| `GET` / `POST /api/store/visitors`, `GET` / `PUT` / `DELETE /api/store/visitors/{name}` | Runtime visitor store CRUD — same conditions |
+| `GET` / `POST /api/store/proxies`, `GET` / `PUT` / `DELETE /api/store/proxies/{name}` | Runtime proxy store CRUD — only when `store.path` is set; the same paths as Go frp (GET 200 / HEAD 405 / OPTIONS 405), but the body/payload shape is **frp-rs-specific** (Go frp's admin API uses a different nested body shape), so it is not wire-compatible with a Go admin client |
+| `GET` / `POST /api/store/visitors`, `GET` / `PUT` / `DELETE /api/store/visitors/{name}` | Runtime visitor store CRUD — same conditions and the same frp-rs-specific payload shape |
 
 `GET /api/reload` needs no body and no `Content-Type` — the Go-compatible call
 `curl -u user:pass http://127.0.0.1:7400/api/reload` reloads in non-strict mode.
@@ -638,6 +638,30 @@ strict-mode unknown key).
 `{"strict_config": true}` (also accepted as `"strictConfig"`, the spelling
 frpc's own CLI sends); when both channels are present the query parameter wins.
 A body that is present but malformed JSON is rejected with 400.
+
+Three request-target rules follow from Go and are worth knowing. Go's admin
+router matches methods exactly, so every `GET` route *Go registers* answers
+`HEAD` with `405 Method Not Allowed` (`/api/metrics` is frp-rs-only — Go has no
+such route and answers 404 for every method), and `HEAD /api/reload` never
+reloads, whatever the query says. An *unauthenticated* `HEAD` on a registered
+route is still `401` here, where Go answers `405` — and an unauthenticated
+request to an unknown path is `401` here where Go answers `404` — because the
+auth middleware runs before method routing. A measured alternative (`route_layer`
+for auth plus a route-aware outer HEAD layer) matches Go on both, but it would
+stop the auth layer from protecting unmatched paths, letting an unauthenticated
+client tell which paths exist; not adopting it is a deliberate scope choice
+tracked in `TODO.md`. More than 10000 query parameters disable `strictConfig`:
+Go's `net/url.parseQuery` opens with a parameter-count guard (`defaultMaxParams =
+10000`, inclusive, counting `&`s + 1) and its error leaves the query empty, so
+`?strictConfig=true` plus 9999 `&` is a strict 400 and plus 10000 `&` is a
+non-strict 200; frp-rs mirrors the guard, and because an over-limit query means
+"parameter absent" the JSON body form can still select strict mode (a frp-rs
+extension). Finally, do not put `#` in an admin request target: Go never splits
+a fragment, so `/api/reload?strictConfig=true#strictConfig=false` is non-strict
+for Go (its value is `true#strictConfig=false`) but strict here, and
+`/api/reload#x?strictConfig=true` is Go's 404 but a reload here. The fragment
+is dropped inside hyper's request-line parsing before any frp-rs code runs, so
+that divergence cannot be fixed without replacing the HTTP stack.
 
 ### Health Checks
 

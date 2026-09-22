@@ -81,7 +81,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   excludes integration tests. **Done-when:** the client integration lane runs with
   `--features admin`, or the test moves to a target that does.
   Done: fixed in #351. See that PR for the evidence and the residue it records.
-- [ ] Lower severity: `?strictConfig=a&strictConfig=b` returns 400 here and 200 in Go (Go
+- [x] Lower severity: `?strictConfig=a&strictConfig=b` returns 400 here and 200 in Go (Go
   reads the first value), which falsifies the documented "never a 400"; the
   `Option<Json<..>>` rationale is wrong (axum yields `None` only when `Content-Type` is
   absent, not for a malformed JSON body with the header set); `HEAD /api/reload` now
@@ -90,7 +90,22 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   first value wins). The `Option<Json<..>>` rationale is **already** fixed: `handle_reload`
   takes `body: Bytes` and its comment gives the correct reason ("a body that is present but
   not well-formed JSON must be a 400 on every method"), so no `Option<Json<..>>` remains to
-  mis-explain. The `HEAD`-performs-a-reload half is still open.
+  mis-explain.
+  Done: the `HEAD` half is fixed in `frp-client/src/admin.rs` — the admin route table
+  (`admin_router`) registers an explicit `.head(...)` on **every** `GET` route, answering
+  `405` and never running the GET handler. A blanket HEAD-rejection *layer* was rejected on
+  measurement, not on the axum docs: outermost it answers `405` for
+  `HEAD /api/nonexistent` where Go answers `404` (a new divergence); innermost it lets auth
+  win on a matched path (unauthenticated `HEAD /api/reload` -> 401, the very divergence it
+  was meant to avoid). Per-route `.head()` changes only `HEAD` on a *registered* route and
+  keeps axum's natural 404. Pinned by `admin_head_is_405_and_never_runs_a_get_handler`
+  (integration, unknown-key oracle: a handler run would answer 400/200, so a 405 is the
+  proof it did not run) and
+  `head_on_registered_admin_get_routes_is_405_without_running_the_handler` (unit, over the
+  real route table; also asserts that no reload request is enqueued by any HEAD). Residual,
+  pre-existing and unchanged: an unauthenticated `HEAD` on a registered route is 401 here
+  where Go answers 405, because frp-rs wraps the whole router in the auth layer before the
+  method router runs.
 - [x] **Corrected record: the hypothesised "malformed escape also 400'd" class did
   not exist.** The claim was that `?strictConfig=%zz`/`%ff` answered 400 through axum's
   `Query` extractor. It is false, and it was never measured before being written down:
@@ -839,10 +854,12 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   written here is rewritten the moment it lands and becomes a false citation — the text originally
   carried one, and a rebase onto the post-#363 `main` had already invalidated it before the squash
   could. Identify the change by its subject instead.
-- [ ] **Pre-existing: no query-parameter-count guard, so >10000 params diverge from Go.**
+- [x] **Pre-existing: no query-parameter-count guard, so >10000 params diverge from Go.**
   Go's `parseQuery` opens with
   `if !urlParamsWithinMax(strings.Count(query, "&") + 1) { return Values{}, err }`
-  (`net/url/url.go:980`, `defaultMaxParams = 10000`), so an over-limit query yields empty
+  (`net/url/url.go:1019-1020` in go1.25.12, the shipped binary's toolchain — line numbers
+  drift between Go releases, `:980` in go1.27.1; `defaultMaxParams = 10000` at `:1001` in
+  go1.25.12), so an over-limit query yields empty
   `Values` and the reload is non-strict. Precision measured by Reviewer 2: `defaultMaxParams`
   is present in **go1.25.12** (the toolchain that built the shipped Go frp v0.71.0 binary) and
   **absent in go1.25.0** — a 1.25.x backport, not a 1.25.0 feature. Reproduced on two
@@ -856,13 +873,118 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   **Done-when:** the parser mirrors
   Go's parameter-count guard (or the divergence is documented at the endpoint), with both N
   cases pinned.
-- [ ] **Pre-existing: `#` in the request target changes strictness.** Go parses request URIs
+  Done: `first_strict_config_param` (`frp-client/src/admin.rs`) now opens with
+  `if raw.matches('&').count() + 1 > GO_DEFAULT_MAX_PARAMS { return None; }`
+  (`GO_DEFAULT_MAX_PARAMS = 10000`), before any pair is parsed, so an over-limit query takes
+  the same "parameter absent" path as the `%zz` case — which means the frp-rs JSON-body
+  extension still applies when a body is present (Go reads no body at all, so that channel is
+  a frp-rs extension either way). Count, inclusivity and the GODEBUG precision
+  (`urlmaxqueryparams`, so the parity target is the shipped binary's default rather than "Go
+  in general") are in the `GO_DEFAULT_MAX_PARAMS` doc comment. Pinned by
+  `first_strict_config_param_mirrors_go_max_param_guard` (boundary: 9999 `&` -> `Some`, 10000
+  `&` -> `None`), `reload_over_max_params_flips_strict_decision_like_go` (handler level: 9999
+  `&` -> observed strict, 10000 `&` -> observed non-strict, 10000 `&` + body `true` ->
+  observed strict) and `admin_max_query_params_boundary_matches_go` (wire level against the
+  unknown-key oracle: 400 / 400 / 200).
+- [x] **Pre-existing: `#` in the request target changes strictness.** Go parses request URIs
   with `viaRequest=true`, which never splits a fragment, so `#` stays inside `RawQuery` and
   `GET /api/reload?strictConfig=true#strictConfig=false` is a **200** non-strict reload (the
   value becomes `true#strictConfig=false`, which `ParseBool` rejects). `axum::extract::RawQuery`
   comes from `http::Uri`, which strips the fragment, so frp-rs reads `strictConfig=true` and
   is strict — same endpoint, opposite strictness. **Done-when:** the raw request target is
   used (or the divergence documented at the endpoint), with the `#` case pinned.
+  Done: documented and pinned, **not fixed** — the divergence is unrecoverable at this layer.
+  `RawQuery` comes from `http::Uri`, which truncates the target at the first `#`
+  (`http-1.5.0/src/uri/path.rs:28-29`:
+  `if let Some(i) = fragment { src.truncate(i as usize); }`) inside hyper's request-line
+  parsing, before any frp-rs code runs; recovering the raw target would mean replacing the
+  HTTP stack. Both manifestations are recorded on `first_strict_config_param` (which has the
+  `net/url` citation) and in the admin-API prose in `docs/deployment.md`, and pinned by
+  `admin_hash_fragment_divergence_is_pinned`
+  (`frp-client/tests/reload_malformed_config.rs`) as a known divergence, so a future change
+  that "fixes" either one fails the pin and forces the record to be updated:
+  `?strictConfig=true#strictConfig=false` -> frp-rs 400 where Go is 200;
+  `/api/reload#x?strictConfig=true` -> frp-rs 200 where Go is 404.
+- [ ] **The admin HEAD/auth placement matches Go only for *authenticated* requests; a measured
+  alternative matches on every axis but is deliberately not adopted here.** With the per-route
+  `.head(...)` + `.layer(auth)` arrangement in `frp-client/src/admin.rs`, an *unauthenticated*
+  HEAD on a registered route is 401 where Go is 405, and an unauthenticated request to an
+  unknown path (GET or HEAD) is 401 where Go is 404. Reviewer 2 measured a configuration that
+  matches Go on every axis — `.route_layer(auth)` instead of `.layer(auth)` (which alone fixes
+  the two unknown-path cells, because middleware added that way runs only when a route matches)
+  plus a **route-aware** outermost HEAD layer (which fixes the unauthenticated-HEAD cell):
+  8/8 rows on an isolated axum 0.8.9 probe and 14/14 rows on the real admin router over the
+  wire; the coordinator reproduced the mechanism. Not adopted here as a deliberate scope
+  choice:
+  1. `.route_layer` makes unmatched paths bypass auth, so an unauthenticated client gets
+     404/405 for an unknown path instead of 401 — it reveals which paths and methods exist.
+     axum's own `route_layer` doc names this trade-off ("might otherwise convert a
+     `404 Not Found` into a `401 Unauthorized`"). Reviewer 2 measured the sharper form: an
+     unauthenticated `GET /api/store/proxies` would answer 401 when the store is enabled and
+     404 when it is not, disclosing *configuration state*, not merely path existence. That is
+     a security-posture change, and this repo already deviates from Go for security elsewhere:
+     a wildcard/unspecified `web_server.addr` is forced to `127.0.0.1` regardless of auth (an
+     explicit non-loopback address is honoured only when auth is set).
+  2. The HEAD half needs a production route-pattern predicate that matches `{name}` segments
+     without over-matching (`/api/proxy/a/b/config`); Reviewer 2's prototype over-matched.
+     axum 0.8.9 exposes no route introspection (only `has_routes() -> bool`), so the predicate
+     would be a hand-maintained path list — the maintenance hazard
+     `frp-core/src/config/strict.rs:280-285` refuses.
+  3. `apply_admin_auth` is shared (`frp-core/src/admin_auth.rs:36`), called from
+     `frp-client/src/admin.rs` and `frp-server/src/dashboard.rs:3610/3626/3650`, so switching
+     it to `route_layer` is not scoped to the frpc admin API.
+  **Done-when:** either adopt the alternative with a production route predicate and the
+  dashboard's auth posture re-reviewed (accepting the path-existence and configuration-state
+  disclosure), or record in
+  `docs/deployment.md` that the 401-vs-404/405 unauthenticated divergence is permanent. No sha.
+- [ ] **Strict mode accepts unknown fields inside `[[proxies]]` / `[[visitors]]`, where Go
+  rejects them — a deliberate, documented divergence that is not in this list and not in the
+  user-facing docs.** Measured with identical config text on Go frp v0.71.0 and frp-rs, both
+  through `GET /api/reload?strictConfig=true`:
+
+  | unknown field in | Go v0.71.0 | frp-rs |
+  |---|---|---|
+  | `[auth]` / `[log]` / `[webServer]` / `[transport]` | 400 | 400 |
+  | a `[[proxies]]` entry | **400** (`decode proxy at index 0: ... unknown field`) | **200** |
+  | a `[[visitors]]` entry | **400** | **200** |
+
+  This is **deliberate, not an oversight**: `section_known_keys`
+  (`frp-core/src/config/strict.rs:280-285`) documents that sections not listed are not
+  recursed into — "Go's RejectUnknownMembers (pkg/config/v1/decode.go) rejects unknown
+  proxy/visitor/plugin fields; frp-rs deliberately does not recurse into them — per-type keys
+  would make the check a maintenance hazard, and skipping the recursion is the looser
+  direction, keeping valid frp-rs configs loading." The point of this item is that the
+  decision lives only in that code comment: it is absent from this known-debt list and from
+  the user-facing strict-mode prose in `docs/deployment.md`, which lists "a strict-mode
+  unknown key" as a 400 source without the exemption. Consequence: a typo in a proxy or
+  visitor block is silently ignored in strict mode — the same silent-config-loss class as the
+  camelCase wire-field gotcha.
+  **Done-when:** either recurse into the arrays with per-type key sets (Go-faithful; needs a
+  maintenance story for new proxy types and their aliases), or state the exemption and its
+  rationale in the strict-mode prose in `docs/deployment.md`, so a user knows a proxy-block
+  typo will not be caught. No sha.
+- [ ] **`frpc reload` / `frpc status` silently ignore a config that fails to load, and talk to
+  `127.0.0.1:7400` instead.** `resolve_admin_connection` (`frpc/src/main.rs:29`) loads the
+  config with `load_client_config(path, true)` at `:46` and, on **any** error, falls through to
+  the `127.0.0.1:7400` default at `:54-59` with the error discarded (the `if let Ok(cfg)` drops
+  it). Call sites: `run_reload` (`:623`) and `run_status` (`:641`). Measured with identical
+  config text — a valid config plus one unknown top-level key, with an admin server actually
+  listening on the configured `webServer.port`:
+  * Go v0.71.0: `frpc reload -c <config>` and `frpc status -c <config>` each print
+    `json: unknown field "notAKnownFrpKey"` and exit **1** — no address is ever contacted.
+  * frp-rs: both silently retarget `127.0.0.1:7400`
+    (`reload failed: connect 127.0.0.1:7400: Connection refused (os error 61)` /
+    `status query failed: connect 127.0.0.1:7400: Connection refused (os error 61)`), exit 1,
+    and never mention the config error — so a different admin server on 7400 would be driven
+    instead, and the user is not told their config did not load.
+  `strict = true` here is **Go-faithful** (Go's `frpc reload --help`: "strict config parsing
+  mode, unknown fields will cause an errors (default true)"), so the divergence is the silent
+  fallback, not the strictness. The daemon's own startup load is strict in both Go and frp-rs
+  (measured), so the fallback is reachable whenever the on-disk config changes after the daemon
+  has started — exactly the situation `frpc reload` is used in.
+  **Done-when:** propagate the load error (Go's exit 1 plus the parse message) instead of
+  falling back, or warn and fall back only when the config genuinely has no `[web_server]`
+  section, with both cases pinned. No sha.
 
 ---
 
