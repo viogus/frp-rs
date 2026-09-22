@@ -278,9 +278,10 @@ targets are whole-file-cfg'd *empty* here — `kcp.rs` and `xtcp_p2p.rs` (`kcp`)
 
 That step is compile-only: it type-checks the test targets but does not link or
 run them, so it cannot see a missing `#[cfg]` on a test or bench that still
-*compiles*. The `Tests (unit)` job carries the runtime half **for `frp-core`** —
-not for the tier gates in general; see the sibling-crate note below — in the same
-no-features configuration:
+*compiles*. The runtime half lives in the test lanes: `Tests (unit)` runs the
+no-features command for `frp-core` and for `frp-client`, and
+`Tests (server integration)` runs it for `frp-server`; the two sibling steps are
+spelled out below. For `frp-core`, in the same no-features configuration:
 
 ```bash
 cargo test -p frp-core --no-default-features --all-targets
@@ -314,11 +315,64 @@ benchmark. The
 tests and both are `ignore`-marked (`frp-core/src/buffer_pool.rs:54`,
 `frp-core/src/feature_gate.rs:9`), so nothing is lost.
 
-The same runtime class is live in the sibling crates and is **not** covered by any
-step: [`../TODO.md`](../TODO.md) records the measured `cargo test -p frp-server
---no-default-features --all-targets --no-fail-fast` and `cargo test -p frp-client
---no-default-features --all-targets --no-fail-fast` failures, while the
-compile-only siblings of this step exit 0 on the same targets.
+The same runtime class was live in the sibling crates and now has two sibling
+runtime steps.
+
+`frp-client`'s is in the `Tests (unit)` lane, because its test targets need no
+`frps`/`frpc` binary — they drive in-process services:
+
+```bash
+cargo test -p frp-client --no-default-features --all-targets -j 1 --no-fail-fast
+```
+
+`frp-server`'s is in the `Tests (server integration)` lane, because its five
+`oidc_integration.rs` tests spawn `frps` and fail environmentally without one
+(`failed to start frps: Os { code: 2, kind: NotFound }`,
+`frp-server/tests/common/mod.rs`); that lane already builds the binary and sets
+`FRPS_BIN`/`FRPC_BIN`:
+
+```bash
+cargo test -p frp-server --no-default-features --all-targets -j 1 --no-fail-fast
+```
+
+What they close, measured in this worktree (macOS arm64): 34 deterministic
+`frp-server` failures and one `frp-client` failure in the no-features
+configuration, all of them a missing `#[cfg]`. Per target, with the feature
+floor each gate needs (every passing run below enables that feature and nothing
+else) — `frp-server/tests/http_plugin.rs` (23 tests) and `http_plugin_ping.rs`
+(5) whole-file on `http-proxy`;
+`control::proxy_ops::unregister_generation_tests::stale_unregister_keeps_fresh_user_record`
+on `http-proxy`; `test_login_via_websocket` on `websocket` and
+`test_login_via_tls` on `tls` in `server_protocol.rs`; the two TLS cases in
+`slowloris.rs` on `tls`; the three e2e cases in `vhost_https_sni.rs` on `tls`
+(its fourth case, `test_hello_construction_extracts_sni`, needs no feature and
+still runs in the no-features configuration);
+`test_e2e_tcp_proxy_over_websocket` in `frp-client/tests/end_to_end.rs` on
+`websocket` — 7 tests with the feature, 6 without, so no case is lost. The gates
+are on each crate's **own** features, not `frp-core`'s: measured with `-v`,
+`frp-core` is compiled with `websocket`, `tls` and the rest **on** in both graphs
+(frp-server's dev-dependency on frp-client supplies frp-client's default
+features, which forward `frp-core/websocket`, `frp-core/tls`, …), so
+`TransportProtocol::WebSocket` exists and parses there.
+
+Measured after the gates: `frp-server`'s step exited 0 with 436 passed /
+0 failed in three of five samples, with an `frps` binary present (2m08s warm);
+the other two were 435 passed / 1 failed on the pre-existing
+`test_tcpmux_proxy_auth_interior_space_rejected_407` flake, which also fails
+with default features and is the only measured pre-existing failure in those
+five samples. Without an `frps` binary the same command adds 5 environmental
+`oidc_integration` failures — that is why it is not in the unit lane.
+`frp-client`'s step exits 101 **on this macOS host** with 312-313 passed
+and 1-2 failed, both failures not this class and recorded in
+[`../TODO.md`](../TODO.md) (a `start_paused` deadline flake and a
+filename-containing-`0xFF` `EILSEQ`); both also run in the existing
+default-features `Tests (client integration)` lane.
+
+Neither step was measured on the runner (Linux, cache restored from a
+default-feature build), and neither says anything about the whole-file-cfg'd
+*empty* targets listed below — 9 of `frp-server`'s 35 `tests/*.rs`, 6 of
+`frp-core`'s 10, 4 of `frp-client`'s 40 — which compile to nothing in this
+configuration and so cannot fail in it.
 
 This is the **no-features** configuration for frp-client — the micro tier — not the
 tiny one. frp-client's tiny set is `tls,tcp-mux`, and its test targets do not
@@ -346,17 +400,18 @@ here instead of a warning nothing promotes.
 Measured bound on that guarantee — it is a bound on the **code that is compiled**,
 not on the targets. A whole-file-cfg'd target compiles to nothing, and inside a
 target that does compile, any `#[cfg]`-excluded item is unchecked in exactly the
-same way. Concretely: **7 of `frp-server`'s 35 test targets are
+same way. Concretely: **9 of `frp-server`'s 35 `tests/*.rs` targets are
 whole-file-cfg'd *empty* in this configuration**, so nothing inside them is
 checked at all — `dashboard_integration.rs` and `dashboard_v2_integration.rs`
 (`dashboard`), `ssh_gateway.rs` (`ssh`), `transport_e2e_kcp.rs` (`kcp`),
-`transport_e2e_quic.rs` and `v2_quic_r2r.rs` (`quic`), and `vhost_h2c.rs`
-(`http-proxy`; that whole-file gate is one this change added). `cargo test
+`transport_e2e_quic.rs` and `v2_quic_r2r.rs` (`quic`), `vhost_h2c.rs` and the
+pair this change gated, `http_plugin.rs` and `http_plugin_ping.rs`
+(`http-proxy`). `cargo test
 -p frp-server --no-default-features --test <t> -- --list` reports 0 tests for
-each of the seven. The same escape exists item-by-item inside a target that does
+each of the nine. The same escape exists item-by-item inside a target that does
 compile: `vhost_audit_fixes.rs` declares 21 tests, 2 of them `tls`-gated per
 item, so 19 are compiled and checked and those 2 are not. `mock_oidc.rs` also
-reports 0 tests but is not one of the seven: it has no inner `#[cfg]`, so it is
+reports 0 tests but is not one of the nine: it has no inner `#[cfg]`, so it is
 not whole-file-cfg'd empty — it is compiled as its own test target and simply
 declares no tests.
 

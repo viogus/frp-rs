@@ -99,9 +99,10 @@ jobs:
         # --all-targets` is compile-only: it type-checks the test targets but
         # does not link or run them, so it cannot see a runtime failure in a
         # test or bench that still compiles. This step is the runtime half **for
-        # frp-core** — not for the tier gates in general: the same class is live
-        # in frp-server's and frp-client's no-features test targets right now,
-        # measured and recorded in TODO.md, and neither crate has a runtime step.
+        # frp-core**; the sibling runtime steps are `Run frp-client's tests with
+        # no features` (this lane, below) and `Run frp-server's tests with no
+        # features` (the Tests (server integration) lane, which already builds
+        # the frps binary the oidc_integration tests spawn).
         #
         # For frp-core this step is the only gate for two measured classes:
         #   - eight frp-core lib tests (all in the compression path) failed with
@@ -125,6 +126,49 @@ jobs:
         # 10 test targets and the bench touched (forced rebuild). The runner's
         # cost — Linux, cold cache — was not measured.
         run: cargo test -p frp-core --no-default-features --all-targets
+      - name: Run frp-client's tests with no features (runtime half of frp-client's tier gate)
+        # The `verify` lane's `cargo check -p frp-client --no-default-features
+        # --all-targets` is compile-only: it type-checks the test targets but
+        # does not link or run them, so it cannot see a missing #[cfg] on a test
+        # that still compiles. This is the runtime half for frp-client, in the
+        # same no-features configuration as its compile sibling.
+        #
+        # What it closes (TODO.md): exactly one frp-client target failed at
+        # runtime in this configuration without a gate —
+        # `test_e2e_tcp_proxy_over_websocket` (frp-client/tests/end_to_end.rs)
+        # builds a client with `transport_protocol: "websocket"` and waits for
+        # the proxy port; it now carries `#[cfg(feature = "websocket")]`.
+        # Measured with the gate removed:
+        #   cargo test -p frp-client --no-default-features --test end_to_end
+        #     test_e2e_tcp_proxy_over_websocket   -> exit 101, panicking at that
+        # test's `await.expect("proxy port ready")`. After the gate, that target
+        # is 6 passed / 0 failed with no features, 7 passed / 0 failed with
+        # `--no-default-features --features websocket`, and 7 passed / 0 failed
+        # with default features — so no test was lost.
+        #
+        # It lives in the unit lane because frp-client's test targets need no
+        # frps/frpc binary: they drive in-process services (nothing under
+        # frp-client/ references FRPS_BIN/FRPC_BIN), so no env is set here.
+        #
+        # Caveat, measured on macOS arm64 and NOT on the runner: this whole
+        # command also fails two pre-existing, timing/platform-sensitive lib
+        # tests that are not this class and carry their own TODO.md entry —
+        # `plugin::http::tests::http_proxy_head_read_absolute_window_releases_trickler`
+        # (6 of 10 isolated no-features runs failed; 3 of 3 with default
+        # features) and `plugin::static_file::tests::
+        # test_static_file_e2e_non_ascii_round_trip` (`Os { code: 92, kind:
+        # Uncategorized, message: "Illegal byte sequence" }` writing a file name
+        # containing byte 0xFF, rejected by this host's filesystem); in one
+        # sample the two `plugin::https2http/https2https` `start_paused`
+        # handshake-deadline tests failed too. Every one of them is also run by
+        # the existing default-features `Tests (client integration)` lane
+        # (`cargo test -p frp-client --features admin -j 1`), measured red on
+        # this host in the same way, so nothing here is introduced by this step.
+        #
+        # Wall clock, macOS arm64 warm build: 1m12s to 3m07s on four runs (the
+        # shortest aborted at the first failing lib target). `--no-fail-fast`
+        # keeps every later target running when an unrelated lib test fails.
+        run: cargo test -p frp-client --no-default-features --all-targets -j 1 --no-fail-fast
 
   tests-server:
     name: Tests (server integration)
@@ -161,6 +205,67 @@ jobs:
         # process; parallel bins can grab the same port and flake. The
         # common::allocate_port flock lock narrows the window; -j 1 removes it.
         run: cargo test -p frp-server --features dashboard -j 1
+        env:
+          FRPS_BIN: ${{ github.workspace }}/target/debug/frps
+          FRPC_BIN: ${{ github.workspace }}/target/debug/frpc
+      - name: Run frp-server's tests with no features (runtime half of frp-server's tier gate)
+        # The `verify` lane's `cargo check -p frp-server --no-default-features
+        # --all-targets` is compile-only, so it cannot see a missing #[cfg] on a
+        # test that still compiles. This is the runtime half for frp-server, in
+        # the same no-features configuration as its compile sibling.
+        #
+        # It lives in this lane because it needs the frps binary: the five
+        # frp-server/tests/oidc_integration.rs tests spawn frps
+        # (frp-server/tests/common/mod.rs resolves FRPS_BIN, then
+        # CARGO_BIN_EXE_frps, then ../frps, then ../target/{debug,release}/frps),
+        # and without one they fail with `failed to start frps: Os { code: 2,
+        # kind: NotFound }`. The two build steps above already pay that cost, so
+        # FRPS_BIN/FRPC_BIN are set here exactly as in the step above.
+        #
+        # What it closes (TODO.md): 34 deterministic frp-server failures in this
+        # configuration, all missing feature gates, closed by
+        #   - `#![cfg(feature = "http-proxy")]` on frp-server/tests/http_plugin.rs
+        #     and frp-server/tests/http_plugin_ping.rs (each file then runs
+        #     0 tests here and 23 / 5 with `--features http-proxy`); the
+        #     `#[cfg(not(feature = "http-proxy"))]` stub at
+        #     frp-server/src/plugin/mod.rs makes `notify` return `Ok(None)` and
+        #     `record_login_user` a no-op, so 22 of 23 and 4 of 5 of those tests
+        #     failed without the gate;
+        #   - `#[cfg(feature = "http-proxy")]` on
+        #     `control::proxy_ops::unregister_generation_tests::
+        #     stale_unregister_keeps_fresh_user_record`
+        #     (frp-server/src/control/proxy_ops.rs) — measured without it:
+        #     `48 passed; 1 failed`, `left: None`, `right: Some("fresh")`;
+        #   - `#[cfg(feature = "websocket")]` on `test_login_via_websocket` and
+        #     `#[cfg(feature = "tls")]` on `test_login_via_tls`
+        #     (frp-server/tests/server_protocol.rs), the two `tls` dial cases in
+        #     frp-server/tests/slowloris.rs, and the three e2e cases in
+        #     frp-server/tests/vhost_https_sni.rs. Without the gate each dial
+        #     fails (`WS dial: Transport(Other("WS raw connect read: Connection
+        #     reset by peer (os error 54)"))`, `TLS dial: ... (os error 54)`)
+        #     or the https vhost port refuses the connection. The gates are on
+        #     **frp-server's own** features: frp-core's websocket/tls are ON in
+        #     this graph (the frp-client dev-dependency's default features
+        #     forward them), which is
+        #     exactly why the server-side gate is the one that matters.
+        #     `vhost_https_sni.rs` keeps its one no-feature test
+        #     (`test_hello_construction_extracts_sni`, per item, not per file).
+        #
+        # Measured after the gates, with `target/debug/frps` present and
+        # `-j 1 --no-fail-fast`: three of five samples exited 0 with 436 passed /
+        # 0 failed (2m08s warm on macOS arm64 — the runner was not measured); the
+        # other two were 435 passed / 1 failed, the single failure being the
+        # pre-existing, feature-independent
+        # `test_tcpmux_proxy_auth_interior_space_rejected_407` flake, which has
+        # its own TODO.md entry and also fails with default features — it is the
+        # only measured pre-existing failure in those five samples. Measured
+        # without an frps binary, the same command adds 5 environmental
+        # `oidc_integration` failures; that is why it is not in the unit lane.
+        #
+        # Caveat: the runner (Linux, cache restored from a default-feature
+        # build) was not measured; the restored cache does not contain this
+        # feature set, so the step pays a fresh compile of the no-features graph.
+        run: cargo test -p frp-server --no-default-features --all-targets -j 1 --no-fail-fast
         env:
           FRPS_BIN: ${{ github.workspace }}/target/debug/frps
           FRPC_BIN: ${{ github.workspace }}/target/debug/frpc
@@ -278,13 +383,15 @@ jobs:
         # Caveat, measured — the bound is on the code that is *compiled*, not on
         # the targets. A whole-file-cfg'd target compiles to nothing, and inside
         # a target that does compile, any #[cfg]-excluded item is unchecked the
-        # same way. 7 of frp-server's 35 test targets are whole-file-cfg'd
-        # *empty* here: dashboard_integration.rs and dashboard_v2_integration.rs
-        # (#![cfg(feature = "dashboard")]), ssh_gateway.rs (#![cfg(feature =
-        # "ssh")]), transport_e2e_kcp.rs (#![cfg(feature = "kcp")]),
-        # transport_e2e_quic.rs and v2_quic_r2r.rs (#![cfg(feature = "quic")]),
-        # vhost_h2c.rs (#![cfg(feature = "http-proxy")], the gate this change
-        # added). `cargo test -p frp-server --no-default-features --test <t> --
+        # same way. 9 of frp-server's 35 `tests/*.rs` targets are
+        # whole-file-cfg'd *empty* here: dashboard_integration.rs and
+        # dashboard_v2_integration.rs (#![cfg(feature = "dashboard")]),
+        # ssh_gateway.rs (#![cfg(feature = "ssh")]), transport_e2e_kcp.rs
+        # (#![cfg(feature = "kcp")]), transport_e2e_quic.rs and v2_quic_r2r.rs
+        # (#![cfg(feature = "quic")]), vhost_h2c.rs,
+        # http_plugin.rs and http_plugin_ping.rs (#![cfg(feature =
+        # "http-proxy")] — the last two are the pair this change gated).
+        # `cargo test -p frp-server --no-default-features --test <t> --
         # --list` reports 0 tests for each. Item-by-item escapes exist too:
         # vhost_audit_fixes.rs declares 21 tests, 2 tls-gated per item, so 19 are
         # compiled and those 2 are not. (mock_oidc.rs also reports 0 tests but is

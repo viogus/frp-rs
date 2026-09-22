@@ -349,7 +349,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `ws_tls_stall.rs` under `tls`+`websocket`): each reports 0 tests in this configuration
   (`cargo test -p frp-core --no-default-features --test <t> -- --list` reports 0) and `running
   0 tests` in the runtime step's output.
-- [ ] **The same no-features runtime class is live in `frp-server` and `frp-client`, and no
+- [x] **The same no-features runtime class is live in `frp-server` and `frp-client`, and no
   step runs their test targets in that configuration.** Measured in this worktree (macOS
   arm64); the `verify` lane's compile-only siblings
   (`cargo check -p frp-server --no-default-features --all-targets` and the `frp-client` one)
@@ -360,16 +360,19 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     also reproduced the 433 / 39 / 7 shape. 39 failures are deterministic:
     34 are feature-gated behaviour:
     27 are the `http-proxy` stub — `tests/http_plugin.rs` 22 failed / 1 passed and
-    `tests/http_plugin_ping.rs` 4 failed / 1 passed (both files contain zero `cfg(feature ...)`,
-    measured), plus the lib test `control::proxy_ops::unregister_generation_tests::
-    stale_unregister_keeps_fresh_user_record` (`frp-server/src/control/proxy_ops.rs:3783`,
-    assertion at `:3803`) which expects `plugin_manager.user_info(...)` to be `Some` while the
+    `tests/http_plugin_ping.rs` 4 failed / 1 passed (both files carried no
+    `cfg(feature ...)` before this change, measured), plus the lib test
+    `control::proxy_ops::unregister_generation_tests::
+    stale_unregister_keeps_fresh_user_record` (in `frp-server/src/control/proxy_ops.rs`; its
+    `assert_eq!` on `plugin_manager.user_info(...)`) which expects that to be `Some` while the
     `#[cfg(not(feature = "http-proxy"))]` stub (`frp-server/src/plugin/mod.rs:8-34`) makes
     `record_login_user` a no-op (`:29`) and `user_info` return `None` (`:30-32`); the real impl
     is `frp-server/src/plugin/http.rs:132` (`record_login_user` `:200`, `user_info` `:209`).
-    The other 7: 2 `tests/server_protocol.rs` WS/TLS dials (`:667`, `:738`), 2
-    `tests/slowloris.rs` TLS dials (`:317`, `:359`), 3 `tests/vhost_https_sni.rs` connects
-    (`:185`, `:294`, `:431`). Controls with the feature on, measured: `--test http_plugin`
+    The other 7: `test_login_via_websocket` and `test_login_via_tls` in
+    `tests/server_protocol.rs`, the two `tls_*` TLS-dial cases in `tests/slowloris.rs`, and
+    `test_https_vhost_sni_passthrough`, `test_tls_control_login_not_hijacked_by_https_wildcard`
+    and `test_https_group_sni_fan_out_round_robin` in `tests/vhost_https_sni.rs`.
+    Controls with the feature on, measured: `--test http_plugin`
     23 passed / 0 failed, `--test http_plugin_ping` 5/0, `--lib unregister_generation_tests`
     49/0, `--no-default-features --features websocket,tls --test server_protocol test_login_via`
     2/0, `--no-default-features --features tls,http-proxy --test slowloris` 5/0 and
@@ -383,15 +386,86 @@ agent commits), which matters because the *reason* for two reviewers is that no 
       failures, not 40.
   - `cargo test -p frp-client --no-default-features --all-targets --no-fail-fast` exits 101
     with 313 passed / 2 failed: `test_e2e_tcp_proxy_over_websocket`
-    (`frp-client/tests/end_to_end.rs:105`, file contains zero `cfg(feature ...)`) fails on the
-    proxy-port wait (`:203`) and passes with `--no-default-features --features websocket`
-    (control: `--test end_to_end` with default features 7 passed / 0 failed); the other is
+    (`frp-client/tests/end_to_end.rs`; the file carried no `cfg(feature ...)` before this change)
+    fails on the
+    proxy-port wait (`await.expect("proxy port ready")`) and passes with `--no-default-features
+    --features websocket` (control: `--test end_to_end` with default features 7 passed /
+    0 failed); the other is
     `plugin::static_file::tests::test_static_file_e2e_non_ascii_round_trip`
     (`frp-client/src/plugin/static_file.rs:3420`, `EILSEQ`), which also fails with default
     features (0 passed / 1 failed) — macOS-only, not this class.
   Gating these and adding sibling runtime steps is its own change. **Done-when:** each
   runtime-failing target carries its gate (or the configuration is documented as unsupported)
   and a step runs it.
+  Done: fixed in this change. Every runtime failure in the no-features configuration **caused by
+  a missing feature gate** now carries that gate, and both crates have a runtime step. Per file,
+  with the **minimal** feature floor each gate needs (measured: the passing run enables that one
+  feature and nothing else, and removing the gate reproduces the failure below):
+  - `frp-server/tests/http_plugin.rs` — whole-file `#![cfg(feature = "http-proxy")]`. Ungated in
+    this configuration: 1 passed / 22 failed. Gated: 0 tests here, `cargo test -p frp-server
+    --no-default-features --features http-proxy --test http_plugin` 23 passed / 0 failed.
+  - `frp-server/tests/http_plugin_ping.rs` — whole-file `#![cfg(feature = "http-proxy")]`.
+    Ungated: 1 passed / 4 failed. Gated: 0 tests here, `--features http-proxy --test
+    http_plugin_ping` 5 passed / 0 failed.
+  - `frp-server/src/control/proxy_ops.rs`
+    `control::proxy_ops::unregister_generation_tests::stale_unregister_keeps_fresh_user_record`
+    — `#[cfg(feature = "http-proxy")]`. Ungated: `--lib unregister_generation_tests` 48 passed /
+    1 failed, `assert_eq!` at `:3814`, `left: None` vs `right: Some("fresh")`. Gated:
+    `--features http-proxy` 49 passed / 0 failed.
+  - `frp-server/tests/server_protocol.rs` — `#[cfg(feature = "websocket")]` on
+    `test_login_via_websocket` (ungated: `WS dial: Transport(Other("WS raw connect read:
+    Connection reset by peer (os error 54)"))`; `--features websocket` alone 1 passed /
+    0 failed) and `#[cfg(feature = "tls")]` on `test_login_via_tls` (ungated: `TLS dial:
+    Transport(Other("TLS connect: Connection reset by peer (os error 54)"))`; `--features tls`
+    alone 1 passed / 0 failed). The other 11 cases stay ungated and pass with no features.
+  - `frp-server/tests/slowloris.rs` — `#[cfg(feature = "tls")]` on the two TLS cases (plus the
+    imports and `test_cert_dir`, which only they use). Ungated both panic on the TLS dial;
+    `--features tls` alone 5 passed / 0 failed.
+  - `frp-server/tests/vhost_https_sni.rs` — per-item `#[cfg(feature = "tls")]` on the three e2e
+    cases; `test_hello_construction_extracts_sni` stays ungated and still runs here. Ungated the
+    three fail (`connect to https vhost port: Os { code: 61, kind: ConnectionRefused }` twice,
+    `TLS control dial: ... (os error 54)` once); `--features tls` alone 4 passed / 0 failed.
+  - `frp-client/tests/end_to_end.rs` — `#[cfg(feature = "websocket")]` on
+    `test_e2e_tcp_proxy_over_websocket`. Ungated it panics at the test's
+    `await.expect("proxy port ready")`; gated the target is 6 passed / 0 failed here and
+    7 passed / 0 failed with `--features websocket` and with default features, so no case is
+    lost.
+  The gates are on each crate's **own** features, not `frp-core`'s. Measured with
+  `cargo check -p frp-client --no-default-features --test end_to_end -v`, `frp-core` is
+  compiled with `--cfg feature="websocket"` (and `tls`, `kcp`, …) **on** in that graph — the
+  `frp-server` dev-dependency supplies `frp-client`'s default features, which forward
+  `frp-core/websocket`, `frp-core/tls`, … — so the feature-off
+  `frp-core` stub is not what any of these tests hits. The
+  `#[cfg(not(feature = "websocket"))]` arm that drops a WS connection
+  (`frp-server/src/service.rs`) and the `not(feature = "tls")` handler that drops a TLS one
+  (`frp-server/src/handlers/transport.rs:669`) are frp-server's own.
+  Two CI steps now cover the configuration:
+  - `Run frp-client's tests with no features (runtime half of frp-client's tier gate)` in
+    `Tests (unit)`: `cargo test -p frp-client --no-default-features --all-targets -j 1
+    --no-fail-fast`. It belongs in the unit lane because frp-client's test targets need no
+    `frps`/`frpc` binary (they drive in-process services).
+  - `Run frp-server's tests with no features (runtime half of frp-server's tier gate)` in
+    `Tests (server integration)`: `cargo test -p frp-server --no-default-features --all-targets
+    -j 1 --no-fail-fast`, with that lane's `FRPS_BIN`/`FRPC_BIN`. The 5
+    `tests/oidc_integration.rs` tests need an `frps` binary — measured here with
+    `target/debug/frps` present they pass (7 passed / 0 failed in that target), and the item's
+    original "5 environmental failures" sample was taken in a tree without one.
+  Measured after the gates: `cargo test -p frp-server --no-default-features --all-targets -j 1
+  --no-fail-fast` exited 0 with 436 passed / 0 failed in three of five samples (2m08s, macOS
+  arm64 warm build); the other two were 435 passed / 1 failed, the single failure being the
+  tcpmux flake tracked below, which also fails with default features. `cargo test -p
+  frp-client --no-default-features
+  --all-targets -j 1 --no-fail-fast` exits 101 on this macOS host with 312-313 passed and
+  1-2 failed — the failures are the two non-class ones recorded below (the `start_paused`
+  deadline flake and the macOS-only `EILSEQ` test); the runner was not
+  measured for either command.
+  Still **not** covered by these steps: (a) the whole-file-cfg'd *empty* test targets — 9 of
+  `frp-server`'s 35 `tests/*.rs` (the two `http_plugin*` files were added to that set by this
+  change), 6 of `frp-core`'s 10, 4 of `frp-client`'s 40 — compile to nothing in this
+  configuration; (b) `frp-client`'s **lib** target is red on macOS in this configuration for the
+  two non-class reasons below, so a Linux-green run there is an inference from the existing
+  default-feature lane being green, not a measurement; (c) `frpc-tiny`'s test targets, which are
+  their own item below.
 - [ ] **`test_tcpmux_proxy_auth_interior_space_rejected_407` is a load-dependent flake,
   independent of features, and can turn the default-feature suite red.** Assertion:
   `frp-server/tests/tcpmux_httpconnect.rs:418` — `double-space credentials must be rejected:
@@ -410,6 +484,42 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   separate reads the buffer holds only the 200. Pre-existing. **Done-when:** the test tolerates
   the split (or the server writes both responses in one buffer), so the default-feature suite
   cannot go red on scheduling.
+- [ ] **`frp-client`'s `start_paused` socket-deadline tests are flaky on this host at *default*
+  features — they can turn the existing default-feature lanes red.** Found while measuring the
+  new no-features runtime step; none of them is a feature gate, and none is touched by the
+  gating change. Measured on macOS arm64:
+  - `plugin::http::tests::http_proxy_head_read_absolute_window_releases_trickler`
+    (`frp-client/src/plugin/http.rs`): `cargo test -p frp-client --lib
+    http_proxy_head_read_absolute_window_releases_trickler` failed 3 of 3 runs, and `cargo test
+    -p frp-client --no-default-features --lib <same test>` failed 6 of 10, with two different
+    panic sites — `Ok(Err(e))` → `read error from a trickled head read: Connection reset by
+    peer (os error 54)`, and `Err(_elapsed)` → `trickled head read was not released: the 60 s
+    absolute window never fired`. The test accepts only `Ok(Ok(0))` (a clean EOF); the
+    `Connection reset by peer` arm is the other observed outcome. Mechanism not investigated.
+  - `plugin::https2http::tests::test_tls_handshake_deadline_releases_handler` and
+    `plugin::https2https::tests::test_https2https_handshake_deadline_releases_handler`:
+    `cargo test -p frp-client --features admin --lib` — the lib half of the configuration the
+    existing `Tests (client integration)` lane runs — failed 3 of 3 runs with `stalled TLS
+    handshake was not released: conn still open after 70`
+    (`frp-client/src/plugin/https2http.rs:290`,
+    `frp-client/src/plugin/https2https.rs:329`).
+  Same family (`#[tokio::test(start_paused = true)]` driving real loopback sockets) so probably
+  one root cause; not investigated here. **Done-when:** each asserts its deadline without
+  depending on the peer's FIN-vs-RST close, so the default-feature lanes cannot go red on
+  scheduling.
+- [ ] **`plugin::static_file::tests::test_static_file_e2e_non_ascii_round_trip` fails on macOS,
+  at default features.** Measured: `cargo test -p frp-client --lib
+  test_static_file_e2e_non_ascii_round_trip` → `panicked at
+  frp-client/src/plugin/static_file.rs:3420:72: called Result::unwrap() on an Err value: Os {
+  code: 92, kind: Uncategorized, message: "Illegal byte sequence" }`. The line writes a file
+  whose name contains byte `0xFF` (`OsString::from_vec(b"raw\xff.txt".to_vec())`), which this
+  host's filesystem rejects with `EILSEQ`. Not measured on Linux; it is an `frp-client` **lib**
+  test, so of the two new steps only `Run frp-client's tests with no features` runs it (the
+  `-p frp-server` step runs no `frp_client` test target). It also runs in the
+  default-feature `Tests (client integration)` lane,
+  so it is the one local `frp-client` failure expected not to appear on the ubuntu-latest
+  runner. **Done-when:** the non-UTF-8-name half of the test is skipped where the filesystem
+  cannot store such a name, or it is platform-conditional.
 - [ ] **`frpc-tiny`'s test targets do not compile either.** Evidence:
   `cargo check -p frp-client --no-default-features --features tls,tcp-mux --all-targets`
   — exactly the tiny tier for frp-client, measured `['tcp-mux','tls']` — exits 101 with

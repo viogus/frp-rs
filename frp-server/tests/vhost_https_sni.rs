@@ -5,19 +5,52 @@
 //! the original encrypted bytes to the matching frpc HTTPS proxy. This test
 //! asserts the backend (work conn) receives the raw TLS bytes.
 
+// This file is mixed, so the gate is per item rather than whole-file:
+// `test_hello_construction_extracts_sni` needs no feature — it exercises
+// `frp_server::vhost::extract_sni_from_client_hello`
+// (frp-server/src/vhost.rs:3066), which is not feature-gated — while the three
+// e2e cases connect to the HTTPS vhost port, which is only served under `tls`:
+// `run_vhost_https_listener`'s real body is `#[cfg(feature = "tls")]`
+// (frp-server/src/vhost.rs:1586) while the `not(feature = "tls")` stub
+// (frp-server/src/vhost.rs:1829) never binds and returns
+// `Err("TLS feature not enabled")`; the call site in the service is not itself
+// gated (the `crate::vhost::run_vhost_https_listener(...)` call is at
+// frp-server/src/service.rs:685). Measured with no features:
+// `connect to https vhost port: Os { code: 61, kind: ConnectionRefused,
+// message: "Connection refused" }` from the `expect("connect to https vhost
+// port")` at vhost_https_sni.rs:221 and :469 in this tree, and
+// `TLS control dial: Transport(Other("TLS connect: Connection reset by peer
+// (os error 54)"))` at :331. Gating the file wholesale would drop
+// `test_hello_construction_extracts_sni` from the very run whose purpose is
+// that configuration.
+// The `tls` gates on the imports and helpers below are required, not
+// cosmetic: every one of them is referenced only by the three gated cases, so
+// leaving them ungated would be a `-D warnings` failure (`unused_imports` /
+// `dead_code`) in the no-features compile step.
+#[cfg(feature = "tls")]
 mod common;
 
+#[cfg(feature = "tls")]
 use std::net::SocketAddr;
+#[cfg(feature = "tls")]
 use std::path::PathBuf;
+#[cfg(feature = "tls")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[cfg(feature = "tls")]
 use common::{allocate_port, login_with_test_token, start_test_server, test_auth_cfg, TEST_TOKEN};
+#[cfg(feature = "tls")]
 use frp_core::auth;
+#[cfg(feature = "tls")]
 use frp_core::config::ServerConfig;
+#[cfg(feature = "tls")]
 use frp_core::msg::{self, FrpMessage, NewProxy};
+#[cfg(feature = "tls")]
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
+#[cfg(feature = "tls")]
 use frp_core::transport::{dial_server, DialOptions};
 
+#[cfg(feature = "tls")]
 fn test_cert_dir() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop(); // workspace root
@@ -74,6 +107,7 @@ fn client_hello_with_sni(host: &str) -> Vec<u8> {
     bytes
 }
 
+#[cfg(feature = "tls")]
 fn https_group_proxy(name: &str, group: &str, group_key: &str, domain: &str) -> NewProxy {
     let mut np = https_proxy(name, vec![domain.into()]);
     np.group = Some(group.into());
@@ -81,6 +115,7 @@ fn https_group_proxy(name: &str, group: &str, group_key: &str, domain: &str) -> 
     np
 }
 
+#[cfg(feature = "tls")]
 fn https_proxy(name: &str, domains: Vec<String>) -> NewProxy {
     NewProxy {
         proxy_name: name.into(),
@@ -126,6 +161,7 @@ fn test_hello_construction_extracts_sni() {
     assert_eq!(sni.as_deref(), Some("example.com"), "SNI must be extracted");
 }
 
+#[cfg(feature = "tls")]
 #[tokio::test]
 async fn test_https_vhost_sni_passthrough() {
     let bind_port = allocate_port();
@@ -243,6 +279,7 @@ async fn test_https_vhost_sni_passthrough() {
 /// under a wildcard domain covering the server hostname, a TLS control
 /// login's SNI matched the wildcard route and the connection was diverted to
 /// the https backend instead of being accepted as a control connection.
+#[cfg(feature = "tls")]
 #[tokio::test]
 async fn test_tls_control_login_not_hijacked_by_https_wildcard() {
     let bind_port = allocate_port();
@@ -340,6 +377,7 @@ async fn test_tls_control_login_not_hijacked_by_https_wildcard() {
 /// each conn to whichever member accepts first; frp-rs round-robins over the
 /// https-kind members). Each dispatch must land on a pooled work conn of ONE
 /// member — StartWorkConn names the winner and the raw ClientHello follows.
+#[cfg(feature = "tls")]
 #[tokio::test]
 async fn test_https_group_sni_fan_out_round_robin() {
     let bind_port = allocate_port();
