@@ -235,16 +235,28 @@ mod tests {
     /// (rustls waits for the record body) must be released by the 60 s
     /// handshake deadline — the handler task + fd cannot park forever.
     /// Pinned under paused time through the REAL plugin listener:
-    /// RED (bare `acceptor.accept`) — no deadline timer exists, so only the
-    /// test's own 70 s read bound fires and the client read times out while
-    /// the server conn stays open. GREEN (accept wrapped in the shared
-    /// PLUGIN_HANDSHAKE_TIMEOUT window) — the accept fails at t=60 s, the
-    /// handler drops the conn, and the client read returns EOF well inside
-    /// the 70 s bound. The RED phase uses a local 60 s literal; the fix
-    /// hoists the shared const and this test switches to it.
+    /// RED (bare `acceptor.accept`) — no deadline timer exists, so nothing
+    /// ever drops the conn and the wait walks to its bound and panics.
+    /// GREEN (accept wrapped in the shared PLUGIN_HANDSHAKE_TIMEOUT window) —
+    /// the accept fails at t=60 s and the handler drops the conn.
+    ///
+    /// The wait is driven in bounded virtual-time slices by
+    /// [`crate::plugin::test_support::assert_peer_closed_within`], which
+    /// accepts the peer's close as EOF or as a peer-close error, refuses a
+    /// close observed before the shared window, and — because one slice costs
+    /// one I/O poll — keeps the bound a real-time allowance as well. The old
+    /// single `timeout(70 s, read)` was a scheduling race, not a product
+    /// measurement: in 12 instrumented runs of it the listener accepted every
+    /// time, but the per-connection handler task was first polled at virtual
+    /// t=8 ms in the 7 that passed and at virtual t=69.64 s in the 5 that
+    /// failed — the outer 70 s timeout was the only timer the test owned, so
+    /// the paused clock's auto-advance jumped straight to it, and the
+    /// handler's own 60 s window (armed on that first poll) then fired at
+    /// 129.6 s. The RED phase used a local 60 s literal; the fix hoists the
+    /// shared const and this test switches to it.
     #[tokio::test(start_paused = true)]
     async fn test_tls_handshake_deadline_releases_handler() {
-        use tokio::io::AsyncReadExt;
+        use crate::plugin::test_support::assert_peer_closed_within;
         use tokio::io::AsyncWriteExt;
         // The hoisted shared const (RED phase used a local 60 s literal).
         let handshake_timeout = crate::plugin::PLUGIN_HANDSHAKE_TIMEOUT;
@@ -277,21 +289,14 @@ mod tests {
         client.write_all(&[0x16, 0x03, 0x01]).await.unwrap();
         tokio::task::yield_now().await;
 
-        let mut buf = [0u8; 1];
-        match tokio::time::timeout(
+        assert_peer_closed_within(
+            &mut client,
+            handshake_timeout,
             handshake_timeout + std::time::Duration::from_secs(10),
-            client.read(&mut buf),
+            "a stalled TLS handshake",
+            "PLUGIN_HANDSHAKE_TIMEOUT never fires, so a partial ClientHello parks the handler task + fd forever",
         )
-        .await
-        {
-            Ok(Ok(0)) => {}
-            Ok(Ok(n)) => panic!("unexpected {n} bytes from a stalled TLS handshake"),
-            Ok(Err(e)) => panic!("read error from a stalled TLS handshake: {e}"),
-            Err(_elapsed) => panic!(
-                "stalled TLS handshake was not released: conn still open after {}",
-                handshake_timeout.as_secs() + 10
-            ),
-        }
+        .await;
     }
 
     // FIX 5: `connect_tls_client` / `read_until_tls_close` were byte-identical

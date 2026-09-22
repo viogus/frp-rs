@@ -276,15 +276,18 @@ pub(crate) mod tests {
     /// fd cannot park forever. Same pin shape as https2http.rs
     /// `test_tls_handshake_deadline_releases_handler`, driven through the
     /// REAL https2https plugin listener (accept_tls_bounded at
-    /// start_https2https_plugin's accept closure). Paused time: RED (bare
-    /// `acceptor.accept`) — no deadline timer exists, only the test's own
-    /// 70 s read bound fires and the client read times out while the server
-    /// conn stays open; GREEN (bounded accept) — the accept fails at
-    /// t=60 s, the handler drops the conn, and the client read returns EOF
-    /// well inside the bound.
+    /// start_https2https_plugin's accept closure). RED (bare
+    /// `acceptor.accept`) — no deadline timer exists, so nothing ever drops
+    /// the conn and the wait walks to its bound and panics; GREEN (bounded
+    /// accept) — the accept fails at t=60 s and the handler drops the conn.
+    ///
+    /// The wait is driven in bounded virtual-time slices by
+    /// [`crate::plugin::test_support::assert_peer_closed_within`]; the close
+    /// may arrive as EOF or as a peer-close error, and a close observed
+    /// before the shared 60 s window is a failure too.
     #[tokio::test(start_paused = true)]
     async fn test_https2https_handshake_deadline_releases_handler() {
-        use tokio::io::AsyncReadExt;
+        use crate::plugin::test_support::assert_peer_closed_within;
         use tokio::io::AsyncWriteExt;
         let handshake_timeout = crate::plugin::PLUGIN_HANDSHAKE_TIMEOUT;
         let dir = tempfile::tempdir().unwrap();
@@ -316,21 +319,14 @@ pub(crate) mod tests {
         client.write_all(&[0x16, 0x03, 0x01]).await.unwrap();
         tokio::task::yield_now().await;
 
-        let mut buf = [0u8; 1];
-        match tokio::time::timeout(
+        assert_peer_closed_within(
+            &mut client,
+            handshake_timeout,
             handshake_timeout + std::time::Duration::from_secs(10),
-            client.read(&mut buf),
+            "a stalled TLS handshake",
+            "PLUGIN_HANDSHAKE_TIMEOUT never fires, so a partial ClientHello parks the handler task + fd forever",
         )
-        .await
-        {
-            Ok(Ok(0)) => {}
-            Ok(Ok(n)) => panic!("unexpected {n} bytes from a stalled TLS handshake"),
-            Ok(Err(e)) => panic!("read error from a stalled TLS handshake: {e}"),
-            Err(_elapsed) => panic!(
-                "stalled TLS handshake was not released: conn still open after {}",
-                handshake_timeout.as_secs() + 10
-            ),
-        }
+        .await;
     }
 
     /// Connect a skip-verify TLS client to the plugin's listener (the

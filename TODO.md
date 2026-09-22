@@ -559,7 +559,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   same worktree another agent is measuring contaminates both, silently and in the direction of
   looking like a real flake. Review agents need their own checkout or a frozen revision, and a
   mutation must be reverted *and* the target rebuilt before any measurement resumes.
-- [ ] **`frp-client`'s `start_paused` socket-deadline tests are flaky on this host at *default*
+- [x] **`frp-client`'s `start_paused` socket-deadline tests are flaky on this host at *default*
   features — they can turn the existing default-feature lanes red.** Found while measuring the
   new no-features runtime step; none of them is a feature gate, and none is touched by the
   gating change. Measured on macOS arm64:
@@ -570,7 +570,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     panic sites — `Ok(Err(e))` → `read error from a trickled head read: Connection reset by
     peer (os error 54)`, and `Err(_elapsed)` → `trickled head read was not released: the 60 s
     absolute window never fired`. The test accepts only `Ok(Ok(0))` (a clean EOF); the
-    `Connection reset by peer` arm is the other observed outcome. Mechanism not investigated.
+    `Connection reset by peer` arm is the other observed outcome.
   - `plugin::https2http::tests::test_tls_handshake_deadline_releases_handler` and
     `plugin::https2https::tests::test_https2https_handshake_deadline_releases_handler`:
     `cargo test -p frp-client --features admin --lib` — the lib half of the configuration the
@@ -578,10 +578,64 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     handshake was not released: conn still open after 70`
     (`frp-client/src/plugin/https2http.rs:290`,
     `frp-client/src/plugin/https2https.rs:329`).
-  Same family (`#[tokio::test(start_paused = true)]` driving real loopback sockets) so probably
-  one root cause; not investigated here. **Done-when:** each asserts its deadline without
-  depending on the peer's FIN-vs-RST close, so the default-feature lanes cannot go red on
-  scheduling.
+  **Mechanism, investigated and confirmed — there were THREE scheduling dependencies, not one.**
+  **(A) FIN vs RST.** Closing a socket that still has unread inbound bytes makes the OS send RST,
+  so the peer's `read` returns `ECONNRESET` — a *successful* release that the old
+  `Ok(Err(e)) => panic!` arm reported as failure. Probe: close with the peer's 5 bytes unread →
+  `ECONNRESET` 20/20; read them first → `Ok(0)` 20/20. This was the **trickler's** failure form
+  (10 of 60 pre-fix runs); the TLS pins' acceptor consumes the 3-byte partial ClientHello on the
+  first poll, so they see clean EOF (180/180 measured).
+  **(B) Paused-clock auto-advance ordering.** While the clock is paused, tokio's time driver
+  parks the I/O driver with a zero timeout and, if that park did not unpark the runtime
+  (`!handle.did_wake()` — `tokio-1.53.1/src/runtime/time/mod.rs`), advances the virtual clock the
+  *whole* distance to the next timer. With the old single far-away bound (70 s / 300 s) as the
+  only timer the TLS pins owned, one park could jump the entire 70 s past the handler's 60 s
+  deadline. Instrumented, 12 runs of the old https2http pin: the passing 7 polled the handler at
+  virtual t=8 ms; the failing 5 first polled it at t=69.64 s, arming its 60 s window at 129.6 s.
+  **(C) Real-time adequacy — found by review, and the reason a naive fix still failed.** The bound
+  is virtual, but observing the close needs real time. One slice costs one park ≈ one poll ≈ a few
+  µs real, so the old 10 s of virtual slack at 250 ms/slice bought only ~40 polls ≈ **0.2 ms** to
+  deliver the FIN/RST. Reviewer 1 measured the fixed-but-two-tier version failing **6/10,394** runs
+  at load 10-37, every failure *after* the product deadline had already fired (instrumented:
+  `accept_tls_bounded` resolved `timed_out=true` at vt=60.075 s; the client never saw the close in
+  the remaining 9.9 s of virtual time = ~0.2 ms real).
+  **Fixed** (test-only; no product constant, deadline or behaviour touched — proven by injecting
+  `compile_error!` into the helper: `cargo build -p frp-client` and `--all-features` and
+  `frpc --bins --all-features` all still succeed, while `cargo test --lib --no-run` fails).
+  New `frp-client/src/plugin/test_support.rs` (behind `#[cfg(test)] mod test_support;`) provides
+  `assert_peer_closed_within(stream, earliest, bound, what, red)`: a loop of
+  `timeout(STEP, read)` with a **uniform `STEP = 1 ms`**, so a virtual `bound` is also a real-time
+  allowance (~10,000 polls ≈ tens of ms of real time for the TLS pins, instead of ~0.2 ms);
+  it returns on clean EOF or a peer close (`ConnectionReset`/`ConnectionAborted`/`BrokenPipe`),
+  panics on `Ok(n>0)` payload, on any other error kind, **before `earliest` minus 1 s of slack**
+  (a handler that drops the connection immediately is a regression too — the old shape only
+  rejected that by accident, and only when the early drop happened to be an RST), and once
+  `elapsed > bound`.
+  **Verification.** Pre-fix baselines (three agents, load-stated, all samples): 8-way 500-run
+  batches — https2http 88/500, https2https 60/500, trickler 25/500; sequential — trickler 50/60
+  (10× arm A), https2http 0/60, https2https 0/60 at load ~3.7, and 60/60, 18/60, 15/60 at load
+  175-181. Post-fix, final design: **0/200 per pin at 8-way concurrency with 0 vacuous runs**
+  (each run re-checked to have really executed its test — a `0/N` from a binary where the test
+  does not exist is worthless, and that trap was hit once during this work). RED intact: deleting
+  the deadline wrap in `accept_tls_bounded` (`plugin/mod.rs`) makes both TLS pins fail and deleting
+  the head-read wrap in `http.rs` makes the trickler fail, each **3/3** via the helper's own panic,
+  with clean per-test attribution. The detection loss the first fix round introduced is closed:
+  an immediate-drop mutant (accept returns `Err` at once, dropping the conn with the 3 bytes
+  unread) now fails the pins instead of passing them.
+  Gates: `cargo fmt --all -- --check` clean; `cargo clippy -p frp-client --all-targets -D warnings`
+  clean at default, `--no-default-features` and `--all-features`; `cargo test -p frp-client --lib`
+  268 passed / 1 failed (default) and 275/1 (`--features admin`), the single failure being the
+  unrelated macOS `EILSEQ` `static_file` test; `scripts/repo-health.sh` exit 0.
+  **Residue / not fixed here:** the two TLS pins are `#[cfg(all(test, feature = "tls"))]`, so they
+  simply do not exist under `--no-default-features` and cannot redden that lane. `plugin::tls2raw`
+  bounds three accepts with the same `PLUGIN_HANDSHAKE_TIMEOUT` (`tls2raw.rs:94`, `:107`, `:127`)
+  but has **no** paused-time pin at all, and `plugin/static_file.rs` carries a third copy of the
+  60 s absolute head-read window as a literal with no deadline pin — both are coverage gaps, not
+  flakes, and are **recorded here rather than fixed**: neither is pinned, so nothing would catch
+  their deadlines being removed. If they are to be pinned they need their own item; this change
+  deliberately does not touch them. `is_peer_close` accepts `BrokenPipe`, which no probe on
+  this host could produce from a `read` (EPIPE is a write-side error) — kept for the pin's
+  contract and documented as unverified on a read path. All measurements are macOS arm64.
 - [ ] **`plugin::static_file::tests::test_static_file_e2e_non_ascii_round_trip` fails on macOS,
   at default features.** Measured: `cargo test -p frp-client --lib
   test_static_file_e2e_non_ascii_round_trip` → `panicked at
