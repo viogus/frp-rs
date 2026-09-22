@@ -1161,11 +1161,13 @@ fn render_dir_listing(dir: &std::path::Path) -> Result<String, String> {
 /// renders the Go dirList body. No filesystem access, so it runs — and can be
 /// asserted byte-exactly — on a host whose filesystem cannot store the
 /// non-UTF-8 name at all: restoring the pre-round-16 lossy hop
-/// (`to_string_lossy()`) HERE turns `raw%FF.txt` into `raw%EF%BF%BD.txt` (and
-/// moves the byte-wise order with it), which the `#[cfg(unix)]` e2e half
-/// cannot observe on APFS because the write of the 0xFF name itself fails
-/// there (EILSEQ). The name→bytes hop deliberately lives in this pure half
-/// for that reason.
+/// (`to_string_lossy()`) HERE turns `raw%FF.txt` into `raw%EF%BF%BD.txt` and
+/// moves the byte-wise sort order with it — both pinned by
+/// `test_render_listing_non_utf8_name_escapes_byte_exact`, whose lossy-sort-key
+/// mutation the first three entries alone cannot catch. The `#[cfg(unix)]` e2e
+/// half cannot observe any of this on APFS because the write of the 0xFF name
+/// itself fails there (EILSEQ). The name→bytes hop deliberately lives in this
+/// pure half for that reason.
 fn render_listing(entries: &[(std::ffi::OsString, bool)]) -> String {
     let mut entries: Vec<(Vec<u8>, bool)> = entries
         .iter()
@@ -3669,28 +3671,46 @@ mod tests {
     }
 
     /// Round-16 FIX 2, pure half: the name→bytes hop must keep a name that is
-    /// NOT valid UTF-8 byte-exact, so the dirList href is `%FF` (and the
-    /// byte-wise sort order follows the raw bytes). Synthetic entries only —
-    /// no filesystem, so this runs on APFS, where the `#[cfg(unix)]` half of
+    /// NOT valid UTF-8 byte-exact, so the dirList href is `%FF`, and the
+    /// byte-wise sort key must be the RAW bytes. Synthetic entries only — no
+    /// filesystem, so this runs on APFS, where the `#[cfg(unix)]` half of
     /// `test_static_file_e2e_non_ascii_round_trip` skips because a 0xFF name
-    /// cannot be created at all (EILSEQ). Restoring the pre-round-16 lossy hop
-    /// (`into_vec()` → `to_string_lossy().as_bytes().to_vec()`) makes this
-    /// fail with `raw%EF%BF%BD.txt`; before this test, nothing in the suite
-    /// observed that on macOS.
+    /// cannot be created at all (EILSEQ).
+    ///
+    /// Two mutations this pins, each checked by mutation:
+    /// * the pre-round-16 lossy hop (`into_vec()` →
+    ///   `to_string_lossy().as_bytes().to_vec()`) renders `raw%EF%BF%BD.txt`
+    ///   instead of `raw%FF.txt`. Before this test nothing in the suite
+    ///   observed that on macOS.
+    /// * a lossy SORT key (`from_utf8_lossy` in the comparator) is invisible
+    ///   to the first three entries, whose raw and lossy orders agree — hence
+    ///   `a\xff` and `a\xef\xbf\xbd`: raw sorts `EF BF BD` before `FF`, but
+    ///   under a lossy key both collapse to `a\u{fffd}` and the order flips
+    ///   (Go compares Go strings, i.e. raw bytes, so raw is the faithful one).
+    ///   The flip is deterministic but does lean on `slice::sort_by` being
+    ///   stable: the two lossy keys are EQUAL, so a lossy comparator keeps the
+    ///   input order — which the array below deliberately sets to the wrong one.
+    ///   The input array is deliberately NOT in rendered order, so the order
+    ///   in the expected body also proves a sort happened at all.
     #[cfg(unix)]
     #[test]
     fn test_render_listing_non_utf8_name_escapes_byte_exact() {
         use std::os::unix::ffi::OsStringExt;
+        let name = |b: &[u8]| std::ffi::OsString::from_vec(b.to_vec());
         let entries = [
-            (std::ffi::OsString::from_vec(b"plain.txt".to_vec()), false),
-            (std::ffi::OsString::from_vec(b"raw\xff.txt".to_vec()), false),
-            (std::ffi::OsString::from_vec(b"sub\xff".to_vec()), true),
+            (name(b"sub\xff"), true),
+            (name(b"plain.txt"), false),
+            (name(b"a\xff"), false),
+            (name(b"raw\xff.txt"), false),
+            (name(b"a\xef\xbf\xbd"), false),
         ];
         assert_eq!(
             render_listing(&entries),
             "<!doctype html>\n\
              <meta name=\"viewport\" content=\"width=device-width\">\n\
              <pre>\n\
+             <a href=\"a%EF%BF%BD\">a\u{fffd}</a>\n\
+             <a href=\"a%FF\">a\u{fffd}</a>\n\
              <a href=\"plain.txt\">plain.txt</a>\n\
              <a href=\"raw%FF.txt\">raw\u{fffd}.txt</a>\n\
              <a href=\"sub%FF/\">sub\u{fffd}/</a>\n\
@@ -3706,10 +3726,13 @@ mod tests {
     #[test]
     fn test_join_components_non_utf8_component_byte_exact() {
         use std::os::unix::ffi::OsStrExt;
+        // The byte-exact assertion already rules out the exact mojibake a lossy
+        // hop would produce (`/base/raw` + bytes `EF BF BD` + `.txt`). A
+        // separate `assert_ne!` against that string would be dead code — this
+        // assertion fails first, so the negative one could never be the
+        // detector.
         let one = join_components("/base", &[b"raw\xff.txt".to_vec()]);
         assert_eq!(one.as_os_str().as_bytes(), b"/base/raw\xff.txt");
-        // The exact mojibake the lossy arm would produce, ruled out.
-        assert_ne!(one.as_os_str().as_bytes(), b"/base/raw\xef\xbf\xbd.txt");
         let two = join_components("/base", &[b"sub".to_vec(), b"raw\xff.txt".to_vec()]);
         assert_eq!(two.as_os_str().as_bytes(), b"/base/sub/raw\xff.txt");
     }

@@ -167,9 +167,12 @@ jobs:
         # no longer fails. It writes a file name containing byte 0xFF, which
         # this host's filesystem rejects with `Os { code: 92, kind:
         # Uncategorized, message: "Illegal byte sequence" }`, and now skips
-        # only that half at runtime for EILSEQ; the two name→bytes hops of
-        # that half are pinned instead by the pure, filesystem-independent
+        # only that half at runtime for EILSEQ; its name→bytes hop and its
+        # bytes→path hop are pinned instead by the pure, filesystem-independent
         # `render_listing` / `join_components` unit tests in the same module.
+        # (Those are two different directions: `render_listing` turns a name
+        # into the bytes it escapes, `join_components` turns request bytes into
+        # a path. Neither test is a name→bytes hop.)
         #
         # Wall clock, macOS arm64 warm build: 1m12s to 3m07s on four runs (the
         # shortest aborted at the first failing lib target). `--no-fail-fast`

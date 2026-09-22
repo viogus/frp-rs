@@ -647,9 +647,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `frp-client/src/plugin/static_file.rs:3471`, the line having moved with the fixes below. The
   line wrote a file
   whose name contains byte `0xFF` (`OsString::from_vec(b"raw\xff.txt".to_vec())`), which this
-  host's filesystem rejects with `EILSEQ`. It is an `frp-client` **lib** test, so of the two
-  no-features steps only `Run frp-client's tests with no features` runs it (the `-p frp-server`
-  step runs no `frp_client` test target); it also runs in the default-feature
+  host's filesystem rejects with `EILSEQ`. It is an `frp-client` **lib** test, so of the three
+  no-features *runtime* test steps (`ci.yml:97` frp-core, `:129` frp-client, `:220` frp-server)
+  only `Run frp-client's tests with no features` runs it — the other two are `-p frp-core` /
+  `-p frp-server` and build no `frp_client` test target; it also runs in the default-feature
   `Tests (client integration)` lane.
   **Fixed** by skipping only the non-UTF-8-name **half** where the filesystem cannot store such
   a name — the property under test is frp-rs's byte-exact escaping and round-trip, not the
@@ -673,9 +674,15 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `render_listing(entries: &[(OsString, bool)]) -> String` that `render_dir_listing` now calls,
   and `test_render_listing_non_utf8_name_escapes_byte_exact` feeds it a synthetic
   `b"raw\xff.txt"` (plus a `sub\xff` directory) and asserts the whole HTML body byte-exactly,
-  including `<a href="raw%FF.txt">` and the byte-wise order;
+  including `<a href="raw%FF.txt">`; it also pins the byte-wise **sort key** with the pair
+  `b"a\xff"` / `b"a\xef\xbf\xbd"` — raw order puts `EF BF BD` before `FF`, a lossy comparator
+  collapses the two to equal keys and so keeps the input order (set to the wrong one), and the
+  other three names cannot tell the two keys apart (Reviewer 1 F7 /
+  Reviewer 2 N1; the input array is deliberately not in rendered order, so the order in the
+  expected body also proves a sort happened at all);
   `test_join_components_non_utf8_component_byte_exact` pins `join_components`'s unix arm on
-  `b"raw\xff.txt"` — its only call site is this path and it had **zero** tests before.
+  `b"raw\xff.txt"` — its only call site is this path and it had **no direct** test before
+  (existing e2e tests reached it indirectly, with valid-UTF-8 names only).
   Mutation-checked: restoring the pre-round-16 lossy hop in `render_listing`
   (`name.clone().into_vec()` → `name.to_string_lossy().as_bytes().to_vec()`) makes the new
   `render_listing` test fail, where before this change the entire `frp-client` lib suite stayed
@@ -683,13 +690,24 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   Counts after this change: `cargo test -p frp-client --lib static_file` **33 passed / 0 failed**
   (was 31), `cargo test -p frp-client --lib` **271 passed / 0 failed** (was 269).
   **Still NOT covered on a filesystem that cannot store the name:** the *e2e* half itself. The
-  `%FF` request → decode → `join_components` → open → serve chain, and the `read_dir` loop's
-  `DirEntry` → `OsString` collection, are still unexercised here — the new tests pin the pure
-  escaping and joining hops they *call*, not the socket-level round trip, so a regression
-  *between* `render_listing` and the file open (in the caller, the request decoder, or the
-  collection loop) remains invisible on this host and rests on the `Tests (client
-  integration)` lane on ubuntu-latest, which is exactly where the item expected the failure not
-  to appear.
+  `%FF` request → decode → `join_components` → open → serve chain is unexercised here, as is
+  collecting a **non-UTF-8** `DirEntry` — the `read_dir` loop itself does run on APFS for the
+  UTF-8 `naïve.txt` entry, and after the split that hop is `ent.file_name()`, an `OsString` →
+  `OsString` move with no lossy step in it to get wrong. The new tests pin the pure escaping and
+  joining hops they *call*, not the socket-level round trip, so a regression *between*
+  `render_listing` and the file open — in the caller, in the request decoder's wiring into this
+  handler (`urlencoding_decode("%FF")` is itself unit-pinned at
+  `frp-client/src/plugin/mod.rs:2588`), or in the collection loop — remains invisible on this
+  host and rests on the `Tests (client integration)` lane on ubuntu-latest, which is exactly
+  where the item expected the failure not to appear.
+  **Deliberately not done (Reviewer 2 N5, NIT):** `render_listing` borrows `&[(OsString, bool)]`
+  and therefore clones each name (`name.clone().into_vec()` at the hop) where the pre-change
+  code was zero-copy (`ent.file_name().into_vec()`). Passing the `Vec` by value and iterating
+  with `into_iter()` removes that clone and keeps the hop reachable by a synthetic test, so this
+  is a viable follow-up. It was left alone because the item is about *coverage*, not listing
+  throughput, and the production half of this file has now been reviewed twice: re-opening its
+  signature for an unmeasured saving would invalidate those reviews to buy back one allocation
+  per directory entry. Recorded here so a later round can do it with a measurement.
 - [x] **`frpc-tiny`'s test targets did not compile.** Evidence:
   `cargo check -p frp-client --no-default-features --features tls,tcp-mux --all-targets`
   — exactly the tiny tier for frp-client, measured `['tcp-mux','tls']` — exited 101 with
