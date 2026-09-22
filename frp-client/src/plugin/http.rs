@@ -1673,15 +1673,27 @@ mod tests {
     }
 
     /// B6: audit round-8 F8 pin through the REAL http_proxy listener — the
-    /// head-read loop here in http.rs (a verbatim twin of the loop in
-    /// plugin/mod.rs, which has its own copy of this pin). A slowloris peer
-    /// that drips ONE byte per 59 s never trips a per-read re-armed deadline
+    /// head-read loop here in http.rs (the other copy of that loop lives in
+    /// plugin/mod.rs and has its own copy of this pin; the two are siblings,
+    /// not twins: this one reads 4 KiB chunks clamped to `HEAD_READ_LIMIT`,
+    /// mod.rs reads 512 B chunks under a 64 KiB cap). A slowloris peer that
+    /// drips ONE byte per 59 s never trips a per-read re-armed deadline
     /// (every byte resets the clock) but MUST be released by the single
     /// absolute PLUGIN_HEADER_READ_TIMEOUT window over the whole head read
-    /// (Go http.Server ReadHeaderTimeout = 60 s): the handler errors out at
-    /// virtual t=60 s and drops the conn, and the client observes EOF.
-    /// Paused time keeps the 300 s outer bound deterministic. RED (per-read
-    /// re-arm): the outer bound trips and the test panics.
+    /// (Go frp sets `http.Server.ReadHeaderTimeout` to 60 s; Go's own field
+    /// default is 0, so the 60 s is Go frp's setting): the handler errors out
+    /// and drops the conn, and the client observes the close.
+    ///
+    /// The wait is driven in bounded virtual-time slices by
+    /// [`crate::plugin::test_support::assert_peer_closed_within`], which also
+    /// accepts a peer-close error and refuses a close observed before the
+    /// shared window. The old single `timeout(300 s, read)` accepted only a
+    /// clean EOF, but when the handler's window fired just after a trickled
+    /// byte the drop left that byte unread and the peer's read returned
+    /// `ECONNRESET` instead — that was this pin's dominant pre-fix failure
+    /// form (10 of 60 measured runs), and a rarer run saw no close at all
+    /// within the 300 s bound. RED (per-read re-arm): nothing ever drops the
+    /// conn, so the wait walks to the 300 s bound and panics.
     #[tokio::test(start_paused = true)]
     async fn http_proxy_head_read_absolute_window_releases_trickler() {
         use tokio::io::AsyncWriteExt;
@@ -1711,18 +1723,15 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(59)).await;
             }
         });
-        let mut buf = [0u8; 1];
-        let res = tokio::time::timeout(Duration::from_secs(300), reader.read(&mut buf)).await;
+        crate::plugin::test_support::assert_peer_closed_within(
+            &mut reader,
+            crate::plugin::PLUGIN_HEADER_READ_TIMEOUT,
+            Duration::from_secs(300),
+            "a trickled head read",
+            "the 60 s absolute head window never fired (a per-read re-arm lets 1 B/59 s beat it)",
+        )
+        .await;
         drop(trickle);
-        match res {
-            Ok(Ok(0)) => {}
-            Ok(Ok(n)) => panic!("unexpected {n} bytes from a trickled head read"),
-            Ok(Err(e)) => panic!("read error from a trickled head read: {e}"),
-            Err(_elapsed) => panic!(
-                "trickled head read was not released: the 60 s absolute window never fired \
-                 (per-read re-arm lets 1 B/59 s beat it)"
-            ),
-        }
     }
 
     /// Audit FIX 4 pin: Go frp dials CONNECT targets verbatim

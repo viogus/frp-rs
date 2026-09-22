@@ -32,6 +32,8 @@ mod https2http;
 mod https2https;
 mod socks5;
 mod static_file;
+#[cfg(test)]
+mod test_support;
 mod tls2raw;
 mod unix_socket;
 mod visitor;
