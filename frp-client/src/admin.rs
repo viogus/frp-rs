@@ -58,6 +58,32 @@ struct ReloadBody {
     strict_config: Option<bool>,
 }
 
+/// Go's `net/url` default maximum URL query parameter count.
+///
+/// `parseQuery` (`net/url/url.go:979-980`) opens with
+/// `if !urlParamsWithinMax(strings.Count(query, "&") + 1) { return Values{}, err }`,
+/// where `defaultMaxParams = 10000` (`net/url/url.go:961`) and
+/// `urlParamsWithinMax(n) = n <= defaultMaxParams` — the limit is
+/// **inclusive** and the count is `&`s + 1 (so an empty query is one
+/// parameter). `URL.Query()` discards the returned error together with the
+/// empty `Values`, so an over-limit query leaves `Get("strictConfig")` at `""`
+/// — a non-strict reload.
+///
+/// Measured on the shipped Go frp v0.71.0 binary with `?strictConfig=true`
+/// plus N `&`: N=9999 (10000 parameters) -> 400 strict, N=10000 (10001
+/// parameters) -> 200 non-strict. frp-rs had no guard, so it was strict for
+/// both.
+///
+/// Precision: this guard is present in **go1.25.12**, the toolchain that built
+/// the shipped v0.71.0 binary, and **absent in go1.25.0** — it is a 1.25.x
+/// backport, not a 1.25.0 feature (two successful fetches of
+/// `net/url/url.go`: 0 hits for `defaultMaxParams` on go1.25.0, 2 on
+/// go1.25.12). It is also GODEBUG-gated: `urlmaxqueryparams`
+/// (`net/url/url.go:958`) can raise the limit, or set it to `0` for
+/// unlimited. The parity target is therefore the shipped binary's default,
+/// not "Go in general".
+const GO_DEFAULT_MAX_PARAMS: usize = 10000;
+
 /// Go's strict-mode query channel, reimplemented the way Go reads it.
 ///
 /// `client/http/controller.go` (commit 4a23aa18) calls
@@ -80,9 +106,43 @@ struct ReloadBody {
 ///   applies and `{"strict_config": true}` can select strict mode, whereas the
 ///   old extractor kept the key present and ignored the body.
 ///
+/// ## `#` in the request target (known divergence, not fixable here)
+///
+/// Go parses request URIs with `viaRequest=true`, which never splits a
+/// fragment (`net/url/url.go`: the only cut is `strings.Cut(rest, "?")`), so a
+/// `#` stays inside `RawQuery`. Both manifestations differ from frp-rs:
+///
+/// * `GET /api/reload?strictConfig=true#strictConfig=false` — Go's value is
+///   `true#strictConfig=false`, which `ParseBool` rejects, so Go reloads
+///   **non-strict (200)**; frp-rs's fragment is dropped, so it reads
+///   `strictConfig=true` and is **strict (400)**.
+/// * `GET /api/reload#x?strictConfig=true` — Go's path is `/api/reload#x`,
+///   which matches no route (**404**); frp-rs's fragment is dropped and the
+///   request reloads (**200**).
+///
+/// This is unrecoverable at this layer: `RawQuery` comes from `http::Uri`,
+/// whose parser truncates the target at the first `#`
+/// (`http-1.5.0/src/uri/path.rs:27-29`:
+/// `if let Some(i) = fragment { src.truncate(i as usize); }`), and that
+/// truncation happens inside hyper's request-line parsing, before any frp-rs
+/// code runs. Recovering the raw target would mean replacing the HTTP stack.
+/// Both manifestations are pinned as documented divergences in
+/// `frp-client/tests/reload_malformed_config.rs` and described for users in
+/// `docs/deployment.md`.
+///
 /// Returns the first `strictConfig` value, or `None` when no pair carries it.
 fn first_strict_config_param(raw_query: Option<&str>) -> Option<String> {
     let raw = raw_query?;
+    // Go's parameter-count guard, before any pair is looked at: `parseQuery`
+    // returns early with its error and leaves `Values` EMPTY, and `URL.Query()`
+    // discards that error, so *every* parameter -- including `strictConfig` --
+    // is absent. `None` follows the same "parameter absent" path as the `%zz`
+    // case below, so the frp-rs JSON-body extension still applies when a body
+    // is present (Go reads no body at all, so the body channel is a frp-rs
+    // extension either way).
+    if raw.matches('&').count() + 1 > GO_DEFAULT_MAX_PARAMS {
+        return None;
+    }
     for segment in raw.split('&') {
         // Go: an empty segment is skipped; a segment containing ';' is a
         // parse error since Go 1.17, so the pair is dropped.
@@ -696,6 +756,139 @@ impl axum::serve::Listener for TlsListener {
 
 // --- Server ---
 
+/// Explicit HEAD handler for every admin `GET` route.
+///
+/// axum serves HEAD through the `get` handler
+/// (`axum-0.8.9/src/routing/method_routing.rs:1157-1158`:
+/// `call!(req, HEAD, head); call!(req, HEAD, get);`), so without this, HEAD on
+/// an admin GET route runs the GET handler. Go's admin router matches methods
+/// exactly and answers `405` for every registered GET route — the shipped
+/// v0.71.0 binary was measured 405 on `HEAD /api/status`, `HEAD /api/reload`,
+/// `HEAD /api/config`, `HEAD /api/proxy/{name}/config` and
+/// `HEAD /api/visitor/{name}/config` (with existing names; GET on those two
+/// routes is 200 on both).
+///
+/// The `/api/reload` case is not cosmetic: the GET handler *reloads the
+/// config*, so a HEAD there was a real, unrequested side effect, and with
+/// `?strictConfig=true` the reload is strict and can reject the config — the
+/// pre-change tree answered **400** to `HEAD /api/reload?strictConfig=true`
+/// where Go answers 405.
+async fn handle_head_not_allowed() -> StatusCode {
+    StatusCode::METHOD_NOT_ALLOWED
+}
+
+/// The frpc admin route table.
+///
+/// Split out of [`run_admin_server`] so the unit tests drive the exact routes
+/// the server serves, including the per-route HEAD handlers below.
+/// `store_enabled` mirrors `state.store.is_some()`.
+///
+/// Every route that registers `get(...)` also registers
+/// `.head(handle_head_not_allowed)`. A blanket HEAD-rejection *layer* was
+/// rejected on measurement, not on the axum docs (`Router::layer` is often
+/// read as applying only to existing routes, which does not mean unmatched
+/// paths skip it — measured, they do not):
+///
+/// * a layer OUTERMOST (before auth) answers 405 for
+///   `HEAD /api/nonexistent`, where Go answers 404 — a new divergence;
+/// * a layer INNERMOST (inside the auth layer) lets auth win on a matched
+///   path, so an unauthenticated `HEAD /api/reload` would be 401 — the very
+///   divergence such a layer was meant to avoid. Go answers 405 with *and*
+///   without credentials: its router resolves path+method before auth
+///   (measured: `HEAD /api/reload` 405 both ways, `HEAD /api/nonexistent` 404
+///   both ways, while an unauthenticated `GET /api/reload` is 401).
+///
+/// Per-route `.head(...)` introduces no new divergence: it changes only HEAD
+/// on a *registered* admin GET route (405 instead of 200/400/...) and, for a
+/// request the auth layer admits (valid credentials, or no auth configured),
+/// keeps axum's natural 404 for an unknown path, matching Go.
+///
+/// Residual, pre-existing and NOT changed here: frp-rs applies the auth
+/// middleware to the whole router before the method router runs, so an
+/// *unauthenticated* HEAD on a registered route is still 401 where Go is 405
+/// (measured on both with `webServer.user`/`password` set); an unauthenticated
+/// request to an unknown path is likewise 401 here where Go is 404, for GET as
+/// well as HEAD. Those requests are already 401 today; matching Go there needs
+/// routing-before-auth, a router-wide change.
+///
+/// The rule is applied uniformly to `/api/metrics` and the `/api/store/*`
+/// routes too, but no Go parity is claimed for them: Go v0.71.0's client admin
+/// has no `/api/metrics` route at all (404 for GET and HEAD — measured) and the
+/// store API is a frp-rs-only extension, so parity is undefined there. POST is
+/// unchanged: `frpc/src/main.rs:630-631` sends `POST` with a JSON body
+/// (`admin_post_json`), and the comment on the `/api/reload` route documents
+/// POST as a deliberate frp-rs extension. `OPTIONS /api/reload` is already 405
+/// on both, and `POST`/`HEAD /api/stop` already agree; only HEAD changes.
+fn admin_router(store_enabled: bool) -> Router<AdminState> {
+    let app = Router::new()
+        .route(
+            "/api/status",
+            get(handle_status).head(handle_head_not_allowed),
+        )
+        .route(
+            "/api/metrics",
+            get(handle_metrics).head(handle_head_not_allowed),
+        )
+        // Go frp compat: GET /api/reload (Go uses GET; keep POST too).
+        .route(
+            "/api/reload",
+            get(handle_reload)
+                .post(handle_reload)
+                .head(handle_head_not_allowed),
+        )
+        .route("/api/stop", axum::routing::post(handle_stop))
+        .route(
+            "/api/proxy/{name}/config",
+            get(handle_get_proxy_config).head(handle_head_not_allowed),
+        )
+        .route(
+            "/api/visitor/{name}/config",
+            get(handle_get_visitor_config).head(handle_head_not_allowed),
+        )
+        .route(
+            "/api/config",
+            get(handle_get_config)
+                .put(handle_put_config)
+                .head(handle_head_not_allowed)
+                .layer(DefaultBodyLimit::max(1024 * 1024)),
+        );
+
+    // Store CRUD uses the Rust-native typed JSON body (full ProxyConfig /
+    // VisitorConfig objects). Go frp v0.70.1's admin API uses nested typed
+    // blocks (`ProxyDefinition` with tcp/udp/stcp...), so this endpoint is
+    // intentionally frp-rs-only and is not wire-compatible with Go clients.
+    if store_enabled {
+        app.route(
+            "/api/store/proxies",
+            get(handle_list_store_proxies)
+                .post(handle_create_store_proxy)
+                .head(handle_head_not_allowed),
+        )
+        .route(
+            "/api/store/proxies/{name}",
+            get(handle_get_store_proxy)
+                .put(handle_update_store_proxy)
+                .delete(handle_delete_store_proxy)
+                .head(handle_head_not_allowed),
+        )
+        .route(
+            "/api/store/visitors",
+            get(handle_list_store_visitors)
+                .post(handle_create_store_visitor)
+                .head(handle_head_not_allowed),
+        )
+        .route(
+            "/api/store/visitors/{name}",
+            get(handle_get_store_visitor)
+                .put(handle_update_store_visitor)
+                .delete(handle_delete_store_visitor)
+                .head(handle_head_not_allowed),
+        )
+    } else {
+        app
+    }
+}
+
 pub async fn run_admin_server(
     addr: String,
     state: AdminState,
@@ -704,49 +897,7 @@ pub async fn run_admin_server(
     tls_cert_file: Option<String>,
     tls_key_file: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let app = Router::new()
-        .route("/api/status", get(handle_status))
-        .route("/api/metrics", get(handle_metrics))
-        // Go frp compat: GET /api/reload (Go uses GET; keep POST too).
-        .route("/api/reload", get(handle_reload).post(handle_reload))
-        .route("/api/stop", axum::routing::post(handle_stop))
-        .route("/api/proxy/{name}/config", get(handle_get_proxy_config))
-        .route("/api/visitor/{name}/config", get(handle_get_visitor_config))
-        .route(
-            "/api/config",
-            get(handle_get_config)
-                .put(handle_put_config)
-                .layer(DefaultBodyLimit::max(1024 * 1024)),
-        );
-
-    // Store CRUD uses the Rust-native typed JSON body (full ProxyConfig /
-    // VisitorConfig objects). Go frp v0.70.1's admin API uses nested typed
-    // blocks (`ProxyDefinition` with tcp/udp/stcp...), so this endpoint is
-    // intentionally frp-rs-only and is not wire-compatible with Go clients.
-    let app = if state.store.is_some() {
-        app.route(
-            "/api/store/proxies",
-            get(handle_list_store_proxies).post(handle_create_store_proxy),
-        )
-        .route(
-            "/api/store/proxies/{name}",
-            get(handle_get_store_proxy)
-                .put(handle_update_store_proxy)
-                .delete(handle_delete_store_proxy),
-        )
-        .route(
-            "/api/store/visitors",
-            get(handle_list_store_visitors).post(handle_create_store_visitor),
-        )
-        .route(
-            "/api/store/visitors/{name}",
-            get(handle_get_store_visitor)
-                .put(handle_update_store_visitor)
-                .delete(handle_delete_store_visitor),
-        )
-    } else {
-        app
-    };
+    let app = admin_router(state.store.is_some());
 
     let app = apply_admin_auth(app, &auth_user, &auth_password);
     let app = app.with_state(state);
@@ -1037,6 +1188,41 @@ passwd = "socks-pass"
         ));
     }
 
+    #[test]
+    fn first_strict_config_param_mirrors_go_max_param_guard() {
+        // Go `parseQuery` (`net/url/url.go:979-980`):
+        //   if !urlParamsWithinMax(strings.Count(query, "&") + 1) { return err }
+        // with `defaultMaxParams = 10000` and `urlParamsWithinMax(n) =
+        // n <= 10000`. The count is `&`s + 1 and the limit is INCLUSIVE, so
+        // 9999 `&` (10000 parameters) parses and 10000 `&` (10001) does not.
+        // Cross-checked on the shipped Go frp v0.71.0 binary:
+        // `?strictConfig=true` + 9999 `&` -> 400 strict; + 10000 `&` -> 200
+        // non-strict.
+        let at_limit = format!("strictConfig=true{}", "&".repeat(9999));
+        assert_eq!(
+            first_strict_config_param(Some(&at_limit)).as_deref(),
+            Some("true"),
+            "10000 parameters is within Go's inclusive limit"
+        );
+        let over_limit = format!("strictConfig=true{}", "&".repeat(10000));
+        assert_eq!(
+            first_strict_config_param(Some(&over_limit)),
+            None,
+            "10001 parameters exceeds Go's limit -> empty Values -> absent"
+        );
+        // The guard runs before any pair is parsed, so a well-formed
+        // `strictConfig` later in an over-limit query is still invisible.
+        let over_limit_late = format!("junk{}&strictConfig=true", "&".repeat(10000));
+        assert_eq!(first_strict_config_param(Some(&over_limit_late)), None);
+        // A trailing empty segment keeps the parameter count at the boundary:
+        // 9999 `&` total is still exactly 10000 parameters.
+        let at_limit_trailing = format!("strictConfig=true{}&", "&".repeat(9998));
+        assert_eq!(
+            first_strict_config_param(Some(&at_limit_trailing)).as_deref(),
+            Some("true")
+        );
+    }
+
     #[tokio::test]
     async fn reload_duplicate_strict_config_takes_first_like_go() {
         // The defect this pins: `Query<ReloadQuery>` (a struct) made axum
@@ -1170,6 +1356,177 @@ passwd = "socks-pass"
             Some(true),
             "a dropped query pair must let the JSON body select strict"
         );
+    }
+
+    #[tokio::test]
+    async fn reload_over_max_params_flips_strict_decision_like_go() {
+        // Handler-level proof that the parameter-count guard changes the
+        // DECISION, not just the helper's return value: the fake reload
+        // channel reports the `strict` flag the run loop would have received.
+        let (state, mut reload_rx) = test_state();
+        let (seen_tx, mut seen_rx) = mpsc::channel::<bool>(8);
+        tokio::spawn(async move {
+            while let Some(req) = reload_rx.recv().await {
+                let _ = seen_tx.send(req.strict).await;
+                let _ = req.reply.send(Ok("reload success".into()));
+            }
+        });
+        let app = admin_router(true).with_state(state);
+
+        // 9999 `&` = 10000 parameters: within Go's inclusive limit -> the
+        // parameter is read -> strict.
+        let uri = format!("/api/reload?strictConfig=true{}", "&".repeat(9999));
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            seen_rx.recv().await,
+            Some(true),
+            "10000 parameters is within Go's limit, so ?strictConfig=true is read"
+        );
+
+        // 10000 `&` = 10001 parameters: Go's guard trips and the discarded
+        // error leaves `Values` empty -> parameter absent -> non-strict.
+        let uri = format!("/api/reload?strictConfig=true{}", "&".repeat(10000));
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            seen_rx.recv().await,
+            Some(false),
+            "10001 parameters must trip the guard and reload non-strict"
+        );
+
+        // Guard-absent is the same path as the dropped `%zz` pair, so the
+        // frp-rs JSON-body extension still applies when a body is present:
+        // over-limit query + body true selects strict. (Go reads no body at
+        // all, so the body channel is a frp-rs extension either way.)
+        let uri = format!("/api/reload?strictConfig=true{}", "&".repeat(10000));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&uri)
+                    .body(Body::from(r#"{"strict_config": true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            seen_rx.recv().await,
+            Some(true),
+            "an over-limit query is absent, so the JSON body fallback applies"
+        );
+    }
+
+    #[tokio::test]
+    async fn head_on_registered_admin_get_routes_is_405_without_running_the_handler() {
+        // axum serves HEAD through the `get` handler
+        // (`axum-0.8.9/src/routing/method_routing.rs:1157-1158`), so this
+        // drives the REAL route table (`admin_router`) to prove every GET
+        // route registers an explicit `.head(...)`.
+        //
+        // No reload-forwarding task is spawned for the HEAD phase on purpose:
+        // `reload_rx` stays owned here, so `try_recv` is a direct proof that
+        // no request reached the service run loop.
+        let (state, mut reload_rx) = test_state();
+        let app = admin_router(true).with_state(state);
+
+        // HEAD on every registered GET route -> 405.
+        for path in [
+            "/api/status",
+            "/api/metrics",
+            "/api/reload",
+            "/api/reload?strictConfig=true",
+            "/api/proxy/p1/config",
+            "/api/visitor/v1/config",
+            "/api/config",
+            "/api/store/proxies",
+            "/api/store/proxies/p1",
+            "/api/store/visitors",
+            "/api/store/visitors/v1",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::HEAD)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "HEAD {path} must be 405 (never the GET handler)"
+            );
+        }
+
+        // The proof that the /api/reload GET handler did not run and that the
+        // strict query was never even evaluated: no reload request was
+        // enqueued. A handler run would have queued one and then waited on the
+        // reply oneshot.
+        assert!(
+            reload_rx.try_recv().is_err(),
+            "HEAD /api/reload must not enqueue a reload request"
+        );
+
+        // An unknown path keeps axum's natural 404, matching Go — this is why
+        // a blanket router-level HEAD layer was not used.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/api/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Now answer reload requests so the controls can complete.
+        let (seen_tx, mut seen_rx) = mpsc::channel::<bool>(8);
+        tokio::spawn(async move {
+            while let Some(req) = reload_rx.recv().await {
+                let _ = seen_tx.send(req.strict).await;
+                let _ = req.reply.send(Ok("reload success".into()));
+            }
+        });
+
+        // GET controls: the routes really are live (not vacuous).
+        for path in ["/api/status", "/api/metrics"] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "GET {path} control");
+        }
+
+        // POST support is untouched (frpc's CLI sends POST + JSON body).
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/reload")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "POST /api/reload control");
+        assert_eq!(seen_rx.recv().await, Some(false));
     }
 
     #[test]

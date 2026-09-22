@@ -777,3 +777,308 @@ async fn reload_admin_go_query_parity_and_body_extension() {
         .expect("client run() panicked");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Tests 4-6 — request-target rules that Go's admin router and net/url impose.
+// All three arm the same unknown-key oracle as test 3 (strict -> 400,
+// non-strict -> 200), so the status reveals the strictness *decision*, not
+// just that the request was answered.
+// ---------------------------------------------------------------------------
+
+/// A running frpc with an admin `[webServer]`, started from a valid config,
+/// with the unknown-key oracle armed over the same config file (the service
+/// holds the initial valid config, so startup does not reject it).
+#[cfg(feature = "admin")]
+struct AdminOracle {
+    client: Arc<ClientService>,
+    runner: tokio::task::JoinHandle<()>,
+    admin_port: u16,
+    proxy_addr: std::net::SocketAddr,
+    dir: std::path::PathBuf,
+    _frps: tokio::task::JoinHandle<()>,
+    _echo: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(feature = "admin")]
+async fn start_admin_oracle(tag: &str) -> AdminOracle {
+    init_tracing();
+    let echo_port = allocate_port();
+    let server_port = allocate_port();
+    let admin_port = allocate_port();
+    let p1 = allocate_port();
+
+    let echo = start_echo_server(echo_port);
+    let frps = common::start_frps(server_port, "reload-malformed-token").await;
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
+    wait_for_port(server_addr, Duration::from_secs(5))
+        .await
+        .expect("server ready");
+
+    let dir = std::env::temp_dir().join(format!("frp-reload-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let cfg_path = dir.join("frpc.toml");
+    write_valid_config(&cfg_path, server_port, echo_port, p1, Some(admin_port));
+
+    let cfg = load_client_config(cfg_path.to_str().unwrap(), false).expect("load initial config");
+    let client = Arc::new(
+        ClientService::new(cfg, Some(cfg_path.to_string_lossy().into()))
+            .await
+            .expect("create client service"),
+    );
+    let runner = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let _ = client.run().await;
+        })
+    };
+    let proxy_addr: std::net::SocketAddr = format!("127.0.0.1:{p1}").parse().unwrap();
+    wait_for_port(proxy_addr, Duration::from_secs(15))
+        .await
+        .expect("initial proxy port ready");
+    assert_echo_serving(proxy_addr, "baseline echo before any reload").await;
+
+    let admin_addr: std::net::SocketAddr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    wait_for_port(admin_addr, Duration::from_secs(10))
+        .await
+        .expect("frpc admin server never came up");
+
+    // Arm the oracle: the on-disk config now carries the unknown top-level key.
+    write_unknown_key_config(&cfg_path, server_port, echo_port, p1, Some(admin_port));
+
+    AdminOracle {
+        client,
+        runner,
+        admin_port,
+        proxy_addr,
+        dir,
+        _frps: frps,
+        _echo: echo,
+    }
+}
+
+#[cfg(feature = "admin")]
+async fn shutdown_admin_oracle(oracle: AdminOracle) {
+    let AdminOracle {
+        client,
+        runner,
+        dir,
+        ..
+    } = oracle;
+    client.request_stop();
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("client did not shut down after request_stop")
+        .expect("client run() panicked");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// (c) HEAD must never reach an admin GET handler. Measured against the
+/// shipped Go frp v0.71.0 binary: Go matches methods exactly and answers 405
+/// for `HEAD` on a registered GET route.
+#[cfg(feature = "admin")]
+#[tokio::test]
+async fn admin_head_is_405_and_never_runs_a_get_handler() {
+    let oracle = start_admin_oracle("head-405").await;
+
+    // Controls: the routes are live and the oracle is armed.
+    let (status, body) = admin_request(oracle.admin_port, "GET", "/api/status", None).await;
+    assert!(
+        status.contains("200"),
+        "GET /api/status control must be 200, got: {status} / {body}"
+    );
+    let (status, body) = admin_request(
+        oracle.admin_port,
+        "GET",
+        "/api/reload?strictConfig=true",
+        None,
+    )
+    .await;
+    assert!(
+        status.contains("400"),
+        "armed oracle control: strict reload must be 400, got: {status} / {body}"
+    );
+
+    // The discriminating case: HEAD /api/reload?strictConfig=true is 405, NOT
+    // 400. A 400 would prove axum ran the GET handler and performed a strict
+    // reload (a real, unrequested side effect for a HEAD); 405 proves it did
+    // not. Before the fix this was 400.
+    let (status, body) = admin_request(
+        oracle.admin_port,
+        "HEAD",
+        "/api/reload?strictConfig=true",
+        None,
+    )
+    .await;
+    assert!(
+        status.contains("405"),
+        "HEAD /api/reload?strictConfig=true must be 405 (handler must not run; \
+         a 400 would mean a strict reload happened), got: {status} / {body}"
+    );
+
+    // Before the fix this was a 200, because axum served HEAD through `get`
+    // and the non-strict reload succeeded.
+    let (status, body) = admin_request(oracle.admin_port, "HEAD", "/api/reload", None).await;
+    assert!(
+        status.contains("405"),
+        "HEAD /api/reload must be 405, got: {status} / {body}"
+    );
+
+    // Uniform across the registered GET routes (Go measured 405 on each of
+    // /api/status, /api/config, /api/proxy/{name}/config and
+    // /api/visitor/{name}/config).
+    for path in [
+        "/api/status",
+        "/api/metrics",
+        "/api/config",
+        "/api/proxy/p1/config",
+    ] {
+        let (status, body) = admin_request(oracle.admin_port, "HEAD", path, None).await;
+        assert!(
+            status.contains("405"),
+            "HEAD {path} must be 405, got: {status} / {body}"
+        );
+    }
+
+    // An unknown path keeps axum's natural 404 — Go answers 404 there too.
+    // This is exactly why a blanket router-level HEAD layer was not used.
+    let (status, _) = admin_request(oracle.admin_port, "HEAD", "/api/nonexistent", None).await;
+    assert!(
+        status.contains("404"),
+        "HEAD on an unknown path must stay 404, got: {status}"
+    );
+
+    // POST support is untouched (frpc/src/main.rs sends POST + JSON body).
+    let (status, body) = admin_request(oracle.admin_port, "POST", "/api/reload", Some("{}")).await;
+    assert!(
+        status.contains("200"),
+        "POST /api/reload must still work, got: {status} / {body}"
+    );
+
+    assert!(
+        !oracle.runner.is_finished(),
+        "client run task ended after the HEAD probes"
+    );
+    assert_echo_serving(
+        oracle.proxy_addr,
+        "proxy keeps serving across the HEAD probes",
+    )
+    .await;
+    shutdown_admin_oracle(oracle).await;
+}
+
+/// (d) Wire-level max-parameter boundary. Go's `parseQuery` guard
+/// (`net/url/url.go:979-980`, `defaultMaxParams = 10000`) makes an over-limit
+/// query parse as empty, so `strictConfig` is absent and the reload is
+/// non-strict. The limit is inclusive and counts `&`s + 1.
+#[cfg(feature = "admin")]
+#[tokio::test]
+async fn admin_max_query_params_boundary_matches_go() {
+    let oracle = start_admin_oracle("max-params").await;
+
+    // Baseline: the oracle rejects strict mode.
+    let (status, body) = admin_request(
+        oracle.admin_port,
+        "GET",
+        "/api/reload?strictConfig=true",
+        None,
+    )
+    .await;
+    assert!(
+        status.contains("400"),
+        "?strictConfig=true control must be strict 400, got: {status} / {body}"
+    );
+
+    // + 9999 `&` = 10000 parameters: within Go's inclusive limit -> the
+    // parameter is read -> strict 400.
+    let target = format!("/api/reload?strictConfig=true{}", "&".repeat(9999));
+    let (status, body) = admin_request(oracle.admin_port, "GET", &target, None).await;
+    assert!(
+        status.contains("400"),
+        "10000 parameters is within Go's limit, so strictConfig=true must still \
+         be strict (400), got: {status} / {body}"
+    );
+
+    // + 10000 `&` = 10001 parameters: the guard trips, `URL.Query()` discards
+    // the error with an empty Values, so the reload is non-strict 200.
+    // Measured on the shipped Go frp v0.71.0 binary: 200.
+    let target = format!("/api/reload?strictConfig=true{}", "&".repeat(10000));
+    let (status, body) = admin_request(oracle.admin_port, "GET", &target, None).await;
+    assert!(
+        status.contains("200"),
+        "10001 parameters must trip Go's guard (non-strict 200), got: {status} / {body}"
+    );
+
+    assert!(
+        !oracle.runner.is_finished(),
+        "client run task ended after the max-parameter probes"
+    );
+    assert_echo_serving(
+        oracle.proxy_addr,
+        "proxy keeps serving across the max-parameter probes",
+    )
+    .await;
+    shutdown_admin_oracle(oracle).await;
+}
+
+/// (e) The `#` divergence, pinned as a KNOWN, DOCUMENTED, UNFIXABLE
+/// divergence — these assertions encode frp-rs's side, which is *wrong*
+/// relative to Go, so a future change that "fixes" either one makes this test
+/// fail on purpose and forces the doc/comment record to be updated too.
+///
+/// Reason it cannot be fixed here: `RawQuery` comes from `http::Uri`, which
+/// truncates the request target at the first `#` inside hyper's request-line
+/// parsing (`http-1.5.0/src/uri/path.rs:27-29`), before any frp-rs code runs.
+#[cfg(feature = "admin")]
+#[tokio::test]
+async fn admin_hash_fragment_divergence_is_pinned() {
+    let oracle = start_admin_oracle("hash").await;
+
+    // Manifestation 1 — strictness flip. Go parses the request target with
+    // `viaRequest=true`, which never splits a fragment, so it reads the value
+    // `true#strictConfig=false`; ParseBool rejects it and Go reloads
+    // NON-strict (200, measured). frp-rs drops the fragment and reads
+    // `strictConfig=true`, so it is strict (400). PIN: frp-rs 400, Go 200.
+    let (status, body) = admin_request(
+        oracle.admin_port,
+        "GET",
+        "/api/reload?strictConfig=true#strictConfig=false",
+        None,
+    )
+    .await;
+    assert!(
+        status.contains("400"),
+        "KNOWN DIVERGENCE PIN: frp-rs is strict 400 here where Go v0.71.0 is \
+         non-strict 200 (Go's value is `true#strictConfig=false`); if this is \
+         now 200, the `#` divergence was fixed and the TODO/doc/comment record \
+         must be updated. got: {status} / {body}"
+    );
+
+    // Manifestation 2 — `#` before `?`. Go's path is `/api/reload#x`, which
+    // matches no route (404, measured). frp-rs drops the fragment, sees
+    // `/api/reload`, and reloads (200). PIN: frp-rs 200, Go 404.
+    let (status, body) = admin_request(
+        oracle.admin_port,
+        "GET",
+        "/api/reload#x?strictConfig=true",
+        None,
+    )
+    .await;
+    assert!(
+        status.contains("200"),
+        "KNOWN DIVERGENCE PIN: frp-rs reloads 200 here where Go v0.71.0 is 404 \
+         (Go's path is `/api/reload#x`); if this is now 404, the `#` divergence \
+         was fixed and the TODO/doc/comment record must be updated. \
+         got: {status} / {body}"
+    );
+
+    assert!(
+        !oracle.runner.is_finished(),
+        "client run task ended after the `#` probes"
+    );
+    assert_echo_serving(
+        oracle.proxy_addr,
+        "proxy keeps serving across the `#` probes",
+    )
+    .await;
+    shutdown_admin_oracle(oracle).await;
+}
