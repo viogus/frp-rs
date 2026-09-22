@@ -1134,7 +1134,8 @@ fn open_handle_canonical(
 /// percent-encoded byte-wise with uppercase hex. Link-text escaping =
 /// htmlReplacer (net/http server.go): & < > " ' -> &amp; &lt; &gt; &#34;
 /// &#39;. Entries are sorted byte-wise over the RAW names — Go dirList runs
-/// sort.Slice itself (fs.go:156), with the same byte comparison over
+/// sort.Slice itself (fs.go:160 in go1.25.12 — the line drifts between Go
+/// releases; :156 was stale), with the same byte comparison over
 /// Name() strings, so this sort matches Go's and lossy-string sorting
 /// would misorder invalid UTF-8 names. Round-16 FIX 2: the href escapes
 /// the RAW name bytes, so a
@@ -3684,12 +3685,14 @@ mod tests {
     ///   observed that on macOS.
     /// * a lossy SORT key (`from_utf8_lossy` in the comparator) is invisible
     ///   to the first three entries, whose raw and lossy orders agree — hence
-    ///   `a\xff` and `a\xef\xbf\xbd`: raw sorts `EF BF BD` before `FF`, but
-    ///   under a lossy key both collapse to `a\u{fffd}` and the order flips
-    ///   (Go compares Go strings, i.e. raw bytes, so raw is the faithful one).
-    ///   The flip is deterministic but does lean on `slice::sort_by` being
-    ///   stable: the two lossy keys are EQUAL, so a lossy comparator keeps the
-    ///   input order — which the array below deliberately sets to the wrong one.
+    ///   `a\xff` and `a\xf0\x90\x80\x80` (U+10000): raw sorts `F0 90 80 80`
+    ///   before `FF`, while a lossy key collapses `a\xff` to `61 EF BF BD` and
+    ///   moves it *ahead*. The two keys stay distinct, so the flip does **not**
+    ///   depend on sort stability. Go compares Go strings, i.e. raw bytes
+    ///   (`net/http/fs.go` `dirList` sorts `Name()` with `sort.Slice`), so the
+    ///   raw key is the faithful one — and for a genuinely tied key Go's
+    ///   *unstable* `sort.Slice` (sort/slice.go:15-17) has no fixed expectation
+    ///   to match, which is why the pair here is chosen to be tie-free.
     ///   The input array is deliberately NOT in rendered order, so the order
     ///   in the expected body also proves a sort happened at all.
     #[cfg(unix)]
@@ -3702,14 +3705,14 @@ mod tests {
             (name(b"plain.txt"), false),
             (name(b"a\xff"), false),
             (name(b"raw\xff.txt"), false),
-            (name(b"a\xef\xbf\xbd"), false),
+            (name(b"a\xf0\x90\x80\x80"), false),
         ];
         assert_eq!(
             render_listing(&entries),
             "<!doctype html>\n\
              <meta name=\"viewport\" content=\"width=device-width\">\n\
              <pre>\n\
-             <a href=\"a%EF%BF%BD\">a\u{fffd}</a>\n\
+             <a href=\"a%F0%90%80%80\">a\u{10000}</a>\n\
              <a href=\"a%FF\">a\u{fffd}</a>\n\
              <a href=\"plain.txt\">plain.txt</a>\n\
              <a href=\"raw%FF.txt\">raw\u{fffd}.txt</a>\n\

@@ -674,12 +674,12 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `render_listing(entries: &[(OsString, bool)]) -> String` that `render_dir_listing` now calls,
   and `test_render_listing_non_utf8_name_escapes_byte_exact` feeds it a synthetic
   `b"raw\xff.txt"` (plus a `sub\xff` directory) and asserts the whole HTML body byte-exactly,
-  including `<a href="raw%FF.txt">`; it also pins the byte-wise **sort key** with the pair
-  `b"a\xff"` / `b"a\xef\xbf\xbd"` — raw order puts `EF BF BD` before `FF`, a lossy comparator
-  collapses the two to equal keys and so keeps the input order (set to the wrong one), and the
-  other three names cannot tell the two keys apart (Reviewer 1 F7 /
-  Reviewer 2 N1; the input array is deliberately not in rendered order, so the order in the
-  expected body also proves a sort happened at all);
+  including `<a href="raw%FF.txt">`; it also pins the byte-wise **sort key** with the tie-free
+  pair `b"a\xff"` / `b"a\xf0\x90\x80\x80"` — raw order puts `F0 90 80 80` before `FF`, a lossy
+  comparator collapses `a\xff` to `61 EF BF BD` and moves it ahead (the two keys stay distinct, so
+  the flip does not depend on sort stability), and the other three names cannot tell the two keys
+  apart (Reviewer 1 F7 / Reviewer 2 N1; the input array is deliberately not in rendered order, so
+  the order in the expected body also proves a sort happened at all);
   `test_join_components_non_utf8_component_byte_exact` pins `join_components`'s unix arm on
   `b"raw\xff.txt"` — its only call site is this path and it had **no direct** test before
   (existing e2e tests reached it indirectly, with valid-UTF-8 names only).
@@ -705,9 +705,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   code was zero-copy (`ent.file_name().into_vec()`). Passing the `Vec` by value and iterating
   with `into_iter()` removes that clone and keeps the hop reachable by a synthetic test, so this
   is a viable follow-up. It was left alone because the item is about *coverage*, not listing
-  throughput, and the production half of this file has now been reviewed twice: re-opening its
-  signature for an unmeasured saving would invalidate those reviews to buy back one allocation
-  per directory entry. Recorded here so a later round can do it with a measurement.
+  throughput: the saving is one allocation per directory entry, no measurement shows the listing
+  path is hot, and the change would re-open a production signature that has already been reviewed
+  twice. Recorded here so a later round can do it with a measurement.
 - [x] **`frpc-tiny`'s test targets did not compile.** Evidence:
   `cargo check -p frp-client --no-default-features --features tls,tcp-mux --all-targets`
   — exactly the tiny tier for frp-client, measured `['tcp-mux','tls']` — exited 101 with
