@@ -7,7 +7,11 @@
 //! inbound TLS listener of https2http/https2https only; outbound to the
 //! backend is always HTTP/1.1 (Go http.Server + httputil.ReverseProxy).
 
-#![cfg(feature = "tls")]
+// This test needs `h2`/`http`, which the `http2http` feature provides (it
+// implies `tls`). Gating on `tls` alone left the target unable to compile in
+// the tiny configuration (`--no-default-features --features tls,tcp-mux`),
+// where `h2` and `http` are absent.
+#![cfg(feature = "http2http")]
 
 use std::collections::HashMap;
 use std::path::PathBuf;

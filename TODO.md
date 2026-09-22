@@ -649,17 +649,36 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   so it is the one local `frp-client` failure expected not to appear on the ubuntu-latest
   runner. **Done-when:** the non-UTF-8-name half of the test is skipped where the filesystem
   cannot store such a name, or it is platform-conditional.
-- [ ] **`frpc-tiny`'s test targets do not compile either.** Evidence:
+- [x] **`frpc-tiny`'s test targets did not compile.** Evidence:
   `cargo check -p frp-client --no-default-features --features tls,tcp-mux --all-targets`
-  — exactly the tiny tier for frp-client, measured `['tcp-mux','tls']` — exits 101 with
+  — exactly the tiny tier for frp-client, measured `['tcp-mux','tls']` — exited 101 with
   `could not compile frp-client (test "plugin_h2") due to 5 previous errors`: `E0433 cannot
-  find module or crate 'h2'`, `'http'`, plus an `E0277`. `plugin_h2.rs` is gated
-  `#![cfg(feature = "tls")]` only, but its `h2`/`http` imports come from `http2http`. The
-  new isolated CI step uses `--no-default-features` (no features), so it does not reach this
-  configuration. **Done-when:** the `plugin_h2` test target is gated on the feature that
-  provides `h2`/`http` (`http2http`), so the tiny test targets build and a
-  `-p frp-client --no-default-features --features tls,tcp-mux --all-targets` step can be
-  added.
+  find module or crate 'h2'`, `'http'`, plus an `E0277`. `plugin_h2.rs` was gated
+  `#![cfg(feature = "tls")]` only, but its `h2`/`http` imports come from `http2http` (which
+  implies `tls` — `frp-client/Cargo.toml`: `http2http = ["dep:h2", "dep:http", "dep:bytes",
+  "tls"]`), so in the tiny configuration the gate selected the whole file in while the crates
+  it needs were absent.
+  **Fixed:** the gate is now `#![cfg(feature = "http2http")]`, with a comment naming the
+  crates that actually require it. Verified: the same
+  `RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --features
+  tls,tcp-mux --all-targets` now exits **0**, and `cargo test -p frp-client --test plugin_h2`
+  still builds and passes **6/6** at default features — the target is still exercised where its
+  dependencies exist, and at `--no-default-features` it is whole-file-cfg'd *empty* by design
+  rather than failing.
+  **Gate added** (`ci.yml`, `verify` lane): `Check frp-client tiny test targets compile
+  (isolated, tls+tcp-mux)` runs that exact command under `-D warnings`. Without it the tiny
+  test targets are checked nowhere, because the `--workspace` tiny step deliberately omits
+  `--all-targets` (dev-dependency unification would re-enable both crates' `default` sets and
+  silently drop the tier check — see that step's own comment). The neighbouring isolated step's
+  comment had already predicted this failure mode ("which is exactly how plugin_h2's
+  tls-vs-http2http bug hid"); this closes it.
+  **Residue:** because the fix makes the target *correctly empty* in the tiny configuration,
+  the new step cannot catch a missing gate *inside* it — its body is only compiled with
+  `http2http` on, which the default-feature lane covers. The neighbouring step's caveat lists
+  the targets that are whole-file-cfg'd empty in the **no-features** configuration; under this
+  step's tiny configuration only 3 of those are still empty (`plugin_h2`, `xtcp_pair_e2e`,
+  `xtcp_visitor_failure_e2e` — measured: `peer_xff_registry_e2e` reports 1 test there), so
+  those 3 are the set this gate cannot check inside.
 - [ ] **Measured `-p` configurations that are red under `-D warnings`.** Measured:
   - `RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --features vnet --all-targets`
     exits 101: `error: method 'remove_run_id_vnet_routes' is never used` at
