@@ -738,30 +738,107 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   step's tiny configuration only 3 of those are still empty (`plugin_h2`, `xtcp_pair_e2e`,
   `xtcp_visitor_failure_e2e` — measured: `peer_xff_registry_e2e` reports 1 test there), so
   those 3 are the set this gate cannot check inside.
-- [ ] **Measured `-p` configurations that are red under `-D warnings`.** Measured:
+- [x] **Measured `-p` configurations that are red under `-D warnings`.** Measured at `846c1b9`
+  and re-measured 2026-09-22: all four exit **101**. Fixed in this change by narrowing the `cfg`
+  on the definition/import side at every site — no `#[allow(dead_code)]`,
+  `#[allow(unused_imports)]` or `#[allow(unused_variables)]` anywhere. No configuration is
+  documented as unsupported: all four compile clean at `-D warnings` (done-when met by fixing,
+  not by excusing).
   - `RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --features vnet --all-targets`
-    exits 101: `error: method 'remove_run_id_vnet_routes' is never used` at
+    → 101: `error: method 'remove_run_id_vnet_routes' is never used` at
     `frp-server/src/state.rs:1876` — its only caller, `frp-server/src/ssh_gateway.rs:1987`,
-    is `ssh`-gated, so `vnet` without `ssh` leaves it dead.
+    is `ssh`-gated, and the whole `ssh_gateway` module is too (`frp-server/src/lib.rs:18`), so
+    `vnet` without `ssh` leaves it dead.
   - `RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --features quic`
-    exits 101 with two errors: `error: unused variable: 'quic_params'` at
+    → 101 with two errors: `error: unused variable: 'quic_params'` at
     `frp-client/src/nat_hole.rs:521` and `error: field 'quic_params' is never read` at
     `frp-client/src/visitor.rs:371`.
   - `RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --features vnet --all-targets`
-    exits 101 with two `unused import` errors (`tokio::io::AsyncReadExt`,
+    → 101 with two `unused import` errors (`tokio::io::AsyncReadExt`,
     `tokio::io::AsyncWriteExt`) at `frp-client/src/visitor.rs:2900-2901`. `--all-targets` is
     required: those imports live in `#[cfg(all(test, feature = "vnet"))] mod tests`, and the
     bare command without it exits 0.
   - `RUSTFLAGS="-D warnings" cargo check -p frp-core --no-default-features --features kcp --all-targets`
-    exits 101: `error: unused imports: 'AtomicU64' and 'AtomicUsize'` at
+    → 101: `error: unused imports: 'AtomicU64' and 'AtomicUsize'` at
     `frp-core/src/xtcp_session.rs:40` — every use of those two imports is inside `tcp-mux`-gated
-    code. Measured family: `--features kcp,stun`, `--features kcp,quic` and `--features vnet,kcp`
-    exit 101 with that same error, while `--features kcp,tcp-mux`, `--features kcp,stun,tcp-mux`
-    and `--features tcp-mux` exit 0.
+    code, while `AtomicBool` on the same line IS used unconditionally (the QUIC session's
+    `alive` flag) and stays in the un-gated import. Measured family: `--features kcp,stun`,
+    `--features kcp,quic` and `--features vnet,kcp` exit 101 with that same error, while
+    `--features kcp,tcp-mux`, `--features kcp,stun,tcp-mux` and `--features tcp-mux` exit 0.
   These four are **intra-crate** feature combinations — a different class from the
-  feature-unification defect fixed in `ConnectionType`, which was cross-crate. **Done-when:**
-  each of the four either compiles clean under `-D warnings` or the configuration is
-  documented as unsupported.
+  feature-unification defect fixed in `ConnectionType`, which was cross-crate. Why the item
+  existed: nothing gated them, and `cargo check --workspace` cannot see them either — feature
+  unification across members re-enables each crate's `default` set, so a `-p`-only failure is
+  invisible in the lane meant to cover feature combinations. Hence discovery by a measurement
+  round rather than by CI.
+  **Fixed** — each `cfg` now names exactly the condition that admits its user:
+  - `frp-server/src/state.rs:1883` — `#[cfg(feature = "ssh")]` added to
+    `remove_run_id_vnet_routes`, on top of the `#[cfg(feature = "vnet")]` already on its `impl`
+    block (`frp-server/src/state.rs:1846`): caller and callee now exist under the same pair.
+  - `frp-client/src/nat_hole.rs:529` — the `quic_params` binding's `#[cfg(feature = "quic")]`
+    → `#[cfg(all(feature = "quic", feature = "kcp"))]`, agreeing with its only consumer
+    (`frp-client/src/nat_hole.rs:668`, inside the `all(quic, kcp)` data-plane arm).
+  - `frp-client/src/visitor.rs:94-95`, `:375`, `:1200`, `:1251`, `:1842`, `:3728`, `:3771` and
+    `frp-client/src/service.rs:2648`, `:2717` — the whole client `quic_params` chain (the
+    `VisitorListenerConfig` field, the `XtcpPunchConfig` field, both destructures, both
+    punch-config test literals, and the compute/pass sites) moved from
+    `#[cfg(feature = "quic")]` to `#[cfg(all(feature = "quic", feature = "kcp"))]`. The value's
+    only consumer is the `cfg.quic_params` read at `frp-client/src/visitor.rs:655`, inside that
+    same `all(quic, kcp)` arm, and the type it feeds — `frp_core::xtcp_p2p::QuicTunnelSession`
+    with its `xtcp_p2p_connect_quic_session*` constructors — is re-exported by frp-core only
+    under `#[cfg(all(feature = "kcp", feature = "quic"))]` (`frp-core/src/xtcp_p2p.rs:137`).
+    Widening the *use* was therefore not available: under `quic` without `kcp` frp-client has no
+    QUIC data plane at all, so the config field must not exist either.
+  - `frp-client/src/visitor.rs:2913-2916` — the two `tokio::io` extension-trait imports in
+    `#[cfg(all(test, feature = "vnet"))] mod tests` are now each
+    `#[cfg(feature = "compression")]`; the only methods they supply are called from that
+    module's single `#[cfg(feature = "compression")]` test (`write_all` at `:3147`, `read_exact`
+    at `:3152`).
+  - `frp-core/src/xtcp_session.rs:40,47` — split into
+    `use std::sync::atomic::{AtomicBool, Ordering};` plus a separately gated
+    `#[cfg(feature = "tcp-mux")] use std::sync::atomic::{AtomicU64, AtomicUsize};`. Every
+    `AtomicU64`/`AtomicUsize` use is in `ReadActivity`, `LiveP2pStream`, `spawn_tunnel_driver`
+    or the `#[cfg(all(test, feature = "tcp-mux"))] mod tests`.
+  **Verified after the change (raw exit codes):** the four commands above → **0 / 0 / 0 / 0**
+  (was 101 / 101 / 101 / 101). `cargo fmt --all -- --check` → 0. `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings` → 0. `cargo check --workspace --all-targets`
+  (default features, no `RUSTFLAGS`) → 0. `bash scripts/repo-health.sh` → `RESULT: invariants
+  hold`, exit 0 (a repo-path/version gate, not a compile gate). Regression sweep at
+  `-D warnings`, all exit 0 — including the item's own measured family: frp-core `kcp,tcp-mux`,
+  `kcp,stun`, `vnet,kcp`, `tcp-mux`, `kcp,quic`, `kcp,tcp-mux,quic`; frp-client `vnet,tcp-mux`,
+  `quic,kcp`, `vnet,compression`, `quic --all-targets`; frp-server `vnet,ssh`, `ssh`. Tests over
+  the edited code: `cargo test -p frp-core --lib xtcp_session` → 2 passed / 0 failed / 854
+  filtered out, exit 0; `cargo test -p frp-client --features tcp-mux --lib visitor` → 25 passed
+  / 0 failed / 246 filtered out, exit 0; `cargo test -p frp-client --features vnet --lib
+  virtual_net` (the re-gated imports' module) → 5 passed / 0 failed / 285 filtered out, exit 0.
+  Both frp-client counts moved by exactly 2 when #363 added 2 lib tests — they were first written
+  as 244/283. They are **per-feature-set** counts: 246 is over **271** lib tests under
+  `--features tcp-mux`, while 285 is over **290** under `--features vnet`, because the
+  feature-gated test modules change the denominator. **Nothing gates a `filtered out` value**
+  (repo-health has no such entry and skips `TODO.md`), so a bare count in durable prose cannot be
+  checked later: state the feature set and its total with it, or the number rots.
+  **Gate added** (`.github/workflows/ci.yml:495`, `verify` lane): `Check the four measured-red
+  intra-crate feature combinations (curated list, NOT the full 2^N space)` runs exactly those
+  four commands in one `set -e` block under `env: RUSTFLAGS: "-D warnings"`, in the isolated `-p`
+  form that reproduces them. Step body measured green when run verbatim as a shell script
+  (exit 0), so the gate is a gate and not a red step.
+  **Residue:** the gate pins **only these four combinations**. It is a curated, closed list —
+  not the 2^N intra-crate feature space — as its step name, its step comment and this paragraph
+  all state, and **every other intra-crate combination remains unmeasured**, including
+  combinations of features not named in this item. Three narrower notes: (a) the three extra
+  members of this item's measured family (`kcp,stun`, `kcp,quic`, `vnet,kcp`) are closed by the
+  same import split and re-measured at exit 0 above, but they are **not** in the gate — only the
+  four named commands are; (b) the second command is the bare form the item measured (no
+  `--all-targets`), so a *test-target-only* failure of `frp-client --features quic` without
+  `kcp` would not be caught (that variant was measured clean at exit 0, but is not pinned);
+  (c) a whole-file-cfg'd *empty* target still reads as clean, so the gate bounds the code
+  compiled, not coverage. The step's CI wall-clock cost (four extra feature graphs, each a new
+  `RUSTFLAGS` fingerprint, inside a 15-minute lane) was not measured here.
+  **Commit:** *fix: gate the four measured-red intra-crate feature combinations, and add the gate
+  step.* No sha and no parent sha are cited on purpose: this PR is squash-merged, so any sha
+  written here is rewritten the moment it lands and becomes a false citation — the text originally
+  carried one, and a rebase onto the post-#363 `main` had already invalidated it before the squash
+  could. Identify the change by its subject instead.
 - [ ] **Pre-existing: no query-parameter-count guard, so >10000 params diverge from Go.**
   Go's `parseQuery` opens with
   `if !urlParamsWithinMax(strings.Count(query, "&") + 1) { return Values{}, err }`

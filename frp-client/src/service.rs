@@ -2639,7 +2639,13 @@ impl Service {
             let ctx_udp_packet_codec = ctx.wc_udp_packet_codec.clone();
             // Client QUIC transport params for the XTCP tunnel session (Go
             // `clientCfg.Transport.QUIC`).
-            #[cfg(feature = "quic")]
+            //
+            // `kcp` as well as `quic`: this value flows into
+            // `VisitorListenerConfig::quic_params` → `XtcpPunchConfig` →
+            // `do_hole_punch`'s QUIC session call, and frp-core re-exports
+            // `QuicTunnelSession` only under `all(feature = "kcp", feature =
+            // "quic")`. See the field gate in `frp-client/src/visitor.rs`.
+            #[cfg(all(feature = "quic", feature = "kcp"))]
             let visitor_quic_params = frp_core::quic::quic_params_from_option_values(
                 cfg_local
                     .quic_options
@@ -2708,7 +2714,7 @@ impl Service {
                     // byte-stream bridge; mismatches fall back to the
                     // message-level transcoding bridge.
                     udp_packet_codec: ctx_udp_packet_codec.clone(),
-                    #[cfg(feature = "quic")]
+                    #[cfg(all(feature = "quic", feature = "kcp"))]
                     quic_params: visitor_quic_params,
                 })
                 .await;

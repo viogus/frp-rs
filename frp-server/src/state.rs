@@ -1873,6 +1873,14 @@ impl AppState {
     }
 
     /// Remove every route registered by `run_id` and broadcast matching removals.
+    ///
+    /// `ssh`-gated on top of this `vnet`-gated `impl` block: the only caller is
+    /// `ssh_gateway::cleanup_session` (`frp-server/src/ssh_gateway.rs`), and
+    /// that module is itself `#[cfg(feature = "ssh")]`. With `vnet` on and
+    /// `ssh` off the method has no caller and trips `dead_code` under
+    /// `-D warnings` (measured with `cargo check -p frp-server
+    /// --no-default-features --features vnet --all-targets`).
+    #[cfg(feature = "ssh")]
     pub(crate) async fn remove_run_id_vnet_routes(&self, run_id: &str) {
         let removed = {
             let mut routes = self.vnet_routes.write().await;

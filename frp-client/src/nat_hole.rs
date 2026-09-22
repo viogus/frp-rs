@@ -517,7 +517,16 @@ impl Service {
         let resp_v2 = self.cfg.read().await.v2;
         // Client QUIC transport params for the provider-side tunnel session
         // (Go `listenByQUIC` reads `pxy.clientCfg.Transport.QUIC`).
-        #[cfg(feature = "quic")]
+        //
+        // Gated on `kcp` as well as `quic`, because the only consumer is the
+        // QUIC tunnel session a few hundred lines below — inside the
+        // `#[cfg(all(feature = "quic", feature = "kcp"))]` data-plane arm
+        // (`TunnelSession::Quic`, whose backing
+        // `frp_core::xtcp_p2p::QuicTunnelSession` is re-exported by frp-core
+        // under that same pair). With `quic` on and `kcp` off there is no QUIC
+        // data plane in frp-client, so the binding has no use and trips
+        // `unused_variables` under `-D warnings`.
+        #[cfg(all(feature = "quic", feature = "kcp"))]
         let quic_params = {
             let cfg = self.cfg.read().await;
             frp_core::quic::quic_params_from_option_values(
