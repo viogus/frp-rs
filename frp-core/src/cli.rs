@@ -3,6 +3,8 @@
 //! Uses bpaf combinators to match Go frp v0.69.1 CLI surface.
 //! All flags accept both hyphen (`--log-file`) and underscore (`--log_file`) forms.
 
+use std::time::Duration;
+
 use bpaf::Parser;
 use bpaf::*;
 
@@ -22,6 +24,194 @@ fn parse_go_bool(value: String) -> Result<bool, String> {
         "0" | "f" | "F" | "FALSE" | "false" | "False" => Ok(false),
         _ => Err(format!("invalid boolean value \"{value}\"")),
     }
+}
+
+/// Default of `--api-timeout`: Go frp v0.71.0's
+/// `var adminAPITimeout = 30 * time.Second` (`cmd/frpc/sub/admin.go:34`).
+pub const DEFAULT_ADMIN_API_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Consume Go's `leadingInt` from `time.ParseDuration`: digits into a `u64`,
+/// failing on the same overflow Go fails on.
+fn leading_int(s: &[u8]) -> Result<(u64, usize), ()> {
+    let mut x: u64 = 0;
+    let mut i = 0;
+    while i < s.len() && s[i].is_ascii_digit() {
+        if x > (1u64 << 63) / 10 {
+            return Err(());
+        }
+        x = x * 10 + u64::from(s[i] - b'0');
+        if x > 1u64 << 63 {
+            return Err(());
+        }
+        i += 1;
+    }
+    Ok((x, i))
+}
+
+/// Consume Go's `leadingFraction`: the digits after a decimal point as a
+/// `u64` plus the matching power-of-ten scale. On overflow Go stops updating
+/// the value but keeps consuming digits; the scale stops growing too.
+fn leading_fraction(s: &[u8]) -> (u64, f64, usize) {
+    let mut x: u64 = 0;
+    let mut scale = 1f64;
+    let mut overflow = false;
+    let mut i = 0;
+    while i < s.len() && s[i].is_ascii_digit() {
+        if !overflow {
+            if x > ((1u64 << 63) - 1) / 10 {
+                overflow = true;
+            } else {
+                let y = x * 10 + u64::from(s[i] - b'0');
+                if y > 1u64 << 63 {
+                    overflow = true;
+                } else {
+                    x = y;
+                    scale *= 10.0;
+                }
+            }
+        }
+        i += 1;
+    }
+    (x, scale, i)
+}
+
+/// Parse a duration with Go `time.ParseDuration`'s grammar, hand-written.
+///
+/// Needed because `Duration` does not implement `FromStr` on the pinned
+/// toolchain and the dependency policy forbids adding a crate for it. Grammar
+/// (Go's `ParseDuration`): one or more `number unit` groups, each number a
+/// decimal integer with an optional fractional part, each unit one of
+/// `ns us µs μs ms s m h` (lowercase only), behind an optional leading `+`/`-`.
+/// A bare `0` is the only unit-less form; a number with no unit is
+/// `time: missing unit in duration "…"`, an unknown unit is
+/// `time: unknown unit "d" in duration "1d"`, and everything else malformed is
+/// `time: invalid duration "…"` — Go's wording, measured through
+/// `frpc stop --api-timeout=<value>` on the v0.71.0 binary. Overflow past
+/// `2562047h47m16.854775807s` (`i64::MAX` ns) is rejected, never panicked.
+///
+/// A negative value parses (Go accepts `-1s`) but a [`Duration`] cannot be
+/// negative and the only consumer is a deadline, where "negative" means
+/// "already elapsed" — so it is represented as [`Duration::ZERO`], exactly like
+/// a parsed `0`. Go distinguishes them only in the sign it later applies to an
+/// already-expired context, which behaves the same.
+fn parse_go_duration(text: String) -> Result<Duration, String> {
+    let orig = text.as_str();
+    let invalid = || format!("time: invalid duration \"{orig}\"");
+    let mut rest = text.as_bytes();
+    let mut neg = false;
+    if let Some((&c, tail)) = rest.split_first() {
+        match c {
+            b'-' => {
+                neg = true;
+                rest = tail;
+            }
+            b'+' => rest = tail,
+            _ => {}
+        }
+    }
+    // Go special-cases a bare "0" after the sign.
+    if rest == b"0" {
+        return Ok(Duration::ZERO);
+    }
+    if rest.is_empty() {
+        return Err(invalid());
+    }
+    // Total nanoseconds, tracked in Go's unsigned domain so the overflow checks
+    // match (`d > 1<<63` fails, `d == 1<<63` is still representable as -2^63).
+    let mut total: u64 = 0;
+    while !rest.is_empty() {
+        if !(rest[0] == b'.' || rest[0].is_ascii_digit()) {
+            return Err(invalid());
+        }
+        let (v, used) = leading_int(rest).map_err(|()| invalid())?;
+        let pre = used != 0;
+        rest = &rest[used..];
+        let mut f: u64 = 0;
+        let mut scale = 1f64;
+        let mut post = false;
+        if !rest.is_empty() && rest[0] == b'.' {
+            rest = &rest[1..];
+            let (ff, ss, used) = leading_fraction(rest);
+            f = ff;
+            scale = ss;
+            rest = &rest[used..];
+            post = used != 0;
+        }
+        if !pre && !post {
+            return Err(invalid());
+        }
+        // The unit is the run of bytes that are neither a digit nor a point.
+        let unit_len = rest
+            .iter()
+            .take_while(|c| **c != b'.' && !c.is_ascii_digit())
+            .count();
+        if unit_len == 0 {
+            return Err(format!("time: missing unit in duration \"{orig}\""));
+        }
+        let unit_name = &rest[..unit_len];
+        rest = &rest[unit_len..];
+        let unit: u64 = match unit_name {
+            b"ns" => 1,
+            // U+00B5 MICRO SIGN and U+03BC GREEK SMALL LETTER MU, Go's two µs
+            // spellings (UTF-8: C2 B5 and CE BC).
+            b"us" | b"\xc2\xb5s" | b"\xce\xbcs" => 1_000,
+            b"ms" => 1_000_000,
+            b"s" => 1_000_000_000,
+            b"m" => 60 * 1_000_000_000,
+            b"h" => 3_600 * 1_000_000_000,
+            _ => {
+                return Err(format!(
+                    "time: unknown unit \"{}\" in duration \"{orig}\"",
+                    String::from_utf8_lossy(unit_name)
+                ))
+            }
+        };
+        if v > (1u64 << 63) / unit {
+            return Err(invalid());
+        }
+        let mut v = v * unit;
+        if f > 0 {
+            // Go: `v += uint64(float64(f) * (float64(unit) / scale))`.
+            let fraction = (f as f64) * (unit as f64 / scale);
+            if !fraction.is_finite() || fraction < 0.0 {
+                return Err(invalid());
+            }
+            v = v.checked_add(fraction as u64).ok_or_else(invalid)?;
+            if v > 1u64 << 63 {
+                return Err(invalid());
+            }
+        }
+        total = total.checked_add(v).ok_or_else(invalid)?;
+        if total > 1u64 << 63 {
+            return Err(invalid());
+        }
+    }
+    if neg {
+        return Ok(Duration::ZERO);
+    }
+    if total > (1u64 << 63) - 1 {
+        return Err(invalid());
+    }
+    Ok(Duration::from_nanos(total))
+}
+
+/// `--api-timeout` for the frpc admin subcommands.
+///
+/// Go frp v0.71.0 registers this flag **per subcommand** —
+/// `cmd.Flags().DurationVar(&adminAPITimeout, "api-timeout", adminAPITimeout,
+/// "Timeout for admin API calls")` inside `NewAdminCommand`'s loop over
+/// `reload`/`status`/`stop` (`cmd/frpc/sub/admin.go:36-50`) — not as a root
+/// persistent flag; measured, `frpc verify --api-timeout=1s` is
+/// `Error: unknown flag: --api-timeout`, exit 1. The underscore spelling
+/// `--api_timeout` is registered as well, like every other flag in this file;
+/// `docs/deployment.md` records the measured Go behaviour for both spellings.
+fn api_timeout_parser() -> impl Parser<Duration> {
+    long("api-timeout")
+        .long("api_timeout")
+        .argument::<String>("DURATION")
+        .help("Timeout for admin API calls")
+        .parse(parse_go_duration)
+        .fallback(DEFAULT_ADMIN_API_TIMEOUT)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -397,7 +587,10 @@ pub fn parse_frps_args() -> FrpsArgs {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// frpc CLI — run mode + 9 subcommands matching Go frp v0.69.1
+// frpc CLI — run mode + 12 subcommands: tcp, udp, http, https, stcp, xtcp,
+// sudp, tcpmux, verify, reload, status, stop. Go frp v0.71.0's `frpc --help`
+// lists those 12 plus `nathole` (not implemented here), `completion` and
+// `help` (cobra built-ins).
 // ──────────────────────────────────────────────────────────────────────
 
 /// CLI arguments for frpc (client).
@@ -427,6 +620,8 @@ pub enum FrpcCmd {
     Reload(ReloadArgs),
     /// Query running frpc proxy status via admin API
     Status(StatusArgs),
+    /// Stop running frpc via admin API
+    Stop(StopArgs),
 }
 
 #[derive(Debug, Clone)]
@@ -557,6 +752,9 @@ pub struct ReloadArgs {
     pub admin_port: Option<u16>,
     pub admin_user: Option<String>,
     pub admin_pwd: Option<String>,
+    /// Deadline for the whole admin HTTP call; default
+    /// [`DEFAULT_ADMIN_API_TIMEOUT`] (Go's `adminAPITimeout`).
+    pub api_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -572,6 +770,28 @@ pub struct StatusArgs {
     pub admin_port: Option<u16>,
     pub admin_user: Option<String>,
     pub admin_pwd: Option<String>,
+    /// Deadline for the whole admin HTTP call; default
+    /// [`DEFAULT_ADMIN_API_TIMEOUT`] (Go's `adminAPITimeout`).
+    pub api_timeout: Duration,
+}
+
+/// Arguments of `frpc stop` — [`StatusArgs`] without `--json`, mirroring Go's
+/// registration (all three admin commands get the same flag set).
+#[derive(Debug, Clone)]
+pub struct StopArgs {
+    pub config: Option<String>,
+    /// Go frp v0.71.0: `--strict-config` is a persistent rootCmd flag
+    /// (cmd/frpc/sub/root.go), so `frpc stop` accepts it too — and
+    /// `NewAdminCommand` passes it to `config.LoadClientConfig`
+    /// (cmd/frpc/sub/admin.go:57). Absent → true.
+    pub strict_config: bool,
+    pub admin_addr: Option<String>,
+    pub admin_port: Option<u16>,
+    pub admin_user: Option<String>,
+    pub admin_pwd: Option<String>,
+    /// Deadline for the whole admin HTTP call; default
+    /// [`DEFAULT_ADMIN_API_TIMEOUT`] (Go's `adminAPITimeout`).
+    pub api_timeout: Duration,
 }
 
 // ─── frpc parser combinators ─────────────────────────────────────────
@@ -1065,13 +1285,15 @@ fn reload_cmd() -> impl Parser<FrpcCmd> {
         .long("admin_pwd")
         .argument::<String>("PWD")
         .optional();
+    let api_timeout = api_timeout_parser();
     let args = construct!(ReloadArgs {
         config,
         strict_config,
         admin_addr,
         admin_port,
         admin_user,
-        admin_pwd
+        admin_pwd,
+        api_timeout
     });
     args.to_options()
         .command("reload")
@@ -1114,6 +1336,7 @@ fn status_cmd() -> impl Parser<FrpcCmd> {
         .long("admin_pwd")
         .argument::<String>("PWD")
         .optional();
+    let api_timeout = api_timeout_parser();
     let args = construct!(StatusArgs {
         config,
         strict_config,
@@ -1121,12 +1344,63 @@ fn status_cmd() -> impl Parser<FrpcCmd> {
         admin_addr,
         admin_port,
         admin_user,
-        admin_pwd
+        admin_pwd,
+        api_timeout
     });
     args.to_options()
         .command("status")
         .help("Query running frpc proxy status")
         .map(FrpcCmd::Status)
+}
+
+/// `frpc stop` — Go frp v0.71.0 `cmd/frpc/sub/admin.go:40` registers it with
+/// the short text `Stop the running frpc`, the same config load / port refusal
+/// as the other two admin commands, and the same `--api-timeout` flag.
+fn stop_cmd() -> impl Parser<FrpcCmd> {
+    let config = long("config")
+        .short('c')
+        .argument::<String>("FILE")
+        .optional();
+    // Same persistent-rootCmd-flag semantics as reload/status: bare
+    // `--strict-config` → true, `--strict-config=false` → false, absent → true.
+    // (The space-separated form `--strict-config false` → false is an frp-rs
+    // extension, not Go pflag semantics — see `parse_go_bool`.)
+    let strict_value = long("strict-config")
+        .long("strict_config")
+        .argument::<String>("BOOL")
+        .parse(parse_go_bool);
+    let strict_switch = long("strict-config").long("strict_config").flag(true, true);
+    let strict_config = construct!([strict_value, strict_switch]);
+    let admin_addr = long("admin-addr")
+        .long("admin_addr")
+        .argument::<String>("IP")
+        .optional();
+    let admin_port = long("admin-port")
+        .long("admin_port")
+        .argument::<u16>("PORT")
+        .optional();
+    let admin_user = long("admin-user")
+        .long("admin_user")
+        .argument::<String>("USER")
+        .optional();
+    let admin_pwd = long("admin-pwd")
+        .long("admin_pwd")
+        .argument::<String>("PWD")
+        .optional();
+    let api_timeout = api_timeout_parser();
+    let args = construct!(StopArgs {
+        config,
+        strict_config,
+        admin_addr,
+        admin_port,
+        admin_user,
+        admin_pwd,
+        api_timeout
+    });
+    args.to_options()
+        .command("stop")
+        .help("Stop the running frpc")
+        .map(FrpcCmd::Stop)
 }
 
 /// Compose all frpc subcommands + run-mode fallback.
@@ -1151,6 +1425,7 @@ fn frpc_parser() -> impl Parser<FrpcCmd> {
         verify_cmd(),
         reload_cmd(),
         status_cmd(),
+        stop_cmd(),
         run,
     ])
 }
@@ -1675,5 +1950,251 @@ mod tests {
 
         let with_dir = parse_frps(&["--config-dir", "/etc/frp/conf.d"]).unwrap();
         assert!(!with_dir.cli_overrides_enabled());
+    }
+
+    // ── frpc stop / --api-timeout ───────────────────────────────────────
+
+    fn parse_frpc_status(args: &[&str]) -> Result<StatusArgs, bpaf::ParseFailure> {
+        match frpc_parser().to_options().run_inner(args)? {
+            FrpcCmd::Status(a) => Ok(a),
+            other => panic!("expected status command, got {other:?}"),
+        }
+    }
+
+    fn parse_frpc_stop(args: &[&str]) -> Result<StopArgs, bpaf::ParseFailure> {
+        match frpc_parser().to_options().run_inner(args)? {
+            FrpcCmd::Stop(a) => Ok(a),
+            other => panic!("expected stop command, got {other:?}"),
+        }
+    }
+
+    /// Parse `argv` (a whole admin-subcommand invocation) and return its
+    /// `--api-timeout`, so a grammar case can be pinned on all three
+    /// subcommands that must carry the flag.
+    fn admin_api_timeout(argv: &[&str]) -> Duration {
+        match argv[0] {
+            "reload" => parse_frpc_reload(argv).unwrap().api_timeout,
+            "status" => parse_frpc_status(argv).unwrap().api_timeout,
+            "stop" => parse_frpc_stop(argv).unwrap().api_timeout,
+            other => panic!("not an admin subcommand: {other}"),
+        }
+    }
+
+    #[test]
+    fn api_timeout_defaults_to_go_30s() {
+        // Go frp v0.71.0 `var adminAPITimeout = 30 * time.Second`
+        // (cmd/frpc/sub/admin.go:34); absent flag → 30 s. Checked on all three
+        // subcommands because Go registers the default per subcommand.
+        assert_eq!(DEFAULT_ADMIN_API_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(
+            parse_frpc_reload(&["reload"]).unwrap().api_timeout,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            parse_frpc_status(&["status"]).unwrap().api_timeout,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            parse_frpc_stop(&["stop"]).unwrap().api_timeout,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn api_timeout_parses_go_duration_grammar() {
+        // Every value on the left was measured *accepted* by Go v0.71.0
+        // (`frpc stop --api-timeout=<v> -c frpc.toml` with a refused admin
+        // port); the right-hand side is `time.ParseDuration`'s value. Run on
+        // reload/status/stop so the grammar cannot be wired to one command.
+        let cases: [(&str, Duration); 15] = [
+            ("1m", Duration::from_secs(60)),
+            ("500ms", Duration::from_millis(500)),
+            ("1h2m3.5s", Duration::from_millis(3_723_500)),
+            ("1s500ms", Duration::from_millis(1_500)),
+            ("1m0s", Duration::from_secs(60)),
+            ("1.5h", Duration::from_secs(5_400)),
+            (".5s", Duration::from_millis(500)),
+            ("+1s", Duration::from_secs(1)),
+            ("100us", Duration::from_micros(100)),
+            ("1µs", Duration::from_micros(1)),
+            ("1μs", Duration::from_micros(1)),
+            ("0", Duration::ZERO),
+            ("0s", Duration::ZERO),
+            ("-1s", Duration::ZERO),
+            (
+                "2562047h47m16.854775807s",
+                Duration::from_nanos(i64::MAX as u64),
+            ),
+        ];
+        for command in ["reload", "status", "stop"] {
+            for (text, expected) in cases {
+                let flag = format!("--api-timeout={text}");
+                assert_eq!(
+                    admin_api_timeout(&[command, &flag]),
+                    expected,
+                    "{command} {flag}"
+                );
+            }
+        }
+        // `-1s` reaches the CLI as ZERO because a `Duration` cannot be
+        // negative and the consumer only needs "deadline already past"
+        // (see `parse_go_duration`).
+        assert_eq!(parse_go_duration("-1s".into()).unwrap(), Duration::ZERO);
+    }
+
+    #[test]
+    fn api_timeout_rejects_what_go_rejects() {
+        // Measured rejected by Go v0.71.0, exit 1, message + usage on stderr:
+        // `1` → `time: missing unit in duration "1"`; `abc`/`Inf` →
+        // `time: invalid duration "…"`; `1d`/`1S`/`1Ms`/`1e3s` → `time: unknown
+        // unit "…" in duration "…"`; `2562048h` and a 21-digit hour count →
+        // `time: invalid duration "…"` (overflow).
+        for text in [
+            "1",
+            "abc",
+            "1d",
+            "1S",
+            "1Ms",
+            "1e3s",
+            "Inf",
+            "2562048h",
+            "999999999999999999999h",
+            "",
+        ] {
+            assert!(parse_go_duration(text.into()).is_err(), "{text:?}");
+            for command in ["reload", "status", "stop"] {
+                for prefix in ["--api-timeout", "--api_timeout"] {
+                    let flag = format!("{prefix}={text}");
+                    assert!(
+                        frpc_parser()
+                            .to_options()
+                            .run_inner(&[command, &flag][..])
+                            .is_err(),
+                        "{command} {flag} must be rejected"
+                    );
+                }
+            }
+        }
+        // The two wordings the brief pins verbatim.
+        assert_eq!(
+            parse_go_duration("1".into()).unwrap_err(),
+            "time: missing unit in duration \"1\""
+        );
+        assert_eq!(
+            parse_go_duration("abc".into()).unwrap_err(),
+            "time: invalid duration \"abc\""
+        );
+    }
+
+    #[test]
+    fn api_timeout_is_not_accepted_outside_the_three_admin_commands() {
+        // Go registers `--api-timeout` per subcommand inside
+        // NewAdminCommand's loop (cmd/frpc/sub/admin.go:36-50); measured on
+        // v0.71.0, `frpc verify --api-timeout=1s` → `Error: unknown flag:
+        // --api-timeout`, exit 1. Same for the underscore spelling.
+        let tcp: [&str; 5] = ["tcp", "--local-port", "1", "--remote-port", "2"];
+        assert!(
+            frpc_parser().to_options().run_inner(&tcp[..]).is_ok(),
+            "control: the tcp invocation without the flag must parse"
+        );
+        for argv in [
+            &["--api-timeout", "1s"][..],
+            &["verify", "--api-timeout=1s", "-c", "x.toml"][..],
+            &["verify", "--api_timeout=1s", "-c", "x.toml"][..],
+            &[
+                "tcp",
+                "--api-timeout=1s",
+                "--local-port",
+                "1",
+                "--remote-port",
+                "2",
+            ][..],
+        ] {
+            assert!(
+                frpc_parser().to_options().run_inner(argv).is_err(),
+                "{argv:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn api_timeout_underscore_spelling_matches_go() {
+        // Go v0.71.0 accepts `--api_timeout` on these three subcommands as it
+        // accepts every hyphen spelling (measured: `frpc stop
+        // --api_timeout=abc` fails on `--api-timeout`, so the alias reaches the
+        // same flag, while `--api_timeoutt` is `unknown flag`;
+        // `docs/deployment.md` carries the mechanism). frp-rs registers both
+        // spellings here and must enforce the same grammar on each.
+        assert_eq!(
+            admin_api_timeout(&["stop", "--api_timeout=500ms"]),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            admin_api_timeout(&["reload", "--api_timeout", "2s"]),
+            Duration::from_secs(2)
+        );
+        assert!(
+            parse_frpc_status(&["status", "--api_timeout=abc"]).is_err(),
+            "the alias must enforce the same grammar as the hyphen spelling"
+        );
+    }
+
+    #[test]
+    fn stop_accepts_the_shared_admin_flags_and_defaults_strict() {
+        let args = parse_frpc_stop(&[
+            "stop",
+            "-c",
+            "x.toml",
+            "--strict-config=false",
+            "--admin-addr",
+            "10.0.0.1",
+            "--admin-port",
+            "7401",
+            "--admin-user",
+            "u",
+            "--admin-pwd",
+            "p",
+        ])
+        .unwrap();
+        assert_eq!(args.config.as_deref(), Some("x.toml"));
+        assert!(!args.strict_config);
+        assert_eq!(args.admin_addr.as_deref(), Some("10.0.0.1"));
+        assert_eq!(args.admin_port, Some(7401));
+        assert_eq!(args.admin_user.as_deref(), Some("u"));
+        assert_eq!(args.admin_pwd.as_deref(), Some("p"));
+        assert_eq!(args.api_timeout, DEFAULT_ADMIN_API_TIMEOUT);
+        // `--strict-config` is a persistent rootCmd flag (default true), so
+        // stop inherits run-mode semantics like reload/status.
+        assert!(parse_frpc_stop(&["stop"]).unwrap().strict_config);
+        assert!(
+            parse_frpc_stop(&["stop", "--strict_config"])
+                .unwrap()
+                .strict_config
+        );
+        assert!(
+            !parse_frpc_stop(&["stop", "--strict_config", "false"])
+                .unwrap()
+                .strict_config
+        );
+    }
+
+    #[test]
+    fn stop_help_is_go_short_text() {
+        // Go v0.71.0 `cmd/frpc/sub/admin.go:40` registers the short text
+        // `Stop the running frpc`, and `frpc --help` lists it under
+        // `Available Commands`. bpaf renders the per-command `.help()` string
+        // in the parent's command list, which is where frp-rs prints it:
+        // `frpc --help` shows `stop` with this text.
+        let failure = frpc_parser()
+            .to_options()
+            .run_inner(&["--help"][..])
+            .expect_err("--help is reported as a ParseFailure");
+        match failure {
+            bpaf::ParseFailure::Stdout(doc, _) => {
+                let text = doc.to_string();
+                assert!(text.contains("Stop the running frpc"), "help={text}");
+            }
+            other => panic!("expected help on stdout, got {other:?}"),
+        }
     }
 }

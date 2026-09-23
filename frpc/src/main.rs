@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::process;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(unix)]
 use tokio::signal;
@@ -8,6 +9,7 @@ use tokio::signal;
 use frp_client::service::Service;
 use frp_core::cli::{
     build_single_proxy_config, parse_frpc_args, FrpcCmd, FrpcRunArgs, ReloadArgs, StatusArgs,
+    StopArgs,
 };
 use frp_core::config::{collect_config_files, load_client_config, ClientConfig, ProxyConfig};
 use frp_core::logging;
@@ -25,7 +27,7 @@ struct AdminConnection {
     password: String,
 }
 
-/// Why the admin address could not be resolved for `reload`/`status`.
+/// Why the admin address could not be resolved for `reload`/`status`/`stop`.
 ///
 /// Go frp v0.71.0 (`cmd/frpc/sub/admin.go:56-71`) loads the config first and, on
 /// any error, prints it and exits 1 **without contacting anything**; it then
@@ -141,7 +143,47 @@ fn basic_auth_header(user: &str, password: &str) -> String {
     )
 }
 
-async fn admin_get(conn: &AdminConnection, path: &str) -> Result<String, String> {
+/// Error for an admin call that ran out of its `--api-timeout` deadline, or
+/// whose deadline had already passed before it started.
+///
+/// frp-rs's wording is its own: Go wraps the same call in
+/// `context.WithTimeout` (`cmd/frpc/sub/admin.go`) and reports
+/// `context deadline exceeded`. Measured on v0.71.0 with `--api-timeout=0`,
+/// `=0s` and `=-1s`: `Post "http://127.0.0.1:27411/api/stop": context deadline
+/// exceeded` on **stdout**, exit 1.
+fn admin_timeout_error(timeout: Duration) -> String {
+    format!("admin request timed out after {timeout:?}")
+}
+
+/// Bounds one whole admin HTTP call — connect, write and read — with
+/// `timeout`, exactly the span Go's `context.WithTimeout` covers.
+///
+/// A zero timeout is checked before dialing: Go treats `0`, `0s` and `-1s` as
+/// an already-expired context and reports a timeout rather than whatever the
+/// socket does, so a refused port must not win that race. (`-1s` reaches here
+/// as [`Duration::ZERO`] — see `parse_go_duration`.)
+async fn with_admin_timeout<F>(timeout: Duration, call: F) -> Result<String, String>
+where
+    F: std::future::Future<Output = Result<String, String>>,
+{
+    if timeout.is_zero() {
+        return Err(admin_timeout_error(timeout));
+    }
+    match tokio::time::timeout(timeout, call).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(admin_timeout_error(timeout)),
+    }
+}
+
+async fn admin_get(
+    conn: &AdminConnection,
+    path: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    with_admin_timeout(timeout, admin_get_inner(conn, path)).await
+}
+
+async fn admin_get_inner(conn: &AdminConnection, path: &str) -> Result<String, String> {
     let mut stream = tokio::net::TcpStream::connect(&conn.addr)
         .await
         .map_err(|e| format!("connect {}: {e}", conn.addr))?;
@@ -172,6 +214,15 @@ async fn admin_get(conn: &AdminConnection, path: &str) -> Result<String, String>
 }
 
 async fn admin_post_json(
+    conn: &AdminConnection,
+    path: &str,
+    json_body: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    with_admin_timeout(timeout, admin_post_json_inner(conn, path, json_body)).await
+}
+
+async fn admin_post_json_inner(
     conn: &AdminConnection,
     path: &str,
     json_body: &str,
@@ -301,6 +352,7 @@ async fn main() {
         FrpcCmd::Verify(args) => run_verify(&args.config, args.strict_config).await,
         FrpcCmd::Reload(args) => run_reload(args).await,
         FrpcCmd::Status(args) => run_status(args).await,
+        FrpcCmd::Stop(args) => run_stop(args).await,
     }
 }
 
@@ -710,7 +762,7 @@ async fn run_reload(args: ReloadArgs) {
         }
     };
     let body = format!(r#"{{"strictConfig":{}}}"#, args.strict_config);
-    match admin_post_json(&conn, "/api/reload", &body).await {
+    match admin_post_json(&conn, "/api/reload", &body, args.api_timeout).await {
         Ok(summary) => println!("reload success: {summary}"),
         Err(e) => {
             eprintln!("reload failed: {e}");
@@ -736,7 +788,7 @@ async fn run_status(args: StatusArgs) {
             process::exit(EXIT_RUNTIME);
         }
     };
-    let body = match admin_get(&conn, "/api/status").await {
+    let body = match admin_get(&conn, "/api/status", args.api_timeout).await {
         Ok(b) => b,
         Err(e) => {
             eprintln!("status query failed: {e}");
@@ -750,6 +802,36 @@ async fn run_status(args: StatusArgs) {
     }
 
     print_status_table(&body);
+}
+
+async fn run_stop(args: StopArgs) {
+    let conn = match resolve_admin_connection(
+        args.admin_addr.as_deref(),
+        args.admin_port,
+        args.admin_user.as_deref(),
+        args.admin_pwd.as_deref(),
+        args.config.as_deref(),
+        args.strict_config,
+    ) {
+        Ok(conn) => conn,
+        Err(e) => {
+            // Same as run_reload/run_status: Go's refusal messages go to
+            // stdout, exit 1, and no connection is attempted.
+            println!("{e}");
+            process::exit(EXIT_RUNTIME);
+        }
+    };
+    // Go's StopHandler sends no body and prints its own `stop success`,
+    // discarding the response body (`cmd/frpc/sub/admin.go`, tag v0.71.0); the
+    // request frp-rs sends has `Content-Length: 0` and no body bytes, matching
+    // the Go client's request (measured on the v0.71.0 binary).
+    match admin_post_json(&conn, "/api/stop", "", args.api_timeout).await {
+        Ok(_) => println!("stop success"),
+        Err(e) => {
+            eprintln!("stop failed: {e}");
+            std::process::exit(frp_core::EXIT_RUNTIME);
+        }
+    }
 }
 
 fn print_status_table(body: &str) {
