@@ -654,7 +654,13 @@ other subcommand does — measured on v0.71.0, `frpc verify --api-timeout=1s` is
 sign, units `ns us µs μs ms s m h` — parsed in-tree because `Duration: FromStr`
 is not implemented by the pinned toolchain (1.98.1: the trait bound
 `Duration: FromStr` is not satisfied). As in Go, a zero or negative value is
-accepted and means the deadline has already passed. The deadline covers the whole
+accepted and means the deadline has already passed. One exception to that grammar
+is recorded rather than copied: when the group sum passes `2^64`, Go's `uint64`
+running total wraps and can still survive its own range checks — measured, two
+2^63 ns groups wrap to 0 and Go reports `context deadline exceeded` — while
+frp-rs rejects the input with `time: invalid duration`. frp-rs is stricter on
+that class, never looser, and never panics; `TODO.md` carries the measurements
+and `frp-core/src/cli.rs` the unit pin. The deadline covers the whole
 admin call (connect, write, read); when it runs out — or had already passed
 before dialing — the command prints `reload failed:` / `status query failed:` /
 `stop failed:` followed by `admin request timed out after <duration>` on stderr
@@ -670,8 +676,8 @@ the subcommand (`frpc --api-timeout 1s stop …`, measured), while frp-rs requir
 the subcommand word first — the pre-existing rule for every subcommand flag,
 unchanged here.
 
-Four reject-path and help-text differences remain in this flag's surface, none
-of them in the accepted-value grammar or in the call itself. (1) A rejected value
+Four further differences remain in this flag's surface — none of them in the
+accepted-value grammar or in the call itself. (1) A rejected value
 is reported as bpaf's `Error: couldn't parse <value>: time: …`, where Go wraps
 the same inner text in `invalid argument "<value>" for "--api-timeout" flag` —
 for ASCII inputs the inner `time: …` wording matches Go verbatim, and the outer
