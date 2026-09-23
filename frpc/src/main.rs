@@ -822,9 +822,12 @@ async fn run_stop(args: StopArgs) {
         }
     };
     // Go's StopHandler sends no body and prints its own `stop success`,
-    // discarding the response body (`cmd/frpc/sub/admin.go`, tag v0.71.0); the
-    // request frp-rs sends has `Content-Length: 0` and no body bytes, matching
-    // the Go client's request (measured on the v0.71.0 binary).
+    // discarding the response body (`cmd/frpc/sub/admin.go:115-125`, tag
+    // v0.71.0). Method, path, `Content-Length: 0` and an empty body match the
+    // measured Go request (`POST /api/stop HTTP/1.1`, `Content-Length: 0`);
+    // the remaining headers differ: Go sends `User-Agent: Go-http-client/1.1`
+    // and `Accept-Encoding: gzip`, frp-rs sends `Content-Type:
+    // application/json` and `Connection: close`.
     match admin_post_json(&conn, "/api/stop", "", args.api_timeout).await {
         Ok(_) => println!("stop success"),
         Err(e) => {

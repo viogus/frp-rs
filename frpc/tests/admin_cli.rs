@@ -39,14 +39,14 @@
 //! the no-default-features lanes CI runs.
 //!
 //! The `stop` tests reuse those refusals — Go registers `stop` through the same
-//! `NewAdminCommand` body (`cmd/frpc/sub/admin.go:40-66`) — and add a one-shot
-//! mock admin server that answers a captured request, so they can pin
-//! `POST /api/stop` with `Content-Length: 0` and no body bytes, `stop success`
-//! on stdout and exit 0 (Go's `StopHandler` sends no body and prints its own
-//! `stop success`). A black-hole variant accepts a connection and never
-//! responds, pinning `--api-timeout`: without the deadline the client blocks in
-//! `read_to_end` forever (measured pre-fix against `frpc status`, no exit in
-//! 8 s), so the test hangs into `run_frpc`'s failure rather than passing.
+//! `NewAdminCommand` refusal body (`cmd/frpc/sub/admin.go:42`, `:56-71`) — and
+//! add a one-shot mock admin server that answers a captured request, so they can
+//! pin `POST /api/stop` with `Content-Length: 0` and no bytes after the request
+//! head, `stop success` on stdout and exit 0 (Go's `StopHandler` sends no body
+//! and prints its own `stop success`). A black-hole variant accepts a connection
+//! and never responds, pinning `--api-timeout`: without the deadline the client
+//! blocks in `read_to_end` forever (measured pre-fix against `frpc status`, no
+//! exit in 8 s), so the test hangs into `run_frpc`'s failure rather than passing.
 #![cfg(feature = "full")]
 
 use std::io::{Read, Write};
@@ -578,8 +578,15 @@ fn status_strict_config_false_tolerates_an_unknown_key() {
 // ── frpc stop: POST /api/stop, empty body, `stop success` on 200 ────────────
 
 /// Start a one-shot mock admin server: accept exactly one connection, record
-/// every request byte up to the blank line that ends the head, then answer
-/// `status` + `body`. The receiver yields the captured head.
+/// every request byte up to the blank line that ends the head **and any bytes
+/// that follow it**, then answer `status` + `body`. The receiver yields the
+/// captured bytes.
+///
+/// The post-head read is what gives the "no body" assertion power. frpc writes
+/// the whole request in one `write_all`, so any body bytes are already in the
+/// socket buffer when the terminator is seen; a short read therefore returns
+/// them immediately, while a client that sends no body only makes this read
+/// wait out its 200 ms timeout.
 fn mock_admin(
     status: &'static str,
     body: &'static str,
@@ -592,15 +599,24 @@ fn mock_admin(
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("mock admin read timeout");
-        let mut head = Vec::new();
+        let mut captured = Vec::new();
         let mut byte = [0u8; 1];
-        while !head.ends_with(b"\r\n\r\n") {
+        while !captured.ends_with(b"\r\n\r\n") {
             match stream.read(&mut byte) {
                 Ok(0) | Err(_) => break,
-                Ok(_) => head.push(byte[0]),
+                Ok(_) => captured.push(byte[0]),
             }
         }
-        let _ = tx.send(head);
+        // Anything after the terminator is a request body; a client that sends
+        // none makes this read time out.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("mock admin body read timeout");
+        let mut rest = [0u8; 1024];
+        if let Ok(n) = stream.read(&mut rest) {
+            captured.extend_from_slice(&rest[..n]);
+        }
+        let _ = tx.send(captured);
         let response = format!(
             "{status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -642,7 +658,11 @@ fn config_for_port(dir: &TempDir, port: u16) -> String {
 #[test]
 fn stop_posts_api_stop_without_a_body_and_prints_stop_success() {
     let dir = TempDir::new();
-    let (port, request_rx, handle) = mock_admin("HTTP/1.1 200 OK", "stop success");
+    // The response body is deliberately *not* `stop success`: the CLI must
+    // print its own fixed string, as Go's StopHandler does, so a regression
+    // that echoes the daemon's body must fail here. The real Go daemon returns
+    // an empty body anyway (measured: `Content-Length: 0`).
+    let (port, request_rx, handle) = mock_admin("HTTP/1.1 200 OK", "IGNORED");
     let cfg = config_for_port(&dir, port);
 
     let out = run_frpc(&["stop", "-c", &cfg]);
@@ -654,23 +674,24 @@ fn stop_posts_api_stop_without_a_body_and_prints_stop_success() {
         stdout_of(&out),
         stderr_of(&out)
     );
-    assert_eq!(stdout_of(&out).trim_end(), "stop success");
+    // Untrimmed: `println!` writes exactly this, newline included.
+    assert_eq!(stdout_of(&out), "stop success\n");
     assert!(stderr_of(&out).is_empty(), "stderr={:?}", stderr_of(&out));
-    let head = request_rx
+    let captured = request_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("mock admin received a request");
     handle.join().expect("mock admin thread");
-    let head = String::from_utf8_lossy(&head).to_string();
     // Measured on Go v0.71.0: `POST /api/stop HTTP/1.1`, `Content-Length: 0`,
-    // and no body bytes after the blank line.
+    // and no bytes after the blank line that ends the head.
+    let head = String::from_utf8_lossy(&captured).to_string();
     assert!(
         head.starts_with("POST /api/stop HTTP/1.1\r\n"),
         "head={head:?}"
     );
     assert!(head.contains("Content-Length: 0\r\n"), "head={head:?}");
     assert!(
-        head.ends_with("\r\n\r\n"),
-        "no body may follow the head: {head:?}"
+        captured.ends_with(b"\r\n\r\n"),
+        "no body may follow the head: {captured:?}"
     );
 }
 
@@ -817,9 +838,10 @@ fn api_timeout_zero_or_negative_is_a_timeout_not_a_connection_error() {
 
 #[test]
 fn api_timeout_one_second_still_succeeds_against_a_responding_server() {
-    // Positive control: the deadline must not break the happy path.
+    // Positive control: the deadline must not break the happy path. The body
+    // is again not `stop success`, so this also fails if the CLI echoes it.
     let dir = TempDir::new();
-    let (port, _rx, _handle) = mock_admin("HTTP/1.1 200 OK", "stop success");
+    let (port, _rx, _handle) = mock_admin("HTTP/1.1 200 OK", "IGNORED");
     let cfg = config_for_port(&dir, port);
 
     let out = run_frpc(&["stop", "--api-timeout=1s", "-c", &cfg]);
@@ -831,7 +853,7 @@ fn api_timeout_one_second_still_succeeds_against_a_responding_server() {
         stdout_of(&out),
         stderr_of(&out)
     );
-    assert_eq!(stdout_of(&out).trim_end(), "stop success");
+    assert_eq!(stdout_of(&out), "stop success\n");
 }
 
 /// The discriminating timeout test: the listener accepts and holds the socket
