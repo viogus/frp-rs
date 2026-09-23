@@ -224,6 +224,90 @@ cargo test --workspace       # Run all tests
 cargo clippy                 # Lint
 ```
 
+### Toolchain pinning
+
+`rust-toolchain.toml` at the repo root pins the compiler for every rustup-based
+job that builds the checked-out tree: an exact `channel` (`X.Y.Z`, never `stable`
+and never a floating `X.Y`), `profile = "minimal"`, and the `clippy`/`rustfmt`
+components. That is what makes a `cargo fmt` / `cargo clippy` result a property
+of the commit rather than of the runner image or a developer's `rustup default`.
+
+The channel is exact because a floating one re-introduces the failure the pin
+removes: a new rustc/clippy release can add a lint that fires on untouched code,
+which turns the lint gate red on a commit that changed nothing. An exact version
+makes a compiler bump a deliberate, reviewable diff.
+
+It is the file, not a workflow step, that selects the compiler: any `rustc`,
+`cargo`, `cargo clippy` or `cargo fmt` run anywhere under the repository resolves
+it, including subdirectories such as `scripts/frp-stress/`. A job therefore only
+has to make sure the toolchain exists — run `rustup toolchain install --no-self-update`
+in the repository. With no toolchain argument it installs exactly what the file
+asks for: the pinned version, its `profile`, and its two components, reporting
+`the active toolchain ... has been installed` and `overridden by
+<repo>/rust-toolchain.toml`. A missing toolchain is never a reason to pass
+`+toolchain` by hand. Bare `rustup show` also auto-installs the file's
+toolchain, but rustup 1.29.1 warns that auto-installation is deprecated, so the
+explicit install is what CI runs.
+
+Typo behaviour, measured on rustup 1.29.1. A **misspelled component** is loud
+where it matters: with a fresh `RUSTUP_HOME` — the state a CI runner starts in —
+`rustup toolchain install --no-self-update` fails with `error: component 'rustfm'
+for target '<host>' is unavailable for download for channel '1.98.1-<host>'`,
+exit 1, installing nothing; only when that toolchain is **already installed**
+does it degrade to `warn: skipping unavailable component rustfm` with exit 0, so
+a local typo of that kind can pass unnoticed. An **unknown key** in the
+`[toolchain]` table (for example `profilee = "minimal"`, or `component = [...]`
+instead of `components`) is ignored with no warning at all and exits 0 in both
+cases, so **that** typo rests on review. A typo in a *value* is always loud (a
+malformed file, an unknown `profile` and a non-existent `channel` all exit 1),
+and no silent case can leave the compiler unpinned: the `channel` rustup actually
+resolves is the one the assertion step in `ci.yml` checks. And the file must keep
+the standard `[toolchain]` section form:
+rustup also honours an inline table (`toolchain = { channel = "..." }`) and a
+dotted key (`toolchain.channel = "..."`), but the `repo-health.sh` gate parses
+the section form only and **fails closed** on those two spellings rather than
+accepting a form it does not check.
+
+**Not covered:** the Docker source build. `docker/Dockerfile.source` starts from
+a floating `rust:1-slim-bookworm` and does not copy `rust-toolchain.toml` into
+the build context, so images built from it are outside the pin. That is recorded
+as an open item in `TODO.md` ("The Docker source build is outside the toolchain
+pin and floats its own compiler").
+
+To bump:
+
+1. edit `channel` in `rust-toolchain.toml` to the new exact version;
+2. run `rustup toolchain install --no-self-update` — it installs the new
+   toolchain and its two components;
+3. run `cargo fmt --all -- --check`;
+4. run `cargo clippy --workspace --all-targets --all-features -- -D warnings`;
+5. fix every lint the new compiler reports **in the same PR**. That diff is the
+   point of the pin: it is the reviewable consequence of the bump, not a
+   follow-up chore.
+
+`scripts/repo-health.sh` gates the pin itself: exactly one toolchain file, at the
+repo root, in `.toml` form (tracked, present, and not shadowed by an untracked
+one); an exact `channel` inside its `[toolchain]` table, quoted either way and
+tolerating a trailing TOML comment; no `toolchain:` input on a
+`setup-rust-toolchain` step — with the step recognised in these forms and no
+others: inline `- uses: ...`, `uses :`, a quoted `uses:` value, a named step
+(`- name: ...` with `uses:` on its own line, or under a bare `-`), and the flow
+form `- {uses: ..., with: {...}}`, in `*.yml` and `*.yaml` — and the key
+recognised as a block mapping, a flow mapping, a comma-separated flow mapping,
+or a single-/double-quoted key, matched case-insensitively since action input
+names are reported to be matched that way; and no floating `rustup default`
+selection under `.github/workflows/`. Each of those checks' own comments list the
+known shapes it does **not** see (each measured there, and explicitly not a
+completeness claim): for the `toolchain:` scan those are, among others, an anchor
+or tag token between `-` and `uses:`, a flow sequence with no `-` line, a comment
+at or below the step's indentation before the key, a `#` inside an earlier quoted
+value on the same line, an anchor/alias on the `with:` block, a key consumed by a
+different action, and a case-different action URL (not verified against GitHub) —
+plus fail-closed over-catches, where a `{`/`,` inside a quoted scalar or inline
+comment, a nested sequence in the step, or a key-like line inside a block scalar
+makes the gate fail a workflow that never passes the input. Deliberately not
+chased: the check is a text scan, not a YAML parser.
+
 ### Binary Variants
 
 Four size tiers via feature flags. The authoritative tier list, exact commands

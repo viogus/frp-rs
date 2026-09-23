@@ -66,6 +66,7 @@ jobs:
           # Checkout by frozen SHA — all platforms get the same commit.
           ref: ${{ needs.prepare.outputs.release_sha }}
 
+      # Toolchain from the repo-root `rust-toolchain.toml` (no `toolchain:` input).
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.target }}
@@ -142,6 +143,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.release_sha }}
 
+      # Toolchain from the repo-root `rust-toolchain.toml` (no `toolchain:` input).
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.target }}
@@ -192,6 +194,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.release_sha }}
 
+      # Toolchain from the repo-root `rust-toolchain.toml` (no `toolchain:` input).
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.target }}

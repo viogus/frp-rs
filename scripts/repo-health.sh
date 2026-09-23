@@ -13,10 +13,12 @@
 # Exit code: 0 if the mandatory invariants hold, 1 otherwise. The gates (each of
 # which can set the exit code) are: version alignment, every unsafe block having
 # a `// SAFETY:` justification, every vendored crate having a
-# README-FRP-RS.md, docs-index reachability, backtick repo-path resolution, and
-# the curated doc-figure list. The code-size and binary-size sections are pure
-# reports; the archive-path report is not a content gate but does fail the run
-# if its scan cannot complete.
+# README-FRP-RS.md, the toolchain pin (exactly one root `rust-toolchain.toml`,
+# an exact `channel` inside its `[toolchain]` table, and no `toolchain:` input or
+# floating `rustup default` in CI), docs-index reachability, backtick
+# repo-path resolution, and the curated doc-figure list. The code-size and
+# binary-size sections are pure reports; the archive-path report is not a content
+# gate but does fail the run if its scan cannot complete.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
@@ -241,6 +243,248 @@ for v in vendor/*/; do
 done
 printf '\n  Each vendored crate must document WHY and its EXIT CONDITION.\n'
 printf '  A vendored copy pins the crate: track upstream advisories by hand.\n'
+
+# ---------------------------------------------------------------- toolchain
+hdr "Toolchain pin"
+
+# Gates: the compiler must be pinned to an exact version, by exactly one file,
+# and no workflow may select one by another route. Unpinned, the lint gate is a
+# function of the runner image — a new rustc/clippy release can add a lint that
+# fires on untouched code, so the same commit is green on one image and red on
+# the next. The pin is `rust-toolchain.toml`'s `[toolchain] channel`; "stable",
+# "nightly" and a floating "1.98" all track new releases and are failures here.
+#
+# Both directions were exercised when this gate landed. The pass shapes that must
+# NOT fail: `- run: cargo build # rustup default stable was removed`,
+# `- name: Install Rust stable (rustup default stable)`, a comment mentioning the
+# removed command, `channel = '1.98.1'` (single-quoted TOML), and a trailing TOML
+# comment after either the `[toolchain]` header or the `channel` value.
+TOOLCHAIN_FILE=rust-toolchain.toml
+
+# (a) Exactly one toolchain file, at the repo root, in `.toml` form, present on
+# disk, and not shadowed by an untracked one. `git ls-files` because it is
+# precise and cheap. The extension-less legacy `rust-toolchain` is still honoured
+# by rustup and WINS over the `.toml` when both exist (measured stderr:
+# `warn: both .../rust-toolchain and .../rust-toolchain.toml exist; using
+# contents of .../rust-toolchain`), so a second file moves the compiler while the
+# `.toml` still reads as pinned. A nested file
+# (`scripts/frp-stress/rust-toolchain.toml`) does the same from inside its own
+# directory. The `find` fallback keeps the gate usable from a source tree with
+# no `.git` (the `health` CI job always has one).
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  tc_files=$(git ls-files | grep -E '(^|/)rust-toolchain(\.toml)?$' || true)
+  # Untracked-but-not-gitignored shadowing files: they win in rustup exactly like
+  # tracked ones, so a pass here would assert more than was checked. Gitignored
+  # scratch stays invisible on purpose (`--exclude-standard`), and anything under
+  # a `target/` build directory is pruned for the same reason the `find` fallback
+  # below prunes it — nothing builds from inside `target/`.
+  tc_untracked=$(git ls-files --others --exclude-standard \
+    | grep -E '(^|/)rust-toolchain(\.toml)?$' | grep -vE '(^|/)target/' || true)
+else
+  tc_files=$(find . -type d -name target -prune -o \
+    \( -name rust-toolchain -o -name rust-toolchain.toml \) -print 2>/dev/null \
+    | sed 's|^\./||')
+  tc_untracked=""
+fi
+if [ ! -f "$TOOLCHAIN_FILE" ]; then
+  printf '  FAIL  %s is missing — the toolchain is not pinned\n' "$TOOLCHAIN_FILE"
+  fail=1
+elif [ "$tc_files" = "$TOOLCHAIN_FILE" ] && [ -z "$tc_untracked" ]; then
+  printf '  ok    exactly one toolchain file: %s (repo root)\n' "$TOOLCHAIN_FILE"
+else
+  [ -n "$tc_files" ] && printf '%s\n' "$tc_files" | sed 's/^/    /'
+  [ -n "$tc_untracked" ] && printf '%s\n' "$tc_untracked" | sed 's/^/    untracked: /'
+  printf '  FAIL  expected exactly one `%s` at the repo root and no other `rust-toolchain`/`rust-toolchain.toml`\n' \
+    "$TOOLCHAIN_FILE"
+  [ -n "$tc_untracked" ] && printf '        (the untracked file(s) still win in rustup — delete them or add them to .gitignore)\n'
+  fail=1
+fi
+
+# (b) `channel` must be present, inside the `[toolchain]` table, and an exact
+# X.Y.Z, optionally followed by a TOML comment. Single and double quotes are both
+# valid TOML and both honoured by rustup. Reading only inside the table matters: a
+# `channel` key outside it is ignored by rustup, so accepting it would print `ok`
+# for a tree that is not pinned at all. The extraction is intentionally a
+# three-step bash parse, not a TOML reader: the two other legal spellings rustup
+# honours — an inline table (`toolchain = { channel = "1.98.1" }`) and a dotted
+# key (`toolchain.channel = "1.98.1"`) — are NOT recognised and fail closed here.
+# That is documented in docs/developing.md, not silently tolerated.
+if [ -f "$TOOLCHAIN_FILE" ]; then
+  # The header may carry a trailing comment; the value's own trailing comment is
+  # stripped below, outside the quotes.
+  tc_line=$(awk '
+    /^[[:space:]]*\[/ { in_table = ($0 ~ /^[[:space:]]*\[toolchain\][[:space:]]*(#.*)?$/); next }
+    in_table && /^[[:space:]]*channel[[:space:]]*=/ { print; exit }
+  ' "$TOOLCHAIN_FILE")
+  tc_raw=$(printf '%s' "${tc_line#*=}" | sed -E 's/^[[:space:]]+//')
+  case "$tc_raw" in
+    \"*\"*) tc_channel=${tc_raw#\"}; tc_channel=${tc_channel%%\"*} ;;
+    \'*\'*) tc_channel=${tc_raw#\'}; tc_channel=${tc_channel%%\'*} ;;
+    *)      tc_channel=$(printf '%s' "$tc_raw" | sed -E 's/[[:space:]]*#.*$//; s/[[:space:]]//g') ;;
+  esac
+  if [ -z "$tc_channel" ]; then
+    printf '  FAIL  %s has no `channel = ...` key in its [toolchain] table — the toolchain is not pinned\n' \
+      "$TOOLCHAIN_FILE"
+    fail=1
+  elif printf '%s' "$tc_channel" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    printf '  ok    %s channel = %s (exact version)\n' "$TOOLCHAIN_FILE" "$tc_channel"
+  else
+    printf '  FAIL  %s channel = "%s" is not an exact X.Y.Z version\n' \
+      "$TOOLCHAIN_FILE" "$tc_channel"
+    fail=1
+  fi
+fi
+
+# (c) No workflow may pass a `toolchain:` input to
+# `actions-rust-lang/setup-rust-toolchain@v1`. The action documents that a
+# provided `toolchain` makes it ignore the toolchain file and install that value
+# instead, and its `override: true` default then beats the file for the rest of
+# the job — which would silently unpin every step that relies on the file.
+#
+# The scan is scoped to the action's own step, not the whole file: a
+# `toolchain:` that overrides nothing (`workflow_dispatch.inputs.toolchain`, a
+# `matrix.toolchain` entry, a job `env:` mapping, another step's `run: |` body)
+# must not fail the gate. Both `*.yml` and `*.yaml` are read.
+#
+# RECOGNISED STEP FORMS (a closed list — a form not named here is not detected):
+#   * `- uses: ...@v1`; `- uses : ...`; `- uses: "...@v1"`;
+#   * a named step: `- name: ...` with `uses:` as a mapping key on its own line
+#     below it, or below a bare `-`;
+#   * the flow form `- {uses: ...@v1, with: {toolchain: stable}}`, whose opening
+#     line is scanned as well as its continuation lines.
+# The block's base is the indentation of the enclosing `-` list item, not of the
+# `uses:` line, so those forms keep their continuation lines in scope. Only a
+# `-` at that base (or outside any item) starts a new item: a deeper `-` is item
+# content, so a block scalar such as
+# `rustflags: |` / `  -D warnings` before `toolchain: stable` keeps the key in
+# scope instead of silently closing the block.
+#
+# Arming the block requires the action in a YAML key position — the start of the
+# line's mapping (optional indent, optional `- `, optional quote) or immediately
+# after `{`/`,` in a flow mapping. A comment line is skipped before the arming
+# test, so a comment, a step `name:` or a `run:` value that merely mentions the
+# action URL does not arm it. That is not a guarantee for every spelling though:
+# the `{`/`,` alternative cannot tell a flow key from a `{`/`,` inside a quoted
+# scalar or an inline comment, so those DO arm it (fail-closed; see the list).
+#
+# RECOGNISED KEY FORMS (also a closed list): block mapping
+# (`toolchain: stable`), flow mapping (`with: {toolchain: stable}` or
+# `with: {rustflags: '', toolchain: stable}`) and a quoted key (`"toolchain":`,
+# `'toolchain':`) — allowing `{`, `,` or whitespace before it and optional quotes
+# around it, in any letter case. The case-insensitivity is on purpose: the runner
+# and `@actions/core` are reported to match action input names that way, so an
+# uppercase `TOOLCHAIN:` would unpin too. Comment-awareness is deliberate but has
+# two halves: a line whose first non-space character is `#` is skipped, and a key
+# appearing only after an inline `#` on the same line is skipped too — PROVIDED
+# the comment is deeper than the item's indentation, because a comment at or
+# below it closes the block before the skip test runs (see the list).
+#
+# KNOWN NOT COVERED (each measured; this is not a completeness claim and there is
+# deliberately no YAML parser here — a pass means only that none of the
+# recognised forms above was seen):
+#   * an anchor or tag token between `-` and the `uses:` key —
+#     `- &step uses: ...@v1` with `toolchain: stable` below it: exit 0. This is a
+#     NARROWING introduced by this commit's rewrite: `5bf5270` caught it, and the
+#     anchor was lost when the arming test was limited to key position (pre-5bf5270
+#     `b8a9bf6` did not catch it either).
+#   * a flow *sequence* with no `-` line — `steps: [{uses: ...@v1, with:
+#     {toolchain: stable}}]`: exit 0 (pre-existing);
+#   * a comment at or below the item's indentation (`<=` the step's `-`) between
+#     the action's `uses:` and the key: it closes the item before the comment skip
+#     runs, so the key is never scanned: exit 0 (pre-existing);
+#   * a `#` inside an *earlier quoted value on the same line*: the guard looks for
+#     `#` in the raw prefix, so `with: {rustflags: "a#b", toolchain: stable}`
+#     is skipped as if commented out: exit 0;
+#   * a YAML anchor/alias on the `with:` block — `x-tc: &tc {toolchain: stable}`
+#     at the top level and `with: *tc` on the step: exit 0;
+#   * a `toolchain:` key consumed by a *different* action: not scanned at all;
+#   * the action URL is matched case-sensitively, so
+#     `Actions-Rust-Lang/Setup-Rust-Toolchain@v1` is missed. NOT verified against
+#     GitHub: whether Actions resolves a case-different `uses:` was not measured
+#     here; owner/repo names are case-insensitive on GitHub, so it is a likely
+#     bypass but is not claimed as one;
+#   * fail-closed over-catch (the gate fails a workflow that uses no `toolchain:`
+#     input): a `{` or `,` inside a quoted scalar or an inline comment arms the
+#     block — `run: 'echo "see, uses: ...@v1"'` + `env:` `toolchain: stable`:
+#     exit 1; so do `name: "match { uses: ...@v1"` and
+#     `run: echo hi # , uses: ...@v1` with that `env:`;
+#   * fail-closed over-catch: a nested sequence inside the step
+#     (`x-extra:` / `  - toolchain: stable`) is in scope and trips: exit 1;
+#   * fail-closed over-catch: a line that reads like a mapping key inside a block
+#     scalar of this step (`uses: ...@v1` inside its `run: |`) arms the block, and
+#     a later `toolchain: stable` then fails a workflow that never uses the action
+#     in a real key position: exit 1.
+tc_input=$(awk '
+  BEGIN { item_indent = -1; in_item = 0; target = 0 }
+  {
+    line = $0
+    match(line, /^[[:space:]]*/); ind = RLENGTH
+    if (substr(line, ind + 1, 1) == "-" && (!in_item || ind <= item_indent)) {
+      item_indent = ind; in_item = 1; target = 0
+      rest = substr(line, ind + 2)
+      if (rest ~ /(^|[{,])[[:space:]]*["'"'"']?[uU][sS][eE][sS]["'"'"']?[[:space:]]*:[[:space:]]*["'"'"']?actions-rust-lang\/setup-rust-toolchain@/) {
+        target = 1
+        if (match(rest, /(^|[{,[:space:]])["'"'"']?[tT][oO][oO][lL][cC][hH][aA][iI][nN]["'"'"']?[[:space:]]*:/)) {
+          if (index(substr(rest, 1, RSTART - 1), "#") == 0) print FILENAME ":" FNR ":" line
+        }
+      }
+      next
+    }
+    if (!in_item) next
+    if (line ~ /^[[:space:]]*$/) next
+    if (ind <= item_indent) { in_item = 0; target = 0; next }
+    if (line ~ /^[[:space:]]*#/) next
+    if (!target) {
+      if (line ~ /^[[:space:]]*(-[[:space:]]+)?["'"'"']?[uU][sS][eE][sS]["'"'"']?[[:space:]]*:[[:space:]]*["'"'"']?actions-rust-lang\/setup-rust-toolchain@/ ||
+          line ~ /[{,][[:space:]]*["'"'"']?[uU][sS][eE][sS]["'"'"']?[[:space:]]*:[[:space:]]*["'"'"']?actions-rust-lang\/setup-rust-toolchain@/) target = 1
+      else next
+    }
+    if (match(line, /(^|[{,[:space:]])["'"'"']?[tT][oO][oO][lL][cC][hH][aA][iI][nN]["'"'"']?[[:space:]]*:/)) {
+      if (index(substr(line, 1, RSTART - 1), "#") == 0) print FILENAME ":" FNR ":" line
+    }
+  }
+' .github/workflows/*.y*ml 2>/dev/null || true)
+if [ -n "$tc_input" ]; then
+  printf '%s\n' "$tc_input" | sed 's/^/    /'
+  printf '  FAIL  %s `toolchain:` input(s) on a setup-rust-toolchain step override the toolchain file\n' \
+    "$(printf '%s\n' "$tc_input" | grep -c .)"
+  fail=1
+else
+  printf '  ok    no `toolchain:` input on any setup-rust-toolchain step\n'
+fi
+
+# (d) No workflow may select a toolchain with `rustup default`. The pattern is
+# anchored to a real command — the start of a `run:` value, or the start of a
+# line inside a `run: |` block — so a step *name* or an explanatory comment that
+# merely mentions the removed command does not trip it (both were false
+# positives before; they are the pass cases in the header comment above). That
+# anchoring is also what makes the scan comment-aware.
+#
+# COVERAGE — deliberately narrow, and a pass means only this much:
+#   * catches `rustup default <name>` as a leading command in a file under
+#     `.github/workflows/`, tolerating extra whitespace
+#     (`rustup  default  stable`);
+#   * does NOT catch a floating selection that never writes that command as a
+#     leading `run:` command. Measured as passing (i.e. missed) when this gate
+#     landed: `cargo +stable`, an inline `RUSTUP_TOOLCHAIN=stable cargo ...`,
+#     `rustup override set stable`, a `rustc = ...` written into
+#     `.cargo/config.toml`, a `rustup default` that is not the first command of
+#     its `run:` line (`cd x && rustup default stable`), a **quoted scalar**
+#     (`run: "rustup default stable"`), a `rustup default` inside a script or
+#     Makefile the job invokes, and a compiler floated by a container base image.
+#     The Docker source build is one instance of that last case and has its own
+#     TODO.md item; this gate does not cover it.
+#   * check (c) above is scoped to the setup-action step and so does not see a
+#     `toolchain:` key that some other action might consume.
+floating=$(grep -rnE '^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*rustup[[:space:]]+default[[:space:]]|^[[:space:]]+rustup[[:space:]]+default[[:space:]]' .github/workflows/ 2>/dev/null || true)
+if [ -n "$floating" ]; then
+  printf '%s\n' "$floating" | sed 's/^/    /'
+  printf '  FAIL  %s floating toolchain selection(s) under .github/workflows/ (rustup default ...)\n' \
+    "$(printf '%s\n' "$floating" | grep -c .)"
+  fail=1
+else
+  printf '  ok    no floating toolchain selection under .github/workflows/\n'
+fi
 
 # ---------------------------------------------------------------- docs
 hdr "Docs"

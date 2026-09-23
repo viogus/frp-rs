@@ -30,6 +30,9 @@ cargo run --bin frpc -- -c frpc.toml
 RUST_LOG=debug cargo run --bin frps -- -c frps.toml  # Enable debug logging
 ```
 
+**Toolchain:** `rust-toolchain.toml` pins an exact `channel` (rustup-based jobs
+only — not the Docker build); bump deliberately — [§ Toolchain pinning](docs/developing.md#toolchain-pinning).
+
 ### Integration Tests Without Building
 
 Integration tests (`frp-server/tests/`) need an `frps` binary. Without `cargo build`, use a pre-built release:
@@ -105,7 +108,7 @@ Default features: frps = websocket, kcp, quic, oidc, tls, http-proxy, compressio
 
 Feature-surface maintenance policy — which surfaces keep Go parity, which are opt-in best-effort, which are frozen, and what would unfreeze them: [**docs/developing.md § Maintenance policy: feature surface**](docs/developing.md#maintenance-policy-feature-surface).
 
-- No `cargo check` variation needed for day-to-day work — `cargo build` covers the full workspace; ci.yml additionally gates the size tiers with `cargo check --workspace --no-default-features --features tiny|micro` under `RUSTFLAGS="-D warnings"`, so the small-tier builds must be warning-free in CI rather than only asserted to be.
+- No `cargo check` variation needed — `cargo build` covers the workspace; `ci.yml` gates the tiny/micro tiers under `RUSTFLAGS="-D warnings"`.
 - Unit tests live inline (`#[cfg(test)] mod tests`); integration tests live in per-crate `tests/` dirs (`frp-server/tests/`, `frp-client/tests/`, `frp-core/tests/`).
 
 ## Versioning (mandatory)
@@ -163,7 +166,7 @@ not be cited for them.
 |--------|----------------------|
 | **Version alignment (mandatory)** | `bash scripts/repo-health.sh` — gate; exits 1 on drift. All 5 crates + `VERSION` + download script + README at `0.71.0` (frp-vnet `0.1.0` by design) |
 | `cargo fmt --all -- --check` | zero diffs |
-| `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
+| `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings (pinned toolchain) |
 | `cargo test --workspace --all-features` | must pass — needs an all-features `frps` binary, see Testing & Tooling. **The pass count is a runtime fact; do not quote a stored number here.** The in-tree test-function total is not stable either — it changes with every test-adding PR, and the same tree has measured differently in CI vs locally — so read it from `bash scripts/repo-health.sh` ("Tests") instead of storing it |
 | `cargo build --release` | all 4 profiles pass — sizes in [Binary Variants](#binary-variants) |
 | `unsafe` (`repo-health.sh`) | frp-core: 21 blocks + 3 `unsafe fn` + 1 `unsafe impl` (comment-stripped: a doc comment mentioning `unsafe impl` is not code); frp-vnet: 38 blocks. Every block carries a `// SAFETY:` comment |

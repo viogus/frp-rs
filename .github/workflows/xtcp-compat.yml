@@ -47,6 +47,7 @@ jobs:
           XTCP_VPS_HOST: ${{ secrets.XTCP_VPS_HOST }}
           XTCP_VPS_SSH_KEY: ${{ secrets.XTCP_VPS_SSH_KEY }}
 
+      # Toolchain from the repo-root `rust-toolchain.toml` (no `toolchain:` input).
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         if: steps.check.outputs.configured == 'true'
 
