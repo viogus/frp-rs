@@ -78,6 +78,13 @@ const ORACLE_WINDOW: Duration = Duration::from_millis(300);
 /// A child that refuses must exit well within this; if it does not, it is
 /// sitting on a connection it should never have made.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Exit bound for the black-hole `--api-timeout` test. The child's own deadline
+/// is 1 s and idle it exits in ~1.02–1.04 s, but CI runs this file in parallel
+/// and a host under heavy load (39k processes plus a cargo rebuild) once pushed
+/// a 1 s-deadline child past the 5 s refusal bound. 10 s keeps the property
+/// being pinned — with the deadline the child exits promptly, without it it
+/// never exits — while removing that load-induced flake.
+const DEADLINE_EXIT_BOUND: Duration = Duration::from_secs(10);
 
 static DIR_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -137,17 +144,22 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::proces
 /// exit within `EXIT_TIMEOUT` — for a refusal case that means it opened a
 /// connection and is waiting on a response, which is itself the failure.
 fn run_frpc(args: &[&str]) -> Output {
+    run_frpc_with_bound(args, EXIT_TIMEOUT)
+}
+
+/// Run the child to completion under an explicit exit `bound`; see [`run_frpc`].
+fn run_frpc_with_bound(args: &[&str], bound: Duration) -> Output {
     let mut child = Command::new(BIN)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn frpc");
-    if wait_with_timeout(&mut child, EXIT_TIMEOUT).is_none() {
+    if wait_with_timeout(&mut child, bound).is_none() {
         let _ = child.kill();
         let out = child.wait_with_output().expect("collect timed-out child");
         panic!(
-            "frpc {args:?} did not exit within {EXIT_TIMEOUT:?} (a refusal must not connect); \
+            "frpc {args:?} did not exit within {bound:?} (a refusal must not connect); \
              stdout={:?} stderr={:?}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
@@ -859,7 +871,7 @@ fn api_timeout_one_second_still_succeeds_against_a_responding_server() {
 /// The discriminating timeout test: the listener accepts and holds the socket
 /// open without ever responding, so the child can only exit by enforcing its
 /// own deadline. Pre-fix (`with_admin_timeout` reduced to a bare call) this
-/// hangs and `run_frpc` panics after `EXIT_TIMEOUT`.
+/// hangs and `run_frpc_with_bound` panics after `DEADLINE_EXIT_BOUND`.
 #[test]
 fn api_timeout_bounds_a_black_hole_admin_listener_for_each_subcommand() {
     for command in ["reload", "status", "stop"] {
@@ -868,7 +880,10 @@ fn api_timeout_bounds_a_black_hole_admin_listener_for_each_subcommand() {
         let cfg = config_for_port(&dir, port);
 
         let started = Instant::now();
-        let out = run_frpc(&[command, "--api-timeout", "1s", "-c", &cfg]);
+        let out = run_frpc_with_bound(
+            &[command, "--api-timeout", "1s", "-c", &cfg],
+            DEADLINE_EXIT_BOUND,
+        );
         let elapsed = started.elapsed();
 
         assert_eq!(exit_code(&out), 1, "{command}");
@@ -883,8 +898,8 @@ fn api_timeout_bounds_a_black_hole_admin_listener_for_each_subcommand() {
             stderr_of(&out)
         );
         assert!(
-            elapsed < EXIT_TIMEOUT,
-            "{command}: took {elapsed:?}, the deadline must fire well inside {EXIT_TIMEOUT:?}"
+            elapsed < DEADLINE_EXIT_BOUND,
+            "{command}: took {elapsed:?}, the deadline must fire well inside {DEADLINE_EXIT_BOUND:?}"
         );
     }
 }
