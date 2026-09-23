@@ -1334,13 +1334,14 @@ nothing about whether the described behaviour still holds.
   nested one wins inside its own directory, measured, and an untracked copy does
   so identically); a `channel` that is absent, outside the `[toolchain]` table,
   or not an exact `X.Y.Z` (single- or double-quoted, trailing TOML comment
-  allowed); a `toolchain:` input **on a `setup-rust-toolchain` step** — detected
-  however the step is written (inline `- uses:` or named step with `uses:` on its
-  own line under `- name:` or a bare `-`, a quoted `uses:` value, `uses :` with a
-  space, and the flow form `- {uses: ..., with: {toolchain: stable}}`) and
-  however the key is spelled or cased (block mapping, flow mapping
-  `with: {toolchain: stable}`, comma-separated `{rustflags: '', toolchain: ...}`,
-  a single- or double-quoted key, an uppercase `TOOLCHAIN:`) in both `*.yml` and
+  allowed); a `toolchain:` input **on a `setup-rust-toolchain` step** — with the
+  step detected in this closed list of forms and no others: inline
+  `- uses:`, a quoted `uses:` value, `uses :` with a space, a named step with
+  `uses:` on its own line under `- name:` or a bare `-`, and the flow form
+  `- {uses: ..., with: {toolchain: stable}}`; and the key detected as a block
+  mapping, a flow mapping `with: {toolchain: stable}`, a comma-separated
+  `{rustflags: '', toolchain: ...}`, a single- or double-quoted key, or an
+  uppercase `TOOLCHAIN:` — in both `*.yml` and
   `*.yaml`; and
   `rustup default` used as a leading `run:` command under `.github/workflows/`. It
   is pure text/file parsing — no rustup and no installed version — so the
@@ -1360,13 +1361,20 @@ nothing about whether the described behaviour still holds.
   into `.cargo/config.toml`, a non-leading `rustup default` in a `run:` line, a
   quoted-scalar `run: "rustup default stable"`, a script/Makefile the job invokes,
   a container base image) — the `toolchain:` check's own comment records both what
-  it catches and what it still does not: it is
+  it catches and the known shapes it does not see, each measured there and
+  explicitly **not a completeness claim**: it is
   scoped to the setup-action step, so a `toolchain:` that overrides nothing is
   ignored (`workflow_dispatch.inputs.toolchain`, `matrix.toolchain`, an `env:`
-  entry, a `run: |` body line in another step), and three shapes escape it
-  entirely: a `#` inside an earlier quoted value on the same line (the
-  comment guard is not quote-aware), a YAML anchor/alias, and a key consumed by a
-  different action.
+  entry, a `run: |` body line in another step), and the shapes listed in its
+  `KNOWN NOT COVERED` block escape it — among them an anchor or tag token between
+  `-` and `uses:` (a narrowing introduced by `476305a`'s rewrite, which `5bf5270`
+  caught), a flow sequence with no `-` line, a comment at or below the step's
+  indentation before the key, a `#` inside an earlier quoted value on the same
+  line, an anchor/alias on the `with:` block, a key consumed by a different
+  action, and a case-different action URL (not verified against GitHub) — plus
+  fail-closed over-catches, where the gate fails a workflow that never passes the
+  input: a `{`/`,` inside a quoted scalar or inline comment, a nested sequence in
+  the step, and a key-like line inside a block scalar.
   Docs: `CLAUDE.md` (Build / Test / Lint, plus the clippy row of Current Health),
   `docs/developing.md` § 3 (`### Toolchain pinning`) and one sentence in
   `README.md`.

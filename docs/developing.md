@@ -289,14 +289,24 @@ To bump:
 repo root, in `.toml` form (tracked, present, and not shadowed by an untracked
 one); an exact `channel` inside its `[toolchain]` table, quoted either way and
 tolerating a trailing TOML comment; no `toolchain:` input on a
-`setup-rust-toolchain` step — recognised however the step is written (inline or
-named form, quoted `uses:` value, `uses :`, flow style) and matched
-case-insensitively, since action input names are reported to be matched that way;
-and no floating `rustup default` selection under `.github/workflows/` (`*.yml`
-and `*.yaml` both). Each of those checks' own comments list what it does **not**
-cover: the non-`[toolchain]` spellings above and, for the `toolchain:` scan, a
-`#` inside an earlier quoted value on the same line, a YAML anchor/alias, and a
-key consumed by a different action.
+`setup-rust-toolchain` step — with the step recognised in these forms and no
+others: inline `- uses: ...`, `uses :`, a quoted `uses:` value, a named step
+(`- name: ...` with `uses:` on its own line, or under a bare `-`), and the flow
+form `- {uses: ..., with: {...}}`, in `*.yml` and `*.yaml` — and the key
+recognised as a block mapping, a flow mapping, a comma-separated flow mapping,
+or a single-/double-quoted key, matched case-insensitively since action input
+names are reported to be matched that way; and no floating `rustup default`
+selection under `.github/workflows/`. Each of those checks' own comments list the
+known shapes it does **not** see (each measured there, and explicitly not a
+completeness claim): for the `toolchain:` scan those are, among others, an anchor
+or tag token between `-` and `uses:`, a flow sequence with no `-` line, a comment
+at or below the step's indentation before the key, a `#` inside an earlier quoted
+value on the same line, an anchor/alias on the `with:` block, a key consumed by a
+different action, and a case-different action URL (not verified against GitHub) —
+plus fail-closed over-catches, where a `{`/`,` inside a quoted scalar or inline
+comment, a nested sequence in the step, or a key-like line inside a block scalar
+makes the gate fail a workflow that never passes the input. Deliberately not
+chased: the check is a text scan, not a YAML parser.
 
 ### Binary Variants
 

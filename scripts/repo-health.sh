@@ -346,15 +346,14 @@ fi
 # `matrix.toolchain` entry, a job `env:` mapping, another step's `run: |` body)
 # must not fail the gate. Both `*.yml` and `*.yaml` are read.
 #
-# The step is recognised however it is written, because which form a future edit
-# picks is not predictable:
-#   * `- uses: ...@v1`, `- uses : ...` and `- uses: "...@v1"`;
-#   * a named step, where `uses:` is a mapping key on its own line under
-#     `- name: ...`, or under a bare `-`;
+# RECOGNISED STEP FORMS (a closed list — a form not named here is not detected):
+#   * `- uses: ...@v1`; `- uses : ...`; `- uses: "...@v1"`;
+#   * a named step: `- name: ...` with `uses:` as a mapping key on its own line
+#     below it, or below a bare `-`;
 #   * the flow form `- {uses: ...@v1, with: {toolchain: stable}}`, whose opening
 #     line is scanned as well as its continuation lines.
 # The block's base is the indentation of the enclosing `-` list item, not of the
-# `uses:` line, so all of those keep their continuation lines in scope. Only a
+# `uses:` line, so those forms keep their continuation lines in scope. Only a
 # `-` at that base (or outside any item) starts a new item: a deeper `-` is item
 # content, so a block scalar such as
 # `rustflags: |` / `  -D warnings` before `toolchain: stable` keeps the key in
@@ -362,33 +361,59 @@ fi
 #
 # Arming the block requires the action in a YAML key position — the start of the
 # line's mapping (optional indent, optional `- `, optional quote) or immediately
-# after `{`/`,` in a flow mapping — and never on a comment line, which is skipped
-# before the arming test. A step `name:`, a `run:` value or a comment that merely
-# mentions the action URL therefore does not arm it.
+# after `{`/`,` in a flow mapping. A comment line is skipped before the arming
+# test, so a comment, a step `name:` or a `run:` value that merely mentions the
+# action URL does not arm it. That is not a guarantee for every spelling though:
+# the `{`/`,` alternative cannot tell a flow key from a `{`/`,` inside a quoted
+# scalar or an inline comment, so those DO arm it (fail-closed; see the list).
 #
-# Inside the step the key is matched however it is spelled — block mapping
+# RECOGNISED KEY FORMS (also a closed list): block mapping
 # (`toolchain: stable`), flow mapping (`with: {toolchain: stable}` or
 # `with: {rustflags: '', toolchain: stable}`) and a quoted key (`"toolchain":`,
 # `'toolchain':`) — allowing `{`, `,` or whitespace before it and optional quotes
-# around it. The key is matched case-insensitively on purpose: the runner and
-# `@actions/core` are reported to match action input names case-insensitively, so
-# an uppercase `TOOLCHAIN:` would unpin too. Comment-awareness is deliberate: a
-# line whose first non-space character is `#` is skipped, and a key appearing
-# only after an inline `#` on the same line is skipped too, so an explanatory
-# `# toolchain: stable` inside the step does not fail the gate.
+# around it, in any letter case. The case-insensitivity is on purpose: the runner
+# and `@actions/core` are reported to match action input names that way, so an
+# uppercase `TOOLCHAIN:` would unpin too. Comment-awareness is deliberate but has
+# two halves: a line whose first non-space character is `#` is skipped, and a key
+# appearing only after an inline `#` on the same line is skipped too — PROVIDED
+# the comment is deeper than the item's indentation, because a comment at or
+# below it closes the block before the skip test runs (see the list).
 #
-# STILL NOT COVERED — a pass means only that none of the forms above was seen,
-# and there is deliberately no YAML parser here:
+# KNOWN NOT COVERED (each measured; this is not a completeness claim and there is
+# deliberately no YAML parser here — a pass means only that none of the
+# recognised forms above was seen):
+#   * an anchor or tag token between `-` and the `uses:` key —
+#     `- &step uses: ...@v1` with `toolchain: stable` below it: exit 0. This is a
+#     NARROWING introduced by this commit's rewrite: `5bf5270` caught it, and the
+#     anchor was lost when the arming test was limited to key position (pre-5bf5270
+#     `b8a9bf6` did not catch it either).
+#   * a flow *sequence* with no `-` line — `steps: [{uses: ...@v1, with:
+#     {toolchain: stable}}]`: exit 0 (pre-existing);
+#   * a comment at or below the item's indentation (`<=` the step's `-`) between
+#     the action's `uses:` and the key: it closes the item before the comment skip
+#     runs, so the key is never scanned: exit 0 (pre-existing);
 #   * a `#` inside an *earlier quoted value on the same line*: the guard looks for
 #     `#` in the raw prefix, so `with: {rustflags: "a#b", toolchain: stable}`
-#     would be skipped as if commented out;
-#   * a YAML anchor/alias — `x-tc: &tc {toolchain: stable}` at the top level and
-#     `with: *tc` on the step;
-#   * a `toolchain:` key consumed by a *different* action;
-#   * a line that reads like a mapping key inside a block scalar of this step —
-#     measured: a `run: |` body line `uses: actions-rust-lang/setup-rust-toolchain@v1`
-#     arms the block, and a later `toolchain: stable` then fails a workflow that
-#     never uses the action in a real key position (fail-closed).
+#     is skipped as if commented out: exit 0;
+#   * a YAML anchor/alias on the `with:` block — `x-tc: &tc {toolchain: stable}`
+#     at the top level and `with: *tc` on the step: exit 0;
+#   * a `toolchain:` key consumed by a *different* action: not scanned at all;
+#   * the action URL is matched case-sensitively, so
+#     `Actions-Rust-Lang/Setup-Rust-Toolchain@v1` is missed. NOT verified against
+#     GitHub: whether Actions resolves a case-different `uses:` was not measured
+#     here; owner/repo names are case-insensitive on GitHub, so it is a likely
+#     bypass but is not claimed as one;
+#   * fail-closed over-catch (the gate fails a workflow that uses no `toolchain:`
+#     input): a `{` or `,` inside a quoted scalar or an inline comment arms the
+#     block — `run: 'echo "see, uses: ...@v1"'` + `env:` `toolchain: stable`:
+#     exit 1; so do `name: "match { uses: ...@v1"` and
+#     `run: echo hi # , uses: ...@v1` with that `env:`;
+#   * fail-closed over-catch: a nested sequence inside the step
+#     (`x-extra:` / `  - toolchain: stable`) is in scope and trips: exit 1;
+#   * fail-closed over-catch: a line that reads like a mapping key inside a block
+#     scalar of this step (`uses: ...@v1` inside its `run: |`) arms the block, and
+#     a later `toolchain: stable` then fails a workflow that never uses the action
+#     in a real key position: exit 1.
 tc_input=$(awk '
   BEGIN { item_indent = -1; in_item = 0; target = 0 }
   {
