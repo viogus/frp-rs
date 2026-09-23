@@ -891,9 +891,47 @@ source comments must still resolve — against the directory of the file that
 names it first, then the nearest ancestor holding a `Cargo.toml` (the owning
 crate root — so a test that names src/v2_handshake.rs means
 frp-core/src/v2_handshake.rs), then the repo root. A `crate/feature` span such
-as `frp-core/tls` is recognised as Cargo feature syntax, not a path. This is
-deliberately **not** "every repo path named resolves": un-backticked prose and
-tree diagrams are not scanned, spans with no locating root (`mux.rs`,
+as `frp-core/tls` is recognised as Cargo feature syntax, not a path.
+
+The path scan is **tracked-files-only**: its file list comes from the git index
+(`git ls-files -z`), i.e. the set a clean checkout tracks. Untracked and
+gitignored local state — `.worktrees/`, `.superpowers/`, a nested worktree's
+point-in-time backlog and archive prose, editor backups — is therefore never
+scanned, so the local mirror does not fail merely because the mandated worktree
+workflow is in use. The index supplies the file *list* while content is read
+from the worktree, so a tracked file edited locally is gated at its current
+content. Local index state is visible too, so the list is not *exactly* a clean
+checkout's file set: an intent-to-add (`git add -N`) entry is scanned, and an
+unmerged path is listed once per stage and collapsed by path. Submodule contents
+are never scanned — the index lists only the gitlink, and CI does not initialise
+submodules. Because the scan follows the index, an *untracked* local file that
+names a dead path is not gated — deliberate, since CI runs on a clean checkout
+where untracked is absent, so the gate's CI meaning is unchanged.
+
+Only a tree with no `.git` entry at all — not even a dangling symlink or a
+gitfile whose gitdir is gone — falls back to walking the filesystem (release
+tarball, Docker build context), pruning `.git` and `target` at any depth. A tree
+that has any such `.git` entry but whose index cannot be read is **not**
+certified: the gate exits 3 rather than silently walking, because a walk would
+scan the gitignored state this gate exists to avoid. A sparse checkout, or any
+worktree missing a tracked path, is likewise not certified — that path is a read
+error, not a skip; a partial clone (`--filter=blob:none`) materialises every
+tracked file and does pass. The scan's minimum-size floors apply to the walk path
+as well, and the `git ls-files` call runs with `GIT_DIR`/`GIT_WORK_TREE`/
+`GIT_INDEX_FILE`/`GIT_COMMON_DIR`/`GIT_OBJECT_DIRECTORY` and any `GIT_TRACE*`
+removed so the list comes from the repository git resolves for that directory,
+not from an inherited environment: `git rev-parse --show-toplevel` must equal the
+working directory (`realpath` on both sides) or the gate exits 3, which is what
+stops an enclosing repository's index from certifying a cwd whose own `.git` is
+invalid. (The guard identifies the tree by where git says it is; it does not
+prove the index file itself belongs to that tree — a symlinked or foreign
+`.git/index` is tampering outside this gate's threat model.)
+Hit lines are sorted by path and then by line number rather than in the old
+depth-first walk order (per-directory filename sort); the counts and the hit set
+are unaffected.
+
+This is deliberately **not** "every repo path named resolves": un-backticked
+prose and tree diagrams are not scanned, spans with no locating root (`mux.rs`,
 `control/mod.rs`) are counted and left to review, and a directory that still
 exists but has been emptied is not detected (existence is all that can be
 checked mechanically). Third-party vendored markdown (`vendor/*/README.md`) is
