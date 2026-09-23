@@ -341,42 +341,69 @@ fi
 # instead, and its `override: true` default then beats the file for the rest of
 # the job — which would silently unpin every step that relies on the file.
 #
-# The scan is scoped to the action's own step block (the lines indented deeper
-# than the `- uses:` marker) rather than the whole file, because a line-leading
-# `toolchain:` elsewhere overrides nothing: `workflow_dispatch.inputs.toolchain`,
-# a `matrix.toolchain` entry, an `env:` mapping, a `run: |` body line. Those were
-# the false positives of the file-wide scan.
+# The scan is scoped to the action's own step, not the whole file: a
+# `toolchain:` that overrides nothing (`workflow_dispatch.inputs.toolchain`, a
+# `matrix.toolchain` entry, a job `env:` mapping, another step's `run: |` body)
+# must not fail the gate. Both `*.yml` and `*.yaml` are read.
 #
-# Inside the block the key is matched however the step may spell it — block
-# mapping (`toolchain: stable`), flow mapping (`with: {toolchain: stable}` or
+# The step is recognised however it is written, because which form a future edit
+# picks is not predictable:
+#   * `- uses: ...@v1`, `- uses : ...` and `- uses: "...@v1"`;
+#   * a named step, where `uses:` is a mapping key on its own line under
+#     `- name: ...`, or under a bare `-`;
+#   * the flow form `- {uses: ...@v1, with: {toolchain: stable}}`, whose opening
+#     line is scanned as well as its continuation lines.
+# The block's base is the indentation of the enclosing `-` list item, not of the
+# `uses:` line, so all of those keep their continuation lines in scope.
+#
+# Inside the step the key is matched however it is spelled — block mapping
+# (`toolchain: stable`), flow mapping (`with: {toolchain: stable}` or
 # `with: {rustflags: '', toolchain: stable}`) and a quoted key (`"toolchain":`,
-# `'toolchain':`) — by allowing `{`, `,` or whitespace before it and optional
-# quotes around it. Comment-awareness is deliberate: a line whose first
-# non-space character is `#` is skipped, and a key that appears only after an
-# inline `#` on the same line is skipped too, so an explanatory
-# `# toolchain: stable` inside the block does not fail the gate.
+# `'toolchain':`) — allowing `{`, `,` or whitespace before it and optional quotes
+# around it. The key is matched case-insensitively on purpose: the runner and
+# `@actions/core` are reported to match action input names case-insensitively, so
+# an uppercase `TOOLCHAIN:` would unpin too. Comment-awareness is deliberate: a
+# line whose first non-space character is `#` is skipped, and a key appearing
+# only after an inline `#` on the same line is skipped too, so an explanatory
+# `# toolchain: stable` inside the step does not fail the gate.
 #
-# STILL NOT COVERED (a pass here means only that no spelling above was seen):
+# STILL NOT COVERED — a pass means only that none of the forms above was seen,
+# and there is deliberately no YAML parser here:
+#   * a `#` inside an *earlier quoted value on the same line*: the guard looks for
+#     `#` in the raw prefix, so `with: {rustflags: "a#b", toolchain: stable}`
+#     would be skipped as if commented out;
 #   * a YAML anchor/alias — `x-tc: &tc {toolchain: stable}` at the top level and
 #     `with: *tc` on the step;
-#   * an uppercase `TOOLCHAIN:` key. Whether GitHub Actions matches action input
-#     names case-insensitively was NOT measured here, so the pattern stays
-#     case-sensitive and this spelling would be missed;
 #   * a `toolchain:` key consumed by a *different* action.
 tc_input=$(awk '
-  /^[[:space:]]*-[[:space:]]*uses:[[:space:]]*actions-rust-lang\/setup-rust-toolchain@/ {
-    match($0, /^[[:space:]]*/); base = RLENGTH; inblock = 1; next
-  }
-  inblock {
-    if ($0 ~ /^[[:space:]]*$/) next
-    match($0, /^[[:space:]]*/); ind = RLENGTH
-    if (ind <= base) { inblock = 0; next }
-    if ($0 ~ /^[[:space:]]*#/) next
-    if (match($0, /(^|[{,[:space:]])["'"'"']?toolchain["'"'"']?[[:space:]]*:/)) {
-      if (index(substr($0, 1, RSTART - 1), "#") == 0) print FILENAME ":" FNR ":" $0
+  BEGIN { item_indent = -1; in_item = 0; target = 0 }
+  {
+    line = $0
+    match(line, /^[[:space:]]*/); ind = RLENGTH
+    if (substr(line, ind + 1, 1) == "-") {
+      item_indent = ind; in_item = 1; target = 0
+      rest = substr(line, ind + 2)
+      if (rest ~ /(^|[{,[:space:]])[uU][sS][eE][sS][[:space:]]*:[[:space:]]*["'"'"']?actions-rust-lang\/setup-rust-toolchain@/) {
+        target = 1
+        if (match(rest, /(^|[{,[:space:]])["'"'"']?[tT][oO][oO][lL][cC][hH][aA][iI][nN]["'"'"']?[[:space:]]*:/)) {
+          if (index(substr(rest, 1, RSTART - 1), "#") == 0) print FILENAME ":" FNR ":" line
+        }
+      }
+      next
+    }
+    if (!in_item) next
+    if (line ~ /^[[:space:]]*$/) next
+    if (ind <= item_indent) { in_item = 0; target = 0; next }
+    if (!target) {
+      if (line ~ /(^|[{,[:space:]])[uU][sS][eE][sS][[:space:]]*:[[:space:]]*["'"'"']?actions-rust-lang\/setup-rust-toolchain@/) target = 1
+      else next
+    }
+    if (line ~ /^[[:space:]]*#/) next
+    if (match(line, /(^|[{,[:space:]])["'"'"']?[tT][oO][oO][lL][cC][hH][aA][iI][nN]["'"'"']?[[:space:]]*:/)) {
+      if (index(substr(line, 1, RSTART - 1), "#") == 0) print FILENAME ":" FNR ":" line
     }
   }
-' .github/workflows/*.yml 2>/dev/null || true)
+' .github/workflows/*.y*ml 2>/dev/null || true)
 if [ -n "$tc_input" ]; then
   printf '%s\n' "$tc_input" | sed 's/^/    /'
   printf '  FAIL  %s `toolchain:` input(s) on a setup-rust-toolchain step override the toolchain file\n' \

@@ -1305,11 +1305,15 @@ nothing about whether the described behaviour still holds.
   the replacement is measured on rustup
   1.29.1 in an empty `RUSTUP_HOME` — it resolves the file, downloads 5
   components, installs no rust-docs, and reports the toolchain active "because:
-  overridden by `<repo>/rust-toolchain.toml`". Two caveats on that command, both
-  measured on rustup 1.29.1: a **misspelled component does not fail** —
-  `components = ["rustfm"]` prints `warn: skipping unavailable component rustfm`
-  and exits 0 (malformed TOML and an unknown `profile` do exit 1), so a typo
-  there rests on review — and the gate parses only the standard `[toolchain]`
+  overridden by `<repo>/rust-toolchain.toml`". Silent-typo caveats on that
+  command, all measured on rustup 1.29.1: a **misspelled component does not
+  fail** — `components = ["rustfm"]` prints `warn: skipping unavailable component
+  rustfm` and exits 0 — and an **unknown key in the `[toolchain]` table** (e.g.
+  `profilee = "minimal"`, or `component = [...]`) is ignored with no warning at
+  all and also exits 0, so both rest on review. A typo in a *value* is loud
+  (malformed TOML, an unknown `profile` and a non-existent `channel` all exit 1),
+  and no silent case can leave the compiler unpinned. Also, the gate parses only
+  the standard `[toolchain]`
   section form, so the inline-table and dotted-key spellings rustup also honours
   fail closed rather than being accepted unchecked. The
   `actions-rust-lang/setup-rust-toolchain@v1` steps in `compat.yml`,
@@ -1326,10 +1330,14 @@ nothing about whether the described behaviour still holds.
   nested one wins inside its own directory, measured, and an untracked copy does
   so identically); a `channel` that is absent, outside the `[toolchain]` table,
   or not an exact `X.Y.Z` (single- or double-quoted, trailing TOML comment
-  allowed); a `toolchain:` input **on a `setup-rust-toolchain` step**, in any
-  spelling that step could use (block mapping, flow mapping
+  allowed); a `toolchain:` input **on a `setup-rust-toolchain` step** — detected
+  however the step is written (inline `- uses:` or named step with `uses:` on its
+  own line under `- name:` or a bare `-`, a quoted `uses:` value, `uses :` with a
+  space, and the flow form `- {uses: ..., with: {toolchain: stable}}`) and
+  however the key is spelled or cased (block mapping, flow mapping
   `with: {toolchain: stable}`, comma-separated `{rustflags: '', toolchain: ...}`,
-  and a single- or double-quoted key); and
+  a single- or double-quoted key, an uppercase `TOOLCHAIN:`) in both `*.yml` and
+  `*.yaml`; and
   `rustup default` used as a leading `run:` command under `.github/workflows/`. It
   is pure text/file parsing — no rustup and no installed version — so the
   toolchain-less `health` CI job can run it. Falsified in both directions:
@@ -1337,7 +1345,7 @@ nothing about whether the described behaviour still holds.
   outside `[toolchain]`, a deleted file, a tracked second `rust-toolchain`, a
   tracked nested `scripts/frp-stress/rust-toolchain.toml`, an **untracked**
   `rust-toolchain`, a workflow `toolchain:` input on the setup step in each of
-  those five spellings, an injected
+  those twelve step/key spellings, an injected
   `run: rustup default stable`, its double-spaced variant and a block-scalar
   `rustup default stable` line each exit 1 with the file and value named;
   `channel = '1.98.1'`, `[toolchain] # comment`, `channel = "1.98.1" # comment`,
@@ -1348,13 +1356,13 @@ nothing about whether the described behaviour still holds.
   into `.cargo/config.toml`, a non-leading `rustup default` in a `run:` line, a
   quoted-scalar `run: "rustup default stable"`, a script/Makefile the job invokes,
   a container base image) — the `toolchain:` check's own comment records both what
-  it now catches beyond a line-leading key and what it still does not: it is
+  it catches and what it still does not: it is
   scoped to the setup-action step, so a `toolchain:` that overrides nothing is
   ignored (`workflow_dispatch.inputs.toolchain`, `matrix.toolchain`, an `env:`
-  entry, a `run: |` body line in another step), while a YAML anchor/alias, an
-  uppercase `TOOLCHAIN:` key (whether Actions matches input names
-  case-insensitively was not measured) and a key consumed by a different action
-  are not detected at all.
+  entry, a `run: |` body line in another step), and three shapes escape it
+  entirely: a `#` inside an earlier quoted value on the same line (the
+  comment guard is not quote-aware), a YAML anchor/alias, and a key consumed by a
+  different action.
   Docs: `CLAUDE.md` (Build / Test / Lint, plus the clippy row of Current Health),
   `docs/developing.md` § 3 (`### Toolchain pinning`) and one sentence in
   `README.md`.
@@ -1392,11 +1400,14 @@ nothing about whether the described behaviour still holds.
   `warn:` lines and the ~10 s figure (06:15:28.906 → 06:15:38.473) come from, and
   it must not be read as evidence for the shipped command. The install is neither
   cached nor free: nothing caches `~/.rustup` and hosted runners are fresh VMs, so
-  **all 7 cargo jobs of every `ci.yml` run** pay it — the 8th job, `health`, has
-  no Rust toolchain and runs only the gate — plus the `setup-rust-toolchain@v1`
-  steps in the other workflows, whose cost was not measured. Keying a `~/.rustup`
+  every `ci.yml` run pays it in its cargo jobs — **6 of the 8 jobs on a
+  `pull_request`** (`build` is `if: push && (main || tags)`, so it is skipped on
+  PRs, verified in run `35828829198`) and **7 of the 8 on a `main`/tag push**; the
+  8th, `health`, has no Rust toolchain and runs only the gate — plus the
+  `setup-rust-toolchain@v1` steps in the other workflows, whose cost was not
+  measured. Keying a `~/.rustup`
   cache on `hashFiles('rust-toolchain.toml')` was considered and rejected: a
-  second cache key plus save/restore logic across 7 jobs to save ~8-10 s per job
+  second cache key plus save/restore logic across 6-7 jobs to save ~8-10 s per job
   is not worth it. The 5m00.420s measured on this macOS host for the same 5
   components is this host's route to `static.rust-lang.org`, not a runner
   estimate.

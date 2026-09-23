@@ -249,16 +249,19 @@ asks for: the pinned version, its `profile`, and its two components, reporting
 toolchain, but rustup 1.29.1 warns that auto-installation is deprecated, so the
 explicit install is what CI runs.
 
-Two caveats on that mechanism, both measured on rustup 1.29.1. A **misspelled
-component** is the one degenerate case that does not fail loudly:
-`components = ["rustfm"]` prints `warn: skipping unavailable component rustfm`
-and **exits 0**, so a typo there is caught by review, not by the command (a
-malformed file and an unknown `profile` both exit 1). And the file must keep the
-standard `[toolchain]` section form: rustup also honours an inline table
-(`toolchain = { channel = "..." }`) and a dotted key
-(`toolchain.channel = "..."`), but the `repo-health.sh` gate parses the section
-form only and **fails closed** on those two spellings rather than accepting a
-form it does not check.
+Silent-typo caveats, measured on rustup 1.29.1: a **misspelled component**
+(`components = ["rustfm"]`) prints `warn: skipping unavailable component rustfm`
+and **exits 0**, and an **unknown key** in the `[toolchain]` table (for example
+`profilee = "minimal"`, or `component = [...]` instead of `components`) is
+ignored with no warning at all and also exits 0 — so those two typos rest on
+review. A typo in a *value* is loud (a malformed file, an unknown `profile` and a
+non-existent `channel` all exit 1), and no silent case can leave the compiler
+unpinned: the `channel` rustup actually resolves is the one the assertion step in
+`ci.yml` checks. And the file must keep the standard `[toolchain]` section form:
+rustup also honours an inline table (`toolchain = { channel = "..." }`) and a
+dotted key (`toolchain.channel = "..."`), but the `repo-health.sh` gate parses
+the section form only and **fails closed** on those two spellings rather than
+accepting a form it does not check.
 
 **Not covered:** the Docker source build. `docker/Dockerfile.source` starts from
 a floating `rust:1-slim-bookworm` and does not copy `rust-toolchain.toml` into
@@ -281,11 +284,14 @@ To bump:
 repo root, in `.toml` form (tracked, present, and not shadowed by an untracked
 one); an exact `channel` inside its `[toolchain]` table, quoted either way and
 tolerating a trailing TOML comment; no `toolchain:` input on a
-`setup-rust-toolchain` step; and no floating `rustup default` selection under
-`.github/workflows/`. Each of those checks' own comments list what it does
-**not** cover (the non-`[toolchain]` spellings above, the evasions of the
-floating-selection scan, and the fact that the `toolchain:` scan is scoped to the
-setup-action step).
+`setup-rust-toolchain` step — recognised however the step is written (inline or
+named form, quoted `uses:` value, `uses :`, flow style) and matched
+case-insensitively, since action input names are reported to be matched that way;
+and no floating `rustup default` selection under `.github/workflows/` (`*.yml`
+and `*.yaml` both). Each of those checks' own comments list what it does **not**
+cover: the non-`[toolchain]` spellings above and, for the `toolchain:` scan, a
+`#` inside an earlier quoted value on the same line, a YAML anchor/alias, and a
+key consumed by a different action.
 
 ### Binary Variants
 
