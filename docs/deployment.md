@@ -626,9 +626,12 @@ default, where Go defaults `-c` to ./frpc.ini — strictly unless
 `--strict-config=false`, which both subcommands now accept (`status` gained it
 here; Go frp v0.71.0 inherits it as a persistent root flag). A config that fails
 to load is reported on stdout and the command exits 1 **without contacting
-anything**, rather than falling back to `127.0.0.1:7400`. `web_server.port` must
-be set for either command — otherwise both print Go's
-`web server port should be set if you want to use this feature` and exit 1. The
+anything**, rather than falling back to `127.0.0.1:7400`. When the address comes
+from the config, `web_server.port` must be set — otherwise both commands print
+Go's `web server port should be set if you want to use this feature` and exit 1;
+the two exceptions are no `-c` at all (frp-rs keeps its `127.0.0.1:7400` default
+and checks no port) and a portless config given **both** `--admin-addr` and
+`--admin-port` (the flags win, so the config port is never consulted). The
 `--admin-addr` / `--admin-port` / `--admin-user` / `--admin-pwd` flags are an
 frp-rs extension (Go frp v0.71.0's `reload`/`status`/`stop` register no such
 flags) and override the address **after** a successful load, so they can no

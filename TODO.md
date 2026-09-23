@@ -997,8 +997,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   and is passed to the load (Go inherits it as a persistent rootCmd flag; before, frp-rs answered
   `Error: --strict-config is not expected in this context`). The frp-rs-only
   `--admin-addr` / `--admin-port` / `--admin-user` / `--admin-pwd` flags carry no `.help()` text
-  and appear in no live doc (`--admin-addr` nowhere; `--admin-port` only in the archived
-  `docs/archive/specs/2026-07-12-error-messages-cli-polish-design.md`); they now override the
+  (they do appear in `--help` output, as bare names). **Before this branch** no live doc mentioned
+  them: `--admin-addr` appeared nowhere and `--admin-port` only in the archived
+  `docs/archive/specs/2026-07-12-error-messages-cli-polish-design.md:183`; this branch adds both
+  flags to `docs/deployment.md` § client admin, so they are now documented. They override the
   address **after** a successful load, so `reload --admin-addr X --admin-port Y -c bad.toml`
   reports the config error instead of silently using the flags. That is the deliberate behaviour
   change of this item. The pre-existing rule that the override needs **both** flags is unchanged,
@@ -1037,9 +1039,19 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   rewritten, two added). Refusal cases bind a `TcpListener` on an ephemeral port, put it in
   `webServer.port`, and assert **0** connections arrived after the child exits; the
   `--strict-config=false` cases assert the connection **does** arrive (count 1). Falsified to prove
-  the oracle is live: with the port-0 guard disabled (`if false && port == 0`) and the load made
-  lenient (`load_client_config(path, false)`), 6 of the 14 tests fail — 4 by hanging on a real
-  connection the oracle was holding, 2 on the message assertion. CI:
+  the oracle is live (re-measured after review, same mutation): with the config-branch port-0
+  guard disabled (`if false && port == 0`) and the load made lenient
+  (`load_client_config(path, false)`), **6 of the 14** integration tests fail
+  (`8 passed; 6 failed`, exit 101) — **3 by hanging on a real connection** the oracle was holding
+  (`frpc/tests/admin_cli.rs:125`, "did not exit within 5s"):
+  `reload_load_error_…`, `status_load_error_…` and
+  `reload_bad_config_with_admin_flags_still_reports_the_config_error`; and **3 on the message
+  assertion** (`left: ""` vs Go's string) at `:296` `reload_port_zero_…`, `:318`
+  `status_port_zero_…` and `:350` `reload_admin_port_zero_override_…`. The `frpc` bin unit target
+  stayed `8 passed; 0 failed` for that mutation; disabling the no-config-branch guard as well
+  additionally reddens the bin unit test
+  `tests::test_resolve_admin_connection_explicit_port_zero_is_rejected` (`7 passed; 1 failed`),
+  which is not one of the 14. CI:
   `Run frpc CLI tests (admin address resolution)` / `cargo test -p frpc` in the `Tests (unit)`
   lane (`.github/workflows/ci.yml`) — no lane ran `-p frpc` before, so this also executes the unit
   tests that previously never ran. `cargo test -p frpc` 22 passed / 0 failed (8 unit + 14
@@ -1054,11 +1066,16 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   (`scripts/repo-health.sh:692-693`), so it descends into `.worktrees/` and `.superpowers/` —
   both gitignored (`.gitignore:17`, `:20`) and absent from a clean checkout. Measured in the
   main tree `/Users/cdf/Codes/frp-rs` (rule 1 makes worktrees mandatory) with the tree's own
-  script: `bash scripts/repo-health.sh` → exit **1**, `FAIL 4139 path reference(s) do not
-  resolve from the referencing file`, `RESULT: FAILURES above — fix before release`; the 4139
-  are 4135 under `.worktrees/*` (20 nested worktrees, 204-220 each) and 4 under
-  `.superpowers/sdd/*`. (The figure tracks how many worktrees exist — the coordinator measured
-  3919 = 3915 + 4 on an earlier tree state.) Two root causes compound: (a) nested worktrees are
+  script on **2026-09-23T12:57Z, with 20 nested worktrees on disk**:
+  `bash scripts/repo-health.sh` → exit **1**, `FAIL 4140 path reference(s) do not resolve from
+  the referencing file`, `RESULT: FAILURES above — fix before release`; 4136 of them were under
+  `.worktrees/*` and 4 under `.superpowers/sdd/*`. **The total is not a stable number** — it
+  tracks how many nested worktrees exist and how much point-in-time prose each carries; the same
+  command reported 4139 earlier the same day (220 from this worktree, before this paragraph was
+  written) and the coordinator measured 3919 = 3915 + 4 earlier still. The stable facts are the
+  mechanism and the per-worktree contribution: at this reading each of the 20 worktrees
+  contributed **204-221** refs, and `.worktrees/frpc-cli-config/TODO.md` alone contributed 23.
+  Two root causes compound: (a) nested worktrees are
   scanned at all; (b) the exclusions are root-anchored — `p in SKIP_FILES` and
   `p.startswith(SKIP_DIRS)` (`:598-599`, `:699`) — so a nested
   `.worktrees/<x>/TODO.md`, `CHANGELOG.md` or `docs/archive/…` is **not** skipped even though
