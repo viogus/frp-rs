@@ -1112,7 +1112,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `ERROR frpc: Failed to load config: unknown field "notAKnownFrpKey" in config file …`,
     exit **2** (`EXIT_CONFIG`, `frp-core/src/lib.rs:193` — "bad config file, unknown field,
     invalid value", part of frp-rs's 1-4 CLI exit scheme, which no live doc states: the only
-    prose is that constant's comment and two archived plans).
+    prose is that constant's comment and **three** archived documents
+    (`docs/archive/plans/2026-07-12-error-messages-phase-b.md`,
+    `docs/archive/plans/2026-07-12-phase-a-errors.md`, and the variant table at
+    `docs/archive/specs/2026-07-12-error-messages-cli-polish-design.md:91`).
   The gap is inside frp-rs, not only against Go: after this branch's `frpc reload`/`status`
   change the two frpc CLI paths disagree — the admin subcommands now exit **1** for a load
   error, exactly as Go does, while the daemon path exits 2. Pre-existing; deliberately not
@@ -1122,6 +1125,45 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   (`docs/developing.md` or `CLAUDE.md`) that `2` is a deliberate frp-rs extension and why —
   with the exit code pinned by a test on both paths (`frpc -c bad.toml` and the admin
   subcommands) so the next change cannot silently re-diverge them. No sha.
+- [ ] **The space-separated `--strict-config false` form is an frp-rs extension presented as Go
+  pflag semantics, and it parses differently from Go.** Measured on Go v0.71.0 and frp-rs
+  (`frp-core/src/cli.rs`), with the same unknown-key config:
+  * `frpc reload --strict-config false -c badwithport.toml` → Go: `json: unknown field
+    "notAKnownFrpKey"`, exit 1 (strict stays **true**; `false` is left as an unused positional
+    argument). frp-rs: the value is consumed as `false`, the unknown key is tolerated and the
+    config's port is dialed. Same on `status`.
+  * The adjacent form agrees: `--strict-config=false` is lenient on both.
+  * `--strict-config foo` → Go ignores the stray token and keeps strict=true; frp-rs rejects it
+    (`Error: \`foo\` is not expected in this context`). Go errors only on `--strict-config=foo`
+    (`invalid argument "foo" for "--strict-config" flag: strconv.ParseBool: parsing "foo":
+    invalid syntax`), where frp-rs's message differs but both exit 1.
+  The divergence is **pre-existing** on `run`/`reload` and newly reachable on `status`, whose
+  parser this branch added; several `frp-core/src/cli.rs` comments asserted the space form was
+  "Go pflag bool semantics" and were corrected (no parser change).
+  **Done-when:** either drop the space-separated value form so both binaries agree with Go pflag
+  (and update `strict_config_space_separated_value_parses` /
+  `strict_config_invalid_value_errors_cleanly`), or state it as a documented extension — in
+  `docs/` and in the `--strict-config` help text — with the `=` form staying Go-faithful. No sha.
+- [ ] **Three pre-existing `frpc` CLI inputs Go accepts and frp-rs does not** (all measured on
+  Go v0.71.0 and on `main` @ `9c1b291`'s frpc as well as this branch's, so none is introduced by
+  the `reload`/`status` fix):
+  * **`-c` twice.** `frpc reload -c noweb.toml -c goodcli.toml` → Go is last-wins and dials the
+    second config (`Get "http://127.0.0.1:7499/api/reload…": dial tcp 127.0.0.1:7499: connect:
+    connection refused`); frp-rs (both binaries) exits before loading with
+    ``Error: `-c` cannot be used multiple times in this context``.
+  * **Capitalised `[webServer] Port`.** `Port = 7499` → Go's JSON decoding matches the field
+    case-insensitively and dials `127.0.0.1:7499`; frp-rs errors
+    `unknown field "web_server.Port" in config file … — did you mean 'port'?`. On the pre-fix
+    binary the same config silently fell back to `127.0.0.1:7400` (the load error was swallowed),
+    so only the error message is new here — the mismatch with Go is not.
+  * **Empty `webServer.addr`.** `addr = ""` → Go dials `127.0.0.1:<port>`
+    (`WebServerConfig.Complete()` fills the empty addr, `pkg/config/v1/common.go:71-73`);
+    frp-rs dials `":<port>"` and fails with `failed to lookup address information: nodename nor
+    servname provided, or not known`.
+  **Done-when:** match Go on all three (last-wins `-c`, case-insensitive config keys, default the
+  empty `addr` to `127.0.0.1` at the CLI/load boundary) with a CLI test per case in the style of
+  `frpc/tests/admin_cli.rs`, or record each as a deliberate divergence in the feature-surface
+  policy. No sha.
 
 ---
 
