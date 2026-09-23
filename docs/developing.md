@@ -908,16 +908,20 @@ submodules. Because the scan follows the index, an *untracked* local file that
 names a dead path is not gated — deliberate, since CI runs on a clean checkout
 where untracked is absent, so the gate's CI meaning is unchanged.
 
-Only a tree with no `.git` at all (release tarball, Docker build context) falls
-back to walking the filesystem, pruning `.git` and `target` at any depth. A tree
-that has `.git` but whose index cannot be read is **not** certified: the gate
-exits 3 rather than silently walking, because a walk would scan the gitignored
-state this gate exists to avoid. A partial or sparse checkout is likewise not
-certified — a tracked path with no file in the worktree is a read error, not a
-skip — and the scan's minimum-size floors apply to the walk path as well. Hit
-lines are path-sorted (the index is sorted and the hits are sorted before
-printing) rather than in filesystem readdir order; the counts and the hit set are
-unaffected.
+Only a tree with no `.git` entry at all — not even a dangling symlink or a
+gitfile whose gitdir is gone — falls back to walking the filesystem (release
+tarball, Docker build context), pruning `.git` and `target` at any depth. A tree
+that has any such `.git` entry but whose index cannot be read is **not**
+certified: the gate exits 3 rather than silently walking, because a walk would
+scan the gitignored state this gate exists to avoid. A sparse checkout, or any
+worktree missing a tracked path, is likewise not certified — that path is a read
+error, not a skip; a partial clone (`--filter=blob:none`) materialises every
+tracked file and does pass. The scan's minimum-size floors apply to the walk path
+as well, and the `git ls-files` call runs with `GIT_DIR`/`GIT_WORK_TREE`/
+`GIT_INDEX_FILE`/`GIT_COMMON_DIR` removed so the list always comes from the tree
+the script is in, not from an inherited environment. Hit lines are sorted by path
+and then by line number rather than in the old depth-first walk order
+(per-directory filename sort); the counts and the hit set are unaffected.
 
 This is deliberately **not** "every repo path named resolves": un-backticked
 prose and tree diagrams are not scanned, spans with no locating root (`mux.rs`,

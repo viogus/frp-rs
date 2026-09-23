@@ -1103,16 +1103,20 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   local index state is visible too (an intent-to-add entry is scanned; an unmerged path is listed
   once per stage and is collapsed by path) — so there is no re-implementation of `.gitignore`
   matching, it is one fast call, and it fixes the root-anchoring bug (b) for free. The walk is used
-  **only** when `.git` is genuinely absent; if `.git` is present but the index cannot be read the
-  gate exits 3 instead of silently walking (a walk would scan the gitignored state this gate exists
-  to avoid), so a partial/sparse checkout is not certified. Submodule contents are never scanned —
+  **only** when there is no `.git` entry at all (not even a dangling symlink); if any `.git` entry
+  is present but the index cannot be read the gate exits 3 instead of silently walking (a walk would
+  scan the gitignored state this gate exists to avoid), so a sparse checkout, or any worktree missing
+  a tracked path, is not certified. `git ls-files` also runs with `GIT_DIR`/`GIT_WORK_TREE`/
+  `GIT_INDEX_FILE`/`GIT_COMMON_DIR` stripped from the environment, so the list always comes from the
+  tree the script is in. Submodule contents are never scanned —
   the index lists only the gitlink. The index supplies the file *list*; content is read from the
   **worktree**, so a tracked file edited locally is gated at its current content. Paths are
   NUL-split and decoded with `surrogateescape`, so spaces, newlines and non-ASCII cannot be
   mis-parsed or silently dropped. The summary line format and every classification rule (`ROOTS`,
   `normalize`, `classify`, `cargo_features`, `SKIP_DIRS`/`SKIP_FILES`) are unchanged, so no count
-  changed meaning. Hits are now sorted before printing, so hit *order* is path-sorted instead of
-  filesystem readdir order; the counts and the hit *set* are unchanged. Measured in the worktree,
+  changed meaning. Hits are sorted as `(path, line number)` pairs before printing, so hit *order* is
+  path order then line number instead of the old depth-first walk order (per-directory filename
+  sort); the counts and the hit *set* are unchanged. Measured in the worktree,
   macOS arm64, warm cache (2.4-2.7 s):
   * clean (no `.worktrees/`, no `.superpowers/`): exit **0**, `ok    272 repo path references
     resolve (file-relative, crate root, then repo root)`, `info  skipped 227 locator-less bare
@@ -1135,7 +1139,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     exit 0 / `ok 272`. This also pins the index-vs-worktree decision: the file was
     unmodified in the index and the local edit was still caught.
   * fallback: `git archive HEAD | tar -x -C /tmp/rh-nogit`, run from there → exit **0**, `ok 272`
-    (the `os.path.exists('.git')` check returns `None`, so `walk_files()` scans the tarball). A tree
+    (the `os.path.lexists('.git')` check returns `None`, so `walk_files()` scans the tarball). A tree
     that *has* `.git` but whose index cannot be read does **not** fall back: a corrupt
     `.git/index` (with `.worktrees/fake/TODO.md` and `.superpowers/sdd/probe.md` present) gives
     exit **1** with `scan error: .git is present but the file list could not be read from the index
@@ -1147,10 +1151,12 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   * fail-loud floors, falsified in throwaway copies under `/tmp` (never in the repo): forcing the
     index list to `[]` → `scan error: git ls-files listed no scannable .md/.rs file — refusing to
     report "no stale refs"`; keeping the real list but raising the floor → `scan error:
-    implausibly small scan from git ls-files (267 file(s), 12207 span(s); floor 10**9/100) — refs
-    not certified`; suppressing the span loop → `scan error: git ls-files examined 267 file(s) / 0
-    span(s) — refs not certified`. All three exit **3** and surface as `FAIL  path-reference scan
-    produced no result (exit 3) — refs not certified` with `RESULT: FAILURES above`. The floors
+    implausibly small scan from git ls-files (<N> file(s), <N> span(s); floor 10**9/100) — refs
+    not certified`; suppressing the span loop → `scan error: git ls-files examined <N> file(s) / 0
+    span(s) — refs not certified`. The `<N>`s are elided on purpose: the span count drifts with any
+    doc edit (readings of this same probe were 12207 at `c75b3a3` and 12210 at `80623e3`), so a
+    literal here would be stale on arrival. All three exit **3** and surface as `FAIL  path-reference
+    scan produced no result (exit 3) — refs not certified` with `RESULT: FAILURES above`. The floors
     apply to the walk source as well, so a partial tarball with fewer than 50 scannable files also
     exits 3 rather than passing. A tracked path
     that cannot be opened (deleted in the worktree, or a mode-160000 gitlink named `*.md`) prints
@@ -1158,25 +1164,37 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     anything else is filtered out by the extension test before it is opened. `git ls-files -s | awk
     '$1==160000'` is empty in this repo today, and `git ls-files` reports 0 paths with spaces or
     non-ASCII, so neither case is live — they are handled and were probed synthetically as above.
-  * fix round after two reviews (same branch, follow-up commit): the fail-closed hole where *any*
-    git failure fell back to the walk silently is closed, as above. Verdict parity for the walk's
-    `target` prune is restored — a synthetic tracked `sub/target/t.md` carrying a dead ref is
-    skipped while `sub/x.md` carrying the same dead ref is reported, matching the pre-fix script;
-    the interim commit reported both. Unmerged index entries are collapsed by path (git lists an
-    unmerged path once per stage; `--deduplicate` exists on git 2.50.1 here and reduces 3 → 1, but
-    the collapse is done in python so no git-version floor is introduced) — without it the interim
-    commit counted the same hit three times. Hit order: with hits present the pre-fix walk emits
-    `zz.md`, `a/x.md`, `a/b/y.md` (readdir order) while the index emits `a/b/y.md`, `a/x.md`,
-    `zz.md` (path-sorted); `hits.sort()` now makes that deterministic. The earlier "byte-identical
-    output" claim in this item and in the first commit's message was true only when there were no
-    hits; this paragraph is the correction (history is not rewritten).
+  * fix rounds after review (same branch, further commits, none of the reviewed commits amended):
+    the fail-closed hole where *any* git failure fell back to the walk silently is closed, as
+    above. The `.git` probe is `os.path.lexists`, so a dangling `.git` symlink (or a gitfile whose
+    gitdir is gone), where `exists` is False, also fails the gate instead of walking. Verdict parity
+    for the walk's `target` prune is restored — a synthetic tracked `sub/target/t.md` carrying a
+    dead ref is skipped while `sub/x.md` carrying the same dead ref is reported, matching the
+    pre-fix script; the interim commit reported both. Unmerged index entries are collapsed by path
+    (git lists an unmerged path once per stage; `--deduplicate` exists on git 2.50.1 here and
+    reduces 3 → 1, but the collapse is done in python so no git-version floor is introduced) —
+    without it the interim commit counted the same hit three times.
+    `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_COMMON_DIR` are stripped from the environment
+    git runs in, so pointing `GIT_INDEX_FILE` at another repo's index no longer certifies this tree
+    against a foreign file list (measured: before the fix `ok 272` / exit 0 while the tree's own
+    tracked `zdead.md` held a dead ref; after, exit 1 naming `zdead.md`). `subprocess.run` gets a
+    60 s timeout and `SubprocessError` is caught, so a hung git exits 3 with a message instead of
+    stalling or tracebacking (`TimeoutExpired` is not an `OSError`). Hit order: with hits present
+    the pre-fix walk emits `zz.md`, `a/x.md`, `a/b/y.md` (depth-first walk, per-directory filename
+    sort) while the index emits `a/b/y.md`, `a/x.md`, `zz.md`; hits are now sorted as `(path, line
+    number)` pairs, so `multi.md:1` prints before `multi.md:10`. The earlier "byte-identical output"
+    claim in this item and in the first commit's message is not guaranteed once there are hits (a
+    single hit is still identical); this paragraph is the correction (the reviewed commits are not
+    amended).
   * scope: the scan is now **tracked-files-only**, so an untracked local file naming a dead path is
     no longer gated. Deliberate: the CI `health` job runs on a clean checkout where untracked ==
-    absent, so the gate's CI meaning is unchanged. Because a `.git` tree whose index cannot be read
-    exits 3, a partial or sparse checkout is not certified by this gate either — a tracked path with
-    no file in the worktree is a read error, not a skip. Stated in the `scripts/repo-health.sh`
-    coverage comment, `docs/developing.md` § Repository Invariants and `CLAUDE.md:209`. No Rust file
-    touched; `bash -n scripts/repo-health.sh` clean and the path-scan heredoc `compile()`s.
+    absent, so the gate's CI meaning is unchanged. Because any `.git` entry whose index cannot be
+    read exits 3, a sparse checkout, or any worktree missing a tracked path, is not certified by
+    this gate either — that path is a read error, not a skip (a partial clone
+    `--filter=blob:none` materialises every tracked file and does pass). Stated in the
+    `scripts/repo-health.sh` coverage comment, `docs/developing.md` § Repository Invariants and
+    `CLAUDE.md:209`. No Rust file touched; `bash -n scripts/repo-health.sh` clean and the path-scan
+    heredoc `compile()`s.
 - [ ] **`frpc` has no `stop` subcommand and no `--api-timeout`, so its admin-command surface is
   short of Go v0.71.0.** Go's `cmd/frpc/sub/admin.go:34-50` (tag `v0.71.0`, fetched during this
   work) registers **three** commands — `reload`, `status`, **`stop`** — and gives each

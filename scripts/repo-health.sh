@@ -589,12 +589,14 @@ PY
   #     untracked == absent, so the gate's CI meaning is unchanged. Submodule
   #     *contents* are not scanned either: the index lists only the gitlink (and
   #     CI does not initialise submodules);
-  #   * the filesystem walk is used ONLY when `.git` is genuinely absent (release
-  #     tarball, Docker build context). If `.git` exists but the index cannot be
-  #     read, the gate FAILS (exit 3) instead of silently walking — a walk would
-  #     scan the gitignored state this gate exists to avoid. So a partial/sparse
-  #     checkout is not certified: a tracked path with no file in the worktree is
-  #     a read error, not a skip;
+  #   * the filesystem walk is used ONLY when `.git` is genuinely absent — not
+  #     even a dangling symlink or a gitfile whose gitdir is gone (release
+  #     tarball, Docker build context). If any `.git` entry is present but the
+  #     index cannot be read, the gate FAILS (exit 3) instead of silently
+  #     walking — a walk would scan the gitignored state this gate exists to
+  #     avoid. So a sparse checkout, or any worktree missing a tracked path, is
+  #     not certified: that path is a read error, not a skip (a partial clone
+  #     `--filter=blob:none` materialises every tracked file and does pass);
   #   * only backtick spans are claims; un-backticked prose and tree diagrams are
   #     not scanned. A broad prose sweep was tried and produced hundreds of
   #     misses that were almost all false positives (`frp-core/tls` is a Cargo
@@ -611,8 +613,9 @@ PY
   # that comes back empty/implausibly small all exit 3 rather than print "ok 0".
   # The size floors (MIN_FILES/MIN_SPANS) apply to the walk source too, so a
   # partial tarball is not certified either.
-  # Hit order is path-sorted (the index is sorted; hits are sorted before print)
-  # rather than the old readdir order; the counts and the hit set are unchanged.
+  # Hit order is path order, then line number (hits are sorted as (path, line)
+  # pairs before printing), instead of the old depth-first walk order
+  # (per-directory filename sort); the counts and the hit set are unchanged.
   # Point-in-time documents (history, dated audits, changelog, the refactor
   # proposal, and the backlog that quotes removed paths as evidence) describe an
   # older tree on purpose and are out of scope; the archive has check (b).
@@ -644,6 +647,14 @@ MIN_SPANS = 100
 # agreement (no tracked `.md`/`.rs` lives under `target/`, but verdict parity is
 # what makes this change safe to reason about).
 PRUNE_DIRS = ('.git', 'target')
+
+# `git ls-files` is run with these variables removed from the environment: with
+# them inherited, cwd's tree could be certified against *another* repository's
+# index (the tree the script cd'd into is the tree it must report on). A linked
+# worktree's `.git` gitfile resolves without any of them. Everything else (PATH,
+# HOME, locale, GIT_SSH*) is passed through untouched.
+GIT_ENV_DROP = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR')
+GIT_TIMEOUT = 60          # a hung git must fail the gate, not stall the CI job
 
 def cargo_features(crate):
     path = os.path.join(crate, 'Cargo.toml')
@@ -763,21 +774,28 @@ class IndexUnavailable(Exception):
 
 def tracked_files():
     """Root-relative paths from the git index, or None when there is genuinely no
-    index to read (`.git` absent: release tarball / Docker build context). Only
-    that case may fall back to the filesystem walk; if `.git` is present but the
-    index cannot be read, raise IndexUnavailable so the caller fails the gate —
-    a silent walk would scan the gitignored state this gate exists to avoid.
-    Duplicate entries are collapsed by path (an unmerged path is listed once per
-    stage). `-z`/NUL splitting keeps paths containing spaces, newlines and
-    non-ASCII bytes intact; surrogateescape means a path that is not valid UTF-8
-    is still reported rather than dropped."""
-    if not os.path.exists('.git'):
+    index to read (`.git` absent, not even a dangling symlink: release tarball /
+    Docker build context). Only that case may fall back to the filesystem walk;
+    if a `.git` entry is present — including a dangling symlink or a gitfile
+    whose gitdir is missing, where `os.path.exists` is False but `lexists` is
+    True — but the index cannot be read, raise IndexUnavailable so the caller
+    fails the gate: a silent walk would scan the gitignored state this gate
+    exists to avoid. Duplicate entries are collapsed by path (an unmerged path is
+    listed once per stage). `-z`/NUL splitting keeps paths containing spaces,
+    newlines and non-ASCII bytes intact; surrogateescape means a path that is not
+    valid UTF-8 is still reported rather than dropped."""
+    if not os.path.lexists('.git'):
         return None
+    env = {k: v for k, v in os.environ.items() if k not in GIT_ENV_DROP}
     try:
         r = subprocess.run(['git', 'ls-files', '-z', '--full-name', '--cached'],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           env=env, timeout=GIT_TIMEOUT)
     except OSError as e:
         raise IndexUnavailable('git could not be run: %s' % e)
+    except subprocess.SubprocessError as e:      # TimeoutExpired is not an OSError
+        raise IndexUnavailable('git ls-files did not finish within %ds (%s)'
+                               % (GIT_TIMEOUT, e.__class__.__name__))
     if r.returncode != 0:
         detail = r.stderr.decode('utf8', 'replace').strip().splitlines()
         raise IndexUnavailable('git ls-files exited %d%s'
@@ -812,7 +830,7 @@ def scan(entries):
                 verdict = classify(span, base, crate_base)
                 counts[verdict] += 1
                 if verdict == 'stale':
-                    hits.append('%s:%d: `%s`' % (p, lineno, normalize(span)))
+                    hits.append((p, lineno, normalize(span)))
         except OSError as e:
             read_errors.append('%s: %s' % (p, e.strerror or e))
         else:
@@ -862,11 +880,11 @@ if n_files < MIN_FILES or n_spans < MIN_SPANS:
           'floor %d/%d) — refs not certified'
           % (source, n_files, n_spans, MIN_FILES, MIN_SPANS))
     sys.exit(3)
-hits.sort()       # deterministic: index order is path-sorted, readdir order is not
+hits.sort(key=lambda h: (h[0], h[1]))   # path order, then line number
 print('%d %d %d %d %d %d' % (counts['ok'], counts['stale'], counts['feature'],
                              counts['shorthand'], counts['bare'], counts['superpowers']))
-for h in hits:
-    print(h)
+for p, lineno, ref in hits:
+    print('%s:%d: `%s`' % (p, lineno, ref))
 PY
 )
   path_status=$?
