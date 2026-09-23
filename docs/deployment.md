@@ -620,24 +620,55 @@ Client endpoints:
 | `GET` / `POST /api/store/proxies`, `GET` / `PUT` / `DELETE /api/store/proxies/{name}` | Runtime proxy store CRUD — only when `store.path` is set; the same paths as Go frp (GET 200 / HEAD 405 / OPTIONS 405), but the body/payload shape is **frp-rs-specific** (Go frp's admin API uses a different nested body shape), so it is not wire-compatible with a Go admin client |
 | `GET` / `POST /api/store/visitors`, `GET` / `PUT` / `DELETE /api/store/visitors/{name}` | Runtime visitor store CRUD — same conditions and the same frp-rs-specific payload shape |
 
-`frpc reload` and `frpc status` load the config named by `-c` — the same file a
-daemon started with `-c` uses; with no `-c` frp-rs keeps its `127.0.0.1:7400`
-default, where Go defaults `-c` to ./frpc.ini — strictly unless
-`--strict-config=false`, which both subcommands now accept (`status` gained it
-here; Go frp v0.71.0 inherits it as a persistent root flag). A config that fails
-to load is reported on stdout and the command exits 1 **without contacting
-anything**, rather than falling back to `127.0.0.1:7400`. When the address comes
-from the config, `web_server.port` must be set — otherwise both commands print
-Go's `web server port should be set if you want to use this feature` and exit 1;
-the two exceptions are no `-c` at all (frp-rs keeps its `127.0.0.1:7400` default
-and checks no port) and a portless config given **both** `--admin-addr` and
+`frpc reload`, `frpc status` and `frpc stop` load the config named by `-c` — the
+same file a daemon started with `-c` uses; with no `-c` frp-rs keeps its
+`127.0.0.1:7400` default, where Go defaults `-c` to ./frpc.ini — strictly unless
+`--strict-config=false`, which all three accept (Go frp v0.71.0 inherits it as a
+persistent root flag). A config that fails to load is
+reported on stdout and the command exits 1 **without contacting anything**,
+rather than falling back to `127.0.0.1:7400`. When the address comes from the
+config, `web_server.port` must be set — otherwise all three print Go's
+`web server port should be set if you want to use this feature` and exit 1; the
+two exceptions are no `-c` at all (frp-rs keeps its `127.0.0.1:7400` default and
+checks no port) and a portless config given **both** `--admin-addr` and
 `--admin-port` (the flags win, so the config port is never consulted). The
 `--admin-addr` / `--admin-port` / `--admin-user` / `--admin-pwd` flags are an
 frp-rs extension (Go frp v0.71.0's `reload`/`status`/`stop` register no such
 flags) and override the address **after** a successful load, so they can no
 longer mask a broken config; both `--admin-addr` and `--admin-port` must be given
-for the override to apply, and connection failures keep their pre-existing
-message and stream (`reload failed: …` / `status query failed: …` on stderr).
+for the override to apply. `stop` is Go's third admin command
+(`cmd/frpc/sub/admin.go:40`): it POSTs `/api/stop` with an empty body
+(`Content-Length: 0`, measured on the Go v0.71.0 binary) and prints
+`stop success` on 200. Connection failures, non-200 responses and timeouts use
+frp-rs's message shapes on **stderr** (`reload failed: …` /
+`status query failed: …` / `stop failed: …`) — a pre-existing divergence from
+Go's `fmt.Println(err)` on stdout, measured for `stop` against a 500: Go prints
+`api status code [500]`.
+
+`--api-timeout DURATION` is Go parity with Go's 30 s default
+(`adminAPITimeout`). Go registers it *per subcommand*
+(`cmd/frpc/sub/admin.go:47`), so `reload`, `status` and `stop` accept it and no
+other subcommand does — measured on v0.71.0, `frpc verify --api-timeout=1s` is
+`Error: unknown flag: --api-timeout`, exit 1. The value follows Go's
+`time.ParseDuration` grammar — compound values, decimal fractions, an optional
+sign, units `ns us µs μs ms s m h` — parsed in-tree because `Duration: FromStr`
+is not implemented by the pinned toolchain (1.98.1: the trait bound
+`Duration: FromStr` is not satisfied). As in Go, a zero or negative value is
+accepted and means the deadline has already passed. The deadline covers the whole
+admin call (connect, write, read); when it runs out — or had already passed
+before dialing — the command prints `reload failed:` / `status query failed:` /
+`stop failed:` followed by `admin request timed out after <duration>` on stderr
+and exits 1, where Go prints `context deadline exceeded` on stdout (measured with
+`--api-timeout=0`, `=0s` and `=-1s`). Both `--api-timeout` and `--api_timeout`
+are accepted, and here that is Go parity rather than an frp-rs extension: Go's
+`Execute()` installs `config.WordSepNormalizeFunc` globally
+(`rootCmd.SetGlobalNormalizationFunc`, `cmd/frpc/sub/root.go`), so its flags
+accept the underscore spelling too (measured for `--api_timeout` and
+`--strict_config`; `--admin_addr` is `unknown flag` because no such flag exists
+there). One placement difference remains: Go's cobra also accepts the flag before
+the subcommand (`frpc --api-timeout 1s stop …`, measured), while frp-rs requires
+the subcommand word first — the pre-existing rule for every subcommand flag,
+unchanged here.
 
 `GET /api/reload` needs no body and no `Content-Type` — the Go-compatible call
 `curl -u user:pass http://127.0.0.1:7400/api/reload` reloads in non-strict mode.

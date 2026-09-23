@@ -1198,7 +1198,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `scripts/repo-health.sh` coverage comment, `docs/developing.md` § Repository Invariants and
     `CLAUDE.md:209`. No Rust file touched; `bash -n scripts/repo-health.sh` clean and the path-scan
     heredoc `compile()`s.
-- [ ] **`frpc` has no `stop` subcommand and no `--api-timeout`, so its admin-command surface is
+- [x] **`frpc` has no `stop` subcommand and no `--api-timeout`, so its admin-command surface is
   short of Go v0.71.0.** Go's `cmd/frpc/sub/admin.go:34-50` (tag `v0.71.0`, fetched during this
   work) registers **three** commands — `reload`, `status`, **`stop`** — and gives each
   `cmd.Flags().DurationVar(&adminAPITimeout, "api-timeout", adminAPITimeout, "Timeout for admin
@@ -1213,6 +1213,56 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   does) and `--api-timeout` (default 30 s, applied to the admin HTTP call) to `frpc`, each
   pinned by a CLI test in the style of `frpc/tests/admin_cli.rs`; or record in the feature-surface
   policy why frp-rs deliberately exposes two of Go's three admin commands. No sha.
+  Done (branch `feat/frpc-admin-stop`, based on `main` @ `71a4baf`): both halves of the
+  done-when. `FrpcCmd::Stop(StopArgs)` mirrors `StatusArgs` minus `--json`; `stop_cmd()` carries
+  Go's short text `Stop the running frpc` (`cmd/frpc/sub/admin.go:40`); `run_stop`
+  (`frpc/src/main.rs`) resolves the connection exactly like `run_reload` (load errors and a port-0
+  `[webServer]` on stdout + exit 1, no connection) and then POSTs `/api/stop` with an empty body,
+  printing `stop success` on 200 and `stop failed: …` on stderr + exit 1 otherwise. `--api-timeout`
+  is Go's per-subcommand flag (`cmd/frpc/sub/admin.go:47`, default 30 s) and now bounds the whole
+  admin HTTP call — connect, write, read — via `tokio::time::timeout`, with the zero deadline
+  checked *before* dialing so a refused port cannot win the race; `admin_get`/`admin_post_json`
+  previously had no timeout at all. The value parser is a hand-written `time.ParseDuration`
+  (units `ns us µs μs ms s m h`, decimal fractions, compound groups, optional sign, bare `0`;
+  overflow past `i64::MAX` ns rejected; a negative value becomes `Duration::ZERO` because a
+  `Duration` cannot be negative and the only consumer is a deadline) — `Duration: FromStr` is not
+  implemented on the pinned toolchain (verified: `rustc 1.98.1`, `error[E0277]: the trait bound
+  Duration: FromStr is not satisfied`), and the dependency policy forbids a crate for it.
+
+  Measured here against Go v0.71.0 `/private/tmp/frp_0.71.0_darwin_arm64/frpc`: `frpc --help` lists
+  `stop  Stop the running frpc`; `frpc stop --api-timeout=1s -c <cfg, webServer.port = 1>` → stdout
+  `Post "http://127.0.0.1:1/api/stop": dial tcp 127.0.0.1:1: connect: connection refused`, exit 1;
+  `--api-timeout=0`/`=0s`/`=-1s` → `context deadline exceeded` on stdout, exit 1, i.e. the expired
+  context wins over the refused port; rejected values (`1`, `abc`, `1d`, `1S`, `1Ms`, `1e3s`, `Inf`,
+  `2562048h`, a 21-digit hour count) → stderr `Error: invalid argument …`, exit 1;
+  `frpc verify --api-timeout=1s` and `frpc verify --api_timeout=1s` →
+  `Error: unknown flag: --api-timeout`, exit 1. A raw-socket capture of `frpc stop` shows
+  `POST /api/stop HTTP/1.1`, `Content-Length: 0`, no body bytes. **The brief this work came from
+  claimed Go does not accept the underscore spelling; that is wrong** —
+  `frpc stop --api_timeout=abc` errors on `--api-timeout`, so the alias reaches the registered
+  flag: `Execute()` installs `config.WordSepNormalizeFunc` globally
+  (`rootCmd.SetGlobalNormalizationFunc`, `cmd/frpc/sub/root.go` @ v0.71.0). frp-rs's
+  `--api_timeout` is therefore Go parity, not an extension, and `docs/deployment.md` says so.
+  (`--admin_addr` is still `unknown flag` in Go because no such flag exists — the `--admin-*`
+  frp-rs flags remain extensions.)
+
+  Timeout test, red then green: the pre-fix hang is real — `target/debug/frpc` from `main` (no
+  `stop`; `frpc --help` lists 11 commands, `frpc status --help` has no `--api-timeout`) run as
+  `frpc status -c <cfg pointing at a listener that accepts and holds the socket>` did not exit
+  within 8 s. With `with_admin_timeout` temporarily reduced to a bare `call.await`, the new
+  `api_timeout_bounds_a_black_hole_admin_listener_for_each_subcommand` fails:
+  `frpc ["reload", "--api-timeout", "1s", …] did not exit within 5s`; with the deadline restored it
+  passes for `reload`, `status` and `stop`, and the whole file is 23 passed / 0 failed. End-to-end
+  with the real daemon (`cargo build -p frpc --features admin`; `frps` + `frpc` with
+  `[webServer] port = 27411`): `frpc stop -c frpc.toml` → stdout `stop success`, stderr empty,
+  exit 0; the daemon logged `Stop requested, shutting down` then `frpc shutting down` and exited 0,
+  and 27411 was no longer listening — so the CLI stops the client, it does not merely see a 200.
+  Unit tests live in `frp-core/src/cli.rs` (default 30 s, the grammar's accepted and rejected
+  values, `--api-timeout` absent from `run`/`verify`/single-proxy commands, the underscore alias,
+  and `Stop the running frpc` in the help). Carriers corrected in the same branch: the stale
+  `frpc CLI — run mode + 9 subcommands matching Go frp v0.69.1` comment in `frp-core/src/cli.rs`
+  (the tree had 11 non-run subcommands before this change, 12 after; the comment now names them),
+  the `docs/deployment.md` client-admin paragraph, and `CHANGELOG.md`.
 - [ ] **The `frpc` daemon start path exits 2 where Go exits 1 on the same bad config, and prints a
   tracing line instead of Go's bare parse error.** Measured with identical config text (a valid
   config plus one unknown top-level key), both on **stdout**:
