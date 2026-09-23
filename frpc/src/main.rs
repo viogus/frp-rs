@@ -18,45 +18,116 @@ use frp_core::base64::encode as base64_encode;
 
 // ── Admin HTTP client (raw TCP, zero deps) ─────────────────────────────────────
 
+#[derive(Debug)]
 struct AdminConnection {
     addr: String,
     user: String,
     password: String,
 }
 
+/// Why the admin address could not be resolved for `reload`/`status`.
+///
+/// Go frp v0.71.0 (`cmd/frpc/sub/admin.go:56-71`) loads the config first and, on
+/// any error, prints it and exits 1 **without contacting anything**; it then
+/// rejects `cfg.WebServer.Port <= 0` with a fixed message and exits 1. There is
+/// no `127.0.0.1:7400` fallback anywhere in that path. Both refusals are
+/// modelled here so a broken config can never be silently replaced by a default
+/// address.
+#[derive(Debug)]
+enum AdminResolveError {
+    /// `load_client_config` failed (missing file, parse error, unknown field in
+    /// strict mode, …). The string is the load error, printed verbatim.
+    Config(String),
+    /// The effective admin port is 0 — from `[web_server] port`, or from the
+    /// frp-rs-only `--admin-port` extension when it is explicitly `0`.
+    NoPort,
+}
+
+impl std::fmt::Display for AdminResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Go: `fmt.Println(err); os.Exit(1)` (cmd/frpc/sub/admin.go:59-62).
+            AdminResolveError::Config(e) => f.write_str(e),
+            // Go: `fmt.Println("web server port should be set if you want to
+            // use this feature"); os.Exit(1)` (cmd/frpc/sub/admin.go:63-66).
+            AdminResolveError::NoPort => {
+                f.write_str("web server port should be set if you want to use this feature")
+            }
+        }
+    }
+}
+
 /// Resolve admin server address, user, and password.
-/// Priority: CLI flags > config file [web_server] > defaults (127.0.0.1:7400, no auth).
+///
+/// A config path, when given, is **always** loaded and validated; a load error
+/// is returned instead of falling back to a default address (Go always loads,
+/// and a broken config is exactly what the user must be told). Priority after a
+/// successful load: CLI flags (only when BOTH `--admin-addr` AND `--admin-port`
+/// are given — the pre-existing rule, unchanged) > config file `[web_server]`.
+/// With no config path at all the frp-rs default `127.0.0.1:7400` is used.
+///
+/// `--admin-addr`/`--admin-port`/`--admin-user`/`--admin-pwd` are an
+/// undocumented frp-rs extension: Go v0.71.0's `reload`/`status`/`stop` register
+/// no such flags (`cmd/frpc/sub/admin.go:34-50`), so they can never compensate
+/// for a config that fails to load.
 fn resolve_admin_connection(
     cli_addr: Option<&str>,
     cli_port: Option<u16>,
     cli_user: Option<&str>,
     cli_pwd: Option<&str>,
     config_path: Option<&str>,
-) -> AdminConnection {
-    // Priority 1: CLI flags (need both addr AND port)
+    strict_config: bool,
+) -> Result<AdminConnection, AdminResolveError> {
+    if let Some(path) = config_path {
+        let cfg = load_client_config(path, strict_config)
+            .map_err(|e| AdminResolveError::Config(e.to_string()))?;
+        let (addr, port, user, password) = match (cli_addr, cli_port) {
+            // Priority 1: CLI flags (need both addr AND port).
+            (Some(addr), Some(port)) => (
+                addr.to_string(),
+                port,
+                cli_user.unwrap_or("").to_string(),
+                cli_pwd.unwrap_or("").to_string(),
+            ),
+            // Priority 2: config file [web_server] section.
+            _ => (
+                cfg.web_server.addr.clone(),
+                cfg.web_server.port,
+                cfg.web_server.user.clone(),
+                cfg.web_server.password.clone(),
+            ),
+        };
+        // An explicit `--admin-port 0` is rejected with Go's message rather than
+        // treated as "not supplied": falling back to the config port would
+        // silently ignore an explicit flag, and `connect 127.0.0.1:0` is never
+        // valid. Same rule Go applies to a port-0 `[web_server]`.
+        if port == 0 {
+            return Err(AdminResolveError::NoPort);
+        }
+        return Ok(AdminConnection {
+            addr: format!("{addr}:{port}"),
+            user,
+            password,
+        });
+    }
+    // No config path supplied. Go defaults `-c` to `./frpc.ini`; frp-rs keeps
+    // `-c` optional for these two subcommands, so there is nothing to load —
+    // a recorded divergence, unchanged here.
     if let (Some(addr), Some(port)) = (cli_addr, cli_port) {
-        return AdminConnection {
+        if port == 0 {
+            return Err(AdminResolveError::NoPort);
+        }
+        return Ok(AdminConnection {
             addr: format!("{addr}:{port}"),
             user: cli_user.unwrap_or("").into(),
             password: cli_pwd.unwrap_or("").into(),
-        };
+        });
     }
-    // Priority 2: Config file [web_server] section
-    if let Some(path) = config_path {
-        if let Ok(cfg) = frp_core::config::load_client_config(path, true) {
-            return AdminConnection {
-                addr: format!("{}:{}", cfg.web_server.addr, cfg.web_server.port),
-                user: cfg.web_server.user,
-                password: cfg.web_server.password,
-            };
-        }
-    }
-    // Priority 3: Defaults
-    AdminConnection {
+    Ok(AdminConnection {
         addr: "127.0.0.1:7400".into(),
         user: String::new(),
         password: String::new(),
-    }
+    })
 }
 
 fn basic_auth_header(user: &str, password: &str) -> String {
@@ -620,13 +691,24 @@ async fn run_verify(config_path: &str, strict_config: bool) {
 }
 
 async fn run_reload(args: ReloadArgs) {
-    let conn = resolve_admin_connection(
+    let conn = match resolve_admin_connection(
         args.admin_addr.as_deref(),
         args.admin_port,
         args.admin_user.as_deref(),
         args.admin_pwd.as_deref(),
         args.config.as_deref(),
-    );
+        args.strict_config,
+    ) {
+        Ok(conn) => conn,
+        Err(e) => {
+            // Go prints both refusal messages with `fmt.Println` (stdout) and
+            // exits 1 before contacting anything (cmd/frpc/sub/admin.go:56-71).
+            // The connection-error path below stays on stderr — a pre-existing
+            // stream divergence, deliberately not changed here.
+            println!("{e}");
+            process::exit(EXIT_RUNTIME);
+        }
+    };
     let body = format!(r#"{{"strictConfig":{}}}"#, args.strict_config);
     match admin_post_json(&conn, "/api/reload", &body).await {
         Ok(summary) => println!("reload success: {summary}"),
@@ -638,13 +720,22 @@ async fn run_reload(args: ReloadArgs) {
 }
 
 async fn run_status(args: StatusArgs) {
-    let conn = resolve_admin_connection(
+    let conn = match resolve_admin_connection(
         args.admin_addr.as_deref(),
         args.admin_port,
         args.admin_user.as_deref(),
         args.admin_pwd.as_deref(),
         args.config.as_deref(),
-    );
+        args.strict_config,
+    ) {
+        Ok(conn) => conn,
+        Err(e) => {
+            // Same as run_reload: Go's refusal messages go to stdout, exit 1,
+            // and no connection is attempted.
+            println!("{e}");
+            process::exit(EXIT_RUNTIME);
+        }
+    };
     let body = match admin_get(&conn, "/api/status").await {
         Ok(b) => b,
         Err(e) => {
@@ -748,7 +839,9 @@ mod tests {
             Some("u"),
             Some("p"),
             None, // no config file
-        );
+            true,
+        )
+        .unwrap();
         assert_eq!(conn.addr, "10.0.0.1:1234");
         assert_eq!(conn.user, "u");
         assert_eq!(conn.password, "p");
@@ -756,7 +849,7 @@ mod tests {
 
     #[test]
     fn test_resolve_admin_connection_defaults() {
-        let conn = resolve_admin_connection(None, None, None, None, None);
+        let conn = resolve_admin_connection(None, None, None, None, None, true).unwrap();
         assert_eq!(conn.addr, "127.0.0.1:7400");
         assert_eq!(conn.user, "");
         assert_eq!(conn.password, "");
@@ -765,13 +858,51 @@ mod tests {
     #[test]
     fn test_resolve_admin_connection_cli_addr_only_falls_through() {
         // addr without port is not enough — falls to defaults
-        let conn = resolve_admin_connection(Some("10.0.0.1"), None, Some("u"), Some("p"), None);
+        let conn =
+            resolve_admin_connection(Some("10.0.0.1"), None, Some("u"), Some("p"), None, true)
+                .unwrap();
         assert_eq!(conn.addr, "127.0.0.1:7400");
     }
 
     #[test]
     fn test_resolve_admin_connection_cli_port_only_falls_through() {
-        let conn = resolve_admin_connection(None, Some(9999), None, None, None);
+        let conn = resolve_admin_connection(None, Some(9999), None, None, None, true).unwrap();
         assert_eq!(conn.addr, "127.0.0.1:7400");
+    }
+
+    #[test]
+    fn test_resolve_admin_connection_explicit_port_zero_is_rejected() {
+        // `--admin-port 0` is not "not supplied": it is refused with Go's
+        // web-server message instead of silently falling back to the default.
+        let err = resolve_admin_connection(Some("127.0.0.1"), Some(0), None, None, None, true)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "web server port should be set if you want to use this feature"
+        );
+    }
+
+    #[test]
+    fn test_resolve_admin_connection_missing_config_is_an_error() {
+        // A config path that cannot be loaded must not fall back to a default
+        // address; the error text is the load error, printed verbatim.
+        let err = resolve_admin_connection(
+            None,
+            None,
+            None,
+            None,
+            Some("/nonexistent/frpc-does-not-exist.toml"),
+            true,
+        )
+        .unwrap_err();
+        match err {
+            AdminResolveError::Config(msg) => {
+                assert!(
+                    msg.contains("frpc-does-not-exist.toml"),
+                    "load error should name the file, got: {msg}"
+                );
+            }
+            other => panic!("expected a config error, got {other:?}"),
+        }
     }
 }
