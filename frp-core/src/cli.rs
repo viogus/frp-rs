@@ -1,6 +1,6 @@
 //! CLI argument parsing for frps and frpc binaries.
 //!
-//! Uses bpaf combinators to match Go frp v0.69.1 CLI surface.
+//! Uses bpaf combinators for the frps and frpc CLI surfaces.
 //! All flags accept both hyphen (`--log-file`) and underscore (`--log_file`) forms.
 
 use std::time::Duration;
@@ -27,7 +27,7 @@ fn parse_go_bool(value: String) -> Result<bool, String> {
 }
 
 /// Default of `--api-timeout`: Go frp v0.71.0's
-/// `var adminAPITimeout = 30 * time.Second` (`cmd/frpc/sub/admin.go:34`).
+/// `var adminAPITimeout = 30 * time.Second` (`cmd/frpc/sub/admin.go:32`).
 pub const DEFAULT_ADMIN_API_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Consume Go's `leadingInt` from `time.ParseDuration`: digits into a `u64`,
@@ -94,6 +94,15 @@ fn leading_fraction(s: &[u8]) -> (u64, f64, usize) {
 /// "already elapsed" — so it is represented as [`Duration::ZERO`], exactly like
 /// a parsed `0`. Go distinguishes them only in the sign it later applies to an
 /// already-expired context, which behaves the same.
+///
+/// One divergence, recorded rather than copied: Go accumulates the group total
+/// in a `uint64` (`d += v`) and only checks `d > 1<<63`, so two groups that sum
+/// past `2^64` wrap. Measured on the v0.71.0 binary,
+/// `frpc stop --api-timeout=9223372036854775808ns9223372036854775808ns` is
+/// accepted and reports `context deadline exceeded` (the wrapped total is 0 ns),
+/// while this parser rejects it with `time: invalid duration`. frp-rs is
+/// therefore **stricter** on that input and never panics: it uses checked
+/// arithmetic instead of wrapping.
 fn parse_go_duration(text: String) -> Result<Duration, String> {
     let orig = text.as_str();
     let invalid = || format!("time: invalid duration \"{orig}\"");
@@ -197,11 +206,12 @@ fn parse_go_duration(text: String) -> Result<Duration, String> {
 
 /// `--api-timeout` for the frpc admin subcommands.
 ///
-/// Go frp v0.71.0 registers this flag **per subcommand** —
-/// `cmd.Flags().DurationVar(&adminAPITimeout, "api-timeout", adminAPITimeout,
-/// "Timeout for admin API calls")` inside `NewAdminCommand`'s loop over
-/// `reload`/`status`/`stop` (`cmd/frpc/sub/admin.go:36-50`) — not as a root
-/// persistent flag; measured, `frpc verify --api-timeout=1s` is
+/// Go frp v0.71.0 registers this flag **per subcommand**:
+/// `init()`'s loop over `reload`/`status`/`stop` (`cmd/frpc/sub/admin.go:45-49`)
+/// runs `cmd.Flags().DurationVar(&adminAPITimeout, "api-timeout",
+/// adminAPITimeout, "Timeout for admin API calls")` at `:47`.
+/// `NewAdminCommand` (`:52-73`) only builds the command and registers no flag.
+/// It is not a root persistent flag; measured, `frpc verify --api-timeout=1s` is
 /// `Error: unknown flag: --api-timeout`, exit 1. The underscore spelling
 /// `--api_timeout` is registered as well, like every other flag in this file;
 /// `docs/deployment.md` records the measured Go behaviour for both spellings.
@@ -215,10 +225,10 @@ fn api_timeout_parser() -> impl Parser<Duration> {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// frps CLI — 30+ flags matching Go frp v0.69.1
+// frps CLI — 30+ flags
 // ──────────────────────────────────────────────────────────────────────
 
-/// CLI arguments for frps (server). Mirrors Go frp v0.69.1 frps flags.
+/// CLI arguments for frps (server).
 ///
 /// Fields that can also appear in the config file use `Option<T>`: `Some`
 /// means the user explicitly passed the flag on the CLI and it should
@@ -1353,7 +1363,7 @@ fn status_cmd() -> impl Parser<FrpcCmd> {
         .map(FrpcCmd::Status)
 }
 
-/// `frpc stop` — Go frp v0.71.0 `cmd/frpc/sub/admin.go:40` registers it with
+/// `frpc stop` — Go frp v0.71.0 `cmd/frpc/sub/admin.go:42` registers it with
 /// the short text `Stop the running frpc`, the same config load / port refusal
 /// as the other two admin commands, and the same `--api-timeout` flag.
 fn stop_cmd() -> impl Parser<FrpcCmd> {
@@ -1983,7 +1993,7 @@ mod tests {
     #[test]
     fn api_timeout_defaults_to_go_30s() {
         // Go frp v0.71.0 `var adminAPITimeout = 30 * time.Second`
-        // (cmd/frpc/sub/admin.go:34); absent flag → 30 s. Checked on all three
+        // (cmd/frpc/sub/admin.go:32); absent flag → 30 s. Checked on all three
         // subcommands because Go registers the default per subcommand.
         assert_eq!(DEFAULT_ADMIN_API_TIMEOUT, Duration::from_secs(30));
         assert_eq!(
@@ -2087,9 +2097,35 @@ mod tests {
     }
 
     #[test]
+    fn api_timeout_rejects_go_uint64_wrap_where_go_accepts_zero() {
+        // The one divergence a 420-value randomised differential sweep found:
+        // Go accumulates the group total in a `uint64` (`d += v`) and only
+        // checks `d > 1<<63`, so two 2^63 ns groups wrap to 0 and Go *accepts*
+        // this input as 0 ns — measured on the v0.71.0 binary, `frpc stop
+        // --api-timeout=9223372036854775808ns9223372036854775808ns` prints
+        // `context deadline exceeded`, exit 1. frp-rs uses checked arithmetic
+        // and rejects it: stricter than Go, and never a panic.
+        let wrapped = "9223372036854775808ns9223372036854775808ns";
+        assert_eq!(
+            parse_go_duration(wrapped.into()).unwrap_err(),
+            "time: invalid duration \"9223372036854775808ns9223372036854775808ns\""
+        );
+        for command in ["reload", "status", "stop"] {
+            let flag = format!("--api-timeout={wrapped}");
+            assert!(
+                frpc_parser()
+                    .to_options()
+                    .run_inner(&[command, &flag][..])
+                    .is_err(),
+                "{command} {flag} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn api_timeout_is_not_accepted_outside_the_three_admin_commands() {
-        // Go registers `--api-timeout` per subcommand inside
-        // NewAdminCommand's loop (cmd/frpc/sub/admin.go:36-50); measured on
+        // Go registers `--api-timeout` per subcommand inside `init()`'s loop
+        // (cmd/frpc/sub/admin.go:45-49, the DurationVar at :47); measured on
         // v0.71.0, `frpc verify --api-timeout=1s` → `Error: unknown flag:
         // --api-timeout`, exit 1. Same for the underscore spelling.
         let tcp: [&str; 5] = ["tcp", "--local-port", "1", "--remote-port", "2"];
@@ -2180,7 +2216,7 @@ mod tests {
 
     #[test]
     fn stop_help_is_go_short_text() {
-        // Go v0.71.0 `cmd/frpc/sub/admin.go:40` registers the short text
+        // Go v0.71.0 `cmd/frpc/sub/admin.go:42` registers the short text
         // `Stop the running frpc`, and `frpc --help` lists it under
         // `Available Commands`. bpaf renders the per-command `.help()` string
         // in the parent's command list, which is where frp-rs prints it:
