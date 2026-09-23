@@ -654,9 +654,11 @@ PRUNE_DIRS = ('.git', 'target')
 # the script cd'd into is the tree it must report on — though git can still
 # discover an *enclosing* repository if cwd holds an invalid `.git`, which is why
 # `tracked_files()` also requires `git rev-parse --show-toplevel` to equal cwd
-# (fail closed otherwise). A repository that legitimately needs
-# `GIT_OBJECT_DIRECTORY` (objects behind a separate store) now fails closed with
-# git's refusal: loud and rare, deliberate. A linked worktree's `.git` gitfile
+# (fail closed otherwise). A repository whose own `.git/objects` is absent and
+# which relies on `GIT_OBJECT_DIRECTORY` now fails closed with git's refusal
+# (`fatal: not a git repository`): loud and rare, deliberate — one whose
+# `objects/` still exists keeps working, because `git ls-files` reads only the
+# index (measured). A linked worktree's `.git` gitfile
 # resolves without any of these, and `GIT_ALTERNATE_OBJECT_DIRECTORIES` is left
 # alone (shared object stores are legitimate). Everything else (PATH, HOME,
 # locale, GIT_SSH*) is passed through untouched. `GIT_TRACE*` is dropped by
@@ -832,7 +834,7 @@ def tracked_files():
         detail = t.stderr.decode('utf8', 'replace').strip().splitlines()
         raise IndexUnavailable('git rev-parse --show-toplevel exited %d%s'
                                % (t.returncode, (': ' + detail[0]) if detail else ''))
-    toplevel = t.stdout.decode('utf8', 'surrogateescape').strip()
+    toplevel = t.stdout.decode('utf8', 'surrogateescape').rstrip('\r\n')
     cwd = os.path.realpath(os.getcwd())
     if not toplevel or os.path.realpath(toplevel) != cwd:
         raise IndexUnavailable(
