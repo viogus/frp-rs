@@ -637,7 +637,7 @@ frp-rs extension (Go frp v0.71.0's `reload`/`status`/`stop` register no such
 flags) and override the address **after** a successful load, so they can no
 longer mask a broken config; both `--admin-addr` and `--admin-port` must be given
 for the override to apply. `stop` is Go's third admin command
-(`cmd/frpc/sub/admin.go:40`): it POSTs `/api/stop` with an empty body
+(`cmd/frpc/sub/admin.go:42`): it POSTs `/api/stop` with an empty body
 (`Content-Length: 0`, measured on the Go v0.71.0 binary) and prints
 `stop success` on 200. Connection failures, non-200 responses and timeouts use
 frp-rs's message shapes on **stderr** (`reload failed: …` /
@@ -669,6 +669,16 @@ there). One placement difference remains: Go's cobra also accepts the flag befor
 the subcommand (`frpc --api-timeout 1s stop …`, measured), while frp-rs requires
 the subcommand word first — the pre-existing rule for every subcommand flag,
 unchanged here.
+
+Three cosmetic differences remain in this flag's surface. A rejected value is
+reported as bpaf's `Error: couldn't parse <value>: time: …`, where Go wraps the
+same inner text in `invalid argument "<value>" for "--api-timeout" flag` — the
+inner `time: …` wording matches Go verbatim and the outer shape is bpaf's,
+pre-existing across this CLI. `frpc stop --help` renders the flag as
+`--api-timeout=DURATION` and omits Go's `(default 30s)`, because bpaf prints no
+fallback default. And a negative value collapses to `Duration::ZERO`, so
+`--api-timeout=-1s` reports `admin request timed out after 0ns` where Go reports
+`context deadline exceeded`.
 
 `GET /api/reload` needs no body and no `Content-Type` — the Go-compatible call
 `curl -u user:pass http://127.0.0.1:7400/api/reload` reloads in non-strict mode.

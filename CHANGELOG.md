@@ -14,17 +14,19 @@ User-facing release notes for frp-rs.
 ### Features
 - **`frpc stop` and `--api-timeout` — Go parity.** `frpc stop -c frpc.toml`
   POSTs `/api/stop` with an empty body and prints `stop success` on 200,
-  matching Go frp's third admin command; `reload`, `status` and `stop` now
-  accept `--api-timeout DURATION` (default 30 s, Go's `adminAPITimeout`) with
-  Go's `time.ParseDuration` grammar (`1m`, `500ms`, `1h2m3.5s`, …; a zero or
-  negative value is accepted and means the deadline has already passed). The
-  deadline bounds the whole admin HTTP call — connect, write and read —
-  where those calls previously had no timeout at all, so a hung admin server
-  blocked the command forever. frp-rs reports an expired deadline as
-  `admin request timed out after <duration>` on stderr, where Go prints
-  `context deadline exceeded` on stdout.
+  matching Go frp's third admin command. `reload`, `status` and `stop` accept
+  `--api-timeout DURATION` (default 30 s, Go's `adminAPITimeout`) with Go's
+  `time.ParseDuration` grammar (`1m`, `500ms`, `1h2m3.5s`, …; a zero or
+  negative value is accepted and means the deadline has already passed).
 
 ### Changed
+- **`frpc reload` and `frpc status` are now bounded by a 30 s admin deadline —
+  a behaviour change.** Their admin HTTP call previously had no timeout at all,
+  so a daemon that accepted the connection and never answered hung the command
+  forever; it now fails after `--api-timeout` (default 30 s) with
+  `admin request timed out after <duration>` on stderr, exit 1. Where Go prints
+  `context deadline exceeded` on stdout, frp-rs keeps its own message and
+  stream.
 - **`frpc reload` now honours `--strict-config` — a behaviour change.** The
   reload subcommand parses the flag like `run`/`verify`: absent and bare
   `--strict_config` are strict (`true`, matching Go frp's persistent

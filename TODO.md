@@ -1215,7 +1215,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   policy why frp-rs deliberately exposes two of Go's three admin commands. No sha.
   Done (branch `feat/frpc-admin-stop`, based on `main` @ `71a4baf`): both halves of the
   done-when. `FrpcCmd::Stop(StopArgs)` mirrors `StatusArgs` minus `--json`; `stop_cmd()` carries
-  Go's short text `Stop the running frpc` (`cmd/frpc/sub/admin.go:40`); `run_stop`
+  Go's short text `Stop the running frpc` (`cmd/frpc/sub/admin.go:42`); `run_stop`
   (`frpc/src/main.rs`) resolves the connection exactly like `run_reload` (load errors and a port-0
   `[webServer]` on stdout + exit 1, no connection) and then POSTs `/api/stop` with an empty body,
   printing `stop success` on 200 and `stop failed: …` on stderr + exit 1 otherwise. `--api-timeout`
@@ -1235,9 +1235,15 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `--api-timeout=0`/`=0s`/`=-1s` → `context deadline exceeded` on stdout, exit 1, i.e. the expired
   context wins over the refused port; rejected values (`1`, `abc`, `1d`, `1S`, `1Ms`, `1e3s`, `Inf`,
   `2562048h`, a 21-digit hour count) → stderr `Error: invalid argument …`, exit 1;
-  `frpc verify --api-timeout=1s` and `frpc verify --api_timeout=1s` →
-  `Error: unknown flag: --api-timeout`, exit 1. A raw-socket capture of `frpc stop` shows
-  `POST /api/stop HTTP/1.1`, `Content-Length: 0`, no body bytes. **The brief this work came from
+  `frpc verify --api-timeout=1s` → `Error: unknown flag: --api-timeout`, exit 1, and
+  `frpc verify --api_timeout=1s` → `Error: unknown flag: --api_timeout` (Go echoes the typed
+  spelling), exit 1. A raw-socket capture of the Go `frpc stop` request shows
+  `POST /api/stop HTTP/1.1`, `Content-Length: 0`, no body bytes; the frp-rs request matches on
+  method, path, `Content-Length: 0` and an empty body (asserted by the mock in
+  `frpc/tests/admin_cli.rs`), while the other headers differ. The one measured input where frp-rs
+  is *stricter* is `9223372036854775808ns9223372036854775808ns`: Go's `uint64` total wraps to 0
+  and it accepts the value as 0 ns, frp-rs rejects it with `time: invalid duration` (checked
+  arithmetic, never a panic) — pinned in `frp-core/src/cli.rs`. **The brief this work came from
   claimed Go does not accept the underscore spelling; that is wrong** —
   `frpc stop --api_timeout=abc` errors on `--api-timeout`, so the alias reaches the registered
   flag: `Execute()` installs `config.WordSepNormalizeFunc` globally
