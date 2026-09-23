@@ -650,12 +650,16 @@ PRUNE_DIRS = ('.git', 'target')
 
 # `git ls-files` is run with these variables removed from the environment: with
 # them inherited, cwd's tree could be certified against *another* repository's
-# index, or a foreign object store could fail an otherwise-clean tree (the tree
+# index, or a foreign object store could fail an otherwise-clean tree. The tree
 # the script cd'd into is the tree it must report on — though git can still
-# discover an *enclosing* repository if cwd holds an invalid `.git`; that yields
-# an empty or foreign list and exits 3 loudly, which is fail-closed). A linked
-# worktree's `.git` gitfile resolves without any of them. Everything else (PATH,
-# HOME, locale, GIT_SSH*) is passed through untouched. `GIT_TRACE*` is dropped by
+# discover an *enclosing* repository if cwd holds an invalid `.git`, which is why
+# `tracked_files()` also requires `git rev-parse --show-toplevel` to equal cwd
+# (fail closed otherwise). A repository that legitimately needs
+# `GIT_OBJECT_DIRECTORY` (objects behind a separate store) now fails closed with
+# git's refusal: loud and rare, deliberate. A linked worktree's `.git` gitfile
+# resolves without any of these, and `GIT_ALTERNATE_OBJECT_DIRECTORIES` is left
+# alone (shared object stores are legitimate). Everything else (PATH, HOME,
+# locale, GIT_SSH*) is passed through untouched. `GIT_TRACE*` is dropped by
 # prefix so trace output cannot become the first stderr line of a failure
 # message.
 GIT_ENV_DROP = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR',
@@ -777,7 +781,8 @@ def wanted(p):
 
 
 class IndexUnavailable(Exception):
-    """`.git` exists but the index could not be listed."""
+    """`.git` exists but the index could not be listed, or it belongs to another
+    tree (`git rev-parse --show-toplevel` != cwd)."""
 
 
 def tracked_files():
@@ -809,6 +814,31 @@ def tracked_files():
         detail = r.stderr.decode('utf8', 'replace').strip().splitlines()
         raise IndexUnavailable('git ls-files exited %d%s'
                                % (r.returncode, (': ' + detail[0]) if detail else ''))
+    # The file list must belong to *this* tree. git can still discover an
+    # enclosing repository when cwd holds an invalid `.git` (an empty directory,
+    # say), which would let a foreign non-empty list certify cwd — so the
+    # toplevel must equal cwd, compared with realpath on both sides (`/tmp` is
+    # `/private/tmp` on macOS, and a symlinked checkout path must not fail).
+    try:
+        t = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           env=env, timeout=GIT_TIMEOUT)
+    except OSError as e:
+        raise IndexUnavailable('git rev-parse --show-toplevel could not be run: %s' % e)
+    except subprocess.SubprocessError as e:
+        raise IndexUnavailable('git rev-parse --show-toplevel did not finish within '
+                               '%ds (%s)' % (GIT_TIMEOUT, e.__class__.__name__))
+    if t.returncode != 0:
+        detail = t.stderr.decode('utf8', 'replace').strip().splitlines()
+        raise IndexUnavailable('git rev-parse --show-toplevel exited %d%s'
+                               % (t.returncode, (': ' + detail[0]) if detail else ''))
+    toplevel = t.stdout.decode('utf8', 'surrogateescape').strip()
+    cwd = os.path.realpath(os.getcwd())
+    if not toplevel or os.path.realpath(toplevel) != cwd:
+        raise IndexUnavailable(
+            'the index belongs to another tree: git --show-toplevel reports %s, '
+            'cwd is %s — refusing to certify this tree from a foreign file list'
+            % (toplevel or '<none>', cwd))
     paths = [b.decode('utf8', 'surrogateescape') for b in r.stdout.split(b'\0') if b]
     return list(dict.fromkeys(paths))    # unmerged paths appear once per stage
 

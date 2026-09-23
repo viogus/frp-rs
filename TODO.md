@@ -1349,6 +1349,40 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   misses `VERSION`, the download script or the README now fails CI instead of
   being noticed at release time.
 
+- [ ] **`repo-health.sh`'s doc-figures gate tracebacks under a sparse checkout.** The curated
+  `doc_claims` block's `vendor_version` (`scripts/repo-health.sh:1087`, heredoc from `:937`) opens
+  `vendor/<crate>/Cargo.toml` unconditionally, so a tree whose worktree does not materialise it
+  raises instead of reporting. Reproduce:
+  `git sparse-checkout init --cone && git sparse-checkout set docs scripts && bash scripts/repo-health.sh`
+  → `Traceback (most recent call last):` / `File "<stdin>", line 155, in <module>` /
+  `File "<stdin>", line 152, in vendor_version` /
+  `FileNotFoundError: [Errno 2] No such file or directory: 'vendor/rustls/Cargo.toml'`, after which
+  the run reports `FAIL  a live doc quotes a figure the tree no longer matches`. Pre-existing: the
+  `f8f127f` script prints the identical traceback (same `<stdin>` lines 152/155) on the same tree —
+  re-measured 2026-09-23 during the path-scan work, not caused by it. The path-scan gate itself
+  fails closed there (242 `read error:` lines → exit 3), so nothing is certified green.
+  **Done-when:** `vendor_version` treats a missing manifest as a loud, non-traceback failure (an
+  explicit `FAIL … vendor manifest missing` line, or a documented "partial tree" exit 3 reported
+  once before the entries that need it). No sha.
+- [ ] **`repo-health.sh` derives its root from `$0`, so a symlinked script scans the wrong tree.**
+  `cd "$(dirname "$0")/.."` (`scripts/repo-health.sh:23`) resolves the *symlink's* directory: a
+  symlink to the script placed in a subdirectory makes the whole run treat that subdirectory's
+  parent as the repository root. Guarded form: the fail-open half — a wrong root certified from an
+  enclosing repository's index — is closed by the `git rev-parse --show-toplevel` check below; what
+  remains is that the run scans the wrong subtree loudly, red or floor-failed. Measured
+  2026-09-23 by symlinking the script into each subtree, `docs/` reports 204 stale refs,
+  `frp-core/` 9, `frp-core/src/` 6, `frp-client/` 13 and `frp-server/` 4, while `frpc/`
+  (4 scannable files), `frpc/src/` (3) and `frp-server/src/` (32) hit the size floors and exit 3.
+  The fail-open half is now closed: a wrong root that *does* hold an invalid `.git` entry (an
+  empty `.git` directory, say) inside a real repository runs `git ls-files` against the enclosing
+  repo's index, and the `git rev-parse --show-toplevel` guard rejects it (`the index belongs to
+  another tree: git --show-toplevel reports R, cwd is R/sub`) with exit 3. (An earlier
+  transcription of this list said `frpc/src` 6; that figure is `frp-core/src`, which reproduces at
+  6 — `frpc/src` really is 3 files and floor-failed.) Every wrong-root run also logs
+  `walk error: docs/archive: No such file or directory` from the archive report.
+  **Done-when:** resolve the real script path (`readlink -f` or `cd -P`) before deriving the root,
+  or refuse to run when the resolved root is not the tree containing the script. No sha.
+
 ---
 
 ## P1 — documentation correctness
@@ -2179,31 +2213,3 @@ nothing about whether the described behaviour still holds.
   harness used, showing RSS over time for both — or the claim is dropped from the
   positioning docs. `scripts/memory-baseline.sh` already accepts
   `FRPS_BIN`/`FRPC_BIN`, so pointing it at the Go binary is the starting point.
-
-- [ ] **`repo-health.sh`'s doc-figures gate tracebacks under a sparse checkout.** The curated
-  `doc_claims` block's `vendor_version` (`scripts/repo-health.sh:1087`, heredoc from `:937`) opens
-  `vendor/<crate>/Cargo.toml` unconditionally, so a tree whose worktree does not materialise it
-  raises instead of reporting. Reproduce:
-  `git sparse-checkout init --cone && git sparse-checkout set docs scripts && bash scripts/repo-health.sh`
-  → `Traceback (most recent call last):` / `File "<stdin>", line 155, in <module>` /
-  `File "<stdin>", line 152, in vendor_version` /
-  `FileNotFoundError: [Errno 2] No such file or directory: 'vendor/rustls/Cargo.toml'`, after which
-  the run reports `FAIL  a live doc quotes a figure the tree no longer matches`. Pre-existing: the
-  `f8f127f` script prints the identical traceback (same `<stdin>` lines 152/155) on the same tree —
-  re-measured 2026-09-23 during the path-scan work, not caused by it. The path-scan gate itself
-  fails closed there (242 `read error:` lines → exit 3), so nothing is certified green.
-  **Done-when:** `vendor_version` treats a missing manifest as a loud, non-traceback failure (an
-  explicit `FAIL … vendor manifest missing` line, or a documented "partial tree" exit 3 reported
-  once before the entries that need it). No sha.
-- [ ] **`repo-health.sh` derives its root from `$0`, so a symlinked script scans the wrong tree.**
-  `cd "$(dirname "$0")/.."` (`scripts/repo-health.sh:23`) resolves the *symlink's* directory: a
-  symlink to the script placed in a subdirectory makes the whole run treat that subdirectory's
-  parent as the repository root. Latent on this repo — no wrong-root run goes green: measured
-  2026-09-23 by symlinking the script into each subtree, `docs/` reports 204 stale refs,
-  `frp-core/` 9, `frp-client/` 13 and `frp-server/` 4, while `frpc/` (4 scannable files),
-  `frpc/src/` (3) and `frp-server/src/` (32) hit the size floors and exit 3. (A review round
-  reported `frpc/src` 6; that does not reproduce here — the subtree is below the floor.) Every
-  wrong-root run also logs `walk error: docs/archive: No such file or directory` from the archive
-  report.
-  **Done-when:** resolve the real script path (`readlink -f` or `cd -P`) before deriving the root,
-  or refuse to run when the resolved root is not the tree containing the script. No sha.
