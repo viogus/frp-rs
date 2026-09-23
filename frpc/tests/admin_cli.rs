@@ -1,5 +1,5 @@
-//! `frpc reload` / `frpc status` admin-address resolution, pinned against Go
-//! frp v0.71.0.
+//! `frpc reload` / `frpc status` / `frpc stop` admin-address resolution, pinned
+//! against Go frp v0.71.0.
 //!
 //! Go's `NewAdminCommand` (`cmd/frpc/sub/admin.go:56-71`, tag `v0.71.0`):
 //!
@@ -37,12 +37,25 @@
 //! Gated on `full`: the `frpc` bin carries `required-features = ["full"]`, so
 //! without the gate this file's `CARGO_BIN_EXE_frpc` would fail to compile in
 //! the no-default-features lanes CI runs.
+//!
+//! The `stop` tests reuse those refusals — Go registers `stop` through the same
+//! `NewAdminCommand` body (`cmd/frpc/sub/admin.go:40-66`) — and add a one-shot
+//! mock admin server that answers a captured request, so they can pin
+//! `POST /api/stop` with `Content-Length: 0` and no body bytes, `stop success`
+//! on stdout and exit 0 (Go's `StopHandler` sends no body and prints its own
+//! `stop success`). A black-hole variant accepts a connection and never
+//! responds, pinning `--api-timeout`: without the deadline the client blocks in
+//! `read_to_end` forever (measured pre-fix against `frpc status`, no exit in
+//! 8 s), so the test hangs into `run_frpc`'s failure rather than passing.
 #![cfg(feature = "full")]
 
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_frpc");
@@ -560,4 +573,296 @@ fn status_strict_config_false_tolerates_an_unknown_key() {
     let mut child =
         expect_one_connection(&["status", "--strict_config=false", "-c", &cfg], &listener);
     kill(&mut child);
+}
+
+// ── frpc stop: POST /api/stop, empty body, `stop success` on 200 ────────────
+
+/// Start a one-shot mock admin server: accept exactly one connection, record
+/// every request byte up to the blank line that ends the head, then answer
+/// `status` + `body`. The receiver yields the captured head.
+fn mock_admin(
+    status: &'static str,
+    body: &'static str,
+) -> (u16, mpsc::Receiver<Vec<u8>>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock admin");
+    let port = listener.local_addr().expect("mock admin addr").port();
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("mock admin accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("mock admin read timeout");
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match stream.read(&mut byte) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => head.push(byte[0]),
+            }
+        }
+        let _ = tx.send(head);
+        let response = format!(
+            "{status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    });
+    (port, rx, handle)
+}
+
+/// Start a black-hole admin server: accept exactly one connection, drain
+/// whatever the client sends, and then keep the socket open without ever
+/// writing a byte. The final read blocks until the client closes, so a client
+/// without its own deadline waits forever and this thread ends only when that
+/// client gives up.
+fn black_hole_admin() -> (u16, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind black hole");
+    let port = listener.local_addr().expect("black-hole addr").port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("black-hole accept");
+        let mut buf = [0u8; 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+    (port, handle)
+}
+
+fn config_for_port(dir: &TempDir, port: u16) -> String {
+    dir.config(
+        "good.toml",
+        &format!("{BASE_CONFIG}[webServer]\naddr = \"127.0.0.1\"\nport = {port}\n"),
+    )
+}
+
+#[test]
+fn stop_posts_api_stop_without_a_body_and_prints_stop_success() {
+    let dir = TempDir::new();
+    let (port, request_rx, handle) = mock_admin("HTTP/1.1 200 OK", "stop success");
+    let cfg = config_for_port(&dir, port);
+
+    let out = run_frpc(&["stop", "-c", &cfg]);
+
+    assert_eq!(
+        exit_code(&out),
+        0,
+        "stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert_eq!(stdout_of(&out).trim_end(), "stop success");
+    assert!(stderr_of(&out).is_empty(), "stderr={:?}", stderr_of(&out));
+    let head = request_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("mock admin received a request");
+    handle.join().expect("mock admin thread");
+    let head = String::from_utf8_lossy(&head).to_string();
+    // Measured on Go v0.71.0: `POST /api/stop HTTP/1.1`, `Content-Length: 0`,
+    // and no body bytes after the blank line.
+    assert!(
+        head.starts_with("POST /api/stop HTTP/1.1\r\n"),
+        "head={head:?}"
+    );
+    assert!(head.contains("Content-Length: 0\r\n"), "head={head:?}");
+    assert!(
+        head.ends_with("\r\n\r\n"),
+        "no body may follow the head: {head:?}"
+    );
+}
+
+#[test]
+fn stop_non_200_reports_the_status_and_exits_1() {
+    // Go v0.71.0 measured against a 500 response: stdout `api status code
+    // [500]`, exit 1, no `stop success`. frp-rs keeps its pre-existing
+    // message/stream shape (`stop failed: …` on stderr, like reload/status);
+    // the exit code and the absence of `stop success` are what must match.
+    let dir = TempDir::new();
+    let (port, _rx, _handle) = mock_admin("HTTP/1.1 500 Internal Server Error", "bad");
+    let cfg = config_for_port(&dir, port);
+
+    let out = run_frpc(&["stop", "-c", &cfg]);
+
+    assert_eq!(exit_code(&out), 1);
+    assert!(stdout_of(&out).is_empty(), "stdout={:?}", stdout_of(&out));
+    assert!(
+        stderr_of(&out).contains("stop failed:"),
+        "stderr={:?}",
+        stderr_of(&out)
+    );
+    assert!(
+        stderr_of(&out).contains("500"),
+        "stderr={:?}",
+        stderr_of(&out)
+    );
+}
+
+#[test]
+fn stop_load_error_is_printed_on_stdout_and_no_connection_is_made() {
+    let dir = TempDir::new();
+    let (listener, port) = oracle_listener();
+    let cfg = dir.config(
+        "bad.toml",
+        &format!(
+            "{BASE_CONFIG}notAKnownFrpKey = 1\n[webServer]\naddr = \"127.0.0.1\"\nport = {port}\n"
+        ),
+    );
+
+    let out = run_frpc(&["stop", "-c", &cfg]);
+
+    assert_eq!(exit_code(&out), 1, "stderr={:?}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains("unknown field \"notAKnownFrpKey\""),
+        "load error must be printed on stdout, got stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        !stderr_of(&out).contains("connect"),
+        "no connection may be attempted: stderr={:?}",
+        stderr_of(&out),
+    );
+    assert_eq!(connections_after_exit(&listener), 0);
+}
+
+#[test]
+fn stop_port_zero_prints_go_message_and_no_connection_is_made() {
+    let dir = TempDir::new();
+    let (listener, _port) = oracle_listener();
+    let cfg = dir.config("noweb.toml", BASE_CONFIG);
+
+    let out = run_frpc(&["stop", "-c", &cfg]);
+
+    assert_eq!(exit_code(&out), 1, "stderr={:?}", stderr_of(&out));
+    assert_eq!(stdout_of(&out).trim_end(), GO_NO_PORT_MSG);
+    assert!(
+        !stderr_of(&out).contains("connect"),
+        "stderr={:?}",
+        stderr_of(&out)
+    );
+    assert_eq!(connections_after_exit(&listener), 0);
+}
+
+// ── --api-timeout: grammar rejection, deadline, positive control ────────────
+
+#[test]
+fn stop_bad_api_timeout_is_rejected_before_any_connection() {
+    let dir = TempDir::new();
+    let (listener, port) = oracle_listener();
+    let cfg = config_for_port(&dir, port);
+
+    let out = run_frpc(&["stop", "--api-timeout=1", "-c", &cfg]);
+
+    assert_eq!(exit_code(&out), 1, "stderr={:?}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("missing unit in duration"),
+        "stderr={:?}",
+        stderr_of(&out)
+    );
+    assert!(stdout_of(&out).is_empty(), "stdout={:?}", stdout_of(&out));
+    assert_eq!(
+        connections_after_exit(&listener),
+        0,
+        "a rejected flag must not connect"
+    );
+}
+
+/// frp-rs's placement rule (subcommand word first, unchanged by this work):
+/// Go's cobra also accepts a root-level `frpc --api-timeout 1s stop …`
+/// (measured on v0.71.0), which frp-rs refuses — a pre-existing divergence,
+/// pinned here so it cannot silently change.
+#[test]
+fn api_timeout_before_the_subcommand_is_refused_and_does_not_connect() {
+    let dir = TempDir::new();
+    let (listener, port) = oracle_listener();
+    let cfg = config_for_port(&dir, port);
+
+    let out = run_frpc(&["--api-timeout=1s", "stop", "-c", &cfg]);
+
+    assert_eq!(exit_code(&out), 1, "stderr={:?}", stderr_of(&out));
+    assert_eq!(connections_after_exit(&listener), 0);
+}
+
+#[test]
+fn api_timeout_zero_or_negative_is_a_timeout_not_a_connection_error() {
+    // Go treats 0, 0s and -1s as an already-expired context — measured:
+    // `context deadline exceeded` even with the admin port refused. The
+    // deadline must therefore be checked before dialing, or the refused port
+    // would win the race with `connect 127.0.0.1:1: Connection refused`.
+    let dir = TempDir::new();
+    let cfg = dir.config(
+        "good.toml",
+        &format!("{BASE_CONFIG}[webServer]\naddr = \"127.0.0.1\"\nport = {REFUSED_PORT_A}\n"),
+    );
+
+    for value in ["0", "0s", "-1s"] {
+        let flag = format!("--api-timeout={value}");
+        let out = run_frpc(&["stop", &flag, "-c", &cfg]);
+        assert_eq!(exit_code(&out), 1, "{flag}");
+        assert!(
+            stderr_of(&out).contains("admin request timed out"),
+            "{flag}: stderr={:?}",
+            stderr_of(&out)
+        );
+        assert!(
+            !stderr_of(&out).contains("connect"),
+            "{flag}: a refused port must not win the race, stderr={:?}",
+            stderr_of(&out)
+        );
+    }
+}
+
+#[test]
+fn api_timeout_one_second_still_succeeds_against_a_responding_server() {
+    // Positive control: the deadline must not break the happy path.
+    let dir = TempDir::new();
+    let (port, _rx, _handle) = mock_admin("HTTP/1.1 200 OK", "stop success");
+    let cfg = config_for_port(&dir, port);
+
+    let out = run_frpc(&["stop", "--api-timeout=1s", "-c", &cfg]);
+
+    assert_eq!(
+        exit_code(&out),
+        0,
+        "stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert_eq!(stdout_of(&out).trim_end(), "stop success");
+}
+
+/// The discriminating timeout test: the listener accepts and holds the socket
+/// open without ever responding, so the child can only exit by enforcing its
+/// own deadline. Pre-fix (`with_admin_timeout` reduced to a bare call) this
+/// hangs and `run_frpc` panics after `EXIT_TIMEOUT`.
+#[test]
+fn api_timeout_bounds_a_black_hole_admin_listener_for_each_subcommand() {
+    for command in ["reload", "status", "stop"] {
+        let dir = TempDir::new();
+        let (port, _handle) = black_hole_admin();
+        let cfg = config_for_port(&dir, port);
+
+        let started = Instant::now();
+        let out = run_frpc(&[command, "--api-timeout", "1s", "-c", &cfg]);
+        let elapsed = started.elapsed();
+
+        assert_eq!(exit_code(&out), 1, "{command}");
+        assert!(
+            stdout_of(&out).is_empty(),
+            "{command}: stdout={:?}",
+            stdout_of(&out)
+        );
+        assert!(
+            stderr_of(&out).contains("admin request timed out after 1s"),
+            "{command}: stderr={:?}",
+            stderr_of(&out)
+        );
+        assert!(
+            elapsed < EXIT_TIMEOUT,
+            "{command}: took {elapsed:?}, the deadline must fire well inside {EXIT_TIMEOUT:?}"
+        );
+    }
 }
