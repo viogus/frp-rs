@@ -171,9 +171,11 @@ jobs:
         run: cargo test -p frp-core --no-default-features --all-targets
       - name: Run frpc CLI tests (admin address resolution)
         # No lane ran a `cargo test` target of the `frpc` package before this
-        # step (`ab-matrix.yml` only *builds* `-p frpc`; the two
-        # `cargo test --workspace … --lib` steps restrict to lib targets, and
-        # `frpc` has no lib). The package's tests were therefore compiled by the
+        # step (`ab-matrix.yml` only *builds* `-p frpc`; the two `--lib` steps —
+        # `Run all-features lib tests` (`cargo test --workspace --all-features
+        # --lib`) and `Run vnet unit tests` (`cargo test -p frp-server --features
+        # vnet --lib`) — restrict to lib targets, and `frpc` has no lib). The
+        # package's tests were therefore compiled by the
         # `Lint` lane (`cargo clippy --workspace --all-targets --all-features`,
         # which satisfies the bin's `required-features = ["full"]`) and executed
         # by nothing. That mattered: `frpc/src/main.rs`'s inline unit tests
@@ -188,11 +190,16 @@ jobs:
         # historical `127.0.0.1:7400` fallback by itself. Measured with a second
         # listener on 7400: the pre-fix binary leaves **0** connections on the
         # config's port and **1** on 7400; this branch's binary leaves 0 on
-        # both. The fallback is caught by the exact-output assertion instead:
-        # pre-fix, the child prints a connection error rather than the refusal
-        # message. Measured against `main` @ `9c1b291`'s frpc, **9 of the 14
-        # fail** (5 passed; 9 failed), and 14/14 pass against this branch's
-        # binary.
+        # both. What catches a 7400 fallback is the output assertion, and it
+        # takes two shapes: the two `*_port_zero_*` tests compare stdout exactly
+        # (`assert_eq!(stdout.trim_end(), GO_NO_PORT_MSG)`), while the
+        # load-error tests check a stdout substring
+        # (`stdout.contains("unknown field \"notAKnownFrpKey\"")`, e.g.
+        # `frpc/tests/admin_cli.rs:228`) plus a stderr check that no `connect`
+        # was attempted. Pre-fix those fail with empty stdout and stderr
+        # `reload failed: connect 127.0.0.1:7400: Connection refused (os error
+        # 61)`. Measured against `main` @ `9c1b291`'s frpc, **9 of the 14 fail**
+        # (5 passed; 9 failed), and 14/14 pass against this branch's binary.
         #
         # It belongs to the unit lane: the tests need no `frps`, and
         # `cargo test` builds the default-feature `frpc` bin they resolve via

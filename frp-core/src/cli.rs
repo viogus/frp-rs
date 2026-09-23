@@ -179,7 +179,7 @@ fn svr_meta() -> impl Parser<SvrMeta> {
         .long("config_dir")
         .argument::<String>("DIR")
         .optional();
-    // Go frp v0.70.1 pflag bool semantics: bare `--strict-config` → true,
+    // Go frp v0.71.0 pflag bool semantics: bare `--strict-config` → true,
     // `--strict-config=false` → false, absent → true. (The space-separated
     // form `--strict-config false` → false is an frp-rs extension, NOT Go
     // pflag semantics — see `parse_go_bool`.) A plain `.switch()` cannot parse
@@ -542,7 +542,7 @@ pub struct TcpmuxArgs {
 #[derive(Debug, Clone)]
 pub struct VerifyArgs {
     pub config: String,
-    /// Go frp v0.70.1: `strict_config` is a persistent rootCmd flag
+    /// Go frp v0.71.0: `strict_config` is a persistent rootCmd flag
     /// (cmd/frpc/sub/root.go), so `frpc verify` honors it too
     /// (cmd/frpc/sub/verify.go passes strictConfigMode to
     /// config.LoadClientConfig).
@@ -585,7 +585,7 @@ fn run_mode() -> impl Parser<FrpcRunArgs> {
         .long("config_dir")
         .argument::<String>("DIR")
         .optional();
-    // Go frp v0.70.1 pflag bool semantics: bare `--strict-config` → true,
+    // Go frp v0.71.0 pflag bool semantics: bare `--strict-config` → true,
     // `--strict-config=false` → false, absent → true. (The space-separated
     // form `--strict-config false` → false is an frp-rs extension, NOT Go
     // pflag semantics — see `parse_go_bool`.) A plain `.switch()` cannot parse
@@ -1002,7 +1002,7 @@ fn tcpmux_cmd() -> impl Parser<FrpcCmd> {
 
 fn verify_cmd() -> impl Parser<FrpcCmd> {
     let config = long("config").short('c').argument::<String>("FILE");
-    // Go frp v0.70.1 pflag bool semantics (same as run/reload): `strict_config`
+    // Go frp v0.71.0 pflag bool semantics (same as run/reload): `strict_config`
     // is a persistent rootCmd flag (default true), so `verify` inherits it —
     // bare `--strict-config` → true, `--strict-config=false` → false, absent →
     // true. (The space-separated form `--strict-config false` → false is an
@@ -1030,7 +1030,7 @@ fn reload_cmd() -> impl Parser<FrpcCmd> {
         .short('c')
         .argument::<String>("FILE")
         .optional();
-    // Go frp v0.70.1 pflag bool semantics: `--strict_config` is a
+    // Go frp v0.71.0 pflag bool semantics: `--strict_config` is a
     // *persistent* rootCmd flag (default true), so the reload subcommand
     // inherits the run-mode semantics — bare `--strict-config` → true,
     // `--strict-config=false` → false, absent → true. (The space-separated
@@ -1551,7 +1551,7 @@ mod tests {
 
     #[test]
     fn reload_strict_config_matches_run_mode_semantics() {
-        // Go frp v0.70.1: --strict_config is a persistent rootCmd flag
+        // Go frp v0.71.0: --strict_config is a persistent rootCmd flag
         // (default true), so the reload subcommand inherits run-mode
         // semantics — absent → true, bare → true, `=false` / ` false` →
         // false. The old plain switch made the `=false` form a parse error
@@ -1583,7 +1583,7 @@ mod tests {
 
     #[test]
     fn verify_strict_config_parses_like_run_mode() {
-        // Go frp v0.70.1: --strict_config is a persistent rootCmd flag
+        // Go frp v0.71.0: --strict_config is a persistent rootCmd flag
         // (default true), so the `verify` subcommand inherits run-mode
         // semantics — absent → true, bare → true, `=false` / ` false` →
         // false (cmd/frpc/sub/verify.go passes strictConfigMode to

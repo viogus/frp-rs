@@ -1112,10 +1112,14 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `ERROR frpc: Failed to load config: unknown field "notAKnownFrpKey" in config file …`,
     exit **2** (`EXIT_CONFIG`, `frp-core/src/lib.rs:193` — "bad config file, unknown field,
     invalid value", part of frp-rs's 1-4 CLI exit scheme, which no live doc states: the only
-    prose is that constant's comment and **three** archived documents
-    (`docs/archive/plans/2026-07-12-error-messages-phase-b.md`,
-    `docs/archive/plans/2026-07-12-phase-a-errors.md`, and the variant table at
-    `docs/archive/specs/2026-07-12-error-messages-cli-polish-design.md:91`).
+    prose is that constant's comment and three archived documents that **state** the scheme —
+    `docs/archive/plans/2026-07-12-error-messages-phase-b.md`,
+    `docs/archive/plans/2026-07-12-phase-a-errors.md`, and
+    `docs/archive/specs/2026-07-12-error-messages-cli-polish-design.md` (const block
+    `:83-88`, variant table `:168-173`). A fourth archived document mentions a constant
+    without stating the scheme
+    (`docs/archive/plans/2026-07-12-profiling-infrastructure.md:436` calls `EXIT_RUNTIME` in a
+    snippet), so this is "the three that state it", not a proven-exhaustive list.
   The gap is inside frp-rs, not only against Go: after this branch's `frpc reload`/`status`
   change the two frpc CLI paths disagree — the admin subcommands now exit **1** for a load
   error, exactly as Go does, while the daemon path exits 2. Pre-existing; deliberately not
@@ -1150,7 +1154,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   * **`-c` twice.** `frpc reload -c noweb.toml -c goodcli.toml` → Go is last-wins and dials the
     second config (`Get "http://127.0.0.1:7499/api/reload…": dial tcp 127.0.0.1:7499: connect:
     connection refused`); frp-rs (both binaries) exits before loading with
-    ``Error: `-c` cannot be used multiple times in this context``.
+    ``Error: argument `-c` cannot be used multiple times in this context``.
   * **Capitalised `[webServer] Port`.** `Port = 7499` → Go's JSON decoding matches the field
     case-insensitively and dials `127.0.0.1:7499`; frp-rs errors
     `unknown field "web_server.Port" in config file … — did you mean 'port'?`. On the pre-fix

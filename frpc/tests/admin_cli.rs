@@ -19,9 +19,20 @@
 //! refusals (message on **stdout**, exit 1) plus the frp-rs-only `--admin-*`
 //! address override, which now applies only *after* a successful load.
 //!
-//! The refusal tests use a `TcpListener` oracle: the listener's port is put in
-//! `webServer.port` of the bad config and the test asserts that zero
-//! connections arrived after the child exits.
+//! The refusal tests use a `TcpListener` oracle. Where a test writes the
+//! listener's port into the bad config's `webServer.port`, it asserts the
+//! connections that arrived after the child exited: **zero** for the two
+//! load-error tests, the `--admin-port 0` override test and
+//! `reload_bad_config_with_admin_flags_*`, and **one** for the two
+//! `--strict-config=false` tolerance tests and the positive control
+//! `reload_valid_config_port_is_used`. Three further tests bind a listener as a
+//! canary but never write its port into any config — the two port-zero tests
+//! and `reload_missing_config_file_*` (there is no config to write it into) —
+//! so what pins those is the exact stdout (Go's port message, or the open
+//! error) plus exit 1. The remaining four
+//! (`reload_valid_config_connection_error_*`, `reload_admin_flags_override_*`
+//! and `reload_lone_admin_{addr,port}_*`) use the fixed, never-listened ports
+//! 1 and 2 and assert the connection error names the expected port.
 //!
 //! Gated on `full`: the `frpc` bin carries `required-features = ["full"]`, so
 //! without the gate this file's `CARGO_BIN_EXE_frpc` would fail to compile in
