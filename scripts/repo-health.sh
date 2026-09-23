@@ -650,11 +650,19 @@ PRUNE_DIRS = ('.git', 'target')
 
 # `git ls-files` is run with these variables removed from the environment: with
 # them inherited, cwd's tree could be certified against *another* repository's
-# index (the tree the script cd'd into is the tree it must report on). A linked
+# index, or a foreign object store could fail an otherwise-clean tree (the tree
+# the script cd'd into is the tree it must report on — though git can still
+# discover an *enclosing* repository if cwd holds an invalid `.git`; that yields
+# an empty or foreign list and exits 3 loudly, which is fail-closed). A linked
 # worktree's `.git` gitfile resolves without any of them. Everything else (PATH,
-# HOME, locale, GIT_SSH*) is passed through untouched.
-GIT_ENV_DROP = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR')
-GIT_TIMEOUT = 60          # a hung git must fail the gate, not stall the CI job
+# HOME, locale, GIT_SSH*) is passed through untouched. `GIT_TRACE*` is dropped by
+# prefix so trace output cannot become the first stderr line of a failure
+# message.
+GIT_ENV_DROP = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR',
+                'GIT_OBJECT_DIRECTORY')
+GIT_ENV_DROP_PREFIX = ('GIT_TRACE',)
+GIT_TIMEOUT = 60          # an ordinary hang: subprocess.run(timeout=) cannot
+                          # reap a process stuck in uninterruptible (D-state) I/O
 
 def cargo_features(crate):
     path = os.path.join(crate, 'Cargo.toml')
@@ -786,7 +794,8 @@ def tracked_files():
     valid UTF-8 is still reported rather than dropped."""
     if not os.path.lexists('.git'):
         return None
-    env = {k: v for k, v in os.environ.items() if k not in GIT_ENV_DROP}
+    env = {k: v for k, v in os.environ.items()
+           if k not in GIT_ENV_DROP and not k.startswith(GIT_ENV_DROP_PREFIX)}
     try:
         r = subprocess.run(['git', 'ls-files', '-z', '--full-name', '--cached'],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,

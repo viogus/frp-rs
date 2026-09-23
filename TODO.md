@@ -1151,12 +1151,14 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   * fail-loud floors, falsified in throwaway copies under `/tmp` (never in the repo): forcing the
     index list to `[]` → `scan error: git ls-files listed no scannable .md/.rs file — refusing to
     report "no stale refs"`; keeping the real list but raising the floor → `scan error:
-    implausibly small scan from git ls-files (<N> file(s), <N> span(s); floor 10**9/100) — refs
-    not certified`; suppressing the span loop → `scan error: git ls-files examined <N> file(s) / 0
-    span(s) — refs not certified`. The `<N>`s are elided on purpose: the span count drifts with any
-    doc edit (readings of this same probe were 12207 at `c75b3a3` and 12210 at `80623e3`), so a
-    literal here would be stale on arrival. All three exit **3** and surface as `FAIL  path-reference
-    scan produced no result (exit 3) — refs not certified` with `RESULT: FAILURES above`. The floors
+    implausibly small scan from git ls-files (<N> file(s), <N> span(s); floor 1000000000/100) —
+    refs not certified` (the probe patches `MIN_FILES = 10**9`; the message interpolates `%d`, so it
+    prints the literal `1000000000`); suppressing the span loop → `scan error: git ls-files examined
+    <N> file(s) / 0 span(s) — refs not certified`. The `<N>`s are elided on purpose: the span count
+    drifts with any doc edit (readings of this same probe were 12207 at `c75b3a3`, 12210 at
+    `80623e3` and 12224 at `526b93e`), so a literal here would be stale on arrival. All three exit
+    **3** and surface as `FAIL  path-reference scan produced no result (exit 3) — refs not
+    certified` with `RESULT: FAILURES above`. The floors
     apply to the walk source as well, so a partial tarball with fewer than 50 scannable files also
     exits 3 rather than passing. A tracked path
     that cannot be opened (deleted in the worktree, or a mode-160000 gitlink named `*.md`) prints
@@ -1166,8 +1168,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     non-ASCII, so neither case is live — they are handled and were probed synthetically as above.
   * fix rounds after review (same branch, further commits, none of the reviewed commits amended):
     the fail-closed hole where *any* git failure fell back to the walk silently is closed, as
-    above. The `.git` probe is `os.path.lexists`, so a dangling `.git` symlink (or a gitfile whose
-    gitdir is gone), where `exists` is False, also fails the gate instead of walking. Verdict parity
+    above. The `.git` probe is `os.path.lexists`: a dangling `.git` symlink, where `os.path.exists`
+    is False but `lexists` is True, now fails the gate instead of walking (a `.git` gitfile whose
+    gitdir is gone has `exists` True and already failed closed at `80623e3`). Verdict parity
     for the walk's `target` prune is restored — a synthetic tracked `sub/target/t.md` carrying a
     dead ref is skipped while `sub/x.md` carrying the same dead ref is reported, matching the
     pre-fix script; the interim commit reported both. Unmerged index entries are collapsed by path
@@ -2176,3 +2179,31 @@ nothing about whether the described behaviour still holds.
   harness used, showing RSS over time for both — or the claim is dropped from the
   positioning docs. `scripts/memory-baseline.sh` already accepts
   `FRPS_BIN`/`FRPC_BIN`, so pointing it at the Go binary is the starting point.
+
+- [ ] **`repo-health.sh`'s doc-figures gate tracebacks under a sparse checkout.** The curated
+  `doc_claims` block's `vendor_version` (`scripts/repo-health.sh:1087`, heredoc from `:937`) opens
+  `vendor/<crate>/Cargo.toml` unconditionally, so a tree whose worktree does not materialise it
+  raises instead of reporting. Reproduce:
+  `git sparse-checkout init --cone && git sparse-checkout set docs scripts && bash scripts/repo-health.sh`
+  → `Traceback (most recent call last):` / `File "<stdin>", line 155, in <module>` /
+  `File "<stdin>", line 152, in vendor_version` /
+  `FileNotFoundError: [Errno 2] No such file or directory: 'vendor/rustls/Cargo.toml'`, after which
+  the run reports `FAIL  a live doc quotes a figure the tree no longer matches`. Pre-existing: the
+  `f8f127f` script prints the identical traceback (same `<stdin>` lines 152/155) on the same tree —
+  re-measured 2026-09-23 during the path-scan work, not caused by it. The path-scan gate itself
+  fails closed there (242 `read error:` lines → exit 3), so nothing is certified green.
+  **Done-when:** `vendor_version` treats a missing manifest as a loud, non-traceback failure (an
+  explicit `FAIL … vendor manifest missing` line, or a documented "partial tree" exit 3 reported
+  once before the entries that need it). No sha.
+- [ ] **`repo-health.sh` derives its root from `$0`, so a symlinked script scans the wrong tree.**
+  `cd "$(dirname "$0")/.."` (`scripts/repo-health.sh:23`) resolves the *symlink's* directory: a
+  symlink to the script placed in a subdirectory makes the whole run treat that subdirectory's
+  parent as the repository root. Latent on this repo — no wrong-root run goes green: measured
+  2026-09-23 by symlinking the script into each subtree, `docs/` reports 204 stale refs,
+  `frp-core/` 9, `frp-client/` 13 and `frp-server/` 4, while `frpc/` (4 scannable files),
+  `frpc/src/` (3) and `frp-server/src/` (32) hit the size floors and exit 3. (A review round
+  reported `frpc/src` 6; that does not reproduce here — the subtree is below the floor.) Every
+  wrong-root run also logs `walk error: docs/archive: No such file or directory` from the archive
+  report.
+  **Done-when:** resolve the real script path (`readlink -f` or `cd -P`) before deriving the root,
+  or refuse to run when the resolved root is not the tree containing the script. No sha.

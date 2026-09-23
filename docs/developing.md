@@ -918,7 +918,8 @@ worktree missing a tracked path, is likewise not certified — that path is a re
 error, not a skip; a partial clone (`--filter=blob:none`) materialises every
 tracked file and does pass. The scan's minimum-size floors apply to the walk path
 as well, and the `git ls-files` call runs with `GIT_DIR`/`GIT_WORK_TREE`/
-`GIT_INDEX_FILE`/`GIT_COMMON_DIR` removed so the list always comes from the tree
+`GIT_INDEX_FILE`/`GIT_COMMON_DIR`/`GIT_OBJECT_DIRECTORY` and any `GIT_TRACE*`
+removed so the list always comes from the tree
 the script is in, not from an inherited environment. Hit lines are sorted by path
 and then by line number rather than in the old depth-first walk order
 (per-directory filename sort); the counts and the hit set are unaffected.
