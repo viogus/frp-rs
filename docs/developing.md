@@ -226,33 +226,50 @@ cargo clippy                 # Lint
 
 ### Toolchain pinning
 
-`rust-toolchain.toml` at the repo root pins the compiler: an exact `channel`
-(`X.Y.Z`, never `stable` and never a floating `X.Y`), `profile = "minimal"`, and
-the `clippy`/`rustfmt` components. It is the single source of truth for local
-development and for CI, so a `cargo fmt` / `cargo clippy` result is a property of
-the commit rather than of the runner image or a developer's `rustup default`.
+`rust-toolchain.toml` at the repo root pins the compiler for every rustup-based
+job that builds the checked-out tree: an exact `channel` (`X.Y.Z`, never `stable`
+and never a floating `X.Y`), `profile = "minimal"`, and the `clippy`/`rustfmt`
+components. That is what makes a `cargo fmt` / `cargo clippy` result a property
+of the commit rather than of the runner image or a developer's `rustup default`.
 
 The channel is exact because a floating one re-introduces the failure the pin
 removes: a new rustc/clippy release can add a lint that fires on untouched code,
 which turns the lint gate red on a commit that changed nothing. An exact version
 makes a compiler bump a deliberate, reviewable diff.
 
-Applying the pin locally needs no argument on any command — run `rustup show` in
-the repository. It reads the file, installs the pinned toolchain and its
-`clippy`/`rustfmt` components if they are absent, and reports it as the active
-one (`overridden by <repo>/rust-toolchain.toml`); from then on `rustc`, `cargo`,
-`cargo clippy` and `cargo fmt` all resolve to the pinned version. A missing
-toolchain is never a reason to pass `+toolchain` by hand.
+It is the file, not a workflow step, that selects the compiler: any `rustc`,
+`cargo`, `cargo clippy` or `cargo fmt` run anywhere under the repository resolves
+it, including subdirectories such as `scripts/frp-stress/`. A job therefore only
+has to make sure the toolchain exists — run `rustup toolchain install --no-self-update`
+in the repository. With no toolchain argument it installs exactly what the file
+asks for: the pinned version, its `profile`, and its two components, reporting
+`the active toolchain ... has been installed` and `overridden by
+<repo>/rust-toolchain.toml`. A missing toolchain is never a reason to pass
+`+toolchain` by hand. Bare `rustup show` also auto-installs the file's
+toolchain, but rustup 1.29.1 warns that auto-installation is deprecated, so the
+explicit install is what CI runs.
+
+**Not covered:** the Docker source build. `docker/Dockerfile.source` starts from
+a floating `rust:1-slim-bookworm` and does not copy `rust-toolchain.toml` into
+the build context, so images built from it are outside the pin. That is recorded
+as an open item in `TODO.md` ("The Docker source build is outside the toolchain
+pin and floats its own compiler").
 
 To bump:
 
 1. edit `channel` in `rust-toolchain.toml` to the new exact version;
-2. run `rustup show` — it installs the new toolchain and its two components;
+2. run `rustup toolchain install --no-self-update` — it installs the new
+   toolchain and its two components;
 3. run `cargo fmt --all -- --check`;
 4. run `cargo clippy --workspace --all-targets --all-features -- -D warnings`;
 5. fix every lint the new compiler reports **in the same PR**. That diff is the
    point of the pin: it is the reviewable consequence of the bump, not a
    follow-up chore.
+
+`scripts/repo-health.sh` gates the pin itself: exactly one toolchain file, at the
+repo root, in `.toml` form; an exact `channel` inside its `[toolchain]` table; and
+no `toolchain:` input or floating `rustup default` selection under
+`.github/workflows/`. Its comments list what that scan does **not** cover.
 
 ### Binary Variants
 

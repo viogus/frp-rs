@@ -38,10 +38,28 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       # Compiler from `rust-toolchain.toml` at the repo root (see
-      # `docs/developing.md` § Toolchain pinning). `rustup show` installs the pinned
-      # version under its versioned name; the image's `stable` does not satisfy it.
+      # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
+      # argument resolves that file's channel; the image's `stable` does not satisfy
+      # a version pin, so this installs a second copy — the cost of the pin.
       - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
-        run: rustup show
+        run: rustup toolchain install --no-self-update
+      - name: Assert the lint compiler is the pinned one
+        # Derived from the file, never hardcoded, so the pin and this check cannot
+        # drift apart. The install step above says what was *requested*; this one
+        # fails the job if the compiler that will actually run is not it, instead
+        # of leaving a green lint result that a reader must trace to a log line.
+        run: |
+          expected=$(grep -m1 -E '^[[:space:]]*channel[[:space:]]*=' rust-toolchain.toml \
+            | sed -E 's/^[^=]*=[[:space:]]*//' | tr -d "\"'[:space:]")
+          if [ -z "$expected" ]; then
+            echo "::error::could not parse a channel value from rust-toolchain.toml"
+            exit 1
+          fi
+          ver=$(rustc --version)
+          case "$ver" in
+            "rustc $expected "*) echo "lint compiler: $ver — matches the pinned channel $expected" ;;
+            *) echo "::error::lint compiler is '$ver', which does not start with 'rustc $expected ' from rust-toolchain.toml"; exit 1 ;;
+          esac
       - name: Record the toolchain this lint result came from
         # The pin states which version is *requested*; this line states which one
         # actually ran, so a future red or green Lint log is self-describing.
@@ -86,10 +104,11 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       # Compiler from `rust-toolchain.toml` at the repo root (see
-      # `docs/developing.md` § Toolchain pinning). `rustup show` installs the pinned
-      # version under its versioned name; the image's `stable` does not satisfy it.
+      # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
+      # argument resolves that file's channel; the image's `stable` does not satisfy
+      # a version pin, so this installs a second copy — the cost of the pin.
       - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
-        run: rustup show
+        run: rustup toolchain install --no-self-update
       - name: Run all-features lib tests (QUIC admission and feature combos)
         run: cargo test --workspace --all-features --lib
       - name: Run vnet unit tests (nathole membership/cap guards)
@@ -209,10 +228,11 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       # Compiler from `rust-toolchain.toml` at the repo root (see
-      # `docs/developing.md` § Toolchain pinning). `rustup show` installs the pinned
-      # version under its versioned name; the image's `stable` does not satisfy it.
+      # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
+      # argument resolves that file's channel; the image's `stable` does not satisfy
+      # a version pin, so this installs a second copy — the cost of the pin.
       - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
-        run: rustup show
+        run: rustup toolchain install --no-self-update
       - name: Build frpc (server integration tests spawn it as the bridge end)
         run: cargo build --bin frpc
       - name: Build frps with dashboard feature
@@ -309,10 +329,11 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       # Compiler from `rust-toolchain.toml` at the repo root (see
-      # `docs/developing.md` § Toolchain pinning). `rustup show` installs the pinned
-      # version under its versioned name; the image's `stable` does not satisfy it.
+      # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
+      # argument resolves that file's channel; the image's `stable` does not satisfy
+      # a version pin, so this installs a second copy — the cost of the pin.
       - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
-        run: rustup show
+        run: rustup toolchain install --no-self-update
       - name: Build binaries (needed for integration tests)
         run: cargo build --bin frps --bin frpc
       - name: Run frp-client integration tests
@@ -348,10 +369,11 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       # Compiler from `rust-toolchain.toml` at the repo root (see
-      # `docs/developing.md` § Toolchain pinning). `rustup show` installs the pinned
-      # version under its versioned name; the image's `stable` does not satisfy it.
+      # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
+      # argument resolves that file's channel; the image's `stable` does not satisfy
+      # a version pin, so this installs a second copy — the cost of the pin.
       - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
-        run: rustup show
+        run: rustup toolchain install --no-self-update
       - name: Check benchmarks compile
         run: cargo bench --workspace --no-run
       - name: Check tiny feature set compiles
@@ -566,10 +588,11 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       # Compiler from `rust-toolchain.toml` at the repo root (see
-      # `docs/developing.md` § Toolchain pinning). `rustup show` installs the pinned
-      # version under its versioned name; the image's `stable` does not satisfy it.
+      # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
+      # argument resolves that file's channel; the image's `stable` does not satisfy
+      # a version pin, so this installs a second copy — the cost of the pin.
       - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
-        run: rustup show
+        run: rustup toolchain install --no-self-update
       - name: Build release (LTO disabled for CI speed)
         run: |
           mkdir -p .cargo
@@ -605,10 +628,11 @@ jobs:
           key: ${{ runner.os }}-cargo-security-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       # Compiler from `rust-toolchain.toml` at the repo root (see
-      # `docs/developing.md` § Toolchain pinning). `rustup show` installs the pinned
-      # version under its versioned name; the image's `stable` does not satisfy it.
+      # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
+      # argument resolves that file's channel; the image's `stable` does not satisfy
+      # a version pin, so this installs a second copy — the cost of the pin.
       - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
-        run: rustup show
+        run: rustup toolchain install --no-self-update
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Install cargo-deny

@@ -13,8 +13,9 @@
 # Exit code: 0 if the mandatory invariants hold, 1 otherwise. The gates (each of
 # which can set the exit code) are: version alignment, every unsafe block having
 # a `// SAFETY:` justification, every vendored crate having a
-# README-FRP-RS.md, the toolchain pin (an exact `rust-toolchain.toml` channel and
-# no floating toolchain selection in CI), docs-index reachability, backtick
+# README-FRP-RS.md, the toolchain pin (exactly one root `rust-toolchain.toml`,
+# an exact `channel` inside its `[toolchain]` table, and no `toolchain:` input or
+# floating `rustup default` in CI), docs-index reachability, backtick
 # repo-path resolution, and the curated doc-figure list. The code-size and
 # binary-size sections are pure reports; the archive-path report is not a content
 # gate but does fail the run if its scan cannot complete.
@@ -246,23 +247,62 @@ printf '  A vendored copy pins the crate: track upstream advisories by hand.\n'
 # ---------------------------------------------------------------- toolchain
 hdr "Toolchain pin"
 
-# Gate: the compiler must be pinned to an exact version. Unpinned, the lint gate
-# is a function of the runner image — a new rustc/clippy release can add a lint
-# that fires on untouched code, so the same commit is green on one image and red
-# on the next. `rust-toolchain.toml`'s `channel` is the pin; "stable", "nightly"
-# and a floating "1.98" all track new releases and are failures here.
+# Gates: the compiler must be pinned to an exact version, by exactly one file,
+# and no workflow may select one by another route. Unpinned, the lint gate is a
+# function of the runner image — a new rustc/clippy release can add a lint that
+# fires on untouched code, so the same commit is green on one image and red on
+# the next. The pin is `rust-toolchain.toml`'s `[toolchain] channel`; "stable",
+# "nightly" and a floating "1.98" all track new releases and are failures here.
+#
+# Both directions were exercised when this gate landed. The pass shapes that must
+# NOT fail: `- run: cargo build # rustup default stable was removed`,
+# `- name: Install Rust stable (rustup default stable)`, a comment mentioning the
+# removed command, and `channel = '1.98.1'` (single-quoted TOML is valid and
+# honoured by rustup).
 TOOLCHAIN_FILE=rust-toolchain.toml
+
+# (a) Exactly one toolchain file, at the repo root, in `.toml` form, and present
+# on disk. `git ls-files` because it is precise (tracked files only, so a scratch
+# file in a developer's tree cannot fail the gate) and cheap. The
+# extension-less legacy `rust-toolchain` is still honoured by rustup and WINS
+# over the `.toml` when both exist (measured stderr: `warn: both
+# .../rust-toolchain and .../rust-toolchain.toml exist; using contents of
+# .../rust-toolchain`), so a second file moves the compiler while the `.toml`
+# still reads as pinned. A nested file
+# (`scripts/frp-stress/rust-toolchain.toml`) does the same from inside its own
+# directory. The `find` fallback keeps the gate usable from a source tree with
+# no `.git` (the `health` CI job always has one).
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  tc_files=$(git ls-files | grep -E '(^|/)rust-toolchain(\.toml)?$' || true)
+else
+  tc_files=$(find . -path ./target -prune -o \
+    \( -name rust-toolchain -o -name rust-toolchain.toml \) -print 2>/dev/null \
+    | sed 's|^\./||')
+fi
 if [ ! -f "$TOOLCHAIN_FILE" ]; then
   printf '  FAIL  %s is missing — the toolchain is not pinned\n' "$TOOLCHAIN_FILE"
   fail=1
+elif [ "$tc_files" = "$TOOLCHAIN_FILE" ]; then
+  printf '  ok    exactly one toolchain file: %s (repo root)\n' "$TOOLCHAIN_FILE"
 else
-  # First `channel = "..."` assignment. Comments are ignored by requiring the
-  # line to start with optional whitespace + `channel`; nothing in the file
-  # quotes that pattern.
-  tc_channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' \
-    "$TOOLCHAIN_FILE" | head -1)
+  printf '%s\n' "$tc_files" | sed 's/^/    /'
+  printf '  FAIL  expected exactly one `%s` at the repo root and no other `rust-toolchain`/`rust-toolchain.toml`\n' \
+    "$TOOLCHAIN_FILE"
+  fail=1
+fi
+
+# (b) `channel` must be present, inside the `[toolchain]` table, and an exact
+# X.Y.Z. Single and double quotes are both valid TOML and both honoured by
+# rustup. Reading only inside the table matters: a `channel` key outside it is
+# ignored by rustup, so accepting it would print `ok` for a tree that is not
+# pinned at all.
+if [ -f "$TOOLCHAIN_FILE" ]; then
+  tc_channel=$(awk '
+    /^[[:space:]]*\[/ { in_table = ($0 ~ /^[[:space:]]*\[toolchain\][[:space:]]*$/); next }
+    in_table && /^[[:space:]]*channel[[:space:]]*=/ { print; exit }
+  ' "$TOOLCHAIN_FILE" | sed -E 's/^[^=]*=[[:space:]]*//' | tr -d "\"'[:space:]")
   if [ -z "$tc_channel" ]; then
-    printf '  FAIL  %s has no `channel = "..."` key — the toolchain is not pinned\n' \
+    printf '  FAIL  %s has no `channel = ...` key in its [toolchain] table — the toolchain is not pinned\n' \
       "$TOOLCHAIN_FILE"
     fail=1
   elif printf '%s' "$tc_channel" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
@@ -274,31 +314,44 @@ else
   fi
 fi
 
-# Gate: no workflow may select a toolchain by a floating name. `rustup default
-# stable` in a job is exactly the race the pin removes; a job that wants the
-# pinned compiler gets it from the toolchain file instead.
-#
-# The scan is comment-aware (a line whose first non-space character is `#` is
-# skipped) on purpose: the natural place to explain *why* the old selection was
-# removed is a comment that names it, and a gate that fails on its own
-# explanation would be worked around by wording it indirectly. Shell comments
-# inside a `run: |` block are skipped too, for the same reason. Purely textual —
-# this runs in the `health` CI job, which has no Rust toolchain at all, and
-# locally for contributors who may have no rustup. It does not compare an
-# installed version against the pin; that is `rustc --version`'s job in the
-# `lint` log.
+# (c) No workflow may pass a `toolchain:` input to
+# `actions-rust-lang/setup-rust-toolchain@v1`. The action documents that a
+# provided `toolchain` makes it ignore the toolchain file and install that value
+# instead, and its `override: true` default then beats the file for the rest of
+# the job — which would silently unpin the 7 steps that rely on the file.
+# Inherently comment-aware: the pattern is anchored at the start of the line, so
+# a `#`-prefixed line can never match.
+tc_input=$(grep -rnE '^[[:space:]]*toolchain[[:space:]]*:' .github/workflows/ 2>/dev/null || true)
+if [ -n "$tc_input" ]; then
+  printf '%s\n' "$tc_input" | sed 's/^/    /'
+  printf '  FAIL  %s `toolchain:` input(s) in .github/workflows/ override the toolchain file\n' \
+    "$(printf '%s\n' "$tc_input" | grep -c .)"
+  fail=1
+else
+  printf '  ok    no `toolchain:` input in .github/workflows/ (the file is not overridden)\n'
+fi
+
+# (d) No workflow may select a toolchain with `rustup default`. The pattern is
+# anchored to a real command — the start of a `run:` value, or the start of a
+# line inside a `run: |` block — so a step *name* or an explanatory comment that
+# merely mentions the removed command does not trip it (both were false
+# positives before; they are the pass cases in the header comment above). That
+# anchoring is also what makes the scan comment-aware.
 #
 # COVERAGE — deliberately narrow, and a pass means only this much:
-#   * catches `rustup default <name>` in a file under `.github/workflows/`,
-#     tolerating extra whitespace (`rustup  default  stable`);
-#   * does NOT catch a floating selection that never spells that command in a
-#     workflow: `RUSTUP_TOOLCHAIN` in an `env:` block, a `rustup override`, a
-#     `rustup default` inside a script or Makefile the job invokes, or a
-#     compiler floated by a container base image. The Docker source build is one
-#     known instance of the last case — see the open TODO.md item on
-#     `docker/Dockerfile.source`; this gate does not cover it.
-floating=$(grep -rnE 'rustup[[:space:]]+default[[:space:]]' .github/workflows/ 2>/dev/null \
-  | grep -vE '^[^:]*:[0-9]+:[[:space:]]*#' || true)
+#   * catches `rustup default <name>` as a leading command in a file under
+#     `.github/workflows/`, tolerating extra whitespace
+#     (`rustup  default  stable`);
+#   * does NOT catch a floating selection that never writes that command as a
+#     leading `run:` command. Measured as passing (i.e. missed) when this gate
+#     landed: `cargo +stable`, an inline `RUSTUP_TOOLCHAIN=stable cargo ...`,
+#     `rustup override set stable`, a `rustc = ...` written into
+#     `.cargo/config.toml`, a `rustup default` that is not the first command of
+#     its `run:` line (`cd x && rustup default stable`), a `rustup default`
+#     inside a script or Makefile the job invokes, and a compiler floated by a
+#     container base image. The Docker source build is one instance of that last
+#     case and has its own TODO.md item; this gate does not cover it.
+floating=$(grep -rnE '^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*rustup[[:space:]]+default[[:space:]]|^[[:space:]]+rustup[[:space:]]+default[[:space:]]' .github/workflows/ 2>/dev/null || true)
 if [ -n "$floating" ]; then
   printf '%s\n' "$floating" | sed 's/^/    /'
   printf '  FAIL  %s floating toolchain selection(s) under .github/workflows/ (rustup default ...)\n' \
