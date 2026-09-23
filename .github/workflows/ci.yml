@@ -48,11 +48,23 @@ jobs:
         # drift apart. The install step above says what was *requested*; this one
         # fails the job if the compiler that will actually run is not it, instead
         # of leaving a green lint result that a reader must trace to a log line.
+        # The `channel` read mirrors the gate in `scripts/repo-health.sh`: scoped
+        # to the `[toolchain]` table (a stray `channel` outside it is not the pin),
+        # single- or double-quoted, tolerant of a trailing TOML comment. Keep the
+        # two in step when either changes.
         run: |
-          expected=$(grep -m1 -E '^[[:space:]]*channel[[:space:]]*=' rust-toolchain.toml \
-            | sed -E 's/^[^=]*=[[:space:]]*//' | tr -d "\"'[:space:]")
+          channel=$(awk '
+            /^[[:space:]]*\[/ { in_table = ($0 ~ /^[[:space:]]*\[toolchain\][[:space:]]*(#.*)?$/); next }
+            in_table && /^[[:space:]]*channel[[:space:]]*=/ { print; exit }
+          ' rust-toolchain.toml)
+          raw=$(printf '%s' "${channel#*=}" | sed -E 's/^[[:space:]]+//')
+          case "$raw" in
+            \"*\"*) expected=${raw#\"}; expected=${expected%%\"*} ;;
+            \'*\'*) expected=${raw#\'}; expected=${expected%%\'*} ;;
+            *)      expected=$(printf '%s' "$raw" | sed -E 's/[[:space:]]*#.*$//; s/[[:space:]]//g') ;;
+          esac
           if [ -z "$expected" ]; then
-            echo "::error::could not parse a channel value from rust-toolchain.toml"
+            echo "::error::could not parse a [toolchain] channel value from rust-toolchain.toml"
             exit 1
           fi
           ver=$(rustc --version)

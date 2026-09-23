@@ -1305,7 +1305,13 @@ nothing about whether the described behaviour still holds.
   the replacement is measured on rustup
   1.29.1 in an empty `RUSTUP_HOME` — it resolves the file, downloads 5
   components, installs no rust-docs, and reports the toolchain active "because:
-  overridden by `<repo>/rust-toolchain.toml`". The
+  overridden by `<repo>/rust-toolchain.toml`". Two caveats on that command, both
+  measured on rustup 1.29.1: a **misspelled component does not fail** —
+  `components = ["rustfm"]` prints `warn: skipping unavailable component rustfm`
+  and exits 0 (malformed TOML and an unknown `profile` do exit 1), so a typo
+  there rests on review — and the gate parses only the standard `[toolchain]`
+  section form, so the inline-table and dotted-key spellings rustup also honours
+  fail closed rather than being accepted unchecked. The
   `actions-rust-lang/setup-rust-toolchain@v1` steps in `compat.yml`,
   `release.yml` (×3), `stress-test.yml`, `xtcp-compat.yml` and `ab-matrix.yml`
   pass no `toolchain:` input, so per that action's `v1` README they install what
@@ -1315,22 +1321,32 @@ nothing about whether the described behaviour still holds.
   Gate: `scripts/repo-health.sh` gained a `Toolchain pin` section, printed between
   the `Vendored crates` and `Docs` sections. It fails on: a missing
   `rust-toolchain.toml`; anything other than exactly one toolchain file, at the
-  repo root, in `.toml` form (a legacy `rust-toolchain` wins over the `.toml` in
-  rustup, and a nested one wins inside its own directory — measured); a `channel`
-  that is absent, outside the `[toolchain]` table, or not an exact `X.Y.Z`
-  (single- or double-quoted); a `toolchain:` input under `.github/workflows/`;
-  and `rustup default` used as a leading `run:` command there. It is pure
-  text/file parsing — no rustup and no installed version — so the toolchain-less
-  `health` CI job can run it. Falsified in both directions: `stable`, `nightly`,
-  `1.98`, `1.98.1.0`, a deleted `channel` key, a deleted file, a second
-  `rust-toolchain` file, an injected `run: rustup default stable` and its
-  double-spaced variant each exit 1 with the file and value named;
-  `channel = '1.98.1'`, a comment naming the removed command and
+  repo root, in `.toml` form — tracked, present, and **not shadowed by an
+  untracked one** (a legacy `rust-toolchain` wins over the `.toml` in rustup and a
+  nested one wins inside its own directory, measured, and an untracked copy does
+  so identically); a `channel` that is absent, outside the `[toolchain]` table,
+  or not an exact `X.Y.Z` (single- or double-quoted, trailing TOML comment
+  allowed); a `toolchain:` input **on a `setup-rust-toolchain` step**; and
+  `rustup default` used as a leading `run:` command under `.github/workflows/`. It
+  is pure text/file parsing — no rustup and no installed version — so the
+  toolchain-less `health` CI job can run it. Falsified in both directions:
+  `stable`, `nightly`, `1.98`, `1.98.1.0`, a deleted `channel` key, `channel`
+  outside `[toolchain]`, a deleted file, a tracked second `rust-toolchain`, a
+  tracked nested `scripts/frp-stress/rust-toolchain.toml`, an **untracked**
+  `rust-toolchain`, a workflow `toolchain:` input on the setup step, an injected
+  `run: rustup default stable`, its double-spaced variant and a block-scalar
+  `rustup default stable` line each exit 1 with the file and value named;
+  `channel = '1.98.1'`, `[toolchain] # comment`, `channel = "1.98.1" # comment`,
+  a comment naming the removed command and
   `- run: cargo build # rustup default stable was removed` do **not** fail it. Its
   comments list the evasions it does **not** catch (`cargo +stable`, an inline
   `RUSTUP_TOOLCHAIN=stable ...`, `rustup override set`, a `rustc = ...` written
   into `.cargo/config.toml`, a non-leading `rustup default` in a `run:` line, a
-  script/Makefile the job invokes, a container base image).
+  quoted-scalar `run: "rustup default stable"`, a script/Makefile the job invokes,
+  a container base image) — the `toolchain:` check's own comment records that it
+  is scoped to the setup-action step and so ignores a line-leading `toolchain:`
+  that overrides nothing (`workflow_dispatch.inputs.toolchain`, `matrix.toolchain`,
+  an `env:` entry, a `run: |` body line).
   Docs: `CLAUDE.md` (Build / Test / Lint, plus the clippy row of Current Health),
   `docs/developing.md` § 3 (`### Toolchain pinning`) and one sentence in
   `README.md`.
@@ -1346,23 +1362,39 @@ nothing about whether the described behaviour still holds.
   --features tiny` → exit 0 and the same with `micro` → exit 0;
   `cargo test --workspace --all-features --lib` → exit 0, 300 (frp-client) +
   870 (frp-core) + 497 (frp-server) + 40 (frp-vnet) passed / 0 failed;
-  `bash scripts/repo-health.sh` → exit 0. The new assertion step was falsified
-  too: a wrong expectation, an unparsable `channel`, and a `rustc` shim reporting
-  `1.96.0` each exit 1 with their `::error::` message.
-  CI, measured in this PR's own run (run `35825672987`, `Lint` job
-  `107066732208`): `syncing channel updates for
-  1.98.1-x86_64-unknown-linux-gnu`, `downloading 5 components`, `overridden by
-  '/home/runner/work/frp-rs/frp-rs/rust-toolchain.toml'`, the recorded
-  `rustc 1.98.1` / `clippy 0.1.98`, `Lint` green in 4m43s. The install is neither
-  cached nor free: nothing caches `~/.rustup` and hosted runners are fresh VMs,
-  so **every job of every run** pays it — measured on the runner at ~10 s for the
-  5 components (`Lint` 06:15:28.906 → 06:15:38.473). Keying a `~/.rustup` cache on
-  `hashFiles('rust-toolchain.toml')` was considered and rejected: a second cache
-  key plus save/restore logic across 7 jobs to save ~10 s per job is not worth it.
-  The 5m00.420s measured on this macOS host for the same 5 components is this
-  host's route to `static.rust-lang.org`, not a runner estimate.
+  `bash scripts/repo-health.sh` → exit 0. The assertion step was falsified too: a
+  wrong expectation (`1.99.99` with a live `rustc 1.98.1`), an unparsable
+  `[toolchain]` channel, and a `rustc` shim reporting `1.96.0` each exit 1 with
+  their `::error::` message; and it now passes the two shapes that used to false-fail
+  it — `[toolchain] # pinned` with `channel = "1.98.1" # pinned`, and a stray
+  `channel` outside the table, which both parsers ignore because they read the
+  table (`channel = '1.98.1' # c` passes too).
+  CI. The shipped command is measured on the runner by **this PR's own run
+  `35828829198`** (`Lint` job `107076491956`, conclusion `success`, head
+  `4c729f8`); timestamps below are anchored from that job's log by this author:
+  the step's `##[group]Run rustup toolchain install --no-self-update` line at
+  `06:54:19.3038416` to `info: it's active because: overridden by
+  '/home/runner/work/frp-rs/frp-rs/rust-toolchain.toml'` at `06:54:28.1387715` —
+  **≈8.83 s**; the same step in that run's `Security` job (`107076491729`) runs
+  `06:53:19.5561254` → `06:53:27.5356438` (**≈7.98 s**). That log contains no
+  `rustup show` group and no rustup deprecation warning, and its assertion step
+  prints `lint compiler: rustc 1.98.1 (48a229cea 2026-09-01) — matches the pinned
+  channel 1.98.1`. The earlier run `35825672987` (`Lint` job `107066732208`) is
+  the **pre-fix `rustup show` measurement** — it is where the five deprecation
+  `warn:` lines and the ~10 s figure (06:15:28.906 → 06:15:38.473) come from, and
+  it must not be read as evidence for the shipped command. The install is neither
+  cached nor free: nothing caches `~/.rustup` and hosted runners are fresh VMs, so
+  **all 7 cargo jobs of every `ci.yml` run** pay it — the 8th job, `health`, has
+  no Rust toolchain and runs only the gate — plus the `setup-rust-toolchain@v1`
+  steps in the other workflows, whose cost was not measured. Keying a `~/.rustup`
+  cache on `hashFiles('rust-toolchain.toml')` was considered and rejected: a
+  second cache key plus save/restore logic across 7 jobs to save ~8-10 s per job
+  is not worth it. The 5m00.420s measured on this macOS host for the same 5
+  components is this host's route to `static.rust-lang.org`, not a runner
+  estimate.
   Not verified: the other lanes' results at the time of writing, the
-  Windows/macOS release lanes, and the Docker image's compiler.
+  Windows/macOS release lanes, the Docker image's compiler, and the other
+  workflows' install cost.
 
 - [ ] **The compat lanes install a floating Go toolchain that nothing uses.**
   Evidence: `.github/workflows/compat.yml:37-39` and

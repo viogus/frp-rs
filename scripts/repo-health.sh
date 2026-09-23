@@ -257,50 +257,71 @@ hdr "Toolchain pin"
 # Both directions were exercised when this gate landed. The pass shapes that must
 # NOT fail: `- run: cargo build # rustup default stable was removed`,
 # `- name: Install Rust stable (rustup default stable)`, a comment mentioning the
-# removed command, and `channel = '1.98.1'` (single-quoted TOML is valid and
-# honoured by rustup).
+# removed command, `channel = '1.98.1'` (single-quoted TOML), and a trailing TOML
+# comment after either the `[toolchain]` header or the `channel` value.
 TOOLCHAIN_FILE=rust-toolchain.toml
 
-# (a) Exactly one toolchain file, at the repo root, in `.toml` form, and present
-# on disk. `git ls-files` because it is precise (tracked files only, so a scratch
-# file in a developer's tree cannot fail the gate) and cheap. The
-# extension-less legacy `rust-toolchain` is still honoured by rustup and WINS
-# over the `.toml` when both exist (measured stderr: `warn: both
-# .../rust-toolchain and .../rust-toolchain.toml exist; using contents of
-# .../rust-toolchain`), so a second file moves the compiler while the `.toml`
-# still reads as pinned. A nested file
+# (a) Exactly one toolchain file, at the repo root, in `.toml` form, present on
+# disk, and not shadowed by an untracked one. `git ls-files` because it is
+# precise and cheap. The extension-less legacy `rust-toolchain` is still honoured
+# by rustup and WINS over the `.toml` when both exist (measured stderr:
+# `warn: both .../rust-toolchain and .../rust-toolchain.toml exist; using
+# contents of .../rust-toolchain`), so a second file moves the compiler while the
+# `.toml` still reads as pinned. A nested file
 # (`scripts/frp-stress/rust-toolchain.toml`) does the same from inside its own
 # directory. The `find` fallback keeps the gate usable from a source tree with
 # no `.git` (the `health` CI job always has one).
 if git rev-parse --git-dir >/dev/null 2>&1; then
   tc_files=$(git ls-files | grep -E '(^|/)rust-toolchain(\.toml)?$' || true)
+  # Untracked-but-not-gitignored shadowing files: they win in rustup exactly like
+  # tracked ones, so a pass here would assert more than was checked. Gitignored
+  # scratch stays invisible on purpose (`--exclude-standard`), and anything under
+  # a `target/` build directory is pruned for the same reason the `find` fallback
+  # below prunes it — nothing builds from inside `target/`.
+  tc_untracked=$(git ls-files --others --exclude-standard \
+    | grep -E '(^|/)rust-toolchain(\.toml)?$' | grep -vE '(^|/)target/' || true)
 else
-  tc_files=$(find . -path ./target -prune -o \
+  tc_files=$(find . -type d -name target -prune -o \
     \( -name rust-toolchain -o -name rust-toolchain.toml \) -print 2>/dev/null \
     | sed 's|^\./||')
+  tc_untracked=""
 fi
 if [ ! -f "$TOOLCHAIN_FILE" ]; then
   printf '  FAIL  %s is missing — the toolchain is not pinned\n' "$TOOLCHAIN_FILE"
   fail=1
-elif [ "$tc_files" = "$TOOLCHAIN_FILE" ]; then
+elif [ "$tc_files" = "$TOOLCHAIN_FILE" ] && [ -z "$tc_untracked" ]; then
   printf '  ok    exactly one toolchain file: %s (repo root)\n' "$TOOLCHAIN_FILE"
 else
-  printf '%s\n' "$tc_files" | sed 's/^/    /'
+  [ -n "$tc_files" ] && printf '%s\n' "$tc_files" | sed 's/^/    /'
+  [ -n "$tc_untracked" ] && printf '%s\n' "$tc_untracked" | sed 's/^/    untracked: /'
   printf '  FAIL  expected exactly one `%s` at the repo root and no other `rust-toolchain`/`rust-toolchain.toml`\n' \
     "$TOOLCHAIN_FILE"
+  [ -n "$tc_untracked" ] && printf '        (the untracked file(s) still win in rustup — delete them or add them to .gitignore)\n'
   fail=1
 fi
 
 # (b) `channel` must be present, inside the `[toolchain]` table, and an exact
-# X.Y.Z. Single and double quotes are both valid TOML and both honoured by
-# rustup. Reading only inside the table matters: a `channel` key outside it is
-# ignored by rustup, so accepting it would print `ok` for a tree that is not
-# pinned at all.
+# X.Y.Z, optionally followed by a TOML comment. Single and double quotes are both
+# valid TOML and both honoured by rustup. Reading only inside the table matters: a
+# `channel` key outside it is ignored by rustup, so accepting it would print `ok`
+# for a tree that is not pinned at all. The extraction is intentionally a
+# three-step bash parse, not a TOML reader: the two other legal spellings rustup
+# honours — an inline table (`toolchain = { channel = "1.98.1" }`) and a dotted
+# key (`toolchain.channel = "1.98.1"`) — are NOT recognised and fail closed here.
+# That is documented in docs/developing.md, not silently tolerated.
 if [ -f "$TOOLCHAIN_FILE" ]; then
-  tc_channel=$(awk '
-    /^[[:space:]]*\[/ { in_table = ($0 ~ /^[[:space:]]*\[toolchain\][[:space:]]*$/); next }
+  # The header may carry a trailing comment; the value's own trailing comment is
+  # stripped below, outside the quotes.
+  tc_line=$(awk '
+    /^[[:space:]]*\[/ { in_table = ($0 ~ /^[[:space:]]*\[toolchain\][[:space:]]*(#.*)?$/); next }
     in_table && /^[[:space:]]*channel[[:space:]]*=/ { print; exit }
-  ' "$TOOLCHAIN_FILE" | sed -E 's/^[^=]*=[[:space:]]*//' | tr -d "\"'[:space:]")
+  ' "$TOOLCHAIN_FILE")
+  tc_raw=$(printf '%s' "${tc_line#*=}" | sed -E 's/^[[:space:]]+//')
+  case "$tc_raw" in
+    \"*\"*) tc_channel=${tc_raw#\"}; tc_channel=${tc_channel%%\"*} ;;
+    \'*\'*) tc_channel=${tc_raw#\'}; tc_channel=${tc_channel%%\'*} ;;
+    *)      tc_channel=$(printf '%s' "$tc_raw" | sed -E 's/[[:space:]]*#.*$//; s/[[:space:]]//g') ;;
+  esac
   if [ -z "$tc_channel" ]; then
     printf '  FAIL  %s has no `channel = ...` key in its [toolchain] table — the toolchain is not pinned\n' \
       "$TOOLCHAIN_FILE"
@@ -318,17 +339,31 @@ fi
 # `actions-rust-lang/setup-rust-toolchain@v1`. The action documents that a
 # provided `toolchain` makes it ignore the toolchain file and install that value
 # instead, and its `override: true` default then beats the file for the rest of
-# the job — which would silently unpin the 7 steps that rely on the file.
-# Inherently comment-aware: the pattern is anchored at the start of the line, so
-# a `#`-prefixed line can never match.
-tc_input=$(grep -rnE '^[[:space:]]*toolchain[[:space:]]*:' .github/workflows/ 2>/dev/null || true)
+# the job — which would silently unpin every step that relies on the file.
+#
+# The scan is scoped to the action's own step block (the lines indented deeper
+# than the `- uses:` marker) rather than the whole file, because a line-leading
+# `toolchain:` elsewhere overrides nothing: `workflow_dispatch.inputs.toolchain`,
+# a `matrix.toolchain` entry, an `env:` mapping, a `run: |` body line. Those were
+# the false positives of the file-wide scan.
+tc_input=$(awk '
+  /^[[:space:]]*-[[:space:]]*uses:[[:space:]]*actions-rust-lang\/setup-rust-toolchain@/ {
+    match($0, /^[[:space:]]*/); base = RLENGTH; inblock = 1; next
+  }
+  inblock {
+    if ($0 ~ /^[[:space:]]*$/) next
+    match($0, /^[[:space:]]*/); ind = RLENGTH
+    if (ind <= base) { inblock = 0; next }
+    if ($0 ~ /^[[:space:]]*toolchain[[:space:]]*:/) print FILENAME ":" FNR ":" $0
+  }
+' .github/workflows/*.yml 2>/dev/null || true)
 if [ -n "$tc_input" ]; then
   printf '%s\n' "$tc_input" | sed 's/^/    /'
-  printf '  FAIL  %s `toolchain:` input(s) in .github/workflows/ override the toolchain file\n' \
+  printf '  FAIL  %s `toolchain:` input(s) on a setup-rust-toolchain step override the toolchain file\n' \
     "$(printf '%s\n' "$tc_input" | grep -c .)"
   fail=1
 else
-  printf '  ok    no `toolchain:` input in .github/workflows/ (the file is not overridden)\n'
+  printf '  ok    no `toolchain:` input on any setup-rust-toolchain step\n'
 fi
 
 # (d) No workflow may select a toolchain with `rustup default`. The pattern is
@@ -347,10 +382,13 @@ fi
 #     landed: `cargo +stable`, an inline `RUSTUP_TOOLCHAIN=stable cargo ...`,
 #     `rustup override set stable`, a `rustc = ...` written into
 #     `.cargo/config.toml`, a `rustup default` that is not the first command of
-#     its `run:` line (`cd x && rustup default stable`), a `rustup default`
-#     inside a script or Makefile the job invokes, and a compiler floated by a
-#     container base image. The Docker source build is one instance of that last
-#     case and has its own TODO.md item; this gate does not cover it.
+#     its `run:` line (`cd x && rustup default stable`), a **quoted scalar**
+#     (`run: "rustup default stable"`), a `rustup default` inside a script or
+#     Makefile the job invokes, and a compiler floated by a container base image.
+#     The Docker source build is one instance of that last case and has its own
+#     TODO.md item; this gate does not cover it.
+#   * check (c) above is scoped to the setup-action step and so does not see a
+#     `toolchain:` key that some other action might consume.
 floating=$(grep -rnE '^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*rustup[[:space:]]+default[[:space:]]|^[[:space:]]+rustup[[:space:]]+default[[:space:]]' .github/workflows/ 2>/dev/null || true)
 if [ -n "$floating" ]; then
   printf '%s\n' "$floating" | sed 's/^/    /'

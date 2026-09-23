@@ -33,6 +33,14 @@
 # auto-installs it, but rustup 1.29.1 prints that auto-installation is deprecated
 # for most commands and that `rustup install` should be used instead.
 #
+# Two caveats, both measured on rustup 1.29.1. A misspelled component is the one
+# degenerate case that does NOT fail loudly: `components = ["rustfm"]` prints
+# `warn: skipping unavailable component rustfm` and exits 0 (a malformed file and
+# an unknown `profile` both exit 1), so a typo there is caught by review, not by
+# the command. And keep the standard `[toolchain]` section form below: rustup
+# also honours an inline table and a dotted key, but `scripts/repo-health.sh`
+# parses the section form only and fails closed on those.
+#
 # To bump:
 #   1. edit `channel` below to the new exact version;
 #   2. run `rustup toolchain install --no-self-update` (installs it and its two
