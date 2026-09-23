@@ -33,15 +33,17 @@
 # auto-installs it, but rustup 1.29.1 prints that auto-installation is deprecated
 # for most commands and that `rustup install` should be used instead.
 #
-# Silent-typo caveats, measured on rustup 1.29.1: a misspelled component
-# (`components = ["rustfm"]`) prints `warn: skipping unavailable component
-# rustfm` and exits 0, and an unknown key in this table (e.g.
-# `profilee = "minimal"`) is ignored with no warning at all and also exits 0 —
-# those two rest on review. A typo in a value is loud (a malformed file, an
-# unknown `profile` and a non-existent `channel` all exit 1), and no silent case
-# can leave the compiler unpinned: the `channel` rustup resolves is the one
-# `ci.yml` asserts. And keep the standard `[toolchain]` section form below:
-# rustup also honours an inline table and a dotted key, but
+# Typo behaviour, measured on rustup 1.29.1. A misspelled component is loud on a
+# fresh `RUSTUP_HOME` (`error: component 'rustfm' ... is unavailable for
+# download`, exit 1, nothing installed — what a CI runner starts from) and only
+# `warn: skipping unavailable component rustfm` with exit 0 once that toolchain is
+# already installed, so a local typo of that kind can pass unnoticed. An unknown
+# key in this table (e.g. `profilee = "minimal"`) is ignored with no warning and
+# exits 0 in both cases — that one rests on review. A typo in a value is always
+# loud (a malformed file, an unknown `profile` and a non-existent `channel` all
+# exit 1), and no silent case can leave the compiler unpinned: the `channel`
+# rustup resolves is the one `ci.yml` asserts. And keep the standard `[toolchain]`
+# section form below: rustup also honours an inline table and a dotted key, but
 # `scripts/repo-health.sh` parses the section form only and fails closed on those.
 #
 # To bump:

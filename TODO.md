@@ -1305,15 +1305,19 @@ nothing about whether the described behaviour still holds.
   the replacement is measured on rustup
   1.29.1 in an empty `RUSTUP_HOME` — it resolves the file, downloads 5
   components, installs no rust-docs, and reports the toolchain active "because:
-  overridden by `<repo>/rust-toolchain.toml`". Silent-typo caveats on that
-  command, all measured on rustup 1.29.1: a **misspelled component does not
-  fail** — `components = ["rustfm"]` prints `warn: skipping unavailable component
-  rustfm` and exits 0 — and an **unknown key in the `[toolchain]` table** (e.g.
-  `profilee = "minimal"`, or `component = [...]`) is ignored with no warning at
-  all and also exits 0, so both rest on review. A typo in a *value* is loud
-  (malformed TOML, an unknown `profile` and a non-existent `channel` all exit 1),
-  and no silent case can leave the compiler unpinned. Also, the gate parses only
-  the standard `[toolchain]`
+  overridden by `<repo>/rust-toolchain.toml`". Typo behaviour, measured on rustup
+  1.29.1: a **misspelled component is loud on a fresh `RUSTUP_HOME`** —
+  `components = ["rustfm"]` gives `error: component 'rustfm' for target '<host>'
+  is unavailable for download for channel '1.98.1-<host>'` and exit 1 with nothing
+  installed, which is the state a CI runner starts in — and only degrades to
+  `warn: skipping unavailable component rustfm` with exit 0 once that toolchain is
+  **already installed** (the local case), so a local typo of that kind can pass
+  unnoticed. An **unknown key in the `[toolchain]` table** (e.g.
+  `profilee = "minimal"`, or `component = [...]`) is ignored with no warning and
+  exits 0 in both cases, so that one rests on review. A typo in a *value* is
+  always loud (malformed TOML, an unknown `profile` and a non-existent `channel`
+  all exit 1), and no silent case can leave the compiler unpinned. Also, the gate
+  parses only the standard `[toolchain]`
   section form, so the inline-table and dotted-key spellings rustup also honours
   fail closed rather than being accepted unchecked. The
   `actions-rust-lang/setup-rust-toolchain@v1` steps in `compat.yml`,
@@ -1402,7 +1406,9 @@ nothing about whether the described behaviour still holds.
   cached nor free: nothing caches `~/.rustup` and hosted runners are fresh VMs, so
   every `ci.yml` run pays it in its cargo jobs — **6 of the 8 jobs on a
   `pull_request`** (`build` is `if: push && (main || tags)`, so it is skipped on
-  PRs, verified in run `35828829198`) and **7 of the 8 on a `main`/tag push**; the
+  PRs, verified in run `35828829198`) and **7 of the 8 on a push to `main`**
+  (`ci.yml` is `on.push.branches: [main]`, so no tag push reaches this workflow at
+  all and the `refs/tags/` clause in `build`'s `if:` is unreachable inside it); the
   8th, `health`, has no Rust toolchain and runs only the gate — plus the
   `setup-rust-toolchain@v1` steps in the other workflows, whose cost was not
   measured. Keying a `~/.rustup`

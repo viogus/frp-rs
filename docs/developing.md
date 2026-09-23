@@ -249,15 +249,20 @@ asks for: the pinned version, its `profile`, and its two components, reporting
 toolchain, but rustup 1.29.1 warns that auto-installation is deprecated, so the
 explicit install is what CI runs.
 
-Silent-typo caveats, measured on rustup 1.29.1: a **misspelled component**
-(`components = ["rustfm"]`) prints `warn: skipping unavailable component rustfm`
-and **exits 0**, and an **unknown key** in the `[toolchain]` table (for example
-`profilee = "minimal"`, or `component = [...]` instead of `components`) is
-ignored with no warning at all and also exits 0 — so those two typos rest on
-review. A typo in a *value* is loud (a malformed file, an unknown `profile` and a
-non-existent `channel` all exit 1), and no silent case can leave the compiler
-unpinned: the `channel` rustup actually resolves is the one the assertion step in
-`ci.yml` checks. And the file must keep the standard `[toolchain]` section form:
+Typo behaviour, measured on rustup 1.29.1. A **misspelled component** is loud
+where it matters: with a fresh `RUSTUP_HOME` — the state a CI runner starts in —
+`rustup toolchain install --no-self-update` fails with `error: component 'rustfm'
+for target '<host>' is unavailable for download for channel '1.98.1-<host>'`,
+exit 1, installing nothing; only when that toolchain is **already installed**
+does it degrade to `warn: skipping unavailable component rustfm` with exit 0, so
+a local typo of that kind can pass unnoticed. An **unknown key** in the
+`[toolchain]` table (for example `profilee = "minimal"`, or `component = [...]`
+instead of `components`) is ignored with no warning at all and exits 0 in both
+cases, so **that** typo rests on review. A typo in a *value* is always loud (a
+malformed file, an unknown `profile` and a non-existent `channel` all exit 1),
+and no silent case can leave the compiler unpinned: the `channel` rustup actually
+resolves is the one the assertion step in `ci.yml` checks. And the file must keep
+the standard `[toolchain]` section form:
 rustup also honours an inline table (`toolchain = { channel = "..." }`) and a
 dotted key (`toolchain.channel = "..."`), but the `repo-health.sh` gate parses
 the section form only and **fails closed** on those two spellings rather than

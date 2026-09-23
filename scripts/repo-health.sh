@@ -354,7 +354,17 @@ fi
 #   * the flow form `- {uses: ...@v1, with: {toolchain: stable}}`, whose opening
 #     line is scanned as well as its continuation lines.
 # The block's base is the indentation of the enclosing `-` list item, not of the
-# `uses:` line, so all of those keep their continuation lines in scope.
+# `uses:` line, so all of those keep their continuation lines in scope. Only a
+# `-` at that base (or outside any item) starts a new item: a deeper `-` is item
+# content, so a block scalar such as
+# `rustflags: |` / `  -D warnings` before `toolchain: stable` keeps the key in
+# scope instead of silently closing the block.
+#
+# Arming the block requires the action in a YAML key position — the start of the
+# line's mapping (optional indent, optional `- `, optional quote) or immediately
+# after `{`/`,` in a flow mapping — and never on a comment line, which is skipped
+# before the arming test. A step `name:`, a `run:` value or a comment that merely
+# mentions the action URL therefore does not arm it.
 #
 # Inside the step the key is matched however it is spelled — block mapping
 # (`toolchain: stable`), flow mapping (`with: {toolchain: stable}` or
@@ -374,16 +384,20 @@ fi
 #     would be skipped as if commented out;
 #   * a YAML anchor/alias — `x-tc: &tc {toolchain: stable}` at the top level and
 #     `with: *tc` on the step;
-#   * a `toolchain:` key consumed by a *different* action.
+#   * a `toolchain:` key consumed by a *different* action;
+#   * a line that reads like a mapping key inside a block scalar of this step —
+#     measured: a `run: |` body line `uses: actions-rust-lang/setup-rust-toolchain@v1`
+#     arms the block, and a later `toolchain: stable` then fails a workflow that
+#     never uses the action in a real key position (fail-closed).
 tc_input=$(awk '
   BEGIN { item_indent = -1; in_item = 0; target = 0 }
   {
     line = $0
     match(line, /^[[:space:]]*/); ind = RLENGTH
-    if (substr(line, ind + 1, 1) == "-") {
+    if (substr(line, ind + 1, 1) == "-" && (!in_item || ind <= item_indent)) {
       item_indent = ind; in_item = 1; target = 0
       rest = substr(line, ind + 2)
-      if (rest ~ /(^|[{,[:space:]])[uU][sS][eE][sS][[:space:]]*:[[:space:]]*["'"'"']?actions-rust-lang\/setup-rust-toolchain@/) {
+      if (rest ~ /(^|[{,])[[:space:]]*["'"'"']?[uU][sS][eE][sS]["'"'"']?[[:space:]]*:[[:space:]]*["'"'"']?actions-rust-lang\/setup-rust-toolchain@/) {
         target = 1
         if (match(rest, /(^|[{,[:space:]])["'"'"']?[tT][oO][oO][lL][cC][hH][aA][iI][nN]["'"'"']?[[:space:]]*:/)) {
           if (index(substr(rest, 1, RSTART - 1), "#") == 0) print FILENAME ":" FNR ":" line
@@ -394,11 +408,12 @@ tc_input=$(awk '
     if (!in_item) next
     if (line ~ /^[[:space:]]*$/) next
     if (ind <= item_indent) { in_item = 0; target = 0; next }
+    if (line ~ /^[[:space:]]*#/) next
     if (!target) {
-      if (line ~ /(^|[{,[:space:]])[uU][sS][eE][sS][[:space:]]*:[[:space:]]*["'"'"']?actions-rust-lang\/setup-rust-toolchain@/) target = 1
+      if (line ~ /^[[:space:]]*(-[[:space:]]+)?["'"'"']?[uU][sS][eE][sS]["'"'"']?[[:space:]]*:[[:space:]]*["'"'"']?actions-rust-lang\/setup-rust-toolchain@/ ||
+          line ~ /[{,][[:space:]]*["'"'"']?[uU][sS][eE][sS]["'"'"']?[[:space:]]*:[[:space:]]*["'"'"']?actions-rust-lang\/setup-rust-toolchain@/) target = 1
       else next
     }
-    if (line ~ /^[[:space:]]*#/) next
     if (match(line, /(^|[{,[:space:]])["'"'"']?[tT][oO][oO][lL][cC][hH][aA][iI][nN]["'"'"']?[[:space:]]*:/)) {
       if (index(substr(line, 1, RSTART - 1), "#") == 0) print FILENAME ":" FNR ":" line
     }
