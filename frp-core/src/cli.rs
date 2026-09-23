@@ -1553,8 +1553,12 @@ mod tests {
     fn reload_strict_config_matches_run_mode_semantics() {
         // Go frp v0.71.0: --strict_config is a persistent rootCmd flag
         // (default true), so the reload subcommand inherits run-mode
-        // semantics — absent → true, bare → true, `=false` / ` false` →
-        // false. The old plain switch made the `=false` form a parse error
+        // semantics — absent → true, bare → true, `--strict-config=false` →
+        // false (matches Go pflag). The space-separated
+        // `--strict-config false` → false is an frp-rs extension, NOT Go pflag
+        // semantics (measured: Go keeps strict=true and leaves `false` as an
+        // unused positional argument — see `parse_go_bool`). The old plain
+        // switch made the `=false` form a parse error
         // and the absent default false; the value is sent to the running
         // frpc as `{"strictConfig":...}`, so the parsed value matters.
         // The subcommand word comes first: `reload [--strict-config ...]`.
@@ -1585,8 +1589,11 @@ mod tests {
     fn verify_strict_config_parses_like_run_mode() {
         // Go frp v0.71.0: --strict_config is a persistent rootCmd flag
         // (default true), so the `verify` subcommand inherits run-mode
-        // semantics — absent → true, bare → true, `=false` / ` false` →
-        // false (cmd/frpc/sub/verify.go passes strictConfigMode to
+        // semantics — absent → true, bare → true, `--strict-config=false` →
+        // false (matches Go pflag), while the space-separated
+        // `--strict-config false` → false is an frp-rs extension, NOT Go pflag
+        // semantics (see `parse_go_bool`)
+        // (cmd/frpc/sub/verify.go passes strictConfigMode to
         // config.LoadClientConfig). Round-8 fix 7e.
         let args = parse_frpc_verify(&["verify", "-c", "x.toml"]).unwrap();
         assert_eq!(args.config, "x.toml");
