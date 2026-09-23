@@ -220,6 +220,31 @@ jobs:
         # shortest aborted at the first failing lib target). `--no-fail-fast`
         # keeps every later target running when an unrelated lib test fails.
         run: cargo test -p frp-client --no-default-features --all-targets -j 1 --no-fail-fast
+      - name: Run frpc CLI tests (admin address resolution)
+        # No lane ran a `cargo test` target of the `frpc` package before this
+        # step (`ab-matrix.yml` only *builds* `-p frpc`; the two
+        # `cargo test --workspace … --lib` steps restrict to lib targets, and
+        # `frpc` has no lib). The package's tests were therefore compiled by the
+        # `Lint` lane (`cargo clippy --workspace --all-targets --all-features`,
+        # which satisfies the bin's `required-features = ["full"]`) and executed
+        # by nothing. That mattered: `frpc/src/main.rs`'s inline unit tests
+        # pinned the old `127.0.0.1:7400` fallback that let
+        # `frpc reload`/`status` silently ignore a config that fails to load.
+        # This step executes them (8 unit tests) plus `frpc/tests/admin_cli.rs`
+        # (14 tests), which spawns the `frpc` binary with crafted configs and
+        # uses a `TcpListener` oracle to prove that a load error or a port-less
+        # `[webServer]` contacts nothing. It belongs to the unit lane: the tests
+        # need no `frps`, and `cargo test` builds the default-feature `frpc` bin
+        # these tests resolve via `CARGO_BIN_EXE_frpc`. `frpc/tests/admin_cli.rs`
+        # is `#![cfg(feature = "full")]`-gated for the no-default-features lanes
+        # (`cargo test -p frpc --no-default-features` compiles it to 0 tests).
+        #
+        # Measured warm, macOS arm64: `cargo test -p frpc` 1.6 s wall (8 unit
+        # tests in 0.00 s + 14 spawn-based tests in ~1.4 s, each waiting out a
+        # 300 ms post-exit oracle window); `--no-default-features` 11.1 s from a
+        # cold no-feature graph, with the integration file compiled to 0 tests.
+        # The runner was not measured.
+        run: cargo test -p frpc
 
   tests-server:
     name: Tests (server integration)

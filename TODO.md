@@ -963,7 +963,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   maintenance story for new proxy types and their aliases), or state the exemption and its
   rationale in the strict-mode prose in `docs/deployment.md`, so a user knows a proxy-block
   typo will not be caught. No sha.
-- [ ] **`frpc reload` / `frpc status` silently ignore a config that fails to load, and talk to
+- [x] **`frpc reload` / `frpc status` silently ignore a config that fails to load, and talk to
   `127.0.0.1:7400` instead.** `resolve_admin_connection` (`frpc/src/main.rs:29`) loads the
   config with `load_client_config(path, true)` at `:46` and, on **any** error, falls through to
   the `127.0.0.1:7400` default at `:54-59` with the error discarded (the `if let Ok(cfg)` drops
@@ -984,7 +984,127 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   has started — exactly the situation `frpc reload` is used in.
   **Done-when:** propagate the load error (Go's exit 1 plus the parse message) instead of
   falling back, or warn and fall back only when the config genuinely has no `[web_server]`
-  section, with both cases pinned. No sha.
+  section, with both cases pinned.
+  Done (branch `fix/frpc-cli-config-error`, based on `main` @ `9c1b291`): the first branch of the
+  done-when. `resolve_admin_connection` (`frpc/src/main.rs`) now returns
+  `Result<AdminConnection, AdminResolveError>` and **always** loads and validates the config when
+  `-c` is given, so a load error is propagated instead of dropped. Both refusals go to **stdout**
+  via `println!` and exit **1**, matching Go's `fmt.Println` / `os.Exit(1)`
+  (`cmd/frpc/sub/admin.go:56-71`, tag `v0.71.0`, refetched during this work):
+  `if err != nil { fmt.Println(err); os.Exit(1) }`, then
+  `if cfg.WebServer.Port <= 0 { fmt.Println("web server port should be set if you want to use
+  this feature"); os.Exit(1) }`. `--strict-config` / `--strict_config` was added to `StatusArgs`
+  and is passed to the load (Go inherits it as a persistent rootCmd flag; before, frp-rs answered
+  `Error: --strict-config is not expected in this context`). The frp-rs-only
+  `--admin-addr` / `--admin-port` / `--admin-user` / `--admin-pwd` flags carry no `.help()` text
+  and appear in no live doc (`--admin-addr` nowhere; `--admin-port` only in the archived
+  `docs/archive/specs/2026-07-12-error-messages-cli-polish-design.md`); they now override the
+  address **after** a successful load, so `reload --admin-addr X --admin-port Y -c bad.toml`
+  reports the config error instead of silently using the flags. That is the deliberate behaviour
+  change of this item. The pre-existing rule that the override needs **both** flags is unchanged,
+  and an explicit `--admin-port 0` is refused with Go's web-server message rather than treated as
+  "not supplied" (falling back to the config port would silently ignore an explicit flag, and
+  `connect 127.0.0.1:0` is never valid). The pre-existing connection-error stream and message
+  (`reload failed: …` / `status query failed: …` on **stderr**; Go's equivalent is a
+  `Get "http://…"` error on **stdout**) is also unchanged — a separate divergence, recorded here
+  rather than fixed.
+
+  Measured before → after, frp-rs `target/debug/frpc` built with `cargo build -p frpc`; every row
+  re-measured against Go v0.71.0 `/private/tmp/frp_0.71.0_darwin_arm64/frpc` (all reproduced, all
+  stdout + exit 1 on the Go side, no exceptions found):
+
+  | case | frp-rs before | frp-rs after |
+  |---|---|---|
+  | `reload -c badcli.toml` (unknown key) | stderr `reload failed: connect 127.0.0.1:7400: Connection refused (os error 61)`, exit 1 | stdout `unknown field "notAKnownFrpKey" in config file …`, exit 1 |
+  | `status -c badcli.toml` | stderr `status query failed: connect 127.0.0.1:7400: …`, exit 1 | same stdout parse error, exit 1 |
+  | `reload -c noweb.toml` (no `[webServer]`) | stderr `reload failed: connect 127.0.0.1:0: Can't assign requested address (os error 49)`, exit 1 | stdout `web server port should be set if you want to use this feature`, exit 1 |
+  | `reload -c goodcli.toml` (`port = 7499`) | stderr `connect 127.0.0.1:7499: …` | unchanged (`127.0.0.1:7499` still the address) |
+  | `reload -c nope.toml` (missing) | silently `127.0.0.1:7400` | stdout `/tmp/probe/nope.toml: failed to read config file: No such file or directory (os error 2)`, exit 1 |
+  | `reload --admin-addr 127.0.0.1 --admin-port 7499 -c badcli.toml` | used `127.0.0.1:7499`, config error swallowed | stdout parse error, exit 1, nothing contacted |
+  | `status --strict-config=false -c badcli.toml` | `Error: --strict-config is not expected in this context`, exit 1 | flag accepted; with a real port the unknown key is tolerated and the port is dialed |
+
+  Go's parse message wording differs (`json: unknown field "notAKnownFrpKey"` vs frp-rs's
+  `unknown field "notAKnownFrpKey" in config file <path>`), and so does the missing-file wording —
+  the config-layer error text, not the CLI's; the stream and exit code now match. Two divergences
+  are **left in place** and recorded, not fixed: with no `-c` at all Go defaults to `./frpc.ini`
+  and exits 1 (`open ./frpc.ini: no such file or directory`, measured) while frp-rs keeps `-c`
+  optional and still uses `127.0.0.1:7400`; and the daemon start path uses `EXIT_CONFIG = 2` where
+  Go exits 1 (now its own item below).
+
+  Pinned by `frpc/tests/admin_cli.rs` (14 tests; `#![cfg(feature = "full")]`-gated because the
+  `frpc` bin has `required-features = ["full"]`, so `cargo test -p frpc --no-default-features`
+  compiles it to 0 tests) plus 8 unit tests in `frpc/src/main.rs` (the four fallback assertions
+  rewritten, two added). Refusal cases bind a `TcpListener` on an ephemeral port, put it in
+  `webServer.port`, and assert **0** connections arrived after the child exits; the
+  `--strict-config=false` cases assert the connection **does** arrive (count 1). Falsified to prove
+  the oracle is live: with the port-0 guard disabled (`if false && port == 0`) and the load made
+  lenient (`load_client_config(path, false)`), 6 of the 14 tests fail — 4 by hanging on a real
+  connection the oracle was holding, 2 on the message assertion. CI:
+  `Run frpc CLI tests (admin address resolution)` / `cargo test -p frpc` in the `Tests (unit)`
+  lane (`.github/workflows/ci.yml`) — no lane ran `-p frpc` before, so this also executes the unit
+  tests that previously never ran. `cargo test -p frpc` 22 passed / 0 failed (8 unit + 14
+  integration; 1.6-2.7 s wall warm on three runs);
+  `--no-default-features` compiles clean with the gate. Docs: a paragraph in
+  `docs/deployment.md` § client admin states the load-then-refuse behaviour, the required
+  `web_server.port`, and that the `--admin-*` flags are an frp-rs extension applied after a
+  successful load. Committed on branch `fix/frpc-cli-config-error` (no PR).
+- [ ] **`scripts/repo-health.sh`'s path-reference scanner walks gitignored directories, so the
+  local mirror of the `health` job fails whenever any worktree exists.** The scanner walks the
+  tree with `os.walk('.')` from the repo root and prunes only `.git` and `target`
+  (`scripts/repo-health.sh:692-693`), so it descends into `.worktrees/` and `.superpowers/` —
+  both gitignored (`.gitignore:17`, `:20`) and absent from a clean checkout. Measured in the
+  main tree `/Users/cdf/Codes/frp-rs` (rule 1 makes worktrees mandatory) with the tree's own
+  script: `bash scripts/repo-health.sh` → exit **1**, `FAIL 4139 path reference(s) do not
+  resolve from the referencing file`, `RESULT: FAILURES above — fix before release`; the 4139
+  are 4135 under `.worktrees/*` (20 nested worktrees, 204-220 each) and 4 under
+  `.superpowers/sdd/*`. (The figure tracks how many worktrees exist — the coordinator measured
+  3919 = 3915 + 4 on an earlier tree state.) Two root causes compound: (a) nested worktrees are
+  scanned at all; (b) the exclusions are root-anchored — `p in SKIP_FILES` and
+  `p.startswith(SKIP_DIRS)` (`:598-599`, `:699`) — so a nested
+  `.worktrees/<x>/TODO.md`, `CHANGELOG.md` or `docs/archive/…` is **not** skipped even though
+  the root copy is a deliberate point-in-time exclusion, and those files are exactly where the
+  intentional absent paths live. The `health` CI job (clean checkout) and an isolated worktree
+  with no nested `.worktrees/` both pass with `RESULT: invariants hold` — so a local gate that
+  is red only because the mandated workflow is in use is a false positive, and it trains authors
+  to ignore the script (the same trap the archive/SKIP list was added to avoid).
+  **Done-when:** drive the scan from `git ls-files` (keeping the existing `find` fallback for a
+  `.git`-less tree) or prune gitignored paths before walking, falsified by both cases: with a
+  nested worktree under `.worktrees/` and a `.superpowers/sdd/` file present, the script exits 0
+  and reports the same path counts as the clean checkout; and a genuinely stale backticked path
+  added to a tracked file still exits 1. No sha.
+- [ ] **`frpc` has no `stop` subcommand and no `--api-timeout`, so its admin-command surface is
+  short of Go v0.71.0.** Go's `cmd/frpc/sub/admin.go:34-50` (tag `v0.71.0`, fetched during this
+  work) registers **three** commands — `reload`, `status`, **`stop`** — and gives each
+  `cmd.Flags().DurationVar(&adminAPITimeout, "api-timeout", adminAPITimeout, "Timeout for admin
+  API calls")` with a 30 s default; `frpc reload --help` on the Go binary prints exactly
+  `--api-timeout duration … (default 30s)` and no `--admin-addr`-style flags. frp-rs's CLI
+  exposes only `reload` and `status` (`frp-core/src/cli.rs`) and neither accepts `--api-timeout`.
+  The server side is already there: `POST /api/stop` is routed (`frp-client/src/admin.rs:882`,
+  handler `:548`) and listed in the `docs/deployment.md` client-endpoints table, so only the CLI
+  wrapper is missing; `--api-timeout` has no frp-rs equivalent at all. (Found while fixing
+  `frpc reload`/`status`; deliberately not implemented there.)
+  **Done-when:** add `stop` (POST `/api/stop`, print `stop success` on 200 as Go's `StopHandler`
+  does) and `--api-timeout` (default 30 s, applied to the admin HTTP call) to `frpc`, each
+  pinned by a CLI test in the style of `frpc/tests/admin_cli.rs`; or record in the feature-surface
+  policy why frp-rs deliberately exposes two of Go's three admin commands. No sha.
+- [ ] **The `frpc` daemon start path exits 2 where Go exits 1 on the same bad config, and prints a
+  tracing line instead of Go's bare parse error.** Measured with identical config text (a valid
+  config plus one unknown top-level key), both on **stdout**:
+  * Go v0.71.0 `frpc -c badcli.toml` → `json: unknown field "notAKnownFrpKey"`, exit **1**.
+  * frp-rs `target/debug/frpc -c badcli.toml` → an ANSI-coloured tracing line
+    `ERROR frpc: Failed to load config: unknown field "notAKnownFrpKey" in config file …`,
+    exit **2** (`EXIT_CONFIG`, `frp-core/src/lib.rs:193` — "bad config file, unknown field,
+    invalid value", part of frp-rs's 1-4 CLI exit scheme, which no live doc states: the only
+    prose is that constant's comment and two archived plans).
+  The gap is inside frp-rs, not only against Go: after this branch's `frpc reload`/`status`
+  change the two frpc CLI paths disagree — the admin subcommands now exit **1** for a load
+  error, exactly as Go does, while the daemon path exits 2. Pre-existing; deliberately not
+  changed in that branch.
+  **Done-when:** either match Go's exit 1 on the daemon CLI path while keeping the richer
+  per-class scheme for whatever it is documented to distinguish, or state in a live doc
+  (`docs/developing.md` or `CLAUDE.md`) that `2` is a deliberate frp-rs extension and why —
+  with the exit code pinned by a test on both paths (`frpc -c bad.toml` and the admin
+  subcommands) so the next change cannot silently re-diverge them. No sha.
 
 ---
 
@@ -1550,6 +1670,30 @@ nothing about whether the described behaviour still holds.
   ENOENT path) still fails the test loudly. The compat-scenario flakes
   (zero-throughput `tcp-tls`/`tcp-tls-mux`, unreachable `ws-plain`,
   `go-to-rust-quic` timeout) are **not** touched and this item stays open.
+
+  **Recurrence (2026-09-23 — two more instances, both re-verified from the CI logs, on trees
+  that passed the same lanes on other runs):**
+  * `5bf5270`'s Cross-Compat run
+    [35833904525](https://github.com/viogus/frp-rs/actions/runs/35833904525) (attempt 1,
+    `pull_request`) failed in the **Protocol connectivity matrix** step while the compat-tests
+    step in the *same job* printed `RESULTS: 86 passed, 0 failed`. The matrix log reads
+    `[matrix] retry 1/3 tcp-plain: zero throughput (mbps=0.0)`, `retry 2/3 … (mbps=0)`,
+    `retry 3/3 … (mbps=0)`, `[matrix] FAIL tcp-plain: zero throughput (mbps=0)`, then
+    `[matrix] FAIL tcp-tls: proxy port not reachable`, ending
+    `=== protocol matrix: 9 passed, 2 failed ===`, exit 1. The same job therefore both
+    certified the data plane (86 scenarios) and failed to move bytes in the matrix — the two
+    halves are different suites and must not be pooled either way.
+  * The post-merge push run on `9c1b291`,
+    [35840916594](https://github.com/viogus/frp-rs/actions/runs/35840916594), failed in the
+    compat-tests step on **attempt 1** with `go-to-rust-wss-plain: proxy port 23802 not
+    reachable`, `RESULTS: 85 passed, 1 failed`, exit 1. The scenario logged its
+    `=== go-to-rust-wss-plain ===` banner at 09:13:21.735 and the failure at 09:13:38.088 —
+    **16.35 s**, consistent with the scenario burning its whole wait window — while
+    `go-to-rust-wss-encrypted` and `go-to-rust-wss-mux` passed immediately after it. The
+    run-level conclusion is `success` only because the job was re-run (attempt 2); the failed
+    attempt is the evidence, and `gh run view --attempt 1 --log-failed` is how it was read.
+  Both instances are the item's shape — a scenario failing on a tree that passed the same lane
+  elsewhere — and neither can be explained by a data-plane diff.
 
 - [x] **`Tests (server integration)` fails intermittently, and it turns `main` red.**
   Evidence: on 2026-09-17 the CI run for the merge commit `d9ca98b` failed on

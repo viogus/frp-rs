@@ -553,6 +553,11 @@ pub struct ReloadArgs {
 #[derive(Debug, Clone)]
 pub struct StatusArgs {
     pub config: Option<String>,
+    /// Go frp v0.71.0: `--strict-config` is a persistent rootCmd flag
+    /// (cmd/frpc/sub/root.go), so `frpc status` accepts it too — and
+    /// `NewAdminCommand` passes it to `config.LoadClientConfig`
+    /// (cmd/frpc/sub/admin.go:57). Absent → true.
+    pub strict_config: bool,
     pub json: bool,
     pub admin_addr: Option<String>,
     pub admin_port: Option<u16>,
@@ -1064,6 +1069,18 @@ fn status_cmd() -> impl Parser<FrpcCmd> {
         .short('c')
         .argument::<String>("FILE")
         .optional();
+    // Go frp v0.71.0: `--strict-config` is a *persistent* rootCmd flag
+    // (default true) inherited by every subcommand, `status` included — probe:
+    // `frpc status --strict-config=false -c bad.toml` is accepted and tolerates
+    // unknown fields. Same pflag bool semantics as reload/run: bare
+    // `--strict-config` → true, `--strict-config=false` / `--strict-config
+    // false` → false, absent → true.
+    let strict_value = long("strict-config")
+        .long("strict_config")
+        .argument::<String>("BOOL")
+        .parse(parse_go_bool);
+    let strict_switch = long("strict-config").long("strict_config").flag(true, true);
+    let strict_config = construct!([strict_value, strict_switch]);
     let json = long("json").switch();
     let admin_addr = long("admin-addr")
         .long("admin_addr")
@@ -1083,6 +1100,7 @@ fn status_cmd() -> impl Parser<FrpcCmd> {
         .optional();
     let args = construct!(StatusArgs {
         config,
+        strict_config,
         json,
         admin_addr,
         admin_port,
