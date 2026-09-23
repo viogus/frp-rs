@@ -894,17 +894,30 @@ frp-core/src/v2_handshake.rs), then the repo root. A `crate/feature` span such
 as `frp-core/tls` is recognised as Cargo feature syntax, not a path.
 
 The path scan is **tracked-files-only**: its file list comes from the git index
-(`git ls-files -z`), i.e. exactly the tree a clean checkout contains. Untracked
-and gitignored local state — `.worktrees/`, `.superpowers/`, a nested worktree's
+(`git ls-files -z`), i.e. the set a clean checkout tracks. Untracked and
+gitignored local state — `.worktrees/`, `.superpowers/`, a nested worktree's
 point-in-time backlog and archive prose, editor backups — is therefore never
 scanned, so the local mirror does not fail merely because the mandated worktree
 workflow is in use. The index supplies the file *list* while content is read
 from the worktree, so a tracked file edited locally is gated at its current
-content. A `.git`-less tree (release tarball, Docker build context) has no index
-and falls back to walking the filesystem, pruning only `.git` and `target`.
-Because the scan follows the index, an *untracked* local file that names a dead
-path is not gated — deliberate, since CI runs on a clean checkout where untracked
-is absent, so the gate's CI meaning is unchanged.
+content. Local index state is visible too, so the list is not *exactly* a clean
+checkout's file set: an intent-to-add (`git add -N`) entry is scanned, and an
+unmerged path is listed once per stage and collapsed by path. Submodule contents
+are never scanned — the index lists only the gitlink, and CI does not initialise
+submodules. Because the scan follows the index, an *untracked* local file that
+names a dead path is not gated — deliberate, since CI runs on a clean checkout
+where untracked is absent, so the gate's CI meaning is unchanged.
+
+Only a tree with no `.git` at all (release tarball, Docker build context) falls
+back to walking the filesystem, pruning `.git` and `target` at any depth. A tree
+that has `.git` but whose index cannot be read is **not** certified: the gate
+exits 3 rather than silently walking, because a walk would scan the gitignored
+state this gate exists to avoid. A partial or sparse checkout is likewise not
+certified — a tracked path with no file in the worktree is a read error, not a
+skip — and the scan's minimum-size floors apply to the walk path as well. Hit
+lines are path-sorted (the index is sorted and the hits are sorted before
+printing) rather than in filesystem readdir order; the counts and the hit set are
+unaffected.
 
 This is deliberately **not** "every repo path named resolves": un-backticked
 prose and tree diagrams are not scanned, spans with no locating root (`mux.rs`,

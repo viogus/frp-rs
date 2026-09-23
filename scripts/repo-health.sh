@@ -574,18 +574,27 @@ PY
   # still open. Coverage is deliberately narrow, and the docs claim exactly this
   # much, no more:
   #   * the scan is TRACKED-FILES-ONLY: the file list comes from the git index
-  #     (`git ls-files -z`), i.e. exactly the tree a clean checkout has. Untracked
-  #     and gitignored local state — `.worktrees/`, `.superpowers/`, a nested
-  #     worktree's point-in-time `TODO.md` / `docs/archive/…`, editor backups — is
-  #     never scanned, so this local mirror agrees with the `health` CI job
-  #     instead of failing whenever the mandated worktree workflow is in use. The
-  #     index supplies the file *list*; content is read from the worktree, so a
-  #     tracked file edited locally is gated at its current content. Consequence:
-  #     an *untracked* file naming a dead path is no longer gated — deliberate,
-  #     because CI runs on a clean checkout where untracked == absent, so the
-  #     gate's CI meaning is unchanged. A `.git`-less tree (release tarball,
-  #     Docker context) has no index and falls back to the old filesystem walk,
-  #     which prunes only `.git` and `target`;
+  #     (`git ls-files -z`), i.e. the set a clean checkout tracks — not *exactly*
+  #     what a clean checkout contains, because local index state is visible too:
+  #     an intent-to-add (`git add -N`) entry is scanned, an unstaged deletion is
+  #     a read error, and an unmerged path (listed once per stage) is collapsed by
+  #     path. Untracked and gitignored local state — `.worktrees/`,
+  #     `.superpowers/`, a nested worktree's point-in-time `TODO.md` /
+  #     `docs/archive/…`, editor backups — is never scanned, so this local mirror
+  #     agrees with the `health` CI job instead of failing whenever the mandated
+  #     worktree workflow is in use. The index supplies the file *list*; content
+  #     is read from the worktree, so a tracked file edited locally is gated at
+  #     its current content. Consequence: an *untracked* file naming a dead path
+  #     is no longer gated — deliberate, because CI runs on a clean checkout where
+  #     untracked == absent, so the gate's CI meaning is unchanged. Submodule
+  #     *contents* are not scanned either: the index lists only the gitlink (and
+  #     CI does not initialise submodules);
+  #   * the filesystem walk is used ONLY when `.git` is genuinely absent (release
+  #     tarball, Docker build context). If `.git` exists but the index cannot be
+  #     read, the gate FAILS (exit 3) instead of silently walking — a walk would
+  #     scan the gitignored state this gate exists to avoid. So a partial/sparse
+  #     checkout is not certified: a tracked path with no file in the worktree is
+  #     a read error, not a skip;
   #   * only backtick spans are claims; un-backticked prose and tree diagrams are
   #     not scanned. A broad prose sweep was tried and produced hundreds of
   #     misses that were almost all false positives (`frp-core/tls` is a Cargo
@@ -598,8 +607,12 @@ PY
   # crate-relative `src/v2_handshake.rs` in frp-core/tests/ resolve), then the
   # repo root.
   # The scan is fail-closed: an unreadable directory, a tracked-but-unreadable
-  # file, and a file list or span total that comes back empty/implausibly small
-  # all exit 3 rather than print "ok 0".
+  # file, a `.git` tree whose index cannot be read, and a file list or span total
+  # that comes back empty/implausibly small all exit 3 rather than print "ok 0".
+  # The size floors (MIN_FILES/MIN_SPANS) apply to the walk source too, so a
+  # partial tarball is not certified either.
+  # Hit order is path-sorted (the index is sorted; hits are sorted before print)
+  # rather than the old readdir order; the counts and the hit set are unchanged.
   # Point-in-time documents (history, dated audits, changelog, the refactor
   # proposal, and the backlog that quotes removed paths as evidence) describe an
   # older tree on purpose and are out of scope; the archive has check (b).
@@ -621,9 +634,16 @@ BANNED = ' \t{}*<>|'
 # cwd, a git that exits 0 with no output), it must FAIL rather than certify
 # "no stale refs". The real tree has hundreds of scannable files and thousands
 # of backtick spans, so these floors are far below any real checkout and only
-# catch a truncated list.
+# catch a truncated list. They apply to the walk source as well, so a partial
+# tarball / Docker context is not certified either.
 MIN_FILES = 50
 MIN_SPANS = 100
+
+# Directories the historical walk pruned at any depth. The index does not prune
+# them for us, so `wanted()` applies the same rule to keep the two sources in
+# agreement (no tracked `.md`/`.rs` lives under `target/`, but verdict parity is
+# what makes this change safe to reason about).
+PRUNE_DIRS = ('.git', 'target')
 
 def cargo_features(crate):
     path = os.path.join(crate, 'Cargo.toml')
@@ -717,9 +737,13 @@ def walk_error(e):
 
 def wanted(p):
     """Inclusion rules, unchanged from the historical walk: markdown and Rust
-    source only, minus the point-in-time and vendored exclusions. `p` is always
-    root-relative, so the SKIP_DIRS/SKIP_FILES patterns stay root-anchored and
-    mean the same thing in the index and in the walk fallback."""
+    source only, minus the point-in-time and vendored exclusions, minus any path
+    whose *directory* chain holds one of PRUNE_DIRS (the walk pruned those
+    directories at any depth; the index does not, so the same rule is applied
+    here and the two sources keep identical verdicts). `p` is always
+    root-relative, so the SKIP_DIRS/SKIP_FILES patterns stay root-anchored."""
+    if any(part in PRUNE_DIRS for part in p.split('/')[:-1]):
+        return None
     if p.endswith('.md'):
         if p.startswith(SKIP_DIRS) or p in SKIP_FILES:
             return None
@@ -733,22 +757,33 @@ def wanted(p):
     return None
 
 
+class IndexUnavailable(Exception):
+    """`.git` exists but the index could not be listed."""
+
+
 def tracked_files():
-    """Root-relative paths from the git index, or None when there is no index to
-    read (`.git`-less tarball / Docker context, or git missing): the caller then
-    walks the filesystem instead. `-z`/NUL splitting keeps paths containing
-    spaces, newlines and non-ASCII bytes intact; surrogateescape means a path
-    that is not valid UTF-8 is still reported rather than dropped."""
+    """Root-relative paths from the git index, or None when there is genuinely no
+    index to read (`.git` absent: release tarball / Docker build context). Only
+    that case may fall back to the filesystem walk; if `.git` is present but the
+    index cannot be read, raise IndexUnavailable so the caller fails the gate —
+    a silent walk would scan the gitignored state this gate exists to avoid.
+    Duplicate entries are collapsed by path (an unmerged path is listed once per
+    stage). `-z`/NUL splitting keeps paths containing spaces, newlines and
+    non-ASCII bytes intact; surrogateescape means a path that is not valid UTF-8
+    is still reported rather than dropped."""
     if not os.path.exists('.git'):
         return None
     try:
         r = subprocess.run(['git', 'ls-files', '-z', '--full-name', '--cached'],
-                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    except OSError:
-        return None
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as e:
+        raise IndexUnavailable('git could not be run: %s' % e)
     if r.returncode != 0:
-        return None
-    return [b.decode('utf8', 'surrogateescape') for b in r.stdout.split(b'\0') if b]
+        detail = r.stderr.decode('utf8', 'replace').strip().splitlines()
+        raise IndexUnavailable('git ls-files exited %d%s'
+                               % (r.returncode, (': ' + detail[0]) if detail else ''))
+    paths = [b.decode('utf8', 'surrogateescape') for b in r.stdout.split(b'\0') if b]
+    return list(dict.fromkeys(paths))    # unmerged paths appear once per stage
 
 
 def walk_files():
@@ -785,11 +820,19 @@ def scan(entries):
     return n_files
 
 
-index = tracked_files()
-source = 'git ls-files'
-candidates = index if index is not None else walk_files()
+try:
+    index = tracked_files()
+except IndexUnavailable as e:
+    print('scan error: .git is present but the file list could not be read from '
+          'the index (%s) — refusing to fall back to a filesystem walk that '
+          'would scan gitignored state; refs not certified' % e)
+    sys.exit(3)
 if index is None:
-    source = 'filesystem walk (no git index)'
+    candidates = walk_files()
+    source = 'filesystem walk (no .git in this tree)'
+else:
+    candidates = index
+    source = 'git ls-files'
 entries = []
 for p in candidates:
     kind = wanted(p)
@@ -819,6 +862,7 @@ if n_files < MIN_FILES or n_spans < MIN_SPANS:
           'floor %d/%d) — refs not certified'
           % (source, n_files, n_spans, MIN_FILES, MIN_SPANS))
     sys.exit(3)
+hits.sort()       # deterministic: index order is path-sorted, readdir order is not
 print('%d %d %d %d %d %d' % (counts['ok'], counts['stale'], counts['feature'],
                              counts['shorthand'], counts['bare'], counts['superpowers']))
 for h in hits:
