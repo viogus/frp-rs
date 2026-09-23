@@ -670,15 +670,21 @@ the subcommand (`frpc --api-timeout 1s stop …`, measured), while frp-rs requir
 the subcommand word first — the pre-existing rule for every subcommand flag,
 unchanged here.
 
-Three cosmetic differences remain in this flag's surface. A rejected value is
-reported as bpaf's `Error: couldn't parse <value>: time: …`, where Go wraps the
-same inner text in `invalid argument "<value>" for "--api-timeout" flag` — the
-inner `time: …` wording matches Go verbatim and the outer shape is bpaf's,
-pre-existing across this CLI. `frpc stop --help` renders the flag as
-`--api-timeout=DURATION` and omits Go's `(default 30s)`, because bpaf prints no
-fallback default. And a negative value collapses to `Duration::ZERO`, so
-`--api-timeout=-1s` reports `admin request timed out after 0ns` where Go reports
-`context deadline exceeded`.
+Four reject-path and help-text differences remain in this flag's surface, none
+of them in the accepted-value grammar or in the call itself. (1) A rejected value
+is reported as bpaf's `Error: couldn't parse <value>: time: …`, where Go wraps
+the same inner text in `invalid argument "<value>" for "--api-timeout" flag` —
+for ASCII inputs the inner `time: …` wording matches Go verbatim, and the outer
+shape is bpaf's, pre-existing across this CLI. (2) For a non-ASCII unit the inner
+text does not match: `--api-timeout=1µ` gives Go
+`time: unknown unit "\xc2\xb5" in duration "1\xc2\xb5"` and frp-rs
+`time: unknown unit "µ" in duration "1µ"` — Go hex-escapes the unit and the
+original, frp-rs prints them raw (measured on both binaries; `1d` matches
+verbatim, so the inner identity is ASCII-only). (3) `frpc stop --help` renders
+the flag as `--api-timeout=DURATION` and omits Go's `(default 30s)`, because bpaf
+prints no fallback default. (4) A negative value collapses to `Duration::ZERO`,
+so `--api-timeout=-1s` reports `admin request timed out after 0ns` where Go
+reports `context deadline exceeded`.
 
 `GET /api/reload` needs no body and no `Content-Type` — the Go-compatible call
 `curl -u user:pass http://127.0.0.1:7400/api/reload` reloads in non-strict mode.

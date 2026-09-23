@@ -1240,10 +1240,17 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   spelling), exit 1. A raw-socket capture of the Go `frpc stop` request shows
   `POST /api/stop HTTP/1.1`, `Content-Length: 0`, no body bytes; the frp-rs request matches on
   method, path, `Content-Length: 0` and an empty body (asserted by the mock in
-  `frpc/tests/admin_cli.rs`), while the other headers differ. The one measured input where frp-rs
-  is *stricter* is `9223372036854775808ns9223372036854775808ns`: Go's `uint64` total wraps to 0
-  and it accepts the value as 0 ns, frp-rs rejects it with `time: invalid duration` (checked
-  arithmetic, never a panic) — pinned in `frp-core/src/cli.rs`. **The brief this work came from
+  `frpc/tests/admin_cli.rs`), while the other headers differ. The class where frp-rs is *stricter*
+  is group sums whose `uint64` total passes 2^64, which Go wraps: re-measured on both binaries,
+  `9223372036854775808ns9223372036854775808ns`, `9223372036854775808ns` ×4 and
+  `9223372036854775.808us9223372036854775.808us` are all accepted by Go (wrapped total 0 ns →
+  `context deadline exceeded`) and rejected by frp-rs with `time: invalid duration` (checked
+  arithmetic, never a panic); the two-group case is pinned in `frp-core/src/cli.rs`. This is not a
+  single input — the round-2 review's differential over 19,612 candidates measured 1,564
+  divergences, all Go-accepts/frp-rs-rejects and 0 panics. On reject-path wording frp-rs matches Go
+  only for ASCII: `1d` gives the same inner `time: unknown unit "d" in duration "1d"` on both, while
+  `1µ` has Go print `unknown unit "\xc2\xb5"` and frp-rs print `unknown unit "µ"` (measured).
+  **The brief this work came from
   claimed Go does not accept the underscore spelling; that is wrong** —
   `frpc stop --api_timeout=abc` errors on `--api-timeout`, so the alias reaches the registered
   flag: `Execute()` installs `config.WordSepNormalizeFunc` globally
