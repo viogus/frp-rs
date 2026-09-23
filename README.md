@@ -354,7 +354,9 @@ bash scripts/compat-test.sh            # Go↔Rust cross-compat suite (needs Go 
 
 The full workflow — adding a proxy type, feature flags, debugging with `RUST_LOG`,
 the test tiers, and the release checklist — is in
-[docs/developing.md](docs/developing.md).
+[docs/developing.md](docs/developing.md). The compiler is pinned in
+`rust-toolchain.toml` at the repo root, so local development and CI both lint
+with the same `rustc`/`clippy`.
 
 ---
 

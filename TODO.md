@@ -1250,7 +1250,7 @@ nothing about whether the described behaviour still holds.
   test, now `#[cfg(feature = "tls")]`. Linux is delegated to the edited `verify`
   CI job — macOS cannot run the Linux `#[cfg]` paths here.
 
-- [ ] **The `Lint` gate depends on the unpinned runner toolchain, so it can go red on unchanged code.**
+- [x] **The `Lint` gate depends on the unpinned runner toolchain, so it can go red on unchanged code.**
   Evidence: on `rustc 1.96.0` / `clippy 0.1.96` the documented gate
   `cargo clippy --workspace --all-targets --all-features -- -D warnings` failed
   on unmodified base content:
@@ -1270,6 +1270,114 @@ nothing about whether the described behaviour still holds.
   runner-image race, and the `Lint` gate is verified green on that pinned
   version. A `rust-toolchain.toml` would also make the local/CI lint result
   identical, which is the property the health table currently assumes.
+  Done: pinned by a new `rust-toolchain.toml` at the repo root —
+  `channel = "1.98.1"`, `profile = "minimal"`,
+  `components = ["clippy", "rustfmt"]`. The channel is an **exact version** on
+  purpose (`stable`, `nightly` or a floating `1.98` would track new releases and
+  re-open the hazard); `profile = "minimal"` plus those two components is exactly
+  what the documented gates need (`cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`).
+  1.98.1 is the compiler the gate already used: the last green `Lint` job
+  (`85f6a15`, run `35786004665`, job `106942858348`) ran on ubuntu-24.04 image
+  `20260920.314.1`, whose published readme lists Rust 1.98.1 / Cargo 1.98.1 /
+  Rustup 1.29.1 / Rustfmt 1.9.0 — coordinator-measured from that image's readme,
+  not re-fetched here — so the pin closes the race without moving the result it
+  was racing on.
+  Mechanism: all 7 `- name: Install Rust stable` + `run: rustup default stable`
+  pairs in `.github/workflows/ci.yml` are now
+  ``- name: Install pinned Rust toolchain (`rust-toolchain.toml`)`` +
+  `run: rustup show` (`rustup show` is measured: in a directory holding such a
+  file it installs the missing toolchain, honours `profile`/`components`, and
+  reports `active because: overridden by '<dir>/rust-toolchain.toml'`), and the
+  `lint` job additionally prints `rustc --version` and `cargo clippy --version`
+  so each result names the compiler that produced it. The
+  `actions-rust-lang/setup-rust-toolchain@v1` steps in `compat.yml`,
+  `release.yml` (×3), `stress-test.yml`, `xtcp-compat.yml` and `ab-matrix.yml`
+  pass no `toolchain:` input, so per that action's `v1` README they install what
+  the file specifies — cited, not executed: no workflow was run from this host.
+  `ab-matrix.yml` also inherits the pin for the `./base` checkout it builds,
+  because rustup resolves a toolchain file from parent directories (measured),
+  so its before/after delta stays a single-compiler comparison.
+  Gate: `scripts/repo-health.sh` gained a `Toolchain pin` section, printed
+  between the `Vendored crates` and `Docs` sections, that fails on a missing
+  `rust-toolchain.toml`, on a missing or non-`X.Y.Z` `channel`, and on any
+  non-comment line under `.github/workflows/` selecting a toolchain by
+  `rustup default `. It is pure text/file parsing — no rustup and no installed
+  version — so the toolchain-less `health` CI job can run it. Falsified in both
+  directions: `stable`, `nightly`, `1.98`, `1.98.1.0`, a deleted `channel` key, a
+  deleted file and an injected `run: rustup default stable` each exit 1 with the
+  file and value named; a comment line containing the same literal does **not**
+  fail it, and the tree produced here exits 0.
+  Docs: `CLAUDE.md` (Build / Test / Lint, plus the clippy row of Current Health),
+  `docs/developing.md` § 3 (`### Toolchain pinning`) and one sentence in
+  `README.md`.
+  Verified in the worktree with **no** `+toolchain` argument — i.e. selected by
+  the file: `rustc --version` → `rustc 1.98.1 (48a229cea 2026-09-01)`,
+  `cargo clippy --version` → `clippy 0.1.98`,
+  `rustfmt --version` → `rustfmt 1.9.0-stable`, and `rustup show` reporting
+  `1.98.1-aarch64-apple-darwin` active because overridden by
+  `<worktree>/rust-toolchain.toml`. Gates: `cargo fmt --all -- --check` → exit 0;
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings` →
+  exit 0 (58.33 s, after `cargo clean -p` on the 6 workspace crates forced a real
+  re-check of all of them, 0 warning/error lines);
+  `RUSTFLAGS="-D warnings" cargo check --workspace --no-default-features
+  --features tiny` → exit 0 and the same with `micro` → exit 0;
+  `cargo test --workspace --all-features --lib` → exit 0, 300 (frp-client) +
+  870 (frp-core) + 497 (frp-server) + 40 (frp-vnet) passed / 0 failed;
+  `bash scripts/repo-health.sh` → exit 0. Not measured: the runner-side install
+  cost (the image ships the compiler as `stable-<host>`, not `1.98.1-<host>`, so
+  the first CI run downloads the pinned toolchain) and any actual GitHub Actions
+  behaviour — this host is macOS and no workflow was executed.
+
+- [ ] **The compat lanes install a floating Go toolchain that nothing uses.**
+  Evidence: `.github/workflows/compat.yml:37-39` and
+  `.github/workflows/xtcp-compat.yml:54-57` run `actions/setup-go@v5` with
+  `go-version: '>=1.22.0'`, so which Go actually gets used is a property of the
+  runner image, not of the commit — the same class as the `Lint` item above. In
+  the last green `compat` run (`85f6a15`, run `35786004606`, job `106942857867`)
+  that range resolved to a runner-image-cached toolchain, not to current Go:
+  `Setup go version spec >=1.22.0` → `Found in cache @
+  /opt/hostedtoolcache/go/1.26.8/x64` → `go version go1.26.8 linux/amd64`; the
+  ubuntu-24.04 image `20260920.314` readme lists cached Go 1.24.13 / 1.25.14 /
+  1.26.8. Nothing in the pipeline invokes it: `git ls-files '*.go'` is empty,
+  `git grep -nE '(^|[^a-zA-Z_/.-])go (build|run)' -- scripts/ .github/` finds
+  nothing, and `scripts/download-go-frp.sh:29` fetches the **prebuilt** release
+  tarball (`https://github.com/fatedier/frp/releases/download/v${VERSION}/…`).
+  It is a leftover of a removed path that `CHANGELOG.md:1329-1330` (0.3.1)
+  records — `build_go_frp_v2()` (clone + `go build`, cached to
+  `/tmp/frp-source-build/`) exists nowhere in the tree, yet
+  `.github/workflows/compat.yml:48` still caches that orphaned
+  `/tmp/frp-source-build/` under a step named "Cache cargo + go-frp builds".
+  **Done-when:** either drop the `setup-go` step, the stale
+  `/tmp/frp-source-build/` cache path and the "go-frp builds" wording with the
+  lane still green, or pin the Go version and state what consumes it. Today
+  nothing consumes it, and the `>=` range makes the resolved version a
+  runner-image property.
+
+- [ ] **The Docker source build is outside the toolchain pin and floats its own compiler.**
+  Evidence, read from `docker/Dockerfile.source` — the Docker build was **not**
+  run, so this is a code-read, not a measurement of the image: `:12`
+  `FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS builder`, a floating
+  `rust:1` tag. The build's `COPY` set (`:56-64`, plus `docker/entrypoint.c` at
+  `:81`) is `Cargo.toml`, `Cargo.lock*`, `vendor/` and the six crate dirs
+  (`frp-core`, `frp-server`, `frp-client`, `frp-vnet`, `frps`, `frpc`) —
+  `rust-toolchain.toml` is not copied and there is no `COPY . .`, so the pin never
+  reaches the image build, and `cargo zigbuild` (`:71`) runs on the base image's
+  default toolchain. `.github/workflows/docker.yml` builds that Dockerfile on
+  `pull_request` (`:8-9`) for a 6-component matrix (`:34-41`) and the result is
+  pushed to `ghcr.io` (`env.REGISTRY`), so a shipped artifact is built by a
+  compiler nothing pins. `scripts/repo-health.sh`'s toolchain gate scans
+  `.github/workflows/` only and does not cover this file.
+  Unverified reasoning — a naive fix is not sufficient and the image was not
+  built: `COPY rust-toolchain.toml ./` at `:56` would not be enough, because
+  `:52` `RUN rustup target add $(cat /tmp/rust_target)` installs the musl target
+  into the **base image's** toolchain *before* that COPY, so a pinned toolchain
+  created afterwards would lack that `rust-std`.
+  **Done-when:** either pin the base image tag *and* keep it in sync with
+  `rust-toolchain.toml` **by construction** rather than by hand, or put the
+  toolchain file in the build context and reorder/extend the target setup so the
+  musl target is installed for the pinned toolchain — in both cases with a
+  measured `docker buildx build` for at least one component.
 
 - [ ] **The compat gate is flaky, which weakens the project's strongest claim.**
   Evidence: on 2026-09-17 the `compat` CI job failed **2 of 3 consecutive runs on

@@ -87,6 +87,7 @@ jobs:
           ref: ${{ steps.refs.outputs.before }}
           fetch-depth: 0
 
+      # Toolchain from the repo-root `rust-toolchain.toml` (no `toolchain:` input).
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         if: steps.vps.outputs.available == 'true'
 

@@ -13,10 +13,11 @@
 # Exit code: 0 if the mandatory invariants hold, 1 otherwise. The gates (each of
 # which can set the exit code) are: version alignment, every unsafe block having
 # a `// SAFETY:` justification, every vendored crate having a
-# README-FRP-RS.md, docs-index reachability, backtick repo-path resolution, and
-# the curated doc-figure list. The code-size and binary-size sections are pure
-# reports; the archive-path report is not a content gate but does fail the run
-# if its scan cannot complete.
+# README-FRP-RS.md, the toolchain pin (an exact `rust-toolchain.toml` channel and
+# no floating toolchain selection in CI), docs-index reachability, backtick
+# repo-path resolution, and the curated doc-figure list. The code-size and
+# binary-size sections are pure reports; the archive-path report is not a content
+# gate but does fail the run if its scan cannot complete.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
@@ -241,6 +242,71 @@ for v in vendor/*/; do
 done
 printf '\n  Each vendored crate must document WHY and its EXIT CONDITION.\n'
 printf '  A vendored copy pins the crate: track upstream advisories by hand.\n'
+
+# ---------------------------------------------------------------- toolchain
+hdr "Toolchain pin"
+
+# Gate: the compiler must be pinned to an exact version. Unpinned, the lint gate
+# is a function of the runner image — a new rustc/clippy release can add a lint
+# that fires on untouched code, so the same commit is green on one image and red
+# on the next. `rust-toolchain.toml`'s `channel` is the pin; "stable", "nightly"
+# and a floating "1.98" all track new releases and are failures here.
+TOOLCHAIN_FILE=rust-toolchain.toml
+if [ ! -f "$TOOLCHAIN_FILE" ]; then
+  printf '  FAIL  %s is missing — the toolchain is not pinned\n' "$TOOLCHAIN_FILE"
+  fail=1
+else
+  # First `channel = "..."` assignment. Comments are ignored by requiring the
+  # line to start with optional whitespace + `channel`; nothing in the file
+  # quotes that pattern.
+  tc_channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' \
+    "$TOOLCHAIN_FILE" | head -1)
+  if [ -z "$tc_channel" ]; then
+    printf '  FAIL  %s has no `channel = "..."` key — the toolchain is not pinned\n' \
+      "$TOOLCHAIN_FILE"
+    fail=1
+  elif printf '%s' "$tc_channel" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    printf '  ok    %s channel = %s (exact version)\n' "$TOOLCHAIN_FILE" "$tc_channel"
+  else
+    printf '  FAIL  %s channel = "%s" is not an exact X.Y.Z version\n' \
+      "$TOOLCHAIN_FILE" "$tc_channel"
+    fail=1
+  fi
+fi
+
+# Gate: no workflow may select a toolchain by a floating name. `rustup default
+# stable` in a job is exactly the race the pin removes; a job that wants the
+# pinned compiler gets it from the toolchain file instead.
+#
+# The scan is comment-aware (a line whose first non-space character is `#` is
+# skipped) on purpose: the natural place to explain *why* the old selection was
+# removed is a comment that names it, and a gate that fails on its own
+# explanation would be worked around by wording it indirectly. Shell comments
+# inside a `run: |` block are skipped too, for the same reason. Purely textual —
+# this runs in the `health` CI job, which has no Rust toolchain at all, and
+# locally for contributors who may have no rustup. It does not compare an
+# installed version against the pin; that is `rustc --version`'s job in the
+# `lint` log.
+#
+# COVERAGE — deliberately narrow, and a pass means only this much:
+#   * catches `rustup default <name>` in a file under `.github/workflows/`,
+#     tolerating extra whitespace (`rustup  default  stable`);
+#   * does NOT catch a floating selection that never spells that command in a
+#     workflow: `RUSTUP_TOOLCHAIN` in an `env:` block, a `rustup override`, a
+#     `rustup default` inside a script or Makefile the job invokes, or a
+#     compiler floated by a container base image. The Docker source build is one
+#     known instance of the last case — see the open TODO.md item on
+#     `docker/Dockerfile.source`; this gate does not cover it.
+floating=$(grep -rnE 'rustup[[:space:]]+default[[:space:]]' .github/workflows/ 2>/dev/null \
+  | grep -vE '^[^:]*:[0-9]+:[[:space:]]*#' || true)
+if [ -n "$floating" ]; then
+  printf '%s\n' "$floating" | sed 's/^/    /'
+  printf '  FAIL  %s floating toolchain selection(s) under .github/workflows/ (rustup default ...)\n' \
+    "$(printf '%s\n' "$floating" | grep -c .)"
+  fail=1
+else
+  printf '  ok    no floating toolchain selection under .github/workflows/\n'
+fi
 
 # ---------------------------------------------------------------- docs
 hdr "Docs"

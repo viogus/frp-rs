@@ -30,6 +30,18 @@ cargo run --bin frpc -- -c frpc.toml
 RUST_LOG=debug cargo run --bin frps -- -c frps.toml  # Enable debug logging
 ```
 
+**Toolchain is pinned.** `rust-toolchain.toml` at the repo root is the single
+source of truth for the compiler: local dev and every CI job resolve
+`rustc`/`cargo`/`clippy`/`rustfmt` from it, so the lint figures in
+[Current Health](#current-health) are produced by the same toolchain in both
+places. `channel` is an **exact version** on purpose — `stable` would float and
+re-open the hazard where a new clippy release turns `Lint` red on code that
+changed nothing. Applying or bumping it is deliberate: edit `channel`, run
+`rustup show` (installs the pinned version plus its `clippy`/`rustfmt`
+components), then `cargo fmt --all -- --check` and
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`, fixing
+any new lint in the same PR.
+
 ### Integration Tests Without Building
 
 Integration tests (`frp-server/tests/`) need an `frps` binary. Without `cargo build`, use a pre-built release:
@@ -163,7 +175,7 @@ not be cited for them.
 |--------|----------------------|
 | **Version alignment (mandatory)** | `bash scripts/repo-health.sh` — gate; exits 1 on drift. All 5 crates + `VERSION` + download script + README at `0.71.0` (frp-vnet `0.1.0` by design) |
 | `cargo fmt --all -- --check` | zero diffs |
-| `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
+| `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings, measured on the pinned toolchain (`rust-toolchain.toml`; see Build / Test / Lint) |
 | `cargo test --workspace --all-features` | must pass — needs an all-features `frps` binary, see Testing & Tooling. **The pass count is a runtime fact; do not quote a stored number here.** The in-tree test-function total is not stable either — it changes with every test-adding PR, and the same tree has measured differently in CI vs locally — so read it from `bash scripts/repo-health.sh` ("Tests") instead of storing it |
 | `cargo build --release` | all 4 profiles pass — sizes in [Binary Variants](#binary-variants) |
 | `unsafe` (`repo-health.sh`) | frp-core: 21 blocks + 3 `unsafe fn` + 1 `unsafe impl` (comment-stripped: a doc comment mentioning `unsafe impl` is not code); frp-vnet: 38 blocks. Every block carries a `// SAFETY:` comment |

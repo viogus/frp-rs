@@ -224,6 +224,36 @@ cargo test --workspace       # Run all tests
 cargo clippy                 # Lint
 ```
 
+### Toolchain pinning
+
+`rust-toolchain.toml` at the repo root pins the compiler: an exact `channel`
+(`X.Y.Z`, never `stable` and never a floating `X.Y`), `profile = "minimal"`, and
+the `clippy`/`rustfmt` components. It is the single source of truth for local
+development and for CI, so a `cargo fmt` / `cargo clippy` result is a property of
+the commit rather than of the runner image or a developer's `rustup default`.
+
+The channel is exact because a floating one re-introduces the failure the pin
+removes: a new rustc/clippy release can add a lint that fires on untouched code,
+which turns the lint gate red on a commit that changed nothing. An exact version
+makes a compiler bump a deliberate, reviewable diff.
+
+Applying the pin locally needs no argument on any command — run `rustup show` in
+the repository. It reads the file, installs the pinned toolchain and its
+`clippy`/`rustfmt` components if they are absent, and reports it as the active
+one (`overridden by <repo>/rust-toolchain.toml`); from then on `rustc`, `cargo`,
+`cargo clippy` and `cargo fmt` all resolve to the pinned version. A missing
+toolchain is never a reason to pass `+toolchain` by hand.
+
+To bump:
+
+1. edit `channel` in `rust-toolchain.toml` to the new exact version;
+2. run `rustup show` — it installs the new toolchain and its two components;
+3. run `cargo fmt --all -- --check`;
+4. run `cargo clippy --workspace --all-targets --all-features -- -D warnings`;
+5. fix every lint the new compiler reports **in the same PR**. That diff is the
+   point of the pin: it is the reviewable consequence of the bump, not a
+   follow-up chore.
+
 ### Binary Variants
 
 Four size tiers via feature flags. The authoritative tier list, exact commands

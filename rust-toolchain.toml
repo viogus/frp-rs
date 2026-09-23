@@ -1,0 +1,34 @@
+# Toolchain pin — the single source of truth for the compiler used locally and in
+# CI. `.github/workflows/ci.yml` makes it active with `rustup show`; the other
+# workflows' `actions-rust-lang/setup-rust-toolchain@v1` steps pass no
+# `toolchain:` input, so they install what this file specifies (the action's
+# documented behaviour). Result: a rustc/clippy bump must be a deliberate,
+# reviewable change to this file instead of a race with whatever `stable` a
+# runner image or a developer's `rustup default` happens to carry.
+#
+# `channel` is an EXACT version on purpose. `channel = "stable"` — or a floating
+# `"1.98"` — would follow new releases, which is the hazard this file exists to
+# close: a new rustc/clippy can add a lint that fires on untouched code, so the
+# `Lint` gate would go red on a commit that changed nothing.
+#
+# `profile = "minimal"` installs rustc, cargo and rust-std only; `components`
+# adds exactly the two tools the documented gates need — `rustfmt` for
+# `cargo fmt --all -- --check`, and `clippy` for
+# `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+#
+# Running `rustup show` inside the repository installs this toolchain when it is
+# absent and reports it as active ("overridden by <repo>/rust-toolchain.toml");
+# the rustc/cargo/clippy/rustfmt shims then resolve to it with no `+toolchain`
+# argument, which is what makes the local and CI lint results comparable.
+#
+# To bump:
+#   1. edit `channel` below to the new exact version;
+#   2. run `rustup show` (installs it, and its two components);
+#   3. run `cargo fmt --all -- --check` and
+#      `cargo clippy --workspace --all-targets --all-features -- -D warnings`;
+#   4. fix any lint the new compiler reports in that same PR — that diff is the
+#      point of the pin, not a separate chore.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

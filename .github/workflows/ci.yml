@@ -37,8 +37,17 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Install Rust stable
-        run: rustup default stable
+      # Compiler from `rust-toolchain.toml` at the repo root (see
+      # `docs/developing.md` § Toolchain pinning). `rustup show` installs the pinned
+      # version under its versioned name; the image's `stable` does not satisfy it.
+      - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
+        run: rustup show
+      - name: Record the toolchain this lint result came from
+        # The pin states which version is *requested*; this line states which one
+        # actually ran, so a future red or green Lint log is self-describing.
+        run: |
+          rustc --version
+          cargo clippy --version
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -76,8 +85,11 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Install Rust stable
-        run: rustup default stable
+      # Compiler from `rust-toolchain.toml` at the repo root (see
+      # `docs/developing.md` § Toolchain pinning). `rustup show` installs the pinned
+      # version under its versioned name; the image's `stable` does not satisfy it.
+      - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
+        run: rustup show
       - name: Run all-features lib tests (QUIC admission and feature combos)
         run: cargo test --workspace --all-features --lib
       - name: Run vnet unit tests (nathole membership/cap guards)
@@ -196,8 +208,11 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Install Rust stable
-        run: rustup default stable
+      # Compiler from `rust-toolchain.toml` at the repo root (see
+      # `docs/developing.md` § Toolchain pinning). `rustup show` installs the pinned
+      # version under its versioned name; the image's `stable` does not satisfy it.
+      - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
+        run: rustup show
       - name: Build frpc (server integration tests spawn it as the bridge end)
         run: cargo build --bin frpc
       - name: Build frps with dashboard feature
@@ -293,8 +308,11 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Install Rust stable
-        run: rustup default stable
+      # Compiler from `rust-toolchain.toml` at the repo root (see
+      # `docs/developing.md` § Toolchain pinning). `rustup show` installs the pinned
+      # version under its versioned name; the image's `stable` does not satisfy it.
+      - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
+        run: rustup show
       - name: Build binaries (needed for integration tests)
         run: cargo build --bin frps --bin frpc
       - name: Run frp-client integration tests
@@ -329,8 +347,11 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Install Rust stable
-        run: rustup default stable
+      # Compiler from `rust-toolchain.toml` at the repo root (see
+      # `docs/developing.md` § Toolchain pinning). `rustup show` installs the pinned
+      # version under its versioned name; the image's `stable` does not satisfy it.
+      - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
+        run: rustup show
       - name: Check benchmarks compile
         run: cargo bench --workspace --no-run
       - name: Check tiny feature set compiles
@@ -544,8 +565,11 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Install Rust stable
-        run: rustup default stable
+      # Compiler from `rust-toolchain.toml` at the repo root (see
+      # `docs/developing.md` § Toolchain pinning). `rustup show` installs the pinned
+      # version under its versioned name; the image's `stable` does not satisfy it.
+      - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
+        run: rustup show
       - name: Build release (LTO disabled for CI speed)
         run: |
           mkdir -p .cargo
@@ -580,8 +604,11 @@ jobs:
             ~/.cargo/git/
           key: ${{ runner.os }}-cargo-security-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Install Rust stable
-        run: rustup default stable
+      # Compiler from `rust-toolchain.toml` at the repo root (see
+      # `docs/developing.md` § Toolchain pinning). `rustup show` installs the pinned
+      # version under its versioned name; the image's `stable` does not satisfy it.
+      - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
+        run: rustup show
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Install cargo-deny
