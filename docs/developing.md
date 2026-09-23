@@ -891,9 +891,23 @@ source comments must still resolve — against the directory of the file that
 names it first, then the nearest ancestor holding a `Cargo.toml` (the owning
 crate root — so a test that names src/v2_handshake.rs means
 frp-core/src/v2_handshake.rs), then the repo root. A `crate/feature` span such
-as `frp-core/tls` is recognised as Cargo feature syntax, not a path. This is
-deliberately **not** "every repo path named resolves": un-backticked prose and
-tree diagrams are not scanned, spans with no locating root (`mux.rs`,
+as `frp-core/tls` is recognised as Cargo feature syntax, not a path.
+
+The path scan is **tracked-files-only**: its file list comes from the git index
+(`git ls-files -z`), i.e. exactly the tree a clean checkout contains. Untracked
+and gitignored local state — `.worktrees/`, `.superpowers/`, a nested worktree's
+point-in-time backlog and archive prose, editor backups — is therefore never
+scanned, so the local mirror does not fail merely because the mandated worktree
+workflow is in use. The index supplies the file *list* while content is read
+from the worktree, so a tracked file edited locally is gated at its current
+content. A `.git`-less tree (release tarball, Docker build context) has no index
+and falls back to walking the filesystem, pruning only `.git` and `target`.
+Because the scan follows the index, an *untracked* local file that names a dead
+path is not gated — deliberate, since CI runs on a clean checkout where untracked
+is absent, so the gate's CI meaning is unchanged.
+
+This is deliberately **not** "every repo path named resolves": un-backticked
+prose and tree diagrams are not scanned, spans with no locating root (`mux.rs`,
 `control/mod.rs`) are counted and left to review, and a directory that still
 exists but has been emptied is not detected (existence is all that can be
 checked mechanically). Third-party vendored markdown (`vendor/*/README.md`) is

@@ -573,6 +573,19 @@ PY
   # (c) Gate: a *backtick-delimited* path anchored at a known repo root must
   # still open. Coverage is deliberately narrow, and the docs claim exactly this
   # much, no more:
+  #   * the scan is TRACKED-FILES-ONLY: the file list comes from the git index
+  #     (`git ls-files -z`), i.e. exactly the tree a clean checkout has. Untracked
+  #     and gitignored local state — `.worktrees/`, `.superpowers/`, a nested
+  #     worktree's point-in-time `TODO.md` / `docs/archive/…`, editor backups — is
+  #     never scanned, so this local mirror agrees with the `health` CI job
+  #     instead of failing whenever the mandated worktree workflow is in use. The
+  #     index supplies the file *list*; content is read from the worktree, so a
+  #     tracked file edited locally is gated at its current content. Consequence:
+  #     an *untracked* file naming a dead path is no longer gated — deliberate,
+  #     because CI runs on a clean checkout where untracked == absent, so the
+  #     gate's CI meaning is unchanged. A `.git`-less tree (release tarball,
+  #     Docker context) has no index and falls back to the old filesystem walk,
+  #     which prunes only `.git` and `target`;
   #   * only backtick spans are claims; un-backticked prose and tree diagrams are
   #     not scanned. A broad prose sweep was tried and produced hundreds of
   #     misses that were almost all false positives (`frp-core/tls` is a Cargo
@@ -584,11 +597,14 @@ PY
   # ancestor holding a Cargo.toml (the owning crate root — what makes the
   # crate-relative `src/v2_handshake.rs` in frp-core/tests/ resolve), then the
   # repo root.
+  # The scan is fail-closed: an unreadable directory, a tracked-but-unreadable
+  # file, and a file list or span total that comes back empty/implausibly small
+  # all exit 3 rather than print "ok 0".
   # Point-in-time documents (history, dated audits, changelog, the refactor
   # proposal, and the backlog that quotes removed paths as evidence) describe an
   # older tree on purpose and are out of scope; the archive has check (b).
   path_report=$(python3 -B - <<'PY'
-import os, re, sys
+import os, re, subprocess, sys
 
 ROOTS = ('src/', 'tests/', 'benches/', 'examples/',
          'docs/', 'scripts/', 'vendor/', 'docker/', '.github/',
@@ -599,6 +615,15 @@ SKIP_DIRS = ('docs/archive/', 'docs/history/', 'docs/audit/')
 SKIP_FILES = ('CHANGELOG.md', 'TODO.md', 'performance-audit.md',
               'docs/refactor-large-modules.md')
 BANNED = ' \t{}*<>|'
+
+# Sanity floors for the scan below. The gate is never-empty: if the file list or
+# the span total comes back empty or implausibly small (a broken index, a bogus
+# cwd, a git that exits 0 with no output), it must FAIL rather than certify
+# "no stale refs". The real tree has hundreds of scannable files and thousands
+# of backtick spans, so these floors are far below any real checkout and only
+# catch a truncated list.
+MIN_FILES = 50
+MIN_SPANS = 100
 
 def cargo_features(crate):
     path = os.path.join(crate, 'Cargo.toml')
@@ -683,35 +708,116 @@ counts = {k: 0 for k in ('ok', 'stale', 'feature', 'shorthand', 'bare',
                          'superpowers', 'ignore')}
 hits = []
 walk_errors = []
+read_errors = []
 
 
 def walk_error(e):
     walk_errors.append('%s: %s' % (getattr(e, 'filename', '?'), e.strerror or e))
 
 
-for root, dirs, files in os.walk('.', onerror=walk_error):
-    dirs[:] = [d for d in dirs if d not in ('.git', 'target')]
-    for fn in sorted(files):
-        p = os.path.join(root, fn)[2:]
-        is_md, is_rs = fn.endswith('.md'), fn.endswith('.rs')
-        if not (is_md or is_rs):
-            continue
-        if is_md and (p.startswith(SKIP_DIRS) or p in SKIP_FILES):
-            continue
-        if is_md and p.startswith('vendor/') and os.path.basename(p) != 'README-FRP-RS.md':
-            continue    # third-party prose, pinned upstream (our own notes stay in scope)
-        if is_rs and p.startswith('vendor/'):   # third-party source, pinned
-            continue
+def wanted(p):
+    """Inclusion rules, unchanged from the historical walk: markdown and Rust
+    source only, minus the point-in-time and vendored exclusions. `p` is always
+    root-relative, so the SKIP_DIRS/SKIP_FILES patterns stay root-anchored and
+    mean the same thing in the index and in the walk fallback."""
+    if p.endswith('.md'):
+        if p.startswith(SKIP_DIRS) or p in SKIP_FILES:
+            return None
+        if p.startswith('vendor/') and os.path.basename(p) != 'README-FRP-RS.md':
+            return None    # third-party prose, pinned upstream (our notes stay in scope)
+        return 'md'
+    if p.endswith('.rs'):
+        if p.startswith('vendor/'):   # third-party source, pinned
+            return None
+        return 'rs'
+    return None
+
+
+def tracked_files():
+    """Root-relative paths from the git index, or None when there is no index to
+    read (`.git`-less tarball / Docker context, or git missing): the caller then
+    walks the filesystem instead. `-z`/NUL splitting keeps paths containing
+    spaces, newlines and non-ASCII bytes intact; surrogateescape means a path
+    that is not valid UTF-8 is still reported rather than dropped."""
+    if not os.path.exists('.git'):
+        return None
+    try:
+        r = subprocess.run(['git', 'ls-files', '-z', '--full-name', '--cached'],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    if r.returncode != 0:
+        return None
+    return [b.decode('utf8', 'surrogateescape') for b in r.stdout.split(b'\0') if b]
+
+
+def walk_files():
+    """Fallback for a `.git`-less tree: the historical os.walk, pruning `.git`
+    and `target`; an unreadable directory is recorded by walk_error, not ignored."""
+    found = []
+    for root, dirs, files in os.walk('.', onerror=walk_error):
+        dirs[:] = [d for d in dirs if d not in ('.git', 'target')]
+        for fn in sorted(files):
+            found.append(os.path.join(root, fn)[2:])
+    return found
+
+
+def scan(entries):
+    """Classify every backtick span in `entries` ([(root-relative path, kind)]).
+    A path that is tracked but cannot be read — deleted in the worktree, a
+    submodule gitlink listed as a path, or an unreadable file — is recorded and
+    fails the scan (exit 3), never a traceback and never a silent skip."""
+    n_files = 0
+    for p, kind in entries:
         base = os.path.dirname(p)
         crate_base = nearest_manifest_dir(base)
-        for lineno, span in spans(md(p) if is_md else rs(p)):
-            verdict = classify(span, base, crate_base)
-            counts[verdict] += 1
-            if verdict == 'stale':
-                hits.append('%s:%d: `%s`' % (p, lineno, normalize(span)))
-if walk_errors:  # an unreadable directory is not "no stale refs"
+        try:
+            lines = md(p) if kind == 'md' else rs(p)
+            for lineno, span in spans(lines):
+                verdict = classify(span, base, crate_base)
+                counts[verdict] += 1
+                if verdict == 'stale':
+                    hits.append('%s:%d: `%s`' % (p, lineno, normalize(span)))
+        except OSError as e:
+            read_errors.append('%s: %s' % (p, e.strerror or e))
+        else:
+            n_files += 1
+    return n_files
+
+
+index = tracked_files()
+source = 'git ls-files'
+candidates = index if index is not None else walk_files()
+if index is None:
+    source = 'filesystem walk (no git index)'
+entries = []
+for p in candidates:
+    kind = wanted(p)
+    if kind is not None:
+        entries.append((p, kind))
+
+if not entries:
+    print('scan error: %s listed no scannable .md/.rs file — refusing to report '
+          '"no stale refs"' % source)
+    sys.exit(3)
+n_files = scan(entries)
+n_spans = sum(counts.values())
+if read_errors:   # a tracked file we could not read is not "no stale refs"
+    for e in read_errors:
+        print('read error: %s' % e)
+    sys.exit(3)
+if walk_errors:   # an unreadable directory is not "no stale refs"
     for e in walk_errors:
         print('walk error: %s' % e)
+    sys.exit(3)
+if n_files == 0 or n_spans == 0:
+    print('scan error: %s examined %d file(s) / %d span(s) — refs not certified'
+          % (source, n_files, n_spans))
+    sys.exit(3)
+if n_files < MIN_FILES or n_spans < MIN_SPANS:
+    print('scan error: implausibly small scan from %s (%d file(s), %d span(s); '
+          'floor %d/%d) — refs not certified'
+          % (source, n_files, n_spans, MIN_FILES, MIN_SPANS))
     sys.exit(3)
 print('%d %d %d %d %d %d' % (counts['ok'], counts['stale'], counts['feature'],
                              counts['shorthand'], counts['bare'], counts['superpowers']))

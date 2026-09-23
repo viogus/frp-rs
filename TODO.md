@@ -1059,36 +1059,89 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `--no-default-features` compiles clean with the gate. Docs: a paragraph in
   `docs/deployment.md` § client admin states the load-then-refuse behaviour, the required
   `web_server.port`, and that the `--admin-*` flags are an frp-rs extension applied after a
-  successful load. Committed on branch `fix/frpc-cli-config-error` (no PR).
-- [ ] **`scripts/repo-health.sh`'s path-reference scanner walks gitignored directories, so the
-  local mirror of the `health` job fails whenever any worktree exists.** The scanner walks the
-  tree with `os.walk('.')` from the repo root and prunes only `.git` and `target`
-  (`scripts/repo-health.sh:692-693`), so it descends into `.worktrees/` and `.superpowers/` —
-  both gitignored (`.gitignore:17`, `:20`) and absent from a clean checkout. Measured in the
-  main tree `/Users/cdf/Codes/frp-rs` (rule 1 makes worktrees mandatory) with the tree's own
-  script on **2026-09-23T12:57Z, with 20 nested worktrees on disk**:
-  `bash scripts/repo-health.sh` → exit **1**, `FAIL 4140 path reference(s) do not resolve from
-  the referencing file`, `RESULT: FAILURES above — fix before release`; 4136 of them were under
-  `.worktrees/*` and 4 under `.superpowers/sdd/*`. **The total is not a stable number** — it
-  tracks how many nested worktrees exist and how much point-in-time prose each carries; the same
-  command reported 4139 earlier the same day (220 from this worktree, before this paragraph was
-  written) and the coordinator measured 3919 = 3915 + 4 earlier still. The stable facts are the
-  mechanism and the per-worktree contribution: at this reading each of the 20 worktrees
-  contributed **204-221** refs, and `.worktrees/frpc-cli-config/TODO.md` alone contributed 23.
-  Two root causes compound: (a) nested worktrees are
-  scanned at all; (b) the exclusions are root-anchored — `p in SKIP_FILES` and
-  `p.startswith(SKIP_DIRS)` (`:598-599`, `:699`) — so a nested
-  `.worktrees/<x>/TODO.md`, `CHANGELOG.md` or `docs/archive/…` is **not** skipped even though
-  the root copy is a deliberate point-in-time exclusion, and those files are exactly where the
-  intentional absent paths live. The `health` CI job (clean checkout) and an isolated worktree
-  with no nested `.worktrees/` both pass with `RESULT: invariants hold` — so a local gate that
-  is red only because the mandated workflow is in use is a false positive, and it trains authors
-  to ignore the script (the same trap the archive/SKIP list was added to avoid).
+  successful load. Merged as PR **#367**, squash-merged to `main` as `f8f127f` (branch
+  `fix/frpc-cli-config-error`).
+- [x] **`scripts/repo-health.sh`'s path-reference scanner walked gitignored directories, so the
+  local mirror of the `health` job failed whenever any worktree existed.** The scanner used
+  `os.walk('.')` from the repo root and pruned only `.git` and `target`
+  (`scripts/repo-health.sh:692-693` pre-fix), so it descended into `.worktrees/` and
+  `.superpowers/` — both gitignored (`.gitignore:17`, `:20`) and absent from a clean checkout.
+  **The reported total was never a stable number** — it tracked how many nested worktrees were on
+  disk and how much point-in-time prose each carried. Every reading below was taken with the
+  *broken* script on 2026-09-23 and is therefore not reproducible from the fixed script; the
+  coordinator measured `FAIL 3919` (3915 under `.worktrees/*` + 4 in `.superpowers/sdd/*`), then
+  4139, then **4140** (4136 + 4) as worktrees came and went, i.e. each nested worktree contributed
+  **204-221** refs. The stable facts are the mechanism, the per-worktree contribution, and the 4
+  refs that live in `.superpowers/sdd/*` (all four are absent paths quoted by that directory's
+  2026-08 insight reports). Two root causes compounded: (a) nested worktrees were scanned at all;
+  (b) the exclusions are root-anchored — `p in SKIP_FILES` and `p.startswith(SKIP_DIRS)`
+  (`:598-599`, `:699` pre-fix) — so a nested `.worktrees/<x>/TODO.md`, `CHANGELOG.md` or
+  `docs/archive/…` was **not** skipped even though the root copy is a deliberate point-in-time
+  exclusion, and those files are exactly where the intentional absent paths live. The `health` CI
+  job (clean checkout) and an isolated worktree with no nested `.worktrees/` both passed with
+  `RESULT: invariants hold` — so a local gate that was red only because the mandated workflow was
+  in use was a false positive, and it trained authors to ignore the script (the same trap the
+  archive/SKIP list was added to avoid).
   **Done-when:** drive the scan from `git ls-files` (keeping the existing `find` fallback for a
   `.git`-less tree) or prune gitignored paths before walking, falsified by both cases: with a
   nested worktree under `.worktrees/` and a `.superpowers/sdd/` file present, the script exits 0
   and reports the same path counts as the clean checkout; and a genuinely stale backticked path
   added to a tracked file still exits 1. No sha.
+
+  Done (branch `fix/repo-health-tracked-scan`, based on `main` @ `f8f127f`): the first branch of
+  the done-when — the file list now comes from the git index. A new `tracked_files()` runs
+  `git ls-files -z --full-name --cached` (python3 stdlib `subprocess`, no new dependency) and
+  returns `None` when `.git` is absent or git cannot list, in which case `walk_files()` keeps the
+  old `os.walk` (still pruning only `.git`/`target`) for a `.git`-less tarball / Docker context.
+  `git ls-files -z` is preferred over pruning gitignored directories by hand because the index *is*
+  the clean-checkout file set (no re-implementation of `.gitignore` matching, one fast call), and
+  it fixes the root-anchoring bug (b) for free. The index supplies the file *list*; content is read
+  from the **worktree**, so a tracked file edited locally is gated at its current content. Paths
+  are NUL-split and decoded with `surrogateescape`, so spaces, newlines and non-ASCII cannot be
+  mis-parsed or silently dropped. The summary line format and every classification rule (`ROOTS`,
+  `normalize`, `classify`, `cargo_features`, `SKIP_DIRS`/`SKIP_FILES`) are unchanged, so no count
+  changed meaning. Measured in the worktree, macOS arm64, warm cache:
+  * clean (no `.worktrees/`, no `.superpowers/`): exit **0**, `ok    272 repo path references
+    resolve (file-relative, crate root, then repo root)`, `info  skipped 227 locator-less bare
+    ref(s) and 57 locator-less shorthand(s) (no recoverable base); 7 `crate/feature` span(s)`,
+    2.42 s wall.
+  * case (a) nested worktree + ignored probe: `git worktree add .worktrees/scan-falsify -b
+    probe/scan-falsify` (ignored — `git check-ignore -v .worktrees/scan-falsify` →
+    `.gitignore:17:.worktrees/`) plus `.superpowers/sdd/probe.md` naming
+    `frp-core/src/this-file-does-not-exist.rs` (`git check-ignore` → `.gitignore:20`). The
+    **pre-fix** script on that tree exited **1**, `FAIL  222 path reference(s) do not resolve`
+    (221 from the nested worktree + 1 from the probe). The fixed script exits **0** with the count
+    line **byte-identical** to the clean run above (ok 272 / features 7 / shorthand 57 / bare 227),
+    2.39 s wall. Probe worktree removed with `git worktree remove --force` + `git worktree prune`
+    and the `probe/scan-falsify` branch deleted.
+  * case (b) stale ref in a tracked file: appending a `//` comment naming
+    `frp-core/src/this-file-does-not-exist.rs` to tracked `frp-core/src/base64.rs` gave exit **1**
+    with `stale: frp-core/src/base64.rs:165` naming that path, and `FAIL  1 path reference(s) do
+    not resolve from the referencing file`; `git checkout -- frp-core/src/base64.rs` restored
+    exit 0 / `ok 272`. This also pins the index-vs-worktree decision: the file was
+    unmodified in the index and the local edit was still caught.
+  * fallback (committed tree): `git archive HEAD | tar -x -C /tmp/rh-nogit`, run from there →
+    exit **0**, `ok 272`. That exercised `os.path.exists('.git')` → `None` → `walk_files()`. With
+    `.git` present but unlistable (an empty `.git` directory, and a `PATH` containing no `git` at
+    all, which raises `FileNotFoundError` → `None`) the same fallback runs and the gate still
+    evaluates: exit 0 / `ok 272`, no traceback.
+  * fail-loud floors, falsified in throwaway copies under `/tmp` (never in the repo): forcing the
+    index list to `[]` → `scan error: git ls-files listed no scannable .md/.rs file — refusing to
+    report "no stale refs"`; keeping the real list but raising the floor → `scan error:
+    implausibly small scan from git ls-files (267 file(s), 12207 span(s); floor 10**9/100) — refs
+    not certified`; suppressing the span loop → `scan error: git ls-files examined 267 file(s) / 0
+    span(s) — refs not certified`. All three exit **3** and surface as `FAIL  path-reference scan
+    produced no result (exit 3) — refs not certified` with `RESULT: FAILURES above`. A tracked path
+    that cannot be opened (deleted in the worktree, or a mode-160000 gitlink named `*.md`) prints
+    `read error: <path>: No such file or directory` and exits 3, no traceback; a gitlink named
+    anything else is filtered out by the extension test before it is opened. `git ls-files -s | awk
+    '$1==160000'` is empty in this repo today, and `git ls-files` reports 0 paths with spaces or
+    non-ASCII, so neither case is live — they are handled and were probed synthetically as above.
+  * scope: the scan is now **tracked-files-only**, so an untracked local file naming a dead path is
+    no longer gated. Deliberate: the CI `health` job runs on a clean checkout where untracked ==
+    absent, so the gate's CI meaning is unchanged. Stated in the `scripts/repo-health.sh` coverage
+    comment, `docs/developing.md` § Repository Invariants and `CLAUDE.md:209`. No Rust file
+    touched; `bash -n scripts/repo-health.sh` clean.
 - [ ] **`frpc` has no `stop` subcommand and no `--api-timeout`, so its admin-command surface is
   short of Go v0.71.0.** Go's `cmd/frpc/sub/admin.go:34-50` (tag `v0.71.0`, fetched during this
   work) registers **three** commands — `reload`, `status`, **`stop`** — and gives each
