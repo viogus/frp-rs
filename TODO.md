@@ -1326,14 +1326,18 @@ nothing about whether the described behaviour still holds.
   nested one wins inside its own directory, measured, and an untracked copy does
   so identically); a `channel` that is absent, outside the `[toolchain]` table,
   or not an exact `X.Y.Z` (single- or double-quoted, trailing TOML comment
-  allowed); a `toolchain:` input **on a `setup-rust-toolchain` step**; and
+  allowed); a `toolchain:` input **on a `setup-rust-toolchain` step**, in any
+  spelling that step could use (block mapping, flow mapping
+  `with: {toolchain: stable}`, comma-separated `{rustflags: '', toolchain: ...}`,
+  and a single- or double-quoted key); and
   `rustup default` used as a leading `run:` command under `.github/workflows/`. It
   is pure text/file parsing — no rustup and no installed version — so the
   toolchain-less `health` CI job can run it. Falsified in both directions:
   `stable`, `nightly`, `1.98`, `1.98.1.0`, a deleted `channel` key, `channel`
   outside `[toolchain]`, a deleted file, a tracked second `rust-toolchain`, a
   tracked nested `scripts/frp-stress/rust-toolchain.toml`, an **untracked**
-  `rust-toolchain`, a workflow `toolchain:` input on the setup step, an injected
+  `rust-toolchain`, a workflow `toolchain:` input on the setup step in each of
+  those five spellings, an injected
   `run: rustup default stable`, its double-spaced variant and a block-scalar
   `rustup default stable` line each exit 1 with the file and value named;
   `channel = '1.98.1'`, `[toolchain] # comment`, `channel = "1.98.1" # comment`,
@@ -1343,10 +1347,14 @@ nothing about whether the described behaviour still holds.
   `RUSTUP_TOOLCHAIN=stable ...`, `rustup override set`, a `rustc = ...` written
   into `.cargo/config.toml`, a non-leading `rustup default` in a `run:` line, a
   quoted-scalar `run: "rustup default stable"`, a script/Makefile the job invokes,
-  a container base image) — the `toolchain:` check's own comment records that it
-  is scoped to the setup-action step and so ignores a line-leading `toolchain:`
-  that overrides nothing (`workflow_dispatch.inputs.toolchain`, `matrix.toolchain`,
-  an `env:` entry, a `run: |` body line).
+  a container base image) — the `toolchain:` check's own comment records both what
+  it now catches beyond a line-leading key and what it still does not: it is
+  scoped to the setup-action step, so a `toolchain:` that overrides nothing is
+  ignored (`workflow_dispatch.inputs.toolchain`, `matrix.toolchain`, an `env:`
+  entry, a `run: |` body line in another step), while a YAML anchor/alias, an
+  uppercase `TOOLCHAIN:` key (whether Actions matches input names
+  case-insensitively was not measured) and a key consumed by a different action
+  are not detected at all.
   Docs: `CLAUDE.md` (Build / Test / Lint, plus the clippy row of Current Health),
   `docs/developing.md` § 3 (`### Toolchain pinning`) and one sentence in
   `README.md`.

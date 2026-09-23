@@ -346,6 +346,23 @@ fi
 # `toolchain:` elsewhere overrides nothing: `workflow_dispatch.inputs.toolchain`,
 # a `matrix.toolchain` entry, an `env:` mapping, a `run: |` body line. Those were
 # the false positives of the file-wide scan.
+#
+# Inside the block the key is matched however the step may spell it — block
+# mapping (`toolchain: stable`), flow mapping (`with: {toolchain: stable}` or
+# `with: {rustflags: '', toolchain: stable}`) and a quoted key (`"toolchain":`,
+# `'toolchain':`) — by allowing `{`, `,` or whitespace before it and optional
+# quotes around it. Comment-awareness is deliberate: a line whose first
+# non-space character is `#` is skipped, and a key that appears only after an
+# inline `#` on the same line is skipped too, so an explanatory
+# `# toolchain: stable` inside the block does not fail the gate.
+#
+# STILL NOT COVERED (a pass here means only that no spelling above was seen):
+#   * a YAML anchor/alias — `x-tc: &tc {toolchain: stable}` at the top level and
+#     `with: *tc` on the step;
+#   * an uppercase `TOOLCHAIN:` key. Whether GitHub Actions matches action input
+#     names case-insensitively was NOT measured here, so the pattern stays
+#     case-sensitive and this spelling would be missed;
+#   * a `toolchain:` key consumed by a *different* action.
 tc_input=$(awk '
   /^[[:space:]]*-[[:space:]]*uses:[[:space:]]*actions-rust-lang\/setup-rust-toolchain@/ {
     match($0, /^[[:space:]]*/); base = RLENGTH; inblock = 1; next
@@ -354,7 +371,10 @@ tc_input=$(awk '
     if ($0 ~ /^[[:space:]]*$/) next
     match($0, /^[[:space:]]*/); ind = RLENGTH
     if (ind <= base) { inblock = 0; next }
-    if ($0 ~ /^[[:space:]]*toolchain[[:space:]]*:/) print FILENAME ":" FNR ":" $0
+    if ($0 ~ /^[[:space:]]*#/) next
+    if (match($0, /(^|[{,[:space:]])["'"'"']?toolchain["'"'"']?[[:space:]]*:/)) {
+      if (index(substr($0, 1, RSTART - 1), "#") == 0) print FILENAME ":" FNR ":" $0
+    }
   }
 ' .github/workflows/*.yml 2>/dev/null || true)
 if [ -n "$tc_input" ]; then
