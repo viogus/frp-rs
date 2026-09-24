@@ -1477,8 +1477,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   cwd and then `command -v`, symlinks followed with a bounded `readlink` loop (`readlink -f` is not
   POSIX and older macOS/BSD releases lack it) and `cd -P` on the result. Measured on the item's own
   shape: a link at `frp-core/src/rh-link.sh` invoked as `cd frp-core/src && bash rh-link.sh` scanned
-  `frp-core/` pre-fix (`canonical (frp-core/Cargo.toml) :` empty, eight
-  `grep: … No such file or directory` lines, exit 1) and the repository root post-fix (exit 0,
+  `frp-core/` pre-fix (`canonical (frp-core/Cargo.toml) :` empty, nine
+  `grep: … No such file or directory` lines — eight distinct paths, `frp-core/Cargo.toml` twice —
+  exit 1) and the repository root post-fix (exit 0,
   `RESULT: invariants hold`); a `docs/`-level link from the repository root and from inside `docs/`,
   a two-hop relative chain, an absolute path, `bash ./scripts/repo-health.sh`,
   `bash scripts/./repo-health.sh`, a PATH invocation with a decoy same-named file in the cwd, a path
@@ -1489,23 +1490,26 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   resolves to `/dev`; `source` now resolves the real file but still `cd`s and `exit`s in the caller's
   shell.
 
-- [ ] **Read sites outside the doc-figures block still block on a FIFO.** The doc-figures path now
-  refuses a non-regular measurement input before opening it, but other read sites do not:
-  `mkfifo frp-core/src/zz.rs` hangs the `Code size` section's `find … -name '*.rs' | xargs cat`; a
-  FIFO at `README.md` hangs the version gate's bash `grep`; a FIFO at `docs/developing.md` hangs the
-  curated-claims `open()`. Measured 2026-09-24 (macOS 26.6.2, no `timeout(1)`; a kill watchdog bounded
-  each probe at 20 s, all killed with zero `FAIL` lines and no `RESULT` line) — and the pre-fix script
-  hangs identically, so this is pre-existing, not a regression. **Done-when:** each read site refuses
-  (or bounds) a non-regular file, with one probe per site showing a loud non-zero exit instead of a
-  hang.
+- [ ] **Read sites outside the doc-figures block still block on a non-regular file.** The
+  doc-figures path now refuses a non-regular measurement input before opening it, but other read
+  sites do not. Measured 2026-09-24 (macOS 26.6.2, no `timeout(1)`; a kill watchdog bounded each probe
+  at 20 s, each killed with zero `FAIL` lines and no `RESULT` line): a FIFO named
+  `frp-core/src/zz.rs` hangs the `Code size` section's `find … -name '*.rs' | xargs cat`; a FIFO at
+  `README.md` hangs the version gate's bash `grep`; a FIFO at `docs/developing.md` hangs the
+  **path-reference scan** (that scan, not the curated-claims `open()`, is a live doc's first reader);
+  and a symlink at `vendor/rustls/Cargo.toml` whose target flips between a regular file and a FIFO
+  hangs the Vendored-crates loop, whose `[ -f ]` test and `grep` are two separate processes (6 of 20
+  flipper runs killed at 8 s). The pre-fix script hangs identically, so this is pre-existing, not a
+  regression. **Done-when:** each read site refuses (or bounds) a non-regular file, with one probe per
+  site showing a loud non-zero exit instead of a hang.
 - [ ] **Two gates print `ok` rows computed from a tree they could not read.** With
   `frp-core/Cargo.toml` unreadable the version gate compares `""` to `""` and prints
   `ok    frp-core/Cargo.toml`; with `frp-server/src` absent the SAFETY gate prints
-  `ok    every unsafe block has a // SAFETY: justification` over an empty file list. Measured
-  2026-09-24 by the second (adversarial) review round. Both runs still exit 1 for other reasons, so
-  these are false `ok` rows in the report rather than a false green — the same class the doc-figures
-  gate no longer has. **Done-when:** a gate whose input is missing or unreadable reports that instead
-  of an `ok` row, pinned by a probe.
+  `ok    every unsafe block has a // SAFETY: justification` while that crate's file list is empty
+  (the other three crates are still scanned). Measured 2026-09-24 by the second (adversarial) review
+  round. Both runs still exit 1 for other reasons, so these are false `ok` rows in the report rather
+  than a false green — the same class the doc-figures gate no longer has. **Done-when:** a gate whose
+  input is missing or unreadable reports that instead of an `ok` row, pinned by a probe.
 
 ---
 
