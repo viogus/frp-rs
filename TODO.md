@@ -1416,7 +1416,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   misses `VERSION`, the download script or the README now fails CI instead of
   being noticed at release time.
 
-- [ ] **`repo-health.sh`'s doc-figures gate tracebacks under a sparse checkout.** The curated
+- [x] **`repo-health.sh`'s doc-figures gate tracebacks under a sparse checkout.** The curated
   `doc_claims` block's `vendor_version` (`scripts/repo-health.sh:1087`, heredoc from `:937`) opens
   `vendor/<crate>/Cargo.toml` unconditionally, so a tree whose worktree does not materialise it
   raises instead of reporting. Reproduce:
@@ -1431,7 +1431,29 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   **Done-when:** `vendor_version` treats a missing manifest as a loud, non-traceback failure (an
   explicit `FAIL … vendor manifest missing` line, or a documented "partial tree" exit 3 reported
   once before the entries that need it). No sha.
-- [ ] **`repo-health.sh` derives its root from `$0`, so a symlinked script scans the wrong tree.**
+
+  Done (branch `fix/p0-repo-health-script`, based on `main` @ `0a8aed4`): the `doc_claims` block now
+  preflights its complete measurement-input set in one run — `scripts/compat-test.sh`,
+  `scripts/protocol-matrix.sh`, `scripts/rust_comments.py`, `frp-core/Cargo.toml`, the two bench
+  sources, each `vendor/<crate>/Cargo.toml`, and both crate `src` directories — and an input the tree
+  does not carry or cannot read is reported *before* the entries that need it:
+  `FAIL partial tree: <path> is missing — cannot measure the doc figures (sparse checkout?)`,
+  `FAIL vendor manifest missing: <path>`, or `FAIL … is unreadable (<reason>)` with the real reason
+  (`Permission denied`, `not a regular file`, `not valid UTF-8`), after which the block exits 3 and
+  `repo-health.sh` prints `FAIL doc figures not evaluated — the tree is partial (exit 3)` and keeps
+  the run red. A source walk that cannot complete exits 2 with its own line; a genuine figure
+  mismatch keeps `a live doc quotes a figure the tree no longer matches`. Reproduced on the item's own
+  command (`git sparse-checkout init --cone && git sparse-checkout set docs scripts`): pre-fix
+  `FileNotFoundError: [Errno 2] No such file or directory: 'vendor/rustls/Cargo.toml'` plus the
+  docs-blame line; post-fix 0 tracebacks, all 11 inputs reported in one run, exit 1. The first two
+  review rounds found the same class still reachable *inside* the block — `unsafe_counts`' unguarded
+  `.rs` reads, a missing or emptied `frp-core/src` measuring a false 0, a non-UTF-8 input tracebacking,
+  and a FIFO blocking the read — all closed in the same PR, each with a before/after probe in the
+  review record. Residue (pre-existing, unchanged, now recorded as the two new items below): read
+  sites outside this block (the `Code size` walk, the bash `grep` on `README.md`, the curated-claims
+  `open()` on a doc path, the SAFETY/report walks) can still block on a FIFO, and the version/SAFETY
+  gates can print `ok` rows computed from a tree they could not read.
+- [x] **`repo-health.sh` derives its root from `$0`, so a symlinked script scans the wrong tree.**
   `cd "$(dirname "$0")/.."` (`scripts/repo-health.sh:23`) resolves the *symlink's* directory: a
   symlink to the script placed in a subdirectory makes the whole run treat that subdirectory's
   parent as the repository root. Guarded form: the fail-open half — a wrong root certified from an
@@ -1449,6 +1471,41 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `walk error: docs/archive: No such file or directory` from the archive report.
   **Done-when:** resolve the real script path (`readlink -f` or `cd -P`) before deriving the root,
   or refuse to run when the resolved root is not the tree containing the script. No sha.
+
+  Done (branch `fix/p0-repo-health-script`, based on `main` @ `0a8aed4`): the root is now derived
+  from the physical script path — `${BASH_SOURCE[0]:-$0}`, a bare name resolved against the caller's
+  cwd and then `command -v`, symlinks followed with a bounded `readlink` loop (`readlink -f` is not
+  POSIX and older macOS/BSD releases lack it) and `cd -P` on the result. Measured on the item's own
+  shape: a link at `frp-core/src/rh-link.sh` invoked as `cd frp-core/src && bash rh-link.sh` scanned
+  `frp-core/` pre-fix (`canonical (frp-core/Cargo.toml) :` empty, eight
+  `grep: … No such file or directory` lines, exit 1) and the repository root post-fix (exit 0,
+  `RESULT: invariants hold`); a `docs/`-level link from the repository root and from inside `docs/`,
+  a two-hop relative chain, an absolute path, `bash ./scripts/repo-health.sh`,
+  `bash scripts/./repo-health.sh`, a PATH invocation with a decoy same-named file in the cwd, a path
+  containing a space, `env -i`, `sh` and the `.git`-less tarball all land on the repository root. The
+  complete-tree report stays byte-identical to the pre-fix script on stdout and stderr (exit 0 both).
+  Residue (pre-existing, unchanged, measured): a hard link in a subtree still resolves to the link's
+  directory (no syscall returns a hard link's real path) and `bash <(cat scripts/repo-health.sh)`
+  resolves to `/dev`; `source` now resolves the real file but still `cd`s and `exit`s in the caller's
+  shell.
+
+- [ ] **Read sites outside the doc-figures block still block on a FIFO.** The doc-figures path now
+  refuses a non-regular measurement input before opening it, but other read sites do not:
+  `mkfifo frp-core/src/zz.rs` hangs the `Code size` section's `find … -name '*.rs' | xargs cat`; a
+  FIFO at `README.md` hangs the version gate's bash `grep`; a FIFO at `docs/developing.md` hangs the
+  curated-claims `open()`. Measured 2026-09-24 (macOS 26.6.2, no `timeout(1)`; a kill watchdog bounded
+  each probe at 20 s, all killed with zero `FAIL` lines and no `RESULT` line) — and the pre-fix script
+  hangs identically, so this is pre-existing, not a regression. **Done-when:** each read site refuses
+  (or bounds) a non-regular file, with one probe per site showing a loud non-zero exit instead of a
+  hang.
+- [ ] **Two gates print `ok` rows computed from a tree they could not read.** With
+  `frp-core/Cargo.toml` unreadable the version gate compares `""` to `""` and prints
+  `ok    frp-core/Cargo.toml`; with `frp-server/src` absent the SAFETY gate prints
+  `ok    every unsafe block has a // SAFETY: justification` over an empty file list. Measured
+  2026-09-24 by the second (adversarial) review round. Both runs still exit 1 for other reasons, so
+  these are false `ok` rows in the report rather than a false green — the same class the doc-figures
+  gate no longer has. **Done-when:** a gate whose input is missing or unreadable reports that instead
+  of an `ok` row, pinned by a probe.
 
 ---
 
