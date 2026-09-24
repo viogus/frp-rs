@@ -20,13 +20,13 @@
 # binary-size sections are pure reports; the archive-path report is not a content
 # gate but does fail the run if its scan cannot complete.
 #
-# The doc-figures gate measures expected values from the tree. A measurement
-# input the tree does not carry, or cannot read (missing, unreadable, not a
-# regular file, not UTF-8), is reported once as `FAIL partial tree: …` (or
-# `FAIL vendor manifest …`) and the gate exits 3, "could not measure"; a source
-# walk that cannot complete exits 2. Both are mapped to a red run with their own
-# message, so a partial tree is never reported as a doc figure the docs got
-# wrong.
+# The doc-figures gate measures expected values from the tree. Measurement
+# inputs the tree does not carry, or cannot read (missing, unreadable, not a
+# regular file, not UTF-8), are reported together in one run — one `FAIL partial
+# tree: …` (or `FAIL vendor manifest …`) line per input — and the gate exits 3,
+# "could not measure"; a source walk that cannot complete exits 2. Both are
+# mapped to a red run with their own message, so a partial tree is never
+# reported as a doc figure the docs got wrong.
 set -uo pipefail
 
 # Resolve the *real* script path before deriving the root. Two ways this goes
@@ -1314,11 +1314,14 @@ def unsafe_counts(crate):
                 blocks += len(re.findall(r'unsafe\s*\{', text))
                 fns += len(re.findall(r'unsafe fn', text))
                 impls += len(re.findall(r'unsafe impl', text))
-    if n_rs == 0:
+    if n_rs == 0 and not walk_errors:
         # An emptied <crate>/src measures (0,0,0), which the CLAIMS below would
         # report as "the tree measures 0" — a false accusation against the docs.
         # A source directory with no .rs file is not the source those counts come
-        # from. (The preflight only proves the directory exists.)
+        # from. (The preflight only proves the directory exists.) A recorded walk
+        # error wins: "no .rs files" would be false when the files exist but
+        # their directory could not be read, so the block-level
+        # `if walk_errors: sys.exit(2)` below reports that instead.
         raise PartialTree(src, reason='no .rs files')
     return (blocks, fns, impls)
 
