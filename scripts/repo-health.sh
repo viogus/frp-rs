@@ -20,7 +20,42 @@
 # binary-size sections are pure reports; the archive-path report is not a content
 # gate but does fail the run if its scan cannot complete.
 set -uo pipefail
-cd "$(dirname "$0")/.." || exit 1
+
+# Resolve the *real* script path before deriving the root. `$0` may be a
+# symlink: a link to this script dropped into a subtree makes `dirname "$0"` the
+# symlink's directory, so the whole run would scan that subtree as if it were
+# the repo. Measured 2026-09-24: a link at frp-core/src/rh-link.sh invoked as
+# `bash rh-link.sh` from that directory made the root `frp-core/` — the run lost
+# frp-core/Cargo.toml, printed an empty canonical version, and every section
+# scanned the wrong subtree. `$0` may also be a bare name (no `/`): then it is
+# relative to the caller's cwd, so resolve it there (falling back to `command -v`
+# for an invocation found on PATH).
+rh_self=$0
+case "$rh_self" in
+  */*) ;;
+  *) if [ -e "$rh_self" ]; then rh_self=$PWD/$rh_self
+     else rh_self=$(command -v -- "$rh_self") || exit 1; fi ;;
+esac
+# Follow symlinks portably: `readlink -f` is GNU-only, so loop on plain
+# `readlink` and resolve each target against the link's own directory. Bounded so
+# a symlink cycle cannot hang the run.
+rh_n=0
+while [ -L "$rh_self" ]; do
+  rh_dir=$(cd -P -- "$(dirname -- "$rh_self")" && pwd) || exit 1
+  rh_link=$(readlink -- "$rh_self") || exit 1
+  case "$rh_link" in
+    /*) rh_self=$rh_link ;;
+    *)  rh_self=$rh_dir/$rh_link ;;
+  esac
+  rh_n=$((rh_n + 1))
+  if [ "$rh_n" -gt 40 ]; then
+    printf '  FAIL  cannot resolve script path (symlink cycle?): %s\n' "$0"
+    exit 1
+  fi
+done
+# `cd -P` also resolves any symlinked directory left in the path, so the root is
+# the physical tree that really contains the script.
+cd -P -- "$(dirname -- "$rh_self")/.." || exit 1
 
 fail=0
 # The python3-driven gates are fail-closed: a missing interpreter means the gate
@@ -969,6 +1004,65 @@ EOF
   doc_claims=$(python3 -B - <<'PY'
 import os, re, subprocess, sys
 
+# --- partial-tree guard ------------------------------------------------------
+# Every file read below that produces an *expected* value is a measurement
+# input: if the working tree does not carry it, the gate must say exactly that
+# and exit 3 ("could not measure"), never traceback and never blame the docs.
+# Measured 2026-09-24 on a `git sparse-checkout init --cone && git
+# sparse-checkout set docs scripts` tree: vendor_version() raised
+# FileNotFoundError ('vendor/rustls/Cargo.toml') and the caller then printed
+# "a live doc quotes a figure the tree no longer matches" — a statement about
+# the docs for a tree that could not be measured at all.
+class PartialTree(Exception):
+    """A measurement input the tree cannot supply (sparse/partial checkout)."""
+
+    def __init__(self, path, detail=None):
+        super().__init__(path)
+        self.path = path
+        self.detail = detail
+
+
+def read_required(path):
+    """Read a measurement input; a missing one is a PartialTree, not a traceback."""
+    try:
+        with open(path, encoding='utf8') as f:
+            return f.read()
+    except OSError:
+        raise PartialTree(path)
+
+
+def report_partial(errs):
+    """Report every unreadable measurement input, then exit 3 ('could not measure')."""
+    for e in errs:
+        if e.detail:
+            print('  FAIL  partial tree: %s — cannot measure the doc figures' % e.detail)
+        elif e.path.startswith('vendor/') and e.path.endswith('/Cargo.toml'):
+            print('  FAIL  vendor manifest missing: %s' % e.path)
+        else:
+            print('  FAIL  partial tree: %s is missing — cannot measure the doc figures (sparse checkout?)'
+                  % e.path)
+    sys.exit(3)
+
+
+# Preflight — the complete set of measurement inputs, checked before the
+# `rust_comments` import (a missing scripts/ made that a ModuleNotFoundError
+# traceback) and before any read, so a partial tree is diagnosed in ONE run
+# rather than one path per run. read_required stays as the belt-and-braces net
+# for any path a later change adds but forgets to list here.
+MEASUREMENT_INPUTS = (
+    'scripts/compat-test.sh',             # count_compat() --list, n_xtcp, n_v2gated
+    'scripts/protocol-matrix.sh',         # n_rows
+    'scripts/rust_comments.py',           # imported just below: code_only()
+    'frp-core/Cargo.toml',                # canon_version
+    'frp-core/benches/crypto_bridge.rs',  # n_group
+    'frp-server/benches/nathole.rs',      # n_group
+    'vendor/rustls/Cargo.toml',           # vendor_version
+    'vendor/yamux/Cargo.toml',
+    'vendor/russh/Cargo.toml',
+)
+_partial = [PartialTree(p) for p in MEASUREMENT_INPUTS if not os.path.isfile(p)]
+if _partial:
+    report_partial(_partial)
 
 sys.path.insert(0, 'scripts')
 from rust_comments import code_only   # shared: comments removed, literals blanked
@@ -1017,15 +1111,27 @@ from rust_comments import code_only   # shared: comments removed, literals blank
 # mentions an attribute is not a function and does not count.
 
 def count_compat():
-    out = subprocess.run(['bash', 'scripts/compat-test.sh', '--list'],
-                         capture_output=True, text=True).stdout.split()
+    r = subprocess.run(['bash', 'scripts/compat-test.sh', '--list'],
+                       capture_output=True, text=True)
+    out = r.stdout.split()
+    # A present-but-unrunnable script must not read as "the tree measures 0" —
+    # that would be a false claim about the docs. A non-zero exit or an empty
+    # token list is the same "could not measure" condition as a missing file
+    # (which the preflight already caught); it is never a measured 0.
+    if r.returncode != 0 or not out:
+        raise PartialTree('scripts/compat-test.sh',
+                          '`bash scripts/compat-test.sh --list` produced no scenario list (exit %d)'
+                          % r.returncode)
     return sum(1 for x in out if re.match(r'^[a-z0-9_-]+$', x))
 
 # One subprocess: six claims quote this figure, and `--list` is the script's own
 # view of which scenarios will run. `--list` covers the non-XTCP scenarios only;
 # the 17 XTCP ones are `test_xtcp*()` definitions (they are selected by the
 # XTCP_TESTS[] loop, not by a top-level `run_test` line).
-n_compat = count_compat()
+try:
+    n_compat = count_compat()
+except PartialTree as e:
+    report_partial([e])
 
 walk_errors = []
 
@@ -1034,10 +1140,12 @@ def walk_error(e):
     walk_errors.append('%s: %s' % (getattr(e, 'filename', '?'), e.strerror or e))
 
 
-n_xtcp = sum(1 for l in open('scripts/compat-test.sh', encoding='utf8')
-             if re.match(r'^\s*"test_xtcp[a-z0-9_]*",?\s*$', l))
-n_rows = len(re.findall(r'^\s*run_row ', open('scripts/protocol-matrix.sh',
-               encoding='utf8').read(), re.M))
+try:
+    n_xtcp = sum(1 for l in read_required('scripts/compat-test.sh').split('\n')
+                 if re.match(r'^\s*"test_xtcp[a-z0-9_]*",?\s*$', l))
+    n_rows = len(re.findall(r'^\s*run_row ', read_required('scripts/protocol-matrix.sh'), re.M))
+except PartialTree as e:
+    report_partial([e])
 # NOTE: `proptest!` and protocol.rs "regular tests" counts are NOT curated either
 # — they are test-function counts that change whenever someone adds a test, the
 # same chore as the aggregate totals above. `repo-health.sh` still prints
@@ -1047,7 +1155,10 @@ n_rows = len(re.findall(r'^\s*run_row ', open('scripts/protocol-matrix.sh',
 # function that self-guards with `ensure_go_frp_v2 || return 0` (the two UDP V2
 # scenarios are invoked outside that block). The count is the union of names, so
 # a scenario that does both is counted once.
-_compat = open('scripts/compat-test.sh', encoding='utf8').read().split('\n')
+try:
+    _compat = read_required('scripts/compat-test.sh').split('\n')
+except PartialTree as e:
+    report_partial([e])
 _in_if, _guarded, _cur = set(), set(), None
 _seen_if = False
 for _l in _compat:
@@ -1069,7 +1180,7 @@ for _l in _compat:
 n_v2gated = len(_in_if | _guarded)
 
 def n_group(path):
-    m = re.search(r'criterion_group!\(([^)]*)\)', open(path, encoding='utf8').read())
+    m = re.search(r'criterion_group!\(([^)]*)\)', read_required(path))
     return len(re.findall(r'\bbench_[a-z0-9_]+', m.group(1))) if m else 0
 
 # NOTE: the *aggregate* test counts (total test functions, frp-server/tests) are
@@ -1118,19 +1229,27 @@ u_vnet = unsafe_counts('frp-vnet')
 # above does (from each vendor/<crate>/Cargo.toml).
 def vendor_version(name):
     path = os.path.join('vendor', name, 'Cargo.toml')
-    m = re.search(r'^version\s*=\s*"([^"]+)"', open(path, encoding='utf8').read(), re.M)
+    m = re.search(r'^version\s*=\s*"([^"]+)"', read_required(path), re.M)
     return m.group(1) if m else '?'
-
-v_rustls = vendor_version('rustls')
-v_yamux = vendor_version('yamux')
-v_russh = vendor_version('russh')
 
 # frp-rs's own version (canonical = frp-core/Cargo.toml; the version gate above
 # forces the other sources to match it). Live-doc restatements of it are pinned
 # here so a bump cannot leave prose behind. References to "Go frp vX.Y.Z" as the
 # *compat target* are a different statement and are not pinned.
-canon_version = re.search(r'^version\s*=\s*"([^"]+)"',
-                          open('frp-core/Cargo.toml', encoding='utf8').read(), re.M).group(1)
+#
+# Every expected value is measured here in one guarded block; the bench-group
+# values are precomputed rather than called inside CLAIMS so a missing input is
+# reported before any per-claim "claim not found"/"tree measures" line.
+try:
+    v_rustls = vendor_version('rustls')
+    v_yamux = vendor_version('yamux')
+    v_russh = vendor_version('russh')
+    canon_version = re.search(r'^version\s*=\s*"([^"]+)"',
+                              read_required('frp-core/Cargo.toml'), re.M).group(1)
+    g_crypto = n_group('frp-core/benches/crypto_bridge.rs')
+    g_nathole = n_group('frp-server/benches/nathole.rs')
+except PartialTree as e:
+    report_partial([e])
 
 if walk_errors:  # a tree walked with errors must not silently undercount
     for e in walk_errors:
@@ -1169,11 +1288,11 @@ CLAIMS = [
     ('docs/why-frp-rs.md',     r'([0-9]+) 条传输链路',                       n_rows,     'protocol-matrix.sh `run_row`'),
     ('docs/go-frp-compat-audit.md', r'^> ([0-9]+)/[0-9]+\)',               n_rows,     'protocol-matrix.sh `run_row`'),
     ('docs/developing.md',     r'([0-9]+) of which are gated on Go frp V2', n_v2gated, 'V2-gated scenarios in compat-test.sh'),
-    ('CLAUDE.md',              r'\(([0-9]+) groups:',                      n_group('frp-core/benches/crypto_bridge.rs'),
+    ('CLAUDE.md',              r'\(([0-9]+) groups:',                      g_crypto,
                                                                                         'criterion_group! in crypto_bridge.rs'),
-    ('docs/developing.md',     r'crypto_bridge\.rs.[^(]*\(([0-9]+) groups', n_group('frp-core/benches/crypto_bridge.rs'),
+    ('docs/developing.md',     r'crypto_bridge\.rs.[^(]*\(([0-9]+) groups', g_crypto,
                                                                                         'criterion_group! in crypto_bridge.rs'),
-    ('docs/developing.md',     r'nathole\.rs.[^(]*\(([0-9]+) groups',      n_group('frp-server/benches/nathole.rs'),
+    ('docs/developing.md',     r'nathole\.rs.[^(]*\(([0-9]+) groups',      g_nathole,
                                                                                         'criterion_group! in nathole.rs'),
     # Unsafe counts — the same numbers the "Unsafe usage" section prints.
     ('CLAUDE.md',              r'frp-core: ([0-9]+) blocks',               u_core[0],  'unsafe-block count, Unsafe usage section'),
@@ -1259,11 +1378,17 @@ PY
   # The decision is the Python process's exit status, never a grep over its
   # stdout: that stdout contains witness lines quoted *from the documents*, so a
   # document could otherwise inject `DOC-FIGURES: ok` and neutralise the gate.
+  # Exit 3 is the block's own "could not measure" status (a partial tree — its
+  # FAIL lines, one per missing input, are already in the captured output above);
+  # any other non-zero status is a real figure disagreement.
   doc_status=$?
   printf '%s\n' "$doc_claims"
   if [ "$doc_status" -eq 0 ]; then
     printf '  ok    %d curated doc figures agree with the tree (inventory above)\n' \
       "$(printf '%s\n' "$doc_claims" | grep -c 'claimed')"
+  elif [ "$doc_status" -eq 3 ]; then
+    printf '  FAIL  doc figures not evaluated — the tree is partial (exit 3)\n'
+    fail=1
   else
     printf '  FAIL  a live doc quotes a figure the tree no longer matches\n'
     fail=1
