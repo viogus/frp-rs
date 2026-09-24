@@ -19,18 +19,29 @@
 # repo-path resolution, and the curated doc-figure list. The code-size and
 # binary-size sections are pure reports; the archive-path report is not a content
 # gate but does fail the run if its scan cannot complete.
+#
+# The doc-figures gate measures expected values from the tree. A measurement
+# input the tree does not carry, or cannot read (missing, unreadable, not a
+# regular file, not UTF-8), is reported once as `FAIL partial tree: …` (or
+# `FAIL vendor manifest …`) and the gate exits 3, "could not measure"; a source
+# walk that cannot complete exits 2. Both are mapped to a red run with their own
+# message, so a partial tree is never reported as a doc figure the docs got
+# wrong.
 set -uo pipefail
 
-# Resolve the *real* script path before deriving the root. `$0` may be a
-# symlink: a link to this script dropped into a subtree makes `dirname "$0"` the
-# symlink's directory, so the whole run would scan that subtree as if it were
-# the repo. Measured 2026-09-24: a link at frp-core/src/rh-link.sh invoked as
-# `bash rh-link.sh` from that directory made the root `frp-core/` — the run lost
-# frp-core/Cargo.toml, printed an empty canonical version, and every section
-# scanned the wrong subtree. `$0` may also be a bare name (no `/`): then it is
-# relative to the caller's cwd, so resolve it there (falling back to `command -v`
-# for an invocation found on PATH).
-rh_self=$0
+# Resolve the *real* script path before deriving the root. Two ways this goes
+# wrong: (a) the path bash opened may be a symlink — a link to this script
+# dropped into a subtree makes `dirname` the symlink's directory, so the whole
+# run scans that subtree as the repo (measured 2026-09-24: a link at
+# frp-core/src/rh-link.sh invoked as `bash rh-link.sh` made the root `frp-core/`,
+# losing frp-core/Cargo.toml and printing an empty canonical version); (b) for a
+# *sourced* script `$0` is the caller's name, not the file — an interactive
+# `bash` resolves through `command -v` to /bin/bash and puts the root at `/`,
+# walking the whole filesystem. `BASH_SOURCE[0]` names the file bash actually
+# opened, so use it first (bash 3.2 has it); `$0` remains the fallback for
+# execution paths that do not set it, where a bare name (no `/`) is relative to
+# the caller's cwd and `command -v` is the last resort.
+rh_self=${BASH_SOURCE[0]:-$0}
 case "$rh_self" in
   */*) ;;
   *) if [ -e "$rh_self" ]; then
@@ -155,29 +166,44 @@ import os, re, sys
 sys.path.insert(0, 'scripts')
 from rust_comments import code_only   # shared: comments removed, literals blanked
 
+errors = []
+
+
+def note(msg):
+    errors.append(msg)
+
+
+def walk_error(e):
+    note('%s: %s' % (getattr(e, 'filename', '?'), e.strerror or e))
+
+
 for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
     src = os.path.join(crate, 'src')
     if not os.path.isdir(src):
         continue
     blocks = fns = impls = 0
-    try:
-        for root, _d, files in os.walk(src):
-            for fn in files:
-                if fn.endswith('.rs'):
-                    text = code_only(open(os.path.join(root, fn),
-                                          encoding='utf8',
+    for root, _d, files in os.walk(src, onerror=walk_error):
+        for fn in files:
+            if fn.endswith('.rs'):
+                path = os.path.join(root, fn)
+                try:
+                    text = code_only(open(path, encoding='utf8',
                                           errors='ignore').read())
-                    blocks += len(re.findall(r'unsafe\s*\{', text))
-                    fns += len(re.findall(r'unsafe fn', text))
-                    impls += len(re.findall(r'unsafe impl', text))
-    except OSError as e:
-        # A report must not traceback (or print an undercount) when a source
-        # file is unreadable; the SAFETY gate below fails closed on the same
-        # condition, with the same `scan error` wording and exit status.
-        print('scan error: %s: %s' % (getattr(e, 'filename', '?'), e.strerror or e),
-              file=sys.stderr)
-        sys.exit(4)
+                except OSError as e:
+                    note('%s: %s' % (path, e.strerror or e))
+                    continue
+                blocks += len(re.findall(r'unsafe\s*\{', text))
+                fns += len(re.findall(r'unsafe fn', text))
+                impls += len(re.findall(r'unsafe impl', text))
+    # Print every row even when part of its walk failed: the reader sees the
+    # count that *was* measurable, and the `scan error:` lines below plus the
+    # exit 4 mark it as incomplete rather than silently undercounted (the
+    # previous whole-loop try/except exited before printing any rows).
     print('%s %d %d %d' % (crate, blocks, fns, impls))
+if errors:
+    for e in errors:
+        print('scan error: %s' % e, file=sys.stderr)
+    sys.exit(4)
 PY
 )
   while read -r c b f i; do
@@ -1038,10 +1064,24 @@ class PartialTree(Exception):
 
 
 def read_required(path, errors=None):
-    """Read a measurement input; a missing/unreadable one is a PartialTree."""
+    """Read a measurement input; a missing/unreadable/non-UTF-8 one is a PartialTree."""
+    # Refuse anything that is not a regular file *before* opening it: a FIFO (or
+    # device) swapped in for a measurement input between the preflight and this
+    # read would otherwise block forever on open/read. Absent paths (including a
+    # dangling symlink) keep the "is missing" wording; a present non-file gets
+    # "not a regular file".
+    if not os.path.exists(path):
+        raise PartialTree(path)
+    if not os.path.isfile(path):
+        raise PartialTree(path, reason='not a regular file')
     try:
         with open(path, encoding='utf8', errors=errors) as f:
             return f.read()
+    except UnicodeDecodeError:
+        # Only manifests/scripts reach here strict; unsafe_counts deliberately
+        # passes errors='ignore' so one stray byte cannot make the Rust counts
+        # unmeasurable.
+        raise PartialTree(path, reason='not valid UTF-8')
     except OSError as e:
         raise PartialTree(path, reason=e.strerror or e.__class__.__name__)
 
@@ -1076,6 +1116,9 @@ def report_partial(errs):
         vendor = e.path.startswith('vendor/') and e.path.endswith('/Cargo.toml')
         if e.detail:
             print('  FAIL  partial tree: %s — cannot measure the doc figures' % e.detail)
+        elif e.reason == 'no .rs files':
+            print('  FAIL  partial tree: %s has no .rs files — cannot measure the doc figures'
+                  % e.path)
         elif e.reason in (None, 'No such file or directory', 'Not a directory'):
             if vendor:
                 print('  FAIL  vendor manifest missing: %s' % e.path)
@@ -1262,14 +1305,21 @@ def unsafe_counts(crate):
         # *expected* values for the CLAIMS below. The preflight lists these
         # directories too; this is the belt-and-braces path.
         raise PartialTree(src)
-    blocks = fns = impls = 0
+    blocks = fns = impls = n_rs = 0
     for root, _d, files in os.walk(src, onerror=walk_error):
         for fn in files:
             if fn.endswith('.rs'):
+                n_rs += 1
                 text = code_only(read_required(os.path.join(root, fn), errors='ignore'))
                 blocks += len(re.findall(r'unsafe\s*\{', text))
                 fns += len(re.findall(r'unsafe fn', text))
                 impls += len(re.findall(r'unsafe impl', text))
+    if n_rs == 0:
+        # An emptied <crate>/src measures (0,0,0), which the CLAIMS below would
+        # report as "the tree measures 0" — a false accusation against the docs.
+        # A source directory with no .rs file is not the source those counts come
+        # from. (The preflight only proves the directory exists.)
+        raise PartialTree(src, reason='no .rs files')
     return (blocks, fns, impls)
 
 try:
