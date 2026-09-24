@@ -1445,7 +1445,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   mismatch keeps `a live doc quotes a figure the tree no longer matches`. Reproduced on the item's own
   command (`git sparse-checkout init --cone && git sparse-checkout set docs scripts`): pre-fix
   `FileNotFoundError: [Errno 2] No such file or directory: 'vendor/rustls/Cargo.toml'` plus the
-  docs-blame line; post-fix 0 tracebacks, all 11 inputs reported in one run, exit 1. The first two
+  docs-blame line; post-fix 0 tracebacks, the full 11-input set checked and the 8 missing inputs
+  reported in one run, exit 1. The first two
   review rounds found the same class still reachable *inside* the block — `unsafe_counts`' unguarded
   `.rs` reads, a missing or emptied `frp-core/src` measuring a false 0, a non-UTF-8 input tracebacking,
   and a FIFO blocking the read — all closed in the same PR, each with a before/after probe in the
