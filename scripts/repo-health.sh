@@ -33,12 +33,18 @@ set -uo pipefail
 rh_self=$0
 case "$rh_self" in
   */*) ;;
-  *) if [ -e "$rh_self" ]; then rh_self=$PWD/$rh_self
-     else rh_self=$(command -v -- "$rh_self") || exit 1; fi ;;
+  *) if [ -e "$rh_self" ]; then
+       rh_self=$PWD/$rh_self
+     else
+       rh_self=$(command -v -- "$rh_self") || {
+         printf '  FAIL  cannot locate the script named on the command line: %s\n' "$0"
+         exit 1
+       }
+     fi ;;
 esac
-# Follow symlinks portably: `readlink -f` is GNU-only, so loop on plain
-# `readlink` and resolve each target against the link's own directory. Bounded so
-# a symlink cycle cannot hang the run.
+# Follow symlinks portably: `readlink -f` is not POSIX and older macOS/BSD
+# releases lack it, so loop on plain `readlink` and resolve each target against
+# the link's own directory. Bounded so a symlink cycle cannot hang the run.
 rh_n=0
 while [ -L "$rh_self" ]; do
   rh_dir=$(cd -P -- "$(dirname -- "$rh_self")" && pwd) || exit 1
@@ -154,15 +160,23 @@ for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
     if not os.path.isdir(src):
         continue
     blocks = fns = impls = 0
-    for root, _d, files in os.walk(src):
-        for fn in files:
-            if fn.endswith('.rs'):
-                text = code_only(open(os.path.join(root, fn),
-                                      encoding='utf8',
-                                      errors='ignore').read())
-                blocks += len(re.findall(r'unsafe\s*\{', text))
-                fns += len(re.findall(r'unsafe fn', text))
-                impls += len(re.findall(r'unsafe impl', text))
+    try:
+        for root, _d, files in os.walk(src):
+            for fn in files:
+                if fn.endswith('.rs'):
+                    text = code_only(open(os.path.join(root, fn),
+                                          encoding='utf8',
+                                          errors='ignore').read())
+                    blocks += len(re.findall(r'unsafe\s*\{', text))
+                    fns += len(re.findall(r'unsafe fn', text))
+                    impls += len(re.findall(r'unsafe impl', text))
+    except OSError as e:
+        # A report must not traceback (or print an undercount) when a source
+        # file is unreadable; the SAFETY gate below fails closed on the same
+        # condition, with the same `scan error` wording and exit status.
+        print('scan error: %s: %s' % (getattr(e, 'filename', '?'), e.strerror or e),
+              file=sys.stderr)
+        sys.exit(4)
     print('%s %d %d %d' % (crate, blocks, fns, impls))
 PY
 )
@@ -1005,10 +1019,10 @@ EOF
 import os, re, subprocess, sys
 
 # --- partial-tree guard ------------------------------------------------------
-# Every file read below that produces an *expected* value is a measurement
-# input: if the working tree does not carry it, the gate must say exactly that
-# and exit 3 ("could not measure"), never traceback and never blame the docs.
-# Measured 2026-09-24 on a `git sparse-checkout init --cone && git
+# Every read below that produces an *expected* value is a measurement input: if
+# the working tree does not carry it, or cannot read it, the gate must say
+# exactly that and exit 3 ("could not measure"), never traceback and never blame
+# the docs. Measured 2026-09-24 on a `git sparse-checkout init --cone && git
 # sparse-checkout set docs scripts` tree: vendor_version() raised
 # FileNotFoundError ('vendor/rustls/Cargo.toml') and the caller then printed
 # "a live doc quotes a figure the tree no longer matches" — a statement about
@@ -1016,51 +1030,85 @@ import os, re, subprocess, sys
 class PartialTree(Exception):
     """A measurement input the tree cannot supply (sparse/partial checkout)."""
 
-    def __init__(self, path, detail=None):
+    def __init__(self, path, detail=None, reason=None):
         super().__init__(path)
         self.path = path
-        self.detail = detail
+        self.detail = detail   # ready-made explanation (e.g. a failed subprocess)
+        self.reason = reason   # strerror when the path exists but cannot be read
 
 
-def read_required(path):
-    """Read a measurement input; a missing one is a PartialTree, not a traceback."""
+def read_required(path, errors=None):
+    """Read a measurement input; a missing/unreadable one is a PartialTree."""
     try:
-        with open(path, encoding='utf8') as f:
+        with open(path, encoding='utf8', errors=errors) as f:
             return f.read()
-    except OSError:
-        raise PartialTree(path)
+    except OSError as e:
+        raise PartialTree(path, reason=e.strerror or e.__class__.__name__)
+
+
+def preflight(inputs):
+    """Classify every measurement input, without opening it (a FIFO must not hang).
+
+    Returning every failure at once is the point: a partial tree is diagnosed in
+    one run, not one path per run. stat/access do not block, so a special file is
+    reported rather than read forever; read_required remains the net for a
+    present-but-unreadable file and for any path added later but not listed here.
+    """
+    errs = []
+    for path, kind in inputs:
+        if not os.path.exists(path):          # absent, or a dangling symlink
+            errs.append(PartialTree(path))
+        elif kind == 'd':
+            if not os.path.isdir(path):
+                errs.append(PartialTree(path, reason='not a directory'))
+            elif not os.access(path, os.R_OK | os.X_OK):
+                errs.append(PartialTree(path, reason='Permission denied'))
+        elif not os.path.isfile(path):
+            errs.append(PartialTree(path, reason='not a regular file'))
+        elif not os.access(path, os.R_OK):
+            errs.append(PartialTree(path, reason='Permission denied'))
+    return errs
 
 
 def report_partial(errs):
-    """Report every unreadable measurement input, then exit 3 ('could not measure')."""
+    """Report every unusable measurement input, then exit 3 ('could not measure')."""
     for e in errs:
+        vendor = e.path.startswith('vendor/') and e.path.endswith('/Cargo.toml')
         if e.detail:
             print('  FAIL  partial tree: %s — cannot measure the doc figures' % e.detail)
-        elif e.path.startswith('vendor/') and e.path.endswith('/Cargo.toml'):
-            print('  FAIL  vendor manifest missing: %s' % e.path)
+        elif e.reason in (None, 'No such file or directory', 'Not a directory'):
+            if vendor:
+                print('  FAIL  vendor manifest missing: %s' % e.path)
+            else:
+                print('  FAIL  partial tree: %s is missing — cannot measure the doc figures (sparse checkout?)'
+                      % e.path)
+        elif vendor:
+            print('  FAIL  vendor manifest unreadable: %s (%s)' % (e.path, e.reason))
         else:
-            print('  FAIL  partial tree: %s is missing — cannot measure the doc figures (sparse checkout?)'
-                  % e.path)
+            print('  FAIL  partial tree: %s is unreadable (%s) — cannot measure the doc figures'
+                  % (e.path, e.reason))
     sys.exit(3)
 
 
 # Preflight — the complete set of measurement inputs, checked before the
 # `rust_comments` import (a missing scripts/ made that a ModuleNotFoundError
 # traceback) and before any read, so a partial tree is diagnosed in ONE run
-# rather than one path per run. read_required stays as the belt-and-braces net
-# for any path a later change adds but forgets to list here.
+# rather than one path per run. 'f' = file, 'd' = directory. read_required stays
+# as the belt-and-braces net for any path a later change adds but forgets here.
 MEASUREMENT_INPUTS = (
-    'scripts/compat-test.sh',             # count_compat() --list, n_xtcp, n_v2gated
-    'scripts/protocol-matrix.sh',         # n_rows
-    'scripts/rust_comments.py',           # imported just below: code_only()
-    'frp-core/Cargo.toml',                # canon_version
-    'frp-core/benches/crypto_bridge.rs',  # n_group
-    'frp-server/benches/nathole.rs',      # n_group
-    'vendor/rustls/Cargo.toml',           # vendor_version
-    'vendor/yamux/Cargo.toml',
-    'vendor/russh/Cargo.toml',
+    ('scripts/compat-test.sh', 'f'),             # count_compat() --list, n_xtcp, n_v2gated
+    ('scripts/protocol-matrix.sh', 'f'),         # n_rows
+    ('scripts/rust_comments.py', 'f'),           # imported just below: code_only()
+    ('frp-core/Cargo.toml', 'f'),                # canon_version
+    ('frp-core/benches/crypto_bridge.rs', 'f'),  # n_group
+    ('frp-server/benches/nathole.rs', 'f'),      # n_group
+    ('vendor/rustls/Cargo.toml', 'f'),           # vendor_version
+    ('vendor/yamux/Cargo.toml', 'f'),
+    ('vendor/russh/Cargo.toml', 'f'),
+    ('frp-core/src', 'd'),                       # unsafe_counts('frp-core')
+    ('frp-vnet/src', 'd'),                       # unsafe_counts('frp-vnet')
 )
-_partial = [PartialTree(p) for p in MEASUREMENT_INPUTS if not os.path.isfile(p)]
+_partial = preflight(MEASUREMENT_INPUTS)
 if _partial:
     report_partial(_partial)
 
@@ -1210,20 +1258,25 @@ def n_group(path):
 def unsafe_counts(crate):
     src = os.path.join(crate, 'src')
     if not os.path.isdir(src):
-        return (0, 0, 0)
+        # A partial tree must not read as "0 unsafe blocks": the counts are
+        # *expected* values for the CLAIMS below. The preflight lists these
+        # directories too; this is the belt-and-braces path.
+        raise PartialTree(src)
     blocks = fns = impls = 0
     for root, _d, files in os.walk(src, onerror=walk_error):
         for fn in files:
             if fn.endswith('.rs'):
-                text = code_only(open(os.path.join(root, fn), encoding='utf8',
-                                                 errors='ignore').read())
+                text = code_only(read_required(os.path.join(root, fn), errors='ignore'))
                 blocks += len(re.findall(r'unsafe\s*\{', text))
                 fns += len(re.findall(r'unsafe fn', text))
                 impls += len(re.findall(r'unsafe impl', text))
     return (blocks, fns, impls)
 
-u_core = unsafe_counts('frp-core')
-u_vnet = unsafe_counts('frp-vnet')
+try:
+    u_core = unsafe_counts('frp-core')
+    u_vnet = unsafe_counts('frp-vnet')
+except PartialTree as e:
+    report_partial([e])
 
 # Vendored crate versions, computed exactly as the "Vendored crates" section
 # above does (from each vendor/<crate>/Cargo.toml).
@@ -1378,9 +1431,10 @@ PY
   # The decision is the Python process's exit status, never a grep over its
   # stdout: that stdout contains witness lines quoted *from the documents*, so a
   # document could otherwise inject `DOC-FIGURES: ok` and neutralise the gate.
-  # Exit 3 is the block's own "could not measure" status (a partial tree — its
-  # FAIL lines, one per missing input, are already in the captured output above);
-  # any other non-zero status is a real figure disagreement.
+  # Exit 3 is the block's own "could not measure" status (a partial/unreadable
+  # tree — its FAIL lines, one per input, are already in the captured output
+  # above); exit 2 means the source walk could not complete, which is also not a
+  # statement about the docs; any other non-zero status is a real disagreement.
   doc_status=$?
   printf '%s\n' "$doc_claims"
   if [ "$doc_status" -eq 0 ]; then
@@ -1388,6 +1442,9 @@ PY
       "$(printf '%s\n' "$doc_claims" | grep -c 'claimed')"
   elif [ "$doc_status" -eq 3 ]; then
     printf '  FAIL  doc figures not evaluated — the tree is partial (exit 3)\n'
+    fail=1
+  elif [ "$doc_status" -eq 2 ]; then
+    printf '  FAIL  doc figures not evaluated — the walk reported errors (exit 2)\n'
     fail=1
   else
     printf '  FAIL  a live doc quotes a figure the tree no longer matches\n'
