@@ -667,13 +667,15 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   average ramped 16.9 → 96.8, bracketing the reported 61–77), plus **10/10 of observation 1's target
   alone** (`cargo test -p frp-server --test tcpmux`); a grep for `panicked at` / `test result: FAILED`
   / `error[E` across all 110 logs found nothing, so no failure occurred and there was nothing to
-  capture bytes from. **Independently replicated by Reviewer 1: 0/48** (25 quiet parallel, 5 quiet
-  serial, 12 loaded with the 1-min average passing through and beyond the band to 160.55, 6
-  `tcpmux`-alone), with both targets listed and the named tests (`test_tcpmux_proxy_auth`, the 407
+  capture bytes from. **Independently replicated by Reviewer 1: 0/48** (25 parallel on a host shared
+  with another reviewer's builds but with no mutation build in this tree, 5 quiet serial, 12 loaded
+  with the 1-min average passing through and beyond the band to 160.55, 6 `tcpmux`-alone), with both
+  targets listed and the named tests (`test_tcpmux_proxy_auth`, the 407
   test) shown executing. **Reviewer 2 (adversarial) reproduced the mechanism in its own tree** —
   deleting the 407 arm's `return;` fails **3/3** at `tests/tcpmux.rs:679` with observation 2's message
   byte-for-byte, and stripping the 407's `Proxy-Authenticate` fails **3/3** at `:698` with observation
-  1's — and ran 19 more green runs (default/2/4/8 threads, loads ~30 → ~145), plus the **true
+  1's — and ran 19 more green runs (default/2/4/8 threads; 18 under applied load in the ~30 → ~145
+  range, plus a baseline at ambient ~11), plus the **true
   observation-1 shape** the author could not run: with `frps` built and `FRPS_BIN` set,
   `cargo test -p frp-server` exits 0 across all 35 targets with `Running tests/tcpmux.rs` and
   `test_tcpmux_proxy_auth ... ok`. **Citation correction:** the two observations cite
@@ -693,8 +695,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   mechanism (none was observed to collide), mutation+relink+revert *inside* one batch is invisible to
   a per-batch hash check, and a
   green clean tree cannot by itself prove the original two runs were contaminated rather than very
-  rare — it only fails to reproduce them in 110 attempts spanning quiet and heavily loaded
-  conditions. The process lesson the item names is already enforced in
+  rare — it only fails to reproduce them in the ~180 attempts above (110 author + 48 Reviewer 1 + 19
+  Reviewer 2) spanning quiet and heavily loaded conditions. The process lesson the item names is already enforced in
   `docs/developing.md § Review protocol` ("Mutate in your own checkout, never the tree being
   measured"), so no further durable change was needed.
 - [x] **`frp-client`'s `start_paused` socket-deadline tests are flaky on this host at *default*
