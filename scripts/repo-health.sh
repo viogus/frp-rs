@@ -105,8 +105,6 @@ except FileNotFoundError:
     sys.exit(2)                       # missing (or a dangling symlink)
 except PermissionError:
     sys.exit(5)
-except IsADirectoryError:
-    sys.exit(6)
 except OSError:
     sys.exit(4)
 if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -144,7 +142,6 @@ read_into() { # <label> <path>
     2) reason=missing ;;
     3) reason='not a regular file' ;;
     5) reason='Permission denied' ;;
-    6) reason='a directory' ;;
     *) reason='unreadable' ;;
   esac
   printf '  FAIL  %s could not be read: %s (%s) — not evaluated\n' "$1" "$2" "$reason"
@@ -748,10 +745,18 @@ fi
 GIT_BOUND=15
 git_bounded() { # <git args...>
   python3 -B -c '
-import subprocess, sys
+import os, subprocess, sys
 bound = int(sys.argv[1])
+# Same environment discipline as the path scan: a caller GIT_DIR/GIT_INDEX_FILE/
+# GIT_COMMON_DIR would point git at another tree, and GIT_TRACE* would decorate
+# stderr; both are dropped here too.
+drop = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY")
+env = {k: v for k, v in os.environ.items()
+       if k not in drop and not k.startswith("GIT_TRACE")}
 try:
-    r = subprocess.run(["git"] + sys.argv[2:], stdout=subprocess.PIPE, timeout=bound)
+    r = subprocess.run(["git"] + sys.argv[2:], stdout=subprocess.PIPE,
+                       env=env, timeout=bound)
 except OSError as e:
     sys.stderr.write("git could not be run: %s\n" % e)
     sys.exit(127)
@@ -944,57 +949,167 @@ fi
 # the scans printing `ok` with rc=0 and "invariants hold". A mode-000
 # `.github/workflows` directory fails its listing just as silently, so that is
 # checked too. Any refusal suppresses both scans' `ok` lines.
+# The two scans below read the workflow file set through the guarded reader and
+# scan the *bytes it read*; they must not re-open the paths. The earlier shape
+# guarded each file with `read_into` and then re-opened the same paths with
+# `find -exec awk` / `-exec grep`, so a symlink flipping regular<->FIFO between
+# the guard and the scan hung the scan (measured 2/12 runs), and a missing `awk`
+# made `… || true` swallow the whole scan while the `ok` line still printed.
+# One python block walks the set with `os.walk(followlinks=False)` and the same
+# O_NONBLOCK + fstat reader, feeds the text to a faithful port of the awk state
+# machine and of the floating grep, and prints `C <path:line:line>` / `D <…>`
+# hits. The state is per file: `{} +` batching could leak `in_item` across files
+# at an ARG_MAX boundary (a latent, unintended behaviour); the port makes the
+# intended per-file semantics explicit.
 wf_scan_ok=1
+wf_scan_reason="a workflow file could not be read"
 if [ -d .github/workflows ] && { [ ! -r .github/workflows ] || [ ! -x .github/workflows ]; }; then
   printf '  FAIL  .github/workflows is not readable/searchable — toolchain scan not evaluated\n'
   fail=1
   wf_scan_ok=0
 fi
-while IFS= read -r wf; do
-  [ -n "$wf" ] || continue
-  read_into "$wf" "$wf"
-  [ "$READ_OK" = 1 ] || wf_scan_ok=0
-done <<EOF
-$(find -L .github/workflows \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null)
-EOF
-tc_input=""
-if [ "$wf_scan_ok" = 1 ]; then
-tc_input=$(find -L .github/workflows -maxdepth 1 -type f \
-  \( -name '*.yml' -o -name '*.yaml' \) -exec awk '
-  BEGIN { item_indent = -1; in_item = 0; target = 0 }
-  {
-    line = $0
-    match(line, /^[[:space:]]*/); ind = RLENGTH
-    if (substr(line, ind + 1, 1) == "-" && (!in_item || ind <= item_indent)) {
-      item_indent = ind; in_item = 1; target = 0
-      rest = substr(line, ind + 2)
-      if (rest ~ /(^|[{,])[[:space:]]*["'"'"']?[uU][sS][eE][sS]["'"'"']?[[:space:]]*:[[:space:]]*["'"'"']?actions-rust-lang\/setup-rust-toolchain@/) {
-        target = 1
-        if (match(rest, /(^|[{,[:space:]])["'"'"']?[tT][oO][oO][lL][cC][hH][aA][iI][nN]["'"'"']?[[:space:]]*:/)) {
-          if (index(substr(rest, 1, RSTART - 1), "#") == 0) print FILENAME ":" FNR ":" line
-        }
-      }
-      next
-    }
-    if (!in_item) next
-    if (line ~ /^[[:space:]]*$/) next
-    if (ind <= item_indent) { in_item = 0; target = 0; next }
-    if (line ~ /^[[:space:]]*#/) next
-    if (!target) {
-      if (line ~ /^[[:space:]]*(-[[:space:]]+)?["'"'"']?[uU][sS][eE][sS]["'"'"']?[[:space:]]*:[[:space:]]*["'"'"']?actions-rust-lang\/setup-rust-toolchain@/ ||
-          line ~ /[{,][[:space:]]*["'"'"']?[uU][sS][eE][sS]["'"'"']?[[:space:]]*:[[:space:]]*["'"'"']?actions-rust-lang\/setup-rust-toolchain@/) target = 1
-      else next
-    }
-    if (match(line, /(^|[{,[:space:]])["'"'"']?[tT][oO][oO][lL][cC][hH][aA][iI][nN]["'"'"']?[[:space:]]*:/)) {
-      if (index(substr(line, 1, RSTART - 1), "#") == 0) print FILENAME ":" FNR ":" line
-    }
-  }
-' {} + 2>/dev/null || true)
+if [ "$have_python" != 1 ]; then
+  wf_scan_ok=0
+  wf_scan_reason="python3 not found (a green run needs it)"
 fi
+wf_out=""
+# Kept as a function (not `$(python3 - <<'PY' …)`) because bash 3.2 lexes a
+# here-document body inside a command substitution as shell text, so the
+# scanner's `["']` character classes would open a shell quote and the parse
+# would fail. A here-document in a function body is read literally.
+wf_scan() {
+  python3 -B - <<'PY'
+import errno, os, re, stat, sys
+
+SP = r'[ \t\r\v\f]'
+SPIN = ' \t\r\v\f'          # the same set without the class brackets, to embed
+Q = '["\x27]'
+# The closed-form scanner's regexes, one item at a time (a record never holds a
+# newline, so POSIX [[:space:]] is SP here):
+ARM_REST = re.compile(r'(^|[{,])' + SP + r'*' + Q + r'?[uU][sS][eE][sS]' + Q + r'?'
+                      + SP + r'*:' + SP + r'*' + Q + r'?actions-rust-lang/setup-rust-toolchain@')
+TOOLKEY = re.compile(r'(^|[{,' + SPIN + r'])' + Q + r'?[tT][oO][oO][lL][cC][hH][aA][iI][nN]'
+                     + Q + r'?' + SP + r'*:')
+ARM_LINE = re.compile(r'^' + SP + r'*(-' + SP + r'+)?' + Q + r'?[uU][sS][eE][sS]'
+                      + Q + r'?' + SP + r'*:' + SP + r'*' + Q + r'?actions-rust-lang/setup-rust-toolchain@')
+ARM_FLOW = re.compile(r'[{,]' + SP + r'*' + Q + r'?[uU][sS][eE][sS]' + Q + r'?'
+                      + SP + r'*:' + SP + r'*' + Q + r'?actions-rust-lang/setup-rust-toolchain@')
+FLOAT1 = re.compile(r'^' + SP + r'*(-' + SP + r'+)?run:' + SP + r'*rustup' + SP + r'+default' + SP)
+FLOAT2 = re.compile(r'^' + SP + r'+rustup' + SP + r'+default' + SP)
+state = {'bad': False}
+
+
+def walk_error(e):
+    state['bad'] = True
+    print('  FAIL  %s: %s — workflow scan not evaluated'
+          % (getattr(e, 'filename', '?'), e.strerror or e), file=sys.stderr)
+
+
+def safe_read(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, 'not a regular file', path)
+        with os.fdopen(fd, 'r', encoding='utf8', errors='ignore') as f:
+            fd = -1
+            return f.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def refusal(e):
+    if isinstance(e, FileNotFoundError):
+        return 'missing'
+    if isinstance(e, PermissionError):
+        return 'Permission denied'
+    return e.strerror or 'unreadable'
+
+
+def toolchain_hits(text):
+    """Port of the awk step scanner; state is per file."""
+    hits = []
+    item_indent = -1
+    in_item = False
+    target = False
+    for n, line in enumerate(text.split('\n'), 1):
+        ind = re.match(SP + '*', line).end()
+        if line[ind:ind + 1] == '-' and (not in_item or ind <= item_indent):
+            item_indent = ind
+            in_item = True
+            target = False
+            rest = line[ind + 1:]
+            if ARM_REST.search(rest):
+                target = True
+                k = TOOLKEY.search(rest)
+                if k and '#' not in rest[:k.start()]:
+                    hits.append((n, line))
+            continue
+        if not in_item:
+            continue
+        if re.match(SP + '*$', line):
+            continue
+        if ind <= item_indent:
+            in_item = False
+            target = False
+            continue
+        if re.match(SP + '*#', line):
+            continue
+        if not target:
+            if ARM_LINE.search(line) or ARM_FLOW.search(line):
+                target = True
+            else:
+                continue
+        k = TOOLKEY.search(line)
+        if k and '#' not in line[:k.start()]:
+            hits.append((n, line))
+    return hits
+
+
+def floating_hits(text):
+    return [(n, line) for n, line in enumerate(text.split('\n'), 1)
+            if FLOAT1.search(line) or FLOAT2.search(line)]
+
+
+files = []
+for dirpath, _dirs, names in os.walk('.github/workflows', onerror=walk_error,
+                                     followlinks=False):
+    for fn in sorted(names):
+        if fn.endswith(('.yml', '.yaml')):
+            files.append(os.path.join(dirpath, fn))
+files.sort()
+top = os.path.join('.github', 'workflows')
+for path in files:
+    try:
+        text = safe_read(path)
+    except OSError as e:
+        state['bad'] = True
+        print('  FAIL  %s could not be read: %s (%s) — not evaluated'
+              % (path, path, refusal(e)), file=sys.stderr)
+        continue
+    if os.path.dirname(path) == top:
+        for n, line in toolchain_hits(text):
+            print('C %s:%d:%s' % (path, n, line))
+    for n, line in floating_hits(text):
+        print('D %s:%d:%s' % (path, n, line))
+sys.exit(4 if state['bad'] else 0)
+PY
+}
+if [ "$wf_scan_ok" = 1 ]; then
+  wf_out=$(wf_scan)
+  wf_rc=$?
+  if [ "$wf_rc" -ne 0 ]; then
+    wf_scan_ok=0
+    wf_scan_reason="a workflow file could not be read"
+    fail=1
+  fi
+fi
+tc_input=$(printf '%s\n' "$wf_out" | sed -n 's/^C //p')
+floating=$(printf '%s\n' "$wf_out" | sed -n 's/^D //p')
 if [ "$wf_scan_ok" = 0 ]; then
-  # A workflow file the guard could not read is named above; an `ok` here would
-  # certify a file set the gate never read.
-  printf '  FAIL  setup-rust-toolchain toolchain input scan not evaluated — a workflow file could not be read\n'
+  # A file the scan could not read, or a scanner that could not start, is named
+  # above; an `ok` here would certify a scan that did not happen.
+  printf '  FAIL  setup-rust-toolchain toolchain input scan not evaluated — %s\n' "$wf_scan_reason"
   fail=1
 elif [ -n "$tc_input" ]; then
   printf '%s\n' "$tc_input" | sed 's/^/    /'
@@ -1028,13 +1143,10 @@ fi
 #     TODO.md item; this gate does not cover it.
 #   * check (c) above is scoped to the setup-action step and so does not see a
 #     `toolchain:` key that some other action might consume.
-floating=""
-if [ "$wf_scan_ok" = 1 ]; then
-  floating=$(find -L .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) \
-    -exec grep -HnE '^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*rustup[[:space:]]+default[[:space:]]|^[[:space:]]+rustup[[:space:]]+default[[:space:]]' {} + 2>/dev/null || true)
-fi
+# `floating` was filled by the python scan above (the `D …` hits), which read the
+# same bytes the guard read — no re-open, so no flip can slip in.
 if [ "$wf_scan_ok" = 0 ]; then
-  printf '  FAIL  floating toolchain selection scan not evaluated — a workflow file could not be read\n'
+  printf '  FAIL  floating toolchain selection scan not evaluated — %s\n' "$wf_scan_reason"
   fail=1
 elif [ -n "$floating" ]; then
   printf '%s\n' "$floating" | sed 's/^/    /'
@@ -1456,6 +1568,10 @@ def tracked_files():
             raise IndexUnavailable('%s is not a regular file — git would block on it' % p)
     common = gd
     cdfile = os.path.join(gd, 'commondir')
+    # A *missing* commondir is legitimate (a normal repo); a present non-regular
+    # one would block git exactly like HEAD/config/index, so refuse it too.
+    if os.path.lexists(cdfile) and not os.path.isfile(cdfile):
+        raise IndexUnavailable('%s is not a regular file — git would block on it' % cdfile)
     if os.path.isfile(cdfile):
         try:
             rel = safe_read(cdfile).strip()
