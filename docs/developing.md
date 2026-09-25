@@ -966,6 +966,22 @@ that claimed them would be certifying text, not behaviour. The inventory is mean
 to be read at release time; a claim that no longer matches fails the `health` CI
 job.
 
+A tree the gate cannot measure is **not** certified. Every file that supplies an
+*expected* value for an entry — `scripts/compat-test.sh`,
+`scripts/protocol-matrix.sh`, `scripts/rust_comments.py`, `frp-core/Cargo.toml`,
+the two bench sources and each vendored crate's manifest — is checked before it is
+read. An input the tree does not carry prints a partial-tree line (a missing path,
+or `vendor manifest missing: …`); one it cannot read names the reason
+(`Permission denied`, `not a regular file`, `not valid UTF-8`); a crate source
+directory with no `.rs` file is refused rather than counted as zero. The block then
+exits 3, a source walk that cannot complete exits 2, and `repo-health.sh` maps both
+to its own failure line and a red run — so a sparse checkout or an unreadable input
+is reported as unmeasurable, never as "a live doc quotes a figure the tree no
+longer matches". Residue: gates outside this block (version alignment, the
+unsafe/SAFETY scan) can still print `ok` rows computed from a tree they could not
+read, and the read sites outside the doc-figures block can still block on a
+non-regular file; both are recorded in `TODO.md`.
+
 ## 6. Release Process
 
 ### Pre-release checklist
