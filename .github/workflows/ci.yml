@@ -559,6 +559,29 @@ jobs:
         run: cargo check -p frp-server --no-default-features --features tls,http-proxy,tcp-mux --all-targets
         env:
           RUSTFLAGS: "-D warnings"
+      - name: Check frp-server dashboard test targets compile (isolated, dashboard only)
+        # The dashboard tier is opt-in (`dashboard = ["dep:prometheus",
+        # "dep:axum", "frp-core/admin-auth"]`, frp-server/Cargo.toml) and no
+        # other step compiles frp-server's test targets with it ON. `-p
+        # frp-server` keeps frp-server's own features at just `dashboard`, so
+        # frp-server/oidc is OFF while frp-core/oidc is ON — frp-server's
+        # dev-dependency on frp-client pulls frp-client's defaults, which
+        # forward frp-core/oidc. That unification is the gate's point: a
+        # frp-core item that exists only feature-on must not make an
+        # frp-server `match` non-exhaustive, and an frp-server #[cfg] gate
+        # naming a feature that is off here (tls) must not hide an item that
+        # is actually used. Measured before the fix:
+        #   RUSTFLAGS="-D warnings" cargo check -p frp-server \
+        #     --no-default-features --features dashboard --all-targets
+        # exited 101 with E0004 `AuthMethod::Oidc` not covered
+        # (dashboard.rs, frp-server/oidc off), E0425 `TcpListener` and
+        # `TcpStream`, E0433 `io` (NoDelayListener serves the plain-HTTP
+        # dashboard path with tls off, but its imports were tls-gated) and
+        # unused-import `AtomicU64` (only the tls-gated handshake throttle uses
+        # it). After the fix: exit 0 with -D warnings.
+        run: cargo check -p frp-server --no-default-features --features dashboard --all-targets
+        env:
+          RUSTFLAGS: "-D warnings"
       - name: Check frp-core tier test targets compile (isolated, no features)
         # The frp-core sibling of the two steps above: `-p frp-core` makes it
         # the only root and frp-core's own features are at the micro set

@@ -2142,4 +2142,40 @@ mod tests {
             "error leaked the token-file path: {err}"
         );
     }
+
+    /// Measured behaviour when frp-server's own `oidc` feature is OFF (frp-core's
+    /// `oidc` may still be ON through feature unification — the configuration the
+    /// `-p frp-server --no-default-features --features dashboard` CI step
+    /// compiles). `method = "oidc"` is **accepted**, not a load error: the
+    /// `"oidc"` arm of `build_auth_config`'s parse is gated on frp-server/oidc, so
+    /// this build falls through to `Token`.
+    ///
+    /// It still fails closed: an empty token is refused by `check_startup`, and
+    /// with a token set an OIDC-style login (no `privilege_key`, so a JWT cannot
+    /// satisfy `generate_token`) is rejected by the token path. The frp-core stub
+    /// error ("OIDC feature disabled at compile time") is not reachable from a
+    /// config in this build — the method never becomes `Oidc`, so no stub
+    /// verifier is consulted. Asserting the parse as-is, rather than a rejection
+    /// the code does not implement.
+    #[test]
+    #[cfg(not(feature = "oidc"))]
+    fn oidc_method_with_server_oidc_off_parses_as_token_and_fails_closed() {
+        let mut auth = frp_core::config::AuthServerConfig {
+            method: "oidc".to_string(),
+            ..Default::default()
+        };
+        let cfg = build_auth_config(&auth, &UnsafeFeatures::default()).expect("parse");
+        assert_eq!(cfg.method, AuthMethod::Token);
+        assert!(
+            cfg.check_startup().is_err(),
+            "an OIDC config with no token must refuse startup"
+        );
+
+        auth.token = "secret".to_string();
+        let cfg = build_auth_config(&auth, &UnsafeFeatures::default()).expect("parse");
+        assert_eq!(cfg.method, AuthMethod::Token);
+        assert!(cfg.check_startup().is_ok());
+        // No privilege_key => an OIDC/JWT login cannot authenticate as Token.
+        assert!(cfg.validate_login(None, Some(1_700_000_000)).is_err());
+    }
 }

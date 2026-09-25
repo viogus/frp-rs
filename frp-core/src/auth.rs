@@ -203,7 +203,24 @@ impl Default for AuthConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AuthMethod {
     Token,
-    #[cfg(feature = "oidc")]
+    /// OIDC (JWT) auth.
+    ///
+    /// Deliberately **not** feature-gated, unlike the config parses that
+    /// construct it (each dependent crate builds it only under its own `oidc`
+    /// feature): `frp-core` can be compiled with `feature = "oidc"` on while a
+    /// dependent crate's own `oidc` is off (Cargo feature unification — e.g.
+    /// `frp-server`'s dev-dependency on `frp-client` pulls `frp-core/oidc`
+    /// in), and a variant that exists only in the feature-on build makes every
+    /// `match` in such a dependent crate non-exhaustive in the feature-off
+    /// build. That is exactly the E0004 at `frp-server/src/dashboard.rs` that
+    /// `cargo check -p frp-server --no-default-features --features dashboard
+    /// --all-targets` used to hit; do not "tidy" the `#[cfg]` back on. Same
+    /// shape as `ConnectionType::WebSocket` in
+    /// `frp-core/src/transport/mod.rs`.
+    ///
+    /// Only ever constructed when the *dependent* crate's `oidc` feature is on
+    /// (its config parse is gated); with frp-core's `oidc` off the runtime OIDC
+    /// entry points are the stubs below, so an OIDC login still fails closed.
     Oidc,
 }
 
@@ -274,7 +291,6 @@ impl AuthConfig {
                 }
                 Ok(String::new())
             }
-            #[cfg(feature = "oidc")]
             AuthMethod::Oidc => {
                 Err("OIDC auth requires server-side verifier (not configured)".into())
             }
@@ -305,7 +321,6 @@ impl AuthConfig {
         }
         match self.method {
             AuthMethod::Token => Ok(generate_token(token.as_str(), timestamp)),
-            #[cfg(feature = "oidc")]
             AuthMethod::Oidc => Err("OIDC auth does not use token login keys".into()),
         }
     }
@@ -319,8 +334,11 @@ impl AuthConfig {
                 return Err("CRITICAL: [auth].token / auth.tokenSource resolved empty with token auth method — server would accept ALL connections. Set a strong token in the config file.".into());
             }
         }
-        // OIDC configuration validation.
-        #[cfg(feature = "oidc")]
+        // OIDC configuration validation. Not feature-gated: the `Oidc` variant is
+        // always present and the runtime OIDC entry points are feature-gated, so
+        // validating whenever the method is `Oidc` is the fail-closed direction
+        // (with the feature off the variant is unconstructible from config, but a
+        // manually built one must still be rejected on an incomplete issuer).
         if self.method == AuthMethod::Oidc {
             if self.oidc_issuer.is_empty() {
                 return Err(
@@ -2459,8 +2477,10 @@ pub use oidc_impl::{LoginOidcToken, OidcClient, OidcVerifier};
 
 // Stub types for when the oidc feature is disabled. These exist so that
 // type-level references (struct fields, function parameters, Option<Arc<...>>)
-// compile without per-site #[cfg] gates. Actual OIDC logic paths are gated
-// by AuthMethod::Oidc which is behind #[cfg(feature = "oidc")].
+// compile without per-site #[cfg] gates. Actual OIDC logic paths are gated by
+// the feature that *constructs* AuthMethod::Oidc (config parsing), not by the
+// variant: the variant itself is always present so a dependent crate's `match`
+// stays exhaustive (see the variant's doc comment).
 #[cfg(not(feature = "oidc"))]
 pub struct OidcClient;
 #[cfg(not(feature = "oidc"))]
@@ -2473,7 +2493,8 @@ pub struct LoginOidcToken {
 }
 #[cfg(not(feature = "oidc"))]
 impl OidcClient {
-    /// Stub — the oidc feature is disabled; AuthMethod::Oidc is unreachable.
+    /// Stub — the oidc feature is disabled, so config parsing cannot construct
+    /// AuthMethod::Oidc and this client is never reached through it.
     pub async fn set_login(&self, _login: &mut crate::msg::Login) -> Result<(), String> {
         Err("OIDC feature disabled at compile time".into())
     }
@@ -2508,7 +2529,8 @@ impl OidcVerifier {
         Err("OIDC feature disabled at compile time".into())
     }
     /// Stub — jti replay checking is unreachable when the oidc feature is
-    /// disabled (AuthMethod::Oidc is compiled out).
+    /// disabled (config parsing cannot construct AuthMethod::Oidc, so the
+    /// verifier is always None on the login path).
     pub fn check_replay(
         &self,
         _jti: Option<&str>,
@@ -2518,8 +2540,8 @@ impl OidcVerifier {
         Ok(())
     }
     /// Stub — the jti replay pre-check (S2) is unreachable when the oidc
-    /// feature is disabled (AuthMethod::Oidc is compiled out; the verifier
-    /// is always None on the login path).
+    /// feature is disabled (config parsing cannot construct AuthMethod::Oidc;
+    /// the verifier is always None on the login path).
     pub fn extract_claims_unverified(
         &self,
         _token: &str,
