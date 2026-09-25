@@ -620,7 +620,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   provenance a concurrent rebuild destroyed; and the fact that the probe pins the wire order and the
   Go source hook order, not Go's internal write-syscall count.
 
-- [ ] **Two observations of `test_tcpmux_proxy_auth` failing are unusable: both fall inside windows
+- [x] **Two observations of `test_tcpmux_proxy_auth` failing are unusable: both fall inside windows
   when a reviewing agent had `frp-server/src/tcpmux.rs` mutants in this same worktree.** They are
   kept here only as a contaminated-measurement record — the test is **not** established as flaky.
   - Observation 1: a full `cargo test -p frp-server` run failed at `tcpmux.rs:698:9`, the byte-exact
@@ -653,6 +653,52 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   same worktree another agent is measuring contaminates both, silently and in the direction of
   looking like a real flake. Review agents need their own checkout or a frozen revision, and a
   mutation must be reverted *and* the target rebuilt before any measurement resumes.
+
+  Done (branch `chore/close-tcpmux-flake`, based on `main` @ `7e2a0b5`): **closed as a
+  contaminated-measurement record**, after the quiet-tree reproduction the done-when asks for.
+  Measured on a pristine worktree at `7e2a0b5` — `git status` empty before/between/after every batch
+  (that check, not the single-file md5 below, is what covers mutations anywhere in the tree),
+  `frp-server/src/tcpmux.rs` md5 `cc646387f9a239c4d3216f85a2fa8935` before and after, both test
+  binaries' hashes constant **within that worktree** (`tcpmux` `acad919efdcfb6492fee9025fdc6f06c`,
+  `tcpmux_httpconnect` `9e52be1c077f3e8d84ebe9d90852bdc2` — debug binaries embed their build path, so
+  the hex is a relink guard for that worktree, not a portable fingerprint), no concurrent
+  `cargo`/`rustc`, and no other worktree dirty — **110/110 runs of the observation-2 command exited
+  0**: 50 quiet parallel, 20 quiet serial (`-- --test-threads=1`), 30 under 70 busy loops (load
+  average ramped 16.9 → 96.8, bracketing the reported 61–77), plus **10/10 of observation 1's target
+  alone** (`cargo test -p frp-server --test tcpmux`); a grep for `panicked at` / `test result: FAILED`
+  / `error[E` across all 110 logs found nothing, so no failure occurred and there was nothing to
+  capture bytes from. **Independently replicated by Reviewer 1: 0/48** (25 parallel on a host shared
+  with another reviewer's builds but with no mutation build in this tree, 5 quiet serial, 12 loaded
+  with the 1-min average passing through and beyond the band to 160.55, 6 `tcpmux`-alone), with both
+  targets listed and the named tests (`test_tcpmux_proxy_auth`, the 407
+  test) shown executing. **Reviewer 2 (adversarial) reproduced the mechanism in its own tree** —
+  deleting the 407 arm's `return;` fails **3/3** at `tests/tcpmux.rs:679` with observation 2's message
+  byte-for-byte, and stripping the 407's `Proxy-Authenticate` fails **3/3** at `:698` with observation
+  1's — and ran 19 more green runs (default/2/4/8 threads; 18 under applied load in the ~30 → ~145
+  range, plus a baseline at ambient ~11), plus the **true
+  observation-1 shape** the author could not run: with `frps` built and `FRPS_BIN` set,
+  `cargo test -p frp-server` exits 0 across all 35 targets with `Running tests/tcpmux.rs` and
+  `test_tcpmux_proxy_auth ... ok`. **Citation correction:** the two observations cite
+  `frp-server/src/tcpmux.rs:698`/`:679`, but those assertions are in `frp-server/tests/tcpmux.rs`
+  (`:698` the byte-exact 407 head, `:679` the 2 s first-read timeout; `src/tcpmux.rs:698` is a closing
+  brace, not that assertion). **One caveat on the guard itself, measured by Reviewer 2:** empty
+  `git status` + a constant source md5 + constant binary hashes do **not** prove the *executed* binary
+  was built from pristine source — a mutant built and then reverted (with its mtime restored) survives
+  in `target/` and `cargo test` will not relink it, and that run fails at `:698` while every guard
+  reads clean. What actually rules that out here is the **direction of the result**: a mutant binary
+  makes these runs red, and 110 author runs plus 19 reviewer runs were green, so no mutant was in the
+  executed path. Not covered, recorded so the closure is not
+  read as stronger than it is: the load was not *held* in the 61–77 band (it ramped through it), a
+  near-miss on the 2 s first read was not instrumented, other hosts/CI/`--release`/`--all-features`
+  were not exercised, test-thread counts other than default, 1, 2, 4 and 8 were not run, the
+  tests' `flock`-based cross-process `allocate_port()` allocator was not analysed as a concurrency
+  mechanism (none was observed to collide), mutation+relink+revert *inside* one batch is invisible to
+  a per-batch hash check, and a
+  green clean tree cannot by itself prove the original two runs were contaminated rather than very
+  rare — it only fails to reproduce them in the ~180 attempts above (110 author + 48 Reviewer 1 + 19
+  Reviewer 2) spanning quiet and heavily loaded conditions. The process lesson the item names is already enforced in
+  `docs/developing.md § Review protocol` ("Mutate in your own checkout, never the tree being
+  measured"), so no further durable change was needed.
 - [x] **`frp-client`'s `start_paused` socket-deadline tests are flaky on this host at *default*
   features — they can turn the existing default-feature lanes red.** Found while measuring the
   new no-features runtime step; none of them is a feature gate, and none is touched by the
