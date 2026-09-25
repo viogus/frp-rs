@@ -6404,10 +6404,17 @@ mod tests {
     #[tokio::test]
     #[cfg(not(feature = "oidc"))]
     async fn oidc_method_with_client_oidc_off_is_rejected() {
-        let mut auth = frp_core::config::AuthClientConfig::default();
-        auth.method = "oidc".to_string();
-        let mut cfg = ClientConfig::default();
-        cfg.auth = Some(auth);
+        // One-expression initialisers (clippy::field_reassign_with_default):
+        // neither config type implements `Drop`, so the struct-update form is
+        // available here.
+        let auth = frp_core::config::AuthClientConfig {
+            method: "oidc".to_string(),
+            ..Default::default()
+        };
+        let cfg = ClientConfig {
+            auth: Some(auth),
+            ..Default::default()
+        };
         let err = match Service::with_unsafe_features(cfg, None, UnsafeFeatures::default()).await {
             Ok(_) => panic!("an oidc client config in an oidc-less build must be rejected"),
             Err(e) => e,
