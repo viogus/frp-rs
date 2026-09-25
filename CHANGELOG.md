@@ -24,11 +24,12 @@ User-facing release notes for frp-rs.
   load — a behaviour change.** `frps-tiny` / `frpc-tiny` (and any build compiled
   without the `oidc` feature) previously fell through to `Token`, so a config
   that asked for OIDC silently ran token auth: an frps with `auth.token` set
-  started as a token server and accepted token logins. It now fails at startup
-  with `auth.method = "oidc" requires the "oidc" feature, which this build was
-  compiled without — rebuild with it or set auth.method = "token"`, on both the
-  server and the client. Rebuild with the `oidc` feature if you meant OIDC, or
-  set `auth.method = "token"` explicitly.
+  started as a token server and accepted token logins. It now fails — at server
+  startup and on the server's reload, and in `frpc run` / `frpc verify` — with
+  `auth.method = "oidc" requires the "oidc" feature, which this build was
+  compiled without — rebuild with it or set auth.method = "token"`. Rebuild with
+  the `oidc` feature if you meant OIDC, or set `auth.method = "token"`
+  explicitly.
 - **`frpc reload` and `frpc status` are now bounded by a 30 s admin deadline —
   a behaviour change.** Their admin HTTP call previously had no timeout at all,
   so a daemon that accepted the connection and never answered hung the command
