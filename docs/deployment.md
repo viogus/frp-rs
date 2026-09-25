@@ -706,6 +706,22 @@ the parameter absent and the reload non-strict. The remaining 400 sources are a
 body that cannot be buffered or does not deserialize into the expected
 `{"strict_config": bool}` shape, and a reload the loader itself rejects (a
 strict-mode unknown key).
+
+Strict mode does not recurse into `[[proxies]]` / `[[visitors]]` array elements
+(nor the server-side `[[httpPlugins]]`): an unknown field inside one is
+**accepted** (a 200 reload), where Go frp v0.71.0 rejects the same config with
+400 (`decode proxy at index 0: ... unknown field`).
+The sections most likely to be typo'd — `[auth]`, `[log]`, `[webServer]`,
+`[transport]` — are still checked, so an unknown key there is still 400, which
+scopes the exemption to the two arrays. The exemption is deliberate: per-type key
+sets (every proxy and visitor type, plus the Go camelCase aliases each accepts)
+would be a hand-maintained list that drifts as types are added, and skipping the
+recursion is the looser direction that keeps valid frp-rs configs loading. The
+consequence is blunt: **a typo in a proxy or visitor block is silently ignored in
+strict mode** — the same silent-config-loss class as the camelCase wire-field
+gotcha — so check a block's keys against its type's reference rather than relying
+on strict mode to catch them.
+
 `POST /api/reload` additionally accepts the frp-rs extension body
 `{"strict_config": true}` (also accepted as `"strictConfig"`, the spelling
 frpc's own CLI sends); when both channels are present the query parameter wins.

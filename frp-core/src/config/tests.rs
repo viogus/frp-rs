@@ -3927,6 +3927,161 @@ tokenz = "secret"
     assert!(err.contains("unknown field \"auth.tokenz\""), "got: {err}");
 }
 
+/// Strict mode deliberately does NOT recurse into `[[proxies]]` / `[[visitors]]`
+/// array elements: an unknown field inside one loads where Go frp v0.71.0
+/// rejects the same config with 400 (`decode proxy at index 0: ... unknown
+/// field`). `section_known_keys` returns `None` for those sections, so the
+/// exemption is array-wide rather than type-specific — hence a `tcp` proxy, a
+/// plugin proxy and an `xtcp` visitor, each with its own unknown key. The
+/// rationale and the operator-facing consequence (a proxy/visitor typo is
+/// silently ignored in strict mode) are recorded in the strict-mode paragraph
+/// of the client-admin section in `docs/deployment.md`; a future Go-faithful
+/// recursion must update that paragraph and this pin together.
+///
+/// The older `test_strict_accepts_unknown_proxy_field_deliberate_divergence`
+/// covers the single-`tcp`-proxy case; this one adds the visitor half and the
+/// array-wide scope.
+#[test]
+fn strict_mode_exempts_proxy_and_visitor_array_elements() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        br#"serverAddr = "127.0.0.1"
+serverPort = 7000
+token = "t"
+
+[[proxies]]
+name = "plain"
+type = "tcp"
+local_port = 80
+remote_port = 7001
+bogus_key_in_tcp_proxy = 1
+
+[[proxies]]
+name = "plug"
+type = "tcp"
+remote_port = 7002
+bogus_key_in_plugin_proxy = 1
+[proxies.plugin]
+type = "http_proxy"
+httpUser = "u"
+
+[[visitors]]
+name = "vis"
+type = "xtcp"
+server_name = "s"
+bind_port = 7003
+protocol = ""
+bogus_key_in_visitor = 1
+"#,
+    )
+    .unwrap();
+    let cfg = load_client_config(f.path().to_str().unwrap(), true)
+        .expect("strict mode must accept unknown fields inside proxies/visitors");
+    assert_eq!(cfg.proxies.len(), 2);
+    assert_eq!(cfg.proxies[0].name, "plain");
+    assert_eq!(cfg.proxies[0].remote_port, 7001);
+    assert_eq!(cfg.proxies[1].name, "plug");
+    assert_eq!(
+        cfg.proxies[1].plugin.as_ref().unwrap().plugin_type,
+        "http_proxy"
+    );
+    assert_eq!(cfg.visitors.len(), 1);
+    assert_eq!(cfg.visitors[0].name, "vis");
+
+    // The same array exemption reaches frps: `[[httpPlugins]]` normalizes to
+    // the `http_plugins` array, which `check_strict` cannot recurse into
+    // either, so an unknown field inside one is accepted too. Covered because
+    // it is the only server-side config array of tables a user edits by hand.
+    let mut sf = tempfile::NamedTempFile::new().unwrap();
+    sf.write_all(
+        br#"bindPort = 7000
+[[httpPlugins]]
+name = "hook"
+addr = "http://127.0.0.1:4000"
+path = "/handler"
+ops = ["login"]
+bogus_key_in_http_plugin = 1
+"#,
+    )
+    .unwrap();
+    let scfg = load_server_config(sf.path().to_str().unwrap(), true)
+        .expect("strict mode must accept unknown fields inside httpPlugins");
+    assert_eq!(scfg.http_plugins.len(), 1);
+    assert_eq!(scfg.http_plugins[0].name, "hook");
+
+    // Control: the sections strict mode DOES recurse into still reject an
+    // unknown key, so the green result above cannot be a disabled checker.
+    // Same behaviour as `test_strict_rejects_nested_unknown_keys`; asserted
+    // here too so this pin fails if the control regresses. Server configs are
+    // used so `[transport]`/`[web_server]` exercise the section recursion
+    // itself (a *client* `[transport]` is flattened to top level before the
+    // check, so it rejects too but with an unprefixed `full_key`).
+    for (label, body, expected) in [
+        (
+            "log",
+            "bindPort = 7000\n[log]\nlevel = \"info\"\nlevell = \"info\"\n",
+            "unknown field \"log.levell\"",
+        ),
+        (
+            "auth",
+            "bindPort = 7000\n[auth]\ntoken = \"t\"\ntokenz = \"t\"\n",
+            "unknown field \"auth.tokenz\"",
+        ),
+        (
+            "transport",
+            "bindPort = 7000\n[transport]\ntcpMux = true\ntcpMuxx = true\n",
+            "unknown field \"transport.tcpMuxx\"",
+        ),
+        (
+            "web_server",
+            "bindPort = 7000\n[webServer]\naddr = \"127.0.0.1\"\nport = 7400\naddrr = \"x\"\n",
+            "unknown field \"web_server.addrr\"",
+        ),
+    ] {
+        let mut cf = tempfile::NamedTempFile::new().unwrap();
+        cf.write_all(body.as_bytes()).unwrap();
+        let err = load_server_config(cf.path().to_str().unwrap(), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(expected),
+            "control [{label}] must still reject: expected {expected:?}, got: {err}"
+        );
+    }
+
+    // `[webServer]` is frpc's own admin block, not only frps's dashboard: the
+    // client spelling normalizes to the same `web_server` section, so it is
+    // caught there too (the doc names the section generically).
+    let mut wf = tempfile::NamedTempFile::new().unwrap();
+    wf.write_all(
+        b"serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[webServer]\naddr = \"127.0.0.1\"\nport = 7400\naddrr = \"x\"\n",
+    )
+    .unwrap();
+    let err = load_client_config(wf.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"web_server.addrr\""),
+        "client [webServer] control: got: {err}"
+    );
+
+    // Teeth, without touching `strict.rs`: the *identical* key one level up
+    // (top level) is rejected by the same strict check. So the acceptance above
+    // is the array skip, not a disabled checker, and the moment
+    // `section_known_keys` starts returning a set for `proxies`/`visitors` the
+    // positive load errors and this pin fails.
+    let mut top = tempfile::NamedTempFile::new().unwrap();
+    top.write_all(b"serverAddr = \"127.0.0.1\"\nserverPort = 7000\nbogus_key_in_tcp_proxy = 1\n")
+        .unwrap();
+    let err = load_client_config(top.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"bogus_key_in_tcp_proxy\""),
+        "top-level control: the same key must be rejected outside the array; got: {err}"
+    );
+}
+
 #[test]
 fn test_strict_accepts_go_section_keys() {
     // Go-valid keys inside known sections must pass strict mode
