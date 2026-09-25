@@ -1027,7 +1027,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   that "fixes" either one fails the pin and forces the record to be updated:
   `?strictConfig=true#strictConfig=false` -> frp-rs 400 where Go is 200;
   `/api/reload#x?strictConfig=true` -> frp-rs 200 where Go is 404.
-- [ ] **The admin HEAD/auth placement matches Go only for *authenticated* requests; a measured
+- [x] **The admin HEAD/auth placement matches Go only for *authenticated* requests; a measured
   alternative matches on every axis but is deliberately not adopted here.** With the per-route
   `.head(...)` + `.layer(auth)` arrangement in `frp-client/src/admin.rs`, an *unauthenticated*
   HEAD on a registered route is 401 where Go is 405, and an unauthenticated request to an
@@ -1059,6 +1059,45 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   dashboard's auth posture re-reviewed (accepting the path-existence and configuration-state
   disclosure), or record in
   `docs/deployment.md` that the 401-vs-404/405 unauthenticated divergence is permanent. No sha.
+
+  Done (branch `docs/admin-head-divergence`, based on `main` @ `9007ba7`): closed by the
+  **documentation** branch, with the record corrected after the adversarial review falsified its
+  first draft. `docs/deployment.md`'s admin-API paragraph now splits the two unauthenticated
+  mismatches by kind, and `frp-client/src/admin.rs`'s rationale carries the same correction:
+  * the **unknown-path** cell (`401` here vs Go's `404`, GET or HEAD) is **permanent by decision**:
+    `401` hides which paths exist, and a matched-routes-only construction (a blanket `route_layer`)
+    would answer `404` there and disclose configuration state too — measured on that construction,
+    `GET /api/store/proxies` answers `401` with `[store]` configured and `404` without it (the code
+    supports it: `/api/store/*` is registered only when the store is enabled);
+  * the **`HEAD`-on-a-registered-route** cell (`401` here vs Go's `405`) is **not** an
+    impossibility and needs no route predicate: the adversarial review **measured** a construction
+    that matches Go on it — per-handler auth on the registered GET/POST routes, the existing
+    unauthenticated `handle_head_not_allowed` left on each route's `.head(...)`, and an
+    auth-wrapped `Router::fallback` — with an axum 0.8.9 probe (`405` there, unmatched paths still
+    `401`), against Go frp v0.71.0's cells measured over the wire. It is rejected because
+    authentication then becomes **opt-in per route**: a route added later without the wrapper is
+    unauthenticated by default, whereas the single outer layer authenticates every route, present
+    and future, by default. Any future fix must first close that fail-open foot-gun (a wrapping
+    helper that is the only registration entry point, plus a test that every registered route
+    answers `401` unauthenticated — the existing HEAD-405 test already drives the real router over
+    a hand-maintained GET-route list, so the barrier is smaller than it looks).
+  `apply_admin_auth` is demoted from "reason the cell cannot be fixed" to a scope note: only a
+  *blanket* switch to `route_layer` is out of scope, because the frps dashboard calls the same
+  helper; the per-handler construction is admin-local. `admin_head_auth_divergence_is_pinned`
+  (`frp-client/tests/reload_malformed_config.rs`) asserts the cells over the wire with authenticated
+  controls (unknown path `404`, `HEAD` on a registered route `405`) and a positive control that the
+  armed config really does move a proxy, so "401 and no reload" cannot pass vacuously; switching the
+  live layer to `route_layer` fails it at the unknown-path assertion with a message that names the
+  doc update (measured by both reviewers, reverted). **Citation corrections:** this item's
+  `.layer(auth)` is not in `frp-client/src/admin.rs` — the layer is applied in
+  `frp-core/src/admin_auth.rs` (`apply_admin_auth`) and `admin.rs` reaches it through that helper;
+  and the dashboard call sites are `frp-server/src/dashboard.rs:3656/3672/3696`, not the
+  3610/3626/3650 written above (verified by grep). Residue: the `GET /api/store/proxies`
+  store-on/off pair and the Go rows are the earlier review rounds' measurements, not re-run in this
+  change; this host cannot bind `127.0.0.2`, so the full
+  `cargo test -p frp-client --features admin -j 1` lane fails at
+  `frp-client/tests/peer_xff_registry_e2e.rs:326` for an environmental reason (that file is not in
+  this diff; both reviewers reproduced it).
 - [ ] **Strict mode accepts unknown fields inside `[[proxies]]` / `[[visitors]]`, where Go
   rejects them — a deliberate, documented divergence that is not in this list and not in the
   user-facing docs.** Measured with identical config text on Go frp v0.71.0 and frp-rs, both
