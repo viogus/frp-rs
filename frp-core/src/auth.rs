@@ -220,11 +220,22 @@ pub enum AuthMethod {
     ///
     /// Only ever constructed when the *dependent* crate's `oidc` feature is on.
     /// A dependent whose own `oidc` is off **refuses** an `auth.method = "oidc"`
-    /// configuration at load, so an OIDC-configured server never silently runs
-    /// token auth. With frp-core's `oidc` off the runtime OIDC entry points are
-    /// the stubs below, so a hand-built `Oidc` still fails closed.
+    /// configuration when its service is constructed — server startup and the
+    /// server's SIGUSR1 reload, and `frpc run` — and in `frpc verify`, so an
+    /// OIDC-configured server or client never silently runs token auth. (The
+    /// client's admin-triggered reload does not re-derive auth at all; auth is
+    /// startup-only there.) With frp-core's `oidc` off the runtime OIDC entry
+    /// points are the stubs below, so a hand-built `Oidc` still fails closed.
     Oidc,
 }
+
+/// Error for a configuration that requests OIDC in a build compiled without the
+/// `oidc` feature. One constant so the server builder, the client builder and
+/// `frpc verify` refuse the same configuration with the same text — the failure
+/// mode this prevents is a silent downgrade to token auth.
+pub const OIDC_FEATURE_REQUIRED: &str =
+    "auth.method = \"oidc\" requires the \"oidc\" feature, which this build was compiled \
+     without — rebuild with it or set auth.method = \"token\"";
 
 impl AuthConfig {
     /// Resolve the current auth token.

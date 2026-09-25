@@ -717,6 +717,26 @@ fn next_ping_backoff(prev: Option<Duration>, interval: Duration) -> Duration {
     next.min(interval)
 }
 
+/// Refuse an `auth.method = "oidc"` client configuration when this crate was
+/// compiled without the `oidc` feature. Always defined, so a caller does not
+/// need its own `#[cfg]`: it is a no-op in an oidc build, where the parse
+/// constructs `AuthMethod::Oidc` instead.
+///
+/// Shared by [`Service::with_unsafe_features`] (so `frpc run` refuses) and by
+/// `frpc verify`, which only *loads* the config — without this, `verify` would
+/// print `Config file … is valid` and exit 0 for a config that `run` exits 3 on.
+pub fn refuse_oidc_method_without_feature(
+    auth: Option<&frp_core::config::AuthClientConfig>,
+) -> Result<(), String> {
+    #[cfg(not(feature = "oidc"))]
+    if matches!(auth, Some(ac) if ac.method == "oidc") {
+        return Err(frp_core::auth::OIDC_FEATURE_REQUIRED.to_string());
+    }
+    #[cfg(feature = "oidc")]
+    let _ = auth;
+    Ok(())
+}
+
 impl Service {
     /// Wait briefly for visitor listener tasks to exit gracefully, then
     /// force-abort any still blocked in `accept()` so their listeners drop
@@ -810,6 +830,12 @@ impl Service {
         // visitors outside the allowlist must not register or start.
         cfg.visitors = filter_active_visitors(&cfg, &cfg.visitors);
 
+        // Refuse an `auth.method = "oidc"` config when this crate was built
+        // without the `oidc` feature — otherwise it would silently fall through to
+        // token auth below. `frpc verify` calls the same helper, so it cannot
+        // report valid a config `frpc run` refuses. No-op in an oidc build.
+        refuse_oidc_method_without_feature(cfg.auth.as_ref()).map_err(std::io::Error::other)?;
+
         // Determine auth method from [auth] section if present, otherwise token
         #[cfg(feature = "oidc")]
         let auth_method = if let Some(ref ac) = cfg.auth {
@@ -821,21 +847,8 @@ impl Service {
         } else {
             AuthMethod::Token
         };
-        // Without the `oidc` feature this used to fall through to `Token`, so an
-        // `auth.method = "oidc"` client silently ran token auth. Refuse it: the
-        // operator asked for OIDC and this build cannot provide it. The case
-        // handling matches the feature-on arm above (`== "oidc"`).
         #[cfg(not(feature = "oidc"))]
-        let auth_method = match cfg.auth.as_ref() {
-            Some(ac) if ac.method == "oidc" => {
-                return Err(std::io::Error::other(
-                    "auth.method = \"oidc\" requires the \"oidc\" feature, which this build \
-                     was compiled without — rebuild with it or set auth.method = \"token\"",
-                )
-                .into());
-            }
-            _ => AuthMethod::Token,
-        };
+        let auth_method = AuthMethod::Token;
 
         let auth_token_source = cfg.auth.as_ref().and_then(|a| a.token_source.clone());
         let token = if let Some(ref source) = auth_token_source {
@@ -6424,5 +6437,28 @@ mod tests {
             msg.contains("\"oidc\"") && msg.contains("feature"),
             "error must name the missing feature: {msg}"
         );
+    }
+
+    /// The helper `frpc verify` calls (via `run_verify`) — the only unit-testable
+    /// half of that path, because `run_verify` itself ends in `process::exit`
+    /// and would kill the test process. Pins both directions plus the `None`
+    /// case, so `verify` and `run` agree on what an oidc-less build refuses.
+    #[test]
+    #[cfg(not(feature = "oidc"))]
+    fn refuse_oidc_helper_rejects_oidc_and_accepts_token() {
+        let oidc = frp_core::config::AuthClientConfig {
+            method: "oidc".to_string(),
+            ..Default::default()
+        };
+        let err = refuse_oidc_method_without_feature(Some(&oidc))
+            .expect_err("an oidc config must be refused");
+        assert_eq!(err, frp_core::auth::OIDC_FEATURE_REQUIRED);
+
+        let token = frp_core::config::AuthClientConfig {
+            method: "token".to_string(),
+            ..Default::default()
+        };
+        assert!(refuse_oidc_method_without_feature(Some(&token)).is_ok());
+        assert!(refuse_oidc_method_without_feature(None).is_ok());
     }
 }

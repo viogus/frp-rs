@@ -559,22 +559,22 @@ jobs:
         run: cargo check -p frp-server --no-default-features --features tls,http-proxy,tcp-mux --all-targets
         env:
           RUSTFLAGS: "-D warnings"
-      - name: Check frp-server dashboard test targets compile (isolated, dashboard only)
+      - name: Lint frp-server dashboard and frp-client oidc-off test targets (isolated)
         # The dashboard tier is opt-in (`dashboard = ["dep:prometheus",
         # "dep:axum", "frp-core/admin-auth"]`, frp-server/Cargo.toml). One other
         # step does compile frp-server's test targets with `dashboard` ON —
         # `cargo test -p frp-server --features dashboard -j 1` above — but that
         # one runs *with frp-server's defaults*, so `oidc` is ON. This step is
-        # the only one that compiles them with `dashboard` ON **and `oidc`
-        # OFF**. `-p frp-server` keeps frp-server's own features at just
-        # `dashboard`, so frp-server/oidc is OFF while frp-core/oidc is ON —
-        # frp-server's dev-dependency on frp-client pulls frp-client's
-        # defaults, which forward frp-core/oidc. That unification is the gate's
-        # point: a frp-core item that exists only feature-on must not make an
-        # frp-server `match` non-exhaustive, an frp-server #[cfg] gate naming a
-        # feature that is off here (tls) must not hide an item that is actually
-        # used, and an `auth.method = "oidc"` config must be refused rather
-        # than silently downgraded (S1). Measured before the fix:
+        # the only one that lints them with `dashboard` ON **and `oidc` OFF**.
+        # `-p frp-server` keeps frp-server's own features at just `dashboard`, so
+        # frp-server/oidc is OFF while frp-core/oidc is ON — frp-server's
+        # dev-dependency on frp-client pulls frp-client's defaults, which
+        # forward frp-core/oidc. That unification is the gate's point: a frp-core
+        # item that exists only feature-on must not make an frp-server `match`
+        # non-exhaustive, an frp-server #[cfg] gate naming a feature that is off
+        # here (tls) must not hide an item that is actually used, and an
+        # `auth.method = "oidc"` config must be refused rather than silently
+        # downgraded (S1). Measured before the fix:
         #   RUSTFLAGS="-D warnings" cargo check -p frp-server \
         #     --no-default-features --features dashboard --all-targets
         # exited 101 with E0004 `AuthMethod::Oidc` not covered
@@ -583,7 +583,19 @@ jobs:
         # dashboard path with tls off, but its imports were tls-gated) and
         # unused-import `AtomicU64` (only the tls-gated handshake throttle uses
         # it). After the fix: exit 0 with -D warnings.
-        run: cargo check -p frp-server --no-default-features --features dashboard --all-targets
+        #
+        # `clippy`, not `check`, and a second `-p frp-client` invocation: the
+        # workspace clippy lane is `--all-features`, which compiles every
+        # `#[cfg(not(feature = "oidc"))]` item *out*, so in the 2026-09 round a
+        # `clippy::field_reassign_with_default` error in a client test gated
+        # exactly that way was invisible to CI and had to be caught locally.
+        # `-p frp-server ... --features dashboard` covers frp-server's own
+        # targets; `-p frp-client --no-default-features` is the command that
+        # caught that lint. Both are needed — frp-client is a dev-dependency of
+        # frp-server, so it is only compiled, never linted, by the first.
+        run: |
+          cargo clippy -p frp-server --no-default-features --features dashboard --all-targets
+          cargo clippy -p frp-client --no-default-features --all-targets
         env:
           RUSTFLAGS: "-D warnings"
       - name: Check frp-core tier test targets compile (isolated, no features)

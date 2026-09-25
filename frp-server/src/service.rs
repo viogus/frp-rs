@@ -40,6 +40,27 @@ fn build_auth_config(
     auth: &frp_core::config::AuthServerConfig,
     unsafe_features: &UnsafeFeatures,
 ) -> Result<AuthConfig, String> {
+    // Refuse an `auth.method = "oidc"` config in an oidc-less build *before*
+    // resolving a token source: the method is the decisive reason the config
+    // cannot work, so a broken source must neither mask it nor be executed for a
+    // config that is going to be rejected. (frp-core's `oidc` can be ON here
+    // through feature unification while frp-server's own is off; the feature that
+    // matters is the one that supplies the verifier, i.e. this crate's.) Before
+    // this check the config fell through to `Token` — the operator asked for OIDC
+    // and got a token-auth server that accepts anyone holding the token.
+    let method = match auth.method.to_lowercase().as_str() {
+        "oidc" => {
+            #[cfg(feature = "oidc")]
+            {
+                AuthMethod::Oidc
+            }
+            #[cfg(not(feature = "oidc"))]
+            {
+                return Err(frp_core::auth::OIDC_FEATURE_REQUIRED.to_string());
+            }
+        }
+        _ => AuthMethod::Token,
+    };
     let token_source = auth.token_source.clone();
     let token = if let Some(ref source) = token_source {
         frp_core::config::validate_auth_token_source(&auth.token, &auth.token_source)?;
@@ -54,29 +75,6 @@ fn build_auth_config(
         // not silently degrade auth to an empty token (when both sides'
         // sources fail, that would silently disable auth).
         frp_core::auth::resolve_dynamic_token_checked(&auth.token, unsafe_features)?
-    };
-    // `auth.method = "oidc"` in a build whose `oidc` feature is off used to fall
-    // through to `Token` — the operator asked for OIDC and got a token-auth
-    // server that accepts anyone holding the token. Refuse the configuration
-    // instead. (frp-core's `oidc` can be ON here through feature unification
-    // while frp-server's own is off; the feature that matters is the one that
-    // supplies the verifier, i.e. this crate's.)
-    let method = match auth.method.to_lowercase().as_str() {
-        "oidc" => {
-            #[cfg(feature = "oidc")]
-            {
-                AuthMethod::Oidc
-            }
-            #[cfg(not(feature = "oidc"))]
-            {
-                return Err(
-                    "auth.method = \"oidc\" requires the \"oidc\" feature, which this build \
-                     was compiled without — rebuild with it or set auth.method = \"token\""
-                        .into(),
-                );
-            }
-        }
-        _ => AuthMethod::Token,
     };
     Ok(AuthConfig {
         method,
