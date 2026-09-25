@@ -3929,7 +3929,8 @@ tokenz = "secret"
 
 /// Strict mode deliberately does NOT recurse into `[[proxies]]` / `[[visitors]]`
 /// array elements: an unknown field inside one loads where Go frp v0.71.0
-/// rejects the same config (it refuses to start: `decode proxy at index 0:
+/// rejects the same config (with strict mode on — Go's default — it refuses to
+/// start: `decode proxy at index 0:
 /// unmarshal ProxyConfig error: json: unknown field ...`). The enforcement
 /// point is `check_strict`'s "recurse only into a `toml::Value::Table`" guard:
 /// an array value never reaches the `section_known_keys` lookup, which is why
@@ -5565,11 +5566,15 @@ fn test_server_negative_max_pool_count_rejected() {
 #[test]
 fn test_strict_accepts_unknown_proxy_field_deliberate_divergence() {
     // strict.rs deliberately does NOT recurse into `proxies`/`visitors`
-    // arrays (section_known_keys returns None for them): per-type keys
-    // would make the check a maintenance hazard, and skipping the recursion
-    // is the looser direction, keeping valid frp-rs configs loading (Go's
-    // RejectUnknownMembers rejects unknown proxy fields). Pin the
-    // divergence: an unknown field inside [[proxies]] is ACCEPTED.
+    // arrays: the enforcement point is `check_strict`'s "recurse only into a
+    // `toml::Value::Table`" guard, so an array value never reaches the
+    // `section_known_keys` lookup. Skipping the recursion is a deliberate
+    // choice, not a capability gap: the key sets are per *struct* and
+    // mechanically derivable (all that stops them is the false-400 risk of a
+    // hand-tracked list — see the pin below and the strict-mode paragraph in
+    // `docs/deployment.md`). Go's RejectUnknownMembers rejects unknown proxy
+    // fields. Pin the divergence: an unknown field inside [[proxies]] is
+    // ACCEPTED.
     let mut f = tempfile::NamedTempFile::new().unwrap();
     f.write_all(
         br#"serverAddr = "127.0.0.1"

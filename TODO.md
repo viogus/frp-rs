@@ -1153,9 +1153,11 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   * the consequence is not uniform: an unknown or optional key is dropped silently (`remote_portt =
     7001` loads as `remote_port: 0` — the silent-config-loss class), but a **required** key left unset
     is rejected (`visitor 'v': bind port is required`);
-  * the divergence is wider than the reload answer: Go frpc **refuses to start** on such a config
+  * the divergence is wider than the reload answer: with strict mode on (Go's default), Go frpc
+    **refuses to start** on such a config
     (`decode proxy at index 0: unmarshal ProxyConfig error: json: unknown field
-    "bogus_key_in_tcp_proxy"`, measured against the real binary), where frp-rs starts with the key
+    "bogus_key_in_tcp_proxy"`, measured against the real binary with default flags), where frp-rs
+    starts with the key
     dropped; the exemption also covers nested arrays (`healthCheckHttpHeaders`) and nested tables in
     unwalked sections (`auth.tokenSource.exec.env`);
   * the pin's teeth comment was wrong about the mechanism (adding `section_known_keys` arms alone

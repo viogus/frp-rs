@@ -709,7 +709,8 @@ strict-mode unknown key).
 
 Strict mode does not recurse into `[[proxies]]` / `[[visitors]]` array elements,
 and the server-side `[[httpPlugins]]` array behaves the same way. The gap is
-wider than the reload answer: Go frp v0.71.0 **refuses to start** on such a
+wider than the reload answer: with strict mode on (Go's default, `strictConfig =
+true`), Go frp v0.71.0 **refuses to start** on such a
 config — `decode proxy at index 0: unmarshal ProxyConfig error: json: unknown
 field "bogus_key_in_tcp_proxy"` — whereas frp-rs starts with the key dropped.
 Arrays and nested tables are not walked generally: nothing inside an array
@@ -726,8 +727,10 @@ already carries Go's camelCase spellings as serde aliases, so one set per
 *struct* — not per proxy type — covers every element.
 `#[serde(deny_unknown_fields)]` on those structs implements it in a few lines
 with no list to maintain, but it is unconditional: it cannot be keyed on
-`strictConfig`, so it would also reject unknown fields in *non*-strict loads and
-at startup, where Go ignores them. A strict-only scan list instead has to track
+`strictConfig`, so it would also reject unknown fields in *non*-strict loads
+(`--strict-config=false`), where Go ignores them — under strict mode, which is
+Go's default and what the paragraph above measures, it would match Go instead. A
+strict-only scan list instead has to track
 every field and alias of those structs, exempt their open maps (`headers`,
 `response_headers`, `annotations`, `metas`) and nested arrays, and has no
 reflection to prove completeness (hand-maintained lists are already the pattern
