@@ -656,23 +656,32 @@ agent commits), which matters because the *reason* for two reviewers is that no 
 
   Done (branch `chore/close-tcpmux-flake`, based on `main` @ `7e2a0b5`): **closed as a
   contaminated-measurement record**, after the quiet-tree reproduction the done-when asks for.
-  Measured on a pristine worktree at `7e2a0b5` — `git status` empty before/between/after every batch,
+  Measured on a pristine worktree at `7e2a0b5` — `git status` empty before/between/after every batch
+  (that check, not the single-file md5 below, is what covers mutations anywhere in the tree),
   `frp-server/src/tcpmux.rs` md5 `cc646387f9a239c4d3216f85a2fa8935` before and after, both test
-  binaries' hashes constant (`tcpmux` `acad919efdcfb6492fee9025fdc6f06c`,
-  `tcpmux_httpconnect` `9e52be1c077f3e8d84ebe9d90852bdc2`), no concurrent `cargo`/`rustc`, and no other
-  worktree dirty — **110/110 runs of the observation-2 command exited 0**: 50 quiet parallel, 20 quiet
-  serial (`-- --test-threads=1`), 30 under 70 busy loops (load average ramped 16.9 → 96.8, bracketing
-  the reported 61–77), plus **10/10 of observation 1's target alone** (`cargo test -p frp-server
-  --test tcpmux`); a grep for `panicked at` / `test result: FAILED` / `error[E` across all 110 logs
-  found nothing, so no failure occurred and there was nothing to capture bytes from. **Citation
-  correction:** the two observations cite `frp-server/src/tcpmux.rs:698`/`:679`, but those assertions
-  are in `frp-server/tests/tcpmux.rs` (`:698` the byte-exact 407 head, `:679` the 2 s first-read
-  timeout; `src/tcpmux.rs:698` is a closing brace, not that assertion). Not covered, recorded so the closure is not
+  binaries' hashes constant **within that worktree** (`tcpmux` `acad919efdcfb6492fee9025fdc6f06c`,
+  `tcpmux_httpconnect` `9e52be1c077f3e8d84ebe9d90852bdc2` — debug binaries embed their build path, so
+  the hex is a relink guard for that worktree, not a portable fingerprint), no concurrent
+  `cargo`/`rustc`, and no other worktree dirty — **110/110 runs of the observation-2 command exited
+  0**: 50 quiet parallel, 20 quiet serial (`-- --test-threads=1`), 30 under 70 busy loops (load
+  average ramped 16.9 → 96.8, bracketing the reported 61–77), plus **10/10 of observation 1's target
+  alone** (`cargo test -p frp-server --test tcpmux`); a grep for `panicked at` / `test result: FAILED`
+  / `error[E` across all 110 logs found nothing, so no failure occurred and there was nothing to
+  capture bytes from. **Independently replicated by Reviewer 1: 0/48** (25 quiet parallel, 5 quiet
+  serial, 12 loaded with the 1-min average passing through and beyond the band to 160.55, 6
+  `tcpmux`-alone), with both targets listed and the named tests (`test_tcpmux_proxy_auth`, the 407
+  test) shown executing. **Citation correction:** the two observations cite
+  `frp-server/src/tcpmux.rs:698`/`:679`, but those assertions are in `frp-server/tests/tcpmux.rs`
+  (`:698` the byte-exact 407 head, `:679` the 2 s first-read timeout; `src/tcpmux.rs:698` is a closing
+  brace, not that assertion). Not covered, recorded so the closure is not
   read as stronger than it is: the load was not *held* in the 61–77 band (it ramped through it), a
   near-miss on the 2 s first read was not instrumented, observation 1's full-suite shape was not
   reproduced (a fresh worktree's `cargo test -p frp-server` stops at `oidc_integration`, which needs
   `target/debug/frps` or `FRPS_BIN`; Batch D ran that target alone), other hosts/CI/`--release`/
-  `--all-features` were not exercised, test-thread counts other than default and 1 were not run, and a
+  `--all-features` were not exercised, test-thread counts other than default and 1 were not run, the
+  tests' `flock`-based cross-process `allocate_port()` allocator was not analysed as a concurrency
+  mechanism (none was observed to collide), mutation+relink+revert *inside* one batch is invisible to
+  a per-batch hash check, and a
   green clean tree cannot by itself prove the original two runs were contaminated rather than very
   rare — it only fails to reproduce them in 110 attempts spanning quiet and heavily loaded
   conditions. The process lesson the item names is already enforced in
