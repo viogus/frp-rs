@@ -715,14 +715,28 @@ Three request-target rules follow from Go and are worth knowing. Go's admin
 router matches methods exactly, so every `GET` route *Go registers* answers
 `HEAD` with `405 Method Not Allowed` (`/api/metrics` is frp-rs-only — Go has no
 such route and answers 404 for every method), and `HEAD /api/reload` never
-reloads, whatever the query says. An *unauthenticated* `HEAD` on a registered
-route is still `401` here, where Go answers `405` — and an unauthenticated
-request to an unknown path is `401` here where Go answers `404` — because the
-auth middleware runs before method routing. A measured alternative (`route_layer`
-for auth plus a route-aware outer HEAD layer) matches Go on both, but it would
-stop the auth layer from protecting unmatched paths, letting an unauthenticated
-client tell which paths exist; not adopting it is a deliberate scope choice
-tracked in `TODO.md`. More than 10000 query parameters disable `strictConfig`:
+reloads, whatever the query says. The authenticated cells match Go; two
+*unauthenticated* cells do not, and that divergence is **permanent**, not a
+deferred fix. Because the auth middleware is applied to the whole admin router
+before method and path routing, an unauthenticated `HEAD` on a registered route
+is `401` here where Go answers `405`, and an unauthenticated request to an
+unknown path (GET or HEAD) is `401` here where Go answers `404`. Measured over
+the wire against Go frp v0.71.0 with `webServer.user` and `webServer.password`
+set: a measured alternative — `route_layer` for auth plus a route-aware outer
+HEAD layer — reproduced Go on every cell and is still deliberately not adopted,
+for three reasons. It moves auth off unmatched paths, so an unauthenticated
+client learns which paths and methods exist (axum's own `Router::route_layer`
+documentation names that trade-off), and the sharper measured case is
+`GET /api/store/proxies`, which would answer `401` when `[store]` is enabled and
+`404` when it is not — disclosing *configuration state*, not merely path
+existence; frp-rs prefers hiding existence to Go's `404`/`405`. The `HEAD` half
+additionally needs a route-aware predicate that matches `{name}` segments
+without over-matching (`/api/proxy/a/b/config`), and axum 0.8.9 exposes no route
+introspection (`has_routes() -> bool` only), so it would be a hand-maintained
+path list — the same maintenance hazard `frp-core/src/config/strict.rs` refuses
+for the strict-mode key list. And `apply_admin_auth` is shared by the frpc admin
+API and the frps dashboard, so switching it to `route_layer` is not scoped to
+this endpoint. More than 10000 query parameters disable `strictConfig`:
 Go's `net/url.parseQuery` opens with a parameter-count guard (`defaultMaxParams =
 10000`, inclusive, counting `&`s + 1) and its error leaves the query empty, so
 `?strictConfig=true` plus 9999 `&` is a strict 400 and plus 10000 `&` is a

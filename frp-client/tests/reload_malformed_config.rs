@@ -57,8 +57,39 @@ fn write_valid_config(
     remote_port: u16,
     web_server_port: Option<u16>,
 ) {
+    write_valid_config_with_admin_auth(
+        path,
+        server_port,
+        echo_port,
+        remote_port,
+        web_server_port,
+        "",
+        "",
+    )
+}
+
+/// [`write_valid_config`] with `[webServer].user`/`.password`. Both must be
+/// non-empty for `apply_admin_auth` to enforce Basic Auth (an empty half keeps
+/// auth off), which is what lets the auth-divergence pin observe 401s; when
+/// either is empty the emitted config is byte-identical to
+/// [`write_valid_config`]'s.
+fn write_valid_config_with_admin_auth(
+    path: &std::path::Path,
+    server_port: u16,
+    echo_port: u16,
+    remote_port: u16,
+    web_server_port: Option<u16>,
+    user: &str,
+    password: &str,
+) {
     let web_server = match web_server_port {
-        Some(p) => format!("\n[webServer]\naddr = \"127.0.0.1\"\nport = {p}\n"),
+        Some(p) => {
+            let mut section = format!("\n[webServer]\naddr = \"127.0.0.1\"\nport = {p}\n");
+            if !user.is_empty() && !password.is_empty() {
+                section.push_str(&format!("user = \"{user}\"\npassword = \"{password}\"\n"));
+            }
+            section
+        }
         None => String::new(),
     };
     std::fs::write(
@@ -310,7 +341,8 @@ async fn reload_malformed_config_rejected_keeps_old_proxy_serving() {
 
 /// Raw HTTP request to the frpc admin API. `body`, when `Some`, is sent as a
 /// JSON body with the matching `Content-Type`/`Content-Length`. Returns the
-/// status line and the response body text.
+/// status line and the response body text. Sends no `Authorization` header —
+/// the unauthenticated case the auth-divergence pin probes.
 #[cfg(feature = "admin")]
 async fn admin_request(
     admin_port: u16,
@@ -318,11 +350,27 @@ async fn admin_request(
     path: &str,
     body: Option<&str>,
 ) -> (String, String) {
+    admin_request_with_auth(admin_port, method, path, body, None).await
+}
+
+/// [`admin_request`] with an optional `Authorization` header value (e.g.
+/// `Basic …`). `None` is byte-identical to `admin_request`'s request.
+#[cfg(feature = "admin")]
+async fn admin_request_with_auth(
+    admin_port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    authorization: Option<&str>,
+) -> (String, String) {
     let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", admin_port))
         .await
         .expect("connect frpc admin server");
     let mut request =
         format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+    if let Some(auth) = authorization {
+        request.push_str(&format!("Authorization: {auth}\r\n"));
+    }
     match body {
         Some(body) => request.push_str(&format!(
             "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -795,12 +843,25 @@ struct AdminOracle {
     admin_port: u16,
     proxy_addr: std::net::SocketAddr,
     dir: std::path::PathBuf,
+    /// Kept so a pin can re-write the config file itself (e.g. to arm a
+    /// would-be port change with `write_valid_config_with_admin_auth`).
+    server_port: u16,
+    echo_port: u16,
     _frps: tokio::task::JoinHandle<()>,
     _echo: tokio::task::JoinHandle<()>,
 }
 
 #[cfg(feature = "admin")]
 async fn start_admin_oracle(tag: &str) -> AdminOracle {
+    start_admin_oracle_with_auth(tag, "", "").await
+}
+
+/// [`start_admin_oracle`] with admin Basic Auth configured (`user`/`password`
+/// non-empty). The running admin server's auth is fixed at startup, so the
+/// unknown-key arming write (which carries no credentials) does not turn it
+/// off; the pin probes auth before any successful reload.
+#[cfg(feature = "admin")]
+async fn start_admin_oracle_with_auth(tag: &str, user: &str, password: &str) -> AdminOracle {
     init_tracing();
     let echo_port = allocate_port();
     let server_port = allocate_port();
@@ -817,7 +878,15 @@ async fn start_admin_oracle(tag: &str) -> AdminOracle {
     let dir = std::env::temp_dir().join(format!("frp-reload-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let cfg_path = dir.join("frpc.toml");
-    write_valid_config(&cfg_path, server_port, echo_port, p1, Some(admin_port));
+    write_valid_config_with_admin_auth(
+        &cfg_path,
+        server_port,
+        echo_port,
+        p1,
+        Some(admin_port),
+        user,
+        password,
+    );
 
     let cfg = load_client_config(cfg_path.to_str().unwrap(), false).expect("load initial config");
     let client = Arc::new(
@@ -851,6 +920,8 @@ async fn start_admin_oracle(tag: &str) -> AdminOracle {
         admin_port,
         proxy_addr,
         dir,
+        server_port,
+        echo_port,
         _frps: frps,
         _echo: echo,
     }
@@ -1106,5 +1177,142 @@ async fn admin_hash_fragment_divergence_is_pinned() {
         "proxy keeps serving across the `#` probes",
     )
     .await;
+    shutdown_admin_oracle(oracle).await;
+}
+
+/// Permanent divergence pin: the two *unauthenticated* admin cells where frp-rs
+/// does not match Go, recorded as permanent in `docs/deployment.md` and
+/// explained in the `admin_router` comment (`frp-client/src/admin.rs`). The
+/// auth middleware is applied to the whole router before method/path routing,
+/// so an unauthenticated `HEAD` on a registered route is `401` here where Go
+/// v0.71.0 answers `405`, and an unauthenticated request to an unknown path is
+/// `401` for `GET` and `HEAD` where Go answers `404`. The authenticated
+/// controls below show the divergence is exactly those two cells: with valid
+/// credentials, an unknown path is `404` and `HEAD` on a registered route is
+/// `405`, matching Go.
+///
+/// The alternative that would match Go (`route_layer` auth plus a route-aware
+/// outer HEAD layer) is deliberately not adopted — it would make unmatched
+/// paths bypass auth and disclose which paths, and with `[store]` enabled which
+/// configuration, exist. That is the security-posture half of the record; this
+/// pin is the other half, so a future change that "fixes" the cells fails here
+/// and forces `docs/deployment.md` to be updated with it.
+#[cfg(feature = "admin")]
+#[tokio::test]
+async fn admin_head_auth_divergence_is_pinned() {
+    const USER: &str = "admin";
+    const PASSWORD: &str = "head-divergence-pin";
+    let oracle = start_admin_oracle_with_auth("head-auth-divergence", USER, PASSWORD).await;
+    let basic = format!(
+        "Basic {}",
+        frp_core::base64::encode(format!("{USER}:{PASSWORD}").as_bytes())
+    );
+
+    // Arm an OBSERVABLE would-be reload: rewrite the config so a reload moves
+    // proxy `main` from p1 to `moved`. This is what makes the "no reload
+    // happened" assertions below non-vacuous — if any probe below reached the
+    // GET handler, p1 would stop serving and `moved` would open. (The sibling
+    // negative tests use the same would-be-port-change check.)
+    let moved = allocate_port();
+    write_valid_config_with_admin_auth(
+        &oracle.dir.join("frpc.toml"),
+        oracle.server_port,
+        oracle.echo_port,
+        moved,
+        Some(oracle.admin_port),
+        USER,
+        PASSWORD,
+    );
+    let moved_addr: std::net::SocketAddr = format!("127.0.0.1:{moved}").parse().unwrap();
+    assert_echo_serving(oracle.proxy_addr, "baseline p1 before the armed probes").await;
+    assert!(
+        wait_for_port(moved_addr, Duration::from_secs(2))
+            .await
+            .is_err(),
+        "armed `moved` port must be closed before any reload: something \
+         already applied the rewritten config"
+    );
+
+    // Unauthenticated cells: no `Authorization` header. Every one of these is
+    // 401 here because auth runs before routing. `/api/store/proxies` is
+    // unmatched in this harness (no `[store]`), so it is one more unknown-path
+    // probe; with `[store]` enabled it would be a registered route and would
+    // answer 401 too (never 404), which is exactly the configuration-state
+    // leak the alternative would reintroduce.
+    for (method, path) in [
+        ("GET", "/api/reload"),
+        ("HEAD", "/api/reload"),
+        ("GET", "/api/nope"),
+        ("HEAD", "/api/nope"),
+        ("GET", "/api/store/proxies"),
+    ] {
+        let (status, body) = admin_request(oracle.admin_port, method, path, None).await;
+        assert!(
+            status.contains("401"),
+            "KNOWN DIVERGENCE PIN: unauthenticated {method} {path} is 401 in \
+             frp-rs because auth runs before routing (Go v0.71.0 answers 405 \
+             for HEAD on a registered route and 404 for an unknown path); if \
+             this is now 404/405, the divergence was fixed by moving auth off \
+             unmatched paths and docs/deployment.md must be updated with the \
+             new posture. got: {status} / {body}"
+        );
+    }
+
+    // "No reload happened" for the unauthenticated probes above: p1 still
+    // serves and the armed `moved` port never opened. A 401 that had
+    // nonetheless run the GET handler would have moved the proxy — the
+    // positive control at the end proves the armed config really does that.
+    assert_echo_serving(
+        oracle.proxy_addr,
+        "p1 still serves after the unauthenticated probes (no reload ran)",
+    )
+    .await;
+    assert!(
+        wait_for_port(moved_addr, Duration::from_secs(2))
+            .await
+            .is_err(),
+        "unauthenticated probes must not reload: proxy `main` moved to the \
+         armed port, so a 401 reached the GET handler"
+    );
+
+    // Authenticated controls — the cells that DO match Go. Unknown path passes
+    // auth and falls through to axum's natural 404 (both methods).
+    for (method, path) in [("GET", "/api/nope"), ("HEAD", "/api/nope")] {
+        let (status, body) =
+            admin_request_with_auth(oracle.admin_port, method, path, None, Some(&basic)).await;
+        assert!(
+            status.contains("404"),
+            "authenticated {method} {path} must be Go's 404 (auth admits it, \
+             then no route matches); got: {status} / {body}"
+        );
+    }
+    // HEAD on a registered route passes auth and hits the per-route HEAD
+    // handler, which is Go's 405.
+    let (status, body) =
+        admin_request_with_auth(oracle.admin_port, "HEAD", "/api/reload", None, Some(&basic)).await;
+    assert!(
+        status.contains("405"),
+        "authenticated HEAD /api/reload must be 405 (Go parity); got: \
+         {status} / {body}"
+    );
+
+    // Positive control: the armed config really does move the proxy, so the
+    // unchanged p1 / closed `moved` above are evidence that no probe reloaded.
+    let (status, body) =
+        admin_request_with_auth(oracle.admin_port, "GET", "/api/reload", None, Some(&basic)).await;
+    assert!(
+        status.contains("200"),
+        "authenticated GET /api/reload must apply the armed config (positive \
+         control for the no-reload assertions); got: {status} / {body}"
+    );
+    wait_for_port(moved_addr, Duration::from_secs(15))
+        .await
+        .expect("the armed reload never applied");
+    assert_echo_serving(moved_addr, "echo through the reloaded proxy").await;
+
+    assert!(
+        !oracle.runner.is_finished(),
+        "client run task ended across the divergence probes"
+    );
     shutdown_admin_oracle(oracle).await;
 }
