@@ -18,7 +18,13 @@ use frp_core::admin_auth::apply_admin_auth;
 use frp_core::metrics::MetricsSnapshot;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+// `AtomicU64` is used only by the tls-gated handshake-warn throttle below;
+// `Ordering` is used by the ungated pool/metrics loads, so it must stay
+// unconditional (splitting the import is the honest fix — an
+// `#[allow(unused_imports)]` would hide a future genuinely-unused item).
+#[cfg(feature = "tls")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
@@ -79,11 +85,13 @@ where
 
 // --- Local TlsListener (moved from frp-core to avoid axum in core) ---
 
-#[cfg(feature = "tls")]
+// `io`/`TcpListener`/`TcpStream` are needed by `NoDelayListener`, which serves
+// the plain-HTTP dashboard path and compiles with tls OFF (see the listener
+// match in `serve`), so they must not be gated on tls — that gate was the
+// E0425/E0433 pair under `-p frp-server --no-default-features --features
+// dashboard`. `TlsAcceptor` is used only by the tls-gated `TlsListener`.
 use std::io;
-#[cfg(feature = "tls")]
 use tokio::net::TcpListener;
-#[cfg(feature = "tls")]
 use tokio::net::TcpStream;
 #[cfg(feature = "tls")]
 use tokio_rustls::server::TlsAcceptor;
@@ -2343,7 +2351,12 @@ mod v2 {
             .clone();
         let method = match method {
             frp_core::auth::AuthMethod::Token => "token",
-            #[cfg(feature = "oidc")]
+            // Not cfg-gated: `AuthMethod::Oidc` is always present in frp-core
+            // (its config construction is what is feature-gated), so gating this
+            // arm on frp-server's own `oidc` makes the match non-exhaustive when
+            // frp-core/oidc is on and frp-server/oidc is off — the feature
+            // unification shape of `-p frp-server --no-default-features
+            // --features dashboard --all-targets`. See the variant's doc comment.
             frp_core::auth::AuthMethod::Oidc => "oidc",
         }
         .to_string();
@@ -2928,9 +2941,18 @@ mod v2 {
         use axum::extract::FromRequest as _;
 
         fn test_state() -> Arc<AppState> {
+            test_state_with(frp_core::auth::AuthConfig::with_token("test-token"))
+        }
+
+        /// Same state with a caller-chosen auth config (the OIDC-method case):
+        /// `/api/v2/config` reports `auth.method` from the live config, so the
+        /// dashboard arm that maps `AuthMethod::Oidc => "oidc"` needs a state
+        /// whose method is OIDC. Kept ungated — the variant exists in every
+        /// build.
+        fn test_state_with(auth: frp_core::auth::AuthConfig) -> Arc<AppState> {
             let cfg = frp_core::config::ServerConfig::default();
             Arc::new(AppState::new(
-                frp_core::auth::AuthConfig::with_token("test-token"),
+                auth,
                 "127.0.0.1".into(),
                 frp_core::encryption::derive_key("test-token"),
                 vec![frp_core::config::PortsRange {
@@ -3143,6 +3165,30 @@ mod v2 {
                 !s.contains("password"),
                 "dashboard password field must not be serialized"
             );
+        }
+
+        /// Coverage for the arm that made this gate non-exhaustive: an
+        /// `AuthMethod::Oidc` config must be reported as `"oidc"` by
+        /// `/api/v2/config`, in every build (the variant is always present; the
+        /// arm is no longer `#[cfg(feature = "oidc")]`).
+        #[tokio::test]
+        async fn test_v2_config_reports_oidc_method() {
+            let mut auth = frp_core::auth::AuthConfig::with_token("test-token");
+            auth.method = frp_core::auth::AuthMethod::Oidc;
+            let state = test_state_with(auth);
+            let resp = handle_v2_config(
+                State(state),
+                "127.0.0.1:7500".to_string(),
+                "admin".to_string(),
+                true,
+            )
+            .await;
+            assert_eq!(resp.auth.method, "oidc");
+            // The method is reported; the token still never is.
+            let s = serde_json::to_string(&to_json(&resp.0))
+                .unwrap()
+                .to_lowercase();
+            assert!(!s.contains("test-token"), "auth token leaked: {s}");
         }
 
         #[tokio::test]

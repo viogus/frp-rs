@@ -20,6 +20,16 @@ User-facing release notes for frp-rs.
   negative value is accepted and means the deadline has already passed).
 
 ### Changed
+- **A build without the `oidc` feature now refuses `auth.method = "oidc"` — a
+  behaviour change.** `frps-tiny` / `frpc-tiny` (and any build compiled
+  without the `oidc` feature) previously fell through to `Token`, so a config
+  that asked for OIDC silently ran token auth: an frps with `auth.token` set
+  started as a token server and accepted token logins. It now fails — at server
+  startup and on the server's reload, and in `frpc run` / `frpc verify` — with
+  `auth.method = "oidc" requires the "oidc" feature, which this build was
+  compiled without — rebuild with it or set auth.method = "token"`. Rebuild with
+  the `oidc` feature if you meant OIDC, or set `auth.method = "token"`
+  explicitly.
 - **`frpc reload` and `frpc status` are now bounded by a 30 s admin deadline —
   a behaviour change.** Their admin HTTP call previously had no timeout at all,
   so a daemon that accepted the connection and never answered hung the command
@@ -37,6 +47,13 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **`frp-server` builds with only the `dashboard` feature compile again.** A
+  downstream workspace (or `cargo check -p frp-server --no-default-features
+  --features dashboard --all-targets`) that had frp-core's `oidc` on while
+  frp-server's was off failed with `AuthMethod::Oidc` not covered plus four
+  unrelated errors (`TcpListener`, `TcpStream`, `io`, unused `AtomicU64`). The
+  variant is now exhaustive by construction and the imports are gated on what
+  actually uses them; the configuration is gated in CI.
 - **`/api/reload` now reads `?strictConfig=` the way Go frp does — two behaviour changes.**
   A repeated parameter (`?strictConfig=true&strictConfig=false`) reloads with the first value
   (Go's `url.Values.Get`); it previously failed serde deserialization and answered 400. And a

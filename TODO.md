@@ -183,7 +183,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `Read`/`Write`/`Arc` imports) and `frp-server/tests/vhost_h2c.rs` a whole-file
   `#![cfg(feature = "http-proxy")]` (it is entirely driven by `dep:h2`).
   `docs/developing.md § Binary Variants` states what the new step does and does not prove.
-- [ ] **The same feature-unification defect class survives elsewhere: `AuthMethod::Oidc` in
+- [x] **The same feature-unification defect class survives elsewhere: `AuthMethod::Oidc` in
   `dashboard.rs`.** `frp-core`'s `AuthMethod::Oidc` carries `#[cfg(feature = "oidc")]`
   (`frp-core/src/auth.rs:206`) while `frp-server/src/dashboard.rs:2344` matches it under
   `#[cfg(feature = "oidc")]` — frp-server's own feature. With frp-core's `oidc` on and
@@ -208,6 +208,82 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `ConnectionType::WebSocket` was), the four unrelated errors are fixed, and the command
   above exits 0. Note this is the second instance of the class fixed in
   `frp-core/src/transport/mod.rs` — the fix there was per-variant, not systematic.
+
+  Done (branch `fix/dashboard-oidc-feature`, based on `main` @ `d302b50`): `AuthMethod::Oidc` is no
+  longer feature-gated, following the `ConnectionType::WebSocket` precedent — the variant and the
+  three `frp-core` arms that match it are unconditional, while *construction* stays gated in each
+  dependent crate's config parse, so the variant is only built where a verifier exists and a
+  hand-built `Oidc` still fails closed through the `#[cfg(not(feature = "oidc"))]` stubs (whose
+  comments no longer claim the variant is "compiled out"). The four unrelated errors were real gate
+  bugs in the same configuration: `NoDelayListener` serves the plain-HTTP dashboard path with `tls`
+  off, so `io`/`TcpListener`/`TcpStream` are no longer tls-gated, and `AtomicU64` is now tls-gated
+  while `Ordering` stays unconditional. `RUSTFLAGS="-D warnings" cargo check -p frp-server
+  --no-default-features --features dashboard --all-targets` exits 0 (measured 101 with exactly the
+  five documented errors on `d302b50`), and a new `ci.yml` step gates the configuration — the only
+  step that compiles frp-server's test targets with `dashboard` ON **and `oidc` OFF**. It runs
+  `cargo clippy` (not `check`) for both reverse-feature directions, because the `--all-features`
+  clippy lane compiles `#[cfg(not(feature = "oidc"))]` items *out*: a `clippy::field_reassign_with_default`
+  error in this branch's own client pin escaped that lane and was caught locally by hand (measured
+  cost of the added line: ~12 s warm, ~33 s cold). Both reviewers re-ran the command, every
+  neighbouring CI combination, and a 29-configuration single-feature sweep under `-D warnings`; no
+  other instance of the class exists, and the healthy OIDC-on counts are unchanged (`frp-core --lib
+  auth` 86, `frp-server --features dashboard --lib` 469→470 with the new dashboard test).
+
+  The adversarial review then measured what the newly-compilable configuration did at runtime and
+  found a **pre-existing silent downgrade** that the first version of the new test blessed: with
+  frp-server's `oidc` off, `auth.method = "oidc"` parsed to `Token`, so a config carrying a `token`
+  started as **token auth** and a token login authenticated (measured on `frps-tiny`: `logged in with
+  run_id …`, proxy registered); the parent `d302b50` behaves identically. Both parses now **refuse**
+  the configuration with a shared `OIDC_FEATURE_REQUIRED` error naming the feature, the test is
+  inverted to assert the rejection in both the no-token and with-token halves, the client parse
+  refuses it too with its own pin, the dashboard arm that used to be cfg-gated is covered by an
+  `"oidc"` assertion, and the method match now precedes token-source resolution so a config that
+  cannot work names the decisive reason. The refusal happens where the service is constructed —
+  server startup, the server's SIGUSR1 reload (which logs the error and keeps serving the old
+  config), `frpc run` — and in `frpc verify` (`frpc-tiny verify` on an OIDC config: rc 2 with the
+  feature error; a default `frpc` still says valid), so the CLI's two paths agree. This is a
+  behaviour change for builds without the `oidc` feature (tiny/micro): such a config now fails
+  instead of starting as token auth — recorded in `CHANGELOG.md`.
+
+  Residue, recorded below as new items: `auth.method` parsing is inconsistent across the three sites
+  (the client compares case-sensitively; unknown/whitespace spellings fall back to `Token` on both
+  sides), the client's admin-triggered `reload` never re-derives auth, and `oidc_throttle_tests` is
+  load-dependent because the mock IdP can read 0 bytes after accepting.
+- [ ] **`auth.method` parsing is inconsistent across its three sites; a typo silently selects token
+  auth.** Measured 2026-09-25 by the adversarial review on this branch, with real binaries:
+  - *Client*: `frp-client` compares `ac.method == "oidc"` (feature-on arm, the new refusal helper and
+    `frpc/src/main.rs`'s verify check), so with `oidc` **off**, `method = "OIDC"` and `" oidc"` still
+    fall through to `Token` — the client connects and authenticates while the server lowercases and
+    uses OIDC. With `oidc` **on** the same spelling makes the *client* do token auth against an OIDC
+    server, and `frp-core/src/config/loader.rs:414` skips the OIDC client-credentials validation for
+    it.
+  - *Server*: `to_lowercase()` catches `"OIDC"`/`"Oidc"`, but `" oidc"`, `"oidc "`, `"OIDC "`, a
+    Cyrillic-о lookalike and `""` all fall through the `_ => Token` arm and start a **token** server
+    when a token is set. Pre-existing (the same spellings give token in an OIDC-on build too), but it
+    is the exact silent-downgrade outcome the sibling fix closes for the canonical spelling.
+  **Done-when:** one method-parsing policy at all sites — trim, compare case-insensitively, and decide
+  (with a Go frp v0.71.0 source/probe check first) whether an unrecognised method is a load error
+  rather than a token fallback — pinned by a probe per site.
+- [ ] **The client's admin-triggered reload never re-derives auth, so an OIDC config reload reports
+  success.** Measured 2026-09-25 by the adversarial review: with a running `frpc-tiny` (oidc off) and
+  an OIDC config file, `frpc-tiny reload -c <file>` returns rc 0 with
+  `reload success: reload success: no changes detected` and **zero** log lines mentioning
+  oidc/auth — `reload_from_sources` diffs proxies and never re-parses auth (auth is startup-only).
+  The server's SIGUSR1 reload is the opposite: it logs the refusal and keeps the old config. Pre-existing
+  and out of the sibling item's scope. **Done-when:** a reload that changes `auth.method` either
+  re-derives auth (rejecting a method this build cannot serve) or reports that auth changes need a
+  restart, pinned by a probe.
+- [ ] **`oidc_throttle_tests` is a load-dependent flake: the mock IdP answers 404 for a valid
+  request.** `cargo test -p frp-server --lib oidc` failed **3/3** `oidc_throttle_tests` under CPU
+  load with `OIDC: openid-configuration returned 404 Not Found`, while a serial run passes 6/6 and
+  the 469-test `-p frp-server --features dashboard --lib` run passes; measured 2026-09-25 by the
+  first review round on `9c3ddd0`, whose change does not touch `control/login.rs`. Mechanism:
+  `oidc_mock_server` (`frp-server/src/control/login.rs:2159`) accepts on a **non-blocking** listener
+  and reads the request with `Read::read(&mut stream, &mut buf).unwrap_or(0)` (`:2183`), so when the
+  accept fires before the client's bytes arrive the read returns `WouldBlock` → 0 bytes → the path
+  falls back to `/` → 404. CI runs these tests in parallel, so the lane can flake. **Done-when:** the
+  mock waits for the request line (or the tests retry), pinned by a looped run of the three tests
+  under load.
 
 **The SSH readiness fix (#344) left two sites and one unbounded case.**
 - [x] Two SSH-gateway tests still connect with a bare `.unwrap()` and no readiness wait.

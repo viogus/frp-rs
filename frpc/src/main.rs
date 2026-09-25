@@ -730,6 +730,17 @@ async fn run_verify(config_path: &str, strict_config: bool) {
     // fields are accepted.
     match load_client_config(config_path, strict_config) {
         Ok(cfg) => {
+            // `load_client_config` only parses, so without this `verify` printed
+            // "is valid" (rc 0) for a config `frpc run` refuses with exit 3 —
+            // an oidc config in a build without the `oidc` feature. The helper
+            // is the same one the service construction uses, and is a no-op in
+            // an oidc build, so nothing changes there.
+            if let Err(e) =
+                frp_client::service::refuse_oidc_method_without_feature(cfg.auth.as_ref())
+            {
+                eprintln!("Config file {} is invalid: {}", config_path, e);
+                process::exit(EXIT_CONFIG);
+            }
             println!("Config file {} is valid", config_path);
             println!("  Server: {}:{}", cfg.server_addr, cfg.server_port);
             println!("  Proxies: {}", cfg.proxies.len());
