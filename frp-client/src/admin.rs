@@ -815,35 +815,37 @@ async fn handle_head_not_allowed() -> StatusCode {
 /// well as HEAD. Those requests are already 401 today.
 ///
 /// Matching Go on those cells is reachable, and was measured, but is NOT
-/// adopted here as a deliberate scope choice. Reviewer 2 built
-/// `.route_layer(auth)` (which on its own fixes the two unknown-path cells,
-/// because middleware added that way runs only when a route matches — axum
-/// `axum-0.8.9/src/docs/routing/route_layer.md`) plus a *route-aware* outermost
-/// HEAD layer (which fixes the unauthenticated-HEAD cell): 8/8 rows on an
-/// isolated axum 0.8.9 probe and 14/14 rows on the real admin router over the
-/// wire matched Go, and the coordinator reproduced the mechanism. It is not
-/// taken here because:
+/// adopted here — and not because the `HEAD` cell is unmatchable. An earlier
+/// review round built `.route_layer(auth)` (which on its own fixes the two
+/// unknown-path cells, because middleware added that way runs only when a route
+/// matches — axum `axum-0.8.9/src/docs/routing/route_layer.md`) plus a
+/// *route-aware* outermost HEAD layer. A later adversarial review measured a
+/// per-handler construction C instead, which reaches Go's `HEAD` cell with
+/// **no** route introspection and no path list: auth on the registered GET/POST
+/// handlers, the existing unauthenticated `handle_head_not_allowed` left on
+/// each route's `.head(...)`, and an auth-wrapped `Router::fallback`. C answers
+/// 405 for an unauthenticated HEAD on a registered route while keeping
+/// unmatched paths at 401. It is not adopted because:
 ///
-/// 1. `.route_layer` lets unmatched paths bypass auth, so an unauthenticated
-///    client gets 404/405 for an unknown path instead of 401 — it reveals
-///    which paths and methods exist. axum's own `route_layer` doc names this
-///    trade-off ("might otherwise convert a `404 Not Found` into a `401
-///    Unauthorized`"). Reviewer 2 measured the sharper form: an unauthenticated
-///    `GET /api/store/proxies` would answer 401 when the store is enabled and
-///    404 when it is not, disclosing *configuration state*, not merely path
-///    existence. That is a security-posture change, and this repo already
-///    deviates from Go for security elsewhere: a wildcard/unspecified
-///    `web_server.addr` is forced to `127.0.0.1` regardless of auth, and an
-///    explicit non-loopback address is honoured only when auth is set.
-/// 2. The HEAD half needs a production route-pattern predicate that matches
-///    `{name}` segments without over-matching (`/api/proxy/a/b/config`);
-///    Reviewer 2's prototype over-matched. axum 0.8.9 exposes no route
-///    introspection (only `has_routes() -> bool`), so the predicate would be a
-///    hand-maintained path list — exactly the maintenance hazard
-///    `frp-core/src/config/strict.rs:280-285` refuses.
-/// 3. `apply_admin_auth` is shared (`frp-core/src/admin_auth.rs:36`), called
-///    from this file and from `frp-server/src/dashboard.rs:3610/3626/3650`, so
-///    switching it to `route_layer` is not scoped to the frpc admin API.
+/// 1. C makes auth opt-in per route: a route added later without the wrapper is
+///    unauthenticated by default, whereas the single outer layer authenticates
+///    every route, present and future, by default. Closing that fail-open
+///    foot-gun (a wrapping helper plus a test that every registered route
+///    answers 401 unauthenticated) is the first requirement of any future fix.
+/// 2. The unknown-path 401 is deliberate and permanent: authenticating only
+///    matched routes (`route_layer`, or C's fallback left off) would answer 404
+///    there and reveal which paths and methods exist. Reviewer 2 measured the
+///    sharper form: an unauthenticated `GET /api/store/proxies` answers 401 when
+///    the store is enabled and 404 when it is not, disclosing *configuration
+///    state*, not merely path existence. This repo already deviates from Go for
+///    security elsewhere: a wildcard/unspecified `web_server.addr` is forced to
+///    `127.0.0.1` regardless of auth, and an explicit non-loopback address is
+///    honoured only when auth is set.
+/// 3. A *blanket* switch of `apply_admin_auth` to `route_layer` is out of scope:
+///    the helper is shared (`frp-core/src/admin_auth.rs:36`), called from this
+///    file and from `frp-server/src/dashboard.rs:3656/3672/3696`, so it would
+///    change the frps dashboard too. C is admin-local and leaves the helper and
+///    the dashboard alone.
 ///
 /// The rule is applied uniformly to `/api/metrics` and the `/api/store/*`
 /// routes too. `/api/metrics` is the genuinely frp-rs-only one: Go v0.71.0's
