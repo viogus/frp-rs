@@ -101,8 +101,14 @@ read_regular() { # <path> — prints the text, or prints nothing and returns 3
 import os, stat, sys
 try:
     fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK)
+except FileNotFoundError:
+    sys.exit(2)                       # missing (or a dangling symlink)
+except PermissionError:
+    sys.exit(5)
+except IsADirectoryError:
+    sys.exit(6)
 except OSError:
-    sys.exit(3)
+    sys.exit(4)
 if not stat.S_ISREG(os.fstat(fd).st_mode):
     os.close(fd)
     sys.exit(3)
@@ -111,58 +117,39 @@ with os.fdopen(fd, "r", encoding="utf8", errors="replace") as f:
 ' "$1"
 }
 
-read_refused() { # <label> <path>
-  printf '  FAIL  %s could not be read (%s) — not evaluated\n' "$1" "$2"
-  fail=1
-}
-
-# read_into <label> <path> — sets READ_TEXT/READ_OK. A refusal prints a FAIL
-# naming the path and never an `ok`: an unreadable source would otherwise
-# extract to "" and compare equal to an empty expectation (the false-ok class
-# this closes).
+# read_into <label> <path> — sets READ_TEXT/READ_OK. A refusal prints one FAIL
+# carrying the *reason* (missing / not a regular file / Permission denied / a
+# directory) and never an `ok`: an unreadable source would otherwise extract to
+# "" and compare equal to an empty expectation (the false-ok class this closes).
+# `python3` missing is named as the cause instead of blaming the file.
 READ_TEXT=""
 READ_OK=0
 read_into() { # <label> <path>
-  if READ_TEXT=$(read_regular "$2"); then
-    READ_OK=1
-  else
+  if [ "$have_python" != 1 ]; then
     READ_TEXT=""
     READ_OK=0
-    read_refused "$1" "$2"
+    printf '  FAIL  %s not evaluated — python3 not found (a green run needs it)\n' "$1"
+    fail=1
+    return
   fi
-}
-
-# nonregular <name-glob> <root>... — print paths matching the glob that are not
-# regular files (FIFO, socket, device, dangling symlink). Every recursive read
-# below uses `find -L … -type f`, which keeps those out of the read (so it cannot
-# block) but would silently omit them; this is the one place that names them and
-# fails the run. Returns 1 when any were found.
-nonregular() { # <name-glob> <root>...
-  local glob=$1 out
-  shift
-  out=$(find -L "$@" -name "$glob" ! -type f -print 2>/dev/null)
-  if [ -n "$out" ]; then
-    printf '%s\n' "$out" | sed 's/^/    non-regular: /'
-    return 1
+  READ_TEXT=$(read_regular "$2")
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    READ_OK=1
+    return
   fi
-  return 0
+  READ_TEXT=""
+  READ_OK=0
+  case "$rc" in
+    2) reason=missing ;;
+    3) reason='not a regular file' ;;
+    5) reason='Permission denied' ;;
+    6) reason='a directory' ;;
+    *) reason='unreadable' ;;
+  esac
+  printf '  FAIL  %s could not be read: %s (%s) — not evaluated\n' "$1" "$2" "$reason"
+  fail=1
 }
-
-# A non-regular `.rs` path in the scanned crates makes every count below omit a
-# file; name it once, up front, so the omission is red instead of silent.
-if ! nonregular '*.rs' frp-core frp-server frp-client frp-vnet frps frpc; then
-  printf '  FAIL  non-regular .rs path(s) in the scanned crates — source counts not certified\n'
-  fail=1
-fi
-# The workflow files are read by two awk scans and one grep; a FIFO there is
-# skipped by `find -type f` and must be named. The toolchain checks below must
-# then not print their `ok` line over an incomplete scan (the flag suppresses it).
-wf_scan_ok=1
-if ! nonregular '*.y*ml' .github/workflows; then
-  printf '  FAIL  non-regular workflow file(s) under .github/workflows/ — toolchain scan not certified\n'
-  fail=1
-  wf_scan_ok=0
-fi
 
 # ---------------------------------------------------------------- versioning
 hdr "Version alignment (mandatory — CLAUDE.md)"
@@ -179,9 +166,11 @@ canon=""
 [ "$READ_OK" = 1 ] && canon=$(extract_ver "$READ_TEXT")
 printf '  canonical (frp-core/Cargo.toml) : %s\n' "$canon"
 
-check_ver() { # <label> <actual>
+check_ver() { # <label> <actual> <path>
   if [ -z "$2" ]; then
-    printf '  FAIL  %-34s no version extracted — not evaluated\n' "$1"
+    # The file *was* read; it simply carries no extractable version. That is a
+    # content failure, not a failure to evaluate the source.
+    printf '  FAIL  %-34s no version found in %s — check the wording\n' "$1" "$3"
     fail=1
   elif [ -z "$canon" ]; then
     # The canonical source was refused (or held no version): there is nothing to
@@ -198,65 +187,230 @@ check_ver() { # <label> <actual>
 
 for c in frp-core frp-server frp-client frps frpc; do
   read_into "$c/Cargo.toml" "$c/Cargo.toml"
-  [ "$READ_OK" = 1 ] && check_ver "$c/Cargo.toml" "$(extract_ver "$READ_TEXT")"
+  [ "$READ_OK" = 1 ] && check_ver "$c/Cargo.toml" "$(extract_ver "$READ_TEXT")" "$c/Cargo.toml"
 done
 read_into "frp-core/src/lib.rs VERSION" frp-core/src/lib.rs
 [ "$READ_OK" = 1 ] && check_ver "frp-core/src/lib.rs VERSION" \
-  "$(printf '%s' "$READ_TEXT" | grep -m1 'pub const VERSION' | sed -E 's/.*"([^"]+)".*/\1/')"
+  "$(printf '%s' "$READ_TEXT" | grep -m1 'pub const VERSION' | sed -E 's/.*"([^"]+)".*/\1/')" \
+  "frp-core/src/lib.rs"
 # `VERSION="${1:-0.71.0}"` — pull the default out of the parameter expansion.
 read_into "scripts/download-frp-rs.sh" scripts/download-frp-rs.sh
 [ "$READ_OK" = 1 ] && check_ver "scripts/download-frp-rs.sh" \
   "$(printf '%s' "$READ_TEXT" \
      | grep -m1 -oE 'VERSION="\$\{[0-9]+:-v?[0-9]+\.[0-9]+\.[0-9]+\}"' \
-     | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+     | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')" \
+  "scripts/download-frp-rs.sh"
 read_into "README.md version" README.md
 [ "$READ_OK" = 1 ] && check_ver "README.md version" \
-  "$(printf '%s' "$READ_TEXT" | grep -oE 'frp-rs [0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/frp-rs //')"
+  "$(printf '%s' "$READ_TEXT" | grep -oE 'frp-rs [0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/frp-rs //')" \
+  "README.md"
 
-# frp-vnet is deliberately NOT aligned (CLAUDE.md documents this exception).
+# frp-vnet is deliberately NOT aligned (CLAUDE.md documents this exception). The
+# row is suppressed when the manifest was refused (a FAIL already named it) so it
+# cannot print an empty version as if it had been read.
 read_into "frp-vnet/Cargo.toml" frp-vnet/Cargo.toml
-vnet=""
-[ "$READ_OK" = 1 ] && vnet=$(extract_ver "$READ_TEXT")
-printf '  info  %-34s %s (exception, not aligned)\n' "frp-vnet/Cargo.toml" "$vnet"
+if [ "$READ_OK" = 1 ]; then
+  printf '  info  %-34s %s (exception, not aligned)\n' "frp-vnet/Cargo.toml" "$(extract_ver "$READ_TEXT")"
+fi
+
+# ------------------------------------------------- source counts (python walk)
+# Every printed source count (Code size, Tests, the SAFETY-cmts column) comes
+# from one python walk so the printed and gated definitions agree by
+# construction. `os.walk(..., followlinks=False)` is what the gated python scans
+# use: it does not follow a symlinked *directory* (measured: `find -L` counted
+# frp-core 98 files / 120833 lines when `frp-core/src/ext` was a symlink to
+# frp-server/src, while the gated scans still saw 21 blocks), so the printed
+# numbers return to the gated set. Each `.rs` file is opened with the same
+# O_NONBLOCK + fstat guard: a FIFO or an unreadable file is recorded and fails
+# the run instead of blocking `find | xargs cat` / `-exec grep` (which stats a
+# regular file and then opens a FIFO — measured 13/20 hangs on a flipping
+# `frp-core/src/*.rs`). A symlinked `.rs` *file* is still double-counted by both
+# the printed and the gated walks (pre-existing, recorded).
+TEST_ATTR='^[[:space:]]*#\[(tokio::)?test(\([^]]*\))?\]'
+counts=""
+if [ "$have_python" = 1 ]; then
+  counts=$(python3 -B - <<'PY'
+import errno, os, re, stat, sys
+
+CRATES = ('frp-core', 'frp-server', 'frp-client', 'frp-vnet', 'frps', 'frpc')
+GATED = ('frp-core', 'frp-server', 'frp-client', 'frp-vnet')
+TEST_ATTR = re.compile(r'^[^\S\n]*#\[(tokio::)?test(\([^]]*\))?\]')
+errors = []
+
+
+def note(msg):
+    errors.append(msg)
+
+
+def safe_read(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, 'not a regular file', path)
+        with os.fdopen(fd, 'r', encoding='utf8', errors='ignore') as f:
+            fd = -1
+            return f.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def walk_error(e):
+    note('%s: %s' % (getattr(e, 'filename', '?'), e.strerror or e))
+
+
+def rs_texts(root, top_only=False):
+    """Yield the text of every `.rs` file under `root`, reading each with the
+    O_NONBLOCK guard. `top_only` matches a `root/*.rs` glob (not a recursive
+    grep): only the directory's own entries."""
+    if top_only:
+        try:
+            names = sorted(os.listdir(root))
+        except OSError as e:
+            note('%s: %s' % (root, e.strerror or e))
+            return
+        for fn in names:
+            if fn.endswith('.rs'):
+                yield os.path.join(root, fn)
+        return
+    for dirpath, _dirs, names in os.walk(root, onerror=walk_error, followlinks=False):
+        for fn in names:
+            if fn.endswith('.rs'):
+                yield os.path.join(dirpath, fn)
+
+
+files = {c: 0 for c in CRATES}
+lines = {c: 0 for c in CRATES}
+safety = {c: 0 for c in GATED}
+testfuncs = testfiles = proptest = 0
+for crate in CRATES:
+    # The historical scopes differ: Code size and SAFETY cmts read <crate>/src,
+    # while the test-function/proptest greps recursed over the whole crate dir
+    # (so `tests/` and `benches/` count). One walk over the crate root serves
+    # both, keyed on whether the file is under `<crate>/src/`.
+    if not os.path.isdir(crate):
+        continue
+    srcpfx = os.path.join(crate, 'src') + os.sep
+    for p in rs_texts(crate):
+        try:
+            text = safe_read(p)
+        except OSError as e:
+            note('%s: %s' % (p, e.strerror or e))
+            continue
+        if p.startswith(srcpfx):
+            files[crate] += 1
+            lines[crate] += text.count('\n')
+            if crate in safety:
+                safety[crate] += text.count('// SAFETY')
+        if crate in GATED:
+            proptest += text.count('proptest!')
+        hits = sum(1 for l in text.split('\n') if TEST_ATTR.match(l))
+        testfuncs += hits
+        if hits:
+            testfiles += 1
+
+srvtest = 0
+for p in rs_texts(os.path.join('frp-server', 'tests'), top_only=True):
+    try:
+        text = safe_read(p)
+    except OSError as e:
+        note('%s: %s' % (p, e.strerror or e))
+        continue
+    srvtest += sum(1 for l in text.split('\n') if TEST_ATTR.match(l))
+
+for e in errors:
+    print('scan error: %s' % e, file=sys.stderr)
+print('F ' + ' '.join(str(files[c]) for c in CRATES))
+print('L ' + ' '.join(str(lines[c]) for c in CRATES))
+print('S ' + ' '.join(str(safety[c]) for c in GATED))
+print('T %d %d %d %d' % (testfuncs, testfiles, srvtest, proptest))
+if errors:
+    sys.exit(4)
+PY
+)
+  counts_rc=$?
+  if [ "$counts_rc" -ne 0 ]; then
+    printf '  FAIL  source counts incomplete (see scan errors above) — report not certified\n'
+    fail=1
+  fi
+fi
+F=""; L=""; S=""; T=""
+if [ -n "$counts" ]; then
+  { read -r _k F; read -r _k L; read -r _k S; read -r _k T; } <<EOF
+$counts
+EOF
+fi
+crate_files=()
+crate_lines=()
+crate_safety=()
+read -r -a crate_files <<EOF
+$F
+EOF
+read -r -a crate_lines <<EOF
+$L
+EOF
+read -r -a crate_safety <<EOF
+$S
+EOF
+read -r n_testfuncs n_testfiles n_srvtest n_proptest <<EOF
+$T
+EOF
+if [ -z "$F" ] && [ "$have_python" != 1 ]; then
+  # No python3: historical find-based counts so the report is not a row of
+  # zeros. The run is already red (every python gate fails closed), and a static
+  # non-regular file is still excluded by `-type f`; a *flipping* one is not
+  # bounded on this path (residual).
+  idx=0
+  for c in frp-core frp-server frp-client frp-vnet frps frpc; do
+    if [ -d "$c/src" ]; then
+      crate_files[idx]=$(find -L "$c/src" -type f -name '*.rs' 2>/dev/null | wc -l | tr -d ' ')
+      crate_lines[idx]=$(find -L "$c/src" -type f -name '*.rs' -exec cat {} + 2>/dev/null | wc -l | tr -d ' ')
+    else
+      crate_files[idx]=0
+      crate_lines[idx]=0
+    fi
+    idx=$((idx + 1))
+  done
+  idx=0
+  for c in frp-core frp-server frp-client frp-vnet; do
+    if [ -d "$c/src" ]; then
+      crate_safety[idx]=$(find -L "$c/src" -type f -name '*.rs' -exec grep -ho '// SAFETY' {} + 2>/dev/null | wc -l | tr -d ' ')
+    else
+      crate_safety[idx]=0
+    fi
+    idx=$((idx + 1))
+  done
+  n_testfuncs=$(find -L frp-core frp-server frp-client frp-vnet frps frpc -type f -name '*.rs' -exec grep -hoE "$TEST_ATTR" {} + 2>/dev/null | wc -l | tr -d ' ')
+  n_testfiles=$(find -L frp-core frp-server frp-client frp-vnet frps frpc -type f -name '*.rs' -exec grep -lE "$TEST_ATTR" {} + 2>/dev/null | wc -l | tr -d ' ')
+  n_srvtest=$(find -L frp-server/tests -maxdepth 1 -type f -name '*.rs' -exec grep -hoE "$TEST_ATTR" {} + 2>/dev/null | wc -l | tr -d ' ')
+  n_proptest=$(find -L frp-core frp-server frp-client frp-vnet -type f -name '*.rs' -exec grep -ho 'proptest!' {} + 2>/dev/null | wc -l | tr -d ' ')
+fi
 
 # ---------------------------------------------------------------- code size
-# Report only: an unreadable *regular* file here still undercounts silently
-# (`cat`'s error is discarded), and the gates are the python3 scans below. What
-# it must not do is follow a non-regular path into a blocking read — `find -L …
-# -type f` excludes a FIFO/socket/device/dangling symlink, and the up-front
-# `nonregular` check fails the run when one is present, so the omission is red
-# rather than a hang.
 hdr "Code size"
 printf '  %-14s %8s %8s\n' "crate" "files" "lines"
+idx=0
 for c in frp-core frp-server frp-client frp-vnet frps frpc; do
-  [ -d "$c/src" ] || continue
-  files=$(find -L "$c/src" -type f -name '*.rs' | wc -l | tr -d ' ')
-  lines=$(find -L "$c/src" -type f -name '*.rs' -print0 | xargs -0 cat 2>/dev/null | wc -l | tr -d ' ')
-  printf '  %-14s %8s %8s\n' "$c" "$files" "$lines"
+  if [ -d "$c/src" ]; then
+    printf '  %-14s %8s %8s\n' "$c" "${crate_files[idx]:-0}" "${crate_lines[idx]:-0}"
+  fi
+  idx=$((idx + 1))
 done
 
 # ---------------------------------------------------------------- tests
 hdr "Tests"
-# Definition of "test function" used by the two prints below:
+# Definition of "test function" used by the prints below (and by the python walk
+# above):
 #   one test attribute that *starts a line* after optional indentation, plain
 #   `#[test]` or `#[tokio::test]`, **parameterised or not** (e.g.
 #   `#[tokio::test(flavor = "multi_thread")]`). Comment text that merely
 #   mentions an attribute is not a function and does not count (three Rust
 #   comments do mention `#[tokio::test]`; a raw grep over-counts them).
 # These counts are PRINTED, not curated — see the doc-figure note further down.
-TEST_ATTR='^[[:space:]]*#\[(tokio::)?test(\([^]]*\))?\]'
-printf '  test functions      : %s\n' \
-  "$(find -L frp-core frp-server frp-client frp-vnet frps frpc -type f -name '*.rs' \
-       -exec grep -hoE "$TEST_ATTR" {} + 2>/dev/null | wc -l | tr -d ' ')"
-printf '  files with tests    : %s\n' \
-  "$(find -L frp-core frp-server frp-client frp-vnet frps frpc -type f -name '*.rs' \
-       -exec grep -lE "$TEST_ATTR" {} + 2>/dev/null | wc -l | tr -d ' ')"
-printf '  frp-server/tests    : %s\n' \
-  "$(find -L frp-server/tests -maxdepth 1 -type f -name '*.rs' \
-       -exec grep -hoE "$TEST_ATTR" {} + 2>/dev/null | wc -l | tr -d ' ')"
-printf '  proptest blocks     : %s\n' \
-  "$(find -L frp-core frp-server frp-client frp-vnet -type f -name '*.rs' \
-       -exec grep -ho 'proptest!' {} + 2>/dev/null | wc -l | tr -d ' ')"
+printf '  test functions      : %s\n' "${n_testfuncs:-0}"
+printf '  files with tests    : %s\n' "${n_testfiles:-0}"
+printf '  frp-server/tests    : %s\n' "${n_srvtest:-0}"
+printf '  proptest blocks     : %s\n' "${n_proptest:-0}"
 printf '  integration test dirs: %s\n' \
   "$(find . -path ./target -prune -o -type d -name tests -print 2>/dev/null | grep -vc '^\./\.' || true)"
 printf '\n  NOTE: the number of tests that *pass* is a runtime fact, not a static one.\n'
@@ -264,6 +418,17 @@ printf '  Run: cargo test --workspace --all-features\n'
 
 # ---------------------------------------------------------------- unsafe
 hdr "Unsafe usage"
+# SAFETY-cmts lookup for the table below (a function because bash 3.2 mis-parses
+# a `case` pattern's `)` inside `$( ... )`).
+safety_of() { # <crate>
+  case "$1" in
+    frp-core)   printf '%s' "${crate_safety[0]:-0}" ;;
+    frp-server) printf '%s' "${crate_safety[1]:-0}" ;;
+    frp-client) printf '%s' "${crate_safety[2]:-0}" ;;
+    frp-vnet)   printf '%s' "${crate_safety[3]:-0}" ;;
+    *)          printf '%s' '?' ;;
+  esac
+}
 # Counts are comment-stripped, because a doc comment that merely mentions an
 # attribute is not a code occurrence: frp-core/src/mux.rs has a `/// \`unsafe
 # impl\` is needed` line that used to inflate the count. The doc-figure gate
@@ -347,8 +512,11 @@ PY
   fi
   while read -r c b f i; do
     [ -n "$c" ] || continue
-    s=$(find -L "$c/src" -type f -name '*.rs' -exec grep -ho '// SAFETY' {} + 2>/dev/null \
-          | wc -l | tr -d ' ')
+    # The same python walk that produced the counts above produced this column,
+    # so the table and the doc-figure gate cannot diverge. (The lookup is a
+    # function, not an inline `case`: bash 3.2 mis-parses a pattern's `)` inside
+    # `$( ... )`.)
+    s=$(safety_of "$c")
     printf '  %-12s %8s %10s %12s %10s\n' "$c" "$b" "$f" "$i" "$s"
   done <<EOF
 $unsafe_table
@@ -518,37 +686,116 @@ TOOLCHAIN_FILE=rust-toolchain.toml
 # (`scripts/frp-stress/rust-toolchain.toml`) does the same from inside its own
 # directory. The `find` fallback keeps the gate usable from a source tree with
 # no `.git` (the `health` CI job always has one).
-tc_index_bad=0
-if git rev-parse --git-dir >/dev/null 2>&1; then
-  # `git ls-files` reads the index; with a FIFO in its place the open() blocks
-  # forever (measured: `git ls-files` alone did not return in 12 s, and the
-  # whole script sat here past 90 s). The path scan's git calls are bounded by a
-  # 60 s subprocess timeout; these two are plain bash, so refuse on a non-regular
-  # index instead of hanging. `--git-path` resolves the index for a linked
-  # worktree's gitfile too.
-  tc_index=$(git rev-parse --git-path index 2>/dev/null)
-  if [ -n "$tc_index" ] && [ ! -f "$tc_index" ]; then
-    printf '  FAIL  git index (%s) is not a regular file — toolchain file list not evaluated\n' \
-      "$tc_index"
-    tc_files=""
-    tc_untracked=""
-    tc_index_bad=1
+# ---- git guard (the whole group of git calls) -------------------------------
+# git is not safe to start until its own files are known regular: `git
+# rev-parse` reads .git/HEAD and the config, and `git ls-files` reads the index;
+# a FIFO at any of them blocks git in open() before it can print anything
+# (measured: `git rev-parse --git-dir` hung >20 s against a FIFO .git/config,
+# and a flipping index escaped a plain-bash `git ls-files` for 75 s). Resolve
+# those paths *without* git and refuse a non-regular one; every git call below
+# still runs under a wall-clock bound, so a path that flips after this check
+# cannot hang the run either. `git_state`: none = no .git (find fallback),
+# ok = safe to run git, bad = refused (already reported by read_into).
+git_state=none
+if [ -L .git ] || [ -e .git ]; then
+  git_dir=""
+  if [ -d .git ]; then
+    git_dir=.git
+  elif [ -f .git ]; then
+    # Linked worktree: `.git` is a gitfile whose `gitdir:` is relative to it.
+    read_into ".git" .git
+    if [ "$READ_OK" = 1 ]; then
+      git_dir=$(printf '%s\n' "$READ_TEXT" | sed -n 's/^gitdir:[[:space:]]*//p' | head -1)
+    fi
+  fi
+  if [ -z "$git_dir" ] || [ ! -d "$git_dir" ]; then
+    printf '  FAIL  .git is not a directory or a readable gitfile — git-backed scans not evaluated\n'
     fail=1
+    git_state=bad
   else
-    tc_files=$(git ls-files | grep -E '(^|/)rust-toolchain(\.toml)?$' || true)
+    git_state=ok
+    for f in "$git_dir/HEAD" "$git_dir/index"; do
+      if [ -e "$f" ] || [ -L "$f" ]; then
+        read_into "$f" "$f"
+        [ "$READ_OK" = 1 ] || git_state=bad
+      fi
+    done
+    common=$git_dir
+    if [ "$git_state" = ok ] && { [ -e "$git_dir/commondir" ] || [ -L "$git_dir/commondir" ]; }; then
+      read_into "$git_dir/commondir" "$git_dir/commondir"
+      if [ "$READ_OK" = 1 ]; then
+        rel=$(printf '%s\n' "$READ_TEXT" | head -1)
+        case "$rel" in
+          /*) common=$rel ;;
+          *)  common="$git_dir/$rel" ;;
+        esac
+      else
+        git_state=bad
+      fi
+    fi
+    if [ "$git_state" = ok ] && { [ -e "$common/config" ] || [ -L "$common/config" ]; }; then
+      read_into "$common/config" "$common/config"
+      [ "$READ_OK" = 1 ] || git_state=bad
+    fi
+  fi
+fi
+
+# Run git under a wall-clock bound, mirroring the path scan's own git timeout.
+# `subprocess.run(timeout=)` cannot reap a process stuck in uninterruptible
+# I/O, but a FIFO open() is interruptible — the case this bounds. Needs python3;
+# without it the call fails and the toolchain gate says `not evaluated` (the run
+# is already red). A real `git ls-files` is sub-second, so 15 s is already a hang.
+GIT_BOUND=15
+git_bounded() { # <git args...>
+  python3 -B -c '
+import subprocess, sys
+bound = int(sys.argv[1])
+try:
+    r = subprocess.run(["git"] + sys.argv[2:], stdout=subprocess.PIPE, timeout=bound)
+except OSError as e:
+    sys.stderr.write("git could not be run: %s\n" % e)
+    sys.exit(127)
+except subprocess.TimeoutExpired:
+    sys.stderr.write("git %s did not finish within %ds\n" % (" ".join(sys.argv[2:]), bound))
+    sys.exit(124)
+sys.stdout.buffer.write(r.stdout)
+sys.exit(r.returncode)
+' "$GIT_BOUND" "$@"
+}
+
+tc_index_bad=0
+tc_files=""
+tc_untracked=""
+if [ "$git_state" = ok ]; then
+  tracked=$(git_bounded ls-files); git_rc=$?
+  if [ "$git_rc" -ne 0 ]; then
+    printf '  FAIL  git ls-files could not be run (exit %s) — toolchain file list not evaluated\n' "$git_rc"
+    fail=1
+    tc_index_bad=1
+  else
+    tc_files=$(printf '%s\n' "$tracked" | grep -E '(^|/)rust-toolchain(\.toml)?$' || true)
     # Untracked-but-not-gitignored shadowing files: they win in rustup exactly like
     # tracked ones, so a pass here would assert more than was checked. Gitignored
     # scratch stays invisible on purpose (`--exclude-standard`), and anything under
     # a `target/` build directory is pruned for the same reason the `find` fallback
     # below prunes it — nothing builds from inside `target/`.
-    tc_untracked=$(git ls-files --others --exclude-standard \
-      | grep -E '(^|/)rust-toolchain(\.toml)?$' | grep -vE '(^|/)target/' || true)
+    others=$(git_bounded ls-files --others --exclude-standard); git_rc=$?
+    if [ "$git_rc" -ne 0 ]; then
+      printf '  FAIL  git ls-files --others could not be run (exit %s) — toolchain file list not evaluated\n' "$git_rc"
+      fail=1
+      tc_index_bad=1
+    else
+      tc_untracked=$(printf '%s\n' "$others" \
+        | grep -E '(^|/)rust-toolchain(\.toml)?$' | grep -vE '(^|/)target/' || true)
+    fi
   fi
-else
+elif [ "$git_state" = none ]; then
   tc_files=$(find . -type d -name target -prune -o \
     \( -name rust-toolchain -o -name rust-toolchain.toml \) -print 2>/dev/null \
     | sed 's|^\./||')
   tc_untracked=""
+else
+  tc_index_bad=1
 fi
 if [ "$tc_index_bad" = 1 ]; then
   printf '        toolchain file count not evaluated\n'
@@ -690,6 +937,28 @@ fi
 #     scalar of this step (`uses: ...@v1` inside its `run: |`) arms the block, and
 #     a later `toolchain: stable` then fails a workflow that never uses the action
 #     in a real key position: exit 1.
+#
+# Read the workflow file set through the guard first. `find -type f` excludes a
+# FIFO, but a mode-000 *regular* file passes it and `-exec … 2>/dev/null` fails
+# silently — measured: a chmod-000 workflow holding `rustup default stable` left
+# the scans printing `ok` with rc=0 and "invariants hold". A mode-000
+# `.github/workflows` directory fails its listing just as silently, so that is
+# checked too. Any refusal suppresses both scans' `ok` lines.
+wf_scan_ok=1
+if [ -d .github/workflows ] && { [ ! -r .github/workflows ] || [ ! -x .github/workflows ]; }; then
+  printf '  FAIL  .github/workflows is not readable/searchable — toolchain scan not evaluated\n'
+  fail=1
+  wf_scan_ok=0
+fi
+while IFS= read -r wf; do
+  [ -n "$wf" ] || continue
+  read_into "$wf" "$wf"
+  [ "$READ_OK" = 1 ] || wf_scan_ok=0
+done <<EOF
+$(find -L .github/workflows \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null)
+EOF
+tc_input=""
+if [ "$wf_scan_ok" = 1 ]; then
 tc_input=$(find -L .github/workflows -maxdepth 1 -type f \
   \( -name '*.yml' -o -name '*.yaml' \) -exec awk '
   BEGIN { item_indent = -1; in_item = 0; target = 0 }
@@ -721,10 +990,11 @@ tc_input=$(find -L .github/workflows -maxdepth 1 -type f \
     }
   }
 ' {} + 2>/dev/null || true)
+fi
 if [ "$wf_scan_ok" = 0 ]; then
-  # The scan skipped a non-regular workflow file (named above), so an `ok` here
-  # would certify a file set the gate never read.
-  printf '  FAIL  setup-rust-toolchain toolchain input scan not evaluated — non-regular workflow file(s)\n'
+  # A workflow file the guard could not read is named above; an `ok` here would
+  # certify a file set the gate never read.
+  printf '  FAIL  setup-rust-toolchain toolchain input scan not evaluated — a workflow file could not be read\n'
   fail=1
 elif [ -n "$tc_input" ]; then
   printf '%s\n' "$tc_input" | sed 's/^/    /'
@@ -758,10 +1028,13 @@ fi
 #     TODO.md item; this gate does not cover it.
 #   * check (c) above is scoped to the setup-action step and so does not see a
 #     `toolchain:` key that some other action might consume.
-floating=$(find -L .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) \
-  -exec grep -HnE '^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*rustup[[:space:]]+default[[:space:]]|^[[:space:]]+rustup[[:space:]]+default[[:space:]]' {} + 2>/dev/null || true)
+floating=""
+if [ "$wf_scan_ok" = 1 ]; then
+  floating=$(find -L .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) \
+    -exec grep -HnE '^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*rustup[[:space:]]+default[[:space:]]|^[[:space:]]+rustup[[:space:]]+default[[:space:]]' {} + 2>/dev/null || true)
+fi
 if [ "$wf_scan_ok" = 0 ]; then
-  printf '  FAIL  floating toolchain selection scan not evaluated — non-regular workflow file(s)\n'
+  printf '  FAIL  floating toolchain selection scan not evaluated — a workflow file could not be read\n'
   fail=1
 elif [ -n "$floating" ]; then
   printf '%s\n' "$floating" | sed 's/^/    /'
@@ -1010,8 +1283,11 @@ PRUNE_DIRS = ('.git', 'target')
 GIT_ENV_DROP = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR',
                 'GIT_OBJECT_DIRECTORY')
 GIT_ENV_DROP_PREFIX = ('GIT_TRACE',)
-GIT_TIMEOUT = 60          # an ordinary hang: subprocess.run(timeout=) cannot
-                          # reap a process stuck in uninterruptible (D-state) I/O
+GIT_TIMEOUT = 30          # an ordinary hang: subprocess.run(timeout=) cannot reap
+                          # a process stuck in uninterruptible (D-state) I/O; a
+                          # real `git ls-files` here is sub-second, so 30 s is
+                          # already a hang. Bounds a FIFO index that slipped past
+                          # the pre-check, together with the toolchain's GIT_BOUND.
 
 def cargo_features(crate):
     path = os.path.join(crate, 'Cargo.toml')
@@ -1154,25 +1430,41 @@ def tracked_files():
         return None
     env = {k: v for k, v in os.environ.items()
            if k not in GIT_ENV_DROP and not k.startswith(GIT_ENV_DROP_PREFIX)}
-    # A FIFO/socket in place of the index makes `git ls-files` block in open()
-    # forever (measured: it did not return in 12 s, so the 60 s timeout below
-    # was the only bound). `git rev-parse --git-path index` does not read the
-    # index, so resolve the path with it and refuse a non-regular one at once;
-    # this also covers a linked worktree, whose `.git` is a gitfile.
-    try:
-        gp = subprocess.run(['git', 'rev-parse', '--git-path', 'index'],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            env=env, timeout=GIT_TIMEOUT)
-    except OSError as e:
-        raise IndexUnavailable('git rev-parse --git-path index could not be run: %s' % e)
-    except subprocess.SubprocessError as e:
-        raise IndexUnavailable('git rev-parse --git-path index did not finish within '
-                               '%ds (%s)' % (GIT_TIMEOUT, e.__class__.__name__))
-    if gp.returncode == 0:
-        idx = gp.stdout.decode('utf8', 'surrogateescape').rstrip('\r\n')
-        if idx and not os.path.isfile(idx):
-            raise IndexUnavailable('%s is not a regular file — a FIFO index would '
-                                   'block git ls-files' % idx)
+    # git is not safe to start until its own files are regular: `git rev-parse`
+    # reads .git/HEAD and the config, and `git ls-files` reads the index; a FIFO
+    # at any of them blocks git in open() before it can print anything
+    # (measured: `git rev-parse --git-dir` hung >20 s on a FIFO .git/config).
+    # Resolve the paths *without* git and refuse a non-regular one; the git calls
+    # below are also bounded by GIT_TIMEOUT, so a flip after this check cannot
+    # hang the run either.
+    if os.path.isdir('.git'):
+        gd = '.git'
+    elif os.path.isfile('.git'):
+        try:
+            m = re.search(r'^gitdir:[ \t]*(.+)$', safe_read('.git'), re.M)
+        except OSError as e:
+            raise IndexUnavailable('.git could not be read: %s' % (e.strerror or e))
+        if not m:
+            raise IndexUnavailable('.git is a gitfile with no gitdir: line')
+        gd = m.group(1).strip()        # a relative gitdir resolves against cwd
+    else:
+        raise IndexUnavailable('.git is neither a directory nor a regular file')
+    if not os.path.isdir(gd):
+        raise IndexUnavailable('git dir %s is not a directory' % gd)
+    for p in (os.path.join(gd, 'HEAD'), os.path.join(gd, 'index')):
+        if os.path.lexists(p) and not os.path.isfile(p):
+            raise IndexUnavailable('%s is not a regular file — git would block on it' % p)
+    common = gd
+    cdfile = os.path.join(gd, 'commondir')
+    if os.path.isfile(cdfile):
+        try:
+            rel = safe_read(cdfile).strip()
+        except OSError as e:
+            raise IndexUnavailable('%s could not be read: %s' % (cdfile, e.strerror or e))
+        common = rel if os.path.isabs(rel) else os.path.join(gd, rel)
+    cfg = os.path.join(common, 'config')
+    if os.path.lexists(cfg) and not os.path.isfile(cfg):
+        raise IndexUnavailable('%s is not a regular file — git would block on it' % cfg)
     try:
         r = subprocess.run(['git', 'ls-files', '-z', '--full-name', '--cached'],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
