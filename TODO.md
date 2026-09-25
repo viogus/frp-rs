@@ -1093,7 +1093,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `frp-core/src/admin_auth.rs` (`apply_admin_auth`) and `admin.rs` reaches it through that helper;
   and the dashboard call sites are `frp-server/src/dashboard.rs:3656/3672/3696`, not the
   3610/3626/3650 written above (verified by grep). Residue: the `GET /api/store/proxies`
-  store-on/off pair and the Go rows are the earlier review rounds' measurements, not re-run in this
+  store-on/off pair is **inferred** from the measured matched/unmatched cells plus the conditional
+  `/api/store/*` registration (only the Go store-on/off pair and the `route_layer` cells were
+  measured end to end), and the Go cells are the review rounds' wire measurements, not re-run in this
   change; this host cannot bind `127.0.0.2`, so the full
   `cargo test -p frp-client --features admin -j 1` lane fails at
   `frp-client/tests/peer_xff_registry_e2e.rs:326` for an environmental reason (that file is not in

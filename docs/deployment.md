@@ -734,8 +734,9 @@ registered GET/POST routes, the existing unauthenticated
 `handle_head_not_allowed` left on each route's `.head(...)`, and an auth-wrapped
 `Router::fallback`: the adversarial review measured that construction with an
 axum 0.8.9 probe to answer `405` there while keeping unmatched paths at `401`,
-and measured Go frp v0.71.0's cells over the wire (`401`/`405`/`404`); the
-construction needs no route introspection and no path
+and measured Go frp v0.71.0's cells over the wire (unauthenticated `GET` `401`,
+unauthenticated `HEAD` on a registered route `405`, unauthenticated unknown path
+`404`); the construction needs no route introspection and no path
 list. It is not adopted because authentication then becomes opt-in per route — a
 route added later without the wrapper is unauthenticated by default, whereas the
 single outer layer authenticates every route, present and future, by default.
