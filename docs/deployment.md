@@ -715,28 +715,35 @@ Three request-target rules follow from Go and are worth knowing. Go's admin
 router matches methods exactly, so every `GET` route *Go registers* answers
 `HEAD` with `405 Method Not Allowed` (`/api/metrics` is frp-rs-only — Go has no
 such route and answers 404 for every method), and `HEAD /api/reload` never
-reloads, whatever the query says. The authenticated cells match Go; two
-*unauthenticated* cells do not, and that divergence is **permanent**, not a
-deferred fix. Because the auth middleware is applied to the whole admin router
-before method and path routing, an unauthenticated `HEAD` on a registered route
-is `401` here where Go answers `405`, and an unauthenticated request to an
-unknown path (GET or HEAD) is `401` here where Go answers `404`. Measured over
-the wire against Go frp v0.71.0 with `webServer.user` and `webServer.password`
-set: a measured alternative — `route_layer` for auth plus a route-aware outer
-HEAD layer — reproduced Go on every cell and is still deliberately not adopted,
-for three reasons. It moves auth off unmatched paths, so an unauthenticated
-client learns which paths and methods exist (axum's own `Router::route_layer`
-documentation names that trade-off), and the sharper measured case is
-`GET /api/store/proxies`, which would answer `401` when `[store]` is enabled and
-`404` when it is not — disclosing *configuration state*, not merely path
-existence; frp-rs prefers hiding existence to Go's `404`/`405`. The `HEAD` half
-additionally needs a route-aware predicate that matches `{name}` segments
-without over-matching (`/api/proxy/a/b/config`), and axum 0.8.9 exposes no route
-introspection (`has_routes() -> bool` only), so it would be a hand-maintained
-path list — the same maintenance hazard `frp-core/src/config/strict.rs` refuses
-for the strict-mode key list. And `apply_admin_auth` is shared by the frpc admin
-API and the frps dashboard, so switching it to `route_layer` is not scoped to
-this endpoint. More than 10000 query parameters disable `strictConfig`:
+reloads, whatever the query says.
+
+The authenticated cells match Go; two *unauthenticated* cells do not, and the
+two differ in kind. Because the auth middleware is applied to the whole admin
+router before method and path routing, an unauthenticated `HEAD` on a registered
+route is `401` here where Go answers `405`, and an unauthenticated request to an
+unknown path (GET or HEAD) is `401` here where Go answers `404`. The unknown-path
+cell is **permanent by decision**: `401` hides which paths exist, and a
+construction that authenticates only matched routes (a blanket `route_layer`)
+would answer `404` there and disclose configuration state too — measured on that
+construction, `GET /api/store/proxies` answers `401` with `[store]` configured
+and `404` without it. frp-rs prefers hiding existence to Go's `404`.
+
+The `HEAD` cell is not an impossibility; it is a known alternative, rejected for
+the fail-closed default. The Go-matching construction is per-handler auth on the
+registered GET/POST routes, the existing unauthenticated
+`handle_head_not_allowed` left on each route's `.head(...)`, and an auth-wrapped
+`Router::fallback`: the adversarial review measured that construction over the
+wire against Go frp v0.71.0 (with an axum 0.8.9 probe) to answer `405` there
+while keeping unmatched paths at `401`, with no route introspection and no path
+list. It is not adopted because authentication then becomes opt-in per route — a
+route added later without the wrapper is unauthenticated by default, whereas the
+single outer layer authenticates every route, present and future, by default.
+Any future fix must first close that fail-open foot-gun (a wrapping helper plus a
+test that every registered route answers `401` unauthenticated). Only a *blanket*
+switch of `apply_admin_auth` to `route_layer` is out of scope here, because that
+helper is the frps dashboard's too; the per-handler construction is admin-local.
+
+More than 10000 query parameters disable `strictConfig`:
 Go's `net/url.parseQuery` opens with a parameter-count guard (`defaultMaxParams =
 10000`, inclusive, counting `&`s + 1) and its error leaves the query empty, so
 `?strictConfig=true` plus 9999 `&` is a strict 400 and plus 10000 `&` is a

@@ -1181,22 +1181,30 @@ async fn admin_hash_fragment_divergence_is_pinned() {
 }
 
 /// Permanent divergence pin: the two *unauthenticated* admin cells where frp-rs
-/// does not match Go, recorded as permanent in `docs/deployment.md` and
-/// explained in the `admin_router` comment (`frp-client/src/admin.rs`). The
-/// auth middleware is applied to the whole router before method/path routing,
-/// so an unauthenticated `HEAD` on a registered route is `401` here where Go
-/// v0.71.0 answers `405`, and an unauthenticated request to an unknown path is
-/// `401` for `GET` and `HEAD` where Go answers `404`. The authenticated
-/// controls below show the divergence is exactly those two cells: with valid
-/// credentials, an unknown path is `404` and `HEAD` on a registered route is
-/// `405`, matching Go.
+/// does not match Go, recorded in `docs/deployment.md` and explained in the
+/// `admin_router` comment (`frp-client/src/admin.rs`). The auth middleware is
+/// applied to the whole router before method/path routing, so an unauthenticated
+/// `HEAD` on a registered route is `401` here where Go v0.71.0 answers `405`,
+/// and an unauthenticated request to an unknown path is `401` for `GET` and
+/// `HEAD` where Go answers `404`. The authenticated controls below show the
+/// divergence is exactly those two cells: with valid credentials, an unknown
+/// path is `404` and `HEAD` on a registered route is `405`, matching Go.
 ///
-/// The alternative that would match Go (`route_layer` auth plus a route-aware
-/// outer HEAD layer) is deliberately not adopted — it would make unmatched
-/// paths bypass auth and disclose which paths, and with `[store]` enabled which
-/// configuration, exist. That is the security-posture half of the record; this
-/// pin is the other half, so a future change that "fixes" the cells fails here
-/// and forces `docs/deployment.md` to be updated with it.
+/// The unknown-path cell is deliberate and permanent: `401` hides which paths
+/// exist, and authenticating only matched routes would disclose configuration
+/// state too (`GET /api/store/proxies` is 401 with `[store]` set, 404 without).
+///
+/// The `HEAD` cell is **not** unmatchable and needs no path list. The rejected
+/// construction C — auth on the registered GET/POST handlers, the existing
+/// unauthenticated `handle_head_not_allowed` left on each `.head(...)`, and an
+/// auth-wrapped `Router::fallback` — was measured to answer `405` there while
+/// keeping unmatched paths at `401`, with no route introspection. It is rejected
+/// because per-route auth is opt-in: a route added later without the wrapper is
+/// unauthenticated by default, whereas the single outer layer authenticates
+/// every route, present and future, by default. A future "fix" must first close
+/// that fail-open foot-gun (a wrapping helper plus a test that every registered
+/// route answers 401 unauthenticated); until then this pin fails on purpose and
+/// forces `docs/deployment.md` to be updated with it.
 #[cfg(feature = "admin")]
 #[tokio::test]
 async fn admin_head_auth_divergence_is_pinned() {
