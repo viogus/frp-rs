@@ -3929,13 +3929,14 @@ tokenz = "secret"
 
 /// Strict mode deliberately does NOT recurse into `[[proxies]]` / `[[visitors]]`
 /// array elements: an unknown field inside one loads where Go frp v0.71.0
-/// rejects the same config with 400 (`decode proxy at index 0: ... unknown
-/// field`). `section_known_keys` returns `None` for those sections, so the
-/// exemption is array-wide rather than type-specific — hence a `tcp` proxy, a
-/// plugin proxy and an `xtcp` visitor, each with its own unknown key. The
-/// rationale and the operator-facing consequence (a proxy/visitor typo is
-/// silently ignored in strict mode) are recorded in the strict-mode paragraph
-/// of the client-admin section in `docs/deployment.md`; a future Go-faithful
+/// rejects the same config (it refuses to start: `decode proxy at index 0:
+/// unmarshal ProxyConfig error: json: unknown field ...`). The enforcement
+/// point is `check_strict`'s "recurse only into a `toml::Value::Table`" guard:
+/// an array value never reaches the `section_known_keys` lookup, which is why
+/// the exemption covers every element regardless of its `type` — a `tcp` proxy,
+/// a plugin proxy and an `xtcp` visitor are all pinned below. The rationale and
+/// the operator-facing consequence are recorded in the strict-mode paragraph of
+/// the client-admin section in `docs/deployment.md`; a future Go-faithful
 /// recursion must update that paragraph and this pin together.
 ///
 /// The older `test_strict_accepts_unknown_proxy_field_deliberate_divergence`
@@ -4067,9 +4068,10 @@ bogus_key_in_http_plugin = 1
 
     // Teeth, without touching `strict.rs`: the *identical* key one level up
     // (top level) is rejected by the same strict check. So the acceptance above
-    // is the array skip, not a disabled checker, and the moment
-    // `section_known_keys` starts returning a set for `proxies`/`visitors` the
-    // positive load errors and this pin fails.
+    // is the array skip, not a disabled checker. The pin flips once
+    // `check_strict` recurses into those arrays with their per-struct key sets;
+    // adding `section_known_keys` arms alone is not enough, because an array
+    // value never reaches that lookup while the recursion is `Table`-only.
     let mut top = tempfile::NamedTempFile::new().unwrap();
     top.write_all(b"serverAddr = \"127.0.0.1\"\nserverPort = 7000\nbogus_key_in_tcp_proxy = 1\n")
         .unwrap();

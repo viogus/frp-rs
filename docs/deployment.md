@@ -707,20 +707,41 @@ body that cannot be buffered or does not deserialize into the expected
 `{"strict_config": bool}` shape, and a reload the loader itself rejects (a
 strict-mode unknown key).
 
-Strict mode does not recurse into `[[proxies]]` / `[[visitors]]` array elements
-(nor the server-side `[[httpPlugins]]`): an unknown field inside one is
-**accepted** (a 200 reload), where Go frp v0.71.0 rejects the same config with
-400 (`decode proxy at index 0: ... unknown field`).
-The sections most likely to be typo'd — `[auth]`, `[log]`, `[webServer]`,
-`[transport]` — are still checked, so an unknown key there is still 400, which
-scopes the exemption to the two arrays. The exemption is deliberate: per-type key
-sets (every proxy and visitor type, plus the Go camelCase aliases each accepts)
-would be a hand-maintained list that drifts as types are added, and skipping the
-recursion is the looser direction that keeps valid frp-rs configs loading. The
-consequence is blunt: **a typo in a proxy or visitor block is silently ignored in
-strict mode** — the same silent-config-loss class as the camelCase wire-field
-gotcha — so check a block's keys against its type's reference rather than relying
-on strict mode to catch them.
+Strict mode does not recurse into `[[proxies]]` / `[[visitors]]` array elements,
+and the server-side `[[httpPlugins]]` array behaves the same way. The gap is
+wider than the reload answer: Go frp v0.71.0 **refuses to start** on such a
+config — `decode proxy at index 0: unmarshal ProxyConfig error: json: unknown
+field "bogus_key_in_tcp_proxy"` — whereas frp-rs starts with the key dropped.
+Arrays and nested tables are not walked generally: nothing inside an array
+element is visited (including arrays nested there, such as a proxy's
+`healthCheckHttpHeaders`), and a nested table in a section that *is* checked is
+skipped too (`auth.tokenSource.exec.env` has no key set at `tokenSource`). The
+sections most likely to be typo'd — `[auth]`, `[log]`, `[webServer]`,
+`[transport]` — are still checked, so an unknown key there is still 400.
+
+Keeping the loose direction is a choice between two affordable fixes, not a
+missing capability. The key sets are mechanically derivable: `ProxyConfig`,
+`VisitorConfig` and `HttpPluginConfig` are each a single union struct that
+already carries Go's camelCase spellings as serde aliases, so one set per
+*struct* — not per proxy type — covers every element.
+`#[serde(deny_unknown_fields)]` on those structs implements it in a few lines
+with no list to maintain, but it is unconditional: it cannot be keyed on
+`strictConfig`, so it would also reject unknown fields in *non*-strict loads and
+at startup, where Go ignores them. A strict-only scan list instead has to track
+every field and alias of those structs, exempt their open maps (`headers`,
+`response_headers`, `annotations`, `metas`) and nested arrays, and has no
+reflection to prove completeness (hand-maintained lists are already the pattern
+for the walked sections — the risk here is completeness, not novelty): a false
+400 blocks a valid config, while a missed typo only drops a key. frp-rs keeps the
+loose direction on that basis; the Go-faithful strict-only fix is tracked as its
+own `TODO.md` item.
+
+The consequence is not uniform. An unknown or optional key is dropped silently —
+`remote_portt = 7001` loads as `remote_port: 0`, the same silent-config-loss
+class as the camelCase wire-field gotcha — but a *required* key left unset is
+rejected with a message naming it (`visitor 'v': bind port is required`). For a
+proxy block, check its keys against the type's reference rather than relying on
+strict mode to catch a typo.
 
 `POST /api/reload` additionally accepts the frp-rs extension body
 `{"strict_config": true}` (also accepted as `"strictConfig"`, the spelling
