@@ -1100,7 +1100,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `cargo test -p frp-client --features admin -j 1` lane fails at
   `frp-client/tests/peer_xff_registry_e2e.rs:326` for an environmental reason (that file is not in
   this diff; both reviewers reproduced it).
-- [ ] **Strict mode accepts unknown fields inside `[[proxies]]` / `[[visitors]]`, where Go
+- [x] **Strict mode accepts unknown fields inside `[[proxies]]` / `[[visitors]]`, where Go
   rejects them — a deliberate, documented divergence that is not in this list and not in the
   user-facing docs.** Measured with identical config text on Go frp v0.71.0 and frp-rs, both
   through `GET /api/reload?strictConfig=true`:
@@ -1126,6 +1126,60 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   maintenance story for new proxy types and their aliases), or state the exemption and its
   rationale in the strict-mode prose in `docs/deployment.md`, so a user knows a proxy-block
   typo will not be caught. No sha.
+
+  Done (branch `docs/strict-proxy-exemption`, based on `main` @ `c00b2e8`): closed by the
+  **documentation** branch, with the rationale corrected after the adversarial review falsified the
+  first draft. `docs/deployment.md`'s strict-mode prose now states the exemption, its true scope and
+  its non-uniform consequence, and `strict_mode_exempts_proxy_and_visitor_array_elements`
+  (`frp-core/src/config/tests.rs`) pins it (a `tcp` proxy, a plugin proxy, an `xtcp` visitor and a
+  server `[[httpPlugins]]` entry with unknown keys all load; the same key at top level and unknown
+  keys in `[log]`/`[auth]`/`[transport]`/`[webServer]` are still rejected), complementing the older
+  `test_strict_accepts_unknown_proxy_field_deliberate_divergence` (#273), which pinned only the `tcp`
+  half. What the review changed:
+  * the first draft's rationale — "per-type key sets … would be a maintenance hazard" — is **false**:
+    `ProxyConfig`, `VisitorConfig` and `HttpPluginConfig` are each a *single union struct* that
+    already carries Go's camelCase spellings as serde aliases, so the set is per **struct**, and the
+    adversarial review generated it mechanically (163 keys over `proxies`/`visitors`/`http_plugins`/
+    `plugin`) and wired array recursion with **zero false positives** across 77 blocks / ~92 keys (the
+    only two failing tests were the ones asserting the exemption);
+    `#[serde(deny_unknown_fields)]` on those structs reaches the same result in ten lines. The record
+    now gives the *measured* trade-off instead: that attribute is unconditional (it cannot be keyed on
+    `strictConfig`, so it would tighten non-strict loads, which Go leaves loose), while a strict-only
+    scan list must track every field and alias, exempt the open maps (`headers`, `response_headers`,
+    `annotations`, `metas`) and nested arrays, and has no reflection to prove completeness — a false
+    400 blocks a valid config where a missed typo only drops a key. Keeping the loose direction is
+    therefore stated as a **choice**, not a missing capability, and the affordable fix is now the
+    item below;
+  * the consequence is not uniform: an unknown or optional key is dropped silently (`remote_portt =
+    7001` loads as `remote_port: 0` — the silent-config-loss class), but a **required** key left unset
+    is rejected (`visitor 'v': bind port is required`);
+  * the divergence is wider than the reload answer: with strict mode on (Go's default), Go frpc
+    **refuses to start** on such a config
+    (`decode proxy at index 0: unmarshal ProxyConfig error: json: unknown field
+    "bogus_key_in_tcp_proxy"`, measured against the real binary with default flags), where frp-rs
+    starts with the key
+    dropped; the exemption also covers nested arrays (`healthCheckHttpHeaders`) and nested tables in
+    unwalked sections (`auth.tokenSource.exec.env`);
+  * the pin's teeth comment was wrong about the mechanism (adding `section_known_keys` arms alone
+    changes nothing — the enforcement is `check_strict`'s Table-only recursion guard) and is reworded;
+    the reviewer measured that the pin does fail once the arrays are recursed into, with Go-shaped
+    messages.
+
+- [ ] **Strict mode can be made Go-faithful in the proxy/visitor arrays cheaply — the fix is measured
+  and one serde attribute away.** The adversarial review built it during
+  `docs/strict-proxy-exemption`: `ProxyConfig` (`frp-core/src/config/client.rs`), `VisitorConfig`
+  (same file) and `HttpPluginConfig` (`frp-server`'s `server.rs`) are single union structs carrying
+  Go's camelCase spellings as `#[serde(alias)]`, so the key set is per **struct**; generating it
+  mechanically (163 keys over `proxies`/`visitors`/`http_plugins`/`plugin`) and recursing into the
+  arrays in `check_strict` gives `cargo test -p frp-core --lib config` → 258 passed / 2 failed — the
+  only two failures being the tests that assert the exemption — with **zero false positives** across
+  77 blocks and ~92 keys. `#[serde(deny_unknown_fields)]` on those five structs produces the identical
+  result with no list to maintain, at the cost of also tightening *non*-strict loads (it cannot be
+  keyed on `strictConfig`). What is missing is not capability but a decision plus a drift guard.
+  **Done-when:** either wire strict-only recursion with a per-struct list and a test that fails when a
+  struct field or alias is added without the list (the exemption pins in `frp-core/src/config/tests.rs`
+  flip to assert rejection), or record in `docs/deployment.md` — with a measurement, not the retracted
+  "per-type" claim — that the false-400 risk of a scan list is the larger cost in this configuration.
 - [x] **`frpc reload` / `frpc status` silently ignore a config that fails to load, and talk to
   `127.0.0.1:7400` instead.** `resolve_admin_connection` (`frpc/src/main.rs:29`) loads the
   config with `load_client_config(path, true)` at `:46` and, on **any** error, falls through to
