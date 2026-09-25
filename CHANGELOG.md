@@ -20,8 +20,8 @@ User-facing release notes for frp-rs.
   negative value is accepted and means the deadline has already passed).
 
 ### Changed
-- **A build without the `oidc` feature now refuses `auth.method = "oidc"` at
-  load — a behaviour change.** `frps-tiny` / `frpc-tiny` (and any build compiled
+- **A build without the `oidc` feature now refuses `auth.method = "oidc"` — a
+  behaviour change.** `frps-tiny` / `frpc-tiny` (and any build compiled
   without the `oidc` feature) previously fell through to `Token`, so a config
   that asked for OIDC silently ran token auth: an frps with `auth.token` set
   started as a token server and accepted token logins. It now fails — at server
