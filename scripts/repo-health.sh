@@ -110,7 +110,7 @@ except OSError:
 if not stat.S_ISREG(os.fstat(fd).st_mode):
     os.close(fd)
     sys.exit(3)
-with os.fdopen(fd, "r", encoding="utf8", errors="replace") as f:
+with os.fdopen(fd, "r", encoding="utf8", errors="replace", newline="") as f:
     sys.stdout.write(f.read())
 ' "$1"
 }
@@ -244,7 +244,10 @@ def safe_read(path):
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(errno.EINVAL, 'not a regular file', path)
-        with os.fdopen(fd, 'r', encoding='utf8', errors='ignore') as f:
+        # newline='' keeps the raw records this walker replaced (`cat`/`grep`):
+        # universal-newline translation would turn a lone `\r` into a line break
+        # `wc -l` never counted, and strip the `\r` a CRLF line ends with.
+        with os.fdopen(fd, 'r', encoding='utf8', errors='ignore', newline='') as f:
             fd = -1
             return f.read()
     finally:
@@ -912,9 +915,18 @@ fi
 # recognised forms above was seen):
 #   * an anchor or tag token between `-` and the `uses:` key —
 #     `- &step uses: ...@v1` with `toolchain: stable` below it: exit 0. This is a
-#     NARROWING introduced by this commit's rewrite: `5bf5270` caught it, and the
-#     anchor was lost when the arming test was limited to key position (pre-5bf5270
-#     `b8a9bf6` did not catch it either).
+#     NARROWING introduced when the arming test was limited to key position; the
+#     earlier SHAs that recorded it are not in this branch's history, so they are
+#     deliberately not cited here (a citation must be resolvable in the tree).
+#   * a symlinked *directory* under `.github/workflows/` holding a violating
+#     `.yml`: the old `find -L` followed the link and caught the file; this scan
+#     walks with `os.walk(followlinks=False)`, so the link is not descended. NOT
+#     covered, deliberately: following it would let a link point outside the
+#     tree, and the gated python scans use the same no-follow rule;
+#   * a *directory* named `*.yml`/`*.yaml`: the old `find -type f` excluded it and
+#     the old guard refused it as non-regular; the walk lists it under `dirs`,
+#     not `files`, so it is ignored. NOT covered: a directory cannot hold the
+#     workflow text this gate reads.
 #   * a flow *sequence* with no `-` line — `steps: [{uses: ...@v1, with:
 #     {toolchain: stable}}]`: exit 0 (pre-existing);
 #   * a comment at or below the item's indentation (`<=` the step's `-`) between
@@ -1001,8 +1013,11 @@ state = {'bad': False}
 
 def walk_error(e):
     state['bad'] = True
-    print('  FAIL  %s: %s — workflow scan not evaluated'
-          % (getattr(e, 'filename', '?'), e.strerror or e), file=sys.stderr)
+    # `E ` lines go to stdout and the bash wrapper prints them verbatim with the
+    # other FAIL detail, so the offending path survives a stdout-only capture
+    # (the aggregate lines alone do not name it).
+    print('E   FAIL  %s: %s — workflow scan not evaluated'
+          % (getattr(e, 'filename', '?'), e.strerror or e))
 
 
 def safe_read(path):
@@ -1010,7 +1025,13 @@ def safe_read(path):
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(errno.EINVAL, 'not a regular file', path)
-        with os.fdopen(fd, 'r', encoding='utf8', errors='ignore') as f:
+        # newline='' — no universal-newline translation. The reader must hand the
+        # regexes the same records awk/grep saw, `\r` included: with the default
+        # translation a CRLF `- run: rustup default\r\n` line arrives without its
+        # `\r`, and a *bare* `rustup default\r` loses the trailing `[[:space:]]`
+        # the old verdict depended on — measured: the port printed `ok` where
+        # awk/grep exited 1.
+        with os.fdopen(fd, 'r', encoding='utf8', errors='ignore', newline='') as f:
             fd = -1
             return f.read()
     finally:
@@ -1084,8 +1105,8 @@ for path in files:
         text = safe_read(path)
     except OSError as e:
         state['bad'] = True
-        print('  FAIL  %s could not be read: %s (%s) — not evaluated'
-              % (path, path, refusal(e)), file=sys.stderr)
+        print('E   FAIL  %s could not be read: %s (%s) — not evaluated'
+              % (path, path, refusal(e)))
         continue
     if os.path.dirname(path) == top:
         for n, line in toolchain_hits(text):
@@ -1104,17 +1125,39 @@ if [ "$wf_scan_ok" = 1 ]; then
     fail=1
   fi
 fi
-tc_input=$(printf '%s\n' "$wf_out" | sed -n 's/^C //p')
-floating=$(printf '%s\n' "$wf_out" | sed -n 's/^D //p')
+# Split the scan's stdout in pure bash: the verdict must not depend on sed/grep
+# (with either missing, a pipeline would parse the hits away and the gate would
+# print `ok` over a violation). `E ` lines are the per-file refusals, printed
+# here on stdout so the offending path survives a stdout-only capture.
+tc_input=""
+floating=""
+while IFS= read -r wfline; do
+  case "$wfline" in
+    C\ *) tc_input="${tc_input}${wfline#C }
+" ;;
+    D\ *) floating="${floating}${wfline#D }
+" ;;
+    E\ *) printf '%s\n' "${wfline#E }" ;;
+  esac
+done <<EOF
+$wf_out
+EOF
 if [ "$wf_scan_ok" = 0 ]; then
   # A file the scan could not read, or a scanner that could not start, is named
   # above; an `ok` here would certify a scan that did not happen.
   printf '  FAIL  setup-rust-toolchain toolchain input scan not evaluated — %s\n' "$wf_scan_reason"
   fail=1
 elif [ -n "$tc_input" ]; then
-  printf '%s\n' "$tc_input" | sed 's/^/    /'
-  printf '  FAIL  %s `toolchain:` input(s) on a setup-rust-toolchain step override the toolchain file\n' \
-    "$(printf '%s\n' "$tc_input" | grep -c .)"
+  n_tc=0
+  while IFS= read -r hit; do
+    if [ -n "$hit" ]; then
+      printf '    %s\n' "$hit"
+      n_tc=$((n_tc + 1))
+    fi
+  done <<EOF
+$tc_input
+EOF
+  printf '  FAIL  %s `toolchain:` input(s) on a setup-rust-toolchain step override the toolchain file\n' "$n_tc"
   fail=1
 else
   printf '  ok    no `toolchain:` input on any setup-rust-toolchain step\n'
@@ -1149,9 +1192,16 @@ if [ "$wf_scan_ok" = 0 ]; then
   printf '  FAIL  floating toolchain selection scan not evaluated — %s\n' "$wf_scan_reason"
   fail=1
 elif [ -n "$floating" ]; then
-  printf '%s\n' "$floating" | sed 's/^/    /'
-  printf '  FAIL  %s floating toolchain selection(s) under .github/workflows/ (rustup default ...)\n' \
-    "$(printf '%s\n' "$floating" | grep -c .)"
+  n_fl=0
+  while IFS= read -r hit; do
+    if [ -n "$hit" ]; then
+      printf '    %s\n' "$hit"
+      n_fl=$((n_fl + 1))
+    fi
+  done <<EOF
+$floating
+EOF
+  printf '  FAIL  %s floating toolchain selection(s) under .github/workflows/ (rustup default ...)\n' "$n_fl"
   fail=1
 else
   printf '  ok    no floating toolchain selection under .github/workflows/\n'
