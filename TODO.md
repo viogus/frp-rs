@@ -670,15 +670,25 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   capture bytes from. **Independently replicated by Reviewer 1: 0/48** (25 quiet parallel, 5 quiet
   serial, 12 loaded with the 1-min average passing through and beyond the band to 160.55, 6
   `tcpmux`-alone), with both targets listed and the named tests (`test_tcpmux_proxy_auth`, the 407
-  test) shown executing. **Citation correction:** the two observations cite
+  test) shown executing. **Reviewer 2 (adversarial) reproduced the mechanism in its own tree** —
+  deleting the 407 arm's `return;` fails **3/3** at `tests/tcpmux.rs:679` with observation 2's message
+  byte-for-byte, and stripping the 407's `Proxy-Authenticate` fails **3/3** at `:698` with observation
+  1's — and ran 19 more green runs (default/2/4/8 threads, loads ~30 → ~145), plus the **true
+  observation-1 shape** the author could not run: with `frps` built and `FRPS_BIN` set,
+  `cargo test -p frp-server` exits 0 across all 35 targets with `Running tests/tcpmux.rs` and
+  `test_tcpmux_proxy_auth ... ok`. **Citation correction:** the two observations cite
   `frp-server/src/tcpmux.rs:698`/`:679`, but those assertions are in `frp-server/tests/tcpmux.rs`
   (`:698` the byte-exact 407 head, `:679` the 2 s first-read timeout; `src/tcpmux.rs:698` is a closing
-  brace, not that assertion). Not covered, recorded so the closure is not
+  brace, not that assertion). **One caveat on the guard itself, measured by Reviewer 2:** empty
+  `git status` + a constant source md5 + constant binary hashes do **not** prove the *executed* binary
+  was built from pristine source — a mutant built and then reverted (with its mtime restored) survives
+  in `target/` and `cargo test` will not relink it, and that run fails at `:698` while every guard
+  reads clean. What actually rules that out here is the **direction of the result**: a mutant binary
+  makes these runs red, and 110 author runs plus 19 reviewer runs were green, so no mutant was in the
+  executed path. Not covered, recorded so the closure is not
   read as stronger than it is: the load was not *held* in the 61–77 band (it ramped through it), a
-  near-miss on the 2 s first read was not instrumented, observation 1's full-suite shape was not
-  reproduced (a fresh worktree's `cargo test -p frp-server` stops at `oidc_integration`, which needs
-  `target/debug/frps` or `FRPS_BIN`; Batch D ran that target alone), other hosts/CI/`--release`/
-  `--all-features` were not exercised, test-thread counts other than default and 1 were not run, the
+  near-miss on the 2 s first read was not instrumented, other hosts/CI/`--release`/`--all-features`
+  were not exercised, test-thread counts other than default, 1, 2, 4 and 8 were not run, the
   tests' `flock`-based cross-process `allocate_port()` allocator was not analysed as a concurrency
   mechanism (none was observed to collide), mutation+relink+revert *inside* one batch is invisible to
   a per-batch hash check, and a
