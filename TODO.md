@@ -620,7 +620,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   provenance a concurrent rebuild destroyed; and the fact that the probe pins the wire order and the
   Go source hook order, not Go's internal write-syscall count.
 
-- [ ] **Two observations of `test_tcpmux_proxy_auth` failing are unusable: both fall inside windows
+- [x] **Two observations of `test_tcpmux_proxy_auth` failing are unusable: both fall inside windows
   when a reviewing agent had `frp-server/src/tcpmux.rs` mutants in this same worktree.** They are
   kept here only as a contaminated-measurement record — the test is **not** established as flaky.
   - Observation 1: a full `cargo test -p frp-server` run failed at `tcpmux.rs:698:9`, the byte-exact
@@ -653,6 +653,31 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   same worktree another agent is measuring contaminates both, silently and in the direction of
   looking like a real flake. Review agents need their own checkout or a frozen revision, and a
   mutation must be reverted *and* the target rebuilt before any measurement resumes.
+
+  Done (branch `chore/close-tcpmux-flake`, based on `main` @ `7e2a0b5`): **closed as a
+  contaminated-measurement record**, after the quiet-tree reproduction the done-when asks for.
+  Measured on a pristine worktree at `7e2a0b5` — `git status` empty before/between/after every batch,
+  `frp-server/src/tcpmux.rs` md5 `cc646387f9a239c4d3216f85a2fa8935` before and after, both test
+  binaries' hashes constant (`tcpmux` `acad919efdcfb6492fee9025fdc6f06c`,
+  `tcpmux_httpconnect` `9e52be1c077f3e8d84ebe9d90852bdc2`), no concurrent `cargo`/`rustc`, and no other
+  worktree dirty — **110/110 runs of the observation-2 command exited 0**: 50 quiet parallel, 20 quiet
+  serial (`-- --test-threads=1`), 30 under 70 busy loops (load average ramped 16.9 → 96.8, bracketing
+  the reported 61–77), plus **10/10 of observation 1's target alone** (`cargo test -p frp-server
+  --test tcpmux`); a grep for `panicked at` / `test result: FAILED` / `error[E` across all 110 logs
+  found nothing, so no failure occurred and there was nothing to capture bytes from. **Citation
+  correction:** the two observations cite `frp-server/src/tcpmux.rs:698`/`:679`, but those assertions
+  are in `frp-server/tests/tcpmux.rs` (`:698` the byte-exact 407 head, `:679` the 2 s first-read
+  timeout; `src/tcpmux.rs:698` is a closing brace, not that assertion). Not covered, recorded so the closure is not
+  read as stronger than it is: the load was not *held* in the 61–77 band (it ramped through it), a
+  near-miss on the 2 s first read was not instrumented, observation 1's full-suite shape was not
+  reproduced (a fresh worktree's `cargo test -p frp-server` stops at `oidc_integration`, which needs
+  `target/debug/frps` or `FRPS_BIN`; Batch D ran that target alone), other hosts/CI/`--release`/
+  `--all-features` were not exercised, test-thread counts other than default and 1 were not run, and a
+  green clean tree cannot by itself prove the original two runs were contaminated rather than very
+  rare — it only fails to reproduce them in 110 attempts spanning quiet and heavily loaded
+  conditions. The process lesson the item names is already enforced in
+  `docs/developing.md § Review protocol` ("Mutate in your own checkout, never the tree being
+  measured"), so no further durable change was needed.
 - [x] **`frp-client`'s `start_paused` socket-deadline tests are flaky on this host at *default*
   features — they can turn the existing default-feature lanes red.** Found while measuring the
   new no-features runtime step; none of them is a feature gate, and none is touched by the
