@@ -2941,9 +2941,18 @@ mod v2 {
         use axum::extract::FromRequest as _;
 
         fn test_state() -> Arc<AppState> {
+            test_state_with(frp_core::auth::AuthConfig::with_token("test-token"))
+        }
+
+        /// Same state with a caller-chosen auth config (the OIDC-method case):
+        /// `/api/v2/config` reports `auth.method` from the live config, so the
+        /// dashboard arm that maps `AuthMethod::Oidc => "oidc"` needs a state
+        /// whose method is OIDC. Kept ungated — the variant exists in every
+        /// build.
+        fn test_state_with(auth: frp_core::auth::AuthConfig) -> Arc<AppState> {
             let cfg = frp_core::config::ServerConfig::default();
             Arc::new(AppState::new(
-                frp_core::auth::AuthConfig::with_token("test-token"),
+                auth,
                 "127.0.0.1".into(),
                 frp_core::encryption::derive_key("test-token"),
                 vec![frp_core::config::PortsRange {
@@ -3156,6 +3165,30 @@ mod v2 {
                 !s.contains("password"),
                 "dashboard password field must not be serialized"
             );
+        }
+
+        /// Coverage for the arm that made this gate non-exhaustive: an
+        /// `AuthMethod::Oidc` config must be reported as `"oidc"` by
+        /// `/api/v2/config`, in every build (the variant is always present; the
+        /// arm is no longer `#[cfg(feature = "oidc")]`).
+        #[tokio::test]
+        async fn test_v2_config_reports_oidc_method() {
+            let mut auth = frp_core::auth::AuthConfig::with_token("test-token");
+            auth.method = frp_core::auth::AuthMethod::Oidc;
+            let state = test_state_with(auth);
+            let resp = handle_v2_config(
+                State(state),
+                "127.0.0.1:7500".to_string(),
+                "admin".to_string(),
+                true,
+            )
+            .await;
+            assert_eq!(resp.auth.method, "oidc");
+            // The method is reported; the token still never is.
+            let s = serde_json::to_string(&to_json(&resp.0))
+                .unwrap()
+                .to_lowercase();
+            assert!(!s.contains("test-token"), "auth token leaked: {s}");
         }
 
         #[tokio::test]

@@ -561,16 +561,20 @@ jobs:
           RUSTFLAGS: "-D warnings"
       - name: Check frp-server dashboard test targets compile (isolated, dashboard only)
         # The dashboard tier is opt-in (`dashboard = ["dep:prometheus",
-        # "dep:axum", "frp-core/admin-auth"]`, frp-server/Cargo.toml) and no
-        # other step compiles frp-server's test targets with it ON. `-p
-        # frp-server` keeps frp-server's own features at just `dashboard`, so
-        # frp-server/oidc is OFF while frp-core/oidc is ON — frp-server's
-        # dev-dependency on frp-client pulls frp-client's defaults, which
-        # forward frp-core/oidc. That unification is the gate's point: a
-        # frp-core item that exists only feature-on must not make an
-        # frp-server `match` non-exhaustive, and an frp-server #[cfg] gate
-        # naming a feature that is off here (tls) must not hide an item that
-        # is actually used. Measured before the fix:
+        # "dep:axum", "frp-core/admin-auth"]`, frp-server/Cargo.toml). One other
+        # step does compile frp-server's test targets with `dashboard` ON —
+        # `cargo test -p frp-server --features dashboard -j 1` above — but that
+        # one runs *with frp-server's defaults*, so `oidc` is ON. This step is
+        # the only one that compiles them with `dashboard` ON **and `oidc`
+        # OFF**. `-p frp-server` keeps frp-server's own features at just
+        # `dashboard`, so frp-server/oidc is OFF while frp-core/oidc is ON —
+        # frp-server's dev-dependency on frp-client pulls frp-client's
+        # defaults, which forward frp-core/oidc. That unification is the gate's
+        # point: a frp-core item that exists only feature-on must not make an
+        # frp-server `match` non-exhaustive, an frp-server #[cfg] gate naming a
+        # feature that is off here (tls) must not hide an item that is actually
+        # used, and an `auth.method = "oidc"` config must be refused rather
+        # than silently downgraded (S1). Measured before the fix:
         #   RUSTFLAGS="-D warnings" cargo check -p frp-server \
         #     --no-default-features --features dashboard --all-targets
         # exited 101 with E0004 `AuthMethod::Oidc` not covered

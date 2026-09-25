@@ -55,12 +55,31 @@ fn build_auth_config(
         // sources fail, that would silently disable auth).
         frp_core::auth::resolve_dynamic_token_checked(&auth.token, unsafe_features)?
     };
-    Ok(AuthConfig {
-        method: match auth.method.to_lowercase().as_str() {
+    // `auth.method = "oidc"` in a build whose `oidc` feature is off used to fall
+    // through to `Token` — the operator asked for OIDC and got a token-auth
+    // server that accepts anyone holding the token. Refuse the configuration
+    // instead. (frp-core's `oidc` can be ON here through feature unification
+    // while frp-server's own is off; the feature that matters is the one that
+    // supplies the verifier, i.e. this crate's.)
+    let method = match auth.method.to_lowercase().as_str() {
+        "oidc" => {
             #[cfg(feature = "oidc")]
-            "oidc" => AuthMethod::Oidc,
-            _ => AuthMethod::Token,
-        },
+            {
+                AuthMethod::Oidc
+            }
+            #[cfg(not(feature = "oidc"))]
+            {
+                return Err(
+                    "auth.method = \"oidc\" requires the \"oidc\" feature, which this build \
+                     was compiled without — rebuild with it or set auth.method = \"token\""
+                        .into(),
+                );
+            }
+        }
+        _ => AuthMethod::Token,
+    };
+    Ok(AuthConfig {
+        method,
         token,
         token_source,
         oidc_issuer: auth.oidc_issuer.clone(),
@@ -2143,39 +2162,38 @@ mod tests {
         );
     }
 
-    /// Measured behaviour when frp-server's own `oidc` feature is OFF (frp-core's
-    /// `oidc` may still be ON through feature unification — the configuration the
+    /// With frp-server's own `oidc` feature OFF (frp-core's `oidc` may still be
+    /// ON through feature unification — the configuration the
     /// `-p frp-server --no-default-features --features dashboard` CI step
-    /// compiles). `method = "oidc"` is **accepted**, not a load error: the
-    /// `"oidc"` arm of `build_auth_config`'s parse is gated on frp-server/oidc, so
-    /// this build falls through to `Token`.
-    ///
-    /// It still fails closed: an empty token is refused by `check_startup`, and
-    /// with a token set an OIDC-style login (no `privilege_key`, so a JWT cannot
-    /// satisfy `generate_token`) is rejected by the token path. The frp-core stub
-    /// error ("OIDC feature disabled at compile time") is not reachable from a
-    /// config in this build — the method never becomes `Oidc`, so no stub
-    /// verifier is consulted. Asserting the parse as-is, rather than a rejection
-    /// the code does not implement.
+    /// compiles), `method = "oidc"` is a **configuration error**, not a silent
+    /// fallthrough to token auth. Before this pin the build started as token
+    /// auth whenever `auth.token` was set, so the operator asked for OIDC and got
+    /// a server that accepted anyone holding the token.
     #[test]
     #[cfg(not(feature = "oidc"))]
-    fn oidc_method_with_server_oidc_off_parses_as_token_and_fails_closed() {
-        let mut auth = frp_core::config::AuthServerConfig {
-            method: "oidc".to_string(),
-            ..Default::default()
-        };
-        let cfg = build_auth_config(&auth, &UnsafeFeatures::default()).expect("parse");
-        assert_eq!(cfg.method, AuthMethod::Token);
-        assert!(
-            cfg.check_startup().is_err(),
-            "an OIDC config with no token must refuse startup"
-        );
+    fn oidc_method_with_server_oidc_off_is_rejected() {
+        // Both halves of the measured downgrade: no token, and a token set.
+        for token in ["", "secret"] {
+            let auth = frp_core::config::AuthServerConfig {
+                method: "oidc".to_string(),
+                token: token.to_string(),
+                ..Default::default()
+            };
+            let err = build_auth_config(&auth, &UnsafeFeatures::default())
+                .expect_err("an oidc config in an oidc-less build must be rejected");
+            assert!(
+                err.contains("\"oidc\"") && err.contains("feature"),
+                "error must name the missing feature: {err}"
+            );
+        }
 
-        auth.token = "secret".to_string();
-        let cfg = build_auth_config(&auth, &UnsafeFeatures::default()).expect("parse");
-        assert_eq!(cfg.method, AuthMethod::Token);
-        assert!(cfg.check_startup().is_ok());
-        // No privilege_key => an OIDC/JWT login cannot authenticate as Token.
+        // The other half, still true and worth pinning: a *hand-built*
+        // `AuthMethod::Oidc` must fail closed on the token path (it is matched
+        // exhaustively now, but no verifier exists in this build). Built by
+        // mutation rather than struct-update: `AuthConfig` implements `Drop`
+        // (the zeroizing token), so `..Default::default()` cannot move out of it.
+        let mut cfg = AuthConfig::with_token("secret");
+        cfg.method = AuthMethod::Oidc;
         assert!(cfg.validate_login(None, Some(1_700_000_000)).is_err());
     }
 }

@@ -218,9 +218,11 @@ pub enum AuthMethod {
     /// shape as `ConnectionType::WebSocket` in
     /// `frp-core/src/transport/mod.rs`.
     ///
-    /// Only ever constructed when the *dependent* crate's `oidc` feature is on
-    /// (its config parse is gated); with frp-core's `oidc` off the runtime OIDC
-    /// entry points are the stubs below, so an OIDC login still fails closed.
+    /// Only ever constructed when the *dependent* crate's `oidc` feature is on.
+    /// A dependent whose own `oidc` is off **refuses** an `auth.method = "oidc"`
+    /// configuration at load, so an OIDC-configured server never silently runs
+    /// token auth. With frp-core's `oidc` off the runtime OIDC entry points are
+    /// the stubs below, so a hand-built `Oidc` still fails closed.
     Oidc,
 }
 

@@ -821,8 +821,21 @@ impl Service {
         } else {
             AuthMethod::Token
         };
+        // Without the `oidc` feature this used to fall through to `Token`, so an
+        // `auth.method = "oidc"` client silently ran token auth. Refuse it: the
+        // operator asked for OIDC and this build cannot provide it. The case
+        // handling matches the feature-on arm above (`== "oidc"`).
         #[cfg(not(feature = "oidc"))]
-        let auth_method = AuthMethod::Token;
+        let auth_method = match cfg.auth.as_ref() {
+            Some(ac) if ac.method == "oidc" => {
+                return Err(std::io::Error::other(
+                    "auth.method = \"oidc\" requires the \"oidc\" feature, which this build \
+                     was compiled without — rebuild with it or set auth.method = \"token\"",
+                )
+                .into());
+            }
+            _ => AuthMethod::Token,
+        };
 
         let auth_token_source = cfg.auth.as_ref().and_then(|a| a.token_source.clone());
         let token = if let Some(ref source) = auth_token_source {
@@ -6383,5 +6396,26 @@ mod tests {
         ));
         // No session start (never logged in): no reset.
         assert!(!healthy_resets_error_count(3, None, now, healthy));
+    }
+
+    /// The client half of S1: without the `oidc` feature, `auth.method = "oidc"`
+    /// used to fall through to `Token`, so an operator asking for OIDC got a
+    /// token-auth client. It must now be refused before any connection is made.
+    #[tokio::test]
+    #[cfg(not(feature = "oidc"))]
+    async fn oidc_method_with_client_oidc_off_is_rejected() {
+        let mut auth = frp_core::config::AuthClientConfig::default();
+        auth.method = "oidc".to_string();
+        let mut cfg = ClientConfig::default();
+        cfg.auth = Some(auth);
+        let err = match Service::with_unsafe_features(cfg, None, UnsafeFeatures::default()).await {
+            Ok(_) => panic!("an oidc client config in an oidc-less build must be rejected"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("\"oidc\"") && msg.contains("feature"),
+            "error must name the missing feature: {msg}"
+        );
     }
 }
