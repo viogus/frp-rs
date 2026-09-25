@@ -1491,7 +1491,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   resolves to `/dev`; `source` now resolves the real file but still `cd`s and `exit`s in the caller's
   shell.
 
-- [ ] **Read sites outside the doc-figures block still block on a non-regular file.** The
+- [x] **Read sites outside the doc-figures block still block on a non-regular file.** The
   doc-figures path now refuses a non-regular measurement input before opening it, but other read
   sites do not. Measured 2026-09-24 (macOS 26.6.2, no `timeout(1)`; a kill watchdog bounded each probe
   at 20 s, each killed with zero `FAIL` lines and no `RESULT` line): a FIFO named
@@ -1503,7 +1503,32 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   flipper runs killed at 8 s). The pre-fix script hangs identically, so this is pre-existing, not a
   regression. **Done-when:** each read site refuses (or bounds) a non-regular file, with one probe per
   site showing a loud non-zero exit instead of a hang.
-- [ ] **Two gates print `ok` rows computed from a tree they could not read.** With
+
+  Done (branch `fix/repo-health-read-sites`, based on `main` @ `fe37358`): every read site refuses a
+  non-regular file instead of blocking on it. Named paths — the version gate's seven sources, the
+  vendored manifests, `rust-toolchain.toml`, the workflow files — go through `read_regular`, one
+  `python3` doing `os.open(O_RDONLY|O_NONBLOCK)` + `os.fstat` on the *same* fd, so a path flipping
+  regular↔FIFO between a test and the open cannot slip through and a FIFO's blocking `open()` is
+  never reached (this host has no `timeout(1)`, so a shell-level bound is not portable). The
+  recursive source counts are one python walk (`os.walk(followlinks=False)` + the same fd guard)
+  instead of `find -L … | xargs cat` / `-exec grep`, the gated python blocks use an equivalent
+  `safe_read`, and the two workflow scans consume the bytes the guard read rather than re-opening the
+  files. `.git` is resolved *without* git (directory or gitfile + `commondir`) and
+  `HEAD`/`config`/`index`/`commondir` must be regular before any git call; every git call is bounded
+  (`git_bounded`, 15 s; the path scan 30 s) and sees the same `GIT_*` environment sanitisation as the
+  path scan. Measured with watchdog-bounded probes: a FIFO at `frp-core/src/zz.rs`,
+  `frp-server/tests/zz.rs`, `README.md`, `docs/developing.md`, `.github/workflows/zz.yml`,
+  `.git/config`, `.git/HEAD`, `.git/index` or `.git/commondir` hung the pre-change script (killed,
+  zero `FAIL` lines, no `RESULT`) and now exits 1 naming the path; a flipping symlink at
+  `vendor/rustls/Cargo.toml` hung 6/20 → 0/20, `frp-core/Cargo.toml` 15/20 → 0/20,
+  `rust-toolchain.toml` 11/20 → 0/20, a crate `*.rs` 13/20 → 0/12, the workflow set 2/12 → 0/15, a
+  flipping `.git/index` 4/4 (one still running past 75 s) → 0/4, the worst case bounded at 33 s by
+  the path scan's timeout. Residue (all measured, none a false green): with `grep`/`sed`/`awk`
+  absent, gates outside the read guard word a *content* failure where the tool is missing (red
+  either way); a symlinked `.rs` *file* is double-counted by the python walks (recorded below); a
+  directory named `*.yml` and a symlinked directory under `.github/workflows/` are now documented in
+  the gate's own known-not-covered list; `--sizes` and non-host platforms are unmeasured.
+- [x] **Two gates print `ok` rows computed from a tree they could not read.** With
   `frp-core/Cargo.toml` unreadable the version gate compares `""` to `""` and prints
   `ok    frp-core/Cargo.toml`; with `frp-server/src` absent the SAFETY gate prints
   `ok    every unsafe block has a // SAFETY: justification` while that crate's file list is empty
@@ -1511,6 +1536,56 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   round. Both runs still exit 1 for other reasons, so these are false `ok` rows in the report rather
   than a false green — the same class the doc-figures gate no longer has. **Done-when:** a gate whose
   input is missing or unreadable reports that instead of an `ok` row, pinned by a probe.
+
+  Done (branch `fix/repo-health-read-sites`, based on `main` @ `fe37358`): a source a gate cannot
+  read is reported instead of compared. `read_into` refuses a missing / unreadable / non-regular
+  path with the reason in the message and never prints `ok`; `check_ver` distinguishes "no version
+  found in `<path>`" (the file *was* read, and the wording is what needs checking) from "not
+  evaluated" (it was not read), and prints `canonical version unknown — not compared` instead of an
+  empty `(expected )`; a refused `frp-vnet/Cargo.toml` no longer prints an empty `info` row; an
+  absent `<crate>/src` is noted, so both the Unsafe-usage table (whose exit status is now checked in
+  bash) and the SAFETY gate report "not evaluated" instead of `ok`; and the two workflow scans read
+  the file set through the guard first, so any refusal prints `not evaluated`. Measured:
+  `chmod 000 frp-core/Cargo.toml` → zero `ok` rows, `canonical version unknown — not compared`;
+  `rm -rf frp-server/src` → `scan error: frp-server/src is not a directory — crate not scanned` +
+  `FAIL unsafe/SAFETY scan failed (exit 4)`, no `ok`; an unreadable **regular**
+  `.github/workflows/evil.yml` holding a real `rustup default stable` was the worst case — the
+  pre-change script printed `ok    no floating toolchain selection under .github/workflows/` and
+  `RESULT: invariants hold` at rc 0, and now exits 1 with the file named and both workflow scans
+  "not evaluated" (`chmod 000 .github/workflows/` likewise); with `python3` absent every source
+  reads `not evaluated — python3 not found (a green run needs it)` instead of blaming the file; with
+  `awk`/`sed` absent the workflow verdict is unchanged, because that scan is python and its output
+  is parsed in bash. Residue: the workflow scan walks with `os.walk(followlinks=False)`, so a
+  symlinked directory under `.github/workflows/` and a directory named `*.yml` are not covered
+  (documented in the gate's own known-not-covered list); the tracked-`__pycache__` and
+  symlinked-`.rs` items below are unchanged by this work.
+
+- [ ] **A committed `__pycache__` byte-code file is tracked in the repository.**
+  `scripts/__pycache__/rust_comments.cpython-314.pyc` has been tracked since `84a621f` (#354): a
+  CPython-version- and platform-specific artifact that churns on any diff of the module, is
+  meaningless on another interpreter, and is exactly what `.gitignore` is for. Measured 2026-09-25
+  during the read-site work (present at `fe37358` and still present at the branch head). Not a
+  correctness issue — Python validates the source's mtime/size and falls back to it, and the
+  `.git`-less walk fallback is unaffected. **Done-when:** the file is untracked, `__pycache__/` is
+  in `.gitignore`, and `bash scripts/repo-health.sh` still exits 0.
+- [ ] **A symlinked `.rs` *file* is double-counted by the python source walks.** `ln -s
+  kcp/session.rs frp-core/src/zz.rs` makes `unsafe_counts` (and the printed `Code size` walk) read
+  the same file twice: the printed block count becomes 22 while the curated `CLAUDE.md` claim says
+  21, so `DOC-FIGURES` fails and blames the docs for a tree that is merely symlinked. Measured
+  2026-09-25 (both the pre-change `find`/`grep` and the new `os.walk` behave the same way, so this
+  is pre-existing, not introduced). A symlinked *directory* is no longer followed (it is documented
+  as not covered). **Done-when:** a symlinked `.rs` whose target is inside the same crate root is
+  counted once (by real path), or the `Code size` and unsafe counts both name the duplicate instead
+  of silently disagreeing with the curated claim.
+- [ ] **A newline in a workflow filename is mis-parsed by the workflow-scan protocol.** The scan
+  hands its hits to bash as `C <path>:<line>:<text>` / `D …` / `E …` lines on stdout and the wrapper
+  parses them with `case`. A tracked file whose *name* contains a newline (git can track such names;
+  the path scan already handles them with `surrogateescape`) splits a hit line, and the fragment is
+  re-parsed as a hit of its own: measured 2026-09-25 by the adversarial review with a file named
+  `a<LF>C forged.yml`, which produced a bogus `FAIL 1 \`toolchain:\` input(s)` naming
+  `forged.yml:5` while the real witness was truncated to `.github/workflows/a`. False-FAIL direction
+  only — no false green, and the real violation is still reported. **Done-when:** the wrapper refuses
+  or skips a workflow path containing a newline (or the protocol escapes it), pinned by a probe.
 
 ---
 

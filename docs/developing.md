@@ -977,10 +977,24 @@ directory with no `.rs` file is refused rather than counted as zero. The block t
 exits 3, a source walk that cannot complete exits 2, and `repo-health.sh` maps both
 to its own failure line and a red run — so a sparse checkout or an unreadable input
 is reported as unmeasurable, never as "a live doc quotes a figure the tree no
-longer matches". Residue: gates outside this block (version alignment, the
-unsafe/SAFETY scan) can still print `ok` rows computed from a tree they could not
-read, and the read sites outside the doc-figures block can still block on a
-non-regular file; both are recorded in `TODO.md`.
+longer matches".
+
+The same rule holds for every other read in the script: a gate reports a source it
+could not read rather than comparing an empty value. Named paths (the version
+sources, each vendored manifest, `rust-toolchain.toml`, the workflow files) are read
+through `read_regular` — one `python3` doing an `O_NONBLOCK` open plus `fstat` on
+the same descriptor — so a path flipping between a regular file and a FIFO cannot
+slip between a test and the open, and a FIFO's blocking `open()` is never reached
+(the `health` runner has no `timeout` binary, so a shell-level bound is not
+portable). The recursive source counts are one python walk with the same guard
+instead of `find | xargs cat`, and `.git` is resolved *without* git: `HEAD`, the
+common `config`, `index` and `commondir` must be regular files before any git call,
+every git call is bounded (15 s there, 30 s in the path scan), and the git
+environment is sanitised. A refusal prints the reason and never an `ok`; a scan
+whose file set was incomplete prints `not evaluated`. Known, deliberate holes are
+listed next to the code (a directory named `*.yml`, a symlinked directory under
+`.github/workflows/`); the tracked `__pycache__` artifact and the symlinked `.rs`
+double count are recorded in `TODO.md`.
 
 ## 6. Release Process
 
