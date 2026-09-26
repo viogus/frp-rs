@@ -753,14 +753,20 @@ element keys; the remaining nested values (`headers`, `response_headers`,
 `annotations`, `metas`) are open maps whose keys are user data and are not
 walked. A drift guard (`strict_array_element_keys_match_struct_fields` in
 `frp-core/src/config/tests.rs`) extracts each struct's field names,
-`rename(deserialize = …)` names and `alias` values and compares them two-way
-with those lists, so adding, removing or renaming a field or alias fails the
-suite. The guard does **not** model a container `#[serde(rename_all = …)]`, a
-field `#[serde(flatten)]`, `skip`/`skip_deserializing`, or an unrecognised serde
-attribute: those case-rewrite, open up, shrink or otherwise change the accepted
-set in ways the extractor cannot compute, so it panics rather than guessing (four
-`#[should_panic]` tests pin that), and every `*_KNOWN_KEYS` list must appear in
-the guard's table (`strict_known_key_lists_are_all_covered`). Every
+`rename(deserialize = …)` names and `alias` values — for a field with any
+visibility, including none at all — and compares them two-way with those lists,
+so adding, removing or renaming a field or alias fails the suite.
+`skip`/`skip_deserializing` **are** modelled — the field contributes no key, so
+it must be absent from the lists. The guard does **not** model a container
+`#[serde(rename_all = …)]`, a field `#[serde(flatten)]`, or an unrecognised
+serde attribute: those case-rewrite, open up or otherwise change the accepted set
+in ways the extractor cannot compute, so it panics rather than guessing (four
+`#[should_panic]` tests pin that, and two more cover private fields and a
+`rename(serialize = …)`-only field), and every `*_KNOWN_KEYS` list must appear in
+the guard's table (`strict_known_key_lists_are_all_covered`). A `#[cfg]`-gated
+field is read as if it were always present, so a build without that feature has
+the lists accept a key its serde ignores — the safe direction (a missed typo,
+never a false 400). Every
 serde-accepted spelling is in the list, so a Go-authored config using Go's names
 (`localPort`, `customDomains`, `useEncryption`, …) and an frp-rs-authored one
 using snake_case both still load.
@@ -786,14 +792,16 @@ What the walk does **not** reach, each cell measured on Go frp v0.71.0
   configured value). This mirrors the top-level behaviour that predates this
   walk: `SERVERADDR` at the top level is Go-accepted (exit 0, measured) and
   frp-rs-refused (`unknown field "SERVERADDR"`, exit 1).
-* A legacy INI proxy/visitor section is fed through the same check, but with
-  Go's accept-and-ignore semantics rather than the v1 surface's rejection: the
-  legacy collector folds the prefix mechanisms Go reads (`meta_*` →
-  `metadatas`, `header_*` → `headers` for `type = "http"`, `plugin_header_*` →
-  the plugin's `request_headers` for the three plugin types whose conversion
-  reads them — `http2https`, `https2http`, `https2https`), then **drops** every
-  remaining key the typed struct does not name, because Go's legacy path
-  (`gopkg.in/ini` `MapTo` plus the explicit field reads in
+* A **legacy-shaped top-level section** — any top-level mapping that carries a
+  `type` key, in **any** config format, because the collector keys on the shape
+  and `normalize_client_config` never sees the file format — is fed through the
+  same check, but with Go's accept-and-ignore semantics rather than the v1
+  surface's rejection: the legacy collector folds the prefix mechanisms Go reads
+  (`meta_*` → `metadatas`, `header_*` → `headers` for `type = "http"`,
+  `plugin_header_*` → the plugin's `request_headers` for the three plugin types
+  whose conversion reads them — `http2https`, `https2http`, `https2https`), then
+  **drops** every remaining key the typed struct does not name, because Go's
+  legacy path (`gopkg.in/ini` `MapTo` plus the explicit field reads in
   `pkg/config/legacy/*.go`) ignores such keys instead of rejecting them.
   Measured: Go frp v0.71.0's own `conf/legacy/frpc_legacy_full.ini` gives
   `frpc verify -c` exit 0, and every one of those mechanisms loads here too
@@ -814,6 +822,21 @@ What the walk does **not** reach, each cell measured on Go frp v0.71.0
   check every 2.0 s whether or not `_seconds = 99` is also set, `_seconds = 2`
   alone is ignored (one check, then the 10 s default), and `_s = 99` +
   `_seconds = 2` gives one check.
+  * **Divergence for a legacy-shaped section in a non-INI file.** Go's v1
+    decoder rejects the *section name* outright, while frp-rs collects it into a
+    proxy and (after this change) ignores the same key again. Measured on
+    `serverAddr`/`serverPort` plus `[legacysection] type = "tcp"` + … +
+    `notAKnownKey = 1`, with identical results for `.toml`, `.json` and
+    `.yaml`: Go `json: unknown field "legacysection"`, exit 1; frp-rs before
+    this item exit 0 (`Config file … is valid`); frp-rs at the round-1 head
+    exit 1 (`unknown field "proxies[0].notAKnownKey"`); frp-rs now exit 0. So
+    this is the **pre-existing** frp-rs extension (the collector has always been
+    shape-based), not a new divergence: the round-1 strict walk briefly made it
+    Go-like for non-INI files and the strip restored the extension's behaviour.
+    It is permissive only — frp-rs loads a config Go rejects — so it cannot
+    produce a false 400. Scoping the collection to `.ini` would mean threading
+    the file format into `normalize_client_config` and would remove the ability
+    to spell a proxy as a top-level table; the divergence is recorded instead.
 * Keys frp-rs accepts that Go does not stay accepted, because strict mode must
   accept valid frp-rs configs: `[[http_plugins]]` (Go knows only `httpPlugins`),
   `url` / `timeout` / `enable_control` in an `[[httpPlugins]]` entry,

@@ -72,14 +72,20 @@ User-facing release notes for frp-rs.
   Go's case-insensitive JSON decoder reads and applies (`RemotePort` — see the
   case-sensitivity entry below; use `remotePort` or `remote_port`).
   `--strict-config=false` still drops such keys silently, as before.
-  **Legacy INI sections keep Go's accept-and-ignore semantics**: the legacy
-  collector folds the prefix mechanisms Go reads (`meta_*` → `metadatas`,
-  `header_*` → `headers` on an `http` proxy, `plugin_header_*` → the plugin's
-  `request_headers`) and then drops keys Go's INI path ignores
+  **Legacy-shaped top-level sections (any format — the collector keys on a
+  top-level mapping carrying a `type`, not on the `.ini` extension) keep Go's
+  accept-and-ignore INI semantics for the strict check**: the legacy collector folds the prefix mechanisms Go reads (`meta_*` →
+  `metadatas`, `header_*` → `headers` on an `http` proxy, `plugin_header_*` →
+  the plugin's `request_headers`) and then drops the keys Go's INI path ignores
   (`[common]`-only keys misplaced into a proxy section, a stray `plugin_*`
   parameter, a visitor's `meta_*`/`header_*`, an unknown key in a legacy
-  `[plugin.xxx]` server section), so Go v0.71.0's own
-  `conf/legacy/frpc_legacy_full.ini` loads as it does on Go. Two measured gaps
+  `[plugin.xxx]` server section). Go v0.71.0's own
+  `conf/legacy/frpc_legacy_full.ini` therefore draws no unknown-field refusal
+  here either (it is vendored and pinned in `frp-core/src/config/fixtures/`),
+  though it still does not load end to end: the INI reader infers integers and
+  comma-lists where INI has only strings, so `token = 12345678` fails serde on
+  both this and the previous release (an open item in `TODO.md`; see the fixture
+  README). Two measured gaps
   remain: an unknown key inside `[proxies.requestHeaders]` /
   `[proxies.responseHeaders]` is still accepted (normalization consumes those
   tables before the check, where Go rejects it), and the v1 spellings
