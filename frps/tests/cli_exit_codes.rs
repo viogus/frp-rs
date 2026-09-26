@@ -271,3 +271,51 @@ fn config_dir_extension_refuses_nonexistent_dir_with_2() {
         stderr_of(&out),
     );
 }
+
+/// The frp-rs space-separated `--strict-config` extension is made **loud** on
+/// `frps` too: exactly one stderr line, and silence for the Go-faithful shapes
+/// (`--strict-config=false`, the bare switch, absent). `BAD_CONFIG` carries no
+/// `auth.token`, so the lenient load proceeds into the documented empty-token
+/// refusal and the child still exits inside `run_frps`'s bound — a strict load
+/// would stop at the unknown field, which is what the assertion below rules out.
+#[test]
+fn space_form_strict_config_warns_on_stderr() {
+    let dir = TempDir::new();
+    let cfg = dir.write("badfrps.toml", BAD_CONFIG);
+    let warning = frp_core::cli::STRICT_CONFIG_SPACE_FORM_WARNING;
+
+    let out = run_frps(&["--strict-config", "false", "-c", &cfg]);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(warning),
+        "the extension must warn on stderr; stdout={:?} stderr={stderr:?}",
+        stdout_of(&out),
+    );
+    // Exactly once — a second emission must fail (a bare `contains` cannot
+    // see it).
+    assert_eq!(
+        stderr.matches(warning).count(),
+        1,
+        "the warning must be printed exactly once; stderr={stderr:?}"
+    );
+    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        !all.contains(UNKNOWN_FIELD),
+        "the space form consumes `false`, so the unknown key must be tolerated: {all:?}"
+    );
+
+    // The Go-faithful shapes stay silent.
+    for args in [
+        &["--strict-config=false", "-c", &cfg][..],
+        &["--strict-config", "-c", &cfg][..],
+        &["-c", &cfg][..],
+    ] {
+        let out = run_frps(args);
+        assert!(
+            !stderr_of(&out).contains(warning),
+            "{args:?} is Go-faithful and must stay silent; stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+    }
+}

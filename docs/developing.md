@@ -1219,7 +1219,211 @@ practical advice is the same as the README's: use the documented spellings; the
 camelCase aliases cover the Go-authored configs. The array-element half is the
 `TODO.md:1168` strict-mode item's territory, not this one's.
 
+#### `--strict-config`: the space-separated value form
+
+`--strict-config false` (a space, two argv tokens) is an **frp-rs extension**,
+kept, documented and made **loud** rather than dropped (`TODO.md:1613`). Go frp
+v0.71.0 registers `strict_config` as a pflag bool on both binaries, and a pflag
+bool never consumes a following token — so the same argv behaves differently.
+The `=` spelling (`--strict-config=false`) is the **Go-faithful** one and is the
+spelling to use when an argv must behave identically under both binaries.
+
+The extension is announced on **stderr**, once, on the path only:
+
+```text
+warning: --strict-config <bool> is an frp-rs extension; Go's pflag does not consume the token and stays strict. Use --strict-config=<bool> for identical behaviour.
+```
+
+It fires for the space-separated form on all six parsers (`frps`, and `frpc`'s
+`run`/`verify`/`reload`/`status`/`stop`) and for nothing else: not the `=` form,
+not the bare switch, not an absent flag, and not a non-bool token (there no value
+is consumed and the parse fails before the warning point — the entry points print
+it only after a successful parse). The reason it exists at all is that the
+divergence is otherwise **silent**: `frpc verify --strict-config false -c
+<config with an unknown key>` exits **0** where Go exits 1, and the admin
+commands dial a config Go would have refused. Documentation alone never surfaces
+at the moment it bites.
+
+Measured 2026-09-26 against Go frp **v0.71.0** (darwin/arm64,
+`/private/tmp/frp_0.71.0_darwin_arm64/`) and the frp-rs `frpc`/`frps` at this
+branch's head. Client config: a valid config plus `notAKnownFrpKey = 1` and
+`[webServer] port = 7499`, so "strict" (refuse the unknown key) and "lenient"
+(dial `7499`) are distinguishable; a second client config `host.toml` has
+`[webServer] addr = "localhost"` and no unknown key; server configs are
+`/private/tmp/goprobe/badfrps2.toml` (`bindPort = 7511`, `auth.token`, the same
+unknown key) and `/private/tmp/goprobe/goodfrps.toml` (`bindPort = 7513`,
+`auth.token`, no unknown key). Every row was run through a bounded runner;
+**rc 124 means the process started successfully and was killed by the bound**,
+which is how the lenient server rows are recorded. Rows marked *(warns)* print
+the stderr line above; every other row is silent.
+
+| argv | Go v0.71.0 | frp-rs |
+|---|---|---|
+| `frpc reload -c bad.toml` (absent) | rc 1, `json: unknown field "notAKnownFrpKey"` | rc 1, `unknown field "notAKnownFrpKey" in config file …` |
+| `frpc reload --strict-config -c bad.toml` (bare) | rc 1, same | rc 1, same |
+| `frpc reload --strict_config -c bad.toml` (bare, `_`) | rc 1, same | rc 1, same |
+| `frpc reload --strict-config=true -c bad.toml` | rc 1, same | rc 1, same |
+| `frpc reload --strict-config=false -c bad.toml` | rc 1, dials `127.0.0.1:7499` | rc 1, dials `127.0.0.1:7499` |
+| `frpc reload --strict-config false -c bad.toml` *(warns)* | rc 1, `json: unknown field …`, **no dial** (`false` is a positional) | rc 1, dials `7499` — **extension** |
+| `frpc reload --strict-config foo -c bad.toml` | rc 1, `json: unknown field …`; the stray token is ignored and strict stays `true` | rc 1, ``Error: `foo` is not expected in this context`` |
+| `frpc reload --strict-config=foo -c bad.toml` | rc 1, `Error: invalid argument "foo" for "--strict-config" flag: strconv.ParseBool: parsing "foo": invalid syntax` | rc 1, ``Error: `foo` is not expected in this context`` |
+| `frpc --strict-config false -c bad.toml` (run) *(warns)* | rc 1, `Error: unknown command "false" for "frpc"` (the root command takes no positional) | rc 1, lenient: connects to `127.0.0.1:7500` |
+| `frpc --strict-config=false -c bad.toml` (run) | rc 1, lenient: connects to `7500` | rc 1, lenient: connects to `7500` |
+| `frpc verify --strict-config false -c bad.toml` *(warns)* | rc 1, `json: unknown field …` | **rc 0**, `Config file … is valid` — **extension** |
+| `frpc verify -c bad.toml --strict-config false` *(warns)* | rc 1, `json: unknown field …` — position changes nothing | **rc 0**, `is valid` — **extension** |
+| `frpc verify --strict-config=false -c bad.toml` | rc 0, `syntax is ok` | rc 0, `is valid` |
+| `frpc status \| stop --strict-config false -c bad.toml` *(warns)* | rc 1, `json: unknown field …`, no dial | rc 1, dials `7499` — **extension** |
+| `frpc verify --strict-config "" -c bad.toml` | rc 1, `json: unknown field …` — the empty token is a positional | rc 1, ``Error: `` is not expected in this context`` |
+| `frpc verify --strict-config "" -c good.toml` | **rc 0**, `syntax is ok` — positional ignored, config valid | rc 1, ``Error: `` is not expected in this context`` |
+| `frpc verify --strict-config= -c bad.toml` | rc 1, `invalid argument "" for "--strict-config" flag: strconv.ParseBool: parsing "": invalid syntax` | rc 1, ``Error: `` is not expected in this context`` |
+| `frpc verify --strict-config=true --strict-config=false -c bad.toml` (repeated) | **rc 0**, `syntax is ok` — pflag is last-wins, so lenient | rc 1, ``argument `--strict-config` cannot be used multiple times in this context`` |
+| `frpc verify --strict-config=false --strict-config=true -c bad.toml` (repeated) | rc 1, `json: unknown field …` — last-wins, so strict | rc 1, the same repetition refusal |
+| `frps --strict-config=false -c badfrps2.toml` | rc 124 — starts (lenient) | rc 124 — starts (lenient) |
+| `frps --strict-config false -c badfrps2.toml` *(warns)* | rc 1, `Error: unknown command "false" for "frps"` | rc 124 — starts (lenient) — **extension** |
+| `frps verify --strict-config false -c badfrps2.toml` | rc 1, `json: unknown field …` | n/a — frp-rs `frps` has no `verify` subcommand (separate `TODO.md` item) |
+| `frps --strict-config foo -c badfrps2.toml` | rc 1, `Error: unknown command "foo" for "frps"` | rc 1, ``Error: `foo` is not expected in this context`` |
+| `frps --strict-config=foo -c badfrps2.toml` | rc 1, `invalid argument "foo" … strconv.ParseBool` | rc 1, ``Error: `foo` is not expected in this context`` |
+
+What the table says, precisely:
+
+- **The `=` form is Go-faithful on every parser for a single occurrence** —
+  `frps` and `frpc`'s `run`/`verify`/`reload`/`status`/`stop` — for `=true`,
+  `=false`, and a bad `=foo` (both exit 1; only the message differs). A
+  **repeated** flag is *not* Go-faithful and is not covered by that sentence:
+  Go's pflag is last-wins (`=true =false` → rc 0 lenient, the reverse → rc 1
+  strict) while frp-rs refuses the repetition outright with rc 1 in both orders.
+  The rc agrees on one of those orders and not on the other; the reason differs
+  on both.
+- **The space form is the only divergence in flag *values*.** frp-rs consumes
+  the next token as the value, which is why the lenient rows above dial where
+  Go refuses. On the two *root* commands (`frpc`, `frps`) Go answers
+  `unknown command "false"` instead — it takes no positional — while the four
+  `frpc` subcommands accept the argv and silently ignore the token, keeping
+  strict on. **Position does not matter**: with `-c` first the same divergence
+  reproduces on both binaries (measured above), so the warning is tied to the
+  flag, not to where it sits in the argv.
+- **Only a bool value is consumed — the empty token is not.** `--strict-config
+  ""` is an argv error on frp-rs (bpaf takes no empty value), and on Go the empty
+  token is an ignored positional, so with a valid config Go exits **0** where
+  frp-rs exits 1. That is a second, pre-existing "frp-rs stricter than Go"
+  divergence on the same flag, in the opposite direction from the extension; it
+  is recorded here rather than fixed. The attached `--strict-config=` fails on
+  both (Go: pflag's `ParseBool`; frp-rs: the same leftover-token message as
+  `--strict-config foo`), and neither warns.
+- **`--strict-config foo` is a different divergence from `--strict-config=foo`.**
+  Go ignores the stray space-separated token (the config is still loaded, rc 1
+  only because the config itself is refused) where frp-rs refuses the argv
+  outright; Go's `=foo` is pflag's own `strconv.ParseBool` error. All three exit
+  1, and frp-rs's message is the same for both spellings.
+- **`frps` is covered, not out of scope.** Go's server registers the same pflag
+  bool (its `--help` carries Go's text `strict config parsing mode, unknown
+  fields will cause errors (default true)`), so the extension applies there too,
+  is stated in the same help text, and warns from the same detection.
+- **"The `=` spelling is Go-faithful" is a per-flag rule, not a CLI-wide one.**
+  It holds for `--strict-config` because that flag goes through the shared
+  bool-value parser; it does **not** hold for flags still on a plain switch.
+  Measured on `frps` with the valid server config (`goodfrps.toml`, bounded
+  runner), four flags accept the pflag `=value` spelling on Go (rc 124 — it
+  starts and listens) and are refused by frp-rs with rc 1
+  (``Error: `false` is not expected in this context``): `--tls-only=false`,
+  `--enable-prometheus=false`, `--disable-log-color=false` and
+  `--dashboard-tls-mode=false`. That list is **representative, not exhaustive**
+  — those four were probed, no sweep was done, and the class is "any bool flag
+  registered as a bpaf `switch()` on either binary". The divergence runs the
+  *opposite* way from this item (frp-rs refuses an argv Go accepts) and is
+  tracked as its own `TODO.md` item whose done-when *is* that sweep. The class
+  also covers Go bool flags frp-rs does not register: Go's `frpc tcp` spells the
+  pair `--ue`/`--uc` and accepts them (`--ue=false` parses; the rc 1 is Go's
+  post-parse `name should not be empty`), while frp-rs implements neither and
+  refuses the token — the same direction as the rest of this paragraph.
+  `--use-encryption=false` is the long spelling, which Go does not register
+  (`Error: unknown flag: --use-encryption`, rc 1), so there is no Go behaviour to
+  match there, while frp-rs has the flag and refuses the `=` form for its own
+  reason.
+
+Why the extension is kept, as the measured trade the done-when asks for:
+
+- **Keeping preserves argv acceptance and every existing invocation.** The
+  measured cost is a *silent* behaviour difference for a Go-written argv: `frpc
+  verify --strict-config false -c good.toml` is rc 0 on **both** binaries today
+  (Go: strict but the config is valid; frp-rs: lenient), and
+  `frpc reload --strict-config false -c host.toml` is rc 1 on both (Go's request
+  carries `?strictConfig=true`, frp-rs dials the same address). What differs is
+  *which load happened*, which is why the warning — not just the docs — is the
+  mitigation.
+- **Dropping (bpaf `ParseArgument::adjacent()`, one method call) makes that
+  divergence loud but converts a Go-succeeding argv into an frp-rs failure.**
+  Measured with the drop branch built:
+  `frpc verify --strict-config false -c good.toml` → Go **rc 0**
+  (`syntax is ok`), drop branch **rc 1** (``Error: `false` is not expected in
+  this context``) — *this* is the load-bearing row, because the config is valid
+  and the argv succeeds on Go; `frpc verify --strict-config false -c bad.toml` →
+  Go rc 1, drop rc 1 (rc agrees, reason does not); `frpc reload --strict-config
+  false -c host.toml` → Go rc 1, drop rc 1. On the **root** command the same
+  argv is a failure on both sides already: `frps --strict-config false -c
+  goodfrps.toml` → Go **rc 1** (`Error: unknown command "false" for "frps"` — it
+  takes no positional and refuses before reading the config), head rc 124 (the
+  extension starts), drop rc 1, so there Go and the drop branch *agree* on the
+  code and that row is completeness rather than evidence. The `=` spellings keep
+  working under the drop branch (`frps --strict-config=false` still starts). So
+  the drop branch improves raw rc agreement on the config-refusal rows by turning
+  *behaviour* differences into *acceptance* differences — it refuses argv that Go
+  accepts and simply ignores the token on. This document does not quote a global
+  mismatch count; the reviewers' matrices are theirs, and the rows above are the
+  ones measured here.
+- **The decision is keep + warn.** The space form honours the user's obvious
+  intent, existing invocations keep working, and the silent part of the
+  divergence — the part that made this item worth filing — is now printed on
+  stderr by every parser that can consume it, with the Go-faithful spelling in
+  the same line. The repo already keeps bounded, documented extensions
+  (`--config-dir`, `--admin-addr`, the V1 type bytes 7/8); this one announces
+  itself on every use.
+- **The blast radius of changing it is small, but non-zero.** A tree-wide
+  `git grep` for the two-token form finds no script and no other doc — only the
+  unit tests and this item — so nothing *documents* a dependency on the form;
+  changing it would still alter behaviour for any user who typed it.
+
+Carriers, all of which agree:
+
+- the **warning**: `STRICT_CONFIG_SPACE_FORM_WARNING` (`frp-core/src/cli.rs`),
+  printed from `parse_frps_args`/`parse_frpc_args` after a successful parse and
+  gated by `strict_config_space_form_used`, which mirrors bpaf's consumption rule
+  (a `--strict-config`/`--strict_config` token immediately followed by a
+  non-`-`-prefixed bool). Pinned by `strict_config_warning_text_is_the_documented_line`
+  (exact text), `strict_config_warning_detection_matches_the_consumed_shape`
+  (the shapes that must and must not be detected, including the bare switch and
+  `--strict-config --config x`), `space_form_warning_fires_on_each_frpc_parser`
+  (real binary, one row per `frpc` parser, plus the silent `=` rows) and
+  `space_form_strict_config_warns_on_stderr` (`frps/tests/cli_exit_codes.rs`);
+- the **help text** of every parser that takes the flag, from one definition
+  (`strict_config_parser` in `frp-core/src/cli.rs`) — the bare-form line names
+  the Go-faithful spellings, states that frp-rs additionally consumes a
+  space-separated value "which Go's pflag does not", and says a warning is
+  printed; the `=BOOL` line names the Go-faithful value spelling. Pinned by
+  `strict_config_help_text_states_the_extension` (`frp-core/src/cli.rs`), which
+  asserts **each entry separately** — the rendered `--help` of all six parsers
+  must contain the squashed help const *and* the const must still carry its
+  meaning (independent literals), so neither a deleted value-form `.help()` nor
+  an inverted bare-form help passes;
+- `CHANGELOG.md` (Unreleased § Changed, for the warning, and § Docs) and this
+  section;
+- the parser tests `strict_config_defaults_to_true`,
+  `strict_config_bare_flag_is_true`, `strict_config_equals_true_parses`,
+  `strict_config_equals_false_parses_and_disables`,
+  `strict_config_space_separated_value_parses` and
+  `strict_config_invalid_value_errors_cleanly` (`frp-core/src/cli.rs`), each run
+  across all six parsers (their `.unwrap()`s carry the parser label, so a
+  failure names which parser broke);
+- the real-binary pins `verify_strict_config_spellings_match_their_measured_rows`
+  (`frpc/tests/cli_inputs.rs`: rc, which load happened, the warning for every
+  spelling, both repeated-flag orders, both empty-value spellings and the
+  position row) and `reload_space_separated_strict_config_is_consumed_as_the_value`
+  / `reload_bare_strict_config_stays_strict_and_never_connects`
+  (`frpc/tests/admin_cli.rs`, the mock-admin connection as proof of the consumed
+  value and its strict-mode control).
+
 ### Repository Invariants (`repo-health.sh`)
+
 
 `bash scripts/repo-health.sh` mirrors the `health` CI job. On top of version
 alignment it gates the `Docs` section: every `docs/*.md` and `docs/*/` must be

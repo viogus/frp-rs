@@ -840,3 +840,258 @@ fn case_insensitive_key_in_a_walked_section_is_refused_in_strict_mode() {
         stdout_of(&out)
     );
 }
+
+// ── `--strict-config`: every spelling, pinned at the rc level ───────────────
+//
+// `verify` carries the whole matrix without a listener: a strict load of an
+// unknown top-level key exits 1 with the unknown-field line, a lenient one
+// exits 0 with `is valid`. That is what makes the two forms distinguishable
+// here — the difference is *which config load happened*, not only an exit code.
+//
+// Every row also pins the **warning** (`frp_core::cli::STRICT_CONFIG_SPACE_FORM_WARNING`,
+// whose exact text is pinned by a unit test in `frp-core/src/cli.rs`): the
+// frp-rs space-separated extension prints exactly one stderr line and nothing
+// else does, so the divergence cannot bite silently.
+//
+// The Go v0.71.0 rows this encodes (measured on the official darwin/arm64
+// binary) and where frp-rs diverges:
+//
+// | argv | Go v0.71.0 | frp-rs |
+// |---|---|---|
+// | absent / bare / `=true` | strict, rc 1 (`json: unknown field …`) | strict, rc 1, silent |
+// | `--strict-config=false` | lenient, rc 0 (`syntax is ok`) | lenient, rc 0, silent |
+// | `--strict-config false` | strict, rc 1 (token is a positional) | lenient, rc 0 — **extension**, warns |
+// | `--strict-config=foo` | rc 1, pflag `invalid argument … strconv.ParseBool` | rc 1, `` `foo` is not expected ``, silent |
+// | `--strict-config foo` | rc 1 unknown field (token ignored, config still loaded) | rc 1, `` `foo` is not expected ``, silent |
+// | `--strict-config=` | rc 1 `invalid argument "" … ParseBool` | rc 1, `` `` is not expected ``, silent |
+// | `--strict-config ""` | rc 1 unknown field here (rc **0** with a valid config: the empty token is a positional) | rc 1, `` `` is not expected ``, silent |
+// | `=true =false` (repeated) | rc 0 — pflag is last-wins, so lenient | rc 1 `cannot be used multiple times`, silent |
+// | `=false =true` (repeated) | rc 1 unknown field (last-wins → strict) | rc 1, same refusal, silent |
+// | `-c bad --strict-config false` | rc 1 unknown field (position does not matter) | rc 0 `is valid` — **extension**, warns |
+//
+// The full table (including `run`/`reload`/`status`/`stop`/`frps`), the measured
+// drop branch and the reason the space form is kept are in
+// `docs/developing.md` § "`--strict-config`: the space-separated value form".
+#[test]
+fn verify_strict_config_spellings_match_their_measured_rows() {
+    let dir = TempDir::new();
+    let cfg = dir.config(
+        "bad.toml",
+        "serverAddr = \"127.0.0.1\"\nserverPort = 7500\nnotAKnownFrpKey = 1\n",
+    );
+    let warning = frp_core::cli::STRICT_CONFIG_SPACE_FORM_WARNING;
+
+    // Go-faithful rows: absent, bare (both spellings) and `=true` are strict and
+    // must not warn.
+    for args in [
+        &["verify", "-c", &cfg][..],
+        &["verify", "--strict-config", "-c", &cfg][..],
+        &["verify", "--strict_config", "-c", &cfg][..],
+        &["verify", "--strict-config=true", "-c", &cfg][..],
+        &["verify", "--strict_config=true", "-c", &cfg][..],
+    ] {
+        let out = run_frpc(args);
+        assert_eq!(exit_code(&out), 1, "{args:?} stderr={:?}", stderr_of(&out));
+        let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(
+            all.contains("unknown field \"notAKnownFrpKey\""),
+            "{args:?}: {all:?}"
+        );
+        assert!(
+            !stderr_of(&out).contains(warning),
+            "{args:?} is Go-faithful and must stay silent: stderr={:?}",
+            stderr_of(&out)
+        );
+    }
+
+    // Go-faithful row: the adjacent `=false` spelling is lenient on both.
+    for args in [
+        &["verify", "--strict-config=false", "-c", &cfg][..],
+        &["verify", "--strict_config=false", "-c", &cfg][..],
+    ] {
+        let out = run_frpc(args);
+        assert_eq!(exit_code(&out), 0, "{args:?} stderr={:?}", stderr_of(&out));
+        assert!(stdout_of(&out).contains("is valid"), "{args:?}");
+        assert!(
+            !stderr_of(&out).contains(warning),
+            "{args:?} is Go-faithful and must stay silent: stderr={:?}",
+            stderr_of(&out)
+        );
+    }
+
+    // The frp-rs extension, and the measured divergence: the space-separated
+    // token **is** consumed as the value, so the load is lenient and the
+    // warning fires. Go keeps strict on for the same argv and exits 1 without
+    // ever reaching `verify`'s success path.
+    for args in [
+        &["verify", "--strict-config", "false", "-c", &cfg][..],
+        &["verify", "--strict_config", "false", "-c", &cfg][..],
+    ] {
+        let out = run_frpc(args);
+        assert_eq!(exit_code(&out), 0, "{args:?} stderr={:?}", stderr_of(&out));
+        assert!(stdout_of(&out).contains("is valid"), "{args:?}");
+        assert!(
+            stderr_of(&out).contains(warning),
+            "{args:?} must warn on stderr: stderr={:?}",
+            stderr_of(&out)
+        );
+    }
+
+    // Position does not change the extension (measured: `-c` first is the same
+    // divergence on Go and frp-rs), and the warning follows the flag, not the
+    // position.
+    let out = run_frpc(&["verify", "-c", &cfg, "--strict-config", "false"]);
+    assert_eq!(exit_code(&out), 0, "stderr={:?}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("is valid"));
+    assert!(
+        stderr_of(&out).contains(warning),
+        "stderr={:?}",
+        stderr_of(&out)
+    );
+
+    // Non-bool values: exit 1 on both binaries and both spellings; only the
+    // message differs (Go: pflag's `strconv.ParseBool` text for the adjacent
+    // form, the stray token ignored for the space form). No value is consumed,
+    // so there is nothing to warn about.
+    for args in [
+        &["verify", "--strict-config=foo", "-c", &cfg][..],
+        &["verify", "--strict_config=foo", "-c", &cfg][..],
+        &["verify", "--strict-config", "foo", "-c", &cfg][..],
+    ] {
+        let out = run_frpc(args);
+        assert_eq!(exit_code(&out), 1, "{args:?}");
+        let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(
+            all.contains("`foo` is not expected in this context"),
+            "{args:?}: {all:?}"
+        );
+        assert!(
+            !stderr_of(&out).contains(warning),
+            "{args:?} consumes no value, so it must not warn: stderr={:?}",
+            stderr_of(&out)
+        );
+    }
+
+    // The empty value: `=` is pflag's ParseBool failure on Go, and the
+    // space-separated empty token is a *positional* on Go (rc 0 with a valid
+    // config, measured) while bpaf does not consume it either — both refuse on
+    // frp-rs, with a message difference and no warning.
+    for args in [
+        &["verify", "--strict-config=", "-c", &cfg][..],
+        &["verify", "--strict-config", "", "-c", &cfg][..],
+    ] {
+        let out = run_frpc(args);
+        assert_eq!(exit_code(&out), 1, "{args:?}");
+        let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(
+            all.contains("`` is not expected in this context"),
+            "{args:?}: {all:?}"
+        );
+        assert!(
+            !stderr_of(&out).contains(warning),
+            "{args:?} consumes no value, so it must not warn: stderr={:?}",
+            stderr_of(&out)
+        );
+    }
+
+    // A repeated flag: Go's pflag is last-wins (`=true =false` → rc 0 lenient;
+    // the reverse → rc 1 strict), frp-rs refuses the repetition outright. Same
+    // code as the strict Go row, different reason, and no warning either way.
+    for args in [
+        &[
+            "verify",
+            "--strict-config=true",
+            "--strict-config=false",
+            "-c",
+            &cfg,
+        ][..],
+        &[
+            "verify",
+            "--strict-config=false",
+            "--strict-config=true",
+            "-c",
+            &cfg,
+        ][..],
+    ] {
+        let out = run_frpc(args);
+        assert_eq!(exit_code(&out), 1, "{args:?}");
+        let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(
+            all.contains("cannot be used multiple times in this context"),
+            "{args:?}: {all:?}"
+        );
+        assert!(
+            !stderr_of(&out).contains(warning),
+            "{args:?} parses no value, so it must not warn: stderr={:?}",
+            stderr_of(&out)
+        );
+    }
+}
+
+/// The warning fires on **each** `frpc` parser, not only `verify`: one row per
+/// parser family (`run`, `verify`, `reload`, `status`, `stop`), each with a
+/// config that makes the command exit immediately (port 1 is privileged and
+/// never listening) so no child outlives `run_frpc`'s bound — and the same rows
+/// with the Go-faithful `=` spelling stay silent.
+#[test]
+fn space_form_warning_fires_on_each_frpc_parser() {
+    let dir = TempDir::new();
+    let bad = dir.config(
+        "bad.toml",
+        "serverAddr = \"127.0.0.1\"\nserverPort = 7500\nnotAKnownFrpKey = 1\n",
+    );
+    // The admin commands need a `webServer.port` to dial; port 1 is refused at
+    // once by the kernel.
+    let dial = dir.config(
+        "dial.toml",
+        "serverAddr = \"127.0.0.1\"\nserverPort = 1\nnotAKnownFrpKey = 1\n\
+         [webServer]\naddr = \"127.0.0.1\"\nport = 1\n",
+    );
+    // Run mode: the refused server port ends the login attempt immediately
+    // (`login_fail_exit`), and with no `[webServer]` no admin listener is bound.
+    let run = dir.config(
+        "run.toml",
+        "serverAddr = \"127.0.0.1\"\nserverPort = 1\nnotAKnownFrpKey = 1\n",
+    );
+
+    let space_rows: [&[&str]; 5] = [
+        &["verify", "--strict-config", "false", "-c", &bad],
+        &["reload", "--strict-config", "false", "-c", &dial],
+        &["status", "--strict-config", "false", "-c", &dial],
+        &["stop", "--strict-config", "false", "-c", &dial],
+        &["--strict-config", "false", "-c", &run],
+    ];
+    let equals_rows: [&[&str]; 5] = [
+        &["verify", "--strict-config=false", "-c", &bad],
+        &["reload", "--strict-config=false", "-c", &dial],
+        &["status", "--strict-config=false", "-c", &dial],
+        &["stop", "--strict-config=false", "-c", &dial],
+        &["--strict-config=false", "-c", &run],
+    ];
+    let warning = frp_core::cli::STRICT_CONFIG_SPACE_FORM_WARNING;
+
+    for args in space_rows {
+        let out = run_frpc(args);
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(warning),
+            "{args:?} is the extension and must warn: stderr={stderr:?}"
+        );
+        // Exactly once: a warning printed per parser stage, or by both the
+        // detection and a parser, must fail here (a bare `contains` cannot see
+        // a second emission).
+        assert_eq!(
+            stderr.matches(warning).count(),
+            1,
+            "{args:?} must print the warning exactly once: stderr={stderr:?}"
+        );
+    }
+    for args in equals_rows {
+        let out = run_frpc(args);
+        assert!(
+            !stderr_of(&out).contains(warning),
+            "{args:?} is Go-faithful and must stay silent: stderr={:?}",
+            stderr_of(&out)
+        );
+    }
+}

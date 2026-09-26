@@ -587,6 +587,66 @@ fn status_strict_config_false_tolerates_an_unknown_key() {
     kill(&mut child);
 }
 
+/// The **documented frp-rs extension** for the space-separated form, pinned
+/// end-to-end (`TODO.md:1613`; the contract is in `docs/developing.md`
+/// § "`--strict-config`: the space-separated value form"). frp-rs consumes the
+/// next token as the value, so `--strict-config false` tolerates the unknown
+/// key and dials the config's `webServer.port` — the connection arriving at
+/// this oracle is what proves the value was consumed.
+///
+/// Measured Go v0.71.0 on the same argv: pflag's bool does **not** consume the
+/// token, strict stays `true`, and the command exits 1 with `json: unknown
+/// field "notAKnownFrpKey"` **without connecting**. This test is therefore red
+/// against a Go-semantics parser, which is exactly the divergence it records.
+#[test]
+fn reload_space_separated_strict_config_is_consumed_as_the_value() {
+    let dir = TempDir::new();
+    let (listener, port) = oracle_listener();
+    let cfg = dir.config(
+        "badwithport.toml",
+        &format!(
+            "{BASE_CONFIG}notAKnownFrpKey = 1\n[webServer]\naddr = \"127.0.0.1\"\nport = {port}\n"
+        ),
+    );
+
+    let mut child = expect_one_connection(
+        &["reload", "--strict-config", "false", "-c", &cfg],
+        &listener,
+    );
+    kill(&mut child);
+}
+
+/// The control for the test above: the bare switch is Go's own semantics and
+/// stays strict, so the same config is refused and **nothing is dialled**.
+/// Together the two tests pin the extension as *value consumption*, not as
+/// "anything after the flag is tolerated".
+#[test]
+fn reload_bare_strict_config_stays_strict_and_never_connects() {
+    let dir = TempDir::new();
+    let (listener, port) = oracle_listener();
+    let cfg = dir.config(
+        "badwithport.toml",
+        &format!(
+            "{BASE_CONFIG}notAKnownFrpKey = 1\n[webServer]\naddr = \"127.0.0.1\"\nport = {port}\n"
+        ),
+    );
+
+    let out = run_frpc(&["reload", "--strict-config", "-c", &cfg]);
+
+    assert_eq!(exit_code(&out), 1, "stderr={:?}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains("unknown field \"notAKnownFrpKey\""),
+        "strict is the default and the bare switch keeps it: stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert_eq!(
+        connections_after_exit(&listener),
+        0,
+        "a strict refusal must not dial the config's webServer.port"
+    );
+}
+
 // ── frpc stop: POST /api/stop, empty body, `stop success` on 200 ────────────
 
 /// Start a one-shot mock admin server: accept exactly one connection, record
