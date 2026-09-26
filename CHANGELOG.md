@@ -49,6 +49,33 @@ User-facing release notes for frp-rs.
   negative value is accepted and means the deadline has already passed).
 
 ### Changed
+- **Strict mode now rejects unknown keys inside `[[proxies]]` / `[[visitors]]` /
+  `[[httpPlugins]]` elements — a behaviour change, and Go parity.** The key set
+  used to be per *section*, so an unknown field inside an array element was
+  accepted and silently dropped even in strict mode (Go's default), where Go frp
+  v0.71.0 exits 1 with `decode proxy at index 0: unmarshal ProxyConfig error:
+  json: unknown field "notAKnownProxyKey"`. frp-rs now reports
+  `unknown field "proxies[0].notAKnownProxyKey" in config file …` and exits 1.
+  Checked positions: every `[[proxies]]` / `[[visitors]]` element, the
+  `[proxies.plugin]` / `[visitors.plugin]` tables, a proxy's
+  `health_check_http_headers` elements, and every `[[httpPlugins]]` entry. The
+  key sets are the serde surface of `ProxyConfig` / `VisitorConfig` /
+  `PluginConfig` / `VisitorPluginConfig` / `HttpPluginConfig` — every field name
+  **and** every camelCase alias — so a Go-authored config that uses Go's
+  spellings (`localPort`, `customDomains`, `useEncryption`, …) keeps loading; a
+  drift guard fails when a field or alias is added without the list. **What now
+  fails that used to load:** a genuinely unknown key in one of those blocks
+  (`remote_portt`, `notAKnownProxyKey`) and a mis-cased key Go's
+  case-insensitive JSON decoder would have honoured (`RemotePort` — see the
+  case-sensitivity entry below; use `remotePort` or `remote_port`).
+  `--strict-config=false` still drops such keys silently, as before. Two gaps
+  remain, both measured on Go v0.71.0: an unknown key inside
+  `[proxies.requestHeaders]` / `[proxies.responseHeaders]` is still accepted
+  (normalization consumes those tables before the check, where Go rejects it),
+  and an unknown key in a legacy INI proxy section is refused here where Go's
+  INI path ignores it (the same shape as an unknown `[common]` key, which the
+  top-level check already refuses). Per-depth Go-vs-frp-rs measurements are in
+  `docs/deployment.md`.
 - **A CLI config failure now exits 1, not 2 — a behaviour change.**
   `frpc -c <bad or missing or unparsable>`, `frpc verify -c <…>` and
   `frps -c <…>` exited `2` (`EXIT_CONFIG`), while the admin subcommands
@@ -72,16 +99,18 @@ User-facing release notes for frp-rs.
     `[webServer] Port = 7499` gives `unknown field "web_server.Port" … did you
     mean 'port'?`, exit 1.
   - Inside a `[[proxies]]`/`[[visitors]]` (or `[[httpPlugins]]`) element the key
-    is **silently dropped even in strict mode** and the command exits 0 — the
-    long-standing strict-mode array exemption, not new here. A dropped
-    `remotePort` therefore registers `remote_port: 0` and lets the server
-    auto-allocate a port where Go would have used the configured one.
+    is now **refused in strict mode too** (`unknown field "proxies[0].RemotePort"
+    … did you mean 'remotePort'?`, exit 1) — stricter than Go, which reads and
+    honours the key, but the previous behaviour dropped its value silently while
+    the command exited 0. With `--strict-config=false` it is still dropped, and
+    the array's key sets are still exact-match otherwise (see the entry above).
   - With `--strict-config=false` the key is dropped everywhere and the command
     may succeed on a different value than Go used (`ServerAddr`/`ServerPort`
     fall back to `0.0.0.0:7000`) or fail later with a missing-value error.
-  The measurements, the reason no bounded alias set closes it, and the covered
-  vs uncovered scope are in `docs/developing.md` § CLI inputs; the array
-  exemption's own consequences are in `docs/deployment.md`.
+  The measurements, the reason no bounded alias set closes the remaining
+  top-level arms, and the covered vs uncovered scope are in
+  `docs/developing.md` § CLI inputs; the array recursion's own consequences are
+  in `docs/deployment.md`.
 - **`--config-dir` mode keeps its own refusal code — unchanged, and a
   divergence.** A directory that does not exist, is empty, or holds a config
   that fails to parse still exits **2** on the frp-rs side, where Go's own

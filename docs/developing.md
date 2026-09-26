@@ -973,9 +973,9 @@ Some things this table does not say, each measured:
   `authstore.json` and **4** when it is `plainstore.json`. The pins in
   `frpc/tests/cli_exit_codes.rs` use an auth-free filename (`badstore.json`), so
   they cannot catch that flip; the substring coupling is tracked in `TODO.md`.
-- **Three inputs where the two binaries disagree without a like-for-like exit
+- **Two inputs where the two binaries disagree without a like-for-like exit
   code** — one where frp-rs refuses and Go does not, one where Go crashes on a
-  code frp-rs handles, and one the other way round:
+  code frp-rs handles:
   - `frps` with `[auth] method = "token"` and an empty `token`: frp-rs exits
     **3** in ~0.01 s (`security misconfiguration: CRITICAL: [auth].token …
     server would accept ALL connections`); Go **starts and keeps running**
@@ -990,11 +990,13 @@ Some things this table does not say, each measured:
     failure. Go does exit here, so this bullet is *not* a
     "refuses-where-Go-does-not" case. That panic is also why no blanket statement
     like "Go only ever returns 0 or 1" belongs in this document.
-  - `frpc verify -c <config whose [[proxies]] block has an unknown key>`: frp-rs
-    reports `Config file … is valid` and exits **0** while Go exits **1**
-    (`decode proxy at index 0: … unknown field "notAKnownProxyKey"`). The
-    disagreement runs the *other* way — frp-rs accepts what Go refuses. Tracked
-    at `TODO.md:1168` (#375), not changed here.
+
+  A third case — `frpc verify -c <config whose [[proxies]] block has an unknown
+  key>` exiting **0** here against Go's **1** (`decode proxy at index 0: …
+  unknown field "notAKnownProxyKey"`) — **was** in this list and is now a
+  like-for-like **1**: `check_strict` walks the array elements
+  (`TODO.md:1193`), so frp-rs prints `unknown field
+  "proxies[0].notAKnownProxyKey"` and exits 1 exactly where Go does.
 
 Tests that pin this — real binaries, no mocks:
 `frpc/tests/cli_exit_codes.rs` (`frpc -c <bad>` start, `verify -c <bad>`,
@@ -1147,7 +1149,12 @@ is a property of the decoder, not of one struct, so it cannot be closed with a
 bounded set of `#[serde(alias)]`: serde's aliases are exact strings, and a
 complete fix means either per-field aliases for every case permutation across
 the whole config tree or a canonicalising pre-pass in front of
-`serde_json::from_value`.
+`serde_json::from_value`. What *did* change is which way the array arm diverges:
+`check_strict` now walks the `[[proxies]]`/`[[visitors]]`/`[[httpPlugins]]`
+elements, so a mis-cased array key is **refused** in strict mode instead of being
+dropped with exit 0 (the `cap-proxy.toml` row below). The value-level divergence
+under `--strict-config=false`, and in the positions the walk does not reach,
+is unchanged.
 
 Measured against Go v0.71.0, cell by cell, with the exact configs named. `verify`
 and `status` differ on the same file — `verify` parses and reports, while
@@ -1162,35 +1169,34 @@ and `status` differ on the same file — `verify` parses and reports, while
 | `caps-web.toml` = `ServerAddr`/`ServerPort` + `[webServer] port = 7499` | `status -c …` | rc 1, dials `127.0.0.1:7499` | rc 1, the unknown-field error | **rc 1, dials `127.0.0.1:7499`** |
 | `port-only.toml` = `[webServer] Port = 7499` | `status -c …` | rc 1, dials `7499` | rc 1, `unknown field "web_server.Port" … did you mean 'port'?` | rc 1, `web server port should be set …` |
 | `section-only.toml` = `[WebServer] port = 7499` | `status -c …` | rc 1, dials `7499` | rc 1, `unknown field "WebServer" … did you mean 'webServer'?` | rc 1, `web server port should be set …` |
-| `cap-proxy.toml` = `[[proxies]] name/type` + `LocalPort`/`RemotePort` | `verify -c …` | rc 0 (Go's loader reads the keys) | **rc 0 — the keys are silently dropped, no unknown-field error** | rc 0 |
+| `cap-proxy.toml` = `[[proxies]] name/type` + `LocalPort`/`RemotePort` | `verify -c …` | rc 0 — accepted (Go's decoder matches object keys case-insensitively) | **rc 1 — refused by the array recursion (see below)** | rc 0 — dropped, `remote_port: 0` |
 
 The last row is the sharp edge and the reason the earlier "refused (strict) or
-silently mis-defaulted (lenient)" phrasing was wrong in **both** directions:
+silently mis-defaulted (lenient)" phrasing was wrong in **both** directions.
+That row has since **changed** with the strict-mode array recursion
+(`TODO.md:1193`): `cap-proxy.toml` is now refused in strict mode
+(`unknown field "proxies[0].LocalPort" …`, exit 1, alongside
+`proxies[0].RemotePort`), because `check_strict` walks the
+`[[proxies]]`/`[[visitors]]`/`[[httpPlugins]]` elements with one exact-match key
+set per **struct** (`PROXY_KNOWN_KEYS` and friends in
+`frp-core/src/config/strict.rs:248`). Non-strict mode still drops the keys
+(rc 0, `remote_port: 0`, `local_port: 80`).
 
 - **Strict mode does not refuse everywhere: it walks only the tables it has a
   key list for.** `section_known_keys`
-  (`frp-core/src/config/strict.rs:277-285`) has nine arms, plus the top level
-  that `check_strict` is entered with. Each is listed here with a capitalised
-  nested key measured as refused at the head: the top level (`"ServerAddr"`),
-  then the nine arms — `[auth]` (`"auth.Token"`), `[log]` (`"log.Level"`),
-  `[webServer]` (`"web_server.Port"`), `[transport]` (`"TcpMux"`), `[quic]`
+  (`frp-core/src/config/strict.rs:474`) has nine arms, plus the top level
+  `check_strict` is entered with and, since the array recursion, the proxy /
+  visitor / client-plugin / visitor-plugin / http-plugin element sets. Each
+  walked position is listed here with a capitalised key measured as refused at
+  the head: the top level (`"ServerAddr"`), then the nine arms — `[auth]`
+  (`"auth.Token"`), `[log]` (`"log.Level"`), `[webServer]`
+  (`"web_server.Port"`), `[transport]` (`"TcpMux"`), `[quic]`
   (`"quic.MaxIdleTimeout"`), `[observability]` (`"observability.OtlpEndpoint"`),
   `[store]` (`"store.Path"`), `[virtual_net]` (`"virtual_net.Address"`) and the
   server-only `[sshTunnelGateway]` (`"ssh_tunnel_gateway.BindPort"`; the client
-  side has no such table). Three categories fall outside the walked set (the top
-  level plus those nine arms) and are **dropped silently even in strict mode**,
-  with `frpc verify` exiting 0:
-  - **array elements** — `[[proxies]]`/`[[visitors]]` (and the server's
-    `[[httpPlugins]]`). Stated in
-    [§ Deployment § Dashboard Web UI](deployment.md#dashboard-web-ui), lines
-    710-747, which also carry the end-to-end consequence: the same config makes
-    Go frpc bind the configured port while frp-rs registers `remote_port: 0` and
-    frps auto-allocates one. Pinned (with the value) by
-    `case_insensitive_proxy_array_key_is_dropped_in_strict_mode` and
-    `strict_mode_exempts_proxy_and_visitor_array_elements` in
-    `frp-core/src/config/tests.rs`, and at the CLI level by
-    `case_insensitive_proxy_array_keys_are_dropped_in_strict_mode` in
-    `frpc/tests/cli_inputs.rs`.
+  side has no such table) — and now a `[[proxies]]` element
+  (`"proxies[0].LocalPort"`). Two categories still fall outside the walked set
+  and are **dropped silently even in strict mode**, with `frpc verify` exiting 0:
   - **a table alias the normalizer leaves alone** — `check_strict` looks up the
     section by the spelling it sees, so a camelCase alias survives (no key list)
     and is not descended into. Measured with `[virtualNet] Address =
@@ -1224,15 +1230,15 @@ silently mis-defaulted (lenient)" phrasing was wrong in **both** directions:
     `env` is read into the token-source struct, `Env` leaves it empty. Go refuses
     both spellings (`unsafe feature "TokenSourceExec" is not enabled …`). Already
     documented in
-    [§ Deployment § Dashboard Web UI](deployment.md#dashboard-web-ui), line 719
-    (`auth.tokenSource.exec.env` has no key set at `tokenSource`). Pinned by
+    [§ Deployment § Dashboard Web UI](deployment.md#dashboard-web-ui)
+    (`auth.tokenSource.exec.env` has no key set at `tokenSource`), and pinned by
     `case_insensitive_key_in_a_nested_table_is_dropped_in_strict_mode` in
     `frp-core/src/config/tests.rs`.
 
-  So neither "the walked sections refuse" nor "arrays are dropped" is the whole
-  rule: the rule is *a mis-cased key is refused only where strict mode has a key
-  list for the table being visited — everywhere else it is dropped silently, and
-  the dropped key can change a value or hide a later refusal*.
+  So "the walked sections refuse" is still not the whole rule, but its second
+  half is gone: the rule is now *a key is refused only where strict mode has a
+  key list for the table being visited — everywhere else it is dropped silently,
+  and the dropped key can change a value or hide a later refusal*.
 - **Lenient mode need not end in an error.** With a `[webServer] port` present,
   frp-rs in non-strict mode drops the mis-cased top-level key and then uses the
   defaults — `ServerAddr` becomes `0.0.0.0` and `ServerPort` becomes `7000`
@@ -1247,9 +1253,16 @@ Scope of what *is* matched: the exact snake_case names, plus the documented
 Go camelCase aliases (`serverAddr`, `serverPort`, `webServer`, `tokenSource`,
 `oidcClientId`, …) which serde accepts per struct. What is **not** matched:
 arbitrary case variants of any key, at any level, on either frpc or frps. The
-practical advice is the same as the README's: use the documented spellings; the
-camelCase aliases cover the Go-authored configs. The array-element half is the
-`TODO.md:1168` strict-mode item's territory, not this one's.
+array-element arm of that now matches the walked sections' behaviour instead of
+being an exception: with the array recursion in place a mis-cased key inside a
+`[[proxies]]`/`[[visitors]]` element, a `[proxies.plugin]` table or an
+`[[httpPlugins]]` entry is refused in strict mode (`unknown field
+"proxies[0].RemotePort" … did you mean 'remotePort'?`, exit 1) and dropped under
+`--strict-config=false`, exactly as `[webServer] Port` behaves on both sides of
+the flag. The practical advice is the same as the README's: use the documented
+spellings; the camelCase aliases cover the Go-authored configs. The two arms
+above (`[virtualNet]`, `auth.tokenSource.exec`) remain open and are recorded in
+`TODO.md`.
 
 #### The persistent rootCmd flags on every subcommand
 

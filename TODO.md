@@ -1190,7 +1190,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     the reviewer measured that the pin does fail once the arrays are recursed into, with Go-shaped
     messages.
 
-- [ ] **Strict mode can be made Go-faithful in the proxy/visitor arrays cheaply — the fix is measured
+- [x] **Strict mode can be made Go-faithful in the proxy/visitor arrays cheaply — the fix is measured
   and one serde attribute away.** The adversarial review built it during
   `docs/strict-proxy-exemption`: `ProxyConfig` (`frp-core/src/config/client.rs`), `VisitorConfig`
   (same file) and `HttpPluginConfig` (`frp-server`'s `server.rs`) are single union structs carrying
@@ -1214,6 +1214,66 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   * frp-rs `frpc verify -c badproxy.toml` → `Config file … is valid`, exit **0**; `frpc -c
     badproxy.toml` → logs `frpc (Rust) v0.71.0 connecting...` and exits 1 later, because the
     config was accepted and the *connection* failed. That rc matches Go by coincidence only and
+  Done (branch `fix/strict-array-parity`, based on `main` @ `97fdd38`): **option (A)** — strict-only
+  recursion with per-struct key sets in `check_strict`, plus a drift guard. Measured **first** on both
+  binaries (Go frp v0.71.0 darwin/arm64 against the frp-rs `frpc`/`frps` built from this branch), with
+  Go's camelCase spellings at every level so a Go rejection is attributable to the injected key:
+  * unknown key in an array element — Go rc 1 `decode proxy at index 0: unmarshal ProxyConfig error:
+    json: unknown field "notAKnownProxyKey"`; frp-rs before rc 0 (`Config file … is valid`), after
+    rc 1 `unknown field "proxies[0].notAKnownProxyKey"`. Same shape for `[[visitors]]`
+    (`visitors[0].notAKnownVisitorKey`) and the server `[[httpPlugins]]` array
+    (`http_plugins[0].notAKnownHttpPluginKey`; Go's message there carries no index prefix —
+    `json: unknown field "notAKnownHttpPluginKey"`). `[[proxy]]`/`[[visitor]]` singular spellings are
+    rejected by **both** as unknown *top-level* keys (Go: `json: unknown field "proxy"`), and the
+    loader accepts no other array spelling.
+  * nested objects inside an element — `[proxies.transport]`, `[proxies.healthCheck]`,
+    `[proxies.loadBalancer]`, `[proxies.natTraversal]` and `[[proxies.healthCheck.httpHeaders]]` each
+    draw a Go rejection and now draw one from frp-rs too (the normalizer flattens those tables onto
+    the element before the check, so their keys are checked as element keys; the header array gets its
+    own two-key set). Residual, measured: an unknown key inside `[proxies.requestHeaders]` /
+    `[proxies.responseHeaders]` (or the `plugin` equivalents) stays accepted because `normalize_proxies`
+    consumes those tables — Go rejects it. Documented, not silently assumed.
+  * plugin depth — `[proxies.plugin] notAKnownPluginKey` and `[visitors.plugin]
+    notAKnownVisitorPluginKey` now rejected; `[proxies.plugin.requestHeaders] <unknown>` remains
+    accepted for the same normalize reason.
+  * false-positive sweep — all **160** keys of the six lists (ProxyConfig 67, VisitorConfig 32,
+    PluginConfig 39, VisitorPluginConfig 11, HttpPluginConfig 9, HealthCheckHttpHeader 2) placed
+    inside their element produce **zero** `unknown field` diagnostics after the change (0/160), and
+    the 13 alias/known-key probe blocks (camelCase aliases, snake_case, frp-rs-only
+    spellings, known nested tables) plus the repo's whole config suite still load. The prototype's
+    "163 keys" over four groups is not reproducible from this tree; this tree extracts 160 over six.
+  * the one measured new divergence — Go's `encoding/json` matches field names case-insensitively, so
+    Go accepts and honours `RemotePort`/`REMOTEPORT`/`remoteport` (rc 0, measured); frp-rs's lists
+    match exactly, so strict mode now refuses them (`unknown field "proxies[0].RemotePort" … did you
+    mean 'remotePort'?`) where it previously dropped the value silently at rc 0. This mirrors the
+    pre-existing top-level behaviour (`SERVERADDR`: Go rc 0, frp-rs rc 1) and non-strict still drops
+    the key (`remote_port: 0`).
+  * legacy INI regression found by measurement and closed: `health_check_interval_s` /
+    `health_check_timeout_s` are valid Go legacy INI keys (`pkg/config/legacy/proxy.go:130,136`) that
+    Go's conversion maps onto `HealthCheck.IntervalSeconds`/`.TimeoutSeconds`
+    (`pkg/config/legacy/conversion.go:204-206`); the new element walk would have refused them, so
+    `collect_legacy_ini_proxy_sections` now renames them onto the v1 fields (and they are honoured).
+    An unknown key in a legacy INI proxy section is still refused where Go's INI path ignores it — the
+    same shape as an unknown `[common]` key, which frp-rs already refused (both measured).
+  * tests flipped: `strict_mode_rejects_unknown_proxy_and_visitor_array_elements` (was
+    `…_exempts_…`), `test_strict_rejects_unknown_proxy_field` (was
+    `…_accepts_unknown_proxy_field_deliberate_divergence`),
+    `case_insensitive_proxy_array_key_is_refused_in_strict_mode` (was `…_is_dropped_…`, now asserting
+    refusal in strict and the drop in non-strict), and the CLI counterpart
+    `case_insensitive_proxy_array_keys_are_refused_in_strict_mode` in `frpc/tests/cli_inputs.rs`.
+    Red evidence: before the flips `cargo test -p frp-core --lib config` was 276 passed / **3 failed**
+    — exactly those pins and no other config test; the prototype's 2 failures predate
+    `case_insensitive_proxy_array_key_is_dropped_in_strict_mode`. After: 279 passed / 0 failed.
+  * drift guard — `strict_array_element_keys_match_struct_fields` (`frp-core/src/config/tests.rs`)
+    extracts field names, `rename` and `alias` values from `client.rs`/`server.rs` via `include_str!`
+    and compares both ways with the lists. Red evidence: adding `alias = "localPortDrift"` to
+    `ProxyConfig.local_port` fails it with `PROXY_KNOWN_KEYS is missing serde keys
+    ["localPortDrift"] of ProxyConfig`; two teeth tests pin that a `#[serde(flatten)]` struct and a
+    missing struct panic instead of passing vacuously.
+  * `#[serde(deny_unknown_fields)]` was **not** used: it cannot be keyed on `strictConfig`, so it
+    would tighten non-strict loads, where Go stays lenient.
+  * `scripts/compat-test.sh` was **not** run: the diff is config-load only (no protocol, transport,
+    encryption or proxy path), so it cannot reach the wire.
     must not be cited as parity on this row.
 
 - [x] **`frpc reload` / `frpc status` silently ignore a config that fails to load, and talk to
