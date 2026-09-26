@@ -914,6 +914,7 @@ valid config (plus the variations named):
 | `frpc --config-dir <nonexistent\|empty\|bad>` | **0** | **2** (deliberate) |
 | `frpc --config-dir <good>`, service cannot run | 0 (0.026 s) | 0 (0.026 s) |
 | `frps --config-dir <…>` | 1 — `unknown flag: --config-dir` | 2 (extension flag) |
+| `frps --config-dir -x` / `--config-dir --strict-config=false` | 1 — `unknown flag: --config-dir` | 2 (extension flag; the dash-shaped token is the value, so the directory read runs — was rc 1 ``--config-dir` requires an argument `DIR`` before the shared `-c <dash-value>` pass, see § CLI inputs) |
 | `frpc -c empty.toml` (defaults only, peer accepts and never answers) | 1 after 10.04 s | 1 after 30.07 s |
 | the same, with the port genuinely refusing | 1 after 0.026 s | 1 after 0.023 s |
 | `frps` on an occupied `bindPort`, `auth.token` set | 1 | 1 |
@@ -947,7 +948,10 @@ Some things this table does not say, each measured:
   `frpc service error for config file […]` and exits 0. A config that was never
   loaded is not a success, so frp-rs keeps its pre-existing non-zero refusal
   (`EXIT_CONFIG`/2) on that path. Go `frps` has no `--config-dir` flag at all
-  (`Error: unknown flag: --config-dir`, exit 1); frp-rs's is an extension.
+  (`Error: unknown flag: --config-dir`, exit 1); frp-rs's is an extension, and
+  its dash-valued form (`--config-dir -x`) takes the same 2 rather than the
+  parser's old rc 1 refusal, because `--config-dir` is one of the four flags the
+  shared `-c <dash-value>` pass covers (§ CLI inputs).
 - **`EXIT_AUTH`/3 is an extension, and its documented example is
   `auth.tokenSource`.** Worst measured case: a `tokenSource` whose file does not
   exist exits **3** on both binaries, where Go exits **1** immediately
@@ -1324,30 +1328,48 @@ parser registers; and only an unknown multi-character single-dash token falls
 back to `Arg::Word`. `State::take_arg`
 (`bpaf-0.9.27/src/args.rs:670-694`) accepts only the `Word`/`ArgWord` items
 tokenisation produced, so **it is not true that bpaf never takes a
-`-`-prefixed value** — measured at the base head (`ec82a20`), it already took
-`-foo.toml`, `-nonexistent.toml` and `-=v` (unknown multi-character tokens are
-demoted to `Arg::Word`), and refused only the flag-shaped `--strict-config=false`,
-`-x`, `-c`, `-a=b` and `--long`. `parse_frpc_args` therefore rewrites exactly
+`-`-prefixed value** — measured at the base head (`ec82a20`, and re-measured at
+this branch's base `f5437e6`), it already took `-foo.toml`, `-nonexistent.toml`
+and `-=v` (unknown multi-character tokens are demoted to `Arg::Word`), and
+refused only the flag-shaped `--strict-config=false`, `-x`, `-c`, `-a=b` and
+`--long`. A shared pre-parse pass (`prepared_cli_argv` →
+`rewrite_config_dash_values`, `frp-core/src/cli.rs`) therefore rewrites exactly
 the config-selecting occurrences — `-c`, `--config`, `--config-dir`, the frp-rs
 `--config_dir` alias — whose next token starts with `-` into the attached
-`-c=VALUE` spelling before bpaf sees argv (`rewrite_config_dash_values`,
-`frp-core/src/cli.rs`); for the already-working shapes the rewrite is a
-pass-through pin, not a repair. It stops at the first real `--` (Go treats
-everything after it as positional), and a `--` consumed as `-c`'s value is
-attached like any other value. No other value-taking flag is rewritten, so this
-does not claim pflag's rule as a class.
+`-c=VALUE` spelling before bpaf sees argv. Both entry points call that one
+function (`parse_frps_args` and `parse_frpc_args` differ only in which parser
+they run over the result), which is what makes one rule cover both binaries. For
+the already-working shapes the rewrite is a pass-through pin, not a repair. It
+stops at the first real `--` (Go treats everything after it as positional), and a
+`--` consumed as `-c`'s value is attached like any other value. No other
+value-taking flag is rewritten, so this does not claim pflag's rule as a class.
 
-**frps is the same rule and is not fixed here.** Measured on Go frps v0.71.0 and
-this head's `frps`: `frps -c --strict-config=false` → Go rc 1
-`open --strict-config=false: no such file or directory`, frp-rs rc 1
-``-c` requires an argument `FILE``; `frps -c -x` → Go rc 1 `open -x: …`, frp-rs
-rc 1 ``-c` requires an argument `FILE`, got a flag `-x`, try `-c=-x` …``;
-`frps verify -c --strict-config=false` → Go rc 1 `open --strict-config=false`,
-frp-rs rc 1 ``-c` requires an argument `FILE`` (frp-rs has no `frps verify`, but
-the `-c` failure is reported first). `frps --config-dir --strict-config=false` is
-a different pair: Go rc 1 `unknown flag: --config-dir`, frp-rs rc 1
-``--config-dir` requires an argument `DIR``. Filed as its own `TODO.md` item
-(`TODO.md:2251`) because this item is frpc-scoped, as the #378 work was.
+**`frps` is the same rule and is fixed too.** Measured on Go frps v0.71.0
+(darwin/arm64, bounded children) against the frp-rs `frps` with the shared pass;
+the "before" column was re-measured with the source reverted to the base head
+(`f5437e6`), not quoted from an earlier round:
+
+| argv | Go v0.71.0 | frp-rs before | frp-rs now |
+|---|---|---|---|
+| `frps -c --strict-config=false` | rc 1, `open --strict-config=false: no such file or directory` | rc 1, ``-c` requires an argument `FILE`` | rc 1, same load path: `Failed to load config: --strict-config=false: failed to read config file: No such file or directory (os error 2)` (message shape differs; rc and the *named path* agree) |
+| `frps -c -x` | rc 1, `open -x: no such file or directory` | rc 1, ``-c` requires an argument `FILE`, got a flag `-x`, try `-c=-x` …`` | rc 1, same load path naming `-x` |
+| `frps -c --bind-port` (a *known* frps flag) | rc 1, `open --bind-port: no such file or directory` | rc 1, ``-c` requires an argument `FILE`, got a flag `--bind-port` …`` | rc 1, same load path naming `--bind-port` |
+| `frps -c --` | rc 1, `open --: no such file or directory` — pflag takes the separator token as the value | rc 1, ``-c` requires an argument `FILE`` | rc 1, same load path naming `--` |
+| `frps -c -zzz` (unknown multi-character token) | rc 1, `open -zzz: …` | rc 1, same load path (bpaf already took it as `Arg::Word`) | rc 1, unchanged |
+| `frps -c -` | rc 1, `open -: …` | rc 1, same load path | rc 1, unchanged |
+| `frps --config -x` | rc 1, `open -x: …` | rc 1, ``--config` requires an argument `FILE`, got a flag `-x` …`` | rc 1, same load path naming `-x` |
+| `frps --config=-x`, `frps -c=-x`, `frps -c=-nonexistent.toml` | rc 1, `open -x` / `-nonexistent.toml: …` | rc 1, same load path | rc 1, unchanged (attached spellings never needed the rewrite) |
+| `frps -- --strict-config=false` | rc 1, `unknown command "--strict-config=false"` (a positional) | rc 1, `` `--strict-config=false` is not expected in this context`` | rc 1, unchanged — the rewrite stops at a real `--` |
+| `frps -c` (dangling) | rc 1, `flag needs an argument: 'c' in -c` | rc 1, ``-c` requires an argument `FILE`` | rc 1, unchanged (message shape differs, rc agrees) |
+| `frps --config-dir --strict-config=false` / `--config_dir --strict-config=false` | rc 1, `unknown flag: --config-dir` / `unknown flag: --config_dir` — Go frps has **no** such flag | rc 1, ``--config-dir` requires an argument `DIR`` | **rc 2**, `Failed to read config directory: No such file or directory (os error 2)`: `--config-dir` is an frp-rs extension and one of the four flags the pass covers, so the dash-shaped token is now its value and the directory read runs; the extension's refusal stays on `EXIT_CONFIG`/2 (see § CLI exit codes). Still divergent from Go in a different way, and not comparable — Go has no flag to compare against |
+| `frps verify -c --strict-config=false` | rc 1, `open --strict-config=false: no such file or directory` (Go has `frps verify`) | rc 1, ``-c` requires an argument `FILE`` | rc 1, **`` `verify` is not expected in this context``** — the rewrite lets `-c` consume its value, so the missing subcommand is now the first error. `frps verify` is its own item (`TODO.md:2518`); implementing it flips this row back to a config-load error. The current error is what is pinned, so the flip is visible |
+
+Scope note: `--config-dir`/`--config_dir` are not Go `frps` flags at all (Go:
+`unknown flag: --config-dir`, rc 1), so the pass covering them on `frps` is an
+frp-rs-internal consistency choice, not a parity claim: the same flag behaves the
+same way on both frp-rs binaries. A `-`-prefixed token after any *other* flag
+(`--bind-port -x`, `-t -x`) is untouched, and a token after a real `--` is never
+rewritten.
 
 One more `frpc` shape is the same *root-flag placement* question and is filed
 separately (`TODO.md:2270`): Go's cobra resolves a subcommand that follows
