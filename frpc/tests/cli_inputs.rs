@@ -840,3 +840,88 @@ fn case_insensitive_key_in_a_walked_section_is_refused_in_strict_mode() {
         stdout_of(&out)
     );
 }
+
+// ── `--strict-config`: every spelling, pinned at the rc level ───────────────
+//
+// `verify` carries the whole matrix without a listener: a strict load of an
+// unknown top-level key exits 1 with the unknown-field line, a lenient one
+// exits 0 with `is valid`. That is what makes the two forms distinguishable
+// here — the difference is *which config load happened*, not only an exit code.
+//
+// The Go v0.71.0 rows this encodes (measured on the official darwin/arm64
+// binary with `badwithport.toml`) and the one row where frp-rs diverges:
+//
+// | argv | Go v0.71.0 | frp-rs |
+// |---|---|---|
+// | absent / bare / `=true` | strict, rc 1 (`json: unknown field …`) | strict, rc 1 |
+// | `--strict-config=false` | lenient, rc 0 (`syntax is ok`) | lenient, rc 0 |
+// | `--strict-config false` | strict, rc 1 (token is a positional) | lenient, rc 0 — **extension** |
+// | `--strict-config=foo` | rc 1, pflag `invalid argument … strconv.ParseBool` | rc 1, `` `foo` is not expected in this context `` |
+//
+// The full table (including `run`/`reload`/`status`/`stop`/`frps`) and the
+// reason the space form is kept are in `docs/developing.md`
+// § "`--strict-config`: the space-separated value form".
+#[test]
+fn verify_strict_config_spellings_match_their_measured_rows() {
+    let dir = TempDir::new();
+    let cfg = dir.config(
+        "bad.toml",
+        "serverAddr = \"127.0.0.1\"\nserverPort = 7500\nnotAKnownFrpKey = 1\n",
+    );
+
+    // Go-faithful rows: absent, bare (both spellings) and `=true` are strict.
+    for args in [
+        &["verify", "-c", &cfg][..],
+        &["verify", "--strict-config", "-c", &cfg][..],
+        &["verify", "--strict_config", "-c", &cfg][..],
+        &["verify", "--strict-config=true", "-c", &cfg][..],
+        &["verify", "--strict_config=true", "-c", &cfg][..],
+    ] {
+        let out = run_frpc(args);
+        assert_eq!(exit_code(&out), 1, "{args:?} stderr={:?}", stderr_of(&out));
+        let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(
+            all.contains("unknown field \"notAKnownFrpKey\""),
+            "{args:?}: {all:?}"
+        );
+    }
+
+    // Go-faithful row: the adjacent `=false` spelling is lenient on both.
+    for args in [
+        &["verify", "--strict-config=false", "-c", &cfg][..],
+        &["verify", "--strict_config=false", "-c", &cfg][..],
+    ] {
+        let out = run_frpc(args);
+        assert_eq!(exit_code(&out), 0, "{args:?} stderr={:?}", stderr_of(&out));
+        assert!(stdout_of(&out).contains("is valid"), "{args:?}");
+    }
+
+    // The frp-rs extension, and the measured divergence: the space-separated
+    // token **is** consumed as the value, so the load is lenient. Go keeps
+    // strict on for the same argv and exits 1 without ever reaching `verify`'s
+    // success path.
+    for args in [
+        &["verify", "--strict-config", "false", "-c", &cfg][..],
+        &["verify", "--strict_config", "false", "-c", &cfg][..],
+    ] {
+        let out = run_frpc(args);
+        assert_eq!(exit_code(&out), 0, "{args:?} stderr={:?}", stderr_of(&out));
+        assert!(stdout_of(&out).contains("is valid"), "{args:?}");
+    }
+
+    // Non-bool values: exit 1 on both binaries and both spellings; only the
+    // message differs (Go: pflag's `strconv.ParseBool` text for the adjacent
+    // form, the stray token ignored for the space form).
+    for args in [
+        &["verify", "--strict-config=foo", "-c", &cfg][..],
+        &["verify", "--strict-config", "foo", "-c", &cfg][..],
+    ] {
+        let out = run_frpc(args);
+        assert_eq!(exit_code(&out), 1, "{args:?}");
+        let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(
+            all.contains("`foo` is not expected in this context"),
+            "{args:?}: {all:?}"
+        );
+    }
+}
