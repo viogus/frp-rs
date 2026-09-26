@@ -137,7 +137,7 @@ User-facing release notes for frp-rs.
   `frpc --version=foo` exits 1 like Go's `strconv.ParseBool` refusal and an
   invalid flag wins. One row moves the other way and is recorded in
   `docs/developing.md`: `frpc verify --version` is now rc 1 because frp-rs does
-  not register Go's persistent root flags on its subcommands (`TODO.md:2011`).
+  not register Go's persistent root flags on its subcommands (`TODO.md:2013`).
 - **A repeated `-c`/`--config` is now last-wins on the five `frpc` commands that
   read a config file — a behaviour change.** Go registers `-c` with pflag
   `StringVarP`, so `frpc status -c a.toml -c b.toml` loads `b.toml` and is never

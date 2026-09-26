@@ -1839,9 +1839,11 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     new help entries and the nameless usage line bpaf itself renders when argv[0] is
     unreadable. Residual, recorded rather than fixed: because the rewrite precedes the
     parse, a *rejected* `-v=<bool>` can be reported under its long name — measured,
-    `frpc status -v=false -c <cfg>` is rc 1 `` `--version` is not expected `` where the
-    base head said `` `-v=false` `` but exited **0** (the speculative-`exit` defect this
-    branch fixes) and Go exits 1 (the persistent flag parses and `status` dials).
+    `frpc status -v=false -c <cfg>` is rc 1 `` `--version` is not expected ``, where the
+    base head printed the version and exited **0** (the speculative-`exit` defect this
+    branch fixes; no diagnostic at all) and the first-revision head said `` `-v` `` (rc 1,
+    the token being the short `-v`); Go exits 1 too (the persistent flag parses and
+    `status` dials).
   * **A second defect, found by the sweep and fixed here.** `frpc`'s version check lived
     in a bpaf `.map()` closure on `frpc_parser()`'s run branch, and bpaf's `ParseOrElse`
     evaluates **every** alternative on a forked state, so at the base head
@@ -1871,7 +1873,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     (`--flag=BOOL` and `--flag`) and a `(--version=BOOL | [-v])` usage alternative where
     Go prints one `-v, --version` line; and `frpc verify --version` is rc 1 here where Go
     is rc 0 (with a valid `-c`; with no `-c` Go is rc 1 too), one row of the
-    persistent-root-flag class already tracked by the `frpc` eight-single-proxy-subcommands item (`TODO.md:2011`).
+    persistent-root-flag class already tracked by the `frpc` eight-single-proxy-subcommands item (`TODO.md:2013`).
     Measured for that class: `frpc tcp --version --local-port … --remote-port …` is the
     same shape, Go 124 / base 0 / head 1, while `reload|status|stop --version` moved
     0 → 1 and now **matches** Go's rc 1 there.

@@ -1652,7 +1652,7 @@ What the table says, precisely:
   "notAKnownFrpKey"` on Go, where frp-rs answers `` `--allow-unsafe` is not
   expected in this context `` / `` `--config-dir` is not expected in this
   context `` (rc 1, nothing loaded). That class is already tracked as
-  `TODO.md:2011` ("`frpc`'s eight single-proxy subcommands reject `-c`/
+  `TODO.md:2013` ("`frpc`'s eight single-proxy subcommands reject `-c`/
   `--config`, which Go accepts and ignores"); the `verify` row above is another
   row of the same class (the `tcp`/`reload`/`status`/`stop` rows are covered by
   the same registration gap). Fixing it means registering Go's
@@ -1663,11 +1663,12 @@ What the table says, precisely:
 - **A rejection message can name the expanded spelling.** Because `-v=<bool>`
   becomes `--version=<bool>` before bpaf parses, a *refused* token is reported
   under its long name: measured, `frpc status -v=false -c <cfg>` is rc 1
-  `` `--version` is not expected in this context `` where the base head said
-  `` `-v=false` `` — but the base head's rc was **0** there (it printed the
-  version, the speculative-`exit` defect this branch fixes) while Go is rc 1
-  (the persistent flag parses, `status` ignores it and dials the admin API), so
-  the rc moved *towards* Go and only the message text names an alias. The `--`
+  `` `--version` is not expected in this context ``, where the base head printed
+  the version and exited **0** (the speculative-`exit` defect this branch fixes;
+  it emitted no diagnostic at all) and the first-revision head said `` `-v` ``
+  (rc 1 — the token there is the short `-v`, not `-v=false`). Go is rc 1 there
+  too (the persistent flag parses, `status` ignores it and dials the admin API),
+  so the rc moved *towards* Go and only the message text names an alias. The `--`
   guard removes the one case where the rewrite was gratuitous (`frps -- -v=false`
   names `-v=false` again, byte-identical to the base head). Recorded rather than
   fixed: the alternative is a message rewrite after the fact, which cannot be
