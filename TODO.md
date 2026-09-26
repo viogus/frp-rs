@@ -2576,7 +2576,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   names a known subcommand before bpaf runs, or restructure the parser) and pin the three rows
   against Go, or record the refusal as a deliberate divergence in `docs/developing.md` § CLI inputs.
   frp-rs's own `frpc <subcommand> [flags]` order keeps working either way.
-  **Done (2026-09-27, `0c8433b`).** Re-measured everything at this branch's base
+  **Done (2026-09-27, `9bff35e`; the classifier fix in the second commit of this PR).** Re-measured everything at this branch's base
   (`5b9a084`; the item's `ec82a20` is four PRs stale) with the official
   `/private/tmp/frp_0.71.0_darwin_arm64` binaries and the frp-rs `frpc` built from the base and the
   head, over a 45-row table (one-shot mock admin on the config's `[webServer]` port, canary TCP
