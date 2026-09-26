@@ -147,7 +147,14 @@ fn yaml_key_to_string(k: &serde_yaml_ng::Value) -> String {
 // ─── INI parser (Go Viper-compatible type inference) ─────────────────
 
 /// Parse INI content into a toml::Value.
-/// Type inference rules match Go Viper behavior.
+///
+/// Unlike Go's legacy INI loader (`gopkg.in/ini.v1`, which hands every value
+/// to the target field as text and lets the *field's* Go type decide), this
+/// reader infers a TOML type. The inference is **lossless**: a value only
+/// becomes a TOML integer/float/boolean/array when rendering that value back
+/// produces exactly the text the file wrote (`ini_value_text`). `007`, `1.50`,
+/// `YES` and `a, b` therefore stay strings here — the type decision moves to
+/// the target field, made by `super::ini_lenient` for `.ini` configs.
 fn ini_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
     let mut root = toml::Table::new();
     let mut current_section: Option<String> = None;
@@ -201,7 +208,32 @@ fn ini_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>>
 /// remaining value degrades to a plain string literal.
 const MAX_INI_NESTING: usize = 16;
 
-/// Infer INI value type matching Go Viper behavior.
+/// Render a TOML value as the INI text it came from. The inverse of the
+/// lossless inference below: for every value `infer_ini_value_depth` returns
+/// that is not a `String`, `ini_value_text(&value)` equals the input text —
+/// `super::ini_lenient` relies on that when a string-typed field reads an
+/// inferred value.
+pub(super) fn ini_value_text(v: &toml::Value) -> String {
+    match v {
+        toml::Value::String(s) => s.clone(),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f) => f.to_string(),
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Array(items) => items
+            .iter()
+            .map(ini_value_text)
+            .collect::<Vec<_>>()
+            .join(","),
+        // INI never produces these; an empty rendering simply fails the
+        // round-trip check below and the text is kept verbatim.
+        toml::Value::Datetime(_) | toml::Value::Table(_) => String::new(),
+    }
+}
+
+/// Infer INI value type matching Go Viper behavior — losslessly.
+///
+/// The result must satisfy `ini_value_text(&result) == input`; otherwise the
+/// value stays a `String`. See `ini_to_toml`.
 fn infer_ini_value(s: &str) -> toml::Value {
     infer_ini_value_depth(s, 0)
 }
@@ -227,11 +259,15 @@ fn infer_ini_value_depth(s: &str, depth: usize) -> toml::Value {
         return toml::Value::String(s[1..s.len() - 1].to_string());
     }
 
-    // Boolean
-    match s.to_lowercase().as_str() {
-        "true" | "yes" => return toml::Value::Boolean(true),
-        "false" | "no" => return toml::Value::Boolean(false),
-        _ => {}
+    // Boolean — only the canonical spellings, so the text survives the
+    // round-trip. `yes`/`no`/`TRUE` stay text and are read as a boolean by
+    // `super::ini_lenient` when the target field is a bool (Go's
+    // `ini.v1.parseBool` accepts the wider spelling set, `key.go:194`).
+    if s == "true" {
+        return toml::Value::Boolean(true);
+    }
+    if s == "false" {
+        return toml::Value::Boolean(false);
     }
 
     // Nested type inference (array literals / comma splits) recurses — cap
@@ -241,7 +277,13 @@ fn infer_ini_value_depth(s: &str, depth: usize) -> toml::Value {
         return toml::Value::String(s.to_string());
     }
 
-    // ["a", "b"] array literal (Go ini.v1 []string syntax) → Array.
+    // ["a", "b"] / [] array literal → Array. This is a **frp-rs extension**,
+    // not Go syntax: measured on Go v0.71.0, `custom_domains =
+    // ["a.example.com","b.example.com"]` reaches frps as
+    // `['["a.example.com"', '"b.example.com"]']` (ini.v1 only splits a slice
+    // field on `,`; `[]` becomes `["[]"]`). Kept for the slice fields that
+    // already accept it; a *string* field reading such a value is rendered by
+    // `ini_value_text` as the comma-joined elements, not as the bracket text.
     // Only when the inner content looks like a list: quoted elements or at
     // least one comma. A bare "[::1]" (IPv6 literal) falls through to the
     // string branch instead of becoming the one-element array "["::1"]".
@@ -260,23 +302,33 @@ fn infer_ini_value_depth(s: &str, depth: usize) -> toml::Value {
         }
     }
 
-    // Comma-separated → Array (type-infer each element)
+    // Comma-separated → Array (type-infer each element), but only when the
+    // split round-trips: `1,2` becomes an array, `1, 2` keeps its space and
+    // stays text (Go trims each element of a slice field, so both read the
+    // same through the target type — see `super::ini_lenient`).
     if s.contains(',') {
         let parts: Vec<toml::Value> = s
             .split(',')
             .map(|p| infer_ini_value_depth(p.trim(), depth + 1))
             .collect();
-        return toml::Value::Array(parts);
+        if ini_value_text(&toml::Value::Array(parts.clone())) == s {
+            return toml::Value::Array(parts);
+        }
+        return toml::Value::String(s.to_string());
     }
 
-    // Integer
+    // Integer / Float — only when the parsed value renders back to exactly
+    // this text: `007`, `+5`, `1.50`, `1e3` stay strings, and are read as a
+    // number by `super::ini_lenient` when the target field is numeric.
     if let Ok(i) = s.parse::<i64>() {
-        return toml::Value::Integer(i);
+        if i.to_string() == s {
+            return toml::Value::Integer(i);
+        }
     }
-
-    // Float
     if let Ok(f) = s.parse::<f64>() {
-        return toml::Value::Float(f);
+        if f.to_string() == s {
+            return toml::Value::Float(f);
+        }
     }
 
     // Default: string

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use super::file::process_includes;
-use super::format::{detect_format, parse_to_toml_value};
+use super::format::{detect_format, parse_to_toml_value, ConfigFormat};
 use super::loader::ConfigPresence;
 use super::strict::{run_strict_check, HTTP_PLUGIN_KNOWN_KEYS};
 
@@ -415,6 +415,39 @@ fn parse_port_num(s: &str) -> Option<u32> {
     s.parse::<u32>().ok().filter(|&n| n <= 65535)
 }
 
+/// Truthiness of a legacy INI boolean value.
+///
+/// The INI reader keeps a non-canonical spelling (`TRUE`, `yes`, `on`) as text
+/// so a string-typed field can receive it verbatim; these normalizer passes
+/// predate that and must accept both the inferred boolean and the text Go's
+/// `ini.v1.parseBool` accepts (`key.go:194`).
+fn ini_truthy(v: &toml::Value) -> bool {
+    match v {
+        toml::Value::Boolean(b) => *b,
+        // Go reads a bool field with `Key.Bool()` (`ini.v1` `key.go:194`),
+        // whose accepted spellings include `1`/`0`; those are the canonical
+        // rendering of an integer, so the tree holds them as numbers.
+        toml::Value::Integer(1) => true,
+        toml::Value::Integer(0) => false,
+        toml::Value::String(s) => matches!(
+            s.as_str(),
+            "1" | "t"
+                | "T"
+                | "true"
+                | "TRUE"
+                | "True"
+                | "YES"
+                | "yes"
+                | "Yes"
+                | "y"
+                | "ON"
+                | "on"
+                | "On"
+        ),
+        _ => false,
+    }
+}
+
 /// Move matching top-level keys into a sub-table, optionally stripping known prefixes.
 /// e.g. `flatten_to_table(t, &["log_file","log_level"], "log", &["log_"])`
 /// Move legacy top-level keys into the `web_server` sub-table (Go
@@ -492,8 +525,16 @@ pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
         run_strict_check(&value, &known_keys(), path)?;
     }
     let json_value = toml_to_json(value);
-    let cfg: C = serde_json::from_value(json_value)
-        .map_err(|e| format!("{path}: config validation error: {e}"))?;
+    // Go's legacy INI loader reads every value as text and lets the target
+    // field's type decide (`gopkg.in/ini.v1` `MapTo`), so `.ini` inputs go
+    // through the type-directed reader; TOML/JSON/YAML keep the strict serde
+    // typing Go's v1 decoder has.
+    let cfg: C = if format == ConfigFormat::Ini {
+        super::ini_lenient::deserialize_ini(&json_value)
+    } else {
+        serde_json::from_value(json_value)
+    }
+    .map_err(|e| format!("{path}: config validation error: {e}"))?;
     validate(&cfg).map_err(|e| format!("{path}: {e}"))?;
     Ok((cfg, presence))
 }
@@ -527,15 +568,13 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
         let mut extra_scopes: Vec<String> = Vec::new();
         if table
             .remove("authenticate_heartbeats")
-            .and_then(|v| v.as_bool())
-            == Some(true)
+            .is_some_and(|v| ini_truthy(&v))
         {
             extra_scopes.push("HeartBeats".to_string());
         }
         if table
             .remove("authenticate_new_work_conns")
-            .and_then(|v| v.as_bool())
-            == Some(true)
+            .is_some_and(|v| ini_truthy(&v))
         {
             extra_scopes.push("NewWorkConns".to_string());
         }
@@ -1028,15 +1067,13 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
         let mut extra_scopes: Vec<String> = Vec::new();
         if table
             .remove("authenticate_heartbeats")
-            .and_then(|v| v.as_bool())
-            == Some(true)
+            .is_some_and(|v| ini_truthy(&v))
         {
             extra_scopes.push("HeartBeats".to_string());
         }
         if table
             .remove("authenticate_new_work_conns")
-            .and_then(|v| v.as_bool())
-            == Some(true)
+            .is_some_and(|v| ini_truthy(&v))
         {
             extra_scopes.push("NewWorkConns".to_string());
         }
@@ -1564,14 +1601,33 @@ fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) -> (Vec<usize>, Ve
         }
 
         if let Some(prefix) = section_name.strip_prefix("range:") {
-            // Expand into {prefix}_{i} per-port proxies (Go renderRangeProxyTemplates).
-            // local_port/remote_port accept a quoted string ("6000-6002") or
-            // an unquoted single port (6000 — ini_to_toml makes it Integer).
+            // Expand into {prefix}_{i} per-port proxies (Go renderRangeProxyTemplates,
+            // pkg/config/legacy/client.go:289-336). local_port/remote_port accept a
+            // comma-separated string ("6000-6002,6010"), an unquoted single port
+            // (6000 — ini_to_toml makes it Integer), or an array — the TOML/JSON
+            // spelling of the same list, which the INI reader produced for a
+            // canonical comma list before the lossless reader kept it as text.
             fn ini_port_numbers(v: &Value) -> Option<Vec<u16>> {
                 match v {
                     Value::String(s) => ini_range_numbers(s),
                     Value::Integer(i) if *i >= 0 && *i <= i64::from(u16::MAX) => {
                         Some(vec![*i as u16])
+                    }
+                    Value::Array(items) => {
+                        let mut out = Vec::new();
+                        for item in items {
+                            match item {
+                                Value::String(s) => out.extend(ini_range_numbers(s)?),
+                                Value::Integer(i) if *i >= 0 && *i <= i64::from(u16::MAX) => {
+                                    out.push(*i as u16);
+                                }
+                                _ => return None,
+                            }
+                            if out.len() > MAX_RANGE_EXPANSION_NUMBERS {
+                                return None;
+                            }
+                        }
+                        Some(out)
                     }
                     _ => None,
                 }
@@ -1599,16 +1655,33 @@ fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) -> (Vec<usize>, Ve
                 );
                 continue;
             }
+            // Go expands the template into {prefix}_{i} sections and only then
+            // dispatches on `role` (client.go:252-285), so a `role = visitor`
+            // range builds one *visitor* per port, not a proxy. Route the
+            // generated element to the same target the rest of the collector
+            // uses, and record its index there: the strip pass keeps the
+            // visitor-only keys (`bind_addr`, `bind_port`, `server_name`) only
+            // when the element is known to be a visitor.
+            let role_is_visitor = st.get("role").and_then(Value::as_str) == Some("visitor");
             for (i, (lp, rp)) in local_ports.into_iter().zip(remote_ports).enumerate() {
                 let mut t = st.clone();
                 t.insert("name".to_string(), Value::String(format!("{prefix}_{i}")));
                 t.insert("local_port".to_string(), Value::Integer(i64::from(lp)));
                 t.insert("remote_port".to_string(), Value::Integer(i64::from(rp)));
-                let proxies = table
-                    .entry("proxies".to_string())
+                let target_key = if role_is_visitor {
+                    "visitors"
+                } else {
+                    "proxies"
+                };
+                let arr = table
+                    .entry(target_key.to_string())
                     .or_insert_with(|| Value::Array(Vec::new()));
-                if let Value::Array(arr) = proxies {
-                    proxy_indices.push(arr.len());
+                if let Value::Array(arr) = arr {
+                    if role_is_visitor {
+                        visitor_indices.push(arr.len());
+                    } else {
+                        proxy_indices.push(arr.len());
+                    }
                     arr.push(Value::Table(t));
                 }
             }
