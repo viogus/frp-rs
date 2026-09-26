@@ -896,13 +896,24 @@ valid config (plus the variations named):
 | `frpc -c bad.toml` (unknown key) | 1 | 1 |
 | `frpc -c missing.toml` / `-c <dir>` / `-c badport.toml` | 1 | 1 |
 | `frpc --strict-config=foo -c good.toml` | 1 | 1 |
-| `frpc verify -c bad.toml` (and missing / bad port / unknown proxy key) | 1 | 1 |
+| `frpc verify -c bad.toml` (and missing / bad port) | 1 | 1 |
 | `frpc verify -c good.toml` | 0 | 0 |
 | `frpc reload\|status\|stop -c bad.toml` | 1 | 1 |
 | `frps -c badfrps.toml` (and missing / dir / bad port) | 1 | 1 |
 | `frpc --config-dir <nonexistent\|empty\|bad>` | **0** | **2** (deliberate) |
-| `frpc --config-dir <good>` | 0 | 0 |
+| `frpc --config-dir <good>`, service cannot run (no listener / refused login) | 0 after ~0.1–1 s: the service fails and the daemon returns | 0 after ~0.1–1 s: same shape, same code |
 | `frps --config-dir <…>` | 1 — `unknown flag: --config-dir` | 2 (extension flag) |
+| `frpc -c empty.toml` (defaults only, nothing listening on 7000) | 1 after ~10 s | 1 after ~30 s |
+| `frps` on an occupied `bindPort` (with `auth.token` set — without one frp-rs refuses at construction for the empty token, exit 3) | 1 | 1 |
+
+The good-directory row is deliberately qualified: a directory whose service
+actually *runs* is long-running on both sides and has no natural exit code, so a
+`0` obtained by signalling a live process must never be recorded in this table.
+The `0`s above are the case where the service cannot run (measured with no
+listener: both exit in ~0.1 s, Go after `connect to server error`, frp-rs after
+`frpc service error for config file [...]`) and are the only directory-mode
+`0`s this table asserts. With a reachable-but-refusing server both exited 0 in
+~1 s for the same reason.
 
 Three things this table does not say, each measured:
 
@@ -925,9 +936,11 @@ Three things this table does not say, each measured:
 
 Tests that pin this — real binaries, no mocks:
 `frpc/tests/cli_exit_codes.rs` (`frpc -c <bad>` start, `verify -c <bad>`,
-`verify -c <missing>`, the directory-mode divergence) and
-`frps/tests/cli_exit_codes.rs` (`frps -c <bad>`). The admin-subcommand refusals
-stay pinned by `frpc/tests/admin_cli.rs`.
+`verify -c <missing>`, a `verify -c <good>` positive control, and the
+directory-mode divergence for a missing / empty / invalid directory) and
+`frps/tests/cli_exit_codes.rs` (`frps -c <bad>`, `-c <missing>`, a
+starts-then-SIGTERM positive control, and the extension flag's refusal). The
+admin-subcommand refusals stay pinned by `frpc/tests/admin_cli.rs`.
 
 Still divergent, and **not** covered by those tests: the *shape* of the output.
 Go prints one bare parse error to **stdout** and nothing else; the frp-rs daemon
