@@ -1324,8 +1324,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   is present but the index cannot be read the gate exits 3 instead of silently walking (a walk would
   scan the gitignored state this gate exists to avoid), so a sparse checkout, or any worktree missing
   a tracked path, is not certified. `git ls-files` also runs with `GIT_DIR`/`GIT_WORK_TREE`/
-  `GIT_INDEX_FILE`/`GIT_COMMON_DIR` stripped from the environment, so the list always comes from the
-  tree the script is in. Submodule contents are never scanned —
+  `GIT_INDEX_FILE`/`GIT_COMMON_DIR` stripped from the environment, so the list comes from the
+  repository git resolves for the script's directory, not from an inherited environment:
+  `git rev-parse --show-toplevel` must equal the working directory (`realpath` on both sides) or the
+  gate exits 3. Submodule contents are never scanned —
   the index lists only the gitlink. The index supplies the file *list*; content is read from the
   **worktree**, so a tracked file edited locally is gated at its current content. Paths are
   NUL-split and decoded with `surrogateescape`, so spaces, newlines and non-ASCII cannot be
@@ -1777,7 +1779,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   (documented in the gate's own known-not-covered list); the tracked-`__pycache__` and
   symlinked-`.rs` items below are unchanged by this work.
 
-- [ ] **A committed `__pycache__` byte-code file is tracked in the repository.**
+- [x] **A committed `__pycache__` byte-code file is tracked in the repository.**
   `scripts/__pycache__/rust_comments.cpython-314.pyc` has been tracked since `84a621f` (#354): a
   CPython-version- and platform-specific artifact that churns on any diff of the module, is
   meaningless on another interpreter, and is exactly what `.gitignore` is for. Measured 2026-09-25
@@ -1785,6 +1787,24 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   correctness issue — Python validates the source's mtime/size and falls back to it, and the
   `.git`-less walk fallback is unaffected. **Done-when:** the file is untracked, `__pycache__/` is
   in `.gitignore`, and `bash scripts/repo-health.sh` still exits 0.
+
+  Done (measured 2026-09-26, untracked in this branch, based on `main` @ `774ed26`): both halves of
+  the done-when. Pre-fix blob, observed before the untracking —
+  `git rev-parse --verify 774ed26:scripts/__pycache__/rust_comments.cpython-314.pyc` →
+  `8bc4eaa077a244bcdc2f56903103e690910b8d18`; no sha is invented for the fix, this branch's own
+  commit is the untracking. `git ls-files scripts/__pycache__` listed that one path before and
+  prints nothing after `git rm --cached scripts/__pycache__/rust_comments.cpython-314.pyc`, and
+  `git status --porcelain --ignored scripts/__pycache__` then prints
+  `D  scripts/__pycache__/rust_comments.cpython-314.pyc` (the staged deletion) plus
+  `!! scripts/__pycache__/` (ignored by the new `__pycache__/` line in `.gitignore`; it has no
+  leading slash, so it matches at any depth). The `.pyc` may stay on disk: `rm -f` of the 5035-byte
+  worktree copy did not change any verdict — `bash scripts/repo-health.sh` exited **0** before and
+  after, with byte-identical output (the artifact is not an input to any gate), and the run did
+  **not** recreate it, because all ten of the script's `python3` invocations pass `-B` (so the
+  tracked copy must have come from an ad-hoc import, not from the gate). The worktree copy was
+  byte-identical to the blob it was untracked from — md5 `0893cb97642c7c462a62e1d1ab15baab` before
+  deletion, and `git hash-object scripts/__pycache__/rust_comments.cpython-314.pyc` =
+  `8bc4eaa077a244bcdc2f56903103e690910b8d18`.
 - [ ] **A symlinked `.rs` *file* is double-counted by the python source walks.** `ln -s
   kcp/session.rs frp-core/src/zz.rs` makes `unsafe_counts` (and the printed `Code size` walk) read
   the same file twice: the printed block count becomes 22 while the curated `CLAUDE.md` claim says

@@ -993,8 +993,7 @@ every git call is bounded (15 s there, 30 s in the path scan), and the git
 environment is sanitised. A refusal prints the reason and never an `ok`; a scan
 whose file set was incomplete prints `not evaluated`. Known, deliberate holes are
 listed next to the code (a directory named `*.yml`, a symlinked directory under
-`.github/workflows/`); the tracked `__pycache__` artifact and the symlinked `.rs`
-double count are recorded in `TODO.md`.
+`.github/workflows/`); the symlinked `.rs` double count is recorded in `TODO.md`.
 
 ## 6. Release Process
 
