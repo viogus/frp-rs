@@ -18,6 +18,11 @@ scripts/frp-stress/Cargo.lock
 .claude/
 .reasonix/
 .superpowers/
+# CPython byte-code caches: interpreter-version- and platform-specific, and
+# regenerated from the `.py` source on import, so a committed copy is pure churn.
+# A bare `__pycache__/` (no leading slash) matches at any depth — one was tracked
+# under `scripts/__pycache__/` until it was untracked on 2026-09-26.
+__pycache__/
 # SSH tunnel gateway host key. frps writes this to the CURRENT WORKING DIRECTORY
 # by default (`sshTunnelGateway.autoGenPrivateKeyPath` defaults to
 # "./.autogen_ssh_key", matching Go frp), so running frps from the repo root
