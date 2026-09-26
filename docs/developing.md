@@ -881,6 +881,59 @@ Proptest-based tests verify correctness under adversarial inputs:
 > a `#[cfg]`-disabled one — so their count and enablement are covered by the test
 > suite, not by the gate.
 
+### CLI exit codes (`frpc` / `frps`)
+
+The CLI contract is Go's: **exit 0 on success, exit 1 on any failure that the
+command itself detects**. There is no per-class scheme to preserve, and
+`EXIT_CONFIG`/2 no longer covers a single-config or `verify` failure.
+
+Measured 2026-09-26 against Go frp **v0.71.0** (darwin/arm64) and the frp-rs
+`frpc`/`frps` binaries, with one unknown top-level key added to an otherwise
+valid config (plus the variations named):
+
+| command | Go v0.71.0 | frp-rs (now) |
+|---|---|---|
+| `frpc -c bad.toml` (unknown key) | 1 | 1 |
+| `frpc -c missing.toml` / `-c <dir>` / `-c badport.toml` | 1 | 1 |
+| `frpc --strict-config=foo -c good.toml` | 1 | 1 |
+| `frpc verify -c bad.toml` (and missing / bad port / unknown proxy key) | 1 | 1 |
+| `frpc verify -c good.toml` | 0 | 0 |
+| `frpc reload\|status\|stop -c bad.toml` | 1 | 1 |
+| `frps -c badfrps.toml` (and missing / dir / bad port) | 1 | 1 |
+| `frpc --config-dir <nonexistent\|empty\|bad>` | **0** | **2** (deliberate) |
+| `frpc --config-dir <good>` | 0 | 0 |
+| `frps --config-dir <…>` | 1 — `unknown flag: --config-dir` | 2 (extension flag) |
+
+Three things this table does not say, each measured:
+
+- **Directory mode is a deliberate divergence, not an oversight.** Go's
+  `frpc --config-dir` returns **0** for a directory that does not exist, is
+  empty, *or holds a config that fails to parse* — the bad case prints only
+  `frpc service error for config file […]` and exits 0. A config that was never
+  loaded is not a success, so frp-rs keeps its pre-existing non-zero refusal
+  (`EXIT_CONFIG`/2) on that path. Go `frps` has no `--config-dir` flag at all
+  (`Error: unknown flag: --config-dir`, exit 1); frp-rs's is an extension.
+- **`EXIT_AUTH`/3 and `EXIT_BIND`/4 are extensions with no Go counterpart**, and
+  they are the remaining known exit-code divergence: they come from the
+  daemons' service-*construction* failure arms. A rejected login leaves the
+  client through `service.run()` and exits **1**, matching Go; the case measured
+  live is frps refusing a tokenless token auth method, which exits **3** where
+  Go frps exits **1**. Tracked in `TODO.md`.
+- **A bind conflict exits 1 on both sides.** `frps` on an occupied `bindPort`
+  returns 1 (the listener binds inside `service.run()`, not at construction),
+  so the `EXIT_BIND` arm is not the path a port conflict takes.
+
+Tests that pin this — real binaries, no mocks:
+`frpc/tests/cli_exit_codes.rs` (`frpc -c <bad>` start, `verify -c <bad>`,
+`verify -c <missing>`, the directory-mode divergence) and
+`frps/tests/cli_exit_codes.rs` (`frps -c <bad>`). The admin-subcommand refusals
+stay pinned by `frpc/tests/admin_cli.rs`.
+
+Still divergent, and **not** covered by those tests: the *shape* of the output.
+Go prints one bare parse error to **stdout** and nothing else; the frp-rs daemon
+prints an ANSI-coloured `tracing` line on stdout, and `frpc verify` prints its
+message to **stderr** where Go uses stdout. Only the exit code is pinned.
+
 ### Repository Invariants (`repo-health.sh`)
 
 `bash scripts/repo-health.sh` mirrors the `health` CI job. On top of version

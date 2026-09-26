@@ -188,11 +188,36 @@ pub mod xtcp_p2p {
 use thiserror::Error;
 
 /// Exit codes for process termination.
-/// Mirrored in frps/frpc main.rs — keep in sync.
-pub const EXIT_RUNTIME: i32 = 1; // connection lost, I/O error, unexpected
-pub const EXIT_CONFIG: i32 = 2; // bad config file, unknown field, invalid value
-pub const EXIT_AUTH: i32 = 3; // bad token, OIDC failure
-pub const EXIT_BIND: i32 = 4; // port in use, permission denied
+///
+/// Go frp v0.71.0's CLI contract is two-valued — exit 0 on success, exit 1 on
+/// any failure. That was measured over the config-failure surface (unknown
+/// top-level key, missing file, directory instead of file, unparsable field,
+/// unknown key inside `[[proxies]]`, an invalid `--strict-config` value, the
+/// `reload`/`status`/`stop` admin subcommands, `verify`) and over a rejected
+/// login and a bind conflict; Go never returned anything but 0 or 1 on the
+/// single-config surface. There is no per-class scheme in Go, and frp-rs has
+/// none either: every CLI config or flag failure on `frpc -c` / `frpc verify`
+/// / `frps -c` exits 1.
+///
+/// `EXIT_RUNTIME` is that Go-faithful failure code. The other three are
+/// **frp-rs extensions with no Go counterpart**, each kept for a surface Go
+/// does not have or does not refuse:
+///
+/// * `EXIT_CONFIG`/2 — the `--config-dir` refusals (`frpc`/`frps` `main.rs`)
+///   and nothing else. Go's `frpc --config-dir` mode exits **0** even for a
+///   directory that does not exist, is empty, or holds a config that fails to
+///   parse, so strict parity here would mean exiting 0 on a config that was
+///   never loaded; frp-rs refuses instead. (Go `frps` has no `--config-dir`
+///   flag at all.) See `docs/developing.md` § CLI exit codes.
+/// * `EXIT_AUTH`/3 and `EXIT_BIND`/4 — the daemons' service-*construction*
+///   failure arms (the `init error` paths in `frpc`/`frps` `main.rs`). The one
+///   case measured live, frps refusing a tokenless token auth method, exits 3
+///   where Go frps exits 1. Whether to collapse them into 1 is tracked in
+///   `TODO.md`.
+pub const EXIT_RUNTIME: i32 = 1; // any CLI config/flag failure — Go's only failure code
+pub const EXIT_CONFIG: i32 = 2; // frp-rs extension: --config-dir refusal (Go exits 0 there)
+pub const EXIT_AUTH: i32 = 3; // frp-rs extension: daemon service-construction auth error
+pub const EXIT_BIND: i32 = 4; // frp-rs extension: daemon service-construction bind error
 
 // ── Sub-error types with structured context ──────────────────────────
 
@@ -378,23 +403,6 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
-}
-
-impl Error {
-    /// Map each error variant to a process exit code.
-    pub fn exit_code(&self) -> i32 {
-        match self {
-            Error::Config(_) => EXIT_CONFIG,
-            Error::Auth(_) => EXIT_AUTH,
-            Error::Io(e)
-                if e.kind() == std::io::ErrorKind::AddrInUse
-                    || e.kind() == std::io::ErrorKind::PermissionDenied =>
-            {
-                EXIT_BIND
-            }
-            _ => EXIT_RUNTIME,
-        }
-    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

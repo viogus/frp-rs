@@ -20,6 +20,20 @@ User-facing release notes for frp-rs.
   negative value is accepted and means the deadline has already passed).
 
 ### Changed
+- **A CLI config or flag failure now exits 1, not 2 — a behaviour change.**
+  `frpc -c bad.toml`, `frpc verify -c bad.toml` and `frps -c bad.toml` (and
+  their missing-file / unparsable-field / invalid-`--strict-config` variants)
+  exited `2` (`EXIT_CONFIG`), while the admin subcommands
+  (`frpc reload`/`status`/`stop`) already exited `1` for the identical load
+  error. Go frp v0.71.0 exits `1` on every one of those, so the per-class code
+  is gone and the paths now agree. `--config-dir` mode keeps its non-zero
+  exit: Go's own directory mode exits **0** even for a missing, empty or
+  invalid directory — a silent success frp-rs does not adopt — and that
+  divergence is stated in `docs/developing.md` § CLI exit codes. The unused
+  `frp_core::Error::exit_code()` mapping was removed with it, and the remaining
+  `3`/`4` codes (daemon service-construction failures) are now documented as
+  frp-rs extensions with no Go counterpart, tracked in `TODO.md`. Scripts that
+  branched on `2` should branch on `1`.
 - **A build without the `oidc` feature now refuses `auth.method = "oidc"` — a
   behaviour change.** `frps-tiny` / `frpc-tiny` (and any build compiled
   without the `oidc` feature) previously fell through to `Token`, so a config

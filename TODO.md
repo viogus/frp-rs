@@ -1500,7 +1500,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `frpc CLI — run mode + 9 subcommands matching Go frp v0.69.1` comment in `frp-core/src/cli.rs`
   (the tree had 11 non-run subcommands before this change, 12 after; the comment now names them),
   the `docs/deployment.md` client-admin paragraph, and `CHANGELOG.md`.
-- [ ] **The `frpc` daemon start path exits 2 where Go exits 1 on the same bad config, and prints a
+- [x] **The `frpc` daemon start path exits 2 where Go exits 1 on the same bad config, and prints a
   tracing line instead of Go's bare parse error.** Measured with identical config text (a valid
   config plus one unknown top-level key), both on **stdout**:
   * Go v0.71.0 `frpc -c badcli.toml` → `json: unknown field "notAKnownFrpKey"`, exit **1**.
@@ -1525,6 +1525,56 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   (`docs/developing.md` or `CLAUDE.md`) that `2` is a deliberate frp-rs extension and why —
   with the exit code pinned by a test on both paths (`frpc -c bad.toml` and the admin
   subcommands) so the next change cannot silently re-diverge them. No sha.
+  **Done — took the first branch (match Go's 1), measurement below, no sha.**
+  * **Go v0.71.0 darwin/arm64, re-measured by the author**: `frpc -c bad.toml` → rc **1**,
+    stdout `json: unknown field "notAKnownFrpKey"`; `frpc verify -c bad.toml` → rc **1**,
+    same first line; `frps -c badfrps.toml` → rc **1**, same first line. Same configs
+    (`notAKnownFrpKey = 1` added to a valid config). The wider surface is also all-1:
+    missing file, `-c <directory>`, unparsable field, unknown key inside `[[proxies]]`,
+    `--strict-config=foo`, and `reload`/`status`/`stop`; `verify -c <good>` is 0.
+  * **frp-rs on real built binaries (`cargo build -p frpc -p frps`)** — before →
+    after: `frpc -c bad.toml` **2 → 1**; `frpc verify -c bad.toml` **2 → 1**;
+    `frps -c badfrps.toml` **2 → 1**. Same for `-c <missing>`, `-c <dir>`,
+    `badport.toml`/`badportfrps.toml` (all 2 → 1). `reload`/`status`/`stop` were already 1
+    and stay 1. `frpc -c empty.toml` is a *runtime* retry, not a config failure: it was
+    still running after 12 s under both Go and frp-rs and was killed by the harness.
+  * **A test that goes red without the fix, checked both ways**: reverting the daemon site
+    to `EXIT_CONFIG` fails `daemon_bad_config_exits_1_and_names_the_unknown_field`
+    (`left: Some(2), right: Some(1)`), and reverting the two `verify` sites fails
+    `verify_bad_config_exits_1_and_names_the_unknown_field` and
+    `verify_missing_config_exits_1`.
+  * **The live doc now states the scheme**: `docs/developing.md` § CLI exit codes — the
+    measured Go/frp-rs table, the `--config-dir` divergence, and the `3`/`4` residue.
+    `frp-core/src/lib.rs`'s constants carry the same statement at the definition site, and
+    the now-uncalled `Error::exit_code()` (which mapped `Config → EXIT_CONFIG` and `Io
+    AddrInUse/PermissionDenied → EXIT_BIND` for no caller) was deleted; `EXIT_CONFIG` now
+    covers exactly the four `--config-dir` refusal sites and nothing else.
+  * **Pinned by tests that run the real binaries** (new files, real `CARGO_BIN_EXE_*`):
+    `frpc/tests/cli_exit_codes.rs` — `daemon_bad_config_exits_1_and_names_the_unknown_field`,
+    `verify_bad_config_exits_1_and_names_the_unknown_field`, `verify_missing_config_exits_1`,
+    `verify_good_config_exits_0` (positive control),
+    `config_dir_refusals_exit_2_where_go_exits_0` (the divergence, pinned); and
+    `frps/tests/cli_exit_codes.rs` — `bad_config_exits_1_and_names_the_unknown_field`,
+    `missing_config_exits_1`, `good_config_starts_and_exits_0_on_sigterm`,
+    `config_dir_extension_refuses_nonexistent_dir_with_2`. The admin-side pin already
+    existed: `frpc/tests/admin_cli.rs` (23 tests, `reload`/`status`/`stop` load errors
+    assert exit 1). Measured: `cargo test -p frpc` 23 + 5 passed, `cargo test -p frps`
+    4 passed, 0 failed.
+  * **Carriers updated**: `CHANGELOG.md` (new first `### Changed` entry — user-visible
+    exit-code change), `docs/developing.md` (new § CLI exit codes), `frp-core/src/lib.rs`,
+    `frpc/src/main.rs`, `frps/src/main.rs`.
+  * **Divergence kept, deliberately**: `frpc --config-dir` with a nonexistent, empty or
+    unparsable config exits **2** where Go exits **0** (Go prints `frpc service error for
+    config file [...]` and reports success). Exiting 0 for a config that was never loaded
+    is a silent success frp-rs does not adopt; the trade is stated in the live doc and the
+    behaviour is pinned by a test rather than left to drift. `frps --config-dir` is an
+    frp-rs extension flag (Go: `unknown flag: --config-dir`, rc 1).
+  * **Still open, recorded rather than claimed**: (a) the output/stream shape — frp-rs
+    prints an ANSI tracing line on stdout where Go prints a bare parse error, and `verify`
+    prints its refusal on stderr where Go uses stdout (new item below); (b) the `3`/`4`
+    codes (new item below); (c) `frpc verify -c <config whose [[proxies]] block has an
+    unknown key>` returns 0 while Go exits 1 — found while measuring the surface above,
+    a separate strict-proxy-field defect (new item below).
 - [ ] **The space-separated `--strict-config false` form is an frp-rs extension presented as Go
   pflag semantics, and it parses differently from Go.** Measured on Go v0.71.0 and frp-rs
   (`frp-core/src/cli.rs`), with the same unknown-key config:
@@ -1564,6 +1614,49 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   empty `addr` to `127.0.0.1` at the CLI/load boundary) with a CLI test per case in the style of
   `frpc/tests/admin_cli.rs`, or record each as a deliberate divergence in the feature-surface
   policy. No sha.
+- [ ] **A CLI failure's output shape is still not Go's: frp-rs prints a `tracing` line where Go
+  prints one bare error, and `verify` writes to stderr where Go writes to stdout.** Measured on Go
+  v0.71.0 and on the head binaries while closing the exit-code item above (only the *exit code*
+  was fixed there):
+  * Go `frpc -c bad.toml` → stdout is exactly `json: unknown field "notAKnownFrpKey"`, nothing
+    else. frp-rs → an ANSI-coloured `ERROR frpc: Failed to load config: unknown field … in config
+    file …  error=…` on stdout (same stream, different shape).
+  * Go `frpc verify -c bad.toml` → the parse error on **stdout**, exit 1. frp-rs →
+    `Config file … is invalid: …` on **stderr**, exit 1 (now correct).
+  * frp-rs's `--strict-config=foo` message (`Error: \`foo\` is not expected in this context`) also
+    differs from Go's pflag message, though both exit 1 (already recorded in the space-separated
+    `--strict-config` item above).
+  **Done-when:** either match Go's message shape and stream on these paths, or state the shape
+  divergence in `docs/developing.md` § CLI exit codes as deliberate with the reason. No sha.
+- [ ] **Exit codes `3`/`4` on daemon service-construction failures are frp-rs extensions where Go
+  exits 1.** Measured on Go v0.71.0 darwin/arm64 and the frp-rs debug binaries:
+  * frps with a token auth method and an empty `auth.token` → frp-rs `frps init error: security
+    misconfiguration: CRITICAL: [auth].token …`, exit **3**; Go frps starts (or fails later) with
+    exit **1**. This is the `is_token_error` heuristic in `frps/src/main.rs`'s init-error arm; the
+    same shape exists in `frpc/src/main.rs` (`run_normal` and `run_single_proxy`), so a *client*
+    init error whose text contains `token`/`auth` also exits 3. Not measured live on frpc: with
+    `loginFailExit = true` a rejected login leaves through `service.run()` and exits **1** on both
+    sides, so the client's 3/4 arm needs a service-construction failure to reach.
+  * A bind conflict is **not** one of these paths: `frps` on an occupied `bindPort` exits **1** on
+    both sides (frp-rs binds inside `service.run()`, so `EXIT_BIND`/4 was not observed on any input
+    tried). Go binds eagerly in `RunServer` and also exits 1.
+  **Done-when:** either collapse the daemons' init-error arms to exit 1 like Go (and delete/keep
+  `EXIT_AUTH`/`EXIT_BIND` accordingly, noting the empty-token hardening refusal that Go does not
+  have), or state them as deliberate extensions in `docs/developing.md` § CLI exit codes with a
+  test pinning each reachable arm. No sha.
+- [ ] **`frpc verify` accepts an unknown key inside a `[[proxies]]` block that Go rejects, and the
+  daemon start path treats such a config as valid too.** Found while measuring the CLI
+  config-failure surface for the exit-code item above; a separate defect, not fixed there.
+  * Go v0.71.0 `frpc -c badproxy.toml` (valid client config plus `notAKnownProxyKey = 1` inside
+    `[[proxies]]`) → stdout `decode proxy at index 0: unmarshal ProxyConfig error: json: unknown
+    field "notAKnownProxyKey"`, exit **1**.
+  * frp-rs → `frpc verify -c badproxy.toml` prints `Config file … is valid`, exit **0**; the
+    daemon path logs `frpc (Rust) v0.71.0 connecting...` and only fails later if no server
+    answers. Unknown top-level keys *are* rejected, so strict mode is not applied to the proxy
+    list.
+  **Done-when:** reject unknown fields inside `[[proxies]]`/`[[visitors]]` in strict mode (or
+  state the exemption deliberately in the feature-surface policy), with a `frpc verify` test in
+  the style of `frpc/tests/cli_exit_codes.rs`. No sha.
 
 ---
 
