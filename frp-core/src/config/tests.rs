@@ -5735,10 +5735,16 @@ fn case_insensitive_proxy_array_key_is_dropped_in_strict_mode() {
 ///
 /// * Go refuses **both** spellings — `unsafe feature "TokenSourceExec" is not
 ///   enabled …` — because it reads the key either way and then hits its gate.
-/// * frp-rs strict `verify` exits 0 and prints `is valid` for **both** as well;
-///   it has no `TokenSourceExec` gate for the drop to surface at. The drop is
-///   visible only at the parsed-value level, which is what this pin asserts:
-///   `env` is read into the token source, `Env` leaves it empty.
+/// * frp-rs strict `verify` exits 0 and prints `is valid` for **both** too, but
+///   not because it lacks the gate: `TokenSourceExec` is defined at
+///   `frp-core/src/unsafe_features.rs:10` and enforced by
+///   `validate_token_source_unsafe` (`frp-core/src/auth.rs`), called from
+///   `frp-client/src/service.rs` — i.e. at **service start**, outside `verify`'s
+///   load path. Measured: `frpc -c <this config>` is rc 3 with
+///   `auth.tokenSource exec blocked: TokenSourceExec not in UnsafeFeatures
+///   allowlist. …`, identical for `Env` and `env`. The drop is therefore visible
+///   only at the parsed-value level, which is what this pin asserts: `env` is
+///   read into the token source, `Env` leaves it empty.
 ///
 /// Already documented in `docs/deployment.md:719`
 /// (`auth.tokenSource.exec.env` has no key set at `tokenSource`).

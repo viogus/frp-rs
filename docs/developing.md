@@ -1137,15 +1137,17 @@ silently mis-defaulted (lenient)" phrasing was wrong in **both** directions:
 
 - **Strict mode does not refuse everywhere: it walks only the tables it has a
   key list for.** `section_known_keys`
-  (`frp-core/src/config/strict.rs:277-285`) has nine arms, each listed here with
-  a capitalised nested key measured as refused at the head: the top level
-  (`"ServerAddr"`), `[auth]` (`"auth.Token"`), `[log]` (`"log.Level"`),
+  (`frp-core/src/config/strict.rs:277-285`) has nine arms, plus the top level
+  that `check_strict` is entered with. Each is listed here with a capitalised
+  nested key measured as refused at the head: the top level (`"ServerAddr"`),
+  then the nine arms — `[auth]` (`"auth.Token"`), `[log]` (`"log.Level"`),
   `[webServer]` (`"web_server.Port"`), `[transport]` (`"TcpMux"`), `[quic]`
   (`"quic.MaxIdleTimeout"`), `[observability]` (`"observability.OtlpEndpoint"`),
   `[store]` (`"store.Path"`), `[virtual_net]` (`"virtual_net.Address"`) and the
   server-only `[sshTunnelGateway]` (`"ssh_tunnel_gateway.BindPort"`; the client
-  side has no such table). Three categories fall outside those arms and are
-  **dropped silently even in strict mode**, with `frpc verify` exiting 0:
+  side has no such table). Three categories fall outside the walked set (the top
+  level plus those nine arms) and are **dropped silently even in strict mode**,
+  with `frpc verify` exiting 0:
   - **array elements** — `[[proxies]]`/`[[visitors]]` (and the server's
     `[[httpPlugins]]`). Stated in
     [§ Deployment § Dashboard Web UI](deployment.md#dashboard-web-ui), lines
@@ -1177,9 +1179,16 @@ silently mis-defaulted (lenient)" phrasing was wrong in **both** directions:
     of its own and nothing inside it is visited either. Measured with
     `[auth.tokenSource] type = "exec"` +
     `[auth.tokenSource.exec] command = "echo tok"` and a capitalised `Env`:
-    frp-rs strict `verify` exits **0** and prints `is valid` — and so does the
-    correctly-spelled `env`, because frp-rs has no `TokenSourceExec` gate for the
-    drop to surface at. The drop is visible only at the parsed-value level:
+    frp-rs strict `verify` exits **0** and prints `is valid`, and it does so for
+    the correctly-spelled `env` too. frp-rs *does* have the `TokenSourceExec`
+    gate (`frp-core/src/unsafe_features.rs:10`, enforced by
+    `validate_token_source_unsafe` in `frp-core/src/auth.rs` and called from
+    `frp-client/src/service.rs`); it runs at **service start**, not in `verify`'s
+    load path, which is why `verify` cannot surface the drop either way —
+    measured, `frpc -c <that config>` is rc **3** with
+    `auth.tokenSource exec blocked: TokenSourceExec not in UnsafeFeatures
+    allowlist. Pass --allow-unsafe TokenSourceExec to enable.`, identical for
+    `Env` and `env`. So the drop is visible only at the parsed-value level:
     `env` is read into the token-source struct, `Env` leaves it empty. Go refuses
     both spellings (`unsafe feature "TokenSourceExec" is not enabled …`). Already
     documented in
