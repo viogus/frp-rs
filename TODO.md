@@ -692,13 +692,37 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   near-miss on the 2 s first read was not instrumented, other hosts/CI/`--release`/`--all-features`
   were not exercised, test-thread counts other than default, 1, 2, 4 and 8 were not run, the
   tests' `flock`-based cross-process `allocate_port()` allocator was not analysed as a concurrency
-  mechanism (none was observed to collide), mutation+relink+revert *inside* one batch is invisible to
+  mechanism in this round — **it has since been observed to collide, recorded in the addendum
+  below as evidence and not as an established flake** — mutation+relink+revert *inside* one batch is invisible to
   a per-batch hash check, and a
   green clean tree cannot by itself prove the original two runs were contaminated rather than very
   rare — it only fails to reproduce them in the ~180 attempts above (110 author + 48 Reviewer 1 + 19
   Reviewer 2) spanning quiet and heavily loaded conditions. The process lesson the item names is already enforced in
   `docs/developing.md § Review protocol` ("Mutate in your own checkout, never the tree being
   measured"), so no further durable change was needed.
+  * **Addendum (2026-09-26, at the head of `fix/frps-empty-addr`): the `allocate_port()`
+    probe→bind window has been observed to collide — recorded as evidence; no test here is
+    established as flaky.** Four samples, two signatures, all from the `dashboard_integration`
+    binary: (i) **3 collisions in 110 reviewer runs** of that bin — 1 in 55 *with*, 2 in 55
+    *without* the three tests that PR added, each sample on a different test; (ii) the author's one
+    sample at that head, a run that failed 19/20 with `test_dashboard_proxy_type_and_name_filters`
+    panicking at `frp-server/tests/dashboard_integration.rs:1330` with
+    `register tcp-one: Some("port unavailable")`. Both signatures were observed in bins *with* and
+    *without* that PR's new tests, so **none of the four is attributable to
+    `fix/frps-empty-addr`**. Mechanism (`frp-server/tests/common/mod.rs`, `allocate_port()`): the
+    probe binds `127.0.0.1:0`, reads the port and **drops the probe socket**; macOS's ephemeral
+    range is 49152–65535, so a concurrent outbound socket in the same test process can take that
+    number before the child `frps` binds it, and the child then exits **rc 1
+    `Address already in use (os error 48)`** (measured directly: with `127.0.0.1:17740` held,
+    `frps -c` on that port exits 1 with exactly that error) — a failure `wait_tcp_port` cannot
+    distinguish from a slow start, so it burns its full 15 s and panics `frps bind_port not ready`
+    (`common/mod.rs:717`, the site the two `sleep`-based forced-failure runs hit). The `flock` in
+    `acquire_port_request_lock()` serialises the probe→confirm→hand-out step only, not the window to
+    the eventual bind; a comment at `allocate_port()` now names that window. The author's follow-up
+    sampling after the sample above was **0 failures in 15 runs** (6 with and 6 without the three
+    new tests, 3 mixed), so this is **one symptom plus a sampling split, not established debt**:
+    promotion to its own `[ ]` item waits for a second controlled reproduction, the same bar as the
+    `test_tcpmux_proxy_auth` record above.
 - [x] **`frp-client`'s `start_paused` socket-deadline tests are flaky on this host at *default*
   features — they can turn the existing default-feature lanes red.** Found while measuring the
   new no-features runtime step; none of them is a feature gate, and none is touched by the
@@ -2064,11 +2088,11 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   dead dashboard on a live control listener), neither is security-relevant, and both are
   Go-divergent.
   * **(a) `--dashboard-addr ""` is applied after `complete()`, so the dashboard is handed
-    `:<port>`.** `frps` loads and completes the config (`frp-core/src/config/file.rs:22` calls
-    `cfg.complete()`), then applies CLI overrides (`frps/src/main.rs:191-193` →
-    `override_server_config`, `frp-core/src/cli.rs:1841`) whose dashboard-addr assignment is
-    `frp-core/src/cli.rs:1897-1899` — with no `-c`/`--config-dir` the flag value is therefore
-    written **after** the completion that would have filled it. Measured at the head of
+    `:<port>`.** `frps` loads and completes the config (`frp-core/src/config/file.rs:25` calls
+    `cfg.complete()`), then applies CLI overrides (`frps/src/main.rs:191`
+    `cli.override_server_config(&mut cfg)`, inside `cli_overrides_enabled()`) whose dashboard-addr
+    assignment is `frp-core/src/cli.rs:1897-1899` — with no `-c`/`--config-dir` the flag value is
+    therefore written **after** the completion that would have filled it. Measured at the head of
     `fix/frps-empty-addr`, cwd holding a `frps.toml` (`bindPort = 17720`,
     `[webServer] port = 17721`, `user`/`password`) and argv `frps --dashboard-addr ""` (dashboard
     build): the control listener comes up on `0.0.0.0:17720`, then
@@ -2108,14 +2132,20 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     the head of `fix/frps-empty-addr`: `grep -ac "Dashboard listening on" target/debug/frps` is `1`
     right after `cargo build -p frps --features dashboard`, `0` after `cargo test -p frps` (16 s),
     and `0` after `touch frps/src/main.rs && cargo clippy -p frps --all-targets --all-features`
-    (18 s); a clippy run with nothing to rebuild leaves the previous artifact in place (measured:
-    the fully cached gate run finished in 0.4 s and the marker stayed `1`). With the swapped
-    binary, `cargo test -p frp-server --features dashboard --test dashboard_integration` reports
-    **0 passed / 20 failed**, every test with
-    `frps dashboard_port not ready: "port N not ready after 15s"`. CI is safe only because its lane
-    builds `frps --features dashboard` immediately before running (`.github/workflows/ci.yml`); the
-    author hit the trap while producing this PR's measurements and both reviewers reported it in
-    review.
+    (18 s); the same marker through `strings target/debug/frps | grep -c "Dashboard listening on"`
+    is `2 → 0` (the two hits are the plain and the TLS format string — same conclusion, the count is
+    tool-dependent, so name the tool). A clippy run with nothing to rebuild leaves the previous
+    artifact in place (measured: the fully cached gate run finished in 0.4 s and the marker stayed
+    `1`). With the swapped binary, `cargo test -p frp-server --features dashboard --test
+    dashboard_integration` reports **0 passed / 20 failed**, every test with
+    `frps dashboard_port not ready: "port N not ready after 15s"` — and one such run at this head
+    (46.54 s) left **17 orphaned `frps` children** (`PPID 1`, still `LISTEN`, until killed), i.e.
+    the swap is exactly what produces hazard (b)'s orphan wave; the file's three
+    `CapturedFrps`-based tests are among those 20 and their children were reaped (measured
+    separately: the same forced failure grew the orphan count by 0 there). CI is safe only because
+    its lane builds `frps --features dashboard` immediately before running
+    (`.github/workflows/ci.yml`); the author hit the trap while producing this PR's measurements and
+    both reviewers reported it in review.
   **Done-when:** make the failure self-explaining — e.g. `common::frps_binary()` verifies the
   resolved binary carries the dashboard listener and panics with "rebuild `frps --features
   dashboard`" when it does not — pinned by a test that asserts the message, with the build ordering

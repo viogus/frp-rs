@@ -296,9 +296,25 @@ fn acquire_port_request_lock() -> PortRequestGuard {
 /// the port is still bindable right before returning (narrows the
 /// probe-then-drop window). Falls back to a random ephemeral port on
 /// sandboxed environments where explicit binding is disallowed.
+///
+/// **Known residual window — not a fix, and not covered by the `flock`.** The
+/// lock below serialises only the probe→confirm→hand-out step. The socket is
+/// still *dropped* before the returned port is bound by the test (typically by
+/// a child `frps`), and the port came from `127.0.0.1:0`, i.e. the ephemeral
+/// range — so a concurrent outbound socket can take the number in between, and
+/// the child then fails to bind with rc 1 `Address already in use (os error
+/// 48)`, which `wait_tcp_port` cannot tell from a slow start (it waits out its
+/// whole timeout). Four such collisions have been observed in `dashboard`-bin
+/// runs on both sides of `fix/frps-empty-addr`; the evidence, the sampling
+/// split and why they are not treated as established flakiness are recorded in
+/// `TODO.md` (the `allocate_port` addendum). Closing it needs a holder that
+/// survives until the child binds (or a retry on bind failure), not a wider
+/// lock here.
 pub fn allocate_port() -> u16 {
     // Serialize the whole probe→confirm→hand-out across processes so the
-    // probe-then-drop window cannot be interleaved by another test bin.
+    // probe-then-drop window cannot be interleaved by another test bin. This
+    // does *not* cover the window from the drop to the caller's bind — see the
+    // doc comment above.
     let _lock = acquire_port_request_lock();
     for _ in 0..64 {
         let Some(port) = probe_ephemeral_port() else {
