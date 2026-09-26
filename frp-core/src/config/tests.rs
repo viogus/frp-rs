@@ -4201,23 +4201,274 @@ ops = ["login"]
 
 // ─── Strict mode: array-element key lists ─────────────────────────────
 
+/// Serde attribute names the key extractor below **models** on a field. Any
+/// other `#[serde(...)]` name is a hard error (see `serde_attr_key_names`), so
+/// a future attribute that changes the accepted key set cannot slip past the
+/// guard unnoticed; it has to be classified here first.
+const SERDE_FIELD_ATTRS_MODELLED: &[&str] = &[
+    "rename",
+    "alias",
+    "skip",
+    "skip_deserializing",
+    // Understood, and unable to change which keys are accepted:
+    "default",
+    "skip_serializing",
+    "with",
+    "deserialize_with",
+    "serialize_with",
+    "borrow",
+    "bound",
+    "getter",
+    "expecting",
+];
+
+/// `#[serde(...)]` names on a **field** that would change the accepted key set
+/// in a way this scanner does not model. Listed explicitly so the panic message
+/// says what to do.
+const SERDE_FIELD_ATTRS_UNMODELLED: &[&str] = &[
+    "flatten",
+    "rename_all",
+    "rename_all_fields",
+    "untagged",
+    "tag",
+    "content",
+    "transparent",
+    "remote",
+    "from",
+    "try_from",
+    "into",
+    "crate",
+];
+
+/// Same, for a `#[serde(...)]` on the **struct** itself. A container
+/// `rename_all` rewrites every field spelling, which is exactly the kind of
+/// two-way drift the guard exists to catch, so it panics rather than guessing a
+/// case convention.
+const SERDE_CONTAINER_ATTRS_MODELLED: &[&str] = &[
+    "default",
+    "deny_unknown_fields",
+    "expecting",
+    "bound",
+    "crate",
+];
+
+const SERDE_CONTAINER_ATTRS_UNMODELLED: &[&str] = &[
+    "rename_all",
+    "rename_all_fields",
+    "flatten",
+    "untagged",
+    "tag",
+    "content",
+    "transparent",
+];
+
+/// One `#[serde(...)]` entry: its name, an optional `= "value"`, and its
+/// optional nested `(...)` entries (for `rename(deserialize = "…")`).
+struct SerdeAttr {
+    name: String,
+    value: Option<String>,
+    nested: Vec<SerdeAttr>,
+}
+
+/// Parse the argument list of a `#[serde(...)]` attribute (the text between the
+/// outer parentheses) into entries, splitting on top-level commas.
+fn parse_serde_args(text: &str) -> Vec<SerdeAttr> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while !rest.trim().is_empty() {
+        // name
+        let trimmed = rest.trim_start();
+        let name_end = trimmed
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(trimmed.len());
+        let name = trimmed[..name_end].to_string();
+        let mut rest2 = trimmed[name_end..].trim_start();
+        let mut value = None;
+        let mut nested = Vec::new();
+        if let Some(r) = rest2.strip_prefix('=') {
+            let r = r.trim_start();
+            assert!(
+                r.starts_with('"'),
+                "serde attribute `{name}` has a non-string value this guard does not model: {text}"
+            );
+            let after = &r[1..];
+            let end = after
+                .find('"')
+                .unwrap_or_else(|| panic!("unterminated string in serde attribute: {text}"));
+            value = Some(after[..end].to_string());
+            rest2 = &after[end + 1..];
+        } else if let Some(r) = rest2.strip_prefix('(') {
+            let (inner, after) = split_balanced_parens(r)
+                .unwrap_or_else(|| panic!("unbalanced serde attribute parentheses: {text}"));
+            nested = parse_serde_args(inner);
+            rest2 = after;
+        }
+        out.push(SerdeAttr {
+            name,
+            value,
+            nested,
+        });
+        rest2 = rest2.trim_start();
+        if let Some(r) = rest2.strip_prefix(',') {
+            rest = r;
+        } else {
+            assert!(
+                rest2.is_empty(),
+                "unexpected trailing text in serde attribute: {text}"
+            );
+            rest = "";
+        }
+    }
+    out
+}
+
+/// Split `text` (the inside of a parenthesised group, with the opening paren
+/// already consumed) at its matching close paren; returns `(inside, rest)`.
+fn split_balanced_parens(text: &str) -> Option<(&str, &str)> {
+    let mut depth = 1usize;
+    let mut in_string = false;
+    let mut prev_backslash = false;
+    for (i, c) in text.char_indices() {
+        if in_string {
+            if c == '"' && !prev_backslash {
+                in_string = false;
+            }
+            prev_backslash = c == '\\' && !prev_backslash;
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&text[..i], &text[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Classify the `#[serde(...)]` entries found on a field or a struct, and panic
+/// on any name this guard does not model.
+fn classify_serde_attrs(attrs: &[SerdeAttr], container: bool) {
+    let (modelled, unmodelled) = if container {
+        (
+            SERDE_CONTAINER_ATTRS_MODELLED,
+            SERDE_CONTAINER_ATTRS_UNMODELLED,
+        )
+    } else {
+        (SERDE_FIELD_ATTRS_MODELLED, SERDE_FIELD_ATTRS_UNMODELLED)
+    };
+    for attr in attrs {
+        let Some(name) = attr.name.as_str().into() else {
+            unreachable!()
+        };
+        let name: &str = name;
+        assert!(
+            !unmodelled.contains(&name),
+            "the strict-mode key guard does not model `#[serde({name})]` \
+             ({}): it can change the accepted key set, so the key lists in \
+             `strict.rs` cannot be checked against the struct until the \
+             extractor is taught it",
+            if container {
+                "container attribute"
+            } else {
+                "field attribute"
+            }
+        );
+        assert!(
+            modelled.contains(&name),
+            "the strict-mode key guard does not recognise `#[serde({name})]` \
+             ({}): classify it in `SERDE_FIELD_ATTRS_*` / \
+             `SERDE_CONTAINER_ATTRS_*` in `frp-core/src/config/tests.rs` before \
+             relying on this guard",
+            if container {
+                "container attribute"
+            } else {
+                "field attribute"
+            }
+        );
+    }
+}
+
+/// Accepted key names contributed by one field's attributes, or `None` when the
+/// field is skipped for deserialization.
+fn field_key_names(attrs: &[SerdeAttr], field: &str) -> Option<std::collections::BTreeSet<String>> {
+    classify_serde_attrs(attrs, false);
+    if attrs
+        .iter()
+        .any(|a| a.name == "skip" || a.name == "skip_deserializing")
+    {
+        return None;
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    let serialized = attrs.iter().find(|a| a.name == "rename").map(|a| {
+        if let Some(v) = &a.value {
+            v.clone()
+        } else {
+            let deserialize = a
+                .nested
+                .iter()
+                .find(|n| n.name == "deserialize")
+                .and_then(|n| n.value.clone())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`#[serde(rename(...))]` on field `{field}` has no \
+                         `deserialize = \"…\"`: the accepted key cannot be derived"
+                    )
+                });
+            deserialize
+        }
+    });
+    keys.insert(serialized.unwrap_or_else(|| field.to_string()));
+    for alias in attrs.iter().filter(|a| a.name == "alias") {
+        keys.insert(
+            alias
+                .value
+                .clone()
+                .expect("alias always has a string value"),
+        );
+    }
+    Some(keys)
+}
+
 /// Extract the serde-accepted key set of `pub struct <name>` from a Rust
-/// source file: each `pub <field>`, with `#[serde(rename = "…")]` replacing the
-/// field name, plus every `#[serde(alias = "…")]`.
+/// source file: each field's `rename`/`rename(deserialize = …)` name (or the
+/// field name) plus every `alias`, skipping `skip`/`skip_deserializing` fields.
 ///
 /// Panics when the struct is missing (the guard must not pass because it
-/// matched nothing) and when the struct has a `#[serde(flatten)]` field: a
-/// flattened field makes the accepted key set open-ended, so a fixed list
-/// cannot be complete and this guard must fail rather than pretend otherwise.
-///
-/// A small hand-written scanner rather than a Rust parser: it only needs
-/// attributes and field names, skips `//`/`/* */` comments, accepts
-/// multi-line `#[serde(...)]` groups and string literals inside them.
+/// matched nothing) and on any serde attribute it does not model — `flatten`
+/// and `rename_all` above all, because they make the accepted set open-ended or
+/// rewrite every field spelling.
 fn serde_keys_of_struct(src: &str, name: &str) -> std::collections::BTreeSet<String> {
-    let needle = format!("pub struct {name}");
-    let at = src
-        .find(&needle)
-        .unwrap_or_else(|| panic!("struct {name} not found in the source passed to this guard"));
+    // Any visibility is accepted (`pub`, `pub(crate)`, `pub(super)`,
+    // `pub(in …)`, or private): the declaration keyword carries no key
+    // information, so the scan starts at `struct <name>` and the container
+    // attributes are read from the window before it.
+    let needle = format!("struct {name}");
+    let mut at = None;
+    let mut from = 0usize;
+    while let Some(found) = src[from..].find(&needle) {
+        let abs = from + found;
+        let after = &src[abs + needle.len()..];
+        if after.starts_with(|c: char| c.is_whitespace() || c == '{' || c == '<') {
+            at = Some(abs);
+            break;
+        }
+        from = abs + needle.len();
+    }
+    let at =
+        at.unwrap_or_else(|| panic!("struct {name} not found in the source passed to this guard"));
+    // Container attributes sit between the end of the previous item and
+    // `struct`; the derive/doc lines in that window are ignored, and a
+    // `#[serde(...)]` there is classified as a container attribute.
+    let window_start = src[..at].rfind("\n}").map(|i| i + 2).unwrap_or(0);
+    let container_attrs = serde_attrs_in(&src[window_start..at]);
+    classify_serde_attrs(&container_attrs, true);
+
     let open = at + src[at..].find('{').expect("struct body opens");
     let mut depth = 0usize;
     let mut close = None;
@@ -4236,115 +4487,147 @@ fn serde_keys_of_struct(src: &str, name: &str) -> std::collections::BTreeSet<Str
     }
     let body = &src[open + 1..close.expect("struct body closes")];
 
-    let bytes = body.as_bytes();
     let mut keys = std::collections::BTreeSet::new();
-    let mut attrs: Vec<&str> = Vec::new();
+    let mut pending: Vec<SerdeAttr> = Vec::new();
     let mut i = 0usize;
-    while i < bytes.len() {
-        // Comments and source in this crate carry non-ASCII (em dashes,
-        // arrows); every slice below needs a char boundary, and the byte scan
-        // advances one byte at a time.
+    while i < body.len() {
+        // Source in this crate carries non-ASCII (em dashes, arrows); every
+        // slice below needs a char boundary and the scan advances byte-wise.
         if !body.is_char_boundary(i) {
             i += 1;
             continue;
         }
         if body[i..].starts_with("//") {
-            i += body[i..].find('\n').unwrap_or(bytes.len() - i);
+            i += body[i..].find('\n').unwrap_or(body.len() - i);
         } else if body[i..].starts_with("/*") {
             i += body[i..].find("*/").expect("block comment closes") + 2;
         } else if body[i..].starts_with("#[") {
-            // Balanced `#[...]`, skipping string literals (an alias value could
-            // contain a bracket, and `\"` inside one must not end it early).
-            let mut j = i;
-            let mut paren_depth = 0usize;
-            let mut in_string = false;
-            while j < bytes.len() {
-                let ch = bytes[j];
-                if in_string {
-                    if ch == b'\\' {
-                        j += 1;
-                    } else if ch == b'"' {
-                        in_string = false;
-                    }
-                } else if ch == b'"' {
-                    in_string = true;
-                } else if ch == b'[' {
-                    paren_depth += 1;
-                } else if ch == b']' {
-                    paren_depth -= 1;
-                    if paren_depth == 0 {
-                        j += 1;
-                        break;
-                    }
-                }
-                j += 1;
+            let (text, next) = split_attribute(&body[i..]);
+            if let Some(args) = text
+                .strip_prefix("serde(")
+                .and_then(|t| t.strip_suffix(')'))
+            {
+                pending.extend(parse_serde_args(args));
             }
-            attrs.push(&body[i..j]);
-            i = j;
-        } else if let Some(rest) = body[i..].strip_prefix("pub ") {
-            let ident_len = rest
-                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .unwrap_or(rest.len());
-            let ident = &rest[..ident_len];
-            let after = rest[ident_len..].trim_start();
-            if ident.is_empty() || !after.starts_with(':') {
-                i += 1;
-                continue;
-            }
-            let joined = attrs.join(" ");
-            attrs.clear();
-            assert!(
-                !joined.contains("flatten"),
-                "struct {name} has a #[serde(flatten)] field ({ident}); its key \
-                 set is open-ended and cannot be covered by a strict-mode list"
-            );
-            let renamed = joined
-                .find("rename")
-                .and_then(|pos| serde_string_arg(&joined[pos..], "rename"));
-            let primary = renamed.unwrap_or_else(|| ident.to_string());
-            keys.insert(primary);
-            let mut search = 0usize;
-            while let Some(rest) = joined.get(search..) {
-                let Some(found) = rest.find("alias") else {
-                    break;
-                };
-                let pos = search + found;
-                let arg = serde_string_arg(&joined[pos..], "alias");
-                if let Some(value) = arg {
-                    keys.insert(value);
-                }
-                search = pos + "alias".len();
-            }
-            // Skip the field's type up to the next field/attribute at top level
-            // of the struct body; the scanner resumes on the next `pub ` or
-            // `#[`, so nothing else is needed here.
-            i += 1;
+            i += next;
         } else {
-            i += 1;
+            match field_name_at(&body[i..]) {
+                Some((field, after)) => {
+                    if let Some(names) = field_key_names(&pending, &field) {
+                        keys.extend(names);
+                    }
+                    pending.clear();
+                    i += after;
+                }
+                None => i += 1,
+            }
         }
     }
     keys
 }
 
-/// Read the string value of `<key> = "…"` at the start of `s`, if the token at
-/// `s` really is that key. Used for `rename` and `alias`.
-fn serde_string_arg(s: &str, key: &str) -> Option<String> {
-    let rest = s.trim_start().strip_prefix(key)?;
-    let rest = rest.trim_start().strip_prefix('=')?.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+/// Every `#[serde(...)]` group in `text`, parsed (doc comments skipped).
+fn serde_attrs_in(text: &str) -> Vec<SerdeAttr> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < text.len() {
+        if !text.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        if text[i..].starts_with("//") {
+            i += text[i..].find('\n').unwrap_or(text.len() - i);
+        } else if text[i..].starts_with("#[") {
+            let (attr, next) = split_attribute(&text[i..]);
+            if let Some(args) = attr
+                .strip_prefix("serde(")
+                .and_then(|t| t.strip_suffix(')'))
+            {
+                out.extend(parse_serde_args(args));
+            }
+            i += next;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Consume one balanced `#[...]` group at the start of `text`; returns the text
+/// between the brackets and how many bytes were consumed.
+fn split_attribute(text: &str) -> (String, usize) {
+    let bytes = text.as_bytes();
+    let mut i = 2usize; // past `#[`
+    let mut depth = 1usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if c == b'\\' {
+                i += 1;
+            } else if c == b'"' {
+                in_string = false;
+            }
+        } else if c == b'"' {
+            in_string = true;
+        } else if c == b'[' {
+            depth += 1;
+        } else if c == b']' {
+            depth -= 1;
+            if depth == 0 {
+                return (text[2..i].to_string(), i + 1);
+            }
+        }
+        i += 1;
+    }
+    panic!("unbalanced `#[` attribute in struct source: {text}");
+}
+
+/// If a field declaration starts at `text`, return its name and the number of
+/// bytes it occupies up to (and including) the colon. Handles `pub`,
+/// `pub(crate)`, `pub(super)` and `pub(in path)` fields.
+fn field_name_at(text: &str) -> Option<(String, usize)> {
+    let rest = text.strip_prefix("pub")?;
+    let mut consumed = 3usize;
+    let rest = if let Some(r) = rest.strip_prefix('(') {
+        let (_, after) = split_balanced_parens(r)?;
+        consumed += 1 + (r.len() - after.len());
+        after
+    } else {
+        rest
+    };
+    let ws = rest.len() - rest.trim_start().len();
+    consumed += ws;
+    let rest = rest.trim_start();
+    let ident_len = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    let ident = &rest[..ident_len];
+    if ident.is_empty() {
+        return None;
+    }
+    let after_ident = rest[ident_len..].trim_start();
+    let colon = after_ident.strip_prefix(':')?;
+    consumed += ident_len + (rest[ident_len..].len() - after_ident.len()) + 1;
+    let _ = colon;
+    Some((ident.to_string(), consumed))
 }
 
 /// The key sets `check_strict` uses for `proxies`/`visitors`/`[[httpPlugins]]`
 /// elements and for the `plugin` tables must equal the serde surface of the
-/// struct they stand for. This is the drift guard: adding a field or an
-/// `#[serde(alias = "…")]` to any of the five structs without adding it to the
-/// matching list in `strict.rs` fails here (and so does a stale list entry),
-/// which is what keeps the lists from silently under- or over-accepting.
+/// struct they stand for. This is the drift guard: adding, removing or renaming
+/// a field or an `#[serde(alias = "…")]` on any of the six structs without
+/// updating the matching list in `strict.rs` fails here, in either direction
+/// (a stale list entry is also a bug: it admits a key the deserializer drops).
 ///
-/// The comparison is deliberately two-way and exact — an extra list entry is
-/// also a bug, because it admits a key the deserializer drops.
+/// **What it does not cover**, stated rather than implied: a container
+/// `#[serde(rename_all = …)]` or a field `#[serde(flatten)]`/`skip_*` — those
+/// panic in the extractor instead of being modelled, so the suite goes red and
+/// asks for the extractor to be taught the transformation; and a *new*
+/// struct + array pair added to `child_table_keys`/`child_array_keys` — that
+/// needs a new row in the table below, which
+/// `strict_known_key_lists_are_all_covered` enforces for `strict.rs`'s
+/// `*_KNOWN_KEYS` constants, but not for a wholesale reuse of an existing list.
 #[test]
 fn strict_array_element_keys_match_struct_fields() {
     use super::strict::{
@@ -4354,7 +4637,7 @@ fn strict_array_element_keys_match_struct_fields() {
     let client_src = include_str!("client.rs");
     let server_src = include_str!("server.rs");
 
-    // Parser self-check: a struct whose `#[serde(...)]` groups span several
+    // Extractor self-check: a struct whose `#[serde(...)]` groups span several
     // lines must still yield every alias, and a `rename` must replace the field
     // name. Without this the whole guard could pass by extracting nothing.
     let quic = serde_keys_of_struct(server_src, "QuicOptions");
@@ -4375,9 +4658,23 @@ fn strict_array_element_keys_match_struct_fields() {
         quic, expected_quic,
         "the key extractor must read multi-line #[serde(...)] groups"
     );
-    assert!(
-        serde_keys_of_struct(client_src, "HealthCheckHttpHeader").contains("name"),
-        "the extractor must read plain fields"
+    // `rename(deserialize = "…")` and a `pub(super)` field, both synthetic: the
+    // tree has no live example of either, and the guard must handle them.
+    let synthetic = concat!(
+        "pub(super) struct Synthetic {\n",
+        "    #[serde(rename(deserialize = \"renamed\", serialize = \"out\"))]\n",
+        "    pub(crate) inner_name: String,\n",
+        "    pub(in crate::config) plain: u8,\n",
+        "    #[serde(skip_deserializing)]\n",
+        "    pub skipped: u8,\n",
+        "}\n",
+    );
+    let synthetic_keys = serde_keys_of_struct(synthetic, "Synthetic");
+    let expected_synthetic: std::collections::BTreeSet<String> =
+        ["renamed", "plain"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        synthetic_keys, expected_synthetic,
+        "pub(crate)/pub(in …) fields and rename(deserialize = …) must be extracted"
     );
 
     for (label, src, struct_name, list) in [
@@ -4441,19 +4738,75 @@ fn strict_array_element_keys_match_struct_fields() {
     }
 }
 
-/// Teeth for the guard above: a `#[serde(flatten)]` field makes a struct's key
-/// set open-ended, and the guard must fail loudly instead of comparing against
-/// a set it cannot complete (the repo's `FeatureConfig` is that shape).
+/// Every `*_KNOWN_KEYS` list in `strict.rs` must be covered by the guard table
+/// above. Without this, a new struct + array pair could add a list that no test
+/// ever compares against its struct.
 #[test]
-#[should_panic(expected = "flatten")]
+fn strict_known_key_lists_are_all_covered() {
+    let strict_src = include_str!("strict.rs");
+    let mut declared: Vec<String> = Vec::new();
+    for line in strict_src.lines() {
+        let Some(rest) = line.trim().strip_prefix("pub(super) const ") else {
+            continue;
+        };
+        let Some((name, _)) = rest.split_once(':') else {
+            continue;
+        };
+        if name.ends_with("_KNOWN_KEYS") {
+            declared.push(name.to_string());
+        }
+    }
+    declared.sort();
+    let covered = [
+        "PROXY_KNOWN_KEYS",
+        "VISITOR_KNOWN_KEYS",
+        "CLIENT_PLUGIN_KNOWN_KEYS",
+        "VISITOR_PLUGIN_KNOWN_KEYS",
+        "HTTP_PLUGIN_KNOWN_KEYS",
+        "HEALTH_CHECK_HEADER_KNOWN_KEYS",
+    ];
+    let mut covered_sorted: Vec<String> = covered.iter().map(|s| s.to_string()).collect();
+    covered_sorted.sort();
+    assert_eq!(
+        declared, covered_sorted,
+        "a `*_KNOWN_KEYS` list in `frp-core/src/config/strict.rs` is not compared \
+         against its struct by `strict_array_element_keys_match_struct_fields`; \
+         add it there (and to the recursion in strict.rs)"
+    );
+}
+
+/// Teeth for the extractor: a `#[serde(rename_all = "…")]` container attribute
+/// rewrites every field spelling, and the guard must fail loudly instead of
+/// comparing against a set it cannot compute (this is the mutant that slipped
+/// through the first version of the guard).
+#[test]
+#[should_panic(expected = "does not model `#[serde(rename_all)]`")]
+fn strict_key_extractor_refuses_rename_all() {
+    let synthetic = "#[serde(rename_all = \"camelCase\")]\npub struct Cased {\n    pub health_check_type: String,\n}\n";
+    let _ = serde_keys_of_struct(synthetic, "Cased");
+}
+
+/// Teeth: a `#[serde(flatten)]` field makes a struct's key set open-ended
+/// (the repo's `FeatureConfig` is that shape), so the guard must fail rather
+/// than compare against a set it cannot complete.
+#[test]
+#[should_panic(expected = "does not model `#[serde(flatten)]`")]
 fn strict_key_extractor_refuses_open_ended_structs() {
     let synthetic = "pub struct Open {\n    #[serde(flatten)]\n    pub gates: std::collections::HashMap<String, bool>,\n}\n";
     let _ = serde_keys_of_struct(synthetic, "Open");
 }
 
-/// Teeth for the guard above: a struct that is not in the source must panic,
-/// not return an empty set (an empty set would make the two-way comparison fail
-/// for the wrong reason, but a *missing struct* silently skipped would pass).
+/// Teeth: an unrecognised serde attribute must not be ignored — if it changed
+/// the key set, the two-way comparison would silently accept the drift.
+#[test]
+#[should_panic(expected = "does not recognise `#[serde(invented_attr)]`")]
+fn strict_key_extractor_refuses_unknown_attrs() {
+    let synthetic = "pub struct Odd {\n    #[serde(invented_attr)]\n    pub x: u8,\n}\n";
+    let _ = serde_keys_of_struct(synthetic, "Odd");
+}
+
+/// Teeth: a struct that is not in the source must panic, not return an empty
+/// set (a silently skipped struct would be a guard that proves nothing).
 #[test]
 #[should_panic(expected = "not found in the source")]
 fn strict_key_extractor_refuses_missing_structs() {
@@ -5079,6 +5432,272 @@ fn test_legacy_ini_health_check_s_spellings_survive_strict_mode() {
         err.contains("unknown field \"proxies[0].health_check_interval_s\""),
         "got: {err}"
     );
+}
+/// Go frp v0.71.0's own `conf/legacy/frpc_legacy_full.ini`, copied
+/// byte-identically to `frp-core/src/config/fixtures/frpc_legacy_full.ini`
+/// (`frp-core/src/config/fixtures/README.md` records the origin and licence).
+/// It exercises every legacy INI prefix mechanism Go consumes — `[common]` and
+/// `[ssh]` `meta_*`, `[web01] header_*`, and `plugin_header_*` on the three
+/// plugin types that read it (`http2https`, `https2http`, `https2https`) — which
+/// is exactly the class the strict-mode array walk must not refuse: Go's INI
+/// path ignores an INI key its typed struct does not name instead of erroring,
+/// so the whole file loads on Go (`frpc verify -c` exits 0).
+///
+/// The assertion is made at the **strict-check layer** on purpose. The file also
+/// carries bare numeric values for string fields (`token = 12345678`,
+/// `meta_var1 = 123`), and frp-rs's INI number inference turns those into TOML
+/// integers that serde then rejects — a pre-existing legacy-INI gap unrelated to
+/// strict mode (it fails on this file with or without the array walk). What this
+/// item changed is the strict check, so that is what is pinned; the full-load
+/// behaviour of the same mechanisms is covered by
+/// `legacy_ini_prefix_mechanisms_load_through_strict_mode` with quoted values.
+#[test]
+fn legacy_ini_go_shipped_fixture_passes_strict_mode() {
+    let mut value = super::format::parse_to_toml_value(
+        include_str!("fixtures/frpc_legacy_full.ini"),
+        super::format::ConfigFormat::Ini,
+    )
+    .unwrap();
+    super::normalize::normalize_client_config(&mut value);
+    super::strict::run_strict_check(
+        &value,
+        &super::strict::known_client_keys(),
+        "frpc_legacy_full.ini",
+    )
+    .expect("Go's shipped legacy INI fixture must not draw a strict-mode refusal");
+
+    // …and the three honoured prefix families must have survived as the keys
+    // their Go counterparts fill. A bare "no error" assertion would also pass if
+    // the strip pass had dropped them.
+    let proxies = value
+        .get("proxies")
+        .and_then(toml::Value::as_array)
+        .expect("proxies array");
+    let named = |name: &str| {
+        proxies
+            .iter()
+            .find(|p| p.get("name").and_then(toml::Value::as_str) == Some(name))
+            .unwrap_or_else(|| panic!("proxy `{name}` not collected"))
+    };
+    assert_eq!(
+        named("ssh")
+            .get("metadatas")
+            .and_then(|m| m.get("var1"))
+            .and_then(toml::Value::as_integer),
+        Some(123),
+        "`meta_var1` in a proxy section must be folded into `metadatas`"
+    );
+    assert_eq!(
+        named("web01")
+            .get("headers")
+            .and_then(|h| h.get("X-From-Where"))
+            .and_then(toml::Value::as_str),
+        Some("frp"),
+        "`header_*` in an http proxy section must be folded into `headers`"
+    );
+    for name in [
+        "plugin_https2http",
+        "plugin_https2https",
+        "plugin_http2https",
+    ] {
+        assert_eq!(
+            named(name)
+                .get("plugin")
+                .and_then(|p| p.get("request_headers"))
+                .and_then(|h| h.get("X-From-Where"))
+                .and_then(toml::Value::as_str),
+            Some("frp"),
+            "`plugin_header_*` on `{name}` must be folded into the plugin's \
+             `request_headers`"
+        );
+    }
+}
+
+/// Every legacy INI prefix mechanism Go reads, loaded end to end through strict
+/// mode with values that survive serde (quoted where frp-rs's INI inference
+/// would otherwise make them numbers):
+///
+/// * `meta_*` → `metadatas` (`pkg/config/legacy/proxy.go:198`);
+/// * `header_*` → HTTP request headers, for `type = "http"` only
+///   (`proxy.go:244`; the HTTPS/TCP structs have no `Headers` field);
+/// * `plugin_header_*` → the plugin's `request_headers` for the three plugin
+///   types whose conversion calls `transformHeadersFromPluginParams`
+///   (`conversion.go:171-181,217,228,236`);
+/// * the flat `health_check_*_s` spellings (see the dedicated test below).
+#[test]
+fn legacy_ini_prefix_mechanisms_load_through_strict_mode() {
+    let mut f = tempfile::Builder::new().suffix(".ini").tempfile().unwrap();
+    f.write_all(
+        br#"[common]
+server_addr = 127.0.0.1
+server_port = 7000
+
+[web]
+type = http
+local_port = 8080
+custom_domains = a.example.com
+header_X-Foo = bar
+
+[gh]
+type = tcp
+local_port = 8080
+remote_port = 7001
+meta_env = prod
+
+[pl]
+type = tcp
+remote_port = 7002
+plugin = https2http
+plugin_local_addr = 127.0.0.1:80
+plugin_crt_path = a.crt
+plugin_key_path = a.key
+plugin_header_X-Plugin = bar
+"#,
+    )
+    .unwrap();
+    let cfg = load_client_config(f.path().to_str().unwrap(), true)
+        .expect("every Go legacy prefix mechanism must load in strict mode");
+    let named = |name: &str| cfg.proxies.iter().find(|p| p.name == name).unwrap();
+    assert_eq!(
+        named("web").headers.get("X-Foo").map(String::as_str),
+        Some("bar"),
+        "header_* -> headers"
+    );
+    assert_eq!(
+        named("gh").metas.get("env").map(String::as_str),
+        Some("prod"),
+        "meta_* -> metadatas"
+    );
+    assert_eq!(
+        named("pl")
+            .plugin
+            .as_ref()
+            .unwrap()
+            .request_headers
+            .get("X-Plugin")
+            .map(String::as_str),
+        Some("bar"),
+        "plugin_header_* -> plugin request_headers"
+    );
+}
+
+/// The keys Go's legacy layer **ignores** (its typed structs never name them,
+/// and `gopkg.in/ini`'s `MapTo` skips what it cannot map) must not be refused
+/// either — Go loads every config below with exit 0. The legacy collector drops
+/// them before the strict walk, so the v1 `[[proxies]]` check stays strict while
+/// the legacy INI surface keeps Go's accept-and-ignore semantics.
+#[test]
+fn legacy_ini_ignores_keys_go_ignores() {
+    let mut f = tempfile::Builder::new().suffix(".ini").tempfile().unwrap();
+    f.write_all(
+        br#"[common]
+server_addr = 127.0.0.1
+server_port = 7000
+
+[p]
+type = tcp
+local_port = 8080
+remote_port = 7001
+log_level = debug
+privilege_mode = true
+pool_count = 5
+plugin = http_proxy
+plugin_unknown_param = 1
+plugin_enable_http2 = true
+
+[v]
+type = stcp
+role = visitor
+server_name = p
+sk = abc
+bind_port = 6000
+meta_foo = bar
+header_X-Foo = bar
+"#,
+    )
+    .unwrap();
+    let cfg = load_client_config(f.path().to_str().unwrap(), true)
+        .expect("keys Go's legacy layer ignores must not be refused");
+    assert_eq!(cfg.proxies.len(), 1);
+    assert_eq!(cfg.proxies[0].name, "p");
+    // The ignored keys must be *gone*, not silently honoured: `log_level` etc.
+    // are client-level keys, and `plugin_enable_http2` is not a Go or frp-rs
+    // plugin parameter (the v1 spelling is `enable_http2`).
+    let plugin = cfg.proxies[0].plugin.as_ref().expect("plugin parsed");
+    assert_eq!(plugin.plugin_type, "http_proxy");
+    assert_eq!(plugin.enable_http2, None);
+    assert_eq!(cfg.visitors.len(), 1);
+    assert_eq!(cfg.visitors[0].name, "v");
+}
+
+/// Go's legacy INI struct declares only the `_s` health-check spellings
+/// (`pkg/config/legacy/proxy.go:130,136`), so `health_check_interval_seconds` is
+/// an unknown INI key there and is ignored. Measured on Go v0.71.0 with a real
+/// frps+frpc pair and a dead local port (health-check log gaps): `_s = 2` alone
+/// → a check every 2.0 s; `_seconds = 2` alone → one check and then the 10 s
+/// default; `_s = 2` + `_seconds = 99` → every 2.0 s; `_s = 99` + `_seconds = 2`
+/// → one check. The `_s` value therefore wins in both orders, which is what the
+/// rewrite in `collect_legacy_ini_proxy_sections` implements (`insert`, not
+/// `or_insert`).
+#[test]
+fn legacy_ini_health_check_s_wins_over_seconds() {
+    let mut f = tempfile::Builder::new().suffix(".ini").tempfile().unwrap();
+    f.write_all(
+        br#"[common]
+server_addr = 127.0.0.1
+server_port = 7000
+
+[tcp]
+type = tcp
+local_port = 8080
+remote_port = 7001
+health_check_type = tcp
+health_check_interval_s = 7
+health_check_interval_seconds = 99
+health_check_timeout_s = 2
+health_check_timeout_seconds = 88
+"#,
+    )
+    .unwrap();
+    let cfg = load_client_config(f.path().to_str().unwrap(), true).unwrap();
+    assert_eq!(
+        cfg.proxies[0].health_check_interval_seconds, 7,
+        "the Go-honoured `_s` spelling wins over the frp-rs-only `_seconds` one"
+    );
+    assert_eq!(
+        cfg.proxies[0].health_check_timeout_seconds, 2,
+        "same for the timeout pair"
+    );
+}
+
+/// Strict mode walks a proxy's health-check header array under **both** serde
+/// spellings. `healthCheckHttpHeaders` is an alias not renamed by
+/// `normalize_proxies`, so it reaches the check as its own key; without the
+/// alias arm here the unknown key was accepted under the alias while the
+/// canonical `health_check_http_headers` spelling refused it.
+#[test]
+fn strict_mode_rejects_unknown_health_check_header_via_both_spellings() {
+    for spelling in ["health_check_http_headers", "healthCheckHttpHeaders"] {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(
+            format!(
+                "serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[[proxies]]\nname = \"p\"\ntype = \"tcp\"\nlocalPort = 80\nremotePort = 7001\n\
+                 [[proxies.healthCheck]]\ntype = \"tcp\"\nintervalSeconds = 10\n\
+                 [[proxies.{spelling}]]\nname = \"X-Test\"\nvalue = \"1\"\nnotAKnownHeaderKey = 1\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let err = load_client_config(f.path().to_str().unwrap(), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "unknown field \"proxies[0].{spelling}[0].notAKnownHeaderKey\""
+            )),
+            "[{spelling}] got: {err}"
+        );
+    }
 }
 
 /// Legacy INI range template with mismatched port counts is skipped (warn),

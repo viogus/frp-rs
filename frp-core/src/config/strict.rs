@@ -662,15 +662,86 @@ fn child_table_keys(ctx: Ctx, key: &str) -> Option<&'static [&'static str]> {
 /// descends into, one element at a time. Arrays not listed here are left
 /// alone: their element type is either a scalar (`ops`, `custom_domains`,
 /// `locations`, …) or an open shape (maps of user-chosen keys).
+///
+/// Both spellings of the health-check header array are listed: serde accepts
+/// `health_check_http_headers` and its alias `healthCheckHttpHeaders`, and
+/// `normalize_proxies` renames only the nested `healthCheck.httpHeaders` form,
+/// so a flat `healthCheckHttpHeaders` alias survives here as its own key.
 fn child_array_keys(ctx: Ctx, key: &str) -> Option<(&'static [&'static str], Ctx)> {
     match (ctx, key) {
         (Ctx::Root, "proxies") => Some((PROXY_KNOWN_KEYS, Ctx::ProxyElement)),
         (Ctx::Root, "visitors") => Some((VISITOR_KNOWN_KEYS, Ctx::VisitorElement)),
         (Ctx::Root, "http_plugins") => Some((HTTP_PLUGIN_KNOWN_KEYS, Ctx::HttpPluginElement)),
-        (Ctx::ProxyElement, "health_check_http_headers") => {
+        (Ctx::ProxyElement, "health_check_http_headers" | "healthCheckHttpHeaders") => {
             Some((HEALTH_CHECK_HEADER_KNOWN_KEYS, Ctx::HealthCheckHeader))
         }
         _ => None,
+    }
+}
+
+/// Child context of a nested table, so the two walkers cannot disagree about
+/// which struct a `plugin` table belongs to.
+fn child_ctx(ctx: Ctx, key: &str) -> Ctx {
+    match (ctx, key) {
+        (Ctx::ProxyElement, "plugin") => Ctx::ProxyPlugin,
+        (Ctx::VisitorElement, "plugin") => Ctx::VisitorPlugin,
+        _ => Ctx::Root,
+    }
+}
+
+/// Drop every key `check_strict` would reject, recursing through the same
+/// whitelists. Used for elements produced by the **legacy INI / legacy-section**
+/// collector: Go's legacy path ignores a key its typed struct does not name
+/// (`gopkg.in/ini` `MapTo` and the explicit field reads in
+/// `pkg/config/legacy/*.go`) rather than rejecting it, so refusing one there
+/// would fail a config Go loads.
+///
+/// Runs after `normalize_proxies` / `normalize_visitors`, so the keys those
+/// folds consume (`transport`, `healthCheck`, `loadBalancer`, `natTraversal`,
+/// `requestHeaders`, …) have already been renamed and survive as element keys.
+pub(super) fn strip_unknown_legacy_element_keys(element: &mut toml::Value, visitor: bool) {
+    let Some(table) = element.as_table_mut() else {
+        return;
+    };
+    let (keys, ctx) = if visitor {
+        (VISITOR_KNOWN_KEYS, Ctx::VisitorElement)
+    } else {
+        (PROXY_KNOWN_KEYS, Ctx::ProxyElement)
+    };
+    strip_unknown_keys_in(table, &known_set_from(keys), ctx);
+}
+
+fn strip_unknown_keys_in(
+    table: &mut toml::Table,
+    known: &std::collections::HashSet<&str>,
+    ctx: Ctx,
+) {
+    for key in table.keys().cloned().collect::<Vec<_>>() {
+        if !known.contains(key.as_str()) {
+            table.remove(&key);
+            continue;
+        }
+        match table.get_mut(&key) {
+            Some(toml::Value::Table(sub)) => {
+                if let Some(sub_keys) = child_table_keys(ctx, &key) {
+                    strip_unknown_keys_in(sub, &known_set_from(sub_keys), child_ctx(ctx, &key));
+                }
+            }
+            Some(toml::Value::Array(elements)) => {
+                if let Some((element_keys, element_ctx)) = child_array_keys(ctx, &key) {
+                    for element in elements.iter_mut() {
+                        if let toml::Value::Table(element) = element {
+                            strip_unknown_keys_in(
+                                element,
+                                &known_set_from(element_keys),
+                                element_ctx,
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -751,17 +822,12 @@ fn check_strict_in(
         match table.get(key) {
             Some(toml::Value::Table(sub)) => {
                 if let Some(sub_keys) = child_table_keys(ctx, key) {
-                    let sub_ctx = match (ctx, key.as_str()) {
-                        (Ctx::ProxyElement, "plugin") => Ctx::ProxyPlugin,
-                        (Ctx::VisitorElement, "plugin") => Ctx::VisitorPlugin,
-                        _ => Ctx::Root,
-                    };
                     errors.extend(check_strict_in(
                         sub,
                         &known_set_from(sub_keys),
                         &full_key,
                         config_path,
-                        sub_ctx,
+                        child_ctx(ctx, key),
                     ));
                 }
             }
