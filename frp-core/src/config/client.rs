@@ -429,7 +429,7 @@ impl ClientConfig {
         // Go frp v0.71.0 `ClientCommonConfig.Complete()` calls
         // `c.WebServer.Complete()` (`pkg/config/v1/client.go:96`), which is
         // `c.Addr = util.EmptyOr(c.Addr, "127.0.0.1")`
-        // (`pkg/config/v1/common.go:71-73`). `EmptyOr` fills on the **empty
+        // (`pkg/config/v1/common.go:71-72`). `EmptyOr` fills on the **empty
         // string**, so an explicit `addr = ""` becomes `127.0.0.1` there, and
         // the client has no later step that re-defaults the address.
         //

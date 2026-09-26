@@ -5181,7 +5181,7 @@ fn test_server_bind_port_zero_maps_to_default_in_complete() {
 }
 
 /// The **server** side of the empty `webServer.addr` story, now Go parity. Go's
-/// `ServerConfig.Complete()` (`pkg/config/v1/server.go:101-120`) runs
+/// `ServerConfig.Complete()` (`pkg/config/v1/server.go:101-126`) runs
 /// `WebServer.Complete()` → `Addr = util.EmptyOr(Addr, "127.0.0.1")`
 /// (`pkg/config/v1/common.go:71-72`) at `:107` and only then the
 /// `if Port > 0 { Addr = util.EmptyOr(Addr, "0.0.0.0") }` at `:116-117`, so that

@@ -1073,7 +1073,7 @@ is "which persistent root flags each subparser declares".
 **2. An empty `webServer.addr` is completed to `127.0.0.1` — on frpc and frps
 alike, and only the empty string.** Go's `ClientCommonConfig.Complete()` calls
 `c.WebServer.Complete()` (`pkg/config/v1/client.go:96`), which is
-`c.Addr = util.EmptyOr(c.Addr, "127.0.0.1")` (`pkg/config/v1/common.go:71-73`).
+`c.Addr = util.EmptyOr(c.Addr, "127.0.0.1")` (`pkg/config/v1/common.go:71-72`).
 frp-rs's serde field default only fires when the key is **absent**, so an explicit
 `addr = ""` survived and every dial became a lookup of the empty host. Measured
 with `[webServer] port = 7499` and the `addr` varied:

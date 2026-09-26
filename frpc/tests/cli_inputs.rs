@@ -26,7 +26,7 @@
 //!   ``Error: argument `-c` cannot be used multiple times in this context``.
 //! * **An empty `webServer.addr` is completed to `127.0.0.1`.** Go's
 //!   `WebServerConfig.Complete()` is `c.Addr = util.EmptyOr(c.Addr, "127.0.0.1")`
-//!   (`pkg/config/v1/common.go:71-73`), reached from
+//!   (`pkg/config/v1/common.go:71-72`), reached from
 //!   `ClientCommonConfig.Complete()` (`pkg/config/v1/client.go:96`). frp-rs's
 //!   serde default only fired when the key was absent, so an explicit `addr = ""`
 //!   produced `connect :7499: failed to lookup address information …`.
@@ -609,7 +609,7 @@ fn dangling_last_config_flag_is_an_error_not_a_reuse() {
 // ── case 3: an empty `webServer.addr` is completed to 127.0.0.1 ─────────────
 
 /// Go fills an empty `[webServer] addr` with `127.0.0.1`
-/// (`WebServerConfig.Complete()`, `pkg/config/v1/common.go:71-73`, reached from
+/// (`WebServerConfig.Complete()`, `pkg/config/v1/common.go:71-72`, reached from
 /// `pkg/config/v1/client.go:96`). The proof is the dial: a listener bound on
 /// `127.0.0.1` sees the request, and the peer/`Host` name loopback.
 #[test]
