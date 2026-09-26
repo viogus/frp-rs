@@ -2889,13 +2889,18 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   both shapes the expectation itself stays hard-coded in the guard: it is the guard that must not
   take its expected count from the file it is checking.
   Done: each lane's expected count now has one home — a job-level `env:` block on `tests-unit` in
-  `.github/workflows/ci.yml` (`FRPS_CLI_TESTS: "9"`, `FRPC_TINY_CLI_TESTS: "11"`) — and the lane's
-  log grep and its `[ "$n" = ... ]` comparison read that same value, so the duplicate literals the
-  item measured (`[ "$n" = "9" ]`, `:277`, and `[ "$n" = "11" ]`, `:322`, 45 lines apart at the
-  base head `0658427`) are now one value per lane. The failure message names the guarded file and
-  the single value to move: `if frps/tests/cli_exit_codes.rs really gained or lost tests, move the
-  single env.FRPS_CLI_TESTS value on the tests-unit job in .github/workflows/ci.yml from 9 to 8`.
-  The expectation stays hard-coded and is never derived from the file the lane checks — the mutants
+  `.github/workflows/ci.yml` (`FRPS_CLI_TESTS: "9"`, `FRPC_TINY_CLI_TESTS: "11"`) — and both of the
+  lane's count assertions (the log grep and the `[ "$n" = ... ]` comparison) read that same value,
+  so the duplicate literals the item measured (`[ "$n" = "9" ]`, `:277`, and `[ "$n" = "11" ]`,
+  `:322`, 45 lines apart at the base head `0658427`) are now one value per lane. A malformed or
+  missing value is rejected before cargo runs (`…must be a non-negative integer (got '')`), and the
+  failure text is direction-aware: it prints the three counts distinctly (`env=…, file=…, log=…`)
+  and names the single value to move only when the log's summary count and the `-- --list` count
+  agree and the file lists **more** tests than the value (`…lists 10 tests, env.FRPS_CLI_TESTS is 9:
+  move the single env.FRPS_CLI_TESTS value … from 9 to 10`); a **decrease** says so and sends the
+  reader back to the tests instead of down to the value (`…lists 8 tests, env.FRPS_CLI_TESTS is 9 —
+  the listed count DECREASED: if you deleted tests, restore them; do not lower this value`). The
+  expectation stays hard-coded and is never derived from the file the lane checks — the mutants
   below are what show a deleted test cannot ride along with its expectation. Shape chosen over the
   meta-test: it removes the second site instead of adding a third artefact that must itself be kept
   in sync, and the value the guard reads is the value the message names.
@@ -2907,22 +2912,28 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   (#381, `57d9f4b` — the only post-`79478ca` commit that touched `ci.yml`; #382/#383/#384 touched
   neither `ci.yml` nor either guarded file).
   Mutants, each run by extracting the step's `run:` block and executing it against the real cargo
-  commands in a scratch copy of the tree (both lanes pass with the committed values: `frps CLI
-  exit-code guard ok: 9 tests listed (expected 9)` and `frpc tiny CLI exit-code guard ok: 11 tests
-  listed (expected 11)`): `FRPS_CLI_TESTS=10` → rc 1, `status=1, listed=9, expected=10`;
-  `FRPS_CLI_TESTS` unset → rc 1 (fails closed); one test deleted from `frps/tests/cli_exit_codes.rs`
-  → rc 1, `listed=8`, message to move 9 → 8; one test appended → rc 1, `listed=10`, 9 → 10;
-  `FRPC_TINY_CLI_TESTS=10` on the tiny lane → rc 1.
+  commands (both lanes pass with the committed values: `frps CLI exit-code guard ok: 9 tests listed
+  (expected 9)` and `frpc tiny CLI exit-code guard ok: 11 tests listed (expected 11)`; the two
+  source mutants in a scratch copy of the tree, restored afterwards): `FRPS_CLI_TESTS=10` → rc 1
+  (`env=10, file=9, log=9`, DECREASED); `FRPS_CLI_TESTS=8` → rc 1 (`from 8 to 9`); `FRPS_CLI_TESTS`
+  unset → rc 1; empty → rc 1; `"9 "` / `" 9"` → rc 1; `"*"` → rc 1; a typo'd key → rc 1; only the
+  other lane's variable set → rc 1 (every malformed/unset shape exits at the integer check, before
+  cargo); one test deleted from `frps/tests/cli_exit_codes.rs` → rc 1 with `env=9, file=8, log=8`
+  and the DECREASED text; one test appended → rc 1 with `from 9 to 10`; `FRPC_TINY_CLI_TESTS=12` /
+  `=10` → rc 1 with the same two directions.
   Stale comments: `ci.yml`'s `frpc/tests/admin_cli.rs` "(14 tests)" is now **25**
   (`cargo test -p frpc --test admin_cli -- --list`; the file carries 25 `#[test]` attributes and no
-  lane counts it, so the corrected figure is marked a snapshot). The item's other stale comment —
-  `ci.yml:300`'s `4`, the frps count quoted inside the `tiny` lane's "Same three checks as the step
-  above" — had already been rewritten to `9`/`11` by `57d9f4b`; this change drops the restated
-  per-lane counts from both steps' prose (each now points at its own `env.*` value), so the count is
-  written once per lane rather than in the gate twice plus the surrounding prose. Left alone
-  deliberately: the 14-era point-in-time measurements (`ci.yml`'s "9 of the 14 fail", "8 unit
-  tests ... + 14 spawn-based tests") describe the runs they measured; re-measuring their wall time
-  was not this item's scope.
+  lane counts it, so the corrected figure is marked a snapshot — both reviewers judged that marking
+  sufficient and declined a follow-up item). The same paragraph cited
+  `frpc/tests/admin_cli.rs:228` for the `unknown field` stdout assertion; `:228` is `fn exit_code`,
+  and the first of the four such assertions is at `:253` (also `:285`, `:496`, `:638`), which is
+  what the citation now says. The item's other stale comment — `ci.yml:300`'s `4`, the frps count
+  quoted inside the `tiny` lane's "Same three checks as the step above" — had already been
+  rewritten to `9`/`11` by `57d9f4b`; this change drops the restated per-lane counts from both
+  steps' prose (each now points at its own `env.*` value), so the count is written once per lane
+  rather than in the gate twice plus the surrounding prose. Left alone deliberately: the 14-era
+  point-in-time measurements (`ci.yml`'s "9 of the 14 fail", "8 unit tests ... + 14 spawn-based
+  tests") describe the runs they measured; re-measuring their wall time was not this item's scope.
 
 ---
 

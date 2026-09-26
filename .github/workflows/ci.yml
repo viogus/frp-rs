@@ -106,11 +106,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     # The two guarded test counts, one value each. The lane that owns a value
-    # reads it twice — in the `test result: ok. N passed; 0 failed` grep over
-    # the captured log, and against the `n` counted from `-- --list` — so a test
-    # added to (or removed from) a guarded file moves exactly one literal here.
-    # The values stay hard-coded: a count derived from the file a lane checks
-    # would stay green if that file's tests were removed altogether.
+    # reads it in both of its count assertions — the `test result: ok. N passed;
+    # 0 failed` grep over the captured log, and the `[ "$n" = ... ]` comparison
+    # against the count from `-- --list` — and prints it in its own status lines,
+    # so a test added to (or removed from) a guarded file moves exactly one
+    # literal here. The values stay hard-coded: a count derived from the file a
+    # lane checks would stay green if that file's tests were removed altogether.
     env:
       # frps/tests/cli_exit_codes.rs — "Run frps CLI tests (config-failure exit codes)"
       FRPS_CLI_TESTS: "9"
@@ -209,9 +210,10 @@ jobs:
         # takes two shapes: the two `*_port_zero_*` tests compare stdout exactly
         # (`assert_eq!(stdout.trim_end(), GO_NO_PORT_MSG)`), while the
         # load-error tests check a stdout substring
-        # (`stdout.contains("unknown field \"notAKnownFrpKey\"")`, e.g.
-        # `frpc/tests/admin_cli.rs:228`) plus a stderr check that no `connect`
-        # was attempted. Pre-fix those fail with empty stdout and stderr
+        # (`stdout_of(&out).contains("unknown field \"notAKnownFrpKey\"")`, e.g.
+        # `frpc/tests/admin_cli.rs:253`; also `:285`, `:496`, `:638`) plus a
+        # stderr check that no `connect` was attempted. Pre-fix those fail with
+        # empty stdout and stderr
         # `reload failed: connect 127.0.0.1:7400: Connection refused (os error
         # 61)`. Measured against `main` @ `9c1b291`'s frpc, **9 of the 14 fail**
         # (5 passed; 9 failed), and 14/14 pass against this branch's binary.
@@ -261,6 +263,12 @@ jobs:
         # expected count is asserted from the test list itself, not only from
         # cargo's human-readable summary.
         #
+        # The failure text is direction-aware: it names the single value to move
+        # only when the log's summary count and the `-- --list` count agree and
+        # the file lists more tests than the value; a *decrease* says to restore
+        # the deleted tests instead of lowering the value. A malformed or missing
+        # value is rejected before cargo runs.
+        #
         # Colour — the one thing here with *runner* evidence. This job sets
         # `CARGO_TERM_COLOR: always`, and cargo colours its `Running tests/…`
         # line: the first runner run of this step failed on exactly that literal
@@ -283,17 +291,30 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
+          case "$FRPS_CLI_TESTS" in
+            ''|*[!0-9]*)
+              echo "::error::frps CLI exit-code guard: env.FRPS_CLI_TESTS must be a non-negative integer (got '$FRPS_CLI_TESTS')"
+              exit 1
+              ;;
+          esac
           log=/tmp/frps-cli-tests.log
           cargo test -p frps --test cli_exit_codes --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           n=$(cargo test -p frps --test cli_exit_codes --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          log_n=$(grep -E -o 'test result: ok\. [0-9]+ passed; 0 failed' "$log.plain" | head -1 | sed -E 's/^test result: ok\. ([0-9]+) passed; 0 failed$/\1/' || true)
           status=0
           grep -q "Running tests/cli_exit_codes.rs" "$log.plain" || status=1
           grep -q "test result: ok. $FRPS_CLI_TESTS passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "$FRPS_CLI_TESTS" ] || status=1
           if [ "$status" != "0" ]; then
-            echo "::error::frps CLI exit-code guard failed (status=$status, listed=$n, expected=$FRPS_CLI_TESTS)"
-            echo "::error::if frps/tests/cli_exit_codes.rs really gained or lost tests, move the single env.FRPS_CLI_TESTS value on the tests-unit job in .github/workflows/ci.yml from $FRPS_CLI_TESTS to $n"
+            echo "::error::frps CLI exit-code guard failed (status=$status, env=$FRPS_CLI_TESTS, file=$n, log=$log_n)"
+            if [ -n "$log_n" ] && [ "$log_n" = "$n" ] && [ "$n" != "$FRPS_CLI_TESTS" ]; then
+              if [ "$n" -gt "$FRPS_CLI_TESTS" ]; then
+                echo "::error::frps/tests/cli_exit_codes.rs lists $n tests, env.FRPS_CLI_TESTS is $FRPS_CLI_TESTS: move the single env.FRPS_CLI_TESTS value on the tests-unit job in .github/workflows/ci.yml from $FRPS_CLI_TESTS to $n"
+              else
+                echo "::error::frps/tests/cli_exit_codes.rs lists $n tests, env.FRPS_CLI_TESTS is $FRPS_CLI_TESTS — the listed count DECREASED: if you deleted tests, restore them; do not lower this value"
+              fi
+            fi
             cat "$log.plain"
             exit 1
           fi
@@ -332,17 +353,30 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
+          case "$FRPC_TINY_CLI_TESTS" in
+            ''|*[!0-9]*)
+              echo "::error::frpc tiny CLI exit-code guard: env.FRPC_TINY_CLI_TESTS must be a non-negative integer (got '$FRPC_TINY_CLI_TESTS')"
+              exit 1
+              ;;
+          esac
           log=/tmp/frpc-tiny-cli-tests.log
           cargo test -p frpc --no-default-features --features tiny --test cli_exit_codes --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           n=$(cargo test -p frpc --no-default-features --features tiny --test cli_exit_codes --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          log_n=$(grep -E -o 'test result: ok\. [0-9]+ passed; 0 failed' "$log.plain" | head -1 | sed -E 's/^test result: ok\. ([0-9]+) passed; 0 failed$/\1/' || true)
           status=0
           grep -q "Running tests/cli_exit_codes.rs" "$log.plain" || status=1
           grep -q "test result: ok. $FRPC_TINY_CLI_TESTS passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "$FRPC_TINY_CLI_TESTS" ] || status=1
           if [ "$status" != "0" ]; then
-            echo "::error::frpc tiny CLI exit-code guard failed (status=$status, listed=$n, expected=$FRPC_TINY_CLI_TESTS)"
-            echo "::error::if frpc/tests/cli_exit_codes.rs really gained or lost tests, move the single env.FRPC_TINY_CLI_TESTS value on the tests-unit job in .github/workflows/ci.yml from $FRPC_TINY_CLI_TESTS to $n"
+            echo "::error::frpc tiny CLI exit-code guard failed (status=$status, env=$FRPC_TINY_CLI_TESTS, file=$n, log=$log_n)"
+            if [ -n "$log_n" ] && [ "$log_n" = "$n" ] && [ "$n" != "$FRPC_TINY_CLI_TESTS" ]; then
+              if [ "$n" -gt "$FRPC_TINY_CLI_TESTS" ]; then
+                echo "::error::frpc/tests/cli_exit_codes.rs lists $n tests, env.FRPC_TINY_CLI_TESTS is $FRPC_TINY_CLI_TESTS: move the single env.FRPC_TINY_CLI_TESTS value on the tests-unit job in .github/workflows/ci.yml from $FRPC_TINY_CLI_TESTS to $n"
+              else
+                echo "::error::frpc/tests/cli_exit_codes.rs lists $n tests, env.FRPC_TINY_CLI_TESTS is $FRPC_TINY_CLI_TESTS — the listed count DECREASED: if you deleted tests, restore them; do not lower this value"
+              fi
+            fi
             cat "$log.plain"
             exit 1
           fi
