@@ -1026,11 +1026,29 @@ fn is_known_subcommand(s: &str) -> bool {
 /// `frpc --nodash status` are `unknown shorthand flag` / `unknown flag` on Go
 /// (so the token after the unknown flag was never a candidate).
 ///
-/// `--help`/`-h` deliberately **stays** a consumer here even though pflag
-/// registers it as a bool: cobra adds it in `execute`, i.e. *after* `Find`
-/// called `stripFlags`, so at stripping time it is an unknown flag and does
-/// consume. Measured, `frpc --help status` and `frpc -h status` print help
-/// (rc 0) on Go rather than resolving `status`, and frp-rs agrees.
+/// `--help`/`-h` deliberately **stays** a consumer here. pflag makes `help` a
+/// bool, so the tempting reading is "it carries `NoOptDefVal` and therefore does
+/// not consume" — that reading is **falsified**, and it is worth spelling out
+/// because a shallow probe cannot tell the two mechanisms apart. cobra
+/// registers the help flag in `execute` (`cobra-1.8.0/command.go:885`), which
+/// `ExecuteC` calls *after* `Find` (`:1090`) ran `stripFlags`; the only other
+/// registration site is `getCompletions` (`cobra-1.8.0/completions.go:304`),
+/// reached only by the hidden `__complete` command. So at stripping time `help`
+/// is an unknown flag, `hasNoOptDefVal` returns false, and it **does** consume
+/// the next token. Two measurements pin the mechanism, not just the outcome:
+///
+/// * `frpc --help status` prints the **root** help (`Usage: frpc [flags]`,
+///   listing `Available Commands`), not the `status` help a non-consuming flag
+///   would select — `frpc status --help` is `Overview of all proxies status` /
+///   `Usage: frpc status [flags]`;
+/// * `frpc --help notacommand` is rc **0** with that same root help. A
+///   non-consuming flag would leave `notacommand` as the first bare word, and
+///   Go's `legacyArgs` refuses a root-level bare word (`unknown command
+///   "notacommand" for "frpc"`, rc 1).
+///
+/// frp-rs must match both: exempting `--help` here would hoist `status` out of
+/// `--help status` and print the *status* help where Go prints the root's.
+/// `help_does_not_become_a_candidate` pins the decision.
 ///
 /// Getting the list wrong is **not** harmless in either direction, which the
 /// first version of this function got wrong by listing `--strict-config` as a
@@ -4293,6 +4311,47 @@ mod hoist_tests {
     /// **no** token is hoisted — in particular not the real command name that
     /// follows it. Measured on Go v0.71.0: `frpc --strict-config true status -c
     /// cfg` is rc 1 `unknown command "true" for "frpc"` and never dials.
+    /// `--help`/`-h` stays a consumer, measured rather than assumed: cobra
+    /// registers the help flag in `execute` (`cobra-1.8.0/command.go:885`),
+    /// after `Find` (`:1090`) ran `stripFlags`, so it is unknown at stripping
+    /// time. The argv below must therefore be left alone — hoisting `status`
+    /// would make frp-rs print the *status* help where Go prints the root's.
+    #[test]
+    fn help_does_not_become_a_candidate() {
+        for argv in [
+            vec!["--help", "status"],
+            vec!["-h", "status"],
+            vec!["--help", "notacommand"],
+            vec!["-h", "notacommand"],
+            vec!["--help", "tcp", "--local-port", "5"],
+            vec!["-c", "pA.toml", "--help", "status"],
+        ] {
+            assert_eq!(hoist(&argv), argv, "{argv:?} must not be rewritten");
+        }
+        // And the parse really is the root's: bpaf reports help on stdout with
+        // the root usage line, not a `status` subcommand usage.
+        let prepared =
+            prepared_cli_argv(&[OsString::from("--help"), OsString::from("status")], true);
+        assert_eq!(prepared.len(), 2, "no token may be hoisted");
+        let failure = frpc_parser()
+            .to_options()
+            .run_inner(&prepared[..])
+            .expect_err("--help is reported as a ParseFailure");
+        match failure {
+            bpaf::ParseFailure::Stdout(doc, _) => {
+                let text = doc.to_string();
+                // The root usage lists its command alternatives; a selected
+                // subcommand's help is a bare `Usage: COMMAND ...` with no
+                // alternation.
+                assert!(
+                    text.contains("(COMMAND ..."),
+                    "the ROOT usage must be printed, not the status command's:\n{text}"
+                );
+            }
+            other => panic!("expected help on stdout, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_word_after_bare_strict_config_is_the_first_bare_word() {
         for argv in [

@@ -28,21 +28,29 @@ User-facing release notes for frp-rs.
   `-c a.toml --strict-config=false status`, `--strict-config status -c a.toml`,
   `-c a.toml -c a.toml status`, `-c a.toml tcp --local-port …` and the
   `reload`/`stop`/`verify` equivalents. The already-supported order
-  `frpc <subcommand> [flags]` is unchanged.
+  `frpc <subcommand> [flags]` is unchanged. The bool rule's blast radius was
+  measured across every command: before this fix the over-consuming version
+  resolved the command after the bare flag on **all eight** single-proxy
+  commands and the three admin commands, so each of those eleven now follows
+  Go's refusal instead.
   Two boundaries follow Go exactly and are worth naming, because they are what
   distinguishes a flag **value** from the command word: `--strict-config` is a
   pflag *bool*, so it never consumes the token after it — a bare
   `--strict-config` immediately before a command word leaves that word as the
   command (`frpc --strict-config status -c frpc.toml` resolves `status` and
   dials, as Go does), whereas `frpc --strict-config true status -c frpc.toml`
-  refuses `true` as an unknown command on both binaries and does **not** run
-  `status`. Values are never mistaken for commands: a config file literally named
+  exits 1 on both binaries and runs neither `status` nor any other command: Go
+  refuses the word (`unknown command "true" for "frpc"`), frp-rs refuses it as
+  an unexpected positional, and the **outcome** — exit 1, no admin request, no
+  proxy dialled — is what matches; the message text is the pre-existing
+  output-shape item. Values are never mistaken for commands: a config file literally named
   `status` (`-c status`, `--config=status`, `-c=status`, `-cstatus`), a value
   after a real `--`, and a `--proxy-name status` all stay values, because the
   hoist skips the value of every value-taking flag. `frps` is untouched (Go's
-  `frps` has no subcommands to resolve), and a leading word that is not a command
-  is still refused — including a value-looking word such as `true` after a bare
-  bool flag, which Go refuses as `unknown command "true"`. The full
+  `frps` has no subcommands to resolve), and a non-command word in front of a
+  command still refuses the argv on both binaries — Go as `unknown command
+  "…" for "frpc"`, frp-rs as an unexpected-token error naming the token it could
+  not place. The full
   Go-vs-frp-rs table, including the `--strict-config <bool>` rows and the cases
   that remain divergent, is in `docs/developing.md` § CLI inputs.
 - **Bool flags now accept Go's `--flag=<bool>` spelling — ten flags on both

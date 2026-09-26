@@ -1447,10 +1447,19 @@ the flag's pflag registration carries a `NoOptDefVal`**, which every bool has
 `--strict-config`/`--strict_config` (`:53`,
 `BoolVarP(&strictConfigMode, "strict_config", "", true, …)`); the three
 value-taking root flags (`:50-51,55`) and any flag cobra does not know consume.
-`--help`/`-h` is the counter-intuitive one: pflag makes it a bool, but cobra adds
-it in `execute` — *after* `Find` ran `stripFlags` — so at stripping time it is
-unknown and **does** consume (measured: `frpc --help status` prints help, rc 0,
-rather than resolving `status`).
+`--help`/`-h` is the counter-intuitive one and it is **not** exempt: pflag makes
+`help` a bool, but cobra registers it in `execute` (`cobra-1.8.0/command.go:885`),
+which `ExecuteC` calls *after* `Find` (`:1090`) ran `stripFlags` (the only other
+registration site is `getCompletions`, `cobra-1.8.0/completions.go:304`, reached
+only by `__complete`), so at stripping time it is unknown, `hasNoOptDefVal`
+returns false, and it **does** consume the next token. Two measurements
+discriminate the mechanism rather than just the outcome: `frpc --help status`
+prints the **root** help (`Usage: frpc [flags]` + `Available Commands`), not the
+`status` help a non-consuming flag would select (`frpc status --help` is
+`Overview of all proxies status`), and `frpc --help notacommand` is rc **0** with
+the same root help where a non-consuming flag would leave `notacommand` as the
+first bare word for `legacyArgs` to refuse. Exempting `--help` would therefore
+make frp-rs print the *status* help for `--help status`; it stays a consumer.
 
 The first version of this pass listed `--strict-config` as a consumer, and both
 directions were measured wrong. Over-consuming is not the safe direction: it
@@ -1465,7 +1474,8 @@ would have refused.
 | `--strict-config reload -c pA.toml` | rc 0, `reload success` | rc 1, `` `reload` is not expected `` | rc 0 |
 | `--strict-config verify -c missing.toml` | rc 1, `open …missing.toml: no such file or directory` (the verify branch runs) | rc 1, `` `verify` is not expected `` | rc 1, the config-load error |
 | `--strict-config true status -c pA.toml`, `--strict-config false status -c pA.toml`, `--strict_config true stop -c pA.toml`, `--strict-config true reload -c pA.toml` | rc 1, ``unknown command "true"/"false" for "frpc"`` — the word is the first bare word and **no** command is resolved | rc 1 (a different refusal) | rc 1, no dial — the same outcome as Go |
-| `--strict-config true tcp … --server-port <free>` | rc 1, ``unknown command "true"``, nothing dialled | rc 1, same class | rc 1, nothing dialled |
+| `--strict-config true {tcp,udp,http,https,stcp,xtcp,sudp,tcpmux} … --server-port <free>` — **all eight single-proxy branches** | rc 1, ``unknown command "true"``, nothing dialled | rc 1, same class | rc 1, nothing dialled |
+| `--strict-config true {status,stop,reload} -c pA.toml` — the three admin commands | rc 1, ``unknown command "true"``, no admin request | rc 1, same class | rc 1, nothing dialled |
 | `--strict-config=true status -c pA.toml`, `--strict-config=false status -c pA.toml` | rc 0, dials it | rc 1, the refusal | rc 0, dials it (unchanged by this fix: the `=` form never consumed) |
 | `--strict-config=foo status -c pA.toml` | rc 1, pflag's `invalid argument "foo" for "--strict-config" flag: strconv.ParseBool: …` | rc 1, bpaf's message | rc 1, unchanged (message shape differs) |
 | `status --strict-config false -c pA.toml` (space form **after** the command) | rc 0, dials it (`false` is ignored as a positional) | rc 0, dials, prints the space-form warning | unchanged |
@@ -1481,6 +1491,17 @@ consumes `status` as the flag's value on **both** (rc 1, run mode, no dial);
 run-only frp-rs flags (`--log-level`, `--disable-log-color`) are treated as
 value-taking, which matches cobra's treatment of them as *unknown* flags
 (measured: `--disable-log-color status` is rc 1 on Go and here, no dial).
+
+**Blast radius of the direction-A bug, measured on all eleven commands.** R2's independent
+sweep first found the class wider than the `tcp` row above: every one of the eight single-proxy
+branches connected to the `--server-port` canary on the pre-fix head — `tcp`, `udp`, `http`,
+`https`, `stcp`, `xtcp`, `sudp`, `tcpmux`, each with its own required flags — and the three
+admin commands (`status`, `stop`, `reload`) returned rc 0 with a real request to the mock
+(`GET /api/status`, `POST /api/stop`, `POST /api/reload`). Re-measured here on Go / base /
+pre-fix head / fixed with one row per command (`/tmp/ledprobe/{go,base,oldhead,fixed}_sc8.jsonl`,
+11 rows each): all eleven rows have the pre-fix head differing from Go on (rc, dial), and the
+fixed head agrees with Go on all eleven. So the hole was "any command resolved from a word that
+followed the bare bool", not a `tcp`-specific one.
 
 **Not hoisted, deliberately.** A leading token that merely starts with a dash is
 never a candidate, and only the **first** bare word can be one: cobra's `Find`

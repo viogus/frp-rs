@@ -2576,7 +2576,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   names a known subcommand before bpaf runs, or restructure the parser) and pin the three rows
   against Go, or record the refusal as a deliberate divergence in `docs/developing.md` § CLI inputs.
   frp-rs's own `frpc <subcommand> [flags]` order keeps working either way.
-  **Done (2026-09-27, `9bff35e`; the classifier fix in the second commit of this PR).** Re-measured everything at this branch's base
+  **Done (2026-09-27, `9bff35e` plus the carrier pass on the same branch).** Re-measured everything at this branch's base
   (`5b9a084`; the item's `ec82a20` is four PRs stale) with the official
   `/private/tmp/frp_0.71.0_darwin_arm64` binaries and the frp-rs `frpc` built from the base and the
   head, over a 45-row table (one-shot mock admin on the config's `[webServer]` port, canary TCP
@@ -2644,9 +2644,13 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     (`FRPS_CLI_TESTS: "16"`, `FRPC_TINY_CLI_TESTS: "11"`) are unchanged and still match
     `-- --list`. `frpc/tests/cli_inputs.rs` went 21 tests at the base to 34 (13 new); with `BIN`
     re-pinned to the base binary the suite is **28 passed, 6 failed**, the six being exactly the
-    command-resolution tests, and with it pinned to the pre-fix head
-    `a_word_after_bare_strict_config_is_not_resolved_as_a_subcommand` fails while the
-    command-resolution tests pass — the two directions are pinned independently.
+    command-resolution tests, and with it pinned to the pre-fix head `86745d5` the suite is
+    **32 passed, 2 failed** — and the two failures are *both* direction tests,
+    `a_word_after_bare_strict_config_is_not_resolved_as_a_subcommand` (the regression the
+    over-consuming classifier introduced) and
+    `bare_strict_config_before_the_subcommand_still_resolves_it` (the mirror it left unfixed),
+    while the five command-resolution tests pass. Each direction is red on the revision that got
+    it wrong, independently.
   * **Gates at this head**: `cargo fmt --all -- --check` clean; `cargo clippy -p frp-core -p frps
     -p frpc --all-targets --all-features -- -D warnings` clean; `cargo test -p frp-core --lib`,
     `cargo test -p frps`, `cargo test -p frpc` pass; `bash scripts/repo-health.sh` rc 0;
