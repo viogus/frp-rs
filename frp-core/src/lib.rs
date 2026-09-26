@@ -213,17 +213,22 @@ use thiserror::Error;
 ///   flag at all.) See `docs/developing.md` § CLI exit codes.
 /// * `EXIT_AUTH`/3 — a service-*construction* failure whose text mentions
 ///   `token`/`auth`. Measured example: `auth.tokenSource` pointing at a missing
-///   file exits 3 on both binaries where Go exits 1. Not to be confused with the
-///   empty-token hardening refusal, where Go has no exit code to compare because
-///   it starts and runs the server. Whether to collapse 3 into 1 is tracked in
-///   `TODO.md`.
+///   file exits 3 on both binaries where Go exits 1. The test is a substring
+///   match over the whole formatted error (`logging::is_token_error`), which
+///   embeds config paths and URLs, so it is not a stable classification of the
+///   failure — see `docs/developing.md` § CLI exit codes. Not to be confused
+///   with the empty-token hardening refusal, where Go has no exit code to
+///   compare because it starts and runs the server. Whether to collapse 3 into 1
+///   is tracked in `TODO.md`.
 /// * `EXIT_BIND`/4 — despite the name, this is not specifically a bind error: it
 ///   is the fallback for **any** construction error whose text lacks
 ///   `token`/`auth` (the `init error` arms in `frpc`/`frps` `main.rs`). Measured
-///   example: `[store] path` pointing at a file that is not JSON exits 4 where
-///   Go exits 1. A real port conflict does *not* take this arm — frps on an
-///   occupied `bindPort` binds inside `service.run()` and exits 1, like Go.
-///   Tracked in `TODO.md`.
+///   example: an **`frpc`** config with `[store] path` pointing at a file that is
+///   not JSON exits 4 where Go exits 1. (It has to be the client: `[store]` is
+///   not a key Go's *frps* accepts — `json: unknown field "store"` — and frp-rs
+///   frps rejects it too, both rc 1.) A real port conflict does *not* take this
+///   arm — frps on an occupied `bindPort` binds inside `service.run()` and exits
+///   1, like Go. Tracked in `TODO.md`.
 pub const EXIT_RUNTIME: i32 = 1; // any CLI config/flag failure — Go's only failure code
 pub const EXIT_CONFIG: i32 = 2; // frp-rs extension: --config-dir refusal (Go exits 0 there)
 pub const EXIT_AUTH: i32 = 3; // frp-rs extension: construction error whose text says token/auth

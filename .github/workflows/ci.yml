@@ -228,7 +228,15 @@ jobs:
         #
         # Measured warm, macOS arm64: 2.47 s wall for the package (4 tests, the
         # SIGTERM positive control dominating). The runner was not measured.
-        run: cargo test -p frps
+        #
+        # Fail closed on the count: `cargo test` exits 0 when a `#[cfg]` or
+        # target change compiles the file to zero tests ("0 passed"), which
+        # would silently retire the pin. Proven with a mutation (`full` →
+        # `not(full)` in the file's crate-level cfg): the run printed
+        # `test result: ok. 0 passed` and exited 0, and this grep rejected it.
+        run: |
+          cargo test -p frps 2>&1 | tee /tmp/frps-cli-tests.log
+          grep -q "test result: ok. 4 passed" /tmp/frps-cli-tests.log
       - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
         # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag
         # exit-code fix has to hold in the no-default-features build too — but
@@ -241,7 +249,13 @@ jobs:
         #
         # Measured warm, macOS arm64: 1.00 s wall (9 tests — the 7 `full`-tier
         # assertions plus the 2 `tiny`-gated ones). The runner was not measured.
-        run: cargo test -p frpc --no-default-features --features tiny --test cli_exit_codes
+        #
+        # Fail closed on the count, for the same reason as the `frps` step
+        # above: this is the lane most exposed to a cfg change compiling the
+        # file to zero tests, and `cargo test` would still exit 0.
+        run: |
+          cargo test -p frpc --no-default-features --features tiny --test cli_exit_codes 2>&1 | tee /tmp/frpc-tiny-cli-tests.log
+          grep -q "test result: ok. 9 passed" /tmp/frpc-tiny-cli-tests.log
       - name: Run frp-client's tests with no features (runtime half of frp-client's tier gate)
         # The `verify` lane's `cargo check -p frp-client --no-default-features
         # --all-targets` is compile-only: it type-checks the test targets but

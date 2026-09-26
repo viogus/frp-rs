@@ -1686,6 +1686,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `EXIT_BIND` arm is not reached by a port conflict.
   * A rejected login is also not one: with `loginFailExit = true` it leaves through
     `service.run()` and exits **1** on both sides.
+  * **The 3-vs-4 choice is a substring match over the whole error text, so the same failure can
+    land on either code** — tracked separately in the item below; the two pins named above use
+    auth-free filenames and therefore cannot catch that flip.
   **Done-when:** either collapse the daemons' init-error arms to exit 1 like Go (and delete/keep
   `EXIT_AUTH`/`EXIT_BIND` accordingly, noting the empty-token hardening refusal that Go does not
   have), or state them as deliberate extensions in `docs/developing.md` § CLI exit codes with a
@@ -1704,6 +1707,27 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   **Done-when:** add `frps verify` mirroring `frpc verify` (Go's output shape, rc 0 good / 1 bad,
   honoring `--strict-config`) with CLI tests in the style of `frps/tests/cli_exit_codes.rs`, or
   record it as a deliberate surface reduction in the feature-surface policy. No sha.
+- [ ] **The `3`-vs-`4` exit code is chosen by a substring match on the formatted error, so the
+  *same* failure exits differently depending on a path or URL inside it.** `is_token_error`
+  (`frp-core/src/logging.rs:474`) is `msg.contains("token") || msg.contains("auth")`, and the
+  daemons call it on `e.to_string()` of a service-construction error
+  (`frpc/src/main.rs:583`, `frps/src/main.rs`'s init-error arm). The error text embeds the config
+  path and any URL from the config, so an unrelated substring decides the code. Measured with the
+  identical malformed-`[store]` config, changing only the file *name*:
+  * `[store] path = "/tmp/exitprobe3/authstore.json"` (file contains `this is not json`) →
+    frp-rs exits **3**, Go exits **1** (0.03 s).
+  * the same file content at `…/plainstore.json` → frp-rs exits **4**, Go exits **1** (0.02 s).
+  The mismatch is not the code: it is that frp-rs's own two runs disagree about the *same* failure
+  class. The same coupling applies to an OIDC discovery URL ending in `/authz` (3) versus `/zzz`
+  (4), per the adversarial review.
+  **Pinning gap, stated deliberately:** `frpc/tests/cli_exit_codes.rs::malformed_store_file_exits_4_where_go_exits_1`
+  uses `badstore.json` — an auth-free name — so it pins the 4 path and *cannot* catch this flip.
+  A test for the flip would have to assert both codes for one failure class, which would pin the
+  wrong behaviour rather than fix it.
+  **Done-when:** classify construction failures by error *kind* (e.g. a typed `AuthError` /
+  `ConfigError` at the construction boundary) instead of by substring, so the code cannot depend
+  on the text; then give 3 and 4 one measured input each, and either delete the substring helper
+  or document it as a heuristic with its false positives named. No sha.
 
 ---
 

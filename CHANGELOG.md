@@ -28,10 +28,10 @@ User-facing release notes for frp-rs.
   is gone and the paths now agree. (An invalid `--strict-config` value was
   already `1` at the base — only its message differs from Go's.) The unused
   `frp_core::Error::exit_code()` mapping was removed with it, and the remaining
-  `3`/`4` codes (service-construction failures: an unresolvable
-  `auth.tokenSource`, or a malformed `[store]` file — Go exits `1` on both) are
-  now documented as frp-rs extensions with no Go counterpart, tracked in
-  `TODO.md`.
+  `3`/`4` codes are now documented as frp-rs extensions with no Go counterpart,
+  tracked in `TODO.md` — for example, an unresolvable `auth.tokenSource`, or (on
+  the client) a malformed `[store]` file, each of which exits `1` in Go; the
+  examples are not an exhaustive list of what can reach them.
 - **`--config-dir` mode keeps its own refusal code — unchanged, and a
   divergence.** A directory that does not exist, is empty, or holds a config
   that fails to parse still exits **2** on the frp-rs side, where Go's own
