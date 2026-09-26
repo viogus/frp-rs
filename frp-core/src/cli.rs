@@ -8,6 +8,9 @@ use std::time::Duration;
 
 use bpaf::Parser;
 use bpaf::*;
+// `bpaf::*` re-exports the combinator functions but not this builder type, which
+// [`go_bool_named`] returns.
+use bpaf::parsers::NamedArg;
 
 /// Parse a bool flag value with Go `strconv.ParseBool` spellings.
 ///
@@ -134,6 +137,135 @@ fn strict_config_parser() -> impl Parser<bool> {
         .help(STRICT_CONFIG_SWITCH_HELP)
         .flag(true, true);
     construct!([strict_value, strict_switch])
+}
+
+/// The `NamedArg` behind both branches of [`go_bool_flag`]: one spelling list
+/// (hyphen name, the underscore alias frp-rs has always accepted, and an
+/// optional short) and one `help`, so the two branches cannot drift apart.
+fn go_bool_named(
+    name: &'static str,
+    alias: Option<&'static str>,
+    short: Option<char>,
+    help: &'static str,
+) -> NamedArg {
+    let mut named = long(name);
+    if let Some(alias) = alias {
+        named = named.long(alias);
+    }
+    if let Some(short) = short {
+        named = named.short(short);
+    }
+    named.help(help)
+}
+
+/// A Go-parity bool flag: the generalisation of [`strict_config_parser`] to
+/// every bool both binaries register.
+///
+/// Go registers these with pflag's bool machinery, which accepts three
+/// spellings of one flag: the bare `--flag` (sets `true`), `--flag=true` and
+/// `--flag=false`. The attached value goes through `strconv.ParseBool`
+/// ([`parse_go_bool`]), so `1`/`0`/`t`/`f`/`T`/`F`/`TRUE`/`FALSE`/`True`/
+/// `False` are accepted and anything else is
+/// `Error: invalid argument "…" for "--flag" flag: strconv.ParseBool: …`.
+/// A pflag bool **never consumes a following token**, so the space-separated
+/// `--flag <bool>` is not a value there.
+///
+/// bpaf's `.switch()` implements only the first of those three, which is why
+/// argv Go accepts exited 1 here with `` `<bool>` is not expected in this
+/// context `` (`TODO.md:1745`). This expands to the `=BOOL` spelling with Go's
+/// grammar, and deliberately does **not** add the space-separated form:
+/// `.adjacent()` makes the value branch accept only `--flag=<value>`, so
+/// `--flag <bool>` leaves the token unconsumed and is refused exactly as
+/// before. That keeps this change to the spellings Go accepts — see
+/// `docs/developing.md` § `--flag=<bool>` for the measured per-command Go
+/// behaviour of the space form, which is *not* uniform (`frps --tls-only
+/// false` is rc 1 `unknown command "false"`, while `frpc tcp --ue false` is
+/// accepted and the token ignored) and is therefore recorded per flag rather
+/// than papered over with a second extension.
+///
+/// The bare form keeps `.switch()`'s meaning: present → `true`, absent →
+/// `false`.
+///
+/// A macro rather than a function because bpaf's `help` wants `&'static str`
+/// and `concat!` is the only way to build the per-flag help while keeping the
+/// flag name in the rendered text *derived from the name the parser registers*
+/// — the help cannot end up naming a different flag.
+macro_rules! go_bool_flag {
+    ($name:literal, $alias:expr, $short:expr, $meaning:literal $(,)?) => {
+        go_bool_flag_impl!(
+            $name,
+            $alias,
+            $short,
+            concat!(
+                $meaning,
+                ". The Go-faithful value spelling is --",
+                $name,
+                "=<bool>"
+            ),
+            concat!($meaning, " (bare form = true)")
+        )
+    };
+}
+
+/// A flag frp-rs registers as a bool where **Go's flag of the same name is a
+/// string**, so the help must not claim a Go bool it does not have. Go's own
+/// grammar is wider and is measured in `docs/developing.md`; here only the
+/// bool-shaped values are honoured.
+macro_rules! go_bool_flag_go_string {
+    ($name:literal, $alias:expr, $short:expr, $meaning:literal $(,)?) => {
+        go_bool_flag_impl!(
+            $name,
+            $alias,
+            $short,
+            concat!(
+                $meaning,
+                ". frp-rs value spelling: --",
+                $name,
+                "=<bool>; Go's --",
+                $name,
+                " is a string flag and accepts any value there"
+            ),
+            concat!(
+                $meaning,
+                " (bare form = true); Go's --",
+                $name,
+                " is a string flag and consumes the next token"
+            )
+        )
+    };
+}
+
+/// An frp-rs-only bool flag: same parsing and value grammar, but Go registers
+/// no flag of this name, so the help must say so rather than claim parity.
+macro_rules! go_bool_flag_rs_only {
+    ($name:literal, $alias:expr, $short:expr, $meaning:literal $(,)?) => {
+        go_bool_flag_impl!(
+            $name,
+            $alias,
+            $short,
+            concat!(
+                $meaning,
+                ". --",
+                $name,
+                "=<bool> is an frp-rs extension: Go registers no --",
+                $name
+            ),
+            concat!($meaning, " (bare form = true)")
+        )
+    };
+}
+
+/// The one place the two branches are built; [`go_bool_flag`] and its two
+/// siblings differ only in the help they pass.
+macro_rules! go_bool_flag_impl {
+    ($name:literal, $alias:expr, $short:expr, $value_help:expr, $switch_help:expr $(,)?) => {{
+        let value = go_bool_named($name, $alias, $short, $value_help)
+            .argument::<String>("BOOL")
+            .adjacent()
+            .parse(parse_go_bool);
+        let switch = go_bool_named($name, $alias, $short, $switch_help).flag(true, false);
+        construct!([value, switch])
+    }};
 }
 
 /// Default of `--api-timeout`: Go frp v0.71.0's
@@ -490,7 +622,9 @@ fn svr_meta() -> impl Parser<SvrMeta> {
         .argument::<String>("DIR")
         .optional();
     let strict_config = strict_config_parser();
-    let show_version = long("version").short('v').switch();
+    // Go: `-v, --version  version of frps` (`frps --help`), a pflag bool, so
+    // `--version=false` starts the server there (measured, rc 124).
+    let show_version = go_bool_flag!("version", None, Some('v'), "Version of frps");
     construct!(SvrMeta {
         config,
         config_dir,
@@ -570,10 +704,24 @@ fn svr_dashboard() -> impl Parser<SvrDashboard> {
         .long("dashboard_tls_key_file")
         .argument::<String>("FILE")
         .optional();
-    let dashboard_tls_mode = long("dashboard-tls-mode")
-        .long("dashboard_tls_mode")
-        .switch();
-    let enable_prometheus = long("enable-prometheus").long("enable_prometheus").switch();
+    // Go's `--dashboard-tls-mode` is a **string** flag, not a bool: it accepts
+    // any value at parse time (`=auto`, `=bogus` and the empty string all start
+    // frps, rc 124) and its bare form consumes the next token (`frps
+    // --dashboard-tls-mode -c cfg` → `unknown command "cfg"`). frp-rs models
+    // the field as a bool, so only Go's bool-shaped spellings can be honoured
+    // here; the string residue is recorded in `docs/developing.md`.
+    let dashboard_tls_mode = go_bool_flag_go_string!(
+        "dashboard-tls-mode",
+        Some("dashboard_tls_mode"),
+        None,
+        "Enable dashboard TLS mode",
+    );
+    let enable_prometheus = go_bool_flag!(
+        "enable-prometheus",
+        Some("enable_prometheus"),
+        None,
+        "Enable prometheus dashboard",
+    );
     construct!(SvrDashboard {
         dashboard_addr,
         dashboard_port,
@@ -603,7 +751,12 @@ fn svr_log() -> impl Parser<SvrLog> {
         .long("log_format")
         .argument::<String>("FORMAT")
         .optional();
-    let disable_log_color = long("disable-log-color").long("disable_log_color").switch();
+    let disable_log_color = go_bool_flag!(
+        "disable-log-color",
+        Some("disable_log_color"),
+        None,
+        "Disable log color in console",
+    );
     construct!(SvrLog {
         log_file,
         log_level,
@@ -644,7 +797,7 @@ fn svr_transport() -> impl Parser<SvrTransport> {
         .long("max_ports_per_client")
         .argument::<u64>("N")
         .optional();
-    let tls_only = long("tls-only").long("tls_only").switch();
+    let tls_only = go_bool_flag!("tls-only", Some("tls_only"), None, "Frps TLS only");
     construct!(SvrTransport {
         kcp_bind_port,
         quic_bind_port,
@@ -948,7 +1101,7 @@ fn run_mode() -> impl Parser<FrpcRunArgs> {
                 .collect::<Vec<_>>()
         })
         .fallback(vec![]);
-    let show_version = long("version").short('v').switch();
+    let show_version = go_bool_flag!("version", None, Some('v'), "Version of frpc");
     let log_file = long("log-file")
         .long("log_file")
         .argument::<String>("FILE")
@@ -966,7 +1119,12 @@ fn run_mode() -> impl Parser<FrpcRunArgs> {
         .long("log_format")
         .argument::<String>("FORMAT")
         .optional();
-    let disable_log_color = long("disable-log-color").long("disable_log_color").switch();
+    let disable_log_color = go_bool_flag!(
+        "disable-log-color",
+        Some("disable_log_color"),
+        None,
+        "Disable log color in console",
+    );
     construct!(FrpcRunArgs {
         config,
         config_dir,
@@ -1006,8 +1164,23 @@ fn tcp_cmd() -> impl Parser<FrpcCmd> {
         .short('t')
         .argument::<String>("TOKEN")
         .optional();
-    let use_encryption = long("use-encryption").long("use_encryption").switch();
-    let use_compression = long("use-compression").long("use_compression").switch();
+    // Go registers this pair on `frpc tcp` under **different names**:
+    // `--uc` ("use compression") and `--ue` ("use encryption"), both pflag
+    // bools. frp-rs has always spelled them out; the names stay divergent (the
+    // short pair is not implemented at all), but the value grammar is Go's —
+    // measured, `frpc tcp --ue=false …` is accepted by Go and the proxy runs.
+    let use_encryption = go_bool_flag!(
+        "use-encryption",
+        Some("use_encryption"),
+        None,
+        "Use encryption",
+    );
+    let use_compression = go_bool_flag!(
+        "use-compression",
+        Some("use_compression"),
+        None,
+        "Use compression",
+    );
     let proxy_name = long("proxy-name")
         .long("proxy_name")
         .argument::<String>("NAME")
@@ -1399,7 +1572,12 @@ fn status_cmd() -> impl Parser<FrpcCmd> {
     // accepted and tolerates unknown fields — `status` inherits the persistent
     // rootCmd flag like the other admin subcommands.
     let strict_config = strict_config_parser();
-    let json = long("json").switch();
+    // frp-rs-only flag: Go's `frpc status` has no `--json` at all (measured,
+    // `Error: unknown flag: --json`, rc 1, for every spelling), so there is no
+    // Go behaviour to match. It goes through the shared parser so that every
+    // bool on the client answers `--flag=<bool>` uniformly; the value form is
+    // an frp-rs extension (recorded in `docs/developing.md`).
+    let json = go_bool_flag_rs_only!("json", None, None, "Output the status as JSON");
     let admin_addr = long("admin-addr")
         .long("admin_addr")
         .argument::<String>("IP")
@@ -1473,14 +1651,19 @@ fn stop_cmd() -> impl Parser<FrpcCmd> {
 }
 
 /// Compose all frpc subcommands + run-mode fallback.
+///
+/// The `--version` **exit is not here** — see [`parse_frpc_args`]. It used to
+/// be a closure on this branch, and bpaf's `ParseOrElse` evaluates every
+/// alternative on a forked state, so that closure ran during speculative
+/// branch exploration: measured at the base commit, `frpc --nope=1 --version`
+/// and `frpc verify --version` both printed `frpc 0.71.0 (Rust)` with exit 0
+/// (Go: rc 1 `unknown flag: --nope`, rc 0 with `verify` actually running),
+/// because the `println!`+`exit` fired before the leftover-token and
+/// branch-choice logic could run. Checking after `run()` returns is also what
+/// `frps` does ([`parse_frps_args`]) and what makes `--version=foo` a parse
+/// error instead of a version print.
 fn frpc_parser() -> impl Parser<FrpcCmd> {
-    let run = run_mode().map(|args| {
-        if args.show_version {
-            println!("frpc {} (Rust)", crate::VERSION);
-            std::process::exit(0);
-        }
-        FrpcCmd::Run(args)
-    });
+    let run = run_mode().map(FrpcCmd::Run);
 
     construct!([
         tcp_cmd(),
@@ -1511,6 +1694,18 @@ pub fn parse_frpc_args() -> FrpcCmd {
     // frp-rs space-separated extension, on every `frpc` parser (run, verify,
     // reload, status, stop).
     warn_if_strict_config_space_form_used(&argv);
+    // `--version` is acted on **after** the parse, not inside `frpc_parser()`
+    // (see that function): Go registers it as a persistent rootCmd bool and
+    // only the root command's `RunE` prints a version, so `-v`/`--version` must
+    // not short-circuit a parse that is going to fail. `--version=false` and
+    // `--version=0` therefore start the client, exactly as on Go (measured
+    // rc 124 there, bounded); `--version=foo` is the pflag value error (rc 1).
+    if let FrpcCmd::Run(args) = &args {
+        if args.show_version {
+            println!("frpc {} (Rust)", crate::VERSION);
+            std::process::exit(0);
+        }
+    }
     args
 }
 
@@ -1820,6 +2015,15 @@ mod tests {
         match frpc_parser().to_options().run_inner(args)? {
             FrpcCmd::Verify(a) => Ok(a),
             other => panic!("expected verify command, got {other:?}"),
+        }
+    }
+
+    /// `frpc tcp` — the only surface that carries the `--ue`/`--uc` pair on Go
+    /// and `--use-encryption`/`--use-compression` here.
+    fn parse_frpc_tcp(args: &[&str]) -> Result<TcpArgs, bpaf::ParseFailure> {
+        match frpc_parser().to_options().run_inner(args)? {
+            FrpcCmd::Tcp(a) => Ok(a),
+            other => panic!("expected tcp command, got {other:?}"),
         }
     }
 
@@ -2524,6 +2728,293 @@ mod tests {
         // returned — i.e. the successful-parse gate, not the scan, is what
         // keeps the warning honest.
         assert!(warned(&["frpc", "-c", "--strict-config", "false"]));
+    }
+
+    // ── `--flag=<bool>` on every Go-parity bool flag ──────────────────────
+    //
+    // Go registers these as pflag bools, which accept the bare `--flag`, and
+    // `--flag=true` / `--flag=false` parsed by `strconv.ParseBool`. bpaf's
+    // `.switch()` accepted only the bare form, so `frps --tls-only=false -c
+    // <valid config>` started on Go (rc 124 under a bounded runner) and exited
+    // 1 here (`TODO.md:1745`). The rows below are the parser half; the
+    // real-binary half is `frps/tests/cli_exit_codes.rs` and
+    // `frpc/tests/cli_exit_codes.rs`.
+
+    /// Every bool flag the two binaries register, as
+    /// `(site label, canonical long name, underscore alias)`.
+    ///
+    /// The list is the sweep's own answer to "how many are there" — ten flags
+    /// over four parser surfaces — and every row is exercised below, so a new
+    /// `.switch()` that is not routed through the shared parser has to be
+    /// added here too.
+    const GO_BOOL_SITES: [(&str, &str, Option<&str>); 10] = [
+        ("frps --tls-only", "--tls-only", Some("--tls_only")),
+        (
+            "frps --enable-prometheus",
+            "--enable-prometheus",
+            Some("--enable_prometheus"),
+        ),
+        (
+            "frps --disable-log-color",
+            "--disable-log-color",
+            Some("--disable_log_color"),
+        ),
+        (
+            "frps --dashboard-tls-mode",
+            "--dashboard-tls-mode",
+            Some("--dashboard_tls_mode"),
+        ),
+        ("frps --version", "--version", None),
+        (
+            "frpc --disable-log-color",
+            "--disable-log-color",
+            Some("--disable_log_color"),
+        ),
+        ("frpc --version", "--version", None),
+        (
+            "frpc tcp --use-encryption",
+            "--use-encryption",
+            Some("--use_encryption"),
+        ),
+        (
+            "frpc tcp --use-compression",
+            "--use-compression",
+            Some("--use_compression"),
+        ),
+        ("frpc status --json", "--json", None),
+    ];
+
+    /// Parse the flag under test on its own surface: the required positional
+    /// arguments of `frpc tcp`/`frpc status` are supplied, and the flag argv is
+    /// appended.
+    fn parse_site(site: &str, flag_argv: &[&str]) -> Result<bool, bpaf::ParseFailure> {
+        let base: &[&str] = match site {
+            "frpc tcp --use-encryption" | "frpc tcp --use-compression" => {
+                &["tcp", "--local-port", "1", "--remote-port", "2"]
+            }
+            "frpc status --json" => &["status"],
+            _ => &[],
+        };
+        let argv: Vec<&str> = base
+            .iter()
+            .copied()
+            .chain(flag_argv.iter().copied())
+            .collect();
+        match site {
+            "frps --tls-only" => parse_frps(&argv).map(|a| a.tls_only),
+            "frps --enable-prometheus" => parse_frps(&argv).map(|a| a.enable_prometheus),
+            "frps --disable-log-color" => parse_frps(&argv).map(|a| a.disable_log_color),
+            "frps --dashboard-tls-mode" => parse_frps(&argv).map(|a| a.dashboard_tls_mode),
+            "frps --version" => parse_frps(&argv).map(|a| a.show_version),
+            "frpc --disable-log-color" => parse_frpc_run(&argv).map(|a| a.disable_log_color),
+            "frpc --version" => parse_frpc_run(&argv).map(|a| a.show_version),
+            "frpc tcp --use-encryption" => parse_frpc_tcp(&argv).map(|a| a.use_encryption),
+            "frpc tcp --use-compression" => parse_frpc_tcp(&argv).map(|a| a.use_compression),
+            "frpc status --json" => parse_frpc_status(&argv).map(|a| a.json),
+            other => panic!("unknown site {other}"),
+        }
+    }
+
+    #[test]
+    fn every_go_bool_flag_accepts_the_pflag_value_spellings() {
+        for (site, name, alias) in GO_BOOL_SITES {
+            // Absent keeps `.switch()`'s default — this change adds spellings,
+            // it does not move any default.
+            assert!(
+                !parse_site(site, &[]).unwrap(),
+                "{site}: absent must stay false"
+            );
+            // Bare = true on every site (Go's pflag bool).
+            assert!(parse_site(site, &[name]).unwrap(), "{site}: bare = true");
+            // Go's `strconv.ParseBool` true/false spellings, verbatim.
+            for value in ["true", "1", "t", "T", "TRUE", "True"] {
+                let arg = format!("{name}={value}");
+                assert!(
+                    parse_site(site, &[&arg]).unwrap(),
+                    "{site}: {arg} must parse as true"
+                );
+            }
+            for value in ["false", "0", "f", "F", "FALSE", "False"] {
+                let arg = format!("{name}={value}");
+                assert!(
+                    !parse_site(site, &[&arg]).unwrap(),
+                    "{site}: {arg} must parse as false"
+                );
+            }
+            // The underscore alias is the same pflag variable on Go and the
+            // same parser branch here, so it must take the same values.
+            if let Some(alias) = alias {
+                let t = format!("{alias}=TRUE");
+                let f = format!("{alias}=false");
+                assert!(parse_site(site, &[&t]).unwrap(), "{site}: {t}");
+                assert!(!parse_site(site, &[&f]).unwrap(), "{site}: {f}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_go_bool_flag_refuses_non_bool_values_and_the_space_form() {
+        for (site, name, _) in GO_BOOL_SITES {
+            // `--flag=foo` is Go's `invalid argument "foo" for "--flag" flag:
+            // strconv.ParseBool: …`, exit 1; here bpaf backtracks and reports
+            // the leftover value, which is the same message the switch sites
+            // produced before. Both must exit 1 — the rc is the contract, the
+            // message shape may differ.
+            let bad = format!("{name}=foo");
+            let err = parse_site(site, &[&bad])
+                .expect_err("a non-bool value must be refused")
+                .unwrap_stderr();
+            assert!(
+                err.contains("is not expected in this context"),
+                "{site}: {bad} must fail as a leftover token, got {err}"
+            );
+            // The empty attached value is a value Go also refuses
+            // (`strconv.ParseBool: parsing "": invalid syntax`).
+            let empty = format!("{name}=");
+            assert!(parse_site(site, &[&empty]).is_err(), "{site}: {empty}");
+            // The space-separated form is *not* consumed: `.adjacent()` keeps
+            // this byte-identical to the pre-change `.switch()` refusal, which
+            // is also what Go's root commands do with the stray token
+            // (`Error: unknown command "false" for "frps"`, rc 1). The
+            // per-command rows where Go does *not* refuse it are recorded in
+            // `docs/developing.md`, not silently matched here.
+            assert!(
+                parse_site(site, &[name, "false"]).is_err(),
+                "{site}: `{name} false` must stay refused (Go does not consume \
+                 the token either)"
+            );
+        }
+    }
+
+    #[test]
+    fn every_go_bool_flag_help_states_its_own_spelling() {
+        // `help` must name the spelling *of the flag it is attached to*, and
+        // the claim must match what Go actually registers. The expected lines
+        // are written out here as independent literals (not read back from the
+        // macro), so a deleted `.help()`, a help naming another flag, or a
+        // claim that Go has a bool where it has a string all fail.
+        let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help_of = |site: &str| -> String {
+            let argv: Vec<&str> = match site {
+                "frps" => vec!["--help"],
+                "frpc" => vec!["--help"],
+                "frpc tcp" => vec!["tcp", "--help"],
+                "frpc status" => vec!["status", "--help"],
+                other => panic!("unknown surface {other}"),
+            };
+            let failure = if site == "frps" {
+                frps_args().to_options().run_inner(&argv[..]).map(|_| ())
+            } else {
+                frpc_parser().to_options().run_inner(&argv[..]).map(|_| ())
+            }
+            .expect_err("--help is reported as a ParseFailure");
+            squash(&failure.unwrap_stdout())
+        };
+
+        // (surface, long name, meaning, how the value entry must describe Go)
+        let rows: [(&str, &str, &str, &str); 10] = [
+            ("frps", "--tls-only", "Frps TLS only", "go-bool"),
+            (
+                "frps",
+                "--enable-prometheus",
+                "Enable prometheus dashboard",
+                "go-bool",
+            ),
+            (
+                "frps",
+                "--disable-log-color",
+                "Disable log color in console",
+                "go-bool",
+            ),
+            (
+                "frps",
+                "--dashboard-tls-mode",
+                "Enable dashboard TLS mode",
+                "go-string",
+            ),
+            ("frps", "--version", "Version of frps", "go-bool"),
+            (
+                "frpc",
+                "--disable-log-color",
+                "Disable log color in console",
+                "go-bool",
+            ),
+            ("frpc", "--version", "Version of frpc", "go-bool"),
+            ("frpc tcp", "--use-encryption", "Use encryption", "go-bool"),
+            (
+                "frpc tcp",
+                "--use-compression",
+                "Use compression",
+                "go-bool",
+            ),
+            (
+                "frpc status",
+                "--json",
+                "Output the status as JSON",
+                "rs-only",
+            ),
+        ];
+
+        for (surface, name, meaning, claim) in rows {
+            let help = help_of(surface);
+            let (value_help, switch_help) = match claim {
+                // Go registers a pflag bool under this name.
+                "go-bool" => (
+                    format!("{meaning}. The Go-faithful value spelling is {name}=<bool>"),
+                    format!("{meaning} (bare form = true)"),
+                ),
+                // Go registers the name, but as a *string* flag: the help must
+                // say so instead of implying a Go bool.
+                "go-string" => (
+                    format!(
+                        "{meaning}. frp-rs value spelling: {name}=<bool>; Go's {name} is a \
+                         string flag and accepts any value there"
+                    ),
+                    format!(
+                        "{meaning} (bare form = true); Go's {name} is a string flag and \
+                         consumes the next token"
+                    ),
+                ),
+                // Go has no flag of this name at all.
+                "rs-only" => (
+                    format!(
+                        "{meaning}. {name}=<bool> is an frp-rs extension: Go registers no {name}"
+                    ),
+                    format!("{meaning} (bare form = true)"),
+                ),
+                other => panic!("unknown claim {other}"),
+            };
+            assert!(
+                help.contains(&value_help),
+                "{surface} must render the {name}=BOOL entry: {value_help:?} not in {help}"
+            );
+            assert!(
+                help.contains(&switch_help),
+                "{surface} must render the {name} switch entry: {switch_help:?} not in {help}"
+            );
+            assert_ne!(value_help, switch_help);
+        }
+    }
+
+    #[test]
+    fn every_go_bool_flag_rejects_a_repeated_flag() {
+        // Recorded divergence, not a claim of parity: Go's pflag is last-wins
+        // (`frps --tls-only --tls-only=false` → rc 124, `… =false … --tls-only`
+        // → rc 124 too, measured), while every one of these flags refuses the
+        // second occurrence with rc 1 — the same repetition refusal
+        // `--strict-config` already has (`docs/developing.md`). Pinned so the
+        // behaviour cannot change silently in either direction.
+        for (site, name, _) in GO_BOOL_SITES {
+            let bare_then_false = [name, &format!("{name}=false")];
+            let false_then_bare = [&format!("{name}=false"), name];
+            for argv in [bare_then_false.as_slice(), false_then_bare.as_slice()] {
+                let result = parse_site(site, argv);
+                assert!(
+                    result.is_err(),
+                    "{site}: repeated {argv:?} must stay refused (Go is last-wins there)"
+                );
+            }
+        }
     }
 
     #[test]
