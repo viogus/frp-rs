@@ -690,8 +690,9 @@ fn child_ctx(ctx: Ctx, key: &str) -> Ctx {
 }
 
 /// Drop every key `check_strict` would reject, recursing through the same
-/// whitelists. Used for elements produced by the **legacy INI / legacy-section**
-/// collector: Go's legacy path ignores a key its typed struct does not name
+/// whitelists. Used for elements produced by the **legacy-shaped-section**
+/// collector (a top-level mapping carrying a `type`, in any config format):
+/// Go's legacy path ignores a key its typed struct does not name
 /// (`gopkg.in/ini` `MapTo` and the explicit field reads in
 /// `pkg/config/legacy/*.go`) rather than rejecting it, so refusing one there
 /// would fail a config Go loads.

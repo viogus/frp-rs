@@ -4405,25 +4405,24 @@ fn field_key_names(attrs: &[SerdeAttr], field: &str) -> Option<std::collections:
         return None;
     }
     let mut keys = std::collections::BTreeSet::new();
-    let serialized = attrs.iter().find(|a| a.name == "rename").map(|a| {
+    // Deserialization name: `rename = "…"` and `rename(deserialize = "…")`
+    // replace it; a `rename(serialize = "…")` **only** does not, because serde
+    // then still deserializes from the field name — measured with a probe struct
+    // (`{"inner":1}` parses, `{"out":1}` does not, for
+    // `#[serde(rename(serialize = "out"))] inner`), which is also serde's
+    // documented behaviour. Demanding `deserialize = …` there would fail the
+    // guard on a legitimate edit.
+    let renamed = attrs.iter().find(|a| a.name == "rename").map(|a| {
         if let Some(v) = &a.value {
-            v.clone()
+            Some(v.clone())
         } else {
-            let deserialize = a
-                .nested
+            a.nested
                 .iter()
                 .find(|n| n.name == "deserialize")
                 .and_then(|n| n.value.clone())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "`#[serde(rename(...))]` on field `{field}` has no \
-                         `deserialize = \"…\"`: the accepted key cannot be derived"
-                    )
-                });
-            deserialize
         }
     });
-    keys.insert(serialized.unwrap_or_else(|| field.to_string()));
+    keys.insert(renamed.flatten().unwrap_or_else(|| field.to_string()));
     for alias in attrs.iter().filter(|a| a.name == "alias") {
         keys.insert(
             alias
@@ -4435,14 +4434,19 @@ fn field_key_names(attrs: &[SerdeAttr], field: &str) -> Option<std::collections:
     Some(keys)
 }
 
-/// Extract the serde-accepted key set of `pub struct <name>` from a Rust
-/// source file: each field's `rename`/`rename(deserialize = …)` name (or the
-/// field name) plus every `alias`, skipping `skip`/`skip_deserializing` fields.
+/// Extract the serde-accepted key set of `struct <name>` from a Rust source
+/// file: each field's deserialization name (`rename = "…"` or
+/// `rename(deserialize = "…")`, else the field name) plus every `alias`,
+/// skipping `skip`/`skip_deserializing` fields. Any visibility is read
+/// (`pub`, `pub(crate)`, `pub(super)`, `pub(in path)`, or none at all).
 ///
 /// Panics when the struct is missing (the guard must not pass because it
 /// matched nothing) and on any serde attribute it does not model — `flatten`
 /// and `rename_all` above all, because they make the accepted set open-ended or
-/// rewrite every field spelling.
+/// rewrite every field spelling. Not covered, and stated in
+/// `docs/deployment.md`: a `#[cfg]`-gated field is read as if always present, so
+/// with the feature off the key lists accept a key the build's serde ignores
+/// (the safe direction — a missed typo, never a false 400).
 fn serde_keys_of_struct(src: &str, name: &str) -> std::collections::BTreeSet<String> {
     // Any visibility is accepted (`pub`, `pub(crate)`, `pub(super)`,
     // `pub(in …)`, or private): the declaration keyword carries no key
@@ -4490,17 +4494,29 @@ fn serde_keys_of_struct(src: &str, name: &str) -> std::collections::BTreeSet<Str
     let mut keys = std::collections::BTreeSet::new();
     let mut pending: Vec<SerdeAttr> = Vec::new();
     let mut i = 0usize;
+    // Only a position where a **field declaration** can start is tested, so an
+    // identifier inside a field's type (`HashMap<String, std::path::PathBuf>`,
+    // `dyn Iterator<Item: Clone>`) cannot be mistaken for a field. A boundary is
+    // the body start, the byte after a `,` at bracket depth 0, and the byte
+    // after an attribute or a comment **at depth 0** (comments inside a type
+    // must not open one). `depth` counts `<>`, `()`, `[]` so a `,` inside
+    // `HashMap<A, B>` does not open a boundary either.
+    let mut at_boundary = true;
+    let mut depth = 0i32;
     while i < body.len() {
         // Source in this crate carries non-ASCII (em dashes, arrows); every
         // slice below needs a char boundary and the scan advances byte-wise.
         if !body.is_char_boundary(i) {
             i += 1;
+            at_boundary = false;
             continue;
         }
         if body[i..].starts_with("//") {
             i += body[i..].find('\n').unwrap_or(body.len() - i);
+            at_boundary = depth == 0;
         } else if body[i..].starts_with("/*") {
             i += body[i..].find("*/").expect("block comment closes") + 2;
+            at_boundary = depth == 0;
         } else if body[i..].starts_with("#[") {
             let (text, next) = split_attribute(&body[i..]);
             if let Some(args) = text
@@ -4510,16 +4526,48 @@ fn serde_keys_of_struct(src: &str, name: &str) -> std::collections::BTreeSet<Str
                 pending.extend(parse_serde_args(args));
             }
             i += next;
+            at_boundary = depth == 0;
         } else {
+            let ch = body[i..].chars().next().expect("non-empty slice");
+            if ch.is_whitespace() {
+                // Whitespace between a boundary and the token it introduces must
+                // not close the boundary (fields and attributes are indented).
+                i += 1;
+                continue;
+            }
+            match ch {
+                ',' if depth == 0 => {
+                    at_boundary = true;
+                    i += 1;
+                    continue;
+                }
+                '<' | '(' | '[' => {
+                    depth += 1;
+                    at_boundary = false;
+                    i += 1;
+                    continue;
+                }
+                '>' | ')' | ']' => {
+                    depth = (depth - 1).max(0);
+                    at_boundary = false;
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
             match field_name_at(&body[i..]) {
-                Some((field, after)) => {
+                Some((field, after)) if at_boundary => {
                     if let Some(names) = field_key_names(&pending, &field) {
                         keys.extend(names);
                     }
                     pending.clear();
                     i += after;
+                    at_boundary = false; // inside the field's type now
                 }
-                None => i += 1,
+                _ => {
+                    at_boundary = false;
+                    i += 1;
+                }
             }
         }
     }
@@ -4585,31 +4633,47 @@ fn split_attribute(text: &str) -> (String, usize) {
 
 /// If a field declaration starts at `text`, return its name and the number of
 /// bytes it occupies up to (and including) the colon. Handles `pub`,
-/// `pub(crate)`, `pub(super)` and `pub(in path)` fields.
+/// `pub(crate)`, `pub(super)`, `pub(in path)` and a field with **no visibility
+/// modifier** (private or inherited) — the visibility carries no key
+/// information, and a private field with a serde `alias` is a real way for the
+/// lists to go stale (R2's `HealthCheckHttpHeader` mutant).
+///
+/// The colon must not be the first of a `::` path separator, so a type such as
+/// `std::path::PathBuf` cannot be read as a field named `std`.
 fn field_name_at(text: &str) -> Option<(String, usize)> {
-    let rest = text.strip_prefix("pub")?;
-    let mut consumed = 3usize;
-    let rest = if let Some(r) = rest.strip_prefix('(') {
-        let (_, after) = split_balanced_parens(r)?;
-        consumed += 1 + (r.len() - after.len());
-        after
-    } else {
-        rest
-    };
+    let mut consumed = 0usize;
+    let mut rest = text;
+    if let Some(after_pub) = rest.strip_prefix("pub") {
+        // `pub` only counts as a visibility when it is not the start of a
+        // longer identifier (`publish`), i.e. it is followed by `(` or space.
+        if !after_pub.starts_with(|c: char| c == '(' || c.is_whitespace()) {
+            return None;
+        }
+        consumed += 3;
+        rest = after_pub;
+        if let Some(r) = rest.trim_start().strip_prefix('(') {
+            let (_, after) = split_balanced_parens(r)?;
+            consumed += (rest.len() - rest.trim_start().len()) + 1 + (r.len() - after.len());
+            rest = after;
+        }
+    }
     let ws = rest.len() - rest.trim_start().len();
     consumed += ws;
-    let rest = rest.trim_start();
+    rest = rest.trim_start();
     let ident_len = rest
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .unwrap_or(rest.len());
     let ident = &rest[..ident_len];
-    if ident.is_empty() {
+    if ident.is_empty() || ident.starts_with(|c: char| c.is_ascii_digit()) {
         return None;
     }
     let after_ident = rest[ident_len..].trim_start();
     let colon = after_ident.strip_prefix(':')?;
+    if colon.starts_with(':') {
+        // `::` — a path segment, not a field declaration.
+        return None;
+    }
     consumed += ident_len + (rest[ident_len..].len() - after_ident.len()) + 1;
-    let _ = colon;
     Some((ident.to_string(), consumed))
 }
 
@@ -4811,6 +4875,40 @@ fn strict_key_extractor_refuses_unknown_attrs() {
 #[should_panic(expected = "not found in the source")]
 fn strict_key_extractor_refuses_missing_structs() {
     let _ = serde_keys_of_struct("pub struct Other { pub x: u8 }\n", "ProxyConfig");
+}
+
+/// A field with **no** visibility modifier still contributes its key. R2's
+/// mutant — `#[serde(default, alias = "driftPriv")] drift_priv: String` on
+/// `HealthCheckHeader` — compiles, is accepted by serde, and left the earlier
+/// scanner (which required a literal `pub`) passing while the binary refused the
+/// serde-accepted `driftPriv`: a green guard over a false 400.
+#[test]
+fn strict_key_extractor_reads_private_fields() {
+    let synthetic = "pub struct Priv {\n    #[serde(default, alias = \"driftPriv\")]\n    drift_priv: String,\n}\n";
+    let keys = serde_keys_of_struct(synthetic, "Priv");
+    let expected: std::collections::BTreeSet<String> = ["drift_priv", "driftPriv"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        keys, expected,
+        "a private field and its serde alias must be extracted"
+    );
+}
+
+/// `#[serde(rename(serialize = "…"))]` alone does **not** change the key serde
+/// deserializes from — the field name does (measured with a probe struct:
+/// `{{\"inner\":1}}` parses, `{{\"out\":1}}` does not, for
+/// `#[serde(rename(serialize = \"out\"))] inner`). The scanner must therefore use
+/// the field name rather than panicking or taking the serialized spelling.
+#[test]
+fn strict_key_extractor_uses_field_name_for_serialize_only_rename() {
+    let synthetic =
+        "pub struct SerOnly {\n    #[serde(rename(serialize = \"out\"))]\n    pub inner: u8,\n}\n";
+    let keys = serde_keys_of_struct(synthetic, "SerOnly");
+    let expected: std::collections::BTreeSet<String> =
+        ["inner"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(keys, expected);
 }
 #[test]
 fn test_strict_accepts_go_section_keys() {
@@ -5698,6 +5796,35 @@ fn strict_mode_rejects_unknown_health_check_header_via_both_spellings() {
             "[{spelling}] got: {err}"
         );
     }
+}
+
+/// The legacy `plugin_header_*` fold is gated on elements the **legacy
+/// collector** created, so it cannot widen the v1 surface. On a TOML
+/// `[[proxies]]` element the flat plugin spelling is an frp-rs extension Go
+/// rejects outright (v1's `plugin` is an object: `json: cannot unmarshal string
+/// into … plugin`), and the header key itself was dropped at the base commit and
+/// refused at the round-1 head — folding it there would silently start honouring
+/// a key that is not a v1 name. Measured three ways at the round-3 head:
+/// Go rc 1 (`cannot unmarshal string into … plugin`), frp-rs before
+/// `Config file … is valid` (key dropped), frp-rs now
+/// `unknown field "proxies[0].plugin.plugin_header_X-Foo"`. The legacy-shaped
+/// section form is covered (and its value asserted) by
+/// `legacy_ini_prefix_mechanisms_load_through_strict_mode`.
+#[test]
+fn toml_proxy_element_does_not_inherit_the_legacy_plugin_header_fold() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        b"serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[[proxies]]\nname = \"p\"\ntype = \"tcp\"\nremotePort = 7001\n\
+          plugin = \"https2http\"\nplugin_local_addr = \"127.0.0.1:80\"\nplugin_crt_path = \"a.crt\"\nplugin_key_path = \"a.key\"\nplugin_header_X-Foo = \"y\"\n",
+    )
+    .unwrap();
+    let err = load_client_config(f.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"proxies[0].plugin.plugin_header_X-Foo\""),
+        "the v1 element must not fold the legacy plugin header spelling; got: {err}"
+    );
 }
 
 /// Legacy INI range template with mismatched port counts is skipped (warn),

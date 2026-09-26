@@ -1302,7 +1302,7 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
         let _ = table.remove("log_way");
 
         // Normalize Go-format proxy sub-tables into flat fields
-        normalize_proxies(table);
+        normalize_proxies(table, &legacy_proxy_indices);
         normalize_visitors(table);
 
         // Legacy-collected elements keep Go's INI semantics: a key the typed
@@ -1446,7 +1446,15 @@ fn fold_prefixed_keys_into(st: &mut toml::Table, prefix: &str, target: &str) {
     }
 }
 
-/// Collect Go legacy INI proxy/visitor sections into `[proxies]`/`[visitors]`.
+/// Collect legacy-shaped proxy/visitor sections into `[proxies]`/`[visitors]`.
+///
+/// "Legacy-shaped" means a top-level mapping that carries a `type` key — the
+/// shape Go's legacy INI sections have. The check is by shape, not by file
+/// extension or format, because normalization only ever sees the parsed
+/// `toml::Value`; a `.toml`/`.json`/`.yaml` config can therefore use the same
+/// spelling, which is a pre-existing frp-rs extension (Go's v1 decoder rejects
+/// the section name outright). Recorded with its measurement in
+/// `docs/deployment.md`.
 ///
 /// Returns the indices of the elements it created, so the caller can run
 /// `strip_unknown_legacy_element_keys` over exactly those elements: Go's legacy
@@ -1637,7 +1645,14 @@ fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) -> (Vec<usize>, Ve
     (proxy_indices, visitor_indices)
 }
 
-fn normalize_proxies(table: &mut toml::Table) {
+/// Normalize Go-format proxy sub-tables onto each `proxies` element.
+///
+/// `legacy_indices` are the element indices `collect_legacy_ini_proxy_sections`
+/// created. They gate the folds that only Go's legacy INI path justifies (today
+/// `plugin_header_*`, which Go's conversion reads only for three plugin types);
+/// a `[[proxies]]` element written directly in TOML/YAML/JSON must keep the v1
+/// surface's behaviour, where those flat spellings are not Go names.
+fn normalize_proxies(table: &mut toml::Table, legacy_indices: &[usize]) {
     use toml::Value;
 
     let proxies = match table.get_mut("proxies") {
@@ -1645,7 +1660,8 @@ fn normalize_proxies(table: &mut toml::Table) {
         _ => return,
     };
 
-    for proxy_val in proxies.iter_mut() {
+    for (index, proxy_val) in proxies.iter_mut().enumerate() {
+        let is_legacy = legacy_indices.contains(&index);
         let proxy_table = match proxy_val.as_table_mut() {
             Some(t) => t,
             _ => continue,
@@ -1773,10 +1789,17 @@ fn normalize_proxies(table: &mut toml::Table) {
             // parameters, so only those three fold here. A `plugin_header_*` on
             // another type stays a plugin key: the legacy-IN I strip pass drops
             // it (Go ignores it), and a v1 `[[proxies]]` element refuses it.
-            let consumes_plugin_headers = matches!(
-                plugin_type.as_str(),
-                "http2https" | "https2http" | "https2https"
-            );
+            // Only for elements the legacy collector produced: Go's legacy
+            // conversion reads `plugin_header_*` for these three plugin types,
+            // but the flat plugin spelling is not part of the v1 TOML surface —
+            // on a `[[proxies]]` element Go rejects `plugin` itself as a string,
+            // and folding the headers there would silently *honour* a key that
+            // was previously dropped.
+            let consumes_plugin_headers = is_legacy
+                && matches!(
+                    plugin_type.as_str(),
+                    "http2https" | "https2http" | "https2https"
+                );
             let mut plugin_request_headers = toml::Table::new();
 
             let plugin_keys: Vec<String> = proxy_table
