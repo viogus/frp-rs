@@ -485,6 +485,15 @@ async fn run_normal(mut args: FrpcRunArgs) {
             });
         }
 
+        // Config-directory mode is a deliberate, measured divergence: Go frp
+        // v0.71.0 exits **0** here even when the directory does not exist, is
+        // empty, or holds a config that fails to parse (`frpc --config-dir
+        // <nonexistent|empty|bad>` → rc 0, the bad case printing only
+        // `frpc service error for config file [...]`). frp-rs keeps its
+        // pre-existing non-zero `EXIT_CONFIG` refusal rather than reporting a
+        // silent success for a config that was never loaded. Stated in
+        // `docs/developing.md` § CLI exit codes and pinned by
+        // `frpc/tests/cli_exit_codes.rs`; do not "fix" it to 0.
         let files = match collect_config_files(Path::new(dir)) {
             Ok(files) => files,
             Err(e) => {
@@ -554,7 +563,11 @@ async fn run_normal(mut args: FrpcRunArgs) {
         Err(e) => {
             init_logging(&args, None);
             tracing::error!(error = %e, "Failed to load config: {}", e);
-            process::exit(EXIT_CONFIG);
+            // Go frp v0.71.0: a `frpc -c <bad>` config failure is
+            // `fmt.Println(err); os.Exit(1)` (`cmd/frpc/sub/root.go`) — exit 1,
+            // not a per-class code. Measured against the Go binary; pinned by
+            // `frpc/tests/cli_exit_codes.rs`.
+            process::exit(EXIT_RUNTIME);
         }
     };
 
@@ -731,15 +744,16 @@ async fn run_verify(config_path: &str, strict_config: bool) {
     match load_client_config(config_path, strict_config) {
         Ok(cfg) => {
             // `load_client_config` only parses, so without this `verify` printed
-            // "is valid" (rc 0) for a config `frpc run` refuses with exit 3 —
-            // an oidc config in a build without the `oidc` feature. The helper
-            // is the same one the service construction uses, and is a no-op in
-            // an oidc build, so nothing changes there.
+            // "is valid" (rc 0) for a config `frpc run` refuses during service
+            // construction (an oidc config in a build without the `oidc`
+            // feature). The helper is the same one the service construction
+            // uses, and is a no-op in an oidc build, so nothing changes there.
             if let Err(e) =
                 frp_client::service::refuse_oidc_method_without_feature(cfg.auth.as_ref())
             {
                 eprintln!("Config file {} is invalid: {}", config_path, e);
-                process::exit(EXIT_CONFIG);
+                // Go v0.71.0 `frpc verify -c <bad>` exits 1 (`cmd/frpc/sub/verify.go`).
+                process::exit(EXIT_RUNTIME);
             }
             println!("Config file {} is valid", config_path);
             println!("  Server: {}:{}", cfg.server_addr, cfg.server_port);
@@ -748,7 +762,9 @@ async fn run_verify(config_path: &str, strict_config: bool) {
         }
         Err(e) => {
             eprintln!("Config file {} is invalid: {}", config_path, e);
-            process::exit(EXIT_CONFIG);
+            // Go v0.71.0 `frpc verify -c <bad>` exits 1; measured against the Go
+            // binary and pinned by `frpc/tests/cli_exit_codes.rs`.
+            process::exit(EXIT_RUNTIME);
         }
     }
 }

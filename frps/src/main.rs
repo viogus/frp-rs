@@ -106,6 +106,12 @@ async fn run(mut cli: FrpsArgs) {
     if let Some(ref dir) = cli.config_dir {
         init_logging(&cli, None);
 
+        // `--config-dir` itself is an frp-rs extension — Go frps v0.71.0 rejects
+        // it with `Error: unknown flag: --config-dir` and exit 1 — and the
+        // non-zero refusals below are a deliberate, measured divergence from
+        // Go's *client* directory mode, which exits 0 even for a missing or
+        // invalid directory. See `frpc/src/main.rs` and `docs/developing.md`
+        // § CLI exit codes; do not "fix" these to 0.
         let files = match collect_config_files(Path::new(dir)) {
             Ok(files) => files,
             Err(e) => {
@@ -170,7 +176,10 @@ async fn run(mut cli: FrpsArgs) {
         Err(e) => {
             init_logging(&cli, None);
             tracing::error!(error = %e, "Failed to load config: {}", e);
-            process::exit(frp_core::EXIT_CONFIG);
+            // Go frp v0.71.0: `frps -c <bad>` exits 1 (`cmd/frps/root.go`), same
+            // as the client. Measured against the Go binary; pinned by
+            // `frps/tests/cli_exit_codes.rs`.
+            process::exit(frp_core::EXIT_RUNTIME);
         }
     };
 

@@ -188,11 +188,51 @@ pub mod xtcp_p2p {
 use thiserror::Error;
 
 /// Exit codes for process termination.
-/// Mirrored in frps/frpc main.rs — keep in sync.
-pub const EXIT_RUNTIME: i32 = 1; // connection lost, I/O error, unexpected
-pub const EXIT_CONFIG: i32 = 2; // bad config file, unknown field, invalid value
-pub const EXIT_AUTH: i32 = 3; // bad token, OIDC failure
-pub const EXIT_BIND: i32 = 4; // port in use, permission denied
+///
+/// Go frp v0.71.0's CLI contract is two-valued on the config/flag-failure
+/// surface: exit 1 on failure, 0 on success. That was measured over that surface
+/// (unknown top-level key, missing file, directory instead of file, unparsable
+/// field, an invalid `--strict-config` value, the `reload`/`status`/`stop` admin
+/// subcommands, `verify`) and over a rejected login and a bind conflict. There
+/// is no per-class scheme in Go, and frp-rs has none either: every CLI config or
+/// flag failure on `frpc -c` / `frpc verify` / `frps -c` exits 1.
+///
+/// "0 or 1 only" would be too strong even for Go: `frps` on an oidc config with
+/// no issuer **panics** and its runtime exits 2, and `frps` with an empty token
+/// does not exit at all (it starts and keeps running — see `EXIT_AUTH` below).
+///
+/// `EXIT_RUNTIME` is the Go-faithful failure code. The other three are
+/// **frp-rs extensions with no Go counterpart**, each kept for a surface Go
+/// does not have or does not refuse:
+///
+/// * `EXIT_CONFIG`/2 — the `--config-dir` refusals (`frpc`/`frps` `main.rs`)
+///   and nothing else. Go's `frpc --config-dir` mode exits **0** even for a
+///   directory that does not exist, is empty, or holds a config that fails to
+///   parse, so strict parity here would mean exiting 0 on a config that was
+///   never loaded; frp-rs refuses instead. (Go `frps` has no `--config-dir`
+///   flag at all.) See `docs/developing.md` § CLI exit codes.
+/// * `EXIT_AUTH`/3 — a service-*construction* failure whose text mentions
+///   `token`/`auth`. Measured example: `auth.tokenSource` pointing at a missing
+///   file exits 3 on both binaries where Go exits 1. The test is a substring
+///   match over the whole formatted error (`logging::is_token_error`), which
+///   embeds config paths and URLs, so it is not a stable classification of the
+///   failure — see `docs/developing.md` § CLI exit codes. Not to be confused
+///   with the empty-token hardening refusal, where Go has no exit code to
+///   compare because it starts and runs the server. Whether to collapse 3 into 1
+///   is tracked in `TODO.md`.
+/// * `EXIT_BIND`/4 — despite the name, this is not specifically a bind error: it
+///   is the fallback for **any** construction error whose text lacks
+///   `token`/`auth` (the `init error` arms in `frpc`/`frps` `main.rs`). Measured
+///   example: an **`frpc`** config with `[store] path` pointing at a file that is
+///   not JSON exits 4 where Go exits 1. (It has to be the client: `[store]` is
+///   not a key Go's *frps* accepts — `json: unknown field "store"` — and frp-rs
+///   frps rejects it too, both rc 1.) A real port conflict does *not* take this
+///   arm — frps on an occupied `bindPort` binds inside `service.run()` and exits
+///   1, like Go. Tracked in `TODO.md`.
+pub const EXIT_RUNTIME: i32 = 1; // any CLI config/flag failure — Go's only failure code
+pub const EXIT_CONFIG: i32 = 2; // frp-rs extension: --config-dir refusal (Go exits 0 there)
+pub const EXIT_AUTH: i32 = 3; // frp-rs extension: construction error whose text says token/auth
+pub const EXIT_BIND: i32 = 4; // frp-rs extension: fallback for any other construction error
 
 // ── Sub-error types with structured context ──────────────────────────
 
@@ -378,23 +418,6 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
-}
-
-impl Error {
-    /// Map each error variant to a process exit code.
-    pub fn exit_code(&self) -> i32 {
-        match self {
-            Error::Config(_) => EXIT_CONFIG,
-            Error::Auth(_) => EXIT_AUTH,
-            Error::Io(e)
-                if e.kind() == std::io::ErrorKind::AddrInUse
-                    || e.kind() == std::io::ErrorKind::PermissionDenied =>
-            {
-                EXIT_BIND
-            }
-            _ => EXIT_RUNTIME,
-        }
-    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

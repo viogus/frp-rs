@@ -881,6 +881,140 @@ Proptest-based tests verify correctness under adversarial inputs:
 > a `#[cfg]`-disabled one — so their count and enablement are covered by the test
 > suite, not by the gate.
 
+### CLI exit codes (`frpc` / `frps`)
+
+The CLI contract is Go's **on the config/flag-failure surface**: exit 0 on
+success, exit 1 on a failure the command detects and reports through its own
+error path. The qualifiers are measured and listed below, not rhetorical — Go
+itself exits 2 when frps panics on an oidc config with no issuer, and it does not
+exit at all on a tokenless token config (it starts and runs), while frp-rs keeps
+three codes of its own (`2`/`3`/`4`): `2` only for a `--config-dir` refusal
+(a surface Go answers with 0, or has no flag for at all), and `3`/`4` for
+service-construction failures — including some like `auth.tokenSource` and
+`[store]` that Go *has* and refuses with 1, and some like the empty-token check
+that Go does not refuse at all. There is no per-class scheme to preserve, and
+`EXIT_CONFIG`/2 no longer covers a single-config or `verify` failure.
+
+Measured 2026-09-26 against Go frp **v0.71.0** (darwin/arm64) and the frp-rs
+`frpc`/`frps` binaries, with one unknown top-level key added to an otherwise
+valid config (plus the variations named):
+
+| command | Go v0.71.0 | frp-rs (now) |
+|---|---|---|
+| `frpc -c bad.toml` (unknown key) | 1 | 1 |
+| `frpc -c missing.toml` / `-c <dir>` / `-c badport.toml` | 1 | 1 |
+| `frpc --strict-config=foo -c good.toml` | 1 | 1 (message differs) |
+| `frpc verify -c bad.toml` (and missing / bad port) | 1 | 1 |
+| `frpc verify -c good.toml` | 0 | 0 |
+| `frpc reload\|status\|stop -c bad.toml` | 1 | 1 |
+| `frps -c badfrps.toml` (and missing / dir / bad port) | 1 | 1 |
+| `frpc` with `[auth] tokenSource` → a missing file | 1 (0.26 s) | **3** (0.25 s) — extension |
+| `frps` with `[auth] tokenSource` → a missing file | 1 (0.26 s) | **3** (0.25 s) — extension |
+| `frpc` with `[store] path` → a file that is not JSON | 1 (0.26 s) | **4** (0.25 s) — extension |
+| `frpc --config-dir <nonexistent\|empty\|bad>` | **0** | **2** (deliberate) |
+| `frpc --config-dir <good>`, service cannot run | 0 (0.026 s) | 0 (0.026 s) |
+| `frps --config-dir <…>` | 1 — `unknown flag: --config-dir` | 2 (extension flag) |
+| `frpc -c empty.toml` (defaults only, peer accepts and never answers) | 1 after 10.04 s | 1 after 30.07 s |
+| the same, with the port genuinely refusing | 1 after 0.026 s | 1 after 0.023 s |
+| `frps` on an occupied `bindPort`, `auth.token` set | 1 | 1 |
+
+The good-directory row is deliberately qualified: a directory whose service
+actually *runs* is long-running on both sides and has no natural exit code, so a
+`0` obtained by signalling a live process must never be recorded here. The `0`
+above is measured for the case where the service cannot run (the example config
+points at a closed port: both exit in 0.026 s, Go after
+`connect to server error`, frp-rs after `frpc service error for config file
+[...]`), and it is the only directory-mode `0` this table asserts. The same
+`--config-dir` shape pointed at a peer that accepts TCP and never answers also
+returns **0** on both sides, but slowly: re-measured with the directory's config
+dialling `127.0.0.1:7000` (macOS Control Center accepts and stays silent) →
+**Go 0 at 10.06 s, frp-rs 0 at 30.06 s**, twice each. Those are the same
+timeouts as the `empty.toml` row, not the ~0.03 s of the refused case.
+
+The `frpc -c empty.toml` rows exist because the durations are **peer-dependent,
+not a bound**. The default empty config dials `127.0.0.1:7000`; on the host these
+were measured on, macOS Control Center *accepts* that port and never speaks frp,
+so the timeout is what is being measured (10.04 s / 30.07 s, Go then frp-rs).
+With a port that genuinely refuses, the same shape returns in ~0.02 s on both
+sides. That case is a *runtime* stop, not a config-parse failure — the exit code
+is 1 on both sides, which is what the row is for.
+
+Some things this table does not say, each measured:
+
+- **Directory mode is a deliberate divergence, not an oversight.** Go's
+  `frpc --config-dir` returns **0** for a directory that does not exist, is
+  empty, *or holds a config that fails to parse* — the bad case prints only
+  `frpc service error for config file […]` and exits 0. A config that was never
+  loaded is not a success, so frp-rs keeps its pre-existing non-zero refusal
+  (`EXIT_CONFIG`/2) on that path. Go `frps` has no `--config-dir` flag at all
+  (`Error: unknown flag: --config-dir`, exit 1); frp-rs's is an extension.
+- **`EXIT_AUTH`/3 is an extension, and its documented example is
+  `auth.tokenSource`.** Worst measured case: a `tokenSource` whose file does not
+  exist exits **3** on both binaries, where Go exits **1** immediately
+  (`failed to resolve auth.tokenSource: failed to read file …`). A rejected
+  login is *not* an example: it leaves the client through `service.run()` and
+  exits **1**, matching Go.
+- **`EXIT_BIND`/4 is not specifically a bind error** — it is the daemons'
+  fallback for *any* service-construction error whose text lacks `token`/`auth`
+  (`frpc/src/main.rs`'s init-error arm). Measured input: **`frpc`** with
+  `[store] path` pointing at a file that is not JSON exits **4**, where Go exits
+  **1** (`failed to create store source: … failed to parse JSON: …`). It is an
+  frpc example on purpose: `[store]` is not a key Go's *frps* accepts
+  (`json: unknown field "store"`), and on frp-rs frps the same key is also an
+  unknown-field error, both rc 1. A real port conflict does *not* take this arm —
+  `frps` on an occupied `bindPort` returns 1 on both sides, because the listener
+  binds inside `service.run()`. Both codes are tracked in `TODO.md`;
+  `frpc/tests/cli_exit_codes.rs` pins the two measured inputs.
+- **Both codes 3 and 4 are picked by a substring match on the whole error text**
+  (`is_token_error` → `msg.contains("token") || msg.contains("auth")`,
+  `frp-core/src/logging.rs`), and that text embeds the config path and any URL
+  in it — so the *same* failure can land on different codes. Measured: the same
+  malformed-`[store]` failure exits **3** when the file is named
+  `authstore.json` and **4** when it is `plainstore.json`. The pins in
+  `frpc/tests/cli_exit_codes.rs` use an auth-free filename (`badstore.json`), so
+  they cannot catch that flip; the substring coupling is tracked in `TODO.md`.
+- **Three inputs where the two binaries disagree without a like-for-like exit
+  code** — one where frp-rs refuses and Go does not, one where Go crashes on a
+  code frp-rs handles, and one the other way round:
+  - `frps` with `[auth] method = "token"` and an empty `token`: frp-rs exits
+    **3** in ~0.01 s (`security misconfiguration: CRITICAL: [auth].token …
+    server would accept ALL connections`); Go **starts and keeps running**
+    (`frps started successfully`, still alive after 6 s), because it has no such
+    check. This is a hardening divergence, not the same failure with another
+    code — do not describe it as "Go exits 1 here". Go exits 1 on that config
+    only when the port is *held*, which is the occupied-`bindPort` row above.
+  - `frps -c <[auth] method = "oidc"` with no issuer>`: frp-rs refuses with
+    **3**; Go **panics** (`panic: Get "/.well-known/openid-configuration":
+    unsupported protocol scheme ""`) and its runtime exits **2** — a code frp-rs
+    uses only for a `--config-dir` refusal, never for a service-construction
+    failure. Go does exit here, so this bullet is *not* a
+    "refuses-where-Go-does-not" case. That panic is also why no blanket statement
+    like "Go only ever returns 0 or 1" belongs in this document.
+  - `frpc verify -c <config whose [[proxies]] block has an unknown key>`: frp-rs
+    reports `Config file … is valid` and exits **0** while Go exits **1**
+    (`decode proxy at index 0: … unknown field "notAKnownProxyKey"`). The
+    disagreement runs the *other* way — frp-rs accepts what Go refuses. Tracked
+    at `TODO.md:1168` (#375), not changed here.
+
+Tests that pin this — real binaries, no mocks:
+`frpc/tests/cli_exit_codes.rs` (`frpc -c <bad>` start, `verify -c <bad>`,
+`verify -c <missing>`, a `verify -c <good>` positive control, the directory-mode
+divergence for a missing / empty / invalid directory, the `tokenSource` → 3 case,
+the `[store]` → 4 case, and — under `--features tiny` — the same two assertions
+against `frpc-tiny`) and `frps/tests/cli_exit_codes.rs` (`frps -c <bad>`,
+`-c <missing>`, a starts-then-SIGTERM positive control, and the extension flag's
+refusal). The admin-subcommand refusals stay pinned by
+`frpc/tests/admin_cli.rs`. Executing lanes: `Run frpc CLI tests`, `Run frps CLI
+tests` and `Run frpc's CLI exit-code tests under tiny` in `.github/workflows/ci.yml`
+(the `frps` lane and the `tiny` lane were added with these tests — nothing ran a
+`cargo test` target of the `frps` package, or executed the `tiny` CLI binary,
+before them).
+
+Still divergent, and **not** covered by those tests: the *shape* of the output.
+Go prints one bare parse error to **stdout** and nothing else; the frp-rs daemon
+prints an ANSI-coloured `tracing` line on stdout, and `frpc verify` prints its
+message to **stderr** where Go uses stdout. Only the exit code is pinned.
+
 ### Repository Invariants (`repo-health.sh`)
 
 `bash scripts/repo-health.sh` mirrors the `health` CI job. On top of version
