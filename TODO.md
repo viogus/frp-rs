@@ -1764,10 +1764,15 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   pflag's bool machinery (`--flag`, `--flag=true`, `--flag=false`). The `--strict-config` item
   above solved exactly this shape for one flag by routing it through a shared bool-value parser
   (`strict_config_parser`), and its `=` spelling is Go-faithful because of that; the rule does not
-  generalise to any flag still on `.switch()`. frp-rs-only bool flags are outside this item — there
-  is no Go behaviour to match: `frpc tcp --use-encryption=false` is
-  `Error: unknown flag: --use-encryption`, rc 1 on Go (frp-rs has the flag, refuses the `=` spelling
-  for its own reason: ``Error: expected `--remote-port=PORT`, got `false` `` at the point probed).
+  generalise to any flag still on `.switch()`. The class also covers Go bool flags frp-rs does not
+  register at all: Go's `frpc tcp` spells this pair `--ue`/`--uc`, and Go **accepts** them
+  (`frpc tcp --ue=false -c <cfg>` → rc 1 `name should not be empty`, i.e. the flag parsed and the
+  failure is post-parse), where frp-rs implements neither and refuses the token
+  (``Error: expected `--local-port=PORT`, got `--ue` ``). `--use-encryption=false` itself has no Go
+  behaviour to match — Go answers `Error: unknown flag: --use-encryption`, rc 1 — while frp-rs has
+  the flag and refuses the `=` spelling for its own reason: ``Error: expected `--local-port=PORT`,
+  got `false` `` for exactly that argv (the message names `--remote-port` only once `--local-port`
+  has already been supplied).
   **Done-when:** **sweep** every bool flag on `frps`/`frpc` (the four measured above are examples,
   not the set), give each the `=value` spelling Go accepts (the shared value-parser shape, or a
   sweep over the switches), and pin one representative per binary end-to-end in the style of

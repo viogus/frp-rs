@@ -1331,10 +1331,15 @@ What the table says, precisely:
   — those four were probed, no sweep was done, and the class is "any bool flag
   registered as a bpaf `switch()` on either binary". The divergence runs the
   *opposite* way from this item (frp-rs refuses an argv Go accepts) and is
-  tracked as its own `TODO.md` item whose done-when *is* that sweep. frp-rs-only
-  bool flags are outside it: `frpc tcp --use-encryption=false` is
-  `Error: unknown flag: --use-encryption`, rc 1 on Go — there is no Go behaviour
-  to match (and frp-rs refuses it too, for its own reason).
+  tracked as its own `TODO.md` item whose done-when *is* that sweep. The class
+  also covers Go bool flags frp-rs does not register: Go's `frpc tcp` spells the
+  pair `--ue`/`--uc` and accepts them (`--ue=false` parses; the rc 1 is Go's
+  post-parse `name should not be empty`), while frp-rs implements neither and
+  refuses the token — the same direction as the rest of this paragraph.
+  `--use-encryption=false` is the long spelling, which Go does not register
+  (`Error: unknown flag: --use-encryption`, rc 1), so there is no Go behaviour to
+  match there, while frp-rs has the flag and refuses the `=` form for its own
+  reason.
 
 Why the extension is kept, as the measured trade the done-when asks for:
 
