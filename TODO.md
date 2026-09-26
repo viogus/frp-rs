@@ -1509,9 +1509,18 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     client-fixture end-to-end test (its 17 `tcp_port_*` proxies disappear) and the two range tests
     (`Proxies: 0`); with only the `role` dispatch reverted, the visitor test fails
     (`Proxies: 3 Visitors: 0`); with `deserialize_ini` replaced by `serde_json::from_value` for
-    `.ini`, the two fixture tests fail with the base errors. Re-measured after the review round:
-    the same three mutants fail the same way (3 / 1 / 2 tests). `scripts/compat-test.sh` was **not**
-    run: the diff is config-load only (no protocol, transport, encryption or proxy path) and the
+    `.ini`, the two fixture tests fail with the base errors. Re-measured after the review round,
+    together with three mutants for the review fixes themselves — all six single mutants fail, and
+    the tree is restored from git between runs: array arm reverted **3** (client fixture + the two
+    range tests), `role_is_visitor = false` **1** (visitor test), `.ini` back on the strict serde
+    path **2** (both fixtures), `round_trips` reduced to the TOML renderer **2**
+    (`ini_value_text_matches_inference`, `test_legacy_ini_values_are_read_by_target_type` — the
+    `10000000000000000000` / `0.0000001` rows), `canonicalize_legacy_ini_bools` called for every
+    format **1** (`test_legacy_ini_bool_scopes_are_ini_only` — which goes through the real file
+    loader, a gap the first version of that test had: it used the content helpers, which bypass the
+    gate, and M5 stayed green until the test was rewritten), and the inference back on `split(',')`
+    **1** (`test_legacy_ini_slice_values_use_go_strings_semantics`). `scripts/compat-test.sh` was
+    **not** run: the diff is config-load only (no protocol, transport, encryption or proxy path) and the
     script generates no `.ini` config at all, so it cannot reach the wire.
 
 

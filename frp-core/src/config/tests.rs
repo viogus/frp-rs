@@ -6074,8 +6074,10 @@ fn test_legacy_ini_slice_values_use_go_strings_semantics() {
 /// The server enforces these scopes (`frp-server/src/control/proxy.rs:418-425`),
 /// so applying the wider set in every format — as the first cut of this fix did
 /// through a format-agnostic `ini_truthy` — silently changed the meaning of a
-/// TOML/JSON/YAML config that base ignored. Those formats keep the strict
-/// boolean typing they always had.
+/// TOML/JSON/YAML config that base ignored. These rows go through the **real
+/// file loader** (`load_client_config`, which detects the format from the
+/// extension), not a test helper, so the format gate itself is pinned: with the
+/// gate removed the TOML/JSON/YAML rows flip to `["HeartBeats"]` and fail.
 #[test]
 fn test_legacy_ini_bool_scopes_are_ini_only() {
     fn scopes(cfg: &ClientConfig) -> Vec<String> {
@@ -6084,40 +6086,54 @@ fn test_legacy_ini_bool_scopes_are_ini_only() {
             .map(|a| a.additional_auth_scopes.clone())
             .unwrap_or_default()
     }
+    fn load(suffix: &str, body: &str) -> ClientConfig {
+        let mut f = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        f.flush().unwrap();
+        load_client_config(f.path().to_str().unwrap(), true).unwrap()
+    }
 
-    let ini = load_client_ini(
+    // `.ini`: Go's spellings apply.
+    let ini = load(
+        ".ini",
         "[common]\nserver_addr = 127.0.0.1\n\
          authenticate_heartbeats = 1\nauthenticate_new_work_conns = yes\n",
-    )
-    .unwrap();
+    );
     assert_eq!(scopes(&ini), ["HeartBeats", "NewWorkConns"]);
 
-    let toml = load_client_config_from_str(
-        "server_addr = \"127.0.0.1\"\nauthenticate_heartbeats = 1\nauthenticate_new_work_conns = \"yes\"\n",
-    )
-    .unwrap();
+    // The other formats: the same spellings stay ignored, exactly as at base.
+    let toml = load(
+        ".toml",
+        "server_addr = \"127.0.0.1\"\nauthenticate_heartbeats = 1\n\
+         authenticate_new_work_conns = \"yes\"\n",
+    );
     assert!(
         scopes(&toml).is_empty(),
         "a non-boolean spelling in TOML must stay ignored (base behaviour)"
     );
-    let json = load_client_config_from_json(
+    let json = load(
+        ".json",
         r#"{"serverAddr": "127.0.0.1", "authenticate_heartbeats": 1}"#,
-    )
-    .unwrap();
+    );
     assert!(scopes(&json).is_empty(), "JSON");
-    let yaml = load_client_config_from_yaml(
+    let yaml = load(
+        ".yaml",
         "server_addr: 127.0.0.1\nauthenticate_new_work_conns: \"yes\"\n",
-    )
-    .unwrap();
+    );
     assert!(scopes(&yaml).is_empty(), "YAML");
 
-    // The pre-existing *boolean* spelling maps in every format (frp-rs
+    // The pre-existing *boolean* spelling maps in every format (an frp-rs
     // extension; Go's v1 decoder refuses the key outside `.ini`).
-    let toml = load_client_config_from_str(
+    let toml = load(
+        ".toml",
         "server_addr = \"127.0.0.1\"\nauthenticate_heartbeats = true\n",
-    )
-    .unwrap();
+    );
     assert_eq!(scopes(&toml), ["HeartBeats"]);
+    let ini = load(
+        ".ini",
+        "[common]\nserver_addr = 127.0.0.1\nauthenticate_heartbeats = false\n",
+    );
+    assert!(scopes(&ini).is_empty());
 }
 
 /// The array spelling of the same port list — a TOML/JSON config may write the
