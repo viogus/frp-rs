@@ -2855,8 +2855,10 @@ fn web_server_addr_defaults_to_localhost() {
 /// Go frp v0.71.0 `ClientCommonConfig.Complete()` calls
 /// `c.WebServer.Complete()` (`pkg/config/v1/client.go:96`), and the client has
 /// no later step that re-defaults the address (the server's
-/// `pkg/config/v1/server.go:116-118` re-defaults a *set port* to `0.0.0.0`, and
-/// is a different surface). So on frpc an explicit `addr = ""` becomes
+/// `pkg/config/v1/server.go:116-117` re-defaults a *set port* to `0.0.0.0`, but
+/// that branch is dead for the same reason and is a different surface — see
+/// `server_web_server_addr_empty_is_completed_to_localhost`). So on frpc an
+/// explicit `addr = ""` becomes
 /// `127.0.0.1`. Measured on the Go v0.71.0 binary: with `[webServer] addr = ""`
 /// and `port = 7499`, `frpc status -c <cfg>` dials `127.0.0.1:7499`. Before this
 /// completion, frp-rs dialled `:7499` and failed with
@@ -5178,41 +5180,69 @@ fn test_server_bind_port_zero_maps_to_default_in_complete() {
     assert_eq!(cfg.bind_port, 7000);
 }
 
-/// The **server** side of the empty `webServer.addr` story is a recorded
-/// divergence, not parity — an earlier draft of the frpc-side change claimed
-/// otherwise. Go's `ServerConfig.Complete()` (`pkg/config/v1/server.go:101-120`)
-/// runs `WebServer.Complete()` → `Addr = util.EmptyOr(Addr, "127.0.0.1")`
-/// (`pkg/config/v1/common.go:71-73`) at `:107` and only then the
-/// `if Port > 0 { Addr = util.EmptyOr(Addr, "0.0.0.0") }` at `:116-118`, so the
-/// second branch can never fire and an empty `addr` stays loopback. Measured on
-/// Go v0.71.0 with `[webServer] addr = "" port = 7597` plus credentials: Go frps
-/// logs `dashboard listen on 127.0.0.1:7597` and listens there, while frp-rs
-/// logs `Dashboard listening on 0.0.0.0:7597` and listens on `*:7597`.
-///
-/// frp-core `ServerConfig::complete` reproduces only the second half. This test
-/// pins the *current* value so the divergence cannot be mistaken for parity in
-/// either direction: whoever implements the Go order must change this
-/// assertion deliberately, and the flip is then a recorded event rather than a
-/// silent one. The flip is tracked in `TODO.md`.
+/// The **server** side of the empty `webServer.addr` story, now Go parity. Go's
+/// `ServerConfig.Complete()` (`pkg/config/v1/server.go:101-126`) runs
+/// `WebServer.Complete()` → `Addr = util.EmptyOr(Addr, "127.0.0.1")`
+/// (`pkg/config/v1/common.go:71-72`) at `:107` and only then the
+/// `if Port > 0 { Addr = util.EmptyOr(Addr, "0.0.0.0") }` at `:116-117`, so that
+/// second branch is **dead** and an empty `addr` stays loopback. frp-core's
+/// `ServerConfig::complete` used to implement only the second half (an empty
+/// `addr` with a set port bound `*:<port>`); it now fills the empty string with
+/// `127.0.0.1` first and no longer has the `0.0.0.0` branch at all. Measured on
+/// Go v0.71.0 and frp-rs with `[webServer] addr = "" port = 7597` plus
+/// credentials: Go logs `dashboard listen on 127.0.0.1:7597`, frp-rs (before)
+/// logged `Dashboard listening on 0.0.0.0:7597`. The *bound address* is pinned
+/// by the spawn test `dashboard_explicit_empty_addr_binds_loopback_only` in
+/// `frp-server/tests/dashboard_integration.rs`; this test pins the completion
+/// that feeds it, and the passthrough of every non-empty value.
 #[test]
-fn server_web_server_addr_empty_stays_wildcard_a_recorded_divergence() {
+fn server_web_server_addr_empty_is_completed_to_localhost() {
+    // Explicit empty string, as `[webServer] addr = ""` deserializes, with a
+    // set port: the pre-fix code made this the wildcard.
     let mut cfg: ServerConfig =
         serde_json::from_value(serde_json::json!({ "bindPort": 7000 })).unwrap();
-    // Explicit empty string, as `[webServer] addr = ""` deserializes.
     cfg.web_server.addr = String::new();
     cfg.web_server.port = 7597;
     cfg.complete();
     assert_eq!(
-        cfg.web_server.addr, "0.0.0.0",
-        "current frp-rs behaviour: wildcard. Go v0.71.0 binds 127.0.0.1 here — \
-         see the doc comment; this is the divergence, not parity"
+        cfg.web_server.addr, "127.0.0.1",
+        "Go's WebServer.Complete() fills the empty string unconditionally, \
+         so the Port > 0 -> 0.0.0.0 branch it precedes is dead"
     );
 
-    // An ABSENT `addr` key is unaffected either way: the serde default already
-    // supplies 127.0.0.1, so the wildcard branch is skipped.
+    // Go's `WebServer.Complete()` does not look at the port, so an empty addr
+    // is filled the same way when the dashboard is disabled.
     let mut cfg: ServerConfig =
         serde_json::from_value(serde_json::json!({ "bindPort": 7000 })).unwrap();
-    cfg.web_server.port = 7597;
+    cfg.web_server.addr = String::new();
+    assert_eq!(cfg.web_server.port, 0);
+    cfg.complete();
+    assert_eq!(cfg.web_server.addr, "127.0.0.1");
+
+    // Every explicit non-empty address is used verbatim — including the
+    // wildcard, which the deleted branch used to be able to overwrite.
+    for addr in ["0.0.0.0", "::1", "10.1.2.3"] {
+        let mut cfg: ServerConfig = serde_json::from_value(
+            serde_json::json!({ "bindPort": 7000, "webServer": { "addr": addr, "port": 7597 } }),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.web_server.addr, addr,
+            "deserialization must not rewrite it"
+        );
+        cfg.complete();
+        assert_eq!(
+            cfg.web_server.addr, addr,
+            "addr = {addr:?} must pass through"
+        );
+    }
+
+    // An ABSENT `addr` key: the serde default already supplies 127.0.0.1, so
+    // the completion never sees an empty string (parity before and after).
+    let mut cfg: ServerConfig = serde_json::from_value(
+        serde_json::json!({ "bindPort": 7000, "webServer": { "port": 7597 } }),
+    )
+    .unwrap();
     assert_eq!(cfg.web_server.addr, "127.0.0.1", "serde default");
     cfg.complete();
     assert_eq!(cfg.web_server.addr, "127.0.0.1");

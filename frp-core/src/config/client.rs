@@ -429,22 +429,22 @@ impl ClientConfig {
         // Go frp v0.71.0 `ClientCommonConfig.Complete()` calls
         // `c.WebServer.Complete()` (`pkg/config/v1/client.go:96`), which is
         // `c.Addr = util.EmptyOr(c.Addr, "127.0.0.1")`
-        // (`pkg/config/v1/common.go:71-73`). `EmptyOr` fills on the **empty
+        // (`pkg/config/v1/common.go:71-72`). `EmptyOr` fills on the **empty
         // string**, so an explicit `addr = ""` becomes `127.0.0.1` there, and
         // the client has no later step that re-defaults the address.
         //
-        // The server is NOT the same shape, and does not mirror Go. Go's
-        // `ServerConfig.Complete()` (`pkg/config/v1/server.go:101-120`) runs the
-        // same `WebServer.Complete()` at `:107` and only then the
-        // `if Port > 0 { Addr = EmptyOr(Addr, "0.0.0.0") }` at `:116-118`, so
-        // that branch can never fire and an empty `addr` with a set port stays
-        // loopback. frp-core's `ServerConfig::complete`
-        // (`frp-core/src/config/server.rs`) implements **only the second half**,
-        // so an empty server `webServer.addr` binds `*:<port>` where Go binds
-        // `127.0.0.1:<port>` — a recorded server-side divergence, pinned by
-        // `server_web_server_addr_empty_stays_wildcard_a_recorded_divergence`
-        // in `frp-core/src/config/tests.rs` and tracked in `TODO.md`. It is
-        // deliberately unchanged here: this item is frpc-scoped.
+        // The server has the same Go shape and now mirrors it too:
+        // `ServerConfig::complete` (`frp-core/src/config/server.rs`) fills the
+        // empty string with `127.0.0.1` first and has **no** `Port > 0 ->
+        // "0.0.0.0"` step, because Go's branch for that
+        // (`pkg/config/v1/server.go:116-117`) is unreachable once
+        // `WebServer.Complete()` has run at `:107`. So an explicit empty server
+        // `webServer.addr` binds `127.0.0.1:<port>` on both implementations;
+        // it bound `*:<port>` here before, and that server-side divergence is
+        // now closed — the bound address is pinned by
+        // `dashboard_explicit_empty_addr_binds_loopback_only` and
+        // `dashboard_absent_addr_binds_loopback_only` in
+        // `frp-server/tests/dashboard_integration.rs`.
         //
         // The serde default on the field (`default_web_server_addr`) only fires
         // when the key is ABSENT, so without this an explicit `addr = ""`

@@ -1070,10 +1070,10 @@ They are recorded with the single-proxy `-c` item in `TODO.md` rather than fixed
 here: the first two are the same "what may follow `-c`" question, and the third
 is "which persistent root flags each subparser declares".
 
-**2. An empty `webServer.addr` is completed to `127.0.0.1` — now matched, and
-only the empty string.** Go's `ClientCommonConfig.Complete()` calls
+**2. An empty `webServer.addr` is completed to `127.0.0.1` — on frpc and frps
+alike, and only the empty string.** Go's `ClientCommonConfig.Complete()` calls
 `c.WebServer.Complete()` (`pkg/config/v1/client.go:96`), which is
-`c.Addr = util.EmptyOr(c.Addr, "127.0.0.1")` (`pkg/config/v1/common.go:71-73`).
+`c.Addr = util.EmptyOr(c.Addr, "127.0.0.1")` (`pkg/config/v1/common.go:71-72`).
 frp-rs's serde field default only fires when the key is **absent**, so an explicit
 `addr = ""` survived and every dial became a lookup of the empty host. Measured
 with `[webServer] port = 7499` and the `addr` varied:
@@ -1094,19 +1094,42 @@ names, so it applies to the admin subcommands *and* to the client's own
 `[webServer]` admin listener. Pinned by `frpc/tests/cli_inputs.rs` (empty,
 whitespace and no-`[webServer]` shapes) plus `frp-core/src/config/tests.rs`.
 
-**The server side is *not* matched, and an earlier draft of this section claimed
-it was.** Go's `ServerConfig.Complete()` calls `c.WebServer.Complete()`
+**The server side is matched too — this paragraph used to say it was not, and
+the earlier draft it corrected had claimed parity before the code had it.** Go's
+`ServerConfig.Complete()` calls `c.WebServer.Complete()`
 (`pkg/config/v1/server.go:107`) — the same `EmptyOr(Addr, "127.0.0.1")` as the
 client — *before* the `if c.WebServer.Port > 0 { c.WebServer.Addr =
-util.EmptyOr(c.WebServer.Addr, "0.0.0.0") }` branch at `:116-118`, so that
-branch is dead and an empty `addr` with a set port stays loopback. Measured with
-`[webServer] addr = "" port = 7597 user/password`: Go frps logs
-`dashboard listen on 127.0.0.1:7597` and listens on `127.0.0.1:7597`, while
-frp-rs (`--features dashboard`) logs `Dashboard listening on 0.0.0.0:7597` and
-listens on `*:7597`. `frp-core/src/config/server.rs` defaults the address to
-`0.0.0.0` when the port is set, which is the second half of the two-step
-without the first. The server keeps its behaviour here (this item is
-frpc-scoped); the divergence is pinned by a test and tracked in `TODO.md`.
+util.EmptyOr(c.WebServer.Addr, "0.0.0.0") }` branch at `:116-117`, so that
+branch is dead and an explicit `addr` that is empty with a set port stays
+loopback. `frp-core/src/config/server.rs` used to default the address to
+`0.0.0.0` when the port was set — the second half of the two-step without the
+first, i.e. the dashboard on **every** interface where Go keeps it on the
+loopback — and now fills the empty string with `127.0.0.1` first, with no
+wildcard branch at all. Measured on Go v0.71.0 and frp-rs (`--features
+dashboard`), same config file for both (`[webServer] addr = ""` or the key
+present/absent as tabled, one free dashboard port and one free `bindPort` per
+row, `user`/`password`, plus an `[auth]` token so neither binary refuses to
+start), address read back with `lsof -nP -iTCP:<port> -sTCP:LISTEN`:
+
+| `addr` | dashboard port | Go v0.71.0 | frp-rs before | frp-rs now |
+|---|---|---|---|---|
+| `""` | 17701 | `dashboard listen on 127.0.0.1:17701`; `TCP 127.0.0.1:17701 (LISTEN)` | `Dashboard listening on 0.0.0.0:17701`; `TCP *:17701 (LISTEN)` | `127.0.0.1:17701` |
+| absent | 17703 | `127.0.0.1:17703` | `127.0.0.1:17703` (serde default) | `127.0.0.1:17703` (unchanged) |
+| `"0.0.0.0"` | 17705 | `0.0.0.0:17705`; `TCP *:17705 (LISTEN)` | same | same |
+| `"::1"` | 17707 | `[::1]:17707` | same | same |
+
+The completion fills only the empty string — an absent key is already
+`127.0.0.1` through the serde default, and every explicit non-empty address
+(including the wildcard and `"::1"`) is used verbatim, which is what the
+positive control in the spawn test checks. Pinned on the **bound address** by
+`dashboard_explicit_empty_addr_binds_loopback_only` and
+`dashboard_absent_addr_binds_loopback_only` in
+`frp-server/tests/dashboard_integration.rs` (both spawn the real `frps` binary
+from this lane's `FRPS_BIN`; the wildcard case is their positive control,
+because a host whose non-loopback probe could never connect must fail rather
+than let the two loopback assertions pass vacuously), and on the completed
+value by `server_web_server_addr_empty_is_completed_to_localhost` in
+`frp-core/src/config/tests.rs`.
 
 **3. Config keys are matched case-sensitively — a recorded divergence, not
 parity.** Go decodes with `encoding/json`, whose matching is case-insensitive

@@ -92,7 +92,7 @@ Dashboard and metrics HTTP server.
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
-| `addr` | `string` | `"127.0.0.1"` | `webServer.addr` | Dashboard bind address. Empty string binds to all interfaces. |
+| `addr` | `string` | `"127.0.0.1"` | `webServer.addr` | Dashboard bind address. An empty string is completed to `127.0.0.1` (Go's `WebServer.Complete()`); write `"0.0.0.0"` to bind every interface. |
 | `port` | `u16` | `0` | `webServer.port` | Dashboard port. 0 = disabled. |
 | `user` | `string` | `""` | `webServer.user` | Basic Auth username for dashboard and management API. |
 | `password` | `string` | `""` | `webServer.password` | Basic Auth password for dashboard and management API. |
@@ -335,7 +335,7 @@ Admin REST API for the client. Same fields as the server `[web_server]` section.
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
-| `addr` | `string` | `"127.0.0.1"` | `webServer.addr` | Admin API bind address. Empty string binds to all interfaces. |
+| `addr` | `string` | `"127.0.0.1"` | `webServer.addr` | Admin API bind address. An empty string is completed to `127.0.0.1` (Go's `WebServer.Complete()`); write `"0.0.0.0"` to bind every interface. |
 | `port` | `u16` | `0` | `webServer.port` | Admin API port. 0 = disabled. |
 | `user` | `string` | `""` | `webServer.user` | Basic Auth username for the admin API. |
 | `password` | `string` | `""` | `webServer.password` | Basic Auth password for the admin API. |
