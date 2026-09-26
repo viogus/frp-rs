@@ -32,6 +32,17 @@ User-facing release notes for frp-rs.
   tracked in `TODO.md` — for example, an unresolvable `auth.tokenSource`, or (on
   the client) a malformed `[store]` file, each of which exits `1` in Go; the
   examples are not an exhaustive list of what can reach them.
+- **Config keys are still matched case-sensitively — a known divergence from
+  Go, recorded rather than half-fixed.** Go decodes the config with
+  `encoding/json`, whose field and table matching is case-insensitive
+  *everywhere*: `ServerAddr`, `[WebServer] Port` and even capitalised keys
+  inside `[[proxies]]` are accepted and used. frp-rs matches exactly (plus the
+  documented camelCase aliases), so `[webServer] Port = 7499` is rejected in
+  strict mode with `unknown field "web_server.Port" … did you mean 'port'?`,
+  and in `--strict-config=false` mode the key is silently dropped and the
+  command then reports `web server port should be set if you want to use this
+  feature`. The measurement, the reason no bounded alias set closes it, and what
+  a user sees instead are in `docs/developing.md` § CLI exit codes.
 - **`--config-dir` mode keeps its own refusal code — unchanged, and a
   divergence.** A directory that does not exist, is empty, or holds a config
   that fails to parse still exits **2** on the frp-rs side, where Go's own
@@ -67,6 +78,26 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **A repeated `-c`/`--config` is now last-wins on every `frpc` command — a
+  behaviour change.** Go registers `-c` with pflag `StringVarP`, so
+  `frpc status -c a.toml -c b.toml` loads `b.toml` and is never an error; frp-rs
+  rejected the second occurrence with ``argument `-c` cannot be used multiple
+  times in this context`` before loading anything. `run`, `verify`, `reload`,
+  `status` and `stop` now all take the **last** config, mixing `-c`, `--config`,
+  `-cPATH` and `-c=PATH` freely (they are one variable, as in Go). An absent
+  `-c` keeps its previous meaning on each command (`run` → `frpc.toml`, the
+  admin subcommands → the frp-rs default address), and a `-c` with no value is
+  still a parse error. The `frps` CLI is unchanged.
+- **An empty `webServer.addr` is now completed to `127.0.0.1` — a behaviour
+  change.** Go's `WebServerConfig.Complete()` is
+  `c.Addr = util.EmptyOr(c.Addr, "127.0.0.1")`, so a client config with
+  `[webServer] addr = ""` and a port dials loopback. frp-rs used the empty
+  string literally and failed with `connect :<port>: failed to lookup address
+  information`, which broke `frpc reload`/`status`/`stop` on such a config and
+  also bound the client's own `[webServer]` admin listener on the empty host.
+  Only the empty string is completed: `" "`, `"0.0.0.0"`, `"::1"` and
+  `"localhost"` are still passed through to the dialer verbatim, as in Go.
+  `frps` is unaffected (its own completion re-defaults a set port to `0.0.0.0`).
 - **`frp-server` builds with only the `dashboard` feature compile again.** A
   downstream workspace (or `cargo check -p frp-server --no-default-features
   --features dashboard --all-targets`) that had frp-core's `oidc` on while

@@ -1004,7 +1004,8 @@ the `[store]` → 4 case, and — under `--features tiny` — the same two asser
 against `frpc-tiny`) and `frps/tests/cli_exit_codes.rs` (`frps -c <bad>`,
 `-c <missing>`, a starts-then-SIGTERM positive control, and the extension flag's
 refusal). The admin-subcommand refusals stay pinned by
-`frpc/tests/admin_cli.rs`. Executing lanes: `Run frpc CLI tests`, `Run frps CLI
+`frpc/tests/admin_cli.rs`, and the repeated-`-c` / empty-`addr` inputs by
+`frpc/tests/cli_inputs.rs`. Executing lanes: `Run frpc CLI tests`, `Run frps CLI
 tests` and `Run frpc's CLI exit-code tests under tiny` in `.github/workflows/ci.yml`
 (the `frps` lane and the `tiny` lane were added with these tests — nothing ran a
 `cargo test` target of the `frps` package, or executed the `tiny` CLI binary,
@@ -1014,6 +1015,98 @@ Still divergent, and **not** covered by those tests: the *shape* of the output.
 Go prints one bare parse error to **stdout** and nothing else; the frp-rs daemon
 prints an ANSI-coloured `tracing` line on stdout, and `frpc verify` prints its
 message to **stderr** where Go uses stdout. Only the exit code is pinned.
+
+#### CLI inputs: repeated `-c`, an empty `webServer.addr`, case-insensitive keys
+
+Three `frpc` inputs Go accepts and frp-rs used to refuse (`TODO.md:1547`). Two
+are now Go-faithful; the third is a **recorded divergence**, because the honest
+fix is not bounded and a partial one would be a false claim of parity. Measured
+2026-09-26 against Go frp **v0.71.0** (darwin/arm64) and the frp-rs `frpc` at
+this branch's head.
+
+**1. A repeated `-c`/`--config` is last-wins — now matched.** Go registers `-c`
+with pflag `StringVarP` in a package-level initializer (`cmd/frpc/sub/root.go`),
+so each occurrence overwrites the last and repetition is never an error. frp-rs's
+bpaf parser exited before loading anything with
+``argument `-c` cannot be used multiple times in this context``. Every frpc
+config argument now goes through `config_arg()` (`frp-core/src/cli.rs`), which is
+`.last()` — bpaf's contradicting-options combinator — wrapped in the same
+`fallback`/`optional` each command already had. Measured, both binaries:
+
+| command | Go v0.71.0 | frp-rs (now) | frp-rs (before) |
+|---|---|---|---|
+| `frpc status -c noweb.toml -c p7499.toml` | dials `127.0.0.1:7499` | dials `127.0.0.1:7499` | rc 1, ``argument `-c` cannot be used multiple times`` |
+| `frpc reload \| stop -c noweb.toml -c p7499.toml` | dials `7499` | dials `7499` | same refusal |
+| `frpc status -c p7499.toml -c noweb.toml` | `web server port should be set …` | same sentence | same refusal |
+| `frpc verify -c noweb.toml -c p7499.toml` | `syntax is ok` for `p7499.toml` | `Config file …/p7499.toml is valid` | same refusal |
+| `frpc status --config p7499.toml -c p7498.toml` | dials `7498` | dials `7498` | same refusal |
+| `frpc status -cp7498.toml` / `-c=p7498.toml` | dials `7498` | dials `7498` | dials `7498` (bpaf already accepted both) |
+| `frpc status -c p7498.toml -c` (dangling) | `Error: flag needs an argument: 'c' in -c` | ``Error: `-c` requires an argument `FILE` `` | same refusal |
+| `frpc status -c ""` | rc 1, `open : no such file or directory` | rc 1, `: failed to read config file: …` | same (message shape differs; see the output-shape note above) |
+
+The last two rows are the guard rails: an empty value stays a value (no fallback
+to the `127.0.0.1:7400` default) and a dangling occurrence is still an error, not
+a reused previous value. Pinned by `frpc/tests/cli_inputs.rs` and the
+parser-level tests in `frp-core/src/cli.rs`. `frps` is unchanged — a separate
+surface, not part of that item.
+
+**2. An empty `webServer.addr` is completed to `127.0.0.1` — now matched, and
+only the empty string.** Go's `ClientCommonConfig.Complete()` calls
+`c.WebServer.Complete()` (`pkg/config/v1/client.go:96`), which is
+`c.Addr = util.EmptyOr(c.Addr, "127.0.0.1")` (`pkg/config/v1/common.go:71-73`).
+frp-rs's serde field default only fires when the key is **absent**, so an explicit
+`addr = ""` survived and every dial became a lookup of the empty host. Measured
+with `[webServer] port = 7499` and the `addr` varied:
+
+| `addr` | Go v0.71.0 | frp-rs (now) | frp-rs (before) |
+|---|---|---|---|
+| `""` | dials `127.0.0.1:7499` | dials `127.0.0.1:7499` | `connect :7499: failed to lookup address information` |
+| `" "` | rc 1, `parse "http:// :7499/api/status": invalid character " " in host name` | rc 1, the whitespace host reaches the dialer | same |
+| `"0.0.0.0"` | dials `0.0.0.0:7499` | literal | literal |
+| `"::1"` | dials `[::1]:7499` | literal | literal |
+| `"localhost"` | dials `[::1]:7499` (dialer resolution) | dialer resolution | dialer resolution |
+
+The rule mirrored is exactly Go's: **the empty string becomes `127.0.0.1`;
+anything else is used verbatim** — no trimming, no whitespace special case. The
+completion lives in `ClientConfig::complete_with_heartbeat_set`
+(`frp-core/src/config/client.rs`), the same load/complete boundary the item
+names, so it applies to the admin subcommands *and* to the client's own
+`[webServer]` admin listener. `frps` keeps its own `Complete()`: Go's server
+completes `WebServer.Complete()` first and then re-defaults a set port to
+`0.0.0.0` (`pkg/config/v1/server.go:107,116-118`), which
+`frp-core/src/config/server.rs` already does. Pinned by
+`frpc/tests/cli_inputs.rs` (empty, whitespace and no-`[webServer]` shapes) plus
+`frp-core/src/config/tests.rs`.
+
+**3. Config keys are matched case-sensitively — a recorded divergence, not
+parity.** Go decodes with `encoding/json`, whose matching is case-insensitive
+for **field and table names at every level**, including inside array items. That
+is a property of the decoder, not of one struct, so it cannot be closed with a
+bounded set of `#[serde(alias)]`: serde's aliases are exact strings, and a
+complete fix means either per-field aliases for every case permutation across
+the whole config tree or a canonicalising pre-pass in front of
+`serde_json::from_value`. Measured, Go against frp-rs (all rc 1 except where
+noted; the configs differ only in key case):
+
+| config (`frpc status -c …`) | Go v0.71.0 | frp-rs strict | frp-rs `--strict-config=false` |
+|---|---|---|---|
+| `ServerAddr`/`ServerPort` capitalized | dials `127.0.0.1:7499` | `unknown field "ServerAddr" … did you mean 'serverAddr'?` | key dropped; `web server port should be set …` |
+| `SERVERADDR`/`SERVERPORT` all-caps | dials `7499` | `unknown field "SERVERADDR"` | key dropped; same sentence |
+| `[WebServer]` capitalized section + `port` | dials `7499` | `unknown field "WebServer" … did you mean 'webServer'?` | section dropped; same sentence |
+| `[webServer] Port` | dials `7499` | `unknown field "web_server.Port" … did you mean 'port'?` | key dropped; same sentence |
+| `[webServer] Port` **plus** `[[proxies]] Name/Type/LocalPort` capitalized | dials `7499` (values used) | `unknown field "web_server.Port"` | `missing field \`name\`` |
+
+Scope of what *is* matched: the exact snake_case names, plus the documented
+Go camelCase aliases (`serverAddr`, `serverPort`, `webServer`, `tokenSource`,
+`oidcClientId`, …) which serde accepts per struct. What is **not** matched:
+arbitrary case variants of any key, at any level, on either frpc or frps. So the
+divergence is not "`[webServer] Port` specifically" — it is every casing
+difference, and until the decoder-level fix lands, a config that relies on Go's
+insensitivity loads on Go and is refused (strict) or silently mis-defaulted
+(lenient, where the mis-cased key is dropped and the next error is about a
+missing value rather than a bad key) on frp-rs. The practical advice is the same
+as the README's: use the documented spellings; the camelCase aliases cover the
+Go-authored configs.
 
 ### Repository Invariants (`repo-health.sh`)
 

@@ -1629,7 +1629,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   (and update `strict_config_space_separated_value_parses` /
   `strict_config_invalid_value_errors_cleanly`), or state it as a documented extension — in
   `docs/` and in the `--strict-config` help text — with the `=` form staying Go-faithful. No sha.
-- [ ] **Three pre-existing `frpc` CLI inputs Go accepts and frp-rs does not** (all measured on
+- [x] **Three pre-existing `frpc` CLI inputs Go accepts and frp-rs does not** (all measured on
   Go v0.71.0 and on `main` @ `9c1b291`'s frpc as well as this branch's, so none is introduced by
   the `reload`/`status` fix):
   * **`-c` twice.** `frpc reload -c noweb.toml -c goodcli.toml` → Go is last-wins and dials the
@@ -1649,6 +1649,41 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   empty `addr` to `127.0.0.1` at the CLI/load boundary) with a CLI test per case in the style of
   `frpc/tests/admin_cli.rs`, or record each as a deliberate divergence in the feature-surface
   policy. No sha.
+  **Done (2026-09-26, at the head of `fix/frpc-cli-inputs`).** Two matched, one recorded.
+  * **`-c` twice → matched.** Every frpc config argument now goes through `config_arg()`
+    (`frp-core/src/cli.rs`), bpaf's `.last()`, so `run`/`verify`/`reload`/`status`/`stop` are all
+    last-wins like Go's pflag `StringVarP`. Measured, Go vs frp-rs-now: `status -c noweb.toml -c
+    p7499.toml` → both dial `127.0.0.1:7499`; reverse order → both print `web server port should be
+    set if you want to use this feature`; `verify -c noweb.toml -c p7499.toml` → both report
+    `p7499.toml`; `--config p7499.toml -c p7498.toml` → both dial `7498`; `-cp7498.toml` and
+    `-c=p7498.toml` → both dial `7498` (bpaf already accepted both spellings); `-c ""` → both rc 1
+    without falling back to 7400; dangling `-c` → both rc 1. Before: rc 1,
+    ``argument `-c` cannot be used multiple times in this context``, nothing loaded.
+  * **Empty `webServer.addr` → matched.** `ClientConfig::complete_with_heartbeat_set`
+    (`frp-core/src/config/client.rs`) fills the **empty string** with `127.0.0.1`, mirroring Go's
+    `ClientCommonConfig.Complete() → WebServer.Complete()`
+    (`pkg/config/v1/client.go:96` → `pkg/config/v1/common.go:71-73`). Measured: `status -c
+    emptyaddr.toml` (`addr = ""`, `port = 7499`) → both dial `127.0.0.1:7499`; before, frp-rs
+    printed `connect :7499: failed to lookup address information`. Only the empty string is
+    completed — `" "` still reaches the dialer verbatim and fails (the guard against a `trim()`),
+    while `"0.0.0.0"`/`"::1"`/`"localhost"` pass through as Go does. `frps` keeps its own `0.0.0.0`
+    completion (`pkg/config/v1/server.go:107,116-118`).
+  * **Case-insensitive keys → recorded divergence, not fixed.** Go's `encoding/json` matches field
+    *and table* names case-insensitively at every level, including inside `[[proxies]]` — measured:
+    `ServerAddr`/`SERVERADDR`, `[WebServer]`, `[webServer] Port`, and `Port` plus capitalised proxy
+    keys all load on Go and dial `7499`. A bounded `#[serde(alias)]` set is not parity (aliases are
+    exact strings), so the fix would be a canonicalising pre-pass or per-field aliases for every
+    permutation across the whole tree; measured instead and stated with its scope in
+    `docs/developing.md` § CLI inputs (strict: `unknown field "web_server.Port" … did you mean
+    'port'?`; lenient: the key is dropped and the next error is `web server port should be set …`).
+    The doc names what *is* matched (snake_case + the documented camelCase aliases) and that the
+    divergence is every casing difference on both frpc and frps, not one struct.
+  * Tests: `frpc/tests/cli_inputs.rs` (17 CLI tests, real `CARGO_BIN_EXE_frpc` + a one-shot
+    loopback mock; red-run without the fix: 12 of 17 fail), parser tests in `frp-core/src/cli.rs`,
+    and `frp-core/src/config/tests.rs`
+    (`client_web_server_addr_empty_is_completed_to_localhost`,
+    `client_web_server_addr_explicit_and_absent_are_unchanged`). Doc claims in `docs/developing.md`
+    § CLI inputs and `CHANGELOG.md`.
 - [ ] **A CLI failure's output shape is still not Go's: frp-rs prints a `tracing` line where Go
   prints one bare error, and `verify` writes to stderr where Go writes to stdout.** Measured on Go
   v0.71.0 and on the head binaries while closing the exit-code item above (only the *exit code*
