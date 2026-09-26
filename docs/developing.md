@@ -888,9 +888,12 @@ success, exit 1 on a failure the command detects and reports through its own
 error path. The qualifiers are measured and listed below, not rhetorical — Go
 itself exits 2 when frps panics on an oidc config with no issuer, and it does not
 exit at all on a tokenless token config (it starts and runs), while frp-rs keeps
-three codes of its own (`2`/`3`/`4`) for surfaces Go does not have or does not
-refuse. There is no per-class scheme to preserve, and `EXIT_CONFIG`/2 no longer
-covers a single-config or `verify` failure.
+three codes of its own (`2`/`3`/`4`): `2` only for a `--config-dir` refusal
+(a surface Go answers with 0, or has no flag for at all), and `3`/`4` for
+service-construction failures — including some like `auth.tokenSource` and
+`[store]` that Go *has* and refuses with 1, and some like the empty-token check
+that Go does not refuse at all. There is no per-class scheme to preserve, and
+`EXIT_CONFIG`/2 no longer covers a single-config or `verify` failure.
 
 Measured 2026-09-26 against Go frp **v0.71.0** (darwin/arm64) and the frp-rs
 `frpc`/`frps` binaries, with one unknown top-level key added to an otherwise
@@ -982,8 +985,9 @@ Some things this table does not say, each measured:
     only when the port is *held*, which is the occupied-`bindPort` row above.
   - `frps -c <[auth] method = "oidc"` with no issuer>`: frp-rs refuses with
     **3**; Go **panics** (`panic: Get "/.well-known/openid-configuration":
-    unsupported protocol scheme ""`) and its runtime exits **2**. Go does exit
-    here, with a code frp-rs never uses, so this bullet is *not* a
+    unsupported protocol scheme ""`) and its runtime exits **2** — a code frp-rs
+    uses only for a `--config-dir` refusal, never for a service-construction
+    failure. Go does exit here, so this bullet is *not* a
     "refuses-where-Go-does-not" case. That panic is also why no blanket statement
     like "Go only ever returns 0 or 1" belongs in this document.
   - `frpc verify -c <config whose [[proxies]] block has an unknown key>`: frp-rs

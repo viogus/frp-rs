@@ -229,13 +229,23 @@ jobs:
         # Measured warm, macOS arm64: 2.47 s wall for the package (4 tests, the
         # SIGTERM positive control dominating). The runner was not measured.
         #
-        # Fail closed on the count: `cargo test` exits 0 when a `#[cfg]` or
-        # target change compiles the file to zero tests ("0 passed"), which
-        # would silently retire the pin. Proven with a mutation (`full` →
-        # `not(full)` in the file's crate-level cfg): the run printed
-        # `test result: ok. 0 passed` and exited 0, and this grep rejected it.
+        # Fail closed, and target-specifically. `--test cli_exit_codes` makes the
+        # integration file the only target, so the log holds exactly one
+        # `test result:` line and a bare-count match cannot be satisfied by some
+        # other binary's summary ("4 unit tests + 0 CLI tests"). `cargo test`
+        # exits 0 when a `#[cfg]` or target change compiles the file to zero
+        # tests ("0 passed"), which would silently retire the pin — proven with a
+        # mutation (`full` → `not(full)` in the file's crate-level cfg): the run
+        # printed `test result: ok. 0 passed` and exited 0, and this grep
+        # rejected it. `-o pipefail` (with the explicit bash shell, since the
+        # default `run:` shell is `bash -e` without pipefail) is what makes a
+        # cargo failure after the matched line fail the step rather than being
+        # masked by `tee`'s exit status.
+        shell: bash
         run: |
-          cargo test -p frps 2>&1 | tee /tmp/frps-cli-tests.log
+          set -eo pipefail
+          cargo test -p frps --test cli_exit_codes 2>&1 | tee /tmp/frps-cli-tests.log
+          grep -q "Running tests/cli_exit_codes.rs" /tmp/frps-cli-tests.log
           grep -q "test result: ok. 4 passed" /tmp/frps-cli-tests.log
       - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
         # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag
@@ -252,9 +262,15 @@ jobs:
         #
         # Fail closed on the count, for the same reason as the `frps` step
         # above: this is the lane most exposed to a cfg change compiling the
-        # file to zero tests, and `cargo test` would still exit 0.
+        # file to zero tests, and `cargo test` would still exit 0. Targeting the
+        # file explicitly plus the `Running tests/cli_exit_codes.rs` line is what
+        # makes the count unambiguous; `-o pipefail` is what keeps a later cargo
+        # failure from being masked.
+        shell: bash
         run: |
+          set -eo pipefail
           cargo test -p frpc --no-default-features --features tiny --test cli_exit_codes 2>&1 | tee /tmp/frpc-tiny-cli-tests.log
+          grep -q "Running tests/cli_exit_codes.rs" /tmp/frpc-tiny-cli-tests.log
           grep -q "test result: ok. 9 passed" /tmp/frpc-tiny-cli-tests.log
       - name: Run frp-client's tests with no features (runtime half of frp-client's tier gate)
         # The `verify` lane's `cargo check -p frp-client --no-default-features
