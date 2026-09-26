@@ -1573,8 +1573,12 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     prints an ANSI tracing line on stdout where Go prints a bare parse error, and `verify`
     prints its refusal on stderr where Go uses stdout (new item below); (b) the `3`/`4`
     codes (new item below); (c) `frpc verify -c <config whose [[proxies]] block has an
-    unknown key>` returns 0 while Go exits 1 — found while measuring the surface above,
-    a separate strict-proxy-field defect (new item below).
+    unknown key>` returns 0 while Go exits 1 — already tracked by the strict-mode
+    proxy/visitor-array item at `TODO.md:1168` (recorded by #375), **not** changed or
+    claimed here. Note for the record that `frpc -c <that config>` returns 1 both before
+    and after this change, but for the *wrong* reason: the config is accepted and the
+    process then fails to connect (a runtime exit), not a config refusal. The exit code
+    agrees with Go by coincidence on that one row.
 - [ ] **The space-separated `--strict-config false` form is an frp-rs extension presented as Go
   pflag semantics, and it parses differently from Go.** Measured on Go v0.71.0 and frp-rs
   (`frp-core/src/cli.rs`), with the same unknown-key config:
@@ -1644,19 +1648,18 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `EXIT_AUTH`/`EXIT_BIND` accordingly, noting the empty-token hardening refusal that Go does not
   have), or state them as deliberate extensions in `docs/developing.md` § CLI exit codes with a
   test pinning each reachable arm. No sha.
-- [ ] **`frpc verify` accepts an unknown key inside a `[[proxies]]` block that Go rejects, and the
-  daemon start path treats such a config as valid too.** Found while measuring the CLI
-  config-failure surface for the exit-code item above; a separate defect, not fixed there.
-  * Go v0.71.0 `frpc -c badproxy.toml` (valid client config plus `notAKnownProxyKey = 1` inside
-    `[[proxies]]`) → stdout `decode proxy at index 0: unmarshal ProxyConfig error: json: unknown
-    field "notAKnownProxyKey"`, exit **1**.
-  * frp-rs → `frpc verify -c badproxy.toml` prints `Config file … is valid`, exit **0**; the
-    daemon path logs `frpc (Rust) v0.71.0 connecting...` and only fails later if no server
-    answers. Unknown top-level keys *are* rejected, so strict mode is not applied to the proxy
-    list.
-  **Done-when:** reject unknown fields inside `[[proxies]]`/`[[visitors]]` in strict mode (or
-  state the exemption deliberately in the feature-surface policy), with a `frpc verify` test in
-  the style of `frpc/tests/cli_exit_codes.rs`. No sha.
+- [ ] **`frpc verify` accepts an unknown key inside a `[[proxies]]` block that Go rejects** —
+  already tracked, with the measured fix, by the **strict-mode proxy/visitor-array item
+  above** (`TODO.md:1168`, recorded by #375). Kept here only as the observation that made
+  it visible on the *CLI* surface while the exit-code item above was being measured; it is
+  not a duplicate item and nothing here changes it.
+  * Go v0.71.0 `frpc verify -c badproxy.toml` (valid client config plus
+    `notAKnownProxyKey = 1` inside `[[proxies]]`) → stdout `decode proxy at index 0:
+    unmarshal ProxyConfig error: json: unknown field "notAKnownProxyKey"`, exit **1**.
+  * frp-rs → `frpc verify -c badproxy.toml` prints `Config file … is valid`, exit **0**;
+    `frpc -c badproxy.toml` logs `frpc (Rust) v0.71.0 connecting...` and exits 1 later
+    (a runtime failure, not a config refusal — so its rc matches Go by coincidence only).
+  **Done-when:** see `TODO.md:1168`. No sha.
 
 ---
 
