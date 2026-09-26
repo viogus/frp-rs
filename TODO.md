@@ -1642,12 +1642,16 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `ParseArgument::adjacent()`), and it would make the divergence impossible to miss, but it
     converts a Go-succeeding argv into an frp-rs failure: measured with the drop branch built,
     `frpc verify --strict-config false -c good.toml` → Go **rc 0** (`syntax is ok`), drop branch
-    **rc 1** (``Error: `false` is not expected in this context``); `frpc verify --strict-config
-    false -c badwithport.toml` → Go rc 1, drop rc 1 (rc agrees, reason does not); `frps
-    --strict-config false -c goodfrps.toml` → Go rc 124 (starts), drop rc 1; `frps
-    --strict-config=false` keeps working under the drop branch. So dropping trades a behaviour
-    difference for an acceptance difference. The chosen mitigation is the warning below; the
-    silent cost of keeping is stated in the docs section.
+    **rc 1** (``Error: `false` is not expected in this context``) — the load-bearing row, a valid
+    config so the argv succeeds on Go; `frpc verify --strict-config false -c badwithport.toml` →
+    Go rc 1, drop rc 1 (rc agrees, reason does not); `frpc reload --strict-config false -c
+    host.toml` → Go rc 1, drop rc 1. On the **root** command that argv already fails on Go:
+    `frps --strict-config false -c goodfrps.toml` → Go **rc 1** (`Error: unknown command "false"
+    for "frps"` — no positional, refused before the config is read), head rc 124 (the extension
+    starts), drop rc 1 — so there Go and the drop branch agree on the code and the row is
+    completeness, not evidence. `frps --strict-config=false` keeps working under the drop branch.
+    So dropping trades a behaviour difference for an acceptance difference. The chosen mitigation
+    is the warning below; the silent cost of keeping is stated in the docs section.
   * **The warning.** `STRICT_CONFIG_SPACE_FORM_WARNING` (`frp-core/src/cli.rs`) is printed from
     `parse_frps_args`/`parse_frpc_args` after a successful parse, gated by
     `strict_config_space_form_used`: a `--strict-config`/`--strict_config` token immediately
@@ -1698,9 +1702,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
       covered; Go's `frps verify` subcommand has no frp-rs counterpart and is not part of this item.
     * **Per-flag, not CLI-wide:** `frps --tls-only=false -c goodfrps.toml` → Go rc 124 (accepted,
       starts) vs frp-rs rc 1 ``Error: `false` is not expected in this context``; same for
-      `--enable-prometheus=false` and `--disable-log-color=false`. The "`=` spelling is
-      Go-faithful" rule therefore does not generalise past the flags routed through the shared
-      bool-value parser — new item below.
+      `--enable-prometheus=false`, `--disable-log-color=false` and `--dashboard-tls-mode=false`
+      (four probed, not a sweep). The "`=` spelling is Go-faithful" rule therefore does not
+      generalise past the flags routed through the shared bool-value parser — new item below.
   * **Carriers.** `--strict-config` help text from one definition (`strict_config_parser` in
     `frp-core/src/cli.rs`, used by `frps` and `frpc` `run`/`verify`/`reload`/`status`/`stop`): the
     bare-form line names the Go-faithful spellings, says frp-rs additionally consumes a
@@ -1749,6 +1753,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     message.
   * `frps --disable-log-color=false -c goodfrps.toml` → Go rc 124 (starts) vs frp-rs rc 1, the same
     message.
+  * `frps --dashboard-tls-mode=false -c goodfrps.toml` → Go rc 124 (starts) vs frp-rs rc 1, the same
+    message.
+  * The four rows above are the **measured examples of a class, not an exhaustive list**: the sweep
+    is this item's done-when.
   * The space-separated form is *not* the divergence here: `frps --tls-only false -c goodfrps.toml`
     → Go rc 1 `Error: unknown command "false" for "frps"` (root command, no positional) vs frp-rs
     rc 1 ``Error: `false` is not expected in this context`` — both refuse, for different reasons.
@@ -1756,13 +1764,15 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   pflag's bool machinery (`--flag`, `--flag=true`, `--flag=false`). The `--strict-config` item
   above solved exactly this shape for one flag by routing it through a shared bool-value parser
   (`strict_config_parser`), and its `=` spelling is Go-faithful because of that; the rule does not
-  generalise to any flag still on `.switch()`. Also note the config-level twin: an frp-rs-only flag
-  (`frpc --disable-log-color`, `unknown flag` on Go) is not part of this item — there is no Go
-  behaviour to match.
-  **Done-when:** enumerate every bool flag on `frps`/`frpc`, give each the `=value` spelling Go
-  accepts (the shared value-parser shape, or a sweep over the switches), and pin one representative
-  per binary end-to-end in the style of `frps/tests/cli_exit_codes.rs`; or record each remaining
-  one as a deliberate divergence in the feature-surface policy. No sha.
+  generalise to any flag still on `.switch()`. frp-rs-only bool flags are outside this item — there
+  is no Go behaviour to match: `frpc tcp --use-encryption=false` is
+  `Error: unknown flag: --use-encryption`, rc 1 on Go (frp-rs has the flag, refuses the `=` spelling
+  for its own reason: ``Error: expected `--remote-port=PORT`, got `false` `` at the point probed).
+  **Done-when:** **sweep** every bool flag on `frps`/`frpc` (the four measured above are examples,
+  not the set), give each the `=value` spelling Go accepts (the shared value-parser shape, or a
+  sweep over the switches), and pin one representative per binary end-to-end in the style of
+  `frps/tests/cli_exit_codes.rs`; or record each remaining one as a deliberate divergence in the
+  feature-surface policy and say the list is complete. No sha.
 - [x] **Three pre-existing `frpc` CLI inputs Go accepts and frp-rs does not** (all measured on
   Go v0.71.0 and on `main` @ `9c1b291`'s frpc as well as this branch's, so none is introduced by
   the `reload`/`status` fix):

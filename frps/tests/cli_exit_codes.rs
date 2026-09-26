@@ -285,11 +285,18 @@ fn space_form_strict_config_warns_on_stderr() {
     let warning = frp_core::cli::STRICT_CONFIG_SPACE_FORM_WARNING;
 
     let out = run_frps(&["--strict-config", "false", "-c", &cfg]);
+    let stderr = stderr_of(&out);
     assert!(
-        stderr_of(&out).contains(warning),
-        "the extension must warn on stderr; stdout={:?} stderr={:?}",
+        stderr.contains(warning),
+        "the extension must warn on stderr; stdout={:?} stderr={stderr:?}",
         stdout_of(&out),
-        stderr_of(&out),
+    );
+    // Exactly once — a second emission must fail (a bare `contains` cannot
+    // see it).
+    assert_eq!(
+        stderr.matches(warning).count(),
+        1,
+        "the warning must be printed exactly once; stderr={stderr:?}"
     );
     let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
     assert!(

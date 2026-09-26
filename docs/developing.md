@@ -1320,13 +1320,21 @@ What the table says, precisely:
   fields will cause errors (default true)`), so the extension applies there too,
   is stated in the same help text, and warns from the same detection.
 - **"The `=` spelling is Go-faithful" is a per-flag rule, not a CLI-wide one.**
-  It happens to hold for `--strict-config` and does not generalise: `frps
-  --tls-only=false -c goodfrps.toml` is accepted by Go (rc 124, it starts) while
-  frp-rs refuses it (``Error: `false` is not expected in this context``, rc 1),
-  and the same holds for `--enable-prometheus=false` and
-  `--disable-log-color=false` on `frps`. Those flags are bpaf switches, not the
-  shared value parser, and the divergence runs the *opposite* way from this
-  item (frp-rs refuses an argv Go accepts). Tracked as its own `TODO.md` item.
+  It holds for `--strict-config` because that flag goes through the shared
+  bool-value parser; it does **not** hold for flags still on a plain switch.
+  Measured on `frps` with the valid server config (`goodfrps.toml`, bounded
+  runner), four flags accept the pflag `=value` spelling on Go (rc 124 — it
+  starts and listens) and are refused by frp-rs with rc 1
+  (``Error: `false` is not expected in this context``): `--tls-only=false`,
+  `--enable-prometheus=false`, `--disable-log-color=false` and
+  `--dashboard-tls-mode=false`. That list is **representative, not exhaustive**
+  — those four were probed, no sweep was done, and the class is "any bool flag
+  registered as a bpaf `switch()` on either binary". The divergence runs the
+  *opposite* way from this item (frp-rs refuses an argv Go accepts) and is
+  tracked as its own `TODO.md` item whose done-when *is* that sweep. frp-rs-only
+  bool flags are outside it: `frpc tcp --use-encryption=false` is
+  `Error: unknown flag: --use-encryption`, rc 1 on Go — there is no Go behaviour
+  to match (and frp-rs refuses it too, for its own reason).
 
 Why the extension is kept, as the measured trade the done-when asks for:
 
@@ -1343,16 +1351,21 @@ Why the extension is kept, as the measured trade the done-when asks for:
   Measured with the drop branch built:
   `frpc verify --strict-config false -c good.toml` → Go **rc 0**
   (`syntax is ok`), drop branch **rc 1** (``Error: `false` is not expected in
-  this context``); `frpc verify --strict-config false -c bad.toml` → Go rc 1,
-  drop rc 1 (rc agrees, reason does not); `frpc reload --strict-config false -c
-  host.toml` → Go rc 1, drop rc 1; `frps --strict-config false -c
-  goodfrps.toml` → Go rc 124 (starts), drop rc 1; and the `=` spellings keep
-  working (`frps --strict-config=false` still starts). So the drop branch
-  improves raw rc agreement on the config-refusal rows by turning *behaviour*
-  differences into *acceptance* differences — it refuses argv Go accepts and
-  simply ignores the token on. This document does not quote a global mismatch
-  count; the reviewers' matrices are theirs, and the rows above are the ones
-  measured here.
+  this context``) — *this* is the load-bearing row, because the config is valid
+  and the argv succeeds on Go; `frpc verify --strict-config false -c bad.toml` →
+  Go rc 1, drop rc 1 (rc agrees, reason does not); `frpc reload --strict-config
+  false -c host.toml` → Go rc 1, drop rc 1. On the **root** command the same
+  argv is a failure on both sides already: `frps --strict-config false -c
+  goodfrps.toml` → Go **rc 1** (`Error: unknown command "false" for "frps"` — it
+  takes no positional and refuses before reading the config), head rc 124 (the
+  extension starts), drop rc 1, so there Go and the drop branch *agree* on the
+  code and that row is completeness rather than evidence. The `=` spellings keep
+  working under the drop branch (`frps --strict-config=false` still starts). So
+  the drop branch improves raw rc agreement on the config-refusal rows by turning
+  *behaviour* differences into *acceptance* differences — it refuses argv that Go
+  accepts and simply ignores the token on. This document does not quote a global
+  mismatch count; the reviewers' matrices are theirs, and the rows above are the
+  ones measured here.
 - **The decision is keep + warn.** The space form honours the user's obvious
   intent, existing invocations keep working, and the silent part of the
   divergence — the part that made this item worth filing — is now printed on

@@ -1072,10 +1072,18 @@ fn space_form_warning_fires_on_each_frpc_parser() {
 
     for args in space_rows {
         let out = run_frpc(args);
+        let stderr = stderr_of(&out);
         assert!(
-            stderr_of(&out).contains(warning),
-            "{args:?} is the extension and must warn: stderr={:?}",
-            stderr_of(&out)
+            stderr.contains(warning),
+            "{args:?} is the extension and must warn: stderr={stderr:?}"
+        );
+        // Exactly once: a warning printed per parser stage, or by both the
+        // detection and a parser, must fail here (a bare `contains` cannot see
+        // a second emission).
+        assert_eq!(
+            stderr.matches(warning).count(),
+            1,
+            "{args:?} must print the warning exactly once: stderr={stderr:?}"
         );
     }
     for args in equals_rows {
