@@ -3,7 +3,7 @@ use std::path::Path;
 use super::file::process_includes;
 use super::format::{detect_format, parse_to_toml_value};
 use super::loader::ConfigPresence;
-use super::strict::run_strict_check;
+use super::strict::{run_strict_check, HTTP_PLUGIN_KNOWN_KEYS};
 
 /// Convert a toml::Value to a serde_json::Value for deserialization.
 /// This is needed because toml::Value can't be directly deserialized into
@@ -779,6 +779,38 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
                     "name".to_string(),
                     Value::String(name.trim_start_matches("plugin.").to_string()),
                 );
+                // Go's `loadHTTPPluginOpt` maps the section onto
+                // HTTPPluginOptions with `section.MapTo` and silently ignores a
+                // key that struct does not name (pkg/config/legacy/server.go:266-275),
+                // and its conversion keeps only name/addr/path/ops/tlsVerify
+                // (conversion.go:150-166). Keep the same accept-and-ignore
+                // semantics by dropping keys outside HttpPluginConfig's serde
+                // surface before the strict walk sees the element; the frp-rs
+                // extensions (`url`, `timeout`, `enable_control`) are in that
+                // surface and survive.
+                // Go's `Ops []string` is filled by `ini`'s comma-splitting
+                // `section.MapTo`, so a single operation (`ops = Login`) is a
+                // one-element slice there. `ini_to_toml` only splits a value
+                // that contains a comma, so a single value arrives as a
+                // `String` and would fail `Vec<String>` deserialization —
+                // normalize it the same way the client list keys are.
+                if let Some(Value::String(s)) = st.get("ops") {
+                    let items: Vec<Value> = s
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(|p| Value::String(p.to_string()))
+                        .collect();
+                    st.insert("ops".to_string(), Value::Array(items));
+                }
+                let unknown_keys: Vec<String> = st
+                    .keys()
+                    .filter(|k| !HTTP_PLUGIN_KNOWN_KEYS.contains(&k.as_str()))
+                    .cloned()
+                    .collect();
+                for key in unknown_keys {
+                    st.remove(&key);
+                }
                 plugins.push(Value::Table(st));
             }
             let arr = table
@@ -951,7 +983,8 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
         // expanded into per-port proxies {prefix}_{i} (Go
         // renderRangeProxyTemplates — local/remote port lists must match in
         // length).
-        collect_legacy_ini_proxy_sections(table);
+        let (legacy_proxy_indices, legacy_visitor_indices) =
+            collect_legacy_ini_proxy_sections(table);
 
         // Go legacy INI keys: top-level admin_* -> [web_server] (Go
         // pkg/config/legacy conversion.go AdminAddr/Port/User/Pwd/...).
@@ -1269,8 +1302,25 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
         let _ = table.remove("log_way");
 
         // Normalize Go-format proxy sub-tables into flat fields
-        normalize_proxies(table);
+        normalize_proxies(table, &legacy_proxy_indices);
         normalize_visitors(table);
+
+        // Legacy-collected elements keep Go's INI semantics: a key the typed
+        // struct does not name is ignored, not refused. Run after the folds
+        // above so every key those folds produce is already in place.
+        for (target, indices, visitor) in [
+            ("proxies", &legacy_proxy_indices, false),
+            ("visitors", &legacy_visitor_indices, true),
+        ] {
+            let Some(Value::Array(arr)) = table.get_mut(target) else {
+                continue;
+            };
+            for index in indices {
+                if let Some(element) = arr.get_mut(*index) {
+                    super::strict::strip_unknown_legacy_element_keys(element, visitor);
+                }
+            }
+        }
 
         // Extract meta_* prefixed keys into metas map (Go frp legacy compat).
         let meta_keys: Vec<String> = table
@@ -1361,9 +1411,62 @@ fn ini_range_numbers(s: &str) -> Option<Vec<u16>> {
     Some(out)
 }
 
-/// Collect Go legacy INI proxy/visitor sections into `[proxies]`/`[visitors]`.
-fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) {
+/// Fold `<prefix>*` keys into a map stored under `target` — Go's
+/// `GetMapWithoutPrefix` (`pkg/config/legacy/utils.go:21`), which is how the
+/// legacy INI layer spells `metadatas` (`meta_*`, `proxy.go:198`) and HTTP
+/// request headers (`header_*`, `proxy.go:244`). Merges into an existing map
+/// rather than replacing it (`or_insert` per key, like Go's per-key writes).
+fn fold_prefixed_keys_into(st: &mut toml::Table, prefix: &str, target: &str) {
     use toml::Value;
+
+    let mut map = toml::Table::new();
+    for key in st.keys().cloned().collect::<Vec<_>>() {
+        let Some(sub) = key.strip_prefix(prefix) else {
+            continue;
+        };
+        if sub.is_empty() {
+            continue;
+        }
+        if let Some(v) = st.remove(&key) {
+            map.insert(sub.to_string(), v);
+        }
+    }
+    if map.is_empty() {
+        return;
+    }
+    match st.get_mut(target) {
+        Some(Value::Table(existing)) => {
+            for (k, v) in map {
+                existing.entry(k).or_insert(v);
+            }
+        }
+        _ => {
+            st.insert(target.to_string(), Value::Table(map));
+        }
+    }
+}
+
+/// Collect legacy-shaped proxy/visitor sections into `[proxies]`/`[visitors]`.
+///
+/// "Legacy-shaped" means a top-level mapping that carries a `type` key — the
+/// shape Go's legacy INI sections have. The check is by shape, not by file
+/// extension or format, because normalization only ever sees the parsed
+/// `toml::Value`; a `.toml`/`.json`/`.yaml` config can therefore use the same
+/// spelling, which is a pre-existing frp-rs extension (Go's v1 decoder rejects
+/// the section name outright). Recorded with its measurement in
+/// `docs/deployment.md`.
+///
+/// Returns the indices of the elements it created, so the caller can run
+/// `strip_unknown_legacy_element_keys` over exactly those elements: Go's legacy
+/// path ignores an INI key its typed struct does not name (`gopkg.in/ini`
+/// `MapTo`), while the strict check on a *v1* `[[proxies]]` element rejects it.
+/// Stripping the leftovers keeps the legacy surface at Go's accept-and-ignore
+/// semantics without loosening the v1 check.
+fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) -> (Vec<usize>, Vec<usize>) {
+    use toml::Value;
+
+    let mut proxy_indices = Vec::new();
+    let mut visitor_indices = Vec::new();
 
     // Known non-proxy top-level sections are never collected even if they
     // happen to carry a `type` key.
@@ -1415,6 +1518,51 @@ fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) {
             }
         }
 
+        // Go legacy INI health-check spellings. The v1 field names are
+        // `health_check_interval_seconds` / `health_check_timeout_seconds`, and
+        // Go's legacy conversion maps the flat `_s` INI spellings onto
+        // `HealthCheck.IntervalSeconds` / `.TimeoutSeconds`
+        // (pkg/config/legacy/conversion.go:204-206) — a valid Go legacy INI
+        // config uses them and Go honours them. The
+        // `[proxies.healthCheck]` flatten in `normalize_proxies` already
+        // renames them; the flat INI form needs the same rename, because the
+        // element reaches `check_strict` unrenamed otherwise and strict mode
+        // walks `proxies`/`visitors` elements (a valid Go legacy config would
+        // be refused).
+        //
+        // `insert`, not `or_insert`: when both spellings are present Go uses
+        // the `_s` one. `health_check_interval_s` is the only interval INI tag
+        // Go's legacy struct declares (`pkg/config/legacy/proxy.go:130,136`),
+        // so `_seconds` is an unknown INI key there; measured on Go v0.71.0
+        // (frpc + frps, health-check log gaps): `_s = 2` alone → checks every
+        // 2.0 s; `_seconds = 2` alone → one check then the 10 s default
+        // (ignored); `_s = 2` + `_seconds = 99` → every 2.0 s, and `_s = 99` +
+        // `_seconds = 2` → one check. So `_s` wins in both orders.
+        for (from, to) in [
+            ("health_check_interval_s", "health_check_interval_seconds"),
+            ("health_check_timeout_s", "health_check_timeout_seconds"),
+        ] {
+            if let Some(v) = st.remove(from) {
+                st.insert(to.to_string(), v);
+            }
+        }
+
+        // Go's prefix mechanisms for a legacy *proxy* section (the visitor
+        // struct has neither: `pkg/config/legacy/visitor.go` has no prefix
+        // reads, so Go ignores the keys there and the strip pass drops them).
+        let is_visitor = st.get("role").and_then(Value::as_str) == Some("visitor");
+        if !is_visitor {
+            // meta_* -> Metadatas (proxy.go:198, conversion.go:192).
+            fold_prefixed_keys_into(&mut st, "meta_", "metadatas");
+            // header_* -> HTTP request headers. Go folds these only for
+            // `type = "http"` (HTTPProxyConf.UnmarshalFromIni, proxy.go:244);
+            // HTTPS/TCP have no Headers field, so Go ignores the keys there and
+            // the strip pass drops them.
+            if st.get("type").and_then(Value::as_str) == Some("http") {
+                fold_prefixed_keys_into(&mut st, "header_", "headers");
+            }
+        }
+
         if let Some(prefix) = section_name.strip_prefix("range:") {
             // Expand into {prefix}_{i} per-port proxies (Go renderRangeProxyTemplates).
             // local_port/remote_port accept a quoted string ("6000-6002") or
@@ -1460,6 +1608,7 @@ fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) {
                     .entry("proxies".to_string())
                     .or_insert_with(|| Value::Array(Vec::new()));
                 if let Value::Array(arr) = proxies {
+                    proxy_indices.push(arr.len());
                     arr.push(Value::Table(t));
                 }
             }
@@ -1485,12 +1634,25 @@ fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) {
             .entry(target_key.to_string())
             .or_insert_with(|| Value::Array(Vec::new()));
         if let Value::Array(arr) = arr {
+            if target_key == "visitors" {
+                visitor_indices.push(arr.len());
+            } else {
+                proxy_indices.push(arr.len());
+            }
             arr.push(Value::Table(st));
         }
     }
+    (proxy_indices, visitor_indices)
 }
 
-fn normalize_proxies(table: &mut toml::Table) {
+/// Normalize Go-format proxy sub-tables onto each `proxies` element.
+///
+/// `legacy_indices` are the element indices `collect_legacy_ini_proxy_sections`
+/// created. They gate the folds that only Go's legacy INI path justifies (today
+/// `plugin_header_*`, which Go's conversion reads only for three plugin types);
+/// a `[[proxies]]` element written directly in TOML/YAML/JSON must keep the v1
+/// surface's behaviour, where those flat spellings are not Go names.
+fn normalize_proxies(table: &mut toml::Table, legacy_indices: &[usize]) {
     use toml::Value;
 
     let proxies = match table.get_mut("proxies") {
@@ -1498,7 +1660,8 @@ fn normalize_proxies(table: &mut toml::Table) {
         _ => return,
     };
 
-    for proxy_val in proxies.iter_mut() {
+    for (index, proxy_val) in proxies.iter_mut().enumerate() {
+        let is_legacy = legacy_indices.contains(&index);
         let proxy_table = match proxy_val.as_table_mut() {
             Some(t) => t,
             _ => continue,
@@ -1617,7 +1780,27 @@ fn normalize_proxies(table: &mut toml::Table) {
         if let Some(Value::String(plugin_type)) = proxy_table.get("plugin").cloned() {
             proxy_table.remove("plugin");
             let mut plugin_table = toml::Table::new();
-            plugin_table.insert("type".to_string(), Value::String(plugin_type));
+            plugin_table.insert("type".to_string(), Value::String(plugin_type.clone()));
+
+            // `plugin_header_*` is Go's spelling for plugin request headers —
+            // `transformHeadersFromPluginParams` (pkg/config/legacy/conversion.go:171-181)
+            // is called only by the http2https / https2http / https2https arms
+            // (conversion.go:217,228,236); every other plugin type drops the
+            // parameters, so only those three fold here. A `plugin_header_*` on
+            // another type stays a plugin key: the legacy-IN I strip pass drops
+            // it (Go ignores it), and a v1 `[[proxies]]` element refuses it.
+            // Only for elements the legacy collector produced: Go's legacy
+            // conversion reads `plugin_header_*` for these three plugin types,
+            // but the flat plugin spelling is not part of the v1 TOML surface —
+            // on a `[[proxies]]` element Go rejects `plugin` itself as a string,
+            // and folding the headers there would silently *honour* a key that
+            // was previously dropped.
+            let consumes_plugin_headers = is_legacy
+                && matches!(
+                    plugin_type.as_str(),
+                    "http2https" | "https2http" | "https2https"
+                );
+            let mut plugin_request_headers = toml::Table::new();
 
             let plugin_keys: Vec<String> = proxy_table
                 .keys()
@@ -1626,6 +1809,12 @@ fn normalize_proxies(table: &mut toml::Table) {
                 .collect();
             for key in plugin_keys {
                 if let Some(v) = proxy_table.remove(&key) {
+                    if let Some(name) = key.strip_prefix("plugin_header_") {
+                        if consumes_plugin_headers && !name.is_empty() {
+                            plugin_request_headers.insert(name.to_string(), v);
+                            continue;
+                        }
+                    }
                     let flat_key = match key.as_str() {
                         "plugin_local_addr" | "pluginLocalAddr" => "local_addr",
                         "plugin_local_path" | "pluginLocalPath" => "local_path",
@@ -1647,6 +1836,12 @@ fn normalize_proxies(table: &mut toml::Table) {
                     };
                     plugin_table.entry(flat_key.to_string()).or_insert(v);
                 }
+            }
+            if !plugin_request_headers.is_empty() {
+                plugin_table.insert(
+                    "request_headers".to_string(),
+                    Value::Table(plugin_request_headers),
+                );
             }
 
             if let Some(Value::Table(existing)) = proxy_table.get_mut("plugin") {

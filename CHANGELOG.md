@@ -49,6 +49,54 @@ User-facing release notes for frp-rs.
   negative value is accepted and means the deadline has already passed).
 
 ### Changed
+- **Strict mode now rejects unknown keys inside `[[proxies]]` / `[[visitors]]` /
+  `[[httpPlugins]]` elements — a behaviour change, and Go parity.** The key set
+  used to be per *section*, so an unknown field inside an array element was
+  accepted and silently dropped even in strict mode (Go's default), where Go frp
+  v0.71.0 exits 1 with `decode proxy at index 0: unmarshal ProxyConfig error:
+  json: unknown field "notAKnownProxyKey"`. frp-rs now reports
+  `unknown field "proxies[0].notAKnownProxyKey" in config file …` and exits 1.
+  Checked positions: every `[[proxies]]` / `[[visitors]]` element, the
+  `[proxies.plugin]` / `[visitors.plugin]` tables, a proxy's
+  `health_check_http_headers` elements (under both the canonical name and the
+  `healthCheckHttpHeaders` alias), and every `[[httpPlugins]]` entry. The
+  key sets are the serde surface of `ProxyConfig` / `VisitorConfig` /
+  `PluginConfig` / `VisitorPluginConfig` / `HttpPluginConfig` — every field name
+  **and** every camelCase alias — so a Go-authored config that uses Go's
+  spellings (`localPort`, `customDomains`, `useEncryption`, …) keeps loading; a
+  drift guard extracts those names from the structs and fails in both directions
+  when a field or alias is added, removed or renamed (it refuses to guess on a
+  container `#[serde(rename_all)]`, a `flatten` field or an unrecognised serde
+  attribute). **What now fails that used to load:** a genuinely unknown key in
+  one of those blocks (`remote_portt`, `notAKnownProxyKey`) and a mis-cased key
+  Go's case-insensitive JSON decoder reads and applies (`RemotePort` — see the
+  case-sensitivity entry below; use `remotePort` or `remote_port`).
+  `--strict-config=false` still drops such keys silently, as before.
+  **Legacy-shaped top-level sections (any format — the collector keys on a
+  top-level mapping carrying a `type`, not on the `.ini` extension) keep Go's
+  accept-and-ignore INI semantics for the strict check**: the legacy collector folds the prefix mechanisms Go reads (`meta_*` →
+  `metadatas`, `header_*` → `headers` on an `http` proxy, `plugin_header_*` →
+  the plugin's `request_headers`) and then drops the keys Go's INI path ignores
+  (`[common]`-only keys misplaced into a proxy section, a stray `plugin_*`
+  parameter, a visitor's `meta_*`/`header_*`, an unknown key in a legacy
+  `[plugin.xxx]` server section). Go v0.71.0's own
+  `conf/legacy/frpc_legacy_full.ini` therefore draws no unknown-field refusal
+  here either (it is vendored and pinned in `frp-core/src/config/fixtures/`),
+  though it still does not load end to end: the INI reader infers an integer
+  where INI has only strings, so `token = 12345678` fails serde on both this and
+  the previous release; a separate pre-existing class, comma-splitting, drops a
+  `[range:…]` template whose `local_port` is a list (and `allow_ports` on the
+  server). Both are open items in `TODO.md`; see the fixture README. Two measured gaps
+  remain: an unknown key inside `[proxies.requestHeaders]` /
+  `[proxies.responseHeaders]` is still accepted (normalization consumes those
+  tables before the check, where Go rejects it), and the v1 spellings
+  `healthCheckType` / `healthCheckURL` / `healthCheckHTTPHeaders` /
+  `healthCheckIntervalS` / `healthCheckTimeoutS` / `healthCheckMaxFailed`
+  advertised in `docs/config.md` are not Go names — strict mode now refuses
+  them (they were silently dropped before, leaving the health check
+  unconfigured), as Go does; the Go v1 spelling is the nested
+  `[proxies.healthCheck]` table. Per-depth Go-vs-frp-rs measurements are in
+  `docs/deployment.md`.
 - **A CLI config failure now exits 1, not 2 — a behaviour change.**
   `frpc -c <bad or missing or unparsable>`, `frpc verify -c <…>` and
   `frps -c <…>` exited `2` (`EXIT_CONFIG`), while the admin subcommands
@@ -72,16 +120,18 @@ User-facing release notes for frp-rs.
     `[webServer] Port = 7499` gives `unknown field "web_server.Port" … did you
     mean 'port'?`, exit 1.
   - Inside a `[[proxies]]`/`[[visitors]]` (or `[[httpPlugins]]`) element the key
-    is **silently dropped even in strict mode** and the command exits 0 — the
-    long-standing strict-mode array exemption, not new here. A dropped
-    `remotePort` therefore registers `remote_port: 0` and lets the server
-    auto-allocate a port where Go would have used the configured one.
+    is now **refused in strict mode too** (`unknown field "proxies[0].RemotePort"
+    … did you mean 'remotePort'?`, exit 1) — stricter than Go, which reads and
+    honours the key, but the previous behaviour dropped its value silently while
+    the command exited 0. With `--strict-config=false` it is still dropped, and
+    the array's key sets are still exact-match otherwise (see the entry above).
   - With `--strict-config=false` the key is dropped everywhere and the command
     may succeed on a different value than Go used (`ServerAddr`/`ServerPort`
     fall back to `0.0.0.0:7000`) or fail later with a missing-value error.
-  The measurements, the reason no bounded alias set closes it, and the covered
-  vs uncovered scope are in `docs/developing.md` § CLI inputs; the array
-  exemption's own consequences are in `docs/deployment.md`.
+  The measurements, the reason no bounded alias set closes the remaining
+  top-level arms, and the covered vs uncovered scope are in
+  `docs/developing.md` § CLI inputs; the array recursion's own consequences are
+  in `docs/deployment.md`.
 - **`--config-dir` mode keeps its own refusal code — unchanged, and a
   divergence.** A directory that does not exist, is empty, or holds a config
   that fails to parse still exits **2** on the frp-rs side, where Go's own

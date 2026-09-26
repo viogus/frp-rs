@@ -730,44 +730,139 @@ body that cannot be buffered or does not deserialize into the expected
 `{"strict_config": bool}` shape, and a reload the loader itself rejects (a
 strict-mode unknown key).
 
-Strict mode does not recurse into `[[proxies]]` / `[[visitors]]` array elements,
-and the server-side `[[httpPlugins]]` array behaves the same way. The gap is
-wider than the reload answer: with strict mode on (Go's default, `strictConfig =
-true`), Go frp v0.71.0 **refuses to start** on such a
-config — `decode proxy at index 0: unmarshal ProxyConfig error: json: unknown
-field "bogus_key_in_tcp_proxy"` — whereas frp-rs starts with the key dropped.
-Arrays and nested tables are not walked generally: nothing inside an array
-element is visited (including arrays nested there, such as a proxy's
-`healthCheckHttpHeaders`), and a nested table in a section that *is* checked is
-skipped too (`auth.tokenSource.exec.env` has no key set at `tokenSource`). The
-sections most likely to be typo'd — `[auth]`, `[log]`, `[webServer]`,
-`[transport]` — are still checked, so an unknown key there is still 400.
+Strict mode walks the `[[proxies]]` / `[[visitors]]` array elements and the
+server-side `[[httpPlugins]]` array as well. With strict mode on (Go's default,
+`strictConfig = true`), Go frp v0.71.0 **refuses to start** on such a config —
+`decode proxy at index 0: unmarshal ProxyConfig error: json: unknown field
+"bogus_key_in_tcp_proxy"`, exit 1 — and frp-rs now refuses it in the same place,
+with the element index in the path: `unknown field
+"proxies[0].bogus_key_in_tcp_proxy" in config file …`.
 
-Keeping the loose direction is a choice between two affordable fixes, not a
-missing capability. The key sets are mechanically derivable: `ProxyConfig`,
-`VisitorConfig` and `HttpPluginConfig` are each a single union struct that
-already carries Go's camelCase spellings as serde aliases, so one set per
-*struct* — not per proxy type — covers every element.
-`#[serde(deny_unknown_fields)]` on those structs implements it in a few lines
-with no list to maintain, but it is unconditional: it cannot be keyed on
-`strictConfig`, so it would also reject unknown fields in *non*-strict loads
-(`--strict-config=false`), where Go ignores them — under strict mode, which is
-Go's default and what the paragraph above measures, it would match Go instead. A
-strict-only scan list instead has to track
-every field and alias of those structs, exempt their open maps (`headers`,
-`response_headers`, `annotations`, `metas`) and nested arrays, and has no
-reflection to prove completeness (hand-maintained lists are already the pattern
-for the walked sections — the risk here is completeness, not novelty): a false
-400 blocks a valid config, while a missed typo only drops a key. frp-rs keeps the
-loose direction on that basis; the Go-faithful strict-only fix is tracked as its
-own `TODO.md` item.
+The key set is per **struct**, not per proxy/visitor/plugin type:
+`ProxyConfig`, `VisitorConfig`, `PluginConfig`, `VisitorPluginConfig` and
+`HttpPluginConfig` are each a single union struct that already carries Go's
+camelCase spellings as serde aliases, so one list per struct covers every
+element. The same walk descends into the `[proxies.plugin]` / `[visitors.plugin]`
+tables and into a proxy's health-check header elements under **both** spellings
+the deserializer accepts (`health_check_http_headers` and the alias
+`healthCheckHttpHeaders`, which normalization leaves alone) — the only nested
+values in an element whose contents are field names. Go nests more (`transport`,
+`healthCheck`, `loadBalancer`, `natTraversal`), but `normalize_proxies` flattens
+those onto the element before the check runs, so their keys are checked as
+element keys; the remaining nested values (`headers`, `response_headers`,
+`annotations`, `metas`) are open maps whose keys are user data and are not
+walked. A drift guard (`strict_array_element_keys_match_struct_fields` in
+`frp-core/src/config/tests.rs`) extracts each struct's field names,
+`rename(deserialize = …)` names and `alias` values — for a field with any
+visibility, including none at all — and compares them two-way with those lists,
+so adding, removing or renaming a field or alias fails the suite.
+`skip`/`skip_deserializing` **are** modelled — the field contributes no key, so
+it must be absent from the lists. The guard does **not** model a container
+`#[serde(rename_all = …)]`, a field `#[serde(flatten)]`, or an unrecognised
+serde attribute: those case-rewrite, open up or otherwise change the accepted set
+in ways the extractor cannot compute, so it panics rather than guessing (four
+`#[should_panic]` tests pin that, and two more cover private fields and a
+`rename(serialize = …)`-only field), and every `*_KNOWN_KEYS` list must appear in
+the guard's table (`strict_known_key_lists_are_all_covered`). Two latent
+`cfg` hazards, both absent from the six structs today: a `#[cfg]`-gated **field**
+is read as if it were always present, so a build without that feature has the
+lists accept a key its serde ignores — the safe direction (a missed typo, never a
+false 400); but a `#[cfg_attr(feature, serde(rename/alias = …))]` is invisible to
+the textual guard, which then knows only the field name, so on the
+feature-enabled build serde accepts the renamed key while strict mode refuses it
+— the **false-400** direction. (Measured with a probe struct under
+`--features otel`: with the feature on, `{"cfgAlias": …}` fills the field whose
+only attribute is `#[cfg_attr(feature = "otel", serde(alias = "cfgAlias"))]`,
+while the extractor still returns just the field name.) The extractor also
+panics rather than mis-reading a `#[serde (rename = "…")]` written with a space
+before the parenthesis (rustfmt normalises it) or a comment inside the attribute
+value; both are fail-closed false alarms. Every
+serde-accepted spelling is in the list, so a Go-authored config using Go's names
+(`localPort`, `customDomains`, `useEncryption`, …) and an frp-rs-authored one
+using snake_case both still load.
 
-The consequence is not uniform. An unknown or optional key is dropped silently —
-`remote_portt = 7001` loads as `remote_port: 0`, the same silent-config-loss
-class as the camelCase wire-field gotcha — but a *required* key left unset is
-rejected with a message naming it (`visitor 'v': bind port is required`). For a
-proxy block, check its keys against the type's reference rather than relying on
-strict mode to catch a typo.
+What the walk does **not** reach, each cell measured on Go frp v0.71.0
+(darwin/arm64) against frp-rs at this commit:
+
+* An unknown key inside `[proxies.requestHeaders]` / `[proxies.responseHeaders]`
+  (or the same tables under `plugin`) is still accepted here and rejected by Go:
+  `normalize_proxies` removes those tables before the check, keeping only their
+  `set` map. Measured: `[proxies.requestHeaders] notAKnownRhKey = 1` →
+  Go `decode proxy at index 0: unmarshal ProxyConfig error: json: unknown field
+  "notAKnownRhKey"`, exit 1; frp-rs `Config file … is valid`, exit 0.
+* A mis-cased key is refused where Go accepts **and applies** it. Go's
+  `encoding/json` decoder matches object keys case-insensitively, so
+  `[[proxies]] … RemotePort = 7198` is read as `remotePort`; frp-rs's lists match
+  exactly, so strict mode reports
+  `unknown field "proxies[0].RemotePort" … did you mean 'remotePort'?` and exits
+  1, and `--strict-config=false` drops the key (leaving `remote_port: 0`).
+  Measured on a real Go frps + Go frpc pair, reading `GET /api/proxy/tcp` from
+  the frps admin API: `RemotePort`, `REMOTEPORT` and `remoteport` each register
+  the requested port verbatim (`remotePort` in the API response equals the
+  configured value). This mirrors the top-level behaviour that predates this
+  walk: `SERVERADDR` at the top level is Go-accepted (exit 0, measured) and
+  frp-rs-refused (`unknown field "SERVERADDR"`, exit 1).
+* A **legacy-shaped top-level section** — any top-level mapping that carries a
+  `type` key, in **any** config format, because the collector keys on the shape
+  and `normalize_client_config` never sees the file format — is fed through the
+  same check, but with Go's accept-and-ignore semantics rather than the v1
+  surface's rejection: the legacy collector folds the prefix mechanisms Go reads
+  (`meta_*` → `metadatas`, `header_*` → `headers` for `type = "http"`,
+  `plugin_header_*` → the plugin's `request_headers` for the three plugin types
+  whose conversion reads them — `http2https`, `https2http`, `https2https`), then
+  **drops** every remaining key the typed struct does not name, because Go's
+  legacy path (`gopkg.in/ini` `MapTo` plus the explicit field reads in
+  `pkg/config/legacy/*.go`) ignores such keys instead of rejecting them.
+  Measured: Go frp v0.71.0's own `conf/legacy/frpc_legacy_full.ini` gives
+  `frpc verify -c` exit 0, and every one of those mechanisms loads here too
+  (`legacy_ini_go_shipped_fixture_passes_strict_mode` runs the shipped file
+  through the strict check from
+  `frp-core/src/config/fixtures/frpc_legacy_full.ini`). The keys Go ignores —
+  `[common]`-only keys misplaced into a proxy section (`log_level`,
+  `privilege_mode`, `pool_count`, `start`, `tcp_mux`, `log_file`,
+  `log_max_days`, `log_way`, `login_fail_exit`), a stray `plugin_*` parameter
+  (`plugin_enable_http2`), a visitor's `meta_*`/`header_*`, and an unknown key
+  inside a legacy `[plugin.xxx]` server section — load and are dropped on both
+  sides (all measured; Go exit 0 / frp-rs exit 0).
+  The health-check `health_check_interval_s` / `health_check_timeout_s`
+  spellings are renamed onto the v1 fields before the check, as Go's own legacy
+  conversion does (`pkg/config/legacy/conversion.go:204-206`), and when both
+  spellings are present the `_s` value wins: measured on Go v0.71.0 with a real
+  frps+frpc pair and a dead local port (health-check log gaps), `_s = 2` gives a
+  check every 2.0 s whether or not `_seconds = 99` is also set, `_seconds = 2`
+  alone is ignored (one check, then the 10 s default), and `_s = 99` +
+  `_seconds = 2` gives one check.
+  * **Divergence for a legacy-shaped section in a non-INI file.** Go's v1
+    decoder rejects the *section name* outright, while frp-rs collects it into a
+    proxy and (after this change) ignores the same key again. Measured on
+    `serverAddr`/`serverPort` plus `[legacysection] type = "tcp"` + … +
+    `notAKnownKey = 1`, with identical results for `.toml`, `.json` and
+    `.yaml`: Go `json: unknown field "legacysection"`, exit 1; frp-rs before
+    this item exit 0 (`Config file … is valid`); frp-rs at the round-1 head
+    exit 1 (`unknown field "proxies[0].notAKnownKey"`); frp-rs now exit 0. So
+    this is the **pre-existing** frp-rs extension (the collector has always been
+    shape-based), not a new divergence: the round-1 strict walk briefly made it
+    Go-like for non-INI files and the strip restored the extension's behaviour.
+    It is permissive only — frp-rs loads a config Go rejects — so it cannot
+    produce a false 400. Scoping the collection to `.ini` would mean threading
+    the file format into `normalize_client_config` and would remove the ability
+    to spell a proxy as a top-level table; the divergence is recorded instead.
+* Keys frp-rs accepts that Go does not stay accepted, because strict mode must
+  accept valid frp-rs configs: `[[http_plugins]]` (Go knows only `httpPlugins`),
+  `url` / `timeout` / `enable_control` in an `[[httpPlugins]]` entry,
+  `healthCheckHttpHeaders`, `vnetIp` / `vnetNetmask` / `vnetMtu` /
+  `advertiseSubnet`, and the snake_case element spellings.
+
+Nested tables in sections that *are* checked but have no key set of their own
+are still skipped (`auth.tokenSource.exec.env` — see the `[auth]` note below),
+and the sections most likely to be typo'd — `[auth]`, `[log]`, `[webServer]`,
+`[transport]` — are checked as before.
+
+With `--strict-config=false`, and in any position this walk does not reach, an
+unknown or optional key is still dropped silently: `remote_portt = 7001` loads
+as `remote_port: 0`, the same silent-config-loss class as the camelCase
+wire-field gotcha. A *required* key left unset is rejected with a message naming
+it (`visitor 'v': bind port is required`).
 
 `POST /api/reload` additionally accepts the frp-rs extension body
 `{"strict_config": true}` (also accepted as `"strictConfig"`, the spelling

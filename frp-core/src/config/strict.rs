@@ -236,6 +236,199 @@ pub(super) fn known_client_keys() -> std::collections::HashSet<&'static str> {
     ])
 }
 
+/// Serde-accepted key sets for the **array elements** `check_strict` recurses
+/// into, one list per struct (not per proxy/visitor/plugin type: each of these
+/// is a single union struct whose serde fields and aliases cover every type).
+///
+/// `strict_array_element_keys_match_struct_fields` (in `tests.rs`) extracts the
+/// field and `alias` names from the struct definitions and fails when a list
+/// here drifts from them, in either direction.
+///
+/// `ProxyConfig` (`frp-core/src/config/client.rs`).
+pub(super) const PROXY_KNOWN_KEYS: &[&str] = &[
+    "advertiseSubnet",
+    "advertise_subnet",
+    "allowUsers",
+    "allow_users",
+    "annotations",
+    "bandwidthLimit",
+    "bandwidthLimitMode",
+    "bandwidth_limit",
+    "bandwidth_limit_mode",
+    "customDomains",
+    "custom_domains",
+    "disableAssistedAddrs",
+    "disable_assisted_addrs",
+    "enabled",
+    "group",
+    "groupKey",
+    "group_key",
+    "headers",
+    "healthCheckHttpHeaders",
+    "health_check_http_headers",
+    "health_check_interval_seconds",
+    "health_check_max_failed",
+    "health_check_timeout_seconds",
+    "health_check_type",
+    "health_check_url",
+    "hostHeaderRewrite",
+    "host_header_rewrite",
+    "httpPassword",
+    "httpPwd",
+    "httpUser",
+    "http_password",
+    "http_pwd",
+    "http_user",
+    "localIP",
+    "localIp",
+    "localPort",
+    "local_ip",
+    "local_port",
+    "locations",
+    "metadatas",
+    "metas",
+    "multiplexer",
+    "name",
+    "plugin",
+    "proxyProtocolVersion",
+    "proxy_protocol_version",
+    "remotePort",
+    "remote_port",
+    "responseHeaders",
+    "response_headers",
+    "routeByHTTPUser",
+    "route_by_http_user",
+    "secretKey",
+    "sk",
+    "subdomain",
+    "type",
+    "useCompression",
+    "useEncryption",
+    "use_compression",
+    "use_encryption",
+    "virtual_net",
+    "vnetIp",
+    "vnetMtu",
+    "vnetNetmask",
+    "vnet_ip",
+    "vnet_mtu",
+    "vnet_netmask",
+];
+
+/// `VisitorConfig` (`frp-core/src/config/client.rs`).
+pub(super) const VISITOR_KNOWN_KEYS: &[&str] = &[
+    "bindAddr",
+    "bindPort",
+    "bind_addr",
+    "bind_port",
+    "disableAssistedAddrs",
+    "disable_assisted_addrs",
+    "enabled",
+    "fallbackTimeoutMs",
+    "fallbackTo",
+    "fallback_timeout_ms",
+    "fallback_to",
+    "keepTunnelOpen",
+    "keep_tunnel_open",
+    "maxRetriesAnHour",
+    "max_retries_an_hour",
+    "minRetryInterval",
+    "min_retry_interval",
+    "name",
+    "plugin",
+    "protocol",
+    "secretKey",
+    "secret_key",
+    "serverName",
+    "serverUser",
+    "server_name",
+    "server_user",
+    "sk",
+    "type",
+    "useCompression",
+    "useEncryption",
+    "use_compression",
+    "use_encryption",
+];
+
+/// `PluginConfig` (`frp-core/src/config/server.rs`) — the client plugin table
+/// (`[proxies.plugin]`).
+pub(super) const CLIENT_PLUGIN_KNOWN_KEYS: &[&str] = &[
+    "bindAddr",
+    "bindPort",
+    "bind_addr",
+    "bind_port",
+    "crtPath",
+    "crt_file",
+    "enableHTTP2",
+    "enable_http2",
+    "hostHeaderRewrite",
+    "host_header_rewrite",
+    "httpPassword",
+    "httpUser",
+    "http_password",
+    "http_user",
+    "keyPath",
+    "key_file",
+    "localAddr",
+    "localPath",
+    "local_addr",
+    "local_path",
+    "passwd",
+    "password",
+    "pluginCrtPath",
+    "pluginKeyPath",
+    "plugin_crt_path",
+    "plugin_key_path",
+    "proxyProtocolVersion",
+    "proxy_protocol_version",
+    "request_headers",
+    "secret_key",
+    "serverName",
+    "server_name",
+    "sk",
+    "stripPrefix",
+    "strip_prefix",
+    "type",
+    "unixPath",
+    "user",
+    "username",
+];
+
+/// `VisitorPluginConfig` (`frp-core/src/config/client.rs`) — the visitor plugin
+/// table (`[visitors.plugin]`).
+pub(super) const VISITOR_PLUGIN_KNOWN_KEYS: &[&str] = &[
+    "bindAddr",
+    "bindPort",
+    "bind_addr",
+    "bind_port",
+    "destinationIP",
+    "destination_ip",
+    "secret_key",
+    "serverName",
+    "server_name",
+    "sk",
+    "type",
+];
+
+/// `HttpPluginConfig` (`frp-core/src/config/server.rs`) — `[[httpPlugins]]`
+/// elements (normalized to the `http_plugins` array before the check).
+pub(super) const HTTP_PLUGIN_KNOWN_KEYS: &[&str] = &[
+    "addr",
+    "enable_control",
+    "name",
+    "ops",
+    "path",
+    "timeout",
+    "tlsVerify",
+    "tls_verify",
+    "url",
+];
+
+/// `HealthCheckHttpHeader` (`frp-core/src/config/client.rs`) — elements of a
+/// proxy's `health_check_http_headers` array.
+pub(super) const HEALTH_CHECK_HEADER_KNOWN_KEYS: &[&str] = &["name", "value"];
+
 pub(super) fn run_strict_check(
     value: &toml::Value,
     known: &std::collections::HashSet<&str>,
@@ -276,13 +469,8 @@ pub(super) fn levenshtein(a: &str, b: &str) -> usize {
 
 /// Known keys for nested sections, used by `check_strict` recursion.
 /// Each entry lists the snake_case fields the frp-rs structs deserialize plus
-/// the Go frp v0.70.1 camelCase aliases serde accepts (normalization does not
-/// rename keys inside these sections). Sections not listed are not recursed
-/// into (e.g. `proxies`/`visitors` arrays). Go's RejectUnknownMembers
-/// (pkg/config/v1/decode.go) rejects unknown proxy/visitor/plugin fields;
-/// frp-rs deliberately does not recurse into them — per-type keys would make
-/// the check a maintenance hazard, and skipping the recursion is the looser
-/// direction, keeping valid frp-rs configs loading.
+/// the Go frp v0.71.0 camelCase aliases serde accepts (normalization does not
+/// rename keys inside these sections).
 fn section_known_keys(section: &str) -> Option<&'static [&'static str]> {
     let keys: &'static [&'static str] = match section {
         // Union of client and server auth flat fields (normalization flattens
@@ -427,11 +615,152 @@ fn section_known_keys(section: &str) -> Option<&'static [&'static str]> {
     Some(keys)
 }
 
+/// Where the table currently being checked sits in the config tree. Needed
+/// because `plugin` means a different struct inside a `[[proxies]]` element
+/// (`PluginConfig`) than inside a `[[visitors]]` element
+/// (`VisitorPluginConfig`), and because the element positions decide which
+/// arrays and nested tables may be descended into.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ctx {
+    /// Top level of a client or server config (and the walked `[section]`
+    /// tables, which keep the same per-key dispatch).
+    Root,
+    /// One `[[proxies]]` element.
+    ProxyElement,
+    /// One `[[visitors]]` element.
+    VisitorElement,
+    /// One `[[httpPlugins]]` (normalized `http_plugins`) element.
+    HttpPluginElement,
+    /// One `[proxies.plugin]` table.
+    ProxyPlugin,
+    /// One `[visitors.plugin]` table.
+    VisitorPlugin,
+    /// One `health_check_http_headers` array element.
+    HealthCheckHeader,
+}
+
+/// Key set of a nested **table** child, by the kind of table it sits in.
+///
+/// Deliberately an explicit whitelist. The other nested values inside a proxy
+/// element are open maps (`headers`, `response_headers`, `annotations`,
+/// `metas`) whose user-chosen keys must not be read as field names; everything
+/// else Go nests (`transport`, `healthCheck`, `loadBalancer`, `natTraversal`)
+/// is flattened onto the element by `normalize_proxies` before this check runs,
+/// so it is checked as an element key instead.
+fn child_table_keys(ctx: Ctx, key: &str) -> Option<&'static [&'static str]> {
+    match ctx {
+        Ctx::Root => section_known_keys(key),
+        Ctx::ProxyElement => (key == "plugin").then_some(CLIENT_PLUGIN_KNOWN_KEYS),
+        Ctx::VisitorElement => (key == "plugin").then_some(VISITOR_PLUGIN_KNOWN_KEYS),
+        Ctx::HttpPluginElement | Ctx::ProxyPlugin | Ctx::VisitorPlugin | Ctx::HealthCheckHeader => {
+            None
+        }
+    }
+}
+
+/// Key set (and child context) of an **array** child that `check_strict`
+/// descends into, one element at a time. Arrays not listed here are left
+/// alone: their element type is either a scalar (`ops`, `custom_domains`,
+/// `locations`, …) or an open shape (maps of user-chosen keys).
+///
+/// Both spellings of the health-check header array are listed: serde accepts
+/// `health_check_http_headers` and its alias `healthCheckHttpHeaders`, and
+/// `normalize_proxies` renames only the nested `healthCheck.httpHeaders` form,
+/// so a flat `healthCheckHttpHeaders` alias survives here as its own key.
+fn child_array_keys(ctx: Ctx, key: &str) -> Option<(&'static [&'static str], Ctx)> {
+    match (ctx, key) {
+        (Ctx::Root, "proxies") => Some((PROXY_KNOWN_KEYS, Ctx::ProxyElement)),
+        (Ctx::Root, "visitors") => Some((VISITOR_KNOWN_KEYS, Ctx::VisitorElement)),
+        (Ctx::Root, "http_plugins") => Some((HTTP_PLUGIN_KNOWN_KEYS, Ctx::HttpPluginElement)),
+        (Ctx::ProxyElement, "health_check_http_headers" | "healthCheckHttpHeaders") => {
+            Some((HEALTH_CHECK_HEADER_KNOWN_KEYS, Ctx::HealthCheckHeader))
+        }
+        _ => None,
+    }
+}
+
+/// Child context of a nested table, so the two walkers cannot disagree about
+/// which struct a `plugin` table belongs to.
+fn child_ctx(ctx: Ctx, key: &str) -> Ctx {
+    match (ctx, key) {
+        (Ctx::ProxyElement, "plugin") => Ctx::ProxyPlugin,
+        (Ctx::VisitorElement, "plugin") => Ctx::VisitorPlugin,
+        _ => Ctx::Root,
+    }
+}
+
+/// Drop every key `check_strict` would reject, recursing through the same
+/// whitelists. Used for elements produced by the **legacy-shaped-section**
+/// collector (a top-level mapping carrying a `type`, in any config format):
+/// Go's legacy path ignores a key its typed struct does not name
+/// (`gopkg.in/ini` `MapTo` and the explicit field reads in
+/// `pkg/config/legacy/*.go`) rather than rejecting it, so refusing one there
+/// would fail a config Go loads.
+///
+/// Runs after `normalize_proxies` / `normalize_visitors`, so the keys those
+/// folds consume (`transport`, `healthCheck`, `loadBalancer`, `natTraversal`,
+/// `requestHeaders`, …) have already been renamed and survive as element keys.
+pub(super) fn strip_unknown_legacy_element_keys(element: &mut toml::Value, visitor: bool) {
+    let Some(table) = element.as_table_mut() else {
+        return;
+    };
+    let (keys, ctx) = if visitor {
+        (VISITOR_KNOWN_KEYS, Ctx::VisitorElement)
+    } else {
+        (PROXY_KNOWN_KEYS, Ctx::ProxyElement)
+    };
+    strip_unknown_keys_in(table, &known_set_from(keys), ctx);
+}
+
+fn strip_unknown_keys_in(
+    table: &mut toml::Table,
+    known: &std::collections::HashSet<&str>,
+    ctx: Ctx,
+) {
+    for key in table.keys().cloned().collect::<Vec<_>>() {
+        if !known.contains(key.as_str()) {
+            table.remove(&key);
+            continue;
+        }
+        match table.get_mut(&key) {
+            Some(toml::Value::Table(sub)) => {
+                if let Some(sub_keys) = child_table_keys(ctx, &key) {
+                    strip_unknown_keys_in(sub, &known_set_from(sub_keys), child_ctx(ctx, &key));
+                }
+            }
+            Some(toml::Value::Array(elements)) => {
+                if let Some((element_keys, element_ctx)) = child_array_keys(ctx, &key) {
+                    for element in elements.iter_mut() {
+                        if let toml::Value::Table(element) = element {
+                            strip_unknown_keys_in(
+                                element,
+                                &known_set_from(element_keys),
+                                element_ctx,
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub(super) fn check_strict(
     table: &toml::Table,
     known: &std::collections::HashSet<&str>,
     path: &str,
     config_path: &str,
+) -> Vec<String> {
+    check_strict_in(table, known, path, config_path, Ctx::Root)
+}
+
+fn check_strict_in(
+    table: &toml::Table,
+    known: &std::collections::HashSet<&str>,
+    path: &str,
+    config_path: &str,
+    ctx: Ctx,
 ) -> Vec<String> {
     let mut errors = Vec::new();
     // Sections whose keys are wildcards (HashMap via #[serde(flatten)])
@@ -483,16 +812,42 @@ pub(super) fn check_strict(
 
         // Recurse into known sub-tables with per-section known-key sets so
         // nested unknown fields are caught too (Go strict mode checks the
-        // whole config tree, not just the top level).
-        if let Some(toml::Value::Table(sub)) = table.get(key) {
-            if let Some(sub_keys) = section_known_keys(key) {
-                errors.extend(check_strict(
-                    sub,
-                    &known_set_from(sub_keys),
-                    &full_key,
-                    config_path,
-                ));
+        // whole config tree, not just the top level), and into the
+        // array-of-tables elements `[[proxies]]`/`[[visitors]]`/
+        // `[[httpPlugins]]` with their per-struct key sets. Go's
+        // RejectUnknownMembers (pkg/config/v1/decode.go) rejects an unknown
+        // proxy/visitor/plugin field at any depth, including inside these
+        // arrays; before this recursion the key set was per *section* and an
+        // array value never reached the lookup, so an unknown element key was
+        // accepted (the exemption the tests used to pin).
+        match table.get(key) {
+            Some(toml::Value::Table(sub)) => {
+                if let Some(sub_keys) = child_table_keys(ctx, key) {
+                    errors.extend(check_strict_in(
+                        sub,
+                        &known_set_from(sub_keys),
+                        &full_key,
+                        config_path,
+                        child_ctx(ctx, key),
+                    ));
+                }
             }
+            Some(toml::Value::Array(elements)) => {
+                if let Some((element_keys, element_ctx)) = child_array_keys(ctx, key) {
+                    for (index, element) in elements.iter().enumerate() {
+                        if let toml::Value::Table(element) = element {
+                            errors.extend(check_strict_in(
+                                element,
+                                &known_set_from(element_keys),
+                                &format!("{}[{}]", full_key, index),
+                                config_path,
+                                element_ctx,
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     errors

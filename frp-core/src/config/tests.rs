@@ -3969,24 +3969,24 @@ tokenz = "secret"
     assert!(err.contains("unknown field \"auth.tokenz\""), "got: {err}");
 }
 
-/// Strict mode deliberately does NOT recurse into `[[proxies]]` / `[[visitors]]`
-/// array elements: an unknown field inside one loads where Go frp v0.71.0
-/// rejects the same config (with strict mode on — Go's default — it refuses to
-/// start: `decode proxy at index 0:
-/// unmarshal ProxyConfig error: json: unknown field ...`). The enforcement
-/// point is `check_strict`'s "recurse only into a `toml::Value::Table`" guard:
-/// an array value never reaches the `section_known_keys` lookup, which is why
-/// the exemption covers every element regardless of its `type` — a `tcp` proxy,
-/// a plugin proxy and an `xtcp` visitor are all pinned below. The rationale and
-/// the operator-facing consequence are recorded in the strict-mode paragraph of
-/// the client-admin section in `docs/deployment.md`; a future Go-faithful
-/// recursion must update that paragraph and this pin together.
+/// Strict mode recurses into `[[proxies]]` / `[[visitors]]` / `[[httpPlugins]]`
+/// array elements with one key set per **struct** (`strict.rs`:
+/// `PROXY_KNOWN_KEYS`, `VISITOR_KNOWN_KEYS`, `CLIENT_PLUGIN_KNOWN_KEYS`,
+/// `VISITOR_PLUGIN_KNOWN_KEYS`, `HTTP_PLUGIN_KNOWN_KEYS`), so an unknown field
+/// inside an element is refused with the element index in the path — the
+/// Go-faithful direction. Go frp v0.71.0 with strict mode on (its default)
+/// refuses to start on the config below: `decode proxy at index 0: unmarshal
+/// ProxyConfig error: json: unknown field "bogus_key_in_tcp_proxy"` (measured
+/// on the v0.71.0 darwin/arm64 binary; `frpc verify -c` exits 1).
 ///
-/// The older `test_strict_accepts_unknown_proxy_field_deliberate_divergence`
-/// covers the single-`tcp`-proxy case; this one adds the visitor half and the
-/// array-wide scope.
+/// The key sets are generated from the struct definitions and held in place by
+/// `strict_array_element_keys_match_struct_fields`, which fails when a field or
+/// `alias` is added without updating the list. The older
+/// `test_strict_rejects_unknown_proxy_field` covers the single-`tcp`-proxy
+/// case; this one adds the visitor half, the plugin table, the server-side
+/// `[[httpPlugins]]` array and the non-strict contrast.
 #[test]
-fn strict_mode_exempts_proxy_and_visitor_array_elements() {
+fn strict_mode_rejects_unknown_proxy_and_visitor_array_elements() {
     let mut f = tempfile::NamedTempFile::new().unwrap();
     f.write_all(
         br#"serverAddr = "127.0.0.1"
@@ -4019,8 +4019,56 @@ bogus_key_in_visitor = 1
 "#,
     )
     .unwrap();
-    let cfg = load_client_config(f.path().to_str().unwrap(), true)
-        .expect("strict mode must accept unknown fields inside proxies/visitors");
+    let err = load_client_config(f.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    for expected in [
+        "unknown field \"proxies[0].bogus_key_in_tcp_proxy\"",
+        "unknown field \"proxies[1].bogus_key_in_plugin_proxy\"",
+        "unknown field \"visitors[0].bogus_key_in_visitor\"",
+    ] {
+        assert!(
+            err.contains(expected),
+            "strict mode must refuse {expected:?}; got: {err}"
+        );
+    }
+
+    // The same file without the three unknown keys loads under strict mode and
+    // carries the element values the arrays declared — the refusal above is the
+    // unknown keys, not a blanket refusal of proxies/visitors. (`protocol = ""`
+    // on the xtcp visitor also exercises the normalizer's empty-protocol arm.)
+    let mut clean = tempfile::NamedTempFile::new().unwrap();
+    clean
+        .write_all(
+            br#"serverAddr = "127.0.0.1"
+serverPort = 7000
+token = "t"
+
+[[proxies]]
+name = "plain"
+type = "tcp"
+local_port = 80
+remote_port = 7001
+
+[[proxies]]
+name = "plug"
+type = "tcp"
+remote_port = 7002
+[proxies.plugin]
+type = "http_proxy"
+httpUser = "u"
+
+[[visitors]]
+name = "vis"
+type = "xtcp"
+server_name = "s"
+bind_port = 7003
+protocol = ""
+"#,
+        )
+        .unwrap();
+    let cfg = load_client_config(clean.path().to_str().unwrap(), true)
+        .expect("the same config without the unknown keys must load");
     assert_eq!(cfg.proxies.len(), 2);
     assert_eq!(cfg.proxies[0].name, "plain");
     assert_eq!(cfg.proxies[0].remote_port, 7001);
@@ -4031,11 +4079,20 @@ bogus_key_in_visitor = 1
     );
     assert_eq!(cfg.visitors.len(), 1);
     assert_eq!(cfg.visitors[0].name, "vis");
+    assert_eq!(cfg.visitors[0].protocol, "quic");
 
-    // The same array exemption reaches frps: `[[httpPlugins]]` normalizes to
-    // the `http_plugins` array, which `check_strict` cannot recurse into
-    // either, so an unknown field inside one is accepted too. Covered because
-    // it is the only server-side config array of tables a user edits by hand.
+    // Non-strict mode keeps the old Go-ignores-unknown-fields behaviour: the
+    // key is dropped, the rest of the element is honoured. Go with
+    // `--strict-config=false` loads this file too (measured).
+    let cfg = load_client_config(f.path().to_str().unwrap(), false)
+        .expect("non-strict mode must still load the file");
+    assert_eq!(cfg.proxies.len(), 2);
+    assert_eq!(cfg.proxies[0].remote_port, 7001);
+    assert_eq!(cfg.proxies[1].name, "plug");
+    assert_eq!(cfg.visitors.len(), 1);
+
+    // The server-side array is checked too: `[[httpPlugins]]` normalizes to
+    // `http_plugins`, and the error path carries the element index.
     let mut sf = tempfile::NamedTempFile::new().unwrap();
     sf.write_all(
         br#"bindPort = 7000
@@ -4048,18 +4105,36 @@ bogus_key_in_http_plugin = 1
 "#,
     )
     .unwrap();
-    let scfg = load_server_config(sf.path().to_str().unwrap(), true)
-        .expect("strict mode must accept unknown fields inside httpPlugins");
+    let err = load_server_config(sf.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"http_plugins[0].bogus_key_in_http_plugin\""),
+        "got: {err}"
+    );
+
+    let mut sclean = tempfile::NamedTempFile::new().unwrap();
+    sclean
+        .write_all(
+            br#"bindPort = 7000
+[[httpPlugins]]
+name = "hook"
+addr = "http://127.0.0.1:4000"
+path = "/handler"
+ops = ["login"]
+"#,
+        )
+        .unwrap();
+    let scfg = load_server_config(sclean.path().to_str().unwrap(), true)
+        .expect("the same httpPlugins entry without the unknown key must load");
     assert_eq!(scfg.http_plugins.len(), 1);
     assert_eq!(scfg.http_plugins[0].name, "hook");
 
-    // Control: the sections strict mode DOES recurse into still reject an
-    // unknown key, so the green result above cannot be a disabled checker.
-    // Same behaviour as `test_strict_rejects_nested_unknown_keys`; asserted
-    // here too so this pin fails if the control regresses. Server configs are
-    // used so `[transport]`/`[web_server]` exercise the section recursion
-    // itself (a *client* `[transport]` is flattened to top level before the
-    // check, so it rejects too but with an unprefixed `full_key`).
+    // Control: the sections strict mode already recursed into still reject an
+    // unknown key, so the refusal above cannot be a blanket failure. Server
+    // configs are used so `[transport]`/`[web_server]` exercise the section
+    // recursion itself (a *client* `[transport]` is flattened to top level
+    // before the check, so it rejects too but with an unprefixed `full_key`).
     for (label, body, expected) in [
         (
             "log",
@@ -4110,11 +4185,8 @@ bogus_key_in_http_plugin = 1
     );
 
     // Teeth, without touching `strict.rs`: the *identical* key one level up
-    // (top level) is rejected by the same strict check. So the acceptance above
-    // is the array skip, not a disabled checker. The pin flips once
-    // `check_strict` recurses into those arrays with their per-struct key sets;
-    // adding `section_known_keys` arms alone is not enough, because an array
-    // value never reaches that lookup while the recursion is `Table`-only.
+    // (top level) is rejected by the same strict check, so the refusals above
+    // are the array recursion, not a checker that rejects everything.
     let mut top = tempfile::NamedTempFile::new().unwrap();
     top.write_all(b"serverAddr = \"127.0.0.1\"\nserverPort = 7000\nbogus_key_in_tcp_proxy = 1\n")
         .unwrap();
@@ -4127,6 +4199,783 @@ bogus_key_in_http_plugin = 1
     );
 }
 
+// ─── Strict mode: array-element key lists ─────────────────────────────
+
+/// Serde attribute names the key extractor below **models** on a field. Any
+/// other `#[serde(...)]` name is a hard error (see `serde_attr_key_names`), so
+/// a future attribute that changes the accepted key set cannot slip past the
+/// guard unnoticed; it has to be classified here first.
+const SERDE_FIELD_ATTRS_MODELLED: &[&str] = &[
+    "rename",
+    "alias",
+    "skip",
+    "skip_deserializing",
+    // Understood, and unable to change which keys are accepted:
+    "default",
+    "skip_serializing",
+    "with",
+    "deserialize_with",
+    "serialize_with",
+    "borrow",
+    "bound",
+    "getter",
+    "expecting",
+];
+
+/// `#[serde(...)]` names on a **field** that would change the accepted key set
+/// in a way this scanner does not model. Listed explicitly so the panic message
+/// says what to do.
+const SERDE_FIELD_ATTRS_UNMODELLED: &[&str] = &[
+    "flatten",
+    "rename_all",
+    "rename_all_fields",
+    "untagged",
+    "tag",
+    "content",
+    "transparent",
+    "remote",
+    "from",
+    "try_from",
+    "into",
+    "crate",
+];
+
+/// Same, for a `#[serde(...)]` on the **struct** itself. A container
+/// `rename_all` rewrites every field spelling, which is exactly the kind of
+/// two-way drift the guard exists to catch, so it panics rather than guessing a
+/// case convention.
+const SERDE_CONTAINER_ATTRS_MODELLED: &[&str] = &[
+    "default",
+    "deny_unknown_fields",
+    "expecting",
+    "bound",
+    "crate",
+];
+
+const SERDE_CONTAINER_ATTRS_UNMODELLED: &[&str] = &[
+    "rename_all",
+    "rename_all_fields",
+    "flatten",
+    "untagged",
+    "tag",
+    "content",
+    "transparent",
+];
+
+/// One `#[serde(...)]` entry: its name, an optional `= "value"`, and its
+/// optional nested `(...)` entries (for `rename(deserialize = "…")`).
+struct SerdeAttr {
+    name: String,
+    value: Option<String>,
+    nested: Vec<SerdeAttr>,
+}
+
+/// Parse the argument list of a `#[serde(...)]` attribute (the text between the
+/// outer parentheses) into entries, splitting on top-level commas.
+fn parse_serde_args(text: &str) -> Vec<SerdeAttr> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while !rest.trim().is_empty() {
+        // name
+        let trimmed = rest.trim_start();
+        let name_end = trimmed
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(trimmed.len());
+        let name = trimmed[..name_end].to_string();
+        let mut rest2 = trimmed[name_end..].trim_start();
+        let mut value = None;
+        let mut nested = Vec::new();
+        if let Some(r) = rest2.strip_prefix('=') {
+            let r = r.trim_start();
+            assert!(
+                r.starts_with('"'),
+                "serde attribute `{name}` has a non-string value this guard does not model: {text}"
+            );
+            let after = &r[1..];
+            let end = after
+                .find('"')
+                .unwrap_or_else(|| panic!("unterminated string in serde attribute: {text}"));
+            value = Some(after[..end].to_string());
+            rest2 = &after[end + 1..];
+        } else if let Some(r) = rest2.strip_prefix('(') {
+            let (inner, after) = split_balanced_parens(r)
+                .unwrap_or_else(|| panic!("unbalanced serde attribute parentheses: {text}"));
+            nested = parse_serde_args(inner);
+            rest2 = after;
+        }
+        out.push(SerdeAttr {
+            name,
+            value,
+            nested,
+        });
+        rest2 = rest2.trim_start();
+        if let Some(r) = rest2.strip_prefix(',') {
+            rest = r;
+        } else {
+            assert!(
+                rest2.is_empty(),
+                "unexpected trailing text in serde attribute: {text}"
+            );
+            rest = "";
+        }
+    }
+    out
+}
+
+/// Split `text` (the inside of a parenthesised group, with the opening paren
+/// already consumed) at its matching close paren; returns `(inside, rest)`.
+fn split_balanced_parens(text: &str) -> Option<(&str, &str)> {
+    let mut depth = 1usize;
+    let mut in_string = false;
+    let mut prev_backslash = false;
+    for (i, c) in text.char_indices() {
+        if in_string {
+            if c == '"' && !prev_backslash {
+                in_string = false;
+            }
+            prev_backslash = c == '\\' && !prev_backslash;
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&text[..i], &text[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Classify the `#[serde(...)]` entries found on a field or a struct, and panic
+/// on any name this guard does not model.
+fn classify_serde_attrs(attrs: &[SerdeAttr], container: bool) {
+    let (modelled, unmodelled) = if container {
+        (
+            SERDE_CONTAINER_ATTRS_MODELLED,
+            SERDE_CONTAINER_ATTRS_UNMODELLED,
+        )
+    } else {
+        (SERDE_FIELD_ATTRS_MODELLED, SERDE_FIELD_ATTRS_UNMODELLED)
+    };
+    for attr in attrs {
+        let Some(name) = attr.name.as_str().into() else {
+            unreachable!()
+        };
+        let name: &str = name;
+        assert!(
+            !unmodelled.contains(&name),
+            "the strict-mode key guard does not model `#[serde({name})]` \
+             ({}): it can change the accepted key set, so the key lists in \
+             `strict.rs` cannot be checked against the struct until the \
+             extractor is taught it",
+            if container {
+                "container attribute"
+            } else {
+                "field attribute"
+            }
+        );
+        assert!(
+            modelled.contains(&name),
+            "the strict-mode key guard does not recognise `#[serde({name})]` \
+             ({}): classify it in `SERDE_FIELD_ATTRS_*` / \
+             `SERDE_CONTAINER_ATTRS_*` in `frp-core/src/config/tests.rs` before \
+             relying on this guard",
+            if container {
+                "container attribute"
+            } else {
+                "field attribute"
+            }
+        );
+    }
+}
+
+/// Accepted key names contributed by one field's attributes, or `None` when the
+/// field is skipped for deserialization.
+fn field_key_names(attrs: &[SerdeAttr], field: &str) -> Option<std::collections::BTreeSet<String>> {
+    classify_serde_attrs(attrs, false);
+    if attrs
+        .iter()
+        .any(|a| a.name == "skip" || a.name == "skip_deserializing")
+    {
+        return None;
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    // Deserialization name: `rename = "…"` and `rename(deserialize = "…")`
+    // replace it; a `rename(serialize = "…")` **only** does not, because serde
+    // then still deserializes from the field name — measured with a probe struct
+    // (`{"inner":1}` parses, `{"out":1}` does not, for
+    // `#[serde(rename(serialize = "out"))] inner`), which is also serde's
+    // documented behaviour. Demanding `deserialize = …` there would fail the
+    // guard on a legitimate edit.
+    let renamed = attrs.iter().find(|a| a.name == "rename").map(|a| {
+        if let Some(v) = &a.value {
+            Some(v.clone())
+        } else {
+            a.nested
+                .iter()
+                .find(|n| n.name == "deserialize")
+                .and_then(|n| n.value.clone())
+        }
+    });
+    keys.insert(renamed.flatten().unwrap_or_else(|| field.to_string()));
+    for alias in attrs.iter().filter(|a| a.name == "alias") {
+        keys.insert(
+            alias
+                .value
+                .clone()
+                .expect("alias always has a string value"),
+        );
+    }
+    Some(keys)
+}
+
+/// Extract the serde-accepted key set of `struct <name>` from a Rust source
+/// file: each field's deserialization name (`rename = "…"` or
+/// `rename(deserialize = "…")`, else the field name) plus every `alias`,
+/// skipping `skip`/`skip_deserializing` fields. Any visibility is read
+/// (`pub`, `pub(crate)`, `pub(super)`, `pub(in path)`, or none at all).
+///
+/// Panics when the struct is missing (the guard must not pass because it
+/// matched nothing) and on any serde attribute it does not model — `flatten`
+/// and `rename_all` above all, because they make the accepted set open-ended or
+/// rewrite every field spelling. Not covered, and stated in
+/// `docs/deployment.md`: a `#[cfg]`-gated field is read as if always present, so
+/// with the feature off the key lists accept a key the build's serde ignores
+/// (the safe direction — a missed typo, never a false 400).
+fn serde_keys_of_struct(src: &str, name: &str) -> std::collections::BTreeSet<String> {
+    // Any visibility is accepted (`pub`, `pub(crate)`, `pub(super)`,
+    // `pub(in …)`, or private): the declaration keyword carries no key
+    // information, so the scan starts at `struct <name>` and the container
+    // attributes are read from the window before it.
+    let needle = format!("struct {name}");
+    let mut at = None;
+    let mut from = 0usize;
+    while let Some(found) = src[from..].find(&needle) {
+        let abs = from + found;
+        let after = &src[abs + needle.len()..];
+        if after.starts_with(|c: char| c.is_whitespace() || c == '{' || c == '<') {
+            at = Some(abs);
+            break;
+        }
+        from = abs + needle.len();
+    }
+    let at =
+        at.unwrap_or_else(|| panic!("struct {name} not found in the source passed to this guard"));
+    // Container attributes sit between the end of the previous item and
+    // `struct`; the derive/doc lines in that window are ignored, and a
+    // `#[serde(...)]` there is classified as a container attribute.
+    let window_start = src[..at].rfind("\n}").map(|i| i + 2).unwrap_or(0);
+    let container_attrs = serde_attrs_in(&src[window_start..at]);
+    classify_serde_attrs(&container_attrs, true);
+
+    let open = at + src[at..].find('{').expect("struct body opens");
+    let mut depth = 0usize;
+    let mut close = None;
+    for (offset, ch) in src[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + offset);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &src[open + 1..close.expect("struct body closes")];
+
+    let mut keys = std::collections::BTreeSet::new();
+    let mut pending: Vec<SerdeAttr> = Vec::new();
+    let mut i = 0usize;
+    // Only a position where a **field declaration** can start is tested, so an
+    // identifier inside a field's type (`HashMap<String, std::path::PathBuf>`,
+    // `dyn Iterator<Item: Clone>`) cannot be mistaken for a field. A boundary is
+    // the body start, the byte after a `,` at bracket depth 0, and the byte
+    // after an attribute or a comment **at depth 0** (comments inside a type
+    // must not open one). `depth` counts `<>`, `()`, `[]` so a `,` inside
+    // `HashMap<A, B>` does not open a boundary either.
+    let mut at_boundary = true;
+    let mut depth = 0i32;
+    while i < body.len() {
+        // Source in this crate carries non-ASCII (em dashes, arrows); every
+        // slice below needs a char boundary and the scan advances byte-wise.
+        if !body.is_char_boundary(i) {
+            i += 1;
+            at_boundary = false;
+            continue;
+        }
+        if body[i..].starts_with("//") {
+            i += body[i..].find('\n').unwrap_or(body.len() - i);
+            at_boundary = depth == 0;
+        } else if body[i..].starts_with("/*") {
+            i += body[i..].find("*/").expect("block comment closes") + 2;
+            at_boundary = depth == 0;
+        } else if body[i..].starts_with("#[") {
+            let (text, next) = split_attribute(&body[i..]);
+            if let Some(args) = serde_args_of(&text) {
+                pending.extend(parse_serde_args(args));
+            }
+            i += next;
+            at_boundary = depth == 0;
+        } else {
+            let ch = body[i..].chars().next().expect("non-empty slice");
+            if ch.is_whitespace() {
+                // Whitespace between a boundary and the token it introduces must
+                // not close the boundary (fields and attributes are indented).
+                i += 1;
+                continue;
+            }
+            match ch {
+                ',' if depth == 0 => {
+                    at_boundary = true;
+                    i += 1;
+                    continue;
+                }
+                '<' | '(' | '[' => {
+                    depth += 1;
+                    at_boundary = false;
+                    i += 1;
+                    continue;
+                }
+                '>' | ')' | ']' => {
+                    depth = (depth - 1).max(0);
+                    at_boundary = false;
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            match field_name_at(&body[i..]) {
+                Some((field, after)) if at_boundary => {
+                    if let Some(names) = field_key_names(&pending, &field) {
+                        keys.extend(names);
+                    }
+                    pending.clear();
+                    i += after;
+                    at_boundary = false; // inside the field's type now
+                }
+                _ => {
+                    at_boundary = false;
+                    i += 1;
+                }
+            }
+        }
+    }
+    keys
+}
+
+/// Every `#[serde(...)]` group in `text`, parsed (doc comments skipped).
+fn serde_attrs_in(text: &str) -> Vec<SerdeAttr> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < text.len() {
+        if !text.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        if text[i..].starts_with("//") {
+            i += text[i..].find('\n').unwrap_or(text.len() - i);
+        } else if text[i..].starts_with("#[") {
+            let (attr, next) = split_attribute(&text[i..]);
+            if let Some(args) = serde_args_of(&attr) {
+                out.extend(parse_serde_args(args));
+            }
+            i += next;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Arguments of a `#[serde(...)]` attribute, or `None` for any other attribute.
+///
+/// A `serde` attribute that is not exactly the `serde(...)` form — e.g.
+/// `#[serde (rename = "…")]` with whitespace before the parenthesis — **panics**
+/// rather than being skipped: skipping it would treat the field as unrenamed,
+/// which is the drift this guard exists to catch. `rustfmt` normalises the space
+/// form away, so the panic is belt-and-braces for hand-written code.
+fn serde_args_of(attr: &str) -> Option<&str> {
+    let rest = attr.strip_prefix("serde")?;
+    if let Some(args) = rest.strip_prefix('(') {
+        return args.strip_suffix(')');
+    }
+    assert!(
+        !rest.starts_with(|c: char| c.is_whitespace()),
+        "`#[{attr}]` starts with `serde` but is not the `#[serde(...)]` form this \
+         guard parses; the key set cannot be derived from it"
+    );
+    None
+}
+
+/// Consume one balanced `#[...]` group at the start of `text`; returns the text
+/// between the brackets and how many bytes were consumed.
+fn split_attribute(text: &str) -> (String, usize) {
+    let bytes = text.as_bytes();
+    let mut i = 2usize; // past `#[`
+    let mut depth = 1usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if c == b'\\' {
+                i += 1;
+            } else if c == b'"' {
+                in_string = false;
+            }
+        } else if c == b'"' {
+            in_string = true;
+        } else if c == b'[' {
+            depth += 1;
+        } else if c == b']' {
+            depth -= 1;
+            if depth == 0 {
+                return (text[2..i].to_string(), i + 1);
+            }
+        }
+        i += 1;
+    }
+    panic!("unbalanced `#[` attribute in struct source: {text}");
+}
+
+/// If a field declaration starts at `text`, return its name and the number of
+/// bytes it occupies up to (and including) the colon. Handles `pub`,
+/// `pub(crate)`, `pub(super)`, `pub(in path)` and a field with **no visibility
+/// modifier** (private or inherited) — the visibility carries no key
+/// information, and a private field with a serde `alias` is a real way for the
+/// lists to go stale (R2's `HealthCheckHttpHeader` mutant).
+///
+/// The colon must not be the first of a `::` path separator, so a type such as
+/// `std::path::PathBuf` cannot be read as a field named `std`.
+fn field_name_at(text: &str) -> Option<(String, usize)> {
+    let mut consumed = 0usize;
+    let mut rest = text;
+    if let Some(after_pub) = rest.strip_prefix("pub") {
+        // `pub` only counts as a visibility when it is not the start of a
+        // longer identifier (`publish`), i.e. it is followed by `(` or space.
+        if !after_pub.starts_with(|c: char| c == '(' || c.is_whitespace()) {
+            return None;
+        }
+        consumed += 3;
+        rest = after_pub;
+        if let Some(r) = rest.trim_start().strip_prefix('(') {
+            let (_, after) = split_balanced_parens(r)?;
+            consumed += (rest.len() - rest.trim_start().len()) + 1 + (r.len() - after.len());
+            rest = after;
+        }
+    }
+    let ws = rest.len() - rest.trim_start().len();
+    consumed += ws;
+    rest = rest.trim_start();
+    // Raw identifier: serde's accepted key is the **stripped** name — measured
+    // with a probe struct (`{"match": …}` sets a `r#match` field, the alias
+    // `{"aliasMatch": …}` does too, and the literal `{"r#match": …}` does not) —
+    // so `r#` is dropped here. Before this, the field was not recognised at all
+    // and the extractor returned an empty set for the struct.
+    if let Some(stripped) = rest.strip_prefix("r#") {
+        consumed += 2;
+        rest = stripped;
+    }
+    let ident_len = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    let ident = &rest[..ident_len];
+    if ident.is_empty() || ident.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let after_ident = rest[ident_len..].trim_start();
+    let colon = after_ident.strip_prefix(':')?;
+    if colon.starts_with(':') {
+        // `::` — a path segment, not a field declaration.
+        return None;
+    }
+    consumed += ident_len + (rest[ident_len..].len() - after_ident.len()) + 1;
+    Some((ident.to_string(), consumed))
+}
+
+/// The key sets `check_strict` uses for `proxies`/`visitors`/`[[httpPlugins]]`
+/// elements and for the `plugin` tables must equal the serde surface of the
+/// struct they stand for. This is the drift guard: adding, removing or renaming
+/// a field or an `#[serde(alias = "…")]` on any of the six structs without
+/// updating the matching list in `strict.rs` fails here, in either direction
+/// (a stale list entry is also a bug: it admits a key the deserializer drops).
+///
+/// **What it does not cover**, stated rather than implied: a container
+/// `#[serde(rename_all = …)]` or a field `#[serde(flatten)]`/`skip_*` — those
+/// panic in the extractor instead of being modelled, so the suite goes red and
+/// asks for the extractor to be taught the transformation; and a *new*
+/// struct + array pair added to `child_table_keys`/`child_array_keys` — that
+/// needs a new row in the table below, which
+/// `strict_known_key_lists_are_all_covered` enforces for `strict.rs`'s
+/// `*_KNOWN_KEYS` constants, but not for a wholesale reuse of an existing list.
+#[test]
+fn strict_array_element_keys_match_struct_fields() {
+    use super::strict::{
+        CLIENT_PLUGIN_KNOWN_KEYS, HEALTH_CHECK_HEADER_KNOWN_KEYS, HTTP_PLUGIN_KNOWN_KEYS,
+        PROXY_KNOWN_KEYS, VISITOR_KNOWN_KEYS, VISITOR_PLUGIN_KNOWN_KEYS,
+    };
+    let client_src = include_str!("client.rs");
+    let server_src = include_str!("server.rs");
+
+    // Extractor self-check: a struct whose `#[serde(...)]` groups span several
+    // lines must still yield every alias, and a `rename` must replace the field
+    // name. Without this the whole guard could pass by extracting nothing.
+    let quic = serde_keys_of_struct(server_src, "QuicOptions");
+    let expected_quic: std::collections::BTreeSet<String> = [
+        "keepalive_period",
+        "keepalivePeriod",
+        "max_idle_timeout",
+        "maxIdleTimeout",
+        "max_incoming_streams",
+        "maxIncomingStreams",
+        "stream_receive_window",
+        "streamReceiveWindow",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(
+        quic, expected_quic,
+        "the key extractor must read multi-line #[serde(...)] groups"
+    );
+    // `rename(deserialize = "…")` and a `pub(super)` field, both synthetic: the
+    // tree has no live example of either, and the guard must handle them.
+    let synthetic = concat!(
+        "pub(super) struct Synthetic {\n",
+        "    #[serde(rename(deserialize = \"renamed\", serialize = \"out\"))]\n",
+        "    pub(crate) inner_name: String,\n",
+        "    pub(in crate::config) plain: u8,\n",
+        "    #[serde(skip_deserializing)]\n",
+        "    pub skipped: u8,\n",
+        "}\n",
+    );
+    let synthetic_keys = serde_keys_of_struct(synthetic, "Synthetic");
+    let expected_synthetic: std::collections::BTreeSet<String> =
+        ["renamed", "plain"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        synthetic_keys, expected_synthetic,
+        "pub(crate)/pub(in …) fields and rename(deserialize = …) must be extracted"
+    );
+
+    for (label, src, struct_name, list) in [
+        (
+            "PROXY_KNOWN_KEYS",
+            client_src,
+            "ProxyConfig",
+            PROXY_KNOWN_KEYS,
+        ),
+        (
+            "VISITOR_KNOWN_KEYS",
+            client_src,
+            "VisitorConfig",
+            VISITOR_KNOWN_KEYS,
+        ),
+        (
+            "CLIENT_PLUGIN_KNOWN_KEYS",
+            server_src,
+            "PluginConfig",
+            CLIENT_PLUGIN_KNOWN_KEYS,
+        ),
+        (
+            "VISITOR_PLUGIN_KNOWN_KEYS",
+            client_src,
+            "VisitorPluginConfig",
+            VISITOR_PLUGIN_KNOWN_KEYS,
+        ),
+        (
+            "HTTP_PLUGIN_KNOWN_KEYS",
+            server_src,
+            "HttpPluginConfig",
+            HTTP_PLUGIN_KNOWN_KEYS,
+        ),
+        (
+            "HEALTH_CHECK_HEADER_KNOWN_KEYS",
+            client_src,
+            "HealthCheckHttpHeader",
+            HEALTH_CHECK_HEADER_KNOWN_KEYS,
+        ),
+    ] {
+        let extracted = serde_keys_of_struct(src, struct_name);
+        let listed: std::collections::BTreeSet<String> =
+            list.iter().map(|k| (*k).to_string()).collect();
+        let missing: Vec<&String> = extracted.difference(&listed).collect();
+        let stale: Vec<&String> = listed.difference(&extracted).collect();
+        assert!(
+            missing.is_empty(),
+            "{label} is missing serde keys {missing:?} of {struct_name} \
+             (frp-core/src/config/strict.rs)"
+        );
+        assert!(
+            stale.is_empty(),
+            "{label} lists keys {stale:?} that {struct_name} does not accept \
+             (frp-core/src/config/strict.rs)"
+        );
+        assert!(
+            !extracted.is_empty(),
+            "{label}/{struct_name}: the extractor found no fields at all, so the \
+             comparison above proved nothing"
+        );
+    }
+}
+
+/// Every `*_KNOWN_KEYS` list in `strict.rs` must be covered by the guard table
+/// above. Without this, a new struct + array pair could add a list that no test
+/// ever compares against its struct.
+#[test]
+fn strict_known_key_lists_are_all_covered() {
+    let strict_src = include_str!("strict.rs");
+    let mut declared: Vec<String> = Vec::new();
+    for line in strict_src.lines() {
+        let Some(rest) = line.trim().strip_prefix("pub(super) const ") else {
+            continue;
+        };
+        let Some((name, _)) = rest.split_once(':') else {
+            continue;
+        };
+        if name.ends_with("_KNOWN_KEYS") {
+            declared.push(name.to_string());
+        }
+    }
+    declared.sort();
+    let covered = [
+        "PROXY_KNOWN_KEYS",
+        "VISITOR_KNOWN_KEYS",
+        "CLIENT_PLUGIN_KNOWN_KEYS",
+        "VISITOR_PLUGIN_KNOWN_KEYS",
+        "HTTP_PLUGIN_KNOWN_KEYS",
+        "HEALTH_CHECK_HEADER_KNOWN_KEYS",
+    ];
+    let mut covered_sorted: Vec<String> = covered.iter().map(|s| s.to_string()).collect();
+    covered_sorted.sort();
+    assert_eq!(
+        declared, covered_sorted,
+        "a `*_KNOWN_KEYS` list in `frp-core/src/config/strict.rs` is not compared \
+         against its struct by `strict_array_element_keys_match_struct_fields`; \
+         add it there (and to the recursion in strict.rs)"
+    );
+}
+
+/// Teeth for the extractor: a `#[serde(rename_all = "…")]` container attribute
+/// rewrites every field spelling, and the guard must fail loudly instead of
+/// comparing against a set it cannot compute (this is the mutant that slipped
+/// through the first version of the guard).
+#[test]
+#[should_panic(expected = "does not model `#[serde(rename_all)]`")]
+fn strict_key_extractor_refuses_rename_all() {
+    let synthetic = "#[serde(rename_all = \"camelCase\")]\npub struct Cased {\n    pub health_check_type: String,\n}\n";
+    let _ = serde_keys_of_struct(synthetic, "Cased");
+}
+
+/// Teeth: a `#[serde(flatten)]` field makes a struct's key set open-ended
+/// (the repo's `FeatureConfig` is that shape), so the guard must fail rather
+/// than compare against a set it cannot complete.
+#[test]
+#[should_panic(expected = "does not model `#[serde(flatten)]`")]
+fn strict_key_extractor_refuses_open_ended_structs() {
+    let synthetic = "pub struct Open {\n    #[serde(flatten)]\n    pub gates: std::collections::HashMap<String, bool>,\n}\n";
+    let _ = serde_keys_of_struct(synthetic, "Open");
+}
+
+/// Teeth: an unrecognised serde attribute must not be ignored — if it changed
+/// the key set, the two-way comparison would silently accept the drift.
+#[test]
+#[should_panic(expected = "does not recognise `#[serde(invented_attr)]`")]
+fn strict_key_extractor_refuses_unknown_attrs() {
+    let synthetic = "pub struct Odd {\n    #[serde(invented_attr)]\n    pub x: u8,\n}\n";
+    let _ = serde_keys_of_struct(synthetic, "Odd");
+}
+
+/// A raw identifier contributes its **stripped** name, which is what serde
+/// accepts: measured with a probe struct, `{"match": …}` sets a `r#match` field
+/// and the alias `{"aliasMatch": …}` sets it too, while the literal
+/// `{"r#match": …}` is ignored. Before this the field was not recognised at all
+/// and the extractor returned an **empty** set for the whole struct, so adding a
+/// raw-ident field to one of the six structs left the guard green while the
+/// binary refused both the stripped name and the alias.
+#[test]
+fn strict_key_extractor_strips_raw_identifier_prefixes() {
+    let synthetic = "pub struct Raw {\n    #[serde(default, alias = \"aliasMatch\")]\n    pub r#match: String,\n}\n";
+    let keys = serde_keys_of_struct(synthetic, "Raw");
+    let expected: std::collections::BTreeSet<String> = ["match", "aliasMatch"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(keys, expected);
+}
+
+/// Teeth for the same hole on the open-ended path: a `#[serde(flatten)]` field
+/// written as a raw identifier **in last position** used to leave the stale
+/// attribute list unclassified, so the extractor returned a closed set
+/// (`{"kept"}`) with no panic — the guard would have blessed a struct whose key
+/// set is open-ended.
+#[test]
+#[should_panic(expected = "does not model `#[serde(flatten)]`")]
+fn strict_key_extractor_refuses_open_ended_structs_behind_a_raw_ident() {
+    let synthetic = "pub struct OpenRaw {\n    pub kept: u8,\n    #[serde(flatten)]\n    pub r#extra: std::collections::HashMap<String, String>,\n}\n";
+    let _ = serde_keys_of_struct(synthetic, "OpenRaw");
+}
+
+/// Teeth: `#[serde (rename = "…")]` with whitespace before the parenthesis is
+/// not parsed as a serde attribute, so skipping it silently would treat the
+/// field as unrenamed. `rustfmt` normalises the spelling, but the extractor
+/// fails closed anyway.
+#[test]
+#[should_panic(expected = "is not the `#[serde(...)]` form")]
+fn strict_key_extractor_refuses_the_spaced_serde_attribute_form() {
+    let _ = serde_keys_of_struct(
+        "pub struct Spaced {\n    #[serde (rename = \"x\")]\n    pub inner: u8,\n}\n",
+        "Spaced",
+    );
+}
+
+/// Teeth: a struct that is not in the source must panic, not return an empty
+/// set (a silently skipped struct would be a guard that proves nothing).
+#[test]
+#[should_panic(expected = "not found in the source")]
+fn strict_key_extractor_refuses_missing_structs() {
+    let _ = serde_keys_of_struct("pub struct Other { pub x: u8 }\n", "ProxyConfig");
+}
+
+/// A field with **no** visibility modifier still contributes its key. R2's
+/// mutant — `#[serde(default, alias = "driftPriv")] drift_priv: String` on
+/// `HealthCheckHeader` — compiles, is accepted by serde, and left the earlier
+/// scanner (which required a literal `pub`) passing while the binary refused the
+/// serde-accepted `driftPriv`: a green guard over a false 400.
+#[test]
+fn strict_key_extractor_reads_private_fields() {
+    let synthetic = "pub struct Priv {\n    #[serde(default, alias = \"driftPriv\")]\n    drift_priv: String,\n}\n";
+    let keys = serde_keys_of_struct(synthetic, "Priv");
+    let expected: std::collections::BTreeSet<String> = ["drift_priv", "driftPriv"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        keys, expected,
+        "a private field and its serde alias must be extracted"
+    );
+}
+
+/// `#[serde(rename(serialize = "…"))]` alone does **not** change the key serde
+/// deserializes from — the field name does (measured with a probe struct:
+/// `{{\"inner\":1}}` parses, `{{\"out\":1}}` does not, for
+/// `#[serde(rename(serialize = \"out\"))] inner`). The scanner must therefore use
+/// the field name rather than panicking or taking the serialized spelling.
+#[test]
+fn strict_key_extractor_uses_field_name_for_serialize_only_rename() {
+    let synthetic =
+        "pub struct SerOnly {\n    #[serde(rename(serialize = \"out\"))]\n    pub inner: u8,\n}\n";
+    let keys = serde_keys_of_struct(synthetic, "SerOnly");
+    let expected: std::collections::BTreeSet<String> =
+        ["inner"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(keys, expected);
+}
 #[test]
 fn test_strict_accepts_go_section_keys() {
     // Go-valid keys inside known sections must pass strict mode
@@ -4706,6 +5555,342 @@ bind_port = 9000
     assert_eq!(visitors[0].name, "xtcp_visitor");
     assert_eq!(visitors[0].secret_key, "abc123");
     assert_eq!(visitors[0].bind_port, 9000);
+}
+
+/// A Go legacy INI config's flat health-check spellings
+/// (`health_check_interval_s` / `health_check_timeout_s`) survive strict mode
+/// **and are honoured**. They are valid Go legacy keys — `pkg/config/legacy`
+/// declares them (`proxy.go:130,136`) and its conversion maps them onto
+/// `HealthCheck.IntervalSeconds` / `.TimeoutSeconds`
+/// (`pkg/config/legacy/conversion.go:204-206`) — so a config that loads on Go
+/// must load here. Before `check_strict` walked the arrays they were silently
+/// dropped; without the rename in `collect_legacy_ini_proxy_sections` the new
+/// element walk would refuse the whole file (measured: `frpc verify` rc 1 with
+/// `unknown field "proxies[0].health_check_interval_s"` against the version of
+/// this branch without the rename).
+#[test]
+fn test_legacy_ini_health_check_s_spellings_survive_strict_mode() {
+    let mut f = tempfile::Builder::new().suffix(".ini").tempfile().unwrap();
+    f.write_all(
+        b"[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\n[tcp]\ntype = tcp\nlocal_port = 8080\nremote_port = 7001\nhealth_check_type = tcp\nhealth_check_interval_s = 7\nhealth_check_timeout_s = 2\n",
+    )
+    .unwrap();
+    let cfg = load_client_config(f.path().to_str().unwrap(), true)
+        .expect("a Go legacy INI health-check spelling must load in strict mode");
+    assert_eq!(cfg.proxies.len(), 1);
+    assert_eq!(cfg.proxies[0].health_check_interval_seconds, 7);
+    assert_eq!(cfg.proxies[0].health_check_timeout_seconds, 2);
+
+    // Contrast: the same spelling in a TOML `[[proxies]]` element is not a Go
+    // v1 key (v1 has only `healthCheck.intervalSeconds`), so strict mode
+    // refuses it there — the rename is scoped to the legacy INI collector.
+    let mut t = tempfile::NamedTempFile::new().unwrap();
+    t.write_all(
+        b"serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[[proxies]]\nname = \"p\"\ntype = \"tcp\"\nlocalPort = 80\nremotePort = 7001\nhealth_check_interval_s = 7\n",
+    )
+    .unwrap();
+    let err = load_client_config(t.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"proxies[0].health_check_interval_s\""),
+        "got: {err}"
+    );
+}
+/// Go frp v0.71.0's own `conf/legacy/frpc_legacy_full.ini`, copied
+/// byte-identically to `frp-core/src/config/fixtures/frpc_legacy_full.ini`
+/// (`frp-core/src/config/fixtures/README.md` records the origin and licence).
+/// It exercises every legacy INI prefix mechanism Go consumes — `[common]` and
+/// `[ssh]` `meta_*`, `[web01] header_*`, and `plugin_header_*` on the three
+/// plugin types that read it (`http2https`, `https2http`, `https2https`) — which
+/// is exactly the class the strict-mode array walk must not refuse: Go's INI
+/// path ignores an INI key its typed struct does not name instead of erroring,
+/// so the whole file loads on Go (`frpc verify -c` exits 0).
+///
+/// The assertion is made at the **strict-check layer** on purpose. The file also
+/// carries bare numeric values for string fields (`token = 12345678`,
+/// `meta_var1 = 123`), and frp-rs's INI number inference turns those into TOML
+/// integers that serde then rejects — a pre-existing legacy-INI gap unrelated to
+/// strict mode (it fails on this file with or without the array walk). What this
+/// item changed is the strict check, so that is what is pinned; the full-load
+/// behaviour of the same mechanisms is covered by
+/// `legacy_ini_prefix_mechanisms_load_through_strict_mode` with quoted values.
+#[test]
+fn legacy_ini_go_shipped_fixture_passes_strict_mode() {
+    let mut value = super::format::parse_to_toml_value(
+        include_str!("fixtures/frpc_legacy_full.ini"),
+        super::format::ConfigFormat::Ini,
+    )
+    .unwrap();
+    super::normalize::normalize_client_config(&mut value);
+    super::strict::run_strict_check(
+        &value,
+        &super::strict::known_client_keys(),
+        "frpc_legacy_full.ini",
+    )
+    .expect("Go's shipped legacy INI fixture must not draw a strict-mode refusal");
+
+    // …and the three honoured prefix families must have survived as the keys
+    // their Go counterparts fill. A bare "no error" assertion would also pass if
+    // the strip pass had dropped them.
+    let proxies = value
+        .get("proxies")
+        .and_then(toml::Value::as_array)
+        .expect("proxies array");
+    let named = |name: &str| {
+        proxies
+            .iter()
+            .find(|p| p.get("name").and_then(toml::Value::as_str) == Some(name))
+            .unwrap_or_else(|| panic!("proxy `{name}` not collected"))
+    };
+    assert_eq!(
+        named("ssh")
+            .get("metadatas")
+            .and_then(|m| m.get("var1"))
+            .and_then(toml::Value::as_integer),
+        Some(123),
+        "`meta_var1` in a proxy section must be folded into `metadatas`"
+    );
+    assert_eq!(
+        named("web01")
+            .get("headers")
+            .and_then(|h| h.get("X-From-Where"))
+            .and_then(toml::Value::as_str),
+        Some("frp"),
+        "`header_*` in an http proxy section must be folded into `headers`"
+    );
+    for name in [
+        "plugin_https2http",
+        "plugin_https2https",
+        "plugin_http2https",
+    ] {
+        assert_eq!(
+            named(name)
+                .get("plugin")
+                .and_then(|p| p.get("request_headers"))
+                .and_then(|h| h.get("X-From-Where"))
+                .and_then(toml::Value::as_str),
+            Some("frp"),
+            "`plugin_header_*` on `{name}` must be folded into the plugin's \
+             `request_headers`"
+        );
+    }
+}
+
+/// Every legacy INI prefix mechanism Go reads, loaded end to end through strict
+/// mode with values that survive serde (quoted where frp-rs's INI inference
+/// would otherwise make them numbers):
+///
+/// * `meta_*` → `metadatas` (`pkg/config/legacy/proxy.go:198`);
+/// * `header_*` → HTTP request headers, for `type = "http"` only
+///   (`proxy.go:244`; the HTTPS/TCP structs have no `Headers` field);
+/// * `plugin_header_*` → the plugin's `request_headers` for the three plugin
+///   types whose conversion calls `transformHeadersFromPluginParams`
+///   (`conversion.go:171-181,217,228,236`);
+/// * the flat `health_check_*_s` spellings (see the dedicated test below).
+#[test]
+fn legacy_ini_prefix_mechanisms_load_through_strict_mode() {
+    let mut f = tempfile::Builder::new().suffix(".ini").tempfile().unwrap();
+    f.write_all(
+        br#"[common]
+server_addr = 127.0.0.1
+server_port = 7000
+
+[web]
+type = http
+local_port = 8080
+custom_domains = a.example.com
+header_X-Foo = bar
+
+[gh]
+type = tcp
+local_port = 8080
+remote_port = 7001
+meta_env = prod
+
+[pl]
+type = tcp
+remote_port = 7002
+plugin = https2http
+plugin_local_addr = 127.0.0.1:80
+plugin_crt_path = a.crt
+plugin_key_path = a.key
+plugin_header_X-Plugin = bar
+"#,
+    )
+    .unwrap();
+    let cfg = load_client_config(f.path().to_str().unwrap(), true)
+        .expect("every Go legacy prefix mechanism must load in strict mode");
+    let named = |name: &str| cfg.proxies.iter().find(|p| p.name == name).unwrap();
+    assert_eq!(
+        named("web").headers.get("X-Foo").map(String::as_str),
+        Some("bar"),
+        "header_* -> headers"
+    );
+    assert_eq!(
+        named("gh").metas.get("env").map(String::as_str),
+        Some("prod"),
+        "meta_* -> metadatas"
+    );
+    assert_eq!(
+        named("pl")
+            .plugin
+            .as_ref()
+            .unwrap()
+            .request_headers
+            .get("X-Plugin")
+            .map(String::as_str),
+        Some("bar"),
+        "plugin_header_* -> plugin request_headers"
+    );
+}
+
+/// The keys Go's legacy layer **ignores** (its typed structs never name them,
+/// and `gopkg.in/ini`'s `MapTo` skips what it cannot map) must not be refused
+/// either — Go loads every config below with exit 0. The legacy collector drops
+/// them before the strict walk, so the v1 `[[proxies]]` check stays strict while
+/// the legacy INI surface keeps Go's accept-and-ignore semantics.
+#[test]
+fn legacy_ini_ignores_keys_go_ignores() {
+    let mut f = tempfile::Builder::new().suffix(".ini").tempfile().unwrap();
+    f.write_all(
+        br#"[common]
+server_addr = 127.0.0.1
+server_port = 7000
+
+[p]
+type = tcp
+local_port = 8080
+remote_port = 7001
+log_level = debug
+privilege_mode = true
+pool_count = 5
+plugin = http_proxy
+plugin_unknown_param = 1
+plugin_enable_http2 = true
+
+[v]
+type = stcp
+role = visitor
+server_name = p
+sk = abc
+bind_port = 6000
+meta_foo = bar
+header_X-Foo = bar
+"#,
+    )
+    .unwrap();
+    let cfg = load_client_config(f.path().to_str().unwrap(), true)
+        .expect("keys Go's legacy layer ignores must not be refused");
+    assert_eq!(cfg.proxies.len(), 1);
+    assert_eq!(cfg.proxies[0].name, "p");
+    // The ignored keys must be *gone*, not silently honoured: `log_level` etc.
+    // are client-level keys, and `plugin_enable_http2` is not a Go or frp-rs
+    // plugin parameter (the v1 spelling is `enable_http2`).
+    let plugin = cfg.proxies[0].plugin.as_ref().expect("plugin parsed");
+    assert_eq!(plugin.plugin_type, "http_proxy");
+    assert_eq!(plugin.enable_http2, None);
+    assert_eq!(cfg.visitors.len(), 1);
+    assert_eq!(cfg.visitors[0].name, "v");
+}
+
+/// Go's legacy INI struct declares only the `_s` health-check spellings
+/// (`pkg/config/legacy/proxy.go:130,136`), so `health_check_interval_seconds` is
+/// an unknown INI key there and is ignored. Measured on Go v0.71.0 with a real
+/// frps+frpc pair and a dead local port (health-check log gaps): `_s = 2` alone
+/// → a check every 2.0 s; `_seconds = 2` alone → one check and then the 10 s
+/// default; `_s = 2` + `_seconds = 99` → every 2.0 s; `_s = 99` + `_seconds = 2`
+/// → one check. The `_s` value therefore wins in both orders, which is what the
+/// rewrite in `collect_legacy_ini_proxy_sections` implements (`insert`, not
+/// `or_insert`).
+#[test]
+fn legacy_ini_health_check_s_wins_over_seconds() {
+    let mut f = tempfile::Builder::new().suffix(".ini").tempfile().unwrap();
+    f.write_all(
+        br#"[common]
+server_addr = 127.0.0.1
+server_port = 7000
+
+[tcp]
+type = tcp
+local_port = 8080
+remote_port = 7001
+health_check_type = tcp
+health_check_interval_s = 7
+health_check_interval_seconds = 99
+health_check_timeout_s = 2
+health_check_timeout_seconds = 88
+"#,
+    )
+    .unwrap();
+    let cfg = load_client_config(f.path().to_str().unwrap(), true).unwrap();
+    assert_eq!(
+        cfg.proxies[0].health_check_interval_seconds, 7,
+        "the Go-honoured `_s` spelling wins over the frp-rs-only `_seconds` one"
+    );
+    assert_eq!(
+        cfg.proxies[0].health_check_timeout_seconds, 2,
+        "same for the timeout pair"
+    );
+}
+
+/// Strict mode walks a proxy's health-check header array under **both** serde
+/// spellings. `healthCheckHttpHeaders` is an alias not renamed by
+/// `normalize_proxies`, so it reaches the check as its own key; without the
+/// alias arm here the unknown key was accepted under the alias while the
+/// canonical `health_check_http_headers` spelling refused it.
+#[test]
+fn strict_mode_rejects_unknown_health_check_header_via_both_spellings() {
+    for spelling in ["health_check_http_headers", "healthCheckHttpHeaders"] {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(
+            format!(
+                "serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[[proxies]]\nname = \"p\"\ntype = \"tcp\"\nlocalPort = 80\nremotePort = 7001\n\
+                 [[proxies.healthCheck]]\ntype = \"tcp\"\nintervalSeconds = 10\n\
+                 [[proxies.{spelling}]]\nname = \"X-Test\"\nvalue = \"1\"\nnotAKnownHeaderKey = 1\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let err = load_client_config(f.path().to_str().unwrap(), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "unknown field \"proxies[0].{spelling}[0].notAKnownHeaderKey\""
+            )),
+            "[{spelling}] got: {err}"
+        );
+    }
+}
+
+/// The legacy `plugin_header_*` fold is gated on elements the **legacy
+/// collector** created, so it cannot widen the v1 surface. On a TOML
+/// `[[proxies]]` element the flat plugin spelling is an frp-rs extension Go
+/// rejects outright (v1's `plugin` is an object: `json: cannot unmarshal string
+/// into … plugin`), and the header key itself was dropped at the base commit and
+/// refused at the round-1 head — folding it there would silently start honouring
+/// a key that is not a v1 name. Measured three ways at the round-3 head:
+/// Go rc 1 (`cannot unmarshal string into … plugin`), frp-rs before
+/// `Config file … is valid` (key dropped), frp-rs now
+/// `unknown field "proxies[0].plugin.plugin_header_X-Foo"`. The legacy-shaped
+/// section form is covered (and its value asserted) by
+/// `legacy_ini_prefix_mechanisms_load_through_strict_mode`.
+#[test]
+fn toml_proxy_element_does_not_inherit_the_legacy_plugin_header_fold() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        b"serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[[proxies]]\nname = \"p\"\ntype = \"tcp\"\nremotePort = 7001\n\
+          plugin = \"https2http\"\nplugin_local_addr = \"127.0.0.1:80\"\nplugin_crt_path = \"a.crt\"\nplugin_key_path = \"a.key\"\nplugin_header_X-Foo = \"y\"\n",
+    )
+    .unwrap();
+    let err = load_client_config(f.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"proxies[0].plugin.plugin_header_X-Foo\""),
+        "the v1 element must not fold the legacy plugin header spelling; got: {err}"
+    );
 }
 
 /// Legacy INI range template with mismatched port counts is skipped (warn),
@@ -5674,17 +6859,18 @@ fn test_server_negative_max_pool_count_rejected() {
 // ─── Strict mode: section recursion ───────────────────────────────────
 
 #[test]
-fn test_strict_accepts_unknown_proxy_field_deliberate_divergence() {
-    // strict.rs deliberately does NOT recurse into `proxies`/`visitors`
-    // arrays: the enforcement point is `check_strict`'s "recurse only into a
-    // `toml::Value::Table`" guard, so an array value never reaches the
-    // `section_known_keys` lookup. Skipping the recursion is a deliberate
-    // choice, not a capability gap: the key sets are per *struct* and
-    // mechanically derivable (all that stops them is the false-400 risk of a
-    // hand-tracked list — see the pin below and the strict-mode paragraph in
-    // `docs/deployment.md`). Go's RejectUnknownMembers rejects unknown proxy
-    // fields. Pin the divergence: an unknown field inside [[proxies]] is
-    // ACCEPTED.
+fn test_strict_rejects_unknown_proxy_field() {
+    // Go frp v0.71.0 with strict mode on (its default) refuses this config:
+    // `decode proxy at index 0: unmarshal ProxyConfig error: json: unknown
+    // field "totally_unknown_proxy_field"` (measured on the v0.71.0
+    // darwin/arm64 binary; `frpc verify -c` exits 1). `check_strict` recurses
+    // into the `proxies` array with `PROXY_KNOWN_KEYS` (`strict.rs`), so the
+    // same key is refused here with the element index in the path.
+    //
+    // The match is exact, so Go's case-insensitive field lookup is *not*
+    // mirrored: Go accepts `RemotePort` here (measured), frp-rs refused it
+    // before this recursion only by silently dropping the value — see
+    // `case_insensitive_proxy_array_key_is_dropped_in_strict_mode`.
     let mut f = tempfile::NamedTempFile::new().unwrap();
     f.write_all(
         br#"serverAddr = "127.0.0.1"
@@ -5698,9 +6884,20 @@ totally_unknown_proxy_field = 1
 "#,
     )
     .unwrap();
-    let cfg = load_client_config(f.path().to_str().unwrap(), true).unwrap();
+    let err = load_client_config(f.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"proxies[0].totally_unknown_proxy_field\""),
+        "got: {err}"
+    );
+
+    // Non-strict mode still accepts the file and drops the unknown key — the
+    // direction Go takes with `--strict-config=false` (measured: rc 0).
+    let cfg = load_client_config(f.path().to_str().unwrap(), false).unwrap();
     assert_eq!(cfg.proxies.len(), 1);
     assert_eq!(cfg.proxies[0].remote_port, 7001);
+    assert_eq!(cfg.proxies[0].name, "p");
 }
 
 #[test]
@@ -5724,34 +6921,46 @@ unknown_web_server_key = 1
     );
 }
 
-/// The array-element arm of the case-insensitive-keys divergence, with the
-/// dropped **value** asserted — the CLI-level test of the same shape
-/// (`case_insensitive_proxy_array_keys_are_dropped_in_strict_mode`) can only
-/// see `rc 0` / `is valid` / no `unknown field`, which a future
-/// `#[serde(alias = "RemotePort")]` would also satisfy while honouring the key.
-/// This pin fails if that happens, because the alias would set `remote_port`.
+/// The array-element arm of the case-insensitive-keys divergence. Go v0.71.0
+/// accepts the file (`frpc verify -c` exits 0, measured) because its
+/// `encoding/json` decoder matches object keys case-insensitively, so
+/// `RemotePort` reaches the same field as `remotePort`; frp-rs's serde field
+/// matching is exact, so the key is unknown to the frp-rs config surface and
+/// its value is dropped. Strict mode now **refuses** that key instead of
+/// dropping it silently (`check_strict` recurses into the array with its exact
+/// key set), which is stricter than Go but louder than the previous silent
+/// loss; non-strict mode keeps the drop, which is what the old pin asserted.
 ///
-/// Go v0.71.0 reads `RemotePort` case-insensitively and binds the requested
-/// port; frp-rs drops the key, so the server auto-allocates. `check_strict`
-/// never recurses into the array (`strict.rs`), and `ProxyConfig` carries no
-/// `deny_unknown_fields`.
+/// This is not a new class of divergence: the same config with a mis-cased
+/// **top-level** key (`SERVERADDR`) is refused by frp-rs strict mode today and
+/// accepted by Go (both measured).
 #[test]
-fn case_insensitive_proxy_array_key_is_dropped_in_strict_mode() {
+fn case_insensitive_proxy_array_key_is_refused_in_strict_mode() {
     let mut f = tempfile::NamedTempFile::new().unwrap();
     f.write_all(
         b"serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[[proxies]]\nname = \"p\"\ntype = \"tcp\"\nlocalPort = 80\nRemotePort = 7198\n",
     )
     .unwrap();
-    let cfg = load_client_config(f.path().to_str().unwrap(), true)
-        .expect("strict mode accepts the mis-cased array key");
+    let err = load_client_config(f.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"proxies[0].RemotePort\""),
+        "the mis-cased key must be refused in strict mode; got: {err}"
+    );
+
+    // Non-strict mode still drops the value: `remote_port` stays 0 while the
+    // camelCase alias `localPort` (which serde does know) is honoured. A
+    // future `#[serde(alias = "RemotePort")]` would break this arm, so the
+    // drop cannot be silently upgraded into an honoured key.
+    let cfg = load_client_config(f.path().to_str().unwrap(), false).unwrap();
     assert_eq!(cfg.proxies.len(), 1);
     assert_eq!(
         cfg.proxies[0].remote_port, 0,
-        "the mis-cased key must be dropped (Go would use 7198); a serde alias \
-         would make this 7198 and would be a behaviour change, not a test tweak"
+        "non-strict keeps Go's `--strict-config=false` shape: the mis-cased key \
+         is dropped, not read (Go would use 7198); a serde alias would make \
+         this 7198 and would be a behaviour change, not a test tweak"
     );
-    // `localPort` (the camelCase alias serde does know) IS honoured, so the
-    // zero above is specific to the mis-cased spelling.
     assert_eq!(cfg.proxies[0].local_port, 80);
 }
 
