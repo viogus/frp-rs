@@ -2848,8 +2848,48 @@ fn log_format_preserved_when_absent() {
 
 #[test]
 fn web_server_addr_defaults_to_localhost() {
-    let cfg = super::WebServerConfig::default();
+    let cfg: super::WebServerConfig = Default::default();
     assert_eq!(cfg.addr, "127.0.0.1");
+}
+
+/// Go frp v0.71.0 `ClientCommonConfig.Complete()` calls
+/// `c.WebServer.Complete()` (`pkg/config/v1/client.go:96`), and the client has
+/// no later step that re-defaults the address (the server's
+/// `pkg/config/v1/server.go:116-118` re-defaults a *set port* to `0.0.0.0`, and
+/// is a different surface). So on frpc an explicit `addr = ""` becomes
+/// `127.0.0.1`. Measured on the Go v0.71.0 binary: with `[webServer] addr = ""`
+/// and `port = 7499`, `frpc status -c <cfg>` dials `127.0.0.1:7499`. Before this
+/// completion, frp-rs dialled `:7499` and failed with
+/// `failed to lookup address information`.
+#[test]
+fn client_web_server_addr_empty_is_completed_to_localhost() {
+    let toml =
+        "serverAddr = \"127.0.0.1\"\nserverPort = 7500\n[webServer]\naddr = \"\"\nport = 7499\n";
+    let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+    assert_eq!(cfg.web_server.addr, "127.0.0.1");
+    assert_eq!(cfg.web_server.port, 7499);
+}
+
+/// The completion fills only an *empty* address: an explicit bind address
+/// survives, and the absent-key case still goes through the serde default
+/// (also `127.0.0.1`).
+#[test]
+fn client_web_server_addr_explicit_and_absent_are_unchanged() {
+    let toml = "serverAddr = \"127.0.0.1\"\nserverPort = 7500\n[webServer]\naddr = \"10.1.2.3\"\nport = 7499\n";
+    let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+    assert_eq!(cfg.web_server.addr, "10.1.2.3");
+
+    let toml = "serverAddr = \"127.0.0.1\"\nserverPort = 7500\n[webServer]\nport = 7499\n";
+    let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+    assert_eq!(cfg.web_server.addr, "127.0.0.1");
+
+    // No `[webServer]` at all: the port stays 0, so the admin commands still
+    // refuse with Go's sentence instead of dialing the completed address (the
+    // `AdminResolveError::NoPort` path).
+    let toml = "serverAddr = \"127.0.0.1\"\nserverPort = 7500\n";
+    let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+    assert_eq!(cfg.web_server.port, 0);
+    assert_eq!(cfg.web_server.addr, "127.0.0.1");
 }
 
 // ── MEDIUM-5: OIDC nesting normalization ───────────────────────────

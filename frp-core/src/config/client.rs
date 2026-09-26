@@ -426,6 +426,33 @@ impl ClientConfig {
         heartbeat_interval_set: bool,
         heartbeat_timeout_set: bool,
     ) {
+        // Go frp v0.71.0 `ClientCommonConfig.Complete()` calls
+        // `c.WebServer.Complete()` (`pkg/config/v1/client.go:96`), which is
+        // `c.Addr = util.EmptyOr(c.Addr, "127.0.0.1")`
+        // (`pkg/config/v1/common.go:71-73`). `EmptyOr` fills on the **empty
+        // string**, so an explicit `addr = ""` becomes `127.0.0.1` there — and
+        // only there; the server's own `Complete()` runs `WebServer.Complete()`
+        // first and then re-defaults a set port to `0.0.0.0`
+        // (`pkg/config/v1/server.go:107,116-118`), which the server-side
+        // completion in `frp-core/src/config/server.rs` mirrors. The client has
+        // no such second step, so `127.0.0.1` is the final value.
+        //
+        // The serde default on the field (`default_web_server_addr`) only fires
+        // when the key is ABSENT, so without this an explicit `addr = ""`
+        // survived as the empty string and every admin dial became a lookup of
+        // the empty host: measured at `main` @ `c4836b7`,
+        // `frpc status -c emptyaddr.toml` (with `[webServer] addr = ""`, `port
+        // = 7499`) printed
+        // `status query failed: connect :7499: failed to lookup address
+        // information: nodename nor servname provided, or not known` (rc 1),
+        // where Go v0.71.0 dials `127.0.0.1:7499`. Fixing it here, not in the
+        // admin-connection resolver, is what makes the value right wherever the
+        // client web server address is consumed — the admin subcommands and the
+        // client's own `[webServer]` admin listener alike.
+        if self.web_server.addr.is_empty() {
+            self.web_server.addr = "127.0.0.1".into();
+        }
+
         // MEDIUM-7: Fallback to http_proxy/HTTP_PROXY env var when proxy_url is empty
         if self.proxy_url.is_empty() {
             if let Ok(proxy) = std::env::var("http_proxy") {
