@@ -858,8 +858,9 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
                 // one-element slice there. `ini_to_toml` only splits a value it
                 // can reproduce verbatim, so a value with an escape or a space
                 // after the comma arrives as a `String` and would fail
-                // `Vec<String>` deserialization — split it the way Go does,
-                // dropping an empty element (frp-rs behaviour, pre-existing).
+                // `Vec<String>` deserialization — split it the way Go does. The
+                // `filter` below drops an empty element on this text path only
+                // (pre-existing; an array that reached here is not filtered).
                 if let Some(Value::String(s)) = st.get("ops") {
                     let items: Vec<Value> = super::format::split_ini_list(s)
                         .into_iter()
@@ -1569,10 +1570,13 @@ fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) -> (Vec<usize>, Ve
 
         // Go ini.v1 []string fields: a scalar value becomes a one-element
         // array (a comma list the reader could reproduce verbatim is already an
-        // Array here). The splitter is Go's `Key.Strings(",")` (key.go:492), so
-        // `a\,b` is one element and a trailing empty element is dropped;
-        // frp-rs additionally drops an empty element wherever it appears
-        // (pre-existing — Go keeps a middle one).
+        // Array here, and is *not* filtered — `a.com,,b.com` keeps its middle
+        // empty element on both sides). The splitter is Go's
+        // `Key.Strings(",")` (key.go:492), so `a\,b` is one element and a
+        // trailing empty element is dropped; the `filter` below then drops an
+        // empty element on this **text path only** (pre-existing): measured,
+        // `a.com, ,b.com` is `["a.com", "", "b.com"]` on Go and `["a.com",
+        // "b.com"]` here, while the verbatim `a.com,,b.com` matches Go.
         for list_key in ["custom_domains", "locations", "allow_users"] {
             if let Some(Value::String(s)) = st.get(list_key) {
                 let items: Vec<Value> = super::format::split_ini_list(s)
@@ -1635,9 +1639,14 @@ fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) -> (Vec<usize>, Ve
             // Expand into {prefix}_{i} per-port proxies (Go renderRangeProxyTemplates,
             // pkg/config/legacy/client.go:289-336). local_port/remote_port accept a
             // comma-separated string ("6000-6002,6010"), an unquoted single port
-            // (6000 — ini_to_toml makes it Integer), or an array — the TOML/JSON
-            // spelling of the same list, which the INI reader produced for a
-            // canonical comma list before the lossless reader kept it as text.
+            // (6000 — ini_to_toml makes it Integer), or an array. The array is the
+            // spelling a TOML/JSON/YAML legacy-shaped section carries
+            // (`"local_port": [6010, "6011-6012"]`); the INI reader also produces one
+            // for a comma list that renders back verbatim (`6010-6012,6020`), and
+            // keeps the list as text when it does not (a space, an escape or a
+            // trailing comma), which the String arm below handles. Accepting the
+            // array only adds cases: before, an array here was `None` and the whole
+            // section was dropped with the warning below.
             fn ini_port_numbers(v: &Value) -> Option<Vec<u16>> {
                 match v {
                     Value::String(s) => ini_range_numbers(s),

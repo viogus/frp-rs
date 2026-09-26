@@ -381,8 +381,13 @@ User-facing release notes for frp-rs.
   TOML/JSON/YAML `1`/`"yes"` keeps being ignored exactly as before. Both of Go's shipped `conf/legacy/{frpc,frps}_legacy_full.ini`
   fixtures are vendored byte-identically and now load end to end — 43 proxies
   and 2 visitors for the client file, exactly the names and counts Go frpc
-  v0.71.0 itself reports for it (`proxy added: […]`, `visitor added: […]`). TOML,
-  JSON and YAML keep strict typing; see
+  v0.71.0 itself reports for it (`proxy added: […]`, `visitor added: […]`).
+  Scope: the type-directed reader above **and** the wider legacy boolean
+  spellings are `.ini`-only — TOML/JSON/YAML keep strict serde typing, so a
+  numeric `token` is still refused there — while `[range:...]`'s array arm
+  belongs to the shape-based legacy collector and therefore applies in **every**
+  format (it only adds acceptance: such an array was dropped with a warning
+  before). See
   [docs/config.md § Legacy `.ini` values](docs/config.md#legacy-ini-values-are-read-by-the-target-fields-type).
 - **`/api/reload` now reads `?strictConfig=` the way Go frp does — two behaviour changes.**
   A repeated parameter (`?strictConfig=true&strictConfig=false`) reloads with the first value

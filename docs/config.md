@@ -835,6 +835,14 @@ Scope and residuals, measured on Go frp v0.71.0:
   serde_json's `ryu` rendering is exponential (`1e+19`, `1e-7`); a value whose
   two renderings differ stays text, so a string field never receives a
   re-rendered token or domain.
+- A comma list that renders back verbatim stays an **array** and is *not*
+  filtered: `custom_domains = a.com,,b.com` → `["a.com", "", "b.com"]`,
+  matching Go (measured). A list that has to stay text (a space after the
+  comma, an escape, a trailing comma) goes through the text path, where frp-rs's
+  pre-existing `filter` drops empty elements: `a.com, ,b.com` →
+  `["a.com", "b.com"]` here against Go's `["a.com", "", "b.com"]`. So the
+  empty-element divergence is narrower than the text-path filter suggests — only
+  a text-path middle empty element differs.
 - Go's `Key.Int64()` is `strconv.ParseInt(s, 0, 64)` — **base 0**. frp-rs reads
   base 10, which is a silent *different value* for an octal-looking spelling:
   `server_port = 07000` dials 3584 on Go and 7000 here, `010` is 8 on Go and 10
