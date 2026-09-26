@@ -5464,8 +5464,12 @@ custom404Page = "<h1>nope</h1>"
 fn load_client_ini(content: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
     let mut value = super::format::parse_to_toml_value(content, super::format::ConfigFormat::Ini)?;
     super::normalize::normalize_client_config(&mut value);
-    let cfg: ClientConfig = serde_json::from_value(super::normalize::toml_to_json(value))
-        .map_err(|e| format!("config validation error: {e}"))?;
+    // `.ini` inputs read values by target type, exactly as
+    // `load_config_from_file` does (Go's legacy INI model) — not the strict
+    // serde path TOML/JSON/YAML use.
+    let cfg: ClientConfig =
+        super::ini_lenient::deserialize_ini(&super::normalize::toml_to_json(value))
+            .map_err(|e| format!("config validation error: {e}"))?;
     super::validate_client_config(&cfg)?;
     Ok(cfg)
 }
@@ -5474,8 +5478,9 @@ fn load_client_ini(content: &str) -> Result<ClientConfig, Box<dyn std::error::Er
 fn load_server_ini(content: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let mut value = super::format::parse_to_toml_value(content, super::format::ConfigFormat::Ini)?;
     super::normalize::normalize_server_config(&mut value);
-    let cfg: ServerConfig = serde_json::from_value(super::normalize::toml_to_json(value))
-        .map_err(|e| format!("config validation error: {e}"))?;
+    let cfg: ServerConfig =
+        super::ini_lenient::deserialize_ini(&super::normalize::toml_to_json(value))
+            .map_err(|e| format!("config validation error: {e}"))?;
     super::validate_server_config(&cfg)?;
     Ok(cfg)
 }
@@ -5607,14 +5612,15 @@ fn test_legacy_ini_health_check_s_spellings_survive_strict_mode() {
 /// path ignores an INI key its typed struct does not name instead of erroring,
 /// so the whole file loads on Go (`frpc verify -c` exits 0).
 ///
-/// The assertion is made at the **strict-check layer** on purpose. The file also
-/// carries bare numeric values for string fields (`token = 12345678`,
-/// `meta_var1 = 123`), and frp-rs's INI number inference turns those into TOML
-/// integers that serde then rejects — a pre-existing legacy-INI gap unrelated to
-/// strict mode (it fails on this file with or without the array walk). What this
-/// item changed is the strict check, so that is what is pinned; the full-load
-/// behaviour of the same mechanisms is covered by
-/// `legacy_ini_prefix_mechanisms_load_through_strict_mode` with quoted values.
+/// The assertion is made at the **strict-check layer** on purpose: what this
+/// test's item (#384) changed is the strict check, so the check is what it
+/// pins, on the shipped file itself. When it was written the file also carried
+/// bare numeric values for string fields (`token = 12345678`,
+/// `meta_var1 = 123`) that frp-rs's INI number inference turned into TOML
+/// integers serde then rejected — a pre-existing legacy-INI gap unrelated to
+/// strict mode. That gap is fixed (`TODO.md:1359`) and the full load is pinned
+/// by `legacy_ini_go_shipped_frpc_fixture_loads_end_to_end` below; this test
+/// stays as the narrower strict-check pin.
 #[test]
 fn legacy_ini_go_shipped_fixture_passes_strict_mode() {
     let mut value = super::format::parse_to_toml_value(
@@ -5677,9 +5683,368 @@ fn legacy_ini_go_shipped_fixture_passes_strict_mode() {
     }
 }
 
+/// Go frp v0.71.0's own `conf/legacy/frpc_legacy_full.ini` (vendored
+/// byte-identically), loaded **end to end** through the real client config
+/// path with strict mode on — the assertion `legacy_ini_go_shipped_fixture_passes_strict_mode`
+/// deliberately could not make before `TODO.md:1359` was closed.
+///
+/// Every expected name and count here is Go's own, measured on the real
+/// v0.71.0 binary: Go frpc + Go frps with the same file (only
+/// `server_addr`/`server_port`/`admin_port` swapped for free ports — every
+/// other byte unchanged) logs
+/// `proxy added: [dns p2p_tcp plugin_http2https … web01 web02]` (43 names) and
+/// `visitor added: [p2p_tcp_visitor secret_tcp_visitor]`.
+///
+/// `[range:tcp_port]`'s `local_port = 6010-6020,6022,6024-6028` is 17 numbers
+/// (Go `pkg/util/util/util.go:71` splits on `,`;
+/// `pkg/config/legacy/client.go:314-336` renders one proxy per number).
+#[test]
+fn legacy_ini_go_shipped_frpc_fixture_loads_end_to_end() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/config/fixtures/frpc_legacy_full.ini"
+    );
+    let cfg = load_client_config(path, true)
+        .expect("Go's shipped legacy frpc INI fixture must load end to end in strict mode");
+
+    let mut names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+    names.sort_unstable();
+    let expected: &[&str] = &[
+        "dns",
+        "p2p_tcp",
+        "plugin_http2https",
+        "plugin_http_proxy",
+        "plugin_https2http",
+        "plugin_https2https",
+        "plugin_socks5",
+        "plugin_static_file",
+        "plugin_unix_domain_socket",
+        "secret_tcp",
+        "ssh",
+        "ssh_random",
+        "tcp_port_0",
+        "tcp_port_1",
+        "tcp_port_10",
+        "tcp_port_11",
+        "tcp_port_12",
+        "tcp_port_13",
+        "tcp_port_14",
+        "tcp_port_15",
+        "tcp_port_16",
+        "tcp_port_2",
+        "tcp_port_3",
+        "tcp_port_4",
+        "tcp_port_5",
+        "tcp_port_6",
+        "tcp_port_7",
+        "tcp_port_8",
+        "tcp_port_9",
+        "tcpmuxhttpconnect",
+        "udp_port_0",
+        "udp_port_1",
+        "udp_port_10",
+        "udp_port_2",
+        "udp_port_3",
+        "udp_port_4",
+        "udp_port_5",
+        "udp_port_6",
+        "udp_port_7",
+        "udp_port_8",
+        "udp_port_9",
+        "web01",
+        "web02",
+    ];
+    assert_eq!(names, expected, "proxy name set");
+    assert_eq!(cfg.proxies.len(), 43);
+
+    let mut visitors: Vec<&str> = cfg.visitors.iter().map(|v| v.name.as_str()).collect();
+    visitors.sort_unstable();
+    assert_eq!(visitors, ["p2p_tcp_visitor", "secret_tcp_visitor"]);
+    let stcp_visitor = cfg
+        .visitors
+        .iter()
+        .find(|v| v.name == "secret_tcp_visitor")
+        .expect("secret_tcp_visitor");
+    assert_eq!(stcp_visitor.visitor_type, "stcp");
+    assert_eq!(stcp_visitor.server_name, "secret_tcp");
+    assert_eq!(stcp_visitor.secret_key, "abcdefg");
+    assert_eq!(stcp_visitor.bind_addr, "127.0.0.1");
+    assert_eq!(stcp_visitor.bind_port, 9000, "visitor-only key survives");
+    let xtcp_visitor = cfg
+        .visitors
+        .iter()
+        .find(|v| v.name == "p2p_tcp_visitor")
+        .expect("p2p_tcp_visitor");
+    assert_eq!(xtcp_visitor.bind_port, 9001, "visitor-only key survives");
+    assert_eq!(xtcp_visitor.server_user, "user1");
+    assert!(!xtcp_visitor.keep_tunnel_open);
+    assert_eq!(xtcp_visitor.max_retries_an_hour, 8);
+    assert_eq!(xtcp_visitor.min_retry_interval, 90);
+
+    // Value inference (TODO.md:1359 class 1): a bare numeric `token` and a bare
+    // numeric `meta_*` are text on Go, not integers — Go's `frpc verify -c`
+    // exits 0 and the token is the string `12345678`.
+    assert_eq!(cfg.token, "12345678");
+    assert_eq!(cfg.metas.get("var1").map(String::as_str), Some("123"));
+    assert_eq!(cfg.metas.get("var2").map(String::as_str), Some("234"));
+
+    let named = |name: &str| {
+        cfg.proxies
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("proxy `{name}`"))
+    };
+    let ssh = named("ssh");
+    assert_eq!(ssh.group_key, "123456", "a numeric string field");
+    assert_eq!(
+        ssh.metas.get("var1").map(String::as_str),
+        Some("123"),
+        "`meta_*` folded into the proxy map as text"
+    );
+    assert_eq!(ssh.bandwidth_limit, "1MB");
+    assert_eq!(ssh.health_check_interval_seconds, 10);
+
+    // Class 2: the comma list expands to Go's per-port proxies.
+    let tcp_ports: Vec<u16> = (0..17)
+        .map(|i| named(&format!("tcp_port_{i}")).local_port)
+        .collect();
+    let mut expected_ports: Vec<u16> = (6010..=6020).collect();
+    expected_ports.push(6022);
+    expected_ports.extend(6024..=6028);
+    assert_eq!(tcp_ports, expected_ports);
+    assert_eq!(named("tcp_port_16").remote_port, 6028);
+    let udp_ports: Vec<u16> = (0..11)
+        .map(|i| named(&format!("udp_port_{i}")).local_port)
+        .collect();
+    assert_eq!(udp_ports, (6010..=6020).collect::<Vec<u16>>());
+}
+
+/// The same for Go's `conf/legacy/frps_legacy_full.ini` (vendored
+/// byte-identically): Go `frps verify -c` exits 0 with
+/// `allow_ports = 2000-3000,3001,3003,4000-50000` read as the *string*
+/// (`pkg/config/legacy/server.go:243-247`), and `token = 12345678` as the
+/// string `12345678`.
+///
+/// `frps` has no `verify` subcommand in frp-rs (a pre-existing CLI divergence,
+/// `TODO.md:1632`), so this loads through the same `load_server_config` the
+/// daemon calls — the same entry point `frps -c` uses.
+#[test]
+fn legacy_ini_go_shipped_frps_fixture_loads_end_to_end() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/config/fixtures/frps_legacy_full.ini"
+    );
+    let cfg = load_server_config(path, true)
+        .expect("Go's shipped legacy frps INI fixture must load end to end in strict mode");
+
+    assert_eq!(cfg.auth.token, "12345678", "numeric `token` read as text");
+    assert_eq!(cfg.auth.method, "token");
+    assert_eq!(cfg.allow_ports, "2000-3000,3001,3003,4000-50000");
+    assert_eq!(cfg.bind_port, 7000);
+    assert_eq!(cfg.log.max_days, 3, "numeric INI field still parses");
+    assert_eq!(cfg.sub_domain_host, "frps.com");
+    assert_eq!(cfg.nat_hole_analysis_data_reserve_hours, 168);
+    assert_eq!(cfg.transport.max_pool_count, 5);
+
+    let mut plugins: Vec<&str> = cfg.http_plugins.iter().map(|p| p.name.as_str()).collect();
+    plugins.sort_unstable();
+    assert_eq!(plugins, ["port-manager", "user-manager"]);
+    let user_manager = cfg
+        .http_plugins
+        .iter()
+        .find(|p| p.name == "user-manager")
+        .expect("user-manager");
+    assert_eq!(user_manager.ops, ["Login"]);
+    assert_eq!(user_manager.addr, "127.0.0.1:9000");
+}
+
+/// `TODO.md:1359` class 2, on a constructed case: the trigger for the dropped
+/// section is the **comma list**, not the range.
+///
+/// Measured on Go v0.71.0 (Go frps + Go frpc, `GET /api/proxy/tcp`):
+/// `local_port = 6010-6012` registers `x_0`…`x_2` (3);
+/// `local_port = 6010-6012,6020` registers `x_0`…`x_3` (4). frp-rs used to
+/// report `Proxies: 0` plus
+/// `WARN … legacy INI [range:...] section: missing or invalid local_port; skipped`
+/// for the second, because `ini_to_toml` split the list into a TOML array that
+/// `ini_port_numbers` did not accept.
+#[test]
+fn test_legacy_ini_range_comma_list_expands_to_go_count() {
+    let simple = load_client_ini(
+        "[common]\n\
+         server_addr = 127.0.0.1\n\
+         server_port = 7000\n\
+         [range:x]\n\
+         type = tcp\n\
+         local_port = 6010-6012\n\
+         remote_port = 7010-7012\n",
+    )
+    .unwrap();
+    let mut names: Vec<&str> = simple.proxies.iter().map(|p| p.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["x_0", "x_1", "x_2"]);
+
+    let comma = load_client_ini(
+        "[common]\n\
+         server_addr = 127.0.0.1\n\
+         server_port = 7000\n\
+         [range:x]\n\
+         type = tcp\n\
+         local_port = 6010-6012,6020\n\
+         remote_port = 7010-7012,7020\n",
+    )
+    .unwrap();
+    let mut names: Vec<&str> = comma.proxies.iter().map(|p| p.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["x_0", "x_1", "x_2", "x_3"]);
+    assert_eq!(
+        comma.proxies[3].local_port, 6020,
+        "the element after a range is expanded, not dropped"
+    );
+    assert_eq!(comma.proxies[3].remote_port, 7020);
+}
+
+/// `TODO.md:1359` class 3: Go dispatches a `[range:...]` template on `role`
+/// **after** expanding it (`pkg/config/legacy/client.go:252-285`), so
+/// `role = visitor` builds visitors. Measured on Go v0.71.0: a `6010-6012`
+/// range with `role = visitor` logs `visitor added: [rv_0 rv_1 rv_2]`; frp-rs
+/// used to report `Proxies: 3 Visitors: 0` and strip `bind_addr`/`bind_port`/
+/// `server_name` with them (the elements were stripped against the *proxy*
+/// key set).
+#[test]
+fn test_legacy_ini_range_role_visitor_builds_visitors() {
+    let cfg = load_client_ini(
+        "[common]\n\
+         server_addr = 127.0.0.1\n\
+         server_port = 7000\n\
+         [range:rv]\n\
+         type = stcp\n\
+         role = visitor\n\
+         server_name = missing_proxy\n\
+         sk = abc\n\
+         bind_addr = 127.0.0.1\n\
+         bind_port = 6000\n\
+         local_port = 6010-6012\n\
+         remote_port = 7010-7012\n",
+    )
+    .unwrap();
+    assert!(cfg.proxies.is_empty(), "a visitor template is not a proxy");
+    let mut names: Vec<&str> = cfg.visitors.iter().map(|v| v.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["rv_0", "rv_1", "rv_2"]);
+    for visitor in &cfg.visitors {
+        assert_eq!(visitor.visitor_type, "stcp");
+        assert_eq!(visitor.server_name, "missing_proxy");
+        assert_eq!(visitor.secret_key, "abc");
+        assert_eq!(visitor.bind_addr, "127.0.0.1");
+        assert_eq!(
+            visitor.bind_port, 6000,
+            "the template's visitor-only keys must survive the strip pass"
+        );
+    }
+}
+
+/// `TODO.md:1359` class 1, the smallest form: an INI value that the lossless
+/// reader infers as a non-string is read back **as text** by a string-typed
+/// field, and the same value is still read as a number/boolean by a
+/// numeric/boolean field (the trap: a blanket "keep every INI value as a
+/// string" would break `bind_port = 7000` and `log_max_days = 3`).
+#[test]
+fn test_legacy_ini_values_are_read_by_target_type() {
+    let cfg = load_client_ini(
+        "[common]\n\
+         server_addr = 127.0.0.1\n\
+         server_port = 7000\n\
+         token = 12345678\n\
+         meta_var1 = 123\n\
+         log_max_days = 3\n\
+         tcp_mux = no\n\
+         pool_count = 5\n\
+         [tcp]\n\
+         type = tcp\n\
+         local_port = 8080\n\
+         remote_port = 7001\n\
+         group_key = 123456\n\
+         bandwidth_limit = 1MB\n",
+    )
+    .unwrap();
+    assert_eq!(cfg.token, "12345678");
+    assert_eq!(cfg.metas.get("var1").map(String::as_str), Some("123"));
+    assert_eq!(cfg.server_port, 7000, "numeric field still numeric");
+    assert_eq!(cfg.log.max_days, 3, "numeric field still numeric");
+    assert_eq!(cfg.pool_count, 5, "numeric field still numeric");
+    assert!(!cfg.tcp_mux, "`no` still reads as a false boolean");
+    assert_eq!(cfg.proxies[0].local_port, 8080);
+    assert_eq!(cfg.proxies[0].remote_port, 7001);
+    assert_eq!(cfg.proxies[0].group_key, "123456");
+    assert_eq!(cfg.proxies[0].bandwidth_limit, "1MB");
+
+    // The spellings Go's `ini.v1.parseBool` accepts (`key.go:194`) but the
+    // inference no longer rewrites.
+    let cfg = load_client_ini("[common]\nserver_addr = 127.0.0.1\ntcp_mux = OFF\n").unwrap();
+    assert!(!cfg.tcp_mux);
+    let cfg = load_client_ini("[common]\nserver_addr = 127.0.0.1\ntcp_mux = yes\n").unwrap();
+    assert!(cfg.tcp_mux);
+    // `1`/`0` are Go's `parseBool` spellings too, and reach the field as the
+    // inferred integer rather than as text.
+    let cfg = load_client_ini("[common]\nserver_addr = 127.0.0.1\ntcp_mux = 1\n").unwrap();
+    assert!(cfg.tcp_mux);
+    let cfg = load_client_ini("[common]\nserver_addr = 127.0.0.1\ntcp_mux = 0\n").unwrap();
+    assert!(!cfg.tcp_mux);
+    // The legacy `authenticate_heartbeats` -> additional_auth_scopes pass has
+    // the same spelling set (it is a Go bool field).
+    let cfg = load_client_ini("[common]\nserver_addr = 127.0.0.1\nauthenticate_heartbeats = 1\n")
+        .unwrap();
+    assert_eq!(
+        cfg.auth
+            .as_ref()
+            .map(|a| a.additional_auth_scopes.clone())
+            .unwrap_or_default(),
+        ["HeartBeats"]
+    );
+    // …and a string-typed field keeps the spelling the file wrote.
+    let cfg = load_client_ini("[common]\nserver_addr = 127.0.0.1\ntoken = YES\n").unwrap();
+    assert_eq!(cfg.token, "YES");
+
+    // An INI value that is not a number at all still fails a numeric field.
+    let err = load_client_ini("[common]\nserver_addr = 127.0.0.1\nserver_port = abc\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("config validation error"), "got: {err}");
+}
+
+/// The array spelling of the same port list — a TOML/JSON config may write the
+/// legacy-shaped section with a real array, and `[range:...]`'s
+/// `local/remote_port` must accept it just like the comma list
+/// (`TODO.md:1359`'s "let `ini_port_numbers` accept the split array").
+#[test]
+fn test_legacy_ini_range_port_list_accepts_an_array() {
+    let cfg = load_client_config_from_json(
+        r#"{
+          "serverAddr": "127.0.0.1",
+          "serverPort": 7000,
+          "range:x": {
+            "type": "tcp",
+            "local_port": [6010, "6011-6012"],
+            "remote_port": [7010, 7011, 7012]
+          }
+        }"#,
+    )
+    .unwrap();
+    let mut names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["x_0", "x_1", "x_2"]);
+    assert_eq!(cfg.proxies[0].local_port, 6010);
+    assert_eq!(cfg.proxies[1].local_port, 6011);
+    assert_eq!(cfg.proxies[2].local_port, 6012);
+}
+
 /// Every legacy INI prefix mechanism Go reads, loaded end to end through strict
-/// mode with values that survive serde (quoted where frp-rs's INI inference
-/// would otherwise make them numbers):
+/// mode (the values here were once quoted so they survived the INI reader's
+/// number inference; since the reader became lossless and `.ini` values are
+/// read by the target field's type, quoting is no longer needed — the
+/// unquoted spellings are covered by
+/// `test_legacy_ini_values_are_read_by_target_type`):
 ///
 /// * `meta_*` → `metadatas` (`pkg/config/legacy/proxy.go:198`);
 /// * `header_*` → HTTP request headers, for `type = "http"` only
@@ -7626,10 +7991,23 @@ fn test_type_mismatch_toml_values_rejected() {
 
 #[test]
 fn test_ini_yes_no_bool_inference() {
-    // format.rs infer_ini_value: yes/no → true/false (Go Viper parity).
+    // format.rs infer_ini_value is lossless: `yes`/`no` are NOT the canonical
+    // rendering of a boolean, so they stay text here and the *target field*
+    // decides. A string field receives `yes` verbatim — what Go's legacy INI
+    // loader gives it (`ini.v1` `Key.String()`, struct.go:164) — where the old
+    // inference rewrote it to `true` before serde ever saw the field.
     let value =
         super::format::parse_to_toml_value("a = yes\nb = no\n", super::format::ConfigFormat::Ini)
             .unwrap();
+    let table = value.as_table().unwrap();
+    assert_eq!(table.get("a"), Some(&toml::Value::String("yes".into())));
+    assert_eq!(table.get("b"), Some(&toml::Value::String("no".into())));
+    // The canonical spellings are still inferred.
+    let value = super::format::parse_to_toml_value(
+        "a = true\nb = false\n",
+        super::format::ConfigFormat::Ini,
+    )
+    .unwrap();
     let table = value.as_table().unwrap();
     assert_eq!(table.get("a"), Some(&toml::Value::Boolean(true)));
     assert_eq!(table.get("b"), Some(&toml::Value::Boolean(false)));
