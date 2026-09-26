@@ -929,14 +929,39 @@ fn run_cli<T>(parser: bpaf::OptionParser<T>, argv: &[OsString]) -> T {
     }
 }
 
+/// The argv a binary's entry point hands bpaf with pflag's config dash-value
+/// rule applied (the `-c=<value>` attachment in
+/// [`rewrite_config_dash_values`]; the short-`=` alias expansion is separate and
+/// happens inside [`cli_args`]).
+///
+/// Both entry points call **this** function, which is what makes the shared
+/// pass a single decision rather than two call sites that could drift:
+/// [`parse_frps_args`] and [`parse_frpc_args`] differ only in which parser they
+/// run over the result. Crate-private: the module's tests pin the pair (this
+/// preparation, then the parser) through it, so they follow the same expression
+/// the binaries use instead of calling the rewrite directly — see
+/// `frps_takes_a_dash_shaped_config_value`.
+fn prepared_cli_argv(argv: &[OsString]) -> Vec<OsString> {
+    rewrite_config_dash_values(argv)
+}
+
 /// Parse frps CLI args. Prints help/version and exits as needed.
 pub fn parse_frps_args() -> FrpsArgs {
     let argv: Vec<OsString> = std::env::args_os().collect();
+    // Go's pflag consumes a `-`-prefixed token as a config flag's value on
+    // `frps` too; bpaf only refuses the tokens it classifies as flags (see
+    // [`rewrite_config_dash_values`]). Shared with `frpc` through
+    // [`prepared_cli_argv`] — measured on Go frps v0.71.0:
+    // `-c --strict-config=false` and `-c -x` are
+    // `open <token>: no such file or directory` there, and `-c --` is
+    // `open --: no such file or directory`. `warn_if_strict_config_space_form_used`
+    // keeps reading the original argv.
+    let parse_argv = prepared_cli_argv(&argv);
     let args = run_cli(
         frps_args()
             .to_options()
             .descr("frps is the server of frp-rs (https://github.com/fatedier/frp)"),
-        &argv,
+        &parse_argv,
     );
     // Only reached when the argv parsed: the failure path above exits the
     // process, so the warning can never fire for a refused argv, and the
@@ -1267,7 +1292,9 @@ where
 }
 
 /// Rewrite pflag's `-c <dash-value>` spellings into bpaf's attached
-/// `-c=<dash-value>` form, before bpaf sees argv.
+/// `-c=<dash-value>` form, before bpaf sees argv. Used by **both** binaries —
+/// [`parse_frps_args`] and [`parse_frpc_args`] — because Go's `frps` shares the
+/// rule through pflag, not only cobra's `frpc` subcommands.
 ///
 /// Go's pflag consumes the **next argv token** as a value for a value-taking
 /// flag with no regard for a leading `-`. bpaf classifies tokens first
@@ -1292,7 +1319,10 @@ where
 /// Scope is exactly the config-selecting persistent flags — `-c`, `--config`,
 /// `--config-dir` and the frp-rs `--config_dir` alias — so this does not
 /// generalise pflag's rule to every value-taking flag; a `-`-prefixed value for
-/// any other flag is left untouched. Nothing after the first `--` is rewritten
+/// any other flag is left untouched. `--config-dir`/`--config_dir` are not Go
+/// `frps` flags (Go answers `unknown flag: --config-dir`, rc 1) — they are
+/// frp-rs's own, and the rewrite covers their dash-valued form here so the flag
+/// behaves the same on both binaries. Nothing after the first `--` is rewritten
 /// (Go treats those as positional args), except that a `--` consumed as a
 /// config value is attached like any other value, which is what Go does.
 fn rewrite_config_dash_values(argv: &[OsString]) -> Vec<OsString> {
@@ -1933,11 +1963,11 @@ pub fn parse_frpc_args() -> FrpcCmd {
     let argv: Vec<OsString> = std::env::args_os().collect();
     // Go's pflag consumes a `-`-prefixed token as a config flag's value; bpaf
     // only refuses the tokens it classifies as flags (see
-    // [`rewrite_config_dash_values`]). The rewrite is frpc-only: this item
-    // covers the frpc surface, and the frps half is measured and filed as its
-    // own `TODO.md` item. `warn_if_strict_config_space_form_used` keeps reading
-    // the original argv.
-    let parse_argv = rewrite_config_dash_values(&argv);
+    // [`rewrite_config_dash_values`]). Shared with `frps` through
+    // [`prepared_cli_argv`]; this call site is what makes the rewrite apply to
+    // every `frpc` subcommand. `warn_if_strict_config_space_form_used` keeps
+    // reading the original argv.
+    let parse_argv = prepared_cli_argv(&argv);
     let args = run_cli(
         frpc_parser()
             .to_options()
@@ -3810,5 +3840,110 @@ mod tests {
             let expected: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
             assert_eq!(rewrite(&argv), expected, "rewrote {argv:?}");
         }
+    }
+
+    // ── The frps half of the same rewrite (the `-c <dash-value>` item in
+    // `TODO.md`) ─────────────────────────────────────────────────────
+
+    /// Run argv through the **shared preparation function** the binaries call
+    /// ([`prepared_cli_argv`], used by both `parse_frps_args` and
+    /// `parse_frpc_args`) and then through the frps parser, the way
+    /// `parse_frps_args` does. Going through the shared function — rather than
+    /// calling the rewrite directly — is what makes this a pin on the pair the
+    /// entry point evaluates; the wiring itself (that `parse_frps_args` passes
+    /// the prepared argv to `run_cli`) is what the argv-level tests in
+    /// `frps/tests/cli_exit_codes.rs` fail on when it is reverted.
+    ///
+    /// Measured on Go frp v0.71.0: `frps -c --strict-config=false` is rc 1
+    /// `open --strict-config=false: no such file or directory` — the token is
+    /// `-c`'s value. Before this call site prepared the argv, frp-rs's parser
+    /// exited with ``-c` requires an argument `FILE``.
+    #[test]
+    fn frps_takes_a_dash_shaped_config_value() {
+        let argv: Vec<OsString> = ["-c", "--strict-config=false"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let parsed = frps_args()
+            .to_options()
+            .run_inner(&prepared_cli_argv(&argv)[..])
+            .expect("the prepared argv parses");
+        assert_eq!(
+            parsed.config.as_deref(),
+            Some("--strict-config=false"),
+            "the dash-shaped token must be `-c`'s value, not the flag"
+        );
+
+        // The long spelling, a value-taking frps flag, and a value that is
+        // itself the config short flag.
+        for (argv, expected) in [
+            (&["--config", "-x"][..], "-x"),
+            (&["-c", "--bind-port"][..], "--bind-port"),
+            (&["-c", "-c"][..], "-c"),
+        ] {
+            let argv: Vec<OsString> = argv.iter().map(OsString::from).collect();
+            let parsed = frps_args()
+                .to_options()
+                .run_inner(&prepared_cli_argv(&argv)[..])
+                .unwrap_or_else(|err| {
+                    panic!("frps {argv:?} must parse after the rewrite: {err:?}")
+                });
+            assert_eq!(
+                parsed.config.as_deref(),
+                Some(expected),
+                "frps {argv:?} must take the dash-shaped token as the config value"
+            );
+        }
+
+        // `--` consumed as the value takes it out of flag position, exactly as
+        // it does on `frpc` (measured on Go v0.71.0 and on frp-rs:
+        // `open --: no such file or directory`, rc 1, both). A word *after*
+        // that value is a positional, and frp-rs refuses leftover positionals
+        // with or without a `--` on both binaries — a pre-existing divergence
+        // filed with the subcommand-after-root-flags item in `TODO.md`.
+        let argv: Vec<OsString> = ["-c", "--"].iter().map(OsString::from).collect();
+        let parsed = frps_args()
+            .to_options()
+            .run_inner(&prepared_cli_argv(&argv)[..])
+            .expect("`-c --` parses with `--` as the value");
+        assert_eq!(parsed.config.as_deref(), Some("--"));
+
+        // Without the rewrite the same argv is still refused — this is what
+        // makes the assertion above a pin on the preparation, not on bpaf.
+        let raw: Vec<OsString> = ["-c", "--strict-config=false"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert!(
+            frps_args().to_options().run_inner(&raw[..]).is_err(),
+            "bpaf must still refuse the unprepared spelling — otherwise this test proves nothing"
+        );
+    }
+
+    /// The rewrite's scope on `frps`: the same four config-selecting flags as
+    /// `frpc`, so `--config-dir`/`--config_dir` (frp-rs extensions — Go frps has
+    /// neither) get the same treatment, and a dash-shaped token anywhere else is
+    /// left for bpaf.
+    #[test]
+    fn frps_rewrite_scope_matches_frpc() {
+        assert_eq!(
+            rewrite(&["--config-dir", "-x"]),
+            vec!["--config-dir=-x"],
+            "--config-dir is one of the four flags"
+        );
+        assert_eq!(
+            rewrite(&["--config_dir", "-x"]),
+            vec!["--config_dir=-x"],
+            "--config_dir is the frp-rs alias and is one of the four flags"
+        );
+        // Not a config flag: a dash value here is bpaf's business, and on frps
+        // `--bind-port` takes an integer, so this stays refused on both sides.
+        assert_eq!(rewrite(&["--bind-port", "-x"]), vec!["--bind-port", "-x"]);
+        assert_eq!(rewrite(&["-t", "-x"]), vec!["-t", "-x"]);
+        // A real `--` on frps, with a config flag after it: untouched.
+        assert_eq!(
+            rewrite(&["-c", "p.toml", "--", "-c", "-x"]),
+            vec!["-c", "p.toml", "--", "-c", "-x"]
+        );
     }
 }

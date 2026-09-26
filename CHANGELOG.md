@@ -198,9 +198,43 @@ User-facing release notes for frp-rs.
   b.toml`, `frpc status extra`, `frpc tcp … extra`), including the leftover
   argument of a flag-shaped `-c` value (`frpc tcp … -c --config-dir cDir` starts
   on Go, is rc 1 here) — the residual shapes, each with its measurement in
-  `docs/developing.md` § CLI inputs. The `frps` command is unchanged: Go's pflag
-  consumes `-`-prefixed values for `frps -c` too and frp-rs still refuses them
-  (filed as its own item).
+  `docs/developing.md` § CLI inputs. The `frps` command behaved the same way at
+  that head — Go's pflag consumes `-`-prefixed values for `frps -c` too and
+  frp-rs refused them — and the shared pre-parse pass now covers it; see the next
+  entry.
+- **`frps` now takes a `-`-prefixed value after `-c`/`--config` too, exactly as
+  `frpc` does — a behaviour change.** The pflag value rule in the entry above was
+  wired to the `frpc` entry point only, so Go's
+  `frps -c --strict-config=false` (which is `open --strict-config=false: no such
+  file or directory`, exit 1 — the token is `-c`'s **value**) exited 1 here with
+  ``Error: `-c` requires an argument `FILE```, and `frps -c -x` exited 1 with
+  the "got a flag `-x`, try `-c=-x`" refusal. Both binaries now run the same
+  pre-parse pass, so these argv shapes work on `frps`: `frps -c
+  --strict-config=false`, `-c -x`, `-c --bind-port` and `--config -x` all read
+  the flag-shaped token as the config path and fail on the missing file with
+  exit 1, as Go does; `frps -c --` reads a file named `--` (Go: `open --: …`);
+  and `frps -c --help` now reads `--help` as the config path (exit 1, as Go)
+  instead of printing help with exit 0 — the same rule, and a deliberate loss of
+  the old frp-rs convenience. Not changed: a dangling `-c` is still an error, and
+  a `--` that is a real separator still ends flag parsing (`frps --
+  --strict-config=false` and `frps -- -c p.toml` are refused here, while Go
+  **starts the server** — it takes everything after `--` as positional args and
+  ignores them; `unknown command "…"` fires only for a positional *without* `--`,
+  which is the pre-existing positional divergence, not a new one). Also not
+  changed, and stated so it is not read into this note: **`frps` has no `-c`
+  last-wins** — `frps -c a.toml -c b.toml` is refused on both trees where Go
+  opens `b.toml`; only the rewrite's dash-value attachment is shared with frpc.
+  One row moves
+  the other way and is deliberate: `frps --config-dir -x` (or
+  `--config-dir --strict-config=false`) now reaches frp-rs's pre-existing
+  `--config-dir` refusal, **exit 2**, where the parser used to answer exit 1
+  ``--config-dir` requires an argument `DIR`` — `--config-dir` is one of the
+  four flags the pass covers on both binaries. Go `frps` has no `--config-dir`
+  at all (`unknown flag`, exit 1), so that row is a documented divergence either
+  way. `frps verify -c <dash-value>` also reports a different error now: `verify`
+  is not a subcommand here, so the unknown subcommand is the first error instead
+  of the `-c` refusal (Go has `frps verify`; the row's current Go error is
+  pinned in `docs/developing.md` § CLI inputs).
 - **`frpc --version` no longer short-circuits an argv that is going to fail — a
   behaviour change.** The version check lived in a closure on the run-mode
   branch of `frpc`'s argument parser, and bpaf evaluates every alternative while

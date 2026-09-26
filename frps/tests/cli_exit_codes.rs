@@ -29,6 +29,14 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_frps");
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The child's own **progress witness**: the SIGUSR1 task logs this line after
+/// its `tokio::signal::unix::signal` call returns (`frps/src/main.rs:207-215`),
+/// which a `frps` that is still pre-init cannot have printed. It is *not* proof
+/// that SIGTERM's handler is installed — tokio registers signals per kind and
+/// lazily (`tokio-1.53.1/src/signal/unix.rs:283-300`), so the SIGTERM
+/// registration is a separate call that this line does not witness. See
+/// [`start_listening_then_sigterm`] for what the marker does buy.
+const SIGNAL_READY_MARKER: &str = "SIGUSR1 reload ready";
 const BAD_CONFIG: &str = "bindPort = 7500\nnotAKnownFrpKey = 1\n";
 const UNKNOWN_FIELD: &str = "unknown field \"notAKnownFrpKey\"";
 
@@ -164,12 +172,58 @@ fn missing_config_exits_1() {
 /// Returns the child's combined output.
 ///
 /// It is not enough to sleep: the SIGTERM handler is installed only after the
-/// service has bound its listener, so signalling an already-started-but-not-yet-
-/// listening frps kills it with the *default* disposition (measured:
+/// service has asked for its listener, so signalling an already-started-but-not-
+/// yet-listening frps kills it with the *default* disposition (measured:
 /// `unix_wait_status(15)`, i.e. `code() == None`, no exit). A successful connect
-/// proves the listener exists, which is the ordering these tests need — and it
-/// is also how "the argv was accepted and a server really started" is asserted
-/// without inferring it from an exit code.
+/// proves *a* listener exists, which is the ordering these tests need — and it is
+/// also how "the argv was accepted and a server really started" is asserted
+/// without inferring it from an exit code. **It does not prove the listener is
+/// this child's** — see the foreign-listener arm below.
+///
+/// **The readiness barrier is the second half of the flake, measured.** Two
+/// mechanisms, both real, and the second one is the one that produces the
+/// failures:
+///
+/// 1. *The install race.* `Service::run` spawns the SIGTERM task from the same
+///    async fn that later runs the accept loop
+///    (`frp-server/src/service.rs:1579-1619`), so the listener can be accepting
+///    before that task has been polled even once — and then SIGTERM takes the
+///    default disposition.
+/// 2. *The foreign-listener false witness.* `ephemeral_port()` binds a port and
+///    releases it before the child binds it; tests run in parallel, so another
+///    test's `frps` can take that port first. A connect then succeeds against
+///    the **wrong process**, and if that one is still pre-init its SIGTERM does
+///    not shut down the child we are watching.
+///
+/// Both were measured on the connect-only helper, with the helper as the *only*
+/// difference and 40 iterations of the whole file per run: **7/40** on the
+/// author's host and **5/40** on the adversarial reviewer's, against **0/40,
+/// 0/40 and 1/40** across three marker-helper loops on the author's host and
+/// **0/40** on the reviewer's. The one residual marker failure is the
+/// non-zero window below, not the foreign-listener arm. Every failure had an **empty child log**
+/// although a connect had succeeded — impossible for the child under test, which
+/// logs before it binds, and therefore the foreign-listener arm — and one
+/// reviewer failure ended in `Address already in use (os error 48)`. Respawning
+/// a fresh child does **not** fix it (3/3 fresh spawns lost the same race in one
+/// run).
+///
+/// So the barrier is a **child-specific progress witness**: the SIGUSR1 task
+/// logs `SIGUSR1 reload ready` after its `tokio::signal::unix::signal` call
+/// returns (`frps/src/main.rs:207-215`), i.e. only after that `frps` is past its
+/// own startup logging. A foreign listener cannot fake it — only the child under
+/// test writes to that log path. If the line never appears (a platform without
+/// the handler), the helper panics with the log rather than silently weakening
+/// the assertion.
+///
+/// **What it does not prove, stated rather than implied.** tokio registers
+/// signals per kind and lazily (`tokio-1.53.1/src/signal/unix.rs:283-300`), so
+/// registering SIGUSR1 does *not* install SIGTERM's handler: a window remains
+/// between the marker and SIGTERM's registration. The reviewer measured it at
+/// **~0.16 ms median / 1.10 ms max**, i.e. small but nonzero — and it does
+/// occasionally open: see the `1/40` above, not reproduced in a follow-up 30-run
+/// loop (~1/100). That is why this helper reports such a failure rather than
+/// retrying it away, and why a future CI flake here should be diagnosed as this
+/// window before anything else.
 ///
 /// Output goes to a file, not a pipe: a child whose piped stdout nobody reads
 /// can block on a full pipe.
@@ -193,7 +247,12 @@ fn start_listening_then_sigterm(args: &[&str], port: u16, dir: &TempDir) -> Stri
 
     let ready_deadline = Instant::now() + EXIT_TIMEOUT;
     loop {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        // Two witnesses, both needed: a connect for "the argv produced a
+        // listener" (the port may be a foreign one, hence the second) and the
+        // child's own progress line for "this child is the one that got there".
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && read_log().contains(SIGNAL_READY_MARKER)
+        {
             break;
         }
         if let Some(status) = child.try_wait().expect("try_wait frps") {
@@ -207,19 +266,20 @@ fn start_listening_then_sigterm(args: &[&str], port: u16, dir: &TempDir) -> Stri
             let _ = child.kill();
             let _ = child.wait();
             panic!(
-                "frps {args:?} never listened on 127.0.0.1:{port} within {EXIT_TIMEOUT:?}; \
-                 log={:?}",
+                "frps {args:?} never listened on 127.0.0.1:{port} and logged \
+                 {SIGNAL_READY_MARKER:?} within {EXIT_TIMEOUT:?}; log={:?}",
                 read_log(),
             );
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(10));
     }
 
+    let started = Instant::now();
     let _ = Command::new("kill")
         .args(["-TERM", &child.id().to_string()])
         .status();
 
-    let deadline = Instant::now() + EXIT_TIMEOUT;
+    let deadline = started + EXIT_TIMEOUT;
     loop {
         match child.try_wait().expect("try_wait frps") {
             Some(status) => {
@@ -235,7 +295,10 @@ fn start_listening_then_sigterm(args: &[&str], port: u16, dir: &TempDir) -> Stri
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!(
-                    "frps {args:?} did not exit within {EXIT_TIMEOUT:?} of SIGTERM; log={:?}",
+                    "frps {args:?} did not exit within {EXIT_TIMEOUT:?} of SIGTERM (the child had \
+                     logged {SIGNAL_READY_MARKER:?}, but tokio registers each signal kind \
+                     separately, so SIGTERM's own registration may still have been pending); \
+                     log={:?}",
                     read_log(),
                 );
             }
@@ -604,5 +667,366 @@ fn disable_log_color_value_spelling_is_applied() {
             .windows(ANSI_ESCAPE.len())
             .any(|w| w == ANSI_ESCAPE),
         "--disable-log-color=true must strip ANSI colour from the log; log={log:?}"
+    );
+}
+
+// ── pflag's `-c <dash-value>` rule on `frps` (the `TODO.md` item of that
+// name) ─────────────────────────────────────────────────────────────
+//
+// Go's pflag hands a value-taking flag the **next argv token** whatever it
+// looks like (`parseSingleShortArg`'s `len(args) > 0` arm consumes `args[0]`
+// with no leading-`-` test — `spf13/pflag@v1.0.5/flag.go`), and `frps` uses
+// pflag, so `frps -c -x` is not a flag error on Go: it is an attempt to open a
+// file named `-x`. Measured on Go frp v0.71.0 (darwin/arm64, bounded children),
+// against the same argv here:
+//
+// ```text
+// frps -c --strict-config=false  → Go rc 1 `open --strict-config=false: no such file or directory`
+//                                  (was rc 1 ``-c` requires an argument `FILE``)
+// frps -c -x                     → Go rc 1 `open -x: no such file or directory`
+//                                  (was rc 1 ``-c` requires an argument `FILE`, got a flag `-x` …``)
+// frps -c --                     → Go rc 1 `open --: no such file or directory`
+//                                  (was rc 1 ``-c` requires an argument `FILE``)
+// ```
+//
+// What the pins assert is *which* thing happened, not just the code: the child
+// must have reached the config load and named the flag-shaped token as the file
+// it could not read, rather than the parser refusing the token. The exit code
+// alone is 1 in every row, before and after.
+//
+// Two shapes the rewrite deliberately does **not** change stay pinned here: a
+// `-`-prefixed token in any position other than the one right after a
+// config-selecting flag, and a `--` that is a real separator rather than `-c`'s
+// value.
+
+/// Both streams, ANSI stripped: the load error arrives on stdout inside a
+/// `tracing` line on this path, and these assertions are about the *path named*,
+/// not the stream (the output-shape divergence is tracked separately). The
+/// stripping mirrors what `--disable-log-color` does to the same line and keeps
+/// the assertion about the message text, not the colour.
+fn combined(out: &Output) -> String {
+    let mut clean = String::new();
+    for bytes in [&out.stdout, &out.stderr] {
+        let text = String::from_utf8_lossy(bytes);
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            // An SGR sequence is `ESC [` … one ASCII letter; the `ESC` itself
+            // must go too, or the text keeps a stray 0x1b.
+            if c == '\u{1b}' && chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            clean.push(c);
+        }
+    }
+    clean
+}
+
+/// `-c` followed by a token that is itself a flag's spelling: the token is the
+/// value. Both a Go bool (`--strict-config=false`) and a value-taking frps flag
+/// (`--bind-port`, whose own argument is therefore *not* consumed) are covered —
+/// pflag does not look at the token at all.
+///
+/// **Discrimination, per iteration.** The assertion is the load path's own line
+/// (`Failed to load config: <value>: failed to read config file`) plus the
+/// absence of any parser refusal, because "the output contains the token" is
+/// *not* discriminating on its own: the base head's refusal text already names
+/// `--bind-port`, `-x` and `-c` (`` … got a flag `-x`, try `-c=-x` …``). Only
+/// `--strict-config=false` is named solely by its own refusal
+/// (`` `-c` requires an argument `FILE` ``), so all four iterations assert the
+/// load line; the base tree then fails on `--strict-config=false` for the old
+/// reason and on the other three because "Failed to load config" is absent
+/// (they were refusals, not loads).
+#[test]
+fn dash_shaped_config_value_is_the_value_not_a_flag() {
+    for value in ["--strict-config=false", "--bind-port", "-x", "-c"] {
+        let out = run_frps(&["-c", value]);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "frps -c {value} must reach the load and fail there like Go; stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        let all = combined(&out);
+        assert!(
+            all.contains("Failed to load config") && all.contains(value),
+            "frps -c {value} must name `{value}` as the path it could not read, not refuse the \
+             token as a flag; output={all:?}"
+        );
+        assert!(
+            !all.contains("requires an argument"),
+            "the parser must not have refused the dash-shaped token; output={all:?}"
+        );
+    }
+
+    // The long spelling, and a dash value followed by a real flag that must
+    // still be parsed as one (the rewrite consumes only the one token).
+    for args in [
+        &["--config", "-x"][..],
+        &["-c", "-x", "--bind-port", "7000"][..],
+    ] {
+        let out = run_frps(args);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "frps {args:?} must reach the load; stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        assert!(
+            combined(&out).contains("-x"),
+            "frps {args:?} must name `-x` as the config path; output={:?}",
+            combined(&out)
+        );
+    }
+}
+
+/// `-c --` is the same rule: pflag consumes the separator token as the value
+/// before `parseArgs` can reach it as a terminator (`parseArgs` treats `--` as
+/// one only when it is the *current* token, and the value arm has already taken
+/// it). Measured on Go v0.71.0: rc 1, `open --: no such file or directory`.
+#[test]
+fn dash_dash_as_config_value_is_consumed_not_a_separator() {
+    let out = run_frps(&["-c", "--"]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "frps -c -- must try to open a file named `--` like Go; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = combined(&out);
+    assert!(
+        all.contains("--"),
+        "the child must name `--` as the config path it could not read; output={all:?}"
+    );
+    assert!(
+        !all.contains("not expected"),
+        "`--` must not survive as a separator token for the parser to refuse; output={all:?}"
+    );
+}
+
+/// The scope control: a real `--` still terminates flags, and a dangling `-c`
+/// is still a refusal. **Measured on Go v0.71.0, and the `--` half is a larger
+/// divergence than the message shape**: `frps -p <free> -- junk` and
+/// `frps -p <free> -- --strict-config=false` **start the server** (alive at 3-6 s,
+/// `frps started successfully`) because cobra takes everything after `--` as
+/// positional args and `frps`'s `RunE` ignores them; only a positional *without*
+/// `--` is an error (`frps junk` → rc 1 `unknown command "junk" for "frps"`).
+/// frp-rs refuses a leftover positional with or without `--` — the recorded
+/// divergence — so this test pins the refusal on our side, not a match with Go.
+/// A dangling `-c` *is* a match: `flag needs an argument: 'c' in -c` on Go.
+///
+/// Without the first assertion, a mutant that attached `=` to whatever follows
+/// any `-c` would pass this file.
+#[test]
+fn real_separator_and_dangling_config_stay_refused() {
+    // A real `--`: the token after it is positional, never `-c`'s value. Go
+    // ignores that positional and serves; frp-rs refuses it (both with and
+    // without a `--`), which is this suite's recorded positional divergence.
+    let out = run_frps(&["-c", "probe.toml", "--", "--strict-config=false"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "frp-rs refuses the leftover positional (Go starts the server); \
+         stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = combined(&out);
+    assert!(
+        all.contains("--strict-config=false"),
+        "the refused leftover must be named; output={all:?}"
+    );
+    assert!(
+        !all.contains("Failed to load config"),
+        "the token after a real `--` must not have been taken as `-c`'s value; output={all:?}"
+    );
+
+    // Dangling `-c`: still a refusal, with no value invented from anywhere.
+    let out = run_frps(&["-c"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a dangling -c must stay a refusal; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        combined(&out).contains("`-c` requires an argument"),
+        "the dangling `-c` refusal must keep naming the flag; output={:?}",
+        combined(&out)
+    );
+}
+
+/// The control row, re-measured after the rewrite: `--config-dir` is an frp-rs
+/// **extension** (Go frps answers `unknown flag: --config-dir`, rc 1) and it is
+/// one of the four flags the rewrite covers — so its dash-valued form now
+/// reaches the directory read (`-x` is opened, not refused) and lands on the
+/// extension's `EXIT_CONFIG`/2 instead of the parser's rc 1
+/// ``--config-dir` requires an argument `DIR``. Recorded in `docs/developing.md`
+/// § CLI exit codes with this measurement; Go's row is a different divergence (a
+/// flag it does not have) and cannot be matched.
+#[test]
+fn config_dir_dash_value_now_reaches_the_directory_read() {
+    let out = run_frps(&["--config-dir", "-x"]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--config-dir is an frp-rs extension and its refusal stays on 2; \
+         stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = combined(&out);
+    assert!(
+        all.contains("config directory"),
+        "the dash-shaped value must reach the directory read; output={all:?}"
+    );
+    assert!(
+        !all.contains("requires an argument"),
+        "the parser must no longer refuse the dash-shaped value; output={all:?}"
+    );
+}
+
+/// The item's third row, pinned **because it is sequencing, not parity**: Go has
+/// `frps verify`, frp-rs does not. Measured on Go v0.71.0:
+/// `frps verify -c --strict-config=false` is rc 1 `open --strict-config=false: no
+/// such file or directory`; here the rewrite lets `-c` consume its value, so the
+/// missing subcommand is now the first error.
+///
+/// **This test is a tripwire and its cheapest future fix is deletion — do not
+/// take it.** Implementing `frps verify` makes this test fail; that is the
+/// intended signal, and the fix is to move the pin to whatever the row now
+/// reports (and the matching row in `docs/developing.md` § CLI inputs), not to
+/// delete the test. The reason lives here and in the `frps verify` item in
+/// `TODO.md`, which carries the same warning.
+#[test]
+fn verify_subcommand_is_now_the_first_error_for_a_dash_config_value() {
+    let out = run_frps(&["verify", "-c", "--strict-config=false"]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "frp-rs has no `frps verify`; the unknown subcommand is rc 1 \
+         (stdout={:?} stderr={:?})",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = combined(&out);
+    assert!(
+        all.contains("verify") && all.contains("not expected"),
+        "the current first error must be the unknown `verify` subcommand, not a `-c` refusal; \
+         output={all:?}"
+    );
+    assert!(
+        !all.contains("-c` requires an argument"),
+        "the `-c` value must have been consumed by the rewrite; output={all:?}"
+    );
+}
+
+/// The other side of the same pflag rule, pinned so the help-precedence change
+/// is recorded rather than discovered: `--help` is only special when pflag
+/// *reaches* it as a flag. `frps -c --help` therefore takes `--help` as the
+/// config path.
+///
+/// Measured on Go v0.71.0 (free port): rc 1, `open --help: no such file or
+/// directory`. frp-rs before this branch: **rc 0, the help text** (bpaf resolved
+/// `--help` before the value); frp-rs now: rc 1 naming `--help` — a match, and a
+/// deliberate loss of the old frp-rs convenience.
+///
+/// The neighbouring shape `frps --help` (no `-c`) prints help on both trees —
+/// not pinned here because it is not discriminating; the value-position rule is
+/// what this test is about. `frps -c <word> --help` is likewise rc 0 + help on
+/// both trees (the value is a plain word, so no attachment happens) and is
+/// deliberately not covered.
+#[test]
+fn dash_help_after_config_is_a_value_not_a_help_request() {
+    const HELP_MARKER: &str = "frps is the server of frp-rs";
+
+    let out = run_frps(&["-c", "--help"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "`-c --help` must read `--help` as the config path, as Go does \
+         (stdout={:?} stderr={:?})",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = combined(&out);
+    assert!(
+        all.contains("--help"),
+        "the load error must name `--help` as the path; output={all:?}"
+    );
+    assert!(
+        !all.contains(HELP_MARKER),
+        "help must not have been printed — `--help` was `-c`'s value; output={all:?}"
+    );
+    assert!(
+        !all.contains("requires an argument"),
+        "the parser must not have refused the value; output={all:?}"
+    );
+}
+
+/// Repeated `-c`, measured on both sides because the rewrite changes **which**
+/// refusal is reported and frp-rs has no last-wins at all on `frps`:
+///
+/// ```text
+/// Go v0.71.0:  frps -c a.toml -c b.toml                   → rc 1 `open b.toml: …` (last-wins; starts with a valid b)
+/// Go v0.71.0:  frps -c --strict-config=false -c good.toml → starts (the second -c overwrites the first)
+/// frp-rs base: frps -c a.toml -c b.toml                   → rc 1 `argument `-c` cannot be used multiple times …`
+/// frp-rs head: frps -c a.toml -c b.toml                   → rc 1, unchanged
+/// frp-rs base: frps -c --strict-config=false -c …         → rc 1 `` -c` requires an argument `FILE` ``
+/// frp-rs head: frps -c --strict-config=false -c …         → rc 1 `argument `-c` cannot be used multiple times …`
+/// ```
+///
+/// So `frps -c a -c b` is a **pre-existing, unchanged** divergence (frp-rs
+/// refuses repetition; Go is last-wins), and this branch only makes the refusal
+/// message for the dash-value spelling consistent with it. The item's "same rule
+/// on both binaries" covers the dash-value attachment, *not* last-wins: the frpc
+/// `-c` last-wins work (`config_arg()`'s `.last()`) did not touch the frps
+/// parser, and this branch does not either.
+#[test]
+fn repeated_config_flags_refuse_with_the_multiple_times_message() {
+    let out = run_frps(&["-c", "a.toml", "-c", "b.toml"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "repetition is refused on frp-rs (Go is last-wins); stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        combined(&out).contains("cannot be used multiple times"),
+        "the pre-existing repetition refusal must be named; output={:?}",
+        combined(&out)
+    );
+
+    // The dash-value spelling now lands on that same refusal instead of the
+    // "requires an argument" one — a message change, same rc.
+    let out = run_frps(&["-c", "--strict-config=false", "-c", "p.toml"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the repeated dash-valued -c is still rc 1; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = combined(&out);
+    assert!(
+        all.contains("cannot be used multiple times"),
+        "with the dash value consumed, the repetition is what bpaf reports first; output={all:?}"
+    );
+    assert!(
+        !all.contains("-c` requires an argument"),
+        "the first `-c` must have taken `--strict-config=false` as its value; output={all:?}"
     );
 }
