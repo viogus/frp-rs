@@ -1301,27 +1301,77 @@ is `17498` and a second probe on the `--config-dir`'s config port:
 | `status --version -c p7498.toml`, `status -v=false -c …` | parses the flag, dials `17498` | rc 1, `` `--version`/`--version` is not expected`` | parses, dials `17498` |
 | `verify --config-dir cDir` (no `-c`) | rc 1, `open ./frpc.ini: no such file or directory` (`-c`'s Go default) | rc 1, ``--config-dir` is not expected`` | rc 1, ``expected `--config=FILE``` — the pre-existing "frp-rs `verify` has no default config" divergence, now visible through this argv |
 
-**The `-c <dash-value>` rewrite.** bpaf's `State::take_arg`
-(`bpaf-0.9.27/src/args.rs`) accepts only a plain word as an argument value, so
-no bpaf parser can express pflag's "the next token is the value, whatever it
-looks like". `parse_frpc_args` therefore rewrites exactly the config-selecting
-occurrences — `-c`, `--config`, `--config-dir`, the frp-rs `--config_dir` alias
-— whose next token starts with `-` into the attached `-c=VALUE` spelling before
-bpaf sees argv (`rewrite_config_dash_values`, `frp-core/src/cli.rs`). It stops
-at the first real `--` (Go treats everything after it as positional), and a `--`
-consumed as `-c`'s value is attached like any other value. It is **frpc-only**:
-the item is frpc-scoped and the shape has not been measured on frps. No other
-value-taking flag is rewritten, so this does not claim pflag's rule as a class.
+**The `-c <dash-value>` rewrite.** pflag consumes the next argv token as the
+value whatever it looks like. bpaf classifies tokens before anything else
+(`split_os_argument`, `bpaf-0.9.27/src/arg.rs:118-215`, then
+`disambiguate_short`, `bpaf-0.9.27/src/args.rs:183-250`): `--long` is
+`Arg::Long`; a single-dash token is `Arg::Short` when it has one character, when
+the character after the first is `=`, or when its first character is a short the
+parser registers; and only an unknown multi-character single-dash token falls
+back to `Arg::Word`. `State::take_arg`
+(`bpaf-0.9.27/src/args.rs:670-694`) accepts only the `Word`/`ArgWord` items
+tokenisation produced, so **it is not true that bpaf never takes a
+`-`-prefixed value** — measured at the base head (`ec82a20`), it already took
+`-foo.toml`, `-nonexistent.toml` and `-=v` (unknown multi-character tokens are
+demoted to `Arg::Word`), and refused only the flag-shaped `--strict-config=false`,
+`-x`, `-c`, `-a=b` and `--long`. `parse_frpc_args` therefore rewrites exactly
+the config-selecting occurrences — `-c`, `--config`, `--config-dir`, the frp-rs
+`--config_dir` alias — whose next token starts with `-` into the attached
+`-c=VALUE` spelling before bpaf sees argv (`rewrite_config_dash_values`,
+`frp-core/src/cli.rs`); for the already-working shapes the rewrite is a
+pass-through pin, not a repair. It stops at the first real `--` (Go treats
+everything after it as positional), and a `--` consumed as `-c`'s value is
+attached like any other value. No other value-taking flag is rewritten, so this
+does not claim pflag's rule as a class.
+
+**frps is the same rule and is not fixed here.** Measured on Go frps v0.71.0 and
+this head's `frps`: `frps -c --strict-config=false` → Go rc 1
+`open --strict-config=false: no such file or directory`, frp-rs rc 1
+``-c` requires an argument `FILE``; `frps -c -x` → Go rc 1 `open -x: …`, frp-rs
+rc 1 ``-c` requires an argument `FILE`, got a flag `-x`, try `-c=-x` …``;
+`frps verify -c --strict-config=false` → Go rc 1 `open --strict-config=false`,
+frp-rs rc 1 ``-c` requires an argument `FILE`` (frp-rs has no `frps verify`, but
+the `-c` failure is reported first). `frps --config-dir --strict-config=false` is
+a different pair: Go rc 1 `unknown flag: --config-dir`, frp-rs rc 1
+``--config-dir` requires an argument `DIR``. Filed as its own `TODO.md` item
+(`TODO.md:2251`) because this item is frpc-scoped, as the #378 work was.
+
+One more `frpc` shape is the same *root-flag placement* question and is filed
+separately (`TODO.md:2270`): Go's cobra resolves a subcommand that follows
+leading root flags, so `frpc -c pA.toml status` runs `status` (dials pA.toml's
+admin port) and `frpc -c missing.toml tcp …` starts the tcp proxy, while frp-rs
+falls back to run mode and answers ``no such command or positional: `status` ``.
+Identical at the base head, so this registration did not change it.
 
 **What remains divergent, with its measurement.** (1) Positional arguments, as
 described above: Go ignores them, frp-rs refuses a leftover token, with or
 without `--` — `frpc status -c p7498.toml -- -c p7499.toml` dials 7498 on Go and
-is rc 1 here. (2) The *message* on a rejected value: `frpc tcp … --strict-config=foo`
+is rc 1 here. The rewrite adds one instance of the same rule: when the value
+consumed for `-c` is itself flag-shaped, the flag's **own** argument is left
+behind as a positional Go ignores and frp-rs refuses — measured, `frpc tcp …
+-c --config-dir cDir` reaches `try to connect to server...` on Go and is rc 1
+`` `cDir` is not expected`` here; `frpc status -c --config-dir cDir` is Go
+`open --config-dir` (rc 1) vs rc 1 `` `cDir` is not expected``; `frpc tcp …
+-c --strict-config false` starts on Go and is rc 1 `` `false` is not expected``
+here. (2) The *message* on a rejected value: `frpc tcp … --strict-config=foo`
 is pflag's `invalid argument "foo" for "--strict-config" flag: strconv.ParseBool:
 …` on Go and `` `foo` is not expected in this context `` here; both exit 1, and
 that shape is the already-recorded output-shape item, not this one. (3) A
-config *load* failure on the admin commands is written to stderr here and to
-stdout on Go (same already-recorded output-shape item).
+config *load* failure is written to **stderr** by `verify` only; measured,
+`reload`/`status`/`stop -c <unknown-key config>` all write the same error to
+**stdout**, matching Go's stream (the message *shape* still differs — the
+already-recorded output-shape item). (4) `help` routing, a consequence of the
+rewrite and of pflag's value rule: `frpc -c --help` / `frpc --config --help`
+printed help (rc 0) at the base head and now read a config called `--help`
+(rc 1), which is what Go does (`open --help: no such file or directory`), and on
+a single-proxy command `frpc tcp … -c --help` now starts the proxy instead of
+printing help, again as Go. `frpc --config-dir --help` is the one that moves
+*away*: rc 0 help at the base head, **rc 2** now, because the value reaches the
+pre-existing frp-rs `--config-dir` refusal (Go swallows the `WalkDir` error and
+exits 0 — the recorded "Directory mode is a deliberate divergence" in § CLI exit
+codes). The bare-run spelling `frpc --config-dir -x -c <cfg>` moves rc 1 → 2 for
+the same reason. This is the frp-rs `--config-dir` extension's territory, not a
+persistent-flag claim.
 
 Pinned by `every_single_proxy_command_ignores_all_five_persistent_root_flags`,
 `repeated_persistent_root_flags_are_not_an_error`,

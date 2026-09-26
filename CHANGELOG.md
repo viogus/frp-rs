@@ -130,12 +130,27 @@ User-facing release notes for frp-rs.
   spellings come with it: a repeated flag is last-wins (or appending for
   `--allow-unsafe`) and never an error, and a `-`-prefixed token after `-c` is
   consumed as that flag's **value** — `frpc status -c --strict-config=false -c
-  p7498.toml` dials p7498, as Go does; because bpaf refuses that shape, those
-  config-flag occurrences are rewritten to `-c=VALUE` before parsing. Unchanged:
-  a dangling `-c` is still an error, the single-proxy commands still do not read
-  the config file, and positional arguments (with or without `--`) are still
-  refused where Go ignores them — the one residual shape, recorded with its
-  measurement in `docs/developing.md` § CLI inputs.
+  p7498.toml` dials p7498, as Go does. bpaf already took some `-`-prefixed values
+  (an unknown multi-character token such as `-foo.toml`), but not a token it
+  classifies as a flag (`--long`, `-x`, `-c`, `-a=b`), so those config-flag
+  occurrences are rewritten to `-c=VALUE` before parsing.
+  Three user-visible consequences of taking pflag's value rule:
+  `frpc -c --help` and `frpc --config --help` no longer print help — the token is
+  the config path, so they read a file called `--help` and exit 1, as Go does;
+  on a single-proxy command `frpc tcp … -c --help` now starts the proxy instead
+  of printing help, again as Go; and `frpc --config-dir --help` (or
+  `--config-dir -x`) now reaches frp-rs's pre-existing `--config-dir` refusal,
+  **exit 2**, where Go swallows the directory error and exits 0 — the recorded
+  deliberate divergence, not a new one.
+  Unchanged: a dangling `-c` is still an error and the single-proxy commands
+  still do not read the config file. Still refused, where Go ignores it:
+  **positional arguments**, with or without `--` (`frpc status -c a.toml -- -c
+  b.toml`, `frpc status extra`, `frpc tcp … extra`), including the leftover
+  argument of a flag-shaped `-c` value (`frpc tcp … -c --config-dir cDir` starts
+  on Go, is rc 1 here) — the residual shapes, each with its measurement in
+  `docs/developing.md` § CLI inputs. The `frps` command is unchanged: Go's pflag
+  consumes `-`-prefixed values for `frps -c` too and frp-rs still refuses them
+  (filed as its own item).
 - **`frpc --version` no longer short-circuits an argv that is going to fail — a
   behaviour change.** The version check lived in a closure on the run-mode
   branch of `frpc`'s argument parser, and bpaf evaluates every alternative while

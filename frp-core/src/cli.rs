@@ -1270,9 +1270,19 @@ where
 /// `-c=<dash-value>` form, before bpaf sees argv.
 ///
 /// Go's pflag consumes the **next argv token** as a value for a value-taking
-/// flag with no regard for a leading `-`; bpaf's `State::take_arg`
-/// (`bpaf-0.9.27/src/args.rs`) accepts only a plain word, so
-/// `-c --strict-config=false` exited with ``-c` requires an argument `FILE``.
+/// flag with no regard for a leading `-`. bpaf classifies tokens first
+/// (`split_os_argument`, `bpaf-0.9.27/src/arg.rs:118-215`, then
+/// `disambiguate_short`, `bpaf-0.9.27/src/args.rs:183-250`): `--long` becomes
+/// `Arg::Long`; a single-dash token becomes `Arg::Short` when it has one
+/// character, when the character after the first is `=`, or when its first
+/// character is a short the parser registers; and only an unknown
+/// multi-character single-dash token falls back to `Arg::Word`. `State::take_arg`
+/// (`bpaf-0.9.27/src/args.rs:670-694`) accepts only the `Word`/`ArgWord` items
+/// that tokenisation produced, so measured at the base head: it already took
+/// `-foo.toml`, `-nonexistent.toml` and `-=v` (unknown multi-character tokens
+/// demoted to `Arg::Word`), and refused `--strict-config=false`, `-x`, `-c`,
+/// `-a=b` and `--long`. Only for those flag-shaped tokens did
+/// `-c <token>` exit with ``-c` requires an argument `FILE``.
 /// Measured on Go v0.71.0: `frpc status -c --strict-config=false` alone is
 /// `open --strict-config=false: no such file or directory` (the token is `-c`'s
 /// value, not the flag), and `frpc status -c --strict-config=false -c
@@ -1921,10 +1931,12 @@ fn frpc_parser() -> impl Parser<FrpcCmd> {
 /// Parse frpc CLI args.
 pub fn parse_frpc_args() -> FrpcCmd {
     let argv: Vec<OsString> = std::env::args_os().collect();
-    // pflag consumes a `-`-prefixed token as a config flag's value; bpaf cannot
-    // (see [`rewrite_config_dash_values`]). The rewrite is frpc-only: this item
-    // covers the frpc surface, and the shape has not been measured on frps.
-    // `warn_if_strict_config_space_form_used` keeps reading the original argv.
+    // Go's pflag consumes a `-`-prefixed token as a config flag's value; bpaf
+    // only refuses the tokens it classifies as flags (see
+    // [`rewrite_config_dash_values`]). The rewrite is frpc-only: this item
+    // covers the frpc surface, and the frps half is measured and filed as its
+    // own `TODO.md` item. `warn_if_strict_config_space_form_used` keeps reading
+    // the original argv.
     let parse_argv = rewrite_config_dash_values(&argv);
     let args = run_cli(
         frpc_parser()
@@ -3757,6 +3769,12 @@ mod tests {
             rewrite(&["status", "-c", "--strict-config=false"]),
             vec!["status", "-c=--strict-config=false"]
         );
+        // A pin, not a fix: bpaf already took `-foo` as a value (unknown
+        // multi-character dash tokens are demoted to `Arg::Word`; measured at
+        // the base head, `frpc status -c -foo.toml` read `-foo.toml`). The
+        // rewrite must keep doing so via the attached spelling. The shapes it
+        // actually repairs are the flag-shaped ones — `--long`, `-x`, `-c`,
+        // `-a=b` (see `rewrite_config_dash_values`).
         assert_eq!(
             rewrite(&["status", "--config", "-foo"]),
             vec!["status", "--config=-foo"]
