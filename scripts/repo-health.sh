@@ -1662,7 +1662,12 @@ def tracked_files():
         detail = t.stderr.decode('utf8', 'replace').strip().splitlines()
         raise IndexUnavailable('git rev-parse --show-toplevel exited %d%s'
                                % (t.returncode, (': ' + detail[0]) if detail else ''))
-    toplevel = t.stdout.decode('utf8', 'surrogateescape').rstrip('\r\n')
+    # git writes the raw path plus exactly one LF and never a CR, so remove that
+    # one LF and nothing else: rstrip('\r\n') would also eat a trailing CR or LF
+    # that is part of the root's *name* (both are legal in a POSIX filename), and
+    # the comparison below would then refuse a legitimate tree as "another tree"
+    # (exit 3).
+    toplevel = t.stdout.decode('utf8', 'surrogateescape').removesuffix('\n')
     cwd = os.path.realpath(os.getcwd())
     if not toplevel or os.path.realpath(toplevel) != cwd:
         raise IndexUnavailable(
