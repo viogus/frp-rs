@@ -1896,12 +1896,15 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     (`--help=false -c cfg` starts, rc 124) and is bpaf's built-in here (prints help,
     rc 0); the help *shape* also differs — frp-rs renders two entries per bool flag
     (`--flag=BOOL` and `--flag`) and a `(--version=BOOL | [-v])` usage alternative where
-    Go prints one `-v, --version` line; and `frpc verify --version` is rc 1 here where Go
-    is rc 0 (with a valid `-c`; with no `-c` Go is rc 1 too), one row of the
-    persistent-root-flag class already tracked by the `frpc` eight-single-proxy-subcommands item (`TODO.md:2013`).
-    Measured for that class: `frpc tcp --version --local-port … --remote-port …` is the
-    same shape, Go 124 / base 0 / head 1, while `reload|status|stop --version` moved
-    0 → 1 and now **matches** Go's rc 1 there.
+    Go prints one `-v, --version` line; and at that head `frpc verify --version` was rc 1 where
+    Go is rc 0 (with a valid `-c`; with no `-c` Go is rc 1 too) — one row of the
+    persistent-root-flag class then tracked by the `frpc` eight-single-proxy-subcommands item
+    (`TODO.md:2173`, since closed by the persistent-rootCmd-flag work, which registers all five
+    flags on the twelve subcommands: `frpc verify --version -c <valid>` is rc 0 again and
+    `frpc tcp --version …` starts the proxy).
+    Measured for that class at that head: `frpc tcp --version --local-port … --remote-port …` was
+    the same shape, Go 124 / base 0 / head 1, while `reload|status|stop --version` moved
+    0 → 1 and already **matched** Go's rc 1 there.
   * **Tests.** Parser level (`frp-core/src/cli.rs`):
     `every_go_bool_flag_accepts_the_pflag_value_spellings` (absent, bare, all ten
     `strconv.ParseBool` spellings and the underscore aliases, across all ten sites from
@@ -2170,7 +2173,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   test; and sweep the strays earlier runs left (done at this head — batches of ~65, 34 and 2
   children killed, 0 `frps` processes and no listeners remaining — because a leaked child also
   holds its port for the next run).
-- [ ] **`frpc`'s eight single-proxy subcommands reject `-c`/`--config`, which Go accepts and
+- [x] **`frpc`'s eight single-proxy subcommands reject `-c`/`--config`, which Go accepts and
   ignores.** Go's `-c` is a persistent rootCmd flag, so every subcommand parses it; the single-proxy
   commands simply never read the value. frp-rs's bpaf parsers for `tcp`/`udp`/`http`/`https`/`stcp`/
   `xtcp`/`sudp`/`tcpmux` do not define it.
@@ -2193,6 +2196,90 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   in `docs/developing.md` § CLI inputs with these measurements. The `-c` last-wins work above covers
   the **five** config-consuming parsers (`run`, `verify`, `reload`, `status`, `stop`) — that wording
   must not be read as covering these shapes or those eight subcommands. No sha.
+  **Done (2026-09-26, at the head of `fix/frpc-proxy-persistent-flags`).** All five persistent
+  rootCmd flags (`-c`/`--config`, `--config-dir`, `--strict-config`, `--allow-unsafe`,
+  `-v`/`--version`) are registered on the twelve `frpc` subcommand parsers and dropped; of the three
+  recorded shapes, two are matched and one is recorded as a divergence of a different rule.
+  * **What was measured before implementing.** Go frp v0.71.0 darwin/arm64, a loopback probe
+    listener on the command's `--server-port` (single-proxy) or on the `-c` config's
+    `[webServer] port` (admin), a fixed proxy name so Go passes its own validation, and every child
+    bounded (start, observe 3 s, SIGTERM, SIGKILL, reap). Appending any of `-c noweb.toml`,
+    `--config noweb.toml`, `--config-dir cDir` (present or missing), `-c a -c b`,
+    `-c --strict-config=false`, `-c missing.toml`, `--strict-config`/`--strict-config=false`,
+    `--allow-unsafe TokenSourceExec`, `--version`, or a repetition of any of them — to `tcp`,
+    `https` and `tcpmux` (three different local parsers) reaches `try to connect to server...` and
+    connects on Go, byte-identical in observable to the same argv with the flag removed. frp-rs
+    exited 1 with ``Error: `-c` is not expected in this context`` (and the analogous message for
+    each other flag) before this change. The admin commands behave the same for
+    `--config-dir`/`--allow-unsafe`/`--version`: `status -c p7498.toml --config-dir cDir` dials
+    17498 on Go, was refused here, and dials 17498 now; `verify -c p7498.toml --config-dir cDir
+    --allow-unsafe X --version` is rc 0 on Go and is rc 0 now.
+  * **Shapes 1 and 3 are matched.** `status -c --strict-config=false -c p7498.toml` dials 17498 on
+    both — pflag consumes the dash-shaped token as `-c`'s **value**, then the later `-c` overwrites
+    it. bpaf classifies tokens first and only refuses the ones it reads as flags (`--long`, `-x`,
+    `-c`, `-a=b`; measured at the base head it already took `-foo.toml`/`-nonexistent.toml`/`-=v`
+    as values — `split_os_argument`, `bpaf-0.9.27/src/arg.rs:118-215`, then `disambiguate_short`,
+    `bpaf-0.9.27/src/args.rs:183-250`; `State::take_arg` at `:670-694` takes only
+    `Word`/`ArgWord`), so `rewrite_config_dash_values` attaches exactly the config-selecting
+    occurrences (`-c`, `--config`, `--config-dir`, `--config_dir`) before bpaf sees argv; it stops
+    at the first real `--`. The rewrite is frpc-only — the item is frpc-scoped; the frps half is
+    measured and filed as its own item (`TODO.md:2251`).
+  * **Shape 2 stays divergent, with its measurement.** `status -c p7498.toml -- -c p7499.toml`
+    dials 7498 on Go (everything after `--` is positional and ignored) and is rc 1 `` `-c` is not
+    expected in this context`` here. It is a *positional-args* rule, not a persistent-flag one: Go
+    ignores positional args on every `frpc` subcommand — measured, `status extra` loads
+    `./frpc.ini` and `tcp … extra` starts the proxy — while frp-rs refuses a leftover token with or
+    without `--`. It is not half-fixed, because accepting only the `--` form is not Go-faithful and
+    accepting bare words would swallow unknown flags Go rejects (`tcp -c -- -foo` is
+    `unknown shorthand flag: 'f' in -foo`, rc 1). The rewrite adds one instance of the same rule:
+    when the value taken for `-c` is itself flag-shaped, the flag's own argument is left behind as a
+    positional — measured, `frpc tcp … -c --config-dir cDir` starts on Go and is rc 1
+    `` `cDir` is not expected`` here, `frpc tcp … -c --strict-config false` starts on Go and is
+    rc 1 `` `false` is not expected`` here. Recorded in `docs/developing.md` § CLI inputs.
+  * **Pins.** `frpc/tests/cli_persistent_flags.rs` (7 tests) runs the real binary: all eight
+    commands with all five flags appended reach the probe port; repeated flags; the dash-shaped
+    value on `status`; `--config-dir` ignored by `status`/`reload`/`stop` (a second probe on the
+    directory's own config port must stay silent); `verify` rc 0 with the flags; dangling `-c` and
+    `--strict-config=foo` still refused; and the positional divergence pinned. Red at the base head
+    (source reverted, test file kept): **6 of 7 fail** — the positional pin passes on both trees by
+    design. Parser-level tests in `frp-core/src/cli.rs` cover all eight parsers, repetition, the
+    strict-config value grammar, the `tcp --help` listing and the rewrite's exact scope.
+  * **Carriers.** `CHANGELOG.md` (Unreleased → Fixed, user-visible argv change);
+    `docs/developing.md` § CLI inputs gained the persistent-flag section and the `--flag=<bool>`
+    section's recorded `--version`/`--allow-unsafe`/`--config-dir` divergences are marked matched.
+    No sha.
+- [ ] **The `frps` half of the `-c <dash-value>` rule: Go's pflag consumes a `-`-prefixed token as
+  `-c`'s value, frp-rs's `frps` parser does not.** `parse_frps_args` was untouched by `TODO.md:2173`
+  (frpc-only, as the #378 `-c` last-wins work was). Measured on Go frps v0.71.0 darwin/arm64 and
+  this head's `frps`, every child bounded:
+  * `frps -c --strict-config=false` → Go rc 1 `open --strict-config=false: no such file or
+    directory`; frp-rs rc 1 `` `-c` requires an argument `FILE` ``.
+  * `frps -c -x` → Go rc 1 `open -x: no such file or directory`; frp-rs rc 1 `` `-c` requires an
+    argument `FILE`, got a flag `-x`, try `-c=-x` to use it as an argument ``.
+  * `frps verify -c --strict-config=false` → Go rc 1 `open --strict-config=false: no such file or
+    directory` (Go has `frps verify`, frp-rs does not — its own item below); frp-rs rc 1
+    `` `-c` requires an argument `FILE` `` because the `-c` failure is reported before the
+    unknown-command one.
+  * A control that is a *different* divergence: `frps --config-dir --strict-config=false` → Go rc 1
+    `unknown flag: --config-dir` (Go frps has no such flag); frp-rs rc 1 `` `--config-dir` requires
+    an argument `DIR` `` (frp-rs extension flag, recorded in `docs/developing.md` § CLI exit codes).
+  **Done-when:** apply `rewrite_config_dash_values` to `parse_frps_args` (or lift it into a shared
+  pre-parse pass used by both binaries) and pin the three `-c` rows against Go v0.71.0, or record
+  each refusal as a deliberate divergence with these measurements. Implementing `frps verify`
+  changes which error the third row reports, so sequence the two.
+- [ ] **`frpc` does not accept a subcommand after leading root flags, where Go's cobra does.**
+  Measured on Go v0.71.0 and this head (identical at the base head `ec82a20`, so the
+  persistent-flag work did not change it): `frpc -c pA.toml status` → Go resolves the `status`
+  subcommand and dials `127.0.0.1:17498` (pA.toml's `[webServer] port`); frp-rs falls back to run
+  mode and answers rc 1 ``Error: no such command or positional: `status`, did you mean `https`?``.
+  Same for `frpc --strict-config=false status -c pA.toml` (Go dials 17498) and
+  `frpc -c missing.toml tcp --local-port 5 --remote-port 6 --proxy-name x --server-port <free>`
+  (Go starts the single tcp proxy; frp-rs says ``no such command or positional: `tcp` ``). bpaf
+  chooses the branch before dispatch, so the subcommand token is a leftover in the run-mode parser.
+  **Done-when:** either accept cobra's flag/subcommand interleaving (hoist a leading token that
+  names a known subcommand before bpaf runs, or restructure the parser) and pin the three rows
+  against Go, or record the refusal as a deliberate divergence in `docs/developing.md` § CLI inputs.
+  frp-rs's own `frpc <subcommand> [flags]` order keeps working either way.
 - [ ] **A CLI failure's output shape is still not Go's: frp-rs prints a `tracing` line where Go
   prints one bare error, and `verify` writes to stderr where Go writes to stdout.** Measured on Go
   v0.71.0 and on the head binaries while closing the exit-code item above (only the *exit code*
