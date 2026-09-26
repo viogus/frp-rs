@@ -2458,10 +2458,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   each refusal as a deliberate divergence with these measurements. Implementing `frps verify`
   changes which error the third row reports, so sequence the two.
   **Done (2026-09-27, on `fix/frps-dash-value` off `f5437e6`; head sha in the PR).** The shared
-  pre-parse pass was chosen over a second call-site copy: `parse_frps_args` now computes
-  `parse_argv = rewrite_config_dash_values(&argv)` and hands it to `run_cli`, exactly as
-  `parse_frpc_args` does — one function with two entry-point call sites, so the `--`-awareness and
-  the four-flag scope cannot drift between binaries. Measured on Go frp v0.71.0 darwin/arm64 against
+  pre-parse pass was chosen over a second call-site copy: `parse_frps_args` and `parse_frpc_args`
+  both compute `let parse_argv = prepared_cli_argv(&argv)` (one small function wrapping
+  `rewrite_config_dash_values`) and hand it to `run_cli`, so the `--`-awareness and the four-flag
+  scope cannot drift between binaries. Measured on Go frp v0.71.0 darwin/arm64 against
   the frp-rs binaries, bounded children, free ports and the "before" column re-measured with the
   source reverted to the base head (`f5437e6`) — not quoted from the rows above:
   * The three `-c` rows now **agree on rc and on the path they name**: `frps -c
@@ -2472,15 +2472,36 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     directory`) because pflag takes the separator token as the value.
   * Boundary measured, same pair: `-c --bind-port` (a *known* frps flag) → rc 1 naming
     `--bind-port` like Go, was the parser refusal; `-c -zzz`, `-c -`, `-c=-x`, `-c=-nonexistent.toml`
-    and `--config=-x` were already on the load path and are unchanged; `frps -- --strict-config=false`
-    still refuses the positional (`--strict-config=false` is not expected in this context;
-    Go: `unknown command "--strict-config=false"`); a dangling `-c` still refuses. The
-    `--config-dir`/`--config_dir` control stays a divergence and is now a **different** one: rc 2
+    and `--config=-x` were already on the load path and are unchanged; a dangling `-c` still refuses.
+    `frps -- --strict-config=false` (and `frps -- -c p.toml`, base == head) still refuses the
+    positional with `` `--strict-config=false` is not expected in this context`` — and here the
+    divergence is **larger than the message shape**: re-measured on Go v0.71.0 with a free port,
+    `frps -p <free> -- --strict-config=false` and `frps -p <free> -- junk` **start the server**
+    (`frps started successfully`, still alive at 5 s, killed) because cobra takes everything after
+    `--` as positional args and `frps`'s `RunE` ignores them; `unknown command "…"` fires only for a
+    positional **without** `--` (`frps junk`, `frps -c <valid> junk`, `frps --strict-config false`
+    are all rc 1 `unknown command`, measured). The earlier `rc 1` reading of this row came from
+    probing without `-p`, which lands on the default `:7000` that macOS Control Center holds — a
+    standalone-process collision, not the argv. So this cell is Go **serves** vs frp-rs **refuses**,
+    and the refusal (with or without `--`) is the same pre-existing positional rule filed in the
+    `frpc`-subcommand-after-leading-root-flags item below, not something this branch changed.
+    The `--config-dir`/`--config_dir` control stays a divergence and is now a **different** one: rc 2
     `Failed to read config directory: No such file or directory (os error 2)`, because the extension
     flag is one of the four the pass covers and the dash-shaped token is now its value, where it was
     rc 1 ``--config-dir` requires an argument `DIR``; Go's rc 1 `unknown flag: --config-dir` is not
     comparable (it has no flag). Both spellings behave the same here. Recorded in
     `docs/developing.md` § CLI exit codes.
+    Two more user-visible rows of the same rule, both measured Go/head: `frps -c --help` is now
+    rc 1 naming `--help` as the config path (Go: `open --help: no such file or directory`; base
+    printed help, rc 0) — a match, deliberately losing the old convenience; and a repeated `-c`
+    still refuses on frps (`frps -c a.toml -c b.toml` → `` argument `-c` cannot be used multiple
+    times `` , base == head) where **Go is last-wins and opens `b.toml`** — so "the same rule on
+    both binaries" covers the dash-value attachment only, **not** last-wins: the frpc `.last()`
+    work did not touch `parse_frps_args` and this branch does not either. With the rewrite the
+    dash-valued repeat (`frps -c --strict-config=false -c p.toml`) moves from the `-c` refusal to
+    that same "multiple times" message (rc 1 either way). Pinned by
+    `dash_help_after_config_is_a_value_not_a_help_request` and
+    `repeated_config_flags_refuse_with_the_multiple_times_message`.
   * **Sequencing:** the third row's *current* Go error is `open --strict-config=false: no such file
     or directory`, and that is what the fix pins. `frps verify` is still unimplemented (its own item
     below), and with the rewrite in place `frps verify -c --strict-config=false` now reports
@@ -2488,37 +2509,53 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     subcommand is the first error. Implementing `frps verify` flips this row back to a config-load
     error; this item and `docs/developing.md` § CLI inputs both state the current error, so the flip
     is visible rather than silent.
-  * Pins: `frps/tests/cli_exit_codes.rs` grew five argv-level tests
+  * Pins: `frps/tests/cli_exit_codes.rs` grew seven argv-level tests
     (`dash_shaped_config_value_is_the_value_not_a_flag`,
     `dash_dash_as_config_value_is_consumed_not_a_separator`,
     `real_separator_and_dangling_config_stay_refused`,
     `config_dir_dash_value_now_reaches_the_directory_read`,
-    `verify_subcommand_is_now_the_first_error_for_a_dash_config_value`), so
-    `env.FRPS_CLI_TESTS` moved 9 → 14 in `.github/workflows/ci.yml` in the same commit; the
+    `verify_subcommand_is_now_the_first_error_for_a_dash_config_value`,
+    `dash_help_after_config_is_a_value_not_a_help_request`,
+    `repeated_config_flags_refuse_with_the_multiple_times_message`), so
+    `env.FRPS_CLI_TESTS` moved 9 → 16 in `.github/workflows/ci.yml` in the same commit; the
     parser-level pins `frps_takes_a_dash_shaped_config_value` and
     `frps_rewrite_scope_matches_frpc` live in `frp-core/src/cli.rs`, and both the real entry points
     and the test call the same `prepared_cli_argv` (`frp-core/src/cli.rs`), so the test follows the
     wiring rather than a sibling copy.
-    Red evidence, measured by reverting only the `parse_frps_args` call site: **4 of the 5** new
-    integration tests fail (the dash-shaped-value, the `-c --`, the `--config-dir` and the `verify`
-    pins), and the fifth — the separator/dangling-scope control — passes on both trees **by
-    design**, because it pins what must *not* change. The parser-level test still passes with the
-    call site reverted (it pins the repair, not the wiring).
+    Red evidence, measured by reverting only the `parse_frps_args` call site in a scratch copy and
+    re-running the file: `test result: FAILED. 10 passed; 6 failed` — the six failing new pins are
+    the dash-shaped-value, `-c --`, `--help` value-position, repeated-`-c`, `--config-dir` and
+    `verify` tests. The seventh new pin, `real_separator_and_dangling_config_stay_refused`, passes
+    on both trees **by design**: it pins what must *not* change (Go serves a positional after `--`,
+    so frp-rs refusing it is pre-existing, not this branch's). The parser-level test still passes
+    with the call site reverted (it pins the repair, not the wiring).
   * The `verify` pin is the sequencing made loud: it asserts the **current** first error
     (`` `verify` is not expected in this context ``) and the `-c` value being consumed, so
     implementing `frps verify` turns it red instead of silently changing which error the row
-    reports. The item's third measurement above therefore has one foot in this item and one in
-    `TODO.md`'s `frps verify` item.
-  * **A flaky pre-existing SIGTERM control, found and fixed while adding these tests.** Running
-    `cargo test -p frps --test cli_exit_codes` in a loop: the extra tests pushed
-    `good_config_starts_and_exits_0_on_sigterm` / `disable_log_color_value_spelling_is_applied` into
-    `unix_wait_status(15)` in **1 run in 10** (0/10 at the base commit with the same loop), i.e. the
-    helper's SIGTERM arrived before the child's sigterm task had been polled — a successful TCP
-    connect proves the *listener*, not the signal driver
-    (`frp-server/src/service.rs:1579-1619`). Respawning did not help (3/3 fresh spawns lost it
-    again). The helper now waits for the child's own `SIGUSR1 reload ready` line
-    (`frps/src/main.rs:207-215`, logged after the signal registration returns) before signalling:
-    **0 failures in 15 consecutive runs**. This is a test-harness fix, not a product change — the
+    reports. Verified by simulation in a scratch copy (accept a bare `verify` positional): **that
+    one test fails, the other 15 pass**. The item's third measurement above therefore has one foot
+    in this item and one in the `frps verify` item below, which now carries the same warning.
+  * **A flaky pre-existing SIGTERM control, found and fixed while adding these tests.** With the
+    extra tests in the file, `cargo test -p frps --test cli_exit_codes` failed
+    `good_config_starts_and_exits_0_on_sigterm` / `disable_log_color_value_spelling_is_applied` with
+    `unix_wait_status(15)`. Two mechanisms, both measured with the helper as the **only** difference
+    (40 iterations of the whole file per arm): (a) the SIGTERM task is spawned from the same async
+    fn as the accept loop and can be unpolled when the connection is accepted
+    (`frp-server/src/service.rs:1579-1619`); (b) **the load-bearing one** — `ephemeral_port()`
+    releases its port before the child binds it and tests run in parallel, so the connect witness
+    can be satisfied by a *foreign* listener (every failure in both A/B arms had an **empty child
+    log** although a connect had succeeded, and one reviewer failure ended in `Address already in
+    use (os error 48)`). Connect-only helper: **7/40** on the author's host, **5/40** on the
+    reviewer's; marker helper: **0/40** on both. Respawning fresh children did not help (3/3 lost
+    the race again). The helper now waits for the
+    child's own `SIGUSR1 reload ready` line (`frps/src/main.rs:207-215`), which only this child can
+    write to its own log: **0/40, 0/40 and 1/40** across three A/B loops here and **0/40** on the
+    reviewer's host — the one residual failure is the non-zero window below, not the
+    foreign-listener arm (a follow-up 30-run loop did not reproduce it, ~1/100).
+    The marker is **not** proof that SIGTERM's handler is registered — tokio registers signals per
+    kind and lazily (`tokio-1.53.1/src/signal/unix.rs:283-300`), leaving a measured ~0.16 ms
+    median / 1.10 ms max window — so the helper's doc comment says "small but nonzero" instead of
+    claiming the handler is up. This is a test-harness fix, not a product change — the
     product path is unchanged — and it is the only edit to a pre-existing test.
   * **frpc regression check** (the shared pass's other caller): the #383 rows were re-measured with
     the new `frpc` binary, including against a one-shot mock on `p7498.toml`'s admin port —
@@ -2597,6 +2634,14 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   **Done-when:** add `frps verify` mirroring `frpc verify` (Go's output shape, rc 0 good / 1 bad,
   honoring `--strict-config`) with CLI tests in the style of `frps/tests/cli_exit_codes.rs`, or
   record it as a deliberate surface reduction in the feature-surface policy. No sha.
+  **Sequencing warning (2026-09-27):** the `-c <dash-value>` item above pins this item's current
+  behaviour with `verify_subcommand_is_now_the_first_error_for_a_dash_config_value`
+  (`frps/tests/cli_exit_codes.rs`): with the shared config dash-value rewrite in place,
+  `frps verify -c --strict-config=false` now reports `` `verify` is not expected in this context ``
+  as the first error. **Implementing `frps verify` is expected to make that test fail** — that is the
+  tripwire working as designed, not a regression: update the test (and the row in
+  `docs/developing.md` § CLI inputs) to the new error at the same time, and do not delete the test to
+  make it pass.
 - [ ] **The `3`-vs-`4` exit code is chosen by a substring match on the formatted error, so the
   *same* failure exits differently depending on a path or URL inside it.** `is_token_error`
   (`frp-core/src/logging.rs:474`) is `msg.contains("token") || msg.contains("auth")`, and the

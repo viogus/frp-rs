@@ -212,10 +212,19 @@ User-facing release notes for frp-rs.
   pre-parse pass, so these argv shapes work on `frps`: `frps -c
   --strict-config=false`, `-c -x`, `-c --bind-port` and `--config -x` all read
   the flag-shaped token as the config path and fail on the missing file with
-  exit 1, as Go does; `frps -c --` reads a file named `--` (Go: `open --: …`).
-  Not changed: a dangling `-c` is still an error, and a `--` that is a real
-  separator still ends flag parsing (`frps -- --strict-config=false` is refused
-  here, `unknown command "…"` on Go — the positional divergence). One row moves
+  exit 1, as Go does; `frps -c --` reads a file named `--` (Go: `open --: …`);
+  and `frps -c --help` now reads `--help` as the config path (exit 1, as Go)
+  instead of printing help with exit 0 — the same rule, and a deliberate loss of
+  the old frp-rs convenience. Not changed: a dangling `-c` is still an error, and
+  a `--` that is a real separator still ends flag parsing (`frps --
+  --strict-config=false` and `frps -- -c p.toml` are refused here, while Go
+  **starts the server** — it takes everything after `--` as positional args and
+  ignores them; `unknown command "…"` fires only for a positional *without* `--`,
+  which is the pre-existing positional divergence, not a new one). Also not
+  changed, and stated so it is not read into this note: **`frps` has no `-c`
+  last-wins** — `frps -c a.toml -c b.toml` is refused on both trees where Go
+  opens `b.toml`; only the rewrite's dash-value attachment is shared with frpc.
+  One row moves
   the other way and is deliberate: `frps --config-dir -x` (or
   `--config-dir --strict-config=false`) now reaches frp-rs's pre-existing
   `--config-dir` refusal, **exit 2**, where the parser used to answer exit 1

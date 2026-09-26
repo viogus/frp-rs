@@ -114,7 +114,7 @@ jobs:
     # lane checks would stay green if that file's tests were removed altogether.
     env:
       # frps/tests/cli_exit_codes.rs — "Run frps CLI tests (config-failure exit codes)"
-      FRPS_CLI_TESTS: "14"
+      FRPS_CLI_TESTS: "16"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
       FRPC_TINY_CLI_TESTS: "11"

@@ -29,11 +29,13 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_frps");
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
-/// The child's own witness that its signal driver is live — the SIGUSR1 task
-/// logs this after `tokio::signal::unix::signal` returns
-/// (`frps/src/main.rs:207-215`), which is the same registration the SIGTERM task
-/// joins. See [`start_listening_then_sigterm`] for why a successful connect is
-/// not enough.
+/// The child's own **progress witness**: the SIGUSR1 task logs this line after
+/// its `tokio::signal::unix::signal` call returns (`frps/src/main.rs:207-215`),
+/// which a `frps` that is still pre-init cannot have printed. It is *not* proof
+/// that SIGTERM's handler is installed — tokio registers signals per kind and
+/// lazily (`tokio-1.53.1/src/signal/unix.rs:283-300`), so the SIGTERM
+/// registration is a separate call that this line does not witness. See
+/// [`start_listening_then_sigterm`] for what the marker does buy.
 const SIGNAL_READY_MARKER: &str = "SIGUSR1 reload ready";
 const BAD_CONFIG: &str = "bindPort = 7500\nnotAKnownFrpKey = 1\n";
 const UNKNOWN_FIELD: &str = "unknown field \"notAKnownFrpKey\"";
@@ -173,33 +175,55 @@ fn missing_config_exits_1() {
 /// service has asked for its listener, so signalling an already-started-but-not-
 /// yet-listening frps kills it with the *default* disposition (measured:
 /// `unix_wait_status(15)`, i.e. `code() == None`, no exit). A successful connect
-/// proves the listener exists, which is the ordering these tests need — and it
-/// is also how "the argv was accepted and a server really started" is asserted
-/// without inferring it from an exit code.
+/// proves *a* listener exists, which is the ordering these tests need — and it is
+/// also how "the argv was accepted and a server really started" is asserted
+/// without inferring it from an exit code. **It does not prove the listener is
+/// this child's** — see the foreign-listener arm below.
 ///
-/// **The readiness barrier is the second half of that race, measured.** A
-/// successful connect proves the *listener* is there, not that the signal driver
-/// has run: `Service::run` spawns the SIGTERM task from the same async fn that
-/// later runs the accept loop (`frp-server/src/service.rs:1579-1619`), so the
-/// connection can be accepted before that task has been polled even once — and
-/// then SIGTERM takes the default disposition. Measured on this host by running
-/// `cargo test -p frps --test cli_exit_codes` in a loop: **1 run in 10** failed
-/// with `unix_wait_status(15)` on one of the two SIGTERM positive controls, where
-/// the same loop at the base commit measured 0/10 — the extra argv tests in this
-/// file schedule enough extra work to lose the race. **Respawning did not help**
-/// (3 of 3 fresh spawns lost it again in one run), because the loser is decided
-/// by which task the runtime polls first, not by chance timing.
+/// **The readiness barrier is the second half of the flake, measured.** Two
+/// mechanisms, both real, and the second one is the one that produces the
+/// failures:
 ///
-/// The barrier is therefore the child's own log line: the SIGUSR1 task logs
-/// `SIGUSR1 reload ready` **after** its `tokio::signal::unix::signal` call
-/// returns (`frps/src/main.rs:207-215`), and the SIGTERM task is spawned earlier
-/// in the same `run` body (`frp-server/src/service.rs:1579`, reached from
-/// `main.rs`'s `service.run()`). The line witnesses that the signal driver is
-/// live — the same registration the SIGTERM task then joins — so the signal is
-/// sent only once it is in the log. If it never appears (a platform without the
-/// handler), the helper panics with the log rather than silently weakening the
-/// assertion. Measured after the change: **0 failures in 15 consecutive runs**,
-/// against 1-2 in 10-15 before it.
+/// 1. *The install race.* `Service::run` spawns the SIGTERM task from the same
+///    async fn that later runs the accept loop
+///    (`frp-server/src/service.rs:1579-1619`), so the listener can be accepting
+///    before that task has been polled even once — and then SIGTERM takes the
+///    default disposition.
+/// 2. *The foreign-listener false witness.* `ephemeral_port()` binds a port and
+///    releases it before the child binds it; tests run in parallel, so another
+///    test's `frps` can take that port first. A connect then succeeds against
+///    the **wrong process**, and if that one is still pre-init its SIGTERM does
+///    not shut down the child we are watching.
+///
+/// Both were measured on the connect-only helper, with the helper as the *only*
+/// difference and 40 iterations of the whole file per run: **7/40** on the
+/// author's host and **5/40** on the adversarial reviewer's, against **0/40,
+/// 0/40 and 1/40** across three marker-helper loops on the author's host and
+/// **0/40** on the reviewer's. The one residual marker failure is the
+/// non-zero window below, not the foreign-listener arm. Every failure had an **empty child log**
+/// although a connect had succeeded — impossible for the child under test, which
+/// logs before it binds, and therefore the foreign-listener arm — and one
+/// reviewer failure ended in `Address already in use (os error 48)`. Respawning
+/// a fresh child does **not** fix it (3/3 fresh spawns lost the same race in one
+/// run).
+///
+/// So the barrier is a **child-specific progress witness**: the SIGUSR1 task
+/// logs `SIGUSR1 reload ready` after its `tokio::signal::unix::signal` call
+/// returns (`frps/src/main.rs:207-215`), i.e. only after that `frps` is past its
+/// own startup logging. A foreign listener cannot fake it — only the child under
+/// test writes to that log path. If the line never appears (a platform without
+/// the handler), the helper panics with the log rather than silently weakening
+/// the assertion.
+///
+/// **What it does not prove, stated rather than implied.** tokio registers
+/// signals per kind and lazily (`tokio-1.53.1/src/signal/unix.rs:283-300`), so
+/// registering SIGUSR1 does *not* install SIGTERM's handler: a window remains
+/// between the marker and SIGTERM's registration. The reviewer measured it at
+/// **~0.16 ms median / 1.10 ms max**, i.e. small but nonzero — and it does
+/// occasionally open: see the `1/40` above, not reproduced in a follow-up 30-run
+/// loop (~1/100). That is why this helper reports such a failure rather than
+/// retrying it away, and why a future CI flake here should be diagnosed as this
+/// window before anything else.
 ///
 /// Output goes to a file, not a pipe: a child whose piped stdout nobody reads
 /// can block on a full pipe.
@@ -223,8 +247,9 @@ fn start_listening_then_sigterm(args: &[&str], port: u16, dir: &TempDir) -> Stri
 
     let ready_deadline = Instant::now() + EXIT_TIMEOUT;
     loop {
-        // The listener and the signal driver both have to be up: connect for the
-        // listener, then the readiness line for the signal driver.
+        // Two witnesses, both needed: a connect for "the argv produced a
+        // listener" (the port may be a foreign one, hence the second) and the
+        // child's own progress line for "this child is the one that got there".
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
             && read_log().contains(SIGNAL_READY_MARKER)
         {
@@ -270,8 +295,10 @@ fn start_listening_then_sigterm(args: &[&str], port: u16, dir: &TempDir) -> Stri
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!(
-                    "frps {args:?} did not exit within {EXIT_TIMEOUT:?} of SIGTERM (the signal \
-                     driver was already live when it was sent); log={:?}",
+                    "frps {args:?} did not exit within {EXIT_TIMEOUT:?} of SIGTERM (the child had \
+                     logged {SIGNAL_READY_MARKER:?}, but tokio registers each signal kind \
+                     separately, so SIGTERM's own registration may still have been pending); \
+                     log={:?}",
                     read_log(),
                 );
             }
@@ -643,7 +670,8 @@ fn disable_log_color_value_spelling_is_applied() {
     );
 }
 
-// ── pflag's `-c <dash-value>` rule on `frps` (`TODO.md:2440`) ──────────
+// ── pflag's `-c <dash-value>` rule on `frps` (the `TODO.md` item of that
+// name) ─────────────────────────────────────────────────────────────
 //
 // Go's pflag hands a value-taking flag the **next argv token** whatever it
 // looks like (`parseSingleShortArg`'s `len(args) > 0` arm consumes `args[0]`
@@ -703,6 +731,17 @@ fn combined(out: &Output) -> String {
 /// value. Both a Go bool (`--strict-config=false`) and a value-taking frps flag
 /// (`--bind-port`, whose own argument is therefore *not* consumed) are covered —
 /// pflag does not look at the token at all.
+///
+/// **Discrimination, per iteration.** The assertion is the load path's own line
+/// (`Failed to load config: <value>: failed to read config file`) plus the
+/// absence of any parser refusal, because "the output contains the token" is
+/// *not* discriminating on its own: the base head's refusal text already names
+/// `--bind-port`, `-x` and `-c` (`` … got a flag `-x`, try `-c=-x` …``). Only
+/// `--strict-config=false` is named solely by its own refusal
+/// (`` `-c` requires an argument `FILE` ``), so all four iterations assert the
+/// load line; the base tree then fails on `--strict-config=false` for the old
+/// reason and on the other three because "Failed to load config" is absent
+/// (they were refusals, not loads).
 #[test]
 fn dash_shaped_config_value_is_the_value_not_a_flag() {
     for value in ["--strict-config=false", "--bind-port", "-x", "-c"] {
@@ -716,9 +755,13 @@ fn dash_shaped_config_value_is_the_value_not_a_flag() {
         );
         let all = combined(&out);
         assert!(
-            all.contains(value),
+            all.contains("Failed to load config") && all.contains(value),
             "frps -c {value} must name `{value}` as the path it could not read, not refuse the \
              token as a flag; output={all:?}"
+        );
+        assert!(
+            !all.contains("requires an argument"),
+            "the parser must not have refused the dash-shaped token; output={all:?}"
         );
     }
 
@@ -771,19 +814,29 @@ fn dash_dash_as_config_value_is_consumed_not_a_separator() {
 }
 
 /// The scope control: a real `--` still terminates flags, and a dangling `-c`
-/// is still a refusal. Go rejects both too (`frps -- --strict-config=false` is
-/// rc 1, `unknown command "--strict-config=false"`; a dangling `-c` is
-/// `flag needs an argument: 'c' in -c`), so these are the shapes the rewrite
-/// must leave alone. Without the first assertion, a mutant that attached `=` to
-/// whatever follows any `-c` would pass this file.
+/// is still a refusal. **Measured on Go v0.71.0, and the `--` half is a larger
+/// divergence than the message shape**: `frps -p <free> -- junk` and
+/// `frps -p <free> -- --strict-config=false` **start the server** (alive at 3-6 s,
+/// `frps started successfully`) because cobra takes everything after `--` as
+/// positional args and `frps`'s `RunE` ignores them; only a positional *without*
+/// `--` is an error (`frps junk` → rc 1 `unknown command "junk" for "frps"`).
+/// frp-rs refuses a leftover positional with or without `--` — the recorded
+/// divergence — so this test pins the refusal on our side, not a match with Go.
+/// A dangling `-c` *is* a match: `flag needs an argument: 'c' in -c` on Go.
+///
+/// Without the first assertion, a mutant that attached `=` to whatever follows
+/// any `-c` would pass this file.
 #[test]
 fn real_separator_and_dangling_config_stay_refused() {
-    // A real `--`: the token after it is positional, never `-c`'s value.
+    // A real `--`: the token after it is positional, never `-c`'s value. Go
+    // ignores that positional and serves; frp-rs refuses it (both with and
+    // without a `--`), which is this suite's recorded positional divergence.
     let out = run_frps(&["-c", "probe.toml", "--", "--strict-config=false"]);
     assert_eq!(
         out.status.code(),
         Some(1),
-        "a positional after `--` is refused here (Go refuses it too); stdout={:?} stderr={:?}",
+        "frp-rs refuses the leftover positional (Go starts the server); \
+         stdout={:?} stderr={:?}",
         stdout_of(&out),
         stderr_of(&out),
     );
@@ -845,12 +898,17 @@ fn config_dir_dash_value_now_reaches_the_directory_read() {
 }
 
 /// The item's third row, pinned **because it is sequencing, not parity**: Go has
-/// `frps verify`, frp-rs does not (`TODO.md:2518`). Measured on Go v0.71.0:
+/// `frps verify`, frp-rs does not. Measured on Go v0.71.0:
 /// `frps verify -c --strict-config=false` is rc 1 `open --strict-config=false: no
 /// such file or directory`; here the rewrite lets `-c` consume its value, so the
-/// missing subcommand is now the first error. Implementing `frps verify` makes
-/// this test **fail** — which is the point: the row's current Go error is what
-/// this branch pins, and the flip should not be silent.
+/// missing subcommand is now the first error.
+///
+/// **This test is a tripwire and its cheapest future fix is deletion — do not
+/// take it.** Implementing `frps verify` makes this test fail; that is the
+/// intended signal, and the fix is to move the pin to whatever the row now
+/// reports (and the matching row in `docs/developing.md` § CLI inputs), not to
+/// delete the test. The reason lives here and in the `frps verify` item in
+/// `TODO.md`, which carries the same warning.
 #[test]
 fn verify_subcommand_is_now_the_first_error_for_a_dash_config_value() {
     let out = run_frps(&["verify", "-c", "--strict-config=false"]);
@@ -872,5 +930,103 @@ fn verify_subcommand_is_now_the_first_error_for_a_dash_config_value() {
     assert!(
         !all.contains("-c` requires an argument"),
         "the `-c` value must have been consumed by the rewrite; output={all:?}"
+    );
+}
+
+/// The other side of the same pflag rule, pinned so the help-precedence change
+/// is recorded rather than discovered: `--help` is only special when pflag
+/// *reaches* it as a flag. `frps -c --help` therefore takes `--help` as the
+/// config path.
+///
+/// Measured on Go v0.71.0 (free port): rc 1, `open --help: no such file or
+/// directory`. frp-rs before this branch: **rc 0, the help text** (bpaf resolved
+/// `--help` before the value); frp-rs now: rc 1 naming `--help` — a match, and a
+/// deliberate loss of the old frp-rs convenience.
+///
+/// The neighbouring shape `frps --help` (no `-c`) prints help on both trees —
+/// not pinned here because it is not discriminating; the value-position rule is
+/// what this test is about. `frps -c <word> --help` is likewise rc 0 + help on
+/// both trees (the value is a plain word, so no attachment happens) and is
+/// deliberately not covered.
+#[test]
+fn dash_help_after_config_is_a_value_not_a_help_request() {
+    const HELP_MARKER: &str = "frps is the server of frp-rs";
+
+    let out = run_frps(&["-c", "--help"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "`-c --help` must read `--help` as the config path, as Go does \
+         (stdout={:?} stderr={:?})",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = combined(&out);
+    assert!(
+        all.contains("--help"),
+        "the load error must name `--help` as the path; output={all:?}"
+    );
+    assert!(
+        !all.contains(HELP_MARKER),
+        "help must not have been printed — `--help` was `-c`'s value; output={all:?}"
+    );
+    assert!(
+        !all.contains("requires an argument"),
+        "the parser must not have refused the value; output={all:?}"
+    );
+}
+
+/// Repeated `-c`, measured on both sides because the rewrite changes **which**
+/// refusal is reported and frp-rs has no last-wins at all on `frps`:
+///
+/// ```text
+/// Go v0.71.0:  frps -c a.toml -c b.toml                   → rc 1 `open b.toml: …` (last-wins; starts with a valid b)
+/// Go v0.71.0:  frps -c --strict-config=false -c good.toml → starts (the second -c overwrites the first)
+/// frp-rs base: frps -c a.toml -c b.toml                   → rc 1 `argument `-c` cannot be used multiple times …`
+/// frp-rs head: frps -c a.toml -c b.toml                   → rc 1, unchanged
+/// frp-rs base: frps -c --strict-config=false -c …         → rc 1 `` -c` requires an argument `FILE` ``
+/// frp-rs head: frps -c --strict-config=false -c …         → rc 1 `argument `-c` cannot be used multiple times …`
+/// ```
+///
+/// So `frps -c a -c b` is a **pre-existing, unchanged** divergence (frp-rs
+/// refuses repetition; Go is last-wins), and this branch only makes the refusal
+/// message for the dash-value spelling consistent with it. The item's "same rule
+/// on both binaries" covers the dash-value attachment, *not* last-wins: the frpc
+/// `-c` last-wins work (`config_arg()`'s `.last()`) did not touch the frps
+/// parser, and this branch does not either.
+#[test]
+fn repeated_config_flags_refuse_with_the_multiple_times_message() {
+    let out = run_frps(&["-c", "a.toml", "-c", "b.toml"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "repetition is refused on frp-rs (Go is last-wins); stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        combined(&out).contains("cannot be used multiple times"),
+        "the pre-existing repetition refusal must be named; output={:?}",
+        combined(&out)
+    );
+
+    // The dash-value spelling now lands on that same refusal instead of the
+    // "requires an argument" one — a message change, same rc.
+    let out = run_frps(&["-c", "--strict-config=false", "-c", "p.toml"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the repeated dash-valued -c is still rc 1; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = combined(&out);
+    assert!(
+        all.contains("cannot be used multiple times"),
+        "with the dash value consumed, the repetition is what bpaf reports first; output={all:?}"
+    );
+    assert!(
+        !all.contains("-c` requires an argument"),
+        "the first `-c` must have taken `--strict-config=false` as its value; output={all:?}"
     );
 }

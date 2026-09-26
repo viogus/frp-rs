@@ -3842,7 +3842,8 @@ mod tests {
         }
     }
 
-    // ── The frps half of the same rewrite (`TODO.md:2440`) ──────────────
+    // ── The frps half of the same rewrite (the `-c <dash-value>` item in
+    // `TODO.md`) ─────────────────────────────────────────────────────
 
     /// Run argv through the **shared preparation function** the binaries call
     /// ([`prepared_cli_argv`], used by both `parse_frps_args` and
@@ -3899,7 +3900,7 @@ mod tests {
         // `open --: no such file or directory`, rc 1, both). A word *after*
         // that value is a positional, and frp-rs refuses leftover positionals
         // with or without a `--` on both binaries — a pre-existing divergence
-        // filed with the subcommand-after-root-flags item in `TODO.md:2459`.
+        // filed with the subcommand-after-root-flags item in `TODO.md`.
         let argv: Vec<OsString> = ["-c", "--"].iter().map(OsString::from).collect();
         let parsed = frps_args()
             .to_options()
