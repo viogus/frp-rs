@@ -2296,8 +2296,11 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   step's own comment names at `:232`.
   Two comments in that file are stale at this head:
   * `ci.yml:300` — the `tiny` lane's comment opens "Same three checks as the step above" and
-    gives the `frps` lane's count as 4 ("4"/"9" tests listed). The `frps` step lists **5** now
-    (`:271`), so that `4` is stale.
+    gives the count of that step (`frps`) as 4 ("4"/"9" tests listed). It was literally right
+    when written: at `c4836b7` the only `4` literal in the file was the `frps` step's, and the
+    `tiny` lane's own count has been `9` since it was added (`frpc/tests/cli_exit_codes.rs` held
+    9 tests at `c4836b7` too, so the `4` is not this lane's earlier count). The `frps` step lists
+    **5** now (`:271`), so that `4` is stale.
   * `ci.yml:185` — says `frpc/tests/admin_cli.rs` has "(14 tests)"; it has **25** attributes at
     this head. The figure was written by `f8f127f` (#367) and was true then
     (`git show f8f127f:frpc/tests/admin_cli.rs` counts 14), and `0a8aed4` (#369) and `79478ca`
@@ -2309,9 +2312,11 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   tests together with the expectation and the lane stays green). The follow-up is to give the
   number one home, not to remove it.
   **Done-when:** each expected count lives in one place — a job-level `env:` value consumed by
-  both lanes, or a meta-test over the `ci.yml` count literals — so a test-count change cannot
-  leave a stale literal behind, and the two stale comments (`ci.yml:300`'s `4`, `ci.yml:185`'s
-  `14`) are corrected. The expectation stays hard-coded.
+  both lanes (the primary shape), or a meta-test that only checks the `ci.yml` *literals* agree
+  with the counts in the guarded files — so a test-count change cannot leave a stale literal
+  behind, and the two stale comments (`ci.yml:300`'s `4`, `ci.yml:185`'s `14`) are corrected. In
+  both shapes the expectation itself stays hard-coded in the guard: it is the guard that must not
+  take its expected count from the file it is checking.
 
 ---
 
@@ -2845,24 +2850,40 @@ nothing about whether the described behaviour still holds.
   failures ran 01:12:33–01:14:23. The diff is the strongest form of this item's evidence: its
   changed files were `.gitignore`, `TODO.md`, `docs/developing.md`, a deleted
   `scripts/__pycache__/rust_comments.cpython-314.pyc` and `scripts/repo-health.sh` — **no Rust
-  source at all**, so the compiled `frps`/`frpc` were byte-identical to `main`'s and nothing on
-  the data plane could have changed. Attempt 2 of the same run: `success`. Evidence class: the
+  source at all**, so `frps`/`frpc` were built from inputs identical to `main`'s and nothing on
+  the data plane could have changed (the evidence is that file list; no artifact hash was
+  compared). Attempt 2 of the same run: `success`. Evidence class: the
   attempt-1 failures and the attempt-2 results were both re-read from this run's logs
   (`gh run view --attempt 1 --log-failed`, then `--attempt 2 --log`) while writing this item.
 
-  **Counted at this head, from the runs recorded in this item** (not from a stored total): the
-  shape — one suite red while a neighbouring suite in the same job is green, green on a rerun —
-  is now recorded **five** times: the two 2026-09-17 episodes above (the original report and
-  PR #351), the two 2026-09-23 runs, and the 2026-09-26 recurrence. An earlier reading of this
-  item counted four, taking the 2026-09-17 entry for a single occurrence; that entry records
-  **two** failing runs on the same commit, which is why the count is five. The failing scenario
-  is not stable across the five: **eight** distinct names appear in total —
+  **Counted at this head over the record in this item** (not from a stored total). Units matter,
+  so all three, and "five" is the last one: **four recurrence blocks** record the shape — the
+  original report, the PR #351 recurrence, the 2026-09-23 block (two instances) and the
+  2026-09-26 block; the PR #338 ETXTBSY block below is a different phenomenon and is not counted;
+  **seven failing runs** (2 + 2 + 2 + 1); and **five distinct failing commits** — 2026-09-17 ×2
+  (the original report and the PR #351 recurrence: neither carries a run id or commit id in this
+  item), `5bf5270`, `9c1b291`, and `f3e7b96` (squash `1becff8`). An earlier reading counted four
+  by taking 2026-09-17 for a single failing commit; the item records two separate 2026-09-17
+  episodes, which is where the fifth comes from.
+  The failing scenario is not stable across the five: **eight** distinct names appear in total —
   `go-to-rust-quic`, `kcp-rust-to-rust`, `rust-to-go-tcp-tls` and `go-to-rust-wss-plain` from
   `compat-test.sh`, and `tcp-plain`, `tcp-tls`, `tcp-tls-mux` and `ws-plain` from
   `protocol-matrix.sh` — although the 2026-09-26 run did repeat the 2026-09-17 matrix set, so
   "a different scenario each time" holds only in the loose sense that no two consecutive
-  occurrences failed the same *set*. This is exactly why the item exists: all five were closed
-  by re-running until green, and a habit of re-running cannot tell the sixth apart from a real
+  occurrences failed the same *set*. That qualified reading uses two premises, neither checkable
+  from the record: the count is over scenario failures only (the PR #338 ETXTBSY unit-test block
+  is excluded, as it says itself), and the two 2026-09-17 episodes are treated as two different
+  commits on the strength of two different labels with no run id behind either — were they one
+  commit, "no two consecutive" would need restating.
+  This is still exactly why the item exists, and the one instance that was never re-run is the
+  worse version of the habit, not a better one: **four** of the five were re-run to green (the
+  original report on the third run, PR #351 on the third attempt, `9c1b291` on attempt 2,
+  `f3e7b96` on attempt 2) while
+  **`5bf5270` was never re-run at all** — run `35833904525` is still `attempt 1, failure`, and the
+  branch simply moved on to `476305a` (run 35836440857) and `d211d71` (run 35838710545), whose
+  Cross-Compat runs were green on attempt 1. So the red run was left red and a new commit was
+  pushed over it, leaving nothing on the record that distinguishes "flaked" from "fixed". That is
+  why a habit of re-running, or of pushing past, cannot tell the sixth apart from a real
   regression. Nothing above is fixed, and this round claims no fix.
 
 - [x] **`Tests (server integration)` fails intermittently, and it turns `main` red.**
