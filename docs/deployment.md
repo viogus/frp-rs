@@ -763,10 +763,20 @@ serde attribute: those case-rewrite, open up or otherwise change the accepted se
 in ways the extractor cannot compute, so it panics rather than guessing (four
 `#[should_panic]` tests pin that, and two more cover private fields and a
 `rename(serialize = …)`-only field), and every `*_KNOWN_KEYS` list must appear in
-the guard's table (`strict_known_key_lists_are_all_covered`). A `#[cfg]`-gated
-field is read as if it were always present, so a build without that feature has
-the lists accept a key its serde ignores — the safe direction (a missed typo,
-never a false 400). Every
+the guard's table (`strict_known_key_lists_are_all_covered`). Two latent
+`cfg` hazards, both absent from the six structs today: a `#[cfg]`-gated **field**
+is read as if it were always present, so a build without that feature has the
+lists accept a key its serde ignores — the safe direction (a missed typo, never a
+false 400); but a `#[cfg_attr(feature, serde(rename/alias = …))]` is invisible to
+the textual guard, which then knows only the field name, so on the
+feature-enabled build serde accepts the renamed key while strict mode refuses it
+— the **false-400** direction. (Measured with a probe struct under
+`--features otel`: with the feature on, `{"cfgAlias": …}` fills the field whose
+only attribute is `#[cfg_attr(feature = "otel", serde(alias = "cfgAlias"))]`,
+while the extractor still returns just the field name.) The extractor also
+panics rather than mis-reading a `#[serde (rename = "…")]` written with a space
+before the parenthesis (rustfmt normalises it) or a comment inside the attribute
+value; both are fail-closed false alarms. Every
 serde-accepted spelling is in the list, so a Go-authored config using Go's names
 (`localPort`, `customDomains`, `useEncryption`, …) and an frp-rs-authored one
 using snake_case both still load.

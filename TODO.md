@@ -1317,10 +1317,20 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     scanner reports `HEALTH_CHECK_HEADER_KNOWN_KEYS is missing serde keys ["driftPriv",
     "drift_priv"]`), and `rename(serialize = "…")`-only, where serde deserializes from the field name
     (measured with a probe: `{"inner":1}` parses, `{"out":1}` does not) so the guard uses the field
-    name instead of failing a legitimate edit. Six extractor tests now pin the behaviour (four
-    `#[should_panic]`: `rename_all`, `flatten`, an invented attribute, a missing struct; plus private
-    fields and the serialize-only case), `#[cfg]`-gated fields are read as always present (safe
-    direction, stated in `docs/deployment.md`), and
+    name instead of failing a legitimate edit. A third hole R2 found is closed too: a **raw
+    identifier** (`pub r#match: String`) was not recognised at all, so the extractor returned an
+    empty set for the struct — serde accepts the stripped name (`match`) and the alias (probe:
+    `{"match": …}` and `{"aliasMatch": …}` fill the field, `{"r#match": …}` does not), so the guard
+    was green while the binary refused both keys (`unknown field
+    "proxies[0].healthCheckHttpHeaders[0].match"`, rc 1 under the mutant). The prefix is now
+    stripped, which also fixes the same field in last position carrying `#[serde(flatten)]` (the
+    stale attribute list used to go unclassified and the open-ended guard returned a closed set).
+    Nine extractor tests now pin the behaviour (five `#[should_panic]`: `rename_all`, `flatten`,
+    `flatten` behind a raw ident, an invented attribute, a missing struct, plus the spaced
+    `#[serde (…)]` form; and three positive: private fields, the serialize-only case, raw
+    identifiers). `#[cfg]`-gated fields are read as always present (safe direction) while
+    `#[cfg_attr(…, serde(rename/alias = …))]` is invisible and gives the **false-400** direction on
+    the feature-enabled build — both stated in `docs/deployment.md` with the `otel` probe, and
     `strict_known_key_lists_are_all_covered`, which parses `strict.rs` and fails if a `*_KNOWN_KEYS`
     list is not compared by the guard. Red evidence for the new teeth: the `rename_all` mutant that
     previously passed now panics with ``does not model `#[serde(rename_all)]` (container attribute)``.

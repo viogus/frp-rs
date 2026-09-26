@@ -82,10 +82,11 @@ User-facing release notes for frp-rs.
   `[plugin.xxx]` server section). Go v0.71.0's own
   `conf/legacy/frpc_legacy_full.ini` therefore draws no unknown-field refusal
   here either (it is vendored and pinned in `frp-core/src/config/fixtures/`),
-  though it still does not load end to end: the INI reader infers integers and
-  comma-lists where INI has only strings, so `token = 12345678` fails serde on
-  both this and the previous release (an open item in `TODO.md`; see the fixture
-  README). Two measured gaps
+  though it still does not load end to end: the INI reader infers an integer
+  where INI has only strings, so `token = 12345678` fails serde on both this and
+  the previous release; a separate pre-existing class, comma-splitting, drops a
+  `[range:…]` template whose `local_port` is a list (and `allow_ports` on the
+  server). Both are open items in `TODO.md`; see the fixture README. Two measured gaps
   remain: an unknown key inside `[proxies.requestHeaders]` /
   `[proxies.responseHeaders]` is still accepted (normalization consumes those
   tables before the check, where Go rejects it), and the v1 spellings
