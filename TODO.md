@@ -1610,7 +1610,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `frpc -c <that config>` returns 1 both before and after this change, but for the *wrong*
     reason: the config is accepted and the process then fails to connect (a runtime exit),
     not a config refusal. The exit code agrees with Go by coincidence on that one row.
-- [ ] **The space-separated `--strict-config false` form is an frp-rs extension presented as Go
+- [x] **The space-separated `--strict-config false` form is an frp-rs extension presented as Go
   pflag semantics, and it parses differently from Go.** Measured on Go v0.71.0 and frp-rs
   (`frp-core/src/cli.rs`), with the same unknown-key config:
   * `frpc reload --strict-config false -c badwithport.toml` → Go: `json: unknown field
@@ -1629,6 +1629,69 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   (and update `strict_config_space_separated_value_parses` /
   `strict_config_invalid_value_errors_cleanly`), or state it as a documented extension — in
   `docs/` and in the `--strict-config` help text — with the `=` form staying Go-faithful. No sha.
+  **Done (2026-09-26, at the head of `fix/strict-config-space`).** Branch taken: **keep the
+  extension and document it**; no parser behaviour changed.
+  * **Why keep.** Dropping it would not make the two binaries agree on the argv — frp-rs has no
+    positional-argument concept here, so `--strict-config false` would become an argv error where
+    Go *accepts* it (silently keeping strict on for the subcommands, `unknown command` on the root
+    commands) and, for the subcommands, loads the config from it. That is a user-visible behaviour
+    change for no capability gain; it makes frp-rs stricter than Go on inputs Go accepts. The drop
+    branch itself is cheap — bpaf 0.9.27's `ParseArgument::adjacent()` restricts a value to the
+    same word, and measured with it `verify --strict-config false` becomes ``Error: `false` is not
+    expected in this context``, rc 1 — so the argument for keeping is the user-visible trade, not
+    implementation cost. The honest cost of keeping is a *silent* divergence for a Go-written
+    argv that passes `--strict-config false`: strict there, lenient here. That is what the help
+    text and the docs section now state, and the `=` spelling is the recommended one. Blast radius
+    checked with `git grep` over tracked files: no script and no other doc uses the two-token form;
+    only these unit tests and this item.
+  * **Measured table (2026-09-26, Go v0.71.0 darwin/arm64 vs this branch's binaries).** Client
+    config `/private/tmp/goprobe/badwithport.toml` (valid + `notAKnownFrpKey = 1` +
+    `[webServer] port = 7499`); server config `/private/tmp/goprobe/badfrps2.toml` (`bindPort =
+    7511`, `auth.token`, the same unknown key); every run through a bounded runner (`rc 124` = the
+    process started and the bound killed it).
+    * `frpc reload|status|stop --strict-config false -c bad` → Go rc 1 `json: unknown field …`,
+      **no dial**; frp-rs rc 1, dials `7499` (**extension**). `--strict-config=false` → both
+      lenient, dial `7499`. `--strict-config foo` → Go rc 1 unknown field (token ignored, config
+      still loaded); frp-rs rc 1 ``Error: `foo` is not expected in this context``.
+      `--strict-config=foo` → Go rc 1 `invalid argument "foo" … strconv.ParseBool`; frp-rs rc 1
+      with the same `` `foo` is not expected `` message. Absent / bare / `=true` → strict on both.
+    * `frpc --strict-config false -c bad` (run) → Go rc 1 `Error: unknown command "false" for
+      "frpc"` (the root command takes no positional — a correction to the "unused positional"
+      wording above, which holds for the subcommands only); frp-rs consumes it and goes lenient,
+      connecting to `7500`.
+    * `frpc verify --strict-config false -c bad` → Go rc 1 unknown field; frp-rs **rc 0**
+      `Config file … is valid` (the extension is observable without a listener).
+    * `frps --strict-config=false -c badfrps2.toml` → both start (lenient, rc 124).
+      `frps --strict-config false` → Go rc 1 `Error: unknown command "false" for "frps"`; frp-rs
+      consumes it and starts (extension). `frps --strict-config=foo` → rc 1 both, Go pflag text vs
+      frp-rs's message. Go's `frps` **does** carry the flag (`strict config parsing mode, unknown
+      fields will cause errors (default true)` in `frps --help`), so frps is in scope and covered;
+      Go's `frps verify` subcommand has no frp-rs counterpart and is not part of this item.
+  * **Carriers.** `--strict-config` now has help text from one definition
+    (`strict_config_parser` in `frp-core/src/cli.rs`, used by `frps` and `frpc`
+    `run`/`verify`/`reload`/`status`/`stop`): the bare-form line names the Go-faithful spellings
+    and says frp-rs additionally consumes a space-separated value "which Go's pflag does not", the
+    `=BOOL` line names the Go-faithful value spelling. `docs/developing.md`
+    § `--strict-config`: the space-separated value form carries the full table and the reasoning;
+    `docs/deployment.md` states it in the user-facing admin-CLI paragraph; `CHANGELOG.md`
+    (Unreleased § Docs) records it as documentation-only.
+  * **Tests.** `strict_config_space_separated_value_parses` and
+    `strict_config_invalid_value_errors_cleanly` (`frp-core/src/cli.rs`) now pin the documented
+    behaviour: the former the extension and its Go divergence (all six parsers, both spellings,
+    Go's `ParseBool` value grammar), the latter the refusal message for **both** non-bool
+    spellings; the four Go-faithful forms (absent / bare / `=true` / `=false`) are pinned across
+    all six parsers and the help text by
+    `strict_config_help_text_states_the_extension` (reads the rendered `--help` of all six).
+    End-to-end, on the real binary: `verify_strict_config_spellings_match_their_measured_rows`
+    (`frpc/tests/cli_inputs.rs`, rc + which load happened per spelling) and
+    `reload_space_separated_strict_config_is_consumed_as_the_value` /
+    `reload_bare_strict_config_stays_strict_and_never_connects` (`frpc/tests/admin_cli.rs`; the
+    consumed value is proven by the mock admin receiving the connection, its control by a strict
+    refusal that dials nothing). Red evidence: with the help text removed
+    `strict_config_help_text_states_the_extension` fails; with `status_cmd` back on a plain
+    `.switch()` the uniform value loops fail on the `frpc status` label; with the value branch
+    dropped from `strict_config_parser` both real-binary tests fail; and a Go-semantics binary
+    fails them by measurement (the `verify --strict-config false` row is rc 1 there, rc 0 here).
 - [x] **Three pre-existing `frpc` CLI inputs Go accepts and frp-rs does not** (all measured on
   Go v0.71.0 and on `main` @ `9c1b291`'s frpc as well as this branch's, so none is introduced by
   the `reload`/`status` fix):
