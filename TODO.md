@@ -1840,14 +1840,15 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `:2134`; a third textual hit is a comment at `:2095`), `sys.exit(3)` ×9, `sys.exit(4)` ×4,
   `sys.exit(5)` ×1, `sys.exit(1)` ×1 (`:2253`), plus the computed
   `sys.exit(4 if state['bad'] else 0)` (`:1116`) and the second inline block's
-  `sys.exit(124)`/`sys.exit(127)`/`sys.exit(r.returncode)` (`:765`, `:768`, `:770`);
-  `IndexUnavailable` is caught at `:1721` (its `raise` is at `:1677`) and exits at `:1725`. The bash
-  side turns each block status into a `FAIL` row and sets `fail=1` — several rows carry the number
-  (the path scan interpolates it: `(exit %s)`, `:1775`; the doc-figures mapping branches on it:
-  `(exit 3)` at `:2271`, `(exit 2)` at `:2274`), while others name the reason in words (`read_into`'s
-  `missing`/`not a regular file`/`Permission denied`, `:147`; the source-counts block's "source counts
-  incomplete (see scan errors above)", `:333`; the workflow scan's "a workflow file could not be
-  read", `:1124`). The prose drifted because the shorthand "the gate exits 3" gives the block's
+  `sys.exit(127)`/`sys.exit(124)`/`sys.exit(r.returncode)` (`:765`, `:768`, `:770`);
+  `IndexUnavailable` is caught at `:1721` (a `raise` — the toplevel guard's — is at `:1677`) and
+  exits at `:1725`. The bash side turns each block status into a `FAIL` row and sets `fail=1` —
+  several rows carry the number (the path scan interpolates it: `(exit %s)`, `:1775`; the
+  doc-figures mapping branches on it: `(exit 3)` at `:2271`, `(exit 2)` at `:2274`), while others name
+  the reason in words (`read_into`'s `missing`/`not a regular file`/`Permission denied`, set at
+  `:142`-`:144` and printed at `:147`; the source-counts block's "source counts incomplete (see scan
+  errors above)", `:333`; the workflow scan's "a workflow file could not be read", `:1124`).
+  The prose drifted because the shorthand "the gate exits 3" gives the block's
   status the whole script as its subject; it appeared in `docs/developing.md:915`/`:924` and
   `TODO.md:1324`/`:1330` and had to be corrected in this PR (the #368 block above), while
   `docs/developing.md:977` already stated the mapping correctly. Nothing prevents it drifting back:
