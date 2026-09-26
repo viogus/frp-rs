@@ -478,12 +478,12 @@ Each `[[proxies]]` entry defines a proxy that the client registers with the serv
 | `bandwidth_limit_mode` | `string` | `"client"` | `bandwidthLimitMode` | Bandwidth limit mode: `"client"` (limit client→server), `"server"` (limit server→client), or `"both"` (both directions). |
 | `group` | `string` | `""` | `group` | Proxy group name for load balancing. Proxies with the same group name are treated as a pool. |
 | `group_key` | `string` | `""` | `groupKey` | Group key for authentication within a proxy group. |
-| `health_check_type` | `string` | `""` | `healthCheckType` | Health check type: `"tcp"` (connect check) or `"http"` (HTTP GET check). Empty = no health checks. |
-| `health_check_url` | `string` | `""` | `healthCheckURL` | URL path for HTTP health checks. Only used when `health_check_type = "http"`. |
-| `health_check_http_headers` | `map<string,string>` | `{}` | `healthCheckHTTPHeaders` | Custom HTTP headers sent with health check requests. |
-| `health_check_interval_seconds` | `u64` | `10` | `healthCheckIntervalS` | Seconds between health checks. `0` = default (10). Explicit values below the old minimum are honored (Go parity — the `.max(10)` floor was removed, health.go:57-64). |
-| `health_check_timeout_seconds` | `u64` | `3` | `healthCheckTimeoutS` | Health check connect/read timeout in seconds. `0` = default (3). |
-| `health_check_max_failed` | `u32` | `1` | `healthCheckMaxFailed` | Consecutive failures before marking the proxy unhealthy. `0` = default (1). |
+| `health_check_type` | `string` | `""` | `healthCheck.type` (nested) | Health check type: `"tcp"` (connect check) or `"http"` (HTTP GET check). Empty = no health checks. `healthCheckType` is **not** a Go name and is refused in strict mode. |
+| `health_check_url` | `string` | `""` | `healthCheck.path` (nested) | URL path for HTTP health checks. Only used when `health_check_type = "http"`. `healthCheckURL` is **not** a Go name and is refused in strict mode. |
+| `health_check_http_headers` | `map<string,string>` | `{}` | `healthCheck.httpHeaders` (nested) | Custom HTTP headers sent with health check requests. Alias: `healthCheckHttpHeaders`. `healthCheckHTTPHeaders` is **not** a Go name and is refused in strict mode. |
+| `health_check_interval_seconds` | `u64` | `10` | `healthCheck.intervalSeconds` (nested) | Seconds between health checks. `0` = default (10). Explicit values below the old minimum are honored (Go parity — the `.max(10)` floor was removed, health.go:57-64). `healthCheckIntervalS` is **not** a Go name and is refused in strict mode; the legacy-INI spelling `health_check_interval_s` is accepted and wins when both are present. |
+| `health_check_timeout_seconds` | `u64` | `3` | `healthCheck.timeoutSeconds` (nested) | Health check connect/read timeout in seconds. `0` = default (3). `healthCheckTimeoutS` is **not** a Go name and is refused in strict mode; the legacy-INI spelling `health_check_timeout_s` is accepted. |
+| `health_check_max_failed` | `u32` | `1` | `healthCheck.maxFailed` (nested) | Consecutive failures before marking the proxy unhealthy. `0` = default (1). `healthCheckMaxFailed` is **not** a Go name and is refused in strict mode. |
 | `multiplexer` | `string` | `""` | `multiplexer` | Multiplexer type for the proxy connection (e.g. `"yamux"`). |
 
 ### HTTP/HTTPS Proxy Fields
@@ -507,7 +507,7 @@ Each `[[proxies]]` entry defines a proxy that the client registers with the serv
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
 | `sk` | `string` | `""` | `sk` | **Secret key.** Required for STCP/XTCP. The visitor must present the same key to connect. Also used as the encryption key when `use_encryption = true`. |
-| `virtual_net` | `string` | `""` | `virtualNet` | Virtual network name for proxy isolation. Proxies in different virtual nets cannot reach each other. Empty = default (global) network. |
+| `virtual_net` | `string` | `""` | — (frp-rs proxy extension) | Virtual network name for proxy isolation. Proxies in different virtual nets cannot reach each other. Empty = default (global) network. Go has no per-proxy field for this: its `virtualNet` is a **top-level client** section (`pkg/config/v1/client.go:66`, frp-rs's top-level `[virtualNet]`/`[virtual_net]`), so the flat per-proxy `virtualNet` is not a Go name. |
 
 ### Proxy Metadata and Misc Fields
 

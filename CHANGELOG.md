@@ -58,23 +58,37 @@ User-facing release notes for frp-rs.
   `unknown field "proxies[0].notAKnownProxyKey" in config file …` and exits 1.
   Checked positions: every `[[proxies]]` / `[[visitors]]` element, the
   `[proxies.plugin]` / `[visitors.plugin]` tables, a proxy's
-  `health_check_http_headers` elements, and every `[[httpPlugins]]` entry. The
+  `health_check_http_headers` elements (under both the canonical name and the
+  `healthCheckHttpHeaders` alias), and every `[[httpPlugins]]` entry. The
   key sets are the serde surface of `ProxyConfig` / `VisitorConfig` /
   `PluginConfig` / `VisitorPluginConfig` / `HttpPluginConfig` — every field name
   **and** every camelCase alias — so a Go-authored config that uses Go's
   spellings (`localPort`, `customDomains`, `useEncryption`, …) keeps loading; a
-  drift guard fails when a field or alias is added without the list. **What now
-  fails that used to load:** a genuinely unknown key in one of those blocks
-  (`remote_portt`, `notAKnownProxyKey`) and a mis-cased key Go's
-  case-insensitive JSON decoder would have honoured (`RemotePort` — see the
+  drift guard extracts those names from the structs and fails in both directions
+  when a field or alias is added, removed or renamed (it refuses to guess on a
+  container `#[serde(rename_all)]`, a `flatten` field or an unrecognised serde
+  attribute). **What now fails that used to load:** a genuinely unknown key in
+  one of those blocks (`remote_portt`, `notAKnownProxyKey`) and a mis-cased key
+  Go's case-insensitive JSON decoder reads and applies (`RemotePort` — see the
   case-sensitivity entry below; use `remotePort` or `remote_port`).
-  `--strict-config=false` still drops such keys silently, as before. Two gaps
-  remain, both measured on Go v0.71.0: an unknown key inside
-  `[proxies.requestHeaders]` / `[proxies.responseHeaders]` is still accepted
-  (normalization consumes those tables before the check, where Go rejects it),
-  and an unknown key in a legacy INI proxy section is refused here where Go's
-  INI path ignores it (the same shape as an unknown `[common]` key, which the
-  top-level check already refuses). Per-depth Go-vs-frp-rs measurements are in
+  `--strict-config=false` still drops such keys silently, as before.
+  **Legacy INI sections keep Go's accept-and-ignore semantics**: the legacy
+  collector folds the prefix mechanisms Go reads (`meta_*` → `metadatas`,
+  `header_*` → `headers` on an `http` proxy, `plugin_header_*` → the plugin's
+  `request_headers`) and then drops keys Go's INI path ignores
+  (`[common]`-only keys misplaced into a proxy section, a stray `plugin_*`
+  parameter, a visitor's `meta_*`/`header_*`, an unknown key in a legacy
+  `[plugin.xxx]` server section), so Go v0.71.0's own
+  `conf/legacy/frpc_legacy_full.ini` loads as it does on Go. Two measured gaps
+  remain: an unknown key inside `[proxies.requestHeaders]` /
+  `[proxies.responseHeaders]` is still accepted (normalization consumes those
+  tables before the check, where Go rejects it), and the v1 spellings
+  `healthCheckType` / `healthCheckURL` / `healthCheckHTTPHeaders` /
+  `healthCheckIntervalS` / `healthCheckTimeoutS` / `healthCheckMaxFailed`
+  advertised in `docs/config.md` are not Go names — strict mode now refuses
+  them (they were silently dropped before, leaving the health check
+  unconfigured), as Go does; the Go v1 spelling is the nested
+  `[proxies.healthCheck]` table. Per-depth Go-vs-frp-rs measurements are in
   `docs/deployment.md`.
 - **A CLI config failure now exits 1, not 2 — a behaviour change.**
   `frpc -c <bad or missing or unparsable>`, `frpc verify -c <…>` and

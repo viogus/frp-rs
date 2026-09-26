@@ -23,5 +23,13 @@ gap, independent of strict mode; the test asserts at the strict-check layer and
 the full-load behaviour is covered with quoted values by
 `legacy_ini_prefix_mechanisms_load_through_strict_mode`.
 
+The server-side counterpart (`conf/legacy/frps_legacy_full.ini`) is **not**
+vendored: it fails for the same class of pre-existing gap in the other
+direction (`allow_ports = 2000-3000,3001,3003,4000-50000` is comma-split into an
+array by the INI reader while `ServerConfig.allow_ports` is a string), which is
+unrelated to strict mode and to this fixture's purpose. The legacy
+`[plugin.xxx]` server-section behaviour is covered by
+`legacy_ini_ignores_keys_go_ignores` instead.
+
 To refresh it, download the Go frp release tarball and copy
 `conf/legacy/frpc_legacy_full.ini` over this file.
