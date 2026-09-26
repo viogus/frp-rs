@@ -426,6 +426,42 @@ impl ClientConfig {
         heartbeat_interval_set: bool,
         heartbeat_timeout_set: bool,
     ) {
+        // Go frp v0.71.0 `ClientCommonConfig.Complete()` calls
+        // `c.WebServer.Complete()` (`pkg/config/v1/client.go:96`), which is
+        // `c.Addr = util.EmptyOr(c.Addr, "127.0.0.1")`
+        // (`pkg/config/v1/common.go:71-73`). `EmptyOr` fills on the **empty
+        // string**, so an explicit `addr = ""` becomes `127.0.0.1` there, and
+        // the client has no later step that re-defaults the address.
+        //
+        // The server is NOT the same shape, and does not mirror Go. Go's
+        // `ServerConfig.Complete()` (`pkg/config/v1/server.go:101-120`) runs the
+        // same `WebServer.Complete()` at `:107` and only then the
+        // `if Port > 0 { Addr = EmptyOr(Addr, "0.0.0.0") }` at `:116-118`, so
+        // that branch can never fire and an empty `addr` with a set port stays
+        // loopback. frp-core's `ServerConfig::complete`
+        // (`frp-core/src/config/server.rs`) implements **only the second half**,
+        // so an empty server `webServer.addr` binds `*:<port>` where Go binds
+        // `127.0.0.1:<port>` — a recorded server-side divergence, pinned by
+        // `server_web_server_addr_empty_stays_wildcard_a_recorded_divergence`
+        // in `frp-core/src/config/tests.rs` and tracked in `TODO.md`. It is
+        // deliberately unchanged here: this item is frpc-scoped.
+        //
+        // The serde default on the field (`default_web_server_addr`) only fires
+        // when the key is ABSENT, so without this an explicit `addr = ""`
+        // survived as the empty string and every admin dial became a lookup of
+        // the empty host: measured at `main` @ `c4836b7`,
+        // `frpc status -c emptyaddr.toml` (with `[webServer] addr = ""`, `port
+        // = 7499`) printed
+        // `status query failed: connect :7499: failed to lookup address
+        // information: nodename nor servname provided, or not known` (rc 1),
+        // where Go v0.71.0 dials `127.0.0.1:7499`. Fixing it here, not in the
+        // admin-connection resolver, is what makes the value right wherever the
+        // client web server address is consumed — the admin subcommands and the
+        // client's own `[webServer]` admin listener alike.
+        if self.web_server.addr.is_empty() {
+            self.web_server.addr = "127.0.0.1".into();
+        }
+
         // MEDIUM-7: Fallback to http_proxy/HTTP_PROXY env var when proxy_url is empty
         if self.proxy_url.is_empty() {
             if let Ok(proxy) = std::env::var("http_proxy") {

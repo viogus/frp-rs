@@ -2848,8 +2848,48 @@ fn log_format_preserved_when_absent() {
 
 #[test]
 fn web_server_addr_defaults_to_localhost() {
-    let cfg = super::WebServerConfig::default();
+    let cfg: super::WebServerConfig = Default::default();
     assert_eq!(cfg.addr, "127.0.0.1");
+}
+
+/// Go frp v0.71.0 `ClientCommonConfig.Complete()` calls
+/// `c.WebServer.Complete()` (`pkg/config/v1/client.go:96`), and the client has
+/// no later step that re-defaults the address (the server's
+/// `pkg/config/v1/server.go:116-118` re-defaults a *set port* to `0.0.0.0`, and
+/// is a different surface). So on frpc an explicit `addr = ""` becomes
+/// `127.0.0.1`. Measured on the Go v0.71.0 binary: with `[webServer] addr = ""`
+/// and `port = 7499`, `frpc status -c <cfg>` dials `127.0.0.1:7499`. Before this
+/// completion, frp-rs dialled `:7499` and failed with
+/// `failed to lookup address information`.
+#[test]
+fn client_web_server_addr_empty_is_completed_to_localhost() {
+    let toml =
+        "serverAddr = \"127.0.0.1\"\nserverPort = 7500\n[webServer]\naddr = \"\"\nport = 7499\n";
+    let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+    assert_eq!(cfg.web_server.addr, "127.0.0.1");
+    assert_eq!(cfg.web_server.port, 7499);
+}
+
+/// The completion fills only an *empty* address: an explicit bind address
+/// survives, and the absent-key case still goes through the serde default
+/// (also `127.0.0.1`).
+#[test]
+fn client_web_server_addr_explicit_and_absent_are_unchanged() {
+    let toml = "serverAddr = \"127.0.0.1\"\nserverPort = 7500\n[webServer]\naddr = \"10.1.2.3\"\nport = 7499\n";
+    let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+    assert_eq!(cfg.web_server.addr, "10.1.2.3");
+
+    let toml = "serverAddr = \"127.0.0.1\"\nserverPort = 7500\n[webServer]\nport = 7499\n";
+    let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+    assert_eq!(cfg.web_server.addr, "127.0.0.1");
+
+    // No `[webServer]` at all: the port stays 0, so the admin commands still
+    // refuse with Go's sentence instead of dialing the completed address (the
+    // `AdminResolveError::NoPort` path).
+    let toml = "serverAddr = \"127.0.0.1\"\nserverPort = 7500\n";
+    let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+    assert_eq!(cfg.web_server.port, 0);
+    assert_eq!(cfg.web_server.addr, "127.0.0.1");
 }
 
 // ── MEDIUM-5: OIDC nesting normalization ───────────────────────────
@@ -5138,6 +5178,46 @@ fn test_server_bind_port_zero_maps_to_default_in_complete() {
     assert_eq!(cfg.bind_port, 7000);
 }
 
+/// The **server** side of the empty `webServer.addr` story is a recorded
+/// divergence, not parity — an earlier draft of the frpc-side change claimed
+/// otherwise. Go's `ServerConfig.Complete()` (`pkg/config/v1/server.go:101-120`)
+/// runs `WebServer.Complete()` → `Addr = util.EmptyOr(Addr, "127.0.0.1")`
+/// (`pkg/config/v1/common.go:71-73`) at `:107` and only then the
+/// `if Port > 0 { Addr = util.EmptyOr(Addr, "0.0.0.0") }` at `:116-118`, so the
+/// second branch can never fire and an empty `addr` stays loopback. Measured on
+/// Go v0.71.0 with `[webServer] addr = "" port = 7597` plus credentials: Go frps
+/// logs `dashboard listen on 127.0.0.1:7597` and listens there, while frp-rs
+/// logs `Dashboard listening on 0.0.0.0:7597` and listens on `*:7597`.
+///
+/// frp-core `ServerConfig::complete` reproduces only the second half. This test
+/// pins the *current* value so the divergence cannot be mistaken for parity in
+/// either direction: whoever implements the Go order must change this
+/// assertion deliberately, and the flip is then a recorded event rather than a
+/// silent one. The flip is tracked in `TODO.md`.
+#[test]
+fn server_web_server_addr_empty_stays_wildcard_a_recorded_divergence() {
+    let mut cfg: ServerConfig =
+        serde_json::from_value(serde_json::json!({ "bindPort": 7000 })).unwrap();
+    // Explicit empty string, as `[webServer] addr = ""` deserializes.
+    cfg.web_server.addr = String::new();
+    cfg.web_server.port = 7597;
+    cfg.complete();
+    assert_eq!(
+        cfg.web_server.addr, "0.0.0.0",
+        "current frp-rs behaviour: wildcard. Go v0.71.0 binds 127.0.0.1 here — \
+         see the doc comment; this is the divergence, not parity"
+    );
+
+    // An ABSENT `addr` key is unaffected either way: the serde default already
+    // supplies 127.0.0.1, so the wildcard branch is skipped.
+    let mut cfg: ServerConfig =
+        serde_json::from_value(serde_json::json!({ "bindPort": 7000 })).unwrap();
+    cfg.web_server.port = 7597;
+    assert_eq!(cfg.web_server.addr, "127.0.0.1", "serde default");
+    cfg.complete();
+    assert_eq!(cfg.web_server.addr, "127.0.0.1");
+}
+
 /// server_port: same EmptyOr mapping on the client (Go v1/client.go:87).
 /// `server_port = 0` used to dial port 0 (connect refused) instead of the
 /// default listener.
@@ -5610,6 +5690,164 @@ unknown_web_server_key = 1
         .to_string();
     assert!(
         err.contains("unknown field \"web_server.unknown_web_server_key\""),
+        "got: {err}"
+    );
+}
+
+/// The array-element arm of the case-insensitive-keys divergence, with the
+/// dropped **value** asserted — the CLI-level test of the same shape
+/// (`case_insensitive_proxy_array_keys_are_dropped_in_strict_mode`) can only
+/// see `rc 0` / `is valid` / no `unknown field`, which a future
+/// `#[serde(alias = "RemotePort")]` would also satisfy while honouring the key.
+/// This pin fails if that happens, because the alias would set `remote_port`.
+///
+/// Go v0.71.0 reads `RemotePort` case-insensitively and binds the requested
+/// port; frp-rs drops the key, so the server auto-allocates. `check_strict`
+/// never recurses into the array (`strict.rs`), and `ProxyConfig` carries no
+/// `deny_unknown_fields`.
+#[test]
+fn case_insensitive_proxy_array_key_is_dropped_in_strict_mode() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        b"serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[[proxies]]\nname = \"p\"\ntype = \"tcp\"\nlocalPort = 80\nRemotePort = 7198\n",
+    )
+    .unwrap();
+    let cfg = load_client_config(f.path().to_str().unwrap(), true)
+        .expect("strict mode accepts the mis-cased array key");
+    assert_eq!(cfg.proxies.len(), 1);
+    assert_eq!(
+        cfg.proxies[0].remote_port, 0,
+        "the mis-cased key must be dropped (Go would use 7198); a serde alias \
+         would make this 7198 and would be a behaviour change, not a test tweak"
+    );
+    // `localPort` (the camelCase alias serde does know) IS honoured, so the
+    // zero above is specific to the mis-cased spelling.
+    assert_eq!(cfg.proxies[0].local_port, 80);
+}
+
+/// The third non-walked shape: a **nested table inside a walked section**. The
+/// key-list lookup happens for the table being visited, so nothing below it is
+/// visited either — `[auth.tokenSource]` is walked (its own keys are checked)
+/// but `[auth.tokenSource.exec]` has no list and is skipped.
+///
+/// Measured against Go v0.71.0 with `[auth.tokenSource] type = "exec"` and
+/// `[auth.tokenSource.exec] command = "echo tok"`:
+///
+/// * Go refuses **both** spellings — `unsafe feature "TokenSourceExec" is not
+///   enabled …` — because it reads the key either way and then hits its gate.
+/// * frp-rs strict `verify` exits 0 and prints `is valid` for **both** too, but
+///   not because it lacks the gate: `TokenSourceExec` is defined at
+///   `frp-core/src/unsafe_features.rs:10` and enforced by
+///   `validate_token_source_unsafe` (`frp-core/src/auth.rs`), called from
+///   `frp-client/src/service.rs` — i.e. at **service start**, outside `verify`'s
+///   load path. Measured: `frpc -c <this config>` is rc 3 with
+///   `auth.tokenSource exec blocked: TokenSourceExec not in UnsafeFeatures
+///   allowlist. …`, identical for `Env` and `env`. The drop is therefore visible
+///   only at the parsed-value level, which is what this pin asserts: `env` is
+///   read into the token source, `Env` leaves it empty.
+///
+/// Already documented in `docs/deployment.md:719`
+/// (`auth.tokenSource.exec.env` has no key set at `tokenSource`).
+#[test]
+fn case_insensitive_key_in_a_nested_table_is_dropped_in_strict_mode() {
+    let base = "serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[auth]\nmethod = \"token\"\n\
+                [auth.tokenSource]\ntype = \"exec\"\n[auth.tokenSource.exec]\n\
+                command = \"echo tok\"\n";
+
+    let mut cap = tempfile::NamedTempFile::new().unwrap();
+    cap.write_all(format!("{base}Env = [{{ name = \"A\", value = \"B\" }}]\n").as_bytes())
+        .unwrap();
+    let cfg = load_client_config(cap.path().to_str().unwrap(), true)
+        .expect("strict mode accepts the mis-cased nested key");
+    let exec = cfg
+        .auth
+        .as_ref()
+        .and_then(|a| a.token_source.as_ref())
+        .and_then(|ts| ts.exec.as_ref())
+        .expect("exec source parsed");
+    assert!(
+        exec.env.is_empty(),
+        "the mis-cased `Env` must be dropped (Go would read it and refuse at its \
+         TokenSourceExec gate); got {:?}",
+        exec.env
+    );
+
+    // The correctly spelled key is read — the same frp-rs `verify` rc, a
+    // different parsed value. That difference is the whole claim.
+    let mut lower = tempfile::NamedTempFile::new().unwrap();
+    lower
+        .write_all(format!("{base}env = [{{ name = \"A\", value = \"B\" }}]\n").as_bytes())
+        .unwrap();
+    let cfg = load_client_config(lower.path().to_str().unwrap(), true).unwrap();
+    let exec = cfg
+        .auth
+        .as_ref()
+        .and_then(|a| a.token_source.as_ref())
+        .and_then(|ts| ts.exec.as_ref())
+        .expect("exec source parsed");
+    assert_eq!(exec.env.len(), 1, "the correct spelling IS read");
+    assert_eq!(exec.env[0].name, "A");
+    assert_eq!(exec.env[0].value, "B");
+}
+
+/// The second non-walked shape for a mis-cased key, and the reason the
+/// case-insensitive-keys record cannot say "the walked sections refuse, arrays
+/// are dropped": a **table alias the normalizer leaves alone**. `[virtualNet]`
+/// is a documented camelCase alias for `virtual_net`, but
+/// `normalize_client_config` canonicalises only some spellings (`webServer`,
+/// `featureGates`, …), so this alias survives to `check_strict`, which has no
+/// key list for it and therefore does not descend. A capitalised nested key is
+/// then dropped silently in strict mode.
+///
+/// Measured against Go v0.71.0: Go's `verify -c` on the `Address` spelling fails
+/// with `VirtualNet feature is not enabled; enable it by setting the appropriate
+/// feature gate flag`, while frp-rs's `verify` exits 0 and prints `is valid`, and
+/// the strict load returns `Ok` with `virtual_net.address == ""`. The dropped key
+/// also *hides* the feature-gate refusal, because an empty address means no vnet
+/// config is seen at all. `[virtual_net] Address` and `[virtualNet] address`
+/// both behave differently, so this is specifically the alias arm.
+#[test]
+fn case_insensitive_key_in_a_table_alias_is_dropped_in_strict_mode() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        b"serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[virtualNet]\nAddress = \"10.1.0.0/24\"\n",
+    )
+    .unwrap();
+    let cfg = load_client_config(f.path().to_str().unwrap(), true)
+        .expect("strict mode accepts the alias with a mis-cased nested key");
+    assert_eq!(
+        cfg.virtual_net.address, "",
+        "the mis-cased key is dropped, not read (Go would use 10.1.0.0/24)"
+    );
+
+    // The correctly spelled alias key IS read, and then the feature-gate check
+    // fires — which is what the dropped key above hides.
+    let mut ok = tempfile::NamedTempFile::new().unwrap();
+    ok.write_all(
+        b"serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[virtualNet]\naddress = \"10.1.0.0/24\"\n",
+    )
+    .unwrap();
+    let err = load_client_config(ok.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("VirtualNet feature is not enabled"),
+        "the correctly spelled alias key reaches the feature gate: {err}"
+    );
+
+    // Contrast: the canonical snake_case section DOES have a key list, so the
+    // same mis-cased nested key is refused there.
+    let mut snake = tempfile::NamedTempFile::new().unwrap();
+    snake
+        .write_all(
+            b"serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[virtual_net]\nAddress = \"10.1.0.0/24\"\n",
+        )
+        .unwrap();
+    let err = load_client_config(snake.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"virtual_net.Address\""),
         "got: {err}"
     );
 }

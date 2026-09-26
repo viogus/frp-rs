@@ -1629,7 +1629,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   (and update `strict_config_space_separated_value_parses` /
   `strict_config_invalid_value_errors_cleanly`), or state it as a documented extension — in
   `docs/` and in the `--strict-config` help text — with the `=` form staying Go-faithful. No sha.
-- [ ] **Three pre-existing `frpc` CLI inputs Go accepts and frp-rs does not** (all measured on
+- [x] **Three pre-existing `frpc` CLI inputs Go accepts and frp-rs does not** (all measured on
   Go v0.71.0 and on `main` @ `9c1b291`'s frpc as well as this branch's, so none is introduced by
   the `reload`/`status` fix):
   * **`-c` twice.** `frpc reload -c noweb.toml -c goodcli.toml` → Go is last-wins and dials the
@@ -1649,6 +1649,106 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   empty `addr` to `127.0.0.1` at the CLI/load boundary) with a CLI test per case in the style of
   `frpc/tests/admin_cli.rs`, or record each as a deliberate divergence in the feature-surface
   policy. No sha.
+  **Done (2026-09-26, at the head of `fix/frpc-cli-inputs`).** Two matched, one recorded.
+  * **`-c` twice → matched.** Every frpc config argument now goes through `config_arg()`
+    (`frp-core/src/cli.rs`), bpaf's `.last()`, so `run`/`verify`/`reload`/`status`/`stop` are all
+    last-wins like Go's pflag `StringVarP`. Measured, Go vs frp-rs-now: `status -c noweb.toml -c
+    p7499.toml` → both dial `127.0.0.1:7499`; reverse order → both print `web server port should be
+    set if you want to use this feature`; `verify -c noweb.toml -c p7499.toml` → both report
+    `p7499.toml`; `--config p7499.toml -c p7498.toml` → both dial `7498`; `-cp7498.toml` and
+    `-c=p7498.toml` → both dial `7498` (bpaf already accepted both spellings); `-c ""` → both rc 1
+    without falling back to 7400; dangling `-c` → both rc 1. Before: rc 1,
+    ``argument `-c` cannot be used multiple times in this context``, nothing loaded.
+  * **Empty `webServer.addr` → matched on the client.** `ClientConfig::complete_with_heartbeat_set`
+    (`frp-core/src/config/client.rs`) fills the **empty string** with `127.0.0.1`, mirroring Go's
+    `ClientCommonConfig.Complete() → WebServer.Complete()`
+    (`pkg/config/v1/client.go:96` → `pkg/config/v1/common.go:71-73`). Measured: `status -c
+    emptyaddr.toml` (`addr = ""`, `port = 7499`) → both dial `127.0.0.1:7499`; before, frp-rs
+    printed `connect :7499: failed to lookup address information`. Only the empty string is
+    completed — `" "` still reaches the dialer verbatim and fails (the guard against a `trim()`),
+    while `"0.0.0.0"`/`"::1"`/`"localhost"` pass through as Go does. **The server is *not* matched
+    and this block does not claim it:** Go's `ServerConfig.Complete()` runs the same
+    `WebServer.Complete()` (`127.0.0.1`) at `pkg/config/v1/server.go:107` *before* the
+    `Port > 0 → "0.0.0.0"` line at `:116-118`, so that line is dead; measured, Go frps binds
+    `127.0.0.1:7597` where frp-rs (`--features dashboard`) binds `*:7597`. Filed as its own item
+    below (`frp-core/src/config/server.rs:402` is a stale two-step without the first half).
+  * **Case-insensitive keys → recorded divergence, not fixed.** Go's `encoding/json` matches field
+    *and table* names case-insensitively at every level, including inside `[[proxies]]` — measured:
+    `ServerAddr`/`SERVERADDR`, `[WebServer]`, `[webServer] Port`, and `LocalPort`/`RemotePort`
+    inside `[[proxies]]` all load on Go and are used. A bounded `#[serde(alias)]` set is not parity
+    (aliases are exact strings), so the fix would be a canonicalising pre-pass or per-field aliases
+    for every permutation across the whole tree; measured instead and stated with its scope in
+    `docs/developing.md` § CLI inputs. The wording there is measured cell by cell and is deliberately
+    **not** the earlier blanket "refused (strict) or mis-defaulted (lenient)": strict mode refuses a
+    mis-cased key only in the walked sections (top level, `[auth]`/`[log]`/`[webServer]`/
+    `[transport]`), while a mis-cased key inside a `[[proxies]]`/`[[visitors]]`/`[[httpPlugins]]`
+    element is silently dropped **even in strict mode** (`frpc verify` rc 0; the exemption in
+    `frp-core/src/config/strict.rs:277-285`, its consequences already in `docs/deployment.md:710-747`,
+    pinned by `strict_mode_exempts_proxy_and_visitor_array_elements` and now also by the CLI test
+    `case_insensitive_proxy_array_keys_are_dropped_in_strict_mode`). In non-strict mode the dropped
+    key may later error (`web server port should be set …`, `missing field \`name\``) *or* silently
+    change a default frp-rs uses (`ServerAddr`/`ServerPort` → `0.0.0.0:7000` where Go uses the file's
+    values). The doc names what *is* matched (snake_case + the documented camelCase aliases) and that
+    the divergence is every casing difference on both frpc and frps, not one struct.
+  * Tests: `frpc/tests/cli_inputs.rs` (19 CLI tests, real `CARGO_BIN_EXE_frpc` + a one-shot
+    loopback mock; red-run without the fix: 12 of the 17 pre-existing ones fail — the two case-2
+    pins added in review pass on both sides, because they pin the divergence that is not being
+    changed), parser tests in `frp-core/src/cli.rs`,
+    and `frp-core/src/config/tests.rs`
+    (`client_web_server_addr_empty_is_completed_to_localhost`,
+    `client_web_server_addr_explicit_and_absent_are_unchanged`). Doc claims in `docs/developing.md`
+    § CLI inputs and `CHANGELOG.md`.
+- [ ] **An empty `webServer.addr` still binds frps to `0.0.0.0`, where Go binds `127.0.0.1`.** Found
+  while closing the frpc item above; the two-step in `frp-core/src/config/server.rs` is the opposite
+  order from Go's, so Go's `0.0.0.0` branch is dead and frp-rs's `127.0.0.1` step is missing.
+  * Go v0.71.0 `ServerConfig.Complete()` (`pkg/config/v1/server.go:101-120`): line 107 calls
+    `c.WebServer.Complete()` → `Addr = util.EmptyOr(Addr, "127.0.0.1")`
+    (`pkg/config/v1/common.go:71-73`), **then** `:116-118` runs
+    `if c.WebServer.Port > 0 { c.WebServer.Addr = util.EmptyOr(c.WebServer.Addr, "0.0.0.0") }` —
+    which can never fire, because the address was just filled.
+  * Measured with `[webServer] addr = ""`, `port = 7597`, `user`/`password` set: Go frps logs
+    `dashboard listen on 127.0.0.1:7597` and `lsof -nP -iTCP:7597 -sTCP:LISTEN` shows
+    `TCP 127.0.0.1:7597 (LISTEN)`; frp-rs frps (`--features dashboard`) logs
+    `Dashboard listening on 0.0.0.0:7597` and shows `TCP *:7597 (LISTEN)`.
+  * `frp-core/src/config/server.rs` reproduces only the second half: it assigns `0.0.0.0` when the
+    port is set and the address **is empty**, and no earlier step fills `127.0.0.1`. The divergence
+    is therefore the **explicit `addr = ""`** case only — an *absent* `addr` key never reaches that
+    branch, because the serde field default already supplies `127.0.0.1` and the `is_empty()` guard
+    is then false (measured: an absent `addr` binds `127.0.0.1` on both, i.e. already parity; pinned
+    by the second assertion of
+    `server_web_server_addr_empty_stays_wildcard_a_recorded_divergence`). For the explicit empty
+    string it is a reachable security-relevant divergence (an admin/dashboard listener on every
+    interface where Go keeps it loopback), not just a docs defect.
+  **Done-when:** match Go — complete `web_server.addr` to `127.0.0.1` on the empty string first, and
+  delete or neutralise the `0.0.0.0` branch — with a test asserting the bound address for `addr = ""`
+  and for an absent `addr` (not merely the config field), and update the `docs/developing.md`
+  § CLI inputs paragraph that currently records the divergence. If a deliberate exception is kept
+  (a server that *must* expose the dashboard on a wildcard address for an empty value), say so with
+  the measurement and the reason instead; do not leave the current claim that frp-rs "already does"
+  what Go does. No sha.
+- [ ] **`frpc`'s eight single-proxy subcommands reject `-c`/`--config`, which Go accepts and
+  ignores.** Go's `-c` is a persistent rootCmd flag, so every subcommand parses it; the single-proxy
+  commands simply never read the value. frp-rs's bpaf parsers for `tcp`/`udp`/`http`/`https`/`stcp`/
+  `xtcp`/`sudp`/`tcpmux` do not define it.
+  * Measured: with a proxy name supplied so Go gets past its own validation,
+    `frpc tcp --local-port 5 --remote-port 6 --proxy-name x -c noweb.toml` → Go v0.71.0 starts the
+    single proxy (killed by this measurement after 3 s, `try to connect to server...` on stdout);
+    frp-rs exits 1 with ``Error: `-c` is not expected in this context``. The same holds for `udp`.
+    Dropping `-c` from the frp-rs argv makes both behave the same, so the flag is the only
+    difference.
+  * Three further argv shapes are the same "what persists into which subparser" question and are
+    recorded in `docs/developing.md` § CLI inputs rather than fixed: `status -c
+    --strict-config=false -c p7498.toml` (Go rc 1 dialling 7498, frp-rs ``-c` requires an
+    argument`), `status -c p7498.toml -- -c p7499.toml` (Go rc 1 dialling 7498, frp-rs
+    `` `-c` is not expected``) and `status -c p7498.toml --config-dir cDir` (Go rc 1 dialling 7498,
+    frp-rs `` `--config-dir` is not expected``). All measured at the head of
+    `fix/frpc-cli-inputs` against Go v0.71.0.
+  **Done-when:** accept `-c`/`--config` (and, to be Go-faithful, the other persistent root flags,
+  including `--config-dir`, and `-`-prefixed values after `-c`) on the eight single-proxy parsers
+  and the admin subcommands and ignore the file, or record each refusal as a deliberate divergence
+  in `docs/developing.md` § CLI inputs with these measurements. The `-c` last-wins work above covers
+  the **five** config-consuming parsers (`run`, `verify`, `reload`, `status`, `stop`) — that wording
+  must not be read as covering these shapes or those eight subcommands. No sha.
 - [ ] **A CLI failure's output shape is still not Go's: frp-rs prints a `tracing` line where Go
   prints one bare error, and `verify` writes to stderr where Go writes to stdout.** Measured on Go
   v0.71.0 and on the head binaries while closing the exit-code item above (only the *exit code*

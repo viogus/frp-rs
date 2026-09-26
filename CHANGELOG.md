@@ -32,6 +32,36 @@ User-facing release notes for frp-rs.
   tracked in `TODO.md` — for example, an unresolvable `auth.tokenSource`, or (on
   the client) a malformed `[store]` file, each of which exits `1` in Go; the
   examples are not an exhaustive list of what can reach them.
+- **Config keys are still matched case-sensitively — a known divergence from
+  Go, recorded rather than half-fixed.** Go decodes the config with
+  `encoding/json`, whose field and table matching is case-insensitive
+  *everywhere*, including inside `[[proxies]]`. frp-rs matches exactly (plus the
+  documented camelCase aliases), and the two diverge differently depending on
+  the key's position:
+  - In the walked sections — the top level and `[auth]`/`[log]`/`[webServer]`/
+    `[transport]` — strict mode (the default) refuses the mis-cased key:
+    `[webServer] Port = 7499` gives `unknown field "web_server.Port" … did you
+    mean 'port'?`, exit 1.
+  - Inside a `[[proxies]]`/`[[visitors]]` (or `[[httpPlugins]]`) element the key
+    is **silently dropped even in strict mode** and the command exits 0 — the
+    long-standing strict-mode array exemption, not new here. A dropped
+    `remotePort` therefore registers `remote_port: 0` and lets the server
+    auto-allocate a port where Go would have used the configured one.
+  - With `--strict-config=false` the key is dropped everywhere and the command
+    may succeed on a different value than Go used (`ServerAddr`/`ServerPort`
+    fall back to `0.0.0.0:7000`) or fail later with a missing-value error.
+  The measurements, the reason no bounded alias set closes it, and the covered
+  vs uncovered scope are in `docs/developing.md` § CLI inputs; the array
+  exemption's own consequences are in `docs/deployment.md`.
+- **An empty `[webServer] addr` still binds `frps` to `0.0.0.0` — unchanged, and
+  a divergence found while fixing the client side.** Go's server completes the
+  address to `127.0.0.1` before its "set port → `0.0.0.0`" branch, so that branch
+  never fires there; frp-rs has only the second half. Measured with
+  `[webServer] addr = ""`, `port = 7597` and credentials: Go frps listens on
+  `127.0.0.1:7597`, frp-rs (`--features dashboard`) on `*:7597`. An admin
+  listener on every interface where Go keeps it loopback is a security-relevant
+  difference, so this one is tracked in `TODO.md` with the measurement rather
+  than described as parity. Not changed in this release.
 - **`--config-dir` mode keeps its own refusal code — unchanged, and a
   divergence.** A directory that does not exist, is empty, or holds a config
   that fails to parse still exits **2** on the frp-rs side, where Go's own
@@ -67,6 +97,42 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **A repeated `-c`/`--config` is now last-wins on the five `frpc` commands that
+  read a config file — a behaviour change.** Go registers `-c` with pflag
+  `StringVarP`, so `frpc status -c a.toml -c b.toml` loads `b.toml` and is never
+  an error; frp-rs rejected the second occurrence with ``argument `-c` cannot be
+  used multiple times in this context`` before loading anything. `run`,
+  `verify`, `reload`, `status` and `stop` now all take the **last** config,
+  mixing `-c`, `--config`, `-cPATH` and `-c=PATH` freely (they are one variable,
+  as in Go). An absent `-c` keeps its previous meaning on each command (`run` →
+  `frpc.toml`, the admin subcommands → the frp-rs default address), and a `-c`
+  with no value is still a parse error. Out of scope here, and unchanged: the
+  eight single-proxy subcommands (`tcp`, `udp`, `http`, `https`, `stcp`, `xtcp`,
+  `sudp`, `tcpmux`) still **reject** `-c` with ``Error: `-c` is not expected in
+  this context``, where Go accepts and ignores the persistent flag — recorded as
+  its own `TODO.md` item, not fixed; and the `frps` CLI is untouched.
+- **An empty `webServer.addr` is now completed to `127.0.0.1` — a behaviour
+  change.** Go's `WebServerConfig.Complete()` is
+  `c.Addr = util.EmptyOr(c.Addr, "127.0.0.1")`, so a client config with
+  `[webServer] addr = ""` and a port dials loopback. frp-rs used the empty
+  string literally and failed with `connect :<port>: failed to lookup address
+  information`, which broke `frpc reload`/`status`/`stop` on such a config. The
+  client's own `[webServer]` admin listener was **not** binding the empty host.
+  Measured at the base with `--features admin` and a live frps: with credentials
+  it logged `admin server starting on :7597` and then
+  `admin server failed: failed to lookup address information …`, so nothing
+  listened; without credentials it logged `refusing to bind admin API to
+  non-loopback address :7597` and listened on `127.0.0.1:7597` through the
+  pre-existing force. The completion removes that failure and makes the
+  configured address explicit; where an unauthenticated listener binds is
+  unchanged.
+  Only the empty string is completed: `" "`, `"0.0.0.0"`, `"::1"` and
+  `"localhost"` are still passed through to the dialer verbatim, as in Go.
+  `frps` is unchanged by this release, and its own completion is a **recorded
+  divergence, not parity**: frp-rs re-defaults a set port to `0.0.0.0`, while
+  Go's equivalent branch is dead (its address was already completed to
+  `127.0.0.1` first), so an empty `[webServer] addr` leaves Go listening on
+  `127.0.0.1` and frp-rs on every interface. Tracked in `TODO.md`.
 - **`frp-server` builds with only the `dashboard` feature compile again.** A
   downstream workspace (or `cargo check -p frp-server --no-default-features
   --features dashboard --all-targets`) that had frp-core's `oidc` on while

@@ -806,11 +806,34 @@ pub struct StopArgs {
 
 // ─── frpc parser combinators ─────────────────────────────────────────
 
+/// `-c`/`--config`, matching Go's pflag `StringVar`: a repeated flag is
+/// **last-wins** and never an error.
+///
+/// Go registers `-c` with `StringVarP` inside `func init()`
+/// (`cmd/frpc/sub/root.go`), so `frpc status -c a.toml -c b.toml` parses `a`
+/// first and overwrites it with `b`. Measured on Go v0.71.0 darwin/arm64 with
+/// `noweb.toml` (no `[webServer]`) followed by `p7499.toml`
+/// (`[webServer] port = 7499`): `frpc status -c noweb.toml -c p7499.toml` dials
+/// `127.0.0.1:7499` (rc 1, `connect: connection refused`) — the first config's
+/// port-less refusal is never reached. The reverse order
+/// (`-c p7499.toml -c noweb.toml`) prints
+/// `web server port should be set if you want to use this feature`.
+///
+/// bpaf exits with `argument \`-c\` cannot be used multiple times in this
+/// context` on the second occurrence, so every frpc parser that takes a config
+/// path wraps the argument in [`Parser::last`] (bpaf's documented
+/// contradicting-options combinator: run the inner parser as many times as it
+/// succeeds and return the last value). `.last()` fails when the flag is
+/// absent, exactly like the bare `argument` it replaces, so a required `-c`
+/// stays required and an `.optional()`/`.fallback()` wrapper keeps its previous
+/// meaning. The `frps` CLI is left alone: that is a separate surface, not part
+/// of this item.
+fn config_arg() -> impl Parser<String> {
+    long("config").short('c').argument::<String>("FILE").last()
+}
+
 fn run_mode() -> impl Parser<FrpcRunArgs> {
-    let config = long("config")
-        .short('c')
-        .argument::<String>("FILE")
-        .fallback("frpc.toml".into());
+    let config = config_arg().fallback("frpc.toml".into());
     let config_dir = long("config-dir")
         .long("config_dir")
         .argument::<String>("DIR")
@@ -1231,7 +1254,8 @@ fn tcpmux_cmd() -> impl Parser<FrpcCmd> {
 }
 
 fn verify_cmd() -> impl Parser<FrpcCmd> {
-    let config = long("config").short('c').argument::<String>("FILE");
+    // `-c` is required here and last-wins on repetition — see [`config_arg`].
+    let config = config_arg();
     // Go frp v0.71.0 pflag bool semantics (same as run/reload): `strict_config`
     // is a persistent rootCmd flag (default true), so `verify` inherits it —
     // bare `--strict-config` → true, `--strict-config=false` → false, absent →
@@ -1256,10 +1280,8 @@ fn verify_cmd() -> impl Parser<FrpcCmd> {
 }
 
 fn reload_cmd() -> impl Parser<FrpcCmd> {
-    let config = long("config")
-        .short('c')
-        .argument::<String>("FILE")
-        .optional();
+    // Last-wins on repetition; still optional here — see [`config_arg`].
+    let config = config_arg().optional();
     // Go frp v0.71.0 pflag bool semantics: `--strict_config` is a
     // *persistent* rootCmd flag (default true), so the reload subcommand
     // inherits the run-mode semantics — bare `--strict-config` → true,
@@ -1312,10 +1334,8 @@ fn reload_cmd() -> impl Parser<FrpcCmd> {
 }
 
 fn status_cmd() -> impl Parser<FrpcCmd> {
-    let config = long("config")
-        .short('c')
-        .argument::<String>("FILE")
-        .optional();
+    // Last-wins on repetition; still optional here — see [`config_arg`].
+    let config = config_arg().optional();
     // Go frp v0.71.0: `--strict-config` is a *persistent* rootCmd flag
     // (default true) inherited by every subcommand, `status` included — probe:
     // `frpc status --strict-config=false -c bad.toml` is accepted and tolerates
@@ -1367,10 +1387,8 @@ fn status_cmd() -> impl Parser<FrpcCmd> {
 /// the short text `Stop the running frpc`, the same config load / port refusal
 /// as the other two admin commands, and the same `--api-timeout` flag.
 fn stop_cmd() -> impl Parser<FrpcCmd> {
-    let config = long("config")
-        .short('c')
-        .argument::<String>("FILE")
-        .optional();
+    // Last-wins on repetition; still optional here — see [`config_arg`].
+    let config = config_arg().optional();
     // Same persistent-rootCmd-flag semantics as reload/status: bare
     // `--strict-config` → true, `--strict-config=false` → false, absent → true.
     // (The space-separated form `--strict-config false` → false is an frp-rs
@@ -1757,6 +1775,20 @@ mod tests {
         }
     }
 
+    fn parse_frpc_status(args: &[&str]) -> Result<StatusArgs, bpaf::ParseFailure> {
+        match frpc_parser().to_options().run_inner(args)? {
+            FrpcCmd::Status(a) => Ok(a),
+            other => panic!("expected status command, got {other:?}"),
+        }
+    }
+
+    fn parse_frpc_stop(args: &[&str]) -> Result<StopArgs, bpaf::ParseFailure> {
+        match frpc_parser().to_options().run_inner(args)? {
+            FrpcCmd::Stop(a) => Ok(a),
+            other => panic!("expected stop command, got {other:?}"),
+        }
+    }
+
     #[test]
     fn strict_config_defaults_to_true() {
         assert!(parse_frps(&[]).unwrap().strict_config);
@@ -1963,20 +1995,6 @@ mod tests {
     }
 
     // ── frpc stop / --api-timeout ───────────────────────────────────────
-
-    fn parse_frpc_status(args: &[&str]) -> Result<StatusArgs, bpaf::ParseFailure> {
-        match frpc_parser().to_options().run_inner(args)? {
-            FrpcCmd::Status(a) => Ok(a),
-            other => panic!("expected status command, got {other:?}"),
-        }
-    }
-
-    fn parse_frpc_stop(args: &[&str]) -> Result<StopArgs, bpaf::ParseFailure> {
-        match frpc_parser().to_options().run_inner(args)? {
-            FrpcCmd::Stop(a) => Ok(a),
-            other => panic!("expected stop command, got {other:?}"),
-        }
-    }
 
     /// Parse `argv` (a whole admin-subcommand invocation) and return its
     /// `--api-timeout`, so a grammar case can be pinned on all three
@@ -2229,6 +2247,102 @@ mod tests {
             bpaf::ParseFailure::Stdout(doc, _) => {
                 let text = doc.to_string();
                 assert!(text.contains("Stop the running frpc"), "help={text}");
+            }
+            other => panic!("expected help on stdout, got {other:?}"),
+        }
+    }
+
+    // ── `-c`/`--config` is last-wins, like Go's pflag StringVarP ──────────
+    //
+    // Go registers `-c` with `StringVarP` inside `func init()`
+    // (`cmd/frpc/sub/root.go`), so a repeated flag is never an error and the
+    // last value wins. Measured on Go v0.71.0 darwin/arm64:
+    // `frpc status -c noweb.toml -c p7499.toml` dials `127.0.0.1:7499` and
+    // `-c p7499.toml -c noweb.toml` prints Go's port refusal (see
+    // `frpc/tests/cli_inputs.rs` for the end-to-end form). bpaf failed the
+    // second occurrence with
+    // ``argument `-c` cannot be used multiple times in this context`` before
+    // every frpc parser was routed through `config_arg`.
+
+    #[test]
+    fn run_mode_config_is_last_wins() {
+        let args = parse_frpc_run(&["-c", "a.toml", "-c", "b.toml"]).unwrap();
+        assert_eq!(args.config, "b.toml");
+        // Mixed spellings are the same pflag variable.
+        let args = parse_frpc_run(&["--config", "a.toml", "-c", "b.toml"]).unwrap();
+        assert_eq!(args.config, "b.toml");
+        // Three occurrences: still the last.
+        let args = parse_frpc_run(&["-c", "a.toml", "-c", "b.toml", "-c", "c.toml"]).unwrap();
+        assert_eq!(args.config, "c.toml");
+        // Absent keeps the frp-rs default; one occurrence is unchanged.
+        assert_eq!(parse_frpc_run(&[]).unwrap().config, "frpc.toml");
+        assert_eq!(
+            parse_frpc_run(&["-c", "only.toml"]).unwrap().config,
+            "only.toml"
+        );
+        // The flag still needs a value.
+        assert!(parse_frpc_run(&["-c"]).is_err());
+    }
+
+    #[test]
+    fn verify_config_is_last_wins_and_still_required() {
+        let args = parse_frpc_verify(&["verify", "-c", "a.toml", "-c", "b.toml"]).unwrap();
+        assert_eq!(args.config, "b.toml");
+        assert_eq!(
+            parse_frpc_verify(&["verify", "-c", "only.toml"])
+                .unwrap()
+                .config,
+            "only.toml"
+        );
+        // No fallback here: `verify` refuses a missing `-c`, as before.
+        assert!(parse_frpc_verify(&["verify"]).is_err());
+        assert!(parse_frpc_verify(&["verify", "-c"]).is_err());
+    }
+
+    #[test]
+    fn admin_config_is_last_wins_and_still_optional() {
+        // The subcommand name is part of the argv: without it bpaf falls back
+        // to run mode (the last branch of the `construct!` alternation).
+        let args = parse_frpc_reload(&["reload", "-c", "a.toml", "-c", "b.toml"]).unwrap();
+        assert_eq!(args.config.as_deref(), Some("b.toml"));
+        let args = parse_frpc_status(&["status", "-c", "a.toml", "-c", "b.toml"]).unwrap();
+        assert_eq!(args.config.as_deref(), Some("b.toml"));
+        let args = parse_frpc_stop(&["stop", "-c", "a.toml", "-c", "b.toml"]).unwrap();
+        assert_eq!(args.config.as_deref(), Some("b.toml"));
+        // Absent stays `None` for all three (the frp-rs `127.0.0.1:7400`
+        // default path, a recorded divergence).
+        assert_eq!(parse_frpc_reload(&["reload"]).unwrap().config, None);
+        assert_eq!(parse_frpc_status(&["status"]).unwrap().config, None);
+        assert_eq!(parse_frpc_stop(&["stop"]).unwrap().config, None);
+        assert!(parse_frpc_reload(&["reload", "-c"]).is_err());
+        assert!(parse_frpc_status(&["status", "-c"]).is_err());
+        assert!(parse_frpc_stop(&["stop", "-c"]).is_err());
+    }
+
+    #[test]
+    fn config_help_says_the_flag_may_repeat() {
+        // bpaf renders `last()` as a repeatable option (`-c=FILE...`), which is
+        // accurate for pflag. Pinned so the help cannot drift back to a
+        // single-use spelling while the parser stays last-wins.
+        let failure = frpc_parser()
+            .to_options()
+            .run_inner(&["--help"][..])
+            .expect_err("--help is reported as a ParseFailure");
+        match failure {
+            bpaf::ParseFailure::Stdout(doc, _) => {
+                let text = doc.to_string();
+                assert!(text.contains("[-c=FILE...]"), "help={text}");
+            }
+            other => panic!("expected help on stdout, got {other:?}"),
+        }
+        let failure = frpc_parser()
+            .to_options()
+            .run_inner(&["verify", "--help"][..])
+            .expect_err("verify --help is reported as a ParseFailure");
+        match failure {
+            bpaf::ParseFailure::Stdout(doc, _) => {
+                let text = doc.to_string();
+                assert!(text.contains("verify -c=FILE..."), "help={text}");
             }
             other => panic!("expected help on stdout, got {other:?}"),
         }
