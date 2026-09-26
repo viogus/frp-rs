@@ -120,7 +120,11 @@ User-facing release notes for frp-rs.
   also bound the client's own `[webServer]` admin listener on the empty host.
   Only the empty string is completed: `" "`, `"0.0.0.0"`, `"::1"` and
   `"localhost"` are still passed through to the dialer verbatim, as in Go.
-  `frps` is unaffected (its own completion re-defaults a set port to `0.0.0.0`).
+  `frps` is unchanged by this release, and its own completion is a **recorded
+  divergence, not parity**: frp-rs re-defaults a set port to `0.0.0.0`, while
+  Go's equivalent branch is dead (its address was already completed to
+  `127.0.0.1` first), so an empty `[webServer] addr` leaves Go listening on
+  `127.0.0.1` and frp-rs on every interface. Tracked in `TODO.md`.
 - **`frp-server` builds with only the `dashboard` feature compile again.** A
   downstream workspace (or `cargo check -p frp-server --no-default-features
   --features dashboard --all-targets`) that had frp-core's `oidc` on while
