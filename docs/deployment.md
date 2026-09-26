@@ -694,10 +694,15 @@ are accepted, and here that is Go parity rather than an frp-rs extension: Go's
 (`rootCmd.SetGlobalNormalizationFunc`, `cmd/frpc/sub/root.go`), so its flags
 accept the underscore spelling too (measured for `--api_timeout` and
 `--strict_config`; `--admin_addr` is `unknown flag` because no such flag exists
-there). One placement difference remains: Go's cobra also accepts the flag before
-the subcommand (`frpc --api-timeout 1s stop …`, measured), while frp-rs requires
-the subcommand word first — the pre-existing rule for every subcommand flag,
-unchanged here.
+there). The one placement difference that used to remain here — Go's cobra also
+accepts the flag **before** the subcommand (`frpc --api-timeout 1s stop …`) —
+is gone: the shared `frpc` hoist (`frp-core/src/cli.rs`, `TODO.md:2566`) now
+resolves a leading subcommand after root flags, so that argv dials the admin port
+on both binaries and both stop at the 1 s deadline (measured on Go v0.71.0 and
+this branch: rc 1, one connection, Go `Post "…/api/stop": context deadline
+exceeded`, frp-rs `stop failed: admin request timed out after 1s`). The pin in
+`frpc/tests/admin_cli.rs::api_timeout_before_the_subcommand_reaches_the_command`
+asserts the connection now.
 
 Four further differences remain in this flag's surface — none of them in the
 accepted-value grammar or in the call itself. (1) A rejected value

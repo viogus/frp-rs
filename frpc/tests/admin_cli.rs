@@ -863,12 +863,15 @@ fn stop_bad_api_timeout_is_rejected_before_any_connection() {
     );
 }
 
-/// frp-rs's placement rule (subcommand word first, unchanged by this work):
-/// Go's cobra also accepts a root-level `frpc --api-timeout 1s stop …`
-/// (measured on v0.71.0), which frp-rs refuses — a pre-existing divergence,
-/// pinned here so it cannot silently change.
+/// The placement rule is now Go's: cobra resolves a subcommand that follows
+/// leading root flags, so `frpc --api-timeout 1s stop …` runs `stop` with the
+/// flag (measured on Go v0.71.0: one connection to the admin port, then
+/// `Post "…/api/stop": context deadline exceeded`, rc 1). frp-rs's shared
+/// `frpc` hoist (`frp-core/src/cli.rs`, `TODO.md:2566`) resolves the same way,
+/// so the flag is *used* here and the deadline is what the rc reflects — this
+/// test used to pin the refusal as a divergence and now pins the connection.
 #[test]
-fn api_timeout_before_the_subcommand_is_refused_and_does_not_connect() {
+fn api_timeout_before_the_subcommand_reaches_the_command() {
     let dir = TempDir::new();
     let (listener, port) = oracle_listener();
     let cfg = config_for_port(&dir, port);
@@ -876,7 +879,16 @@ fn api_timeout_before_the_subcommand_is_refused_and_does_not_connect() {
     let out = run_frpc(&["--api-timeout=1s", "stop", "-c", &cfg]);
 
     assert_eq!(exit_code(&out), 1, "stderr={:?}", stderr_of(&out));
-    assert_eq!(connections_after_exit(&listener), 0);
+    let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        text.contains("admin request timed out"),
+        "the 1s --api-timeout must be applied by the stop command: {text:?}"
+    );
+    assert_eq!(
+        connections_after_exit(&listener),
+        1,
+        "the resolved stop command must dial the admin port"
+    );
 }
 
 #[test]

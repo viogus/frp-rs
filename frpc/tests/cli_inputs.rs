@@ -269,6 +269,74 @@ fn connections_after_exit(listener: &TcpListener) -> usize {
     count
 }
 
+/// A canary listener that accepts and immediately closes: enough to prove
+/// *which port* a single-proxy child dialled, since a closed socket makes the
+/// child exit at once instead of waiting out its login retry. Same shape as the
+/// helper in `cli_persistent_flags.rs`.
+struct Canary {
+    port: u16,
+    rx: mpsc::Receiver<()>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+fn canary() -> Canary {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind canary");
+    let port = listener.local_addr().expect("canary addr").port();
+    listener.set_nonblocking(true).expect("canary non-blocking");
+    let (tx, rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let handle = std::thread::spawn(move || {
+        while !thread_stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = tx.send(());
+                    drop(stream);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    Canary {
+        port,
+        rx,
+        stop,
+        handle,
+    }
+}
+
+impl Canary {
+    /// The child reached this listener exactly `expected` times.
+    fn assert_hits(self, expected: usize, context: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut hits = 0;
+        while hits < expected {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || self.rx.recv_timeout(left).is_err() {
+                break;
+            }
+            hits += 1;
+        }
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.handle.join().expect("canary thread");
+        assert_eq!(
+            hits, expected,
+            "{context}: expected {expected} connection(s) on canary port {}, saw {hits}",
+            self.port
+        );
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
 fn stdout_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
@@ -1108,4 +1176,424 @@ fn space_form_warning_fires_on_each_frpc_parser() {
             stderr_of(&out)
         );
     }
+}
+
+// ── a subcommand after leading root flags (`TODO.md:2566`) ──────────────────
+//
+// Go's cobra resolves a command that follows leading root flags: `Find`
+// (`cobra-1.8.0/command.go`) strips flags from argv and looks at the first
+// surviving bare word, so `frpc -c pA.toml status` runs the `status` command
+// with `pA.toml` as its config and dials the `[webServer] port` in it. bpaf
+// picks the run-mode branch before dispatch, so that argv used to fall through
+// to run mode and answer ``Error: no such command or positional: `status`,
+// did you mean `https`?`` (rc 1). `hoist_leading_subcommand` in
+// `frp-core/src/cli.rs` now moves that token in front of bpaf.
+//
+// Every Go cell below was measured on the official `frp_0.71.0_darwin_arm64`
+// binary and the frp-rs `frpc` at this branch's base (`5b9a084`, the "before"
+// column) and head, with the mock's port written into the config the argv
+// names. The measuring harness and the full 45-row table are recorded in
+// `docs/developing.md` § CLI inputs.
+
+/// Config whose `[webServer] port` is `port`; the client server target is
+/// unused by the admin commands and refused at once by the kernel.
+fn admin_config(dir: &TempDir, name: &str, port: u16) -> String {
+    dir.config(
+        name,
+        &format!(
+            "serverAddr = \"127.0.0.1\"\nserverPort = 1\n[webServer]\naddr = \"127.0.0.1\"\nport = {port}\n"
+        ),
+    )
+}
+
+#[test]
+fn subcommand_after_leading_root_flags_reaches_that_command() {
+    // The item's flag orders, each in its own test so no test has to share a
+    // one-shot listener: the subcommand token follows one, two and three
+    // leading root flags, and a `-c <cfg>` sits between the flag and the token
+    // in one row and before it in another. Go resolves all three to `status`
+    // (measured); each must dial this config's admin port.
+    let orders: [&[&str]; 4] = [
+        &["-c", "CFG", "status"],
+        &["--strict-config=false", "status", "-c", "CFG"],
+        &["-c", "CFG", "--strict-config=false", "status"],
+        &[
+            "--strict-config=false",
+            "--allow-unsafe",
+            "TokenSourceExec",
+            "-c",
+            "CFG",
+            "status",
+        ],
+    ];
+    for order in orders {
+        let dir = TempDir::new();
+        let (port, rx, handle) = mock_admin("HTTP/1.1 200 OK");
+        let cfg = admin_config(&dir, "led.toml", port);
+        let argv: Vec<String> = order
+            .iter()
+            .map(|a| {
+                if *a == "CFG" {
+                    cfg.clone()
+                } else {
+                    (*a).to_string()
+                }
+            })
+            .collect();
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+
+        let out = run_frpc(&refs);
+
+        // `captured_request` panics if no request arrived, which is the failure
+        // a run-mode fallback produces (it never dials `[webServer].port`).
+        let captured = captured_request(rx, handle);
+        assert_eq!(
+            exit_code(&out),
+            0,
+            "{refs:?} must dial the config's admin port: stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out)
+        );
+        assert!(
+            captured.head.starts_with("GET /api/status HTTP/1.1\r\n"),
+            "{refs:?} must run the status command: head={:?}",
+            captured.head
+        );
+    }
+}
+
+/// Like [`run_frpc`], but for a child expected to *fail a parse*: the same
+/// bounded-then-killed collection, with a timeout short enough that a dropped
+/// subcommand (whose fallback would wait on the network instead of exiting)
+/// fails the test rather than the suite's wall clock.
+fn run_frpc_brief(args: &[&str]) -> Output {
+    let mut child = Command::new(BIN)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn frpc");
+    if wait_with_timeout(&mut child, Duration::from_secs(5)).is_none() {
+        let _ = child.kill();
+        let out = child.wait_with_output().expect("collect timed-out child");
+        panic!(
+            "frpc {args:?} did not exit within 5s (a dropped subcommand would fall through to run mode); stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    child.wait_with_output().expect("collect frpc output")
+}
+
+#[test]
+fn subcommand_after_leading_root_flags_dials_the_named_config() {
+    // The item's first row, in the shape the report tables it: `status` follows
+    // `-c <cfg>`. Pinned on the request the mock received, which is what proves
+    // the `status` branch ran with the config's port rather than run mode.
+    let dir = TempDir::new();
+    let (port, rx, handle) = mock_admin("HTTP/1.1 200 OK");
+    let cfg = admin_config(&dir, "pA.toml", port);
+
+    let out = run_frpc(&["-c", &cfg, "status"]);
+
+    let captured = captured_request(rx, handle);
+    assert_eq!(
+        exit_code(&out),
+        0,
+        "stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert!(
+        captured.head.starts_with("GET /api/status HTTP/1.1\r\n"),
+        "head={:?}",
+        captured.head
+    );
+    assert!(
+        captured.head.contains(&format!("Host: 127.0.0.1:{port}")),
+        "the config's port must be the one dialled; head={:?}",
+        captured.head
+    );
+}
+
+#[test]
+fn subcommand_after_leading_root_flags_runs_a_single_proxy() {
+    // The item's third row: `-c <missing>.toml tcp …` starts the tcp proxy on
+    // Go even though the config does not exist (the single-proxy branch never
+    // reads it). The canary accepts and closes, so the child exits at once; its
+    // hit is the evidence the branch ran.
+    let dir = TempDir::new();
+    let missing = dir.config("missing.toml", "not even TOML\n");
+    std::fs::remove_file(&missing).expect("remove the config so it is genuinely missing");
+    let canary = canary();
+    let port = canary.port().to_string();
+
+    let out = run_frpc(&[
+        "-c",
+        &missing,
+        "tcp",
+        "--local-port",
+        "5",
+        "--remote-port",
+        "6",
+        "--proxy-name",
+        "x",
+        "--server-port",
+        &port,
+    ]);
+
+    canary.assert_hits(1, "the hoisted tcp branch must dial --server-port");
+    let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        !text.contains("no such command or positional"),
+        "the tcp token must be resolved, not refused: {text:?}"
+    );
+    assert!(
+        text.contains("starting single proxy"),
+        "the single-proxy path must run: {text:?}"
+    );
+}
+
+#[test]
+fn attached_and_repeated_config_spellings_still_resolve_the_hoisted_subcommand() {
+    // The same rule has to survive pflag's `=`/attached spellings and a
+    // repeated flag, all measured on Go: each dials the mock.
+    let dir = TempDir::new();
+    let (port, rx, handle) = mock_admin("HTTP/1.1 200 OK");
+    let cfg = admin_config(&dir, "att.toml", port);
+    let attached = format!("-c={cfg}");
+    let short_attached = format!("-c{cfg}");
+
+    let rows: [Vec<&str>; 3] = [
+        vec![&attached, "status"],
+        vec![&short_attached, "status"],
+        vec!["-c", &cfg, &attached, "status"],
+    ];
+    // One mock answers one request; the first row consumes it. Assert the
+    // first (attached `-c=`) and let the remaining rows be covered by the
+    // parser-level pins in `frp-core/src/cli.rs`, which cannot exhaust a
+    // listener.
+    let out = run_frpc(&rows[0]);
+    let captured = captured_request(rx, handle);
+    assert_eq!(exit_code(&out), 0, "stderr={:?}", stderr_of(&out));
+    assert!(captured.head.starts_with("GET /api/status HTTP/1.1\r\n"));
+
+    // The parser half of the other two rows, without a listener: both must
+    // resolve the status command and never run mode.
+    for argv in [&rows[1], &rows[2]] {
+        let out = run_frpc(argv);
+        let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(
+            !text.contains("no such command or positional"),
+            "{argv:?} must not fall back to run mode: {text:?}"
+        );
+        assert!(
+            !text.contains("connecting to"),
+            "{argv:?} must not start run mode's service: {text:?}"
+        );
+    }
+}
+
+#[test]
+fn a_config_file_named_after_a_subcommand_stays_a_config_file() {
+    // The value-position trap: `-c status` is a config file literally named
+    // `status`, not the `status` command. Go loads it in run mode (measured:
+    // `start frpc service for config file […/status]`), never the admin command;
+    // frp-rs must do the same, so no mock admin can be reached.
+    let dir = TempDir::new();
+    let (port, rx, handle) = mock_admin("HTTP/1.1 200 OK");
+    let cfg = admin_config(&dir, "status", port);
+
+    for argv in [
+        vec!["-c", cfg.as_str()],
+        vec!["--config", cfg.as_str()],
+        vec![&format!("--config={cfg}")],
+        vec![&format!("-c={cfg}")],
+        vec![&format!("-c{cfg}")],
+    ] {
+        let out = run_frpc_brief(&argv);
+        assert_ne!(
+            exit_code(&out),
+            0,
+            "{argv:?} is run mode against a config whose server port refuses"
+        );
+        let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        // The config the argv names is what run mode loaded: its server target
+        // (`serverPort = 1`, refused at once) is the only port the child
+        // dials, and the status command would have dialled the mock's instead.
+        // The log fields are ANSI-wrapped at every token boundary, so the
+        // assertion is on the refused *server* port the config names, which no
+        // admin command would ever dial (the admin path would show the mock's
+        // port and the status output instead).
+        assert!(
+            text.contains("dial to 127.0.0.1:1") || text.contains("connect to 127.0.0.1:1"),
+            "{argv:?} must load the config named `status` and dial its server port in run mode: {text:?}"
+        );
+        assert!(
+            !text.contains(&port.to_string()),
+            "{argv:?} must not reach the config's admin port: {text:?}"
+        );
+        assert!(
+            !text.contains("Proxy Status") && !text.contains("NAME  TYPE"),
+            "{argv:?} must not run the status command: {text:?}"
+        );
+    }
+    // Nothing reached the admin mock: the port belonged to run mode's
+    // `[webServer]`, which frp-rs never dialled (it binds it, and this run
+    // ended on the refused server port first).
+    assert!(
+        rx.try_recv().is_err(),
+        "the admin listener must stay silent for a config file named `status`"
+    );
+    // The mock thread is parked in `accept` and nothing will ever connect, so
+    // its handle is dropped rather than joined (a `join` here would block the
+    // harness forever). Dropping the handle detaches it; the thread exits when
+    // the test's listener is dropped at the end of the function.
+    drop(handle);
+}
+
+#[test]
+fn a_flag_value_named_after_a_subcommand_is_still_a_value() {
+    // `--proxy-name status` is a value; only the leading word can be a command.
+    // Measured on Go: `tcp --proxy-name status …` starts the tcp proxy.
+    let canary = canary();
+    let port = canary.port().to_string();
+
+    let out = run_frpc(&[
+        "tcp",
+        "--proxy-name",
+        "status",
+        "--local-port",
+        "5",
+        "--remote-port",
+        "6",
+        "--server-port",
+        &port,
+    ]);
+
+    canary.assert_hits(1, "the proxy named `status` must still start");
+    let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        text.contains("starting single proxy"),
+        "the tcp branch must run: {text:?}"
+    );
+}
+
+#[test]
+fn a_word_that_is_not_a_command_is_refused_even_when_a_command_follows() {
+    // Go refuses the *first* bare word (`unknown command "notacommand" for
+    // "frpc"`, measured) even when a real command name follows it, so the hoist
+    // must stay out of this argv entirely.
+    let dir = TempDir::new();
+    let cfg = dir.config("plain.toml", "serverAddr = \"127.0.0.1\"\nserverPort = 1\n");
+    let out = run_frpc_brief(&["-c", &cfg, "notacommand", "status"]);
+    let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        text.contains("notacommand"),
+        "the first bare word must be the one refused: {text:?}"
+    );
+    assert!(
+        !text.contains("Proxy Status"),
+        "the later `status` word must not be hoisted: {text:?}"
+    );
+    assert_ne!(exit_code(&out), 0);
+}
+
+#[test]
+fn a_real_double_dash_still_stops_the_hoist() {
+    // Go treats everything after a real `--` as a positional: measured,
+    // `frpc -c <cfg> -- status` starts the client in run mode and never dials
+    // `[webServer].port`. frp-rs refuses the leftover positional (the recorded
+    // positional divergence), but it must not turn it into the status command.
+    let dir = TempDir::new();
+    let (port, rx, handle) = mock_admin("HTTP/1.1 200 OK");
+    let cfg = admin_config(&dir, "dd.toml", port);
+
+    let out = run_frpc_brief(&["-c", &cfg, "--", "status"]);
+
+    assert_ne!(exit_code(&out), 0, "the positional must be refused");
+    let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        text.contains("status"),
+        "the refused token must be named: {text:?}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "`-- status` must not reach the admin port"
+    );
+    // Parked in `accept` with nothing coming: drop rather than join (see
+    // `a_config_file_named_after_a_subcommand_stays_a_config_file`).
+    drop(handle);
+}
+
+#[test]
+fn a_dash_prefixed_config_value_stays_the_config_value() {
+    // `-c -status`: pflag gives `-c` the value `-status` (Go: `open -status: no
+    // such file or directory`), so the token is a value and not a command. The
+    // shared dash-value rewrite may attach it (`-c=-status`) — either way the
+    // load error must name `-status`.
+    let dir = TempDir::new();
+    for argv in [vec!["-c", "-status"], vec!["--config", "--status"]] {
+        let out = run_frpc_brief(&argv);
+        assert_eq!(exit_code(&out), 1, "{argv:?} must fail on the load");
+        let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        let token = if argv[0] == "-c" {
+            "-status"
+        } else {
+            "--status"
+        };
+        assert!(
+            text.contains(token),
+            "{argv:?} must try to read {token}: {text:?}"
+        );
+        assert!(
+            !text.contains("no such command or positional"),
+            "{argv:?} must not be a leftover-token refusal: {text:?}"
+        );
+    }
+    let _ = dir;
+}
+
+#[test]
+fn the_existing_frpc_order_is_unchanged() {
+    // frp-rs's own `frpc <subcommand> [flags]` order keeps working, hoisted or
+    // not: the same argv with the subcommand already leading must dial the same
+    // mock port.
+    let dir = TempDir::new();
+    let (port, rx, handle) = mock_admin("HTTP/1.1 200 OK");
+    let cfg = admin_config(&dir, "order.toml", port);
+
+    let out = run_frpc(&["status", "-c", &cfg]);
+
+    let captured = captured_request(rx, handle);
+    assert_eq!(exit_code(&out), 0, "stderr={:?}", stderr_of(&out));
+    assert!(captured.head.starts_with("GET /api/status HTTP/1.1\r\n"));
+    assert!(captured.head.contains(&format!("Host: 127.0.0.1:{port}")));
+}
+
+#[test]
+fn the_hoisted_subcommand_dials_the_same_port_as_the_unhoisted_order() {
+    // The strongest equivalence available without a second mock in flight: the
+    // hoisted `-c <cfg> status` and the already-leading `status -c <cfg>` argv
+    // must produce the identical request head against the same config. Two
+    // one-shot mocks, one per order, same config file.
+    let dir = TempDir::new();
+    let (port_a, rx_a, handle_a) = mock_admin("HTTP/1.1 200 OK");
+    let cfg = admin_config(&dir, "same.toml", port_a);
+    let first = run_frpc(&["-c", &cfg, "status"]);
+    let captured_a = captured_request(rx_a, handle_a);
+    assert_eq!(exit_code(&first), 0, "stderr={:?}", stderr_of(&first));
+
+    let (port_b, rx_b, handle_b) = mock_admin("HTTP/1.1 200 OK");
+    let cfg_b = admin_config(&dir, "same-b.toml", port_b);
+    let second = run_frpc(&["status", "-c", &cfg_b]);
+    let captured_b = captured_request(rx_b, handle_b);
+    assert_eq!(exit_code(&second), 0, "stderr={:?}", stderr_of(&second));
+
+    let norm = |head: &str, port: u16| head.replace(&port.to_string(), "<port>");
+    assert_eq!(
+        norm(&captured_a.head, port_a),
+        norm(&captured_b.head, port_b),
+        "the hoisted and unhoisted orders must send the same request"
+    );
 }
