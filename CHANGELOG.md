@@ -20,20 +20,26 @@ User-facing release notes for frp-rs.
   negative value is accepted and means the deadline has already passed).
 
 ### Changed
-- **A CLI config or flag failure now exits 1, not 2 — a behaviour change.**
-  `frpc -c bad.toml`, `frpc verify -c bad.toml` and `frps -c bad.toml` (and
-  their missing-file / unparsable-field / invalid-`--strict-config` variants)
-  exited `2` (`EXIT_CONFIG`), while the admin subcommands
+- **A CLI config failure now exits 1, not 2 — a behaviour change.**
+  `frpc -c <bad or missing or unparsable>`, `frpc verify -c <…>` and
+  `frps -c <…>` exited `2` (`EXIT_CONFIG`), while the admin subcommands
   (`frpc reload`/`status`/`stop`) already exited `1` for the identical load
   error. Go frp v0.71.0 exits `1` on every one of those, so the per-class code
-  is gone and the paths now agree. `--config-dir` mode keeps its non-zero
-  exit: Go's own directory mode exits **0** even for a missing, empty or
-  invalid directory — a silent success frp-rs does not adopt — and that
-  divergence is stated in `docs/developing.md` § CLI exit codes. The unused
+  is gone and the paths now agree. (An invalid `--strict-config` value was
+  already `1` at the base — only its message differs from Go's.) The unused
   `frp_core::Error::exit_code()` mapping was removed with it, and the remaining
-  `3`/`4` codes (daemon service-construction failures) are now documented as
-  frp-rs extensions with no Go counterpart, tracked in `TODO.md`. Scripts that
-  branched on `2` should branch on `1`.
+  `3`/`4` codes (service-construction failures: an unresolvable
+  `auth.tokenSource`, or a malformed `[store]` file — Go exits `1` on both) are
+  now documented as frp-rs extensions with no Go counterpart, tracked in
+  `TODO.md`.
+- **`--config-dir` mode keeps its own refusal code — unchanged, and a
+  divergence.** A directory that does not exist, is empty, or holds a config
+  that fails to parse still exits **2** on the frp-rs side, where Go's own
+  directory mode exits **0** for all three (a silent success frp-rs does not
+  adopt; it is the only thing in the CLI that still exits 2). The divergence and
+  its reason are stated in `docs/developing.md` § CLI exit codes, and it is
+  pinned by a test. Scripts that branched on a config failure should branch on
+  `1`; a `--config-dir` refusal is the one case still on `2`.
 - **A build without the `oidc` feature now refuses `auth.method = "oidc"` — a
   behaviour change.** `frps-tiny` / `frpc-tiny` (and any build compiled
   without the `oidc` feature) previously fell through to `Token`, so a config

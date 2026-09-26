@@ -186,7 +186,11 @@ fn good_config_starts_and_exits_0_on_sigterm() {
         .spawn()
         .expect("spawn frps");
 
-    let read_log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    // `expect`, not `unwrap_or_default`: this reader only ever runs inside a
+    // panic message, and swallowing a read error there would replace a real
+    // diagnosis with an empty string. A read failure means the child wrote
+    // nothing or the path is wrong — both are findings.
+    let read_log = || std::fs::read_to_string(&log_path).expect("read frps diagnostic log");
 
     // Wait until the bind port accepts a connection. It is not enough to sleep:
     // the SIGTERM handler is installed only after the service has bound its

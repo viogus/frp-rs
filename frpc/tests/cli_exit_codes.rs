@@ -19,18 +19,28 @@
 //! fails to parse, and frp-rs keeps its non-zero refusal. See
 //! `docs/developing.md` § CLI exit codes.
 //!
+//! Two further tests pin the *extension* codes on the client:
+//! `unresolvable_token_source_exits_3_like_frps` (`EXIT_AUTH`/3 — the same
+//! input makes Go exit 1, see `docs/developing.md`) and
+//! `malformed_store_file_exits_4_where_go_exits_1` (`EXIT_BIND`/4, which is the
+//! fallback for any construction error whose text lacks `token`/`auth`).
+//!
 //! Gated on `full`: the `frpc` bin carries `required-features = ["full"]`, so
 //! without the gate this file's `CARGO_BIN_EXE_frpc` would fail to compile in
-//! the no-default-features lanes CI runs.
+//! the no-default-features lanes CI runs. The `tiny` gate at the end is the
+//! same pin for the `frpc-tiny` variant, which the `full` gate cannot cover.
 
-#![cfg(feature = "full")]
+#![cfg(any(feature = "full", feature = "tiny"))]
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+#[cfg(feature = "full")]
 const BIN: &str = env!("CARGO_BIN_EXE_frpc");
+#[cfg(all(feature = "tiny", not(feature = "full")))]
+const BIN: &str = env!("CARGO_BIN_EXE_frpc-tiny");
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const BASE_CONFIG: &str = "serverAddr = \"127.0.0.1\"\nserverPort = 7000\n";
 const BAD_CONFIG: &str = "serverAddr = \"127.0.0.1\"\nserverPort = 7000\nnotAKnownFrpKey = 1\n";
@@ -243,6 +253,136 @@ fn config_dir_refusals_exit_2_where_go_exits_0() {
             Some(2),
             "--config-dir with a {label} directory must exit 2 (frp-rs refusal; Go exits 0); \
              stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+    }
+}
+
+// ── the extension codes: 3 (auth) and 4 (the construction fallback) ─────────
+
+/// `EXIT_AUTH`/3, pinned on the one input where it is a *genuine* divergence
+/// rather than a hardening refusal: a `auth.tokenSource` whose file does not
+/// exist. Go frp v0.71.0 exits **1** here (`failed to resolve auth.tokenSource:
+/// failed to read file …`), frp-rs exits **3**.
+///
+/// The tokenless-token case (`[auth] method = "token"` with an empty token) is
+/// *not* a code divergence at all: Go frps starts and keeps running there while
+/// frp-rs refuses at construction with 3 — see `docs/developing.md`.
+#[test]
+fn unresolvable_token_source_exits_3_where_go_exits_1() {
+    let dir = TempDir::new();
+    let missing = dir.path("no-such-token-file");
+    let cfg = dir.write(
+        "badsource.toml",
+        &format!(
+            "{BASE_CONFIG}[auth]\nmethod = \"token\"\n\
+             tokenSource = {{ type = \"file\", file = {{ path = \"{missing}\" }} }}\n"
+        ),
+    );
+
+    let out = run_frpc(&["-c", &cfg]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "an unresolvable tokenSource is the frp-rs EXIT_AUTH/3 extension (Go exits 1); \
+         stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        all.contains("tokenSource"),
+        "the refusal must name tokenSource, got stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
+/// `EXIT_BIND`/4 is **not** specifically about bind errors: it is the daemons'
+/// fallback for any service-*construction* error whose text lacks `token` or
+/// `auth`. A `[store] path` pointing at a file that is not JSON reaches it
+/// without any port or token being involved.
+///
+/// Go frp v0.71.0 exits **1** on the identical config (`failed to create store
+/// source: failed to load existing data: failed to parse JSON: …`), so this is
+/// an frp-rs extension like 3. The `name` of this test is the finding: 4 is the
+/// construction fallback, and `docs/developing.md` now says so.
+#[test]
+fn malformed_store_file_exits_4_where_go_exits_1() {
+    let dir = TempDir::new();
+    let store = dir.write("badstore.json", "this is not json\n");
+    let cfg = dir.write(
+        "badstore.toml",
+        &format!("{BASE_CONFIG}[store]\npath = \"{store}\"\n"),
+    );
+
+    let out = run_frpc(&["-c", &cfg]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "a malformed [store] file is the frp-rs EXIT_BIND/4 fallback (Go exits 1); \
+         stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        all.contains("badstore.json"),
+        "the refusal must name the store file, got stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
+// ── the same pin for the `tiny` tier ────────────────────────────────────────
+
+/// `frpc-tiny` includes `frpc/src/main.rs` verbatim, so the exit-code fix has
+/// to hold in the no-default-features build too — and the `full`-gated tests
+/// above cannot see it (the `frpc` bin is `required-features = ["full"]`).
+/// CI's tiny lane runs this file for that variant: the crate-level
+/// `#![cfg(any(feature = "full", feature = "tiny"))]` is what makes the file
+/// compile there at all.
+#[cfg(all(feature = "tiny", not(feature = "full")))]
+mod tiny {
+    use super::*;
+
+    #[test]
+    fn tiny_bad_config_exits_1_like_go() {
+        let dir = TempDir::new();
+        let cfg = dir.write("bad.toml", BAD_CONFIG);
+
+        let out = run_frpc(&["-c", &cfg]);
+
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "frpc-tiny -c <bad config> must exit 1 like Go; stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(
+            all.contains(UNKNOWN_FIELD),
+            "the load error must name the unknown field, got stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+    }
+
+    #[test]
+    fn tiny_verify_bad_config_exits_1_like_go() {
+        let dir = TempDir::new();
+        let cfg = dir.write("bad.toml", BAD_CONFIG);
+
+        let out = run_frpc(&["verify", "-c", &cfg]);
+
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "frpc-tiny verify -c <bad config> must exit 1 like Go; stdout={:?} stderr={:?}",
             stdout_of(&out),
             stderr_of(&out),
         );

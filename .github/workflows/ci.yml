@@ -217,6 +217,31 @@ jobs:
         # cold no-feature graph, with the integration file compiled to 0 tests.
         # The runner was not measured.
         run: cargo test -p frpc
+      - name: Run frps CLI tests (config-failure exit codes)
+        # The `frps` sibling of the step above. No lane ran a `cargo test`
+        # target of the `frps` package before this step: the two `--lib` steps
+        # restrict to lib targets, `frps` has no lib, and the `Lint` lane only
+        # *compiles* the test targets (`cargo clippy --workspace --all-targets
+        # --all-features`). So `frps/tests/cli_exit_codes.rs` — added with the
+        # CLI config-failure fix (`TODO.md:1503`) — executed in no lane, and
+        # the frps half of that fix had no executing pin.
+        #
+        # Measured warm, macOS arm64: 2.47 s wall for the package (4 tests, the
+        # SIGTERM positive control dominating). The runner was not measured.
+        run: cargo test -p frps
+      - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
+        # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag
+        # exit-code fix has to hold in the no-default-features build too — but
+        # the `full`-gated tests in the step above cannot see that binary (the
+        # `frpc` bin is `required-features = ["full"]`) and the tier lane only
+        # `cargo check`s (`Check tiny feature set compiles`), which compiles no
+        # test target at all. This runs `frpc/tests/cli_exit_codes.rs` against
+        # `CARGO_BIN_EXE_frpc-tiny`; its crate-level cfg admits `tiny` for
+        # exactly this lane.
+        #
+        # Measured warm, macOS arm64: 1.00 s wall (9 tests — the 7 `full`-tier
+        # assertions plus the 2 `tiny`-gated ones). The runner was not measured.
+        run: cargo test -p frpc --no-default-features --features tiny --test cli_exit_codes
       - name: Run frp-client's tests with no features (runtime half of frp-client's tier gate)
         # The `verify` lane's `cargo check -p frp-client --no-default-features
         # --all-targets` is compile-only: it type-checks the test targets but
