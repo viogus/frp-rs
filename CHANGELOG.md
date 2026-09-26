@@ -370,9 +370,15 @@ User-facing release notes for frp-rs.
   `[range:...]` template with `role = visitor` was misrouted to proxies (Go
   builds visitors, `pkg/config/legacy/client.go:252-285`), with the
   visitor-only keys stripped with them. `.ini` values are now read by the target
-  field's type (the inference is lossless, so `token = 007` stays `"007"`),
-  `[range:...]`'s port lists accept the split array, and a visitor template
-  builds visitors. Both of Go's shipped `conf/legacy/{frpc,frps}_legacy_full.ini`
+  field's type (the inference is lossless through both renderers, so `token = 007`
+  stays `"007"` and an extreme magnitude such as `token = 10000000000000000000`
+  or `token = 0.0000001` is passed through as the file's text instead of a
+  re-rendering like `1e+19`/`1e-7`), a slice value is split the way Go's
+  `Key.Strings(",")` does (`custom_domains = a\,b` → `["a,b"]`, a trailing empty
+  element dropped), `[range:...]`'s port lists accept the split array, and a
+  visitor template builds visitors. Go's wider legacy boolean spellings
+  (`authenticate_heartbeats = 1`/`yes`) are honoured for `.ini` only: a
+  TOML/JSON/YAML `1`/`"yes"` keeps being ignored exactly as before. Both of Go's shipped `conf/legacy/{frpc,frps}_legacy_full.ini`
   fixtures are vendored byte-identically and now load end to end — 43 proxies
   and 2 visitors for the client file, exactly the names and counts Go frpc
   v0.71.0 itself reports for it (`proxy added: […]`, `visitor added: […]`). TOML,

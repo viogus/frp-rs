@@ -25,6 +25,19 @@ Two tests use it, in `frp-core/src/config/tests.rs`:
   `frpc/tests/legacy_ini_fixture.rs` (`frpc verify -c` → rc 0, `Proxies: 43`,
   `Visitors: 2`).
 
+  The pinned counts are **config-level** — what Go's own loader reports for the
+  file. How many of those 43 a *server* actually accepts varies with the server
+  configuration and the host. Measured once on Go v0.71.0 with a frps that had
+  `vhostHTTPPort`/`vhostHTTPSPort` but no `tcpmuxHTTPConnectPort`: 38 registered,
+  and Go's own frpc log names the failures — `ssh` and `web01` fail their first
+  health check against a dead local `:22`/`:80`, one of the two https plugins
+  fails `open ./server.crt: no such file or directory` while the other hits
+  `router config conflict` (which of the two loses varies between runs), `web02`
+  is `subdomain is not supported because this feature is not enabled in server`,
+  and `tcpmuxhttpconnect` is `tcpmux with multiplexer httpconnect not supported
+  …`. So the fixture test asserts the config set, not a registration count; the
+  registered-count pin for this item is the `[range:...]` case (4 vs Go's 4).
+
 Edited copies of the file are deliberately avoided: the fixture stays
 byte-identical to upstream so a future Go release can be diffed against it
 (`cmp` against the file in the Go release tarball).

@@ -25,6 +25,8 @@ use serde::de::{
 };
 use serde_json::Value;
 
+use super::format::{parse_ini_bool, split_ini_list};
+
 /// Deserialize a parsed `.ini` config with the target type deciding how each
 /// value is read.
 pub(super) fn deserialize_ini<T: DeserializeOwned>(value: &Value) -> Result<T, serde_json::Error> {
@@ -42,53 +44,6 @@ fn ini_text(v: &Value) -> String {
         Value::Array(items) => items.iter().map(ini_text).collect::<Vec<_>>().join(","),
         Value::Null | Value::Object(_) => String::new(),
     }
-}
-
-/// Go's `ini.v1` boolean spellings — `parseBool` (`key.go:194`). Go's list is
-/// case-sensitive; `yes`/`no`/`ON` are accepted there and are *not* inferred as
-/// booleans by the lossless reader, so a `bool` field reads them through here.
-fn parse_ini_bool(s: &str) -> Option<bool> {
-    match s {
-        "1" | "t" | "T" | "true" | "TRUE" | "True" | "YES" | "yes" | "Yes" | "y" | "ON" | "on"
-        | "On" => Some(true),
-        "0" | "f" | "F" | "false" | "FALSE" | "False" | "NO" | "no" | "No" | "n" | "OFF"
-        | "off" | "Off" => Some(false),
-        _ => None,
-    }
-}
-
-/// Split a value the way Go's `Key.Strings(",")` does (`key.go:492`): on `,`,
-/// trimming each element; `\,` is a literal comma; an empty value is no
-/// elements and a trailing empty element is dropped. A slice-typed field reads
-/// a comma list that the lossless reader kept as text (because it re-renders
-/// differently, e.g. `a, b`) through here.
-fn split_ini_list(s: &str) -> Vec<String> {
-    if s.is_empty() {
-        return Vec::new();
-    }
-    let mut items = Vec::new();
-    let mut buf = String::new();
-    let mut escape = false;
-    for c in s.chars() {
-        if escape {
-            escape = false;
-            if c != '\\' && c != ',' {
-                buf.push('\\');
-            }
-            buf.push(c);
-        } else if c == '\\' {
-            escape = true;
-        } else if c == ',' {
-            items.push(buf.trim().to_string());
-            buf.clear();
-        } else {
-            buf.push(c);
-        }
-    }
-    if !buf.is_empty() {
-        items.push(buf.trim().to_string());
-    }
-    items
 }
 
 /// A value being read as whatever the target field asks for.
@@ -549,6 +504,25 @@ mod tests {
             "list = 1,2,3",
             "list = 2000-3000,3001",
             "neg = -1",
+            // Extreme magnitudes, where serde_json's `ryu` rendering (1e+19,
+            // 1e-7) and Rust's `f64` Display (plain decimal) disagree. The
+            // inference must keep these as *text*: a string field that received
+            // a re-rendered value would send a different token/domain than the
+            // file names.
+            "token = 10000000000000000000",
+            "token = 0.0000001",
+            "token = -0.0000001",
+            "token = 0.00001",
+            "token = 0.0001",
+            "token = 1000000000000000",
+            "token = 12345678901234567",
+            "token = 1e19",
+            "token = 1e-7",
+            // Comma lists that Go's `Key.Strings(",")` does not reproduce
+            // verbatim: an escape and a trailing empty element.
+            r"token = a\,b",
+            r"token = x\,y,z",
+            "token = a.example.com,",
         ] {
             let toml_value = super::super::format::parse_to_toml_value(
                 source,

@@ -415,36 +415,50 @@ fn parse_port_num(s: &str) -> Option<u32> {
     s.parse::<u32>().ok().filter(|&n| n <= 65535)
 }
 
-/// Truthiness of a legacy INI boolean value.
+/// Canonicalize Go's legacy INI boolean keys (`authenticate_heartbeats`,
+/// `authenticate_new_work_conns`) for **`.ini` inputs only**.
 ///
-/// The INI reader keeps a non-canonical spelling (`TRUE`, `yes`, `on`) as text
-/// so a string-typed field can receive it verbatim; these normalizer passes
-/// predate that and must accept both the inferred boolean and the text Go's
-/// `ini.v1.parseBool` accepts (`key.go:194`).
-fn ini_truthy(v: &toml::Value) -> bool {
-    match v {
-        toml::Value::Boolean(b) => *b,
-        // Go reads a bool field with `Key.Bool()` (`ini.v1` `key.go:194`),
-        // whose accepted spellings include `1`/`0`; those are the canonical
-        // rendering of an integer, so the tree holds them as numbers.
-        toml::Value::Integer(1) => true,
-        toml::Value::Integer(0) => false,
-        toml::Value::String(s) => matches!(
-            s.as_str(),
-            "1" | "t"
-                | "T"
-                | "true"
-                | "TRUE"
-                | "True"
-                | "YES"
-                | "yes"
-                | "Yes"
-                | "y"
-                | "ON"
-                | "on"
-                | "On"
-        ),
-        _ => false,
+/// Go declares them as `bool` fields with those ini tags
+/// (`pkg/auth/legacy/legacy.go:25,28`) and reads them through `MapTo` ->
+/// `Key.Bool()` -> `parseBool` (`key.go:194`), whose accepted spellings are
+/// wider than `true`/`false`. The lossless INI reader keeps a non-canonical
+/// spelling as text (or as the integer `1`/`0`) so a string-typed field can
+/// receive it verbatim, so the scope conversion in `conversion.go:31-36,92-97`
+/// has to see a real boolean here.
+///
+/// Deliberately **not** applied to TOML/JSON/YAML: those formats' consumers of
+/// these two keys (a frp-rs extension — Go's v1 decoder refuses the keys in
+/// them) keep the strict boolean typing they have always had, so a `1` or a
+/// `"yes"` there is still ignored rather than silently flipping the
+/// heart-beat / new-work-conn scope the server enforces.
+pub(super) fn canonicalize_legacy_ini_bools(table: &mut toml::Table) {
+    const KEYS: &[&str] = &["authenticate_heartbeats", "authenticate_new_work_conns"];
+    for key in KEYS {
+        canonicalize_one_legacy_ini_bool(table, key);
+    }
+    // Go reads both from `[common]` (`legacy/client.go:185-196`,
+    // `legacy/server.go:236-247`), and the normalizers merge `[common]` into the
+    // root *later* — so the pre-pass has to reach into the section too.
+    if let Some(toml::Value::Table(common)) = table.get_mut("common") {
+        for key in KEYS {
+            canonicalize_one_legacy_ini_bool(common, key);
+        }
+    }
+}
+
+fn canonicalize_one_legacy_ini_bool(table: &mut toml::Table, key: &str) {
+    let canonical = match table.get(key) {
+        Some(toml::Value::Boolean(b)) => Some(*b),
+        Some(toml::Value::Integer(1)) => Some(true),
+        Some(toml::Value::Integer(0)) => Some(false),
+        Some(toml::Value::String(s)) => super::format::parse_ini_bool(s),
+        // An unrecognised spelling is left alone: Go's non-strict `MapTo`
+        // swallows the parse error and keeps the field's default, and the
+        // `as_bool()` reads then ignore it the same way.
+        _ => None,
+    };
+    if let Some(b) = canonical {
+        table.insert(key.to_string(), toml::Value::Boolean(b));
     }
 }
 
@@ -519,6 +533,14 @@ pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
     // (so an argument like "${PORT_RANGE}" is expanded first) and before
     // normalization. See `expand_template_functions` for the exact subset.
     expand_template_functions(&mut value);
+    // Go's legacy INI booleans accept a wider spelling set than the canonical
+    // `true`/`false` the lossless reader infers; canonicalize them for `.ini`
+    // inputs only, so TOML/JSON/YAML keep the strict boolean behaviour.
+    if format == ConfigFormat::Ini {
+        if let Some(table) = value.as_table_mut() {
+            canonicalize_legacy_ini_bools(table);
+        }
+    }
     normalize(&mut value);
     let presence = ConfigPresence::from_normalized_value(&value);
     if strict_config {
@@ -568,13 +590,15 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
         let mut extra_scopes: Vec<String> = Vec::new();
         if table
             .remove("authenticate_heartbeats")
-            .is_some_and(|v| ini_truthy(&v))
+            .and_then(|v| v.as_bool())
+            == Some(true)
         {
             extra_scopes.push("HeartBeats".to_string());
         }
         if table
             .remove("authenticate_new_work_conns")
-            .is_some_and(|v| ini_truthy(&v))
+            .and_then(|v| v.as_bool())
+            == Some(true)
         {
             extra_scopes.push("NewWorkConns".to_string());
         }
@@ -828,17 +852,19 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
                 // extensions (`url`, `timeout`, `enable_control`) are in that
                 // surface and survive.
                 // Go's `Ops []string` is filled by `ini`'s comma-splitting
-                // `section.MapTo`, so a single operation (`ops = Login`) is a
-                // one-element slice there. `ini_to_toml` only splits a value
-                // that contains a comma, so a single value arrives as a
-                // `String` and would fail `Vec<String>` deserialization —
-                // normalize it the same way the client list keys are.
+                // `section.MapTo` (`Key.Strings(",")`, key.go:492: trim each
+                // element, `\,` is a literal comma, a trailing empty element is
+                // dropped), so a single operation (`ops = Login`) is a
+                // one-element slice there. `ini_to_toml` only splits a value it
+                // can reproduce verbatim, so a value with an escape or a space
+                // after the comma arrives as a `String` and would fail
+                // `Vec<String>` deserialization — split it the way Go does,
+                // dropping an empty element (frp-rs behaviour, pre-existing).
                 if let Some(Value::String(s)) = st.get("ops") {
-                    let items: Vec<Value> = s
-                        .split(',')
-                        .map(str::trim)
+                    let items: Vec<Value> = super::format::split_ini_list(s)
+                        .into_iter()
                         .filter(|p| !p.is_empty())
-                        .map(|p| Value::String(p.to_string()))
+                        .map(Value::String)
                         .collect();
                     st.insert("ops".to_string(), Value::Array(items));
                 }
@@ -1067,13 +1093,15 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
         let mut extra_scopes: Vec<String> = Vec::new();
         if table
             .remove("authenticate_heartbeats")
-            .is_some_and(|v| ini_truthy(&v))
+            .and_then(|v| v.as_bool())
+            == Some(true)
         {
             extra_scopes.push("HeartBeats".to_string());
         }
         if table
             .remove("authenticate_new_work_conns")
-            .is_some_and(|v| ini_truthy(&v))
+            .and_then(|v| v.as_bool())
+            == Some(true)
         {
             extra_scopes.push("NewWorkConns".to_string());
         }
@@ -1540,14 +1568,17 @@ fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) -> (Vec<usize>, Ve
         };
 
         // Go ini.v1 []string fields: a scalar value becomes a one-element
-        // array (comma-separated values were already split by ini_to_toml).
+        // array (a comma list the reader could reproduce verbatim is already an
+        // Array here). The splitter is Go's `Key.Strings(",")` (key.go:492), so
+        // `a\,b` is one element and a trailing empty element is dropped;
+        // frp-rs additionally drops an empty element wherever it appears
+        // (pre-existing — Go keeps a middle one).
         for list_key in ["custom_domains", "locations", "allow_users"] {
             if let Some(Value::String(s)) = st.get(list_key) {
-                let items: Vec<Value> = s
-                    .split(',')
-                    .map(str::trim)
+                let items: Vec<Value> = super::format::split_ini_list(s)
+                    .into_iter()
                     .filter(|p| !p.is_empty())
-                    .map(|p| Value::String(p.to_string()))
+                    .map(Value::String)
                     .collect();
                 if !items.is_empty() {
                     st.insert(list_key.to_string(), Value::Array(items));

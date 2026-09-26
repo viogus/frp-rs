@@ -1415,22 +1415,45 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     (rc 1), `[range:x] local_port = 6010-6012,6020` -> `Proxies: 0`, `role = visitor` range ->
     `Proxies: 3 Visitors: 0`.
   * **Class 1 — value inference: fixed at the deserialization boundary, not by weakening the
-    schema.** `infer_ini_value` is now **lossless** (a value becomes an integer/float/boolean/array
-    only when rendering it back reproduces the text the file wrote — so `007`, `1.50`, `1e3`, `YES`
-    and `a, b` stay text), and `.ini` inputs are deserialized by a type-directed reader
+    schema.** `infer_ini_value` is now **lossless through both renderers** (a value becomes an
+    integer/float/boolean/array only when *both* `ini_value_text` and the JSON projection reproduce
+    the text the file wrote — so `007`, `1.50`, `1e3`, `YES`, `a, b`, `a\,b`, `a.example.com,`,
+    `1e19` and `10000000000000000000` stay text). The JSON half matters: Rust's `f64` Display is
+    plain decimal where serde_json's `ryu` rendering is exponential, so a check against the TOML
+    rendering alone let `meta_id = 10000000000000000000` reach a string field as the **`"1e+19"`**
+    serde_json renders (and `token = 0.0000001` as `"1e-7"`) — a string field accepting a
+    *different* value than the file wrote, i.e. the class this item exists to fix (R1's MAJOR,
+    reproduced here: base rc 1 ``invalid type: floating point `1e-7` ``, the intermediate head
+    accepted it, head now reads `"0.0000001"`). Comma lists are split with Go's own
+    `Key.Strings(",")` (`key.go:492`, measured on Go v0.71.0: `a\,b` → `["a,b"]`,
+    `x\,y,z` → `["x,y", "z"]`, `a.example.com,` → `["a.example.com"]`; base and the first cut gave
+    `["a\\", "b"]` and `["a.example.com", ""]`), in the inference, in the deserializer and in the
+    two normalizer list conversions. `.ini` inputs are deserialized by a type-directed reader
     (`frp-core/src/config/ini_lenient.rs`, `deserialize_ini`) used only when `detect_format` says
     `.ini`: a string field reads the text Go's `ini.v1` `Key.String()` would give it, a numeric/bool
     field parses it (`Key.Int64()`/`parseBool` spellings), and a slice field splits it with Go's
     `Key.Strings(",")` rules. TOML/JSON/YAML keep strict serde typing, so no numeric `token` in a
-    `.toml` became acceptable. Measured on Go v0.71.0 (`/private/tmp/frp_0.71.0_darwin_arm64`) and
-    at this head: Go `frpc verify -c` = rc 0, `frps verify -c` = rc 0; frp-rs base = rc 1 for both
+    `.toml` became acceptable. The one normalizer conversion that reads a wider spelling set is
+    gated on the `.ini` format (`canonicalize_legacy_ini_bools`): `[common] authenticate_heartbeats = 1`
+    / `= yes` now adds the `HeartBeats`/`NewWorkConns` scope as Go's `parseBool`
+    (`pkg/auth/legacy/legacy.go:25,28` + `conversion.go:31-36,92-97`) does, while a TOML/JSON/YAML
+    `= 1`/`= "yes"` stays **ignored** exactly as at base — the first cut applied the wider set in
+    every format, which would have silently flipped the scopes the server enforces
+    (`frp-server/src/control/proxy.rs:418-425`; R1's scope finding, now covered by
+    `test_legacy_ini_bool_scopes_are_ini_only`). Measured on Go v0.71.0
+    (`/private/tmp/frp_0.71.0_darwin_arm64`) and at this head: Go `frpc verify -c` = rc 0,
+    `frps verify -c` = rc 0; frp-rs base = rc 1 for both
     (`invalid type: integer \`12345678\``, `invalid type: sequence`), frp-rs now = rc 0 for both.
     Go's numeric token is the *string*: with `auth.token = "12345678"` on Go frps, Go frpc with the
     fixture's `token = 12345678` logs `login to server success` (and `12345679` logs
     `token in login doesn't match …`).
   * **Class 2 — range comma list: fixed in `ini_port_numbers`.** It now accepts the split array
     (each element a single port or a nested range string), which is what the INI reader produces for
-    a canonical comma list, and the collector is unchanged otherwise. Measured on Go v0.71.0 with a
+    a canonical comma list, and the collector is unchanged otherwise. This arm applies to the
+    shape-based legacy `[range:...]` collector in **every** config format, not only `.ini` (base
+    dropped such an array with the `WARN … invalid local_port`; a JSON
+    `"local_port": [6010, "6011-6012"]` now expands) — pinned by
+    `test_legacy_ini_range_port_list_accepts_an_array`, which uses JSON. Measured on Go v0.71.0 with a
     real frps + `GET /api/proxy/tcp`: `6010-6012` -> 3 (`x_0`…`x_2`), `6010-6012,6020` -> 4
     (`x_0`…`x_3`); frp-rs base for the second case = `Proxies: 0` + the WARN, frp-rs now =
     `Proxies: 4`. Go's own `[range:tcp_port]` (`local_port = 6010-6020,6022,6024-6028`, 17 numbers)
@@ -1451,7 +1474,14 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `proxy added: […]` and 2 visitors (`p2p_tcp_visitor`, `secret_tcp_visitor`) — while
     `legacy_ini_go_shipped_frps_fixture_loads_end_to_end` loads the server file through
     `load_server_config(path, true)`: `auth.token == "12345678"`,
-    `allow_ports == "2000-3000,3001,3003,4000-50000"`, two `[plugin.*]` HTTP plugins. `frps` has no
+    `allow_ports == "2000-3000,3001,3003,4000-50000"`, two `[plugin.*]` HTTP plugins. Those counts
+    are **config-level** (what Go's loader reports); how many of the 43 a server accepts is
+    environment-dependent — measured once on Go v0.71.0 with a vhost-only frps, 38 registered, with
+    Go's own frpc log naming the causes (health checks against a dead local `:22`/`:80` for `ssh`
+    and `web01`, `open ./server.crt: no such file or directory` on one of the two https plugins and
+    `router config conflict` on the other — which of the two loses varies — `subdomain is not
+    supported because this feature is not enabled in server` for `web02`, and
+    `tcpmux with multiplexer httpconnect not supported` for `tcpmuxhttpconnect`). `frps` has no
     `verify` subcommand in frp-rs (pre-existing CLI divergence, `TODO.md:1632`), so the server file
     is pinned at the same `load_server_config` entry point `frps -c` uses; the client file is also
     pinned through the CLI by `frpc/tests/legacy_ini_fixture.rs` (`frpc verify -c` -> rc 0,
@@ -1465,17 +1495,58 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `bind_port` 9000/9001 and `keep_tunnel_open`/`max_retries_an_hour`/`min_retry_interval` (fixture
     test).
   * **Residuals recorded in `docs/config.md`** (not open divergences of this item): Go's
-    `Key.Int64()` is `strconv.ParseInt(s, 0, 64)` — base 0, so Go reads `0x10` as 16 where frp-rs
-    reads base 10 and refuses it (pre-existing: the old inference was base 10 too); and the
+    `Key.Int64()` is `strconv.ParseInt(s, 0, 64)` — base 0 — and the dangerous half is the *silent
+    different value*, not the refusal (measured on Go v0.71.0 via the dialled port in frpc's log,
+    frp-rs head in brackets): `server_port = 07000` → Go 3584 [7000], `= 010` → Go 8 [10],
+    `= 0x10` → Go 16 [refused], `= 08` → not a Go integer, so the field keeps the default 7000
+    [8]. Pre-existing (the old inference read base 10 too); matching Go fully would also need its
+    non-strict "swallow the parse error, keep the default" behaviour, which a serde field cannot
+    express. The other residual is the
     `["a", "b"]` array-literal spelling is an frp-rs extension, so a *string* field given that
     spelling reads the comma-joined elements where Go reads the bracketed text (that spelling is not
     Go syntax — measured: Go gives `['["a.example.com"', '"b.example.com"]']`).
-  * Red evidence: with only `ini_port_numbers`' array arm reverted, the two range tests fail
+  * Red evidence: with only `ini_port_numbers`' array arm reverted, **three** tests fail — the
+    client-fixture end-to-end test (its 17 `tcp_port_*` proxies disappear) and the two range tests
     (`Proxies: 0`); with only the `role` dispatch reverted, the visitor test fails
     (`Proxies: 3 Visitors: 0`); with `deserialize_ini` replaced by `serde_json::from_value` for
-    `.ini`, the two fixture tests fail with the base errors. `scripts/compat-test.sh` was **not**
+    `.ini`, the two fixture tests fail with the base errors. Re-measured after the review round:
+    the same three mutants fail the same way (3 / 1 / 2 tests). `scripts/compat-test.sh` was **not**
     run: the diff is config-load only (no protocol, transport, encryption or proxy path) and the
     script generates no `.ini` config at all, so it cannot reach the wire.
+
+
+- [ ] **A legacy section with an invalid `role` is accepted as a proxy where Go exits 1.** Found
+  while closing `:1359` (R1), measured on Go v0.71.0 and frp-rs head. Go dispatches a legacy section
+  on `role` after expanding a `[range:...]` template and errors on anything but `server`/`visitor`
+  (`pkg/config/legacy/client.go:263-284`, `proxy %s role should be 'server' or 'visitor'`):
+  `frpc verify -c` is **rc 1** for both `[x] type = tcp role = serverx …` (`proxy x role should be
+  'server' or 'visitor'`) and `[range:x] … role = serverx` (`proxy x_0 role should be …`). frp-rs is
+  **rc 0** for both — the explicit shape treats any non-`visitor` role as a proxy (pre-existing), and
+  the range shape got the same treatment from this item's role dispatch. Pre-existing and
+  net-unchanged for the explicit shape; the range shape is now reachable the same way.
+  **Done-when:** refuse a legacy section whose `role` is neither `server` nor `visitor` with Go's
+  message and exit code, covering both shapes — which means the legacy collector has to be able to
+  fail (`normalize_client_config` currently returns `()`), or record the divergence in
+  `docs/config.md` with this measurement.
+  Reproducer: `/tmp/lip/f5/role_bad.ini` (range) and `/tmp/lip/f5/role_bad2.ini` (explicit) in the
+  `:1359` round's probe directory; `frpc verify -c` on each, Go vs frp-rs.
+
+
+- [ ] **`frpc` panics on SIGTERM when more than one visitor shares a `bind_port` (pre-existing;
+  now reachable from a `[range:...]` template).** Found by R1 while reviewing `:1359`, reproduced
+  here on both the base and head binaries. Three `stcp` visitors with the same `bind_port` (the
+  legacy template's shape: `[range:rv] … role = visitor … bind_port = <one port>`) start fine; on
+  `SIGTERM` the process panics with
+  `fatal: panicked at tokio-1.53.1/src/runtime/task/core.rs:427: JoinHandle polled after completion`
+  and exits **101** — in the release profile (`panic = "abort"`) that is a crash, not a clean
+  shutdown. Measured (3 runs each, Rust frps + frpc, free ports, children reaped):
+  head explicit-3 **3/3**, head range-3 **3/3**, base explicit-3 **3/3**, base range-3 **0/3** —
+  base's range shape built *proxies*, not visitors, so `:1359`'s role fix is what makes the range
+  shape reach it; the explicit shape predates it. Not caused by `:1359` and not fixed by it.
+  **Done-when:** `frpc` shuts down cleanly (rc 0, no `panicked at`) with N ≥ 2 visitors sharing a
+  `bind_port`, and a regression test pins it for both the explicit and the range spelling.
+  Reproducer: `/tmp/lip/probe6.sh <label> <frpc> <frps> <explicit|range> <runs>` from the `:1359`
+  round (it also shows base range-3 at 0/3).
 
 
 - [x] **`frpc reload` / `frpc status` silently ignore a config that fails to load, and talk to

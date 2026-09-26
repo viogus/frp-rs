@@ -5463,6 +5463,9 @@ custom404Page = "<h1>nope</h1>"
 /// pipeline (ini_to_toml rejects nothing, so [range:x] headers are legal).
 fn load_client_ini(content: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
     let mut value = super::format::parse_to_toml_value(content, super::format::ConfigFormat::Ini)?;
+    if let Some(table) = value.as_table_mut() {
+        super::normalize::canonicalize_legacy_ini_bools(table);
+    }
     super::normalize::normalize_client_config(&mut value);
     // `.ini` inputs read values by target type, exactly as
     // `load_config_from_file` does (Go's legacy INI model) — not the strict
@@ -5477,6 +5480,9 @@ fn load_client_ini(content: &str) -> Result<ClientConfig, Box<dyn std::error::Er
 /// Same for server configs.
 fn load_server_ini(content: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let mut value = super::format::parse_to_toml_value(content, super::format::ConfigFormat::Ini)?;
+    if let Some(table) = value.as_table_mut() {
+        super::normalize::canonicalize_legacy_ini_bools(table);
+    }
     super::normalize::normalize_server_config(&mut value);
     let cfg: ServerConfig =
         super::ini_lenient::deserialize_ini(&super::normalize::toml_to_json(value))
@@ -6006,11 +6012,112 @@ fn test_legacy_ini_values_are_read_by_target_type() {
     let cfg = load_client_ini("[common]\nserver_addr = 127.0.0.1\ntoken = YES\n").unwrap();
     assert_eq!(cfg.token, "YES");
 
+    // Extreme magnitudes: serde_json's `ryu` rendering is exponential where
+    // Rust's `f64` Display is not (`1e+19` / `1e-7`), so the reader keeps these
+    // as text and a string field gets the file's text, not a re-rendering.
+    // Measured on Go v0.71.0: the token `10000000000000000000` logs in against
+    // a Go frps whose `auth.token` is that string.
+    let cfg = load_client_ini(
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         token = 10000000000000000000\nmeta_id = 0.0000001\n",
+    )
+    .unwrap();
+    assert_eq!(cfg.token, "10000000000000000000");
+    assert_eq!(cfg.metas.get("id").map(String::as_str), Some("0.0000001"));
+
     // An INI value that is not a number at all still fails a numeric field.
     let err = load_client_ini("[common]\nserver_addr = 127.0.0.1\nserver_port = abc\n")
         .unwrap_err()
         .to_string();
     assert!(err.contains("config validation error"), "got: {err}");
+}
+
+/// Go splits a slice field with `Key.Strings(",")` (`key.go:492`): trim each
+/// element, `\,` is a literal comma, and a trailing empty element is dropped.
+/// Measured on Go v0.71.0 (`custom_domains`, `GET /api/proxy/http`): `a\,b` →
+/// `["a,b"]`, `x\,y,z` → `["x,y", "z"]`, `a.example.com,` → `["a.example.com"]`.
+/// Base and the first cut of this fix split naively, giving
+/// `["a\\", "b"]` and `["a.example.com", ""]`.
+#[test]
+fn test_legacy_ini_slice_values_use_go_strings_semantics() {
+    for (value, expected) in [
+        (r"a\,b", vec!["a,b"]),
+        (r"x\,y,z", vec!["x,y", "z"]),
+        ("a.example.com,", vec!["a.example.com"]),
+        (
+            "a.example.com, b.example.com",
+            vec!["a.example.com", "b.example.com"],
+        ),
+        ("a,b", vec!["a", "b"]),
+    ] {
+        let cfg = load_client_ini(&format!(
+            "[common]\nserver_addr = 127.0.0.1\n[web]\ntype = http\nlocal_port = 8080\n\
+             custom_domains = {value}\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.proxies[0].custom_domains, expected, "value `{value}`");
+        // A *string* field reading the same value gets the file's text.
+        let cfg = load_client_ini(&format!(
+            "[common]\nserver_addr = 127.0.0.1\ntoken = {value}\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.token, value, "string field for `{value}`");
+    }
+}
+
+/// The legacy-INI boolean conversion (`authenticate_heartbeats` /
+/// `authenticate_new_work_conns` → `[auth] additional_auth_scopes`, Go
+/// `pkg/config/legacy/conversion.go:31-36,92-97`; the fields are
+/// `pkg/auth/legacy/legacy.go:25,28` bools read with `Key.Bool()`) accepts Go's
+/// wider `parseBool` spelling set for **`.ini` only**.
+///
+/// The server enforces these scopes (`frp-server/src/control/proxy.rs:418-425`),
+/// so applying the wider set in every format — as the first cut of this fix did
+/// through a format-agnostic `ini_truthy` — silently changed the meaning of a
+/// TOML/JSON/YAML config that base ignored. Those formats keep the strict
+/// boolean typing they always had.
+#[test]
+fn test_legacy_ini_bool_scopes_are_ini_only() {
+    fn scopes(cfg: &ClientConfig) -> Vec<String> {
+        cfg.auth
+            .as_ref()
+            .map(|a| a.additional_auth_scopes.clone())
+            .unwrap_or_default()
+    }
+
+    let ini = load_client_ini(
+        "[common]\nserver_addr = 127.0.0.1\n\
+         authenticate_heartbeats = 1\nauthenticate_new_work_conns = yes\n",
+    )
+    .unwrap();
+    assert_eq!(scopes(&ini), ["HeartBeats", "NewWorkConns"]);
+
+    let toml = load_client_config_from_str(
+        "server_addr = \"127.0.0.1\"\nauthenticate_heartbeats = 1\nauthenticate_new_work_conns = \"yes\"\n",
+    )
+    .unwrap();
+    assert!(
+        scopes(&toml).is_empty(),
+        "a non-boolean spelling in TOML must stay ignored (base behaviour)"
+    );
+    let json = load_client_config_from_json(
+        r#"{"serverAddr": "127.0.0.1", "authenticate_heartbeats": 1}"#,
+    )
+    .unwrap();
+    assert!(scopes(&json).is_empty(), "JSON");
+    let yaml = load_client_config_from_yaml(
+        "server_addr: 127.0.0.1\nauthenticate_new_work_conns: \"yes\"\n",
+    )
+    .unwrap();
+    assert!(scopes(&yaml).is_empty(), "YAML");
+
+    // The pre-existing *boolean* spelling maps in every format (frp-rs
+    // extension; Go's v1 decoder refuses the key outside `.ini`).
+    let toml = load_client_config_from_str(
+        "server_addr = \"127.0.0.1\"\nauthenticate_heartbeats = true\n",
+    )
+    .unwrap();
+    assert_eq!(scopes(&toml), ["HeartBeats"]);
 }
 
 /// The array spelling of the same port list — a TOML/JSON config may write the

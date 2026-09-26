@@ -208,11 +208,62 @@ fn ini_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>>
 /// remaining value degrades to a plain string literal.
 const MAX_INI_NESTING: usize = 16;
 
+/// Go's `ini.v1` boolean spellings — `parseBool` (`key.go:194`). The list is
+/// case-sensitive there; `yes`/`no`/`1`/`0` are accepted and are *not* inferred
+/// as booleans by the lossless reader, so a bool target reads them through
+/// `super::ini_lenient` and the legacy-bool pre-pass below.
+pub(super) fn parse_ini_bool(s: &str) -> Option<bool> {
+    match s {
+        "1" | "t" | "T" | "true" | "TRUE" | "True" | "YES" | "yes" | "Yes" | "y" | "ON" | "on"
+        | "On" => Some(true),
+        "0" | "f" | "F" | "false" | "FALSE" | "False" | "NO" | "no" | "No" | "n" | "OFF"
+        | "off" | "Off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Split a value the way Go's `Key.Strings(",")` does (`key.go:492`): on `,`,
+/// trimming each element; `\,` is a literal comma; an empty value is no
+/// elements and a trailing empty element is dropped.
+///
+/// Both the inference below and `super::ini_lenient` use this, so the array
+/// form and the text form of a comma list agree — and agree with Go. Measured
+/// on Go v0.71.0 (`custom_domains`, `GET /api/proxy/http`): `a\,b` →
+/// `["a,b"]`, `x\,y,z` → `["x,y", "z"]`, `a.example.com,` → `["a.example.com"]`.
+pub(super) fn split_ini_list(s: &str) -> Vec<String> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let mut items = Vec::new();
+    let mut buf = String::new();
+    let mut escape = false;
+    for c in s.chars() {
+        if escape {
+            escape = false;
+            if c != '\\' && c != ',' {
+                buf.push('\\');
+            }
+            buf.push(c);
+        } else if c == '\\' {
+            escape = true;
+        } else if c == ',' {
+            items.push(buf.trim().to_string());
+            buf.clear();
+        } else {
+            buf.push(c);
+        }
+    }
+    if !buf.is_empty() {
+        items.push(buf.trim().to_string());
+    }
+    items
+}
+
 /// Render a TOML value as the INI text it came from. The inverse of the
 /// lossless inference below: for every value `infer_ini_value_depth` returns
-/// that is not a `String`, `ini_value_text(&value)` equals the input text —
-/// `super::ini_lenient` relies on that when a string-typed field reads an
-/// inferred value.
+/// that is not a `String`, both this and [`ini_value_json_text`] equal the
+/// input text — `super::ini_lenient` relies on that when a string-typed field
+/// reads an inferred value.
 pub(super) fn ini_value_text(v: &toml::Value) -> String {
     match v {
         toml::Value::String(s) => s.clone(),
@@ -230,10 +281,43 @@ pub(super) fn ini_value_text(v: &toml::Value) -> String {
     }
 }
 
+/// The text the **JSON projection** renders for a value — what
+/// `super::ini_lenient::ini_text` gives a string-typed field, and therefore the
+/// rendering that actually has to match the file.
+///
+/// Rust's `f64` Display and serde_json's `ryu` disagree for extreme
+/// magnitudes: `10000000000000000000` is `1e+19` there and `0.0000001` is
+/// `1e-7`, while both print as plain decimals here. A value whose two
+/// renderings differ is kept as text by the inference, so a string field always
+/// receives exactly what the file wrote.
+pub(super) fn ini_value_json_text(v: &toml::Value) -> String {
+    match v {
+        toml::Value::String(s) => s.clone(),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Array(items) => items
+            .iter()
+            .map(ini_value_json_text)
+            .collect::<Vec<_>>()
+            .join(","),
+        toml::Value::Datetime(_) | toml::Value::Table(_) => String::new(),
+    }
+}
+
+/// Whether an inferred value survives both renderers — the losslessness the
+/// inference promises.
+fn round_trips(v: &toml::Value, raw: &str) -> bool {
+    ini_value_text(v) == raw && ini_value_json_text(v) == raw
+}
+
 /// Infer INI value type matching Go Viper behavior — losslessly.
 ///
-/// The result must satisfy `ini_value_text(&result) == input`; otherwise the
-/// value stays a `String`. See `ini_to_toml`.
+/// The result must satisfy both `ini_value_text(&result) == input` and
+/// `ini_value_json_text(&result) == input`; otherwise the value stays a
+/// `String`. See `ini_to_toml`.
 fn infer_ini_value(s: &str) -> toml::Value {
     infer_ini_value_depth(s, 0)
 }
@@ -303,31 +387,41 @@ fn infer_ini_value_depth(s: &str, depth: usize) -> toml::Value {
     }
 
     // Comma-separated → Array (type-infer each element), but only when the
-    // split round-trips: `1,2` becomes an array, `1, 2` keeps its space and
-    // stays text (Go trims each element of a slice field, so both read the
-    // same through the target type — see `super::ini_lenient`).
+    // split round-trips through *both* renderers: `1,2` becomes an array,
+    // `1, 2` keeps its space and `a\,b` keeps its backslash, and both stay
+    // text — Go trims each element of a slice field and honours the escape, so
+    // the text form and the array form read the same through the target type
+    // (see `super::ini_lenient`). The element splitter is Go's own
+    // (`Key.Strings(",")`), so `a\,b` is one element here too.
     if s.contains(',') {
-        let parts: Vec<toml::Value> = s
-            .split(',')
-            .map(|p| infer_ini_value_depth(p.trim(), depth + 1))
+        let parts: Vec<toml::Value> = split_ini_list(s)
+            .into_iter()
+            .map(|p| infer_ini_value_depth(&p, depth + 1))
             .collect();
-        if ini_value_text(&toml::Value::Array(parts.clone())) == s {
-            return toml::Value::Array(parts);
+        let array = toml::Value::Array(parts);
+        if round_trips(&array, s) {
+            return array;
         }
         return toml::Value::String(s.to_string());
     }
 
     // Integer / Float — only when the parsed value renders back to exactly
-    // this text: `007`, `+5`, `1.50`, `1e3` stay strings, and are read as a
-    // number by `super::ini_lenient` when the target field is numeric.
+    // this text through **both** renderers: `007`, `+5`, `1.50`, `1e3` stay
+    // strings, and are read as a number by `super::ini_lenient` when the target
+    // field is numeric. The JSON check matters for extreme magnitudes, where
+    // serde_json's `ryu` rendering is exponential and Rust's `f64` Display is
+    // not (`1e+19` / `1e-7`): without it a string field would receive
+    // `"1e+19"` instead of the `10000000000000000000` the file wrote.
     if let Ok(i) = s.parse::<i64>() {
-        if i.to_string() == s {
-            return toml::Value::Integer(i);
+        let v = toml::Value::Integer(i);
+        if round_trips(&v, s) {
+            return v;
         }
     }
     if let Ok(f) = s.parse::<f64>() {
-        if f.to_string() == s {
-            return toml::Value::Float(f);
+        let v = toml::Value::Float(f);
+        if round_trips(&v, s) {
+            return v;
         }
     }
 
