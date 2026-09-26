@@ -30,8 +30,8 @@ User-facing release notes for frp-rs.
   and now match Go on both binaries: `frps -vtrue`/`-vh`/`-vtok`/`-vp7000` set
   `-v` and re-parse the rest, exactly as before; on `frpc` the same cluster no
   longer prints the version where Go refuses it (`frpc -vtrue` is rc 1 on both,
-  was 0 here) and `frpc -vh` prints **help** as Go does (this release also
-  prints the version there — both are fixes toward Go); `-vfoo`/`-v0` stay rc 1
+  was 0 here) and `frpc -vh` prints **help** as Go does (the previous release
+  printed the version there — both are fixes toward Go); `-vfoo`/`-v0` stay rc 1
   on both binaries. Three caveats, all measured and recorded in
   `docs/developing.md`: the space-separated `--flag false` is still refused
   (Go's pflag never consumes that token either, and Go's own behaviour differs
