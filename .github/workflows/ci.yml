@@ -105,6 +105,18 @@ jobs:
     name: Tests (unit)
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # The two guarded test counts, one value each. The lane that owns a value
+    # reads it twice — in the `test result: ok. N passed; 0 failed` grep over
+    # the captured log, and against the `n` counted from `-- --list` — so a test
+    # added to (or removed from) a guarded file moves exactly one literal here.
+    # The values stay hard-coded: a count derived from the file a lane checks
+    # would stay green if that file's tests were removed altogether.
+    env:
+      # frps/tests/cli_exit_codes.rs — "Run frps CLI tests (config-failure exit codes)"
+      FRPS_CLI_TESTS: "9"
+      # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
+      # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
+      FRPC_TINY_CLI_TESTS: "11"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
@@ -181,8 +193,11 @@ jobs:
         # by nothing. That mattered: `frpc/src/main.rs`'s inline unit tests
         # pinned the old `127.0.0.1:7400` fallback that let
         # `frpc reload`/`status` silently ignore a config that fails to load.
-        # This step executes them (8 unit tests) plus `frpc/tests/admin_cli.rs`
-        # (14 tests), which spawns the `frpc` binary with crafted configs.
+        # This step executes them (8 unit tests — `cargo test -p frpc --bin frpc
+        # -- --list`) plus `frpc/tests/admin_cli.rs` (25 tests —
+        # `cargo test -p frpc --test admin_cli -- --list`; a snapshot figure,
+        # since no lane counts that file and nothing reddens when it moves),
+        # which spawns the `frpc` binary with crafted configs.
         #
         # What the `TcpListener` oracle does and does not prove. The listener is
         # bound to a port that is then written into the bad config's
@@ -227,17 +242,18 @@ jobs:
         # the frps half of that fix had no executing pin.
         #
         # Measured warm, macOS arm64: 2.47 s wall for the package (4 tests, the
-        # SIGTERM positive control dominating) when this step was added; the
-        # count is 5 since the `--strict-config` space-form lane added
+        # SIGTERM positive control dominating) when this step was added; 5 after
+        # the `--strict-config` space-form lane added
         # `space_form_strict_config_warns_on_stderr` (the warning assertion, a
-        # fast `--help`-free parse) — and 9 since the bool-flag `=value` lanes
-        # added `version_flag_value_spelling_decides_what_happens` (three fast
+        # fast `--help`-free parse); then 4 more from the bool-flag `=value` lanes
+        # — `version_flag_value_spelling_decides_what_happens` (three fast
         # exits), `version_short_shorthand_clusters_and_equals_spelling_match_go`
         # (the `-v` shorthand grammar, seven fast exits),
         # `tls_only_false_value_starts_and_listens` (a SIGTERM positive control)
         # and `disable_log_color_value_spelling_is_applied` (two spawns, each
-        # waiting out a listener). The runner was not measured for wall time
-        # either way.
+        # waiting out a listener). The current count is not repeated here: it is
+        # `env.FRPS_CLI_TESTS` on this job. The runner was not measured for wall
+        # time either way.
         #
         # Fail closed, target-specifically, and colour-proof. `--test
         # cli_exit_codes` makes the integration file the only target, and
@@ -273,14 +289,15 @@ jobs:
           n=$(cargo test -p frps --test cli_exit_codes --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/cli_exit_codes.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 9 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "9" ] || status=1
+          grep -q "test result: ok. $FRPS_CLI_TESTS passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "$FRPS_CLI_TESTS" ] || status=1
           if [ "$status" != "0" ]; then
-            echo "::error::frps CLI exit-code guard failed (status=$status, listed=$n)"
+            echo "::error::frps CLI exit-code guard failed (status=$status, listed=$n, expected=$FRPS_CLI_TESTS)"
+            echo "::error::if frps/tests/cli_exit_codes.rs really gained or lost tests, move the single env.FRPS_CLI_TESTS value on the tests-unit job in .github/workflows/ci.yml from $FRPS_CLI_TESTS to $n"
             cat "$log.plain"
             exit 1
           fi
-          echo "frps CLI exit-code guard ok: $n tests listed, 0 failed"
+          echo "frps CLI exit-code guard ok: $n tests listed (expected $FRPS_CLI_TESTS), 0 failed"
       - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
         # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag
         # exit-code fix has to hold in the no-default-features build too — but
@@ -291,11 +308,12 @@ jobs:
         # `CARGO_BIN_EXE_frpc-tiny`; its crate-level cfg admits `tiny` for
         # exactly this lane.
         #
-        # Measured warm, macOS arm64: 1.00 s wall (9 tests — the 7 `full`-tier
-        # assertions plus the 2 `tiny`-gated ones) before the bool-flag `=value`
-        # lane added its own pair; the tiny lane now lists 11 (9 `full`-tier
-        # assertions plus the 2 `tiny`-gated ones). The runner was not measured
-        # for wall time.
+        # Measured warm, macOS arm64: 1.00 s wall for the 9 tests this lane listed
+        # when the step was added (the 7 `full`-tier assertions plus the 2
+        # `tiny`-gated ones) before the bool-flag `=value` lane added its own pair
+        # of ungated `frpc` tests. The current count is not repeated here: it is
+        # `env.FRPC_TINY_CLI_TESTS` on this job. The runner was not measured for
+        # wall time.
         #
         # Evidence for this lane's colour fix is *inferred*, not measured on the
         # runner: the run that exposed the `frps` failure never reached this step
@@ -305,10 +323,12 @@ jobs:
         # the local `CARGO_TERM_COLOR=always` reproduction of that grep failing
         # and passing after the fix. The next runner run measures it for real.
         #
-        # Same three checks as the step above (target ran; `9`/`11` tests listed;
-        # `ok. N passed; 0 failed`), same colour handling, same fail-closed exit.
-        # The `frps` step is the one with runner evidence: its log shows cargo's
-        # coloured `Running …` line and the guard's exit 1.
+        # Same three checks as the step above (the target ran; the log says
+        # `ok. N passed; 0 failed` and `-- --list` counts that same N, both
+        # against this job's expected-count env value), same colour handling,
+        # same fail-closed exit. The `frps` step is the one with runner
+        # evidence: its log shows cargo's coloured `Running …` line and the
+        # guard's exit 1.
         shell: bash
         run: |
           set -eo pipefail
@@ -318,14 +338,15 @@ jobs:
           n=$(cargo test -p frpc --no-default-features --features tiny --test cli_exit_codes --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/cli_exit_codes.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 11 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "11" ] || status=1
+          grep -q "test result: ok. $FRPC_TINY_CLI_TESTS passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "$FRPC_TINY_CLI_TESTS" ] || status=1
           if [ "$status" != "0" ]; then
-            echo "::error::frpc tiny CLI exit-code guard failed (status=$status, listed=$n)"
+            echo "::error::frpc tiny CLI exit-code guard failed (status=$status, listed=$n, expected=$FRPC_TINY_CLI_TESTS)"
+            echo "::error::if frpc/tests/cli_exit_codes.rs really gained or lost tests, move the single env.FRPC_TINY_CLI_TESTS value on the tests-unit job in .github/workflows/ci.yml from $FRPC_TINY_CLI_TESTS to $n"
             cat "$log.plain"
             exit 1
           fi
-          echo "frpc tiny CLI exit-code guard ok: $n tests listed, 0 failed"
+          echo "frpc tiny CLI exit-code guard ok: $n tests listed (expected $FRPC_TINY_CLI_TESTS), 0 failed"
       - name: Run frp-client's tests with no features (runtime half of frp-client's tier gate)
         # The `verify` lane's `cargo check -p frp-client --no-default-features
         # --all-targets` is compile-only: it type-checks the test targets but
