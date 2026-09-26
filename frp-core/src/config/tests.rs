@@ -5694,6 +5694,99 @@ unknown_web_server_key = 1
     );
 }
 
+/// The array-element arm of the case-insensitive-keys divergence, with the
+/// dropped **value** asserted — the CLI-level test of the same shape
+/// (`case_insensitive_proxy_array_keys_are_dropped_in_strict_mode`) can only
+/// see `rc 0` / `is valid` / no `unknown field`, which a future
+/// `#[serde(alias = "RemotePort")]` would also satisfy while honouring the key.
+/// This pin fails if that happens, because the alias would set `remote_port`.
+///
+/// Go v0.71.0 reads `RemotePort` case-insensitively and binds the requested
+/// port; frp-rs drops the key, so the server auto-allocates. `check_strict`
+/// never recurses into the array (`strict.rs`), and `ProxyConfig` carries no
+/// `deny_unknown_fields`.
+#[test]
+fn case_insensitive_proxy_array_key_is_dropped_in_strict_mode() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        b"serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[[proxies]]\nname = \"p\"\ntype = \"tcp\"\nlocalPort = 80\nRemotePort = 7198\n",
+    )
+    .unwrap();
+    let cfg = load_client_config(f.path().to_str().unwrap(), true)
+        .expect("strict mode accepts the mis-cased array key");
+    assert_eq!(cfg.proxies.len(), 1);
+    assert_eq!(
+        cfg.proxies[0].remote_port, 0,
+        "the mis-cased key must be dropped (Go would use 7198); a serde alias \
+         would make this 7198 and would be a behaviour change, not a test tweak"
+    );
+    // `localPort` (the camelCase alias serde does know) IS honoured, so the
+    // zero above is specific to the mis-cased spelling.
+    assert_eq!(cfg.proxies[0].local_port, 80);
+}
+
+/// The second non-walked shape for a mis-cased key, and the reason the
+/// case-insensitive-keys record cannot say "the walked sections refuse, arrays
+/// are dropped": a **table alias the normalizer leaves alone**. `[virtualNet]`
+/// is a documented camelCase alias for `virtual_net`, but
+/// `normalize_client_config` canonicalises only some spellings (`webServer`,
+/// `featureGates`, …), so this alias survives to `check_strict`, which has no
+/// key list for it and therefore does not descend. A capitalised nested key is
+/// then dropped silently in strict mode.
+///
+/// Measured against Go v0.71.0: Go's `verify -c` on the `Address` spelling fails
+/// with `VirtualNet feature is not enabled; enable it by setting the appropriate
+/// feature gate flag`, while frp-rs's `verify` exits 0 and prints `is valid`, and
+/// the strict load returns `Ok` with `virtual_net.address == ""`. The dropped key
+/// also *hides* the feature-gate refusal, because an empty address means no vnet
+/// config is seen at all. `[virtual_net] Address` and `[virtualNet] address`
+/// both behave differently, so this is specifically the alias arm.
+#[test]
+fn case_insensitive_key_in_a_table_alias_is_dropped_in_strict_mode() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        b"serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[virtualNet]\nAddress = \"10.1.0.0/24\"\n",
+    )
+    .unwrap();
+    let cfg = load_client_config(f.path().to_str().unwrap(), true)
+        .expect("strict mode accepts the alias with a mis-cased nested key");
+    assert_eq!(
+        cfg.virtual_net.address, "",
+        "the mis-cased key is dropped, not read (Go would use 10.1.0.0/24)"
+    );
+
+    // The correctly spelled alias key IS read, and then the feature-gate check
+    // fires — which is what the dropped key above hides.
+    let mut ok = tempfile::NamedTempFile::new().unwrap();
+    ok.write_all(
+        b"serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[virtualNet]\naddress = \"10.1.0.0/24\"\n",
+    )
+    .unwrap();
+    let err = load_client_config(ok.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("VirtualNet feature is not enabled"),
+        "the correctly spelled alias key reaches the feature gate: {err}"
+    );
+
+    // Contrast: the canonical snake_case section DOES have a key list, so the
+    // same mis-cased nested key is refused there.
+    let mut snake = tempfile::NamedTempFile::new().unwrap();
+    snake
+        .write_all(
+            b"serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[virtual_net]\nAddress = \"10.1.0.0/24\"\n",
+        )
+        .unwrap();
+    let err = load_client_config(snake.path().to_str().unwrap(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown field \"virtual_net.Address\""),
+        "got: {err}"
+    );
+}
+
 #[test]
 fn test_strict_rejects_unknown_quic_key() {
     // Client-side top-level [quic] (normalize flattens [transport.quic] to

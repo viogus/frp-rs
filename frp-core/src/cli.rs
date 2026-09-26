@@ -809,7 +809,7 @@ pub struct StopArgs {
 /// `-c`/`--config`, matching Go's pflag `StringVar`: a repeated flag is
 /// **last-wins** and never an error.
 ///
-/// Go registers `-c` with `StringVarP` in a package-level `var` initializer
+/// Go registers `-c` with `StringVarP` inside `func init()`
 /// (`cmd/frpc/sub/root.go`), so `frpc status -c a.toml -c b.toml` parses `a`
 /// first and overwrites it with `b`. Measured on Go v0.71.0 darwin/arm64 with
 /// `noweb.toml` (no `[webServer]`) followed by `p7499.toml`
@@ -2254,7 +2254,7 @@ mod tests {
 
     // ── `-c`/`--config` is last-wins, like Go's pflag StringVarP ──────────
     //
-    // Go registers `-c` with `StringVarP` in a package-level initializer
+    // Go registers `-c` with `StringVarP` inside `func init()`
     // (`cmd/frpc/sub/root.go`), so a repeated flag is never an error and the
     // last value wins. Measured on Go v0.71.0 darwin/arm64:
     // `frpc status -c noweb.toml -c p7499.toml` dials `127.0.0.1:7499` and

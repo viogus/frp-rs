@@ -1710,10 +1710,14 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `dashboard listen on 127.0.0.1:7597` and `lsof -nP -iTCP:7597 -sTCP:LISTEN` shows
     `TCP 127.0.0.1:7597 (LISTEN)`; frp-rs frps (`--features dashboard`) logs
     `Dashboard listening on 0.0.0.0:7597` and shows `TCP *:7597 (LISTEN)`.
-  * `frp-core/src/config/server.rs` reproduces only the second half (it assigns `0.0.0.0` when the
-    port is set and the address is empty), and no earlier step fills `127.0.0.1`; an *absent* `addr`
-    key reaches the field's serde default (`127.0.0.1`) and then is overwritten by that same branch.
-    So this is a reachable security-relevant divergence (an admin/dashboard listener on every
+  * `frp-core/src/config/server.rs` reproduces only the second half: it assigns `0.0.0.0` when the
+    port is set and the address **is empty**, and no earlier step fills `127.0.0.1`. The divergence
+    is therefore the **explicit `addr = ""`** case only — an *absent* `addr` key never reaches that
+    branch, because the serde field default already supplies `127.0.0.1` and the `is_empty()` guard
+    is then false (measured: an absent `addr` binds `127.0.0.1` on both, i.e. already parity; pinned
+    by the second assertion of
+    `server_web_server_addr_empty_stays_wildcard_a_recorded_divergence`). For the explicit empty
+    string it is a reachable security-relevant divergence (an admin/dashboard listener on every
     interface where Go keeps it loopback), not just a docs defect.
   **Done-when:** match Go — complete `web_server.addr` to `127.0.0.1` on the empty string first, and
   delete or neutralise the `0.0.0.0` branch — with a test asserting the bound address for `addr = ""`
@@ -1732,11 +1736,19 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     frp-rs exits 1 with ``Error: `-c` is not expected in this context``. The same holds for `udp`.
     Dropping `-c` from the frp-rs argv makes both behave the same, so the flag is the only
     difference.
-  **Done-when:** accept `-c`/`--config` (and, to be Go-faithful, the other persistent root flags) on
-  the eight single-proxy parsers and ignore the file, or record the refusal as a deliberate
-  divergence in `docs/developing.md` § CLI inputs with this measurement. The `-c` last-wins work
-  above covers the **five** config-consuming parsers (`run`, `verify`, `reload`, `status`, `stop`) —
-  that wording must not be read as covering these eight. No sha.
+  * Three further argv shapes are the same "what persists into which subparser" question and are
+    recorded in `docs/developing.md` § CLI inputs rather than fixed: `status -c
+    --strict-config=false -c p7498.toml` (Go rc 1 dialling 7498, frp-rs ``-c` requires an
+    argument`), `status -c p7498.toml -- -c p7499.toml` (Go rc 1 dialling 7498, frp-rs
+    `` `-c` is not expected``) and `status -c p7498.toml --config-dir cDir` (Go rc 1 dialling 7498,
+    frp-rs `` `--config-dir` is not expected``). All measured at the head of
+    `fix/frpc-cli-inputs` against Go v0.71.0.
+  **Done-when:** accept `-c`/`--config` (and, to be Go-faithful, the other persistent root flags,
+  including `--config-dir`, and `-`-prefixed values after `-c`) on the eight single-proxy parsers
+  and the admin subcommands and ignore the file, or record each refusal as a deliberate divergence
+  in `docs/developing.md` § CLI inputs with these measurements. The `-c` last-wins work above covers
+  the **five** config-consuming parsers (`run`, `verify`, `reload`, `status`, `stop`) — that wording
+  must not be read as covering these shapes or those eight subcommands. No sha.
 - [ ] **A CLI failure's output shape is still not Go's: frp-rs prints a `tracing` line where Go
   prints one bare error, and `verify` writes to stderr where Go writes to stdout.** Measured on Go
   v0.71.0 and on the head binaries while closing the exit-code item above (only the *exit code*

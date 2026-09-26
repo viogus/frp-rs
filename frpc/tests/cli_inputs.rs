@@ -33,16 +33,24 @@
 //!
 //! The third measured input — case-insensitive config keys — is deliberately
 //! **not** fixed here; it is recorded as a divergence in
-//! `docs/developing.md` § CLI inputs with its measurement and scope. The one
-//! case-shaped test in this file, `case_insensitive_proxy_array_keys_are_dropped_
-//! in_strict_mode`, pins the *shipped* behaviour of a mis-cased key inside
-//! `[[proxies]]` (dropped, rc 0). The analogue for the walked sections is pinned
-//! at the load boundary by `test_strict_rejects_unknown_web_server_key`
-//! (`unknown field "web_server.unknown_web_server_key"`) and
-//! `test_strict_rejects_nested_unknown_keys`
-//! (`unknown field "web_server.addrr"`) in `frp-core/src/config/tests.rs`, and
-//! the array exemption by `strict_mode_exempts_proxy_and_visitor_array_elements`
-//! there.
+//! `docs/developing.md` § CLI inputs with its measurement and scope. The
+//! case-shaped tests in this file pin only what a CLI can see (`rc 0`,
+//! `is valid`, the absence of an `unknown field` line); the **values** are
+//! asserted at the config layer, because a future serde alias would keep these
+//! tests green while honouring the key. Citation pairs (each verified against
+//! the test that actually contains the assertion):
+//!
+//! * walked-section refusal — `test_strict_rejects_nested_unknown_keys`
+//!   (`log.levell`, `auth.tokenz`) and, for the admin section,
+//!   `strict_mode_exempts_proxy_and_visitor_array_elements`
+//!   (`web_server.addrr`) and `test_strict_rejects_unknown_web_server_key`
+//!   (`web_server.unknown_web_server_key`) in `frp-core/src/config/tests.rs`;
+//! * array-element drop, value included —
+//!   `case_insensitive_proxy_array_key_is_dropped_in_strict_mode`
+//!   (`remote_port == 0`) there, alongside the pre-existing
+//!   `strict_mode_exempts_proxy_and_visitor_array_elements`;
+//! * table-alias drop — `case_insensitive_key_in_a_table_alias_is_dropped_in_strict_mode`
+//!   (`virtual_net.address == ""`) there.
 //!
 //! Gated on `full` for the same reason as `admin_cli.rs`: the `frpc` bin carries
 //! `required-features = ["full"]`, so without the gate this file would fail to
@@ -754,18 +762,21 @@ fn status_without_web_server_section_still_refuses() {
 /// pins the current divergence rather than matching Go.
 ///
 /// This is the strict-mode array exemption, not something this branch
-/// introduced: `check_strict` walks the top level and the
-/// `[auth]`/`[log]`/`[webServer]`/`[transport]` sections and deliberately does
-/// not recurse into `[[proxies]]`/`[[visitors]]`/`[[httpPlugins]]`
-/// (`frp-core/src/config/strict.rs:277-285`), and `ProxyConfig` carries no
-/// `deny_unknown_fields`. It is already recorded in `docs/deployment.md:710-747`
-/// (with the end-to-end consequence: the same config makes Go frpc bind the
-/// configured port while frp-rs registers `remote_port: 0` and the server
-/// auto-allocates one) and pinned at the config layer by
-/// `strict_mode_exempts_proxy_and_visitor_array_elements` in
-/// `frp-core/src/config/tests.rs`. What this test adds is the CLI-level pin the
-/// case-insensitive-keys record leans on: making the arrays strict later must
-/// fail here, so it is a deliberate change rather than a silent one.
+/// introduced: `check_strict` recurses only into sections it has a key list for
+/// and deliberately does not descend into `[[proxies]]`/`[[visitors]]`/
+/// `[[httpPlugins]]` (`frp-core/src/config/strict.rs:277-285`), and
+/// `ProxyConfig` carries no `deny_unknown_fields`. It is recorded in
+/// `docs/deployment.md:710-747` with the end-to-end consequence (the same config
+/// makes Go frpc bind the configured port while frp-rs registers
+/// `remote_port: 0` and the server auto-allocates one).
+///
+/// **What this test does and does not pin.** It pins the CLI-visible outcome
+/// only: `rc 0`, `is valid`, no `unknown field` line. It does NOT pin that the
+/// keys were dropped — a `#[serde(alias = "RemotePort")]` would keep it green
+/// while honouring the key. That is asserted by
+/// `case_insensitive_proxy_array_key_is_dropped_in_strict_mode` in
+/// `frp-core/src/config/tests.rs` (`remote_port == 0`), which is where the
+/// value-level claim lives.
 #[test]
 fn case_insensitive_proxy_array_keys_are_dropped_in_strict_mode() {
     let dir = TempDir::new();

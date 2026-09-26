@@ -116,8 +116,16 @@ User-facing release notes for frp-rs.
   `c.Addr = util.EmptyOr(c.Addr, "127.0.0.1")`, so a client config with
   `[webServer] addr = ""` and a port dials loopback. frp-rs used the empty
   string literally and failed with `connect :<port>: failed to lookup address
-  information`, which broke `frpc reload`/`status`/`stop` on such a config and
-  also bound the client's own `[webServer]` admin listener on the empty host.
+  information`, which broke `frpc reload`/`status`/`stop` on such a config. The
+  client's own `[webServer]` admin listener was **not** binding the empty host.
+  Measured at the base with `--features admin` and a live frps: with credentials
+  it logged `admin server starting on :7597` and then
+  `admin server failed: failed to lookup address information …`, so nothing
+  listened; without credentials it logged `refusing to bind admin API to
+  non-loopback address :7597` and listened on `127.0.0.1:7597` through the
+  pre-existing force. The completion removes that failure and makes the
+  configured address explicit; where an unauthenticated listener binds is
+  unchanged.
   Only the empty string is completed: `" "`, `"0.0.0.0"`, `"::1"` and
   `"localhost"` are still passed through to the dialer verbatim, as in Go.
   `frps` is unchanged by this release, and its own completion is a **recorded

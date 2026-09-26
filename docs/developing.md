@@ -1050,6 +1050,21 @@ a reused previous value. Pinned by `frpc/tests/cli_inputs.rs` and the
 parser-level tests in `frp-core/src/cli.rs`. `frps` is unchanged — a separate
 surface, not part of that item.
 
+Three argv shapes around that change are **still divergent**, all measured on the
+same pair of configs and all one underlying rule — bpaf will not take a
+`-`-prefixed token as `-c`'s value, and the admin subcommands define no
+`--config-dir`:
+
+| argv | Go v0.71.0 | frp-rs |
+|---|---|---|
+| `frpc status -c --strict-config=false -c p7498.toml` | rc 1, dials `7498` (`--strict-config=false` is consumed as the flag, not as `-c`'s value) | rc 1, ``-c` requires an argument `FILE`` |
+| `frpc status -c p7498.toml -- -c p7499.toml` | rc 1, dials `7498` (flags after `--` are positional) | rc 1, `` `-c` is not expected in this context`` |
+| `frpc status -c p7498.toml --config-dir cDir` | rc 1, dials `7498` (`--config-dir` exists on the root command) | rc 1, `` `--config-dir` is not expected in this context`` |
+
+They are recorded with the single-proxy `-c` item in `TODO.md` rather than fixed
+here: the first two are the same "what may follow `-c`" question, and the third
+is "which persistent root flags each subparser declares".
+
 **2. An empty `webServer.addr` is completed to `127.0.0.1` — now matched, and
 only the empty string.** Go's `ClientCommonConfig.Complete()` calls
 `c.WebServer.Complete()` (`pkg/config/v1/client.go:96`), which is
@@ -1115,22 +1130,46 @@ and `status` differ on the same file — `verify` parses and reports, while
 The last row is the sharp edge and the reason the earlier "refused (strict) or
 silently mis-defaulted (lenient)" phrasing was wrong in **both** directions:
 
-- **Strict mode does not refuse everywhere.** It walks the top level and the
-  `[auth]`/`[log]`/`[webServer]`/`[transport]` sections
-  (`section_known_keys`, `frp-core/src/config/strict.rs:277-285`) and does not
-  recurse into `[[proxies]]`/`[[visitors]]` (or the server's `[[httpPlugins]]`),
-  so a mis-cased key **inside an array element is dropped even in strict mode**
-  and `frpc verify` exits 0. That is not new with this branch: it is the
-  deliberate exemption stated in
-  [§ Deployment § Dashboard Web UI](deployment.md#dashboard-web-ui), lines
-  710-747 (which also carry the end-to-end consequence: the same config makes Go
-  frpc bind the configured port while frp-rs registers `remote_port: 0` and frps
-  auto-allocates one), and it is pinned by
-  `strict_mode_exempts_proxy_and_visitor_array_elements` in
-  `frp-core/src/config/tests.rs`. This branch adds a CLI-level pin too:
-  `case_insensitive_proxy_array_keys_are_dropped_in_strict_mode` in
-  `frpc/tests/cli_inputs.rs` asserts the rc 0 explicitly, so making the arrays
-  strict later is a deliberate change, not a silent one.
+- **Strict mode does not refuse everywhere: it walks only the sections it has a
+  key list for.** Those are the top level and `[auth]`, `[log]`, `[webServer]`,
+  `[transport]`, `[quic]`, `[observability]`, `[store]` and `[virtual_net]` (all
+  measured: a capitalised nested key is refused in each — `unknown field
+  "log.Level"`, `"auth.Token"`, `"web_server.Port"`, `"TcpMux"`,
+  `"quic.MaxIdleTimeout"`, `"observability.OtlpEndpoint"`, `"store.Path"`,
+  `"virtual_net.Address"`), via `section_known_keys`
+  (`frp-core/src/config/strict.rs:277-285`). Two categories fall outside that
+  list and are **dropped silently even in strict mode**, with `frpc verify`
+  exiting 0:
+  - **array elements** — `[[proxies]]`/`[[visitors]]` (and the server's
+    `[[httpPlugins]]`). Stated in
+    [§ Deployment § Dashboard Web UI](deployment.md#dashboard-web-ui), lines
+    710-747, which also carry the end-to-end consequence: the same config makes
+    Go frpc bind the configured port while frp-rs registers `remote_port: 0` and
+    frps auto-allocates one. Pinned (with the value) by
+    `case_insensitive_proxy_array_key_is_dropped_in_strict_mode` and
+    `strict_mode_exempts_proxy_and_visitor_array_elements` in
+    `frp-core/src/config/tests.rs`, and at the CLI level by
+    `case_insensitive_proxy_array_keys_are_dropped_in_strict_mode` in
+    `frpc/tests/cli_inputs.rs`.
+  - **a table alias the normalizer leaves alone** — `check_strict` looks up the
+    section by the spelling it sees, so a camelCase alias survives (no key list)
+    and is not descended into. Measured with `[virtualNet] Address =
+    "10.1.0.0/24"` (no array anywhere): Go `verify -c` fails with
+    `VirtualNet feature is not enabled; enable it by setting the appropriate
+    feature gate flag`, while frp-rs prints `is valid` and exits 0, the load
+    returns `Ok`, and `virtual_net.address` is `""` — the dropped key even
+    **hides** the feature-gate refusal. The canonical `[virtual_net] Address` IS
+    refused (`unknown field "virtual_net.Address" … did you mean 'address'?`)
+    and `[virtualNet] address` IS read, so this is specifically the alias arm;
+    `normalize_client_config` canonicalises `webServer`/`featureGates`/… but not
+    `virtualNet`. Pinned by
+    `case_insensitive_key_in_a_table_alias_is_dropped_in_strict_mode` in
+    `frp-core/src/config/tests.rs`.
+
+  So neither "the walked sections refuse" nor "arrays are dropped" is the whole
+  rule: the rule is *a mis-cased key is refused only where strict mode has a key
+  list for the surrounding table — everywhere else it is dropped silently, and
+  the dropped key can change a value or hide a later refusal*.
 - **Lenient mode need not end in an error.** With a `[webServer] port` present,
   frp-rs in non-strict mode drops the mis-cased top-level key and then uses the
   defaults — `ServerAddr` becomes `0.0.0.0` and `ServerPort` becomes `7000`
