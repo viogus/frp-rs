@@ -5725,6 +5725,65 @@ fn case_insensitive_proxy_array_key_is_dropped_in_strict_mode() {
     assert_eq!(cfg.proxies[0].local_port, 80);
 }
 
+/// The third non-walked shape: a **nested table inside a walked section**. The
+/// key-list lookup happens for the table being visited, so nothing below it is
+/// visited either — `[auth.tokenSource]` is walked (its own keys are checked)
+/// but `[auth.tokenSource.exec]` has no list and is skipped.
+///
+/// Measured against Go v0.71.0 with `[auth.tokenSource] type = "exec"` and
+/// `[auth.tokenSource.exec] command = "echo tok"`:
+///
+/// * Go refuses **both** spellings — `unsafe feature "TokenSourceExec" is not
+///   enabled …` — because it reads the key either way and then hits its gate.
+/// * frp-rs strict `verify` exits 0 and prints `is valid` for **both** as well;
+///   it has no `TokenSourceExec` gate for the drop to surface at. The drop is
+///   visible only at the parsed-value level, which is what this pin asserts:
+///   `env` is read into the token source, `Env` leaves it empty.
+///
+/// Already documented in `docs/deployment.md:719`
+/// (`auth.tokenSource.exec.env` has no key set at `tokenSource`).
+#[test]
+fn case_insensitive_key_in_a_nested_table_is_dropped_in_strict_mode() {
+    let base = "serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[auth]\nmethod = \"token\"\n\
+                [auth.tokenSource]\ntype = \"exec\"\n[auth.tokenSource.exec]\n\
+                command = \"echo tok\"\n";
+
+    let mut cap = tempfile::NamedTempFile::new().unwrap();
+    cap.write_all(format!("{base}Env = [{{ name = \"A\", value = \"B\" }}]\n").as_bytes())
+        .unwrap();
+    let cfg = load_client_config(cap.path().to_str().unwrap(), true)
+        .expect("strict mode accepts the mis-cased nested key");
+    let exec = cfg
+        .auth
+        .as_ref()
+        .and_then(|a| a.token_source.as_ref())
+        .and_then(|ts| ts.exec.as_ref())
+        .expect("exec source parsed");
+    assert!(
+        exec.env.is_empty(),
+        "the mis-cased `Env` must be dropped (Go would read it and refuse at its \
+         TokenSourceExec gate); got {:?}",
+        exec.env
+    );
+
+    // The correctly spelled key is read — the same frp-rs `verify` rc, a
+    // different parsed value. That difference is the whole claim.
+    let mut lower = tempfile::NamedTempFile::new().unwrap();
+    lower
+        .write_all(format!("{base}env = [{{ name = \"A\", value = \"B\" }}]\n").as_bytes())
+        .unwrap();
+    let cfg = load_client_config(lower.path().to_str().unwrap(), true).unwrap();
+    let exec = cfg
+        .auth
+        .as_ref()
+        .and_then(|a| a.token_source.as_ref())
+        .and_then(|ts| ts.exec.as_ref())
+        .expect("exec source parsed");
+    assert_eq!(exec.env.len(), 1, "the correct spelling IS read");
+    assert_eq!(exec.env[0].name, "A");
+    assert_eq!(exec.env[0].value, "B");
+}
+
 /// The second non-walked shape for a mis-cased key, and the reason the
 /// case-insensitive-keys record cannot say "the walked sections refuse, arrays
 /// are dropped": a **table alias the normalizer leaves alone**. `[virtualNet]`

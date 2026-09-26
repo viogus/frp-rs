@@ -1055,9 +1055,14 @@ same pair of configs and all one underlying rule — bpaf will not take a
 `-`-prefixed token as `-c`'s value, and the admin subcommands define no
 `--config-dir`:
 
-| argv | Go v0.71.0 | frp-rs |
+Every Go cell below ends rc 1 **because nothing is listening** on the port the
+command resolves to (the connection refusal); with a mock answering, the same
+argv exits 0. What the cells pin is *which port* Go resolved, so a reader running
+a listener should expect 0, not a contradiction:
+
+| argv | Go v0.71.0 (no listener) | frp-rs |
 |---|---|---|
-| `frpc status -c --strict-config=false -c p7498.toml` | rc 1, dials `7498` (`--strict-config=false` is consumed as the flag, not as `-c`'s value) | rc 1, ``-c` requires an argument `FILE`` |
+| `frpc status -c --strict-config=false -c p7498.toml` | rc 1, dials `7498` — Go consumes `--strict-config=false` **as `-c`'s value** (measured: `frpc status -c --strict-config=false` alone is `open --strict-config=false: no such file or directory`, and had it been parsed as the flag the first `-c` would have dangled), then the later `-c p7498.toml` overwrites it | rc 1, ``-c` requires an argument `FILE`` |
 | `frpc status -c p7498.toml -- -c p7499.toml` | rc 1, dials `7498` (flags after `--` are positional) | rc 1, `` `-c` is not expected in this context`` |
 | `frpc status -c p7498.toml --config-dir cDir` | rc 1, dials `7498` (`--config-dir` exists on the root command) | rc 1, `` `--config-dir` is not expected in this context`` |
 
@@ -1130,16 +1135,17 @@ and `status` differ on the same file — `verify` parses and reports, while
 The last row is the sharp edge and the reason the earlier "refused (strict) or
 silently mis-defaulted (lenient)" phrasing was wrong in **both** directions:
 
-- **Strict mode does not refuse everywhere: it walks only the sections it has a
-  key list for.** Those are the top level and `[auth]`, `[log]`, `[webServer]`,
-  `[transport]`, `[quic]`, `[observability]`, `[store]` and `[virtual_net]` (all
-  measured: a capitalised nested key is refused in each — `unknown field
-  "log.Level"`, `"auth.Token"`, `"web_server.Port"`, `"TcpMux"`,
-  `"quic.MaxIdleTimeout"`, `"observability.OtlpEndpoint"`, `"store.Path"`,
-  `"virtual_net.Address"`), via `section_known_keys`
-  (`frp-core/src/config/strict.rs:277-285`). Two categories fall outside that
-  list and are **dropped silently even in strict mode**, with `frpc verify`
-  exiting 0:
+- **Strict mode does not refuse everywhere: it walks only the tables it has a
+  key list for.** `section_known_keys`
+  (`frp-core/src/config/strict.rs:277-285`) has nine arms, each listed here with
+  a capitalised nested key measured as refused at the head: the top level
+  (`"ServerAddr"`), `[auth]` (`"auth.Token"`), `[log]` (`"log.Level"`),
+  `[webServer]` (`"web_server.Port"`), `[transport]` (`"TcpMux"`), `[quic]`
+  (`"quic.MaxIdleTimeout"`), `[observability]` (`"observability.OtlpEndpoint"`),
+  `[store]` (`"store.Path"`), `[virtual_net]` (`"virtual_net.Address"`) and the
+  server-only `[sshTunnelGateway]` (`"ssh_tunnel_gateway.BindPort"`; the client
+  side has no such table). Three categories fall outside those arms and are
+  **dropped silently even in strict mode**, with `frpc verify` exiting 0:
   - **array elements** — `[[proxies]]`/`[[visitors]]` (and the server's
     `[[httpPlugins]]`). Stated in
     [§ Deployment § Dashboard Web UI](deployment.md#dashboard-web-ui), lines
@@ -1166,9 +1172,25 @@ silently mis-defaulted (lenient)" phrasing was wrong in **both** directions:
     `case_insensitive_key_in_a_table_alias_is_dropped_in_strict_mode` in
     `frp-core/src/config/tests.rs`.
 
+  - **a nested table inside a walked section** — the key-list lookup happens for
+    the *table being visited*, so a sub-table below a walked section has no list
+    of its own and nothing inside it is visited either. Measured with
+    `[auth.tokenSource] type = "exec"` +
+    `[auth.tokenSource.exec] command = "echo tok"` and a capitalised `Env`:
+    frp-rs strict `verify` exits **0** and prints `is valid` — and so does the
+    correctly-spelled `env`, because frp-rs has no `TokenSourceExec` gate for the
+    drop to surface at. The drop is visible only at the parsed-value level:
+    `env` is read into the token-source struct, `Env` leaves it empty. Go refuses
+    both spellings (`unsafe feature "TokenSourceExec" is not enabled …`). Already
+    documented in
+    [§ Deployment § Dashboard Web UI](deployment.md#dashboard-web-ui), line 719
+    (`auth.tokenSource.exec.env` has no key set at `tokenSource`). Pinned by
+    `case_insensitive_key_in_a_nested_table_is_dropped_in_strict_mode` in
+    `frp-core/src/config/tests.rs`.
+
   So neither "the walked sections refuse" nor "arrays are dropped" is the whole
   rule: the rule is *a mis-cased key is refused only where strict mode has a key
-  list for the surrounding table — everywhere else it is dropped silently, and
+  list for the table being visited — everywhere else it is dropped silently, and
   the dropped key can change a value or hide a later refusal*.
 - **Lenient mode need not end in an error.** With a `[webServer] port` present,
   frp-rs in non-strict mode drops the mis-cased top-level key and then uses the
