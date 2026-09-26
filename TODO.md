@@ -2768,7 +2768,11 @@ nothing about whether the described behaviour still holds.
   `compat-test.sh` scenarios, whereas `tcp-plain`, `tcp-tls`, `tcp-tls-mux` and `ws-plain` were
   reported by the **protocol-matrix** step of the same job, and `go-to-rust-quic` was a
   `compat-test.sh` scenario. `tcp-plain` is listed above only because it was part of the
-  original #341 report; it is not part of this reproduction.
+  original #341 report (Cross-Compat run `35260126822`, 2026-09-17: the same job's
+  `Run compat tests` printed `86 passed, 0 failed` while its protocol matrix printed
+  `8 passed, 3 failed` with `tcp-plain` at zero throughput and `tcp-tls-mux` "proxy port not
+  reachable"; the PR merged with that run still red and it was never re-run); it is not part of
+  this reproduction.
   Also worth separating: the #338 recurrence below is a different phenomenon — a single
   **ETXTBSY unit-test** failure inside the same job, not a scenario that moved between runs.
   Both matter, but "the failure moves around" is a claim about the scenario failures only.
@@ -2856,10 +2860,11 @@ nothing about whether the described behaviour still holds.
   attempt-1 failures and the attempt-2 results were both re-read from this run's logs
   (`gh run view --attempt 1 --log-failed`, then `--attempt 2 --log`) while writing this item.
 
-  **Counted at this head over the record in this item** (not from a stored total). Units matter,
+  **Counted at this head over the record in this item, other than the #341 report it names above**
+  (not from a stored total). Units matter,
   so all three, and "five" is the last one: **four recurrence blocks** record the shape — the
   original report, the PR #351 recurrence, the 2026-09-23 block (two instances) and the
-  2026-09-26 block; the PR #338 ETXTBSY block below is a different phenomenon and is not counted;
+  2026-09-26 block; the PR #338 ETXTBSY block above is a different phenomenon and is not counted;
   **seven failing runs** (2 + 2 + 2 + 1); and **five distinct failing commits** — 2026-09-17 ×2
   (the original report and the PR #351 recurrence: neither carries a run id or commit id in this
   item), `5bf5270`, `9c1b291`, and `f3e7b96` (squash `1becff8`). An earlier reading counted four
@@ -2870,11 +2875,13 @@ nothing about whether the described behaviour still holds.
   `compat-test.sh`, and `tcp-plain`, `tcp-tls`, `tcp-tls-mux` and `ws-plain` from
   `protocol-matrix.sh` — although the 2026-09-26 run did repeat the 2026-09-17 matrix set, so
   "a different scenario each time" holds only in the loose sense that no two consecutive
-  occurrences failed the same *set*. That qualified reading uses two premises, neither checkable
-  from the record: the count is over scenario failures only (the PR #338 ETXTBSY unit-test block
-  is excluded, as it says itself), and the two 2026-09-17 episodes are treated as two different
-  commits on the strength of two different labels with no run id behind either — were they one
-  commit, "no two consecutive" would need restating.
+  occurrences failed the same *set*. That qualified reading rests on one premise the reader should
+  know: the count is over scenario failures only (the PR #338 ETXTBSY unit-test block is excluded,
+  as it says itself). The 2026-09-17 ambiguity does not affect it — those two episodes are treated
+  as two different commits on the strength of two different labels with no run id behind either,
+  and merging them into one would still leave the 2026-09-26 matrix set separated from the
+  remaining 2026-09-17 set by two intervening occurrences (the PR #351 recurrence and the
+  2026-09-23 pair), so no two consecutive sets would become equal.
   This is still exactly why the item exists, and the one instance that was never re-run is the
   worse version of the habit, not a better one: **four** of the five were re-run to green (the
   original report on the third run, PR #351 on the third attempt, `9c1b291` on attempt 2,
