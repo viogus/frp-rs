@@ -1950,12 +1950,14 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     emptyaddr.toml` (`addr = ""`, `port = 7499`) → both dial `127.0.0.1:7499`; before, frp-rs
     printed `connect :7499: failed to lookup address information`. Only the empty string is
     completed — `" "` still reaches the dialer verbatim and fails (the guard against a `trim()`),
-    while `"0.0.0.0"`/`"::1"`/`"localhost"` pass through as Go does. **The server is *not* matched
-    and this block does not claim it:** Go's `ServerConfig.Complete()` runs the same
+    while `"0.0.0.0"`/`"::1"`/`"localhost"` pass through as Go does. **The server is matched too,
+    but not by this change:** Go's `ServerConfig.Complete()` runs the same
     `WebServer.Complete()` (`127.0.0.1`) at `pkg/config/v1/server.go:107` *before* the
-    `Port > 0 → "0.0.0.0"` line at `:116-118`, so that line is dead; measured, Go frps binds
-    `127.0.0.1:7597` where frp-rs (`--features dashboard`) binds `*:7597`. Filed as its own item
-    below (`frp-core/src/config/server.rs:402` is a stale two-step without the first half).
+    `Port > 0 → "0.0.0.0"` line at `:116-117`, so that line is dead; when this block was written,
+    Go frps bound `127.0.0.1:7597` where frp-rs (`--features dashboard`) bound `*:7597` — that was
+    filed as its own item below and **has since been fixed** (see that item's `Done` block; the
+    server-side assertion now lives in `server_web_server_addr_empty_is_completed_to_localhost` and
+    the spawn tests in `frp-server/tests/dashboard_integration.rs`).
   * **Case-insensitive keys → recorded divergence, not fixed.** Go's `encoding/json` matches field
     *and table* names case-insensitively at every level, including inside `[[proxies]]` — measured:
     `ServerAddr`/`SERVERADDR`, `[WebServer]`, `[webServer] Port`, and `LocalPort`/`RemotePort`
@@ -1982,7 +1984,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     (`client_web_server_addr_empty_is_completed_to_localhost`,
     `client_web_server_addr_explicit_and_absent_are_unchanged`). Doc claims in `docs/developing.md`
     § CLI inputs and `CHANGELOG.md`.
-- [ ] **An empty `webServer.addr` still binds frps to `0.0.0.0`, where Go binds `127.0.0.1`.** Found
+- [x] **An empty `webServer.addr` still binds frps to `0.0.0.0`, where Go binds `127.0.0.1`.** Found
   while closing the frpc item above; the two-step in `frp-core/src/config/server.rs` is the opposite
   order from Go's, so Go's `0.0.0.0` branch is dead and frp-rs's `127.0.0.1` step is missing.
   * Go v0.71.0 `ServerConfig.Complete()` (`pkg/config/v1/server.go:101-120`): line 107 calls
@@ -2010,6 +2012,49 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   (a server that *must* expose the dashboard on a wildcard address for an empty value), say so with
   the measurement and the reason instead; do not leave the current claim that frp-rs "already does"
   what Go does. No sha.
+  **Done (2026-09-26, at the head of `fix/frps-empty-addr`).** Matched Go; no deliberate exception.
+  * **Fix.** `ServerConfig::complete` (`frp-core/src/config/server.rs`) now fills the **empty**
+    `web_server.addr` with `127.0.0.1` unconditionally (Go's `WebServer.Complete()` does not look at
+    the port), and the `Port > 0 -> "0.0.0.0"` assignment that Go's dead `:116-117` branch
+    corresponds to is **deleted**, not left as a second step. An absent `addr` key still goes through
+    the serde default (`127.0.0.1`) and every explicit non-empty address is used verbatim.
+  * **Measured, same config for both binaries** (`[webServer]` with the `addr` varied, one free
+    dashboard port and one free `bindPort` per row, `user`/`password`, plus an `[auth]` token —
+    without credentials frp-rs force-binds loopback and the wildcard cells would be false),
+    Go v0.71.0 vs frp-rs `frps --features dashboard`, both started by a bounded probe that
+    SIGTERMs the child, address read back with `lsof -nP -iTCP:<port> -sTCP:LISTEN`:
+
+    | `addr` | dashboard port | Go v0.71.0 | frp-rs before | frp-rs now |
+    |---|---|---|---|---|
+    | `""` | 17701 | `dashboard listen on 127.0.0.1:17701`; `TCP 127.0.0.1:17701 (LISTEN)` | `Dashboard listening on 0.0.0.0:17701`; `TCP *:17701 (LISTEN)` | `Dashboard listening on 127.0.0.1:17701`; `TCP 127.0.0.1:17701 (LISTEN)` |
+    | absent | 17703 | `dashboard listen on 127.0.0.1:17703`; `TCP 127.0.0.1:17703 (LISTEN)` | `127.0.0.1:17703` (serde default) | `127.0.0.1:17703` |
+    | `"0.0.0.0"` | 17705 | `dashboard listen on 0.0.0.0:17705`; `TCP *:17705 (LISTEN)` | same | same |
+    | `"::1"` | 17707 | `dashboard listen on [::1]:17707`; `TCP [::1]:17707 (LISTEN)` | same | same |
+
+    No listener was left behind: after the probes, `lsof -nP -iTCP:17700-17710 -sTCP:LISTEN` was empty
+    and no `frps -c /tmp/fer/...` process remained.
+  * **Tests.** The old pin
+    `server_web_server_addr_empty_stays_wildcard_a_recorded_divergence` is replaced by
+    `server_web_server_addr_empty_is_completed_to_localhost` (`frp-core/src/config/tests.rs`), which
+    asserts `""` → `127.0.0.1` with and without a port, `"0.0.0.0"`/`"::1"`/`"10.1.2.3"` verbatim, and
+    the absent-key default. The **bound address** is asserted by three new spawn tests in
+    `frp-server/tests/dashboard_integration.rs` (`dashboard_explicit_empty_addr_binds_loopback_only`,
+    `dashboard_absent_addr_binds_loopback_only`, `dashboard_explicit_wildcard_addr_binds_every_interface`),
+    which run the real `frps` binary from this lane's `FRPS_BIN` (built `--features dashboard`), read its
+    post-bind `Dashboard listening on …` line, connect to `127.0.0.1`, and probe a non-loopback local
+    IPv4: refused for both loopback cases, accepted for the explicit `0.0.0.0` case — that last test is
+    the positive control for the probe (a host where the probe could never connect fails there rather
+    than letting the two loopback assertions pass vacuously). Red evidence: before the fix the config
+    test failed with `left: "0.0.0.0", right: "127.0.0.1"` and the empty-addr spawn test failed with
+    `Dashboard listening on 0.0.0.0:<port>` (19 passed / 1 failed in the dashboard bin); after, 20
+    passed. Helper added: `common::CapturedFrps` / `common::frps_binary` (`frp-server/tests/common/mod.rs`).
+  * **Carriers.** `docs/developing.md` § CLI inputs rewritten (the paragraph no longer records a
+    server-side divergence and carries the measured table above), `docs/config.md`'s two `webServer.addr`
+    rows (server and client admin API) no longer say "Empty string binds to all interfaces", the stale
+    server-divergence comment in `frp-core/src/config/client.rs` and the `WebServerConfig::addr` doc
+    comment in `frp-core/src/config/server.rs` now state the Go order, `CHANGELOG.md` gained the
+    user-visible binding-change entry (and the frpc entry no longer claims `frps` is unchanged), and this
+    item is ticked. `CHANGELOG.md:1250` is a historical v0.69-era entry and was left alone.
 - [ ] **`frpc`'s eight single-proxy subcommands reject `-c`/`--config`, which Go accepts and
   ignores.** Go's `-c` is a persistent rootCmd flag, so every subcommand parses it; the single-proxy
   commands simply never read the value. frp-rs's bpaf parsers for `tcp`/`udp`/`http`/`https`/`stcp`/

@@ -82,15 +82,6 @@ User-facing release notes for frp-rs.
   The measurements, the reason no bounded alias set closes it, and the covered
   vs uncovered scope are in `docs/developing.md` § CLI inputs; the array
   exemption's own consequences are in `docs/deployment.md`.
-- **An empty `[webServer] addr` still binds `frps` to `0.0.0.0` — unchanged, and
-  a divergence found while fixing the client side.** Go's server completes the
-  address to `127.0.0.1` before its "set port → `0.0.0.0`" branch, so that branch
-  never fires there; frp-rs has only the second half. Measured with
-  `[webServer] addr = ""`, `port = 7597` and credentials: Go frps listens on
-  `127.0.0.1:7597`, frp-rs (`--features dashboard`) on `*:7597`. An admin
-  listener on every interface where Go keeps it loopback is a security-relevant
-  difference, so this one is tracked in `TODO.md` with the measurement rather
-  than described as parity. Not changed in this release.
 - **`--config-dir` mode keeps its own refusal code — unchanged, and a
   divergence.** A directory that does not exist, is empty, or holds a config
   that fails to parse still exits **2** on the frp-rs side, where Go's own
@@ -169,11 +160,31 @@ User-facing release notes for frp-rs.
   unchanged.
   Only the empty string is completed: `" "`, `"0.0.0.0"`, `"::1"` and
   `"localhost"` are still passed through to the dialer verbatim, as in Go.
-  `frps` is unchanged by this release, and its own completion is a **recorded
-  divergence, not parity**: frp-rs re-defaults a set port to `0.0.0.0`, while
-  Go's equivalent branch is dead (its address was already completed to
-  `127.0.0.1` first), so an empty `[webServer] addr` leaves Go listening on
-  `127.0.0.1` and frp-rs on every interface. Tracked in `TODO.md`.
+  The server's own `[webServer] addr` is a separate, also-fixed surface — see
+  the entry below.
+- **An empty `webServer.addr` no longer puts the `frps` dashboard on every
+  interface — a behaviour change, and a hardening fix.** Found while closing the
+  client-side item above, where it was recorded as an unchanged divergence. Go's
+  `ServerConfig.Complete()` calls `c.WebServer.Complete()` at
+  `pkg/config/v1/server.go:107` — `Addr = util.EmptyOr(Addr, "127.0.0.1")`
+  (`pkg/config/v1/common.go:71-72`) — **before** the
+  `if c.WebServer.Port > 0 { c.WebServer.Addr = util.EmptyOr(c.WebServer.Addr,
+  "0.0.0.0") }` branch at `:116-117`, so that branch is dead on Go and an
+  explicit `addr = ""` with a set port stays loopback. frp-rs implemented only
+  the second half: it rewrote an empty address to `0.0.0.0` whenever the
+  dashboard port was set, so with `[webServer] addr = ""` plus credentials the
+  dashboard and `/metrics` listened on **all** interfaces where Go listens on
+  `127.0.0.1`. Measured, same config for both binaries (dashboard port 17701),
+  `lsof -nP -iTCP:17701 -sTCP:LISTEN`: Go `TCP 127.0.0.1:17701 (LISTEN)`,
+  frp-rs (before) `TCP *:17701 (LISTEN)`, frp-rs (now)
+  `TCP 127.0.0.1:17701 (LISTEN)`. An *absent* `addr` key was already
+  `127.0.0.1` on both (the serde default supplies it) and every explicit
+  address is still used verbatim — `"0.0.0.0"` keeps binding all interfaces,
+  `"::1"` stays `[::1]`. The completion now follows Go's order and the dead
+  wildcard branch is gone; the bound address is pinned by tests that spawn the
+  real binary (`frp-server/tests/dashboard_integration.rs`). Operators who
+  relied on `addr = ""` meaning "all interfaces" must now write
+  `addr = "0.0.0.0"`.
 - **`frp-server` builds with only the `dashboard` feature compile again.** A
   downstream workspace (or `cargo check -p frp-server --no-default-features
   --features dashboard --all-targets`) that had frp-core's `oidc` on while
