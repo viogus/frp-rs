@@ -4519,10 +4519,7 @@ fn serde_keys_of_struct(src: &str, name: &str) -> std::collections::BTreeSet<Str
             at_boundary = depth == 0;
         } else if body[i..].starts_with("#[") {
             let (text, next) = split_attribute(&body[i..]);
-            if let Some(args) = text
-                .strip_prefix("serde(")
-                .and_then(|t| t.strip_suffix(')'))
-            {
+            if let Some(args) = serde_args_of(&text) {
                 pending.extend(parse_serde_args(args));
             }
             i += next;
@@ -4587,10 +4584,7 @@ fn serde_attrs_in(text: &str) -> Vec<SerdeAttr> {
             i += text[i..].find('\n').unwrap_or(text.len() - i);
         } else if text[i..].starts_with("#[") {
             let (attr, next) = split_attribute(&text[i..]);
-            if let Some(args) = attr
-                .strip_prefix("serde(")
-                .and_then(|t| t.strip_suffix(')'))
-            {
+            if let Some(args) = serde_args_of(&attr) {
                 out.extend(parse_serde_args(args));
             }
             i += next;
@@ -4599,6 +4593,26 @@ fn serde_attrs_in(text: &str) -> Vec<SerdeAttr> {
         }
     }
     out
+}
+
+/// Arguments of a `#[serde(...)]` attribute, or `None` for any other attribute.
+///
+/// A `serde` attribute that is not exactly the `serde(...)` form — e.g.
+/// `#[serde (rename = "…")]` with whitespace before the parenthesis — **panics**
+/// rather than being skipped: skipping it would treat the field as unrenamed,
+/// which is the drift this guard exists to catch. `rustfmt` normalises the space
+/// form away, so the panic is belt-and-braces for hand-written code.
+fn serde_args_of(attr: &str) -> Option<&str> {
+    let rest = attr.strip_prefix("serde")?;
+    if let Some(args) = rest.strip_prefix('(') {
+        return args.strip_suffix(')');
+    }
+    assert!(
+        !rest.starts_with(|c: char| c.is_whitespace()),
+        "`#[{attr}]` starts with `serde` but is not the `#[serde(...)]` form this \
+         guard parses; the key set cannot be derived from it"
+    );
+    None
 }
 
 /// Consume one balanced `#[...]` group at the start of `text`; returns the text
@@ -4660,6 +4674,15 @@ fn field_name_at(text: &str) -> Option<(String, usize)> {
     let ws = rest.len() - rest.trim_start().len();
     consumed += ws;
     rest = rest.trim_start();
+    // Raw identifier: serde's accepted key is the **stripped** name — measured
+    // with a probe struct (`{"match": …}` sets a `r#match` field, the alias
+    // `{"aliasMatch": …}` does too, and the literal `{"r#match": …}` does not) —
+    // so `r#` is dropped here. Before this, the field was not recognised at all
+    // and the extractor returned an empty set for the struct.
+    if let Some(stripped) = rest.strip_prefix("r#") {
+        consumed += 2;
+        rest = stripped;
+    }
     let ident_len = rest
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .unwrap_or(rest.len());
@@ -4867,6 +4890,49 @@ fn strict_key_extractor_refuses_open_ended_structs() {
 fn strict_key_extractor_refuses_unknown_attrs() {
     let synthetic = "pub struct Odd {\n    #[serde(invented_attr)]\n    pub x: u8,\n}\n";
     let _ = serde_keys_of_struct(synthetic, "Odd");
+}
+
+/// A raw identifier contributes its **stripped** name, which is what serde
+/// accepts: measured with a probe struct, `{"match": …}` sets a `r#match` field
+/// and the alias `{"aliasMatch": …}` sets it too, while the literal
+/// `{"r#match": …}` is ignored. Before this the field was not recognised at all
+/// and the extractor returned an **empty** set for the whole struct, so adding a
+/// raw-ident field to one of the six structs left the guard green while the
+/// binary refused both the stripped name and the alias.
+#[test]
+fn strict_key_extractor_strips_raw_identifier_prefixes() {
+    let synthetic = "pub struct Raw {\n    #[serde(default, alias = \"aliasMatch\")]\n    pub r#match: String,\n}\n";
+    let keys = serde_keys_of_struct(synthetic, "Raw");
+    let expected: std::collections::BTreeSet<String> = ["match", "aliasMatch"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(keys, expected);
+}
+
+/// Teeth for the same hole on the open-ended path: a `#[serde(flatten)]` field
+/// written as a raw identifier **in last position** used to leave the stale
+/// attribute list unclassified, so the extractor returned a closed set
+/// (`{"kept"}`) with no panic — the guard would have blessed a struct whose key
+/// set is open-ended.
+#[test]
+#[should_panic(expected = "does not model `#[serde(flatten)]`")]
+fn strict_key_extractor_refuses_open_ended_structs_behind_a_raw_ident() {
+    let synthetic = "pub struct OpenRaw {\n    pub kept: u8,\n    #[serde(flatten)]\n    pub r#extra: std::collections::HashMap<String, String>,\n}\n";
+    let _ = serde_keys_of_struct(synthetic, "OpenRaw");
+}
+
+/// Teeth: `#[serde (rename = "…")]` with whitespace before the parenthesis is
+/// not parsed as a serde attribute, so skipping it silently would treat the
+/// field as unrenamed. `rustfmt` normalises the spelling, but the extractor
+/// fails closed anyway.
+#[test]
+#[should_panic(expected = "is not the `#[serde(...)]` form")]
+fn strict_key_extractor_refuses_the_spaced_serde_attribute_form() {
+    let _ = serde_keys_of_struct(
+        "pub struct Spaced {\n    #[serde (rename = \"x\")]\n    pub inner: u8,\n}\n",
+        "Spaced",
+    );
 }
 
 /// Teeth: a struct that is not in the source must panic, not return an empty
