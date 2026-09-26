@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::process::{Child, Command};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tokio::net::TcpSocket;
@@ -558,6 +559,97 @@ pub async fn login_with_test_token(
     raw_login(addr, Some(key), Some(ts), TEST_TOKEN).await
 }
 
+/// Resolve the `frps` binary the way the CLI-driven tests need it (there is no
+/// `CARGO_BIN_EXE_frps` for this package: `frps` is not a `frp-server`
+/// dependency). Order of precedence:
+///   1. `FRPS_BIN` env var (set by CI to a `--features dashboard` build)
+///   2. `CARGO_BIN_EXE_frps` (set by cargo when frps *is* a dependency)
+///   3. `../frps` in the workspace root (downloaded release)
+///   4. `../target/{profile}/frps` (built from source)
+#[allow(dead_code)]
+pub fn frps_binary() -> String {
+    std::env::var("FRPS_BIN")
+        .or_else(|_| std::env::var("CARGO_BIN_EXE_frps"))
+        .or_else(|_| {
+            let local = "../frps";
+            if std::path::Path::new(local).is_file() {
+                Ok(local.to_string())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        })
+        .unwrap_or_else(|_| {
+            let profile = if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            };
+            format!("../target/{}/frps", profile)
+        })
+}
+
+/// A spawned real `frps` child whose stdout **and** stderr are redirected to a
+/// file in its scratch config dir, so a test can read the listener lines it
+/// emitted (which `FrpsHandle` deliberately discards). Kills the process and
+/// removes the scratch dir on drop, so every spawn is bounded.
+#[allow(dead_code)]
+pub struct CapturedFrps {
+    child: Child,
+    log_path: PathBuf,
+    _config_dir: tempfile::TempDir,
+}
+
+impl CapturedFrps {
+    /// Spawn `frps -c <config>` with `config_content` and capture its output.
+    /// Does **not** wait for the listeners: the caller polls `log()` (or the
+    /// port) so the wait is bounded by the caller's own timeout.
+    #[allow(dead_code)]
+    pub fn start(config_content: &str) -> Self {
+        let config_dir = tempfile::TempDir::new().unwrap();
+        let config_path = config_dir.path().join("frps.toml");
+        std::fs::write(&config_path, config_content).unwrap();
+        let log_path = config_dir.path().join("frps.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+
+        let child = Command::new(frps_binary())
+            .arg("-c")
+            .arg(&config_path)
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("failed to start frps");
+
+        Self {
+            child,
+            log_path,
+            _config_dir: config_dir,
+        }
+    }
+
+    /// Everything frps has written to stdout/stderr so far. `tracing` writes
+    /// each line through a line-buffered writer, so a completed line is
+    /// readable as soon as it is emitted.
+    #[allow(dead_code)]
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(&self.log_path).unwrap_or_default()
+    }
+
+    /// False once the child has exited, so a caller polling `log()` can fail
+    /// fast on a startup error instead of waiting out its timeout.
+    #[allow(dead_code)]
+    pub fn running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+impl Drop for CapturedFrps {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Handle to a running frps child process with dashboard.
 /// Kills the process on drop.
 #[allow(dead_code)]
@@ -606,29 +698,8 @@ impl FrpsHandle {
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
 
-        // Resolve frps binary. Order of precedence:
-        //   1. FRPS_BIN env var (pre-built release binary)
-        //   2. CARGO_BIN_EXE_frps (set by cargo when frps is a dependency)
-        //   3. ../frps in workspace root (downloaded release)
-        //   4. ../target/{profile}/frps (built from source)
-        let frps_bin = std::env::var("FRPS_BIN")
-            .or_else(|_| std::env::var("CARGO_BIN_EXE_frps"))
-            .or_else(|_| {
-                let local = "../frps";
-                if std::path::Path::new(local).is_file() {
-                    Ok(local.to_string())
-                } else {
-                    Err(std::env::VarError::NotPresent)
-                }
-            })
-            .unwrap_or_else(|_| {
-                let profile = if cfg!(debug_assertions) {
-                    "debug"
-                } else {
-                    "release"
-                };
-                format!("../target/{}/frps", profile)
-            });
+        // Resolve frps binary (see `frps_binary` for the precedence order).
+        let frps_bin = frps_binary();
 
         let child = Command::new(&frps_bin)
             .arg("-c")

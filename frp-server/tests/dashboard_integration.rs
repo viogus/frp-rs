@@ -1669,3 +1669,227 @@ enable_prometheus = true
         "scrape body must render the client_counts family, got: {body}"
     );
 }
+
+// ─── The dashboard's *bound* address for an empty / absent `[webServer] addr` ──
+//
+// Go frp v0.71.0 `ServerConfig.Complete()` (`pkg/config/v1/server.go:101`) calls
+// `c.WebServer.Complete()` at `:107`, which is
+// `c.Addr = util.EmptyOr(c.Addr, "127.0.0.1")` (`pkg/config/v1/common.go:71-72`),
+// and only afterwards runs the `if c.WebServer.Port > 0 { c.WebServer.Addr =
+// util.EmptyOr(c.WebServer.Addr, "0.0.0.0") }` branch at `:116-117` — which can
+// therefore never fire. So on Go an explicit `addr = ""` with a set port stays
+// **loopback**, and `0.0.0.0` is only ever a value the operator wrote.
+//
+// These tests pin the *listener*, not the config field: they spawn the real
+// `frps` binary (`common::frps_binary`, i.e. this lane's `FRPS_BIN`, built with
+// `--features dashboard` by `.github/workflows/ci.yml`) and check
+//   (a) the address it logs after `TcpListener::bind` succeeds
+//       (`frp-server/src/dashboard.rs`: the line is emitted post-bind) and
+//   (b) a real TCP connect on `127.0.0.1` succeeding and on a *non-loopback*
+//       local IPv4 failing — i.e. the port is not on every interface.
+//
+// (b) is the only dependency-free, OS-observed discriminator available: binding
+// to `127.0.0.1` and to `0.0.0.0` are indistinguishable from `127.0.0.1` alone.
+// The wildcard test doubles as the **positive control** for it: if the host's
+// non-loopback probe could never connect, that test fails rather than letting
+// the two loopback tests pass vacuously. Where a host has no non-loopback IPv4
+// at all, `local_non_loopback_ipv4()` returns `None` and the two loopback tests
+// fall back to (a) + (b)'s `127.0.0.1` half, which the positive control would
+// already have failed on — that is stated, not hidden.
+//
+// Credentials are mandatory in these configs: without `user`/`password`
+// `frp-server/src/dashboard.rs` force-binds `127.0.0.1` regardless of the
+// configured address, so a no-credential config would pass both cases for the
+// wrong reason.
+
+fn bind_addr_config(bind_port: u16, dashboard_port: u16, addr_line: Option<&str>) -> String {
+    let addr_line = addr_line.map(|l| format!("{l}\n")).unwrap_or_default();
+    format!(
+        r#"bind_addr = "127.0.0.1"
+bind_port = {bind_port}
+
+[auth]
+method = "token"
+token = "test-token"
+
+[transport]
+tcp_mux = false
+
+[web_server]
+{addr_line}port = {dashboard_port}
+user = "admin"
+password = "admin"
+"#,
+        bind_port = bind_port,
+        dashboard_port = dashboard_port,
+    )
+}
+
+/// Drop ANSI SGR escapes. `frps` colourises output unless `--disable-log-color`
+/// / `log.disable_print_color` is set, and these configs do not — the listener
+/// message is one contiguous string, but stripping keeps the assertion and the
+/// failure messages readable and colour-proof.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c == '\u{1b}' {
+            for c in it.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Poll `frps`'s captured output for its post-bind listener line. Fails fast
+/// (with the whole log) if the child exits first.
+fn wait_for_dashboard_line(frps: &mut common::CapturedFrps) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(line) = strip_ansi(&frps.log())
+            .lines()
+            .find(|l| l.contains("Dashboard listening on"))
+            .map(str::to_string)
+        {
+            return line;
+        }
+        if !frps.running() {
+            panic!(
+                "frps exited before binding the dashboard; log:\n{}",
+                frps.log()
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "frps never logged a dashboard listener line; log:\n{}",
+                frps.log()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn tcp_connect_ok(host: std::net::IpAddr, port: u16) -> bool {
+    let addr = std::net::SocketAddr::new(host, port);
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).is_ok()
+}
+
+/// The local IPv4 the kernel would use to reach the outside world. `connect()`
+/// on a UDP socket sends nothing; it only performs the route lookup that
+/// selects the source address. `None` when the host has no such route.
+fn local_non_loopback_ipv4() -> Option<std::net::Ipv4Addr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("192.0.2.1:9").ok()?; // TEST-NET-1; no packet is emitted
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) if !v4.is_loopback() => Some(v4),
+        _ => None,
+    }
+}
+
+/// `addr = ""` with a port: Go keeps this loopback (`WebServer.Complete()`
+/// fills it before the `0.0.0.0` branch), and so must frps. Measured before the
+/// fix: frps logged `Dashboard listening on 0.0.0.0:<port>` and the port was
+/// reachable on a non-loopback local address.
+#[test]
+fn dashboard_explicit_empty_addr_binds_loopback_only() {
+    let bind_port = common::allocate_port();
+    let dashboard_port = common::allocate_port();
+    let cfg = bind_addr_config(bind_port, dashboard_port, Some("addr = \"\""));
+    let mut frps = common::CapturedFrps::start(&cfg);
+
+    let line = wait_for_dashboard_line(&mut frps);
+    assert!(
+        line.contains(&format!(
+            "Dashboard listening on 127.0.0.1:{dashboard_port}"
+        )),
+        "addr = \"\" must bind 127.0.0.1:{dashboard_port} (Go frp v0.71.0 \
+         pkg/config/v1/server.go:107 -> common.go:71-72), got: {line:?}\nlog:\n{}",
+        frps.log()
+    );
+    assert!(
+        tcp_connect_ok("127.0.0.1".parse().unwrap(), dashboard_port),
+        "dashboard must actually accept on 127.0.0.1:{dashboard_port}"
+    );
+    match local_non_loopback_ipv4() {
+        Some(ip) => assert!(
+            !tcp_connect_ok(std::net::IpAddr::V4(ip), dashboard_port),
+            "addr = \"\" must NOT listen on every interface, but {ip}:{dashboard_port} \
+             accepted a connection (log line: {line:?})"
+        ),
+        None => eprintln!(
+            "no non-loopback local IPv4 on this host: the every-interface half of \
+             dashboard_explicit_empty_addr_binds_loopback_only was not exercised \
+             (the wildcard positive control fails on such a host)"
+        ),
+    }
+}
+
+/// The absent-key case: the serde field default is already `127.0.0.1`, so this
+/// was parity before the completion change and must stay parity after it.
+#[test]
+fn dashboard_absent_addr_binds_loopback_only() {
+    let bind_port = common::allocate_port();
+    let dashboard_port = common::allocate_port();
+    let cfg = bind_addr_config(bind_port, dashboard_port, None);
+    let mut frps = common::CapturedFrps::start(&cfg);
+
+    let line = wait_for_dashboard_line(&mut frps);
+    assert!(
+        line.contains(&format!("Dashboard listening on 127.0.0.1:{dashboard_port}")),
+        "an absent addr must keep the serde default 127.0.0.1:{dashboard_port}, got: {line:?}\nlog:\n{}",
+        frps.log()
+    );
+    assert!(
+        tcp_connect_ok("127.0.0.1".parse().unwrap(), dashboard_port),
+        "dashboard must actually accept on 127.0.0.1:{dashboard_port}"
+    );
+    match local_non_loopback_ipv4() {
+        Some(ip) => assert!(
+            !tcp_connect_ok(std::net::IpAddr::V4(ip), dashboard_port),
+            "an absent addr must NOT listen on every interface, but {ip}:{dashboard_port} \
+             accepted a connection (log line: {line:?})"
+        ),
+        None => eprintln!(
+            "no non-loopback local IPv4 on this host: the every-interface half of \
+             dashboard_absent_addr_binds_loopback_only was not exercised \
+             (the wildcard positive control fails on such a host)"
+        ),
+    }
+}
+
+/// An explicit `addr = "0.0.0.0"` passes through untouched — the deleted
+/// `Port > 0 -> "0.0.0.0"` branch must not be replaced by anything that
+/// second-guesses an operator-written wildcard. This is also the positive
+/// control for the non-loopback probe used by the two tests above.
+#[test]
+fn dashboard_explicit_wildcard_addr_binds_every_interface() {
+    let bind_port = common::allocate_port();
+    let dashboard_port = common::allocate_port();
+    let cfg = bind_addr_config(bind_port, dashboard_port, Some("addr = \"0.0.0.0\""));
+    let mut frps = common::CapturedFrps::start(&cfg);
+
+    let line = wait_for_dashboard_line(&mut frps);
+    assert!(
+        line.contains(&format!("Dashboard listening on 0.0.0.0:{dashboard_port}")),
+        "an explicit addr = \"0.0.0.0\" must pass through untouched, got: {line:?}\nlog:\n{}",
+        frps.log()
+    );
+    assert!(
+        tcp_connect_ok("127.0.0.1".parse().unwrap(), dashboard_port),
+        "dashboard must accept on 127.0.0.1:{dashboard_port}"
+    );
+    let ip = local_non_loopback_ipv4().expect(
+        "positive control for the every-interface probe needs a non-loopback local IPv4; \
+         none was discovered, so the probe cannot be validated on this host",
+    );
+    assert!(
+        tcp_connect_ok(std::net::IpAddr::V4(ip), dashboard_port),
+        "positive control: an explicit 0.0.0.0 dashboard must accept on the non-loopback \
+         local address {ip}:{dashboard_port} (log line: {line:?})"
+    );
+}
