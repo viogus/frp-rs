@@ -1097,10 +1097,10 @@ complete fix means either per-field aliases for every case permutation across
 the whole config tree or a canonicalising pre-pass in front of
 `serde_json::from_value`.
 
-Measured against Go v0.71.0, cell by cell, with the exact configs named. Each
-row's config is a bare `ServerAddr`/`ServerPort` pair (no `[webServer]`) unless
-the cell says otherwise; `verify` and `status` differ on the same file because
-`verify` never resolves an admin address:
+Measured against Go v0.71.0, cell by cell, with the exact configs named. `verify`
+and `status` differ on the same file — `verify` parses and reports, while
+`status` also has to resolve an admin address, which is where a dropped
+`[webServer] port` turns into Go's refusal sentence:
 
 | config | command | Go v0.71.0 | frp-rs strict | frp-rs `--strict-config=false` |
 |---|---|---|---|---|
