@@ -1321,11 +1321,14 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   once per stage and is collapsed by path) — so there is no re-implementation of `.gitignore`
   matching, it is one fast call, and it fixes the root-anchoring bug (b) for free. The walk is used
   **only** when there is no `.git` entry at all (not even a dangling symlink); if any `.git` entry
-  is present but the index cannot be read the gate exits 3 instead of silently walking (a walk would
-  scan the gitignored state this gate exists to avoid), so a sparse checkout, or any worktree missing
-  a tracked path, is not certified. `git ls-files` also runs with `GIT_DIR`/`GIT_WORK_TREE`/
-  `GIT_INDEX_FILE`/`GIT_COMMON_DIR` stripped from the environment, so the list always comes from the
-  tree the script is in. Submodule contents are never scanned —
+  is present but the index cannot be read the path scan exits 3 instead of silently walking (a walk
+  would scan the gitignored state this gate exists to avoid; the wrapping run is red at exit 1), so a
+  sparse checkout, or any worktree missing a tracked path, is not certified. `git ls-files` also runs
+  with `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_COMMON_DIR`/`GIT_OBJECT_DIRECTORY` and any
+  `GIT_TRACE*` stripped from the environment, so the list comes from the repository git resolves for
+  the script's directory, not from an inherited environment: `git rev-parse --show-toplevel` must
+  equal the working directory (`realpath` on both sides) or the path scan exits 3. Submodule contents
+  are never scanned —
   the index lists only the gitlink. The index supplies the file *list*; content is read from the
   **worktree**, so a tracked file edited locally is gated at its current content. Paths are
   NUL-split and decoded with `surrogateescape`, so spaces, newlines and non-ASCII cannot be
@@ -1777,7 +1780,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   (documented in the gate's own known-not-covered list); the tracked-`__pycache__` and
   symlinked-`.rs` items below are unchanged by this work.
 
-- [ ] **A committed `__pycache__` byte-code file is tracked in the repository.**
+- [x] **A committed `__pycache__` byte-code file is tracked in the repository.**
   `scripts/__pycache__/rust_comments.cpython-314.pyc` has been tracked since `84a621f` (#354): a
   CPython-version- and platform-specific artifact that churns on any diff of the module, is
   meaningless on another interpreter, and is exactly what `.gitignore` is for. Measured 2026-09-25
@@ -1785,6 +1788,30 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   correctness issue — Python validates the source's mtime/size and falls back to it, and the
   `.git`-less walk fallback is unaffected. **Done-when:** the file is untracked, `__pycache__/` is
   in `.gitignore`, and `bash scripts/repo-health.sh` still exits 0.
+
+  Done (measured 2026-09-26, untracked in this branch, based on `main` @ `774ed26`): both halves of
+  the done-when. Pre-fix blob, observed before the untracking —
+  `git rev-parse --verify 774ed26:scripts/__pycache__/rust_comments.cpython-314.pyc` →
+  `8bc4eaa077a244bcdc2f56903103e690910b8d18`; no sha is invented for the fix, this branch's own
+  commit is the untracking. `git ls-files scripts/__pycache__` listed that one path before and
+  prints nothing after `git rm --cached scripts/__pycache__/rust_comments.cpython-314.pyc`. At the
+  head of this branch, with the ignored copy still on disk as in this worktree,
+  `git status --porcelain --ignored scripts/__pycache__` prints exactly `!! scripts/__pycache__/`
+  (24 bytes; ignored by the new `__pycache__/` line in `.gitignore`, which has no leading slash and
+  so matches at any depth) and nothing else. That output is precondition-dependent: in a fresh
+  checkout of the same commit the copy is absent with its directory, and the same command prints
+  **nothing at all** (0 bytes, exit 0) — measured both ways at this head. The transient index
+  state between that `git rm --cached` and its commit (`0a66def`) printed the staged deletion as
+  well — `D  scripts/__pycache__/rust_comments.cpython-314.pyc` — which an earlier draft of this
+  block quoted as the head state; that line is gone once the deletion is committed. The `.pyc` may
+  stay on disk: `rm -f` of the 5035-byte worktree copy did not change any verdict —
+  `bash scripts/repo-health.sh` exited **0** before and after, with byte-identical output (the
+  artifact is not an input to any gate), and the run did **not** recreate it, because all ten of
+  the script's `python3` invocations pass `-B` (so the tracked copy must have come from an ad-hoc
+  import, not from the gate). The worktree copy was byte-identical to the blob it was untracked
+  from — md5 `0893cb97642c7c462a62e1d1ab15baab` before deletion, and
+  `git hash-object scripts/__pycache__/rust_comments.cpython-314.pyc` =
+  `8bc4eaa077a244bcdc2f56903103e690910b8d18`.
 - [ ] **A symlinked `.rs` *file* is double-counted by the python source walks.** `ln -s
   kcp/session.rs frp-core/src/zz.rs` makes `unsafe_counts` (and the printed `Code size` walk) read
   the same file twice: the printed block count becomes 22 while the curated `CLAUDE.md` claim says
@@ -1803,6 +1830,36 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `forged.yml:5` while the real witness was truncated to `.github/workflows/a`. False-FAIL direction
   only — no false green, and the real violation is still reported. **Done-when:** the wrapper refuses
   or skips a workflow path containing a newline (or the protocol escapes it), pinned by a probe.
+- [ ] **The exit-code mapping between the gate's python blocks and `repo-health.sh` is unpinned.**
+  Measured 2026-09-26 at this branch's head: the script itself can only exit **0 or 1** — every
+  assignment is `fail=0`/`fail=1` (`grep -n "fail=" scripts/repo-health.sh`; `grep -c "fail=[234]"`
+  is 0), the explicit early exits are `exit 1` (`:55`, `:73`) plus the `|| exit 1` fallbacks on the
+  root-resolution `cd -P`/`readlink` steps (`:64`, `:65`, `:78`), and the tail is `exit "$fail"`
+  (`:2328`). The statuses 2/3/4 belong to the python blocks. Census with `ast` over all ten inline
+  blocks (eight heredocs, two `-c` bodies), comments excluded: `sys.exit(2)` ×**2** (`:105`,
+  `:2134`; a third textual hit is a comment at `:2095`), `sys.exit(3)` ×9, `sys.exit(4)` ×4,
+  `sys.exit(5)` ×1, `sys.exit(1)` ×1 (`:2253`), plus the computed
+  `sys.exit(4 if state['bad'] else 0)` (`:1116`) and the second inline block's
+  `sys.exit(127)`/`sys.exit(124)`/`sys.exit(r.returncode)` (`:765`, `:768`, `:770`);
+  `IndexUnavailable` is caught at `:1721` (a `raise` — the toplevel guard's — is at `:1677`) and
+  exits at `:1725`. The bash side turns each block status into a `FAIL` row and sets `fail=1` —
+  several rows carry the number (the path scan interpolates it: `(exit %s)`, `:1775`; the
+  doc-figures mapping branches on it: `(exit 3)` at `:2271`, `(exit 2)` at `:2274`), while others name
+  the reason in words (`read_into`'s `missing`/`not a regular file`/`Permission denied`, set at
+  `:142`-`:144` and printed at `:147`; the source-counts block's "source counts incomplete (see scan
+  errors above)", `:333`; the workflow scan's "a workflow file could not be read", `:1124`).
+  The prose drifted because the shorthand "the gate exits 3" gives the block's
+  status the whole script as its subject; it appeared in `docs/developing.md:915`/`:924` and
+  `TODO.md:1324`/`:1330` and had to be corrected in this PR (the #368 block above), while
+  `docs/developing.md:977` already stated the mapping correctly. Nothing prevents it drifting back:
+  there is no test harness for `scripts/repo-health.sh` anywhere under `scripts/`, and CI only runs
+  the gate itself (`.github/workflows/ci.yml:102`, whose comment at `:91` says
+  "scripts/repo-health.sh exits 1 on drift"). **Done-when:** a fixture-based check — a throwaway
+  tree, e.g. a gitfile whose gitdir is gone or a repo missing a tracked path, so the run needs
+  seconds, not a whole-tree scan (a full `bash scripts/repo-health.sh` measures ~2.6 s here) —
+  asserts both the process rc the wrapper returns (**1**, never 3) and the `(exit 3)` annotation on
+  the corresponding `FAIL` row, so a future bare `exit 3`/`fail=3` regression, or a re-drifted
+  "the gate exits 3" claim, fails a test.
 
 ---
 
