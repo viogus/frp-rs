@@ -159,26 +159,25 @@ fn missing_config_exits_1() {
 /// default 7000 (`frp-core/src/config/server.rs:394-395`), which on macOS is
 /// held by Control Center. The released-port window is microseconds and this
 /// test only needs the listener to come up.
-#[test]
-fn good_config_starts_and_exits_0_on_sigterm() {
-    let port = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
-        probe.local_addr().expect("local_addr").port()
-    };
-    let dir = TempDir::new();
-    let cfg = dir.write(
-        "goodfrps.toml",
-        &format!(
-            "bindAddr = \"127.0.0.1\"\nbindPort = {port}\n[auth]\ntoken = \"cli-exit-test\"\n"
-        ),
-    );
-
-    // Output goes to a file, not a pipe: a child whose piped stdout nobody reads
-    // can block on a full pipe, and this test only needs the log for diagnosis.
+/// Spawn `frps` with `args` against the listener `port`, wait until the port
+/// **accepts a connection**, then SIGTERM it and require a clean exit 0.
+/// Returns the child's combined output.
+///
+/// It is not enough to sleep: the SIGTERM handler is installed only after the
+/// service has bound its listener, so signalling an already-started-but-not-yet-
+/// listening frps kills it with the *default* disposition (measured:
+/// `unix_wait_status(15)`, i.e. `code() == None`, no exit). A successful connect
+/// proves the listener exists, which is the ordering these tests need — and it
+/// is also how "the argv was accepted and a server really started" is asserted
+/// without inferring it from an exit code.
+///
+/// Output goes to a file, not a pipe: a child whose piped stdout nobody reads
+/// can block on a full pipe.
+fn start_listening_then_sigterm(args: &[&str], port: u16, dir: &TempDir) -> String {
     let log_path = dir.path("frps.log");
     let log = std::fs::File::create(&log_path).expect("create log");
     let mut child: Child = Command::new(BIN)
-        .args(["-c", &cfg])
+        .args(args)
         .stdout(std::process::Stdio::from(
             log.try_clone().expect("clone log"),
         ))
@@ -192,12 +191,6 @@ fn good_config_starts_and_exits_0_on_sigterm() {
     // nothing or the path is wrong — both are findings.
     let read_log = || std::fs::read_to_string(&log_path).expect("read frps diagnostic log");
 
-    // Wait until the bind port accepts a connection. It is not enough to sleep:
-    // the SIGTERM handler is installed only after the service has bound its
-    // listener, so signalling an already-started-but-not-yet-listening frps
-    // kills it with the *default* disposition (measured: `unix_wait_status(15)`,
-    // i.e. `code() == None`, no exit). A successful connect proves the listener
-    // exists, which is the ordering this test needs.
     let ready_deadline = Instant::now() + EXIT_TIMEOUT;
     loop {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -205,7 +198,8 @@ fn good_config_starts_and_exits_0_on_sigterm() {
         }
         if let Some(status) = child.try_wait().expect("try_wait frps") {
             panic!(
-                "frps exited ({status:?}) instead of listening on 127.0.0.1:{port}; log={:?}",
+                "frps {args:?} exited ({status:?}) instead of listening on 127.0.0.1:{port}; \
+                 log={:?}",
                 read_log(),
             );
         }
@@ -213,7 +207,8 @@ fn good_config_starts_and_exits_0_on_sigterm() {
             let _ = child.kill();
             let _ = child.wait();
             panic!(
-                "frps never listened on 127.0.0.1:{port} within {EXIT_TIMEOUT:?}; log={:?}",
+                "frps {args:?} never listened on 127.0.0.1:{port} within {EXIT_TIMEOUT:?}; \
+                 log={:?}",
                 read_log(),
             );
         }
@@ -231,23 +226,50 @@ fn good_config_starts_and_exits_0_on_sigterm() {
                 assert_eq!(
                     status.code(),
                     Some(0),
-                    "frps must exit 0 on SIGTERM with a valid config (signal={:?}); log={:?}",
-                    status,
+                    "frps {args:?} must exit 0 on SIGTERM (signal={status:?}); log={:?}",
                     read_log(),
                 );
-                return;
+                return read_log();
             }
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!(
-                    "frps did not exit within {EXIT_TIMEOUT:?} of SIGTERM; log={:?}",
+                    "frps {args:?} did not exit within {EXIT_TIMEOUT:?} of SIGTERM; log={:?}",
                     read_log(),
                 );
             }
             None => std::thread::sleep(Duration::from_millis(10)),
         }
     }
+}
+
+/// An ephemeral port, released immediately: `bindPort = 0` is *not* "any port"
+/// here — frp-rs normalizes 0 back to the default 7000
+/// (`frp-core/src/config/server.rs:394-395`), which on macOS is held by Control
+/// Center. The released-port window is microseconds and these tests only need
+/// the listener to come up.
+fn ephemeral_port() -> u16 {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+    probe.local_addr().expect("local_addr").port()
+}
+
+fn valid_config(dir: &TempDir, port: u16) -> String {
+    dir.write(
+        "goodfrps.toml",
+        &format!(
+            "bindAddr = \"127.0.0.1\"\nbindPort = {port}\n[auth]\ntoken = \"cli-exit-test\"\n"
+        ),
+    )
+}
+
+#[test]
+fn good_config_starts_and_exits_0_on_sigterm() {
+    let port = ephemeral_port();
+    let dir = TempDir::new();
+    let cfg = valid_config(&dir, port);
+
+    start_listening_then_sigterm(&["-c", &cfg], port, &dir);
 }
 
 /// Deliberate divergence, pinned so it cannot drift silently: Go frps v0.71.0
@@ -407,87 +429,178 @@ fn version_flag_value_spelling_decides_what_happens() {
     );
 }
 
+/// The `-v` **shorthand** grammar, which is where `.adjacent()` first bit: pflag
+/// sets a bool short and re-parses the rest of the token as more shorthands
+/// (`-vtrue` is `-v` + `-t rue`), while `-v=<bool>` is a value, and `-vfoo` is
+/// an unknown shorthand — Go's own text is `unknown shorthand flag: 'f' in
+/// -foo`, rc 1. Measured 2026-09-26 on Go v0.71.0 / base head `2b1d51f` / this
+/// head, all with a *missing* config, so rc 0 proves the version short-circuit
+/// and rc 1 naming the missing file proves the run reached the loader:
+///
+/// ```text
+/// frps -vtrue   -c missing → 0 (version) / 0 (version) / 0 (version)
+/// frps -vh                 → 0 (help)    / 0 (help)    / 0 (help)
+/// frps -vtok    -c missing → 0 (version) / 0 (version) / 0 (version)
+/// frps -vp7000  -c missing → 0 (version) / 0 (version) / 0 (version)
+/// frps -v=false -c missing → 1 (load)    / 1 (argv)    / 1 (load)
+/// frps -vfoo    -c missing → 1           / 1           / 1
+/// frps -v0      -c missing → 1           / 1           / 1
+/// ```
+///
+/// The middle column is the regression an earlier revision of this branch
+/// introduced: the value branch carried the short, so bpaf's
+/// `this_or_that_picks_first` discarded the flag branch's successful cluster
+/// parse (see `docs/developing.md` § `--flag=<bool>`). Hence these rows are
+/// pinned rather than only documented — `-vh` printing **help** and `-vtrue`/
+/// `-vtok`/`-vp7000` printing the **version** cannot both hold if the cluster
+/// path breaks again, and `-v=false` naming the missing config cannot hold
+/// unless the `-v=` alias expansion consumed the value.
+#[test]
+fn version_short_shorthand_clusters_and_equals_spelling_match_go() {
+    let dir = TempDir::new();
+    let missing = dir.path("does-not-exist.toml");
+
+    // Shorthand clusters: `-v` set, the rest re-parsed. The version
+    // short-circuit must win over the (missing) config.
+    for args in [
+        &["-vtrue", "-c", &missing][..],
+        &["-vtok", "-c", &missing][..],
+        &["-vp7000", "-c", &missing][..],
+    ] {
+        let out = run_frps(args);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?} is a pflag shorthand cluster that sets -v, so the version must print \
+             and exit 0 like Go; stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        assert!(
+            stdout_of(&out).contains(frp_core::VERSION),
+            "{args:?} must print the version; stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+    }
+
+    // The same cluster with `h` as the next shorthand prints help, not version.
+    let out = run_frps(&["-vh"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "-vh must print help and exit 0 like Go; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stdout_of(&out).contains("frps is the server"),
+        "-vh must render the help text (a broken cluster path exits 1 here); stdout={:?} \
+         stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+
+    // `-v=<bool>` is the short spelling of `--version=<bool>`: false is consumed
+    // as the value, so the run reaches the loader.
+    let out = run_frps(&["-v=false", "-c", &missing]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "-v=false must fall through to the config load; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        format!("{}{}", stdout_of(&out), stderr_of(&out)).contains(&missing),
+        "-v=false must reach the loader and name the missing file; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+
+    // A short that is not registered stays an error, as on Go.
+    for args in [&["-vfoo", "-c", &missing][..], &["-v0", "-c", &missing][..]] {
+        let out = run_frps(args);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{args:?} must exit 1 like Go's `unknown shorthand flag`; stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        assert!(
+            !stdout_of(&out).contains(frp_core::VERSION),
+            "{args:?} must not print the version; stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+    }
+}
+
 /// The item's measured row, end to end: `frps --tls-only=false -c <valid>`
 /// starts and listens on Go (rc 124 under the bounded runner), and exited 1
 /// with `` `false` is not expected in this context `` before the bool flags
 /// were routed through the shared value parser. Asserting the exit code alone
 /// would not distinguish "started" from "refused and exited 1", so this waits
-/// for the bind port to accept a connection — the same proof
-/// `good_config_starts_and_exits_0_on_sigterm` uses to know the listener is up.
+/// for the bind port to accept a connection.
+///
+/// **What this does not prove.** Only that the argv was *accepted* and a server
+/// came up: with `-c` the config file is authoritative for the transport
+/// section (`cli_overrides_enabled()` is false, `frp-core/src/cli.rs:1730`), so
+/// the parsed `tls_only = false` never reaches the service — a mutant that
+/// consumed `=false` but stored `true` would still pass this test. The value
+/// actually being applied is pinned in
+/// `disable_log_color_value_spelling_is_applied`, whose flag *is* read from the
+/// CLI (`frps/src/main.rs:55-56`).
 #[test]
 fn tls_only_false_value_starts_and_listens() {
-    let port = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
-        probe.local_addr().expect("local_addr").port()
-    };
+    let port = ephemeral_port();
     let dir = TempDir::new();
-    let cfg = dir.write(
-        "goodfrps.toml",
-        &format!(
-            "bindAddr = \"127.0.0.1\"\nbindPort = {port}\n[auth]\ntoken = \"cli-exit-test\"\n"
-        ),
+    let cfg = valid_config(&dir, port);
+
+    start_listening_then_sigterm(&["--tls-only=false", "-c", &cfg], port, &dir);
+}
+
+/// The `=value` spelling is not merely accepted — it is the value the flag
+/// carries. `--disable-log-color` is the observable one: the frps log
+/// initialiser reads it straight off the CLI
+/// (`logging::resolve_ansi(!disable)` → `with_ansi(ansi)`,
+/// `frps/src/main.rs:55-56`), so the child's own output shows which value won.
+///
+/// Measured at this head with a valid config and a bounded runner, counting
+/// `ESC [` sequences in the child's combined output:
+/// `--disable-log-color=false` → 140, `=true` → 0, bare → 0. Asserting only the
+/// exit code would pass for all three.
+///
+/// One caveat, stated rather than implied: this pins that `false` and `true` are
+/// *distinguished and applied*; that a rejected value (`=foo`) never reaches the
+/// log initialiser is pinned by `run_frps`'s rc-1 row in
+/// `version_flag_value_spelling_decides_what_happens`.
+#[test]
+fn disable_log_color_value_spelling_is_applied() {
+    const ANSI_ESCAPE: &[u8] = b"\x1b[";
+
+    // `=false` → colour stays on.
+    let port = ephemeral_port();
+    let dir = TempDir::new();
+    let cfg = valid_config(&dir, port);
+    let log = start_listening_then_sigterm(&["--disable-log-color=false", "-c", &cfg], port, &dir);
+    assert!(
+        log.as_bytes()
+            .windows(ANSI_ESCAPE.len())
+            .any(|w| w == ANSI_ESCAPE),
+        "--disable-log-color=false must leave ANSI colour in the log; log={log:?}"
     );
-    let log_path = dir.path("frps.log");
-    let log = std::fs::File::create(&log_path).expect("create log");
-    let mut child = Command::new(BIN)
-        .args(["--tls-only=false", "-c", &cfg])
-        .stdout(std::process::Stdio::from(
-            log.try_clone().expect("clone log"),
-        ))
-        .stderr(std::process::Stdio::from(log))
-        .spawn()
-        .expect("spawn frps");
-    let read_log = || std::fs::read_to_string(&log_path).expect("read frps diagnostic log");
 
-    let deadline = Instant::now() + EXIT_TIMEOUT;
-    loop {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break;
-        }
-        if let Some(status) = child.try_wait().expect("try_wait frps") {
-            panic!(
-                "frps --tls-only=false exited ({status:?}) instead of listening on \
-                 127.0.0.1:{port}; log={:?}",
-                read_log(),
-            );
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "frps --tls-only=false never listened on 127.0.0.1:{port} within \
-                 {EXIT_TIMEOUT:?}; log={:?}",
-                read_log(),
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-
-    let _ = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status();
-    let deadline = Instant::now() + EXIT_TIMEOUT;
-    loop {
-        match child.try_wait().expect("try_wait frps") {
-            Some(status) => {
-                assert_eq!(
-                    status.code(),
-                    Some(0),
-                    "--tls-only=false must start a server that shuts down cleanly; log={:?}",
-                    read_log(),
-                );
-                return;
-            }
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!(
-                    "frps --tls-only=false did not exit within {EXIT_TIMEOUT:?} of SIGTERM; \
-                     log={:?}",
-                    read_log(),
-                );
-            }
-            None => std::thread::sleep(Duration::from_millis(10)),
-        }
-    }
+    // `=true` → colour is stripped, same server, same config shape.
+    let port = ephemeral_port();
+    let dir = TempDir::new();
+    let cfg = valid_config(&dir, port);
+    let log = start_listening_then_sigterm(&["--disable-log-color=true", "-c", &cfg], port, &dir);
+    assert!(
+        !log.as_bytes()
+            .windows(ANSI_ESCAPE.len())
+            .any(|w| w == ANSI_ESCAPE),
+        "--disable-log-color=true must strip ANSI colour from the log; log={log:?}"
+    );
 }

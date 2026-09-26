@@ -257,9 +257,21 @@ macro_rules! go_bool_flag_rs_only {
 
 /// The one place the two branches are built; [`go_bool_flag`] and its two
 /// siblings differ only in the help they pass.
+///
+/// The value branch is **long-only on purpose** — `$short` goes to the flag
+/// branch and nowhere else. A short in an `.adjacent()` argument makes bpaf's
+/// `ParseArgument` push the named argument onto `State::path` as soon as it
+/// *attempts* a token, so that branch is reported one level deeper than the flag
+/// branch and `this_or_that_picks_first` returns the deeper branch's error even
+/// when the flag branch parsed the token successfully. Measured on `frps`:
+/// with the short in both branches, `-vtrue`/`-vh`/`-vtok`/`-vp7000` — pflag
+/// shorthand clusters that set `-v` and re-parse the rest, rc 0 on Go and rc 0
+/// at the base head — all became rc 1. The short's `=` spelling (`-v=false`)
+/// is instead expanded to the long form before bpaf sees argv; see
+/// [`expand_bool_short_value_form`].
 macro_rules! go_bool_flag_impl {
     ($name:literal, $alias:expr, $short:expr, $value_help:expr, $switch_help:expr $(,)?) => {{
-        let value = go_bool_named($name, $alias, $short, $value_help)
+        let value = go_bool_named($name, $alias, None, $value_help)
             .argument::<String>("BOOL")
             .adjacent()
             .parse(parse_go_bool);
@@ -831,15 +843,80 @@ pub fn frps_args() -> impl Parser<FrpsArgs> {
     frps_build().map(FrpsArgs::from)
 }
 
+/// The output width bpaf's own `OptionParser::run` passes to
+/// `ParseFailure::print_message` — `OptionParserInfo::default().max_width`
+/// (`bpaf-0.9.27/src/info.rs:46`), and no parser here calls `.max_width()`.
+/// Spelled out because the two entry points below build bpaf's `Args` by hand
+/// (to apply [`expand_bool_short_value_form`]) and therefore cannot use `run()`.
+const CLI_OUTPUT_WIDTH: usize = 100;
+
+/// Expand pflag's `-<bool short>=<value>` spelling into the long spelling,
+/// before bpaf sees argv.
+///
+/// Go's pflag treats `-v=false` as the same variable as `--version=false`
+/// (measured on Go frp v0.71.0: `frps -v=false -c <valid config>` starts the
+/// server, rc 124), while `-vfalse` — no `=` — is a *shorthand cluster*, not a
+/// value: pflag sets `-v` and re-parses `-t rue`, so that one must keep reaching
+/// bpaf's short-flag parser untouched. bpaf cannot express both in one
+/// alternation (see [`go_bool_flag_impl`]), so the `=` form is rewritten here
+/// and the cluster form is left alone.
+///
+/// Only `-v` is rewritten because it is the only bool **short** either binary
+/// registers; every other short (`-c`, `-t`, `-p`, `-L`, …) takes a value and
+/// already parses its `=` spelling through bpaf.
+///
+/// `argv` is the process argv **without** `argv[0]`, matching what bpaf's
+/// `Args::current_args` hands the parser.
+fn expand_bool_short_value_form(argv: Vec<OsString>) -> Vec<OsString> {
+    argv.into_iter()
+        .map(
+            |arg| match arg.to_str().and_then(|text| text.strip_prefix("-v=")) {
+                Some(value) => OsString::from(format!("--version={value}")),
+                None => arg,
+            },
+        )
+        .collect()
+}
+
+/// The bpaf `Args` for a process argv: `argv[0]` dropped the way
+/// `Args::current_args` drops it, its file name carried over so help and error
+/// output keep naming the program, and the pflag short-`=` alias expanded.
+fn cli_args(argv: &[OsString]) -> (String, Vec<OsString>) {
+    let name = argv
+        .first()
+        .map(std::path::Path::new)
+        .and_then(std::path::Path::file_name)
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_owned);
+    let rest = expand_bool_short_value_form(argv.iter().skip(1).cloned().collect());
+    (name.unwrap_or_else(|| "frps".to_string()), rest)
+}
+
+/// Run an `OptionParser` over `argv` and exit the way `OptionParser::run` does
+/// (`err.print_message(self.info.max_width)`, then `err.exit_code()`).
+fn run_cli<T>(parser: bpaf::OptionParser<T>, argv: &[OsString]) -> T {
+    let (name, rest) = cli_args(argv);
+    let run_inner = |args: bpaf::Args<'_>| parser.run_inner(args);
+    match run_inner(bpaf::Args::from(&rest[..]).set_name(&name)) {
+        Ok(value) => value,
+        Err(err) => {
+            err.print_message(CLI_OUTPUT_WIDTH);
+            std::process::exit(err.exit_code());
+        }
+    }
+}
+
 /// Parse frps CLI args. Prints help/version and exits as needed.
 pub fn parse_frps_args() -> FrpsArgs {
     let argv: Vec<OsString> = std::env::args_os().collect();
-    let args = frps_args()
-        .to_options()
-        .descr("frps is the server of frp-rs (https://github.com/fatedier/frp)")
-        .run();
-    // Only reached when the argv parsed: `run()` exits the process on a parse
-    // failure, so the warning can never fire for a refused argv, and the
+    let args = run_cli(
+        frps_args()
+            .to_options()
+            .descr("frps is the server of frp-rs (https://github.com/fatedier/frp)"),
+        &argv,
+    );
+    // Only reached when the argv parsed: the failure path above exits the
+    // process, so the warning can never fire for a refused argv, and the
     // detection never matches the `=`, bare or non-bool forms.
     warn_if_strict_config_space_form_used(&argv);
     if args.show_version {
@@ -1685,10 +1762,12 @@ fn frpc_parser() -> impl Parser<FrpcCmd> {
 /// Parse frpc CLI args.
 pub fn parse_frpc_args() -> FrpcCmd {
     let argv: Vec<OsString> = std::env::args_os().collect();
-    let args = frpc_parser()
-        .to_options()
-        .descr("frpc is the client of frp-rs (https://github.com/fatedier/frp)")
-        .run();
+    let args = run_cli(
+        frpc_parser()
+            .to_options()
+            .descr("frpc is the client of frp-rs (https://github.com/fatedier/frp)"),
+        &argv,
+    );
     // See `parse_frps_args`: printed only for a successfully parsed argv whose
     // `--strict-config` token was followed by a consumed bool value — i.e. the
     // frp-rs space-separated extension, on every `frpc` parser (run, verify,
@@ -3014,6 +3093,63 @@ mod tests {
                     "{site}: repeated {argv:?} must stay refused (Go is last-wins there)"
                 );
             }
+        }
+    }
+
+    /// The argv rewrite the entry points apply before bpaf sees argv. `-v`
+    /// is the only bool short either binary registers, so this is the whole
+    /// rule: `-v=<bool>` becomes `--version=<bool>` (pflag treats them as one
+    /// variable), and everything else — the bare `-v`, a shorthand cluster
+    /// (`-vtrue`), an `=`-spelling of a *value-taking* short (`-c=x`), a
+    /// non-UTF-8 token — is passed through untouched for bpaf to parse.
+    #[test]
+    fn bool_short_equals_spelling_expands_to_the_long_form_only() {
+        let expand = |args: &[&str]| -> Vec<String> {
+            expand_bool_short_value_form(args.iter().map(OsString::from).collect())
+                .into_iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        // pflag's shorthand `=` spelling: rewritten, value and all.
+        assert_eq!(expand(&["-v=false"]), ["--version=false"]);
+        assert_eq!(expand(&["-v=TRUE"]), ["--version=TRUE"]);
+        assert_eq!(expand(&["-v="]), ["--version="]);
+        assert_eq!(
+            expand(&["-c", "x.toml", "-v=false"]),
+            ["-c", "x.toml", "--version=false"]
+        );
+
+        // Everything else is exactly what bpaf had before.
+        for argv in [
+            &["-v"][..],
+            &["-vtrue"][..],
+            &["-vh"][..],
+            &["-vfoo"][..],
+            &["-v0"][..],
+            &["--version=false"][..],
+            &["--version"][..],
+            // `-c=x` / `-t=v` are value-taking shorts and already parse their
+            // `=` spelling through bpaf — rewriting them would be a new rule.
+            &["-c=x.toml"][..],
+            &["-t=v"][..],
+            &["-vp7000"][..],
+        ] {
+            assert_eq!(
+                expand(argv),
+                argv.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "{argv:?} must pass through untouched"
+            );
+        }
+
+        // A non-UTF-8 token cannot be inspected, so it must not be dropped or
+        // mangled (unix is where such an argv can exist at all).
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = OsString::from_vec(vec![b'-', b'v', b'=', 0xff]);
+            let out = expand_bool_short_value_form(vec![raw.clone()]);
+            assert_eq!(out, vec![raw]);
         }
     }
 

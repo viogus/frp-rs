@@ -1423,25 +1423,57 @@ Carriers, all of which agree:
 
 #### `--flag=<bool>`: the pflag value spelling on both binaries
 
-Go registers eight of these ten flags with pflag's bool machinery, which accepts
-three spellings of **one** flag: the bare `--flag` (sets `true`), `--flag=true`
-and `--flag=false`. The attached value is parsed by `strconv.ParseBool`, so `1`,
+Five of these ten flags are a pflag bool **under the same name on the same Go
+command**: `frps --tls-only`, `--enable-prometheus`, `--disable-log-color`,
+`-v`/`--version` and `frpc -v`/`--version`. Two more are Go pflag bools under a
+different name (`frpc tcp --use-encryption`/`--use-compression` are Go's `--ue`/
+`--uc`, on all eight proxy subcommands). One is a Go pflag bool on a *different*
+command (`frpc --disable-log-color` is on those eight, not on the root). One is
+a **string** flag on Go (`--dashboard-tls-mode`). One has no Go flag at all
+(`frpc status --json`).
+
+For every one of them that Go registers as a pflag bool, Go accepts three
+spellings of **one** flag: the bare `--flag` (sets `true`), `--flag=true` and
+`--flag=false`. The attached value is parsed by `strconv.ParseBool`, so `1`,
 `0`, `t`, `f`, `T`, `F`, `TRUE`, `FALSE`, `True` and `False` are accepted and
 anything else is `Error: invalid argument "foo" for "--flag" flag:
 strconv.ParseBool: parsing "foo": invalid syntax` (rc 1). A pflag bool never
-consumes a following token, so `--flag <bool>` is not a value there. The other
-two are `--dashboard-tls-mode`, a **string** flag on Go, and
-`frpc status --json`, which Go has no flag of at all.
+consumes a following token, so `--flag <bool>` is not a value there — and a bool
+**short** never takes an attached value either: `-vtrue` sets `-v` and re-parses
+the rest as more shorthands, while only `-v=<bool>` is a value.
 
 frp-rs registered the ten as bpaf `.switch()`es, which implement only the bare
 form, so argv Go accepts exited 1 here with `` `false` is not expected in this
-context `` (`TODO.md:1745`). They now all go through one parser,
+context `` (`TODO.md:1745`). They now all go through one macro,
 `go_bool_flag!` (`frp-core/src/cli.rs`): a `parse_go_bool` value branch marked
 `.adjacent()` — only `--flag=<value>` is a value — plus the bare
 `.flag(true, false)` fallback, so present → `true` and absent → `false`, exactly
 the `.switch()` it replaces. The space-separated form is deliberately **not**
 consumed: `.adjacent()` keeps this byte-identical to the pre-change refusal
 instead of adding a second extension like `--strict-config`'s.
+
+**The value branch is long-only, and that is not cosmetic.** A **short** in an
+`.adjacent()` argument breaks bpaf's branch selection: `ParseArgument` pushes the
+named argument onto `State::path` as soon as it *attempts* a token
+(`bpaf-0.9.27/src/params.rs:451`), so the value branch is reported one level
+deeper than the flag branch and `this_or_that_picks_first`
+(`bpaf-0.9.27/src/structs.rs:322-350`) returns the deeper branch's error even
+when the flag branch parsed the token successfully. Measured with the short in
+both branches: `frps -vtrue`, `-vh`, `-vtok`, `-vp7000` — pflag shorthand
+clusters that set `-v` and re-parse the rest, rc 0 on Go **and rc 0 at the base
+head** — all became rc 1 with `` `-vtrue` is not expected in this context ``.
+Branch order does not fix it (switching the two made `-v` alone stop setting the
+flag at all), so the short goes to the flag branch only and pflag's `-v=<bool>`
+spelling — the same variable as `--version=<bool>` there — is expanded to
+`--version=<bool>` before bpaf sees argv
+(`expand_bool_short_value_form`). That is the only bool short either binary
+registers; every other short (`-c`, `-t`, `-p`, `-L`, …) takes a value and
+already parses its `=` spelling. The two entry points therefore build bpaf's
+`Args` by hand (`cli_args` / `run_cli`: `Args::set_name`, `print_message(100)`,
+`exit_code()` — the same constants `OptionParser::run` uses) so the rewrite has
+a place to live; help and error output were diffed byte-for-byte against the
+previous build and differ only in the intended usage-line spelling
+(`(--version=BOOL | [-v])` instead of `(-v=BOOL | [-v])`).
 
 The sweep — every bpaf `.switch()` on either binary. At the base commit
 `grep -n "\.switch()" frp-core/src/cli.rs` returned those ten sites (plus the
@@ -1455,7 +1487,7 @@ list below is what the sweep found:
 | `--disable-log-color` | `frps` | pflag bool |
 | `--dashboard-tls-mode` | `frps` | **string** flag, not a bool |
 | `-v`, `--version` | `frps` | pflag bool |
-| `--disable-log-color` | `frpc` (run) | **not on the root** — only `frpc tcp` |
+| `--disable-log-color` | `frpc` (run) | **not on the root** — on the eight proxy subcommands |
 | `-v`, `--version` | `frpc` (run) | pflag bool (persistent rootCmd flag) |
 | `--use-encryption` | `frpc tcp` | Go spells it `--ue` |
 | `--use-compression` | `frpc tcp` | Go spells it `--uc` |
@@ -1489,7 +1521,10 @@ Server-side (`frps`, valid config):
 | `--version` (bare) / `=true` / `=1` | 0, version on stdout | 0 (bare) / 1 | 0 |
 | `--version=false` / `=0` | 124 | 1 | **124** |
 | `--version=foo` | 1 `strconv.ParseBool` | 1 | 1 |
-| `-v=false` (short form) | 124 | 1 | **124** |
+| `-v=false` (short + `=`) | 124 | 1 | **124** |
+| `-vtrue` / `-vtok` / `-vp7000` *(short cluster)* | 0, version on stdout | 0 | **0** |
+| `-vh` *(short cluster)* | 0, help on stdout | 0 | **0** |
+| `-vfoo` / `-v0` *(unknown short)* | 1 `unknown shorthand flag: 'f' in -foo` / `… '0' in -0` | 1 | 1 (`` `-vfoo` is not expected in this context ``) |
 | `--tls-only --tls-only=false` *(repeated)* | 124 — pflag is last-wins | 1 | 1 |
 
 Client-side (`frpc`; the `frpc tcp` pair is compared against its Go names):
@@ -1500,7 +1535,10 @@ Client-side (`frpc`; the `frpc tcp` pair is compared against its Go names):
 | `frpc --version=false` / `=0` | 124 (client starts) | **0, version** | **124** |
 | `frpc --version=foo` | 1 `strconv.ParseBool` | **0, version** | **1** |
 | `frpc --nope=1 --version` | 1 `unknown flag: --nope` | **0, version** | **1** |
-| `frpc -v=false` | 124 | 0, version | 124 |
+| `frpc -v=false` | 124 | 0, version | **124** |
+| `frpc -vtrue` *(short cluster)* | 1 `unknown shorthand flag: 't' in -true` (`-t` is not a run-mode flag there) | 0, version | 1 |
+| `frpc -vc<path>` / `frpc -vh` *(short cluster)* | 0, version / 0, help | 0, version / 0, version | **0** / **0, help** |
+| `frpc -vLdebug` *(short cluster)* | 1 `unknown shorthand flag: 'L' in -Ldebug` | 0, version | 0, version — pre-existing: `-L` is an frp-rs-only short |
 | `frpc --disable-log-color=false -c <cfg>` | 1 `unknown flag` (no such flag on Go's root) | 1 | 124 — the flag itself is a pre-existing placement divergence |
 | `frpc tcp --ue=false …` / `--use-encryption=false …` | 124 | 1 | **124** |
 | `frpc tcp --ue=foo …` / `--use-encryption=foo …` | 1 | 1 | 1 |
@@ -1509,9 +1547,12 @@ Client-side (`frpc`; the `frpc tcp` pair is compared against its Go names):
 
 What the table says, precisely:
 
-- **The `=BOOL` spelling is Go-faithful for nine of the ten flags**, for every
-  value `strconv.ParseBool` accepts and for a bad value (both exit 1; only the
-  message differs). The tenth is `--dashboard-tls-mode`: Go's flag is a
+- **The `=BOOL` spelling is Go-faithful for the eight flags Go registers as
+  pflag bools** — five by the same name, `frpc tcp`'s pair by Go's `--ue`/
+  `--uc`, and `frpc --disable-log-color` on the command Go registers it on — for
+  every value `strconv.ParseBool` accepts and for a bad value (both exit 1; only
+  the message differs). One of the remaining two is `--dashboard-tls-mode`: Go's
+  flag is a
   **string**, so it also accepts `=auto`, `=bogus`, the empty value, and its
   bare form swallows the next token (`frps --dashboard-tls-mode -c cfg` is
   `unknown command "cfg"`, rc 1, while frp-rs treats the bare form as `true` and
@@ -1549,17 +1590,23 @@ What the table says, precisely:
   own help says so, and the meaning and the value form are the only things Go
   cannot confirm.
 - **`--disable-log-color` is on a different `frpc` command than on Go.** Go
-  registers it on `frpc tcp` (and the other single-proxy subcommands), not on
-  the root, so `frpc --disable-log-color=false -c cfg` starts here (124) and is
+  registers it on its **eight single-proxy subcommands** — `tcp`, `udp`, `http`,
+  `https`, `stcp`, `xtcp`, `sudp`, `tcpmux`, and their `visitor` forms for the
+  last three (measured: `frpc <cmd> --help` lists it on all eight; not on the
+  root) — so `frpc --disable-log-color=false -c cfg` starts here (124) and is
   `unknown flag` there (1); the bare form already diverged the same way. That is
   a **flag-placement** divergence, recorded and not addressed here.
-- **Three Go bool flags on `frpc tcp` are not implemented at all**:
-  `--ue`, `--uc` (the short spellings of the pair frp-rs calls
-  `--use-encryption`/`--use-compression`) and `--tls-enable` (Go's default-true
-  client-TLS switch). Go accepts all three with the usual bool grammar
-  (`--tls-enable=false …` → 124; `--tls-enable=foo` → 1), frp-rs refuses them as
-  unknown (`--tls-enable` is not expected in this context``, rc 1). They are a
-  surface gap, not a spelling gap.
+- **Four Go bools are not implemented at all**, and they are not `frpc tcp`'s
+  alone: `--ue`, `--uc` (the short spellings of the pair frp-rs calls
+  `--use-encryption`/`--use-compression`), `--tls-enable` (Go's default-true
+  client-TLS switch) and `--disable-log-color`. Measured with
+  `frpc <cmd> --help`: all four are on **all eight** single-proxy subcommands,
+  and on `stcp|xtcp|sudp visitor` too; `frpc completion <shell>` also carries
+  cobra's `--no-descriptions`. Go accepts them with the usual bool grammar
+  (`--tls-enable=false …` → 124; `--tls-enable=foo` → 1), frp-rs refuses the name
+  (`` `--tls-enable` is not expected in this context ``, rc 1; `--disable-log-color`
+  is accepted on the client **root** instead — the placement row above). They are
+  a surface gap, not a spelling gap.
 - **`--version` on `frpc` was two defects, and both needed the same fix.** The
   flag was a `.switch()` (so `--version=false` was an argv error where Go starts
   the client), and the version check lived in a `.map()` closure on
@@ -1571,27 +1618,44 @@ What the table says, precisely:
   `parse_frpc_args` after `run()` returns, exactly as `parse_frps_args` already
   did, which fixes the non-bool values (rc 1) and the invalid-flag row (rc 1)
   and keeps `--version` → 0.
-- **`--version` is a persistent flag on Go and only a run-mode flag here.** One
-  row moves the wrong way as a result of moving the check:
-  `frpc verify --version -c cfg` is rc **0** on Go (the persistent bool parses
-  and `verify` ignores it, then runs) and was rc 0 here before — printing the
-  version instead of verifying — but is rc **1** after, because frp-rs's
-  `verify` parser does not register `--version` at all. That is a measured,
-  **pre-existing** class, not a new one: Go's other persistent rootCmd flags
-  behave the same way. Measured with `<unknown-key config>`, so the rc 1 on Go
-  is the *config* refusal and proves the flag parsed —
-  `frpc verify --allow-unsafe=TokenSourceExec -c …` and
+- **`--version` is a persistent flag on Go and only a run-mode flag here.** Four
+  subcommand rows move as a result of moving the check, measured Go / base head
+  / this head: `frpc verify --version -c <valid>` is rc **0** on Go (the
+  persistent bool parses and `verify` ignores it, then runs) and was rc 0 here
+  before — printing the version instead of verifying — but is rc **1** after;
+  `frpc verify --version` with **no** `-c` is rc 1 on Go too (it falls back to
+  `./frpc.ini`), and rc 1 here for the other reason. `frpc tcp --version
+  --local-port … --remote-port …` is the same shape: Go **124** (it starts the
+  proxy and ignores the persistent flag), base head **0** (printed the version),
+  this head **1**. The other two are an *improvement*: `frpc
+  reload|status|stop --version -c <valid>` all moved 0 → 1 and now **match**
+  Go's rc 1 (Go parses the flag, ignores it and dials the admin API, which is
+  not listening).
+  All of that is a measured, **pre-existing** class, not a new one: Go's other
+  persistent rootCmd flags behave the same way. Measured with
+  `<unknown-key config>`, so the rc 1 on Go is the *config* refusal and proves
+  the flag parsed — `frpc verify --allow-unsafe=TokenSourceExec -c …` and
   `frpc verify --config-dir=… -c …` are both rc 1 `json: unknown field
   "notAKnownFrpKey"` on Go, where frp-rs answers `` `--allow-unsafe` is not
   expected in this context `` / `` `--config-dir` is not expected in this
   context `` (rc 1, nothing loaded). That class is already tracked as
-  `TODO.md:1878` ("`frpc`'s eight single-proxy subcommands reject `-c`/
-  `--config`, which Go accepts and ignores"); `verify --version` is another row
-  of the same class. Fixing it means registering Go's
+  `TODO.md:1996` ("`frpc`'s eight single-proxy subcommands reject `-c`/
+  `--config`, which Go accepts and ignores"); the `verify` row above is another
+  row of the same class (the `tcp`/`reload`/`status`/`stop` rows are covered by
+  the same registration gap). Fixing it means registering Go's
   persistent set (`-c`, `--config-dir`, `--strict-config`, `--allow-unsafe`,
   `-v`/`--version`) on all twelve `frpc` subcommand parsers, which is that
-  item's change, not this one's; the one `--version` row is recorded here rather
-  than left as a silent regression.
+  item's change, not this one's; these rows are recorded here rather than left
+  as a silent regression.
+- **The help *shape* is user-visible and different from Go's.** frp-rs renders
+  **two** entries per bool flag — `--flag=BOOL` (the value spelling) and
+  `--flag` (the bare form) — and a usage alternation
+  `(--version=BOOL | [-v])`, where Go prints a single `-v, --version  version of
+  frps` line and no separate value entry. The `-v=<bool>` spelling works but is
+  not advertised as its own entry (it is expanded to `--version=<bool>` at the
+  entry point). That is a deliberate consequence of having one parser for both
+  spellings, recorded rather than described as parity; nothing in Go's help
+  string is contradicted, the same information is just laid out differently.
 - **`--help`/`-h` is a pflag bool on Go too, and is not covered by this
   parser.** `frps --help=false -c cfg` starts the server there (124) and prints
   help here (0, bpaf's built-in help parser, which accepts the attached value
@@ -1607,24 +1671,34 @@ Carriers, all of which agree:
   text's claim about Go is derived from which macro the call site uses and the
   flag name in the help is the name the parser registers (`concat!`, not a
   second literal);
+- the **entry points**: `expand_bool_short_value_form` plus `cli_args`/`run_cli`
+  (`frp-core/src/cli.rs`), which expand pflag's `-v=<bool>` short spelling and
+  hand bpaf the same `Args` (`set_name` + `print_message(100)` +
+  `exit_code()`) that `OptionParser::run` would have built;
 - the **help text**, one `=BOOL` entry and one bare entry per flag, rendered by
   `--help` on all four surfaces (`frps`, `frpc` run, `frpc tcp`,
   `frpc status`);
-- `CHANGELOG.md` (Unreleased § Added, the newly accepted spellings) and this
-  section;
+- `CHANGELOG.md` (Unreleased § Features for the newly accepted spellings, § Fixed
+  for the `frpc --version` short-circuit) and this section;
 - the parser tests `every_go_bool_flag_accepts_the_pflag_value_spellings`,
   `every_go_bool_flag_refuses_non_bool_values_and_the_space_form`,
   `every_go_bool_flag_help_states_its_own_spelling` and
   `every_go_bool_flag_rejects_a_repeated_flag` (`frp-core/src/cli.rs`), which
   read their flag list from one `GO_BOOL_SITES` table so a site cannot be
   dropped from the sweep without the count moving;
-- the real-binary pins `version_flag_value_spelling_decides_what_happens` and
-  `tls_only_false_value_starts_and_listens` (`frps/tests/cli_exit_codes.rs`)
+- the real-binary pins `version_flag_value_spelling_decides_what_happens`,
+  `version_short_shorthand_clusters_and_equals_spelling_match_go`,
+  `tls_only_false_value_starts_and_listens` and
+  `disable_log_color_value_spelling_is_applied` (`frps/tests/cli_exit_codes.rs`)
   and `version_flag_value_spelling_decides_what_happens` /
   `disable_log_color_value_spelling_is_consumed`
   (`frpc/tests/cli_exit_codes.rs`), which assert the rc **and** what happened
-  (version on stdout, the missing config named, a real listener accepting a
-  connection).
+  (version or help on stdout, the missing config named, a real listener
+  accepting a connection, and — for the value actually being applied — ANSI
+  escapes present with `=false` and absent with `=true`). The `tls_only` test's
+  own doc comment states what it does *not* prove: with `-c` present the
+  config's transport section is authoritative (`cli_overrides_enabled()`), so it
+  pins argv acceptance, not that `false` reached the service.
 
 ### Repository Invariants (`repo-health.sh`)
 

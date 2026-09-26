@@ -24,7 +24,11 @@ User-facing release notes for frp-rs.
   `-v`/`--version`; `frpc tcp --use-encryption`, `--use-compression`; and
   `frpc status --json` (an frp-rs-only flag — Go has no `--json`, so its value
   form is an frp-rs extension). A non-bool value exits 1 exactly as Go's
-  `strconv.ParseBool` refusal does. Three caveats, all measured and recorded in
+  `strconv.ParseBool` refusal does, and the **short** spelling `-v=<bool>` is
+  accepted as well (Go's pflag treats it as `--version=<bool>`; frp-rs expands
+  it before parsing). Short-hand clusters are unchanged from before this
+  release and match Go: `-vtrue`/`-vh`/`-vtok`/`-vp7000` set `-v` and re-parse
+  the rest, `-vfoo`/`-v0` stay rc 1. Three caveats, all measured and recorded in
   `docs/developing.md`: the space-separated `--flag false` is still refused
   (Go's pflag never consumes that token either, and Go's own behaviour differs
   per command — `frps` answers `unknown command "false"`, `frpc tcp` ignores the
@@ -129,7 +133,7 @@ User-facing release notes for frp-rs.
   `frpc --version=foo` exits 1 like Go's `strconv.ParseBool` refusal and an
   invalid flag wins. One row moves the other way and is recorded in
   `docs/developing.md`: `frpc verify --version` is now rc 1 because frp-rs does
-  not register Go's persistent root flags on its subcommands (`TODO.md:1878`).
+  not register Go's persistent root flags on its subcommands (`TODO.md:1996`).
 - **A repeated `-c`/`--config` is now last-wins on the five `frpc` commands that
   read a config file — a behaviour change.** Go registers `-c` with pflag
   `StringVarP`, so `frpc status -c a.toml -c b.toml` loads `b.toml` and is never
