@@ -1666,8 +1666,12 @@ def tracked_files():
     # one LF and nothing else: rstrip('\r\n') would also eat a trailing CR or LF
     # that is part of the root's *name* (both are legal in a POSIX filename), and
     # the comparison below would then refuse a legitimate tree as "another tree"
-    # (exit 3).
-    toplevel = t.stdout.decode('utf8', 'surrogateescape').removesuffix('\n')
+    # (this block's exit 3, which the wrapper prints as `(exit 3)` and folds into
+    # a red run at exit 1). A slice, not `str.removesuffix('\n')`: that needs
+    # Python >= 3.9, the rest of the gate needs only f-strings (3.6), and no floor
+    # is declared anywhere — so this stays on the floor-free form.
+    raw = t.stdout.decode('utf8', 'surrogateescape')
+    toplevel = raw[:-1] if raw.endswith('\n') else raw
     cwd = os.path.realpath(os.getcwd())
     if not toplevel or os.path.realpath(toplevel) != cwd:
         raise IndexUnavailable(
