@@ -1018,7 +1018,7 @@ message to **stderr** where Go uses stdout. Only the exit code is pinned.
 
 #### CLI inputs: repeated `-c`, an empty `webServer.addr`, case-insensitive keys
 
-Three `frpc` inputs Go accepts and frp-rs used to refuse (`TODO.md:1547`). Two
+Three `frpc` inputs Go accepts and frp-rs used to refuse (`TODO.md:1632`). Two
 are now Go-faithful; the third is a **recorded divergence**, because the honest
 fix is not bounded and a partial one would be a false claim of parity. Measured
 2026-09-26 against Go frp **v0.71.0** (darwin/arm64) and the frp-rs `frpc` at
@@ -1071,12 +1071,22 @@ anything else is used verbatim** — no trimming, no whitespace special case. Th
 completion lives in `ClientConfig::complete_with_heartbeat_set`
 (`frp-core/src/config/client.rs`), the same load/complete boundary the item
 names, so it applies to the admin subcommands *and* to the client's own
-`[webServer]` admin listener. `frps` keeps its own `Complete()`: Go's server
-completes `WebServer.Complete()` first and then re-defaults a set port to
-`0.0.0.0` (`pkg/config/v1/server.go:107,116-118`), which
-`frp-core/src/config/server.rs` already does. Pinned by
-`frpc/tests/cli_inputs.rs` (empty, whitespace and no-`[webServer]` shapes) plus
-`frp-core/src/config/tests.rs`.
+`[webServer]` admin listener. Pinned by `frpc/tests/cli_inputs.rs` (empty,
+whitespace and no-`[webServer]` shapes) plus `frp-core/src/config/tests.rs`.
+
+**The server side is *not* matched, and an earlier draft of this section claimed
+it was.** Go's `ServerConfig.Complete()` calls `c.WebServer.Complete()`
+(`pkg/config/v1/server.go:107`) — the same `EmptyOr(Addr, "127.0.0.1")` as the
+client — *before* the `if c.WebServer.Port > 0 { c.WebServer.Addr =
+util.EmptyOr(c.WebServer.Addr, "0.0.0.0") }` branch at `:116-118`, so that
+branch is dead and an empty `addr` with a set port stays loopback. Measured with
+`[webServer] addr = "" port = 7597 user/password`: Go frps logs
+`dashboard listen on 127.0.0.1:7597` and listens on `127.0.0.1:7597`, while
+frp-rs (`--features dashboard`) logs `Dashboard listening on 0.0.0.0:7597` and
+listens on `*:7597`. `frp-core/src/config/server.rs` defaults the address to
+`0.0.0.0` when the port is set, which is the second half of the two-step
+without the first. The server keeps its behaviour here (this item is
+frpc-scoped); the divergence is pinned by a test and tracked in `TODO.md`.
 
 **3. Config keys are matched case-sensitively — a recorded divergence, not
 parity.** Go decodes with `encoding/json`, whose matching is case-insensitive
@@ -1085,28 +1095,59 @@ is a property of the decoder, not of one struct, so it cannot be closed with a
 bounded set of `#[serde(alias)]`: serde's aliases are exact strings, and a
 complete fix means either per-field aliases for every case permutation across
 the whole config tree or a canonicalising pre-pass in front of
-`serde_json::from_value`. Measured, Go against frp-rs (all rc 1 except where
-noted; the configs differ only in key case):
+`serde_json::from_value`.
 
-| config (`frpc status -c …`) | Go v0.71.0 | frp-rs strict | frp-rs `--strict-config=false` |
-|---|---|---|---|
-| `ServerAddr`/`ServerPort` capitalized | dials `127.0.0.1:7499` | `unknown field "ServerAddr" … did you mean 'serverAddr'?` | key dropped; `web server port should be set …` |
-| `SERVERADDR`/`SERVERPORT` all-caps | dials `7499` | `unknown field "SERVERADDR"` | key dropped; same sentence |
-| `[WebServer]` capitalized section + `port` | dials `7499` | `unknown field "WebServer" … did you mean 'webServer'?` | section dropped; same sentence |
-| `[webServer] Port` | dials `7499` | `unknown field "web_server.Port" … did you mean 'port'?` | key dropped; same sentence |
-| `[webServer] Port` **plus** `[[proxies]] Name/Type/LocalPort` capitalized | dials `7499` (values used) | `unknown field "web_server.Port"` | `missing field \`name\`` |
+Measured against Go v0.71.0, cell by cell, with the exact configs named. Each
+row's config is a bare `ServerAddr`/`ServerPort` pair (no `[webServer]`) unless
+the cell says otherwise; `verify` and `status` differ on the same file because
+`verify` never resolves an admin address:
+
+| config | command | Go v0.71.0 | frp-rs strict | frp-rs `--strict-config=false` |
+|---|---|---|---|---|
+| `cap-top.toml` = `ServerAddr`/`ServerPort` | `verify -c …` | rc 0, `syntax is ok` | rc 1, `unknown field "ServerAddr" … did you mean 'serverAddr'?` | rc 0, `is valid` |
+| the same | `status -c …` | rc 1, `web server port should be set …` | rc 1, the unknown-field error | rc 1, the same Go sentence |
+| `caps-all.toml` = `SERVERADDR`/`SERVERPORT` | `verify -c …` | rc 0 | rc 1, `unknown field "SERVERADDR"` (no suggestion — distance > 3) | rc 0 |
+| `caps-web.toml` = `ServerAddr`/`ServerPort` + `[webServer] port = 7499` | `status -c …` | rc 1, dials `127.0.0.1:7499` | rc 1, the unknown-field error | **rc 1, dials `127.0.0.1:7499`** |
+| `port-only.toml` = `[webServer] Port = 7499` | `status -c …` | rc 1, dials `7499` | rc 1, `unknown field "web_server.Port" … did you mean 'port'?` | rc 1, `web server port should be set …` |
+| `section-only.toml` = `[WebServer] port = 7499` | `status -c …` | rc 1, dials `7499` | rc 1, `unknown field "WebServer" … did you mean 'webServer'?` | rc 1, `web server port should be set …` |
+| `cap-proxy.toml` = `[[proxies]] name/type` + `LocalPort`/`RemotePort` | `verify -c …` | rc 0 (Go's loader reads the keys) | **rc 0 — the keys are silently dropped, no unknown-field error** | rc 0 |
+
+The last row is the sharp edge and the reason the earlier "refused (strict) or
+silently mis-defaulted (lenient)" phrasing was wrong in **both** directions:
+
+- **Strict mode does not refuse everywhere.** It walks the top level and the
+  `[auth]`/`[log]`/`[webServer]`/`[transport]` sections
+  (`section_known_keys`, `frp-core/src/config/strict.rs:277-285`) and does not
+  recurse into `[[proxies]]`/`[[visitors]]` (or the server's `[[httpPlugins]]`),
+  so a mis-cased key **inside an array element is dropped even in strict mode**
+  and `frpc verify` exits 0. That is not new with this branch: it is the
+  deliberate exemption stated in
+  [§ Deployment § Dashboard Web UI](deployment.md#dashboard-web-ui), lines
+  710-747 (which also carry the end-to-end consequence: the same config makes Go
+  frpc bind the configured port while frp-rs registers `remote_port: 0` and frps
+  auto-allocates one), and it is pinned by
+  `strict_mode_exempts_proxy_and_visitor_array_elements` in
+  `frp-core/src/config/tests.rs`. This branch adds a CLI-level pin too:
+  `case_insensitive_proxy_array_keys_are_dropped_in_strict_mode` in
+  `frpc/tests/cli_inputs.rs` asserts the rc 0 explicitly, so making the arrays
+  strict later is a deliberate change, not a silent one.
+- **Lenient mode need not end in an error.** With a `[webServer] port` present,
+  frp-rs in non-strict mode drops the mis-cased top-level key and then uses the
+  defaults — `ServerAddr` becomes `0.0.0.0` and `ServerPort` becomes `7000`
+  where Go uses what the file says — and the domain the command is about
+  (`status` here) still succeeds on `127.0.0.1:7499`. Whether the load ends in
+  an error depends on which key was dropped and what the command needs next: a
+  dropped `[webServer] port` surfaces as `web server port should be set …`, a
+  dropped `[[proxies]] name` as `missing field \`name\``, and a dropped optional
+  key as nothing at all.
 
 Scope of what *is* matched: the exact snake_case names, plus the documented
 Go camelCase aliases (`serverAddr`, `serverPort`, `webServer`, `tokenSource`,
 `oidcClientId`, …) which serde accepts per struct. What is **not** matched:
-arbitrary case variants of any key, at any level, on either frpc or frps. So the
-divergence is not "`[webServer] Port` specifically" — it is every casing
-difference, and until the decoder-level fix lands, a config that relies on Go's
-insensitivity loads on Go and is refused (strict) or silently mis-defaulted
-(lenient, where the mis-cased key is dropped and the next error is about a
-missing value rather than a bad key) on frp-rs. The practical advice is the same
-as the README's: use the documented spellings; the camelCase aliases cover the
-Go-authored configs.
+arbitrary case variants of any key, at any level, on either frpc or frps. The
+practical advice is the same as the README's: use the documented spellings; the
+camelCase aliases cover the Go-authored configs. The array-element half is the
+`TODO.md:1168` strict-mode item's territory, not this one's.
 
 ### Repository Invariants (`repo-health.sh`)
 
