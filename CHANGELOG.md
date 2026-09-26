@@ -148,20 +148,32 @@ User-facing release notes for frp-rs.
   kept the broken value and ignored the body. Malformed escapes without a body are unchanged
   (still a non-strict 200), as is every other endpoint.
 
+### Changed
+- **The space-separated `--strict-config <bool>` extension now prints a warning
+  on stderr — new output on that path only.** `--strict-config false` (two argv
+  tokens) has always been consumed as the value by frp-rs, while Go frp
+  v0.71.0's pflag bool does **not** consume it: the same argv stays strict there
+  (`json: unknown field …`, exit 1) and is lenient here — a silent difference
+  that can change which config is loaded (`frpc verify` exits 0 here and 1
+  there) or which port an admin command dials. Every parser that can consume the
+  form (`frps` and `frpc`'s `run`/`verify`/`reload`/`status`/`stop`) now prints
+  exactly one line before doing anything:
+  `warning: --strict-config <bool> is an frp-rs extension; Go's pflag does not
+  consume the token and stays strict. Use --strict-config=<bool> for identical
+  behaviour.` The `=`, bare and absent spellings stay silent, and nothing else
+  about the parsing changed — the extension is kept, because dropping it would
+  turn argv Go accepts into an frp-rs argv error.
+
 ### Docs
-- **The space-separated `--strict-config <bool>` form is now documented as an
-  frp-rs extension, in the help text and the docs — no behaviour change.**
-  `--strict-config false` (two argv tokens) has always been consumed as the
-  value by frp-rs; Go frp v0.71.0's pflag bool does **not** consume it, so the
-  same argv stays strict there (`json: unknown field …`, exit 1) and is lenient
-  here. The extension is kept — dropping it would only turn an argv Go accepts
-  into an frp-rs argv error, for no safety gain — and is now stated in the
-  `--strict-config` help of every parser that takes the flag (`frps` and
-  `frpc`'s `run`/`verify`/`reload`/`status`/`stop`), so the flag is no longer
-  presented as Go pflag semantics. `--strict-config=<bool>` remains the
-  Go-faithful spelling; the measured rows for both binaries, the differing
-  messages, and the reason are in `docs/developing.md`
-  § `--strict-config`: the space-separated value form.
+- **The space-separated `--strict-config <bool>` form is documented as an
+  frp-rs extension.** It is now stated in the `--strict-config` help of every
+  parser that takes the flag (both entries are pinned separately by a test), so
+  the flag is no longer presented as Go pflag semantics.
+  `--strict-config=<bool>` is named as the Go-faithful spelling — **for a single
+  occurrence**: a repeated flag is last-wins in Go but refused by frp-rs, and
+  that row, the empty-value rows, the position row and the measured drop branch
+  are in `docs/developing.md` § `--strict-config`: the space-separated value
+  form.
 
 ## v0.71.0 — re-release (2026-09-13)
 

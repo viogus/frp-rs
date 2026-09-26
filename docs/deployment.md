@@ -627,8 +627,11 @@ same file a daemon started with `-c` uses; with no `-c` frp-rs keeps its
 persistent root flag). The `=` spelling is the Go-faithful one; frp-rs **also**
 accepts a space-separated `--strict-config <bool>` and consumes the token as the
 value, which Go's pflag does not — an frp-rs extension, measured and tabulated
-in `docs/developing.md` § `--strict-config`: the space-separated value form. Use
-the `=` spelling for any argv that must behave identically under both binaries.
+in `docs/developing.md` § `--strict-config`: the space-separated value form.
+Using it prints one warning line on stderr (`warning: --strict-config <bool> is
+an frp-rs extension; …`), because the outcome differs from Go silently
+otherwise. Use the `=` spelling for any argv that must behave identically under
+both binaries.
 A config that fails to load is
 reported on stdout and the command exits 1 **without contacting anything**,
 rather than falling back to `127.0.0.1:7400`. When the address comes from the
