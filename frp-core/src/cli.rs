@@ -1185,6 +1185,134 @@ fn config_arg() -> impl Parser<String> {
     long("config").short('c').argument::<String>("FILE").last()
 }
 
+// ─── The persistent rootCmd flags every subcommand parses ────────────
+
+/// `--config-dir`, as an ignored persistent root flag. Same spellings as the
+/// run-mode flag (hyphen plus the frp-rs underscore alias) and Go's pflag
+/// semantics: last-wins on repetition.
+fn ignored_config_dir() -> impl Parser<Option<String>> {
+    long("config-dir")
+        .long("config_dir")
+        .argument::<String>("DIR")
+        .last()
+        .optional()
+}
+
+/// `--allow-unsafe`, as an ignored persistent root flag. Go registers it as a
+/// pflag `strings` (comma-separated, repeatable), so repeats append; the value
+/// is dropped here either way.
+fn ignored_allow_unsafe() -> impl Parser<Vec<String>> {
+    long("allow-unsafe")
+        .long("allow_unsafe")
+        .argument::<String>("FEATURES")
+        .many()
+}
+
+/// `-v`/`--version`, as an ignored persistent root flag. Go registers it as a
+/// persistent **rootCmd bool**, and only the root command's `RunE` prints the
+/// version: measured on Go v0.71.0, `frpc tcp … --version` starts the proxy
+/// exactly like the same argv without it. The value grammar is the shared
+/// Go-bool one, so `--version=foo` is still the pflag value error.
+fn ignored_version() -> impl Parser<bool> {
+    go_bool_flag!("version", None, Some('v'), "Version of frpc").last()
+}
+
+/// The persistent root flags the four config-reading subcommands
+/// (`verify`/`reload`/`status`/`stop`) did not declare: `-c` and
+/// `--strict-config` are already fields of their own parsers.
+fn ignored_admin_root_flags() -> impl Parser<()> {
+    construct!(
+        ignored_config_dir(),
+        ignored_allow_unsafe(),
+        ignored_version()
+    )
+    .map(|_| ())
+}
+
+/// All five persistent rootCmd flags, accepted and ignored on the eight
+/// single-proxy commands.
+///
+/// Go registers these on `rootCmd` (`cmd/frpc/sub/root.go`, `func init()`), so
+/// pflag parses them for **every** subcommand — `frpc tcp --help` lists them
+/// under `Global Flags` beside the command's own flags. The single-proxy
+/// commands never read any of them: measured on Go v0.71.0, every shape in
+/// `docs/developing.md` § CLI inputs (including `-c missing.toml`,
+/// `--config-dir cDir` and a `-`-prefixed value after `-c`) reaches
+/// `try to connect to server...` and connects to the probe port exactly like
+/// the same argv with the flag removed. Acceptance is the parity, not the
+/// value, so all five are dropped here.
+///
+/// Scalar flags go through [`Parser::last`] because a repeated pflag flag is
+/// last-wins and never an error — measured on Go, the proxy still starts with
+/// `-c a -c b`, `--config-dir a --config-dir b`, `--strict-config
+/// --strict-config=false` and `--version --version`.
+fn ignored_proxy_root_flags() -> impl Parser<()> {
+    let config = config_arg().optional();
+    let config_dir = ignored_config_dir();
+    let strict_config = strict_config_parser().last();
+    let allow_unsafe = ignored_allow_unsafe();
+    let version = ignored_version();
+    construct!(config, config_dir, strict_config, allow_unsafe, version).map(|_| ())
+}
+
+/// Attach [`ignored_proxy_root_flags`] to one single-proxy command's own
+/// argument parser and map the pair down to the command's `FrpcCmd` variant.
+fn single_proxy_cmd<T, P, F>(args: P, f: F) -> impl Parser<FrpcCmd>
+where
+    P: Parser<T> + 'static,
+    T: 'static,
+    F: Fn(T) -> FrpcCmd + 'static,
+{
+    construct!(args, ignored_proxy_root_flags()).map(move |(args, _)| f(args))
+}
+
+/// Rewrite pflag's `-c <dash-value>` spellings into bpaf's attached
+/// `-c=<dash-value>` form, before bpaf sees argv.
+///
+/// Go's pflag consumes the **next argv token** as a value for a value-taking
+/// flag with no regard for a leading `-`; bpaf's `State::take_arg`
+/// (`bpaf-0.9.27/src/args.rs`) accepts only a plain word, so
+/// `-c --strict-config=false` exited with ``-c` requires an argument `FILE``.
+/// Measured on Go v0.71.0: `frpc status -c --strict-config=false` alone is
+/// `open --strict-config=false: no such file or directory` (the token is `-c`'s
+/// value, not the flag), and `frpc status -c --strict-config=false -c
+/// p7498.toml` dials the second config's port because the later `-c` overwrites
+/// it. frp-rs now accepts both.
+///
+/// Scope is exactly the config-selecting persistent flags — `-c`, `--config`,
+/// `--config-dir` and the frp-rs `--config_dir` alias — so this does not
+/// generalise pflag's rule to every value-taking flag; a `-`-prefixed value for
+/// any other flag is left untouched. Nothing after the first `--` is rewritten
+/// (Go treats those as positional args), except that a `--` consumed as a
+/// config value is attached like any other value, which is what Go does.
+fn rewrite_config_dash_values(argv: &[OsString]) -> Vec<OsString> {
+    const CONFIG_FLAGS: [&str; 4] = ["-c", "--config", "--config-dir", "--config_dir"];
+    let mut out = Vec::with_capacity(argv.len());
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = &argv[i];
+        if arg == "--" {
+            out.extend(argv[i..].iter().cloned());
+            break;
+        }
+        let attach = CONFIG_FLAGS.iter().any(|flag| arg == flag)
+            && argv
+                .get(i + 1)
+                .is_some_and(|next| next.to_string_lossy().starts_with('-'));
+        if attach {
+            let mut joined = arg.clone();
+            joined.push("=");
+            joined.push(&argv[i + 1]);
+            out.push(joined);
+            i += 2;
+        } else {
+            out.push(arg.clone());
+            i += 1;
+        }
+    }
+    out
+}
+
 fn run_mode() -> impl Parser<FrpcRunArgs> {
     let config = config_arg().fallback("frpc.toml".into());
     let config_dir = long("config-dir")
@@ -1296,10 +1424,10 @@ fn tcp_cmd() -> impl Parser<FrpcCmd> {
         use_compression,
         proxy_name,
     });
-    args.to_options()
+    single_proxy_cmd(args, FrpcCmd::Tcp)
+        .to_options()
         .command("tcp")
         .help("Run frpc with a single tcp proxy")
-        .map(FrpcCmd::Tcp)
 }
 
 fn udp_cmd() -> impl Parser<FrpcCmd> {
@@ -1338,10 +1466,10 @@ fn udp_cmd() -> impl Parser<FrpcCmd> {
         token,
         proxy_name,
     });
-    args.to_options()
+    single_proxy_cmd(args, FrpcCmd::Udp)
+        .to_options()
         .command("udp")
         .help("Run frpc with a single udp proxy")
-        .map(FrpcCmd::Udp)
 }
 
 fn http_cmd() -> impl Parser<FrpcCmd> {
@@ -1399,10 +1527,10 @@ fn http_cmd() -> impl Parser<FrpcCmd> {
         host_header_rewrite,
         proxy_name,
     });
-    args.to_options()
+    single_proxy_cmd(args, FrpcCmd::Http)
+        .to_options()
         .command("http")
         .help("Run frpc with a single http proxy")
-        .map(FrpcCmd::Http)
 }
 
 fn https_cmd() -> impl Parser<FrpcCmd> {
@@ -1443,10 +1571,10 @@ fn https_cmd() -> impl Parser<FrpcCmd> {
         subdomain,
         proxy_name,
     });
-    args.to_options()
+    single_proxy_cmd(args, FrpcCmd::Https)
+        .to_options()
         .command("https")
         .help("Run frpc with a single https proxy")
-        .map(FrpcCmd::Https)
 }
 
 fn stcp_cmd() -> impl Parser<FrpcCmd> {
@@ -1483,10 +1611,10 @@ fn stcp_cmd() -> impl Parser<FrpcCmd> {
         server_port,
         token,
     });
-    args.to_options()
+    single_proxy_cmd(args, FrpcCmd::Stcp)
+        .to_options()
         .command("stcp")
         .help("Run frpc with a single stcp proxy")
-        .map(FrpcCmd::Stcp)
 }
 
 fn xtcp_cmd() -> impl Parser<FrpcCmd> {
@@ -1523,10 +1651,10 @@ fn xtcp_cmd() -> impl Parser<FrpcCmd> {
         server_port,
         token,
     });
-    args.to_options()
+    single_proxy_cmd(args, FrpcCmd::Xtcp)
+        .to_options()
         .command("xtcp")
         .help("Run frpc with a single xtcp proxy")
-        .map(FrpcCmd::Xtcp)
 }
 
 fn sudp_cmd() -> impl Parser<FrpcCmd> {
@@ -1565,10 +1693,10 @@ fn sudp_cmd() -> impl Parser<FrpcCmd> {
         token,
         proxy_name,
     });
-    args.to_options()
+    single_proxy_cmd(args, FrpcCmd::Sudp)
+        .to_options()
         .command("sudp")
         .help("Run frpc with a single sudp proxy")
-        .map(FrpcCmd::Sudp)
 }
 
 fn tcpmux_cmd() -> impl Parser<FrpcCmd> {
@@ -1605,10 +1733,10 @@ fn tcpmux_cmd() -> impl Parser<FrpcCmd> {
         token,
         proxy_name,
     });
-    args.to_options()
+    single_proxy_cmd(args, FrpcCmd::Tcpmux)
+        .to_options()
         .command("tcpmux")
         .help("Run frpc with a single tcpmux proxy")
-        .map(FrpcCmd::Tcpmux)
 }
 
 fn verify_cmd() -> impl Parser<FrpcCmd> {
@@ -1621,7 +1749,9 @@ fn verify_cmd() -> impl Parser<FrpcCmd> {
         config,
         strict_config
     });
-    args.to_options()
+    construct!(args, ignored_admin_root_flags())
+        .map(|(args, _)| args)
+        .to_options()
         .command("verify")
         .help("Verify that the configuration is valid")
         .map(FrpcCmd::Verify)
@@ -1659,7 +1789,9 @@ fn reload_cmd() -> impl Parser<FrpcCmd> {
         admin_pwd,
         api_timeout
     });
-    args.to_options()
+    construct!(args, ignored_admin_root_flags())
+        .map(|(args, _)| args)
+        .to_options()
         .command("reload")
         .help("Reload running frpc configuration")
         .map(FrpcCmd::Reload)
@@ -1705,7 +1837,9 @@ fn status_cmd() -> impl Parser<FrpcCmd> {
         admin_pwd,
         api_timeout
     });
-    args.to_options()
+    construct!(args, ignored_admin_root_flags())
+        .map(|(args, _)| args)
+        .to_options()
         .command("status")
         .help("Query running frpc proxy status")
         .map(FrpcCmd::Status)
@@ -1744,7 +1878,9 @@ fn stop_cmd() -> impl Parser<FrpcCmd> {
         admin_pwd,
         api_timeout
     });
-    args.to_options()
+    construct!(args, ignored_admin_root_flags())
+        .map(|(args, _)| args)
+        .to_options()
         .command("stop")
         .help("Stop the running frpc")
         .map(FrpcCmd::Stop)
@@ -1785,11 +1921,16 @@ fn frpc_parser() -> impl Parser<FrpcCmd> {
 /// Parse frpc CLI args.
 pub fn parse_frpc_args() -> FrpcCmd {
     let argv: Vec<OsString> = std::env::args_os().collect();
+    // pflag consumes a `-`-prefixed token as a config flag's value; bpaf cannot
+    // (see [`rewrite_config_dash_values`]). The rewrite is frpc-only: this item
+    // covers the frpc surface, and the shape has not been measured on frps.
+    // `warn_if_strict_config_space_form_used` keeps reading the original argv.
+    let parse_argv = rewrite_config_dash_values(&argv);
     let args = run_cli(
         frpc_parser()
             .to_options()
             .descr("frpc is the client of frp-rs (https://github.com/fatedier/frp)"),
-        &argv,
+        &parse_argv,
     );
     // See `parse_frps_args`: printed only for a successfully parsed argv whose
     // `--strict-config` token was followed by a consumed bool value — i.e. the
@@ -3328,6 +3469,328 @@ mod tests {
                 assert!(text.contains("verify -c=FILE..."), "help={text}");
             }
             other => panic!("expected help on stdout, got {other:?}"),
+        }
+    }
+
+    // ── the persistent rootCmd flags, accepted and ignored everywhere ─────
+    //
+    // Go registers `-c/--config`, `--config-dir`, `--strict-config`,
+    // `--allow-unsafe` and `-v/--version` on `rootCmd`
+    // (`cmd/frpc/sub/root.go`, `func init()`), so pflag parses them for every
+    // subcommand — `frpc tcp --help` lists all five under `Global Flags` —
+    // while the single-proxy commands read none of them. Measured on Go
+    // v0.71.0 darwin/arm64: with a fixed proxy name, every flag shape below
+    // still reaches `try to connect to server...` and connects to the probe
+    // port. The end-to-end form is pinned by
+    // `frpc/tests/cli_persistent_flags.rs`.
+
+    /// Each single-proxy command with its own required flags, without any
+    /// persistent root flag. `--server-port` is added by the caller in the
+    /// end-to-end test only.
+    const SINGLE_PROXY_BASE: [(&str, &[&str]); 8] = [
+        (
+            "tcp",
+            &[
+                "--local-port",
+                "5",
+                "--remote-port",
+                "6",
+                "--proxy-name",
+                "x",
+            ],
+        ),
+        (
+            "udp",
+            &[
+                "--local-port",
+                "5",
+                "--remote-port",
+                "6",
+                "--proxy-name",
+                "x",
+            ],
+        ),
+        (
+            "http",
+            &[
+                "--local-port",
+                "5",
+                "--custom-domains",
+                "example.com",
+                "--proxy-name",
+                "x",
+            ],
+        ),
+        (
+            "https",
+            &[
+                "--local-port",
+                "5",
+                "--custom-domains",
+                "example.com",
+                "--proxy-name",
+                "x",
+            ],
+        ),
+        ("stcp", &["--local-port", "5", "--sk", "s"]),
+        ("xtcp", &["--local-port", "5", "--sk", "s"]),
+        (
+            "sudp",
+            &[
+                "--local-port",
+                "5",
+                "--remote-port",
+                "6",
+                "--proxy-name",
+                "x",
+            ],
+        ),
+        (
+            "tcpmux",
+            &["--local-port", "5", "--mux-port", "7", "--proxy-name", "x"],
+        ),
+    ];
+
+    const ALL_FIVE_ROOT_FLAGS: [&str; 8] = [
+        "-c",
+        "missing.toml",
+        "--config-dir",
+        "cDir",
+        "--strict-config=false",
+        "--allow-unsafe",
+        "TokenSourceExec",
+        "--version",
+    ];
+
+    fn single_proxy_argv(cmd: &str, base: &[&str], extra: &[&str]) -> Vec<String> {
+        let mut argv = vec![cmd.to_string()];
+        argv.extend(base.iter().map(|s| s.to_string()));
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        argv
+    }
+
+    #[test]
+    fn every_single_proxy_command_accepts_the_five_persistent_root_flags() {
+        for (cmd, base) in SINGLE_PROXY_BASE {
+            let argv = single_proxy_argv(cmd, base, &ALL_FIVE_ROOT_FLAGS);
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let parsed = frpc_parser().to_options().run_inner(&refs[..]);
+            assert!(parsed.is_ok(), "{cmd} refused {argv:?}: {parsed:?}");
+            assert!(
+                !matches!(parsed.unwrap(), FrpcCmd::Run(_)),
+                "{cmd} fell through to run mode"
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_config_flag_value_is_parsed_and_dropped() {
+        // Go ignores the file on these commands: the proxy must start with
+        // `-c` pointing at a path that does not exist, with the last of a
+        // repeated pair, and with an empty value. Nothing here loads a file.
+        let args = parse_frpc_tcp(&[
+            "tcp",
+            "--local-port",
+            "5",
+            "--remote-port",
+            "6",
+            "-c",
+            "missing.toml",
+        ])
+        .unwrap();
+        assert_eq!(args.local_port, 5);
+        assert_eq!(args.remote_port, 6);
+        let args = parse_frpc_tcp(&[
+            "tcp",
+            "--local-port",
+            "5",
+            "--remote-port",
+            "6",
+            "-c",
+            "a.toml",
+            "-c",
+            "b.toml",
+        ])
+        .unwrap();
+        assert_eq!(args.remote_port, 6);
+        assert!(parse_frpc_tcp(&[
+            "tcp",
+            "--local-port",
+            "5",
+            "--remote-port",
+            "6",
+            "--config",
+            "",
+        ])
+        .is_ok());
+        // A dangling `-c` is still a parse error on both sides (Go: `flag
+        // needs an argument: 'c' in -c`).
+        let err = parse_frpc_tcp(&["tcp", "--local-port", "5", "--remote-port", "6", "-c"])
+            .expect_err("dangling -c must be refused")
+            .unwrap_stderr();
+        assert!(
+            err.contains("`-c` requires an argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn persistent_root_flags_tolerate_pflag_repetition() {
+        // A repeated pflag flag is last-wins for scalars and appending for
+        // slices, never an error — measured on Go v0.71.0, the tcp proxy still
+        // starts with each of these.
+        for extra in [
+            vec!["-c", "a.toml", "-c", "b.toml"],
+            vec!["--config-dir", "a", "--config-dir", "b"],
+            vec!["--strict-config", "--strict-config=false"],
+            vec!["--allow-unsafe", "a", "--allow-unsafe", "b"],
+            vec!["--version", "--version"],
+        ] {
+            let argv = single_proxy_argv("tcp", SINGLE_PROXY_BASE[0].1, &extra);
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            assert!(
+                frpc_parser().to_options().run_inner(&refs[..]).is_ok(),
+                "repeated {extra:?} refused"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_subcommands_accept_the_root_flags_they_did_not_declare() {
+        // `verify`/`reload`/`status`/`stop` already declare `-c` and
+        // `--strict-config`; these are the other three Go puts on rootCmd.
+        for cmd in ["reload", "status", "stop"] {
+            let argv = [
+                cmd,
+                "-c",
+                "p7498.toml",
+                "--config-dir",
+                "cDir",
+                "--allow-unsafe",
+                "TokenSourceExec",
+                "--version",
+            ];
+            assert!(
+                frpc_parser().to_options().run_inner(&argv[..]).is_ok(),
+                "{cmd} refused the persistent root flags"
+            );
+        }
+        assert!(parse_frpc_verify(&[
+            "verify",
+            "-c",
+            "p7498.toml",
+            "--config-dir",
+            "cDir",
+            "--allow-unsafe",
+            "TokenSourceExec",
+            "--version",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn strict_config_value_grammar_is_still_go() {
+        // The ignored flag keeps Go's pflag bool grammar, so a value Go
+        // rejects is still rejected: measured, `--strict-config=foo` is
+        // `Error: invalid argument "foo" for "--strict-config" flag:
+        // strconv.ParseBool: …` (rc 1); frp-rs's message differs (recorded),
+        // but it is not silently accepted.
+        assert!(parse_frpc_tcp(&[
+            "tcp",
+            "--local-port",
+            "5",
+            "--remote-port",
+            "6",
+            "--strict-config=foo",
+        ])
+        .is_err());
+        assert!(parse_frpc_tcp(&[
+            "tcp",
+            "--local-port",
+            "5",
+            "--remote-port",
+            "6",
+            "--strict-config=0",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn single_proxy_help_lists_the_global_flags() {
+        let failure = frpc_parser()
+            .to_options()
+            .run_inner(&["tcp", "--help"][..])
+            .expect_err("tcp --help is reported as a ParseFailure");
+        match failure {
+            bpaf::ParseFailure::Stdout(doc, _) => {
+                let text = doc.to_string();
+                for flag in [
+                    "-c",
+                    "--config-dir",
+                    "--strict-config",
+                    "--allow-unsafe",
+                    "--version",
+                ] {
+                    assert!(text.contains(flag), "tcp help lacks {flag}:\n{text}");
+                }
+            }
+            other => panic!("expected help on stdout, got {other:?}"),
+        }
+    }
+
+    // ── pflag's `-c <dash-value>` spelling, rewritten before bpaf ─────────
+
+    fn rewrite(args: &[&str]) -> Vec<String> {
+        let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+        rewrite_config_dash_values(&argv)
+            .into_iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn rewrite_attaches_a_dash_prefixed_config_value() {
+        // Go: `frpc status -c --strict-config=false` is
+        // `open --strict-config=false: no such file or directory` — pflag
+        // consumes the token as `-c`'s value, flag-shaped or not.
+        assert_eq!(
+            rewrite(&["status", "-c", "--strict-config=false"]),
+            vec!["status", "-c=--strict-config=false"]
+        );
+        assert_eq!(
+            rewrite(&["status", "--config", "-foo"]),
+            vec!["status", "--config=-foo"]
+        );
+        assert_eq!(
+            rewrite(&["tcp", "--config-dir", "--strict-config=false"]),
+            vec!["tcp", "--config-dir=--strict-config=false"]
+        );
+        // `--` is consumed as the value, exactly as Go does; the token after
+        // it is therefore a plain word again (Go then parses `-foo` as a flag
+        // and fails with `unknown shorthand flag: 'f' in -foo`, rc 1; frp-rs
+        // reports the leftover token, also rc 1 — a recorded message-shape
+        // divergence, not a behaviour one).
+        assert_eq!(
+            rewrite(&["tcp", "-c", "--", "-foo"]),
+            vec!["tcp", "-c=--", "-foo"]
+        );
+    }
+
+    #[test]
+    fn rewrite_leaves_every_other_shape_alone() {
+        // Ordinary values, attached spellings, dangling flags, non-config
+        // flags and anything right of a real `--` are untouched.
+        for argv in [
+            vec!["status", "-c", "p7498.toml"],
+            vec!["status", "-cp7498.toml"],
+            vec!["status", "-c=p7498.toml"],
+            vec!["status", "-c"],
+            vec!["status", "--strict-config", "-c"],
+            vec!["status", "--", "-c", "--foo"],
+            vec!["status", "-c", "p7498.toml", "--", "-c", "p7499.toml"],
+        ] {
+            let expected: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            assert_eq!(rewrite(&argv), expected, "rewrote {argv:?}");
         }
     }
 }
