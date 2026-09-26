@@ -2274,6 +2274,45 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   the corresponding `FAIL` row, so a future bare `exit 3`/`fail=3` regression, or a re-drifted
   "the gate exits 3" claim, fails a test.
 
+- [ ] **`ci.yml` spells the guarded test counts out by hand in two lanes, so every added test moves a literal.**
+  Evidence (read at this head, `79478ca`): the `frps` CLI exit-code guard asserts its expected
+  count twice — `.github/workflows/ci.yml:270`
+  `grep -q "test result: ok. 5 passed; 0 failed"` and `.github/workflows/ci.yml:271`
+  `[ "$n" = "5" ]` — and the `tiny` sibling (`.github/workflows/ci.yml:278`) repeats the pattern
+  with its own pair at `:313`/`:314` (`9`). Both are steps of one job (`tests-unit`,
+  `.github/workflows/ci.yml:104`), so the two pairs sit 43 lines apart (`:271` → `:314`) with
+  nothing tying them together. Counted at this head as `#[test]`/`#[tokio::test]` attributes:
+  `frps/tests/cli_exit_codes.rs` **5**, `frpc/tests/cli_exit_codes.rs` **9** (7 `full`-tier plus
+  the 2 `tiny`-gated ones at `frpc/tests/cli_exit_codes.rs:352` and `:375`). Not hypothetical:
+  PR #379's first CI run
+  ([36231618841](https://github.com/viogus/frp-rs/actions/runs/36231618841), head `4b02c51`,
+  branch `fix/strict-config-space`) failed the `frps` step with
+  `##[error]frps CLI exit-code guard failed (status=1, listed=5)` at 09:11:26, while the tests
+  were green. The captured log the step prints on failure pins which checks failed: at that head
+  they still expected `4` (`test result: ok. 4 passed`, `[ "$n" = "4" ]`), and the log shows both
+  `Running tests/cli_exit_codes.rs` and `test result: ok. 5 passed; 0 failed` — so those two `4`
+  literals were the only red, and the guard failed closed (`:272`). The test that moved the count
+  is `space_form_strict_config_warns_on_stderr` (`frps/tests/cli_exit_codes.rs:282`), which the
+  step's own comment names at `:232`.
+  Two comments in that file are stale at this head:
+  * `ci.yml:300` — the `tiny` lane's comment opens "Same three checks as the step above" and
+    gives the `frps` lane's count as 4 ("4"/"9" tests listed). The `frps` step lists **5** now
+    (`:271`), so that `4` is stale.
+  * `ci.yml:185` — says `frpc/tests/admin_cli.rs` has "(14 tests)"; it has **25** attributes at
+    this head. The figure was written by `f8f127f` (#367) and was true then
+    (`git show f8f127f:frpc/tests/admin_cli.rs` counts 14), and `0a8aed4` (#369) and `79478ca`
+    (#379) have added tests to the file since. The 14-era measurements at `:201`/`:202` and
+    `:215` are point-in-time and were not re-measured here; only the two present-tense claims
+    above are stale.
+  Keep the hard-coded *expectation*: both reviewers of #379 judged that a guard deriving its
+  expected count from the same file it checks can be fooled by wholesale deletion (delete the
+  tests together with the expectation and the lane stays green). The follow-up is to give the
+  number one home, not to remove it.
+  **Done-when:** each expected count lives in one place — a job-level `env:` value consumed by
+  both lanes, or a meta-test over the `ci.yml` count literals — so a test-count change cannot
+  leave a stale literal behind, and the two stale comments (`ci.yml:300`'s `4`, `ci.yml:185`'s
+  `14`) are corrected. The expectation stays hard-coded.
+
 ---
 
 ## P1 — documentation correctness
@@ -2789,8 +2828,42 @@ nothing about whether the described behaviour still holds.
     `go-to-rust-wss-encrypted` and `go-to-rust-wss-mux` passed immediately after it. The
     run-level conclusion is `success` only because the job was re-run (attempt 2); the failed
     attempt is the evidence, and `gh run view --attempt 1 --log-failed` is how it was read.
+  Attempt 2 of that same run is a separate, later re-run — `RESULTS: 86 passed, 0 failed` at
+  09:53:30 and `=== protocol matrix: 11 passed, 0 failed ===` at 09:55:07, both re-read from the
+  attempt-2 log — landing ~39 min after the 09:14:31 attempt-1 failure, not in the same minute.
   Both instances are the item's shape — a scenario failing on a tree that passed the same lane
   elsewhere — and neither can be explained by a data-plane diff.
+
+  **Recurrence (2026-09-26, PR #376's run
+  [36207103495](https://github.com/viogus/frp-rs/actions/runs/36207103495) — head `f3e7b96`,
+  squash-merged as `1becff8`):** **attempt 1** failed in the **Protocol connectivity matrix**
+  step only, repeating the **2026-09-17 matrix signature** with the same scenario set: the
+  `retry 1/3`…`retry 3/3` pair on `tcp-tls` and again on `tcp-tls-mux`, each ending
+  `[matrix] FAIL …: zero throughput (mbps=0)`, then `[matrix] FAIL ws-plain: proxy port not
+  reachable`, ending `=== protocol matrix: 8 passed, 3 failed ===`, exit 1. The *same job's*
+  `Run compat tests` step printed `RESULTS: 86 passed, 0 failed` at 01:12:00; the matrix
+  failures ran 01:12:33–01:14:23. The diff is the strongest form of this item's evidence: its
+  changed files were `.gitignore`, `TODO.md`, `docs/developing.md`, a deleted
+  `scripts/__pycache__/rust_comments.cpython-314.pyc` and `scripts/repo-health.sh` — **no Rust
+  source at all**, so the compiled `frps`/`frpc` were byte-identical to `main`'s and nothing on
+  the data plane could have changed. Attempt 2 of the same run: `success`. Evidence class: the
+  attempt-1 failures and the attempt-2 results were both re-read from this run's logs
+  (`gh run view --attempt 1 --log-failed`, then `--attempt 2 --log`) while writing this item.
+
+  **Counted at this head, from the runs recorded in this item** (not from a stored total): the
+  shape — one suite red while a neighbouring suite in the same job is green, green on a rerun —
+  is now recorded **five** times: the two 2026-09-17 episodes above (the original report and
+  PR #351), the two 2026-09-23 runs, and the 2026-09-26 recurrence. An earlier reading of this
+  item counted four, taking the 2026-09-17 entry for a single occurrence; that entry records
+  **two** failing runs on the same commit, which is why the count is five. The failing scenario
+  is not stable across the five: **eight** distinct names appear in total —
+  `go-to-rust-quic`, `kcp-rust-to-rust`, `rust-to-go-tcp-tls` and `go-to-rust-wss-plain` from
+  `compat-test.sh`, and `tcp-plain`, `tcp-tls`, `tcp-tls-mux` and `ws-plain` from
+  `protocol-matrix.sh` — although the 2026-09-26 run did repeat the 2026-09-17 matrix set, so
+  "a different scenario each time" holds only in the loose sense that no two consecutive
+  occurrences failed the same *set*. This is exactly why the item exists: all five were closed
+  by re-running until green, and a habit of re-running cannot tell the sixth apart from a real
+  regression. Nothing above is fixed, and this round claims no fix.
 
 - [x] **`Tests (server integration)` fails intermittently, and it turns `main` red.**
   Evidence: on 2026-09-17 the CI run for the merge commit `d9ca98b` failed on
