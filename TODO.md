@@ -2488,24 +2488,29 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     subcommand is the first error. Implementing `frps verify` flips this row back to a config-load
     error; this item and `docs/developing.md` § CLI inputs both state the current error, so the flip
     is visible rather than silent.
-  * Pins: `frps/tests/cli_exit_codes.rs` grew four argv-level tests
+  * Pins: `frps/tests/cli_exit_codes.rs` grew five argv-level tests
     (`dash_shaped_config_value_is_the_value_not_a_flag`,
     `dash_dash_as_config_value_is_consumed_not_a_separator`,
     `real_separator_and_dangling_config_stay_refused`,
-    `config_dir_dash_value_now_reaches_the_directory_read`), so `env.FRPS_CLI_TESTS` moved 9 → 13 in
-    `.github/workflows/ci.yml` in the same commit; the parser-level pins
-    `frps_takes_a_dash_shaped_config_value` and `frps_rewrite_scope_matches_frpc` live in
-    `frp-core/src/cli.rs`, and both the real entry points and the test call the same
-    `prepared_cli_argv` (`frp-core/src/cli.rs`), so the test follows the wiring rather than a
-    sibling copy.
-    Red evidence, measured by reverting only the `parse_frps_args` call site: **3 of the 4** new
-    integration tests fail (the dash-shaped-value, the `-c --` and the `--config-dir` pins), and the
-    fourth — the separator/dangling-scope control — passes on both trees **by design**, because it
-    pins what must *not* change. The parser-level test still passes with the call site reverted (it
-    pins the repair, not the wiring) unless `prepared_cli_argv`'s body is also reverted, which is
-    what the respawn-free variant did.
+    `config_dir_dash_value_now_reaches_the_directory_read`,
+    `verify_subcommand_is_now_the_first_error_for_a_dash_config_value`), so
+    `env.FRPS_CLI_TESTS` moved 9 → 14 in `.github/workflows/ci.yml` in the same commit; the
+    parser-level pins `frps_takes_a_dash_shaped_config_value` and
+    `frps_rewrite_scope_matches_frpc` live in `frp-core/src/cli.rs`, and both the real entry points
+    and the test call the same `prepared_cli_argv` (`frp-core/src/cli.rs`), so the test follows the
+    wiring rather than a sibling copy.
+    Red evidence, measured by reverting only the `parse_frps_args` call site: **4 of the 5** new
+    integration tests fail (the dash-shaped-value, the `-c --`, the `--config-dir` and the `verify`
+    pins), and the fifth — the separator/dangling-scope control — passes on both trees **by
+    design**, because it pins what must *not* change. The parser-level test still passes with the
+    call site reverted (it pins the repair, not the wiring).
+  * The `verify` pin is the sequencing made loud: it asserts the **current** first error
+    (`` `verify` is not expected in this context ``) and the `-c` value being consumed, so
+    implementing `frps verify` turns it red instead of silently changing which error the row
+    reports. The item's third measurement above therefore has one foot in this item and one in
+    `TODO.md`'s `frps verify` item.
   * **A flaky pre-existing SIGTERM control, found and fixed while adding these tests.** Running
-    `cargo test -p frps --test cli_exit_codes` in a loop: the four extra tests pushed
+    `cargo test -p frps --test cli_exit_codes` in a loop: the extra tests pushed
     `good_config_starts_and_exits_0_on_sigterm` / `disable_log_color_value_spelling_is_applied` into
     `unix_wait_status(15)` in **1 run in 10** (0/10 at the base commit with the same loop), i.e. the
     helper's SIGTERM arrived before the child's sigterm task had been polled — a successful TCP

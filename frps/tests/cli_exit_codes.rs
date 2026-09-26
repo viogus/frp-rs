@@ -843,3 +843,34 @@ fn config_dir_dash_value_now_reaches_the_directory_read() {
         "the parser must no longer refuse the dash-shaped value; output={all:?}"
     );
 }
+
+/// The item's third row, pinned **because it is sequencing, not parity**: Go has
+/// `frps verify`, frp-rs does not (`TODO.md:2518`). Measured on Go v0.71.0:
+/// `frps verify -c --strict-config=false` is rc 1 `open --strict-config=false: no
+/// such file or directory`; here the rewrite lets `-c` consume its value, so the
+/// missing subcommand is now the first error. Implementing `frps verify` makes
+/// this test **fail** — which is the point: the row's current Go error is what
+/// this branch pins, and the flip should not be silent.
+#[test]
+fn verify_subcommand_is_now_the_first_error_for_a_dash_config_value() {
+    let out = run_frps(&["verify", "-c", "--strict-config=false"]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "frp-rs has no `frps verify`; the unknown subcommand is rc 1 \
+         (stdout={:?} stderr={:?})",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = combined(&out);
+    assert!(
+        all.contains("verify") && all.contains("not expected"),
+        "the current first error must be the unknown `verify` subcommand, not a `-c` refusal; \
+         output={all:?}"
+    );
+    assert!(
+        !all.contains("-c` requires an argument"),
+        "the `-c` value must have been consumed by the rewrite; output={all:?}"
+    );
+}
