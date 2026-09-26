@@ -1006,23 +1006,51 @@ fn is_known_subcommand(s: &str) -> bool {
 /// Whether cobra's `stripFlags` would treat this token as a flag that swallows
 /// the next argv token — `cobra-1.8.0/command.go`, verbatim in effect: a
 /// `--long` without `=` whose flag carries no `NoOptDefVal`, or a
-/// two-character short flag without `=`. Since no flag in this argv is being
-/// resolved against a whole `FlagSet`, the frp-rs reading is the root command's
-/// own set: a bare boolean (`--version`, `-v`) consumes nothing, every other
-/// long token and every other single-character short token consumes the next
-/// token, and anything with an `=` or without a leading `-` consumes nothing.
+/// two-character short flag without `=`.
 ///
-/// Being *more* willing to consume than cobra is safe for this pass: the only
-/// failure mode is hoisting less often, which leaves frp-rs's pre-existing
-/// refusal in place. Being *less* willing would hoist a token cobra treats as a
-/// flag **value** — the trap this whole item is about.
+/// The exemption list is therefore **exactly the root flags that Go registers
+/// with a pflag bool**, because a pflag bool sets `NoOptDefVal =
+/// "true"` (`pflag-1.0.5/bool.go:56`, reached from `BoolVarP`). On `frpc`
+/// those are two, both on `rootCmd`:
+///
+/// * `--version` / `-v` — `cmd/frpc/sub/root.go:52`;
+/// * `--strict-config` / `--strict_config` — `cmd/frpc/sub/root.go:53`
+///   (`BoolVarP(&strictConfigMode, "strict_config", "", true, …)`). Both
+///   spellings are exempt because `rootCmd.SetGlobalNormalizationFunc(config.WordSepNormalizeFunc)`
+///   makes pflag resolve `--strict-config` to the same flag.
+///
+/// Everything else consumes the next token: the three value-taking root flags
+/// (`--config`/`-c`, `--config_dir`, `--allow-unsafe`, `cmd/frpc/sub/root.go:50-51,55`)
+/// **and any flag cobra does not know**, because `hasNoOptDefVal` returns false
+/// for a name that is not in the set — measured, `frpc -x status` and
+/// `frpc --nodash status` are `unknown shorthand flag` / `unknown flag` on Go
+/// (so the token after the unknown flag was never a candidate).
+///
+/// `--help`/`-h` deliberately **stays** a consumer here even though pflag
+/// registers it as a bool: cobra adds it in `execute`, i.e. *after* `Find`
+/// called `stripFlags`, so at stripping time it is an unknown flag and does
+/// consume. Measured, `frpc --help status` and `frpc -h status` print help
+/// (rc 0) on Go rather than resolving `status`, and frp-rs agrees.
+///
+/// Getting the list wrong is **not** harmless in either direction, which the
+/// first version of this function got wrong by listing `--strict-config` as a
+/// consumer: skipping a token shifts *which* token is the first bare word, so
+/// over-consuming can hoist a **later** word that cobra would have refused.
+/// Measured on Go v0.71.0, `frpc --strict-config true status -c cfg` is rc 1
+/// `unknown command "true" for "frpc"` — `true` is the first bare word and
+/// `status` is never resolved — while the over-consuming version hoisted
+/// `status` and dialled the admin port (rc 0). Under-consuming is the other
+/// direction of the same bug: `frpc --strict-config status -c cfg` is rc 0 and
+/// dials on Go, because `status` was not consumed.
 fn consumes_value(s: &OsStr) -> bool {
     let Some(s) = s.to_str() else { return false };
     if s.contains('=') {
         return false;
     }
     match s.as_bytes() {
-        [b'-', b'-', rest @ ..] if !rest.is_empty() => rest != b"version",
+        [b'-', b'-', rest @ ..] if !rest.is_empty() => {
+            rest != b"version" && rest != b"strict-config" && rest != b"strict_config"
+        }
         [b'-', c] => *c != b'v',
         _ => false,
     }
@@ -1070,6 +1098,18 @@ fn consumes_value(s: &OsStr) -> bool {
 ///   consumed by the same one-token lookahead.
 /// * `tcp --proxy-name status` — the subcommand already leads, so no token is
 ///   hoisted; the value `status` belongs to the already-selected proxy command.
+/// * `--strict-config true status` — the trap the **first** version of the
+///   classification fell into. `--strict-config` is a pflag bool
+///   (`cmd/frpc/sub/root.go:53`), so cobra does not let it swallow `true`;
+///   `true` is the first bare word, and Go refuses that word
+///   (`unknown command "true" for "frpc"`, rc 1) instead of resolving the
+///   `status` that follows it. Treating the flag as value-taking hoisted
+///   `status` and dialled the admin port (rc 0) — a regression against Go and
+///   against the base. See [`consumes_value`] for the full exemption list.
+/// * `--strict-config status` — the other direction, and the reason the flag
+///   is exempt: `status` is not consumed, so Go resolves the command and dials
+///   the config's admin port (rc 0). The same holds for the underscore
+///   spelling and for `-c cfg.toml --strict_config status`.
 /// * `frpc -c cfg.toml notacommand` — the first bare word is not a command and
 ///   Go refuses **that** word (`unknown command "notacommand" for "frpc"`,
 ///   rc 1), even when a real command name follows it (measured:
@@ -4161,13 +4201,18 @@ mod hoist_tests {
             "--config",
             "--config-dir",
             "--config_dir",
-            "--strict-config",
             "--allow-unsafe",
             "-L",
             "-t",
             "-x",
             "--nodash",
             "--",
+            // Deliberately a consumer although pflag makes it a bool: cobra
+            // adds `--help` in `execute`, after `Find` ran `stripFlags`, so at
+            // stripping time it is unknown. Measured, `frpc --help status`
+            // prints help (rc 0) rather than resolving `status`.
+            "--help",
+            "-h",
         ] {
             assert!(
                 consumes_value(OsStr::new(takes)),
@@ -4176,7 +4221,15 @@ mod hoist_tests {
         }
         for keeps in [
             "-v",
+            "--version",
             "--version=false",
+            // The two root pflag bools besides version (`cmd/frpc/sub/root.go:53`).
+            // Both spellings, bare: cobra's `hasNoOptDefVal` is true for them, so
+            // the next token is NOT consumed. Putting `--strict-config` back in
+            // the list above is the regression `--strict-config true status`
+            // measured (see `a_word_after_bare_strict_config_is_the_first_bare_word`).
+            "--strict-config",
+            "--strict_config",
             "--strict-config=false",
             "-c=p.toml",
             "-cp.toml",
@@ -4190,6 +4243,72 @@ mod hoist_tests {
             assert!(
                 !consumes_value(OsStr::new(keeps)),
                 "{keeps} must not swallow the next token"
+            );
+        }
+    }
+
+    /// Direction B (R1): a bare `--strict-config`/`--strict_config` before the
+    /// command word does **not** consume it, so the command is hoisted.
+    /// Measured on Go v0.71.0: `frpc --strict-config status -c cfg` is rc 0 and
+    /// dials the config's admin port; so are `--strict_config status -c cfg`,
+    /// `-c cfg --strict-config status` and `--strict-config tcp …`.
+    #[test]
+    fn a_bare_strict_config_does_not_swallow_the_subcommand() {
+        assert_eq!(
+            hoist(&["--strict-config", "status", "-c", "pA.toml"]),
+            ["status", "--strict-config", "-c", "pA.toml"]
+        );
+        assert_eq!(
+            hoist(&["--strict_config", "status", "-c", "pA.toml"]),
+            ["status", "--strict_config", "-c", "pA.toml"]
+        );
+        assert_eq!(
+            hoist(&["-c", "pA.toml", "--strict-config", "status"]),
+            ["status", "-c", "pA.toml", "--strict-config"]
+        );
+        assert_eq!(
+            hoist(&["-c", "pA.toml", "--strict_config", "status"]),
+            ["status", "-c", "pA.toml", "--strict_config"]
+        );
+        // The same on a single-proxy command and with a second `-c`.
+        assert_eq!(
+            hoist(&["--strict-config", "tcp", "--local-port", "5"]),
+            ["tcp", "--strict-config", "--local-port", "5"]
+        );
+        assert_eq!(
+            hoist(&["--strict-config", "status", "-c", "a.toml", "-c", "b.toml"]),
+            ["status", "--strict-config", "-c", "a.toml", "-c", "b.toml"]
+        );
+        // And the hoisted argv parses as the command, not as run mode.
+        match run_frpc(&["--strict-config", "status", "-c", "pA.toml"])
+            .expect("the hoisted argv parses")
+        {
+            FrpcCmd::Status(args) => assert_eq!(args.config.as_deref(), Some("pA.toml")),
+            other => panic!("expected the status command, got {other:?}"),
+        }
+    }
+
+    /// Direction A (R2, the regression): a *word* after a bare
+    /// `--strict-config` is the first bare word, and it is not a command, so
+    /// **no** token is hoisted — in particular not the real command name that
+    /// follows it. Measured on Go v0.71.0: `frpc --strict-config true status -c
+    /// cfg` is rc 1 `unknown command "true" for "frpc"` and never dials.
+    #[test]
+    fn a_word_after_bare_strict_config_is_the_first_bare_word() {
+        for argv in [
+            vec!["--strict-config", "true", "status", "-c", "pA.toml"],
+            vec!["--strict-config", "false", "status", "-c", "pA.toml"],
+            vec!["--strict_config", "true", "stop", "-c", "pA.toml"],
+            vec!["--strict-config", "true", "tcp", "--local-port", "5"],
+            vec!["--strict-config", "true", "reload", "-c", "pA.toml"],
+            // `notacommand` is refused by Go as the first bare word; the real
+            // command after it must not be hoisted either.
+            vec!["--strict-config", "notacommand", "status"],
+        ] {
+            let out = hoist(&argv);
+            assert_eq!(
+                out, argv,
+                "{argv:?} must not be rewritten: the word after the bare flag is the first bare word"
             );
         }
     }

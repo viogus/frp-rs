@@ -312,7 +312,11 @@ fn canary() -> Canary {
 }
 
 impl Canary {
-    /// The child reached this listener exactly `expected` times.
+    /// The child reached this listener exactly `expected` times — no more, no
+    /// fewer. The extra window matters: stopping the read at `expected` would
+    /// let a child that dialled twice (or a second child) pass, so after the
+    /// expected reports arrive the listener keeps accepting for
+    /// [`ORACLE_WINDOW`] and any report in that window fails the assertion.
     fn assert_hits(self, expected: usize, context: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut hits = 0;
@@ -323,6 +327,10 @@ impl Canary {
             }
             hits += 1;
         }
+        let mut extras = 0;
+        while self.rx.recv_timeout(ORACLE_WINDOW).is_ok() {
+            extras += 1;
+        }
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         self.handle.join().expect("canary thread");
         assert_eq!(
@@ -330,10 +338,27 @@ impl Canary {
             "{context}: expected {expected} connection(s) on canary port {}, saw {hits}",
             self.port
         );
+        assert_eq!(
+            extras, 0,
+            "{context}: {extras} unexpected extra connection(s) on canary port {}",
+            self.port
+        );
     }
 
     fn port(&self) -> u16 {
         self.port
+    }
+
+    /// The child never reached this listener.
+    fn assert_silent(self, context: &str) {
+        let hit = self.rx.recv_timeout(ORACLE_WINDOW).is_ok();
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.handle.join().expect("canary thread");
+        assert!(
+            !hit,
+            "{context}: unexpected connection reached canary port {}",
+            self.port
+        );
     }
 }
 
@@ -1357,41 +1382,53 @@ fn subcommand_after_leading_root_flags_runs_a_single_proxy() {
 #[test]
 fn attached_and_repeated_config_spellings_still_resolve_the_hoisted_subcommand() {
     // The same rule has to survive pflag's `=`/attached spellings and a
-    // repeated flag, all measured on Go: each dials the mock.
+    // repeated flag, all measured on Go: each dials the mock. Every row gets
+    // its own one-shot listener and asserts the **positive** outcome (rc 0 plus
+    // the request the mock received), because a negative-only assertion
+    // (`!contains("no such command or positional")`) would also pass on a third,
+    // different error message.
     let dir = TempDir::new();
-    let (port, rx, handle) = mock_admin("HTTP/1.1 200 OK");
-    let cfg = admin_config(&dir, "att.toml", port);
-    let attached = format!("-c={cfg}");
-    let short_attached = format!("-c{cfg}");
+    for (i, spelling) in ["-c=", "-c", "--config="].iter().enumerate() {
+        let (port, rx, handle) = mock_admin("HTTP/1.1 200 OK");
+        let cfg = admin_config(&dir, &format!("att{i}.toml"), port);
+        let attached = format!("{spelling}{cfg}");
+        let argv: Vec<&str> = vec![&attached, "status"];
 
-    let rows: [Vec<&str>; 3] = [
-        vec![&attached, "status"],
-        vec![&short_attached, "status"],
-        vec!["-c", &cfg, &attached, "status"],
-    ];
-    // One mock answers one request; the first row consumes it. Assert the
-    // first (attached `-c=`) and let the remaining rows be covered by the
-    // parser-level pins in `frp-core/src/cli.rs`, which cannot exhaust a
-    // listener.
-    let out = run_frpc(&rows[0]);
+        let out = run_frpc(&argv);
+
+        let captured = captured_request(rx, handle);
+        assert_eq!(
+            exit_code(&out),
+            0,
+            "{argv:?} must dial the config's admin port: stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out)
+        );
+        assert!(
+            captured.head.starts_with("GET /api/status HTTP/1.1\r\n"),
+            "{argv:?} must run the status command: head={:?}",
+            captured.head
+        );
+        assert!(
+            captured.head.contains(&format!("Host: 127.0.0.1:{port}")),
+            "{argv:?} must dial the config's port: head={:?}",
+            captured.head
+        );
+    }
+
+    // A repeated `-c`: the last one wins and the command still resolves.
+    let (port, rx, handle) = mock_admin("HTTP/1.1 200 OK");
+    let cfg = admin_config(&dir, "att-rep.toml", port);
+    let other = admin_config(&dir, "att-dead.toml", 1);
+    let out = run_frpc(&["-c", &other, "-c", &cfg, "status"]);
     let captured = captured_request(rx, handle);
     assert_eq!(exit_code(&out), 0, "stderr={:?}", stderr_of(&out));
     assert!(captured.head.starts_with("GET /api/status HTTP/1.1\r\n"));
-
-    // The parser half of the other two rows, without a listener: both must
-    // resolve the status command and never run mode.
-    for argv in [&rows[1], &rows[2]] {
-        let out = run_frpc(argv);
-        let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
-        assert!(
-            !text.contains("no such command or positional"),
-            "{argv:?} must not fall back to run mode: {text:?}"
-        );
-        assert!(
-            !text.contains("connecting to"),
-            "{argv:?} must not start run mode's service: {text:?}"
-        );
-    }
+    assert!(
+        captured.head.contains(&format!("Host: 127.0.0.1:{port}")),
+        "the last -c must win: head={:?}",
+        captured.head
+    );
 }
 
 #[test]
@@ -1596,4 +1633,135 @@ fn the_hoisted_subcommand_dials_the_same_port_as_the_unhoisted_order() {
         norm(&captured_b.head, port_b),
         "the hoisted and unhoisted orders must send the same request"
     );
+}
+
+// ── `--strict-config`/`--strict_config` before the subcommand, both ways ────
+//
+// Go registers the flag with pflag `BoolVarP` (`cmd/frpc/sub/root.go:53`), and
+// a pflag bool sets `NoOptDefVal = "true"` (`pflag-1.0.5/bool.go:56`), so
+// cobra's `stripFlags` does **not** let it swallow the next argv token. Both
+// signs of getting that wrong were measured on Go v0.71.0:
+//
+// * bare flag before the command word — `frpc --strict-config status -c cfg` is
+//   rc 0 and dials the config's admin port (the command **is** resolved), so a
+//   classifier that consumes the token misses it;
+// * a word after the bare flag — `frpc --strict-config true status -c cfg` is
+//   rc 1 `unknown command "true" for "frpc"` and never dials (`true` is the
+//   first bare word, and `status` is not resolved), so a classifier that
+//   consumes the token resolves a command Go refuses.
+//
+// These two tests pin one direction each, end to end.
+
+#[test]
+fn bare_strict_config_before_the_subcommand_still_resolves_it() {
+    // Direction B: the flag does not consume `status`, so the status command
+    // runs and dials. Each spelling gets its own one-shot mock.
+    let dir = TempDir::new();
+    // The command word must be the token immediately after the bare flag: that
+    // is the shape where a consuming classifier loses it. (`--strict-config
+    // CFG status` is a different, also-Go-refused shape — the config path is
+    // the first bare word — and is covered by the direction-A test below.)
+    let orders: [&[&str]; 4] = [
+        &["--strict-config", "status", "-c", "CFG"],
+        &["--strict_config", "status", "-c", "CFG"],
+        &["-c", "CFG", "--strict-config", "status"],
+        &["-c", "CFG", "--strict_config", "status"],
+    ];
+    for order in orders {
+        let (port, rx, handle) = mock_admin("HTTP/1.1 200 OK");
+        let cfg = admin_config(&dir, "sc-led.toml", port);
+        let argv: Vec<String> = order
+            .iter()
+            .map(|a| {
+                if *a == "CFG" {
+                    cfg.clone()
+                } else {
+                    (*a).to_string()
+                }
+            })
+            .collect();
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+
+        let out = run_frpc(&refs);
+
+        let captured = captured_request(rx, handle);
+        assert_eq!(
+            exit_code(&out),
+            0,
+            "{refs:?} must resolve the status command: stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out)
+        );
+        assert!(
+            captured.head.starts_with("GET /api/status HTTP/1.1\r\n"),
+            "{refs:?} must run the status command: head={:?}",
+            captured.head
+        );
+    }
+}
+
+#[test]
+fn a_word_after_bare_strict_config_is_not_resolved_as_a_subcommand() {
+    // Direction A (the regression the over-consuming classifier introduced):
+    // `true`/`false` is the first bare word, so Go refuses that word and never
+    // resolves the real command name that follows it. The listener must stay
+    // silent and the exit code must be non-zero.
+    let dir = TempDir::new();
+    let (port, rx, handle) = mock_admin("HTTP/1.1 200 OK");
+    let cfg = admin_config(&dir, "sc-true.toml", port);
+
+    for argv in [
+        vec!["--strict-config", "true", "status", "-c", cfg.as_str()],
+        vec!["--strict-config", "false", "status", "-c", cfg.as_str()],
+        vec!["--strict_config", "true", "stop", "-c", cfg.as_str()],
+        vec!["--strict-config", "true", "reload", "-c", cfg.as_str()],
+    ] {
+        let out = run_frpc_brief(&argv);
+        assert_ne!(
+            exit_code(&out),
+            0,
+            "{argv:?} must be refused like Go's `unknown command \"true\"`: stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out)
+        );
+        let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(
+            !text.contains("Proxy Status")
+                && !text.contains("stop success")
+                && !text.contains("reload success"),
+            "{argv:?} must not run the later command: {text:?}"
+        );
+    }
+
+    // Nothing reached the admin mock: the config's `[webServer]` port was never
+    // dialled (the status/stop/reload commands would have dialled it).
+    assert!(
+        rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "no admin request may arrive for a word-after-flag argv"
+    );
+    drop(handle); // parked in `accept()`; see the reversed-order test.
+
+    // The same shape on a single-proxy command: Go refuses `true` and the tcp
+    // proxy must not start, so the canary stays silent.
+    let canary = canary();
+    let out = run_frpc_brief(&[
+        "--strict-config",
+        "true",
+        "tcp",
+        "--local-port",
+        "5",
+        "--remote-port",
+        "6",
+        "--proxy-name",
+        "x",
+        "--server-port",
+        &canary.port().to_string(),
+    ]);
+    assert_ne!(exit_code(&out), 0, "stderr={:?}", stderr_of(&out));
+    let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        !text.contains("starting single proxy"),
+        "the tcp proxy must not start: {text:?}"
+    );
+    canary.assert_silent("a refused `--strict-config true tcp …` must not dial");
 }

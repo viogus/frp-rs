@@ -19,21 +19,32 @@ User-facing release notes for frp-rs.
   started the single tcp proxy; bpaf picked a branch before dispatch, so frp-rs
   fell through to run mode and exited 1 with ``Error: no such command or
   positional: `status`, did you mean `https`?``. The interleavings that now work
-  are the ones Go accepts: any of the five persistent root flags before the
-  subcommand (`-c FILE`, `--config=FILE`, `-cFILE`, `--config-dir DIR`,
-  `--strict-config[=BOOL]`, `--allow-unsafe F`, `-v`/`--version[=BOOL]`), in any
-  order, repeated, and with the subcommand also split from the flags by further
-  root flags — `-c a.toml status`, `--strict-config=false status -c a.toml`,
-  `-c a.toml --strict-config=false status`, `-c a.toml -c a.toml status`,
-  `-c a.toml tcp --local-port …` and the `reload`/`stop`/`verify` equivalents.
-  The already-supported order `frpc <subcommand> [flags]` is unchanged. Values
-  are never mistaken for commands: a config file literally named `status`
-  (`-c status`, `--config=status`, `-c=status`, `-cstatus`), a value after a
-  real `--`, and a `--proxy-name status` all stay values, because the hoist
-  skips every token that is a flag's value. `frps` is untouched (Go's `frps` has
-  no subcommands to resolve), and a leading word that is not a command is still
-  refused. The full Go-vs-frp-rs table, including the cases that remain
-  divergent, is in `docs/developing.md` § CLI inputs.
+  are the ones Go accepts: a leading root flag before the subcommand — `-c FILE`,
+  `--config=FILE`, `-cFILE`, `--config-dir DIR`, a bare
+  `--strict-config`/`--strict_config`, `--strict-config=BOOL`,
+  `--allow-unsafe F`, `-v`/`--version` — in any order, repeated, and with the
+  subcommand also split from the flags by further root flags —
+  `-c a.toml status`, `--strict-config=false status -c a.toml`,
+  `-c a.toml --strict-config=false status`, `--strict-config status -c a.toml`,
+  `-c a.toml -c a.toml status`, `-c a.toml tcp --local-port …` and the
+  `reload`/`stop`/`verify` equivalents. The already-supported order
+  `frpc <subcommand> [flags]` is unchanged.
+  Two boundaries follow Go exactly and are worth naming, because they are what
+  distinguishes a flag **value** from the command word: `--strict-config` is a
+  pflag *bool*, so it never consumes the token after it — a bare
+  `--strict-config` immediately before a command word leaves that word as the
+  command (`frpc --strict-config status -c frpc.toml` resolves `status` and
+  dials, as Go does), whereas `frpc --strict-config true status -c frpc.toml`
+  refuses `true` as an unknown command on both binaries and does **not** run
+  `status`. Values are never mistaken for commands: a config file literally named
+  `status` (`-c status`, `--config=status`, `-c=status`, `-cstatus`), a value
+  after a real `--`, and a `--proxy-name status` all stay values, because the
+  hoist skips the value of every value-taking flag. `frps` is untouched (Go's
+  `frps` has no subcommands to resolve), and a leading word that is not a command
+  is still refused — including a value-looking word such as `true` after a bare
+  bool flag, which Go refuses as `unknown command "true"`. The full
+  Go-vs-frp-rs table, including the `--strict-config <bool>` rows and the cases
+  that remain divergent, is in `docs/developing.md` § CLI inputs.
 - **Bool flags now accept Go's `--flag=<bool>` spelling — ten flags on both
   binaries.** Go registers eight of them with pflag's bool machinery, which takes
   the bare `--flag` (true), `--flag=true`/`--flag=false`, and any value

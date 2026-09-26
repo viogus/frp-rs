@@ -2610,17 +2610,43 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     (`prepared_cli_argv`, `frp-core/src/cli.rs`).
   * **Design**: `hoist_leading_subcommand` runs before bpaf over the argv after `cli_args` dropped
     `argv[0]` — the first version saw `argv[0]` as a bare word and never fired, which the 45-row
-    table caught immediately. It skips the value of any value-taking token, stops at a real `--`,
-    and only ever hoists the first bare word. `frps` passes `has_subcommands: false` and is
-    byte-identical (Go `frps` declares no subcommands).
-  * **Tests**: nine unit tests in `frp-core/src/cli.rs` (`mod hoist_tests`) pin the classifier, the
-    hoist, the traps, the composition order and both directions of the `FRPC_SUBCOMMANDS` ↔
-    `frpc_parser` correspondence; eight end-to-end tests appended to `frpc/tests/cli_inputs.rs`
-    (one-shot mock admin and canary listeners) pin the fixed orders, the traps, the `--` case, the
-    existing order and the request-head equality between the hoisted and unhoisted orders. Nothing
-    was added to `frpc/tests/cli_exit_codes.rs` or `frps/tests/cli_exit_codes.rs`, so the two
-    guarded counts in `.github/workflows/ci.yml` (`FRPS_CLI_TESTS: "16"`,
-    `FRPC_TINY_CLI_TESTS: "11"`) are unchanged and still match `-- --list`.
+    table caught immediately. It skips the value of a flag that cobra's `stripFlags` would let
+    swallow one, stops at a real `--`, and only ever hoists the first bare word. `frps` passes
+    `has_subcommands: false` and is byte-identical (Go `frps` declares no subcommands).
+  * **The classifier's `NoOptDefVal` set is where the first version was wrong, and the reviews
+    found it in both directions.** The rule is cobra's: a `--long`/`-x` without `=` consumes the
+    next token *unless the flag is a pflag bool* (`pflag-1.0.5/bool.go:56` sets
+    `NoOptDefVal = "true"`). On `frpc` exactly two root flags are bools —
+    `--version`/`-v` (`cmd/frpc/sub/root.go:52`) and `--strict-config`/`--strict_config` (`:53`) —
+    while `-c/--config`, `--config_dir` and `--allow-unsafe` (`:50-51,55`) consume, and a flag
+    cobra does not know also consumes. The first version wrongly listed `--strict-config` as a
+    consumer. **Over-consuming is not the safe direction** (the earlier claim that it was is
+    falsified): skipping a token shifts *which* token is the first bare word, so the regression
+    direction was `frpc --strict-config true status -c pA.toml` — Go rc 1
+    ``unknown command "true" for "frpc"``, base rc 1, that head **rc 0 with a real
+    `GET /api/status`** (`stop`/`reload` likewise, and `--strict-config true tcp …` connected to
+    the canary); the mirror was `frpc --strict-config status -c pA.toml` — Go rc 0 and dials, that
+    head rc 1 ``no such command or positional``. Both are fixed by exempting the two bool
+    spellings, and the four other root flags were swept with no divergence:
+    `-v/--version`, `--allow-unsafe` and `--config_dir` behave as Go does, `--help`/`-h` stays a
+    consumer (cobra adds it in `execute`, after `Find`), and an unknown flag consumes like Go's
+    `stripFlags`. The full matrix, both directions, is in `docs/developing.md` § "A subcommand
+    after leading root flags" (raw rows `/tmp/ledprobe/{go,base,oldhead,fixed}_sc_.jsonl` and
+    `…_ofl_.jsonl`).
+  * **Tests**: 11 unit tests in `frp-core/src/cli.rs` (`mod hoist_tests`) pin the classifier (both
+    the consumer and the `NoOptDefVal` rows), the hoist, the traps, the composition order, both
+    directions of the `--strict-config` grammar and both directions of the `FRPC_SUBCOMMANDS` ↔
+    `frpc_parser` correspondence; 13 end-to-end tests appended to `frpc/tests/cli_inputs.rs`
+    (one-shot mock admin and canary listeners) pin the fixed orders, the traps, the `--` case, both
+    `--strict-config` directions, the existing order and the request-head equality between the
+    hoisted and unhoisted orders. Nothing was added to `frpc/tests/cli_exit_codes.rs` or
+    `frps/tests/cli_exit_codes.rs`, so the two guarded counts in `.github/workflows/ci.yml`
+    (`FRPS_CLI_TESTS: "16"`, `FRPC_TINY_CLI_TESTS: "11"`) are unchanged and still match
+    `-- --list`. `frpc/tests/cli_inputs.rs` went 21 tests at the base to 34 (13 new); with `BIN`
+    re-pinned to the base binary the suite is **28 passed, 6 failed**, the six being exactly the
+    command-resolution tests, and with it pinned to the pre-fix head
+    `a_word_after_bare_strict_config_is_not_resolved_as_a_subcommand` fails while the
+    command-resolution tests pass — the two directions are pinned independently.
   * **Gates at this head**: `cargo fmt --all -- --check` clean; `cargo clippy -p frp-core -p frps
     -p frpc --all-targets --all-features -- -D warnings` clean; `cargo test -p frp-core --lib`,
     `cargo test -p frps`, `cargo test -p frpc` pass; `bash scripts/repo-health.sh` rc 0;
