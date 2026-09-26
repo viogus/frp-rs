@@ -868,20 +868,37 @@ const CLI_OUTPUT_WIDTH: usize = 100;
 /// `argv` is the process argv **without** `argv[0]`, matching what bpaf's
 /// `Args::current_args` hands the parser.
 fn expand_bool_short_value_form(argv: Vec<OsString>) -> Vec<OsString> {
+    // Nothing after the first `--` is a flag, so nothing there is a shorthand
+    // either. Rewriting past it would put a token the user never typed into a
+    // rejection message: `frps -- -v=false` would answer
+    // `` `--version=false` is not expected `` where the base head and Go both
+    // name `-v=false`.
+    let mut seen_separator = false;
     argv.into_iter()
-        .map(
-            |arg| match arg.to_str().and_then(|text| text.strip_prefix("-v=")) {
+        .map(|arg| {
+            if seen_separator {
+                return arg;
+            }
+            if arg == "--" {
+                seen_separator = true;
+                return arg;
+            }
+            match arg.to_str().and_then(|text| text.strip_prefix("-v=")) {
                 Some(value) => OsString::from(format!("--version={value}")),
                 None => arg,
-            },
-        )
+            }
+        })
         .collect()
 }
 
 /// The bpaf `Args` for a process argv: `argv[0]` dropped the way
 /// `Args::current_args` drops it, its file name carried over so help and error
 /// output keep naming the program, and the pflag short-`=` alias expanded.
-fn cli_args(argv: &[OsString]) -> (String, Vec<OsString>) {
+fn cli_args(argv: &[OsString]) -> (Option<String>, Vec<OsString>) {
+    // Mirror `Args::current_args` exactly (`bpaf-0.9.27/src/args.rs:145-159`):
+    // the name is argv[0]'s *file name* when it is valid UTF-8, and `None`
+    // otherwise — never a hardcoded program name, which would make `frpc` print
+    // `Usage: frps …` for an argv[0] bpaf cannot read.
     let name = argv
         .first()
         .map(std::path::Path::new)
@@ -889,15 +906,21 @@ fn cli_args(argv: &[OsString]) -> (String, Vec<OsString>) {
         .and_then(std::ffi::OsStr::to_str)
         .map(str::to_owned);
     let rest = expand_bool_short_value_form(argv.iter().skip(1).cloned().collect());
-    (name.unwrap_or_else(|| "frps".to_string()), rest)
+    (name, rest)
 }
 
 /// Run an `OptionParser` over `argv` and exit the way `OptionParser::run` does
 /// (`err.print_message(self.info.max_width)`, then `err.exit_code()`).
 fn run_cli<T>(parser: bpaf::OptionParser<T>, argv: &[OsString]) -> T {
     let (name, rest) = cli_args(argv);
-    let run_inner = |args: bpaf::Args<'_>| parser.run_inner(args);
-    match run_inner(bpaf::Args::from(&rest[..]).set_name(&name)) {
+    let args = bpaf::Args::from(&rest[..]);
+    // `set_name` only when there *is* one: `Args::current_args` leaves the name
+    // unset for an unreadable argv[0], and bpaf renders that case differently.
+    let args = match &name {
+        Some(name) => args.set_name(name),
+        None => args,
+    };
+    match parser.run_inner(args) {
         Ok(value) => value,
         Err(err) => {
             err.print_message(CLI_OUTPUT_WIDTH);
@@ -3073,6 +3096,18 @@ mod tests {
             );
             assert_ne!(value_help, switch_help);
         }
+
+        // The usage line's value alternative is part of the rendered help and is
+        // quoted as a carrier in `docs/developing.md`; pin the spelling for the
+        // one flag that also has a short, so a future parser change cannot
+        // silently re-render `-v=BOOL` (or drop the alternative) while the
+        // per-entry assertions above still pass. Spaces are removed first
+        // because the usage line wraps at the output width.
+        let usage: String = help_of("frps").split_whitespace().collect();
+        assert!(
+            usage.contains("(--version=BOOL|[-v])"),
+            "the usage line must render the long value spelling plus the short: {usage}"
+        );
     }
 
     #[test]
@@ -3151,6 +3186,22 @@ mod tests {
             let out = expand_bool_short_value_form(vec![raw.clone()]);
             assert_eq!(out, vec![raw]);
         }
+
+        // Nothing after the first `--` is a flag, so nothing there is rewritten
+        // either: a rewritten token would surface in a rejection message as
+        // `--version=false` where the user typed `-v=false`. Measured on the
+        // binary, `frps -- -v=false` is rc 1 and names `-v=false`, as the base
+        // head did; only the token *after* the separator is skipped.
+        assert_eq!(
+            expand(&["--", "-v=false"]),
+            ["--", "-v=false"],
+            "the separator must stop the rewrite"
+        );
+        assert_eq!(
+            expand(&["-v=false", "--", "-v=false"]),
+            ["--version=false", "--", "-v=false"],
+            "before the separator is still rewritten, after it is not"
+        );
     }
 
     #[test]

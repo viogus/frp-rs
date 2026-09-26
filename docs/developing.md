@@ -1468,12 +1468,25 @@ spelling — the same variable as `--version=<bool>` there — is expanded to
 `--version=<bool>` before bpaf sees argv
 (`expand_bool_short_value_form`). That is the only bool short either binary
 registers; every other short (`-c`, `-t`, `-p`, `-L`, …) takes a value and
-already parses its `=` spelling. The two entry points therefore build bpaf's
-`Args` by hand (`cli_args` / `run_cli`: `Args::set_name`, `print_message(100)`,
-`exit_code()` — the same constants `OptionParser::run` uses) so the rewrite has
-a place to live; help and error output were diffed byte-for-byte against the
-previous build and differ only in the intended usage-line spelling
-(`(--version=BOOL | [-v])` instead of `(-v=BOOL | [-v])`).
+already parses its `=` spelling. The rewrite also stops at the first `--`:
+nothing after it is a flag, and rewriting there would put a token the user never
+typed into a rejection message (`frps -- -v=false` must answer
+`` `-v=false` is not expected ``, as the base head and Go do, not
+`` `--version=false` ``).
+
+The two entry points therefore build bpaf's `Args` by hand (`cli_args` /
+`run_cli`) so the rewrite has a place to live, and they reproduce
+`OptionParser::run`'s own behaviour exactly: `print_message(100)` (bpaf's
+default `max_width`) then `exit_code()`, `argv[0]` dropped the way
+`Args::current_args` drops it, and `set_name` called **only** when argv[0] yields
+a UTF-8 file name — never a hardcoded program name, which would make `frpc`
+render `Usage: frps …` for an argv[0] bpaf cannot read. Help and error output
+were diffed byte-for-byte against the previous build over 14 argvs (help on five
+surfaces, nine parse-error paths) **and** over argv[0] shapes
+(`b"frpc"`, `b"frpc\xff"`, `b""`, `b"weird/name.bin"`): the only differences are
+the intended usage-line spelling (`(--version=BOOL | [-v])` instead of
+`(-v=BOOL | [-v])`), the two new help entries, and the nameless usage line
+`Args::current_args` also produces for an unreadable argv[0].
 
 The sweep — every bpaf `.switch()` on either binary. At the base commit
 `grep -n "\.switch()" frp-core/src/cli.rs` returned those ten sites (plus the
@@ -1639,7 +1652,7 @@ What the table says, precisely:
   "notAKnownFrpKey"` on Go, where frp-rs answers `` `--allow-unsafe` is not
   expected in this context `` / `` `--config-dir` is not expected in this
   context `` (rc 1, nothing loaded). That class is already tracked as
-  `TODO.md:1996` ("`frpc`'s eight single-proxy subcommands reject `-c`/
+  `TODO.md:2011` ("`frpc`'s eight single-proxy subcommands reject `-c`/
   `--config`, which Go accepts and ignores"); the `verify` row above is another
   row of the same class (the `tcp`/`reload`/`status`/`stop` rows are covered by
   the same registration gap). Fixing it means registering Go's
@@ -1647,11 +1660,28 @@ What the table says, precisely:
   `-v`/`--version`) on all twelve `frpc` subcommand parsers, which is that
   item's change, not this one's; these rows are recorded here rather than left
   as a silent regression.
+- **A rejection message can name the expanded spelling.** Because `-v=<bool>`
+  becomes `--version=<bool>` before bpaf parses, a *refused* token is reported
+  under its long name: measured, `frpc status -v=false -c <cfg>` is rc 1
+  `` `--version` is not expected in this context `` where the base head said
+  `` `-v=false` `` — but the base head's rc was **0** there (it printed the
+  version, the speculative-`exit` defect this branch fixes) while Go is rc 1
+  (the persistent flag parses, `status` ignores it and dials the admin API), so
+  the rc moved *towards* Go and only the message text names an alias. The `--`
+  guard removes the one case where the rewrite was gratuitous (`frps -- -v=false`
+  names `-v=false` again, byte-identical to the base head). Recorded rather than
+  fixed: the alternative is a message rewrite after the fact, which cannot be
+  done reliably on bpaf's rendered text. Related and unchanged: Go *accepts*
+  `frps -p <free> -- xyz` (it starts, rc 124) while frp-rs refuses the stray
+  positional (rc 1, `` `xyz` is not expected ``) — the same
+  stricter-than-Go-positional class as the space form above, no `-v` involved.
 - **The help *shape* is user-visible and different from Go's.** frp-rs renders
   **two** entries per bool flag — `--flag=BOOL` (the value spelling) and
   `--flag` (the bare form) — and a usage alternation
   `(--version=BOOL | [-v])`, where Go prints a single `-v, --version  version of
-  frps` line and no separate value entry. The `-v=<bool>` spelling works but is
+  frps` line and no separate value entry. That rendering is pinned by
+  `every_go_bool_flag_help_states_its_own_spelling` (spaces removed before the
+  assertion, because the usage line wraps at the output width). The `-v=<bool>` spelling works but is
   not advertised as its own entry (it is expanded to `--version=<bool>` at the
   entry point). That is a deliberate consequence of having one parser for both
   spellings, recorded rather than described as parity; nothing in Go's help
@@ -1672,9 +1702,11 @@ Carriers, all of which agree:
   flag name in the help is the name the parser registers (`concat!`, not a
   second literal);
 - the **entry points**: `expand_bool_short_value_form` plus `cli_args`/`run_cli`
-  (`frp-core/src/cli.rs`), which expand pflag's `-v=<bool>` short spelling and
-  hand bpaf the same `Args` (`set_name` + `print_message(100)` +
-  `exit_code()`) that `OptionParser::run` would have built;
+  (`frp-core/src/cli.rs`), which expand pflag's `-v=<bool>` short spelling (never
+  past a `--`) and hand bpaf the same `Args` (`set_name` only when argv[0] yields
+  a name, `print_message(100)`, `exit_code()`) that `OptionParser::run` would
+  have built; pinned at unit level by
+  `bool_short_equals_spelling_expands_to_the_long_form_only`;
 - the **help text**, one `=BOOL` entry and one bare entry per flag, rendered by
   `--help` on all four surfaces (`frps`, `frpc` run, `frpc tcp`,
   `frpc status`);

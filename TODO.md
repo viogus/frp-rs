@@ -1823,14 +1823,25 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     rc 0 on Go **and rc 0 at the base head** — all became rc 1. Fixed by giving the short
     to the flag branch only and expanding pflag's `-v=<bool>` spelling to
     `--version=<bool>` before bpaf sees argv (`expand_bool_short_value_form`), which is
-    the same variable under pflag. Measured now, Go / base / this head: `-v` 0/0/0,
-    `-v=<bool>` 124/1/**124**, `-vtrue` 0/0/**0**, `-vh` 0/0/**0**, `-vtok` 0/0/**0**,
-    `-vp7000` 0/0/**0**, `-vfoo` 1/1/1, `-v0` 1/1/1 (Go `unknown shorthand flag: '0' in
-    -0`, here `` `-v0` is not expected `` — rc agrees, message shape only). The entry
-    points now build bpaf's `Args` by hand (`cli_args`/`run_cli`, `Args::set_name` +
-    `print_message(100)` + `exit_code()`, the same constants `OptionParser::run` uses) so
-    the rewrite has a place to live; help and error output were diffed byte-for-byte
-    against the previous build and differ only in the intended usage-line spelling.
+    the same variable under pflag, and never past a `--`, so `frps -- -v=false` still
+    names `-v=false` exactly as the base head did. Measured now, Go / base / this head:
+    `-v` 0/0/0, `-v=<bool>` 124/1/**124**, `-vtrue` 0/0/**0**, `-vh` 0/0/**0**,
+    `-vtok` 0/0/**0**, `-vp7000` 0/0/**0**, `-vfoo` 1/1/1, `-v0` 1/1/1 (Go
+    `unknown shorthand flag: '0' in -0`, here `` `-v0` is not expected `` — rc agrees,
+    message shape only). The entry points now build bpaf's `Args` by hand
+    (`cli_args`/`run_cli`) so the rewrite has a place to live; they reproduce
+    `OptionParser::run` exactly (`print_message(100)`, `exit_code()`, argv[0] dropped the
+    way `Args::current_args` drops it, `set_name` only when argv[0] yields a UTF-8 file
+    name — never a hardcoded program name, which made `frpc` print `Usage: frps …` for an
+    unreadable argv[0] in the first revision of this fix). Help and error output were
+    diffed byte-for-byte against the previous build over 14 argvs **and** over four
+    argv[0] shapes; the only differences are the intended usage-line spelling, the two
+    new help entries and the nameless usage line bpaf itself renders when argv[0] is
+    unreadable. Residual, recorded rather than fixed: because the rewrite precedes the
+    parse, a *rejected* `-v=<bool>` can be reported under its long name — measured,
+    `frpc status -v=false -c <cfg>` is rc 1 `` `--version` is not expected `` where the
+    base head said `` `-v=false` `` but exited **0** (the speculative-`exit` defect this
+    branch fixes) and Go exits 1 (the persistent flag parses and `status` dials).
   * **A second defect, found by the sweep and fixed here.** `frpc`'s version check lived
     in a bpaf `.map()` closure on `frpc_parser()`'s run branch, and bpaf's `ParseOrElse`
     evaluates **every** alternative on a forked state, so at the base head
@@ -1860,7 +1871,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     (`--flag=BOOL` and `--flag`) and a `(--version=BOOL | [-v])` usage alternative where
     Go prints one `-v, --version` line; and `frpc verify --version` is rc 1 here where Go
     is rc 0 (with a valid `-c`; with no `-c` Go is rc 1 too), one row of the
-    persistent-root-flag class already tracked by the `frpc` eight-single-proxy-subcommands item (`TODO.md:1996`).
+    persistent-root-flag class already tracked by the `frpc` eight-single-proxy-subcommands item (`TODO.md:2011`).
     Measured for that class: `frpc tcp --version --local-port … --remote-port …` is the
     same shape, Go 124 / base 0 / head 1, while `reload|status|stop --version` moved
     0 → 1 and now **matches** Go's rc 1 there.
@@ -1870,8 +1881,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     one `GO_BOOL_SITES` table), `every_go_bool_flag_refuses_non_bool_values_and_the_space_form`
     (`=foo`, `=` and the space form, each pinned on the user-visible message),
     `every_go_bool_flag_help_states_its_own_spelling` (the rendered `--help` of all four
-    surfaces, per flag, including which Go claim the call site's macro form makes) and
-    `every_go_bool_flag_rejects_a_repeated_flag`. Real binary, all asserting what
+    surfaces, per flag, including which Go claim the call site's macro form makes, and
+    the `(--version=BOOL | [-v])` usage alternative the docs quote) and
+    `every_go_bool_flag_rejects_a_repeated_flag`; the rewrite's own unit test also pins
+    that a `--` stops it and that `-c=x`/`-t=v`/non-UTF-8 tokens are passed through. Real binary, all asserting what
     happened and not only the rc: `version_flag_value_spelling_decides_what_happens`,
     `version_short_shorthand_clusters_and_equals_spelling_match_go`,
     `tls_only_false_value_starts_and_listens` and
@@ -1883,8 +1896,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     "started" is not inferred from an rc), but with `-c` the transport section of the
     config is authoritative, so it pins argv **acceptance**, not that `false` reached the
     service — its doc comment now says so; `disable_log_color_value_spelling_is_applied`
-    pins the value actually being **applied** (`--disable-log-color=false` leaves 140
-    `ESC [` sequences in the child's output, `=true` leaves 0);
+    pins the value actually being **applied** (`--disable-log-color=false` leaves ANSI
+    escape sequences in the child's output — 140 on the author's host, 260 on a
+    reviewer's, which is why the assertion is "some vs none" and not a count —
+    while `=true` leaves none);
     `version_short_shorthand_clusters_and_equals_spelling_match_go` pins the `-v`
     shorthand grammar that the review round's regression broke (`-vh` help,
     `-vtrue`/`-vtok`/`-vp7000` version, `-v=false` reaching the loader, `-vfoo`/`-v0`

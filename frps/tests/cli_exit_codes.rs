@@ -567,10 +567,12 @@ fn tls_only_false_value_starts_and_listens() {
 /// (`logging::resolve_ansi(!disable)` → `with_ansi(ansi)`,
 /// `frps/src/main.rs:55-56`), so the child's own output shows which value won.
 ///
-/// Measured at this head with a valid config and a bounded runner, counting
+/// Measured at this head with a valid config and a bounded runner, on the
 /// `ESC [` sequences in the child's combined output:
-/// `--disable-log-color=false` → 140, `=true` → 0, bare → 0. Asserting only the
-/// exit code would pass for all three.
+/// `--disable-log-color=false` → some (140 on the author's host, 260 on a
+/// reviewer's — the count is host-dependent, so the assertion below is
+/// "some vs none"), `=true` → none, bare → none. Asserting only the exit code
+/// would pass for all three.
 ///
 /// One caveat, stated rather than implied: this pins that `false` and `true` are
 /// *distinguished and applied*; that a rejected value (`=foo`) never reaches the
