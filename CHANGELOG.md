@@ -12,6 +12,35 @@ User-facing release notes for frp-rs.
 ## Unreleased
 
 ### Features
+- **Bool flags now accept Go's `--flag=<bool>` spelling — ten flags on both
+  binaries.** Go registers eight of them with pflag's bool machinery, which takes
+  the bare `--flag` (true), `--flag=true`/`--flag=false`, and any value
+  `strconv.ParseBool` accepts (`1`, `0`, `t`, `f`, `TRUE`, `False`, …); frp-rs
+  registered them as bpaf switches that took no value, so
+  `frps --tls-only=false -c frps.toml` **started and listened on Go** and exited
+  `1` here with ``Error: `false` is not expected in this context``. The flags
+  are `frps --tls-only`, `--enable-prometheus`, `--disable-log-color`,
+  `--dashboard-tls-mode`, `-v`/`--version`; `frpc --disable-log-color`,
+  `-v`/`--version`; `frpc tcp --use-encryption`, `--use-compression`; and
+  `frpc status --json` (an frp-rs-only flag — Go has no `--json`, so its value
+  form is an frp-rs extension). A non-bool value exits 1 exactly as Go's
+  `strconv.ParseBool` refusal does, and the **short** spelling `-v=<bool>` is
+  accepted as well (Go's pflag treats it as `--version=<bool>`; frp-rs expands
+  it before parsing, and never after a `--`). Short-hand clusters keep working
+  and now match Go on both binaries: `frps -vtrue`/`-vh`/`-vtok`/`-vp7000` set
+  `-v` and re-parse the rest, exactly as before; on `frpc` the same cluster no
+  longer prints the version where Go refuses it (`frpc -vtrue` is rc 1 on both,
+  was 0 here) and `frpc -vh` prints **help** as Go does (the previous release
+  printed the version there — both are fixes toward Go); `-vfoo`/`-v0` stay rc 1
+  on both binaries. Three caveats, all measured and recorded in
+  `docs/developing.md`: the space-separated `--flag false` is still refused
+  (Go's pflag never consumes that token either, and Go's own behaviour differs
+  per command — `frps` answers `unknown command "false"`, `frpc tcp` ignores the
+  token); `--dashboard-tls-mode` is a **string** flag on Go, so Go also accepts
+  `=auto`/`=disable`/any value there, which frp-rs's bool model does not; and Go
+  flags frp-rs does not register at all (`frpc tcp --ue`/`--uc` and
+  `--tls-enable`) stay unimplemented. A repeated bool flag is still refused
+  rather than last-wins.
 - **`frpc stop` and `--api-timeout` — Go parity.** `frpc stop -c frpc.toml`
   POSTs `/api/stop` with an empty body and prints `stop success` on 200,
   matching Go frp's third admin command. `reload`, `status` and `stop` accept
@@ -97,6 +126,18 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **`frpc --version` no longer short-circuits an argv that is going to fail — a
+  behaviour change.** The version check lived in a closure on the run-mode
+  branch of `frpc`'s argument parser, and bpaf evaluates every alternative while
+  choosing one, so the closure printed `frpc 0.71.0 (Rust)` and exited **0**
+  before the rest of the argv was judged: `frpc --nope=1 --version` and
+  `frpc verify --version` both exited 0, where Go exits 1 (`unknown flag:
+  --nope`) and 0-with-`verify`-actually-running respectively. The check now runs
+  after the parse, exactly as `frps`'s already did, so
+  `frpc --version=foo` exits 1 like Go's `strconv.ParseBool` refusal and an
+  invalid flag wins. One row moves the other way and is recorded in
+  `docs/developing.md`: `frpc verify --version` is now rc 1 because frp-rs does
+  not register Go's persistent root flags on its subcommands (`TODO.md:2013`).
 - **A repeated `-c`/`--config` is now last-wins on the five `frpc` commands that
   read a config file — a behaviour change.** Go registers `-c` with pflag
   `StringVarP`, so `frpc status -c a.toml -c b.toml` loads `b.toml` and is never

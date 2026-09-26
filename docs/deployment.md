@@ -632,6 +632,21 @@ Using it prints one warning line on stderr (`warning: --strict-config <bool> is
 an frp-rs extension; …`), because the outcome differs from Go silently
 otherwise. Use the `=` spelling for any argv that must behave identically under
 both binaries.
+
+The same `--flag=<bool>` spelling (and any value `strconv.ParseBool` accepts:
+`1`, `0`, `t`, `f`, `TRUE`, `False`, …) is accepted by every bool flag frp-rs
+registers — `frps --tls-only=false`, `--enable-prometheus=false`,
+`--dashboard-tls-mode=false`, `frps -v=false`; `frpc --disable-log-color=false`,
+`frpc -v=false`; `frpc tcp --use-encryption=false`/`--use-compression=false`;
+`frpc status --json=false` — where before only the bare `--flag` parsed. A
+non-bool value exits 1 as it does on Go's pflag, and the space-separated
+`--flag false` is refused (Go's pflag never consumes that token either). Three
+of those names are frp-rs's own (`frpc tcp`'s pair is Go's `--ue`/`--uc`, and
+`frpc status --json` has no Go counterpart), and `--dashboard-tls-mode` is a
+**string** flag on Go, which therefore also accepts `=auto`/`=disable` and any
+other value. The per-flag Go comparison, the deliberate divergences and the Go
+flags frp-rs does not register (`--ue`/`--uc`, `--tls-enable`) are tabulated in
+`docs/developing.md` § `--flag=<bool>`.
 A config that fails to load is
 reported on stdout and the command exits 1 **without contacting anything**,
 rather than falling back to `127.0.0.1:7400`. When the address comes from the

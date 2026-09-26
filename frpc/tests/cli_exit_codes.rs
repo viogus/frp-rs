@@ -337,6 +337,161 @@ fn malformed_store_file_exits_4_where_go_exits_1() {
     );
 }
 
+/// A Go pflag bool takes `--flag=<bool>` as well as the bare `--flag`, and the
+/// *value* decides what happens. `-v, --version` is such a bool on Go's root
+/// command, so measured on Go frp v0.71.0 (darwin/arm64, bounded runner)
+/// against a *missing* config file:
+///
+/// ```text
+/// frpc --version=true  -c missing.toml → rc 0, stdout `0.71.0`
+/// frpc --version=false -c missing.toml → rc 1, `open missing.toml: no such file or directory`
+/// frpc --version=foo   -c missing.toml → rc 1, `invalid argument "foo" for "-v, --version" flag: strconv.ParseBool: …`
+/// frpc --nope=1 --version              → rc 1, `Error: unknown flag: --nope`
+/// ```
+///
+/// Two separate pre-fix defects are pinned here, both fixed by routing the flag
+/// through the shared bool-value parser (`frp-core/src/cli.rs`) **and** moving
+/// the `--version` check out of `frpc_parser()`'s `.map()` into
+/// `parse_frpc_args`:
+///
+/// * the `.switch()` took no value, so `--version=false` was an argv error
+///   where Go starts the client;
+/// * that `.map()` closure printed the version and called `process::exit(0)`
+///   while bpaf was still exploring alternatives, so *any* argv containing
+///   `--version` exited 0 — `frpc --version=foo` and even
+///   `frpc --nope=1 --version` printed `frpc 0.71.0 (Rust)` and exited 0
+///   (measured on the base commit's binary), where Go refuses both with rc 1.
+///
+/// `--version=false -c <missing>` is the row that separates all three
+/// outcomes: rc 1 naming the missing file can only be a run that consumed the
+/// value and reached the loader.
+#[test]
+fn version_flag_value_spelling_decides_what_happens() {
+    let dir = TempDir::new();
+    let missing = dir.path("does-not-exist.toml");
+
+    // `=true`: the version short-circuit, before any config read.
+    let out = run_frpc(&["--version=true", "-c", &missing]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--version=true must print the version and exit 0 like Go; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stdout_of(&out).contains(frp_core::VERSION),
+        "stdout must carry the version; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+
+    // `=false`: false is consumed as the value, so the run reaches the load.
+    let out = run_frpc(&["--version=false", "-c", &missing]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--version=false must fall through to the config load like Go; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        all.contains(&missing),
+        "--version=false must reach the loader and name the missing file; the pre-fix binary \
+         printed the version instead; output={all:?}"
+    );
+    assert!(
+        !stdout_of(&out).contains(frp_core::VERSION),
+        "--version=false must not print the version; output={all:?}"
+    );
+
+    // `=foo`: refused, exactly as Go's `strconv.ParseBool` refuses it (rc 1).
+    let out = run_frpc(&["--version=foo", "-c", &missing]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--version=foo must exit 1 like Go's ParseBool refusal; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stderr_of(&out).contains("`foo` is not expected in this context"),
+        "the refusal must name the value; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+
+    // The speculative-`exit` row: an unrelated invalid flag must win over
+    // `--version`, as it does on Go (`unknown flag: --nope`, rc 1). The pre-fix
+    // binary exited 0 here after printing the version.
+    let out = run_frpc(&["--nope=1", "--version"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an invalid flag alongside --version must exit 1 like Go; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        !stdout_of(&out).contains(frp_core::VERSION),
+        "--version must not short-circuit a parse that fails elsewhere; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
+/// The second bool on the client's run mode, and a different kind of row:
+/// `--disable-log-color` exists in Go only on `frpc tcp` (`Error: unknown flag:
+/// --disable-log-color` on Go's root, rc 1), so there is no Go root behaviour to
+/// match — the *value spelling* is the shared parser's, and reading the value as
+/// `false` must leave the run on the normal load path. Before this branch
+/// `--disable-log-color=false -c <missing>` exited 1 with
+/// `` `false` is not expected in this context ``; now it exits 1 naming the
+/// missing file, which is the difference between "argv refused" and "value
+/// consumed, config load attempted".
+#[test]
+fn disable_log_color_value_spelling_is_consumed() {
+    let dir = TempDir::new();
+    let missing = dir.path("does-not-exist.toml");
+
+    let out = run_frpc(&["--disable-log-color=false", "-c", &missing]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the run must reach the loader; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        all.contains(&missing),
+        "the missing config must be named; output={all:?}"
+    );
+    assert!(
+        !all.contains("is not expected in this context"),
+        "the `=false` spelling must not be an argv error; output={all:?}"
+    );
+
+    // A non-bool value is refused with rc 1, the same exit code Go's pflag
+    // produces for its own bools.
+    let out = run_frpc(&["--disable-log-color=foo", "-c", &missing]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a non-bool value must exit 1; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        !format!("{}{}", stdout_of(&out), stderr_of(&out)).contains(&missing),
+        "a refused value must not reach the loader; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
 // ── the same pin for the `tiny` tier ────────────────────────────────────────
 
 /// `frpc-tiny` includes `frpc/src/main.rs` verbatim, so the exit-code fix has

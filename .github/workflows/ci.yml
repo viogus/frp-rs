@@ -230,8 +230,14 @@ jobs:
         # SIGTERM positive control dominating) when this step was added; the
         # count is 5 since the `--strict-config` space-form lane added
         # `space_form_strict_config_warns_on_stderr` (the warning assertion, a
-        # fast `--help`-free parse), and the runner was not measured for wall
-        # time either way.
+        # fast `--help`-free parse) — and 9 since the bool-flag `=value` lanes
+        # added `version_flag_value_spelling_decides_what_happens` (three fast
+        # exits), `version_short_shorthand_clusters_and_equals_spelling_match_go`
+        # (the `-v` shorthand grammar, seven fast exits),
+        # `tls_only_false_value_starts_and_listens` (a SIGTERM positive control)
+        # and `disable_log_color_value_spelling_is_applied` (two spawns, each
+        # waiting out a listener). The runner was not measured for wall time
+        # either way.
         #
         # Fail closed, target-specifically, and colour-proof. `--test
         # cli_exit_codes` makes the integration file the only target, and
@@ -267,8 +273,8 @@ jobs:
           n=$(cargo test -p frps --test cli_exit_codes --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/cli_exit_codes.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 5 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "5" ] || status=1
+          grep -q "test result: ok. 9 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "9" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frps CLI exit-code guard failed (status=$status, listed=$n)"
             cat "$log.plain"
@@ -286,6 +292,8 @@ jobs:
         # exactly this lane.
         #
         # Measured warm, macOS arm64: 1.00 s wall (9 tests — the 7 `full`-tier
+        # assertions plus the 2 `tiny`-gated ones) before the bool-flag `=value`
+        # lane added its own pair; the tiny lane now lists 11 (9 `full`-tier
         # assertions plus the 2 `tiny`-gated ones). The runner was not measured
         # for wall time.
         #
@@ -297,7 +305,7 @@ jobs:
         # the local `CARGO_TERM_COLOR=always` reproduction of that grep failing
         # and passing after the fix. The next runner run measures it for real.
         #
-        # Same three checks as the step above (target ran; `4`/`9` tests listed;
+        # Same three checks as the step above (target ran; `9`/`11` tests listed;
         # `ok. N passed; 0 failed`), same colour handling, same fail-closed exit.
         # The `frps` step is the one with runner evidence: its log shows cargo's
         # coloured `Running …` line and the guard's exit 1.
@@ -310,8 +318,8 @@ jobs:
           n=$(cargo test -p frpc --no-default-features --features tiny --test cli_exit_codes --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/cli_exit_codes.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 9 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "9" ] || status=1
+          grep -q "test result: ok. 11 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "11" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frpc tiny CLI exit-code guard failed (status=$status, listed=$n)"
             cat "$log.plain"
