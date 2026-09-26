@@ -912,16 +912,16 @@ Only a tree with no `.git` entry at all — not even a dangling symlink or a
 gitfile whose gitdir is gone — falls back to walking the filesystem (release
 tarball, Docker build context), pruning `.git` and `target` at any depth. A tree
 that has any such `.git` entry but whose index cannot be read is **not**
-certified: the gate exits 3 rather than silently walking, because a walk would
-scan the gitignored state this gate exists to avoid. A sparse checkout, or any
-worktree missing a tracked path, is likewise not certified — that path is a read
-error, not a skip; a partial clone (`--filter=blob:none`) materialises every
+certified: the path scan exits 3 rather than silently walking, because a walk
+would scan the gitignored state this gate exists to avoid. A sparse checkout, or
+any worktree missing a tracked path, is likewise not certified — that path is a
+read error, not a skip; a partial clone (`--filter=blob:none`) materialises every
 tracked file and does pass. The scan's minimum-size floors apply to the walk path
 as well, and the `git ls-files` call runs with `GIT_DIR`/`GIT_WORK_TREE`/
 `GIT_INDEX_FILE`/`GIT_COMMON_DIR`/`GIT_OBJECT_DIRECTORY` and any `GIT_TRACE*`
 removed so the list comes from the repository git resolves for that directory,
 not from an inherited environment: `git rev-parse --show-toplevel` must equal the
-working directory (`realpath` on both sides) or the gate exits 3, which is what
+working directory (`realpath` on both sides) or the path scan exits 3, which is what
 stops an enclosing repository's index from certifying a cwd whose own `.git` is
 invalid. (The guard identifies the tree by where git says it is; it does not
 prove the index file itself belongs to that tree — a symlinked or foreign
