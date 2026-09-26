@@ -148,6 +148,21 @@ User-facing release notes for frp-rs.
   kept the broken value and ignored the body. Malformed escapes without a body are unchanged
   (still a non-strict 200), as is every other endpoint.
 
+### Docs
+- **The space-separated `--strict-config <bool>` form is now documented as an
+  frp-rs extension, in the help text and the docs — no behaviour change.**
+  `--strict-config false` (two argv tokens) has always been consumed as the
+  value by frp-rs; Go frp v0.71.0's pflag bool does **not** consume it, so the
+  same argv stays strict there (`json: unknown field …`, exit 1) and is lenient
+  here. The extension is kept — dropping it would only turn an argv Go accepts
+  into an frp-rs argv error, for no safety gain — and is now stated in the
+  `--strict-config` help of every parser that takes the flag (`frps` and
+  `frpc`'s `run`/`verify`/`reload`/`status`/`stop`), so the flag is no longer
+  presented as Go pflag semantics. `--strict-config=<bool>` remains the
+  Go-faithful spelling; the measured rows for both binaries, the differing
+  messages, and the reason are in `docs/developing.md`
+  § `--strict-config`: the space-separated value form.
+
 ## v0.71.0 — re-release (2026-09-13)
 
 Supersedes the 2026-08-16 v0.71.0 build (PR #246 era). Same version number,
