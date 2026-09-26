@@ -789,6 +789,44 @@ token: "my-token"
 
 Non-string mapping keys are converted to their string form (YAML allows them; JSON and TOML do not).
 
+#### Legacy `.ini` values are read by the target field's type
+
+Go's legacy INI loader hands every value to the target field as **text** and
+lets the field's Go type decide how to read it (`gopkg.in/ini.v1`'s `MapTo`:
+`Key.String()` for a string, `Key.Int64()` for an int, `Key.Strings(",")` for a
+slice — `struct.go:154-266`). frp-rs's INI reader infers a TOML type first; that
+inference is now **lossless** (a value becomes an integer/float/boolean/array
+only when rendering it back reproduces the text the file wrote), and `.ini`
+inputs are deserialized with the field's type deciding — so a bare numeric or a
+comma list reaches a string field as the string Go would give it:
+
+| INI line | target field | value read |
+|---|---|---|
+| `token = 12345678` | `String` | `"12345678"` |
+| `allow_ports = 2000-3000,3001` | `String` | `"2000-3000,3001"` |
+| `meta_var1 = 123` | `HashMap<String, String>` value | `"123"` |
+| `server_port = 7000` | `u16` | `7000` |
+| `log_max_days = 3` | `i64` | `3` |
+| `tcp_mux = no` | `bool` | `false` (Go's `ini.v1.parseBool` spellings: `1/t/true/yes/y/on` and `0/f/false/no/n/off`) |
+| `custom_domains = a, b` | `Vec<String>` | `["a", "b"]` (Go's `Key.Strings(",")`: split on `,`, trim each element, `\,` is a literal comma) |
+
+Scope and residuals, measured on Go frp v0.71.0:
+
+- Only `.ini` uses this reader. TOML/JSON/YAML keep strict serde typing, where a
+  numeric `token` is refused exactly as Go's v1 decoder refuses it.
+- `007`, `+5`, `1.50`, `1e3` and `YES` keep their text for a string field (this is
+  what makes `token = 007` the token `"007"`, not `"7"`); for an integer/float/
+  bool field the same text is parsed — `007` → `7`, `1e3` → `1000.0`.
+- Go's `Key.Int64()` is `strconv.ParseInt(s, 0, 64)` — **base 0**, so Go reads
+  `0x10` as 16 for an integer field while frp-rs reads base 10 and refuses it.
+  This is pre-existing (the inference it replaced also read base 10).
+- The `["a", "b"]` array-literal spelling is an frp-rs extension, not Go syntax:
+  measured on Go v0.71.0, `custom_domains = ["a.example.com","b.example.com"]`
+  reaches frps as `['["a.example.com"', '"b.example.com"]']`. A **string** field
+  that is given such a literal receives the comma-joined elements (`a.example.com,b.example.com`)
+  where Go would give the bracketed text — a divergence this reader introduces
+  only for the frp-rs-only spelling.
+
 ---
 
 ## Environment Variable Expansion

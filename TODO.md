@@ -1356,7 +1356,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     encryption or proxy path), so it cannot reach the wire.
 
 
-- [ ] **Legacy INI still diverges from Go in three measured ways (value inference, `[range:...]`
+- [x] **Legacy INI still diverges from Go in three measured ways (value inference, `[range:...]`
   list and role handling).** Discovered while closing `:1193`; all three are pre-existing (identical
   at `97fdd38` and at the current head) and none of them is caused by the strict-mode array walk.
   `parse_to_toml_value`/`ini_to_toml` turn a bare numeric value into a TOML integer and a
@@ -1403,6 +1403,79 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   durable in `docs/config.md`; either way pin both shipped fixtures with a full `frpc verify` /
   `frps verify` load against the Go behaviour above (for the range case, against the registered
   proxy count).
+
+  **Done — fixed, not recorded (2026-09-27).** All three classes are fixed and both shipped fixtures
+  load end to end; nothing was left to `docs/config.md` as an open divergence except the
+  pre-existing base-0 integer note and the array-literal spelling (below).
+  * **Independence re-measured, not inherited.** The claim that the three classes are independent of
+    #384's array walk was re-verified twice: (a) with `--strict-config=false` (the walk does not run
+    at all) every class is byte-identical to strict mode; (b) a scratch copy of this branch with the
+    walk reverted to `Some(toml::Value::Array(_)) => {}` reproduces all three — client fixture
+    `invalid type: integer \`12345678\`, expected a string` plus the `WARN … invalid local_port`
+    (rc 1), `[range:x] local_port = 6010-6012,6020` -> `Proxies: 0`, `role = visitor` range ->
+    `Proxies: 3 Visitors: 0`.
+  * **Class 1 — value inference: fixed at the deserialization boundary, not by weakening the
+    schema.** `infer_ini_value` is now **lossless** (a value becomes an integer/float/boolean/array
+    only when rendering it back reproduces the text the file wrote — so `007`, `1.50`, `1e3`, `YES`
+    and `a, b` stay text), and `.ini` inputs are deserialized by a type-directed reader
+    (`frp-core/src/config/ini_lenient.rs`, `deserialize_ini`) used only when `detect_format` says
+    `.ini`: a string field reads the text Go's `ini.v1` `Key.String()` would give it, a numeric/bool
+    field parses it (`Key.Int64()`/`parseBool` spellings), and a slice field splits it with Go's
+    `Key.Strings(",")` rules. TOML/JSON/YAML keep strict serde typing, so no numeric `token` in a
+    `.toml` became acceptable. Measured on Go v0.71.0 (`/private/tmp/frp_0.71.0_darwin_arm64`) and
+    at this head: Go `frpc verify -c` = rc 0, `frps verify -c` = rc 0; frp-rs base = rc 1 for both
+    (`invalid type: integer \`12345678\``, `invalid type: sequence`), frp-rs now = rc 0 for both.
+    Go's numeric token is the *string*: with `auth.token = "12345678"` on Go frps, Go frpc with the
+    fixture's `token = 12345678` logs `login to server success` (and `12345679` logs
+    `token in login doesn't match …`).
+  * **Class 2 — range comma list: fixed in `ini_port_numbers`.** It now accepts the split array
+    (each element a single port or a nested range string), which is what the INI reader produces for
+    a canonical comma list, and the collector is unchanged otherwise. Measured on Go v0.71.0 with a
+    real frps + `GET /api/proxy/tcp`: `6010-6012` -> 3 (`x_0`…`x_2`), `6010-6012,6020` -> 4
+    (`x_0`…`x_3`); frp-rs base for the second case = `Proxies: 0` + the WARN, frp-rs now =
+    `Proxies: 4`. Go's own `[range:tcp_port]` (`local_port = 6010-6020,6022,6024-6028`, 17 numbers)
+    now expands to 17 proxies named `tcp_port_0`…`tcp_port_16`, and `[range:udp_port]` to 11.
+  * **Class 3 — role dispatch: fixed after expansion, as Go does.** The range branch reads `role`
+    from the template and pushes the generated `{prefix}_{i}` elements to `visitors` when it is
+    `visitor` (Go `pkg/config/legacy/client.go:252-285` expands first and dispatches on `role`
+    after), and records their indices so the legacy strip pass uses the *visitor* key set — the
+    visitor-only keys (`bind_addr`, `bind_port`, `server_name`, `sk`, `server_user`) survive;
+    `local_port`/`remote_port` (added by the expansion, not named by Go's visitor struct) are
+    dropped like Go's `MapTo` ignores them. Measured: Go frpc with a `6010-6012` `role = visitor`
+    template logs `visitor added: [rv_0 rv_1 rv_2]`; frp-rs base = `Proxies: 3 Visitors: 0`, frp-rs
+    now = `Proxies: 0 Visitors: 3` with `bind_port = 6000` intact on all three.
+  * **Both shipped fixtures pinned end to end.** `frps_legacy_full.ini` is vendored byte-identically
+    next to the client one (`cmp` against the v0.71.0 tarball copy), and
+    `legacy_ini_go_shipped_frpc_fixture_loads_end_to_end` loads the client file through
+    `load_client_config(path, true)` — 43 proxies with the exact names Go frpc v0.71.0 logs in
+    `proxy added: […]` and 2 visitors (`p2p_tcp_visitor`, `secret_tcp_visitor`) — while
+    `legacy_ini_go_shipped_frps_fixture_loads_end_to_end` loads the server file through
+    `load_server_config(path, true)`: `auth.token == "12345678"`,
+    `allow_ports == "2000-3000,3001,3003,4000-50000"`, two `[plugin.*]` HTTP plugins. `frps` has no
+    `verify` subcommand in frp-rs (pre-existing CLI divergence, `TODO.md:1632`), so the server file
+    is pinned at the same `load_server_config` entry point `frps -c` uses; the client file is also
+    pinned through the CLI by `frpc/tests/legacy_ini_fixture.rs` (`frpc verify -c` -> rc 0,
+    `Proxies: 43`, `Visitors: 2`, no `skipped` warning).
+  * **Trap (a) measured:** numeric and boolean INI fields still parse — `server_port = 7000`,
+    `log_max_days = 3`, `pool_count = 5`, `local_port`/`remote_port` as integers, `tcp_mux = no` /
+    `OFF` / `yes`, and `health_check_interval_s = 10` -> `10` (test
+    `test_legacy_ini_values_are_read_by_target_type`); `server_port = abc` still fails the load.
+  * **Trap (b) measured:** the visitor-only keys survive the strip (test
+    `test_legacy_ini_range_role_visitor_builds_visitors`) and the two shipped visitor sections keep
+    `bind_port` 9000/9001 and `keep_tunnel_open`/`max_retries_an_hour`/`min_retry_interval` (fixture
+    test).
+  * **Residuals recorded in `docs/config.md`** (not open divergences of this item): Go's
+    `Key.Int64()` is `strconv.ParseInt(s, 0, 64)` — base 0, so Go reads `0x10` as 16 where frp-rs
+    reads base 10 and refuses it (pre-existing: the old inference was base 10 too); and the
+    `["a", "b"]` array-literal spelling is an frp-rs extension, so a *string* field given that
+    spelling reads the comma-joined elements where Go reads the bracketed text (that spelling is not
+    Go syntax — measured: Go gives `['["a.example.com"', '"b.example.com"]']`).
+  * Red evidence: with only `ini_port_numbers`' array arm reverted, the two range tests fail
+    (`Proxies: 0`); with only the `role` dispatch reverted, the visitor test fails
+    (`Proxies: 3 Visitors: 0`); with `deserialize_ini` replaced by `serde_json::from_value` for
+    `.ini`, the two fixture tests fail with the base errors. `scripts/compat-test.sh` was **not**
+    run: the diff is config-load only (no protocol, transport, encryption or proxy path) and the
+    script generates no `.ini` config at all, so it cannot reach the wire.
 
 
 - [x] **`frpc reload` / `frpc status` silently ignore a config that fails to load, and talk to

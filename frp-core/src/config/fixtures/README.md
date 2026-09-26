@@ -15,7 +15,8 @@ Two tests use it, in `frp-core/src/config/tests.rs`:
   rather than erroring.
 * `legacy_ini_go_shipped_frpc_fixture_loads_end_to_end` loads the file through
   the real client config path (`load_client_config`, strict) and asserts the
-  names and counts **Go itself registers** for it: 43 proxies —
+  names and counts **Go frpc v0.71.0 itself reports** for it
+  (`proxy added: [43 names]`, `visitor added: [2 names]`): 43 proxies —
   `[range:tcp_port]`'s `local_port = 6010-6020,6022,6024-6028` is 17 numbers
   (`pkg/util/util/util.go:71` splits on `,`,
   `pkg/config/legacy/client.go:314-336` renders one proxy per number) and

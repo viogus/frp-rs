@@ -354,6 +354,30 @@ User-facing release notes for frp-rs.
   unrelated errors (`TcpListener`, `TcpStream`, `io`, unused `AtomicU64`). The
   variant is now exhaustive by construction and the imports are gated on what
   actually uses them; the configuration is gated in CI.
+- **Legacy `.ini` configs now load where Go's do: a bare numeric or a comma list
+  reaches a string field as the string Go gives it, and a `[range:...]`
+  template with a comma list or `role = visitor` behaves like Go's.** Three
+  measured divergences, all pre-existing:
+  `token = 12345678` (Go's own `conf/legacy/frpc_legacy_full.ini`) was inferred
+  as a TOML integer and refused with ``invalid type: integer `12345678`,
+  expected a string`` where Go's `frpc verify -c` exits 0 with the token as the
+  string; `allow_ports = 2000-3000,3001,3003,4000-50000` (Go's
+  `frps_legacy_full.ini`) was refused as ``invalid type: sequence``;
+  `[range:x] local_port = 6010-6012,6020` was **silently dropped** — Go
+  registers 4 proxies, frp-rs reported `Proxies: 0` and logged
+  `WARN … missing or invalid local_port; skipped` — so the 17
+  `[range:tcp_port]` proxies of Go's shipped client fixture were lost; and a
+  `[range:...]` template with `role = visitor` was misrouted to proxies (Go
+  builds visitors, `pkg/config/legacy/client.go:252-285`), with the
+  visitor-only keys stripped with them. `.ini` values are now read by the target
+  field's type (the inference is lossless, so `token = 007` stays `"007"`),
+  `[range:...]`'s port lists accept the split array, and a visitor template
+  builds visitors. Both of Go's shipped `conf/legacy/{frpc,frps}_legacy_full.ini`
+  fixtures are vendored byte-identically and now load end to end — 43 proxies
+  and 2 visitors for the client file, exactly the names and counts Go frpc
+  v0.71.0 itself reports for it (`proxy added: […]`, `visitor added: […]`). TOML,
+  JSON and YAML keep strict typing; see
+  [docs/config.md § Legacy `.ini` values](docs/config.md#legacy-ini-values-are-read-by-the-target-fields-type).
 - **`/api/reload` now reads `?strictConfig=` the way Go frp does — two behaviour changes.**
   A repeated parameter (`?strictConfig=true&strictConfig=false`) reloads with the first value
   (Go's `url.Values.Get`); it previously failed serde deserialization and answered 400. And a
