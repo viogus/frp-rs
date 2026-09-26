@@ -5178,6 +5178,46 @@ fn test_server_bind_port_zero_maps_to_default_in_complete() {
     assert_eq!(cfg.bind_port, 7000);
 }
 
+/// The **server** side of the empty `webServer.addr` story is a recorded
+/// divergence, not parity — an earlier draft of the frpc-side change claimed
+/// otherwise. Go's `ServerConfig.Complete()` (`pkg/config/v1/server.go:101-120`)
+/// runs `WebServer.Complete()` → `Addr = util.EmptyOr(Addr, "127.0.0.1")`
+/// (`pkg/config/v1/common.go:71-73`) at `:107` and only then the
+/// `if Port > 0 { Addr = util.EmptyOr(Addr, "0.0.0.0") }` at `:116-118`, so the
+/// second branch can never fire and an empty `addr` stays loopback. Measured on
+/// Go v0.71.0 with `[webServer] addr = "" port = 7597` plus credentials: Go frps
+/// logs `dashboard listen on 127.0.0.1:7597` and listens there, while frp-rs
+/// logs `Dashboard listening on 0.0.0.0:7597` and listens on `*:7597`.
+///
+/// frp-core `ServerConfig::complete` reproduces only the second half. This test
+/// pins the *current* value so the divergence cannot be mistaken for parity in
+/// either direction: whoever implements the Go order must change this
+/// assertion deliberately, and the flip is then a recorded event rather than a
+/// silent one. The flip is tracked in `TODO.md`.
+#[test]
+fn server_web_server_addr_empty_stays_wildcard_a_recorded_divergence() {
+    let mut cfg: ServerConfig =
+        serde_json::from_value(serde_json::json!({ "bindPort": 7000 })).unwrap();
+    // Explicit empty string, as `[webServer] addr = ""` deserializes.
+    cfg.web_server.addr = String::new();
+    cfg.web_server.port = 7597;
+    cfg.complete();
+    assert_eq!(
+        cfg.web_server.addr, "0.0.0.0",
+        "current frp-rs behaviour: wildcard. Go v0.71.0 binds 127.0.0.1 here — \
+         see the doc comment; this is the divergence, not parity"
+    );
+
+    // An ABSENT `addr` key is unaffected either way: the serde default already
+    // supplies 127.0.0.1, so the wildcard branch is skipped.
+    let mut cfg: ServerConfig =
+        serde_json::from_value(serde_json::json!({ "bindPort": 7000 })).unwrap();
+    cfg.web_server.port = 7597;
+    assert_eq!(cfg.web_server.addr, "127.0.0.1", "serde default");
+    cfg.complete();
+    assert_eq!(cfg.web_server.addr, "127.0.0.1");
+}
+
 /// server_port: same EmptyOr mapping on the client (Go v1/client.go:87).
 /// `server_port = 0` used to dial port 0 (connect refused) instead of the
 /// default listener.

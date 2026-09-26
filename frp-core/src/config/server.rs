@@ -398,7 +398,24 @@ impl ServerConfig {
         if self.proxy_bind_addr.is_empty() {
             self.proxy_bind_addr = self.bind_addr.clone();
         }
-        // When web_server port is set but addr is empty, default to 0.0.0.0 (Go compat).
+        // When web_server port is set but addr is empty, default to 0.0.0.0.
+        //
+        // NOT Go parity, despite the shape: Go's `ServerConfig.Complete()`
+        // (`pkg/config/v1/server.go:101-120`) runs `WebServer.Complete()` at
+        // `:107` FIRST — `Addr = util.EmptyOr(Addr, "127.0.0.1")`
+        // (`pkg/config/v1/common.go:71-73`) — so this branch, at `:116-118`
+        // there, can never fire and a set port with an empty addr stays
+        // `127.0.0.1`. Measured on Go v0.71.0 with
+        // `[webServer] addr = "" port = 7597` and credentials: Go logs
+        // `dashboard listen on 127.0.0.1:7597` and binds it, while frp-rs logs
+        // `Dashboard listening on 0.0.0.0:7597` and binds `*:7597`. The
+        // divergence (and its security relevance: an admin listener on every
+        // interface) is tracked in `TODO.md`; it is deliberately unchanged here
+        // because the item that touched this area was frpc-scoped.
+        //
+        // An ABSENT `addr` key never reaches this branch twice over: the serde
+        // field default already supplies `127.0.0.1`, so `is_empty()` is false
+        // and the branch is skipped.
         if self.web_server.port > 0 && self.web_server.addr.is_empty() {
             self.web_server.addr = "0.0.0.0".into();
         }

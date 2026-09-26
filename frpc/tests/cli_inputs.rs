@@ -1,15 +1,24 @@
 //! The three `frpc` CLI/config inputs Go frp v0.71.0 accepts and frp-rs used to
-//! reject (`TODO.md:1547`).
+//! reject (`TODO.md:1632`).
 //!
 //! Each test here runs the real `CARGO_BIN_EXE_frpc` against a one-shot
-//! loopback mock admin server, so what is pinned is the address actually
-//! **dialled**, not a config value read back in-process.
+//! loopback mock admin server and asserts on the request the mock received —
+//! which proves a connection reached that listener and carries the request line
+//! and `Host:` header the command sent. The address *dialled* is pinned by the
+//! combination of (a) a listener bound on `127.0.0.1` at an ephemeral port that
+//! only the config under test names and (b) that `Host:` header; the mock's
+//! `local_addr` is, strictly, its own address on the accepted socket (equal to
+//! the listening port by construction), and the `peer.ip().is_loopback()`
+//! assertions are tautological once a connection has arrived. The load-bearing
+//! assertions are the wrong-listener-must-stay-silent ones and the reversed-order
+//! negative control.
 //!
 //! The Go measurements these tests encode were reproduced against the official
 //! `frp_0.71.0_darwin_arm64` binary with configs in `/private/tmp/goprobe/`:
 //!
 //! * **Repeated `-c` is last-wins.** Go registers `-c` with pflag `StringVarP`
-//!   (`cmd/frpc/sub/root.go`), so every occurrence overwrites the previous one.
+//!   inside `func init()` (`cmd/frpc/sub/root.go`), so every occurrence
+//!   overwrites the previous one.
 //!   `frpc status -c noweb.toml -c p7499.toml` dials `127.0.0.1:7499`; the
 //!   reverse order prints `web server port should be set if you want to use
 //!   this feature` because the last config has no `[webServer]`. frp-rs's bpaf
@@ -24,10 +33,16 @@
 //!
 //! The third measured input — case-insensitive config keys — is deliberately
 //! **not** fixed here; it is recorded as a divergence in
-//! `docs/developing.md` § CLI exit codes with its measurement and scope. There
-//! is no test for it in this file: the behaviour shipped is the refusal, which
-//! `frp-core/src/config/tests.rs` already pins at the load boundary
-//! (`unknown field "web_server.Port"`).
+//! `docs/developing.md` § CLI inputs with its measurement and scope. The one
+//! case-shaped test in this file, `case_insensitive_proxy_array_keys_are_dropped_
+//! in_strict_mode`, pins the *shipped* behaviour of a mis-cased key inside
+//! `[[proxies]]` (dropped, rc 0). The analogue for the walked sections is pinned
+//! at the load boundary by `test_strict_rejects_unknown_web_server_key`
+//! (`unknown field "web_server.unknown_web_server_key"`) and
+//! `test_strict_rejects_nested_unknown_keys`
+//! (`unknown field "web_server.addrr"`) in `frp-core/src/config/tests.rs`, and
+//! the array exemption by `strict_mode_exempts_proxy_and_visitor_array_elements`
+//! there.
 //!
 //! Gated on `full` for the same reason as `admin_cli.rs`: the `frpc` bin carries
 //! `required-features = ["full"]`, so without the gate this file would fail to
@@ -87,13 +102,19 @@ impl Drop for TempDir {
 
 /// One captured admin request: the bytes the daemon would have seen.
 struct Captured {
-    /// The mock's own address for the accepted connection. `local_addr()` on the
-    /// accepted socket is the **destination** frpc dialled; `peer_addr()` would
-    /// be frpc's ephemeral source port, which is a different number (the first
-    /// version of this harness compared that against the listening port and
-    /// failed by a few counts).
+    /// The mock socket's **own** address for the accepted connection — i.e. the
+    /// listening socket's address, which by construction is
+    /// `127.0.0.1:<listening port>`. It is *not* the address frpc dialled in the
+    /// sense of a separate observation: the evidence that frpc dialled this
+    /// listener is that the connection arrived at all, plus the request's
+    /// `Host:` header. Captured instead of `peer_addr()` because the peer's port
+    /// is frpc's ephemeral **source** port, and the first version of this
+    /// harness compared that against the listening port and failed by a few
+    /// counts.
     local_addr: std::net::SocketAddr,
-    /// Peer address the kernel recorded for the accepted connection.
+    /// The client's address as the kernel recorded it (frpc's ephemeral source
+    /// port). Used only for `is_loopback()`, which is tautological once a
+    /// connection has arrived.
     peer: std::net::SocketAddr,
     /// Everything up to and including the blank line that ends the head.
     head: String,
@@ -723,4 +744,88 @@ fn status_without_web_server_section_still_refuses() {
     assert_eq!(exit_code(&out), 1, "stdout={:?}", stdout_of(&out));
     assert_eq!(stdout_of(&out).trim_end(), GO_NO_PORT_MSG);
     assert_eq!(connections_after_exit(&listener), 0);
+}
+
+// ── case 2: case-insensitive keys — the shipped behaviour, pinned ───────────
+
+/// A mis-cased key **inside `[[proxies]]`** is silently dropped even in strict
+/// mode: `LocalPort`/`RemotePort` are neither matched nor reported, and `frpc
+/// verify` exits **0**. Go accepts the same file and *uses* the keys, so this
+/// pins the current divergence rather than matching Go.
+///
+/// This is the strict-mode array exemption, not something this branch
+/// introduced: `check_strict` walks the top level and the
+/// `[auth]`/`[log]`/`[webServer]`/`[transport]` sections and deliberately does
+/// not recurse into `[[proxies]]`/`[[visitors]]`/`[[httpPlugins]]`
+/// (`frp-core/src/config/strict.rs:277-285`), and `ProxyConfig` carries no
+/// `deny_unknown_fields`. It is already recorded in `docs/deployment.md:710-747`
+/// (with the end-to-end consequence: the same config makes Go frpc bind the
+/// configured port while frp-rs registers `remote_port: 0` and the server
+/// auto-allocates one) and pinned at the config layer by
+/// `strict_mode_exempts_proxy_and_visitor_array_elements` in
+/// `frp-core/src/config/tests.rs`. What this test adds is the CLI-level pin the
+/// case-insensitive-keys record leans on: making the arrays strict later must
+/// fail here, so it is a deliberate change rather than a silent one.
+#[test]
+fn case_insensitive_proxy_array_keys_are_dropped_in_strict_mode() {
+    let dir = TempDir::new();
+    // The capital `R` on `RemotePort` is the Go-accepted spelling; `name`/`type`
+    // are lowercase so the element still parses.
+    let cfg = dir.config(
+        "cap-proxy.toml",
+        "serverAddr = \"127.0.0.1\"\nserverPort = 7500\n\
+         [[proxies]]\nname = \"t\"\ntype = \"tcp\"\nLocalPort = 7198\nRemotePort = 7198\n",
+    );
+
+    // Strict is the default (and Go's); no `--strict-config=false` here.
+    let out = run_frpc(&["verify", "-c", &cfg]);
+
+    assert_eq!(
+        exit_code(&out),
+        0,
+        "the array exemption must keep this loading (Go refuses it); stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    assert!(
+        stdout_of(&out).contains("is valid"),
+        "stdout={:?}",
+        stdout_of(&out)
+    );
+    // No unknown-field diagnostic for the array element — that is the point.
+    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        !all.contains("unknown field"),
+        "the array-element key must be dropped silently, not reported: {all:?}"
+    );
+}
+
+/// The contrast for the test above: the walked sections still refuse in strict
+/// mode, so the exemption is specifically the array element. `webServer.Port`
+/// rather than the camel-case alias `port` is the Go-accepted spelling.
+#[test]
+fn case_insensitive_key_in_a_walked_section_is_refused_in_strict_mode() {
+    let dir = TempDir::new();
+    let cfg = dir.config(
+        "cap-web.toml",
+        "serverAddr = \"127.0.0.1\"\nserverPort = 7500\n[webServer]\nPort = 7499\n",
+    );
+
+    let out = run_frpc(&["verify", "-c", &cfg]);
+
+    assert_eq!(exit_code(&out), 1, "stdout={:?}", stdout_of(&out));
+    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        all.contains("unknown field \"web_server.Port\""),
+        "the walked section must still refuse the mis-cased key: {all:?}"
+    );
+    // Non-strict drops the key instead and the refusal changes shape: the load
+    // succeeds and the next error is about the missing port, not the bad key.
+    let out = run_frpc(&["verify", "--strict-config=false", "-c", &cfg]);
+    assert_eq!(exit_code(&out), 0, "stderr={:?}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains("is valid"),
+        "stdout={:?}",
+        stdout_of(&out)
+    );
 }
