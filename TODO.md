@@ -707,8 +707,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     *without* the three tests that PR added, each sample on a different test; (ii) the author's one
     sample at that head, a run that failed 19/20 with `test_dashboard_proxy_type_and_name_filters`
     panicking at `frp-server/tests/dashboard_integration.rs:1330` with
-    `register tcp-one: Some("port unavailable")`. Both signatures were observed in bins *with* and
-    *without* that PR's new tests, so **none of the four is attributable to
+    `register tcp-one: Some("port unavailable")`. The collisions were observed in bins *with* and
+    *without* that PR's new tests — signature (i) on both sides, signature (ii)'s single sample with
+    them — so **none of the four is attributable to
     `fix/frps-empty-addr`**. Mechanism (`frp-server/tests/common/mod.rs`, `allocate_port()`): the
     probe binds `127.0.0.1:0`, reads the port and **drops the probe socket**; macOS's ephemeral
     range is 49152–65535, so a concurrent outbound socket in the same test process can take that
@@ -716,7 +717,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `Address already in use (os error 48)`** (measured directly: with `127.0.0.1:17740` held,
     `frps -c` on that port exits 1 with exactly that error) — a failure `wait_tcp_port` cannot
     distinguish from a slow start, so it burns its full 15 s and panics `frps bind_port not ready`
-    (`common/mod.rs:717`, the site the two `sleep`-based forced-failure runs hit). The `flock` in
+    (`common/mod.rs:733`, the site the two `sleep`-based forced-failure runs hit). The `flock` in
     `acquire_port_request_lock()` serialises the probe→confirm→hand-out step only, not the window to
     the eventual bind; a comment at `allocate_port()` now names that window. The author's follow-up
     sampling after the sample above was **0 failures in 15 runs** (6 with and 6 without the three
@@ -2152,13 +2153,13 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   also recorded where a local run reads it. Do not close it by making the dashboard tests skip when
   the feature is missing.
   * **(b) `FrpsHandle::start` can orphan its child.** It spawns `frps`, `.expect()`s the bind-port
-    and dashboard-port waits (`frp-server/tests/common/mod.rs:717` and `:722` at this head), and
+    and dashboard-port waits (`frp-server/tests/common/mod.rs:733` and `:738` at this head), and
     only then constructs the handle whose `Drop` kills and reaps — so a panic in those waits leaves
     a live `frps` behind with `PPID 1` and its `TempDir` already removed. Reproduced **2/2** at the
     head of `fix/frps-empty-addr` with the real binary and the swapped (no-dashboard) `FRPS_BIN`:
     `cargo test -p frp-server --features dashboard --test dashboard_integration test_dashboard_healthz`
     (which selects `test_dashboard_healthz` and `test_dashboard_healthz_readiness`) failed both
-    tests at `common/mod.rs:722` (`frps dashboard_port not ready`), and `ps` then showed two
+    tests at `common/mod.rs:738` (`frps dashboard_port not ready`), and `ps` then showed two
     `/…/target/debug/frps -c /var/folders/…/frps.toml` processes with `PPID 1`, both still `LISTEN`
     on their bind ports (`lsof` count 2) until they were killed. The new `CapturedFrps` (same file)
     does **not** have the shape — it is constructed before any wait, and in the same forced-failure
