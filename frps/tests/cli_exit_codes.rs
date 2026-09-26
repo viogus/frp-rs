@@ -319,3 +319,175 @@ fn space_form_strict_config_warns_on_stderr() {
         );
     }
 }
+
+/// A Go pflag bool takes `--flag=<bool>` as well as the bare `--flag`, and the
+/// *value* decides what happens. `-v, --version  version of frps` is such a
+/// bool on Go, so measured on Go frp v0.71.0 (darwin/arm64, bounded runner)
+/// against a *missing* config file:
+///
+/// ```text
+/// frps --version=true  -c missing.toml  → rc 0, stdout `0.71.0` (config never read)
+/// frps --version=false -c missing.toml  → rc 1, `open missing.toml: no such file or directory`
+/// frps --version=foo   -c missing.toml  → rc 1, `invalid argument "foo" for "-v, --version" flag: strconv.ParseBool: …`
+/// ```
+///
+/// The base commit's frp-rs registered `--version` as a bpaf `.switch()`
+/// (no value), so all three rows exited 1 with
+/// `` `false` / `foo` is not expected in this context `` — the config load
+/// never happened. The missing config is what makes each row distinguish
+/// *which* thing happened rather than only the exit code: rc 0 with the version
+/// on stdout can only be the version short-circuit, and rc 1 naming the missing
+/// path can only be a run that got past the flag.
+///
+/// The item's headline is the `frps --tls-only=false -c <valid>` row, where Go
+/// starts and listens (rc 124 under the bound); that one is asserted by
+/// actually binding and connecting, below. `TODO.md:1745`.
+#[test]
+fn version_flag_value_spelling_decides_what_happens() {
+    let dir = TempDir::new();
+    let missing = dir.path("does-not-exist.toml");
+
+    // `=true`: the version short-circuit, before any config read.
+    let out = run_frps(&["--version=true", "-c", &missing]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--version=true must print the version and exit 0 like Go; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stdout_of(&out).contains(frp_core::VERSION),
+        "stdout must carry the version; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        !format!("{}{}", stdout_of(&out), stderr_of(&out)).contains(&missing),
+        "the version short-circuit must not have read the config at all; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+
+    // `=false`: false is consumed as the value, so the run reaches the load.
+    let out = run_frps(&["--version=false", "-c", &missing]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--version=false must fall through to the config load like Go (which starts the \
+         server there); stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        all.contains(&missing),
+        "--version=false must reach the loader and name the missing file; the pre-fix \
+         binary refused the argv instead; output={all:?}"
+    );
+    assert!(
+        !all.contains("is not expected in this context"),
+        "--version=false must not be an argv error any more; output={all:?}"
+    );
+
+    // `=foo`: refused, exactly as Go's `strconv.ParseBool` refuses it (rc 1).
+    let out = run_frps(&["--version=foo", "-c", &missing]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--version=foo must exit 1 like Go's ParseBool refusal; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stderr_of(&out).contains("`foo` is not expected in this context"),
+        "the refusal must name the value; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
+/// The item's measured row, end to end: `frps --tls-only=false -c <valid>`
+/// starts and listens on Go (rc 124 under the bounded runner), and exited 1
+/// with `` `false` is not expected in this context `` before the bool flags
+/// were routed through the shared value parser. Asserting the exit code alone
+/// would not distinguish "started" from "refused and exited 1", so this waits
+/// for the bind port to accept a connection — the same proof
+/// `good_config_starts_and_exits_0_on_sigterm` uses to know the listener is up.
+#[test]
+fn tls_only_false_value_starts_and_listens() {
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+        probe.local_addr().expect("local_addr").port()
+    };
+    let dir = TempDir::new();
+    let cfg = dir.write(
+        "goodfrps.toml",
+        &format!(
+            "bindAddr = \"127.0.0.1\"\nbindPort = {port}\n[auth]\ntoken = \"cli-exit-test\"\n"
+        ),
+    );
+    let log_path = dir.path("frps.log");
+    let log = std::fs::File::create(&log_path).expect("create log");
+    let mut child = Command::new(BIN)
+        .args(["--tls-only=false", "-c", &cfg])
+        .stdout(std::process::Stdio::from(
+            log.try_clone().expect("clone log"),
+        ))
+        .stderr(std::process::Stdio::from(log))
+        .spawn()
+        .expect("spawn frps");
+    let read_log = || std::fs::read_to_string(&log_path).expect("read frps diagnostic log");
+
+    let deadline = Instant::now() + EXIT_TIMEOUT;
+    loop {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        if let Some(status) = child.try_wait().expect("try_wait frps") {
+            panic!(
+                "frps --tls-only=false exited ({status:?}) instead of listening on \
+                 127.0.0.1:{port}; log={:?}",
+                read_log(),
+            );
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "frps --tls-only=false never listened on 127.0.0.1:{port} within \
+                 {EXIT_TIMEOUT:?}; log={:?}",
+                read_log(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    let deadline = Instant::now() + EXIT_TIMEOUT;
+    loop {
+        match child.try_wait().expect("try_wait frps") {
+            Some(status) => {
+                assert_eq!(
+                    status.code(),
+                    Some(0),
+                    "--tls-only=false must start a server that shuts down cleanly; log={:?}",
+                    read_log(),
+                );
+                return;
+            }
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "frps --tls-only=false did not exit within {EXIT_TIMEOUT:?} of SIGTERM; \
+                     log={:?}",
+                    read_log(),
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
