@@ -3,6 +3,7 @@
 //! Uses bpaf combinators for the frps and frpc CLI surfaces.
 //! All flags accept both hyphen (`--log-file`) and underscore (`--log_file`) forms.
 
+use std::ffi::OsString;
 use std::time::Duration;
 
 use bpaf::Parser;
@@ -20,17 +21,77 @@ use bpaf::*;
 /// proceeds. The same holds for `--strict-config foo`, where Go ignores the
 /// token and frp-rs rejects it. The divergence is recorded in `TODO.md`.
 ///
-/// That extension is **kept and documented**, not dropped: the measured table,
-/// the reason, and the `--strict-config foo` / `--strict-config=foo` message
-/// divergences live in `docs/developing.md` § "`--strict-config`: the
-/// space-separated value form", and every parser below states it in its
-/// `--help` through [`strict_config_parser`]. The Go-faithful spellings are a
-/// bare `--strict-config` (true) and `--strict-config=<bool>`.
+/// That extension is **kept, documented and made loud**, not dropped: the
+/// measured table, the measured drop branch, and the reason live in
+/// `docs/developing.md` § "`--strict-config`: the space-separated value form";
+/// every parser below states the extension in its `--help` through
+/// [`strict_config_parser`], and
+/// [`STRICT_CONFIG_SPACE_FORM_WARNING`] is printed on stderr whenever the space
+/// form is actually consumed, so the divergence cannot bite silently.
+///
+/// Note the error string below is never user-visible: bpaf backtracks from this
+/// parser on `Err` and the leftover token is then reported as
+/// `` `<value>` is not expected in this context `` (measured for
+/// `--strict-config foo`, `--strict-config ""` and `--strict-config=foo`).
+/// The value only has to signal failure.
 fn parse_go_bool(value: String) -> Result<bool, String> {
     match value.as_str() {
         "1" | "t" | "T" | "TRUE" | "true" | "True" => Ok(true),
         "0" | "f" | "F" | "FALSE" | "false" | "False" => Ok(false),
         _ => Err(format!("invalid boolean value \"{value}\"")),
+    }
+}
+
+/// The one stderr line printed when the space-separated `--strict-config <bool>`
+/// extension is consumed. Deliberately a single line, on the path only, so a
+/// script that pipes stderr still sees it and a Go-faithful invocation stays
+/// silent.
+pub const STRICT_CONFIG_SPACE_FORM_WARNING: &str = "warning: --strict-config <bool> is an frp-rs extension; Go's pflag does not consume the token and stays strict. Use --strict-config=<bool> for identical behaviour.";
+
+/// Help for the `=BOOL` form (Go-faithful), used by [`strict_config_parser`].
+///
+/// Kept as a `const` so the test can pin each entry separately: the bare-form
+/// help also contains `--strict-config=<bool>`, so a substring assertion on the
+/// rendered help alone cannot tell a deleted value help from a present one.
+const STRICT_CONFIG_VALUE_HELP: &str = "Strict config parsing mode: true or false. The Go-faithful value spelling is --strict-config=<bool>";
+
+/// Help for the bare `--strict-config` switch (Go-faithful) plus the extension
+/// statement. See [`STRICT_CONFIG_VALUE_HELP`] for why these are `const`s.
+const STRICT_CONFIG_SWITCH_HELP: &str = "Strict config parsing mode, unknown fields cause an error (default true). The Go-faithful spellings are this bare flag (=true) and --strict-config=<bool>; frp-rs additionally consumes a space-separated --strict-config <bool> as the value, which Go's pflag does not. A warning is printed when that extension is used";
+
+/// True when `argv` contains the frp-rs space-separated extension in the one
+/// shape frp-rs actually consumes it: a `--strict-config`/`--strict_config`
+/// token immediately followed by a token that is a value under Go's
+/// `strconv.ParseBool` grammar and is not `-`-prefixed.
+///
+/// This mirrors bpaf exactly, which is what makes the warning safe to key off
+/// argv rather than off the parser:
+///
+/// * the `=` spelling (`--strict-config=false`) is a **single** argv token, so
+///   it never matches the `--strict-config` / `--strict_config` equality test —
+///   the Go-faithful spelling stays silent;
+/// * a bare `--strict-config` followed by another flag (`--strict-config
+///   --config x`) is not matched, because bpaf's `argument` never consumes a
+///   `-`-prefixed token as a value — the switch still yields `true` silently;
+/// * a non-bool token (`foo`, `""`) is not matched, and does not need to be:
+///   the parse fails there, so no value was consumed and the process exits
+///   before any command runs.
+///
+/// The caller prints the warning only after the command parsed successfully, so
+/// a failing argv never produces a warning either.
+fn strict_config_space_form_used(argv: &[OsString]) -> bool {
+    argv.windows(2).any(|pair| {
+        (pair[0] == "--strict-config" || pair[0] == "--strict_config")
+            && pair[1].to_str().is_some_and(|value| {
+                !value.starts_with('-') && parse_go_bool(value.to_string()).is_ok()
+            })
+    })
+}
+
+/// Print [`STRICT_CONFIG_SPACE_FORM_WARNING`] once if `argv` used the extension.
+fn warn_if_strict_config_space_form_used(argv: &[OsString]) {
+    if strict_config_space_form_used(argv) {
+        eprintln!("{STRICT_CONFIG_SPACE_FORM_WARNING}");
     }
 }
 
@@ -65,20 +126,12 @@ fn parse_go_bool(value: String) -> Result<bool, String> {
 fn strict_config_parser() -> impl Parser<bool> {
     let strict_value = long("strict-config")
         .long("strict_config")
-        .help(
-            "Strict config parsing mode: true or false. The Go-faithful value spelling is \
-             --strict-config=<bool>",
-        )
+        .help(STRICT_CONFIG_VALUE_HELP)
         .argument::<String>("BOOL")
         .parse(parse_go_bool);
     let strict_switch = long("strict-config")
         .long("strict_config")
-        .help(
-            "Strict config parsing mode, unknown fields cause an error (default true). The \
-             Go-faithful spellings are this bare flag (=true) and --strict-config=<bool>; frp-rs \
-             additionally consumes a space-separated --strict-config <bool> as the value, which \
-             Go's pflag does not",
-        )
+        .help(STRICT_CONFIG_SWITCH_HELP)
         .flag(true, true);
     construct!([strict_value, strict_switch])
 }
@@ -627,10 +680,15 @@ pub fn frps_args() -> impl Parser<FrpsArgs> {
 
 /// Parse frps CLI args. Prints help/version and exits as needed.
 pub fn parse_frps_args() -> FrpsArgs {
+    let argv: Vec<OsString> = std::env::args_os().collect();
     let args = frps_args()
         .to_options()
         .descr("frps is the server of frp-rs (https://github.com/fatedier/frp)")
         .run();
+    // Only reached when the argv parsed: `run()` exits the process on a parse
+    // failure, so the warning can never fire for a refused argv, and the
+    // detection never matches the `=`, bare or non-bool forms.
+    warn_if_strict_config_space_form_used(&argv);
     if args.show_version {
         println!("frps {} (Rust)", crate::VERSION);
         std::process::exit(0);
@@ -1443,10 +1501,17 @@ fn frpc_parser() -> impl Parser<FrpcCmd> {
 
 /// Parse frpc CLI args.
 pub fn parse_frpc_args() -> FrpcCmd {
-    frpc_parser()
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    let args = frpc_parser()
         .to_options()
         .descr("frpc is the client of frp-rs (https://github.com/fatedier/frp)")
-        .run()
+        .run();
+    // See `parse_frps_args`: printed only for a successfully parsed argv whose
+    // `--strict-config` token was followed by a consumed bool value — i.e. the
+    // frp-rs space-separated extension, on every `frpc` parser (run, verify,
+    // reload, status, stop).
+    warn_if_strict_config_space_form_used(&argv);
+    args
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1819,7 +1884,11 @@ mod tests {
         // same way. See `docs/developing.md` § "`--strict-config`: the
         // space-separated value form".
         for (label, argv) in strict_config_argv(&[]) {
-            assert!(strict_config_of(label, &argv).unwrap(), "{label}");
+            assert!(
+                strict_config_of(label, &argv)
+                    .unwrap_or_else(|e| panic!("{label} {argv:?} must parse: {e:?}")),
+                "{label}"
+            );
         }
     }
 
@@ -1833,7 +1902,11 @@ mod tests {
         // rc 1 on Go and the same strict refusal on frp-rs).
         for args in [&["--strict-config"][..], &["--strict_config"][..]] {
             for (label, argv) in strict_config_argv(args) {
-                assert!(strict_config_of(label, &argv).unwrap(), "{label} {args:?}");
+                assert!(
+                    strict_config_of(label, &argv)
+                        .unwrap_or_else(|e| panic!("{label} {args:?} must parse: {e:?}")),
+                    "{label} {args:?}"
+                );
             }
         }
     }
@@ -1851,7 +1924,11 @@ mod tests {
             &["--strict_config=false"][..],
         ] {
             for (label, argv) in strict_config_argv(args) {
-                assert!(!strict_config_of(label, &argv).unwrap(), "{label} {args:?}");
+                assert!(
+                    !strict_config_of(label, &argv)
+                        .unwrap_or_else(|e| panic!("{label} {args:?} must parse: {e:?}")),
+                    "{label} {args:?}"
+                );
             }
         }
     }
@@ -1864,7 +1941,11 @@ mod tests {
         // field "notAKnownFrpKey"`, rc 1.
         for args in [&["--strict-config=true"][..], &["--strict_config=true"][..]] {
             for (label, argv) in strict_config_argv(args) {
-                assert!(strict_config_of(label, &argv).unwrap(), "{label} {args:?}");
+                assert!(
+                    strict_config_of(label, &argv)
+                        .unwrap_or_else(|e| panic!("{label} {args:?} must parse: {e:?}")),
+                    "{label} {args:?}"
+                );
             }
         }
     }
@@ -1889,19 +1970,31 @@ mod tests {
             &["--strict_config", "false"][..],
         ] {
             for (label, argv) in strict_config_argv(args) {
-                assert!(!strict_config_of(label, &argv).unwrap(), "{label} {args:?}");
+                assert!(
+                    !strict_config_of(label, &argv)
+                        .unwrap_or_else(|e| panic!("{label} {args:?} must parse: {e:?}")),
+                    "{label} {args:?}"
+                );
             }
         }
         // Go strconv.ParseBool spellings — the value grammar is Go's, only the
         // token's position differs from pflag.
         for v in ["1", "t", "T", "TRUE", "true", "True"] {
             for (label, argv) in strict_config_argv(&["--strict-config", v]) {
-                assert!(strict_config_of(label, &argv).unwrap(), "{label} {v}");
+                assert!(
+                    strict_config_of(label, &argv)
+                        .unwrap_or_else(|e| panic!("{label} {v} must parse: {e:?}")),
+                    "{label} {v}"
+                );
             }
         }
         for v in ["0", "f", "F", "FALSE", "false", "False"] {
             for (label, argv) in strict_config_argv(&["--strict-config", v]) {
-                assert!(!strict_config_of(label, &argv).unwrap(), "{label} {v}");
+                assert!(
+                    !strict_config_of(label, &argv)
+                        .unwrap_or_else(|e| panic!("{label} {v} must parse: {e:?}")),
+                    "{label} {v}"
+                );
             }
         }
     }
@@ -2002,7 +2095,13 @@ mod tests {
         //
         // The exit code is 1 on both binaries for both spellings; only the
         // message — and, on the space form, whether the config is loaded — is
-        // divergent.
+        // divergent. Note what this test does *not* prove: the name says
+        // "cleanly", but `parse_go_bool`'s own `invalid boolean value "…"`
+        // string is never user-visible — bpaf backtracks on the `Err` and the
+        // leftover token is reported with the message asserted below (measured
+        // on the binary for `foo`, `=foo` and the empty value). The assertion
+        // here is on that user-visible message, and on the parser refusing
+        // rather than silently dropping the token.
         const EXPECTED: &str = "`foo` is not expected in this context";
         for args in [
             &["--strict-config", "foo"][..],
@@ -2297,14 +2396,57 @@ mod tests {
     #[test]
     fn strict_config_help_text_states_the_extension() {
         // The done-when for `TODO.md:1613` requires the divergence stated in
-        // the flag's **help text**, not only in `docs/`. Every parser that
-        // takes the flag must say both halves: the `=` spelling is the
-        // Go-faithful one, and frp-rs additionally consumes a space-separated
-        // value (which Go's pflag does not). A revert of the help strings must
-        // fail this test — see the report's red-run.
-        const EXTENSION: &str = "space-separated";
-        const GO_FAITHFUL: &str = "--strict-config=<bool>";
-        const DIVERGENCE: &str = "pflag does not";
+        // the flag's **help text**, not only in `docs/`.
+        //
+        // The two entries must be pinned **separately**, because the rendered
+        // help contains `--strict-config=<bool>` in both: a deletion of just
+        // the value-form `.help()` leaves a fragment-only assertion green (that
+        // mutant was run and did pass against the first version of this test).
+        // So each entry is asserted twice:
+        //
+        // 1. the parser still uses each help const — the rendered, whitespace-
+        //    squashed help must contain the squashed const (this catches a
+        //    deleted or swapped `.help()`);
+        // 2. the const still *means* what it must — asserted against literals
+        //    written here, deliberately **not** derived from the consts, so a
+        //    rewritten (e.g. inverted) const fails even though it still renders.
+        let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let value_help = squash(STRICT_CONFIG_VALUE_HELP);
+        let switch_help = squash(STRICT_CONFIG_SWITCH_HELP);
+
+        // 2. Meaning, per entry, with independent literals.
+        assert!(
+            value_help.contains("Strict config parsing mode: true or false."),
+            "the value entry must keep its own meaning: {value_help:?}"
+        );
+        assert!(
+            value_help.contains("The Go-faithful value spelling is --strict-config=<bool>"),
+            "the value entry must name the Go-faithful spelling: {value_help:?}"
+        );
+        assert!(
+            switch_help.contains("The Go-faithful spellings are this bare flag (=true)"),
+            "the bare entry must state what the bare flag means: {switch_help:?}"
+        );
+        // One contiguous clause: an inverted sentence ("…the only Go-faithful
+        // one… Go's pflag does not differ here") cannot contain it.
+        assert!(
+            switch_help.contains(
+                "frp-rs additionally consumes a space-separated --strict-config <bool> as the \
+                 value, which Go's pflag does not"
+            ),
+            "the bare entry must state the extension and that Go's pflag does not consume it: \
+             {switch_help:?}"
+        );
+        assert!(
+            !switch_help.contains("Go-faithful spelling is the space-separated"),
+            "the space form must never be described as the Go-faithful spelling: {switch_help:?}"
+        );
+        assert_ne!(
+            value_help, switch_help,
+            "the two entries must not be the same string"
+        );
+
+        // 1. Every parser renders both entries.
         let cases: [(&str, bool, &str); 6] = [
             ("frps", true, "--help"),
             ("frpc run", false, "--help"),
@@ -2321,11 +2463,78 @@ mod tests {
                 frpc_parser().to_options().run_inner(&argv[..]).map(|_| ())
             }
             .expect_err("--help is reported as a ParseFailure");
-            let help = failure.unwrap_stdout();
-            assert!(help.contains(EXTENSION), "{label}: {help}");
-            assert!(help.contains(GO_FAITHFUL), "{label}: {help}");
-            assert!(help.contains(DIVERGENCE), "{label}: {help}");
+            let help = squash(&failure.unwrap_stdout());
+            assert!(help.contains(&value_help), "{label} value entry: {help}");
+            assert!(help.contains(&switch_help), "{label} switch entry: {help}");
         }
+    }
+
+    #[test]
+    fn strict_config_warning_detection_matches_the_consumed_shape() {
+        // The warning is keyed off argv, so the detection must mirror bpaf
+        // exactly: only a `--strict-config`/`--strict_config` token followed by
+        // a *consumed* bool value counts. `parse_frps_args`/`parse_frpc_args`
+        // additionally warn only after a successful parse, so a candidate shape
+        // whose parse then fails stays silent.
+        let warned = |args: &[&str]| {
+            let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+            strict_config_space_form_used(&argv)
+        };
+
+        // The extension: a following token that is a bool in Go's ParseBool
+        // grammar, both spellings, several value shapes.
+        for args in [
+            &["frpc", "verify", "--strict-config", "false", "-c", "x.toml"][..],
+            &["frpc", "verify", "--strict-config", "true", "-c", "x.toml"][..],
+            &["frpc", "reload", "--strict_config", "0"][..],
+            &["frpc", "status", "--strict-config", "1"][..],
+            &["frpc", "run", "--strict-config", "TRUE"][..],
+            &["frps", "--strict-config", "False", "-c", "frps.toml"][..],
+        ] {
+            assert!(warned(args), "{args:?} must be detected as the extension");
+        }
+
+        // Everything Go-faithful or non-consuming stays silent.
+        for args in [
+            // `=` spelling: one token, so the equality test never matches.
+            &["frpc", "verify", "--strict-config=false", "-c", "x.toml"][..],
+            &["frpc", "verify", "--strict_config=true", "-c", "x.toml"][..],
+            // bare switch followed by another flag (bpaf never takes a
+            // `-`-prefixed token as a value) …
+            &["frps", "--strict-config", "-c", "frps.toml"][..],
+            // … or at the end of argv.
+            &["frps", "--strict-config"][..],
+            &["frpc", "stop", "--strict_config"][..],
+            // a non-bool token: the parse fails there, so nothing is consumed
+            // and the process exits before a warning could matter.
+            &["frpc", "verify", "--strict-config", "foo", "-c", "x.toml"][..],
+            &["frpc", "verify", "--strict-config", "", "-c", "x.toml"][..],
+            &["frpc", "verify", "--strict-config", "-1", "-c", "x.toml"][..],
+            // `=` spelling with a bool-looking *next* token: the next token is
+            // not consumed by `--strict-config` at all.
+            &["frpc", "verify", "--strict-config=false", "false"][..],
+        ] {
+            assert!(!warned(args), "{args:?} must not warn");
+        }
+
+        // Documented caveat: detection is argv-local, so a `--strict-config`
+        // that is really another flag's value does match here. It cannot
+        // produce a warning, because that argv fails to parse (`-c` refuses a
+        // `-`-prefixed value) and the entry points warn only after `run()`
+        // returned — i.e. the successful-parse gate, not the scan, is what
+        // keeps the warning honest.
+        assert!(warned(&["frpc", "-c", "--strict-config", "false"]));
+    }
+
+    #[test]
+    fn strict_config_warning_text_is_the_documented_line() {
+        // Pin the exact line users see (and scripts may match), including the
+        // Go-faithful spelling it recommends.
+        assert_eq!(
+            STRICT_CONFIG_SPACE_FORM_WARNING,
+            "warning: --strict-config <bool> is an frp-rs extension; Go's pflag does not consume \
+             the token and stays strict. Use --strict-config=<bool> for identical behaviour."
+        );
     }
 
     #[test]
