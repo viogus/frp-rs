@@ -2563,7 +2563,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `status -c --strict-config=false` and `status -c -x` still read the token as a file (rc 1,
     naming it). `rewrite_config_dash_values`'s body is unchanged on this branch; the only call-site
     change is on the frps side, and the frpc suites pass unchanged.
-- [ ] **`frpc` does not accept a subcommand after leading root flags, where Go's cobra does.**
+- [x] **`frpc` does not accept a subcommand after leading root flags, where Go's cobra does.**
   Measured on Go v0.71.0 and this head (identical at the base head `ec82a20`, so the
   persistent-flag work did not change it): `frpc -c pA.toml status` → Go resolves the `status`
   subcommand and dials `127.0.0.1:17498` (pA.toml's `[webServer] port`); frp-rs falls back to run
@@ -2576,6 +2576,86 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   names a known subcommand before bpaf runs, or restructure the parser) and pin the three rows
   against Go, or record the refusal as a deliberate divergence in `docs/developing.md` § CLI inputs.
   frp-rs's own `frpc <subcommand> [flags]` order keeps working either way.
+  **Done (2026-09-27, `9bff35e` plus the carrier pass on the same branch).** Re-measured everything at this branch's base
+  (`5b9a084`; the item's `ec82a20` is four PRs stale) with the official
+  `/private/tmp/frp_0.71.0_darwin_arm64` binaries and the frp-rs `frpc` built from the base and the
+  head, over a 45-row table (one-shot mock admin on the config's `[webServer]` port, canary TCP
+  listener on `--server-port`, every child bounded and killed on timeout). The table is in
+  `docs/developing.md` § "A subcommand after leading root flags"; the harness is
+  `/tmp/ledprobe/probe.py` and the raw rows `/tmp/ledprobe/{go,base,head}45.jsonl`.
+  * **The three rows and every flag order now match Go**, not just resolve: `-c pA.toml status`,
+    `--strict-config=false status -c pA.toml`, `-c pA.toml --strict-config=false status`,
+    `-c pA.toml -c pA.toml status`, `-c=pA.toml`/`-cpA.toml` spellings,
+    `--config-dir <dir> -c pA.toml status`, `-v=false`/`--version=false`/`--version=true`/
+    `--allow-unsafe X` before the token — each rc 0 and dialling the mock at the config's
+    `[webServer] port`, where the base gave rc 1 ``no such command or positional``. The tcp row
+    (`-c missing.toml tcp … --server-port <free>`) connects to the canary on both Go and the head
+    (the missing config is never opened) and was the same refusal at the base.
+  * **The value-position traps were measured on both binaries and none is hoisted**:
+    `-c status`/`--config status` — a config file literally named `status` — is run mode on Go
+    (`start frpc service for config file […/status]`, and on both frp-rs trees the same run-mode
+    load), as are `--config=status`, `-c=status` and `-cstatus`; `-c -status` is the value
+    `-status` on Go (`open -status: no such file or directory`) and on the head;
+    `tcp --proxy-name status …` and `-c missing.toml tcp --proxy-name status …` connect on Go and on
+    the head; `-c pA.toml -- status` stays Go's run mode (positional ignored) and frp-rs's recorded
+    positional refusal — the hoist does not cross a real `--`; `-c pA.toml notacommand status` is
+    Go's `unknown command "notacommand"` and frp-rs's leftover-token refusal, so only the **first**
+    bare word is ever hoisted.
+  * **One Go row is surprising and is recorded rather than claimed as a match**: `-c -- status` is
+    `open --: no such file or directory` on Go — pflag gives `-c` the value `--`, so `status` *is*
+    resolved (the config read happens on the admin path). Because the shared
+    `rewrite_config_dash_values` pass runs first and attaches that value (`-c=--`), the hoist sees
+    `status` as the first bare word; the head answers `--: failed to read config file: …`, Go's path
+    and rc with a different message shape. This is why the two passes compose in that order
+    (`prepared_cli_argv`, `frp-core/src/cli.rs`).
+  * **Design**: `hoist_leading_subcommand` runs before bpaf over the argv after `cli_args` dropped
+    `argv[0]` — the first version saw `argv[0]` as a bare word and never fired, which the 45-row
+    table caught immediately. It skips the value of a flag that cobra's `stripFlags` would let
+    swallow one, stops at a real `--`, and only ever hoists the first bare word. `frps` passes
+    `has_subcommands: false` and is byte-identical (Go `frps` declares no subcommands).
+  * **The classifier's `NoOptDefVal` set is where the first version was wrong, and the reviews
+    found it in both directions.** The rule is cobra's: a `--long`/`-x` without `=` consumes the
+    next token *unless the flag is a pflag bool* (`pflag-1.0.5/bool.go:56` sets
+    `NoOptDefVal = "true"`). On `frpc` exactly two root flags are bools —
+    `--version`/`-v` (`cmd/frpc/sub/root.go:52`) and `--strict-config`/`--strict_config` (`:53`) —
+    while `-c/--config`, `--config_dir` and `--allow-unsafe` (`:50-51,55`) consume, and a flag
+    cobra does not know also consumes. The first version wrongly listed `--strict-config` as a
+    consumer. **Over-consuming is not the safe direction** (the earlier claim that it was is
+    falsified): skipping a token shifts *which* token is the first bare word, so the regression
+    direction was `frpc --strict-config true status -c pA.toml` — Go rc 1
+    ``unknown command "true" for "frpc"``, base rc 1, that head **rc 0 with a real
+    `GET /api/status`** (`stop`/`reload` likewise, and `--strict-config true tcp …` connected to
+    the canary); the mirror was `frpc --strict-config status -c pA.toml` — Go rc 0 and dials, that
+    head rc 1 ``no such command or positional``. Both are fixed by exempting the two bool
+    spellings, and the four other root flags were swept with no divergence:
+    `-v/--version`, `--allow-unsafe` and `--config_dir` behave as Go does, `--help`/`-h` stays a
+    consumer (cobra adds it in `execute`, after `Find`), and an unknown flag consumes like Go's
+    `stripFlags`. The full matrix, both directions, is in `docs/developing.md` § "A subcommand
+    after leading root flags" (raw rows `/tmp/ledprobe/{go,base,oldhead,fixed}_sc_.jsonl` and
+    `…_ofl_.jsonl`).
+  * **Tests**: 11 unit tests in `frp-core/src/cli.rs` (`mod hoist_tests`) pin the classifier (both
+    the consumer and the `NoOptDefVal` rows), the hoist, the traps, the composition order, both
+    directions of the `--strict-config` grammar and both directions of the `FRPC_SUBCOMMANDS` ↔
+    `frpc_parser` correspondence; 13 end-to-end tests appended to `frpc/tests/cli_inputs.rs`
+    (one-shot mock admin and canary listeners) pin the fixed orders, the traps, the `--` case, both
+    `--strict-config` directions, the existing order and the request-head equality between the
+    hoisted and unhoisted orders. Nothing was added to `frpc/tests/cli_exit_codes.rs` or
+    `frps/tests/cli_exit_codes.rs`, so the two guarded counts in `.github/workflows/ci.yml`
+    (`FRPS_CLI_TESTS: "16"`, `FRPC_TINY_CLI_TESTS: "11"`) are unchanged and still match
+    `-- --list`. `frpc/tests/cli_inputs.rs` went 21 tests at the base to 34 (13 new); with `BIN`
+    re-pinned to the base binary the suite is **28 passed, 6 failed**, the six being exactly the
+    command-resolution tests, and with it pinned to the pre-fix head `86745d5` the suite is
+    **32 passed, 2 failed** — and the two failures are *both* direction tests,
+    `a_word_after_bare_strict_config_is_not_resolved_as_a_subcommand` (the regression the
+    over-consuming classifier introduced) and
+    `bare_strict_config_before_the_subcommand_still_resolves_it` (the mirror it left unfixed),
+    while the five command-resolution tests pass. Each direction is red on the revision that got
+    it wrong, independently.
+  * **Gates at this head**: `cargo fmt --all -- --check` clean; `cargo clippy -p frp-core -p frps
+    -p frpc --all-targets --all-features -- -D warnings` clean; `cargo test -p frp-core --lib`,
+    `cargo test -p frps`, `cargo test -p frpc` pass; `bash scripts/repo-health.sh` rc 0;
+    `scripts/compat-test.sh` not run and not relevant — this is an argv-layer change with no wire
+    effect (no protocol, transport, encryption or proxy code touched).
 - [ ] **A CLI failure's output shape is still not Go's: frp-rs prints a `tracing` line where Go
   prints one bare error, and `verify` writes to stderr where Go writes to stdout.** Measured on Go
   v0.71.0 and on the head binaries while closing the exit-code item above (only the *exit code*

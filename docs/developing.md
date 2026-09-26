@@ -1373,12 +1373,164 @@ same way on both frp-rs binaries. A `-`-prefixed token after any *other* flag
 (`--bind-port -x`, `-t -x`) is untouched, and a token after a real `--` is never
 rewritten.
 
-One more `frpc` shape is the same *root-flag placement* question and is filed
-separately (`TODO.md:2270`): Go's cobra resolves a subcommand that follows
-leading root flags, so `frpc -c pA.toml status` runs `status` (dials pA.toml's
-admin port) and `frpc -c missing.toml tcp …` starts the tcp proxy, while frp-rs
-falls back to run mode and answers ``no such command or positional: `status` ``.
-Identical at the base head, so this registration did not change it.
+#### A subcommand after leading root flags (cobra's command resolution)
+
+Go's cobra resolves a command that follows leading root flags, because `Find`
+(`cobra-1.8.0/command.go`, reached from `ExecuteC`) strips flags with
+`stripFlags` and then looks at the **first surviving bare word**: if that word
+names a child command, the child is selected and `argsMinusFirstX` removes it
+before the child's pflag parse. bpaf instead picks a branch *before* dispatch,
+so `frpc -c pA.toml status` used to fall through to run mode and answer rc 1
+``Error: no such command or positional: `status`, did you mean `https`?``.
+`frp-core/src/cli.rs`'s `hoist_leading_subcommand` now moves that token to the
+front of the argv before bpaf runs (`TODO.md:2566`).
+
+Composition, because it is load-bearing: the entry points call `cli_args`
+(which drops `argv[0]` and expands the `-v=` alias), then `prepared_cli_argv`,
+which applies `rewrite_config_dash_values` **first** and
+`hoist_leading_subcommand` **second** — `frpc` only (`has_subcommands`; Go's
+`frps` declares no subcommands, so its behaviour is byte-identical to before).
+The rewrite must run first because the hoist classifies flag/value/bare-word the
+way cobra does, and cobra classifies the argv pflag has already applied its
+value rule to. The shape that shows it: `-c -- status`, where the value of `-c`
+is the token `--` itself, so `status` is the first bare word and Go resolves the
+`status` command (measured: rc 1 `open --: no such file or directory` — the
+config read happens on the admin path). Hoisting on the raw argv would see a
+`--` separator there and leave the token behind.
+
+Measured on Go frp **v0.71.0** darwin/arm64 against the frp-rs `frpc` at this
+branch's base (`5b9a084`) and head, with the port the config names held by a
+one-shot mock admin listener (a single JSON `{}` answer) or, for the
+single-proxy rows, a canary TCP listener on `--server-port`. "dials N" means the
+listener accepted a connection and the request/`Host:` named N; a `rc 1` cell
+with no dial is a refusal before any connection.
+
+| argv | Go v0.71.0 | frp-rs before | frp-rs now |
+|---|---|---|---|
+| `-c pA.toml status` | rc 0, dials the config's admin port, `Proxy Status...` | rc 1, ``no such command or positional: `status`, did you mean `https`?`` | rc 0, dials it |
+| `--strict-config=false status -c pA.toml` | rc 0, dials it | rc 1, same refusal | rc 0, dials it |
+| `-c pA.toml --strict-config=false status` | rc 0, dials it | rc 1, same refusal | rc 0, dials it |
+| `-c pA.toml -c pA.toml status` (repeated) | rc 0, dials it | rc 1, same refusal | rc 0, dials it |
+| `--allow-unsafe TokenSourceExec -c pA.toml status`, `-v=false … status`, `--version=false … status`, `--version=true … status`, `--config-dir <dir> -c pA.toml status`, `-c pA.toml --strict-config=false --allow-unsafe TokenSourceExec status` | rc 0, dials it | rc 1, same refusal | rc 0, dials it |
+| `-c=pA.toml status`, `-cpA.toml status`, `-c pA.toml --config=pA.toml status` | rc 0, dials it | rc 1, same refusal | rc 0, dials it |
+| `-c missing.toml tcp --local-port 5 --remote-port 6 --proxy-name x --server-port <free>` | rc 1, **connects** (`try to connect to server...`, then the probe's non-TLS bytes) — the missing config is never opened | rc 1, ``no such command or positional: `tcp`, did you mean `stcp`?`` | rc 1, connects the same way |
+| `-c missing.toml https` | rc 1, `name should not be empty` (the `https` branch runs; its `--custom-domains` is required) | rc 1, ``no such command or positional: `https`, did you mean `http`?`` | rc 1, ``expected `--local-port=PORT` `` — the **branch is the same one**, but bpaf reports its first missing flag where Go reports a later validation. Recorded, not claimed as a match |
+| `-c pA.toml -- status` | rc 1, starts the client in **run mode** (`start frpc service for config file […/pA.toml]`), never dials the admin port | rc 1, `` `status` is not expected in this context`` | unchanged — a real `--` stops the hoist; the positional refusal is the recorded divergence below |
+| `-c pA.toml -- notacommand status` | rc 1, run mode, same as above | rc 1, `` `notacommand` is not expected`` | unchanged |
+| `-c status` / `--config status` / `--config=status` / `-c=status` / `-cstatus` — a config file **literally named `status`** | rc 1, run mode (`start frpc service for config file […/status]`), never the admin command | rc 1, run mode, same message | unchanged — the token is `-c`'s value |
+| `-c -status` | rc 1, `open -status: no such file or directory` | rc 1, same load path, message shape differs | unchanged |
+| `-c --strict-config=false` (no subcommand) | rc 1, `open --strict-config=false: …` | rc 1, same load path | unchanged |
+| `-c -- status` | rc 1, `open --: no such file or directory` — `--` is `-c`'s value, so `status` **is** resolved | rc 1, ``no such command or positional: `status` `` | rc 1, `--: failed to read config file: …` — Go's path; a match on rc and on both behaviours, message shape aside |
+| `tcp --proxy-name status --local-port 5 … --server-port <free>` | rc 1, connects (the proxy starts with a proxy named `status`) | rc 1, connects | unchanged |
+| `-c missing.toml tcp --proxy-name status …` | rc 1, connects | rc 1, ``no such command or positional: `tcp` `` | rc 1, connects |
+| `tcp --proxy-name=status …` | rc 1, connects | rc 1, connects | unchanged |
+| `-c pA.toml notacommand` | rc 1, `unknown command "notacommand" for "frpc"` | rc 1, `` `notacommand` is not expected in this context`` | unchanged (message shape) |
+| `-c pA.toml notacommand status` | rc 1, same — the first bare word is the only candidate | rc 1, same refusal | unchanged |
+| `-c pA.toml reload` / `stop` / `verify` | rc 0 `reload success` / `stop success`; `verify` rc 1 on a missing file | rc 1, `` `reload` is not expected in this context`` (per command) | rc 0 / rc 1, the same commands |
+| `status -c pA.toml` (frp-rs's own order), `status -c pA.toml --strict-config=false` | rc 0, dials it | rc 0, dials it | unchanged (regression pin) |
+
+Two Go behaviours in the table are worth stating rather than assuming. First,
+`--status` (a double-dash token after `-c`) is `-c`'s **value** on Go, and the
+later `-c pA.toml` overwrites it — the code that made the rewrite run first.
+Second, `https` after `-c missing.toml`: Go resolves the branch and fails on its
+required `--custom-domains` with `name should not be empty`, while frp-rs's
+`https` branch reports its first missing flag (`--local-port`); the branch is
+now the same one, the message is not, and that message-shape difference belongs
+to the output-shape item rather than to this one.
+
+**Which tokens a flag swallows — `--strict-config` is the sharp case.** The
+hoist has to reproduce cobra's `stripFlags`, whose rule is `hasNoOptDefVal`:
+a `--long` (or two-character `-x`) without `=` consumes the next token **unless
+the flag's pflag registration carries a `NoOptDefVal`**, which every bool has
+(`pflag-1.0.5/bool.go:56`). On `frpc` that exempts exactly two root flags,
+`--version`/`-v` (`cmd/frpc/sub/root.go:52`) and
+`--strict-config`/`--strict_config` (`:53`,
+`BoolVarP(&strictConfigMode, "strict_config", "", true, …)`); the three
+value-taking root flags (`:50-51,55`) and any flag cobra does not know consume.
+`--help`/`-h` is the counter-intuitive one and it is **not** exempt: pflag makes
+`help` a bool, but cobra registers it in `execute` (`cobra-1.8.0/command.go:885`),
+which `ExecuteC` calls *after* `Find` (`:1090`) ran `stripFlags` (the only other
+registration site is `getCompletions`, `cobra-1.8.0/completions.go:304`, reached
+only by `__complete`), so at stripping time it is unknown, `hasNoOptDefVal`
+returns false, and it **does** consume the next token. Two measurements
+discriminate the mechanism rather than just the outcome: `frpc --help status`
+prints the **root** help (`Usage: frpc [flags]` + `Available Commands`), not the
+`status` help a non-consuming flag would select (`frpc status --help` is
+`Overview of all proxies status`), and `frpc --help notacommand` is rc **0** with
+the same root help where a non-consuming flag would leave `notacommand` as the
+first bare word for `legacyArgs` to refuse. Exempting `--help` would therefore
+make frp-rs print the *status* help for `--help status`; it stays a consumer.
+
+The first version of this pass listed `--strict-config` as a consumer, and both
+directions were measured wrong. Over-consuming is not the safe direction: it
+shifts *which* token is the first bare word, so it can hoist a later word cobra
+would have refused.
+
+| argv | Go v0.71.0 | frp-rs before | frp-rs now |
+|---|---|---|---|
+| `--strict-config status -c pA.toml`, `--strict_config status -c pA.toml` | rc 0, dials the admin port (`status` was not consumed) | rc 1, ``no such command or positional: `status` `` | rc 0, dials it |
+| `-c pA.toml --strict-config status`, `-c pA.toml --strict_config status` | rc 0, dials it | rc 1, same refusal | rc 0, dials it |
+| `--strict-config tcp --local-port 5 … --server-port <free>` | rc 1, **connects** (the tcp branch runs) | rc 1, ``no such command or positional: `tcp` `` | rc 1, connects |
+| `--strict-config reload -c pA.toml` | rc 0, `reload success` | rc 1, `` `reload` is not expected `` | rc 0 |
+| `--strict-config verify -c missing.toml` | rc 1, `open …missing.toml: no such file or directory` (the verify branch runs) | rc 1, `` `verify` is not expected `` | rc 1, the config-load error |
+| `--strict-config true status -c pA.toml`, `--strict-config false status -c pA.toml`, `--strict_config true stop -c pA.toml`, `--strict-config true reload -c pA.toml` | rc 1, ``unknown command "true"/"false" for "frpc"`` — the word is the first bare word and **no** command is resolved | rc 1 (a different refusal) | rc 1, no dial — the same outcome as Go |
+| `--strict-config true {tcp,udp,http,https,stcp,xtcp,sudp,tcpmux} … --server-port <free>` — **all eight single-proxy branches** | rc 1, ``unknown command "true"``, nothing dialled | rc 1, same class | rc 1, nothing dialled |
+| `--strict-config true {status,stop,reload} -c pA.toml` — the three admin commands | rc 1, ``unknown command "true"``, no admin request | rc 1, same class | rc 1, nothing dialled |
+| `--strict-config=true status -c pA.toml`, `--strict-config=false status -c pA.toml` | rc 0, dials it | rc 1, the refusal | rc 0, dials it (unchanged by this fix: the `=` form never consumed) |
+| `--strict-config=foo status -c pA.toml` | rc 1, pflag's `invalid argument "foo" for "--strict-config" flag: strconv.ParseBool: …` | rc 1, bpaf's message | rc 1, unchanged (message shape differs) |
+| `status --strict-config false -c pA.toml` (space form **after** the command) | rc 0, dials it (`false` is ignored as a positional) | rc 0, dials, prints the space-form warning | unchanged |
+| `--strict-config notacommand status` | rc 1, `unknown command "notacommand"` | rc 1, leftover-token refusal | unchanged (message shape) |
+| `--strict-config true` (no command) | rc 1, `unknown command "true"` | rc 1, config-load error | unchanged |
+
+The other four root flags were swept the same way and are **correct**: with
+`--allow-unsafe TokenSourceExec status -c pA.toml`, `--config-dir <dir> status
+-c pA.toml`, `--version status -c pA.toml` and `-v status -c pA.toml` Go dials
+the admin port and so does the head (rc 0); `--allow-unsafe status -c pA.toml`
+consumes `status` as the flag's value on **both** (rc 1, run mode, no dial);
+`--help status` and `-h status` print help on both (rc 0). The single-proxy and
+run-only frp-rs flags (`--log-level`, `--disable-log-color`) are treated as
+value-taking, which matches cobra's treatment of them as *unknown* flags
+(measured: `--disable-log-color status` is rc 1 on Go and here, no dial).
+
+**Blast radius of the direction-A bug, measured on all eleven commands.** R2's independent
+sweep first found the class wider than the `tcp` row above: every one of the eight single-proxy
+branches connected to the `--server-port` canary on the pre-fix head — `tcp`, `udp`, `http`,
+`https`, `stcp`, `xtcp`, `sudp`, `tcpmux`, each with its own required flags — and the three
+admin commands (`status`, `stop`, `reload`) returned rc 0 with a real request to the mock
+(`GET /api/status`, `POST /api/stop`, `POST /api/reload`). Re-measured here on Go / base /
+pre-fix head / fixed with one row per command (`/tmp/ledprobe/{go,base,oldhead,fixed}_sc8.jsonl`,
+11 rows each): all eleven rows have the pre-fix head differing from Go on (rc, dial), and the
+fixed head agrees with Go on all eleven. So the hole was "any command resolved from a word that
+followed the bare bool", not a `tcp`-specific one.
+
+**Not hoisted, deliberately.** A leading token that merely starts with a dash is
+never a candidate, and only the **first** bare word can be one: cobra's `Find`
+looks at `argsWOflags[0]` and `legacyArgs` refuses that word even when a real
+command name follows it, so `notacommand status` is Go's
+`unknown command "notacommand"` (measured). The `nathole` command Go lists is not
+implemented, so `frpc -c cfg.toml nathole` stays a leftover-token refusal;
+`completion` and `help` are cobra built-ins and are not implemented either —
+both are deliberately absent from `FRPC_SUBCOMMANDS`, which is pinned against
+`frpc_parser` in both directions by unit tests.
+
+Four residual rows, each measured and each **pre-existing** (the base behaves the
+same as the head):
+
+* `frpc - status` and `frpc -c pA.toml - status`: Go resolves `status` and
+  ignores the stray `-` positional (`frpc - status` is rc 1 only because the
+  status command's default config `./frpc.ini` is missing; `-c pA.toml`
+  variants are rc 0 and dial). The hoist resolves the command correctly and then
+  bpaf refuses the leftover `-` — the positional-arguments divergence below, not
+  a command-resolution one.
+* `frpc --config-dir <empty or non-dir>`: Go rc 0 (its `runMultipleClients`
+  swallows the error), frp-rs rc 2 — the deliberate directory-mode divergence in
+  § CLI exit codes.
+* `frpc status -c pA.toml stop`: the first subcommand is already selected, so the
+  later word is a positional; Go ignores it (rc 0), frp-rs refuses it (rc 1).
+  Same positional rule.
+* `frpc -c pA.toml nathole`, `completion`, `help` as a bare word: Go rc 0
+  (`nathole` is a real command there and the other two are built-ins), frp-rs
+  rc 1 — the implementation gap named above.
 
 **What remains divergent, with its measurement.** (1) Positional arguments, as
 described above: Go ignores them, frp-rs refuses a leftover token, with or

@@ -3,6 +3,7 @@
 //! Uses bpaf combinators for the frps and frpc CLI surfaces.
 //! All flags accept both hyphen (`--log-file`) and underscore (`--log_file`) forms.
 
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::time::Duration;
 
@@ -891,9 +892,16 @@ fn expand_bool_short_value_form(argv: Vec<OsString>) -> Vec<OsString> {
         .collect()
 }
 
-/// The bpaf `Args` for a process argv: `argv[0]` dropped the way
-/// `Args::current_args` drops it, its file name carried over so help and error
-/// output keep naming the program, and the pflag short-`=` alias expanded.
+/// The bpaf argv for a process argv: `argv[0]` dropped the way
+/// `Args::current_args` drops it (its file name is returned separately so help
+/// and error output keep naming the program), and the pflag short-`=` alias
+/// expanded.
+///
+/// `argv[0]` is dropped **here**, before every other pre-parse pass, because
+/// the passes must classify exactly the tokens bpaf will classify: argv[0] is
+/// not one of them, and a pass that sees it sees one spurious leading bare word
+/// (which is how the first version of [`hoist_leading_subcommand`] managed to
+/// never fire).
 fn cli_args(argv: &[OsString]) -> (Option<String>, Vec<OsString>) {
     // Mirror `Args::current_args` exactly (`bpaf-0.9.27/src/args.rs:145-159`):
     // the name is argv[0]'s *file name* when it is valid UTF-8, and `None`
@@ -909,11 +917,11 @@ fn cli_args(argv: &[OsString]) -> (Option<String>, Vec<OsString>) {
     (name, rest)
 }
 
-/// Run an `OptionParser` over `argv` and exit the way `OptionParser::run` does
-/// (`err.print_message(self.info.max_width)`, then `err.exit_code()`).
-fn run_cli<T>(parser: bpaf::OptionParser<T>, argv: &[OsString]) -> T {
-    let (name, rest) = cli_args(argv);
-    let args = bpaf::Args::from(&rest[..]);
+/// Run an `OptionParser` over the argv [`cli_args`] produced and exit the way
+/// `OptionParser::run` does (`err.print_message(self.info.max_width)`, then
+/// `err.exit_code()`).
+fn run_cli<T>(parser: bpaf::OptionParser<T>, name: Option<String>, rest: &[OsString]) -> T {
+    let args = bpaf::Args::from(rest);
     // `set_name` only when there *is* one: `Args::current_args` leaves the name
     // unset for an unreadable argv[0], and bpaf renders that case differently.
     let args = match &name {
@@ -929,25 +937,240 @@ fn run_cli<T>(parser: bpaf::OptionParser<T>, argv: &[OsString]) -> T {
     }
 }
 
-/// The argv a binary's entry point hands bpaf with pflag's config dash-value
-/// rule applied (the `-c=<value>` attachment in
-/// [`rewrite_config_dash_values`]; the short-`=` alias expansion is separate and
-/// happens inside [`cli_args`]).
+/// The argv a binary's entry point hands bpaf, built from the argv
+/// [`cli_args`] produced (`argv[0]` already dropped, `-v=` alias already
+/// expanded), with the pre-parse passes applied in the one order that
+/// composes:
+///
+/// 1. [`rewrite_config_dash_values`] — pflag's config dash-value rule.
+/// 2. [`hoist_leading_subcommand`] — cobra's command resolution, `frpc` only
+///    (`has_subcommands`; Go's `frps` declares no subcommands, so there is
+///    nothing to resolve and `frps` keeps the old behaviour exactly).
 ///
 /// Both entry points call **this** function, which is what makes the shared
 /// pass a single decision rather than two call sites that could drift:
 /// [`parse_frps_args`] and [`parse_frpc_args`] differ only in which parser they
-/// run over the result. Crate-private: the module's tests pin the pair (this
+/// run over the result. Crate-private: the module's tests pin the chain (this
 /// preparation, then the parser) through it, so they follow the same expression
-/// the binaries use instead of calling the rewrite directly — see
+/// the binaries use instead of calling a pass directly — see
 /// `frps_takes_a_dash_shaped_config_value`.
-fn prepared_cli_argv(argv: &[OsString]) -> Vec<OsString> {
-    rewrite_config_dash_values(argv)
+///
+/// **Why the rewrite runs first.** The hoist classifies tokens as flag / value /
+/// bare word, and it has to classify the argv the parser will actually see —
+/// which, on Go, is the argv *after* pflag's value rule has already been
+/// applied inside pflag, not a separate pre-pass. `-c -- status` is the shape
+/// that shows the difference: the rewrite turns `--` into `-c`'s **value**
+/// (`-c=--`), so by the time the hoist looks there is no separator left and
+/// `status` is the first bare word — measured on Go v0.71.0,
+/// `frpc -c -- status` resolves the `status` subcommand (that is why the config
+/// is even read) and fails on `open --: no such file or directory`, rc 1.
+/// Running the hoist on the raw argv instead would see a `--` separator and
+/// leave `status` un-hoisted, producing frp-rs's pre-existing ``no such command
+/// or positional: `status` ``. The reverse order (hoist, then rewrite) would
+/// decide before `--`-as-value is known, and could move a token across what is
+/// still a real separator.
+fn prepared_cli_argv(rest: &[OsString], has_subcommands: bool) -> Vec<OsString> {
+    let rewritten = rewrite_config_dash_values(rest);
+    if has_subcommands {
+        hoist_leading_subcommand(&rewritten)
+    } else {
+        rewritten
+    }
+}
+
+/// The `frpc` subcommand names [`hoist_leading_subcommand`] recognises, in the
+/// order [`frpc_parser`] composes them.
+///
+/// This is the **whole** implemented surface: Go's `frpc --help` also lists
+/// `nathole` (not implemented in frp-rs) and the cobra built-ins `completion`
+/// and `help`, so `frpc -c cfg.toml nathole` stays a leftover-token refusal
+/// here. The set is not hand-trusted: `every_known_subcommand_name_has_a_parser_branch`
+/// runs each name through `frpc_parser` and fails on a name with no command,
+/// and `the_known_subcommand_list_is_exactly_the_parser_branches` fails when the
+/// list and the parser disagree in the other direction too.
+const FRPC_SUBCOMMANDS: [&str; 12] = [
+    "tcp", "udp", "http", "https", "stcp", "xtcp", "sudp", "tcpmux", "verify", "reload", "status",
+    "stop",
+];
+
+/// Whether `token` names one of the commands [`frpc_parser`] registers.
+///
+/// `s` is a whole argv token, never a prefix: cobra's `findNext`
+/// (`cobra-1.8.0/command.go`) compares with `commandNameMatches`, i.e. string
+/// equality (`EnablePrefixMatching` is off — frp does not set it), and frp-rs
+/// does not implement prefix matching either.
+fn is_known_subcommand(s: &str) -> bool {
+    FRPC_SUBCOMMANDS.contains(&s)
+}
+
+/// Whether cobra's `stripFlags` would treat this token as a flag that swallows
+/// the next argv token — `cobra-1.8.0/command.go`, verbatim in effect: a
+/// `--long` without `=` whose flag carries no `NoOptDefVal`, or a
+/// two-character short flag without `=`.
+///
+/// The exemption list is therefore **exactly the root flags that Go registers
+/// with a pflag bool**, because a pflag bool sets `NoOptDefVal =
+/// "true"` (`pflag-1.0.5/bool.go:56`, reached from `BoolVarP`). On `frpc`
+/// those are two, both on `rootCmd`:
+///
+/// * `--version` / `-v` — `cmd/frpc/sub/root.go:52`;
+/// * `--strict-config` / `--strict_config` — `cmd/frpc/sub/root.go:53`
+///   (`BoolVarP(&strictConfigMode, "strict_config", "", true, …)`). Both
+///   spellings are exempt because `rootCmd.SetGlobalNormalizationFunc(config.WordSepNormalizeFunc)`
+///   makes pflag resolve `--strict-config` to the same flag.
+///
+/// Everything else consumes the next token: the three value-taking root flags
+/// (`--config`/`-c`, `--config_dir`, `--allow-unsafe`, `cmd/frpc/sub/root.go:50-51,55`)
+/// **and any flag cobra does not know**, because `hasNoOptDefVal` returns false
+/// for a name that is not in the set — measured, `frpc -x status` and
+/// `frpc --nodash status` are `unknown shorthand flag` / `unknown flag` on Go
+/// (so the token after the unknown flag was never a candidate).
+///
+/// `--help`/`-h` deliberately **stays** a consumer here. pflag makes `help` a
+/// bool, so the tempting reading is "it carries `NoOptDefVal` and therefore does
+/// not consume" — that reading is **falsified**, and it is worth spelling out
+/// because a shallow probe cannot tell the two mechanisms apart. cobra
+/// registers the help flag in `execute` (`cobra-1.8.0/command.go:885`), which
+/// `ExecuteC` calls *after* `Find` (`:1090`) ran `stripFlags`; the only other
+/// registration site is `getCompletions` (`cobra-1.8.0/completions.go:304`),
+/// reached only by the hidden `__complete` command. So at stripping time `help`
+/// is an unknown flag, `hasNoOptDefVal` returns false, and it **does** consume
+/// the next token. Two measurements pin the mechanism, not just the outcome:
+///
+/// * `frpc --help status` prints the **root** help (`Usage: frpc [flags]`,
+///   listing `Available Commands`), not the `status` help a non-consuming flag
+///   would select — `frpc status --help` is `Overview of all proxies status` /
+///   `Usage: frpc status [flags]`;
+/// * `frpc --help notacommand` is rc **0** with that same root help. A
+///   non-consuming flag would leave `notacommand` as the first bare word, and
+///   Go's `legacyArgs` refuses a root-level bare word (`unknown command
+///   "notacommand" for "frpc"`, rc 1).
+///
+/// frp-rs must match both: exempting `--help` here would hoist `status` out of
+/// `--help status` and print the *status* help where Go prints the root's.
+/// `help_does_not_become_a_candidate` pins the decision.
+///
+/// Getting the list wrong is **not** harmless in either direction, which the
+/// first version of this function got wrong by listing `--strict-config` as a
+/// consumer: skipping a token shifts *which* token is the first bare word, so
+/// over-consuming can hoist a **later** word that cobra would have refused.
+/// Measured on Go v0.71.0, `frpc --strict-config true status -c cfg` is rc 1
+/// `unknown command "true" for "frpc"` — `true` is the first bare word and
+/// `status` is never resolved — while the over-consuming version hoisted
+/// `status` and dialled the admin port (rc 0). Under-consuming is the other
+/// direction of the same bug: `frpc --strict-config status -c cfg` is rc 0 and
+/// dials on Go, because `status` was not consumed.
+fn consumes_value(s: &OsStr) -> bool {
+    let Some(s) = s.to_str() else { return false };
+    if s.contains('=') {
+        return false;
+    }
+    match s.as_bytes() {
+        [b'-', b'-', rest @ ..] if !rest.is_empty() => {
+            rest != b"version" && rest != b"strict-config" && rest != b"strict_config"
+        }
+        [b'-', c] => *c != b'v',
+        _ => false,
+    }
+}
+
+/// Move `frpc`'s **leading** subcommand token to the front of the argv, the way
+/// cobra resolves a command that follows leading root flags (`TODO.md:2566`).
+///
+/// Go's `Find` (`cobra-1.8.0/command.go`, `ExecuteC` → `Find` → `innerfind`)
+/// strips flags from argv with `stripFlags` and then looks at **only the first
+/// surviving bare word**: if that word names a child command the child is
+/// selected and `argsMinusFirstX` removes it, so the rest of argv reaches the
+/// child's `pflag` parse; if it does not name a child, the root command runs
+/// with the whole argv (and its positional check refuses the word). bpaf instead
+/// picks a branch *before* dispatch, so with `-c pA.toml status` the run-mode
+/// parser sees the `status` token as a leftover positional. Hoisting the token
+/// reproduces cobra's resolution at the one point where frp-rs picks its branch.
+///
+/// `argv` is the argv **after** `argv[0]` was dropped and after
+/// [`rewrite_config_dash_values`]; see [`prepared_cli_argv`] for why that order
+/// is load-bearing.
+///
+/// **What counts as a candidate — measured on Go v0.71.0, not inferred.** The
+/// scan skips the value of every value-taking token (see [`consumes_value`]),
+/// stops at a real `--` separator, and stops at anything it cannot classify.
+/// The value-position shapes this must never hoist out of, each measured on Go
+/// v0.71.0 and on the frp-rs binaries (the table with both columns is in
+/// `docs/developing.md` § CLI inputs):
+///
+/// * `-c status` — a config file literally named `status`: `status` is `-c`'s
+///   value, so Go loads it **in run mode** and starts the client (measured:
+///   `start frpc service for config file […]/status`), never the `status`
+///   admin command. Nothing may be hoisted here.
+/// * `--config=status` and `-c=status` — the `=`-attached spelling holds the
+///   value inside one token; there is no next token to consume and nothing to
+///   hoist.
+/// * `-c cfg.toml -- status` — a real `--`; Go treats `status` as a positional
+///   and runs the root command's run mode (measured: it starts the client and
+///   never dials `[webServer].port`). The scan stops at `--`, so nothing after
+///   it is hoisted.
+/// * `-c -status` — the value is the dash-shaped token `-status` (Go:
+///   `open -status: no such file or directory`); the rewrite has already
+///   attached the flag-shaped spellings (`-c --strict-config=false` becomes
+///   `-c=--strict-config=false`) before this runs, and a bare `-status` is
+///   consumed by the same one-token lookahead.
+/// * `tcp --proxy-name status` — the subcommand already leads, so no token is
+///   hoisted; the value `status` belongs to the already-selected proxy command.
+/// * `--strict-config true status` — the trap the **first** version of the
+///   classification fell into. `--strict-config` is a pflag bool
+///   (`cmd/frpc/sub/root.go:53`), so cobra does not let it swallow `true`;
+///   `true` is the first bare word, and Go refuses that word
+///   (`unknown command "true" for "frpc"`, rc 1) instead of resolving the
+///   `status` that follows it. Treating the flag as value-taking hoisted
+///   `status` and dialled the admin port (rc 0) — a regression against Go and
+///   against the base. See [`consumes_value`] for the full exemption list.
+/// * `--strict-config status` — the other direction, and the reason the flag
+///   is exempt: `status` is not consumed, so Go resolves the command and dials
+///   the config's admin port (rc 0). The same holds for the underscore
+///   spelling and for `-c cfg.toml --strict_config status`.
+/// * `frpc -c cfg.toml notacommand` — the first bare word is not a command and
+///   Go refuses **that** word (`unknown command "notacommand" for "frpc"`,
+///   rc 1), even when a real command name follows it (measured:
+///   `notacommand status` is the same refusal). The first bare word is
+///   therefore the only candidate; a later word is never hoisted.
+///
+/// Returns `argv` unchanged when there is nothing to hoist.
+fn hoist_leading_subcommand(argv: &[OsString]) -> Vec<OsString> {
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = &argv[i];
+        if arg == "--" {
+            // A real end-of-flags marker: every later token is a positional and
+            // cobra's `stripFlags` returns before looking at them.
+            return argv.to_vec();
+        }
+        if arg.to_string_lossy().starts_with('-') {
+            // A flag — never a candidate. A value-taking flag also swallows the
+            // token after it, which is how `-c status` keeps its value.
+            i += if consumes_value(arg) { 2 } else { 1 };
+            continue;
+        }
+        let Some(word) = arg.to_str() else {
+            // Not valid UTF-8, so not a subcommand name; the first bare word has
+            // been seen and cobra would not look further.
+            return argv.to_vec();
+        };
+        if is_known_subcommand(word) && i > 0 {
+            let mut out = Vec::with_capacity(argv.len());
+            out.push(arg.clone());
+            out.extend(argv[..i].iter().cloned());
+            out.extend(argv[i + 1..].iter().cloned());
+            return out;
+        }
+        return argv.to_vec();
+    }
+    argv.to_vec()
 }
 
 /// Parse frps CLI args. Prints help/version and exits as needed.
 pub fn parse_frps_args() -> FrpsArgs {
     let argv: Vec<OsString> = std::env::args_os().collect();
+    let (name, rest) = cli_args(&argv);
     // Go's pflag consumes a `-`-prefixed token as a config flag's value on
     // `frps` too; bpaf only refuses the tokens it classifies as flags (see
     // [`rewrite_config_dash_values`]). Shared with `frpc` through
@@ -955,12 +1178,15 @@ pub fn parse_frps_args() -> FrpsArgs {
     // `-c --strict-config=false` and `-c -x` are
     // `open <token>: no such file or directory` there, and `-c --` is
     // `open --: no such file or directory`. `warn_if_strict_config_space_form_used`
-    // keeps reading the original argv.
-    let parse_argv = prepared_cli_argv(&argv);
+    // keeps reading the original argv. `false`: Go's `frps` declares no
+    // subcommands, so no hoist runs on this binary and its behaviour is
+    // byte-identical to before.
+    let parse_argv = prepared_cli_argv(&rest, false);
     let args = run_cli(
         frps_args()
             .to_options()
             .descr("frps is the server of frp-rs (https://github.com/fatedier/frp)"),
+        name,
         &parse_argv,
     );
     // Only reached when the argv parsed: the failure path above exits the
@@ -1961,17 +2187,19 @@ fn frpc_parser() -> impl Parser<FrpcCmd> {
 /// Parse frpc CLI args.
 pub fn parse_frpc_args() -> FrpcCmd {
     let argv: Vec<OsString> = std::env::args_os().collect();
+    let (name, rest) = cli_args(&argv);
     // Go's pflag consumes a `-`-prefixed token as a config flag's value; bpaf
     // only refuses the tokens it classifies as flags (see
     // [`rewrite_config_dash_values`]). Shared with `frps` through
-    // [`prepared_cli_argv`]; this call site is what makes the rewrite apply to
-    // every `frpc` subcommand. `warn_if_strict_config_space_form_used` keeps
-    // reading the original argv.
-    let parse_argv = prepared_cli_argv(&argv);
+    // [`prepared_cli_argv`]; this call site is what makes the rewrite **and**
+    // the subcommand hoist apply to every `frpc` invocation.
+    // `warn_if_strict_config_space_form_used` keeps reading the original argv.
+    let parse_argv = prepared_cli_argv(&rest, true);
     let args = run_cli(
         frpc_parser()
             .to_options()
             .descr("frpc is the client of frp-rs (https://github.com/fatedier/frp)"),
+        name,
         &parse_argv,
     );
     // See `parse_frps_args`: printed only for a successfully parsed argv whose
@@ -3866,7 +4094,7 @@ mod tests {
             .collect();
         let parsed = frps_args()
             .to_options()
-            .run_inner(&prepared_cli_argv(&argv)[..])
+            .run_inner(&prepared_cli_argv(&argv, false)[..])
             .expect("the prepared argv parses");
         assert_eq!(
             parsed.config.as_deref(),
@@ -3884,7 +4112,7 @@ mod tests {
             let argv: Vec<OsString> = argv.iter().map(OsString::from).collect();
             let parsed = frps_args()
                 .to_options()
-                .run_inner(&prepared_cli_argv(&argv)[..])
+                .run_inner(&prepared_cli_argv(&argv, false)[..])
                 .unwrap_or_else(|err| {
                     panic!("frps {argv:?} must parse after the rewrite: {err:?}")
                 });
@@ -3904,7 +4132,7 @@ mod tests {
         let argv: Vec<OsString> = ["-c", "--"].iter().map(OsString::from).collect();
         let parsed = frps_args()
             .to_options()
-            .run_inner(&prepared_cli_argv(&argv)[..])
+            .run_inner(&prepared_cli_argv(&argv, false)[..])
             .expect("`-c --` parses with `--` as the value");
         assert_eq!(parsed.config.as_deref(), Some("--"));
 
@@ -3944,6 +4172,454 @@ mod tests {
         assert_eq!(
             rewrite(&["-c", "p.toml", "--", "-c", "-x"]),
             vec!["-c", "p.toml", "--", "-c", "-x"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod hoist_tests {
+    use super::*;
+
+    fn hoist(args: &[&str]) -> Vec<String> {
+        let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+        hoist_leading_subcommand(&argv)
+            .into_iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn prepared(args: &[&str]) -> Vec<String> {
+        let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+        prepared_cli_argv(&argv, true)
+            .into_iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn run_frpc(args: &[&str]) -> Result<FrpcCmd, bpaf::ParseFailure> {
+        let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let prepared = prepared_cli_argv(&argv, true);
+        frpc_parser().to_options().run_inner(&prepared[..])
+    }
+
+    // ── the flag/value classifier ────────────────────────────────────────
+    //
+    // `consumes_value` decides whether the next argv token belongs to a flag
+    // and therefore is never a subcommand candidate. Each row is cobra 1.8.0's
+    // `stripFlags` reading (`command.go`): a `--long` without `=` consumes the
+    // next token unless the flag carries `NoOptDefVal` (which is what
+    // `--version` is), a two-character short without `=` likewise (`-v` is the
+    // boolean), and anything with `=` or without a leading dash consumes
+    // nothing.
+
+    #[test]
+    fn only_value_taking_tokens_swallow_the_next_arg() {
+        for takes in [
+            "-c",
+            "--config",
+            "--config-dir",
+            "--config_dir",
+            "--allow-unsafe",
+            "-L",
+            "-t",
+            "-x",
+            "--nodash",
+            "--",
+            // Deliberately a consumer although pflag makes it a bool: cobra
+            // adds `--help` in `execute`, after `Find` ran `stripFlags`, so at
+            // stripping time it is unknown. Measured, `frpc --help status`
+            // prints help (rc 0) rather than resolving `status`.
+            "--help",
+            "-h",
+        ] {
+            assert!(
+                consumes_value(OsStr::new(takes)),
+                "{takes} must swallow the next token"
+            );
+        }
+        for keeps in [
+            "-v",
+            "--version",
+            "--version=false",
+            // The two root pflag bools besides version (`cmd/frpc/sub/root.go:53`).
+            // Both spellings, bare: cobra's `hasNoOptDefVal` is true for them, so
+            // the next token is NOT consumed. Putting `--strict-config` back in
+            // the list above is the regression `--strict-config true status`
+            // measured (see `a_word_after_bare_strict_config_is_the_first_bare_word`).
+            "--strict-config",
+            "--strict_config",
+            "--strict-config=false",
+            "-c=p.toml",
+            "-cp.toml",
+            "--config=p.toml",
+            "-c=",
+            "-",
+            "",
+            "status",
+            "p.toml",
+        ] {
+            assert!(
+                !consumes_value(OsStr::new(keeps)),
+                "{keeps} must not swallow the next token"
+            );
+        }
+    }
+
+    /// Direction B (R1): a bare `--strict-config`/`--strict_config` before the
+    /// command word does **not** consume it, so the command is hoisted.
+    /// Measured on Go v0.71.0: `frpc --strict-config status -c cfg` is rc 0 and
+    /// dials the config's admin port; so are `--strict_config status -c cfg`,
+    /// `-c cfg --strict-config status` and `--strict-config tcp …`.
+    #[test]
+    fn a_bare_strict_config_does_not_swallow_the_subcommand() {
+        assert_eq!(
+            hoist(&["--strict-config", "status", "-c", "pA.toml"]),
+            ["status", "--strict-config", "-c", "pA.toml"]
+        );
+        assert_eq!(
+            hoist(&["--strict_config", "status", "-c", "pA.toml"]),
+            ["status", "--strict_config", "-c", "pA.toml"]
+        );
+        assert_eq!(
+            hoist(&["-c", "pA.toml", "--strict-config", "status"]),
+            ["status", "-c", "pA.toml", "--strict-config"]
+        );
+        assert_eq!(
+            hoist(&["-c", "pA.toml", "--strict_config", "status"]),
+            ["status", "-c", "pA.toml", "--strict_config"]
+        );
+        // The same on a single-proxy command and with a second `-c`.
+        assert_eq!(
+            hoist(&["--strict-config", "tcp", "--local-port", "5"]),
+            ["tcp", "--strict-config", "--local-port", "5"]
+        );
+        assert_eq!(
+            hoist(&["--strict-config", "status", "-c", "a.toml", "-c", "b.toml"]),
+            ["status", "--strict-config", "-c", "a.toml", "-c", "b.toml"]
+        );
+        // And the hoisted argv parses as the command, not as run mode.
+        match run_frpc(&["--strict-config", "status", "-c", "pA.toml"])
+            .expect("the hoisted argv parses")
+        {
+            FrpcCmd::Status(args) => assert_eq!(args.config.as_deref(), Some("pA.toml")),
+            other => panic!("expected the status command, got {other:?}"),
+        }
+    }
+
+    /// Direction A (R2, the regression): a *word* after a bare
+    /// `--strict-config` is the first bare word, and it is not a command, so
+    /// **no** token is hoisted — in particular not the real command name that
+    /// follows it. Measured on Go v0.71.0: `frpc --strict-config true status -c
+    /// cfg` is rc 1 `unknown command "true" for "frpc"` and never dials.
+    /// `--help`/`-h` stays a consumer, measured rather than assumed: cobra
+    /// registers the help flag in `execute` (`cobra-1.8.0/command.go:885`),
+    /// after `Find` (`:1090`) ran `stripFlags`, so it is unknown at stripping
+    /// time. The argv below must therefore be left alone — hoisting `status`
+    /// would make frp-rs print the *status* help where Go prints the root's.
+    #[test]
+    fn help_does_not_become_a_candidate() {
+        for argv in [
+            vec!["--help", "status"],
+            vec!["-h", "status"],
+            vec!["--help", "notacommand"],
+            vec!["-h", "notacommand"],
+            vec!["--help", "tcp", "--local-port", "5"],
+            vec!["-c", "pA.toml", "--help", "status"],
+        ] {
+            assert_eq!(hoist(&argv), argv, "{argv:?} must not be rewritten");
+        }
+        // And the parse really is the root's: bpaf reports help on stdout with
+        // the root usage line, not a `status` subcommand usage.
+        let prepared =
+            prepared_cli_argv(&[OsString::from("--help"), OsString::from("status")], true);
+        assert_eq!(prepared.len(), 2, "no token may be hoisted");
+        let failure = frpc_parser()
+            .to_options()
+            .run_inner(&prepared[..])
+            .expect_err("--help is reported as a ParseFailure");
+        match failure {
+            bpaf::ParseFailure::Stdout(doc, _) => {
+                let text = doc.to_string();
+                // The root usage lists its command alternatives; a selected
+                // subcommand's help is a bare `Usage: COMMAND ...` with no
+                // alternation.
+                assert!(
+                    text.contains("(COMMAND ..."),
+                    "the ROOT usage must be printed, not the status command's:\n{text}"
+                );
+            }
+            other => panic!("expected help on stdout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_word_after_bare_strict_config_is_the_first_bare_word() {
+        for argv in [
+            vec!["--strict-config", "true", "status", "-c", "pA.toml"],
+            vec!["--strict-config", "false", "status", "-c", "pA.toml"],
+            vec!["--strict_config", "true", "stop", "-c", "pA.toml"],
+            vec!["--strict-config", "true", "tcp", "--local-port", "5"],
+            vec!["--strict-config", "true", "reload", "-c", "pA.toml"],
+            // `notacommand` is refused by Go as the first bare word; the real
+            // command after it must not be hoisted either.
+            vec!["--strict-config", "notacommand", "status"],
+        ] {
+            let out = hoist(&argv);
+            assert_eq!(
+                out, argv,
+                "{argv:?} must not be rewritten: the word after the bare flag is the first bare word"
+            );
+        }
+    }
+
+    // ── the hoist itself ────────────────────────────────────────────────
+
+    #[test]
+    fn a_subcommand_after_leading_root_flags_is_hoisted() {
+        assert_eq!(
+            hoist(&["-c", "pA.toml", "status"]),
+            ["status", "-c", "pA.toml"]
+        );
+        assert_eq!(
+            hoist(&["--strict-config=false", "status", "-c", "pA.toml"]),
+            ["status", "--strict-config=false", "-c", "pA.toml"]
+        );
+        assert_eq!(
+            hoist(&["-c", "pA.toml", "--strict-config=false", "status"]),
+            ["status", "-c", "pA.toml", "--strict-config=false"]
+        );
+        // The value is a flag-shaped token, so the rewrite has already attached
+        // it and the bare word is the candidate.
+        assert_eq!(
+            hoist(&["-c=--strict-config=false", "status", "-c", "pA.toml"]),
+            ["status", "-c=--strict-config=false", "-c", "pA.toml"]
+        );
+    }
+
+    #[test]
+    fn an_already_leading_subcommand_is_left_alone() {
+        // frp-rs's own order must keep working; `i > 0` is what keeps this a
+        // no-op rather than an identity rewrite.
+        for argv in [
+            vec!["status", "-c", "pA.toml"],
+            vec!["tcp", "--local-port", "5"],
+            vec!["verify", "-c", "p.toml"],
+        ] {
+            let out = hoist(&argv);
+            assert_eq!(out, argv, "leading subcommand was reordered");
+        }
+    }
+
+    #[test]
+    fn a_value_that_names_a_subcommand_is_never_hoisted() {
+        // The value-position traps, each measured on Go v0.71.0 (the full table
+        // is in `docs/developing.md` § CLI inputs).
+        for argv in [
+            // a config file literally named after a command: `-c`'s value
+            vec!["-c", "status"],
+            vec!["-c", "tcp"],
+            vec!["--config", "run"],
+            // `=`-attached: the value lives inside the flag token
+            vec!["--config=status"],
+            vec!["-c=status"],
+            vec!["-cstatus"],
+            // a dash-shaped value
+            vec!["-c", "-status"],
+            vec!["-c", "--status"],
+            // a real `--` ends the scan: `status` is a positional there
+            vec!["--", "status"],
+            vec!["-c", "cfg.toml", "--", "status"],
+            // a subcommand already leads, so its option values are its own
+            vec!["tcp", "--proxy-name", "status", "--local-port", "5"],
+        ] {
+            let out = hoist(&argv);
+            assert_eq!(out, argv, "{argv:?} must not be rewritten");
+        }
+    }
+
+    #[test]
+    fn only_the_first_bare_word_can_be_a_candidate() {
+        // Go refuses the first bare word (`unknown command "notacommand" for
+        // "frpc"`, measured) even when a real command follows it, so a later
+        // word is never hoisted.
+        for argv in [
+            vec!["-c", "pA.toml", "notacommand"],
+            vec!["-c", "pA.toml", "notacommand", "status"],
+            vec!["nathole"],
+            vec!["completion"],
+            vec!["help"],
+            vec!["STATUS"],
+        ] {
+            let out = hoist(&argv);
+            assert_eq!(out, argv, "{argv:?} must not be rewritten");
+        }
+    }
+
+    // ── the composition with the rewrite ────────────────────────────────
+
+    #[test]
+    fn the_rewrite_runs_before_the_hoist() {
+        // `-c -- status`: pflag gives `-c` the value `--`, so there is no
+        // separator left and `status` is the first bare word. Measured on Go
+        // v0.71.0: `frpc -c -- status` resolves the `status` subcommand and
+        // fails on `open --: no such file or directory` — the config read
+        // happens on the admin path, not in run mode.
+        assert_eq!(prepared(&["-c", "--", "status"]), ["status", "-c=--"]);
+        // With no rewrite in front, `-c` still takes `--` as its value: the
+        // separator check is reached only at a token position that is not a
+        // flag's value, which for this argv never happens.
+        assert_eq!(hoist(&["-c", "--", "status"]), ["status", "-c", "--"]);
+        // The separator is real at the front, though, and stops the scan.
+        assert_eq!(prepared(&["--", "status"]), ["--", "status"]);
+        // A flag-shaped value is attached, never a candidate.
+        assert_eq!(
+            prepared(&["-c", "--strict-config=false"]),
+            ["-c=--strict-config=false"]
+        );
+        assert_eq!(
+            prepared(&["-c", "--strict-config=false", "status"])
+                .first()
+                .map(String::as_str),
+            Some("status")
+        );
+    }
+
+    #[test]
+    fn the_hoisted_argv_parses_as_the_subcommand() {
+        // End of the chain: the hoist exists so this argv reaches the `status`
+        // branch with its config, and so `tcp`'s own flags are parsed by the
+        // tcp branch. Measured on Go v0.71.0 (both resolve; neither falls back
+        // to run mode).
+        match run_frpc(&["-c", "pA.toml", "status"]).expect("hoisted argv parses") {
+            FrpcCmd::Status(args) => assert_eq!(args.config.as_deref(), Some("pA.toml")),
+            other => panic!("expected the status command, got {other:?}"),
+        }
+        match run_frpc(&[
+            "-c",
+            "missing.toml",
+            "tcp",
+            "--local-port",
+            "5",
+            "--remote-port",
+            "6",
+            "--proxy-name",
+            "x",
+        ])
+        .expect("hoisted argv parses")
+        {
+            FrpcCmd::Tcp(args) => {
+                assert_eq!(args.local_port, 5);
+                assert_eq!(args.remote_port, 6);
+                assert_eq!(args.proxy_name.as_deref(), Some("x"));
+            }
+            other => panic!("expected the tcp command, got {other:?}"),
+        }
+        // A value that names a subcommand stays a value: this is run mode with
+        // the config file `status`, not the admin command.
+        match run_frpc(&["-c", "status"]).expect("run mode with a config named status") {
+            FrpcCmd::Run(args) => assert_eq!(args.config, "status"),
+            other => panic!("expected run mode, got {other:?}"),
+        }
+        // After a real `--`, the token is a positional, which run mode refuses
+        // on frp-rs (Go ignores it and then fails to dial — the pre-existing
+        // positional divergence recorded in § CLI inputs).
+        assert!(run_frpc(&["-c", "pA.toml", "--", "status"]).is_err());
+    }
+
+    /// `FrpcCmd`'s twelve command variants, one per `frpc_parser` subcommand —
+    /// the same set `FrpcCmd` in this file declares, and the same set
+    /// [`FRPC_SUBCOMMANDS`] names. Adding a thirteenth subcommand to the parser
+    /// without extending this list fails the match below.
+    fn command_variant_name(cmd: &FrpcCmd) -> Option<&'static str> {
+        match cmd {
+            FrpcCmd::Tcp(_) => Some("tcp"),
+            FrpcCmd::Udp(_) => Some("udp"),
+            FrpcCmd::Http(_) => Some("http"),
+            FrpcCmd::Https(_) => Some("https"),
+            FrpcCmd::Stcp(_) => Some("stcp"),
+            FrpcCmd::Xtcp(_) => Some("xtcp"),
+            FrpcCmd::Sudp(_) => Some("sudp"),
+            FrpcCmd::Tcpmux(_) => Some("tcpmux"),
+            FrpcCmd::Verify(_) => Some("verify"),
+            FrpcCmd::Reload(_) => Some("reload"),
+            FrpcCmd::Status(_) => Some("status"),
+            FrpcCmd::Stop(_) => Some("stop"),
+            FrpcCmd::Run(_) => None,
+        }
+    }
+
+    /// A command that needs a flag of its own when invoked bare: the parse
+    /// fails, and the failure must name that flag (run mode has none of them,
+    /// so this is the evidence that the branch was reached rather than fallen
+    /// through to). `verify` needs `-c` (`verify`'s config is not optional in
+    /// frp-rs); the other three admin commands complete with no flags.
+    fn single_proxy_own_flag(name: &str) -> Option<&'static str> {
+        match name {
+            "tcp" | "udp" | "sudp" => Some("--local-port"),
+            "http" | "https" => Some("--local-port"),
+            "stcp" | "xtcp" => Some("--sk"),
+            "tcpmux" => Some("--local-port"),
+            "verify" => Some("--config"),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn every_known_subcommand_name_selects_its_own_branch() {
+        // Each name must actually reach its own branch. Two failure modes are
+        // caught: a name with no `command("…")` in `frpc_parser` (run mode, or
+        // a parse error), and a name that selects a *different* command.
+        for name in FRPC_SUBCOMMANDS {
+            assert_eq!(hoist(&[name]), [name], "{name} must be accepted as leading");
+            let prepared = prepared_cli_argv(&[OsString::from(name)], true);
+            let own_flag = single_proxy_own_flag(name);
+            match frpc_parser().to_options().run_inner(&prepared[..]) {
+                // The four admin commands are complete without further flags.
+                Ok(cmd) => assert_eq!(
+                    command_variant_name(&cmd),
+                    Some(name),
+                    "{name} selected a different branch"
+                ),
+                Err(failure) => {
+                    let own_flag = own_flag.unwrap_or_else(|| {
+                        panic!("{name} must parse with no flags, got {failure:?}")
+                    });
+                    let message = failure.unwrap_stderr();
+                    assert!(
+                        message.contains(own_flag),
+                        "{name} was not resolved: its own {own_flag} is not the error, got {message:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_known_subcommand_list_is_exactly_the_parser_branches() {
+        // The other direction: `frpc_parser` composes one `command("…")` per
+        // subcommand, and bpaf renders exactly those in its own help. Comparing
+        // the list to that rendering fails if a branch is added to
+        // `frpc_parser` without a name here (or removed from it while the name
+        // stays), which is the drift a hand-written list otherwise allows.
+        let failure = frpc_parser()
+            .to_options()
+            .run_inner(&["--help"][..])
+            .expect_err("--help is reported as a ParseFailure");
+        let text = match failure {
+            bpaf::ParseFailure::Stdout(doc, _) => doc.to_string(),
+            other => panic!("expected help on stdout, got {other:?}"),
+        };
+        let listed: Vec<String> = text
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("Available commands:"))
+            .skip(1)
+            .take_while(|line| !line.trim().is_empty())
+            .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            listed,
+            FRPC_SUBCOMMANDS.to_vec(),
+            "the parser's command list and FRPC_SUBCOMMANDS disagree; help was:\n{text}"
         );
     }
 }
