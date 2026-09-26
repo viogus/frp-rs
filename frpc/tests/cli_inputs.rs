@@ -31,24 +31,26 @@
 //!   serde default only fired when the key was absent, so an explicit `addr = ""`
 //!   produced `connect :7499: failed to lookup address information …`.
 //!
-//! The third measured input — case-insensitive config keys — is deliberately
-//! **not** fixed here; it is recorded as a divergence in
+//! The third measured input — case-insensitive config keys — is still a
+//! divergence, but its array-element arm is now **refused** rather than
+//! silently dropped: `check_strict` recurses into the proxy/visitor/plugin
+//! arrays with exact-match key sets. It is recorded in
 //! `docs/developing.md` § CLI inputs with its measurement and scope. The
-//! case-shaped tests in this file pin only what a CLI can see (`rc 0`,
-//! `is valid`, the absence of an `unknown field` line); the **values** are
-//! asserted at the config layer, because a future serde alias would keep these
-//! tests green while honouring the key. Citation pairs (each verified against
+//! case-shaped tests in this file pin what a CLI can see (`rc`, `is valid`,
+//! the `unknown field` lines); the **values** are asserted at the config layer,
+//! because a future serde alias would keep a CLI-level test green while
+//! honouring the key. Citation pairs (each verified against
 //! the test that actually contains the assertion):
 //!
 //! * walked-section refusal — `test_strict_rejects_nested_unknown_keys`
 //!   (`log.levell`, `auth.tokenz`) and, for the admin section,
-//!   `strict_mode_exempts_proxy_and_visitor_array_elements`
+//!   `strict_mode_rejects_unknown_proxy_and_visitor_array_elements`
 //!   (`web_server.addrr`) and `test_strict_rejects_unknown_web_server_key`
 //!   (`web_server.unknown_web_server_key`) in `frp-core/src/config/tests.rs`;
-//! * array-element drop, value included —
-//!   `case_insensitive_proxy_array_key_is_dropped_in_strict_mode`
-//!   (`remote_port == 0`) there, alongside the pre-existing
-//!   `strict_mode_exempts_proxy_and_visitor_array_elements`;
+//! * array-element refusal, value included —
+//!   `case_insensitive_proxy_array_key_is_refused_in_strict_mode`
+//!   (strict `Err` naming `proxies[0].RemotePort`; non-strict still
+//!   `remote_port == 0`) there;
 //! * table-alias drop — `case_insensitive_key_in_a_table_alias_is_dropped_in_strict_mode`
 //!   (`virtual_net.address == ""`) there.
 //!
@@ -756,32 +758,24 @@ fn status_without_web_server_section_still_refuses() {
 
 // ── case 2: case-insensitive keys — the shipped behaviour, pinned ───────────
 
-/// A mis-cased key **inside `[[proxies]]`** is silently dropped even in strict
-/// mode: `LocalPort`/`RemotePort` are neither matched nor reported, and `frpc
-/// verify` exits **0**. Go accepts the same file and *uses* the keys, so this
-/// pins the current divergence rather than matching Go.
-///
-/// This is the strict-mode array exemption, not something this branch
-/// introduced: `check_strict` recurses only into sections it has a key list for
-/// and deliberately does not descend into `[[proxies]]`/`[[visitors]]`/
-/// `[[httpPlugins]]` (`frp-core/src/config/strict.rs:277-285`), and
-/// `ProxyConfig` carries no `deny_unknown_fields`. It is recorded in
-/// `docs/deployment.md:710-747` with the end-to-end consequence (the same config
-/// makes Go frpc bind the configured port while frp-rs registers
-/// `remote_port: 0` and the server auto-allocates one).
-///
-/// **What this test does and does not pin.** It pins the CLI-visible outcome
-/// only: `rc 0`, `is valid`, no `unknown field` line. It does NOT pin that the
-/// keys were dropped — a `#[serde(alias = "RemotePort")]` would keep it green
-/// while honouring the key. That is asserted by
-/// `case_insensitive_proxy_array_key_is_dropped_in_strict_mode` in
-/// `frp-core/src/config/tests.rs` (`remote_port == 0`), which is where the
-/// value-level claim lives.
+/// A mis-cased key **inside `[[proxies]]`** is now refused in strict mode:
+/// `check_strict` recurses into the array with its exact-match key set
+/// (`PROXY_KNOWN_KEYS` in `frp-core/src/config/strict.rs`), so
+/// `LocalPort`/`RemotePort` each produce an `unknown field "proxies[0].…"` line
+/// and `frpc verify` exits **1**. Go accepts the same file (`frpc verify -c`
+/// exits 0, measured) because its `encoding/json` decoder matches object keys
+/// case-insensitively, so this is stricter than Go — but it replaces a silent
+/// config loss, and the exact
+/// same refusal already applied to a mis-cased key in a walked section or at
+/// the top level. The **values** are asserted at the config layer by
+/// `case_insensitive_proxy_array_key_is_refused_in_strict_mode` in
+/// `frp-core/src/config/tests.rs`, which also pins that *non*-strict mode still
+/// drops the key (`remote_port == 0`).
 #[test]
-fn case_insensitive_proxy_array_keys_are_dropped_in_strict_mode() {
+fn case_insensitive_proxy_array_keys_are_refused_in_strict_mode() {
     let dir = TempDir::new();
-    // The capital `R` on `RemotePort` is the Go-accepted spelling; `name`/`type`
-    // are lowercase so the element still parses.
+    // The capital `L`/`R` on `LocalPort`/`RemotePort` are the Go-accepted
+    // spellings; `name`/`type` are lowercase so the element still parses.
     let cfg = dir.config(
         "cap-proxy.toml",
         "serverAddr = \"127.0.0.1\"\nserverPort = 7500\n\
@@ -793,8 +787,28 @@ fn case_insensitive_proxy_array_keys_are_dropped_in_strict_mode() {
 
     assert_eq!(
         exit_code(&out),
+        1,
+        "strict mode must refuse the mis-cased element keys; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    // Both keys are reported, with the element index in the path and a
+    // suggestion (each is one edit away from the alias serde does know).
+    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    for expected in [
+        "unknown field \"proxies[0].LocalPort\"",
+        "unknown field \"proxies[0].RemotePort\"",
+    ] {
+        assert!(all.contains(expected), "expected {expected:?} in: {all:?}");
+    }
+
+    // Non-strict mode keeps the lenient contract: rc 0, the keys dropped, no
+    // diagnostic. That is what the earlier version of this test pinned.
+    let out = run_frpc(&["verify", "--strict-config=false", "-c", &cfg]);
+    assert_eq!(
+        exit_code(&out),
         0,
-        "the array exemption must keep this loading (Go refuses it); stdout={:?} stderr={:?}",
+        "non-strict mode must still load the file; stdout={:?} stderr={:?}",
         stdout_of(&out),
         stderr_of(&out)
     );
@@ -803,17 +817,17 @@ fn case_insensitive_proxy_array_keys_are_dropped_in_strict_mode() {
         "stdout={:?}",
         stdout_of(&out)
     );
-    // No unknown-field diagnostic for the array element — that is the point.
     let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
     assert!(
         !all.contains("unknown field"),
-        "the array-element key must be dropped silently, not reported: {all:?}"
+        "non-strict mode drops the keys silently: {all:?}"
     );
 }
 
-/// The contrast for the test above: the walked sections still refuse in strict
-/// mode, so the exemption is specifically the array element. `webServer.Port`
-/// rather than the camel-case alias `port` is the Go-accepted spelling.
+/// The walked sections refuse in strict mode with the same sentence shape as
+/// the array test above — the array recursion did not create a new class of
+/// refusal. `webServer.Port` rather than the camel-case alias `port` is the
+/// Go-accepted spelling.
 #[test]
 fn case_insensitive_key_in_a_walked_section_is_refused_in_strict_mode() {
     let dir = TempDir::new();

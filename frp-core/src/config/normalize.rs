@@ -1415,6 +1415,26 @@ fn collect_legacy_ini_proxy_sections(table: &mut toml::Table) {
             }
         }
 
+        // Go legacy INI health-check spellings. The v1 field names are
+        // `health_check_interval_seconds` / `health_check_timeout_seconds`, and
+        // Go's legacy conversion maps the flat `_s` INI spellings onto
+        // `HealthCheck.IntervalSeconds` / `.TimeoutSeconds`
+        // (pkg/config/legacy/conversion.go:204-206) — a valid Go legacy INI
+        // config uses them and Go honours them. The
+        // `[proxies.healthCheck]` flatten in `normalize_proxies` already
+        // renames them; the flat INI form needs the same rename, because the
+        // element reaches `check_strict` unrenamed otherwise and strict mode
+        // walks `proxies`/`visitors` elements (a valid Go legacy config would
+        // be refused).
+        for (from, to) in [
+            ("health_check_interval_s", "health_check_interval_seconds"),
+            ("health_check_timeout_s", "health_check_timeout_seconds"),
+        ] {
+            if let Some(v) = st.remove(from) {
+                st.entry(to.to_string()).or_insert(v);
+            }
+        }
+
         if let Some(prefix) = section_name.strip_prefix("range:") {
             // Expand into {prefix}_{i} per-port proxies (Go renderRangeProxyTemplates).
             // local_port/remote_port accept a quoted string ("6000-6002") or
