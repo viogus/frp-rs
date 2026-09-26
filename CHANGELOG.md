@@ -117,6 +117,25 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **The five persistent rootCmd flags are now accepted — and ignored — on every
+  `frpc` subcommand — a behaviour change.** Go registers `-c`/`--config`,
+  `--config-dir`, `--strict-config`, `--allow-unsafe` and `-v`/`--version` on
+  `rootCmd`, so pflag parses all five for every subcommand, while the eight
+  single-proxy commands never read any of them. frp-rs's bpaf parsers did not
+  define them, so `frpc tcp --local-port 5 --remote-port 6 --proxy-name x -c
+  noweb.toml` started the proxy on Go and exited **1** here with ``Error: `-c`
+  is not expected in this context``; `--config-dir` and the other three behaved
+  the same way. All twelve `frpc` subcommands now accept and drop them (the four
+  admin commands already declared `-c` and `--strict-config`). Two pflag
+  spellings come with it: a repeated flag is last-wins (or appending for
+  `--allow-unsafe`) and never an error, and a `-`-prefixed token after `-c` is
+  consumed as that flag's **value** — `frpc status -c --strict-config=false -c
+  p7498.toml` dials p7498, as Go does; because bpaf refuses that shape, those
+  config-flag occurrences are rewritten to `-c=VALUE` before parsing. Unchanged:
+  a dangling `-c` is still an error, the single-proxy commands still do not read
+  the config file, and positional arguments (with or without `--`) are still
+  refused where Go ignores them — the one residual shape, recorded with its
+  measurement in `docs/developing.md` § CLI inputs.
 - **`frpc --version` no longer short-circuits an argv that is going to fail — a
   behaviour change.** The version check lived in a closure on the run-mode
   branch of `frpc`'s argument parser, and bpaf evaluates every alternative while
@@ -126,9 +145,11 @@ User-facing release notes for frp-rs.
   --nope`) and 0-with-`verify`-actually-running respectively. The check now runs
   after the parse, exactly as `frps`'s already did, so
   `frpc --version=foo` exits 1 like Go's `strconv.ParseBool` refusal and an
-  invalid flag wins. One row moves the other way and is recorded in
-  `docs/developing.md`: `frpc verify --version` is now rc 1 because frp-rs does
-  not register Go's persistent root flags on its subcommands (`TODO.md:2013`).
+  invalid flag wins. One row moved the other way at that head and is repaired in
+  this same unreleased section (see the persistent-rootCmd-flags entry above):
+  `frpc verify --version` was rc 1 because frp-rs did not register Go's
+  persistent root flags on its subcommands (`TODO.md:2173`); it now parses the
+  flag, ignores it and verifies, as Go does.
 - **A repeated `-c`/`--config` is now last-wins on the five `frpc` commands that
   read a config file — a behaviour change.** Go registers `-c` with pflag
   `StringVarP`, so `frpc status -c a.toml -c b.toml` loads `b.toml` and is never
@@ -138,11 +159,12 @@ User-facing release notes for frp-rs.
   mixing `-c`, `--config`, `-cPATH` and `-c=PATH` freely (they are one variable,
   as in Go). An absent `-c` keeps its previous meaning on each command (`run` →
   `frpc.toml`, the admin subcommands → the frp-rs default address), and a `-c`
-  with no value is still a parse error. Out of scope here, and unchanged: the
-  eight single-proxy subcommands (`tcp`, `udp`, `http`, `https`, `stcp`, `xtcp`,
-  `sudp`, `tcpmux`) still **reject** `-c` with ``Error: `-c` is not expected in
-  this context``, where Go accepts and ignores the persistent flag — recorded as
-  its own `TODO.md` item, not fixed; and the `frps` CLI is untouched.
+  with no value is still a parse error. The eight single-proxy subcommands
+  (`tcp`, `udp`, `http`, `https`, `stcp`, `xtcp`, `sudp`, `tcpmux`) still
+  rejected `-c` at that point (``Error: `-c` is not expected in this context``,
+  where Go accepts and ignores the persistent flag); that is fixed later in this
+  same unreleased section — see **the five persistent rootCmd flags** above —
+  and the `frps` CLI is untouched.
 - **An empty `webServer.addr` is now completed to `127.0.0.1` — a behaviour
   change.** Go's `WebServerConfig.Complete()` is
   `c.Addr = util.EmptyOr(c.Addr, "127.0.0.1")`, so a client config with
