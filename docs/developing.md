@@ -1290,11 +1290,15 @@ not a whole-line one) — `<path>: failed to read config file:` for `frps`,
 `Config file <path> is invalid: <path>:` for `frpc verify` — so a reintroduced
 timestamp/level prefix or ANSI escape fails. The tiny module asserts the same for
 `frpc-tiny`. All are in the two `cli_exit_codes.rs` files named above, on the same
-three lanes. Nothing was added to or deleted from **those two files**, so the
-guarded counts `env.FRPS_CLI_TESTS` (`16` = `frps/tests/cli_exit_codes.rs`) and
-`env.FRPC_TINY_CLI_TESTS` (`11` = the tiny run of `frpc/tests/cli_exit_codes.rs`)
-are unchanged, and neither literal counts the N ≥ 2 pin above, which is a unit
-test in `frp-core`.
+three lanes. Nothing was added to or deleted from **those two files** by that
+round, so the guarded counts `env.FRPS_CLI_TESTS` (then `16` =
+`frps/tests/cli_exit_codes.rs`) and `env.FRPC_TINY_CLI_TESTS` (`11` = the tiny
+run of `frpc/tests/cli_exit_codes.rs`) were unchanged by it, and neither literal
+counts the N ≥ 2 pin above, which is a unit test in `frp-core`. **The `frps`
+literal has moved twice since** — to `19` with the typed exit-code pins (#393)
+and to **`26`** with `frps verify` (the `FRPS_CLI_TESTS` value in
+`.github/workflows/ci.yml` is the single home; do not read a count from this
+paragraph).
 
 #### CLI inputs: repeated `-c`, an empty `webServer.addr`, case-insensitive keys
 
@@ -1468,7 +1472,8 @@ credentials → dashboard reports and dials `127.0.0.1:<port>` and no
 `[webServer].addr` is what binds), executed by the
 `Run frps CLI completion tests (merged-config completion order)` step in
 `.github/workflows/ci.yml` (a different target from the guarded
-`cli_exit_codes`, so `env.FRPS_CLI_TESTS` stays `16`; it passes
+`cli_exit_codes`, so the `env.FRPS_CLI_TESTS` literal does not move with it — it
+reads `26` at the `frps verify` head; it passes
 `--features dashboard`, without which the dashboard regression is not covered —
 against a true pre-fix no-dashboard binary that configuration is 3 passed /
 3 failed (of six), with the dashboard shape **passing** because there is no
@@ -2014,7 +2019,7 @@ question: does the first surviving bare word become that command?
 | `frps --enable-prometheus verify -c good.toml`, `frps --disable-log-color verify -c good.toml` | rc 0, same (both are `BoolVarP`) | rc 1, the refusal | rc 0 |
 | `frps --version verify -c good.toml` | rc 0, `syntax is ok` — **no version line**: `showVersion` is read only by the root command's `RunE` (`cmd/frps/root.go:57`), never by `verifyCmd` | rc 1, the refusal | rc 0, no version line |
 | `frps -p <free> verify -c good.toml` | rc 0 — `-p` consumes its port, `verify` is the *next* token and is the first bare word | rc 1, the refusal | rc 0 |
-| `frps --dashboard-tls-mode verify -c good.toml` | **rc 124** (bounded): it *starts the server* (`frps started successfully`). `--dashboard-tls-mode` is registered with `VarP(BoolFuncFlag{…})` (`pkg/config/flags.go:256-258`), **not** `BoolVarP`, so pflag never sets `NoOptDefVal` on it and it consumes `verify` as its value — no bare word survives | rc 1, the refusal | rc 1, `` `verify` is not expected in this context`` — **still divergent**: the hoist correctly declines to move the token (the row above is why), but frp-rs models the flag as a bool, so it has no value slot to put `verify` in. The divider is "Go serves, frp-rs refuses"; the pre-existing `--dashboard-tls-mode` modelling divergence, not a command-resolution one |
+| `frps --dashboard-tls-mode verify -c good.toml` | **rc 143** — the probe's 6 s SIGTERM watchdog killed a server that had **started** (`frps started successfully`; the `timeout`-based rows elsewhere in this file report 124 for the same shape). `--dashboard-tls-mode` is registered with `VarP(BoolFuncFlag{…})` (`pkg/config/flags.go:256-258`), **not** `BoolVarP`, so pflag never sets `NoOptDefVal` on it and it consumes `verify` as its value — no bare word survives | rc 1, the refusal | rc 1, `` `verify` is not expected in this context`` — **still divergent**: the hoist correctly declines to move the token (the row above is why), but frp-rs models the flag as a bool, so it has no value slot to put `verify` in. The divider is "Go serves, frp-rs refuses"; the pre-existing `--dashboard-tls-mode` modelling divergence, not a command-resolution one |
 | `frps --strict-config true verify -c bad.toml` | rc 1 on **stderr**, ``Error: unknown command "true" for "frps"`` — pflag's bool does not consume `true`, so `true` is the first bare word and cobra refuses it instead of resolving `verify` | rc 1, `` `verify` is not expected`` | rc 1, `` `verify` is not expected in this context`` — same rc, same (empty) stdout, different message. The hoist declines for the right reason (the first bare word is `true`, not a command); the leftover frp-rs reports is `verify`, because its space-form `--strict-config true` *does* consume `true` (the documented extension below). The `unknown command "…"` message shape is the pre-existing divergence recorded in § `--strict-config` |
 
 The last two rows are the reason the classification is per root command and not a

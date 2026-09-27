@@ -3457,8 +3457,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `cmd/frps/root.go:44-48`, `pkg/config/flags.go:242,246,251`; `frpc` = `version`,
   `strict_config`). The deciding row is `--dashboard-tls-mode`: `VarP(BoolFuncFlag{…})`
   (`pkg/config/flags.go:256-258`), **not** `BoolVarP`, so pflag sets no `NoOptDefVal` and it
-  consumes `verify` — Go then **starts the server** (rc 124 under a 6 s bound) instead of
-  verifying; `frps --tls-only verify -c <valid>` resolves the command on Go (rc **0**, head
+  consumes `verify` — Go then **starts the server** (rc **143**, the probe's 6 s SIGTERM
+  watchdog; the `timeout`-based rows elsewhere in this repo report 124 for the same shape) instead
+  of verifying; `frps --tls-only verify -c <valid>` resolves the command on Go (rc **0**, head
   rc **0**). Both directions are pinned by
   `the_bool_root_flag_sets_are_per_root_command` and
   `frps_hoists_verify_past_its_own_root_flags`.

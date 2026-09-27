@@ -1150,7 +1150,9 @@ impl RootCommand {
     ///   (`pkg/config/flags.go:256-258`), not `BoolVarP`, so pflag never sets
     ///   `NoOptDefVal` on it. Measured: `frps --dashboard-tls-mode verify -c
     ///   <valid cfg>` consumes `verify` as the flag's value, finds no bare word
-    ///   and **starts the server** (rc 124 when bounded) instead of verifying.
+    ///   and **starts the server** instead of verifying (bounded and killed by
+    ///   the probe's watchdog, rc 143 — the `timeout`-based rows elsewhere in
+    ///   this repo report 124 for that shape).
     /// * `frpc` — `version`/`-v` and `strict_config`
     ///   (`cmd/frpc/sub/root.go:52-53`).
     fn bool_root_flags(self) -> &'static [&'static str] {
@@ -1277,7 +1279,8 @@ fn is_known_subcommand(s: &str, root: RootCommand) -> bool {
 /// `frps --tls-only verify -c <valid cfg>` resolves `verify` (rc 0), so
 /// `--tls-only` must **not** consume, while
 /// `frps --dashboard-tls-mode verify -c <valid cfg>` consumes `verify` as the
-/// flag's value and starts the server (rc 124 when bounded), so that one must.
+/// flag's value and starts the server (bounded and killed by the probe's watchdog, rc 143), so that
+/// one must.
 fn consumes_value(s: &OsStr, root: RootCommand) -> bool {
     let Some(s) = s.to_str() else { return false };
     if s.contains('=') {
@@ -1380,7 +1383,7 @@ fn consumes_value(s: &OsStr, root: RootCommand) -> bool {
 ///   flag that is *not* a pflag bool (`VarP(BoolFuncFlag{…})`,
 ///   `pkg/config/flags.go:256-258`): `verify` becomes the flag's **value**, no
 ///   bare word survives, and Go runs the root command instead — measured, it
-///   starts the server (`frps started successfully`, rc 124 when bounded). The
+///   starts the server (`frps started successfully`, killed by the 6 s probe watchdog at rc 143). The
 ///   exemption list must therefore leave this name consuming.
 /// * `frps --strict-config true verify -c cfg.toml` — the space form: pflag's
 ///   bool does not consume `true`, `true` is the first bare word, and Go
@@ -4995,7 +4998,7 @@ mod hoist_tests {
     /// (`pkg/config/flags.go:256-258`), which never sets `NoOptDefVal`.
     /// Measured: `frps --dashboard-tls-mode verify -c <valid cfg>` consumes
     /// `verify` as the flag's value, finds no bare word and **starts the
-    /// server** (rc 124 under a 6 s bound) instead of verifying. Treating it as
+    /// server** (killed by the 6 s probe watchdog at rc 143) instead of verifying. Treating it as
     /// a bool here would hoist `verify` out of that argv and turn a running
     /// server into a verify run.
     #[test]
