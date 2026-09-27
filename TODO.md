@@ -1982,7 +1982,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `config_dir_refusals_exit_2_where_go_exits_0` (the divergence, pinned),
     `unresolvable_token_source_exits_3_where_go_exits_1` (the `EXIT_AUTH` pin: Go 1,
     frp-rs 3), `malformed_store_file_exits_4_where_go_exits_1` (the `EXIT_BIND` pin: Go 1,
-    frp-rs 4), plus `tiny::tiny_bad_config_exits_1_like_go` and
+    frp-rs 4; **renamed** by the later typed-classification change to
+    `malformed_store_file_exits_4_regardless_of_the_file_name` — the same pin plus the two-name
+    flip control; the name in this line is the one this item landed with), plus
+    `tiny::tiny_bad_config_exits_1_like_go` and
     `tiny::tiny_verify_bad_config_exits_1_like_go` under `--features tiny`; and
     `frps/tests/cli_exit_codes.rs` — `bad_config_exits_1_and_names_the_unknown_field`,
     `missing_config_exits_1`, `good_config_starts_and_exits_0_on_sigterm`,
@@ -3327,7 +3330,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   * **`EXIT_BIND`/4 is the construction fallback, not a bind error.** `frpc` with `[store] path`
     pointing at a file that is not JSON → frp-rs **4** in 0.25 s, Go **1** in 0.26 s
     (`failed to create store source: … failed to parse JSON: …`). Pinned by
-    `frpc/tests/cli_exit_codes.rs::malformed_store_file_exits_4_where_go_exits_1`.
+    `frpc/tests/cli_exit_codes.rs::malformed_store_file_exits_4_where_go_exits_1` — the name this
+    item landed with; the test is `…_regardless_of_the_file_name` at the head (same pin, both
+    names).
   * A bind conflict is **not** one of these paths: `frps` on an occupied `bindPort` (with
     `auth.token` set) exits **1** on both sides — frp-rs binds inside `service.run()`, so the
     `EXIT_BIND` arm is not reached by a port conflict.
@@ -3419,7 +3424,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   The mismatch is not the code: it is that frp-rs's own two runs disagree about the *same* failure
   class. The same coupling applies to an OIDC discovery URL ending in `/authz` (3) versus `/zzz`
   (4), per the adversarial review.
-  **Pinning gap, stated deliberately:** `frpc/tests/cli_exit_codes.rs::malformed_store_file_exits_4_where_go_exits_1`
+  **Pinning gap, stated deliberately (test since renamed to
+  `…_regardless_of_the_file_name`):** `frpc/tests/cli_exit_codes.rs::malformed_store_file_exits_4_where_go_exits_1`
   uses `badstore.json` — an auth-free name — so it pins the 4 path and *cannot* catch this flip.
   A test for the flip would have to assert both codes for one failure class, which would pin the
   wrong behaviour rather than fix it.
@@ -3457,13 +3463,40 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   **Corrected from the item's own text**: the daemon site was `frpc/src/main.rs:583` in the
   frame the item was written in; at `d0f9ec5` it is `:592` (`run_normal`) and `:731`
   (`run_single_proxy`), and the frps arm is `:228`.
-  **Not shown by this probe:** the OIDC `/authz` vs `/zzz` half. Measured *after* the change with
-  a mock discovery endpoint serving a `jwks_uri`, frp-rs exits **3** for either issuer path; the
-  *pre-change* flip on that path was not reproduced, because the mock made Go panic before frp-rs's
-  old behaviour could be observed in the same run. The flip evidence is the `[store]` pair above.
+  **The OIDC half, re-measured and corrected (it is observable, on the client, with no mock, and
+  my earlier "not shown" note here was wrong).** The failing reasoning was that Go and frp-rs were
+  treated as one observation — they are separate processes, and the probe had been on **`frps`**,
+  where the flip was never possible in the first place. Measured with one fresh config and one
+  fresh closed port per row, rc read directly from the child:
+  * **`frpc`** `[auth] method = "oidc"`, `clientID`/`clientSecret` set, **no**
+    `oidc.tokenEndpointURL` → `OidcClient::new` fetches `<issuer>/.well-known/openid-configuration`
+    and the error embeds that URL (`frp-core/src/auth.rs:1232-1247`). Base `d0f9ec5`: an issuer
+    path containing `auth` → **3**; the auth-free paths `zzz`, `plain`, `nope`, `x` → **4** (five
+    paths, four runs each, same rc every time). Head: **3** for every path. A missing
+    `oidc.trustedCaFile` is the same family (base **4** at an auth-free path, head **3**).
+  * **`frps` changes no code and never did**: every reachable server construction failure already
+    carried `auth`/`token` in its message (the OIDC dial failure through the
+    `Cannot start frps with OIDC auth: …` wrapper, the startup refusals through `check_startup`'s
+    `[auth]` text), so base **and** head are **3** for `/authz`, `/zzz`, a missing `tokenSource`,
+    an empty token, a missing OIDC CA file, an empty issuer and an empty audience — `EXIT_BIND`/4
+    is **unreachable on `frps`**.
+  * **Probe confound, recorded so it is not repeated:** the claim is about the *message*, and the
+    message does not contain the config path, so the config's own **directory name** must be held
+    fixed across the arms being compared. An earlier probe used `mktemp -d` per run, whose random
+    suffix can spell `auth`; two nominally identical arms then disagreed and produced two wrong
+    readings. Isolated directly: with the issuer path held at `/zzz`, an auth-bearing and an
+    auth-free config directory both give base **4** / head **3** — the directory name is not what
+    the classifier read; the URL is.
+  Pinned by `frpc/tests/cli_exit_codes.rs::oidc_construction_failure_exits_3_whatever_the_issuer_path`
+  (two auth-free issuer paths, both 3), `#[cfg(feature = "full")]` because `oidc` is not in `tiny`.
+  It is mutation-checked: reinstating `to_string().contains("auth")` in `frpc`'s arm fails it with
+  `left: Some(4)`, `right: Some(3)` on the `zzz` arm.
   **Pinning gap closed, not argued away:** the old test used `badstore.json` and could not catch
-  the flip; the new one uses `authstore.json` *and* `plainstore.json`, and neither path contains
-  `token`, so moving the auth-bearing arm to 3 can only come from a text match on `auth`.
+  the flip; the new store test uses `authstore.json` *and* `plainstore.json`, and neither path
+  contains `token`, so moving the auth-bearing arm to 3 can only come from a text match on `auth`.
+  **Where the guard is weak, stated:** on `frps` no test can distinguish the typed arm from a text
+  match, because every reachable frps construction message contains `auth`/`token` — a substring
+  mutant in `frps/src/main.rs` passes all 19 of that file's tests (verified by attempting it).
 
 ---
 
