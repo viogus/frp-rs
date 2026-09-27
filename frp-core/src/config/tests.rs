@@ -6853,6 +6853,94 @@ fn test_server_bind_port_zero_maps_to_default_in_complete() {
     assert_eq!(cfg.bind_port, 7000);
 }
 
+/// `bind_addr`: an explicit empty string is filled to `0.0.0.0`, matching Go's
+/// `c.BindAddr = util.EmptyOr(c.BindAddr, "0.0.0.0")`
+/// (`pkg/config/v1/server.go:110`, which runs before the `ProxyBindAddr`
+/// inheritance at `:112-114` and before `BindPort` at `:111`).
+///
+/// Measured on Go v0.71.0 and frp-rs (base `80199f4`) with `bindAddr: ""` +
+/// `bindPort: 19815`, credentials set, `-c <file>`: Go stdout
+/// `frps tcp listen on 0.0.0.0:19815`, `lsof -nP -iTCP:19815 -sTCP:LISTEN`
+/// → `TCP *:19815 (LISTEN)`; frp-rs (before) logged `frps starting on :19815`
+/// then `frps error: failed to lookup address information...` and exited 1 with
+/// nothing listening. The bound address is pinned end-to-end by the spawn test
+/// `cli_empty_bind_addr_binds_wildcard` in `frps/tests/cli_completion.rs`.
+#[test]
+fn server_bind_addr_empty_is_completed_to_wildcard() {
+    let mut cfg: ServerConfig =
+        serde_json::from_value(serde_json::json!({ "bindPort": 19815 })).unwrap();
+    assert_eq!(cfg.bind_addr, "0.0.0.0", "serde default for an ABSENT key");
+    cfg.bind_addr = String::new();
+    cfg.complete();
+    assert_eq!(cfg.bind_addr, "0.0.0.0");
+
+    // The completion does not look at the port (Go fills it unconditionally at
+    // `:110`, before `BindPort`'s own EmptyOr), so an empty address with an
+    // explicitly zero port is filled the same way.
+    let mut cfg: ServerConfig =
+        serde_json::from_value(serde_json::json!({ "bindPort": 0 })).unwrap();
+    cfg.bind_addr = String::new();
+    assert_eq!(cfg.bind_port, 0);
+    cfg.complete();
+    assert_eq!(cfg.bind_addr, "0.0.0.0");
+    assert_eq!(cfg.bind_port, 7000);
+
+    // Every explicit non-empty address passes through verbatim.
+    for addr in ["127.0.0.1", "::", "10.1.2.3"] {
+        let mut cfg: ServerConfig =
+            serde_json::from_value(serde_json::json!({ "bindAddr": addr, "bindPort": 19815 }))
+                .unwrap();
+        assert_eq!(cfg.bind_addr, addr, "deserialization must not rewrite it");
+        cfg.complete();
+        assert_eq!(cfg.bind_addr, addr, "bindAddr = {addr:?} must pass through");
+    }
+
+    // Go order: the `ProxyBindAddr` inheritance sees the filled address, so an
+    // empty `proxyBindAddr` inherits `0.0.0.0`, not `""`.
+    let mut cfg: ServerConfig =
+        serde_json::from_value(serde_json::json!({ "bindPort": 19815 })).unwrap();
+    cfg.bind_addr = String::new();
+    cfg.proxy_bind_addr = String::new();
+    cfg.complete();
+    assert_eq!(cfg.bind_addr, "0.0.0.0");
+    assert_eq!(cfg.proxy_bind_addr, "0.0.0.0");
+}
+
+/// **Call-order pin for the CLI override path.** `frps` overlays CLI flag values
+/// onto the file config and must complete the *merged* result, as Go does
+/// (`cmd/frps/root.go:97-99`: flags are bound onto the struct and
+/// `ServerConfig.Complete()` runs afterwards). Completing the file first and
+/// overlaying the flags afterwards loses the completion for any flag whose
+/// value is empty — the shape this test pins, since that ordering is what made
+/// an empty `--dashboard-addr ""` reach the dashboard as `:<port>` (measured:
+/// `Dashboard web UI starting on :<port>` + `failed to lookup address
+/// information`, no listener on the dashboard port).
+#[test]
+fn server_completion_must_run_on_the_merged_cli_config() {
+    // What the file holds: an empty addr in each of the two completion inputs
+    // and no bindAddr, then the flags that reach the same values.
+    let mut cfg: ServerConfig =
+        serde_json::from_value(serde_json::json!({ "bindPort": 19817 })).unwrap();
+    cfg.bind_addr = String::new();
+    cfg.web_server.addr = String::new();
+    cfg.web_server.port = 19818;
+
+    // The buggy order: complete, then write the flag values (all empty).
+    let mut completed_first = cfg.clone();
+    completed_first.complete();
+    completed_first.bind_addr = String::new();
+    completed_first.web_server.addr = String::new();
+    assert_eq!(
+        completed_first.web_server.addr, "",
+        "completing before the override leaves the override value uncompleted"
+    );
+
+    // The Go order: overlay, then complete.
+    cfg.complete();
+    assert_eq!(cfg.bind_addr, "0.0.0.0");
+    assert_eq!(cfg.web_server.addr, "127.0.0.1");
+}
+
 /// The **server** side of the empty `webServer.addr` story, now Go parity. Go's
 /// `ServerConfig.Complete()` (`pkg/config/v1/server.go:101-126`) runs
 /// `WebServer.Complete()` → `Addr = util.EmptyOr(Addr, "127.0.0.1")`
