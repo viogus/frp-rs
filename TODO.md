@@ -2881,7 +2881,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   * `frps -c -x` → Go rc 1 `open -x: no such file or directory`; frp-rs rc 1 `` `-c` requires an
     argument `FILE`, got a flag `-x`, try `-c=-x` to use it as an argument ``.
   * `frps verify -c --strict-config=false` → Go rc 1 `open --strict-config=false: no such file or
-    directory` (Go has `frps verify`, frp-rs does not — its own item below); frp-rs rc 1
+    directory` (Go has `frps verify`; frp-rs did not at this head — its own item below, **now
+    closed**, and the flip this row predicted is in that item's Done block); frp-rs rc 1
     `` `-c` requires an argument `FILE` `` because the `-c` failure is reported before the
     unknown-command one.
   * A control that is a *different* divergence: `frps --config-dir --strict-config=false` → Go rc 1
@@ -3391,7 +3392,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `tiny` lane's literal stayed **11**.
   **Least sure:** the rejected-login row is the one evidence row taken from the item rather than
   re-measured at this head.
-- [ ] **Go has `frps verify`, frp-rs has no `frps verify` at all.** Measured on Go v0.71.0 and the
+- [x] **Go has `frps verify`, frp-rs has no `frps verify` at all.** Measured on Go v0.71.0 and the
   frp-rs debug binary: `frps verify -c goodfrps.toml` → Go rc **0**, stdout `frps: the
   configuration file goodfrps.toml syntax is ok`; `frps verify -c badportfrps.toml` → Go rc **1**
   with the parse error. frp-rs on both: `Error: \`verify\` is not expected in this context`, rc
@@ -3411,6 +3412,83 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   tripwire working as designed, not a regression: update the test (and the row in
   `docs/developing.md` § CLI inputs) to the new error at the same time, and do not delete the test to
   make it pass.
+  **Done (head `ed3c1f8`, 2026-09-27): `frps verify` exists, and the tripwire fired exactly as this
+  item predicted — the test was re-pointed, not deleted.** `frps_verify_cmd`
+  (`frp-core/src/cli.rs`) is Go's `verifyCmd` shape: `frps_build` parses the root surface and only
+  the two fields `verifyCmd` reads are kept (`cmd/frps/verify.go:36,40`), with `-c` as
+  `config_arg` (pflag last-wins) and `--config-dir` refused — it is an frp-rs-only extension, and
+  accepting it would make an argv Go rejects (`unknown flag: --config-dir`, rc 1) exit 0. The
+  loader is `load_server_config`, the same parse-and-validate path the run path uses.
+  **Measured on Go v0.71.0 darwin/arm64 and the frp-rs debug binary, one fresh config and one fresh
+  free port per row, stdout/stderr in separate files, rc read **directly** from the child, every
+  child bounded (6 s) and reaped, `pgrep -x frps` = 0 at the end:**
+  * `frps verify -c <valid>` → Go rc **0** stdout `frps: the configuration file <p> syntax is ok`,
+    stderr 0 B; base rc **1** `` `verify` is not expected in this context ``; head rc **0**, the
+    same line, stderr 0 B.
+  * `frps verify -c <missing>` → Go rc **1** stdout `open <p>: no such file or directory`;
+    head rc **1** stdout `<p>: failed to read config file: No such file or directory (os error 2)`.
+  * `frps verify -c <unknown key>` → Go rc **1** `json: unknown field "notAKnownFrpKey"`; head
+    rc **1** `unknown field "notAKnownFrpKey" in config file <p>`.
+  * `frps verify -c <bindPort = "not-a-port">` → Go rc **1** `field "bindPort": cannot unmarshal
+    string into int`; head rc **1** `<p>: config validation error: invalid type: string
+    "not-a-port", expected u16`.
+  * `frps verify` (no `-c`) → Go rc **0** `frps: the configuration file is not specified` (frps's
+    `-c` default is the empty string, `cmd/frps/root.go:44`; `verifyCmd` returns nil at `:36-39`);
+    head rc **0**, same line.
+  * `--strict-config=false` in **every** flag order Go accepts — `frps verify -c <bad>
+    --strict-config=false`, `frps verify --strict-config=false -c <bad>`,
+    `frps --strict-config=false verify -c <bad>`, `frps --strict_config=false verify -c <bad>` →
+    Go rc **0** (`syntax is ok`) and head rc **0** with the same line; the bare, `=true` and space
+    spellings keep strict on (the space form is the documented extension and warns on stderr, Go
+    rc 1 / head rc **1** with the same verdict).
+  * Accepted-and-ignored root flags: `frps verify --bind-port <free> -c <valid>`,
+    `frps verify --allow-unsafe X --version -c <valid>` → Go rc **0** and head rc **0** with the
+    verify output and **no** version line (`showVersion` is read only by the root command's `RunE`,
+    `cmd/frps/root.go:57`).
+  * `frps verify -c <valid> -c <valid2>` → Go rc **0** naming `<valid2>` (pflag last-wins on the
+    persistent `-c`); head rc **0** naming `<valid2>`.
+  **The false premise, corrected and acted on.** The comment at the `parse_frps_args` call site said
+  "Go's `frps` declares no subcommands, so no hoist runs on this binary and its behaviour is
+  byte-identical to before" — false (`frps --help` lists `verify`, `completion` and `help`, and the
+  measured `unknown command "true" for "frps"` is cobra's `Find` running). The hoist now runs on
+  **both** roots through a `RootCommand` that carries the two facts `stripFlags`/`Find` read:
+  subcommands (`frps` = ["verify"]) and pflag **bools** (`frps` = `version`,
+  `strict_config`, `enable_prometheus`, `disable_log_color`, `tls_only` —
+  `cmd/frps/root.go:44-48`, `pkg/config/flags.go:242,246,251`; `frpc` = `version`,
+  `strict_config`). The deciding row is `--dashboard-tls-mode`: `VarP(BoolFuncFlag{…})`
+  (`pkg/config/flags.go:256-258`), **not** `BoolVarP`, so pflag sets no `NoOptDefVal` and it
+  consumes `verify` — Go then **starts the server** (rc 124 under a 6 s bound) instead of
+  verifying; `frps --tls-only verify -c <valid>` resolves the command on Go (rc **0**, head
+  rc **0**). Both directions are pinned by
+  `the_bool_root_flag_sets_are_per_root_command` and
+  `frps_hoists_verify_past_its_own_root_flags`.
+  **The tripwire, re-pointed.** `verify_subcommand_is_now_the_first_error_for_a_dash_config_value`
+  became `verify_subcommand_resolves_so_the_dash_config_value_is_the_first_error`
+  (`frps/tests/cli_exit_codes.rs`): for `frps verify -c --strict-config=false` it now pins rc **1**,
+  **stdout** `--strict-config=false: failed to read config file: …` — Go rc **1** stdout
+  `open --strict-config=false: no such file or directory`, i.e. the config read is the first error
+  and the argv is no longer refused for the bare word `verify`. The matching
+  `docs/developing.md` § CLI inputs row moved in the same commit, as did the "n/a — frp-rs `frps`
+  has no `verify` subcommand" row in § `--strict-config`.
+  **Guard interaction:** `frps/tests/cli_exit_codes.rs` is the guarded file, so
+  `env.FRPS_CLI_TESTS` (`.github/workflows/ci.yml`) moved **19 → 26** in the same commit — seven
+  new pins plus the re-point (a re-point is not an added test). `-- --list` reads **26 tests,
+  0 benchmarks**; the lane's own guard logic was driven locally with 26 (`ok: 26 tests listed
+  (expected 26), 0 failed`), with the stale 19 (fails closed: "lists 26 tests … move the single
+  env.FRPS_CLI_TESTS value … from 19 to 26") and with 27 (fails closed with the DECREASED-direction
+  message). `FRPC_TINY_CLI_TESTS` stays **11** (re-measured).
+  **Three things this does not claim.** (1) The `--allow-unsafe`/`TokenSourceExec` gate is not run:
+  Go's verify does run its post-load `ValidateServerConfig`
+  (`pkg/config/v1/validation/validator.go:22-27` via `auth.go:34-35`, reached from
+  `cmd/frps/verify.go:46-48`), so `frps verify -c <exec tokenSource>` is Go rc **1**
+  (`unsafe feature "TokenSourceExec" is not enabled …`) and head rc **0** — the same pre-existing
+  divergence `frpc verify` has, left alone so the two verifies keep agreeing. (2) Trailing
+  positionals: Go's `verifyCmd` sets no `Args` validator, so `frps verify -c <valid> junk` is Go
+  rc **0** and head rc **1** — the same divergence `frpc verify -c <valid> junk` has (measured,
+  Go 0 / frp-rs 1). (3) The run path's `frps -c a.toml -c b.toml` has no last-wins either before or
+  after this (`svr_config`, not `config_arg`); only the verify subcommand takes pflag's last-wins.
+  Head sha `ed3c1f8`; carriers: `CHANGELOG.md`, `docs/developing.md` § CLI inputs (three corrected
+  rows, a new `frps` hoist table and a new `#### frps verify (Go's verifyCmd)` section).
 - [x] **The `3`-vs-`4` exit code is chosen by a substring match on the formatted error, so the
   *same* failure exits differently depending on a path or URL inside it.** `is_token_error`
   (`frp-core/src/logging.rs:474`) is `msg.contains("token") || msg.contains("auth")`, and the
