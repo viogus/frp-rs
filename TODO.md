@@ -2554,13 +2554,13 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     split left this lane on the completing `load_server_config`, but the fill itself changes it):
     before **rc 0 with nothing bound**, now `*:19881` listening. Not "silent": the pre-fix run did
     emit `ERROR frps: frps service error for config file [...]: failed to lookup address
-    information` on stdout — the defect is that the **exit code was 0**. No byte total is quoted for
-    this or for the log-shape rows below: the config path appears twice in that line, so the total is
-    a function of the harness's path length (the same shape measured 1489 / 1540 / 1654 B under three
-    different path lengths). With the path held fixed, consecutive pre-fix runs are byte-identical —
-    which is what makes "the code emits this line" the reproducible claim, and any cross-harness
-    total difference a path artifact rather than a code difference
-    for a service that never bound. Go has no `frps --config-dir`
+    information` on stdout — the defect is that the **exit code was 0** for a service that never
+    bound. No byte total is quoted for this or for the log-shape rows below: the config path
+    appears twice in that line, so the total is a function of the harness's path length (the same
+    shape measured 1489 / 1540 / 1654 B under three different path lengths). With the path held
+    fixed, consecutive pre-fix runs are byte-identical — which is what makes "the code emits this
+    line" the reproducible claim, and any cross-harness total difference a path artifact rather
+    than a code difference. Go has no `frps --config-dir`
     (`Error: unknown flag: --config-dir`, rc 1), so the analogue is Go's `-c` lane, which binds
     `0.0.0.0` for the same file.
   * Absent-flag controls: `--dashboard-addr` absent keeps the file's `127.0.0.1:19802` (Go's
