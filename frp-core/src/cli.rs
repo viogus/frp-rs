@@ -1094,14 +1094,36 @@ fn expand_bool_short_value_form(argv: Vec<OsString>) -> Vec<OsString> {
 /// [`claims_the_next_token`]. `-v` is deliberately absent — Go registers it as a
 /// pflag **bool**, so it never needs an argument.
 ///
-/// The root command's value-taking shorts — `frpc`'s run path (which is the root
-/// parser) and `frps`'s root both take `-c`, `-p`, `-t`; only `frpc`'s run path
-/// takes `-L`.
-const VALUE_TAKING_SHORTS_ROOT: [char; 4] = ['c', 'p', 't', 'L'];
+/// `frpc`'s root — which is the run path — takes `-c`, `-p` and `-t` from the
+/// shared list below, **plus `-L`**: frp-rs's own alias for `--log-level`
+/// (`frp-core/src/cli.rs`, the `run_mode` parser). Go has no `-L` at all
+/// (`log_level` is registered with an empty shorthand, `pkg/config/flags.go:161`),
+/// so Go's refusal there is `unknown shorthand flag: 'L' in -L`.
+const VALUE_TAKING_SHORTS_FRPC_ROOT: [char; 4] = ['c', 'p', 't', 'L'];
 
-/// The subcommand set: `-c` (persistent on both binaries) and `-p`/`-t` for the
-/// `frps verify` and `frpc` proxy surfaces. `-L` is deliberately absent.
+/// `frps`'s root takes `-c`, `-p` (`bind_port`, `pkg/config/flags.go:231`) and
+/// `-t` (`token`, `:247`) and **no `-L`**: Go registers `log_level` with an empty
+/// shorthand (`:244`) and frp-rs's `svr_log` gives `log-level` no short either.
+/// The two roots therefore need **separate** sets — sharing frpc's made
+/// `frps -hL` print a `flag needs an argument: 'L' in -L` for a short frps does
+/// not register, which is exactly the fabricated line this constant exists to
+/// avoid on the subcommand set.
+const VALUE_TAKING_SHORTS_FRPS_ROOT: [char; 3] = ['c', 'p', 't'];
+
+/// Every **subcommand** of both binaries: `-c` is persistent on both, and `-p` /
+/// `-t` cover the `frps verify` and `frpc` proxy surfaces. `-L` is absent here on
+/// both binaries, so `frpc status -hL`, `frpc tcp -hL` and `frps verify -hL` get
+/// bpaf's own reading rather than a missing-argument line for a short those
+/// parsers do not have.
 const VALUE_TAKING_SHORTS_SUBCOMMAND: [char; 3] = ['c', 'p', 't'];
+
+/// The root set for a binary: the two roots are **not** the same list.
+fn value_taking_root_shorts(root: RootCommand) -> &'static [char] {
+    match root {
+        RootCommand::Frpc => &VALUE_TAKING_SHORTS_FRPC_ROOT,
+        RootCommand::Frps => &VALUE_TAKING_SHORTS_FRPS_ROOT,
+    }
+}
 
 /// Which value-taking short set a pass uses: the root command's (a bare `frpc`
 /// invocation, which is the run path and *does* have `-L`, or `frps`'s root) or a
@@ -1124,7 +1146,7 @@ impl ShortFlagContext {
             value_taking: if on_subcommand {
                 &VALUE_TAKING_SHORTS_SUBCOMMAND
             } else {
-                &VALUE_TAKING_SHORTS_ROOT
+                value_taking_root_shorts(root)
             },
         }
     }
@@ -1141,7 +1163,7 @@ impl ShortFlagContext {
             value_taking: if on_subcommand {
                 &VALUE_TAKING_SHORTS_SUBCOMMAND
             } else {
-                &VALUE_TAKING_SHORTS_ROOT
+                value_taking_root_shorts(root)
             },
         }
     }
@@ -1312,10 +1334,21 @@ fn attach_flag_shaped_values(argv: Vec<OsString>, root: RootCommand) -> Vec<OsSt
 /// `go_bool_flag!` family, whose value branch is `.adjacent()`, so a separate
 /// token is never their value and attaching one makes the bool parser refuse it.
 ///
-/// **Scope, stated rather than implied:** this is a curated list. A value-taking
-/// long flag added later that is missing here simply is not attached, which
-/// leaves bpaf's own refusal in place — a divergence from pflag, not a fabricated
-/// error, and the unit test below pins the members the measured rows use.
+/// **Scope, stated rather than implied:** this is a curated list, derived
+/// mechanically from this file's `long("…") … .argument` chains (both spellings
+/// in the chain are taken, whatever order the `.long()`/`.short()`/`.help()`
+/// calls come in — `svr_bind` puts `.short('p')` before `.long("bind_port")`,
+/// which is how `--bind-port` was missed at first). A name **frp-rs does not
+/// register** is deliberately absent even when Go accepts it: Go normalises `_`
+/// to `-` (`config.WordSepNormalizeFunc`) so `frps verify --bind-port …` is a
+/// real flag there, while frp-rs registers only the underscore spelling in some
+/// places — and attaching a value to an unknown name is exactly the round-3
+/// regression, so the absence is the safe side. `frps verify --bind-port
+/// --help=false -c CFG` is rc 1 on both trees and `--bind-port 7000 verify -c
+/// CFG` is rc 0 on both (measured). A value-taking long flag added later that is
+/// missing here is simply not attached, which leaves bpaf's own refusal in place
+/// — a divergence from pflag, not a fabricated error. The unit test below pins
+/// the members the measured rows use and every excluded bool, in both directions.
 const VALUE_TAKING_LONG_FLAGS: &[&str] = &[
     "admin-addr",
     "admin-port",
@@ -1879,8 +1912,9 @@ fn prepared_cli_argv(rest: &[OsString], root: RootCommand) -> Vec<OsString> {
     // The expansion runs **first**: it is the pass that knows a `--help=<bool>`
     // token can be another flag's value, so by the time the refusal walks the
     // result, `frpc -hc --help=false status` still has a token after the cluster
-    // and is left alone (Go: root help, rc 0 — measured), while `frpc -hc` is
-    // last after the hoist and is the argv pflag refuses.
+    // and is left alone (measured: Go prints **`status`'s** help with rc 0 —
+    // 627 B — and the base head agreed at 1604 B), while `frpc -hc` is last after
+    // the hoist and is the argv pflag refuses.
     let expanded = expand_help_bool_value_form(hoisted, root);
     reject_pflag_shorthand_cluster_that_needs_a_value(&expanded, root);
     expanded
@@ -5508,9 +5542,10 @@ mod hoist_tests {
     #[test]
     fn a_help_token_in_a_value_position_is_not_a_request() {
         // `frpc -hc --help=false status` — the cluster's `c` takes the token, so
-        // Go answers with root help and rc 0 (measured, 1370 B) and the base head
-        // agreed (2405 B of bpaf root usage). Stripping it left `-hc` dangling
-        // and refused an argv both trees parse.
+        // Go answers with **`status`'s** help and rc 0 (measured: 627 B,
+        // `Overview of all proxies status`) and the base head agreed at 1604 B of
+        // bpaf usage. Stripping the token left `-hc` dangling and refused an argv
+        // both trees parse.
         assert_eq!(
             prepared(&["-hc", "--help=false", "status"]),
             ["status", "-hc", "--help=false"]
@@ -5582,8 +5617,8 @@ mod hoist_tests {
             // it (Go has no `-L` at all: `unknown shorthand flag: 'L' in -L`,
             // rc 1 — the message differs, the rc and stream agree).
             (vec!["-hL"], Some('L')),
-            // The subcommands and `verify` do **not** have `-L` in frp-rs, so no
-            // fabricated `flag needs an argument: 'L'` line there.
+            // The subcommands of **both** binaries do not have `-L` in frp-rs, so
+            // no fabricated `flag needs an argument: 'L'` line there.
             (vec!["status", "-hL"], None),
             (vec!["tcp", "-hL"], None),
             (vec!["verify", "-hL"], None),
@@ -5617,6 +5652,39 @@ mod hoist_tests {
                 "{argv:?} reaches the walk as {items:?} and must be {expected:?}"
             );
         }
+    }
+
+    /// M1: the two **roots** do not share a short set. `-L` is `frpc`'s run-path
+    /// alias for `--log-level`; `frps`'s root has no such short in frp-rs *or* in
+    /// Go (`log_level` is registered with an empty shorthand,
+    /// `pkg/config/flags.go:244`). Sharing the sets made `frps -hL` print a
+    /// fabricated `flag needs an argument: 'L' in -L` where the base and Go are
+    /// rc 1 with bpaf's own refusal (measured: base == head, stderr 45 B).
+    #[test]
+    fn the_root_shorts_are_per_binary() {
+        assert!(value_taking_root_shorts(RootCommand::Frpc).contains(&'L'));
+        assert!(!value_taking_root_shorts(RootCommand::Frps).contains(&'L'));
+        let argv: Vec<OsString> = ["-hL"].iter().map(OsString::from).collect();
+        assert_eq!(
+            walk_argv(
+                &argv,
+                ShortFlagContext::of(&argv, RootCommand::Frpc),
+                RootCommand::Frpc
+            )
+            .needs_argument,
+            Some('L'),
+            "frpc's run path registers -L, so the cluster is reported"
+        );
+        assert_eq!(
+            walk_argv(
+                &argv,
+                ShortFlagContext::of(&argv, RootCommand::Frps),
+                RootCommand::Frps
+            )
+            .needs_argument,
+            None,
+            "frps has no -L, so nothing may be fabricated"
+        );
     }
 
     /// A flag-shaped value is attached to the flag that owns it, because bpaf
