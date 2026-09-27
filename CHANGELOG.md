@@ -490,6 +490,58 @@ User-facing release notes for frp-rs.
   *absent*, so a `POST` body (`{"strict_config": true}`) takes effect where the old handling
   kept the broken value and ignored the body. Malformed escapes without a body are unchanged
   (still a non-strict 200), as is every other endpoint.
+- **The exit code on a service-construction failure no longer depends on the
+  error text — two input families change code, in opposite directions.**
+  `frpc`/`frps` used to pick between `EXIT_AUTH`/3 and `EXIT_BIND`/4 with
+  `msg.contains("token") || msg.contains("auth")` over the formatted error, which
+  embeds the config path and any URL from the config. The kind is now a typed
+  value chosen where the constructor raises the error (`frp_core::init_error`).
+  Measured base-vs-head, one fresh config and one fresh closed port per row, rc
+  captured directly from the child:
+  - **`frpc` `[store] path` → a file that is not JSON: 3 → 4** when the path
+    contains `auth` or `token` (it was 3 for `authstore.json` and 4 for
+    `plainstore.json` — the same failure class, two codes). Now 4 for either
+    name.
+  - **`frpc` client-OIDC construction failure: 4 → 3** at an **auth-free** issuer
+    URL. The discovery fetch (only when `oidc.token_endpoint` is unset **and**
+    `oidc.token_source` is unset **and** the issuer is set — `frp-core/src/auth.rs`)
+    embeds the issuer URL in its error, so an issuer path
+    containing `auth` gave 3 and an auth-free one gave 4. Every issuer path is
+    now 3 — e.g. `…/zzz` and `…/plain` were 4 and are now 3, `…/authz` is 3
+    either way. The same family covers a missing `oidc.trustedCaFile`
+    (`OIDC client: failed to read CA cert …`: 4 → 3 at an auth-free path).
+  - **`frps` changes no code at all:** every reachable server construction
+    failure already carried `auth` or `token` in its message, so base and head
+    are 3 for `/authz`, `/zzz`, a missing `tokenSource`, an empty token, a
+    missing OIDC CA file, an empty issuer and an empty audience — **4 was
+    unreachable on `frps`**. The typed arm fixes the text dependency there
+    without moving a code.
+  **Go's behaviour is not one code across all of this**, measured on v0.71.0
+  (darwin/arm64), and it is worth spelling out because both frp-rs codes are
+  extensions either way. On the two **`frpc`** families Go **exits 1**:
+  `failed to create store source: … failed to parse JSON: …` for the `[store]`
+  pair, and `json: unknown field "issuer"` for the client OIDC inputs — Go's
+  *client* OIDC config has no `issuer` key at all. On the **`frps`** rows it does
+  not: an empty `token` with `method = "token"` **does not exit** (it prints
+  `frps started successfully` and keeps running), the two OIDC rows **panic and
+  the runtime exits 2**, and a missing `auth.oidc.trustedCaFile` is not a
+  comparable input — Go's *server* OIDC config has no such key
+  (`json: unknown field "trustedCaFile"`, rc 1). Other inputs
+  keep their codes: `auth.tokenSource` on a missing file is still 3 on both
+  binaries, the empty-token refusal is still 3, and an occupied `bindPort` is
+  still 1 on both sides. There is deliberately **no** `EXIT_AUTH`/`EXIT_BIND`
+  collapse to Go's 1 here — see `docs/developing.md` § CLI exit codes for the
+  argument.
+- **Library API (`frp-core`, `frp-client`, `frp-server`): two breaking changes**
+  on top of the user-visible one above. `frp_core::logging::is_token_error` was
+  `pub` and is **deleted** (it classified a failure by matching `token`/`auth` in
+  a message; use `frp_core::init_error::InitErrorKind` instead). And
+  `Service::new` / `Service::with_unsafe_features` now return
+  `Result<_, frp_core::init_error::ConstructError>` — it was
+  `Box<dyn std::error::Error>` in `frp-client` and `String` in `frp-server`.
+  `ConstructError` implements `Display`/`Error`, so `?`-based callers that only
+  print or propagate keep working; callers that matched on `String` or compared
+  the error text need the `kind()` method.
 
 ### Changed
 - **The space-separated `--strict-config <bool>` extension now prints a warning

@@ -36,10 +36,13 @@
 //! asserted here so the shape cannot drift back silently.
 //!
 //! Two further tests pin the *extension* codes on the client:
-//! `unresolvable_token_source_exits_3_like_frps` (`EXIT_AUTH`/3 — the same
+//! `unresolvable_token_source_exits_3_where_go_exits_1` (`EXIT_AUTH`/3 — the same
 //! input makes Go exit 1, see `docs/developing.md`) and
-//! `malformed_store_file_exits_4_where_go_exits_1` (`EXIT_BIND`/4, which is the
-//! fallback for any construction error whose text lacks `token`/`auth`).
+//! `malformed_store_file_exits_4_regardless_of_the_file_name` (`EXIT_BIND`/4,
+//! the tag for any construction failure that is not an auth one). The second is
+//! also the **flip control**: it runs one failure class under an `auth`-bearing
+//! and an auth-free file name and requires the same code from both, so a
+//! reversion to a text-based classifier fails it (see the test's own docs).
 //!
 //! Gated on `full`: the `frpc` bin carries `required-features = ["full"]`, so
 //! without the gate this file's `CARGO_BIN_EXE_frpc` would fail to compile in
@@ -347,40 +350,127 @@ fn unresolvable_token_source_exits_3_where_go_exits_1() {
 }
 
 /// `EXIT_BIND`/4 is **not** specifically about bind errors: it is the daemons'
-/// fallback for any service-*construction* error whose text lacks `token` or
-/// `auth`. A `[store] path` pointing at a file that is not JSON reaches it
-/// without any port or token being involved.
+/// tag for any service-*construction* failure that is not an auth one. A
+/// `[store] path` pointing at a file that is not JSON reaches it without any
+/// port or token being involved.
 ///
 /// Go frp v0.71.0 exits **1** on the identical config (`failed to create store
 /// source: failed to load existing data: failed to parse JSON: …`), so this is
-/// an frp-rs extension like 3. The `name` of this test is the finding: 4 is the
-/// construction fallback, and `docs/developing.md` now says so.
+/// an frp-rs extension like 3.
+///
+/// **This test is the flip control.** It runs the *same* failure class twice,
+/// changing only the store file's *name*: `authstore.json` (the name supplies an
+/// `auth` substring) and `plainstore.json` (it supplies none). Both must exit 4.
+/// Before the typed classification, `is_token_error`'s
+/// `msg.contains("token") || msg.contains("auth")` matched the first name and
+/// not the second, so the one failure class exited 3 or 4 depending on the file
+/// name — measured on the base commit, and against Go both names exit 1. A
+/// revert to any text-based classifier fails here on the `authstore.json` arm,
+/// which is the whole point of the loop; neither store path contains the
+/// substring `token`, so the *only* thing that can move the `authstore.json` arm
+/// to 3 is a text match on `auth`.
 #[test]
-fn malformed_store_file_exits_4_where_go_exits_1() {
-    let dir = TempDir::new();
-    let store = dir.write("badstore.json", "this is not json\n");
-    let cfg = dir.write(
-        "badstore.toml",
-        &format!("{BASE_CONFIG}[store]\npath = \"{store}\"\n"),
-    );
+fn malformed_store_file_exits_4_regardless_of_the_file_name() {
+    for name in ["authstore.json", "plainstore.json"] {
+        let dir = TempDir::new();
+        let store = dir.write(name, "this is not json\n");
+        let cfg = dir.write(
+            "badstore.toml",
+            &format!("{BASE_CONFIG}[store]\npath = \"{store}\"\n"),
+        );
 
-    let out = run_frpc(&["-c", &cfg]);
+        let out = run_frpc(&["-c", &cfg]);
 
-    assert_eq!(
-        out.status.code(),
-        Some(4),
-        "a malformed [store] file is the frp-rs EXIT_BIND/4 fallback (Go exits 1); \
-         stdout={:?} stderr={:?}",
-        stdout_of(&out),
-        stderr_of(&out),
-    );
-    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
-    assert!(
-        all.contains("badstore.json"),
-        "the refusal must name the store file, got stdout={:?} stderr={:?}",
-        stdout_of(&out),
-        stderr_of(&out),
-    );
+        assert_eq!(
+            out.status.code(),
+            Some(4),
+            "a malformed [store] file is the frp-rs EXIT_BIND/4 fallback whatever it is \
+             called (Go exits 1 on both names); name={name} stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(
+            all.contains(name),
+            "the refusal must name the store file, got stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+    }
+}
+
+/// The client-side OIDC construction failure, pinned on **both sides of the pair
+/// the text classifier disagreed about**: an `auth`-bearing issuer path
+/// (`…/authz`) and auth-free ones (`…/zzz`, `…/plain`). Before the typed
+/// classification `…/authz` exited **3** while `…/zzz` and `…/plain` exited **4**
+/// for the identical failure — measured on the base commit — and all of them must
+/// now be 3.
+///
+/// The three paths are chosen for exactly that reason. The auth-free two contain
+/// neither `auth` nor `token`, so a text classifier scores them 4; `/authz`
+/// contains `auth`, so the same classifier scores it 3. Asserting **only** the
+/// auth-free pair would still pass under a text classifier whose polarity was
+/// inverted, so the array carries the auth-bearing path too and the assertion is
+/// the same for all three. The config directory is `TempDir`'s and never reaches
+/// an assertion. A mutant that reinstates `to_string().contains("auth")` fails
+/// this test on the auth-free arms (measured: `left: Some(4)`, `right: Some(3)`).
+///
+/// An `[auth] method = "oidc"` config with `clientID`/`clientSecret` set and
+/// **no** `oidc.tokenEndpointURL` makes `OidcClient::new` fetch
+/// `<issuer>/.well-known/openid-configuration` (`frp-core/src/auth.rs`);
+/// pointing the issuer at a **closed** port fails that fetch, and the error text
+/// embeds the full discovery URL.
+///
+/// Go frp v0.71.0 has no like-for-like code here: it has no `auth.oidc.issuer`
+/// key on the client at all (measured, `json: unknown field "issuer"`, rc 1) — not
+/// because the client starts. This is an frp-rs extension like the
+/// store/`tokenSource` arms, not a Go comparison.
+///
+/// Gated on `full`: the `oidc` feature is not in `tiny`, so `frpc-tiny` cannot
+/// reach `OidcClient::new` at all and the test would be wrong (not merely
+/// skipped) there.
+#[cfg(feature = "full")]
+#[test]
+fn oidc_construction_failure_exits_3_whatever_the_issuer_path() {
+    fn closed_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let p = l.local_addr().expect("local_addr").port();
+        drop(l);
+        p
+    }
+
+    for path in ["authz", "zzz", "plain"] {
+        let dir = TempDir::new();
+        let issuer = format!("http://127.0.0.1:{}/{}", closed_port(), path);
+        let cfg = dir.write(
+            "oidcc.toml",
+            &format!(
+                "{BASE_CONFIG}[auth]\nmethod = \"oidc\"\n\
+                 [auth.oidc]\nissuer = \"{issuer}\"\naudience = \"x\"\n\
+                 clientID = \"cid\"\nclientSecret = \"csec\"\n"
+            ),
+        );
+
+        let out = run_frpc(&["-c", &cfg]);
+
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "a client OIDC construction failure is InitErrorKind::Auth (3) for every \
+             issuer path — /authz and an auth-free path must not differ; path={path} \
+             issuer={issuer} stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(
+            all.contains("openid-configuration"),
+            "the failure must be the discovery fetch (not a config-validation refusal \
+             before it), got stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+    }
 }
 
 /// A Go pflag bool takes `--flag=<bool>` as well as the bare `--flag`, and the

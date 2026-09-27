@@ -114,7 +114,18 @@ jobs:
     # lane checks would stay green if that file's tests were removed altogether.
     env:
       # frps/tests/cli_exit_codes.rs — "Run frps CLI tests (config-failure exit codes)"
-      FRPS_CLI_TESTS: "16"
+      # 16 → 19 with the typed exit-code classification: +3 server-side pins
+      # (`unresolvable_token_source_exits_3_where_go_exits_1`,
+      # `empty_token_refusal_is_a_hardening_divergence_go_does_not_have`,
+      # `oidc_without_an_issuer_is_refused_with_3_where_go_panics`).
+      # The client file gained one test since (`oidc_construction_failure_exits_3_
+      # whatever_the_issuer_path`), but it is `#[cfg(feature = "full")]`: `oidc` is
+      # not in the `tiny` feature set, so `frpc-tiny` cannot reach
+      # `OidcClient::new` and the test must not compile into this lane. Its store
+      # flip control replaced the single-name store test rather than adding one.
+      # `FRPC_TINY_CLI_TESTS` therefore stays 11, while the `full` lane in
+      # "Run frpc CLI tests" went 9 → 10.
+      FRPS_CLI_TESTS: "19"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
       FRPC_TINY_CLI_TESTS: "11"

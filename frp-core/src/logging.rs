@@ -471,9 +471,14 @@ pub fn build_otel_layer(
     Ok((tracing_opentelemetry::layer().with_tracer(tracer), provider))
 }
 
-pub fn is_token_error(msg: &str) -> bool {
-    msg.contains("token") || msg.contains("auth")
-}
+// `is_token_error(msg) = msg.contains("token") || msg.contains("auth")` used to
+// live here; the daemons called it on `e.to_string()` to pick between
+// `EXIT_AUTH`/3 and `EXIT_BIND`/4, which let a config *path* choose the exit
+// code (`…/authstore.json` → 3, `…/plainstore.json` → 4 for the identical
+// malformed-store failure). Classification is now the typed
+// `frp_core::init_error::InitErrorKind`, attached where the construction error
+// is raised. Do not reintroduce a text classifier here: a message is a
+// user-facing string, not a machine channel.
 
 #[cfg(test)]
 mod tests {

@@ -32,6 +32,7 @@ use tracing::{debug, info, instrument, warn};
 
 use frp_core::auth::{AuthConfig, AuthMethod, OidcClient};
 use frp_core::config::ClientConfig;
+use frp_core::init_error::ConstructError;
 use frp_core::unsafe_features::UnsafeFeatures;
 
 use frp_core::encryption;
@@ -831,19 +832,28 @@ impl Service {
     pub async fn new(
         cfg: ClientConfig,
         config_file: Option<String>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, ConstructError> {
         Self::with_unsafe_features(cfg, config_file, UnsafeFeatures::default()).await
     }
 
     /// Create a new client Service with a custom unsafe features allowlist.
+    ///
+    /// The error is a [`ConstructError`], whose [`ConstructError::kind`] is the
+    /// *only* thing the daemons turn into a process exit code (they never look
+    /// at the message). See `frp-core/src/init_error.rs` for why.
     pub async fn with_unsafe_features(
         mut cfg: ClientConfig,
         config_file: Option<String>,
         unsafe_features: UnsafeFeatures,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, ConstructError> {
         // Load the file-backed store when [store] path is set and overlay its
         // proxies/visitors on the config file entries (Go frp v0.70.1 store
         // source semantics).
+        //
+        // The only non-auth construction failure reachable here, so it takes
+        // the `From<String>` default (`InitErrorKind::Other`); it must not be
+        // tagged `Auth` — the failure class is "the store file cannot be read
+        // or parsed", whatever the path happens to be spelled.
         let store_source = if let Some(ref store_cfg) = cfg.store {
             if store_cfg.path.is_empty() {
                 None
@@ -880,7 +890,7 @@ impl Service {
         // without the `oidc` feature — otherwise it would silently fall through to
         // token auth below. `frpc verify` calls the same helper, so it cannot
         // report valid a config `frpc run` refuses. No-op in an oidc build.
-        refuse_oidc_method_without_feature(cfg.auth.as_ref()).map_err(std::io::Error::other)?;
+        refuse_oidc_method_without_feature(cfg.auth.as_ref()).map_err(ConstructError::auth)?;
 
         // Determine auth method from [auth] section if present, otherwise token
         #[cfg(feature = "oidc")]
@@ -897,24 +907,24 @@ impl Service {
         let auth_method = AuthMethod::Token;
 
         let auth_token_source = cfg.auth.as_ref().and_then(|a| a.token_source.clone());
+        // Every failure below is an *auth* construction failure and is tagged as
+        // one here, at the raise site — the messages happen to contain "auth"
+        // today, but the tag does not depend on that.
         let token = if let Some(ref source) = auth_token_source {
             source
                 .validate()
-                .map_err(|e| format!("invalid auth.tokenSource: {e}"))
-                .map_err(std::io::Error::other)?;
+                .map_err(|e| ConstructError::auth(format!("invalid auth.tokenSource: {e}")))?;
             frp_core::auth::validate_token_source_unsafe(source, &unsafe_features)
-                .map_err(std::io::Error::other)?;
-            source
-                .resolve()
-                .map_err(|e| format!("failed to resolve auth.tokenSource: {e}"))
-                .map_err(std::io::Error::other)?
+                .map_err(ConstructError::auth)?;
+            source.resolve().map_err(|e| {
+                ConstructError::auth(format!("failed to resolve auth.tokenSource: {e}"))
+            })?
         } else {
             // Go frp v0.70.1: a token-source resolution failure is a startup
             // error — no silent empty-token fallback (an empty token on both
             // sides would silently degrade auth to no-auth).
             frp_core::auth::resolve_dynamic_token_checked(&cfg.token, &unsafe_features)
-                .map_err(|e| format!("failed to resolve auth token: {e}"))
-                .map_err(std::io::Error::other)?
+                .map_err(|e| ConstructError::auth(format!("failed to resolve auth token: {e}")))?
         };
         let auth_cfg = AuthConfig {
             method: auth_method.clone(),
@@ -949,10 +959,9 @@ impl Service {
         // Create OIDC client if auth method is OIDC
         #[cfg(feature = "oidc")]
         let oidc_client = if auth_method == AuthMethod::Oidc {
-            let ac = cfg
-                .auth
-                .as_ref()
-                .ok_or("OIDC auth requires [auth] section in config")?;
+            let ac = cfg.auth.as_ref().ok_or_else(|| {
+                ConstructError::auth("OIDC auth requires [auth] section in config")
+            })?;
             // Go frp v0.70.1 compat: auth.oidc.tokenSource (dynamic token
             // source, mutually exclusive with the client-credentials flow).
             // The config validator enforces mutual exclusivity; exec sources
@@ -960,7 +969,7 @@ impl Service {
             let token_source = ac.oidc_token_source.clone();
             if let Some(ref source) = token_source {
                 frp_core::auth::validate_token_source_unsafe(source, &unsafe_features)
-                    .map_err(std::io::Error::other)?;
+                    .map_err(ConstructError::auth)?;
             }
             let client = OidcClient::new(
                 ac.oidc_client_id.clone(),
@@ -976,7 +985,7 @@ impl Service {
                 token_source,
             )
             .await
-            .map_err(|e| format!("OIDC client init failed: {e}"))?;
+            .map_err(|e| ConstructError::auth(format!("OIDC client init failed: {e}")))?;
             info!(endpoint = %client.token_endpoint(), "OIDC client initialized, token endpoint: {}", client.token_endpoint());
             Some(Arc::new(client))
         } else {

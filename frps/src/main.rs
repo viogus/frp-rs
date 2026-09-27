@@ -225,12 +225,11 @@ async fn run(mut cli: FrpsArgs) {
             .await
             .unwrap_or_else(|e| {
                 tracing::error!(error = %e, "frps init error: {}", e);
-                let code = if logging::is_token_error(&e) {
-                    frp_core::EXIT_AUTH
-                } else {
-                    frp_core::EXIT_BIND
-                };
-                process::exit(code);
+                // Typed tag, not a text match: the message embeds the config
+                // path and the OIDC issuer URL, so a substring over it let an
+                // unrelated word choose the code. See
+                // `frp-core/src/init_error.rs`.
+                process::exit(e.kind().exit_code());
             }),
     );
 

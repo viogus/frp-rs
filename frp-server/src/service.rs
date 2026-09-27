@@ -13,6 +13,7 @@ use frp_core::auth::OidcVerifier;
 use frp_core::auth::{AuthConfig, AuthMethod};
 use frp_core::config::ServerConfig;
 use frp_core::format_socket_addr;
+use frp_core::init_error::ConstructError;
 #[cfg(feature = "websocket")]
 use frp_core::mux;
 #[cfg(feature = "tls")]
@@ -171,21 +172,33 @@ pub struct Service {
 
 impl Service {
     /// Create a new Service with default unsafe features (all blocked).
-    pub async fn new(cfg: ServerConfig, config_file: Option<String>) -> Result<Self, String> {
+    pub async fn new(
+        cfg: ServerConfig,
+        config_file: Option<String>,
+    ) -> Result<Self, ConstructError> {
         Self::with_unsafe_features(cfg, config_file, UnsafeFeatures::default()).await
     }
 
     /// Create a new Service with a custom unsafe features allowlist.
     /// Use this when `--allow-unsafe` CLI flag is provided.
+    ///
+    /// The error is a [`ConstructError`], whose [`ConstructError::kind`] is the
+    /// *only* thing the daemon turns into a process exit code (it never looks at
+    /// the message). See `frp-core/src/init_error.rs` for why.
     pub async fn with_unsafe_features(
         cfg: ServerConfig,
         config_file: Option<String>,
         unsafe_features: UnsafeFeatures,
-    ) -> Result<Self, String> {
-        let auth_cfg = build_auth_config(&cfg.auth, &unsafe_features)?;
+    ) -> Result<Self, ConstructError> {
+        // Every failure below is an auth construction failure (the server's
+        // whole pre-run surface is auth: the token source, the token/oidc
+        // startup checks, and the OIDC verifier), so all of them are tagged
+        // explicitly at the raise site rather than left to the `From` default.
+        let auth_cfg =
+            build_auth_config(&cfg.auth, &unsafe_features).map_err(ConstructError::auth)?;
         auth_cfg
             .check_startup()
-            .map_err(|e| format!("security misconfiguration: {e}"))?;
+            .map_err(|e| ConstructError::auth(format!("security misconfiguration: {e}")))?;
 
         #[cfg(feature = "oidc")]
         let oidc_verifier = if auth_cfg.method == AuthMethod::Oidc {
@@ -210,7 +223,9 @@ impl Service {
                 }
                 Err(e) => {
                     error!(error = %e, "OIDC verifier initialization failed: {e}");
-                    return Err(format!("Cannot start frps with OIDC auth: {e}"));
+                    return Err(ConstructError::auth(format!(
+                        "Cannot start frps with OIDC auth: {e}"
+                    )));
                 }
             }
         } else {

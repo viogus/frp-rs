@@ -14,7 +14,7 @@ use frp_core::cli::{
 use frp_core::config::{collect_config_files, load_client_config, ClientConfig, ProxyConfig};
 use frp_core::logging;
 use frp_core::unsafe_features::UnsafeFeatures;
-use frp_core::{EXIT_AUTH, EXIT_BIND, EXIT_CONFIG, EXIT_RUNTIME};
+use frp_core::{EXIT_CONFIG, EXIT_RUNTIME};
 
 use frp_core::base64::encode as base64_encode;
 
@@ -589,11 +589,12 @@ async fn run_normal(mut args: FrpcRunArgs) {
         {
             Ok(svc) => svc,
             Err(e) => {
-                let code = if logging::is_token_error(&e.to_string()) {
-                    EXIT_AUTH
-                } else {
-                    EXIT_BIND
-                };
+                // The exit code comes from the constructor's typed tag, never
+                // from the message: `e.to_string()` embeds the config path and
+                // any URL in it, and a substring test over that text made two
+                // identical failures exit differently (`…/authstore.json` → 3,
+                // `…/plainstore.json` → 4). See `frp-core/src/init_error.rs`.
+                let code = e.kind().exit_code();
                 tracing::error!(error = %e, "frpc init error: {}", e);
                 process::exit(code);
             }
@@ -728,11 +729,8 @@ async fn run_single_proxy(
     let service = match Service::new(cfg, None).await {
         Ok(svc) => svc,
         Err(e) => {
-            let code = if logging::is_token_error(&e.to_string()) {
-                EXIT_AUTH
-            } else {
-                EXIT_BIND
-            };
+            // Typed tag, not a text match — same reason as `run_normal` above.
+            let code = e.kind().exit_code();
             tracing::error!(error = %e, "frpc init error: {}", e);
             process::exit(code);
         }
