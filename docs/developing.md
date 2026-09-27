@@ -2768,41 +2768,60 @@ other bool flag here, so `1`/`0`/`t`/`f`/`T`/`F`/`TRUE`/`FALSE`/`True`/`False`
 are accepted on the `=` spelling.
 
 **Recorded residuals, each measured on Go v0.71.0 / base / head.** The sweep is
-**154 argv** on `frpc` (the original 85 plus the 69 the review round named), **20**
-more on `frps`, **10 `verify` rows** with a valid config on each binary, and **6
-run-path rows** with a hardening-safe config: **34 `frpc` rows moved to Go's `(rc,
-connection count, stdout empty)` and none regressed**, all 10 `verify` rows and
-all 6 `run` rows agree with Go on that signature, and the 29 historical help rows (`--help`, `-h`,
-`--help=true`, every `frpc <sub> --help`/`-h`, `-hc`, `-hcx`, `-hc=x`,
-`-hc --help=false status`, …) are **byte-identical** to the base head. The `frps`
-sweep agrees with Go on `(rc, connection count, stdout empty)` for 15 of 20 rows;
-the five differences are all pre-existing or this item's documented residue:
-`--help=false -c CFG` (the root divergence below), `-h -c`/`-h -L`/`-h -t` (the
-split `-h` family below) and `verify --token --help=false -c CFG` (frp-rs's
-`verify` flag set differs from Go's, an frps-surface row). `frps --help=false
-verify` matches Go exactly (46 B on stdout, rc 0), and every `verify` row measured
-with a valid config — `--token --help=false`, `--bind-addr --help=false`,
-`-t --help=false`, `--log_file --help=false`, `--log-level --help=false`,
-`frpc verify --allow-unsafe --help=false`, `frpc verify --config-dir
---help=false` — matches Go **byte-for-byte** (116 B on stdout, rc 0). The `frpc
-tcp --proxy-name --help=false -c CFG` row is worth stating precisely: the head is
-now **byte-identical to the base's** `frpc tcp --proxy-name=x -c CFG` (rc 1, 0 B
-on stdout, 73 B on stderr), i.e. the help flag is inert; Go *starts* on both, and
-that gap is the pre-existing "frp-rs's single-proxy commands require their own
-flags where Go falls back to the config file" divergence, which the base shows
-with no help flag in argv at all.
+**154 argv** on `frpc` (the original 85 plus the 69 the review round named), plus
+the review-round matrices: **20 `frps` argv**, **10 `verify` rows** with a valid
+config per binary and **6 run-path rows** with a hardening-safe config. Against
+the base head, the `frpc` and `frps` rows together are **183 + 20** argv with
+**0 regressions** and **48 + 10 moved to Go's `(rc, connection count, stdout
+empty)`**; the 29 historical help rows (`--help`, `-h`, `--help=true`, every
+`frpc <sub> --help`/`-h`, `-hc`, `-hcx`, `-hc=x`, `-hc --help=false status`, …)
+are **byte-identical** to the base head.
+
+Scored per surface, since one aggregate hid the frps half in two earlier rounds:
+
+| surface | rows | agree with Go on `(rc, conns, stdout empty)` | residuals |
+|---|---|---|---|
+| `frpc` (all matrices) | 183 | 139 (48 of them moved by this change) | 44, of which **32 are unchanged from the base** |
+| `frps` (20-row matrix) | 20 | **19** (10 moved) | 1: `--help=false -c CFG`, the root divergence below |
+| `frps` `verify` (valid configs) | 10 (incl. 2 `frpc`) | 9 | 1: the run-path row in that fixture, whose `rc 3` is the `EXIT_AUTH` hardening below |
+| `run` rows (hardening-safe configs) | 6 | 3 | 3: all `frpc tcp`, the pre-existing single-proxy flag requirement |
+
+The seven `frps verify` rows measured with a valid config —
+`--token --help=false`, `--bind-addr --help=false`, `-t --help=false`,
+`--log_file --help=false`, `--log-level --help=false`, and the two controls — are
+**byte-identical** to Go (116 B on stdout, rc 0). The two **`frpc verify`** rows
+(`--allow-unsafe --help=false`, `--config-dir --help=false`) match Go on `rc`,
+connection count and stream but **not** on bytes: 147 B against Go's 116, because
+frp-rs prints `Config file <path> is valid` where Go prints `frpc: the
+configuration file <path> syntax is ok`; `--config-dir` is base == head
+(pre-existing). The `frpc tcp --proxy-name --help=false -c CFG` row is worth
+stating precisely: the head is **byte-identical to the base's** `frpc tcp
+--proxy-name=x -c CFG` (rc 1, 0 B on stdout, 73 B on stderr), i.e. the help flag
+is inert; Go *starts* on both, and that gap is the pre-existing "frp-rs's
+single-proxy commands require their own flags where Go falls back to the config
+file" divergence, which the base shows with no help flag in argv at all.
 
 | argv | Go | base | head | what is left |
 |---|---|---|---|---|
 | `--help=false -c cfg` | rc 1 | rc 0, root usage | rc 0, root usage | the pre-existing root divergence above, deliberately unchanged |
 | `--help=0` / `--help=false` / `--help=false notacommand` / `--help=true notacommand` | rc 1 | rc 0 help | rc 0 help | unchanged: no command word, or a word that is not one |
-| `-h -v -c` | rc 1 stderr | rc 0 help | rc 0 help | a value-taking short separated from the help short by a token that is not itself value-taking; bpaf's help short-circuit wins. The attachment pass only pairs a flag with the token **immediately** after it |
+| `-h -v -c` | rc 1 stderr | rc 0 help | rc 0 help | a value-taking short separated from the help short by a token that is not itself value-taking; bpaf's help short-circuit wins. The refusal pairs a bare help flag only with the short **immediately** after it |
 | `-hLinfo` | rc 1 stderr | rc 0 help | rc 0 help | a trailing `-hL<value>` cluster: pflag hands `info` to `-L` and bpaf hands the token to `-h`. `-L` is frp-rs's alias for `--log-level` (`frp-core/src/cli.rs`, the `run_mode` parser's `log_level`) and **not** a Go shorthand — Go registers `log_level` with `StringVarP(..., "", ...)` (`pkg/config/flags.go:161`), so its own refusal is `unknown shorthand flag: 'L' in -L` |
-| `-h -c`, `-h -L`, `-h -t` | rc 1 stderr | rc 0 help | rc 0 help | a **bare** `-h` with a value-taking short after it. pflag's walk does not let the help bool swallow that short (`frpc -h -c status` is rc 1 with the missing-argument line, 637 B), but bpaf reads the `-h` first and prints help. Attaching the pair (`-h=-c`) does **not** help: `-h` is a known short bool to bpaf, so `-h=` is refused as an unknown *long* flag and bpaf's help still wins; and dropping the `-h` broke `frpc -h -c status -c CFG` (which Go answers with `status`'s help, rc 0) in an earlier revision of this fix. Recorded rather than fixed |
-| `-h -c status`, `-h -c status -c CFG` | rc 1 / rc 0 | rc 0 / rc 0 | rc 0 / rc 0 | the same family with a command word: the status command ends up with `["-h", "-c"]` on Go, so rc is 1, while frp-rs's hoist hands `status` to `-c` and prints `status`'s help. Pre-existing, unchanged |
-| `frps -c CFG -t -h`, `frps -t -h`, `frps -p -h` | rc 1, stdout 36 B / 186 B / stderr 2438 B | rc 0, root help | **rc 1**, stdout 72 B / 78 B / stderr 58 B | **fixed**: the config load runs as Go's does (the byte counts differ — frp-rs's loader wording and no cobra usage block) |
+| `frpc -hL` | rc 1 stderr (1351 B) | rc 0 root help | **rc 1 stderr (41 B)** | fixed on rc and stream; the message is pflag's `flag needs an argument: 'L' in -L` against Go's `unknown shorthand flag: 'L' in -L` **because frp-rs registers `-L` and Go does not** |
+| `frpc status -hL`, `frpc tcp -hL`, `frps verify -hL` | rc 1 stderr | rc 0 help | rc 0 help | unchanged: those parsers have no `-L`, so nothing is claimed and no missing-argument line is fabricated for a short frp-rs does not register there (bpaf's own refusal for `frps verify -hL`) |
+| `frps -c CFG -t -h`, `frps -t -h`, `frps -p -h` (hardening-safe config) | rc 1, stdout 239 B / 186 B / stderr 2438 B | rc 0, root help | **rc 1**, stdout 1449 B / 78 B / stderr 58 B | **fixed**: the config load runs as Go's does (the byte counts differ — frp-rs's loader wording and no cobra usage block) |
+| `frps -c CFG -t -h` (**tokenless** config) | rc 1 | rc 0, root help | rc 3 | the `EXIT_AUTH`/3 empty-token hardening, which is its own recorded divergence: with `[auth] method = "token"` and a token in the file the head reaches the server start and exits 1 like Go |
 | `-c cfg -- --help=false` | rc 1 stdout | rc 1 stderr | rc 1 stderr | the positional-argument class (Go ignores what follows `--`, frp-rs refuses it) |
 | `--help=false status -c CFG` (port set) | rc 1, 1 conn, **stdout** 45 B | rc 0, 0 conn | rc 1, 1 conn, **stderr** 22 B | the admin status error's stream: frp-rs's `status query failed: …` goes to stderr on every status failure, port or not, unrelated to this flag |
+
+**The help-rendering row is filed, not just named.** Reproducing cobra's document
+is a flag-surface-wide renderer over bpaf's metadata (command short text, the
+`Flags:`/`Global Flags:` split, 30-column alignment, `-h, --help  help for
+<cmd>`), and it covers argv this item does not own: `frpc --help` (2405 B vs
+1370 B) and every `frpc <sub> --help` (1604 B vs 627 B for `status`) differ for
+the same reason on **both** trees' existing behaviour. It is a `TODO.md` item of
+its own ("The help *document* is bpaf's, not cobra's"), with the ten per-surface
+byte counts as its witness, so it is a tracked row rather than a sentence in this section.
 
 Verified rather than assumed: `frpc --help`, `frpc -h`, `frpc --help=true`, every
 `frpc <sub> --help`/`<sub> -h`, `frpc --help status`, `frpc --help notacommand`,
