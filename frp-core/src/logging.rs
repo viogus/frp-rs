@@ -16,7 +16,27 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// `cfg_level` when the caller has one, and to the built-in default when it does
 /// not — `frps`'s `--config-dir` lane calls `init_logging(&cli, None)`, so it is
 /// the `None` arm (`"info"`, or `_debug_default` under the `debug-logs`
-/// feature). That is Go's value-level semantics: on Go the flag is bound with
+/// feature).
+///
+/// **Which value the fall-through reaches differs between the two binaries when
+/// the config file sets a non-default `level`, and that is a recorded
+/// divergence, not an accident of this function.** Only `frps` overlays its CLI
+/// flags onto the loaded config (`FrpsArgs::override_server_config`), so its
+/// `cfg_level` is the *post-overlay, post-completion* value: an empty
+/// `--log-level ""` is written into `[log] level` and then filled to `"info"` by
+/// `LogConfig::complete`, and the empty CLI falls through to `"info"`. `frpc`
+/// never overlays its CLI flags, so its `cfg_level` stays the file's value.
+/// Measured on the head binary with `[log] level = "warn"` plus
+/// `--log-level ""` (own dir and free port, both streams separate, 3 s settle,
+/// pre-signal): `frps` → **1498 B / 7 records, all `INFO`, 0 `WARN`**, listener
+/// up; `frpc` → **569 B / 2 records, 1 `WARN` + 1 `ERROR`, 0 `INFO`** — the
+/// file's `warn` is honoured. Controls in the same run: `frps` with the config's
+/// `warn` and **no** flag → 0 B / 0 records (so the empty flag is what raises it
+/// to `info`), and `frpc` with the config's `warn` and no flag → the same
+/// 569 B / 2 records as with the empty flag. With no `[log] level` in the file
+/// both resolve to `"info"`. Filed as its own `TODO.md` item; aligning them
+/// would mean making `frps` skip an empty `--log-level` rather than complete it
+/// to Go's zero value, which is a product call. That is Go's value-level semantics: on Go the flag is bound with
 /// its default (`pkg/config/flags.go:161` registers `--log_level` with
 /// `"info"`), so `--log_level ""` leaves the struct empty and
 /// `LogConfig.Complete()`'s `util.EmptyOr(c.Level, "info")`
@@ -95,9 +115,28 @@ pub fn resolve_log_file(cli_file: Option<String>, cfg_file: &str) -> Option<Stri
 /// [`LogConfig::complete`](crate::config::LogConfig::complete) had just filled,
 /// because `frps`/`frpc` read `cli.log_max_days.or(cfg.log.max_days)`: the flag
 /// had already overlaid `0` onto the config and completion had rewritten it to
-/// `3`, then `Some(0)` won anyway. The observable is **synchronous startup
-/// cleanup** (`init_tracing` calls
-/// [`cleanup_expired_logs`] before the process serves): measured with a
+/// `3`, then `Some(0)` won anyway.
+///
+/// **On Go this field has no startup observable at all**, which is why the
+/// frp-rs rows are measured with a local aged-file fixture: the logger sweeps
+/// only at the midnight rotation. `clearFiles()` has exactly one caller —
+/// `rotate()` (`golib@v0.8.2/log/output_rotatefile.go:103`) — and `rotate()` is
+/// reached only from `dailyRotate`'s 0:00 boundary (`Init` `:60-70` starts
+/// `go fw.dailyRotate()` at `:68`; `:178-199` waits to the next hour and
+/// rotates only `if nextHour.Hour() == 0` at `:193` → `fw.Rotate()` at `:194`).
+/// `pkg/util/log/log.go:53-58` constructs the writer with
+/// `Mode: RotateFileModeDaily` and calls only `Init()`, so **Go's cleanup is
+/// midnight-only and never runs at startup** — no bounded probe can observe a
+/// `MaxDays` difference on the Go binary, and the Go row above (282 B / 3
+/// records) cannot discriminate this field. The corollary is worth recording:
+/// frp-rs's synchronous startup sweep is itself a pre-existing *timing*
+/// divergence from Go, which is what makes the aged-file method work against
+/// frp-rs and not against Go. `clearFiles()` also returns early when
+/// `Mode == Daily && MaxDays <= 0` (`:242-244`), so "a zero or negative
+/// `MaxDays` disables cleanup" is Go-true as well.
+///
+/// The frp-rs observable **is** synchronous startup cleanup (`init_tracing`
+/// calls [`cleanup_expired_logs`] before the process serves): measured with a
 /// backdated `logs/frps.log.2020-01-01` and `[log] to = "logs/frps.log"`, the
 /// pre-fix binary left the file in place under `--log-max-days 0` (cleanup
 /// disabled) while the default, `--log-max-days 3`, `5` and the config-file

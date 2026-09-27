@@ -2719,7 +2719,11 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   (`pkg/config/flags.go:161-163`) so `--log_level ""` reaches `LogConfig.Complete()` as the zero
   value, not as a literal empty level.
   **Measured** (this box, 2026-09-28, Go v0.71.0 `/private/tmp/frp_0.71.0_darwin_arm64/frps`,
-  base = clean `main` build, own empty CWD and own free port per case, stdout and stderr redirected
+  base = clean `main` build, own CWD and own free port per case — Go's flags-only lane needs an
+  **empty** CWD (a `frps.yaml` there would be discovered and win), while frp-rs's override lane needs
+  a `./frps.toml` holding the bind/auth keys and **no** `[log]` section, because frp-rs has no
+  flags-only mode: with an empty CWD it exits rc 1 printing `frps.toml: failed to read config file`
+  (78 B stdout, 0 B stderr) — stdout and stderr redirected
   to **separate** files and counted in bytes **before any signal** — the totals after SIGTERM are
   reported separately because the graceful-shutdown lines land there; rc read from `wait` on the
   direct child, never through a pipe):
@@ -2731,15 +2735,25 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     already mapped an empty *config* value to console — the earlier "0 B/0 B and a file created" row
     here was wrong and is corrected), and `maxDays = 0` is 1498 B/0 B **with retention disabled**;
     frp-rs **head** is 1498 B/0 B and 7 records in every shape, with no log file created.
-  * flags-only lane (`frps --bind-port <free>` + one log flag, own empty CWD): Go `--log-level ""`
+  * flags-only lane (`frps --bind-port <free>` + one log flag; own **empty** CWD for Go, own
+    `./frps.toml` without a `[log]` section for frp-rs, see the preamble): Go `--log-level ""`
     / `--log-file ""` / `--log-max-days 0` each 282 B stdout / 0 B stderr / 3 INFO records / listener
     up (`--log-format ""` is `Error: unknown flag: --log-format` + usage, 2368 B **stderr**, rc 1);
     frp-rs **base** `--log-level ""` → 0 B/0 B and `--log-file ""` → 0 B/0 B **plus a
     `frps.log.2026-09-27` written in the CWD** (2434 B after SIGTERM), `--log-max-days 0` →
     1498 B/0 B with cleanup disabled; frp-rs **head** all three → 1498 B stdout / 0 B stderr /
     7 records / listener up / no file created. Absent values are unchanged (1498 B before and after).
-  * `--log-max-days 0` / `[log] max_days = 0` has a **synchronous** observable that the byte rows
-    above cannot show: `init_tracing` runs `cleanup_expired_logs` at startup when `max_days > 0`.
+  * **Go's retention field has no startup observable at all**, which is why the rows below are an
+    frp-rs-local aged-file fixture: `clearFiles()` has exactly one caller — `rotate()`
+    (`golib@v0.8.2/log/output_rotatefile.go:103`) — reached only from `dailyRotate`'s 0:00 boundary
+    (`Init` `:60-70` starts `go fw.dailyRotate()` at `:68`; `:178-199`, `if nextHour.Hour() == 0` at
+    `:193` → `fw.Rotate()` at `:194`), and `pkg/util/log/log.go:53-58` only constructs the writer and
+    calls `Init()`. So the Go `--log-max-days 0` row (282 B / 3 records) cannot discriminate this
+    field, and frp-rs's **synchronous startup sweep is itself a pre-existing timing divergence** from
+    Go (Go sweeps at midnight only). `clearFiles()` returns early for `Mode == Daily && MaxDays <= 0`
+    (`:242-244`), so zero/negative disabling cleanup is Go-true.
+  * `--log-max-days 0` / `[log] max_days = 0` has a **synchronous** observable on frp-rs that the byte
+    rows above cannot show: `init_tracing` runs `cleanup_expired_logs` at startup when `max_days > 0`.
     With `[log] to = "logs/frps.log"` and a backdated `logs/frps.log.2020-01-01` (mtime on the epoch):
 
     | shape | `d3a16d2` (pre-this-round) | head |
@@ -2766,6 +2780,19 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   (5 tests; **0 passed / 5 failed** against a pre-fix `FRPS_BIN` — and **4 passed / 1 failed**
   against `d3a16d2`, the single failure being the CLI `--log-max-days 0` arm, which is what isolates
   this round's fix — all five green at the head).
+  **A recorded divergence: an empty `--log-level ""` does not mean the same thing on the two
+  binaries when the file sets a non-default `level`.** The fall-through rule is one rule
+  (`resolve_log_level` treats `Some("")` as *not supplied*), but the value it falls through to
+  differs, because only `frps` overlays its CLI flags onto the loaded config: `frps` writes the empty
+  flag into `[log] level` and completion fills it to `"info"`, while `frpc` (which never overlays its
+  CLI flags) keeps the file's value. Measured at the head with `[log] level = "warn"` +
+  `--log-level ""` (own dir and free port, both streams separate, 3 s settle, pre-signal):
+  `frps` → **1498 B / 7 records, all `INFO`, 0 `WARN`**, listener up; `frpc` → **569 B / 2 records,
+  1 `WARN` + 1 `ERROR`, 0 `INFO`**. Controls: `frps` with `warn` and no flag → 0 B / 0 records (the
+  empty flag is what raises it to `info`); `frpc` with `warn` and no flag → the same 569 B / 2 records
+  as with the empty flag; with no `[log] level` in the file both resolve to `"info"`. Filed as its own
+  item below — the fix would be `override_server_config` skipping an empty `--log-level`, i.e. a
+  product call about which lane frps mirrors, not a completion bug.
   **`--log-format` was verified and deliberately not touched**: Go v0.71.0's `LogConfig`
   (`pkg/config/v1/common.go:103-117`) has no `Format` field and the real binary refuses the flag
   (measurement above); frp-rs's `--log-format` is an extension and `resolve_log_format` already maps
@@ -2783,8 +2810,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   an explicit empty/zero is filled; `format` says it is an frp-rs extension with no Go completion and
   the old "console (default, stderr)" slip is corrected to stdout), `CHANGELOG.md` under `### Fixed`,
   and the CI step `Run frps's log-completion spawn tests`
-  (`cargo test -p frps --features dashboard --test log_completion`) — the fourth `frps` test target,
-  which no lane executed before.
+  (`cargo test -p frps --features dashboard --test log_completion`) — the fourth `frps` **target**
+  (its third *test* target, after `cli_exit_codes` and `cli_completion`; the fourth is the bin unit
+  target), which no lane executed before.
   Guards: **none moved.** `frps/tests/cli_exit_codes.rs` is untouched, so `env.FRPS_CLI_TESTS` stays
   `"27"` (`.github/workflows/ci.yml`, `-- --list` = 27) and `FRPC_TINY_CLI_TESTS` stays `"11"`
   (`-- --list` = 11; the default-feature frpc file lists 10). Gates at the head: fmt clean, clippy
@@ -2793,6 +2821,32 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   tiny `cargo test -p frpc --no-default-features --features tiny --test cli_exit_codes` 11/0,
   `bash scripts/repo-health.sh` rc 0. `scripts/compat-test.sh` is **not relevant**: this is a
   config-completion change on the logging surface and moves no wire byte.
+- [ ] **P1 — An empty `--log-level ""` means `info` on `frps` and "the file's level" on `frpc`, so the
+  two binaries disagree whenever the config sets a non-default `level`.** Found while closing the
+  `Log.Complete()` item above and deliberately **not** fixed there (the reviewers classified it as a
+  product call, and this item is the record of it). Only `frps` overlays its CLI flags onto the loaded
+  config (`FrpArgs::override_server_config` in `frp-core/src/cli.rs`); `frpc` does not, so on `frps`
+  the empty flag is written into `[log] level` and `LogConfig::complete`
+  (`frp-core/src/config/server.rs`) then fills it to `"info"`, while `frpc`'s resolver falls through
+  to the file's value. Measured at `97ad00d` with `[log] level = "warn"` + `--log-level ""`, own dir
+  and free port per case, both streams captured separately, 3 s settle, counts taken pre-signal:
+  `frps` → **1498 B stdout, 7 records, all `INFO`, 0 `WARN`**, listener up; `frpc` → **569 B stdout,
+  2 records, 1 `WARN` + 1 `ERROR`, 0 `INFO`**. Controls in the same run: `frps` with the config's
+  `warn` and **no** flag → 0 B / 0 records, i.e. the empty flag is what raises it; `frpc` with `warn`
+  and no flag → the same 569 B / 2 records; with **no** `[log] level` in the file both resolve to
+  `"info"`, which is why the default-config paths agree. Each binary's outcome is defensible on its
+  own (`frps`'s is Go's zero-value outcome for a flag bound to its own default,
+  `pkg/config/flags.go:161`; `frpc`'s is Go's `-c` outcome, where flags are ignored,
+  `cmd/frpc/sub/root.go:66-79`), and frp-rs's two lanes simply differ.
+  **Done-when:** decide which lane `frps` mirrors and make the rule true on both — either
+  `override_server_config` skips an **empty** `--log-level`/`--log-file`/`--log-max-days 0` (leaving
+  the file's value, which aligns `frps` with `frpc` and with Go's `-c` lane) or `frpc` gains the
+  overlay (aligning it with `frps` and Go's flags-only lane). Whichever is chosen needs a Go-binary
+  row per lane (Go's flags-only `--log_level ""` → `info`; Go's `-c` with `[log] level: warm` and the
+  flag ignored → `warn`), a spawn test per binary pinning the chosen outcome, and the
+  `docs/config.md` `[log] level` row rewritten to one consequence-free sentence. Until then the
+  divergence is stated in `docs/config.md`, in `resolve_log_level`'s doc comment
+  (`frp-core/src/logging.rs`) and here.
 - [x] **Two test-harness hazards: a feature swap that breaks the dashboard lane silently, and
   `FrpsHandle::start` orphaning its child on the panic path.**
   * **(a) `cargo test -p frps` and a clippy run that compiles `frps` replace `target/debug/frps`
