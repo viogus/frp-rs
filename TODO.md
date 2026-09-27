@@ -3329,22 +3329,30 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   in -c` on stderr with rc 1 for the argv bpaf answered with help. Sweep: **85 argvs** measured on
   Go v0.71.0 (darwin/arm64) / base `5b18489` / this head, one fresh listening socket per run on the
   config's `[webServer] port` with connections counted by `accept`, streams separate and rc read
-  from the child — **20 rows moved to Go's (rc, connection count, stdout-empty) and none
-  regressed**; `frpc --help`, `-h`, `--help=true`, every `frpc <sub> --help`/`-h`,
-  `frpc --help status`, `frpc -c --help` and the root `frpc --help=false -c cfg` divergence are
-  unchanged. **One correction to this item's own rows:** `frpc -hc status` is rc 1 with the
-  missing-argument line only because Go's `stripFlags` consumes `status` as `-c`'s value and
-  `argsMinusFirstX` then hands the status command `["-hc"]`; with a trailing value-taking short
-  (`frpc -hc status -c CFG`, `… -t`, `… -p 1`) Go is **rc 0 and prints `status`'s help**, and the
-  detector leaves those alone. **Not done, deliberately:** the help **document**.
+  from the child — **34 of 154 rows moved to Go's (rc, connection count, stdout-empty) and none
+  regressed** (the review-fix round added the 69-row matrix R2 named, which is where the first
+  revision's 19 regressions were found and fixed); `frpc --help`, `-h`, `--help=true`, every
+  `frpc <sub> --help`/`-h`, `frpc --help status`, `frpc -c --help` and the root
+  `frpc --help=false -c cfg` divergence are unchanged — the 29 historical help rows are
+  **byte-identical** to the base. **One correction to this item's own rows:** `frpc -hc status` is
+  rc 1 with the missing-argument line because pflag's shorthand walk hands `status` to the `c`
+  inside the cluster (the cluster's first short is a value-less `h`, so the walk does not stop
+  there) and the status command is then left with `["-hc"]` and nothing for `-c`; with a token
+  after the cluster (`frpc -hc status -c CFG`, `… -t`, `… -v`) Go is **rc 0 and prints help**, and
+  the walk leaves those alone because the cluster claims the token. **Not done, deliberately:** the
+  help **document**.
   `--help=true status` and `status --help` still print bpaf's usage (1604 B for `status`, 2405 B
   root) where Go prints cobra's (`Overview of all proxies status`, 627 B; 1370 B root) —
   reproducing cobra's renderer over bpaf's metadata is a flag-surface-wide row, so the byte counts
   are the honest statement and are tabulated in `docs/developing.md` § `--help=<bool>` with the
   residual argvs (`--help=false -c cfg`, `--help=0`, `--help=true notacommand`, `-h -v -c`,
-  `-hLinfo`, `-c cfg -- --help=false`) and the unchanged admin-status stream divergence. No test
-  was added to a guarded lane, so `env.FRPC_TINY_CLI_TESTS` stays `11` and `env.FRPS_CLI_TESTS`
-  stays `27`.
+  `-hLinfo`, `-h -c status`, `-c cfg -- --help=false`) and the unchanged admin-status stream
+  divergence. Two argv families the review round measured are covered by the same item and are
+  **not** residuals: a `--help=<bool>` token in a flag's **value** position
+  (`-c --help=false status`, `-hc --help=false status`, …) stays untouched, and a flag-shaped value
+  is attached to its flag (`-c CFG -t -h` on both binaries reaches the config load, as Go does).
+  No test was added to a guarded lane, so `env.FRPC_TINY_CLI_TESTS` stays `11` and
+  `env.FRPS_CLI_TESTS` stays `27`.
 - [x] **Exit codes `3`/`4` on daemon service-construction failures are frp-rs extensions where Go
   exits 1.** Measured at the head of the CLI-exit branch on Go v0.71.0 darwin/arm64 and the frp-rs
   debug binaries:

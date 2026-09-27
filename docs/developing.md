@@ -2701,9 +2701,10 @@ counted by `accept`:
 | `--help=true status -c CFG` | rc 0, 0 connections, stdout 627 B (`Overview of all proxies status` + `Usage: frpc status [flags]`) | rc 0, 0 connections, 1604 B of bpaf usage | rc 0, 0 connections, 1604 B of bpaf usage |
 | `-hc status` | rc 1, **stderr** 637 B `Error: flag needs an argument: 'c' in -c` + usage, stdout 0 B | rc 0, usage 1604 B on **stdout** | rc 1, **stderr** 41 B, the same first line, stdout 0 B |
 | `-hc` | rc 1, stderr 1351 B, stdout 0 B | rc 0, root usage 2405 B on stdout | rc 1, stderr 41 B, stdout 0 B |
-| `-h -c status` | rc 1, stderr 637 B, stdout 0 B | rc 0, 1604 B on stdout | rc 1, stderr 41 B, stdout 0 B |
+| `-h -c status` | rc 1, stderr 637 B, stdout 0 B | rc 0, 1604 B on stdout | rc 0, 1604 B on stdout (unchanged; the split `-h` family is a recorded residual) |
 | `-hc status -c CFG` | rc 0, `status`'s help | rc 0, bpaf usage | rc 0, bpaf usage (unchanged) |
 | `--help=foo status` | rc 1, stderr 698 B, stdout 0 B | rc 0, usage 1604 B on stdout | rc 1, stderr 102 B, stdout 0 B |
+| `--help=` (empty) | rc 1, stderr 1406 B, stdout 0 B | rc 0, root usage 2405 B | rc 1, stderr 96 B, stdout 0 B |
 | `--help` / `-h` / `--help=true` (no subcommand) | rc 0, root help 1370 B | rc 0, root usage 2405 B | rc 0, root usage 2405 B (unchanged) |
 | `status --help` / `status -h` / `status --help=true` | rc 0, `status`'s help 627 B | rc 0, 1604 B | rc 0, 1604 B (unchanged) |
 
@@ -2747,25 +2748,47 @@ load-bearing):
 * `reject_pflag_shorthand_cluster_that_needs_a_value` prints pflag's
   `flag needs an argument: '<c>' in -<c>` on stderr and exits 1 for the argv bpaf
   answered with help: a trailing `-h<value-short>` cluster (`-hc`, `-hL`) whose
-  value never arrived, and its split spellings (`-h -c`, `-c -h`). It stays
-  narrow on purpose — a `-c` with no help short beside it is already a bpaf
-  error with rc 1 on the right stream, and only the help short turns the same
-  argv into a help print instead.
+  value never arrived. Its input is the **expanded** argv, because the expansion
+  is what knows a `--help=<bool>` token can be another flag's value — so
+  `frpc -hc --help=false status` is left alone and `frpc -hc` (last after the
+  hoist) is refused. It stays narrow on purpose: a bare `-c` with nothing after it
+  is already a bpaf error with rc 1 on the right stream, and it is the `-h<short>`
+  cluster that turns the same argv into a help print instead.
+* `attach_flag_shaped_values` joins a flag-shaped value to its flag with `=`,
+  because bpaf classifies a token before it parses it: `frps -c CFG -t -h` reached
+  bpaf as `-t` with no value plus a bare `-h`, so the server exited **0** with
+  3571 B of help where Go hands `-h` to `--token`, loads the config and exits 1
+  (measured: 36 B on stdout). `-t=-h` is the same flag and value to pflag. On
+  `frpc` this is also what makes `frpc -c CFG -t -h` and `frpc tcp -c CFG -t -h`
+  reach the config load instead of printing help — the two argv R2 measured as
+  "Go runs, the head refuses".
 
 Values go through `parse_go_bool`, the same `strconv.ParseBool` grammar as every
 other bool flag here, so `1`/`0`/`t`/`f`/`T`/`F`/`TRUE`/`FALSE`/`True`/`False`
 are accepted on the `=` spelling.
 
-**Recorded residuals, each measured on Go v0.71.0 / base / head** (the sweep is
-85 argvs; 20 moved to Go's `(rc, connection count, stdout empty)` and **none
-regressed**):
+**Recorded residuals, each measured on Go v0.71.0 / base / head.** The sweep is
+**154 argv** on `frpc` (the original 85 plus the 69 the review round named) plus
+**20** on `frps`: **34 `frpc` rows moved to Go's `(rc, connection count, stdout
+empty)` and none regressed**, and the 29 historical help rows (`--help`, `-h`,
+`--help=true`, every `frpc <sub> --help`/`-h`, `-hc`, `-hcx`, `-hc=x`,
+`-hc --help=false status`, …) are **byte-identical** to the base head. The `frps`
+sweep agrees with Go on `(rc, connection count, stdout empty)` for 15 of 20 rows;
+the five differences are all pre-existing or this item's documented residue:
+`--help=false -c CFG` (the root divergence below), `-h -c`/`-h -L`/`-h -t` (the
+split `-h` family below) and `verify --token --help=false -c CFG` (frp-rs's
+`verify` flag set differs from Go's, an frps-surface row). `frps --help=false
+verify` matches Go exactly (46 B on stdout, rc 0).
 
 | argv | Go | base | head | what is left |
 |---|---|---|---|---|
 | `--help=false -c cfg` | rc 1 | rc 0, root usage | rc 0, root usage | the pre-existing root divergence above, deliberately unchanged |
 | `--help=0` / `--help=false` / `--help=false notacommand` / `--help=true notacommand` | rc 1 | rc 0 help | rc 0 help | unchanged: no command word, or a word that is not one |
-| `-h -v -c` | rc 1 stderr | rc 0 help | rc 0 help | a value-taking short separated from the help short by another token; the pass only pairs *adjacent* tokens |
-| `-hLinfo` | rc 1 stderr | rc 0 help | rc 0 help | a trailing `-hL<value>` cluster: pflag hands `info` to `-L` and bpaf hands the token to `-h`. `-L` is frp-rs's alias for `--log-level` (`frpc/src/main.rs`'s run mode) and **not** a Go shorthand — Go registers `log_level` with `StringVarP(..., "", ...)` (`pkg/config/flags.go:161`), so its own refusal is `unknown shorthand flag: 'L' in -L` |
+| `-h -v -c` | rc 1 stderr | rc 0 help | rc 0 help | a value-taking short separated from the help short by a token that is not itself value-taking; bpaf's help short-circuit wins. The attachment pass only pairs a flag with the token **immediately** after it |
+| `-hLinfo` | rc 1 stderr | rc 0 help | rc 0 help | a trailing `-hL<value>` cluster: pflag hands `info` to `-L` and bpaf hands the token to `-h`. `-L` is frp-rs's alias for `--log-level` (`frp-core/src/cli.rs`, the `run_mode` parser's `log_level`) and **not** a Go shorthand — Go registers `log_level` with `StringVarP(..., "", ...)` (`pkg/config/flags.go:161`), so its own refusal is `unknown shorthand flag: 'L' in -L` |
+| `-h -c`, `-h -L`, `-h -t` | rc 1 stderr | rc 0 help | rc 0 help | a **bare** `-h` with a value-taking short after it. pflag's walk does not let the help bool swallow that short (`frpc -h -c status` is rc 1 with the missing-argument line, 637 B), but bpaf reads the `-h` first and prints help. Attaching the pair (`-h=-c`) does **not** help: `-h` is a known short bool to bpaf, so `-h=` is refused as an unknown *long* flag and bpaf's help still wins; and dropping the `-h` broke `frpc -h -c status -c CFG` (which Go answers with `status`'s help, rc 0) in an earlier revision of this fix. Recorded rather than fixed |
+| `-h -c status`, `-h -c status -c CFG` | rc 1 / rc 0 | rc 0 / rc 0 | rc 0 / rc 0 | the same family with a command word: the status command ends up with `["-h", "-c"]` on Go, so rc is 1, while frp-rs's hoist hands `status` to `-c` and prints `status`'s help. Pre-existing, unchanged |
+| `frps -c CFG -t -h`, `frps -t -h`, `frps -p -h` | rc 1, stdout 36 B / 186 B / stderr 2438 B | rc 0, root help | **rc 1**, stdout 72 B / 78 B / stderr 58 B | **fixed**: the config load runs as Go's does (the byte counts differ — frp-rs's loader wording and no cobra usage block) |
 | `-c cfg -- --help=false` | rc 1 stdout | rc 1 stderr | rc 1 stderr | the positional-argument class (Go ignores what follows `--`, frp-rs refuses it) |
 | `--help=false status -c CFG` (port set) | rc 1, 1 conn, **stdout** 45 B | rc 0, 0 conn | rc 1, 1 conn, **stderr** 22 B | the admin status error's stream: frp-rs's `status query failed: …` goes to stderr on every status failure, port or not, unrelated to this flag |
 

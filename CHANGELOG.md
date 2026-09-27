@@ -305,7 +305,10 @@ User-facing release notes for frp-rs.
   - `frpc -hc status` (pflag's shorthand cluster, `-h` then `-c` with no value)
     is rc 1 with `Error: flag needs an argument: 'c' in -c` on **stderr** and
     0 B on stdout, as on Go, where frp-rs used to print help on stdout with rc 0.
-    The same applies to the split spellings `-h -c` and `-c -h`.
+    The go-shaped `-h -c`/`-c -h` split spellings are **not** claimed here: `-c -h`
+    is `open -h: no such file or directory` on Go (`-h` is `--config`'s value, rc 1,
+    35 B on stdout), and the `-h -c` order is a recorded residual — see
+    `docs/developing.md` § `--help=<bool>`.
   Deliberately unchanged: `frpc --help`, `frpc -h`, `frpc --help=true`,
   `frpc <sub> --help`/`-h`, `frpc --help <word>` and the root
   `frpc --help=false -c cfg` divergence. Two residual differences are recorded,
