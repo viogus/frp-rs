@@ -462,6 +462,24 @@ impl ClientConfig {
             self.web_server.addr = "127.0.0.1".into();
         }
 
+        // The client is the **sibling slot** of the server's log completion:
+        // Go's `ClientCommonConfig.Complete()` calls `c.Log.Complete()` at
+        // `pkg/config/v1/client.go:94` — the same call, in the same position
+        // (first field completion, after `c.Auth.Complete()` at `:91`) — and
+        // that path runs for EVERY frpc load, `-c` included:
+        // `config.LoadClientConfigResult` → `result.Common.Complete()`
+        // (`pkg/config/load.go:392`), which is *not* the flags-only exception
+        // the server's `-c` path is (`pkg/config/load.go:313-321` completes a
+        // fresh struct loaded from the file). frp-rs had no log fill on either
+        // config, so the same explicit-empty input (`--log-level ""`,
+        // `--log-file ""`, `--log-max-days 0`, or `log.level = ""` in the file
+        // — the client does not overlay its CLI flags onto the config, so the
+        // file is the reachable shape there) silenced frpc's own logging.
+        // Fixed here rather than filed: the fix is the one Go call, and
+        // `LogConfig::complete` (`frp-core/src/config/server.rs`) is shared, so
+        // the sibling cannot drift from the server.
+        self.log.complete();
+
         // MEDIUM-7: Fallback to http_proxy/HTTP_PROXY env var when proxy_url is empty
         if self.proxy_url.is_empty() {
             if let Ok(proxy) = std::env::var("http_proxy") {

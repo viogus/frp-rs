@@ -412,6 +412,31 @@ impl ServerConfig {
     /// `--bind-addr` moves the proxy listeners too — measured end to end, see
     /// `docs/developing.md` § CLI inputs § 2b).
     pub fn complete(&mut self) {
+        // Go frp: `c.Log.Complete()` (`pkg/config/v1/server.go:105`) is the
+        // FIRST field completion in `ServerConfig.Complete()`, right after
+        // `c.Auth.Complete()` (`:102`) — before `Transport`, `WebServer` and
+        // `SSHTunnelGateway` (`:106-108`) and before the `BindAddr`/`BindPort`/
+        // `ProxyBindAddr` fills at `:110-114`. frp-core has no Auth completion
+        // step, so this call is in the same slot, at the top of the function.
+        //
+        // Why it is needed at all: an explicit `--log-level ""` / `--log-file ""`
+        // / `--log-max-days 0` is written into the struct by
+        // `FrpsArgs::override_server_config` (`frp-core/src/cli.rs`) BEFORE this
+        // call, and the serde defaults on `LogConfig` fire only for an ABSENT
+        // key — so without this fill the empty/zero value reaches
+        // `init_logging` (`frps/src/main.rs`) and the server goes **silent while
+        // its listener still binds**. Measured on the pre-fix binary, own free
+        // port, flags-only lane, stdout/stderr counted separately before any
+        // signal: `--log-level ""` → 0 B stdout / 0 B stderr (the empty level
+        // parses as `off`), `--log-file ""` → 0 B / 0 B **and** a
+        // `frps.log.<date>` file created in the CWD instead. Go v0.71.0 with the
+        // same flags logs its startup lines on stdout (measured: 282 B / 3
+        // `INFO` lines, 0 B stderr, listener up).
+        //
+        // The Go call sits after `Auth.Complete()`, which can fail and return
+        // early; frp-rs has no fallible completion before this point, so there
+        // is no early-return path whose ordering this could change.
+        self.log.complete();
         // Go frp: `BindAddr = util.EmptyOr(BindAddr, "0.0.0.0")`
         // (`pkg/config/v1/server.go:110`), which runs BEFORE the `ProxyBindAddr`
         // and `BindPort` completions in the same function. An explicit
@@ -773,6 +798,60 @@ impl Default for LogConfig {
             max_days: default_max_days(),
             format: default_log_format(),
             disable_print_color: false,
+        }
+    }
+}
+
+impl LogConfig {
+    /// Apply Go frp's `LogConfig.Complete()`
+    /// (`pkg/config/v1/common.go:119-123`):
+    ///
+    /// ```text
+    /// c.To = util.EmptyOr(c.To, "console")
+    /// c.Level = util.EmptyOr(c.Level, "info")
+    /// c.MaxDays = util.EmptyOr(c.MaxDays, 3)
+    /// ```
+    ///
+    /// `util.EmptyOr` (`pkg/util/util/types.go:17-23`) fills the type's **zero
+    /// value**, so an *explicit* `""` / `0` is filled, not only an absent key.
+    /// The serde field defaults in this file fire only when the key is
+    /// **absent**, which is what left the explicit-empty shapes uncompleted.
+    ///
+    /// **Position.** Go calls `c.Log.Complete()` at `pkg/config/v1/server.go:105`
+    /// (server) and `pkg/config/v1/client.go:94` (client), as the first of the
+    /// field-completion calls and *after* `c.Auth.Complete()`. frp-rs has no
+    /// `Auth::complete` step, so this is the **first** fill in
+    /// `ServerConfig::complete` and the first Go-mirroring fill in
+    /// `ClientConfig::complete_with_heartbeat_set` — the same slot. Nothing in
+    /// either config reads `log` during completion, so the position is
+    /// observable only through the ordering of the calls; this is **not** a
+    /// claim that moving it changes a value.
+    ///
+    /// **What it deliberately does not touch.** `format` has no Go completion
+    /// to mirror: Go v0.71.0's `LogConfig` (`common.go:103-117`) has no
+    /// `Format` field at all, and `--log-format` is `unknown flag` on the real
+    /// binary (measured: `frps --log-format ""` → stderr
+    /// `Error: unknown flag: --log-format` + usage, rc 1). frp-rs's `format` is
+    /// a frp-rs-only extension and
+    /// [`resolve_log_format`](crate::logging::resolve_log_format) already maps
+    /// an empty value to `"text"`. `disable_print_color` is a bare `bool` on
+    /// Go too and has no `EmptyOr` fallback.
+    ///
+    /// **What it is and is not.** It rewrites the *completion input*; it does
+    /// not resolve CLI-vs-config precedence — `frps`/`frpc` call
+    /// `logging::resolve_*` with the CLI value first, so an explicit non-empty
+    /// flag still wins and an empty `--log-file ""` (which reaches
+    /// `LogConfig::file` through `override_server_config`) is filled here
+    /// before `init_logging` sees the config.
+    pub fn complete(&mut self) {
+        if self.file.is_empty() {
+            self.file = default_log_file();
+        }
+        if self.level.is_empty() {
+            self.level = default_log_level();
+        }
+        if self.max_days == 0 {
+            self.max_days = default_max_days();
         }
     }
 }

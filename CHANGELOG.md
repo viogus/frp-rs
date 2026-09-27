@@ -286,6 +286,26 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **An empty `--log-level` / `--log-file` / `--log-max-days 0` no longer
+  silences `frps` or `frpc`.** Go fills all three in `LogConfig.Complete()`
+  (`pkg/config/v1/common.go:119-123`: empty → `console`, empty → `info`, zero →
+  `3`), and an explicit empty value is Go's zero value, so `util.EmptyOr` fills
+  it exactly like an absent key. frp-rs had no log completion and its serde
+  defaults fire only when a key is **absent**, so `frps --log-level ""` brought
+  the listener up while emitting **0 bytes on stdout and 0 on stderr** (an empty
+  level is parsed as `error`, and every startup record is `INFO`), and
+  `--log-file ""` did the same *and* wrote a `frps.log.<date>` rotation file in
+  the working directory instead of logging to the console. `--log-max-days 0`
+  kept logging but silently disabled log cleanup, where Go retains 3 days. Both
+  configs now complete their `[log]` section the way Go does — `frpc` too, since
+  Go calls the same `c.Log.Complete()` from `ClientCommonConfig.Complete()`
+  (`pkg/config/v1/client.go:94`) and `frpc` had the identical hole — and an empty
+  CLI value is treated as "not supplied" rather than as a literal level or path,
+  which is Go's value-level semantics for a flag bound to its own default.
+  Absent keys still take the serde default, and non-empty values (including a
+  negative `max_days`, which keeps cleanup disabled) pass through unchanged. The
+  frp-rs-only `--log-format` is deliberately **not** completed: Go v0.71.0 has no
+  such flag (`unknown flag: --log-format`) or config key.
 - **`frpc --help=<bool>` no longer hides the command it names, and a `-hc`
   shorthand cluster is a parse error again.** Go registers `--help`/`-h` as a
   pflag bool, so `frpc --help=false status -c frpc.toml` **runs** `status` (it

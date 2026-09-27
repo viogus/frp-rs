@@ -9,12 +9,30 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use tracing_subscriber::filter::{LevelFilter, Targets};
 
+/// Resolve the effective log level: the CLI value wins over the config value,
+/// which wins over the built-in default.
+///
+/// An **empty** CLI value counts as *not supplied* and falls through to the
+/// config level. That is Go's value-level semantics: on Go the flag is bound
+/// with its default (`pkg/config/flags.go:161` registers `--log_level` with
+/// `"info"`), so `--log_level ""` leaves the struct empty and
+/// `LogConfig.Complete()`'s `util.EmptyOr(c.Level, "info")`
+/// (`pkg/config/v1/common.go:121`) fills it — measured on Go v0.71.0, where
+/// `frps --log-level ""` still logs its 3 startup `INFO` lines (282 B on
+/// stdout, 0 B stderr, listener up — flags-only lane). Treating `Some("")` as a value instead routed the
+/// empty string to `parse_level`, where `LevelFilter::from_str("")` is
+/// `Ok(ERROR)` — tracing-core 0.1.36 maps the empty string to `ERROR`
+/// (`metadata.rs:798`) — and every startup record is `INFO`. Measured on the
+/// pre-fix frp-rs binary:
+/// `--log-level ""` → 0 B stdout / 0 B stderr with the listener up (the startup
+/// records are all `INFO`). See `LogConfig::complete`
+/// (`frp-core/src/config/server.rs`) for the config-side half of the same fill.
 pub fn resolve_log_level(
     cli_level: Option<String>,
     cfg_level: Option<&str>,
     _debug_default: &str,
 ) -> String {
-    cli_level.unwrap_or_else(|| {
+    cli_level.filter(|l| !l.is_empty()).unwrap_or_else(|| {
         cfg_level
             .unwrap_or({
                 #[cfg(feature = "debug-logs")]
@@ -30,8 +48,19 @@ pub fn resolve_log_level(
     })
 }
 
+/// Resolve the log destination: `None` means stdout (`console`), `Some(path)`
+/// means a rolling file at `path`. The CLI value wins over the config value.
+///
+/// An **empty** CLI value counts as *not supplied*, the same rule as
+/// [`resolve_log_level`]: `--log-file ""` must mean "use the config", i.e.
+/// `console` in every default shape — not "roll a file at the empty path".
+/// Measured on the pre-fix frp-rs binary: `--log-file ""` → 0 B stdout /
+/// 0 B stderr **and** a `frps.log.<date>` created in the CWD, because the empty
+/// path reached `tracing_appender::rolling::daily` (whose `file_name()` is
+/// `None`, so it fell back to the default log name). Go v0.71.0 with
+/// `--log-file ""` logs on stdout (282 B, 0 B stderr).
 pub fn resolve_log_file(cli_file: Option<String>, cfg_file: &str) -> Option<String> {
-    cli_file.or_else(|| {
+    cli_file.filter(|f| !f.is_empty()).or_else(|| {
         if cfg_file.is_empty() || cfg_file == "console" {
             None // "console" means stdout (Go frp compat)
         } else {
@@ -524,6 +553,97 @@ mod tests {
         assert_eq!(resolve_log_format(Some("".into()), "text"), "text");
     }
 
+    /// `--log-level ""` is Go's zero value, so it must behave like an absent
+    /// flag (Go's `LogConfig.Complete()` fills `""` with `info`,
+    /// `pkg/config/v1/common.go:121`), **not** like the literal empty level —
+    /// which tracing-core parses as `ERROR`, silencing the pre-fix binaries
+    /// while their listeners still came up.
+    #[test]
+    fn resolve_log_level_treats_empty_cli_value_as_absent() {
+        // Empty CLI → the config value.
+        assert_eq!(
+            resolve_log_level(Some("".into()), Some("warn"), "debug"),
+            "warn"
+        );
+        // Empty CLI with no config value → the built-in default.
+        let expected = if cfg!(feature = "debug-logs") {
+            "debug"
+        } else {
+            "info"
+        };
+        assert_eq!(resolve_log_level(Some("".into()), None, "debug"), expected);
+        // A non-empty CLI value still wins.
+        assert_eq!(
+            resolve_log_level(Some("trace".into()), Some("warn"), "debug"),
+            "trace"
+        );
+        // Nothing set at all.
+        assert_eq!(resolve_log_level(None, None, "debug"), expected);
+    }
+
+    /// `--log-file ""` is likewise Go's zero value: it must mean "not supplied"
+    /// (→ the config destination, `console` by default), not "roll a file at the
+    /// empty path". Pre-fix, `Some("")` reached
+    /// `tracing_appender::rolling::daily`, whose `file_name()` on an empty path
+    /// is `None`, so it silently rolled `frps.log.<date>` in the CWD while both
+    /// streams stayed empty.
+    #[test]
+    fn resolve_log_file_treats_empty_cli_value_as_absent() {
+        // Empty CLI → the config destination.
+        assert_eq!(resolve_log_file(Some("".into()), "console"), None);
+        assert_eq!(resolve_log_file(Some("".into()), ""), None);
+        assert_eq!(
+            resolve_log_file(Some("".into()), "/var/log/frps.log"),
+            Some("/var/log/frps.log".to_string())
+        );
+        // A non-empty CLI path still wins.
+        assert_eq!(
+            resolve_log_file(Some("/tmp/x.log".into()), "console"),
+            Some("/tmp/x.log".to_string())
+        );
+        // `console` in the config means stdout.
+        assert_eq!(resolve_log_file(None, "console"), None);
+    }
+
+    /// `RUST_LOG` outranks the configured level (`filter_from_env`), so the
+    /// spawn tests in `frps/tests/log_completion.rs` deliberately clear it —
+    /// leaving it set (as `frps/tests/cli_completion.rs` does with
+    /// `RUST_LOG=info`) would mask an empty `--log-level`.
+    ///
+    /// The observable is `Targets::would_enable`, not a byte count: a byte-count
+    /// probe of a process-global subscriber is racy, and installing a global
+    /// subscriber in a unit test would break every sibling test in this crate.
+    #[test]
+    fn rust_log_outranks_the_configured_level() {
+        // RAII so a panic cannot leave RUST_LOG set for the rest of the process.
+        struct RustLogGuard(Option<String>);
+        impl Drop for RustLogGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("RUST_LOG", v),
+                    None => std::env::remove_var("RUST_LOG"),
+                }
+            }
+        }
+        let _guard = RustLogGuard(std::env::var("RUST_LOG").ok());
+
+        std::env::remove_var("RUST_LOG");
+        assert!(
+            filter_from_env("info").would_enable("frp_core", &tracing::Level::INFO),
+            "without RUST_LOG the configured level applies"
+        );
+
+        std::env::set_var("RUST_LOG", "error");
+        assert!(
+            !filter_from_env("info").would_enable("frp_core", &tracing::Level::INFO),
+            "an explicit RUST_LOG must outrank the configured level"
+        );
+        assert!(
+            filter_from_env("info").would_enable("frp_core", &tracing::Level::ERROR),
+            "the RUST_LOG level is what applies, not the configured one"
+        );
+    }
+
     #[test]
     fn cleanup_removes_only_expired_prefix_files() {
         let dir = std::env::temp_dir().join(format!("frp_rs_log_cleanup_{}", std::process::id()));
@@ -574,8 +694,14 @@ mod tests {
         assert_eq!(parse_level("off"), LevelFilter::OFF);
         // Unknown → INFO (the safe default).
         assert_eq!(parse_level("bogus"), LevelFilter::INFO);
-        // tracing-core maps "" → ERROR (a `LevelFilter::from_str` quirk); never
-        // hit in practice — config always supplies a real level.
+        // tracing-core 0.1.36 maps "" → **ERROR**, not an error and not INFO
+        // (`LevelFilter::from_str`, `metadata.rs:798`). That is the mechanism
+        // behind the pre-fix silence for `--log-level ""`: ERROR admits only
+        // error records and every startup record is INFO, so both streams were
+        // 0 B while the listener still bound. `resolve_log_level` now treats an
+        // empty CLI value as absent, so this branch is unreachable from a flag;
+        // it stays pinned because it is what made the flag costly.
+        assert_eq!(LevelFilter::from_str("").unwrap(), LevelFilter::ERROR);
         assert_eq!(parse_level(""), LevelFilter::ERROR);
     }
 

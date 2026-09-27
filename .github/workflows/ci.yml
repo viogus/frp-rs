@@ -400,6 +400,31 @@ jobs:
         # for* dashboard coverage: the dashboard shapes then take their documented
         # inert branch, quietly — the check does not itself raise an alarm.)
         run: cargo test -p frps --features dashboard --test cli_completion
+      - name: Run frps's log-completion spawn tests
+        # `frps/tests/log_completion.rs` pins Go's `LogConfig.Complete()`
+        # (`pkg/config/v1/common.go:119-123`, called at
+        # `pkg/config/v1/server.go:105`): an explicit `--log-level ""` /
+        # `--log-file ""` / `--log-max-days 0`, or the same values in the config
+        # file, must be filled rather than silencing the server while its
+        # listener still binds. No other lane executes this file: the `frps`
+        # package declares no library target and its `src/` carries no tests, so
+        # `cargo test --workspace --lib` cannot see it, and the steps above
+        # select `--test cli_exit_codes` / `--test cli_completion` explicitly. A
+        # separate step (rather than extending the one above) keeps the guarded
+        # `env.FRPS_CLI_TESTS` count untouched — this file adds a fourth `frps`
+        # test *target*, not a test inside a counted one.
+        #
+        # `--features dashboard` matches the step above, so the same cached
+        # `frps --features dashboard` artifact is reused (warm: no extra
+        # rebuild). The file does not depend on the dashboard and also passes
+        # against the default build; matching the sibling keeps this job from
+        # swapping the artifact back and forth, and leaves the dashboard-bearing
+        # binary behind — the safe direction the note above measures.
+        #
+        # The file removes `RUST_LOG` from its children on purpose (the variable
+        # outranks `--log-level`, so leaving it set would mask the shape being
+        # pinned); this step does not set it.
+        run: cargo test -p frps --features dashboard --test log_completion
       - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
         # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag
         # exit-code fix has to hold in the no-default-features build too — but
