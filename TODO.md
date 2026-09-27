@@ -3048,8 +3048,11 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   * **Design**: `hoist_leading_subcommand` runs before bpaf over the argv after `cli_args` dropped
     `argv[0]` — the first version saw `argv[0]` as a bare word and never fired, which the 45-row
     table caught immediately. It skips the value of a flag that cobra's `stripFlags` would let
-    swallow one, stops at a real `--`, and only ever hoists the first bare word. `frps` passes
-    `has_subcommands: false` and is byte-identical (Go `frps` declares no subcommands).
+    swallow one, stops at a real `--`, and only ever hoists the first bare word. `frps` passed
+    `has_subcommands: false` and was byte-identical at that head. **Superseded, and the
+    parenthetical was false:** Go's `frps` declares `verify`, so the "no subcommands" premise is
+    wrong and `frps` now runs the same hoist from its own flag/command set — see the `frps verify`
+    item's Done block (`RootCommand`, `FRPS_SUBCOMMANDS`, `FRPS_BOOL_ROOT_FLAGS`).
   * **The classifier's `NoOptDefVal` set is where the first version was wrong, and the reviews
     found it in both directions.** The rule is cobra's: a `--long`/`-x` without `=` consumes the
     next token *unless the flag is a pflag bool* (`pflag-1.0.5/bool.go:56` sets
@@ -3078,8 +3081,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `--strict-config` directions, the existing order and the request-head equality between the
     hoisted and unhoisted orders. Nothing was added to `frpc/tests/cli_exit_codes.rs` or
     `frps/tests/cli_exit_codes.rs`, so the two guarded counts in `.github/workflows/ci.yml`
-    (`FRPS_CLI_TESTS: "16"`, `FRPC_TINY_CLI_TESTS: "11"`) are unchanged and still match
-    `-- --list`. `frpc/tests/cli_inputs.rs` went 21 tests at the base to 34 (13 new); with `BIN`
+    (`FRPS_CLI_TESTS: "16"` **at that head** — the literal has since moved to `19` with the typed
+    exit-code pins and to `27` with `frps verify` plus its review round, and `FRPC_TINY_CLI_TESTS:
+    "11"`) were unchanged by that round and matched `-- --list` then. `frpc/tests/cli_inputs.rs` went 21 tests at the base to 34 (13 new); with `BIN`
     re-pinned to the base binary the suite is **28 passed, 6 failed**, the six being exactly the
     command-resolution tests, and with it pinned to the pre-fix head `86745d5` the suite is
     **32 passed, 2 failed** — and the two failures are *both* direction tests,
@@ -3223,8 +3227,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `frps/src/main.rs` checked out at `5ae1bcf` and rebuilt, the strengthened suite is **6 passed /
     3 failed** in `cargo test -p frpc --test cli_exit_codes` (daemon, verify-bad, verify-missing),
     **14 / 2 failed** in `-p frps` (bad, missing) and **6 / 5 failed** in the tiny lane — then 9/0,
-    16/0 and 11/0 at head. The three counts are unchanged (`env.FRPS_CLI_TESTS` `16`,
-    `env.FRPC_TINY_CLI_TESTS` `11`, both re-checked against `-- --list`).
+    16/0 and 11/0 at head. The three counts were unchanged by that round (`env.FRPS_CLI_TESTS`
+    `16` **at that head** — the literal reads `27` now, after the typed exit-code pins took it to
+    `19` and `frps verify` plus its review round took it to `27`; `env.FRPC_TINY_CLI_TESTS` `11`,
+    still `11`; both were re-checked against `-- --list` then).
   * **Carriers**: `docs/developing.md` § CLI exit codes gained a
     **Output stream and shape on a config-load failure** subsection with the table above, the
     recorded wording divergence, the recorded N ≥ 2 line-count divergence and the adjacent `verify`
@@ -3472,24 +3478,52 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `docs/developing.md` § CLI inputs row moved in the same commit, as did the "n/a — frp-rs `frps`
   has no `verify` subcommand" row in § `--strict-config`.
   **Guard interaction:** `frps/tests/cli_exit_codes.rs` is the guarded file, so
-  `env.FRPS_CLI_TESTS` (`.github/workflows/ci.yml`) moved **19 → 26** in the same commit — seven
-  new pins plus the re-point (a re-point is not an added test). `-- --list` reads **26 tests,
-  0 benchmarks**; the lane's own guard logic was driven locally with 26 (`ok: 26 tests listed
-  (expected 26), 0 failed`), with the stale 19 (fails closed: "lists 26 tests … move the single
-  env.FRPS_CLI_TESTS value … from 19 to 26") and with 27 (fails closed with the DECREASED-direction
-  message). `FRPC_TINY_CLI_TESTS` stays **11** (re-measured).
+  `env.FRPS_CLI_TESTS` (`.github/workflows/ci.yml`) moved **19 → 26** in that commit — seven
+  new pins plus the re-point (a re-point is not an added test) — and then **26 → 27** in the
+  review-fix round below (+1: `verify_refuses_the_two_frp_rs_only_root_flags_like_go`).
+  `-- --list` reads **27 tests, 0 benchmarks**; the lane's own guard logic was driven locally with
+  27 (`ok: 27 tests listed (expected 27), 0 failed`), with the stale 26 (`lists 27 tests … move the
+  single env.FRPS_CLI_TESTS value … from 26 to 27`) and with 28 (DECREASED direction), and the same
+  three ways at the earlier 26/19/27 values. `FRPC_TINY_CLI_TESTS` stays **11** (re-measured).
+  **Review-fix round (same branch, after both reviewers returned "MERGE after these fixes"):** one
+  behavioural fix plus carriers. `frps verify` used to let the frp-rs-only `--log-format` ride in
+  through `frps_build`, so `frps verify --log-format json -c <valid>` printed `syntax is ok` and
+  exited **0** where Go exits **1** (`unknown flag: --log-format`) — the same false success the
+  `--config-dir` refusal had been designed against. Both extension slots are now
+  `bpaf::pure(None)` on the verify path (`FrpsRootSlots`), the run path keeps both, and the two
+  flags are the *complete* extension set — measured by diffing the two binaries' rendered `--help`
+  lists: frp-rs-only = {`config-dir`, `log-format`}, Go-only = {`vhost-http-timeout`}. Two further
+  verify rows were measured and classified as pre-existing: `--vhost-http-timeout` (frp-rs does not
+  model it — filed below) and `--dashboard-tls-mode` in its string-flag spellings, including the
+  bare trailing form where frp-rs reads `true` and answers rc **0** `syntax is ok` while Go answers
+  rc **1** `flag needs an argument: --dashboard-tls-mode` — a **false ok**, which is why the
+  carrier sentences now say "every root flag frp-rs **models**" instead of "every other root flag".
+  Carriers corrected in the same round: the `WordSepNormalizeFunc` direction in two comments
+  (Go rewrites `_` to `-`, `pkg/config/flags.go:31-36`), two doc comments that cited a
+  non-existent test name, `frp-core/src/config/tests.rs` and
+  `frp-core/src/config/fixtures/README.md` (both said `frps` has no verify subcommand), this file's
+  earlier hoist item (the false "Go `frps` declares no subcommands" premise, marked superseded) and
+  two stale `FRPS_CLI_TESTS: "16"` quotes in this file. The `frpc verify` success-line divergence
+  and the `frps help`/`completion` rc divergence are recorded — the first filed as an item below,
+  the second in `docs/developing.md` § Maintenance policy: feature surface.
   **Three things this does not claim.** (1) The `--allow-unsafe`/`TokenSourceExec` gate is not run:
   Go's verify does run its post-load `ValidateServerConfig`
   (`pkg/config/v1/validation/validator.go:22-27` via `auth.go:34-35`, reached from
   `cmd/frps/verify.go:46-48`), so `frps verify -c <exec tokenSource>` is Go rc **1**
   (`unsafe feature "TokenSourceExec" is not enabled …`) and head rc **0** — the same pre-existing
-  divergence `frpc verify` has, left alone so the two verifies keep agreeing. (2) Trailing
+  divergence `frpc verify` has, now filed as its own item below. (2) Trailing
   positionals: Go's `verifyCmd` sets no `Args` validator, so `frps verify -c <valid> junk` is Go
   rc **0** and head rc **1** — the same divergence `frpc verify -c <valid> junk` has (measured,
   Go 0 / frp-rs 1). (3) The run path's `frps -c a.toml -c b.toml` has no last-wins either before or
   after this (`svr_config`, not `config_arg`); only the verify subcommand takes pflag's last-wins.
-  Head sha `ed3c1f8`; carriers: `CHANGELOG.md`, `docs/developing.md` § CLI inputs (three corrected
-  rows, a new `frps` hoist table and a new `#### frps verify (Go's verifyCmd)` section).
+  Head sha `ed3c1f8` — the commit that implemented the item; the review-fix commit(s) follow it
+  on the same branch, and every claim above was re-derived at the frozen head before that round.
+  Carriers: `CHANGELOG.md`, `docs/developing.md` § CLI inputs
+  (three corrected rows, the new `frps` hoist table, the new `#### frps verify (Go's verifyCmd)`
+  section and the four review-round rows), `docs/developing.md` § Maintenance policy: feature
+  surface (`help`/`completion`). **Ledger:** this item was the 84th closed; the three items filed
+  by the review round (this one's `--allow-unsafe` gate, `frpc verify`'s success line, and `frps`'s
+  missing `--vhost-http-timeout`) take the open count from 17 to **20** — 84 closed / 20 open.
 - [x] **The `3`-vs-`4` exit code is chosen by a substring match on the formatted error, so the
   *same* failure exits differently depending on a path or URL inside it.** `is_token_error`
   (`frp-core/src/logging.rs:474`) is `msg.contains("token") || msg.contains("auth")`, and the
@@ -3576,6 +3610,72 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   **Where the guard is weak, stated:** on `frps` no test can distinguish the typed arm from a text
   match, because every reachable frps construction message contains `auth`/`token` — a substring
   mutant in `frps/src/main.rs` passes all 19 of that file's tests (verified by attempting it).
+
+- [ ] **`frps verify` / `frpc verify` do not run the post-load `--allow-unsafe` gate, so `verify`
+  accepts a config the daemon refuses.** Found by the reviewers of the `frps verify` round; the
+  sentence that pointed at "its own item" in `docs/developing.md` § CLI inputs named an item that
+  did not exist, which is what filed this one.
+  Evidence, all measured on Go v0.71.0 darwin/arm64 and the frp-rs debug binaries with one fresh
+  config and one fresh free port per row, stdout/stderr in separate files, the exit status read
+  directly from the child, every child bounded (5 s) and reaped. Config in every row:
+  `[auth] method = "token"` + `[auth.tokenSource] type = "exec"` with a `command` set.
+  * `frps verify -c <that config>` → Go rc **1**, stdout `unsafe feature "TokenSourceExec" is not
+    enabled. To enable it, ensure it is allowed in the configuration or command line flags`,
+    stderr 0 B; frp-rs head rc **0**, `frps: the configuration file <p> syntax is ok`.
+  * `frpc verify -c <that config>` → Go rc **1**, the same line; frp-rs rc **0**,
+    `Config file <p> is valid`.
+  * `frps -c <that config>` / `frpc -c <that config>` (**run** path) → Go rc **1**, the same line;
+    frp-rs rc **3** (the `EXIT_AUTH` construction refusal, a documented extension).
+  * `--allow-unsafe TokenSourceExec` makes **all** of the above Go rc 0, and frp-rs's `verify` rc 0
+    as well.
+  So the gate exists on both sides but at a different **stage**: Go applies it in
+  `ValidateServerConfig` (`ValidateUnsafeFeature`, `pkg/config/v1/validation/validator.go:22-27`,
+  called for `tokenSource.Type == "exec"` at `pkg/config/v1/validation/auth.go:34-35`), which both
+  Go's run path (`cmd/frps/root.go:85-94`) and its verify (`cmd/frps/verify.go:46-48`) run;
+  frp-rs applies it only in service construction (`frp-server/src/service.rs`, via
+  `frp_core::auth::validate_token_source_unsafe`), which `verify` never reaches. The client has
+  carried the same divergence since its verify existed (`frp-core/src/config/tests.rs`:
+  "Go refuses both spellings … frp-rs strict `verify` exits 0").
+  **Done-when:** run the gate on the load path (one place, both binaries, both commands) so
+  `verify` refuses what the daemon refuses, and give each row above a measured pin; or record it
+  as a deliberate divergence in `docs/developing.md` § CLI inputs **and** in the feature-surface
+  policy, with the reason the two stages are allowed to differ. No sha.
+- [ ] **`frpc verify`'s success line is not Go's, and now differs from `frps verify`'s too.**
+  Recorded as "a second, adjacent divergence left alone" by the output-shape round
+  (`docs/developing.md` § Output stream and shape on a config-load failure) and mentioned in
+  `CHANGELOG.md`; the `frps verify` round gave the **server** verify Go's exact line and
+  deliberately left the client's, because moving it touches `frpc/tests/cli_exit_codes.rs` and is
+  outside that item's done-when.
+  Evidence, measured on Go v0.71.0 and the frp-rs debug binaries (streams separated, rc direct):
+  * `frps verify -c <valid>` → both Go and frp-rs print `frps: the configuration file <p> syntax is
+    ok`, stderr 0 B — a match.
+  * `frpc verify -c <valid>` → Go prints `frpc: the configuration file <p> syntax is ok`, stderr
+    0 B; frp-rs prints `Config file <p> is valid` plus three indented summary lines
+    (`Server: …`, `Proxies: …`, `Visitors: …`), stderr 0 B.
+  The rc, the stream and the verdict are Go's on both; only the sentence differs, and the two
+  frp-rs verifies now disagree with each other while each agrees with its Go counterpart on rc.
+  **Done-when:** print Go's line (keeping or dropping the summary lines is a separate call worth
+  stating) and move `frpc/tests/cli_exit_codes.rs`'s exact-bytes pins in the same commit, or record
+  the divergence as deliberate **with the asymmetry to `frps verify` named** in
+  `docs/developing.md`. No sha.
+- [ ] **`frps` does not register Go's `--vhost-http-timeout`, so an argv Go's `frps` accepts is
+  refused here — on both paths.** Surfaced by the `frps verify` round's flag-surface work.
+  Evidence, measured on Go v0.71.0 and the frp-rs debug binaries (own config and free port per row,
+  streams separated, rc direct, children bounded and reaped):
+  * Flag-set diff from the two binaries' rendered `--help`: **Go-only = {`vhost-http-timeout`}**,
+    frp-rs-only = {`config-dir`, `log-format`}. So this is the one Go `frps` root flag frp-rs does
+    not model at all (the config-file key `vhost_http_timeout` **is** supported — `docs/config.md`).
+  * `frps --vhost-http-timeout 30 -c <valid>` → Go rc **143** (bounded: `frps started
+    successfully`); frp-rs rc **1**, `` `--vhost-http-timeout` is not expected in this context ``,
+    identical on the base (`37f91cd`) and the head — a **pre-existing** gap, not introduced by the
+    `frps verify` work.
+  * `frps verify --vhost-http-timeout 30 -c <valid>` → Go rc **0** (`syntax is ok`; `verifyCmd`
+    ignores the flag); frp-rs rc **1**, the same refusal. Newly *visible* on `verify` because
+    `verify` is new.
+  **Done-when:** register the flag on the run path with Go's default (`60`,
+  `pkg/config/flags.go:237`) and let `verify` inherit it through the shared builder, with one
+  end-to-end row per path; or record it as a deliberate surface reduction in the feature-surface
+  policy. No sha.
 
 ---
 
