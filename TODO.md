@@ -2948,7 +2948,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   pattern). `CHANGELOG.md` gets no entry: test-harness only, no user-visible behaviour. The same
   shape elsewhere in the tree is **not** closed by this item — it has its own item immediately
   below.
-- [ ] **`frp-server/tests/reload_integration.rs` has seven unguarded spawn sites and can orphan its children on a panic path.**
+- [x] **`frp-server/tests/reload_integration.rs` has seven unguarded spawn sites and can orphan its children on a panic path.**
+  Done on `fix/reload-guards` at `d151fda` (based on `095b83a`, #396), two commits:
+  `f31a4c9` the guard + its test, `d151fda` the residual sweep.
   Evidence: `.spawn()` at `:262`, `:272`, `:504`, `:523`, `:741`, `:750`, `:781` (frps/frpc pairs
   plus one more frps). None is wrapped in a kill-on-drop guard — the children are killed by explicit
   `kill()`/`wait()` calls at the end of each test body (`:355-358`, `:635-638`, `:767-768`,
@@ -2970,6 +2972,36 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   forces a spawn or wait failure and asserts no child outlives the test — in the style of
   `frp-server/tests/frps_handle_orphan.rs` — or the file is deleted in favour of `common`'s
   handles; and the admin_cli/cli_exit_codes residuals are either guarded or recorded as deliberate.
+  **Done (2026-09-28, at `d151fda`).** (a) `frp-server/tests/common/mod.rs` gains
+  `ChildGuard::new(child)`: constructed on the line after `spawn()` returns and before the first
+  wait, `Drop` kills **and** reaps, idempotent with an explicit `kill_and_reap()`, and its doc
+  states what it does not cover (`Drop` never runs on `abort`; it signals the direct child only).
+  All seven spawn sites (`:259`, `:271`, `:504`, `:524`, `:744`, `:755`, `:787` at this head) are
+  wrapped; the end-of-body `kill()`/`wait()` pairs became `kill_and_reap()`. (b) The new test
+  `reload_integration.rs::spawn_failure_does_not_orphan_the_child_started_before_it` forces the
+  item's own shape — a mode-644 copy of the resolved `frpc`, so `.exists()` passes and `spawn`
+  fails `EACCES` — inside `catch_unwind` so the guard's `Drop` runs during the unwind, then
+  asserts the observed `frps` pid is gone (`kill -0`), its port is not accepting and is
+  rebindable, killing a regression's survivor by pid before failing (style:
+  `frp-server/tests/frps_handle_orphan.rs`, which observes a `JoinError` instead because its
+  failing wait is async). (c) Measured from the shell after the harness exited, both arms the
+  item's shape and nothing else (a temporary target, deleted before the commit): unguarded
+  `pgrep -x frps` **0 → 1**, `ps` showing `PPID 1` (`38280 1 /tmp/rg-target/debug/frps …`) and
+  `lsof` the port still `LISTEN`; guarded **0 → 0**, port free; control arm proves the shape is
+  `EACCES` on a real binary. (d) Residuals **guarded**, not recorded: the `try_wait().expect(..)`
+  panic paths in `frps/tests/cli_exit_codes.rs` (item `:87`/`:258`/`:284`; tree `:99`/`:441`/`:467`)
+  and `frpc/tests/cli_exit_codes.rs` (item `:96`; tree `:115`) now go through a local
+  `try_wait_or_kill` that kills + reaps on the error path before panicking — the item's allowed
+  "kill in the expect path" form — as do `frpc/tests/admin_cli.rs`'s `wait_with_timeout` and
+  `expect_one_connection` (its `oracle accept failed` arm now kills first; the timeout arm already
+  did), plus two same-class sites not in the item (`frpc/tests/cli_inputs.rs:223`,
+  `frpc/tests/cli_persistent_flags.rs:192`). The one exception, recorded as deliberate:
+  `frpc/tests/admin_cli.rs` `connections_after_exit`'s `oracle accept failed` runs *after* the
+  child exited, so no live child is in scope. No test was added or removed in a guarded lane:
+  `env.FRPS_CLI_TESTS` stays **27** and `env.FRPC_TINY_CLI_TESTS` stays **11**, both re-measured
+  with the guard's own `-- --list` pattern. No `CHANGELOG.md` entry: test-harness only.
+  `scripts/compat-test.sh` is not relevant (no wire surface). Full evidence, including the orphan
+  table and a "least sure" section: `/tmp/reload-guards-report.md`.
 - [x] **`frpc`'s eight single-proxy subcommands reject `-c`/`--config`, which Go accepts and
   ignores.** Go's `-c` is a persistent rootCmd flag, so every subcommand parses it; the single-proxy
   commands simply never read the value. frp-rs's bpaf parsers for `tcp`/`udp`/`http`/`https`/`stcp`/
