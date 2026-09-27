@@ -319,6 +319,40 @@ jobs:
             exit 1
           fi
           echo "frps CLI exit-code guard ok: $n tests listed (expected $FRPS_CLI_TESTS), 0 failed"
+      - name: Run frps CLI completion tests (merged-config completion order)
+        # `frps/tests/cli_completion.rs` pins the CLI-override completion order
+        # (TODO.md "The rest of the server-side completion is not Go's"): an
+        # empty `--bind-addr`/`--dashboard-addr` must pass through
+        # `ServerConfig::complete` exactly as Go completes its merged struct.
+        # Without this step the file executed in no lane — the step above is
+        # target-specific (`--test cli_exit_codes`) and every other lane that
+        # runs a test target is `-p frp-server`.
+        #
+        # `--features dashboard` is load-bearing: the dashboard regression (an
+        # empty `--dashboard-addr` handed to the listener as `:<port>`) is only
+        # covered when the dashboard is compiled in. In the no-dashboard build
+        # the file's dashboard shapes take their documented inert branch, and
+        # `--bind-port 0` is the reason the step needs a *real* bind: `:7000`
+        # may be occupied on the runner, which the test tolerates because it
+        # asserts the completed address in the child's own listener line (see
+        # the file).
+        #
+        # Cost: one `frps --features dashboard` rebuild. The `Tests (server
+        # integration)` job restores the same `target/` cache key and builds this
+        # exact artifact as its first step, so the compiled object files are
+        # shared through the cache (jobs run on separate runners — this step does
+        # not hand the artifact to that job within a run). It is a different
+        # *target* from the guarded `cli_exit_codes`, so `env.FRPS_CLI_TESTS`
+        # does not move.
+        #
+        # The same feature flag is what keeps this step clear of the artifact
+        # swap: a plain `cargo test -p frps` builds `target/debug/frps` **without**
+        # the dashboard (TODO.md's feature-swap item) and would leave a swapped
+        # artifact behind for any later step in this job; this step's build
+        # carries the dashboard. Whichever step runs last in this job decides
+        # what `target/debug/frps` holds, which is why the `--features dashboard`
+        # lane that needs the marker builds it immediately before running.
+        run: cargo test -p frps --features dashboard --test cli_completion
       - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
         # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag
         # exit-code fix has to hold in the no-default-features build too — but
