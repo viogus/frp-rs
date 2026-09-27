@@ -387,18 +387,26 @@ impl ServerConfig {
     /// Apply conditional defaults matching Go frp dev (fatedier/frp@d486018)
     /// `ServerConfig.Complete()`. Call after deserialization, before consuming.
     ///
-    /// **Call order is part of the contract.** Go runs this on the *merged*
-    /// config: `cmd/frps/root.go:78-81` completes the flags-only struct, and
-    /// `config.LoadServerConfig` completes the `-c` struct after the flags are
-    /// bound onto it. A caller that overlays CLI flags (or any other late
-    /// input) must therefore complete afterwards — take the file from
+    /// **Call order is part of the contract.** Go completes a
+    /// **flag-populated** struct only on its flags-only path
+    /// (`cmd/frps/root.go:77-83`: `serverCfg.Complete()` on the struct pflag
+    /// bound, no config file involved). Its `-c` path builds a *fresh*
+    /// `svrCfg = &v1.ServerConfig{}` (`pkg/config/load.go:313`), unmarshals the
+    /// file into that, and completes **it** (`load.go:318-321`); the
+    /// pflag-bound `serverCfg` is never completed and is dropped, which is why
+    /// Go ignores the flags in that lane (`frp-core/src/cli.rs:2862` records the
+    /// same rule: flags apply only when `cfgFile == ""`). frp-rs mirrors both
+    /// lanes — on `-c` it also ignores the flags, and on its override lane it
+    /// overlays and *then* completes, the same shape as Go's flags-only path. A
+    /// caller that overlays CLI flags (or any other late input) must therefore
+    /// complete afterwards — take the file from
     /// `load_server_config_uncompleted`, overlay, then complete — and never
-    /// complete first and overlay later. Three fields make the difference
-    /// observable: `bind_addr` (`""` filled to `0.0.0.0`), `web_server.addr`
-    /// (`""` filled to `127.0.0.1`), and `proxy_bind_addr` (inherits the
-    /// **effective** `bind_addr`, so a late `--bind-addr` moves the proxy
-    /// listeners too — measured end to end, see `docs/developing.md` § CLI
-    /// inputs § 2b).
+    /// complete first and overlay later. Four fields make the difference
+    /// observable: `bind_addr` (`""` filled to `0.0.0.0`), `bind_port` (`0`
+    /// filled to `7000`), `web_server.addr` (`""` filled to `127.0.0.1`), and
+    /// `proxy_bind_addr` (inherits the **effective** `bind_addr`, so a late
+    /// `--bind-addr` moves the proxy listeners too — measured end to end, see
+    /// `docs/developing.md` § CLI inputs § 2b).
     pub fn complete(&mut self) {
         // Go frp: `BindAddr = util.EmptyOr(BindAddr, "0.0.0.0")`
         // (`pkg/config/v1/server.go:110`), which runs BEFORE the `ProxyBindAddr`

@@ -324,52 +324,49 @@ jobs:
         # (TODO.md "The rest of the server-side completion is not Go's"): an
         # empty `--bind-addr`/`--dashboard-addr` must pass through
         # `ServerConfig::complete` exactly as Go completes its merged struct.
-        # Without this step the file executed in no lane. Of the `frps` package's
+        # Before this step the file executed in no lane. Of the `frps` package's
         # targets, the only one any lane ran was `--test cli_exit_codes`
-        # (the step above); `frps/src` carries **no** `#[test]`/`#[tokio::test]`
-        # (so the package's lib/bin targets are empty) and `frps/tests/` holds
-        # only these two files, so this file was genuinely the one target the job
-        # had never executed. The other `cargo test` steps in this workflow are
-        # other packages (`-p frp-core`, `-p frpc`, `-p frp-client`,
+        # (the step above); `frps` declares no library target at all
+        # (`cargo test -p frps --lib` is `error: no library targets found`) and
+        # its `src/` carries no `#[test]`/`#[tokio::test]`, while `frps/tests/`
+        # holds only these two files — so this file was genuinely the one target
+        # the job had never executed. The other `cargo test` steps in this
+        # workflow are other packages (`-p frp-core`, `-p frpc`, `-p frp-client`,
         # `-p frp-server`, and the `--workspace --lib` step, whose `--lib`
         # restricts it to library targets).
         #
         # `--features dashboard` is load-bearing: the dashboard regression (an
         # empty `--dashboard-addr` handed to the listener as `:<port>`) is only
         # covered when the dashboard is compiled in. In the no-dashboard build
-        # the file's dashboard shapes take their documented inert branch, and
-        # `--bind-port 0` is the reason the step needs a *real* bind: `:7000`
-        # may be occupied on the runner, which the test tolerates because it
-        # asserts the completed address in the child's own listener line (see
-        # the file).
+        # the file's dashboard shapes take their documented inert branch (and are
+        # not red pre-fix — see that file). `--bind-port 0` is the deliberate
+        # exception: `:7000` may be occupied on the runner, so that shape asserts
+        # the **pre-bind** `frps starting on …:7000` line and has no connect leg,
+        # on purpose.
         #
         # Cost: one `frps --features dashboard` rebuild. The `Tests (server
-        # integration)` job restores the same `target/` cache key and builds this
-        # exact artifact as its first step, so the compiled object files are
-        # shared through the cache (jobs run on separate runners — this step does
-        # not hand the artifact to that job within a run). It is a different
-        # *target* from the guarded `cli_exit_codes`, so `env.FRPS_CLI_TESTS`
-        # does not move.
+        # integration)` job restores the same `target/` cache key and builds the
+        # same artifact (it builds `frpc` first, then `frps --features
+        # dashboard`), so the compiled object files are shared through the cache.
+        # Jobs run on separate runners: this step does not hand an artifact to
+        # that job within a run. It is a different *target* from the guarded
+        # `cli_exit_codes`, so `env.FRPS_CLI_TESTS` does not move.
         #
-        # The same feature flag is what keeps this step clear of the artifact
-        # swap: a plain `cargo test -p frps` builds `target/debug/frps` **without**
-        # the dashboard (TODO.md's feature-swap item), and this step's test
-        # invocation compiles the dashboard-enabled graph instead. Measured here
-        # (macOS, warm, marker = `grep -ac "Dashboard listening on"
-        # target/debug/frps`): after `cargo test -p frps` the marker is 0; after
-        # this step's `cargo test -p frps --features dashboard --test
-        # cli_completion` it is 1, and it stays 1 on a repeat; a later plain
-        # `cargo build -p frps` resets it to 0, and a later `cargo build -p frps
-        # --features dashboard` sets it back to 1. So this step leaves a
-        # **dashboard** artifact behind, which is the safe direction for any
-        # later consumer, and no step in this job consumes `target/debug/frps` as
-        # a dashboard binary anyway (this file resolves the binary through
-        # `CARGO_BIN_EXE_frps`); the `Tests (server integration)` job runs on its
-        # own runner and builds the dashboard artifact itself. The point of the
-        # flag is that the dashboard-shaped assertions execute with a dashboard
-        # binary — and the test file re-checks the marker in the resolved binary
-        # at run time, so a swapped artifact would take the documented inert
-        # branch rather than silently pass as dashboard coverage.
+        # The feature flag also decides what this step leaves at
+        # `target/debug/frps`. Measured here (macOS, warm, marker =
+        # `grep -ac "Dashboard listening on" target/debug/frps`): after
+        # `cargo test -p frps` the marker is 0; after this step's
+        # `cargo test -p frps --features dashboard --test cli_completion` it is 1,
+        # stable on a repeat; a later plain `cargo build -p frps` resets it to 0
+        # and a later `cargo build -p frps --features dashboard` sets it back to
+        # 1. So the step leaves a **dashboard** artifact behind, the safe
+        # direction for any later consumer; and even if it did not, the test file
+        # re-checks the marker in the binary it resolves at run time and would
+        # take the documented inert branch rather than silently pass as dashboard
+        # coverage. (The binary it resolves is `CARGO_BIN_EXE_frps`, which *is*
+        # `<target>/debug/frps`, so it is not insulated from a swap — the
+        # run-time marker check is what makes a swap visible rather than
+        # misleading.)
         run: cargo test -p frps --features dashboard --test cli_completion
       - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
         # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag

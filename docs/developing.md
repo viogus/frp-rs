@@ -1206,9 +1206,14 @@ Go applies its flags before `ServerConfig.Complete()`.** `frps` reads
 reach the listener are the merged ones. Until this change the file was completed
 first (`frp-core/src/config/file.rs`) and the overrides were written afterwards
 (`FrpsArgs::override_server_config`), which made every **empty** override bypass
-the completion that fills it: Go applies the flags to the struct and calls
-`Complete()` afterwards on both paths (`cmd/frps/root.go:78-81` for flags-only;
-`config.LoadServerConfig` for `-c`). The loader now has an un-completed entry
+the completion that fills it. Go's ordering is *per lane*: only the flags-only
+path completes a struct the flags have populated (`cmd/frps/root.go:77-83`); the
+`-c` path loads a fresh struct from the file and completes that
+(`pkg/config/load.go:313`, `:318-321`), discarding the pflag-bound one, which is
+why Go ignores the flags there — and why frp-rs, which also ignores them on `-c`
+(`FrpsArgs::cli_overrides_enabled`), matches Go on that lane for a different
+reason. frp-rs's override lane is the analogue of Go's flags-only path. The
+loader now has an un-completed entry
 point (`load_server_config_uncompleted`) that `frps/src/main.rs` overlays and
 completes, and `ServerConfig::complete` gained Go's
 `c.BindAddr = util.EmptyOr(c.BindAddr, "0.0.0.0")`
@@ -1261,9 +1266,11 @@ Three things this does **not** claim:
   `127.0.0.1`. Measured and explained: Go registers the flag with its default
   written straight into the struct field —
   `StringVarP(&c.WebServer.Addr, "dashboard_addr", "", "0.0.0.0", …)`
-  (`pkg/config/flags.go:239`) — so an absent flag supplies `0.0.0.0`, the
-  `util.EmptyOr` in `WebServer.Complete()` cannot fire, and the value comes from
-  the later `if Port > 0 { Addr = EmptyOr(Addr, "0.0.0.0") }` branch instead. An
+  (`pkg/config/flags.go:239`) — so an absent flag supplies `0.0.0.0` and the
+  `util.EmptyOr` in `WebServer.Complete()` cannot fire; the later
+  `if Port > 0 { Addr = EmptyOr(Addr, "0.0.0.0") }` branch cannot fire either
+  (`Addr` is already `0.0.0.0`), so the binding comes from the pflag default
+  itself, not from that branch. An
   explicit empty flag overwrites the field with `""` and is then completed to
   `127.0.0.1`. That flags-only shape has no frp-rs equivalent to match (frp-rs
   always reads a file in this lane), so nothing changed there; the row is
@@ -1279,9 +1286,20 @@ Three things this does **not** claim:
 
   | file `bind_addr` | argv | Go v0.71.0 proxy | frp-rs before | frp-rs now |
   |---|---|---|---|---|
-  | `127.0.0.1` | *(none)* | `127.0.0.1:<port>` (`-c`) | `127.0.0.1` | `127.0.0.1` |
-  | `127.0.0.1` | `--bind-addr 0.0.0.0` | *(no Go equivalent: Go ignores flags with `-c`)* | `127.0.0.1` | `0.0.0.0` |
-  | `0.0.0.0` | `--bind-addr 127.0.0.1` | *(Go `-c` ignores the flag → `0.0.0.0`)* | `0.0.0.0` | `127.0.0.1` |
+  | `127.0.0.1` | *(none)* | `127.0.0.1:19872` (`-c`) | `127.0.0.1` | `127.0.0.1` |
+  | `127.0.0.1` | `--bind-addr 0.0.0.0` | **flags-only equivalent** `--bind_addr 0.0.0.0 --proxy_bind_addr ""` → `*:19902`; the exact file+flag shape has no Go analogue, because Go's `-c` lane ignores the flags | `127.0.0.1` | `0.0.0.0` |
+  | `0.0.0.0` | `--bind-addr 127.0.0.1` | **flags-only equivalent** `--bind_addr 127.0.0.1 --proxy_bind_addr ""` → `127.0.0.1:19904`; `-c` with the same file and flag stays `*:19874` (flags ignored) | `0.0.0.0` | `127.0.0.1` |
+
+  The two Go rows are the measurement that decides whether the widening below is
+  Go-correct, and they say it is: on Go, an empty `proxyBindAddr` inherits the
+  **post-flag** `bind_addr` (`Complete()` runs after pflag has written the struct),
+  so `--bind_addr 0.0.0.0 --proxy_bind_addr ""` puts the proxy listener on
+  `0.0.0.0` and `--bind_addr 127.0.0.1` puts it on `127.0.0.1` — exactly what the
+  head column does. The one thing frp-rs does that no Go lane does is combine a
+  **file** value with an overriding flag: on Go those two never meet (the `-c`
+  lane drops the flags, the flags-only lane has no file), so "file `bind_addr`
+  plus `--bind-addr`" is an frp-rs-only shape, and the defensible half of the
+  claim is that *within that shape* the completion follows Go's rule.
 
   So the proxy plane now **follows `--bind-addr` in both directions**. The
   widening row is the one to know about: a file that pins proxies to loopback

@@ -173,14 +173,18 @@ async fn run(mut cli: FrpsArgs) {
 
     // Single config mode: load config first, then init logging with [log] fallback.
     //
-    // Go ordering: Go binds the flag values onto the config struct and only then
-    // calls `ServerConfig.Complete()` (`cmd/frps/root.go:78-81`), so a flag value
-    // is always seen by the completion. frp-rs loads the file, overlays the CLI
-    // flags, and completes the merged result — the same effective order. See
+    // Go ordering: Go completes a **flag-populated** struct only on its
+    // flags-only path — `cmd/frps/root.go:77-83`, no config file involved. Its
+    // `-c` path loads a fresh struct from the file and completes that
+    // (`pkg/config/load.go:313`, `:318-321`), discarding the pflag-bound one, so
+    // Go ignores the flags there; frp-rs matches by ignoring them on `-c` too.
+    // On the override lane frp-rs loads the file, overlays the CLI flags, and
+    // completes the result — the same shape as Go's flags-only path. See
     // `load_server_config_uncompleted` for the fields where writing the override
-    // after `complete()` was observable (`bind_addr`, `web_server.addr`, and the
-    // derived `proxy_bind_addr`, which now follows `--bind-addr`; measured end to
-    // end in `docs/developing.md` § CLI inputs § 2b).
+    // after `complete()` was observable (`bind_addr`, `bind_port`,
+    // `web_server.addr`, and the derived `proxy_bind_addr`, which now follows
+    // `--bind-addr`; measured end to end in `docs/developing.md` § CLI inputs
+    // § 2b).
     let config_path = cli.config_path();
     let mut cfg = match load_server_config_uncompleted(&config_path, cli.strict_config) {
         Ok(cfg) => cfg,

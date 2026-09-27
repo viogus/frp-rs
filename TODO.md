@@ -2470,11 +2470,19 @@ agent commits), which matters because the *reason* for two reviewers is that no 
 - [x] **The rest of the server-side completion is not Go's: an empty `bindAddr` is not filled, and
   an empty `--dashboard-addr` bypasses `complete()` entirely so the dashboard cannot start.** Both
   found while fixing the empty `webServer.addr` above; both fail *closed* (a refused start, or a
-  dead dashboard on a live control listener), neither is security-relevant, and both are
-  Go-divergent.
+  dead dashboard on a live control listener). **Neither gap widens or adds any listening socket:**
+  measured with the real binaries and `lsof -nP -iTCP:<port> -sTCP:LISTEN`, base `--bind-addr ""`
+  exits 1 having bound **nothing**, and base `--dashboard-addr ""` with credentials leaves the
+  control listener up while the dashboard port has **no socket** — so the impact of both is
+  availability only (a refused start, a dashboard gap on an otherwise live server), and the
+   `--proxy-bind-addr`/proxy-listener widening recorded below is a *separate*, deliberate
+  consequence of matching Go. Both gaps are otherwise Go-divergent.
   * **(a) `--dashboard-addr ""` is applied after `complete()`, so the dashboard is handed
-    `:<port>`.** `frps` loads and completes the config (`frp-core/src/config/file.rs:25` calls
-    `cfg.complete()`), then applies CLI overrides (`frps/src/main.rs:191`
+    `:<port>`.** `frps` loads and completes the config (on the pre-fix tree,
+    `frp-core/src/config/file.rs:25` calls `cfg.complete()`; that is **base numbering** — on this
+    branch the load is un-completed and the completion happens in `frps/src/main.rs:205` after the
+    overlay, so the numbered sites below are given per tree), then applies CLI overrides
+    (pre-fix `frps/src/main.rs:191`, now `:202`
     `cli.override_server_config(&mut cfg)`, inside `cli_overrides_enabled()`) whose dashboard-addr
     assignment is `frp-core/src/cli.rs:2309-2311` — with no `-c`/`--config-dir` the flag value is
     therefore written **after** the completion that would have filled it. Measured at the head of
@@ -2512,9 +2520,12 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   **Done (commit `fix/server-addr-completion`).** Order, not a special case: `frps/src/main.rs`
   now loads the file **un-completed** (`config::load_server_config_uncompleted`, new in
   `frp-core/src/config/file.rs`; `load_server_config` is the completing wrapper it used to be),
-  overlays the flags, and only then calls `cfg.complete()`. That is Go's order on both paths —
-  `cmd/frps/root.go:78-81` completes the flags-only struct, `config.LoadServerConfig` completes the
-  `-c` struct with the flags already bound — so *every* completed input the CLI can write is filled
+  overlays the flags, and only then calls `cfg.complete()`. Go's ordering is per lane, and the
+  flags-only lane is the one frp-rs's override lane mirrors: `cmd/frps/root.go:77-83` completes the
+  struct pflag bound, while the `-c` lane builds a fresh `svrCfg`
+  (`pkg/config/load.go:313`), unmarshals the file into it and completes that (`:318-321`) — the
+  pflag-bound struct is dropped, so Go ignores the flags there (frp-rs does too). So *every*
+  completed input the CLI can write is filled
   (`bind_addr`, `bind_port`, `proxy_bind_addr`, `web_server.addr`) instead of only the dashboard
   address, which is why re-running `WebServer.Complete()` at the CLI site was rejected: it would have
   fixed one of the four sites and left `--bind-addr ""`/`--bind-port 0` broken. (Second rejected
@@ -2539,18 +2550,32 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   * `bindAddr = ""` **in the file**, no flag → Go `*:19815` / before exit 1 / now `*:19815`.
   * `--config-dir <dir>` with `bindAddr = ""` in the file (same fill, different lane — the loader
     split left this lane on the completing `load_server_config`, but the fill itself changes it):
-    before **rc 0 with nothing bound** (a silent no-op), now `*:19881` listening; Go has no
-    `frps --config-dir` (`Error: unknown flag: --config-dir`, rc 1), so the analogue is Go's `-c`
-    lane, which binds `0.0.0.0` for the same file.
+    before **rc 0 with nothing bound**, now `*:19881` listening. Not "silent": the pre-fix run did
+    emit `ERROR frps: frps service error for config file [...]: failed to lookup address
+    information` (1489 bytes on stdout, none on stderr) — the defect is that the **exit code was 0**
+    for a service that never bound. Go has no `frps --config-dir`
+    (`Error: unknown flag: --config-dir`, rc 1), so the analogue is Go's `-c` lane, which binds
+    `0.0.0.0` for the same file.
   * Absent-flag controls: `--dashboard-addr` absent keeps the file's `127.0.0.1:19802` (Go's
     flags-only absent flag binds `0.0.0.0:19802`, because pflag writes its flag default straight
     into `c.WebServer.Addr` — `pkg/config/flags.go:239` — so `WebServer.Complete()`'s `EmptyOr`
     cannot fire; frp-rs has no flags-only mode, so there is nothing to match); `--bind-addr` absent
     keeps the file's `127.0.0.1:19807` on both.
-  * Other-override sweep: only `bind_addr`, `bind_port`, `proxy_bind_addr` and `web_server.addr`
-    feed a completion; `log.*`, `auth.token`, `allow_ports`, `tls_only`, the port numbers,
-    `max_ports_per_client` and the dashboard TLS paths are absolute writes with no completion
-    input, so they were already correct.
+  * Other-override sweep, corrected by measurement (reviewer R2 F2): `bind_addr`, `bind_port`,
+    `proxy_bind_addr` and `web_server.addr` are the fields *this* `complete()` fills, and
+    `auth.token`, `allow_ports`, `tls_only`, the port numbers, `max_ports_per_client` and the
+    dashboard TLS paths are absolute writes that no completion reads. **`log.*` is different and
+    the first version of this entry was wrong about it:** Go's `ServerConfig.Complete()` calls
+    `c.Log.Complete()` (`pkg/config/v1/server.go:105`) which is
+    `To = EmptyOr(To, "console")`, `Level = EmptyOr(Level, "info")`, `MaxDays = EmptyOr(MaxDays, 3)`
+    (`pkg/config/v1/common.go:119-123`), and `frps`'s CLI writes all three. frp-core's
+    `ServerConfig::complete` has **no** log completion, and the serde defaults only fire on an
+    absent key, so an explicit empty value survives: measured, `frps --log-level ""` and
+    `frps --log-file ""` each produce **zero bytes on both streams** while the listener still comes
+    up (base and head alike), where Go v0.71.0 with `--log_level ""` still logs at `info`
+    (282 bytes of startup lines). This is **pre-existing**, not a regression of this change; it is
+    filed as its own item (see below) rather than fixed here, because closing it is a behaviour
+    change that needs its own compat rows.
   * **`proxy_bind_addr` inheritance — a measured behaviour change that the first version of this
     entry wrongly called "not observable" (reviewer R2 F1).** `complete()` now derives
     `proxy_bind_addr` from the **post-override** `bind_addr`, which is Go's order (`Complete()` runs
@@ -2591,8 +2616,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   against the 5-test version of this file), the four failures carrying exactly the measured
   pre-fix log (`Dashboard web UI starting on :<port>` + `Dashboard server failed: failed to lookup
   address information`; `frps error: failed to lookup address information`). The same file against a
-  pre-fix **no-dashboard** binary (built `--no-default-features` from the pre-fix tree) is
-  **3 passed / 3 failed** —
+  pre-fix **no-dashboard** binary (built from a pre-fix tree with the *default* features — `cargo
+  build -p frps`, or equivalently `--no-default-features --features full`; note
+  `--no-default-features` alone produces **no** `target/debug/frps`, because the bin is declared
+  `required-features = ["full"]`) is **3 passed / 3 failed** —
   `cli_empty_dashboard_addr_binds_loopback` **passes** pre-fix there, because with the dashboard
   compiled out there is no empty address handed to a listener; the dashboard regression is therefore
   covered **only** under `--features dashboard`, which is why the CI step passes that flag. Both
@@ -2610,6 +2637,29 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   CHANGELOG.md frp-core/src frps/src`: the remaining hits are this item's own historical
   measurements, the frpc admin-address one (`docs/developing.md:1098`, a different path), and the
   code/log sites themselves.
+- [ ] **`frps` has no `Log.Complete()`: an explicit empty `--log-level`/`--log-file` silences the
+  server, where Go falls back to `info`/`console`.** Go's `ServerConfig.Complete()` calls
+  `c.Log.Complete()` (`pkg/config/v1/server.go:105`), which is
+  `To = util.EmptyOr(To, "console")`, `Level = util.EmptyOr(Level, "info")`,
+  `MaxDays = util.EmptyOr(MaxDays, 3)` (`pkg/config/v1/common.go:119-123`). frp-core's
+  `ServerConfig::complete` (`frp-core/src/config/server.rs`) has no log completion and the serde
+  defaults on `LogConfig` fire only when the key is **absent**, so an explicit empty string
+  survives into `init_logging` (`frps/src/main.rs`), and `frps`'s CLI writes all three fields
+  (`override_server_config`: `--log-file`, `--log-level`, `--log-max-days`). Measured (real Go
+  v0.71.0 vs frp-rs at `46f4543`, own free port, `[auth] token` set):
+  * frp-rs `--log-level ""` → **0 bytes on stdout and 0 on stderr**, listener up on
+    `127.0.0.1:19891`; frp-rs `--log-file ""` → same; frp-rs with neither flag → 1496 bytes of
+    `INFO` lines.
+  * Go v0.71.0 `--log_level ""` → 282 bytes of startup lines at `info`; the same for
+    `--log_file ""` and for the no-flag control.
+  Found while sweeping the CLI overrides for the completed-input hazard above (the sweep's first
+  version wrongly called `log.*` "already correct"). **Pre-existing**, not a regression of that
+  change; not fixed there because it is a behaviour change needing its own Go-binary rows.
+  **Done-when:** add the `Log.Complete()` fill to `ServerConfig::complete` (empty `to` → `console`,
+  empty `level` → `info`, zero `max_days` → 3, in Go's position at `server.go:105`) with a bounded
+  spawn test per shape that asserts the server still logs, plus a Go-binary measurement row each for
+  `--log-level ""`, `--log-file ""` and `--log-max-days 0`; absent values must keep the serde
+  default, and `--log-format` has no Go completion (verify that before touching it).
 - [x] **Two test-harness hazards: a feature swap that breaks the dashboard lane silently, and
   `FrpsHandle::start` orphaning its child on the panic path.**
   * **(a) `cargo test -p frps` and a clippy run that compiles `frps` replace `target/debug/frps`

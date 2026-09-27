@@ -132,14 +132,27 @@ fn used_ports() -> &'static std::sync::Mutex<std::collections::HashSet<u16>> {
 ///
 /// **What the no-dashboard arm does and does not prove.** It is a weaker check
 /// than the dashboard arm: measured against a **true** pre-fix no-dashboard
-/// binary (built with `--no-default-features` from the pre-fix tree — not a
-/// dashboard binary run under a no-dashboard *cargo* invocation, which still
-/// carries the dashboard listener and is what a first draft of this note got
-/// wrong), this file is **3 passed / 3 failed**:
-/// `cli_empty_dashboard_addr_binds_loopback` **passes** there, because with the
-/// dashboard compiled out there is no empty address handed to a listener, so the
-/// arm degenerates to "the control listener still works". The dashboard
-/// regression itself is red only under `--features dashboard` — against a
+/// binary, this file is **3 passed / 3 failed**:
+///
+/// ```text
+/// # build it either way — plain default features, or tiny+full explicitly:
+/// cargo build -p frps                       # no dashboard; no flag needed
+/// cargo build -p frps --no-default-features --features full   # same graph
+/// # NOT `cargo build -p frps --no-default-features` — that exits 0 but emits
+/// # no target/debug/frps, because the bin is `required-features = ["full"]`.
+/// FRPS_BIN=<that frps> cargo test -p frps --test cli_completion
+/// ```
+///
+/// (Also note what that measurement is *not*: a dashboard binary run under a
+/// no-dashboard *cargo* invocation still carries the dashboard listener, so it is
+/// not a no-dashboard probe — a first draft of this note made exactly that
+/// mistake and got 2 passed / 4 failed.)
+///
+/// The arm degenerates as follows: `cli_empty_dashboard_addr_binds_loopback`
+/// **passes** pre-fix there, because with the dashboard compiled out there is no
+/// empty address handed to a listener, so the arm reduces to "the control
+/// listener still works". The dashboard regression itself is red only under
+/// `--features dashboard` — against a
 /// pre-fix dashboard binary the same six tests are **2 passed / 4 failed**, the
 /// dashboard shape among the failures — which is why the CI step that runs this
 /// file passes `--features dashboard`. The arm is kept rather than skipped
