@@ -241,7 +241,7 @@ fn assert_clean_sigterm(
     std::fs::write(&frps_cfg, frps_config(ports.server)).expect("write frps config");
     std::fs::write(&frpc_cfg, make_client_config(&ports)).expect("write frpc config");
 
-    let mut frps = BoundedChild::spawn(
+    let frps = BoundedChild::spawn(
         &workspace_bin("frps"),
         &frps_cfg,
         dir.path().join("frps.log"),
