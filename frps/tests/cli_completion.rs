@@ -16,6 +16,21 @@
 //! of `frps`, so the in-tree assertion stays on the address the server reports
 //! at the point where it binds and on the socket being dialable.
 //!
+//! **Known limitation, stated rather than papered over.** The connect leg proves
+//! liveness, not the address: on this platform both `0.0.0.0:<port>` and
+//! `127.0.0.1:<port>` answer on loopback, so the wildcard-vs-loopback
+//! distinction rests on the address string the listener logs **after** a
+//! successful bind (`frp-server/src/service.rs` and `dashboard.rs` log it with
+//! the value they bound). A socket-level discriminator does exist in this repo
+//! for the sibling item — `frp-server/tests/dashboard_integration.rs`'s
+//! `tcp_connect_ok` + `local_non_loopback_ipv4`, which dial the host's
+//! non-loopback address and fail when the listener is loopback-only — and it was
+//! deliberately **not** adopted here: it needs a non-loopback IPv4 on the host
+//! (absent on some runners), it dials outside the loopback interface, and it
+//! would make this file depend on the `frp-server` test module for a check whose
+//! regression is "the string handed to `bind`". If that discrimination is ever
+//! needed at socket level, that helper is the place to take it from.
+//!
 //! Bounded: every wait has a deadline, every child is killed and reaped by
 //! [`ChildGuard::drop`] even on panic, and each test picks its own free ports.
 //! Credentials are set in every dashboard shape: without them frp-rs's
@@ -113,8 +128,23 @@ fn used_ports() -> &'static std::sync::Mutex<std::collections::HashSet<u16>> {
 /// * dashboard present → the dashboard must bind the completed `127.0.0.1`;
 /// * dashboard absent → `--dashboard-addr ""` must be inert (the dashboard is
 ///   not started at all) and, crucially, must **not** break the control
-///   listener. That second arm still catches the pre-fix defect, which made the
-///   empty value reach a bind and left the process unable to serve anything.
+///   listener.
+///
+/// **What the no-dashboard arm does and does not prove.** It is a weaker check
+/// than the dashboard arm: measured against a **true** pre-fix no-dashboard
+/// binary (built with `--no-default-features` from the pre-fix tree — not a
+/// dashboard binary run under a no-dashboard *cargo* invocation, which still
+/// carries the dashboard listener and is what a first draft of this note got
+/// wrong), this file is **3 passed / 3 failed**:
+/// `cli_empty_dashboard_addr_binds_loopback` **passes** there, because with the
+/// dashboard compiled out there is no empty address handed to a listener, so the
+/// arm degenerates to "the control listener still works". The dashboard
+/// regression itself is red only under `--features dashboard` — against a
+/// pre-fix dashboard binary the same six tests are **2 passed / 4 failed**, the
+/// dashboard shape among the failures — which is why the CI step that runs this
+/// file passes `--features dashboard`. The arm is kept rather than skipped
+/// because "the flag is inert without the feature" is itself a behaviour worth
+/// pinning, and because a silent skip would hide the file.
 ///
 /// This is the same "does the binary carry the marker" check CI uses for the
 /// artifact swap (`grep -ac "Dashboard listening on" target/debug/frps`, see
@@ -458,6 +488,66 @@ fn absent_bind_addr_flag_keeps_configured_value() {
     assert!(
         !line.contains(&format!("0.0.0.0:{bind_port}")),
         "an absent flag must not be completed to the wildcard, got: {line}"
+    );
+    assert_loopback_listens(bind_port);
+}
+
+/// The **`--config-dir` lane**: it never overlays CLI flags (Go parity — the
+/// file is authoritative), so it still resolves through the completing
+/// `load_server_config`, but the new `bind_addr` fill is observable in it.
+/// Measured: with `bindAddr = ""` in the file, the pre-fix binary exits **0
+/// with nothing bound** (a silent no-op — worse than the `-c` lane's
+/// loud lookup error), and the fixed binary binds `0.0.0.0:<port>`, which is
+/// what Go binds for the same file through its `-c` lane (`frps` has no
+/// `--config-dir`: Go exits 1 with `unknown flag: --config-dir`).
+///
+/// `--config-dir` collects every config file in a directory, so this test owns
+/// a one-file directory and its own free port.
+#[test]
+fn config_dir_empty_bind_addr_binds_wildcard() {
+    let bind_port = free_port();
+    let dir = TempDir::new();
+    let conf_dir = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_dir).expect("create config dir");
+    std::fs::write(
+        conf_dir.join("c1.toml"),
+        format!(
+            "bind_addr = \"\"\nbind_port = {bind_port}\n\n\
+             [auth]\nmethod = \"token\"\ntoken = \"cli-completion-test\"\n"
+        ),
+    )
+    .expect("write config");
+
+    // Spawn by hand: `Spawned::start` writes `./frps.toml`, while this lane
+    // takes its config from `--config-dir` and needs no cwd config at all.
+    let mut child = Command::new(bin())
+        .arg("--config-dir")
+        .arg(&conf_dir)
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn frps");
+    let out = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let err = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    drain(child.stdout.take().expect("child stdout"), out.clone());
+    drain(child.stderr.take().expect("child stderr"), err.clone());
+    let spawned = Spawned {
+        _guard: ChildGuard { child },
+        _dir: dir,
+        stdout: out,
+        stderr: err,
+    };
+
+    let line = spawned.wait_for_line("frps listener started on");
+    assert!(
+        line.contains(&format!("0.0.0.0:{bind_port}")),
+        "an empty bind_addr from --config-dir must be completed to the wildcard, got: {line}"
+    );
+    assert_streams_clean_of(
+        "config_dir_empty_bind_addr_binds_wildcard",
+        &spawned,
+        "failed to lookup address information",
     );
     assert_loopback_listens(bind_port);
 }
