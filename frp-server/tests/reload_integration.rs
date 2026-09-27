@@ -925,15 +925,15 @@ health_check_max_failed = 1
             assert!(wait_for_port(bind_port, 10), "frps did not start");
 
             // Witness the failure *kind* separately from the panic, so a spawn
-            // error for any other reason cannot be read as this shape.
+            // error for any other reason cannot be read as this shape. (This
+            // call's `Ok` arm would yield a child, but the shape forces `Err`.)
             let err = Command::new(&unexecutable)
                 .arg("-c")
                 .arg(&frps_config_path)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-                .err()
-                .expect("spawning a mode-644 file must fail");
+                .expect_err("spawning a mode-644 file must fail");
             assert_eq!(
                 err.kind(),
                 std::io::ErrorKind::PermissionDenied,
@@ -942,6 +942,7 @@ health_check_max_failed = 1
 
             // And the pre-fix shape itself: this `.expect(..)` panics while
             // `frps` is still a live child holding `bind_port`.
+            #[allow(clippy::zombie_processes)] // the `.expect` always panics here
             let _frpc = Command::new(&unexecutable)
                 .arg("-c")
                 .arg(&frps_config_path)

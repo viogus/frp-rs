@@ -52,7 +52,7 @@
 #![cfg(any(feature = "full", feature = "tiny"))]
 
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -103,6 +103,23 @@ impl Drop for TempDir {
 /// Run `frpc` with `args` and wait for it to exit, with a hard bound: none of
 /// the cases here may start a working daemon, so a child that outlives the
 /// bound is a finding, not a timeout to tolerate.
+/// `Child::try_wait`, but the error path kills **and reaps** the child before
+/// panicking, so that panic cannot orphan it. `try_wait` fails only on an OS
+/// error — an already-reaped child is not an error, std caches its status — so
+/// this is the "kill in the expect path" fix for the shape `TODO.md`'s
+/// reload-guards item lists (`frpc/tests/cli_exit_codes.rs:96`). The timeout arm
+/// below already kills before it panics.
+fn try_wait_or_kill(child: &mut Child, what: &str) -> Option<std::process::ExitStatus> {
+    match child.try_wait() {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("try_wait {what} failed: {e}");
+        }
+    }
+}
+
 fn run_frpc(args: &[&str]) -> Output {
     let mut child = Command::new(BIN)
         .args(args)
@@ -112,7 +129,7 @@ fn run_frpc(args: &[&str]) -> Output {
         .expect("spawn frpc");
     let deadline = std::time::Instant::now() + EXIT_TIMEOUT;
     loop {
-        match child.try_wait().expect("try_wait frpc") {
+        match try_wait_or_kill(&mut child, "frpc") {
             Some(_) => return child.wait_with_output().expect("collect frpc output"),
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();

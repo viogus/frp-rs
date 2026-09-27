@@ -217,10 +217,25 @@ fn captured_request(rx: mpsc::Receiver<Captured>, handle: JoinHandle<()>) -> Cap
     captured
 }
 
+/// `Child::try_wait`, but the error path kills **and reaps** the child before
+/// panicking, so that panic cannot orphan it — the same shape `TODO.md`'s
+/// reload-guards item lists for `admin_cli`/`cli_exit_codes`, found in that
+/// sweep. The timeout arm's caller kills the child itself.
+fn try_wait_or_kill(child: &mut Child, what: &str) -> Option<std::process::ExitStatus> {
+    match child.try_wait() {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("try_wait {what} failed: {e}");
+        }
+    }
+}
+
 fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
-        match child.try_wait().expect("try_wait") {
+        match try_wait_or_kill(child, "frpc") {
             Some(status) => return Some(status),
             None if Instant::now() >= deadline => return None,
             None => std::thread::sleep(Duration::from_millis(10)),
