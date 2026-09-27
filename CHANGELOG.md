@@ -491,22 +491,47 @@ User-facing release notes for frp-rs.
   kept the broken value and ignored the body. Malformed escapes without a body are unchanged
   (still a non-strict 200), as is every other endpoint.
 - **The exit code on a service-construction failure no longer depends on the
-  config's text — exactly one input changes code.** `frpc`/`frps` used to pick
-  between `EXIT_AUTH`/3 and `EXIT_BIND`/4 with
+  error text — two input families change code, in opposite directions.**
+  `frpc`/`frps` used to pick between `EXIT_AUTH`/3 and `EXIT_BIND`/4 with
   `msg.contains("token") || msg.contains("auth")` over the formatted error, which
-  embeds the config path and any URL from the config. So the **same** failure
-  class exited differently by file name: an `frpc` `[store] path` pointing at a
-  file that is not JSON exited **3** when the file was named `authstore.json`
-  and **4** when it was `plainstore.json`. The kind is now a typed value chosen
-  where the constructor raises the error (`frp_core::init_error`), and the
-  affected input — a malformed store whose path contains `auth` or `token`, or an
-  OIDC discovery URL whose path does — now exits **4** instead of 3. Go frp
-  v0.71.0 exits **1** on both names, so the code is still an frp-rs extension;
-  only frp-rs's internal disagreement is gone. Every other input keeps its code:
-  `auth.tokenSource` on a missing file is still 3 on both binaries, the empty
-  token refusal is still 3, and an occupied `bindPort` is still 1 on both sides.
-  There is deliberately **no** `EXIT_AUTH`/`EXIT_BIND` collapse to Go's 1 here —
-  see `docs/developing.md` § CLI exit codes for the argument.
+  embeds the config path and any URL from the config. The kind is now a typed
+  value chosen where the constructor raises the error (`frp_core::init_error`).
+  Measured base-vs-head, one fresh config and one fresh closed port per row, rc
+  captured directly from the child:
+  - **`frpc` `[store] path` → a file that is not JSON: 3 → 4** when the path
+    contains `auth` or `token` (it was 3 for `authstore.json` and 4 for
+    `plainstore.json` — the same failure class, two codes). Now 4 for either
+    name.
+  - **`frpc` client-OIDC construction failure: 4 → 3** at an **auth-free** issuer
+    URL. The discovery fetch (only when `oidc.token_endpoint` is unset and the
+    issuer is set) embeds the issuer URL in its error, so an issuer path
+    containing `auth` gave 3 and an auth-free one gave 4. Every issuer path is
+    now 3 — e.g. `…/zzz` and `…/plain` were 4 and are now 3, `…/authz` is 3
+    either way. The same family covers a missing `oidc.trustedCaFile`
+    (`OIDC client: failed to read CA cert …`: 4 → 3 at an auth-free path).
+  - **`frps` changes no code at all:** every reachable server construction
+    failure already carried `auth` or `token` in its message, so base and head
+    are 3 for `/authz`, `/zzz`, a missing `tokenSource`, an empty token, a
+    missing OIDC CA file, an empty issuer and an empty audience — **4 was
+    unreachable on `frps`**. The typed arm fixes the text dependency there
+    without moving a code.
+  Go frp v0.71.0 exits **1** on every one of these inputs, so both codes remain
+  frp-rs extensions; only frp-rs's internal disagreement is gone. Other inputs
+  keep their codes: `auth.tokenSource` on a missing file is still 3 on both
+  binaries, the empty-token refusal is still 3, and an occupied `bindPort` is
+  still 1 on both sides. There is deliberately **no** `EXIT_AUTH`/`EXIT_BIND`
+  collapse to Go's 1 here — see `docs/developing.md` § CLI exit codes for the
+  argument.
+- **Library API (`frp-core`, `frp-client`, `frp-server`): two breaking changes**
+  on top of the user-visible one above. `frp_core::logging::is_token_error` was
+  `pub` and is **deleted** (it classified a failure by matching `token`/`auth` in
+  a message; use `frp_core::init_error::InitErrorKind` instead). And
+  `Service::new` / `Service::with_unsafe_features` now return
+  `Result<_, frp_core::init_error::ConstructError>` — it was
+  `Box<dyn std::error::Error>` in `frp-client` and `String` in `frp-server`.
+  `ConstructError` implements `Display`/`Error`, so `?`-based callers that only
+  print or propagate keep working; callers that matched on `String` or compared
+  the error text need the `kind()` method.
 
 ### Changed
 - **The space-separated `--strict-config <bool>` extension now prints a warning

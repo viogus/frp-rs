@@ -1075,7 +1075,20 @@ Some things this table does not say, each measured:
   requires **4** from both, so a reversion to a text match (which gives 3 for the
   first name, as the base commit did) fails the test. That failure was measured
   by re-introducing the substring expression in `frpc`'s arm: the test failed on
-  the `authstore.json` iteration with `left: Some(3)`, `right: Some(4)`.
+  the `authstore.json` iteration with `left: Some(3)`, `right: Some(4)`. The
+  second control is
+  `oidc_construction_failure_exits_3_whatever_the_issuer_path` (two auth-free
+  issuer paths, both must be 3; measured `left: Some(4)` on a revert).
+  **Coverage limit, stated because a partial guard must name what it does not
+  cover:** both mutant-detecting pins are in the **client** file. No test
+  distinguishes `frps`'s typed arm from a substring test — every reachable frps
+  construction message contains `auth` or `token` (see the frps bullet below), so
+  a substring mutant in `frps/src/main.rs` passes all 19 tests of
+  `frps/tests/cli_exit_codes.rs`. Verified by attempting exactly that mutant. The
+  frps arm's correctness therefore rests on the code plus the kind → code unit
+  tests in `frp-core/src/init_error.rs`, not on a failing-on-mutant test; the
+  `InitErrorKind` swap that *would* be caught by those unit tests is the only
+  frps-reachable mis-tag there is, since 3 is the only code frps can produce.
 - **Both construction codes are deliberate extensions, kept after weighing the
   collapse.** Grounds, and what would reverse it: the argument is in the
   *Decision* paragraph above. If Go ever grows a per-class exit scheme, or if a
@@ -1104,18 +1117,43 @@ Some things this table does not say, each measured:
     "refuses-where-Go-does-not" case. That panic is also why no blanket statement
     like "Go only ever returns 0 or 1" belongs in this document. Pinned by
     `oidc_without_an_issuer_is_refused_with_3_where_go_panics`.
-  - The OIDC *issuer URL* is where the old substring coupling was structurally
-    most exposed, since the URL is inside the error text. Measured with a mock
-    discovery endpoint serving a `jwks_uri`: frp-rs exits **3** for an issuer
-    path ending `/authz` and **3** for `/zzz` — the same code for both, which is
-    now a consequence of the type rather than of the two paths happening to lack
-    a distinguishing substring. Go exits **2** on both, by panicking
-    (`panic: oidc: issuer URL provided to client (…) did not match the issuer
-    returned by provider`), so this pair has no like-for-like Go code. What this
-    probe does **not** show is the pre-change `/authz` → 3 vs `/zzz` → 4 flip:
-    the mock issuer made Go panic before frp-rs's own pre-change behaviour could
-    be observed on that path, so the flip is evidenced by the `[store]` fixture
-    below, not by an OIDC run.
+  - **The pre-change 3-vs-4 flip is a *client* property, and it is measured.**
+    `frps` was never the daemon where the coupling was reachable: every frps
+    construction failure already carried `auth` or `token` in its message (an
+    OIDC dial failure through the `Cannot start frps with OIDC auth: …` wrapper
+    in `frp-server/src/service.rs`, the startup refusals through
+    `check_startup`'s `[auth]` text), so at `d0f9ec5` **frps exited 3 for every
+    reachable construction failure and `EXIT_BIND`/4 was unreachable there** —
+    measured for `/authz`, `/zzz`, a missing `tokenSource`, an empty token, a
+    missing OIDC CA file, an empty issuer and an empty audience, all 3 at base
+    and all 3 at the head. `frpc`'s OIDC path is where the flip is real: with
+    `[auth] method = "oidc"` and **no** `oidc.tokenEndpointURL`, `OidcClient::new`
+    fetches `<issuer>/.well-known/openid-configuration`
+    (`frp-core/src/auth.rs:1232-1247`) and the error embeds that URL, so at the
+    base commit an issuer path containing `auth` gave **3** while four auth-free
+    paths (`zzz`, `plain`, `nope`, `x`) gave **4** — each of the five repeated
+    four times, one fresh config and one fresh closed port per run, rc read
+    directly from the child. Every issuer path is **3** at the head. A missing
+    `oidc.trustedCaFile` is the same family (`OIDC client: failed to read CA
+    cert …`: base 4 at an auth-free path, head 3).
+    **A confound worth recording**, because it produced two wrong probe
+    readings before it was isolated: the claim is about the *message*, and the
+    message does not contain the config path, so the config's own directory name
+    must not vary between the arms being compared. An earlier version of this
+    probe used `mktemp -d` per run, whose random suffix can itself spell
+    `auth`; that made two nominally identical arms disagree. Isolated directly:
+    with the issuer path `/zzz` held fixed, an auth-bearing and an auth-free
+    config directory both give base **4** and head **3**, so the directory name is
+    not what the classifier was reading — the URL is. With the directory name held
+    fixed per arm the matrix above is deterministic (four runs per cell, same rc
+    every time).
+    Go has no like-for-like code on this path — it has no discovery preflight, so
+    the client starts — and therefore this flip has no Go row at all; the
+    `[store]` fixture below is the flip control that *has* a Go row (Go exits 1 on
+    both names). Pinned by
+    `frpc/tests/cli_exit_codes.rs::oidc_construction_failure_exits_3_whatever_the_issuer_path`,
+    which also fails on a text-classifier revert (measured: `left: Some(4)`,
+    `right: Some(3)` on the `zzz` arm).
 
   A third case — `frpc verify -c <config whose [[proxies]] block has an unknown
   key>` exiting **0** here against Go's **1** (`decode proxy at index 0: …
@@ -1129,14 +1167,24 @@ Tests that pin this — real binaries, no mocks:
 `verify -c <missing>`, a `verify -c <good>` positive control, the directory-mode
 divergence for a missing / empty / invalid directory, the `tokenSource` → 3 case,
 the **flip control** `malformed_store_file_exits_4_regardless_of_the_file_name`
-— one failure class under two file names, both 4 — and, under `--features tiny`,
-the same two assertions against `frpc-tiny`) and `frps/tests/cli_exit_codes.rs`
+— one failure class under two file names, both 4 — and the client-side OIDC pin
+`oidc_construction_failure_exits_3_whatever_the_issuer_path`, which is the *other*
+half of the same control: it runs two auth-free issuer paths and requires 3 from
+both, and it is `#[cfg(feature = "full")]` because the `oidc` feature is not in
+`tiny`; under `--features tiny` the same two assertions run against `frpc-tiny`)
+and `frps/tests/cli_exit_codes.rs`
 (`frps -c <bad>`, `-c <missing>`, a starts-then-SIGTERM positive control, the
 extension flag's refusal, and the three construction-code pins
 `unresolvable_token_source_exits_3_where_go_exits_1`,
 `empty_token_refusal_is_a_hardening_divergence_go_does_not_have`,
 `oidc_without_an_issuer_is_refused_with_3_where_go_panics`). The kind → code
-mapping itself is asserted in `frp-core/src/init_error.rs`. The admin-subcommand
+mapping itself is asserted in `frp-core/src/init_error.rs`. **Where the guard is
+weak, stated rather than implied:** the frps arm's typed classification is *not*
+test-backed — every reachable frps construction message contains `auth`/`token`
+(see above), so a substring mutant in `frps/src/main.rs` passes all 19 of that
+file's tests. The guarantee on that daemon rests on the code and on the kind →
+code unit tests, not on a failing-on-mutant integration test; the mutant-detecting
+pins are the two client ones. The admin-subcommand
 refusals stay pinned by `frpc/tests/admin_cli.rs`, and the repeated-`-c` /
 empty-`addr` inputs by `frpc/tests/cli_inputs.rs`. Executing lanes: `Run frpc CLI
 tests`, `Run frps CLI tests` and `Run frpc's CLI exit-code tests under tiny` in `.github/workflows/ci.yml`

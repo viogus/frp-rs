@@ -282,12 +282,18 @@ fn empty_token_refusal_is_a_hardening_divergence_go_does_not_have() {
 /// unsupported protocol scheme ""`) and its runtime exits **2**. That panic is
 /// also why no blanket "Go only returns 0 or 1" belongs in the docs.
 ///
-/// The issuer is not needed to reach the refusal, but note that the OIDC
-/// construction path is where the substring classifier was *most* exposed: the
-/// error text embeds the issuer **URL**, so an issuer ending in `/authz` used to
-/// select 3 while `/zzz` selected 4 for the identical failure. Both are 3 now
-/// (measured, mock discovery endpoint serving `jwks_uri`), and this fixture pins
-/// the path that needs no network at all.
+/// The issuer is not needed to reach the refusal. Note what this arm does **not**
+/// demonstrate: it is **not** an example of the pre-change text coupling, and
+/// `frps` was never the daemon where that coupling was reachable. Every frps
+/// construction failure already carried `auth` or `token` in its message — this
+/// one passes through `check_startup`'s `[auth]` text, and an OIDC *dial* failure
+/// through the `Cannot start frps with OIDC auth: …` wrapper
+/// (`frp-server/src/service.rs`) — so at base `frps` exited **3 for every
+/// reachable construction failure** and `EXIT_BIND`/4 was **unreachable** there.
+/// Measured at `d0f9ec5` for `/authz`, `/zzz`, a missing `tokenSource`, an empty
+/// token, a missing OIDC CA file, an empty issuer and an empty audience. The
+/// pre-change 3-vs-4 flip is a **client** property, pinned by
+/// `frpc/tests/cli_exit_codes.rs::oidc_construction_failure_exits_3_whatever_the_issuer_path`.
 #[test]
 fn oidc_without_an_issuer_is_refused_with_3_where_go_panics() {
     let dir = TempDir::new();

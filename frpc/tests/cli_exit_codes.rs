@@ -399,6 +399,73 @@ fn malformed_store_file_exits_4_regardless_of_the_file_name() {
     }
 }
 
+/// The client-side OIDC construction failure, pinned on the two issuer paths
+/// that the text classifier actually disagreed about. An `[auth] method = "oidc"`
+/// config with `clientID`/`clientSecret` set and **no** `oidc.tokenEndpointURL`
+/// makes `OidcClient::new` fetch `<issuer>/.well-known/openid-configuration`
+/// (`frp-core/src/auth.rs:1232-1247`); pointing the issuer at a **closed** port
+/// fails that fetch, and the error text embeds the full discovery URL. So before
+/// the typed classification `…/authz` exited **3** while `…/zzz` and `…/plain`
+/// exited **4** for the identical failure — measured on the base commit — and
+/// both must now be 3.
+///
+/// The two paths are chosen for exactly that reason: neither contains `auth` or
+/// `token`, and the config directory is `TempDir`'s (which this test does not let
+/// leak into the assertion), so the only thing that could move an arm to 4 is a
+/// reversion to a text-based classifier over the *message*. A mutant that
+/// reinstates `to_string().contains("auth")` fails this test.
+///
+/// Go frp v0.71.0 has no like-for-like code here: it has no discovery preflight,
+/// so the client starts. This is an frp-rs extension like the store/`tokenSource`
+/// arms, not a Go comparison.
+///
+/// Gated on `full`: the `oidc` feature is not in `tiny`, so `frpc-tiny` cannot
+/// reach `OidcClient::new` at all and the test would be wrong (not merely
+/// skipped) there.
+#[cfg(feature = "full")]
+#[test]
+fn oidc_construction_failure_exits_3_whatever_the_issuer_path() {
+    fn closed_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let p = l.local_addr().expect("local_addr").port();
+        drop(l);
+        p
+    }
+
+    for path in ["zzz", "plain"] {
+        let dir = TempDir::new();
+        let issuer = format!("http://127.0.0.1:{}/{}", closed_port(), path);
+        let cfg = dir.write(
+            "oidcc.toml",
+            &format!(
+                "{BASE_CONFIG}[auth]\nmethod = \"oidc\"\n\
+                 [auth.oidc]\nissuer = \"{issuer}\"\naudience = \"x\"\n\
+                 clientID = \"cid\"\nclientSecret = \"csec\"\n"
+            ),
+        );
+
+        let out = run_frpc(&["-c", &cfg]);
+
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "a client OIDC construction failure is InitErrorKind::Auth (3) for every \
+             issuer path — /authz and an auth-free path must not differ; path={path} \
+             issuer={issuer} stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(
+            all.contains("openid-configuration"),
+            "the failure must be the discovery fetch (not a config-validation refusal \
+             before it), got stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+    }
+}
+
 /// A Go pflag bool takes `--flag=<bool>` as well as the bare `--flag`, and the
 /// *value* decides what happens. `-v, --version` is such a bool on Go's root
 /// command, so measured on Go frp v0.71.0 (darwin/arm64, bounded runner)
