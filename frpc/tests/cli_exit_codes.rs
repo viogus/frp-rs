@@ -3,21 +3,37 @@
 //!
 //! Go's CLI is two-valued: 0 on success, 1 on any failure. Measured on Go
 //! v0.71.0 (darwin/arm64) with one unknown top-level key added to an otherwise
-//! valid client config:
+//! valid client config, **stdout and stderr captured separately**:
 //!
 //! ```text
-//! frpc -c bad.toml          → rc 1, stdout `json: unknown field "notAKnownFrpKey"`
-//! frpc verify -c bad.toml   → rc 1, stdout `json: unknown field "notAKnownFrpKey"`
+//! frpc -c bad.toml          → rc 1, stdout `json: unknown field "notAKnownFrpKey"`, stderr 0 bytes
+//! frpc verify -c bad.toml   → rc 1, stdout `json: unknown field "notAKnownFrpKey"`, stderr 0 bytes
 //! frpc verify -c good.toml  → rc 0, stdout `frpc: the configuration file … syntax is ok`
 //! ```
 //!
-//! frp-rs exited **2** (`EXIT_CONFIG`) on the first two until this pin; the
-//! admin subcommands (`reload`/`status`/`stop`) already exited 1 for the same
-//! load error, which is the internal disagreement this file closes. The last
+//! frp-rs exited **2** (`EXIT_CONFIG`) on the first two until the exit-code pin;
+//! the admin subcommands (`reload`/`status`/`stop`) already exited 1 for the
+//! same load error, which was the internal disagreement that closed. The last
 //! test pins the one deliberate divergence: Go's `--config-dir` mode exits 0
 //! even for a directory that does not exist, is empty, or holds a config that
 //! fails to parse, and frp-rs keeps its non-zero refusal. See
 //! `docs/developing.md` § CLI exit codes.
+//!
+//! **Stream and shape are pinned too** (the `TODO.md` item "A CLI failure's
+//! output shape is still not Go's"). Both load-failure paths now write bare
+//! line(s) to **stdout** and nothing to stderr, matching Go's
+//! `fmt.Println(err)` / `os.Exit(1)` (`cmd/frpc/sub/root.go`,
+//! `cmd/frpc/sub/verify.go`); before, the daemon start path wrapped the error in
+//! an ANSI-coloured `tracing` record on stdout and `verify` wrote its message to
+//! stderr. Two things are recorded, not matched, and this file's fixtures are
+//! single-key so neither is visible here: the *text* (frp-rs appends
+//! `in config file <path>` — and sometimes a `did you mean …?` suggestion —
+//! where Go prints the codec's `json: unknown field "…"` with no path), and the
+//! *line count* at N ≥ 2 (frp-rs prints one line per rejected key, Go stops at
+//! the first; pinned at the collector by
+//! `strict_check_reports_every_unknown_key_not_just_the_first` in
+//! `frp-core/src/config/tests.rs`). The exact single-line frp-rs bytes are
+//! asserted here so the shape cannot drift back silently.
 //!
 //! Two further tests pin the *extension* codes on the client:
 //! `unresolvable_token_source_exits_3_like_frps` (`EXIT_AUTH`/3 — the same
@@ -117,10 +133,22 @@ fn stderr_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).to_string()
 }
 
-/// Go: `frpc -c <bad>` → bare parse error on **stdout**, exit 1
-/// (`cmd/frpc/sub/root.go`). frp-rs writes the same error inside a `tracing`
-/// line (an output/stream divergence that is out of scope here — see
-/// `docs/developing.md` § CLI exit codes); the exit code is what this pins.
+/// Go: `frpc -c <bad>` → one bare parse error on **stdout**, exit 1
+/// (`cmd/frpc/sub/root.go`: `fmt.Println(err); os.Exit(1)`). Measured on Go
+/// v0.71.0 with the streams captured separately: stdout 38 bytes
+/// (`json: unknown field "notAKnownFrpKey"`), stderr 0 bytes.
+///
+/// frp-rs now writes the same bare line to stdout, with stderr empty. It is
+/// **one line per rejected key**, so this single-key fixture is the N=1 case;
+/// the N ≥ 2 count is pinned at the collector
+/// (`frp-core/src/config/tests.rs`), not here.
+/// The line's **text** is frp-rs's own and stays divergent, deliberately: it
+/// names the config file (`in config file <path>`) where Go's decoder error
+/// carries no path, and it can add a `did you mean …?` suggestion. That split —
+/// stream and shape matched, wording kept — is recorded in
+/// `docs/developing.md` § CLI exit codes. Asserting the exact bytes means a
+/// regression to a `tracing` record (ANSI, timestamp, level, target, the
+/// duplicated `error=` field) fails here rather than silently.
 #[test]
 fn daemon_bad_config_exits_1_and_names_the_unknown_field() {
     let dir = TempDir::new();
@@ -135,24 +163,30 @@ fn daemon_bad_config_exits_1_and_names_the_unknown_field() {
         stdout_of(&out),
         stderr_of(&out),
     );
-    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
-    assert!(
-        all.contains(UNKNOWN_FIELD),
-        "the load error must name the unknown field, got stdout={:?} stderr={:?}",
+    assert_eq!(
         stdout_of(&out),
+        format!("{UNKNOWN_FIELD} in config file {cfg}\n"),
+        "frpc -c <bad config> must print one bare line on stdout for this one-key \
+         fixture (the N >= 2 case is N lines — see the module doc), like Go's \
+         `fmt.Println(err)`; stderr={:?}",
         stderr_of(&out),
     );
     assert!(
-        all.contains(&cfg),
-        "the load error must name the config file, got stdout={:?} stderr={:?}",
-        stdout_of(&out),
+        stderr_of(&out).is_empty(),
+        "Go prints nothing on stderr for this failure; stderr={:?}",
         stderr_of(&out),
     );
 }
 
-/// Go: `frpc verify -c <bad>` → rc 1, the parse error on stdout
-/// (`cmd/frpc/sub/verify.go`). frp-rs prints its refusal on **stderr**; same
-/// stream caveat as above.
+/// Go: `frpc verify -c <bad>` → rc 1, the parse error on **stdout**
+/// (`cmd/frpc/sub/verify.go`: `fmt.Println(err); os.Exit(1)`). Measured on Go
+/// v0.71.0 with the streams captured separately: stdout 38 bytes
+/// (`json: unknown field "notAKnownFrpKey"`), stderr 0 bytes.
+///
+/// frp-rs now writes its refusal to stdout too, with stderr empty. Before, this
+/// path was the one place a config failure went to stderr while the exit code
+/// already matched. The wording (`Config file <path> is invalid: …`) stays
+/// divergent and is recorded in `docs/developing.md` § CLI exit codes.
 #[test]
 fn verify_bad_config_exits_1_and_names_the_unknown_field() {
     let dir = TempDir::new();
@@ -167,23 +201,23 @@ fn verify_bad_config_exits_1_and_names_the_unknown_field() {
         stdout_of(&out),
         stderr_of(&out),
     );
-    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
-    assert!(
-        all.contains(UNKNOWN_FIELD),
-        "the refusal must name the unknown field, got stdout={:?} stderr={:?}",
+    assert_eq!(
         stdout_of(&out),
+        format!("Config file {cfg} is invalid: {UNKNOWN_FIELD} in config file {cfg}\n"),
+        "frpc verify -c <bad config> must put its refusal on stdout, where Go's \
+         `fmt.Println(err)` puts it; stderr={:?}",
         stderr_of(&out),
     );
     assert!(
-        all.contains(&cfg),
-        "the refusal must name the config file, got stdout={:?} stderr={:?}",
-        stdout_of(&out),
+        stderr_of(&out).is_empty(),
+        "Go prints nothing on stderr for this failure; stderr={:?}",
         stderr_of(&out),
     );
 }
 
-/// The sibling of the previous test: a missing file is the same failure class
-/// and the same code (Go rc 1).
+/// The sibling of the previous test: a missing file is the same failure class,
+/// the same code (Go rc 1) and the same stream. Measured on Go v0.71.0:
+/// stdout `open <path>: no such file or directory`, stderr 0 bytes.
 #[test]
 fn verify_missing_config_exits_1() {
     let dir = TempDir::new();
@@ -196,6 +230,18 @@ fn verify_missing_config_exits_1() {
         Some(1),
         "frpc verify -c <missing> must exit 1 like Go; stdout={:?} stderr={:?}",
         stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stdout_of(&out).starts_with(&format!("Config file {missing} is invalid: {missing}:")),
+        "the refusal must be on stdout and must name the missing config file; stdout={:?} \
+         stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stderr_of(&out).is_empty(),
+        "Go prints nothing on stderr for this failure; stderr={:?}",
         stderr_of(&out),
     );
 }
@@ -494,12 +540,12 @@ fn disable_log_color_value_spelling_is_consumed() {
 
 // ── the same pin for the `tiny` tier ────────────────────────────────────────
 
-/// `frpc-tiny` includes `frpc/src/main.rs` verbatim, so the exit-code fix has
-/// to hold in the no-default-features build too — and the `full`-gated tests
-/// above cannot see it (the `frpc` bin is `required-features = ["full"]`).
-/// CI's tiny lane runs this file for that variant: the crate-level
-/// `#![cfg(any(feature = "full", feature = "tiny"))]` is what makes the file
-/// compile there at all.
+/// `frpc-tiny` includes `frpc/src/main.rs` verbatim, so the exit-code **and
+/// output-shape** fixes have to hold in the no-default-features build too — and
+/// the `full`-gated tests above cannot see it (the `frpc` bin is
+/// `required-features = ["full"]`). CI's tiny lane runs this file for that
+/// variant: the crate-level `#![cfg(any(feature = "full", feature = "tiny"))]`
+/// is what makes the file compile there at all.
 #[cfg(all(feature = "tiny", not(feature = "full")))]
 mod tiny {
     use super::*;
@@ -518,11 +564,17 @@ mod tiny {
             stdout_of(&out),
             stderr_of(&out),
         );
-        let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
-        assert!(
-            all.contains(UNKNOWN_FIELD),
-            "the load error must name the unknown field, got stdout={:?} stderr={:?}",
+        assert_eq!(
             stdout_of(&out),
+            format!("{UNKNOWN_FIELD} in config file {cfg}\n"),
+            "frpc-tiny -c <bad config> must print one bare line on stdout for this \
+             one-key fixture like the full binary and like Go (N >= 2 is N lines); \
+             stderr={:?}",
+            stderr_of(&out),
+        );
+        assert!(
+            stderr_of(&out).is_empty(),
+            "Go prints nothing on stderr for this failure; stderr={:?}",
             stderr_of(&out),
         );
     }
@@ -539,6 +591,18 @@ mod tiny {
             Some(1),
             "frpc-tiny verify -c <bad config> must exit 1 like Go; stdout={:?} stderr={:?}",
             stdout_of(&out),
+            stderr_of(&out),
+        );
+        assert_eq!(
+            stdout_of(&out),
+            format!("Config file {cfg} is invalid: {UNKNOWN_FIELD} in config file {cfg}\n"),
+            "frpc-tiny verify must put its refusal on stdout, where Go's `fmt.Println(err)` \
+             puts it; stderr={:?}",
+            stderr_of(&out),
+        );
+        assert!(
+            stderr_of(&out).is_empty(),
+            "Go prints nothing on stderr for this failure; stderr={:?}",
             stderr_of(&out),
         );
     }

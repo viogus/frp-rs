@@ -2048,6 +2048,53 @@ fn test_unknown_field_suggestion() {
     assert!(errors[0].contains("did you mean 'server_addr'"));
 }
 
+/// `run_strict_check` reports **every** unknown key, joined with `\n`
+/// (`errors.join("\n")` in `frp-core/src/config/strict.rs`), not just the first.
+///
+/// That is what makes a CLI config-load failure **N lines for N rejected keys**,
+/// where Go's decoder sets `DisallowUnknownFields` on one `decoder.Decode(out)`
+/// call (`pkg/util/jsonx/json_v1.go:43-44`, reached from
+/// `pkg/config/v1/decode.go:29-33`) and returns at the **first** unknown field,
+/// so Go prints one line whatever N is. The divergence is recorded as deliberate
+/// in `docs/developing.md` § CLI exit codes → *Output stream and shape on a
+/// config-load failure*, and it is pinned **here** because every CLI fixture in
+/// `frpc/tests/cli_exit_codes.rs` and `frps/tests/cli_exit_codes.rs` carries
+/// exactly one unknown key — none of them can see this count move.
+///
+/// The order is pinned too, and it is why the two binaries name the same key
+/// first: `toml::Table` iterates in **key-name** order, so `zzz_bad, mmm_bad,
+/// aaa_bad` in the document comes out as `aaa_bad, mmm_bad, zzz_bad` here, and
+/// the key Go names first is that same alphabetically-first one — measured on
+/// both binaries with the document order permuted (with `zzz…, another…,
+/// third…`, Go names `another…` and frp-rs names `another…` first).
+#[test]
+fn strict_check_reports_every_unknown_key_not_just_the_first() {
+    let toml_str = "server_addr = \"127.0.0.1\"\nserver_port = 7000\n\
+                    zzz_bad = 1\nmmm_bad = 2\naaa_bad = 3\n";
+    let value: toml::Value = toml::from_str(toml_str).unwrap();
+    let known: std::collections::HashSet<&str> =
+        ["server_addr", "server_port"].iter().copied().collect();
+
+    let err = super::strict::run_strict_check(&value, &known, "t.toml")
+        .expect_err("three unknown keys must be refused")
+        .to_string();
+
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "one line per rejected key (Go prints one line for all three); got {err:?}"
+    );
+    for (line, key) in lines.iter().zip(["aaa_bad", "mmm_bad", "zzz_bad"]) {
+        assert_eq!(
+            *line,
+            format!("unknown field \"{key}\" in config file t.toml"),
+            "each line names its own key, in key-name order, with no suggestion \
+             for these keys; got {err:?}"
+        );
+    }
+}
+
 #[test]
 fn test_auth_client_config_oidc_method() {
     // When method is "oidc", oidc_* fields should be usable

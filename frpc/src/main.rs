@@ -561,12 +561,21 @@ async fn run_normal(mut args: FrpcRunArgs) {
     let cfg = match load_client_config(&args.config, args.strict_config) {
         Ok(cfg) => cfg,
         Err(e) => {
-            init_logging(&args, None);
-            tracing::error!(error = %e, "Failed to load config: {}", e);
             // Go frp v0.71.0: a `frpc -c <bad>` config failure is
-            // `fmt.Println(err); os.Exit(1)` (`cmd/frpc/sub/root.go`) — exit 1,
-            // not a per-class code. Measured against the Go binary; pinned by
-            // `frpc/tests/cli_exit_codes.rs`.
+            // `fmt.Println(err); os.Exit(1)` (`cmd/frpc/sub/root.go`) — one
+            // bare line on **stdout**, no log prefix and no ANSI, then exit 1
+            // (not a per-class code). Measured against the Go binary, stdout
+            // and stderr captured separately; pinned by
+            // `frpc/tests/cli_exit_codes.rs`. The `tracing` line this replaces
+            // was the last path in `frpc` that wrapped the load error in a log
+            // record — the admin subcommands already `println!` it
+            // (`run_reload` / `run_status` / `run_stop` below).
+            //
+            // `init_logging` is deliberately **not** called here: Go installs
+            // its logger only after a successful load
+            // (`startServiceWithAggregator`, `cmd/frpc/sub/root.go:191`), and
+            // this branch exits before any log record is emitted.
+            println!("{e}");
             process::exit(EXIT_RUNTIME);
         }
     };
@@ -751,7 +760,9 @@ async fn run_verify(config_path: &str, strict_config: bool) {
             if let Err(e) =
                 frp_client::service::refuse_oidc_method_without_feature(cfg.auth.as_ref())
             {
-                eprintln!("Config file {} is invalid: {}", config_path, e);
+                // Same stream as the parse refusal below and as Go's
+                // `fmt.Println(err)` (`cmd/frpc/sub/verify.go`).
+                println!("Config file {} is invalid: {}", config_path, e);
                 // Go v0.71.0 `frpc verify -c <bad>` exits 1 (`cmd/frpc/sub/verify.go`).
                 process::exit(EXIT_RUNTIME);
             }
@@ -761,7 +772,12 @@ async fn run_verify(config_path: &str, strict_config: bool) {
             println!("  Visitors: {}", cfg.visitors.len());
         }
         Err(e) => {
-            eprintln!("Config file {} is invalid: {}", config_path, e);
+            // Go frp v0.71.0 `frpc verify -c <bad>`: `fmt.Println(err);
+            // os.Exit(1)` (`cmd/frpc/sub/verify.go`) — the refusal goes to
+            // **stdout**, not stderr. Measured against the Go binary with the
+            // two streams captured separately (Go: stdout 38 bytes, stderr 0);
+            // pinned by `frpc/tests/cli_exit_codes.rs`.
+            println!("Config file {} is invalid: {}", config_path, e);
             // Go v0.71.0 `frpc verify -c <bad>` exits 1; measured against the Go
             // binary and pinned by `frpc/tests/cli_exit_codes.rs`.
             process::exit(EXIT_RUNTIME);

@@ -90,6 +90,35 @@ User-facing release notes for frp-rs.
   negative value is accepted and means the deadline has already passed).
 
 ### Changed
+- **A config-load failure now prints a bare line on stdout, and `frpc verify`
+  prints its refusal there instead of on stderr — a user-visible output change,
+  and Go parity on the stream and the shape of each line.** Go frp v0.71.0 does
+  `fmt.Println(err); os.Exit(1)` on all of these paths (`cmd/frpc/sub/root.go`,
+  `cmd/frpc/sub/verify.go`, `cmd/frps/root.go`); frp-rs printed the daemon's
+  start-up load error inside an ANSI-coloured `tracing` record on stdout —
+  timestamp, level, `frpc:` target, and the message repeated in a trailing
+  `error=` field — and `frpc verify -c <bad>` wrote `Config file … is invalid: …`
+  to **stderr**, so a script that captured stdout saw nothing. Both `frpc` and
+  `frps` now `println!` the error on stdout with an empty stderr, for
+  `frpc -c <bad>`, `frps -c <bad>`, `frpc verify -c <bad>` and
+  `frpc verify -c <missing>`; the exit codes are unchanged (1 everywhere). The
+  output is **one line per rejected key**, and with two or more unknown keys
+  that is a deliberate divergence rather than a match: frp-rs lists **all** of
+  them (`run_strict_check` joins every refusal with `\n`), while Go's
+  `DisallowUnknownFields` decoder stops at the first — three unknown keys are
+  three lines here and one line there, both naming the same first key and both
+  ordering by key name, not document position. **What else did not change:** the
+  wording. frp-rs still names the config file and can append a
+  `did you mean 'x'?` suggestion, where Go prints the codec's
+  `json: unknown field "x"` with no path — matching that byte-for-byte would mean
+  a literal `json: ` prefix on a message also emitted for TOML/YAML/INI and the
+  loss of the file identity in `--config-dir` mode. `frpc verify`'s success line
+  (`Config file … is valid` plus a short summary) is also unchanged; Go prints a
+  single `frpc: the configuration file … syntax is ok`. `--strict-config=foo` is
+  untouched: both binaries already write that refusal to stderr. The
+  `--config-dir` extension keeps its `tracing` output — Go's counterpart there is
+  a different line and a different exit code (0). Measured on Go v0.71.0 with
+  stdout and stderr captured separately.
 - **Strict mode now rejects unknown keys inside `[[proxies]]` / `[[visitors]]` /
   `[[httpPlugins]]` elements — a behaviour change, and Go parity.** The key set
   used to be per *section*, so an unknown field inside an array element was
