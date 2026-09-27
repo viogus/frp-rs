@@ -399,25 +399,32 @@ fn malformed_store_file_exits_4_regardless_of_the_file_name() {
     }
 }
 
-/// The client-side OIDC construction failure, pinned on the two issuer paths
-/// that the text classifier actually disagreed about. An `[auth] method = "oidc"`
-/// config with `clientID`/`clientSecret` set and **no** `oidc.tokenEndpointURL`
-/// makes `OidcClient::new` fetch `<issuer>/.well-known/openid-configuration`
-/// (`frp-core/src/auth.rs:1232-1247`); pointing the issuer at a **closed** port
-/// fails that fetch, and the error text embeds the full discovery URL. So before
-/// the typed classification `…/authz` exited **3** while `…/zzz` and `…/plain`
-/// exited **4** for the identical failure — measured on the base commit — and
-/// both must now be 3.
+/// The client-side OIDC construction failure, pinned on **both sides of the pair
+/// the text classifier disagreed about**: an `auth`-bearing issuer path
+/// (`…/authz`) and auth-free ones (`…/zzz`, `…/plain`). Before the typed
+/// classification `…/authz` exited **3** while `…/zzz` and `…/plain` exited **4**
+/// for the identical failure — measured on the base commit — and all of them must
+/// now be 3.
 ///
-/// The two paths are chosen for exactly that reason: neither contains `auth` or
-/// `token`, and the config directory is `TempDir`'s (which this test does not let
-/// leak into the assertion), so the only thing that could move an arm to 4 is a
-/// reversion to a text-based classifier over the *message*. A mutant that
-/// reinstates `to_string().contains("auth")` fails this test.
+/// The three paths are chosen for exactly that reason. The auth-free two contain
+/// neither `auth` nor `token`, so a text classifier scores them 4; `/authz`
+/// contains `auth`, so the same classifier scores it 3. Asserting **only** the
+/// auth-free pair would still pass under a text classifier whose polarity was
+/// inverted, so the array carries the auth-bearing path too and the assertion is
+/// the same for all three. The config directory is `TempDir`'s and never reaches
+/// an assertion. A mutant that reinstates `to_string().contains("auth")` fails
+/// this test on the auth-free arms (measured: `left: Some(4)`, `right: Some(3)`).
 ///
-/// Go frp v0.71.0 has no like-for-like code here: it has no discovery preflight,
-/// so the client starts. This is an frp-rs extension like the store/`tokenSource`
-/// arms, not a Go comparison.
+/// An `[auth] method = "oidc"` config with `clientID`/`clientSecret` set and
+/// **no** `oidc.tokenEndpointURL` makes `OidcClient::new` fetch
+/// `<issuer>/.well-known/openid-configuration` (`frp-core/src/auth.rs`);
+/// pointing the issuer at a **closed** port fails that fetch, and the error text
+/// embeds the full discovery URL.
+///
+/// Go frp v0.71.0 has no like-for-like code here: it has no `auth.oidc.issuer`
+/// key on the client at all (measured, `json: unknown field "issuer"`, rc 1) — not
+/// because the client starts. This is an frp-rs extension like the
+/// store/`tokenSource` arms, not a Go comparison.
 ///
 /// Gated on `full`: the `oidc` feature is not in `tiny`, so `frpc-tiny` cannot
 /// reach `OidcClient::new` at all and the test would be wrong (not merely
@@ -432,7 +439,7 @@ fn oidc_construction_failure_exits_3_whatever_the_issuer_path() {
         p
     }
 
-    for path in ["zzz", "plain"] {
+    for path in ["authz", "zzz", "plain"] {
         let dir = TempDir::new();
         let issuer = format!("http://127.0.0.1:{}/{}", closed_port(), path);
         let cfg = dir.write(

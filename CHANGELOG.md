@@ -503,8 +503,9 @@ User-facing release notes for frp-rs.
     `plainstore.json` — the same failure class, two codes). Now 4 for either
     name.
   - **`frpc` client-OIDC construction failure: 4 → 3** at an **auth-free** issuer
-    URL. The discovery fetch (only when `oidc.token_endpoint` is unset and the
-    issuer is set) embeds the issuer URL in its error, so an issuer path
+    URL. The discovery fetch (only when `oidc.token_endpoint` is unset **and**
+    `oidc.token_source` is unset **and** the issuer is set — `frp-core/src/auth.rs`)
+    embeds the issuer URL in its error, so an issuer path
     containing `auth` gave 3 and an auth-free one gave 4. Every issuer path is
     now 3 — e.g. `…/zzz` and `…/plain` were 4 and are now 3, `…/authz` is 3
     either way. The same family covers a missing `oidc.trustedCaFile`
@@ -515,8 +516,17 @@ User-facing release notes for frp-rs.
     missing OIDC CA file, an empty issuer and an empty audience — **4 was
     unreachable on `frps`**. The typed arm fixes the text dependency there
     without moving a code.
-  Go frp v0.71.0 exits **1** on every one of these inputs, so both codes remain
-  frp-rs extensions; only frp-rs's internal disagreement is gone. Other inputs
+  **Go's behaviour is not one code across all of this**, measured on v0.71.0
+  (darwin/arm64), and it is worth spelling out because both frp-rs codes are
+  extensions either way. On the two **`frpc`** families Go **exits 1**:
+  `failed to create store source: … failed to parse JSON: …` for the `[store]`
+  pair, and `json: unknown field "issuer"` for the client OIDC inputs — Go's
+  *client* OIDC config has no `issuer` key at all. On the **`frps`** rows it does
+  not: an empty `token` with `method = "token"` **does not exit** (it prints
+  `frps started successfully` and keeps running), the two OIDC rows **panic and
+  the runtime exits 2**, and a missing `auth.oidc.trustedCaFile` is not a
+  comparable input — Go's *server* OIDC config has no such key
+  (`json: unknown field "trustedCaFile"`, rc 1). Other inputs
   keep their codes: `auth.tokenSource` on a missing file is still 3 on both
   binaries, the empty-token refusal is still 3, and an occupied `bindPort` is
   still 1 on both sides. There is deliberately **no** `EXIT_AUTH`/`EXIT_BIND`

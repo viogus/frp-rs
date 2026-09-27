@@ -1147,10 +1147,10 @@ Some things this table does not say, each measured:
     not what the classifier was reading — the URL is. With the directory name held
     fixed per arm the matrix above is deterministic (four runs per cell, same rc
     every time).
-    Go has no like-for-like code on this path — it has no discovery preflight, so
-    the client starts — and therefore this flip has no Go row at all; the
-    `[store]` fixture below is the flip control that *has* a Go row (Go exits 1 on
-    both names). Pinned by
+    This flip has no like-for-like Go row, **because Go's `frpc` has no
+    `auth.oidc.issuer` key at all** — measured, `json: unknown field "issuer"`,
+    rc 1 — not because the client starts. The `[store]` fixture below is the flip
+    control that *has* a Go row (Go exits 1 on both names). Pinned by
     `frpc/tests/cli_exit_codes.rs::oidc_construction_failure_exits_3_whatever_the_issuer_path`,
     which also fails on a text-classifier revert (measured: `left: Some(4)`,
     `right: Some(3)` on the `zzz` arm).
