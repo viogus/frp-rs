@@ -2765,7 +2765,7 @@ regressed**):
 | `--help=false -c cfg` | rc 1 | rc 0, root usage | rc 0, root usage | the pre-existing root divergence above, deliberately unchanged |
 | `--help=0` / `--help=false` / `--help=false notacommand` / `--help=true notacommand` | rc 1 | rc 0 help | rc 0 help | unchanged: no command word, or a word that is not one |
 | `-h -v -c` | rc 1 stderr | rc 0 help | rc 0 help | a value-taking short separated from the help short by another token; the pass only pairs *adjacent* tokens |
-| `-hLinfo` | rc 1 stderr | rc 0 help | rc 0 help | a trailing `-hL<value>` cluster: pflag hands `info` to `-L`, bpaf hands the token to `-h` |
+| `-hLinfo` | rc 1 stderr | rc 0 help | rc 0 help | a trailing `-hL<value>` cluster: pflag hands `info` to `-L` and bpaf hands the token to `-h`. `-L` is frp-rs's alias for `--log-level` (`frpc/src/main.rs`'s run mode) and **not** a Go shorthand — Go registers `log_level` with `StringVarP(..., "", ...)` (`pkg/config/flags.go:161`), so its own refusal is `unknown shorthand flag: 'L' in -L` |
 | `-c cfg -- --help=false` | rc 1 stdout | rc 1 stderr | rc 1 stderr | the positional-argument class (Go ignores what follows `--`, frp-rs refuses it) |
 | `--help=false status -c CFG` (port set) | rc 1, 1 conn, **stdout** 45 B | rc 0, 0 conn | rc 1, 1 conn, **stderr** 22 B | the admin status error's stream: frp-rs's `status query failed: …` goes to stderr on every status failure, port or not, unrelated to this flag |
 
