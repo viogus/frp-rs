@@ -2554,9 +2554,12 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     split left this lane on the completing `load_server_config`, but the fill itself changes it):
     before **rc 0 with nothing bound**, now `*:19881` listening. Not "silent": the pre-fix run did
     emit `ERROR frps: frps service error for config file [...]: failed to lookup address
-    information` on stdout (byte counts here and below vary with the run: the line embeds the
-    config path, and R1/R2 measured different totals for the same shape) — the defect is that the
-    **exit code was 0**
+    information` on stdout — the defect is that the **exit code was 0**. No byte total is quoted for
+    this or for the log-shape rows below: the config path appears twice in that line, so the total is
+    a function of the harness's path length (the same shape measured 1489 / 1540 / 1654 B under three
+    different path lengths). With the path held fixed, consecutive pre-fix runs are byte-identical —
+    which is what makes "the code emits this line" the reproducible claim, and any cross-harness
+    total difference a path artifact rather than a code difference
     for a service that never bound. Go has no `frps --config-dir`
     (`Error: unknown flag: --config-dir`, rc 1), so the analogue is Go's `-c` lane, which binds
     `0.0.0.0` for the same file.
@@ -2613,8 +2616,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `frps/tests/cli_exit_codes.rs` count is untouched at 16; executed by the new
   `Run frps CLI completion tests (merged-config completion order)` step in `.github/workflows/ci.yml`,
   which is `--test cli_completion` and therefore moves no guarded count): six bounded spawns, each
-  with its own free ports, `RUST_LOG=info`, stdout/stderr drained on reader threads and the child
-  killed+reaped by a `Drop` guard — five of the six own their ports via `free_port()`;
+  with `RUST_LOG=info`, stdout/stderr drained on reader threads and the child killed+reaped by a
+  `Drop` guard. Ports: five of the six shapes own theirs via `free_port()`;
   `cli_bind_port_zero_is_completed_to_default` deliberately hard-codes `bind_port = 19845` because
   the flag under test (`--bind-port 0`) is then completed to `7000` and 19845 is never bound.
   The shapes: `--dashboard-addr ""` (credentials set, asserts the dashboard's
@@ -2647,12 +2650,16 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   proxy-listener consequence**. Swept
   `grep -rn "failed to lookup address information\|Dashboard web UI starting" docs TODO.md
   CHANGELOG.md frp-core/src frps/src`: the remaining hits are this item's own historical
-  measurements, the frpc admin-address one (`docs/developing.md:1151`, the
-  `frpc reload | stop -c …` row, a different code path), and the code/log sites themselves.
+  measurements, the frpc admin-address one (`docs/developing.md:1151`, the client-admin table's
+  `[webServer] addr = ""` row — `| "" | dials 127.0.0.1:7499 | … | connect :7499: failed to lookup
+  address information |`; the separate `frpc reload | stop -c …` row is `:1098`), and the code/log
+  sites themselves.
   (Other hits with the same phrase belong to *other* items' history, not to this item's sweep:
-  `TODO.md` `:2339`/`:2360` and `CHANGELOG.md` `:379`.)
-- [ ] **`frps` has no `Log.Complete()`: an explicit empty `--log-level`/`--log-file` silences the
-  server, where Go falls back to `info`/`console`.** Go's `ServerConfig.Complete()` calls
+  `TODO.md` `:2339`/`:2360`, and `CHANGELOG.md` `:382`
+  (`admin server failed: failed to lookup address information …`) — that one *is* a sweep hit too,
+  but it is the frpc admin-address history the sentence above already accounts for.)
+- [ ] **`frps` has no `Log.Complete()`: an explicit empty `--log-level`/`--log-file` silences its
+  **logging** (the listener still comes up), where Go falls back to `info`/`console`.** Go's `ServerConfig.Complete()` calls
   `c.Log.Complete()` (`pkg/config/v1/server.go:105`), which is
   `To = util.EmptyOr(To, "console")`, `Level = util.EmptyOr(Level, "info")`,
   `MaxDays = util.EmptyOr(MaxDays, 3)` (`pkg/config/v1/common.go:119-123`). frp-core's
@@ -2660,10 +2667,11 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   defaults on `LogConfig` fire only when the key is **absent**, so an explicit empty string
   survives into `init_logging` (`frps/src/main.rs`), and `frps`'s CLI writes all three fields
   (`override_server_config`: `--log-file`, `--log-level`, `--log-max-days`). Measured (real Go
-  v0.71.0 vs frp-rs at `46f4543`, own free port, `[auth] token` set):
+  v0.71.0 vs frp-rs on this branch, own free port, `[auth] token` set):
   * frp-rs `--log-level ""` → **0 bytes on stdout and 0 on stderr**, listener up on
     `127.0.0.1:19891`; frp-rs `--log-file ""` → the same; frp-rs with neither flag → its normal
-    `INFO` startup lines (11 lines; byte totals vary by run).
+    **7** `INFO` startup lines before any signal (1498 B; the run's 11-line / 2434 B total is
+    reached only after the harness's SIGTERM appends 4 graceful-shutdown lines).
   * Go v0.71.0 `--log_level ""` → still logs its startup lines at `info` (3 lines; byte totals
     vary by run); the same for `--log_file ""` and for the no-flag control.
   Found while sweeping the CLI overrides for the completed-input hazard above (the sweep's first

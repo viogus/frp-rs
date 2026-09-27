@@ -509,9 +509,12 @@ fn absent_bind_addr_flag_keeps_configured_value() {
 /// file is authoritative), so it still resolves through the completing
 /// `load_server_config`, but the new `bind_addr` fill is observable in it.
 /// Measured: with `bindAddr = ""` in the file, the pre-fix binary exits **0
-/// with nothing bound** while logging the *same* `ERROR … failed to lookup
-/// address information` shape the `-c` lane produces — the defect is the exit
-/// code, not silence, and it is not "louder" on either lane. The fixed binary
+/// with nothing bound**, logging
+/// `ERROR frps: frps service error for config file […]: failed to lookup address
+/// information`. The underlying error text is the one `-c` also reports, but the
+/// message wraps it per config file and the disposition differs (`-c` exits 1);
+/// the defect here is the exit code, not silence, and neither lane is "louder".
+/// The fixed binary
 /// binds `0.0.0.0:<port>`, which is what Go binds for the same file through its
 /// `-c` lane (`frps` has no `--config-dir`: Go exits 1 with
 /// `unknown flag: --config-dir`).

@@ -1236,7 +1236,7 @@ with `lsof -nP -iTCP:<port> -sTCP:LISTEN`:
 | `--bind-addr ""` (`[auth] token`, `bindPort` in the file) | `frps tcp listen on 0.0.0.0:19805`; `TCP *:19805 (LISTEN)` | `frps starting on :19805` + `failed to lookup address information`, exit 1, nothing bound | `0.0.0.0:19805`; `TCP *:19805 (LISTEN)` |
 | `--bind-port 0` | `create server listener error, listen tcp 0.0.0.0:7000: bind: address already in use` (tries the default 7000) | `frps starting on 127.0.0.1:0`, binds an ephemeral port | `frps starting on 127.0.0.1:7000` |
 | `bindAddr = ""` **in the file** (no flag) | `0.0.0.0:19815` | exit 1, nothing bound | `0.0.0.0:19815` |
-| `--config-dir <dir>` with `bindAddr = ""` in the file (the lane that never overlays flags — it still resolves through the completing `load_server_config`) | *(no `frps --config-dir` on Go: `Error: unknown flag: --config-dir`, rc 1; the `-c` analogue binds `0.0.0.0`)* | **rc 0 with nothing bound** — but *not* silent: the run logs `ERROR frps: frps service error for config file […]: failed to lookup address information`, the same error shape the `-c` lane produces; the defect is the **exit code** | `0.0.0.0:19881` listening |
+| `--config-dir <dir>` with `bindAddr = ""` in the file (the lane that never overlays flags — it still resolves through the completing `load_server_config`) | *(no `frps --config-dir` on Go: `Error: unknown flag: --config-dir`, rc 1; the `-c` analogue binds `0.0.0.0`)* | **rc 0 with nothing bound** — and *not* silent: it logs `ERROR frps: frps service error for config file […]: failed to lookup address information`. The **underlying error text** is the same one `-c` reports, but the message and the disposition differ: `-c` prints `ERROR frps: frps error: failed to lookup address information` and **exits 1**, while this lane wraps it per config file and **exits 0** — the defect is that exit code | `0.0.0.0:19881` listening |
 | the no-auth force-bind, no flag (control case) | n/a | `127.0.0.1` | unchanged |
 
 Pinned by `frps/tests/cli_completion.rs` (`--dashboard-addr ""` with
@@ -1264,7 +1264,10 @@ Three things this does **not** claim:
   In a directory without one frp-rs exits
   `Failed to load config: frps.toml: … No such file or directory`. Where a file
   *is* present, the CLI-override lane above is the frp-rs analogue of Go's
-  flags-only lane and is what was measured; Go's flags-only `--dashboard-addr ""`
+  flags-only lane and is what was measured — the same **order** (overlay, then
+  complete), not the same **values**, for the reason given at the top of this
+  section (Go pre-seeds every pflag default; frp-rs keeps the file's values except
+  where a flag overrides). Go's flags-only `--dashboard-addr ""`
   also completes to `127.0.0.1` (`WebServer.Complete()`), but Go's flags-only
   **absent** `--dashboard-addr` binds `0.0.0.0`, where frp-rs keeps the file's
   `127.0.0.1`. Measured and explained: Go registers the flag with its default
