@@ -2623,11 +2623,16 @@ What the table says, precisely:
   spellings, recorded rather than described as parity; nothing in Go's help
   string is contradicted, the same information is just laid out differently.
 - **`--help`/`-h` is a pflag bool on Go too, and is not covered by this
-  parser.** `frps --help=false -c cfg` starts the server there (124) and prints
-  help here (0, bpaf's built-in help parser, which accepts the attached value
-  and ignores it). It is not one of the ten `.switch()` sites and is unchanged;
-  recorded because it is the one remaining bool on both binaries with this
-  spelling shape.
+  parser.** It is not one of the ten `.switch()` sites: bpaf owns `--help` as
+  `Info::help_arg`, so it has its own two pre-parse passes instead of the
+  `go_bool_flag!` macro, and the two entry points own the ordering — see
+  [§ `--help=<bool>`: the bool that a subcommand can follow](#--helpbool-the-bool-that-a-subcommand-can-follow).
+  The **root** half is still divergent and deliberately so:
+  `frps --help=false -c cfg` starts the server there (124) and prints help here
+  (0, bpaf's built-in help parser, which accepts the attached value and ignores
+  it) — the pass leaves the token in place when no command word follows it.
+  The **subcommand** half (`--help=false status`, `--help=true status`, `-hc`)
+  is fixed there, with its measurements.
 
 Carriers, all of which agree:
 
@@ -2667,6 +2672,114 @@ Carriers, all of which agree:
   own doc comment states what it does *not* prove: with `-c` present the
   config's transport section is authoritative (`cli_overrides_enabled()`), so it
   pins argv acceptance, not that `false` reached the service.
+
+#### `--help=<bool>`: the bool that a subcommand can follow
+
+`--help`/`-h` is one of the pflag bools above, but it is registered by **cobra**
+(`InitDefaultHelpFlag`, `cobra-1.8.0/command.go:1186`) inside `execute` — after
+`Find` has already run `stripFlags` — so it is the one bool that is *not* in
+`RootCommand::bool_root_flags` and *does* consume the next token during command
+resolution (`frpc --help status` prints the **root** help on Go, not `status`'s).
+On the parse side it behaves like every other pflag bool: `--help=false` sets it
+to `false` and cobra then runs the command normally
+(`cobra-1.8.0/command.go:892-894`), while `--help=true` prints the resolved
+command's own help.
+
+bpaf has no such flag to parse. `--help` is `Info::help_arg`
+(`bpaf-0.9.27/src/info.rs:41`), which the inner parser never sees: bpaf evaluates
+it only after parsing fails, and a value attached with `=` makes the parse fail,
+so `--help=false status` used to short-circuit to help. Measured on Go frp
+v0.71.0 darwin/arm64 against the base head (`5b18489`) and this head, stdout and
+stderr captured separately, rc read from the child directly, and **one fresh
+listening socket per run** on the config's `[webServer] port` with connections
+counted by `accept`:
+
+| argv | Go v0.71.0 | frp-rs base | frp-rs head |
+|---|---|---|---|
+| `--help=false status -c CFG` (port set) | rc 1, **1 connection** (it dialled), stdout 45 B, stderr 0 B | rc 0, **0 connections**, `status`'s bpaf usage 1604 B on stdout | rc 1, **1 connection**, stdout 0 B, stderr 22 B (`status query failed: `) |
+| the same with no `port` | rc 1, 0 connections, stdout 62 B `web server port should be set if you want to use this feature` | rc 0, 0 connections, the same 1604 B usage | rc 1, 0 connections, the same 62 B line |
+| `--help=true status -c CFG` | rc 0, 0 connections, stdout 627 B (`Overview of all proxies status` + `Usage: frpc status [flags]`) | rc 0, 0 connections, 1604 B of bpaf usage | rc 0, 0 connections, 1604 B of bpaf usage |
+| `-hc status` | rc 1, **stderr** 637 B `Error: flag needs an argument: 'c' in -c` + usage, stdout 0 B | rc 0, usage 1604 B on **stdout** | rc 1, **stderr** 41 B, the same first line, stdout 0 B |
+| `-hc` | rc 1, stderr 1351 B, stdout 0 B | rc 0, root usage 2405 B on stdout | rc 1, stderr 41 B, stdout 0 B |
+| `-h -c status` | rc 1, stderr 637 B, stdout 0 B | rc 0, 1604 B on stdout | rc 1, stderr 41 B, stdout 0 B |
+| `-hc status -c CFG` | rc 0, `status`'s help | rc 0, bpaf usage | rc 0, bpaf usage (unchanged) |
+| `--help=foo status` | rc 1, stderr 698 B, stdout 0 B | rc 0, usage 1604 B on stdout | rc 1, stderr 102 B, stdout 0 B |
+| `--help` / `-h` / `--help=true` (no subcommand) | rc 0, root help 1370 B | rc 0, root usage 2405 B | rc 0, root usage 2405 B (unchanged) |
+| `status --help` / `status -h` / `status --help=true` | rc 0, `status`'s help 627 B | rc 0, 1604 B | rc 0, 1604 B (unchanged) |
+
+What moved is the **class the item measured**: whether the command resolves and
+runs at all (`--help=false status` now dials, 1 connection, rc 1), and the three
+shorthand-cluster argvs that printed help instead of pflag's refusal. What did
+**not** move is the help **document**: `--help=true <sub>` and `<sub> --help`
+still print bpaf's usage document (1604 B for `status`) where Go prints cobra's
+`Overview of all proxies status` (627 B). Reproducing that document means
+reproducing cobra's command-help renderer over bpaf's metadata — command short
+text, the `Flags:`/`Global Flags:` split, 30-column flag alignment, `-h, --help
+help for status` — and it is a **flag-surface-wide** row, not a `--help` one:
+`frpc status --help` (627 B vs 1604 B) and `frpc --help` (1370 B vs 2405 B) differ
+for exactly the same reason and are **not** made worse here. It is left as the
+separate, larger row the item named, and the byte counts are the honest
+statement of where the two trees stand. Two sub-differences are *inside* the
+matched class and are also not fixed:
+
+* the shorthand refusal reproduces pflag's **line**, rc 1 and the stderr stream,
+  but not cobra's trailing usage block: Go's stderr is 637 B for `-hc status`
+  and 1351 B for `-hc`; frp-rs's is 41 B, because no frp-rs parse failure prints
+  a usage block (measured: `frpc -c` is 40 B on stderr). The old `rc 0` help
+  print is gone, which is the parity that matters for a script.
+* `--help=<bool>` is refused with pflag's grammar and rc for out-of-grammar
+  values (`--help=foo`, `--help=`, `--help=yes` → stderr 102 B, rc 1), where the
+  base printed help; the **text** is frp-rs's spelling of pflag's message.
+
+The implementation is two pre-parse passes in `frp-core/src/cli.rs`, both
+reading the argv `rewrite_config_dash_values` and `hoist_leading_subcommand` have
+already produced (`prepared_cli_argv` carries the order and why it is
+load-bearing):
+
+* `expand_help_bool_value_form` drops a `--help=<bool>` token when the argv's
+  first bare word is a command this binary implements — so the command resolves
+  and runs — and appends a bare `--help` at the **end** when the value is true,
+  so the *subcommand's* help is what prints. It deliberately leaves the token in
+  place when there is no command word (`--help=false -c cfg`, the pre-existing
+  root divergence) or when the bare word is not a command
+  (`--help=true notacommand` must stay bpaf's refusal, not become root help),
+  and it never touches anything after a real `--`.
+* `reject_pflag_shorthand_cluster_that_needs_a_value` prints pflag's
+  `flag needs an argument: '<c>' in -<c>` on stderr and exits 1 for the argv bpaf
+  answered with help: a trailing `-h<value-short>` cluster (`-hc`, `-hL`) whose
+  value never arrived, and its split spellings (`-h -c`, `-c -h`). It stays
+  narrow on purpose — a `-c` with no help short beside it is already a bpaf
+  error with rc 1 on the right stream, and only the help short turns the same
+  argv into a help print instead.
+
+Values go through `parse_go_bool`, the same `strconv.ParseBool` grammar as every
+other bool flag here, so `1`/`0`/`t`/`f`/`T`/`F`/`TRUE`/`FALSE`/`True`/`False`
+are accepted on the `=` spelling.
+
+**Recorded residuals, each measured on Go v0.71.0 / base / head** (the sweep is
+85 argvs; 20 moved to Go's `(rc, connection count, stdout empty)` and **none
+regressed**):
+
+| argv | Go | base | head | what is left |
+|---|---|---|---|---|
+| `--help=false -c cfg` | rc 1 | rc 0, root usage | rc 0, root usage | the pre-existing root divergence above, deliberately unchanged |
+| `--help=0` / `--help=false` / `--help=false notacommand` / `--help=true notacommand` | rc 1 | rc 0 help | rc 0 help | unchanged: no command word, or a word that is not one |
+| `-h -v -c` | rc 1 stderr | rc 0 help | rc 0 help | a value-taking short separated from the help short by another token; the pass only pairs *adjacent* tokens |
+| `-hLinfo` | rc 1 stderr | rc 0 help | rc 0 help | a trailing `-hL<value>` cluster: pflag hands `info` to `-L`, bpaf hands the token to `-h` |
+| `-c cfg -- --help=false` | rc 1 stdout | rc 1 stderr | rc 1 stderr | the positional-argument class (Go ignores what follows `--`, frp-rs refuses it) |
+| `--help=false status -c CFG` (port set) | rc 1, 1 conn, **stdout** 45 B | rc 0, 0 conn | rc 1, 1 conn, **stderr** 22 B | the admin status error's stream: frp-rs's `status query failed: …` goes to stderr on every status failure, port or not, unrelated to this flag |
+
+Verified rather than assumed: `frpc --help`, `frpc -h`, `frpc --help=true`, every
+`frpc <sub> --help`/`<sub> -h`, `frpc --help status`, `frpc --help notacommand`,
+`frpc -h status`, `frpc -c --help`, `frpc status -c cfg -hc`, `frpc -hcx`,
+`frpc -hc=x`, `frpc -hc status -c CFG`, `frpc --strict-config status -c cfg` and
+`frpc -v status -c cfg` are all byte-identical to the base head (or differ only
+in the documented help-document bytes). The unit rows are
+`help_bool_value_form_rows_match_go`,
+`help_bool_value_form_uses_go_bool_spellings` and
+`shorthand_cluster_needing_a_value_is_detected` (`frp-core/src/cli.rs`); the
+`frpc` integration lanes are untouched, so `env.FRPC_TINY_CLI_TESTS` stays `11`
+and `env.FRPS_CLI_TESTS` stays `27`.
 
 ### Repository Invariants (`repo-health.sh`)
 
