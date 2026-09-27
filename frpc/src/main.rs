@@ -569,12 +569,12 @@ async fn run_normal(mut args: FrpcRunArgs) {
             // `frpc/tests/cli_exit_codes.rs`. The `tracing` line this replaces
             // was the last path in `frpc` that wrapped the load error in a log
             // record — the admin subcommands already `println!` it
-            // (`run_reload` / `run_status` below).
+            // (`run_reload` / `run_status` / `run_stop` below).
             //
             // `init_logging` is deliberately **not** called here: Go installs
             // its logger only after a successful load
-            // (`startServiceWithAggregator`, `cmd/frpc/sub/root.go`), and this
-            // branch exits before any log record is emitted.
+            // (`startServiceWithAggregator`, `cmd/frpc/sub/root.go:191`), and
+            // this branch exits before any log record is emitted.
             println!("{e}");
             process::exit(EXIT_RUNTIME);
         }

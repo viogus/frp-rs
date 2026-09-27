@@ -199,7 +199,8 @@ async fn run(mut cli: FrpsArgs) {
             // bytes, stderr 0); pinned by `frps/tests/cli_exit_codes.rs`.
             //
             // `init_logging` is deliberately **not** called here: Go installs
-            // its logger only after a successful load, and this branch exits
+            // its logger only after a successful load
+            // (`runServer`, `cmd/frps/root.go:112`), and this branch exits
             // before any log record is emitted.
             println!("{e}");
             process::exit(frp_core::EXIT_RUNTIME);
