@@ -526,6 +526,31 @@ pub struct FrpsArgs {
     pub show_version: bool,
 }
 
+/// CLI command for frps (server): the root command's run path, or one of its
+/// child commands.
+///
+/// `frps` has a subcommand now, and Go has had one all along: `verify`
+/// (`cmd/frps/verify.go:29`). Before this, `parse_frps_args` returned
+/// [`FrpsArgs`] directly, which is the same shape as saying "`frps` has no
+/// commands" — the premise the old `frp-core/src/cli.rs` comment recorded and
+/// which was false.
+///
+/// The size gap between the two variants is accepted rather than boxed: one
+/// value of this enum exists per process, built once from argv at startup
+/// (`parse_frps_args`), so `Run`'s ~440 bytes are a single stack slot and `Box`
+/// would buy nothing but an allocation plus a deref at every use.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum FrpsCmd {
+    /// Normal mode: load the config (or the flags) and run the server.
+    Run(FrpsArgs),
+    /// Verify that a config file is valid, mirroring Go's `verifyCmd` and
+    /// `frpc verify`. The `-c` value is **empty** when the flag was absent —
+    /// Go's frps registers it with an empty default and `verifyCmd` answers
+    /// that case with a message and rc 0 (`cmd/frps/verify.go:36-39`).
+    Verify(VerifyArgs),
+}
+
 // Intermediate builder structs — each within bpaf construct! field limits.
 
 struct SvrMeta {
@@ -625,15 +650,44 @@ impl From<FrpsBuild> for FrpsArgs {
 
 // ─── Parser combinators ──────────────────────────────────────────────
 
-fn svr_meta() -> impl Parser<SvrMeta> {
-    let config = long("config")
+/// The `-c`/`--config` parser of the frps **run** path.
+///
+/// No `.last()`: a repeated `-c` stays bpaf's "cannot be used multiple times in
+/// this context" refusal, which is frp-rs's pre-existing, documented divergence
+/// from Go's pflag last-wins (`docs/developing.md` § CLI inputs, row
+/// `frps -c a.toml -c b.toml`). `frps verify` is a **new** surface and takes
+/// [`config_arg`] instead, because Go's `verifyCmd` reads the same persistent
+/// pflag and is last-wins like every `frpc` parser — measured, `frps verify -c
+/// a.toml -c b.toml` loads `b.toml` (rc 0).
+fn svr_config() -> impl Parser<Option<String>> {
+    long("config")
         .short('c')
         .argument::<String>("FILE")
-        .optional();
-    let config_dir = long("config-dir")
+        .optional()
+}
+
+/// The frp-rs-only `--config-dir`/`--config_dir` extension, run path only.
+///
+/// Go's frps has no such flag (`unknown flag: --config-dir`, rc 1). It is
+/// deliberately **not** part of the `verify` subcommand's surface: accepting it
+/// there would make `frps verify --config-dir cDir` exit 0 (verify ignores the
+/// directory) where Go exits 1, i.e. a validation tool reporting success for an
+/// argv Go refuses. [`frps_verify_cmd`] passes `bpaf::pure(None)` in this slot.
+fn svr_config_dir() -> impl Parser<Option<String>> {
+    long("config-dir")
         .long("config_dir")
         .argument::<String>("DIR")
-        .optional();
+        .optional()
+}
+
+/// The four root flags [`SvrMeta`] carries. The two config-selecting parsers are
+/// parameters because the run path and the `verify` subcommand differ in exactly
+/// those two (`verify` is last-wins on `-c` and has no `--config-dir`);
+/// everything else is shared, so the two surfaces cannot drift.
+fn svr_meta(
+    config: impl Parser<Option<String>>,
+    config_dir: impl Parser<Option<String>>,
+) -> impl Parser<SvrMeta> {
     let strict_config = strict_config_parser();
     // Go: `-v, --version  version of frps` (`frps --help`), a pflag bool, so
     // `--version=false` starts the server there (measured, rc 124).
@@ -822,8 +876,11 @@ fn svr_transport() -> impl Parser<SvrTransport> {
     })
 }
 
-fn frps_build() -> impl Parser<FrpsBuild> {
-    let meta = svr_meta();
+fn frps_build(
+    config: impl Parser<Option<String>>,
+    config_dir: impl Parser<Option<String>>,
+) -> impl Parser<FrpsBuild> {
+    let meta = svr_meta(config, config_dir);
     let bind = svr_bind();
     let auth = svr_auth();
     let dash = svr_dashboard();
@@ -839,9 +896,66 @@ fn frps_build() -> impl Parser<FrpsBuild> {
     })
 }
 
-/// Raw parser for frps CLI. Returns the parser, doesn't run it.
+/// Raw parser for the frps **run** path — the root command's own arguments,
+/// which is what the binary runs when no child command is selected. Returns the
+/// parser, doesn't run it; for the whole `frps` surface (run + `verify`) use
+/// [`frps_parser`].
 pub fn frps_args() -> impl Parser<FrpsArgs> {
-    frps_build().map(FrpsArgs::from)
+    frps_build(svr_config(), svr_config_dir()).map(FrpsArgs::from)
+}
+
+/// The whole `frps` surface: the `verify` child command, then the root
+/// command's run path — the same branch order [`frpc_parser`] uses.
+///
+/// Command branches come first for the same reason as on `frpc`: bpaf picks a
+/// branch *before* dispatch, and a command branch matches the command token
+/// where it sits, so the run branch must not get first refusal on an argv whose
+/// first token is a command name. `verify` leads the argv only after
+/// [`hoist_leading_subcommand`] moved it there; that is what makes
+/// `frps -c cfg.toml verify` reach `verify_cmd` instead of the run branch's
+/// leftover-token refusal (measured on Go: rc 0).
+fn frps_parser() -> impl Parser<FrpsCmd> {
+    let run = frps_args().map(FrpsCmd::Run);
+    construct!([frps_verify_cmd(), run])
+}
+
+/// The `frps verify` subcommand, mirroring Go's `verifyCmd`
+/// (`cmd/frps/verify.go`, registered on `rootCmd` at `:29`).
+///
+/// Go's `verifyCmd` reads exactly two persistent root flags — `cfgFile` and
+/// `strictConfigMode` (`cmd/frps/verify.go:36,40`) — and **accepts and ignores**
+/// every other one, because they hang off `rootCmd`:
+/// `config.RegisterServerConfigFlags(rootCmd, &serverCfg)` (`cmd/frps/root.go:50`)
+/// plus `--version` and `--allow-unsafe` (`:44-48`). Measured on Go v0.71.0:
+/// `frps verify --help` prints the whole surface under `Global Flags`, and
+/// `frps verify --bind-port <free> -c <valid>`,
+/// `frps verify --allow-unsafe X -c <valid>` and
+/// `frps verify --version -c <valid>` are all rc 0 with the *verify* output (no
+/// version line). Parsing through [`frps_build`] and keeping only the two fields
+/// reproduces that acceptance without a second hand-written flag list.
+///
+/// The two slots where this differs from the run path are the parameters
+/// [`frps_build`] takes: `-c` is [`config_arg`] (pflag last-wins; Go's verifyCmd
+/// reads the same persistent flag, so `-c a -c b` loads `b` — measured rc 0 on
+/// `b`), and `--config-dir` is refused (`bpaf::pure(None)`), because Go has no
+/// such flag and refusing it keeps Go's rc 1 instead of silently succeeding on a
+/// directory this command would never look at.
+///
+/// `config` is therefore `Option<String>` and **empty** when absent: Go
+/// registers `-c` with an empty default on frps (`cmd/frps/root.go:44`) and
+/// `verifyCmd` answers an empty path with `frps: the configuration file is not
+/// specified` + rc **0** (`cmd/frps/verify.go:36-39`; measured), unlike `frpc`,
+/// whose default is `./frpc.ini`. `frps/src/main.rs`'s `run_verify` reproduces
+/// that branch.
+fn frps_verify_cmd() -> impl Parser<FrpsCmd> {
+    let args = frps_build(config_arg().optional(), bpaf::pure(None)).map(|b| VerifyArgs {
+        config: b.meta.config.unwrap_or_default(),
+        strict_config: b.meta.strict_config,
+    });
+    args.to_options()
+        .command("verify")
+        .help("Verify that the configuration is valid")
+        .map(FrpsCmd::Verify)
 }
 
 /// The output width bpaf's own `OptionParser::run` passes to
@@ -943,17 +1057,22 @@ fn run_cli<T>(parser: bpaf::OptionParser<T>, name: Option<String>, rest: &[OsStr
 /// composes:
 ///
 /// 1. [`rewrite_config_dash_values`] — pflag's config dash-value rule.
-/// 2. [`hoist_leading_subcommand`] — cobra's command resolution, `frpc` only
-///    (`has_subcommands`; Go's `frps` declares no subcommands, so there is
-///    nothing to resolve and `frps` keeps the old behaviour exactly).
+/// 2. [`hoist_leading_subcommand`] — cobra's command resolution, on the root
+///    command named by `root`. **Both** binaries have a hoistable root: Go's
+///    `frps` registers a child command (`rootCmd.AddCommand(verifyCmd)`,
+///    `cmd/frps/verify.go:29`) beside cobra's own `completion`/`help`, and
+///    `frps --help` lists all three under `Available Commands` (measured on Go
+///    v0.71.0). The claim this comment used to carry — "Go's `frps` declares no
+///    subcommands" — was false, and `frps` is now hoisted exactly like `frpc`,
+///    from its own measured flag/command set ([`RootCommand`]).
 ///
 /// Both entry points call **this** function, which is what makes the shared
 /// pass a single decision rather than two call sites that could drift:
 /// [`parse_frps_args`] and [`parse_frpc_args`] differ only in which parser they
-/// run over the result. Crate-private: the module's tests pin the chain (this
-/// preparation, then the parser) through it, so they follow the same expression
-/// the binaries use instead of calling a pass directly — see
-/// `frps_takes_a_dash_shaped_config_value`.
+/// run over the result and in the [`RootCommand`] they name. Crate-private: the
+/// module's tests pin the chain (this preparation, then the parser) through it,
+/// so they follow the same expression the binaries use instead of calling a pass
+/// directly — see `frps_takes_a_dash_shaped_config_value`.
 ///
 /// **Why the rewrite runs first.** The hoist classifies tokens as flag / value /
 /// bare word, and it has to classify the argv the parser will actually see —
@@ -969,12 +1088,76 @@ fn run_cli<T>(parser: bpaf::OptionParser<T>, name: Option<String>, rest: &[OsStr
 /// or positional: `status` ``. The reverse order (hoist, then rewrite) would
 /// decide before `--`-as-value is known, and could move a token across what is
 /// still a real separator.
-fn prepared_cli_argv(rest: &[OsString], has_subcommands: bool) -> Vec<OsString> {
+fn prepared_cli_argv(rest: &[OsString], root: RootCommand) -> Vec<OsString> {
     let rewritten = rewrite_config_dash_values(rest);
-    if has_subcommands {
-        hoist_leading_subcommand(&rewritten)
-    } else {
-        rewritten
+    hoist_leading_subcommand(&rewritten, root)
+}
+
+/// Which binary's **root command** a cobra-shaped pre-parse pass is emulating.
+///
+/// Go's two root commands differ in the two facts `Find`/`stripFlags` read, so
+/// neither can be described by a single shared constant:
+///
+/// * which child commands exist ([`RootCommand::subcommands`]);
+/// * which root flags pflag registers as **bools**
+///   ([`RootCommand::bool_root_flags`]) — a bool carries `NoOptDefVal =
+///   "true"`, so `stripFlags` does *not* let it swallow the next argv token,
+///   while every other flag does.
+///
+/// `frps` was previously modelled as having neither, on the stated grounds that
+/// it declares no subcommands. That premise is false: `frps` declares `verify`
+/// and inherits cobra's `completion`/`help` (measured — `frps --help` lists all
+/// three), and it runs the same `stripFlags`-then-`Find` resolution, which is
+/// where Go's measured `unknown command "true" for "frps"` for
+/// `frps --strict-config true verify -c <cfg>` comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootCommand {
+    Frps,
+    Frpc,
+}
+
+impl RootCommand {
+    /// The child command names cobra's `Find` can resolve on this root — the
+    /// **whole implemented** surface, not Go's full list (cobra's `completion`
+    /// and `help` are not implemented on either binary).
+    fn subcommands(self) -> &'static [&'static str] {
+        match self {
+            RootCommand::Frps => &FRPS_SUBCOMMANDS,
+            RootCommand::Frpc => &FRPC_SUBCOMMANDS,
+        }
+    }
+
+    /// The long flag names this root registers with a pflag **bool**, written
+    /// in pflag's normalized `_` spelling: `config.WordSepNormalizeFunc` folds
+    /// `-` to `_`, and `hasNoOptDefVal` looks the name up through that
+    /// normalization, so `--strict-config` and `--strict_config` are one flag
+    /// and both spellings of every entry below are exempt.
+    ///
+    /// Every entry is measured on Go v0.71.0 (the probes are tabulated in
+    /// `docs/developing.md` § CLI inputs); the *complement* is the interesting
+    /// half, because a name missing here is treated as value-taking:
+    ///
+    /// * `frps` — `version`/`-v` and `strict_config`
+    ///   (`cmd/frps/root.go:44-48`), plus the three `BoolVarP` registrations in
+    ///   `pkg/config/flags.go:242,246,251` (`enable_prometheus`,
+    ///   `disable_log_color`, `tls_only`). Measured:
+    ///   `frps --enable-prometheus verify -c <cfg>`,
+    ///   `frps --disable-log-color verify -c <cfg>` and
+    ///   `frps --tls-only verify -c <cfg>` all resolve the `verify` command
+    ///   (rc 0), so neither flag consumed it.
+    /// * `frps`'s `--dashboard-tls-mode` is **not** here, and the measurement
+    ///   is why: it is registered with `VarP(BoolFuncFlag{…})`
+    ///   (`pkg/config/flags.go:256-258`), not `BoolVarP`, so pflag never sets
+    ///   `NoOptDefVal` on it. Measured: `frps --dashboard-tls-mode verify -c
+    ///   <valid cfg>` consumes `verify` as the flag's value, finds no bare word
+    ///   and **starts the server** (rc 124 when bounded) instead of verifying.
+    /// * `frpc` — `version`/`-v` and `strict_config`
+    ///   (`cmd/frpc/sub/root.go:52-53`).
+    fn bool_root_flags(self) -> &'static [&'static str] {
+        match self {
+            RootCommand::Frps => &FRPS_BOOL_ROOT_FLAGS,
+            RootCommand::Frpc => &FRPC_BOOL_ROOT_FLAGS,
+        }
     }
 }
 
@@ -993,14 +1176,38 @@ const FRPC_SUBCOMMANDS: [&str; 12] = [
     "stop",
 ];
 
-/// Whether `token` names one of the commands [`frpc_parser`] registers.
+/// The `frps` subcommand names [`hoist_leading_subcommand`] recognises.
+///
+/// One name, because `verify` is the only `frps` child frp-rs implements; Go's
+/// `frps --help` additionally lists the cobra built-ins `completion` and `help`
+/// (measured), which stay refusals here exactly as they do on `frpc`.
+/// `every_known_subcommand_name_has_a_parser_branch` pins this list against the
+/// parser's own branches, so a name without a command (or a command missing
+/// from the list) fails.
+const FRPS_SUBCOMMANDS: [&str; 1] = ["verify"];
+
+/// The pflag **bool** long flags of Go's `frps` root command, normalized to `_`.
+/// See [`RootCommand::bool_root_flags`] for the source lines and the probes.
+const FRPS_BOOL_ROOT_FLAGS: [&str; 5] = [
+    "version",
+    "strict_config",
+    "enable_prometheus",
+    "disable_log_color",
+    "tls_only",
+];
+
+/// The pflag **bool** long flags of Go's `frpc` root command, normalized to `_`.
+/// See [`RootCommand::bool_root_flags`].
+const FRPC_BOOL_ROOT_FLAGS: [&str; 2] = ["version", "strict_config"];
+
+/// Whether `token` names one of the commands `root` registers.
 ///
 /// `s` is a whole argv token, never a prefix: cobra's `findNext`
 /// (`cobra-1.8.0/command.go`) compares with `commandNameMatches`, i.e. string
 /// equality (`EnablePrefixMatching` is off — frp does not set it), and frp-rs
 /// does not implement prefix matching either.
-fn is_known_subcommand(s: &str) -> bool {
-    FRPC_SUBCOMMANDS.contains(&s)
+fn is_known_subcommand(s: &str, root: RootCommand) -> bool {
+    root.subcommands().contains(&s)
 }
 
 /// Whether cobra's `stripFlags` would treat this token as a flag that swallows
@@ -1010,21 +1217,27 @@ fn is_known_subcommand(s: &str) -> bool {
 ///
 /// The exemption list is therefore **exactly the root flags that Go registers
 /// with a pflag bool**, because a pflag bool sets `NoOptDefVal =
-/// "true"` (`pflag-1.0.5/bool.go:56`, reached from `BoolVarP`). On `frpc`
-/// those are two, both on `rootCmd`:
+/// "true"` (`pflag-1.0.5/bool.go:56`, reached from `BoolVarP`) — but the list is
+/// **per root command**: [`RootCommand::bool_root_flags`] carries the two sets
+/// with their `file:line` sources and the probes that pin them, and `frps`'s is
+/// the longer one (five names against `frpc`'s two) because Go hangs the whole
+/// server flag surface off `frps`'s root
+/// (`config.RegisterServerConfigFlags(rootCmd, &serverCfg)`,
+/// `cmd/frps/root.go:50`).
 ///
-/// * `--version` / `-v` — `cmd/frpc/sub/root.go:52`;
-/// * `--strict-config` / `--strict_config` — `cmd/frpc/sub/root.go:53`
-///   (`BoolVarP(&strictConfigMode, "strict_config", "", true, …)`). Both
-///   spellings are exempt because `rootCmd.SetGlobalNormalizationFunc(config.WordSepNormalizeFunc)`
-///   makes pflag resolve `--strict-config` to the same flag.
+/// Both spellings of a bool are exempt because
+/// `rootCmd.SetGlobalNormalizationFunc(config.WordSepNormalizeFunc)` makes pflag
+/// resolve `--strict-config` to the same `strict_config` entry.
 ///
-/// Everything else consumes the next token: the three value-taking root flags
-/// (`--config`/`-c`, `--config_dir`, `--allow-unsafe`, `cmd/frpc/sub/root.go:50-51,55`)
-/// **and any flag cobra does not know**, because `hasNoOptDefVal` returns false
-/// for a name that is not in the set — measured, `frpc -x status` and
-/// `frpc --nodash status` are `unknown shorthand flag` / `unknown flag` on Go
-/// (so the token after the unknown flag was never a candidate).
+/// Everything else consumes the next token: the value-taking root flags
+/// (`--config`/`-c`, `--config_dir`, `--allow-unsafe`,
+/// `cmd/frpc/sub/root.go:50-51,55`; `--bind_port`/`-p`, `--token`/`-t`,
+/// `--allow-ports`, `--dashboard-port`, `--log-file`, …,
+/// `pkg/config/flags.go:229-255`) **and any flag cobra does not know**, because
+/// `hasNoOptDefVal` returns false for a name that is not in the set — measured,
+/// `frpc -x status` and `frpc --nodash status` are `unknown shorthand flag` /
+/// `unknown flag` on Go (so the token after the unknown flag was never a
+/// candidate).
 ///
 /// `--help`/`-h` deliberately **stays** a consumer here. pflag makes `help` a
 /// bool, so the tempting reading is "it carries `NoOptDefVal` and therefore does
@@ -1059,23 +1272,36 @@ fn is_known_subcommand(s: &str) -> bool {
 /// `status` is never resolved — while the over-consuming version hoisted
 /// `status` and dialled the admin port (rc 0). Under-consuming is the other
 /// direction of the same bug: `frpc --strict-config status -c cfg` is rc 0 and
-/// dials on Go, because `status` was not consumed.
-fn consumes_value(s: &OsStr) -> bool {
+/// dials on Go, because `status` was not consumed. The `frps` rows are the same
+/// shape and are measured in `docs/developing.md` § CLI inputs:
+/// `frps --tls-only verify -c <valid cfg>` resolves `verify` (rc 0), so
+/// `--tls-only` must **not** consume, while
+/// `frps --dashboard-tls-mode verify -c <valid cfg>` consumes `verify` as the
+/// flag's value and starts the server (rc 124 when bounded), so that one must.
+fn consumes_value(s: &OsStr, root: RootCommand) -> bool {
     let Some(s) = s.to_str() else { return false };
     if s.contains('=') {
         return false;
     }
     match s.as_bytes() {
         [b'-', b'-', rest @ ..] if !rest.is_empty() => {
-            rest != b"version" && rest != b"strict-config" && rest != b"strict_config"
+            // pflag looks the name up through `WordSepNormalizeFunc`, which
+            // folds `-` into `_`, so `--strict-config` and `--strict_config`
+            // both find the same registry entry.
+            let name = String::from_utf8_lossy(rest).replace('-', "_");
+            !root.bool_root_flags().contains(&name.as_str())
         }
         [b'-', c] => *c != b'v',
         _ => false,
     }
 }
 
-/// Move `frpc`'s **leading** subcommand token to the front of the argv, the way
-/// cobra resolves a command that follows leading root flags (`TODO.md:2566`).
+/// Move a **leading** subcommand token to the front of the argv, the way cobra
+/// resolves a command that follows leading root flags (`TODO.md:2566`).
+///
+/// [`RootCommand`] selects which root command's flag and command sets are
+/// emulated; both binaries run the same resolution, because Go's `frps` declares
+/// a child command too (`verify`).
 ///
 /// Go's `Find` (`cobra-1.8.0/command.go`, `ExecuteC` → `Find` → `innerfind`)
 /// strips flags from argv with `stripFlags` and then looks at **only the first
@@ -1134,8 +1360,36 @@ fn consumes_value(s: &OsStr) -> bool {
 ///   `notacommand status` is the same refusal). The first bare word is
 ///   therefore the only candidate; a later word is never hoisted.
 ///
+/// The `frps` rows, each measured on Go v0.71.0 with a fresh valid config
+/// (`docs/developing.md` § CLI inputs has the table):
+///
+/// * `frps verify -c cfg.toml` — already leading, nothing to hoist (rc 0).
+/// * `frps -c cfg.toml verify` — `-c` consumes its value, so `verify` is the
+///   first bare word and cobra resolves it: Go runs `verifyCmd` on `cfg.toml`,
+///   rc 0. Without the hoist frp-rs answered rc 1 `` `verify` is not expected
+///   in this context `` — a *valid* config reported as a failure by the one
+///   command whose job is to say whether it is valid.
+/// * `frps --strict-config=false verify -c cfg.toml` — an `=`-attached flag
+///   never consumes, so `verify` is again the first bare word; Go rc 0
+///   (lenient), and the hoist is what makes the lenient spelling reach the
+///   verify branch at all.
+/// * `frps --tls-only verify -c cfg.toml` — `--tls-only` is a pflag bool
+///   (`pkg/config/flags.go:251`), so it does **not** swallow `verify`; Go
+///   resolves the command, rc 0.
+/// * `frps --dashboard-tls-mode verify -c cfg.toml` — the same shape with a
+///   flag that is *not* a pflag bool (`VarP(BoolFuncFlag{…})`,
+///   `pkg/config/flags.go:256-258`): `verify` becomes the flag's **value**, no
+///   bare word survives, and Go runs the root command instead — measured, it
+///   starts the server (`frps started successfully`, rc 124 when bounded). The
+///   exemption list must therefore leave this name consuming.
+/// * `frps --strict-config true verify -c cfg.toml` — the space form: pflag's
+///   bool does not consume `true`, `true` is the first bare word, and Go
+///   refuses it (`unknown command "true" for "frps"`, rc 1) rather than
+///   resolving the `verify` that follows. The first bare word is the only
+///   candidate on `frps` too.
+///
 /// Returns `argv` unchanged when there is nothing to hoist.
-fn hoist_leading_subcommand(argv: &[OsString]) -> Vec<OsString> {
+fn hoist_leading_subcommand(argv: &[OsString], root: RootCommand) -> Vec<OsString> {
     let mut i = 0;
     while i < argv.len() {
         let arg = &argv[i];
@@ -1147,7 +1401,7 @@ fn hoist_leading_subcommand(argv: &[OsString]) -> Vec<OsString> {
         if arg.to_string_lossy().starts_with('-') {
             // A flag — never a candidate. A value-taking flag also swallows the
             // token after it, which is how `-c status` keeps its value.
-            i += if consumes_value(arg) { 2 } else { 1 };
+            i += if consumes_value(arg, root) { 2 } else { 1 };
             continue;
         }
         let Some(word) = arg.to_str() else {
@@ -1155,7 +1409,7 @@ fn hoist_leading_subcommand(argv: &[OsString]) -> Vec<OsString> {
             // been seen and cobra would not look further.
             return argv.to_vec();
         };
-        if is_known_subcommand(word) && i > 0 {
+        if is_known_subcommand(word, root) && i > 0 {
             let mut out = Vec::with_capacity(argv.len());
             out.push(arg.clone());
             out.extend(argv[..i].iter().cloned());
@@ -1168,7 +1422,7 @@ fn hoist_leading_subcommand(argv: &[OsString]) -> Vec<OsString> {
 }
 
 /// Parse frps CLI args. Prints help/version and exits as needed.
-pub fn parse_frps_args() -> FrpsArgs {
+pub fn parse_frps_args() -> FrpsCmd {
     let argv: Vec<OsString> = std::env::args_os().collect();
     let (name, rest) = cli_args(&argv);
     // Go's pflag consumes a `-`-prefixed token as a config flag's value on
@@ -1178,12 +1432,13 @@ pub fn parse_frps_args() -> FrpsArgs {
     // `-c --strict-config=false` and `-c -x` are
     // `open <token>: no such file or directory` there, and `-c --` is
     // `open --: no such file or directory`. `warn_if_strict_config_space_form_used`
-    // keeps reading the original argv. `false`: Go's `frps` declares no
-    // subcommands, so no hoist runs on this binary and its behaviour is
-    // byte-identical to before.
-    let parse_argv = prepared_cli_argv(&rest, false);
-    let args = run_cli(
-        frps_args()
+    // keeps reading the original argv. [`RootCommand::Frps`] also runs the
+    // subcommand hoist, which Go has always run here: `frps -c cfg.toml verify`
+    // resolves `verify` and exits 0 (measured), not the rc 1 leftover-token
+    // refusal this binary used to answer with.
+    let parse_argv = prepared_cli_argv(&rest, RootCommand::Frps);
+    let cmd = run_cli(
+        frps_parser()
             .to_options()
             .descr("frps is the server of frp-rs (https://github.com/fatedier/frp)"),
         name,
@@ -1193,11 +1448,18 @@ pub fn parse_frps_args() -> FrpsArgs {
     // process, so the warning can never fire for a refused argv, and the
     // detection never matches the `=`, bare or non-bool forms.
     warn_if_strict_config_space_form_used(&argv);
-    if args.show_version {
-        println!("frps {} (Rust)", crate::VERSION);
-        std::process::exit(0);
+    // `--version` is acted on **after** the parse, and only on the run path:
+    // Go hangs it off `rootCmd` but prints a version only in the root command's
+    // `RunE` (`cmd/frps/root.go:57-60`), so `frps verify --version -c <valid>`
+    // verifies (rc 0, `syntax is ok`) instead of printing a version — measured,
+    // and pinned by `frps/tests/cli_exit_codes.rs`.
+    if let FrpsCmd::Run(args) = &cmd {
+        if args.show_version {
+            println!("frps {} (Rust)", crate::VERSION);
+            std::process::exit(0);
+        }
     }
-    args
+    cmd
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1350,11 +1612,18 @@ pub struct TcpmuxArgs {
 
 #[derive(Debug, Clone)]
 pub struct VerifyArgs {
+    /// The config path to verify. **Empty** on `frps` when `-c` was absent:
+    /// Go's frps registers `-c` with an empty default and `verifyCmd` answers
+    /// that with `frps: the configuration file is not specified` + rc 0
+    /// (`cmd/frps/verify.go:36-39`). On `frpc` the flag is required and this is
+    /// never empty (`cmd/frpc/sub/root.go` defaults `cfgFile` to `./frpc.ini`,
+    /// a default frp-rs's `frpc verify` deliberately does not take).
     pub config: String,
-    /// Go frp v0.71.0: `strict_config` is a persistent rootCmd flag
-    /// (cmd/frpc/sub/root.go), so `frpc verify` honors it too
-    /// (cmd/frpc/sub/verify.go passes strictConfigMode to
-    /// config.LoadClientConfig).
+    /// Go frp v0.71.0: `strict_config` is a persistent rootCmd flag on **both**
+    /// binaries (`cmd/frpc/sub/root.go`, `cmd/frps/root.go:46`), so
+    /// `frpc verify` and `frps verify` honor it too — each verify command
+    /// passes the flag to its config loader (`cmd/frpc/sub/verify.go:37`,
+    /// `cmd/frps/verify.go:40`).
     pub strict_config: bool,
 }
 
@@ -1424,14 +1693,18 @@ pub struct StopArgs {
 /// `web server port should be set if you want to use this feature`.
 ///
 /// bpaf exits with `argument \`-c\` cannot be used multiple times in this
-/// context` on the second occurrence, so every frpc parser that takes a config
+/// context` on the second occurrence, so every parser that takes a config
 /// path wraps the argument in [`Parser::last`] (bpaf's documented
 /// contradicting-options combinator: run the inner parser as many times as it
 /// succeeds and return the last value). `.last()` fails when the flag is
 /// absent, exactly like the bare `argument` it replaces, so a required `-c`
 /// stays required and an `.optional()`/`.fallback()` wrapper keeps its previous
-/// meaning. The `frps` CLI is left alone: that is a separate surface, not part
-/// of this item.
+/// meaning. The **`frps` run path** is deliberately not one of these: its `-c`
+/// stays bpaf's duplicate refusal, the pre-existing divergence from pflag
+/// last-wins recorded in `docs/developing.md` § CLI inputs, and this change
+/// does not touch it (`svr_config`). The `frps verify` subcommand **is** one of
+/// them, because Go's `verifyCmd` reads that same persistent pflag and is
+/// therefore last-wins like the `frpc` parsers.
 fn config_arg() -> impl Parser<String> {
     long("config").short('c').argument::<String>("FILE").last()
 }
@@ -2194,7 +2467,7 @@ pub fn parse_frpc_args() -> FrpcCmd {
     // [`prepared_cli_argv`]; this call site is what makes the rewrite **and**
     // the subcommand hoist apply to every `frpc` invocation.
     // `warn_if_strict_config_space_form_used` keeps reading the original argv.
-    let parse_argv = prepared_cli_argv(&rest, true);
+    let parse_argv = prepared_cli_argv(&rest, RootCommand::Frpc);
     let args = run_cli(
         frpc_parser()
             .to_options()
@@ -2506,8 +2779,20 @@ impl TcpmuxArgs {
 mod tests {
     use super::*;
 
+    /// The `frps` **run-path** parser, which is `frps_args()` — the module's
+    /// flag-surface tests want the root command's own arguments, and driving
+    /// them through [`frps_parser`]'s alternation would let the `verify` branch
+    /// answer for a run-mode argv. The whole surface is `frps_parser()`; the
+    /// hoist tests below use [`run_frps_cmd`] for it.
     fn parse_frps(args: &[&str]) -> Result<FrpsArgs, bpaf::ParseFailure> {
         frps_args().to_options().run_inner(args)
+    }
+
+    fn parse_frps_verify(args: &[&str]) -> Result<VerifyArgs, bpaf::ParseFailure> {
+        match frps_parser().to_options().run_inner(args)? {
+            FrpsCmd::Verify(a) => Ok(a),
+            other => panic!("expected the frps verify command, got {other:?}"),
+        }
     }
 
     fn parse_frpc_run(args: &[&str]) -> Result<FrpcRunArgs, bpaf::ParseFailure> {
@@ -2554,11 +2839,18 @@ mod tests {
         }
     }
 
-    /// Every parser that accepts `--strict-config`, as
-    /// `(label, argv)` — `frps`, then `frpc`'s `run`/`verify`/`reload`/
-    /// `status`/`stop`. `-c x.toml` is present throughout because `verify`
-    /// requires it; the other five fall back and never read the file (these
-    /// helpers only run the bpaf parser).
+    /// Every parser that accepts `--strict-config`, as `(label, argv)` —
+    /// `frps`'s run path, `frps verify`, then `frpc`'s `run`/`verify`/`reload`/
+    /// `status`/`stop`. `-c x.toml` is present throughout because both `verify`
+    /// commands need a config path in the argv; the other five fall back and
+    /// never read the file (these helpers only run the bpaf parser).
+    ///
+    /// `frps verify` belongs in this table: Go registers `--strict_config` on
+    /// `frps`'s **root** command (`cmd/frps/root.go:46`) and `verifyCmd` reads
+    /// it (`cmd/frps/verify.go:40`), so it is the same persistent pflag and must
+    /// take the same spellings and the same default. The table's purpose is
+    /// exactly that "one flag, every parser" claim, and leaving the new parser
+    /// out would let it drift silently.
     fn strict_config_argv(flag: &[&str]) -> Vec<(&'static str, Vec<String>)> {
         let base: Vec<String> = ["-c", "x.toml"]
             .iter()
@@ -2572,6 +2864,7 @@ mod tests {
         };
         vec![
             ("frps", base.clone()),
+            ("frps verify", prefixed("verify")),
             ("frpc run", base.clone()),
             ("frpc verify", prefixed("verify")),
             ("frpc reload", prefixed("reload")),
@@ -2584,6 +2877,7 @@ mod tests {
         let a: Vec<&str> = argv.iter().map(String::as_str).collect();
         match label {
             "frps" => parse_frps(&a).map(|x| x.strict_config),
+            "frps verify" => parse_frps_verify(&a).map(|x| x.strict_config),
             "frpc run" => parse_frpc_run(&a).map(|x| x.strict_config),
             "frpc verify" => parse_frpc_verify(&a).map(|x| x.strict_config),
             "frpc reload" => parse_frpc_reload(&a).map(|x| x.strict_config),
@@ -4094,7 +4388,7 @@ mod tests {
             .collect();
         let parsed = frps_args()
             .to_options()
-            .run_inner(&prepared_cli_argv(&argv, false)[..])
+            .run_inner(&prepared_cli_argv(&argv, RootCommand::Frps)[..])
             .expect("the prepared argv parses");
         assert_eq!(
             parsed.config.as_deref(),
@@ -4112,7 +4406,7 @@ mod tests {
             let argv: Vec<OsString> = argv.iter().map(OsString::from).collect();
             let parsed = frps_args()
                 .to_options()
-                .run_inner(&prepared_cli_argv(&argv, false)[..])
+                .run_inner(&prepared_cli_argv(&argv, RootCommand::Frps)[..])
                 .unwrap_or_else(|err| {
                     panic!("frps {argv:?} must parse after the rewrite: {err:?}")
                 });
@@ -4132,7 +4426,7 @@ mod tests {
         let argv: Vec<OsString> = ["-c", "--"].iter().map(OsString::from).collect();
         let parsed = frps_args()
             .to_options()
-            .run_inner(&prepared_cli_argv(&argv, false)[..])
+            .run_inner(&prepared_cli_argv(&argv, RootCommand::Frps)[..])
             .expect("`-c --` parses with `--` as the value");
         assert_eq!(parsed.config.as_deref(), Some("--"));
 
@@ -4182,7 +4476,7 @@ mod hoist_tests {
 
     fn hoist(args: &[&str]) -> Vec<String> {
         let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
-        hoist_leading_subcommand(&argv)
+        hoist_leading_subcommand(&argv, RootCommand::Frpc)
             .into_iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect()
@@ -4190,15 +4484,33 @@ mod hoist_tests {
 
     fn prepared(args: &[&str]) -> Vec<String> {
         let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
-        prepared_cli_argv(&argv, true)
+        prepared_cli_argv(&argv, RootCommand::Frpc)
             .into_iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect()
     }
 
+    /// The same two helpers on the **`frps`** surface. They are separate
+    /// functions rather than a parameter because every assertion below is about
+    /// one root command's own flag/command set, and a shared helper would let a
+    /// change to one root's set silently re-point the other's rows.
+    fn hoist_frps(args: &[&str]) -> Vec<String> {
+        let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+        hoist_leading_subcommand(&argv, RootCommand::Frps)
+            .into_iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn run_frps_cmd(args: &[&str]) -> Result<FrpsCmd, bpaf::ParseFailure> {
+        let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let prepared = prepared_cli_argv(&argv, RootCommand::Frps);
+        frps_parser().to_options().run_inner(&prepared[..])
+    }
+
     fn run_frpc(args: &[&str]) -> Result<FrpcCmd, bpaf::ParseFailure> {
         let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
-        let prepared = prepared_cli_argv(&argv, true);
+        let prepared = prepared_cli_argv(&argv, RootCommand::Frpc);
         frpc_parser().to_options().run_inner(&prepared[..])
     }
 
@@ -4233,7 +4545,7 @@ mod hoist_tests {
             "-h",
         ] {
             assert!(
-                consumes_value(OsStr::new(takes)),
+                consumes_value(OsStr::new(takes), RootCommand::Frpc),
                 "{takes} must swallow the next token"
             );
         }
@@ -4259,7 +4571,7 @@ mod hoist_tests {
             "p.toml",
         ] {
             assert!(
-                !consumes_value(OsStr::new(keeps)),
+                !consumes_value(OsStr::new(keeps), RootCommand::Frpc),
                 "{keeps} must not swallow the next token"
             );
         }
@@ -4330,8 +4642,10 @@ mod hoist_tests {
         }
         // And the parse really is the root's: bpaf reports help on stdout with
         // the root usage line, not a `status` subcommand usage.
-        let prepared =
-            prepared_cli_argv(&[OsString::from("--help"), OsString::from("status")], true);
+        let prepared = prepared_cli_argv(
+            &[OsString::from("--help"), OsString::from("status")],
+            RootCommand::Frpc,
+        );
         assert_eq!(prepared.len(), 2, "no token may be hoisted");
         let failure = frpc_parser()
             .to_options()
@@ -4571,7 +4885,7 @@ mod hoist_tests {
         // a parse error), and a name that selects a *different* command.
         for name in FRPC_SUBCOMMANDS {
             assert_eq!(hoist(&[name]), [name], "{name} must be accepted as leading");
-            let prepared = prepared_cli_argv(&[OsString::from(name)], true);
+            let prepared = prepared_cli_argv(&[OsString::from(name)], RootCommand::Frpc);
             let own_flag = single_proxy_own_flag(name);
             match frpc_parser().to_options().run_inner(&prepared[..]) {
                 // The four admin commands are complete without further flags.
@@ -4621,5 +4935,254 @@ mod hoist_tests {
             FRPC_SUBCOMMANDS.to_vec(),
             "the parser's command list and FRPC_SUBCOMMANDS disagree; help was:\n{text}"
         );
+    }
+
+    /// The `frps` half of the pair above, in both directions, because
+    /// [`FRPS_SUBCOMMANDS`] is a new hand-written list and the whole point of
+    /// the list is that it matches [`frps_parser`].
+    ///
+    /// Forward: every name in the list must select a command branch — here
+    /// `verify`, which parses with no further flags (Go registers `-c` with an
+    /// empty default on `frps`, `cmd/frps/root.go:44`, so the command is
+    /// complete bare). Reverse: the list must be exactly the `command("…")`
+    /// branches bpaf renders for `frps_parser`.
+    #[test]
+    fn the_frps_command_list_is_exactly_the_parser_branches() {
+        for name in FRPS_SUBCOMMANDS {
+            match run_frps_cmd(&[name]) {
+                Ok(FrpsCmd::Verify(args)) => assert_eq!(
+                    args.config, "",
+                    "{name} bare must mean \"no config file specified\", the empty default Go \
+                     registers for `-c`"
+                ),
+                other => panic!("{name} must select the verify branch, got {other:?}"),
+            }
+        }
+
+        let failure = frps_parser()
+            .to_options()
+            .run_inner(&["--help"][..])
+            .expect_err("--help is reported as a ParseFailure");
+        let text = match failure {
+            bpaf::ParseFailure::Stdout(doc, _) => doc.to_string(),
+            other => panic!("expected help on stdout, got {other:?}"),
+        };
+        let listed: Vec<String> = text
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("Available commands:"))
+            .skip(1)
+            .take_while(|line| !line.trim().is_empty())
+            .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            listed,
+            FRPS_SUBCOMMANDS.to_vec(),
+            "the parser's command list and FRPS_SUBCOMMANDS disagree; help was:\n{text}"
+        );
+    }
+
+    /// Cobra's `stripFlags` reads **this root command's** flag registry, so the
+    /// bool set is per root and the two sets are not interchangeable. Measured
+    /// on Go v0.71.0 (`docs/developing.md` § CLI inputs carries the table):
+    /// `frps --tls-only verify -c <cfg>`, `frps --enable-prometheus verify -c
+    /// <cfg>` and `frps --disable-log-color verify -c <cfg>` all resolve
+    /// `verify` (rc 0), so those three are pflag bools **on `frps`** — and the
+    /// same three names are ordinary flags on `frpc`, where they would swallow
+    /// a following token.
+    ///
+    /// The reverse-direction row is `--dashboard-tls-mode`: it looks like the
+    /// other `--…-mode` flags but is registered with `VarP(BoolFuncFlag{…})`
+    /// (`pkg/config/flags.go:256-258`), which never sets `NoOptDefVal`.
+    /// Measured: `frps --dashboard-tls-mode verify -c <valid cfg>` consumes
+    /// `verify` as the flag's value, finds no bare word and **starts the
+    /// server** (rc 124 under a 6 s bound) instead of verifying. Treating it as
+    /// a bool here would hoist `verify` out of that argv and turn a running
+    /// server into a verify run.
+    #[test]
+    fn the_bool_root_flag_sets_are_per_root_command() {
+        for keeps in [
+            "--version",
+            "-v",
+            "--strict_config",
+            "--strict-config",
+            "--tls-only",
+            "--tls_only",
+            "--enable-prometheus",
+            "--enable_prometheus",
+            "--disable-log-color",
+            "--disable_log_color",
+        ] {
+            assert!(
+                !consumes_value(OsStr::new(keeps), RootCommand::Frps),
+                "frps: {keeps} is a pflag bool (both spellings, through \
+                 WordSepNormalizeFunc) and must not swallow the next token"
+            );
+        }
+        for takes in [
+            "--dashboard-tls-mode",
+            "--dashboard_tls_mode",
+            "--bind-port",
+            "--bind_addr",
+            "-p",
+            "-t",
+            "--token",
+            "--allow-ports",
+            "--log-file",
+            "--config-dir",
+            "--nodash",
+            "--help",
+            "-h",
+        ] {
+            assert!(
+                consumes_value(OsStr::new(takes), RootCommand::Frps),
+                "frps: {takes} must swallow the next token"
+            );
+        }
+
+        // `frpc` is unchanged by this, and the three frps-only bools are
+        // consumers there — which is what makes the sets per-root rather than
+        // one shared constant.
+        for takes in [
+            "--tls-only",
+            "--enable-prometheus",
+            "--disable-log-color",
+            "--dashboard-tls-mode",
+            "--allow-ports",
+        ] {
+            assert!(
+                consumes_value(OsStr::new(takes), RootCommand::Frpc),
+                "frpc: {takes} is not a pflag bool on this root and must swallow"
+            );
+        }
+        for keeps in ["--version", "--strict-config", "--strict_config", "-v"] {
+            assert!(
+                !consumes_value(OsStr::new(keeps), RootCommand::Frpc),
+                "frpc: {keeps} is a pflag bool and must not swallow"
+            );
+        }
+    }
+
+    /// The `frps` hoist rows, each measured on Go v0.71.0 with its own config
+    /// and port (`docs/developing.md` § CLI inputs). The command word moves past
+    /// leading root flags exactly when cobra would have resolved it, and the
+    /// first bare word is the only candidate:
+    ///
+    /// * `-c cfg.toml verify` and `--strict-config=false verify -c cfg.toml` —
+    ///   the flag does not swallow it, so Go runs `verifyCmd` (rc 0); the base
+    ///   binary answered rc 1 `` `verify` is not expected in this context ``;
+    /// * `--tls-only` / `--enable-prometheus` / `--disable-log-color` /
+    ///   `--version` / `--strict_config` before `verify` — all pflag bools, so
+    ///   none of them consumes it (measured rc 0 on Go);
+    /// * `-p 7000 verify` — `-p` takes a value, so `verify` is that value's
+    ///   *successor* and no hoist happens;
+    /// * `--dashboard-tls-mode verify` — that flag consumes `verify` itself, so
+    ///   there is no command word at all (measured: Go starts the server);
+    /// * `--strict-config true verify` — the space form: `true` is the first
+    ///   bare word, and it is not a command, so `verify` is never reached
+    ///   (measured: `unknown command "true" for "frps"`, rc 1).
+    #[test]
+    fn frps_hoists_verify_past_its_own_root_flags() {
+        for flag in [
+            "--strict-config=false",
+            "--strict_config=false",
+            "--tls-only",
+            "--enable-prometheus",
+            "--disable-log-color",
+            "--version",
+            "-v",
+        ] {
+            assert_eq!(
+                hoist_frps(&[flag, "verify", "-c", "cfg.toml"]),
+                ["verify", flag, "-c", "cfg.toml"],
+                "frps {flag} is a pflag bool and must not swallow `verify`"
+            );
+        }
+        assert_eq!(
+            hoist_frps(&["-c", "cfg.toml", "verify"]),
+            ["verify", "-c", "cfg.toml"]
+        );
+        assert_eq!(
+            hoist_frps(&["-c", "cfg.toml", "--strict-config=false", "verify"]),
+            ["verify", "-c", "cfg.toml", "--strict-config=false"]
+        );
+        // `-c cfg.toml verify --strict-config=false` (the flag after the
+        // command) needs no hoist, and must not be rewritten either.
+        assert_eq!(
+            hoist_frps(&["verify", "-c", "cfg.toml", "--strict-config=false"]),
+            ["verify", "-c", "cfg.toml", "--strict-config=false"]
+        );
+
+        // `-p 7000 verify`: `-p` takes a value, so the value is consumed and
+        // `verify` — the *next* token — is the first bare word and is resolved.
+        // Measured on Go v0.71.0 (rc 0).
+        assert_eq!(
+            hoist_frps(&["-p", "7000", "verify", "-c", "cfg.toml"]),
+            ["verify", "-p", "7000", "-c", "cfg.toml"]
+        );
+
+        for unchanged in [
+            // A value-taking flag swallows the command word itself: `verify` is
+            // `-t`'s **value**, so no bare word survives...
+            &["-t", "verify"][..],
+            // ...and the same for the flag that only *looks* like a bool.
+            &["--dashboard-tls-mode", "verify", "-c", "cfg.toml"][..],
+            // The first bare word is `true`, which is not a command.
+            &["--strict-config", "true", "verify", "-c", "cfg.toml"][..],
+            // A real separator stops the scan.
+            &["-c", "cfg.toml", "--", "verify"][..],
+            // A config file literally named `verify` is a value, not a command.
+            &["-c", "verify"][..],
+            // Already leading.
+            &["verify", "-c", "cfg.toml"][..],
+            // A word that is not a command anywhere in the list.
+            &["notacommand", "verify"][..],
+        ] {
+            assert_eq!(
+                hoist_frps(unchanged),
+                unchanged,
+                "{unchanged:?} must not be rewritten on `frps`"
+            );
+        }
+    }
+
+    /// The end of the chain on `frps`: the hoisted argv must reach the `verify`
+    /// branch with its config, which is the only reason the hoist exists (before
+    /// it, this argv was rc 1 `` `verify` is not expected in this context ``).
+    #[test]
+    fn the_hoisted_frps_argv_parses_as_verify() {
+        match run_frps_cmd(&["-c", "cfg.toml", "verify"]).expect("hoisted argv parses") {
+            FrpsCmd::Verify(args) => {
+                assert_eq!(args.config, "cfg.toml");
+                assert!(args.strict_config);
+            }
+            other => panic!("expected the verify command, got {other:?}"),
+        }
+        match run_frps_cmd(&["--strict-config=false", "verify", "-c", "cfg.toml"])
+            .expect("hoisted argv parses")
+        {
+            FrpsCmd::Verify(args) => {
+                assert_eq!(args.config, "cfg.toml");
+                assert!(!args.strict_config);
+            }
+            other => panic!("expected the verify command, got {other:?}"),
+        }
+        // `verify` without `-c` is the empty-path case, not a parse failure:
+        // Go's `-c` default is the empty string on frps.
+        match run_frps_cmd(&["verify"]).expect("bare verify parses") {
+            FrpsCmd::Verify(args) => assert_eq!(args.config, ""),
+            other => panic!("expected the verify command, got {other:?}"),
+        }
+        // A value that names the command stays a value: run mode with the config
+        // file `verify`, never the verify command.
+        match run_frps_cmd(&["-c", "verify"]).expect("run mode with a config named verify") {
+            FrpsCmd::Run(args) => assert_eq!(args.config.as_deref(), Some("verify")),
+            other => panic!("expected the frps run path, got {other:?}"),
+        }
+        // No `-c` at all is still the run path (the default `frps.toml`), not
+        // `verify` — the two are separated by the command word, not by absence.
+        match run_frps_cmd(&["--bind-port", "7000"]).expect("run mode parses") {
+            FrpsCmd::Run(args) => assert_eq!(args.bind_port, Some(7000)),
+            other => panic!("expected the frps run path, got {other:?}"),
+        }
     }
 }

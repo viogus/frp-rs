@@ -118,6 +118,19 @@ jobs:
       # (`unresolvable_token_source_exits_3_where_go_exits_1`,
       # `empty_token_refusal_is_a_hardening_divergence_go_does_not_have`,
       # `oidc_without_an_issuer_is_refused_with_3_where_go_panics`).
+      # 19 → 26 with `frps verify` — +7 and a re-point, all in one commit:
+      # +7 server-side pins of the new subcommand
+      # (`verify_valid_config_prints_go_line_and_exits_0`,
+      # `verify_invalid_config_exits_1_with_the_load_error_on_stdout`,
+      # `verify_missing_config_exits_1_naming_the_path`,
+      # `verify_without_a_config_file_is_not_an_error`,
+      # `verify_strict_config_false_is_lenient_in_every_flag_order`,
+      # `verify_strict_config_true_still_refuses_the_unknown_key`,
+      # `verify_resolves_leading_root_flags_and_ignores_the_rest`), and the
+      # **re-pointed** tripwire
+      # (`verify_subcommand_is_now_the_first_error_for_a_dash_config_value` →
+      # `verify_subcommand_resolves_so_the_dash_config_value_is_the_first_error`,
+      # which nets zero). A re-point is not an added test: 19 + 7 = 26.
       # The client file gained one test since (`oidc_construction_failure_exits_3_
       # whatever_the_issuer_path`), but it is `#[cfg(feature = "full")]`: `oidc` is
       # not in the `tiny` feature set, so `frpc-tiny` cannot reach
@@ -125,7 +138,7 @@ jobs:
       # flip control replaced the single-name store test rather than adding one.
       # `FRPC_TINY_CLI_TESTS` therefore stays 11, while the `full` lane in
       # "Run frpc CLI tests" went 9 → 10.
-      FRPS_CLI_TESTS: "19"
+      FRPS_CLI_TESTS: "26"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
       FRPC_TINY_CLI_TESTS: "11"

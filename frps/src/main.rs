@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process;
 
-use frp_core::cli::{parse_frps_args, FrpsArgs};
+use frp_core::cli::{parse_frps_args, FrpsArgs, FrpsCmd};
 use frp_core::config::{
     collect_config_files, load_server_config, load_server_config_uncompleted, ServerConfig,
 };
@@ -28,7 +28,76 @@ async fn main() {
     // installed, so the emitter must not run either.
     #[cfg(all(feature = "mem-profile", not(feature = "mimalloc")))]
     frp_core::mem_profile::spawn_emitter();
-    run(cli).await;
+    match cli {
+        // `verify` exits inside the call (`process::exit` on a bad config) and
+        // returns to the runtime's exit 0 otherwise — the same shape as the root
+        // command returning from `RunE` with a nil error.
+        FrpsCmd::Verify(args) => run_verify(&args.config, args.strict_config),
+        FrpsCmd::Run(args) => run(args).await,
+    }
+}
+
+/// `frps verify`: load a server config and report Go's line, or fail like Go.
+///
+/// Mirrors Go's `verifyCmd` (`cmd/frps/verify.go`) and the shape the client's
+/// `run_verify` (`frpc/src/main.rs`) already uses:
+///
+/// * an **empty** path is not an error in Go — `frps` registers `-c` with an
+///   empty default (`cmd/frps/root.go:44`) and `verifyCmd` prints
+///   `frps: the configuration file is not specified` and returns nil
+///   (`cmd/frps/verify.go:36-39`), so the exit status is **0** (measured);
+/// * a load failure is `fmt.Println(err); os.Exit(1)` (`:41-44`) — one bare
+///   line on **stdout**, exit 1 (measured, stderr 0 bytes);
+/// * success is `frps: the configuration file %s syntax is ok` on **stdout**,
+///   exit 0 (`:56`).
+///
+/// The loader is [`load_server_config`] — the same parse-and-validate path the
+/// run path uses: the run path's single-config branch calls
+/// [`load_server_config_uncompleted`] (the same function minus
+/// `ServerConfig::complete`) and completes the merged config itself, and both go
+/// through `load_config_from_file` with `known_server_keys` and
+/// `validate_server_config`. `verify` has no CLI overrides to merge, so it takes
+/// the completing wrapper. The consequence is that `verify` accepts exactly the
+/// configs `frps -c` accepts and refuses the ones it refuses at **load** time.
+/// It does **not** run the later service-construction gates (the
+/// `--allow-unsafe`/`TokenSourceExec` check, applied in
+/// `frp-server/src/service.rs`), which is where Go differs: Go's verify *does*
+/// run its post-load `ValidateServerConfig` gate (`cmd/frps/verify.go:46-48`), so
+/// an `auth.tokenSource` with `type = "exec"` and no
+/// `--allow-unsafe TokenSourceExec` is rc 1 on Go and rc 0 here — the same
+/// pre-existing divergence `frpc verify` has, recorded in `docs/developing.md`
+/// § CLI inputs and measured for the client in `frp-core/src/config/tests.rs`. It
+/// is not closed here because both verify commands must report the same verdict
+/// for the same config; a fix belongs in the shared load path, not in one
+/// binary's verify.
+///
+/// Logging is deliberately **not** initialised: Go installs its logger only in
+/// `runServer` (`cmd/frps/root.go:112`), never on the verify path, and the
+/// measured Go stdout for a lenient (`--strict-config=false`) verify is exactly
+/// the one success line with stderr empty. Leaving `tracing` uninitialised drops
+/// the lenient-load warnings the run path would emit, which is what keeps that
+/// one-line shape (`tracing` records are a no-op without a subscriber).
+fn run_verify(config_path: &str, strict_config: bool) {
+    if config_path.is_empty() {
+        // Go: `fmt.Println("frps: the configuration file is not specified")`,
+        // then `return nil` — rc 0, not an error.
+        println!("frps: the configuration file is not specified");
+        return;
+    }
+    match load_server_config(config_path, strict_config) {
+        Ok(_) => {
+            // Go: `fmt.Printf("frps: the configuration file %s syntax is ok\n",
+            // cfgFile)` (`cmd/frps/verify.go:56`).
+            println!("frps: the configuration file {} syntax is ok", config_path);
+        }
+        Err(e) => {
+            // Go: `fmt.Println(err); os.Exit(1)` (`cmd/frps/verify.go:42-44`) —
+            // the same bare stdout line and rc the run path's load failure
+            // prints (`frps/src/main.rs`, single-config branch).
+            println!("{e}");
+            process::exit(frp_core::EXIT_RUNTIME);
+        }
+    }
 }
 
 // ── Logging / tracing init ────────────────────────────────────────────────────
