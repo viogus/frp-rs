@@ -411,8 +411,10 @@ jobs:
         # `cargo test --workspace --lib` cannot see it, and the steps above
         # select `--test cli_exit_codes` / `--test cli_completion` explicitly. A
         # separate step (rather than extending the one above) keeps the guarded
-        # `env.FRPS_CLI_TESTS` count untouched — this file adds a fourth `frps`
-        # test *target*, not a test inside a counted one.
+        # `env.FRPS_CLI_TESTS` count untouched — this file adds the fourth `frps`
+        # *target* (its third **test** target, after `cli_exit_codes` and
+        # `cli_completion`; the bin unit target is the fourth), not a test inside
+        # a counted one.
         #
         # `--features dashboard` matches the step above, so the same cached
         # `frps --features dashboard` artifact is reused (warm: no extra

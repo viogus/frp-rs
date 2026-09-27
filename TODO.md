@@ -2786,13 +2786,20 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   differs, because only `frps` overlays its CLI flags onto the loaded config: `frps` writes the empty
   flag into `[log] level` and completion fills it to `"info"`, while `frpc` (which never overlays its
   CLI flags) keeps the file's value. Measured at the head with `[log] level = "warn"` +
-  `--log-level ""` (own dir and free port, both streams separate, 3 s settle, pre-signal):
-  `frps` → **1498 B / 7 records, all `INFO`, 0 `WARN`**, listener up; `frpc` → **569 B / 2 records,
-  1 `WARN` + 1 `ERROR`, 0 `INFO`**. Controls: `frps` with `warn` and no flag → 0 B / 0 records (the
-  empty flag is what raises it to `info`); `frpc` with `warn` and no flag → the same 569 B / 2 records
-  as with the empty flag; with no `[log] level` in the file both resolve to `"info"`. Filed as its own
-  item below — the fix would be `override_server_config` skipping an empty `--log-level`, i.e. a
-  product call about which lane frps mirrors, not a completion bug.
+  `--log-level ""` (own dir and free port, both streams separate, 3 s settle, pre-signal, raw-stream
+  bytes): `frps` → **1498 B / 7 records, all `INFO`, 0 `WARN`**, listener up; `frpc` → **0 `INFO`
+  records**, and the composition of what it does log depends on the client's `login_fail_exit`
+  (default `true`) and on whether a server is live — all three measured with `[log] level = "warn"`,
+  one tcp proxy, each identical with and without `--log-level ""`: live server (proxy registers)
+  **478 B / 1 record / 1 `WARN`** (the TLS-verification-disabled banner); no server with
+  `login_fail_exit = false` **624 B / 2 records / 2 `WARN`** (retries); no server with no
+  `login_fail_exit` line, i.e. the default `true` **569 B / 2 records / 1 `WARN` (login failed) +
+  1 `ERROR` (`frpc error: …`)**, because the client gives up instead of retrying. Controls: `frps`
+  with `warn` and no flag → 0 B / 0 records (the empty flag is what raises it to `info`); with no
+  `[log] level` in the file both resolve to `"info"`. **The pair to quote is `0 INFO`; the
+  composition is a property of the shape, so every carrier names its shape.** Filed as its own item
+  below — the fix would be `override_server_config` skipping an empty `--log-level`, i.e. a product
+  call about which lane frps mirrors, not a completion bug.
   **`--log-format` was verified and deliberately not touched**: Go v0.71.0's `LogConfig`
   (`pkg/config/v1/common.go:103-117`) has no `Format` field and the real binary refuses the flag
   (measurement above); frp-rs's `--log-format` is an extension and `resolve_log_format` already maps
@@ -2825,19 +2832,26 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   two binaries disagree whenever the config sets a non-default `level`.** Found while closing the
   `Log.Complete()` item above and deliberately **not** fixed there (the reviewers classified it as a
   product call, and this item is the record of it). Only `frps` overlays its CLI flags onto the loaded
-  config (`FrpArgs::override_server_config` in `frp-core/src/cli.rs`); `frpc` does not, so on `frps`
+  config (`FrpsArgs::override_server_config` in `frp-core/src/cli.rs`); `frpc` does not, so on `frps`
   the empty flag is written into `[log] level` and `LogConfig::complete`
   (`frp-core/src/config/server.rs`) then fills it to `"info"`, while `frpc`'s resolver falls through
-  to the file's value. Measured at `97ad00d` with `[log] level = "warn"` + `--log-level ""`, own dir
-  and free port per case, both streams captured separately, 3 s settle, counts taken pre-signal:
-  `frps` → **1498 B stdout, 7 records, all `INFO`, 0 `WARN`**, listener up; `frpc` → **569 B stdout,
-  2 records, 1 `WARN` + 1 `ERROR`, 0 `INFO`**. Controls in the same run: `frps` with the config's
-  `warn` and **no** flag → 0 B / 0 records, i.e. the empty flag is what raises it; `frpc` with `warn`
-  and no flag → the same 569 B / 2 records; with **no** `[log] level` in the file both resolve to
-  `"info"`, which is why the default-config paths agree. Each binary's outcome is defensible on its
-  own (`frps`'s is Go's zero-value outcome for a flag bound to its own default,
-  `pkg/config/flags.go:161`; `frpc`'s is Go's `-c` outcome, where flags are ignored,
-  `cmd/frpc/sub/root.go:66-79`), and frp-rs's two lanes simply differ.
+  to the file's value. Measured at `96f97e9` with `[log] level = "warn"` + `--log-level ""`, own dir
+  and free port per case, both streams captured separately, 3 s settle, counts taken pre-signal,
+  raw-stream bytes: `frps` → **1498 B stdout, 7 records, all `INFO`, 0 `WARN`**, listener up;
+  `frpc` → **0 `INFO` records in all three shapes measured**, with the composition set by the client's
+  `login_fail_exit` (default `true`) and by whether a server is live: **478 B / 1 record / 1 `WARN`**
+  (live server, proxy registers — the TLS-verification-disabled banner), **624 B / 2 records /
+  2 `WARN`** (no server, `login_fail_exit = false`, retries), **569 B / 2 records / 1 `WARN` + 1
+  `ERROR`** (no server, no `login_fail_exit` line so the default `true` gives up). Each of the three is
+  identical with and without `--log-level ""`. Controls in the same run: `frps` with the config's
+  `warn` and **no** flag → 0 B / 0 records, i.e. the empty flag is what raises it; with **no**
+  `[log] level` in the file both resolve to `"info"`, which is why the default-config paths agree.
+  Each binary's outcome is defensible on its own (`frps`'s is Go's zero-value outcome for a flag bound
+  to its own default, `pkg/config/flags.go:161`; on Go's client the flag does not exist on the run
+  path at all — `--log_level` is registered only for the `frpc <type>` subcommands,
+  `pkg/config/flags.go:161-163` via `cmd/frpc/sub/proxy.go:56`, and in SSH mode,
+  `pkg/ssh/server.go:285`, so the Go binary answers `Error: unknown flag: --log_level`, rc 1, 1343 B
+  stderr, with and without `-c`), and frp-rs's two lanes simply differ.
   **Done-when:** decide which lane `frps` mirrors and make the rule true on both — either
   `override_server_config` skips an **empty** `--log-level`/`--log-file`/`--log-max-days 0` (leaving
   the file's value, which aligns `frps` with `frpc` and with Go's `-c` lane) or `frpc` gains the
