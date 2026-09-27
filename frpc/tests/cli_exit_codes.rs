@@ -36,10 +36,13 @@
 //! asserted here so the shape cannot drift back silently.
 //!
 //! Two further tests pin the *extension* codes on the client:
-//! `unresolvable_token_source_exits_3_like_frps` (`EXIT_AUTH`/3 — the same
+//! `unresolvable_token_source_exits_3_where_go_exits_1` (`EXIT_AUTH`/3 — the same
 //! input makes Go exit 1, see `docs/developing.md`) and
-//! `malformed_store_file_exits_4_where_go_exits_1` (`EXIT_BIND`/4, which is the
-//! fallback for any construction error whose text lacks `token`/`auth`).
+//! `malformed_store_file_exits_4_regardless_of_the_file_name` (`EXIT_BIND`/4,
+//! the tag for any construction failure that is not an auth one). The second is
+//! also the **flip control**: it runs one failure class under an `auth`-bearing
+//! and an auth-free file name and requires the same code from both, so a
+//! reversion to a text-based classifier fails it (see the test's own docs).
 //!
 //! Gated on `full`: the `frpc` bin carries `required-features = ["full"]`, so
 //! without the gate this file's `CARGO_BIN_EXE_frpc` would fail to compile in
@@ -347,40 +350,53 @@ fn unresolvable_token_source_exits_3_where_go_exits_1() {
 }
 
 /// `EXIT_BIND`/4 is **not** specifically about bind errors: it is the daemons'
-/// fallback for any service-*construction* error whose text lacks `token` or
-/// `auth`. A `[store] path` pointing at a file that is not JSON reaches it
-/// without any port or token being involved.
+/// tag for any service-*construction* failure that is not an auth one. A
+/// `[store] path` pointing at a file that is not JSON reaches it without any
+/// port or token being involved.
 ///
 /// Go frp v0.71.0 exits **1** on the identical config (`failed to create store
 /// source: failed to load existing data: failed to parse JSON: …`), so this is
-/// an frp-rs extension like 3. The `name` of this test is the finding: 4 is the
-/// construction fallback, and `docs/developing.md` now says so.
+/// an frp-rs extension like 3.
+///
+/// **This test is the flip control.** It runs the *same* failure class twice,
+/// changing only the store file's *name*: `authstore.json` (the name supplies an
+/// `auth` substring) and `plainstore.json` (it supplies none). Both must exit 4.
+/// Before the typed classification, `is_token_error`'s
+/// `msg.contains("token") || msg.contains("auth")` matched the first name and
+/// not the second, so the one failure class exited 3 or 4 depending on the file
+/// name — measured on the base commit, and against Go both names exit 1. A
+/// revert to any text-based classifier fails here on the `authstore.json` arm,
+/// which is the whole point of the loop; neither store path contains the
+/// substring `token`, so the *only* thing that can move the `authstore.json` arm
+/// to 3 is a text match on `auth`.
 #[test]
-fn malformed_store_file_exits_4_where_go_exits_1() {
-    let dir = TempDir::new();
-    let store = dir.write("badstore.json", "this is not json\n");
-    let cfg = dir.write(
-        "badstore.toml",
-        &format!("{BASE_CONFIG}[store]\npath = \"{store}\"\n"),
-    );
+fn malformed_store_file_exits_4_regardless_of_the_file_name() {
+    for name in ["authstore.json", "plainstore.json"] {
+        let dir = TempDir::new();
+        let store = dir.write(name, "this is not json\n");
+        let cfg = dir.write(
+            "badstore.toml",
+            &format!("{BASE_CONFIG}[store]\npath = \"{store}\"\n"),
+        );
 
-    let out = run_frpc(&["-c", &cfg]);
+        let out = run_frpc(&["-c", &cfg]);
 
-    assert_eq!(
-        out.status.code(),
-        Some(4),
-        "a malformed [store] file is the frp-rs EXIT_BIND/4 fallback (Go exits 1); \
-         stdout={:?} stderr={:?}",
-        stdout_of(&out),
-        stderr_of(&out),
-    );
-    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
-    assert!(
-        all.contains("badstore.json"),
-        "the refusal must name the store file, got stdout={:?} stderr={:?}",
-        stdout_of(&out),
-        stderr_of(&out),
-    );
+        assert_eq!(
+            out.status.code(),
+            Some(4),
+            "a malformed [store] file is the frp-rs EXIT_BIND/4 fallback whatever it is \
+             called (Go exits 1 on both names); name={name} stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        assert!(
+            all.contains(name),
+            "the refusal must name the store file, got stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+    }
 }
 
 /// A Go pflag bool takes `--flag=<bool>` as well as the bare `--flag`, and the

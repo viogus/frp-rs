@@ -490,6 +490,23 @@ User-facing release notes for frp-rs.
   *absent*, so a `POST` body (`{"strict_config": true}`) takes effect where the old handling
   kept the broken value and ignored the body. Malformed escapes without a body are unchanged
   (still a non-strict 200), as is every other endpoint.
+- **The exit code on a service-construction failure no longer depends on the
+  config's text — exactly one input changes code.** `frpc`/`frps` used to pick
+  between `EXIT_AUTH`/3 and `EXIT_BIND`/4 with
+  `msg.contains("token") || msg.contains("auth")` over the formatted error, which
+  embeds the config path and any URL from the config. So the **same** failure
+  class exited differently by file name: an `frpc` `[store] path` pointing at a
+  file that is not JSON exited **3** when the file was named `authstore.json`
+  and **4** when it was `plainstore.json`. The kind is now a typed value chosen
+  where the constructor raises the error (`frp_core::init_error`), and the
+  affected input — a malformed store whose path contains `auth` or `token`, or an
+  OIDC discovery URL whose path does — now exits **4** instead of 3. Go frp
+  v0.71.0 exits **1** on both names, so the code is still an frp-rs extension;
+  only frp-rs's internal disagreement is gone. Every other input keeps its code:
+  `auth.tokenSource` on a missing file is still 3 on both binaries, the empty
+  token refusal is still 3, and an occupied `bindPort` is still 1 on both sides.
+  There is deliberately **no** `EXIT_AUTH`/`EXIT_BIND` collapse to Go's 1 here —
+  see `docs/developing.md` § CLI exit codes for the argument.
 
 ### Changed
 - **The space-separated `--strict-config <bool>` extension now prints a warning

@@ -193,6 +193,129 @@ fn missing_config_exits_1() {
     );
 }
 
+// ── the extension codes on the server: 3 (auth) ─────────────────────────────
+
+/// `EXIT_AUTH`/3 on the **server**, on the same input the client pins: an
+/// `auth.tokenSource` whose file does not exist. Go frp v0.71.0 exits **1**
+/// (`failed to resolve auth.tokenSource: failed to read file …`); frp-rs exits
+/// **3**. Measured on both binaries with the streams captured separately and the
+/// ports distinct per run — see `docs/developing.md` § CLI exit codes.
+///
+/// Before the typed classification this arm read
+/// `logging::is_token_error(&e)`, and it is one of the three sites that made the
+/// code depend on the message text. The kind now comes from the constructor
+/// (`frp-core/src/init_error.rs`).
+#[test]
+fn unresolvable_token_source_exits_3_where_go_exits_1() {
+    let dir = TempDir::new();
+    let missing = dir.path("no-such-token-file");
+    let cfg = dir.write(
+        "badsource.toml",
+        &format!(
+            "bindPort = 7500\n[auth]\nmethod = \"token\"\n\
+             tokenSource = {{ type = \"file\", file = {{ path = \"{missing}\" }} }}\n"
+        ),
+    );
+
+    let out = run_frps(&["-c", &cfg]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "an unresolvable tokenSource is the frp-rs EXIT_AUTH/3 extension (Go exits 1); \
+         stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        all.contains("tokenSource"),
+        "the refusal must name tokenSource, got stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
+/// The hardening divergence `:3313` names: `[auth] method = "token"` with an
+/// empty `token` is refused at construction with **3**, whereas Go frps has no
+/// such check and **starts and keeps running** (`frps started successfully`,
+/// alive after 8 s, killed by the probe). There is therefore no Go exit code to
+/// compare against — this is not "Go exits 1 here", and the test must not be
+/// written as if it were.
+///
+/// It is 3 rather than 4 because the *kind* is auth (`AuthConfig::check_startup`
+/// rejects the token material), which is the whole point of classifying by kind:
+/// the refusal's message happens to contain "[auth].token", but it would be
+/// tagged `Auth` even if it did not.
+#[test]
+fn empty_token_refusal_is_a_hardening_divergence_go_does_not_have() {
+    let dir = TempDir::new();
+    // A real port is not needed: the refusal happens before `Service::run`
+    // binds anything, and this test requires the process to *exit*.
+    let cfg = dir.write(
+        "emptytoken.toml",
+        "bindPort = 7500\n[auth]\nmethod = \"token\"\ntoken = \"\"\n",
+    );
+
+    let out = run_frps(&["-c", &cfg]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "frp-rs refuses an empty token at construction with EXIT_AUTH/3 — a hardening \
+         divergence: Go has no check and does not exit at all, so there is no Go code to \
+         match here; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        all.contains("server would accept ALL connections"),
+        "the refusal must say why the server is refusing, got stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
+/// `[auth] method = "oidc"` with no issuer: frp-rs refuses at construction with
+/// **3**; Go frps **panics** (`panic: Get "/.well-known/openid-configuration":
+/// unsupported protocol scheme ""`) and its runtime exits **2**. That panic is
+/// also why no blanket "Go only returns 0 or 1" belongs in the docs.
+///
+/// The issuer is not needed to reach the refusal, but note that the OIDC
+/// construction path is where the substring classifier was *most* exposed: the
+/// error text embeds the issuer **URL**, so an issuer ending in `/authz` used to
+/// select 3 while `/zzz` selected 4 for the identical failure. Both are 3 now
+/// (measured, mock discovery endpoint serving `jwks_uri`), and this fixture pins
+/// the path that needs no network at all.
+#[test]
+fn oidc_without_an_issuer_is_refused_with_3_where_go_panics() {
+    let dir = TempDir::new();
+    let cfg = dir.write(
+        "noissuer.toml",
+        "bindPort = 7500\n[auth]\nmethod = \"oidc\"\n[auth.oidc]\naudience = \"x\"\n",
+    );
+
+    let out = run_frps(&["-c", &cfg]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "frp-rs refuses an OIDC method with no issuer with EXIT_AUTH/3; Go exits 2 by \
+         panicking, so there is no rc to match — only a divergence to record; \
+         stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
+    assert!(
+        all.contains("oidc_issuer is empty"),
+        "the refusal must name the empty issuer, got stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
 /// Positive control: a valid config starts a real server (exit 0 on SIGTERM,
 /// the graceful-shutdown path), so the tests above pin "bad config → 1" rather
 /// than "frps always fails".

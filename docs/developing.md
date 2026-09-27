@@ -948,6 +948,44 @@ service-construction failures — including some like `auth.tokenSource` and
 that Go does not refuse at all. There is no per-class scheme to preserve, and
 `EXIT_CONFIG`/2 no longer covers a single-config or `verify` failure.
 
+**Decision (2026-09-27): `3`/`4` stay, and the kind that picks them is now a
+typed value, not a substring match.** This was the open pair `TODO.md:3313`
+(whether the codes should exist) and `TODO.md:3365` (what picks them); both are
+closed by the same change. The argument, in the order the alternatives were
+weighed:
+
+- **Collapsing `3`/`4` into Go's `1` would not have removed a compatibility
+  risk, because there is none to remove.** Go's CLI is 0-or-nonzero, and every
+  frp-rs construction failure already returns nonzero. A collapsing change would
+  delete a documented, tested distinction (`auth.tokenSource` → 3, `[store]` → 4)
+  that costs a Go-compatible caller nothing — nobody matches `1` *specifically*
+  and breaks on 3 — while the widening path (Go later inventing exit codes) is
+  not one frp-rs can pre-empt.
+- **What the codes buy is the only per-class signal on this surface**, and it is
+  the one an operator wants: "the auth material could not be resolved" versus
+  "the service could not be constructed for another reason". `EXIT_CONFIG`/2 is
+  already kept on exactly that reasoning (a surface Go answers with 0), so this is
+  the repository's existing posture, not a new one.
+- **The one thing that was *not* defensible was how the code was chosen**, and
+  that is what changed: `logging::is_token_error` (`msg.contains("token") ||
+  msg.contains("auth")`) read the *formatted* error, which embeds the config path
+  and any URL from the config. It has been deleted; the constructor tags the
+  failure with `frp_core::init_error::InitErrorKind` at the point it is raised,
+  and the daemons read only that tag (`e.kind().exit_code()`).
+
+The kind → code mapping, which is now the whole contract:
+
+| `InitErrorKind` | code | what it covers | measured input (Go v0.71.0 → frp-rs) |
+|---|---|---|---|
+| `Auth` | **3** | auth material cannot be resolved or validated, or an auth method is refused | `frpc`/`frps` `auth.tokenSource` → missing file: Go **1** → frp-rs **3** |
+| `Other` | **4** | any other construction failure (currently the client `[store]` source) | `frpc` `[store] path` → non-JSON file: Go **1** → frp-rs **4**, for *either* file name |
+
+The mapping is asserted literally in `frp-core/src/init_error.rs`
+(`kind_maps_to_the_documented_exit_code`), and **the displayed text has no path
+to it**: there is no callable substring classifier left in `frp-core`
+(`logging::is_token_error` is gone), and the daemons' three arms match on the
+kind.
+
 Measured 2026-09-26 against Go frp **v0.71.0** (darwin/arm64) and the frp-rs
 `frpc`/`frps` binaries, with one unknown top-level key added to an otherwise
 valid config (plus the variations named):
@@ -963,7 +1001,10 @@ valid config (plus the variations named):
 | `frps -c badfrps.toml` (and missing / dir / bad port) | 1 | 1 |
 | `frpc` with `[auth] tokenSource` → a missing file | 1 (0.26 s) | **3** (0.25 s) — extension |
 | `frps` with `[auth] tokenSource` → a missing file | 1 (0.26 s) | **3** (0.25 s) — extension |
-| `frpc` with `[store] path` → a file that is not JSON | 1 (0.26 s) | **4** (0.25 s) — extension |
+| `frpc` with `[store] path` → a file that is not JSON, named `authstore.json` | 1 | **4** — was **3** before the typed classification |
+| `frpc` with `[store] path` → the same file content, named `plainstore.json` | 1 | **4** (unchanged) |
+| `frps` with `[auth] method = "token"`, `token = ""` | **does not exit** (starts and runs) | **3** — hardening divergence, not a code divergence |
+| `frps` with `[auth] method = "oidc"` and no issuer | **2** (panics) | **3** — frp-rs refuses where Go panics |
 | `frpc --config-dir <nonexistent\|empty\|bad>` | **0** | **2** (deliberate) |
 | `frpc --config-dir <good>`, service cannot run | 0 (0.026 s) | 0 (0.026 s) |
 | `frps --config-dir <…>` | 1 — `unknown flag: --config-dir` | 2 (extension flag) |
@@ -1010,43 +1051,71 @@ Some things this table does not say, each measured:
   exist exits **3** on both binaries, where Go exits **1** immediately
   (`failed to resolve auth.tokenSource: failed to read file …`). A rejected
   login is *not* an example: it leaves the client through `service.run()` and
-  exits **1**, matching Go.
-- **`EXIT_BIND`/4 is not specifically a bind error** — it is the daemons'
-  fallback for *any* service-construction error whose text lacks `token`/`auth`
-  (`frpc/src/main.rs`'s init-error arm). Measured input: **`frpc`** with
-  `[store] path` pointing at a file that is not JSON exits **4**, where Go exits
-  **1** (`failed to create store source: … failed to parse JSON: …`). It is an
-  frpc example on purpose: `[store]` is not a key Go's *frps* accepts
-  (`json: unknown field "store"`), and on frp-rs frps the same key is also an
-  unknown-field error, both rc 1. A real port conflict does *not* take this arm —
-  `frps` on an occupied `bindPort` returns 1 on both sides, because the listener
-  binds inside `service.run()`. Both codes are tracked in `TODO.md`;
-  `frpc/tests/cli_exit_codes.rs` pins the two measured inputs.
-- **Both codes 3 and 4 are picked by a substring match on the whole error text**
-  (`is_token_error` → `msg.contains("token") || msg.contains("auth")`,
-  `frp-core/src/logging.rs`), and that text embeds the config path and any URL
-  in it — so the *same* failure can land on different codes. Measured: the same
-  malformed-`[store]` failure exits **3** when the file is named
-  `authstore.json` and **4** when it is `plainstore.json`. The pins in
-  `frpc/tests/cli_exit_codes.rs` use an auth-free filename (`badstore.json`), so
-  they cannot catch that flip; the substring coupling is tracked in `TODO.md`.
+  exits **1**, matching Go. The two server-side arms are pinned too: the empty
+  token refusal (below) and `[auth] method = "oidc"` with no issuer.
+- **`EXIT_BIND`/4 is not specifically a bind error** — it is the daemons' tag for
+  *any* service-construction error that is not an auth one. Measured input:
+  **`frpc`** with `[store] path` pointing at a file that is not JSON exits **4**,
+  where Go exits **1** (`failed to create store source: … failed to parse
+  JSON: …`). It is an frpc example on purpose: `[store]` is not a key Go's *frps*
+  accepts (`json: unknown field "store"`), and on frp-rs frps the same key is also
+  an unknown-field error, both rc 1. A real port conflict does *not* take this
+  arm — `frps` on an occupied `bindPort` returns 1 on both sides, because the
+  listener binds inside `service.run()`.
+- **The code is chosen by `InitErrorKind`, never by the message text** (the
+  change that closed `TODO.md:3365`). The constructor tags each failure where it
+  is raised (`frp_core::init_error`), and every daemon arm reads only that tag.
+  The old contract was `is_token_error` → `msg.contains("token") ||
+  msg.contains("auth")` over the formatted error, which embeds the config path and
+  any URL in the config; a callable classifier like it no longer exists in
+  `frp-core`. The regression is pinned by the *flip control* in
+  `frpc/tests/cli_exit_codes.rs`:
+  `malformed_store_file_exits_4_regardless_of_the_file_name` runs the identical
+  malformed-`[store]` failure under `authstore.json` and `plainstore.json` and
+  requires **4** from both, so a reversion to a text match (which gives 3 for the
+  first name, as the base commit did) fails the test. That failure was measured
+  by re-introducing the substring expression in `frpc`'s arm: the test failed on
+  the `authstore.json` iteration with `left: Some(3)`, `right: Some(4)`.
+- **Both construction codes are deliberate extensions, kept after weighing the
+  collapse.** Grounds, and what would reverse it: the argument is in the
+  *Decision* paragraph above. If Go ever grows a per-class exit scheme, or if a
+  caller is found that must see exactly `1`, the collapse becomes the cheaper
+  option — deleting the tag and returning `EXIT_RUNTIME` from the three daemon
+  arms is the whole change, and the tests named here would move with it.
 - **Two inputs where the two binaries disagree without a like-for-like exit
   code** — one where frp-rs refuses and Go does not, one where Go crashes on a
   code frp-rs handles:
   - `frps` with `[auth] method = "token"` and an empty `token`: frp-rs exits
     **3** in ~0.01 s (`security misconfiguration: CRITICAL: [auth].token …
     server would accept ALL connections`); Go **starts and keeps running**
-    (`frps started successfully`, still alive after 6 s), because it has no such
-    check. This is a hardening divergence, not the same failure with another
-    code — do not describe it as "Go exits 1 here". Go exits 1 on that config
-    only when the port is *held*, which is the occupied-`bindPort` row above.
+    (`frps started successfully`, still alive after 8 s in the last measurement,
+    then killed by the probe), because it has no such check. This is a hardening
+    divergence, not the same failure with another code — do not describe it as
+    "Go exits 1 here". Go exits 1 on that config only when the port is *held*,
+    which is the occupied-`bindPort` row above. It is pinned on its own
+    (`empty_token_refusal_is_a_hardening_divergence_go_does_not_have`) precisely
+    because, being a *refusal*, it would survive a collapse of the codes as
+    exit 1 and therefore must not be argued from the 3/4 decision.
   - `frps -c <[auth] method = "oidc"` with no issuer>`: frp-rs refuses with
     **3**; Go **panics** (`panic: Get "/.well-known/openid-configuration":
     unsupported protocol scheme ""`) and its runtime exits **2** — a code frp-rs
     uses only for a `--config-dir` refusal, never for a service-construction
     failure. Go does exit here, so this bullet is *not* a
     "refuses-where-Go-does-not" case. That panic is also why no blanket statement
-    like "Go only ever returns 0 or 1" belongs in this document.
+    like "Go only ever returns 0 or 1" belongs in this document. Pinned by
+    `oidc_without_an_issuer_is_refused_with_3_where_go_panics`.
+  - The OIDC *issuer URL* is where the old substring coupling was structurally
+    most exposed, since the URL is inside the error text. Measured with a mock
+    discovery endpoint serving a `jwks_uri`: frp-rs exits **3** for an issuer
+    path ending `/authz` and **3** for `/zzz` — the same code for both, which is
+    now a consequence of the type rather than of the two paths happening to lack
+    a distinguishing substring. Go exits **2** on both, by panicking
+    (`panic: oidc: issuer URL provided to client (…) did not match the issuer
+    returned by provider`), so this pair has no like-for-like Go code. What this
+    probe does **not** show is the pre-change `/authz` → 3 vs `/zzz` → 4 flip:
+    the mock issuer made Go panic before frp-rs's own pre-change behaviour could
+    be observed on that path, so the flip is evidenced by the `[store]` fixture
+    below, not by an OIDC run.
 
   A third case — `frpc verify -c <config whose [[proxies]] block has an unknown
   key>` exiting **0** here against Go's **1** (`decode proxy at index 0: …
@@ -1059,16 +1128,23 @@ Tests that pin this — real binaries, no mocks:
 `frpc/tests/cli_exit_codes.rs` (`frpc -c <bad>` start, `verify -c <bad>`,
 `verify -c <missing>`, a `verify -c <good>` positive control, the directory-mode
 divergence for a missing / empty / invalid directory, the `tokenSource` → 3 case,
-the `[store]` → 4 case, and — under `--features tiny` — the same two assertions
-against `frpc-tiny`) and `frps/tests/cli_exit_codes.rs` (`frps -c <bad>`,
-`-c <missing>`, a starts-then-SIGTERM positive control, and the extension flag's
-refusal). The admin-subcommand refusals stay pinned by
-`frpc/tests/admin_cli.rs`, and the repeated-`-c` / empty-`addr` inputs by
-`frpc/tests/cli_inputs.rs`. Executing lanes: `Run frpc CLI tests`, `Run frps CLI
-tests` and `Run frpc's CLI exit-code tests under tiny` in `.github/workflows/ci.yml`
+the **flip control** `malformed_store_file_exits_4_regardless_of_the_file_name`
+— one failure class under two file names, both 4 — and, under `--features tiny`,
+the same two assertions against `frpc-tiny`) and `frps/tests/cli_exit_codes.rs`
+(`frps -c <bad>`, `-c <missing>`, a starts-then-SIGTERM positive control, the
+extension flag's refusal, and the three construction-code pins
+`unresolvable_token_source_exits_3_where_go_exits_1`,
+`empty_token_refusal_is_a_hardening_divergence_go_does_not_have`,
+`oidc_without_an_issuer_is_refused_with_3_where_go_panics`). The kind → code
+mapping itself is asserted in `frp-core/src/init_error.rs`. The admin-subcommand
+refusals stay pinned by `frpc/tests/admin_cli.rs`, and the repeated-`-c` /
+empty-`addr` inputs by `frpc/tests/cli_inputs.rs`. Executing lanes: `Run frpc CLI
+tests`, `Run frps CLI tests` and `Run frpc's CLI exit-code tests under tiny` in `.github/workflows/ci.yml`
 (the `frps` lane and the `tiny` lane were added with these tests — nothing ran a
 `cargo test` target of the `frps` package, or executed the `tiny` CLI binary,
-before them).
+before them). The `frps` lane's count literal moved 16 → 19 with the three
+server-side pins; the `tiny` lane's stayed 11, because the client's flip control
+replaced the single-name store test rather than adding one.
 
 #### Output stream and shape on a config-load failure
 
