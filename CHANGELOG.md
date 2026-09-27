@@ -286,6 +286,43 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **`frpc --help=<bool>` no longer hides the command it names, and a `-hc`
+  shorthand cluster is a parse error again.** Go registers `--help`/`-h` as a
+  pflag bool, so `frpc --help=false status -c frpc.toml` **runs** `status` (it
+  dials the config's `[webServer] port`; measured rc 1 and **1 connection** on Go
+  v0.71.0, with the connection counted by `accept` on a fresh listening socket),
+  while `--help=true status` prints `status`'s own help. frp-rs's bpaf parser
+  treats `--help=<anything>` as its built-in help trigger and short-circuits, so
+  both printed bpaf's usage with rc 0 and `status` never ran — a script that
+  passed a bool-valued help flag saw success and no request. Now:
+  - `--help=false <sub>` drops the flag and runs the subcommand (rc and the
+    dial match Go);
+  - `--help=true <sub>` prints the **subcommand's** help on stdout with rc 0, as
+    `frpc <sub> --help` does — the same *shape* Go prints for `--help=true
+    <sub>`, though not yet the same document (below);
+  - `--help=<not a bool>` is refused with pflag's grammar and rc 1
+    (`--help=foo`, `--help=yes`, `--help=`) instead of printing help;
+  - `frpc -hc status` (pflag's shorthand cluster, `-h` then `-c` with no value)
+    is rc 1 with `Error: flag needs an argument: 'c' in -c` on **stderr** and
+    0 B on stdout, as on Go, where frp-rs used to print help on stdout with rc 0.
+    The split spellings are covered too: `-c -h` was already `-c` taking `-h`
+    (`open -h: no such file or directory` on Go, rc 1, 35 B on stdout), and the
+    `-h -c` order is now rc 1 with `flag needs an argument: 'c' in -c` on **stderr**
+    and 0 B on stdout, as Go, where it used to print help with rc 0. The **trailing
+    usage block** cobra adds after that line is not reproduced (frp-rs parse
+    failures print no usage block), so the stderr byte count is 41 where Go's is
+    **637 B** for `frpc -h -c status` and `frpc status -h -c` (the two rows that
+    carry a command word) and **1351 B** for bare `frpc -h -c` — recorded in
+    `docs/developing.md` § `--help=<bool>`.
+  Deliberately unchanged: `frpc --help`, `frpc -h`, `frpc --help=true`,
+  `frpc <sub> --help`/`-h`, `frpc --help <word>` and the root
+  `frpc --help=false -c cfg` divergence. Two residual differences are recorded,
+  not papered over: the help **document** is still bpaf's (1604 B of usage for
+  `frpc status --help` where Go prints cobra's 627 B `Overview of all proxies
+  status` — a flag-surface-wide row that also covers `frpc --help`, 2405 B vs
+  1370 B), and the shorthand refusal prints pflag's line without cobra's trailing
+  usage block (41 B of stderr where Go's is 637 B). Full table and per-argv
+  residuals: `docs/developing.md` § `--help=<bool>`.
 - **`frps` now completes the config *after* the CLI flags are applied, as Go
   does — four argv/config shapes change behaviour, including the proxy listen
   address.** `frps` reads
