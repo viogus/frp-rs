@@ -14,6 +14,8 @@ pub use file::*;
 
 mod format;
 
+mod ini_lenient;
+
 mod strict;
 
 /// Load server configs from a directory, merging all `.toml` files.

@@ -354,6 +354,41 @@ User-facing release notes for frp-rs.
   unrelated errors (`TcpListener`, `TcpStream`, `io`, unused `AtomicU64`). The
   variant is now exhaustive by construction and the imports are gated on what
   actually uses them; the configuration is gated in CI.
+- **Legacy `.ini` configs now load where Go's do: a bare numeric or a comma list
+  reaches a string field as the string Go gives it, and a `[range:...]`
+  template with a comma list or `role = visitor` behaves like Go's.** Three
+  measured divergences, all pre-existing:
+  `token = 12345678` (Go's own `conf/legacy/frpc_legacy_full.ini`) was inferred
+  as a TOML integer and refused with ``invalid type: integer `12345678`,
+  expected a string`` where Go's `frpc verify -c` exits 0 with the token as the
+  string; `allow_ports = 2000-3000,3001,3003,4000-50000` (Go's
+  `frps_legacy_full.ini`) was refused as ``invalid type: sequence``;
+  `[range:x] local_port = 6010-6012,6020` was **silently dropped** — Go
+  registers 4 proxies, frp-rs reported `Proxies: 0` and logged
+  `WARN … missing or invalid local_port; skipped` — so the 17
+  `[range:tcp_port]` proxies of Go's shipped client fixture were lost; and a
+  `[range:...]` template with `role = visitor` was misrouted to proxies (Go
+  builds visitors, `pkg/config/legacy/client.go:252-285`), with the
+  visitor-only keys stripped with them. `.ini` values are now read by the target
+  field's type (the inference is lossless through both renderers, so `token = 007`
+  stays `"007"` and an extreme magnitude such as `token = 10000000000000000000`
+  or `token = 0.0000001` is passed through as the file's text instead of a
+  re-rendering like `1e+19`/`1e-7`), a slice value is split the way Go's
+  `Key.Strings(",")` does (`custom_domains = a\,b` → `["a,b"]`, a trailing empty
+  element dropped), `[range:...]`'s port lists accept the split array, and a
+  visitor template builds visitors. Go's wider legacy boolean spellings
+  (`authenticate_heartbeats = 1`/`yes`) are honoured for `.ini` only: a
+  TOML/JSON/YAML `1`/`"yes"` keeps being ignored exactly as before. Both of Go's shipped `conf/legacy/{frpc,frps}_legacy_full.ini`
+  fixtures are vendored byte-identically and now load end to end — 43 proxies
+  and 2 visitors for the client file, exactly the names and counts Go frpc
+  v0.71.0 itself reports for it (`proxy added: […]`, `visitor added: […]`).
+  Scope: the type-directed reader above **and** the wider legacy boolean
+  spellings are `.ini`-only — TOML/JSON/YAML keep strict serde typing, so a
+  numeric `token` is still refused there — while `[range:...]`'s array arm
+  belongs to the shape-based legacy collector and therefore applies in **every**
+  format (it only adds acceptance: such an array was dropped with a warning
+  before). See
+  [docs/config.md § Legacy `.ini` values](docs/config.md#legacy-ini-values-are-read-by-the-target-fields-type).
 - **`/api/reload` now reads `?strictConfig=` the way Go frp does — two behaviour changes.**
   A repeated parameter (`?strictConfig=true&strictConfig=false`) reloads with the first value
   (Go's `url.Values.Get`); it previously failed serde deserialization and answered 400. And a

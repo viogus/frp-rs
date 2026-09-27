@@ -789,6 +789,75 @@ token: "my-token"
 
 Non-string mapping keys are converted to their string form (YAML allows them; JSON and TOML do not).
 
+#### Legacy `.ini` values are read by the target field's type
+
+Go's legacy INI loader hands every value to the target field as **text** and
+lets the field's Go type decide how to read it (`gopkg.in/ini.v1`'s `MapTo`:
+`Key.String()` for a string, `Key.Int64()` for an int, `Key.Strings(",")` for a
+slice — `struct.go:154-266`). frp-rs's INI reader infers a TOML type first; that
+inference is now **lossless** (a value becomes an integer/float/boolean/array
+only when rendering it back reproduces the text the file wrote through *both*
+renderers — see the magnitude note below), and `.ini` inputs are deserialized
+with the field's type deciding — so a bare numeric or a comma list reaches a
+string field as the string Go would give it:
+
+| INI line | target field | value read |
+|---|---|---|
+| `token = 12345678` | `String` | `"12345678"` |
+| `token = 10000000000000000000` | `String` | `"10000000000000000000"` (serde_json would render the float as `1e+19`) |
+| `allow_ports = 2000-3000,3001` | `String` | `"2000-3000,3001"` |
+| `meta_var1 = 123` | `HashMap<String, String>` value | `"123"` |
+| `server_port = 7000` | `u16` | `7000` |
+| `log_max_days = 3` | `i64` | `3` |
+| `tcp_mux = no` | `bool` | `false` (Go's `ini.v1.parseBool` spellings: `1/t/true/yes/y/on` and `0/f/false/no/n/off`) |
+| `custom_domains = a, b` | `Vec<String>` | `["a", "b"]` (Go's `Key.Strings(",")`: split on `,`, trim each element, `\,` is a literal comma, a trailing empty element is dropped) |
+| `custom_domains = a\,b` | `Vec<String>` | `["a,b"]` (the escape is Go's, measured) |
+| `custom_domains = a.example.com,` | `Vec<String>` | `["a.example.com"]` (Go drops the trailing empty, measured) |
+| `authenticate_heartbeats = 1` | `bool` (legacy key) | `true` — Go's `parseBool` set, **`.ini` only** (`pkg/auth/legacy/legacy.go:25,28`) |
+
+Scope and residuals, measured on Go frp v0.71.0:
+
+- Only `.ini` uses this reader. TOML/JSON/YAML keep strict serde typing, where a
+  numeric `token` is refused exactly as Go's v1 decoder refuses it. Two
+  normalizer passes touch the parsed tree regardless of format and are called out
+  here so the scope is exact: the legacy-boolean canonicalization is gated on the
+  `.ini` format (so a TOML `authenticate_heartbeats = 1` or `"yes"` stays
+  *ignored*, as it always was, while `[common]` `= 1`/`= yes` now adds the
+  `HeartBeats`/`NewWorkConns` scope), whereas `ini_port_numbers`' new array arm
+  applies to the shape-based legacy `[range:...]` collector in **every** format
+  (before it, an array there was dropped with `WARN … invalid local_port`; a
+  JSON `"local_port": [6010, "6011-6012"]` now expands).
+- `007`, `+5`, `1.50`, `1e3`, `YES`, `1e19` and `10000000000000000000`
+  keep their text for a string field (this is what makes `token = 007` the token
+  `"007"`, not `"7"`); for an integer/float/bool field the same text is parsed —
+  `007` → `7`, `1e3` → `1000.0`. Extreme magnitudes matter because Rust's `f64`
+  Display is plain decimal (`10000000000000000000`, `0.0000001`) while
+  serde_json's `ryu` rendering is exponential (`1e+19`, `1e-7`); a value whose
+  two renderings differ stays text, so a string field never receives a
+  re-rendered token or domain.
+- A comma list that renders back verbatim stays an **array** and is *not*
+  filtered: `custom_domains = a.com,,b.com` → `["a.com", "", "b.com"]`,
+  matching Go (measured). A list that has to stay text (a space after the
+  comma, an escape, a trailing comma) goes through the text path, where frp-rs's
+  pre-existing `filter` drops empty elements: `a.com, ,b.com` →
+  `["a.com", "b.com"]` here against Go's `["a.com", "", "b.com"]`. So the
+  empty-element divergence is narrower than the text-path filter suggests — only
+  a text-path middle empty element differs.
+- Go's `Key.Int64()` is `strconv.ParseInt(s, 0, 64)` — **base 0**. frp-rs reads
+  base 10, which is a silent *different value* for an octal-looking spelling:
+  `server_port = 07000` dials 3584 on Go and 7000 here, `010` is 8 on Go and 10
+  here, `0x10` is 16 on Go and refused here, and `08` is not a Go integer at all
+  (the field keeps its default 7000 there, while frp-rs reads 8). Pre-existing
+  (the inference this replaced also read base 10), recorded rather than fixed:
+  matching Go fully would also need its non-strict "swallow the parse error and
+  keep the default" behaviour, which a serde field cannot express.
+- The `["a", "b"]` array-literal spelling is an frp-rs extension, not Go syntax:
+  measured on Go v0.71.0, `custom_domains = ["a.example.com","b.example.com"]`
+  reaches frps as `['["a.example.com"', '"b.example.com"]']`. A **string** field
+  that is given such a literal receives the comma-joined elements (`a.example.com,b.example.com`)
+  where Go would give the bracketed text — a divergence this reader introduces
+  only for the frp-rs-only spelling.
+
 ---
 
 ## Environment Variable Expansion
