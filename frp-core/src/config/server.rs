@@ -427,8 +427,9 @@ impl ServerConfig {
         // `init_logging` (`frps/src/main.rs`) and the server goes **silent while
         // its listener still binds**. Measured on the pre-fix binary, own free
         // port, flags-only lane, stdout/stderr counted separately before any
-        // signal: `--log-level ""` → 0 B stdout / 0 B stderr (the empty level
-        // parses as `off`), `--log-file ""` → 0 B / 0 B **and** a
+        // signal: `--log-level ""` → 0 B stdout / 0 B stderr (tracing-core maps
+        // `LevelFilter::from_str("")` to `ERROR` — `metadata.rs:798` — and every
+        // startup record is `INFO`), `--log-file ""` → 0 B / 0 B **and** a
         // `frps.log.<date>` file created in the CWD instead. Go v0.71.0 with the
         // same flags logs its startup lines on stdout (measured: 282 B / 3
         // `INFO` lines, 0 B stderr, listener up).
@@ -436,6 +437,12 @@ impl ServerConfig {
         // The Go call sits after `Auth.Complete()`, which can fail and return
         // early; frp-rs has no fallible completion before this point, so there
         // is no early-return path whose ordering this could change.
+        //
+        // `[log] to = ""` in a **file** was never part of this: `resolve_log_file`
+        // already mapped an empty config value to `console`, so that shape
+        // logged 1498 B / 7 records on the pre-fix binary and created no file.
+        // The empty-config defects were `level = ""` (silent) and `max_days = 0`
+        // (cleanup disabled, which the fill fixes).
         self.log.complete();
         // Go frp: `BindAddr = util.EmptyOr(BindAddr, "0.0.0.0")`
         // (`pkg/config/v1/server.go:110`), which runs BEFORE the `ProxyBindAddr`

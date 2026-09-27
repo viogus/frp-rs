@@ -12,21 +12,24 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// Resolve the effective log level: the CLI value wins over the config value,
 /// which wins over the built-in default.
 ///
-/// An **empty** CLI value counts as *not supplied* and falls through to the
-/// config level. That is Go's value-level semantics: on Go the flag is bound
-/// with its default (`pkg/config/flags.go:161` registers `--log_level` with
+/// An **empty** CLI value counts as *not supplied* and falls through to
+/// `cfg_level` when the caller has one, and to the built-in default when it does
+/// not — `frps`'s `--config-dir` lane calls `init_logging(&cli, None)`, so it is
+/// the `None` arm (`"info"`, or `_debug_default` under the `debug-logs`
+/// feature). That is Go's value-level semantics: on Go the flag is bound with
+/// its default (`pkg/config/flags.go:161` registers `--log_level` with
 /// `"info"`), so `--log_level ""` leaves the struct empty and
 /// `LogConfig.Complete()`'s `util.EmptyOr(c.Level, "info")`
 /// (`pkg/config/v1/common.go:121`) fills it — measured on Go v0.71.0, where
-/// `frps --log-level ""` still logs its 3 startup `INFO` lines (282 B on
-/// stdout, 0 B stderr, listener up — flags-only lane). Treating `Some("")` as a value instead routed the
-/// empty string to `parse_level`, where `LevelFilter::from_str("")` is
-/// `Ok(ERROR)` — tracing-core 0.1.36 maps the empty string to `ERROR`
-/// (`metadata.rs:798`) — and every startup record is `INFO`. Measured on the
-/// pre-fix frp-rs binary:
-/// `--log-level ""` → 0 B stdout / 0 B stderr with the listener up (the startup
-/// records are all `INFO`). See `LogConfig::complete`
-/// (`frp-core/src/config/server.rs`) for the config-side half of the same fill.
+/// `frps --log-level ""` still logs its 3 startup `INFO` lines (282 B on stdout,
+/// 0 B stderr, listener up — flags-only lane). Treating `Some("")` as a value
+/// instead routed the empty string to `parse_level`, where
+/// `LevelFilter::from_str("")` is `Ok(ERROR)` — tracing-core 0.1.36 maps the
+/// empty string to `ERROR` (`metadata.rs:798`) — and every startup record is
+/// `INFO`. Measured on the pre-fix frp-rs binary: `--log-level ""` → 0 B stdout
+/// / 0 B stderr with the listener up (the startup records are all `INFO`). See
+/// `LogConfig::complete` (`frp-core/src/config/server.rs`) for the config-side
+/// half of the same fill.
 pub fn resolve_log_level(
     cli_level: Option<String>,
     cfg_level: Option<&str>,
@@ -59,6 +62,13 @@ pub fn resolve_log_level(
 /// path reached `tracing_appender::rolling::daily` (whose `file_name()` is
 /// `None`, so it fell back to the default log name). Go v0.71.0 with
 /// `--log-file ""` logs on stdout (282 B, 0 B stderr).
+///
+/// Only the **CLI** value is filtered. An empty *config* value was already
+/// resolved to `console` by this function before the completion existed (the
+/// `cfg_file.is_empty()` arm below), so the file-lane `to = ""` shape was
+/// **never** silent — measured on the pre-fix binary: `[log] to = ""` logged
+/// 1498 B / 7 records and created no file. The defect this filter closes is the
+/// flag arm.
 pub fn resolve_log_file(cli_file: Option<String>, cfg_file: &str) -> Option<String> {
     cli_file.filter(|f| !f.is_empty()).or_else(|| {
         if cfg_file.is_empty() || cfg_file == "console" {
@@ -67,6 +77,38 @@ pub fn resolve_log_file(cli_file: Option<String>, cfg_file: &str) -> Option<Stri
             Some(cfg_file.to_string())
         }
     })
+}
+
+/// Resolve `log.maxDays` / `--log-max-days`: the CLI value wins over the config
+/// value, which wins over the built-in `3`.
+///
+/// The CLI arm filters the **zero** value, because zero is Go's `util.EmptyOr`
+/// zero value: Go binds `--log_max_days` straight onto the struct
+/// (`pkg/config/flags.go:163`, default `3`) and then completes it
+/// (`cmd/frps/root.go:77-83` → `LogConfig.Complete()`,
+/// `pkg/config/v1/common.go:122` `MaxDays = util.EmptyOr(MaxDays, 3)`), so
+/// `--log_max_days 0` means **3** on Go, not "retain forever". Only the CLI arm
+/// filters zero; the config arm is the value `LogConfig::complete` already
+/// filled, so a zero there means a caller skipped completion.
+///
+/// Without this filter the raw CLI value beat the value
+/// [`LogConfig::complete`](crate::config::LogConfig::complete) had just filled,
+/// because `frps`/`frpc` read `cli.log_max_days.or(cfg.log.max_days)`: the flag
+/// had already overlaid `0` onto the config and completion had rewritten it to
+/// `3`, then `Some(0)` won anyway. The observable is **synchronous startup
+/// cleanup** (`init_tracing` calls
+/// [`cleanup_expired_logs`] before the process serves): measured with a
+/// backdated `logs/frps.log.2020-01-01` and `[log] to = "logs/frps.log"`, the
+/// pre-fix binary left the file in place under `--log-max-days 0` (cleanup
+/// disabled) while the default, `--log-max-days 3`, `5` and the config-file
+/// `max_days = 0` all deleted it. Only the zero value is filtered: a negative
+/// CLI value is explicit on Go too (`util.EmptyOr(-1, 3)` is `-1`, cleanup
+/// disabled) and passes through.
+pub fn resolve_log_max_days(cli_max_days: Option<i32>, cfg_max_days: Option<i32>) -> i32 {
+    cli_max_days
+        .filter(|d| *d != 0)
+        .or(cfg_max_days)
+        .unwrap_or(3)
 }
 
 pub fn resolve_ansi(disable_log_color: bool) -> bool {
@@ -603,6 +645,34 @@ mod tests {
         );
         // `console` in the config means stdout.
         assert_eq!(resolve_log_file(None, "console"), None);
+    }
+
+    /// `--log-max-days 0` is Go's zero value and means **3**, not "retain
+    /// forever": Go completes it with `util.EmptyOr(MaxDays, 3)`
+    /// (`pkg/config/v1/common.go:122`). This is the arm the two binaries consume
+    /// instead of `cli.log_max_days.or(cfg.log.max_days)`, which let `Some(0)`
+    /// beat the `3` that `LogConfig::complete` had just written. The end-to-end
+    /// observable (a backdated `logs/frps.log.2020-01-01` surviving startup
+    /// cleanup) is pinned by `frps/tests/log_completion.rs`.
+    #[test]
+    fn resolve_log_max_days_treats_zero_cli_value_as_absent() {
+        // The zero CLI value falls through to the config value…
+        assert_eq!(resolve_log_max_days(Some(0), Some(5)), 5);
+        // …and to the built-in 3 when the config has none.
+        assert_eq!(resolve_log_max_days(Some(0), None), 3);
+        // The **config** arm is trusted, not filtered: every caller passes a
+        // config that `LogConfig::complete` has already filled (0 → 3), so a 0
+        // there is a caller that skipped completion, and this resolver does not
+        // paper over it. (Only the CLI arm can carry an uncompleted zero.)
+        assert_eq!(resolve_log_max_days(Some(0), Some(0)), 0);
+        // A non-zero CLI value still wins.
+        assert_eq!(resolve_log_max_days(Some(7), Some(5)), 7);
+        // A negative CLI value is explicit on Go too — `util.EmptyOr(-1, 3)` is
+        // `-1`, which disables cleanup — so only the zero value is filtered.
+        assert_eq!(resolve_log_max_days(Some(-1), Some(5)), -1);
+        // Nothing set anywhere.
+        assert_eq!(resolve_log_max_days(None, None), 3);
+        assert_eq!(resolve_log_max_days(None, Some(9)), 9);
     }
 
     /// `RUST_LOG` outranks the configured level (`filter_from_env`), so the

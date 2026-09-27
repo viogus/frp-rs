@@ -368,10 +368,10 @@ fn init_logging(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
         cli.log_file.clone(),
         cfg.map(|c| c.log.file.as_str()).unwrap_or(""),
     );
-    let max_days = cli
-        .log_max_days
-        .or_else(|| cfg.map(|c| c.log.max_days))
-        .unwrap_or(3);
+    // Same zero-value rule as `frps`: Go completes `--log_max_days 0` to 3
+    // (`pkg/config/v1/common.go:122`). The client's sibling shape is the config
+    // file, which `LogConfig::complete` fills; this covers the flag.
+    let max_days = logging::resolve_log_max_days(cli.log_max_days, cfg.map(|c| c.log.max_days));
     let format = logging::resolve_log_format(
         cli.log_format.clone(),
         cfg.map(|c| c.log.format.as_str()).unwrap_or("text"),

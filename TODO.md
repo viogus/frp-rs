@@ -2724,26 +2724,48 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   reported separately because the graceful-shutdown lines land there; rc read from `wait` on the
   direct child, never through a pipe):
   * config-file lane (`-c`, Go YAML / frp-rs TOML, `[log]` values identical, all with
-    `bindAddr`/`bind_port` + token): Go is 273 B stdout / 0 B stderr / 4 lines / listener up in
-    **all five** shapes; frp-rs **base** is 0 B/0 B for `to = ""` and for `level = ""` (listener up)
-    and 1498 B/0 B for `absent`, `to=""`-only-with-level-absent is 1498 B, `maxDays = 0` is 1498 B;
-    frp-rs **head** is 1498 B/0 B and 7 INFO lines in every shape, with no log file created.
+    `bindAddr`/`bind_port` + token): Go is 273 B stdout / 0 B stderr / **3** INFO records / listener
+    up in **all five** shapes (a `grep -c .` over the raw stream says 4 — the trailing ANSI reset
+    counts as a line; the record count is 3); frp-rs **base** is 0 B/0 B for `level = ""` (listener
+    up), 1498 B/0 B for `absent` and for `to = ""` (that shape was **never** silent: `resolve_log_file`
+    already mapped an empty *config* value to console — the earlier "0 B/0 B and a file created" row
+    here was wrong and is corrected), and `maxDays = 0` is 1498 B/0 B **with retention disabled**;
+    frp-rs **head** is 1498 B/0 B and 7 records in every shape, with no log file created.
   * flags-only lane (`frps --bind-port <free>` + one log flag, own empty CWD): Go `--log-level ""`
-    / `--log-file ""` / `--log-max-days 0` each 282 B stdout / 0 B stderr / 3 lines / listener up
-    (`--log-format ""` is `Error: unknown flag: --log-format` + usage, 2368 B **stderr**, rc 1);
+    / `--log-file ""` / `--log-max-days 0` each 282 B stdout / 0 B stderr / 3 INFO records / listener
+    up (`--log-format ""` is `Error: unknown flag: --log-format` + usage, 2368 B **stderr**, rc 1);
     frp-rs **base** `--log-level ""` → 0 B/0 B and `--log-file ""` → 0 B/0 B **plus a
     `frps.log.2026-09-27` written in the CWD** (2434 B after SIGTERM), `--log-max-days 0` →
     1498 B/0 B with cleanup disabled; frp-rs **head** all three → 1498 B stdout / 0 B stderr /
-    7 lines / listener up / no file created. Absent values are unchanged (1498 B before and after).
+    7 records / listener up / no file created. Absent values are unchanged (1498 B before and after).
+  * `--log-max-days 0` / `[log] max_days = 0` has a **synchronous** observable that the byte rows
+    above cannot show: `init_tracing` runs `cleanup_expired_logs` at startup when `max_days > 0`.
+    With `[log] to = "logs/frps.log"` and a backdated `logs/frps.log.2020-01-01` (mtime on the epoch):
+
+    | shape | `d3a16d2` (pre-this-round) | head |
+    |---|---|---|
+    | no flag (defaults to 3) | deleted | deleted |
+    | `--log-max-days 0` (CLI) | **SURVIVED** | deleted |
+    | `--log-max-days=-1` (CLI) | survived | survived (only the zero value is filtered) |
+    | `[log] max_days = 0` (file) | deleted | deleted |
+
+    i.e. the config half was fixed by the first commit and the **CLI** half was not: `frps`/`frpc`
+    read `cli.log_max_days.or(cfg.log.max_days)`, and the flag's `Some(0)` beat the `3` that
+    `LogConfig::complete` had just written. Both binaries now go through
+    `logging::resolve_log_max_days`, which filters the CLI zero value (Go's `util.EmptyOr(0, 3)`,
+    `pkg/config/flags.go:163` + `common.go:122`) and passes a negative value through.
   Pins: `log_config_absent_keys_keep_serde_defaults_and_empty_ones_are_filled`,
   `log_config_completion_leaves_format_alone`,
   `server_and_client_config_completion_both_fill_the_log_section`,
   `resolve_log_level_treats_empty_cli_value_as_absent`,
   `resolve_log_file_treats_empty_cli_value_as_absent`,
+  `resolve_log_max_days_treats_zero_cli_value_as_absent`,
   `rust_log_outranks_the_configured_level` +
   `parse_level_maps_known_and_unknown` (`frp-core/src/config/tests.rs`,
   `frp-core/src/logging.rs`), and the bounded spawn file `frps/tests/log_completion.rs`
-  (4 tests; **0 passed / 4 failed** against a pre-fix `FRPS_BIN`, all four green here).
+  (5 tests; **0 passed / 5 failed** against a pre-fix `FRPS_BIN` — and **4 passed / 1 failed**
+  against `d3a16d2`, the single failure being the CLI `--log-max-days 0` arm, which is what isolates
+  this round's fix — all five green at the head).
   **`--log-format` was verified and deliberately not touched**: Go v0.71.0's `LogConfig`
   (`pkg/config/v1/common.go:103-117`) has no `Format` field and the real binary refuses the flag
   (measurement above); frp-rs's `--log-format` is an extension and `resolve_log_format` already maps
@@ -2753,8 +2775,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   path runs for every client load — `config.LoadClientConfigResult` → `result.Common.Complete()`
   (`pkg/config/load.go:392`), i.e. the `-c` lane too, not the server's flags-only exception. Measured
   on frpc against a live frps (own ports, both streams separate): base with
-  `[log] to = "" level = "" maxDays = 0` or `level = ""` in the config → **0 B/0 B with the TCP proxy
-  listening**; head → 2380 B stdout / 0 B stderr / 10 lines, identical to the absent control.
+  `[log] to = "" level = "" maxDays = 0` (the level is what silences it) or `level = ""` alone in the
+  config → **0 B/0 B with the TCP proxy listening**; base with `to = ""` alone → 2380 B / 10 records,
+  i.e. the client's file half was already console (same as the server's, see the corrected row above);
+  head → 2380 B stdout / 0 B stderr / 10 records in every shape, identical to the absent control.
   Carriers: `docs/config.md` `[log]` rows (`level`/`file`/`max_days` now state the completion and that
   an explicit empty/zero is filled; `format` says it is an frp-rs extension with no Go completion and
   the old "console (default, stderr)" slip is corrected to stdout), `CHANGELOG.md` under `### Fixed`,
