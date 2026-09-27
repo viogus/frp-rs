@@ -1197,12 +1197,15 @@ impl RootCommand {
     /// Go's `config.WordSepNormalizeFunc` normalizes the **other** way — it
     /// rewrites every `_` in a queried name to `-`
     /// (`pkg/config/flags.go:31-36`, `strings.ReplaceAll(name, "_", "-")`),
-    /// which is what makes `--strict_config` find the flag registered as
-    /// `strict_config`; both spellings therefore resolve to one registry entry
-    /// and `hasNoOptDefVal` answers for both. frp-rs's [`consumes_value`] folds
-    /// the token's `-` into `_` before the lookup, which is the same
-    /// membership test in the opposite direction (the exemption is a set, so up
-    /// to spelling there is no difference) — see that function for the
+    /// which is what makes a query spelled `--strict_config` find the flag Go
+    /// registers with the underscore spelling (`cmd/frps/root.go:46`,
+    /// `BoolVarP(&strictConfigMode, "strict_config", …)`) while pflag renders it
+    /// hyphenated — measured on Go v0.71.0, `frps --help` and
+    /// `frps verify --help` both print `--strict-config`. Both spellings resolve
+    /// to that one flag, so `hasNoOptDefVal` answers for both. frp-rs's
+    /// [`consumes_value`] folds the token's `-` into `_` before the lookup, which
+    /// is the same membership test in the opposite direction (the exemption is a
+    /// set, so up to spelling there is no difference) — see that function for the
     /// measured end-to-end parity.
     ///
     /// Every entry is measured on Go v0.71.0 (the probes are tabulated in

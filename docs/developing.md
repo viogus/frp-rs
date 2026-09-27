@@ -2989,7 +2989,9 @@ list is pinned against the parser's branches in both directions by
 `the_frps_command_list_is_exactly_the_parser_branches`. **Decision: recorded, not
 implemented** — shell-completion scripts are not part of the product surface on
 either binary, and implementing them for `frps` alone would add a new surface
-with its own parity burden (three shells' script bodies) rather than fix a
+with its own parity burden: **one script body per shell Go ships, and Go ships
+four** — measured on Go v0.71.0, `frps completion --help` lists exactly `bash`,
+`fish`, `powershell` and `zsh` under `Available Commands` — rather than fix a
 parity gap. What would unfreeze it: a user report asking for completion, or
 `frpc` gaining it first.
 
