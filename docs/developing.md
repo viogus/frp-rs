@@ -2768,9 +2768,11 @@ other bool flag here, so `1`/`0`/`t`/`f`/`T`/`F`/`TRUE`/`FALSE`/`True`/`False`
 are accepted on the `=` spelling.
 
 **Recorded residuals, each measured on Go v0.71.0 / base / head.** The sweep is
-**154 argv** on `frpc` (the original 85 plus the 69 the review round named) plus
-**20** on `frps`: **34 `frpc` rows moved to Go's `(rc, connection count, stdout
-empty)` and none regressed**, and the 29 historical help rows (`--help`, `-h`,
+**154 argv** on `frpc` (the original 85 plus the 69 the review round named), **20**
+more on `frps`, **10 `verify` rows** with a valid config on each binary, and **6
+run-path rows** with a hardening-safe config: **34 `frpc` rows moved to Go's `(rc,
+connection count, stdout empty)` and none regressed**, all 10 `verify` rows and
+all 6 `run` rows agree with Go on that signature, and the 29 historical help rows (`--help`, `-h`,
 `--help=true`, every `frpc <sub> --help`/`-h`, `-hc`, `-hcx`, `-hc=x`,
 `-hc --help=false status`, …) are **byte-identical** to the base head. The `frps`
 sweep agrees with Go on `(rc, connection count, stdout empty)` for 15 of 20 rows;
@@ -2778,7 +2780,17 @@ the five differences are all pre-existing or this item's documented residue:
 `--help=false -c CFG` (the root divergence below), `-h -c`/`-h -L`/`-h -t` (the
 split `-h` family below) and `verify --token --help=false -c CFG` (frp-rs's
 `verify` flag set differs from Go's, an frps-surface row). `frps --help=false
-verify` matches Go exactly (46 B on stdout, rc 0).
+verify` matches Go exactly (46 B on stdout, rc 0), and every `verify` row measured
+with a valid config — `--token --help=false`, `--bind-addr --help=false`,
+`-t --help=false`, `--log_file --help=false`, `--log-level --help=false`,
+`frpc verify --allow-unsafe --help=false`, `frpc verify --config-dir
+--help=false` — matches Go **byte-for-byte** (116 B on stdout, rc 0). The `frpc
+tcp --proxy-name --help=false -c CFG` row is worth stating precisely: the head is
+now **byte-identical to the base's** `frpc tcp --proxy-name=x -c CFG` (rc 1, 0 B
+on stdout, 73 B on stderr), i.e. the help flag is inert; Go *starts* on both, and
+that gap is the pre-existing "frp-rs's single-proxy commands require their own
+flags where Go falls back to the config file" divergence, which the base shows
+with no help flag in argv at all.
 
 | argv | Go | base | head | what is left |
 |---|---|---|---|---|

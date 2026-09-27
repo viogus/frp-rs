@@ -1187,25 +1187,6 @@ fn help_cluster_naming_a_value_short(token: &OsStr, context: ShortFlagContext) -
 /// a single token containing `=`, which this pass copies through by the same
 /// rule (`-c=-h` is not a value-taking token, so nothing follows it).
 fn attach_flag_shaped_values(argv: Vec<OsString>, root: RootCommand) -> Vec<OsString> {
-    // The command word may still be anywhere in this argv (the hoist runs
-    // after), so the context comes from the first **bare word** rather than
-    // from the first token — `frps -c CFG verify` is a subcommand parse even
-    // though it does not lead.
-    let on_subcommand = argv
-        .iter()
-        .find(|token| {
-            let text = token.to_string_lossy();
-            !text.starts_with('-')
-        })
-        .and_then(|token| token.to_str())
-        .is_some_and(|word| is_known_subcommand(word, root));
-    let context = ShortFlagContext {
-        value_taking: if on_subcommand {
-            &VALUE_TAKING_SHORTS_SUBCOMMAND
-        } else {
-            &VALUE_TAKING_SHORTS_ROOT
-        },
-    };
     let mut out = Vec::with_capacity(argv.len());
     let mut seen_separator = false;
     let mut index = 0;
@@ -1222,24 +1203,34 @@ fn attach_flag_shaped_values(argv: Vec<OsString>, root: RootCommand) -> Vec<OsSt
             index += 1;
             continue;
         }
-        // Shorts come from the context; of the long flags only the four
-        // config-selecting ones take a value **and** lack a `--flag=` spelling
-        // of their own, which is exactly the pair `-c`-style attachment fits
-        // (`--config=-h`). `consumes_value` is deliberately not reused here: it
-        // answers cobra's `stripFlags` question about *unknown* flags, and on
-        // this tree that includes `--help`/`--version`, which are bools.
-        let takes_value = value_taking_short_name(arg, context).is_some()
-            || matches!(
-                arg.to_str(),
-                Some("--config" | "--config-dir" | "--config_dir")
-            );
+        // Every flag the parser will hand the next token to — the same
+        // cobra-shaped predicate [`walk_argv`] uses, so the two passes cannot
+        // disagree about who owns a token. That is what covers `--token`,
+        // `--proxy-name`, `--bind-addr`, `--log_file` and the admin flags, which
+        // a four-name list did not: `frps verify --token --help=false -c CFG`
+        // must join `--help=false` to `--token` (Go parses the token as the
+        // value and exits 0 with `syntax is ok`).
+        //
+        // The two bare help spellings are excluded because bpaf's built-in help
+        // is the one flag here that must **not** take a value: `frpc --help -h`
+        // is help, not `--help="-h"`, and `-v`/`--version` need no exclusion
+        // because `consumes_value` already answers false for every pflag bool of
+        // the root command.
+        let takes_value =
+            consumes_value(arg, root) && !matches!(arg.to_str(), Some("-h") | Some("--help"));
         // A flag-shaped next token is a value here whatever it says, `-h`
         // included: `frps -c CFG -t -h` is `--token` taking `-h` (Go loads the
         // config and exits 1), and the token only gets this far when the
         // **previous** one is value-taking, so `frpc -v -h` never reaches it.
+        // A flag-shaped next token is this flag's value whatever it contains —
+        // `--help=false`, `-h`, `-c=CFG` and `-v` alike. pflag hands the next
+        // token over without inspecting it, and bpaf will only accept a
+        // `-`-prefixed value when it is attached, so the `=` inside the *value*
+        // must not disqualify it: `frps verify --token --help=false -c CFG` is
+        // the row that showed this.
         let next_is_attachable = argv.get(index + 1).is_some_and(|next| {
             let text = next.to_string_lossy();
-            text.starts_with('-') && next != "-" && !text.contains('=')
+            text.starts_with('-') && next != "-"
         });
         if takes_value && !arg.to_string_lossy().contains('=') && next_is_attachable {
             let mut joined = arg.clone();
@@ -1265,9 +1256,17 @@ fn attach_flag_shaped_values(argv: Vec<OsString>, root: RootCommand) -> Vec<OsSt
 /// cluster's first flag and the value-taking short then takes the next token.
 /// Everything else — `=`, an attached value, `--long`, an unknown short, a bare
 /// `-h` — consumes nothing.
-fn consumes_the_next_token(token: &OsStr, context: ShortFlagContext) -> bool {
-    value_taking_short_name(token, context).is_some()
-        || help_cluster_naming_a_value_short(token, context).is_some()
+fn consumes_the_next_token(token: &OsStr, context: ShortFlagContext, root: RootCommand) -> bool {
+    // `consumes_value` is the cobra-shaped predicate this tree already uses for
+    // command resolution, and it covers every **long** flag a parser will take a
+    // value for — `--token`, `--proxy-name`, `--bind-addr`, `--log_file`, the
+    // admin surface, and any name the parser does not know, which pflag also
+    // feeds the next token to. Reusing it is what makes
+    // `frps verify --token --help=false -c CFG` keep `--help=false` where it
+    // belongs: pflag hands the token to `--token` (Go: rc 0, `syntax is ok`),
+    // while a short-only predicate let the expansion strip it and left `--token`
+    // with no argument (head was rc 1, `--token` requires an argument `TOKEN`).
+    consumes_value(token, root) || help_cluster_naming_a_value_short(token, context).is_some()
 }
 
 /// The result of walking the **hoisted** argv the way pflag's `parseShortArg` /
@@ -1309,7 +1308,7 @@ struct ArgvWalk {
 /// `consumed[i]` is also how [`expand_help_bool_value_form`] knows that a
 /// `--help=<bool>` token is *a value* rather than a flag, which is the fix for
 /// `frpc -hc --help=false status` and `frpc --config --help=false status`.
-fn walk_argv(argv: &[OsString], context: ShortFlagContext) -> ArgvWalk {
+fn walk_argv(argv: &[OsString], context: ShortFlagContext, root: RootCommand) -> ArgvWalk {
     let mut consumed = vec![false; argv.len()];
     // The index of a value-taking token that claimed the **next** token but did
     // not get one, and whether that token was an `-h<short>` cluster.
@@ -1326,26 +1325,33 @@ fn walk_argv(argv: &[OsString], context: ShortFlagContext) -> ArgvWalk {
             index += 1;
             continue;
         }
-        let needs_a_value = value_taking_short_name(token, context)
-            .map(|named| (named, false))
-            .or_else(|| {
-                help_cluster_naming_a_value_short(token, context).map(|named| (named, true))
-            });
-        let Some((named, is_help_cluster)) = needs_a_value else {
+        // Does this token claim the next one? `consumes_value` is the
+        // cobra-shaped predicate this tree already uses for command resolution
+        // and it covers every **long** flag a parser will take a value for
+        // (`--token`, `--proxy-name`, `--bind-addr`, `--log_file`, the admin
+        // surface, and any unknown name, which pflag also feeds the next token
+        // to). The cluster is the one shape it does not model.
+        let cluster = help_cluster_naming_a_value_short(token, context);
+        if !consumes_value(token, root) && cluster.is_none() {
             index += 1;
             continue;
-        };
+        }
+        // Only a **bare value-taking short** or the cluster can be reported; a
+        // long flag or a short this context does not call value-taking still
+        // claims its token, it just leaves the refusal to bpaf.
+        let reportable = value_taking_short_name(token, context)
+            .map(|named| (named, false))
+            .or_else(|| cluster.map(|named| (named, true)));
         if index + 1 < argv.len() {
             // Whatever follows is this flag's value, flag-shaped or not, and the
             // walk steps past it so it is never read as a flag of its own —
-            // `frpc -hc -v` and `frpc -hc -hc` are both one cluster plus a value.
+            // `frpc -hc -v` and `frpc -hc -hc` are both one flag plus a value.
             consumed[index + 1] = true;
             dangling = None;
         } else {
-            dangling = Some((index, named, is_help_cluster));
+            dangling = reportable.map(|(named, is_cluster)| (index, named, is_cluster));
         }
-        // Both shapes took the next token, so the walk steps past it: in
-        // `frpc -hc -hc` the second cluster is a *value*, not a flag.
+        // Both shapes took the next token, so the walk steps past it.
         index += 2;
     }
     ArgvWalk {
@@ -1377,7 +1383,7 @@ fn reject_pflag_shorthand_cluster_that_needs_a_value(argv: &[OsString], root: Ro
     if argv.iter().any(|token| token == "--") {
         return;
     }
-    let walk = walk_argv(argv, ShortFlagContext::of(argv, root));
+    let walk = walk_argv(argv, ShortFlagContext::of(argv, root), root);
     let Some(needed) = walk.needs_argument else {
         return;
     };
@@ -1506,7 +1512,7 @@ fn expand_help_bool_value_form(argv: Vec<OsString>, root: RootCommand) -> Vec<Os
                 break;
             }
             if token.to_string_lossy().starts_with('-') {
-                index += if consumes_the_next_token(token, context) {
+                index += if consumes_the_next_token(token, context, root) {
                     2
                 } else {
                     1
@@ -1520,7 +1526,7 @@ fn expand_help_bool_value_form(argv: Vec<OsString>, root: RootCommand) -> Vec<Os
         }
         found
     };
-    let walk = walk_argv(&argv, context);
+    let walk = walk_argv(&argv, context, root);
     let mut seen_separator = false;
     let mut out = Vec::with_capacity(argv.len());
     let mut wanted_help = false;
@@ -1636,7 +1642,10 @@ fn run_cli<T>(parser: bpaf::OptionParser<T>, name: Option<String>, rest: &[OsStr
 ///
 /// 1. [`rewrite_config_dash_values`] — the pre-existing config dash-value rewrite.
 /// 2. [`attach_flag_shaped_values`] — a flag-shaped value is joined to its flag
-///    with `=`, the only spelling bpaf parses as a value.
+///    with `=`, the only spelling bpaf parses as a value. Its consumer test is
+///    [`consumes_value`] (the same cobra-shaped one the walk uses), so it covers
+///    the long flags too: `frps verify --token --help=false -c CFG` must give
+///    `--help=false` to `--token`.
 /// 3. [`hoist_leading_subcommand`] — cobra's command resolution.
 /// 4. [`expand_help_bool_value_form`] — `--help=<bool>` resolved last-wins and
 ///    dropped (or turned into a trailing bare `--help`) only when a command word
@@ -5408,7 +5417,12 @@ mod hoist_tests {
         ] {
             let items = prepared_before_reject(&argv);
             assert_eq!(
-                walk_argv(&items, ShortFlagContext::of(&items, RootCommand::Frpc)).needs_argument,
+                walk_argv(
+                    &items,
+                    ShortFlagContext::of(&items, RootCommand::Frpc),
+                    RootCommand::Frpc
+                )
+                .needs_argument,
                 expected,
                 "{argv:?} reaches the walk as {items:?} and must be {expected:?}"
             );
@@ -5429,6 +5443,23 @@ mod hoist_tests {
         assert_eq!(attach(&["-c", "CFG", "-t", "-h"]), ["-c", "CFG", "-t=-h"]);
         assert_eq!(attach(&["-t", "-h"]), ["-t=-h"]);
         assert_eq!(attach(&["-p", "-h"]), ["-p=-h"]);
+        // The **long** flags too, including a value that carries its own `=`:
+        // `frps verify --token --help=false -c CFG` must hand `--help=false` to
+        // `--token` (Go parses it and exits 0 with `syntax is ok`, 116 B; a
+        // short-only list left `--token` with no argument and exited 1).
+        assert_eq!(
+            attach(&["verify", "--token", "--help=false", "-c", "CFG"]),
+            ["verify", "--token=--help=false", "-c", "CFG"]
+        );
+        assert_eq!(
+            attach(&["verify", "--bind-addr", "--help=false"]),
+            ["verify", "--bind-addr=--help=false"]
+        );
+        assert_eq!(
+            attach(&["verify", "--log_file", "--help=false"]),
+            ["verify", "--log_file=--help=false"]
+        );
+        assert_eq!(attach(&["--log-level", "-h"]), ["--log-level=-h"]);
         // Nothing to attach when the value is bare, and nothing to attach a
         // *bool* short to: `frpc -v -h` is `-v` plus a help request on both
         // trees, not `--version="-h"`.
@@ -5436,6 +5467,10 @@ mod hoist_tests {
         assert_eq!(attach(&["-v", "-h"]), ["-v", "-h"]);
         assert_eq!(attach(&["--help", "-h"]), ["--help", "-h"]);
         assert_eq!(attach(&["--version", "-h"]), ["--version", "-h"]);
+        assert_eq!(
+            attach(&["--strict-config", "-h"]),
+            ["--strict-config", "-h"]
+        );
         // A cluster is a consumer too: `frpc -hc -h` gives `-h` to the `c`.
         // A cluster is a consumer too, and `-v` is a bool short with no `-v=`
         // spelling, so only the flag-shaped value of a **config** flag is

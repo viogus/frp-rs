@@ -3331,7 +3331,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   config's `[webServer] port` with connections counted by `accept`, streams separate and rc read
   from the child — **34 of 154 rows moved to Go's (rc, connection count, stdout-empty) and none
   regressed** (the review-fix round added the 69-row matrix R2 named, which is where the first
-  revision's 19 regressions were found and fixed); `frpc --help`, `-h`, `--help=true`, every
+  revision's 19 regressions were found and fixed); a further **20 `frps` rows**, **10 `verify`
+  rows** with a valid config and **6 run-path rows** with a hardening-safe config all agree with Go
+  on that signature. `frpc --help`, `-h`, `--help=true`, every
   `frpc <sub> --help`/`-h`, `frpc --help status`, `frpc -c --help` and the root
   `frpc --help=false -c cfg` divergence are unchanged — the 29 historical help rows are
   **byte-identical** to the base. **One correction to this item's own rows:** `frpc -hc status` is
@@ -3348,9 +3350,15 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   residual argvs (`--help=false -c cfg`, `--help=0`, `--help=true notacommand`, `-h -v -c`,
   `-hLinfo`, `-h -c status`, `-c cfg -- --help=false`) and the unchanged admin-status stream
   divergence. Two argv families the review round measured are covered by the same item and are
-  **not** residuals: a `--help=<bool>` token in a flag's **value** position
-  (`-c --help=false status`, `-hc --help=false status`, …) stays untouched, and a flag-shaped value
-  is attached to its flag (`-c CFG -t -h` on both binaries reaches the config load, as Go does).
+  **not** residuals: a `--help=<bool>` token in a flag's **value** position stays untouched for
+  **every** flag the parser feeds the next token to — short, long, cluster and the `verify`/admin
+  surfaces, including `frps verify --token --help=false -c CFG` (Go rc 0, 116 B, byte-identical
+  here) and `frpc verify --allow-unsafe --help=false -c CFG` — and a flag-shaped value is attached
+  to its flag (`frps -c CFG -t -h` now exits 1 with the config load exactly as Go does, where the
+  base printed root help with rc 0). The one `frpc tcp --proxy-name --help=false -c CFG` row is
+  **byte-identical to the base's** `frpc tcp --proxy-name=x -c CFG` (the help flag is inert); Go
+  starts on both and that gap is the pre-existing single-proxy flag-requirement divergence, not
+  this item's.
   No test was added to a guarded lane, so `env.FRPC_TINY_CLI_TESTS` stays `11` and
   `env.FRPS_CLI_TESTS` stays `27`.
 - [x] **Exit codes `3`/`4` on daemon service-construction failures are frp-rs extensions where Go
