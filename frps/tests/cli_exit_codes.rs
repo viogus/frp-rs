@@ -3,18 +3,25 @@
 //!
 //! Go's CLI is two-valued: 0 on success, 1 on any failure. Measured on Go
 //! v0.71.0 (darwin/arm64) with one unknown top-level key added to an otherwise
-//! valid server config:
+//! valid server config, **stdout and stderr captured separately**:
 //!
 //! ```text
-//! frps -c badfrps.toml   → rc 1, stdout `json: unknown field "notAKnownFrpKey"`
-//! frps -c missing.toml   → rc 1, stdout `open missing.toml: no such file or directory`
+//! frps -c badfrps.toml   → rc 1, stdout `json: unknown field "notAKnownFrpKey"`, stderr 0 bytes
+//! frps -c missing.toml   → rc 1, stdout `open missing.toml: no such file or directory`, stderr 0 bytes
 //! ```
 //!
-//! frp-rs exited **2** (`EXIT_CONFIG`) on this path until this pin. Go has no
-//! `frps --config-dir` at all (`Error: unknown flag: --config-dir`, rc 1);
+//! frp-rs exited **2** (`EXIT_CONFIG`) on this path until the exit-code pin. Go
+//! has no `frps --config-dir` at all (`Error: unknown flag: --config-dir`, rc 1);
 //! frp-rs's is an extension whose refusals stay on `EXIT_CONFIG`/2 by the same
 //! deliberate divergence as the client's. See `docs/developing.md`
 //! § CLI exit codes.
+//!
+//! **Stream and shape are pinned too** (the `TODO.md` item "A CLI failure's
+//! output shape is still not Go's"): the single-config load failure is now one
+//! bare line on **stdout** with nothing on stderr, matching Go's
+//! `fmt.Println(err)` / `os.Exit(1)` (`cmd/frps/root.go`) instead of an
+//! ANSI-coloured `tracing` record. The wording stays frp-rs's own and is
+//! recorded, not matched.
 //!
 //! Gated on `full`: the `frps` bin carries `required-features = ["full"]`, so
 //! without the gate this file's `CARGO_BIN_EXE_frps` would fail to compile in
@@ -108,9 +115,16 @@ fn stderr_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).to_string()
 }
 
-/// Go: `frps -c <bad>` → bare parse error on **stdout**, exit 1
-/// (`cmd/frps/root.go`). frp-rs writes the same error inside a `tracing` line
-/// (output-shape divergence, out of scope here); the exit code is the pin.
+/// Go: `frps -c <bad>` → one bare parse error on **stdout**, exit 1
+/// (`cmd/frps/root.go`: `fmt.Println(err); os.Exit(1)`). Measured on Go v0.71.0
+/// with the streams captured separately: stdout 38 bytes
+/// (`json: unknown field "notAKnownFrpKey"`), stderr 0 bytes.
+///
+/// frp-rs now writes the same single bare line to stdout with stderr empty; the
+/// wording stays frp-rs's own (`in config file <path>`) and is recorded in
+/// `docs/developing.md` § CLI exit codes. Asserting the exact bytes means a
+/// regression to a `tracing` record (ANSI, timestamp, level, target, the
+/// duplicated `error=` field) fails here rather than silently.
 #[test]
 fn bad_config_exits_1_and_names_the_unknown_field() {
     let dir = TempDir::new();
@@ -125,23 +139,23 @@ fn bad_config_exits_1_and_names_the_unknown_field() {
         stdout_of(&out),
         stderr_of(&out),
     );
-    let all = format!("{}{}", stdout_of(&out), stderr_of(&out));
-    assert!(
-        all.contains(UNKNOWN_FIELD),
-        "the load error must name the unknown field, got stdout={:?} stderr={:?}",
+    assert_eq!(
         stdout_of(&out),
+        format!("{UNKNOWN_FIELD} in config file {cfg}\n"),
+        "frps -c <bad config> must print one bare line on stdout, like Go's \
+         `fmt.Println(err)`; stderr={:?}",
         stderr_of(&out),
     );
     assert!(
-        all.contains(&cfg),
-        "the load error must name the config file, got stdout={:?} stderr={:?}",
-        stdout_of(&out),
+        stderr_of(&out).is_empty(),
+        "Go prints nothing on stderr for this failure; stderr={:?}",
         stderr_of(&out),
     );
 }
 
-/// The sibling of the previous test: a missing file is the same failure class
-/// and the same code (Go rc 1).
+/// The sibling of the previous test: a missing file is the same failure class,
+/// the same code (Go rc 1) and the same stream. Measured on Go v0.71.0:
+/// stdout `open <path>: no such file or directory`, stderr 0 bytes.
 #[test]
 fn missing_config_exits_1() {
     let dir = TempDir::new();
@@ -154,6 +168,17 @@ fn missing_config_exits_1() {
         Some(1),
         "frps -c <missing> must exit 1 like Go; stdout={:?} stderr={:?}",
         stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stdout_of(&out).contains(&missing),
+        "the load error must name the missing config file on stdout; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stderr_of(&out).is_empty(),
+        "Go prints nothing on stderr for this failure; stderr={:?}",
         stderr_of(&out),
     );
 }
@@ -699,11 +724,14 @@ fn disable_log_color_value_spelling_is_applied() {
 // config-selecting flag, and a `--` that is a real separator rather than `-c`'s
 // value.
 
-/// Both streams, ANSI stripped: the load error arrives on stdout inside a
-/// `tracing` line on this path, and these assertions are about the *path named*,
-/// not the stream (the output-shape divergence is tracked separately). The
-/// stripping mirrors what `--disable-log-color` does to the same line and keeps
-/// the assertion about the message text, not the colour.
+/// Both streams, ANSI stripped. Retained for the assertions that genuinely want
+/// "anywhere in the child's output" — the parser refusals, which go to stderr.
+/// The single-config **load** error is no longer wrapped in a `tracing` line
+/// (it is one bare line on stdout, see
+/// [`bad_config_exits_1_and_names_the_unknown_field`]), so load-path assertions
+/// read `stdout_of` directly and thereby pin the stream as well. The stripping
+/// mirrors what `--disable-log-color` does to a log line and keeps a text
+/// assertion about the message, not the colour.
 fn combined(out: &Output) -> String {
     let mut clean = String::new();
     for bytes in [&out.stdout, &out.stderr] {
@@ -733,15 +761,15 @@ fn combined(out: &Output) -> String {
 /// pflag does not look at the token at all.
 ///
 /// **Discrimination, per iteration.** The assertion is the load path's own line
-/// (`Failed to load config: <value>: failed to read config file`) plus the
-/// absence of any parser refusal, because "the output contains the token" is
-/// *not* discriminating on its own: the base head's refusal text already names
+/// (`<value>: failed to read config file`) on **stdout** plus the absence of any
+/// parser refusal, because "the output contains the token" is *not*
+/// discriminating on its own: the parser's refusal text already names
 /// `--bind-port`, `-x` and `-c` (`` … got a flag `-x`, try `-c=-x` …``). Only
 /// `--strict-config=false` is named solely by its own refusal
 /// (`` `-c` requires an argument `FILE` ``), so all four iterations assert the
-/// load line; the base tree then fails on `--strict-config=false` for the old
-/// reason and on the other three because "Failed to load config" is absent
-/// (they were refusals, not loads).
+/// load line **and its stream** — a refusal would leave stdout empty; the base
+/// tree then fails on `--strict-config=false` for the old reason and on the
+/// other three because the load line is absent (they were refusals, not loads).
 #[test]
 fn dash_shaped_config_value_is_the_value_not_a_flag() {
     for value in ["--strict-config=false", "--bind-port", "-x", "-c"] {
@@ -753,12 +781,14 @@ fn dash_shaped_config_value_is_the_value_not_a_flag() {
             stdout_of(&out),
             stderr_of(&out),
         );
-        let all = combined(&out);
+        let stdout = stdout_of(&out);
         assert!(
-            all.contains("Failed to load config") && all.contains(value),
-            "frps -c {value} must name `{value}` as the path it could not read, not refuse the \
-             token as a flag; output={all:?}"
+            stdout.contains("failed to read config file") && stdout.contains(value),
+            "frps -c {value} must name `{value}` as the path it could not read on stdout, not \
+             refuse the token as a flag; stdout={stdout:?} stderr={:?}",
+            stderr_of(&out),
         );
+        let all = combined(&out);
         assert!(
             !all.contains("requires an argument"),
             "the parser must not have refused the dash-shaped token; output={all:?}"
@@ -846,8 +876,11 @@ fn real_separator_and_dangling_config_stay_refused() {
         "the refused leftover must be named; output={all:?}"
     );
     assert!(
-        !all.contains("Failed to load config"),
-        "the token after a real `--` must not have been taken as `-c`'s value; output={all:?}"
+        !stdout_of(&out).contains("failed to read config file"),
+        "the token after a real `--` must not have been taken as `-c`'s value — that would put \
+         the load line on stdout; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
     );
 
     // Dangling `-c`: still a refusal, with no value invented from anywhere.

@@ -192,11 +192,16 @@ async fn run(mut cli: FrpsArgs) {
     let mut cfg = match load_server_config_uncompleted(&config_path, cli.strict_config) {
         Ok(cfg) => cfg,
         Err(e) => {
-            init_logging(&cli, None);
-            tracing::error!(error = %e, "Failed to load config: {}", e);
-            // Go frp v0.71.0: `frps -c <bad>` exits 1 (`cmd/frps/root.go`), same
-            // as the client. Measured against the Go binary; pinned by
-            // `frps/tests/cli_exit_codes.rs`.
+            // Go frp v0.71.0: `frps -c <bad>` is `fmt.Println(err); os.Exit(1)`
+            // (`cmd/frps/root.go`) — one bare line on **stdout**, no log prefix
+            // and no ANSI, same as the client, exit 1. Measured against the Go
+            // binary with the two streams captured separately (Go: stdout 38
+            // bytes, stderr 0); pinned by `frps/tests/cli_exit_codes.rs`.
+            //
+            // `init_logging` is deliberately **not** called here: Go installs
+            // its logger only after a successful load, and this branch exits
+            // before any log record is emitted.
+            println!("{e}");
             process::exit(frp_core::EXIT_RUNTIME);
         }
     };
