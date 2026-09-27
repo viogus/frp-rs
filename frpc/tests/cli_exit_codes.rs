@@ -20,15 +20,20 @@
 //! `docs/developing.md` § CLI exit codes.
 //!
 //! **Stream and shape are pinned too** (the `TODO.md` item "A CLI failure's
-//! output shape is still not Go's"). Both load-failure paths now write one bare
-//! line to **stdout** and nothing to stderr, matching Go's
+//! output shape is still not Go's"). Both load-failure paths now write bare
+//! line(s) to **stdout** and nothing to stderr, matching Go's
 //! `fmt.Println(err)` / `os.Exit(1)` (`cmd/frpc/sub/root.go`,
 //! `cmd/frpc/sub/verify.go`); before, the daemon start path wrapped the error in
 //! an ANSI-coloured `tracing` record on stdout and `verify` wrote its message to
-//! stderr. The *text* still differs and is recorded, not matched: frp-rs appends
-//! `in config file <path>` (and sometimes a `did you mean …?` suggestion) where
-//! Go prints the codec's `json: unknown field "…"` with no path. The exact
-//! frp-rs bytes are asserted so the shape cannot drift back silently.
+//! stderr. Two things are recorded, not matched, and this file's fixtures are
+//! single-key so neither is visible here: the *text* (frp-rs appends
+//! `in config file <path>` — and sometimes a `did you mean …?` suggestion —
+//! where Go prints the codec's `json: unknown field "…"` with no path), and the
+//! *line count* at N ≥ 2 (frp-rs prints one line per rejected key, Go stops at
+//! the first; pinned at the collector by
+//! `strict_check_reports_every_unknown_key_not_just_the_first` in
+//! `frp-core/src/config/tests.rs`). The exact single-line frp-rs bytes are
+//! asserted here so the shape cannot drift back silently.
 //!
 //! Two further tests pin the *extension* codes on the client:
 //! `unresolvable_token_source_exits_3_like_frps` (`EXIT_AUTH`/3 — the same
@@ -133,7 +138,10 @@ fn stderr_of(out: &Output) -> String {
 /// v0.71.0 with the streams captured separately: stdout 38 bytes
 /// (`json: unknown field "notAKnownFrpKey"`), stderr 0 bytes.
 ///
-/// frp-rs now writes the same single bare line to stdout, with stderr empty.
+/// frp-rs now writes the same bare line to stdout, with stderr empty. It is
+/// **one line per rejected key**, so this single-key fixture is the N=1 case;
+/// the N ≥ 2 count is pinned at the collector
+/// (`frp-core/src/config/tests.rs`), not here.
 /// The line's **text** is frp-rs's own and stays divergent, deliberately: it
 /// names the config file (`in config file <path>`) where Go's decoder error
 /// carries no path, and it can add a `did you mean …?` suggestion. That split —
@@ -158,7 +166,8 @@ fn daemon_bad_config_exits_1_and_names_the_unknown_field() {
     assert_eq!(
         stdout_of(&out),
         format!("{UNKNOWN_FIELD} in config file {cfg}\n"),
-        "frpc -c <bad config> must print one bare line on stdout, like Go's \
+        "frpc -c <bad config> must print one bare line on stdout for this one-key \
+         fixture (the N >= 2 case is N lines — see the module doc), like Go's \
          `fmt.Println(err)`; stderr={:?}",
         stderr_of(&out),
     );
@@ -558,8 +567,9 @@ mod tiny {
         assert_eq!(
             stdout_of(&out),
             format!("{UNKNOWN_FIELD} in config file {cfg}\n"),
-            "frpc-tiny -c <bad config> must print one bare line on stdout like the full \
-             binary and like Go; stderr={:?}",
+            "frpc-tiny -c <bad config> must print one bare line on stdout for this \
+             one-key fixture like the full binary and like Go (N >= 2 is N lines); \
+             stderr={:?}",
             stderr_of(&out),
         );
         assert!(

@@ -17,11 +17,16 @@
 //! § CLI exit codes.
 //!
 //! **Stream and shape are pinned too** (the `TODO.md` item "A CLI failure's
-//! output shape is still not Go's"): the single-config load failure is now one
-//! bare line on **stdout** with nothing on stderr, matching Go's
+//! output shape is still not Go's"): the single-config load failure is now bare
+//! line(s) on **stdout** with nothing on stderr, matching Go's
 //! `fmt.Println(err)` / `os.Exit(1)` (`cmd/frps/root.go`) instead of an
-//! ANSI-coloured `tracing` record. The wording stays frp-rs's own and is
-//! recorded, not matched.
+//! ANSI-coloured `tracing` record. Two things are recorded, not matched, and the
+//! fixtures below are single-key so neither is visible in them: the wording
+//! (frp-rs names the config file; Go's decoder error has no path) and the line
+//! count at N ≥ 2 (frp-rs prints one line per rejected key, Go stops at the
+//! first — pinned at the collector by
+//! `strict_check_reports_every_unknown_key_not_just_the_first` in
+//! `frp-core/src/config/tests.rs`).
 //!
 //! Gated on `full`: the `frps` bin carries `required-features = ["full"]`, so
 //! without the gate this file's `CARGO_BIN_EXE_frps` would fail to compile in
@@ -120,7 +125,9 @@ fn stderr_of(out: &Output) -> String {
 /// with the streams captured separately: stdout 38 bytes
 /// (`json: unknown field "notAKnownFrpKey"`), stderr 0 bytes.
 ///
-/// frp-rs now writes the same single bare line to stdout with stderr empty; the
+/// frp-rs now writes the same bare line to stdout with stderr empty; it is one
+/// line per rejected key, and this fixture has one key, so this is the N=1 pin
+/// (the N ≥ 2 count lives in `frp-core/src/config/tests.rs`). The
 /// wording stays frp-rs's own (`in config file <path>`) and is recorded in
 /// `docs/developing.md` § CLI exit codes. Asserting the exact bytes means a
 /// regression to a `tracing` record (ANSI, timestamp, level, target, the
@@ -142,7 +149,8 @@ fn bad_config_exits_1_and_names_the_unknown_field() {
     assert_eq!(
         stdout_of(&out),
         format!("{UNKNOWN_FIELD} in config file {cfg}\n"),
-        "frps -c <bad config> must print one bare line on stdout, like Go's \
+        "frps -c <bad config> must print one bare line on stdout for this one-key \
+         fixture (the N >= 2 case is N lines — see the module doc), like Go's \
          `fmt.Println(err)`; stderr={:?}",
         stderr_of(&out),
     );
@@ -729,7 +737,7 @@ fn disable_log_color_value_spelling_is_applied() {
 /// Both streams, ANSI stripped. Retained for the assertions that genuinely want
 /// "anywhere in the child's output" — the parser refusals, which go to stderr.
 /// The single-config **load** error is no longer wrapped in a `tracing` line
-/// (it is one bare line on stdout, see
+/// (it is bare line(s) on stdout, see
 /// [`bad_config_exits_1_and_names_the_unknown_field`]), so load-path assertions
 /// read `stdout_of` directly and thereby pin the stream as well. The stripping
 /// mirrors what `--disable-log-color` does to a log line and keeps a text
