@@ -386,7 +386,44 @@ impl Default for ServerConfig {
 impl ServerConfig {
     /// Apply conditional defaults matching Go frp dev (fatedier/frp@d486018)
     /// `ServerConfig.Complete()`. Call after deserialization, before consuming.
+    ///
+    /// **Call order is part of the contract.** Go runs this on the *merged*
+    /// config: `cmd/frps/root.go:97-99` completes the flags-only struct, and
+    /// `config.LoadServerConfig` completes the `-c` struct after the flags are
+    /// bound onto it. A caller that overlays CLI flags (or any other late
+    /// input) must therefore complete afterwards — take the file from
+    /// `load_server_config_uncompleted`, overlay, then complete — and never
+    /// complete first and overlay later. Two fields make the difference
+    /// observable: `bind_addr` (`""` filled to `0.0.0.0`) and
+    /// `web_server.addr` (`""` filled to `127.0.0.1`).
     pub fn complete(&mut self) {
+        // Go frp: `BindAddr = util.EmptyOr(BindAddr, "0.0.0.0")`
+        // (`pkg/config/v1/server.go:110`), which runs BEFORE the `ProxyBindAddr`
+        // and `BindPort` completions in the same function. An explicit
+        // `bindAddr = ""` therefore becomes `0.0.0.0` on Go; without this,
+        // frp-core handed the empty string to `TcpListener::bind`, which exits
+        // the process 1 with `failed to lookup address information` and binds
+        // nothing, where Go logs `frps tcp listen on 0.0.0.0:<port>`.
+        //
+        // Measured on Go v0.71.0 and frp-rs at the head of
+        // `fix/server-addr-completion` (base `80199f4`), config
+        // `bindAddr: ""` + `bindPort: 19815` (Go YAML) / `bind_addr = ""` +
+        // `bind_port = 19815` (frp-rs TOML), credentials set, `-c <file>`:
+        // Go v0.71.0 stderr/stdout `frps tcp listen on 0.0.0.0:19815`,
+        // `lsof -nP -iTCP:19815 -sTCP:LISTEN` → `frps ... TCP *:19815 (LISTEN)`,
+        // rc stays running until SIGTERM; frp-rs logged
+        // `frps starting on :19815` then `ERROR frps: frps error: failed to
+        // lookup address information...` and exited 1 with nothing listening.
+        //
+        // Only the **empty string** is filled: an ABSENT key never reaches this
+        // (the serde field default already supplies `0.0.0.0`), and any
+        // explicit non-empty address is used verbatim. This is *not* Go's
+        // `util.EmptyOr` on the other fields: Go's `EmptyOr` also maps the
+        // zero/empty value of `BindPort` (see below), while `BindAddr` is a
+        // string so `""` is the only empty value.
+        if self.bind_addr.is_empty() {
+            self.bind_addr = "0.0.0.0".into();
+        }
         // Go frp: `BindPort = util.EmptyOr(BindPort, 7000)` (v1/server.go:111)
         // — an EXPLICIT 0 maps to the default too; serde's default fn only
         // fires when the key is absent. Without this, `bindPort = 0` bound
@@ -395,6 +432,9 @@ impl ServerConfig {
             self.bind_port = 7000;
         }
         // When proxy_bind_addr is empty, inherit from bind_addr (Go compat).
+        // Go order matters here: `server.go:112-114` runs this AFTER
+        // `BindAddr = util.EmptyOr(...)` at `:110`, so an empty `bindAddr`
+        // inherits `0.0.0.0`, not `""`.
         if self.proxy_bind_addr.is_empty() {
             self.proxy_bind_addr = self.bind_addr.clone();
         }

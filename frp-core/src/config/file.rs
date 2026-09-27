@@ -9,7 +9,38 @@ use super::strict::{known_client_keys, known_server_keys};
 
 /// Load a server configuration from a file path, auto-detecting format by extension.
 /// When `strict_config` is true, unknown fields cause an error (Go frp default).
+///
+/// The returned config is **completed** ([`ServerConfig::complete`]). Callers
+/// that must overlay CLI-flag values on top of the file take the un-completed
+/// config from [`load_server_config_uncompleted`] instead — see that function
+/// for why the distinction exists.
 pub fn load_server_config(
+    path: &str,
+    strict_config: bool,
+) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+    let mut cfg = load_server_config_uncompleted(path, strict_config)?;
+    cfg.complete();
+    Ok(cfg)
+}
+
+/// Load a server configuration from a file path **without** running
+/// [`ServerConfig::complete`].
+///
+/// This exists to mirror Go's ordering. Go's `cmd/frps/root.go` binds the flag
+/// values straight onto the config struct and calls `serverCfg.Complete()` only
+/// afterwards (`cmd/frps/root.go:97-99` for the flags-only path; the
+/// `-c` path completes inside `config.LoadServerConfig`), so on Go a flag value
+/// is always seen by `Complete()`. frp-rs loads the file first and overlays the
+/// flags afterwards, so an override written after `complete()` lands on an
+/// already-completed value and can no longer re-trigger a completion:
+/// `--dashboard-addr ""` could not re-run Go's `WebServer.Complete()` fill
+/// (`pkg/config/v1/common.go:71-72` → `127.0.0.1`) and `--bind-addr ""` could
+/// not be filled to `0.0.0.0` (`pkg/config/v1/server.go:110`).
+///
+/// The `transport` completion (`complete_with_heartbeat_timeout_set`) still runs
+/// here: it is not safely re-runnable (it keys off the *presence* of
+/// `serverHeartbeatTimeout` in the file) and no CLI flag overrides its result.
+pub fn load_server_config_uncompleted(
     path: &str,
     strict_config: bool,
 ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
@@ -22,7 +53,6 @@ pub fn load_server_config(
     )?;
     cfg.transport
         .complete_with_heartbeat_timeout_set(presence.server_heartbeat_timeout_set);
-    cfg.complete();
     Ok(cfg)
 }
 

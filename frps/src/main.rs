@@ -2,7 +2,9 @@ use std::path::Path;
 use std::process;
 
 use frp_core::cli::{parse_frps_args, FrpsArgs};
-use frp_core::config::{collect_config_files, load_server_config, ServerConfig};
+use frp_core::config::{
+    collect_config_files, load_server_config, load_server_config_uncompleted, ServerConfig,
+};
 use frp_core::logging;
 use frp_core::unsafe_features::UnsafeFeatures;
 use frp_server::service::Service;
@@ -169,9 +171,17 @@ async fn run(mut cli: FrpsArgs) {
         return;
     }
 
-    // Single config mode: load config first, then init logging with [log] fallback
+    // Single config mode: load config first, then init logging with [log] fallback.
+    //
+    // Go ordering: Go binds the flag values onto the config struct and only then
+    // calls `ServerConfig.Complete()` (`cmd/frps/root.go:97-99`), so a flag value
+    // is always seen by the completion. frp-rs loads the file, overlays the CLI
+    // flags, and completes the merged result — the same effective order. See
+    // `load_server_config_uncompleted` for the two flags (`bind_addr`,
+    // `web_server.addr`) where writing the override after `complete()` was
+    // observable, and `docs/developing.md` § CLI inputs.
     let config_path = cli.config_path();
-    let mut cfg = match load_server_config(&config_path, cli.strict_config) {
+    let mut cfg = match load_server_config_uncompleted(&config_path, cli.strict_config) {
         Ok(cfg) => cfg,
         Err(e) => {
             init_logging(&cli, None);
@@ -190,6 +200,8 @@ async fn run(mut cli: FrpsArgs) {
     if cli.cli_overrides_enabled() {
         cli.override_server_config(&mut cfg);
     }
+    // Completion runs on the merged config, never before it (Go order).
+    cfg.complete();
     init_logging(&cli, Some(&cfg));
 
     tracing::info!(version = %frp_core::VERSION, "frps (Rust) v{} starting...", frp_core::VERSION);
