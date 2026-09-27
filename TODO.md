@@ -2685,7 +2685,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `TODO.md` `:2339`/`:2360`, and `CHANGELOG.md` `:382`
   (`admin server failed: failed to lookup address information …`) — that one *is* a sweep hit too,
   but it is the frpc admin-address history the sentence above already accounts for.)
-- [ ] **`frps` has no `Log.Complete()`: an explicit empty `--log-level`/`--log-file` silences its
+- [x] **`frps` has no `Log.Complete()`: an explicit empty `--log-level`/`--log-file` silences its
   **logging** (the listener still comes up), where Go falls back to `info`/`console`.** Go's `ServerConfig.Complete()` calls
   `c.Log.Complete()` (`pkg/config/v1/server.go:105`), which is
   `To = util.EmptyOr(To, "console")`, `Level = util.EmptyOr(Level, "info")`,
@@ -2709,6 +2709,66 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   spawn test per shape that asserts the server still logs, plus a Go-binary measurement row each for
   `--log-level ""`, `--log-file ""` and `--log-max-days 0`; absent values must keep the serde
   default, and `--log-format` has no Go completion (verify that before touching it).
+  Done on `fix/log-complete` at `4c3112a` (based on `05d62c4`). `LogConfig::complete`
+  (`frp-core/src/config/server.rs`) is the three `util.EmptyOr` fills; it is called from
+  `ServerConfig::complete` as the **first** field completion (Go's slot: `server.go:105`, after
+  `Auth.Complete()` at `:102`, before `Transport`/`WebServer`/`SSHTunnelGateway` at `:106-108`) and
+  from `ClientConfig::complete_with_heartbeat_set` — the **sibling slot**, see the client note below.
+  The raw CLI values are also treated as absent when empty (`resolve_log_level` /
+  `resolve_log_file` in `frp-core/src/logging.rs`), because Go binds each flag to its own default
+  (`pkg/config/flags.go:161-163`) so `--log_level ""` reaches `LogConfig.Complete()` as the zero
+  value, not as a literal empty level.
+  **Measured** (this box, 2026-09-28, Go v0.71.0 `/private/tmp/frp_0.71.0_darwin_arm64/frps`,
+  base = clean `main` build, own empty CWD and own free port per case, stdout and stderr redirected
+  to **separate** files and counted in bytes **before any signal** — the totals after SIGTERM are
+  reported separately because the graceful-shutdown lines land there; rc read from `wait` on the
+  direct child, never through a pipe):
+  * config-file lane (`-c`, Go YAML / frp-rs TOML, `[log]` values identical, all with
+    `bindAddr`/`bind_port` + token): Go is 273 B stdout / 0 B stderr / 4 lines / listener up in
+    **all five** shapes; frp-rs **base** is 0 B/0 B for `to = ""` and for `level = ""` (listener up)
+    and 1498 B/0 B for `absent`, `to=""`-only-with-level-absent is 1498 B, `maxDays = 0` is 1498 B;
+    frp-rs **head** is 1498 B/0 B and 7 INFO lines in every shape, with no log file created.
+  * flags-only lane (`frps --bind-port <free>` + one log flag, own empty CWD): Go `--log-level ""`
+    / `--log-file ""` / `--log-max-days 0` each 282 B stdout / 0 B stderr / 3 lines / listener up
+    (`--log-format ""` is `Error: unknown flag: --log-format` + usage, 2368 B **stderr**, rc 1);
+    frp-rs **base** `--log-level ""` → 0 B/0 B and `--log-file ""` → 0 B/0 B **plus a
+    `frps.log.2026-09-27` written in the CWD** (2434 B after SIGTERM), `--log-max-days 0` →
+    1498 B/0 B with cleanup disabled; frp-rs **head** all three → 1498 B stdout / 0 B stderr /
+    7 lines / listener up / no file created. Absent values are unchanged (1498 B before and after).
+  Pins: `log_config_absent_keys_keep_serde_defaults_and_empty_ones_are_filled`,
+  `log_config_completion_leaves_format_alone`,
+  `server_and_client_config_completion_both_fill_the_log_section`,
+  `resolve_log_level_treats_empty_cli_value_as_absent`,
+  `resolve_log_file_treats_empty_cli_value_as_absent`,
+  `rust_log_outranks_the_configured_level` +
+  `parse_level_maps_known_and_unknown` (`frp-core/src/config/tests.rs`,
+  `frp-core/src/logging.rs`), and the bounded spawn file `frps/tests/log_completion.rs`
+  (4 tests; **0 passed / 4 failed** against a pre-fix `FRPS_BIN`, all four green here).
+  **`--log-format` was verified and deliberately not touched**: Go v0.71.0's `LogConfig`
+  (`pkg/config/v1/common.go:103-117`) has no `Format` field and the real binary refuses the flag
+  (measurement above); frp-rs's `--log-format` is an extension and `resolve_log_format` already maps
+  `""` → `"text"`.
+  **The client sibling had the same hole and is fixed in the same commit**: Go's
+  `ClientCommonConfig.Complete()` calls `c.Log.Complete()` (`pkg/config/v1/client.go:94`), and that
+  path runs for every client load — `config.LoadClientConfigResult` → `result.Common.Complete()`
+  (`pkg/config/load.go:392`), i.e. the `-c` lane too, not the server's flags-only exception. Measured
+  on frpc against a live frps (own ports, both streams separate): base with
+  `[log] to = "" level = "" maxDays = 0` or `level = ""` in the config → **0 B/0 B with the TCP proxy
+  listening**; head → 2380 B stdout / 0 B stderr / 10 lines, identical to the absent control.
+  Carriers: `docs/config.md` `[log]` rows (`level`/`file`/`max_days` now state the completion and that
+  an explicit empty/zero is filled; `format` says it is an frp-rs extension with no Go completion and
+  the old "console (default, stderr)" slip is corrected to stdout), `CHANGELOG.md` under `### Fixed`,
+  and the CI step `Run frps's log-completion spawn tests`
+  (`cargo test -p frps --features dashboard --test log_completion`) — the fourth `frps` test target,
+  which no lane executed before.
+  Guards: **none moved.** `frps/tests/cli_exit_codes.rs` is untouched, so `env.FRPS_CLI_TESTS` stays
+  `"27"` (`.github/workflows/ci.yml`, `-- --list` = 27) and `FRPC_TINY_CLI_TESTS` stays `"11"`
+  (`-- --list` = 11; the default-feature frpc file lists 10). Gates at the head: fmt clean, clippy
+  `-p frp-core -p frps -p frpc --all-targets --all-features -D warnings` clean, `cargo test -p
+  frp-core --lib` 961/0, `cargo test -p frps` 0+6+27+4/0, `cargo test -p frpc` 8+25+10+34+7+1/0,
+  tiny `cargo test -p frpc --no-default-features --features tiny --test cli_exit_codes` 11/0,
+  `bash scripts/repo-health.sh` rc 0. `scripts/compat-test.sh` is **not relevant**: this is a
+  config-completion change on the logging surface and moves no wire byte.
 - [x] **Two test-harness hazards: a feature swap that breaks the dashboard lane silently, and
   `FrpsHandle::start` orphaning its child on the panic path.**
   * **(a) `cargo test -p frps` and a clippy run that compiles `frps` replace `target/debug/frps`
