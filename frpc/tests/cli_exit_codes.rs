@@ -224,8 +224,9 @@ fn verify_missing_config_exits_1() {
         stderr_of(&out),
     );
     assert!(
-        stdout_of(&out).contains(&missing),
-        "the refusal must name the missing config file on stdout; stdout={:?} stderr={:?}",
+        stdout_of(&out).starts_with(&format!("Config file {missing} is invalid: {missing}:")),
+        "the refusal must be on stdout and must name the missing config file; stdout={:?} \
+         stderr={:?}",
         stdout_of(&out),
         stderr_of(&out),
     );

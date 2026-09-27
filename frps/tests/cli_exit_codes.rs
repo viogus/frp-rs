@@ -171,8 +171,10 @@ fn missing_config_exits_1() {
         stderr_of(&out),
     );
     assert!(
-        stdout_of(&out).contains(&missing),
-        "the load error must name the missing config file on stdout; stdout={:?} stderr={:?}",
+        stdout_of(&out).starts_with(&format!("{missing}: failed to read config file:")),
+        "the load error must be one **bare** line on stdout — it starts with the path, with no \
+         log prefix (timestamp/level/target) and no ANSI escape — and must name the missing \
+         config file; stdout={:?} stderr={:?}",
         stdout_of(&out),
         stderr_of(&out),
     );
