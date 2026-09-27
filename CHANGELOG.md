@@ -208,6 +208,29 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **`frpc` no longer crashes at shutdown when two or more visitors share a
+  `bind_port`.** Both the explicit multi-visitor config (`[v1]`/`[v2]`/`[v3]` with
+  one `bind_port`) and the legacy `[range:...] … role = visitor` template form
+  started normally and then panicked on `SIGTERM`
+  (`panicked at tokio-1.53.1/src/runtime/task/core.rs:427: JoinHandle polled after
+  completion`), exiting **101** in the debug profile — and the release profile is
+  built with `panic = "abort"`, so the same panic aborts the process instead of
+  shutting it down. The visitors that lose the bind race finish their listener
+  task immediately while the winner stays parked in `accept()`; the visitor
+  teardown then awaited the finished tasks' join handles a second time, which
+  tokio panics on. Shutdown now skips handles that are already finished, so each
+  handle is awaited at most once. Measured before/after (Rust `frps` + `frpc`,
+  free ports, children reaped): explicit three visitors on one `bind_port` 3/3
+  panics (rc 101) → **0/5 (rc 0)**; the `[range:rv] … role = visitor` form 3/3 →
+  **0/5 (rc 0)**; and the same defect without a shared port — two visitors on
+  distinct `bind_port`s with one port already held — 3/3 → **0/3**. Single-visitor
+  shutdown and visitor sets on distinct ports were already clean and stay clean
+  (rc 0), the 500 ms shutdown grace is unchanged, and each run still logs exactly
+  the two `Address already in use` lines for the visitors that lose the bind race,
+  the shape Go frp v0.71.0 produces. Go parity note: on the default TCP transport
+  Go is killed by `SIGTERM` (rc 143 — its handler is installed only for kcp/quic,
+  `cmd/frpc/sub/root.go:206-209`) while logging those same two lines; with
+  `protocol = kcp` the same config exits 0. frp-rs now exits 0 on both.
 - **The five persistent rootCmd flags are now accepted — and ignored — on every
   `frpc` subcommand — a behaviour change.** Go registers `-c`/`--config`,
   `--config-dir`, `--strict-config`, `--allow-unsafe` and `-v`/`--version` on
