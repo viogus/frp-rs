@@ -481,6 +481,24 @@ fn ephemeral_port() -> u16 {
     probe.local_addr().expect("local_addr").port()
 }
 
+/// An ephemeral port **held** by the returned listener for as long as the
+/// binding lives, with its number.
+///
+/// [`ephemeral_port`] releases its probe, which is fine for a test that only
+/// needs a number. A test that must *hold* the port — to prove that a command
+/// which should not bind, does not — cannot reuse it: between the probe's drop
+/// and the re-bind, another test running in parallel in this same binary can
+/// take the port. That is a measured harness fault here, not a hypothesis: the
+/// first cut of `verify_valid_config_prints_go_line_and_exits_0` used
+/// `ephemeral_port()` and then re-bound it, and a full-file run collided with
+/// `verify_resolves_leading_root_flags_and_ignores_the_rest` doing the same
+/// thing, failing on `AddrInUse` (os error 48) rather than on the assertion.
+fn held_port() -> (std::net::TcpListener, u16) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("hold an ephemeral port");
+    let port = listener.local_addr().expect("local_addr").port();
+    (listener, port)
+}
+
 fn valid_config(dir: &TempDir, port: u16) -> String {
     dir.write(
         "goodfrps.toml",
@@ -1069,39 +1087,445 @@ fn config_dir_dash_value_now_reaches_the_directory_read() {
     );
 }
 
-/// The item's third row, pinned **because it is sequencing, not parity**: Go has
-/// `frps verify`, frp-rs does not. Measured on Go v0.71.0:
-/// `frps verify -c --strict-config=false` is rc 1 `open --strict-config=false: no
-/// such file or directory`; here the rewrite lets `-c` consume its value, so the
-/// missing subcommand is now the first error.
+/// The item's third row, **re-pointed** now that `frps verify` exists — this was
+/// the tripwire the `frps verify` item (`TODO.md`, "Go has `frps verify`, frp-rs
+/// has no `frps verify` at all") was told to expect, and it is re-pointed rather
+/// than deleted.
 ///
-/// **This test is a tripwire and its cheapest future fix is deletion — do not
-/// take it.** Implementing `frps verify` makes this test fail; that is the
-/// intended signal, and the fix is to move the pin to whatever the row now
-/// reports (and the matching row in `docs/developing.md` § CLI inputs), not to
-/// delete the test. The reason lives here and in the `frps verify` item in
-/// `TODO.md`, which carries the same warning.
+/// What it pinned before: with the shared dash-value rewrite in place,
+/// `frps verify -c --strict-config=false` reported `` `verify` is not expected in
+/// this context `` — the missing subcommand was the *first* error, because the
+/// rewrite attaches `--strict-config=false` to `-c` as its value. `verify` is a
+/// real command now, so that first error is gone; the rewrite is still the
+/// reason the value is attached, and the first error is now the config read.
+///
+/// Measured on Go v0.71.0 with the two streams captured separately and the exit
+/// status read directly from the child: rc **1**, stdout exactly
+/// `open --strict-config=false: no such file or directory`, stderr 0 bytes. This
+/// test pins the same rc, the same stream, and the two facts that make it the
+/// *same row*: the output **names `--strict-config=false` as the path** (so the
+/// rewrite still put it in the value position) and it is **not** an
+/// unexpected-token refusal (so `verify` was resolved and the loader ran).
 #[test]
-fn verify_subcommand_is_now_the_first_error_for_a_dash_config_value() {
+fn verify_subcommand_resolves_so_the_dash_config_value_is_the_first_error() {
     let out = run_frps(&["verify", "-c", "--strict-config=false"]);
 
     assert_eq!(
         out.status.code(),
         Some(1),
-        "frp-rs has no `frps verify`; the unknown subcommand is rc 1 \
+        "the value-position path must reach the loader and fail there, as Go does \
          (stdout={:?} stderr={:?})",
         stdout_of(&out),
         stderr_of(&out),
     );
+    assert!(
+        stdout_of(&out).starts_with("--strict-config=false: failed to read config file:"),
+        "the first error must be the config read, on **stdout**, naming \
+         `--strict-config=false` as the path — that is what shows the rewrite consumed it as \
+         `-c`'s value and `verify` was resolved as the command; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stderr_of(&out).is_empty(),
+        "the refusal is a bare stdout line like Go's `fmt.Println(err)`; stderr={:?}",
+        stderr_of(&out),
+    );
     let all = combined(&out);
     assert!(
-        all.contains("verify") && all.contains("not expected"),
-        "the current first error must be the unknown `verify` subcommand, not a `-c` refusal; \
+        !all.contains("not expected"),
+        "the argv must no longer be refused for the bare word `verify` — the command exists; \
          output={all:?}"
     );
     assert!(
         !all.contains("-c` requires an argument"),
         "the `-c` value must have been consumed by the rewrite; output={all:?}"
+    );
+}
+
+// ── `frps verify` (Go's verifyCmd) ──────────────────────────────────────────
+
+/// Go v0.71.0, streams captured separately, exit status read directly from the
+/// child: `frps verify -c <valid config>` is rc **0**, stdout exactly
+/// `frps: the configuration file <path> syntax is ok\n`, stderr 0 bytes
+/// (`cmd/frps/verify.go:56`). The base binary answered rc 1 `` `verify` is not
+/// expected in this context `` on stderr for this argv — a *valid* config
+/// reported as a failure by the one command whose job is to say whether it is
+/// valid.
+///
+/// The config's `bindPort` is **held** by this test's own listener for the whole
+/// run. `verify` reads and validates a config; it never binds
+/// (`cmd/frps/verify.go` calls `LoadServerConfig` + `ValidateServerConfig` and
+/// returns), so a version of `verify` that fell through to the run path would
+/// fail right here instead of passing. Nothing is timed and nothing is
+/// reaped — the listener is this test's own socket, dropped at the end.
+#[test]
+fn verify_valid_config_prints_go_line_and_exits_0() {
+    let (_held, port) = held_port();
+    let dir = TempDir::new();
+    let cfg = valid_config(&dir, port);
+
+    let out = run_frps(&["verify", "-c", &cfg]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "`frps verify -c <valid>` must exit 0 like Go (stdout={:?} stderr={:?})",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert_eq!(
+        stdout_of(&out),
+        format!("frps: the configuration file {cfg} syntax is ok\n"),
+        "the success line is Go's, byte for byte — one bare stdout line, no ANSI and no log \
+         prefix; stderr={:?}",
+        stderr_of(&out),
+    );
+    assert!(
+        stderr_of(&out).is_empty(),
+        "Go writes nothing on stderr for this row; stderr={:?}",
+        stderr_of(&out),
+    );
+}
+
+/// The failure half of the same surface, both shapes of "bad config": an unknown
+/// key under the default (strict) mode and a value that does not fit its type.
+/// Measured on Go v0.71.0, streams separated, rc read directly — both are rc
+/// **1** with one bare line on **stdout** and 0 bytes on stderr
+/// (`cmd/frps/verify.go:41-44`: `fmt.Println(err); os.Exit(1)`):
+///
+/// ```text
+/// frps verify -c <unknown-key>   → stdout `json: unknown field "notAKnownFrpKey"`
+/// frps verify -c <string bindPort> → stdout `field "bindPort": cannot unmarshal string into int`
+/// ```
+///
+/// The frp-rs wording is frp-rs's own (it names the config path — see
+/// `docs/developing.md` § CLI exit codes), so these assert rc + stream + the
+/// identifying fragment rather than Go's exact bytes; the *line shape* is what
+/// would regress if a `tracing` record came back, and the assertions below catch
+/// that.
+#[test]
+fn verify_invalid_config_exits_1_with_the_load_error_on_stdout() {
+    let dir = TempDir::new();
+    let bad_key = dir.write("badfrps.toml", BAD_CONFIG);
+    let bad_port = dir.write("badportfrps.toml", "bindPort = \"not-a-port\"\n");
+
+    // (config, identifying fragment, whether the fragment leads the line). The
+    // two failure shapes put the path in different places: the strict-key
+    // collector's message ends with `in config file <path>`, while the loader
+    // wraps the serde type error with the path as a **prefix**. Both are one
+    // bare line, which is the claim that would regress if a `tracing` record
+    // came back.
+    let rows: [(&str, &str, bool); 2] = [
+        (&bad_key, UNKNOWN_FIELD, true),
+        (
+            &bad_port,
+            "config validation error: invalid type: string \"not-a-port\"",
+            false,
+        ),
+    ];
+    for (cfg, fragment, fragment_leads) in rows {
+        let out = run_frps(&["verify", "-c", cfg]);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "`frps verify -c {cfg}` must exit 1 like Go (stdout={:?} stderr={:?})",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        let stdout = stdout_of(&out);
+        assert!(
+            stdout.contains(fragment) && stdout.contains(cfg),
+            "the load error must name both the fault ({fragment:?}) and the config file; \
+             stdout={stdout:?} stderr={:?}",
+            stderr_of(&out),
+        );
+        assert!(
+            stdout.ends_with('\n') && stdout.lines().count() == 1,
+            "the load error must be exactly one bare line on stdout for this one-fault fixture \
+             — no timestamp/level/target prefix and no ANSI escape; stdout={stdout:?} \
+             stderr={:?}",
+            stderr_of(&out),
+        );
+        if fragment_leads {
+            assert!(
+                stdout.starts_with(fragment),
+                "this row's message leads with the fault; stdout={stdout:?}"
+            );
+        } else {
+            assert!(
+                stdout.starts_with(cfg),
+                "the loader wraps this row's message with the path as a prefix; stdout={stdout:?}"
+            );
+        }
+        assert!(
+            stderr_of(&out).is_empty(),
+            "Go writes this refusal to stdout only; stderr={:?}",
+            stderr_of(&out),
+        );
+    }
+}
+
+/// The missing-file row on the new subcommand: same failure class, same code and
+/// same stream as the run path. Measured on Go v0.71.0: rc 1, stdout
+/// `open <path>: no such file or directory`, stderr 0 bytes.
+///
+/// The assertion is a **prefix** pin (frp-rs names the path, then its own
+/// wording), matching `missing_config_exits_1` on the run path.
+#[test]
+fn verify_missing_config_exits_1_naming_the_path() {
+    let dir = TempDir::new();
+    let missing = dir.path("does-not-exist.toml");
+
+    let out = run_frps(&["verify", "-c", &missing]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "`frps verify -c <missing>` must exit 1 like Go (stdout={:?} stderr={:?})",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stdout_of(&out).starts_with(&format!("{missing}: failed to read config file:")),
+        "the load error must be one bare stdout line naming the missing path, with no log \
+         prefix and no ANSI escape; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stderr_of(&out).is_empty(),
+        "Go writes nothing on stderr for this failure; stderr={:?}",
+        stderr_of(&out),
+    );
+}
+
+/// `frps verify` with **no** `-c` is not an error in Go, and that is a property
+/// of `frps`, not of `verify`: its `-c` default is the empty string
+/// (`cmd/frps/root.go:44`), and `verifyCmd` answers an empty `cfgFile` with
+/// `frps: the configuration file is not specified` + `return nil`
+/// (`cmd/frps/verify.go:36-39`). Measured on Go v0.71.0: rc **0**, stdout exactly
+/// that line, stderr 0 bytes.
+///
+/// `frpc` is the opposite (its `-c` defaults to `./frpc.ini`), so this row is
+/// deliberately not shared with the client's verify tests.
+#[test]
+fn verify_without_a_config_file_is_not_an_error() {
+    let out = run_frps(&["verify"]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an absent `-c` is rc 0 on Go for `frps verify` (stdout={:?} stderr={:?})",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert_eq!(
+        stdout_of(&out),
+        "frps: the configuration file is not specified\n",
+        "Go's exact line for this branch (`cmd/frps/verify.go:37`); stderr={:?}",
+        stderr_of(&out),
+    );
+    assert!(
+        stderr_of(&out).is_empty(),
+        "Go writes nothing on stderr for this row; stderr={:?}",
+        stderr_of(&out),
+    );
+}
+
+/// `--strict-config=false` must reach the verify loader in **every** flag
+/// position Go accepts, because Go's `verifyCmd` reads the same persistent
+/// pflag: after `-c`, before the command, and after the command.
+///
+/// Measured on Go v0.71.0 against a config with an unknown top-level key (rc 0,
+/// `frps: the configuration file <path> syntax is ok`, stderr 0):
+///
+/// ```text
+/// frps verify -c bad.toml --strict-config=false   → rc 0
+/// frps verify --strict-config=false -c bad.toml   → rc 0
+/// frps --strict-config=false verify -c bad.toml   → rc 0
+/// frps --strict_config=false verify -c bad.toml   → rc 0   (the `_` alias, same pflag)
+/// ```
+///
+/// The third and fourth rows only work because the hoist resolves a command that
+/// follows root flags: the base binary answered rc 1 `` `verify` is not expected
+/// in this context `` for them. The `=false` value is the discriminating half —
+/// with strict on, the same config is rc 1 (the next test) — so these rows pin
+/// the *value* arriving, not merely the command being found.
+#[test]
+fn verify_strict_config_false_is_lenient_in_every_flag_order() {
+    let dir = TempDir::new();
+    let cfg = dir.write("badfrps.toml", BAD_CONFIG);
+    let expected = format!("frps: the configuration file {cfg} syntax is ok\n");
+
+    for args in [
+        &["verify", "-c", &cfg, "--strict-config=false"][..],
+        &["verify", "--strict-config=false", "-c", &cfg][..],
+        &["--strict-config=false", "verify", "-c", &cfg][..],
+        &["--strict_config=false", "verify", "-c", &cfg][..],
+    ] {
+        let out = run_frps(args);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?} must verify leniently, as Go does (stdout={:?} stderr={:?})",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        assert_eq!(
+            stdout_of(&out),
+            expected,
+            "{args:?} must print Go's success line for the same config; stderr={:?}",
+            stderr_of(&out),
+        );
+        assert!(
+            stderr_of(&out).is_empty(),
+            "{args:?} is the Go-faithful `=` spelling and must not warn; stderr={:?}",
+            stderr_of(&out),
+        );
+    }
+}
+
+/// The other side of the same flag: strict is still the default and still
+/// refuses the unknown key — in the bare, `=true` and space-separated spellings.
+///
+/// Measured on Go v0.71.0 against the unknown-key config: rc 1 with
+/// `json: unknown field "notAKnownFrpKey"` on stdout for `--strict-config`,
+/// `--strict-config=true` **and** the space form `--strict-config true` (pflag's
+/// bool does not consume `true`; the token is a positional `verifyCmd` ignores,
+/// so strict stays at its `true` default). The space form is the one row where
+/// frp-rs deliberately reads the token as the value — the documented extension —
+/// and it prints its warning on stderr; strict is `true` there too, so the
+/// verdict and rc agree with Go and only the warning is extra.
+#[test]
+fn verify_strict_config_true_still_refuses_the_unknown_key() {
+    let dir = TempDir::new();
+    let cfg = dir.write("badfrps.toml", BAD_CONFIG);
+    let warning = frp_core::cli::STRICT_CONFIG_SPACE_FORM_WARNING;
+
+    // (argv, is the space-separated extension). The flag is spelled out per row
+    // rather than sniffed from the argv.
+    let rows: [(&[&str], bool); 3] = [
+        (&["verify", "-c", &cfg, "--strict-config"], false),
+        (&["verify", "--strict-config=true", "-c", &cfg], false),
+        (&["verify", "--strict-config", "true", "-c", &cfg], true),
+    ];
+    for (args, is_space_form) in rows {
+        let out = run_frps(args);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{args:?} must refuse the unknown key under strict mode, as Go does \
+             (stdout={:?} stderr={:?})",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        assert!(
+            stdout_of(&out).starts_with(UNKNOWN_FIELD),
+            "{args:?} must report the unknown field on stdout; stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        let warned = stderr_of(&out).contains(warning);
+        assert_eq!(
+            warned,
+            is_space_form,
+            "{args:?}: the space form is the frp-rs extension and warns exactly once, every \
+             other spelling is Go-faithful and silent; stderr={:?}",
+            stderr_of(&out),
+        );
+    }
+}
+
+/// The `frps` root flags around the command, from the hoist's two directions:
+/// a leading **value-taking** flag must not swallow the command, and a leading
+/// **bool** flag must not either — while both keep their own value.
+///
+/// Measured on Go v0.71.0, each with its own free port and config, streams
+/// separated, rc read directly (all rc 0, `frps: the configuration file <path>
+/// syntax is ok`, stderr 0):
+///
+/// ```text
+/// frps -c good.toml verify                          → the command resolves after `-c`
+/// frps -p <free> verify -c good.toml                → `-p` swallows its port, not `verify`
+/// frps --tls-only verify -c good.toml               → `--tls-only` is a pflag bool, so `verify` survives
+/// frps --enable-prometheus verify -c good.toml      → same
+/// frps verify --bind-port <free> -c good.toml       → a root flag after the command is accepted
+/// frps verify --allow-unsafe X --version -c good.toml → accepted and ignored: no version is printed
+/// frps verify -c good.toml -c later.toml            → pflag last-wins on the persistent `-c`
+/// ```
+///
+/// The counter-example that keeps this honest is `--dashboard-tls-mode`, which is
+/// **not** a pflag bool on Go (`VarP(BoolFuncFlag{…})`, `pkg/config/flags.go:256`)
+/// and therefore *does* swallow `verify`: Go then starts the server instead of
+/// verifying. It is not asserted here — frp-rs models that flag as a bool and
+/// refuses the leftover token instead (rc 1, a recorded divergence in
+/// `docs/developing.md` § CLI inputs) — but it is the row that decides the
+/// exemption list in `consumes_value`.
+#[test]
+fn verify_resolves_leading_root_flags_and_ignores_the_rest() {
+    let dir = TempDir::new();
+    let (_held, port) = held_port();
+    let cfg = valid_config(&dir, port);
+    let expected = format!("frps: the configuration file {cfg} syntax is ok\n");
+    // The two flag *values* below are never bound (`verify` binds nothing), so
+    // a fresh ephemeral port is only a way to avoid a literal that could be a
+    // real service on the runner.
+    let swallowed = ephemeral_port().to_string();
+    let after_cmd = ephemeral_port().to_string();
+
+    let rows: [Vec<&str>; 6] = [
+        vec!["-c", &cfg, "verify"],
+        vec!["-p", swallowed.as_str(), "verify", "-c", &cfg],
+        vec!["--tls-only", "verify", "-c", &cfg],
+        vec!["--enable-prometheus", "verify", "-c", &cfg],
+        vec!["verify", "--bind-port", after_cmd.as_str(), "-c", &cfg],
+        vec!["verify", "--allow-unsafe", "X", "--version", "-c", &cfg],
+    ];
+    for args in &rows {
+        let out = run_frps(args);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?} must verify, as Go does (stdout={:?} stderr={:?})",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        assert_eq!(
+            stdout_of(&out),
+            expected,
+            "{args:?} must print the verify success line — and for `--version` that is the \
+             discriminator: Go prints a version only from the root command's `RunE`, never from \
+             `verifyCmd`; stderr={:?}",
+            stderr_of(&out),
+        );
+        assert!(
+            stderr_of(&out).is_empty(),
+            "{args:?} must not warn; stderr={:?}",
+            stderr_of(&out),
+        );
+    }
+
+    let later = dir.write(
+        "laterfrps.toml",
+        &format!(
+            "bindAddr = \"127.0.0.1\"\nbindPort = {}\n[auth]\ntoken = \"cli-exit-test\"\n",
+            ephemeral_port()
+        ),
+    );
+    let out = run_frps(&["verify", "-c", &cfg, "-c", &later]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a repeated `-c` on `verify` is pflag last-wins, as on Go (stdout={:?} stderr={:?})",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert_eq!(
+        stdout_of(&out),
+        format!("frps: the configuration file {later} syntax is ok\n"),
+        "the **last** `-c` is the one loaded, as Go's StringVar makes it; stderr={:?}",
+        stderr_of(&out),
     );
 }
 
@@ -1200,5 +1624,95 @@ fn repeated_config_flags_refuse_with_the_multiple_times_message() {
     assert!(
         !all.contains("-c` requires an argument"),
         "the first `-c` must have taken `--strict-config=false` as its value; output={all:?}"
+    );
+}
+
+/// `frps verify` must refuse the two **frp-rs-only** `frps` root flags, because
+/// Go's `frps` refuses them. Measured on Go v0.71.0 with the streams separated
+/// and the exit status read directly: `frps verify --log-format json -c <valid>`
+/// and `frps verify --config-dir <dir> -c <valid>` are each rc **1**, stdout
+/// 0 B, stderr `Error: unknown flag: --log-format` / `--config-dir` plus the
+/// usage block.
+///
+/// This is the pin for the round's one behavioural fix: before it,
+/// `frps verify --log-format json -c <valid>` printed
+/// `frps: the configuration file <valid> syntax is ok` and exited **0** — a
+/// validation command reporting success for an argv Go rejects, which is the
+/// exact reason `--config-dir` was already refused on this branch. The control
+/// at the end keeps the fix from over-reaching: both flags are *documented
+/// extensions on the run path*, and the run path still parses them there.
+///
+/// The two flags are the complete extension set (measured by diffing the two
+/// binaries' rendered `--help` flag lists: frp-rs-only = {`config-dir`,
+/// `log-format`}, Go-only = {`vhost-http-timeout`}).
+#[test]
+fn verify_refuses_the_two_frp_rs_only_root_flags_like_go() {
+    let port = ephemeral_port();
+    let dir = TempDir::new();
+    let cfg = valid_config(&dir, port);
+    let missing = dir.path("does-not-exist.toml");
+
+    for (args, flag) in [
+        (
+            vec!["verify", "--log-format", "json", "-c", cfg.as_str()],
+            "--log-format",
+        ),
+        (
+            vec!["verify", "--log-format=json", "-c", cfg.as_str()],
+            "--log-format",
+        ),
+        (
+            vec!["verify", "--log_format", "json", "-c", cfg.as_str()],
+            "--log_format",
+        ),
+        (
+            vec!["verify", "--config-dir", "conf.d", "-c", cfg.as_str()],
+            "--config-dir",
+        ),
+        (
+            vec!["verify", "--config_dir", "conf.d", "-c", cfg.as_str()],
+            "--config_dir",
+        ),
+    ] {
+        let out = run_frps(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{args:?} must be refused with rc 1, as Go refuses it \
+             (stdout={:?} stderr={:?})",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        assert!(
+            stdout_of(&out).is_empty(),
+            "{args:?} must not reach the loader at all — no `syntax is ok`, and no load \
+             error either, because the flag is refused first; stdout={:?}",
+            stdout_of(&out),
+        );
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(flag) && stderr.contains("not expected"),
+            "{args:?} must name {flag} as the token it could not place; stderr={stderr:?}",
+        );
+    }
+
+    // Control: the run path still accepts the same extension, so the refusal
+    // above is about the *verify* surface and not about dropping the flag. The
+    // witness is the load error naming the missing path — a parse refusal would
+    // name the flag instead and print nothing.
+    let out = run_frps(&["--log-format", "json", "-c", &missing]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the run path must still parse --log-format (stdout={:?} stderr={:?})",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stdout_of(&out).starts_with(&format!("{missing}: failed to read config file:")),
+        "the run path must have accepted --log-format and reached the loader; \
+         stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
     );
 }

@@ -12,6 +12,52 @@ User-facing release notes for frp-rs.
 ## Unreleased
 
 ### Features
+- **`frps verify` now exists**, so a script that validates a server config can
+  use frp-rs at all. Go has had the subcommand all along; frp-rs's server CLI
+  registered only the run path, so `frps verify -c frps.toml` on a **valid**
+  config exited 1 with ``Error: `verify` is not expected in this context`` — the
+  one command whose job is to say whether a config is valid reported a good
+  config as bad, and there was no way to ask frp-rs to check a server config. It
+  now mirrors Go's `verifyCmd`: `frps: the configuration file <path> syntax is
+  ok` on **stdout** with exit **0** for a valid config, one bare stdout line and
+  exit **1** for a bad or missing one, and `--strict-config`/`--strict_config`
+  honoured in every flag position Go accepts (`--strict-config=false` is the
+  Go-faithful spelling; the space-separated `--strict-config false` stays the
+  documented frp-rs extension and still warns on stderr). `frps verify` with no
+  `-c` prints `frps: the configuration file is not specified` and exits 0, which
+  is Go's own behaviour for frps's empty `-c` default. As on Go, the command
+  reads only the config path and the strict flag and accepts-and-ignores every
+  other root flag **frp-rs models** (`--bind-port`, `--allow-unsafe`,
+  `--version`, …) — the qualifier is the precise claim, because Go's
+  `--vhost-http-timeout` is a flag frp-rs's `frps` does not model on either path
+  and is therefore refused, and the bare `--dashboard-tls-mode` spelling is read
+  as `true` here where Go needs an argument (both recorded in
+  `docs/developing.md` § CLI inputs).
+  Three things it deliberately does **not** do, all recorded in
+  `docs/developing.md` § CLI inputs: it refuses the two frp-rs-only root flags
+  `--config-dir` and `--log-format` (Go's `frps` has neither, and accepting them
+  would make an argv Go rejects — `unknown flag: …`, exit 1 — exit **0**, i.e. a
+  validation command reporting success for a config it never looked at; the run
+  path keeps both as documented extensions), and it stops at the config loader,
+  so the post-load `--allow-unsafe` gate for an `exec` token source is not
+  applied — the same pre-existing gap `frpc verify` has, left alone here so the
+  two verifies keep agreeing with each other and filed in `TODO.md`.
+- **`frps` now resolves a subcommand that follows leading root flags, as Go's
+  cobra does — and the claim that it did not need to was false.** The previous
+  round's note here said `frps` was untouched because "Go's `frps` has no
+  subcommands to resolve". Go's `frps` registers `verify` on its root command
+  (`cmd/frps/verify.go`) beside cobra's `completion`/`help`, and `frps --help`
+  lists all three, so `frps -c frps.toml verify` and
+  `frps --strict-config=false verify -c frps.toml` ran the verify command on Go
+  and exited **1** here with an unexpected-token refusal. `frps` now runs the
+  same resolution as `frpc`, with its own flag classification: Go's server root
+  registers five pflag bools (`--version`, `--strict_config`,
+  `--enable-prometheus`, `--disable-log-color`, `--tls-only`) against the
+  client's two, and — the row that decides it — `--dashboard-tls-mode` looks
+  like the others but is *not* a pflag bool, so on Go it swallows `verify` as its
+  value and starts the server instead of verifying. That asymmetry is why the
+  bool set is per binary rather than shared, and both directions are pinned by
+  tests.
 - **`frpc` now accepts a subcommand after leading root flags, as Go's cobra
   does.** Go resolves the command after stripping flags, so
   `frpc -c frpc.toml status` ran the `status` admin command and dialled the
@@ -46,8 +92,11 @@ User-facing release notes for frp-rs.
   output-shape item. Values are never mistaken for commands: a config file literally named
   `status` (`-c status`, `--config=status`, `-c=status`, `-cstatus`), a value
   after a real `--`, and a `--proxy-name status` all stay values, because the
-  hoist skips the value of every value-taking flag. `frps` is untouched (Go's
-  `frps` has no subcommands to resolve), and a non-command word in front of a
+  hoist skips the value of every value-taking flag. `frps` was left alone by
+  *that* change, and the parenthetical it carried here — that Go's `frps` has no
+  subcommands to resolve — was **wrong**; the `frps` entries above are the
+  correction (Go's `frps` declares `verify`, and `frps` now runs the same
+  resolution over its own flag and command sets), and a non-command word in front of a
   command still refuses the argv on both binaries — Go as `unknown command
   "…" for "frpc"`, frp-rs as an unexpected-token error naming the token it could
   not place. The full
@@ -366,10 +415,12 @@ User-facing release notes for frp-rs.
   ``--config-dir` requires an argument `DIR`` — `--config-dir` is one of the
   four flags the pass covers on both binaries. Go `frps` has no `--config-dir`
   at all (`unknown flag`, exit 1), so that row is a documented divergence either
-  way. `frps verify -c <dash-value>` also reports a different error now: `verify`
-  is not a subcommand here, so the unknown subcommand is the first error instead
-  of the `-c` refusal (Go has `frps verify`; the row's current Go error is
-  pinned in `docs/developing.md` § CLI inputs).
+  way. `frps verify -c <dash-value>` also reported a different error at that
+  head: `verify` was not a subcommand then, so the unknown subcommand was the
+  first error instead of the `-c` refusal (Go has `frps verify`; the row's Go
+  error is pinned in `docs/developing.md` § CLI inputs). **Superseded by the
+  `frps verify` entry above**: the subcommand now exists, so that argv reaches
+  the loader and fails there, as Go does.
 - **`frpc --version` no longer short-circuits an argv that is going to fail — a
   behaviour change.** The version check lived in a closure on the run-mode
   branch of `frpc`'s argument parser, and bpaf evaluates every alternative while

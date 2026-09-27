@@ -1244,8 +1244,11 @@ shape are Go's and the sentence is not. `frpc verify`'s **success** line is a
 second, adjacent divergence left alone by this decision: Go prints exactly
 `frpc: the configuration file <path> syntax is ok`, frp-rs prints
 `Config file <path> is valid` plus three indented summary lines — a success row,
-not a failure one, so it is outside the item that fixed the stream and is not
-covered by these tests.
+not a failure one, so it was outside the item that fixed the stream and is not
+covered by these tests. It is now filed as `TODO.md`'s "`frpc verify`'s success
+line is not Go's" — the `frps verify` round gave **the server's** verify Go's
+exact line, and deliberately did not move the client's, because that would move
+`frpc/tests/cli_exit_codes.rs` and is outside that item's done-when.
 
 **Still divergent, deliberately: the line count at N ≥ 2.** `run_strict_check`
 (`frp-core/src/config/strict.rs`) collects **every** unknown key and returns
@@ -1290,11 +1293,15 @@ not a whole-line one) — `<path>: failed to read config file:` for `frps`,
 `Config file <path> is invalid: <path>:` for `frpc verify` — so a reintroduced
 timestamp/level prefix or ANSI escape fails. The tiny module asserts the same for
 `frpc-tiny`. All are in the two `cli_exit_codes.rs` files named above, on the same
-three lanes. Nothing was added to or deleted from **those two files**, so the
-guarded counts `env.FRPS_CLI_TESTS` (`16` = `frps/tests/cli_exit_codes.rs`) and
-`env.FRPC_TINY_CLI_TESTS` (`11` = the tiny run of `frpc/tests/cli_exit_codes.rs`)
-are unchanged, and neither literal counts the N ≥ 2 pin above, which is a unit
-test in `frp-core`.
+three lanes. Nothing was added to or deleted from **those two files** by that
+round, so the guarded counts `env.FRPS_CLI_TESTS` (then `16` =
+`frps/tests/cli_exit_codes.rs`) and `env.FRPC_TINY_CLI_TESTS` (`11` = the tiny
+run of `frpc/tests/cli_exit_codes.rs`) were unchanged by it, and neither literal
+counts the N ≥ 2 pin above, which is a unit test in `frp-core`. **The `frps`
+literal has moved twice since** — to `19` with the typed exit-code pins (#393)
+and to **`26`** with `frps verify` (the `FRPS_CLI_TESTS` value in
+`.github/workflows/ci.yml` is the single home; do not read a count from this
+paragraph).
 
 #### CLI inputs: repeated `-c`, an empty `webServer.addr`, case-insensitive keys
 
@@ -1468,7 +1475,8 @@ credentials → dashboard reports and dials `127.0.0.1:<port>` and no
 `[webServer].addr` is what binds), executed by the
 `Run frps CLI completion tests (merged-config completion order)` step in
 `.github/workflows/ci.yml` (a different target from the guarded
-`cli_exit_codes`, so `env.FRPS_CLI_TESTS` stays `16`; it passes
+`cli_exit_codes`, so the `env.FRPS_CLI_TESTS` literal does not move with it — it
+reads `26` at the `frps verify` head; it passes
 `--features dashboard`, without which the dashboard regression is not covered —
 against a true pre-fix no-dashboard binary that configuration is 3 passed /
 3 failed (of six), with the dashboard shape **passing** because there is no
@@ -1769,7 +1777,7 @@ the "before" column was re-measured with the source reverted to the base head
 | `frps -c --help` | rc 1, `open --help: no such file or directory` (`--help` is `-c`'s value, so it is never seen as the help flag) | rc 0, prints help | rc 1, load path naming `--help` — a match; the old `rc 0` convenience is deliberately gone |
 | `frps -c a.toml -c b.toml` (repeated) | rc 1, `open b.toml: …` — pflag is **last-wins** and starts with a valid `b` | rc 1, ``argument `-c` cannot be used multiple times in this context`` | rc 1, unchanged — **frps has no last-wins at all**, on either tree; only the frpc `-c` work uses `.last()`. The dash-valued repeat (`-c --strict-config=false -c p.toml`) moves from the `-c` refusal to this same message (rc 1 either way) |
 | `frps --config-dir --strict-config=false` / `--config_dir --strict-config=false` | rc 1, `unknown flag: --config-dir` / `unknown flag: --config_dir` — Go frps has **no** such flag | rc 1, ``--config-dir` requires an argument `DIR`` | **rc 2**, `Failed to read config directory: No such file or directory (os error 2)`: `--config-dir` is an frp-rs extension and one of the four flags the pass covers, so the dash-shaped token is now its value and the directory read runs; the extension's refusal stays on `EXIT_CONFIG`/2 (see § CLI exit codes). Still divergent from Go in a different way, and not comparable — Go has no flag to compare against |
-| `frps verify -c --strict-config=false` | rc 1, `open --strict-config=false: no such file or directory` (Go has `frps verify`) | rc 1, ``-c` requires an argument `FILE`` | rc 1, **`` `verify` is not expected in this context``** — the rewrite lets `-c` consume its value, so the missing subcommand is now the first error. `frps verify` is its own item (`TODO.md`, "Go has `frps verify`, frp-rs has no `frps verify` at all"); implementing it flips this row back to a config-load error. The current error is what is pinned, so the flip is visible |
+| `frps verify -c --strict-config=false` | rc 1, `open --strict-config=false: no such file or directory` (Go has `frps verify`) | rc 1, ``-c` requires an argument `FILE`` | rc 1 on **stdout**: `--strict-config=false: failed to read config file: No such file or directory (os error 2)`. `frps verify` is a real subcommand now, so the first error is the config read — the flip this cell predicted when the subcommand landed. rc, stream and the named path agree with Go; the wording is frp-rs's. Pinned by the **re-pointed** `verify_subcommand_resolves_so_the_dash_config_value_is_the_first_error` |
 
 Scope note: `--config-dir`/`--config_dir` are not Go `frps` flags at all (Go:
 `unknown flag: --config-dir`, rc 1), so the pass covering them on `frps` is an
@@ -1793,8 +1801,15 @@ front of the argv before bpaf runs (`TODO.md:2566`).
 Composition, because it is load-bearing: the entry points call `cli_args`
 (which drops `argv[0]` and expands the `-v=` alias), then `prepared_cli_argv`,
 which applies `rewrite_config_dash_values` **first** and
-`hoist_leading_subcommand` **second** — `frpc` only (`has_subcommands`; Go's
-`frps` declares no subcommands, so its behaviour is byte-identical to before).
+`hoist_leading_subcommand` **second**. **Both binaries run the hoist**; which
+root command's command-and-bool-flag sets it reads is `RootCommand`
+(`frp-core/src/cli.rs`), because those are exactly the two facts cobra's
+`stripFlags` and `Find` read and they differ per binary. The sentence this
+paragraph used to carry — "`frpc` only (`has_subcommands`; Go's `frps` declares
+no subcommands, so its behaviour is byte-identical to before)" — was **false**:
+Go's `frps` registers `verify` on `rootCmd` (`cmd/frps/verify.go:29`) beside
+cobra's `completion` and `help`, and `frps --help` lists all three (measured), so
+`frps` runs the same resolution. The `frps` rows are further down this section.
 The rewrite must run first because the hoist classifies flag/value/bare-word the
 way cobra does, and cobra classifies the argv pflag has already applied its
 value rule to. The shape that shows it: `-c -- status`, where the value of `-c`
@@ -1988,6 +2003,145 @@ design), plus the parser-level tests in `frp-core/src/cli.rs`
 `rewrite_attaches_a_dash_prefixed_config_value`,
 `rewrite_leaves_every_other_shape_alone`).
 
+**The `frps` rows of the same resolution, measured separately.** They are
+separate numbers because the frps base is a different tree (`37f91cd`) and its
+root command's flag set is not frpc's. Every row below was run with its own valid
+config and its own free port, stdout and stderr redirected to separate files, the
+exit status read directly from the child, and every child bounded (6 s) and
+reaped. `frps` has one child command — `verify` — so every row asks the same
+question: does the first surviving bare word become that command?
+
+| argv | Go v0.71.0 | frp-rs before (`37f91cd`) | frp-rs now |
+|---|---|---|---|
+| `frps verify -c good.toml` | rc 0, `frps: the configuration file good.toml syntax is ok` | rc 1, `` `verify` is not expected in this context`` | rc 0, the same line |
+| `frps -c good.toml verify` | rc 0, same line (`-c` consumes its value, `verify` is the first bare word) | rc 1, the same refusal | rc 0, resolved by the hoist |
+| `frps --strict-config=false verify -c good.toml` | rc 0, same line | rc 1, the same refusal | rc 0, resolved by the hoist |
+| `frps --strict_config=false verify -c good.toml` | rc 0 (the `_` spelling is the same pflag) | rc 1, the same refusal | rc 0 |
+| `frps --strict-config=false verify -c bad.toml` (unknown key) | rc 0, `syntax is ok` — lenient | rc 1, the refusal | rc 0, lenient |
+| `frps --tls-only verify -c good.toml` | rc 0, `syntax is ok` (`--tls-only` is a pflag **bool**: it does not consume `verify`) | rc 1, the refusal | rc 0 |
+| `frps --enable-prometheus verify -c good.toml`, `frps --disable-log-color verify -c good.toml` | rc 0, same (both are `BoolVarP`) | rc 1, the refusal | rc 0 |
+| `frps --version verify -c good.toml` | rc 0, `syntax is ok` — **no version line**: `showVersion` is read only by the root command's `RunE` (`cmd/frps/root.go:57`), never by `verifyCmd` | rc 1, the refusal | rc 0, no version line |
+| `frps -p <free> verify -c good.toml` | rc 0 — `-p` consumes its port, `verify` is the *next* token and is the first bare word | rc 1, the refusal | rc 0 |
+| `frps --dashboard-tls-mode verify -c good.toml` | **rc 143** — the probe's 6 s SIGTERM watchdog killed a server that had **started** (`frps started successfully`; the `timeout`-based rows elsewhere in this file report 124 for the same shape). `--dashboard-tls-mode` is registered with `VarP(BoolFuncFlag{…})` (`pkg/config/flags.go:256-258`), **not** `BoolVarP`, so pflag never sets `NoOptDefVal` on it and it consumes `verify` as its value — no bare word survives | rc 1, the refusal | rc 1, `` `verify` is not expected in this context`` — **still divergent**: the hoist correctly declines to move the token (the row above is why), but frp-rs models the flag as a bool, so it has no value slot to put `verify` in. The divider is "Go serves, frp-rs refuses"; the pre-existing `--dashboard-tls-mode` modelling divergence, not a command-resolution one |
+| `frps --strict-config true verify -c bad.toml` | rc 1 on **stderr**, ``Error: unknown command "true" for "frps"`` — pflag's bool does not consume `true`, so `true` is the first bare word and cobra refuses it instead of resolving `verify` | rc 1, `` `verify` is not expected`` | rc 1, `` `verify` is not expected in this context`` — same rc, same (empty) stdout, different message. The hoist declines for the right reason (the first bare word is `true`, not a command); the leftover frp-rs reports is `verify`, because its space-form `--strict-config true` *does* consume `true` (the documented extension below). The `unknown command "…"` message shape is the pre-existing divergence recorded in § `--strict-config` |
+
+The last two rows are the reason the classification is per root command and not a
+shared constant. Go's `frps` root registers **five** pflag bools — `version` and
+`strict_config` (`cmd/frps/root.go:44-48`) plus `enable_prometheus`,
+`disable_log_color` and `tls_only` (`pkg/config/flags.go:242,246,251`) — against
+`frpc`'s two, and it registers `dashboard_tls_mode` as a *consumer* even though
+it reads like the others. Getting that backwards is observable in both
+directions: treating `--dashboard-tls-mode` as a bool would hoist `verify` out of
+an argv where Go starts a server, and treating `--tls-only` as a consumer would
+leave `frps --tls-only verify -c cfg` refused where Go verifies. Both sets and
+both boundaries are pinned by
+`the_bool_root_flag_sets_are_per_root_command` and
+`frps_hoists_verify_past_its_own_root_flags` (`frp-core/src/cli.rs`), and the
+end-to-end rows by `verify_resolves_leading_root_flags_and_ignores_the_rest`
+(`frps/tests/cli_exit_codes.rs`).
+
+#### `frps verify` (Go's `verifyCmd`)
+
+Go has had `frps verify` all along; frp-rs had no such subcommand, so
+`frps verify -c frps.toml` on a **valid** config exited 1 with ``Error: `verify`
+is not expected in this context`` and a script that validates a server config
+with Go's command could not use frp-rs at all (`TODO.md`, "Go has `frps verify`,
+frp-rs has no `frps verify` at all"). It exists now, and it is Go's command
+(`cmd/frps/verify.go`): `LoadServerConfig(cfgFile, strictConfigMode)`, then
+`fmt.Println(err); os.Exit(1)` on failure, and
+`frps: the configuration file %s syntax is ok` on success — on **stdout**, which
+is where the client's `verifyCmd` writes too
+(`cmd/frpc/sub/verify.go:59,63`).
+
+Measured on Go v0.71.0 darwin/arm64 and on the frp-rs debug binary at `37f91cd`
+(before) and at the head (after), streams captured separately and the exit status
+read directly from the child, one fresh config and one fresh free port per row;
+every child bounded and reaped.
+
+| argv | Go v0.71.0 | frp-rs before | frp-rs now |
+|---|---|---|---|
+| `frps verify -c <valid>` | rc **0**, stdout `frps: the configuration file <path> syntax is ok`, stderr 0 B | rc 1, `` `verify` is not expected`` on stderr | rc 0, the same line, stderr 0 B |
+| `frps verify -c <missing>` | rc **1**, stdout `open <path>: no such file or directory`, stderr 0 B | rc 1, the refusal | rc 1, stdout `<path>: failed to read config file: No such file or directory (os error 2)`, stderr 0 B — same rc, same stream, same named path; the wording is frp-rs's |
+| `frps verify -c <unknown key>` (strict default) | rc **1**, stdout `json: unknown field "notAKnownFrpKey"`, stderr 0 B | rc 1, the refusal | rc 1, stdout `unknown field "notAKnownFrpKey" in config file <path>`, stderr 0 B |
+| `frps verify -c <bindPort = "not-a-port">` | rc **1**, stdout `field "bindPort": cannot unmarshal string into int`, stderr 0 B | rc 1, the refusal | rc 1, stdout `<path>: config validation error: invalid type: string "not-a-port", expected u16`, stderr 0 B |
+| `frps verify` (no `-c`) | rc **0**, stdout `frps: the configuration file is not specified`, stderr 0 B — Go's `-c` default is the **empty string** on `frps` (`cmd/frps/root.go:44`) and `verifyCmd` returns nil for it (`cmd/frps/verify.go:36-39`) | rc 1, the refusal | rc 0, the same line. Unlike `frpc`, whose `-c` defaults to `./frpc.ini` |
+| `frps verify -c <valid> --strict-config=false`, `frps verify --strict-config=false -c <valid>`, `frps --strict-config=false verify -c <valid>`, `frps --strict_config=false verify -c <valid>` | rc **0**, `syntax is ok` on all four | rc 1 (all four) | rc 0 (all four), stderr 0 B — the `=` form is Go-faithful and does not warn |
+| `frps verify -c <unknown key> --strict-config` (bare), `… --strict-config=true`, `… --strict-config=false` | rc 1 / rc 0 / rc 0 — the bare and `=true` forms stay strict | rc 1 (the refusal) | rc 1 / rc 0 — same verdicts |
+| `frps verify --strict-config true -c <unknown key>` (space form) | rc **1**, `json: unknown field …` — pflag's bool does not consume `true`, so strict stays at its `true` default and `true` is an ignored positional | rc 1 (the refusal) | rc **1**, the same verdict, plus the frp-rs **warning** on stderr: the space form is read as the value (the documented extension below) |
+| `frps verify -c <valid> -c <valid2>` | rc **0** naming `<valid2>` — pflag is last-wins | rc 1 (the refusal) | rc 0 naming `<valid2>` |
+| `frps verify --bind-port <free> -c <valid>`, `frps verify --allow-unsafe X --version -c <valid>` | rc **0**, `syntax is ok` — `verifyCmd` reads only `cfgFile` and `strictConfigMode` (`cmd/frps/verify.go:36,40`) and every other flag Go's `frps` root registers is accepted and ignored | rc 1 (the refusal) | rc 0, the same line; for the `--version` spelling that is the discriminating half — Go prints a version only from the root command's `RunE`, never here |
+| `frps verify --log-format json -c <valid>` (`=json`, `--log_format json`, and the flag after `-c`) | rc **1**, stdout 0 B, stderr `Error: unknown flag: --log-format` + usage — Go **frps** has no such flag, so its `verify` refuses it | rc 1, the refusal (that binary has no `verify` at all) | rc **1**, `` `--log-format` is not expected in this context`` — **fixed in this round**: the flag used to ride into `verify` through `frps_build` and made this argv print `syntax is ok` and exit **0**, a validation command reporting success for an argv Go rejects. The run path keeps it (documented extension); pinned by `verify_refuses_the_two_frp_rs_only_root_flags_like_go` and `frps_verify_refuses_the_run_paths_extension_flags` |
+| `frps verify --config-dir <dir> -c <valid>`, `frps --config-dir <dir> verify -c <valid>` (`--config_dir` too) | rc **1**, stdout 0 B, stderr `Error: unknown flag: --config-dir` + usage (Go frps has no such flag) | rc 1, the refusal | rc **1**, `` `--config-dir` is not expected in this context`` — same rc, different message; the second of the two extension slots, refused from the start for exactly the reason the `--log-format` row above now is |
+| `frps verify --vhost-http-timeout 30 -c <valid>` | rc **0**, `syntax is ok` (it is a Go `frps` root flag, and `verifyCmd` ignores it) | rc 1, the refusal (no `verify` subcommand) | rc **1**, `` `--vhost-http-timeout` is not expected in this context`` — **divergent, and pre-existing**: frp-rs's `frps` does not model that flag at all, so the **run path** refuses it identically (`frps --vhost-http-timeout 30 -c <valid>` starts and listens on Go, rc 143 bounded; rc 1 on both the base and this head). Newly visible on `verify` because `verify` is new; not a `verify` defect. Filed as `TODO.md`'s "`frps` does not register Go's `--vhost-http-timeout`" |
+| `frps verify --dashboard-tls-mode=auto -c <valid>`, `… --dashboard-tls-mode auto -c <valid>` | rc **0**, `syntax is ok` — the flag is a **string** on Go (`VarP(BoolFuncFlag{…})`, `pkg/config/flags.go:256-258`), so `auto` is its value | rc 1, the refusal | rc **1**, `` `auto` is not expected in this context`` — **divergent, and pre-existing**: frp-rs models that flag as a bool, which is the same model divergence the run path carries (the `--flag=<bool>` table's `--dashboard-tls-mode=auto` row: Go 124, base 1, head 1) |
+| `frps verify -c <valid> --dashboard-tls-mode` (trailing bare) | rc **1**, stdout 0 B, stderr `Error: flag needs an argument: --dashboard-tls-mode` + usage — a bare string flag with no value | rc 1, the refusal | rc **0**, `frps: the configuration file <valid> syntax is ok` — a **false success**, and the row that makes the "ignores every root flag" sentence wrong: frp-rs reads the bare spelling as `true`, so the flag is *not* ignored, it is misread. Same pre-existing bool-vs-string model, newly visible here; the run path accepts the bare flag too (Go rc 1 `flag needs an argument`, base and head proceed). Recorded, not pinned |
+| `frps verify -c <valid> junk` | rc **0** — `verifyCmd` sets no `Args` validator, so cobra passes positionals through and the command ignores them | rc 1, the refusal | rc **1**, `` `junk` is not expected in this context`` — **divergent** (and the same divergence `frpc verify -c <valid> junk` has, measured: Go rc 0, frp-rs rc 1). Left as the pre-existing positional-arguments divergence, recorded here rather than pinned |
+| `frps verify --strict-config foo -c <valid>` | rc **0** — the stray token is an ignored positional and strict stays `true` | rc 1, the refusal | rc **1**, `` `foo` is not expected`` — same class as the row above, and the same as `frpc verify --strict-config foo -c <valid>` |
+| `frps verify --help` | rc 0, cobra's help for the command: `Usage: frps verify [flags]` with the whole root flag set under `Global Flags` | rc 1, the refusal | rc 0, bpaf's help for the command (`Usage: frps verify …`). The **rendering** is not Go's — the pre-existing help-shape divergence, not this command's |
+| `frps help`, `frps completion` | rc 0 (cobra built-ins: `help` prints the root help, `completion` prints its own) | rc 1, the refusal | rc 1 — unimplemented, exactly as on `frpc`; `FRPS_SUBCOMMANDS` lists only `verify`, and is pinned against the parser in both directions by `the_frps_command_list_is_exactly_the_parser_branches` |
+
+Three things this table does **not** claim:
+
+* **The config verdict is the client verify's, not the daemon's.** `run_verify`
+  (`frps/src/main.rs`) calls `load_server_config` — the same loader the run path
+  uses — and stops there. It does **not** run the service-construction gates,
+  `--allow-unsafe`/`TokenSourceExec` among them (`frp-server/src/service.rs`),
+  because they live after the load. Measured on Go v0.71.0 with
+  `[auth.tokenSource] type = "exec"`: `frps verify -c <that config>` is rc **1**,
+  stdout `unsafe feature "TokenSourceExec" is not enabled. To enable it, ensure
+  it is allowed in the configuration or command line flags`, stderr 0 B
+  (`ValidateUnsafeFeature`, `pkg/config/v1/validation/validator.go:22-27`, called
+  for `tokenSource.Type == "exec"` at `pkg/config/v1/validation/auth.go:34-35`
+  and reached from `cmd/frps/verify.go:46-48`, whose error arm is `:52-55`),
+  while the head prints `syntax is ok` (rc 0) — and
+  `--allow-unsafe TokenSourceExec` makes Go rc 0 as well, which the head also
+  matches. That gap is **pre-existing and
+  shared with `frpc verify`** — measured and recorded for the client in
+  `frp-core/src/config/tests.rs` ("Go refuses both spellings … frp-rs strict
+  `verify` exits 0") — and it is deliberately not closed here, because closing it
+  on one binary alone would make the two verifies disagree about the same config.
+  A fix belongs in the shared load path, and it is now filed:
+  `TODO.md`'s "`frps verify` / `frpc verify` do not run the post-load
+  `--allow-unsafe` gate" (which also records that Go's **run** path refuses the
+  same config, so the gate is a load/validate-time property there, not a
+  verify-only one).
+* **The two frp-rs-only extensions are refused, but the run path still accepts
+  both.** `frps --config-dir <dir>` is rc 2 on that path and rc 1
+  `unknown flag` on Go; `frps --log-format json -c <cfg>` is accepted on that
+  path and rc 1 `unknown flag` on Go. The verify subcommand takes the Go-side
+  answer for both. Measured, the extension set is complete: diffing the rendered
+  `--help` flag lists of the two binaries gives **frp-rs-only = {`config-dir`,
+  `log-format`}** and **Go-only = {`vhost-http-timeout`}**.
+* **"Every other root flag is accepted and ignored" is true of Go and nearly so
+  of frp-rs; the exception is named rather than rounded away.** For Go the
+  sentence is exact — `verifyCmd` reads two fields and every other registered
+  flag is inert. For frp-rs the precise claim is "every root flag frp-rs
+  **models**": a flag frp-rs does not model at all (`--vhost-http-timeout`) is
+  refused, and one it models as a different *kind* (`--dashboard-tls-mode`, a
+  string on Go, a bool here) is refused in the `=auto`/space spellings and
+  **read as `true`** in the bare trailing spelling — which Go answers with
+  `flag needs an argument` and frp-rs answers `syntax is ok`, rc 0. That last
+  row is a false **ok**, not an ignore, and it is why the sentence in
+  `frp-core/src/cli.rs` and `CHANGELOG.md` says "every root flag frp-rs models".
+* **The `frps -c a.toml -c b.toml` run-path divergence is untouched.** That path
+  still has no last-wins (its `-c` is [`svr_config`], not `config_arg`), while
+  `verify`'s `-c` is `config_arg` — pflag last-wins — because Go's `verifyCmd`
+  reads the same persistent `StringVar`. The two are separate surfaces and the
+  run path's row is unchanged by this work.
+
+Pinned by `verify_valid_config_prints_go_line_and_exits_0`,
+`verify_invalid_config_exits_1_with_the_load_error_on_stdout`,
+`verify_missing_config_exits_1_naming_the_path`,
+`verify_without_a_config_file_is_not_an_error`,
+`verify_strict_config_false_is_lenient_in_every_flag_order`,
+`verify_strict_config_true_still_refuses_the_unknown_key` and
+`verify_resolves_leading_root_flags_and_ignores_the_rest` in
+`frps/tests/cli_exit_codes.rs`, plus the parser-level
+`the_frps_command_list_is_exactly_the_parser_branches`,
+`the_hoisted_frps_argv_parses_as_verify` and the extended
+`--strict-config` table (`frps verify` is now one of its seven parsers) in
+`frp-core/src/cli.rs`.
+
 #### `--strict-config`: the space-separated value form
 
 `--strict-config false` (a space, two argv tokens) is an **frp-rs extension**,
@@ -2049,14 +2203,19 @@ the stderr line above; every other row is silent.
 | `frpc verify --strict-config=false --strict-config=true -c bad.toml` (repeated) | rc 1, `json: unknown field …` — last-wins, so strict | rc 1, the same repetition refusal |
 | `frps --strict-config=false -c badfrps2.toml` | rc 124 — starts (lenient) | rc 124 — starts (lenient) |
 | `frps --strict-config false -c badfrps2.toml` *(warns)* | rc 1, `Error: unknown command "false" for "frps"` | rc 124 — starts (lenient) — **extension** |
-| `frps verify --strict-config false -c badfrps2.toml` | rc 1, `json: unknown field …` | n/a — frp-rs `frps` has no `verify` subcommand (separate `TODO.md` item) |
+| `frps verify --strict-config false -c badfrps2.toml` *(warns)* | rc 1, `json: unknown field …` — the token is an ignored positional and strict stays `true` | **rc 0**, `frps: the configuration file … syntax is ok` — the value is read and strict is off — **extension**, the same one `frpc verify --strict-config false` carries. It also warns on stderr |
+| `frps verify --strict-config=true -c badfrps2.toml` | rc 1, `json: unknown field …` | rc 1, `unknown field … in config file <path>` — the `=` form is Go-faithful |
+| `frps verify --strict-config=false -c badfrps2.toml` | rc 0, `frps: the configuration file badfrps2.toml syntax is ok` | rc 0, the same line at this head (the client's `frpc verify` still prints its own `Config file … is valid` here — that success-line divergence is recorded in § Output stream and shape on a config-load failure and is filed as `TODO.md`'s "`frpc verify`'s success line is not Go's") |
+| `frps verify --strict-config foo -c goodfrps.toml` | **rc 0**, `syntax is ok` — the stray token is an ignored positional and strict stays `true` | rc 1, ``Error: `foo` is not expected in this context`` — the pre-existing positional divergence, the same one `frpc verify --strict-config foo -c good.toml` has (measured: Go rc 0, frp-rs rc 1) |
 | `frps --strict-config foo -c badfrps2.toml` | rc 1, `Error: unknown command "foo" for "frps"` | rc 1, ``Error: `foo` is not expected in this context`` |
 | `frps --strict-config=foo -c badfrps2.toml` | rc 1, `invalid argument "foo" … strconv.ParseBool` | rc 1, ``Error: `foo` is not expected in this context`` |
 
 What the table says, precisely:
 
 - **The `=` form is Go-faithful on every parser for a single occurrence** —
-  `frps` and `frpc`'s `run`/`verify`/`reload`/`status`/`stop` — for `=true`,
+  `frps`'s run path, `frps verify`, and `frpc`'s `run`/`verify`/`reload`/
+  `status`/`stop` (seven parsers; `frps verify` is the one this round added, and
+  it is the same `strict_config_parser` inside `svr_meta`) — for `=true`,
   `=false`, and a bad `=foo` (both exit 1; only the message differs). A
   **repeated** flag is *not* Go-faithful and is not covered by that sentence:
   Go's pflag is last-wins (`=true =false` → rc 0 lenient, the reverse → rc 1
@@ -2066,11 +2225,11 @@ What the table says, precisely:
 - **The space form is the only divergence in flag *values*.** frp-rs consumes
   the next token as the value, which is why the lenient rows above dial where
   Go refuses. On the two *root* commands (`frpc`, `frps`) Go answers
-  `unknown command "false"` instead — it takes no positional — while the four
-  `frpc` subcommands accept the argv and silently ignore the token, keeping
-  strict on. **Position does not matter**: with `-c` first the same divergence
-  reproduces on both binaries (measured above), so the warning is tied to the
-  flag, not to where it sits in the argv.
+  `unknown command "false"` instead — it takes no positional — while the `frpc`
+  subcommands and `frps verify` accept the argv and silently ignore the token,
+  keeping strict on. **Position does not matter**: with `-c` first the same
+  divergence reproduces on both binaries (measured above), so the warning is tied
+  to the flag, not to where it sits in the argv.
 - **Only a bool value is consumed — the empty token is not.** `--strict-config
   ""` is an argv error on frp-rs (bpaf takes no empty value), and on Go the empty
   token is an ignored positional, so with a valid config Go exits **0** where
@@ -2814,6 +2973,27 @@ the 10 client plugins, `virtual_net`, is the TUN-backed path with no listener
 of its own (`frp-client/src/plugin/mod.rs:331`), so it follows the opt-in
 `vnet` tier: it is named in the Opt-in row above and is the one client plugin
 not counted in Keep.
+
+One **CLI-surface** entry belongs in the same record, because it is the same kind
+of decision and would otherwise read as an oversight: **cobra's `completion` and
+`help` are not implemented on either binary, and `frps` now has a command list
+they are absent from.** Measured on Go v0.71.0, `frps help` prints the root help
+(rc 0) and `frps completion` prints its own help (rc 0); on this head both are
+rc **1**, exactly as `frpc` has always answered them. The rc is the shared part,
+not the wording: `frps` says `` `help` is not expected in this context `` /
+`` `completion` is not expected in this context ``, while `frpc help` answers
+with its positional-suggestion sentence (`no such command or positional: …`,
+with a `did you mean` hint) because `frpc` has that parser and `frps` does not.
+`FRPS_SUBCOMMANDS` (`frp-core/src/cli.rs`) therefore lists only `verify`, and the
+list is pinned against the parser's branches in both directions by
+`the_frps_command_list_is_exactly_the_parser_branches`. **Decision: recorded, not
+implemented** — shell-completion scripts are not part of the product surface on
+either binary, and implementing them for `frps` alone would add a new surface
+with its own parity burden: **one script body per shell Go ships, and Go ships
+four** — measured on Go v0.71.0, `frps completion --help` lists exactly `bash`,
+`fish`, `powershell` and `zsh` under `Available Commands` — rather than fix a
+parity gap. What would unfreeze it: a user report asking for completion, or
+`frpc` gaining it first.
 
 ### Frozen surfaces, and what would unfreeze each
 
