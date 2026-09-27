@@ -26,14 +26,22 @@ User-facing release notes for frp-rs.
   documented frp-rs extension and still warns on stderr). `frps verify` with no
   `-c` prints `frps: the configuration file is not specified` and exits 0, which
   is Go's own behaviour for frps's empty `-c` default. As on Go, the command
-  accepts and ignores every other root flag (`--bind-port`, `--allow-unsafe`,
-  `--version`, …) and reads only the config path and the strict flag.
-  Two things it deliberately does **not** do, both recorded in
-  `docs/developing.md` § CLI inputs: it refuses the frp-rs-only `--config-dir`
-  (Go refuses it too, and accepting it would make an argv Go rejects exit 0), and
-  it stops at the config loader, so the post-load `--allow-unsafe` gate for an
-  `exec` token source is not applied — the same pre-existing gap `frpc verify`
-  has, left alone here so the two verifies keep agreeing with each other.
+  reads only the config path and the strict flag and accepts-and-ignores every
+  other root flag **frp-rs models** (`--bind-port`, `--allow-unsafe`,
+  `--version`, …) — the qualifier is the precise claim, because Go's
+  `--vhost-http-timeout` is a flag frp-rs's `frps` does not model on either path
+  and is therefore refused, and the bare `--dashboard-tls-mode` spelling is read
+  as `true` here where Go needs an argument (both recorded in
+  `docs/developing.md` § CLI inputs).
+  Three things it deliberately does **not** do, all recorded in
+  `docs/developing.md` § CLI inputs: it refuses the two frp-rs-only root flags
+  `--config-dir` and `--log-format` (Go's `frps` has neither, and accepting them
+  would make an argv Go rejects — `unknown flag: …`, exit 1 — exit **0**, i.e. a
+  validation command reporting success for a config it never looked at; the run
+  path keeps both as documented extensions), and it stops at the config loader,
+  so the post-load `--allow-unsafe` gate for an `exec` token source is not
+  applied — the same pre-existing gap `frpc verify` has, left alone here so the
+  two verifies keep agreeing with each other and filed in `TODO.md`.
 - **`frps` now resolves a subcommand that follows leading root flags, as Go's
   cobra does — and the claim that it did not need to was false.** The previous
   round's note here said `frps` was untouched because "Go's `frps` has no

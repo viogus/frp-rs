@@ -5878,9 +5878,12 @@ fn legacy_ini_go_shipped_frpc_fixture_loads_end_to_end() {
 /// (`pkg/config/legacy/server.go:243-247`), and `token = 12345678` as the
 /// string `12345678`.
 ///
-/// `frps` has no `verify` subcommand in frp-rs (a pre-existing CLI divergence,
-/// `TODO.md:1632`), so this loads through the same `load_server_config` the
-/// daemon calls — the same entry point `frps -c` uses.
+/// `frps` had no `verify` subcommand in frp-rs when this pin was written (the
+/// `TODO.md` item "Go has `frps verify`, frp-rs has no `frps verify` at all",
+/// since closed), so it loads through the same `load_server_config` the daemon
+/// calls. That entry point is still the one `frps verify` uses — the subcommand
+/// adds Go's line and stream around it, not a second loader — so this pin
+/// describes both surfaces.
 #[test]
 fn legacy_ini_go_shipped_frps_fixture_loads_end_to_end() {
     let path = concat!(

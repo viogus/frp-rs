@@ -55,8 +55,9 @@ The same for the server side: a byte-identical copy of
 to fail with `invalid type: sequence, expected a string` on
 `allow_ports = 2000-3000,3001,3003,4000-50000` and on the numeric `token`; it is
 loaded end to end by `legacy_ini_go_shipped_frps_fixture_loads_end_to_end`.
-`frps` has no `verify` subcommand in frp-rs (a pre-existing CLI divergence), so
-that test uses `load_server_config` — the same entry point `frps -c` uses.
+`frps` had no `verify` subcommand in frp-rs when that test was written (since
+implemented), so it uses `load_server_config` — which is still the entry point
+`frps -c` **and** `frps verify` use.
 
 To refresh either fixture, download the Go frp release tarball and copy
 `conf/legacy/<name>` over the file.

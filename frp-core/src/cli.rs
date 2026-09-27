@@ -669,10 +669,8 @@ fn svr_config() -> impl Parser<Option<String>> {
 /// The frp-rs-only `--config-dir`/`--config_dir` extension, run path only.
 ///
 /// Go's frps has no such flag (`unknown flag: --config-dir`, rc 1). It is
-/// deliberately **not** part of the `verify` subcommand's surface: accepting it
-/// there would make `frps verify --config-dir cDir` exit 0 (verify ignores the
-/// directory) where Go exits 1, i.e. a validation tool reporting success for an
-/// argv Go refuses. [`frps_verify_cmd`] passes `bpaf::pure(None)` in this slot.
+/// deliberately **not** part of the `verify` subcommand's surface — see
+/// [`FrpsRootSlots`].
 fn svr_config_dir() -> impl Parser<Option<String>> {
     long("config-dir")
         .long("config_dir")
@@ -680,9 +678,50 @@ fn svr_config_dir() -> impl Parser<Option<String>> {
         .optional()
 }
 
+/// The frp-rs-only `--log-format`/`--log_format` extension, run path only.
+///
+/// Go's frps has no such flag either, and its `frps --help` proves it rather
+/// than a grep: diffing the two binaries' rendered flag sets gives
+/// **frp-rs-only = {`config-dir`, `log-format`}** and **Go-only =
+/// {`vhost-http-timeout`}** (measured on the head binary and the Go v0.71.0
+/// binary). So this is the second of exactly two extension slots, and the
+/// `verify` subcommand refuses it for the same reason it refuses the first:
+/// measured, `frps verify --log-format json -c <valid>` is Go rc **1**
+/// (`Error: unknown flag: --log-format` + usage, stderr, stdout 0 B) while
+/// accepting it here printed `frps: … syntax is ok` and returned rc **0** — a
+/// validation command reporting success for an argv Go rejects.
+fn svr_log_format() -> impl Parser<Option<String>> {
+    long("log-format")
+        .long("log_format")
+        .argument::<String>("FORMAT")
+        .optional()
+}
+
+/// The three `frps` root slots whose parser differs between the run path and the
+/// `verify` subcommand, passed as parsers so [`frps_build`] stays **one** builder
+/// instead of two flag lists that can drift.
+///
+/// * `config` — the run path takes [`svr_config`], which has no `.last()`: a
+///   repeated `-c` is bpaf's duplicate refusal, the pre-existing divergence from
+///   pflag last-wins. `verify` takes [`config_arg`] (last-wins), because Go's
+///   `verifyCmd` reads that same persistent `StringVar` — measured, `frps verify
+///   -c a.toml -c b.toml` loads `b.toml` (rc 0) on both.
+/// * `config_dir`, `log_format` — frp-rs-only **extensions** (the two the
+///   `frps --help` diff above produces). The run path keeps both, as documented
+///   extensions; `verify` passes `bpaf::pure(None)` for each, because accepting
+///   either would make an argv Go answers `unknown flag: …` (rc 1) exit 0 from a
+///   command whose only job is to say whether a config is valid.
+///
+/// The other `frps` root flags are **not** parameterized: they exist on both
+/// sides and [`frps_build`] parses them once for both paths.
+struct FrpsRootSlots<C, D, L> {
+    config: C,
+    config_dir: D,
+    log_format: L,
+}
+
 /// The four root flags [`SvrMeta`] carries. The two config-selecting parsers are
-/// parameters because the run path and the `verify` subcommand differ in exactly
-/// those two (`verify` is last-wins on `-c` and has no `--config-dir`);
+/// parameters because the run path and the `verify` subcommand differ in those;
 /// everything else is shared, so the two surfaces cannot drift.
 fn svr_meta(
     config: impl Parser<Option<String>>,
@@ -801,7 +840,11 @@ fn svr_dashboard() -> impl Parser<SvrDashboard> {
     })
 }
 
-fn svr_log() -> impl Parser<SvrLog> {
+/// The log half of the root surface. `log_format` arrives as a parameter because
+/// it is the frp-rs-only extension [`FrpsRootSlots`] refuses on the `verify`
+/// path; `log_file`, `log_level`, `log_max_days` and `disable_log_color` are Go
+/// frps flags and are parsed once for both paths.
+fn svr_log(log_format: impl Parser<Option<String>>) -> impl Parser<SvrLog> {
     let log_file = long("log-file")
         .long("log_file")
         .argument::<String>("FILE")
@@ -813,10 +856,6 @@ fn svr_log() -> impl Parser<SvrLog> {
     let log_max_days = long("log-max-days")
         .long("log_max_days")
         .argument::<i32>("DAYS")
-        .optional();
-    let log_format = long("log-format")
-        .long("log_format")
-        .argument::<String>("FORMAT")
         .optional();
     let disable_log_color = go_bool_flag!(
         "disable-log-color",
@@ -877,14 +916,17 @@ fn svr_transport() -> impl Parser<SvrTransport> {
 }
 
 fn frps_build(
-    config: impl Parser<Option<String>>,
-    config_dir: impl Parser<Option<String>>,
+    slots: FrpsRootSlots<
+        impl Parser<Option<String>>,
+        impl Parser<Option<String>>,
+        impl Parser<Option<String>>,
+    >,
 ) -> impl Parser<FrpsBuild> {
-    let meta = svr_meta(config, config_dir);
+    let meta = svr_meta(slots.config, slots.config_dir);
     let bind = svr_bind();
     let auth = svr_auth();
     let dash = svr_dashboard();
-    let log = svr_log();
+    let log = svr_log(slots.log_format);
     let transport = svr_transport();
     construct!(FrpsBuild {
         meta,
@@ -901,7 +943,12 @@ fn frps_build(
 /// parser, doesn't run it; for the whole `frps` surface (run + `verify`) use
 /// [`frps_parser`].
 pub fn frps_args() -> impl Parser<FrpsArgs> {
-    frps_build(svr_config(), svr_config_dir()).map(FrpsArgs::from)
+    frps_build(FrpsRootSlots {
+        config: svr_config(),
+        config_dir: svr_config_dir(),
+        log_format: svr_log_format(),
+    })
+    .map(FrpsArgs::from)
 }
 
 /// The whole `frps` surface: the `verify` child command, then the root
@@ -924,7 +971,7 @@ fn frps_parser() -> impl Parser<FrpsCmd> {
 ///
 /// Go's `verifyCmd` reads exactly two persistent root flags — `cfgFile` and
 /// `strictConfigMode` (`cmd/frps/verify.go:36,40`) — and **accepts and ignores**
-/// every other one, because they hang off `rootCmd`:
+/// every other flag Go's `frps` root registers, because they hang off `rootCmd`:
 /// `config.RegisterServerConfigFlags(rootCmd, &serverCfg)` (`cmd/frps/root.go:50`)
 /// plus `--version` and `--allow-unsafe` (`:44-48`). Measured on Go v0.71.0:
 /// `frps verify --help` prints the whole surface under `Global Flags`, and
@@ -932,14 +979,26 @@ fn frps_parser() -> impl Parser<FrpsCmd> {
 /// `frps verify --allow-unsafe X -c <valid>` and
 /// `frps verify --version -c <valid>` are all rc 0 with the *verify* output (no
 /// version line). Parsing through [`frps_build`] and keeping only the two fields
-/// reproduces that acceptance without a second hand-written flag list.
+/// reproduces that acceptance without a second hand-written flag list — for
+/// **every root flag frp-rs models**, which is the precise claim: frp-rs does
+/// not model Go's `--vhost-http-timeout` at all, so `frps verify
+/// --vhost-http-timeout 30 -c <valid>` is rc **1** here and rc **0** on Go,
+/// identically on the run path (`frps --vhost-http-timeout 30 -c <valid>`
+/// starts on Go and is refused on both the base and this head). That is a
+/// pre-existing run-path parser gap, recorded in `docs/developing.md` § CLI
+/// inputs and in `TODO.md`'s "`frps` does not register Go's
+/// `--vhost-http-timeout`" item — not a `verify`-specific defect.
 ///
-/// The two slots where this differs from the run path are the parameters
-/// [`frps_build`] takes: `-c` is [`config_arg`] (pflag last-wins; Go's verifyCmd
-/// reads the same persistent flag, so `-c a -c b` loads `b` — measured rc 0 on
-/// `b`), and `--config-dir` is refused (`bpaf::pure(None)`), because Go has no
-/// such flag and refusing it keeps Go's rc 1 instead of silently succeeding on a
-/// directory this command would never look at.
+/// The three slots where this differs from the run path are the
+/// [`FrpsRootSlots`] fields: `-c` is [`config_arg`] (pflag last-wins; Go's
+/// verifyCmd reads the same persistent flag, so `-c a -c b` loads `b` —
+/// measured rc 0 on `b`), and the two frp-rs-only extensions `--config-dir` and
+/// `--log-format` are refused (`bpaf::pure(None)`), because Go has neither flag
+/// and refusing them keeps Go's rc 1 (`unknown flag: …`) instead of silently
+/// succeeding on flags this command would never read. The log-format slot is the
+/// one this round closed: it used to ride in through `frps_build` and made
+/// `frps verify --log-format json -c <valid>` print `syntax is ok` and exit **0**
+/// where Go exits **1**.
 ///
 /// `config` is therefore `Option<String>` and **empty** when absent: Go
 /// registers `-c` with an empty default on frps (`cmd/frps/root.go:44`) and
@@ -948,7 +1007,12 @@ fn frps_parser() -> impl Parser<FrpsCmd> {
 /// whose default is `./frpc.ini`. `frps/src/main.rs`'s `run_verify` reproduces
 /// that branch.
 fn frps_verify_cmd() -> impl Parser<FrpsCmd> {
-    let args = frps_build(config_arg().optional(), bpaf::pure(None)).map(|b| VerifyArgs {
+    let args = frps_build(FrpsRootSlots {
+        config: config_arg().optional(),
+        config_dir: bpaf::pure(None),
+        log_format: bpaf::pure(None),
+    })
+    .map(|b| VerifyArgs {
         config: b.meta.config.unwrap_or_default(),
         strict_config: b.meta.strict_config,
     });
@@ -1128,10 +1192,18 @@ impl RootCommand {
     }
 
     /// The long flag names this root registers with a pflag **bool**, written
-    /// in pflag's normalized `_` spelling: `config.WordSepNormalizeFunc` folds
-    /// `-` to `_`, and `hasNoOptDefVal` looks the name up through that
-    /// normalization, so `--strict-config` and `--strict_config` are one flag
-    /// and both spellings of every entry below are exempt.
+    /// in frp-rs's `_` spelling.
+    ///
+    /// Go's `config.WordSepNormalizeFunc` normalizes the **other** way — it
+    /// rewrites every `_` in a queried name to `-`
+    /// (`pkg/config/flags.go:31-36`, `strings.ReplaceAll(name, "_", "-")`),
+    /// which is what makes `--strict_config` find the flag registered as
+    /// `strict_config`; both spellings therefore resolve to one registry entry
+    /// and `hasNoOptDefVal` answers for both. frp-rs's [`consumes_value`] folds
+    /// the token's `-` into `_` before the lookup, which is the same
+    /// membership test in the opposite direction (the exemption is a set, so up
+    /// to spelling there is no difference) — see that function for the
+    /// measured end-to-end parity.
     ///
     /// Every entry is measured on Go v0.71.0 (the probes are tabulated in
     /// `docs/developing.md` § CLI inputs); the *complement* is the interesting
@@ -1169,9 +1241,10 @@ impl RootCommand {
 /// This is the **whole** implemented surface: Go's `frpc --help` also lists
 /// `nathole` (not implemented in frp-rs) and the cobra built-ins `completion`
 /// and `help`, so `frpc -c cfg.toml nathole` stays a leftover-token refusal
-/// here. The set is not hand-trusted: `every_known_subcommand_name_has_a_parser_branch`
-/// runs each name through `frpc_parser` and fails on a name with no command,
-/// and `the_known_subcommand_list_is_exactly_the_parser_branches` fails when the
+/// here. The set is not hand-trusted: `every_known_subcommand_name_selects_its_own_branch`
+/// runs each name through `frpc_parser` and fails on a name with no command (or
+/// one that selects a different branch), and
+/// `the_known_subcommand_list_is_exactly_the_parser_branches` fails when the
 /// list and the parser disagree in the other direction too.
 const FRPC_SUBCOMMANDS: [&str; 12] = [
     "tcp", "udp", "http", "https", "stcp", "xtcp", "sudp", "tcpmux", "verify", "reload", "status",
@@ -1183,9 +1256,9 @@ const FRPC_SUBCOMMANDS: [&str; 12] = [
 /// One name, because `verify` is the only `frps` child frp-rs implements; Go's
 /// `frps --help` additionally lists the cobra built-ins `completion` and `help`
 /// (measured), which stay refusals here exactly as they do on `frpc`.
-/// `every_known_subcommand_name_has_a_parser_branch` pins this list against the
-/// parser's own branches, so a name without a command (or a command missing
-/// from the list) fails.
+/// `the_frps_command_list_is_exactly_the_parser_branches` pins this list against
+/// the parser's own branches in both directions, so a name without a command
+/// (or a command missing from the list) fails.
 const FRPS_SUBCOMMANDS: [&str; 1] = ["verify"];
 
 /// The pflag **bool** long flags of Go's `frps` root command, normalized to `_`.
@@ -1288,9 +1361,10 @@ fn consumes_value(s: &OsStr, root: RootCommand) -> bool {
     }
     match s.as_bytes() {
         [b'-', b'-', rest @ ..] if !rest.is_empty() => {
-            // pflag looks the name up through `WordSepNormalizeFunc`, which
-            // folds `-` into `_`, so `--strict-config` and `--strict_config`
-            // both find the same registry entry.
+            // Go's `WordSepNormalizeFunc` rewrites `_` to `-` before the pflag
+            // lookup (`pkg/config/flags.go:31-36`), so `--strict_config` and
+            // `--strict-config` are one flag; folding the token the other way
+            // (`-` to `_`) is the same membership test against this set.
             let name = String::from_utf8_lossy(rest).replace('-', "_");
             !root.bool_root_flags().contains(&name.as_str())
         }
@@ -4511,6 +4585,13 @@ mod hoist_tests {
         frps_parser().to_options().run_inner(&prepared[..])
     }
 
+    /// The `frps` **run-path** parser ([`frps_args`]) only, for the assertions
+    /// that the two extensions are still accepted there. The whole surface is
+    /// [`run_frps_cmd`].
+    fn parse_frps_run(args: &[&str]) -> Result<FrpsArgs, bpaf::ParseFailure> {
+        frps_args().to_options().run_inner(args)
+    }
+
     fn run_frpc(args: &[&str]) -> Result<FrpcCmd, bpaf::ParseFailure> {
         let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
         let prepared = prepared_cli_argv(&argv, RootCommand::Frpc);
@@ -5186,6 +5267,65 @@ mod hoist_tests {
         match run_frps_cmd(&["--bind-port", "7000"]).expect("run mode parses") {
             FrpsCmd::Run(args) => assert_eq!(args.bind_port, Some(7000)),
             other => panic!("expected the frps run path, got {other:?}"),
+        }
+    }
+
+    /// The two **frp-rs-only** `frps` root flags must not ride into `verify`,
+    /// where Go's `frps` answers `unknown flag: …` with rc 1. They are the
+    /// complete extension set, measured by diffing the two binaries' rendered
+    /// `--help` flag lists: frp-rs-only = {`config-dir`, `log-format`}, Go-only =
+    /// {`vhost-http-timeout`}.
+    ///
+    /// Measured on Go v0.71.0, stdout 0 B and stderr 1 line + usage in both
+    /// cases: `frps verify --log-format json -c <valid>` → rc **1** `Error:
+    /// unknown flag: --log-format`; `frps verify --config-dir <dir> -c <valid>`
+    /// → rc **1** `Error: unknown flag: --config-dir`. Before the
+    /// [`FrpsRootSlots`] fix the first printed `syntax is ok` and exited **0** —
+    /// a validation command reporting success for an argv Go rejects, exactly the
+    /// reason `--config-dir` was refused from the start.
+    ///
+    /// `--log-format` is pinned in both directions: the run path still parses it
+    /// (a documented extension there, used as `frps --log-format json -c <cfg>`),
+    /// and the verify path refuses every spelling.
+    #[test]
+    fn frps_verify_refuses_the_run_paths_extension_flags() {
+        assert_eq!(
+            parse_frps_run(&["--log-format", "json"])
+                .expect("the run path keeps the --log-format extension")
+                .log_format
+                .as_deref(),
+            Some("json")
+        );
+        assert_eq!(
+            parse_frps_run(&["--log_format", "json"])
+                .expect("the underscore alias is the same run-path extension")
+                .log_format
+                .as_deref(),
+            Some("json")
+        );
+        assert_eq!(
+            parse_frps_run(&["--config-dir", "conf.d"])
+                .expect("the run path keeps the --config-dir extension")
+                .config_dir
+                .as_deref(),
+            Some("conf.d")
+        );
+
+        for args in [
+            &["verify", "--log-format", "json", "-c", "x.toml"][..],
+            &["verify", "--log_format", "json", "-c", "x.toml"][..],
+            &["verify", "--log-format=json", "-c", "x.toml"][..],
+            &["verify", "-c", "x.toml", "--log-format", "json"][..],
+            &["verify", "--config-dir", "conf.d", "-c", "x.toml"][..],
+            &["verify", "--config_dir", "conf.d", "-c", "x.toml"][..],
+        ] {
+            let err = run_frps_cmd(args)
+                .expect_err(&format!("{args:?} must be refused on the verify path"))
+                .unwrap_stderr();
+            assert!(
+                err.contains("is not expected in this context"),
+                "{args:?} must be a leftover-token refusal naming the flag, got {err:?}"
+            );
         }
     }
 }

@@ -131,6 +131,10 @@ jobs:
       # (`verify_subcommand_is_now_the_first_error_for_a_dash_config_value` →
       # `verify_subcommand_resolves_so_the_dash_config_value_is_the_first_error`,
       # which nets zero). A re-point is not an added test: 19 + 7 = 26.
+      # 26 → 27 in the review-fix round: +1
+      # (`verify_refuses_the_two_frp_rs_only_root_flags_like_go`), pinning the
+      # verify path's refusal of the two frp-rs-only root flags — the behavioural
+      # fix of that round.
       # The client file gained one test since (`oidc_construction_failure_exits_3_
       # whatever_the_issuer_path`), but it is `#[cfg(feature = "full")]`: `oidc` is
       # not in the `tiny` feature set, so `frpc-tiny` cannot reach
@@ -138,7 +142,7 @@ jobs:
       # flip control replaced the single-name store test rather than adding one.
       # `FRPC_TINY_CLI_TESTS` therefore stays 11, while the `full` lane in
       # "Run frpc CLI tests" went 9 → 10.
-      FRPS_CLI_TESTS: "26"
+      FRPS_CLI_TESTS: "27"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
       FRPC_TINY_CLI_TESTS: "11"

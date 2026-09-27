@@ -1626,3 +1626,93 @@ fn repeated_config_flags_refuse_with_the_multiple_times_message() {
         "the first `-c` must have taken `--strict-config=false` as its value; output={all:?}"
     );
 }
+
+/// `frps verify` must refuse the two **frp-rs-only** `frps` root flags, because
+/// Go's `frps` refuses them. Measured on Go v0.71.0 with the streams separated
+/// and the exit status read directly: `frps verify --log-format json -c <valid>`
+/// and `frps verify --config-dir <dir> -c <valid>` are each rc **1**, stdout
+/// 0 B, stderr `Error: unknown flag: --log-format` / `--config-dir` plus the
+/// usage block.
+///
+/// This is the pin for the round's one behavioural fix: before it,
+/// `frps verify --log-format json -c <valid>` printed
+/// `frps: the configuration file <valid> syntax is ok` and exited **0** — a
+/// validation command reporting success for an argv Go rejects, which is the
+/// exact reason `--config-dir` was already refused on this branch. The control
+/// at the end keeps the fix from over-reaching: both flags are *documented
+/// extensions on the run path*, and the run path still parses them there.
+///
+/// The two flags are the complete extension set (measured by diffing the two
+/// binaries' rendered `--help` flag lists: frp-rs-only = {`config-dir`,
+/// `log-format`}, Go-only = {`vhost-http-timeout`}).
+#[test]
+fn verify_refuses_the_two_frp_rs_only_root_flags_like_go() {
+    let port = ephemeral_port();
+    let dir = TempDir::new();
+    let cfg = valid_config(&dir, port);
+    let missing = dir.path("does-not-exist.toml");
+
+    for (args, flag) in [
+        (
+            vec!["verify", "--log-format", "json", "-c", cfg.as_str()],
+            "--log-format",
+        ),
+        (
+            vec!["verify", "--log-format=json", "-c", cfg.as_str()],
+            "--log-format",
+        ),
+        (
+            vec!["verify", "--log_format", "json", "-c", cfg.as_str()],
+            "--log_format",
+        ),
+        (
+            vec!["verify", "--config-dir", "conf.d", "-c", cfg.as_str()],
+            "--config-dir",
+        ),
+        (
+            vec!["verify", "--config_dir", "conf.d", "-c", cfg.as_str()],
+            "--config_dir",
+        ),
+    ] {
+        let out = run_frps(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{args:?} must be refused with rc 1, as Go refuses it \
+             (stdout={:?} stderr={:?})",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        assert!(
+            stdout_of(&out).is_empty(),
+            "{args:?} must not reach the loader at all — no `syntax is ok`, and no load \
+             error either, because the flag is refused first; stdout={:?}",
+            stdout_of(&out),
+        );
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains(flag) && stderr.contains("not expected"),
+            "{args:?} must name {flag} as the token it could not place; stderr={stderr:?}",
+        );
+    }
+
+    // Control: the run path still accepts the same extension, so the refusal
+    // above is about the *verify* surface and not about dropping the flag. The
+    // witness is the load error naming the missing path — a parse refusal would
+    // name the flag instead and print nothing.
+    let out = run_frps(&["--log-format", "json", "-c", &missing]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the run path must still parse --log-format (stdout={:?} stderr={:?})",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stdout_of(&out).starts_with(&format!("{missing}: failed to read config file:")),
+        "the run path must have accepted --log-format and reached the loader; \
+         stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
