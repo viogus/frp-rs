@@ -1541,7 +1541,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `:1359` round's probe directory; `frpc verify -c` on each, Go vs frp-rs.
 
 
-- [ ] **`frpc` panics on SIGTERM when more than one visitor shares a `bind_port` (pre-existing;
+- [x] **`frpc` panics on SIGTERM when more than one visitor shares a `bind_port` (pre-existing;
   now reachable from a `[range:...]` template).** Found by R1 while reviewing `:1359`, reproduced
   here on both the base and head binaries. Three `stcp` visitors with the same `bind_port` (the
   legacy template's shape: `[range:rv] … role = visitor … bind_port = <one port>`) start fine; on
@@ -1556,6 +1556,45 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `bind_port`, and a regression test pins it for both the explicit and the range spelling.
   Reproducer: `/tmp/lip/probe6.sh <label> <frpc> <frps> <explicit|range> <runs>` from the `:1359`
   round (it also shows base range-3 at 0/3).
+  **Done:** root-caused and fixed in `shutdown_visitor_tasks` (`frp-client/src/service.rs`). That
+  function's `join_all` polls every visitor `JoinHandle`; the losers of a shared `bind_port` return
+  from `run_visitor_listener` at once (`frp-client/src/visitor.rs:1203-1208`), so `join_all` takes
+  their output while the winner sits in `accept()`, and the 500ms timeout's abort branch then
+  awaited those already-consumed handles a second time — tokio panics on that (`core.rs:427`). The
+  abort branch now snapshots `is_finished()` before aborting and awaits only the handles that were
+  still pending, so each handle is polled at most once. Measured with the same probes as above
+  (Rust frps + frpc, free ports, children reaped; `leftover` empty every run): explicit-3
+  **3/3 panics (rc 101) → 0/5 (rc 0)**, range-3 **3/3 (rc 101) → 0/5 (rc 0)**, explicit-2
+  **3/3 → 0/3**. The general precondition is *not* the shared port: it is "≥1 visitor task completed
+  before the grace window closed while ≥1 was still parked", proven by a distinct-`bind_port` case
+  (two visitors, one port held externally) that also panicked **3/3** before and is **0/3** after;
+  that case is pinned by the third regression test. Controls, unchanged by the fix: N=1 visitor
+  **0/3 both before and after** (rc 0), N=3 visitors on distinct free ports **0/3 both** (rc 0),
+  single visitor whose port is externally held **0/3 both** (rc 0). The "one binds, the rest fail"
+  shape Go has is kept: every run still logs exactly 2 `Address already in use` lines, and the
+  500ms grace is unchanged (skipping a finished handle can only return sooner).
+  Go v0.71.0 parity, stated precisely: on the default TCP transport Go is **killed by SIGTERM**
+  (rc **143** 3/3, no panic) because it installs its handler only for kcp/quic
+  (`cmd/frpc/sub/root.go:206-209`), while logging the same two
+  `start error: listen tcp 127.0.0.1:<port>: bind: address already in use`
+  (`client/visitor/visitor_manager.go:132`); with `protocol = kcp` and a Go frps `kcpBindPort` the
+  same three-visitor config exits **0** (measured). So frp-rs is strictly better on TCP (clean rc 0
+  where Go dies by signal) and equal on kcp; the loser shape matches in both.
+  Pinned by `frp-server/tests/visitor_multi_sigterm.rs` (explicit, range, and held-port; each sends
+  SIGTERM to the real `frpc` and asserts rc 0, no `panicked at`, and the expected loser count) plus
+  the in-process `service::tests::shutdown_visitor_tasks_tolerates_a_completed_handle` and
+  `shutdown_visitor_tasks_releases_listeners` (`frp-client/src/service.rs`). Red evidence: the
+  binary-level file fails **3/3** against a saved pre-fix `frpc` with the exact panic line (the
+  rc-0 assertion is never reached), and the first unit test fails on the pre-fix hunk with
+  `panicked at … core.rs:427: JoinHandle polled after completion`.
+  Class sweep (nothing else has the "poll to `Ready`, then poll again" shape): the only other
+  `join_all` teardown — work-conn, `frp-client/src/service.rs:4032` — drops its handles after a
+  timeout instead of re-awaiting them; the `timeout(&mut handle)` sites only ever poll again after a
+  *Pending* poll (ssh_gateway's `terminate_ssh_session`, the control writer); the `select!` arm on
+  `&mut session_task` (`frp-server/src/ssh_gateway.rs:4326`) consumes its one `Ready` and the `None`
+  branch is the only path that polls further; and every `JoinSet` drain uses
+  `join_next`/`try_join_next`, which remove the completed task from the set, so no task is polled
+  twice. Details and per-site reasons: the PR body.
 
 
 - [x] **`frpc reload` / `frpc status` silently ignore a config that fails to load, and talk to
