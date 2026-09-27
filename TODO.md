@@ -3310,7 +3310,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `-hc` a parser error like pflag's — the help-rendering shape difference is a separate, larger row
   — or record the rows in `docs/developing.md` § `--flag=<bool>` as deliberate with the reason.
   No sha.
-- [ ] **Exit codes `3`/`4` on daemon service-construction failures are frp-rs extensions where Go
+- [x] **Exit codes `3`/`4` on daemon service-construction failures are frp-rs extensions where Go
   exits 1.** Measured at the head of the CLI-exit branch on Go v0.71.0 darwin/arm64 and the frp-rs
   debug binaries:
   * **The `EXIT_AUTH`/3 example is `auth.tokenSource`, not the empty token.** With
@@ -3342,6 +3342,50 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   test pinning each reachable arm. **The second half is now partly done** — the doc states them
   and two measured inputs are pinned; what remains is the decision, plus pinning the
   `frps`-side 3 and the oidc-no-issuer construction path if they are kept. No sha.
+  **Done (head `889317e`, 2026-09-27): the codes are kept, as deliberate extensions, and every
+  reachable arm is now pinned — the closing half of this item is the decision, and the other half
+  is the typed classification in the item below.** The argument, written out in
+  `docs/developing.md` § CLI exit codes and in `CHANGELOG.md`: collapsing to Go's 1 removes no
+  *compatibility* risk, because Go's CLI is zero-or-nonzero and every frp-rs construction failure
+  is already nonzero — a Go-compatible caller checks for 0, not for 1 specifically — while it
+  would delete a documented per-class signal this repo already keeps for `EXIT_CONFIG`/2 (a
+  surface Go answers with 0). What was not defensible was how the code was *chosen*, and that is
+  what the second item changed. What would reverse the choice is stated in the doc: a Go per-class
+  scheme, or a caller found that must see exactly 1 — then the whole change is to return
+  `EXIT_RUNTIME` from the three daemon arms.
+  **Re-measured 2026-09-27** against Go v0.71.0 (darwin/arm64) and `main`'s `d0f9ec5` binaries,
+  one fresh config and one fresh port per (case, binary), rc captured directly from the child,
+  stdout/stderr in separate files, every child bounded at 8 s and reaped:
+  * `auth.tokenSource` → missing file, on **both** `frps` and `frpc`: Go rc **1** (the frps row
+    printed `failed to resolve auth.tokenSource: failed to read file …` on stdout), frp-rs rc
+    **3**. Both binaries, so the frps-side 3 the Done-when asked for is pinned.
+  * `frps` with `[auth] method = "token"`, `token = ""`: frp-rs rc **3**; Go **still running
+    after 8 s** (`frps started successfully`, then SIGTERM'd by the probe). Confirmed as recorded
+    — a *hardening divergence*, not a code divergence, and it now has its own pin rather than
+    being argued from the 3/4 decision (it survives a collapse, as exit 1).
+  * `frps` on a genuinely occupied `bindPort`: frp-rs rc **1** — the `EXIT_BIND` arm is *not*
+    reached by a port conflict, because the listener binds inside `service.run()`. Confirmed
+    for **both** binaries. The first attempt at this row was a **harness fault, recorded so it
+    is not repeated**: holding the port with an IPv4 `0.0.0.0` socket while frps used its
+    default `bindAddr = "0.0.0.0"` (`pkg/config/v1/server.go:110`) left Go listening on the
+    **IPv6** wildcard and the holder on the IPv4 one — `lsof` showed both in `LISTEN` in the
+    same run, which is not a conflict. Setting `bindAddr = "127.0.0.1"` on both sides gives the
+    real thing: Go rc **1** (`create server listener error, listen tcp 127.0.0.1:<port>:
+    bind: address already in use`), frp-rs rc **1** (`Address already in use (os error 48)`).
+  * `frps` with `[auth] method = "oidc"` and no issuer: frp-rs rc **3**; Go **panics** and exits
+    **2**. Confirmed as recorded, and now pinned.
+  * A rejected login with `loginFailExit = true` — recorded in the item, not re-measured here.
+  **Pins added** (all in `frps/tests/cli_exit_codes.rs`): the tokenSource → 3 arm,
+  `empty_token_refusal_is_a_hardening_divergence_go_does_not_have` (asserting the *absence* of a
+  Go comparison, i.e. the refusal's message, not a Go rc), and
+  `oidc_without_an_issuer_is_refused_with_3_where_go_panics`. The `frps` guard literal moved
+  **16 → 19** in `.github/workflows/ci.yml` in the same commit as the change, and both lanes'
+  guard logic was driven locally: the right value passes, a wrong value exits 1 with the
+  direction-aware message
+  (`lists 19 tests, env.FRPS_CLI_TESTS is 16: move the single env.FRPS_CLI_TESTS value …`). The
+  `tiny` lane's literal stayed **11**.
+  **Least sure:** the rejected-login row is the one evidence row taken from the item rather than
+  re-measured at this head.
 - [ ] **Go has `frps verify`, frp-rs has no `frps verify` at all.** Measured on Go v0.71.0 and the
   frp-rs debug binary: `frps verify -c goodfrps.toml` → Go rc **0**, stdout `frps: the
   configuration file goodfrps.toml syntax is ok`; `frps verify -c badportfrps.toml` → Go rc **1**
@@ -3362,7 +3406,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   tripwire working as designed, not a regression: update the test (and the row in
   `docs/developing.md` § CLI inputs) to the new error at the same time, and do not delete the test to
   make it pass.
-- [ ] **The `3`-vs-`4` exit code is chosen by a substring match on the formatted error, so the
+- [x] **The `3`-vs-`4` exit code is chosen by a substring match on the formatted error, so the
   *same* failure exits differently depending on a path or URL inside it.** `is_token_error`
   (`frp-core/src/logging.rs:474`) is `msg.contains("token") || msg.contains("auth")`, and the
   daemons call it on `e.to_string()` of a service-construction error
@@ -3383,6 +3427,43 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `ConfigError` at the construction boundary) instead of by substring, so the code cannot depend
   on the text; then give 3 and 4 one measured input each, and either delete the substring helper
   or document it as a heuristic with its false positives named. No sha.
+  **Done (head `889317e`, 2026-09-27): classification is by kind, and the substring helper is
+  deleted.** `frp_core::init_error::InitErrorKind` (`Auth` → 3, `Other` → 4) is attached where the
+  `Service` constructor raises the error and is carried by a typed `ConstructError` the
+  constructors return; the three daemon arms read only `e.kind().exit_code()`
+  (`frpc/src/main.rs` `run_normal` + `run_single_proxy`, `frps/src/main.rs`'s init-error arm), and
+  **`logging::is_token_error` no longer exists**. `frp-core/src/init_error.rs` asserts the
+  kind → code mapping literally and that the kind is independent of the displayed text.
+  **The flip control, before and after** — the item's own two names, one run each, one fresh
+  config and one fresh port per run, rc captured directly from the child, stdout/stderr separate:
+  * **Before (`main` = `d0f9ec5` binaries)**: `authstore.json` → frp-rs **3**, Go **1**;
+    `plainstore.json` → frp-rs **4**, Go **1**. Go's message is
+    `failed to create store source: failed to load existing data: failed to parse JSON: invalid
+    character 'h' in literal true (expecting 'r')` (stdout, 137 B, stderr 0); frp-rs's is a
+    `tracing` ANSI record on stdout, stderr 0.
+  * **After (head)**: `authstore.json` → frp-rs **4**, `plainstore.json` → frp-rs **4** — one
+    code for one failure class. Go is unchanged at **1** on both names.
+  The two codes now have one measured input each: **3** = `auth.tokenSource` on a missing file
+  (both `frps` and `frpc`; Go 1), **4** = the malformed `[store]` file (Go 1). The regression is
+  pinned by
+  `frpc/tests/cli_exit_codes.rs::malformed_store_file_exits_4_regardless_of_the_file_name`, which
+  replaces the old single-name `…_where_go_exits_1` test (same test count, so the `tiny` guard
+  literal stays 11) and runs both names — one failure class, both 4.
+  **A reversion to a text match fails that test — measured, not asserted:** re-introducing
+  `e.to_string().contains("token") || …contains("auth")` in `frpc`'s arm made the test fail on the
+  `authstore.json` iteration with `left: Some(3)`, `right: Some(4)`; restoring the typed arm made
+  it pass. The `is_token_error` site itself carries a comment at
+  `frp-core/src/logging.rs` saying why it must not come back.
+  **Corrected from the item's own text**: the daemon site was `frpc/src/main.rs:583` in the
+  frame the item was written in; at `d0f9ec5` it is `:592` (`run_normal`) and `:731`
+  (`run_single_proxy`), and the frps arm is `:228`.
+  **Not shown by this probe:** the OIDC `/authz` vs `/zzz` half. Measured *after* the change with
+  a mock discovery endpoint serving a `jwks_uri`, frp-rs exits **3** for either issuer path; the
+  *pre-change* flip on that path was not reproduced, because the mock made Go panic before frp-rs's
+  old behaviour could be observed in the same run. The flip evidence is the `[store]` pair above.
+  **Pinning gap closed, not argued away:** the old test used `badstore.json` and could not catch
+  the flip; the new one uses `authstore.json` *and* `plainstore.json`, and neither path contains
+  `token`, so moving the auth-bearing arm to 3 can only come from a text match on `auth`.
 
 ---
 
