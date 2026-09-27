@@ -324,9 +324,15 @@ jobs:
         # (TODO.md "The rest of the server-side completion is not Go's"): an
         # empty `--bind-addr`/`--dashboard-addr` must pass through
         # `ServerConfig::complete` exactly as Go completes its merged struct.
-        # Without this step the file executed in no lane — the step above is
-        # target-specific (`--test cli_exit_codes`) and every other lane that
-        # runs a test target is `-p frp-server`.
+        # Without this step the file executed in no lane. Of the `frps` package's
+        # targets, the only one any lane ran was `--test cli_exit_codes`
+        # (the step above); `frps/src` carries **no** `#[test]`/`#[tokio::test]`
+        # (so the package's lib/bin targets are empty) and `frps/tests/` holds
+        # only these two files, so this file was genuinely the one target the job
+        # had never executed. The other `cargo test` steps in this workflow are
+        # other packages (`-p frp-core`, `-p frpc`, `-p frp-client`,
+        # `-p frp-server`, and the `--workspace --lib` step, whose `--lib`
+        # restricts it to library targets).
         #
         # `--features dashboard` is load-bearing: the dashboard regression (an
         # empty `--dashboard-addr` handed to the listener as `:<port>`) is only
@@ -347,11 +353,23 @@ jobs:
         #
         # The same feature flag is what keeps this step clear of the artifact
         # swap: a plain `cargo test -p frps` builds `target/debug/frps` **without**
-        # the dashboard (TODO.md's feature-swap item) and would leave a swapped
-        # artifact behind for any later step in this job; this step's build
-        # carries the dashboard. Whichever step runs last in this job decides
-        # what `target/debug/frps` holds, which is why the `--features dashboard`
-        # lane that needs the marker builds it immediately before running.
+        # the dashboard (TODO.md's feature-swap item), and this step's test
+        # invocation compiles the dashboard-enabled graph instead. Measured here
+        # (macOS, warm, marker = `grep -ac "Dashboard listening on"
+        # target/debug/frps`): after `cargo test -p frps` the marker is 0; after
+        # this step's `cargo test -p frps --features dashboard --test
+        # cli_completion` it is 1, and it stays 1 on a repeat; a later plain
+        # `cargo build -p frps` resets it to 0, and a later `cargo build -p frps
+        # --features dashboard` sets it back to 1. So this step leaves a
+        # **dashboard** artifact behind, which is the safe direction for any
+        # later consumer, and no step in this job consumes `target/debug/frps` as
+        # a dashboard binary anyway (this file resolves the binary through
+        # `CARGO_BIN_EXE_frps`); the `Tests (server integration)` job runs on its
+        # own runner and builds the dashboard artifact itself. The point of the
+        # flag is that the dashboard-shaped assertions execute with a dashboard
+        # binary — and the test file re-checks the marker in the resolved binary
+        # at run time, so a swapped artifact would take the documented inert
+        # branch rather than silently pass as dashboard coverage.
         run: cargo test -p frps --features dashboard --test cli_completion
       - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
         # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag
