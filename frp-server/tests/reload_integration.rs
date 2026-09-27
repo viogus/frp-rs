@@ -7,8 +7,10 @@ mod common;
 
 #[cfg(unix)]
 mod unix_tests {
+    use crate::common::ChildGuard;
     use std::io::{Read, Write};
     use std::net::TcpStream;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::Duration;
@@ -254,23 +256,27 @@ remote_port = {proxy_a_remote}
         std::fs::write(&frpc_config_path, &frpc_config_initial).unwrap();
 
         // ---- Step 4: Start frps ----
-        let mut frps = Command::new(&frps_bin)
-            .arg("-c")
-            .arg(&frps_config_path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("failed to start frps");
+        let mut frps = ChildGuard::new(
+            Command::new(&frps_bin)
+                .arg("-c")
+                .arg(&frps_config_path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to start frps"),
+        );
         assert!(wait_for_port(bind_port, 10), "frps did not start");
 
         // ---- Step 5: Start frpc ----
-        let mut frpc = Command::new(&frpc_bin)
-            .arg("-c")
-            .arg(&frpc_config_path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("failed to start frpc");
+        let mut frpc = ChildGuard::new(
+            Command::new(&frpc_bin)
+                .arg("-c")
+                .arg(&frpc_config_path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to start frpc"),
+        );
 
         // Wait for proxy A to be ready (poll the remote port).
         assert!(
@@ -351,11 +357,10 @@ remote_port = {proxy_b_remote}
         );
         assert_eq!(echo_b_result.unwrap(), b"hello-from-b".to_vec());
 
-        // Cleanup
-        let _ = frpc.kill();
-        let _ = frps.kill();
-        let _ = frpc.wait();
-        let _ = frps.wait();
+        // Cleanup: the guards would do this on drop, but keep the explicit
+        // order so a failure below still reads the same.
+        frpc.kill_and_reap();
+        frps.kill_and_reap();
         stop_tcp_echo_server(echo_a_handle, echo_a_tx);
         stop_tcp_echo_server(echo_b_handle, echo_b_tx);
     }
@@ -496,13 +501,15 @@ transport.tcp_mux = false
         .unwrap();
 
         // ---- Step 4: Start frps and frpc ----
-        let mut frps = Command::new(&frps_bin)
-            .arg("-c")
-            .arg(&frps_config_path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("failed to start frps");
+        let mut frps = ChildGuard::new(
+            Command::new(&frps_bin)
+                .arg("-c")
+                .arg(&frps_config_path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to start frps"),
+        );
         assert!(wait_for_port(bind_port, 10), "frps did not start");
 
         // frpc runs with RUST_LOG=info and its stdout/stderr captured to a
@@ -514,14 +521,16 @@ transport.tcp_mux = false
             .open(&frpc_log_path)
             .expect("create frpc log file");
         let frpc_log_stdout = frpc_log.try_clone().expect("clone frpc log file");
-        let mut frpc = Command::new(&frpc_bin)
-            .arg("-c")
-            .arg(&frpc_config_path)
-            .env("RUST_LOG", "info")
-            .stdout(std::process::Stdio::from(frpc_log))
-            .stderr(std::process::Stdio::from(frpc_log_stdout))
-            .spawn()
-            .expect("failed to start frpc");
+        let mut frpc = ChildGuard::new(
+            Command::new(&frpc_bin)
+                .arg("-c")
+                .arg(&frpc_config_path)
+                .env("RUST_LOG", "info")
+                .stdout(std::process::Stdio::from(frpc_log))
+                .stderr(std::process::Stdio::from(frpc_log_stdout))
+                .spawn()
+                .expect("failed to start frpc"),
+        );
 
         // Wait for tcp-h to be ready and working.
         assert!(
@@ -631,11 +640,10 @@ transport.tcp_mux = false
             "added health-checked proxy's Recover found no config — never re-registered after recovery"
         );
 
-        // Cleanup
-        let _ = frpc.kill();
-        let _ = frps.kill();
-        let _ = frpc.wait();
-        let _ = frps.wait();
+        // Cleanup: the guards would do this on drop, but keep the explicit
+        // order so a failure below still reads the same.
+        frpc.kill_and_reap();
+        frps.kill_and_reap();
         stop_tcp_echo_server(echo_h_handle, echo_h_tx);
         stop_tcp_echo_server(echo_h2_handle, echo_h2_tx);
     }
@@ -733,22 +741,26 @@ health_check_max_failed = 1
 
         // ---- Step 3: start frps + frpc; the proxy registers via the first
         // healthy probe (Recover with the pristine was_failed=true state) ----
-        let mut frps = Command::new(&frps_bin)
-            .arg("-c")
-            .arg(&frps_config_path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("failed to start frps");
+        let mut frps = ChildGuard::new(
+            Command::new(&frps_bin)
+                .arg("-c")
+                .arg(&frps_config_path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to start frps"),
+        );
         assert!(wait_for_port(bind_port, 10), "frps did not start");
 
-        let mut frpc = Command::new(&frpc_bin)
-            .arg("-c")
-            .arg(&frpc_config_path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("failed to start frpc");
+        let mut frpc = ChildGuard::new(
+            Command::new(&frpc_bin)
+                .arg("-c")
+                .arg(&frpc_config_path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to start frpc"),
+        );
 
         assert!(
             wait_for_port(remote_h, 15),
@@ -764,8 +776,7 @@ health_check_max_failed = 1
 
         // ---- Step 4: kill frps; the remote port dies with the server while
         // the local echo stays up (probes keep succeeding) ----
-        let _ = frps.kill();
-        let _ = frps.wait();
+        frps.kill_and_reap();
         assert!(
             wait_for_port_closed(remote_h, 10),
             "remote port should close when frps dies"
@@ -773,13 +784,15 @@ health_check_max_failed = 1
 
         // ---- Step 5: restart frps on the same port; frpc reconnects
         // in-process and the monitor task survives the session boundary ----
-        let mut frps = Command::new(&frps_bin)
-            .arg("-c")
-            .arg(&frps_config_path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("failed to restart frps");
+        let mut frps = ChildGuard::new(
+            Command::new(&frps_bin)
+                .arg("-c")
+                .arg(&frps_config_path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to restart frps"),
+        );
         assert!(wait_for_port(bind_port, 10), "frps did not restart");
 
         // The proxy must re-register on the NEW session via the monitor's
@@ -798,11 +811,178 @@ health_check_max_failed = 1
         );
         assert_eq!(echo_result.unwrap(), b"hello-h-session-2".to_vec());
 
-        // Cleanup
-        let _ = frpc.kill();
-        let _ = frps.kill();
-        let _ = frpc.wait();
-        let _ = frps.wait();
+        // Cleanup: the guards would do this on drop, but keep the explicit
+        // order so a failure below still reads the same.
+        frpc.kill_and_reap();
+        frps.kill_and_reap();
         stop_tcp_echo_server(echo_h_handle, echo_h_tx);
+    }
+
+    /// True while `pid` names a live process. `kill -0` succeeds for one that
+    /// exists and fails with `ESRCH` once it has been reaped, which is the
+    /// state the guard's `Drop` leaves behind (`Child::wait` collects the exit
+    /// status, so the pid is gone rather than a zombie).
+    fn pid_alive(pid: u32) -> bool {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Panic payload → text, so the assertion below can check *which* panic
+    /// this test forced.
+    fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = payload.downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else {
+            "<non-string panic payload>".to_string()
+        }
+    }
+
+    /// The guard is a claim, so this measures it with the item's own failure
+    /// shape: `frpc` is spawned from a **mode-644 copy** of the real binary —
+    /// `.exists()` passes (which is what makes `workspace_bin` accept it), and
+    /// `Command::spawn` fails `EACCES`, not `ENOENT`.
+    ///
+    /// Pre-fix this is the item's reproduction: the panicking `.expect(..)` on
+    /// the `frpc` spawn ran *above* the cleanup `kill()`/`wait()` at the end of
+    /// the test body, so the `frps` started a moment earlier survived at
+    /// `PPID 1` holding its bind port (measured from the shell against the
+    /// unguarded shape: `pgrep -x frps` 0 → 1 once the harness exited; with the
+    /// guard: 0 — see `/tmp/reload-guards-report.md`).
+    ///
+    /// The panic is caught here rather than escaping, so the assertion can run
+    /// in the same process; the guard's `Drop` still runs *during that unwind*,
+    /// which is the whole claim. What this does not cover: the `abort` path
+    /// (`Drop` never runs there) and a process that leaves before the guard is
+    /// constructed — neither exists in this file, which spawns and guards
+    /// synchronously.
+    #[test]
+    fn spawn_failure_does_not_orphan_the_child_started_before_it() {
+        let frps_bin = workspace_bin("frps");
+        let frpc_bin = workspace_bin("frpc");
+        if !frps_bin.exists() || !frpc_bin.exists() {
+            eprintln!(
+                "Skipping: binaries not found ({}, {}) — build with: cargo build -p frps -p frpc",
+                frps_bin.display(),
+                frpc_bin.display(),
+            );
+            return;
+        }
+
+        // Its own free port (never 7000 — something holds it on this host) and
+        // its own temp dir, so this case shares no state with the three above.
+        let bind_port = allocate_port();
+        let dir = tempfile::TempDir::new().unwrap();
+        let frps_config_path = dir.path().join("frps.toml");
+        std::fs::write(
+            &frps_config_path,
+            format!(
+                "bind_addr = \"127.0.0.1\"\n\
+                 bind_port = {bind_port}\n\
+                 \n\
+                 [auth]\n\
+                 method = \"token\"\n\
+                 token = \"reload-guard-token\"\n\
+                 \n\
+                 [transport]\n\
+                 tcp_mux = false\n"
+            ),
+        )
+        .unwrap();
+
+        // The item's input shape. `workspace_bin`-style resolution checks only
+        // `.exists()`, so this file is accepted and the failure lands on the
+        // spawn — which is exactly the ordering the item records.
+        let unexecutable = dir.path().join("frpc-mode-644");
+        std::fs::copy(&frpc_bin, &unexecutable).expect("copy frpc for the mode-644 shape");
+        std::fs::set_permissions(&unexecutable, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod the frpc copy to mode 644");
+        assert!(
+            unexecutable.exists(),
+            "the mode-644 copy must exist: that is what made `.exists()` accept it"
+        );
+
+        let mut observed_pid = 0u32;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Guard constructed before the first wait — the ordering the
+            // item's done-when requires.
+            let frps = ChildGuard::new(
+                Command::new(&frps_bin)
+                    .arg("-c")
+                    .arg(&frps_config_path)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("failed to start frps"),
+            );
+            observed_pid = frps.id();
+            assert!(wait_for_port(bind_port, 10), "frps did not start");
+
+            // Witness the failure *kind* separately from the panic, so a spawn
+            // error for any other reason cannot be read as this shape.
+            let err = Command::new(&unexecutable)
+                .arg("-c")
+                .arg(&frps_config_path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .err()
+                .expect("spawning a mode-644 file must fail");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "the mode-644 shape must fail with EACCES, got: {err}"
+            );
+
+            // And the pre-fix shape itself: this `.expect(..)` panics while
+            // `frps` is still a live child holding `bind_port`.
+            let _frpc = Command::new(&unexecutable)
+                .arg("-c")
+                .arg(&frps_config_path)
+                .spawn()
+                .expect("failed to start frpc");
+        }));
+
+        let payload = caught.expect_err("the mode-644 frpc spawn must panic");
+        let msg = panic_text(&*payload);
+        assert!(
+            msg.contains("failed to start frpc"),
+            "the panic must come from the frpc spawn this test forces; got: {msg}"
+        );
+        assert_ne!(
+            observed_pid, 0,
+            "the guarded frps never started, so the assertions below would pass vacuously"
+        );
+
+        // Drop ran during the unwind: the child is killed and reaped, so its
+        // pid is gone and the port it held is free again. Reap a regression's
+        // survivor before failing — this test is *about* leaked children, so it
+        // must not leak one itself.
+        let alive = pid_alive(observed_pid);
+        if alive {
+            let _ = Command::new("kill")
+                .args(["-9", &observed_pid.to_string()])
+                .status();
+        }
+        assert!(
+            !alive,
+            "the guarded frps (pid {observed_pid}) outlived the panic in the same process; \
+             `ChildGuard::drop` must kill and reap during unwinding"
+        );
+        assert!(
+            wait_for_port_closed(bind_port, 10),
+            "127.0.0.1:{bind_port} is still accepting connections after the panic, so the \
+             guarded child (or another) still holds it"
+        );
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", bind_port)).is_ok(),
+            "127.0.0.1:{bind_port} is not rebindable after the panic"
+        );
     }
 }
