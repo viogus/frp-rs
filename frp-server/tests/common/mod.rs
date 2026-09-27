@@ -595,12 +595,18 @@ pub async fn login_with_test_token(
 /// **Build ordering.** In a `dashboard`-enabled run this resolution also
 /// verifies that the resolved artifact carries the dashboard listener and
 /// panics with a rebuild instruction when it does not (see
-/// [`assert_frps_has_dashboard`]). The check exists because
-/// `cargo test -p frps` — and any `cargo clippy` run that recompiles `frps` —
-/// overwrites `target/debug/frps` with the **no-dashboard** artifact, after
-/// which this lane reports `frps dashboard_port not ready` for every test with
-/// nothing in the output naming the cause. Build the dashboard artifact
-/// immediately before the lane, in this order:
+/// [`assert_frps_has_dashboard`]). The check exists because **a build of the
+/// `frps` bin from the crate's default features rewrites `target/debug/frps`
+/// without the dashboard** — `cargo test -p frps` (any invocation of that crate,
+/// `-- --list` included, because its test target links the bin via
+/// `CARGO_BIN_EXE_frps`: measured 1 → 0 in 0.167 s) and a plain
+/// `cargo build -p frps` *even when cargo treats it as a no-op* (measured: the
+/// marker goes 1 → 0, in 0.16 s) — after which
+/// this lane reports `frps dashboard_port not ready` for every test with nothing
+/// in the output naming the cause. A clippy run is **not** a cause:
+/// `touch frps/src/main.rs && cargo clippy -p frps --all-targets --all-features`
+/// left the artifact byte-identical (same size and mtime; measured). Build the
+/// dashboard artifact immediately before the lane, in this order:
 ///
 /// ```text
 /// cargo build -p frps --features dashboard
@@ -648,17 +654,26 @@ pub fn frps_binary() -> String {
 pub const DASHBOARD_LISTEN_MARKER: &str = "Dashboard listening on";
 
 /// Whether the file at `path` carries [`DASHBOARD_LISTEN_MARKER`].
-/// `None` when the file cannot be read at all (missing, a directory, no
-/// permission): a binary that does not exist is a *different* failure whose
-/// existing `Command::spawn` error (`Os { code: 2, kind: NotFound }`) is the
-/// better message, so this guard stays silent there rather than blaming a
+///
+/// `None` when the path cannot be stat'd or read **at all** — missing, a
+/// directory, or a file this user has no read permission for. A file that *is*
+/// readable always gives `Some(..)`, whatever its permission bits: a mode-644
+/// artifact with no execute bit is `Some(false)`, and the guard then panics
+/// with the rebuild instruction rather than staying silent, because the bytes —
+/// not the mode — decide (the panic reports the mode; see
+/// [`assert_frps_has_dashboard`]). A *missing* binary is a different failure
+/// whose existing `Command::spawn` error (`Os { code: 2, kind: NotFound }`) is
+/// the better message, so this guard stays silent there rather than blaming a
 /// feature.
 ///
 /// Cost: one `read` of the artifact plus a byte scan — no compile, no child
-/// process, no network. The debug artifact is large (`target/debug/frps`
-/// measured 71,033,304 bytes at this head) and a full read+scan of it measured
-/// **61.45 ms** (`/tmp/scan-cost.rs`, `rustc -O`, 50 iterations, this host), so
-/// the verdict is cached per process — see [`DASHBOARD_VERDICTS`].
+/// process, no network. Measured with `/tmp/scan-cost.rs` (`rustc -O`, 50
+/// iterations, this host): **28.83 ms** for the dashboard artifact this lane
+/// resolves (81,444,248 bytes at this head) and 61.45 ms for the
+/// 71,033,304-byte no-dashboard one (measured cold, just after a fresh link) —
+/// the scan stops at the first hit, so where the marker sits in the file
+/// matters as much as its size. Either way it is cached per process — see
+/// [`DASHBOARD_VERDICTS`].
 #[allow(dead_code)]
 pub fn dashboard_listener_present(path: &str) -> Option<bool> {
     let meta = std::fs::metadata(path).ok()?;
@@ -703,53 +718,94 @@ struct CachedDashboardVerdict {
 /// Per-process cache of [`dashboard_listener_present`] verdicts, keyed by the
 /// **exact path string** the caller resolved (a relative and an absolute
 /// spelling of the same file are two entries, never a collision). The dashboard
-/// lane resolves one artifact once per test it spawns (~30 in `cargo test -p
-/// frp-server --features dashboard -j 1`), and each uncached verdict costs a
-/// 61 ms scan of the 71 MB debug artifact; caching takes that to one scan per
+/// lane resolves one artifact once per test it spawns — 46 spawn sites across
+/// 5 test binaries at this head — and each uncached verdict costs a 28.83 ms
+/// read+scan of the 81 MB dashboard artifact; caching takes that to one scan per
 /// test binary instead of one per spawn.
+///
+/// **What no test observes.** The cache lives for one process and every
+/// `cargo test` test binary is a fresh process, so the shipped tests cannot tell
+/// a cache hit from a re-scan: they pin the verdict, not the caching. The
+/// freshness key below is reasoned about rather than pinned.
 ///
 /// **Residual, stated rather than hidden:** `(len, mtime)` cannot notice a swap
 /// that preserves *both* — a `cp -p` or a cache restore that stamps the original
 /// mtime onto an identically sized no-dashboard artifact would keep the stale
-/// verdict. Cargo always writes a fresh mtime, so the swap this guard exists for
-/// (`cargo test -p frps` / `cargo clippy -p frps`) does fire. Closing the
-/// residual would need an inode or a content probe; an inode add is cheap but
-/// does not cover a copy onto a fresh inode, and a content probe is either a
-/// second full read (defeating the cache) or a hash of the same size — judged
+/// verdict. Cargo writes a fresh mtime for the swap this guard exists for (both
+/// `cargo test -p frps` and a plain `cargo build -p frps` replaced the file
+/// wholesale, marker 1 → 0, measured), so it does fire. Closing the residual
+/// would need an inode or a content probe; an inode add is cheap but does not
+/// cover a copy onto a fresh inode, and a content probe is either a second full
+/// read (defeating the cache) or a hash of the same size — judged
 /// over-engineering for a harness guard that already fails loudly and
 /// self-explainingly in the case it is built for.
 static DASHBOARD_VERDICTS: LazyLock<
     Mutex<std::collections::HashMap<String, CachedDashboardVerdict>>,
 > = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// The permission bits of `path` (`None` where they do not apply — non-unix —
+/// or the file cannot be stat'd). Used only to report the one fact that
+/// separates "not a dashboard build" from "not runnable at all".
+#[allow(dead_code)]
+fn file_mode(path: &str) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Panic with a self-explaining message when `bin` is readable but does not
 /// carry the dashboard listener.
 ///
 /// This is hazard (a) of `TODO.md` (item “Two test-harness hazards”): the
-/// dashboard lane resolves its `frps` through [`frps_binary`], and a
-/// `cargo test -p frps` / `cargo clippy -p frps` run silently replaces that
-/// artifact with the no-dashboard build. Without this check the lane then
-/// fails 20/20 with `frps dashboard_port not ready: "port N not ready after
-/// 15s"` and leaks the children that were waiting (hazard (b)), with nothing
-/// in the output saying why. Pinned by
-/// `frp-server/tests/frps_binary_guard.rs`.
+/// dashboard lane resolves its `frps` through [`frps_binary`], and a build of
+/// `frps` from the crate's default features (`cargo test -p frps`, or a plain
+/// `cargo build -p frps`) silently replaces that artifact with the no-dashboard
+/// one. Without this check the lane then fails 20/20 with
+/// `frps dashboard_port not ready: "port N not ready after 15s"` and leaks the
+/// children that were waiting (hazard (b)), with nothing in the output saying
+/// why. Pinned by `frp-server/tests/frps_binary_guard.rs`.
 #[allow(dead_code)]
 pub fn assert_frps_has_dashboard(bin: &str) {
-    if dashboard_listener_present(bin) == Some(false) {
-        panic!(
-            "resolved frps binary `{bin}` does not carry the dashboard listener \
-             (`{DASHBOARD_LISTEN_MARKER}` is absent from the file), so every dashboard test \
-             in this lane would fail with `frps dashboard_port not ready` after its 15s wait \
-             and no hint of the cause. The usual cause is that `cargo test -p frps` or a \
-             `cargo clippy` run that recompiles `frps` replaced this artifact with the \
-             no-dashboard build. Fix: rebuild `frps --features dashboard`, then run this lane \
-             in that order:\n  \
-             cargo build -p frps --features dashboard\n  \
-             cargo test -p frp-server --features dashboard -j 1\n\
-             The path checked is the one this lane resolved (FRPS_BIN / CARGO_BIN_EXE_frps / \
-             ../frps / ../target/<profile>/frps); see the doc comment on `frps_binary`."
-        );
+    if dashboard_listener_present(bin) != Some(false) {
+        return;
     }
+    // A file with no execute bit is readable and marker-less, but
+    // `Command::spawn` on it fails with `PermissionDenied` (measured for a
+    // mode-644 file: `Os { code: 13, kind: PermissionDenied }`) — a different
+    // problem from a missing feature, so say which file this is.
+    let mode_note = match file_mode(bin) {
+        Some(m) if m & 0o111 == 0 => format!(
+            "; `{bin}` is mode {m:o}, i.e. not executable, and `Command::spawn` on it would fail \
+             with `PermissionDenied` — if that is your symptom, this is not a dashboard-feature \
+             problem"
+        ),
+        Some(m) => format!("; `{bin}` is mode {m:o}"),
+        None => String::new(),
+    };
+    panic!(
+        "resolved frps binary `{bin}` does not carry the dashboard listener \
+         (`{DASHBOARD_LISTEN_MARKER}` is absent from the file{mode_note}), so every dashboard test \
+         in this lane would fail with `frps dashboard_port not ready` after its 15s wait \
+         and no hint of the cause. The usual cause is a build of `frps` from the crate's default \
+         features — any `cargo test -p frps …` (`-- --list` included), or a plain \
+         `cargo build -p frps`, even a cached no-op — which rewrote this path without the \
+         dashboard (a clippy run does not: measured, it leaves the artifact byte-identical). \
+         Fix: rebuild `frps --features dashboard`, then run this lane in that \
+         order:\n  \
+         cargo build -p frps --features dashboard\n  \
+         cargo test -p frp-server --features dashboard -j 1\n\
+         The path checked is the one this lane resolved (FRPS_BIN / CARGO_BIN_EXE_frps / \
+         ../frps / ../target/<profile>/frps); see the doc comment on `frps_binary`."
+    );
 }
 
 /// A spawned real `frps` child whose stdout **and** stderr are redirected to a
