@@ -2979,8 +2979,11 @@ of decision and would otherwise read as an oversight: **cobra's `completion` and
 `help` are not implemented on either binary, and `frps` now has a command list
 they are absent from.** Measured on Go v0.71.0, `frps help` prints the root help
 (rc 0) and `frps completion` prints its own help (rc 0); on this head both are
-rc **1** (`` `help` is not expected in this context `` / `` `completion` is not
-expected in this context ``), exactly as `frpc` has always answered them.
+rc **1**, exactly as `frpc` has always answered them. The rc is the shared part,
+not the wording: `frps` says `` `help` is not expected in this context `` /
+`` `completion` is not expected in this context ``, while `frpc help` answers
+with its positional-suggestion sentence (`no such command or positional: …`,
+with a `did you mean` hint) because `frpc` has that parser and `frps` does not.
 `FRPS_SUBCOMMANDS` (`frp-core/src/cli.rs`) therefore lists only `verify`, and the
 list is pinned against the parser's branches in both directions by
 `the_frps_command_list_is_exactly_the_parser_branches`. **Decision: recorded, not
