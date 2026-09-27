@@ -112,10 +112,12 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
         cli.log_file.clone(),
         cfg.map(|c| c.log.file.as_str()).unwrap_or(""),
     );
-    let max_days = cli
-        .log_max_days
-        .or(cfg.map(|c| c.log.max_days))
-        .unwrap_or(3);
+    // `resolve_log_max_days` filters the CLI zero value (Go's `util.EmptyOr(0,
+    // 3)`), so `--log-max-days 0` uses the completed config value — which this
+    // lane has just set to 3 — instead of disabling startup cleanup. The
+    // observable is synchronous: `init_tracing` calls `cleanup_expired_logs`
+    // when `max_days > 0`.
+    let max_days = logging::resolve_log_max_days(cli.log_max_days, cfg.map(|c| c.log.max_days));
     let format = logging::resolve_log_format(
         cli.log_format.clone(),
         cfg.map(|c| c.log.format.as_str()).unwrap_or("text"),

@@ -2891,6 +2891,157 @@ fn log_format_preserved_when_absent() {
     assert_eq!(cfg.format, "text");
 }
 
+// ── LogConfig completion (Go `LogConfig.Complete()`) ───────────────
+//
+// Go's `ServerConfig.Complete()` calls `c.Log.Complete()`
+// (`pkg/config/v1/server.go:105`) and the client's calls the same thing at
+// `pkg/config/v1/client.go:94`. The body is three `util.EmptyOr` fills
+// (`pkg/config/v1/common.go:119-123`), and `util.EmptyOr`
+// (`pkg/util/util/types.go:17-23`) fills the type's ZERO value — so an explicit
+// `""`/`0` is filled, not only an absent key. That zero-value semantics is the
+// whole point: the serde defaults on `LogConfig` fire only when the key is
+// absent, so before this the explicit-empty shapes reached `init_logging` and
+// silenced the logger. Measured on the pre-fix binary (own free port, flags-only
+// lane, stdout and stderr counted separately BEFORE any signal):
+// `frps --log-level ""` → 0 B stdout / 0 B stderr, listener up;
+// `frps --log-file ""` → 0 B / 0 B **and** a `frps.log.<date>` created in the
+// CWD; `frps --log-max-days 0` → logs normally but with retention disabled.
+// Go v0.71.0 with the same flags logs its startup lines on stdout and binds.
+
+/// The absent-vs-empty split, for all three Go fields, on the type itself.
+#[test]
+fn log_config_absent_keys_keep_serde_defaults_and_empty_ones_are_filled() {
+    // ABSENT: the serde default must already be in place, and `complete()` must
+    // be a no-op on it.
+    let mut absent: super::LogConfig = toml::from_str("").unwrap();
+    assert_eq!(absent.level, "info", "serde default for an ABSENT level");
+    assert_eq!(
+        absent.file, "console",
+        "serde default for an ABSENT to/file"
+    );
+    assert_eq!(absent.max_days, 3, "serde default for an ABSENT maxDays");
+    let before = absent.clone();
+    absent.complete();
+    assert_eq!(absent.level, before.level);
+    assert_eq!(absent.file, before.file);
+    assert_eq!(absent.max_days, before.max_days);
+
+    // PRESENT-BUT-EMPTY/ZERO: deserialization alone must NOT default these —
+    // that is the defect — and `complete()` is what fills them.
+    let mut present: super::LogConfig =
+        toml::from_str("level = \"\"\nto = \"\"\nmax_days = 0\n").unwrap();
+    assert_eq!(present.level, "", "deserialization alone must not default");
+    assert_eq!(present.file, "", "deserialization alone must not default");
+    assert_eq!(
+        present.max_days, 0,
+        "deserialization alone must not default"
+    );
+    present.complete();
+    assert_eq!(present.level, "info");
+    assert_eq!(present.file, "console");
+    assert_eq!(present.max_days, 3);
+
+    // The `maxDays` camelCase alias and the frp-rs `file` spelling reach the
+    // same field as `to`, and are completed identically.
+    for toml in ["maxDays = 0\n", "file = \"\"\n", "to = \"\"\n"] {
+        let mut cfg: super::LogConfig = toml::from_str(toml).unwrap();
+        cfg.complete();
+        assert_eq!(cfg.max_days, 3, "maxDays under {toml:?}");
+        assert_eq!(cfg.file, "console", "file/to under {toml:?}");
+    }
+
+    // Every explicit NON-empty/non-zero value passes through verbatim — the
+    // fill is an `EmptyOr`, not a re-default of the field.
+    let mut kept: super::LogConfig =
+        toml::from_str("level = \"trace\"\nto = \"/var/log/frps.log\"\nmax_days = 0\n").unwrap();
+    kept.complete();
+    assert_eq!(kept.level, "trace");
+    assert_eq!(kept.file, "/var/log/frps.log");
+    assert_eq!(kept.max_days, 3, "0 is the zero value -> filled");
+
+    let mut negative: super::LogConfig =
+        toml::from_str("level = \"warn\"\nto = \"console\"\nmax_days = -1\n").unwrap();
+    negative.complete();
+    assert_eq!(
+        negative.max_days, -1,
+        "only the zero value is filled; a negative maxDays is explicit"
+    );
+}
+
+/// The frp-rs-only `format` field must NOT be completed, because Go has nothing
+/// to complete it with: Go v0.71.0's `LogConfig`
+/// (`pkg/config/v1/common.go:103-117`) has no `Format` field, and `--log-format`
+/// is `unknown flag` on the real binary (measured: `frps --log-format ""` →
+/// `Error: unknown flag: --log-format` + usage on **stderr**, 2368 B, rc 1,
+/// nothing listening). `resolve_log_format` already maps `""` to `"text"`, so
+/// adding a fill here would be a second, differently-placed mapping for a field
+/// Go does not have.
+#[test]
+fn log_config_completion_leaves_format_alone() {
+    let mut cfg: super::LogConfig = toml::from_str("format = \"\"\n").unwrap();
+    assert_eq!(
+        cfg.format, "",
+        "the frp-rs extension is not serde-defaulted"
+    );
+    cfg.complete();
+    assert_eq!(
+        cfg.format, "",
+        "format has no Go completion to mirror; resolve_log_format handles it"
+    );
+    assert_eq!(
+        crate::logging::resolve_log_format(None, &cfg.format),
+        "text"
+    );
+}
+
+/// The completion must be reachable through the **server** and **client**
+/// config-level entry points, not just on `LogConfig` — this is the
+/// "precedent applied to one slot and not its sibling" pin. Go calls
+/// `c.Log.Complete()` from both `ServerConfig.Complete()`
+/// (`pkg/config/v1/server.go:105`) and `ClientCommonConfig.Complete()`
+/// (`pkg/config/v1/client.go:94`).
+#[test]
+fn server_and_client_config_completion_both_fill_the_log_section() {
+    // Server: the CLI-override lane writes these values before `complete()`.
+    let mut server: ServerConfig =
+        serde_json::from_value(serde_json::json!({ "bindPort": 19841 })).unwrap();
+    server.log.file = String::new();
+    server.log.level = String::new();
+    server.log.max_days = 0;
+    server.complete();
+    assert_eq!(server.log.file, "console");
+    assert_eq!(server.log.level, "info");
+    assert_eq!(server.log.max_days, 3);
+
+    // Client: `log.file = "" / level = "" / max_days = 0` in the file (frpc does
+    // not overlay its CLI flags onto the loaded config).
+    let mut client: ClientConfig = serde_json::from_value(serde_json::json!({
+        "serverAddr": "127.0.0.1",
+        "serverPort": 19842,
+        "log": { "to": "", "level": "", "maxDays": 0 }
+    }))
+    .unwrap();
+    assert_eq!(client.log.file, "");
+    client.complete_with_heartbeat_set(false, false);
+    assert_eq!(client.log.file, "console");
+    assert_eq!(client.log.level, "info");
+    assert_eq!(client.log.max_days, 3);
+
+    // And the resolved logging inputs the binaries actually pass to
+    // `init_tracing` come out of the completed config rather than the raw one:
+    // an empty file no longer resolves to a *path*, and an empty level no longer
+    // resolves to the empty string.
+    assert_eq!(
+        crate::logging::resolve_log_file(None, &server.log.file),
+        None,
+        "console means stdout"
+    );
+    assert_eq!(
+        crate::logging::resolve_log_level(None, Some(&server.log.level), "debug"),
+        "info"
+    );
+}
+
 // ── MEDIUM-4: WebServer addr default ────────────────────────────────
 
 #[test]
