@@ -227,6 +227,7 @@ pub async fn read_until_eof(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
 /// allocate_port would otherwise let a second test grab the port before
 /// the first test's server binds it (CI flake: a tcpmux CONNECT landing on
 /// a foreign listener → connection reset).
+#[allow(dead_code)]
 static USED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// RAII guard holding an exclusive flock(2) on the shared port-allocation
@@ -237,6 +238,7 @@ static USED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(H
 /// one `allocate_port` call, so two bins can never both confirm the same
 /// ephemeral port is free and hand it out at once.
 #[cfg(unix)]
+#[allow(dead_code)]
 struct PortRequestGuard {
     file: std::os::fd::OwnedFd,
 }
@@ -258,6 +260,7 @@ impl Drop for PortRequestGuard {
 /// is kept in the OS temp dir so every test-bin process resolves the same
 /// path; the file is never deleted (it is a persistent flock anchor).
 #[cfg(unix)]
+#[allow(dead_code)]
 fn acquire_port_request_lock() -> PortRequestGuard {
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
     let path = std::env::temp_dir().join("frp-test-port-alloc.lock");
@@ -284,9 +287,11 @@ fn acquire_port_request_lock() -> PortRequestGuard {
 /// (flock(2) is unix-only; the target platforms are macOS + Linux CI). Keeps
 /// the `let _lock = acquire_port_request_lock();` call site cfg-free.
 #[cfg(not(unix))]
+#[allow(dead_code)]
 struct PortRequestGuard;
 
 #[cfg(not(unix))]
+#[allow(dead_code)]
 fn acquire_port_request_lock() -> PortRequestGuard {
     PortRequestGuard
 }
@@ -310,6 +315,7 @@ fn acquire_port_request_lock() -> PortRequestGuard {
 /// `TODO.md` (the `allocate_port` addendum). Closing it needs a holder that
 /// survives until the child binds (or a retry on bind failure), not a wider
 /// lock here.
+#[allow(dead_code)]
 pub fn allocate_port() -> u16 {
     // Serialize the whole probe→confirm→hand-out across processes so the
     // probe-then-drop window cannot be interleaved by another test bin. This
@@ -338,6 +344,7 @@ pub fn allocate_port() -> u16 {
 }
 
 /// Bind to an ephemeral port and return the kernel-assigned number.
+#[allow(dead_code)]
 fn probe_ephemeral_port() -> Option<u16> {
     let socket = TcpSocket::new_v4().ok()?;
     socket.bind("127.0.0.1:0".parse().unwrap()).ok()?;
@@ -346,6 +353,7 @@ fn probe_ephemeral_port() -> Option<u16> {
 
 /// Re-bind `port` to confirm it is still available (the probe socket was
 /// dropped, so a concurrent test could have taken it in between).
+#[allow(dead_code)]
 fn port_is_free(port: u16) -> bool {
     TcpSocket::new_v4()
         .and_then(|s| s.bind(format!("127.0.0.1:{port}").parse().unwrap()))
@@ -356,6 +364,7 @@ fn port_is_free(port: u16) -> bool {
 /// Tests that need the port will bind to 0 and read the actual port.
 /// Deterministic per process, so walk past ports already handed out to
 /// avoid handing the same fallback port to two tests.
+#[allow(dead_code)]
 fn sandbox_fallback() -> u16 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
@@ -582,9 +591,28 @@ pub async fn login_with_test_token(
 ///   2. `CARGO_BIN_EXE_frps` (set by cargo when frps *is* a dependency)
 ///   3. `../frps` in the workspace root (downloaded release)
 ///   4. `../target/{profile}/frps` (built from source)
+///
+/// **Build ordering.** In a `dashboard`-enabled run this resolution also
+/// verifies that the resolved artifact carries the dashboard listener and
+/// panics with a rebuild instruction when it does not (see
+/// [`assert_frps_has_dashboard`]). The check exists because
+/// `cargo test -p frps` — and any `cargo clippy` run that recompiles `frps` —
+/// overwrites `target/debug/frps` with the **no-dashboard** artifact, after
+/// which this lane reports `frps dashboard_port not ready` for every test with
+/// nothing in the output naming the cause. Build the dashboard artifact
+/// immediately before the lane, in this order:
+///
+/// ```text
+/// cargo build -p frps --features dashboard
+/// cargo test  -p frp-server --features dashboard -j 1
+/// ```
+///
+/// The ordering, why it matters, and the failure it used to cause silently are
+/// also recorded in `docs/developing.md` § Testing → “The `dashboard` lane:
+/// build ordering”, which is where a local run reads them.
 #[allow(dead_code)]
 pub fn frps_binary() -> String {
-    std::env::var("FRPS_BIN")
+    let bin = std::env::var("FRPS_BIN")
         .or_else(|_| std::env::var("CARGO_BIN_EXE_frps"))
         .or_else(|_| {
             let local = "../frps";
@@ -601,7 +629,127 @@ pub fn frps_binary() -> String {
                 "release"
             };
             format!("../target/{}/frps", profile)
-        })
+        });
+    // Only the dashboard lane requires the dashboard listener: a test target
+    // compiled without the `dashboard` feature may legitimately point
+    // `FRPS_BIN` at a no-dashboard build.
+    #[cfg(feature = "dashboard")]
+    assert_frps_has_dashboard(&bin);
+    bin
+}
+
+/// The listener line `frp-server/src/dashboard.rs` emits **after** its
+/// `TcpListener::bind` succeeds (`dashboard.rs:3772` plain, `:3759` TLS). It is
+/// a plain byte string in a `--features dashboard` artifact and absent from a
+/// no-dashboard one — measured at the head of `fix/harness-hazards` across
+/// `cargo test -p frps`: `grep -ac` 1 → 0 and `strings | grep -c` 2 → 0 (the
+/// two are the plain and the TLS format string, which is why this needle stops
+/// before the `{}` / ` (TLS)` suffix and therefore matches both).
+pub const DASHBOARD_LISTEN_MARKER: &str = "Dashboard listening on";
+
+/// Whether the file at `path` carries [`DASHBOARD_LISTEN_MARKER`].
+/// `None` when the file cannot be read at all (missing, a directory, no
+/// permission): a binary that does not exist is a *different* failure whose
+/// existing `Command::spawn` error (`Os { code: 2, kind: NotFound }`) is the
+/// better message, so this guard stays silent there rather than blaming a
+/// feature.
+///
+/// Cost: one `read` of the artifact plus a byte scan — no compile, no child
+/// process, no network. The debug artifact is large (`target/debug/frps`
+/// measured 71,033,304 bytes at this head) and a full read+scan of it measured
+/// **61.45 ms** (`/tmp/scan-cost.rs`, `rustc -O`, 50 iterations, this host), so
+/// the verdict is cached per process — see [`DASHBOARD_VERDICTS`].
+#[allow(dead_code)]
+pub fn dashboard_listener_present(path: &str) -> Option<bool> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let (len, mtime) = (meta.len(), meta.modified().ok());
+    // The lock is scoped to this block on purpose: it must not be held across
+    // the `std::fs::read` below (a guard held across a panic is a new failure
+    // mode in a function whose whole job is to report one).
+    let cached = {
+        let verdicts = DASHBOARD_VERDICTS.lock().unwrap();
+        verdicts.get(path).map(|c| (c.len, c.mtime, c.present))
+    };
+    if let Some((cached_len, cached_mtime, present)) = cached {
+        if cached_len == len && cached_mtime == mtime {
+            return Some(present);
+        }
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let needle = DASHBOARD_LISTEN_MARKER.as_bytes();
+    let present = bytes.windows(needle.len()).any(|w| w == needle);
+    DASHBOARD_VERDICTS.lock().unwrap().insert(
+        path.to_string(),
+        CachedDashboardVerdict {
+            len,
+            mtime,
+            present,
+        },
+    );
+    Some(present)
+}
+
+/// Length + mtime witness for [`DASHBOARD_VERDICTS`]; a mismatch means the file
+/// was replaced and the scan must run again.
+struct CachedDashboardVerdict {
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+    present: bool,
+}
+
+/// Per-process cache of [`dashboard_listener_present`] verdicts, keyed by the
+/// **exact path string** the caller resolved (a relative and an absolute
+/// spelling of the same file are two entries, never a collision). The dashboard
+/// lane resolves one artifact once per test it spawns (~30 in `cargo test -p
+/// frp-server --features dashboard -j 1`), and each uncached verdict costs a
+/// 61 ms scan of the 71 MB debug artifact; caching takes that to one scan per
+/// test binary instead of one per spawn.
+///
+/// **Residual, stated rather than hidden:** `(len, mtime)` cannot notice a swap
+/// that preserves *both* — a `cp -p` or a cache restore that stamps the original
+/// mtime onto an identically sized no-dashboard artifact would keep the stale
+/// verdict. Cargo always writes a fresh mtime, so the swap this guard exists for
+/// (`cargo test -p frps` / `cargo clippy -p frps`) does fire. Closing the
+/// residual would need an inode or a content probe; an inode add is cheap but
+/// does not cover a copy onto a fresh inode, and a content probe is either a
+/// second full read (defeating the cache) or a hash of the same size — judged
+/// over-engineering for a harness guard that already fails loudly and
+/// self-explainingly in the case it is built for.
+static DASHBOARD_VERDICTS: LazyLock<
+    Mutex<std::collections::HashMap<String, CachedDashboardVerdict>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Panic with a self-explaining message when `bin` is readable but does not
+/// carry the dashboard listener.
+///
+/// This is hazard (a) of `TODO.md` (item “Two test-harness hazards”): the
+/// dashboard lane resolves its `frps` through [`frps_binary`], and a
+/// `cargo test -p frps` / `cargo clippy -p frps` run silently replaces that
+/// artifact with the no-dashboard build. Without this check the lane then
+/// fails 20/20 with `frps dashboard_port not ready: "port N not ready after
+/// 15s"` and leaks the children that were waiting (hazard (b)), with nothing
+/// in the output saying why. Pinned by
+/// `frp-server/tests/frps_binary_guard.rs`.
+#[allow(dead_code)]
+pub fn assert_frps_has_dashboard(bin: &str) {
+    if dashboard_listener_present(bin) == Some(false) {
+        panic!(
+            "resolved frps binary `{bin}` does not carry the dashboard listener \
+             (`{DASHBOARD_LISTEN_MARKER}` is absent from the file), so every dashboard test \
+             in this lane would fail with `frps dashboard_port not ready` after its 15s wait \
+             and no hint of the cause. The usual cause is that `cargo test -p frps` or a \
+             `cargo clippy` run that recompiles `frps` replaced this artifact with the \
+             no-dashboard build. Fix: rebuild `frps --features dashboard`, then run this lane \
+             in that order:\n  \
+             cargo build -p frps --features dashboard\n  \
+             cargo test -p frp-server --features dashboard -j 1\n\
+             The path checked is the one this lane resolved (FRPS_BIN / CARGO_BIN_EXE_frps / \
+             ../frps / ../target/<profile>/frps); see the doc comment on `frps_binary`."
+        );
+    }
 }
 
 /// A spawned real `frps` child whose stdout **and** stderr are redirected to a
@@ -667,7 +815,9 @@ impl Drop for CapturedFrps {
 }
 
 /// Handle to a running frps child process with dashboard.
-/// Kills the process on drop.
+/// Kills and reaps the process on drop — including on the panic path inside
+/// [`FrpsHandle::start`], which is why the handle is constructed *before* the
+/// first wait there.
 #[allow(dead_code)]
 pub struct FrpsHandle {
     child: Child,
@@ -678,10 +828,21 @@ pub struct FrpsHandle {
 }
 
 impl FrpsHandle {
-    /// Start frps with the given TOML config content.
-    /// Returns handle after both bind_port and dashboard_port are accepting connections.
+    /// Start frps with the given TOML config content, waiting up to 15s per
+    /// port. Returns the handle after both `bind_port` and `dashboard_port` are
+    /// accepting connections and `/healthz` answers.
     #[allow(dead_code)]
     pub async fn start(config_content: &str) -> Self {
+        Self::start_with_timeout(config_content, Duration::from_secs(15)).await
+    }
+
+    /// [`Self::start`] with an explicit per-wait budget. The budget is a
+    /// parameter so the test that forces a wait failure (and pins that no child
+    /// outlives it) does not have to sit out the production 15s first —
+    /// `frp-server/tests/frps_handle_orphan.rs`. It is otherwise not used: every
+    /// production call site goes through [`Self::start`].
+    #[allow(dead_code)]
+    pub async fn start_with_timeout(config_content: &str, wait: Duration) -> Self {
         let config_dir = tempfile::TempDir::new().unwrap();
         let config_path = config_dir.path().join("frps.toml");
         std::fs::write(&config_path, config_content).unwrap();
@@ -726,14 +887,30 @@ impl FrpsHandle {
             .spawn()
             .expect("failed to start frps");
 
+        // The kill-on-drop guard is constructed **before the first wait**, on
+        // purpose. `Child`'s own `Drop` does not kill, and `Self::drop` is the
+        // only thing that does, so an `.expect()` that panics on one of the
+        // waits below while the child is still a bare local leaves a live
+        // `frps` behind with `PPID 1` and its `TempDir` already removed — the
+        // orphan wave measured when the dashboard lane runs against the
+        // no-dashboard artifact (17 children at `PPID 1`, 20 listeners, in
+        // `TODO.md`'s “Two test-harness hazards” item). Do not inline the
+        // waits back above this binding.
+        let handle = Self {
+            child,
+            bind_port,
+            dashboard_port,
+            _config_dir: config_dir,
+        };
+
         // Wait for ports
         if bind_port > 0 {
-            wait_tcp_port(bind_port, Duration::from_secs(15))
+            wait_tcp_port(bind_port, wait)
                 .await
                 .expect("frps bind_port not ready");
         }
         if dashboard_port > 0 {
-            wait_tcp_port(dashboard_port, Duration::from_secs(15))
+            wait_tcp_port(dashboard_port, wait)
                 .await
                 .expect("frps dashboard_port not ready");
         }
@@ -743,18 +920,13 @@ impl FrpsHandle {
         if dashboard_port > 0 {
             wait_http_ok(
                 &format!("http://127.0.0.1:{}/healthz", dashboard_port),
-                Duration::from_secs(15),
+                wait,
             )
             .await
             .expect("frps dashboard not healthy");
         }
 
-        Self {
-            child,
-            bind_port,
-            dashboard_port,
-            _config_dir: config_dir,
-        }
+        handle
     }
 
     #[allow(dead_code)]
