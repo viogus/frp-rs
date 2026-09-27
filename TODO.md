@@ -3085,7 +3085,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `cargo test -p frps`, `cargo test -p frpc` pass; `bash scripts/repo-health.sh` rc 0;
     `scripts/compat-test.sh` not run and not relevant — this is an argv-layer change with no wire
     effect (no protocol, transport, encryption or proxy code touched).
-- [ ] **A CLI failure's output shape is still not Go's: frp-rs prints a `tracing` line where Go
+- [x] **A CLI failure's output shape is still not Go's: frp-rs prints a `tracing` line where Go
   prints one bare error, and `verify` writes to stderr where Go writes to stdout.** Measured on Go
   v0.71.0 and on the head binaries while closing the exit-code item above (only the *exit code*
   was fixed there):
@@ -3099,6 +3099,117 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `--strict-config` item above).
   **Done-when:** either match Go's message shape and stream on these paths, or state the shape
   divergence in `docs/developing.md` § CLI exit codes as deliberate with the reason. No sha.
+  **Done (2026-09-27, branch `fix/cli-output-shape`, based on `main` @ `04959b1`).** Split per path:
+  the **stream and the line shape are matched** on all three load-failure paths named here, and the
+  **wording is recorded as a deliberate divergence**. `frps -c <bad>` — the same Go code shape, and
+  the same pre-fix output shape — was changed with `frpc`; leaving it would have been an
+  indefensible asymmetry.
+  * **The change.** `frpc/src/main.rs` (`run`'s single-config `Err` arm) and `frps/src/main.rs` (the
+    same arm) replace `init_logging(…, None)` + `tracing::error!(error = %e, "Failed to load
+    config: {}", e)` with `println!("{e}")`; `frpc/src/main.rs`'s `run_verify` moves both refusals
+    (the parse error and the oidc-without-feature refusal) from `eprintln!` to `println!`. Net diff
+    before carriers: `frpc/src/main.rs` +30/−… , `frps/src/main.rs`, and the two
+    `cli_exit_codes.rs` test files (assertions tightened, no test added or deleted). Exit codes are
+    unchanged (`EXIT_RUNTIME`/1 on every one of these paths). Anchors: Go's `fmt.Println(err);
+    os.Exit(1)` in `cmd/frpc/sub/root.go` (`RunE`), `cmd/frpc/sub/verify.go` (`verifyCmd`) and
+    `cmd/frps/root.go` (the `cfgFile != ""` arm); Go installs its logger only after a successful
+    load (`startServiceWithAggregator`), so dropping the `init_logging` call from the arm that exits
+    before any log record is also Go's ordering.
+  * **Measured 2026-09-27, Go v0.71.0 darwin/arm64 (`/private/tmp/frp_0.71.0_darwin_arm64`) vs the
+    frp-rs debug binaries, stdout and stderr redirected to separate files and the exit status read
+    directly from `wait` (never through a pipe), every child bounded and reaped:**
+
+    | command | Go stdout / stderr | frp-rs before | frp-rs at head |
+    |---|---|---|---|
+    | `frpc -c bad.toml` | 38 B `json: unknown field "notAKnownFrpKey"` / 0 B, rc 1 | stdout 268 B, ANSI `ERROR frpc: Failed to load config: … error=…`, stderr 0 B, rc 1 | stdout 75 B `unknown field "notAKnownFrpKey" in config file <path>`, stderr 0 B, rc 1 |
+    | `frpc verify -c bad.toml` | 38 B same text / 0 B, rc 1 | stderr 127 B `Config file <path> is invalid: …`, stdout 0 B, rc 1 | stdout 127 B `Config file <path> is invalid: unknown field … in config file <path>`, stderr 0 B, rc 1 |
+    | `frpc verify -c <missing>` | stdout `open <path>: no such file or directory` / 0 B, rc 1 | stderr 170 B, rc 1 | stdout 170 B `Config file <path> is invalid: <path>: failed to read config file: …`, stderr 0 B, rc 1 |
+    | `frps -c bad.toml` | 38 B same text / 0 B, rc 1 | stdout 276 B ANSI tracing line, stderr 0 B, rc 1 | stdout 79 B `unknown field "notAKnownFrpKey" in config file <path>`, stderr 0 B, rc 1 |
+    | `frpc verify -c good.toml` (control) | stdout 71 B `frpc: the configuration file <path> syntax is ok`, rc 0 | stdout 99 B `Config file <path> is valid` + 3 summary lines, rc 0 | **unchanged** — the success line was not in scope |
+    | `frpc --strict-config=foo -c good.toml` | **stderr** 1417 B pflag `invalid argument "foo" for "--strict-config" flag: …` + full cobra usage, stdout 0 B, rc 1 | stderr 45 B `` Error: `foo` is not expected in this context ``, rc 1 | **unchanged** — same stream, text and usage block differ (recorded; see below) |
+    | `frps -c --strict-config=false` / `-c -x` / `-c -c` / `-c --bind-port` | rc 1 `open <value>: no such file or directory` on stdout | stdout ANSI `Failed to load config: <value>: failed to read config file: …` | stdout `<value>: failed to read config file: …`, stderr 0 B, rc 1 |
+    | `frpc --config-dir <dir with a bad config>` | Go exits **0** (prints only `frpc service error for config file […]`) | stdout ANSI tracing lines, rc 2 | **unchanged** (extension surface, no Go line to match) |
+
+  * **Recorded, not matched: the wording.** frp-rs names the config file (`unknown field "x" in
+    config file <path>`, plus a `did you mean 'y'?` suggestion — `frp-core/src/config/strict.rs`'s
+    `check_strict_in`, levenshtein ≤ 3); Go prints the codec's `json: unknown field "x"` with **no**
+    path. Matching byte-for-byte would mean a literal `json: ` prefix on a message frp-rs also
+    emits for TOML/YAML/INI, and dropping the only file identity in `--config-dir` mode and in the
+    admin `reload`/`status`/`stop` refusals, which already print this same bare stdout line. The
+    `--strict-config=foo` row is the third recorded case: both binaries already write it to
+    **stderr** and exit 1, and only the text differs (Go's pflag sentence plus the whole cobra usage
+    block vs frp-rs's one shorter line) — that text is already carried by the space-separated
+    `--strict-config` item above and by `docs/developing.md` § `--strict-config`, so nothing was
+    changed for it here. `frpc verify`'s **success** line is a third adjacent divergence left alone
+    and stated: Go prints exactly `frpc: the configuration file <path> syntax is ok`, frp-rs prints
+    `Config file <path> is valid` + three indented summary lines; that is a success row, outside
+    this item's failure paths, so it is recorded in `docs/developing.md` rather than folded in.
+  * **Tests (assertions tightened; no test added or deleted, so the guarded counts do not move).**
+    `frpc/tests/cli_exit_codes.rs`: `daemon_bad_config_exits_1_and_names_the_unknown_field` and
+    `verify_bad_config_exits_1_and_names_the_unknown_field` now assert the **exact** stdout bytes and
+    an **empty stderr** (they previously concatenated the two streams); `verify_missing_config_exits_1`
+    asserts the stdout line starts with `Config file <path> is invalid: <path>:` and stderr is
+    empty; the tiny module's two tests get the same treatment for `frpc-tiny`.
+    `frps/tests/cli_exit_codes.rs`: the same exact-stdout/empty-stderr pin for
+    `bad_config_exits_1_and_names_the_unknown_field` and `missing_config_exits_1`;
+    `dash_shaped_config_value_is_the_value_not_a_flag` now asserts the load line on **stdout**
+    (a refusal leaves stdout empty) instead of the removed `Failed to load config` wording, and
+    `real_separator_and_dangling_config_stay_refused` swaps its negative
+    `!all.contains("Failed to load config")` for `!stdout.contains("failed to read config file")`,
+    which keeps the "the token after a real `--` was not taken as `-c`'s value" discrimination.
+    **Red evidence**: with the two `main.rs` files checked out at `04959b1` (pre-fix) and rebuilt,
+    the strengthened suite is **6 passed / 3 failed** in `cargo test -p frpc --test cli_exit_codes`
+    (daemon, verify-bad, verify-missing), **14 / 2 failed** in `-p frps` (bad, missing) and **6 / 5
+    failed** in the tiny lane — then 9/0, 16/0 and 11/0 at head. The three counts are unchanged
+    (`env.FRPS_CLI_TESTS` `16`, `env.FRPC_TINY_CLI_TESTS` `11`, both re-checked against
+    `-- --list`).
+  * **Carriers**: `docs/developing.md` § CLI exit codes gained a
+    **Output stream and shape on a config-load failure** subsection with the table above, the
+    recorded wording divergence and the adjacent `verify` success-line row; § CLI inputs' item (3)
+    ("a config load failure is written to stderr by `verify` only") was corrected to point at it;
+    `CHANGELOG.md` § Unreleased § Changed has one entry (a user-visible stream/shape change);
+    `TODO.md` gained the `--help=<bool>` subcommand item below (filed, not folded in here).
+  * **Gates at this head**: `cargo fmt --all -- --check` clean; `cargo clippy -p frp-core -p frps
+    -p frpc --all-targets --all-features -- -D warnings` clean; `cargo test -p frpc` (6 targets,
+    8+25+9+34+7+1 passed), `cargo test -p frps` (0+16), `cargo test -p frp-core --lib` (937) pass;
+    the tiny lane `cargo test -p frpc --no-default-features --features tiny --test cli_exit_codes`
+    11/0; `bash scripts/repo-health.sh` rc 0. `scripts/compat-test.sh` not run and **not relevant** —
+    no protocol, transport, encryption or proxy code was touched (the diff is two `println!` sites,
+    one removed `init_logging` call per daemon, test assertions and docs).
+- [ ] **`frpc --help=<bool> <subcommand>` does not follow Go: pflag's bool `--help` is
+  short-circuited by frp-rs's bpaf parser, so a subcommand's *help* and a real request are
+  confused.** Found by #387's Reviewer 1, whose report has the same rows on Go v0.71.0, that branch's
+  base head and its head. Re-measured here (2026-09-27) on Go v0.71.0 and on **this branch's base
+  head `04959b1` and its head** — identical on both, i.e. pre-existing and not this item's
+  done-when — with stdout and stderr captured separately, the exit status read from `wait` (never
+  through a pipe), and **one fresh listening socket per run** on the config's `[webServer] port` to
+  observe whether the admin port is dialled at all (connections counted by `accept`, never
+  inferred):
+  * `frpc --help=false status -c CFG` with `[webServer] port` **set** → Go **rc 1**, **1
+    connection**, stdout `Get "http://127.0.0.1:<port>/api/status": read tcp …: read: connection
+    reset by peer` (the listener closes immediately) — the flag is a pflag bool whose `false`
+    **runs status**. frp-rs **rc 0**, **0 connections**, prints `status`'s bpaf usage (1604 B) on
+    stdout.
+  * the same argv with **no** `[webServer] port` → Go **rc 1**, **0 connections**, stdout
+    `web server port should be set if you want to use this feature`; frp-rs **rc 0**, **0
+    connections**, the same bpaf usage. (Both Go rows exit 1; which one you get is the config, so
+    neither row alone pins "runs status".)
+  * `frpc --help=true status -c CFG` → Go **rc 0**, **0 connections**, stdout is `status`'s *help*
+    (`Overview of all proxies status` + `Usage: frpc status [flags]`, 627 B); frp-rs **rc 0**, **0
+    connections**, stdout is the bpaf *usage* text (1604 B) — a different document, not Go's help.
+  * `frpc -hc status` (pflag shorthand cluster: `-h` then `-c`, which needs a value) → Go **rc 1**,
+    **0 connections**, **stderr** `Error: flag needs an argument: 'c' in -c` plus `status`'s usage
+    (637 B), stdout 0 B; frp-rs **rc 0**, **0 connections**, prints `status`'s usage on stdout.
+  The root-command half of this class is already recorded — `--help`/`-h` is a Go pflag bool
+  (`frpc --help=false -c cfg` starts, rc 124) and bpaf's built-in here (prints help, rc 0) — in the
+  `--flag=<bool>` item's "deliberately left divergent" list; these four rows are the *subcommand*
+  case, where Go's bool resolves the command and frp-rs's built-in pre-empts it, and they are not
+  in that item's table.
+  **Done-when:** either make `--help=<bool>` a parsed bool that a subcommand can follow (so
+  `=false status` runs `status` and dials, and `=true status` prints Go's `status` help) and make
+  `-hc` a parser error like pflag's — the help-rendering shape difference is a separate, larger row
+  — or record the rows in `docs/developing.md` § `--flag=<bool>` as deliberate with the reason.
+  No sha.
 - [ ] **Exit codes `3`/`4` on daemon service-construction failures are frp-rs extensions where Go
   exits 1.** Measured at the head of the CLI-exit branch on Go v0.71.0 darwin/arm64 and the frp-rs
   debug binaries:
