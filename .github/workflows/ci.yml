@@ -329,11 +329,14 @@ jobs:
         # (the step above); `frps` declares no library target at all
         # (`cargo test -p frps --lib` is `error: no library targets found`) and
         # its `src/` carries no `#[test]`/`#[tokio::test]`, while `frps/tests/`
-        # holds only these two files — so this file was genuinely the one target
-        # the job had never executed. The other `cargo test` steps in this
-        # workflow are other packages (`-p frp-core`, `-p frpc`, `-p frp-client`,
-        # `-p frp-server`, and the `--workspace --lib` step, whose `--lib`
-        # restricts it to library targets).
+        # holds only these two files — so this file was genuinely the one **test**
+        # target the job had never executed. (The `frps` *bin* target **is**
+        # executed — by that step, and by the server-integration job through
+        # `FRPS_BIN`; the tiers this job never runs are `frps-tiny` and
+        # `frps-micro`.) The other `cargo test` steps in this workflow are other
+        # packages (`-p frp-core`, `-p frpc`, `-p frp-client`, `-p frp-server`,
+        # and the `--workspace --lib` step, whose `--lib` restricts it to library
+        # targets).
         #
         # `--features dashboard` is load-bearing: the dashboard regression (an
         # empty `--dashboard-addr` handed to the listener as `:<port>`) is only
@@ -364,9 +367,10 @@ jobs:
         # re-checks the marker in the binary it resolves at run time and would
         # take the documented inert branch rather than silently pass as dashboard
         # coverage. (The binary it resolves is `CARGO_BIN_EXE_frps`, which *is*
-        # `<target>/debug/frps`, so it is not insulated from a swap — the
-        # run-time marker check is what makes a swap visible rather than
-        # misleading.)
+        # `<target>/debug/frps`, so it is not insulated from a swap. What the
+        # run-time marker check buys is that a swapped artifact is not *mistaken
+        # for* dashboard coverage: the dashboard shapes then take their documented
+        # inert branch, quietly — the check does not itself raise an alarm.)
         run: cargo test -p frps --features dashboard --test cli_completion
       - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
         # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag

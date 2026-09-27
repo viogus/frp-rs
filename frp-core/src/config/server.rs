@@ -397,7 +397,11 @@ impl ServerConfig {
     /// Go ignores the flags in that lane (`frp-core/src/cli.rs:2862` records the
     /// same rule: flags apply only when `cfgFile == ""`). frp-rs mirrors both
     /// lanes — on `-c` it also ignores the flags, and on its override lane it
-    /// overlays and *then* completes, the same shape as Go's flags-only path. A
+    /// overlays and *then* completes: the same **order** as Go's flags-only path,
+    /// though not the same **values**, because Go pre-seeds every pflag default
+    /// into the struct before `Complete()` runs
+    /// (`pkg/config/flags.go:230-255`) while frp-rs keeps what the file
+    /// deserialized to and overwrites only the flags actually passed. A
     /// caller that overlays CLI flags (or any other late input) must therefore
     /// complete afterwards — take the file from
     /// `load_server_config_uncompleted`, overlay, then complete — and never

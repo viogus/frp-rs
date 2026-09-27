@@ -1212,8 +1212,12 @@ path completes a struct the flags have populated (`cmd/frps/root.go:77-83`); the
 (`pkg/config/load.go:313`, `:318-321`), discarding the pflag-bound one, which is
 why Go ignores the flags there — and why frp-rs, which also ignores them on `-c`
 (`FrpsArgs::cli_overrides_enabled`), matches Go on that lane for a different
-reason. frp-rs's override lane is the analogue of Go's flags-only path. The
-loader now has an un-completed entry
+reason. frp-rs's override lane has the same **order** as Go's flags-only path (overlay,
+then complete) — but the **values** are not thereby the same: Go pre-seeds every
+pflag default into the struct before `Complete()` runs (`pkg/config/flags.go:230-255`,
+so e.g. `bind_addr` is already `0.0.0.0` and `proxy_bind_addr` already `0.0.0.0`),
+while frp-rs's override lane keeps whatever the file deserialized to and only
+overwrites the flags the operator actually passed. The loader now has an un-completed entry
 point (`load_server_config_uncompleted`) that `frps/src/main.rs` overlays and
 completes, and `ServerConfig::complete` gained Go's
 `c.BindAddr = util.EmptyOr(c.BindAddr, "0.0.0.0")`
@@ -1232,7 +1236,7 @@ with `lsof -nP -iTCP:<port> -sTCP:LISTEN`:
 | `--bind-addr ""` (`[auth] token`, `bindPort` in the file) | `frps tcp listen on 0.0.0.0:19805`; `TCP *:19805 (LISTEN)` | `frps starting on :19805` + `failed to lookup address information`, exit 1, nothing bound | `0.0.0.0:19805`; `TCP *:19805 (LISTEN)` |
 | `--bind-port 0` | `create server listener error, listen tcp 0.0.0.0:7000: bind: address already in use` (tries the default 7000) | `frps starting on 127.0.0.1:0`, binds an ephemeral port | `frps starting on 127.0.0.1:7000` |
 | `bindAddr = ""` **in the file** (no flag) | `0.0.0.0:19815` | exit 1, nothing bound | `0.0.0.0:19815` |
-| `--config-dir <dir>` with `bindAddr = ""` in the file (the lane that never overlays flags — it still resolves through the completing `load_server_config`) | *(no `frps --config-dir` on Go: `Error: unknown flag: --config-dir`, rc 1; the `-c` analogue binds `0.0.0.0`)* | **rc 0 with nothing bound** — a silent no-op | `0.0.0.0:19881` listening |
+| `--config-dir <dir>` with `bindAddr = ""` in the file (the lane that never overlays flags — it still resolves through the completing `load_server_config`) | *(no `frps --config-dir` on Go: `Error: unknown flag: --config-dir`, rc 1; the `-c` analogue binds `0.0.0.0`)* | **rc 0 with nothing bound** — but *not* silent: the run logs `ERROR frps: frps service error for config file […]: failed to lookup address information`, the same error shape the `-c` lane produces; the defect is the **exit code** | `0.0.0.0:19881` listening |
 | the no-auth force-bind, no flag (control case) | n/a | `127.0.0.1` | unchanged |
 
 Pinned by `frps/tests/cli_completion.rs` (`--dashboard-addr ""` with
@@ -1266,7 +1270,7 @@ Three things this does **not** claim:
   `127.0.0.1`. Measured and explained: Go registers the flag with its default
   written straight into the struct field —
   `StringVarP(&c.WebServer.Addr, "dashboard_addr", "", "0.0.0.0", …)`
-  (`pkg/config/flags.go:239`) — so an absent flag supplies `0.0.0.0` and the
+  (`pkg/config/flags.go:238`) — so an absent flag supplies `0.0.0.0` and the
   `util.EmptyOr` in `WebServer.Complete()` cannot fire; the later
   `if Port > 0 { Addr = EmptyOr(Addr, "0.0.0.0") }` branch cannot fire either
   (`Addr` is already `0.0.0.0`), so the binding comes from the pflag default
@@ -1291,15 +1295,23 @@ Three things this does **not** claim:
   | `0.0.0.0` | `--bind-addr 127.0.0.1` | **flags-only equivalent** `--bind_addr 127.0.0.1 --proxy_bind_addr ""` → `127.0.0.1:19904`; `-c` with the same file and flag stays `*:19874` (flags ignored) | `0.0.0.0` | `127.0.0.1` |
 
   The two Go rows are the measurement that decides whether the widening below is
-  Go-correct, and they say it is: on Go, an empty `proxyBindAddr` inherits the
-  **post-flag** `bind_addr` (`Complete()` runs after pflag has written the struct),
-  so `--bind_addr 0.0.0.0 --proxy_bind_addr ""` puts the proxy listener on
-  `0.0.0.0` and `--bind_addr 127.0.0.1` puts it on `127.0.0.1` — exactly what the
-  head column does. The one thing frp-rs does that no Go lane does is combine a
-  **file** value with an overriding flag: on Go those two never meet (the `-c`
-  lane drops the flags, the flags-only lane has no file), so "file `bind_addr`
-  plus `--bind-addr`" is an frp-rs-only shape, and the defensible half of the
-  claim is that *within that shape* the completion follows Go's rule.
+  Go-correct, and they say it is — **but only with `--proxy_bind_addr ""` passed
+  explicitly**, which is why it is spelled out in both rows. Measured on Go
+  flags-only: `--bind_addr 127.0.0.1` **alone** puts the proxy listener on `*`,
+  because pflag has already written `proxy_bind_addr`'s default `0.0.0.0` into the
+  struct (`pkg/config/flags.go:234`) and `Complete()`'s
+  `if c.ProxyBindAddr == ""` therefore never fires; adding
+  `--proxy_bind_addr ""` is what lets the inheritance run and produce
+  `127.0.0.1:19904`. With that flag present, an empty `proxyBindAddr` inherits the
+  **post-flag** `bind_addr` (`Complete()` runs after pflag wrote the struct), so
+  `--bind_addr 0.0.0.0 --proxy_bind_addr ""` → `0.0.0.0` and
+  `--bind_addr 127.0.0.1 --proxy_bind_addr ""` → `127.0.0.1` — exactly what the
+  head column does.
+  The one thing frp-rs does that no Go lane does is combine a **file** value with
+  an overriding flag: on Go those two never meet (the `-c` lane drops the flags,
+  the flags-only lane has no file), so "file `bind_addr` plus `--bind-addr`" is an
+  frp-rs-only shape, and the defensible half of the claim is that *within that
+  shape* the completion follows Go's rule.
 
   So the proxy plane now **follows `--bind-addr` in both directions**. The
   widening row is the one to know about: a file that pins proxies to loopback

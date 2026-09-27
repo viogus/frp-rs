@@ -33,7 +33,11 @@ pub fn load_server_config(
 /// (`pkg/config/load.go:313`), unmarshals the file into it, and completes that
 /// (`:318-321`), discarding the pflag-bound struct — so Go's flags are ignored in
 /// that lane, exactly as frp-rs ignores them (`FrpsArgs::cli_overrides_enabled`;
-/// frp-rs's override lane is the analogue of Go's flags-only path). frp-rs loads
+/// frp-rs's override lane has the same **order** as Go's flags-only path —
+/// overlay, then complete — though not the same **values**, since Go pre-seeds
+/// every pflag default into the struct (`pkg/config/flags.go:230-255`) while
+/// frp-rs keeps the file's deserialized values except where a flag overrides
+/// them). frp-rs loads
 /// the file first and overlays the flags afterwards, so an override written
 /// after `complete()` lands on an already-completed value and can no longer
 /// re-trigger a completion: `--dashboard-addr ""` could not re-run Go's

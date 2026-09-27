@@ -213,8 +213,11 @@ User-facing release notes for frp-rs.
   address.** `frps` reads
   `./frps.toml` (or `-c <file>`) and overlays the CLI flags when no `-c` is
   given, but it completed the file first and wrote the flags afterwards, so an
-  **empty** flag value bypassed the completion that fills it. Go binds the flags
-  onto the struct and completes afterwards (`cmd/frps/root.go:78-81`). Measured
+  **empty** flag value bypassed the completion that fills it. Go completes a
+  flag-populated struct on its flags-only path only (`cmd/frps/root.go:77-83`):
+  its `-c` path loads a fresh struct from the file and completes that
+  (`pkg/config/load.go:313`, `:318-321`), so the flags are ignored there — which is
+  what frp-rs does on `-c` too. Measured
   against Go frp v0.71.0 with the same config file, a free control port and a
   free dashboard port per row, address read back with `lsof`:
   - `--dashboard-addr ""` with `[webServer] user`/`password` set and

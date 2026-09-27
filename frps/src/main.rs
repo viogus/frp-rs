@@ -179,7 +179,10 @@ async fn run(mut cli: FrpsArgs) {
     // (`pkg/config/load.go:313`, `:318-321`), discarding the pflag-bound one, so
     // Go ignores the flags there; frp-rs matches by ignoring them on `-c` too.
     // On the override lane frp-rs loads the file, overlays the CLI flags, and
-    // completes the result — the same shape as Go's flags-only path. See
+    // completes the result — the same **order** as Go's flags-only path, though
+    // not the same **values**: Go pre-seeds every pflag default into the struct
+    // (`pkg/config/flags.go:230-255`), frp-rs keeps the file's values except
+    // where a flag overrides them. See
     // `load_server_config_uncompleted` for the fields where writing the override
     // after `complete()` was observable (`bind_addr`, `bind_port`,
     // `web_server.addr`, and the derived `proxy_bind_addr`, which now follows

@@ -137,7 +137,7 @@ fn used_ports() -> &'static std::sync::Mutex<std::collections::HashSet<u16>> {
 /// ```text
 /// # build it either way — plain default features, or tiny+full explicitly:
 /// cargo build -p frps                       # no dashboard; no flag needed
-/// cargo build -p frps --no-default-features --features full   # same graph
+/// cargo build -p frps --no-default-features --features full   # same dep graph
 /// # NOT `cargo build -p frps --no-default-features` — that exits 0 but emits
 /// # no target/debug/frps, because the bin is `required-features = ["full"]`.
 /// FRPS_BIN=<that frps> cargo test -p frps --test cli_completion
@@ -509,10 +509,12 @@ fn absent_bind_addr_flag_keeps_configured_value() {
 /// file is authoritative), so it still resolves through the completing
 /// `load_server_config`, but the new `bind_addr` fill is observable in it.
 /// Measured: with `bindAddr = ""` in the file, the pre-fix binary exits **0
-/// with nothing bound** (a silent no-op — worse than the `-c` lane's
-/// loud lookup error), and the fixed binary binds `0.0.0.0:<port>`, which is
-/// what Go binds for the same file through its `-c` lane (`frps` has no
-/// `--config-dir`: Go exits 1 with `unknown flag: --config-dir`).
+/// with nothing bound** while logging the *same* `ERROR … failed to lookup
+/// address information` shape the `-c` lane produces — the defect is the exit
+/// code, not silence, and it is not "louder" on either lane. The fixed binary
+/// binds `0.0.0.0:<port>`, which is what Go binds for the same file through its
+/// `-c` lane (`frps` has no `--config-dir`: Go exits 1 with
+/// `unknown flag: --config-dir`).
 ///
 /// `--config-dir` collects every config file in a directory, so this test owns
 /// a one-file directory and its own free port.
