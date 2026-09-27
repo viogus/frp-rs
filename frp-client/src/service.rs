@@ -757,10 +757,56 @@ impl Service {
                 count = handles.len(),
                 "Visitor shutdown timed out after 500ms; aborting stuck listener task(s) to release bind ports"
             );
+            // Snapshot completion BEFORE the aborts and skip the handles that
+            // are already finished. The invariant this preserves: **each handle
+            // is awaited at most once, and `is_finished()` is true exactly for
+            // the handles whose output `join_all` already took.** Two measured
+            // facts make it the fix:
+            //
+            // 1. A `JoinHandle` may be polled to `Ready` only once, and
+            //    `join_all` above polls every handle. The handles whose task
+            //    already finished have had their output taken and now sit at
+            //    `Stage::Consumed` (`store_output` puts `Stage::Finished` there,
+            //    `take_output` replaces it with `Stage::Consumed`), so awaiting
+            //    them again hits `take_output`'s
+            //    `_ => panic!("JoinHandle polled after completion")`
+            //    (tokio-1.53.1/src/runtime/task/core.rs:427). That is the
+            //    SIGTERM crash: with N >= 2 visitors sharing one `bind_port`
+            //    the losers' `TcpListener::bind` fails and their task returns
+            //    at once, so `join_all` completes their handles while the
+            //    winner stays parked in `accept()` past the 500ms grace.
+            // 2. A finished task has already dropped its future, so skipping it
+            //    releases nothing that this abort path exists to release. The
+            //    future is dropped by `store_output` on normal completion
+            //    (harness.rs:549 -> core.rs:434, where `set_stage`'s assignment
+            //    drops the replaced `Stage::Running(future)`) or by
+            //    `drop_future_or_output` on cancellation (harness.rs:503 ->
+            //    core.rs:399), and the COMPLETE bit `is_finished` reads
+            //    (join.rs:258 -> state.rs:599) is set afterwards by
+            //    `transition_to_complete` (harness.rs:334). The listener socket
+            //    is therefore already closed when `is_finished()` turns true.
+            //    `service::tests::shutdown_visitor_tasks_releases_listeners`
+            //    measures both halves of that: a finished task's port is
+            //    bindable again while its handle is still un-awaited, and a
+            //    parked listener's port is released by the abort+await below.
+            //
+            // Snapshotting before `abort()` keeps the skip set to handles that
+            // were already complete when the grace window expired, so every
+            // handle this branch aborts is still awaited exactly once. The
+            // 500ms grace is unchanged — skipping a finished handle can only
+            // make shutdown return no later than before. Observability is
+            // unchanged too: this branch already discarded join results
+            // (`let _ = h.await`), and a task's panic is reported by the panic
+            // hook when it happens, so a panicking finished visitor is no more
+            // hidden by the skip than by the await it replaces.
+            let already_finished: Vec<bool> = handles.iter().map(|h| h.is_finished()).collect();
             for h in &handles {
                 h.abort();
             }
-            for h in handles {
+            for (h, was_finished) in handles.into_iter().zip(already_finished) {
+                if was_finished {
+                    continue;
+                }
                 let _ = h.await;
             }
         }
@@ -5899,6 +5945,143 @@ mod tests {
             "proxy must be marked StartErr after a failed write, got {:?}",
             info.phase
         );
+    }
+
+    /// Regression (SIGTERM crash, rc 101): `shutdown_visitor_tasks` must not
+    /// poll a `JoinHandle` whose task has already finished. With N >= 2
+    /// visitors sharing one `bind_port` the losers' `TcpListener::bind` fails
+    /// and their task returns at once, so `join_all` drives their handles to
+    /// `Ready` while the winner is still parked in `accept()` past the 500ms
+    /// grace — and the abort path then awaited those already-consumed handles,
+    /// hitting `JoinHandle polled after completion`
+    /// (tokio-1.53.1/src/runtime/task/core.rs:427). The binary-level half of
+    /// this pin is `frp-server/tests/visitor_multi_sigterm.rs`.
+    #[tokio::test]
+    async fn shutdown_visitor_tasks_tolerates_a_completed_handle() {
+        let cfg = ClientConfig {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: 7000,
+            token: "test-token".to_string(),
+            ..Default::default()
+        };
+        let service = Service::with_unsafe_features(cfg, None, UnsafeFeatures::default())
+            .await
+            .expect("service init must succeed");
+
+        // The loser: a task that finishes immediately, exactly like a visitor
+        // whose bind failed (`visitor.rs` returns straight away). `join_all`
+        // inside `shutdown_visitor_tasks` polls it to `Ready` either way.
+        let finished = tokio::spawn(async {});
+        // The winner: parked in `accept()`, like an idle listener.
+        let parked = tokio::spawn(async { std::future::pending::<()>().await });
+
+        // Pre-fix this panics inside the 500ms abort branch; the timeout only
+        // bounds the test if the panic is gone but the join hangs.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.shutdown_visitor_tasks(vec![finished, parked]),
+        )
+        .await
+        .expect("shutdown_visitor_tasks must return");
+    }
+
+    /// Measures the claim that makes skipping an already-finished handle safe
+    /// (the comment in `shutdown_visitor_tasks`): a task's future — and with it
+    /// any listener socket it holds — is dropped by the time
+    /// `JoinHandle::is_finished()` reports true, so the skip cannot leave a
+    /// bind port held; and the abort+await path still releases a listener that
+    /// was parked in `accept()`. Both halves are checked by re-binding the two
+    /// ports after the shutdown call returns (a held port would fail with
+    /// AddrInUse). Everything runs in-process, so no other process can release
+    /// the ports for us.
+    #[tokio::test]
+    async fn shutdown_visitor_tasks_releases_listeners() {
+        let cfg = ClientConfig {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: 7000,
+            token: "test-token".to_string(),
+            ..Default::default()
+        };
+        let service = Service::with_unsafe_features(cfg, None, UnsafeFeatures::default())
+            .await
+            .expect("service init must succeed");
+
+        // Free ports, taken the same way the visitor listeners take theirs.
+        // Both tasks report a successful bind on a oneshot before anything is
+        // asserted, so a port stolen in the probe->bind window (the test
+        // binaries run in parallel) fails this test loudly instead of quietly
+        // turning a task into a finished-without-binding one — which would make
+        // half 2 pass without ever exercising the abort+await path.
+        let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+        let (finished_port, finished) = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
+            let port = probe.local_addr().expect("probe addr").port();
+            drop(probe);
+            let handle = tokio::spawn(async move {
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                    .await
+                    .expect("loser-shaped listener bind");
+                bound_tx.send(()).expect("report loser bind");
+                drop(listener);
+            });
+            (port, handle)
+        };
+        let (parked_bound_tx, parked_bound_rx) = tokio::sync::oneshot::channel();
+        let (parked_port, parked) = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
+            let port = probe.local_addr().expect("probe addr").port();
+            drop(probe);
+            let handle = tokio::spawn(async move {
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                    .await
+                    .expect("winner-shaped listener bind");
+                parked_bound_tx.send(()).expect("report parked bind");
+                let _held = listener;
+                std::future::pending::<()>().await
+            });
+            (port, handle)
+        };
+
+        // Both listeners exist before we observe anything, so neither half can
+        // pass by accident.
+        bound_rx.await.expect("loser-shaped task must bind its port");
+        parked_bound_rx
+            .await
+            .expect("parked task must bind its port");
+        // Let the first task drop its listener and finish.
+        while !finished.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !parked.is_finished(),
+            "the parked task must still be holding its listener when shutdown starts"
+        );
+        // Half 1, measured BEFORE the shutdown call: a finished task has
+        // already dropped its future, so its port is free while the handle is
+        // still un-awaited. This does not discriminate the skip (dropping the
+        // future is what releases the port); it establishes that nothing else
+        // retains a port for a task the shutdown call is about to skip.
+        let rebind = std::net::TcpListener::bind(("127.0.0.1", finished_port));
+        assert!(
+            rebind.is_ok(),
+            "a finished visitor task must have released {finished_port} by the \
+             time is_finished() is true, got {:?}",
+            rebind.err()
+        );
+        drop(rebind);
+
+        // Half 2, the discriminating half: the parked listener can only be
+        // released by the abort+await inside shutdown_visitor_tasks.
+        service.shutdown_visitor_tasks(vec![finished, parked]).await;
+
+        let rebind = std::net::TcpListener::bind(("127.0.0.1", parked_port));
+        assert!(
+            rebind.is_ok(),
+            "the parked listener's port {parked_port} must be released when \
+             shutdown_visitor_tasks returns, got {:?}",
+            rebind.err()
+        );
+        drop(rebind);
     }
 
     /// Sets its flag on drop — used to observe task cancellation (aborting
