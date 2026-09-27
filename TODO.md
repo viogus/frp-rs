@@ -2476,7 +2476,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `:<port>`.** `frps` loads and completes the config (`frp-core/src/config/file.rs:25` calls
     `cfg.complete()`), then applies CLI overrides (`frps/src/main.rs:191`
     `cli.override_server_config(&mut cfg)`, inside `cli_overrides_enabled()`) whose dashboard-addr
-    assignment is `frp-core/src/cli.rs:1897-1899` — with no `-c`/`--config-dir` the flag value is
+    assignment is `frp-core/src/cli.rs:2309-2311` — with no `-c`/`--config-dir` the flag value is
     therefore written **after** the completion that would have filled it. Measured at the head of
     `fix/frps-empty-addr`, cwd holding a `frps.toml` (`bindPort = 17720`,
     `[webServer] port = 17721`, `user`/`password`) and argv `frps --dashboard-addr ""` (dashboard
@@ -2513,12 +2513,18 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   now loads the file **un-completed** (`config::load_server_config_uncompleted`, new in
   `frp-core/src/config/file.rs`; `load_server_config` is the completing wrapper it used to be),
   overlays the flags, and only then calls `cfg.complete()`. That is Go's order on both paths —
-  `cmd/frps/root.go:97-99` completes the flags-only struct, `config.LoadServerConfig` completes the
+  `cmd/frps/root.go:78-81` completes the flags-only struct, `config.LoadServerConfig` completes the
   `-c` struct with the flags already bound — so *every* completed input the CLI can write is filled
   (`bind_addr`, `bind_port`, `proxy_bind_addr`, `web_server.addr`) instead of only the dashboard
-  address, which is why the alternative (re-run `WebServer.Complete()` at the CLI site) was
-  rejected: it would have fixed one of the four sites and left `--bind-addr ""`/`--bind-port 0`
-  broken. `ServerConfig::complete` gained Go's `BindAddr = util.EmptyOr(BindAddr, "0.0.0.0")`
+  address, which is why re-running `WebServer.Complete()` at the CLI site was rejected: it would have
+  fixed one of the four sites and left `--bind-addr ""`/`--bind-port 0` broken. (Second rejected
+  alternative, raised in review: a three-field re-fill of `bind_addr`/`bind_port`/`web_server.addr`
+  *after* the overrides, keeping the file's `proxy_bind_addr` inheritance. That is smaller, but it
+  reproduces base's split brain — control on the override, proxies on the file — which is exactly the
+  inconsistency the row below measures; `complete()` itself is idempotent, so the precise objection to
+  "call `complete()` twice" is narrower than "not re-runnable": a second call after a post-completion
+  `bind_addr` override cannot recover Go's `proxy_bind_addr`, because the first call already consumed
+  the empty value.) `ServerConfig::complete` gained Go's `BindAddr = util.EmptyOr(BindAddr, "0.0.0.0")`
   (`server.go:110`) *before* the `ProxyBindAddr` inheritance (`:112-114`) and the `BindPort` fill
   (`:111`), so `bindAddr = ""` in a file is filled too.
   Re-measured at `80199f4` + the fix, Go v0.71.0 vs frp-rs, same config file per row, own free
@@ -2531,6 +2537,11 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     (`create server listener error … 7000: bind: address already in use`) / before bound an
     ephemeral port (`frps starting on 127.0.0.1:0`) / now `127.0.0.1:7000`.
   * `bindAddr = ""` **in the file**, no flag → Go `*:19815` / before exit 1 / now `*:19815`.
+  * `--config-dir <dir>` with `bindAddr = ""` in the file (same fill, different lane — the loader
+    split left this lane on the completing `load_server_config`, but the fill itself changes it):
+    before **rc 0 with nothing bound** (a silent no-op), now `*:19881` listening; Go has no
+    `frps --config-dir` (`Error: unknown flag: --config-dir`, rc 1), so the analogue is Go's `-c`
+    lane, which binds `0.0.0.0` for the same file.
   * Absent-flag controls: `--dashboard-addr` absent keeps the file's `127.0.0.1:19802` (Go's
     flags-only absent flag binds `0.0.0.0:19802`, because pflag writes its flag default straight
     into `c.WebServer.Addr` — `pkg/config/flags.go:239` — so `WebServer.Complete()`'s `EmptyOr`
@@ -2539,30 +2550,62 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   * Other-override sweep: only `bind_addr`, `bind_port`, `proxy_bind_addr` and `web_server.addr`
     feed a completion; `log.*`, `auth.token`, `allow_ports`, `tls_only`, the port numbers,
     `max_ports_per_client` and the dashboard TLS paths are absolute writes with no completion
-    input, so they were already correct. `--proxy-bind-addr ""` is completed now too and is
-    **not observable**: `AppState::new` (`frp-server/src/service.rs:229-233`) already resolved an
-    empty `proxy_bind_addr` to `bind_addr`; measured through `frpc` with
-    `--proxy-bind-addr ""`, the registered TCP proxy binds `TCP 127.0.0.1:19822 (LISTEN)` before
-    and after.
+    input, so they were already correct.
+  * **`proxy_bind_addr` inheritance — a measured behaviour change that the first version of this
+    entry wrongly called "not observable" (reviewer R2 F1).** `complete()` now derives
+    `proxy_bind_addr` from the **post-override** `bind_addr`, which is Go's order (`Complete()` runs
+    after the flags are bound), so a `--bind-addr` that differs from the file's `bind_addr` now moves
+    the proxy listeners with the control listener. Measured with a real registration and
+    `lsof -nP -iTCP:<port> -sTCP:LISTEN -a -p <pid>` (file has no `proxyBindAddr` key; the `-c` shape
+    ignores the flags on Go, hence its own row):
+
+    | file `bind_addr` | argv | Go v0.71.0 proxy listener | base proxy | head proxy |
+    |---|---|---|---|---|
+    | `127.0.0.1` | no flag | `127.0.0.1:19872` (`-c`) | `127.0.0.1:19862` | `127.0.0.1:19862` |
+    | `127.0.0.1` | `--bind-addr 0.0.0.0` | *no Go equivalent — Go ignores flags with `-c`* | `127.0.0.1:19862` while its **own control** was `*:19861` | `*:19862` (follows the override) |
+    | `0.0.0.0` | `--bind-addr 127.0.0.1` | *(Go `-c` ignores the flag: `*:19874`)* | `*:19874` while its control was `127.0.0.1:19873` | `127.0.0.1:19874` |
+    | flags-only | `--bind_addr 127.0.0.1` | `*:19852` (pflag's `proxy_bind_addr` default is `0.0.0.0`) | — | — |
+
+    **Decision: keep the post-override inheritance.** It is what Go's single `Complete()` call on the
+    bound struct does, and it removes base's internal inconsistency (base moved the *control* listener
+    to `--bind-addr` while leaving the proxy listener on the file's address — in the first row above
+    the proxy stayed loopback-only after the operator asked for the wildcard). The observable change
+    is therefore "the proxy listener follows `--bind-addr`", in both directions: widening when the
+    flag widens, narrowing when the flag narrows. Anyone who wants the proxy plane pinned independently
+    can set `proxyBindAddr` explicitly, as before. The earlier `--proxy-bind-addr ""` probe that looked
+    unchanged used `--bind-addr 127.0.0.1` equal to the file value, which cannot see this; that is the
+    error the reviewers caught.
   **Tests.** `frps/tests/cli_completion.rs` (new, unguarded file — the guarded
-  `frps/tests/cli_exit_codes.rs` count is untouched at 16): five bounded spawns, each with its own
-  free ports, `RUST_LOG=info`, stdout/stderr drained on reader threads and the child killed+reaped
-  by a `Drop` guard — `--dashboard-addr ""` (credentials set, asserts the dashboard's own
-  `Dashboard listening on 127.0.0.1:<port>` line, no `failed to lookup address information`, and
+  `frps/tests/cli_exit_codes.rs` count is untouched at 16; executed by the new
+  `Run frps CLI completion tests (merged-config completion order)` step in `.github/workflows/ci.yml`,
+  which is `--test cli_completion` and therefore moves no guarded count): six bounded spawns, each
+  with its own free ports, `RUST_LOG=info`, stdout/stderr drained on reader threads and the child
+  killed+reaped by a `Drop` guard — `--dashboard-addr ""` (credentials set, asserts the dashboard's
+  own `Dashboard listening on 127.0.0.1:<port>` line, no `failed to lookup address information`, and
   that both the control and dashboard ports accept a real connection), its absent-flag control,
   `--bind-addr ""` (asserts `frps listener started on 0.0.0.0:<port>`), its absent-flag control,
-  and `--bind-port 0` (asserts the completed `:7000`). Red evidence: pointed at the pre-fix binary
-  via `FRPS_BIN`, the two fix tests fail with exactly the measured pre-fix log
-  (`Dashboard web UI starting on :<port>` + `Dashboard server failed: failed to lookup address
-  information`; `frps error: failed to lookup address information`), and both absent-flag controls
-  pass in both directions (2 passed / 2 failed before, 5/5 after). Completion-level pins:
-  `server_bind_addr_empty_is_completed_to_wildcard` and
+  `--config-dir <dir>` with `bindAddr = ""` (the lane that never overlays flags; base exited **0 with
+  nothing bound**), and `--bind-port 0` (asserts the completed `:7000`). Red evidence, re-measured by
+  both reviewers and by the author: pointed at a pre-fix **dashboard** binary via `FRPS_BIN` with
+  `--features dashboard` → **2 passed / 4 failed** (6 tests — the reviewers measured 2 passed / 3 failed
+  against the 5-test version of this file), the four failures carrying exactly the measured
+  pre-fix log (`Dashboard web UI starting on :<port>` + `Dashboard server failed: failed to lookup
+  address information`; `frps error: failed to lookup address information`). The same file against a
+  pre-fix **no-dashboard** binary (built `--no-default-features` from the pre-fix tree) is
+  **3 passed / 3 failed** —
+  `cli_empty_dashboard_addr_binds_loopback` **passes** pre-fix there, because with the dashboard
+  compiled out there is no empty address handed to a listener; the dashboard regression is therefore
+  covered **only** under `--features dashboard`, which is why the CI step passes that flag. Both
+  absent-flag controls pass in every configuration and the fixed binary is 6/6 in both.
+  Completion-level pins: `server_bind_addr_empty_is_completed_to_wildcard` and
   `server_completion_must_run_on_the_merged_cli_config` in `frp-core/src/config/tests.rs`.
   **Carriers.** `docs/developing.md` § CLI inputs gained § 2b (the ordering rule, the measured
-  per-shape table, and the two non-claims: flags-only absent-flag Go divergence, and the
-  unobservable `proxy_bind_addr` completion), `docs/config.md`'s `bind_addr`/`bind_port`/
-  `proxy_bind_addr` rows now state the empty/zero completion and its order, and `CHANGELOG.md`
-  gained the user-visible entry naming the three changed shapes. Swept
+  per-shape table — including the `--config-dir` row and the proxy-listener rows — and the three
+  non-claims: the flags-only absent-flag Go divergence, the `proxy_bind_addr` post-override
+  inheritance now being observable, and frp-rs's missing flags-only mode), `docs/config.md`'s
+  `bind_addr`/`bind_port`/`proxy_bind_addr` rows now state the empty/zero completion and its order,
+  and `CHANGELOG.md` gained the user-visible entry naming the changed shapes **including the
+  proxy-listener consequence**. Swept
   `grep -rn "failed to lookup address information\|Dashboard web UI starting" docs TODO.md
   CHANGELOG.md frp-core/src frps/src`: the remaining hits are this item's own historical
   measurements, the frpc admin-address one (`docs/developing.md:1098`, a different path), and the

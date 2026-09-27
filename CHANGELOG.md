@@ -209,11 +209,12 @@ User-facing release notes for frp-rs.
 
 ### Fixed
 - **`frps` now completes the config *after* the CLI flags are applied, as Go
-  does — three argv/config shapes change behaviour.** `frps` reads
+  does — four argv/config shapes change behaviour, including the proxy listen
+  address.** `frps` reads
   `./frps.toml` (or `-c <file>`) and overlays the CLI flags when no `-c` is
   given, but it completed the file first and wrote the flags afterwards, so an
   **empty** flag value bypassed the completion that fills it. Go binds the flags
-  onto the struct and completes afterwards (`cmd/frps/root.go:97-99`). Measured
+  onto the struct and completes afterwards (`cmd/frps/root.go:78-81`). Measured
   against Go frp v0.71.0 with the same config file, a free control port and a
   free dashboard port per row, address read back with `lsof`:
   - `--dashboard-addr ""` with `[webServer] user`/`password` set and
@@ -229,9 +230,19 @@ User-facing release notes for frp-rs.
     it now binds `0.0.0.0:<port>` like Go
     (`c.BindAddr = util.EmptyOr(c.BindAddr, "0.0.0.0")`,
     `pkg/config/v1/server.go:110`). The same fill now also covers
-    `bindAddr = ""` written in the config file.
+    `bindAddr = ""` written in the config file — including under
+    `--config-dir`, where the same config used to exit **0 with nothing bound**.
   - `--bind-port 0`: it bound an OS-chosen ephemeral port; it is now completed
     to the default **7000**, like `bindPort = 0` in a file and like Go.
+  - **The proxy listeners now follow `--bind-addr`.** Go's `ProxyBindAddr`
+    inherits the final `BindAddr` inside `Complete()`, so frp-rs now does that
+    too; before, the inheritance had already happened against the file's value,
+    so `--bind-addr 0.0.0.0` over a file that said `bind_addr = "127.0.0.1"`
+    moved the control listener to every interface while the registered proxy
+    ports stayed loopback-only. If you pass `--bind-addr`, the proxy ports bind
+    the same address as the control listener (and if you pass a narrower
+    address, they narrow with it). Per-proxy pinning via an explicit
+    `proxyBindAddr` is unchanged and still wins.
   Absent flags are unaffected — the configured value is still what binds — and
   so is `-c`, which keeps the file authoritative (flags ignored). Also
   unchanged: frp-rs still needs `./frps.toml` to exist where Go's flags-only mode

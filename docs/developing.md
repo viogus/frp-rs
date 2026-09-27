@@ -1207,7 +1207,7 @@ reach the listener are the merged ones. Until this change the file was completed
 first (`frp-core/src/config/file.rs`) and the overrides were written afterwards
 (`FrpsArgs::override_server_config`), which made every **empty** override bypass
 the completion that fills it: Go applies the flags to the struct and calls
-`Complete()` afterwards on both paths (`cmd/frps/root.go:97-99` for flags-only;
+`Complete()` afterwards on both paths (`cmd/frps/root.go:78-81` for flags-only;
 `config.LoadServerConfig` for `-c`). The loader now has an un-completed entry
 point (`load_server_config_uncompleted`) that `frps/src/main.rs` overlays and
 completes, and `ServerConfig::complete` gained Go's
@@ -1227,6 +1227,7 @@ with `lsof -nP -iTCP:<port> -sTCP:LISTEN`:
 | `--bind-addr ""` (`[auth] token`, `bindPort` in the file) | `frps tcp listen on 0.0.0.0:19805`; `TCP *:19805 (LISTEN)` | `frps starting on :19805` + `failed to lookup address information`, exit 1, nothing bound | `0.0.0.0:19805`; `TCP *:19805 (LISTEN)` |
 | `--bind-port 0` | `create server listener error, listen tcp 0.0.0.0:7000: bind: address already in use` (tries the default 7000) | `frps starting on 127.0.0.1:0`, binds an ephemeral port | `frps starting on 127.0.0.1:7000` |
 | `bindAddr = ""` **in the file** (no flag) | `0.0.0.0:19815` | exit 1, nothing bound | `0.0.0.0:19815` |
+| `--config-dir <dir>` with `bindAddr = ""` in the file (the lane that never overlays flags — it still resolves through the completing `load_server_config`) | *(no `frps --config-dir` on Go: `Error: unknown flag: --config-dir`, rc 1; the `-c` analogue binds `0.0.0.0`)* | **rc 0 with nothing bound** — a silent no-op | `0.0.0.0:19881` listening |
 | the no-auth force-bind, no flag (control case) | n/a | `127.0.0.1` | unchanged |
 
 Pinned by `frps/tests/cli_completion.rs` (`--dashboard-addr ""` with
@@ -1234,12 +1235,21 @@ credentials → dashboard reports and dials `127.0.0.1:<port>` and no
 `failed to lookup address information`; `--bind-addr ""` → listener reports
 `0.0.0.0:<port>`; `--bind-port 0` → the completed default 7000; plus an
 **absent-flag control** per shape asserting the configured `bind_addr` /
-`[webServer].addr` is what binds), and on the completion itself by
+`[webServer].addr` is what binds), executed by the
+`Run frps CLI completion tests (merged-config completion order)` step in
+`.github/workflows/ci.yml` (a different target from the guarded
+`cli_exit_codes`, so `env.FRPS_CLI_TESTS` stays `16`; it passes
+`--features dashboard`, without which the dashboard regression is not covered —
+against a true pre-fix no-dashboard binary that configuration is 3 passed /
+3 failed (of six), with the dashboard shape **passing** because there is no
+dashboard listener to hand an empty address to; against a pre-fix dashboard
+binary it is 2 passed / 4 failed, dashboard shape included).
+The completion itself is pinned by
 `server_bind_addr_empty_is_completed_to_wildcard` and
 `server_completion_must_run_on_the_merged_cli_config` in
 `frp-core/src/config/tests.rs`.
 
-Two things this does **not** claim:
+Three things this does **not** claim:
 
 - **frp-rs still needs `./frps.toml`; Go's flags-only mode has no file at all.**
   In a directory without one frp-rs exits
@@ -1258,15 +1268,31 @@ Two things this does **not** claim:
   `127.0.0.1`. That flags-only shape has no frp-rs equivalent to match (frp-rs
   always reads a file in this lane), so nothing changed there; the row is
   recorded, not mirrored.
-- **`--proxy-bind-addr ""` is completed too, and is not observable.** Go's
-  `ProxyBindAddr` inherits `BindAddr` when empty (`server.go:112-114`), so the
-  merged config now gets the same inheritance; the pre-existing
-  `Service::new`/`AppState::new` fallback
-  (`frp-server/src/service.rs:229-233`) already resolved an empty
-  `proxy_bind_addr` to `bind_addr` for the data plane, so no listener's bound
-  address changes. Measured end to end through `frpc` with
-  `--proxy-bind-addr ""`: `TCP 127.0.0.1:19822 (LISTEN)` for the registered TCP
-  proxy both before and after.
+- **`proxy_bind_addr` now inherits the *post-override* `bind_addr` — a real,
+  measured behaviour change in the `--bind-addr` lane.** Go's `ProxyBindAddr`
+  inherits `BindAddr` when empty (`server.go:112-114`) *inside* `Complete()`, so
+  it inherits the value the flags put there. frp-rs now does the same; before,
+  the inheritance had already happened against the file's value, so the proxy
+  listener ignored `--bind-addr`. Measured with a real `frpc` registration and
+  `lsof -nP -iTCP:<port> -sTCP:LISTEN -a -p <pid>` (file has no `proxyBindAddr`
+  key; every row's control listener followed the flag in both binaries):
+
+  | file `bind_addr` | argv | Go v0.71.0 proxy | frp-rs before | frp-rs now |
+  |---|---|---|---|---|
+  | `127.0.0.1` | *(none)* | `127.0.0.1:<port>` (`-c`) | `127.0.0.1` | `127.0.0.1` |
+  | `127.0.0.1` | `--bind-addr 0.0.0.0` | *(no Go equivalent: Go ignores flags with `-c`)* | `127.0.0.1` | `0.0.0.0` |
+  | `0.0.0.0` | `--bind-addr 127.0.0.1` | *(Go `-c` ignores the flag → `0.0.0.0`)* | `0.0.0.0` | `127.0.0.1` |
+
+  So the proxy plane now **follows `--bind-addr` in both directions**. The
+  widening row is the one to know about: a file that pins proxies to loopback
+  while the operator passes `--bind-addr 0.0.0.0` had loopback-only proxy ports
+  and now exposes them on the interface the control listener already uses — and
+  symmetrically, a narrowing flag now narrows them. It is a consequence of doing
+  what Go does (one `Complete()` on the merged struct) and it removes the split
+  where the control listener moved but the proxies did not; per-proxy pinning is
+  still available through an explicit `proxyBindAddr`, which the completion never
+  touches. An earlier probe that used `--bind-addr` equal to the file value could
+  not see this and wrongly recorded the change as unobservable.
 
 **3. Config keys are matched case-sensitively — a recorded divergence, not
 parity.** Go decodes with `encoding/json`, whose matching is case-insensitive
