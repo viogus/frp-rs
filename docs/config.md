@@ -11,9 +11,9 @@ Complete field reference for frp-rs `frps.toml` and `frpc.toml`. Every field map
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
-| `bind_addr` | `string` | `"0.0.0.0"` | `bindAddr` | Address the server listens on for control connections. |
-| `bind_port` | `u16` | `7000` | `bindPort` | Main port for control connections. Clients dial this port. |
-| `proxy_bind_addr` | `string` | `""` | `proxyBindAddr` | Separate bind address for proxy listener ports. Empty means same as `bind_addr`. |
+| `bind_addr` | `string` | `"0.0.0.0"` | `bindAddr` | Address the server listens on for control connections. An explicit empty string is completed to `0.0.0.0` too (Go's `ServerConfig.Complete()`, `server.go:110`), so only an absent key and `""` share the default. |
+| `bind_port` | `u16` | `7000` | `bindPort` | Main port for control connections. Clients dial this port. An explicit `0` — in the file or via `--bind-port 0` — is also completed to `7000`. |
+| `proxy_bind_addr` | `string` | `""` | `proxyBindAddr` | Separate bind address for proxy listener ports. Empty means same as the **effective** `bind_addr`: the inheritance runs inside the completion, i.e. after the CLI flags are applied, so `--bind-addr 0.0.0.0` also moves the proxy ports to every interface (and a narrower `--bind-addr` narrows them); an empty `bind_addr` yields `0.0.0.0`, not `""`. Set this key explicitly to pin the proxy plane independently — an explicit value is used verbatim. |
 | `vhost_http_port` | `u16` | `0` | `vhostHTTPPort` | HTTP virtual host routing port. 0 = disabled. When set, HTTP proxies can be routed by `Host` header without consuming individual ports. |
 | `vhost_https_port` | `u16` | `0` | `vhostHTTPSPort` | HTTPS virtual host routing port. 0 = disabled. Routes by TLS SNI. |
 | `tcpmux_httpconnect_port` | `u16` | `0` | `tcpmuxHTTPConnectPort` | TCPMux HTTP CONNECT multiplexing port. TCPMux proxies share this port, routed by HTTP CONNECT `Host` header. 0 = disabled. |

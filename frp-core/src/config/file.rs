@@ -9,7 +9,55 @@ use super::strict::{known_client_keys, known_server_keys};
 
 /// Load a server configuration from a file path, auto-detecting format by extension.
 /// When `strict_config` is true, unknown fields cause an error (Go frp default).
+///
+/// The returned config is **completed** ([`ServerConfig::complete`]). Callers
+/// that must overlay CLI-flag values on top of the file take the un-completed
+/// config from [`load_server_config_uncompleted`] instead — see that function
+/// for why the distinction exists.
 pub fn load_server_config(
+    path: &str,
+    strict_config: bool,
+) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+    let mut cfg = load_server_config_uncompleted(path, strict_config)?;
+    cfg.complete();
+    Ok(cfg)
+}
+
+/// Load a server configuration from a file path **without** running
+/// [`ServerConfig::complete`].
+///
+/// This exists to mirror Go's ordering. On Go, **only the flags-only path**
+/// completes a struct that flags have populated: `cmd/frps/root.go:77-83` calls
+/// `serverCfg.Complete()` on the struct pflag bound. The `-c` path is the
+/// opposite — `config.LoadServerConfig` builds a fresh `svrCfg`
+/// (`pkg/config/load.go:313`), unmarshals the file into it, and completes that
+/// (`:318-321`), discarding the pflag-bound struct — so Go's flags are ignored in
+/// that lane, exactly as frp-rs ignores them (`FrpsArgs::cli_overrides_enabled`;
+/// frp-rs's override lane has the same **order** as Go's flags-only path —
+/// overlay, then complete — though not the same **values**, since Go pre-seeds
+/// every pflag default into the struct (`pkg/config/flags.go:230-255`) while
+/// frp-rs keeps the file's deserialized values except where a flag overrides
+/// them). frp-rs loads
+/// the file first and overlays the flags afterwards, so an override written
+/// after `complete()` lands on an already-completed value and can no longer
+/// re-trigger a completion: `--dashboard-addr ""` could not re-run Go's
+/// `WebServer.Complete()` fill (`pkg/config/v1/common.go:71-72` → `127.0.0.1`)
+/// and `--bind-addr ""` could not be filled to `0.0.0.0`
+/// (`pkg/config/v1/server.go:110`). The merge order is also observable through a
+/// derived field: `proxy_bind_addr` inherits the **effective** `bind_addr`
+/// (`server.go:112-114`), so completing before the overlay left the proxy
+/// listeners on the file's address while the control listener moved to
+/// `--bind-addr` — measured end to end, see `docs/developing.md` § CLI inputs
+/// § 2b.
+///
+/// The `transport` completion (`complete_with_heartbeat_timeout_set`) still runs
+/// here. Calling it is safe because no `frps` CLI flag writes a field it reads
+/// (`heartbeat_timeout`, `tcp_mux`, `tcp_mux_keepalive_interval`), and because
+/// the *presence* of `serverHeartbeatTimeout` in the file — carried by the
+/// `heartbeat_timeout_set` argument — cannot be recovered from an
+/// already-completed config. (The function is itself idempotent: every write it
+/// makes is conditioned on a value its own output no longer holds.)
+pub fn load_server_config_uncompleted(
     path: &str,
     strict_config: bool,
 ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
@@ -22,7 +70,6 @@ pub fn load_server_config(
     )?;
     cfg.transport
         .complete_with_heartbeat_timeout_set(presence.server_heartbeat_timeout_set);
-    cfg.complete();
     Ok(cfg)
 }
 

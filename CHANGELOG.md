@@ -208,6 +208,48 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **`frps` now completes the config *after* the CLI flags are applied, as Go
+  does — four argv/config shapes change behaviour, including the proxy listen
+  address.** `frps` reads
+  `./frps.toml` (or `-c <file>`) and overlays the CLI flags when no `-c` is
+  given, but it completed the file first and wrote the flags afterwards, so an
+  **empty** flag value bypassed the completion that fills it. Go completes a
+  flag-populated struct on its flags-only path only (`cmd/frps/root.go:77-83`):
+  its `-c` path loads a fresh struct from the file and completes that
+  (`pkg/config/load.go:313`, `:318-321`), so the flags are ignored there — which is
+  what frp-rs does on `-c` too. Measured
+  against Go frp v0.71.0 with the same config file, a free control port and a
+  free dashboard port per row, address read back with `lsof`:
+  - `--dashboard-addr ""` with `[webServer] user`/`password` set and
+    `[webServer] port` in the file: frp-rs logged
+    `Dashboard web UI starting on :<port>` and then
+    `Dashboard server failed: failed to lookup address information`, leaving the
+    dashboard port **unbound** while the control listener stayed up; it now
+    binds `127.0.0.1:<port>` like Go (`WebServer.Complete()` fills the empty
+    string with `127.0.0.1`). Without credentials this was masked by the
+    no-auth force-bind, which is unchanged and still applies.
+  - `--bind-addr ""`: the empty address reached `TcpListener::bind`, so frp-rs
+    exited **1** with `failed to lookup address information` and bound nothing;
+    it now binds `0.0.0.0:<port>` like Go
+    (`c.BindAddr = util.EmptyOr(c.BindAddr, "0.0.0.0")`,
+    `pkg/config/v1/server.go:110`). The same fill now also covers
+    `bindAddr = ""` written in the config file — including under
+    `--config-dir`, where the same config used to exit **0 with nothing bound**.
+  - `--bind-port 0`: it bound an OS-chosen ephemeral port; it is now completed
+    to the default **7000**, like `bindPort = 0` in a file and like Go.
+  - **The proxy listeners now follow `--bind-addr`.** Go's `ProxyBindAddr`
+    inherits the final `BindAddr` inside `Complete()`, so frp-rs now does that
+    too; before, the inheritance had already happened against the file's value,
+    so `--bind-addr 0.0.0.0` over a file that said `bind_addr = "127.0.0.1"`
+    moved the control listener to every interface while the registered proxy
+    ports stayed loopback-only. If you pass `--bind-addr`, the proxy ports bind
+    the same address as the control listener (and if you pass a narrower
+    address, they narrow with it). Per-proxy pinning via an explicit
+    `proxyBindAddr` is unchanged and still wins.
+  Absent flags are unaffected — the configured value is still what binds — and
+  so is `-c`, which keeps the file authoritative (flags ignored). Also
+  unchanged: frp-rs still needs `./frps.toml` to exist where Go's flags-only mode
+  needs no file at all.
 - **`frpc` no longer crashes at shutdown when two or more visitors share a
   `bind_port`.** Both the explicit multi-visitor config (`[v1]`/`[v2]`/`[v3]` with
   one `bind_port`) and the legacy `[range:...] … role = visitor` template form
