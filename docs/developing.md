@@ -835,6 +835,59 @@ Follow these conventions:
 5. **Clean up**: ensure spawned tasks/processes are killed on test completion
 6. **Wait on a deadline, not an attempt count**: a readiness/retry loop should poll against a wall-clock deadline (`Instant::now() + timeout`) rather than a fixed `for _ in 0..N` plus sleep — the attempt count is a hidden, load-dependent time budget that flakes on CI — and it must report the last error on exhaustion, not a bare `expect`.
 
+### The `dashboard` lane: build ordering (read this before running it)
+
+`frp-server`'s dashboard tests spawn the real `frps` binary that
+`common::frps_binary()` resolves — `FRPS_BIN` in CI, else `CARGO_BIN_EXE_frps`,
+else `../frps`, else `../target/<profile>/frps`. **That artifact has to be the
+dashboard build, and nothing else in the workspace keeps it that way.** A build
+of the `frps` bin from the crate's default features writes `target/debug/frps`
+again **without** the dashboard: any invocation of `cargo test -p frps` — its
+test targets link the binary through `CARGO_BIN_EXE_frps`, so **even
+`-- --list` does it** (measured: `1 → 0` in 0.167 s) — and a plain
+`cargo build -p frps`, even one cargo treats as a no-op (measured: `1 → 0` in a
+0.16 s cached build). A clippy run is *not* a cause:
+`touch frps/src/main.rs && cargo clippy -p frps --all-targets --all-features`
+left the artifact byte-identical (same size and mtime). Run the lane in this
+order:
+
+```bash
+cargo build -p frps --features dashboard
+cargo test  -p frp-server --features dashboard -j 1
+```
+
+Getting the order wrong used to be silent. On the **pre-fix tree** (`97a8d7e`)
+the lane reported `0 passed; 20 failed` after **45.6 s**, every failure
+`frps dashboard_port not ready: "port N not ready after 15s"`, and the run left
+**17 `frps` children at `PPID 1`** still `LISTEN` on their ports (20 listeners;
+the three `CapturedFrps`-based tests in the same run reaped theirs — the orphan
+count grew by 0 for them). The artifact itself flips between the two runs:
+`grep -ac "Dashboard listening on" target/debug/frps` is 1 right after the
+dashboard build and 0 after `cargo test -p frps`, and the same marker through
+`strings target/debug/frps | grep -c "Dashboard listening on"` is 2 → 0 (the two
+hits are the plain and the TLS format string — same conclusion, different count,
+so name the tool).
+
+On the **fixed** head the same swapped artifact fails fast and says why:
+`0 passed; 20 failed`, every failure the guard's own message, `finished in
+1.58 s` (8.5 s wall, that run including the compile of the edited test target),
+and **0 children** left. The guard is what fires first, not the 15 s timeouts;
+it is compiled only in a `dashboard`-enabled test target and scans the artifact
+`frps_binary()` resolved (see the doc comment there). Both halves are pinned by
+`frp-server/tests/frps_binary_guard.rs` (the panic *message*) and
+`frp-server/tests/frps_handle_orphan.rs` (a panicking `FrpsHandle::start` kills
+the child it spawned). The CI lane that reads this ordering is the
+`Tests (server integration)` job in `.github/workflows/ci.yml`, whose
+`cargo build --bin frps --features dashboard` step immediately precedes its
+`cargo test -p frp-server --features dashboard -j 1` step.
+
+The guard is compiled **only** when the test target has the `dashboard` feature
+(`#[cfg(feature = "dashboard")]`): the no-features runtime step in that same CI
+job resolves the same `FRPS_BIN` for tests that need no dashboard, so it must
+not require the listener. The check costs one `read` and byte scan of the
+resolved artifact (measured 28.83 ms for the 81,444,248-byte dashboard
+artifact), cached per test-binary process.
+
 ### Benchmarks
 
 Criterion micro-benchmarks in `frp-core/benches/crypto_bridge.rs` (8 groups) and `frp-server/benches/nathole.rs` (2 groups):

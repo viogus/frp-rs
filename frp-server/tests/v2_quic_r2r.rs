@@ -150,6 +150,13 @@ port = 0
             .spawn()
             .expect("failed to start frps");
 
+        // Kill-on-drop guard first, wait second: a `panic!` in the wait below
+        // with the child still a bare local would orphan it (`Child`'s own
+        // `Drop` does not kill) — the same shape `common::FrpsHandle::start`
+        // was fixed for (TODO.md “Two test-harness hazards”). Do not inline the
+        // wait above this binding.
+        let process = FrpsProcess { child, dir };
+
         if !wait_for_port(port, Duration::from_secs(10)) {
             eprintln!("--- frps log ({}) ---", log_path.display());
             if let Ok(log) = std::fs::read_to_string(&log_path) {
@@ -158,7 +165,7 @@ port = 0
             panic!("frps did not start");
         }
 
-        FrpsProcess { child, dir }
+        process
     }
 }
 

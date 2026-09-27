@@ -2509,7 +2509,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   credentials set, `--features dashboard` where the dashboard is read) asserting the bound address,
   plus a Go-binary measurement row per shape. Absent flags keep the configured/serde value, and the
   no-auth force-bind stays as it is.
-- [ ] **Two test-harness hazards: a feature swap that breaks the dashboard lane silently, and
+- [x] **Two test-harness hazards: a feature swap that breaks the dashboard lane silently, and
   `FrpsHandle::start` orphaning its child on the panic path.**
   * **(a) `cargo test -p frps` and a clippy run that compiles `frps` replace `target/debug/frps`
     with the no-dashboard artifact** — the same path the dashboard tests resolve through `FRPS_BIN`
@@ -2554,6 +2554,70 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   test; and sweep the strays earlier runs left (done at this head — batches of ~65, 34 and 2
   children killed, 0 `frps` processes and no listeners remaining — because a leaked child also
   holds its port for the next run).
+  Done on `fix/harness-hazards` at `6b7c892` (based on `97a8d7e`). (a)
+  `common::frps_binary()` now scans the artifact it resolved for
+  `Dashboard listening on` and panics with the rebuild instruction when it is absent;
+  `frp-server/tests/frps_binary_guard.rs` pins the **message** (the rebuild literal, the path it
+  checked, the marker name), the silent unreadable/missing-binary branch, and two positive controls
+  (a file carrying the TLS-format-string marker must pass; this lane's real artifact must exist and
+  carry the marker). The check is compiled only when the test target has the `dashboard` feature,
+  compiles and spawns nothing, and no test skips. Marker flip re-measured here with both tools
+  named: `grep -ac "Dashboard listening on" target/debug/frps` **1 → 0** and
+  `strings target/debug/frps | grep -c "Dashboard listening on"` **2 → 0** across a
+  `cargo test -p frps`, and a plain `cargo build -p frps` flips it too — **even the 0.16 s cached
+  no-op**; a clippy run does not (measured: `touch frps/src/main.rs && cargo clippy -p frps
+  --all-targets --all-features` left the artifact byte-identical, same size and mtime). On the
+  **fixed** head a swapped artifact fails fast instead of waiting out 20 × 15 s: `0 passed; 20
+  failed`, every failure the guard's message, `finished in 1.58 s` (8.5 s wall including the
+  compile of the edited test target) and **0 children** left. For contrast, the **pre-fix tree**
+  (`97a8d7e`) reported the same `0 passed; 20 failed` with `frps dashboard_port not ready` after
+  **45.6 s** and left the 17 children below. Cost measured before caching: one full read+scan is
+  **28.83 ms** for the dashboard artifact this lane resolves (81,444,248 bytes) and 61.45 ms for
+  the 71,033,304-byte no-dashboard one (cold, just after a link) — the scan stops at the first hit,
+  so where the marker sits matters as much as size; with 46 spawn sites across 5 test binaries the
+  verdict is cached per process, keyed by the exact path plus `(len, mtime)`, and no shipped test
+  can observe that cache (every `cargo test` binary is a fresh process — stated in the code). The
+  residual that a swap preserving both is invisible is stated in the code. Ordering recorded in
+  `docs/developing.md` § Testing → “The `dashboard` lane: build ordering” and in the `frps_binary`
+  doc comment. (b) `FrpsHandle::start_with_timeout` constructs the kill-on-drop guard before the
+  first wait; `frp-server/tests/frps_handle_orphan.rs` forces the dashboard wait to fail
+  (TEST-NET-1 dashboard address + `[web_server]` credentials + `[auth].token`, so frps stays alive
+  holding the control port), asserts the child it observed bound is gone and the port rebindable,
+  and names + reaps any survivor with pid and command before failing. Pre-fix wave re-measured here,
+  delta-scoped: **17** children at `PPID 1` with **20** listeners after one swapped-artifact lane
+  run, and **+0** for the three `CapturedFrps` tests as the control. Both new tests were shown red
+  on the reverted guard (a) / reverted ordering (b) and green after, leaving 0 strays
+  (worktree-scoped census). Sweep: `frp-server/tests/common/mod.rs` has exactly two spawn sites —
+  `FrpsHandle::start` (fixed) and `CapturedFrps::start` (already guard-first with no wait inside,
+  its +0 control measured); the same shape in `frp-server/tests/v2_quic_r2r.rs`
+  `FrpsProcess::start` is fixed as well (verified by running the test, which skips without an
+  `frpc`). The `cli_exit_codes` files were not touched, so `env.FRPS_CLI_TESTS` /
+  `env.FRPC_TINY_CLI_TESTS` stay at 16 / 11 (both re-measured with the guard's own `-- --list`
+  pattern). `CHANGELOG.md` gets no entry: test-harness only, no user-visible behaviour. The same
+  shape elsewhere in the tree is **not** closed by this item — it has its own item immediately
+  below.
+- [ ] **`frp-server/tests/reload_integration.rs` has seven unguarded spawn sites and can orphan its children on a panic path.**
+  Evidence: `.spawn()` at `:262`, `:272`, `:504`, `:523`, `:741`, `:750`, `:781` (frps/frpc pairs
+  plus one more frps). None is wrapped in a kill-on-drop guard — the children are killed by explicit
+  `kill()`/`wait()` calls at the end of each test body (`:355-358`, `:635-638`, `:767-768`,
+  `:802-805`) — so any panic above those lines leaves the child running with `PPID 1` and its port
+  held. Constructed during review of the fix above, on `fix/harness-hazards` at `6b7c892`: with
+  `FRPC_BIN` pointing at a mode-644 file, `workspace_bin`'s `.exists()` check passes and the
+  `Command::spawn` at `:272` fails, so the `.expect(..)` at `:273` panics, the cleanup at `:355`
+  never runs, and the already-started `frps` survived at `PPID 1` holding its port; the control
+  (a working `frpc`) passed with 0 strays. The
+  shape that closes it is already in `frp-server/tests/common/mod.rs`: `FrpsHandle` and
+  `CapturedFrps` construct the guard before the first wait and their `Drop` kills **and** reaps.
+  Same class, found in the same sweep and also unguarded: `frpc/tests/admin_cli.rs`
+  `expect_one_connection` (spawn at `:193`) panics `oracle accept failed` at `:207` with the child
+  still alive — its timeout path at `:210` does kill — and the `try_wait().expect(..)` panic paths
+  in `frps/tests/cli_exit_codes.rs` (`:87`, `:258`, `:284`), `frpc/tests/cli_exit_codes.rs` (`:96`)
+  and `frpc/tests/admin_cli.rs` (`:135`) have a live child and no kill-on-drop.
+  **Done-when:** every spawn in `reload_integration.rs` is wrapped in a kill-on-drop guard
+  constructed before the first wait (a `common` helper or a local RAII type), with a test that
+  forces a spawn or wait failure and asserts no child outlives the test — in the style of
+  `frp-server/tests/frps_handle_orphan.rs` — or the file is deleted in favour of `common`'s
+  handles; and the admin_cli/cli_exit_codes residuals are either guarded or recorded as deliberate.
 - [x] **`frpc`'s eight single-proxy subcommands reject `-c`/`--config`, which Go accepts and
   ignores.** Go's `-c` is a persistent rootCmd flag, so every subcommand parses it; the single-proxy
   commands simply never read the value. frp-rs's bpaf parsers for `tcp`/`udp`/`http`/`https`/`stcp`/
