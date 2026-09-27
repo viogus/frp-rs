@@ -53,11 +53,20 @@ async fn test_login_empty_token_rejected() {
         Ok(_) => panic!("Server should reject empty token at startup via check_startup()"),
         Err(e) => e,
     };
+    // `Service::new` now returns the typed `ConstructError`, so assert the kind
+    // *and* the message: the kind is what the daemons turn into an exit code, and
+    // a message-only assertion would keep passing if the tag were wrong.
+    assert_eq!(
+        err.kind(),
+        frp_core::init_error::InitErrorKind::Auth,
+        "an empty token is an Auth construction failure, got: {err:?}"
+    );
+    let msg = err.to_string();
     assert!(
-        err.contains("security misconfiguration")
-            || err.contains("CRITICAL")
-            || err.contains("token"),
-        "Expected startup rejection with security message, got: {err}"
+        msg.contains("security misconfiguration")
+            || msg.contains("CRITICAL")
+            || msg.contains("token"),
+        "Expected startup rejection with security message, got: {msg}"
     );
 }
 
