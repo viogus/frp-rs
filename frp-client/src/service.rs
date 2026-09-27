@@ -6044,7 +6044,9 @@ mod tests {
 
         // Both listeners exist before we observe anything, so neither half can
         // pass by accident.
-        bound_rx.await.expect("loser-shaped task must bind its port");
+        bound_rx
+            .await
+            .expect("loser-shaped task must bind its port");
         parked_bound_rx
             .await
             .expect("parked task must bind its port");
