@@ -2767,9 +2767,15 @@ load-bearing):
   class (`frps verify --dashboard_tls_mode -c CFG` was rc 1 with 0 B where Go and the base are rc 0
   with 114 B; `frpc tcp --disable-log-color -h`, `--ue -h`, `--uc -h`, `stcp --tls_enable -h` were
   errors where both trees print help). A name frp-rs does not register is deliberately **not** in the
-  list even where Go accepts it (`--bind-port` is a Go spelling via `WordSepNormalizeFunc` and an
-  frp-rs spelling only as `--bind_port`; both trees end rc 1 on `frps verify --bind-port
-  --help=false -c CFG` and rc 0 on `--bind-port 7000 verify -c CFG`). A token that already contains
+  list even where Go accepts it. `--bind-port` is **not** an example of that: frp-rs registers both
+  spellings (`frp-core/src/cli.rs` `svr_bind`, `long("bind-port").short('p').long("bind_port")`) and
+  it **is** listed (`-` and `_` names both appear, because Go's `config.WordSepNormalizeFunc` folds
+  one into the other). Measured with it listed: `frps verify --bind-port --help=false -c CFG` is
+  **rc 1 on stderr** with `` couldn't parse `--help=false`: invalid digit found in string `` (68 B)
+  where Go is rc 1 with 2191 B — the same rc and stream, and the attach is what gives pflag's
+  faithful outcome instead of bpaf's help — and `--bind-port 7000 verify -c CFG` is rc 0 with 112 B
+  on Go, the base and this head. The names this list deliberately omits are flags frp-rs's **own**
+  parsers do not have at all. A token that already contains
   `=` claims nothing and is never re-attached.
 * **The root short sets are per binary.** `frpc`'s run path is the only parser here with `-L`
   (frp-rs's alias for `--log-level`); `frps`'s root has `{c,p,t}` and every subcommand of both
@@ -2790,16 +2796,39 @@ other bool flag here, so `1`/`0`/`t`/`f`/`T`/`F`/`TRUE`/`FALSE`/`True`/`False`
 are accepted on the `=` spelling.
 
 **Recorded residuals, each measured on Go v0.71.0 / base / head.** The sweep is
-**242 argv** against Go v0.71.0, the base head and this head — **190 `frpc`** + **52 `frps`** —
-with **0 regressions** and **64 moved to Go's `(rc, connection count, stdout empty)`**. The
-composition, so it can be re-derived from the raw files: `frpc` = 154 from rounds 1–2 (85 + the 69
-R2 named) + 12 (`m4`) + 12 (`m5`) + 2 (`verify`) + 3 (`run`) + 7 (`m6`); `frps` = 20 (the `frpsrows`
-matrix) + 13 (`m5`) + 8 (`verify`) + 3 (`run`) + 8 (`m6`). **88 rows whose stdout is a help document
-are byte-identical between base and head** on `rc`, connection count, stdout **and** stderr lengths
-— the number to re-derive is "rows whose stdout contains `Usage:` or `Overview of`, base == head on
-all four". Every figure here comes from `/tmp/probe/*.jsonl`; the matrices are
-`matrix{,2,3}.py`, `matrix4.py`, `matrix5.py`, `m6.py`, `frpsrows.py`, `verifyrows.py`,
-`runrows.py`.
+**262 argv** against Go v0.71.0, the base head and this head — **210 `frpc`** + **52 `frps`** —
+with **0 regressions** and **70 moved to Go's `(rc, connection count, stdout empty)`**. Composition,
+row by row, so every figure is re-derivable from the raw files:
+
+| matrix | binary | rows | moved | help-document rows (all byte-identical) |
+|---|---|---|---|---|
+| `matrix.py` | frpc | 27 | 7 | 14 |
+| `matrix2.py` | frpc | 58 | 13 | 27 |
+| `matrix3.py` | frpc | 69 | 22 | 26 |
+| `matrix4.py` | frpc | 20 | 6 | 7 |
+| `matrix5.py` | frpc | 24 | 6 | 8 |
+| `verifyrows.py` | frpc | 2 | 0 | 0 |
+| `runrows.py` | frpc | 3 | 0 | 0 |
+| `m6.py` | frpc | 7 | 2 | 3 |
+| **frpc total** | | **210** | **56** | **85** |
+| `frpsrows.py` | frps | 20 | 9 | 7 |
+| `matrix5.py` | frps | 13 | 2 | 2 |
+| `verifyrows.py` | frps | 8 | 0 | 0 |
+| `runrows.py` | frps | 3 | 1 | 0 |
+| `m6.py` | frps | 8 | 2 | 1 |
+| **frps total** | | **52** | **14** | **10** |
+
+That is **95 rows whose stdout is a help document, byte-identical between base and head** on `rc`,
+connection count, stdout **and** stderr lengths — the recipe is *"stdout contains `Usage:` or
+`Overview of`, and base == head on all four"*, and it is the recipe rather than a bare number that
+makes it checkable (a wider recipe, "stdout is non-empty", gives 173 rows and 128 identical, which is
+a different question). Two caveats about the counts themselves: `matrix4.py`'s **12 frps rows are
+excluded** — they were stored with an `frpc` config, so they failed on `unknown field "serverAddr"`
+and measure nothing about the frps surface — and 20 frpc labels (`N…`) appear in **both**
+`matrix4.py` and `matrix5.py` with different configs, so the row count is a measurement count while
+the distinct-label count is 190. This round adds `m7.py`'s 6 frps rows (2 moved), which would make
+the totals 268 and 72. Every figure comes from `/tmp/probe/*.jsonl`, whose producers are
+`matrix{,2,3,4,5}.py`, `m6.py`, `m7.py`, `frpsrows.py`, `verifyrows.py` and `runrows.py`.
 
 Scored per surface, since one aggregate hid the frps half in two earlier rounds:
 
@@ -2839,8 +2868,9 @@ file" divergence, which the base shows with no help flag in argv at all.
 | `frps -hL`, `frps -h -L` | rc 1, stderr 2375 B | rc 1, stderr 45 B / rc 0 help | rc 1, stderr 45 B / rc 0 help (**base == head**) | frps has no `-L` in frp-rs **or** Go, so nothing is fabricated; the root split is what keeps `frps -hL` from printing frpc's line |
 | `frpc -hL -c CFG` | rc 1, stderr 1351 B | rc 0 help | rc 0 help | **unchanged from base, unrecorded until now**: the `-L` cluster claims the next token (`-c CFG`), so nothing dangles and bpaf prints help. Go is rc 1 |
 | `frpc -L -h` | rc 1, stderr 1351 B | rc 0 help | **rc 1, stdout 78 B, stderr 0 B** | moved toward Go on rc: `-L` takes `-h` as `--log-level`'s value and the client then fails on the config path (78 B on stdout). Base ≠ Go, head ≠ Go on the stream — recorded |
-| `frps -c CFG -t -h`, `frps -t -h`, `frps -p -h` (hardening-safe config) | rc 1, stdout 239 B / 186 B / stderr 2438 B | rc 0, root help | **rc 1**, stdout ≈1.4 kB / 78 B / stderr 58 B | **fixed**: the config load runs as Go's does. The byte counts differ — frp-rs's loader wording, no cobra usage block — and the `-c CFG -t -h` row is **path-dependent** (its line names the config file: raw 1445, 1449 and 1451 B across runs with different temp paths), so the shape rather than a figure is the claim |
-| `frps -t -c CFG` | rc 1, stderr 137 B | rc 1, stderr **96 B** (bpaf's `` `-t` requires an argument `` hint) | rc 1, stderr **111 B** | same rc and stream; bpaf's particular hint does **not** come back, because `-t=-c` is what pflag actually does and the parser then refuses the leftover positional (`CFG`, which Go also never consumes). Recorded, not a regression |
+| `frps -c CFG -t -h` (hardening-safe config, free `bindPort`) | **runs** (the harness signals it, −15, after the bounded wait; 331 B of startup log) | rc 0, root help | **rc 0, 2472 B of startup log — the server starts**, then exits on the harness's SIGTERM | **fixed**: the config load runs and the server starts, as Go's does. An earlier revision of this row recorded `rc 1` with `frps error: Address already in use (os error 48)` — a **harness artifact**, not this argv: with `bindPort = 0` frp-rs completes the port to 7000, so a row could collide with another test's server. Re-measured here with a fresh free `bindPort` per row |
+| `frps -t -h`, `frps -p -h` (hardening-safe config) | rc 1, stdout 186 B / stderr 2438 B | rc 0, root help | rc 1, stdout 78 B / stderr 58 B | **fixed**: the config load runs as Go's does (the byte counts differ — frp-rs's loader wording, no cobra usage block) |
+| `frps -t -c CFG` | rc 1, stderr 135–142 B (**path-dependent**: the message names the config path) | rc 1, stderr **96 B** (bpaf's `` `-t` requires an argument `` hint, a fixed string) | rc 1, stderr **111–118 B** (path-dependent) | same rc and stream; bpaf's particular hint does **not** come back, because `-t=-c` is what pflag does and the parser then refuses the leftover positional (`CFG`, which Go also never consumes). The byte counts move with the temp path, so the claim is the shape |
 | `frps -c CFG -t -h` (**tokenless** config) | rc 1 | rc 0, root help | rc 3 | the `EXIT_AUTH`/3 empty-token hardening, which is its own recorded divergence: with `[auth] method = "token"` and a token in the file the head reaches the server start and exits 1 like Go |
 | `-c cfg -- --help=false` | rc 1 stdout | rc 1 stderr | rc 1 stderr | the positional-argument class (Go ignores what follows `--`, frp-rs refuses it) |
 | `--help=false status -c CFG` (port set) | rc 1, 1 conn, **stdout** 45 B | rc 0, 0 conn | rc 1, 1 conn, **stderr** 22 B | the admin status error's stream: frp-rs's `status query failed: …` goes to stderr on every status failure, port or not, unrelated to this flag |

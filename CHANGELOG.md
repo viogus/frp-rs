@@ -307,11 +307,12 @@ User-facing release notes for frp-rs.
     0 B on stdout, as on Go, where frp-rs used to print help on stdout with rc 0.
     The split spellings are covered too: `-c -h` was already `-c` taking `-h`
     (`open -h: no such file or directory` on Go, rc 1, 35 B on stdout), and the
-    `-h -c` order — `frpc -h -c`, `frpc -h -c status`, `frpc status -h -c` — is now
-    rc 1 with `flag needs an argument: 'c' in -c` on **stderr** and 0 B on stdout,
-    as Go, where it used to print help with rc 0. The **trailing usage block** cobra
-    adds after that line is not reproduced (frp-rs parse failures print no usage
-    block), so the stderr byte count is 41 rather than Go's 637 — recorded in
+    `-h -c` order is now rc 1 with `flag needs an argument: 'c' in -c` on **stderr**
+    and 0 B on stdout, as Go, where it used to print help with rc 0. The **trailing
+    usage block** cobra adds after that line is not reproduced (frp-rs parse
+    failures print no usage block), so the stderr byte count is 41 where Go's is
+    **637 B** for `frpc -h -c status` and `frpc status -h -c` (the two rows that
+    carry a command word) and **1351 B** for bare `frpc -h -c` — recorded in
     `docs/developing.md` § `--help=<bool>`.
   Deliberately unchanged: `frpc --help`, `frpc -h`, `frpc --help=true`,
   `frpc <sub> --help`/`-h`, `frpc --help <word>` and the root

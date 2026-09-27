@@ -3352,8 +3352,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   **85 argvs** on
   Go v0.71.0 (darwin/arm64) / base `5b18489` / this head, one fresh listening socket per run on the
   config's `[webServer] port` with connections counted by `accept`, streams separate and rc read
-  from the child — **the whole sweep is 242 rows (190 `frpc` + 52 `frps`) with 64 moved and none
-  regressed**; the first matrix alone was 154 with 34 moved (the review-fix round added the 69-row matrix R2 named, which is where the first
+  from the child — **the whole sweep is 262 rows (210 `frpc` + 52 `frps`) with 70 moved and none
+  regressed**; the first matrix alone was 154 with 34 moved. The per-matrix table (rows / moved /
+  help-document rows) is in `docs/developing.md` § `--help=<bool>` so the figure can be re-derived
+  rather than trusted (the review-fix round added the 69-row matrix R2 named, which is where the first
   revision's 19 regressions were found and fixed). **Scored per surface, because one aggregate hid
   the frps half twice:** the 20-row `frps` matrix is **19 agree / 1 differ** (the root
   `--help=false -c CFG` divergence), the valid-config `verify` rows are **9 agree / 1 differ** (that
@@ -3363,8 +3365,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   flag in argv**. `frpc --help`, `-h`, `--help=true`, every
   `frpc <sub> --help`/`-h`, `frpc --help status`, `frpc -c --help` and the root
   `frpc --help=false -c cfg` divergence are unchanged — the 29 historical help rows are
-  **byte-identical** to the base (88 rows whose stdout is a help document, base == head on rc,
-  connection count and both byte counts). **One correction to this item's own rows:** `frpc -hc status` is rc 1 with the
+  **byte-identical** to the base (95 rows whose stdout is a help document, base == head on rc,
+  connection count and both byte counts — the recipe is in the same section). **One correction to this item's own rows:** `frpc -hc status` is rc 1 with the
   missing-argument line, and the mechanism is cobra's, not pflag's: `stripFlags` sees `-hc` (three
   characters, so its two-character short rule does not apply) and then collects `status` as the
   first **bare word**; `Find` selects the `status` command and `argsMinusFirstX` removes the word,

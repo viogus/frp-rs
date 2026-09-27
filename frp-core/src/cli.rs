@@ -1094,11 +1094,19 @@ fn expand_bool_short_value_form(argv: Vec<OsString>) -> Vec<OsString> {
 /// [`claims_the_next_token`]. `-v` is deliberately absent — Go registers it as a
 /// pflag **bool**, so it never needs an argument.
 ///
-/// `frpc`'s root — which is the run path — takes `-c`, `-p` and `-t` from the
-/// shared list below, **plus `-L`**: frp-rs's own alias for `--log-level`
-/// (`frp-core/src/cli.rs`, the `run_mode` parser). Go has no `-L` at all
-/// (`log_level` is registered with an empty shorthand, `pkg/config/flags.go:161`),
-/// so Go's refusal there is `unknown shorthand flag: 'L' in -L`.
+/// `frpc`'s root, which is the run path: `-c` (frp-rs's `config_arg`) and `-L`
+/// (frp-rs's own alias for `--log-level`, `frp-core/src/cli.rs` `run_mode`) are
+/// registered there; **`-p` and `-t` are not** — frp-rs's `frpc` root has no
+/// `bind_port`/`token`, and neither does Go's (`log_level` itself is registered
+/// with an empty shorthand, `pkg/config/flags.go:161`, so Go's `-L` refusal is
+/// `unknown shorthand flag: 'L' in -L`). Keeping `p` and `t` in this set is a
+/// deliberate choice about which error a two-character `-x` gets rather than a
+/// claim about registration: pflag classifies any 2-char single-dash token as a
+/// short that eats the next token, so `frpc -t -h` is Go's `unknown shorthand
+/// flag: 't' in -t` with **rc 1 on stderr** — and the set is what makes this tree
+/// report pflag's missing-argument line with the same rc and stream instead of
+/// letting bpaf print help with rc 0. Dropping them would regress those rows
+/// toward the base.
 const VALUE_TAKING_SHORTS_FRPC_ROOT: [char; 4] = ['c', 'p', 't', 'L'];
 
 /// `frps`'s root takes `-c`, `-p` (`bind_port`, `pkg/config/flags.go:231`) and
@@ -1337,18 +1345,17 @@ fn attach_flag_shaped_values(argv: Vec<OsString>, root: RootCommand) -> Vec<OsSt
 /// **Scope, stated rather than implied:** this is a curated list, derived
 /// mechanically from this file's `long("…") … .argument` chains (both spellings
 /// in the chain are taken, whatever order the `.long()`/`.short()`/`.help()`
-/// calls come in — `svr_bind` puts `.short('p')` before `.long("bind_port")`,
-/// which is how `--bind-port` was missed at first). A name **frp-rs does not
-/// register** is deliberately absent even when Go accepts it: Go normalises `_`
-/// to `-` (`config.WordSepNormalizeFunc`) so `frps verify --bind-port …` is a
-/// real flag there, while frp-rs registers only the underscore spelling in some
-/// places — and attaching a value to an unknown name is exactly the round-3
-/// regression, so the absence is the safe side. `frps verify --bind-port
-/// --help=false -c CFG` is rc 1 on both trees and `--bind-port 7000 verify -c
-/// CFG` is rc 0 on both (measured). A value-taking long flag added later that is
-/// missing here is simply not attached, which leaves bpaf's own refusal in place
-/// — a divergence from pflag, not a fabricated error. The unit test below pins
-/// the members the measured rows use and every excluded bool, in both directions.
+/// calls come in — `svr_bind` is `long("bind-port").short('p').long("bind_port")`,
+/// so both spellings come from one chain and a matcher that expected the shorts
+/// last missed **both**). A name **frp-rs does not register** is deliberately
+/// absent even when Go accepts it, because attaching a value to an unknown name
+/// is exactly the round-3 regression: the absence is the safe side, and the cost
+/// is only that pflag's `--flag value` spelling stays refused where Go (whose
+/// `config.WordSepNormalizeFunc` folds `_` to `-`) would take it. A value-taking
+/// long flag added later that is missing here is simply not attached, which
+/// leaves bpaf's own refusal in place — a divergence from pflag, not a fabricated
+/// error. The unit test below pins the members the measured rows use and every
+/// excluded bool, in both directions.
 const VALUE_TAKING_LONG_FLAGS: &[&str] = &[
     "admin-addr",
     "admin-port",
@@ -1365,6 +1372,7 @@ const VALUE_TAKING_LONG_FLAGS: &[&str] = &[
     "api-timeout",
     "api_timeout",
     "bind-addr",
+    "bind-port",
     "bind_addr",
     "bind_port",
     "config",
@@ -5757,6 +5765,8 @@ mod hoist_tests {
         for member in [
             "token",
             "bind-addr",
+            "bind-port",
+            "bind_port",
             "log_file",
             "log-level",
             "config",
