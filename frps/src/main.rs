@@ -174,12 +174,13 @@ async fn run(mut cli: FrpsArgs) {
     // Single config mode: load config first, then init logging with [log] fallback.
     //
     // Go ordering: Go binds the flag values onto the config struct and only then
-    // calls `ServerConfig.Complete()` (`cmd/frps/root.go:97-99`), so a flag value
+    // calls `ServerConfig.Complete()` (`cmd/frps/root.go:78-81`), so a flag value
     // is always seen by the completion. frp-rs loads the file, overlays the CLI
     // flags, and completes the merged result — the same effective order. See
-    // `load_server_config_uncompleted` for the two flags (`bind_addr`,
-    // `web_server.addr`) where writing the override after `complete()` was
-    // observable, and `docs/developing.md` § CLI inputs.
+    // `load_server_config_uncompleted` for the fields where writing the override
+    // after `complete()` was observable (`bind_addr`, `web_server.addr`, and the
+    // derived `proxy_bind_addr`, which now follows `--bind-addr`; measured end to
+    // end in `docs/developing.md` § CLI inputs § 2b).
     let config_path = cli.config_path();
     let mut cfg = match load_server_config_uncompleted(&config_path, cli.strict_config) {
         Ok(cfg) => cfg,

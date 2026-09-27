@@ -28,18 +28,23 @@ pub fn load_server_config(
 ///
 /// This exists to mirror Go's ordering. Go's `cmd/frps/root.go` binds the flag
 /// values straight onto the config struct and calls `serverCfg.Complete()` only
-/// afterwards (`cmd/frps/root.go:97-99` for the flags-only path; the
+/// afterwards (`cmd/frps/root.go:78-81` for the flags-only path; the
 /// `-c` path completes inside `config.LoadServerConfig`), so on Go a flag value
 /// is always seen by `Complete()`. frp-rs loads the file first and overlays the
 /// flags afterwards, so an override written after `complete()` lands on an
 /// already-completed value and can no longer re-trigger a completion:
 /// `--dashboard-addr ""` could not re-run Go's `WebServer.Complete()` fill
 /// (`pkg/config/v1/common.go:71-72` → `127.0.0.1`) and `--bind-addr ""` could
-/// not be filled to `0.0.0.0` (`pkg/config/v1/server.go:110`).
+/// not be filled to `0.0.0.0` (`pkg/config/v1/server.go:110`). The merge order
+/// is also observable through a derived field: `proxy_bind_addr` inherits the
+/// **effective** `bind_addr` (`server.go:112-114`), so completing before the
+/// overlay left the proxy listeners on the file's address while the control
+/// listener moved to `--bind-addr` — measured end to end, see
+/// `docs/developing.md` § CLI inputs § 2b.
 ///
 /// The `transport` completion (`complete_with_heartbeat_timeout_set`) still runs
-/// here: it is not safely re-runnable (it keys off the *presence* of
-/// `serverHeartbeatTimeout` in the file) and no CLI flag overrides its result.
+/// here: it keys off the *presence* of `serverHeartbeatTimeout` in the file, so
+/// it is not replayable, and no CLI flag overrides its result.
 pub fn load_server_config_uncompleted(
     path: &str,
     strict_config: bool,

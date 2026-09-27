@@ -6908,7 +6908,7 @@ fn server_bind_addr_empty_is_completed_to_wildcard() {
 
 /// **Call-order pin for the CLI override path.** `frps` overlays CLI flag values
 /// onto the file config and must complete the *merged* result, as Go does
-/// (`cmd/frps/root.go:97-99`: flags are bound onto the struct and
+/// (`cmd/frps/root.go:78-81`: flags are bound onto the struct and
 /// `ServerConfig.Complete()` runs afterwards). Completing the file first and
 /// overlaying the flags afterwards loses the completion for any flag whose
 /// value is empty — the shape this test pins, since that ordering is what made

@@ -388,14 +388,17 @@ impl ServerConfig {
     /// `ServerConfig.Complete()`. Call after deserialization, before consuming.
     ///
     /// **Call order is part of the contract.** Go runs this on the *merged*
-    /// config: `cmd/frps/root.go:97-99` completes the flags-only struct, and
+    /// config: `cmd/frps/root.go:78-81` completes the flags-only struct, and
     /// `config.LoadServerConfig` completes the `-c` struct after the flags are
     /// bound onto it. A caller that overlays CLI flags (or any other late
     /// input) must therefore complete afterwards — take the file from
     /// `load_server_config_uncompleted`, overlay, then complete — and never
-    /// complete first and overlay later. Two fields make the difference
-    /// observable: `bind_addr` (`""` filled to `0.0.0.0`) and
-    /// `web_server.addr` (`""` filled to `127.0.0.1`).
+    /// complete first and overlay later. Three fields make the difference
+    /// observable: `bind_addr` (`""` filled to `0.0.0.0`), `web_server.addr`
+    /// (`""` filled to `127.0.0.1`), and `proxy_bind_addr` (inherits the
+    /// **effective** `bind_addr`, so a late `--bind-addr` moves the proxy
+    /// listeners too — measured end to end, see `docs/developing.md` § CLI
+    /// inputs § 2b).
     pub fn complete(&mut self) {
         // Go frp: `BindAddr = util.EmptyOr(BindAddr, "0.0.0.0")`
         // (`pkg/config/v1/server.go:110`), which runs BEFORE the `ProxyBindAddr`
