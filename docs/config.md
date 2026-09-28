@@ -294,10 +294,10 @@ enable_control = true
 | `nat_hole_stun_server` | `string` | `"stun.easyvoip.com:3478"` | `natHoleStunServer` | Custom STUN server address for NAT traversal. Format: `"stun:host:port"`. |
 | `start` | `string[]` | `[]` | `start` | Selective proxy start list. If non-empty, only proxies with names in this list are started. Empty = start all proxies. |
 | `includes` | `string[]` | `[]` | `includes` | Glob patterns for additional config files to merge (`.toml`, `.ini`, `.json`, `.yaml`, `.yml`). Relative to the main config file directory. |
-| `tls_enable` | `bool` | `true` | `tlsEnable` | Enable TLS for the connection to the server. |
-| `tls_cert_file` | `string` | `""` | `tlsCertFile` | Client TLS certificate PEM file (for mTLS). |
-| `tls_key_file` | `string` | `""` | `tlsKeyFile` | Client TLS private key PEM file (for mTLS). |
-| `tls_ca_file` | `string` | `""` | `tlsCaFile` / `tlsTrustedCaFile` | CA certificate PEM file for verifying the server's TLS certificate. |
+| `tls_enable` | `bool` | `true` | `transport.tls.enable` | Enable TLS for the connection to the server. |
+| `tls_cert_file` | `string` | `""` | `transport.tls.certFile` | Client TLS certificate PEM file (for mTLS). |
+| `tls_key_file` | `string` | `""` | `transport.tls.keyFile` | Client TLS private key PEM file (for mTLS). |
+| `tls_ca_file` | `string` | `""` | `transport.tls.trustedCaFile` | CA certificate PEM file for verifying the server's TLS certificate. |
 | `tls_server_name` | `string` | `""` | `tlsServerName` | Server name for TLS SNI. Empty = use `server_addr`. |
 | `disable_custom_tls_first_byte` | `bool` | `true` | `disableCustomTLSFirstByte` | When true, the client skips the Go frp protocol marker byte (`0x17`) and starts TLS directly. Set this when connecting to a non-frp TLS endpoint. |
 | `login_fail_exit` | `bool` | `true` | `loginFailExit` | When true, the client exits on login failure. When false, it keeps retrying. |
@@ -370,6 +370,7 @@ The client config loader normalizes Go frp format to frp-rs format:
 - `[transport]` section is flattened to top level (client keeps `tcp_mux` top-level).
 - `transport.wireProtocol = "v2"` is converted to top-level `v2 = true`.
 - Flat `log_file`, `log_level`, `log_max_days` are nested into `[log]`.
+- Exception: `tls_enable`, `tls_cert_file`, `tls_key_file` and `tls_ca_file` have no camelCase aliases — use the snake_case names. Their four Go-shaped spellings are carried by the nested `[transport.tls]` section instead (`enable` / `certFile` / `keyFile` / `trustedCaFile`, `frp-core/src/config/normalize.rs:1352-1367`), which the `[transport]` flatten above first lifts to a top-level `tls` table (`frp-core/src/config/normalize.rs:1304-1325`). The flat aliases `tlsServerName` (→ `tls_server_name`) and `disableCustomTLSFirstByte` (→ `disable_custom_tls_first_byte`) do work and their rows stay (`frp-core/src/config/client.rs:282-288`); both loading paths are pinned by `test_flat_camelcase_client_tls_spellings_are_not_loader_spellings` in `frp-core/src/config/tests.rs`.
 
 ### Client TOML Example
 
