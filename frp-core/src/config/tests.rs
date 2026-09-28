@@ -2053,6 +2053,80 @@ tlsServerName = "frps.example.com"
     assert_eq!(cfg.tls_server_name, "frps.example.com");
 }
 
+/// Regression pin for `docs/config.md`: the four flat server TLS rows used to
+/// advertise `tlsOnly` / `tlsCertFile` / `tlsKeyFile` / `tlsCaFile` as their
+/// "Go frp Equivalent". No loader accepts them — `frp-core/src/config/server.rs:42-56`
+/// declares those fields with `#[serde(default)]` and no alias, and Go
+/// v0.71.0 carries them under the nested `[transport.tls]` section, which
+/// `frp-core/src/config/normalize.rs:792-810` maps onto the flat fields.
+/// This pins both directions (the four stay rejected, the two real aliases
+/// stay accepted) so the table cannot drift back.
+#[test]
+fn test_flat_camelcase_tls_spellings_are_not_loader_spellings() {
+    let rejected = [
+        ("tlsOnly", "true"),
+        ("tlsCertFile", "\"/cc.crt\""),
+        ("tlsKeyFile", "\"/cc.key\""),
+        ("tlsCaFile", "\"/cc-ca.crt\""),
+    ];
+
+    // 1. Non-strict (the SIGUSR1 reload mode): ignored, every field stays at
+    //    its default. In particular `tlsCaFile` must not trigger the
+    //    ca-implies-only fill at `frp-core/src/config/server.rs:524-525`.
+    for &(key, value) in rejected.iter() {
+        let cfg = load_server_config_from_str(&format!("bind_port = 7000\n{key} = {value}\n"))
+            .unwrap_or_else(|e| panic!("{key} must not fail the non-strict load: {e}"));
+        assert!(!cfg.tls_only, "{key} unexpectedly set tls_only");
+        assert_eq!(
+            cfg.tls_cert_file, "",
+            "{key} unexpectedly set tls_cert_file"
+        );
+        assert_eq!(cfg.tls_key_file, "", "{key} unexpectedly set tls_key_file");
+        assert_eq!(cfg.tls_ca_file, "", "{key} unexpectedly set tls_ca_file");
+    }
+
+    // 2. Strict (frps's default): each is refused, and the message names the
+    //    offending key.
+    for &(key, value) in rejected.iter() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "bind_port = 7000\n{key} = {value}\n").unwrap();
+        let err = load_server_config_uncompleted(file.path().to_str().unwrap(), true)
+            .expect_err("camelCase flat spelling must be refused in strict mode")
+            .to_string();
+        assert!(
+            err.contains(key),
+            "{key} refused, but the message does not name it: {err}"
+        );
+    }
+
+    // 3. The two flat aliases that DO work load in both modes.
+    let aliases = "tlsServerName = \"frps.example.com\"\ntls_trusted_ca_file = \"/cc-ca.crt\"\n";
+    let cfg = load_server_config_from_str(&format!("bind_port = 7000\n{aliases}")).unwrap();
+    assert_eq!(cfg.tls_server_name, "frps.example.com");
+    assert_eq!(cfg.tls_ca_file, "/cc-ca.crt");
+    assert!(cfg.tls_only, "tls_ca_file should complete tls_only to true");
+
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    write!(file, "bind_port = 7000\n{aliases}").unwrap();
+    let cfg = load_server_config_uncompleted(file.path().to_str().unwrap(), true).unwrap();
+    assert_eq!(cfg.tls_server_name, "frps.example.com");
+    assert_eq!(cfg.tls_ca_file, "/cc-ca.crt");
+
+    // 4. The strict-mode allow-list agrees: the two aliases are in it and the
+    //    four camelCase spellings are not. `known_server_keys` is `pub(super)`
+    //    and this module is a child of `config`, so it is reachable without
+    //    widening its visibility.
+    let known = super::strict::known_server_keys();
+    assert!(known.contains("tlsServerName"));
+    assert!(known.contains("tls_trusted_ca_file"));
+    for &(key, _) in rejected.iter() {
+        assert!(
+            !known.contains(key),
+            "{key} must not be in known_server_keys()"
+        );
+    }
+}
+
 #[test]
 fn test_client_disable_custom_tls_first_byte_defaults_match_go() {
     assert!(ClientConfig::default().disable_custom_tls_first_byte);
