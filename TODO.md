@@ -271,7 +271,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   counts above (or their replacements, stated per surface) as the witness, **and** the bool-flag
   collapse from two entries to one. It is a flag-surface-wide row: it covers argv the
   `--help=<bool>` item never touched, so it is filed here rather than closed there. No sha.
-- [ ] **`auth.method` parsing is inconsistent across its three sites; a typo silently selects token
+- [x] **`auth.method` parsing is inconsistent across its three sites; a typo silently selects token
   auth.** Measured 2026-09-25 by the adversarial review on this branch, with real binaries:
   - *Client*: `frp-client` compares `ac.method == "oidc"` (feature-on arm, the new refusal helper and
     `frpc/src/main.rs`'s verify check), so with `oidc` **off**, `method = "OIDC"` and `" oidc"` still
@@ -286,7 +286,31 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   **Done-when:** one method-parsing policy at all sites — trim, compare case-insensitively, and decide
   (with a Go frp v0.71.0 source/probe check first) whether an unrecognised method is a load error
   rather than a token fallback — pinned by a probe per site.
-- [ ] **The client's admin-triggered reload never re-derives auth, so an OIDC config reload reports
+  Done: fixed on `fix/auth-method-and-reload` (one commit; author's report
+  `/tmp/auth-method-report.md`; review record in the PR). **The done-when's "trim, compare
+  case-insensitively" was measured against Go and rejected**: `slices.Contains` over
+  `SupportedAuthMethods` (`pkg/config/v1/validation/validation.go:37-40`, used at
+  `validation/server.go:31` / `client.go:101`) is an exact match, so the policy is exact matching
+  plus Go's `util.EmptyOr` fill (`pkg/config/v1/server.go:136-139`, `client.go:206-209`) — trimming
+  or lower-casing would make frp-rs *accept* configs Go rejects with rc 1. Re-derived on the real
+  v0.71.0 binaries (own config and free port per case, streams separate, rc from `wait`):
+  `method = "OIDC"`/`"Oidc"`/`" oidc"`/`"oidc "`/`"tokenn"`/Cyrillic-о → **rc 1, 54 B stdout,
+  0 B stderr**, whole stdout `invalid auth method, optional values are [token oidc]\n`; `""` and
+  `"token"` start. frp-rs base vs head: `frps` `"OIDC"` rc 3 (parsed as OIDC) → **rc 1**, `" oidc"`/
+  `"oidc "`/`"tokenn"` rc 0 *running as token* → **rc 1**, `""` runs in both; `frpc verify` on
+  `"OIDC"` **rc 0 `is valid`** → **rc 1**; `frpc run` `"OIDC"` started a **token** client → rc 1 with
+  Go's text; the client-credentials check no longer skips `"OIDC"`. Policy in
+  `frp-core/src/auth.rs` (`complete_auth_method` + `parse_auth_method` + `INVALID_AUTH_METHOD`),
+  called by the four sites (both validators, `frp-server`'s `build_auth_config`, the client's shared
+  refusal helper and its construction parse). Pins: 3 unit tests in `frp-core/src/auth.rs`,
+  `auth_method_is_completed_then_validated_exactly` in `frp-core/src/config/tests.rs`, 2 unit tests
+  in `frp-client/src/service.rs`, 2 spawn tests in `frps/tests/cli_exit_codes.rs`, 2 in
+  `frpc/tests/cli_exit_codes.rs` (which also run in the `tiny` lane, where the binary is
+  `frpc-tiny`). Both guards moved in the same commit — `FRPS_CLI_TESTS` 27 → **29**,
+  `FRPC_TINY_CLI_TESTS` 11 → **13** — and both guard shells were driven locally, red at the old
+  literals. Falsified: deleting `parse_auth_method` from both validators reddens the four CLI pins.
+  Recorded divergence: frp-rs prefixes the loader line with `<path>: ` where Go's is bare.
+- [x] **The client's admin-triggered reload never re-derives auth, so an OIDC config reload reports
   success.** Measured 2026-09-25 by the adversarial review: with a running `frpc-tiny` (oidc off) and
   an OIDC config file, `frpc-tiny reload -c <file>` returns rc 0 with
   `reload success: reload success: no changes detected` and **zero** log lines mentioning
@@ -295,6 +319,24 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   and out of the sibling item's scope. **Done-when:** a reload that changes `auth.method` either
   re-derives auth (rejecting a method this build cannot serve) or reports that auth changes need a
   restart, pinned by a probe.
+  Done: fixed on `fix/auth-method-and-reload` (same change). **Decision: refuse, not re-derive** —
+  `Service::auth_cfg` and `Service::encryption_key` are not behind a lock and the bridge key is
+  copied by value into the live control connection, so a mid-flight swap cannot reach the running
+  session and would leave its two ends disagreeing; Go's client is the same shape (its reload
+  re-reads proxies and visitors only, `client/service.go:494-525`). `reload::auth_reload_refusal`
+  compares the newly loaded `[auth]` against `Service::cfg.auth` (which nothing writes after
+  construction) after the load and store merge and before any proxy/plugin/visitor work, and returns
+  an error naming the changed field(s) — names only, never a token or secret value. Pinned by
+  `frp-client/tests/reload_malformed_config.rs::reload_that_changes_auth_is_refused_and_applies_nothing`
+  (a loader-rejected `"OIDC"` rewrite and a loader-**accepted** `additionalAuthScopes` rewrite, each
+  also moving the proxy, plus a positive control that a non-auth rewrite still applies) and by 5 unit
+  tests in `frp-client/src/reload.rs`. Falsified: deleting the `auth_reload_refusal` call reddens the
+  integration test (the auth change then applied and moved the proxy). The first cut of that test was
+  **vacuous** — it used flat `oidcClientID` keys and the loader refused its "accepted" arm for an
+  unrelated reason, so it stayed green with the check deleted; that is recorded in the test's
+  comment. `docs/deployment.md` lists the new admin-API 400 source. Not covered: an `auth.method`
+  change on the **server**'s SIGUSR1 reload is neither refused nor separately tested (the server does
+  rebuild `auth_cfg` when the token changes).
 - [ ] **`oidc_throttle_tests` is a load-dependent flake: the mock IdP answers 404 for a valid
   request.** `cargo test -p frp-server --lib oidc` failed **3/3** `oidc_throttle_tests` under CPU
   load with `OIDC: openid-configuration returned 404 Not Found`, while a serial run passes 6/6 and
