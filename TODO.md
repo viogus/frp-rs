@@ -646,8 +646,18 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   reported" qualified to "…that some code reads"), `tls_enable` added to the no-reader example lists
   in `README.md` and `docs/deployment.md`, and three `docs/config.md` corrections — the false
   `tls_enable` table row (it claimed to enable TLS on the main listener), its removal from the
-  "requires a full restart" list, and the no-reader list becoming eight fields. Full record with
-  commands and outputs: `/tmp/tls-enable-report.md`.
+  "requires a full restart" list, and the no-reader list becoming eight fields. The same defect
+  class — a live, user-facing place presenting `tls_enable` as a working server knob — had two
+  further carriers, both corrected by follow-up commits on this branch: `docs/architecture.md:342`
+  claimed the server's QUIC listener "requires `tls_enable`", when its gate is
+  `#[cfg(feature = "quic")]` + `quic_bind_port > 0` (`frp-server/src/service.rs:1541-1542`) and the
+  listener self-generates a self-signed cert, so the parenthetical now reads "requires the `quic`
+  feature, which implies `tls`" (grounded in `frp-core/Cargo.toml:66`
+  `quic = ["dep:quinn", "tls"]`); and the root `frps.toml:26` sample wrote `tls_enable = true`
+  under `## TLS` — the one line the open warning item below would make `frps -c frps.toml` warn at
+  itself on every start — which is deleted, after checking that no test/script/CI job reads the
+  root sample (the scripts generate their own temp copies; the lone test naming the repo example
+  uses an inline literal). Full record with commands and outputs: `/tmp/tls-enable-report.md`.
 
 - [ ] **`tls_enable` is silently inert: no load-time warning, unlike the sibling `[web_server.tls]
   enable` that #402 made warn.** Measured on this branch (the `grep -rn "\.tls_enable"` above): no
