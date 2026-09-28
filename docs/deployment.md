@@ -447,7 +447,6 @@ openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key \
 Server config with mTLS:
 
 ```toml
-tls_enable = true
 tls_cert_file = "/etc/frp/server.crt"
 tls_key_file = "/etc/frp/server.key"
 tls_ca_file = "/etc/frp/ca.crt"     # client certs must be signed by this CA
