@@ -678,7 +678,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   and the presence flag must be taken from the file (beside the existing `web_server.tls.enable`
   flag), not from the deserialized `ServerConfig`.
 
-- [ ] **`docs/config.md` advertises four camelCase TLS aliases that no loader accepts.**
+- [x] **`docs/config.md` advertises four camelCase TLS aliases that no loader accepts.**
   The `tls_only`, `tls_cert_file`, `tls_key_file` and `tls_ca_file` rows at `docs/config.md:26-29`
   each name a Go-alias spelling (`tlsOnly`, `tlsCertFile`, `tlsKeyFile`, `tlsCaFile`), while
   `docs/config.md:173` in the same file states the opposite ("Exception: `tls_enable`,
@@ -712,6 +712,27 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `tls_trusted_ca_file` as the working `tls_ca_file` alias; and (c) the accepted-spelling list in
   `frp-core/src/config/strict.rs` (`:29`, `:207`) stays the arbiter the docs agree with — with a
   test pinning the accepted/rejected spellings so the table cannot drift back.
+
+  Done 2026-09-29 at `7323259` (docs) + `0e3912e` (test), branch `fix/config-tls-alias-docs`.
+  Re-measured on this head with a throwaway probe over `load_server_config_from_str` (non-strict)
+  and `load_server_config_uncompleted(path, true)` (strict):
+  * `tlsOnly = true` → non-strict ignored, `tls_only` stays `false`; strict `unknown field
+    "tlsOnly" in config file <path> — did you mean 'tls_only'?`.
+  * `tlsCertFile = "/cc.crt"` → non-strict ignored, `tls_cert_file` stays `""`; strict
+    `unknown field "tlsCertFile" in config file <path>`.
+  * `tlsKeyFile = "/cc.key"` → same shape, `unknown field "tlsKeyFile" …`.
+  * `tlsCaFile = "/cc-ca.crt"` → non-strict ignored, `tls_ca_file` stays `""` and `tls_only` stays
+    `false` (it never reaches the fill at `frp-core/src/config/server.rs:524-525`); strict
+    `unknown field "tlsCaFile" …`.
+  * controls: `tlsServerName` and `tls_trusted_ca_file` load in both modes.
+
+  Fix: `docs/config.md:26-29` now name `transport.tls.force` / `certFile` / `keyFile` /
+  `trustedCaFile` — the keys `frp-core/src/config/normalize.rs:792-810` maps onto the flat fields —
+  and the `docs/config.md:173` Exception names all five alias-less keys while keeping the two that
+  work. `frp-core/src/config/tests.rs` pins rejected-and-accepted in both modes plus
+  `known_server_keys()` membership. **Decision: the four camelCase spellings stay rejected** —
+  adding them as serde aliases or to `known_server_keys()` would widen the acceptance surface away
+  from Go, which has no flat `tlsCertFile` server spelling either.
 
 - [x] **`[web_server.tls] cert_file` — the nested section's own canonical spelling — is dropped silently
   in the non-strict loader, and refused in strict mode with a message naming a key the user never wrote.**
