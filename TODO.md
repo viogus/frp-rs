@@ -612,25 +612,36 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   own item directly below** rather than left in a message. Full base/head table and the
   least-sure section: `/tmp/restart-only-report.md`.
 
-- [ ] **`tls_enable` is reported as restart-required, but nothing in `frp-server`/`frps` reads it.**
-  `reload()` has printed the line since before the restart-only list landed (the
+- [x] **`tls_enable` is reported as restart-required, but nothing in `frp-server`/`frps` reads it.**
+  `reload()` printed the line since before the restart-only list landed (the
   `note_restart_change(&self.cfg.tls_enable, …)` call in `frp-server/src/service.rs`), and the new list
-  deliberately leaves it in place because it is base behaviour and the item above counts the field
-  among the ones `reload()` already compares. Measured 2026-09-28 at `5c74455`: `grep -rn tls_enable
-  frp-server/src frps/src` finds only that call site plus one comment, i.e. `ServerConfig.tls_enable`
-  has **no reader** — so a reload that changes only it prints `tls_enable: false -> true (restart
-  required)` and a restart changes nothing. Go v0.71.0 is the same shape, so this is *not* a parity
-  gap: its `ServerConfig` has no `TlsEnable` at all, `TLS.Enable` is a **client** field
-  (`pkg/config/v1/client.go`, read by `pkg/config/v1/validation/client.go:155`), and the legacy INI
-  `tls_enable` maps to `Transport.TLS.Enable` (`pkg/config/legacy/conversion.go:60`) which no server
-  path reads — the server's switch is `TLS.Force`, i.e. `tls_only` (`conversion.go:150`,
-  `pkg/config/v1/server.go:195`). **Done-when:** the disposition is explicit and pinned by a test
-  either way — the line is removed (the `[auth].useEncryption` precedent in
-  `note_auth_restart_changes`: nothing reads the field, so neither a reload nor a restart can make a
-  change take effect, and the reload must not claim one) and the field joins the inert list in
-  `frp-core/src/config/restart_only.rs` with its reader measurement, **or** the field is deliberately
-  wired to a server behaviour (a documented divergence from Go, which ignores it server-side) with a
-  probe showing what a restart changes. A reader of the test must be able to tell which was chosen.
+  deliberately left it in place because it was base behaviour and the item above counted the field
+  among the ones `reload()` already compares. First measured 2026-09-28 at `5c74455`, and re-measured
+  on this branch at base and at head: `grep -rn tls_enable frp-server/src frps/src` finds **no read**
+  of `ServerConfig.tls_enable` — the only hits are `presence.warn_inert_web_server_tls_enable()` (the
+  **different** field `[web_server.tls] enable`, #402) and a comment — so a reload that changes only it
+  printed `tls_enable: false -> true (restart required)` and a restart changed nothing. Go v0.71.0 is
+  the same shape, so this is *not* a parity gap: its `ServerConfig` has no `TlsEnable` at all,
+  `TLS.Enable` is a **client** field (`pkg/config/v1/client.go`, read by
+  `pkg/config/v1/validation/client.go:155`), and the legacy INI `tls_enable` maps to
+  `Transport.TLS.Enable` (`pkg/config/legacy/conversion.go:60`) which no server path reads — the
+  server's switch is `TLS.Force`, i.e. `tls_only` (`conversion.go:150`,
+  `pkg/config/v1/server.go:195`).
+
+  **Measured disposition: the field is inert, so the false line is removed** — the
+  `[auth].useEncryption` precedent in `note_auth_restart_changes`: nothing reads the field, so neither
+  a reload nor a restart can make a change take effect, and the reload must not claim one. The field
+  now sits in `frp-core/src/config/restart_only.rs`'s existing no-reader group (named in the no-`..`
+  destructure and never pushed) with `tls_server_name`/`feature.gates`/`includes`, no second mechanism
+  invented, and the `reload()` call site is gone. Pinned by `inert_settings_are_not_reported` in
+  `frp-server/tests/server_reload_restart_only.rs`, which rewrites `tls_enable = true` and asserts
+  `config reloaded: no changes detected`; putting the line back makes that test fail with
+  `tls_enable: false -> true (restart required)`. The unit test `unreported_fields_stay_unreported` in
+  `restart_only.rs` also asserts the field yields no report.
+
+  Done: removed the `note_restart_change` call, moved `tls_enable` into the no-reader group, and
+  updated the doc bullets plus the test doc comment that claimed the reload reported it. Full record
+  with commands and outputs: `/tmp/tls-enable-report.md`.
 
 - [x] **`[web_server.tls] cert_file` — the nested section's own canonical spelling — is dropped silently
   in the non-strict loader, and refused in strict mode with a message naming a key the user never wrote.**
