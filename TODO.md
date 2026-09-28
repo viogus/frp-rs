@@ -1542,14 +1542,15 @@ agent commits), which matters because the *reason* for two reviewers is that no 
 - [ ] **The tls-off dial pin asserts the TCP refusal with a prefix-only `contains`, which both arms'
   messages satisfy.** `dial_server_refuses_tls_when_tls_is_not_compiled` in
   `frp-core/src/transport/mod.rs` asserts the TCP refusal with `contains("TLS support not compiled")` — a
-  24-character needle both messages begin with (the two full strings are **not** prefixes of each other: the
-  TCP one stops at `feature)` while the WSS one continues `feature for WSS)`) — so swapping the TCP arm's
-  message for the WSS wording leaves the bare-configuration assertion green. End-anchoring the TCP assertion
-  **would** discriminate. Measured by
-  adversarial review of the `:1481` fix (mutation `tcp_wssmsg` + the pin under `--no-default-features` →
-  rc 0). Filed rather than fixed so that the fix round stayed comment-only. **Done-when:** the assertion is
-  end-anchored or negated so the WSS-only wording fails it, with a mutation showing the swapped-message
-  case now fails.
+  24-character needle both source literals begin with (the two full strings are **not** prefixes of each
+  other: 50 characters are shared and they diverge at the 51st, TCP's `)` against WSS's ` for WSS)`) — so
+  swapping the TCP arm's message for the WSS wording leaves the bare-configuration assertion green. (The
+  assertion tests `err.to_string()`, which begins `transport error: `, so a start-anchored rewrite would not
+  be equivalent.) End-anchoring the TCP assertion **would** discriminate. Measured by
+  adversarial review of the no-features clippy fix (mutation `tcp_wssmsg` + the pin under
+  `--no-default-features` → rc 0). Filed rather than fixed so that the fix round stayed comment-only.
+  **Done-when:** the assertion is end-anchored or negated so the WSS-only wording fails it, with a mutation
+  showing the swapped-message case now fails.
 
 - [x] **Pre-existing: no query-parameter-count guard, so >10000 params diverge from Go.**
   Go's `parseQuery` opens with

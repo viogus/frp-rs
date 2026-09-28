@@ -1556,12 +1556,13 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                     // function's tail, so its arms must yield
                     // `Result<IoStream, Error>` — which is why a discarded
                     // value is the `E0308` there and a discarded `()` body is
-                    // legal here. Second, this arm's own `else` diverges
-                    // (`return Ok(..)`), and that is what lets the `if`/`else`
-                    // still type-check as `()` once the `Err(..)` is discarded
-                    // as a statement, leaving `T` unconstrained — the `E0282`
-                    // above. Give the `else` a value instead and the same
-                    // mutation reports `E0308` on that value, not `E0282`.
+                    // legal here. Second, once the `Err(..)` is discarded as a
+                    // statement nothing constrains the `Ok` type parameter `T`
+                    // of that `Result`, which is the `E0282` above — the
+                    // compiler's own wording is "cannot infer type of the type
+                    // parameter `T` declared on the enum `Result`". Give the
+                    // `else` a value instead and the same mutation reports
+                    // `E0308` on that value, not `E0282`.
                     //
                     // Unlike the TCP and WSS arms, `clippy::needless_return`
                     // does not fire on this one — measured in the four `kcp`
