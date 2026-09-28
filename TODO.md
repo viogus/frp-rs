@@ -486,13 +486,21 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `apply` implementation was ever built — the rejection of `apply` is a code-reading argument, and
   `auth.tokenSource` is compared by `Debug` shape (`ValueSource` has no `PartialEq`), which can
   over-report but not under-report. Both are recorded in the report's least-sure section.
-- [ ] **Every restart-only setting outside `[auth]` is still silently ignored by the SIGUSR1
+- [x] **Every restart-only setting outside `[auth]` was silently ignored by the SIGUSR1
   reload.** Measured 2026-09-28 on this branch's fix-round head (the commit after `4d9b251`,
   `frps` built from that working tree; first measured at `360948e`) — own config, own free
   port (60981, 60982 in the first measurement; 49388 in the re-measurement; never 7000), `SIGUSR1`
   by pid, stdout and stderr to **separate** files,
   bounded settle, every child reaped with `wait`, strays by `pgrep -x` only; script
-  `/tmp/sra-probe/probe-non-auth.sh`, run twice with identical results:
+  `/tmp/sra-probe/probe-non-auth.sh` — **deleted during the #399 cleanup, re-derived from this
+  item's text and recreated at the same path** in this round — run twice with identical summary
+  lines (re-measured here: the `SIGUSR1:` lines are identical run to run, but the **byte counts are
+  not the claim and are only approximate** — they move by a few bytes between runs of one probe,
+  because the startup lines carry the port and its digit count varies, and by ~20 B between
+  independent probes of the same shape (a reviewer's own probe measured 1701 / 2637 where this
+  round's re-derived script measured 1719-1720 / 2654). What matters is the *shape*: stdout at the
+  moment the summary is read, a larger archived stdout because the SIGTERM drain logs after that
+  read, and 0 B stderr):
   * running `transport.heartbeat_timeout = 30` with `max_ports_per_client = 0`, rewritten to `60`
     and `7` + `kill -USR1` → `SIGUSR1: config reloaded: no changes detected` on **stdout**
     (**1702 B** stdout / **0 B** stderr at the moment the summary is read; the archived
@@ -511,6 +519,161 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   the summary — with a compiler-enforced field list, the way `note_auth_restart_changes` does for
   `[auth]` — pinned by a probe per field group; `[log]` (read once in `init_logging`, before the
   reload path exists) must be reported rather than silently ignored.
+
+  Done (branch `fix/restart-only-settings`, `5c74455`). The list is
+  `ServerConfig::restart_only_changes` (`frp-core/src/config/restart_only.rs`), filtered and printed by
+  `note_restart_changes` in `frp-server/src/service.rs` and called from `reload()`. Both configs are
+  destructured with **no `..`**, as are all eight config structs it walks, so a new field is a compile
+  error until it is named and classified: measured by adding one probe field to each of the eight and
+  re-checking — **16 E0027s**, two per struct (running and loaded pattern), every one in
+  `restart_only.rs`; probe `/tmp/sra-probe/probe-compile-error.sh`, file restored afterwards
+  (`git diff --stat frp-core/src/config/server.rs` empty). The list lives in `frp-core` and not next to
+  the reload because the three `#[cfg]`-gated listener ports are gated on *frp-core's* features, which
+  Cargo unifies independently of `frp-server`'s: a first draft written in `frp-server` was measured red
+  in two lanes this tree already runs — `cargo test -p frp-server --no-default-features --all-targets`
+  (E0027 on `kcp_bind_port`/`quic_bind_port`/`websocket_port`; the `frp-client` dev-dependency turns
+  `frp-core/kcp` on while `frp-server/kcp` is off) and
+  `cargo check --workspace --no-default-features --features tiny` (the mirror case, where an
+  unconditional pattern entry would be E0026).
+  Base/head per field group, real `frps` + `SIGUSR1` (base = `git archive 3f975e0`): base **3 OK /
+  6 FAIL**, head **9 OK / 0 FAIL** on the same 9 cases, stderr 0 B everywhere, every child reaped with
+  `wait`, `pgrep -x` 0 afterwards. The case above at head:
+  `SIGUSR1: transport.heartbeat_timeout: 30 -> 60 (restart required); max_ports_per_client: 0 -> 7
+  (restart required)`. `[log]` is reported, because all five `[log]` fields are read once in
+  `init_logging`: `log.level: info -> debug (restart required)`.
+  **Two over-reports found by review and fixed in the same round, each pinned by a test that fails
+  against the pre-fix code** (falsification logs `/tmp/sra-probe/discrim/`): (a) the two `Option<u32>`
+  limits were compared as raw options, so an absent `max_connections` / `max_accept_rate` printed
+  `max_connections: <unset> -> 512 (restart required); max_accept_rate: <unset> -> 0 (restart
+  required)` where base said `no changes detected` — both pairs are one setting, so the comparison is
+  now on the value the server resolves (`frp_core::config::effective_max_connections` /
+  `effective_max_accept_rate`, which `frp-server`'s `resolve_max_connections` and its accept-rate sites
+  now delegate to, so the two cannot drift); `max_connections = 0` is *unlimited* and stays reported.
+  (b) the three `#[cfg]`-gated listener ports (`kcp_bind_port`, `quic_bind_port`, `websocket_port`)
+  were classed `ServerReader::Any` although their readers are `frp-server`-gated: in `cargo test -p
+  frp-server --no-default-features --all-targets` — the lane that motivated this module's location —
+  they printed `kcp_bind_port: 0 -> 17001 (restart required); quic_bind_port: 0 -> 17002 (restart
+  required); websocket_port: 0 -> 17003 (restart required)` while `transport.quic_options` was
+  correctly filtered. They now carry `ServerReader::Kcp` / `Quic` / `Websocket`. The second review round
+  caught a first attempt at that fix which classed the first two as a **disjunction** with the dashboard
+  (`KcpOrDashboard` / `QuicOrDashboard`): that reader does not exist — `frp-server/src/dashboard.rs`'s own
+  `#[cfg(feature = "kcp")]` / `cfg(feature = "quic")` (`:501-502`, `:2491-2494`) are *frp-server's*
+  features, so it prints those keys only in a build that already has the listener compiled (measured: the
+  dashboard-only config printed `kcp_bind_port: 0 -> 17001 (restart required); quic_bind_port: 0 -> 17002
+  (restart required)`, and the repo's own `dashboard::v2::tests::test_serverinfo_go_shape` fails there with
+  `missing Go key kcpBindPort`). The disjunction is deleted and the pin's guards are the listener features,
+  so the dashboard-only config — compiled by `ci.yml:916`'s clippy but test-run by no lane before this
+  round — now asserts quiet and fails against the pre-fix classification.
+  **Not over-reported** — a restart could not change these either, so the line would be false: the
+  fields no code in `frp-server` reads (`auth.useEncryption` from the item above, `tls_server_name`,
+  `web_server.pprof_enable`, `web_server.tls_ca_file` / `tls_server_name`, the nested `tls.*` fields
+  (three unread, plus `cert_file` / `key_file`, which the loader's `normalize_web_server_section` renames
+  onto the flat `tls_cert_file` / `tls_key_file` before deserialization, so the nested struct is
+  unreachable), `[featureGates]` — each `_`-bound with its measurement and pinned by
+  `unreported_fields_stay_unreported` / `inert_settings_are_not_reported`), `includes` (consumed by the reload's own `load_server_config`),
+  and the applied set (`allow_ports` + `allow_port_start`/`allow_port_end`, the five `[auth]` fields,
+  the TLS paths). Fields whose only reader is behind a feature are reported only where that reader
+  compiles (`dashboard`, `ssh`, `quic`, `otel`) — the default `full` frps has `ssh` but not
+  `dashboard`/`otel`, and both directions are asserted from whichever build runs the test. Credential-
+  shaped values are never printed (`web_server.password`, `http_plugins`, whose `addr` may carry
+  `user:pass@`).
+  Carriers: `frp-core/src/config/restart_only.rs` (new), `frp-core/src/config/mod.rs`,
+  `frp-core/src/logging.rs` (`OTEL_ENABLED` — the only way `frp-server`, which declares no `otel`
+  feature, can ask whether the binary's OTLP reader exists), `frp-server/src/service.rs`,
+  `frp-server/tests/server_reload_restart_only.rs` (new, 14 tests, run with default features,
+  `--features dashboard`, `--no-default-features`, `--no-default-features --features dashboard`,
+  `…,dashboard,kcp,quic` and `…,kcp,quic`), `docs/config.md` § Server Config Reload,
+  `README.md`, `docs/deployment.md`, `CHANGELOG.md`.
+  Gates: `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets --all-features
+  -- -D warnings` clean; `cargo test -p frp-core --lib` 974/0 (was 966; +8 unit tests);
+  `cargo test -p frp-server` rc 0, 659 passed / 0 failed over 42 lanes (`server_reload_auth` 6/0,
+  `reload_integration` 4/0, `server_reload_restart_only` 14/0, and that target 14/0 in every config it is
+  run in), the `ci.yml:628` dashboard lane (`cargo test -p frp-server --features dashboard -j 1` against a
+  `frps --features dashboard` build) 720/0, and `cargo test -p frp-server
+  --no-default-features --all-targets` 456/0 — with one honest caveat: the first run
+  failed `reload_integration::test_reload_add_proxy` with `AddrInUse` on its own echo-server port,
+  the documented `allocate_port` probe-then-drop race in that file's scaffolding (it signals **frpc**
+  only, never `frps`, so this change cannot reach it); it passed on the quiet re-run. `cargo test -p
+  frps` rc 0; `cargo test -p frpc` rc 0; tiny lane `cargo test -p frpc --no-default-features --features
+  tiny --test cli_exit_codes` 13/0 and `cargo check --workspace --no-default-features --features tiny`
+  rc 0; `bash scripts/repo-health.sh` rc 0; `bash scripts/compat-test.sh` **86 passed / 0 failed** vs Go
+  frp v0.71.0 (relevant to the server config surface, but it does **not** exercise `SIGUSR1`, so it is
+  not evidence about this path). The compat suite leaked its usual **83** orphans (all `PPID 1`, all
+  under `/tmp/frp-compat-test/`, no live `compat-test.sh`), reaped by explicit pid after matching on
+  command line and `PPID == 1`; `pgrep -x frps`/`frpc` are 0.
+  Not covered, stated rather than implied: the inert list is a `grep` result, not a proof; the `otel`
+  gate tracks `frp-core`'s feature, so a build that enables `frp-core/otel` through another member while
+  the binary under test does not would over-report `[observability]`; the dashboard-gated and otel-gated
+  groups are exercised in process, not end to end (the shell probe runs the default build);
+  `OTEL_EXPORTER_OTLP_ENDPOINT` can mask an `[observability]` change; and `ServerConfig.tls_enable` has
+  **no reader** in `frp-server`/`frps` (measured), so its pre-existing "restart required" line is very
+  likely the same class of false positive this item is about — left alone here because it is base
+  behaviour and this item counts the field among those `reload()` already compares, and **filed as its
+  own item directly below** rather than left in a message. Full base/head table and the
+  least-sure section: `/tmp/restart-only-report.md`.
+
+- [ ] **`tls_enable` is reported as restart-required, but nothing in `frp-server`/`frps` reads it.**
+  `reload()` has printed the line since before the restart-only list landed (the
+  `note_restart_change(&self.cfg.tls_enable, …)` call in `frp-server/src/service.rs`), and the new list
+  deliberately leaves it in place because it is base behaviour and the item above counts the field
+  among the ones `reload()` already compares. Measured 2026-09-28 at `5c74455`: `grep -rn tls_enable
+  frp-server/src frps/src` finds only that call site plus one comment, i.e. `ServerConfig.tls_enable`
+  has **no reader** — so a reload that changes only it prints `tls_enable: false -> true (restart
+  required)` and a restart changes nothing. Go v0.71.0 is the same shape, so this is *not* a parity
+  gap: its `ServerConfig` has no `TlsEnable` at all, `TLS.Enable` is a **client** field
+  (`pkg/config/v1/client.go`, read by `pkg/config/v1/validation/client.go:155`), and the legacy INI
+  `tls_enable` maps to `Transport.TLS.Enable` (`pkg/config/legacy/conversion.go:60`) which no server
+  path reads — the server's switch is `TLS.Force`, i.e. `tls_only` (`conversion.go:150`,
+  `pkg/config/v1/server.go:195`). **Done-when:** the disposition is explicit and pinned by a test
+  either way — the line is removed (the `[auth].useEncryption` precedent in
+  `note_auth_restart_changes`: nothing reads the field, so neither a reload nor a restart can make a
+  change take effect, and the reload must not claim one) and the field joins the inert list in
+  `frp-core/src/config/restart_only.rs` with its reader measurement, **or** the field is deliberately
+  wired to a server behaviour (a documented divergence from Go, which ignores it server-side) with a
+  probe showing what a restart changes. A reader of the test must be able to tell which was chosen.
+
+- [ ] **`[web_server.tls] cert_file` — the nested section's own canonical spelling — is dropped silently
+  in the non-strict loader, and refused in strict mode with a message naming a key the user never wrote.**
+  Measured 2026-09-28 at `e6bda94` by loading config shapes through
+  `load_server_config(path, strict)` (probe kept with that round, `/tmp/sra-probe/n1/probe2.rs`, run
+  against the fix-round head):
+
+  | spelling | `strict = false` (the reload path; `--strict-config=false`) | `strict = true` (Go's default; frps `-c`) |
+  |---|---|---|
+  | `[web_server.tls] cert_file` / `key_file` / `trusted_ca_file` / `server_name` / `enable` — snake_case, the struct's **canonical** serde names | `Ok`, and **all five values vanish**: nested struct at its default, `tls_cert_file = ""`, `tls_cert() = ""` | `Err`: `unknown field "web_server.cert_file" … did you mean 'certFile'?`, plus `web_server.enable`, `web_server.key_file` … `did you mean 'keyFile'?`, `web_server.server_name` … `did you mean 'serverName'?`, `web_server.trusted_ca_file` |
+  | `[web_server.tls] certFile` / `keyFile` / `trustedCaFile` / `serverName` (camelCase) | `Ok`, mapped onto the flat fields (`tls_cert_file`, `tls_ca_file`, `tls_server_name`) | `Ok`, same |
+  | YAML `webServer.tls.certFile` … | `Ok`, same as camelCase | `Ok`, same |
+  | flat `web_server.tls_cert_file` / `tls_key_file` | `Ok` | `Ok` |
+  | **both** flat and nested camelCase | flat wins (`tls_cert_file = "/flat/cert.pem"`) | flat wins |
+
+  Mechanism: `normalize_web_server_section` (`frp-core/src/config/normalize.rs:1423`) removes the
+  `web_server.tls` table and re-inserts **every** key at the parent level, renaming only the four Go
+  spellings (`certFile` → `tls_cert_file`, …); every other key keeps its name, so `cert_file` becomes
+  `web_server.cert_file`, which is not a field — dropped in non-strict mode, an unknown-field error in
+  strict mode. Three things make that a defect rather than a quirk: (1)
+  `frp-core/src/config/server.rs:926-938` declares the nested section with `cert_file` / `key_file` /
+  `trusted_ca_file` / `server_name` as the **canonical serde names** and the camelCase spellings only as
+  `alias`es, so the spelling that fails is frp-rs's own and the one that works is Go's; (2) the same
+  struct's doc says the section is "Merged with the flat `tls_cert_file`/`tls_key_file` fields — the
+  nested values take precedence when both are set", while the last table row shows the **opposite** (the
+  flat key wins, because the rename uses `or_insert`), so the documented precedence cannot be exercised
+  either; (3) the strict-mode error names `web_server.cert_file` — a path the user never wrote — and its
+  `did you mean 'certFile'?` hint points at the other spelling of the same field. Go comparison, for
+  calibration: Go's `WebServerConfig.TLS` is `*TLSConfig `json:"tls,omitempty"``
+  (`pkg/config/v1/common.go:68`) whose fields carry camelCase json tags only (`common.go:76-84`), and
+  Go's decoder is `DisallowUnknownFields: strict` (`pkg/config/load.go:158`) — on Go the nested spelling is
+  necessarily camelCase and a `cert_file` key is refused, so the **silent** branch is frp-rs-specific,
+  and the reload path always takes it (`load_server_config(&config_path, false)`,
+  `frp-server/src/service.rs:2301`). **Done-when:** an explicit, test-pinned decision. I would **map the
+  four snake_case spellings** in `normalize_web_server_section` (`cert_file` → `tls_cert_file`, `key_file`
+  → `tls_key_file`, `trusted_ca_file` → `tls_ca_file`, `server_name` → `tls_server_name`; and decide
+  `enable`, which nothing reads) and pin the precedence the struct's doc claims (nested over flat, so the
+  rename must not silently lose to a flat key that is already set), with a load test asserting the value
+  reaches `WebServerConfig::tls_cert()` in **both** modes. Mapping cannot break a config that works today
+  — the spelling it fixes currently either errors or is dropped, and the camelCase spellings keep working
+  — whereas the alternative (reject nested snake_case with an error naming `web_server.tls.cert_file`, the
+  key the user actually wrote) is a smaller change but leaves the struct's canonical names unusable. Either
+  way the test must fail on today's behaviour.
 
 - [ ] **`oidc_throttle_tests` is a load-dependent flake: the mock IdP answers 404 for a valid
   request.** `cargo test -p frp-server --lib oidc` failed **3/3** `oidc_throttle_tests` under CPU
@@ -1240,6 +1403,40 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   written here is rewritten the moment it lands and becomes a false citation — the text originally
   carried one, and a rebase onto the post-#363 `main` had already invalidated it before the squash
   could. Identify the change by its subject instead.
+- [ ] **No lane clippy-checks `frp-core` with features off, so two `clippy::*` lints inside
+  `cfg(not(feature = …))` code are red in the micro configuration and invisible everywhere else.**
+  Measured 2026-09-28 at `47f8fce`:
+  `RUSTFLAGS="-D warnings" cargo clippy -p frp-core --no-default-features --all-targets` → **rc 101**
+  with exactly two errors:
+  * `frp-core/src/encryption.rs:231:5` — `clippy::new_without_default` for `SnappyCompressor::new`,
+    inside `#[cfg(not(feature = "compression"))]`;
+  * `frp-core/src/transport/mod.rs:1643:21` — `clippy::needless_return`, inside
+    `#[cfg(not(feature = "tls"))]`.
+
+  The set is **complete**, so a fix does not have to hunt for a third: the same command with those two
+  allowed (`-- -A clippy::new_without_default -A clippy::needless_return`) exits **rc 0** across all
+  targets (lib, lib test, every `frp-core/tests/*.rs`, the bench), and neither file is in this branch's
+  diff — both were last touched by `96ccca0` (#358). Why no lane sees it: the only workspace clippy lane
+  is `ci.yml:84` (`cargo clippy --workspace --all-targets --all-features -- -D warnings`), which
+  **compiles both `cfg(not(…))` items out**, and the two isolated clippy steps (`ci.yml:916-917`) are
+  `-p frp-server --no-default-features --features dashboard` and `-p frp-client --no-default-features`.
+  The isolated step that *does* compile this configuration — `ci.yml:920`'s frp-core tier step — runs
+  `check`, i.e. rustc lints only, which is exactly why the `unused_mut` that the restart-only change
+  introduced there fired while a `clippy::*` lint cannot. This is the **same gate gap as that CI
+  failure, in the other direction**, which is why it is filed rather than quietly fixed.
+  **Done-when:** both lints are gone **and** the configuration is gated — add a
+  `clippy -p frp-core --no-default-features --all-targets` step (or extend an existing isolated step to
+  run clippy as well as `check`) under `RUSTFLAGS="-D warnings"`, so the gap cannot reopen. Precedent for
+  the disposition is the sibling item directly above: those four red `-p` configurations were closed by
+  **fixing** the code (narrowing `cfg`s), not by excusing it.
+  **Constraint on the `needless_return` fix, which must not be lost:** the `return` at
+  `frp-core/src/transport/mod.rs:1643` is **load-bearing**. The comment in place there records that its
+  absence caused an **E0308 fall-through in the feature-matrix check** — with tls off, the `tls_enable`
+  TCP dial arm fell through to the function tail instead of failing. The fix must therefore keep the
+  `Err` as the **tail expression** of that arm in the tls-off configuration (or otherwise preserve the
+  early failure), not delete the statement; the pin is that `--features kcp` (no tls) still fails the
+  dial with that error rather than falling through.
+
 - [x] **Pre-existing: no query-parameter-count guard, so >10000 params diverge from Go.**
   Go's `parseQuery` opens with
   `if !urlParamsWithinMax(strings.Count(query, "&") + 1) { return Values{}, err }`

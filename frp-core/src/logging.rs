@@ -434,6 +434,22 @@ pub fn init_console_logger() {
         .init();
 }
 
+/// Whether **this build of `frp-core`** carries the `otel` feature.
+///
+/// Exists so a crate that cannot name the feature can still ask about it: `otel`
+/// is declared by `frps`/`frpc` (forwarding `frp-core/otel`), and `frp-server`
+/// declares none of its own, so `#[cfg(feature = "otel")]` there is always false
+/// even in a build where the OTLP exporter *is* compiled. Cargo unifies
+/// `frp-core`'s features, so this const — evaluated where the feature really
+/// lives — is `true` exactly when [`init_tracing_otel`] and [`build_otel_layer`]
+/// are compiled in.
+///
+/// It tracks `frp-core`, not one specific dependent: a build that enables
+/// `frp-core/otel` through another member while the binary under test does not is
+/// a build where this is `true` and that binary's own `#[cfg(feature = "otel")]`
+/// block is absent.
+pub const OTEL_ENABLED: bool = cfg!(feature = "otel");
+
 #[cfg(feature = "otel")]
 #[allow(clippy::too_many_arguments)]
 pub fn init_tracing_otel(

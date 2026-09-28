@@ -153,17 +153,21 @@ fn resolve_allow_ports(cfg: &ServerConfig) -> Vec<frp_core::config::PortsRange> 
 }
 
 /// Resolve the `max_connections` server config into the connection-semaphore
-/// size. `Some(0)` means unlimited and MUST resolve to 0 (not `usize::MAX`):
+/// size.
+///
+/// A **delegation**, deliberately: the reload's restart-change list compares this
+/// field against its effective value (`frp_core::config::effective_max_connections`,
+/// which is this function) so that an absent `max_connections` and an explicit
+/// `max_connections = 512` are not reported as a change. A second copy of the
+/// rule here would let the semaphore and the comparison drift.
+///
+/// `Some(0)` means unlimited and MUST resolve to 0 (not `usize::MAX`):
 /// `AppState::new` builds `Semaphore::new(n)` whenever n > 0, and tokio
 /// panics on `usize::MAX` (batch_semaphore asserts permits <= MAX_PERMITS);
 /// with panic=abort in release, `usize::MAX` would crash frps at boot on the
 /// documented "0 = unlimited" setting (audit H1). `None` defaults to 512.
 fn resolve_max_connections(max_connections: Option<u32>) -> usize {
-    match max_connections {
-        Some(0) => 0, // 0 = unlimited → no semaphore
-        Some(n) => n as usize,
-        None => 512, // default
-    }
+    frp_core::config::effective_max_connections(max_connections)
 }
 
 /// Record a "restart required" change entry when `old != new`. Used by
@@ -330,6 +334,78 @@ fn note_auth_restart_changes(
     // there, and `auth.useEncryption` is not here because nothing reads it.
 }
 
+/// Print every restart-only `ServerConfig` difference a `SIGUSR1` reload can
+/// only **report** — the `ServerConfig`-shaped counterpart of
+/// [`note_auth_restart_changes`], called next to it from `reload()`.
+///
+/// **The list itself** is [`ServerConfig::restart_only_changes`]
+/// (`frp-core/src/config/restart_only.rs`), which destructures both configs with
+/// **no `..`** — so adding or renaming a field of `ServerConfig`, or of one of
+/// its sub-structs, is a compile error (E0027) until the new field is named and
+/// classified. A list of named reads (`old.x != new.x`) has no such property: the
+/// client half of this series measured exactly that on the named-reads shape it
+/// had before it was rewritten to a no-`..` destructure.
+///
+/// **Why the list is not here.** Three `ServerConfig` fields (`kcp_bind_port`,
+/// `quic_bind_port`, `websocket_port`) are `#[cfg]`-gated on **frp-core's**
+/// features, while a pattern written in this crate could only be gated on *this*
+/// crate's — and Cargo unifies the two independently. Measured on a draft of this
+/// list that lived here: `cargo test -p frp-server --no-default-features
+/// --all-targets` (`.github/workflows/ci.yml`) failed to compile with E0027
+/// (`pattern does not mention fields kcp_bind_port, quic_bind_port,
+/// websocket_port`) because the `frp-client` dev-dependency turns `frp-core/kcp`
+/// on while `frp-server/kcp` is off, and the mirror case
+/// (`cargo check --workspace --no-default-features --features tiny`, same file)
+/// has the field absent, where an unconditional pattern entry would be E0026. In
+/// `frp-core` the gates match the struct exactly.
+///
+/// **What stays here** is the part this crate owns: whether the field's only
+/// reader is compiled into this build, and the wording of the summary line.
+/// `name_only` entries print no values at all: they are credential-shaped
+/// (`web_server.password`, `http_plugins`).
+fn note_restart_changes(old: &ServerConfig, new: &ServerConfig, changes: &mut Vec<String>) {
+    for change in old.restart_only_changes(new) {
+        if !server_reader_present(change.reader) {
+            continue;
+        }
+        if change.name_only {
+            changes.push(format!("{} changed (restart required)", change.name));
+        } else {
+            changes.push(format!(
+                "{}: {} -> {} (restart required)",
+                change.name, change.old, change.new
+            ));
+        }
+    }
+}
+
+/// Whether this build contains the only reader a restart-only field has.
+///
+/// `ServerReader` is `frp-core`'s classification of *which* build feature a
+/// field's reader needs; this crate owns the features, so it resolves them here
+/// (`Service::run`'s dashboard, SSH-gateway and QUIC blocks). The one gate that
+/// is not this crate's is `Otel`: that reader is `frps`'s `init_logging`, gated
+/// on the binary's `otel` feature, which forwards `frp-core/otel`. `frp-server`
+/// declares no `otel` feature of its own, so a `#[cfg(feature = "otel")]` here
+/// would be constant `false`; `frp_core::logging::OTEL_ENABLED` is the same
+/// question asked where the feature lives. It tracks `frp-core`, so a build that
+/// enables `frp-core/otel` through another member while the binary under test
+/// does not would report this group anyway — recorded in the change report.
+fn server_reader_present(reader: frp_core::config::ServerReader) -> bool {
+    use frp_core::config::ServerReader;
+    match reader {
+        ServerReader::Any => true,
+        ServerReader::Dashboard => cfg!(feature = "dashboard"),
+        ServerReader::Ssh => cfg!(feature = "ssh"),
+        // The three listener ports: `frp-core`'s features decide whether the
+        // *field* exists, these decide whether anything reads it.
+        ServerReader::Kcp => cfg!(feature = "kcp"),
+        ServerReader::Quic => cfg!(feature = "quic"),
+        ServerReader::Websocket => cfg!(feature = "websocket"),
+        ServerReader::Otel => frp_core::logging::OTEL_ENABLED,
+    }
+}
+
 /// Spawn a boxed future with type erasure. Reduces binary size by
 /// preventing monomorphization of `tokio::spawn` for every concrete
 /// future type — the unsizing coercion from `Pin<Box<ConcreteFut>>`
@@ -419,7 +495,9 @@ impl Service {
         let allow_ports = resolve_allow_ports(&cfg);
         let sub_host = cfg.sub_domain_host.clone();
         let max_connections = resolve_max_connections(cfg.max_connections);
-        let max_accept_rate = cfg.max_accept_rate.unwrap_or(0);
+        // Same effective-value function the reload's comparison uses, so the
+        // limiter and the report cannot disagree about what "unset" means.
+        let max_accept_rate = frp_core::config::effective_max_accept_rate(cfg.max_accept_rate);
         let mut state = AppState::new(
             auth_cfg,
             if cfg.proxy_bind_addr.is_empty() {
@@ -556,7 +634,7 @@ impl Service {
         #[cfg(not(feature = "tls"))]
         let _tls_acceptor: Option<()> = None;
 
-        let max_accept_rate = self.cfg.max_accept_rate.unwrap_or(0);
+        let max_accept_rate = frp_core::config::effective_max_accept_rate(self.cfg.max_accept_rate);
         // Hoisted accept-rate-limiter gate: when max_accept_rate == 0 the
         // limiter is a no-op (rate 0.0 → try_acquire always Ok), so skip
         // taking the mutex on every accept. The limiter never changes after
@@ -2396,6 +2474,14 @@ impl Service {
         // reports, including `auth.method` (the reason a method-only change
         // used to vanish into `config reloaded: no changes detected`).
         note_auth_restart_changes(&self.cfg.auth, &new_cfg.auth, &mut changes);
+
+        // Every other restart-only field, named — the `ServerConfig`-shaped
+        // counterpart of the call above. Baseline is `self.cfg` for the same
+        // reason it is there: nothing writes `self.cfg` after construction and
+        // the apply block above never copies a restart-only field out of the
+        // file, so `self.cfg` *is* the running value. Pre-fix, a change to any
+        // of these alone vanished into `config reloaded: no changes detected`.
+        note_restart_changes(&self.cfg, &new_cfg, &mut changes);
 
         if changes.is_empty() {
             Ok("config reloaded: no changes detected".into())
