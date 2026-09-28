@@ -486,13 +486,16 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `apply` implementation was ever built — the rejection of `apply` is a code-reading argument, and
   `auth.tokenSource` is compared by `Debug` shape (`ValueSource` has no `PartialEq`), which can
   over-report but not under-report. Both are recorded in the report's least-sure section.
-- [ ] **Every restart-only setting outside `[auth]` is still silently ignored by the SIGUSR1
+- [x] **Every restart-only setting outside `[auth]` was silently ignored by the SIGUSR1
   reload.** Measured 2026-09-28 on this branch's fix-round head (the commit after `4d9b251`,
   `frps` built from that working tree; first measured at `360948e`) — own config, own free
   port (60981, 60982 in the first measurement; 49388 in the re-measurement; never 7000), `SIGUSR1`
   by pid, stdout and stderr to **separate** files,
   bounded settle, every child reaped with `wait`, strays by `pgrep -x` only; script
-  `/tmp/sra-probe/probe-non-auth.sh`, run twice with identical results:
+  `/tmp/sra-probe/probe-non-auth.sh` — **deleted during the #399 cleanup, re-derived from this
+  item's text and recreated at the same path** in this round — run twice with identical summary
+  lines (re-measured here, the `SIGUSR1:` lines are identical run to run while the stdout byte
+  counts move by ≤ 6 B, because the startup lines carry the port and its digit count varies):
   * running `transport.heartbeat_timeout = 30` with `max_ports_per_client = 0`, rewritten to `60`
     and `7` + `kill -USR1` → `SIGUSR1: config reloaded: no changes detected` on **stdout**
     (**1702 B** stdout / **0 B** stderr at the moment the summary is read; the archived
@@ -511,6 +514,69 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   the summary — with a compiler-enforced field list, the way `note_auth_restart_changes` does for
   `[auth]` — pinned by a probe per field group; `[log]` (read once in `init_logging`, before the
   reload path exists) must be reported rather than silently ignored.
+
+  Done (branch `fix/restart-only-settings`, `5c74455`). The list is
+  `ServerConfig::restart_only_changes` (`frp-core/src/config/restart_only.rs`), filtered and printed by
+  `note_restart_changes` in `frp-server/src/service.rs` and called from `reload()`. Both configs are
+  destructured with **no `..`**, as are all eight config structs it walks, so a new field is a compile
+  error until it is named and classified: measured by adding one probe field to each of the eight and
+  re-checking — **16 E0027s**, two per struct (running and loaded pattern), every one in
+  `restart_only.rs`; probe `/tmp/sra-probe/probe-compile-error.sh`, file restored afterwards
+  (`git diff --stat frp-core/src/config/server.rs` empty). The list lives in `frp-core` and not next to
+  the reload because the three `#[cfg]`-gated listener ports are gated on *frp-core's* features, which
+  Cargo unifies independently of `frp-server`'s: a first draft written in `frp-server` was measured red
+  in two lanes this tree already runs — `cargo test -p frp-server --no-default-features --all-targets`
+  (E0027 on `kcp_bind_port`/`quic_bind_port`/`websocket_port`; the `frp-client` dev-dependency turns
+  `frp-core/kcp` on while `frp-server/kcp` is off) and
+  `cargo check --workspace --no-default-features --features tiny` (the mirror case, where an
+  unconditional pattern entry would be E0028).
+  Base/head per field group, real `frps` + `SIGUSR1` (base = `git archive 3f975e0`): base **3 OK /
+  6 FAIL**, head **9 OK / 0 FAIL** on the same 9 cases, stderr 0 B everywhere, every child reaped with
+  `wait`, `pgrep -x` 0 afterwards. The case above at head:
+  `SIGUSR1: transport.heartbeat_timeout: 30 -> 60 (restart required); max_ports_per_client: 0 -> 7
+  (restart required)` (2199 B stdout at the read / 3134 B after the drain, 0 B stderr). `[log]` is
+  reported, because all five `[log]` fields are read once in `init_logging`:
+  `log.level: info -> debug (restart required)`.
+  **Not over-reported** — a restart could not change these either, so the line would be false: the
+  fields no code in `frp-server` reads (`auth.useEncryption` from the item above, `tls_server_name`,
+  `web_server.pprof_enable`, `web_server.tls_ca_file` / `tls_server_name`, the nested `tls.*` trio,
+  `[featureGates]` — each `_`-bound with its measurement and pinned by `unreported_fields_stay_unreported`
+  / `inert_settings_are_not_reported`), `includes` (consumed by the reload's own `load_server_config`),
+  and the applied set (`allow_ports` + `allow_port_start`/`allow_port_end`, the five `[auth]` fields,
+  the TLS paths). Fields whose only reader is behind a feature are reported only where that reader
+  compiles (`dashboard`, `ssh`, `quic`, `otel`) — the default `full` frps has `ssh` but not
+  `dashboard`/`otel`, and both directions are asserted from whichever build runs the test. Credential-
+  shaped values are never printed (`web_server.password`, `http_plugins`, whose `addr` may carry
+  `user:pass@`).
+  Carriers: `frp-core/src/config/restart_only.rs` (new), `frp-core/src/config/mod.rs`,
+  `frp-core/src/logging.rs` (`OTEL_ENABLED` — the only way `frp-server`, which declares no `otel`
+  feature, can ask whether the binary's OTLP reader exists), `frp-server/src/service.rs`,
+  `frp-server/tests/server_reload_restart_only.rs` (new, 12 tests, run with default features,
+  `--features dashboard` and `--no-default-features`), `docs/config.md` § Server Config Reload,
+  `README.md`, `docs/deployment.md`, `CHANGELOG.md`.
+  Gates: `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets --all-features
+  -- -D warnings` clean; `cargo test -p frp-core --lib` 971/0 (was 966; +5 unit tests);
+  `cargo test -p frp-server` rc 0, 657 passed / 0 failed over 42 lanes (`server_reload_auth` 6/0,
+  `reload_integration` 4/0, `server_reload_restart_only` 12/0) — with one honest caveat: the first run
+  failed `reload_integration::test_reload_add_proxy` with `AddrInUse` on its own echo-server port,
+  the documented `allocate_port` probe-then-drop race in that file's scaffolding (it signals **frpc**
+  only, never `frps`, so this change cannot reach it); it passed on the quiet re-run. `cargo test -p
+  frps` rc 0; `cargo test -p frpc` rc 0; tiny lane `cargo test -p frpc --no-default-features --features
+  tiny --test cli_exit_codes` 13/0 and `cargo check --workspace --no-default-features --features tiny`
+  rc 0; `bash scripts/repo-health.sh` rc 0; `bash scripts/compat-test.sh` **86 passed / 0 failed** vs Go
+  frp v0.71.0 (relevant to the server config surface, but it does **not** exercise `SIGUSR1`, so it is
+  not evidence about this path). The compat suite leaked its usual **83** orphans (all `PPID 1`, all
+  under `/tmp/frp-compat-test/`, no live `compat-test.sh`), reaped by explicit pid after matching on
+  command line and `PPID == 1`; `pgrep -x frps`/`frpc` are 0.
+  Not covered, stated rather than implied: the inert list is a `grep` result, not a proof; the `otel`
+  gate tracks `frp-core`'s feature, so a build that enables `frp-core/otel` through another member while
+  the binary under test does not would over-report `[observability]`; the dashboard-gated and otel-gated
+  groups are exercised in process, not end to end (the shell probe runs the default build);
+  `OTEL_EXPORTER_OTLP_ENDPOINT` can mask an `[observability]` change; and `ServerConfig.tls_enable` has
+  **no reader** in `frp-server`/`frps` (measured), so its pre-existing "restart required" line is very
+  likely the same class of false positive this item is about — left alone because it is base behaviour
+  and this item counts the field among those `reload()` already compares. Full base/head table and the
+  least-sure section: `/tmp/restart-only-report.md`.
 
 - [ ] **`oidc_throttle_tests` is a load-dependent flake: the mock IdP answers 404 for a valid
   request.** `cargo test -p frp-server --lib oidc` failed **3/3** `oidc_throttle_tests` under CPU
