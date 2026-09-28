@@ -756,8 +756,9 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   the client half of the strict list (`frp-core/src/config/strict.rs:150-156`, via `known_client_keys`
   at `:131`) carries only `tls_enable`, `tls_cert_file`, `tls_key_file`, `tls_ca_file`,
   `tls_server_name`, `tls_skip_verify` and `tlsSkipVerify` for those keys, plus `tlsServerName`
-  (`:207`) and `disableCustomTLSFirstByte` (`:163`) for the two correct rows. The real flat spelling of the four is
-  the nested `[transport.tls]` key that `frp-core/src/config/normalize.rs:1352-1367` flattens onto
+  (`:207`) and `disableCustomTLSFirstByte` (`:163`) for the two correct rows. The real flat spelling
+  of the four is the nested `[transport.tls]` key that
+  `frp-core/src/config/normalize.rs:1352-1367` flattens onto
   them (`enable`, `certFile`, `keyFile`, `trustedCaFile`). Two client rows are **right** and must not
   be erased: `tls_server_name` → `tlsServerName` (`docs/config.md:301`) and
   `disable_custom_tls_first_byte` → `disableCustomTLSFirstByte` (`docs/config.md:302`), both loading
@@ -790,7 +791,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   flatten block (`docs/config.md:373`) gains the same Exception the server block has, naming all four
   alias-less keys while keeping the two that work. The new pin test
   `test_flat_camelcase_client_tls_spellings_are_not_loader_spellings`
-  (`frp-core/src/config/tests.rs:2130`) pins all five rejected spellings (non-strict ignored, strict
+  (`frp-core/src/config/tests.rs:2140`) pins all five rejected spellings (non-strict ignored, strict
   refused by name), the nested spellings and both accepted aliases in both modes, and
   `known_client_keys()` membership. **Decision: the four camelCase spellings stay rejected** — adding
   them as serde aliases or to `known_client_keys()` would widen the acceptance surface away from Go,
