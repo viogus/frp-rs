@@ -323,8 +323,6 @@ chmod 644 /etc/frp/server.crt
 ```toml
 bind_port = 7000
 
-# Enable TLS on the control port
-tls_enable = true
 tls_cert_file = "/etc/frp/server.crt"
 tls_key_file = "/etc/frp/server.key"
 tls_only = false         # false: accept both TLS and plain TCP
