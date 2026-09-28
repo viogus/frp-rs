@@ -632,6 +632,49 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   wired to a server behaviour (a documented divergence from Go, which ignores it server-side) with a
   probe showing what a restart changes. A reader of the test must be able to tell which was chosen.
 
+- [ ] **`[web_server.tls] cert_file` — the nested section's own canonical spelling — is dropped silently
+  in the non-strict loader, and refused in strict mode with a message naming a key the user never wrote.**
+  Measured 2026-09-28 at `e6bda94` by loading config shapes through
+  `load_server_config(path, strict)` (probe kept with that round, `/tmp/sra-probe/n1/probe2.rs`, run
+  against the fix-round head):
+
+  | spelling | `strict = false` (the reload path; `--strict-config=false`) | `strict = true` (Go's default; frps `-c`) |
+  |---|---|---|
+  | `[web_server.tls] cert_file` / `key_file` / `trusted_ca_file` / `server_name` / `enable` — snake_case, the struct's **canonical** serde names | `Ok`, and **all five values vanish**: nested struct at its default, `tls_cert_file = ""`, `tls_cert() = ""` | `Err`: `unknown field "web_server.cert_file" … did you mean 'certFile'?`, plus `web_server.enable`, `web_server.key_file` … `did you mean 'keyFile'?`, `web_server.server_name` … `did you mean 'serverName'?`, `web_server.trusted_ca_file` |
+  | `[web_server.tls] certFile` / `keyFile` / `trustedCaFile` / `serverName` (camelCase) | `Ok`, mapped onto the flat fields (`tls_cert_file`, `tls_ca_file`, `tls_server_name`) | `Ok`, same |
+  | YAML `webServer.tls.certFile` … | `Ok`, same as camelCase | `Ok`, same |
+  | flat `web_server.tls_cert_file` / `tls_key_file` | `Ok` | `Ok` |
+  | **both** flat and nested camelCase | flat wins (`tls_cert_file = "/flat/cert.pem"`) | flat wins |
+
+  Mechanism: `normalize_web_server_section` (`frp-core/src/config/normalize.rs:1423`) removes the
+  `web_server.tls` table and re-inserts **every** key at the parent level, renaming only the four Go
+  spellings (`certFile` → `tls_cert_file`, …); every other key keeps its name, so `cert_file` becomes
+  `web_server.cert_file`, which is not a field — dropped in non-strict mode, an unknown-field error in
+  strict mode. Three things make that a defect rather than a quirk: (1)
+  `frp-core/src/config/server.rs:926-938` declares the nested section with `cert_file` / `key_file` /
+  `trusted_ca_file` / `server_name` as the **canonical serde names** and the camelCase spellings only as
+  `alias`es, so the spelling that fails is frp-rs's own and the one that works is Go's; (2) the same
+  struct's doc says the section is "Merged with the flat `tls_cert_file`/`tls_key_file` fields — the
+  nested values take precedence when both are set", while the last table row shows the **opposite** (the
+  flat key wins, because the rename uses `or_insert`), so the documented precedence cannot be exercised
+  either; (3) the strict-mode error names `web_server.cert_file` — a path the user never wrote — and its
+  `did you mean 'certFile'?` hint points at the other spelling of the same field. Go comparison, for
+  calibration: Go's `WebServerConfig.TLS` is `*TLSConfig `json:"tls,omitempty"``
+  (`pkg/config/v1/common.go:68`) whose fields carry camelCase json tags only (`common.go:76-84`), and
+  Go's decoder is `DisallowUnknownFields: strict` (`pkg/config/load.go:158`) — on Go the nested spelling is
+  necessarily camelCase and a `cert_file` key is refused, so the **silent** branch is frp-rs-specific,
+  and the reload path always takes it (`load_server_config(&config_path, false)`,
+  `frp-server/src/service.rs:2301`). **Done-when:** an explicit, test-pinned decision. I would **map the
+  four snake_case spellings** in `normalize_web_server_section` (`cert_file` → `tls_cert_file`, `key_file`
+  → `tls_key_file`, `trusted_ca_file` → `tls_ca_file`, `server_name` → `tls_server_name`; and decide
+  `enable`, which nothing reads) and pin the precedence the struct's doc claims (nested over flat, so the
+  rename must not silently lose to a flat key that is already set), with a load test asserting the value
+  reaches `WebServerConfig::tls_cert()` in **both** modes. Mapping cannot break a config that works today
+  — the spelling it fixes currently either errors or is dropped, and the camelCase spellings keep working
+  — whereas the alternative (reject nested snake_case with an error naming `web_server.tls.cert_file`, the
+  key the user actually wrote) is a smaller change but leaves the struct's canonical names unusable. Either
+  way the test must fail on today's behaviour.
+
 - [ ] **`oidc_throttle_tests` is a load-dependent flake: the mock IdP answers 404 for a valid
   request.** `cargo test -p frp-server --lib oidc` failed **3/3** `oidc_throttle_tests` under CPU
   load with `OIDC: openid-configuration returned 404 Not Found`, while a serial run passes 6/6 and
