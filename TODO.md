@@ -3061,7 +3061,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     mis-cased key only in the walked sections (top level, `[auth]`/`[log]`/`[webServer]`/
     `[transport]`), while a mis-cased key inside a `[[proxies]]`/`[[visitors]]`/`[[httpPlugins]]`
     element is silently dropped **even in strict mode** (`frpc verify` rc 0; the exemption in
-    `frp-core/src/config/strict.rs:277-285`, its consequences already in `docs/deployment.md:710-747`,
+    `frp-core/src/config/strict.rs:277-285`, its consequences already in `docs/deployment.md:709-746`,
     pinned by `strict_mode_exempts_proxy_and_visitor_array_elements` and now also by the CLI test
     `case_insensitive_proxy_array_keys_are_dropped_in_strict_mode`). In non-strict mode the dropped
     key may later error (`web server port should be set …`, `missing field \`name\``) *or* silently
