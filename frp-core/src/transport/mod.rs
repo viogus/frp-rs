@@ -1549,14 +1549,19 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                     //     value): `error[E0308]: mismatched types`, "expected
                     //     `()`, found `Result<_, Error>`", whose `help:` offers
                     //     to put the `;` or the `return` back.
-                    // What separates this arm from the TCP one is the enclosing
-                    // `match` each refusal sits in, not this `else`: the match
-                    // holding this arm is an expression statement with no
-                    // trailing `;`, so its arms are `()`; the match holding the
-                    // TCP arm is the function's tail, so its arms yield
-                    // `Result<IoStream, Error>`. With `()` arms, a
-                    // discarded `Err` cannot constrain `T` — the `E0282` above;
-                    // with `Result` arms, a discarded value is the `E0308`.
+                    // Two things are at work here. First, the enclosing `match`
+                    // each refusal sits in: the match holding this arm is an
+                    // expression statement with no trailing `;`, so its arms are
+                    // `()`, while the match holding the TCP arm is the
+                    // function's tail, so its arms must yield
+                    // `Result<IoStream, Error>` — which is why a discarded
+                    // value is the `E0308` there and a discarded `()` body is
+                    // legal here. Second, this arm's own `else` diverges
+                    // (`return Ok(..)`), and that is what lets the `if`/`else`
+                    // still type-check as `()` once the `Err(..)` is discarded
+                    // as a statement, leaving `T` unconstrained — the `E0282`
+                    // above. Give the `else` a value instead and the same
+                    // mutation reports `E0308` on that value, not `E0282`.
                     //
                     // Unlike the TCP and WSS arms, `clippy::needless_return`
                     // does not fire on this one — measured in the four `kcp`
