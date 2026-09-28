@@ -330,6 +330,74 @@ fn note_auth_restart_changes(
     // there, and `auth.useEncryption` is not here because nothing reads it.
 }
 
+/// Print every restart-only `ServerConfig` difference a `SIGUSR1` reload can
+/// only **report** — the `ServerConfig`-shaped counterpart of
+/// [`note_auth_restart_changes`], called next to it from `reload()`.
+///
+/// **The list itself** is [`ServerConfig::restart_only_changes`]
+/// (`frp-core/src/config/restart_only.rs`), which destructures both configs with
+/// **no `..`** — so adding or renaming a field of `ServerConfig`, or of one of
+/// its sub-structs, is a compile error (E0027) until the new field is named and
+/// classified. A list of named reads (`old.x != new.x`) has no such property: the
+/// client half of this series measured exactly that on the named-reads shape it
+/// had before it was rewritten to a no-`..` destructure.
+///
+/// **Why the list is not here.** Three `ServerConfig` fields (`kcp_bind_port`,
+/// `quic_bind_port`, `websocket_port`) are `#[cfg]`-gated on **frp-core's**
+/// features, while a pattern written in this crate could only be gated on *this*
+/// crate's — and Cargo unifies the two independently. Measured on a draft of this
+/// list that lived here: `cargo test -p frp-server --no-default-features
+/// --all-targets` (`.github/workflows/ci.yml`) failed to compile with E0027
+/// (`pattern does not mention fields kcp_bind_port, quic_bind_port,
+/// websocket_port`) because the `frp-client` dev-dependency turns `frp-core/kcp`
+/// on while `frp-server/kcp` is off, and the mirror case
+/// (`cargo check --workspace --no-default-features --features tiny`, same file)
+/// has the field absent, where an unconditional pattern entry would be E0028. In
+/// `frp-core` the gates match the struct exactly.
+///
+/// **What stays here** is the part this crate owns: whether the field's only
+/// reader is compiled into this build, and the wording of the summary line.
+/// `name_only` entries print no values at all: they are credential-shaped
+/// (`web_server.password`, `http_plugins`).
+fn note_restart_changes(old: &ServerConfig, new: &ServerConfig, changes: &mut Vec<String>) {
+    for change in old.restart_only_changes(new) {
+        if !server_reader_present(change.reader) {
+            continue;
+        }
+        if change.name_only {
+            changes.push(format!("{} changed (restart required)", change.name));
+        } else {
+            changes.push(format!(
+                "{}: {} -> {} (restart required)",
+                change.name, change.old, change.new
+            ));
+        }
+    }
+}
+
+/// Whether this build contains the only reader a restart-only field has.
+///
+/// `ServerReader` is `frp-core`'s classification of *which* build feature a
+/// field's reader needs; this crate owns the features, so it resolves them here
+/// (`Service::run`'s dashboard, SSH-gateway and QUIC blocks). The one gate that
+/// is not this crate's is `Otel`: that reader is `frps`'s `init_logging`, gated
+/// on the binary's `otel` feature, which forwards `frp-core/otel`. `frp-server`
+/// declares no `otel` feature of its own, so a `#[cfg(feature = "otel")]` here
+/// would be constant `false`; `frp_core::logging::OTEL_ENABLED` is the same
+/// question asked where the feature lives. It tracks `frp-core`, so a build that
+/// enables `frp-core/otel` through another member while the binary under test
+/// does not would report this group anyway — recorded in the change report.
+fn server_reader_present(reader: frp_core::config::ServerReader) -> bool {
+    use frp_core::config::ServerReader;
+    match reader {
+        ServerReader::Any => true,
+        ServerReader::Dashboard => cfg!(feature = "dashboard"),
+        ServerReader::Ssh => cfg!(feature = "ssh"),
+        ServerReader::Quic => cfg!(feature = "quic"),
+        ServerReader::Otel => frp_core::logging::OTEL_ENABLED,
+    }
+}
+
 /// Spawn a boxed future with type erasure. Reduces binary size by
 /// preventing monomorphization of `tokio::spawn` for every concrete
 /// future type — the unsizing coercion from `Pin<Box<ConcreteFut>>`
@@ -2396,6 +2464,14 @@ impl Service {
         // reports, including `auth.method` (the reason a method-only change
         // used to vanish into `config reloaded: no changes detected`).
         note_auth_restart_changes(&self.cfg.auth, &new_cfg.auth, &mut changes);
+
+        // Every other restart-only field, named — the `ServerConfig`-shaped
+        // counterpart of the call above. Baseline is `self.cfg` for the same
+        // reason it is there: nothing writes `self.cfg` after construction and
+        // the apply block above never copies a restart-only field out of the
+        // file, so `self.cfg` *is* the running value. Pre-fix, a change to any
+        // of these alone vanished into `config reloaded: no changes detected`.
+        note_restart_changes(&self.cfg, &new_cfg, &mut changes);
 
         if changes.is_empty() {
             Ok("config reloaded: no changes detected".into())

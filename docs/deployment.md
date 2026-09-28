@@ -37,10 +37,12 @@ SyslogIdentifier=frps
 
 # Signal handling
 # SIGUSR1: reload the auth token/tokenSource, additionalAuthScopes, the auth
-# timeouts, the port range and the TLS files from config. What is left of
-# [auth] (method, OIDC settings) is reported in the reload summary as
-# "restart required" and needs a service restart; auth.useEncryption is parsed
-# but read by nothing, so a change to it has no effect at all.
+# timeouts, the port range and the TLS files from config. Every other
+# restart-only setting the config changed ([log], [transport], [web_server],
+# [ssh_tunnel_gateway], the registration caps, ...) is named in the reload
+# summary as "restart required" and needs a service restart; settings nothing
+# reads (auth.useEncryption, tls_server_name, web_server.pprof_enable, ...) are
+# parsed but have no effect at all, so they are not reported.
 KillSignal=SIGINT
 TimeoutStopSec=30
 

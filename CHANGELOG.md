@@ -211,6 +211,32 @@ User-facing release notes for frp-rs.
   credential. `auth.useEncryption` is deliberately **not** reported: the server
   parses it but reads it nowhere (Go's `AuthServerConfig` has no such field), so
   neither a reload nor a restart can make a change to it take effect.
+- **The server's `SIGUSR1` reload now names every restart-only setting it cannot
+  apply, instead of answering `config reloaded: no changes detected`.** The
+  reload compared `allow_ports`, `[auth]`, `bind_port`, `bind_addr`,
+  `tls_enable` and the TLS file paths, and nothing else — so a rewrite of any
+  other setting was reported as a no-op while the file on disk disagreed with
+  the running process. Measured on a real `frps`: `transport.heartbeat_timeout`
+  `30 -> 60` plus `max_ports_per_client` `0 -> 7` with `kill -USR1` printed
+  `config reloaded: no changes detected` and named neither field. Every
+  restart-only difference is now reported as
+  `name: old -> new (restart required)` — the whole `[transport]` section, the
+  listener ports and addresses, `[log]` (read once in `init_logging`, before the
+  reload path exists), `[web_server]`, `http_plugins`, the
+  per-client/per-proxy registration caps, the connection and drain timeouts,
+  `[ssh_tunnel_gateway]`, `[observability]` and the rest. Nothing new is
+  **applied**: this changes what the reload says, not what it does.
+  Three deliberate silences, so the summary does not claim a restart that would
+  change nothing: settings no code reads (`auth.useEncryption`,
+  `tls_server_name`, `web_server.pprof_enable`, `[featureGates]`, …), fields
+  whose only reader is behind a build feature (`web_server.*` beyond
+  `custom_404_page` without `dashboard`, `[ssh_tunnel_gateway]` without `ssh`,
+  the QUIC options without `quic`, `[observability]` without `otel`), and
+  `includes`, which the reload's own config load already resolves.
+  Credential-shaped values are named without their values (`web_server.password`,
+  `http_plugins`). The classified field list is a compiler-enforced destructure
+  of `ServerConfig`, so a newly added field is a compile error until it is
+  classified rather than silently silent.
 - **A config-load failure now prints a bare line on stdout, and `frpc verify`
   prints its refusal there instead of on stderr — a user-visible output change,
   and Go parity on the stream and the shape of each line.** Go frp v0.71.0 does
