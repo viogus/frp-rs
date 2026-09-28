@@ -3,7 +3,8 @@ use std::process;
 
 use frp_core::cli::{parse_frps_args, FrpsArgs, FrpsCmd};
 use frp_core::config::{
-    collect_config_files, load_server_config, load_server_config_uncompleted, ServerConfig,
+    collect_config_files, load_server_config, load_server_config_uncompleted_with_presence,
+    ServerConfig,
 };
 use frp_core::logging;
 use frp_core::unsafe_features::UnsafeFeatures;
@@ -209,8 +210,16 @@ async fn run(mut cli: FrpsArgs) {
             // Go frp v0.70.1 parity: with --config-dir each file is
             // authoritative — CLI config flags are not overlaid (audit task
             // 9 finding 5).
-            match load_server_config(&path_str, cli.strict_config) {
-                Ok(cfg) => {
+            match load_server_config_uncompleted_with_presence(&path_str, cli.strict_config) {
+                Ok((mut cfg, presence)) => {
+                    // Exactly `load_server_config`: the un-completed loader plus
+                    // completion. Taken apart only to reach `presence`.
+                    cfg.complete();
+                    // `init_logging` ran at the top of this branch, so the sink
+                    // exists; the loader cannot warn (it would be silent on `-c`),
+                    // so the binary owns the diagnostic and this path emits it
+                    // exactly once, here, like the `-c` branch below.
+                    presence.warn_inert_web_server_tls_enable();
                     let uf = unsafe_features.clone();
                     handles.push(tokio::spawn(async move {
                         let service = match Service::with_unsafe_features(cfg, Some(path_str.clone()), uf).await {
@@ -260,23 +269,24 @@ async fn run(mut cli: FrpsArgs) {
     // `--bind-addr`; measured end to end in `docs/developing.md` § CLI inputs
     // § 2b).
     let config_path = cli.config_path();
-    let mut cfg = match load_server_config_uncompleted(&config_path, cli.strict_config) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            // Go frp v0.71.0: `frps -c <bad>` is `fmt.Println(err); os.Exit(1)`
-            // (`cmd/frps/root.go`) — one bare line on **stdout**, no log prefix
-            // and no ANSI, same as the client, exit 1. Measured against the Go
-            // binary with the two streams captured separately (Go: stdout 38
-            // bytes, stderr 0); pinned by `frps/tests/cli_exit_codes.rs`.
-            //
-            // `init_logging` is deliberately **not** called here: Go installs
-            // its logger only after a successful load
-            // (`runServer`, `cmd/frps/root.go:112`), and this branch exits
-            // before any log record is emitted.
-            println!("{e}");
-            process::exit(frp_core::EXIT_RUNTIME);
-        }
-    };
+    let (mut cfg, presence) =
+        match load_server_config_uncompleted_with_presence(&config_path, cli.strict_config) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                // Go frp v0.71.0: `frps -c <bad>` is `fmt.Println(err); os.Exit(1)`
+                // (`cmd/frps/root.go`) — one bare line on **stdout**, no log prefix
+                // and no ANSI, same as the client, exit 1. Measured against the Go
+                // binary with the two streams captured separately (Go: stdout 38
+                // bytes, stderr 0); pinned by `frps/tests/cli_exit_codes.rs`.
+                //
+                // `init_logging` is deliberately **not** called here: Go installs
+                // its logger only after a successful load
+                // (`runServer`, `cmd/frps/root.go:112`), and this branch exits
+                // before any log record is emitted.
+                println!("{e}");
+                process::exit(frp_core::EXIT_RUNTIME);
+            }
+        };
 
     // Go frp v0.70.1 parity: an explicit `-c` makes the config file
     // authoritative — CLI config flags are ignored (audit task 9 finding 5).
@@ -288,6 +298,17 @@ async fn run(mut cli: FrpsArgs) {
     // Completion runs on the merged config, never before it (Go order).
     cfg.complete();
     init_logging(&cli, Some(&cfg));
+
+    // The sink exists from here on. `[web_server.tls] enable` is inert and the
+    // loader cannot warn about it — on this path the load above deliberately
+    // precedes `init_logging` (Go installs its logger only after a successful
+    // load, `cmd/frps/root.go:112`), so a `tracing::warn` inside the loader
+    // reaches no subscriber. The fact is carried out of the loader on
+    // `ConfigPresence` and emitted here, once: the `--config-dir` branch above
+    // warns at its own load site, so no path double-warns (measured, probe
+    // `/tmp/enable-warn-probe/run-probe.sh`: 1 on stdout, 0 on stderr, both
+    // paths, both binaries).
+    presence.warn_inert_web_server_tls_enable();
 
     tracing::info!(version = %frp_core::VERSION, "frps (Rust) v{} starting...", frp_core::VERSION);
     let config_path = Some(config_path);

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use super::client::ClientConfig;
 use super::format::{detect_format, parse_to_toml_value};
-use super::loader::{validate_client_config, validate_server_config};
+use super::loader::{validate_client_config, validate_server_config, ConfigPresence};
 use super::normalize::{load_config_from_file, normalize_client_config, normalize_server_config};
 use super::server::ServerConfig;
 use super::strict::{known_client_keys, known_server_keys};
@@ -61,6 +61,20 @@ pub fn load_server_config_uncompleted(
     path: &str,
     strict_config: bool,
 ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+    Ok(load_server_config_uncompleted_with_presence(path, strict_config)?.0)
+}
+
+/// [`load_server_config_uncompleted`], plus the [`ConfigPresence`] flags read
+/// from the same file.
+///
+/// The flags exist for facts the loader cannot act on itself. In particular
+/// `[webServer.tls]`/`[web_server.tls]` `enable` is inert, and its diagnostic
+/// must be emitted where a log sink exists — on the `-c` path that is **after**
+/// `init_logging`, in the binary, so it cannot live inside this load.
+pub fn load_server_config_uncompleted_with_presence(
+    path: &str,
+    strict_config: bool,
+) -> Result<(ServerConfig, ConfigPresence), Box<dyn std::error::Error>> {
     let (mut cfg, presence) = load_config_from_file::<ServerConfig>(
         path,
         strict_config,
@@ -70,7 +84,7 @@ pub fn load_server_config_uncompleted(
     )?;
     cfg.transport
         .complete_with_heartbeat_timeout_set(presence.server_heartbeat_timeout_set);
-    Ok(cfg)
+    Ok((cfg, presence))
 }
 
 /// Load a client configuration from a file path, auto-detecting format by extension.
@@ -79,6 +93,16 @@ pub fn load_client_config(
     path: &str,
     strict_config: bool,
 ) -> Result<ClientConfig, Box<dyn std::error::Error>> {
+    Ok(load_client_config_with_presence(path, strict_config)?.0)
+}
+
+/// [`load_client_config`], plus the [`ConfigPresence`] flags read from the same
+/// file — the client half of
+/// [`load_server_config_uncompleted_with_presence`]'s rationale.
+pub fn load_client_config_with_presence(
+    path: &str,
+    strict_config: bool,
+) -> Result<(ClientConfig, ConfigPresence), Box<dyn std::error::Error>> {
     let (mut cfg, presence) = load_config_from_file::<ClientConfig>(
         path,
         strict_config,
@@ -90,7 +114,7 @@ pub fn load_client_config(
         presence.client_heartbeat_interval_set,
         presence.client_heartbeat_timeout_set,
     );
-    Ok(cfg)
+    Ok((cfg, presence))
 }
 
 /// Process `includes` directives in a config: for each glob pattern,

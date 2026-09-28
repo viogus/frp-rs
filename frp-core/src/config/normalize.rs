@@ -547,8 +547,14 @@ pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
             canonicalize_legacy_ini_bools(table);
         }
     }
+    // Read before `normalize`: `normalize_web_server_section` removes the nested
+    // `[webServer.tls]`/`[web_server.tls]` table, `enable` included, so this is
+    // the last point at which the key is visible. The other flags are read from
+    // the normalized value (their keys survive normalization).
+    let web_server_tls_enable_set = ConfigPresence::web_server_tls_enable_set_in(&value);
     normalize(&mut value);
-    let presence = ConfigPresence::from_normalized_value(&value);
+    let mut presence = ConfigPresence::from_normalized_value(&value);
+    presence.web_server_tls_enable_set = web_server_tls_enable_set;
     if strict_config {
         run_strict_check(&value, &known_keys(), path)?;
     }
@@ -1472,15 +1478,21 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
 /// what makes the dotted section the trap.
 ///
 /// **What it drops, and why.** `enable` is removed and does not reach any
-/// field; a load that contains it also logs a warning, because that is the
-/// diagnostic a user needs (see the code comment at the removal). **Scope of
-/// that warning, measured on the v0.71.0 binaries:** it is delivered when the log
-/// sink is installed before the load (`frps --config-dir`: 1 warning) and dropped
-/// on the `-c` path (`frps -c`, `frpc -c`: 0 warnings, `RUST_LOG=debug`
+/// field, and the fact that it was written is carried out of the loader on
+/// [`ConfigPresence::web_server_tls_enable_set`] so each binary can emit the
+/// diagnostic a user needs **after** `init_logging`
+/// ([`ConfigPresence::warn_inert_web_server_tls_enable`] — see the code comment
+/// at the removal for why the emission is not here). Measured on the v0.71.0
+/// binaries, before/after that move (probe `/tmp/enable-warn-probe/`,
+/// `run-probe.sh`, stdout and stderr captured separately, occurrence counts):
+/// before, the warning was delivered only where the log sink was installed
+/// before the load (`frps --config-dir`: 1, `frpc --config-dir`: 1) and
+/// **dropped** on the common `-c` path (`frps -c`, `frpc -c`: 0, `RUST_LOG=debug`
 /// included), where the load deliberately precedes `init_logging`
-/// (`frps/src/main.rs:263` vs `:290`, `frpc/src/main.rs:561` vs `:583`). So on
-/// the common path the key is inert **and** silent until the warning is moved
-/// after logging — filed in `TODO.md`. Nothing reads
+/// (`frps/src/main.rs:263` vs `:290`, `frpc/src/main.rs:561` vs `:583`); after,
+/// every one of those four shapes emits exactly **1** on stdout and 0 on stderr.
+/// The `-c` ordering itself is untouched — it is Go parity (see the comment on
+/// that branch) and the fix moves the **emission**, not the load. Nothing reads
 /// [`WebServerTlsConfig::enable`]: the table is removed before serde, so the
 /// field is default-`false` in every loaded config and has no reader in
 /// `frp-server`/`frps`; the dashboard TLS is driven by a non-empty cert/key pair
@@ -1488,8 +1500,11 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
 /// (`pkg/util/http/server.go:77` starts TLS from a non-nil `cfg.TLS`). But Go
 /// does **not** accept the key: its `TLSConfig` (`pkg/config/v1/common.go:76-84`)
 /// has no `Enable` field, so `frps verify` refuses `enable` with
-/// `json: unknown field "enable"` (measured on the v0.71.0 binary by the
-/// fix-round review). Accepting it is therefore a **deliberate divergence**: it
+/// `json: unknown field "enable"` — re-measured on the v0.71.0 binary
+/// (`/private/tmp/frp_0.71.0_darwin_arm64/frps`, probe
+/// `/tmp/enable-warn-probe/go-probe.sh`: rc 1, 29 B on stdout, 0 B on stderr,
+/// while the identical file without `enable` verifies rc 0). Accepting it is
+/// therefore a **deliberate divergence**: it
 /// keeps a config frp-rs can serve correctly from failing, whose only other
 /// cost would be the strict/non-strict split this whole item is about. Do not
 /// "wire it up" to the cert/key pair: `enable = false` beside a valid pair would
@@ -1561,18 +1576,21 @@ fn normalize_web_server_section(table: &mut toml::Table) {
         }
     }
 
-    // Inert, and loudly so. `enable` is accepted (so strict mode does not refuse
-    // a file frp-rs can serve correctly) but stored nowhere a reader can see —
-    // see the doc comment above. The warning is the diagnostic a user needs:
-    // `enable = true` with no cert/key pair leaves the dashboard on **plaintext
-    // HTTP** (measured end-to-end by the fix-round review), and this key is not
-    // even a Go one, so its author believed it switched TLS on.
-    if tls.remove("enable").is_some() {
-        tracing::warn!(
-            "web_server.tls.enable has no effect: the dashboard HTTPS server is \
-             enabled by a non-empty `cert_file` + `key_file` pair"
-        );
-    }
+    // Inert, and silently so **here**. `enable` is accepted (so strict mode does
+    // not refuse a file frp-rs can serve correctly) but stored nowhere a reader
+    // can see — see the doc comment above. The diagnostic a user needs
+    // (`enable = true` with no cert/key pair leaves the dashboard on **plaintext
+    // HTTP**) is **not** emitted from this function: on the `-c` path the loader
+    // runs before `init_logging` (`frps/src/main.rs:263` vs `:290`;
+    // `frpc/src/main.rs:561` vs `:583`), so a `tracing::warn` here reaches no
+    // subscriber and the user sees nothing. The fact is carried out of the
+    // loader on `ConfigPresence::web_server_tls_enable_set` and the warning is
+    // emitted by each binary **after** `init_logging`
+    // (`ConfigPresence::warn_inert_web_server_tls_enable`) — one owner, one
+    // message per load on every path. Do not re-add an emission here: it would
+    // double the message on `--config-dir` (where the sink *is* installed first)
+    // while still being dropped on `-c`.
+    tls.remove("enable");
 
     // Anything else keeps its name at the parent level so strict mode can name
     // it, without clobbering an explicit flat value.

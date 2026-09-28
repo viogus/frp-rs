@@ -474,6 +474,57 @@ jobs:
             exit 1
           fi
           echo "frps log-completion guard ok: $n tests listed (expected 5), 0 failed"
+      - name: Run frps's `web_server.tls.enable` warning-delivery spawn tests
+        # `frps/tests/warn_delivery.rs` pins what a **user** sees when a config
+        # writes `[web_server.tls] enable`: the diagnostic must reach stdout on
+        # the `-c` path, where the config is loaded before `init_logging`
+        # (`frps/src/main.rs:263` vs `:290`) and a `tracing::warn` from inside the
+        # loader therefore reached no subscriber. No other lane executes this
+        # file: the steps above select `--test cli_exit_codes` / `--test
+        # cli_completion` / `--test log_completion` explicitly, `frps` declares no
+        # library target, and `cargo test --workspace --all-features --lib` sees
+        # no library tests. A separate step keeps the guarded
+        # `env.FRPS_CLI_TESTS` and the `log_completion` literal untouched — this
+        # adds a fifth `frps` test target, not a test inside a counted one.
+        #
+        # `--features dashboard` matches the step above so the same cached
+        # `frps --features dashboard` artifact is reused and left behind (warm: no
+        # extra rebuild). The file does not depend on the dashboard; it spawns the
+        # binary with `-c` and with `--config-dir` and counts
+        # `web_server.tls.enable` separately in stdout and stderr, then asserts
+        # the binary really started (the post-`init_logging` startup line), so an
+        # empty count cannot pass as "the key was absent".
+        #
+        # **This step asserts the count, for the reason the step above documents:
+        # a bare `cargo test --test <f>` cannot tell "3 passed" from "0 ran".**
+        # With this file's `FRPS_BIN` override it is also the run that falsifies
+        # the fix — `FRPS_BIN=<pre-change frps> cargo test -p frps --test
+        # warn_delivery` fails the `-c` test and only that one (measured,
+        # `/tmp/enable-warn-probe/out/falsify-frps-prefix.txt`).
+        shell: bash
+        run: |
+          set -eo pipefail
+          log=/tmp/frps-warn-delivery-tests.log
+          cargo test -p frps --features dashboard --test warn_delivery --color never 2>&1 | tee "$log"
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+          n=$(cargo test -p frps --features dashboard --test warn_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          status=0
+          grep -q "Running tests/warn_delivery.rs" "$log.plain" || status=1
+          grep -q "test result: ok. 3 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "3" ] || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::frps warning-delivery guard failed (status=$status, file=$n, log=$log)"
+            if [ -n "$n" ] && [ "$n" != "3" ]; then
+              if [ "$n" -lt "3" ]; then
+                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 3 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
+              else
+                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 3: move the single literal in this shell step from 3 to $n"
+              fi
+            fi
+            cat "$log.plain"
+            exit 1
+          fi
+          echo "frps warning-delivery guard ok: $n tests listed (expected 3), 0 failed"
       - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
         # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag
         # exit-code fix has to hold in the no-default-features build too — but

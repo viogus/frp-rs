@@ -11,7 +11,10 @@ use frp_core::cli::{
     build_single_proxy_config, parse_frpc_args, FrpcCmd, FrpcRunArgs, ReloadArgs, StatusArgs,
     StopArgs,
 };
-use frp_core::config::{collect_config_files, load_client_config, ClientConfig, ProxyConfig};
+use frp_core::config::{
+    collect_config_files, load_client_config, load_client_config_with_presence, ClientConfig,
+    ProxyConfig,
+};
 use frp_core::logging;
 use frp_core::unsafe_features::UnsafeFeatures;
 use frp_core::{EXIT_CONFIG, EXIT_RUNTIME};
@@ -515,8 +518,13 @@ async fn run_normal(mut args: FrpcRunArgs) {
         let mut handles = Vec::new();
         for path in &files {
             let path_str = path.display().to_string();
-            match load_client_config(&path_str, args.strict_config) {
-                Ok(cfg) => {
+            match load_client_config_with_presence(&path_str, args.strict_config) {
+                Ok((cfg, presence)) => {
+                    // `init_logging` ran at the top of this branch, so the sink
+                    // exists. The loader cannot warn (it would be silent on the
+                    // `-c` path below), so the binary owns the diagnostic and
+                    // this path emits it once, at its own load site.
+                    presence.warn_inert_web_server_tls_enable();
                     let uf = unsafe_features.clone();
                     #[cfg(unix)]
                     let stop_services = stop_services.clone();
@@ -558,8 +566,8 @@ async fn run_normal(mut args: FrpcRunArgs) {
     }
 
     // Single config mode
-    let cfg = match load_client_config(&args.config, args.strict_config) {
-        Ok(cfg) => cfg,
+    let (cfg, presence) = match load_client_config_with_presence(&args.config, args.strict_config) {
+        Ok(loaded) => loaded,
         Err(e) => {
             // Go frp v0.71.0: a `frpc -c <bad>` config failure is
             // `fmt.Println(err); os.Exit(1)` (`cmd/frpc/sub/root.go`) — one
@@ -581,6 +589,17 @@ async fn run_normal(mut args: FrpcRunArgs) {
     };
 
     init_logging(&args, Some(&cfg));
+
+    // The sink exists from here on. `[web_server.tls] enable` is inert and the
+    // loader cannot warn about it — on this path the load above deliberately
+    // precedes `init_logging` (Go installs its logger only after a successful
+    // load, `cmd/frpc/sub/root.go:191`), so a `tracing::warn` inside the loader
+    // reaches no subscriber. The fact is carried out of the loader on
+    // `ConfigPresence` and emitted here, once; the `--config-dir` branch above
+    // warns at its own load site, so no path double-warns (measured, probe
+    // `/tmp/enable-warn-probe/run-probe.sh`: 1 on stdout, 0 on stderr, both
+    // paths, both binaries).
+    presence.warn_inert_web_server_tls_enable();
 
     tracing::info!(version = %frp_core::VERSION, "frpc (Rust) v{} connecting...", frp_core::VERSION);
     let service = Arc::new(
@@ -748,8 +767,13 @@ async fn run_verify(config_path: &str, strict_config: bool) {
     // Go frp v0.70.1: `frpc verify` honors the persistent strictConfigMode
     // root flag (cmd/frpc/sub/verify.go) — with --strict-config=false, unknown
     // fields are accepted.
-    match load_client_config(config_path, strict_config) {
-        Ok(cfg) => {
+    match load_client_config_with_presence(config_path, strict_config) {
+        Ok((cfg, presence)) => {
+            // This path installs its console logger **before** the load, so the
+            // sink exists: emit the `[web_server.tls] enable` diagnostic here to
+            // keep the coverage this subcommand had while the loader warned (and
+            // to keep it to one record).
+            presence.warn_inert_web_server_tls_enable();
             // `load_client_config` only parses, so without this `verify` printed
             // "is valid" (rc 0) for a config `frpc run` refuses during service
             // construction (an oidc config in a build without the `oidc`

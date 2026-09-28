@@ -413,16 +413,23 @@ User-facing release notes for frp-rs.
   field, so `frps verify` exits 1 with `json: unknown field "enable"`. Accepting
   it is therefore a deliberate divergence — refusing it would reject a file frp-rs
   can serve correctly, and would split strict from non-strict exactly as the
-  `cert_file` key did — and it comes with a load-time warning, because the value
+  `cert_file` key did — and it comes with a startup warning, because the value
   is inert while the dashboard TLS is switched by a non-empty cert/key pair (the
   rule both implementations use): `enable = true` with no pair serves the
   dashboard as plaintext HTTP, and the warning is what says so. Scope of that
-  warning, measured on the v0.71.0 binaries: it is delivered when the log sink is
-  installed before the config load (`frps --config-dir`, 1 warning) and **not** on
-  the `-c` path (`frps -c` and `frpc -c`, 0 warnings — with `RUST_LOG=debug`
+  warning, measured on the v0.71.0 binaries before and after: it used to be
+  delivered only where the log sink was installed before the config load
+  (`frps --config-dir`, 1 warning; `frpc --config-dir`, 1) and **not** on the
+  `-c` path (`frps -c` and `frpc -c`, 0 warnings — with `RUST_LOG=debug`
   included), where the load deliberately precedes `init_logging`
-  (`frps/src/main.rs:263` vs `:290`; `frpc/src/main.rs:561` vs `:583`). Moving the
-  warning after logging on that path is filed in `TODO.md`, not done here. A
+  (`frps/src/main.rs:263` vs `:290`; `frpc/src/main.rs:561` vs `:583`), so the
+  common path served the dashboard as plaintext HTTP in silence. The warning now
+  survives every path: the loader no longer emits it (a `tracing::warn` there
+  reached no subscriber on `-c`), it carries the fact out on a presence flag, and
+  each binary emits the one record **after** its own `init_logging` — measured
+  1 on stdout / 0 on stderr for `frps -c`, `frps --config-dir`, `frpc -c` and
+  `frpc --config-dir`, and 0 without the key. The Go-parity load ordering is
+  unchanged; only the emission moved. A
   genuinely unknown nested key is still refused, as `web_server.<key>`.
 - **An empty `--log-level` / `--log-file`, and a zero `max_days`, no longer
   silence `frps` or `frpc` — or silently switch off log retention.** Go fills
