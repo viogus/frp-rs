@@ -1403,6 +1403,40 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   written here is rewritten the moment it lands and becomes a false citation — the text originally
   carried one, and a rebase onto the post-#363 `main` had already invalidated it before the squash
   could. Identify the change by its subject instead.
+- [ ] **No lane clippy-checks `frp-core` with features off, so two `clippy::*` lints inside
+  `cfg(not(feature = …))` code are red in the micro configuration and invisible everywhere else.**
+  Measured 2026-09-28 at `47f8fce`:
+  `RUSTFLAGS="-D warnings" cargo clippy -p frp-core --no-default-features --all-targets` → **rc 101**
+  with exactly two errors:
+  * `frp-core/src/encryption.rs:231:5` — `clippy::new_without_default` for `SnappyCompressor::new`,
+    inside `#[cfg(not(feature = "compression"))]`;
+  * `frp-core/src/transport/mod.rs:1643:21` — `clippy::needless_return`, inside
+    `#[cfg(not(feature = "tls"))]`.
+
+  The set is **complete**, so a fix does not have to hunt for a third: the same command with those two
+  allowed (`-- -A clippy::new_without_default -A clippy::needless_return`) exits **rc 0** across all
+  targets (lib, lib test, every `frp-core/tests/*.rs`, the bench), and neither file is in this branch's
+  diff — both were last touched by `96ccca0` (#358). Why no lane sees it: the only workspace clippy lane
+  is `ci.yml:84` (`cargo clippy --workspace --all-targets --all-features -- -D warnings`), which
+  **compiles both `cfg(not(…))` items out**, and the two isolated clippy steps (`ci.yml:916-917`) are
+  `-p frp-server --no-default-features --features dashboard` and `-p frp-client --no-default-features`.
+  The isolated step that *does* compile this configuration — `ci.yml:920`'s frp-core tier step — runs
+  `check`, i.e. rustc lints only, which is exactly why the `unused_mut` that the restart-only change
+  introduced there fired while a `clippy::*` lint cannot. This is the **same gate gap as that CI
+  failure, in the other direction**, which is why it is filed rather than quietly fixed.
+  **Done-when:** both lints are gone **and** the configuration is gated — add a
+  `clippy -p frp-core --no-default-features --all-targets` step (or extend an existing isolated step to
+  run clippy as well as `check`) under `RUSTFLAGS="-D warnings"`, so the gap cannot reopen. Precedent for
+  the disposition is the sibling item directly above: those four red `-p` configurations were closed by
+  **fixing** the code (narrowing `cfg`s), not by excusing it.
+  **Constraint on the `needless_return` fix, which must not be lost:** the `return` at
+  `frp-core/src/transport/mod.rs:1643` is **load-bearing**. The comment in place there records that its
+  absence caused an **E0308 fall-through in the feature-matrix check** — with tls off, the `tls_enable`
+  TCP dial arm fell through to the function tail instead of failing. The fix must therefore keep the
+  `Err` as the **tail expression** of that arm in the tls-off configuration (or otherwise preserve the
+  early failure), not delete the statement; the pin is that `--features kcp` (no tls) still fails the
+  dial with that error rather than falling through.
+
 - [x] **Pre-existing: no query-parameter-count guard, so >10000 params diverge from Go.**
   Go's `parseQuery` opens with
   `if !urlParamsWithinMax(strings.Count(query, "&") + 1) { return Values{}, err }`
