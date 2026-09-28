@@ -339,7 +339,7 @@ ports are configured:
 
 - WebSocket listener (separate port, `websocket_port`)
 - KCP listener (`kcp_bind_port`)
-- QUIC listener (`quic_bind_port`, requires `tls_enable`)
+- QUIC listener (`quic_bind_port`, requires the `quic` feature, which implies `tls`)
 - HTTP VHost listener (`vhost_http_port`)
 - HTTPS VHost listener (`vhost_https_port`)
 - TCPMux HTTP CONNECT listener (`tcpmux_httpconnect_port`)
