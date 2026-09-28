@@ -247,8 +247,9 @@ User-facing release notes for frp-rs.
   rather than silently silent.
 - **The server's `SIGUSR1` reload no longer reports `tls_enable` as
   `(restart required)`.** Nothing in `frp-server`/`frps` reads
-  `ServerConfig::tls_enable` — the field is parsed for Go/legacy compatibility
-  only — so neither a reload nor a restart can make a change to it take effect,
+  `ServerConfig::tls_enable` — frp-rs declares the field on its own
+  `ServerConfig` for historical reasons, not for Go/legacy compatibility — so
+  neither a reload nor a restart can make a change to it take effect,
   and the line claimed one. It now has the same disposition `auth.useEncryption`
   already has (deliberately unreported). Not a parity gap: Go v0.71.0's
   `ServerConfig` has no such field at all, its `TLS.Enable` is a *client* field,
