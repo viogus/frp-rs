@@ -2446,8 +2446,8 @@ impl Service {
         // frp-server/src frps/src` returns seven hits — three
         // `presence.warn_inert_web_server_tls_enable()` calls and four comment
         // lines, zero field reads), so neither a reload nor a restart can make
-        // a change to it
-        // take effect and a "restart required" line would be false. The same
+        // a change to it take effect and a "restart required" line would be
+        // false. The same
         // disposition `auth.useEncryption` has in
         // [`note_auth_restart_changes`]; pinned by
         // `inert_settings_are_not_reported` in
