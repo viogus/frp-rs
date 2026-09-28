@@ -424,12 +424,20 @@ User-facing release notes for frp-rs.
   included), where the load deliberately precedes `init_logging`
   (`frps/src/main.rs:263` vs `:290`; `frpc/src/main.rs:561` vs `:583`), so the
   common path served the dashboard as plaintext HTTP in silence. The warning now
-  survives every path: the loader no longer emits it (a `tracing::warn` there
-  reached no subscriber on `-c`), it carries the fact out on a presence flag, and
-  each binary emits the one record **after** its own `init_logging` — measured
-  1 on stdout / 0 on stderr for `frps -c`, `frps --config-dir`, `frpc -c` and
-  `frpc --config-dir`, and 0 without the key. The Go-parity load ordering is
-  unchanged; only the emission moved. A
+  reaches every load site that has a log sink: the loader no longer emits it (a
+  `tracing::warn` there reached no subscriber on `-c`), it carries the fact out on
+  a presence flag, and each site emits the one record — the two startup paths,
+  `frpc verify`, and the `frps`/`frpc` SIGUSR1 reload. Measured on
+  stdout / stderr: `frps -c` 1/0, `frps --config-dir` 1/0, `frpc -c` 1/0,
+  `frpc --config-dir` 1/0, the same four with the `[common]`-flattened spelling
+  1/0, `frps -c` reload +1, and 0/0 without the key. Three shapes deliberately
+  get nothing: `frps verify` (its logging is never initialised), a `.ini` file
+  (the dotted section header is stored verbatim — pre-existing), and a config
+  that writes `[web_server]` beside `[webServer.tls]` (the rename drops the
+  camelCase table whole, so the key never reaches the hoist). Library callers —
+  `load_*_config_from_str`, i.e. the `frpc` admin API's config GET and its
+  validate-before-write — no longer see the record; filed in `TODO.md`. The
+  Go-parity load ordering is unchanged; only the emission moved. A
   genuinely unknown nested key is still refused, as `web_server.<key>`.
 - **An empty `--log-level` / `--log-file`, and a zero `max_days`, no longer
   silence `frps` or `frpc` — or silently switch off log retention.** Go fills

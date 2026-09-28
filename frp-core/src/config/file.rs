@@ -87,6 +87,23 @@ pub fn load_server_config_uncompleted_with_presence(
     Ok((cfg, presence))
 }
 
+/// [`load_server_config`], plus the [`ConfigPresence`] flags read from the same
+/// file — the completing sibling of
+/// [`load_server_config_uncompleted_with_presence`].
+///
+/// Callers that already have a log sink (the server's SIGUSR1 reload,
+/// `frps --config-dir`) use this and call
+/// `ConfigPresence::warn_inert_web_server_tls_enable` themselves, so the record
+/// is emitted where it can be seen and exactly once per load.
+pub fn load_server_config_with_presence(
+    path: &str,
+    strict_config: bool,
+) -> Result<(ServerConfig, ConfigPresence), Box<dyn std::error::Error>> {
+    let (mut cfg, presence) = load_server_config_uncompleted_with_presence(path, strict_config)?;
+    cfg.complete();
+    Ok((cfg, presence))
+}
+
 /// Load a client configuration from a file path, auto-detecting format by extension.
 /// When `strict_config` is true, unknown fields cause an error (Go frp default).
 pub fn load_client_config(

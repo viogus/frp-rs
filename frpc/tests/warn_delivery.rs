@@ -1,6 +1,7 @@
 //! The client half of `frps/tests/warn_delivery.rs`: the
 //! `[web_server.tls] enable` diagnostic a **`frpc` user** actually sees, on both
-//! config paths, with stdout and stderr captured separately.
+//! config paths and for both the top-level and the `[common]` spelling, with
+//! stdout and stderr captured separately.
 //!
 //! **The defect these pin.** `normalize_web_server_section` (shared by the
 //! server and client normalizers — `ClientConfig.web_server` is the same
@@ -10,31 +11,55 @@
 //! Go-parity ordering — Go installs its logger only after a successful load,
 //! `cmd/frpc/sub/root.go:191`), so the record reached no subscriber:
 //!
-//! | shape | before | after |
-//! |---|---|---|
-//! | `frpc -c <cfg>` with `[web_server.tls] enable = true` | **0** stdout / 0 stderr | **1** stdout / 0 stderr |
-//! | `frpc --config-dir <dir>` | 1 / 0 | 1 / 0 |
-//! | `frpc -c` with no `enable` key | 0 / 0 | 0 / 0 |
-//! | `frpc verify -c <cfg>` (console logger installed before the load) | 1 / 0 | 1 / 0 |
+//! | shape | base | reviewed | now |
+//! |---|---|---|---|
+//! | `frpc -c <cfg>` with `[web_server.tls] enable` | **0** | 1 | 1 |
+//! | `frpc --config-dir <dir>` | 1 | 1 | 1 |
+//! | `[common.web_server.tls] enable`, `-c` | 0 | **0** | 1 |
+//! | `[common.web_server.tls] enable`, `--config-dir` | 1 | **0** | 1 |
+//! | `[web_server]` + `[webServer.tls] enable` (mixed) | 0 | 0 | 0 |
+//! | `frpc -c` with no `enable` key | 0 | 0 | 0 |
+//! | `frpc verify -c <cfg>` (logger installed before the load) | 1 | 1 | 1 |
+//! | **SIGUSR1 reload** delta (`frpc -c`, live session) | +1 | **0** | +1 |
 //!
-//! (Counts are `grep -o web_server\.tls\.enable | wc -l` over separately
-//! captured streams; the full before/after table is
-//! `/tmp/enable-warn-probe/out/{before,after}.txt` with `/tmp/enable-warn-probe/run-extra.sh`
-//! for the `verify` row. The Go-parity ordering itself was **not** moved — only
-//! the emission.)
+//! Every row is stdout; stderr carried 0. Counts are
+//! `grep -o web_server\.tls\.enable | wc -l` over separately captured streams:
+//! `/tmp/enable-warn-probe/out/{before,after}.txt` (first round),
+//! `/tmp/enable-warn-probe/out2-{before,after,after2}.txt` (this round, via
+//! `run-probe2.sh`), `/tmp/enable-warn-probe/out/before-extra.txt` for `verify`.
+//! The Go-parity ordering itself was **not** moved — only the emission.
+//!
+//! The `[common]` spelling is the invisible path the first round created: the
+//! flag detector read the raw value *before* `normalize_*_config` flattens
+//! `[common]` onto the top level, so the key still reached the removal site but
+//! the flag was never set, and the record was lost on exactly the paths where the
+//! base binary delivered it (`--config-dir`).
 //!
 //! **Why the child stays up.** `[web_server] port` is a free port and
 //! `login_fail_exit = false`, so `frpc` retries the (deliberately absent) server
 //! instead of exiting; the startup line and the warning are both emitted before
 //! the first connect attempt, so the ordering does not matter — the retry just
-//! keeps the child alive until the guard reaps it. Falsification (measured): run
-//! this file with `FRPC_BIN=/tmp/enable-warn-probe/before/frpc` and the `-c` test
-//! fails (`stdout: 0`) while the `--config-dir` test still passes.
+//! keeps the child alive until the guard reaps it.
+//!
+//! **Falsification (measured).** With
+//! `FRPC_BIN=/tmp/enable-warn-probe/before/frpc` (the pre-change binary) the
+//! plain `-c` test fails `stdout: 0` and `--config-dir` passes; with
+//! `FRPC_BIN=/tmp/enable-warn-probe/after/frpc` (the reviewed binary) the
+//! `[common]` test fails while the plain ones pass.
+//!
+//! **What these tests assert, and what they do not.** Real binary, real config
+//! file, the two streams captured separately, the **number of records per
+//! stream**, and that the binary reached its post-`init_logging` startup line.
+//! They do **not** pin the message text, the exact log line, or the position of
+//! the record; the text is pinned by
+//! `frp-core/tests/web_server_tls_enable_warning.rs`.
 //!
 //! **What it does not cover.** `frps` (the sibling file
-//! `frps/tests/warn_delivery.rs`), the `verify` row above (measured by probe, not
-//! pinned here), the admin server's actual HTTP/HTTPS behaviour, other sinks, and
-//! the message text beyond the substrings asserted here.
+//! `frps/tests/warn_delivery.rs`, which also pins the server's SIGUSR1 reload
+//! and the `includes` spelling), the `frpc verify` row and the **client** reload
+//! row above (measured by probe; the client reload needs a live session, so it is
+//! pinned in-process by `frp-client/tests/reload_warning_delivery.rs`), the admin
+//! server's actual HTTP/HTTPS behaviour, and other sinks.
 //!
 //! Bounded: every wait has a deadline, every child is killed and reaped by
 //! [`ChildGuard::drop`] even on panic, and each test picks its own ports from the
@@ -265,18 +290,41 @@ fn drain<R: Read + Send + 'static>(mut pipe: R, sink: Arc<Mutex<String>>) {
     });
 }
 
+/// Which spelling of the nested TLS section the config uses. `Nested` and
+/// `CommonNested` set the flag; `MixedSections` deliberately does not (the rename
+/// discards the camelCase table whole) and `None` is the control.
+#[derive(Clone, Copy)]
+enum Section {
+    Nested,
+    CommonNested,
+    MixedSections,
+    None,
+}
+
 /// `server_port` points at nothing (a fresh ephemeral port); `login_fail_exit =
 /// false` keeps the retrying child alive. The dashboard section is there because
 /// it is what the warning is about.
-fn frpc_config(server_port: u16, admin_port: u16, enable: Option<&str>) -> String {
-    let mut cfg = format!(
-        "server_addr = \"127.0.0.1\"\nserver_port = {server_port}\nlogin_fail_exit = false\n\
-         [web_server]\naddr = \"127.0.0.1\"\nport = {admin_port}\n"
+fn frpc_config(server_port: u16, admin_port: u16, section: Section) -> String {
+    let head = format!(
+        "server_addr = \"127.0.0.1\"\nserver_port = {server_port}\nlogin_fail_exit = false\n"
     );
-    if let Some(value) = enable {
-        cfg.push_str(&format!("[web_server.tls]\nenable = {value}\n"));
+    match section {
+        Section::Nested => format!(
+            "{head}[web_server]\naddr = \"127.0.0.1\"\nport = {admin_port}\n\
+             [web_server.tls]\nenable = true\n"
+        ),
+        Section::CommonNested => format!(
+            "{head}[common.web_server]\naddr = \"127.0.0.1\"\nport = {admin_port}\n\
+             [common.web_server.tls]\nenable = true\n"
+        ),
+        Section::MixedSections => format!(
+            "{head}[web_server]\naddr = \"127.0.0.1\"\nport = {admin_port}\n\
+             [webServer.tls]\nenable = true\n"
+        ),
+        Section::None => {
+            format!("{head}[web_server]\naddr = \"127.0.0.1\"\nport = {admin_port}\n")
+        }
     }
-    cfg
 }
 
 fn occurrences(haystack: &str, needle: &str) -> usize {
@@ -307,7 +355,7 @@ fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
 #[test]
 fn web_server_tls_enable_warning_reaches_a_dash_c_user() {
     let dir = TempDir::new("dashc");
-    let cfg = frpc_config(free_port(), free_port(), Some("true"));
+    let cfg = frpc_config(free_port(), free_port(), Section::Nested);
     let path = dir.write("frpc.toml", &cfg);
     let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
     assert_one_warning_on_stdout("frpc -c", &spawned);
@@ -316,7 +364,7 @@ fn web_server_tls_enable_warning_reaches_a_dash_c_user() {
 #[test]
 fn web_server_tls_enable_warning_reaches_a_config_dir_user() {
     let dir = TempDir::new("cfgdir");
-    let cfg = frpc_config(free_port(), free_port(), Some("true"));
+    let cfg = frpc_config(free_port(), free_port(), Section::Nested);
     let sub = dir.0.join("conf.d");
     std::fs::create_dir_all(&sub).expect("create config dir");
     std::fs::write(sub.join("frpc.toml"), &cfg).expect("write config");
@@ -324,12 +372,57 @@ fn web_server_tls_enable_warning_reaches_a_config_dir_user() {
     assert_one_warning_on_stdout("frpc --config-dir", &spawned);
 }
 
+/// The `[common]` spelling: the same shape `frps` pins, on the client's own
+/// config path. `normalize_client_config` flattens `[common]` onto the top level
+/// with `or_insert` before `normalize_web_server_section` runs, so the key does
+/// reach the removal site — and the detector has to mirror the flatten or the
+/// record is lost, exactly as it was on the reviewed tree (measured 0 on
+/// `--config-dir`, where the base binary emitted 1).
+#[test]
+fn web_server_tls_enable_warning_reaches_a_dash_c_user_with_the_common_spelling() {
+    let dir = TempDir::new("dashc-common");
+    let cfg = frpc_config(free_port(), free_port(), Section::CommonNested);
+    let path = dir.write("frpc.toml", &cfg);
+    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    assert_one_warning_on_stdout("frpc -c ([common] spelling)", &spawned);
+}
+
+#[test]
+fn web_server_tls_enable_warning_reaches_a_config_dir_user_with_the_common_spelling() {
+    let dir = TempDir::new("cfgdir-common");
+    let cfg = frpc_config(free_port(), free_port(), Section::CommonNested);
+    let sub = dir.0.join("conf.d");
+    std::fs::create_dir_all(&sub).expect("create config dir");
+    std::fs::write(sub.join("frpc.toml"), &cfg).expect("write config");
+    let spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
+    assert_one_warning_on_stdout("frpc --config-dir ([common] spelling)", &spawned);
+}
+
 /// Negative control: without the key there is no record on either stream, so the
 /// warning is presence-driven and not an unconditional startup line.
 #[test]
 fn no_warning_for_a_config_without_the_key() {
     let dir = TempDir::new("nokey");
-    let cfg = frpc_config(free_port(), free_port(), None);
+    let cfg = frpc_config(free_port(), free_port(), Section::None);
+    let path = dir.write("frpc.toml", &cfg);
+    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    let out = spawned.stdout();
+    let err = spawned.stderr();
+    assert!(
+        out.contains(STARTUP_MARKER),
+        "no startup line\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+    );
+    assert_eq!(occurrences(&out, KEY), 0, "stdout:\n{out}");
+    assert_eq!(occurrences(&err, KEY), 0, "stderr:\n{err}");
+}
+
+/// The mixed-sections shape gets no record: a top-level `[web_server]` makes the
+/// rename discard the whole `[webServer]` table, nested `tls` included, so the
+/// key never reaches the removal site. The detector mirrors that on purpose.
+#[test]
+fn no_warning_when_the_camelcase_table_is_discarded() {
+    let dir = TempDir::new("mixed");
+    let cfg = frpc_config(free_port(), free_port(), Section::MixedSections);
     let path = dir.write("frpc.toml", &cfg);
     let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
     let out = spawned.stdout();

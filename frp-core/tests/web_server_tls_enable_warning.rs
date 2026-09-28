@@ -43,11 +43,14 @@
 //!
 //! **What it does not cover.** Delivery on a real binary is
 //! `frps/tests/warn_delivery.rs` and `frpc/tests/warn_delivery.rs` (real
-//! binaries, `-c` and `--config-dir`, stdout and stderr captured separately); the
-//! dashboard behaviour itself (plaintext HTTP with no pair) is `frp-server` end to
-//! end and was measured by the fix-round review, not re-measured here; and other
-//! sinks, YAML/INI spellings (only TOML is exercised) and `--config-dir` are out
-//! of scope for this file. The measured before/after table lives in
+//! binaries, `-c` and `--config-dir`, top-level and `[common]` spellings, stdout
+//! and stderr captured separately, plus a real SIGUSR1 reload on the server
+//! side); the client's **reload** is `frp-client/tests/reload_warning_delivery.rs`
+//! (in-process because the client only processes a reload inside a live session);
+//! the dashboard behaviour itself (plaintext HTTP with no pair) is `frp-server`
+//! end to end and was measured by the fix-round review, not re-measured here; and
+//! other sinks, YAML and `.ini` spellings (only TOML is exercised) are out of
+//! scope for this file. The measured before/after table lives in
 //! `docs/config.md` and `CHANGELOG.md`.
 
 use std::io::{self, Write};
@@ -88,9 +91,17 @@ fn snapshot(output: &Arc<Mutex<Vec<u8>>>) -> String {
 /// Load `body` through the real loader and then call the binaries' entry point,
 /// all under one capturing subscriber, and return what each phase emitted.
 fn load_capturing(body: &str, strict: bool) -> Captured {
+    load_capturing_files(&[("frps.toml", body)], strict)
+}
+
+/// [`load_capturing`] with extra files in the same directory, so the `includes`
+/// spelling (which is deep-merged before the detector runs) can be exercised.
+fn load_capturing_files(files: &[(&str, &str)], strict: bool) -> Captured {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("frps.toml");
-    std::fs::write(&path, body).unwrap();
+    for (name, body) in files {
+        std::fs::write(dir.path().join(name), body).unwrap();
+    }
 
     let output = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
@@ -241,6 +252,91 @@ fn nested_web_server_tls_enable_warns_once_and_stays_inert() {
     assert_eq!(c.warning_records, 0);
 }
 
+/// The `[common]` spelling and the `includes` spelling set the same flag.
+///
+/// `[common]` is flattened onto the top level by
+/// `table.entry(k).or_insert(v)` **before** `normalize_web_server_section` runs,
+/// so `[common.web_server.tls] enable` reaches the same removal site as
+/// `[web_server.tls] enable`; the detector therefore has to mirror that flatten
+/// (it reads the raw value, before normalization). Measured on the base binary:
+/// `frps --config-dir` and `frpc --config-dir` with the `[common]` spelling each
+/// emitted 1 record, exactly like the top-level spelling — so a detector that
+/// only looked at the top level silently lost the record on that path (the
+/// pre-fix-round state; probe `/tmp/enable-warn-probe/run-probe2.sh`).
+///
+/// The precedence is the flatten's own `or_insert`: a **top-level**
+/// `[web_server]` already present makes the flatten discard
+/// `common.web_server` whole — nested `tls` included — so that mixed shape must
+/// **not** set the flag. It is the same rule as `[web_server]` +
+/// `[webServer.tls]` in [`both_sections_present_the_flag_follows_the_kept_section`].
+#[test]
+fn common_and_includes_spellings_set_the_flag() {
+    // `[common.web_server.tls] enable`, whole dashboard section under `[common]`.
+    let c = load_capturing(
+        "bind_port = 7000\n[common.web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [common.web_server.tls]\nenable = true\n",
+        false,
+    );
+    assert!(
+        c.presence.web_server_tls_enable_set(),
+        "`[common.web_server.tls] enable` reaches the same removal site"
+    );
+    assert_eq!(c.warning_records, 1);
+    assert_eq!(c.cert, "");
+
+    // The camelCase spelling under `[common]`.
+    let c = load_capturing(
+        "bind_port = 7000\n[common.webServer]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [common.webServer.tls]\nenable = true\n",
+        false,
+    );
+    assert!(
+        c.presence.web_server_tls_enable_set(),
+        "`[common.webServer.tls] enable`"
+    );
+    assert_eq!(c.warning_records, 1);
+
+    // The inline-table form of the same thing.
+    let c = load_capturing(
+        "bind_port = 7000\ncommon = { web_server = { tls = { enable = true } } }\n",
+        false,
+    );
+    assert!(
+        c.presence.web_server_tls_enable_set(),
+        "inline `common = {{ web_server = {{ tls = {{ enable = true }} }} }}`"
+    );
+    assert_eq!(c.warning_records, 1);
+
+    // The same shape in an `includes` file: `process_includes` deep-merges it
+    // into the main value before the detector runs, so it must be seen too.
+    let c = load_capturing_files(
+        &[
+            ("frps.toml", "bind_port = 7000\nincludes = [\"inc.txt\"]\n"),
+            ("inc.txt", "[common.web_server.tls]\nenable = true\n"),
+        ],
+        false,
+    );
+    assert!(
+        c.presence.web_server_tls_enable_set(),
+        "the `[common]` spelling inside an `includes` file"
+    );
+    assert_eq!(c.warning_records, 1);
+
+    // Precedence: a top-level `[web_server]` makes the flatten discard
+    // `common.web_server` whole, so this shape is inert *and* unflagged — the
+    // detector must not report a key the loader dropped.
+    let c = load_capturing(
+        "bind_port = 7000\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [common.web_server.tls]\nenable = true\n",
+        false,
+    );
+    assert!(
+        !c.presence.web_server_tls_enable_set(),
+        "a top-level `[web_server]` makes the flatten drop `common.web_server` whole"
+    );
+    assert_eq!(c.warning_records, 0);
+}
+
 /// The flag's detector reproduces the normalizers' section-rename precedence
 /// (`table.entry("web_server").or_insert(v)`): when both sections exist the
 /// snake_case one is kept **whole** and the camelCase one is discarded, nested
@@ -283,15 +379,23 @@ fn both_sections_present_the_flag_follows_the_kept_section() {
 /// The **string** loader is silent too, and does not surface the flag at all.
 ///
 /// This pins the other half of the "one owner" decision: the diagnostic lives on
-/// the CLI startup paths (`frps`/`frpc` run) and `frpc verify`, not in the
-/// library. The one in-repo caller that reaches `load_client_config_from_str`
-/// with a subscriber already installed is the `frpc` admin API's
-/// validate-before-write (`frp-client/src/admin.rs`), which used to see the
-/// record come out of the loader; it no longer does. That is deliberate — the
-/// endpoint's job is to accept or refuse a body, and the reload path reports the
-/// settings it cannot apply — but it is a real scope reduction, so it is pinned
-/// here rather than left to be discovered. A future decision to warn from the
-/// library has to change this test.
+/// the CLI startup paths (`frps`/`frpc` run), `frpc verify` and both in-process
+/// reloads — not in the library. **Two named in-repo sites** reach a silent
+/// loader with a subscriber already installed, both in the `frpc` admin API
+/// (`frp-client/src/admin.rs`):
+///
+/// * `config_from_file` — the admin **GET** path (`/api/proxies`,
+///   `/api/visitors`, the config views), which reloads the config file on
+///   **every request**, and so would warn once per poll;
+/// * `handle_put_config` — validate-before-write, which uses this very string
+///   loader.
+///
+/// Both used to see the record come out of the loader; neither does now. That is
+/// deliberate — a GET is a read, and the PUT path's job is to accept or refuse
+/// the body — but it is a real scope reduction, so it is pinned here rather than
+/// left to be discovered, and filed in `TODO.md`. A future decision to warn from
+/// the library has to change this test. Out-of-repo consumers of
+/// `load_*_config_from_str` are in the same position.
 #[test]
 fn the_string_loader_stays_silent() {
     let output = Arc::new(Mutex::new(Vec::new()));

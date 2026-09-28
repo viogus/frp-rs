@@ -4,7 +4,7 @@ use std::process;
 use frp_core::cli::{parse_frps_args, FrpsArgs, FrpsCmd};
 use frp_core::config::{
     collect_config_files, load_server_config, load_server_config_uncompleted_with_presence,
-    ServerConfig,
+    load_server_config_with_presence, ServerConfig,
 };
 use frp_core::logging;
 use frp_core::unsafe_features::UnsafeFeatures;
@@ -210,11 +210,8 @@ async fn run(mut cli: FrpsArgs) {
             // Go frp v0.70.1 parity: with --config-dir each file is
             // authoritative — CLI config flags are not overlaid (audit task
             // 9 finding 5).
-            match load_server_config_uncompleted_with_presence(&path_str, cli.strict_config) {
-                Ok((mut cfg, presence)) => {
-                    // Exactly `load_server_config`: the un-completed loader plus
-                    // completion. Taken apart only to reach `presence`.
-                    cfg.complete();
+            match load_server_config_with_presence(&path_str, cli.strict_config) {
+                Ok((cfg, presence)) => {
                     // `init_logging` ran at the top of this branch, so the sink
                     // exists; the loader cannot warn (it would be silent on `-c`),
                     // so the binary owns the diagnostic and this path emits it

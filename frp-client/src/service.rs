@@ -4430,8 +4430,19 @@ impl Service {
         strict: bool,
         writer: &Arc<ControlWriter>,
     ) -> Result<String, String> {
-        let mut new_cfg = frp_core::config::load_client_config(config_path, strict)
-            .map_err(|e| format!("failed to load config: {e}"))?;
+        // `load_client_config_with_presence` (not the plain wrapper) so the
+        // `[web_server.tls] enable` diagnostic still reaches the log on a
+        // reload: the loader itself is silent — on the startup `-c` path it
+        // would run before `init_logging` and reach no subscriber — so every
+        // in-process load site that *does* have a sink emits it here. Measured
+        // on the base binary: a SIGUSR1 reload of a config with the key logged
+        // `web_server.tls.enable has no effect: …` from the loader, and the
+        // admin section has no field for it, so that record was the only signal
+        // the reload gave about it.
+        let (mut new_cfg, presence) =
+            frp_core::config::load_client_config_with_presence(config_path, strict)
+                .map_err(|e| format!("failed to load config: {e}"))?;
+        presence.warn_inert_web_server_tls_enable();
         if let Some(ref store) = self.store_source {
             if let Err(e) = store.reload() {
                 tracing::warn!(error = %e, "store reload failed, using in-memory state");

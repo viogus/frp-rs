@@ -490,17 +490,19 @@ jobs:
         # `--features dashboard` matches the step above so the same cached
         # `frps --features dashboard` artifact is reused and left behind (warm: no
         # extra rebuild). The file does not depend on the dashboard; it spawns the
-        # binary with `-c` and with `--config-dir` and counts
-        # `web_server.tls.enable` separately in stdout and stderr, then asserts
-        # the binary really started (the post-`init_logging` startup line), so an
-        # empty count cannot pass as "the key was absent".
+        # binary with `-c` and with `--config-dir`, in the top-level and the
+        # `[common]` spelling of the nested section, over a real `kill -USR1`
+        # reload, and counts `web_server.tls.enable` separately in stdout and
+        # stderr, then asserts the binary really started (the post-`init_logging`
+        # startup line), so an empty count cannot pass as "the key was absent".
         #
         # **This step asserts the count, for the reason the step above documents:
-        # a bare `cargo test --test <f>` cannot tell "3 passed" from "0 ran".**
+        # a bare `cargo test --test <f>` cannot tell "7 passed" from "0 ran".**
         # With this file's `FRPS_BIN` override it is also the run that falsifies
-        # the fix — `FRPS_BIN=<pre-change frps> cargo test -p frps --test
-        # warn_delivery` fails the `-c` test and only that one (measured,
-        # `/tmp/enable-warn-probe/out/falsify-frps-prefix.txt`).
+        # it, in both directions: `FRPS_BIN=<pre-change frps>` fails the plain
+        # `-c` test (`left: 0, right: 1`); `FRPS_BIN=<first-round frps>` fails the
+        # `[common]` and reload tests, which is what the second round fixed
+        # (measured, `/tmp/enable-warn-probe/out2-falsify-frps-{base,reviewed}.txt`).
         shell: bash
         run: |
           set -eo pipefail
@@ -510,21 +512,62 @@ jobs:
           n=$(cargo test -p frps --features dashboard --test warn_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/warn_delivery.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 3 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "3" ] || status=1
+          grep -q "test result: ok. 7 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "7" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frps warning-delivery guard failed (status=$status, file=$n, log=$log)"
-            if [ -n "$n" ] && [ "$n" != "3" ]; then
-              if [ "$n" -lt "3" ]; then
-                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 3 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
+            if [ -n "$n" ] && [ "$n" != "7" ]; then
+              if [ "$n" -lt "7" ]; then
+                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 7 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
               else
-                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 3: move the single literal in this shell step from 3 to $n"
+                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 7: move the single literal in this shell step from 7 to $n"
               fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frps warning-delivery guard ok: $n tests listed (expected 3), 0 failed"
+          echo "frps warning-delivery guard ok: $n tests listed (expected 7), 0 failed"
+      - name: Run frpc's `web_server.tls.enable` warning-delivery spawn tests
+        # The client half of the step above: `frpc/tests/warn_delivery.rs` pins
+        # that the record reaches a `frpc -c` / `frpc --config-dir` user, in both
+        # the top-level and the `[common]` spelling of the nested section. It is
+        # executed by the plain `cargo test -p frpc` step in this job, but that
+        # step runs the whole package and cannot tell "6 passed" from "0 ran" —
+        # so it gets its own count-guarded step, exactly like the `frps` one.
+        # (The client's *reload* row is pinned separately, in-process, by
+        # `frp-client/tests/reload_warning_delivery.rs` in the
+        # `Tests (client integration)` job: the client only processes a reload
+        # inside a live session.)
+        #
+        # No `--features` flag: the file is `#![cfg(feature = "full")]`-gated and
+        # `full` is the default, so this is the same artifact the plain step
+        # builds. `FRPC_BIN` overrides the binary the file spawns, which is how
+        # it is falsified against the pre-change and first-round binaries
+        # (measured: `/tmp/enable-warn-probe/out2-falsify-frpc-{base,reviewed}.txt`).
+        shell: bash
+        run: |
+          set -eo pipefail
+          log=/tmp/frpc-warn-delivery-tests.log
+          cargo test -p frpc --test warn_delivery --color never 2>&1 | tee "$log"
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+          n=$(cargo test -p frpc --test warn_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          status=0
+          grep -q "Running tests/warn_delivery.rs" "$log.plain" || status=1
+          grep -q "test result: ok. 6 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "6" ] || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::frpc warning-delivery guard failed (status=$status, file=$n, log=$log)"
+            if [ -n "$n" ] && [ "$n" != "6" ]; then
+              if [ "$n" -lt "6" ]; then
+                echo "::error::frpc/tests/warn_delivery.rs lists $n tests, this step expects 6 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
+              else
+                echo "::error::frpc/tests/warn_delivery.rs lists $n tests, this step expects 6: move the single literal in this shell step from 6 to $n"
+              fi
+            fi
+            cat "$log.plain"
+            exit 1
+          fi
+          echo "frpc warning-delivery guard ok: $n tests listed (expected 6), 0 failed"
       - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
         # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag
         # exit-code fix has to hold in the no-default-features build too — but
