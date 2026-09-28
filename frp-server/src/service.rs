@@ -2442,12 +2442,17 @@ impl Service {
             &mut changes,
         );
         // `ServerConfig.tls_enable` is deliberately **not** compared here: no
-        // code in `frp-server`/`frps` reads it (measured: `grep -rn tls_enable
-        // frp-server/src frps/src` returns seven hits — three
-        // `presence.warn_inert_web_server_tls_enable()` calls and four comment
-        // lines, zero field reads), so neither a reload nor a restart can make
-        // a change to it take effect and a "restart required" line would be
-        // false. The same
+        // code in `frp-server`/`frps` reads it. `grep -rn tls_enable
+        // frp-server/src frps/src` returns only comment lines and call sites of
+        // the unrelated helper `presence.warn_inert_web_server_tls_enable()`,
+        // which reads a different key, `[web_server.tls] enable`; zero field
+        // reads. No hit count is pinned here: stating one is self-invalidating,
+        // because this comment and any later comment that merely mentions the
+        // identifier change the number. The earlier "seven hits" was already
+        // wrong for that reason, missed
+        // `frp-server/src/control/login.rs:1367`, and was raised by the lines
+        // asserting it. So neither a reload nor a restart can make a change to
+        // it take effect and a "restart required" line would be false. The same
         // disposition `auth.useEncryption` has in
         // [`note_auth_restart_changes`]; pinned by
         // `inert_settings_are_not_reported` in
