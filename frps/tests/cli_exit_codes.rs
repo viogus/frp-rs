@@ -87,6 +87,25 @@ impl Drop for TempDir {
     }
 }
 
+/// `Child::try_wait`, but the error path kills **and reaps** the child before
+/// panicking, so that panic cannot orphan it. `try_wait` fails only on an OS
+/// error — an already-reaped child is not an error, std caches its status — so
+/// this is the "kill in the expect path" fix for the shape `TODO.md`'s
+/// reload-guards item lists for this file (`:87`, `:258`, `:284` at the head the
+/// item was written on; `:99`, `:422`, `:448` here). At the two later sites the
+/// child is signalled and expected to exit on its own, and the already-exited
+/// arm has reaped it; only the `try_wait` error path had a live child.
+fn try_wait_or_kill(child: &mut Child, what: &str) -> Option<std::process::ExitStatus> {
+    match child.try_wait() {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("try_wait {what} failed: {e}");
+        }
+    }
+}
+
 fn run_frps(args: &[&str]) -> Output {
     let mut child = Command::new(BIN)
         .args(args)
@@ -96,7 +115,7 @@ fn run_frps(args: &[&str]) -> Output {
         .expect("spawn frps");
     let deadline = Instant::now() + EXIT_TIMEOUT;
     loop {
-        match child.try_wait().expect("try_wait frps") {
+        match try_wait_or_kill(&mut child, "frps") {
             Some(_) => return child.wait_with_output().expect("collect frps output"),
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
@@ -419,7 +438,7 @@ fn start_listening_then_sigterm(args: &[&str], port: u16, dir: &TempDir) -> Stri
         {
             break;
         }
-        if let Some(status) = child.try_wait().expect("try_wait frps") {
+        if let Some(status) = try_wait_or_kill(&mut child, "frps") {
             panic!(
                 "frps {args:?} exited ({status:?}) instead of listening on 127.0.0.1:{port}; \
                  log={:?}",
@@ -445,7 +464,7 @@ fn start_listening_then_sigterm(args: &[&str], port: u16, dir: &TempDir) -> Stri
 
     let deadline = started + EXIT_TIMEOUT;
     loop {
-        match child.try_wait().expect("try_wait frps") {
+        match try_wait_or_kill(&mut child, "frps") {
             Some(status) => {
                 assert_eq!(
                     status.code(),

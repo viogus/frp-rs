@@ -129,10 +129,27 @@ fn oracle_listener() -> (TcpListener, u16) {
     (listener, port)
 }
 
+/// `Child::try_wait`, but the error path kills **and reaps** the child before
+/// panicking, so that panic cannot orphan it. `try_wait` fails only on an OS
+/// error — an already-reaped child is not an error, std caches its status — so
+/// this is the "kill in the expect path" fix for the shape `TODO.md`'s
+/// reload-guards item lists (`frpc/tests/admin_cli.rs:135`); the timeout arm
+/// below already returns the child to a caller that kills it.
+fn try_wait_or_kill(child: &mut Child, what: &str) -> Option<std::process::ExitStatus> {
+    match child.try_wait() {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("try_wait {what} failed: {e}");
+        }
+    }
+}
+
 fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
-        match child.try_wait().expect("try_wait") {
+        match try_wait_or_kill(child, "frpc") {
             Some(status) => return Some(status),
             None if Instant::now() >= deadline => return None,
             None => std::thread::sleep(Duration::from_millis(10)),
@@ -204,7 +221,15 @@ fn expect_one_connection(args: &[&str], listener: &TcpListener) -> Child {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            Err(e) => panic!("oracle accept failed: {e}"),
+            Err(e) => {
+                // Kill and reap before panicking: this arm runs with `child`
+                // still live and is the only exit besides the timeout below, so
+                // without this the panic (the one `TODO.md`'s reload-guards item
+                // records at `frpc/tests/admin_cli.rs:207`) orphans the child.
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("oracle accept failed: {e}")
+            }
         }
     }
     let _ = child.kill();

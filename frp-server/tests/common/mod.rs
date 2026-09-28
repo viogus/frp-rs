@@ -870,6 +870,63 @@ impl Drop for CapturedFrps {
     }
 }
 
+/// A child process this test started, killed **and reaped** when the guard is
+/// dropped — including while a panic unwinds. A bare [`Child`] does neither:
+/// its own `Drop` leaves the process running, so a panicking `.expect()` on any
+/// wait *after* the spawn orphans it (`PPID 1`) holding whatever ports it had
+/// bound. `frp-server/tests/reload_integration.rs` had seven such spawn sites;
+/// this is the local, binary-agnostic form of the shape `FrpsHandle` and
+/// `CapturedFrps` already use above.
+///
+/// Construct it **immediately after `spawn()` returns and before the first
+/// wait**. An `.expect()` on the spawn itself may stay outside the guard: a
+/// failed spawn produced no child to leak. An `.expect()` on a later wait is
+/// the hazard this type exists for — bind the guard first and let it unwind.
+///
+/// What it models: a child of this process that must not outlive it.
+/// What it panics on: nothing — `Drop` cannot panic (kill/wait results are
+/// discarded), because panicking there would abort the process during
+/// unwinding, which is worse than the leak.
+/// What it does **not** cover: `Drop` never runs on `abort` (including a panic
+/// in an `extern "C"` frame, or an explicit `std::process::abort`), so that
+/// path still leaks; and it reaps only the direct child — a descendant that
+/// already daemonized into its own session is not signalled. Both leave the
+/// same `PPID 1` child behind.
+#[allow(dead_code)]
+pub struct ChildGuard {
+    child: Child,
+}
+
+impl ChildGuard {
+    /// Take ownership of an already-spawned child. The guard is in force from
+    /// this line onward, so it must be the first binding after `spawn()`.
+    #[allow(dead_code)]
+    pub fn new(child: Child) -> Self {
+        Self { child }
+    }
+
+    /// The child's pid, for signalling it (`kill -USR1`).
+    #[allow(dead_code)]
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// `SIGKILL`, then reap. Idempotent enough for an explicit call followed by
+    /// `Drop`: `kill` on a reaped pid is discarded, and `Child::wait` returns
+    /// the status it already collected.
+    #[allow(dead_code)]
+    pub fn kill_and_reap(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.kill_and_reap();
+    }
+}
+
 /// Handle to a running frps child process with dashboard.
 /// Kills and reaps the process on drop — including on the panic path inside
 /// [`FrpsHandle::start`], which is why the handle is constructed *before* the
