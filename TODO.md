@@ -683,7 +683,11 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   each name a Go-alias spelling (`tlsOnly`, `tlsCertFile`, `tlsKeyFile`, `tlsCaFile`), while
   `docs/config.md:173` in the same file states the opposite ("Exception: `tls_enable`,
   `tls_cert_file`, `tls_key_file`, `tls_ca_file` have no camelCase aliases — use the snake_case
-  names") — and the loader agrees with the Exception, not the table. Measured at `a928887` with a
+  names") — and the loader agrees with the Exception, not the table. But that Exception sentence is
+  itself incomplete and is the **third** site to reconcile: it omits `tls_only`, which also has no
+  camelCase alias (the `tlsOnly = true` row below), and it does not mention that `tls_ca_file`
+  *does* have a working alias, `tls_trusted_ca_file` (`frp-core/src/config/server.rs:48`), which the
+  corrected sentence must not erase. Measured at `a928887` with a
   throwaway probe over `frp_core::config::load_server_config_from_str` (non-strict) and
   `frp_core::config::load_server_config_uncompleted(path, true)` (strict):
   * `tlsCertFile = "/cc.crt"` + `tlsKeyFile = "/cc.key"` → ignored; both fields stay `""`.
@@ -702,10 +706,12 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `tlsServerName` (`:29`, `:207`) but lists none of the four camelCase spellings, which is why
   strict mode refuses them.
 
-  Done-when: the four rows at `docs/config.md:26-29` name only spellings a loader accepts (the
-  snake_case key where no alias exists, or the real alias where one exists), consistent with
-  `docs/config.md:173`, and a test pins the accepted/rejected spellings so the table cannot drift
-  back.
+  Done-when, covering all three sites at once: (a) the four rows at `docs/config.md:26-29` name
+  only spellings a loader accepts (the snake_case key where no alias exists, or the real alias
+  where one exists); (b) the Exception at `docs/config.md:173` gains `tls_only` and keeps
+  `tls_trusted_ca_file` as the working `tls_ca_file` alias; and (c) the accepted-spelling list in
+  `frp-core/src/config/strict.rs` (`:29`, `:207`) stays the arbiter the docs agree with — with a
+  test pinning the accepted/rejected spellings so the table cannot drift back.
 
 - [x] **`[web_server.tls] cert_file` — the nested section's own canonical spelling — is dropped silently
   in the non-strict loader, and refused in strict mode with a message naming a key the user never wrote.**
