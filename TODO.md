@@ -632,7 +632,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   wired to a server behaviour (a documented divergence from Go, which ignores it server-side) with a
   probe showing what a restart changes. A reader of the test must be able to tell which was chosen.
 
-- [ ] **`[web_server.tls] cert_file` — the nested section's own canonical spelling — is dropped silently
+- [x] **`[web_server.tls] cert_file` — the nested section's own canonical spelling — is dropped silently
   in the non-strict loader, and refused in strict mode with a message naming a key the user never wrote.**
   Measured 2026-09-28 at `e6bda94` by loading config shapes through
   `load_server_config(path, strict)` (probe kept with that round, `/tmp/sra-probe/n1/probe2.rs`, run
@@ -674,6 +674,81 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   — whereas the alternative (reject nested snake_case with an error naming `web_server.tls.cert_file`, the
   key the user actually wrote) is a smaller change but leaves the struct's canonical names unusable. Either
   way the test must fail on today's behaviour.
+
+  Done 2026-09-29 at `ccff127` (+ the fix round's follow-up commit), branch `fix/web-server-tls-nested`
+  (author round; full before/after table and the probes that produced it: `/tmp/wstls-report.md`; probes
+  kept at `/tmp/wstls-probe/` (the 13-case table, before/after) and `/tmp/wstls-f1/` (the fix round's
+  alias/per-mode matrix, base/shipped/fixed)). **Done-when chosen:** the mapping (the item's pick), and
+  the struct's documented "nested takes precedence" was made true rather than the doc corrected —
+  `or_insert` is now `insert`, so the nested value overwrites a flat key that is already set, in either
+  key order within one `[web_server]` section (both measured; see the **qualification** below). The four
+  snake_case spellings map to the same flat fields as the Go camelCase ones, and **both** spellings of a
+  destination key are removed from the nested table so the loser cannot fall through to the parent-level
+  re-insert. `enable` is a decision, not a mapping: **accepted and inert in both modes**, with a
+  `tracing::warn!` when the key is present. Nothing reads `WebServerTlsConfig::enable` (the nested table
+  is removed before serde and no `frp-server`/`frps` code reads it; `grep` finds only the struct, its
+  construction sites and the `restart_only.rs` destructure that names it as unreachable), the dashboard
+  TLS is driven by a non-empty cert/key pair, and Go refuses the key outright — its `TLSConfig`
+  (`pkg/config/v1/common.go:76-84`) carries only `certFile`/`keyFile`/`trustedCaFile`/`serverName`, so
+  `frps verify` exits 1 with `json: unknown field "enable"` (measured on the v0.71.0 binary by the
+  fix-round review), which makes frp-rs's accept-and-warn a **deliberate divergence**: without the
+  warning, `enable = true` and no pair leaves the dashboard on plaintext HTTP 200 with no diagnostic
+  (measured end-to-end by the same review). The rejected alternative (wire `enable` to the cert/key pair)
+  is pinned as harmful: `enable = false` beside a valid pair would silently disable a working dashboard
+  TLS.
+
+  **Fix round (two reviewers, both `MERGE after these fixes`).** The first attempt introduced a **base
+  regression** it left unpinned: a **parent-level** serde alias beside the nested spelling of the same
+  value (`[web_server] certFile` + `[web_server.tls] cert_file`) hard-failed in **both** modes with
+  ``duplicate field `tls_cert_file` `` (all four destinations, TOML and YAML, server and client), where
+  base loaded it under `strict = false` with the flat value — a new refused start on the reload path.
+  The hoist now also removes the parent-level **alias** spelling before its insert, so the nested value
+  wins there like everywhere else; base's *own* pre-existing duplicate of the same class
+  (`[web_server] certFile` + `[web_server.tls] certFile`, both modes) closes with it. Pinned by
+  `parent_level_alias_beside_nested_spelling_still_loads`, which fails on the frozen head (`/tmp/wstls-f1-falsify.txt`).
+  The parent-level **snake** spelling (`[web_server] cert_file`, not a field) is deliberately *not*
+  removed, so `check_strict` keeps reporting it
+  (`parent_level_snake_spelling_is_still_reported_in_strict_mode`).
+
+  **Correction — a claim in the first attempt was false.** The commit message, the report and the
+  collision test's doc comment all said that writing `cert_file` **and** `certFile` together failed on
+  the **base** tree with `duplicate field`, i.e. that it was a third, previously unrecorded base defect.
+  It was not: base non-strict returned the camelCase value (`tls_cert() == "/camel/cert.pem"`) and base
+  strict reported `unknown field "web_server.cert_file"`. The duplicate appears only in a
+  **half-implemented mapping** (removing just the winner and letting the loser fall through to the
+  re-insert) — a hazard of the implementation, not a pre-existing defect (both fix-round reviewers
+  reproduced it as a scratch variant / mutant). Corrected here, in the test's doc comment, in
+  `/tmp/wstls-report.md` §3/§8.2, and in the fix-round commit message. The honest count of the shipped
+  test set failing against base is **7 of the 8** shipped tests/assertions — the seven unit tests plus the
+  warning target's body, all compiled against `5717fa2` by `/tmp/wstls-extract-tests.py`
+  (`/tmp/wstls-falsify-final.txt`; the single pass is the residue test, which has no discriminating power
+  for this change and says so). The earlier text here said "3 of 4 new tests plus the extended client
+  test" against a four-test harness — that was written before the fix round added the two
+  `parent_level_*` tests, and `/tmp/wstls-falsify.txt` is only a 22-line tail of the original in-place
+  run (2 of the 3 tests that existed then), which is why the harness above is the citable artifact.
+
+  **Qualifications and out-of-scope findings (measured, filed below rather than folded in).** (1) The
+  precedence claim holds for both spellings **inside one `[web_server]` section**; a file that defines
+  both `[webServer]` and `[web_server]` silently discards the whole `[webServer]` table — including a
+  nested `[webServer.tls]` — via `normalize.rs`'s `or_insert` section rename, so the flat
+  `web_server.tls_*` value wins. (2) The hoist never runs for `.ini`: the INI reader stores the section
+  name verbatim, so `[webServer.tls]` becomes the literal top-level key `"webServer.tls"` and
+  `[web_server.tls]` becomes `"web_server.tls"` — non-strict drops the section, strict reports
+  `unknown field "webServer.tls"` (measured in both trees). (3) `[web_server.tls] password = "…"` still
+  lands on the real `web_server.password` field (silent, both trees).
+
+  **Tests** (all in `frp-core/src/config/tests.rs`, real files in their own temp dirs, accessor asserted,
+  both loader modes): `nested_web_server_tls_spellings_reach_the_accessor_in_both_modes`,
+  `both_spellings_of_one_nested_key_do_not_collide`,
+  `nested_web_server_tls_enable_is_accepted_and_inert_in_both_modes`,
+  `nested_web_server_tls_enable_warns_once_and_stays_inert` (captured with a `tracing_subscriber` writer),
+  `unknown_nested_web_server_tls_key_still_names_a_parent_level_path`,
+  `parent_level_alias_beside_nested_spelling_still_loads`,
+  `parent_level_snake_spelling_is_still_reported_in_strict_mode`, plus the client arm of
+  `test_go_client_web_server_tls_flatten`. Docs carried in the same change:
+  `frp-core/src/config/server.rs`, `frp-core/src/config/restart_only.rs` (two now-false comments),
+  `docs/config.md`, `CHANGELOG.md`. `scripts/compat-test.sh` is not relevant (config loading, no wire
+  byte).
 
 - [ ] **`oidc_throttle_tests` is a load-dependent flake: the mock IdP answers 404 for a valid
   request.** `cargo test -p frp-server --lib oidc` failed **3/3** `oidc_throttle_tests` under CPU
@@ -5690,3 +5765,91 @@ nothing about whether the described behaviour still holds.
   harness used, showing RSS over time for both — or the claim is dropped from the
   positioning docs. `scripts/memory-baseline.sh` already accepts
   `FRPS_BIN`/`FRPC_BIN`, so pointing it at the Go binary is the starting point.
+
+**Findings filed by the `[web_server.tls]` fix round (all pre-existing, all measured 2026-09-29 at `ccff127`).**
+- [ ] **A file that defines both `[webServer]` and `[web_server]` silently discards the whole
+  `[webServer]` table — including a nested `[webServer.tls]`.** `normalize_server_config` renames the
+  section with `table.entry("web_server").or_insert(v)` (`frp-core/src/config/normalize.rs`), an
+  all-or-nothing move: when the snake_case section already exists the camelCase one is dropped, so a
+  nested `tls` table written under `webServer` never reaches `normalize_web_server_section`. Measured
+  with `[webServer.tls] cert_file = "/nested"` + `[web_server] tls_cert_file = "/flat"` (probe
+  `/tmp/wstls-f1/src/main.rs` case `s14`): `tls_cert() == "/flat/cert.pem"` in **both** loader modes and
+  in **both** trees — the flat key wins and the nested section is gone, with no diagnostic in
+  non-strict mode. This is the one shape in which the "the nested values take precedence" claim on
+  `WebServerTlsConfig` is **false** (the claim is qualified on `normalize_web_server_section` and in
+  `docs/config.md` now, rather than fixed). It is the same class as the item above — a documented
+  precedence claim the code does not honour — so it needs the same treatment: either deep-merge
+  `[webServer]` into `[web_server]` (making the nested table reachable and the claim true) or report the
+  discarded table. **Done-when:** the chosen behaviour is pinned by a test in both loader modes, and the
+  precedence doc names the shape either way.
+- [ ] **`.ini` files cannot use the nested `[webServer.tls]` section at all: the section name is stored
+  verbatim as a top-level key.** `ini_to_toml` (`frp-core/src/config/format.rs`) inserts the bracket text
+  as the key, so `[webServer.tls]` becomes the literal top-level key `"webServer.tls"` (and
+  `[web_server.tls]` becomes `"web_server.tls"`) — never a `web_server` → `tls` table. Measured (probe
+  `/tmp/wstls-f1/src/main.rs` cases `i01`, `i02`, identical in both trees): non-strict loads with
+  `tls_cert() == ""` (the whole section dropped silently), strict reports
+  `unknown field "webServer.tls"`. The neighbouring shapes **do** work, which is what makes this a trap:
+  `[webServer] certFile = …` (a flat key in a normally-named section) loads in both modes, and the legacy
+  INI `dashboard_tls_cert_file`/`dashboard_tls_key_file` map onto the flat fields. **Done-when:** either
+  the dotted section name is expanded into nested tables before normalization (so `.ini` gets the same
+  treatment as every other format) or the limitation is stated in `docs/config.md` with a test pinning
+  the current message; a silent drop is not an option.
+- [ ] **`[web_server.tls] password = "…"` / `user = "…"` land on the real `web_server.password` /
+  `web_server.user` fields.** `normalize_web_server_section` re-inserts every unmapped nested key at the
+  parent level under its own name (`or_insert`), and `password` / `user` are real `WebServerConfig`
+  fields, so a nested section's credentials silently *become* the dashboard Basic Auth credentials
+  instead of being refused. Re-measured 2026-09-29 at `ccff127` (probe `/tmp/wstls-f1/src/main.rs` case
+  `s15`): `[web_server.tls] user = "nested-user"` + `password = "nested-secret"` loads with
+  `web_server.user == "nested-user"` / `web_server.password == "nested-secret"` — in the fixed tree and
+  in the base tree alike (`5717fa2` also does it, non-strict), so it is pre-existing, not a mapping
+  side effect. This is the mirror image of the `enable` decision above: a nested key that *is* a parent
+  field name is re-inserted rather than dropped. **Done-when:** the unmapped-key re-insert is restricted
+  to keys that are not parent fields (or the nested table is refused outright), pinned by a test
+  asserting a nested `password`/`user` does **not** change `web_server.password`/`web_server.user`.
+- [ ] **The `web_server.tls.enable` warning never reaches a `-c` user: the `-c` path loads the
+  config before logging exists.** `normalize_web_server_section` warns
+  (`frp-core/src/config/normalize.rs`) because `enable` is inert, but the warning is emitted from
+  inside the loader, and on the `-c` path the loader runs **before** `init_logging`
+  (`frps/src/main.rs:263` vs `:290`; `frpc/src/main.rs:561` vs `:583`, both carrying a comment
+  saying the ordering is deliberate Go parity). Measured on the v0.71.0 debug binaries with a config
+  whose `[web_server.tls]` sets `enable = true` (probe `/tmp/wstls-warn-probe/`, output
+  `/tmp/wstls-warn-probe/*.out`): `frps -c` → **0** occurrences of the message (also with
+  `RUST_LOG=debug`), `frpc -c` → **0**, `frps --config-dir=<dir>` → **1** (that path calls
+  `init_logging` first, `frps/src/main.rs:180`). So the honest scope, now written into
+  `docs/config.md`, `CHANGELOG.md` and the test target's doc, is "warned when the sink is installed
+  before the load (`--config-dir`)"; on the common path `enable = true` with no cert/key pair still
+  serves the dashboard as plaintext HTTP **in silence**, which is the outcome the warning exists to
+  prevent. **Done-when:** the warning survives the `-c` path — R1's sketch: add a presence flag to
+  `ConfigPresence` (already returned by `load_config_from_file` and already used for
+  `server_heartbeat_timeout_set`) and warn from `frps`/`frpc` **after** `init_logging` — with a test
+  that fails without the flag on the `-c` path (a spawn test per binary, asserting the message on
+  the captured output). Not done in the prose-only fix round: it is a behaviour change to two
+  binaries, and `docs/config.md`/`CHANGELOG.md` now state the limitation instead of overstating the
+  diagnostic.
+- [ ] **A parent-level `certFile` alias beside the parent-level canonical `tls_cert_file` is a
+  `duplicate field` error — with no nested key involved at all.** serde binds `web_server.certFile`
+  as an `alias` of `web_server.tls_cert_file`, so a file that writes both (in any spelling mix that
+  puts two of those names at the parent level) fails to deserialize in **both** loader modes with
+  ``config validation error: duplicate field `tls_cert_file` ``. Measured on all three trees
+  (`5717fa2`, `ccff127`, the fix-round head — probe `/tmp/wstls-f1/`, cases `t17`/`t18`), so it is
+  **pre-existing and not fixed by the nested-section mapping**: that fix removes the parent-level
+  alias only when a nested value supplies the field. `t16` (`certFile` + `cert_file`, no canonical)
+  is *not* this defect — `cert_file` is not a field, so it is correctly reported as
+  `unknown field "web_server.cert_file"` in strict mode and dropped non-strict. Note the one
+  message change the mapping does cause for `t18`-style files (alias + canonical + a nested table
+  with some other key): base strict reported `unknown field "web_server.key_file"` first, the fixed
+  tree reports the duplicate, because the nested spelling is now mapped instead of being unknown —
+  both refuse, the wording differs. **Done-when:** the duplicate is either closed (drop the
+  parent-level alias whenever the canonical is present, not only when a nested value is) or the
+  error names the two parent-level keys, pinned by a test in both modes.
+- [ ] **A nested empty value clears the flat value: `[web_server.tls] cert_file = ""` beside
+  `[web_server] certFile = "/p.pem"` loads with `tls_cert() == ""`.** The hoist's `insert` treats an
+  explicitly empty nested string as "the nested value wins" — consistent with the documented
+  precedence, but surprising for a field whose emptiness means *disabled*: a cert written for the
+  flat/alias spelling is silently dropped and the dashboard serves plaintext. Measured (probe
+  `/tmp/wstls-f1/`, cases `t19`/`t20`): base kept the flat value in both cases; `ccff127` and the
+  fix-round head load with `tls_cert() == ""` (`t20` — parent canonical + empty nested — already
+  behaved that way on `ccff127`). **Done-when:** the intended semantics are stated for the empty
+  string (nested wins, or an empty nested value is "unset" and falls through to the flat key) and
+  pinned by a test in both modes, with the one-clause note in `docs/config.md` either kept or
+  replaced by the implemented rule.

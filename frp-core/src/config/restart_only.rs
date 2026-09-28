@@ -280,8 +280,8 @@ fn log_restart_changes(out: &mut Vec<RestartOnlyChange>, old: &LogConfig, new: &
 /// paths serve from). The rest are read only by the dashboard block of
 /// `Service::run` — `addr`, `port`, `user`, `password`, `enable_prometheus`,
 /// `assets_dir` and the TLS cert/key pair (flat `tls_cert_file`/`tls_key_file`,
-/// nested `tls.cert_file`/`tls.key_file`, via
-/// `WebServerConfig::tls_cert`/`tls_key`) — so they carry
+/// which is where both spellings of the nested `tls.cert_file`/`tls.key_file`
+/// land, via `WebServerConfig::tls_cert`/`tls_key`) — so they carry
 /// [`ServerReader::Dashboard`] and `frp-server` omits them in a build without
 /// that feature.
 ///
@@ -294,11 +294,14 @@ fn log_restart_changes(out: &mut Vec<RestartOnlyChange>, old: &LogConfig, new: &
 /// `grep -rn 'pprof_enable' frp-server/src` finds no reader, and neither
 /// `WebServerConfig::tls_ca_file` nor `WebServerConfig::tls_server_name` is read
 /// outside the config struct), so a restart cannot make them take effect — the
-/// same disposition `[auth].useEncryption` has in `note_auth_restart_changes` —
-/// and the nested section is not even *reachable* through the loader (see the
-/// measurement in the destructure below: `normalize_web_server_section` removes
-/// the table and renames the four Go spellings onto the flat `tls_*` fields,
-/// which **are** reported). `password` is compared but never printed.
+/// same disposition `[auth].useEncryption` has in `note_auth_restart_changes`.
+/// The nested section's *fields* are likewise unreachable (see the destructure
+/// below: `normalize_web_server_section` removes the table before serde, so
+/// `WebServerTlsConfig` is default-`false`/empty in every loaded config), but
+/// its **values** are not lost — both spelling families are hoisted onto the
+/// flat `tls_cert_file` / `tls_key_file` / `tls_ca_file` / `tls_server_name`
+/// entries, and the first two of those **are** reported. `password` is compared
+/// but never printed.
 fn web_server_restart_changes(
     out: &mut Vec<RestartOnlyChange>,
     old: &WebServerConfig,
@@ -336,24 +339,26 @@ fn web_server_restart_changes(
         tls_server_name: _new_tls_server_name,
         custom_404_page: new_custom_404_page,
     } = new;
-    // **Every** field of the nested section is unreachable through the loader.
+    // **Every** field of the nested section is unreachable through the loader:
     // `normalize_web_server_section` removes the `web_server.tls` table before
-    // serde sees it and re-inserts each key at the parent level, renaming the
-    // four Go spellings onto the flat `tls_*` fields. Measured 2026-09-28 by
-    // loading four config shapes through `load_server_config`
-    // (TOML/YAML, nested snake_case/camelCase and flat; the probe is kept with
-    // the change, not in the tree):
-    //   * `[web_server.tls] certFile = "/camel/cert.pem"` (and the YAML
-    //     `webServer.tls.certFile` spelling) loads with
-    //     `web_server.tls_cert_file == "/camel/cert.pem"` and the nested struct
-    //     at its default;
-    //   * `[web_server.tls] cert_file = ...` (snake_case) loads with **both**
-    //     empty — the key becomes `web_server.cert_file`, which is not a field,
-    //     so the nested spelling is silently dropped (recorded in the change
-    //     report as an out-of-scope finding);
-    //   * the flat spelling loads normally.
+    // serde sees it, so `WebServerTlsConfig` is always `Default` in a loaded
+    // config. Its *values* are not lost — the hoist maps both spelling families
+    // onto the flat `tls_cert_file` / `tls_key_file` entries, which **are**
+    // pushed below, and drops `tls.enable` (inert; see the function's doc
+    // comment). Measured 2026-09-29 by loading each shape as a real file
+    // through `load_server_config(path, strict)` in both modes (probe kept at
+    // `/tmp/wstls-probe/src/main.rs`; the table is in
+    // `/tmp/wstls-report.md`):
+    //   * `[web_server.tls] cert_file = "/snake/cert.pem"` and
+    //     `certFile = "/camel/cert.pem"` both load with
+    //     `web_server.tls_cert_file == "<that path>"`, `tls_cert()` equal to it,
+    //     and the nested struct at its default — so either spelling reaches the
+    //     reported flat entry;
+    //   * `[web_server.tls] enable = true` loads with the nested struct still
+    //     at its default and changes nothing;
+    //   * the flat spellings load normally.
     // So no loaded `ServerConfig` can carry a non-default `WebServerTlsConfig`,
-    // and the four flat entries above cover every spelling that does reach the
+    // and the four flat entries above cover every spelling that can reach the
     // struct. They are named here — not omitted — so a new field in this section
     // is still a compile error.
     let WebServerTlsConfig {
@@ -1352,11 +1357,13 @@ mod tests {
         new.web_server.tls.server_name = "dash-nested.example.com".into();
         // …and the nested section's cert/key pair, which is additionally
         // **unreachable** through the loader (`normalize_web_server_section`
-        // removes the `web_server.tls` table and renames the Go spellings onto
-        // the flat fields): a difference here cannot come from a config file, and
-        // the flat `tls_cert_file` / `tls_key_file` entries are what a reload
-        // reports for `[web_server.tls] certFile` / `cert_file`. Measured in the
-        // change report §8 (four config shapes, nested and flat).
+        // removes the `web_server.tls` table before serde, so no loaded config
+        // carries a non-default `WebServerTlsConfig` — its values are hoisted
+        // onto the flat fields instead): a difference here cannot come from a
+        // config file, and the flat `tls_cert_file` / `tls_key_file` entries are
+        // what a reload reports for `[web_server.tls] certFile` / `cert_file`
+        // alike. Measured in the change report §the before/after table (both
+        // spellings, both loader modes, both table orders).
         new.web_server.tls.cert_file = "/tmp/nested-cert.pem".into();
         new.web_server.tls.key_file = "/tmp/nested-key.pem".into();
         assert!(
