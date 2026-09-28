@@ -842,6 +842,22 @@ User-facing release notes for frp-rs.
   turn argv Go accepts into an frp-rs argv error.
 
 ### Docs
+- **`docs/config.md` no longer advertises four camelCase server TLS aliases that
+  no loader accepts.** The `tls_only`, `tls_cert_file`, `tls_key_file` and
+  `tls_ca_file` rows named `tlsOnly`, `tlsCertFile`, `tlsKeyFile` and
+  `tlsCaFile` in their "Go frp Equivalent" column, but every one of the four is
+  silently ignored by the non-strict loader (the SIGUSR1 reload path) and
+  **refused** in strict mode (`unknown field "tlsOnly" … — did you mean
+  'tls_only'?`) — and flat camelCase is not a Go server spelling either: Go
+  v0.71.0 carries these fields under the nested `[transport.tls]` section. The
+  rows now name `transport.tls.force` / `certFile` / `keyFile` /
+  `trustedCaFile` (the keys frp-rs maps at load), the Exception sentence under
+  the alias list now names `tls_only` alongside the three fields it already
+  covered, and it keeps the two flat aliases that **do** work —
+  `tls_trusted_ca_file` (→ `tls_ca_file`) and `tlsServerName` (→
+  `tls_server_name`). A new test pins all four spellings as rejected in both
+  loader modes, both real aliases as accepted in both, and the
+  `known_server_keys()` list the docs must agree with.
 - **The space-separated `--strict-config <bool>` form is documented as an
   frp-rs extension.** It is now stated in the `--strict-config` help of every
   parser that takes the flag (both entries are pinned separately by a test), so
