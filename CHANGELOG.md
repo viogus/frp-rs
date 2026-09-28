@@ -842,6 +842,22 @@ User-facing release notes for frp-rs.
   turn argv Go accepts into an frp-rs argv error.
 
 ### Docs
+- **`docs/config.md` no longer advertises four camelCase client TLS aliases that
+  no loader accepts.** The four client rows named `tlsEnable`, `tlsCertFile`,
+  `tlsKeyFile` and `tlsCaFile` / `tlsTrustedCaFile` in their "Go frp Equivalent"
+  column — the same defect the server rows above had, in the other half of the
+  table. Every one of the five is silently ignored by the non-strict loader (the
+  SIGUSR1 reload path) and **refused** in strict mode (`unknown field "tlsEnable"
+  … — did you mean 'tls_enable'?`) — and flat camelCase is not a Go client
+  spelling either: Go v0.71.0 carries these fields under the nested
+  `[transport.tls]` section. The rows now name `transport.tls.enable` /
+  `certFile` / `keyFile` / `trustedCaFile` (the keys frp-rs maps at load), and
+  the client flatten block gains the same Exception sentence the server block
+  has, keeping the two flat aliases that **do** work — `tlsServerName` (→
+  `tls_server_name`) and `disableCustomTLSFirstByte` (→
+  `disable_custom_tls_first_byte`). A new test pins all five spellings as
+  rejected in both loader modes, the nested spellings and both real aliases as
+  accepted in both, and the `known_client_keys()` list the docs must agree with.
 - **`docs/config.md` no longer advertises four camelCase server TLS aliases that
   no loader accepts.** The `tls_only`, `tls_cert_file`, `tls_key_file` and
   `tls_ca_file` rows named `tlsOnly`, `tlsCertFile`, `tlsKeyFile` and
