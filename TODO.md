@@ -341,7 +341,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   token and unchanged OIDC fields is reported as **`config reloaded: no changes detected`** while the
   file now says `oidc`. It is filed as its own item immediately below, and it is **outside this
   item's scope** (this item is the client's admin reload).
-- [ ] **The server's SIGUSR1 reload compares neither `auth.method` nor the running verifier, so a
+- [x] **The server's SIGUSR1 reload compares neither `auth.method` nor the running verifier, so a
   method change can be reported as `no changes detected` or leave `auth_cfg` on `oidc` with no
   verifier.**
   Measured 2026-09-28 on this tree with the `frps` built from this worktree — own config and free
@@ -354,7 +354,9 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
     auth, and nothing in the reload output mentions auth.
   * **Shape B — swapped without a verifier.** The same, with the token changed too →
     `SIGUSR1: auth token updated`. `reload()` then assigns the whole new `AuthConfig`
-    (`frp-server/src/service.rs:2057-2061`), so the live `auth_cfg.method` becomes `Oidc`, while
+    (`frp-server/src/service.rs:2068-2072`; the item first cited `:2057-2061`, which is the
+    `allow_ports` arm — corrected when this item was closed), so the live `auth_cfg.method`
+    becomes `Oidc`, while
     `state.oidc.verifier` is built **once** at startup (`frp-server/src/service.rs:215`, `if
     auth_cfg.method == AuthMethod::Oidc`) and is still `None`. The login dispatch keys off the
     **verifier's presence**, not the method (`frp-server/src/control/login.rs:299`, `else if let
@@ -372,7 +374,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
     an **invalid** spelling is refused by the loader before any of this (closed by the `auth.method`
     item above), and an OIDC config that fails `check_startup` is refused with its message
     (`oidc_audience is empty` → `SIGUSR1 reload: security misconfiguration: …`, old config kept).
-  **What is missing is a comparison of the method itself:** the token arm (`:2057-2061`) compares
+  **What is missing is a comparison of the method itself:** the token arm (`:2068-2072`) compares
   `token`, the OIDC arm (`:2132-2142`) compares the OIDC fields, and neither reads `method`.
   **Done-when:** a `method` difference is either applied (rebuild/swap the verifier) or reported the
   way the OIDC fields already are — e.g. a `note_restart_change`-shaped arm on
@@ -381,6 +383,102 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `auth_cfg.method == Oidc` without a verifier), and either the login dispatch is keyed off the
   method instead of `Option<verifier>` or that invariant is stated and pinned. Pre-existing; **not**
   fixed by the client-side change that closed the item above.
+  Done: fixed on `fix/server-reload-auth` (fix commit `360948e`; this ledger commit follows it on
+  the branch). **Decision: report, not an in-place verifier swap.** The client half's reason for
+  refusing ("the auth state is not behind a lock and the bridge key is copied by value") does
+  **not** hold for the server's *credential*: `state.reloadable` is a `std::sync::RwLock` and the
+  reload already swaps `auth_cfg` + the derived `encryption_key` through it. It **does** hold for
+  the *verifier*: `state.oidc.verifier` is a plain `Option<Arc<OidcVerifier>>`
+  (`frp-server/src/state.rs:649-653`), built by an async JWKS fetch, owning a background refresh
+  task started at construction, and read by three sites with no lock to coordinate through
+  (`frp-server/src/control/login.rs`, `frp-server/src/handlers/dispatch.rs`,
+  `frp-server/src/control/proxy.rs`) — so swapping it on the signal path would add a
+  fetch-failure mode to a path whose contract is "re-read the file", for a setting `docs/config.md`
+  already documents as restart-required. The reload now applies exactly `auth.token` /
+  `auth.tokenSource` / `auth.additionalAuthScopes` and reports every other `[auth]` difference as
+  restart-required (`auth.method: token -> oidc (restart required)`, the existing
+  `OIDC settings changed (restart required)` for the OIDC group, plus
+  `auth.authenticationTimeout` / `auth.tokenAuthTimeout` / `auth.useEncryption`). The `AuthConfig`
+  it puts live is the **running** one with only those three fields replaced — never the parsed
+  struct, which is what made Shape B — so `auth_cfg.method` is the method the startup verifier was
+  built for for the process's lifetime and `method == Oidc` ⟺ `verifier.is_some()`; that invariant
+  is why the login dispatch is **not** changed and keeps keying off `Option<verifier>` (stated with
+  its mechanism and its failure mode at `frp-server/src/control/login.rs:297-323`).
+  Pins: `frp-server/tests/server_reload_auth.rs`, 6 tests (own config file in a `TempDir`, own free
+  port and in-process `Service` each; live state read through `Service::state()`; real V1 token
+  logins through `common::raw_login`) — Shape A (summary is not `no changes detected` and carries
+  the method line; live method/token/verifier unchanged; T1 still logs in), Shape B (live
+  `method == Token` **with the new token applied**, verifier still `None`, T2 logs in and T1 does
+  not), a positive control (a matching file is still `no changes detected`, including
+  `method = ""` vs `method = "token"`; a credential-only change still applies with no
+  `restart required`), the widened field list (`oidcSkipNbf` → `OIDC settings changed (restart
+  required)`; `authenticationTimeout: 90 -> 7 (restart required)`), a `tokenSource` swap observed
+  through the live source (both files start on `T1`, so only the live `token_source` — re-resolved
+  per login — decides which token is accepted after file A is rewritten), and the dispatch's
+  fail-closed answer (hand-written `method == Oidc` + no verifier → a token login is refused with
+  `OIDC auth requires server-side verifier (not configured)`). Falsified against a pristine
+  `0829774` tree (`git archive`) with the identical test file: **4 fail / 2 pass**; head 6/6.
+  Probe: `/tmp/sra-probe/probe.sh` with a real `frps` per side (base built from the same pristine
+  tree) and a real `frpc` — own config, own temp dir, own free port per case (54904/54907/54988/
+  54991; `lsof` checked first, `ControlCe` holds 7000 on this host and the script never reuses it),
+  `SIGUSR1` by pid, stdout/stderr to separate files, bounded settle, every child reaped with `wait`,
+  exit status read directly, strays by `pgrep -x` only — base A `config reloaded: no changes
+  detected`; base B `auth token updated` with a T2 login **refused** (`OIDC auth requires
+  server-side verifier (not configured)`) and the `SIGUSR1:` line on **stdout** (0 B stderr); head A
+  `auth.method: token -> oidc (restart required)`; head B
+  `auth token updated; auth.method: token -> oidc (restart required)` with T2 accepted and T1
+  refused (`token in login doesn't match token from configuration`). Full base/head table and the
+  least-sure section: `/tmp/server-reload-auth-report.md`.
+  **Citations corrected** (re-derived from `git show 0829774:frp-server/src/service.rs`; two
+  independent reviewers had measured it): the token arm is **`:2068-2072`**, and `:2070`
+  (`r.auth_cfg = Arc::new(new_auth_cfg)`) is the line that caused Shape B; the original
+  `:2057-2061` is the `allow_ports` arm (`:2061` is `if *r.allow_ports != new_allow_ports`). `:215`,
+  `control/login.rs:299` and `:2132-2142` check out as written. Both occurrences in this item's text
+  are corrected above.
+  The field list is compiler-enforced: `note_auth_restart_changes` destructures
+  `AuthServerConfig` twice with **no `..`**, so a new `[auth]` field is an E0027 compile error —
+  measured by adding a probe field to the struct + its `Default` (`cargo check -p frp-server`
+  reported it twice, once per destructure) and reverted.
+  Carriers: `frp-server/src/service.rs` (`reload()`'s apply block + `note_auth_restart_changes`),
+  `frp-server/src/control/login.rs` (the invariant comment), `docs/config.md` § Server Config
+  Reload, `README.md` § Server config reload (SIGUSR1), `docs/deployment.md` (systemd SIGUSR1
+  comment), `CHANGELOG.md`.
+  Gates: `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets --all-features
+  -- -D warnings` clean; `cargo test -p frp-core --lib` 966/0; `cargo test -p frp-server` rc 0;
+  `cargo test -p frps` rc 0 (`cli_exit_codes` still lists 29); `cargo test -p frpc` rc 0; the tiny
+  lane (`cargo test -p frpc --no-default-features --features tiny --test cli_exit_codes`) 13/0 and
+  `RUSTFLAGS="-D warnings" cargo check --workspace --no-default-features --features tiny` rc 0;
+  `bash scripts/repo-health.sh` rc 0; `bash scripts/compat-test.sh` **86 passed / 0 failed** vs Go
+  frp v0.71.0 (full run, not a subset — the change is not on a wire path, it is run because the
+  surface is the server's auth/reload). That run reproduced the *filed* child leak exactly —
+  `pgrep -x frps` 33, `pgrep -x frpc` 50, all Go binaries under `/tmp/frp-compat-test/` with
+  `PPID 1` (the item below records the same 33/50) — all 83 reaped by explicit pid, `pgrep -x` 0
+  afterwards.
+  Not covered, stated rather than implied: the OIDC branch itself (needs a live issuer), and no
+  `apply` implementation was ever built — the rejection of `apply` is a code-reading argument, and
+  `auth.tokenSource` is compared by `Debug` shape (`ValueSource` has no `PartialEq`), which can
+  over-report but not under-report. Both are recorded in the report's least-sure section.
+- [ ] **Every restart-only setting outside `[auth]` is still silently ignored by the SIGUSR1
+  reload.** Measured 2026-09-28 on head `360948e` (`fix/server-reload-auth`) — own config, own free
+  port (60981, 60982; never 7000), `SIGUSR1` by pid, stdout and stderr to **separate** files,
+  bounded settle, every child reaped with `wait`, strays by `pgrep -x` only; script
+  `/tmp/sra-probe/probe-non-auth.sh`, run twice with identical results:
+  * running `transport.heartbeat_timeout = 30` with `max_ports_per_client = 0`, rewritten to `60`
+    and `7` + `kill -USR1` → `SIGUSR1: config reloaded: no changes detected` on **stdout**
+    (1702 B stdout / 0 B stderr both runs). Neither value is applied, and nothing in the summary
+    names either field.
+  `reload()` compares only `allow_ports`, `[auth]`, `bind_port`, `bind_addr`, `tls_enable` and the
+  TLS file paths (`frp-server/src/service.rs`), so this is the same class as the item above,
+  outside `[auth]`: `transport.*`, `udp_packet_size`, `vhost_http_timeout`, `user_conn_timeout`,
+  `web_server.*`, `http_plugins`, `max_ports_per_client` / `max_conns_per_proxy` /
+  `max_proxies_per_client`, `[log]` and the rest take effect only on restart, and a reload that
+  changes only those reads as a no-op. (The `[auth]` half of the class is closed above; the
+  non-`[auth]` half is the part that would need a `ServerConfig`-shaped `note_restart_change`
+  list.) **Done-when:** a reload that changes a restart-only setting outside `[auth]` names it in
+  the summary — with a compiler-enforced field list, the way `note_auth_restart_changes` does for
+  `[auth]` — pinned by a probe per field group; `[log]` (read once in `init_logging`, before the
+  reload path exists) must be reported rather than silently ignored.
+
 - [ ] **`oidc_throttle_tests` is a load-dependent flake: the mock IdP answers 404 for a valid
   request.** `cargo test -p frp-server --lib oidc` failed **3/3** `oidc_throttle_tests` under CPU
   load with `OIDC: openid-configuration returned 404 Not Found`, while a serial run passes 6/6 and
