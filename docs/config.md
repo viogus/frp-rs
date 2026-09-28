@@ -180,12 +180,15 @@ Send `SIGUSR1` to the frps process to hot-reload these settings from the config 
 |---------|--------|
 | `auth.token` / `auth.tokenSource` | Updates the live credential and the bridge encryption key derived from it; new logins use it. Existing connections are unaffected. |
 | `auth.additionalAuthScopes` | Changes which message types require authentication (`HeartBeats`, `NewWorkConns`). |
+| `auth.authenticationTimeout` / `auth.tokenAuthTimeout` | Changes the login timestamp window and the replay-table prune (read from the live auth config on every login). |
 | `allow_ports` / `allow_port_start` / `allow_port_end` | Adjusts port allocation range. Already-allocated ports are not released. |
 | TLS certificate/key/CA file paths | Rebuilds the TLS acceptor and swaps it atomically. Existing connections keep the old config; new connections pick up the new cert immediately. (A background task also re-stats the cert/key files every 60s, so in-place rotation — e.g. certbot — is picked up even without a reload.) |
 
-Settings that require a full restart: `bind_port`, `bind_addr`, `tls_enable`, **every other `[auth]` field** — `auth.method`, the OIDC settings (`oidc_issuer`, `oidc_audience`, the skips, `oidcAdditionalAudience`, `oidcTLSTrustedCAFile`, `oidcProxyURL`, `oidcTokenEndpointURL`), `auth.authenticationTimeout`, `auth.tokenAuthTimeout`, `auth.useEncryption` — transport settings, and the per-client/proxy registration caps `max_ports_per_client`, `max_conns_per_proxy`, `max_proxies_per_client` (they gate live registrations via semaphores/maps, so a reload cannot retroactively rescale them).
+Settings that require a full restart: `bind_port`, `bind_addr`, `tls_enable`, `auth.method`, the OIDC settings (`oidc_issuer`, `oidc_audience`, the skips, `oidcAdditionalAudience`, `oidcTLSTrustedCAFile`, `oidcProxyURL`, `oidcTokenEndpointURL` — the OIDC verifier is built once at startup), transport settings, and the per-client/proxy registration caps `max_ports_per_client`, `max_conns_per_proxy`, `max_proxies_per_client` (they gate live registrations via semaphores/maps, so a reload cannot retroactively rescale them).
 
-A changed `[auth]` field is never silently dropped: the reload **reports** each one in its summary (`auth.method: token -> oidc (restart required)`, `OIDC settings changed (restart required)`, …) and leaves the running auth untouched. A file that matches the running config still reports `config reloaded: no changes detected`. (The non-`[auth]` restart-only settings above are **not** all echoed this way — `bind_port`, `bind_addr`, `tls_enable` and the TLS file paths are; the registration caps are not compared at all.)
+`auth.useEncryption` is a special case: the server parses it (Go's own server auth struct has no such field) but **never reads it**, so a change to it neither takes effect nor needs a restart, and the reload does not mention it.
+
+A changed `[auth]` field is never silently dropped: the reload **reports** each restart-only one in its summary (`auth.method: token -> oidc (restart required)`, `OIDC settings changed (restart required)`, …) and leaves the running auth untouched, or **applies** it in place and names it (`auth.authenticationTimeout: 90 -> 7`). A file that matches the running config still reports `config reloaded: no changes detected`. (The non-`[auth]` restart-only settings above are **not** all echoed this way — `bind_port`, `bind_addr`, `tls_enable` and the TLS file paths are; the registration caps are not compared at all.)
 
 ### Server TOML Example
 

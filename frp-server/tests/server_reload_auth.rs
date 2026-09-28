@@ -165,6 +165,18 @@ impl Server {
             .clone()
     }
 
+    /// The auth timestamp window the server is validating logins with — read
+    /// from the live config on every login, not cached at startup.
+    fn authentication_timeout(&self) -> i64 {
+        self.svc
+            .state()
+            .reloadable
+            .read()
+            .expect("reloadable lock")
+            .auth_cfg
+            .authentication_timeout
+    }
+
     /// Whether an OIDC verifier exists in the running state. Built once, in
     /// `Service::with_unsafe_features`, and never rebuilt by a reload.
     fn verifier_present(&self) -> bool {
@@ -344,14 +356,25 @@ async fn unchanged_file_stays_quiet_and_a_credential_change_still_applies() {
     assert_eq!(spelled_out, "config reloaded: no changes detected");
 }
 
-/// `[auth]` fields the pre-fix reload never compared at all are reported now
-/// instead of vanishing into `no changes detected`, and still not applied.
+/// `[auth]` fields the pre-fix reload never compared at all are now handled
+/// according to what the server actually does with them: the verifier input is
+/// **reported** restart-required, the live-read timeout is **applied**, and the
+/// one field nothing reads is deliberately silent.
 ///
-/// `oidc_skip_nbf` is one of the fields the startup verifier is built from (it
-/// was missing from the pre-fix OR-chain), and `authenticationTimeout` was
-/// missing from the comparison entirely.
+/// * `oidc_skip_nbf` is one of the fields the startup verifier is built from (it
+///   was missing from the pre-fix OR-chain), so it can only be reported.
+/// * `authenticationTimeout` was missing from the comparison entirely, but every
+///   reader takes it from the live `auth_cfg` (`frp-server/src/control/login.rs`,
+///   `frp-server/src/handlers/dispatch.rs`,
+///   `frp-server/src/control/nathole.rs`), so it is applied in place — refusing
+///   it as restart-required would be false.
+/// * `use_encryption` is the one `[auth]` field the server never reads (Go's
+///   `AuthServerConfig` has no such field), so neither applying nor restarting
+///   changes anything, and a reload must not claim a restart would.
+///
+/// Pre-fix, the whole rewrite below was `config reloaded: no changes detected`.
 #[tokio::test]
-async fn auth_fields_the_pre_fix_reload_never_compared_are_reported() {
+async fn auth_fields_the_pre_fix_reload_never_compared_are_reported_or_applied() {
     let port = allocate_port();
     let server = Server::start(&probe_config(port, "token", T1, "")).await;
 
@@ -365,13 +388,18 @@ async fn auth_fields_the_pre_fix_reload_never_compared_are_reported() {
         .await
         .expect("reload");
 
-    assert!(
-        summary.contains("OIDC settings changed (restart required)"),
-        "oidc_skip_nbf is a verifier input and must be reported: {summary}"
+    // Exact summary: one applied line, one restart-required line, in that order
+    // (the apply block runs before `note_auth_restart_changes`). The default
+    // window is 90 (`frp-core/src/config/server.rs`, `default_authentication_timeout`).
+    assert_eq!(
+        summary, "auth.authenticationTimeout: 90 -> 7; OIDC settings changed (restart required)",
+        "the timeout is applied, the verifier input is reported"
     );
-    assert!(
-        summary.contains("auth.authenticationTimeout: 90 -> 7 (restart required)"),
-        "the pre-fix comparison never read this field at all: {summary}"
+    assert_eq!(
+        server.authentication_timeout(),
+        7,
+        "the live auth config must serve the new window — that is what makes \
+         'applied' true rather than a claim"
     );
     assert_eq!(
         server.method(),
@@ -379,6 +407,24 @@ async fn auth_fields_the_pre_fix_reload_never_compared_are_reported() {
         "reporting a restart-required field must not change the running auth"
     );
     assert_eq!(server.token(), T1);
+
+    // `use_encryption` alone, with everything else back at the running values:
+    // the deliberate silent case. Nothing on the server reads the field, so
+    // there is no value for a reload to apply and no restart that would help.
+    let inert = server
+        .rewrite_and_reload(&probe_config(
+            port,
+            "token",
+            T1,
+            "authentication_timeout = 7\nuse_encryption = true\n",
+        ))
+        .await
+        .expect("reload");
+    assert_eq!(
+        inert, "config reloaded: no changes detected",
+        "auth.useEncryption is parsed but never read by the server; a reload \
+         must neither apply it nor claim a restart would"
+    );
 }
 
 // ---------------------------------------------------------------

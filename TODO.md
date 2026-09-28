@@ -383,23 +383,34 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `auth_cfg.method == Oidc` without a verifier), and either the login dispatch is keyed off the
   method instead of `Option<verifier>` or that invariant is stated and pinned. Pre-existing; **not**
   fixed by the client-side change that closed the item above.
-  Done: fixed on `fix/server-reload-auth` (fix commit `360948e`; this ledger commit follows it on
-  the branch). **Decision: report, not an in-place verifier swap.** The client half's reason for
-  refusing ("the auth state is not behind a lock and the bridge key is copied by value") does
+  Done: fixed on `fix/server-reload-auth` (fix commit `360948e`, ledger commit `4d9b251`, fix-round
+  commit after them on the branch). **Decision: report, not an in-place verifier swap.** The client
+  half's reason for refusing ("the auth state is not behind a lock and the bridge key is copied by
+  value") does
   **not** hold for the server's *credential*: `state.reloadable` is a `std::sync::RwLock` and the
   reload already swaps `auth_cfg` + the derived `encryption_key` through it. It **does** hold for
   the *verifier*: `state.oidc.verifier` is a plain `Option<Arc<OidcVerifier>>`
-  (`frp-server/src/state.rs:649-653`), built by an async JWKS fetch, owning a background refresh
-  task started at construction, and read by three sites with no lock to coordinate through
-  (`frp-server/src/control/login.rs`, `frp-server/src/handlers/dispatch.rs`,
-  `frp-server/src/control/proxy.rs`) — so swapping it on the signal path would add a
-  fetch-failure mode to a path whose contract is "re-read the file", for a setting `docs/config.md`
-  already documents as restart-required. The reload now applies exactly `auth.token` /
-  `auth.tokenSource` / `auth.additionalAuthScopes` and reports every other `[auth]` difference as
+  (`frp-server/src/state.rs:649-653`) — not behind a lock, and not data the signal path can
+  re-derive without a network round trip (it is built by an async JWKS fetch) — and it is read
+  locklessly by four sites (`frp-server/src/control/login.rs`, `frp-server/src/handlers/dispatch.rs`,
+  `frp-server/src/control/proxy.rs`, and the shutdown path's `stop_background_refresh()` at
+  `frp-server/src/service.rs`), so swapping it on the signal path would add a fetch-failure mode to
+  a path whose contract is "re-read the file", for a setting `docs/config.md`
+  already documents as restart-required. The reload now applies the fields it can re-key in place —
+  `auth.token` / `auth.tokenSource`, `auth.additionalAuthScopes`, and
+  `auth.authenticationTimeout` / `auth.tokenAuthTimeout` (both read from the live `auth_cfg` on
+  every use: `frp-server/src/control/login.rs:486-527`,
+  `frp-server/src/handlers/dispatch.rs:68`/`:552`,
+  `frp-server/src/control/nathole.rs:380`/`:575`) — and reports the rest as
   restart-required (`auth.method: token -> oidc (restart required)`, the existing
-  `OIDC settings changed (restart required)` for the OIDC group, plus
-  `auth.authenticationTimeout` / `auth.tokenAuthTimeout` / `auth.useEncryption`). The `AuthConfig`
-  it puts live is the **running** one with only those three fields replaced — never the parsed
+  `OIDC settings changed (restart required)` for the OIDC group).
+  `auth.useEncryption` is the one `[auth]` field that is **neither applied nor reported**: nothing
+  on the server reads `AuthConfig::use_encryption` (its only writer is `build_auth_config`; every
+  other `use_encryption` in the crate is a different field), and Go's `AuthServerConfig` has no
+  such field (`pkg/config/v1/server.go:129-135`; `UseEncryption` is `proxy.go:32` /
+  `visitor.go:25`) — so a restart cannot make a change to it take effect either, and saying
+  "restart required" would be false. The `AuthConfig`
+  it puts live is the **running** one with only those five fields replaced — never the parsed
   struct, which is what made Shape B — so `auth_cfg.method` is the method the startup verifier was
   built for for the process's lifetime and `method == Oidc` ⟺ `verifier.is_some()`; that invariant
   is why the login dispatch is **not** changed and keeps keying off `Option<verifier>` (stated with
@@ -412,7 +423,10 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   not), a positive control (a matching file is still `no changes detected`, including
   `method = ""` vs `method = "token"`; a credential-only change still applies with no
   `restart required`), the widened field list (`oidcSkipNbf` → `OIDC settings changed (restart
-  required)`; `authenticationTimeout: 90 -> 7 (restart required)`), a `tokenSource` swap observed
+  required)`; `authenticationTimeout` **applied**, exact summary
+  `auth.authenticationTimeout: 90 -> 7; OIDC settings changed (restart required)` with the live
+  window asserted to be 7; and `use_encryption = true` alone → `no changes detected`, the
+  deliberate silent case), a `tokenSource` swap observed
   through the live source (both files start on `T1`, so only the live `token_source` — re-resolved
   per login — decides which token is accepted after file A is rewritten), and the dispatch's
   fail-closed answer (hand-written `method == Oidc` + no verifier → a token login is refused with
@@ -427,7 +441,11 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   server-side verifier (not configured)`) and the `SIGUSR1:` line on **stdout** (0 B stderr); head A
   `auth.method: token -> oidc (restart required)`; head B
   `auth token updated; auth.method: token -> oidc (restart required)` with T2 accepted and T1
-  refused (`token in login doesn't match token from configuration`). Full base/head table and the
+  refused (`token in login doesn't match token from configuration`). **Base B is worse than "the
+  config disagrees": the lockout is total** — the login with the *previously working* token is
+  refused with the same `OIDC auth requires server-side verifier (not configured)`, because the
+  token path rejects every attempt once the live method says `oidc`, so that one reload takes the
+  whole client fleet offline until the process is restarted. Full base/head table and the
   least-sure section: `/tmp/server-reload-auth-report.md`.
   **Citations corrected** (re-derived from `git show 0829774:frp-server/src/service.rs`; two
   independent reviewers had measured it): the token arm is **`:2068-2072`**, and `:2070`
@@ -443,29 +461,44 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `frp-server/src/control/login.rs` (the invariant comment), `docs/config.md` § Server Config
   Reload, `README.md` § Server config reload (SIGUSR1), `docs/deployment.md` (systemd SIGUSR1
   comment), `CHANGELOG.md`.
-  Gates: `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets --all-features
-  -- -D warnings` clean; `cargo test -p frp-core --lib` 966/0; `cargo test -p frp-server` rc 0;
+  Gates (all re-run on the fix-round tree, the commit after `4d9b251`):
+  `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets --all-features
+  -- -D warnings` clean; `cargo test -p frp-core --lib` 966/0; `cargo test -p frp-server` rc 0
+  (41 `ok` lanes, `server_reload_auth` 6/0, `reload_integration` guard ran);
   `cargo test -p frps` rc 0 (`cli_exit_codes` still lists 29); `cargo test -p frpc` rc 0; the tiny
   lane (`cargo test -p frpc --no-default-features --features tiny --test cli_exit_codes`) 13/0 and
   `RUSTFLAGS="-D warnings" cargo check --workspace --no-default-features --features tiny` rc 0;
   `bash scripts/repo-health.sh` rc 0; `bash scripts/compat-test.sh` **86 passed / 0 failed** vs Go
   frp v0.71.0 (full run, not a subset — the change is not on a wire path, it is run because the
-  surface is the server's auth/reload). That run reproduced the *filed* child leak exactly —
-  `pgrep -x frps` 33, `pgrep -x frpc` 50, all Go binaries under `/tmp/frp-compat-test/` with
-  `PPID 1` (the item below records the same 33/50) — all 83 reaped by explicit pid, `pgrep -x` 0
-  afterwards.
+  surface is the server's auth/reload; log `/tmp/sra-compat2.log`). That compat run is a **re-run**:
+  the coordinating agent interrupted a live run at ~14:18 and a second independent full run on the
+  frozen `4d9b251` binaries (another agent's, `/tmp/r2/compat-final.log`) finished only afterwards,
+  so no run from that window is cited. The leak reproduced a third time — `pgrep -x frps` 33,
+  `pgrep -x frpc` 50, all Go binaries under `/tmp/frp-compat-test/` with `PPID 1` (the item below
+  records the same 33/50) — all 83 reaped by explicit pid, and the **84** orphans (34 + 50) left by
+  the other agent's finished run were reaped the same way before this run started (their
+  `compat-test.sh` had exited and their `TEST_DIR` was gone, so they were holding listeners for
+  nothing). Both sweeps matched on the command line **and** `PPID == 1` **and** the absence of a
+  live `compat-test.sh` — never by name alone; `pgrep -x` is 0 afterwards. The base-side
+  falsification was re-run on the fix-round test file: **4 failed / 2 passed** on a pristine
+  `0829774` tree, head 6/6.
   Not covered, stated rather than implied: the OIDC branch itself (needs a live issuer), and no
   `apply` implementation was ever built — the rejection of `apply` is a code-reading argument, and
   `auth.tokenSource` is compared by `Debug` shape (`ValueSource` has no `PartialEq`), which can
   over-report but not under-report. Both are recorded in the report's least-sure section.
 - [ ] **Every restart-only setting outside `[auth]` is still silently ignored by the SIGUSR1
-  reload.** Measured 2026-09-28 on head `360948e` (`fix/server-reload-auth`) — own config, own free
-  port (60981, 60982; never 7000), `SIGUSR1` by pid, stdout and stderr to **separate** files,
+  reload.** Measured 2026-09-28 on this branch's fix-round head (the commit after `4d9b251`,
+  `frps` built from that working tree; first measured at `360948e`) — own config, own free
+  port (60981, 60982 in the first measurement; 49388 in the re-measurement; never 7000), `SIGUSR1`
+  by pid, stdout and stderr to **separate** files,
   bounded settle, every child reaped with `wait`, strays by `pgrep -x` only; script
   `/tmp/sra-probe/probe-non-auth.sh`, run twice with identical results:
   * running `transport.heartbeat_timeout = 30` with `max_ports_per_client = 0`, rewritten to `60`
     and `7` + `kill -USR1` → `SIGUSR1: config reloaded: no changes detected` on **stdout**
-    (1702 B stdout / 0 B stderr both runs). Neither value is applied, and nothing in the summary
+    (**1702 B** stdout / **0 B** stderr at the moment the summary is read; the archived
+    `/tmp/sra-probe/non-auth/frps.out` is **2638 B** because the SIGTERM drain logs after that
+    read, `/tmp/sra-probe/non-auth/frps.err` 0 B — the probe prints both counts and both runs
+    agreed byte-for-byte). Neither value is applied, and nothing in the summary
     names either field.
   `reload()` compares only `allow_ports`, `[auth]`, `bind_port`, `bind_addr`, `tls_enable` and the
   TLS file paths (`frp-server/src/service.rs`), so this is the same class as the item above,
