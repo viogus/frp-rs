@@ -1060,6 +1060,40 @@ jobs:
         run: cargo check -p frp-core --no-default-features --all-targets
         env:
           RUSTFLAGS: "-D warnings"
+      - name: Lint frp-core tier test targets (isolated, no features)
+        # The clippy half of the step directly above. `-D warnings` is per
+        # *feature configuration*, and this is the configuration no other lane
+        # lints: the workspace lane's `Clippy` step (job `Lint (fmt + clippy)`,
+        # `cargo clippy --workspace --all-targets --all-features`) compiles
+        # every `cfg(not(feature = …))` item *out*, and the two isolated clippy
+        # commands in `Lint frp-server dashboard and frp-client oidc-off test
+        # targets (isolated)` are `-p frp-server`/`-p frp-client`. The step above
+        # runs `check`, i.e. rustc lints only — which cannot see a `clippy::*`
+        # lint at all. Measured before this step existed, at `005ddd8`:
+        #   RUSTFLAGS="-D warnings" cargo clippy -p frp-core \
+        #     --no-default-features --all-targets
+        # exited 101 with exactly two clippy lints inside `cfg(not(…))` code:
+        # `clippy::new_without_default` on `SnappyCompressor::new`
+        # (frp-core/src/encryption.rs, `#[cfg(not(feature = "compression"))]`)
+        # and `clippy::needless_return` on the TCP arm's tls-off refusal
+        # (frp-core/src/transport/mod.rs, `#[cfg(not(feature = "tls"))]`). Both
+        # were closed by fixing the code; this step is what keeps them closed.
+        #
+        # `clippy` runs rustc under it, so the rustc-lint coverage the step above
+        # documents (E0425/E0432, unused_imports, dead_code, unused_mut) is a
+        # strict subset of what this step reports; the `check` step is kept
+        # because two files cite its name (`frp-core/src/config/restart_only.rs`,
+        # `TODO.md`).
+        #
+        # NOT covered: every other `-p frp-core` feature combination. One other
+        # measured-red configuration exists — `--features websocket` (tls off)
+        # was red on the WSS arm's `needless_return` at `005ddd8` and is fixed in
+        # the same change — but neither it nor `--features kcp` nor any other
+        # combination is gated here; thirteen were measured clean after the fix
+        # and twelve of them are ungated.
+        run: cargo clippy -p frp-core --no-default-features --all-targets
+        env:
+          RUSTFLAGS: "-D warnings"
       - name: Check the four measured-red intra-crate feature combinations (curated list, NOT the full 2^N space)
         # A CURATED, CLOSED list — these four `-p`-isolated configurations were
         # measured red under -D warnings at `846c1b9` and fixed in the change
