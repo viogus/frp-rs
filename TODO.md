@@ -640,8 +640,33 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `restart_only.rs` also asserts the field yields no report.
 
   Done: removed the `note_restart_change` call, moved `tls_enable` into the no-reader group, and
-  updated the doc bullets plus the test doc comment that claimed the reload reported it. Full record
-  with commands and outputs: `/tmp/tls-enable-report.md`.
+  updated the doc bullets plus the test doc comment that claimed the reload reported it. The
+  user-visible reload-output change also owes its collateral, done in the same round: a `CHANGELOG.md`
+  bullet recording the removal (with the #400 bullet's "every restart-only difference is now
+  reported" qualified to "…that some code reads"), `tls_enable` added to the no-reader example lists
+  in `README.md` and `docs/deployment.md`, and three `docs/config.md` corrections — the false
+  `tls_enable` table row (it claimed to enable TLS on the main listener), its removal from the
+  "requires a full restart" list, and the no-reader list becoming eight fields. Full record with
+  commands and outputs: `/tmp/tls-enable-report.md`.
+
+- [ ] **`tls_enable` is silently inert: no load-time warning, unlike the sibling `[web_server.tls]
+  enable` that #402 made warn.** Measured on this branch (the `grep -rn "\.tls_enable"` above): no
+  `frp-server`/`frps` code reads `ServerConfig::tls_enable`, yet a config that writes
+  `tls_enable = true` loads without a word — the user gets neither an effect nor a warning, where
+  `[web_server.tls] enable` at least says `… has no effect: …` at every load site that has a log
+  sink. The existing mechanism to reuse is the `web_server.tls.enable` presence flag carried out of
+  the loader and emitted by each site (`presence.warn_inert_web_server_tls_enable`, called from both
+  `frps` startup paths); do not invent a second one.
+
+  Done-when: a load carrying a user-written `tls_enable` warns once per load at every load site that
+  has a log sink (the two startup paths, `frpc verify`, and the `frps`/`frpc` SIGUSR1 reload), with a
+  test that fails if the warning is removed, and the warning must **not** fire on the legitimate
+  legacy path below. The caveat that makes it non-trivial: `frp-core/src/config/normalize.rs`
+  **synthesizes** `tls_enable = true` when the legacy/canonical `[transport.tls]` has `force = true`
+  or `certFile`/`keyFile` (while mapping `force` → `tls_only`), inserting it with `.or_insert` before
+  deserialization — so after the load a synthesized value is indistinguishable from a written one,
+  and the presence flag must be taken from the file (beside the existing `web_server.tls.enable`
+  flag), not from the deserialized `ServerConfig`.
 
 - [x] **`[web_server.tls] cert_file` — the nested section's own canonical spelling — is dropped silently
   in the non-strict loader, and refused in strict mode with a message naming a key the user never wrote.**
