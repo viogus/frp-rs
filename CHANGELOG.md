@@ -178,6 +178,39 @@ User-facing release notes for frp-rs.
   needed, and **applies nothing** from the new config. Unchanged `[auth]` — by
   content, including `method = ""` vs `method = "token"` — reloads exactly as
   before.
+- **The server's `SIGUSR1` reload now reports an `auth.method` change and never
+  installs a method it cannot serve.** `frps`'s reload compared the token and
+  the OIDC fields but never `auth.method`, so flipping `method = "token"` to
+  `"oidc"` with the OIDC fields already present **and unchanged** answered
+  `config reloaded: no changes detected` while the file on disk said `oidc`; with
+  a token change alongside it, it printed `auth token updated` and committed the
+  whole freshly parsed `[auth]` section, leaving the live `auth_cfg.method` on
+  `oidc` while the OIDC verifier — built once, at startup — was still absent.
+  Logins then took the token path and failed closed (`OIDC auth requires
+  server-side verifier (not configured)`), so the server and its config
+  disagreed. Measured on that shape, the lockout was **total**: after the reload
+  neither the new token nor the previously-working one could log in, because the
+  token path rejects every attempt while the live method says `oidc`.
+  A reload now applies the settings it can re-key in place — the credential
+  (`auth.token` / `auth.tokenSource`), `auth.additionalAuthScopes`, and
+  `auth.authenticationTimeout` / `auth.tokenAuthTimeout`, both of which the login,
+  scoped-message and nathole paths read from the live config — and **reports**
+  every remaining `[auth]` difference as restart-required (`auth.method: token ->
+  oidc (restart required)`, `OIDC settings changed (restart required)`); neither
+  is ever committed, so the live `auth.method` is always the method the running
+  verifier was built for. The classified field list is a compiler-enforced
+  destructure of `AuthServerConfig`, so the next `[auth]` field cannot rejoin the
+  silent class by default. Fields the old code never compared at all are closed
+  with it: `auth.tokenSource`, `auth.additionalAuthScopes`,
+  `authenticationTimeout`, `tokenAuthTimeout`, `oidcSkipNbf`, `oidcProxyURL` and
+  `oidcTokenEndpointURL`. For `auth.tokenSource` the old behaviour was not always
+  silent — the reload compared the *resolved* token, so a source rewrite that
+  resolved to a different value did report `auth token updated` (while a rewrite
+  resolving to the same value reported nothing, and the source itself was never
+  applied); it is now compared as the source it is and applied with the
+  credential. `auth.useEncryption` is deliberately **not** reported: the server
+  parses it but reads it nowhere (Go's `AuthServerConfig` has no such field), so
+  neither a reload nor a restart can make a change to it take effect.
 - **A config-load failure now prints a bare line on stdout, and `frpc verify`
   prints its refusal there instead of on stderr — a user-visible output change,
   and Go parity on the stream and the shape of each line.** Go frp v0.71.0 does

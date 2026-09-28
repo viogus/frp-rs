@@ -36,7 +36,11 @@ StandardError=journal
 SyslogIdentifier=frps
 
 # Signal handling
-# SIGUSR1: reload auth token + port range from config
+# SIGUSR1: reload the auth token/tokenSource, additionalAuthScopes, the auth
+# timeouts, the port range and the TLS files from config. What is left of
+# [auth] (method, OIDC settings) is reported in the reload summary as
+# "restart required" and needs a service restart; auth.useEncryption is parsed
+# but read by nothing, so a change to it has no effect at all.
 KillSignal=SIGINT
 TimeoutStopSec=30
 

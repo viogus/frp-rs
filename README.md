@@ -237,9 +237,14 @@ Build variants, UPX compression and a Compose example:
 
 ### Server config reload (SIGUSR1)
 
-`SIGUSR1` hot-reloads `auth.token`, the allowed port range, and the TLS
-certificate/key/CA paths. Settings that still require a restart — `bind_port`,
-`bind_addr`, the `tls_enable` switch, OIDC, and the registration caps — are listed in
+`SIGUSR1` hot-reloads `auth.token` / `auth.tokenSource`,
+`auth.additionalAuthScopes`, `auth.authenticationTimeout` /
+`auth.tokenAuthTimeout`, the allowed port range, and the TLS
+certificate/key/CA paths. What is left of `[auth]` — `auth.method` and the OIDC
+settings — is **reported in the reload summary** as restart-required rather than
+silently dropped (`auth.useEncryption` is parsed but read by nothing, so it is
+neither); the full list, including the non-`[auth]` restart-only settings
+(`bind_port`, `bind_addr`, the `tls_enable` switch, the registration caps), is in
 [Configuration Reference § Server Config Reload](docs/config.md#server-config-reload-sigusr1).
 
 ---

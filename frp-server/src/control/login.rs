@@ -294,6 +294,34 @@ async fn verify_login_auth(
     // either). The failure paths below still consume a slot via
     // `throttled_login_error`.
 
+    // Which credential validates this login is decided by **the verifier's
+    // presence**, not by `auth_cfg.method`:
+    //
+    //   `state.oidc.verifier.is_some()`  ⟺  the process was started with
+    //   `auth.method = "oidc"`
+    //
+    // The verifier is built once, in `Service::with_unsafe_features`, from the
+    // startup method, and construction *fails* rather than starting without
+    // one (`Cannot start frps with OIDC auth: …`). `Service::reload` then
+    // never installs a `method` the verifier was not built for: the `AuthConfig`
+    // it puts live is the running one with only `auth.token` /
+    // `auth.tokenSource` / `auth.additionalAuthScopes` replaced, and
+    // `auth.method` (like every other `[auth]` field) is only *reported* as
+    // restart-required (`frp-server/src/service.rs`,
+    // `note_auth_restart_changes`). So the two spellings of the dispatch — this
+    // one and `auth_cfg.method == Oidc` — cannot disagree, and the other two
+    // OIDC entry points key off the same field for the same reason
+    // (`frp-server/src/handlers/dispatch.rs`,
+    // `frp-server/src/control/proxy.rs`).
+    //
+    // If that invariant were ever broken (a hand-built state with
+    // `method == Oidc` and no verifier), the `else` branch below runs the
+    // **token** path, and `AuthConfig::validate_login_with_token` answers
+    // `OIDC auth requires server-side verifier (not configured)` — it fails
+    // closed, it does not accept a token under an OIDC-labelled config. Pinned
+    // by
+    // `frp-server/tests/server_reload_auth.rs::token_login_fails_closed_if_the_method_says_oidc_without_a_verifier`.
+
     let oidc_subject: Option<String> = if is_auth_bypass {
         None
     } else if let Some(ref verifier) = state.oidc.verifier {
