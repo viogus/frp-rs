@@ -919,9 +919,24 @@ pub struct ObservabilityConfig {
 }
 
 /// Go frp v0.71.0 compat: the nested `webServer.tls` section
-/// (`tls.enable` / `tls.certFile` / `tls.keyFile` / `tls.trustedCaFile`).
-/// Merged with the flat `tls_cert_file`/`tls_key_file` fields — the nested
-/// values take precedence when both are set.
+/// (`tls.certFile` / `tls.keyFile` / `tls.trustedCaFile` / `tls.serverName`,
+/// plus the canonical snake_case spellings and `tls.enable`).
+///
+/// **Not populated by either loader.** `normalize_web_server_section`
+/// (`frp-core/src/config/normalize.rs`) removes the `tls` table before serde
+/// sees it and hoists both spelling families of the four value keys onto the
+/// flat `tls_cert_file` / `tls_key_file` / `tls_ca_file` / `tls_server_name`
+/// fields, so a loaded config always carries `WebServerTlsConfig::default()`.
+/// Its values are therefore read through the flat fields (and through
+/// [`WebServerConfig::tls_cert`]/[`WebServerConfig::tls_key`], which answer from
+/// the flat field whenever the nested one is empty — always).
+///
+/// **Precedence: the nested values win.** When both a nested key and its flat
+/// counterpart are set, the nested one overwrites the flat one — in either table
+/// order — so the flat key is inert and no warning is emitted. See
+/// `normalize_web_server_section` for why, and for what happens to
+/// `tls.enable`: it is accepted and **ignored in both loader modes** (nothing
+/// reads it; the dashboard TLS is driven by a non-empty cert/key pair).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WebServerTlsConfig {
     #[serde(default)]
@@ -965,9 +980,12 @@ pub struct WebServerConfig {
     /// TLS private key file path.
     #[serde(default, alias = "keyFile")]
     pub tls_key_file: String,
-    /// Go frp v0.71.0 nested `webServer.tls` section (enable/certFile/
-    /// keyFile/trustedCaFile). Takes precedence over the flat
-    /// tls_cert_file/tls_key_file fields.
+    /// Go frp v0.71.0 nested `webServer.tls` section. Takes precedence over the
+    /// flat `tls_cert_file` / `tls_key_file` fields **as a source of values**:
+    /// the loader hoists the nested keys onto the flat fields, overwriting any
+    /// flat key that is already set, so the effective answer is the nested one
+    /// in either table order. This struct itself is always default after a load
+    /// — see [`WebServerTlsConfig`].
     #[serde(default, rename = "tls")]
     pub tls: WebServerTlsConfig,
     /// TLS CA file for the dashboard/admin HTTPS server (Go
@@ -986,8 +1004,14 @@ pub struct WebServerConfig {
 }
 
 impl WebServerConfig {
-    /// Effective TLS certificate path: nested `tls.cert_file` first, then
+    /// Effective TLS certificate path: the nested `tls.cert_file` first, then
     /// the flat `tls_cert_file`.
+    ///
+    /// The loader never leaves the nested field set (the `tls` table is hoisted
+    /// onto the flat fields and removed — see [`WebServerTlsConfig`]), so in a
+    /// loaded config this returns the flat field, which by then holds the nested
+    /// value when the user wrote one. The nested arm is kept so a struct built
+    /// in code (tests, callers) can still set either.
     pub fn tls_cert(&self) -> &str {
         if !self.tls.cert_file.is_empty() {
             &self.tls.cert_file
@@ -996,8 +1020,8 @@ impl WebServerConfig {
         }
     }
 
-    /// Effective TLS key path: nested `tls.key_file` first, then the flat
-    /// `tls_key_file`.
+    /// Effective TLS key path: the nested `tls.key_file` first, then the flat
+    /// `tls_key_file`. Same loader note as [`WebServerConfig::tls_cert`].
     pub fn tls_key(&self) -> &str {
         if !self.tls.key_file.is_empty() {
             &self.tls.key_file

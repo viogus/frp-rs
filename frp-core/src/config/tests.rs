@@ -791,6 +791,40 @@ serverName = "admin.example.com"
     assert_eq!(cfg.web_server.tls_key_file, "/etc/frpc/admin.key");
     assert_eq!(cfg.web_server.tls_ca_file, "/etc/frpc/ca.crt");
     assert_eq!(cfg.web_server.tls_server_name, "admin.example.com");
+
+    // The client's admin `[webServer.tls]` goes through the same
+    // `normalize_web_server_section` (`normalize_client_config` calls it), so
+    // the canonical snake_case spellings land on the same flat fields — the
+    // client half of
+    // `nested_web_server_tls_spellings_reach_the_accessor_in_both_modes`. This
+    // is the string-based loader (no strict check), so it pins the mapping, not
+    // the strict-mode error path.
+    let cfg: ClientConfig = load_client_config_from_str(
+        r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[webServer]
+addr = "127.0.0.1"
+port = 7400
+
+[webServer.tls]
+cert_file = "/etc/frpc/admin.crt"
+key_file = "/etc/frpc/admin.key"
+trusted_ca_file = "/etc/frpc/ca.crt"
+server_name = "admin.example.com"
+enable = true
+"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.web_server.tls_cert(), "/etc/frpc/admin.crt");
+    assert_eq!(cfg.web_server.tls_key(), "/etc/frpc/admin.key");
+    assert_eq!(cfg.web_server.tls_ca_file, "/etc/frpc/ca.crt");
+    assert_eq!(cfg.web_server.tls_server_name, "admin.example.com");
+    assert!(
+        !cfg.web_server.tls.enable,
+        "`enable` is inert on the client too"
+    );
 }
 
 #[test]
@@ -5729,6 +5763,437 @@ custom404Page = "<h1>nope</h1>"
     assert_eq!(cfg.web_server.tls_ca_file, "/tmp/ca.pem");
     assert_eq!(cfg.web_server.tls_server_name, "example.com");
     assert_eq!(cfg.web_server.custom_404_page, "<h1>nope</h1>");
+}
+
+/// The nested `[web_server.tls]` section is **hoisted** onto the flat
+/// `web_server.tls_*` fields by `normalize_web_server_section`
+/// (`frp-core/src/config/normalize.rs`), because the `tls` table is removed
+/// before serde (and before `check_strict`) ever sees it. Two claims about that
+/// hoist are pinned here, each in **both** loader modes and — for precedence —
+/// in **both** orders, because the input shape the claim is about is what
+/// differs:
+///
+/// 1. **Both spelling families reach the field.** `WebServerTlsConfig` declares
+///    `cert_file` / `key_file` / `trusted_ca_file` / `server_name` as its
+///    canonical serde names and the Go camelCase spellings only as `alias`es,
+///    so the *canonical* spelling is `cert_file`. Before this pin the hoist
+///    renamed **only** the four camelCase spellings and re-inserted `cert_file`
+///    under its own name, producing `web_server.cert_file` — not a field, so
+///    the value was **dropped** with `strict = false` (the reload path,
+///    `load_server_config(&path, false)` in `frp-server/src/service.rs`) and
+///    **refused** with `strict = true`, naming `web_server.cert_file` — a path
+///    the user never wrote — with the hint `did you mean 'certFile'?`.
+/// 2. **The nested spelling wins when both are set.** The struct's doc comment
+///    claimed it while `or_insert` made the flat key win, so the claim and the
+///    code disagreed; the hoist now overwrites, which is what makes the doc
+///    true. Both orders are exercised because `or_insert` is order-sensitive
+///    only in the direction that matters (flat first), and TOML table order is
+///    the writer's free choice.
+///
+/// The nested struct itself is asserted **empty** in every case: the `tls`
+/// table is removed before serde, so the effective value is always the flat
+/// field `tls_cert()` falls back to. `enable` is deliberately absent from the
+/// value table — it is dropped by the hoist (see its doc comment) and pinned by
+/// `nested_web_server_tls_enable_is_accepted_and_inert_in_both_modes`.
+///
+/// **What this models.** The loader entry points the two callers use —
+/// `load_server_config(path, strict)` on a real file, one `tempfile::tempdir()`
+/// per case, with `strict` in {`false`, `true`}.
+///
+/// **What it does not cover.** Go's own behaviour on these configs (this pins
+/// frp-rs's surface, not parity: Go's `WebServerConfig.TLS` is a `*TLSConfig`
+/// whose fields carry camelCase json tags only — `pkg/config/v1/common.go:68`,
+/// `:76-84` — so Go refuses a `cert_file` key under strict decoding and has no
+/// `enable` field at all); the reload path end to end (the `strict = false`
+/// arm is exactly what that path calls, and is exercised directly here); and
+/// the YAML/JSON/INI format arms (the hoist runs on the parsed `toml::Value`
+/// before format-specific typing).
+#[test]
+fn nested_web_server_tls_spellings_reach_the_accessor_in_both_modes() {
+    const HEADER: &str = "bind_port = 7000\ntoken = \"t\"\n";
+
+    // (tls_cert(), tls_key(), tls_ca_file, tls_server_name, nested tls struct)
+    type Loaded = (
+        String,
+        String,
+        String,
+        String,
+        (String, String, String, String),
+    );
+
+    /// Write `body` into its own temp dir and load it in both modes,
+    /// returning `(strict = false, strict = true)`.
+    fn load_both_modes(body: &str) -> (Loaded, Loaded) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frps.toml");
+        std::fs::write(&path, body).unwrap();
+        let p = path.to_str().unwrap();
+        let read = |strict: bool| -> Loaded {
+            let cfg = load_server_config(p, strict)
+                .unwrap_or_else(|e| panic!("strict={strict} must load:\n{e}"));
+            let ws = cfg.web_server;
+            (
+                ws.tls_cert().to_string(),
+                ws.tls_key().to_string(),
+                ws.tls_ca_file.clone(),
+                ws.tls_server_name.clone(),
+                (
+                    ws.tls.cert_file.clone(),
+                    ws.tls.key_file.clone(),
+                    ws.tls.trusted_ca_file.clone(),
+                    ws.tls.server_name.clone(),
+                ),
+            )
+        };
+        (read(false), read(true))
+    }
+
+    let expect = |cert: &str, key: &str, ca: &str, sn: &str| -> Loaded {
+        (
+            cert.into(),
+            key.into(),
+            ca.into(),
+            sn.into(),
+            (String::new(), String::new(), String::new(), String::new()),
+        )
+    };
+
+    // ── 1. The canonical snake_case spelling, nested ───────────────────────
+    let snake = format!(
+        "{HEADER}[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [web_server.tls]\ncert_file = \"/snake/cert.pem\"\nkey_file = \"/snake/key.pem\"\n\
+         trusted_ca_file = \"/snake/ca.pem\"\nserver_name = \"snake.example.com\"\n",
+    );
+    let (loose, strict) = load_both_modes(&snake);
+    // `strict = false` first: it is the reload path's mode
+    // (`load_server_config(&config_path, false)`, `frp-server/src/service.rs`),
+    // and the arm whose failure mode was a silent drop rather than an error.
+    for (mode, got) in [
+        ("strict=false (the reload path)", loose),
+        ("strict=true", strict),
+    ] {
+        assert_eq!(
+            got,
+            expect(
+                "/snake/cert.pem",
+                "/snake/key.pem",
+                "/snake/ca.pem",
+                "snake.example.com"
+            ),
+            "nested snake_case, {mode}: the struct's own canonical names must \
+             reach the accessor, and the nested struct stays unpopulated \
+             (normalization removes the table before serde)",
+        );
+    }
+
+    // ── 2. The Go camelCase spelling, nested (kept working) ────────────────
+    let camel = format!(
+        "{HEADER}[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [web_server.tls]\ncertFile = \"/camel/cert.pem\"\nkeyFile = \"/camel/key.pem\"\n\
+         trustedCaFile = \"/camel/ca.pem\"\nserverName = \"camel.example.com\"\n",
+    );
+    let (loose, strict) = load_both_modes(&camel);
+    for (mode, got) in [("strict=false", loose), ("strict=true", strict)] {
+        assert_eq!(
+            got,
+            expect(
+                "/camel/cert.pem",
+                "/camel/key.pem",
+                "/camel/ca.pem",
+                "camel.example.com"
+            ),
+            "nested camelCase, {mode}",
+        );
+    }
+
+    // ── 3. Precedence over a flat key that is already set, both orders ─────
+    let both_set = [
+        (
+            "flat-first/nested-camel",
+            format!(
+                "{HEADER}[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+                 tls_cert_file = \"/flat/cert.pem\"\ntls_key_file = \"/flat/key.pem\"\n\
+                 tls_ca_file = \"/flat/ca.pem\"\ntls_server_name = \"flat.example.com\"\n\
+                 [web_server.tls]\ncertFile = \"/nested/cert.pem\"\n\
+                 keyFile = \"/nested/key.pem\"\ntrustedCaFile = \"/nested/ca.pem\"\n\
+                 serverName = \"nested.example.com\"\n"
+            ),
+        ),
+        (
+            "flat-first/nested-snake",
+            format!(
+                "{HEADER}[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+                 tls_cert_file = \"/flat/cert.pem\"\ntls_key_file = \"/flat/key.pem\"\n\
+                 tls_ca_file = \"/flat/ca.pem\"\ntls_server_name = \"flat.example.com\"\n\
+                 [web_server.tls]\ncert_file = \"/nested/cert.pem\"\n\
+                 key_file = \"/nested/key.pem\"\ntrusted_ca_file = \"/nested/ca.pem\"\n\
+                 server_name = \"nested.example.com\"\n"
+            ),
+        ),
+        (
+            "nested-first/nested-camel",
+            format!(
+                "{HEADER}[web_server.tls]\ncertFile = \"/nested/cert.pem\"\n\
+                 keyFile = \"/nested/key.pem\"\ntrustedCaFile = \"/nested/ca.pem\"\n\
+                 serverName = \"nested.example.com\"\n\
+                 [web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+                 tls_cert_file = \"/flat/cert.pem\"\ntls_key_file = \"/flat/key.pem\"\n\
+                 tls_ca_file = \"/flat/ca.pem\"\ntls_server_name = \"flat.example.com\"\n"
+            ),
+        ),
+        (
+            "nested-first/nested-snake",
+            format!(
+                "{HEADER}[web_server.tls]\ncert_file = \"/nested/cert.pem\"\n\
+                 key_file = \"/nested/key.pem\"\ntrusted_ca_file = \"/nested/ca.pem\"\n\
+                 server_name = \"nested.example.com\"\n\
+                 [web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+                 tls_cert_file = \"/flat/cert.pem\"\ntls_key_file = \"/flat/key.pem\"\n\
+                 tls_ca_file = \"/flat/ca.pem\"\ntls_server_name = \"flat.example.com\"\n"
+            ),
+        ),
+    ];
+    for (name, body) in both_set {
+        let (loose, strict) = load_both_modes(&body);
+        for (mode, got) in [("strict=false", loose), ("strict=true", strict)] {
+            assert_eq!(
+                got,
+                expect(
+                    "/nested/cert.pem",
+                    "/nested/key.pem",
+                    "/nested/ca.pem",
+                    "nested.example.com"
+                ),
+                "{name}, {mode}: the nested section's values take precedence over \
+                 the flat key that is already set — a restart cannot reorder them",
+            );
+        }
+    }
+
+    // ── 4. A flat-only config is untouched (control) ───────────────────────
+    let flat_only = format!(
+        "{HEADER}[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         tls_cert_file = \"/flat/cert.pem\"\ntls_key_file = \"/flat/key.pem\"\n\
+         tls_ca_file = \"/flat/ca.pem\"\ntls_server_name = \"flat.example.com\"\n",
+    );
+    let (loose, strict) = load_both_modes(&flat_only);
+    for (mode, got) in [("strict=false", loose), ("strict=true", strict)] {
+        assert_eq!(
+            got,
+            expect(
+                "/flat/cert.pem",
+                "/flat/key.pem",
+                "/flat/ca.pem",
+                "flat.example.com"
+            ),
+            "flat-only, {mode}",
+        );
+    }
+}
+
+/// Both spellings of one nested `[web_server.tls]` key in the same file: the
+/// canonical snake_case wins, and the loser does **not** survive under its own
+/// name at the parent level. It did before the mapping: `cert_file` (mapped to
+/// `tls_cert_file`) plus `certFile` (unmapped, left in the table and
+/// re-inserted) produced `web_server.certFile` beside `web_server.tls_cert_file`
+/// — and serde reports `duplicate field \`tls_cert_file\`` for that shape
+/// because `certFile` is an `alias` of the same field, so the config failed to
+/// load in **either** mode with a message about a field the user never wrote
+/// twice. The mapping now removes both spellings and keeps one.
+///
+/// Also covers the two camelCase-plus-snake pairs that share a destination
+/// through the `MAPPED` table, so a future edit to that table cannot silently
+/// reintroduce the collision for `key_file` / `trusted_ca_file` /
+/// `server_name`.
+///
+/// **What this models.** The strict loader on a real file (the non-strict arm
+/// is asserted too, since the failure mode differs: an unknown-field drop
+/// versus a `duplicate field` error).
+///
+/// **What it does not cover.** Which of the two spellings a user *meant* — the
+/// choice (snake_case) is a decision recorded on
+/// `normalize_web_server_section`, not a measurement; and YAML, where duplicate
+/// or aliased keys behave differently in the parser itself.
+#[test]
+fn both_spellings_of_one_nested_key_do_not_collide() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.toml");
+    std::fs::write(
+        &path,
+        "bind_port = 7000\ntoken = \"t\"\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [web_server.tls]\ncert_file = \"/snake/cert.pem\"\ncertFile = \"/camel/cert.pem\"\n\
+         key_file = \"/snake/key.pem\"\nkeyFile = \"/camel/key.pem\"\n\
+         trusted_ca_file = \"/snake/ca.pem\"\ntrustedCaFile = \"/camel/ca.pem\"\n\
+         server_name = \"snake.example.com\"\nserverName = \"camel.example.com\"\n",
+    )
+    .unwrap();
+    let p = path.to_str().unwrap();
+    for strict in [false, true] {
+        let cfg = load_server_config(p, strict)
+            .unwrap_or_else(|e| panic!("strict={strict}: both spellings must load:\n{e}"));
+        assert_eq!(
+            cfg.web_server.tls_cert(),
+            "/snake/cert.pem",
+            "strict={strict}"
+        );
+        assert_eq!(
+            cfg.web_server.tls_key(),
+            "/snake/key.pem",
+            "strict={strict}"
+        );
+        assert_eq!(
+            cfg.web_server.tls_ca_file, "/snake/ca.pem",
+            "strict={strict}"
+        );
+        assert_eq!(
+            cfg.web_server.tls_server_name, "snake.example.com",
+            "strict={strict}"
+        );
+        // The camelCase losers are not left behind as parent-level keys.
+        assert_eq!(
+            cfg.web_server.tls_cert_file, "/snake/cert.pem",
+            "strict={strict}"
+        );
+        // …and the nested struct itself is still default: the hoist is the only
+        // way a nested value reaches a field.
+        assert_eq!(cfg.web_server.tls.cert_file, "", "strict={strict}");
+    }
+}
+
+/// `[web_server.tls] enable` is accepted in **both** loader modes and inert in
+/// both — the decision recorded on `normalize_web_server_section`.
+///
+/// It is inert because nothing reads it: the nested `tls` table is removed
+/// before serde, so `WebServerTlsConfig::enable` is default-`false` in every
+/// loaded config (`frp-core/src/config/restart_only.rs` destructures it as
+/// unreachable), and there is no reader anywhere in `frp-server`/`frps`
+/// (`grep -rn 'tls\.enable' frp-server/src frps/src` matches only
+/// `transport.tls.enable` spellings in test fixtures). frp-rs enables the
+/// dashboard TLS from a non-empty cert/key pair
+/// (`frp-server/src/service.rs`, `web_server.tls_cert()`), which is also what Go
+/// does: Go's `TLSConfig` (`pkg/config/v1/common.go:76-84`) has **no** `Enable`
+/// field and its HTTP server starts TLS when `cfg.TLS != nil`
+/// (`pkg/util/http/server.go:77`), so `enable` is not even a Go key to be
+/// compatible with.
+///
+/// Before this pin the key was re-inserted as `web_server.enable` (not a
+/// field): dropped under `strict = false` but **refused** under `strict =
+/// true` — the same silent/refuse split as the snake_case spellings, both
+/// naming a path the user never wrote (`web_server.enable`, not
+/// `web_server.tls.enable`). Dropped in both modes now, so the two modes agree
+/// and neither invents a key.
+///
+/// **What this models.** Both loader modes on a real file for `enable` alone,
+/// for `enable` beside all four mapped spellings, and for `enable = false` with
+/// a cert/key pair — the three shapes the decision has to hold for. The
+/// rejected alternative (map `enable` onto the cert/key pair, i.e. `false`
+/// suppresses TLS) is the third shape.
+///
+/// **What it does not cover.** Whether a future reader is ever wired to the
+/// field — if one is, this test must change with it (that is the point of
+/// pinning the decision); Go's runtime, which is cited from source
+/// (`pkg/util/http/server.go:77`) but not probed with a binary here; and the
+/// `transport.tls.enable` key, which is a different field of a different
+/// section.
+#[test]
+fn nested_web_server_tls_enable_is_accepted_and_inert_in_both_modes() {
+    const HEADER: &str = "bind_port = 7000\ntoken = \"t\"\n";
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.toml");
+    let p = path.to_str().unwrap();
+    let write = |body: &str| std::fs::write(&path, body).unwrap();
+
+    // (a) `enable` alone: loads in both modes, stores nothing, is not a cert.
+    write(&format!(
+        "{HEADER}[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [web_server.tls]\nenable = true\n"
+    ));
+    for strict in [false, true] {
+        let cfg = load_server_config(p, strict)
+            .unwrap_or_else(|e| panic!("strict={strict}: `enable` must load:\n{e}"));
+        assert!(
+            !cfg.web_server.tls.enable,
+            "strict={strict}: inert, not stored"
+        );
+        assert_eq!(cfg.web_server.tls_cert(), "", "strict={strict}: not a cert");
+    }
+
+    // (b) `enable` alongside the four mapped spellings: still loads in both
+    // modes, and no branch reports a path the user never wrote. Before the
+    // mapping, strict mode named one invented sibling per key —
+    // `web_server.cert_file`, `…key_file`, `…trusted_ca_file`, `…server_name`,
+    // `…enable` — which is defect (3) of the item.
+    write(&format!(
+        "{HEADER}[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [web_server.tls]\nenable = true\ncert_file = \"/tls/cert.pem\"\n\
+         key_file = \"/tls/key.pem\"\ntrusted_ca_file = \"/tls/ca.pem\"\n\
+         server_name = \"tls.example.com\"\n"
+    ));
+    for strict in [false, true] {
+        let cfg = load_server_config(p, strict)
+            .unwrap_or_else(|e| panic!("strict={strict}: the mapped spellings must load:\n{e}"));
+        assert_eq!(
+            cfg.web_server.tls_cert(),
+            "/tls/cert.pem",
+            "strict={strict}"
+        );
+        assert_eq!(cfg.web_server.tls_key(), "/tls/key.pem", "strict={strict}");
+        assert_eq!(cfg.web_server.tls_ca_file, "/tls/ca.pem", "strict={strict}");
+        assert_eq!(
+            cfg.web_server.tls_server_name, "tls.example.com",
+            "strict={strict}"
+        );
+    }
+
+    // (c) `enable = false` is as inert as `true`: it neither removes a cert/key
+    // pair nor changes any flat value. Pinned because "map `enable` onto the
+    // TLS switch" was the rejected alternative decision — this is what that
+    // decision would have broken.
+    write(&format!(
+        "{HEADER}[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [web_server.tls]\nenable = false\ncert_file = \"/off/cert.pem\"\n\
+         key_file = \"/off/key.pem\"\n"
+    ));
+    for strict in [false, true] {
+        let cfg = load_server_config(p, strict)
+            .unwrap_or_else(|e| panic!("strict={strict}: `enable = false` must load:\n{e}"));
+        assert_eq!(
+            cfg.web_server.tls_cert(),
+            "/off/cert.pem",
+            "strict={strict}"
+        );
+        assert_eq!(cfg.web_server.tls_key(), "/off/key.pem", "strict={strict}");
+    }
+}
+
+#[test]
+fn unknown_nested_web_server_tls_key_still_names_a_parent_level_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.toml");
+    std::fs::write(
+        &path,
+        "bind_port = 7000\ntoken = \"t\"\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [web_server.tls]\nbogus_key = \"x\"\n",
+    )
+    .unwrap();
+    let p = path.to_str().unwrap();
+
+    let err = load_server_config(p, true).unwrap_err();
+    let err = format!("{err}");
+    assert!(
+        err.contains("unknown field \"web_server.bogus_key\""),
+        "the residue path is pinned, not asserted away: got {err}"
+    );
+    assert!(
+        !err.contains("web_server.cert_file"),
+        "no mapped snake_case spelling is unknown any more: got {err}"
+    );
+
+    // Non-strict keeps the drop, so the two modes differ only in loudness here
+    // — the same shape as every other unknown key (`check_strict`'s job), and
+    // unlike the pre-fix `cert_file` case, whose *value* was lost.
+    load_server_config(p, false).unwrap();
 }
 
 /// Load a Go legacy INI config through the real INI parser + normalize

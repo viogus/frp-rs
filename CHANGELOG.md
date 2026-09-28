@@ -392,6 +392,26 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **`[web_server.tls] cert_file` / `key_file` / `trusted_ca_file` / `server_name`
+  — the nested section's own canonical spellings — are no longer dropped, and the
+  nested section now wins over the flat keys the way the docs always said.**
+  Only Go's camelCase spellings were mapped onto the flat
+  `web_server.tls_cert_file` / `tls_key_file` / `tls_ca_file` / `tls_server_name`
+  fields, so the snake_case names reached `web_server.cert_file` — not a field.
+  With `--strict-config=false` (the SIGUSR1 reload's mode) the value vanished:
+  `[web_server.tls] cert_file = "/c.pem"` loaded with `tls_cert() == ""` and the
+  dashboard came up without TLS, while a file that also set the flat key behaved
+  as if the nested one were not there. With strict mode (frps's default) the same
+  file was **refused** with `unknown field "web_server.cert_file" … did you mean
+  'certFile'?` — a path the user never wrote, pointing at the other spelling of
+  the same field. Both spellings now map, and the nested value **overwrites** a
+  flat key that is already set (documents and code disagreed here: the struct
+  comment claimed nested-wins while `or_insert` made flat win, order-dependently).
+  `[web_server.tls] enable` was in the same bucket — re-inserted as the unknown
+  `web_server.enable` — and is now accepted and ignored in **both** loader modes,
+  matching Go, whose `TLSConfig` has no `Enable` field and whose HTTP server
+  starts TLS when the cert/key pair is non-empty (same rule frp-rs uses). A
+  genuinely unknown nested key is still refused, as `web_server.<key>`.
 - **An empty `--log-level` / `--log-file`, and a zero `max_days`, no longer
   silence `frps` or `frpc` — or silently switch off log retention.** Go fills
   each in `LogConfig.Complete()` (`pkg/config/v1/common.go:119-123`: empty →

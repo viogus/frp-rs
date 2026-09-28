@@ -1418,25 +1418,113 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
     }
 }
 
-/// Normalize canonical Go `[webServer.tls]` (and `[web_server.tls]`) into the
-/// existing flat `web_server.tls_cert_file` / `tls_key_file` fields.
+/// Hoist the nested `[webServer.tls]` / `[web_server.tls]` table onto the flat
+/// `web_server.tls_*` fields, so both spelling families reach the struct that
+/// [`WebServerConfig::tls_cert`]/[`WebServerConfig::tls_key`] read.
+///
+/// `normalize_server_config` also calls this for the **client** admin server's
+/// `[web_server.tls]` (`ClientConfig.web_server` is the same
+/// [`WebServerConfig`]), so one mapping serves both crates.
+///
+/// **What it maps.** Four values, each with two accepted spellings: the Go
+/// camelCase (what Go v0.71.0 accepts — its `TLSConfig` json tags are
+/// camelCase only, `pkg/config/v1/common.go:76-84`) and the canonical
+/// snake_case (what [`WebServerTlsConfig`] names the fields, the camelCase
+/// being only a serde `alias`):
+///
+/// | nested key | mapped to |
+/// |---|---|
+/// | `certFile` / `cert_file` | `tls_cert_file` |
+/// | `keyFile` / `key_file` | `tls_key_file` |
+/// | `trustedCaFile` / `trusted_ca_file` | `tls_ca_file` |
+/// | `serverName` / `server_name` | `tls_server_name` |
+///
+/// **Precedence — nested wins, in both table orders.** The write is an
+/// `insert` (not `or_insert`), so a nested entry replaces a flat key that is
+/// already set. That is the order-independent reading of the doc comment on
+/// [`WebServerConfig::tls`] and on the `tls` field itself ("the nested values
+/// take precedence when both are set"): a user who sets both deliberately gets
+/// the nested section's value, and the flat key is inert — no warning, because
+/// the accessor's answer is the same either way once the hoist has run. Where
+/// both spellings of the *same* key are nested, snake_case wins (it is the
+/// canonical name); that choice is fixed here rather than left to `toml`'s
+/// map order.
+///
+/// **What it drops, and why.** `enable` is removed and does not reach any
+/// field. Nothing reads [`WebServerTlsConfig::enable`]: the table is removed
+/// before serde, so the field is default-`false` in every loaded config and has
+/// no reader in `frp-server`/`frps`; the dashboard TLS is driven by a non-empty
+/// cert/key pair (`Service::run` via `tls_cert()`), which is also what Go does
+/// (Go's `TLSConfig` has **no** `Enable` field at all, and
+/// `pkg/util/http/server.go:77` starts TLS from a non-nil `cfg.TLS`). Before
+/// this, the key was re-inserted as `web_server.enable` — not a field — so it
+/// was dropped under `strict = false` and refused under `strict = true`; now
+/// both modes accept and ignore it, which is the honest shape for a key that
+/// cannot change anything. Do not "wire it up" to the cert/key pair: `enable =
+/// false` beside a valid pair would then silently disable the dashboard TLS.
+///
+/// **What it does not do.** Every other nested key keeps its name and is
+/// re-inserted at the parent level only when the parent does not already have
+/// it, so `check_strict` still refuses a genuinely unknown nested key — with the
+/// parent-level path (`web_server.bogus_key`), the residue pinned by
+/// `unknown_nested_web_server_tls_key_still_names_a_parent_level_path` in
+/// `frp-core/src/config/tests.rs`. The nested [`WebServerTlsConfig`] itself is
+/// never populated by either loader, so
+/// `WebServerConfig::tls_cert`/`tls_key` always answer from the flat field.
 fn normalize_web_server_section(table: &mut toml::Table) {
     use toml::Value;
 
     let Some(Value::Table(ws)) = table.get_mut("web_server") else {
         return;
     };
-    if let Some(Value::Table(tls)) = ws.remove("tls") {
-        for (k, v) in tls {
-            let flat_key = match k.as_str() {
-                "certFile" => "tls_cert_file",
-                "keyFile" => "tls_key_file",
-                "trustedCaFile" => "tls_ca_file",
-                "serverName" => "tls_server_name",
-                other => other,
-            };
-            ws.entry(flat_key.to_string()).or_insert(v);
+    let Some(Value::Table(tls)) = ws.remove("tls") else {
+        return;
+    };
+    let mut tls = tls;
+
+    // One group per destination field. **Both** spellings are removed whichever
+    // one supplies the value, so a config that writes both cannot leave the
+    // loser behind under its own name at the parent level: `web_server.certFile`
+    // beside `web_server.tls_cert_file` is a `duplicate field \`tls_cert_file\``
+    // serde error (the camelCase spelling is an `alias` of the same field) and
+    // an unknown field in strict mode. The canonical snake_case spelling wins.
+    //
+    // Note for the next editor: removing only the winning spelling is not
+    // enough — the loser falls through to the "anything else" loop at the end of
+    // this function, which is where the duplicate came from. Measured 2026-09-29
+    // in this worktree (`case=both_spellings_nested` in `/tmp/wstls-probe/`);
+    // pinned by `both_spellings_of_one_nested_key_do_not_collide` in
+    // `frp-core/src/config/tests.rs`.
+    const MAPPED: [(&str, [&str; 2]); 4] = [
+        ("tls_cert_file", ["cert_file", "certFile"]),
+        ("tls_key_file", ["key_file", "keyFile"]),
+        ("tls_ca_file", ["trusted_ca_file", "trustedCaFile"]),
+        ("tls_server_name", ["server_name", "serverName"]),
+    ];
+    for (flat_key, spellings) in MAPPED {
+        let mut chosen = None;
+        for spelling in spellings {
+            match tls.remove(spelling) {
+                // First spelling present (snake_case) supplies the value.
+                Some(v) if chosen.is_none() => chosen = Some(v),
+                // The other spelling is dropped either way — see above.
+                Some(_) => {}
+                None => {}
+            }
         }
+        if let Some(v) = chosen {
+            ws.insert(flat_key.to_string(), v);
+        }
+    }
+
+    // Inert: accepted (and so not an unknown-field error in strict mode) but
+    // stored nowhere a reader can see — see the doc comment above.
+    tls.remove("enable");
+
+    // Anything else keeps its name at the parent level so strict mode can name
+    // it, without clobbering an explicit flat value.
+    for (k, v) in tls {
+        ws.entry(k).or_insert(v);
     }
 }
 

@@ -632,7 +632,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   wired to a server behaviour (a documented divergence from Go, which ignores it server-side) with a
   probe showing what a restart changes. A reader of the test must be able to tell which was chosen.
 
-- [ ] **`[web_server.tls] cert_file` — the nested section's own canonical spelling — is dropped silently
+- [x] **`[web_server.tls] cert_file` — the nested section's own canonical spelling — is dropped silently
   in the non-strict loader, and refused in strict mode with a message naming a key the user never wrote.**
   Measured 2026-09-28 at `e6bda94` by loading config shapes through
   `load_server_config(path, strict)` (probe kept with that round, `/tmp/sra-probe/n1/probe2.rs`, run
@@ -674,6 +674,36 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   — whereas the alternative (reject nested snake_case with an error naming `web_server.tls.cert_file`, the
   key the user actually wrote) is a smaller change but leaves the struct's canonical names unusable. Either
   way the test must fail on today's behaviour.
+
+  Done 2026-09-29 at `5717fa2`, branch `fix/web-server-tls-nested` (author round; full before/after
+  table and the probe that produced it: `/tmp/wstls-report.md`, probe kept at
+  `/tmp/wstls-probe/src/main.rs`, raw output `-before.txt` / `-after.txt`). **Done-when chosen:** the
+  mapping (the item's pick), and the struct's documented "nested takes precedence" was made true rather
+  than the doc corrected — `or_insert` is now `insert`, so the nested value overwrites a flat key that is
+  already set, in **either** table order (both measured). The four snake_case spellings map to the same
+  flat fields as the Go camelCase ones, and **both** spellings of a destination key are removed so the
+  loser cannot fall through to the parent-level re-insert: writing `cert_file` and `certFile` together
+  used to fail in **both** loader modes with ``duplicate field `tls_cert_file` `` — a third failure the
+  item did not record (the camelCase spelling is a serde `alias` of the same field). `enable` is a
+  decision, not a mapping: **accepted and inert in both modes** (removed from the table). Nothing reads
+  `WebServerTlsConfig::enable` (the nested table is removed before serde and no `frp-server`/`frps` code
+  reads it; `grep` finds only the struct, its construction sites and the `restart_only.rs` destructure
+  that names it as unreachable), the dashboard TLS is driven by a non-empty cert/key pair, and Go has no
+  such key at all — its `TLSConfig` (`pkg/config/v1/common.go:76-84`) carries only
+  `certFile`/`keyFile`/`trustedCaFile`/`serverName` and `pkg/util/http/server.go:77` starts TLS from a
+  non-nil `cfg.TLS`. The rejected alternative (wire `enable` to the cert/key pair) is pinned as harmful
+  by a test: `enable = false` beside a valid pair would silently disable a working dashboard TLS.
+  **Residue, stated not hidden:** a genuinely unknown nested key is still refused with the parent-level
+  path — `unknown field "web_server.bogus_key"` where the user wrote `[web_server.tls] bogus_key` —
+  because `normalize` removes the table before `check_strict` walks it; pinned by
+  `unknown_nested_web_server_tls_key_still_names_a_parent_level_path`. Four new tests in
+  `frp-core/src/config/tests.rs` (accessor asserted, both modes, both orders, real files in their own
+  temp dirs) fail on the base tree: `nested_web_server_tls_spellings_reach_the_accessor_in_both_modes`
+  and `nested_web_server_tls_enable_is_accepted_and_inert_in_both_modes` fail first
+  (`/tmp/wstls-falsify.txt`), the collision case fails through the probe. Docs carried in the same
+  change: `frp-core/src/config/server.rs`, `frp-core/src/config/restart_only.rs` (two now-false
+  comments), `docs/config.md`, `CHANGELOG.md`. `scripts/compat-test.sh` is not relevant (config loading,
+  no wire byte).
 
 - [ ] **`oidc_throttle_tests` is a load-dependent flake: the mock IdP answers 404 for a valid
   request.** `cargo test -p frp-server --lib oidc` failed **3/3** `oidc_throttle_tests` under CPU
