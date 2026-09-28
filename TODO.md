@@ -678,6 +678,35 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   and the presence flag must be taken from the file (beside the existing `web_server.tls.enable`
   flag), not from the deserialized `ServerConfig`.
 
+- [ ] **`docs/config.md` advertises four camelCase TLS aliases that no loader accepts.**
+  The `tls_only`, `tls_cert_file`, `tls_key_file` and `tls_ca_file` rows at `docs/config.md:26-29`
+  each name a Go-alias spelling (`tlsOnly`, `tlsCertFile`, `tlsKeyFile`, `tlsCaFile`), while
+  `docs/config.md:173` in the same file states the opposite ("Exception: `tls_enable`,
+  `tls_cert_file`, `tls_key_file`, `tls_ca_file` have no camelCase aliases — use the snake_case
+  names") — and the loader agrees with the Exception, not the table. Measured at `a928887` with a
+  throwaway probe over `frp_core::config::load_server_config_from_str` (non-strict) and
+  `frp_core::config::load_server_config_uncompleted(path, true)` (strict):
+  * `tlsCertFile = "/cc.crt"` + `tlsKeyFile = "/cc.key"` → ignored; both fields stay `""`.
+  * `tlsOnly = true` → ignored; `tls_only` stays `false`.
+  * `tlsCaFile = "/cc-ca.crt"` → ignored; `tls_ca_file` stays `""` and `tls_only` stays `false`, so
+    it does not even trigger the `tls_ca_file`-implies-`tls_only` fill at
+    `frp-core/src/config/server.rs:524-525`.
+  * all four together in strict mode → `unknown field "tlsCaFile" in config file <path>`,
+    `unknown field "tlsCertFile" …`, `unknown field "tlsKeyFile" …`, and
+    `unknown field "tlsOnly" in config file <path> — did you mean 'tls_only'?`; the snake_case
+    control keys load `Ok`.
+  So all four rows are wrong, `tlsOnly` included — not three of four. `frp-core/src/config/server.rs:43-51`
+  declares those fields with `#[serde(default)]` and no alias for any of them; the only server-TLS
+  aliases that exist are `tls_trusted_ca_file` (`:48`, → `tls_ca_file`) and `tlsServerName`
+  (`:50`, → `tls_server_name`), and both do work. `frp-core/src/config/strict.rs` accepts
+  `tlsServerName` (`:29`, `:207`) but lists none of the four camelCase spellings, which is why
+  strict mode refuses them.
+
+  Done-when: the four rows at `docs/config.md:26-29` name only spellings a loader accepts (the
+  snake_case key where no alias exists, or the real alias where one exists), consistent with
+  `docs/config.md:173`, and a test pins the accepted/rejected spellings so the table cannot drift
+  back.
+
 - [x] **`[web_server.tls] cert_file` — the nested section's own canonical spelling — is dropped silently
   in the non-strict loader, and refused in strict mode with a message naming a key the user never wrote.**
   Measured 2026-09-28 at `e6bda94` by loading config shapes through
