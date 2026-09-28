@@ -2645,6 +2645,53 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `frpc -c <that config>` returns 1 both before and after this change, but for the *wrong*
     reason: the config is accepted and the process then fails to connect (a runtime exit),
     not a config refusal. The exit code agrees with Go by coincidence on that one row.
+- [ ] **`frps --config-dir` never installs the SIGUSR1 handler, so `kill -USR1` kills the server.**
+  `frps/src/main.rs:180-248` is the `--config-dir` branch: it spawns one service task per file at
+  `:221`, awaits the finished tasks at `:243-247`, and `return`s at `:248` — before the
+  single-config path constructs the service at `:312-323` and installs the reload handler at
+  `:325-346` (which requests `SignalKind::user_defined1()` at `:330`). With no handler installed,
+  SIGUSR1 keeps its default disposition, which is terminate. Reproduced at `a928887` against this
+  branch's built `target/debug/frps`: a temp dir holding one valid config
+  (`bind_addr = "127.0.0.1"`, `bind_port = 47233`, `[auth] token = …`), started as
+  `frps --config-dir <dir>`; the log reached `frps listener started on 127.0.0.1:47233`;
+  `kill -USR1 <pid>` printed `… User defined signal 1: 30` and `wait` returned **rc 158**
+  (128 + 30), with no reload line in the log — the *default disposition*, not a handler.
+  Pre-existing and unrelated to this PR: `git diff 2dea6ba..HEAD -- frps/src/main.rs` is empty.
+  Go frps v0.71.0 rejects `--config-dir` outright (`Error: unknown flag: --config-dir`, rc 1), so
+  this lane has no Go behaviour to match; it is compared against frp-rs's own `-c` lane.
+
+  Done-when: `frps --config-dir` installs the same SIGUSR1 reload handler as `-c` (or documents
+  the divergence and pins it with a test), and a test drives a real `--config-dir` process, sends
+  SIGUSR1, and asserts the process stays alive and emits the reload summary.
+
+- [ ] **`frps --config-dir` exits 0 when every config file fails service initialisation.**
+  Same `--config-dir` branch as the item above, and the same reason it is worth recording next to
+  it. `frps/src/main.rs:221` pushes the `tokio::spawn` handle *before* the service is
+  constructed, so `handles` is non-empty even when every config fails inside the task
+  (`:222-232` logs `frps service init failed for [<path>]: …` and `return`s); the
+  `if handles.is_empty()` guard at `:239` therefore never fires, `:243-247` awaits the already
+  finished tasks, and `:248` returns ⇒ process exit 0. The single-config path exits through
+  `process::exit(e.kind().exit_code())` at `:321` instead. Reproduced at `a928887` with the same
+  one-file temp dir and **no `[auth]` token** in it (which trips the empty-token refusal):
+  * `frps -c <file>` → **rc 3**; log
+    `frps init error: security misconfiguration: CRITICAL: [auth].token / auth.tokenSource resolved empty with token auth method — server would accept ALL connections. Set a strong token in the config file.`
+  * `frps --config-dir <dir>` → **rc 0**; log
+    `frps service init failed for [<path>]: security misconfiguration: CRITICAL: [auth].token …`
+    with nothing listening on the bind port.
+  * `frps --config-dir <missing-dir>` → **rc 2**; log
+    `Failed to read config directory: No such file or directory (os error 2)` — so the directory
+    read does refuse non-zero (`frp-core::EXIT_CONFIG`); only the all-configs-failed-to-init lane
+    returns 0.
+
+  A supervisor running `frps --config-dir` therefore sees success while nothing is served. This is
+  pre-existing and unrelated to this PR (`git diff 2dea6ba..HEAD -- frps/src/main.rs` is empty).
+  The comment at `frps/src/main.rs:183-188` calls the non-zero refusals below it "a deliberate,
+  measured divergence" from Go; the init-failure path is *not* one of them — it is the rc 0 above
+  — which is what makes this read as an oversight rather than a decision.
+
+  Done-when: `frps --config-dir` with every file failing service initialisation exits non-zero
+  (the same typed exit-code lane as `-c`), and a test runs a real `--config-dir` process over an
+  all-failing directory and asserts the non-zero rc.
 - [x] **The space-separated `--strict-config false` form is an frp-rs extension presented as Go
   pflag semantics, and it parses differently from Go.** Measured on Go v0.71.0 and frp-rs
   (`frp-core/src/cli.rs`), with the same unknown-key config:
