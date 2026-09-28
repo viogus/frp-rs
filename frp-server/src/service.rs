@@ -2298,8 +2298,19 @@ impl Service {
             Some(p) => p.clone(),
             None => return Err("No config file path stored".into()),
         };
-        let new_cfg: ServerConfig = frp_core::config::load_server_config(&config_path, false)
-            .map_err(|e| format!("Failed to reload config: {e}"))?;
+        // `load_server_config_with_presence` (not the plain wrapper) so the
+        // `[web_server.tls] enable` diagnostic still reaches the log on a
+        // reload: the loader itself is silent — on the startup `-c` path it
+        // would run before `init_logging` and reach no subscriber — so every
+        // in-process load site that *does* have a sink emits it here. Measured
+        // on the base binary: a reload of a config with the key logged
+        // `web_server.tls.enable has no effect: …` before `SIGUSR1: no changes
+        // detected`; `enable` has no field, so that record was the only signal
+        // the reload gave about it.
+        let (new_cfg, presence): (ServerConfig, _) =
+            frp_core::config::load_server_config_with_presence(&config_path, false)
+                .map_err(|e| format!("Failed to reload config: {e}"))?;
+        presence.warn_inert_web_server_tls_enable();
 
         let mut changes: Vec<String> = Vec::new();
 

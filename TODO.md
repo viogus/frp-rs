@@ -5806,7 +5806,7 @@ nothing about whether the described behaviour still holds.
   field name is re-inserted rather than dropped. **Done-when:** the unmapped-key re-insert is restricted
   to keys that are not parent fields (or the nested table is refused outright), pinned by a test
   asserting a nested `password`/`user` does **not** change `web_server.password`/`web_server.user`.
-- [ ] **The `web_server.tls.enable` warning never reaches a `-c` user: the `-c` path loads the
+- [x] **The `web_server.tls.enable` warning never reaches a `-c` user: the `-c` path loads the
   config before logging exists.** `normalize_web_server_section` warns
   (`frp-core/src/config/normalize.rs`) because `enable` is inert, but the warning is emitted from
   inside the loader, and on the `-c` path the loader runs **before** `init_logging`
@@ -5826,6 +5826,71 @@ nothing about whether the described behaviour still holds.
   the captured output). Not done in the prose-only fix round: it is a behaviour change to two
   binaries, and `docs/config.md`/`CHANGELOG.md` now state the limitation instead of overstating the
   diagnostic.
+  Done: `ConfigPresence` gained `web_server_tls_enable_set`, read from the **pre-normalization** value
+  (the nested `tls` table is removed before serde, so the flag could not be recovered afterwards) and
+  surfaced by `load_server_config_uncompleted_with_presence` /
+  `load_client_config_with_presence`. The loader no longer emits the record at all — one owner — and
+  each binary warns once from `ConfigPresence::warn_inert_web_server_tls_enable` **after** its own
+  `init_logging`, at each of its load sites (`frps` `-c` and `--config-dir`; `frpc` `-c`,
+  `--config-dir` and `verify`, which had a sink before the load and keeps its record). Re-measured
+  with the v0.71.0 debug binaries, stdout and stderr captured separately, occurrence counts (probe
+  `/tmp/enable-warn-probe/run-probe.sh`, stream dirs `/tmp/enable-warn-probe/out/{before,after}/`):
+  before `frps -c` 0 / `frpc -c` 0 / `frps --config-dir` 1 / `frpc --config-dir` 1; after **1** for
+  all four, every one on **stdout** with 0 on stderr, and 0 for a config without the key. The
+  `-c` load-before-`init_logging` ordering is untouched (Go parity; the fix moves the emission, not
+  the load). The `frps/src/main.rs:`/`frpc/src/main.rs:` line numbers quoted in this item's opening
+  paragraph are the frame the defect was measured in (base `fb8d6ac`); this change moved those lines,
+  so current carriers cite the file and the symbol instead of a number. The record is
+  presence-driven, not pair-driven, so `enable = false` beside a valid pair — where TLS stays on
+  against the written value — is not silenced; the message text was made true in
+  the no-pair case it exists for (`… ; without that pair the dashboard serves plaintext HTTP`). Tests:
+  `frps/tests/warn_delivery.rs` and `frpc/tests/warn_delivery.rs` (real binary, real config, separate
+  streams, per-case free port, bounded and reaped children; each falsified with
+  `FRPS_BIN`/`FRPC_BIN` pointing at the pre-change binary — the `-c` test fails, `--config-dir` passes
+  — and with the flag mutated to `false`, where all positive shapes fail), plus
+  `frp-core/tests/web_server_tls_enable_warning.rs` for the flag, the message and the loader's
+  silence. A new CI step runs the `frps` spawn target with a count guard and a second one guards
+  `frpc`'s; the client's **reload** is pinned in-process by
+  `frp-client/tests/reload_warning_delivery.rs`. Docs updated: `docs/config.md`, `CHANGELOG.md`, the
+  test targets and `normalize_web_server_section`'s doc.
+  **Second round — both reviewers returned `MERGE after these fixes`, each finding an invisible path
+  the first round created (the same defect class this item closes).** (1) The flag detector read the raw
+  value *before* `normalize_*_config` flattens `[common]` onto the top level, so
+  `[common.web_server.tls] enable` reached the removal site but never set the flag: measured on the
+  first-round binaries `frps --config-dir` **0** (base 1), `frpc --config-dir` **0** (base 1), and the
+  same for `[common.webServer.tls]`, the inline `common = { … }` form and the shape in an `includes`
+  file; the detector now checks the four places the table can come from, in the normalizers'
+  `or_insert` order (top-level `web_server` → `common.web_server` → `webServer` → `common.webServer`),
+  and stops at the first **present** key so it mirrors what the flatten keeps. (2) The now-silent
+  wrappers are also called by the **reloads** (`frp-server/src/service.rs`, `frp-client/src/service.rs`),
+  which run long after `init_logging` and so used to get the record — and the reload summary cannot
+  report it (`enable` has no field), so the record was the only signal: measured `frps -c` reload
+  window +1 on the base binary, **0** on the first-round binaries; both reload sites now emit it,
+  pinned by `frps/tests/warn_delivery.rs` with a real `kill -USR1` and by
+  `frp-client/tests/reload_warning_delivery.rs` in-process. The `docs/config.md`/`CHANGELOG.md` wording
+  was re-derived to name the sites, the `[common]` spellings and the three shapes that deliberately get
+  nothing (`frps verify`, `.ini`, the mixed `[web_server]` + `[webServer.tls]` pair). Falsified in both
+  directions: against the pre-change binaries (plain `-c` fails) and against the first-round binaries
+  (the `[common]` and reload tests fail) — `/tmp/enable-warn-probe/out2-falsify-*.txt`. Remaining scope
+  reduction, filed below.
+- [ ] **The `frpc` admin API's config GET no longer sees the `[web_server.tls] enable` diagnostic.**
+  `frp-client/src/admin.rs`'s `config_from_file` (the admin **GET** path: `/api/proxy/{name}/config`,
+  `/api/visitor/{name}/config`, `/api/config`, on **every request**) loads the file through
+  `load_client_config` — the *file* API, not `load_*_config_from_str` — which is now silent, so the
+  record it used to get from the loader is gone. That is the **only** silent admin load site: the
+  admin **PUT** (`handle_put_config`) still delivers, because although its validate-before-write uses
+  the silent `load_client_config_from_str`, the handler then calls `reload_and_wait`, and the
+  write→reload path emits once per request. Measured end to end with an `admin`-feature `frpc` and a
+  real `frps`, three requests each (`/tmp/enable-warn-probe/run-admin-probe.sh`, output
+  `/tmp/enable-warn-probe/out3/admin-probe.txt`): startup 1 record; after 3 GETs **+0**; after 3 PUTs
+  **+3** (one per request, via the reload). At the loader API the string loader was already measured
+  1 → 0 (`frp-core/tests/web_server_tls_enable_warning.rs::the_string_loader_stays_silent`).
+  **Done-when:** either `config_from_file` emits the record itself (switch to
+  `load_client_config_with_presence` and call
+  `ConfigPresence::warn_inert_web_server_tls_enable`) — with a recorded decision on whether a
+  **per-request GET** should warn once per poll or only on a state change — or the GET's silence is
+  stated where a user of the admin API would look for it; the test target's "what it does not cover"
+  and this item move together either way.
 - [ ] **A parent-level `certFile` alias beside the parent-level canonical `tls_cert_file` is a
   `duplicate field` error — with no nested key involved at all.** serde binds `web_server.certFile`
   as an `alias` of `web_server.tls_cert_file`, so a file that writes both (in any spelling mix that

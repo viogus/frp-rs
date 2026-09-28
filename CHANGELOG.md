@@ -413,16 +413,34 @@ User-facing release notes for frp-rs.
   field, so `frps verify` exits 1 with `json: unknown field "enable"`. Accepting
   it is therefore a deliberate divergence — refusing it would reject a file frp-rs
   can serve correctly, and would split strict from non-strict exactly as the
-  `cert_file` key did — and it comes with a load-time warning, because the value
+  `cert_file` key did — and it comes with a startup warning, because the value
   is inert while the dashboard TLS is switched by a non-empty cert/key pair (the
   rule both implementations use): `enable = true` with no pair serves the
   dashboard as plaintext HTTP, and the warning is what says so. Scope of that
-  warning, measured on the v0.71.0 binaries: it is delivered when the log sink is
-  installed before the config load (`frps --config-dir`, 1 warning) and **not** on
-  the `-c` path (`frps -c` and `frpc -c`, 0 warnings — with `RUST_LOG=debug`
-  included), where the load deliberately precedes `init_logging`
-  (`frps/src/main.rs:263` vs `:290`; `frpc/src/main.rs:561` vs `:583`). Moving the
-  warning after logging on that path is filed in `TODO.md`, not done here. A
+  warning, measured on the v0.71.0 binaries before and after: it used to be
+  delivered only where the log sink was installed before the config load
+  (`frps --config-dir`, 1 warning; `frpc --config-dir`, 1) and **not** on the
+  `-c` path (`frps -c` and `frpc -c`, 0 warnings — with `RUST_LOG=debug`
+  included), where the load deliberately precedes `init_logging` (the
+  single-config branch of `frps/src/main.rs` and of `frpc/src/main.rs`), so the
+  common path served the dashboard as plaintext HTTP in silence. The warning now
+  reaches every load site that has a log sink: the loader no longer emits it (a
+  `tracing::warn` there reached no subscriber on `-c`), it carries the fact out on
+  a presence flag, and each site emits the one record — the two startup paths,
+  `frpc verify`, and the `frps`/`frpc` SIGUSR1 reload. Measured on
+  stdout / stderr: `frps -c` 1/0, `frps --config-dir` 1/0, `frpc -c` 1/0,
+  `frpc --config-dir` 1/0, the same four with the `[common]`-flattened spelling
+  1/0, `frps -c` reload +1, and 0/0 without the key. Four sites deliberately
+  get nothing: `frps verify` (its logging is never initialised), a `.ini` file
+  (the dotted section header is stored verbatim — pre-existing), a config that
+  writes `[web_server]` beside `[webServer.tls]` (the rename drops the camelCase
+  table whole, so the key never reaches the hoist), and the `frpc` admin API's
+  config GET (it loads the file on every request, so a warning there would be one
+  per poll). The admin PUT is **not** silent — it validates through the string
+  loader and then triggers a reload, which emits once per request (measured: 3
+  GETs → +0, 3 PUTs → +3, `/tmp/enable-warn-probe/run-admin-probe.sh`); the GET
+  gap is filed in `TODO.md`. The Go-parity load ordering is unchanged; only the
+  emission moved. A
   genuinely unknown nested key is still refused, as `web_server.<key>`.
 - **An empty `--log-level` / `--log-file`, and a zero `max_days`, no longer
   silence `frps` or `frpc` — or silently switch off log retention.** Go fills
