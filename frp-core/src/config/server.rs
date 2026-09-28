@@ -412,12 +412,21 @@ impl ServerConfig {
     /// `--bind-addr` moves the proxy listeners too — measured end to end, see
     /// `docs/developing.md` § CLI inputs § 2b).
     pub fn complete(&mut self) {
+        // Go frp: `ServerConfig.Complete()` runs `c.Auth.Complete()` FIRST
+        // (`pkg/config/v1/server.go:102`), before `c.Log.Complete()` (`:105`).
+        // This is that call — the empty `auth.method` → `token` fill
+        // (`AuthServerConfig::complete`). The load path already runs it inside
+        // `validate_server_config` (Go's Complete→Validate order), so by the time
+        // a config arrives here the field is normally non-empty and this is a
+        // no-op; it matters for a config built directly (tests, future callers)
+        // and keeps the two entry points from diverging.
+        let _ = self.auth.complete();
         // Go frp: `c.Log.Complete()` (`pkg/config/v1/server.go:105`) is the
         // FIRST field completion in `ServerConfig.Complete()`, right after
         // `c.Auth.Complete()` (`:102`) — before `Transport`, `WebServer` and
         // `SSHTunnelGateway` (`:106-108`) and before the `BindAddr`/`BindPort`/
-        // `ProxyBindAddr` fills at `:110-114`. frp-core has no Auth completion
-        // step, so this call is in the same slot, at the top of the function.
+        // `ProxyBindAddr` fills at `:110-114`. frp-core had no Auth completion
+        // step; the two now run in Go's order.
         //
         // Why it is needed at all: an explicit `--log-level ""` / `--log-file ""`
         // / `--log-max-days 0` is written into the struct by
@@ -753,6 +762,25 @@ pub struct AuthServerConfig {
     /// frps and frpc unconditionally wrap the control stream in CryptoReadWriter.
     #[serde(default)]
     pub use_encryption: bool,
+}
+
+impl AuthServerConfig {
+    /// Go frp v0.71.0 `AuthServerConfig.Complete()`
+    /// (`pkg/config/v1/server.go:136-139`): `c.Method = util.EmptyOr(c.Method,
+    /// "token")`. Returns `Err` only to mirror Go's signature — the fill itself
+    /// cannot fail and Go's `AuthClientConfig.Complete()` is `error`-typed for
+    /// the same reason.
+    ///
+    /// The empty value here comes from the serde lane, not from `Default`:
+    /// `#[serde(default)]` on `method` yields the *string* default (`""`) when
+    /// the key is absent, while `AuthServerConfig::default()` says `"token"`.
+    /// So an absent `[auth] method` and an explicit `method = ""` are both the
+    /// zero value, and both are filled — exactly Go's behaviour, where
+    /// `EmptyOr` sees the zero value in both cases.
+    pub fn complete(&mut self) -> Result<(), String> {
+        crate::auth::complete_auth_method(&mut self.method);
+        Ok(())
+    }
 }
 
 impl Default for AuthServerConfig {

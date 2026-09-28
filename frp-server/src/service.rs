@@ -41,27 +41,38 @@ fn build_auth_config(
     auth: &frp_core::config::AuthServerConfig,
     unsafe_features: &UnsafeFeatures,
 ) -> Result<AuthConfig, String> {
-    // Refuse an `auth.method = "oidc"` config in an oidc-less build *before*
-    // resolving a token source: the method is the decisive reason the config
-    // cannot work, so a broken source must neither mask it nor be executed for a
-    // config that is going to be rejected. (frp-core's `oidc` can be ON here
-    // through feature unification while frp-server's own is off; the feature that
-    // matters is the one that supplies the verifier, i.e. this crate's.) Before
-    // this check the config fell through to `Token` — the operator asked for OIDC
-    // and got a token-auth server that accepts anyone holding the token.
-    let method = match auth.method.to_lowercase().as_str() {
-        "oidc" => {
-            #[cfg(feature = "oidc")]
-            {
-                AuthMethod::Oidc
-            }
-            #[cfg(not(feature = "oidc"))]
-            {
-                return Err(frp_core::auth::OIDC_FEATURE_REQUIRED.to_string());
-            }
+    // The method parse is the shared `frp_core::auth` policy, not a local match:
+    // Go compares the method exactly against `SupportedAuthMethods`
+    // (`pkg/config/v1/validation/server.go:31`) after `Auth.Complete()` has
+    // filled an empty one to `token` (`pkg/config/v1/server.go:136-139`), so
+    // nothing but the two names is accepted and no spelling is folded to lower
+    // case. The load path already rejects an unrecognised spelling with Go's
+    // text (`frp-core/src/config/loader.rs`), so this call is the
+    // construction-time backstop for a `ServerConfig` that never went through
+    // the loader (the unit tests below build one directly) — it must not be the
+    // *first* check, or a bad spelling would reach the exit-3 construction path
+    // instead of Go's exit-1 load error.
+    //
+    // History: this used to be `match auth.method.to_lowercase().as_str()` with
+    // `_ => Token`. `"OIDC"` therefore selected OIDC (Go errors) while
+    // `" oidc"`, `"oidc "`, `"tokenn"` and the Cyrillic-о lookalike selected
+    // **token** — an operator who asked for OIDC got a token-auth server that
+    // accepts anyone holding the token.
+    let method = frp_core::auth::parse_auth_method(&auth.method)?;
+    // The feature refusal is keyed off the *parsed* method, so `"OIDC"` is now
+    // an error like Go's rather than (pre-change) OIDC or a feature error.
+    // (frp-core's `oidc` can be ON here through feature unification while
+    // frp-server's own is off; the feature that matters is the one that supplies
+    // the verifier, i.e. this crate's.) The refusal stays ahead of token-source
+    // resolution: the method is the decisive reason the config cannot work, so a
+    // broken source must neither mask it nor be executed for a config that is
+    // going to be rejected.
+    if method == AuthMethod::Oidc {
+        #[cfg(not(feature = "oidc"))]
+        {
+            return Err(frp_core::auth::OIDC_FEATURE_REQUIRED.to_string());
         }
-        _ => AuthMethod::Token,
-    };
+    }
     let token_source = auth.token_source.clone();
     let token = if let Some(ref source) = token_source {
         frp_core::config::validate_auth_token_source(&auth.token, &auth.token_source)?;

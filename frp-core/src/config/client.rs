@@ -156,6 +156,21 @@ pub struct AuthClientConfig {
     pub token_auth_timeout: bool,
 }
 
+impl AuthClientConfig {
+    /// Go frp v0.71.0 `AuthClientConfig.Complete()`
+    /// (`pkg/config/v1/client.go:206-209`): `c.Method = util.EmptyOr(c.Method,
+    /// "token")`. The `Result` mirrors Go's `error`-typed signature; the fill
+    /// cannot fail.
+    ///
+    /// See [`crate::config::AuthServerConfig::complete`] for why the empty
+    /// value arrives from the serde lane (`#[serde(default)]` on `method` is
+    /// `""`, not the `Default` impl's `"token"`).
+    pub fn complete(&mut self) -> Result<(), String> {
+        crate::auth::complete_auth_method(&mut self.method);
+        Ok(())
+    }
+}
+
 impl Default for AuthClientConfig {
     fn default() -> Self {
         Self {
@@ -426,6 +441,19 @@ impl ClientConfig {
         heartbeat_interval_set: bool,
         heartbeat_timeout_set: bool,
     ) {
+        // Go frp: `ClientCommonConfig.Complete()` runs `c.Auth.Complete()`
+        // (`pkg/config/v1/client.go:91`, implemented at `:206-209` as
+        // `util.EmptyOr(c.Method, "token")`) before `c.Log.Complete()` at `:94`.
+        // This is that call. The load path already ran it inside
+        // `validate_client_config` (Go's Complete→Validate order), so it is
+        // usually a no-op here; it covers a `ClientConfig` built directly and
+        // keeps the two entry points from diverging. `[auth]` is optional on the
+        // client, so an absent section is left absent (Go's `AuthClientConfig`
+        // is a value there, but its `Complete` is the same no-op on a filled
+        // `"token"`).
+        if let Some(auth) = self.auth.as_mut() {
+            let _ = auth.complete();
+        }
         // Go frp v0.71.0 `ClientCommonConfig.Complete()` calls
         // `c.WebServer.Complete()` (`pkg/config/v1/client.go:96`), which is
         // `c.Addr = util.EmptyOr(c.Addr, "127.0.0.1")`

@@ -86,7 +86,7 @@ server_name = "s"
 bind_port = 7000
 protocol = ""
 "#;
-    let cfg = load_client_config_from_str(toml).expect("config loads");
+    let mut cfg = load_client_config_from_str(toml).expect("config loads");
     let visitor = cfg
         .visitors
         .iter()
@@ -97,7 +97,7 @@ protocol = ""
         "empty protocol must normalize to quic"
     );
     // And it passes validation (a literal "" would be rejected).
-    super::loader::validate_client_config(&cfg).expect("empty protocol validates as quic");
+    super::loader::validate_client_config(&mut cfg).expect("empty protocol validates as quic");
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn test_visitor_config_validation_matches_go() {
         ..Default::default()
     };
     let err = |v: VisitorConfig| {
-        super::loader::validate_client_config(&ClientConfig {
+        super::loader::validate_client_config(&mut ClientConfig {
             visitors: vec![v],
             ..Default::default()
         })
@@ -139,7 +139,7 @@ fn test_visitor_config_validation_matches_go() {
     // Negative bind_port is Go's no-bind sentinel — must pass validation.
     let mut ok = mk("v", "s", -1, "quic");
     ok.bind_port = -1;
-    assert!(super::loader::validate_client_config(&ClientConfig {
+    assert!(super::loader::validate_client_config(&mut ClientConfig {
         visitors: vec![ok],
         ..Default::default()
     })
@@ -160,7 +160,7 @@ fn test_unknown_visitor_type_rejected() {
         ..Default::default()
     };
     let err = |v: VisitorConfig| {
-        super::loader::validate_client_config(&ClientConfig {
+        super::loader::validate_client_config(&mut ClientConfig {
             visitors: vec![v],
             ..Default::default()
         })
@@ -172,7 +172,7 @@ fn test_unknown_visitor_type_rejected() {
     // All three valid types pass.
     for t in ["stcp", "sudp", "xtcp"] {
         assert!(
-            super::loader::validate_client_config(&ClientConfig {
+            super::loader::validate_client_config(&mut ClientConfig {
                 visitors: vec![mk(t)],
                 ..Default::default()
             })
@@ -2113,6 +2113,80 @@ fn test_auth_client_config_oidc_method() {
     assert_eq!(cfg.oidc_audience, "https://api.example.com");
 }
 
+/// The load-path half of the one `auth.method` policy
+/// (`frp_core::auth::parse_auth_method`): both config entry points complete an
+/// empty method to `token` (Go's `AuthServerConfig.Complete`,
+/// `pkg/config/v1/server.go:136-139`) and reject anything that is not exactly
+/// `token`/`oidc` with Go's text (`validation/server.go:31`,
+/// `validation/client.go:101`). Before this, `"OIDC"` loaded on the client and
+/// skipped its OIDC client-credentials check, while the server lowercased the
+/// same spelling into OIDC.
+///
+/// Measured against Go v0.71.0 (`frps -c <method = "OIDC">`): rc 1, 54 B
+/// stdout, 0 B stderr, stdout exactly
+/// `invalid auth method, optional values are [token oidc]\n`. This test pins
+/// the *text* returned by the loaders; the rc and the stream belong to the CLI
+/// probes in `frps/tests/cli_exit_codes.rs` and `frpc/tests/cli_exit_codes.rs`.
+#[test]
+fn auth_method_is_completed_then_validated_exactly() {
+    const GO_TEXT: &str = "invalid auth method, optional values are [token oidc]";
+
+    // 1. Client, `[auth]` present with the method absent or explicitly empty →
+    //    completed to `token` and loads. This is Go's `util.EmptyOr`; it must
+    //    keep working.
+    for empty in [
+        "[auth]\ntoken = \"t\"\n",
+        "[auth]\ntoken = \"t\"\nmethod = \"\"\n",
+    ] {
+        let toml = format!("serverAddr = \"127.0.0.1\"\n{empty}");
+        let cfg = load_client_config_from_str(&toml)
+            .unwrap_or_else(|e| panic!("{empty:?} must load (empty → token): {e}"));
+        assert_eq!(
+            cfg.auth.as_ref().map(|a| a.method.as_str()),
+            Some("token"),
+            "the loader must hand on the completed value"
+        );
+    }
+
+    // 2. Server, same shape.
+    let cfg = load_server_config_from_str("bindPort = 7100\n\n[auth]\ntoken = \"t\"\n")
+        .expect("a server config with no method must load (empty → token)");
+    assert_eq!(cfg.auth.method, "token");
+
+    // 3. Client, every spelling Go rejects. The `oidc` fields are deliberately
+    //    EMPTY: with the old `auth.method != "oidc"` early return the
+    //    client-credentials check was skipped for all of these, so this also
+    //    asserts the method error *wins* over the missing-`clientID` error and
+    //    carries Go's text rather than "auth.oidc.clientID is required".
+    for bad in ["OIDC", "Oidc", " oidc", "oidc ", "tokenn", "\u{043e}idc"] {
+        let toml = format!("serverAddr = \"127.0.0.1\"\n\n[auth]\nmethod = \"{bad}\"\n");
+        let err = load_client_config_from_str(&toml)
+            .expect_err(&format!("client method {bad:?} must be a load error"))
+            .to_string();
+        assert!(
+            err.ends_with(GO_TEXT),
+            "client method {bad:?}: expected Go's text, got {err:?}"
+        );
+        assert!(
+            !err.contains("clientID"),
+            "client method {bad:?}: the method check must precede the OIDC \
+             credentials check; got {err:?}"
+        );
+    }
+
+    // 4. Server, same spellings.
+    for bad in ["OIDC", " oidc", "tokenn"] {
+        let toml = format!("bindPort = 7100\n\n[auth]\nmethod = \"{bad}\"\n");
+        let err = load_server_config_from_str(&toml)
+            .expect_err(&format!("server method {bad:?} must be a load error"))
+            .to_string();
+        assert!(
+            err.ends_with(GO_TEXT),
+            "server method {bad:?}: expected Go's text, got {err:?}"
+        );
+    }
+}
+
 #[test]
 fn test_ssh_tunnel_gateway_config_snake_case() {
     let toml = r#"
@@ -3167,7 +3241,7 @@ fn load_server_config_from_yaml(yaml: &str) -> Result<ServerConfig, Box<dyn std:
     let json_value = super::normalize::toml_to_json(value);
     let mut cfg: ServerConfig =
         serde_json::from_value(json_value).map_err(|e| format!("config validation error: {e}"))?;
-    super::loader::validate_server_config(&cfg)?;
+    super::loader::validate_server_config(&mut cfg)?;
     cfg.transport
         .complete_with_heartbeat_timeout_set(presence.server_heartbeat_timeout_set);
     cfg.complete();
@@ -3183,7 +3257,7 @@ fn load_client_config_from_yaml(yaml: &str) -> Result<ClientConfig, Box<dyn std:
     let presence = super::loader::ConfigPresence::from_normalized_value(&value);
     let mut cfg: ClientConfig = serde_json::from_value(super::normalize::toml_to_json(value))
         .map_err(|e| format!("config validation error: {e}"))?;
-    super::loader::validate_client_config(&cfg)?;
+    super::loader::validate_client_config(&mut cfg)?;
     cfg.complete_with_heartbeat_set(
         presence.client_heartbeat_interval_set,
         presence.client_heartbeat_timeout_set,
@@ -3441,7 +3515,7 @@ fn load_client_config_from_json(json: &str) -> Result<ClientConfig, Box<dyn std:
     let presence = super::loader::ConfigPresence::from_normalized_value(&value);
     let mut cfg: ClientConfig = serde_json::from_value(super::normalize::toml_to_json(value))
         .map_err(|e| format!("config validation error: {e}"))?;
-    super::loader::validate_client_config(&cfg)?;
+    super::loader::validate_client_config(&mut cfg)?;
     cfg.complete_with_heartbeat_set(
         presence.client_heartbeat_interval_set,
         presence.client_heartbeat_timeout_set,
@@ -5668,10 +5742,10 @@ fn load_client_ini(content: &str) -> Result<ClientConfig, Box<dyn std::error::Er
     // `.ini` inputs read values by target type, exactly as
     // `load_config_from_file` does (Go's legacy INI model) — not the strict
     // serde path TOML/JSON/YAML use.
-    let cfg: ClientConfig =
+    let mut cfg: ClientConfig =
         super::ini_lenient::deserialize_ini(&super::normalize::toml_to_json(value))
             .map_err(|e| format!("config validation error: {e}"))?;
-    super::validate_client_config(&cfg)?;
+    super::validate_client_config(&mut cfg)?;
     Ok(cfg)
 }
 
@@ -5682,10 +5756,10 @@ fn load_server_ini(content: &str) -> Result<ServerConfig, Box<dyn std::error::Er
         super::normalize::canonicalize_legacy_ini_bools(table);
     }
     super::normalize::normalize_server_config(&mut value);
-    let cfg: ServerConfig =
+    let mut cfg: ServerConfig =
         super::ini_lenient::deserialize_ini(&super::normalize::toml_to_json(value))
             .map_err(|e| format!("config validation error: {e}"))?;
-    super::validate_server_config(&cfg)?;
+    super::validate_server_config(&mut cfg)?;
     Ok(cfg)
 }
 

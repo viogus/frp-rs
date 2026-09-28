@@ -142,10 +142,22 @@ jobs:
       # flip control replaced the single-name store test rather than adding one.
       # `FRPC_TINY_CLI_TESTS` therefore stays 11, while the `full` lane in
       # "Run frpc CLI tests" went 9 → 10.
-      FRPS_CLI_TESTS: "27"
+      # 27 → 29 with the one `auth.method` policy (the `frps` half of it): +2
+      # (`invalid_auth_method_exits_1_like_go_and_names_the_accepted_values`,
+      # `empty_auth_method_completes_to_token_and_the_server_runs`). The
+      # client's half of the same change does not move *this* literal: it added
+      # tests to `frpc/tests/cli_exit_codes.rs` (the other literal below) and to
+      # `frp-client`'s lib tests, which no guarded lane counts.
+      FRPS_CLI_TESTS: "29"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
-      FRPC_TINY_CLI_TESTS: "11"
+      # 11 → 13 with the one `auth.method` policy: +2
+      # (`verify_and_run_refuse_a_non_exact_auth_method_like_go`,
+      # `empty_auth_method_completes_to_token_on_both_client_paths`). This lane
+      # runs `frpc-tiny`, so it is also the only *spawn-level* witness that an
+      # oidc-less build refuses `"OIDC"` with Go's text instead of starting a
+      # token client.
+      FRPC_TINY_CLI_TESTS: "13"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4

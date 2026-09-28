@@ -237,6 +237,90 @@ pub const OIDC_FEATURE_REQUIRED: &str =
     "auth.method = \"oidc\" requires the \"oidc\" feature, which this build was compiled \
      without — rebuild with it or set auth.method = \"token\"";
 
+/// The two method names Go frp v0.71.0 accepts, in the order Go prints them
+/// (`pkg/config/v1/validation/validation.go:37-40`). Used only by the unit test
+/// that pins [`INVALID_AUTH_METHOD`]'s bracket rendering, so it is `#[cfg(test)]`.
+#[cfg(test)]
+const SUPPORTED_AUTH_METHODS: [&str; 2] = ["token", "oidc"];
+
+/// The load-error text for an unrecognised `auth.method`, byte-for-byte Go
+/// v0.71.0's (`pkg/config/v1/validation/server.go:32`, `client.go:102`):
+/// `fmt.Errorf("invalid auth method, optional values are %v", SupportedAuthMethods)`
+/// over a `[]v1.AuthMethod{"token", "oidc"}` prints the slice in Go's bracket
+/// form.
+///
+/// Measured on the real binaries (v0.71.0 darwin/arm64, own config and free
+/// port per case, stdout/stderr redirected to separate files and `rc` read from
+/// `wait` on the direct child): `frps -c <method = "OIDC">` → **rc 1,
+/// 54 B stdout, 0 B stderr**, whole stdout exactly
+/// `invalid auth method, optional values are [token oidc]\n` — the 53-byte
+/// message plus one `\n` (`xxd` on the captured file: the last byte is `0a`),
+/// which is what `println!("{e}")` produces. `frpc` prints the same 54 B on
+/// stdout with rc 1.
+pub const INVALID_AUTH_METHOD: &str = "invalid auth method, optional values are [token oidc]";
+
+/// The one `auth.method` parse policy, mirroring Go frp v0.71.0.
+///
+/// Go compares the method **exactly** against `SupportedAuthMethods`
+/// (`slices.Contains`, `pkg/config/v1/validation/server.go:31` and
+/// `client.go:101`): case-sensitive, no trimming, and an unrecognised value is
+/// a **load error** — not a fallback to token auth. Two measured consequences
+/// of that exactness, both reproduced against the real v0.71.0 binaries:
+/// `method = "OIDC"` and `method = " oidc"` each exit **1** with
+/// [`INVALID_AUTH_METHOD`] on stdout, while `method = ""` completes to `token`
+/// (Go's `AuthServerConfig.Complete`, `pkg/config/v1/server.go:136-139`, and
+/// `AuthClientConfig.Complete`, `client.go:206-209`, both
+/// `util.EmptyOr(c.Method, "token")`) and starts.
+///
+/// **`""` is accepted here and maps to `Token`** so that this function is the
+/// whole policy: every caller must first run [`complete_auth_method`] (Go's
+/// `Complete` step), which is the only way the empty string reaches
+/// `parse_auth_method`. Doing the fill here instead would make an
+/// explicit-empty method indistinguishable from a typo at the call site, and
+/// the fill is *not* the validation (Go's ordering is Complete → Validate, so
+/// `""` is a valid value only because Complete already replaced it).
+///
+/// Callers were previously inconsistent (see `TODO.md`, the two items closed by
+/// this change): the server lowercased the method, so `"OIDC"` selected OIDC
+/// while `" oidc"`/`"tokenn"` selected **token** — a silent downgrade of an
+/// operator's auth intent; the client compared `== "oidc"` exactly, so
+/// `"OIDC"` selected **token** against a server that (at the pre-change head)
+/// selected OIDC; and the client-credentials validation skipped anything that
+/// was not exactly `"oidc"`.
+pub fn parse_auth_method(method: &str) -> Result<AuthMethod, String> {
+    match method {
+        "token" => Ok(AuthMethod::Token),
+        "oidc" => Ok(AuthMethod::Oidc),
+        // Not the empty string: that is completed to "token" by
+        // `complete_auth_method` before this runs (Go's Complete→Validate
+        // order). Reaching this arm with "" means a caller skipped the fill;
+        // `auth_method_error()` is still the right text because Go's validator
+        // would reject "" too if Complete had not run.
+        _ => Err(auth_method_error()),
+    }
+}
+
+/// Go's `util.EmptyOr(c.Method, "token")` — the completion step of Go's
+/// `AuthServerConfig.Complete` / `AuthClientConfig.Complete`
+/// (`pkg/config/v1/server.go:136-139`, `client.go:206-209`). Fills an **empty**
+/// method with `token` and returns whether anything was filled.
+///
+/// Only the empty string is filled: Go's `EmptyOr` tests the type's zero value,
+/// and for a string that is `""`. An explicit `method = "token"` is unchanged.
+pub fn complete_auth_method(method: &mut String) -> bool {
+    if method.is_empty() {
+        *method = "token".into();
+        return true;
+    }
+    false
+}
+
+/// The load-error text for a method Go does not accept — one function for every
+/// site, so all four report the same string.
+pub fn auth_method_error() -> String {
+    INVALID_AUTH_METHOD.to_string()
+}
+
 impl AuthConfig {
     /// Resolve the current auth token.
     ///
@@ -3025,6 +3109,74 @@ pub fn validate_token_source_unsafe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_auth_method_matches_go_exactly() {
+        // The accepted spellings, exactly (Go `slices.Contains` over
+        // `SupportedAuthMethods`, `pkg/config/v1/validation/server.go:31`).
+        assert_eq!(parse_auth_method("token").unwrap(), AuthMethod::Token);
+        assert_eq!(parse_auth_method("oidc").unwrap(), AuthMethod::Oidc);
+
+        // Reproduced against Go v0.71.0 darwin/arm64, own config and free port
+        // per case, streams separate, rc from `wait`: each of these exits 1 with
+        // `invalid auth method, optional values are [token oidc]` on stdout and
+        // 0 bytes on stderr. The Cyrillic-о case is a homoglyph, not a Unicode
+        // normalisation question: Go does no normalisation either.
+        for bad in [
+            "OIDC",
+            "Oidc",
+            "TOKEN",
+            "Token",
+            " oidc",
+            "oidc ",
+            "oidc\t",
+            "tokenn",
+            "\u{043e}idc",
+            // The empty string is not in this list: it is the one input
+            // `complete_auth_method` fills (Go's `util.EmptyOr`), and reaching
+            // `parse_auth_method` with it means a caller skipped the fill.
+            "",
+        ] {
+            let err = parse_auth_method(bad)
+                .expect_err(&format!("{bad:?} must be rejected (Go rejects it)"));
+            assert_eq!(
+                err, INVALID_AUTH_METHOD,
+                "{bad:?} must carry Go's exact text"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_auth_method_text_is_go_bracket_rendering() {
+        // `fmt.Errorf("invalid auth method, optional values are %v", SupportedAuthMethods)`
+        // (`pkg/config/v1/validation/server.go:32`) prints a `[]v1.AuthMethod`
+        // as `[token oidc]` with single spaces and no quotes.
+        assert_eq!(
+            auth_method_error(),
+            format!(
+                "invalid auth method, optional values are [{}]",
+                SUPPORTED_AUTH_METHODS.join(" ")
+            )
+        );
+        // The measured Go stdout is these 53 bytes plus one `\n` (54 B total).
+        assert_eq!(INVALID_AUTH_METHOD.len(), 53);
+        assert!(!INVALID_AUTH_METHOD.ends_with('\n'));
+    }
+
+    #[test]
+    fn complete_auth_method_fills_only_the_empty_string() {
+        let mut m = String::new();
+        assert!(complete_auth_method(&mut m), "an empty method is filled");
+        assert_eq!(m, "token");
+
+        // Everything else is left byte-for-byte, including the spellings Go
+        // rejects — the fill must not become a normaliser.
+        for untouched in ["oidc", "OIDC", " oidc", "token"] {
+            let mut m = untouched.to_string();
+            assert!(!complete_auth_method(&mut m), "{untouched:?} is not filled");
+            assert_eq!(m, untouched);
+        }
+    }
 
     #[test]
     fn test_token_gen_and_verify() {

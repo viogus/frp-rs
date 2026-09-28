@@ -1005,6 +1005,10 @@ valid config (plus the variations named):
 | `frpc` with `[store] path` → the same file content, named `plainstore.json` | 1 | **4** (unchanged) |
 | `frps` with `[auth] method = "token"`, `token = ""` | **does not exit** (starts and runs) | **3** — hardening divergence, not a code divergence |
 | `frps` with `[auth] method = "oidc"` and no issuer | **2** (panics) | **3** — frp-rs refuses where Go panics |
+| `frps` / `frpc` with `[auth] method = "OIDC"` (also `"Oidc"`, `" oidc"`, `"oidc "`, `"tokenn"`, a Cyrillic-о lookalike) | 1 | **1** — matched 2026-09-28 with the streams separate: Go stdout **54 B**, stderr **0 B**, whole stdout `invalid auth method, optional values are [token oidc]\n`; frp-rs stdout is that same 53-byte message **plus its `<path>: ` loader prefix and a final `\n`, so the byte count is path-dependent** (100 B for the 45-character path measured here; a reviewer measured 129 B for a 73-character one), stderr **0 B** |
+| `frps` / `frpc` with `[auth] method = ""` (or no `method` key) | starts (rc only changes when signalled) | starts — Go's `util.EmptyOr(c.Method, "token")`, `pkg/config/v1/server.go:136-139` / `client.go:206-209` |
+| `frpc verify -c <method = "OIDC">` | 1 | **1** — `Config file <path> is invalid: <path>: invalid auth method, …` on stdout, stderr 0 B (was **0**, `is valid`, before the shared policy) |
+| `frpc verify -c <method = "oidc">` with **no** `auth.oidc.clientID`/`tokenEndpointURL` | 1 — **both** missing fields, joined: `auth.oidc.clientID is required; auth.oidc.tokenEndpointURL is required` (**71 B** stdout, 0 B stderr) | **1** — only the first: `auth.oidc.clientID is required`. Recorded divergence: Go's `ValidateOIDCClientCredentialsConfig` accumulates **every** message and joins them with `"; "` (`pkg/config/v1/validation/oidc.go:25-57`, called from `validation/client.go:113-117`), while frp-rs's `validate_oidc_client_config` returns at the first |
 | `frpc --config-dir <nonexistent\|empty\|bad>` | **0** | **2** (deliberate) |
 | `frpc --config-dir <good>`, service cannot run | 0 (0.026 s) | 0 (0.026 s) |
 | `frps --config-dir <…>` | 1 — `unknown flag: --config-dir` | 2 (extension flag) |
@@ -2894,7 +2898,10 @@ in the documented help-document bytes). The unit rows are
 `help_bool_value_form_uses_go_bool_spellings` and
 `shorthand_cluster_needing_a_value_is_detected` (`frp-core/src/cli.rs`); the
 `frpc` integration lanes are untouched, so `env.FRPC_TINY_CLI_TESTS` stays `11`
-and `env.FRPS_CLI_TESTS` stays `27`.
+and `env.FRPS_CLI_TESTS` stays `27` — those two are that round's values, not the
+current ones: the `auth.method` round moved them to `13` and `29`
+(`.github/workflows/ci.yml` is the single home; this paragraph is a record of
+what the help-bool round left behind).
 
 ### Repository Invariants (`repo-health.sh`)
 

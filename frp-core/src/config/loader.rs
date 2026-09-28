@@ -153,7 +153,7 @@ pub fn load_server_config_from_str(
     let json_value = toml_to_json(value);
     let mut cfg: ServerConfig =
         serde_json::from_value(json_value).map_err(|e| format!("config validation error: {e}"))?;
-    validate_server_config(&cfg)?;
+    validate_server_config(&mut cfg)?;
     cfg.transport
         .complete_with_heartbeat_timeout_set(presence.server_heartbeat_timeout_set);
     cfg.complete();
@@ -171,7 +171,7 @@ pub fn load_client_config_from_str(
     let presence = ConfigPresence::from_normalized_value(&value);
     let mut cfg: ClientConfig = serde_json::from_value(toml_to_json(value))
         .map_err(|e| format!("config validation error: {e}"))?;
-    validate_client_config(&cfg)?;
+    validate_client_config(&mut cfg)?;
     cfg.complete_with_heartbeat_set(
         presence.client_heartbeat_interval_set,
         presence.client_heartbeat_timeout_set,
@@ -410,7 +410,13 @@ fn validate_oidc_client_config(auth: &AuthClientConfig) -> Result<(), String> {
             .map_err(|e| format!("invalid auth.oidc.tokenSource: {e}"));
     }
 
-    // Client-credentials validation only applies to the OIDC method.
+    // Client-credentials validation only applies to the OIDC method. The
+    // comparison is exact, and that is now the *validated* form of the field:
+    // `validate_client_config` has already run the one
+    // `crate::auth::complete_auth_method` + `parse_auth_method` policy over
+    // it, so `method` here is exactly `"token"` or `"oidc"` (or the field is
+    // absent). Before that, `method = "OIDC"` skipped this whole block and the
+    // config loaded with no `clientID`.
     if auth.method != "oidc" {
         return Ok(());
     }
@@ -452,7 +458,16 @@ fn validate_oidc_client_config(auth: &AuthClientConfig) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn validate_server_config(cfg: &ServerConfig) -> Result<(), String> {
+pub(super) fn validate_server_config(cfg: &mut ServerConfig) -> Result<(), String> {
+    // `auth.method` first, in Go's order: `ServerConfig.Complete()` runs
+    // `Auth.Complete()` — the empty→token fill, `pkg/config/v1/server.go:136-139`
+    // — and only then does `ValidateServerConfig` (`validation/server.go:31`)
+    // check the value. The load path must fill before it checks, or
+    // `method = ""` (Go's "use the default", and the state of every config with
+    // no `[auth] method` key at all, since serde's string default is `""`) would
+    // be rejected as an unrecognised method.
+    cfg.auth.complete()?;
+    crate::auth::parse_auth_method(&cfg.auth.method)?;
     validate_auth_token_source(&cfg.auth.token, &cfg.auth.token_source)?;
     // Go frp v0.71.0: unknown feature gates are config errors, not a silent
     // fail-open (featuregate SetFromMap "unrecognized feature gate").
@@ -495,7 +510,7 @@ pub(super) fn validate_server_config(cfg: &ServerConfig) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn validate_client_config(cfg: &ClientConfig) -> Result<(), String> {
+pub(super) fn validate_client_config(cfg: &mut ClientConfig) -> Result<(), String> {
     validate_proxy_configs(&cfg.proxies)?;
     validate_no_duplicate_names(&cfg.proxies, &cfg.visitors)?;
     // Go frp v0.71.0 validation/visitor.go:42-63 (round 10 MEDIUM): visitors
@@ -551,11 +566,31 @@ pub(super) fn validate_client_config(cfg: &ClientConfig) -> Result<(), String> {
         crate::feature_gate::validate_keys(&cfg.feature.gates)
             .map_err(|e| format!("client config: {e}"))?;
     }
-    if let Some(auth) = &cfg.auth {
-        let token = if cfg.token.is_empty() {
+    // Split borrows on purpose (`&cfg.token`, `&mut cfg.auth`): the
+    // deprecated flat `token` key is read, never copied — the auth token is a
+    // secret and this file does not clone it into a local.
+    let flat_token = &cfg.token;
+    if let Some(auth) = cfg.auth.as_mut() {
+        // Go's `ClientCommonConfig.Complete()` runs `Auth.Complete()` — the
+        // empty→token fill — at `pkg/config/v1/client.go:91`
+        // (`AuthClientConfig.Complete`, `:206-209`) and *then* validation
+        // checks the method (`validation/client.go:101`, reached from
+        // `ValidateAllClientConfig`). So the fill has to precede the check, and
+        // filling `cfg.auth` itself (not a local copy) is what makes
+        // `method = ""` both start as token and hand the completed value on to
+        // the service. This is the site the old `auth.method != "oidc"`
+        // early-return lived at: it skipped client-credentials validation for
+        // every non-exact spelling, so `method = "OIDC"` with an empty
+        // `clientID` loaded silently. It is now rejected with the same text the
+        // other three sites use.
+        auth.complete()?;
+        crate::auth::parse_auth_method(&auth.method)?;
+        // `cfg.token` is the deprecated flat spelling; the nested
+        // `[auth] token` wins only when the flat one is empty.
+        let token: &str = if flat_token.is_empty() {
             auth.token.as_str()
         } else {
-            cfg.token.as_str()
+            flat_token.as_str()
         };
         validate_auth_token_source(token, &auth.token_source)?;
         validate_oidc_client_config(auth)?;
