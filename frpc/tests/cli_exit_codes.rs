@@ -714,3 +714,159 @@ mod tiny {
         );
     }
 }
+
+// ── `auth.method`: the one policy, at the client's two sites ─────────────────
+
+/// Go frp v0.71.0's method set is `{"token", "oidc"}` compared **exactly**
+/// (`pkg/config/v1/validation/client.go:101` via `SupportedAuthMethods`,
+/// `validation/validation.go:37-40`) after `AuthClientConfig.Complete()` filled
+/// an empty method to `token` (`pkg/config/v1/client.go:206-209`). Measured on
+/// the real `frpc` v0.71.0 (darwin/arm64), own config and free port:
+/// `method = "OIDC"` → **rc 1, 54 B stdout, 0 B stderr**, whole stdout
+/// `invalid auth method, optional values are [token oidc]\n`; `method = ""`
+/// starts.
+///
+/// **Sites 2 and 3** of the client: `refuse_oidc_method_without_feature` (the
+/// check `frpc verify` shares with `frpc run`) and the construction parse in
+/// `Service::with_unsafe_features`. Both used to compare `== "oidc"`, so
+/// `"OIDC"` built a **token** client — against a server that (at the pre-change
+/// head) lowercased the same spelling into OIDC. `verify` reported the config
+/// **valid** (rc 0).
+#[test]
+fn verify_and_run_refuse_a_non_exact_auth_method_like_go() {
+    let dir = TempDir::new();
+    // `oidcClientID` is deliberately absent: with the old `!= "oidc"` early
+    // return the OIDC client-credentials check was skipped for this spelling,
+    // and `frpc verify` said "valid". The text below is what must win instead.
+    let cfg = dir.write(
+        "badmethod.toml",
+        "serverAddr = \"127.0.0.1\"\nserverPort = 7000\n\n[auth]\nmethod = \"OIDC\"\ntoken = \"t\"\n",
+    );
+
+    // `verify` (site 2 — the shared helper).
+    let out = run_frpc(&["verify", "-c", &cfg]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "frpc verify must refuse an unrecognised auth.method (Go exits 1); \
+         stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert_eq!(
+        stdout_of(&out),
+        format!(
+            "Config file {cfg} is invalid: {cfg}: invalid auth method, optional values are [token oidc]\n"
+        ),
+        "verify's refusal must carry Go's text and frp-rs's path prefix, on stdout; \
+         stderr={:?}",
+        stderr_of(&out),
+    );
+    assert!(
+        stderr_of(&out).is_empty(),
+        "Go prints nothing on stderr here; stderr={:?}",
+        stderr_of(&out),
+    );
+
+    // `run` (site 3 — the construction parse). The load path refuses this too,
+    // so the load error is what a CLI run reaches; the construction parse is
+    // pinned ungated by
+    // `frp-client`'s `construction_refuses_a_non_exact_auth_method`, and for a
+    // config that never went through the loader that is the only check.
+    let out = run_frpc(&["-c", &cfg]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "frpc run must not start on an unrecognised auth.method; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stdout_of(&out).ends_with("invalid auth method, optional values are [token oidc]\n"),
+        "the run path's refusal must be Go's text; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stderr_of(&out).is_empty(),
+        "Go prints nothing on stderr here; stderr={:?}",
+        stderr_of(&out),
+    );
+}
+
+/// The other half of the client policy: an **empty** `auth.method` is Go's
+/// `util.EmptyOr(c.Method, "token")` (`pkg/config/v1/client.go:206-209`), so it
+/// must complete to `token` and must not be reported as an unrecognised method.
+///
+/// Measured on Go v0.71.0: `method = ""` starts (it then fails to reach a
+/// listener, which is this fixture's state on both implementations), while
+/// `"OIDC"`/`" oidc"`/`"tokenn"` never get that far. The assertions are
+/// deliberately about *which* refusal appears, not about a started daemon: the
+/// full binary's runtime exit code for a refused login is its own pinned
+/// surface (`login_fail_exit`), and mixing it in would make this test pass for
+/// the wrong reason.
+#[test]
+fn empty_auth_method_completes_to_token_on_both_client_paths() {
+    let dir = TempDir::new();
+    let cfg = dir.write(
+        "emptymethod.toml",
+        "serverAddr = \"127.0.0.1\"\nserverPort = 1\nloginFailExit = false\n\n[auth]\nmethod = \"\"\ntoken = \"t\"\n",
+    );
+
+    // The loader completes the value it hands on.
+    let loaded = frp_core::config::load_client_config(&cfg, true)
+        .expect("an empty auth.method must load (empty → token)");
+    assert_eq!(
+        loaded.auth.as_ref().map(|a| a.method.as_str()),
+        Some("token"),
+        "the loader must hand on the completed value"
+    );
+
+    // And no path reports the method as unrecognised.
+    // `verify` must accept it outright.
+    let out = run_frpc(&["verify", "-c", &cfg]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "frpc verify must accept an empty method; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+
+    // `run` must get PAST the method parse and reach the dial. It cannot be
+    // driven to a clean exit — `loginFailExit = false` keeps retrying by
+    // design — so the witness is its own progress line, read from a file while
+    // the child is alive, and then the child is signalled and reaped.
+    let log_path = dir.path("emptymethod.log");
+    let log = std::fs::File::create(&log_path).expect("create log");
+    let mut child = Command::new(BIN)
+        .args(["-c", &cfg])
+        .stdout(std::process::Stdio::from(
+            log.try_clone().expect("clone log"),
+        ))
+        .stderr(std::process::Stdio::from(log))
+        .spawn()
+        .expect("spawn frpc");
+    let deadline = std::time::Instant::now() + EXIT_TIMEOUT;
+    loop {
+        let text = std::fs::read_to_string(&log_path).expect("read frpc log");
+        if text.contains("connecting to") {
+            break;
+        }
+        assert!(
+            !text.contains("invalid auth method"),
+            "a config whose method is empty must not be refused as an              unrecognised method; log={text:?}"
+        );
+        if let Some(status) = try_wait_or_kill(&mut child, "frpc") {
+            panic!("frpc exited ({status:?}) on an empty auth.method; log={text:?}");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("frpc never reached its dial on an empty auth.method; log={text:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}

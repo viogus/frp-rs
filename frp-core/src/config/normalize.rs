@@ -516,7 +516,13 @@ pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
     strict_config: bool,
     known_keys: fn() -> std::collections::HashSet<&'static str>,
     normalize: fn(&mut toml::Value),
-    validate: fn(&C) -> Result<(), String>,
+    // `&mut` because a validator may *complete* a field as well as check it —
+    // `validate_server_config`/`validate_client_config` run Go's
+    // `Auth.Complete()` (the empty `auth.method` → `token` fill,
+    // `pkg/config/v1/server.go:136-139`) before Go's validation of the same
+    // field, and the completed value has to reach the caller, not just the
+    // check. A validator that only checks simply ignores the `mut`.
+    validate: fn(&mut C) -> Result<(), String>,
 ) -> Result<(C, ConfigPresence), Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("{path}: failed to read config file: {e}"))?;
@@ -551,13 +557,13 @@ pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
     // field's type decide (`gopkg.in/ini.v1` `MapTo`), so `.ini` inputs go
     // through the type-directed reader; TOML/JSON/YAML keep the strict serde
     // typing Go's v1 decoder has.
-    let cfg: C = if format == ConfigFormat::Ini {
+    let mut cfg: C = if format == ConfigFormat::Ini {
         super::ini_lenient::deserialize_ini(&json_value)
     } else {
         serde_json::from_value(json_value)
     }
     .map_err(|e| format!("{path}: config validation error: {e}"))?;
-    validate(&cfg).map_err(|e| format!("{path}: {e}"))?;
+    validate(&mut cfg).map_err(|e| format!("{path}: {e}"))?;
     Ok((cfg, presence))
 }
 

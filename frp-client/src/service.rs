@@ -720,21 +720,37 @@ fn next_ping_backoff(prev: Option<Duration>, interval: Duration) -> Duration {
 
 /// Refuse an `auth.method = "oidc"` client configuration when this crate was
 /// compiled without the `oidc` feature. Always defined, so a caller does not
-/// need its own `#[cfg]`: it is a no-op in an oidc build, where the parse
-/// constructs `AuthMethod::Oidc` instead.
+/// need its own `#[cfg]`. In an oidc build it is **not** fully a no-op: it still
+/// applies the shared exact-method parse (so `"OIDC"` is refused here too) and
+/// only the `"oidc"` arm is compiled away.
 ///
 /// Shared by [`Service::with_unsafe_features`] (so `frpc run` refuses) and by
 /// `frpc verify`, which only *loads* the config — without this, `verify` would
 /// print `Config file … is valid` and exit 0 for a config that `run` exits 3 on.
+///
+/// The method match is `frp_core::auth`'s exact policy, not a local
+/// `== "oidc"`: the string comparison this replaced accepted every non-exact
+/// spelling as if it were token auth, which in an oidc-less build meant
+/// `method = "OIDC"` started a **token** client against a server that (at the
+/// pre-change head) lowercased the same spelling into OIDC. It now returns the
+/// shared parse error for any unrecognised spelling, and the feature error for
+/// exactly `"oidc"`. In an oidc build the construction parse below in
+/// [`Service::with_unsafe_features`] raises both errors too, so this helper's
+/// own answer is not the only gate there — but the two must not disagree, which
+/// is why both call the same function rather than each spelling their own match.
 pub fn refuse_oidc_method_without_feature(
     auth: Option<&frp_core::config::AuthClientConfig>,
 ) -> Result<(), String> {
-    #[cfg(not(feature = "oidc"))]
-    if matches!(auth, Some(ac) if ac.method == "oidc") {
-        return Err(frp_core::auth::OIDC_FEATURE_REQUIRED.to_string());
+    let Some(ac) = auth else {
+        return Ok(());
+    };
+    let method = frp_core::auth::parse_auth_method(&ac.method)?;
+    if method == AuthMethod::Oidc {
+        #[cfg(not(feature = "oidc"))]
+        {
+            return Err(frp_core::auth::OIDC_FEATURE_REQUIRED.to_string());
+        }
     }
-    #[cfg(feature = "oidc")]
-    let _ = auth;
     Ok(())
 }
 
@@ -892,19 +908,22 @@ impl Service {
         // report valid a config `frpc run` refuses. No-op in an oidc build.
         refuse_oidc_method_without_feature(cfg.auth.as_ref()).map_err(ConstructError::auth)?;
 
-        // Determine auth method from [auth] section if present, otherwise token
-        #[cfg(feature = "oidc")]
-        let auth_method = if let Some(ref ac) = cfg.auth {
-            if ac.method == "oidc" {
-                AuthMethod::Oidc
-            } else {
-                AuthMethod::Token
+        // Determine auth method from [auth] section if present, otherwise token.
+        // The parse is the one `frp_core::auth` policy, called unconditionally
+        // (not only under `#[cfg(feature = "oidc")]`): `refuse_oidc_method_without_feature`
+        // above runs the same function, so an unrecognised spelling is already
+        // refused there and this call is the construction-time backstop for a
+        // `ClientConfig` built without going through the loader. The old code
+        // read `ac.method == "oidc"` inside the oidc-on arm and a bare
+        // `AuthMethod::Token` in the oidc-off arm, so `method = "OIDC"` selected
+        // **token** on both sides — against a server that (at the pre-change
+        // head) lowercased it into OIDC.
+        let auth_method = match &cfg.auth {
+            Some(ac) => {
+                frp_core::auth::parse_auth_method(&ac.method).map_err(ConstructError::auth)?
             }
-        } else {
-            AuthMethod::Token
+            None => AuthMethod::Token,
         };
-        #[cfg(not(feature = "oidc"))]
-        let auth_method = AuthMethod::Token;
 
         let auth_token_source = cfg.auth.as_ref().and_then(|a| a.token_source.clone());
         // Every failure below is an *auth* construction failure and is tagged as
@@ -4419,6 +4438,23 @@ impl Service {
             }
             new_cfg = merge_client_config(&new_cfg, Some(store));
         }
+        // `Self::cfg` has not been written yet at this point, so its `auth`
+        // section is the one this process started with — `reload::auth_reload_
+        // refusal` depends on that (see its docs). The check runs before any
+        // proxy/plugin/visitor work so a refused reload has no side effects on
+        // the running session.
+        //
+        // Why refuse instead of re-derive, and what this does *not* cover: see
+        // `reload::auth_reload_refusal`. Scope note: the store merge above has
+        // already happened, so a store-supplied `[auth]` is covered too; a store
+        // *reload* side effect (re-reading the store file) may therefore occur
+        // on a refused reload, but nothing from the new config is applied.
+        if let Some(reason) = crate::reload::auth_reload_refusal(
+            self.cfg.read().await.auth.as_ref(),
+            new_cfg.auth.as_ref(),
+        ) {
+            return Err(reason);
+        }
         // Source-local enabled filtering, then apply the start allowlist so the
         // reload diff never registers store/config proxies outside `start`.
         new_cfg.proxies.retain(|p| p.enabled);
@@ -6654,5 +6690,96 @@ mod tests {
         };
         assert!(refuse_oidc_method_without_feature(Some(&token)).is_ok());
         assert!(refuse_oidc_method_without_feature(None).is_ok());
+    }
+
+    /// The helper must apply the *one* policy, not a local `== "oidc"`. Before
+    /// this, every non-exact spelling returned `Ok` from it, so in an oidc-less
+    /// build `method = "OIDC"` started a token client.
+    ///
+    /// Feature-independent on purpose (`refuse_oidc_method_without_feature`
+    /// always runs the parse): the "not exactly `token`/`oidc`" refusal is Go's
+    /// load error in every build, only the `"oidc"`-in-an-oidc-less-build
+    /// refusal is feature-specific. This is the unit half of the
+    /// `FRPC_TINY_CLI_TESTS` spawn pin; it covers the spellings the CLI test
+    /// cannot afford a subprocess each for.
+    #[test]
+    fn refuse_oidc_helper_applies_the_exact_method_policy() {
+        for bad in [
+            "OIDC",
+            "Oidc",
+            " oidc",
+            "oidc ",
+            "tokenn",
+            "\u{043e}idc",
+            "",
+        ] {
+            let ac = frp_core::config::AuthClientConfig {
+                method: bad.to_string(),
+                ..Default::default()
+            };
+            let err = refuse_oidc_method_without_feature(Some(&ac))
+                .expect_err(&format!("{bad:?} must be refused (Go rejects it)"));
+            assert_eq!(
+                err,
+                frp_core::auth::INVALID_AUTH_METHOD,
+                "{bad:?} must carry Go's exact text"
+            );
+        }
+        // Exactly `"oidc"` takes the feature arm instead: the shared parse
+        // error must not shadow it. Both branches must compile in both
+        // feature configurations, so this matches on the result rather than
+        // binding it twice.
+        let oidc = frp_core::config::AuthClientConfig {
+            method: "oidc".to_string(),
+            ..Default::default()
+        };
+        match refuse_oidc_method_without_feature(Some(&oidc)) {
+            #[cfg(not(feature = "oidc"))]
+            Err(e) => assert_eq!(e, frp_core::auth::OIDC_FEATURE_REQUIRED),
+            #[cfg(not(feature = "oidc"))]
+            Ok(()) => panic!("an oidc-less build must refuse \"oidc\""),
+            #[cfg(feature = "oidc")]
+            Ok(()) => {}
+            #[cfg(feature = "oidc")]
+            Err(e) => panic!("an oidc build serves \"oidc\", got {e:?}"),
+        }
+    }
+
+    /// **Site 3 — the client's construction parse** (`Service::with_unsafe_features`).
+    /// Ungated on purpose: `"OIDC"` is refused by the *shared* parse in every
+    /// build, so this is one behavioural pin for both feature configurations
+    /// (the build matrix already runs this module with `oidc` on and off).
+    ///
+    /// The config never went through the loader (its normal caller does that),
+    /// which is exactly why the construction site keeps its own `parse_auth_method`
+    /// call: without it the old code read `ac.method == "oidc"` → false and
+    /// silently built a **token** client, the downgrade the item describes.
+    #[tokio::test]
+    async fn construction_refuses_a_non_exact_auth_method() {
+        for bad in ["OIDC", "Oidc", " oidc", "tokenn", ""] {
+            let cfg = ClientConfig {
+                auth: Some(frp_core::config::AuthClientConfig {
+                    method: bad.to_string(),
+                    token: "t".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let err =
+                match Service::with_unsafe_features(cfg, None, UnsafeFeatures::default()).await {
+                    Ok(_) => panic!("{bad:?} must be refused at construction (Go rejects it)"),
+                    Err(e) => e,
+                };
+            assert!(
+                err.to_string()
+                    .ends_with(frp_core::auth::INVALID_AUTH_METHOD),
+                "{bad:?} must carry Go's exact text, got {err:?}"
+            );
+            assert_eq!(
+                err.kind(),
+                frp_core::init_error::InitErrorKind::Auth,
+                "{bad:?} must keep the auth tag (EXIT_AUTH/3)"
+            );
+        }
     }
 }

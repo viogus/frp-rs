@@ -732,8 +732,12 @@ matching Go's `url.Values.Get`, and a pair whose percent-escape is malformed
 (`?strictConfig=%zz`) is dropped — again like `url.ParseQuery` — which leaves
 the parameter absent and the reload non-strict. The remaining 400 sources are a
 body that cannot be buffered or does not deserialize into the expected
-`{"strict_config": bool}` shape, and a reload the loader itself rejects (a
-strict-mode unknown key).
+`{"strict_config": bool}` shape, a reload the loader itself rejects (a
+strict-mode unknown key, or an `auth.method` that is not exactly `token`/`oidc`),
+and a reload that changes the client's `[auth]` section: auth is read once at
+startup, so such a reload is refused with a message naming the changed field(s)
+and saying a restart is needed. It applies nothing, so the running proxies keep
+serving the old config.
 
 Strict mode walks the `[[proxies]]` / `[[visitors]]` array elements and the
 server-side `[[httpPlugins]]` array as well. With strict mode on (Go's default,

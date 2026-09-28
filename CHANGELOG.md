@@ -139,6 +139,45 @@ User-facing release notes for frp-rs.
   negative value is accepted and means the deadline has already passed).
 
 ### Changed
+- **`auth.method` is now compared exactly, and a typo is a config-load error
+  instead of silently selecting token auth.** Go accepts exactly `"token"` and
+  `"oidc"` (`pkg/config/v1/validation/validation.go:37-40`, compared with
+  `slices.Contains` at `validation/server.go:31` and `client.go:101`) after
+  `Auth.Complete()` has filled an *empty* method with `token`
+  (`pkg/config/v1/server.go:136-139`, `client.go:206-209`), so on Go
+  `method = "OIDC"` exits **1** with
+  `invalid auth method, optional values are [token oidc]` on stdout and 0 bytes
+  on stderr, while `method = ""` starts as token auth. frp-rs did neither
+  consistently: the **server** lower-cased the method (so `"OIDC"` selected
+  OIDC, where Go errors) and sent everything else — `" oidc"`, `"oidc "`,
+  `"tokenn"` — to **token**; the **client** compared `== "oidc"` exactly, so
+  `"OIDC"` selected **token** *and* skipped the OIDC client-credentials
+  validation, and `frpc verify` reported such a config **valid**. An operator
+  who wrote a near-miss spelling could therefore get token auth against a token
+  they had set, with no diagnostic. All four sites now share one policy
+  (`frp_core::auth::{complete_auth_method, parse_auth_method}`) called from the
+  config loader and kept as a construction-time backstop: an empty method
+  completes to `token`, anything else that is not exactly `token`/`oidc` is a
+  load error with Go's text on stdout and exit **1**, and the
+  `oidc`-without-the-feature refusal is keyed off the validated method (so
+  `"OIDC"` is now Go's error rather than a feature error). No `to_lowercase` and
+  no trimming: adding either would make frp-rs *accept* configs Go rejects. One
+  recorded divergence: frp-rs prefixes the loader's line with `<path>: ` where
+  Go prints the bare decoder text.
+- **A reload that changes `[auth]` is now refused instead of reported as
+  success.** `frpc reload` / SIGUSR1 re-read the config file, and
+  `reload_from_sources` diffed only proxies and visitors, so changing
+  `auth.method` (or the token, or any `[auth.oidc]` field) returned
+  `reload success: reload success: no changes detected` and logged nothing about
+  auth. Auth is built once at client start (`Service::auth_cfg` and the bridge
+  `encryption_key`, which is copied by value into the live control connection),
+  and Go's `frpc` reload has the same shape — it re-reads proxies and visitors
+  only (`client/service.go:494-525`) — so the honest answer is "restart". A
+  reload whose `[auth]` differs from the running one now fails with a message
+  naming the changed field(s) (never their values) and saying a restart is
+  needed, and **applies nothing** from the new config. Unchanged `[auth]` — by
+  content, including `method = ""` vs `method = "token"` — reloads exactly as
+  before.
 - **A config-load failure now prints a bare line on stdout, and `frpc verify`
   prints its refusal there instead of on stderr — a user-visible output change,
   and Go parity on the stream and the shape of each line.** Go frp v0.71.0 does

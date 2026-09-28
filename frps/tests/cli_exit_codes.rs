@@ -1735,3 +1735,114 @@ fn verify_refuses_the_two_frp_rs_only_root_flags_like_go() {
         stderr_of(&out),
     );
 }
+
+// ── `auth.method`: the one policy, at the server's two sites ─────────────────
+
+/// **Site 1 — `frps`'s method parse (`frp-server/src/service.rs`).** Go frp
+/// v0.71.0 compares the method exactly against `SupportedAuthMethods`
+/// (`pkg/config/v1/validation/server.go:31`) after `Auth.Complete()` filled an
+/// empty one to `token` (`pkg/config/v1/server.go:136-139`), so a spelling that
+/// is not exactly `token`/`oidc` is a **load error**.
+///
+/// Measured on Go v0.71.0 (darwin/arm64), own config and free port per case,
+/// stdout/stderr redirected to separate files, `rc` from `wait` on the direct
+/// child: `frps -c <method = "OIDC">` → **rc 1, 54 B stdout, 0 B stderr**, whole
+/// stdout `invalid auth method, optional values are [token oidc]\n`. The same
+/// shape holds for `"Oidc"`, `" oidc"`, `"oidc "`, `"tokenn"` and a Cyrillic-о
+/// lookalike.
+///
+/// frp-rs used to `to_lowercase()` the method and treat every non-`oidc`
+/// spelling as **token**, so `method = "OIDC"` selected OIDC (Go errors) while
+/// `" oidc"`/`"tokenn"` selected token — an operator who asked for OIDC got a
+/// token-auth server. This pins the exact bytes, the stream and the code.
+#[test]
+fn invalid_auth_method_exits_1_like_go_and_names_the_accepted_values() {
+    let dir = TempDir::new();
+    let cfg = dir.write(
+        "badmethod.toml",
+        "bindAddr = \"127.0.0.1\"\nbindPort = 7500\n\n[auth]\ntoken = \"cli-exit-test\"\nmethod = \"OIDC\"\n",
+    );
+
+    let out = run_frps(&["-c", &cfg]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unrecognised auth.method is Go's load error (rc 1), not a started server; \
+         stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stdout_of(&out).ends_with(": invalid auth method, optional values are [token oidc]\n"),
+        "the refusal must be Go's text, on stdout, with frp-rs's `<path>: ` prefix from the \
+         loader and nothing else — no ANSI, no timestamp, no level; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        stderr_of(&out).is_empty(),
+        "Go prints nothing on stderr for this failure; stderr={:?}",
+        stderr_of(&out),
+    );
+}
+
+/// **Site 1, the other half.** An absent/empty `auth.method` is Go's
+/// `util.EmptyOr(c.Method, "token")` (`pkg/config/v1/server.go:136-139`), so
+/// `method = ""` and a config with no `[auth] method` key must both complete to
+/// **token** and the server must **run** — measured on Go v0.71.0: a server with
+/// `method = ""` starts and listens (its stdout is its startup log, rc only
+/// changes when the probe signals it).
+///
+/// The two spellings are checked at the load path *and* one of them is started
+/// for real, because "the loader completed the value" and "the process can use
+/// it" are different claims: the construction site
+/// (`frp-server/src/service.rs`) re-parses the method, and a completion that
+/// only reached the validator would leave this config unstartable.
+///
+/// The load-path half also pins the split the old code got wrong: `""` is
+/// completed, while `" oidc"` (a value Go rejects, and which the old
+/// `to_lowercase` match sent to **token**) is an error.
+#[test]
+fn empty_auth_method_completes_to_token_and_the_server_runs() {
+    let dir = TempDir::new();
+    let absent = dir.write(
+        "noauthmethod.toml",
+        "bindAddr = \"127.0.0.1\"\nbindPort = 7500\n\n[auth]\ntoken = \"cli-exit-test\"\n",
+    );
+    let empty = dir.write(
+        "emptyauthmethod.toml",
+        "bindAddr = \"127.0.0.1\"\nbindPort = 7500\n\n[auth]\ntoken = \"cli-exit-test\"\nmethod = \"\"\n",
+    );
+
+    // Load-path half: both shapes complete to "token", and " oidc" does not.
+    for path in [&absent, &empty] {
+        let cfg = frp_core::config::load_server_config(path, true)
+            .unwrap_or_else(|e| panic!("{path} must load (empty method → token): {e}"));
+        assert_eq!(
+            cfg.auth.method, "token",
+            "the loader must hand on the completed value for {path}"
+        );
+    }
+    let spaced = dir.write(
+        "spacedmethod.toml",
+        "bindAddr = \"127.0.0.1\"\nbindPort = 7500\n\n[auth]\ntoken = \"cli-exit-test\"\nmethod = \" oidc\"\n",
+    );
+    let err = frp_core::config::load_server_config(&spaced, true)
+        .expect_err("\" oidc\" must be a load error, not a token fallback")
+        .to_string();
+    assert!(
+        err.ends_with("invalid auth method, optional values are [token oidc]"),
+        "got {err:?}"
+    );
+
+    // Runtime half: `method = ""` starts and listens.
+    let port = ephemeral_port();
+    let cfg = dir.write(
+        "empty-method.serve.toml",
+        &format!(
+            "bindAddr = \"127.0.0.1\"\nbindPort = {port}\n\n[auth]\ntoken = \"cli-exit-test\"\nmethod = \"\"\n"
+        ),
+    );
+    start_listening_then_sigterm(&["-c", &cfg], port, &dir);
+}

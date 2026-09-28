@@ -47,7 +47,7 @@ Authentication configuration for control connections.
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
-| `method` | `string` | `"token"` | `auth.method` | Authentication method: `"token"` or `"oidc"`. |
+| `method` | `string` | `"token"` | `auth.method` | Authentication method: exactly `"token"` or `"oidc"`. An empty value completes to `"token"` (Go's `Auth.Complete()`); any other spelling is a **config-load error** with Go's text (`invalid auth method, optional values are [token oidc]`) on stdout and exit 1 — no lower-casing, no trimming. |
 | `token` | `string` | `""` | `auth.token` | Shared secret token for MD5-based authentication. Must match the client's token. |
 | `token_source` | `table` | `null` | `auth.tokenSource` | Dynamic token source. Mutually exclusive with `token`. |
 | `oidc_issuer` | `string` | `""` | `auth.oidcIssuer` | OIDC issuer URL. Used when `method = "oidc"`. |
@@ -310,7 +310,7 @@ Full OIDC authentication configuration. When `method = "oidc"`, the client obtai
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
-| `method` | `string` | `"token"` | `auth.method` | Authentication method: `"token"` or `"oidc"`. |
+| `method` | `string` | `"token"` | `auth.method` | Authentication method: exactly `"token"` or `"oidc"`. An empty value completes to `"token"` (Go's `Auth.Complete()`); any other spelling is a **config-load error** with Go's text (`invalid auth method, optional values are [token oidc]`) on stdout and exit 1 — no lower-casing, no trimming. |
 | `token` | `string` | `""` | `auth.token` | Shared secret token (when `method = "token"`). |
 | `token_source` | `table` | `null` | `auth.tokenSource` | Dynamic token source. Mutually exclusive with `token`. |
 | `oidc_client_id` | `string` | `""` | `auth.oidcClientId` | OIDC client ID for the token endpoint. |

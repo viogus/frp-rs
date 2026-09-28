@@ -1324,3 +1324,223 @@ async fn admin_head_auth_divergence_is_pinned() {
     );
     shutdown_admin_oracle(oracle).await;
 }
+
+// ---------------------------------------------------------------------------
+// Test 3 — `[auth]` changes are refused: the reload must not report success
+// and must not apply the rest of the new config either.
+//
+// `TODO.md`, "The client's admin-triggered reload never re-derives auth": with
+// a running `frpc-tiny` and an OIDC config, `frpc-tiny reload -c <file>` used
+// to return rc 0 with `reload success: reload success: no changes detected` and
+// zero log lines about auth. The decision (`reload::auth_reload_refusal`) is
+// now to refuse, naming the changed field, because auth is startup-only in the
+// client (`Service::auth_cfg`/`encryption_key` are not behind a lock, and the
+// bridge key is copied by value per session) and Go's `frpc` reload reloads
+// proxies/visitors only (`client/service.go:494-525`).
+//
+// Observability note: the SIGUSR1 path (`Service::request_reload`) drops the
+// reply oneshot, so the Err *string* is not observable here — the same
+// limitation the module docs above record for the malformed-config case. What
+// this test witnesses is the *effect*: a refused reload applies NOTHING, so a
+// config that also moves the proxy to a new remote port must leave the old port
+// serving and never open the new one.
+// ---------------------------------------------------------------------------
+
+/// The valid config plus an explicit `[auth] method = "token"`, so a later
+/// rewrite can change **only** `[auth]` (an explicit section, rather than
+/// adding or removing one — `[auth] section added`/`removed` are different arms
+/// of `auth_reload_refusal`). The token matches `common::start_frps`'s, so this
+/// config really logs in.
+fn write_valid_config_with_token_auth(
+    path: &std::path::Path,
+    server_port: u16,
+    echo_port: u16,
+    remote_port: u16,
+) {
+    write_config_with_token_auth_and_token(path, server_port, echo_port, remote_port, false);
+}
+
+/// [`write_valid_config_with_token_auth`] with an extra `[auth]`
+/// `additionalAuthScopes` entry. That field is **not** derivable from any flat
+/// top-level key, so the file's `[auth]` really does differ from the running
+/// config — which is the whole point: the config *loads* (the client does not
+/// check auth scopes against the server), so a refusal has to come from
+/// `auth_reload_refusal` rather than from the loader.
+///
+/// The first cut of that arm changed `[auth] token` instead, and it did **not**
+/// work: `normalize_client_config` promotes a flat top-level `token` into
+/// `[auth]`, so the nested value was overwritten with the same server token and
+/// the two `[auth]` sections were identical. Measured by deleting the reload
+/// check and re-running: the test stayed green, i.e. it was vacuous for the
+/// branch it claimed to cover.
+fn write_config_with_token_auth_and_token(
+    path: &std::path::Path,
+    server_port: u16,
+    echo_port: u16,
+    remote_port: u16,
+    extra_scope: bool,
+) {
+    let scope = if extra_scope { "\"HeartBeats\"" } else { "" };
+    std::fs::write(
+        path,
+        format!(
+            r#"serverAddr = "127.0.0.1"
+serverPort = {server_port}
+loginFailExit = false
+token = "reload-malformed-token"
+
+[auth]
+method = "token"
+token = "reload-malformed-token"
+additionalAuthScopes = [{scope}]
+
+[transport]
+tcpMux = false
+
+[[proxies]]
+name = "main"
+type = "tcp"
+localIp = "127.0.0.1"
+localPort = {echo_port}
+remotePort = {remote_port}
+"#
+        ),
+    )
+    .expect("write token-auth config");
+}
+
+#[tokio::test]
+async fn reload_that_changes_auth_is_refused_and_applies_nothing() {
+    init_tracing();
+    let echo_port = allocate_port();
+    let server_port = allocate_port();
+    let p1 = allocate_port(); // the running proxy's remote port
+    let p2 = allocate_port(); // the port a refused config would move it to
+    let p3 = allocate_port(); // a second witness port, for the loader-accepted arm
+
+    let _echo = start_echo_server(echo_port);
+    let _server = common::start_frps(server_port, "reload-malformed-token").await;
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
+    wait_for_port(server_addr, Duration::from_secs(5))
+        .await
+        .expect("server ready");
+
+    let dir = std::env::temp_dir().join(format!("frp-reload-auth-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let cfg_path = dir.join("frpc.toml");
+    write_valid_config_with_token_auth(&cfg_path, server_port, echo_port, p1);
+
+    let cfg = load_client_config(cfg_path.to_str().unwrap(), false).expect("load initial config");
+    let client = Arc::new(
+        ClientService::new(cfg, Some(cfg_path.to_string_lossy().into()))
+            .await
+            .expect("create client service"),
+    );
+    let runner = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let _ = client.run().await;
+        })
+    };
+    let p1_addr: std::net::SocketAddr = format!("127.0.0.1:{p1}").parse().unwrap();
+    wait_for_port(p1_addr, Duration::from_secs(15))
+        .await
+        .expect("initial proxy port ready");
+    assert_echo_serving(p1_addr, "baseline echo before the auth-changing reload").await;
+
+    // 1. Change the method to a spelling the one policy rejects (`"OIDC"` — Go
+    //    exits 1 on it) and move the proxy, so a partial apply is visible. The
+    //    *load* refuses this, so `load_client_config(...)?` returns before any
+    //    mutation.
+    let rejected = format!(
+        r#"serverAddr = "127.0.0.1"
+serverPort = {server_port}
+loginFailExit = false
+token = "reload-malformed-token"
+
+[auth]
+method = "OIDC"
+token = "reload-malformed-token"
+
+[transport]
+tcpMux = false
+
+[[proxies]]
+name = "main"
+type = "tcp"
+localIp = "127.0.0.1"
+localPort = {echo_port}
+remotePort = {p2}
+"#
+    );
+    std::fs::write(&cfg_path, &rejected).expect("write rejected config");
+    client.request_reload();
+    tokio::time::sleep(RELOAD_SETTLE).await;
+    assert!(
+        !runner.is_finished(),
+        "client run task ended after an auth-method reload"
+    );
+    assert_echo_serving(
+        p1_addr,
+        "the running proxy must keep serving after a refused auth reload",
+    )
+    .await;
+    let p2_addr: std::net::SocketAddr = format!("127.0.0.1:{p2}").parse().unwrap();
+    assert!(
+        wait_for_port(p2_addr, Duration::from_secs(2))
+            .await
+            .is_err(),
+        "a refused reload must apply nothing: proxy 'main' moved to p2"
+    );
+
+    // 2. A config that the LOADER ACCEPTS and that still differs from the
+    //    running auth: only the `[auth] token` changes (the method stays
+    //    `"token"`, the file still parses and validates — the client does not
+    //    check its token against the server). So this arm's refusal can only
+    //    come from `auth_reload_refusal`, which is what makes it the witness
+    //    that the check is wired into the reload path at all. p3 is this arm's
+    //    own partial-apply witness.
+    //
+    //    (The first cut of this arm used `method = "oidc"` with an issuer and
+    //    expected the same thing; it was wrong. With a client `[auth]` section
+    //    the loader reported `auth.oidc.clientID is required` for it, so the
+    //    refusal came from the loader and the test would have passed with the
+    //    reload check deleted — measured by deleting the check and re-running:
+    //    the test stayed green, which is why this arm exists.)
+    write_config_with_token_auth_and_token(&cfg_path, server_port, echo_port, p3, true);
+    client.request_reload();
+    tokio::time::sleep(RELOAD_SETTLE).await;
+    assert!(
+        !runner.is_finished(),
+        "client run task ended after an auth-token reload"
+    );
+    assert_echo_serving(
+        p1_addr,
+        "the running proxy must keep serving after a refused auth reload",
+    )
+    .await;
+    let p3_addr: std::net::SocketAddr = format!("127.0.0.1:{p3}").parse().unwrap();
+    assert!(
+        wait_for_port(p3_addr, Duration::from_secs(2))
+            .await
+            .is_err(),
+        "a refused auth reload must apply nothing: proxy 'main' moved to p3"
+    );
+
+    // 3. Positive control: a rewrite that leaves `[auth]` alone still applies,
+    //    so the two refusals above are not vacuous (the proxy really can move
+    //    on this harness).
+    write_valid_config_with_token_auth(&cfg_path, server_port, echo_port, p2);
+    client.request_reload();
+    wait_for_port(p2_addr, Duration::from_secs(15))
+        .await
+        .expect("a reload that does not touch [auth] must still apply");
+    assert_echo_serving(p2_addr, "echo through the validly reloaded proxy (p2)").await;
+
+    client.request_stop();
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("client did not shut down after request_stop")
+        .expect("client run() panicked");
+    let _ = std::fs::remove_dir_all(&dir);
+}
