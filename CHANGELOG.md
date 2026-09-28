@@ -845,7 +845,7 @@ User-facing release notes for frp-rs.
 - **`docs/config.md` no longer advertises four camelCase client TLS aliases that
   no loader accepts.** The four client rows named `tlsEnable`, `tlsCertFile`,
   `tlsKeyFile` and `tlsCaFile` / `tlsTrustedCaFile` in their "Go frp Equivalent"
-  column — the same defect the server rows above had, in the other half of the
+  column — the same defect the server rows had, in the other half of the
   table. Every one of the five is silently ignored by the non-strict loader (the
   SIGUSR1 reload path) and **refused** in strict mode (`unknown field "tlsEnable"
   … — did you mean 'tls_enable'?`) — and flat camelCase is not a Go client

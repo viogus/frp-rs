@@ -2140,7 +2140,7 @@ fn test_flat_camelcase_tls_spellings_are_not_loader_spellings() {
 #[test]
 fn test_flat_camelcase_client_tls_spellings_are_not_loader_spellings() {
     let rejected = [
-        ("tlsEnable", "true"),
+        ("tlsEnable", "false"),
         ("tlsCertFile", "\"/cc.crt\""),
         ("tlsKeyFile", "\"/cc.key\""),
         ("tlsCaFile", "\"/cc-ca.crt\""),
