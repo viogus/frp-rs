@@ -494,8 +494,13 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   bounded settle, every child reaped with `wait`, strays by `pgrep -x` only; script
   `/tmp/sra-probe/probe-non-auth.sh` — **deleted during the #399 cleanup, re-derived from this
   item's text and recreated at the same path** in this round — run twice with identical summary
-  lines (re-measured here, the `SIGUSR1:` lines are identical run to run while the stdout byte
-  counts move by ≤ 6 B, because the startup lines carry the port and its digit count varies):
+  lines (re-measured here: the `SIGUSR1:` lines are identical run to run, but the **byte counts are
+  not the claim and are only approximate** — they move by a few bytes between runs of one probe,
+  because the startup lines carry the port and its digit count varies, and by ~20 B between
+  independent probes of the same shape (a reviewer's own probe measured 1701 / 2637 where this
+  round's re-derived script measured 1719-1720 / 2654). What matters is the *shape*: stdout at the
+  moment the summary is read, a larger archived stdout because the SIGTERM drain logs after that
+  read, and 0 B stderr):
   * running `transport.heartbeat_timeout = 30` with `max_ports_per_client = 0`, rewritten to `60`
     and `7` + `kill -USR1` → `SIGUSR1: config reloaded: no changes detected` on **stdout**
     (**1702 B** stdout / **0 B** stderr at the moment the summary is read; the archived
@@ -529,14 +534,29 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   (E0027 on `kcp_bind_port`/`quic_bind_port`/`websocket_port`; the `frp-client` dev-dependency turns
   `frp-core/kcp` on while `frp-server/kcp` is off) and
   `cargo check --workspace --no-default-features --features tiny` (the mirror case, where an
-  unconditional pattern entry would be E0028).
+  unconditional pattern entry would be E0026).
   Base/head per field group, real `frps` + `SIGUSR1` (base = `git archive 3f975e0`): base **3 OK /
   6 FAIL**, head **9 OK / 0 FAIL** on the same 9 cases, stderr 0 B everywhere, every child reaped with
   `wait`, `pgrep -x` 0 afterwards. The case above at head:
   `SIGUSR1: transport.heartbeat_timeout: 30 -> 60 (restart required); max_ports_per_client: 0 -> 7
-  (restart required)` (2199 B stdout at the read / 3134 B after the drain, 0 B stderr). `[log]` is
-  reported, because all five `[log]` fields are read once in `init_logging`:
-  `log.level: info -> debug (restart required)`.
+  (restart required)`. `[log]` is reported, because all five `[log]` fields are read once in
+  `init_logging`: `log.level: info -> debug (restart required)`.
+  **Two over-reports found by review and fixed in the same round, each pinned by a test that fails
+  against the pre-fix code** (falsification logs `/tmp/sra-probe/discrim/`): (a) the two `Option<u32>`
+  limits were compared as raw options, so an absent `max_connections` / `max_accept_rate` printed
+  `max_connections: <unset> -> 512 (restart required); max_accept_rate: <unset> -> 0 (restart
+  required)` where base said `no changes detected` — both pairs are one setting, so the comparison is
+  now on the value the server resolves (`frp_core::config::effective_max_connections` /
+  `effective_max_accept_rate`, which `frp-server`'s `resolve_max_connections` and its accept-rate sites
+  now delegate to, so the two cannot drift); `max_connections = 0` is *unlimited* and stays reported.
+  (b) the three `#[cfg]`-gated listener ports (`kcp_bind_port`, `quic_bind_port`, `websocket_port`)
+  were classed `ServerReader::Any` although their readers are `frp-server`-gated: in `cargo test -p
+  frp-server --no-default-features --all-targets` — the lane that motivated this module's location —
+  they printed `kcp_bind_port: 0 -> 17001 (restart required); quic_bind_port: 0 -> 17002 (restart
+  required); websocket_port: 0 -> 17003 (restart required)` while `transport.quic_options` was
+  correctly filtered. They now carry `ServerReader::Kcp` / `Quic` / `Websocket`, with a
+  **disjunction** (`KcpOrDashboard` / `QuicOrDashboard`) for the two the dashboard also prints from
+  the startup snapshot (`frp-server/src/dashboard.rs:502`, `:2492`, `:504`, `:2494`).
   **Not over-reported** — a restart could not change these either, so the line would be false: the
   fields no code in `frp-server` reads (`auth.useEncryption` from the item above, `tls_server_name`,
   `web_server.pprof_enable`, `web_server.tls_ca_file` / `tls_server_name`, the nested `tls.*` trio,
@@ -551,13 +571,14 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   Carriers: `frp-core/src/config/restart_only.rs` (new), `frp-core/src/config/mod.rs`,
   `frp-core/src/logging.rs` (`OTEL_ENABLED` — the only way `frp-server`, which declares no `otel`
   feature, can ask whether the binary's OTLP reader exists), `frp-server/src/service.rs`,
-  `frp-server/tests/server_reload_restart_only.rs` (new, 12 tests, run with default features,
+  `frp-server/tests/server_reload_restart_only.rs` (new, 14 tests, run with default features,
   `--features dashboard` and `--no-default-features`), `docs/config.md` § Server Config Reload,
   `README.md`, `docs/deployment.md`, `CHANGELOG.md`.
   Gates: `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets --all-features
-  -- -D warnings` clean; `cargo test -p frp-core --lib` 971/0 (was 966; +5 unit tests);
-  `cargo test -p frp-server` rc 0, 657 passed / 0 failed over 42 lanes (`server_reload_auth` 6/0,
-  `reload_integration` 4/0, `server_reload_restart_only` 12/0) — with one honest caveat: the first run
+  -- -D warnings` clean; `cargo test -p frp-core --lib` 974/0 (was 966; +8 unit tests);
+  `cargo test -p frp-server` rc 0, 659 passed / 0 failed over 42 lanes (`server_reload_auth` 6/0,
+  `reload_integration` 4/0, `server_reload_restart_only` 14/0, and that target 14/0 again with
+  `--features dashboard` and with `--no-default-features`) — with one honest caveat: the first run
   failed `reload_integration::test_reload_add_proxy` with `AddrInUse` on its own echo-server port,
   the documented `allocate_port` probe-then-drop race in that file's scaffolding (it signals **frpc**
   only, never `frps`, so this change cannot reach it); it passed on the quiet re-run. `cargo test -p
@@ -574,9 +595,30 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   groups are exercised in process, not end to end (the shell probe runs the default build);
   `OTEL_EXPORTER_OTLP_ENDPOINT` can mask an `[observability]` change; and `ServerConfig.tls_enable` has
   **no reader** in `frp-server`/`frps` (measured), so its pre-existing "restart required" line is very
-  likely the same class of false positive this item is about — left alone because it is base behaviour
-  and this item counts the field among those `reload()` already compares. Full base/head table and the
+  likely the same class of false positive this item is about — left alone here because it is base
+  behaviour and this item counts the field among those `reload()` already compares, and **filed as its
+  own item directly below** rather than left in a message. Full base/head table and the
   least-sure section: `/tmp/restart-only-report.md`.
+
+- [ ] **`tls_enable` is reported as restart-required, but nothing in `frp-server`/`frps` reads it.**
+  `reload()` has printed the line since before the restart-only list landed (the
+  `note_restart_change(&self.cfg.tls_enable, …)` call in `frp-server/src/service.rs`), and the new list
+  deliberately leaves it in place because it is base behaviour and the item above counts the field
+  among the ones `reload()` already compares. Measured 2026-09-28 at `5c74455`: `grep -rn tls_enable
+  frp-server/src frps/src` finds only that call site plus one comment, i.e. `ServerConfig.tls_enable`
+  has **no reader** — so a reload that changes only it prints `tls_enable: false -> true (restart
+  required)` and a restart changes nothing. Go v0.71.0 is the same shape, so this is *not* a parity
+  gap: its `ServerConfig` has no `TlsEnable` at all, `TLS.Enable` is a **client** field
+  (`pkg/config/v1/client.go`, read by `pkg/config/v1/validation/client.go:155`), and the legacy INI
+  `tls_enable` maps to `Transport.TLS.Enable` (`pkg/config/legacy/conversion.go:60`) which no server
+  path reads — the server's switch is `TLS.Force`, i.e. `tls_only` (`conversion.go:150`,
+  `pkg/config/v1/server.go:195`). **Done-when:** the disposition is explicit and pinned by a test
+  either way — the line is removed (the `[auth].useEncryption` precedent in
+  `note_auth_restart_changes`: nothing reads the field, so neither a reload nor a restart can make a
+  change take effect, and the reload must not claim one) and the field joins the inert list in
+  `frp-core/src/config/restart_only.rs` with its reader measurement, **or** the field is deliberately
+  wired to a server behaviour (a documented divergence from Go, which ignores it server-side) with a
+  probe showing what a restart changes. A reader of the test must be able to tell which was chosen.
 
 - [ ] **`oidc_throttle_tests` is a load-dependent flake: the mock IdP answers 404 for a valid
   request.** `cargo test -p frp-server --lib oidc` failed **3/3** `oidc_throttle_tests` under CPU

@@ -153,17 +153,21 @@ fn resolve_allow_ports(cfg: &ServerConfig) -> Vec<frp_core::config::PortsRange> 
 }
 
 /// Resolve the `max_connections` server config into the connection-semaphore
-/// size. `Some(0)` means unlimited and MUST resolve to 0 (not `usize::MAX`):
+/// size.
+///
+/// A **delegation**, deliberately: the reload's restart-change list compares this
+/// field against its effective value (`frp_core::config::effective_max_connections`,
+/// which is this function) so that an absent `max_connections` and an explicit
+/// `max_connections = 512` are not reported as a change. A second copy of the
+/// rule here would let the semaphore and the comparison drift.
+///
+/// `Some(0)` means unlimited and MUST resolve to 0 (not `usize::MAX`):
 /// `AppState::new` builds `Semaphore::new(n)` whenever n > 0, and tokio
 /// panics on `usize::MAX` (batch_semaphore asserts permits <= MAX_PERMITS);
 /// with panic=abort in release, `usize::MAX` would crash frps at boot on the
 /// documented "0 = unlimited" setting (audit H1). `None` defaults to 512.
 fn resolve_max_connections(max_connections: Option<u32>) -> usize {
-    match max_connections {
-        Some(0) => 0, // 0 = unlimited → no semaphore
-        Some(n) => n as usize,
-        None => 512, // default
-    }
+    frp_core::config::effective_max_connections(max_connections)
 }
 
 /// Record a "restart required" change entry when `old != new`. Used by
@@ -352,7 +356,7 @@ fn note_auth_restart_changes(
 /// websocket_port`) because the `frp-client` dev-dependency turns `frp-core/kcp`
 /// on while `frp-server/kcp` is off, and the mirror case
 /// (`cargo check --workspace --no-default-features --features tiny`, same file)
-/// has the field absent, where an unconditional pattern entry would be E0028. In
+/// has the field absent, where an unconditional pattern entry would be E0026. In
 /// `frp-core` the gates match the struct exactly.
 ///
 /// **What stays here** is the part this crate owns: whether the field's only
@@ -393,7 +397,16 @@ fn server_reader_present(reader: frp_core::config::ServerReader) -> bool {
         ServerReader::Any => true,
         ServerReader::Dashboard => cfg!(feature = "dashboard"),
         ServerReader::Ssh => cfg!(feature = "ssh"),
+        // The three listener ports: `frp-core`'s features decide whether the
+        // *field* exists, these decide whether anything reads it.
+        ServerReader::Kcp => cfg!(feature = "kcp"),
         ServerReader::Quic => cfg!(feature = "quic"),
+        ServerReader::Websocket => cfg!(feature = "websocket"),
+        // `kcp_bind_port` / `quic_bind_port` have a second reader: the dashboard
+        // prints both from the startup `ServerConfigSnapshot`
+        // (`frp-server/src/dashboard.rs`), which exists only with this feature.
+        ServerReader::KcpOrDashboard => cfg!(feature = "kcp") || cfg!(feature = "dashboard"),
+        ServerReader::QuicOrDashboard => cfg!(feature = "quic") || cfg!(feature = "dashboard"),
         ServerReader::Otel => frp_core::logging::OTEL_ENABLED,
     }
 }
@@ -487,7 +500,9 @@ impl Service {
         let allow_ports = resolve_allow_ports(&cfg);
         let sub_host = cfg.sub_domain_host.clone();
         let max_connections = resolve_max_connections(cfg.max_connections);
-        let max_accept_rate = cfg.max_accept_rate.unwrap_or(0);
+        // Same effective-value function the reload's comparison uses, so the
+        // limiter and the report cannot disagree about what "unset" means.
+        let max_accept_rate = frp_core::config::effective_max_accept_rate(cfg.max_accept_rate);
         let mut state = AppState::new(
             auth_cfg,
             if cfg.proxy_bind_addr.is_empty() {
@@ -624,7 +639,7 @@ impl Service {
         #[cfg(not(feature = "tls"))]
         let _tls_acceptor: Option<()> = None;
 
-        let max_accept_rate = self.cfg.max_accept_rate.unwrap_or(0);
+        let max_accept_rate = frp_core::config::effective_max_accept_rate(self.cfg.max_accept_rate);
         // Hoisted accept-rate-limiter gate: when max_accept_rate == 0 the
         // limiter is a no-op (rate 0.0 → try_acquire always Ok), so skip
         // taking the mutex on every accept. The limiter never changes after

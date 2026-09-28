@@ -165,79 +165,96 @@ async fn log_changes_are_reported() {
 /// field. The value pair is asserted too wherever it is stable.
 #[tokio::test]
 async fn each_restart_only_group_is_named() {
-    // (field, initial file body, rewritten file body)
-    let cases: &[(&str, &str, &str)] = &[
+    // (field, initial file body, rewritten file body, other fields the same
+    // rewrite legitimately moves — a line for anything outside this set fails the
+    // test, so an unexpected extra report is caught here and not only at the
+    // shell probe.)
+    let cases: &[(&str, &str, &str, &[&str])] = &[
         (
             "web_server.custom_404_page",
             "[web_server]\ncustom_404_page = \"<html>one</html>\"\n",
             "[web_server]\ncustom_404_page = \"<html>two</html>\"\n",
+            &[],
         ),
         (
             "log.format",
             "[log]\nformat = \"text\"\n",
             "[log]\nformat = \"json\"\n",
+            &[],
         ),
         (
             "max_conns_per_proxy",
             "max_conns_per_proxy = 0\n",
             "max_conns_per_proxy = 9\n",
+            &[],
         ),
         (
             "max_proxies_per_client",
             "max_proxies_per_client = 0\n",
             "max_proxies_per_client = 8\n",
+            &[],
         ),
         (
             "max_custom_domains_per_proxy",
             "max_custom_domains_per_proxy = 0\n",
             "max_custom_domains_per_proxy = 4\n",
+            &[],
         ),
         (
             "vhost_http_timeout",
             "vhost_http_timeout = 60\n",
             "vhost_http_timeout = 61\n",
+            &[],
         ),
         (
             "user_conn_timeout",
             "user_conn_timeout = 10\n",
             "user_conn_timeout = 11\n",
+            &[],
         ),
         (
             "detailed_errors_to_client",
             "detailed_errors_to_client = true\n",
             "detailed_errors_to_client = false\n",
+            &[],
         ),
         (
             "graceful_shutdown_timeout",
             "graceful_shutdown_timeout = 30\n",
             "graceful_shutdown_timeout = 31\n",
+            &[],
         ),
         (
             "tcp_mux_passthrough",
             "tcp_mux_passthrough = false\n",
             "tcp_mux_passthrough = true\n",
+            &[],
         ),
         (
             "udp_packet_size",
             "udp_packet_size = 1500\n",
             "udp_packet_size = 1501\n",
+            &[],
         ),
         (
             "nat_hole_analysis_data_reserve_hours",
             "natholeAnalysisDataReserveHours = 168\n",
             "natholeAnalysisDataReserveHours = 169\n",
+            &[],
         ),
         (
             "max_connections",
             "max_connections = 100\n",
             "max_connections = 101\n",
+            &[],
         ),
         (
             "max_accept_rate",
             "max_accept_rate = 10\n",
             "max_accept_rate = 11\n",
+            &[],
         ),
-        ("tls_only", "", "tls_only = true\n"),
+        ("tls_only", "", "tls_only = true\n", &[]),
         // Not `"" -> "127.0.0.1"`: the loader completes an empty
         // `proxy_bind_addr` from `bind_addr`, so that spelling is not a change
         // (the `udp_packet_size = 0 -> 1500` class of normalization).
@@ -245,55 +262,86 @@ async fn each_restart_only_group_is_named() {
             "proxy_bind_addr",
             "proxy_bind_addr = \"10.0.0.1\"\n",
             "proxy_bind_addr = \"10.0.0.2\"\n",
+            &[],
         ),
-        ("sub_domain_host", "", "sub_domain_host = \"example.com\"\n"),
-        ("sudp_port", "sudp_port = 0\n", "sudp_port = 12500\n"),
+        (
+            "sub_domain_host",
+            "",
+            "sub_domain_host = \"example.com\"\n",
+            &[],
+        ),
+        ("sudp_port", "sudp_port = 0\n", "sudp_port = 12500\n", &[]),
         (
             "transport.max_pool_count",
             "[transport]\nmax_pool_count = 5\n",
             "[transport]\nmax_pool_count = 6\n",
+            &[],
         ),
         (
             "transport.tcp_mux_keepalive_interval",
             "[transport]\ntcp_mux_keepalive_interval = 30\n",
             "[transport]\ntcp_mux_keepalive_interval = 31\n",
+            &[],
         ),
         (
             "transport.tcp_mux_keepalive_timeout",
             "[transport]\ntcp_mux_keepalive_timeout = 0\n",
             "[transport]\ntcp_mux_keepalive_timeout = 90\n",
+            &[],
         ),
         (
             "transport.tcp_keepalive",
             "[transport]\ntcp_keepalive = 7200\n",
             "[transport]\ntcp_keepalive = 7201\n",
+            &[],
         ),
         (
             "transport.tcp_send_buffer_size",
             "[transport]\ntcp_send_buffer_size = 0\n",
             "[transport]\ntcp_send_buffer_size = 4096\n",
+            &[],
         ),
         (
             "transport.tcp_recv_buffer_size",
             "[transport]\ntcp_recv_buffer_size = 0\n",
             "[transport]\ntcp_recv_buffer_size = 4096\n",
+            &[],
         ),
         (
+            // Flipping `tcp_mux` also moves the *completed* `heartbeat_timeout`
+            // (`-1` with the mux on, `90` with it off), which is a real second
+            // difference and therefore an expected second line.
             "transport.tcp_mux",
             "[transport]\ntcp_mux = true\n",
             "[transport]\ntcp_mux = false\n",
+            ["transport.heartbeat_timeout"].as_slice(),
         ),
     ];
 
-    for (field, from, to) in cases {
+    for (field, from, to, also_expected) in cases {
         let port = allocate_port();
         let server = Server::start(port, from).await;
         let summary = server.rewrite_and_reload(&probe_config(port, to)).await;
-        // `tcp_mux_passthrough` and the transport keys can also move a field the
-        // reload applies (a `tcp_mux` flip changes the completed
-        // `heartbeat_timeout`), so the assertion is: the summary names the field
-        // under test, and every `(restart required)` line it prints is a line for
-        // a *config* field that really differs.
+
+        // The summary is a `; `-joined list of `name: …` / `name changed …`
+        // entries. Every entry's name must be the field under test or one of this
+        // case's known companions — anything else is an over-report, which is as
+        // much a failure as a silent field.
+        for entry in summary.split("; ") {
+            let named = match entry.split_once(": ") {
+                Some((name, _)) => name,
+                // `http_plugins changed (restart required)` — name-only entries.
+                None => entry
+                    .split_once(" changed (")
+                    .map(|(n, _)| n)
+                    .unwrap_or(entry),
+            };
+            assert!(
+                named == *field || also_expected.contains(&named),
+                "unexpected field in the summary for `{field}`: `{named}` \
+                 (whole summary: {summary})"
+            );
+        }
         assert!(
             summary.starts_with(field) || summary.contains(&format!("{field}:")),
             "the summary must name `{field}`: {summary}"
@@ -303,6 +351,149 @@ async fn each_restart_only_group_is_named() {
             "`{field}` must not be a no-op: {summary}"
         );
     }
+}
+
+/// The two `Option<u32>` limits are reported only when the value the server
+/// **runs with** changes.
+///
+/// An absent `max_connections` and `max_connections = 512` both build a
+/// 512-permit semaphore, and an absent `max_accept_rate` and
+/// `max_accept_rate = 0` both mean "no limit" — so the pairs are one setting and
+/// the reload must stay quiet. Comparing the raw options reported them as
+/// `max_connections: <unset> -> 512 (restart required)` and
+/// `max_accept_rate: <unset> -> 0 (restart required)` where the base binary said
+/// `no changes detected`: a false "restart required" introduced by this change
+/// and caught by review.
+///
+/// `max_connections = 0` is **not** an equivalence with the default — 0 means
+/// unlimited — so that pair must still be reported.
+#[tokio::test]
+async fn unset_limits_are_not_reported_as_a_restart() {
+    let port = allocate_port();
+    let server = Server::start(port, "").await;
+
+    // Absent -> the explicit default, and back: one setting, no line.
+    let both_spelled = server
+        .rewrite_and_reload(&probe_config(
+            port,
+            "max_connections = 512\nmax_accept_rate = 0\n",
+        ))
+        .await;
+    assert_eq!(
+        both_spelled, "config reloaded: no changes detected",
+        "the explicit defaults of both limits are the running values"
+    );
+    let back_to_absent = server.rewrite_and_reload(&probe_config(port, "")).await;
+    assert_eq!(
+        back_to_absent, "config reloaded: no changes detected",
+        "removing the explicit defaults is not a change either"
+    );
+
+    // A different connection cap IS reported, against the effective running value.
+    let capped = server
+        .rewrite_and_reload(&probe_config(port, "max_connections = 100\n"))
+        .await;
+    assert_eq!(
+        capped, "max_connections: <unset> -> 100 (restart required)",
+        "an absent limit is printed as <unset>, and the value differs in effect"
+    );
+
+    // `0` is "unlimited", a different running value from the 512 default. The
+    // baseline is still the **running** config, which the previous reload did not
+    // apply — so the old side stays `<unset>`, not the `100` it just reported.
+    let unlimited = server
+        .rewrite_and_reload(&probe_config(port, "max_connections = 0\n"))
+        .await;
+    assert_eq!(
+        unlimited, "max_connections: <unset> -> 0 (restart required)",
+        "0 = unlimited differs from the 512 default and must be reported"
+    );
+
+    // A real rate limit differs from "no limit".
+    let limited = server
+        .rewrite_and_reload(&probe_config(port, "max_accept_rate = 10\n"))
+        .await;
+    assert_eq!(
+        limited, "max_accept_rate: <unset> -> 10 (restart required)",
+        "an absent max_accept_rate is 0 = no limit; 10 is a different setting"
+    );
+}
+
+/// The three `#[cfg]`-gated listener ports are reported only when **this build**
+/// has a reader for them — the KCP / QUIC / WebSocket listener, or (for
+/// `kcp_bind_port` and `quic_bind_port`) the dashboard's startup-snapshot
+/// display.
+///
+/// This is the arm that runs in `cargo test -p frp-server --no-default-features
+/// --all-targets` (`.github/workflows/ci.yml`), where the `frp-client`
+/// dev-dependency turns `frp-core`'s `kcp`/`quic`/`websocket` on while
+/// `frp-server`'s stay off: the fields exist and are parsed, and nothing reads
+/// them, so a line here would be a false "restart required". They were classed
+/// `ServerReader::Any` when this landed, which printed exactly that.
+///
+/// Each expectation is derived from the feature the reload itself asks about, so
+/// the test asserts the documented rule in every configuration rather than one
+/// build's answer.
+#[tokio::test]
+async fn gated_listener_ports_follow_their_own_features() {
+    let port = allocate_port();
+    let server = Server::start(port, "").await;
+
+    let summary = server
+        .rewrite_and_reload(&probe_config(
+            port,
+            "kcp_bind_port = 17001\nquic_bind_port = 17002\nwebsocket_port = 17003\n",
+        ))
+        .await;
+
+    // `kcp_bind_port`: the KCP listener, or the dashboard that prints it from
+    // the startup `ServerConfigSnapshot` (`frp-server/src/dashboard.rs`).
+    #[cfg(any(feature = "kcp", feature = "dashboard"))]
+    assert!(
+        summary.contains("kcp_bind_port:"),
+        "a reader exists in this build (kcp listener or dashboard): {summary}"
+    );
+    #[cfg(not(any(feature = "kcp", feature = "dashboard")))]
+    assert!(
+        !summary.contains("kcp_bind_port"),
+        "no reader for kcp_bind_port in this build, so no line: {summary}"
+    );
+
+    #[cfg(any(feature = "quic", feature = "dashboard"))]
+    assert!(
+        summary.contains("quic_bind_port:"),
+        "a reader exists in this build (quic listener or dashboard): {summary}"
+    );
+    #[cfg(not(any(feature = "quic", feature = "dashboard")))]
+    assert!(
+        !summary.contains("quic_bind_port"),
+        "no reader for quic_bind_port in this build, so no line: {summary}"
+    );
+
+    #[cfg(feature = "websocket")]
+    assert!(
+        summary.contains("websocket_port:"),
+        "the WebSocket listener reads it in this build: {summary}"
+    );
+    #[cfg(not(feature = "websocket"))]
+    assert!(
+        !summary.contains("websocket_port"),
+        "no reader for websocket_port in this build, so no line: {summary}"
+    );
+
+    // In the lane that motivated this — none of the four features on — the whole
+    // reload must still be a no-op, which is what the base binary said and what
+    // the first version of this change got wrong.
+    #[cfg(not(any(
+        feature = "kcp",
+        feature = "quic",
+        feature = "websocket",
+        feature = "dashboard"
+    )))]
+    assert_eq!(
+        summary, "config reloaded: no changes detected",
+        "with no listener and no dashboard, all three ports are inert"
+    );
 }
 
 /// The settings no reader in this crate consumes are **not** reported: a restart

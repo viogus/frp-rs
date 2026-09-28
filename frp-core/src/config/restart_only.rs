@@ -31,12 +31,15 @@
 //!   a `#[cfg(feature = "kcp")]` pattern entry is stripped → **E0027**.
 //! * `cargo check --workspace --no-default-features --features tiny`
 //!   (`.github/workflows/ci.yml`): `frp-core/kcp` is off, the field **does not
-//!   exist**, so an unconditional pattern entry → **E0028**.
+//!   exist**, so an unconditional pattern entry → **E0026** ("struct does not
+//!   have a field named …"; measured on this tree — an earlier version of these
+//!   notes said E0028, which is the wrong code).
 //!
 //! Both were measured against a draft of this list written in `frp-server`;
 //! this module is the same list where the gates match the struct exactly. The
 //! *reader* gates stay in `frp-server`, which is the crate that owns those
-//! readers: see [`ServerReader`].
+//! readers: see [`ServerReader`] — and note that the same unification means the
+//! three ports' reader gates are `frp-server`'s features, not `frp-core`'s.
 
 use std::fmt::Display;
 
@@ -52,6 +55,23 @@ use super::{
 /// change to it take effect and reporting one "restart required" would be false.
 /// `frp-server` resolves each variant against its own features (it owns the
 /// readers); this crate only says which one to ask about.
+///
+/// The gates are **`frp-server`'s**, not `frp-core`'s, and Cargo unifies the two
+/// independently — see the module docs for the lane that made that concrete.
+/// `Kcp`, `Quic` and `Websocket` are the three listener fields whose *presence*
+/// is `frp-core`-gated but whose reader is `frp-server`-gated: in a build where
+/// `frp-core/kcp` is on through another crate while `frp-server/kcp` is off, the
+/// field exists and this crate reports it, and only `frp-server`'s resolution of
+/// the gate can suppress the line. They must not be `Any`.
+///
+/// `KcpOrDashboard` / `QuicOrDashboard` are the two ports with **two** readers,
+/// measured: `kcp_bind_port` is read by the KCP listener
+/// (`Service::run`, `frp-server/src/service.rs:1028`) *and* by the dashboard's
+/// `ServerConfigSnapshot` display (`frp-server/src/dashboard.rs:502`, `:2492`);
+/// `quic_bind_port` has the same pair (`service.rs:1532`, `dashboard.rs:504`,
+/// `:2494`). `websocket_port` has one (`service.rs:638`). A disjunction is the
+/// right shape here: suppressing the line because the listener is compiled out
+/// would be wrong in a build where the dashboard prints the value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerReader {
     /// A reader exists in every build of `frp-server`.
@@ -62,8 +82,17 @@ pub enum ServerReader {
     /// The SSH tunnel gateway (`Service::run`, `#[cfg(feature = "ssh")]`, via
     /// `SshListener::new`).
     Ssh,
+    /// The KCP listener (`Service::run`, `#[cfg(feature = "kcp")]`).
+    Kcp,
     /// The QUIC listener (`Service::run`, `#[cfg(feature = "quic")]`).
     Quic,
+    /// The WebSocket listener (`Service::run`, `#[cfg(feature = "websocket")]`).
+    Websocket,
+    /// `kcp_bind_port`: the KCP listener **or** the dashboard's snapshot display.
+    KcpOrDashboard,
+    /// `quic_bind_port`: the QUIC listener **or** the dashboard's snapshot
+    /// display.
+    QuicOrDashboard,
     /// `frps`'s `init_logging` (`#[cfg(feature = "otel")]` on the binary, which
     /// forwards `frp-core/otel`).
     Otel,
@@ -105,11 +134,48 @@ pub struct RestartOnlyChange {
 /// rendering is injective — `<unset>` is not a number and `u32::to_string` is
 /// exact — so it can neither miss a `None`/`Some` or `Some(a)`/`Some(b)`
 /// difference nor invent one.
+///
+/// It is a **rendering**, not the comparison: the two limits below are compared
+/// as the values the server actually runs with (an absent key and its default
+/// are the same setting, so they must not be reported as a change). `<unset>` is
+/// therefore only ever printed next to a value that *differs in effect* from it.
 fn show_opt_u32(v: &Option<u32>) -> String {
     match v {
         None => "<unset>".to_string(),
         Some(n) => n.to_string(),
     }
+}
+
+/// The connection-semaphore size `max_connections` resolves to — the same
+/// function `frp-server`'s `resolve_max_connections` is, and the reason that one
+/// now delegates here rather than repeating the constant.
+///
+/// `Some(0)` means unlimited and MUST resolve to 0 (not `usize::MAX`):
+/// `AppState::new` builds `Semaphore::new(n)` whenever n > 0, and tokio panics on
+/// `usize::MAX` (batch_semaphore asserts permits <= MAX_PERMITS); with
+/// panic=abort in release, `usize::MAX` would crash frps at boot on the
+/// documented "0 = unlimited" setting (audit H1). `None` is the 512 default.
+///
+/// Used by [`ServerConfig::restart_only_changes`] so that an absent
+/// `max_connections` and an explicit `max_connections = 512` compare equal: they
+/// are one setting, and reporting the pair as a change would be a false "restart
+/// required" (measured on the first round of this fix).
+pub fn effective_max_connections(max_connections: Option<u32>) -> usize {
+    match max_connections {
+        Some(0) => 0, // 0 = unlimited → no semaphore
+        Some(n) => n as usize,
+        None => 512, // default
+    }
+}
+
+/// The accept-rate the server runs with: `None` is 0 = no limit, which is what
+/// `Service::run` computes with `unwrap_or(0)`.
+///
+/// Same purpose as [`effective_max_connections`]: an absent `max_accept_rate` and
+/// an explicit `max_accept_rate = 0` are one setting and must not be reported as
+/// a change.
+pub fn effective_max_accept_rate(max_accept_rate: Option<u32>) -> u32 {
+    max_accept_rate.unwrap_or(0)
 }
 
 /// Push a change entry when `old != new`.
@@ -817,13 +883,23 @@ impl ServerConfig {
             "vhost_https_port",
             any,
         );
+        // The three listener ports are `#[cfg]`-gated in the *struct* on
+        // `frp-core`'s features but read only by `frp-server`'s listeners, so
+        // their gate is resolved on `frp-server`'s features: `KcpOrDashboard` /
+        // `QuicOrDashboard` (the dashboard also prints those two from the startup
+        // snapshot) and `Websocket`. `Any` here would report a restart in a build
+        // with the listener compiled out — measured in the very lane that
+        // motivated this module's location, `cargo test -p frp-server
+        // --no-default-features --all-targets`, where `frp-core`'s three features
+        // are on through the `frp-client` dev-dependency and `frp-server`'s are
+        // off.
         #[cfg(feature = "kcp")]
         push(
             out,
             old_kcp_bind_port,
             new_kcp_bind_port,
             "kcp_bind_port",
-            any,
+            ServerReader::KcpOrDashboard,
         );
         #[cfg(feature = "quic")]
         push(
@@ -831,7 +907,7 @@ impl ServerConfig {
             old_quic_bind_port,
             new_quic_bind_port,
             "quic_bind_port",
-            any,
+            ServerReader::QuicOrDashboard,
         );
         push(out, old_sudp_port, new_sudp_port, "sudp_port", any);
         push(
@@ -854,7 +930,7 @@ impl ServerConfig {
             old_websocket_port,
             new_websocket_port,
             "websocket_port",
-            any,
+            ServerReader::Websocket,
         );
         push(out, old_tls_only, new_tls_only, "tls_only", any);
 
@@ -939,22 +1015,42 @@ impl ServerConfig {
             "nat_hole_analysis_data_reserve_hours",
             any,
         );
-        // `Option<u32>` has no `Display`; `show_opt_u32` renders it injectively
-        // (`<unset>` vs the number).
-        push(
-            out,
-            &show_opt_u32(old_max_connections),
-            &show_opt_u32(new_max_connections),
-            "max_connections",
-            any,
-        );
-        push(
-            out,
-            &show_opt_u32(old_max_accept_rate),
-            &show_opt_u32(new_max_accept_rate),
-            "max_accept_rate",
-            any,
-        );
+        // The two `Option<u32>` limits: `Option<u32>` has no `Display`, and the
+        // raw spellings are **not** the running value — an absent
+        // `max_connections` and `max_connections = 512` both build a 512-permit
+        // semaphore, and an absent `max_accept_rate` and `max_accept_rate = 0`
+        // both mean "no limit". So the comparison is on the effective values the
+        // server resolves (`effective_max_connections` /
+        // `effective_max_accept_rate`, the same functions `frp-server` calls), and
+        // the raw spelling is only what gets *printed*: `<unset>` appears only
+        // when the other side differs in effect from it. Comparing the raw
+        // `Option`s was a measured false "restart required"
+        // (`max_connections: <unset> -> 512`, `max_accept_rate: <unset> -> 0`
+        // where base said `no changes detected`) and it is also the shape
+        // `max_connections = 0` (unlimited) deliberately *does* report: 0 and the
+        // 512 default are different settings.
+        if effective_max_connections(*old_max_connections)
+            != effective_max_connections(*new_max_connections)
+        {
+            out.push(RestartOnlyChange {
+                name: "max_connections",
+                old: show_opt_u32(old_max_connections),
+                new: show_opt_u32(new_max_connections),
+                name_only: false,
+                reader: any,
+            });
+        }
+        if effective_max_accept_rate(*old_max_accept_rate)
+            != effective_max_accept_rate(*new_max_accept_rate)
+        {
+            out.push(RestartOnlyChange {
+                name: "max_accept_rate",
+                old: show_opt_u32(old_max_accept_rate),
+                new: show_opt_u32(new_max_accept_rate),
+                name_only: false,
+                reader: any,
+            });
+        }
 
         // `HttpPluginConfig` has neither `PartialEq` nor `Display`: compare the
         // `Debug` rendering (injective for this plain-data struct — four strings,
@@ -1115,6 +1211,75 @@ mod tests {
         assert_eq!(names(&old.restart_only_changes(&new)), vec!["tls_only"]);
     }
 
+    /// The two `Option<u32>` limits are compared as the values the server
+    /// **runs with**, not as their raw `Option` spellings.
+    ///
+    /// `effective_max_connections(None) == effective_max_connections(Some(512))`
+    /// and `effective_max_accept_rate(None) == effective_max_accept_rate(Some(0))`,
+    /// so those pairs are one setting and must not be reported — comparing the raw
+    /// options did report them (`max_connections: <unset> -> 512 (restart
+    /// required)`, `max_accept_rate: <unset> -> 0 (restart required)`) where the
+    /// base binary said `no changes detected`, and it falsified the module's own
+    /// "an absent key and its default are not a change" sentence.
+    ///
+    /// `max_connections = 0` is **not** an equivalence: 0 means unlimited, not the
+    /// 512 default.
+    #[test]
+    fn unset_limits_and_their_explicit_defaults_are_one_setting() {
+        let unset = base();
+        assert_eq!(unset.max_connections, None);
+        assert_eq!(unset.max_accept_rate, None);
+
+        let mut explicit_defaults = base();
+        explicit_defaults.max_connections = Some(512);
+        explicit_defaults.max_accept_rate = Some(0);
+        assert!(
+            unset.restart_only_changes(&explicit_defaults).is_empty(),
+            "an absent limit and its explicit default must not be a change"
+        );
+        assert!(
+            explicit_defaults.restart_only_changes(&unset).is_empty(),
+            "…and the comparison must be symmetric"
+        );
+
+        // The same spelling on both sides is quiet as well.
+        assert!(explicit_defaults
+            .restart_only_changes(&explicit_defaults)
+            .is_empty());
+
+        // `Some(0)` for `max_connections` is "unlimited", which is a different
+        // running value from the 512 default, and IS reported.
+        let mut unlimited = base();
+        unlimited.max_connections = Some(0);
+        let changes = unset.restart_only_changes(&unlimited);
+        assert_eq!(names(&changes), vec!["max_connections"]);
+        assert_eq!(changes[0].old, "<unset>");
+        assert_eq!(changes[0].new, "0");
+
+        // A real rate limit differs from "no limit" and is reported.
+        let mut limited = base();
+        limited.max_accept_rate = Some(10);
+        let changes = unset.restart_only_changes(&limited);
+        assert_eq!(names(&changes), vec!["max_accept_rate"]);
+        assert_eq!(changes[0].old, "<unset>");
+        assert_eq!(changes[0].new, "10");
+    }
+
+    /// The two effective-value functions are the ones the server resolves with —
+    /// `frp-server`'s `resolve_max_connections` and its `Service::run` both
+    /// delegate to them now, so a drift would be a compile-time-visible edit at a
+    /// single site rather than two constants agreeing by coincidence.
+    #[test]
+    fn effective_limits_match_the_runtime_resolution() {
+        assert_eq!(effective_max_connections(None), 512);
+        assert_eq!(effective_max_connections(Some(0)), 0, "0 = unlimited");
+        assert_eq!(effective_max_connections(Some(512)), 512);
+        assert_eq!(effective_max_connections(Some(5)), 5);
+        assert_eq!(effective_max_accept_rate(None), 0);
+        assert_eq!(effective_max_accept_rate(Some(0)), 0);
+        assert_eq!(effective_max_accept_rate(Some(10)), 10);
+    }
+
     /// The listener/address group (the fields whose readers are the listeners
     /// `Service::run` binds once) is named too. Only the fields present in every
     /// feature combination are changed, so the expected list is feature-free.
@@ -1228,5 +1393,55 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert_eq!(otel, vec!["observability.otlp_endpoint"]);
+    }
+
+    /// The three `#[cfg]`-gated listener ports carry the **`frp-server`** gate,
+    /// not `Any`: their fields exist whenever `frp-core`'s features are on (which
+    /// another crate in the graph can turn on), but nothing reads them unless
+    /// `frp-server` compiled the listener — or, for `kcp_bind_port` /
+    /// `quic_bind_port`, the dashboard that prints them from the startup
+    /// snapshot. `Any` here was a measured false "restart required" in
+    /// `cargo test -p frp-server --no-default-features --all-targets`.
+    ///
+    /// Which variants are asserted depends on this crate's features (they decide
+    /// whether the field exists at all); the `frp-server`-side resolution of each
+    /// gate is pinned by `gated_listener_ports_follow_their_own_features` in
+    /// `frp-server/tests/server_reload_restart_only.rs`, which runs in that lane.
+    #[test]
+    fn gated_listener_ports_carry_a_reader_gate_not_any() {
+        let old = base();
+        let mut new = base();
+        #[cfg(feature = "kcp")]
+        {
+            new.kcp_bind_port = 17001;
+        }
+        #[cfg(feature = "quic")]
+        {
+            new.quic_bind_port = 17002;
+        }
+        #[cfg(feature = "websocket")]
+        {
+            new.websocket_port = 17003;
+        }
+        let changes = old.restart_only_changes(&new);
+        for c in &changes {
+            assert!(
+                c.reader != ServerReader::Any,
+                "{} must not be `Any`: its reader is frp-server-gated",
+                c.name
+            );
+        }
+        #[cfg(feature = "kcp")]
+        assert!(changes
+            .iter()
+            .any(|c| c.name == "kcp_bind_port" && c.reader == ServerReader::KcpOrDashboard));
+        #[cfg(feature = "quic")]
+        assert!(changes
+            .iter()
+            .any(|c| c.name == "quic_bind_port" && c.reader == ServerReader::QuicOrDashboard));
+        #[cfg(feature = "websocket")]
+        assert!(changes
+            .iter()
+            .any(|c| c.name == "websocket_port" && c.reader == ServerReader::Websocket));
     }
 }

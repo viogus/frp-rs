@@ -234,9 +234,14 @@ User-facing release notes for frp-rs.
   the QUIC options without `quic`, `[observability]` without `otel`), and
   `includes`, which the reload's own config load already resolves.
   Credential-shaped values are named without their values (`web_server.password`,
-  `http_plugins`). The classified field list is a compiler-enforced destructure
-  of `ServerConfig`, so a newly added field is a compile error until it is
-  classified rather than silently silent.
+  `http_plugins`). A field is compared as the value the server **runs with**, not
+  as its spelling in the file: an absent `max_connections` and
+  `max_connections = 512` are the same 512-permit semaphore, and an absent
+  `max_accept_rate` and `max_accept_rate = 0` are both "no limit", so neither pair
+  is reported (`max_connections = 0` is *unlimited* — a different setting, and it
+  is). The classified field list is a compiler-enforced destructure of
+  `ServerConfig`, so a newly added field is a compile error until it is classified
+  rather than silently silent.
 - **A config-load failure now prints a bare line on stdout, and `frpc verify`
   prints its refusal there instead of on stderr — a user-visible output change,
   and Go parity on the stream and the shape of each line.** Go frp v0.71.0 does
