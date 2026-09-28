@@ -508,7 +508,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
     read, `/tmp/sra-probe/non-auth/frps.err` 0 B — the probe prints both counts and both runs
     agreed byte-for-byte). Neither value is applied, and nothing in the summary
     names either field.
-  `reload()` compares only `allow_ports`, `[auth]`, `bind_port`, `bind_addr`, `tls_enable` and the
+  `reload()` compares only `allow_ports`, `[auth]`, `bind_port`, `bind_addr` and the
   TLS file paths (`frp-server/src/service.rs`), so this is the same class as the item above,
   outside `[auth]`: `transport.*`, `udp_packet_size`, `vhost_http_timeout`, `user_conn_timeout`,
   `web_server.*`, `http_plugins`, `max_ports_per_client` / `max_conns_per_proxy` /
