@@ -866,13 +866,23 @@ health_check_max_failed = 1
     fn spawn_failure_does_not_orphan_the_child_started_before_it() {
         let frps_bin = workspace_bin("frps");
         let frpc_bin = workspace_bin("frpc");
+        // **Fail closed**, unlike the three tests above: this test is the only
+        // artifact pinning the kill-on-drop guards in this file, so a silent
+        // `return` here would report `ok` while asserting nothing on a host
+        // without built binaries (measured at `9ba609a` with `FRPS_BIN` /
+        // `FRPC_BIN` pointed at nonexistent paths: `1 passed … finished in
+        // 0.00s`). A red test carrying the build instruction is the only honest
+        // outcome here; the sibling tests' skip is fine because other lanes pin
+        // what they assert.
         if !frps_bin.exists() || !frpc_bin.exists() {
-            eprintln!(
-                "Skipping: binaries not found ({}, {}) — build with: cargo build -p frps -p frpc",
+            panic!(
+                "the kill-on-drop guard test cannot run: binaries not found ({}, {}) — build \
+                 with: cargo build -p frps -p frpc. This test must not skip: it is the only \
+                 artifact that pins the guard in this file, so skipping it would report `ok` \
+                 while asserting nothing.",
                 frps_bin.display(),
                 frpc_bin.display(),
             );
-            return;
         }
 
         // Its own free port (never 7000 — something holds it on this host) and

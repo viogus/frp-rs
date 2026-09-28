@@ -2950,7 +2950,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   below.
 - [x] **`frp-server/tests/reload_integration.rs` has seven unguarded spawn sites and can orphan its children on a panic path.**
   Done on `fix/reload-guards` at `d151fda` (based on `095b83a`, #396), two commits:
-  `f31a4c9` the guard + its test, `d151fda` the residual sweep.
+  `f31a4c9` the guard + its test, `d151fda` the residual sweep; the review fix in `(e)`
+  landed after both, so the branch head is one commit later.
   Evidence: `.spawn()` at `:262`, `:272`, `:504`, `:523`, `:741`, `:750`, `:781` (frps/frpc pairs
   plus one more frps). None is wrapped in a kill-on-drop guard — the children are killed by explicit
   `kill()`/`wait()` calls at the end of each test body (`:355-358`, `:635-638`, `:767-768`,
@@ -2989,17 +2990,26 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `pgrep -x frps` **0 → 1**, `ps` showing `PPID 1` (`38280 1 /tmp/rg-target/debug/frps …`) and
   `lsof` the port still `LISTEN`; guarded **0 → 0**, port free; control arm proves the shape is
   `EACCES` on a real binary. (d) Residuals **guarded**, not recorded: the `try_wait().expect(..)`
-  panic paths in `frps/tests/cli_exit_codes.rs` (item `:87`/`:258`/`:284`; tree `:99`/`:441`/`:467`)
-  and `frpc/tests/cli_exit_codes.rs` (item `:96`; tree `:115`) now go through a local
-  `try_wait_or_kill` that kills + reaps on the error path before panicking — the item's allowed
-  "kill in the expect path" form — as do `frpc/tests/admin_cli.rs`'s `wait_with_timeout` and
-  `expect_one_connection` (its `oracle accept failed` arm now kills first; the timeout arm already
-  did), plus two same-class sites not in the item (`frpc/tests/cli_inputs.rs:223`,
-  `frpc/tests/cli_persistent_flags.rs:192`). The one exception, recorded as deliberate:
+  panic paths in `frps/tests/cli_exit_codes.rs` (item `:87`/`:258`/`:284`) and
+  `frpc/tests/cli_exit_codes.rs` (item `:96`) now go through a local `try_wait_or_kill` that kills
+  + reaps on the error path before panicking — the item's allowed "kill in the expect path" form —
+  as do `frpc/tests/admin_cli.rs`'s `wait_with_timeout` and `expect_one_connection` (its
+  `oracle accept failed` arm now kills first; the timeout arm already did), plus two same-class
+  `wait_with_timeout` sites not in the item (`frpc/tests/cli_inputs.rs`,
+  `frpc/tests/cli_persistent_flags.rs`). At this head the `try_wait_or_kill` call
+  sites are `frps/tests/cli_exit_codes.rs:118,441,467` and `frpc/tests/cli_exit_codes.rs:132`, and
+  the wait helpers' calls are `frpc/tests/admin_cli.rs:152`, `frpc/tests/cli_inputs.rs:238`,
+  `frpc/tests/cli_persistent_flags.rs:207` — cite those, not the pre-helper lines, whose numbers
+  move whenever a helper is inserted above them. The one exception, recorded as deliberate:
   `frpc/tests/admin_cli.rs` `connections_after_exit`'s `oracle accept failed` runs *after* the
-  child exited, so no live child is in scope. No test was added or removed in a guarded lane:
-  `env.FRPS_CLI_TESTS` stays **27** and `env.FRPC_TINY_CLI_TESTS` stays **11**, both re-measured
-  with the guard's own `-- --list` pattern. No `CHANGELOG.md` entry: test-harness only.
+  child exited, so no live child is in scope. (e) Review fix F1: the new test **fails closed** —
+  where its three siblings `return` when the binaries are absent, it `panic!`s with the build
+  instruction, because it is the only artifact pinning this file's guards and a skip would report
+  `ok` while asserting nothing (measured: at `9ba609a` with `FRPS_BIN`/`FRPC_BIN` at nonexistent
+  paths `1 passed … finished in 0.00s`; after the fix `0 passed; 1 failed`, rc 101). No test was
+  added or removed in a guarded lane: `env.FRPS_CLI_TESTS` stays **27** and
+  `env.FRPC_TINY_CLI_TESTS` stays **11**, both re-measured with the guard's own `-- --list`
+  pattern. No `CHANGELOG.md` entry: test-harness only.
   `scripts/compat-test.sh` is not relevant (no wire surface). Full evidence, including the orphan
   table and a "least sure" section: `/tmp/reload-guards-report.md`.
 - [x] **`frpc`'s eight single-proxy subcommands reject `-c`/`--config`, which Go accepts and
