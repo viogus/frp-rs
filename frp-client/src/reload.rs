@@ -7,11 +7,61 @@ use frp_core::config::{AuthClientConfig, ClientConfig, ProxyConfig, VisitorConfi
 
 use crate::proxy_runtime::ProxyRuntimeInfo;
 
-/// Fields of `[auth]` a reload can change, as `(name, changed)` pairs. One entry
-/// per field of [`AuthClientConfig`], with no `..Default` fallback, so adding a
-/// field to the client `[auth]` section without adding it here is a compile
-/// error rather than a silently-ignored reload input.
+/// Fields of `[auth]` a reload can change, as `(name, changed)` pairs.
+///
+/// **The completeness of this list is enforced by the compiler, not by the
+/// list.** The two `let AuthClientConfig { … }` statements below destructure
+/// every field with **no `..`**, so adding a field to [`AuthClientConfig`] makes
+/// this function fail to compile (E0027: pattern does not mention the field)
+/// until the new field is added to the destructure — and the destructure is
+/// immediately next to the `vec![]` that must also gain an entry. A plain
+/// `vec![("auth.token", old.token != new.token), …]` of named reads does *not*
+/// have that property: measured by the second reviewer on the earlier shape,
+/// adding a probe field to the struct and its `Default` left
+/// `cargo check -p frp-client` green and
+/// `auth_reload_refusal_covers_every_auth_field` passing, i.e. a reload changing
+/// that field would have been silently accepted as `no changes detected` — the
+/// exact bug class this function exists to close, reintroduced by the next
+/// `[auth]` field.
 fn auth_field_changes(old: &AuthClientConfig, new: &AuthClientConfig) -> Vec<(&'static str, bool)> {
+    let AuthClientConfig {
+        method: old_method,
+        token: old_token,
+        token_source: old_token_source,
+        oidc_client_id: old_oidc_client_id,
+        oidc_client_secret: old_oidc_client_secret,
+        oidc_audience: old_oidc_audience,
+        oidc_token_endpoint: old_oidc_token_endpoint,
+        oidc_scope: old_oidc_scope,
+        oidc_issuer: old_oidc_issuer,
+        additional_endpoint_params: old_additional_endpoint_params,
+        oidc_token_source: old_oidc_token_source,
+        oidc_tls_trusted_ca_file: old_oidc_tls_trusted_ca_file,
+        oidc_tls_insecure_skip_verify: old_oidc_tls_insecure_skip_verify,
+        oidc_proxy_url: old_oidc_proxy_url,
+        additional_auth_scopes: old_additional_auth_scopes,
+        authentication_timeout: old_authentication_timeout,
+        token_auth_timeout: old_token_auth_timeout,
+    } = old;
+    let AuthClientConfig {
+        method: new_method,
+        token: new_token,
+        token_source: new_token_source,
+        oidc_client_id: new_oidc_client_id,
+        oidc_client_secret: new_oidc_client_secret,
+        oidc_audience: new_oidc_audience,
+        oidc_token_endpoint: new_oidc_token_endpoint,
+        oidc_scope: new_oidc_scope,
+        oidc_issuer: new_oidc_issuer,
+        additional_endpoint_params: new_additional_endpoint_params,
+        oidc_token_source: new_oidc_token_source,
+        oidc_tls_trusted_ca_file: new_oidc_tls_trusted_ca_file,
+        oidc_tls_insecure_skip_verify: new_oidc_tls_insecure_skip_verify,
+        oidc_proxy_url: new_oidc_proxy_url,
+        additional_auth_scopes: new_additional_auth_scopes,
+        authentication_timeout: new_authentication_timeout,
+        token_auth_timeout: new_token_auth_timeout,
+    } = new;
     vec![
         (
             "auth.method",
@@ -20,67 +70,67 @@ fn auth_field_changes(old: &AuthClientConfig, new: &AuthClientConfig) -> Vec<(&'
             // `complete_auth_method` (Go's `util.EmptyOr`), so a reload that
             // only *spells out* the default must not be reported as auth change.
             {
-                let mut o = old.method.clone();
-                let mut n = new.method.clone();
+                let mut o = old_method.clone();
+                let mut n = new_method.clone();
                 frp_core::auth::complete_auth_method(&mut o);
                 frp_core::auth::complete_auth_method(&mut n);
                 o != n
             },
         ),
-        ("auth.token", old.token != new.token),
+        ("auth.token", old_token != new_token),
         (
             "auth.tokenSource",
             // `ValueSource` is not `PartialEq`; `Debug` is its deterministic
             // shape and is the same mechanism `config_snapshot` above uses for
             // the map fields it cannot compare field-wise.
-            format!("{:?}", old.token_source) != format!("{:?}", new.token_source),
+            format!("{:?}", old_token_source) != format!("{:?}", new_token_source),
         ),
         (
             "auth.oidc.clientID",
-            old.oidc_client_id != new.oidc_client_id,
+            old_oidc_client_id != new_oidc_client_id,
         ),
         (
             "auth.oidc.clientSecret",
-            old.oidc_client_secret != new.oidc_client_secret,
+            old_oidc_client_secret != new_oidc_client_secret,
         ),
-        ("auth.oidc.audience", old.oidc_audience != new.oidc_audience),
+        ("auth.oidc.audience", old_oidc_audience != new_oidc_audience),
         (
             "auth.oidc.tokenEndpointURL",
-            old.oidc_token_endpoint != new.oidc_token_endpoint,
+            old_oidc_token_endpoint != new_oidc_token_endpoint,
         ),
-        ("auth.oidc.scope", old.oidc_scope != new.oidc_scope),
-        ("auth.oidc.issuer", old.oidc_issuer != new.oidc_issuer),
+        ("auth.oidc.scope", old_oidc_scope != new_oidc_scope),
+        ("auth.oidc.issuer", old_oidc_issuer != new_oidc_issuer),
         (
             "auth.oidc.additionalEndpointParams",
-            old.additional_endpoint_params != new.additional_endpoint_params,
+            old_additional_endpoint_params != new_additional_endpoint_params,
         ),
         (
             "auth.oidc.tokenSource",
-            format!("{:?}", old.oidc_token_source) != format!("{:?}", new.oidc_token_source),
+            format!("{:?}", old_oidc_token_source) != format!("{:?}", new_oidc_token_source),
         ),
         (
             "auth.oidc.tlsTrustedCAFile",
-            old.oidc_tls_trusted_ca_file != new.oidc_tls_trusted_ca_file,
+            old_oidc_tls_trusted_ca_file != new_oidc_tls_trusted_ca_file,
         ),
         (
             "auth.oidc.tlsInsecureSkipVerify",
-            old.oidc_tls_insecure_skip_verify != new.oidc_tls_insecure_skip_verify,
+            old_oidc_tls_insecure_skip_verify != new_oidc_tls_insecure_skip_verify,
         ),
         (
             "auth.oidc.proxyURL",
-            old.oidc_proxy_url != new.oidc_proxy_url,
+            old_oidc_proxy_url != new_oidc_proxy_url,
         ),
         (
             "auth.additionalAuthScopes",
-            old.additional_auth_scopes != new.additional_auth_scopes,
+            old_additional_auth_scopes != new_additional_auth_scopes,
         ),
         (
             "auth.authenticationTimeout",
-            old.authentication_timeout != new.authentication_timeout,
+            old_authentication_timeout != new_authentication_timeout,
         ),
         (
             "auth.tokenAuthTimeout",
-            old.token_auth_timeout != new.token_auth_timeout,
+            old_token_auth_timeout != new_token_auth_timeout,
         ),
     ]
 }
@@ -119,6 +169,29 @@ fn auth_field_changes(old: &AuthClientConfig, new: &AuthClientConfig) -> Vec<(&'
 /// still holds the startup value; nothing else ever writes `cfg.auth` (only
 /// `cfg.proxies`/`cfg.visitors` are replaced), so that value stays the running
 /// one for the process's lifetime.
+///
+/// # What is compared, and the one deliberate over-refusal
+///
+/// The comparison is on the **`[auth]` section as written**, after nothing but
+/// the `auth.method` fill (`complete_auth_method`, so `method = ""` equals
+/// `method = "token"`). It is *not* a comparison of the "effective" auth, and it
+/// deliberately over-refuses in one shape: adding an `[auth]` section that
+/// happens to match the effective auth of a client whose `[auth]` was absent is
+/// reported as `[auth] section added` and refused. That is not an oversight:
+///
+/// * `None` and `Some(AuthClientConfig::default())` are **not** equivalent here.
+///   With `[auth]` absent the token comes from the deprecated flat top-level
+///   `token`; with `[auth]` present a non-empty `auth.token` **wins** over it
+///   (`frp_core::config::validate_client_config`), so the same-looking pair can
+///   resolve different tokens. Deciding equivalence would mean modelling that
+///   precedence here, which this function cannot see — it receives only the two
+///   optional sections.
+/// * The two directions are not symmetric in cost. Over-refusing costs a restart
+///   on a config that would have been a no-op; under-refusing silently accepts
+///   an auth change — the bug this function exists to close.
+///
+/// Pinned as deliberate by `auth_reload_refusal_treats_the_section_as_written`
+/// so a future reader does not "fix" it into an equivalence check.
 pub(crate) fn auth_reload_refusal(
     old: Option<&AuthClientConfig>,
     new: Option<&AuthClientConfig>,
@@ -619,6 +692,29 @@ mod tests {
             .starts_with("[auth] section removed"));
     }
 
+    /// The deliberate over-refusal, pinned so it is not "fixed" into an
+    /// equivalence check by a later reader (see the function's
+    /// "What is compared" section for why `None` and `Some(default)` are not
+    /// interchangeable).
+    #[test]
+    fn auth_reload_refusal_treats_the_section_as_written() {
+        // A section that is byte-for-byte the `Default` impl still counts as
+        // "added" against an absent one.
+        let default_auth = AuthClientConfig::default();
+        assert!(auth_reload_refusal(None, Some(&default_auth))
+            .expect("None -> Some(default) is deliberately refused")
+            .starts_with("[auth] section added"));
+        // The same in the other direction.
+        assert!(auth_reload_refusal(Some(&default_auth), None)
+            .expect("Some(default) -> None is deliberately refused")
+            .starts_with("[auth] section removed"));
+        // And the method fill still applies inside a present pair, so this is
+        // not "any textual difference": only the field values matter.
+        let mut empty_method = default_auth.clone();
+        empty_method.method = String::new();
+        assert!(auth_reload_refusal(Some(&empty_method), Some(&default_auth)).is_none());
+    }
+
     /// Every field of the client `[auth]` section participates. If a field is
     /// missing from `auth_field_changes`, its arm here stays `None` and this
     /// fails — that is the point of listing one mutation per field.
@@ -713,11 +809,17 @@ mod tests {
                 Box::new(|a: &mut AuthClientConfig| a.token_auth_timeout = false),
             ),
         ];
+        // A fingerprint, not an enforcement. What the compiler enforces is the
+        // *destructure* in `auth_field_changes` (a new struct field fails that
+        // function to compile); this literal cannot see the struct, so it only
+        // makes a missing row in the table below visible. If you add a field,
+        // the destructure forces you to touch `auth_field_changes`, and this
+        // count forces you to decide whether this table needs a row for it too.
         assert_eq!(
             cases.len(),
             17,
-            "one case per AuthClientConfig field; add the new field to \
-             auth_field_changes and to this list together"
+            "this table has one case per AuthClientConfig field today; if you \
+             added a field, add its case here and move this literal with it"
         );
         for (field, mutate) in cases {
             let mut new = base.clone();

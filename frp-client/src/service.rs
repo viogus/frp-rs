@@ -4445,10 +4445,14 @@ impl Service {
         // the running session.
         //
         // Why refuse instead of re-derive, and what this does *not* cover: see
-        // `reload::auth_reload_refusal`. Scope note: the store merge above has
-        // already happened, so a store-supplied `[auth]` is covered too; a store
-        // *reload* side effect (re-reading the store file) may therefore occur
-        // on a refused reload, but nothing from the new config is applied.
+        // `reload::auth_reload_refusal`. Scope note: the store merge **cannot**
+        // contribute an `[auth]` section at all — `store::merge_client_config`
+        // clones the config and overlays only proxies and visitors
+        // (`frp-client/src/store.rs:231-254`) — so the config file is the only
+        // source this comparison ever sees. The `store.reload()` a few lines
+        // above *has* already run when the check refuses, so re-reading the
+        // store file is one side effect a refused reload can still have;
+        // nothing from the new config is applied.
         if let Some(reason) = crate::reload::auth_reload_refusal(
             self.cfg.read().await.auth.as_ref(),
             new_cfg.auth.as_ref(),

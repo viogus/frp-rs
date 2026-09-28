@@ -1346,38 +1346,35 @@ async fn admin_head_auth_divergence_is_pinned() {
 // serving and never open the new one.
 // ---------------------------------------------------------------------------
 
-/// The valid config plus an explicit `[auth] method = "token"`, so a later
-/// rewrite can change **only** `[auth]` (an explicit section, rather than
-/// adding or removing one — `[auth] section added`/`removed` are different arms
-/// of `auth_reload_refusal`). The token matches `common::start_frps`'s, so this
-/// config really logs in.
-fn write_valid_config_with_token_auth(
-    path: &std::path::Path,
-    server_port: u16,
-    echo_port: u16,
-    remote_port: u16,
-) {
-    write_config_with_token_auth_and_token(path, server_port, echo_port, remote_port, false);
-}
-
-/// [`write_valid_config_with_token_auth`] with an extra `[auth]`
-/// `additionalAuthScopes` entry. That field is **not** derivable from any flat
-/// top-level key, so the file's `[auth]` really does differ from the running
-/// config — which is the whole point: the config *loads* (the client does not
-/// check auth scopes against the server), so a refusal has to come from
-/// `auth_reload_refusal` rather than from the loader.
+/// The valid config plus an explicit `[auth]` section, parameterised by the
+/// `method` and by whether an extra `additionalAuthScopes` entry is present. An
+/// explicit section (rather than adding or removing one) keeps the rewrites on
+/// `auth_reload_refusal`'s field arms — `[auth] section added`/`removed` are
+/// different arms.
 ///
-/// The first cut of that arm changed `[auth] token` instead, and it did **not**
-/// work: `normalize_client_config` promotes a flat top-level `token` into
-/// `[auth]`, so the nested value was overwritten with the same server token and
-/// the two `[auth]` sections were identical. Measured by deleting the reload
-/// check and re-running: the test stayed green, i.e. it was vacuous for the
-/// branch it claimed to cover.
+/// Two properties matter to the test below:
+///
+/// * `[auth.oidc]` credentials are present in **every** variant. This is the
+///   canonical Go sub-table, which `normalize_client_config` flattens to the
+///   `oidc_*` fields. With `method = "token"` the loader does not validate them,
+///   so they sit in the *running* config as the baseline from which a later
+///   rewrite can change **only** `method` — that is what gives
+///   `auth_reload_refusal`'s `auth.method` arm its own end-to-end witness instead
+///   of riding on another field's refusal. (Without the baseline creds, a
+///   `token`→`oidc` rewrite would also add clientID/clientSecret/issuer, and the
+///   test would still pass with the `auth.method` arm deleted.)
+/// * `additionalAuthScopes` is the one field no flat top-level key can supply,
+///   so a variant that adds it is a genuine `[auth]` difference the loader
+///   accepts. A `[auth] token` change is **not** usable for that: the flat
+///   top-level `token` is promoted into `[auth]`, so the nested value is
+///   overwritten and the two sections end up identical — measured by deleting
+///   the reload check and re-running, the arm stayed green, i.e. it was vacuous.
 fn write_config_with_token_auth_and_token(
     path: &std::path::Path,
     server_port: u16,
     echo_port: u16,
     remote_port: u16,
+    method: &str,
     extra_scope: bool,
 ) {
     let scope = if extra_scope { "\"HeartBeats\"" } else { "" };
@@ -1390,9 +1387,14 @@ loginFailExit = false
 token = "reload-malformed-token"
 
 [auth]
-method = "token"
+method = "{method}"
 token = "reload-malformed-token"
 additionalAuthScopes = [{scope}]
+
+[auth.oidc]
+clientID = "reload-test-client"
+clientSecret = "reload-test-secret"
+issuer = "http://127.0.0.1:1"
 
 [transport]
 tcpMux = false
@@ -1409,6 +1411,25 @@ remotePort = {remote_port}
     .expect("write token-auth config");
 }
 
+/// [`write_config_with_token_auth_and_token`] with `method = "token"` and no
+/// extra scope — the running config and the positive control. The token matches
+/// `common::start_frps`'s, so this config really logs in.
+fn write_valid_config_with_token_auth(
+    path: &std::path::Path,
+    server_port: u16,
+    echo_port: u16,
+    remote_port: u16,
+) {
+    write_config_with_token_auth_and_token(
+        path,
+        server_port,
+        echo_port,
+        remote_port,
+        "token",
+        false,
+    );
+}
+
 #[tokio::test]
 async fn reload_that_changes_auth_is_refused_and_applies_nothing() {
     init_tracing();
@@ -1416,7 +1437,8 @@ async fn reload_that_changes_auth_is_refused_and_applies_nothing() {
     let server_port = allocate_port();
     let p1 = allocate_port(); // the running proxy's remote port
     let p2 = allocate_port(); // the port a refused config would move it to
-    let p3 = allocate_port(); // a second witness port, for the loader-accepted arm
+    let p3 = allocate_port(); // witness port for the non-method `[auth]` arm
+    let p4 = allocate_port(); // witness port for the method-only `[auth]` arm
 
     let _echo = start_echo_server(echo_port);
     let _server = common::start_frps(server_port, "reload-malformed-token").await;
@@ -1507,7 +1529,7 @@ remotePort = {p2}
     //    refusal came from the loader and the test would have passed with the
     //    reload check deleted — measured by deleting the check and re-running:
     //    the test stayed green, which is why this arm exists.)
-    write_config_with_token_auth_and_token(&cfg_path, server_port, echo_port, p3, true);
+    write_config_with_token_auth_and_token(&cfg_path, server_port, echo_port, p3, "token", true);
     client.request_reload();
     tokio::time::sleep(RELOAD_SETTLE).await;
     assert!(
@@ -1527,7 +1549,34 @@ remotePort = {p2}
         "a refused auth reload must apply nothing: proxy 'main' moved to p3"
     );
 
-    // 3. Positive control: a rewrite that leaves `[auth]` alone still applies,
+    // 3. A rewrite whose ONLY `[auth]` difference is `method` (the base config
+    //    already carries the same `[auth.oidc]` credentials, see the writer).
+    //    This is the arm that witnesses `auth_reload_refusal`'s `auth.method`
+    //    entry specifically: delete that entry from `auth_field_changes` and
+    //    nothing else fires for this rewrite, so the reload applies and the
+    //    proxy moves to p4. (The arm above witnesses the *wiring*; this one
+    //    witnesses the method field.)
+    write_config_with_token_auth_and_token(&cfg_path, server_port, echo_port, p4, "oidc", false);
+    client.request_reload();
+    tokio::time::sleep(RELOAD_SETTLE).await;
+    assert!(
+        !runner.is_finished(),
+        "client run task ended after a method-only auth reload"
+    );
+    assert_echo_serving(
+        p1_addr,
+        "the running proxy must keep serving after a refused method-only auth reload",
+    )
+    .await;
+    let p4_addr: std::net::SocketAddr = format!("127.0.0.1:{p4}").parse().unwrap();
+    assert!(
+        wait_for_port(p4_addr, Duration::from_secs(2))
+            .await
+            .is_err(),
+        "a refused method-only auth reload must apply nothing: proxy 'main' moved to p4"
+    );
+
+    // 4. Positive control: a rewrite that leaves `[auth]` alone still applies,
     //    so the two refusals above are not vacuous (the proxy really can move
     //    on this harness).
     write_valid_config_with_token_auth(&cfg_path, server_port, echo_port, p2);
