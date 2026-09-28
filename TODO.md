@@ -718,10 +718,14 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   **half-implemented mapping** (removing just the winner and letting the loser fall through to the
   re-insert) — a hazard of the implementation, not a pre-existing defect (both fix-round reviewers
   reproduced it as a scratch variant / mutant). Corrected here, in the test's doc comment, in
-  `/tmp/wstls-report.md` §3/§7.2, and in the fix-round commit message. The honest count of the shipped
-  test set failing against base is **3 of 4 new tests** plus the extended client test
-  (`/tmp/wstls-falsify.txt` for the original in-place run, `/tmp/wstls-falsify-final.txt` for the
-  four-test harness against base), not "two".
+  `/tmp/wstls-report.md` §3/§8.2, and in the fix-round commit message. The honest count of the shipped
+  test set failing against base is **7 of the 8** shipped tests/assertions — the seven unit tests plus the
+  warning target's body, all compiled against `5717fa2` by `/tmp/wstls-extract-tests.py`
+  (`/tmp/wstls-falsify-final.txt`; the single pass is the residue test, which has no discriminating power
+  for this change and says so). The earlier text here said "3 of 4 new tests plus the extended client
+  test" against a four-test harness — that was written before the fix round added the two
+  `parent_level_*` tests, and `/tmp/wstls-falsify.txt` is only a 22-line tail of the original in-place
+  run (2 of the 3 tests that existed then), which is why the harness above is the citable artifact.
 
   **Qualifications and out-of-scope findings (measured, filed below rather than folded in).** (1) The
   precedence claim holds for both spellings **inside one `[web_server]` section**; a file that defines
@@ -5802,3 +5806,50 @@ nothing about whether the described behaviour still holds.
   field name is re-inserted rather than dropped. **Done-when:** the unmapped-key re-insert is restricted
   to keys that are not parent fields (or the nested table is refused outright), pinned by a test
   asserting a nested `password`/`user` does **not** change `web_server.password`/`web_server.user`.
+- [ ] **The `web_server.tls.enable` warning never reaches a `-c` user: the `-c` path loads the
+  config before logging exists.** `normalize_web_server_section` warns
+  (`frp-core/src/config/normalize.rs`) because `enable` is inert, but the warning is emitted from
+  inside the loader, and on the `-c` path the loader runs **before** `init_logging`
+  (`frps/src/main.rs:263` vs `:290`; `frpc/src/main.rs:561` vs `:583`, both carrying a comment
+  saying the ordering is deliberate Go parity). Measured on the v0.71.0 debug binaries with a config
+  whose `[web_server.tls]` sets `enable = true` (probe `/tmp/wstls-warn-probe/`, output
+  `/tmp/wstls-warn-probe/*.out`): `frps -c` → **0** occurrences of the message (also with
+  `RUST_LOG=debug`), `frpc -c` → **0**, `frps --config-dir=<dir>` → **1** (that path calls
+  `init_logging` first, `frps/src/main.rs:180`). So the honest scope, now written into
+  `docs/config.md`, `CHANGELOG.md` and the test target's doc, is "warned when the sink is installed
+  before the load (`--config-dir`)"; on the common path `enable = true` with no cert/key pair still
+  serves the dashboard as plaintext HTTP **in silence**, which is the outcome the warning exists to
+  prevent. **Done-when:** the warning survives the `-c` path — R1's sketch: add a presence flag to
+  `ConfigPresence` (already returned by `load_config_from_file` and already used for
+  `server_heartbeat_timeout_set`) and warn from `frps`/`frpc` **after** `init_logging` — with a test
+  that fails without the flag on the `-c` path (a spawn test per binary, asserting the message on
+  the captured output). Not done in the prose-only fix round: it is a behaviour change to two
+  binaries, and `docs/config.md`/`CHANGELOG.md` now state the limitation instead of overstating the
+  diagnostic.
+- [ ] **A parent-level `certFile` alias beside the parent-level canonical `tls_cert_file` is a
+  `duplicate field` error — with no nested key involved at all.** serde binds `web_server.certFile`
+  as an `alias` of `web_server.tls_cert_file`, so a file that writes both (in any spelling mix that
+  puts two of those names at the parent level) fails to deserialize in **both** loader modes with
+  ``config validation error: duplicate field `tls_cert_file` ``. Measured on all three trees
+  (`5717fa2`, `ccff127`, the fix-round head — probe `/tmp/wstls-f1/`, cases `t17`/`t18`), so it is
+  **pre-existing and not fixed by the nested-section mapping**: that fix removes the parent-level
+  alias only when a nested value supplies the field. `t16` (`certFile` + `cert_file`, no canonical)
+  is *not* this defect — `cert_file` is not a field, so it is correctly reported as
+  `unknown field "web_server.cert_file"` in strict mode and dropped non-strict. Note the one
+  message change the mapping does cause for `t18`-style files (alias + canonical + a nested table
+  with some other key): base strict reported `unknown field "web_server.key_file"` first, the fixed
+  tree reports the duplicate, because the nested spelling is now mapped instead of being unknown —
+  both refuse, the wording differs. **Done-when:** the duplicate is either closed (drop the
+  parent-level alias whenever the canonical is present, not only when a nested value is) or the
+  error names the two parent-level keys, pinned by a test in both modes.
+- [ ] **A nested empty value clears the flat value: `[web_server.tls] cert_file = ""` beside
+  `[web_server] certFile = "/p.pem"` loads with `tls_cert() == ""`.** The hoist's `insert` treats an
+  explicitly empty nested string as "the nested value wins" — consistent with the documented
+  precedence, but surprising for a field whose emptiness means *disabled*: a cert written for the
+  flat/alias spelling is silently dropped and the dashboard serves plaintext. Measured (probe
+  `/tmp/wstls-f1/`, cases `t19`/`t20`): base kept the flat value in both cases; `ccff127` and the
+  fix-round head load with `tls_cert() == ""` (`t20` — parent canonical + empty nested — already
+  behaved that way on `ccff127`). **Done-when:** the intended semantics are stated for the empty
+  string (nested wins, or an empty nested value is "unset" and falls through to the flat key) and
+  pinned by a test in both modes, with the one-clause note in `docs/config.md` either kept or
+  replaced by the implemented rule.

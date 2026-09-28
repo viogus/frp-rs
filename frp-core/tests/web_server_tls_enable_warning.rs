@@ -21,8 +21,18 @@
 //! **What it does not cover.** The user-visible dashboard behaviour itself —
 //! plaintext HTTP with no pair — which is `frp-server` end to end and was
 //! measured by the fix-round review, not re-measured here; the other sinks a
-//! deployment may configure; and YAML/INI (the hoist and the warning are
-//! format-independent, but only TOML is exercised).
+//! deployment may configure; YAML/INI (the hoist and the warning are
+//! format-independent, but only TOML is exercised); and — the gap that matters
+//! most — **the warning is not delivered on either binary's `-c` path**, so this
+//! test pins the message, not the diagnostic a user sees. Measured on the
+//! v0.71.0 binaries (fix-round review R1, re-measured here): `frps -c <file>`
+//! and `frpc -c <file>` emit **0** occurrences of the message (`RUST_LOG=debug`
+//! included), while `frps --config-dir=<dir>` emits **1**, because the `-c` path
+//! deliberately loads the config before `init_logging`
+//! (`frps/src/main.rs:263` vs `:290`; `frpc/src/main.rs:561` vs `:583`) and this
+//! warning is emitted from inside the loader. Moving it after logging on that
+//! path (a `ConfigPresence` presence flag plus a warn in each binary) is filed in
+//! `TODO.md`; until then, `docs/config.md` and `CHANGELOG.md` state the scope.
 
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};

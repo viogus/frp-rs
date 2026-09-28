@@ -1473,7 +1473,14 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
 ///
 /// **What it drops, and why.** `enable` is removed and does not reach any
 /// field; a load that contains it also logs a warning, because that is the
-/// diagnostic a user needs (see the code comment at the removal). Nothing reads
+/// diagnostic a user needs (see the code comment at the removal). **Scope of
+/// that warning, measured on the v0.71.0 binaries:** it is delivered when the log
+/// sink is installed before the load (`frps --config-dir`: 1 warning) and dropped
+/// on the `-c` path (`frps -c`, `frpc -c`: 0 warnings, `RUST_LOG=debug`
+/// included), where the load deliberately precedes `init_logging`
+/// (`frps/src/main.rs:263` vs `:290`, `frpc/src/main.rs:561` vs `:583`). So on
+/// the common path the key is inert **and** silent until the warning is moved
+/// after logging — filed in `TODO.md`. Nothing reads
 /// [`WebServerTlsConfig::enable`]: the table is removed before serde, so the
 /// field is default-`false` in every loaded config and has no reader in
 /// `frp-server`/`frps`; the dashboard TLS is driven by a non-empty cert/key pair

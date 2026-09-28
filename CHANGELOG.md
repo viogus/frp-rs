@@ -408,9 +408,21 @@ User-facing release notes for frp-rs.
   flat key that is already set (documents and code disagreed here: the struct
   comment claimed nested-wins while `or_insert` made flat win, order-dependently).
   `[web_server.tls] enable` was in the same bucket — re-inserted as the unknown
-  `web_server.enable` — and is now accepted and ignored in **both** loader modes,
-  matching Go, whose `TLSConfig` has no `Enable` field and whose HTTP server
-  starts TLS when the cert/key pair is non-empty (same rule frp-rs uses). A
+  `web_server.enable` — and is now accepted and ignored in **both** loader modes.
+  Go **refuses** the key rather than ignoring it: its `TLSConfig` has no `Enable`
+  field, so `frps verify` exits 1 with `json: unknown field "enable"`. Accepting
+  it is therefore a deliberate divergence — refusing it would reject a file frp-rs
+  can serve correctly, and would split strict from non-strict exactly as the
+  `cert_file` key did — and it comes with a load-time warning, because the value
+  is inert while the dashboard TLS is switched by a non-empty cert/key pair (the
+  rule both implementations use): `enable = true` with no pair serves the
+  dashboard as plaintext HTTP, and the warning is what says so. Scope of that
+  warning, measured on the v0.71.0 binaries: it is delivered when the log sink is
+  installed before the config load (`frps --config-dir`, 1 warning) and **not** on
+  the `-c` path (`frps -c` and `frpc -c`, 0 warnings — with `RUST_LOG=debug`
+  included), where the load deliberately precedes `init_logging`
+  (`frps/src/main.rs:263` vs `:290`; `frpc/src/main.rs:561` vs `:583`). Moving the
+  warning after logging on that path is filed in `TODO.md`, not done here. A
   genuinely unknown nested key is still refused, as `web_server.<key>`.
 - **An empty `--log-level` / `--log-file`, and a zero `max_days`, no longer
   silence `frps` or `frpc` — or silently switch off log retention.** Go fills
