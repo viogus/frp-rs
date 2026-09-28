@@ -224,11 +224,17 @@ pub struct ConfigPresence {
 /// paths, `frpc`'s two startup paths plus `frpc verify`, and the two in-process
 /// **reloads** (`frp-server`'s `Service::reload`, `frp-client`'s
 /// `reload_from_sources`) — one record per load, so a reload adds one rather
-/// than replacing the startup record. Loading from the library
-/// (`load_*_config_from_str`) is silent by design: the `frpc` admin API's config
-/// GET and its validate-before-write both go through it, and `frps verify` never
-/// installs a subscriber; the record those paths used to get from the loader is
-/// gone (filed in `TODO.md`).
+/// than replacing the startup record. The sites that stay silent are the ones
+/// with no sink or no emitter: `frps verify` (it never installs a subscriber)
+/// and the `frpc` admin API's config **GET**
+/// (`frp_client::admin::config_from_file`) — that one loads through
+/// `load_client_config`, the *file* API, on every request, so warning there
+/// would be one record per poll. The admin **PUT** (`handle_put_config`)
+/// validates with `load_client_config_from_str`, which is silent, but then
+/// triggers the service reload, so it *does* deliver: once per request, via the
+/// reload site (measured: 3 GETs → +0 records, 3 PUTs → +3, probe
+/// `/tmp/enable-warn-probe/run-admin-probe.sh`). The GET gap is filed in
+/// `TODO.md`.
 pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING: &str = "web_server.tls.enable has no \
      effect: the dashboard HTTPS server is enabled by a non-empty `cert_file` + `key_file` \
      pair; without that pair the dashboard serves plaintext HTTP";
@@ -320,9 +326,10 @@ impl ConfigPresence {
     /// Called by each load site that has a log sink — `frps`'s two startup
     /// paths, `frpc`'s two startup paths, `frpc verify`, and both in-process
     /// reloads — because the loader itself cannot emit it (see the type doc).
-    /// The sites without a sink (`frps verify`) and the library loaders
-    /// (`load_*_config_from_str`, used by the `frpc` admin API) do not call it;
-    /// that gap is filed in `TODO.md`.
+    /// Two sites do not call it: `frps verify` (no subscriber) and the `frpc`
+    /// admin API's config GET (`config_from_file`, which loads through
+    /// `load_client_config` on every request); the admin PUT still delivers,
+    /// because it triggers a reload. See the type doc for the measurement.
     ///
     /// **Warned whenever the key is written, pair or no pair.** The key is inert
     /// in all four combinations, so "does the key do anything" is false in all

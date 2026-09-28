@@ -477,9 +477,9 @@ jobs:
       - name: Run frps's `web_server.tls.enable` warning-delivery spawn tests
         # `frps/tests/warn_delivery.rs` pins what a **user** sees when a config
         # writes `[web_server.tls] enable`: the diagnostic must reach stdout on
-        # the `-c` path, where the config is loaded before `init_logging`
-        # (`frps/src/main.rs:263` vs `:290`) and a `tracing::warn` from inside the
-        # loader therefore reached no subscriber. No other lane executes this
+        # the `-c` path, where the config is loaded before `init_logging` (the
+        # single-config branch of `frps/src/main.rs`) and a `tracing::warn` from
+        # inside the loader therefore reached no subscriber. No other lane executes this
         # file: the steps above select `--test cli_exit_codes` / `--test
         # cli_completion` / `--test log_completion` explicitly, `frps` declares no
         # library target, and `cargo test --workspace --all-features --lib` sees
@@ -499,10 +499,16 @@ jobs:
         # **This step asserts the count, for the reason the step above documents:
         # a bare `cargo test --test <f>` cannot tell "7 passed" from "0 ran".**
         # With this file's `FRPS_BIN` override it is also the run that falsifies
-        # it, in both directions: `FRPS_BIN=<pre-change frps>` fails the plain
-        # `-c` test (`left: 0, right: 1`); `FRPS_BIN=<first-round frps>` fails the
-        # `[common]` and reload tests, which is what the second round fixed
-        # (measured, `/tmp/enable-warn-probe/out2-falsify-frps-{base,reviewed}.txt`).
+        # it, in both directions. `FRPS_BIN=<pre-change frps>` fails **three** of
+        # the seven: the plain `-c` test (`left: 0, right: 1`), the `[common]`
+        # `-c` test, and the reload test — that binary has neither the flag nor
+        # the reload emission, so both paths that need the sink are red.
+        # `FRPS_BIN=<first-round frps>` fails **three** as well: the two
+        # `[common]` tests and the reload test — what the second round fixed —
+        # while its plain `-c` and `--config-dir` tests pass, which is the
+        # direction that matters (the first round did fix the original defect).
+        # (Measured: `/tmp/enable-warn-probe/out2-falsify-frps-{base,reviewed}.txt`
+        # — both runs `4 passed; 3 failed`, with different failure sets.)
         shell: bash
         run: |
           set -eo pipefail

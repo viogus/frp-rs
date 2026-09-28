@@ -134,9 +134,13 @@ async fn a_client_reload_delivers_the_web_server_tls_enable_warning() {
         .await
         .expect("in-process frps ready");
 
-    let dir = std::env::temp_dir().join(format!("frp-reload-warning-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    let cfg_path = dir.join("frpc.toml");
+    // Drop-guarded scratch dir (`tempfile`, this crate's dev-dependency — the
+    // same guard six sibling targets in `frp-client/tests` use). A raw
+    // `std::env::temp_dir().join(...)` path leaked the directory on **every
+    // failure**, which is exactly when the test is re-run most; measured by the
+    // reviewing round as `pass = +0 / fail = +1 leaked $TMPDIR/frp-reload-warning-<pid>`.
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let cfg_path = dir.path().join("frpc.toml");
     write_config(&cfg_path, server_port, echo_port, remote_port);
 
     // The startup load is the *loader* path (deliberately silent); the reload is
@@ -191,5 +195,6 @@ async fn a_client_reload_delivers_the_web_server_tls_enable_warning() {
         .await
         .expect("client did not shut down after request_stop")
         .expect("client run() panicked");
-    let _ = std::fs::remove_dir_all(&dir);
+    // No explicit cleanup: `dir` removes itself on drop, including while an
+    // assertion above unwinds.
 }

@@ -22,13 +22,15 @@
 //! make after `init_logging`.
 //!
 //! **Why the emission is not in the loader (the decision, pinned here).** On the
-//! `-c` path the loader runs before `init_logging` (`frps/src/main.rs:263` vs
-//! `:290`; `frpc/src/main.rs:561` vs `:583`), so a `tracing::warn` from inside
+//! `-c` path the loader runs before `init_logging` (the single-config branch of
+//! `frps/src/main.rs` and of `frpc/src/main.rs`: the load call, then
+//! `init_logging`), so a `tracing::warn` from inside
 //! the loader reaches no subscriber — measured on the v0.71.0 binaries as **0**
 //! occurrences on `frps -c` / `frpc -c` and 1 on `--config-dir`, where that path
 //! does install the sink first. The fix is therefore *one owner*: the loader
-//! warns not at all, each binary warns once after its own `init_logging`, and no
-//! path double-warns. The `logged_during_load` assertions below pin the loader's
+//! warns not at all, every load site that has a sink warns once after
+//! `init_logging` is installed (the CLI startup paths, `frpc verify`, and the
+//! in-process reloads in `frp-server`/`frp-client`), and no path double-warns. The `logged_during_load` assertions below pin the loader's
 //! silence (a re-added `tracing::warn!` in `normalize_web_server_section` fails
 //! here); the rest pin the flag and the message.
 //!
@@ -380,22 +382,22 @@ fn both_sections_present_the_flag_follows_the_kept_section() {
 ///
 /// This pins the other half of the "one owner" decision: the diagnostic lives on
 /// the CLI startup paths (`frps`/`frpc` run), `frpc verify` and both in-process
-/// reloads — not in the library. **Two named in-repo sites** reach a silent
-/// loader with a subscriber already installed, both in the `frpc` admin API
-/// (`frp-client/src/admin.rs`):
+/// reloads — not in the library loaders. The one named in-repo site that is
+/// **genuinely silent** is the `frpc` admin API's config **GET**: its
+/// `config_from_file` (`frp-client/src/admin.rs`) loads through
+/// `load_client_config` — the *file* API, not this string one — on every
+/// request, so the record it used to get from the loader is gone, and emitting
+/// there would mean one record per poll.
 ///
-/// * `config_from_file` — the admin **GET** path (`/api/proxies`,
-///   `/api/visitors`, the config views), which reloads the config file on
-///   **every request**, and so would warn once per poll;
-/// * `handle_put_config` — validate-before-write, which uses this very string
-///   loader.
+/// The admin **PUT** (`handle_put_config`) is *not* silent: it validates through
+/// this very string loader (silent) and then triggers the service reload, so it
+/// still delivers once per request, via the reload site (measured: 3 GETs → +0
+/// records, 3 PUTs → +3, probe `/tmp/enable-warn-probe/run-admin-probe.sh`).
 ///
-/// Both used to see the record come out of the loader; neither does now. That is
-/// deliberate — a GET is a read, and the PUT path's job is to accept or refuse
-/// the body — but it is a real scope reduction, so it is pinned here rather than
-/// left to be discovered, and filed in `TODO.md`. A future decision to warn from
-/// the library has to change this test. Out-of-repo consumers of
-/// `load_*_config_from_str` are in the same position.
+/// The GET's silence is a real scope reduction, pinned here so it cannot be
+/// mistaken for an oversight and filed in `TODO.md`; a future decision to warn
+/// from it has to change this test. Out-of-repo consumers of
+/// `load_*_config_from_str` remain silent.
 #[test]
 fn the_string_loader_stays_silent() {
     let output = Arc::new(Mutex::new(Vec::new()));

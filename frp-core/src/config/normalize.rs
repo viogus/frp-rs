@@ -1479,8 +1479,8 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
 ///
 /// **What it drops, and why.** `enable` is removed and does not reach any
 /// field, and the fact that it was written is carried out of the loader on
-/// [`ConfigPresence::web_server_tls_enable_set`] so each binary can emit the
-/// diagnostic a user needs **after** `init_logging`
+/// [`ConfigPresence::web_server_tls_enable_set`] so every load site that has a
+/// log sink can emit the diagnostic a user needs **after** `init_logging`
 /// ([`ConfigPresence::warn_inert_web_server_tls_enable`] — see the code comment
 /// at the removal for why the emission is not here). Measured on the v0.71.0
 /// binaries, before/after that move (probe `/tmp/enable-warn-probe/`,
@@ -1488,8 +1488,8 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
 /// before, the warning was delivered only where the log sink was installed
 /// before the load (`frps --config-dir`: 1, `frpc --config-dir`: 1) and
 /// **dropped** on the common `-c` path (`frps -c`, `frpc -c`: 0, `RUST_LOG=debug`
-/// included), where the load deliberately precedes `init_logging`
-/// (`frps/src/main.rs:263` vs `:290`, `frpc/src/main.rs:561` vs `:583`); after,
+/// included), where the load deliberately precedes `init_logging` (the
+/// single-config branch of `frps/src/main.rs` and of `frpc/src/main.rs`); after,
 /// every one of those four shapes emits exactly **1** on stdout and 0 on stderr.
 /// The `-c` ordering itself is untouched — it is Go parity (see the comment on
 /// that branch) and the fix moves the **emission**, not the load. Nothing reads
@@ -1581,15 +1581,21 @@ fn normalize_web_server_section(table: &mut toml::Table) {
     // can see — see the doc comment above. The diagnostic a user needs
     // (`enable = true` with no cert/key pair leaves the dashboard on **plaintext
     // HTTP**) is **not** emitted from this function: on the `-c` path the loader
-    // runs before `init_logging` (`frps/src/main.rs:263` vs `:290`;
-    // `frpc/src/main.rs:561` vs `:583`), so a `tracing::warn` here reaches no
-    // subscriber and the user sees nothing. The fact is carried out of the
-    // loader on `ConfigPresence::web_server_tls_enable_set` and the warning is
-    // emitted by each binary **after** `init_logging`
-    // (`ConfigPresence::warn_inert_web_server_tls_enable`) — one owner, one
-    // message per load on every path. Do not re-add an emission here: it would
-    // double the message on `--config-dir` (where the sink *is* installed first)
-    // while still being dropped on `-c`.
+    // runs before `init_logging` (the single-config branch of `frps/src/main.rs`
+    // and of `frpc/src/main.rs` — the load call, then `init_logging`), so a
+    // `tracing::warn` here reaches no subscriber and the user sees nothing.
+    // The fact is carried out of the loader on
+    // `ConfigPresence::web_server_tls_enable_set`, and
+    // `ConfigPresence::warn_inert_web_server_tls_enable` is called by every load
+    // site that has a sink: `frps`'s two startup paths, `frpc`'s two plus
+    // `frpc verify`, and the two in-process **reloads** — the last two live in
+    // `frp-server`/`frp-client`, library crates, not in the binaries. Sites with
+    // no sink stay silent on purpose and are named in `docs/config.md`:
+    // `frps verify` (its logging is never initialised) and the `frpc` admin
+    // API's config GET; the admin PUT reaches the reload and does emit. Do not
+    // re-add an emission here: it would double the record wherever the sink is
+    // already installed (`--config-dir`, the reloads) while still being dropped
+    // on `-c`.
     tls.remove("enable");
 
     // Anything else keeps its name at the parent level so strict mode can name

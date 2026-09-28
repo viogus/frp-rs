@@ -7,8 +7,9 @@
 //! server and client normalizers — `ClientConfig.web_server` is the same
 //! `WebServerConfig`) accepts the key, removes it because nothing reads it, and
 //! used to warn from *inside the loader*. On the `-c` path the loader runs
-//! **before** `init_logging` (`frpc/src/main.rs:561` vs `:583`, deliberate
-//! Go-parity ordering — Go installs its logger only after a successful load,
+//! **before** `init_logging` (the single-config branch of `frpc/src/main.rs`:
+//! `load_client_config_with_presence`, then `init_logging` — deliberate Go-parity
+//! ordering, because Go installs its logger only after a successful load,
 //! `cmd/frpc/sub/root.go:191`), so the record reached no subscriber:
 //!
 //! | shape | base | reviewed | now |

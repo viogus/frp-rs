@@ -7,9 +7,11 @@
 //! `frps verify` refuses it with `json: unknown field "enable"`, measured with
 //! `/private/tmp/frp_0.71.0_darwin_arm64/frps`), removes it because nothing
 //! reads it, and used to warn from *inside the loader*. On the `-c` path the
-//! loader runs **before** `init_logging` (`frps/src/main.rs:263` vs `:290`, a
-//! deliberate Go-parity ordering — Go installs its logger only after a successful
-//! load, `cmd/frps/root.go:112`), so the record reached no subscriber. The fix
+//! loader runs **before** `init_logging` (the single-config branch of
+//! `frps/src/main.rs`: `load_server_config_uncompleted_with_presence`, then
+//! `init_logging` — a deliberate Go-parity ordering, because Go installs its
+//! logger only after a successful load, `cmd/frps/root.go:112`), so the record
+//! reached no subscriber. The fix
 //! carries the fact out of the loader on `ConfigPresence` and emits it at every
 //! **in-process load site that has a sink**: both startup paths, and the SIGUSR1
 //! reload (`Service::reload`).
