@@ -554,14 +554,23 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   frp-server --no-default-features --all-targets` — the lane that motivated this module's location —
   they printed `kcp_bind_port: 0 -> 17001 (restart required); quic_bind_port: 0 -> 17002 (restart
   required); websocket_port: 0 -> 17003 (restart required)` while `transport.quic_options` was
-  correctly filtered. They now carry `ServerReader::Kcp` / `Quic` / `Websocket`, with a
-  **disjunction** (`KcpOrDashboard` / `QuicOrDashboard`) for the two the dashboard also prints from
-  the startup snapshot (`frp-server/src/dashboard.rs:502`, `:2492`, `:504`, `:2494`).
+  correctly filtered. They now carry `ServerReader::Kcp` / `Quic` / `Websocket`. The second review round
+  caught a first attempt at that fix which classed the first two as a **disjunction** with the dashboard
+  (`KcpOrDashboard` / `QuicOrDashboard`): that reader does not exist — `frp-server/src/dashboard.rs`'s own
+  `#[cfg(feature = "kcp")]` / `cfg(feature = "quic")` (`:501-502`, `:2491-2494`) are *frp-server's*
+  features, so it prints those keys only in a build that already has the listener compiled (measured: the
+  dashboard-only config printed `kcp_bind_port: 0 -> 17001 (restart required); quic_bind_port: 0 -> 17002
+  (restart required)`, and the repo's own `dashboard::v2::tests::test_serverinfo_go_shape` fails there with
+  `missing Go key kcpBindPort`). The disjunction is deleted and the pin's guards are the listener features,
+  so the dashboard-only config — compiled by `ci.yml:916`'s clippy but test-run by no lane before this
+  round — now asserts quiet and fails against the pre-fix classification.
   **Not over-reported** — a restart could not change these either, so the line would be false: the
   fields no code in `frp-server` reads (`auth.useEncryption` from the item above, `tls_server_name`,
-  `web_server.pprof_enable`, `web_server.tls_ca_file` / `tls_server_name`, the nested `tls.*` trio,
-  `[featureGates]` — each `_`-bound with its measurement and pinned by `unreported_fields_stay_unreported`
-  / `inert_settings_are_not_reported`), `includes` (consumed by the reload's own `load_server_config`),
+  `web_server.pprof_enable`, `web_server.tls_ca_file` / `tls_server_name`, the nested `tls.*` fields
+  (three unread, plus `cert_file` / `key_file`, which the loader's `normalize_web_server_section` renames
+  onto the flat `tls_cert_file` / `tls_key_file` before deserialization, so the nested struct is
+  unreachable), `[featureGates]` — each `_`-bound with its measurement and pinned by
+  `unreported_fields_stay_unreported` / `inert_settings_are_not_reported`), `includes` (consumed by the reload's own `load_server_config`),
   and the applied set (`allow_ports` + `allow_port_start`/`allow_port_end`, the five `[auth]` fields,
   the TLS paths). Fields whose only reader is behind a feature are reported only where that reader
   compiles (`dashboard`, `ssh`, `quic`, `otel`) — the default `full` frps has `ssh` but not
@@ -572,13 +581,16 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `frp-core/src/logging.rs` (`OTEL_ENABLED` — the only way `frp-server`, which declares no `otel`
   feature, can ask whether the binary's OTLP reader exists), `frp-server/src/service.rs`,
   `frp-server/tests/server_reload_restart_only.rs` (new, 14 tests, run with default features,
-  `--features dashboard` and `--no-default-features`), `docs/config.md` § Server Config Reload,
+  `--features dashboard`, `--no-default-features`, `--no-default-features --features dashboard`,
+  `…,dashboard,kcp,quic` and `…,kcp,quic`), `docs/config.md` § Server Config Reload,
   `README.md`, `docs/deployment.md`, `CHANGELOG.md`.
   Gates: `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets --all-features
   -- -D warnings` clean; `cargo test -p frp-core --lib` 974/0 (was 966; +8 unit tests);
   `cargo test -p frp-server` rc 0, 659 passed / 0 failed over 42 lanes (`server_reload_auth` 6/0,
-  `reload_integration` 4/0, `server_reload_restart_only` 14/0, and that target 14/0 again with
-  `--features dashboard` and with `--no-default-features`) — with one honest caveat: the first run
+  `reload_integration` 4/0, `server_reload_restart_only` 14/0, and that target 14/0 in every config it is
+  run in), the `ci.yml:628` dashboard lane (`cargo test -p frp-server --features dashboard -j 1` against a
+  `frps --features dashboard` build) 720/0, and `cargo test -p frp-server
+  --no-default-features --all-targets` 456/0 — with one honest caveat: the first run
   failed `reload_integration::test_reload_add_proxy` with `AddrInUse` on its own echo-server port,
   the documented `allocate_port` probe-then-drop race in that file's scaffolding (it signals **frpc**
   only, never `frps`, so this change cannot reach it); it passed on the quiet re-run. `cargo test -p

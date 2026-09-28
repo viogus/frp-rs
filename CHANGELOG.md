@@ -231,7 +231,10 @@ User-facing release notes for frp-rs.
   `tls_server_name`, `web_server.pprof_enable`, `[featureGates]`, …), fields
   whose only reader is behind a build feature (`web_server.*` beyond
   `custom_404_page` without `dashboard`, `[ssh_tunnel_gateway]` without `ssh`,
-  the QUIC options without `quic`, `[observability]` without `otel`), and
+  the QUIC options without `quic`, the three listener ports `kcp_bind_port` /
+  `quic_bind_port` / `websocket_port` without their own listener — the dashboard
+  is not a reader for them, because it prints those two keys only where the
+  listener is already compiled — and `[observability]` without `otel`), and
   `includes`, which the reload's own config load already resolves.
   Credential-shaped values are named without their values (`web_server.password`,
   `http_plugins`). A field is compared as the value the server **runs with**, not

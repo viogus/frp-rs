@@ -402,11 +402,6 @@ fn server_reader_present(reader: frp_core::config::ServerReader) -> bool {
         ServerReader::Kcp => cfg!(feature = "kcp"),
         ServerReader::Quic => cfg!(feature = "quic"),
         ServerReader::Websocket => cfg!(feature = "websocket"),
-        // `kcp_bind_port` / `quic_bind_port` have a second reader: the dashboard
-        // prints both from the startup `ServerConfigSnapshot`
-        // (`frp-server/src/dashboard.rs`), which exists only with this feature.
-        ServerReader::KcpOrDashboard => cfg!(feature = "kcp") || cfg!(feature = "dashboard"),
-        ServerReader::QuicOrDashboard => cfg!(feature = "quic") || cfg!(feature = "dashboard"),
         ServerReader::Otel => frp_core::logging::OTEL_ENABLED,
     }
 }

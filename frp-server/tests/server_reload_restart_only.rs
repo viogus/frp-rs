@@ -18,6 +18,24 @@
 //!
 //! No `#![cfg(...)]` at the top: the file compiles in every feature combination
 //! of `frp-server`, and the feature-gated groups carry their own gates.
+//!
+//! **Running this file against a pristine base tree.** Exactly one ident here
+//! belongs to this branch rather than to base: `frp_core::logging::OTEL_ENABLED`
+//! (the `otel` gate, added with the list — the question "does *this* build's
+//! `frp-core` carry `otel`?" has no base-visible API, which is why it is not
+//! spelled with `cfg!`). For a base run, copy this file into the base tree and
+//! replace that one ident with `false`:
+//!
+//! ```text
+//! if frp_core::logging::OTEL_ENABLED {   ->   if false {
+//! ```
+//!
+//! Everything else is base API and needs no edit. Measured 2026-09-28 on a
+//! pristine `3f975e0` checkout with that one edit: **4 passed / 10 failed** — the
+//! four passers are the negative controls (`applied_settings_do_not_report_a_restart`,
+//! `dashboard_only_settings_are_reported_only_with_the_dashboard`,
+//! `inert_settings_are_not_reported`, `observability_follows_the_otel_gate`), and
+//! the ten failures are the fields the base reload never compared.
 
 mod common;
 
@@ -420,16 +438,25 @@ async fn unset_limits_are_not_reported_as_a_restart() {
 }
 
 /// The three `#[cfg]`-gated listener ports are reported only when **this build**
-/// has a reader for them — the KCP / QUIC / WebSocket listener, or (for
-/// `kcp_bind_port` and `quic_bind_port`) the dashboard's startup-snapshot
-/// display.
+/// compiles their reader — the KCP / QUIC / WebSocket listener in `Service::run`.
 ///
-/// This is the arm that runs in `cargo test -p frp-server --no-default-features
-/// --all-targets` (`.github/workflows/ci.yml`), where the `frp-client`
-/// dev-dependency turns `frp-core`'s `kcp`/`quic`/`websocket` on while
-/// `frp-server`'s stay off: the fields exist and are parsed, and nothing reads
-/// them, so a line here would be a false "restart required". They were classed
-/// `ServerReader::Any` when this landed, which printed exactly that.
+/// The dashboard is **not** a second reader, which is the correction this round
+/// makes: `frp-server/src/dashboard.rs`'s own `#[cfg(feature = "kcp")]` /
+/// `#[cfg(feature = "quic")]` (`:501-502`, `:2491-2494`) are **frp-server's**
+/// features, so it prints `kcpBindPort` / `quicBindPort` only in a build that
+/// already has the listener compiled. A dashboard-only build's
+/// `/api/v2/system/info` has neither key, so the dashboard can only ever have
+/// *added* a false positive, never a reader. (Measured: the two keys are absent
+/// in `--no-default-features --features dashboard` and present in
+/// `--no-default-features --features dashboard,kcp,quic`; the configs differ only
+/// in the `cfg`, not in serde.)
+///
+/// This is the arm that runs in `--no-default-features` **and** in
+/// `--no-default-features --features dashboard` — the second is compiled by
+/// `ci.yml:916`'s clippy lane but no lane test-ran it before this round — where
+/// the `frp-client` dev-dependency turns `frp-core`'s `kcp`/`quic`/`websocket` on
+/// while `frp-server`'s stay off: the fields exist and are parsed, nothing reads
+/// them, and a line here is a false "restart required".
 ///
 /// Each expectation is derived from the feature the reload itself asks about, so
 /// the test asserts the documented rule in every configuration rather than one
@@ -446,28 +473,27 @@ async fn gated_listener_ports_follow_their_own_features() {
         ))
         .await;
 
-    // `kcp_bind_port`: the KCP listener, or the dashboard that prints it from
-    // the startup `ServerConfigSnapshot` (`frp-server/src/dashboard.rs`).
-    #[cfg(any(feature = "kcp", feature = "dashboard"))]
+    #[cfg(feature = "kcp")]
     assert!(
         summary.contains("kcp_bind_port:"),
-        "a reader exists in this build (kcp listener or dashboard): {summary}"
+        "the KCP listener reads it in this build: {summary}"
     );
-    #[cfg(not(any(feature = "kcp", feature = "dashboard")))]
+    #[cfg(not(feature = "kcp"))]
     assert!(
         !summary.contains("kcp_bind_port"),
-        "no reader for kcp_bind_port in this build, so no line: {summary}"
+        "no KCP listener in this build, so no line — the dashboard is not a \
+         reader (its own cfg is this crate's kcp too): {summary}"
     );
 
-    #[cfg(any(feature = "quic", feature = "dashboard"))]
+    #[cfg(feature = "quic")]
     assert!(
         summary.contains("quic_bind_port:"),
-        "a reader exists in this build (quic listener or dashboard): {summary}"
+        "the QUIC listener reads it in this build: {summary}"
     );
-    #[cfg(not(any(feature = "quic", feature = "dashboard")))]
+    #[cfg(not(feature = "quic"))]
     assert!(
         !summary.contains("quic_bind_port"),
-        "no reader for quic_bind_port in this build, so no line: {summary}"
+        "no QUIC listener in this build, so no line: {summary}"
     );
 
     #[cfg(feature = "websocket")]
@@ -478,21 +504,17 @@ async fn gated_listener_ports_follow_their_own_features() {
     #[cfg(not(feature = "websocket"))]
     assert!(
         !summary.contains("websocket_port"),
-        "no reader for websocket_port in this build, so no line: {summary}"
+        "no WebSocket listener in this build, so no line: {summary}"
     );
 
-    // In the lane that motivated this — none of the four features on — the whole
+    // In every config without any of the three listeners — `dashboard` on or off,
+    // which is exactly the distinction this test exists to keep honest — the whole
     // reload must still be a no-op, which is what the base binary said and what
-    // the first version of this change got wrong.
-    #[cfg(not(any(
-        feature = "kcp",
-        feature = "quic",
-        feature = "websocket",
-        feature = "dashboard"
-    )))]
+    // the first version of this change got wrong in both directions.
+    #[cfg(not(any(feature = "kcp", feature = "quic", feature = "websocket")))]
     assert_eq!(
         summary, "config reloaded: no changes detected",
-        "with no listener and no dashboard, all three ports are inert"
+        "with no listener compiled in, all three ports are inert"
     );
 }
 

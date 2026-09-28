@@ -64,14 +64,16 @@ use super::{
 /// field exists and this crate reports it, and only `frp-server`'s resolution of
 /// the gate can suppress the line. They must not be `Any`.
 ///
-/// `KcpOrDashboard` / `QuicOrDashboard` are the two ports with **two** readers,
-/// measured: `kcp_bind_port` is read by the KCP listener
-/// (`Service::run`, `frp-server/src/service.rs:1028`) *and* by the dashboard's
-/// `ServerConfigSnapshot` display (`frp-server/src/dashboard.rs:502`, `:2492`);
-/// `quic_bind_port` has the same pair (`service.rs:1532`, `dashboard.rs:504`,
-/// `:2494`). `websocket_port` has one (`service.rs:638`). A disjunction is the
-/// right shape here: suppressing the line because the listener is compiled out
-/// would be wrong in a build where the dashboard prints the value.
+/// **The dashboard is not a second reader for any of them**, which an earlier
+/// version of this list got wrong by classing `kcp_bind_port` / `quic_bind_port`
+/// as a `…OrDashboard` disjunction. `frp-server/src/dashboard.rs` is an
+/// `frp-server` file, so its own `#[cfg(feature = "kcp")]` / `#[cfg(feature =
+/// "quic")]` (`:501-502`, `:2491-2494`) are *this* crate's features: it prints
+/// `kcpBindPort` / `quicBindPort` only in a build that already has the listener
+/// compiled. A dashboard-only build's `/api/v2/system/info` contains neither key
+/// (measured; the same build with `kcp,quic` added contains both — the configs
+/// differ only in the `cfg`, not in serde), so the dashboard can only ever have
+/// *added* a false "restart required", never a reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerReader {
     /// A reader exists in every build of `frp-server`.
@@ -88,11 +90,6 @@ pub enum ServerReader {
     Quic,
     /// The WebSocket listener (`Service::run`, `#[cfg(feature = "websocket")]`).
     Websocket,
-    /// `kcp_bind_port`: the KCP listener **or** the dashboard's snapshot display.
-    KcpOrDashboard,
-    /// `quic_bind_port`: the QUIC listener **or** the dashboard's snapshot
-    /// display.
-    QuicOrDashboard,
     /// `frps`'s `init_logging` (`#[cfg(feature = "otel")]` on the binary, which
     /// forwards `frp-core/otel`).
     Otel,
@@ -292,14 +289,16 @@ fn log_restart_changes(out: &mut Vec<RestartOnlyChange>, old: &LogConfig, new: &
 /// `..`, and the nested `tls` section is destructured the same way.
 ///
 /// **What it does not cover.** `pprof_enable`, the flat `tls_ca_file` /
-/// `tls_server_name` and the nested `tls.enable` / `tls.trusted_ca_file` /
-/// `tls.server_name` are read by nothing in `frp-server` (measured: `grep -rn
-/// 'pprof_enable' frp-server/src` finds no reader, and neither
+/// `tls_server_name` and every field of the nested `tls` section are not
+/// reported: the first three are read by nothing in `frp-server` (measured:
+/// `grep -rn 'pprof_enable' frp-server/src` finds no reader, and neither
 /// `WebServerConfig::tls_ca_file` nor `WebServerConfig::tls_server_name` is read
-/// outside the config struct), so a restart cannot make them take effect either
-/// and they are deliberately not reported — the same disposition
-/// `[auth].useEncryption` has in `note_auth_restart_changes`. `password` is
-/// compared but never printed.
+/// outside the config struct), so a restart cannot make them take effect — the
+/// same disposition `[auth].useEncryption` has in `note_auth_restart_changes` —
+/// and the nested section is not even *reachable* through the loader (see the
+/// measurement in the destructure below: `normalize_web_server_section` removes
+/// the table and renames the four Go spellings onto the flat `tls_*` fields,
+/// which **are** reported). `password` is compared but never printed.
 fn web_server_restart_changes(
     out: &mut Vec<RestartOnlyChange>,
     old: &WebServerConfig,
@@ -337,20 +336,37 @@ fn web_server_restart_changes(
         tls_server_name: _new_tls_server_name,
         custom_404_page: new_custom_404_page,
     } = new;
+    // **Every** field of the nested section is unreachable through the loader.
+    // `normalize_web_server_section` removes the `web_server.tls` table before
+    // serde sees it and re-inserts each key at the parent level, renaming the
+    // four Go spellings onto the flat `tls_*` fields. Measured 2026-09-28 by
+    // loading four config shapes through `load_server_config`
+    // (TOML/YAML, nested snake_case/camelCase and flat; the probe is kept with
+    // the change, not in the tree):
+    //   * `[web_server.tls] certFile = "/camel/cert.pem"` (and the YAML
+    //     `webServer.tls.certFile` spelling) loads with
+    //     `web_server.tls_cert_file == "/camel/cert.pem"` and the nested struct
+    //     at its default;
+    //   * `[web_server.tls] cert_file = ...` (snake_case) loads with **both**
+    //     empty — the key becomes `web_server.cert_file`, which is not a field,
+    //     so the nested spelling is silently dropped (recorded in the change
+    //     report as an out-of-scope finding);
+    //   * the flat spelling loads normally.
+    // So no loaded `ServerConfig` can carry a non-default `WebServerTlsConfig`,
+    // and the four flat entries above cover every spelling that does reach the
+    // struct. They are named here — not omitted — so a new field in this section
+    // is still a compile error.
     let WebServerTlsConfig {
-        // `normalize_web_server_section` maps the nested keys onto the flat
-        // fields and keeps every other key, so this one survives as an unknown
-        // key; it is read by nothing in any case.
         enable: _old_tls_enable,
-        cert_file: old_tls_cert_file_nested,
-        key_file: old_tls_key_file_nested,
+        cert_file: _old_tls_cert_file_nested,
+        key_file: _old_tls_key_file_nested,
         trusted_ca_file: _old_tls_trusted_ca_file,
         server_name: _old_tls_server_name_nested,
     } = old_tls;
     let WebServerTlsConfig {
         enable: _new_tls_enable,
-        cert_file: new_tls_cert_file_nested,
-        key_file: new_tls_key_file_nested,
+        cert_file: _new_tls_cert_file_nested,
+        key_file: _new_tls_key_file_nested,
         trusted_ca_file: _new_tls_trusted_ca_file,
         server_name: _new_tls_server_name_nested,
     } = new_tls;
@@ -402,20 +418,6 @@ fn web_server_restart_changes(
         old_tls_key_file,
         new_tls_key_file,
         "web_server.tls_key_file",
-        reader,
-    );
-    push(
-        out,
-        old_tls_cert_file_nested,
-        new_tls_cert_file_nested,
-        "web_server.tls.cert_file",
-        reader,
-    );
-    push(
-        out,
-        old_tls_key_file_nested,
-        new_tls_key_file_nested,
-        "web_server.tls.key_file",
         reader,
     );
 }
@@ -885,21 +887,24 @@ impl ServerConfig {
         );
         // The three listener ports are `#[cfg]`-gated in the *struct* on
         // `frp-core`'s features but read only by `frp-server`'s listeners, so
-        // their gate is resolved on `frp-server`'s features: `KcpOrDashboard` /
-        // `QuicOrDashboard` (the dashboard also prints those two from the startup
-        // snapshot) and `Websocket`. `Any` here would report a restart in a build
-        // with the listener compiled out — measured in the very lane that
-        // motivated this module's location, `cargo test -p frp-server
-        // --no-default-features --all-targets`, where `frp-core`'s three features
-        // are on through the `frp-client` dev-dependency and `frp-server`'s are
-        // off.
+        // their gate is resolved on `frp-server`'s features
+        // (`ServerReader::Kcp` / `Quic` / `Websocket`). The dashboard is not a
+        // second reader: its own `#[cfg(feature = "kcp")]` is this crate's kcp
+        // too, so it prints those keys only where the listener is compiled. `Any`
+        // here would report a restart in a build with the listener compiled out —
+        // measured in the very lane that motivated this module's location,
+        // `cargo test -p frp-server --no-default-features --all-targets`, where
+        // `frp-core`'s three features are on through the `frp-client`
+        // dev-dependency and `frp-server`'s are off; a `…OrDashboard`
+        // disjunction reported the same false line in
+        // `--no-default-features --features dashboard`.
         #[cfg(feature = "kcp")]
         push(
             out,
             old_kcp_bind_port,
             new_kcp_bind_port,
             "kcp_bind_port",
-            ServerReader::KcpOrDashboard,
+            ServerReader::Kcp,
         );
         #[cfg(feature = "quic")]
         push(
@@ -907,7 +912,7 @@ impl ServerConfig {
             old_quic_bind_port,
             new_quic_bind_port,
             "quic_bind_port",
-            ServerReader::QuicOrDashboard,
+            ServerReader::Quic,
         );
         push(out, old_sudp_port, new_sudp_port, "sudp_port", any);
         push(
@@ -1336,7 +1341,7 @@ mod tests {
         new.tls_enable = true;
         assert!(old.restart_only_changes(&new).is_empty());
 
-        // No reader in `frp-server`.
+        // No reader in `frp-server`…
         let mut new = base();
         new.tls_server_name = "frps.example.com".into();
         new.web_server.pprof_enable = true;
@@ -1345,7 +1350,19 @@ mod tests {
         new.web_server.tls.enable = true;
         new.web_server.tls.trusted_ca_file = "/tmp/dash-trust.pem".into();
         new.web_server.tls.server_name = "dash-nested.example.com".into();
-        assert!(old.restart_only_changes(&new).is_empty());
+        // …and the nested section's cert/key pair, which is additionally
+        // **unreachable** through the loader (`normalize_web_server_section`
+        // removes the `web_server.tls` table and renames the Go spellings onto
+        // the flat fields): a difference here cannot come from a config file, and
+        // the flat `tls_cert_file` / `tls_key_file` entries are what a reload
+        // reports for `[web_server.tls] certFile` / `cert_file`. Measured in the
+        // change report §8 (four config shapes, nested and flat).
+        new.web_server.tls.cert_file = "/tmp/nested-cert.pem".into();
+        new.web_server.tls.key_file = "/tmp/nested-key.pem".into();
+        assert!(
+            old.restart_only_changes(&new).is_empty(),
+            "no reader, and the nested cert/key pair cannot even be loaded"
+        );
 
         // A load-time directive and a load-time validation input.
         let mut new = base();
@@ -1406,7 +1423,10 @@ mod tests {
     /// Which variants are asserted depends on this crate's features (they decide
     /// whether the field exists at all); the `frp-server`-side resolution of each
     /// gate is pinned by `gated_listener_ports_follow_their_own_features` in
-    /// `frp-server/tests/server_reload_restart_only.rs`, which runs in that lane.
+    /// `frp-server/tests/server_reload_restart_only.rs`, which runs in the
+    /// `--no-default-features` lane **and** in the
+    /// `--no-default-features --features dashboard` one — the second is where a
+    /// `…OrDashboard` disjunction used to report a false "restart required".
     #[test]
     fn gated_listener_ports_carry_a_reader_gate_not_any() {
         let old = base();
@@ -1434,11 +1454,11 @@ mod tests {
         #[cfg(feature = "kcp")]
         assert!(changes
             .iter()
-            .any(|c| c.name == "kcp_bind_port" && c.reader == ServerReader::KcpOrDashboard));
+            .any(|c| c.name == "kcp_bind_port" && c.reader == ServerReader::Kcp));
         #[cfg(feature = "quic")]
         assert!(changes
             .iter()
-            .any(|c| c.name == "quic_bind_port" && c.reader == ServerReader::QuicOrDashboard));
+            .any(|c| c.name == "quic_bind_port" && c.reader == ServerReader::Quic));
         #[cfg(feature = "websocket")]
         assert!(changes
             .iter()
