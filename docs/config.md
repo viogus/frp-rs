@@ -170,7 +170,7 @@ The server config loader accepts both Rust (snake_case) and Go frp (camelCase) k
 - Flat `auth_method`, `auth_token`, `log_file`, `log_level`, `log_max_days`, `web_server_*` keys are automatically nested into the correct subsections.
 - `sshTunnelGateway` (camelCase) is normalized to `ssh_tunnel_gateway`.
 - `token` at top level is automatically copied into `[auth]`.
-- Exception: `tls_enable`, `tls_only`, `tls_cert_file`, `tls_key_file` and `tls_ca_file` have no camelCase aliases — use the snake_case names. The four Go-shaped TLS fields (`tls_only`, `tls_cert_file`, `tls_key_file`, `tls_ca_file`) are carried by the nested `[transport.tls]` section instead (`force` / `certFile` / `keyFile` / `trustedCaFile`, `frp-core/src/config/normalize.rs:792-810`). Two flat aliases do work and are not covered by this exception: `tls_trusted_ca_file` (→ `tls_ca_file`) and `tlsServerName` (→ `tls_server_name`) (`frp-core/src/config/server.rs:48-51`).
+- Exception: `tls_enable`, `tls_only`, `tls_cert_file`, `tls_key_file` and `tls_ca_file` have no camelCase aliases — use the snake_case names. The four Go-shaped TLS fields (`tls_only`, `tls_cert_file`, `tls_key_file`, `tls_ca_file`) are carried by the nested `[transport.tls]` section instead (`force` / `certFile` / `keyFile` / `trustedCaFile`, `frp-core/src/config/normalize.rs:792-810`). Two further flat aliases do work and are not camelCase: `tls_trusted_ca_file` (→ `tls_ca_file`) and `tlsServerName` (→ `tls_server_name`) (`frp-core/src/config/server.rs:48-51`); both loading paths are pinned by `test_flat_camelcase_tls_spellings_are_not_loader_spellings` in `frp-core/src/config/tests.rs`.
 
 ### Server Config Reload (SIGUSR1)
 
