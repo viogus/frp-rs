@@ -226,6 +226,19 @@ pub fn compress_into(_data: &[u8], _buf: &mut Vec<u8>) -> Result<(), String> {
 #[cfg(not(feature = "compression"))]
 pub struct SnappyCompressor;
 
+/// Mirror of the `compression`-on `Default` above: both types are the same
+/// public API under different features, so this one answers
+/// `clippy::new_without_default` with a real `Default` too, rather than an
+/// `#[allow]`. The `verify`-lane step `Lint frp-core tier test targets
+/// (isolated, no features)` (`.github/workflows/ci.yml`) is what makes this
+/// configuration's clippy result visible at all.
+#[cfg(not(feature = "compression"))]
+impl Default for SnappyCompressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(not(feature = "compression"))]
 impl SnappyCompressor {
     pub fn new() -> Self {

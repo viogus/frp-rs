@@ -1060,6 +1060,62 @@ jobs:
         run: cargo check -p frp-core --no-default-features --all-targets
         env:
           RUSTFLAGS: "-D warnings"
+      - name: Lint frp-core tier test targets (isolated, no features)
+        # The clippy half of the step directly above. `-D warnings` is per
+        # *feature configuration*, and this is the configuration no other lane
+        # lints: the workspace lane's `Clippy` step (job `Lint (fmt + clippy)`,
+        # `cargo clippy --workspace --all-targets --all-features`) compiles
+        # every `cfg(not(feature = …))` item *out*, and the two isolated clippy
+        # commands in `Lint frp-server dashboard and frp-client oidc-off test
+        # targets (isolated)` are `-p frp-server`/`-p frp-client`. The step above
+        # runs `check`, i.e. rustc lints only — which cannot see a `clippy::*`
+        # lint at all. Measured before this step existed, at `005ddd8`:
+        #   RUSTFLAGS="-D warnings" cargo clippy -p frp-core \
+        #     --no-default-features --all-targets
+        # exited 101 with exactly two clippy lints inside `cfg(not(…))` code:
+        # `clippy::new_without_default` on `SnappyCompressor::new`
+        # (frp-core/src/encryption.rs, `#[cfg(not(feature = "compression"))]`)
+        # and `clippy::needless_return` on the TCP arm's tls-off refusal
+        # (frp-core/src/transport/mod.rs, `#[cfg(not(feature = "tls"))]`). Both
+        # were closed by fixing the code; this step is what keeps them closed.
+        #
+        # `clippy` runs rustc under it, so the rustc-lint coverage the step above
+        # documents (E0425/E0432, unused_imports, dead_code, unused_mut) is a
+        # strict subset of what this step reports; the `check` step is kept
+        # because two files cite its name (`frp-core/src/config/restart_only.rs`,
+        # `TODO.md`).
+        #
+        # NOT covered: every other `-p frp-core` feature combination. The one
+        # other measured-red configuration (`--features websocket`, tls off — red
+        # on the WSS arm's `needless_return` at `005ddd8`) is gated by the step
+        # directly below. `--features kcp`, `tls`, `compression`,
+        # `kcp,compression`, `websocket,compression`, `websocket,kcp`, `tcp-mux`,
+        # `stun`, `vnet`, `oidc` and `kcp,websocket,tcp-mux,stun` were measured
+        # clean after the fix (thirteen configurations in all) but stay ungated,
+        # and the 2^N intra-crate space is not enumerated.
+        run: cargo clippy -p frp-core --no-default-features --all-targets
+        env:
+          RUSTFLAGS: "-D warnings"
+      - name: Lint frp-core tier test targets with websocket (isolated, no features)
+        # The WSS refusal site (frp-core/src/transport/mod.rs, the arm behind
+        # `TransportProtocol::Wss`) sits behind `#[cfg(feature = "websocket")]`,
+        # so the step above compiles it out — the same class of gap this item is
+        # about, one feature flag away. Measured at `005ddd8`:
+        #   RUSTFLAGS="-D warnings" cargo clippy -p frp-core \
+        #     --no-default-features --features websocket --all-targets
+        # exited 101 on three lints — `clippy::new_without_default` for
+        # `SnappyCompressor::new` (compression is off in that configuration) and
+        # `clippy::needless_return` at both the TCP and this WSS refusal, all
+        # fixed in the same change — and exits 0 after it. A `return`
+        # reintroduced there fails THIS
+        # step, not the one above, which is why it is a sibling step rather than
+        # a second command in one step: the step name is the failure attribution.
+        #
+        # NOT covered: the same residue as the step above — every other
+        # `-p frp-core` feature combination, `--features kcp` included.
+        run: cargo clippy -p frp-core --no-default-features --features websocket --all-targets
+        env:
+          RUSTFLAGS: "-D warnings"
       - name: Check the four measured-red intra-crate feature combinations (curated list, NOT the full 2^N space)
         # A CURATED, CLOSED list — these four `-p`-isolated configurations were
         # measured red under -D warnings at `846c1b9` and fixed in the change

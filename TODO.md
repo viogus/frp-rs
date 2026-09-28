@@ -1478,7 +1478,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   written here is rewritten the moment it lands and becomes a false citation — the text originally
   carried one, and a rebase onto the post-#363 `main` had already invalidated it before the squash
   could. Identify the change by its subject instead.
-- [ ] **No lane clippy-checks `frp-core` with features off, so two `clippy::*` lints inside
+- [x] **No lane clippy-checks `frp-core` with features off, so two `clippy::*` lints inside
   `cfg(not(feature = …))` code are red in the micro configuration and invisible everywhere else.**
   Measured 2026-09-28 at `47f8fce`:
   `RUSTFLAGS="-D warnings" cargo clippy -p frp-core --no-default-features --all-targets` → **rc 101**
@@ -1504,13 +1504,53 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   run clippy as well as `check`) under `RUSTFLAGS="-D warnings"`, so the gap cannot reopen. Precedent for
   the disposition is the sibling item directly above: those four red `-p` configurations were closed by
   **fixing** the code (narrowing `cfg`s), not by excusing it.
-  **Constraint on the `needless_return` fix, which must not be lost:** the `return` at
-  `frp-core/src/transport/mod.rs:1643` is **load-bearing**. The comment in place there records that its
-  absence caused an **E0308 fall-through in the feature-matrix check** — with tls off, the `tls_enable`
-  TCP dial arm fell through to the function tail instead of failing. The fix must therefore keep the
-  `Err` as the **tail expression** of that arm in the tls-off configuration (or otherwise preserve the
-  early failure), not delete the statement; the pin is that `--features kcp` (no tls) still fails the
-  dial with that error rather than falling through.
+  **Constraint on the `needless_return` fix, corrected in review:** this paragraph originally said the
+  `return` itself was **load-bearing** and that its absence caused an **E0308 fall-through**. What is
+  load-bearing is the `Err` remaining the arm's **tail expression** — which is exactly what deleting the
+  `return` while keeping the value does. Measured: the `return`-less form compiles in the bare, `kcp` and
+  `websocket` configurations; it is the **`;`-terminated statement** form (value discarded) that is red.
+  The expected type comes from the enclosing `match`'s position: the KCP refusal's match is used as an
+  expression statement, so its arms are `()`, and a discarded `Err` leaves `T` unconstrained
+  (`error[E0282]: type annotations needed`), while the TCP refusal's match is the function's tail, so its
+  arms are `Result<IoStream, Error>` and a discarded value is `error[E0308]: mismatched types`. The pin is
+  that the tls-off dial still fails with that error rather than falling through.
+
+  **Done** (no sha — a squash-merge rewrites the branch's hashes, so identify this change by its subject,
+  *"lint: gate the frp-core no-features configuration and fix the two lints it hid"*):
+  * `frp-core/src/encryption.rs`: `SnappyCompressor` gained a real `Default` delegating to `new`
+    (implemented, not `#[allow]`-silenced) inside `#[cfg(not(feature = "compression"))]`.
+  * `frp-core/src/transport/mod.rs`: the two tls-off dial refusals (TCP, and WSS under `websocket`) drop
+    their `return` and keep `Err(..)` as the surviving tail expression; the listen-side refusals are
+    untouched (their `return`s are not linted). Three in-code comments were rewritten to the measured
+    diagnostics — the KCP arm's `E0282`/`E0308` pair, the enclosing-match discriminator, and by construct
+    rather than by line number throughout.
+  * `.github/workflows/ci.yml`: a new step **"Lint frp-core tier test targets (isolated, no features)"**
+    (`RUSTFLAGS="-D warnings" cargo clippy -p frp-core --no-default-features --all-targets`; rc 101
+    before → rc 0 after) plus a sibling **websocket** step, which alone sees the WSS arm's
+    `needless_return`: re-adding `return ` to the WSS dial refusal leaves the bare step green and reddens
+    that one, which is why the sibling step is what pins it. The pre-existing `check` step is kept because
+    two in-tree comments cite it by name.
+  * Verified: fmt, both new steps, workspace all-features clippy, the other isolated `check` steps,
+    `cargo test -p frp-core --no-default-features --all-targets` (738 passed / 0 failed), the pin in three
+    configurations, and `scripts/repo-health.sh`.
+  * Review: four rounds, two reviewers each (one independent, one adversarial and briefed to falsify).
+    Both round-2 reviewers independently falsified the same **comment claim** — the attribution of the
+    KCP/TCP asymmetry to each arm's `else` — and one round-2 review also falsified a line-number figure the
+    orchestrator had published, which is why no line number is written into the comments or into the PR
+    body as if current.
+
+- [ ] **The tls-off dial pin asserts the TCP refusal with a prefix-only `contains`, which both arms'
+  messages satisfy.** `dial_server_refuses_tls_when_tls_is_not_compiled` in
+  `frp-core/src/transport/mod.rs` asserts the TCP refusal with `contains("TLS support not compiled")` — a
+  24-character needle both source literals begin with (the two full strings are **not** prefixes of each
+  other: 50 characters are shared and they diverge at the 51st, TCP's `)` against WSS's ` for WSS)`) — so
+  swapping the TCP arm's message for the WSS wording leaves the bare-configuration assertion green. (The
+  assertion tests `err.to_string()`, which begins `transport error: `, so a start-anchored rewrite would not
+  be equivalent.) End-anchoring the TCP assertion **would** discriminate. Measured by
+  adversarial review of the no-features clippy fix (mutation `tcp_wssmsg` + the pin under
+  `--no-default-features` → rc 0). Filed rather than fixed so that the fix round stayed comment-only.
+  **Done-when:** the assertion is end-anchored or negated so the WSS-only wording fails it, with a mutation
+  showing the swapped-message case now fails.
 
 - [x] **Pre-existing: no query-parameter-count guard, so >10000 params diverge from Go.**
   Go's `parseQuery` opens with
@@ -5875,7 +5915,7 @@ nothing about whether the described behaviour still holds.
   reduction, filed below.
 - [ ] **The `frpc` admin API's config GET no longer sees the `[web_server.tls] enable` diagnostic.**
   `frp-client/src/admin.rs`'s `config_from_file` (the admin **GET** path: `/api/proxy/{name}/config`,
-  `/api/visitor/{name}/config`, `/api/config`, on **every request**) loads the file through
+  `/api/visitor/{name}/config`, on **every request**) loads the file through
   `load_client_config` — the *file* API, not `load_*_config_from_str` — which is now silent, so the
   record it used to get from the loader is gone. That is the **only** silent admin load site: the
   admin **PUT** (`handle_put_config`) still delivers, because although its validate-before-write uses
@@ -5885,6 +5925,12 @@ nothing about whether the described behaviour still holds.
   `/tmp/enable-warn-probe/out3/admin-probe.txt`): startup 1 record; after 3 GETs **+0**; after 3 PUTs
   **+3** (one per request, via the reload). At the loader API the string loader was already measured
   1 → 0 (`frp-core/tests/web_server_tls_enable_warning.rs::the_string_loader_stays_silent`).
+  (Corrected during #402's review: this list originally also named `/api/config`. That route does not
+  reach `config_from_file` — `config_from_file` has exactly two callers, `frp-client/src/admin.rs:598`
+  and `:618` → `handle_get_proxy_config`/`handle_get_visitor_config` — and `/api/config` is routed to
+  `handle_get_config` (`admin.rs:894`), which reads the raw file and parses it itself. Measured against
+  the **base** binary: 3 × `GET /api/config` added **+0** records while 3 × `GET /api/proxy/main/config`
+  added **+3**, so that route was already silent and is not a regression of the `enable` change.)
   **Done-when:** either `config_from_file` emits the record itself (switch to
   `load_client_config_with_presence` and call
   `ConfigPresence::warn_inert_web_server_tls_enable`) — with a recorded decision on whether a

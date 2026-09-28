@@ -1535,9 +1535,47 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             if opts.tls_enable {
                 #[cfg(not(feature = "tls"))]
                 {
-                    // Round 6: missing `return` — e.g. `--features kcp` (no
-                    // tls) fell through to the function tail instead of
-                    // failing (E0308 in the feature-matrix check).
+                    // No `tls` in this build: refuse before any TLS work. Keep
+                    // the `return` here: in this arm the diverging statement is
+                    // the shape that compiles — the opposite of the TCP arm
+                    // below. Both mutations were measured in a scratch copy with
+                    // `-D warnings`, `--features kcp`:
+                    //   * keyword removed, `;` kept (`Err(..);`): the value is
+                    //     discarded and `Result`'s `T` is never constrained —
+                    //     `error[E0282]: type annotations needed` ("cannot infer
+                    //     type of the type parameter `T` declared on the enum
+                    //     `Result`");
+                    //   * keyword AND `;` removed (`Err(..)` as the block's
+                    //     value): `error[E0308]: mismatched types`, "expected
+                    //     `()`, found `Result<_, Error>`", whose `help:` offers
+                    //     to put the `;` or the `return` back.
+                    // Two things are at work here. First, the enclosing `match`
+                    // each refusal sits in: the match holding this arm is an
+                    // expression statement with no trailing `;`, so its arms are
+                    // `()`, while the match holding the TCP arm is the
+                    // function's tail, so its arms must yield
+                    // `Result<IoStream, Error>` — which is why a discarded
+                    // value is the `E0308` there and a discarded `()` body is
+                    // legal here. Second, once the `Err(..)` is discarded as a
+                    // statement nothing constrains the `Ok` type parameter `T`
+                    // of that `Result`, which is the `E0282` above — the
+                    // compiler's own wording is "cannot infer type of the type
+                    // parameter `T` declared on the enum `Result`". Give the
+                    // `else` a value instead and the same mutation reports
+                    // `E0308` on that value, not `E0282`.
+                    //
+                    // Unlike the TCP and WSS arms, `clippy::needless_return`
+                    // does not fire on this one — measured in the four `kcp`
+                    // configurations named in the CI residue comment in
+                    // `.github/workflows/ci.yml` (`kcp`, `kcp,compression`,
+                    // `websocket,kcp`, `kcp,websocket,tcp-mux,stun`); a
+                    // `compile_error!` probe confirmed those four compile this
+                    // arm. That is the scope of those four names, not the set of
+                    // every configuration that enables `kcp` — `default` enables
+                    // it, and so does every combination containing it. The cause
+                    // of that suppression was NOT isolated (a synthetic `if c
+                    // { return Err(..) } else { return Ok(0) }` arm *is*
+                    // linted), so read the measurement, not a reason.
                     return Err(crate::Error::Transport(
                         "TLS support not compiled (enable the 'tls' feature)".into(),
                     ));
@@ -1637,12 +1675,33 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             if opts.tls_enable {
                 #[cfg(not(feature = "tls"))]
                 {
-                    // Round 6: missing `return` — e.g. `--features kcp` (no
-                    // tls) fell through to the function tail instead of
-                    // failing (E0308 in the feature-matrix check).
-                    return Err(crate::Error::Transport(
+                    // With `tls` off this block's value IS the refusal: it is
+                    // the surviving tail expression of this `if` body, so the
+                    // arm returns `Err` instead of falling through to the
+                    // `else` arm's plaintext stream.
+                    //
+                    // Measured, not assumed (scratch copies, `-D warnings`).
+                    // The `return` keyword was never the load-bearing part —
+                    // the tail position is:
+                    //   * `return` AND its trailing `;` both removed, leaving
+                    //     `Err(..)` as this block's tail expression: rc 0 in
+                    //     `--features kcp` and `--features websocket` (tls off),
+                    //     and the same `Err` is still what the arm returns —
+                    //     pinned at runtime by
+                    //     `dial_server_refuses_tls_when_tls_is_not_compiled`;
+                    //   * only the keyword removed, `;` kept: the value is
+                    //     discarded, this block becomes `()`, and the `if`/`else`
+                    //     arms stop unifying — `error[E0308]: mismatched types`,
+                    //     "expected `Result<IoStream, Error>`, found `()`", whose
+                    //     span is this `if` body's block (the brace above, not
+                    //     the `Err(..)` line) and whose `help:` points at the
+                    //     `;` to remove. Measured in the bare configuration,
+                    //     `--features kcp` and `--features websocket`. That is
+                    //     the failure the old "missing `return`" wording
+                    //     described, and it is about the `;`, not the keyword.
+                    Err(crate::Error::Transport(
                         "TLS support not compiled (enable the 'tls' feature)".into(),
-                    ));
+                    ))
                 }
                 #[cfg(feature = "tls")]
                 {
@@ -1697,11 +1756,19 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             if is_wss {
                 // WSS raw mode: TLS handshake + manual HTTP upgrade.
                 // Avoids tungstenite UTF-8 validation on TEXT frames from Go frps.
+                //
+                // Same shape as the TCP arm above, and reachable in a second
+                // measured configuration: `clippy -p frp-core
+                // --no-default-features --features websocket --all-targets`
+                // was red here for the same `clippy::needless_return` with tls
+                // off. The block's value is this `if` body's tail expression,
+                // so the refusal — not the plaintext `else` arm — is what the
+                // arm returns.
                 #[cfg(not(feature = "tls"))]
                 {
-                    return Err(crate::Error::Transport(
+                    Err(crate::Error::Transport(
                         "TLS support not compiled (enable the 'tls' feature for WSS)".into(),
-                    ));
+                    ))
                 }
                 #[cfg(feature = "tls")]
                 {
@@ -2425,6 +2492,73 @@ mod tests {
         assert_eq!(req[0], 0x05, "VER");
         assert_eq!(req[1], 0x01, "CMD=CONNECT");
         assert_eq!(req[3], 0x01, "ATYP=IPv4");
+    }
+
+    /// With `tls` off, a `tls_enable` dial must fail with the arm's own
+    /// "TLS support not compiled" error — never fall through to the plaintext
+    /// `IoStream` the `else` arm would return. Runtime pin for the tail
+    /// expression at the top of the TCP arm, and (under `websocket`) for the
+    /// WSS arm's.
+    ///
+    /// The compile-time half is E0308: a `;`-terminated statement there
+    /// discards the `Err` and the configuration stops building (measured in a
+    /// scratch copy). This test pins the part a compile error cannot state —
+    /// that the value the arm produces *is* the refusal.
+    ///
+    /// Compiled only without `tls`. CI runs it in `Run frp-core's tests and
+    /// benches with no features (runtime half of frp-core's tier gate)`
+    /// (`--no-default-features --all-targets`, `.github/workflows/ci.yml`);
+    /// the `--features kcp` and `--features websocket` runs of it are local
+    /// measurements.
+    #[cfg(not(feature = "tls"))]
+    #[tokio::test]
+    async fn dial_server_refuses_tls_when_tls_is_not_compiled() {
+        // The TCP connect happens *before* the refusal, so a listener is what
+        // makes this a test of the arm rather than of the address.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let acceptor = tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+
+        let opts = DialOptions {
+            server_addr: "127.0.0.1".into(),
+            server_port: port,
+            tls_enable: true,
+            ..Default::default()
+        };
+        let err = dial_server(&opts)
+            .await
+            .expect_err("a tls_enable dial must fail when `tls` is off");
+        assert!(
+            err.to_string().contains("TLS support not compiled"),
+            "expected the tls-off refusal, got: {err}"
+        );
+
+        // The WSS arm is the other `clippy::needless_return` site in this
+        // configuration family, so pin its refusal too.
+        #[cfg(feature = "websocket")]
+        {
+            let opts = DialOptions {
+                server_addr: "127.0.0.1".into(),
+                server_port: port,
+                protocol: TransportProtocol::Wss,
+                tls_enable: true,
+                ..Default::default()
+            };
+            let err = dial_server(&opts)
+                .await
+                .expect_err("a WSS dial must fail when `tls` is off");
+            assert!(
+                err.to_string()
+                    .contains("TLS support not compiled (enable the 'tls' feature for WSS)"),
+                "expected the tls-off WSS refusal, got: {err}"
+            );
+        }
+
+        acceptor.abort();
     }
 
     /// SOCKS5 reply parser, ATYP 0x03 (domain) with a tail: the bind address
