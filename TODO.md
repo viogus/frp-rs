@@ -336,7 +336,51 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   unrelated reason, so it stayed green with the check deleted; that is recorded in the test's
   comment. `docs/deployment.md` lists the new admin-API 400 source. Not covered: an `auth.method`
   change on the **server**'s SIGUSR1 reload is neither refused nor separately tested (the server does
-  rebuild `auth_cfg` when the token changes).
+  rebuild `auth_cfg` when the token changes). Measured by the second reviewer and re-measured here,
+  the server half is worse than "not covered": a `method = "token"` → `"oidc"` change with the same
+  token and unchanged OIDC fields is reported as **`config reloaded: no changes detected`** while the
+  file now says `oidc`. It is filed as its own item immediately below, and it is **outside this
+  item's scope** (this item is the client's admin reload).
+- [ ] **The server's SIGUSR1 reload compares neither `auth.method` nor the running verifier, so a
+  method change can be reported as `no changes detected` or leave `auth_cfg` on `oidc` with no
+  verifier.**
+  Measured 2026-09-28 on this tree with the `frps` built from this worktree — own config and free
+  port per case, stdout/stderr separate, child bounded and reaped; this is a **probe**, not a code
+  read (script `/tmp/amp/server_reload_probe3.sh`, logs kept):
+  * **Shape A — silently ignored.** Running config: `method = "token"`, one token, and the OIDC
+    fields already present and unchanged (`oidc_issuer`, `oidc_audience`). Rewrite to
+    `method = "oidc"` (same token, same OIDC fields) + `kill -USR1` →
+    `SIGUSR1: config reloaded: no changes detected`. The file says `oidc`; the server kept token
+    auth, and nothing in the reload output mentions auth.
+  * **Shape B — swapped without a verifier.** The same, with the token changed too →
+    `SIGUSR1: auth token updated`. `reload()` then assigns the whole new `AuthConfig`
+    (`frp-server/src/service.rs:2057-2061`), so the live `auth_cfg.method` becomes `Oidc`, while
+    `state.oidc.verifier` is built **once** at startup (`frp-server/src/service.rs:215`, `if
+    auth_cfg.method == AuthMethod::Oidc`) and is still `None`. The login dispatch keys off the
+    **verifier's presence**, not the method (`frp-server/src/control/login.rs:299`, `else if let
+    Some(ref verifier) = state.oidc.verifier`), so logins still take the token branch — with the new
+    token. It fails closed only by accident of that dispatch; the config and the running auth
+    disagree.
+  * **Correction to the reviewer's wording, measured:** the reload is *not* always silent. When the
+    **OIDC fields** change (issuer / audience / skip-expiry / skip-issuer / skip-audience /
+    additional-audience / trusted CA), `frps` does print
+    `OIDC settings changed (restart required)` (`frp-server/src/service.rs:2132-2142`), so a
+    `token` → `oidc` rewrite that *adds* `oidc_issuer`/`oidc_audience` reports that line instead.
+    Shape A needs those fields present **and unchanged** in the running config — reachable, because
+    with `method = "token"` the loader validates none of them.
+  * Adjacent behaviour, also measured, so the item is not read as "the server ignores auth reloads":
+    an **invalid** spelling is refused by the loader before any of this (closed by the `auth.method`
+    item above), and an OIDC config that fails `check_startup` is refused with its message
+    (`oidc_audience is empty` → `SIGUSR1 reload: security misconfiguration: …`, old config kept).
+  **What is missing is a comparison of the method itself:** the token arm (`:2057-2061`) compares
+  `token`, the OIDC arm (`:2132-2142`) compares the OIDC fields, and neither reads `method`.
+  **Done-when:** a `method` difference is either applied (rebuild/swap the verifier) or reported the
+  way the OIDC fields already are — e.g. a `note_restart_change`-shaped arm on
+  `self.cfg.auth.method` vs `new_cfg.auth.method`, or treating any `[auth]` difference as
+  restart-required — pinned by a probe per shape above (A: not `no changes detected`; B: no
+  `auth_cfg.method == Oidc` without a verifier), and either the login dispatch is keyed off the
+  method instead of `Option<verifier>` or that invariant is stated and pinned. Pre-existing; **not**
+  fixed by the client-side change that closed the item above.
 - [ ] **`oidc_throttle_tests` is a load-dependent flake: the mock IdP answers 404 for a valid
   request.** `cargo test -p frp-server --lib oidc` failed **3/3** `oidc_throttle_tests` under CPU
   load with `OIDC: openid-configuration returned 404 Not Found`, while a serial run passes 6/6 and
@@ -3054,6 +3098,48 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   pattern. No `CHANGELOG.md` entry: test-harness only.
   `scripts/compat-test.sh` is not relevant (no wire surface). Full evidence, including the orphan
   table and a "least sure" section: `/tmp/reload-guards-report.md`.
+- [ ] **`scripts/compat-test.sh` leaks its children: a full run left 83 reparented Go processes, and
+  the first reviewer measured 167 in one run.**
+  This is the same class as the two items above (`TODO.md`'s "Two test-harness hazards" and the
+  `reload_integration.rs` orphan item) but in `scripts/`, **outside the test harnesses those items
+  swept**.
+  Measured here 2026-09-28, immediately after a green `bash scripts/compat-test.sh` (86 passed,
+  0 failed, rc 0): `pgrep -x frps | wc -l` → **33**, `pgrep -x frpc | wc -l` → **50** (**83** total),
+  every one with `PPID 1` and every one a `/tmp/frp_0.71.0_darwin_arm64/{frps,frpc} -c
+  /tmp/frp-compat-test/<scenario>/…` process — i.e. the harness's **Go** children, still holding
+  their listeners. All 83 were reaped by explicit pid (matched on the
+  `/tmp/frp-compat-test/` and Go-binary path in their command line, never by name alone). The first
+  reviewer's full run left **167** reparented Go processes, reaped the same way. A third piece of
+  evidence, from CI rather than a local run: **#397's** failed Cross-Compat run had the runner
+  terminate **two dozen** orphans.
+  The script's own cleanup is `cleanup()`/`cleanup_pids()` (`scripts/compat-test.sh:145-176`), a
+  `kill` over a `PIDS` list plus a bounded wait and `kill -9`; the leak is the paths that do not
+  reach it — a `run_go` background child that has already been reparented when the trap runs, or a
+  scenario that aborts between spawn and `track_pid`.
+  **Done-when:** a green full run leaves `pgrep -x frps` and `pgrep -x frpc` at **0** afterwards, by
+  the script's own means (e.g. a process-group kill per scenario, or a `pkill`-free pid-file sweep
+  over the scenario's own children) rather than by hand, pinned by a check that counts strays after
+  a full run and fails when the count is non-zero. Do **not** close it with `pkill -x frps`: the
+  repository's stray rules forbid name-only kills.
+- [ ] **`frps/tests/log_completion.rs` is a load-dependent flake: the child never writes its log
+  file inside the readiness window.**
+  Found by the first reviewer on this branch (the file is **outside** that change's diff, and it
+  landed in **#396**, the `log_completion` step): **2 of 7** runs failed, panicking at
+  `frps/tests/log_completion.rs:502` — the first arms of
+  `max_days_zero_is_completed_to_three_on_the_cli_and_in_the_file`, whose failure text is
+  `aged_file_survives`'s readiness panic (`:465-496`: *"no fresh `logs/frps.log.<date>` was written
+  within {READY_TIMEOUT:?}, so the child never reached the appender"*). So the atomicity that test
+  needs — a backdated `logs/frps.log.2020-01-01` plus a *fresh* daily file written by the child — is
+  racy under load, and the assertion that then fails is about **retention**, reported as if the
+  retention decision were wrong.
+  **Not reproduced here:** 7/7 passes with `--exact --nocapture` on an idle host, and 5/5 further
+  passes running the whole file under four `yes` processes of CPU load (12 runs, 0 failures). The
+  reviewer's 2/7 is the evidence; this note records the non-reproduction rather than disputing it.
+  **Done-when:** the readiness wait is made deterministic (e.g. wait for the appender's own line, or
+  retry the aged-file arm) or the timeout is raised with the load recipe named, pinned by a looped
+  run under load — with the CI lane's own guard literal (`log_completion`'s step counts **5** in
+  `.github/workflows/ci.yml`, not one of the two `env.*_CLI_TESTS` values) moved in the same commit
+  if tests are added or removed.
 - [x] **`frpc`'s eight single-proxy subcommands reject `-c`/`--config`, which Go accepts and
   ignores.** Go's `-c` is a persistent rootCmd flag, so every subcommand parses it; the single-proxy
   commands simply never read the value. frp-rs's bpaf parsers for `tcp`/`udp`/`http`/`https`/`stcp`/
