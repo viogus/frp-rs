@@ -549,6 +549,20 @@ async fn inert_settings_are_not_reported() {
         "ServerConfig::tls_server_name has no reader in frp-server"
     );
 
+    // `ServerConfig.tls_enable`: the pre-fix reload printed
+    // `tls_enable: false -> true (restart required)` for this exact rewrite,
+    // even though nothing in `frp-server`/`frps` reads the field (measured:
+    // `grep -rn tls_enable frp-server/src frps/src` finds no read) — and a
+    // restart could not make the change take effect either. This is the pin
+    // that fails if that line comes back.
+    let summary = server
+        .rewrite_and_reload(&probe_config(port, "tls_enable = true\n"))
+        .await;
+    assert_eq!(
+        summary, "config reloaded: no changes detected",
+        "ServerConfig::tls_enable is inert: neither applied nor reported"
+    );
+
     let summary = server
         .rewrite_and_reload(&probe_config(port, "[featureGates]\nVirtualNet = true\n"))
         .await;
@@ -559,9 +573,10 @@ async fn inert_settings_are_not_reported() {
 }
 
 /// The applied set must stay quiet: `allow_ports` and the TLS paths are re-keyed
-/// in place by the reload, and `bind_port`/`bind_addr`/`tls_enable` are reported
+/// in place by the reload, and `bind_port`/`bind_addr` are reported
 /// by the reload itself — none of them may appear twice or as "restart
-/// required".
+/// required". (`tls_enable` is neither applied nor reported: it is inert, see
+/// [`inert_settings_are_not_reported`].)
 #[tokio::test]
 async fn applied_settings_do_not_report_a_restart() {
     let port = allocate_port();

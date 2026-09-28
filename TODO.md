@@ -508,7 +508,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
     read, `/tmp/sra-probe/non-auth/frps.err` 0 B — the probe prints both counts and both runs
     agreed byte-for-byte). Neither value is applied, and nothing in the summary
     names either field.
-  `reload()` compares only `allow_ports`, `[auth]`, `bind_port`, `bind_addr`, `tls_enable` and the
+  `reload()` compares only `allow_ports`, `[auth]`, `bind_port`, `bind_addr` and the
   TLS file paths (`frp-server/src/service.rs`), so this is the same class as the item above,
   outside `[auth]`: `transport.*`, `udp_packet_size`, `vhost_http_timeout`, `user_conn_timeout`,
   `web_server.*`, `http_plugins`, `max_ports_per_client` / `max_conns_per_proxy` /
@@ -612,25 +612,106 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   own item directly below** rather than left in a message. Full base/head table and the
   least-sure section: `/tmp/restart-only-report.md`.
 
-- [ ] **`tls_enable` is reported as restart-required, but nothing in `frp-server`/`frps` reads it.**
-  `reload()` has printed the line since before the restart-only list landed (the
+- [x] **`tls_enable` is reported as restart-required, but nothing in `frp-server`/`frps` reads it.**
+  `reload()` printed the line since before the restart-only list landed (the
   `note_restart_change(&self.cfg.tls_enable, …)` call in `frp-server/src/service.rs`), and the new list
-  deliberately leaves it in place because it is base behaviour and the item above counts the field
-  among the ones `reload()` already compares. Measured 2026-09-28 at `5c74455`: `grep -rn tls_enable
-  frp-server/src frps/src` finds only that call site plus one comment, i.e. `ServerConfig.tls_enable`
-  has **no reader** — so a reload that changes only it prints `tls_enable: false -> true (restart
-  required)` and a restart changes nothing. Go v0.71.0 is the same shape, so this is *not* a parity
-  gap: its `ServerConfig` has no `TlsEnable` at all, `TLS.Enable` is a **client** field
-  (`pkg/config/v1/client.go`, read by `pkg/config/v1/validation/client.go:155`), and the legacy INI
-  `tls_enable` maps to `Transport.TLS.Enable` (`pkg/config/legacy/conversion.go:60`) which no server
-  path reads — the server's switch is `TLS.Force`, i.e. `tls_only` (`conversion.go:150`,
-  `pkg/config/v1/server.go:195`). **Done-when:** the disposition is explicit and pinned by a test
-  either way — the line is removed (the `[auth].useEncryption` precedent in
-  `note_auth_restart_changes`: nothing reads the field, so neither a reload nor a restart can make a
-  change take effect, and the reload must not claim one) and the field joins the inert list in
-  `frp-core/src/config/restart_only.rs` with its reader measurement, **or** the field is deliberately
-  wired to a server behaviour (a documented divergence from Go, which ignores it server-side) with a
-  probe showing what a restart changes. A reader of the test must be able to tell which was chosen.
+  deliberately left it in place because it was base behaviour and the item above counted the field
+  among the ones `reload()` already compares. First measured 2026-09-28 at `5c74455`, and re-measured
+  on this branch at base and at head: `grep -rn tls_enable frp-server/src frps/src` finds **no read**
+  of `ServerConfig.tls_enable` — the only hits are `presence.warn_inert_web_server_tls_enable()` (the
+  **different** field `[web_server.tls] enable`, #402) and a comment — so a reload that changes only it
+  printed `tls_enable: false -> true (restart required)` and a restart changed nothing. Go v0.71.0 is
+  the same shape, so this is *not* a parity gap: its `ServerConfig` has no `TlsEnable` at all,
+  `TLS.Enable` is a **client** field (`pkg/config/v1/client.go`, read by
+  `pkg/config/v1/validation/client.go:155`), and the legacy INI `tls_enable` maps to
+  `Transport.TLS.Enable` (`pkg/config/legacy/conversion.go:60`) which no server path reads — the
+  server's switch is `TLS.Force`, i.e. `tls_only` (`conversion.go:150`,
+  `pkg/config/v1/server.go:195`).
+
+  **Measured disposition: the field is inert, so the false line is removed** — the
+  `[auth].useEncryption` precedent in `note_auth_restart_changes`: nothing reads the field, so neither
+  a reload nor a restart can make a change take effect, and the reload must not claim one. The field
+  now sits in `frp-core/src/config/restart_only.rs`'s existing no-reader group (named in the no-`..`
+  destructure and never pushed) with `tls_server_name`/`feature.gates`/`includes`, no second mechanism
+  invented, and the `reload()` call site is gone. Pinned by `inert_settings_are_not_reported` in
+  `frp-server/tests/server_reload_restart_only.rs`, which rewrites `tls_enable = true` and asserts
+  `config reloaded: no changes detected`; putting the line back makes that test fail with
+  `tls_enable: false -> true (restart required)`. The unit test `unreported_fields_stay_unreported` in
+  `restart_only.rs` also asserts the field yields no report.
+
+  Done: removed the `note_restart_change` call, moved `tls_enable` into the no-reader group, and
+  updated the doc bullets plus the test doc comment that claimed the reload reported it. The
+  user-visible reload-output change also owes its collateral, done in the same round: a `CHANGELOG.md`
+  bullet recording the removal (with the #400 bullet's "every restart-only difference is now
+  reported" qualified to "…that some code reads"), `tls_enable` added to the no-reader example lists
+  in `README.md` and `docs/deployment.md`, and three `docs/config.md` corrections — the false
+  `tls_enable` table row (it claimed to enable TLS on the main listener), its removal from the
+  "requires a full restart" list, and the no-reader list becoming eight fields. The same defect
+  class — a live, user-facing place presenting `tls_enable` as a working server knob — had two
+  further carriers, both corrected by follow-up commits on this branch: `docs/architecture.md:342`
+  claimed the server's QUIC listener "requires `tls_enable`", when its gate is
+  `#[cfg(feature = "quic")]` + `quic_bind_port > 0` (`frp-server/src/service.rs:1541-1542`) and the
+  listener self-generates a self-signed cert, so the parenthetical now reads "requires the `quic`
+  feature, which implies `tls`" (grounded in `frp-core/Cargo.toml:66`
+  `quic = ["dep:quinn", "tls"]`); and the root `frps.toml:26` sample wrote `tls_enable = true`
+  under `## TLS` — the one line the open warning item below would make `frps -c frps.toml` warn at
+  itself on every start — which is deleted, after checking that no test/script/CI job reads the
+  root sample (the scripts generate their own temp copies; the lone test naming the repo example
+  uses an inline literal). Full record with commands and outputs: `/tmp/tls-enable-report.md`.
+
+- [ ] **`tls_enable` is silently inert: no load-time warning, unlike the sibling `[web_server.tls]
+  enable` that #402 made warn.** Measured on this branch (the `grep -rn "\.tls_enable"` above): no
+  `frp-server`/`frps` code reads `ServerConfig::tls_enable`, yet a config that writes
+  `tls_enable = true` loads without a word — the user gets neither an effect nor a warning, where
+  `[web_server.tls] enable` at least says `… has no effect: …` at every load site that has a log
+  sink. The existing mechanism to reuse is the `web_server.tls.enable` presence flag carried out of
+  the loader and emitted by each site (`presence.warn_inert_web_server_tls_enable`, called from both
+  `frps` startup paths); do not invent a second one.
+
+  Done-when: a load carrying a user-written `tls_enable` warns once per load at every load site that
+  has a log sink (the two startup paths, `frpc verify`, and the `frps`/`frpc` SIGUSR1 reload), with a
+  test that fails if the warning is removed, and the warning must **not** fire on the legitimate
+  legacy path below. The caveat that makes it non-trivial: `frp-core/src/config/normalize.rs`
+  **synthesizes** `tls_enable = true` when the legacy/canonical `[transport.tls]` has `force = true`
+  or `certFile`/`keyFile` (while mapping `force` → `tls_only`), inserting it with `.or_insert` before
+  deserialization — so after the load a synthesized value is indistinguishable from a written one,
+  and the presence flag must be taken from the file (beside the existing `web_server.tls.enable`
+  flag), not from the deserialized `ServerConfig`.
+
+- [ ] **`docs/config.md` advertises four camelCase TLS aliases that no loader accepts.**
+  The `tls_only`, `tls_cert_file`, `tls_key_file` and `tls_ca_file` rows at `docs/config.md:26-29`
+  each name a Go-alias spelling (`tlsOnly`, `tlsCertFile`, `tlsKeyFile`, `tlsCaFile`), while
+  `docs/config.md:173` in the same file states the opposite ("Exception: `tls_enable`,
+  `tls_cert_file`, `tls_key_file`, `tls_ca_file` have no camelCase aliases — use the snake_case
+  names") — and the loader agrees with the Exception, not the table. But that Exception sentence is
+  itself incomplete and is the **third** site to reconcile: it omits `tls_only`, which also has no
+  camelCase alias (the `tlsOnly = true` row below), and it does not mention that `tls_ca_file`
+  *does* have a working alias, `tls_trusted_ca_file` (`frp-core/src/config/server.rs:48`), which the
+  corrected sentence must not erase. Measured at `a928887` with a
+  throwaway probe over `frp_core::config::load_server_config_from_str` (non-strict) and
+  `frp_core::config::load_server_config_uncompleted(path, true)` (strict):
+  * `tlsCertFile = "/cc.crt"` + `tlsKeyFile = "/cc.key"` → ignored; both fields stay `""`.
+  * `tlsOnly = true` → ignored; `tls_only` stays `false`.
+  * `tlsCaFile = "/cc-ca.crt"` → ignored; `tls_ca_file` stays `""` and `tls_only` stays `false`, so
+    it does not even trigger the `tls_ca_file`-implies-`tls_only` fill at
+    `frp-core/src/config/server.rs:524-525`.
+  * all four together in strict mode → `unknown field "tlsCaFile" in config file <path>`,
+    `unknown field "tlsCertFile" …`, `unknown field "tlsKeyFile" …`, and
+    `unknown field "tlsOnly" in config file <path> — did you mean 'tls_only'?`; the snake_case
+    control keys load `Ok`.
+  So all four rows are wrong, `tlsOnly` included — not three of four. `frp-core/src/config/server.rs:43-51`
+  declares those fields with `#[serde(default)]` and no alias for any of them; the only server-TLS
+  aliases that exist are `tls_trusted_ca_file` (`:48`, → `tls_ca_file`) and `tlsServerName`
+  (`:50`, → `tls_server_name`), and both do work. `frp-core/src/config/strict.rs` accepts
+  `tlsServerName` (`:29`, `:207`) but lists none of the four camelCase spellings, which is why
+  strict mode refuses them.
+
+  Done-when, covering all three sites at once: (a) the four rows at `docs/config.md:26-29` name
+  only spellings a loader accepts (the snake_case key where no alias exists, or the real alias
+  where one exists); (b) the Exception at `docs/config.md:173` gains `tls_only` and keeps
+  `tls_trusted_ca_file` as the working `tls_ca_file` alias; and (c) the accepted-spelling list in
+  `frp-core/src/config/strict.rs` (`:29`, `:207`) stays the arbiter the docs agree with — with a
+  test pinning the accepted/rejected spellings so the table cannot drift back.
 
 - [x] **`[web_server.tls] cert_file` — the nested section's own canonical spelling — is dropped silently
   in the non-strict loader, and refused in strict mode with a message naming a key the user never wrote.**
@@ -2570,6 +2651,53 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `frpc -c <that config>` returns 1 both before and after this change, but for the *wrong*
     reason: the config is accepted and the process then fails to connect (a runtime exit),
     not a config refusal. The exit code agrees with Go by coincidence on that one row.
+- [ ] **`frps --config-dir` never installs the SIGUSR1 handler, so `kill -USR1` kills the server.**
+  `frps/src/main.rs:180-248` is the `--config-dir` branch: it spawns one service task per file at
+  `:221`, awaits the finished tasks at `:243-247`, and `return`s at `:248` — before the
+  single-config path constructs the service at `:312-323` and installs the reload handler at
+  `:325-346` (which requests `SignalKind::user_defined1()` at `:330`). With no handler installed,
+  SIGUSR1 keeps its default disposition, which is terminate. Reproduced at `a928887` against this
+  branch's built `target/debug/frps`: a temp dir holding one valid config
+  (`bind_addr = "127.0.0.1"`, `bind_port = 47233`, `[auth] token = …`), started as
+  `frps --config-dir <dir>`; the log reached `frps listener started on 127.0.0.1:47233`;
+  `kill -USR1 <pid>` printed `… User defined signal 1: 30` and `wait` returned **rc 158**
+  (128 + 30), with no reload line in the log — the *default disposition*, not a handler.
+  Pre-existing and unrelated to this PR: `git diff 2dea6ba..HEAD -- frps/src/main.rs` is empty.
+  Go frps v0.71.0 rejects `--config-dir` outright (`Error: unknown flag: --config-dir`, rc 1), so
+  this lane has no Go behaviour to match; it is compared against frp-rs's own `-c` lane.
+
+  Done-when: `frps --config-dir` installs the same SIGUSR1 reload handler as `-c` (or documents
+  the divergence and pins it with a test), and a test drives a real `--config-dir` process, sends
+  SIGUSR1, and asserts the process stays alive and emits the reload summary.
+
+- [ ] **`frps --config-dir` exits 0 when every config file fails service initialisation.**
+  Same `--config-dir` branch as the item above, and the same reason it is worth recording next to
+  it. `frps/src/main.rs:221` pushes the `tokio::spawn` handle *before* the service is
+  constructed, so `handles` is non-empty even when every config fails inside the task
+  (`:222-232` logs `frps service init failed for [<path>]: …` and `return`s); the
+  `if handles.is_empty()` guard at `:239` therefore never fires, `:243-247` awaits the already
+  finished tasks, and `:248` returns ⇒ process exit 0. The single-config path exits through
+  `process::exit(e.kind().exit_code())` at `:321` instead. Reproduced at `a928887` with the same
+  one-file temp dir and **no `[auth]` token** in it (which trips the empty-token refusal):
+  * `frps -c <file>` → **rc 3**; log
+    `frps init error: security misconfiguration: CRITICAL: [auth].token / auth.tokenSource resolved empty with token auth method — server would accept ALL connections. Set a strong token in the config file.`
+  * `frps --config-dir <dir>` → **rc 0**; log
+    `frps service init failed for [<path>]: security misconfiguration: CRITICAL: [auth].token …`
+    with nothing listening on the bind port.
+  * `frps --config-dir <missing-dir>` → **rc 2**; log
+    `Failed to read config directory: No such file or directory (os error 2)` — so the directory
+    read does refuse non-zero (`frp-core::EXIT_CONFIG`); only the all-configs-failed-to-init lane
+    returns 0.
+
+  A supervisor running `frps --config-dir` therefore sees success while nothing is served. This is
+  pre-existing and unrelated to this PR (`git diff 2dea6ba..HEAD -- frps/src/main.rs` is empty).
+  The comment at `frps/src/main.rs:183-188` calls the non-zero refusals below it "a deliberate,
+  measured divergence" from Go; the init-failure path is *not* one of them — it is the rc 0 above
+  — which is what makes this read as an oversight rather than a decision.
+
+  Done-when: `frps --config-dir` with every file failing service initialisation exits non-zero
+  (the same typed exit-code lane as `-c`), and a test runs a real `--config-dir` process over an
+  all-failing directory and asserts the non-zero rc.
 - [x] **The space-separated `--strict-config false` form is an frp-rs extension presented as Go
   pflag semantics, and it parses differently from Go.** Measured on Go v0.71.0 and frp-rs
   (`frp-core/src/cli.rs`), with the same unknown-key config:
@@ -2933,7 +3061,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     mis-cased key only in the walked sections (top level, `[auth]`/`[log]`/`[webServer]`/
     `[transport]`), while a mis-cased key inside a `[[proxies]]`/`[[visitors]]`/`[[httpPlugins]]`
     element is silently dropped **even in strict mode** (`frpc verify` rc 0; the exemption in
-    `frp-core/src/config/strict.rs:277-285`, its consequences already in `docs/deployment.md:710-747`,
+    `frp-core/src/config/strict.rs:277-285`, its consequences already in `docs/deployment.md:709-746`,
     pinned by `strict_mode_exempts_proxy_and_visitor_array_elements` and now also by the CLI test
     `case_insensitive_proxy_array_keys_are_dropped_in_strict_mode`). In non-strict mode the dropped
     key may later error (`web server port should be set …`, `missing field \`name\``) *or* silently

@@ -697,8 +697,8 @@ impl ServerConfig {
     /// The reload applies, in place: `allow_ports` (and the
     /// `allow_port_start`/`allow_port_end` it falls back to, through
     /// `resolve_allow_ports`), the five `[auth]` fields, and — with the `tls`
-    /// feature — the certificate/key/CA paths. It reports `bind_port`, `bind_addr`
-    /// and `tls_enable` itself, and the whole `[auth]` section is
+    /// feature — the certificate/key/CA paths. It reports `bind_port` and
+    /// `bind_addr` itself, and the whole `[auth]` section is
     /// `note_auth_restart_changes`'s. Everything else in `ServerConfig` is named
     /// here, **iff some code in the reloading build reads it** — `reader` says
     /// which build feature that reader needs.
@@ -716,6 +716,13 @@ impl ServerConfig {
     ///
     /// * Fields **no reader in `frp-server`** consumes are neither applied nor
     ///   reported, because a restart cannot make them take effect either:
+    ///   `tls_enable` (`ServerConfig.tls_enable` — `grep -rn tls_enable
+    ///   frp-server/src frps/src` finds no read of it; the hits are only comment
+    ///   lines and call sites of the unrelated helper
+    ///   `presence.warn_inert_web_server_tls_enable()`, which reads a different
+    ///   key, `[web_server.tls] enable`. No count is pinned, because the comment
+    ///   that states it changes it; Go v0.71.0's server config has no
+    ///   such field either, its `TLS.Enable` is a *client* one),
     ///   `tls_server_name` (`ServerConfig::tls_server_name` is a *client* field in
     ///   Go; nothing outside `frp-core`'s client transport reads it),
     ///   `feature.gates` (validated by the loader at load time only;
@@ -739,13 +746,13 @@ impl ServerConfig {
     ///   bounded elsewhere is still compared by the value the loader left.
     /// * It says nothing about whether an applied field has a sensible new value
     ///   — that is the reload's apply block's business.
-    /// * `tls_enable` and `bind_port`/`bind_addr` are skipped because the reload
-    ///   reports them itself. `tls_enable` keeps that pre-existing line even
-    ///   though nothing in `frp-server`/`frps` reads `ServerConfig.tls_enable`
-    ///   (measured: `grep -rn tls_enable frp-server/src frps/src` finds only that
-    ///   call site and a comment) — the same shape as the `tls_server_name` case
-    ///   above. It is deliberately left alone: it is base behaviour, reported
-    ///   before this list existed.
+    /// * `bind_port`/`bind_addr` are skipped because the reload reports them
+    ///   itself. `tls_enable` was previously left in that group and reported by
+    ///   `reload()`; it is now in the no-reader group above, because nothing in
+    ///   `frp-server`/`frps` reads `ServerConfig.tls_enable` (measured:
+    ///   `grep -rn tls_enable frp-server/src frps/src` finds no read) — the same
+    ///   shape as the `tls_server_name` case above, and reporting a restart for
+    ///   it claimed an effect a restart cannot have.
     pub fn restart_only_changes(&self, other: &ServerConfig) -> Vec<RestartOnlyChange> {
         let mut out: Vec<RestartOnlyChange> = Vec::new();
 
@@ -765,7 +772,14 @@ impl ServerConfig {
             sub_domain_host: old_sub_domain_host,
             #[cfg(feature = "websocket")]
                 websocket_port: old_websocket_port,
-            // Reported by the reload itself.
+            // No reader in `frp-server`/`frps` (`grep -rn tls_enable
+            // frp-server/src frps/src` finds no read — only comment lines and
+            // call sites of the unrelated helper
+            // `presence.warn_inert_web_server_tls_enable()`, which reads a
+            // different key, `[web_server.tls] enable`; no count is pinned,
+            // since stating it here would itself change it). Inert: neither a
+            // reload nor a restart can make a change take effect, so it is
+            // neither applied nor reported.
             tls_enable: _old_tls_enable,
             // Applied in place by the reload's TLS hot-reload block.
             tls_cert_file: _old_tls_cert_file,
@@ -821,6 +835,7 @@ impl ServerConfig {
             sub_domain_host: new_sub_domain_host,
             #[cfg(feature = "websocket")]
                 websocket_port: new_websocket_port,
+            // No reader in `frp-server`/`frps`; see the `old` pattern above.
             tls_enable: _new_tls_enable,
             tls_cert_file: _new_tls_cert_file,
             tls_key_file: _new_tls_key_file,
@@ -1343,11 +1358,13 @@ mod tests {
         let mut new = base();
         new.bind_port = 7001;
         new.bind_addr = "0.0.0.0".into();
-        new.tls_enable = true;
         assert!(old.restart_only_changes(&new).is_empty());
 
-        // No reader in `frp-server`…
+        // No reader in `frp-server`… (`tls_enable` is inert: the reload no
+        // longer reports it — measured `grep -rn tls_enable frp-server/src
+        // frps/src` finds no read — and a restart would change nothing either).
         let mut new = base();
+        new.tls_enable = true;
         new.tls_server_name = "frps.example.com".into();
         new.web_server.pprof_enable = true;
         new.web_server.tls_ca_file = "/tmp/dash-ca.pem".into();

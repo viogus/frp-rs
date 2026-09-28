@@ -219,7 +219,7 @@ User-facing release notes for frp-rs.
   the running process. Measured on a real `frps`: `transport.heartbeat_timeout`
   `30 -> 60` plus `max_ports_per_client` `0 -> 7` with `kill -USR1` printed
   `config reloaded: no changes detected` and named neither field. Every
-  restart-only difference is now reported as
+  restart-only difference that some code reads is now reported as
   `name: old -> new (restart required)` — the whole `[transport]` section, the
   listener ports and addresses, `[log]` (read once in `init_logging`, before the
   reload path exists), `[web_server]`, `http_plugins`, the
@@ -245,6 +245,17 @@ User-facing release notes for frp-rs.
   is). The classified field list is a compiler-enforced destructure of
   `ServerConfig`, so a newly added field is a compile error until it is classified
   rather than silently silent.
+- **The server's `SIGUSR1` reload no longer reports `tls_enable` as
+  `(restart required)`.** Nothing in `frp-server`/`frps` reads
+  `ServerConfig::tls_enable` — a field with no counterpart in Go v0.71.0's
+  *server* config, which frp-rs's own `[transport.tls]` flatten inserts as `true`
+  when that Go-shaped section carries `force = true`, `certFile` or `keyFile`
+  (`frp-core/src/config/normalize.rs:792-810`) — so
+  neither a reload nor a restart can make a change to it take effect,
+  and the line claimed one. It now has the same disposition `auth.useEncryption`
+  already has (deliberately unreported). Not a parity gap: Go v0.71.0's
+  `ServerConfig` has no such field at all, its `TLS.Enable` is a *client* field,
+  and the server's own switch is `tls_only` (`TLS.Force`).
 - **A config-load failure now prints a bare line on stdout, and `frpc verify`
   prints its refusal there instead of on stderr — a user-visible output change,
   and Go parity on the stream and the shape of each line.** Go frp v0.71.0 does
