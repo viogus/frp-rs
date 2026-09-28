@@ -1429,20 +1429,41 @@ mod tests {
     /// `…OrDashboard` disjunction used to report a false "restart required".
     #[test]
     fn gated_listener_ports_carry_a_reader_gate_not_any() {
+        /// Move each of the three gated listener ports, where the field exists.
+        ///
+        /// A helper rather than three inline `#[cfg]` blocks in the test body so
+        /// the test's binding is **genuinely mutable in every configuration**:
+        /// `&mut cfg` is a mutable borrow even when the body below compiles to
+        /// nothing, so `RUSTFLAGS="-D warnings" cargo check -p frp-core
+        /// --no-default-features --all-targets`
+        /// (`.github/workflows/ci.yml` "Check frp-core tier test targets compile
+        /// (isolated, no features)") has no `unused_mut` to report in the micro
+        /// tier. That step is exactly where the inline version was caught: the
+        /// three assignments are cfg-gated, so with no features on the `let mut`
+        /// was unused and `-D warnings` made it an error. No `#[allow]` is
+        /// needed, and the feature-gated arms below keep their pins.
+        ///
+        /// The parameter is `_cfg` because in the no-features configuration the
+        /// body is empty; the leading underscore is what keeps *that* from being
+        /// an `unused_variables` error, and the cfg'd arms still use it.
+        fn set_gated_ports(_cfg: &mut ServerConfig) {
+            #[cfg(feature = "kcp")]
+            {
+                _cfg.kcp_bind_port = 17001;
+            }
+            #[cfg(feature = "quic")]
+            {
+                _cfg.quic_bind_port = 17002;
+            }
+            #[cfg(feature = "websocket")]
+            {
+                _cfg.websocket_port = 17003;
+            }
+        }
+
         let old = base();
         let mut new = base();
-        #[cfg(feature = "kcp")]
-        {
-            new.kcp_bind_port = 17001;
-        }
-        #[cfg(feature = "quic")]
-        {
-            new.quic_bind_port = 17002;
-        }
-        #[cfg(feature = "websocket")]
-        {
-            new.websocket_port = 17003;
-        }
+        set_gated_ports(&mut new);
         let changes = old.restart_only_changes(&new);
         for c in &changes {
             assert!(
@@ -1463,5 +1484,16 @@ mod tests {
         assert!(changes
             .iter()
             .any(|c| c.name == "websocket_port" && c.reader == ServerReader::Websocket));
+
+        // In the micro tier none of the three fields exists, so every arm above
+        // is compiled out and the loop is empty. Anchor the test there rather
+        // than leaving it a no-op: the premise of this case is that the three
+        // ports were changed, and the only checkable consequence in a build where
+        // they do not exist is that no *other* field is invented.
+        #[cfg(not(any(feature = "kcp", feature = "quic", feature = "websocket")))]
+        assert!(
+            changes.is_empty(),
+            "no gated port exists in this build, so this case must report nothing: {changes:?}"
+        );
     }
 }
