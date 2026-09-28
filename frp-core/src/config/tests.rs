@@ -5993,27 +5993,42 @@ fn nested_web_server_tls_spellings_reach_the_accessor_in_both_modes() {
 
 /// Both spellings of one nested `[web_server.tls]` key in the same file: the
 /// canonical snake_case wins, and the loser does **not** survive under its own
-/// name at the parent level. It did before the mapping: `cert_file` (mapped to
-/// `tls_cert_file`) plus `certFile` (unmapped, left in the table and
-/// re-inserted) produced `web_server.certFile` beside `web_server.tls_cert_file`
-/// — and serde reports `duplicate field \`tls_cert_file\`` for that shape
-/// because `certFile` is an `alias` of the same field, so the config failed to
-/// load in **either** mode with a message about a field the user never wrote
-/// twice. The mapping now removes both spellings and keeps one.
+/// name at the parent level.
 ///
-/// Also covers the two camelCase-plus-snake pairs that share a destination
+/// **Corrected scope (fix round).** The first version of this comment claimed
+/// the base tree failed this shape with `duplicate field`, i.e. that the
+/// collision was a previously unrecorded pre-existing defect. **It was not.**
+/// Measured on base (`5717fa2`): `strict = false` returned the **camelCase**
+/// value (`tls_cert() == "/camel/cert.pem"` — `certFile` is mapped, the
+/// snake_case sibling was dropped as an unknown key) and `strict = true`
+/// reported `unknown field "web_server.cert_file"`. The `duplicate field`
+/// failure appears only in a **half-implemented mapping** — removing just the
+/// winning spelling and letting the loser fall through to the "anything else"
+/// re-insert at the end of `normalize_web_server_section` — which is what the
+/// first attempt did; both fix-round reviewers reproduced it independently as a
+/// scratch variant / mutant.
+///
+/// So this test pins a hazard of the mapping, not a base defect: it is what
+/// keeps a future edit to the removal loop from reintroducing the collision.
+/// (The *pre-existing* `duplicate field` shape is a different one — a
+/// **parent-level** `[web_server] certFile` beside a nested one — which base
+/// failed in both modes and the fix round closed; see
+/// `parent_level_alias_beside_nested_spelling_still_loads`.)
+///
+/// Also covers the three camelCase-plus-snake pairs that share a destination
 /// through the `MAPPED` table, so a future edit to that table cannot silently
 /// reintroduce the collision for `key_file` / `trusted_ca_file` /
 /// `server_name`.
 ///
-/// **What this models.** The strict loader on a real file (the non-strict arm
-/// is asserted too, since the failure mode differs: an unknown-field drop
-/// versus a `duplicate field` error).
+/// **What this models.** Both loader modes on a real file with all four pairs
+/// written twice.
 ///
 /// **What it does not cover.** Which of the two spellings a user *meant* — the
 /// choice (snake_case) is a decision recorded on
-/// `normalize_web_server_section`, not a measurement; and YAML, where duplicate
-/// or aliased keys behave differently in the parser itself.
+/// `normalize_web_server_section`, not a measurement; the base-tree behaviour,
+/// which this test would pass through if the mapping were removed entirely (the
+/// snake spelling would then be an unknown key, not a duplicate); and YAML,
+/// where duplicate or aliased keys behave differently in the parser itself.
 #[test]
 fn both_spellings_of_one_nested_key_do_not_collide() {
     let dir = tempfile::tempdir().unwrap();
@@ -6167,6 +6182,30 @@ fn nested_web_server_tls_enable_is_accepted_and_inert_in_both_modes() {
     }
 }
 
+/// A genuinely unknown key inside `[web_server.tls]` is still refused, and the
+/// path it names is the only one the hoist can produce: the hoist re-inserts an
+/// unmapped key at the **parent** level with its own name, so the error reads
+/// `web_server.bogus_key` while the user wrote `web_server.tls.bogus_key`.
+///
+/// **This is the residue of the defect, stated rather than papered over** — and
+/// it is also the one test here with **no discriminating power for this change**:
+/// it passes on the base tree (`5717fa2`) and on the fixed tree, because
+/// `bogus_key` was never mapped and the message never changed. What it pins is
+/// that the message keeps naming the parent-level path (and that no *mapped*
+/// spelling appears as an unknown field), so a future change to the hoist cannot
+/// quietly drop the diagnostic or rename what it points at. Naming
+/// `web_server.tls.bogus_key` would need `check_strict` to see the
+/// pre-removal shape, which is a change to the strict walker's input, not to
+/// this mapping; the residue is recorded in the `TODO.md` ledger entry for this
+/// item rather than filed as its own.
+///
+/// **What this models.** Both loader modes on a real file whose only nested key
+/// is unknown.
+///
+/// **What it does not cover.** The `did you mean` suggestion for a *typo* of a
+/// mapped spelling (e.g. `cert_fil`): the suggestion list is the parent-level
+/// key set, so it can suggest `certFile` / `tls_cert_file`, never `cert_file`.
+/// Not pinned here because that heuristic is best-effort everywhere.
 #[test]
 fn unknown_nested_web_server_tls_key_still_names_a_parent_level_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -6194,6 +6233,266 @@ fn unknown_nested_web_server_tls_key_still_names_a_parent_level_path() {
     // — the same shape as every other unknown key (`check_strict`'s job), and
     // unlike the pre-fix `cert_file` case, whose *value* was lost.
     load_server_config(p, false).unwrap();
+}
+
+/// A **parent-level** serde alias beside the nested spelling of the same value
+/// must still load, with the nested value winning.
+///
+/// `WebServerConfig::tls_cert_file` (and the other three) carry
+/// `#[serde(alias = "certFile")]`, so `[web_server] certFile = "…"` and a hoisted
+/// `web_server.tls_cert_file` are the *same field* to serde. The hoist's
+/// `insert` used to leave the parent alias in place, and the pair then failed to
+/// deserialize in **both** loader modes:
+///
+/// ```text
+/// config validation error: duplicate field `tls_cert_file`
+/// ```
+///
+/// The base tree loaded exactly this shape under `strict = false` (the reload
+/// path's mode) with the **flat** value, so that was a new refused start, not a
+/// pre-existing defect — for all four destinations, TOML and YAML, server and
+/// client (probe kept at `/tmp/wstls-f1/`, `s01`–`s05`, `s07`, `s12`, `s13`,
+/// `c01`–`c02`; before/after in `/tmp/wstls-report.md`). Base *did* already fail
+/// the `[web_server] certFile` + `[web_server.tls] certFile` shape with the same
+/// duplicate (probe `s07`, both modes); the fix closes that too.
+///
+/// The hoist now removes the parent-level **alias** spelling before inserting,
+/// which is what these rows pin. The parent-level *snake* spelling is a
+/// different case and is deliberately left alone — see
+/// `parent_level_snake_spelling_is_still_reported_in_strict_mode`.
+///
+/// **What this models.** The five F1 shapes (each destination alone, then all
+/// four together), the both-spellings-nested and alias-plus-nested-camel
+/// pre-existing duplicates, a YAML alias+nested pair, and a **control** with the
+/// parent alias and no nested table — in both loader modes, server and client.
+///
+/// **What it does not cover.** Go, which has no snake_case spelling to confuse
+/// this with (its own `certFile` alias does not exist; the key *is*
+/// `certFile`); and the mixed `[webServer]` / `[web_server]` section pair, whose
+/// pre-existing whole-table discard is qualified on
+/// `normalize_web_server_section` and filed in `TODO.md`.
+#[test]
+fn parent_level_alias_beside_nested_spelling_still_loads() {
+    const HEADER: &str = "bind_port = 7000\ntoken = \"t\"\n";
+    const WS: &str = "[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n";
+
+    // (name, parent-level alias line(s), nested table, expected cert/key/ca/sn)
+    type Case<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        (&'a str, &'a str, &'a str, &'a str),
+    );
+    let nested_all = "[web_server.tls]\ncert_file = \"/nested/cert.pem\"\n\
+                      key_file = \"/nested/key.pem\"\ntrusted_ca_file = \"/nested/ca.pem\"\n\
+                      server_name = \"nested.example.com\"\n";
+    let cases: [Case; 7] = [
+        (
+            "parent certFile",
+            "certFile = \"/parent/cert.pem\"\n",
+            "[web_server.tls]\ncert_file = \"/nested/cert.pem\"\n",
+            ("/nested/cert.pem", "", "", ""),
+        ),
+        (
+            "parent keyFile",
+            "keyFile = \"/parent/key.pem\"\n",
+            "[web_server.tls]\nkey_file = \"/nested/key.pem\"\n",
+            ("", "/nested/key.pem", "", ""),
+        ),
+        (
+            "parent trustedCaFile",
+            "trustedCaFile = \"/parent/ca.pem\"\n",
+            "[web_server.tls]\ntrusted_ca_file = \"/nested/ca.pem\"\n",
+            ("", "", "/nested/ca.pem", ""),
+        ),
+        (
+            "parent serverName",
+            "serverName = \"parent.example.com\"\n",
+            "[web_server.tls]\nserver_name = \"nested.example.com\"\n",
+            ("", "", "", "nested.example.com"),
+        ),
+        (
+            "all four parent aliases",
+            "certFile = \"/parent/cert.pem\"\nkeyFile = \"/parent/key.pem\"\n\
+             trustedCaFile = \"/parent/ca.pem\"\nserverName = \"parent.example.com\"\n",
+            nested_all,
+            (
+                "/nested/cert.pem",
+                "/nested/key.pem",
+                "/nested/ca.pem",
+                "nested.example.com",
+            ),
+        ),
+        (
+            // The pre-existing duplicate: base failed this in both modes.
+            "parent certFile + nested certFile",
+            "certFile = \"/parent/cert.pem\"\n",
+            "[web_server.tls]\ncertFile = \"/nested/cert.pem\"\n",
+            ("/nested/cert.pem", "", "", ""),
+        ),
+        (
+            // The both-spellings-nested shape from the previous round, now with
+            // a parent alias on top.
+            "parent certFile + both nested spellings",
+            "certFile = \"/parent/cert.pem\"\n",
+            "[web_server.tls]\ncert_file = \"/snake/cert.pem\"\ncertFile = \"/camel/cert.pem\"\n",
+            ("/snake/cert.pem", "", "", ""),
+        ),
+    ];
+
+    for (name, parent, nested, want) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frps.toml");
+        std::fs::write(&path, format!("{HEADER}{WS}{parent}{nested}")).unwrap();
+        let p = path.to_str().unwrap();
+        for strict in [false, true] {
+            let cfg = load_server_config(p, strict).unwrap_or_else(|e| {
+                panic!(
+                    "{name}, strict={strict}: must load (the base tree loaded it non-strict):\n{e}"
+                )
+            });
+            let ws = &cfg.web_server;
+            assert_eq!(
+                (
+                    ws.tls_cert(),
+                    ws.tls_key(),
+                    ws.tls_ca_file.as_str(),
+                    ws.tls_server_name.as_str()
+                ),
+                want,
+                "{name}, strict={strict}: the nested value wins over the parent alias",
+            );
+        }
+    }
+
+    // Control: the parent alias with **no** nested table keeps working.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.toml");
+    std::fs::write(
+        &path,
+        format!("{HEADER}{WS}certFile = \"/flat/cert.pem\"\nkeyFile = \"/flat/key.pem\"\n"),
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_server_config(path.to_str().unwrap(), strict).unwrap();
+        assert_eq!(
+            cfg.web_server.tls_cert(),
+            "/flat/cert.pem",
+            "strict={strict}"
+        );
+        assert_eq!(cfg.web_server.tls_key(), "/flat/key.pem", "strict={strict}");
+    }
+
+    // YAML: the same shape under Go's section name.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.yaml");
+    std::fs::write(
+        &path,
+        "bind_port: 7000\ntoken: \"t\"\nwebServer:\n  addr: \"127.0.0.1\"\n  port: 7500\n\
+         \x20 certFile: \"/parent/cert.pem\"\n  tls:\n    cert_file: \"/nested/cert.pem\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_server_config(path.to_str().unwrap(), strict).unwrap();
+        assert_eq!(
+            cfg.web_server.tls_cert(),
+            "/nested/cert.pem",
+            "strict={strict}"
+        );
+    }
+
+    // Client: same normalizer, same shape (frpc's admin TLS).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.toml");
+    std::fs::write(
+        &path,
+        "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\n\
+         [web_server]\naddr = \"127.0.0.1\"\nport = 7400\ncertFile = \"/parent/cert.pem\"\n\
+         keyFile = \"/parent/key.pem\"\n\
+         [web_server.tls]\ncert_file = \"/nested/cert.pem\"\nkey_file = \"/nested/key.pem\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict).unwrap();
+        assert_eq!(
+            cfg.web_server.tls_cert(),
+            "/nested/cert.pem",
+            "strict={strict}"
+        );
+        assert_eq!(
+            cfg.web_server.tls_key(),
+            "/nested/key.pem",
+            "strict={strict}"
+        );
+    }
+}
+
+/// A parent-level **snake** spelling (`[web_server] cert_file`) is not a field
+/// and must keep being reported as an unknown key by strict mode — the hoist
+/// removes only the parent-level `alias`, not every spelling of the group.
+///
+/// This is the narrower half of the F1 fix, and it is deliberate: removing
+/// `cert_file` from the parent as well would silence a legitimate diagnostic for
+/// a user who wrote the snake spelling where only `certFile`/`tls_cert_file`
+/// exist, and it would also remove a *pre-existing* strict-mode report that the
+/// mapping fix has no business touching.
+///
+/// **Two halves, two different powers** (measured against base `5717fa2`, see
+/// `/tmp/wstls-falsify-final.txt`): the strict-mode half has **no
+/// discriminating power** — base reports the same `unknown field
+/// "web_server.cert_file"` path, because the nested snake spelling was dropped
+/// rather than mapped — while the non-strict half **does** fail on base for the
+/// `parent snake + nested snake` shape (`tls_cert() == ""` there, because the
+/// nested value was dropped; `"/nested/cert.pem"` after the mapping).
+///
+/// **What this models.** Three shapes in both modes: parent snake + nested Go
+/// camelCase, parent snake + nested snake, and parent snake alone.
+///
+/// **What it does not cover.** The message wording for a *typo* of a mapped
+/// spelling (the `did you mean` list is parent-level, so it can suggest
+/// `certFile` but never `cert_file`), and the same shape in YAML/JSON/INI.
+#[test]
+fn parent_level_snake_spelling_is_still_reported_in_strict_mode() {
+    const HEADER: &str = "bind_port = 7000\ntoken = \"t\"\n";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.toml");
+    let p = path.to_str().unwrap();
+
+    let shapes = [
+        (
+            "parent snake + nested camel",
+            "[web_server.tls]\ncertFile = \"/nested/cert.pem\"\n",
+        ),
+        (
+            "parent snake + nested snake",
+            "[web_server.tls]\ncert_file = \"/nested/cert.pem\"\n",
+        ),
+        ("parent snake only", ""),
+    ];
+    for (name, nested) in shapes {
+        std::fs::write(
+            &path,
+            format!(
+                "{HEADER}[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+                 cert_file = \"/parent/cert.pem\"\n{nested}"
+            ),
+        )
+        .unwrap();
+        let err = format!("{}", load_server_config(p, true).unwrap_err());
+        assert!(
+            err.contains("unknown field \"web_server.cert_file\""),
+            "{name}: the parent-level snake spelling is still an unknown key: {err}"
+        );
+        // Non-strict keeps the old drop, and the nested value (when there is
+        // one) still reaches the accessor.
+        let cfg = load_server_config(p, false).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let want = if nested.is_empty() {
+            ""
+        } else {
+            "/nested/cert.pem"
+        };
+        assert_eq!(cfg.web_server.tls_cert(), want, "{name}");
+    }
 }
 
 /// Load a Go legacy INI config through the real INI parser + normalize

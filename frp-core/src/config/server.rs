@@ -931,12 +931,18 @@ pub struct ObservabilityConfig {
 /// [`WebServerConfig::tls_cert`]/[`WebServerConfig::tls_key`], which answer from
 /// the flat field whenever the nested one is empty — always).
 ///
-/// **Precedence: the nested values win.** When both a nested key and its flat
-/// counterpart are set, the nested one overwrites the flat one — in either table
-/// order — so the flat key is inert and no warning is emitted. See
-/// `normalize_web_server_section` for why, and for what happens to
-/// `tls.enable`: it is accepted and **ignored in both loader modes** (nothing
-/// reads it; the dashboard TLS is driven by a non-empty cert/key pair).
+/// **Precedence: the nested values win** — over a flat key **in the same
+/// section**, in either key order, and over the flat field's parent-level serde
+/// `alias` (`certFile`, …) too. Two measured limits on that sentence (both filed
+/// in `TODO.md`): a file defining both `[webServer]` and `[web_server]` keeps
+/// only the snake_case section (the camelCase table, nested `tls` included, is
+/// discarded whole, so the flat value wins there), and a `.ini` file cannot
+/// express the nested section at all (its reader stores `[webServer.tls]` as a
+/// literal top-level key). See `normalize_web_server_section` for the mechanism
+/// and for what happens to `tls.enable`: it is accepted, **ignored in both
+/// loader modes**, and warned about on load (nothing reads it; the dashboard TLS
+/// is driven by a non-empty cert/key pair; Go refuses the key outright, so
+/// accepting it is a deliberate divergence rather than parity).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WebServerTlsConfig {
     #[serde(default)]
@@ -982,10 +988,12 @@ pub struct WebServerConfig {
     pub tls_key_file: String,
     /// Go frp v0.71.0 nested `webServer.tls` section. Takes precedence over the
     /// flat `tls_cert_file` / `tls_key_file` fields **as a source of values**:
-    /// the loader hoists the nested keys onto the flat fields, overwriting any
-    /// flat key that is already set, so the effective answer is the nested one
-    /// in either table order. This struct itself is always default after a load
-    /// — see [`WebServerTlsConfig`].
+    /// the loader hoists the nested keys onto the flat fields (removing any flat
+    /// key that is already set, including that field's parent-level `certFile`
+    /// alias), so the effective answer is the nested one in either key order
+    /// **within the same section** — see [`WebServerTlsConfig`] for the two
+    /// measured limits on that. This struct itself is always default after a
+    /// load.
     #[serde(default, rename = "tls")]
     pub tls: WebServerTlsConfig,
     /// TLS CA file for the dashboard/admin HTTPS server (Go
