@@ -23,10 +23,10 @@ Complete field reference for frp-rs `frps.toml` and `frpc.toml`. Every field map
 | `sudp_port` | `u16` | `0` | `sudpPort` | Shared UDP port for all SUDP proxies. When > 0, SUDP proxies share this port instead of allocating individual ports. |
 | `sub_domain_host` | `string` | `""` | `subDomainHost` | Base domain for sub-domain proxy routing (e.g. `"example.com"`). A proxy with `subdomain = "web"` will be reachable at `web.example.com`. |
 | `tls_enable` | `bool` | `false` | `—` (no Go server field; Go's `TLS.Enable` is client-only, `transport.tls.enable`) | Declared by frp-rs's own `ServerConfig` for historical reasons: it has no counterpart in Go v0.71.0's server config at all, and the one place frp-rs's own code sets it from a Go-shaped input is the `[transport.tls]` flatten, which inserts it as `true` when that section carries `force = true`, `certFile` or `keyFile` (`frp-core/src/config/normalize.rs:792-810`) — but **read by nothing** on the server: the field is inert, so the reload neither applies it nor names it as restart-required, and a restart cannot make it take effect. The real server switch is `tls_only` below (Go's server-side `TLS.Force`); the TLS acceptor is built from `tls_cert_file` / `tls_key_file`. |
-| `tls_only` | `bool` | `false` | `tlsOnly` | When true, the main `bind_port` only accepts TLS connections. Plain TCP and WebSocket upgrades are rejected. Clients must also have `tls_enable = true`. |
-| `tls_cert_file` | `string` | `""` | `tlsCertFile` | Path to TLS certificate PEM file. |
-| `tls_key_file` | `string` | `""` | `tlsKeyFile` | Path to TLS private key PEM file. |
-| `tls_ca_file` | `string` | `""` | `tlsCaFile` | Path to CA certificate PEM file for mutual TLS client verification. Empty = no mTLS. |
+| `tls_only` | `bool` | `false` | `transport.tls.force` | When true, the main `bind_port` only accepts TLS connections. Plain TCP and WebSocket upgrades are rejected. Clients must also have `tls_enable = true`. |
+| `tls_cert_file` | `string` | `""` | `transport.tls.certFile` | Path to TLS certificate PEM file. |
+| `tls_key_file` | `string` | `""` | `transport.tls.keyFile` | Path to TLS private key PEM file. |
+| `tls_ca_file` | `string` | `""` | `transport.tls.trustedCaFile` | Path to CA certificate PEM file for mutual TLS client verification. Empty = no mTLS. Also accepted flat as `tls_trusted_ca_file` (the Go legacy spelling frp-rs renames at load). |
 | `allow_port_start` | `u16` | `1` | `allowPorts` (start) | Start of auto-assigned port range. Used when `allow_ports` is empty. |
 | `allow_port_end` | `u16` | `65535` | `allowPorts` (end) | End of auto-assigned port range (inclusive). Used when `allow_ports` is empty. |
 | `allow_ports` | `string` | `""` | `allowPorts` | Comma-separated port ranges, e.g. `"10000-20000,30000-40000"`. Each range is inclusive on both ends. When non-empty, takes precedence over `allow_port_start`/`allow_port_end`. |
@@ -170,7 +170,7 @@ The server config loader accepts both Rust (snake_case) and Go frp (camelCase) k
 - Flat `auth_method`, `auth_token`, `log_file`, `log_level`, `log_max_days`, `web_server_*` keys are automatically nested into the correct subsections.
 - `sshTunnelGateway` (camelCase) is normalized to `ssh_tunnel_gateway`.
 - `token` at top level is automatically copied into `[auth]`.
-- Exception: `tls_enable`, `tls_cert_file`, `tls_key_file`, `tls_ca_file` have no camelCase aliases — use the snake_case names.
+- Exception: `tls_enable`, `tls_only`, `tls_cert_file`, `tls_key_file` and `tls_ca_file` have no camelCase aliases — use the snake_case names. The four Go-shaped TLS fields (`tls_only`, `tls_cert_file`, `tls_key_file`, `tls_ca_file`) are carried by the nested `[transport.tls]` section instead (`force` / `certFile` / `keyFile` / `trustedCaFile`, `frp-core/src/config/normalize.rs:792-810`). Two flat aliases do work and are not covered by this exception: `tls_trusted_ca_file` (→ `tls_ca_file`) and `tlsServerName` (→ `tls_server_name`) (`frp-core/src/config/server.rs:48-51`).
 
 ### Server Config Reload (SIGUSR1)
 
