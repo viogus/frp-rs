@@ -2287,7 +2287,9 @@ impl Service {
     /// not applied**: see [`note_auth_restart_changes`] and the invariant the
     /// apply block below maintains. `auth.useEncryption` is the one exception to
     /// even *that*: nothing on the server reads it, so it is neither applied nor
-    /// reported (see the same function).
+    /// reported (see the same function). `ServerConfig.tls_enable` has the same
+    /// disposition for the same reason: no reader in `frp-server`/`frps`, so it
+    /// is neither applied nor reported.
     ///
     /// NOT reloadable — restart-only (checked once in `AppState::new`, never
     /// re-applied here): `max_ports_per_client`, `max_conns_per_proxy`,
@@ -2439,12 +2441,16 @@ impl Service {
             "bind_addr",
             &mut changes,
         );
-        note_restart_change(
-            &self.cfg.tls_enable,
-            &new_cfg.tls_enable,
-            "tls_enable",
-            &mut changes,
-        );
+        // `ServerConfig.tls_enable` is deliberately **not** compared here: no
+        // code in `frp-server`/`frps` reads it (measured: `grep -rn tls_enable
+        // frp-server/src frps/src` finds no read — the remaining hits are the
+        // `[web_server.tls] enable` warning helper, a different field, and one
+        // comment), so neither a reload nor a restart can make a change to it
+        // take effect and a "restart required" line would be false. The same
+        // disposition `auth.useEncryption` has in
+        // [`note_auth_restart_changes`]; pinned by
+        // `inert_settings_are_not_reported` in
+        // `frp-server/tests/server_reload_restart_only.rs`.
         // TLS certificate hot-reload: if cert/key/ca paths changed, rebuild
         // acceptor and swap atomically. Existing connections keep old config;
         // new connections pick up the new cert immediately.
