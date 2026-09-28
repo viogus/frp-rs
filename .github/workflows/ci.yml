@@ -1085,13 +1085,32 @@ jobs:
         # because two files cite its name (`frp-core/src/config/restart_only.rs`,
         # `TODO.md`).
         #
-        # NOT covered: every other `-p frp-core` feature combination. One other
-        # measured-red configuration exists — `--features websocket` (tls off)
-        # was red on the WSS arm's `needless_return` at `005ddd8` and is fixed in
-        # the same change — but neither it nor `--features kcp` nor any other
-        # combination is gated here; thirteen were measured clean after the fix
-        # and twelve of them are ungated.
+        # NOT covered: every other `-p frp-core` feature combination. The one
+        # other measured-red configuration (`--features websocket`, tls off — red
+        # on the WSS arm's `needless_return` at `005ddd8`) is gated by the step
+        # directly below. `--features kcp`, `tls`, `compression`,
+        # `kcp,compression`, `websocket,compression`, `websocket,kcp`, `tcp-mux`,
+        # `stun`, `vnet`, `oidc` and `kcp,websocket,tcp-mux,stun` were measured
+        # clean after the fix (thirteen configurations in all) but stay ungated,
+        # and the 2^N intra-crate space is not enumerated.
         run: cargo clippy -p frp-core --no-default-features --all-targets
+        env:
+          RUSTFLAGS: "-D warnings"
+      - name: Lint frp-core tier test targets with websocket (isolated, no features)
+        # The WSS refusal site (frp-core/src/transport/mod.rs, the arm behind
+        # `TransportProtocol::Wss`) sits behind `#[cfg(feature = "websocket")]`,
+        # so the step above compiles it out — the same class of gap this item is
+        # about, one feature flag away. Measured at `005ddd8`:
+        #   RUSTFLAGS="-D warnings" cargo clippy -p frp-core \
+        #     --no-default-features --features websocket --all-targets
+        # exited 101 on that arm's `clippy::needless_return` (fixed in the same
+        # change) and exits 0 after it. A `return` reintroduced there fails THIS
+        # step, not the one above, which is why it is a sibling step rather than
+        # a second command in one step: the step name is the failure attribution.
+        #
+        # NOT covered: the same residue as the step above — every other
+        # `-p frp-core` feature combination, `--features kcp` included.
+        run: cargo clippy -p frp-core --no-default-features --features websocket --all-targets
         env:
           RUSTFLAGS: "-D warnings"
       - name: Check the four measured-red intra-crate feature combinations (curated list, NOT the full 2^N space)

@@ -1540,8 +1540,11 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                     // value) — as a plain discarded statement the `if` body
                     // becomes `()` and E0308s against the `else` arm. Unlike
                     // the TCP and WSS arms, `clippy::needless_return` does not
-                    // fire on this one (both branches return), measured over
-                    // thirteen `-p frp-core` feature configurations.
+                    // fire on this one — measured over thirteen `-p frp-core`
+                    // feature configurations. The cause of that suppression was
+                    // NOT isolated (a synthetic `if c { return Err(..) } else
+                    // { return Ok(0) }` arm *is* linted), so read the
+                    // measurement, not a reason.
                     return Err(crate::Error::Transport(
                         "TLS support not compiled (enable the 'tls' feature)".into(),
                     ));
@@ -1646,17 +1649,21 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                     // arm returns `Err` instead of falling through to the
                     // `else` arm's plaintext stream.
                     //
-                    // Measured, not assumed (scratch copies, `-D warnings`):
-                    // deleting the `return` that used to be here keeps this
-                    // configuration compiling (`--features kcp` and
-                    // `--features websocket`, tls off) and keeps returning this
-                    // `Err` — pinned at runtime by
-                    // `dial_server_refuses_tls_when_tls_is_not_compiled`. What
-                    // IS load-bearing is the tail position: as a
-                    // `;`-terminated *statement* the value is discarded, the
-                    // `if` body becomes `()`, and the `if`/`else` arms stop
-                    // unifying — E0308, the failure the old "missing `return`"
-                    // wording described.
+                    // Measured, not assumed (scratch copies, `-D warnings`).
+                    // The `return` keyword was never the load-bearing part —
+                    // the tail position is:
+                    //   * `return` AND its trailing `;` both removed, leaving
+                    //     `Err(..)` as this block's tail expression: rc 0 in
+                    //     `--features kcp` and `--features websocket` (tls off),
+                    //     and the same `Err` is still what the arm returns —
+                    //     pinned at runtime by
+                    //     `dial_server_refuses_tls_when_tls_is_not_compiled`;
+                    //   * only the keyword removed, `;` kept: the value is
+                    //     discarded, this block becomes `()`, and the `if`/`else`
+                    //     arms stop unifying — `error[E0308]` at this line, in
+                    //     the bare configuration and in `--features kcp`. That is
+                    //     the failure the old "missing `return`" wording
+                    //     described, and it is about the `;`, not the keyword.
                     Err(crate::Error::Transport(
                         "TLS support not compiled (enable the 'tls' feature)".into(),
                     ))
@@ -2510,7 +2517,8 @@ mod tests {
                 .await
                 .expect_err("a WSS dial must fail when `tls` is off");
             assert!(
-                err.to_string().contains("TLS support not compiled"),
+                err.to_string()
+                    .contains("TLS support not compiled (enable the 'tls' feature for WSS)"),
                 "expected the tls-off WSS refusal, got: {err}"
             );
         }
