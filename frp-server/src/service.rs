@@ -2443,9 +2443,10 @@ impl Service {
         );
         // `ServerConfig.tls_enable` is deliberately **not** compared here: no
         // code in `frp-server`/`frps` reads it (measured: `grep -rn tls_enable
-        // frp-server/src frps/src` finds no read — the remaining hits are the
-        // `[web_server.tls] enable` warning helper, a different field, and one
-        // comment), so neither a reload nor a restart can make a change to it
+        // frp-server/src frps/src` returns seven hits — three
+        // `presence.warn_inert_web_server_tls_enable()` calls and four comment
+        // lines, zero field reads), so neither a reload nor a restart can make
+        // a change to it
         // take effect and a "restart required" line would be false. The same
         // disposition `auth.useEncryption` has in
         // [`note_auth_restart_changes`]; pinned by
