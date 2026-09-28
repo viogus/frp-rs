@@ -178,6 +178,27 @@ User-facing release notes for frp-rs.
   needed, and **applies nothing** from the new config. Unchanged `[auth]` — by
   content, including `method = ""` vs `method = "token"` — reloads exactly as
   before.
+- **The server's `SIGUSR1` reload now reports an `auth.method` change and never
+  installs a method it cannot serve.** `frps`'s reload compared the token and
+  the OIDC fields but never `auth.method`, so flipping `method = "token"` to
+  `"oidc"` with the OIDC fields already present **and unchanged** answered
+  `config reloaded: no changes detected` while the file on disk said `oidc`; with
+  a token change alongside it, it printed `auth token updated` and committed the
+  whole freshly parsed `[auth]` section, leaving the live `auth_cfg.method` on
+  `oidc` while the OIDC verifier — built once, at startup — was still absent.
+  Logins then took the token path and failed closed (`OIDC auth requires
+  server-side verifier (not configured)`), so the server and its config
+  disagreed. A reload now applies exactly the credential (`auth.token` /
+  `auth.tokenSource`) and `auth.additionalAuthScopes`; every other `[auth]`
+  difference is **reported** as restart-required — `auth.method: token -> oidc
+  (restart required)`, `OIDC settings changed (restart required)`,
+  `auth.authenticationTimeout: 90 -> 7 (restart required)`, … — and never
+  committed, so the live `auth.method` is always the method the running verifier
+  was built for. The reported field list is a compiler-enforced destructure of
+  `AuthServerConfig`, which also closes fields the old comparison never read at
+  all (`auth.tokenSource`, `authenticationTimeout`, `tokenAuthTimeout`,
+  `useEncryption`, `oidcSkipNbf`, `oidcProxyURL`, `oidcTokenEndpointURL`): a
+  change to any of them used to be `no changes detected`.
 - **A config-load failure now prints a bare line on stdout, and `frpc verify`
   prints its refusal there instead of on stderr — a user-visible output change,
   and Go parity on the stream and the shape of each line.** Go frp v0.71.0 does

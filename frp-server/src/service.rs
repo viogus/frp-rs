@@ -11,7 +11,7 @@ use tracing::{error, info, instrument, warn};
 #[cfg(feature = "oidc")]
 use frp_core::auth::OidcVerifier;
 use frp_core::auth::{AuthConfig, AuthMethod};
-use frp_core::config::ServerConfig;
+use frp_core::config::{AuthServerConfig, ServerConfig};
 use frp_core::format_socket_addr;
 use frp_core::init_error::ConstructError;
 #[cfg(feature = "websocket")]
@@ -109,6 +109,25 @@ fn build_auth_config(
     })
 }
 
+/// Whether two `auth.tokenSource` settings differ.
+///
+/// `frp_core::config::ValueSource` derives `Debug` but not `PartialEq`; the
+/// client half of this fix compares its own token source the same way, by
+/// `format!("{…:?}")` (`frp-client/src/reload.rs`). Both sides are the same
+/// struct type here, so this is a faithful field-for-field comparison; a
+/// false "differs" would only re-apply the credential on a reload that did not
+/// change it (reported as `auth token updated`), never the reverse.
+fn value_source_differs(
+    old: &Option<frp_core::config::ValueSource>,
+    new: &Option<frp_core::config::ValueSource>,
+) -> bool {
+    match (old, new) {
+        (None, None) => false,
+        (Some(o), Some(n)) => format!("{o:?}") != format!("{n:?}"),
+        _ => true,
+    }
+}
+
 /// Resolve the allow-ports ranges from a server config: explicit `allow_ports`
 /// spec if present, otherwise the `[allow_port_start, allow_port_end]` range.
 /// Shared by `Service::new()` and `Service::reload()`.
@@ -158,6 +177,143 @@ fn note_restart_change<T: PartialEq + std::fmt::Display>(
     if *old != *new {
         changes.push(format!("{name}: {old} -> {new} (restart required)"));
     }
+}
+
+/// Record every `[auth]` difference a SIGUSR1 reload can only **report**.
+///
+/// **What this models.** `reload()` applies exactly three `[auth]` fields in
+/// place — `auth.token`, `auth.tokenSource` and `auth.additionalAuthScopes`
+/// (see the apply block there); they are compared against the *live*
+/// `ReloadableState` and are ignored here (the `_`-prefixed bindings below).
+/// Everything else in `[auth]` is restart-only and is reported here against
+/// `old`, the running config.
+///
+/// **What keeps it complete.** Both `let AuthServerConfig { … }` patterns
+/// below name every field with **no `..`**, so adding (or renaming) a field of
+/// [`AuthServerConfig`] makes this function fail to compile — E0027, "pattern
+/// does not mention the field" — until the new field is named here and
+/// classified. A list of named reads (`old.x != new.x`) has no such property:
+/// the client half of this fix measured exactly that on the earlier shape, by
+/// adding a probe field to its `[auth]` struct — `cargo check` stayed green
+/// and the completeness test passed, i.e. the next `[auth]` field would have
+/// been silently accepted as `no changes detected` again
+/// (`frp-client/src/reload.rs`, `auth_field_changes`). The `_` names keep the
+/// "bound but never used" warning off; they must stay in the pattern.
+///
+/// **What it does not cover.** It compares only the `AuthServerConfig` shape
+/// (what `self.cfg.auth` holds), which is not field-for-field the runtime
+/// `AuthConfig` — that one carries `additional_data`, which has no config
+/// counterpart and therefore cannot differ between two loads of the file, and
+/// no `oidc_token_endpoint`. A runtime field with no config counterpart can
+/// never be a *reload* difference. It also cannot see a difference the loader
+/// normalises away before `reload()` compares (an absent `[auth] method` and
+/// `method = ""` are both completed to `"token"`), nor an `[auth]` field that
+/// `build_auth_config` never reads at all. It panics on nothing: every value
+/// pushed through `note_restart_change` is `PartialEq + Display`, and the OIDC
+/// group is a fixed string.
+fn note_auth_restart_changes(
+    old: &AuthServerConfig,
+    new: &AuthServerConfig,
+    changes: &mut Vec<String>,
+) {
+    let AuthServerConfig {
+        method: old_method,
+        // Applied in place by `reload()` — reported there, against live state.
+        token: _old_token,
+        token_source: _old_token_source,
+        oidc_issuer: old_oidc_issuer,
+        oidc_audience: old_oidc_audience,
+        oidc_token_endpoint: old_oidc_token_endpoint,
+        oidc_skip_expiry: old_oidc_skip_expiry,
+        oidc_skip_issuer: old_oidc_skip_issuer,
+        oidc_skip_nbf: old_oidc_skip_nbf,
+        oidc_skip_audience: old_oidc_skip_audience,
+        oidc_additional_audience: old_oidc_additional_audience,
+        oidc_tls_trusted_ca_file: old_oidc_tls_trusted_ca_file,
+        oidc_proxy_url: old_oidc_proxy_url,
+        // Applied in place by `reload()` — see above.
+        additional_auth_scopes: _old_additional_auth_scopes,
+        authentication_timeout: old_authentication_timeout,
+        token_auth_timeout: old_token_auth_timeout,
+        use_encryption: old_use_encryption,
+    } = old;
+    let AuthServerConfig {
+        method: new_method,
+        token: _new_token,
+        token_source: _new_token_source,
+        oidc_issuer: new_oidc_issuer,
+        oidc_audience: new_oidc_audience,
+        oidc_token_endpoint: new_oidc_token_endpoint,
+        oidc_skip_expiry: new_oidc_skip_expiry,
+        oidc_skip_issuer: new_oidc_skip_issuer,
+        oidc_skip_nbf: new_oidc_skip_nbf,
+        oidc_skip_audience: new_oidc_skip_audience,
+        oidc_additional_audience: new_oidc_additional_audience,
+        oidc_tls_trusted_ca_file: new_oidc_tls_trusted_ca_file,
+        oidc_proxy_url: new_oidc_proxy_url,
+        additional_auth_scopes: _new_additional_auth_scopes,
+        authentication_timeout: new_authentication_timeout,
+        token_auth_timeout: new_token_auth_timeout,
+        use_encryption: new_use_encryption,
+    } = new;
+
+    // `auth.method` picks which credential is authoritative, so it is the one
+    // restart-only field reported with its direction (`token -> oidc`): the
+    // pair is a closed, non-secret set, and "which method is actually live" is
+    // the question an operator asking about a reload is trying to answer.
+    // Values, not just the name — but only for this field; see the OIDC group
+    // below for why the rest are value-free.
+    note_restart_change(old_method, new_method, "auth.method", changes);
+
+    // The OIDC verifier is built once, in `Service::with_unsafe_features`,
+    // from exactly these fields (`OidcVerifier::new`): issuer, audience, the
+    // three skips it forwards, `oidc_additional_audience`, the CA file and the
+    // proxy URL. A change to any of them cannot reach the running verifier, so
+    // the whole group reports the one line this reload has always printed for
+    // it. `oidc_token_endpoint` is grouped here too: it is an `[auth]` OIDC
+    // setting that this arm did not compare at all before, and grouping it
+    // says "restart required" without claiming the verifier reads it.
+    //
+    // A fixed string, no values: `oidc_tls_trusted_ca_file` is a path and
+    // `oidc_proxy_url` may carry `user:pass@`, and this summary is logged and
+    // echoed back through the reload path — the client half of this fix uses
+    // the same rule ("names only, never a token or secret value",
+    // `frp-client/src/reload.rs`).
+    if old_oidc_issuer != new_oidc_issuer
+        || old_oidc_audience != new_oidc_audience
+        || old_oidc_token_endpoint != new_oidc_token_endpoint
+        || old_oidc_skip_expiry != new_oidc_skip_expiry
+        || old_oidc_skip_issuer != new_oidc_skip_issuer
+        || old_oidc_skip_nbf != new_oidc_skip_nbf
+        || old_oidc_skip_audience != new_oidc_skip_audience
+        || old_oidc_additional_audience != new_oidc_additional_audience
+        || old_oidc_tls_trusted_ca_file != new_oidc_tls_trusted_ca_file
+        || old_oidc_proxy_url != new_oidc_proxy_url
+    {
+        changes.push("OIDC settings changed (restart required)".to_string());
+    }
+
+    // The remaining `[auth]` scalars. They are read from state that a reload
+    // does not re-key, so a file change to them is reported and not applied —
+    // all three were silently ignored (never compared) before this arm.
+    note_restart_change(
+        old_authentication_timeout,
+        new_authentication_timeout,
+        "auth.authenticationTimeout",
+        changes,
+    );
+    note_restart_change(
+        old_token_auth_timeout,
+        new_token_auth_timeout,
+        "auth.tokenAuthTimeout",
+        changes,
+    );
+    note_restart_change(
+        old_use_encryption,
+        new_use_encryption,
+        "auth.useEncryption",
+        changes,
+    );
 }
 
 /// Spawn a boxed future with type erasure. Reduces binary size by
@@ -2029,9 +2185,14 @@ impl Service {
     }
 
     /// Reload configuration from the config file (SIGUSR1 handler).
-    /// Re-reads the TOML config and applies safe-to-reload settings
-    /// (allow_ports, auth token, encryption key, TLS certificates).
-    /// Returns a summary of changes, or an error if the config cannot be read.
+    /// Re-reads the TOML config and applies the safe-to-reload settings:
+    /// `allow_ports`, the `[auth]` credential (`auth.token` / `auth.tokenSource`),
+    /// `auth.additionalAuthScopes`, the bridge encryption key derived from that
+    /// credential, and TLS certificates.
+    ///
+    /// Everything else in `[auth]` — `auth.method` above all — is **reported,
+    /// not applied**: see [`note_auth_restart_changes`] and the invariant the
+    /// apply block below maintains.
     ///
     /// NOT reloadable — restart-only (checked once in `AppState::new`, never
     /// re-applied here): `max_ports_per_client`, `max_conns_per_proxy`,
@@ -2065,18 +2226,54 @@ impl Service {
                 ));
                 r.allow_ports = Arc::new(new_allow_ports);
             }
-            if r.auth_cfg.token != new_auth_cfg.token {
-                changes.push("auth token updated".into());
-                r.auth_cfg = Arc::new(new_auth_cfg);
-                r.encryption_key = new_enc_key;
+
+            // `[auth]`: the `AuthConfig` that goes live is the **running** one
+            // with the reloadable fields replaced — never `new_auth_cfg`
+            // wholesale. Committing the freshly parsed struct is what let a
+            // reload install `method = Oidc` from the file while
+            // `state.oidc.verifier` was still `None` (built once, at startup,
+            // from the startup method), leaving the config and the running auth
+            // disagreeing. Rebuilding from the running value makes
+            // `r.auth_cfg.method` the method this process actually serves for
+            // the process's whole lifetime, so the login dispatch — which keys
+            // off `Option<verifier>`, not off the method
+            // (`frp-server/src/control/login.rs`) — cannot be handed a method
+            // whose verifier was never built. Everything not copied here is
+            // reported restart-required by `note_auth_restart_changes` below.
+            let mut live_auth = (*r.auth_cfg).clone();
+            let credential_changed = live_auth.token != new_auth_cfg.token
+                || value_source_differs(&live_auth.token_source, &new_auth_cfg.token_source);
+            if credential_changed {
+                live_auth.token = new_auth_cfg.token.clone();
+                live_auth.token_source = new_auth_cfg.token_source.clone();
             }
-            let new_scopes = &r.auth_cfg.additional_auth_scopes;
-            if r.additional_auth_scopes != *new_scopes {
+            // `additionalAuthScopes` is read live, per control connection and
+            // per scoped message, from the two places this keeps in step:
+            // `ReloadableState::additional_auth_scopes`
+            // (`frp-server/src/control/login.rs`) and
+            // `auth_cfg.additional_auth_scopes`
+            // (`frp-server/src/handlers/dispatch.rs`,
+            // `frp-server/src/control/proxy.rs`). The pre-fix comparison read
+            // the *new* value out of `r.auth_cfg` only when the token arm above
+            // had already replaced it, so a scopes-only change compared the old
+            // value against itself and was reported as `no changes detected`.
+            let scopes_changed = r.additional_auth_scopes != new_auth_cfg.additional_auth_scopes;
+            if scopes_changed {
                 changes.push(format!(
                     "additional_auth_scopes: {:?} -> {:?}",
-                    r.additional_auth_scopes, new_scopes
+                    r.additional_auth_scopes, new_auth_cfg.additional_auth_scopes
                 ));
-                r.additional_auth_scopes = new_scopes.clone();
+                live_auth.additional_auth_scopes = new_auth_cfg.additional_auth_scopes.clone();
+            }
+            if credential_changed {
+                changes.push("auth token updated".into());
+                r.encryption_key = new_enc_key;
+            }
+            if credential_changed || scopes_changed {
+                r.auth_cfg = Arc::new(live_auth);
+                // The mirror is derived from `auth_cfg`, never assigned
+                // independently — the two readers above must not disagree.
+                r.additional_auth_scopes = r.auth_cfg.additional_auth_scopes.clone();
             }
         }
 
@@ -2129,18 +2326,16 @@ impl Service {
                 }
             }
         }
-        // OIDC verifier is created once at startup (async, fetches JWKS).
-        // Changes to OIDC settings require a full restart.
-        if self.cfg.auth.oidc_issuer != new_cfg.auth.oidc_issuer
-            || self.cfg.auth.oidc_audience != new_cfg.auth.oidc_audience
-            || self.cfg.auth.oidc_skip_expiry != new_cfg.auth.oidc_skip_expiry
-            || self.cfg.auth.oidc_skip_issuer != new_cfg.auth.oidc_skip_issuer
-            || self.cfg.auth.oidc_skip_audience != new_cfg.auth.oidc_skip_audience
-            || self.cfg.auth.oidc_additional_audience != new_cfg.auth.oidc_additional_audience
-            || self.cfg.auth.oidc_tls_trusted_ca_file != new_cfg.auth.oidc_tls_trusted_ca_file
-        {
-            changes.push("OIDC settings changed (restart required)".to_string());
-        }
+        // `[auth]` fields a reload cannot apply (the OIDC verifier is created
+        // once at startup and fetches JWKS; the remaining scalars are read from
+        // state a reload does not re-key). Baseline is `self.cfg.auth`:
+        // `reload` takes `&self`, nothing writes `self.cfg` after construction,
+        // and the apply block above derives the live `auth_cfg` from the
+        // running one — it never copies a restart-only field out of the file.
+        // So `self.cfg.auth` *is* the running value for every field this
+        // reports, including `auth.method` (the reason a method-only change
+        // used to vanish into `config reloaded: no changes detected`).
+        note_auth_restart_changes(&self.cfg.auth, &new_cfg.auth, &mut changes);
 
         if changes.is_empty() {
             Ok("config reloaded: no changes detected".into())
