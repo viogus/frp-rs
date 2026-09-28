@@ -1535,16 +1535,33 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             if opts.tls_enable {
                 #[cfg(not(feature = "tls"))]
                 {
-                    // No `tls` in this build: refuse before any TLS work. The
-                    // refusal must stay a diverging statement (or this arm's
-                    // value) — as a plain discarded statement the `if` body
-                    // becomes `()` and E0308s against the `else` arm. Unlike
-                    // the TCP and WSS arms, `clippy::needless_return` does not
-                    // fire on this one — measured over thirteen `-p frp-core`
-                    // feature configurations. The cause of that suppression was
-                    // NOT isolated (a synthetic `if c { return Err(..) } else
-                    // { return Ok(0) }` arm *is* linted), so read the
-                    // measurement, not a reason.
+                    // No `tls` in this build: refuse before any TLS work. Keep
+                    // the `return` here: the diverging statement is the shape
+                    // that compiles — the opposite of the TCP arm above. Both
+                    // mutations were measured in a scratch copy with `-D
+                    // warnings`, `--features kcp`:
+                    //   * keyword removed, `;` kept (`Err(..);`): the value is
+                    //     discarded and `Result`'s `T` is never constrained —
+                    //     `error[E0282]: type annotations needed` ("cannot infer
+                    //     type of the type parameter `T` declared on the enum
+                    //     `Result`");
+                    //   * keyword AND `;` removed (`Err(..)` as the block's
+                    //     value): `error[E0308]: mismatched types`, "expected
+                    //     `()`, found `Result<_, Error>`", whose `help:` offers
+                    //     to put the `;` or the `return` back.
+                    // The structural difference from the TCP arm is the `else`:
+                    // there it is the `Ok(stream)` expression, here it is a
+                    // `return` (below).
+                    //
+                    // Unlike the TCP and WSS arms, `clippy::needless_return`
+                    // does not fire on this one — measured over the four
+                    // `-p frp-core` feature configurations that enable `kcp`
+                    // (`kcp`, `kcp,compression`, `websocket,kcp`,
+                    // `kcp,websocket,tcp-mux,stun`); a `compile_error!` probe
+                    // confirmed exactly those four compile this arm. The cause
+                    // of that suppression was NOT isolated (a synthetic `if c
+                    // { return Err(..) } else { return Ok(0) }` arm *is*
+                    // linted), so read the measurement, not a reason.
                     return Err(crate::Error::Transport(
                         "TLS support not compiled (enable the 'tls' feature)".into(),
                     ));
@@ -1660,8 +1677,12 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                     //     `dial_server_refuses_tls_when_tls_is_not_compiled`;
                     //   * only the keyword removed, `;` kept: the value is
                     //     discarded, this block becomes `()`, and the `if`/`else`
-                    //     arms stop unifying — `error[E0308]` at this line, in
-                    //     the bare configuration and in `--features kcp`. That is
+                    //     arms stop unifying — `error[E0308]: mismatched types`,
+                    //     "expected `Result<IoStream, Error>`, found `()`", whose
+                    //     span is this `if` body's block (the brace above, not
+                    //     the `Err(..)` line) and whose `help:` points at the
+                    //     `;` to remove. Measured in the bare configuration,
+                    //     `--features kcp` and `--features websocket`. That is
                     //     the failure the old "missing `return`" wording
                     //     described, and it is about the `;`, not the keyword.
                     Err(crate::Error::Transport(
