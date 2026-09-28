@@ -1103,8 +1103,11 @@ jobs:
         # about, one feature flag away. Measured at `005ddd8`:
         #   RUSTFLAGS="-D warnings" cargo clippy -p frp-core \
         #     --no-default-features --features websocket --all-targets
-        # exited 101 on that arm's `clippy::needless_return` (fixed in the same
-        # change) and exits 0 after it. A `return` reintroduced there fails THIS
+        # exited 101 on three lints — `clippy::new_without_default` for
+        # `SnappyCompressor::new` (compression is off in that configuration) and
+        # `clippy::needless_return` at both the TCP and this WSS refusal, all
+        # fixed in the same change — and exits 0 after it. A `return`
+        # reintroduced there fails THIS
         # step, not the one above, which is why it is a sibling step rather than
         # a second command in one step: the step name is the failure attribution.
         #

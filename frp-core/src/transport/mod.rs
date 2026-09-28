@@ -1536,10 +1536,10 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 #[cfg(not(feature = "tls"))]
                 {
                     // No `tls` in this build: refuse before any TLS work. Keep
-                    // the `return` here: the diverging statement is the shape
-                    // that compiles — the opposite of the TCP arm above. Both
-                    // mutations were measured in a scratch copy with `-D
-                    // warnings`, `--features kcp`:
+                    // the `return` here: in this arm the diverging statement is
+                    // the shape that compiles — the opposite of the TCP arm
+                    // below. Both mutations were measured in a scratch copy with
+                    // `-D warnings`, `--features kcp`:
                     //   * keyword removed, `;` kept (`Err(..);`): the value is
                     //     discarded and `Result`'s `T` is never constrained —
                     //     `error[E0282]: type annotations needed` ("cannot infer
@@ -1549,16 +1549,24 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                     //     value): `error[E0308]: mismatched types`, "expected
                     //     `()`, found `Result<_, Error>`", whose `help:` offers
                     //     to put the `;` or the `return` back.
-                    // The structural difference from the TCP arm is the `else`:
-                    // there it is the `Ok(stream)` expression, here it is a
-                    // `return` (below).
+                    // What separates this arm from the TCP one is the enclosing
+                    // `match` each refusal sits in, not this `else`: the match
+                    // holding this arm is an expression statement with no
+                    // trailing `;`, so its arms are `()`; the match holding the
+                    // TCP arm is the function's tail, so its arms yield
+                    // `Result<IoStream, Error>`. With `()` arms, a
+                    // discarded `Err` cannot constrain `T` — the `E0282` above;
+                    // with `Result` arms, a discarded value is the `E0308`.
                     //
                     // Unlike the TCP and WSS arms, `clippy::needless_return`
-                    // does not fire on this one — measured over the four
-                    // `-p frp-core` feature configurations that enable `kcp`
-                    // (`kcp`, `kcp,compression`, `websocket,kcp`,
-                    // `kcp,websocket,tcp-mux,stun`); a `compile_error!` probe
-                    // confirmed exactly those four compile this arm. The cause
+                    // does not fire on this one — measured in the four `kcp`
+                    // configurations named in the CI residue comment in
+                    // `.github/workflows/ci.yml` (`kcp`, `kcp,compression`,
+                    // `websocket,kcp`, `kcp,websocket,tcp-mux,stun`); a
+                    // `compile_error!` probe confirmed those four compile this
+                    // arm. That is the scope of those four names, not the set of
+                    // every configuration that enables `kcp` — `default` enables
+                    // it, and so does every combination containing it. The cause
                     // of that suppression was NOT isolated (a synthetic `if c
                     // { return Err(..) } else { return Ok(0) }` arm *is*
                     // linted), so read the measurement, not a reason.
