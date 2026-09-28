@@ -41,7 +41,7 @@ SyslogIdentifier=frps
 # restart-only setting the config changed ([log], [transport], [web_server],
 # [ssh_tunnel_gateway], the registration caps, ...) is named in the reload
 # summary as "restart required" and needs a service restart; settings nothing
-# reads (auth.useEncryption, tls_server_name, web_server.pprof_enable, ...) are
+# reads (auth.useEncryption, tls_enable, tls_server_name, web_server.pprof_enable, ...) are
 # parsed but have no effect at all, so they are not reported.
 KillSignal=SIGINT
 TimeoutStopSec=30

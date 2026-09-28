@@ -244,7 +244,7 @@ certificate/key/CA paths. Everything else it cannot apply — `auth.method` and
 the OIDC settings, `[log]`, `[transport]`, the registration caps, `[web_server]`,
 `[ssh_tunnel_gateway]`, `[observability]` and the rest — is **reported in the
 reload summary** as restart-required rather than silently dropped; settings no
-code reads (`auth.useEncryption`, `tls_server_name`, `web_server.pprof_enable`,
+code reads (`auth.useEncryption`, `tls_enable`, `tls_server_name`, `web_server.pprof_enable`,
 …) are deliberately not reported, because a restart would not change anything
 either. The full list is in
 [Configuration Reference § Server Config Reload](docs/config.md#server-config-reload-sigusr1).
