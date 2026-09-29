@@ -2644,7 +2644,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     script generates no `.ini` config at all, so it cannot reach the wire.
 
 
-- [ ] **A legacy section with an invalid `role` is accepted as a proxy where Go exits 1.** Found
+- [x] **A legacy section with an invalid `role` is accepted as a proxy where Go exits 1.** Found
   while closing `:1359` (R1), measured on Go v0.71.0 and frp-rs head. Go dispatches a legacy section
   on `role` after expanding a `[range:...]` template and errors on anything but `server`/`visitor`
   (`pkg/config/legacy/client.go:263-284`, `proxy %s role should be 'server' or 'visitor'`):
@@ -2659,6 +2659,19 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `docs/config.md` with this measurement.
   Reproducer: `/tmp/lip/f5/role_bad.ini` (range) and `/tmp/lip/f5/role_bad2.ini` (explicit) in the
   `:1359` round's probe directory; `frpc verify -c` on each, Go vs frp-rs.
+  **Done:** took the Done-when's second branch — the divergence is recorded in `docs/config.md`
+  (§ *A legacy section's `role` is not validated*, `docs/config.md:870-897`), **not fixed**.
+  Both sides re-measured in this round, stdout and stderr captured separately and the rc read
+  directly. Go: the real v0.71.0 binary `/tmp/frp_0.71.0_darwin_arm64/frpc`
+  (sha256 `3ce4ba70ffce7da4026940586c5f3454df50814f4c050d6560efc556b3adef48`, `--version` → `0.71.0`)
+  is **rc 1** on both reproducers with the message on **stdout** and **0 B stderr** — explicit
+  `proxy x role should be 'server' or 'visitor'` (45 B), range `proxy x_0 role should be 'server' or
+  'visitor'` (47 B); this matches the source dispatch at `pkg/config/legacy/client.go:263-284`.
+  frp-rs head (`cargo build -p frpc` → `target/debug/frpc`) is **rc 0** on both with **0 B stderr**:
+  explicit stdout `Config file /tmp/lip/f5/role_bad2.ini is valid` + `Proxies: 1` (99 B), range
+  `Config file /tmp/lip/f5/role_bad.ini is valid` + `Proxies: 3` (98 B). The refusal itself is still
+  unimplemented — the legacy collector cannot fail as it stands (`normalize_client_config` returns
+  `()`), which is why the item closes by documentation. Ledger effect: **closes 1 item**.
 
 
 - [x] **`frpc` panics on SIGTERM when more than one visitor shares a `bind_port` (pre-existing;
