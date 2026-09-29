@@ -247,8 +247,9 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
 
   Residue, recorded below as new items: `auth.method` parsing is inconsistent across the three sites
   (the client compares case-sensitively; unknown/whitespace spellings fall back to `Token` on both
-  sides), the client's admin-triggered `reload` never re-derives auth, and `oidc_throttle_tests` is
-  load-dependent because the mock IdP can read 0 bytes after accepting.
+  sides), the client's admin-triggered `reload` never re-derives auth, and `oidc_throttle_tests` —
+  filed here as load-dependent, since fixed: the mock IdP could read 0 bytes after accepting because
+  the accepted socket inherited the listener's non-blocking mode (see the item below).
 - [ ] **The help *document* is bpaf's, not cobra's — every `--help` surface is a different
   document from Go's, not just a different layout.** Filed by the `--help=<bool>` round
   (`TODO.md:3274`), which matched the *behaviour* of every help argv and deliberately left the
@@ -1012,17 +1013,37 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   later re-derived), `docs/config.md`, `CHANGELOG.md`. `scripts/compat-test.sh` is not relevant (config
   loading, no wire byte).
 
-- [ ] **`oidc_throttle_tests` is a load-dependent flake: the mock IdP answers 404 for a valid
-  request.** `cargo test -p frp-server --lib oidc` failed **3/3** `oidc_throttle_tests` under CPU
-  load with `OIDC: openid-configuration returned 404 Not Found`, while a serial run passes 6/6 and
-  the 469-test `-p frp-server --features dashboard --lib` run passes; measured 2026-09-25 by the
-  first review round on `9c3ddd0`, whose change does not touch `control/login.rs`. Mechanism:
-  `oidc_mock_server` (`frp-server/src/control/login.rs:2159`) accepts on a **non-blocking** listener
-  and reads the request with `Read::read(&mut stream, &mut buf).unwrap_or(0)` (`:2183`), so when the
-  accept fires before the client's bytes arrive the read returns `WouldBlock` → 0 bytes → the path
-  falls back to `/` → 404. CI runs these tests in parallel, so the lane can flake. **Done-when:** the
-  mock waits for the request line (or the tests retry), pinned by a looped run of the three tests
-  under load.
+- [x] **`oidc_throttle_tests` was filed as a load-dependent flake: the mock IdP answers 404 for a
+  valid request.** `cargo test -p frp-server --lib oidc` failed **3/3** `oidc_throttle_tests` under
+  CPU load with `OIDC: openid-configuration returned 404 Not Found`, while a serial run passes 6/6
+  and the 469-test `-p frp-server --features dashboard --lib` run passes; measured 2026-09-25 by the
+  first review round on `9c3ddd0`, whose change does not touch `control/login.rs`. Mechanism
+  (confirmed by measurement, not by re-reading): `oidc_mock_server` accepts on a **non-blocking**
+  listener and the accepted stream inherits that mode — a fresh accepted stream's first `read` with
+  nothing sent returns `Err(WouldBlock, os error 35)` — so the single
+  `Read::read(&mut stream, &mut buf).unwrap_or(0)` returned 0 bytes whenever the accept beat the
+  client's write, and the path fell back to `/` → 404. CPU load is what let the accept win; it is not
+  a second cause. **Done-when:** the mock waits for the request line (or the tests retry), pinned by
+  a looped run of the three tests under load.
+  Done: fixed in this change, entirely inside `mod oidc_throttle_tests`: `read_request_head` clears
+  `O_NONBLOCK`, bounds the whole wait with a 5 s deadline (an `SO_RCVTIMEO` no larger than the
+  remaining budget) and accumulates through `\r\n\r\n` before routing; on expiry the mock answers an
+  explicit `500` naming the cause instead of falling through to `/` → 404. Production is untouched:
+  the mock is `#[cfg(test)]`-only and `verify_login_auth` never calls it; production accept paths use
+  `tokio::net::TcpListener` (`frp-server/src/vhost.rs:1523`, `frp-server/src/tcpmux.rs:320`,
+  `frp-server/src/service.rs:643`), and the only production `set_nonblocking` is the deliberate
+  raw-splice pair in `frp-core/src/splice.rs:396-399`. Pins with literal rcs:
+  `mock_idp_serves_a_request_that_arrives_after_accept` — a client connects, sleeps 0/5/20/50 ms,
+  then sends — is the **race** pin: **red on `d1be6675`** (rc 101; the first delayed iteration was
+  answered `HTTP/1.1 404 OK`), **green after** (rc 0).
+  `read_request_head_waits_for_a_request_that_arrives_after_accept` (150 ms writer delay plus a
+  measured elapsed floor), `read_request_head_times_out_on_a_client_that_never_sends` (200 ms
+  deadline, bounded above and below) and
+  `mock_idp_answers_an_explicit_error_when_no_request_line_arrives` (500 + cause, then the accept
+  loop keeps serving) pin the wait, the bound and the failure. The **load sensitivity** is separate
+  and statistical, not a pin: 50 iterations of the three original tests in the `frp-server` lib test
+  binary (`--test-threads` default) failed **11/50** under 8 concurrent `yes` CPU burners pre-fix
+  (0/50 idle) and **0/50** after the fix.
 
 **The SSH readiness fix (#344) left two sites and one unbounded case.**
 - [x] Two SSH-gateway tests still connect with a bare `.unwrap()` and no readiness wait.
