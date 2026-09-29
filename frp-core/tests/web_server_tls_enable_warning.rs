@@ -160,7 +160,7 @@ fn nested_web_server_tls_enable_warns_once_and_stays_inert() {
     );
     assert!(
         c.presence.web_server_tls_enable_set(),
-        "the presence flag must survive the load (the nested table is removed from the value)"
+        "the presence flag must survive the load (the loader removes `enable` from the value before serde)"
     );
     assert_eq!(
         c.warning_records, 1,

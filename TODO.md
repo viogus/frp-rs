@@ -6170,8 +6170,9 @@ section; ledger now **24 open / 104 closed**.**
 
   Done: the first branch — a dotted header whose first segment is a v1 section name is expanded
   into nested tables **before** normalization, so `.ini` reaches `normalize_web_server_section` like
-  every other format: `ini_to_toml` / `ini_section_path` / `ini_section_mut` /
-  `INI_NESTED_SECTION_ROOTS` in `frp-core/src/config/format.rs`. Measured before/after with the probe
+  every other format: `ini_to_toml` / `ini_section_path` / `insert_ini_section` /
+  `INI_NESTED_SECTION_ROOTS` in `frp-core/src/config/format.rs` (the helper was
+  `ini_section_mut` before the review round that split the parse from the insert). Measured before/after with the probe
   harness (cases B1/B2): `[webServer.tls] certFile = /nested/cert.pem` loaded `tls_cert() == ""` with
   strict reporting `unknown field "webServer.tls"` before, and `"/nested/cert.pem"` in **both** modes
   after; `[web_server.tls] cert_file` likewise. The first-segment restriction is load-bearing, not
@@ -6180,8 +6181,11 @@ section; ledger now **24 open / 104 closed**.**
   because Go's own `.ini` path is the *legacy* loader and keeps `[plugin.user-manager]` as one flat
   section name — `pkg/config/legacy/server.go`, the `strings.HasPrefix(name, "plugin.")` loop over
   `gopkg.in/ini.v1`'s `section.Name()` (v0.71.0 source). A literal top-level `webServer.tls = 1` key
-  stays a distinct unknown key, and a genuine path conflict (`[webServer] tls = 1` beside
-  `[webServer.tls]`) is reported rather than clobbered. Pinned by
+  stays a distinct unknown key. A conflict between a scalar `tls` and the expanded table is
+  **order-dependent**, and both orders are pinned: `[webServer] tls = 1` before `[webServer.tls]`
+  errors (`section [webServer.tls] conflicts with the value already set at `webServer.tls``, rc 1
+  both modes), while the reverse order loads rc 0 both modes with the later scalar overwriting
+  the expanded table (`tls_cert() == ""`). Pinned by
   `dotted_ini_section_headers_become_nested_tables_in_both_modes` (`frp-core/src/config/tests.rs`);
   `docs/config.md` no longer says the section is unusable in `.ini`.
   Parity note: the expansion is an frp-rs **extension** — Go never reads `[webServer.tls]` from an
@@ -6321,15 +6325,21 @@ section; ledger now **24 open / 104 closed**.**
   log flood carrying no new information, while the fact is a property of the file. The cell holds
   `0 = no baseline`, `1 = written`, `2 = absent`; `spawn_admin_server` **seeds it from the file** at
   startup (so a file that already wrote the key produces no second record on the first GET, and a
-  hand-edit made after startup is still reported), the record fires when the answer becomes
-  "written", and `handle_put_config` resets the cell to `0` after a successful reload so a following
-  GET cannot repeat the reload's record. Measured in-process by
-  `admin_config_get_warns_once_per_state_change` (`frp-client/src/admin.rs`), the shipped numbers:
-  seeded cell + a file with the key, three GETs -> **0** (baseline; the startup record is not
-  repeated); rewritten without the key -> **0**; rewritten with it -> **1**; polled three more times
-  -> **1** (no per-poll flood); cell reset (the PUT path) + GET -> **1**; and a hand-edit that adds
-  the key after the seed -> **1** (the window the seed exists to cover). The pre-fix measurement the
-  item filed (3 GETs -> **+0** records, 3 PUTs -> +3) stands as the "before". The test target's "what
+  hand-edit made **after the admin server has started** is still reported — an edit between the
+  startup load and the spawn is baselined, since the seed reads the file at spawn), the record fires
+  when the answer becomes "written", and `handle_put_config` resets the cell to `0` after a successful
+  reload so a following GET cannot repeat the reload's record. Measured in-process by
+  `admin_config_get_warns_once_per_state_change` (`frp-client/src/admin.rs`); the test asserts
+  **cumulative record totals**, so they are quoted here in the test's own execution order — seed
+  `ABSENT` with no key, one GET -> **0**; hand-add the key, one GET -> **1** (the window the seed
+  exists to cover); seed `WRITTEN` with the key, three GETs -> **1** (the startup record is not
+  repeated; no per-poll flood); rewrite without the key -> **1**; rewrite with it -> **2**; three more
+  GETs -> **2**; cell reset (the PUT path) + GET -> **2**; rewrite without the key and back with it ->
+  **3**. The pre-fix measurement the item filed (3 GETs -> **+0** records, 3 PUTs -> +3) stands as the
+  "before". The seed **wiring** (not just the seed function) is pinned against the real binary by
+  `frpc/tests/admin_config_get_warning.rs`, whose `hand_edit_after_startup_is_reported` is red when
+  `spawn_admin_server` reverts to `AtomicU8::new(0)` and whose `seed_reads_the_file_non_strictly` is
+  red when the seed's `strict = false` is flipped. The test target's "what
   it does not cover" (`frp-core/tests/web_server_tls_enable_warning.rs`), the
   `warn_inert_web_server_tls_enable` doc (`frp-core/src/config/loader.rs`), the emission comment in
   `normalize_web_server_section` (`frp-core/src/config/normalize.rs`) and the `docs/config.md` site

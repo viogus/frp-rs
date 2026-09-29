@@ -574,6 +574,45 @@ jobs:
             exit 1
           fi
           echo "frpc warning-delivery guard ok: $n tests listed (expected 8), 0 failed"
+      - name: Run frpc's admin config-GET delivery tests
+        # `frpc/tests/admin_config_get_warning.rs` is the only test that starts a
+        # **real** `frpc` (built with `--features admin`), hits the real admin
+        # config route, and pins the `spawn_admin_server` **wiring** of the dedup
+        # cell — `frp-client`'s in-process test covers the seed function and the
+        # cell protocol but cannot see that one line, and reverting it to
+        # `AtomicU8::new(0)` left all 11 of its tests green while the shipped
+        # behaviour regressed. The file is
+        # `#![cfg(all(feature = "full", feature = "admin"))]`-gated, so it needs
+        # `--features admin` (`full` is the default); without the flag it compiles
+        # to an empty binary and this step would guard nothing, which is why the
+        # count is asserted rather than trusted. `FRPC_BIN` overrides the binary
+        # it spawns, which is how the mutant runs are made (measured:
+        # `AtomicU8::new(0)` and `strict = true` each red exactly the rows named
+        # in the file's doc).
+        shell: bash
+        run: |
+          set -eo pipefail
+          log=/tmp/frpc-admin-config-get-tests.log
+          cargo test -p frpc --features admin --test admin_config_get_warning --color never 2>&1 | tee "$log"
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+          n=$(cargo test -p frpc --features admin --test admin_config_get_warning --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          status=0
+          grep -q "Running tests/admin_config_get_warning.rs" "$log.plain" || status=1
+          grep -q "test result: ok. 3 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "3" ] || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::frpc admin config-GET guard failed (status=$status, file=$n, log=$log)"
+            if [ -n "$n" ] && [ "$n" != "3" ]; then
+              if [ "$n" -lt "3" ]; then
+                echo "::error::frpc/tests/admin_config_get_warning.rs lists $n tests, this step expects 3 — tests were deleted or the file is not being run with --features admin; restore them rather than lowering this literal"
+              else
+                echo "::error::frpc/tests/admin_config_get_warning.rs lists $n tests, this step expects 3: move the single literal in this shell step from 3 to $n"
+              fi
+            fi
+            cat "$log.plain"
+            exit 1
+          fi
+          echo "frpc admin config-GET guard ok: $n tests listed (expected 3), 0 failed"
       - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
         # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag
         # exit-code fix has to hold in the no-default-features build too — but

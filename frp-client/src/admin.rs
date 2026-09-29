@@ -57,9 +57,21 @@ pub const WS_TLS_ENABLE_ABSENT: u8 = 2;
 /// Seeding (rather than starting at [`WS_TLS_ENABLE_NO_BASELINE`]) is what makes
 /// the endpoint's dedup correct in both directions: a file that already wrote
 /// `[web_server.tls] enable` at startup cannot produce a second record on the
-/// first GET, and a hand-edit that *adds* the key between startup and the first
-/// GET is still reported, because the seed recorded "absent". Starting at
-/// `NO_BASELINE` (the first cut) baselined that edit silently and lost it.
+/// first GET, and a hand-edit that *adds* the key **after the admin server has
+/// started** is still reported, because the seed recorded "absent". The window
+/// this closes is that one — an edit landing between the **startup load** and the
+/// spawn is still baselined, since the seed reads the file only at spawn. Starting
+/// at `NO_BASELINE` (the first cut) baselined the post-spawn edit silently and
+/// lost it.
+///
+/// **Read non-strictly, deliberately.** `strict = false` matches the two loads
+/// whose record the seed stands in for: the admin GET itself
+/// (`config_from_file` → `load_client_config_with_presence(path, false)`) and the
+/// service reload (`load_client_config(&path, false)`). Parsing strictly would
+/// make the seed fail on a file the runtime accepts — any unknown field, under
+/// `--strict-config=false` — leaving `NO_BASELINE` and silently baselining the
+/// next edit. Pinned by `frpc/tests/admin_config_get_warning.rs`'s
+/// `seed_reads_the_file_non_strictly`, which is red when this flag is flipped.
 ///
 /// Best-effort by design: no path, or a file that cannot be read or parsed,
 /// yields [`WS_TLS_ENABLE_NO_BASELINE`] and the first GET then baselines
@@ -707,8 +719,10 @@ async fn handle_get_visitor_config(
 /// the cell from the file at startup, so in the ordinary run the cell already
 /// holds the state the startup load reported: a file that wrote the key produces
 /// **0** extra records on the first GET, and — the point of seeding rather than
-/// starting at `NO_BASELINE` — a hand-edit that *adds* the key after startup but
-/// before the first GET **is** reported, because the seed recorded "absent".
+/// starting at `NO_BASELINE` — a hand-edit that *adds* the key after the admin
+/// server has started **is** reported, because the seed recorded "absent". (An
+/// edit landing between the startup load and the spawn is baselined: the seed
+/// reads the file at spawn.)
 /// `NO_BASELINE` is therefore reached only when the config file could not be read
 /// at startup, or right after `handle_put_config` reset it (the PUT's reload has
 /// already emitted for the file it read). After the baseline, the record is
@@ -2032,8 +2046,10 @@ passwd = "socks-pass"
         get(&state);
         assert_eq!(records(&output), 0);
 
-        // The hand-edit window: the key is added after startup, before the next
-        // GET. The seed recorded "absent", so this is a real state change.
+        // The hand-edit window: the key is added after the admin server started,
+        // before the next GET. The seed recorded "absent", so this is a real
+        // state change. (An edit before the spawn would be baselined — see the
+        // seed's doc.)
         std::fs::write(&path, with_key).unwrap();
         get(&state);
         assert_eq!(

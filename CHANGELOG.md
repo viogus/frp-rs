@@ -470,8 +470,10 @@ User-facing release notes for frp-rs.
   than once per request: the route is polled, and the fact is a property of the
   file, not of the request. The cell is seeded from the file when the admin server
   starts, so the endpoint never repeats the startup record while a hand-edit that
-  adds the key after startup is still reported; a PUT's reload resets the cell, so
-  a following GET does not repeat that record either.
+  adds the key **after the admin server has started** is still reported (an edit
+  landing between the startup load and the spawn is baselined — the seed reads the
+  file at spawn); a PUT's reload resets the cell, so a following GET does not
+  repeat that record either.
 - **A server config that writes `tls_enable` now says so instead of loading in
   silence.** The field is inert on the server — nothing in `frp-server` / `frps`
   reads it — so a `tls_enable = true` in `frps.toml` bought neither an effect nor

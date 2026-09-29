@@ -5973,8 +5973,9 @@ custom404Page = "<h1>nope</h1>"
 ///    the writer's free choice.
 ///
 /// The nested struct itself is asserted **empty** in every case: the `tls`
-/// table is removed before serde, so the effective value is always the flat
-/// field `tls_cert()` falls back to. `enable` is deliberately absent from the
+/// table's mapped keys are removed before serde, so the effective value is
+/// always the flat field `tls_cert()` falls back to. (An unmapped key keeps the
+/// table alive, but serde ignores it and none of them is a field.) `enable` is deliberately absent from the
 /// value table — it is dropped by the hoist (see its doc comment) and pinned by
 /// `nested_web_server_tls_enable_is_accepted_and_inert_in_both_modes`.
 ///
@@ -7008,9 +7009,9 @@ fn both_spellings_of_one_nested_key_do_not_collide() {
 /// `[web_server.tls] enable` is accepted in **both** loader modes and inert in
 /// both — the decision recorded on `normalize_web_server_section`.
 ///
-/// It is inert because nothing reads it: the nested `tls` table is removed
-/// before serde, so `WebServerTlsConfig::enable` is default-`false` in every
-/// loaded config (`frp-core/src/config/restart_only.rs` destructures it as
+/// It is inert because nothing reads it: `normalize_web_server_section` removes
+/// `enable` with the table's other mapped keys before serde, so
+/// `WebServerTlsConfig::enable` is default-`false` in every loaded config (`frp-core/src/config/restart_only.rs` destructures it as
 /// unreachable), and there is no reader anywhere in `frp-server`/`frps`
 /// (`grep -rn 'tls\.enable' frp-server/src frps/src` matches only
 /// `transport.tls.enable` spellings in test fixtures). frp-rs enables the

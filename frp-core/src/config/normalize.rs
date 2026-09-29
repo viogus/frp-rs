@@ -1585,8 +1585,10 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
 /// every one of those four shapes emits exactly **1** on stdout and 0 on stderr.
 /// The `-c` ordering itself is untouched — it is Go parity (see the comment on
 /// that branch) and the fix moves the **emission**, not the load. Nothing reads
-/// [`WebServerTlsConfig::enable`]: the table is removed before serde, so the
-/// field is default-`false` in every loaded config and has no reader in
+/// [`WebServerTlsConfig::enable`]: `enable` is removed with the table's other
+/// mapped keys before serde, so the field is default-`false` in every loaded
+/// config (an unmapped key keeps the table alive, but serde ignores it and none
+/// of them matches a field) and it has no reader in
 /// `frp-server`/`frps`; the dashboard TLS is driven by a non-empty cert/key pair
 /// (`Service::run` via `tls_cert()`), which is also what Go does
 /// (`pkg/util/http/server.go:77` starts TLS from a non-nil `cfg.TLS`). But Go
