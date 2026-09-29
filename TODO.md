@@ -738,6 +738,40 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   writes the now-warning key), and one `CHANGELOG.md` `### Fixed` bullet. Ledger after this close:
   28 open / 98 closed.
 
+- [ ] **The new server `tls_enable` warning's text is inaccurate on three measured points (#407).**
+  Filed from the two independent round-2 reviews of #407 (frozen `2e060b0432101a41a944111e25f6416382044495`,
+  merged as `8ff41e05f90b9673ac25d8ae082f112018f18238`). Both reviewers returned MERGE and rated all three
+  **non-blocking**; they were filed rather than fixed so that the merge did not overrun its window.
+
+  (a) **A new factual error, introduced by #407.** The new prose says the server `[transport.tls]` lift renames
+  "only four Go keys (force/certFile/keyFile/trustedCaFile)". It renames **five** — `serverName => tls_server_name`
+  is omitted, and that arm is visible in the very citation the sentence carries
+  (`frp-core/src/config/normalize.rs:802-809`). Sites: `frp-core/src/config/loader.rs:379`,
+  `frp-core/tests/server_tls_enable_warning.rs:27` and `:320`. The detector's behaviour is unaffected, which is why
+  R2 rated it non-blocking — but it is a false statement added by a change whose whole subject was a false statement.
+
+  (b) **A branch the message does not name.** With only `tls_cert_file` written (or only `tls_key_file`), `frps`
+  emits the warning and then aborts startup with `TLS requires both cert_file and key_file to be set; got only one`
+  (`frp-core/src/transport/tls.rs:308-326`). The emitted sentence is not false there, but it does not name the
+  outcome the user actually gets.
+
+  (c) **The mechanism prose is false for one combination.** `[common.transport.tls] tls_enable` warns even when a
+  competing top-level `[transport]` table makes the `[common]` flatten drop the key whole:
+  `frp-core/src/config/normalize.rs:586-589` does `table.entry(k).or_insert(v)`, so `[common]`'s `transport` never
+  reaches the lift. R1 measured real `frps` warn=1 for `[transport] heartbeat_timeout = 30` +
+  `[common.transport.tls] tls_enable = true`, while a temporary in-copy probe printed
+  `competing.tls_enable=false alone.tls_enable=true`. The emitted sentence stays literally true — a dropped key
+  genuinely has no effect — so what is wrong is the "hoisted onto the same inert field" wording in
+  `frp-core/src/config/loader.rs:377-385`, the test header `frp-core/tests/server_tls_enable_warning.rs:29-34`, and
+  the close note above. The sibling dashboard detector deliberately mirrors the drop and stays silent
+  (`frp-core/src/config/loader.rs:310-328`), so moving this one has a precedent to follow or to distinguish.
+
+  Done-when: (a) the count and the key list are correct at all three sites; (b) either the message names the
+  half-written-pair abort or a half-written pair is deliberately made silent, with the reason stated; and (c) either
+  the detector consults `[common]`'s `transport` only when the top-level `transport` is absent or not a table, or
+  the mechanism prose is narrowed to what it actually models — the chosen behaviour pinned by a test that reds
+  before the change.
+
 - [x] **`docs/config.md` advertises four camelCase TLS aliases that no loader accepts.**
   The `tls_only`, `tls_cert_file`, `tls_key_file` and `tls_ca_file` rows at `docs/config.md:26-29`
   each name a Go-alias spelling (`tlsOnly`, `tlsCertFile`, `tlsKeyFile`, `tlsCaFile`), while
