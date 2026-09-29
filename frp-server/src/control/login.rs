@@ -2183,11 +2183,29 @@ mod oidc_throttle_tests {
 
     /// How long the mock waits for one accepted client's complete request head.
     ///
-    /// `accept()` on the mock's `set_nonblocking(true)` listener returns a
-    /// **non-blocking** stream on this host (measured: the first `read` with no
-    /// data sent returns `Err(WouldBlock, os error 35)`), so without a wait the
-    /// mock read 0 bytes whenever the accept beat the client's write. Bounded so
-    /// a client that connects and never sends cannot hold the serving thread.
+    /// The accepted socket's mode is **platform-defined**, and that is what made
+    /// the original mock lose the request. On macOS, `accept()` on a
+    /// `set_nonblocking(true)` listener yields a **non-blocking** stream
+    /// (measured on this host, rustc 1.98.1: the first `read` with nothing sent
+    /// returns `Err(WouldBlock, os error 35)`), so a single `read` returned 0
+    /// bytes whenever the accept beat the client's write. On Linux the accepted
+    /// stream is **blocking** (measured in a `rust:1.98.1-slim` container on
+    /// kernel 6.8.0/Ubuntu 24.04: the read waited out a 500 ms `SO_RCVTIMEO`,
+    /// and a pre-fix-style single read — no mode change, no timeout — returned
+    /// the full request 304.7 ms after a client that slept 300 ms before
+    /// writing), so the pre-fix mock served that same delayed request correctly
+    /// there. Every `ci.yml` job is `ubuntu-latest`, so the pre-fix 404 did not
+    /// reproduce in CI; it was a local-macOS phenomenon. This wait does not
+    /// depend on either mode — it clears `O_NONBLOCK` explicitly — so it is
+    /// correct on both. Bounded so a client that connects and never sends cannot
+    /// hold the serving thread.
+    ///
+    /// What this does **not** cover: the stop channel is read only at the top of
+    /// the accept loop, so a stop sent while the thread is inside this wait is
+    /// not observed until the wait ends — up to the deadline later. The bound is
+    /// on the client's stall, not on stop latency; the mock's threads are
+    /// process-lifetime test scaffolding and no caller blocks on one, so the
+    /// gap is recorded rather than bounded.
     const MOCK_REQUEST_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// Upper bound on the request head the mock buffers before giving up.
@@ -2229,11 +2247,19 @@ mod oidc_throttle_tests {
     /// from `stream`, waiting at most `timeout` in total.
     ///
     /// The accepted socket is switched to **blocking** explicitly (its inherited
-    /// mode is platform-defined) and given an `SO_RCVTIMEO` no larger than the
-    /// remaining budget, so the wait is bounded by the OS rather than by a poll
-    /// loop. Short reads are accumulated because the terminator may be split
-    /// across segments; any bytes past the terminator are left unread, keeping
-    /// the mock's one-request-per-accepted-socket contract.
+    /// mode is platform-defined: non-blocking on macOS, blocking on Linux — both
+    /// measured) and given an `SO_RCVTIMEO` no larger than the remaining budget,
+    /// so the wait is bounded by the OS rather than by a poll loop. Short reads
+    /// are accumulated because the head — the `\r\n\r\n` terminator included —
+    /// may be split across segments. The returned head ends at the terminator:
+    /// bytes that arrived **in the same read** past it are consumed and
+    /// discarded (they cannot be pushed back), so the mock still serves exactly
+    /// one request per accepted socket. The remaining budget can be
+    /// sub-millisecond, and it is passed as-is rather than floored to zero —
+    /// `set_read_timeout(Some(Duration::ZERO))` is an error ("cannot set a 0
+    /// duration timeout", measured), while a sub-millisecond value returns
+    /// promptly (measured: `1ns` → `WouldBlock` after 17.9 µs, `500µs` →
+    /// 633.8 µs) instead of waiting forever.
     fn read_request_head(
         stream: &mut std::net::TcpStream,
         timeout: std::time::Duration,
@@ -2363,18 +2389,26 @@ mod oidc_throttle_tests {
     /// Deterministic regression pin for the accept-before-request-bytes race.
     ///
     /// The mock used to `read` **once** from the accepted socket
-    /// (`Read::read(&mut stream, &mut buf).unwrap_or(0)`) and that socket
-    /// inherits the listener's non-blocking mode (measured on this host:
-    /// `accept()` on a `set_nonblocking(true)` listener yields a stream whose
-    /// first `read` with no data returns `Err(WouldBlock, os error 35)`). A
-    /// client that connects and only then writes therefore made the accept
-    /// fire first, the read returned `WouldBlock` → `unwrap_or(0)` → 0 bytes →
-    /// the `/` fallback → `HTTP/1.1 404 OK`. A client-side sleep of a few
-    /// milliseconds is enough (measured: the 5 ms iteration already fails on
-    /// `d1be6675`), so this is a **deterministic** red on the pre-fix mock — no
-    /// CPU load is involved. `delay_ms = 0` is the control: it passes both
-    /// before and after, so a failure here isolates the *delayed* request, not
-    /// "the mock is broken".
+    /// (`Read::read(&mut stream, &mut buf).unwrap_or(0)`). On macOS that socket
+    /// inherits the listener's non-blocking mode (measured on this host, rustc
+    /// 1.98.1: `accept()` on a `set_nonblocking(true)` listener yields a stream
+    /// whose first `read` with no data returns `Err(WouldBlock, os error 35)`),
+    /// so a client that connected and only then wrote made the accept fire
+    /// first, the read return `WouldBlock` → `unwrap_or(0)` → 0 bytes → the `/`
+    /// fallback → `HTTP/1.1 404 OK`. A client-side sleep of a few milliseconds
+    /// is enough (measured: the 5 ms iteration already fails on `d1be6675`), so
+    /// on macOS this is a **deterministic** red on the pre-fix mock — no CPU
+    /// load is involved. `delay_ms = 0` is the control: it passes both before
+    /// and after, so a failure here isolates the *delayed* request, not "the
+    /// mock is broken".
+    ///
+    /// **This pin is a macOS regression pin only.** On Linux the accepted stream
+    /// is blocking (measured with the same rustc in a container: a pre-fix-style
+    /// single read returned the full request 304.7 ms after a client that slept
+    /// 300 ms), so on the `ubuntu-latest` CI lanes the pre-fix code already
+    /// passed this scenario — green-before, and the test guards nothing there.
+    /// What guards the new logic on every platform are the helper-level pins
+    /// below, which force the accepted side non-blocking themselves.
     #[test]
     fn mock_idp_serves_a_request_that_arrives_after_accept() {
         let (issuer, _stop) = oidc_mock_server();
@@ -2474,6 +2508,88 @@ mod oidc_throttle_tests {
         assert!(
             waited < std::time::Duration::from_secs(5),
             "the deadline is not bounded (waited {waited:?})"
+        );
+    }
+
+    /// The reader must **accumulate across reads**: an HTTP head can arrive in
+    /// more than one segment. Two split points are covered, the second cutting
+    /// the `\r\n\r\n` terminator itself in half — so an implementation that
+    /// reads once, or that searches only the newly-read chunk for the
+    /// terminator, fails here (both are mutants this pin is written against:
+    /// the first returns a truncated head, the second never finds the terminator
+    /// and times out).
+    ///
+    /// The 250 ms gap between the two writes is what makes them separate reads:
+    /// the reader is already blocked in `read` when the first chunk lands, so it
+    /// is woken immediately, and the second chunk arrives ~250 ms later. The
+    /// residual is scheduler starvation of this thread for the whole gap, which
+    /// no assertion can exclude on a shipped test host.
+    #[test]
+    fn read_request_head_accumulates_a_head_split_across_reads() {
+        let cases: [(&[u8], &[u8]); 2] = [
+            // Split at the request-line / header boundary.
+            (
+                b"GET /.well-known/openid-configuration HTTP/1.1\r\n",
+                b"Host: x\r\nConnection: close\r\n\r\n",
+            ),
+            // Split INSIDE the terminator: the 4-byte window must span two reads.
+            (
+                b"GET /.well-known/openid-configuration HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r",
+                b"\n",
+            ),
+        ];
+        for (case, (first, second)) in cases.into_iter().enumerate() {
+            let (mut server, mut client) = nonblocking_accepted_pair();
+            let writer = std::thread::spawn(move || {
+                Write::write_all(&mut client, first).expect("write first chunk");
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                Write::write_all(&mut client, second).expect("write second chunk");
+            });
+            let head = read_request_head(&mut server, std::time::Duration::from_secs(5))
+                .unwrap_or_else(|e| {
+                    panic!("case {case}: a split head must still be read, got {e}")
+                });
+            writer.join().expect("writer thread did not panic");
+            let mut expected = first.to_vec();
+            expected.extend_from_slice(second);
+            assert_eq!(
+                head.as_bytes(),
+                expected.as_slice(),
+                "case {case}: the returned head must be both chunks concatenated"
+            );
+        }
+    }
+
+    /// The buffered head is bounded: a stream that never sends the terminator and
+    /// exceeds [`MOCK_REQUEST_HEAD_MAX`] must fail with `TooLarge` **fast**,
+    /// instead of waiting out the deadline or growing without bound (deleting the
+    /// guard is the mutant this pin is written against; it turns this case into a
+    /// 5 s `TimedOut`).
+    #[test]
+    fn read_request_head_rejects_an_over_max_head_without_a_terminator() {
+        let (mut server, mut client) = nonblocking_accepted_pair();
+        let writer = std::thread::spawn(move || {
+            // The reader stops reading once the cap is exceeded, so bound this
+            // write rather than ever blocking the writer thread forever.
+            client
+                .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("bound writer");
+            // No CRLFCRLF anywhere: more than the cap, in one write.
+            let blob = vec![b'a'; MOCK_REQUEST_HEAD_MAX + 512];
+            let _ = Write::write_all(&mut client, &blob);
+        });
+        let started = std::time::Instant::now();
+        let err = read_request_head(&mut server, std::time::Duration::from_secs(5))
+            .expect_err("an over-max head must be rejected");
+        let waited = started.elapsed();
+        writer.join().expect("writer thread did not panic");
+        assert!(
+            matches!(err, RequestHeadError::TooLarge(n) if n == MOCK_REQUEST_HEAD_MAX),
+            "expected TooLarge({MOCK_REQUEST_HEAD_MAX}), got {err:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "TooLarge must fail fast rather than wait out the deadline (waited {waited:?})"
         );
     }
 
