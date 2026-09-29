@@ -408,11 +408,13 @@ User-facing release notes for frp-rs.
   reads it — so a `tls_enable = true` in `frps.toml` bought neither an effect nor
   a word of explanation. It now emits one warning per load at every server load
   site that has a log sink (the two `frps` startup paths and the SIGUSR1 reload):
-  `tls_enable has no effect on the server: …`, naming the real switches
-  (`tls_only`, and a non-empty `tls_cert_file` + `tls_key_file` pair). Only a
-  value the **user wrote** warns — a flat `tls_enable` or one under `[common]` —
-  not the `tls_enable = true` the loader synthesizes from the legacy
-  `[transport.tls] force` / `certFile` / `keyFile`, so an existing Go-style
+  `tls_enable has no effect on the server: …`, naming the real switch
+  (`tls_only`) and how the acceptor's certificate is really obtained
+  (`tls_cert_file` + `tls_key_file`, or the self-signed pair the server
+  auto-generates when both are empty). Only a value the **user wrote** warns — a
+  flat `tls_enable`, one under `[common]`, or a literal `tls_enable` inside
+  `[transport.tls]` — not the `tls_enable = true` the loader synthesizes from the
+  legacy `[transport.tls] force` / `certFile` / `keyFile`, so an existing Go-style
   config stays quiet. `frpc` is deliberately untouched: the client's own
   `tls_enable` *is* live, so warning there would be a false claim.
 - **`[web_server.tls] cert_file` / `key_file` / `trusted_ca_file` / `server_name`

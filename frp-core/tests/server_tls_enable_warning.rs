@@ -17,31 +17,33 @@
 //! `ConfigPresence::warn_inert_server_tls_enable` — the same call `frps` and
 //! `frp-server`'s reload make after `init_logging`.
 //!
-//! **Why the two spellings, and why nothing else.** `ServerConfig::tls_enable` is
-//! a flat field with `#[serde(default)]` and **no alias**
-//! (`frp-core/src/config/server.rs:42-43`), unlike `bind_port`'s `bindPort`. So
-//! the only keys a user can write that land in it are the snake_case
-//! `tls_enable` at the top level and `tls_enable` under `[common]` (flattened by
+//! **Which spellings count, and which do not.** `ServerConfig::tls_enable` is a
+//! flat field with `#[serde(default)]` and **no alias**
+//! (`frp-core/src/config/server.rs:42-43`), unlike `bind_port`'s `bindPort`. The
+//! keys a user can write that land in it are: the snake_case `tls_enable` at the
+//! top level, `tls_enable` under `[common]` (flattened by
 //! `normalize_server_config` via `table.entry(k).or_insert(v)`, so the top-level
-//! key wins; either way the key was *written*). An `includes` file counts too:
+//! key wins), and a literal `tls_enable` inside `[transport.tls]` — the lift
+//! renames only its four Go keys and passes everything else through unchanged
+//! (`frp-core/src/config/normalize.rs:802-809`), so that key is hoisted onto the
+//! same field. Either way the key was *written*. An `includes` file counts too:
 //! `process_includes` deep-merges before the detector runs. The camelCase
 //! `tlsEnable` never matches — it is absent from `known_server_keys()`, so the
 //! lenient loader drops it (the field keeps its `false` default, which is
-//! "unrecognized", not "inert") and the strict loader refuses it. Neither is a
-//! documented spelling.
+//! "unrecognized", not "inert") and the strict loader refuses it.
 //!
 //! **Why a written key warns but a synthesized one does not.** The server
 //! normalizer *synthesizes* `tls_enable = true` from the legacy
 //! `[transport.tls]` section when it carries `force = true`, `certFile` or
-//! `keyFile` (`frp-core/src/config/normalize.rs:792-810`,
+//! `keyFile` (`frp-core/src/config/normalize.rs:798-816`,
 //! `table.entry("tls_enable").or_insert(…)`) — a Go-shaped input, not a user
 //! writing the frp-rs-only field. After normalization the two are
 //! indistinguishable, so `ConfigPresence::server_tls_enable_set_in` reads the
-//! **raw** value. The `[transport.tls] enable` spelling is a third case: the
-//! *server* lift has no `"enable"` arm (only the client's does, at
-//! `frp-core/src/config/normalize.rs:1353-1357`), so it stays a top-level key
-//! literally named `enable` — ignored leniently, refused strictly — and never
-//! sets `tls_enable` at all. All three are pinned below.
+//! **raw** value. The `[transport.tls] enable` spelling is a deliberately
+//! *unrecognized* neighbour: the *server* lift has no `"enable"` arm (only the
+//! client's does, at `frp-core/src/config/normalize.rs:1363`), so it stays a
+//! top-level key literally named `enable` — ignored leniently, refused strictly —
+//! and never sets `tls_enable` at all. Every case is pinned below.
 //!
 //! **What it does not cover.** Delivery on a real binary is
 //! `frps/tests/warn_delivery.rs` (real `frps`, `-c` and `--config-dir`, stdout and
@@ -179,9 +181,14 @@ fn subscriber_for(
 }
 
 /// The message must be true in every combination: it has to name the inertness,
-/// the real switch, and the pair that actually builds the acceptor.
+/// the real switch, and how the acceptor's certificate is really obtained —
+/// including the auto-generated fallback the server takes when both file paths
+/// are empty (measured on `frps` v0.71.0: with no cert files configured it logs
+/// `TLS enabled with auto-generated self-signed certificate` and still emits
+/// this warning, so the old "non-empty pair" claim was false for the very config
+/// that fires it).
 #[test]
-fn the_message_names_the_inertness_the_real_switch_and_the_pair() {
+fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
     assert!(
         SERVER_TLS_ENABLE_INERT_WARNING.contains(NEEDLE),
         "the const must carry the needle the tests count: {SERVER_TLS_ENABLE_INERT_WARNING}"
@@ -191,12 +198,20 @@ fn the_message_names_the_inertness_the_real_switch_and_the_pair() {
         "`tls_only`",
         "`tls_cert_file`",
         "`tls_key_file`",
+        "auto-generates a self-signed certificate pair",
     ] {
         assert!(
             SERVER_TLS_ENABLE_INERT_WARNING.contains(fact),
             "the message must name {fact:?}: {SERVER_TLS_ENABLE_INERT_WARNING}"
         );
     }
+    // The acceptor is *not* pair-gated: with neither file set the server
+    // auto-generates a self-signed pair. A "non-empty pair" claim here would be
+    // false for the config that fires the warning (F1 regression guard).
+    assert!(
+        !SERVER_TLS_ENABLE_INERT_WARNING.contains("non-empty"),
+        "the message must not claim a non-empty pair is required: {SERVER_TLS_ENABLE_INERT_WARNING}"
+    );
 }
 
 /// A written `tls_enable`, in either value, is inert — so it warns, exactly
@@ -297,6 +312,73 @@ fn synthesized_tls_enable_stays_silent() {
     assert!(
         c.presence.server_tls_enable_set(),
         "the user did write the key"
+    );
+    assert_eq!(c.warning_records, 1);
+}
+
+/// A literal `tls_enable` written *inside* `[transport.tls]` is a third written
+/// spelling: the server lift renames only its four Go keys (`force`, `certFile`,
+/// `keyFile`, `trustedCaFile`) and passes every other key through unchanged
+/// (`frp-core/src/config/normalize.rs:802-809`), so this one is hoisted onto the
+/// very same inert field the warning is about.
+#[test]
+fn literal_tls_enable_inside_the_transport_table_is_a_written_spelling() {
+    for (body, mode, expected) in [
+        (
+            "bind_port = 7000\n[transport.tls]\ntls_enable = true\n",
+            false,
+            true,
+        ),
+        (
+            "bind_port = 7000\n[transport.tls]\ntls_enable = true\n",
+            true,
+            true,
+        ),
+        (
+            "bind_port = 7000\n[transport.tls]\ntls_enable = false\n",
+            false,
+            false,
+        ),
+        (
+            "bind_port = 7000\n[common.transport.tls]\ntls_enable = true\n",
+            false,
+            true,
+        ),
+    ] {
+        let c = load_capturing(body, mode);
+        assert_eq!(
+            c.logged_during_load, "",
+            "the loader must stay silent: {body}"
+        );
+        assert_eq!(
+            c.tls_enable, expected,
+            "the key hoists onto the inert field: {body}"
+        );
+        assert!(
+            c.presence.server_tls_enable_set(),
+            "strict={mode}: a literal `tls_enable` in `[transport.tls]` was written: {body}"
+        );
+        assert_eq!(
+            c.warning_records, 1,
+            "strict={mode}: exactly one record: {body}"
+        );
+        assert!(
+            !c.tls_only,
+            "the literal key must not touch the real switch: {body}"
+        );
+    }
+
+    // Beside a renamed neighbour the literal key is still written, and `force`
+    // still drives the real switch: the two do not collapse into one case.
+    let c = load_capturing(
+        "bind_port = 7000\n[transport.tls]\nforce = true\ntls_enable = true\n",
+        false,
+    );
+    assert!(c.tls_only, "`force` is renamed to the real switch");
+    assert!(c.tls_enable);
+    assert!(
+        c.presence.server_tls_enable_set(),
+        "the literal key is written beside a renamed one"
     );
     assert_eq!(c.warning_records, 1);
 }
