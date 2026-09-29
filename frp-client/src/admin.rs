@@ -52,13 +52,18 @@ pub struct AdminState {
     /// `[web_server.tls] enable`", so the config **GET** can emit the inert-key
     /// diagnostic once per **state change** rather than once per request.
     ///
-    /// `0` = never observed, `1` = observed written, `2` = observed absent. The
-    /// endpoint is polled (`/api/proxy/{name}/config`,
-    /// `/api/visitor/{name}/config`), so warning per request would be a log
-    /// flood carrying no new information, while the fact being warned about is a
-    /// property of the file, not of the request: warn when the answer becomes
-    /// "written", stay quiet while it stays the same, and warn again if the file
-    /// is edited to remove and then re-add the key. See `config_from_file`.
+    /// `0` = **no baseline yet** (and the file's current state has already been
+    /// reported by another emitter — the startup load, or the reload a PUT
+    /// triggers), `1` = observed written, `2` = observed absent. The endpoint is
+    /// polled (`/api/proxy/{name}/config`, `/api/visitor/{name}/config`), so
+    /// warning per request would be a log flood carrying no new information,
+    /// while the fact being warned about is a property of the file, not of the
+    /// request. The first GET after a `0` **establishes** the baseline silently
+    /// (that is what stops it duplicating the startup/reload record); after that,
+    /// the record fires when the answer becomes "written", stays quiet while it
+    /// stays the same, and fires again if the file is edited to remove and then
+    /// re-add the key. `handle_put_config` resets the cell to `0` after a
+    /// successful reload for the same reason. See `config_from_file`.
     pub web_server_tls_enable_seen: Arc<AtomicU8>,
 }
 
@@ -651,11 +656,25 @@ async fn handle_get_visitor_config(
 /// *polled* — a dashboard or a script may GET the proxy config every second —
 /// so emitting per request would write an identical record forever, while the
 /// fact being warned about (`enable` was written in the file) is a property of
-/// the file, not of the request. The dedup cell on `AdminState` holds the last
-/// answer observed here; the record is emitted only when the answer becomes
-/// "written", so editing the file to drop the key and then re-adding it warns
-/// again. A plain per-process `once` would be wrong in the other direction: it
-/// would stay silent after a reload replaced the file with one that has the key.
+/// the file, not of the request.
+///
+/// The cell on `AdminState` holds the last answer **this endpoint** observed, and
+/// `0` means "no baseline yet, and the file's current state has already been
+/// reported by another emitter". The first GET after such an event therefore
+/// *establishes* the baseline silently rather than warning, which is what keeps
+/// the endpoint from duplicating the record the startup load already emitted (and
+/// the one the service reload emits for a PUT, which is why `handle_put_config`
+/// clears the cell after a successful reload). After that baseline, the record is
+/// emitted only when the answer becomes "written" — so editing the file to drop
+/// the key and then re-adding it warns again, and a plain per-process `once` would
+/// be wrong in the other direction.
+///
+/// The one case that is deliberately not deduplicated across emitters: a file
+/// edited *outside* the admin API (e.g. by hand, then a SIGUSR1 reload) makes the
+/// reload emit and leaves this cell on its old answer, so the next GET sees a
+/// change and emits once more. The two records are about two different loads;
+/// suppressing one would require sharing the cell with `reload_from_sources`,
+/// whose emit is per-load by design.
 fn config_from_file(
     state: &AdminState,
 ) -> Result<frp_core::config::ClientConfig, (StatusCode, String)> {
@@ -670,13 +689,14 @@ fn config_from_file(
                 format!("failed to load config: {e}"),
             )
         })?;
+    const NO_BASELINE: u8 = 0;
     const WRITTEN: u8 = 1;
     const ABSENT: u8 = 2;
     let written = presence.web_server_tls_enable_set();
     let previous = state
         .web_server_tls_enable_seen
         .swap(if written { WRITTEN } else { ABSENT }, Ordering::Relaxed);
-    if written && previous != WRITTEN {
+    if written && previous != NO_BASELINE && previous != WRITTEN {
         presence.warn_inert_web_server_tls_enable();
     }
     Ok(cfg)
@@ -734,10 +754,15 @@ async fn handle_put_config(
             "failed to write config file".into(),
         ));
     }
-    // Trigger reload after config update
-    reload_and_wait(&state, true)
-        .await
-        .map(|_| "update success")
+    // Trigger reload after config update. The reload reads the file we just
+    // wrote and emits the inert-`enable` record for it, so drop the config
+    // GET's baseline: the next GET re-establishes it silently instead of
+    // repeating the reload's record. See `config_from_file`.
+    let result = reload_and_wait(&state, true).await;
+    if result.is_ok() {
+        state.web_server_tls_enable_seen.store(0, Ordering::Relaxed);
+    }
+    result.map(|_| "update success")
 }
 
 // --- Local TlsListener (moved from frp-core to avoid axum in core) ---
@@ -1856,18 +1881,28 @@ passwd = "socks-pass"
     /// emission is deduplicated: the route is polled, and the fact is a
     /// property of the file, not of the request.
     ///
-    /// **What this models.** Three GETs over a file that wrote the key → exactly
-    /// one record; rewrite the file without the key and GET again → still one
-    /// (the answer changed to "absent", nothing to warn); rewrite with the key
-    /// and GET again → two (the answer changed back). Plus a control file with
-    /// no key at all → no record. The config itself is asserted to load in every
-    /// case, so the emission cannot have replaced the return value.
+    /// **What this models.** The whole cell protocol, in order: a fresh cell
+    /// (`0`) with a file that wrote the key → the first GET **baselines
+    /// silently** and three GETs add **0** records (the startup load already
+    /// reported this file, so the endpoint must not repeat it); the file
+    /// rewritten without the key → still 0 (the change to "absent" warns
+    /// nothing); rewritten **with** the key → **1** (a real state change); a
+    /// stable written file polled again → still 1 (no per-poll flood); and after
+    /// `handle_put_config` resets the cell to `0`, the next GET baselines
+    /// silently again → still 1, so the reload's record is not duplicated. The
+    /// config itself is asserted to load in every case, so the emission cannot
+    /// have replaced the return value.
     ///
     /// **What it does not cover.** The HTTP layer itself (routing, auth,
     /// status codes) — other tests in this module cover the router, and the
-    /// handler's use of `config_from_file` is a one-line call; the exact
-    /// poll cadence of any particular client; and the equivalent **server**
-    /// admin paths, of which there are none (this is a client-only API).
+    /// handler's use of `config_from_file` is a one-line call; a real PUT +
+    /// reload round trip (the reset is asserted directly, and
+    /// `handle_put_config` is the only caller of the reset); a file edited
+    /// outside the admin API and a reload triggered by something else, which
+    /// deliberately emits twice (the reload's per-load record plus the GET's
+    /// state-change record — see `config_from_file`); the exact poll cadence of
+    /// any particular client; and the equivalent **server** admin paths, of
+    /// which there are none (this is a client-only API).
     #[test]
     fn admin_config_get_warns_once_per_state_change() {
         let dir = tempfile::tempdir().unwrap();
@@ -1896,31 +1931,53 @@ passwd = "socks-pass"
                 .matches("web_server.tls.enable has no effect")
                 .count()
         };
-
-        // Three GETs over a file that wrote the key: one record.
-        std::fs::write(&path, with_key).unwrap();
-        for _ in 0..3 {
-            let cfg = config_from_file(&state).expect("the GET load must succeed");
+        let get = |state: &AdminState| {
+            let cfg = config_from_file(state).expect("the GET load must succeed");
             assert_eq!(cfg.web_server.port, 7400);
-        }
-        assert_eq!(records(&output), 1, "one record for three polls");
+        };
 
-        // The answer changes to "absent": no new record.
-        std::fs::write(&path, without_key).unwrap();
-        config_from_file(&state).expect("loads without the key");
-        assert_eq!(records(&output), 1, "a change to `absent` is not a warning");
-
-        // …and back: the state change warns again.
+        // Fresh cell (`0`), file writes the key: the first GET baselines
+        // silently — the startup load already reported this file — and the
+        // polls after it stay silent too.
         std::fs::write(&path, with_key).unwrap();
-        config_from_file(&state).expect("loads with the key again");
-        assert_eq!(records(&output), 2, "re-adding the key warns again");
-
-        // A stable "absent" file stays silent for further polls.
-        std::fs::write(&path, without_key).unwrap();
         for _ in 0..3 {
-            config_from_file(&state).expect("loads");
+            get(&state);
         }
-        assert_eq!(records(&output), 2, "no record while the answer is absent");
+        assert_eq!(
+            records(&output),
+            0,
+            "the first GET baselines; the startup record is not duplicated"
+        );
+
+        // The answer changes to "absent": no record, and the baseline moves.
+        std::fs::write(&path, without_key).unwrap();
+        get(&state);
+        assert_eq!(records(&output), 0, "a change to `absent` is not a warning");
+
+        // …and back: the state change warns.
+        std::fs::write(&path, with_key).unwrap();
+        get(&state);
+        assert_eq!(records(&output), 1, "re-adding the key warns again");
+
+        // A stable written file polled again emits nothing more: the dedup is
+        // per state change, not per request.
+        for _ in 0..3 {
+            get(&state);
+        }
+        assert_eq!(records(&output), 1, "no per-poll flood");
+
+        // `handle_put_config` clears the cell after a successful reload (the
+        // reload emitted for the file it read), so the next GET baselines
+        // silently instead of repeating that record.
+        state
+            .web_server_tls_enable_seen
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        get(&state);
+        assert_eq!(
+            records(&output),
+            1,
+            "a GET after a PUT does not duplicate the reload's record"
+        );
         drop(guard);
     }
 }
