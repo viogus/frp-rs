@@ -213,15 +213,14 @@ pub struct ConfigPresence {
     pub(super) client_heartbeat_interval_set: bool,
     pub(super) client_heartbeat_timeout_set: bool,
     /// `[webServer.tls]` / `[web_server.tls]` — top-level or under `[common]`,
-    /// in either key case, or in an `includes` file — wrote an `enable` key. The
-    /// **value** is deliberately not carried: the loader drops the key before
-    /// serde, and the diagnostic is about the key being inert in every
-    /// combination (`enable = true` with no pair is the one that silently
-    /// serves plaintext HTTP; `enable = false` beside a valid pair is the one
-    /// where TLS stays on against the written value). See
-    /// [`ConfigPresence::web_server_tls_enable_set_in`] for the four places the
-    /// nested table can come from, and why the spellings are checked in that
-    /// order.
+    /// in either key case, in an `.ini` file, or in an `includes` file — wrote
+    /// an `enable` key. The **value** is deliberately not carried: the loader
+    /// drops the key before serde, and the diagnostic is about the key being
+    /// inert in every combination (`enable = true` with no pair is the one that
+    /// silently serves plaintext HTTP; `enable = false` beside a valid pair is
+    /// the one where TLS stays on against the written value). See
+    /// [`ConfigPresence::web_server_tls_enable_set_in`] for how the two section
+    /// spellings and their `[common]` forms resolve.
     pub(super) web_server_tls_enable_set: bool,
     /// Flat `tls_enable` — top-level, under `[common]`, or in an `includes` file
     /// — was **written** by the user. The **value** is deliberately not carried:
@@ -240,20 +239,17 @@ pub struct ConfigPresence {
 /// `init_logging`, which is the whole point of the presence flag.
 ///
 /// The sites that call it are the ones with a log sink: `frps`'s two startup
-/// paths, `frpc`'s two startup paths plus `frpc verify`, and the two in-process
+/// paths, `frpc`'s two startup paths plus `frpc verify`, the two in-process
 /// **reloads** (`frp-server`'s `Service::reload`, `frp-client`'s
-/// `reload_from_sources`) — one record per load, so a reload adds one rather
-/// than replacing the startup record. The sites that stay silent are the ones
-/// with no sink or no emitter: `frps verify` (it never installs a subscriber)
-/// and the `frpc` admin API's config **GET**
-/// (`frp_client::admin::config_from_file`) — that one loads through
-/// `load_client_config`, the *file* API, on every request, so warning there
-/// would be one record per poll. The admin **PUT** (`handle_put_config`)
-/// validates with `load_client_config_from_str`, which is silent, but then
-/// triggers the service reload, so it *does* deliver: once per request, via the
-/// reload site (measured: 3 GETs → +0 records, 3 PUTs → +3, probe
-/// `/tmp/enable-warn-probe/run-admin-probe.sh`). The GET gap is filed in
-/// `TODO.md`.
+/// `reload_from_sources`), and the `frpc` admin API's config **GET** — one
+/// record per load, so a reload adds one rather than replacing the startup
+/// record. The admin GET (`frp_client::admin::config_from_file`) polls a file on
+/// every request, so it emits only when the answer **changes** (see the code
+/// comment there); the admin **PUT** (`handle_put_config`) validates with
+/// `load_client_config_from_str`, which is silent, but then triggers the service
+/// reload, so it delivers once per request via the reload site. The one site
+/// that stays silent is the one with no sink at all: `frps verify` (it never
+/// installs a subscriber), which is why its one-line output stays one line.
 pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING: &str = "web_server.tls.enable has no \
      effect: the dashboard HTTPS server is enabled by a non-empty `cert_file` + `key_file` \
      pair; without that pair the dashboard serves plaintext HTTP";
@@ -304,54 +300,56 @@ impl ConfigPresence {
     /// Did the file write `[webServer.tls]` / `[web_server.tls]` `enable`?
     ///
     /// Must be called on the **raw, pre-normalization** value: both normalizers
-    /// remove the whole nested `tls` table (`normalize_web_server_section`), so
-    /// after normalization the key is unrecoverable.
+    /// remove the nested `tls` table's mapped keys and `enable`
+    /// (`normalize_web_server_section`), so after normalization the key is
+    /// unrecoverable.
     ///
-    /// The nested table can arrive four ways, and they are checked in the order
-    /// the normalizers resolve them — both moves are `or_insert`, so the first
-    /// candidate present wins and the later ones are dropped **whole**, nested
-    /// `tls` included:
+    /// The two section spellings can each arrive at the top level or under
+    /// `[common]`, and the normalizers resolve them in two steps that this
+    /// mirrors:
     ///
-    /// 1. top-level `web_server`;
-    /// 2. `[common] web_server`, flattened to the top level by
-    ///    `table.entry(k).or_insert(v)` (`[common]` is a documented spelling —
-    ///    `docs/config.md` — and this key reaches the same removal site from
-    ///    there, e.g. `[common.web_server.tls] enable`, its inline
-    ///    `common = { … }` form, or the same shape in an `includes` file, which
-    ///    `process_includes` deep-merges before this runs);
-    /// 3. top-level `webServer`, renamed by
-    ///    `table.entry("web_server").or_insert(v)`;
-    /// 4. `[common] webServer`, flattened then renamed.
+    /// 1. `[common]`'s flatten is `table.entry(k).or_insert(v)`, so a top-level
+    ///    key wins over the `[common]` one **whole** — for each of
+    ///    `web_server` and `webServer` independently;
+    /// 2. the surviving `webServer` is then **merged per key** into the
+    ///    surviving `web_server` (`merge_section_into`), with the snake_case
+    ///    section winning each key it defines and nested tables merging
+    ///    recursively.
     ///
-    /// Stopping at the first candidate whose **key is present** (rather than the
-    /// first that is a table) is what reproduces the `or_insert` semantics: a
-    /// present-but-not-a-table `web_server` stops the normalizers too.
+    /// So `enable` counts when the effective `web_server` table carries it
+    /// *or* the effective `webServer` table does — except when `web_server` is
+    /// present but is not a table, in which case `webServer` is dropped whole
+    /// and cannot contribute. (A present-but-not-a-table section stops the
+    /// normalizers too, exactly as the old whole-table `or_insert` did.)
     ///
-    /// `.ini` never matches: the INI reader stores `[web_server.tls]` as the
-    /// literal top-level key `web_server.tls`, which is not a table in
-    /// `web_server` (pre-existing, filed in `TODO.md`).
+    /// `.ini` matches: the INI reader expands a dotted section header into
+    /// nested tables before this runs (`ini_to_toml` in
+    /// `frp-core/src/config/format.rs`), so `[web_server.tls]` is a real
+    /// nested table like it is in every other format.
     pub(super) fn web_server_tls_enable_set_in(value: &toml::Value) -> bool {
         let Some(table) = value.as_table() else {
             return false;
         };
         let common = table.get("common").and_then(toml::Value::as_table);
-        let candidates = [
-            table.get("web_server"),
-            common.and_then(|c| c.get("web_server")),
-            table.get("webServer"),
-            common.and_then(|c| c.get("webServer")),
-        ];
-        for candidate in candidates {
-            let Some(section) = candidate else {
-                continue;
-            };
-            return section
-                .as_table()
+        let pick = |key: &str| -> Option<&toml::Value> {
+            table.get(key).or_else(|| common.and_then(|c| c.get(key)))
+        };
+        let has_enable = |section: Option<&toml::Value>| -> bool {
+            section
+                .and_then(toml::Value::as_table)
                 .and_then(|ws| ws.get("tls"))
                 .and_then(toml::Value::as_table)
-                .is_some_and(|tls| tls.contains_key("enable"));
+                .is_some_and(|tls| tls.contains_key("enable"))
+        };
+        let snake = pick("web_server");
+        let camel = pick("webServer");
+        match snake {
+            // `web_server` present but not a table: the camelCase section is
+            // dropped whole by `merge_section_into`.
+            Some(v) if v.as_table().is_none() => false,
+            Some(v) => has_enable(Some(v)) || has_enable(camel),
+            None => has_enable(camel),
         }
-        false
     }
 
     /// Whether the loaded file wrote `[webServer.tls]` / `[web_server.tls]`
@@ -450,12 +448,11 @@ impl ConfigPresence {
     /// once per load.
     ///
     /// Called by each load site that has a log sink — `frps`'s two startup
-    /// paths, `frpc`'s two startup paths, `frpc verify`, and both in-process
-    /// reloads — because the loader itself cannot emit it (see the type doc).
-    /// Two sites do not call it: `frps verify` (no subscriber) and the `frpc`
-    /// admin API's config GET (`config_from_file`, which loads through
-    /// `load_client_config` on every request); the admin PUT still delivers,
-    /// because it triggers a reload. See the type doc for the measurement.
+    /// paths, `frpc`'s two startup paths, `frpc verify`, both in-process
+    /// reloads, and the `frpc` admin API's config GET (which additionally
+    /// deduplicates, because that endpoint is polled) — because the loader
+    /// itself cannot emit it (see the type doc). One site does not call it:
+    /// `frps verify` (no subscriber). See the type doc for the measurement.
     ///
     /// **Warned whenever the key is written, pair or no pair.** The key is inert
     /// in all four combinations, so "does the key do anything" is false in all

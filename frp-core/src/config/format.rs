@@ -157,7 +157,7 @@ fn yaml_key_to_string(k: &serde_yaml_ng::Value) -> String {
 /// the target field, made by `super::ini_lenient` for `.ini` configs.
 fn ini_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
     let mut root = toml::Table::new();
-    let mut current_section: Option<String> = None;
+    let mut current_section: Option<Vec<String>> = None;
 
     for raw_line in content.lines() {
         let line = raw_line.trim();
@@ -169,10 +169,33 @@ fn ini_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>>
 
         // Section header: [section]
         if line.starts_with('[') && line.ends_with(']') {
-            let section = &line[1..line.len() - 1].trim();
-            current_section = Some(section.to_string());
-            root.entry(section.to_string())
-                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            let section = line[1..line.len() - 1].trim();
+            // frp-rs treats `.ini` as a config format with the same normalizers
+            // as TOML/YAML/JSON (Go does not: its `.ini` path is the *legacy*
+            // loader, `pkg/config/legacy/server.go` / `client.go`, which reads
+            // `[common]` plus the flat `plugin.NAME` sections and ignores every
+            // other section). So frp-rs has to give a dotted header a meaning,
+            // and the one that makes `.ini` match the other formats is a nested
+            // table: `[webServer.tls]` becomes `webServer` → `tls`, exactly the
+            // shape TOML writes as `[webServer.tls]`, so
+            // `normalize_web_server_section` maps it like any other format.
+            // Before this, the header was stored verbatim as the top-level key
+            // `webServer.tls`: non-strict dropped the section and strict
+            // reported `unknown field "webServer.tls"` (measured in both modes).
+            //
+            // Only headers whose first segment is a **v1 section name** nest.
+            // That is what keeps the legacy `[plugin.NAME]` sections flat —
+            // `gopkg.in/ini.v1` keeps `[plugin.user-manager]` as a single
+            // section name (Go reads it with `strings.HasPrefix(name,
+            // "plugin.")`, `pkg/config/legacy/server.go`), and frp-rs's
+            // `collect_legacy_ini_proxy_sections` / `plugin.` handling depends
+            // on the same flat key. A user-chosen legacy section name (`[web01]`,
+            // `[my.proxy]`) is likewise left verbatim.
+            //
+            // Out of scope, deliberately: quoting (`[a."b.c"]`) and an empty
+            // path segment (`[a..b]`), both of which keep their header verbatim.
+            let path = ini_section_path(section).unwrap_or_else(|| vec![section.to_string()]);
+            current_section = Some(path);
             continue;
         }
 
@@ -187,10 +210,8 @@ fn ini_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>>
 
             let parsed_value = infer_ini_value(value_str);
 
-            if let Some(ref section) = current_section {
-                if let Some(toml::Value::Table(ref mut table)) = root.get_mut(section) {
-                    table.insert(key, parsed_value);
-                }
+            if let Some(ref path) = current_section {
+                ini_section_mut(&mut root, path)?.insert(key, parsed_value);
             } else {
                 root.insert(key, parsed_value);
             }
@@ -198,6 +219,74 @@ fn ini_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>>
     }
 
     Ok(toml::Value::Table(root))
+}
+
+/// The v1 section names whose dotted `.ini` headers become nested tables.
+///
+/// Both spellings of the sections `normalize_*_config` knows, because the
+/// `webServer` → `web_server` (and `httpPlugins` → `http_plugins`,
+/// `featureGates` → `feature`) renames happen *after* the INI reader. A header
+/// whose first segment is anything else — `plugin.user-manager`, a legacy proxy
+/// section, a user-chosen name — keeps its header verbatim so the legacy paths
+/// still see the flat key.
+const INI_NESTED_SECTION_ROOTS: &[&str] = &[
+    "common",
+    "web_server",
+    "webServer",
+    "auth",
+    "transport",
+    "log",
+    "proxies",
+    "visitors",
+    "http_plugins",
+    "httpPlugins",
+    "feature",
+    "featureGates",
+    "ssh_tunnel_gateway",
+    "sshTunnelGateway",
+    "observability",
+    "vnet",
+    "store",
+];
+
+/// The nesting path of an INI section header, or `None` to keep it verbatim.
+///
+/// A header nests only when its first segment is in
+/// [`INI_NESTED_SECTION_ROOTS`], it contains `.`, it carries no quote character
+/// — quoting is out of scope — and every dot-separated part is non-empty after
+/// trimming.
+fn ini_section_path(section: &str) -> Option<Vec<String>> {
+    if !section.contains('.') || section.contains('"') || section.contains('\'') {
+        return None;
+    }
+    let parts: Vec<String> = section.split('.').map(|p| p.trim().to_string()).collect();
+    if parts.iter().any(String::is_empty) {
+        return None;
+    }
+    if !INI_NESTED_SECTION_ROOTS.contains(&parts[0].as_str()) {
+        return None;
+    }
+    Some(parts)
+}
+
+/// Walk (creating as needed) the nested table at `path`, erroring if the path
+/// runs into a value that is not a table — a genuine conflict, reported instead
+/// of silently clobbering the value already set.
+fn ini_section_mut<'a>(
+    root: &'a mut toml::Table,
+    path: &[String],
+) -> Result<&'a mut toml::Table, Box<dyn std::error::Error>> {
+    let mut cur = root;
+    for (depth, part) in path.iter().enumerate() {
+        let slot = cur
+            .entry(part.clone())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        cur = slot.as_table_mut().ok_or_else(|| {
+            let joined = path[..=depth].join(".");
+            format!("section [{joined}] conflicts with the value already set at `{joined}`")
+        })?;
+    }
+    Ok(cur)
 }
 
 /// Deepest legitimate nesting for infer_ini_value (array literal inside a

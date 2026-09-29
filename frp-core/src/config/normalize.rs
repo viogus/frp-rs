@@ -510,6 +510,63 @@ fn flatten_to_table(table: &mut toml::Table, keys: &[&str], target: &str, strip_
     }
 }
 
+/// Merge `from` into `into` **per key**, `into` winning every key it already
+/// defines — the whole-table `or_insert` this replaces, at key granularity.
+///
+/// The whole-table form was the root of this subsystem's six `TODO.md` items: a
+/// file that defines both `[webServer]` and `[web_server]` discarded the
+/// camelCase table **whole**, so a nested `[webServer.tls]` never reached the
+/// hoist and the flat `web_server.tls_*` value won in both loader modes — the
+/// one shape where the documented "the nested values take precedence" claim was
+/// false (measured before this change: `[webServer.tls] cert_file = "/nested"`
+/// beside `[web_server] tls_cert_file = "/flat"` loaded `tls_cert() ==
+/// "/flat"` in both loader modes; probe case A1, transcript
+/// `/tmp/ws-probe-before.txt`). Merging per key
+/// makes the nested table reachable while keeping the *same winner* for a key
+/// both sections define: `[web_server]` still wins, because that is the order
+/// the old `or_insert` resolved in. Nested tables merge recursively, so
+/// `[webServer.tls]` beside `[web_server.tls]` merges per key too — again with
+/// the snake_case section winning each key it defines. The order is never
+/// inverted.
+///
+/// A present-but-not-a-table `into` keeps winning and `from` is dropped whole,
+/// exactly as `or_insert` did — and
+/// [`ConfigPresence::web_server_tls_enable_set_in`] mirrors that.
+fn merge_section_into(table: &mut toml::Table, from: &str, into: &str) {
+    use toml::Value;
+    let Some(Value::Table(src)) = table.remove(from) else {
+        return;
+    };
+    match table.entry(into.to_string()) {
+        toml::map::Entry::Vacant(slot) => {
+            slot.insert(Value::Table(src));
+        }
+        toml::map::Entry::Occupied(mut slot) => {
+            if let Some(dst) = slot.get_mut().as_table_mut() {
+                or_insert_deep(dst, src);
+            }
+        }
+    }
+}
+
+/// `dst.entry(k).or_insert(v)` for every key, recursing into tables that both
+/// sides define so nested tables merge instead of one replacing the other.
+fn or_insert_deep(dst: &mut toml::Table, src: toml::Table) {
+    use toml::Value;
+    for (k, v) in src {
+        match dst.entry(k) {
+            toml::map::Entry::Vacant(slot) => {
+                slot.insert(v);
+            }
+            toml::map::Entry::Occupied(mut slot) => {
+                if let (Some(d), Value::Table(s)) = (slot.get_mut().as_table_mut(), v) {
+                    or_insert_deep(d, s);
+                }
+            }
+        }
+    }
+}
+
 /// Generic config loader shared by `load_server_config` and `load_client_config`.
 pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
     path: &str,
@@ -669,10 +726,11 @@ pub(super) fn normalize_server_config(value: &mut toml::Value) {
         // them regardless of this switch (same effective behavior as Go).
         let _ = table.remove("dashboard_tls_mode");
 
-        // Rename canonical Go camelCase section names.
-        if let Some(v) = table.remove("webServer") {
-            table.entry("web_server").or_insert(v);
-        }
+        // `[webServer]` and `[web_server]` are the same section; a file may
+        // define both and they merge per key (`[web_server]` wins each key it
+        // defines) — see `merge_section_into`. The camelCase table used to be
+        // discarded whole here, nested `tls` included.
+        merge_section_into(table, "webServer", "web_server");
         normalize_web_server_section(table);
         if let Some(v) = table.remove("httpPlugins") {
             table.entry("http_plugins").or_insert(v);
@@ -1085,11 +1143,10 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
             ],
         );
 
-        // Rename canonical Go camelCase section names (mirrors the server
-        // path above).
-        if let Some(v) = table.remove("webServer") {
-            table.entry("web_server").or_insert(v);
-        }
+        // `[webServer]` and `[web_server]` are the same section; merge per key
+        // (mirrors the server path above) so a nested `[webServer.tls]` is not
+        // discarded when `[web_server]` is also present.
+        merge_section_into(table, "webServer", "web_server");
         // Normalize canonical Go `[webServer.tls]` (nested certFile/keyFile)
         // into the flat `web_server.tls_cert_file`/`tls_key_file` fields for
         // the client admin server TLS too — without this the nested `tls`
@@ -1438,50 +1495,69 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
 /// `[web_server.tls]` (`ClientConfig.web_server` is the same
 /// [`WebServerConfig`]), so one mapping serves both crates.
 ///
-/// **What it maps.** Four values, each with two accepted spellings: the Go
-/// camelCase (what Go v0.71.0 accepts — its `TLSConfig` json tags are
-/// camelCase only, `pkg/config/v1/common.go:76-84`) and the canonical
-/// snake_case (what [`WebServerTlsConfig`] names the fields, the camelCase
-/// being only a serde `alias`):
+/// **What it maps.** Four values, each named by **four** spellings that reach
+/// serde as *one* field: the nested canonical snake_case (what
+/// [`WebServerTlsConfig`] names the fields), the nested Go camelCase (Go
+/// v0.71.0's only spelling — its `TLSConfig` json tags are camelCase,
+/// `pkg/config/v1/common.go:76-84`), the parent-level canonical
+/// (`web_server.tls_cert_file`, …) and the parent-level camelCase `alias` of
+/// that field (`#[serde(alias = "certFile")]`):
 ///
-/// | nested key | mapped to |
-/// |---|---|
-/// | `certFile` / `cert_file` | `tls_cert_file` |
-/// | `keyFile` / `key_file` | `tls_key_file` |
-/// | `trustedCaFile` / `trusted_ca_file` | `tls_ca_file` |
-/// | `serverName` / `server_name` | `tls_server_name` |
+/// | destination | nested snake | nested camel | parent canonical | parent alias |
+/// |---|---|---|---|---|
+/// | `tls_cert_file` | `cert_file` | `certFile` | `tls_cert_file` | `certFile` |
+/// | `tls_key_file` | `key_file` | `keyFile` | `tls_key_file` | `keyFile` |
+/// | `tls_ca_file` | `trusted_ca_file` | `trustedCaFile` | `tls_ca_file` | `trustedCaFile` |
+/// | `tls_server_name` | `server_name` | `serverName` | `tls_server_name` | `serverName` |
 ///
-/// **Precedence — nested wins, in either key order, within one section.** The
-/// write is an `insert` (not `or_insert`), so a nested entry replaces a flat key
-/// that is already set — and the parent-level serde `alias` of that flat field
-/// (`certFile`, …) is removed just before, so the pair cannot reach serde as two
-/// values for one field (`duplicate field`). That is the reading of the doc
-/// comment on [`WebServerConfig::tls`] and on the `tls` field itself ("the
-/// nested values take precedence when both are set"): a user who sets both
-/// deliberately gets the nested section's value, and the flat key is inert — no
-/// warning, because the accessor's answer is the same either way once the hoist
-/// has run. Where both spellings of the *same* key are nested, snake_case wins
-/// (it is the canonical name); that choice is fixed here rather than left to
-/// `toml`'s map order.
+/// **Precedence — the first non-empty spelling wins, nested first.** The
+/// resolution order is nested snake → nested camel → parent canonical → parent
+/// alias, so a nested entry replaces a flat key that is already set in either
+/// key order (the claim the struct's doc comment makes) and snake_case beats
+/// camelCase inside one table. Every spelling that loses is **removed**, so the
+/// same field can never reach serde twice — the whole group is canonicalized
+/// down to `flat_key`. That closes a pre-existing `duplicate field
+/// \`tls_cert_file\`` for a parent-level `certFile` beside the parent canonical
+/// (measured before this change in both loader modes) *and* the same collision
+/// a per-key section merge would otherwise introduce between `[webServer]` and
+/// `[web_server]`.
 ///
-/// **Scope of that claim (measured).** "Nested wins" holds when both spellings
-/// live in the section the hoist sees. It does **not** hold for a file that
-/// defines both `[webServer]` and `[web_server]`: `normalize_server_config`'s
-/// section rename is an all-or-nothing `table.entry("web_server").or_insert(v)`,
-/// so the camelCase table — including a nested `[webServer.tls]` — is discarded
-/// whole and the flat key in `[web_server]` wins in both loader modes (probe
-/// `/tmp/wstls-f1/` case `s14`; filed in `TODO.md` rather than fixed here).
-/// A parent-level **snake** spelling (`[web_server] cert_file`) is not a field
-/// and is deliberately left in place, so `check_strict` still reports it.
+/// An explicitly **empty** spelling is *unset* and falls through to the next
+/// one. This is a decision, not a mechanical consequence: emptiness is how these
+/// fields say *disabled*, so `[web_server.tls] cert_file = ""` beside a
+/// configured flat/alias value must not silently drop the certificate and leave
+/// the dashboard serving plaintext HTTP (which is what it did — measured
+/// `tls_cert() == ""` in both loader modes). If every spelling is empty, the
+/// canonical key is written as the empty string, which is the field default.
 ///
-/// **`.ini` never reaches this function.** The INI reader stores a section
-/// header verbatim as a top-level key (`frp-core/src/config/format.rs`), so
-/// `[webServer.tls]` becomes the literal key `webServer.tls` and
-/// `[web_server.tls]` becomes `web_server.tls` — neither is a `web_server` →
-/// `tls` table. Measured: non-strict drops the section, strict reports
-/// `unknown field "webServer.tls"` (probe cases `i01`/`i02`, both trees; filed
-/// in `TODO.md`). `[webServer] certFile = …` in an `.ini` *does* work, which is
-/// what makes the dotted section the trap.
+/// **A parent-level snake `cert_file` is not one of the four.** It is not a
+/// field at all, and it is deliberately left in place so `check_strict` keeps
+/// reporting it.
+///
+/// **The section merge comes first.** `normalize_server_config` /
+/// `normalize_client_config` deep-merge `[webServer]` into `[web_server]`
+/// per key before this runs (`merge_section_into`), so a file that defines both
+/// sections no longer discards the camelCase one — the nested `[webServer.tls]`
+/// table arrives here and merges into `[web_server.tls]` with the snake_case
+/// section winning each key it defines. Measured before that fix:
+/// `[webServer.tls] cert_file = "/nested"` beside
+/// `[web_server] tls_cert_file = "/flat"` loaded `tls_cert() == "/flat"` in both
+/// modes; after, `/nested`.
+///
+/// **`.ini` reaches this function too.** frp-rs treats `.ini` as a config
+/// format with the same normalizers as TOML/YAML/JSON, so the INI reader
+/// expands a dotted section header whose first segment is a v1 section name into
+/// nested tables (`ini_to_toml` / `ini_section_path` in
+/// `frp-core/src/config/format.rs`); legacy `[plugin.NAME]` sections are not v1
+/// section names and stay flat. Before the expansion the header was stored
+/// verbatim as the top-level key `webServer.tls`, so non-strict dropped the
+/// section and strict reported `unknown field "webServer.tls"` (measured in both
+/// modes; probe case B1). This is an frp-rs extension, not Go parity: Go's
+/// `.ini` path is the *legacy* loader (`pkg/config/legacy/server.go` /
+/// `client.go`), which reads `[common]` plus the flat `plugin.*` sections from
+/// `gopkg.in/ini.v1` and ignores every other section — `[webServer.tls]` in a
+/// Go `.ini` is simply never read (probed: the v0.71.0 `frps verify` exits 0 but
+/// no value is applied).
 ///
 /// **What it drops, and why.** `enable` is removed and does not reach any
 /// field, and the fact that it was written is carried out of the loader on
@@ -1517,15 +1593,21 @@ pub(super) fn normalize_client_config(value: &mut toml::Value) {
 /// then silently disable the dashboard TLS, and `enable = true` with no pair
 /// would promise TLS the pair cannot deliver.
 ///
-/// **What it does not do.** Every other nested key keeps its name and is
-/// re-inserted at the parent level only when the parent does not already have
-/// it, so `check_strict` still refuses a genuinely unknown nested key — with the
-/// parent-level path (`web_server.bogus_key`), the residue pinned by
-/// `unknown_nested_web_server_tls_key_still_names_a_parent_level_path` in
-/// `frp-core/src/config/tests.rs`. That re-insert is also why a nested
-/// `password` / `user` reaches the real `web_server.password` / `user` fields
-/// (measured, both trees; filed in `TODO.md`). The nested
-/// [`WebServerTlsConfig`] itself is never populated by either loader, so
+/// **What it does not do.** Every unmapped nested key stays **inside** the
+/// `tls` table, which is re-inserted under `web_server.tls` when non-empty. It
+/// is *not* re-inserted at the parent level: that re-insert existed so
+/// `check_strict` could name an unknown nested key, but it let a nested
+/// `password` / `user` become the real `web_server.password` / `user`
+/// credentials (every `WebServerConfig` field name was reachable this way —
+/// measured in both loader modes, probe case C2), and Go refuses those keys
+/// outright (probed on the v0.71.0 `frps`: rc 1, `json: unknown field
+/// "password"`). Keeping the residue nested makes `check_strict` name the true
+/// path — `web_server.tls.user` — pinned by
+/// `unknown_nested_web_server_tls_key_names_the_true_nested_path` and
+/// `nested_web_server_tls_credentials_do_not_become_the_parent_fields` in
+/// `frp-core/src/config/tests.rs`; non-strict drops it like any other unknown
+/// key. The nested [`WebServerTlsConfig`] itself is never populated by either
+/// loader — only unknown keys can remain in the table — so
 /// `WebServerConfig::tls_cert`/`tls_key` always answer from the flat field.
 fn normalize_web_server_section(table: &mut toml::Table) {
     use toml::Value;
@@ -1533,52 +1615,66 @@ fn normalize_web_server_section(table: &mut toml::Table) {
     let Some(Value::Table(ws)) = table.get_mut("web_server") else {
         return;
     };
-    let Some(Value::Table(tls)) = ws.remove("tls") else {
-        return;
-    };
-    let mut tls = tls;
 
-    // One group per destination field: the canonical snake_case nested spelling,
-    // then Go's camelCase one — which is also the **parent-level serde `alias`**
-    // of the flat field (`#[serde(alias = "certFile")]` on
-    // `WebServerConfig::tls_cert_file`, and the same for the other three). Both
-    // are removed from the nested table whichever one supplies the value, so a
-    // config that writes both cannot leave the loser behind under its own name
-    // at the parent level. The canonical snake_case spelling wins.
+    // Pull the nested table out. A `tls` that is not a table is dropped — it
+    // could never deserialize as `WebServerTlsConfig` — but the parent-level
+    // canonicalization below still runs for it, unlike before.
+    let mut tls = match ws.remove("tls") {
+        Some(Value::Table(t)) => t,
+        _ => toml::Table::new(),
+    };
+
+    // One group per destination field. **Four** spellings name each field, and
+    // serde fails with `duplicate field` if two of them reach it — so whatever
+    // loses is removed and only `flat_key` is written back:
+    //
+    //   * `nested_snake` — the canonical name inside `[web_server.tls]`
+    //   * `go_alias`     — Go's camelCase name: nested **and** the parent-level
+    //                      serde `alias` of the flat field
+    //                      (`#[serde(alias = "certFile")]`)
+    //   * `flat_key`     — the canonical parent-level field
+    //
+    // The first **non-empty** spelling wins, in the order `nested_snake` →
+    // `go_alias` (nested) → `flat_key` → `go_alias` (parent): the nested value
+    // beats the flat one in either key order (the claim the struct's doc
+    // comment makes), snake_case beats camelCase inside one table, and an
+    // explicitly empty string means ***unset***. That last rule is a decision,
+    // not an accident: emptiness is how these fields say *disabled*, so
+    // `[web_server.tls] cert_file = ""` beside `[web_server] certFile =
+    // "/p.pem"` must not silently turn the dashboard HTTPS off and leave it
+    // serving plaintext HTTP (measured before this change: `tls_cert() == ""`
+    // in both loader modes, probe case F1). An all-empty group still writes the
+    // empty canonical key, which is the field default.
     const MAPPED: [(&str, &str, &str); 4] = [
         ("tls_cert_file", "cert_file", "certFile"),
         ("tls_key_file", "key_file", "keyFile"),
         ("tls_ca_file", "trusted_ca_file", "trustedCaFile"),
         ("tls_server_name", "server_name", "serverName"),
     ];
-    for (flat_key, canonical, go_alias) in MAPPED {
-        let mut chosen = None;
-        for spelling in [canonical, go_alias] {
-            match tls.remove(spelling) {
-                // First spelling present (snake_case) supplies the value.
-                Some(v) if chosen.is_none() => chosen = Some(v),
-                // The other spelling is dropped either way — see above.
-                Some(_) => {}
-                None => {}
+    for (flat_key, nested_snake, go_alias) in MAPPED {
+        let mut chosen: Option<Value> = None;
+        let mut written = false;
+        for spelling in [nested_snake, go_alias] {
+            if let Some(v) = tls.remove(spelling) {
+                written = true;
+                if chosen.is_none() && !is_empty_string(&v) {
+                    chosen = Some(v);
+                }
             }
         }
-        if let Some(v) = chosen {
-            // The parent-level `go_alias` names the **same field** as
-            // `flat_key`, so leaving it beside the hoisted value makes serde see
-            // two values for one field: `config validation error: duplicate
-            // field \`tls_cert_file\``, in **both** loader modes. That is a
-            // regression the base tree did not have for this shape — base loaded
-            // it under `strict = false` with the flat value (the nested
-            // snake_case spelling was dropped as an unknown key). Removing the
-            // alias lets the nested value win there, like everywhere else.
-            //
-            // Only the alias is removed. A parent-level `cert_file` (snake) is
-            // **not** a field at all, so it is left for `check_strict` to report
-            // — the diagnostic a user needs when they wrote the snake spelling
-            // at the parent level by mistake. `flat_key` itself needs no
-            // removal: the `insert` below replaces it.
-            ws.remove(go_alias);
-            ws.insert(flat_key.to_string(), v);
+        for spelling in [flat_key, go_alias] {
+            if let Some(v) = ws.remove(spelling) {
+                written = true;
+                if chosen.is_none() && !is_empty_string(&v) {
+                    chosen = Some(v);
+                }
+            }
+        }
+        if written {
+            ws.insert(
+                flat_key.to_string(),
+                chosen.unwrap_or_else(|| Value::String(String::new())),
+            );
         }
     }
 
@@ -1594,21 +1690,42 @@ fn normalize_web_server_section(table: &mut toml::Table) {
     // `ConfigPresence::web_server_tls_enable_set`, and
     // `ConfigPresence::warn_inert_web_server_tls_enable` is called by every load
     // site that has a sink: `frps`'s two startup paths, `frpc`'s two plus
-    // `frpc verify`, and the two in-process **reloads** — the last two live in
-    // `frp-server`/`frp-client`, library crates, not in the binaries. Sites with
-    // no sink stay silent on purpose and are named in `docs/config.md`:
-    // `frps verify` (its logging is never initialised) and the `frpc` admin
-    // API's config GET; the admin PUT reaches the reload and does emit. Do not
-    // re-add an emission here: it would double the record wherever the sink is
-    // already installed (`--config-dir`, the reloads) while still being dropped
-    // on `-c`.
+    // `frpc verify`, the two in-process **reloads** (`frp-server`/`frp-client`,
+    // library crates) and the `frpc` admin API's config **GET**
+    // (`frp_client::admin::config_from_file`, deduplicated per state change).
+    // One site stays silent on purpose and is named in `docs/config.md`:
+    // `frps verify` (its logging is never initialised). Do not re-add an
+    // emission here: it would double the record wherever the sink is already
+    // installed (`--config-dir`, the reloads) while still being dropped on `-c`.
     tls.remove("enable");
 
-    // Anything else keeps its name at the parent level so strict mode can name
-    // it, without clobbering an explicit flat value.
-    for (k, v) in tls {
-        ws.entry(k).or_insert(v);
+    // Anything left is a key this section does not have. It **stays nested**;
+    // the old re-insert at the parent level let a nested `user` / `password`
+    // *become* the dashboard Basic Auth credentials. Every `WebServerConfig`
+    // field name is dangerous (`addr`, `port`, `user`, `password`,
+    // `enable_prometheus` / `enablePrometheus`, `assets_dir` / `assetsDir`,
+    // `pprof_enable` / `pprofEnable`, `tls_cert_file` / `certFile`,
+    // `tls_key_file` / `keyFile`, `tls_ca_file` / `trustedCaFile`,
+    // `tls_server_name` / `serverName`, `custom_404_page` / `custom404Page`),
+    // so no name is re-inserted at all. Measured before this change (probe case
+    // C2): `[web_server.tls] user = "nested-user"` + `password =
+    // "nested-secret"` loaded with `web_server.user == "nested-user"` and
+    // `web_server.password == "nested-secret"` in both loader modes. Go refuses
+    // both keys — its `TLSConfig` has neither — measured on the v0.71.0 `frps`:
+    // rc 1, stdout `json: unknown field "password"`. Keeping the residue inside
+    // `tls` makes `check_strict` name the path the user actually wrote
+    // (`web_server.tls.user`, via the walker's `web_server` → `tls`
+    // recursion); non-strict drops it like any other unknown key.
+    if !tls.is_empty() {
+        ws.insert("tls".to_string(), Value::Table(tls));
     }
+}
+
+/// Is this spelling an explicitly empty string? Used by
+/// [`normalize_web_server_section`] to read "empty" as *unset* for the TLS
+/// fields, whose emptiness means *disabled*.
+fn is_empty_string(v: &toml::Value) -> bool {
+    matches!(v, toml::Value::String(s) if s.is_empty())
 }
 
 /// Normalize Go-format proxy sub-tables into flat fields for each proxy entry.
