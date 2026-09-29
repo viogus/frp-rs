@@ -18,7 +18,7 @@
 //! | `frpc --config-dir <dir>` | 1 | 1 | 1 |
 //! | `[common.web_server.tls] enable`, `-c` | 0 | **0** | 1 |
 //! | `[common.web_server.tls] enable`, `--config-dir` | 1 | **0** | 1 |
-//! | `[web_server]` + `[webServer.tls] enable` (mixed) | 0 | 0 | 0 |
+//! | `[web_server]` + `[webServer.tls] enable` (mixed) | 0 | 0 | **1** |
 //! | `frpc -c` with no `enable` key | 0 | 0 | 0 |
 //! | `frpc verify -c <cfg>` (logger installed before the load) | 1 | 1 | 1 |
 //! | **SIGUSR1 reload** delta (`frpc -c`, live session) | +1 | **0** | +1 |
@@ -299,9 +299,10 @@ fn drain<R: Read + Send + 'static>(mut pipe: R, sink: Arc<Mutex<String>>) {
     });
 }
 
-/// Which spelling of the nested TLS section the config uses. `Nested` and
-/// `CommonNested` set the flag; `MixedSections` deliberately does not (the rename
-/// discards the camelCase table whole) and `None` is the control.
+/// Which spelling of the nested TLS section the config uses. All three named
+/// spellings set the flag — `MixedSections` writes the camelCase `[webServer.tls]`
+/// beside a snake_case `[web_server]`, and the two sections merge per key — and
+/// `None` is the control.
 #[derive(Clone, Copy)]
 enum Section {
     Nested,

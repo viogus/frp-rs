@@ -417,11 +417,15 @@ User-facing release notes for frp-rs.
   dropped in non-strict mode and the file was refused with
   `unknown field "webServer.tls"` in strict mode. A dotted header whose first
   segment is a v1 section name (`web_server`, `auth`, `transport`, …) is now
-  expanded into nested tables, exactly as TOML/YAML/JSON write it. Legacy
-  `[plugin.NAME]` sections — which Go's own `.ini` loader reads as one flat
-  section name — are deliberately **not** split, and a genuine conflict
-  (`[webServer] tls = 1` beside `[webServer.tls]`) is reported instead of
-  silently clobbered. This is a frp-rs extension: Go's `.ini` path is the legacy
+  expanded into nested tables, exactly as TOML/YAML/JSON write it. Two kinds of
+  section are deliberately **not** split, and both stay exactly as they were: a
+  legacy proxy section that carries a `type` key (`[auth.foo]`, `[store.frontend]`,
+  `[log.svc]` — in the legacy dialect any non-`[common]` section is a proxy, and
+  the name is a flat user-chosen identifier, as in Go's own `.ini` loader), and
+  anything whose first segment is not a v1 root (`[plugin.NAME]`). A genuine
+  conflict (`[webServer] tls = 1` beside `[webServer.tls]`) is reported instead of
+  silently clobbered; the one shape the expansion still cannot express is a v1
+  nested table that itself carries `type` (a `[visitors.plugin]`-style table). This is a frp-rs extension: Go's `.ini` path is the legacy
   loader and never reads these sections at all.
 - **A nested `[web_server.tls]` key can no longer silently become a real
   `[web_server]` field.** The hoist re-inserted every unmapped nested key at the
@@ -454,7 +458,9 @@ User-facing release notes for frp-rs.
   request — went through the silent file API, so three GETs added zero records
   while three PUTs added three. It now emits, **once per state change** rather
   than once per request: the route is polled, and the fact is a property of the
-  file, not of the request.
+  file, not of the request. The first GET after startup — or after a PUT's reload,
+  which resets the cell — only establishes the baseline silently, so the endpoint
+  neither repeats the startup record nor the reload's.
 - **A server config that writes `tls_enable` now says so instead of loading in
   silence.** The field is inert on the server — nothing in `frp-server` / `frps`
   reads it — so a `tls_enable = true` in `frps.toml` bought neither an effect nor
@@ -517,8 +523,9 @@ User-facing release notes for frp-rs.
   file, the `[web_server]` + `[webServer.tls]` pair, and the admin config GET —
   are all closed in this release: see the `.ini`, section-merge, nested-residue
   and admin-GET bullets above. What remains silent is `frps verify` (logging is
-  never initialised) and the `[common]`-flattened spelling when a top-level
-  section is also present (the `[common]` flatten discards it whole).
+  never initialised) and the `[common]`-flattened spelling when a top-level section
+  of the **same** spelling is also present (the `[common]` flatten discards that
+  one key whole; the other spelling is a different key, merges in, and does warn).
 - **An empty `--log-level` / `--log-file`, and a zero `max_days`, no longer
   silence `frps` or `frpc` — or silently switch off log retention.** Go fills
   each in `LogConfig.Complete()` (`pkg/config/v1/common.go:119-123`: empty →

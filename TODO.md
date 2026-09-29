@@ -986,28 +986,31 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `parent_level_*` tests, and `/tmp/wstls-falsify.txt` is only a 22-line tail of the original in-place
   run (2 of the 3 tests that existed then), which is why the harness above is the citable artifact.
 
-  **Qualifications and out-of-scope findings (measured, filed below rather than folded in).** (1) The
-  precedence claim holds for both spellings **inside one `[web_server]` section**; a file that defines
-  both `[webServer]` and `[web_server]` silently discards the whole `[webServer]` table — including a
-  nested `[webServer.tls]` — via `normalize.rs`'s `or_insert` section rename, so the flat
-  `web_server.tls_*` value wins. (2) The hoist never runs for `.ini`: the INI reader stores the section
-  name verbatim, so `[webServer.tls]` becomes the literal top-level key `"webServer.tls"` and
-  `[web_server.tls]` becomes `"web_server.tls"` — non-strict drops the section, strict reports
-  `unknown field "webServer.tls"` (measured in both trees). (3) `[web_server.tls] password = "…"` still
-  lands on the real `web_server.password` field (silent, both trees).
+  **Qualifications and out-of-scope findings, as they stood at this change (all three were measured
+  then and all three are fixed now — see the `fix/webserver-tls-cluster` batch below, items A/B/C, and
+  the close notes there).** (1) The precedence claim held for both spellings **inside one
+  `[web_server]` section** only; a file that defined both `[webServer]` and `[web_server]` **discarded
+  the whole `[webServer]` table** — including a nested `[webServer.tls]` — via `normalize.rs`'s
+  `or_insert` section rename, so the flat `web_server.tls_*` value won. (2) The hoist **did not run for
+  `.ini`**: the INI reader stored the section name verbatim, so `[webServer.tls]` became the literal
+  top-level key `"webServer.tls"` and `[web_server.tls]` became `"web_server.tls"` — non-strict dropped
+  the section, strict reported `unknown field "webServer.tls"` (measured in both trees). (3)
+  `[web_server.tls] password = "…"` **landed on the real `web_server.password` field** (silent, both
+  trees).
 
   **Tests** (all in `frp-core/src/config/tests.rs`, real files in their own temp dirs, accessor asserted,
   both loader modes): `nested_web_server_tls_spellings_reach_the_accessor_in_both_modes`,
   `both_spellings_of_one_nested_key_do_not_collide`,
   `nested_web_server_tls_enable_is_accepted_and_inert_in_both_modes`,
   `nested_web_server_tls_enable_warns_once_and_stays_inert` (captured with a `tracing_subscriber` writer),
-  `unknown_nested_web_server_tls_key_still_names_a_parent_level_path`,
+  `unknown_nested_web_server_tls_key_names_the_true_nested_path` (renamed from
+  `…_still_names_a_parent_level_path` when the batch corrected the path it pins),
   `parent_level_alias_beside_nested_spelling_still_loads`,
   `parent_level_snake_spelling_is_still_reported_in_strict_mode`, plus the client arm of
   `test_go_client_web_server_tls_flatten`. Docs carried in the same change:
-  `frp-core/src/config/server.rs`, `frp-core/src/config/restart_only.rs` (two now-false comments),
-  `docs/config.md`, `CHANGELOG.md`. `scripts/compat-test.sh` is not relevant (config loading, no wire
-  byte).
+  `frp-core/src/config/server.rs`, `frp-core/src/config/restart_only.rs` (two comments that the batch
+  later re-derived), `docs/config.md`, `CHANGELOG.md`. `scripts/compat-test.sh` is not relevant (config
+  loading, no wire byte).
 
 - [ ] **`oidc_throttle_tests` is a load-dependent flake: the mock IdP answers 404 for a valid
   request.** `cargo test -p frp-server --lib oidc` failed **3/3** `oidc_throttle_tests` under CPU

@@ -31,7 +31,7 @@
 //! | `[common.webServer.tls] enable`, `-c` | 0 | 0 | 1 |
 //! | inline `common = { … tls = { enable = true } }`, `-c` | 0 | 0 | 1 |
 //! | the same in an `includes` file (`--config-dir`) | 1 | **0** | 1 |
-//! | `[web_server]` + `[webServer.tls] enable` (mixed) | 0 | 0 | 0 |
+//! | `[web_server]` + `[webServer.tls] enable` (mixed) | 0 | 0 | **1** |
 //! | no `enable` key | 0 | 0 | 0 |
 //! | **SIGUSR1 reload** delta on `-c` | +1 | **0** | +1 |
 //!
@@ -323,9 +323,10 @@ fn drain<R: Read + Send + 'static>(mut pipe: R, sink: Arc<Mutex<String>>) {
     });
 }
 
-/// Which spelling of the nested TLS section the config uses. The first two set
-/// the flag; `MixedSections` deliberately does not (the rename discards the
-/// camelCase table whole) and `None` is the control.
+/// Which spelling of the nested TLS section the config uses. The first three all
+/// set the flag — `MixedSections` writes the camelCase `[webServer.tls]` beside a
+/// snake_case `[web_server]`, and the two sections merge per key — and `None` is
+/// the control.
 #[derive(Clone, Copy)]
 enum Section {
     Nested,
