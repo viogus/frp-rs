@@ -4371,6 +4371,11 @@ impl Service {
                 stop_tx: stop_tx.clone(),
                 config_path: self.config_file.clone(),
                 store: self.store_source.clone(),
+                // The admin config GET deduplicates the inert
+                // `[web_server.tls] enable` record per state change (the route
+                // is polled); 0 = nothing observed yet, so the first GET whose
+                // file wrote the key emits. See `config_from_file`.
+                web_server_tls_enable_seen: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             };
             let admin_auth_user = cfg_snapshot.web_server.user.clone();
             let admin_auth_pwd = cfg_snapshot.web_server.password.clone();

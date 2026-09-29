@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
 
@@ -47,6 +48,18 @@ pub struct AdminState {
     /// Optional file-backed store. When present, `/api/store/*` routes are
     /// registered and CRUD operations trigger a reload after persisting.
     pub store: Option<Arc<StoreSource>>,
+    /// Last answer `config_from_file` observed for "did the file write
+    /// `[web_server.tls] enable`", so the config **GET** can emit the inert-key
+    /// diagnostic once per **state change** rather than once per request.
+    ///
+    /// `0` = never observed, `1` = observed written, `2` = observed absent. The
+    /// endpoint is polled (`/api/proxy/{name}/config`,
+    /// `/api/visitor/{name}/config`), so warning per request would be a log
+    /// flood carrying no new information, while the fact being warned about is a
+    /// property of the file, not of the request: warn when the answer becomes
+    /// "written", stay quiet while it stays the same, and warn again if the file
+    /// is edited to remove and then re-add the key. See `config_from_file`.
+    pub web_server_tls_enable_seen: Arc<AtomicU8>,
 }
 
 #[derive(Deserialize)]
@@ -622,7 +635,27 @@ async fn handle_get_visitor_config(
     Err((StatusCode::NOT_FOUND, format!("visitor {name:?} not found")))
 }
 
-/// Load the client config from the stored config path.
+/// Load the client config from the stored config path, and deliver the inert
+/// `[web_server.tls] enable` diagnostic this path used to lose.
+///
+/// The load used to go through `load_client_config` — the silent *file* API —
+/// so when the loader stopped emitting (the record moved to each binary, after
+/// `init_logging`) this became the admin API's only silent load site: measured
+/// end to end against a real `frps`, 3 × `GET /api/proxy/main/config` added
+/// **+0** records while 3 × PUT added +3 (the PUT reaches the service reload,
+/// which emits). `load_client_config_with_presence` returns the flag and the
+/// same entry point the binaries call (`warn_inert_web_server_tls_enable`)
+/// restores it here.
+///
+/// **Once per state change, not once per request.** These two routes are
+/// *polled* — a dashboard or a script may GET the proxy config every second —
+/// so emitting per request would write an identical record forever, while the
+/// fact being warned about (`enable` was written in the file) is a property of
+/// the file, not of the request. The dedup cell on `AdminState` holds the last
+/// answer observed here; the record is emitted only when the answer becomes
+/// "written", so editing the file to drop the key and then re-adding it warns
+/// again. A plain per-process `once` would be wrong in the other direction: it
+/// would stay silent after a reload replaced the file with one that has the key.
 fn config_from_file(
     state: &AdminState,
 ) -> Result<frp_core::config::ClientConfig, (StatusCode, String)> {
@@ -630,12 +663,23 @@ fn config_from_file(
         .config_path
         .as_ref()
         .ok_or_else(|| (StatusCode::NOT_FOUND, "no config file path stored".into()))?;
-    frp_core::config::load_client_config(path, false).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to load config: {e}"),
-        )
-    })
+    let (cfg, presence) =
+        frp_core::config::load_client_config_with_presence(path, false).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load config: {e}"),
+            )
+        })?;
+    const WRITTEN: u8 = 1;
+    const ABSENT: u8 = 2;
+    let written = presence.web_server_tls_enable_set();
+    let previous = state
+        .web_server_tls_enable_seen
+        .swap(if written { WRITTEN } else { ABSENT }, Ordering::Relaxed);
+    if written && previous != WRITTEN {
+        presence.warn_inert_web_server_tls_enable();
+    }
+    Ok(cfg)
 }
 
 async fn handle_put_config(
@@ -1616,6 +1660,7 @@ passwd = "socks-pass"
             stop_tx,
             config_path: None,
             store: Some(store),
+            web_server_tls_enable_seen: Arc::new(AtomicU8::new(0)),
         };
         (state, reload_rx)
     }
@@ -1781,5 +1826,101 @@ passwd = "socks-pass"
             !vj_str.contains("visitor-secret-key"),
             "visitor secret leaked into config JSON: {vj_str}"
         );
+    }
+
+    /// Records `tracing` output into a shared buffer, the pattern
+    /// `frp-core/tests/web_server_tls_enable_warning.rs` uses.
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The admin API's config **GET** delivers the inert
+    /// `[web_server.tls] enable` diagnostic, **once per state change** rather
+    /// than once per request.
+    ///
+    /// `config_from_file` is the function both GET handlers call
+    /// (`handle_get_proxy_config`, `handle_get_visitor_config`) on every
+    /// request. Before this change it loaded through the silent
+    /// `load_client_config`, so the record the loader used to emit was simply
+    /// gone on this path; measured end to end against a real `frps`, three GETs
+    /// added **+0** records while three PUTs added +3 (the PUT triggers the
+    /// service reload, which emits). See `config_from_file`'s doc for why the
+    /// emission is deduplicated: the route is polled, and the fact is a
+    /// property of the file, not of the request.
+    ///
+    /// **What this models.** Three GETs over a file that wrote the key → exactly
+    /// one record; rewrite the file without the key and GET again → still one
+    /// (the answer changed to "absent", nothing to warn); rewrite with the key
+    /// and GET again → two (the answer changed back). Plus a control file with
+    /// no key at all → no record. The config itself is asserted to load in every
+    /// case, so the emission cannot have replaced the return value.
+    ///
+    /// **What it does not cover.** The HTTP layer itself (routing, auth,
+    /// status codes) — other tests in this module cover the router, and the
+    /// handler's use of `config_from_file` is a one-line call; the exact
+    /// poll cadence of any particular client; and the equivalent **server**
+    /// admin paths, of which there are none (this is a client-only API).
+    #[test]
+    fn admin_config_get_warns_once_per_state_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.toml");
+        let with_key = "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\n\
+                        [web_server]\nport = 7400\n[web_server.tls]\nenable = true\n";
+        let without_key = "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\n\
+                           [web_server]\nport = 7400\n";
+
+        let (mut state, _reload_rx) = test_state();
+        state.config_path = Some(path.to_str().unwrap().to_string());
+
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_writer({
+                let output = output.clone();
+                move || CapturedLogs(output.clone())
+            })
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let records = |output: &Arc<std::sync::Mutex<Vec<u8>>>| {
+            String::from_utf8(output.lock().unwrap().clone())
+                .unwrap()
+                .matches("web_server.tls.enable has no effect")
+                .count()
+        };
+
+        // Three GETs over a file that wrote the key: one record.
+        std::fs::write(&path, with_key).unwrap();
+        for _ in 0..3 {
+            let cfg = config_from_file(&state).expect("the GET load must succeed");
+            assert_eq!(cfg.web_server.port, 7400);
+        }
+        assert_eq!(records(&output), 1, "one record for three polls");
+
+        // The answer changes to "absent": no new record.
+        std::fs::write(&path, without_key).unwrap();
+        config_from_file(&state).expect("loads without the key");
+        assert_eq!(records(&output), 1, "a change to `absent` is not a warning");
+
+        // …and back: the state change warns again.
+        std::fs::write(&path, with_key).unwrap();
+        config_from_file(&state).expect("loads with the key again");
+        assert_eq!(records(&output), 2, "re-adding the key warns again");
+
+        // A stable "absent" file stays silent for further polls.
+        std::fs::write(&path, without_key).unwrap();
+        for _ in 0..3 {
+            config_from_file(&state).expect("loads");
+        }
+        assert_eq!(records(&output), 2, "no record while the answer is absent");
+        drop(guard);
     }
 }
