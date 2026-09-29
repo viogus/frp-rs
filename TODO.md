@@ -2093,7 +2093,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     orchestrator had published, which is why no line number is written into the comments or into the PR
     body as if current.
 
-- [ ] **The tls-off dial pin asserts the TCP refusal with a prefix-only `contains`, which both arms'
+- [x] **The tls-off dial pin asserts the TCP refusal with a prefix-only `contains`, which both arms'
   messages satisfy.** `dial_server_refuses_tls_when_tls_is_not_compiled` in
   `frp-core/src/transport/mod.rs` asserts the TCP refusal with `contains("TLS support not compiled")` — a
   24-character needle both source literals begin with (the two full strings are **not** prefixes of each
@@ -2105,6 +2105,21 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `--no-default-features` → rc 0). Filed rather than fixed so that the fix round stayed comment-only.
   **Done-when:** the assertion is end-anchored or negated so the WSS-only wording fails it, with a mutation
   showing the swapped-message case now fails.
+  Done: the assertion at `frp-core/src/transport/mod.rs:2535` now reads
+  `err.to_string().ends_with("TLS support not compiled (enable the 'tls' feature)")` (`:2536`), replacing the
+  24-character prefix-only `contains`. Mutation `tcp_wssmsg` (the TCP arm's literal at
+  `frp-core/src/transport/mod.rs:1703` swapped for the WSS wording) + that assertion, via
+  `cargo test -p frp-core --no-default-features --lib dial_server_refuses_tls_when_tls_is_not_compiled`:
+  rc **101**, panicked at `frp-core/src/transport/mod.rs:2535` with
+  `got: transport error: TLS support not compiled (enable the 'tls' feature for WSS)`; the **same mutation
+  with the old prefix `contains`** was rc **0** (`1 passed; 0 failed`), which is the gap this closes.
+  Unmutated: the same command rc **0** (`1 passed / 0 failed`) and `--features websocket` with `tls` off
+  rc **0**. Sweep of `contains("TLS support not compiled")`: one hit (this assertion); the WSS sibling at
+  `:2557` already asserts the full WSS literal, and the four `frp-client` plugin literals
+  (`… not compiled in`) are asserted nowhere, so no second prefix-only needle. Mutated file restored to
+  sha256 `4a80261dbfb0b40728695744b7457455c86771162afe87e661ef40222b0a04c8`. Ledger: **26 open / 107 closed**
+  → **25 open / 108 closed** (the `- [ ]` → `- [x]` flip moves the item; total stays 133). No CHANGELOG bullet: its `## Unreleased` sections are user-facing
+  (Features/Changed/Fixed/Docs) and recent test/doc-only commits (`c4357fc5`, `66be9ce1`) added none.
 
 - [x] **Pre-existing: no query-parameter-count guard, so >10000 params diverge from Go.**
   Go's `parseQuery` opens with

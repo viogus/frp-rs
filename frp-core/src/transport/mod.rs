@@ -2533,7 +2533,8 @@ mod tests {
             .await
             .expect_err("a tls_enable dial must fail when `tls` is off");
         assert!(
-            err.to_string().contains("TLS support not compiled"),
+            err.to_string()
+                .ends_with("TLS support not compiled (enable the 'tls' feature)"),
             "expected the tls-off refusal, got: {err}"
         );
 
