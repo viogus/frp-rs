@@ -896,10 +896,52 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   **0**; `… check -p frp-core --no-default-features --all-targets` **0**. Six CI count literals re-read with
   `-- --list` and unchanged (frps 29, frpc-tiny 13, `log_completion` 5, frps `warn_delivery` 12, frpc
   `warn_delivery` 8, `admin_config_get_warning` 4). Docs: `docs/config.md:192` now names both variants and
-  which builds get each; `CHANGELOG.md` gained one `### Fixed` bullet. Ledger after this close: **25 open /
-  107 closed**, measured by `grep -c '^- \[ \]' TODO.md` / `grep -c '^- \[x\]' TODO.md` — those read **26**
-  open before this tick, so the filing note above already under-counted open by one; the closed count moves
-  106 → 107.
+  which builds get each; `CHANGELOG.md` gained one `### Fixed` bullet.
+  **Round 2 fixed the pin itself:** those eight `cfg!` arguments were pinned by nothing. Every needle the
+  tests asserted was in *both* texts, and the only variant-distinguishing test passed `has_dashboard` as a
+  **literal** argument, so a call site that hardcoded the wrong answer compiled clean and stayed green.
+  (Reproduced by #411's round-2 review: both `frps` sites set to `cfg!(feature = "admin")`, built
+  `--features dashboard`, printed "no dashboard support" while 27500 was genuinely open, with `frps`
+  `warn_delivery` 12, `frpc` `warn_delivery` 8 and `frp-core --lib config` 342 all passing. Note the hole
+  is the **boolean**, not the word: `cfg!(feature = "admin")` inside `frps` does trip the
+  `RUSTFLAGS="-D warnings"` lanes with `unexpected cfg condition value: 'admin'`.) The clause is now
+  asserted inside the existing tests, keyed on the build: `assert_clause_matches_this_build` in
+  `frps/tests/warn_delivery.rs` (`cfg!(feature = "dashboard")`, also called from the SIGUSR1 reload test so
+  the `frp-server/src/service.rs:2315` site is covered) and in `frpc/tests/warn_delivery.rs`
+  (`cfg!(feature = "admin")`), plus `assert_clause_is_the_dashboard_one` in
+  `frpc/tests/admin_config_get_warning.rs`, called from `assert_records` so all four tests reach it. The
+  markers are `plaintext HTTP` and `no dashboard support` (`web_server.tls.enable has no effect` is in both
+  and cannot tell them apart), and no test count changed (12 / 8 / 4). `ci.yml` gained a **default-feature**
+  `frps` `warn_delivery` step — a separate step rather than an extension of the `cli_exit_codes` step,
+  whose guard is `env.FRPS_CLI_TESTS` for a different file — because before it no lane ran that file
+  without `--features dashboard`, which is what left the no-dashboard direction unobservable. Mutants
+  re-run in a `git archive` copy with its own target dir: `frps/src/main.rs:219` → `false` is a no-op in the
+  default lane (that lane's correct value) and reds the dashboard lane (rc **101**, panic at
+  `frps/tests/warn_delivery.rs:398`), while → `true` reds the **default** lane (rc **101**, panic at
+  `frps/tests/warn_delivery.rs:409`); each was restored and the copied file's sha256 returns to
+  `e5edacf7dd83bccfc5e3d9e51a7a8cf3d68fdbdb663c20f10b7c3c82c80c9c04`. Both lanes green on the unmutated
+  tree (12 passed each). Ledger after this close: **25 open / 107 closed**, measured by
+  `grep -c '^- \[ \]' TODO.md` / `grep -c '^- \[x\]' TODO.md` — those read **26** open before this tick, so
+  the filing note above already under-counted open by one; the closed count moves 106 → 107. Filing the
+  `admin`-without-`tls` item below moves it to **26 open / 107 closed**.
+
+- [ ] **The dashboard clause of the `web_server.tls.enable` warning is still wrong for an `admin`-without-`tls`
+  client build.** Filed by #411's round-2 adversarial review; the item above is the two-variant fix it
+  reviews. That fix picks the text from the caller's `cfg!`, and `frp-client`'s admin path passes
+  `cfg!(feature = "admin")`. But `admin` does **not** imply `tls`: `frp-client/src/admin.rs:1149` gates the
+  acceptor on `#[cfg(feature = "tls")]` and `frp-client/src/admin.rs:1164` discards the configured pair in
+  the `not(feature = "tls")` arm. So `cargo build -p frpc --no-default-features --features micro,admin`
+  (rc 0) is an `admin` build that prints the dashboard clause — "the dashboard HTTPS server is enabled by a
+  non-empty `cert_file` + `key_file` pair" — while its admin listener logs
+  `frpc admin server listening on 127.0.0.1:27598` with no `(TLS)` suffix and answers a plaintext `curl`
+  with **404**. That is the same class of falsehood the item above removed, one feature interaction further
+  in. Done-when: the admin call sites (`frp-client/src/admin.rs:771`, `frp-client/src/service.rs:4457`)
+  answer with `cfg!(all(feature = "admin", feature = "tls"))`, or a third text exists for "an admin server
+  with no TLS" — whichever the maintainer prefers — and a test pins the emitted text in the
+  `--no-default-features --features micro,admin` build, so the `admin`-without-`tls` combination names no
+  TLS acceptor it cannot build. `docs/config.md:192` then loses the `admin`-without-`tls` caveat this
+  filing added, because the sentence becomes unconditionally true again. Ledger after filing this item:
+  **26 open / 107 closed**.
 
 - [x] **`docs/config.md` advertises four camelCase TLS aliases that no loader accepts.**
   The `tls_only`, `tls_cert_file`, `tls_key_file` and `tls_ca_file` rows at `docs/config.md:26-29`

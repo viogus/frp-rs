@@ -420,6 +420,16 @@ User-facing release notes for frp-rs.
   `frps-micro` and `frps-tiny` print the no-dashboard sentence and leave
   `web_server.port` closed, the default `frps` prints it too, and
   `frps --features dashboard` keeps the pair clause and listens.
+  Round 2 closed the gap that fix left: the two texts were told apart only by a test
+  that passed `has_dashboard` as a literal, so nothing checked what a real build
+  answered — a call site hardcoding the other variant compiled clean and stayed green.
+  The clause is now asserted by `cfg!`-keyed checks inside the existing `frps` and
+  `frpc` warning-delivery tests (and `frpc`'s admin-config test), keyed on
+  `plaintext HTTP` versus `no dashboard support`, and CI gained a default-feature
+  `frps` `warn_delivery` lane so the no-dashboard direction is observable at all.
+  `docs/config.md` also no longer states the `cert_file`/`key_file` pair rule
+  unconditionally: an `admin`-without-`tls` client build has no TLS acceptor to hand
+  the pair to, which is filed as its own item.
 - **The server `tls_enable` warning now describes what actually happens to the
   certificate pair, in every build, and no longer fires for a
   `[common.transport.tls] tls_enable` that never reaches the loader.** With only

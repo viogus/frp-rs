@@ -95,6 +95,14 @@ const SETTLE: Duration = Duration::from_millis(500);
 const STARTUP_MARKER: &str = "frpc (Rust) v";
 /// The key, as the message names it.
 const KEY: &str = "web_server.tls.enable";
+/// The marker unique to the **dashboard-build** clause
+/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING`): the only words a build with no admin
+/// server must never print.
+const DASHBOARD_CLAUSE: &str = "plaintext HTTP";
+/// The marker unique to the **no-dashboard-build** clause
+/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD`). The two clauses share
+/// their whole first half, so `KEY` above is in both and cannot tell them apart.
+const NO_DASHBOARD_CLAUSE: &str = "no dashboard support";
 /// The **server-side** flat `tls_enable` diagnostic. It must never appear in
 /// `frpc`: `ClientConfig::tls_enable` is live (it decides whether the control
 /// connection is encrypted — `frp-client/src/control.rs`), so the "no effect"
@@ -341,8 +349,9 @@ fn occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
 }
 
-/// The shared assertion: one record on **stdout**, none on **stderr**, and the
-/// binary really did start.
+/// The shared assertion: one record on **stdout**, none on **stderr**, the
+/// binary really did start, and the record carries the clause **this build**
+/// answers with.
 fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
     let out = spawned.stdout();
     let err = spawned.stderr();
@@ -360,6 +369,49 @@ fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
         0,
         "{tag}: the console sink is stdout; stderr must carry none\n--- stderr ---\n{err}"
     );
+    assert_clause_matches_this_build(tag, spawned);
+}
+
+/// The clause the emitted record must carry — decided by **this build**, not by
+/// a literal argument.
+///
+/// Both variants open with the same `web_server.tls.enable has no effect: …`, so
+/// the count assertions above pass either way: a `frpc/src/main.rs` call site
+/// (or `frp-client/src/service.rs:4457`) that hardcodes the other answer still
+/// compiles and still emits one `KEY` record. `frp-core`'s own dispatch test
+/// passes `has_dashboard` as an argument, so only this `cfg!`-keyed assertion on
+/// the captured stdout can see what the binary answered.
+///
+/// Keyed on **`admin`**, the client's own word (`frp-client`'s `admin` feature,
+/// which `frpc` forwards) — not on `dashboard`, which `frpc` does not have. The
+/// plain `cargo test -p frpc` lane runs with `admin` off, so the no-dashboard
+/// direction is pinned there without a new lane.
+fn assert_clause_matches_this_build(tag: &str, spawned: &Spawned) {
+    let out = spawned.stdout();
+    let err = spawned.stderr();
+    if cfg!(feature = "admin") {
+        assert!(
+            out.contains(DASHBOARD_CLAUSE),
+            "{tag}: a build that compiles the admin server must keep the dashboard clause \
+             ({DASHBOARD_CLAUSE:?})\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+        );
+        assert!(
+            !out.contains(NO_DASHBOARD_CLAUSE),
+            "{tag}: a build that compiles the admin server must not claim it has no dashboard \
+             support ({NO_DASHBOARD_CLAUSE:?})\n--- stdout ---\n{out}"
+        );
+    } else {
+        assert!(
+            out.contains(NO_DASHBOARD_CLAUSE),
+            "{tag}: a build with no admin server must name its own build fact rather than the \
+             dashboard's ({NO_DASHBOARD_CLAUSE:?})\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+        );
+        assert!(
+            !out.contains(DASHBOARD_CLAUSE),
+            "{tag}: a build with no admin server must not describe the dashboard's TLS \
+             ({DASHBOARD_CLAUSE:?})\n--- stdout ---\n{out}"
+        );
+    }
 }
 
 #[test]
@@ -451,6 +503,7 @@ fn warning_when_the_camelcase_tls_table_is_merged_into_the_snake_section() {
         "exactly one record on the console sink\n--- stdout ---\n{out}"
     );
     assert_eq!(occurrences(&err, KEY), 0, "stderr:\n{err}");
+    assert_clause_matches_this_build("frpc -c (mixed sections)", &spawned);
 }
 
 /// The client writes the **same flat key name** the server warning is about, but

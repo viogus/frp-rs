@@ -94,6 +94,14 @@ const SIGNAL_READY_MARKER: &str = "SIGUSR1 reload ready";
 const RELOAD_MARKER: &str = "SIGUSR1:";
 /// The key, as the message names it.
 const KEY: &str = "web_server.tls.enable";
+/// The marker unique to the **dashboard-build** clause
+/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING`): the only words a build with no
+/// dashboard must never print.
+const DASHBOARD_CLAUSE: &str = "plaintext HTTP";
+/// The marker unique to the **no-dashboard-build** clause
+/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD`). The two clauses share
+/// their whole first half, so `KEY` above is in both and cannot tell them apart.
+const NO_DASHBOARD_CLAUSE: &str = "no dashboard support";
 /// The **second** diagnostic this file now pins: the flat server `tls_enable` is
 /// inert too (`TODO.md` item), and it warns from the same three sites. Kept as a
 /// substring of `SERVER_TLS_ENABLE_INERT_WARNING` so a count of it cannot match
@@ -362,10 +370,53 @@ fn occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
 }
 
-/// The shared assertion: one record on **stdout**, none on **stderr**, and the
-/// binary really did start.
+/// The shared assertion: one record on **stdout**, none on **stderr**, the
+/// binary really did start, and the record carries the clause **this build**
+/// answers with.
 fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
     assert_one_warning_on_stdout_for(tag, spawned, KEY);
+    assert_clause_matches_this_build(tag, spawned);
+}
+
+/// The clause the emitted record must carry — decided by **this build**, not by
+/// a literal argument.
+///
+/// The two variants share their whole first half (`web_server.tls.enable has no
+/// effect: …`), so every count assertion in this file passes for either one: a
+/// call site that hardcodes the other answer still compiles, still emits exactly
+/// one `KEY` record, and still satisfies `frp-core`'s own dispatch test — that
+/// one passes `has_dashboard` as an argument, so it never sees a real build's
+/// answer. Only a `cfg!`-keyed assertion on the captured stdout can, and that is
+/// what binds `frps/src/main.rs:219`/`:311` (and the reload site,
+/// `frp-server/src/service.rs:2315`) to the build under test. The lane that runs
+/// this file **without** `--features dashboard` is what makes the other
+/// direction observable.
+fn assert_clause_matches_this_build(tag: &str, spawned: &Spawned) {
+    let out = spawned.stdout();
+    let err = spawned.stderr();
+    if cfg!(feature = "dashboard") {
+        assert!(
+            out.contains(DASHBOARD_CLAUSE),
+            "{tag}: a build that compiles a dashboard must keep the dashboard clause \
+             ({DASHBOARD_CLAUSE:?})\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+        );
+        assert!(
+            !out.contains(NO_DASHBOARD_CLAUSE),
+            "{tag}: a build that compiles a dashboard must not claim it has no dashboard \
+             support ({NO_DASHBOARD_CLAUSE:?})\n--- stdout ---\n{out}"
+        );
+    } else {
+        assert!(
+            out.contains(NO_DASHBOARD_CLAUSE),
+            "{tag}: a build with no dashboard must name its own build fact rather than the \
+             dashboard's ({NO_DASHBOARD_CLAUSE:?})\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+        );
+        assert!(
+            !out.contains(DASHBOARD_CLAUSE),
+            "{tag}: a build with no dashboard must not describe the dashboard's TLS \
+             ({DASHBOARD_CLAUSE:?})\n--- stdout ---\n{out}"
+        );
+    }
 }
 
 /// [`assert_one_warning_on_stdout`] for an arbitrary key, so the flat server
@@ -526,6 +577,7 @@ fn a_sigusr1_reload_delivers_the_warning_again() {
         "startup + reload = exactly 2 records, one per load\n--- stdout ---\n{out}"
     );
     assert_eq!(occurrences(&spawned.stderr(), KEY), 0);
+    assert_clause_matches_this_build("frps reload", &spawned);
 }
 
 /// Negative control: without the key there is no record on either stream, so the
