@@ -247,8 +247,9 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
 
   Residue, recorded below as new items: `auth.method` parsing is inconsistent across the three sites
   (the client compares case-sensitively; unknown/whitespace spellings fall back to `Token` on both
-  sides), the client's admin-triggered `reload` never re-derives auth, and `oidc_throttle_tests` is
-  load-dependent because the mock IdP can read 0 bytes after accepting.
+  sides), the client's admin-triggered `reload` never re-derives auth, and `oidc_throttle_tests` —
+  filed here as load-dependent, since fixed: the mock IdP could read 0 bytes after accepting because
+  the accepted socket inherited the listener's non-blocking mode (see the item below).
 - [ ] **The help *document* is bpaf's, not cobra's — every `--help` surface is a different
   document from Go's, not just a different layout.** Filed by the `--help=<bool>` round
   (`TODO.md:3274`), which matched the *behaviour* of every help argv and deliberately left the
@@ -1012,17 +1013,90 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   later re-derived), `docs/config.md`, `CHANGELOG.md`. `scripts/compat-test.sh` is not relevant (config
   loading, no wire byte).
 
-- [ ] **`oidc_throttle_tests` is a load-dependent flake: the mock IdP answers 404 for a valid
-  request.** `cargo test -p frp-server --lib oidc` failed **3/3** `oidc_throttle_tests` under CPU
-  load with `OIDC: openid-configuration returned 404 Not Found`, while a serial run passes 6/6 and
-  the 469-test `-p frp-server --features dashboard --lib` run passes; measured 2026-09-25 by the
-  first review round on `9c3ddd0`, whose change does not touch `control/login.rs`. Mechanism:
-  `oidc_mock_server` (`frp-server/src/control/login.rs:2159`) accepts on a **non-blocking** listener
-  and reads the request with `Read::read(&mut stream, &mut buf).unwrap_or(0)` (`:2183`), so when the
-  accept fires before the client's bytes arrive the read returns `WouldBlock` → 0 bytes → the path
-  falls back to `/` → 404. CI runs these tests in parallel, so the lane can flake. **Done-when:** the
-  mock waits for the request line (or the tests retry), pinned by a looped run of the three tests
-  under load.
+- [x] **`oidc_throttle_tests` was filed as a load-dependent flake: the mock IdP answers 404 for a
+  valid request.** `cargo test -p frp-server --lib oidc` failed **3/3** `oidc_throttle_tests` under
+  CPU load with `OIDC: openid-configuration returned 404 Not Found`, while a serial run passes 6/6
+  and the 469-test `-p frp-server --features dashboard --lib` run passes; measured 2026-09-25 by the
+  first review round on `9c3ddd0`, whose change does not touch `control/login.rs`. Mechanism
+  (established by measurement on **macOS**, with the pinned rustc 1.98.1): `oidc_mock_server` accepts
+  on a **non-blocking** listener and **on macOS** the accepted stream inherits that mode — a fresh
+  accepted stream's first `read` with nothing sent returns `Err(WouldBlock, os error 35)` — so the
+  single `Read::read(&mut stream, &mut buf).unwrap_or(0)` returned 0 bytes whenever the accept beat
+  the client's write, and the path fell back to `/` → 404. CPU load is what let the accept win; it is
+  not a second cause. **The inheritance is platform-specific, so the race is macOS-only** — but that
+  does **not** make the pre-fix 404 macOS-only, because the same `unwrap_or(0)` also swallowed EOF:
+  on Linux the accepted stream is **blocking** (measured with the same rustc 1.98.1 in a
+  `rust:1.98.1-slim` container, kernel 6.8.0/Ubuntu 24.04: a 500 ms `SO_RCVTIMEO` was waited out in
+  515 ms, and a pre-fix-style single read — no mode change, no timeout — returned the full request
+  304.7 ms after a client that slept 300 ms), so the *race* cannot flake the ubuntu lanes; but an
+  **EOF is platform-independent**: a client that connects and half-closes before sending gives `n=0` →
+  `/` → 404 on both (measured: 3.833 µs macOS, 1.625 µs Linux), and a **head split across writes**
+  mis-routes on both (measured on Linux; the elapsed figure is shape-dependent and named with its shape —
+  with the first write ~200 ms after the accept, `n=16`, `path="/.well-known"` → 404 in ~208 ms, while an
+  immediate first write gives the same `n=16` and the same mis-route in 192 µs). The
+  accumulation half of the fix is therefore load-bearing on Linux too, and the fix is **not** a Linux
+  no-op. (No CI incidence is claimed for either shape — that was not measured; what is measured is that
+  the old code produced the same 404 on both platforms, since the failing tests are the ones that
+  exercise this mock.) Every `ci.yml` job is `ubuntu-latest` (the only macOS runner,
+  `release.yml:134`, only builds).
+  **Done-when:** the mock waits for the request line (or the tests retry), pinned by a looped run of
+  the three tests under load.
+  Done: fixed in this change, entirely inside `mod oidc_throttle_tests`: `read_request_head` clears
+  `O_NONBLOCK`, bounds the whole wait with a 5 s deadline (an `SO_RCVTIMEO` no larger than the
+  remaining budget) and accumulates through `\r\n\r\n` before routing; EOF is reported as `Eof` rather
+  than mapped to an empty head; on expiry the mock answers an explicit `500` naming the cause instead
+  of falling through to `/` → 404. Production is untouched:
+  the mock is `#[cfg(test)]`-only and `verify_login_auth` never calls it; production accept paths use
+  `tokio::net::TcpListener` (`frp-server/src/vhost.rs:1523`, `frp-server/src/tcpmux.rs:320`,
+  `frp-server/src/service.rs:643`), and the only production `set_nonblocking` is the deliberate
+  raw-splice pair in `frp-core/src/splice.rs:396-399`. Pins with literal rcs:
+  `mock_idp_serves_a_request_that_arrives_after_accept` — a client connects, sleeps 0/5/20/50 ms,
+  then sends — is the **race** pin: **red on `d1be6675`** on macOS (rc 101; the first delayed
+  iteration was answered `HTTP/1.1 404 OK`), **green after** (rc 0). On Linux it is **green-before**
+  (measured above), so it guards nothing in the ubuntu lanes; the **platform-independent** red-before
+  pin is `mock_idp_answers_an_explicit_error_when_the_client_closes_before_sending` (a half-closed
+  client got `404 OK` from the pre-fix read on both platforms). The rest of the guards are the
+  helper-level pins, which force the accepted side non-blocking themselves:
+  `read_request_head_waits_for_a_request_that_arrives_after_accept` (150 ms writer delay plus a
+  measured elapsed floor), `read_request_head_times_out_on_a_client_that_never_sends` (200 ms
+  deadline, bounded above and below),
+  `read_request_head_reports_eof_when_the_client_closes_before_sending` (a half-close must be a fast,
+  named `Eof`),
+  `read_request_head_accumulates_a_head_split_across_reads` (two split points, one cutting the
+  `\r\n\r\n` terminator in half), `read_request_head_rejects_an_over_max_head_without_a_terminator`
+  (`TooLarge(8192)`, and fast) and `read_request_head_stops_at_the_terminator` (a pipelined tail in the
+  same read is not appended to the head), plus
+  `mock_idp_answers_an_explicit_error_when_no_request_line_arrives` (500 + cause, then the accept
+  loop keeps serving) for the wait, the bound and the failure, and
+  `mock_idp_stops_serving_after_the_stop_signal` (`send(())` really ends the accept loop — the listener
+  is refused afterwards) with `mock_default_request_head_deadline_is_pinned` (the shipped 5 s value;
+  its end-to-end effect is deliberately not exercised, which would cost 5 s per run). The new pins were
+  demonstrated red against mutants: a single **blocking** read with the mode clear kept and no
+  accumulation or truncation → rc 101, exactly the split, over-max and terminator pins fail while all
+  **fourteen** other `oidc` tests stay green (the note said "ten" while the filter had 14 tests and
+  "twelve" while it had 17; the count moves with every pin added, so it is measured here, not carried);
+  `TooLarge` guard deleted → rc 101, only the over-max pin fails (`got Eof`); terminator
+  searched only in the newly-read chunk → rc 101, only the split pin fails; `Ok(0) => continue` →
+  rc 101, the EOF pins fail (the helper one reporting `TimedOut` instead of `Eof`); the `break` deleted
+  from the stop check → rc 101, only the stop pin fails (`the mock kept accepting connections after
+  send(())`); the deadline raised to 60 s → rc 101, only the default-deadline pin fails;
+  `buf.truncate(end + 4)` removed → rc 101, only the terminator pin fails. A broader single-read mutant
+  that *also* drops the `set_nonblocking(false)` clear reds 8 of 17 (it reaches the three `oidc_*`
+  originals, nondeterministically). Three mutants the round-3 review listed are deliberately **not**
+  pinned, because none is a one-liner:
+  removing the `remaining.is_zero()` guard (it needs a read that lands exactly on the expired budget),
+  moving the size cap ahead of the terminator search (it needs a head that crosses 8192 bytes with its
+  terminator in the crossing read), and the stop-latency gap (stated, not bounded). The **load
+  sensitivity** is separate and statistical:
+  **one sample on a shared host under stated ambient load, not a rate** — 50 iterations of the three
+  original tests in the `frp-server` lib test binary (`--test-threads` default) failed **11/50** under
+  8 concurrent `yes` CPU burners pre-fix (0/50 idle) and 0/50 after. Two independent runs of the same
+  method on the same shared host gave pre-fix idle 1/50, loaded 21/50 (reviewer 1) and idle 0/50,
+  loaded 0/50 at 50 iterations but 10/200 at 200 (reviewer 2). Reviewer 1 recorded the `loadavg`
+  3.9–8.0 with other users active; reviewer 2's arms did not record it — so the ambient-load figure
+  belongs to reviewer 1's samples only. The direction is reproducible, the literal rate is not. A
+  trustworthy figure would need a quiet host, several samples per arm, and the ambient load recorded
+  with each.
 
 **The SSH readiness fix (#344) left two sites and one unbounded case.**
 - [x] Two SSH-gateway tests still connect with a bare `.unwrap()` and no readiness wait.

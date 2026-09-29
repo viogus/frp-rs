@@ -6,8 +6,12 @@
 //! binary is order-dependent: that binary runs ~980 tests in parallel, several of
 //! which install or replace a subscriber, and the capture was measured failing
 //! 2 of 3 full-suite runs (and passing when run alone, and in a serial run) while
-//! costing ~7 s per attempt to observe — exactly the class of load-dependent test
-//! flake the repo already carries an item for (`oidc_throttle_tests`). One test
+//! costing ~7 s per attempt to observe — the interference here is genuinely
+//! order-dependent, unlike the `oidc_throttle_tests` item this once cited as a
+//! sibling class: that one was an accept-before-request-bytes race in its mock IdP,
+//! deterministic on macOS (where the accepted socket inherits the listener's
+//! non-blocking mode) and absent on Linux (where it does not), and fixed by making
+//! the mock wait for the request head regardless of the inherited mode. One test
 //! per process removes the interference. The *inertness* half of the claim stays
 //! in the unit suite (`nested_web_server_tls_enable_is_accepted_and_inert_in_both_modes`);
 //! what lives here is the diagnostic: the presence flag survives the load, the
