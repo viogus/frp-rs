@@ -1,0 +1,462 @@
+//! The server's flat `tls_enable` — the **presence flag** the loader carries out
+//! and the **message** the binaries emit from it, asserted in this file's own
+//! test binary rather than in `frp-core/src/config/tests.rs`.
+//!
+//! **Why a separate target.** Same reason as the sibling
+//! `web_server_tls_enable_warning.rs`: a `tracing` capture inside the `frp-core`
+//! unit binary is order-dependent (that binary runs ~980 tests in parallel, and
+//! several install or replace a subscriber), so a load-dependent capture there is
+//! a flake. One test per process removes the interference; the *inertness* half
+//! of the claim (no reader of `ServerConfig::tls_enable`) is a grep over
+//! `frp-server/src` + `frps/src` recorded in the item, not something a runtime
+//! test can assert.
+//!
+//! **What this models.** A real `load_server_config_uncompleted_with_presence`
+//! call on a real file, with a `tracing_subscriber::fmt` writer installed as the
+//! scoped default and **still installed** for the subsequent
+//! `ConfigPresence::warn_inert_server_tls_enable` — the same call `frps` and
+//! `frp-server`'s reload make after `init_logging`.
+//!
+//! **Which spellings count, and which do not.** `ServerConfig::tls_enable` is a
+//! flat field with `#[serde(default)]` and **no alias**
+//! (`frp-core/src/config/server.rs:42-43`), unlike `bind_port`'s `bindPort`. The
+//! keys a user can write that land in it are: the snake_case `tls_enable` at the
+//! top level, `tls_enable` under `[common]` (flattened by
+//! `normalize_server_config` via `table.entry(k).or_insert(v)`, so the top-level
+//! key wins), and a literal `tls_enable` inside `[transport.tls]` — the lift
+//! renames only its four Go keys and passes everything else through unchanged
+//! (`frp-core/src/config/normalize.rs:802-809`), so that key is hoisted onto the
+//! same field. Either way the key was *written*. An `includes` file counts too:
+//! `process_includes` deep-merges before the detector runs. The camelCase
+//! `tlsEnable` never matches — it is absent from `known_server_keys()`, so the
+//! lenient loader drops it (the field keeps its `false` default, which is
+//! "unrecognized", not "inert") and the strict loader refuses it.
+//!
+//! **Why a written key warns but a synthesized one does not.** The server
+//! normalizer *synthesizes* `tls_enable = true` from the legacy
+//! `[transport.tls]` section when it carries `force = true`, `certFile` or
+//! `keyFile` (`frp-core/src/config/normalize.rs:798-816`,
+//! `table.entry("tls_enable").or_insert(…)`) — a Go-shaped input, not a user
+//! writing the frp-rs-only field. After normalization the two are
+//! indistinguishable, so `ConfigPresence::server_tls_enable_set_in` reads the
+//! **raw** value. The `[transport.tls] enable` spelling is a deliberately
+//! *unrecognized* neighbour: the *server* lift has no `"enable"` arm (only the
+//! client's does, at `frp-core/src/config/normalize.rs:1363`), so it stays a
+//! top-level key literally named `enable` — ignored leniently, refused strictly —
+//! and never sets `tls_enable` at all. Every case is pinned below.
+//!
+//! **What it does not cover.** Delivery on a real binary is
+//! `frps/tests/warn_delivery.rs` (real `frps`, `-c` and `--config-dir`, stdout and
+//! stderr captured separately, plus a real SIGUSR1 reload adding a record). The
+//! client side is deliberately **not** covered because it must stay silent:
+//! `ClientConfig::tls_enable` is live (`frp-client/src/control.rs:389-395` reads
+//! it), so no `frpc`/`frp-client` site calls `warn_inert_server_tls_enable`, and
+//! that absence is pinned by the existing `frpc` warning-delivery tests plus the
+//! grep recorded in the item. YAML and `.ini` spellings are out of scope (only
+//! TOML is exercised).
+
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
+
+use frp_core::config::{
+    load_server_config_from_str, load_server_config_uncompleted_with_presence, ConfigPresence,
+    SERVER_TLS_ENABLE_INERT_WARNING,
+};
+
+/// The stable substring every assertion counts. If the `tracing::warn!` call is
+/// removed the counts drop to zero; if the message is reworded so this stops
+/// appearing, the tests fail on the needle rather than passing vacuously.
+const NEEDLE: &str = "tls_enable has no effect on the server";
+
+#[derive(Clone)]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// One captured load: the text emitted **during the load**, the text the
+/// `warn_inert_server_tls_enable` call appended (with its record count), the
+/// presence flag, and the effective server fields the warning talks about.
+struct Captured {
+    logged_during_load: String,
+    warning_records: usize,
+    logged_by_warning_call: String,
+    presence: ConfigPresence,
+    tls_enable: bool,
+    tls_only: bool,
+    cert: String,
+    key: String,
+}
+
+fn snapshot(output: &Arc<Mutex<Vec<u8>>>) -> String {
+    String::from_utf8(output.lock().unwrap().clone()).unwrap()
+}
+
+/// Load `body` through the real loader and then call the binaries' entry point,
+/// all under one capturing subscriber, and return what each phase emitted.
+fn load_capturing(body: &str, strict: bool) -> Captured {
+    load_capturing_files(&[("frps.toml", body)], strict)
+}
+
+/// [`load_capturing`] with extra files in the same directory, so the `includes`
+/// spelling (deep-merged before the detector runs) can be exercised.
+fn load_capturing_files(files: &[(&str, &str)], strict: bool) -> Captured {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.toml");
+    for (name, body) in files {
+        std::fs::write(dir.path().join(name), body).unwrap();
+    }
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = subscriber_for(&output);
+    let guard = tracing::subscriber::set_default(subscriber);
+    let (mut cfg, presence) =
+        load_server_config_uncompleted_with_presence(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("strict={strict}: must load:\n{e}"));
+
+    // Snapshot before the entry point runs, so "the loader is silent" is a real
+    // assertion rather than an inference from the total.
+    let logged_during_load = snapshot(&output);
+    cfg.complete();
+
+    let before = output.lock().unwrap().len();
+    presence.warn_inert_server_tls_enable();
+    let appended = String::from_utf8(output.lock().unwrap()[before..].to_vec()).unwrap();
+    drop(guard);
+
+    Captured {
+        warning_records: appended.matches(NEEDLE).count(),
+        logged_by_warning_call: appended,
+        logged_during_load,
+        presence,
+        tls_enable: cfg.tls_enable,
+        tls_only: cfg.tls_only,
+        cert: cfg.tls_cert_file.clone(),
+        key: cfg.tls_key_file.clone(),
+    }
+}
+
+/// The strict-mode failure shape: load under a capturing subscriber, expect the
+/// load to be refused, and return the error text. The warning is never reached
+/// (there is no `ConfigPresence`), which is itself the point: a refused key is
+/// not a written-and-inert key.
+fn load_capturing_expect_err(body: &str) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.toml");
+    std::fs::write(&path, body).unwrap();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = subscriber_for(&output);
+    let guard = tracing::subscriber::set_default(subscriber);
+    let err = load_server_config_uncompleted_with_presence(path.to_str().unwrap(), true)
+        .expect_err("strict mode must refuse this key")
+        .to_string();
+    assert_eq!(
+        snapshot(&output),
+        "",
+        "a refused load emits nothing; there is no presence to warn from"
+    );
+    drop(guard);
+    err
+}
+
+fn subscriber_for(
+    output: &Arc<Mutex<Vec<u8>>>,
+) -> impl tracing::Subscriber + Send + Sync + 'static {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .without_time()
+        .with_writer({
+            let output = output.clone();
+            move || CapturedLogs(output.clone())
+        })
+        .finish()
+}
+
+/// The message must be true in every combination: it has to name the inertness,
+/// the real switch, and how the acceptor's certificate is really obtained —
+/// including the auto-generated fallback the server takes when both file paths
+/// are empty (measured on `frps` v0.71.0: with no cert files configured it logs
+/// `TLS enabled with auto-generated self-signed certificate` and still emits
+/// this warning, so the old "non-empty pair" claim was false for the very config
+/// that fires it).
+#[test]
+fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
+    assert!(
+        SERVER_TLS_ENABLE_INERT_WARNING.contains(NEEDLE),
+        "the const must carry the needle the tests count: {SERVER_TLS_ENABLE_INERT_WARNING}"
+    );
+    for fact in [
+        "nothing in frp-server or frps reads it",
+        "`tls_only`",
+        "`tls_cert_file`",
+        "`tls_key_file`",
+        "auto-generates a self-signed certificate pair",
+    ] {
+        assert!(
+            SERVER_TLS_ENABLE_INERT_WARNING.contains(fact),
+            "the message must name {fact:?}: {SERVER_TLS_ENABLE_INERT_WARNING}"
+        );
+    }
+    // The acceptor is *not* pair-gated: with neither file set the server
+    // auto-generates a self-signed pair. A "non-empty pair" claim here would be
+    // false for the config that fires the warning (F1 regression guard).
+    assert!(
+        !SERVER_TLS_ENABLE_INERT_WARNING.contains("non-empty"),
+        "the message must not claim a non-empty pair is required: {SERVER_TLS_ENABLE_INERT_WARNING}"
+    );
+}
+
+/// A written `tls_enable`, in either value, is inert — so it warns, exactly
+/// once, in both strict modes, and the loader itself stays silent.
+#[test]
+fn written_server_tls_enable_warns_once_and_stays_inert() {
+    for (written, mode) in [
+        ("true", false),
+        ("true", true),
+        ("false", false),
+        ("false", true),
+    ] {
+        let value = written == "true";
+        let c = load_capturing(&format!("bind_port = 7000\ntls_enable = {written}\n"), mode);
+        assert_eq!(
+            c.logged_during_load, "",
+            "strict={mode}, tls_enable={written}: the loader itself must stay silent"
+        );
+        assert!(
+            c.presence.server_tls_enable_set(),
+            "strict={mode}, tls_enable={written}: the flag must survive the load"
+        );
+        assert_eq!(
+            c.warning_records, 1,
+            "strict={mode}, tls_enable={written}: exactly one record per load"
+        );
+        assert!(
+            c.logged_by_warning_call.contains(NEEDLE),
+            "strict={mode}: the record must be the server message"
+        );
+        // The field really parses to the written value — it is inert because no
+        // reader exists, not because the value is lost.
+        assert_eq!(
+            c.tls_enable, value,
+            "strict={mode}, tls_enable={written}: the field still carries the written value"
+        );
+    }
+
+    // Control: no key at all. No flag, no record.
+    let c = load_capturing("bind_port = 7000\n", false);
+    assert!(
+        !c.presence.server_tls_enable_set(),
+        "absent key must not set the flag"
+    );
+    assert_eq!(c.warning_records, 0, "absent key must not warn");
+    assert!(!c.tls_enable, "absent key leaves the default");
+}
+
+/// The legacy `[transport.tls]` section synthesizes `tls_enable = true` — that is
+/// not the user writing the flat field, so it must stay silent.
+#[test]
+fn synthesized_tls_enable_stays_silent() {
+    // `force = true` → `tls_only`, plus a synthesized `tls_enable`.
+    let c = load_capturing("bind_port = 7000\n[transport.tls]\nforce = true\n", false);
+    assert!(c.tls_enable, "`force` synthesizes tls_enable = true");
+    assert!(c.tls_only, "`force` is the real switch: tls_only");
+    assert!(
+        !c.presence.server_tls_enable_set(),
+        "a synthesized key was not written"
+    );
+    assert_eq!(c.warning_records, 0, "a synthesized key must not warn");
+
+    // `certFile`/`keyFile` → the pair that actually builds the acceptor, plus the
+    // same synthesized `tls_enable`.
+    let c = load_capturing(
+        "bind_port = 7000\n[transport.tls]\ncertFile = \"/c.crt\"\nkeyFile = \"/c.key\"\n",
+        false,
+    );
+    assert!(c.tls_enable, "the pair synthesizes tls_enable = true");
+    assert_eq!(c.cert, "/c.crt");
+    assert_eq!(c.key, "/c.key");
+    assert!(!c.presence.server_tls_enable_set());
+    assert_eq!(c.warning_records, 0);
+
+    // The `enable` spelling under `[transport.tls]` is a *different* key: the
+    // server lift has no `enable` arm, so it becomes a top-level `enable` and
+    // never reaches `tls_enable`. Ignored leniently...
+    let c = load_capturing("bind_port = 7000\n[transport.tls]\nenable = true\n", false);
+    assert!(!c.tls_enable, "the server lift has no `enable` arm");
+    assert!(!c.presence.server_tls_enable_set());
+    assert_eq!(c.warning_records, 0);
+
+    // ...and refused strictly, by name.
+    let err = load_capturing_expect_err("bind_port = 7000\n[transport.tls]\nenable = true\n");
+    assert!(
+        err.contains("enable"),
+        "the strict error must name the key: {err}"
+    );
+
+    // A written key beside a synthesized one is still written: `or_insert` keeps
+    // the user's `false`, `force` still drives `tls_only`, and the warning fires.
+    let c = load_capturing(
+        "bind_port = 7000\ntls_enable = false\n[transport.tls]\nforce = true\n",
+        false,
+    );
+    assert!(!c.tls_enable, "the written `false` survives the synthesis");
+    assert!(c.tls_only, "`force` still turns on the real switch");
+    assert!(
+        c.presence.server_tls_enable_set(),
+        "the user did write the key"
+    );
+    assert_eq!(c.warning_records, 1);
+}
+
+/// A literal `tls_enable` written *inside* `[transport.tls]` is a third written
+/// spelling: the server lift renames only its four Go keys (`force`, `certFile`,
+/// `keyFile`, `trustedCaFile`) and passes every other key through unchanged
+/// (`frp-core/src/config/normalize.rs:802-809`), so this one is hoisted onto the
+/// very same inert field the warning is about.
+#[test]
+fn literal_tls_enable_inside_the_transport_table_is_a_written_spelling() {
+    for (body, mode, expected) in [
+        (
+            "bind_port = 7000\n[transport.tls]\ntls_enable = true\n",
+            false,
+            true,
+        ),
+        (
+            "bind_port = 7000\n[transport.tls]\ntls_enable = true\n",
+            true,
+            true,
+        ),
+        (
+            "bind_port = 7000\n[transport.tls]\ntls_enable = false\n",
+            false,
+            false,
+        ),
+        (
+            "bind_port = 7000\n[common.transport.tls]\ntls_enable = true\n",
+            false,
+            true,
+        ),
+    ] {
+        let c = load_capturing(body, mode);
+        assert_eq!(
+            c.logged_during_load, "",
+            "the loader must stay silent: {body}"
+        );
+        assert_eq!(
+            c.tls_enable, expected,
+            "the key hoists onto the inert field: {body}"
+        );
+        assert!(
+            c.presence.server_tls_enable_set(),
+            "strict={mode}: a literal `tls_enable` in `[transport.tls]` was written: {body}"
+        );
+        assert_eq!(
+            c.warning_records, 1,
+            "strict={mode}: exactly one record: {body}"
+        );
+        assert!(
+            !c.tls_only,
+            "the literal key must not touch the real switch: {body}"
+        );
+    }
+
+    // Beside a renamed neighbour the literal key is still written, and `force`
+    // still drives the real switch: the two do not collapse into one case.
+    let c = load_capturing(
+        "bind_port = 7000\n[transport.tls]\nforce = true\ntls_enable = true\n",
+        false,
+    );
+    assert!(c.tls_only, "`force` is renamed to the real switch");
+    assert!(c.tls_enable);
+    assert!(
+        c.presence.server_tls_enable_set(),
+        "the literal key is written beside a renamed one"
+    );
+    assert_eq!(c.warning_records, 1);
+}
+
+/// `[common]`, its inline form, and an `includes` file all reach the same field,
+/// so all of them count as written.
+#[test]
+fn common_and_includes_spellings_set_the_flag() {
+    let c = load_capturing("bind_port = 7000\n[common]\ntls_enable = true\n", false);
+    assert!(c.presence.server_tls_enable_set(), "`[common] tls_enable`");
+    assert_eq!(c.warning_records, 1);
+    assert!(c.tls_enable);
+
+    let c = load_capturing("bind_port = 7000\ncommon = { tls_enable = true }\n", false);
+    assert!(
+        c.presence.server_tls_enable_set(),
+        "inline `common = {{ tls_enable = true }}`"
+    );
+    assert_eq!(c.warning_records, 1);
+
+    let c = load_capturing_files(
+        &[
+            ("frps.toml", "bind_port = 7000\nincludes = [\"inc.txt\"]\n"),
+            ("inc.txt", "tls_enable = true\n"),
+        ],
+        false,
+    );
+    assert!(
+        c.presence.server_tls_enable_set(),
+        "`tls_enable` inside an `includes` file"
+    );
+    assert_eq!(c.warning_records, 1);
+
+    // Precedence: the flatten is `or_insert`, so a written top-level key wins
+    // over a written `[common]` one. Both spellings were written, so the flag is
+    // still set either way; the value follows the top level.
+    let c = load_capturing(
+        "bind_port = 7000\ntls_enable = true\n[common]\ntls_enable = false\n",
+        false,
+    );
+    assert!(
+        c.presence.server_tls_enable_set(),
+        "both spellings were written"
+    );
+    assert_eq!(c.warning_records, 1);
+    assert!(c.tls_enable, "the top-level value wins the `or_insert`");
+}
+
+/// `tlsEnable` is not a loader spelling for this field, so it is not "written and
+/// inert" — it is unrecognized. Silent, and the value is dropped rather than
+/// applied.
+#[test]
+fn camelcase_tls_enable_is_not_a_written_key() {
+    let c = load_capturing("bind_port = 7000\ntlsEnable = true\n", false);
+    assert!(!c.tls_enable, "the camelCase key is dropped, not applied");
+    assert!(
+        !c.presence.server_tls_enable_set(),
+        "an unrecognized key was not written"
+    );
+    assert_eq!(c.warning_records, 0);
+
+    let err = load_capturing_expect_err("bind_port = 7000\ntlsEnable = true\n");
+    assert!(
+        err.contains("tlsEnable"),
+        "the strict error must name the key: {err}"
+    );
+}
+
+/// The string loader returns no `ConfigPresence`, so nothing can warn from it;
+/// it must not emit the record itself.
+#[test]
+fn the_string_loader_stays_silent() {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = subscriber_for(&output);
+    let guard = tracing::subscriber::set_default(subscriber);
+    let cfg = load_server_config_from_str("bind_port = 7000\ntls_enable = true\n").unwrap();
+    let logged = snapshot(&output);
+    drop(guard);
+    assert!(cfg.tls_enable, "the field still parses on the string path");
+    assert_eq!(logged, "", "the string loader must not emit the diagnostic");
+}

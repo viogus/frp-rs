@@ -95,6 +95,14 @@ const SETTLE: Duration = Duration::from_millis(500);
 const STARTUP_MARKER: &str = "frpc (Rust) v";
 /// The key, as the message names it.
 const KEY: &str = "web_server.tls.enable";
+/// The **server-side** flat `tls_enable` diagnostic. It must never appear in
+/// `frpc`: `ClientConfig::tls_enable` is live (it decides whether the control
+/// connection is encrypted — `frp-client/src/control.rs`), so the "no effect"
+/// claim would be false. These tests are the client half's negative control; the
+/// `frps` half is `frps/tests/warn_delivery.rs`.
+const SERVER_KEY: &str = "tls_enable has no effect on the server";
+/// How long `frpc verify` may take to exit before the test kills it.
+const EXIT_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn bin() -> String {
     std::env::var("FRPC_BIN").unwrap_or_else(|_| BIN.to_string())
@@ -434,4 +442,80 @@ fn no_warning_when_the_camelcase_table_is_discarded() {
     );
     assert_eq!(occurrences(&out, KEY), 0, "stdout:\n{out}");
     assert_eq!(occurrences(&err, KEY), 0, "stderr:\n{err}");
+}
+
+/// The client writes the **same flat key name** the server warning is about, but
+/// here it is live — so the server message must not appear. This is what keeps a
+/// future "call the new warn from every `warn_inert_web_server_tls_enable` site"
+/// edit from shipping a false claim on the client.
+#[test]
+fn no_server_tls_enable_warning_in_frpc_where_the_field_is_live() {
+    let dir = TempDir::new("srv-key-live");
+    let cfg = format!(
+        "server_addr = \"127.0.0.1\"\nserver_port = {}\nlogin_fail_exit = false\n\
+         tls_enable = false\n",
+        free_port()
+    );
+    let path = dir.write("frpc.toml", &cfg);
+    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    let out = spawned.stdout();
+    let err = spawned.stderr();
+    assert!(
+        out.contains(STARTUP_MARKER),
+        "no startup line\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+    );
+    assert_eq!(
+        occurrences(&out, SERVER_KEY),
+        0,
+        "the server-side message must never appear in frpc\n--- stdout ---\n{out}"
+    );
+    assert_eq!(occurrences(&err, SERVER_KEY), 0, "stderr:\n{err}");
+}
+
+/// `frpc verify` installs its console logger **before** the load and therefore
+/// *does* reach the dashboard diagnostic — but the server `tls_enable` message
+/// must still be absent, because that path loads a `ClientConfig`.
+#[test]
+fn frpc_verify_says_nothing_about_the_server_tls_enable_key() {
+    let dir = TempDir::new("srv-key-verify");
+    let cfg = format!(
+        "server_addr = \"127.0.0.1\"\nserver_port = {}\ntls_enable = false\n",
+        free_port()
+    );
+    let path = dir.write("frpc.toml", &cfg);
+
+    let mut child = Command::new(bin())
+        .args(["verify", "-c", path.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn frpc verify");
+    let deadline = Instant::now() + EXIT_TIMEOUT;
+    loop {
+        match child.try_wait().expect("try_wait frpc verify") {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("frpc verify did not exit within {EXIT_TIMEOUT:?}");
+            }
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .expect("collect frpc verify output");
+    let status = out.status;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        status.success(),
+        "verify must succeed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert_eq!(
+        occurrences(&stdout, SERVER_KEY),
+        0,
+        "frpc verify must not claim the client field is inert\n--- stdout ---\n{stdout}"
+    );
+    assert_eq!(occurrences(&stderr, SERVER_KEY), 0, "stderr:\n{stderr}");
 }

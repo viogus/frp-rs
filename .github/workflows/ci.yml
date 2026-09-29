@@ -518,21 +518,21 @@ jobs:
           n=$(cargo test -p frps --features dashboard --test warn_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/warn_delivery.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 7 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "7" ] || status=1
+          grep -q "test result: ok. 12 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "12" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frps warning-delivery guard failed (status=$status, file=$n, log=$log)"
-            if [ -n "$n" ] && [ "$n" != "7" ]; then
-              if [ "$n" -lt "7" ]; then
-                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 7 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
+            if [ -n "$n" ] && [ "$n" != "12" ]; then
+              if [ "$n" -lt "12" ]; then
+                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 12 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
               else
-                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 7: move the single literal in this shell step from 7 to $n"
+                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 12: move the single literal in this shell step from 12 to $n"
               fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frps warning-delivery guard ok: $n tests listed (expected 7), 0 failed"
+          echo "frps warning-delivery guard ok: $n tests listed (expected 12), 0 failed"
       - name: Run frpc's `web_server.tls.enable` warning-delivery spawn tests
         # The client half of the step above: `frpc/tests/warn_delivery.rs` pins
         # that the record reaches a `frpc -c` / `frpc --config-dir` user, in both
@@ -559,21 +559,21 @@ jobs:
           n=$(cargo test -p frpc --test warn_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/warn_delivery.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 6 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "6" ] || status=1
+          grep -q "test result: ok. 8 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "8" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frpc warning-delivery guard failed (status=$status, file=$n, log=$log)"
-            if [ -n "$n" ] && [ "$n" != "6" ]; then
-              if [ "$n" -lt "6" ]; then
-                echo "::error::frpc/tests/warn_delivery.rs lists $n tests, this step expects 6 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
+            if [ -n "$n" ] && [ "$n" != "8" ]; then
+              if [ "$n" -lt "8" ]; then
+                echo "::error::frpc/tests/warn_delivery.rs lists $n tests, this step expects 8 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
               else
-                echo "::error::frpc/tests/warn_delivery.rs lists $n tests, this step expects 6: move the single literal in this shell step from 6 to $n"
+                echo "::error::frpc/tests/warn_delivery.rs lists $n tests, this step expects 8: move the single literal in this shell step from 8 to $n"
               fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frpc warning-delivery guard ok: $n tests listed (expected 6), 0 failed"
+          echo "frpc warning-delivery guard ok: $n tests listed (expected 8), 0 failed"
       - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
         # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag
         # exit-code fix has to hold in the no-default-features build too — but

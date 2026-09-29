@@ -552,9 +552,15 @@ pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
     // the last point at which the key is visible. The other flags are read from
     // the normalized value (their keys survive normalization).
     let web_server_tls_enable_set = ConfigPresence::web_server_tls_enable_set_in(&value);
+    // Also read before `normalize`: `normalize_server_config` *synthesizes*
+    // `tls_enable` from the legacy `[transport.tls]` section (`force`,
+    // `certFile`, `keyFile`), so afterwards a user-written key and a synthesized
+    // one are indistinguishable.
+    let server_tls_enable_set = ConfigPresence::server_tls_enable_set_in(&value);
     normalize(&mut value);
     let mut presence = ConfigPresence::from_normalized_value(&value);
     presence.web_server_tls_enable_set = web_server_tls_enable_set;
+    presence.server_tls_enable_set = server_tls_enable_set;
     if strict_config {
         run_strict_check(&value, &known_keys(), path)?;
     }

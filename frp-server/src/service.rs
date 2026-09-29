@@ -2313,6 +2313,10 @@ impl Service {
             frp_core::config::load_server_config_with_presence(&config_path, false)
                 .map_err(|e| format!("Failed to reload config: {e}"))?;
         presence.warn_inert_web_server_tls_enable();
+        // The flat server `tls_enable` is inert as well; this reload site has a
+        // sink, so it delivers the record. Once per load — a reload adds one
+        // rather than replacing the startup record.
+        presence.warn_inert_server_tls_enable();
 
         let mut changes: Vec<String> = Vec::new();
 

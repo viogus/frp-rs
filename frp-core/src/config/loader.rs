@@ -149,9 +149,15 @@ pub fn load_server_config_from_str(
     expand_env_vars(&mut value);
     expand_template_functions(&mut value);
     let web_server_tls_enable_set = ConfigPresence::web_server_tls_enable_set_in(&value);
+    let server_tls_enable_set = ConfigPresence::server_tls_enable_set_in(&value);
     normalize_server_config(&mut value);
     let mut presence = ConfigPresence::from_normalized_value(&value);
     presence.web_server_tls_enable_set = web_server_tls_enable_set;
+    // Kept in lockstep with `load_config_from_file`'s capture. This entry point
+    // returns no `ConfigPresence`, so nothing can warn *from here* — it exists
+    // for embedders and the unit tests — but the two loaders must not disagree
+    // about what "the user wrote the key" means.
+    presence.server_tls_enable_set = server_tls_enable_set;
     let json_value = toml_to_json(value);
     let mut cfg: ServerConfig =
         serde_json::from_value(json_value).map_err(|e| format!("config validation error: {e}"))?;
@@ -187,16 +193,20 @@ pub fn load_client_config_from_str(
 /// explicitly configured them. Computed from the normalized TOML value so
 /// serde defaults cannot be confused with explicit values.
 ///
-/// One flag is the exception to "from the normalized value": the
-/// `[webServer.tls]` / `[web_server.tls]` `enable` key is **removed** by
-/// `normalize_web_server_section`, so `ConfigPresence::web_server_tls_enable_set_in`
-/// has to read the value *before* normalization. See the flag's own doc.
+/// Two flags are the exception to "from the normalized value":
+/// `[webServer.tls]` / `[web_server.tls]` `enable` is **removed** by
+/// `normalize_web_server_section`, and the flat `tls_enable` key is
+/// **synthesized** by the server normalizer from the legacy `[transport.tls]`
+/// section, so `ConfigPresence::web_server_tls_enable_set_in` and
+/// `ConfigPresence::server_tls_enable_set_in` both have to read the value
+/// *before* normalization. See each flag's own doc.
 ///
-/// Public because the binaries own the diagnostic that the loader can no longer
+/// Public because the binaries own the diagnostics that the loader can no longer
 /// emit: on the `-c` path the config is loaded **before** `init_logging`, so a
 /// `tracing::warn` from inside the loader has no subscriber to reach. The
-/// binaries re-emit it after `init_logging` via
-/// [`ConfigPresence::warn_inert_web_server_tls_enable`].
+/// binaries re-emit them after `init_logging` via
+/// [`ConfigPresence::warn_inert_web_server_tls_enable`] and
+/// [`ConfigPresence::warn_inert_server_tls_enable`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConfigPresence {
     pub(super) server_heartbeat_timeout_set: bool,
@@ -213,6 +223,15 @@ pub struct ConfigPresence {
     /// nested table can come from, and why the spellings are checked in that
     /// order.
     pub(super) web_server_tls_enable_set: bool,
+    /// Flat `tls_enable` — top-level, under `[common]`, or in an `includes` file
+    /// — was **written** by the user. The **value** is deliberately not carried:
+    /// the field is inert either way, so the diagnostic is about the key being
+    /// present. Read from the raw, pre-normalization value, because
+    /// `normalize_server_config` *synthesizes* `tls_enable = true` from the
+    /// legacy `[transport.tls]` section (`force`, `certFile`, `keyFile`), which
+    /// is not a written key and must stay silent. See
+    /// [`ConfigPresence::server_tls_enable_set_in`].
+    pub(super) server_tls_enable_set: bool,
 }
 
 /// The `[web_server.tls] enable` diagnostic, in one place so `frps` and `frpc`
@@ -238,6 +257,28 @@ pub struct ConfigPresence {
 pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING: &str = "web_server.tls.enable has no \
      effect: the dashboard HTTPS server is enabled by a non-empty `cert_file` + `key_file` \
      pair; without that pair the dashboard serves plaintext HTTP";
+
+/// The server-side flat `tls_enable` diagnostic, in one place so `frps` and
+/// `frp-server` cannot drift. Callers gate it on
+/// [`ConfigPresence::server_tls_enable_set`]; it is emitted **after**
+/// `init_logging`, which is the whole point of the presence flag.
+///
+/// Only the **server**-config load sites call it, and only those with a log
+/// sink: `frps`'s two startup paths (`-c`, `--config-dir`) and `frp-server`'s
+/// `Service::reload` — one record per load, so a reload adds one rather than
+/// replacing the startup record. `frps verify` stays silent (it never installs a
+/// subscriber).
+///
+/// The `frpc` / `frp-client` sites deliberately do **not** call it even though
+/// they call the sibling: they load `ClientConfig`, whose `tls_enable` is
+/// **live** — `frp-client/src/control.rs` reads it to decide whether the control
+/// connection is encrypted and warns when it is not — so emitting "no effect"
+/// there would be false. `tls_enable` is inert only on `ServerConfig`.
+pub const SERVER_TLS_ENABLE_INERT_WARNING: &str = "tls_enable has no effect on the \
+    server: nothing in frp-server or frps reads it. The server's TLS switch is \
+    `tls_only` (Go's `transport.tls.force`); the TLS acceptor is built from \
+    `tls_cert_file` + `tls_key_file`, and with neither set the server auto-generates \
+    a self-signed certificate pair";
 
 impl ConfigPresence {
     pub(super) fn from_normalized_value(value: &toml::Value) -> Self {
@@ -318,6 +359,91 @@ impl ConfigPresence {
     /// condition for [`Self::warn_inert_web_server_tls_enable`].
     pub fn web_server_tls_enable_set(&self) -> bool {
         self.web_server_tls_enable_set
+    }
+
+    /// Did the file write the flat `tls_enable` key — top-level, under
+    /// `[common]`, or as a literal `tls_enable` inside `[transport.tls]`?
+    ///
+    /// Must be called on the **raw, pre-normalization** value:
+    /// `normalize_server_config` flattens `[common]` into the top level and then
+    /// *synthesizes* `tls_enable = true` from the legacy `[transport.tls]`
+    /// section when it carries `force = true`, `certFile` or `keyFile`
+    /// (`frp-core/src/config/normalize.rs:798-816`, `table.entry(…).or_insert(…)`),
+    /// so after normalization a written key and a synthesized one are
+    /// indistinguishable.
+    ///
+    /// Three spellings count. `[common]`'s flatten is `or_insert`, so a written
+    /// top-level key wins over a written `[common]` one — either way the key was
+    /// **written** and the flag is `true`. An `includes` file counts too:
+    /// `process_includes` deep-merges before this runs. The `[transport.tls]`
+    /// lift renames only four Go keys (`force`/`certFile`/`keyFile`/`trustedCaFile`)
+    /// and passes every other key through unchanged
+    /// (`frp-core/src/config/normalize.rs:802-809`), so a literal `tls_enable`
+    /// written *inside* that section is hoisted onto the same inert field — a
+    /// third written spelling, measured on the v0.71.0 `frps`: `tls_enable = "yes"`
+    /// there fails with `invalid type: string "yes", expected a boolean` (exit 1)
+    /// while `tls_enable = true` is accepted (exit 0) and warns.
+    ///
+    /// `tlsEnable` never matches: `ServerConfig::tls_enable` carries no serde
+    /// alias (unlike `bind_port`'s `bindPort`), and `"tlsEnable"` is not in
+    /// `known_server_keys()`, so the lenient loader silently drops the key and
+    /// the strict one refuses it. `[transport.tls] enable` never matches either:
+    /// the **server** lift has no `"enable"` arm (`frp-core/src/config/normalize.rs:802-809`;
+    /// only the **client** lift maps it, at `:1363`), so it stays a
+    /// top-level key literally named `enable`. Neither is a documented spelling.
+    pub(super) fn server_tls_enable_set_in(value: &toml::Value) -> bool {
+        let Some(table) = value.as_table() else {
+            return false;
+        };
+        // A written flat key, at whatever level the caller passes in.
+        let flat = |t: &toml::Table| t.contains_key("tls_enable");
+        // `[transport.tls]` keeps only its four *renamed* Go spellings; every
+        // other key — including a literal `tls_enable` — reaches the top level
+        // unchanged and lands on the same inert field.
+        let nested = |t: &toml::Table| {
+            t.get("transport")
+                .and_then(toml::Value::as_table)
+                .and_then(|transport| transport.get("tls"))
+                .and_then(toml::Value::as_table)
+                .is_some_and(|tls| tls.contains_key("tls_enable"))
+        };
+        flat(table)
+            || nested(table)
+            || table
+                .get("common")
+                .and_then(toml::Value::as_table)
+                .is_some_and(|common| flat(common) || nested(common))
+    }
+
+    /// Whether the loaded file wrote the flat `tls_enable` key — top-level,
+    /// under `[common]`, or as a literal `tls_enable` inside `[transport.tls]` —
+    /// the condition for [`Self::warn_inert_server_tls_enable`].
+    pub fn server_tls_enable_set(&self) -> bool {
+        self.server_tls_enable_set
+    }
+
+    /// Emit [`SERVER_TLS_ENABLE_INERT_WARNING`] when the key was written, once
+    /// per load.
+    ///
+    /// Called by the three **server**-config load sites that have a log sink:
+    /// `frps`'s two startup paths (`-c`, `--config-dir`) and `frp-server`'s
+    /// `Service::reload`. `frps verify` stays silent (no subscriber), and no
+    /// `frpc` / `frp-client` site calls it: those load `ClientConfig`, where
+    /// `tls_enable` is live. See the const doc.
+    ///
+    /// **Warned whenever the key is written, `true` or `false`.** The field is
+    /// inert in both cases, so a value gate would only hide the `false` case,
+    /// which is the one a user is most likely to believe turned something off.
+    /// The Go spellings `force`/`certFile`/`keyFile` are *synthesized*, not
+    /// written, and stay silent; a literal `tls_enable` inside `[transport.tls]`
+    /// **is** written and warns. [`Self::server_tls_enable_set_in`] reads the raw
+    /// value precisely so the two cannot be confused. Pinned by
+    /// `written_server_tls_enable_warns_once_and_stays_inert` and its siblings
+    /// (`frp-core/tests/server_tls_enable_warning.rs`).
+    pub fn warn_inert_server_tls_enable(&self) {
+        if self.server_tls_enable_set {
+            tracing::warn!("{}", SERVER_TLS_ENABLE_INERT_WARNING);
+        }
     }
 
     /// Emit [`WEB_SERVER_TLS_ENABLE_INERT_WARNING`] when the key was written,

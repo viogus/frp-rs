@@ -250,7 +250,7 @@ User-facing release notes for frp-rs.
   `ServerConfig::tls_enable` — a field with no counterpart in Go v0.71.0's
   *server* config, which frp-rs's own `[transport.tls]` flatten inserts as `true`
   when that Go-shaped section carries `force = true`, `certFile` or `keyFile`
-  (`frp-core/src/config/normalize.rs:792-810`) — so
+  (`frp-core/src/config/normalize.rs:798-816`) — so
   neither a reload nor a restart can make a change to it take effect,
   and the line claimed one. It now has the same disposition `auth.useEncryption`
   already has (deliberately unreported). Not a parity gap: Go v0.71.0's
@@ -403,6 +403,20 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **A server config that writes `tls_enable` now says so instead of loading in
+  silence.** The field is inert on the server — nothing in `frp-server` / `frps`
+  reads it — so a `tls_enable = true` in `frps.toml` bought neither an effect nor
+  a word of explanation. It now emits one warning per load at every server load
+  site that has a log sink (the two `frps` startup paths and the SIGUSR1 reload):
+  `tls_enable has no effect on the server: …`, naming the real switch
+  (`tls_only`) and how the acceptor's certificate is really obtained
+  (`tls_cert_file` + `tls_key_file`, or the self-signed pair the server
+  auto-generates when both are empty). Only a value the **user wrote** warns — a
+  flat `tls_enable`, one under `[common]`, or a literal `tls_enable` inside
+  `[transport.tls]` — not the `tls_enable = true` the loader synthesizes from the
+  legacy `[transport.tls] force` / `certFile` / `keyFile`, so an existing Go-style
+  config stays quiet. `frpc` is deliberately untouched: the client's own
+  `tls_enable` *is* live, so warning there would be a false claim.
 - **`[web_server.tls] cert_file` / `key_file` / `trusted_ca_file` / `server_name`
   — the nested section's own canonical spellings — are no longer dropped, and the
   nested section now wins over the flat keys the way the docs always said.**

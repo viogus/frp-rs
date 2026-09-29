@@ -2058,7 +2058,7 @@ tlsServerName = "frps.example.com"
 /// "Go frp Equivalent". No loader accepts them — `frp-core/src/config/server.rs:42-56`
 /// declares those fields with `#[serde(default)]` and no alias, and Go
 /// v0.71.0 carries them under the nested `[transport.tls]` section, which
-/// `frp-core/src/config/normalize.rs:792-810` maps onto the flat fields.
+/// `frp-core/src/config/normalize.rs:798-816` maps onto the flat fields.
 /// This pins both directions (the four stay rejected, the two real aliases
 /// stay accepted) so the table cannot drift back.
 #[test]
@@ -2134,7 +2134,7 @@ fn test_flat_camelcase_tls_spellings_are_not_loader_spellings() {
 /// `frp-core/src/config/client.rs:264-270` declares those fields with
 /// `#[serde(default)]` and no alias, and Go v0.71.0 carries them under the
 /// nested `[transport.tls]` section, which
-/// `frp-core/src/config/normalize.rs:1352-1367` maps onto the flat fields.
+/// `frp-core/src/config/normalize.rs:1358-1373` maps onto the flat fields.
 /// This pins both directions (the five spellings stay rejected, the two real
 /// aliases stay accepted) so the table cannot drift back.
 #[test]
@@ -2764,7 +2764,7 @@ mod proptest_tests {
         /// A proxy expressed with Go-format sub-tables
         /// ([proxies.transport] / [proxies.healthCheck] /
         /// [proxies.loadBalancer]) normalizes to the same TOML as the
-        /// equivalent flat fields. normalize_proxies (normalize.rs:1354)
+        /// equivalent flat fields. normalize_proxies (normalize.rs:1945)
         /// flattens the sub-tables in the order transport → healthCheck →
         /// loadBalancer; the flat form below lists the fields in exactly
         /// that order so the serialized outputs match.
@@ -2819,7 +2819,7 @@ mod proptest_tests {
     proptest! {
         /// Same equivalence for visitor sub-tables
         /// ([visitors.transport] / [visitors.natTraversal],
-        /// normalize_visitors at normalize.rs:1551).
+        /// normalize_visitors at normalize.rs:2197).
         #[test]
         fn visitor_subtables_flat_vs_nested_equivalent(
             use_enc in any::<bool>(),
