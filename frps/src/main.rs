@@ -217,6 +217,9 @@ async fn run(mut cli: FrpsArgs) {
                     // so the binary owns the diagnostic and this path emits it
                     // exactly once, here, like the `-c` branch below.
                     presence.warn_inert_web_server_tls_enable();
+                    // The flat server `tls_enable` is inert too; same sink, same
+                    // one-record-per-load rule.
+                    presence.warn_inert_server_tls_enable();
                     let uf = unsafe_features.clone();
                     handles.push(tokio::spawn(async move {
                         let service = match Service::with_unsafe_features(cfg, Some(path_str.clone()), uf).await {
@@ -306,6 +309,10 @@ async fn run(mut cli: FrpsArgs) {
     // `/tmp/enable-warn-probe/run-probe.sh`: 1 on stdout, 0 on stderr, both
     // paths, both binaries).
     presence.warn_inert_web_server_tls_enable();
+    // The flat server `tls_enable` is inert too — no code in `frp-server` or
+    // `frps` reads `ServerConfig::tls_enable`, and a restart cannot make it take
+    // effect. Same sink, same one-record-per-load rule.
+    presence.warn_inert_server_tls_enable();
 
     tracing::info!(version = %frp_core::VERSION, "frps (Rust) v{} starting...", frp_core::VERSION);
     let config_path = Some(config_path);

@@ -659,7 +659,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   root sample (the scripts generate their own temp copies; the lone test naming the repo example
   uses an inline literal). Full record with commands and outputs: `/tmp/tls-enable-report.md`.
 
-- [ ] **`tls_enable` is silently inert: no load-time warning, unlike the sibling `[web_server.tls]
+- [x] **`tls_enable` is silently inert: no load-time warning, unlike the sibling `[web_server.tls]
   enable` that #402 made warn.** Measured on this branch (the `grep -rn "\.tls_enable"` above): no
   `frp-server`/`frps` code reads `ServerConfig::tls_enable`, yet a config that writes
   `tls_enable = true` loads without a word — the user gets neither an effect nor a warning, where
@@ -671,12 +671,63 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   Done-when: a load carrying a user-written `tls_enable` warns once per load at every load site that
   has a log sink (the two startup paths, `frpc verify`, and the `frps`/`frpc` SIGUSR1 reload), with a
   test that fails if the warning is removed, and the warning must **not** fire on the legitimate
-  legacy path below. The caveat that makes it non-trivial: `frp-core/src/config/normalize.rs`
+  legacy path below. **Closed with one correction to that list** — the `frpc verify` and `frpc` SIGUSR1
+  entries are wrong for this item: those sites load a `ClientConfig`, whose `tls_enable` is *live*
+  (`frp-client/src/control.rs` reads it to decide whether the control connection is encrypted), so a
+  "no effect" warning there would be a false claim. The measured list is in the close note below.
+  The caveat that makes it non-trivial: `frp-core/src/config/normalize.rs`
   **synthesizes** `tls_enable = true` when the legacy/canonical `[transport.tls]` has `force = true`
   or `certFile`/`keyFile` (while mapping `force` → `tls_only`), inserting it with `.or_insert` before
   deserialization — so after the load a synthesized value is indistinguishable from a written one,
   and the presence flag must be taken from the file (beside the existing `web_server.tls.enable`
   flag), not from the deserialized `ServerConfig`.
+
+  **Done (branch `fix/tls-enable-warning`, based on `60624a3`).** Full record with every literal
+  command, output and exit code: `/tmp/tls-enable-warn-report.md`. The premise was re-measured before
+  anything was built and holds: `grep -rn "\.tls_enable" frp-server/src frps/src` (rc=0) returns only
+  two comment lines — `frp-server/src/service.rs:2290` and `:2444` — and no reader, while the *client*
+  field **is** read (`frp-client/src/control.rs:389`, `self.tls_enable || matches!(…, Quic)`), which
+  is what makes the new warning server-only. The written spellings were measured, not assumed:
+  `ServerConfig` has no `rename_all` and no alias on the field (`frp-core/src/config/server.rs:13-15`,
+  `:42-43`), so `grep -rn "tlsEnable" frp-core/src frps/src frpc/src` (rc=0) finds it only inside the
+  test that pins its rejection; `grep -n '"enable"' frp-core/src/config/strict.rs` exits 1; and the
+  server `[transport.tls]` flatten at `frp-core/src/config/normalize.rs:796-803` has no `"enable"` arm
+  (the client's, at `:1353-1367` does). So exactly two raw spellings count as written — a top-level
+  `tls_enable` and one under `[common]` — while `[transport.tls] force = true` / `certFile` /
+  `keyFile` **synthesize** it at `frp-core/src/config/normalize.rs:806-810`. The flag is therefore
+  read from the raw value beside the existing one (`normalize.rs:554-558`; `process_includes` at
+  `:533` has already run, so `includes` spellings are seen), never from the deserialized struct.
+  The Done-when site list was **wrong on two of its four entries** and is corrected above: measured
+  `grep -rn` over `frps/src frpc/src frp-server/src frp-client/src frp-core/src` (rc=0) gives three
+  server-config load sites with a live subscriber — `frps/src/main.rs:219` (`--config-dir`),
+  `frps/src/main.rs:308` (`-c`) and `frp-server/src/service.rs:2315` (SIGUSR1 reload) — plus
+  `frps/src/main.rs:88` (`frps verify`), which deliberately never initialises logging and so has no
+  sink. There is no `frpc` server-config site at all: `frpc verify` and the client reload load a
+  `ClientConfig` whose `tls_enable` is live, so a warning there would be false and none is emitted.
+  Change: `ConfigPresence::server_tls_enable_set_in` + `server_tls_enable_set()` +
+  `warn_inert_server_tls_enable()` + the `SERVER_TLS_ENABLE_INERT_WARNING` const (all in
+  `frp-core/src/config/loader.rs`, beside the sibling), the flag captured in `normalize.rs`, and the
+  call added at the three sites above. Tests: new `frp-core/tests/server_tls_enable_warning.rs`
+  (6 tests — the message names the inertness, `tls_only` and the pair; a written `true` **and** a
+  written `false` warn exactly once in both loader modes; a synthesized `force` / `certFile`+`keyFile`
+  load stays silent and `[transport.tls] enable = true` never reaches the field; `[common]`, inline
+  `common = { … }` and `includes` spellings; `tlsEnable` is not a written key; the string loader
+  emits nothing); `frps/tests/warn_delivery.rs` +5 tests (delivery on `-c` and `--config-dir`, the
+  `[common]` spelling, a written `false`, the synthesized negative control, and one more record after
+  SIGUSR1 — 12 passed rc=0); `frpc/tests/warn_delivery.rs` +2 tests (the client `-c` run and
+  `frpc verify` both print **zero** server-warning records, pinning that the live-field side stays
+  silent — 8 passed rc=0). Gates, each literal exit code: `cargo fmt --all --check` rc=0;
+  `cargo test -p frp-core --lib config` rc=0 (`335 passed; 0 failed`); `cargo test -p frp-core --test
+  web_server_tls_enable_warning` rc=0 (`4 passed`) and `--test server_tls_enable_warning` rc=0
+  (`6 passed`); `cargo test -p frp-core --no-default-features --all-targets` rc=0 (13 `test result:
+  ok` lines, 724 + 2 + 4 passed); the three isolated `-D warnings` lanes rc=0 each; and
+  `bash scripts/repo-health.sh` rc=0 (`RESULT: invariants hold`). The CLI-count guards were
+  re-measured because this change adds tests under `frps/tests/` and `frpc/tests/`: they count only
+  `cli_exit_codes.rs`, which still lists **29** (frps) and **13** (frpc tiny) via `-- --list`, so
+  `.github/workflows/ci.yml` `FRPS_CLI_TESTS` / `FRPC_TINY_CLI_TESTS` are unchanged. Docs updated:
+  the `docs/config.md` `tls_enable` row and inert-fields note, the server example (which no longer
+  writes the now-warning key), and one `CHANGELOG.md` `### Fixed` bullet. Ledger after this close:
+  28 open / 98 closed.
 
 - [x] **`docs/config.md` advertises four camelCase TLS aliases that no loader accepts.**
   The `tls_only`, `tls_cert_file`, `tls_key_file` and `tls_ca_file` rows at `docs/config.md:26-29`

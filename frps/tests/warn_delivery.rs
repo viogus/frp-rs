@@ -94,6 +94,11 @@ const SIGNAL_READY_MARKER: &str = "SIGUSR1 reload ready";
 const RELOAD_MARKER: &str = "SIGUSR1:";
 /// The key, as the message names it.
 const KEY: &str = "web_server.tls.enable";
+/// The **second** diagnostic this file now pins: the flat server `tls_enable` is
+/// inert too (`TODO.md` item), and it warns from the same three sites. Kept as a
+/// substring of `SERVER_TLS_ENABLE_INERT_WARNING` so a count of it cannot match
+/// the dashboard message, and vice versa.
+const SERVER_KEY: &str = "tls_enable has no effect on the server";
 
 fn bin() -> String {
     std::env::var("FRPS_BIN").unwrap_or_else(|_| BIN.to_string())
@@ -359,6 +364,13 @@ fn occurrences(haystack: &str, needle: &str) -> usize {
 /// The shared assertion: one record on **stdout**, none on **stderr**, and the
 /// binary really did start.
 fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
+    assert_one_warning_on_stdout_for(tag, spawned, KEY);
+}
+
+/// [`assert_one_warning_on_stdout`] for an arbitrary key, so the flat server
+/// `tls_enable` diagnostic can reuse the same checks instead of a second copy
+/// that could drift from them.
+fn assert_one_warning_on_stdout_for(tag: &str, spawned: &Spawned, key: &str) {
     let out = spawned.stdout();
     let err = spawned.stderr();
     assert!(
@@ -366,12 +378,12 @@ fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
         "{tag}: no startup line, so this shape never reached `init_logging`\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
     );
     assert_eq!(
-        occurrences(&out, KEY),
+        occurrences(&out, key),
         1,
-        "{tag}: expected exactly 1 `{KEY}` record on stdout (console sink)\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+        "{tag}: expected exactly 1 `{key}` record on stdout (console sink)\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
     );
     assert_eq!(
-        occurrences(&err, KEY),
+        occurrences(&err, key),
         0,
         "{tag}: the console sink is stdout; stderr must carry none\n--- stderr ---\n{err}"
     );
@@ -380,14 +392,44 @@ fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
 /// The shared "no record at all" assertion, with the startup line still there so
 /// the silence is a decision and not a failed run.
 fn assert_no_warning(tag: &str, spawned: &Spawned) {
+    assert_no_warning_for(tag, spawned, KEY);
+}
+
+/// [`assert_no_warning`] for an arbitrary key.
+fn assert_no_warning_for(tag: &str, spawned: &Spawned, key: &str) {
     let out = spawned.stdout();
     let err = spawned.stderr();
     assert!(
         out.contains(STARTUP_MARKER),
         "{tag}: no startup line\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
     );
-    assert_eq!(occurrences(&out, KEY), 0, "{tag}: stdout:\n{out}");
-    assert_eq!(occurrences(&err, KEY), 0, "{tag}: stderr:\n{err}");
+    assert_eq!(occurrences(&out, key), 0, "{tag}: stdout:\n{out}");
+    assert_eq!(occurrences(&err, key), 0, "{tag}: stderr:\n{err}");
+}
+
+/// A `frps` config that writes the **flat** server `tls_enable` (the frp-rs-only
+/// field), or the legacy `[transport.tls]` shapes that *synthesize* it.
+#[derive(Clone, Copy)]
+enum ServerTls {
+    /// `tls_enable = true` — written, inert, warns.
+    WrittenTrue,
+    /// `tls_enable = false` — written, inert, warns the same way.
+    WrittenFalse,
+    /// `[common] tls_enable = true` — written, reached through the flatten.
+    CommonWritten,
+    /// `[transport.tls] force = true` — synthesizes `tls_enable = true` plus the
+    /// real switch `tls_only`; **not** written, so it must stay silent.
+    SynthesizedForce,
+}
+
+fn frps_config_server_tls(bind_port: u16, shape: ServerTls) -> String {
+    let head = format!("bind_port = {bind_port}\ntoken = \"t\"\n");
+    match shape {
+        ServerTls::WrittenTrue => format!("{head}tls_enable = true\n"),
+        ServerTls::WrittenFalse => format!("{head}tls_enable = false\n"),
+        ServerTls::CommonWritten => format!("{head}[common]\ntls_enable = true\n"),
+        ServerTls::SynthesizedForce => format!("{head}[transport.tls]\nforce = true\n"),
+    }
 }
 
 #[test]
@@ -508,4 +550,118 @@ fn no_warning_when_the_camelcase_table_is_discarded() {
     let path = dir.write("frps.toml", &cfg);
     let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
     assert_no_warning("frps -c (mixed sections)", &spawned);
+}
+
+// ---------------------------------------------------------------------------
+// The flat server `tls_enable` diagnostic.
+//
+// Distinct key, distinct field, and a distinct failure mode from the dashboard
+// message above: `ServerConfig::tls_enable` is parsed but read by nothing, so a
+// user who writes it gets no effect and — before this round — no signal either.
+// The same three sink-bearing server paths emit it: `frps -c`, `frps
+// --config-dir`, and `Service::reload`. `frps verify` stays silent (no
+// subscriber). No `frpc` site emits it: those load `ClientConfig`, where
+// `tls_enable` is live.
+//
+// The negative control is not "no key" but "a key the user did **not** write":
+// the legacy `[transport.tls]` section synthesizes `tls_enable = true`, and
+// warning there would be a false claim about a Go-shaped input the user wrote.
+// ---------------------------------------------------------------------------
+
+/// Written `tls_enable = true`, `-c`: one record on stdout, and **zero**
+/// occurrences of the dashboard key, so the two diagnostics cannot be confused.
+#[test]
+fn server_tls_enable_warning_reaches_a_dash_c_user() {
+    let dir = TempDir::new("srv-dashc");
+    let port = free_port();
+    let cfg = frps_config_server_tls(port, ServerTls::WrittenTrue);
+    let path = dir.write("frps.toml", &cfg);
+    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    assert_one_warning_on_stdout_for("frps -c (tls_enable = true)", &spawned, SERVER_KEY);
+    assert_eq!(
+        occurrences(&spawned.stdout(), KEY),
+        0,
+        "the dashboard key was not written, so its diagnostic must not fire\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+}
+
+/// The same key reached through the `[common]` flatten, on both startup paths.
+#[test]
+fn server_tls_enable_warning_reaches_a_config_dir_user_with_the_common_spelling() {
+    let dir = TempDir::new("srv-cfgdir-common");
+    let cfg = frps_config_server_tls(free_port(), ServerTls::CommonWritten);
+    let sub = dir.0.join("conf.d");
+    std::fs::create_dir_all(&sub).expect("create config dir");
+    std::fs::write(sub.join("frps.toml"), &cfg).expect("write config");
+    let spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
+    assert_one_warning_on_stdout_for(
+        "frps --config-dir ([common] tls_enable)",
+        &spawned,
+        SERVER_KEY,
+    );
+
+    let dir = TempDir::new("srv-dashc-common");
+    let cfg = frps_config_server_tls(free_port(), ServerTls::CommonWritten);
+    let path = dir.write("frps.toml", &cfg);
+    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    assert_one_warning_on_stdout_for("frps -c ([common] tls_enable)", &spawned, SERVER_KEY);
+}
+
+/// `tls_enable = false` is just as inert as `true`, and just as likely to be
+/// believed — a value gate would hide exactly this case.
+#[test]
+fn server_tls_enable_warning_reaches_a_dash_c_user_for_a_written_false() {
+    let dir = TempDir::new("srv-false");
+    let cfg = frps_config_server_tls(free_port(), ServerTls::WrittenFalse);
+    let path = dir.write("frps.toml", &cfg);
+    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    assert_one_warning_on_stdout_for("frps -c (tls_enable = false)", &spawned, SERVER_KEY);
+}
+
+/// Negative control: `[transport.tls] force = true` **synthesizes**
+/// `tls_enable = true` inside the normalizer. The user never wrote the flat key,
+/// so the warning must not fire — even though the field ends up `true`.
+#[test]
+fn no_server_tls_enable_warning_when_it_was_synthesized_from_transport_tls() {
+    let dir = TempDir::new("srv-synth");
+    let cfg = frps_config_server_tls(free_port(), ServerTls::SynthesizedForce);
+    let path = dir.write("frps.toml", &cfg);
+    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    assert_no_warning_for("frps -c (synthesized)", &spawned, SERVER_KEY);
+    assert_eq!(
+        occurrences(&spawned.stdout(), KEY),
+        0,
+        "no dashboard key either\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+}
+
+/// The reload is a second in-process load with the sink already installed, so it
+/// adds its own record: startup 1, reload 2. One per load.
+#[test]
+fn a_sigusr1_reload_delivers_the_server_tls_enable_warning_again() {
+    let dir = TempDir::new("srv-reload");
+    let cfg = frps_config_server_tls(free_port(), ServerTls::WrittenTrue);
+    let path = dir.write("frps.toml", &cfg);
+    let mut spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    assert_eq!(
+        occurrences(&spawned.stdout(), SERVER_KEY),
+        1,
+        "startup: one record\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+
+    assert!(
+        spawned.sigusr1_and_reload(),
+        "the reload never logged {RELOAD_MARKER:?}\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+    let out = spawned.stdout();
+    assert_eq!(
+        occurrences(&out, SERVER_KEY),
+        2,
+        "startup + reload = exactly 2 records, one per load\n--- stdout ---\n{out}"
+    );
+    assert_eq!(occurrences(&spawned.stderr(), SERVER_KEY), 0);
 }
