@@ -424,7 +424,8 @@ User-facing release notes for frp-rs.
   that passed `has_dashboard` as a literal, so nothing checked what a real build
   answered — a call site hardcoding the other variant compiled clean and stayed green.
   The clause is now asserted by `cfg!`-keyed checks inside the existing `frps` and
-  `frpc` warning-delivery tests (and `frpc`'s admin-config test), keyed on
+  `frpc` warning-delivery tests, and by `frpc`'s admin-config test — gated whole-file
+  on `admin`, so it asserts the dashboard text unconditionally — keyed on
   `plaintext HTTP` versus `no dashboard support`. Round 3 finished that job: three of
   the eight call sites were still unwitnessed — `frpc verify` (`frpc/src/main.rs:776`,
   whose test wrote no nested key so the record never fired), the client reload

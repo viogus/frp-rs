@@ -580,9 +580,10 @@ jobs:
         # no-dashboard text; the matching `--features admin` run of the same file
         # is its own step below and expects the dashboard text. The client's
         # *reload* row is a different call site, pinned separately and in-process
-        # by `frp-client/tests/reload_warning_delivery.rs` in the
-        # `Tests (client integration)` job (the client only processes a reload
-        # inside a live session) — that file asserts the clause its own `cfg!`
+        # by `frp-client/tests/reload_warning_delivery.rs`, which runs in both
+        # `Tests (client integration)` lanes — with and without `--features admin`
+        # — so one lane pins each clause (the client only processes a reload
+        # inside a live session); that file asserts the clause its own `cfg!`
         # answer produced.
         #
         # No `--features` flag: the file is `#![cfg(feature = "full")]`-gated and

@@ -954,7 +954,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `frpc/tests/warn_delivery.rs:403`) while the default `frpc` lane and the admin config-GET lane stay
   green; and the round-2 `frps` pair (`:219` → `false` is a no-op in the default lane and rc **101** in
   the dashboard lane at `frps/tests/warn_delivery.rs:398`; `:219` → `true` rc **101** in the default lane
-  at `:409`) re-runs unchanged. No test count moved (12 / 8 / 8 / 4 / 1 / 5 / 5 / 342), and no source
+  at `:409`) re-runs unchanged. No test count moved (12 / 12 / 8 / 8 / 4 / 1 / 1 / 5 / 5 / 342), and no source
   crate was touched: `git diff 0ce218be -- '*/src/*'` is empty. Ledger unchanged by this round:
   **26 open / 107 closed**.
 
@@ -966,18 +966,26 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   the `not(feature = "tls")` arm. So `cargo build -p frpc --no-default-features --features micro,admin`
   (rc 0) is an `admin` build that prints the dashboard clause — "the dashboard HTTPS server is enabled by a
   non-empty `cert_file` + `key_file` pair" — while its admin listener logs
-  `frpc admin server listening on 127.0.0.1:27598` with no `(TLS)` suffix and answers a plaintext `curl`
-  with **404**. That is the same class of falsehood the item above removed, one feature interaction further
+  `frpc admin server listening on 127.0.0.1:27598` with no `(TLS)` suffix and answers a bare plaintext
+  `GET /` with **401** and a request authenticated as `admin:admin` to `/api/v2/system/info` with
+  **404**. That is the same class of falsehood the item above removed, one feature interaction further
   in. Done-when: the admin call sites (`frp-client/src/admin.rs:771`, `frp-client/src/service.rs:4457`)
   answer with `cfg!(all(feature = "admin", feature = "tls"))`, or a third text exists for "an admin server
   with no TLS" — whichever the maintainer prefers — and a test pins the emitted text in the
   `--no-default-features --features micro,admin` build, so the `admin`-without-`tls` combination names no
   TLS acceptor it cannot build. **Entanglement (recorded by round 3, not fixed):** whichever condition
-  those two sites end up using, their pins must move with them — today
-  `frp-client/tests/reload_warning_delivery.rs`, `frpc/tests/admin_config_get_warning.rs` and
-  `frpc/tests/warn_delivery.rs` all key their clause assertion on `cfg!(feature = "admin")`, so a site
-  answering `cfg!(all(feature = "admin", feature = "tls"))` would make those three assertions wrong until
-  they are re-keyed. `docs/config.md:192` then loses the `admin`-without-`tls` caveat this filing added,
+  those two sites end up using, their pins must move with them — two of the three clause assertions are
+  `cfg!`-keyed on `cfg!(feature = "admin")` (`frp-client/tests/reload_warning_delivery.rs:99`,
+  `frpc/tests/warn_delivery.rs:402`), while `frpc/tests/admin_config_get_warning.rs` is gated whole-file
+  (`#![cfg(all(feature = "full", feature = "admin"))]` at `:59`) and asserts the dashboard text
+  unconditionally (`:291`/`:296`), so it needs re-keying only if that gate changes. A re-key is not
+  self-witnessing at `frp-client/src/service.rs:4457`: measured there, `cfg!(feature = "tls")` and
+  `cfg!(all(feature = "admin", feature = "tls"))` both leave both client reload lanes rc **0**, because
+  `admin` and `tls` are correlated in every lane that runs that file — so whichever condition is chosen,
+  that pin must be re-keyed deliberately and re-measured on a real build (the `frpc` site at
+  `frpc/src/main.rs:776` does discriminate: `cfg!(feature = "tls")` there reds the new admin lane, rc
+  **101**, `frpc/tests/warn_delivery.rs:403:9`, while the default lane stays rc 0).
+  `docs/config.md:192` then loses the `admin`-without-`tls` caveat this filing added,
   because the sentence becomes unconditionally true again. Ledger after filing this item:
   **26 open / 107 closed**.
 
