@@ -966,9 +966,11 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   the `not(feature = "tls")` arm. So `cargo build -p frpc --no-default-features --features micro,admin`
   (rc 0) is an `admin` build that prints the dashboard clause — "the dashboard HTTPS server is enabled by a
   non-empty `cert_file` + `key_file` pair" — while its admin listener logs
-  `frpc admin server listening on 127.0.0.1:27598` with no `(TLS)` suffix and answers a bare plaintext
-  `GET /` with **401** and a request authenticated as `admin:admin` to `/api/v2/system/info` with
-  **404**. That is the same class of falsehood the item above removed, one feature interaction further
+  `frpc admin server listening on 127.0.0.1:27598` with no `(TLS)` suffix and serves plaintext HTTP
+  (measured on a real `micro,admin` binary: with `[web_server]` `user`/`password` configured a bare
+  `GET /` is **401** and a credentialed `GET /api/v2/system/info` is **404**; with no credentials
+  configured a bare `GET /` is **404**). That is the same class of falsehood the item above removed,
+  one feature interaction further
   in. Done-when: the admin call sites (`frp-client/src/admin.rs:771`, `frp-client/src/service.rs:4457`)
   answer with `cfg!(all(feature = "admin", feature = "tls"))`, or a third text exists for "an admin server
   with no TLS" — whichever the maintainer prefers — and a test pins the emitted text in the
