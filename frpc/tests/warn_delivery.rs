@@ -50,17 +50,19 @@
 //!
 //! **What these tests assert, and what they do not.** Real binary, real config
 //! file, the two streams captured separately, the **number of records per
-//! stream**, and that the binary reached its post-`init_logging` startup line.
-//! They do **not** pin the message text, the exact log line, or the position of
-//! the record; the text is pinned by
+//! stream**, that the binary reached its post-`init_logging` startup line, and —
+//! through `assert_clause_matches_this_build` — **which of the two clauses this
+//! build's `cfg!` answer produced**. They do **not** pin the exact log line or
+//! the position of the record; the full text of both clauses is pinned by
 //! `frp-core/tests/web_server_tls_enable_warning.rs`.
 //!
 //! **What it does not cover.** `frps` (the sibling file
 //! `frps/tests/warn_delivery.rs`, which also pins the server's SIGUSR1 reload
-//! and the `includes` spelling), the `frpc verify` row and the **client** reload
-//! row above (measured by probe; the client reload needs a live session, so it is
-//! pinned in-process by `frp-client/tests/reload_warning_delivery.rs`), the admin
-//! server's actual HTTP/HTTPS behaviour, and other sinks.
+//! and the `includes` spelling), the **client** reload row (the client only
+//! processes a reload inside a live session, so it is pinned in-process by
+//! `frp-client/tests/reload_warning_delivery.rs`, which asserts the clause this
+//! crate's `cfg!` answer produced but not the text), the admin server's actual
+//! HTTP/HTTPS behaviour, and other sinks.
 //!
 //! Bounded: every wait has a deadline, every child is killed and reaped by
 //! [`ChildGuard::drop`] even on panic, and each test picks its own ports from the
@@ -95,6 +97,14 @@ const SETTLE: Duration = Duration::from_millis(500);
 const STARTUP_MARKER: &str = "frpc (Rust) v";
 /// The key, as the message names it.
 const KEY: &str = "web_server.tls.enable";
+/// The marker unique to the **dashboard-build** clause
+/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING`): the only words a build with no admin
+/// server must never print.
+const DASHBOARD_CLAUSE: &str = "plaintext HTTP";
+/// The marker unique to the **no-dashboard-build** clause
+/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD`). The two clauses share
+/// their whole first half, so `KEY` above is in both and cannot tell them apart.
+const NO_DASHBOARD_CLAUSE: &str = "no dashboard support";
 /// The **server-side** flat `tls_enable` diagnostic. It must never appear in
 /// `frpc`: `ClientConfig::tls_enable` is live (it decides whether the control
 /// connection is encrypted — `frp-client/src/control.rs`), so the "no effect"
@@ -341,8 +351,9 @@ fn occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
 }
 
-/// The shared assertion: one record on **stdout**, none on **stderr**, and the
-/// binary really did start.
+/// The shared assertion: one record on **stdout**, none on **stderr**, the
+/// binary really did start, and the record carries the clause **this build**
+/// answers with.
 fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
     let out = spawned.stdout();
     let err = spawned.stderr();
@@ -360,6 +371,57 @@ fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
         0,
         "{tag}: the console sink is stdout; stderr must carry none\n--- stderr ---\n{err}"
     );
+    assert_clause_matches_this_build(tag, spawned);
+}
+
+/// The clause the emitted record must carry — decided by **this build**, not by
+/// a literal argument.
+///
+/// Both variants open with the same `web_server.tls.enable has no effect: …`, so
+/// the count assertions above pass either way: a call site that hardcodes the
+/// other answer still compiles and still emits one `KEY` record. The call sites
+/// this file reaches are `frpc/src/main.rs:527` (`--config-dir`), `:602` (`-c`)
+/// and `:776` (`verify`). `frp-core`'s own dispatch test passes `has_dashboard`
+/// as an argument, so only this `cfg!`-keyed assertion on the captured output can
+/// see what the binary answered.
+///
+/// Keyed on **`admin`**, the client's own word (`frp-client`'s `admin` feature,
+/// which `frpc` forwards) — not on `dashboard`, which `frpc` does not have. The
+/// plain `cargo test -p frpc` lane runs with `admin` off, so the no-dashboard
+/// direction is pinned there without a new lane.
+fn assert_clause_matches_this_build(tag: &str, spawned: &Spawned) {
+    let out = spawned.stdout();
+    let err = spawned.stderr();
+    assert_clause_matches_this_build_in(tag, &out, &err);
+}
+
+/// The same assertion for a caller that collected the streams itself (the
+/// `verify` row below), so exactly one place decides which clause this build
+/// must carry.
+fn assert_clause_matches_this_build_in(tag: &str, out: &str, err: &str) {
+    if cfg!(feature = "admin") {
+        assert!(
+            out.contains(DASHBOARD_CLAUSE),
+            "{tag}: a build that compiles the admin server must keep the dashboard clause \
+             ({DASHBOARD_CLAUSE:?})\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+        );
+        assert!(
+            !out.contains(NO_DASHBOARD_CLAUSE),
+            "{tag}: a build that compiles the admin server must not claim it has no dashboard \
+             support ({NO_DASHBOARD_CLAUSE:?})\n--- stdout ---\n{out}"
+        );
+    } else {
+        assert!(
+            out.contains(NO_DASHBOARD_CLAUSE),
+            "{tag}: a build with no admin server must name its own build fact rather than the \
+             dashboard's ({NO_DASHBOARD_CLAUSE:?})\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+        );
+        assert!(
+            !out.contains(DASHBOARD_CLAUSE),
+            "{tag}: a build with no admin server must not describe the dashboard's TLS \
+             ({DASHBOARD_CLAUSE:?})\n--- stdout ---\n{out}"
+        );
+    }
 }
 
 #[test]
@@ -451,6 +513,7 @@ fn warning_when_the_camelcase_tls_table_is_merged_into_the_snake_section() {
         "exactly one record on the console sink\n--- stdout ---\n{out}"
     );
     assert_eq!(occurrences(&err, KEY), 0, "stderr:\n{err}");
+    assert_clause_matches_this_build("frpc -c (mixed sections)", &spawned);
 }
 
 /// The client writes the **same flat key name** the server warning is about, but
@@ -483,12 +546,19 @@ fn no_server_tls_enable_warning_in_frpc_where_the_field_is_live() {
 
 /// `frpc verify` installs its console logger **before** the load and therefore
 /// *does* reach the dashboard diagnostic — but the server `tls_enable` message
-/// must still be absent, because that path loads a `ClientConfig`.
+/// must still be absent, because that path loads a `ClientConfig`. The config
+/// writes the nested key so the diagnostic actually fires, and its clause is
+/// asserted against this build's `cfg!` answer.
 #[test]
 fn frpc_verify_says_nothing_about_the_server_tls_enable_key() {
     let dir = TempDir::new("srv-key-verify");
+    // The nested key is what lets this row witness the `verify` call site
+    // (`frpc/src/main.rs:776`): with no `[web_server.tls] enable` the presence
+    // flag stays unset and the record never fires, so a hardcoded answer there
+    // was invisible to every lane.
     let cfg = format!(
-        "server_addr = \"127.0.0.1\"\nserver_port = {}\ntls_enable = false\n",
+        "server_addr = \"127.0.0.1\"\nserver_port = {}\ntls_enable = false\n\
+         [web_server.tls]\nenable = true\n",
         free_port()
     );
     let path = dir.write("frpc.toml", &cfg);
@@ -527,4 +597,5 @@ fn frpc_verify_says_nothing_about_the_server_tls_enable_key() {
         "frpc verify must not claim the client field is inert\n--- stdout ---\n{stdout}"
     );
     assert_eq!(occurrences(&stderr, SERVER_KEY), 0, "stderr:\n{stderr}");
+    assert_clause_matches_this_build_in("frpc verify", &stdout, &stderr);
 }

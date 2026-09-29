@@ -403,6 +403,40 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **The `web_server.tls.enable` warning is now build-aware: in a build with no
+  dashboard it no longer claims the dashboard serves plaintext HTTP.** The key is
+  read behind `frp-server`'s `dashboard` feature (and `frpc`'s `admin`), but the
+  warning was not, so every tier that cannot build a dashboard — the default
+  `frps` (`full` does not include `frp-server/dashboard`), `frps-tiny`,
+  `frps-micro` and a default `frpc` — still told the user what the dashboard does
+  with `cert_file`/`key_file`. `frp-core` has neither feature, so the two texts
+  now live in `WEB_SERVER_TLS_ENABLE_INERT_WARNING` (unchanged, for a build that
+  compiles a dashboard) and the new
+  `WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD` ("web_server.tls.enable has
+  no effect: this build has no dashboard support, so nothing reads the key and no
+  dashboard HTTPS server is built"), with
+  `warn_inert_web_server_tls_enable(has_dashboard: bool)` picking between them;
+  each call site passes its own `cfg!`. Measured on the real binaries:
+  `frps-micro` and `frps-tiny` print the no-dashboard sentence and leave
+  `web_server.port` closed, the default `frps` prints it too, and
+  `frps --features dashboard` keeps the pair clause and listens.
+  Round 2 closed the gap that fix left: the two texts were told apart only by a test
+  that passed `has_dashboard` as a literal, so nothing checked what a real build
+  answered — a call site hardcoding the other variant compiled clean and stayed green.
+  The clause is now asserted by `cfg!`-keyed checks inside the existing `frps` and
+  `frpc` warning-delivery tests, and by `frpc`'s admin-config test — gated whole-file
+  on `admin`, so it asserts the dashboard text unconditionally — keyed on
+  `plaintext HTTP` versus `no dashboard support`. Round 3 finished that job: three of
+  the eight call sites were still unwitnessed — `frpc verify` (`frpc/src/main.rs:776`,
+  whose test wrote no nested key so the record never fired), the client reload
+  (`frp-client/src/service.rs:4457`, which had no clause assertion) and the
+  `frpc --config-dir` site (`frpc/src/main.rs:527`, whose pin no CI lane ran). The
+  clause is now asserted on all three, a new count-guarded `frpc --features admin`
+  `warn_delivery` step runs the configuration that witnesses `:527`, and the two
+  existing `frp-client` reload lanes (admin on and off) pin one branch each.
+  `docs/config.md` also no longer states the `cert_file`/`key_file` pair rule
+  unconditionally: an `admin`-without-`tls` client build has no TLS acceptor to hand
+  the pair to, which is filed as its own item.
 - **The server `tls_enable` warning now describes what actually happens to the
   certificate pair, in every build, and no longer fires for a
   `[common.transport.tls] tls_enable` that never reaches the loader.** With only

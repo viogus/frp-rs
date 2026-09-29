@@ -524,7 +524,7 @@ async fn run_normal(mut args: FrpcRunArgs) {
                     // exists. The loader cannot warn (it would be silent on the
                     // `-c` path below), so the binary owns the diagnostic and
                     // this path emits it once, at its own load site.
-                    presence.warn_inert_web_server_tls_enable();
+                    presence.warn_inert_web_server_tls_enable(cfg!(feature = "admin"));
                     let uf = unsafe_features.clone();
                     #[cfg(unix)]
                     let stop_services = stop_services.clone();
@@ -599,7 +599,7 @@ async fn run_normal(mut args: FrpcRunArgs) {
     // warns at its own load site, so no path double-warns (measured, probe
     // `/tmp/enable-warn-probe/run-probe.sh`: 1 on stdout, 0 on stderr, both
     // paths, both binaries).
-    presence.warn_inert_web_server_tls_enable();
+    presence.warn_inert_web_server_tls_enable(cfg!(feature = "admin"));
 
     tracing::info!(version = %frp_core::VERSION, "frpc (Rust) v{} connecting...", frp_core::VERSION);
     let service = Arc::new(
@@ -773,7 +773,7 @@ async fn run_verify(config_path: &str, strict_config: bool) {
             // sink exists: emit the `[web_server.tls] enable` diagnostic here to
             // keep the coverage this subcommand had while the loader warned (and
             // to keep it to one record).
-            presence.warn_inert_web_server_tls_enable();
+            presence.warn_inert_web_server_tls_enable(cfg!(feature = "admin"));
             // `load_client_config` only parses, so without this `verify` printed
             // "is valid" (rc 0) for a config `frpc run` refuses during service
             // construction (an oidc config in a build without the `oidc`

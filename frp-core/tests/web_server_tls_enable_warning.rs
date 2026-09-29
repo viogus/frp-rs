@@ -47,6 +47,18 @@
 //! record for `enable = false` with no pair. All four are pinned below; the
 //! message text is written to be true in every one of them.
 //!
+//! **Two variants, one per build.** The `web_server` reader lives behind
+//! `frp-server`'s `dashboard` feature (the dashboard) and `frp-client`'s `admin`
+//! feature (the client's admin server/API) — and `frp-core` has **neither**, so a
+//! `#[cfg(feature = "dashboard")]` here would be constant `false` in every
+//! configuration and pin nothing. The awareness is therefore supplied by the
+//! caller: `warn_inert_web_server_tls_enable(has_dashboard)` emits the dashboard
+//! variant when the caller compiles one and the no-dashboard variant when it does
+//! not. The variants are the two constants this file exercises directly, and
+//! `the_no_dashboard_build_names_no_dashboard_behaviour` pins both the text and
+//! the selection; the callers pass `cfg!(feature = "dashboard")` (`frps`,
+//! `frp-server`) or `cfg!(feature = "admin")` (`frpc`, `frp-client`).
+//!
 //! **What it does not cover.** Delivery on a real binary is
 //! `frps/tests/warn_delivery.rs` and `frpc/tests/warn_delivery.rs` (real
 //! binaries, `-c` and `--config-dir`, top-level and `[common]` spellings, stdout
@@ -65,7 +77,10 @@
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
-use frp_core::config::{load_server_config_uncompleted_with_presence, ConfigPresence};
+use frp_core::config::{
+    load_server_config_uncompleted_with_presence, ConfigPresence,
+    WEB_SERVER_TLS_ENABLE_INERT_WARNING, WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD,
+};
 
 #[derive(Clone)]
 struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
@@ -99,13 +114,28 @@ fn snapshot(output: &Arc<Mutex<Vec<u8>>>) -> String {
 
 /// Load `body` through the real loader and then call the binaries' entry point,
 /// all under one capturing subscriber, and return what each phase emitted.
+///
+/// Models a caller that **compiles a dashboard** — the `frps --features
+/// dashboard` / `frpc --features admin` shape the pair clause describes. This
+/// crate has no `dashboard` feature and so cannot derive that answer; the
+/// no-dashboard shape is [`load_capturing_as`] with `has_dashboard = false`.
 fn load_capturing(body: &str, strict: bool) -> Captured {
-    load_capturing_files(&[("frps.toml", body)], strict)
+    load_capturing_as(body, strict, true)
+}
+
+/// [`load_capturing`] with the caller's build answer given explicitly, so the
+/// no-dashboard variant is exercised too.
+fn load_capturing_as(body: &str, strict: bool, has_dashboard: bool) -> Captured {
+    load_capturing_files_as(&[("frps.toml", body)], strict, has_dashboard)
 }
 
 /// [`load_capturing`] with extra files in the same directory, so the `includes`
 /// spelling (which is deep-merged before the detector runs) can be exercised.
 fn load_capturing_files(files: &[(&str, &str)], strict: bool) -> Captured {
+    load_capturing_files_as(files, strict, true)
+}
+
+fn load_capturing_files_as(files: &[(&str, &str)], strict: bool, has_dashboard: bool) -> Captured {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("frps.toml");
     for (name, body) in files {
@@ -134,7 +164,7 @@ fn load_capturing_files(files: &[(&str, &str)], strict: bool) -> Captured {
     let key = cfg.web_server.tls_key().to_string();
 
     let before = output.lock().unwrap().len();
-    presence.warn_inert_web_server_tls_enable();
+    presence.warn_inert_web_server_tls_enable(has_dashboard);
     let appended = String::from_utf8(output.lock().unwrap()[before..].to_vec()).unwrap();
     drop(guard);
 
@@ -259,6 +289,105 @@ fn nested_web_server_tls_enable_warns_once_and_stays_inert() {
     );
     assert!(!c.presence.web_server_tls_enable_set());
     assert_eq!(c.warning_records, 0);
+}
+
+/// The **build** axis: a build with no dashboard must name no dashboard
+/// behaviour, and the caller's answer must pick the variant.
+///
+/// `frp-core` has neither `frp-server`'s `dashboard` feature nor `frp-client`'s
+/// `admin` feature, so it cannot resolve this itself — a
+/// `#[cfg(feature = "dashboard")]` inside it would be constant `false` in every
+/// configuration and would pin nothing. The caller answers instead, and these are
+/// the two texts it chooses between. The first half pins the texts; the second
+/// drives the real loader and entry point both ways, so a variant that ignored
+/// `has_dashboard` — or a no-dashboard text that inherited a dashboard fact —
+/// fails here.
+#[test]
+fn the_no_dashboard_build_names_no_dashboard_behaviour() {
+    const NEEDLE: &str = "web_server.tls.enable has no effect";
+
+    // Both texts are still the same diagnostic, and they are distinct: the
+    // dispatch assertions below use `contains`, so one must not be a substring of
+    // the other.
+    for text in [
+        WEB_SERVER_TLS_ENABLE_INERT_WARNING,
+        WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD,
+    ] {
+        assert!(
+            text.contains(NEEDLE),
+            "both variants name the key; got: {text}"
+        );
+    }
+    assert!(
+        !WEB_SERVER_TLS_ENABLE_INERT_WARNING
+            .contains(WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD)
+            && !WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD
+                .contains(WEB_SERVER_TLS_ENABLE_INERT_WARNING),
+        "the two variants must be distinct texts, not one a substring of the other"
+    );
+
+    // Facts that only a build with a dashboard may state.
+    for fact in ["cert_file", "key_file", "plaintext HTTP"] {
+        assert!(
+            WEB_SERVER_TLS_ENABLE_INERT_WARNING.contains(fact),
+            "the dashboard variant names `{fact}`"
+        );
+        assert!(
+            !WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD.contains(fact),
+            "a build with no dashboard must not name `{fact}`; got: \
+             {WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD}"
+        );
+    }
+
+    // What the no-dashboard variant says instead: the build's own inertness.
+    for fact in ["no dashboard support", "no dashboard HTTPS server is built"] {
+        assert!(
+            WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD.contains(fact),
+            "the no-dashboard variant names `{fact}`; got: \
+             {WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD}"
+        );
+    }
+
+    // The selection itself, through the real loader and entry point. Same body,
+    // two caller answers, two different records.
+    let body = "bind_port = 7000\ntoken = \"t\"\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+                [web_server.tls]\nenable = true\n";
+
+    let with_dashboard = load_capturing_as(body, false, true);
+    assert!(with_dashboard.presence.web_server_tls_enable_set());
+    assert_eq!(with_dashboard.warning_records, 1);
+    assert!(
+        with_dashboard
+            .logged_by_warning_call
+            .contains(WEB_SERVER_TLS_ENABLE_INERT_WARNING),
+        "a dashboard build emits the dashboard variant; got: {}",
+        with_dashboard.logged_by_warning_call
+    );
+    assert!(
+        !with_dashboard
+            .logged_by_warning_call
+            .contains(WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD),
+        "a dashboard build must not emit the no-dashboard variant; got: {}",
+        with_dashboard.logged_by_warning_call
+    );
+
+    let without_dashboard = load_capturing_as(body, false, false);
+    assert!(without_dashboard.presence.web_server_tls_enable_set());
+    assert_eq!(without_dashboard.warning_records, 1);
+    assert!(
+        without_dashboard
+            .logged_by_warning_call
+            .contains(WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD),
+        "a build with no dashboard emits the no-dashboard variant; got: {}",
+        without_dashboard.logged_by_warning_call
+    );
+    assert!(
+        !without_dashboard
+            .logged_by_warning_call
+            .contains(WEB_SERVER_TLS_ENABLE_INERT_WARNING),
+        "a build with no dashboard must not emit the dashboard variant; got: {}",
+        without_dashboard.logged_by_warning_call
+    );
 }
 
 /// The `[common]` spelling and the `includes` spelling set the same flag.

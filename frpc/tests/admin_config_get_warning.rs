@@ -75,6 +75,15 @@ const STARTUP_MARKER: &str = "frpc (Rust) v";
 const ADMIN_MARKER: &str = "frpc admin server listening";
 /// The inert-key record the tests count.
 const KEY: &str = "web_server.tls.enable has no effect";
+/// The marker unique to the **dashboard-build** clause
+/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING`); this target only compiles when
+/// `admin` is on, so this is the clause it must carry.
+const DASHBOARD_CLAUSE: &str = "plaintext HTTP";
+/// The marker unique to the **no-dashboard-build** clause
+/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD`) — the one an admin build
+/// must never print. Both clauses share `KEY` above, so `KEY` cannot tell them
+/// apart on its own.
+const NO_DASHBOARD_CLAUSE: &str = "no dashboard support";
 /// How long a shape may take from spawn to a marker being visible.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a killed child may take to disappear before the guard gives up.
@@ -258,7 +267,36 @@ impl Spawned {
             0,
             "{tag}: the console sink is stdout; stderr must carry none\n--- stderr ---\n{err}"
         );
+        assert_clause_is_the_dashboard_one(tag, &out);
     }
+}
+
+/// The clause the emitted record must carry in **this** target.
+///
+/// The file compiles only when `admin` is on (`#![cfg(all(feature = "full",
+/// feature = "admin"))]`), so the build under test answers "a dashboard
+/// exists", and a record that says otherwise means a call site answered wrongly.
+/// The call sites this file reaches are `frpc/src/main.rs:602` (the `-c`
+/// startup load) and `frp-client/src/admin.rs:771` (the admin config-GET handler
+/// runs `config_from_file`); it never drives the reload, so
+/// `frp-client/src/service.rs:4457` is not visible here — that site is pinned by
+/// `frp-client/tests/reload_warning_delivery.rs`. `KEY` is the shared prefix of
+/// both texts and cannot tell them apart; these two markers are the whole
+/// assertion. Every test in this file reaches it through [`assert_records`];
+/// measured, hardcoding either reached site's answer to `false` reds **2 of the
+/// 4** (`test result: FAILED. 2 passed; 2 failed`) — the startup rows witness
+/// `:602`, the hand-edit rows witness `:771`.
+fn assert_clause_is_the_dashboard_one(tag: &str, out: &str) {
+    assert!(
+        out.contains(DASHBOARD_CLAUSE),
+        "{tag}: an admin build's record must keep the dashboard clause \
+         ({DASHBOARD_CLAUSE:?})\n--- stdout ---\n{out}"
+    );
+    assert!(
+        !out.contains(NO_DASHBOARD_CLAUSE),
+        "{tag}: an admin build's record must not claim it has no dashboard support \
+         ({NO_DASHBOARD_CLAUSE:?})\n--- stdout ---\n{out}"
+    );
 }
 
 /// Read a child's pipe to EOF on its own thread, appending into `sink`.

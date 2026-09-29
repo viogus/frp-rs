@@ -37,8 +37,9 @@
 //! `request_reload()` (that is `frpc/src/main.rs`; the probe exercises it end to
 //! end with the real binary and a real `kill -USR1`), the server's reload
 //! (`frps/tests/warn_delivery.rs::a_sigusr1_reload_delivers_the_warning_again`),
-//! and the message text (pinned by
-//! `frp-core/tests/web_server_tls_enable_warning.rs`).
+//! and the exact log line: this file asserts the clause this crate's `cfg!`
+//! answer produced, while the full text of both clauses is pinned by
+//! `frp-core/tests/web_server_tls_enable_warning.rs`.
 
 mod common;
 
@@ -53,6 +54,13 @@ use common::{allocate_port, start_echo_server, start_frps, wait_for_port};
 
 /// The key, as the message names it.
 const KEY: &str = "web_server.tls.enable";
+/// The marker unique to the **dashboard-build** clause
+/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING`).
+const DASHBOARD_CLAUSE: &str = "plaintext HTTP";
+/// The marker unique to the **no-dashboard-build** clause
+/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD`). The two texts share
+/// their whole first half, so `KEY` is in both and cannot tell them apart.
+const NO_DASHBOARD_CLAUSE: &str = "no dashboard support";
 const TOKEN: &str = "reload-warning-token";
 /// How long the reload may take to emit the record.
 const RELOAD_TIMEOUT: Duration = Duration::from_secs(20);
@@ -77,6 +85,40 @@ fn captured(sink: &Arc<Mutex<Vec<u8>>>) -> String {
 
 fn occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
+}
+
+/// The clause the reloaded record must carry — decided by **this crate's**
+/// build, not by a literal argument. `Service::reload_from_sources`
+/// (`frp-client/src/service.rs:4457`) passes `cfg!(feature = "admin")`, so a
+/// site that hardcodes the other answer still compiles and still emits one
+/// `KEY` record; only this `cfg!`-keyed assertion can see what this build
+/// answered. Both CI configurations exercise this target, one per branch:
+/// `-p frp-client --features admin` (admin on) and
+/// `-p frp-client --no-default-features --all-targets` (admin off).
+fn assert_clause_matches_this_build(tag: &str, logged: &str) {
+    if cfg!(feature = "admin") {
+        assert!(
+            logged.contains(DASHBOARD_CLAUSE),
+            "{tag}: an admin build's record must keep the dashboard clause \
+             ({DASHBOARD_CLAUSE:?})\n--- captured ---\n{logged}"
+        );
+        assert!(
+            !logged.contains(NO_DASHBOARD_CLAUSE),
+            "{tag}: an admin build's record must not claim it has no dashboard support \
+             ({NO_DASHBOARD_CLAUSE:?})\n--- captured ---\n{logged}"
+        );
+    } else {
+        assert!(
+            logged.contains(NO_DASHBOARD_CLAUSE),
+            "{tag}: a build with no admin server must name its own build fact rather than the \
+             dashboard's ({NO_DASHBOARD_CLAUSE:?})\n--- captured ---\n{logged}"
+        );
+        assert!(
+            !logged.contains(DASHBOARD_CLAUSE),
+            "{tag}: a build with no admin server must not describe the dashboard's TLS \
+             ({DASHBOARD_CLAUSE:?})\n--- captured ---\n{logged}"
+        );
+    }
 }
 
 /// A valid client config with one tcp proxy, whose dashboard TLS section is
@@ -189,6 +231,7 @@ async fn a_client_reload_delivers_the_web_server_tls_enable_warning() {
         "the record is the `[web_server.tls] enable` diagnostic, not an unrelated \
          mention of the key\n--- captured ---\n{logged}"
     );
+    assert_clause_matches_this_build("client reload", &logged);
 
     client.request_stop();
     tokio::time::timeout(Duration::from_secs(5), runner)

@@ -722,10 +722,10 @@ impl ServerConfig {
     ///   `tls_enable` (`ServerConfig.tls_enable` — `grep -rn tls_enable
     ///   frp-server/src frps/src` finds no read of it; the hits are only comment
     ///   lines and call sites of the unrelated helper
-    ///   `presence.warn_inert_web_server_tls_enable()`, which reads a different
-    ///   key, `[web_server.tls] enable`. No count is pinned, because the comment
-    ///   that states it changes it; Go v0.71.0's server config has no
-    ///   such field either, its `TLS.Enable` is a *client* one),
+    ///   `presence.warn_inert_web_server_tls_enable(has_dashboard)`, which reads
+    ///   a different key, `[web_server.tls] enable`. No count is pinned, because
+    ///   the comment that states it changes it; Go v0.71.0's server config has
+    ///   no such field either, its `TLS.Enable` is a *client* one),
     ///   `tls_server_name` (`ServerConfig::tls_server_name` is a *client* field in
     ///   Go; nothing outside `frp-core`'s client transport reads it),
     ///   `feature.gates` (validated by the loader at load time only;
@@ -778,8 +778,8 @@ impl ServerConfig {
             // No reader in `frp-server`/`frps` (`grep -rn tls_enable
             // frp-server/src frps/src` finds no read — only comment lines and
             // call sites of the unrelated helper
-            // `presence.warn_inert_web_server_tls_enable()`, which reads a
-            // different key, `[web_server.tls] enable`; no count is pinned,
+            // `presence.warn_inert_web_server_tls_enable(has_dashboard)`, which
+            // reads a different key, `[web_server.tls] enable`; no count is pinned,
             // since stating it here would itself change it). Inert: neither a
             // reload nor a restart can make a change take effect, so it is
             // neither applied nor reported.
