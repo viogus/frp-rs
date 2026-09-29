@@ -275,11 +275,43 @@ pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING: &str = "web_server.tls.enable has
 /// **live** — `frp-client/src/control.rs` reads it to decide whether the control
 /// connection is encrypted and warns when it is not — so emitting "no effect"
 /// there would be false. `tls_enable` is inert only on `ServerConfig`.
+///
+/// **Two variants, selected by the `tls` feature**, because the certificate
+/// clauses are false in a build with no TLS: `frp-server`'s whole acceptor block
+/// is `#[cfg(feature = "tls")]` (`frp-server/src/service.rs:603`) while this
+/// warning is not, and `release.yml` ships `frps-micro` / `frps-tiny` (tiny keeps
+/// `tls`; **micro does not**). Measured on a real `frps-micro`
+/// (`/tmp/tls-warn-probe/run-micro.sh`): `tls_enable = true` + only
+/// `tls_cert_file` exits **0**, logs `frps listener started on 0.0.0.0:27331`
+/// and emits this record — no refusal — and with neither file there is no
+/// auto-generated line either. So the no-TLS variant says only what is true
+/// there (the key is inert and no acceptor is ever built) and names **no**
+/// certificate behaviour.
+///
+/// In a `tls` build the pair clause covers both delivery paths, measured on the
+/// real `frps` (`/tmp/tls-warn-probe/run-reload.sh`): at startup a half-written
+/// pair exits **1** (`TLS requires both cert_file and key_file to be set; got
+/// only one`), and so does an unreadable pair (`open cert file: No such file or
+/// directory`); on a SIGUSR1 reload the same shapes keep the server running and
+/// report `TLS certificate reload FAILED: … (keeping old config)`. The text
+/// therefore says "refused at startup", not "the server refuses to start".
+#[cfg(feature = "tls")]
 pub const SERVER_TLS_ENABLE_INERT_WARNING: &str = "tls_enable has no effect on the \
     server: nothing in frp-server or frps reads it. The server's TLS switch is \
     `tls_only` (Go's `transport.tls.force`); the TLS acceptor is built from \
-    `tls_cert_file` + `tls_key_file`, with only one of the two set the server refuses \
-    to start, and with neither set it auto-generates a self-signed certificate pair";
+    `tls_cert_file` + `tls_key_file` — a half-written (only one of the two) or \
+    unreadable pair is refused at startup, a reload reports the failure and keeps the \
+    running acceptor, and with neither set the server auto-generates a self-signed \
+    certificate pair";
+
+/// The no-TLS variant of the server `tls_enable` diagnostic. The `tls`-build text
+/// (and the measurements behind the split) is on the `#[cfg(feature = "tls")]`
+/// definition above; this one names no certificate behaviour, because a build
+/// without the `tls` feature never builds a TLS acceptor.
+#[cfg(not(feature = "tls"))]
+pub const SERVER_TLS_ENABLE_INERT_WARNING: &str = "tls_enable has no effect on the \
+    server: nothing in frp-server or frps reads it. This build has no TLS support \
+    (frp-core's `tls` feature is off), so the server never builds a TLS acceptor";
 
 impl ConfigPresence {
     pub(super) fn from_normalized_value(value: &toml::Value) -> Self {
@@ -394,7 +426,8 @@ impl ConfigPresence {
     /// so after normalization a written key and a synthesized one are
     /// indistinguishable.
     ///
-    /// Three spellings count. `[common]`'s flatten is
+    /// Three spellings count, one of them conditionally (see the next
+    /// paragraph). `[common]`'s flatten is
     /// `table.entry(k).or_insert(v)` **on the whole value**
     /// (`frp-core/src/config/normalize.rs:652-655`), so a written top-level key
     /// wins over a written `[common]` one — either way the key was **written**

@@ -175,6 +175,25 @@ fn load_capturing_expect_err(body: &str) -> String {
     err
 }
 
+/// A load that must fail for a **non-strict** reason (e.g. a wrongly typed
+/// `transport`), under the same capturing subscriber; returns the error text and
+/// the (empty) capture, so "the detector was never reached" is asserted rather
+/// than inferred.
+fn load_capturing_expect_load_err(body: &str) -> (String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.toml");
+    std::fs::write(&path, body).unwrap();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = subscriber_for(&output);
+    let guard = tracing::subscriber::set_default(subscriber);
+    let err = load_server_config_uncompleted_with_presence(path.to_str().unwrap(), false)
+        .expect_err("this shape must fail to load")
+        .to_string();
+    let logged = snapshot(&output);
+    drop(guard);
+    (err, logged)
+}
+
 fn subscriber_for(
     output: &Arc<Mutex<Vec<u8>>>,
 ) -> impl tracing::Subscriber + Send + Sync + 'static {
@@ -188,30 +207,45 @@ fn subscriber_for(
         .finish()
 }
 
-/// The message must be true in every combination: it has to name the inertness,
-/// the real switch, and how the acceptor's certificate is really obtained — the
-/// auto-generated fallback when **both** file paths are empty, and the startup
-/// refusal when **exactly one** is set. Both were measured on the real `frps`
-/// (`/tmp/tls-warn-probe/run-b.sh`, stdout and stderr captured separately):
+/// The message must be true in every configuration that fires it — and in every
+/// **build** that fires it. Two variants are selected by the `tls` feature
+/// (`frp-server`'s acceptor block is `#[cfg(feature = "tls")]` while the warning
+/// is not, and `release.yml` ships `frps-micro`, which has no `tls`), so this
+/// splits its assertions the same way.
+///
+/// Measured on the real binary (`/tmp/tls-warn-probe/run-b.sh` and
+/// `run-reload.sh`, stdout and stderr captured separately): in a `tls` build
 /// neither file → exit 0 and `TLS enabled with auto-generated self-signed
 /// certificate`; both files → exit 0 and `TLS enabled with cert: <path>`;
 /// exactly one → exit **1** and `Failed to initialize TLS: transport error: TLS
-/// requires both cert_file and key_file to be set; got only one` (the same exit
-/// 1 with `tls_enable` absent, so the abort is unconditional). The old
-/// "non-empty pair" claim was false for the very config that fires it (F1
-/// regression guard).
+/// requires both cert_file and key_file to be set; got only one`; both paths
+/// unreadable → exit **1** and `open cert file: No such file or directory`; and
+/// on a SIGUSR1 reload that introduces either shape the server **keeps running**
+/// with `TLS certificate reload FAILED: … (keeping old config)`. On the real
+/// `frps-micro` (`run-micro.sh`) `tls_enable = true` + only `tls_cert_file`
+/// exits **0** and logs `frps listener started on 0.0.0.0:27331` — no refusal,
+/// and no auto-generated line with neither file — which is why the no-TLS
+/// variant names no certificate behaviour. The old "non-empty pair" claim was
+/// false for the very config that fires it (F1 regression guard).
 #[test]
 fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
     assert!(
         SERVER_TLS_ENABLE_INERT_WARNING.contains(NEEDLE),
         "the const must carry the needle the tests count: {SERVER_TLS_ENABLE_INERT_WARNING}"
     );
+    assert!(
+        SERVER_TLS_ENABLE_INERT_WARNING.contains("nothing in frp-server or frps reads it"),
+        "both variants must name the inertness: {SERVER_TLS_ENABLE_INERT_WARNING}"
+    );
+
+    // A `tls` build names the pair's real outcomes, both delivery paths.
+    #[cfg(feature = "tls")]
     for fact in [
-        "nothing in frp-server or frps reads it",
         "`tls_only`",
         "`tls_cert_file`",
         "`tls_key_file`",
-        "refuses to start",
+        "refused at startup",
+        "a reload reports the failure and keeps the running acceptor",
         "auto-generates a self-signed certificate pair",
     ] {
         assert!(
@@ -219,9 +253,36 @@ fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
             "the message must name {fact:?}: {SERVER_TLS_ENABLE_INERT_WARNING}"
         );
     }
-    // The acceptor is *not* pair-gated: with neither file set the server
-    // auto-generates a self-signed pair. A "non-empty pair" claim here would be
-    // false for the config that fires the warning (F1 regression guard).
+
+    // A no-TLS build must name *why* the key is inert and must not claim any
+    // certificate behaviour — the clause the micro tier made false.
+    #[cfg(not(feature = "tls"))]
+    {
+        assert!(
+            SERVER_TLS_ENABLE_INERT_WARNING.contains("no TLS support"),
+            "the no-TLS variant must name the missing support: {SERVER_TLS_ENABLE_INERT_WARNING}"
+        );
+        assert!(
+            SERVER_TLS_ENABLE_INERT_WARNING.contains("never builds a TLS acceptor"),
+            "the no-TLS variant must say no acceptor is built: {SERVER_TLS_ENABLE_INERT_WARNING}"
+        );
+        for false_here in [
+            "refused at startup",
+            "auto-generates",
+            "`tls_cert_file`",
+            "`tls_key_file`",
+        ] {
+            assert!(
+                !SERVER_TLS_ENABLE_INERT_WARNING.contains(false_here),
+                "a no-TLS build must not claim {false_here:?}: {SERVER_TLS_ENABLE_INERT_WARNING}"
+            );
+        }
+    }
+
+    // The acceptor is *not* pair-gated in a `tls` build: with neither file set
+    // the server auto-generates a self-signed pair. A "non-empty pair" claim
+    // here would be false for the config that fires the warning (F1 regression
+    // guard).
     assert!(
         !SERVER_TLS_ENABLE_INERT_WARNING.contains("non-empty"),
         "the message must not claim a non-empty pair is required: {SERVER_TLS_ENABLE_INERT_WARNING}"
@@ -496,11 +557,11 @@ fn the_string_loader_stays_silent() {
 /// alone warns 1 (before **and** after this change); beside `[transport]
 /// heartbeat_timeout = 30` it warned 1 before and warns 0 after; a flat
 /// `[common] tls_enable = true` beside the same competing table still warns 1
-/// (a different key, and it survives the flatten); `transport = 30` (a
-/// top-level non-table) beside `[common.transport.tls]` fails the load with
-/// `invalid type: integer 30, expected struct ServerTransportConfig` (exit 1)
-/// before any warning can be emitted, which is why "absent **or not a table**"
-/// and "absent" are indistinguishable at the warning.
+/// (a different key, and it survives the flatten); `transport = 30` (a top-level
+/// non-table) fails the load with `invalid type: integer 30, expected struct
+/// ServerTransportConfig` (exit 1) before any warning can be emitted, which is
+/// why "absent **or not a table**" and "absent" are indistinguishable at the
+/// warning. All five shapes are asserted below.
 #[test]
 fn common_transport_tls_needs_no_competing_top_level_transport() {
     // Alone: the flatten inserts `[common]`'s `transport`, the lift removes its
@@ -547,4 +608,34 @@ fn common_transport_tls_needs_no_competing_top_level_transport() {
     );
     assert!(c.tls_enable, "the flat key survives the flatten");
     assert_eq!(c.warning_records, 1);
+
+    // An **empty** top-level `transport` table also wins the flatten whole —
+    // `or_insert` only cares that the key exists — so the `[common]` key is
+    // dropped and nothing is hoisted. Pinned because a mutant that treats an
+    // empty table as "absent" moves this shape 0 → 1 record while every other
+    // assertion in this file stays green (round-2 archive-copy measurement).
+    for body in [
+        "bind_port = 7000\n[transport]\n[common.transport.tls]\ntls_enable = true\n",
+        "bind_port = 7000\ntransport = {}\n[common.transport.tls]\ntls_enable = true\n",
+    ] {
+        let c = load_capturing(body, false);
+        assert!(
+            !c.presence.server_tls_enable_set(),
+            "an empty competing `transport` still drops the key: {body}"
+        );
+        assert!(!c.tls_enable, "nothing reached the field: {body}");
+        assert_eq!(c.warning_records, 0, "no record: {body}");
+    }
+
+    // The "not a table" half: a wrongly typed top-level `transport` also
+    // discards `[common]`'s, and the file cannot even load — so the detector is
+    // never reached and the load emits nothing.
+    let (err, logged) = load_capturing_expect_load_err(
+        "bind_port = 7000\ntransport = 30\n[common.transport.tls]\ntls_enable = true\n",
+    );
+    assert!(
+        err.contains("expected struct ServerTransportConfig"),
+        "a non-table `transport` must fail as a type error: {err}"
+    );
+    assert_eq!(logged, "", "a failed load emits nothing");
 }
