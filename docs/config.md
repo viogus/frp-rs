@@ -867,6 +867,35 @@ Scope and residuals, measured on Go frp v0.71.0:
   where Go would give the bracketed text — a divergence this reader introduces
   only for the frp-rs-only spelling.
 
+#### A legacy section's `role` is not validated
+
+Go's legacy INI collector dispatches a section on its `role` key **after**
+expanding a `[range:...]` template, and refuses anything that is neither
+`server` nor `visitor` (`pkg/config/legacy/client.go:263-284`, message
+`proxy %s role should be 'server' or 'visitor'`). frp-rs dispatches on the same
+key but validates nothing: the explicit shape reads `role` with a default of
+`server` and routes every non-`visitor` value to `proxies`
+(`frp-core/src/config/normalize.rs:2044-2054`), and the `[range:...]` shape
+does the same per generated element
+(`frp-core/src/config/normalize.rs:2014`,
+`frp-core/src/config/normalize.rs:2020-2024`). Measured with
+`frpc verify -c`, stdout and stderr captured separately and the rc read
+directly; both reproducers carry `[common]` with `server_addr = 127.0.0.1`,
+`server_port = 7000`:
+
+| Reproducer | Go frp v0.71.0 | frp-rs head |
+|---|---|---|
+| `[x]` `type = tcp` `role = serverx` `local_port = 8080` `remote_port = 7001` | rc **1**; stdout `proxy x role should be 'server' or 'visitor'`; stderr 0 B | rc **0**; stdout `Config file … is valid` + `Proxies: 1`; stderr 0 B |
+| `[range:x]` `type = tcp` `role = serverx` `local_port = 6010-6012` `remote_port = 7010-7012` | rc **1**; stdout `proxy x_0 role should be 'server' or 'visitor'`; stderr 0 B | rc **0**; stdout `Config file … is valid` + `Proxies: 3`; stderr 0 B |
+
+This is **recorded rather than fixed**. Refusing the section needs the legacy
+collector to be able to fail, and `normalize_client_config` returns `()`, so
+the refusal cannot be reported from there as it stands; the item is tracked in
+`TODO.md` and closed as documented-not-fixed. Scope: the divergence covers only
+the legacy INI collector's `role` dispatch, in the explicit `[x]` and
+`[range:...]` shapes. Canonical TOML/JSON/YAML configs have no legacy `role`
+key and are unaffected, and every other legacy key reads as described above.
+
 ---
 
 ## Environment Variable Expansion
