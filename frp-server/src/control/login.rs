@@ -2181,10 +2181,114 @@ mod oidc_throttle_tests {
     use super::authenticate;
     use crate::state::AppState;
 
+    /// How long the mock waits for one accepted client's complete request head.
+    ///
+    /// `accept()` on the mock's `set_nonblocking(true)` listener returns a
+    /// **non-blocking** stream on this host (measured: the first `read` with no
+    /// data sent returns `Err(WouldBlock, os error 35)`), so without a wait the
+    /// mock read 0 bytes whenever the accept beat the client's write. Bounded so
+    /// a client that connects and never sends cannot hold the serving thread.
+    const MOCK_REQUEST_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Upper bound on the request head the mock buffers before giving up.
+    const MOCK_REQUEST_HEAD_MAX: usize = 8192;
+
+    /// Why [`read_request_head`] stopped before a complete request head arrived.
+    ///
+    /// Rendered into the 500 body and stderr, so a request the mock never
+    /// received can never be mistaken for the `/` → 404 unknown-path route.
+    #[derive(Debug)]
+    enum RequestHeadError {
+        /// The peer closed the socket before sending the head terminator.
+        Eof,
+        /// No complete head arrived before the deadline.
+        TimedOut(std::time::Duration),
+        /// The head exceeded [`MOCK_REQUEST_HEAD_MAX`] with no terminator.
+        TooLarge(usize),
+        /// The socket itself failed.
+        Io(std::io::Error),
+    }
+
+    impl std::fmt::Display for RequestHeadError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Eof => write!(
+                    f,
+                    "client closed the socket before sending a complete request head"
+                ),
+                Self::TimedOut(d) => write!(f, "no complete request head within {d:?}"),
+                Self::TooLarge(n) => {
+                    write!(f, "request head exceeded {n} bytes without CRLFCRLF")
+                }
+                Self::Io(e) => write!(f, "socket error: {e}"),
+            }
+        }
+    }
+
+    /// Read exactly one HTTP request head — through its `\r\n\r\n` terminator —
+    /// from `stream`, waiting at most `timeout` in total.
+    ///
+    /// The accepted socket is switched to **blocking** explicitly (its inherited
+    /// mode is platform-defined) and given an `SO_RCVTIMEO` no larger than the
+    /// remaining budget, so the wait is bounded by the OS rather than by a poll
+    /// loop. Short reads are accumulated because the terminator may be split
+    /// across segments; any bytes past the terminator are left unread, keeping
+    /// the mock's one-request-per-accepted-socket contract.
+    fn read_request_head(
+        stream: &mut std::net::TcpStream,
+        timeout: std::time::Duration,
+    ) -> Result<String, RequestHeadError> {
+        stream
+            .set_nonblocking(false)
+            .map_err(RequestHeadError::Io)?;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut buf: Vec<u8> = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(RequestHeadError::TimedOut(timeout));
+            }
+            stream
+                .set_read_timeout(Some(remaining))
+                .map_err(RequestHeadError::Io)?;
+            match Read::read(stream, &mut chunk) {
+                Ok(0) => return Err(RequestHeadError::Eof),
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        buf.truncate(end + 4);
+                        return Ok(String::from_utf8_lossy(&buf).into_owned());
+                    }
+                    if buf.len() >= MOCK_REQUEST_HEAD_MAX {
+                        return Err(RequestHeadError::TooLarge(MOCK_REQUEST_HEAD_MAX));
+                    }
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return Err(RequestHeadError::TimedOut(timeout));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(RequestHeadError::Io(e)),
+            }
+        }
+    }
+
     /// Minimal OIDC discovery + JWKS mock on 127.0.0.1, plain HTTP, so an
     /// `OidcVerifier` can be built without external network access. Returns
     /// the issuer URL and a stop signal for the serving thread.
     fn oidc_mock_server() -> (String, std::sync::mpsc::Sender<()>) {
+        oidc_mock_server_with_timeout(MOCK_REQUEST_HEAD_TIMEOUT)
+    }
+
+    /// `oidc_mock_server` with the request-head deadline overridden, so the
+    /// bounded wait and its explicit failure can be pinned without a 5-second
+    /// test.
+    fn oidc_mock_server_with_timeout(
+        request_timeout: std::time::Duration,
+    ) -> (String, std::sync::mpsc::Sender<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock OIDC server");
         let addr = listener.local_addr().expect("mock OIDC address");
         let issuer = format!("http://{addr}");
@@ -2206,38 +2310,216 @@ mod oidc_throttle_tests {
                     break;
                 }
                 match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut buf = [0u8; 8192];
-                        let n = Read::read(&mut stream, &mut buf).unwrap_or(0);
-                        let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let path = req.split_whitespace().nth(1).unwrap_or("/");
-                        let (status, body) = if path.contains(".well-known/openid-configuration") {
-                            let jwks_uri = format!("http://{addr}/jwks");
-                            (200, format!(r#"{{"jwks_uri":"{jwks_uri}"}}"#))
-                        } else if path == "/jwks" {
-                            (200, jwks.clone())
-                        } else {
-                            (404, String::new())
-                        };
-                        // Connection: close — the mock serves exactly ONE
-                        // request per accepted socket (the socket is dropped
-                        // at the end of this arm). Without the header, the
-                        // HTTP/1.1 keep-alive default makes hyper's client
-                        // pool the discovery connection and route the JWKS
-                        // fetch into the abandoned socket → flaky
-                        // "client error (SendRequest)".
-                        let resp = format!(
-                            "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
-                        let _ = Write::write_all(&mut stream, resp.as_bytes());
-                    }
+                    Ok((mut stream, _)) => match read_request_head(&mut stream, request_timeout) {
+                        Ok(req) => {
+                            let path = req.split_whitespace().nth(1).unwrap_or("/");
+                            let (status, body) =
+                                if path.contains(".well-known/openid-configuration") {
+                                    let jwks_uri = format!("http://{addr}/jwks");
+                                    (200, format!(r#"{{"jwks_uri":"{jwks_uri}"}}"#))
+                                } else if path == "/jwks" {
+                                    (200, jwks.clone())
+                                } else {
+                                    (404, String::new())
+                                };
+                            // Connection: close — the mock serves exactly ONE
+                            // request per accepted socket (the socket is dropped
+                            // at the end of this arm). Without the header, the
+                            // HTTP/1.1 keep-alive default makes hyper's client
+                            // pool the discovery connection and route the JWKS
+                            // fetch into the abandoned socket → flaky
+                            // "client error (SendRequest)".
+                            let resp = format!(
+                                "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = Write::write_all(&mut stream, resp.as_bytes());
+                        }
+                        Err(err) => {
+                            // A request head that never arrived must NOT fall
+                            // through to the `/` route: a silent `404 OK` is
+                            // indistinguishable from a genuinely unknown path,
+                            // which is exactly how the accept-before-bytes race
+                            // used to present. Say what happened on the wire (so
+                            // the client's own error names it) and on stderr.
+                            let body = format!("oidc mock: {err}");
+                            let resp = format!(
+                                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = Write::write_all(&mut stream, resp.as_bytes());
+                            eprintln!("oidc_mock_server: {err}");
+                        }
+                    },
                     Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
                 }
             }
         });
         (issuer, stop_tx)
+    }
+
+    /// Deterministic regression pin for the accept-before-request-bytes race.
+    ///
+    /// The mock used to `read` **once** from the accepted socket
+    /// (`Read::read(&mut stream, &mut buf).unwrap_or(0)`) and that socket
+    /// inherits the listener's non-blocking mode (measured on this host:
+    /// `accept()` on a `set_nonblocking(true)` listener yields a stream whose
+    /// first `read` with no data returns `Err(WouldBlock, os error 35)`). A
+    /// client that connects and only then writes therefore made the accept
+    /// fire first, the read returned `WouldBlock` → `unwrap_or(0)` → 0 bytes →
+    /// the `/` fallback → `HTTP/1.1 404 OK`. A client-side sleep of a few
+    /// milliseconds is enough (measured: the 5 ms iteration already fails on
+    /// `d1be6675`), so this is a **deterministic** red on the pre-fix mock — no
+    /// CPU load is involved. `delay_ms = 0` is the control: it passes both
+    /// before and after, so a failure here isolates the *delayed* request, not
+    /// "the mock is broken".
+    #[test]
+    fn mock_idp_serves_a_request_that_arrives_after_accept() {
+        let (issuer, _stop) = oidc_mock_server();
+        let addr = issuer.strip_prefix("http://").expect("issuer host");
+        for delay_ms in [0u64, 5, 20, 50] {
+            for rep in 0..2 {
+                let mut stream = std::net::TcpStream::connect(addr).expect("connect mock");
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                Write::write_all(
+                    &mut stream,
+                    format!(
+                        "GET /.well-known/openid-configuration HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .expect("send discovery request");
+                let mut resp = String::new();
+                let _ = Read::read_to_string(&mut stream, &mut resp);
+                let first = resp.lines().next().unwrap_or("");
+                assert!(
+                    first.contains(" 200 "),
+                    "delay {delay_ms}ms rep {rep}: mock answered {first:?} to a valid request; full response: {resp:?}"
+                );
+                assert!(
+                    resp.contains(&format!("http://{addr}/jwks")),
+                    "delay {delay_ms}ms rep {rep}: discovery body must name the mock's jwks_uri; got: {resp:?}"
+                );
+            }
+        }
+    }
+
+    /// A listener/client pair whose *accepted* side is forced non-blocking —
+    /// the mode `accept()` inherits from the mock's non-blocking listener on
+    /// this host, reproduced here explicitly so the pin does not depend on that
+    /// inheritance.
+    fn nonblocking_accepted_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind scratch listener");
+        let addr = listener.local_addr().expect("scratch address");
+        let client = std::net::TcpStream::connect(addr).expect("connect scratch listener");
+        let (server, _) = listener.accept().expect("accept scratch connection");
+        server
+            .set_nonblocking(true)
+            .expect("force accepted side non-blocking");
+        (server, client)
+    }
+
+    /// The reader itself must wait for a request that arrives *after* the accept
+    /// on a non-blocking accepted socket — the exact interleaving the pre-fix
+    /// mock got wrong. The 150 ms writer delay is what makes this deterministic:
+    /// a reader that returns on the first `WouldBlock` fails here regardless of
+    /// scheduling, and the elapsed-time floor proves it actually waited rather
+    /// than getting lucky.
+    #[test]
+    fn read_request_head_waits_for_a_request_that_arrives_after_accept() {
+        let (mut server, mut client) = nonblocking_accepted_pair();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            Write::write_all(
+                &mut client,
+                b"GET /.well-known/openid-configuration HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            )
+            .expect("write delayed request head");
+        });
+        let started = std::time::Instant::now();
+        let head = read_request_head(&mut server, std::time::Duration::from_secs(5))
+            .expect("a request that arrives after accept must still be read");
+        let waited = started.elapsed();
+        writer.join().expect("writer thread did not panic");
+        assert!(
+            head.starts_with("GET /.well-known/openid-configuration HTTP/1.1"),
+            "head must be the full request line, got {head:?}"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(100),
+            "reader returned before the client wrote (waited {waited:?})"
+        );
+    }
+
+    /// The wait is **bounded**: a client that connects and never sends must not
+    /// hang the reader, and the failure must be a named timeout rather than a
+    /// silent empty head. Elapsed time is measured, not assumed.
+    #[test]
+    fn read_request_head_times_out_on_a_client_that_never_sends() {
+        let (mut server, _client) = nonblocking_accepted_pair();
+        let started = std::time::Instant::now();
+        let err = read_request_head(&mut server, std::time::Duration::from_millis(200))
+            .expect_err("a silent client must time out");
+        let waited = started.elapsed();
+        assert!(
+            matches!(err, RequestHeadError::TimedOut(_)),
+            "expected TimedOut, got {err:?}"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(150),
+            "gave up before the deadline (waited {waited:?})"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "the deadline is not bounded (waited {waited:?})"
+        );
+    }
+
+    /// End to end: a client that connects and never sends gets an explicit
+    /// `500` naming the cause — never the `/` route's silent `404 OK` — and the
+    /// mock's serving thread stays usable for the next connection.
+    #[test]
+    fn mock_idp_answers_an_explicit_error_when_no_request_line_arrives() {
+        let (issuer, _stop) = oidc_mock_server_with_timeout(std::time::Duration::from_millis(200));
+        let addr = issuer.strip_prefix("http://").expect("issuer host");
+        let mut silent = std::net::TcpStream::connect(addr).expect("connect mock");
+        let started = std::time::Instant::now();
+        let mut resp = String::new();
+        let _ = Read::read_to_string(&mut silent, &mut resp);
+        let waited = started.elapsed();
+        let first = resp.lines().next().unwrap_or("");
+        assert!(
+            first.contains(" 500 "),
+            "a missing request head must be an explicit 500, got {first:?} (full: {resp:?})"
+        );
+        assert!(
+            !first.contains(" 404 "),
+            "a missing request head must not be a silent 404: {first:?}"
+        );
+        assert!(
+            resp.contains("no complete request head"),
+            "the 500 body must name the cause, got {resp:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "the mock did not bound its wait (waited {waited:?})"
+        );
+        // The accept loop survived the failure: the next connection is served.
+        let mut client = std::net::TcpStream::connect(addr).expect("reconnect mock");
+        Write::write_all(
+            &mut client,
+            format!("GET /.well-known/openid-configuration HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .expect("send follow-up request");
+        let mut after = String::new();
+        let _ = Read::read_to_string(&mut client, &mut after);
+        assert!(
+            after.lines().next().unwrap_or("").contains(" 200 "),
+            "the mock must keep serving after an expired wait, got {after:?}"
+        );
     }
 
     /// Read one V1 LoginResp frame from the client side of the duplex and
