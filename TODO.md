@@ -6522,3 +6522,31 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** (a) and (b) state what the row and the failure mode actually pin, and (c) is closed by a
   non-default-filename fixture in the target — or the row's "what it does not cover" says plainly that the
   argument is pinned in-process only.
+
+- [ ] **Three accuracy defects and two precision gaps in the `oidc_throttle_tests` mock note and pins
+  (filed by #409's final round).** All five were marked **non-blocking** and "fileable as-is" by both
+  reviewers after four rounds; PR #409 merged on two MERGE verdicts and these are recorded rather than fixed.
+  (a) **A false count history.** The Done note says it "said 'ten' while the filter had 14 tests and
+  'twelve' while it had 17". Measured: the `oidc` filter was **10** at `ac51f469`, **12** at `b6373f2c`
+  (where "ten other" was still correct), **14** at `7f39d903` (where "ten" was stale and twelve was right)
+  and **17** after the round-4 pins; `git show <sha>:TODO.md | grep -c 'ten other'` is 1 at `b6373f2c` and
+  `7f39d903` and 0 at the merge, and "twelve" appears in **no** committed note. The correct sequence is
+  ten@12 → fourteen@17.
+  (b) **A false reason for not pinning the `remaining.is_zero()` mutant** — the note says it would need a
+  read landing exactly on the expired budget and "a controlled clock, not a socket". Measured by R1: a
+  temporary direct call `read_request_head(&mut s, Duration::ZERO)` returns `TimedOut(0ns)` on the shipped
+  code, and with the guard deleted it returns `Io(InvalidInput "cannot set a 0 duration timeout")` — a
+  **7-line pin** needing no clock control and no socket timing.
+  (c) **A false comment** on `read_request_head_stops_at_the_terminator`: it says the mutant "would hand the
+  routing step a different path". Routing is `split_whitespace().nth(1)`, which yields `/jwks` with or
+  without the pipelined tail; the equality assertion is the entire catch.
+  (d) **The deadline pin guards the constant, not the delegation.** Wiring `oidc_mock_server()` to
+  `oidc_mock_server_with_timeout(Duration::from_secs(60))` while the 5 s constant stays put leaves all 17
+  `oidc` tests green (R2's `M_delegation_60s`).
+  (e) **The immediate-write elapsed is a distribution, not a constant.** R1's 10-run medians were 7.583 µs
+  macOS / 5.917 µs Linux (min 2.083/4.958, max 11.333/8.125); R2's 20-trial probes ranged 2–5 µs macOS and
+  6–1576 µs Linux; the author's 192.08 µs and R1's 1.635 ms both sit inside the spread. Quote a range or
+  attribute the figure, and keep `n=16` / `path` as the durable fact.
+  **Done-when:** (a)–(c) say what is actually true; (b) either adds the 7-line `Duration::ZERO` pin or drops
+  the claim; (d) names the delegation bypass or pins it; (e) quotes a range or attributes the number.
+
