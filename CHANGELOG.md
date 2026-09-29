@@ -250,7 +250,7 @@ User-facing release notes for frp-rs.
   `ServerConfig::tls_enable` — a field with no counterpart in Go v0.71.0's
   *server* config, which frp-rs's own `[transport.tls]` flatten inserts as `true`
   when that Go-shaped section carries `force = true`, `certFile` or `keyFile`
-  (`frp-core/src/config/normalize.rs:798-816`) — so
+  (`frp-core/src/config/normalize.rs:865-884`) — so
   neither a reload nor a restart can make a change to it take effect,
   and the line claimed one. It now has the same disposition `auth.useEncryption`
   already has (deliberately unreported). Not a parity gap: Go v0.71.0's
