@@ -214,15 +214,21 @@ fi
 # Every printed source count (Code size, Tests, the SAFETY-cmts column) comes
 # from one python walk so the printed and gated definitions agree by
 # construction. `os.walk(..., followlinks=False)` is what the gated python scans
-# use: it does not follow a symlinked *directory* (measured: `find -L` counted
-# frp-core 98 files / 120833 lines when `frp-core/src/ext` was a symlink to
-# frp-server/src, while the gated scans still saw 21 blocks), so the printed
-# numbers return to the gated set. Each `.rs` file is opened with the same
+# use: it does not follow a symlinked *directory* **inside** a walked root
+# (measured: `find -L` counted frp-core 98 files / 120833 lines when
+# `frp-core/src/ext` was a symlink to frp-server/src, while the gated scans still
+# saw 21 blocks) — but that flag never covered a walk's *own* root, so a scope
+# root that is itself a symlink is refused outright (see `rs_texts` below), so
+# the printed numbers return to the gated set. Each `.rs` file is opened with the
+# same
 # O_NONBLOCK + fstat guard: a FIFO or an unreadable file is recorded and fails
 # the run instead of blocking `find | xargs cat` / `-exec grep` (which stats a
 # regular file and then opens a FIFO — measured 13/20 hangs on a flipping
-# `frp-core/src/*.rs`). A symlinked `.rs` *file* is still double-counted by both
-# the printed and the gated walks (pre-existing, recorded).
+# `frp-core/src/*.rs`). A symlinked `.rs` *file* is counted once too: every
+# counted walk below dedupes on `os.path.realpath`, because `os.walk` still lists
+# the link next to its target (`ln -s kcp/session.rs frp-core/src/zz.rs` used to
+# read that one source twice and print Code size 70 files / 78342 lines with a
+# gated block count of 22 against the 21 in CLAUDE.md).
 TEST_ATTR='^[[:space:]]*#\[(tokio::)?test(\([^]]*\))?\]'
 counts=""
 if [ "$have_python" = 1 ]; then
@@ -262,7 +268,26 @@ def walk_error(e):
 def rs_texts(root, top_only=False):
     """Yield the text of every `.rs` file under `root`, reading each with the
     O_NONBLOCK guard. `top_only` matches a `root/*.rs` glob (not a recursive
-    grep): only the directory's own entries."""
+    grep): only the directory's own entries. Each *real* file is yielded once
+    per call: the walk still lists a symlinked `.rs` next to its target, so
+    keying on `os.path.realpath` keeps that one source from counting twice.
+    Callers that measure two scopes (`<crate>/src` and the whole crate dir)
+    call this once per scope, so the dedupe never crosses a scope boundary.
+
+    A scope root that is itself a symlink yields nothing and is recorded as an
+    error: `os.walk(root, ..., followlinks=False)` scandirs its own root, so
+    `followlinks=False` never applied to `<crate>/src` itself, and with
+    `ln -s ../frp-server/src frp-core/src` the Code size row read frp-core
+    `32 / 59146` — frp-server's tree (measured). A symlinked directory
+    *inside* a walked root is a different case: that one is already excluded by
+    `followlinks=False`, which is what the probe's symlinked-dir leg pins. This
+    covers the scope roots this script walks; it does not cover the no-python3
+    `find -L` fallback below, which still follows a symlinked root (that path is
+    already red, see its comment)."""
+    if os.path.islink(root):
+        note('%s: scope root is a symlink — not walked' % root)
+        return
+    seen = set()
     if top_only:
         try:
             names = sorted(os.listdir(root))
@@ -271,12 +296,20 @@ def rs_texts(root, top_only=False):
             return
         for fn in names:
             if fn.endswith('.rs'):
-                yield os.path.join(root, fn)
+                path = os.path.join(root, fn)
+                real = os.path.realpath(path)
+                if real not in seen:
+                    seen.add(real)
+                    yield path
         return
     for dirpath, _dirs, names in os.walk(root, onerror=walk_error, followlinks=False):
         for fn in names:
             if fn.endswith('.rs'):
-                yield os.path.join(dirpath, fn)
+                path = os.path.join(dirpath, fn)
+                real = os.path.realpath(path)
+                if real not in seen:
+                    seen.add(real)
+                    yield path
 
 
 files = {c: 0 for c in CRATES}
@@ -286,22 +319,29 @@ testfuncs = testfiles = proptest = 0
 for crate in CRATES:
     # The historical scopes differ: Code size and SAFETY cmts read <crate>/src,
     # while the test-function/proptest greps recursed over the whole crate dir
-    # (so `tests/` and `benches/` count). One walk over the crate root serves
-    # both, keyed on whether the file is under `<crate>/src/`.
+    # (so `tests/` and `benches/` count). Walk the two scopes separately: each
+    # `rs_texts` call owns its own `seen`, so a symlinked `.rs` is deduped
+    # *within* a scope. A single shared walk would let an alias outside `src/`
+    # (`ln -s src/kcp/session.rs frp-core/zz_alias.rs`) mask the real file and
+    # then, being outside `src/`, attribute it to no scope at all.
     if not os.path.isdir(crate):
         continue
-    srcpfx = os.path.join(crate, 'src') + os.sep
+    for p in rs_texts(os.path.join(crate, 'src')):
+        try:
+            text = safe_read(p)
+        except OSError as e:
+            note('%s: %s' % (p, e.strerror or e))
+            continue
+        files[crate] += 1
+        lines[crate] += text.count('\n')
+        if crate in safety:
+            safety[crate] += text.count('// SAFETY')
     for p in rs_texts(crate):
         try:
             text = safe_read(p)
         except OSError as e:
             note('%s: %s' % (p, e.strerror or e))
             continue
-        if p.startswith(srcpfx):
-            files[crate] += 1
-            lines[crate] += text.count('\n')
-            if crate in safety:
-                safety[crate] += text.count('// SAFETY')
         if crate in GATED:
             proptest += text.count('proptest!')
         hits = sum(1 for l in text.split('\n') if TEST_ATTR.match(l))
@@ -480,11 +520,22 @@ for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
         # remaining crates as a complete scan.
         note('%s/src is not a directory — crate not measured' % crate)
         continue
+    if os.path.islink(src):
+        # Same reason as `rs_texts`: `followlinks=False` does not cover a walk's
+        # own root, so a symlinked `<crate>/src` would measure — and attribute to
+        # this crate — whatever it points at.
+        note('%s: scope root is a symlink — not walked' % src)
+        continue
     blocks = fns = impls = 0
+    seen = set()   # a symlinked `.rs` is its target: count the real file once
     for root, _d, files in os.walk(src, onerror=walk_error):
         for fn in files:
             if fn.endswith('.rs'):
                 path = os.path.join(root, fn)
+                real = os.path.realpath(path)
+                if real in seen:
+                    continue
+                seen.add(real)
                 try:
                     text = code_only(safe_read(path))
                 except OSError as e:
@@ -594,11 +645,21 @@ for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
         # list that was never read (measured: `rm -rf frp-server/src`).
         note('%s/src is not a directory — crate not scanned' % crate)
         continue
+    if os.path.islink(src):
+        # `followlinks=False` does not cover a walk's own root: refuse the link
+        # rather than scan (and justify) whatever crate it points at.
+        note('%s: scope root is a symlink — not walked' % src)
+        continue
+    seen = set()   # a symlinked `.rs` is its target: scan the real file once
     for root, _dirs, files in os.walk(src, onerror=walk_error):
         for fn in files:
             if not fn.endswith('.rs'):
                 continue
             path = os.path.join(root, fn)
+            real = os.path.realpath(path)
+            if real in seen:
+                continue
+            seen.add(real)
             try:
                 raw = safe_read(path)
             except OSError as e:
@@ -2076,12 +2137,24 @@ def unsafe_counts(crate):
         # *expected* values for the CLAIMS below. The preflight lists these
         # directories too; this is the belt-and-braces path.
         raise PartialTree(src)
+    if os.path.islink(src):
+        # `followlinks=False` does not cover a walk's own root: a symlinked
+        # `<crate>/src` would measure the link's target as this crate's counts.
+        # Not `PartialTree(src)` alone — that would print "is missing" for a
+        # directory that is present.
+        raise PartialTree(src, detail='%s is a symlink (scope root refused)' % src)
     blocks = fns = impls = n_rs = 0
+    seen = set()   # a symlinked `.rs` is its target: count the real file once
     for root, _d, files in os.walk(src, onerror=walk_error):
         for fn in files:
             if fn.endswith('.rs'):
+                path = os.path.join(root, fn)
+                real = os.path.realpath(path)
+                if real in seen:
+                    continue
+                seen.add(real)
                 n_rs += 1
-                text = code_only(read_required(os.path.join(root, fn), errors='ignore'))
+                text = code_only(read_required(path, errors='ignore'))
                 blocks += len(re.findall(r'unsafe\s*\{', text))
                 fns += len(re.findall(r'unsafe fn', text))
                 impls += len(re.findall(r'unsafe impl', text))
