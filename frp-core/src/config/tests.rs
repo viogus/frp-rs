@@ -6508,11 +6508,17 @@ fn dotted_ini_section_headers_become_nested_tables_in_both_modes() {
 /// so one test pins both.
 ///
 /// **What it does not cover.** A v1 nested table that itself carries a `type`
-/// key (a `[visitors.plugin]`-style table in an `.ini`) does not expand either —
-/// that is the cost of the discriminator, it matches the base tree (which never
-/// expanded anything), and it is stated in `docs/config.md`. A legacy proxy
-/// section **without** a `type` key is not a proxy on either tree (the collector
-/// requires `type`), so its treatment is unchanged and unpinned here.
+/// key (a `[visitors.plugin]`-style table in an `.ini`) is not merely "left
+/// unexpanded": it stays a flat section, and on the client the legacy collector
+/// then reads it as a proxy named after the header and proxy validation refuses
+/// it (measured: `[visitors.plugin] type = "https2http"` → rc 1, `proxy
+/// 'visitors.plugin': invalid proxy_type 'https2http'`; on the server it is an
+/// unknown strict-mode field). That is the cost of the discriminator, it matches
+/// the base tree (which never expanded anything), and it is stated in
+/// `docs/config.md` and `ini_section_path`'s doc. A legacy proxy section
+/// **without** a `type` key is dropped here *and* on base, where Go registers it
+/// as a `tcp` proxy — a pre-existing parity gap filed as its own `TODO.md` item,
+/// not pinned here.
 #[test]
 fn dotted_ini_headers_that_are_legacy_proxy_names_stay_proxies() {
     for name in ["auth.foo", "store.frontend", "log.svc", "my.proxy"] {
