@@ -699,8 +699,8 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `:533` has already run, so `includes` spellings are seen), never from the deserialized struct.
   The Done-when site list was **wrong on two of its four entries** and is corrected above: measured
   `grep -rn` over `frps/src frpc/src frp-server/src frp-client/src frp-core/src` (rc=0) gives three
-  server-config load sites with a live subscriber — `frps/src/main.rs:219` (`--config-dir`),
-  `frps/src/main.rs:308` (`-c`) and `frp-server/src/service.rs:2315` (SIGUSR1 reload) — plus
+  server-config load sites with a live subscriber — `frps/src/main.rs:222` (`--config-dir`),
+  `frps/src/main.rs:315` (`-c`) and `frp-server/src/service.rs:2319` (SIGUSR1 reload) — plus
   `frps/src/main.rs:88` (`frps verify`), which deliberately never initialises logging and so has no
   sink. There is no `frpc` server-config site at all: `frpc verify` and the client reload load a
   `ClientConfig` whose `tls_enable` is live, so a warning there would be false and none is emitted.
