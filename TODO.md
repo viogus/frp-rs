@@ -739,7 +739,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   writes the now-warning key), and one `CHANGELOG.md` `### Fixed` bullet. Ledger after this close:
   28 open / 98 closed.
 
-- [ ] **The new server `tls_enable` warning's text is inaccurate on three measured points (#407).**
+- [x] **The new server `tls_enable` warning's text is inaccurate on three measured points (#407).**
   Filed from the two independent round-2 reviews of #407 (frozen `2e060b0432101a41a944111e25f6416382044495`,
   merged as `8ff41e05f90b9673ac25d8ae082f112018f18238`). Both reviewers returned MERGE and rated all three
   **non-blocking**; they were filed rather than fixed so that the merge did not overrun its window.
@@ -747,7 +747,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   (a) **A new factual error, introduced by #407.** The new prose says the server `[transport.tls]` lift renames
   "only four Go keys (force/certFile/keyFile/trustedCaFile)". It renames **five** — `serverName => tls_server_name`
   is omitted, and that arm is visible in the very citation the sentence carries
-  (`frp-core/src/config/normalize.rs:802-809`). Sites: `frp-core/src/config/loader.rs:379`,
+  (`frp-core/src/config/normalize.rs:869-878`). Sites: `frp-core/src/config/loader.rs:379`,
   `frp-core/tests/server_tls_enable_warning.rs:27` and `:320`. The detector's behaviour is unaffected, which is why
   R2 rated it non-blocking — but it is a false statement added by a change whose whole subject was a false statement.
 
@@ -772,6 +772,93 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   the detector consults `[common]`'s `transport` only when the top-level `transport` is absent or not a table, or
   the mechanism prose is narrowed to what it actually models — the chosen behaviour pinned by a test that reds
   before the change.
+
+  Fix (round 1: all three points; round 2: the micro-tier falsehood and the reviewers' cheap items;
+  every count re-measured on this tree).
+  (a) **Corrected at five carriers, not four.** A sentence-level sweep (`grep -rn -i four` over `*.rs`/`*.md`,
+  then reading each hit's sentence) found the four this item's table carried plus a fifth a phrase-level sweep
+  misses: `docs/config.md:176` — "The four Go-shaped TLS fields (`tls_only`, `tls_cert_file`, `tls_key_file`,
+  `tls_ca_file`) are carried by the nested `[transport.tls]` section instead" — which omits `tls_server_name`.
+  All five now say five and list `serverName` => `tls_server_name`: the `server_tls_enable_set_in` doc comment and
+  its inline comment in `frp-core/src/config/loader.rs`, `frp-core/tests/server_tls_enable_warning.rs:27` and
+  `:320`, and `docs/config.md:176`. The lift's five arms are measured by
+  `test_go_v0701_server_transport_tls_toml` (writes all five Go spellings, asserts all five flat fields; rc 0).
+  A probe of the **real Go v0.71.0 `frps`** (`/private/tmp/frp_0.71.0_darwin_arm64/frps verify -c` on a
+  `[transport.tls]` with all five keys) exits 0 — all five are Go's server spellings, not frp-rs inventions (an
+  unknown key in that table exits 1, `json: unknown field "bogusKey"`). Round 2 re-grepped for the **old**
+  `normalize.rs` ranges rather than the new ones and corrected every live carrier: `docs/config.md:25`,
+  `docs/config.md:375` and two source doc comments at `frp-core/src/config/tests.rs:2061` / `:2137` now carry the
+  measured ranges (`:869-878` arm match, `:865-884` synthesis, `:652-655` `[common]` flatten, `:1429-1437` client
+  match, `:1379-1399` client fold). Older closed ledger entries (the #407 item above, `TODO.md:695`/`:696`) keep
+  their era's line numbers, which is why the round-1 "in every sentence" claim was dropped. `docs/config.md:375`
+  was also **reworded**: both reviewers read its four-spelling list differently, and the client lift measurably
+  maps **six** nested spellings (`normalize.rs:1429-1437`), so it now scopes the four to the four alias-less
+  fields and names `serverName` / `disableCustomTLSFirstByte` as the two further nested mappings.
+  `frp-core/src/config/tests.rs:5962` (`web_server.tls`, genuinely four) was checked and left.
+  (b) **The pair clauses are now build-aware and cover both delivery paths.** Round 2's blocking finding: the
+  acceptor block is `#[cfg(feature = "tls")]` (`frp-server/src/service.rs:603`) but the warning is not, and
+  `release.yml` ships `frps-micro`. Measured on a real `frps-micro` (`/tmp/tls-warn-probe/run-micro.sh`):
+  `tls_enable = true` + only `tls_cert_file` exits **0** and logs `frps listener started on 0.0.0.0:27331` (no
+  refusal), and with neither file there is no auto-generated line either. So the constant is two `cfg` variants:
+  the `tls` build says "…a half-written (only one of the two) or unreadable pair is refused at startup, a reload
+  reports the failure and keeps the running acceptor, and with neither set the server auto-generates a
+  self-signed certificate pair", and the no-TLS build says only "This build has no TLS support (frp-core's `tls`
+  feature is off), so the server never builds a TLS acceptor". Both paths were measured on the real `frps`
+  (`/tmp/tls-warn-probe/run-b.sh`, `run-reload.sh`; stdout/stderr separate, children bounded and reaped): at
+  startup a half-written pair exits **1** (`TLS requires both cert_file and key_file to be set; got only one`),
+  an unreadable pair exits **1** (`open cert file: No such file or directory`), and on a SIGUSR1 reload either
+  shape **keeps the server running** with `TLS certificate reload FAILED: … (keeping old config)` — hence
+  "refused at startup", not "the server refuses to start". Both variants are pinned by
+  `the_message_names_the_inertness_the_real_switch_and_the_certificate`, which splits its facts by the same
+  `cfg(feature = "tls")` and asserts the no-TLS variant names **no** certificate behaviour (the F1 lesson).
+  (c) **Moved the detector** — the first branch; the sibling `web_server_tls_enable_set_in` already keeps the
+  invariant that the flag must not claim a key the loader dropped. `[common]`'s flatten is
+  `table.entry(k).or_insert(v)` on the whole value (`frp-core/src/config/normalize.rs:652-655`), so a written
+  top-level `transport` — table or not — discards `[common]`'s `transport` whole and the lift at
+  `frp-core/src/config/normalize.rs:861-885` never sees it; the nested `[common.transport.tls] tls_enable` now
+  counts **only** when no top-level `transport` key is written. Measured on the real `frps`
+  (`/tmp/tls-warn-probe/run-c.sh`): `[common.transport.tls] tls_enable` alone -> warn **1** before and after
+  (must keep warning); beside `[transport] heartbeat_timeout = 30` -> warn **1** before, **0** after; a flat
+  `[common] tls_enable` beside the same competing table -> **1** before and after; a top-level non-table
+  `transport = 30` -> the load itself fails (`invalid type: integer 30, expected struct ServerTransportConfig`,
+  exit 1) before any warning, so "absent or not a table" and "absent" are indistinguishable at the warning. The
+  test `common_transport_tls_needs_no_competing_top_level_transport` now pins all **six** load cases (alone,
+  competing, flat-`[common]`, empty `[transport]`, inline `transport = {}`, non-table) and **failed pre-change**
+  (`competing: a dropped key must not be claimed`, rc 101). The empty-table cases close a pin-strength gap
+  measured in the round-2 archive copy: a mutant that treats an empty `transport` as absent moves that shape
+  0 -> 1 record while the round-1 tests stayed green (mutant-and-red in the round-2 report).
+  Gates, round 2 (literal rc): `cargo fmt --all -- --check` **0**; `bash scripts/repo-health.sh` **0**;
+  `cargo test -p frp-core --lib config` **0**; `cargo test -p frp-core --test server_tls_enable_warning` **0**;
+  `cargo test -p frps --features dashboard --test warn_delivery` **0**; `cargo test -p frpc --test warn_delivery`
+  **0**; `cargo test -p frpc --features admin --test admin_config_get_warning` **0**; `cargo clippy -p frp-core
+  -p frps -p frp-server --all-targets --all-features -- -D warnings` **0**; `cargo build -p frps
+  --no-default-features --features micro` **0** plus the real `frps-micro` probe above. Six CI count literals
+  re-read with `-- --list` and unchanged (frps 29, frpc-tiny 13, log_completion 5, frps warn_delivery 12, frpc
+  warn_delivery 8, admin_config_get_warning 4). Docs: `docs/config.md`'s `tls_enable` row gained the
+  half-written/unreadable/reload/micro wording and a corrected `normalize.rs` citation, `:375` gained the six-arm
+  client scoping, and the inert-fields note gained the `[common]`-nested condition; `CHANGELOG.md` gained one
+  `### Fixed` bullet. Ledger after this close: **24 open / 106 closed**; the micro sibling filed below moves it
+  to **25 open / 106 closed**.
+
+- [ ] **The sibling `web_server.tls.enable` warning makes the same build-unaware claim: in a build with no
+  dashboard it still says the dashboard serves plaintext HTTP (filed from the round-2 review of #407's follow-up).**
+  R1 measured it and this round reproduced it. `WEB_SERVER_TLS_ENABLE_INERT_WARNING`
+  (`frp-core/src/config/loader.rs:258`) ends "…the dashboard HTTPS server is enabled by a non-empty
+  `cert_file` + `key_file` pair; without that pair the dashboard serves plaintext HTTP", but the dashboard is
+  `#[cfg(feature = "dashboard")]` (`frp-server/src/service.rs:567` and `:1710`) while this warning is not, and
+  `release.yml:105-124` builds, tars and uploads `frps-tiny` / `frps-micro`. Measured on a real `frps-micro`
+  (`/tmp/tls-warn-probe/run-micro.sh`, `run-micro.sh` case `micro_webserver_enable`, stdout/stderr captured
+  separately, child bounded and reaped): a config with `[web_server.tls] enable = true` exits **0**, emits
+  `web_server.tls.enable has no effect: … without that pair the dashboard serves plaintext HTTP`, and starts only
+  the proxy listener — a second probe with `web_server.port = 27500` left TCP 27500 **closed** (`nc -z` rc 1)
+  while the process stayed up. So the clause names a server that does not exist in the build that printed it.
+  This is the same `#[cfg]` asymmetry as the server `tls_enable` warning fixed above, and it is **pre-existing**
+  (not introduced by this series). **Done-when:** the emitted path is build-aware the same way the server
+  `tls_enable` diagnostic now is (a `#[cfg(feature = "dashboard")]` variant, or wording true in both builds),
+  and a test pins that a no-dashboard build names no dashboard behaviour — the server-side pin is
+  `the_message_names_the_inertness_the_real_switch_and_the_certificate` in
+  `frp-core/tests/server_tls_enable_warning.rs`; the sibling test file is
+  `frp-core/tests/web_server_tls_enable_warning.rs`. Ledger after filing this item: **25 open / 106 closed**.
 
 - [x] **`docs/config.md` advertises four camelCase TLS aliases that no loader accepts.**
   The `tls_only`, `tls_cert_file`, `tls_key_file` and `tls_ca_file` rows at `docs/config.md:26-29`
