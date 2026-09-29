@@ -296,8 +296,10 @@ fn log_restart_changes(out: &mut Vec<RestartOnlyChange>, old: &LogConfig, new: &
 /// outside the config struct), so a restart cannot make them take effect — the
 /// same disposition `[auth].useEncryption` has in `note_auth_restart_changes`.
 /// The nested section's *fields* are likewise unreachable (see the destructure
-/// below: `normalize_web_server_section` removes the table before serde, so
-/// `WebServerTlsConfig` is default-`false`/empty in every loaded config), but
+/// below: `normalize_web_server_section` removes the table's mapped keys — and
+/// `enable` — before serde, so `WebServerTlsConfig` is default-`false`/empty in
+/// every loaded config; only a genuinely unmapped key survives in `tls`, and
+/// none of them matches a field), but
 /// its **values** are not lost — both spelling families are hoisted onto the
 /// flat `tls_cert_file` / `tls_key_file` / `tls_ca_file` / `tls_server_name`
 /// entries, and the first two of those **are** reported. `password` is compared
@@ -340,9 +342,10 @@ fn web_server_restart_changes(
         custom_404_page: new_custom_404_page,
     } = new;
     // **Every** field of the nested section is unreachable through the loader:
-    // `normalize_web_server_section` removes the `web_server.tls` table before
-    // serde sees it, so `WebServerTlsConfig` is always `Default` in a loaded
-    // config. Its *values* are not lost — the hoist maps both spelling families
+    // `normalize_web_server_section` removes the `web_server.tls` table's mapped
+    // keys (and `enable`) before serde sees it, so `WebServerTlsConfig` is always
+    // `Default` in a loaded config — only unmapped keys survive in the table, and
+    // serde ignores those. Its *values* are not lost — the hoist maps both spelling families
     // onto the flat `tls_cert_file` / `tls_key_file` entries, which **are**
     // pushed below, and drops `tls.enable` (inert; see the function's doc
     // comment). Measured 2026-09-29 by loading each shape as a real file
@@ -1374,7 +1377,7 @@ mod tests {
         new.web_server.tls.server_name = "dash-nested.example.com".into();
         // …and the nested section's cert/key pair, which is additionally
         // **unreachable** through the loader (`normalize_web_server_section`
-        // removes the `web_server.tls` table before serde, so no loaded config
+        // removes the table's mapped keys before serde, so no loaded config
         // carries a non-default `WebServerTlsConfig` — its values are hoisted
         // onto the flat fields instead): a difference here cannot come from a
         // config file, and the flat `tls_cert_file` / `tls_key_file` entries are

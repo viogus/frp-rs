@@ -31,7 +31,7 @@
 //! | `[common.webServer.tls] enable`, `-c` | 0 | 0 | 1 |
 //! | inline `common = { … tls = { enable = true } }`, `-c` | 0 | 0 | 1 |
 //! | the same in an `includes` file (`--config-dir`) | 1 | **0** | 1 |
-//! | `[web_server]` + `[webServer.tls] enable` (mixed) | 0 | 0 | 0 |
+//! | `[web_server]` + `[webServer.tls] enable` (mixed) | 0 | 0 | **1** |
 //! | no `enable` key | 0 | 0 | 0 |
 //! | **SIGUSR1 reload** delta on `-c` | +1 | **0** | +1 |
 //!
@@ -323,9 +323,10 @@ fn drain<R: Read + Send + 'static>(mut pipe: R, sink: Arc<Mutex<String>>) {
     });
 }
 
-/// Which spelling of the nested TLS section the config uses. The first two set
-/// the flag; `MixedSections` deliberately does not (the rename discards the
-/// camelCase table whole) and `None` is the control.
+/// Which spelling of the nested TLS section the config uses. The first three all
+/// set the flag — `MixedSections` writes the camelCase `[webServer.tls]` beside a
+/// snake_case `[web_server]`, and the two sections merge per key — and `None` is
+/// the control.
 #[derive(Clone, Copy)]
 enum Section {
     Nested,
@@ -538,18 +539,22 @@ fn no_warning_for_a_config_without_the_key() {
     assert_no_warning("frps -c (no key)", &spawned);
 }
 
-/// The mixed-sections shape gets **no** record, before and after: a top-level
-/// `[web_server]` makes the rename discard the whole `[webServer]` table (its
-/// nested `tls` included), so the key never reaches the removal site. The
-/// detector mirrors that precedence deliberately — reporting a key the loader
-/// dropped would be a new false claim — and this pins that it does not fire.
+/// The mixed-sections shape **does** warn: `[webServer]` and `[web_server]` are
+/// the same section, merged per key, so the camelCase `[webServer.tls]` table
+/// reaches the removal site and the key is delivered like any other nested
+/// spelling. (Before the merge, a top-level `[web_server]` discarded the whole
+/// `[webServer]` table — nested `tls` included — and this test pinned the
+/// silence; the detector mirrored the discard on purpose, because reporting a
+/// key the loader dropped would have been a false claim. The detector now
+/// mirrors the per-key merge, which is the invariant: it must neither claim a
+/// dropped key nor miss a kept one.)
 #[test]
-fn no_warning_when_the_camelcase_table_is_discarded() {
+fn warning_when_the_camelcase_tls_table_is_merged_into_the_snake_section() {
     let dir = TempDir::new("mixed");
     let cfg = frps_config(free_port(), free_port(), Section::MixedSections);
     let path = dir.write("frps.toml", &cfg);
     let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
-    assert_no_warning("frps -c (mixed sections)", &spawned);
+    assert_one_warning_on_stdout("frps -c (mixed sections)", &spawned);
 }
 
 // ---------------------------------------------------------------------------

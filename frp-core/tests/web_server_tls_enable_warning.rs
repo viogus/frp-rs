@@ -51,9 +51,12 @@
 //! (in-process because the client only processes a reload inside a live session);
 //! the dashboard behaviour itself (plaintext HTTP with no pair) is `frp-server`
 //! end to end and was measured by the fix-round review, not re-measured here; and
-//! other sinks, YAML and `.ini` spellings (only TOML is exercised) are out of
-//! scope for this file. The measured before/after table lives in
-//! `docs/config.md` and `CHANGELOG.md`.
+//! other sinks and YAML spellings are out of scope for this file. The `.ini`
+//! spelling now reaches the detector too — the INI reader expands a dotted
+//! section header whose first segment is a v1 section name into nested tables —
+//! and is pinned in `frp-core/src/config/tests.rs` with the rest of the INI
+//! format cases. The measured before/after table lives in `docs/config.md` and
+//! `CHANGELOG.md`.
 
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
@@ -157,7 +160,7 @@ fn nested_web_server_tls_enable_warns_once_and_stays_inert() {
     );
     assert!(
         c.presence.web_server_tls_enable_set(),
-        "the presence flag must survive the load (the nested table is removed from the value)"
+        "the presence flag must survive the load (the loader removes `enable` from the value before serde)"
     );
     assert_eq!(
         c.warning_records, 1,
@@ -269,8 +272,9 @@ fn nested_web_server_tls_enable_warns_once_and_stays_inert() {
 /// The precedence is the flatten's own `or_insert`: a **top-level**
 /// `[web_server]` already present makes the flatten discard
 /// `common.web_server` whole — nested `tls` included — so that mixed shape must
-/// **not** set the flag. It is the same rule as `[web_server]` +
-/// `[webServer.tls]` in [`both_sections_present_the_flag_follows_the_kept_section`].
+/// **not** set the flag. That is the `[common]` flatten, which is *not* part of
+/// the per-key sibling merge ([`both_sections_present_the_flag_follows_the_merge`]),
+/// where `[web_server]` + `[webServer.tls]` now **does** set it.
 #[test]
 fn common_and_includes_spellings_set_the_flag() {
     // `[common.web_server.tls] enable`, whole dashboard section under `[common]`.
@@ -326,7 +330,10 @@ fn common_and_includes_spellings_set_the_flag() {
 
     // Precedence: a top-level `[web_server]` makes the flatten discard
     // `common.web_server` whole, so this shape is inert *and* unflagged — the
-    // detector must not report a key the loader dropped.
+    // detector must not report a key the loader dropped. Only the **same**
+    // spelling is discarded: the two cross-spelling rows below keep the key and
+    // do warn, because `web_server` and `webServer` are different keys to the
+    // flatten and merge afterwards.
     let c = load_capturing(
         "bind_port = 7000\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
          [common.web_server.tls]\nenable = true\n",
@@ -337,66 +344,135 @@ fn common_and_includes_spellings_set_the_flag() {
         "a top-level `[web_server]` makes the flatten drop `common.web_server` whole"
     );
     assert_eq!(c.warning_records, 0);
+
+    // Cross-spelling: the `[common]` section keeps its own spelling, the
+    // top-level one is the other spelling, and the merge finds the key.
+    let c = load_capturing(
+        "bind_port = 7000\n[webServer]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [common.web_server.tls]\nenable = true\n",
+        false,
+    );
+    assert!(
+        c.presence.web_server_tls_enable_set(),
+        "`[common.web_server.tls] enable` beside a top-level `[webServer]` is not discarded"
+    );
+    assert_eq!(c.warning_records, 1);
+
+    let c = load_capturing(
+        "bind_port = 7000\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [common.webServer.tls]\nenable = true\n",
+        false,
+    );
+    assert!(
+        c.presence.web_server_tls_enable_set(),
+        "`[common.webServer.tls] enable` beside a top-level `[web_server]` is not discarded"
+    );
+    assert_eq!(c.warning_records, 1);
 }
 
-/// The flag's detector reproduces the normalizers' section-rename precedence
-/// (`table.entry("web_server").or_insert(v)`): when both sections exist the
-/// snake_case one is kept **whole** and the camelCase one is discarded, nested
-/// `tls` included. So `enable` written only under `[webServer.tls]` must not set
-/// the flag — the key is dropped with the rest of that table — while the same
-/// key under `[web_server.tls]` must. (The underlying discard is filed in
-/// `TODO.md`, not fixed here; this pins that the *warning* follows the same rule
-/// the loader does, so it can never claim a key the loader keeps.)
+/// The flag's detector reproduces the normalizers' section resolution:
+/// `[webServer]` and `[web_server]` are the same section and are merged **per
+/// key**, with the snake_case section winning each key it defines and nested
+/// tables merging recursively (`merge_section_into`). So `enable` written only
+/// under `[webServer.tls]` beside a `[web_server]` section **is** seen — the
+/// camelCase `tls` table is no longer discarded whole — and the warning fires
+/// once. The old whole-table discard (and a detector that mirrored it) is the
+/// `TODO.md` item this fixes; the flag must follow the loader, never claim a key
+/// the loader drops nor miss one it keeps.
 #[test]
-fn both_sections_present_the_flag_follows_the_kept_section() {
-    // Only the discarded camelCase table carries `enable` -> no flag.
+fn both_sections_present_the_flag_follows_the_merge() {
+    // Only the camelCase table carries `enable`: it merges into `web_server.tls`
+    // and reaches the removal site -> flag set, one record.
     let c = load_capturing(
         "bind_port = 7000\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
          [webServer.tls]\nenable = true\n",
         false,
     );
     assert!(
-        !c.presence.web_server_tls_enable_set(),
-        "the camelCase table is discarded whole by the rename"
+        c.presence.web_server_tls_enable_set(),
+        "the camelCase `tls` table merges per key into `web_server.tls`"
     );
-    assert_eq!(c.warning_records, 0);
+    assert_eq!(c.warning_records, 1);
 
-    // The kept snake_case table carries it -> flag set.
+    // Both tables, separate keys: both survive — `enable` from the snake table,
+    // the cert from the camel one.
     let c = load_capturing(
         "bind_port = 7000\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
-         [web_server.tls]\nenable = true\n[webServer.tls]\ncert_file = \"/discarded.pem\"\n",
+         [web_server.tls]\nenable = true\n[webServer.tls]\ncert_file = \"/camel.pem\"\n",
         false,
     );
     assert!(
         c.presence.web_server_tls_enable_set(),
-        "the snake_case table is the one kept"
+        "the snake_case table carries `enable`"
     );
     assert_eq!(c.warning_records, 1);
     assert_eq!(
-        c.cert, "",
-        "the discarded camelCase table's cert must not reach the config"
+        c.cert, "/camel.pem",
+        "the camelCase table's cert merges in too — nothing is discarded whole"
     );
+
+    // A key **both** tables define: the snake_case section wins, as the old
+    // whole-table `or_insert` resolved it — the order is not inverted.
+    let c = load_capturing(
+        "bind_port = 7000\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [web_server.tls]\ncert_file = \"/snake.pem\"\n\
+         [webServer.tls]\ncert_file = \"/camel.pem\"\n",
+        false,
+    );
+    assert_eq!(c.cert, "/snake.pem");
+    assert!(!c.presence.web_server_tls_enable_set());
+    assert_eq!(c.warning_records, 0);
+
+    // A `web_server.tls` that is present but **not a table**: `or_insert_deep`
+    // drops the camelCase `tls` sub-table whole, so the `enable` inside it never
+    // reaches the removal site and the flag must stay unset. Without the
+    // matching arm the detector claimed a key the loader had dropped (measured
+    // on the frozen tree: 1 record, both modes all-default).
+    let c = load_capturing(
+        "bind_port = 7000\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\ntls = \"scalar\"\n\
+         [webServer.tls]\nenable = true\n",
+        false,
+    );
+    assert!(
+        !c.presence.web_server_tls_enable_set(),
+        "the scalar `web_server.tls` makes the merge drop the camelCase `tls` table"
+    );
+    assert_eq!(c.warning_records, 0);
+    assert_eq!(c.cert, "", "and the loader really did drop it");
+
+    // The mirror image: a real snake table with no `enable` still receives the
+    // camelCase `tls` table's keys (the merge recurses into tables both sides
+    // define), so `enable` reaches the removal site and does warn.
+    let c = load_capturing(
+        "bind_port = 7000\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [web_server.tls]\ncert_file = \"/snake.pem\"\n[webServer.tls]\nenable = true\n",
+        false,
+    );
+    assert!(
+        c.presence.web_server_tls_enable_set(),
+        "the camelCase `tls` table merges into the snake one"
+    );
+    assert_eq!(c.warning_records, 1);
+    assert_eq!(c.cert, "/snake.pem");
 }
 
 /// The **string** loader is silent too, and does not surface the flag at all.
 ///
 /// This pins the other half of the "one owner" decision: the diagnostic lives on
-/// the CLI startup paths (`frps`/`frpc` run), `frpc verify` and both in-process
-/// reloads — not in the library loaders. The one named in-repo site that is
-/// **genuinely silent** is the `frpc` admin API's config **GET**: its
-/// `config_from_file` (`frp-client/src/admin.rs`) loads through
-/// `load_client_config` — the *file* API, not this string one — on every
-/// request, so the record it used to get from the loader is gone, and emitting
-/// there would mean one record per poll.
+/// the load sites that have a log sink — the CLI startup paths (`frps`/`frpc`
+/// run), `frpc verify`, both in-process reloads, and the `frpc` admin API's
+/// config **GET** — not in the library loaders. The GET's emitter is
+/// `frp-client/src/admin.rs`'s `config_from_file`, which now loads through
+/// `load_client_config_with_presence` and calls
+/// `ConfigPresence::warn_inert_web_server_tls_enable` itself, deduplicated so a
+/// polled GET warns once per **state change** rather than once per request (that
+/// file pins the dedup). It is *not* this string loader: the string loader is
+/// what `frpc verify`'s and the admin PUT's validate step use, and neither may
+/// emit from here (the CLI paths emit after `init_logging`).
 ///
-/// The admin **PUT** (`handle_put_config`) is *not* silent: it validates through
-/// this very string loader (silent) and then triggers the service reload, so it
-/// still delivers once per request, via the reload site (measured: 3 GETs → +0
-/// records, 3 PUTs → +3, probe `/tmp/enable-warn-probe/run-admin-probe.sh`).
-///
-/// The GET's silence is a real scope reduction, pinned here so it cannot be
-/// mistaken for an oversight and filed in `TODO.md`; a future decision to warn
-/// from it has to change this test. Out-of-repo consumers of
+/// The admin **PUT** (`handle_put_config`) validates through this very string
+/// loader (silent) and then triggers the service reload, so it delivers once per
+/// request via the reload site. Out-of-repo consumers of
 /// `load_*_config_from_str` remain silent.
 #[test]
 fn the_string_loader_stays_silent() {

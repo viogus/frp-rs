@@ -5194,7 +5194,7 @@ fn field_name_at(text: &str) -> Option<(String, usize)> {
 fn strict_array_element_keys_match_struct_fields() {
     use super::strict::{
         CLIENT_PLUGIN_KNOWN_KEYS, HEALTH_CHECK_HEADER_KNOWN_KEYS, HTTP_PLUGIN_KNOWN_KEYS,
-        PROXY_KNOWN_KEYS, VISITOR_KNOWN_KEYS, VISITOR_PLUGIN_KNOWN_KEYS,
+        PROXY_KNOWN_KEYS, VISITOR_KNOWN_KEYS, VISITOR_PLUGIN_KNOWN_KEYS, WEB_SERVER_TLS_KNOWN_KEYS,
     };
     let client_src = include_str!("client.rs");
     let server_src = include_str!("server.rs");
@@ -5276,6 +5276,15 @@ fn strict_array_element_keys_match_struct_fields() {
             "HealthCheckHttpHeader",
             HEALTH_CHECK_HEADER_KNOWN_KEYS,
         ),
+        (
+            // The nested `web_server.tls` table the strict walker descends into
+            // (a `child_table_keys` set, not an array element set — the guard is
+            // the same shape).
+            "WEB_SERVER_TLS_KNOWN_KEYS",
+            server_src,
+            "WebServerTlsConfig",
+            WEB_SERVER_TLS_KNOWN_KEYS,
+        ),
     ] {
         let extracted = serde_keys_of_struct(src, struct_name);
         let listed: std::collections::BTreeSet<String> =
@@ -5326,6 +5335,7 @@ fn strict_known_key_lists_are_all_covered() {
         "VISITOR_PLUGIN_KNOWN_KEYS",
         "HTTP_PLUGIN_KNOWN_KEYS",
         "HEALTH_CHECK_HEADER_KNOWN_KEYS",
+        "WEB_SERVER_TLS_KNOWN_KEYS",
     ];
     let mut covered_sorted: Vec<String> = covered.iter().map(|s| s.to_string()).collect();
     covered_sorted.sort();
@@ -5936,11 +5946,14 @@ custom404Page = "<h1>nope</h1>"
 
 /// The nested `[web_server.tls]` section is **hoisted** onto the flat
 /// `web_server.tls_*` fields by `normalize_web_server_section`
-/// (`frp-core/src/config/normalize.rs`), because the `tls` table is removed
-/// before serde (and before `check_strict`) ever sees it. Two claims about that
-/// hoist are pinned here, each in **both** loader modes and — for precedence —
-/// in **both** orders, because the input shape the claim is about is what
-/// differs:
+/// (`frp-core/src/config/normalize.rs`), because the `tls` table's **mapped**
+/// keys are removed before serde sees them. (The table itself survives whenever
+/// it holds an unmapped key, and that residue is exactly what `check_strict`
+/// walks to report `web_server.tls.<key>` — see
+/// `unknown_nested_web_server_tls_key_names_the_true_nested_path`.) Two claims
+/// about that hoist are pinned here, each in **both** loader modes and — for
+/// precedence — in **both** orders, because the input shape the claim is about is
+/// what differs:
 ///
 /// 1. **Both spelling families reach the field.** `WebServerTlsConfig` declares
 ///    `cert_file` / `key_file` / `trusted_ca_file` / `server_name` as its
@@ -5960,8 +5973,9 @@ custom404Page = "<h1>nope</h1>"
 ///    the writer's free choice.
 ///
 /// The nested struct itself is asserted **empty** in every case: the `tls`
-/// table is removed before serde, so the effective value is always the flat
-/// field `tls_cert()` falls back to. `enable` is deliberately absent from the
+/// table's mapped keys are removed before serde, so the effective value is
+/// always the flat field `tls_cert()` falls back to. (An unmapped key keeps the
+/// table alive, but serde ignores it and none of them is a field.) `enable` is deliberately absent from the
 /// value table — it is dropped by the hoist (see its doc comment) and pinned by
 /// `nested_web_server_tls_enable_is_accepted_and_inert_in_both_modes`.
 ///
@@ -6051,7 +6065,7 @@ fn nested_web_server_tls_spellings_reach_the_accessor_in_both_modes() {
             ),
             "nested snake_case, {mode}: the struct's own canonical names must \
              reach the accessor, and the nested struct stays unpopulated \
-             (normalization removes the table before serde)",
+             (normalization removes the table's mapped keys before serde)",
         );
     }
 
@@ -6160,6 +6174,754 @@ fn nested_web_server_tls_spellings_reach_the_accessor_in_both_modes() {
     }
 }
 
+/// `[webServer]` and `[web_server]` are the **same section**, merged per key,
+/// with `[web_server]` (the snake_case spelling) winning every key both define.
+///
+/// The all-or-nothing `table.entry("web_server").or_insert(v)` this replaces
+/// discarded the camelCase table **whole** — so a nested `[webServer.tls]`
+/// never reached the hoist, and a file that wrote the nested section beside a
+/// flat key in the other spelling silently got the *flat* value: the one shape
+/// in which the documented "the nested values take precedence" claim was false.
+/// Measured before this change in both loader modes (probe
+/// probe cases A1–A6, transcript `/tmp/ws-probe-before.txt`): `tls_cert()` was
+/// `/flat`, and
+/// distinct keys written only in `[webServer]` (`user`, `port`) vanished.
+///
+/// The merge preserves the **old winner** rather than inverting it: for a key
+/// both sections define, `[web_server]` wins — the order the flatten resolved
+/// in. Nested tables merge recursively the same way.
+///
+/// **What this models.** Both loader modes on a real file, for: the nested-tls
+/// shape (A1), disjoint flat keys (A2), a key both sections define (A3), a
+/// camelCase alias against the snake canonical (A4 — which a naive merge turns
+/// into a serde `duplicate field`, so this is the row the canonicalization in
+/// `normalize_web_server_section` exists for), two `tls` tables with disjoint
+/// keys (A5), YAML with both spellings, and the client admin section.
+///
+/// **What it does not cover.** A present-but-not-a-table `web_server` (e.g.
+/// `web_server = 1`): the merge keeps the old drop-camelCase-whole behaviour
+/// there, mirrored by `ConfigPresence::web_server_tls_enable_set_in`, and it is
+/// not a shape any real config has. The `[common]` flatten is **not** part of
+/// this merge — it is still `or_insert` on the whole value, so a top-level
+/// `web_server` drops `[common] web_server` whole (pinned in
+/// `frp-core/tests/web_server_tls_enable_warning.rs`).
+#[test]
+fn both_web_server_sections_merge_per_key_in_both_modes() {
+    /// Write `body` as `frps.toml` and return
+    /// `(cert, key, ca, server_name, user, password, port)` in both modes.
+    fn load_both(body: &str) -> Vec<(String, String, String, String, String, String, u16)> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frps.toml");
+        std::fs::write(&path, body).unwrap();
+        let p = path.to_str().unwrap();
+        [false, true]
+            .into_iter()
+            .map(|strict| {
+                let cfg = load_server_config(p, strict)
+                    .unwrap_or_else(|e| panic!("strict={strict} must load:\n{e}"));
+                let ws = cfg.web_server;
+                (
+                    ws.tls_cert().to_string(),
+                    ws.tls_key().to_string(),
+                    ws.tls_ca_file.clone(),
+                    ws.tls_server_name.clone(),
+                    ws.user.clone(),
+                    ws.password.clone(),
+                    ws.port,
+                )
+            })
+            .collect()
+    }
+
+    // A1: the nested camelCase table is reachable and wins over a flat snake key.
+    for (cert, key, ca, sn, user, pwd, port) in load_both(
+        "bind_port = 7000\ntoken = \"t\"\n[webServer.tls]\ncert_file = \"/nested/cert.pem\"\n\
+         [web_server]\nport = 7500\ntls_cert_file = \"/flat/cert.pem\"\n",
+    ) {
+        assert_eq!(cert, "/nested/cert.pem", "A1: nested wins");
+        assert_eq!((key.as_str(), ca.as_str(), sn.as_str()), ("", "", ""));
+        assert_eq!((user.as_str(), pwd.as_str(), port), ("", "", 7500));
+    }
+
+    // A2: disjoint flat keys from both sections all survive.
+    for (_, _, _, _, user, pwd, port) in load_both(
+        "bind_port = 7000\ntoken = \"t\"\n[webServer]\nuser = \"camel\"\nport = 7501\n\
+         [web_server]\npassword = \"snake\"\n",
+    ) {
+        assert_eq!(user, "camel", "A2: the camelCase table is not discarded");
+        assert_eq!(pwd, "snake");
+        assert_eq!(port, 7501);
+    }
+
+    // A3: a key both sections define -> snake wins (the old flatten order).
+    for (_, _, _, _, user, _, _) in load_both(
+        "bind_port = 7000\ntoken = \"t\"\n[webServer]\nuser = \"camel\"\n\
+         [web_server]\nuser = \"snake\"\n",
+    ) {
+        assert_eq!(user, "snake", "A3: the order is not inverted");
+    }
+
+    // A4: camelCase alias in `[webServer]` beside the snake canonical in
+    // `[web_server]` — one field, two names, and a naive merge would make serde
+    // report `duplicate field \`tls_cert_file\``. The canonical wins.
+    for (cert, _, _, _, _, _, _) in load_both(
+        "bind_port = 7000\ntoken = \"t\"\n[webServer]\ncertFile = \"/camel/cert.pem\"\n\
+         [web_server]\ntls_cert_file = \"/snake/cert.pem\"\n",
+    ) {
+        assert_eq!(cert, "/snake/cert.pem", "A4: canonical wins, no duplicate");
+    }
+
+    // A5: two `tls` tables with disjoint keys both survive.
+    for (cert, key, _, _, _, _, _) in load_both(
+        "bind_port = 7000\ntoken = \"t\"\n[webServer.tls]\ncertFile = \"/camel/cert.pem\"\n\
+         [web_server.tls]\nkey_file = \"/snake/key.pem\"\n",
+    ) {
+        assert_eq!(cert, "/camel/cert.pem", "A5: camel tls key survives");
+        assert_eq!(key, "/snake/key.pem");
+    }
+
+    // Same shape in YAML, where the two spellings are sibling keys of one map.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.yaml");
+    std::fs::write(
+        &path,
+        "bind_port: 7000\ntoken: \"t\"\nwebServer:\n  tls:\n    cert_file: \"/nested/cert.pem\"\n\
+         web_server:\n  port: 7500\n  tls_cert_file: \"/flat/cert.pem\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_server_config(path.to_str().unwrap(), strict).unwrap();
+        assert_eq!(
+            cfg.web_server.tls_cert(),
+            "/nested/cert.pem",
+            "YAML, strict={strict}"
+        );
+    }
+
+    // Client admin section: same normalizer, same merge.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.toml");
+    std::fs::write(
+        &path,
+        "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\n\
+         [webServer.tls]\ncert_file = \"/nested/cert.pem\"\n\
+         [web_server]\nport = 7400\ntls_cert_file = \"/flat/cert.pem\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict).unwrap();
+        assert_eq!(
+            cfg.web_server.tls_cert(),
+            "/nested/cert.pem",
+            "client, strict={strict}"
+        );
+    }
+}
+
+/// A dotted `.ini` section header whose first segment is a v1 section name
+/// becomes a **nested table**, so `.ini` reaches the same normalizers as every
+/// other format — and a legacy `[plugin.NAME]` header (or any other non-v1
+/// first segment) stays a flat section name.
+///
+/// Before this, `[webServer.tls]` / `[web_server.tls]` were stored verbatim as
+/// the top-level key `webServer.tls` / `web_server.tls`: non-strict dropped the
+/// whole section and strict reported `unknown field "webServer.tls"` (measured
+/// in both modes, probe case B1/B2). The neighbouring shapes worked, which is
+/// the trap the item names: `[webServer] certFile = …` and the legacy
+/// `dashboard_tls_cert_file` both load.
+///
+/// The first-segment restriction is what keeps Go's legacy sections working:
+/// Go's `.ini` path is the legacy loader (`pkg/config/legacy/server.go`), which
+/// reads `[common]` and the flat `plugin.NAME` sections from `gopkg.in/ini.v1`
+/// — `section.Name()` is the raw `plugin.user-manager`, matched with
+/// `strings.HasPrefix(name, "plugin.")` — and frp-rs mirrors that in
+/// `collect_legacy_ini_proxy_sections` / the `plugin.` fold. Expanding every
+/// dotted header broke the shipped Go fixture (measured: `unknown field
+/// "plugin"` in strict mode), which is why the restriction exists.
+///
+/// **What this models.** Both loader modes on real `.ini` files: the two
+/// spellings, the nested-wins precedence, the legacy `plugin.` boundary, a
+/// literal top-level `webServer.tls` key (which must stay a distinct unknown
+/// key, not collide with the expanded table), and a genuine path conflict
+/// (`[webServer] tls = 1` beside `[webServer.tls]`), which is reported rather
+/// than clobbered.
+///
+/// **What it does not cover.** Quoting (`[a."b.c"]`), which is out of scope and
+/// keeps its header verbatim; `[a..b]`; and Go parity for the expansion itself —
+/// Go never reads `[webServer.tls]` in an `.ini` at all (its legacy loader
+/// ignores the section), so this is an frp-rs extension that makes `.ini` a
+/// first-class spelling of the v1 config, not a parity fix.
+#[test]
+fn dotted_ini_section_headers_become_nested_tables_in_both_modes() {
+    fn load_ini_both(body: &str) -> Vec<(String, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frps.ini");
+        std::fs::write(&path, body).unwrap();
+        let p = path.to_str().unwrap();
+        [false, true]
+            .into_iter()
+            .map(|strict| {
+                let cfg = load_server_config(p, strict).unwrap_or_else(|e| {
+                    panic!("strict={strict} must load:\n{e}");
+                });
+                (
+                    cfg.web_server.tls_cert().to_string(),
+                    cfg.web_server.tls_key().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    // The Go-style spelling, with the values under the nested section.
+    for (cert, key) in load_ini_both(
+        "[common]\nbind_port = 7000\n[webServer]\nport = 7500\n\
+         [webServer.tls]\ncertFile = /nested/cert.pem\nkeyFile = /nested/key.pem\n",
+    ) {
+        assert_eq!(cert, "/nested/cert.pem");
+        assert_eq!(key, "/nested/key.pem");
+    }
+
+    // The snake_case spelling.
+    for (cert, _) in load_ini_both(
+        "[common]\nbind_port = 7000\n[web_server]\nport = 7500\n\
+         [web_server.tls]\ncert_file = /snake/cert.pem\n",
+    ) {
+        assert_eq!(cert, "/snake/cert.pem");
+    }
+
+    // Nested wins over a flat key in the same section, as in every other format.
+    for (cert, _) in load_ini_both(
+        "[common]\nbind_port = 7000\n[webServer]\nport = 7500\ncertFile = /flat/cert.pem\n\
+         [webServer.tls]\ncertFile = /nested/cert.pem\n",
+    ) {
+        assert_eq!(cert, "/nested/cert.pem");
+    }
+
+    // The legacy boundary: `[plugin.NAME]` is not a v1 section root, so it is
+    // NOT split — the plugin still lands in `http_plugins` (whose strict walk
+    // needs the flat key).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(
+        &path,
+        "[common]\nbind_port = 7000\n[plugin.user-manager]\naddr = 127.0.0.1:9000\n\
+         path = /handler\nops = login\ntlsVerify = true\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_server_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("legacy plugin section, strict={strict}: {e}"));
+        assert_eq!(cfg.http_plugins.len(), 1, "strict={strict}");
+        assert_eq!(cfg.http_plugins[0].name, "user-manager", "strict={strict}");
+        assert_eq!(cfg.http_plugins[0].addr, "127.0.0.1:9000");
+    }
+
+    // A literal top-level key named `webServer.tls` is a *different* key from the
+    // expanded table, so it must not be swallowed by it: it stays an unknown
+    // field for strict mode to report.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(
+        &path,
+        "webServer.tls = 1\n[common]\nbind_port = 7000\n[webServer]\nport = 7500\n",
+    )
+    .unwrap();
+    let err = format!(
+        "{}",
+        load_server_config(path.to_str().unwrap(), true).unwrap_err()
+    );
+    assert!(
+        err.contains("unknown field \"webServer.tls\""),
+        "the literal key is still reported: {err}"
+    );
+    load_server_config(path.to_str().unwrap(), false).unwrap();
+
+    // A conflict — a scalar where the expanded path needs a table — is reported
+    // when the containing section comes **first** (the item's "must not collide"
+    // clause) …
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(
+        &path,
+        "[common]\nbind_port = 7000\n[webServer]\nport = 7500\ntls = 1\n\
+         [webServer.tls]\ncertFile = /nested/cert.pem\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let err = format!(
+            "{}",
+            load_server_config(path.to_str().unwrap(), strict).unwrap_err()
+        );
+        assert!(
+            err.contains("conflicts with the value already set at `webServer.tls`"),
+            "strict={strict}: got {err}"
+        );
+    }
+
+    // … and the reverse order is pinned too, because it does **not** error: the
+    // expansion builds the table first and the later verbatim `[webServer]`
+    // section merges `tls = 1` into it, overwriting the table. The file loads in
+    // both modes with the nested values gone (`tls_cert() == ""`). The asymmetry
+    // is stated in `insert_ini_section`'s doc and in `CHANGELOG.md`; pinning it
+    // here is what keeps the "reported instead of silently clobbered" sentence
+    // from quietly becoming false again.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(
+        &path,
+        "[common]\nbind_port = 7000\n[webServer.tls]\ncertFile = /nested/cert.pem\n\
+         [webServer]\nport = 7500\ntls = 1\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_server_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("reverse order must load, strict={strict}: {e}"));
+        assert_eq!(
+            cfg.web_server.tls_cert(),
+            "",
+            "strict={strict}: the later scalar `tls` overwrites the expanded table"
+        );
+        assert_eq!(cfg.web_server.port, 7500, "strict={strict}");
+    }
+}
+
+/// The **other** direction of the `.ini` dotted-header rule: a section whose
+/// name merely *looks* like a v1 path but is a legacy **proxy name** stays a
+/// proxy.
+///
+/// In the legacy INI dialect every section other than `[common]` is a proxy, and
+/// `collect_legacy_ini_proxy_sections` decides membership by the section's own
+/// `type` key. So `[auth.foo]`, `[store.frontend]` and `[log.svc]` are proxies
+/// *named* `auth.foo` / `store.frontend` / `log.svc`, not the `foo` /
+/// `frontend` / `svc` children of an `auth` / `store` / `log` table — Go's legacy
+/// loader looks sections up by their raw name too (`pkg/config/legacy/server.go`,
+/// `section.Name()`). The first cut of the dotted-header expansion split them on
+/// the first segment alone and the proxies **silently disappeared** (measured on
+/// the real binaries: base and Go v0.71.0 register them, `proxy added:
+/// [auth.foo]`; the frozen tree registered nothing), which is the silent drop
+/// item B's Done-when forbids. `ini_section_path` therefore holds a section back
+/// when it carries `type`.
+///
+/// **What this models.** Both loader modes on a real `.ini`, for the three
+/// v1-first-segment names the reviewers probed plus a non-v1 control
+/// (`[my.proxy]`), each asserting the proxy's `type` / `local_port` /
+/// `remote_port` survive; then the expansion direction in the same file family,
+/// so one test pins both.
+///
+/// **What it does not cover.** A v1 nested table that itself carries a `type`
+/// key (a `[visitors.plugin]`-style table in an `.ini`) is not merely "left
+/// unexpanded": it stays a flat section, and on the client the legacy collector
+/// then reads it as a proxy named after the header and proxy validation refuses
+/// it (measured: `[visitors.plugin] type = "https2http"` → rc 1, `proxy
+/// 'visitors.plugin': invalid proxy_type 'https2http'`; on the server it is an
+/// unknown strict-mode field). That is the cost of the discriminator, it matches
+/// the base tree (which never expanded anything), and it is stated in
+/// `docs/config.md` and `ini_section_path`'s doc. A legacy proxy section
+/// **without** a `type` key is dropped here *and* on base, where Go registers it
+/// as a `tcp` proxy — a pre-existing parity gap filed as its own `TODO.md` item,
+/// not pinned here.
+#[test]
+fn dotted_ini_headers_that_are_legacy_proxy_names_stay_proxies() {
+    for name in ["auth.foo", "store.frontend", "log.svc", "my.proxy"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(
+            &path,
+            format!(
+                "server_addr = 127.0.0.1\nserver_port = 7000\ntoken = t\n\
+                 [{name}]\ntype = tcp\nlocal_port = 8080\nremote_port = 9080\n"
+            ),
+        )
+        .unwrap();
+        for strict in [false, true] {
+            let cfg = load_client_config(path.to_str().unwrap(), strict)
+                .unwrap_or_else(|e| panic!("[{name}], strict={strict}: {e}"));
+            let proxy = cfg
+                .proxies
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                    "[{name}], strict={strict}: the legacy proxy section must register; got {:?}",
+                    cfg.proxies.iter().map(|p| p.name.clone()).collect::<Vec<_>>()
+                )
+                });
+            assert_eq!(proxy.proxy_type, "tcp", "[{name}], strict={strict}");
+            assert_eq!(proxy.local_port, 8080, "[{name}], strict={strict}");
+            assert_eq!(proxy.remote_port, 9080, "[{name}], strict={strict}");
+        }
+    }
+
+    // …and the v1 direction still expands: the same `auth` first segment with no
+    // `type` key is a nested table, and `[webServer.tls]` still reaches the hoist.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(
+        &path,
+        "[common]\nbind_port = 7000\n[webServer]\nport = 7500\n\
+         [webServer.tls]\ncertFile = /nested/cert.pem\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_server_config(path.to_str().unwrap(), strict).unwrap();
+        assert_eq!(
+            cfg.web_server.tls_cert(),
+            "/nested/cert.pem",
+            "strict={strict}"
+        );
+    }
+}
+
+/// A **non-table** `webServer` / `web_server` (top level or under `[common]`)
+/// must still reach serde as a type error.
+///
+/// The whole-table `or_insert` this merge replaced *moved* the value whatever its
+/// type, so serde refused it: base `frps verify` rc 1 both modes with
+/// `invalid type: string "not a table", expected struct WebServerConfig`. The
+/// first cut of `merge_section_into` matched `Value::Table` **after**
+/// `table.remove(from)`, so a non-table `webServer` was deleted instead of being
+/// carried across and both modes returned rc 0 "syntax is ok" — on the server and
+/// the client, at the top level and under `[common]`. The merge now moves the
+/// value first and only pattern-matches in the `Occupied` arm.
+///
+/// **What this models.** Both loader modes on real files, server and client, for
+/// `webServer` and `web_server` at the top level and under `[common]`, as a
+/// string and as an integer.
+///
+/// **What it does not cover.** A non-table `web_server` *beside* a camelCase
+/// table: `into` wins and `from` is dropped, which is the old `or_insert`
+/// behaviour and is pinned by `both_web_server_sections_merge_per_key_in_both_modes`
+/// only for the table case.
+#[test]
+fn non_table_web_server_section_is_still_a_type_error() {
+    let server_shapes = [
+        (
+            "webServer = string",
+            "bind_port = 7000\nwebServer = \"not a table\"\n",
+        ),
+        ("web_server = int", "bind_port = 7000\nweb_server = 5\n"),
+        (
+            "[common] webServer = string",
+            "bind_port = 7000\n[common]\nwebServer = \"not a table\"\n",
+        ),
+        (
+            "[common] web_server = int",
+            "bind_port = 7000\n[common]\nweb_server = 5\n",
+        ),
+    ];
+    for (name, body) in server_shapes {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frps.toml");
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let err = format!(
+                "{}",
+                load_server_config(path.to_str().unwrap(), strict).unwrap_err()
+            );
+            assert!(
+                err.contains("WebServerConfig"),
+                "server {name}, strict={strict}: the non-table section must reach serde: {err}"
+            );
+        }
+    }
+
+    let client_shapes = [
+        (
+            "webServer = string",
+            "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\nwebServer = \"not a table\"\n",
+        ),
+        (
+            "web_server = int",
+            "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\nweb_server = 5\n",
+        ),
+        (
+            "[common] webServer = string",
+            "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\n[common]\nwebServer = \"not a table\"\n",
+        ),
+        (
+            "[common] web_server = int",
+            "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\n[common]\nweb_server = 5\n",
+        ),
+    ];
+    for (name, body) in client_shapes {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.toml");
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let err = format!(
+                "{}",
+                load_client_config(path.to_str().unwrap(), strict).unwrap_err()
+            );
+            assert!(
+                err.contains("WebServerConfig"),
+                "client {name}, strict={strict}: the non-table section must reach serde: {err}"
+            );
+        }
+    }
+}
+
+/// The parent-level `certFile` / `keyFile` / `trustedCaFile` / `serverName`
+/// serde **aliases** are canonicalized away, so the same field can never reach
+/// serde twice — a pre-existing `duplicate field \`tls_cert_file\`` in **both**
+/// loader modes, with no nested key involved at all.
+///
+/// serde binds `web_server.certFile` as an `alias` of
+/// `web_server.tls_cert_file`, so writing both at the parent level used to fail
+/// to deserialize (measured: rc 1, `config validation error: duplicate field
+/// \`tls_cert_file\``, both modes — probe case E1/E2, and `frps verify` on a
+/// real binary). `normalize_web_server_section` now canonicalizes the whole
+/// four-spelling group down to `flat_key` whenever the `tls` table is present
+/// *or absent*, and the first **non-empty** spelling wins in the order nested
+/// snake → nested camel → parent canonical → parent alias — so the parent
+/// canonical (the struct's own field name) wins.
+///
+/// **What this models.** Both loader modes, each of the four pairs alone and all
+/// four together, plus the empty-canonical case (where "first non-empty" makes
+/// the alias supply the value, consistent with the empty-means-unset rule) and
+/// the control with the alias alone.
+///
+/// **What it does not cover.** A parent-level **snake** `cert_file` (the nested
+/// spelling written at the parent level) — that is not a field and must keep
+/// being reported, pinned by
+/// `parent_level_snake_spelling_is_still_reported_in_strict_mode`; and YAML,
+/// where a duplicate key is the parser's business before this runs.
+#[test]
+fn parent_alias_beside_parent_canonical_loads_in_both_modes() {
+    const HEADER: &str = "bind_port = 7000\ntoken = \"t\"\n";
+    const WS: &str = "[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n";
+
+    // (name, parent lines, expected cert/key/ca/sn)
+    type Case<'a> = (&'a str, &'a str, (&'a str, &'a str, &'a str, &'a str));
+    let cases: [Case; 6] = [
+        (
+            "certFile + tls_cert_file",
+            "certFile = \"/alias/c.pem\"\ntls_cert_file = \"/canon/c.pem\"\n",
+            ("/canon/c.pem", "", "", ""),
+        ),
+        (
+            "keyFile + tls_key_file",
+            "keyFile = \"/alias/k.pem\"\ntls_key_file = \"/canon/k.pem\"\n",
+            ("", "/canon/k.pem", "", ""),
+        ),
+        (
+            "trustedCaFile + tls_ca_file",
+            "trustedCaFile = \"/alias/ca.pem\"\ntls_ca_file = \"/canon/ca.pem\"\n",
+            ("", "", "/canon/ca.pem", ""),
+        ),
+        (
+            "serverName + tls_server_name",
+            "serverName = \"alias.example\"\ntls_server_name = \"canon.example\"\n",
+            ("", "", "", "canon.example"),
+        ),
+        (
+            "all four pairs",
+            "certFile = \"/a/c\"\ntls_cert_file = \"/c/c\"\nkeyFile = \"/a/k\"\ntls_key_file = \"/c/k\"\n\
+             trustedCaFile = \"/a/ca\"\ntls_ca_file = \"/c/ca\"\nserverName = \"a.example\"\n\
+             tls_server_name = \"c.example\"\n",
+            ("/c/c", "/c/k", "/c/ca", "c.example"),
+        ),
+        (
+            "empty canonical + non-empty alias",
+            "certFile = \"/alias/c.pem\"\ntls_cert_file = \"\"\n",
+            ("/alias/c.pem", "", "", ""),
+        ),
+    ];
+
+    for (name, parent, want) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frps.toml");
+        std::fs::write(&path, format!("{HEADER}{WS}{parent}")).unwrap();
+        let p = path.to_str().unwrap();
+        for strict in [false, true] {
+            let cfg = load_server_config(p, strict)
+                .unwrap_or_else(|e| panic!("{name}, strict={strict}: must load:\n{e}"));
+            let ws = &cfg.web_server;
+            assert_eq!(
+                (
+                    ws.tls_cert(),
+                    ws.tls_key(),
+                    ws.tls_ca_file.as_str(),
+                    ws.tls_server_name.as_str()
+                ),
+                want,
+                "{name}, strict={strict}",
+            );
+            // The alias key itself never survives normalization, so strict mode
+            // does not see a key the loader already folded.
+            assert_eq!(
+                cfg.web_server.tls.cert_file, "",
+                "{name}: the nested struct stays default"
+            );
+        }
+    }
+
+    // Control: the alias alone still works (no canonical to win).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.toml");
+    std::fs::write(
+        &path,
+        format!("{HEADER}{WS}certFile = \"/alias/c.pem\"\nkeyFile = \"/alias/k.pem\"\n"),
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_server_config(path.to_str().unwrap(), strict).unwrap();
+        assert_eq!(cfg.web_server.tls_cert(), "/alias/c.pem", "strict={strict}");
+        assert_eq!(cfg.web_server.tls_key(), "/alias/k.pem", "strict={strict}");
+    }
+
+    // Client: same normalizer, same canonicalization.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.toml");
+    std::fs::write(
+        &path,
+        "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\n\
+         [web_server]\nport = 7400\ncertFile = \"/alias/c.pem\"\ntls_cert_file = \"/canon/c.pem\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict).unwrap();
+        assert_eq!(
+            cfg.web_server.tls_cert(),
+            "/canon/c.pem",
+            "client, strict={strict}"
+        );
+    }
+}
+
+/// An explicitly **empty** nested value is *unset*: it does not clear a value
+/// the flat or alias spelling already supplies.
+///
+/// The hoist's `insert` used to treat `[web_server.tls] cert_file = ""` as "the
+/// nested value wins", so a certificate written for the flat/alias spelling was
+/// silently dropped and the dashboard fell back to plaintext HTTP — measured
+/// `tls_cert() == ""` in both loader modes (probe cases F1/F2). Emptiness is how
+/// these fields say *disabled*, so the fail-safe reading is that an empty
+/// spelling falls through to the next one; the alternative (empty wins) is a
+/// silent loss of a configured certificate. `docs/config.md` states the same
+/// rule.
+///
+/// **What this models.** Both loader modes on a real file: empty nested beside a
+/// parent alias, empty nested beside the parent canonical, empty nested alone,
+/// empty snake beside a set camelCase sibling, and empty nested beside a
+/// **nested** camelCase sibling for all four destinations.
+///
+/// **What it does not cover.** A non-string empty (`cert_file = 0`) is treated
+/// as present rather than empty and reaches serde, which rejects it — the type
+/// error is the honest outcome. The rejected alternative (empty wins) is not
+/// pinned by a test, because it is exactly what the assertions below forbid.
+#[test]
+fn empty_nested_value_is_unset_in_both_modes() {
+    const HEADER: &str = "bind_port = 7000\ntoken = \"t\"\n";
+    const WS: &str = "[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n";
+
+    type Loaded = (String, String, String, String);
+    fn load_both(body: &str) -> [(Loaded, String); 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frps.toml");
+        std::fs::write(&path, body).unwrap();
+        let p = path.to_str().unwrap();
+        [false, true].map(|strict| {
+            let cfg = load_server_config(p, strict)
+                .unwrap_or_else(|e| panic!("strict={strict} must load:\n{e}"));
+            let ws = cfg.web_server;
+            (
+                (
+                    ws.tls_cert().to_string(),
+                    ws.tls_key().to_string(),
+                    ws.tls_ca_file.clone(),
+                    ws.tls_server_name.clone(),
+                ),
+                format!("strict={strict}"),
+            )
+        })
+    }
+
+    // Empty nested beside a parent alias: the alias value survives.
+    for (got, mode) in load_both(&format!(
+        "{HEADER}{WS}certFile = \"/p.pem\"\n[web_server.tls]\ncert_file = \"\"\n"
+    )) {
+        assert_eq!(got.0, "/p.pem", "alias survives, {mode}");
+    }
+
+    // Empty nested beside the parent canonical: the canonical value survives.
+    for (got, mode) in load_both(&format!(
+        "{HEADER}{WS}tls_cert_file = \"/p.pem\"\ntls_key_file = \"/k.pem\"\n\
+         [web_server.tls]\ncert_file = \"\"\nkey_file = \"\"\n"
+    )) {
+        assert_eq!(
+            (got.0.as_str(), got.1.as_str()),
+            ("/p.pem", "/k.pem"),
+            "{mode}"
+        );
+    }
+
+    // Empty nested alone: the field stays empty (the default), and nothing is
+    // invented.
+    for (got, mode) in load_both(&format!(
+        "{HEADER}{WS}[web_server.tls]\ncert_file = \"\"\nkey_file = \"\"\n\
+         trusted_ca_file = \"\"\nserver_name = \"\"\n"
+    )) {
+        assert_eq!(
+            got,
+            (String::new(), String::new(), String::new(), String::new()),
+            "{mode}"
+        );
+    }
+
+    // Empty snake beside a set camelCase sibling: the empty spelling is skipped,
+    // so the camel one supplies the value (the same rule, one level down).
+    for (got, mode) in load_both(&format!(
+        "{HEADER}{WS}[web_server.tls]\ncert_file = \"\"\ncertFile = \"/camel.pem\"\n"
+    )) {
+        assert_eq!(got.0, "/camel.pem", "empty snake falls through, {mode}");
+    }
+
+    // …and the reverse: a non-empty snake wins over an empty camel spelling.
+    for (got, mode) in load_both(&format!(
+        "{HEADER}{WS}[web_server.tls]\ncert_file = \"/snake.pem\"\ncertFile = \"\"\n"
+    )) {
+        assert_eq!(got.0, "/snake.pem", "{mode}");
+    }
+
+    // All four destinations, empty nested beside set flat values.
+    for (got, mode) in load_both(&format!(
+        "{HEADER}{WS}tls_cert_file = \"/f/c\"\ntls_key_file = \"/f/k\"\n\
+         tls_ca_file = \"/f/ca\"\ntls_server_name = \"f.example\"\n\
+         [web_server.tls]\ncert_file = \"\"\nkey_file = \"\"\ntrusted_ca_file = \"\"\n\
+         server_name = \"\"\n"
+    )) {
+        assert_eq!(
+            got,
+            (
+                "/f/c".to_string(),
+                "/f/k".to_string(),
+                "/f/ca".to_string(),
+                "f.example".to_string()
+            ),
+            "{mode}"
+        );
+    }
+
+    // Client: same rule.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.toml");
+    std::fs::write(
+        &path,
+        "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\n\
+         [web_server]\nport = 7400\ncertFile = \"/p.pem\"\n\
+         [web_server.tls]\ncert_file = \"\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict).unwrap();
+        assert_eq!(
+            cfg.web_server.tls_cert(),
+            "/p.pem",
+            "client, strict={strict}"
+        );
+    }
+}
+
 /// Both spellings of one nested `[web_server.tls]` key in the same file: the
 /// canonical snake_case wins, and the loser does **not** survive under its own
 /// name at the parent level.
@@ -6247,9 +7009,9 @@ fn both_spellings_of_one_nested_key_do_not_collide() {
 /// `[web_server.tls] enable` is accepted in **both** loader modes and inert in
 /// both — the decision recorded on `normalize_web_server_section`.
 ///
-/// It is inert because nothing reads it: the nested `tls` table is removed
-/// before serde, so `WebServerTlsConfig::enable` is default-`false` in every
-/// loaded config (`frp-core/src/config/restart_only.rs` destructures it as
+/// It is inert because nothing reads it: `normalize_web_server_section` removes
+/// `enable` with the table's other mapped keys before serde, so
+/// `WebServerTlsConfig::enable` is default-`false` in every loaded config (`frp-core/src/config/restart_only.rs` destructures it as
 /// unreachable), and there is no reader anywhere in `frp-server`/`frps`
 /// (`grep -rn 'tls\.enable' frp-server/src frps/src` matches only
 /// `transport.tls.enable` spellings in test fixtures). frp-rs enables the
@@ -6351,32 +7113,31 @@ fn nested_web_server_tls_enable_is_accepted_and_inert_in_both_modes() {
     }
 }
 
-/// A genuinely unknown key inside `[web_server.tls]` is still refused, and the
-/// path it names is the only one the hoist can produce: the hoist re-inserts an
-/// unmapped key at the **parent** level with its own name, so the error reads
-/// `web_server.bogus_key` while the user wrote `web_server.tls.bogus_key`.
+/// A genuinely unknown key inside `[web_server.tls]` is refused in strict mode,
+/// and the path it names is the one the user actually wrote —
+/// `web_server.tls.bogus_key`.
 ///
-/// **This is the residue of the defect, stated rather than papered over** — and
-/// it is also the one test here with **no discriminating power for this change**:
-/// it passes on the base tree (`5717fa2`) and on the fixed tree, because
-/// `bogus_key` was never mapped and the message never changed. What it pins is
-/// that the message keeps naming the parent-level path (and that no *mapped*
-/// spelling appears as an unknown field), so a future change to the hoist cannot
-/// quietly drop the diagnostic or rename what it points at. Naming
-/// `web_server.tls.bogus_key` would need `check_strict` to see the
-/// pre-removal shape, which is a change to the strict walker's input, not to
-/// this mapping; the residue is recorded in the `TODO.md` ledger entry for this
-/// item rather than filed as its own.
+/// **The residue this replaced.** The hoist used to re-insert every unmapped
+/// nested key at the **parent** level under its own name, so strict mode said
+/// `web_server.bogus_key` for a key written as `web_server.tls.bogus_key`; the
+/// previous round's test pinned that wrong path on purpose and named the fix
+/// ("would need `check_strict` to see the pre-removal shape"). That is what this
+/// change does: the residue stays inside `tls` (it can no longer bind a real
+/// `WebServerConfig` field either — see
+/// `nested_web_server_tls_credentials_do_not_become_the_parent_fields`), and the
+/// walker descends `web_server` → `tls` with
+/// [`super::strict::WEB_SERVER_TLS_KNOWN_KEYS`].
 ///
 /// **What this models.** Both loader modes on a real file whose only nested key
-/// is unknown.
+/// is unknown, for the server and for the client admin section (same
+/// normalizer).
 ///
 /// **What it does not cover.** The `did you mean` suggestion for a *typo* of a
-/// mapped spelling (e.g. `cert_fil`): the suggestion list is the parent-level
-/// key set, so it can suggest `certFile` / `tls_cert_file`, never `cert_file`.
+/// mapped spelling (e.g. `cert_fil`): the suggestion list is now the nested TLS
+/// key set, so it can suggest `cert_file` / `certFile`, never `tls_cert_file`.
 /// Not pinned here because that heuristic is best-effort everywhere.
 #[test]
-fn unknown_nested_web_server_tls_key_still_names_a_parent_level_path() {
+fn unknown_nested_web_server_tls_key_names_the_true_nested_path() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("frps.toml");
     std::fs::write(
@@ -6390,18 +7151,183 @@ fn unknown_nested_web_server_tls_key_still_names_a_parent_level_path() {
     let err = load_server_config(p, true).unwrap_err();
     let err = format!("{err}");
     assert!(
-        err.contains("unknown field \"web_server.bogus_key\""),
-        "the residue path is pinned, not asserted away: got {err}"
+        err.contains("unknown field \"web_server.tls.bogus_key\""),
+        "the diagnostic names the path the user wrote: got {err}"
+    );
+    assert!(
+        !err.contains("unknown field \"web_server.bogus_key\""),
+        "the fabricated parent-level path is gone: got {err}"
     );
     assert!(
         !err.contains("web_server.cert_file"),
-        "no mapped snake_case spelling is unknown any more: got {err}"
+        "no mapped snake_case spelling is unknown: got {err}"
     );
 
     // Non-strict keeps the drop, so the two modes differ only in loudness here
     // — the same shape as every other unknown key (`check_strict`'s job), and
     // unlike the pre-fix `cert_file` case, whose *value* was lost.
     load_server_config(p, false).unwrap();
+
+    // Same for the client's admin `[web_server]` — `load_client_config` calls
+    // the same normalizer and the same walker.
+    let cdir = tempfile::tempdir().unwrap();
+    let cpath = cdir.path().join("frpc.toml");
+    std::fs::write(
+        &cpath,
+        "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\n\
+         [web_server]\nport = 7400\n[web_server.tls]\nbogus_key = \"x\"\n",
+    )
+    .unwrap();
+    let cerr = format!(
+        "{}",
+        load_client_config(cpath.to_str().unwrap(), true).unwrap_err()
+    );
+    assert!(
+        cerr.contains("unknown field \"web_server.tls.bogus_key\""),
+        "client: got {cerr}"
+    );
+    load_client_config(cpath.to_str().unwrap(), false).unwrap();
+}
+
+/// A nested `[web_server.tls]` key that names a real `WebServerConfig` field
+/// must **not** become that field.
+///
+/// Before this change `normalize_web_server_section` re-inserted every unmapped
+/// nested key at the parent level with `or_insert`, and `user` / `password`
+/// (plus `addr`, `port`, `enable_prometheus`, `assets_dir`, `pprof_enable`,
+/// `custom_404_page` and the four flat `tls_*` spellings, and both key cases of
+/// each) are real fields — so `[web_server.tls] user = "nested-user"` loaded
+/// with `web_server.user == "nested-user"`: a nested section silently *became*
+/// the dashboard Basic Auth credentials. Measured in both loader modes (probe
+/// case C2, and C3 for the other fields).
+///
+/// Go refuses these keys: its `TLSConfig` has neither `user` nor `password` and
+/// its decoder rejects unknown members — probed on the v0.71.0 `frps`, which
+/// exits 1 with `json: unknown field "password"` for the same shape. frp-rs
+/// keeps the accept-and-ignore divergence for `.ini`-style leniency but reports
+/// it in strict mode at the true path, so it is never a **silent** credential
+/// substitution.
+///
+/// **What this models.** Both loader modes, every `WebServerConfig` field name
+/// (snake and both Go camelCase spellings where they exist), with and without a
+/// parent value to collide with, server and client.
+///
+/// **What it does not cover.** A *future* `WebServerConfig` field added without
+/// updating this list: `strict_array_element_keys_match_struct_fields` compares
+/// `WEB_SERVER_TLS_KNOWN_KEYS` against `WebServerTlsConfig`, not against
+/// `WebServerConfig`, so a new parent field would need a new row here. The
+/// `enable` key, which is dropped-and-warned rather than reported (a deliberate
+/// divergence, pinned by
+/// `nested_web_server_tls_enable_is_accepted_and_inert_in_both_modes`).
+#[test]
+fn nested_web_server_tls_credentials_do_not_become_the_parent_fields() {
+    const HEADER: &str = "bind_port = 7000\ntoken = \"t\"\n";
+    const PARENT: &str = "[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n";
+
+    // Every real `WebServerConfig` field name, in every spelling serde accepts,
+    // paired with the `(field, value)` the nested key used to reach.
+    let shapes: [(&str, &str); 14] = [
+        ("user", "nested-user"),
+        ("password", "nested-secret"),
+        ("addr", "0.0.0.0"),
+        ("port", "1"),
+        ("enable_prometheus", "true"),
+        ("enablePrometheus", "true"),
+        ("assets_dir", "/nested-assets"),
+        ("assetsDir", "/nested-assets"),
+        ("pprof_enable", "true"),
+        ("pprofEnable", "true"),
+        ("custom_404_page", "<nested-404>"),
+        ("custom404Page", "<nested-404>"),
+        ("tls_cert_file", "/nested-flat-cert.pem"),
+        ("tls_key_file", "/nested-flat-key.pem"),
+    ];
+
+    for (key, value) in shapes {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frps.toml");
+        // No parent value at all: this is the shape that used to *invent* a
+        // credential/field out of the nested section.
+        let body = format!("{HEADER}{PARENT}[web_server.tls]\n{key} = \"{value}\"\n");
+        std::fs::write(&path, &body).unwrap();
+        let p = path.to_str().unwrap();
+
+        // Strict refuses, naming the true nested path.
+        let err = format!("{}", load_server_config(p, true).unwrap_err());
+        assert!(
+            err.contains(&format!("unknown field \"web_server.tls.{key}\"")),
+            "{key}: strict must name the true path, got {err}"
+        );
+
+        // Non-strict drops it: the parent fields keep their defaults.
+        let cfg = load_server_config(p, false)
+            .unwrap_or_else(|e| panic!("{key}: non-strict must load:\n{e}"));
+        let ws = &cfg.web_server;
+        assert_eq!(ws.user, "", "{key} must not set web_server.user");
+        assert_eq!(ws.password, "", "{key} must not set web_server.password");
+        assert_eq!(ws.addr, "127.0.0.1", "{key}: addr default");
+        assert_eq!(ws.port, 7500, "{key}: the parent port");
+        assert!(!ws.enable_prometheus, "{key}");
+        assert_eq!(ws.assets_dir, "", "{key}");
+        assert!(!ws.pprof_enable, "{key}");
+        assert_eq!(ws.custom_404_page, "", "{key}");
+        assert_eq!(ws.tls_cert(), "", "{key}");
+        assert_eq!(ws.tls_key(), "", "{key}");
+    }
+
+    // The item's own shape: nested credentials beside *different* parent
+    // credentials keep the parent ones rather than being overwritten (the
+    // `or_insert` masked this one before — only the collision-free shapes above
+    // were observable, but the guarantee must hold either way).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "{HEADER}[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+             user = \"parent-user\"\npassword = \"parent-pw\"\n\
+             [web_server.tls]\nuser = \"nested-user\"\npassword = \"nested-secret\"\n"
+        ),
+    )
+    .unwrap();
+    for strict in [false, true] {
+        if strict {
+            let err = format!(
+                "{}",
+                load_server_config(path.to_str().unwrap(), true).unwrap_err()
+            );
+            assert!(
+                err.contains("unknown field \"web_server.tls."),
+                "strict names one of the nested keys: got {err}"
+            );
+        } else {
+            let cfg = load_server_config(path.to_str().unwrap(), false).unwrap();
+            assert_eq!(cfg.web_server.user, "parent-user");
+            assert_eq!(cfg.web_server.password, "parent-pw");
+        }
+    }
+
+    // Client admin section: same walker, same guarantee.
+    let cdir = tempfile::tempdir().unwrap();
+    let cpath = cdir.path().join("frpc.toml");
+    std::fs::write(
+        &cpath,
+        "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\n\
+         [web_server]\nport = 7400\nuser = \"parent-user\"\n\
+         [web_server.tls]\nuser = \"nested-user\"\npassword = \"nested-secret\"\n",
+    )
+    .unwrap();
+    let cfg = load_client_config(cpath.to_str().unwrap(), false).unwrap();
+    assert_eq!(cfg.web_server.user, "parent-user");
+    assert_eq!(cfg.web_server.password, "");
+    let cerr = format!(
+        "{}",
+        load_client_config(cpath.to_str().unwrap(), true).unwrap_err()
+    );
+    assert!(
+        cerr.contains("unknown field \"web_server.tls."),
+        "client strict: got {cerr}"
+    );
 }
 
 /// A **parent-level** serde alias beside the nested spelling of the same value
@@ -6437,9 +7363,9 @@ fn unknown_nested_web_server_tls_key_still_names_a_parent_level_path() {
 ///
 /// **What it does not cover.** Go, which has no snake_case spelling to confuse
 /// this with (its own `certFile` alias does not exist; the key *is*
-/// `certFile`); and the mixed `[webServer]` / `[web_server]` section pair, whose
-/// pre-existing whole-table discard is qualified on
-/// `normalize_web_server_section` and filed in `TODO.md`.
+/// `certFile`); and the mixed `[webServer]` / `[web_server]` section pair, which
+/// now **merges per key** instead of discarding the camelCase table whole — see
+/// `both_web_server_sections_merge_per_key_in_both_modes`.
 #[test]
 fn parent_level_alias_beside_nested_spelling_still_loads() {
     const HEADER: &str = "bind_port = 7000\ntoken = \"t\"\n";

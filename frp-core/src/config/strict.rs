@@ -557,6 +557,10 @@ fn section_known_keys(section: &str) -> Option<&'static [&'static str]> {
             "serverName",
             "custom_404_page",
             "custom404Page",
+            // The nested table survives normalization only when it holds a key
+            // `normalize_web_server_section` does not map (see its doc); the
+            // walker descends into it so the diagnostic names the true path.
+            "tls",
         ],
         "transport" => &[
             "tcp_mux",
@@ -637,7 +641,32 @@ enum Ctx {
     VisitorPlugin,
     /// One `health_check_http_headers` array element.
     HealthCheckHeader,
+    /// A `[web_server]` / `[webServer]` section (normalized to `web_server`),
+    /// so its nested `tls` table can be walked with the TLS key set.
+    WebServer,
+    /// The nested `[web_server.tls]` table, which survives normalization only
+    /// when it holds a key the hoist does not map.
+    WebServerTls,
 }
+
+/// `WebServerTlsConfig` (`frp-core/src/config/server.rs`) — the keys
+/// `check_strict` accepts inside a surviving `web_server.tls` table.
+///
+/// The hoist removes every one of them (`normalize_web_server_section`), so in
+/// practice this set exists to keep the walk well-defined rather than to accept
+/// anything: a key that reaches the walker under `tls` is by construction one
+/// the hoist did not map, and every such key is an error.
+pub(super) const WEB_SERVER_TLS_KNOWN_KEYS: &[&str] = &[
+    "enable",
+    "cert_file",
+    "certFile",
+    "key_file",
+    "keyFile",
+    "trusted_ca_file",
+    "trustedCaFile",
+    "server_name",
+    "serverName",
+];
 
 /// Key set of a nested **table** child, by the kind of table it sits in.
 ///
@@ -652,9 +681,12 @@ fn child_table_keys(ctx: Ctx, key: &str) -> Option<&'static [&'static str]> {
         Ctx::Root => section_known_keys(key),
         Ctx::ProxyElement => (key == "plugin").then_some(CLIENT_PLUGIN_KNOWN_KEYS),
         Ctx::VisitorElement => (key == "plugin").then_some(VISITOR_PLUGIN_KNOWN_KEYS),
-        Ctx::HttpPluginElement | Ctx::ProxyPlugin | Ctx::VisitorPlugin | Ctx::HealthCheckHeader => {
-            None
-        }
+        Ctx::WebServer => (key == "tls").then_some(WEB_SERVER_TLS_KNOWN_KEYS),
+        Ctx::HttpPluginElement
+        | Ctx::ProxyPlugin
+        | Ctx::VisitorPlugin
+        | Ctx::HealthCheckHeader
+        | Ctx::WebServerTls => None,
     }
 }
 
@@ -685,6 +717,8 @@ fn child_ctx(ctx: Ctx, key: &str) -> Ctx {
     match (ctx, key) {
         (Ctx::ProxyElement, "plugin") => Ctx::ProxyPlugin,
         (Ctx::VisitorElement, "plugin") => Ctx::VisitorPlugin,
+        (Ctx::Root, "web_server") => Ctx::WebServer,
+        (Ctx::WebServer, "tls") => Ctx::WebServerTls,
         _ => Ctx::Root,
     }
 }

@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
 
@@ -37,6 +38,66 @@ struct ProxyStatusEntry {
     source: Option<String>,
 }
 
+/// Cell values for [`AdminState::web_server_tls_enable_seen`].
+///
+/// `NO_BASELINE` means "no baseline yet, and the file's current state was already
+/// reported by another emitter" — the next GET then *establishes* the baseline
+/// silently instead of warning. `spawn_admin_server` seeds the cell from the file
+/// so this only happens when the file could not be read at startup, and
+/// `handle_put_config` resets it to `NO_BASELINE` after a reload has emitted.
+pub const WS_TLS_ENABLE_NO_BASELINE: u8 = 0;
+/// The last observed answer was "the file wrote `[web_server.tls] enable`".
+pub const WS_TLS_ENABLE_WRITTEN: u8 = 1;
+/// The last observed answer was "the file did not write it".
+pub const WS_TLS_ENABLE_ABSENT: u8 = 2;
+
+/// The seed for [`AdminState::web_server_tls_enable_seen`] of a freshly spawned
+/// admin server: the answer the **startup load** just reported.
+///
+/// Seeding (rather than starting at [`WS_TLS_ENABLE_NO_BASELINE`]) is what makes
+/// the endpoint's dedup correct in both directions: a file that already wrote
+/// `[web_server.tls] enable` at startup cannot produce a second record on the
+/// first GET, and a hand-edit that *adds* the key **after the admin server has
+/// started** is still reported, because the seed recorded "absent". The window
+/// this closes is that one — an edit landing between the **startup load** and the
+/// spawn is still baselined, since the seed reads the file only at spawn. Starting
+/// at `NO_BASELINE` (the first cut) baselined the post-spawn edit silently and
+/// lost it.
+///
+/// **Read non-strictly, deliberately.** `strict = false` is the flag the admin
+/// GET's own load uses — `config_from_file` →
+/// `load_client_config_with_presence(path, false)`, the load this cell
+/// deduplicates — and it is the safe direction for a seed, because a *stricter*
+/// parse than the runtime's would fail on a file the runtime accepted (any
+/// unknown field, under `--strict-config=false`), leave `NO_BASELINE`, and
+/// silently baseline the next edit. The other emitters this cell shadows are
+/// **not** all non-strict: the startup load passes the CLI's `--strict-config`
+/// (`frpc/src/main.rs`, the `-c`/`--config-dir` branches) and the reload passes
+/// its caller's flag — `Service::reload_from_sources(config_path, strict)`
+/// (`frp-client/src/service.rs`), called with `false` by `request_reload()` (the
+/// SIGUSR1 path), with `true` by `handle_put_config` (the admin PUT), and with
+/// the query/body value (default `false`) by `handle_reload`. Seeding is
+/// therefore deliberately *looser* than some of them, never stricter. Pinned by
+/// `frpc/tests/admin_config_get_warning.rs`'s `seed_reads_the_file_non_strictly`,
+/// which is red when this flag is flipped.
+///
+/// Best-effort by design: no path, or a file that cannot be read or parsed,
+/// yields [`WS_TLS_ENABLE_NO_BASELINE`] and the first GET then baselines
+/// silently — the same behaviour the endpoint had before seeding, and the right
+/// degradation for a file the admin server cannot load anyway.
+pub fn seed_web_server_tls_enable_seen(config_path: Option<&str>) -> u8 {
+    config_path
+        .and_then(|path| frp_core::config::load_client_config_with_presence(path, false).ok())
+        .map(|(_, presence)| {
+            if presence.web_server_tls_enable_set() {
+                WS_TLS_ENABLE_WRITTEN
+            } else {
+                WS_TLS_ENABLE_ABSENT
+            }
+        })
+        .unwrap_or(WS_TLS_ENABLE_NO_BASELINE)
+}
+
 #[derive(Clone)]
 pub struct AdminState {
     pub proxy_metrics: Arc<ProxyMetricsRegistry>,
@@ -47,6 +108,26 @@ pub struct AdminState {
     /// Optional file-backed store. When present, `/api/store/*` routes are
     /// registered and CRUD operations trigger a reload after persisting.
     pub store: Option<Arc<StoreSource>>,
+    /// Last answer `config_from_file` observed for "did the file write
+    /// `[web_server.tls] enable`", so the config **GET** can emit the inert-key
+    /// diagnostic once per **state change** rather than once per request.
+    ///
+    /// `0` = **no baseline yet** (and the file's current state has already been
+    /// reported by another emitter — the startup load, or the reload a PUT
+    /// triggers), `1` = observed written, `2` = observed absent. The cell is
+    /// **seeded from the file** by `seed_web_server_tls_enable_seen` when the
+    /// admin server starts, so `0` is reached only when that read failed or
+    /// right after a PUT reset it. The endpoint is
+    /// polled (`/api/proxy/{name}/config`, `/api/visitor/{name}/config`), so
+    /// warning per request would be a log flood carrying no new information,
+    /// while the fact being warned about is a property of the file, not of the
+    /// request. The first GET after a `0` **establishes** the baseline silently
+    /// (that is what stops it duplicating the startup/reload record); after that,
+    /// the record fires when the answer becomes "written", stays quiet while it
+    /// stays the same, and fires again if the file is edited to remove and then
+    /// re-add the key. `handle_put_config` resets the cell to `0` after a
+    /// successful reload for the same reason. See `config_from_file`.
+    pub web_server_tls_enable_seen: Arc<AtomicU8>,
 }
 
 #[derive(Deserialize)]
@@ -622,7 +703,47 @@ async fn handle_get_visitor_config(
     Err((StatusCode::NOT_FOUND, format!("visitor {name:?} not found")))
 }
 
-/// Load the client config from the stored config path.
+/// Load the client config from the stored config path, and deliver the inert
+/// `[web_server.tls] enable` diagnostic this path used to lose.
+///
+/// The load used to go through `load_client_config` — the silent *file* API —
+/// so when the loader stopped emitting (the record moved to each binary, after
+/// `init_logging`) this became the admin API's only silent load site: measured
+/// end to end against a real `frps`, 3 × `GET /api/proxy/main/config` added
+/// **+0** records while 3 × PUT added +3 (the PUT reaches the service reload,
+/// which emits). `load_client_config_with_presence` returns the flag and the
+/// same entry point the binaries call (`warn_inert_web_server_tls_enable`)
+/// restores it here.
+///
+/// **Once per state change, not once per request.** These two routes are
+/// *polled* — a dashboard or a script may GET the proxy config every second —
+/// so emitting per request would write an identical record forever, while the
+/// fact being warned about (`enable` was written in the file) is a property of
+/// the file, not of the request.
+///
+/// The cell on `AdminState` holds the last answer observed, and
+/// [`WS_TLS_ENABLE_NO_BASELINE`] means "no baseline yet, and the file's current
+/// state was already reported by another emitter". `spawn_admin_server` **seeds**
+/// the cell from the file at startup, so in the ordinary run the cell already
+/// holds the state the startup load reported: a file that wrote the key produces
+/// **0** extra records on the first GET, and — the point of seeding rather than
+/// starting at `NO_BASELINE` — a hand-edit that *adds* the key after the admin
+/// server has started **is** reported, because the seed recorded "absent". (An
+/// edit landing between the startup load and the spawn is baselined: the seed
+/// reads the file at spawn.)
+/// `NO_BASELINE` is therefore reached only when the config file could not be read
+/// at startup, or right after `handle_put_config` reset it (the PUT's reload has
+/// already emitted for the file it read). After the baseline, the record is
+/// emitted only when the answer becomes "written" — so editing the file to drop
+/// the key and then re-adding it warns again, and a plain per-process `once` would
+/// be wrong in the other direction.
+///
+/// The one case that is deliberately not deduplicated across emitters: a file
+/// edited *outside* the admin API (e.g. by hand, then a SIGUSR1 reload) makes the
+/// reload emit and leaves this cell on its old answer, so the next GET sees a
+/// change and emits once more. The two records are about two different loads;
+/// suppressing one would require sharing the cell with `reload_from_sources`,
+/// whose emit is per-load by design.
 fn config_from_file(
     state: &AdminState,
 ) -> Result<frp_core::config::ClientConfig, (StatusCode, String)> {
@@ -630,12 +751,26 @@ fn config_from_file(
         .config_path
         .as_ref()
         .ok_or_else(|| (StatusCode::NOT_FOUND, "no config file path stored".into()))?;
-    frp_core::config::load_client_config(path, false).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to load config: {e}"),
-        )
-    })
+    let (cfg, presence) =
+        frp_core::config::load_client_config_with_presence(path, false).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load config: {e}"),
+            )
+        })?;
+    let written = presence.web_server_tls_enable_set();
+    let previous = state.web_server_tls_enable_seen.swap(
+        if written {
+            WS_TLS_ENABLE_WRITTEN
+        } else {
+            WS_TLS_ENABLE_ABSENT
+        },
+        Ordering::Relaxed,
+    );
+    if written && previous != WS_TLS_ENABLE_NO_BASELINE && previous != WS_TLS_ENABLE_WRITTEN {
+        presence.warn_inert_web_server_tls_enable();
+    }
+    Ok(cfg)
 }
 
 async fn handle_put_config(
@@ -690,10 +825,17 @@ async fn handle_put_config(
             "failed to write config file".into(),
         ));
     }
-    // Trigger reload after config update
-    reload_and_wait(&state, true)
-        .await
-        .map(|_| "update success")
+    // Trigger reload after config update. The reload reads the file we just
+    // wrote and emits the inert-`enable` record for it, so drop the config
+    // GET's baseline: the next GET re-establishes it silently instead of
+    // repeating the reload's record. See `config_from_file`.
+    let result = reload_and_wait(&state, true).await;
+    if result.is_ok() {
+        state
+            .web_server_tls_enable_seen
+            .store(WS_TLS_ENABLE_NO_BASELINE, Ordering::Relaxed);
+    }
+    result.map(|_| "update success")
 }
 
 // --- Local TlsListener (moved from frp-core to avoid axum in core) ---
@@ -1616,6 +1758,7 @@ passwd = "socks-pass"
             stop_tx,
             config_path: None,
             store: Some(store),
+            web_server_tls_enable_seen: Arc::new(AtomicU8::new(0)),
         };
         (state, reload_rx)
     }
@@ -1781,5 +1924,196 @@ passwd = "socks-pass"
             !vj_str.contains("visitor-secret-key"),
             "visitor secret leaked into config JSON: {vj_str}"
         );
+    }
+
+    /// Records `tracing` output into a shared buffer, the pattern
+    /// `frp-core/tests/web_server_tls_enable_warning.rs` uses.
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The admin API's config **GET** delivers the inert
+    /// `[web_server.tls] enable` diagnostic, **once per state change** rather
+    /// than once per request.
+    ///
+    /// `config_from_file` is the function both GET handlers call
+    /// (`handle_get_proxy_config`, `handle_get_visitor_config`) on every
+    /// request. Before this change it loaded through the silent
+    /// `load_client_config`, so the record the loader used to emit was simply
+    /// gone on this path; measured end to end against a real `frps`, three GETs
+    /// added **+0** records while three PUTs added +3 (the PUT triggers the
+    /// service reload, which emits). See `config_from_file`'s doc for why the
+    /// emission is deduplicated: the route is polled, and the fact is a
+    /// property of the file, not of the request.
+    ///
+    /// **What this models.** The seed plus the whole cell protocol, in order.
+    /// `seed_web_server_tls_enable_seen` (what `spawn_admin_server` calls) maps a
+    /// real file to `WRITTEN` / `ABSENT`, and a missing path or unreadable file
+    /// to `NO_BASELINE`. Then, against the shipped `config_from_file`:
+    ///
+    /// * seeded **`ABSENT`** (the file had no key at startup) with a file that
+    ///   still has none → 0 records; and, the case the seed exists for, a
+    ///   **hand-edit that adds the key** before the first GET → **1** record (the
+    ///   previous `NO_BASELINE` start lost it). The cell is set to `ABSENT` here
+    ///   **explicitly**, i.e. this models the window *after the admin server has
+    ///   started*; an edit landing before the spawn would have seeded `WRITTEN`
+    ///   and is baselined — see `seed_web_server_tls_enable_seen`'s doc;
+    /// * seeded **`WRITTEN`** (the file already had the key at startup) with the
+    ///   key still there, three GETs → **0** (the startup record is not repeated);
+    ///   the file rewritten without the key → 0; rewritten with it → **1**; polled
+    ///   three more times → **1** (no per-poll flood);
+    /// * seeded **`NO_BASELINE`** (the seed's failure mode, and what
+    ///   `handle_put_config` resets to) with the key present → the first GET
+    ///   baselines silently → **0**, and a later add → **1**.
+    ///
+    /// The config itself is asserted to load in every case, so the emission
+    /// cannot have replaced the return value.
+    ///
+    /// **What it does not cover.** The HTTP layer itself (routing, auth,
+    /// status codes) — other tests in this module cover the router, and the
+    /// handler's use of `config_from_file` is a one-line call; the call to the
+    /// seed from `spawn_admin_server` (this pins the seed function and the cell
+    /// separately — the wiring is one line and needs a whole `Service` to
+    /// exercise); a real PUT + reload round trip (the reset is asserted
+    /// directly, and `handle_put_config` is the only caller of the reset); a file
+    /// edited *outside* the admin API with a reload triggered by something else,
+    /// which deliberately emits twice (the reload's per-load record plus the
+    /// GET's state-change record — see `config_from_file`); the exact poll
+    /// cadence of any particular client; and the equivalent **server** admin
+    /// paths, of which there are none (this is a client-only API).
+    #[test]
+    fn admin_config_get_warns_once_per_state_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.toml");
+        let with_key = "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\n\
+                        [web_server]\nport = 7400\n[web_server.tls]\nenable = true\n";
+        let without_key = "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\n\
+                           [web_server]\nport = 7400\n";
+
+        let (mut state, _reload_rx) = test_state();
+        state.config_path = Some(path.to_str().unwrap().to_string());
+
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_writer({
+                let output = output.clone();
+                move || CapturedLogs(output.clone())
+            })
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let records = |output: &Arc<std::sync::Mutex<Vec<u8>>>| {
+            String::from_utf8(output.lock().unwrap().clone())
+                .unwrap()
+                .matches("web_server.tls.enable has no effect")
+                .count()
+        };
+        let get = |state: &AdminState| {
+            let cfg = config_from_file(state).expect("the GET load must succeed");
+            assert_eq!(cfg.web_server.port, 7400);
+        };
+        let seed = |state: &AdminState| {
+            let value = seed_web_server_tls_enable_seen(state.config_path.as_deref());
+            state
+                .web_server_tls_enable_seen
+                .store(value, std::sync::atomic::Ordering::Relaxed);
+            value
+        };
+
+        // The seed itself: the answer the startup load reported, or `NO_BASELINE`
+        // when there is nothing to read.
+        std::fs::write(&path, with_key).unwrap();
+        assert_eq!(
+            seed_web_server_tls_enable_seen(Some(path.to_str().unwrap())),
+            WS_TLS_ENABLE_WRITTEN
+        );
+        std::fs::write(&path, without_key).unwrap();
+        assert_eq!(
+            seed_web_server_tls_enable_seen(Some(path.to_str().unwrap())),
+            WS_TLS_ENABLE_ABSENT
+        );
+        assert_eq!(
+            seed_web_server_tls_enable_seen(None),
+            WS_TLS_ENABLE_NO_BASELINE
+        );
+        assert_eq!(
+            seed_web_server_tls_enable_seen(Some(
+                dir.path().join("missing.toml").to_str().unwrap()
+            )),
+            WS_TLS_ENABLE_NO_BASELINE
+        );
+
+        // Seeded ABSENT, file still without the key: silent.
+        assert_eq!(seed(&state), WS_TLS_ENABLE_ABSENT);
+        get(&state);
+        assert_eq!(records(&output), 0);
+
+        // The hand-edit window: the key is added after the admin server started,
+        // before the next GET. The seed recorded "absent", so this is a real
+        // state change. (An edit before the spawn would be baselined — see the
+        // seed's doc.)
+        std::fs::write(&path, with_key).unwrap();
+        get(&state);
+        assert_eq!(
+            records(&output),
+            1,
+            "a hand-edit that adds the key after the seed is reported"
+        );
+
+        // Seeded WRITTEN, file with the key: the startup record is not repeated,
+        // even over three polls.
+        std::fs::write(&path, with_key).unwrap();
+        assert_eq!(seed(&state), WS_TLS_ENABLE_WRITTEN);
+        for _ in 0..3 {
+            get(&state);
+        }
+        assert_eq!(
+            records(&output),
+            1,
+            "no second record for the startup state"
+        );
+
+        // The answer changes to "absent": no record, and the baseline moves.
+        std::fs::write(&path, without_key).unwrap();
+        get(&state);
+        assert_eq!(records(&output), 1, "a change to `absent` is not a warning");
+
+        // …and back: the state change warns, once.
+        std::fs::write(&path, with_key).unwrap();
+        get(&state);
+        assert_eq!(records(&output), 2, "re-adding the key warns again");
+        for _ in 0..3 {
+            get(&state);
+        }
+        assert_eq!(records(&output), 2, "no per-poll flood");
+
+        // `NO_BASELINE` — the seed's failure mode, and what `handle_put_config`
+        // resets to after the reload has emitted: the next GET baselines
+        // silently, and a later add still warns.
+        state.web_server_tls_enable_seen.store(
+            WS_TLS_ENABLE_NO_BASELINE,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        get(&state);
+        assert_eq!(
+            records(&output),
+            2,
+            "a GET after a PUT does not duplicate the reload's record"
+        );
+        std::fs::write(&path, without_key).unwrap();
+        get(&state);
+        std::fs::write(&path, with_key).unwrap();
+        get(&state);
+        assert_eq!(records(&output), 3, "a later add still warns");
+        drop(guard);
     }
 }

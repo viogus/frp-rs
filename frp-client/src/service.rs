@@ -4364,6 +4364,17 @@ impl Service {
                 &cfg_snapshot.web_server.addr,
                 cfg_snapshot.web_server.port,
             );
+            // Seed the admin config GET's dedup cell with the answer the startup
+            // load just reported, so a GET does not repeat that record — and, the
+            // reason it is seeded rather than left at `NO_BASELINE`, so a
+            // hand-edit that *adds* `[web_server.tls] enable` **after the admin
+            // server has started** is still reported (the seed recorded
+            // "absent"). An edit landing between the startup load and this spawn
+            // is baselined instead, because the seed reads the file only here.
+            // Best-effort: an unreadable file leaves `NO_BASELINE`, and the first
+            // GET then baselines silently. See
+            // `crate::admin::seed_web_server_tls_enable_seen`.
+            let seeded = crate::admin::seed_web_server_tls_enable_seen(self.config_file.as_deref());
             let admin_state = AdminState {
                 proxy_metrics: self.proxy_metrics.clone(),
                 proxies: self.proxy_info_map.clone(),
@@ -4371,6 +4382,7 @@ impl Service {
                 stop_tx: stop_tx.clone(),
                 config_path: self.config_file.clone(),
                 store: self.store_source.clone(),
+                web_server_tls_enable_seen: Arc::new(std::sync::atomic::AtomicU8::new(seeded)),
             };
             let admin_auth_user = cfg_snapshot.web_server.user.clone();
             let admin_auth_pwd = cfg_snapshot.web_server.password.clone();

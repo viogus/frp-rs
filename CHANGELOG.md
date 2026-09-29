@@ -403,6 +403,77 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **`[webServer]` and `[web_server]` are now the same section, merged per key.**
+  A file that wrote both used to have the camelCase table discarded **whole** —
+  so a nested `[webServer.tls]` never reached the loader and a flat
+  `[web_server] tls_cert_file` won in silence, while any key written only under
+  `[webServer]` (`user`, `port`, …) simply vanished. The two sections now merge
+  key by key, with `[web_server]` winning every key both define (the same winner
+  as before, not an inversion) and nested `tls` tables merging the same way.
+  Pinned in both loader modes, server and client, TOML and YAML.
+- **`.ini` files can use the nested `[webServer.tls]` / `[web_server.tls]`
+  section.** The INI reader stored the bracket text verbatim, so
+  `[webServer.tls]` became a top-level key named `webServer.tls`: the values were
+  dropped in non-strict mode and the file was refused with
+  `unknown field "webServer.tls"` in strict mode. A dotted header whose first
+  segment is a v1 section name (`web_server`, `auth`, `transport`, …) is now
+  expanded into nested tables, exactly as TOML/YAML/JSON write it. Two kinds of
+  section are deliberately **not** split, and both stay exactly as they were: a
+  legacy proxy section that carries a `type` key (`[auth.foo]`, `[store.frontend]`,
+  `[log.svc]`), and anything whose first segment is not a v1 root
+  (`[plugin.NAME]`). The first is needed because a legacy proxy's name is a flat,
+  user-chosen identifier — that is **Go's** `.ini` dialect, where every
+  non-`[common]` section is a proxy (`pkg/config/legacy/client.go`); frp-rs's own
+  `collect_legacy_ini_proxy_sections` additionally requires the `type` key, so a
+  typeless proxy section is dropped here (and on the base tree) where Go registers
+  it as a `tcp` proxy — a pre-existing parity gap, filed in `TODO.md` rather than
+  folded into this change. A genuine
+  conflict is reported instead of silently clobbered **when the containing section
+  comes first** (`[webServer] tls = 1` before `[webServer.tls]` → rc 1); in the
+  reverse order the later section's scalar wins and the nested table is dropped
+  with the file loading rc 0 (both orders pinned, both loader modes). The one
+  shape the expansion still cannot express is a v1 nested table that itself
+  carries `type` (a `[visitors.plugin]`-style table): it stays flat, so on the
+  client the legacy collector reads it as a proxy named after the header and
+  proxy validation refuses it. This is a frp-rs extension: Go's `.ini` path is the legacy
+  loader and never reads these sections at all.
+- **A nested `[web_server.tls]` key can no longer silently become a real
+  `[web_server]` field.** The hoist re-inserted every unmapped nested key at the
+  parent level, so `[web_server.tls] user = "nested-user"` *became* the
+  dashboard Basic Auth username — and the same for `password`, `addr`, `port`,
+  `assets_dir`, `pprof_enable`, `enable_prometheus`, `custom_404_page` and the
+  flat `tls_*` spellings. The residue now stays inside `tls`, so strict mode
+  reports it at the path the user actually wrote (`unknown field
+  "web_server.tls.user"` — previously the fabricated `web_server.user`) and
+  non-strict drops it like any other unknown key. Go refuses these keys
+  outright.
+- **A parent-level `certFile` beside the canonical `tls_cert_file` is no longer
+  a `duplicate field` error.** serde binds the camelCase name as an `alias` of
+  the canonical field, so writing both at the parent level failed to load in
+  **both** modes with `config validation error: duplicate field
+  \`tls_cert_file\``, with no nested section involved at all. The four-value
+  group is now canonicalized down to one key whenever the section is seen:
+  nested snake → nested camel → parent canonical → parent alias, first
+  non-empty wins.
+- **An empty nested TLS value no longer clears a configured certificate.**
+  `[web_server.tls] cert_file = ""` beside `[web_server] certFile = "/p.pem"`
+  loaded with `tls_cert() == ""` — the certificate was silently dropped and the
+  dashboard served plaintext HTTP, because emptiness is how these fields say
+  *disabled*. An explicitly empty nested value is now read as *unset* and falls
+  through to the flat/alias spelling; `docs/config.md` states the implemented
+  rule.
+- **The `frpc` admin API's config GET delivers the inert
+  `[web_server.tls] enable` warning again.** `config_from_file` — the load both
+  `/api/proxy/{name}/config` and `/api/visitor/{name}/config` perform on every
+  request — went through the silent file API, so three GETs added zero records
+  while three PUTs added three. It now emits, **once per state change** rather
+  than once per request: the route is polled, and the fact is a property of the
+  file, not of the request. The cell is seeded from the file when the admin server
+  starts, so the endpoint never repeats the startup record while a hand-edit that
+  adds the key **after the admin server has started** is still reported (an edit
+  landing between the startup load and the spawn is baselined — the seed reads the
+  file at spawn); a PUT's reload resets the cell, so a following GET does not
+  repeat that record either.
 - **A server config that writes `tls_enable` now says so instead of loading in
   silence.** The field is inert on the server — nothing in `frp-server` / `frps`
   reads it — so a `tls_enable = true` in `frps.toml` bought neither an effect nor
@@ -455,18 +526,19 @@ User-facing release notes for frp-rs.
   `frpc verify`, and the `frps`/`frpc` SIGUSR1 reload. Measured on
   stdout / stderr: `frps -c` 1/0, `frps --config-dir` 1/0, `frpc -c` 1/0,
   `frpc --config-dir` 1/0, the same four with the `[common]`-flattened spelling
-  1/0, `frps -c` reload +1, and 0/0 without the key. Four sites deliberately
-  get nothing: `frps verify` (its logging is never initialised), a `.ini` file
-  (the dotted section header is stored verbatim — pre-existing), a config that
-  writes `[web_server]` beside `[webServer.tls]` (the rename drops the camelCase
-  table whole, so the key never reaches the hoist), and the `frpc` admin API's
-  config GET (it loads the file on every request, so a warning there would be one
-  per poll). The admin PUT is **not** silent — it validates through the string
-  loader and then triggers a reload, which emits once per request (measured: 3
-  GETs → +0, 3 PUTs → +3, `/tmp/enable-warn-probe/run-admin-probe.sh`); the GET
-  gap is filed in `TODO.md`. The Go-parity load ordering is unchanged; only the
-  emission moved. A
-  genuinely unknown nested key is still refused, as `web_server.<key>`.
+  1/0, `frps -c` reload +1, and 0/0 without the key. The admin PUT is also not
+  silent — it validates through the string loader and then triggers a reload,
+  which emits once per request (measured: 3 GETs → +0, 3 PUTs → +3,
+  `/tmp/enable-warn-probe/run-admin-probe.sh` at the time). The Go-parity load
+  ordering is unchanged; only the emission moved. A genuinely unknown nested key
+  is still refused, named at the path the user actually wrote
+  (`web_server.tls.<key>`). The gaps this bullet originally recorded — a `.ini`
+  file, the `[web_server]` + `[webServer.tls]` pair, and the admin config GET —
+  are all closed in this release: see the `.ini`, section-merge, nested-residue
+  and admin-GET bullets above. What remains silent is `frps verify` (logging is
+  never initialised) and the `[common]`-flattened spelling when a top-level section
+  of the **same** spelling is also present (the `[common]` flatten discards that
+  one key whole; the other spelling is a different key, merges in, and does warn).
 - **An empty `--log-level` / `--log-file`, and a zero `max_days`, no longer
   silence `frps` or `frpc` — or silently switch off log retention.** Go fills
   each in `LogConfig.Complete()` (`pkg/config/v1/common.go:119-123`: empty →
