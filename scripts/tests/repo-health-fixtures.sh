@@ -90,6 +90,39 @@ if [ "$rc" -eq 3 ]; then
   bad 'the process itself exited 3 (a bare exit 3/fail=3 at top level)'
 fi
 
+# --- scenario 2: a newline in a workflow filename ---------------------------
+# The scan hands hits to bash as `C <path>:<line>:<text>` lines, so a workflow
+# whose own name contains a newline split a hit and had the fragment re-parsed
+# as a hit of its own (a fabricated `toolchain:` violation). The path must be
+# refused fail-closed: the refusal names it (sanitized), nothing in it is
+# scanned, and no forged hit is printed.
+hdr
+printf '%s\n' 'scenario 2: a workflow filename containing a newline'
+t=$(new_tree newline)
+wf="$t/.github/workflows/"$'a\nC forged.yml'
+printf 'name: probe\non: push\njobs:\n  a:\n    steps:\n      - uses: actions-rust-lang/setup-rust-toolchain@v1\n        with:\n          toolchain: 1.98.0\n' > "$wf"
+run_gate "$t"
+if printf '%s\n' "$out" | grep -q 'workflow path with a newline in its name was not scanned'; then
+  ok 'newline path: the workflow is refused by name'
+else
+  bad 'newline path: no refusal naming the workflow'
+fi
+if printf '%s\n' "$out" | grep -q 'toolchain:.*input(s)'; then
+  bad 'newline path: a forged toolchain: hit was parsed from the split line'
+else
+  ok 'newline path: no forged hit from the split path'
+fi
+if printf '%s\n' "$out" | grep -q 'toolchain input scan not evaluated'; then
+  ok 'newline path: the scan reports itself not evaluated (fail-closed)'
+else
+  bad 'newline path: the scan did not report itself not evaluated'
+fi
+if [ "$rc" -eq 1 ]; then
+  ok 'newline path: process rc is 1'
+else
+  bad "newline path: process rc is $rc (expected 1)"
+fi
+
 # ---------------------------------------------------------------- summary
 hdr
 if [ "$fail" -eq 0 ]; then

@@ -1206,6 +1206,21 @@ for dirpath, _dirs, names in os.walk('.github/workflows', onerror=walk_error,
                                      followlinks=False):
     for fn in sorted(names):
         if fn.endswith(('.yml', '.yaml')):
+            if '\n' in fn or '\r' in fn:
+                # The scan hands hits to bash as `C <path>:<line>:<text>` lines,
+                # so a newline in a workflow's own name would split a hit and the
+                # fragment would be re-parsed as a hit of its own (measured: a
+                # tracked `a<LF>C forged.yml` produced a bogus
+                # `FAIL 1 toolchain: input(s)` naming `forged.yml:5`, while the
+                # real witness was truncated). Refuse the path fail-closed rather
+                # than escape it: nothing in that file is scanned, and the gate
+                # says so.
+                state['bad'] = True
+                print('E   FAIL  workflow path with a newline in its name was not '
+                      'scanned: %s'
+                      % fn.replace('\\', '\\\\').replace('\r', '\\r')
+                           .replace('\n', '\\n'))
+                continue
             path = os.path.join(dirpath, fn)
             real = os.path.realpath(path)
             if real in seen:
