@@ -1031,7 +1031,9 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   304.7 ms after a client that slept 300 ms), so the *race* cannot flake the ubuntu lanes; but an
   **EOF is platform-independent**: a client that connects and half-closes before sending gives `n=0` →
   `/` → 404 on both (measured: 3.833 µs macOS, 1.625 µs Linux), and a **head split across writes**
-  mis-routes on both (measured on Linux: `n=16`, `path="/.well-known"` → 404 after 208 ms). The
+  mis-routes on both (measured on Linux; the elapsed figure is shape-dependent and named with its shape —
+  with the first write ~200 ms after the accept, `n=16`, `path="/.well-known"` → 404 in ~208 ms, while an
+  immediate first write gives the same `n=16` and the same mis-route in 192 µs). The
   accumulation half of the fix is therefore load-bearing on Linux too, and the fix is **not** a Linux
   no-op. (No CI incidence is claimed for either shape — that was not measured; what is measured is that
   the old code produced the same 404 on both platforms, since the failing tests are the ones that
@@ -1061,15 +1063,30 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `read_request_head_reports_eof_when_the_client_closes_before_sending` (a half-close must be a fast,
   named `Eof`),
   `read_request_head_accumulates_a_head_split_across_reads` (two split points, one cutting the
-  `\r\n\r\n` terminator in half) and `read_request_head_rejects_an_over_max_head_without_a_terminator`
-  (`TooLarge(8192)`, and fast), plus
+  `\r\n\r\n` terminator in half), `read_request_head_rejects_an_over_max_head_without_a_terminator`
+  (`TooLarge(8192)`, and fast) and `read_request_head_stops_at_the_terminator` (a pipelined tail in the
+  same read is not appended to the head), plus
   `mock_idp_answers_an_explicit_error_when_no_request_line_arrives` (500 + cause, then the accept
-  loop keeps serving) for the wait, the bound and the failure. The new pins were demonstrated red
-  against four mutants of `read_request_head`: single read with no accumulation → rc 101, exactly the
-  split and over-max pins fail while all ten other `oidc` tests (the four earlier pins included) stay
-  green; `TooLarge` guard deleted → rc 101, only the over-max pin fails (`got Eof`); terminator
-  searched only in the newly-read chunk → rc 101, only the split pin fails; and `Ok(0) => continue` →
-  rc 101, the EOF pins fail (the helper one reporting `TimedOut` instead of `Eof`). The **load
+  loop keeps serving) for the wait, the bound and the failure, and
+  `mock_idp_stops_serving_after_the_stop_signal` (`send(())` really ends the accept loop — the listener
+  is refused afterwards) with `mock_default_request_head_deadline_is_pinned` (the shipped 5 s value;
+  its end-to-end effect is deliberately not exercised, which would cost 5 s per run). The new pins were
+  demonstrated red against mutants: a single **blocking** read with the mode clear kept and no
+  accumulation or truncation → rc 101, exactly the split, over-max and terminator pins fail while all
+  **fourteen** other `oidc` tests stay green (the note said "ten" while the filter had 14 tests and
+  "twelve" while it had 17; the count moves with every pin added, so it is measured here, not carried);
+  `TooLarge` guard deleted → rc 101, only the over-max pin fails (`got Eof`); terminator
+  searched only in the newly-read chunk → rc 101, only the split pin fails; `Ok(0) => continue` →
+  rc 101, the EOF pins fail (the helper one reporting `TimedOut` instead of `Eof`); the `break` deleted
+  from the stop check → rc 101, only the stop pin fails (`the mock kept accepting connections after
+  send(())`); the deadline raised to 60 s → rc 101, only the default-deadline pin fails;
+  `buf.truncate(end + 4)` removed → rc 101, only the terminator pin fails. A broader single-read mutant
+  that *also* drops the `set_nonblocking(false)` clear reds 8 of 17 (it reaches the three `oidc_*`
+  originals, nondeterministically). Three mutants the round-3 review listed are deliberately **not**
+  pinned, because none is a one-liner:
+  removing the `remaining.is_zero()` guard (it needs a read that lands exactly on the expired budget),
+  moving the size cap ahead of the terminator search (it needs a head that crosses 8192 bytes with its
+  terminator in the crossing read), and the stop-latency gap (stated, not bounded). The **load
   sensitivity** is separate and statistical:
   **one sample on a shared host under stated ambient load, not a rate** — 50 iterations of the three
   original tests in the `frp-server` lib test binary (`--test-threads` default) failed **11/50** under

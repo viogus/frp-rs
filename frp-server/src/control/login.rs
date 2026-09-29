@@ -2201,8 +2201,11 @@ mod oidc_throttle_tests {
     /// `WouldBlock`: a client that connects and half-closes before sending gives
     /// `n=0` → the `/` fallback → 404 on **both** platforms (measured: 3.833 µs
     /// on macOS, 1.625 µs on Linux). (2) A head split across writes mis-routes,
-    /// because the single read returns only the prefix (measured on Linux:
-    /// `n=16`, `path="/.well-known"` → 404 after 208 ms). Every `ci.yml` job is
+    /// because the single read returns only the prefix (measured on Linux; the
+    /// elapsed figure is shape-dependent, so it is named with its shape — with the
+    /// first write ~200 ms after the accept, `n=16`, `path="/.well-known"` → 404
+    /// in ~208 ms, while an immediate first write gives the same `n=16` and the
+    /// same mis-route in 192 µs). Every `ci.yml` job is
     /// `ubuntu-latest`, so the *race* cannot flake CI — but those EOF and split
     /// shapes could still 404 there. What this wait does not do is depend on the
     /// inherited mode — it clears `O_NONBLOCK` explicitly — so it is correct on
@@ -2216,9 +2219,16 @@ mod oidc_throttle_tests {
     /// read). A **dropped** sender is not a stop at all: `try_recv()` returns
     /// `Err(Disconnected)`, for which `is_ok()` is false (measured), so the mock
     /// keeps serving after `_stop` is dropped — only an explicit `send(())`
-    /// breaks the loop. The bound is on the client's stall, not on stop latency;
-    /// the mock's threads are process-lifetime test scaffolding and no caller
-    /// blocks on one, so the gap is recorded rather than bounded.
+    /// breaks the loop. That explicit stop *is* pinned
+    /// (`mock_idp_stops_serving_after_the_stop_signal`). The bound is on the
+    /// client's stall, not on stop latency; the mock's threads are
+    /// process-lifetime test scaffolding and no caller blocks on one, so the gap
+    /// is recorded rather than bounded.
+    ///
+    /// The shipped 5 s value is pinned by value
+    /// (`mock_default_request_head_deadline_is_pinned`); its **end-to-end effect
+    /// is deliberately not exercised** — that would cost 5 s per run — while the
+    /// deadline *mechanism* is pinned by the 200 ms override test.
     const MOCK_REQUEST_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// Upper bound on the request head the mock buffers before giving up.
@@ -2634,6 +2644,45 @@ mod oidc_throttle_tests {
         );
     }
 
+    /// The returned head ends **at** the terminator: bytes that arrive in the same
+    /// read past it are consumed and discarded, not appended. The target is the
+    /// `buf.truncate(end + 4)` mutant, which would return the pipelined tail as
+    /// part of the head (and would hand the routing step a different path).
+    #[test]
+    fn read_request_head_stops_at_the_terminator() {
+        let (mut server, mut client) = nonblocking_accepted_pair();
+        let writer = std::thread::spawn(move || {
+            // Head plus a pipelined-looking second request, in ONE write.
+            let _ = Write::write_all(
+                &mut client,
+                b"GET /jwks HTTP/1.1\r\nHost: x\r\n\r\nGET /second HTTP/1.1\r\n\r\n",
+            );
+        });
+        let head = read_request_head(&mut server, std::time::Duration::from_secs(2))
+            .expect("a complete head must be returned");
+        writer.join().expect("writer thread did not panic");
+        assert_eq!(
+            head, "GET /jwks HTTP/1.1\r\nHost: x\r\n\r\n",
+            "the head must stop at the first CRLFCRLF, not include what follows it"
+        );
+    }
+
+    /// The **shipped** deadline is the one a stalled client in the suite meets;
+    /// every other test overrides it, so without this the constant could be raised
+    /// to 60 s with the whole suite green (a round-3 review mutant). Pinned by
+    /// value — see the constant's doc for why the end-to-end effect is not
+    /// exercised.
+    #[test]
+    fn mock_default_request_head_deadline_is_pinned() {
+        assert_eq!(
+            MOCK_REQUEST_HEAD_TIMEOUT,
+            std::time::Duration::from_secs(5),
+            "the shipped mock deadline changed: a stalled client now holds the \
+             serving thread for {MOCK_REQUEST_HEAD_TIMEOUT:?}. If deliberate, \
+             update the ledger's 5 s figures and this pin together."
+        );
+    }
+
     /// End to end: a client that connects and never sends gets an explicit
     /// `500` naming the cause — never the `/` route's silent `404 OK` — and the
     /// mock's serving thread stays usable for the next connection.
@@ -2713,6 +2762,58 @@ mod oidc_throttle_tests {
         assert!(
             waited < std::time::Duration::from_secs(2),
             "EOF must not wait out the deadline (waited {waited:?})"
+        );
+    }
+
+    /// `send(())` really does stop the accept loop: after the signal the listener
+    /// must go away, so a later connection is refused. The target is the
+    /// `M_ignore_stop` mutant (dropping the `break` in
+    /// `if stop_rx.try_recv().is_ok()`), which leaves every other `oidc` test
+    /// green — including the doc sentence that says only an explicit `send(())`
+    /// breaks the loop.
+    #[test]
+    fn mock_idp_stops_serving_after_the_stop_signal() {
+        let (issuer, stop) = oidc_mock_server();
+        let addr = issuer
+            .strip_prefix("http://")
+            .expect("issuer host")
+            .to_string();
+        // Prove the loop is alive first, so a refusal below cannot be a mock that
+        // never started.
+        let mut stream = std::net::TcpStream::connect(&addr).expect("connect mock");
+        Write::write_all(
+            &mut stream,
+            format!("GET /.well-known/openid-configuration HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .expect("send discovery request");
+        let mut resp = String::new();
+        let _ = Read::read_to_string(&mut stream, &mut resp);
+        assert!(
+            resp.lines().next().unwrap_or("").contains(" 200 "),
+            "the mock must serve before the stop, got {resp:?}"
+        );
+
+        stop.send(()).expect("send stop signal");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut refused = false;
+        while std::time::Instant::now() < deadline {
+            match std::net::TcpStream::connect(&addr) {
+                // Drop it at once so a connection that lands just before the
+                // break cannot stall the loop in a request-head wait.
+                Ok(probe) => {
+                    drop(probe);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(_) => {
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            refused,
+            "the mock kept accepting connections after send(()): the accept loop did not terminate"
         );
     }
 
