@@ -265,14 +265,25 @@ def walk_error(e):
     note('%s: %s' % (getattr(e, 'filename', '?'), e.strerror or e))
 
 
-def rs_texts(root, top_only=False):
+def rs_texts(root, top_only=False, within=None):
     """Yield the text of every `.rs` file under `root`, reading each with the
     O_NONBLOCK guard. `top_only` matches a `root/*.rs` glob (not a recursive
-    grep): only the directory's own entries. Each *real* file is yielded once
-    per call: the walk still lists a symlinked `.rs` next to its target, so
-    keying on `os.path.realpath` keeps that one source from counting twice.
+    grep): only the directory's own entries.
+
+    Two alias shapes are excluded. Each *real* file is yielded once per call,
+    keyed on `(st_dev, st_ino)` rather than on `os.path.realpath`: the walk
+    still lists a symlinked `.rs` next to its target, and `os.stat` follows the
+    link, so the inode key catches that *and* a hard link, which `realpath`
+    cannot see (measured: `ln frp-core/src/kcp/session.rs frp-core/src/zz_hard.rs`
+    inflated the unsafe-block count, `#33` measuring 22 against a doc figure of
+    21). And a file whose realpath is outside `within` (default: `root`) is
+    another scope's file, not this one's (measured:
+    `ln -s ../../frp-server/src/lib.rs frp-core/src/zz_xcrate.rs` added 24
+    files/lines to the frp-core row while staying in frp-server's own count).
+
     Callers that measure two scopes (`<crate>/src` and the whole crate dir)
-    call this once per scope, so the dedupe never crosses a scope boundary.
+    call this once per scope, so the dedupe never crosses a scope boundary; each
+    passes `within=<crate root>` so one crate's row cannot absorb another's file.
 
     A scope root that is itself a symlink yields nothing and is recorded as an
     error: `os.walk(root, ..., followlinks=False)` scandirs its own root, so
@@ -287,7 +298,22 @@ def rs_texts(root, top_only=False):
     if os.path.islink(root):
         note('%s: scope root is a symlink — not walked' % root)
         return
+    within_real = os.path.realpath(within if within else root)
     seen = set()
+
+    def fresh(path):
+        # None = not this scope's file; otherwise the inode identity to dedupe
+        # on (falling back to the resolved path when the file cannot be stat'd,
+        # e.g. a broken symlink).
+        real = os.path.realpath(path)
+        if not real.startswith(within_real + os.sep):
+            return None
+        try:
+            st = os.stat(path)
+        except OSError:
+            return real
+        return (st.st_dev, st.st_ino)
+
     if top_only:
         try:
             names = sorted(os.listdir(root))
@@ -297,18 +323,18 @@ def rs_texts(root, top_only=False):
         for fn in names:
             if fn.endswith('.rs'):
                 path = os.path.join(root, fn)
-                real = os.path.realpath(path)
-                if real not in seen:
-                    seen.add(real)
+                key = fresh(path)
+                if key is not None and key not in seen:
+                    seen.add(key)
                     yield path
         return
     for dirpath, _dirs, names in os.walk(root, onerror=walk_error, followlinks=False):
         for fn in names:
             if fn.endswith('.rs'):
                 path = os.path.join(dirpath, fn)
-                real = os.path.realpath(path)
-                if real not in seen:
-                    seen.add(real)
+                key = fresh(path)
+                if key is not None and key not in seen:
+                    seen.add(key)
                     yield path
 
 
@@ -326,7 +352,7 @@ for crate in CRATES:
     # then, being outside `src/`, attribute it to no scope at all.
     if not os.path.isdir(crate):
         continue
-    for p in rs_texts(os.path.join(crate, 'src')):
+    for p in rs_texts(os.path.join(crate, 'src'), within=crate):
         try:
             text = safe_read(p)
         except OSError as e:
@@ -336,7 +362,7 @@ for crate in CRATES:
         lines[crate] += text.count('\n')
         if crate in safety:
             safety[crate] += text.count('// SAFETY')
-    for p in rs_texts(crate):
+    for p in rs_texts(crate, within=crate):
         try:
             text = safe_read(p)
         except OSError as e:
@@ -350,7 +376,8 @@ for crate in CRATES:
             testfiles += 1
 
 srvtest = 0
-for p in rs_texts(os.path.join('frp-server', 'tests'), top_only=True):
+for p in rs_texts(os.path.join('frp-server', 'tests'), top_only=True,
+                  within='frp-server'):
     try:
         text = safe_read(p)
     except OSError as e:
@@ -527,15 +554,26 @@ for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
         note('%s: scope root is a symlink — not walked' % src)
         continue
     blocks = fns = impls = 0
-    seen = set()   # a symlinked `.rs` is its target: count the real file once
+    seen = set()
+    # Dedupe on the inode (a symlink and a hard link to one source share it;
+    # `realpath` misses the hard link) and keep this crate's row to files whose
+    # realpath is inside the crate, so a cross-crate symlink is not counted here.
+    within_real = os.path.realpath(crate)
     for root, _d, files in os.walk(src, onerror=walk_error):
         for fn in files:
             if fn.endswith('.rs'):
                 path = os.path.join(root, fn)
                 real = os.path.realpath(path)
-                if real in seen:
+                if not real.startswith(within_real + os.sep):
                     continue
-                seen.add(real)
+                try:
+                    st = os.stat(path)
+                    key = (st.st_dev, st.st_ino)
+                except OSError:
+                    key = real
+                if key in seen:
+                    continue
+                seen.add(key)
                 try:
                     text = code_only(safe_read(path))
                 except OSError as e:
@@ -650,16 +688,25 @@ for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
         # rather than scan (and justify) whatever crate it points at.
         note('%s: scope root is a symlink — not walked' % src)
         continue
-    seen = set()   # a symlinked `.rs` is its target: scan the real file once
+    seen = set()
+    # Inode dedupe + own-crate scope, as in the unsafe-count walks above.
+    within_real = os.path.realpath(crate)
     for root, _dirs, files in os.walk(src, onerror=walk_error):
         for fn in files:
             if not fn.endswith('.rs'):
                 continue
             path = os.path.join(root, fn)
             real = os.path.realpath(path)
-            if real in seen:
+            if not real.startswith(within_real + os.sep):
                 continue
-            seen.add(real)
+            try:
+                st = os.stat(path)
+                key = (st.st_dev, st.st_ino)
+            except OSError:
+                key = real
+            if key in seen:
+                continue
+            seen.add(key)
             try:
                 raw = safe_read(path)
             except OSError as e:
@@ -2155,15 +2202,25 @@ def unsafe_counts(crate):
         # directory that is present.
         raise PartialTree(src, detail='%s is a symlink (scope root refused)' % src)
     blocks = fns = impls = n_rs = 0
-    seen = set()   # a symlinked `.rs` is its target: count the real file once
+    seen = set()
+    # Inode dedupe (`realpath` misses a hard link to the same source) + this
+    # crate's own scope, so a cross-crate symlink is another crate's file.
+    within_real = os.path.realpath(crate)
     for root, _d, files in os.walk(src, onerror=walk_error):
         for fn in files:
             if fn.endswith('.rs'):
                 path = os.path.join(root, fn)
                 real = os.path.realpath(path)
-                if real in seen:
+                if not real.startswith(within_real + os.sep):
                     continue
-                seen.add(real)
+                try:
+                    st = os.stat(path)
+                    key = (st.st_dev, st.st_ino)
+                except OSError:
+                    key = real
+                if key in seen:
+                    continue
+                seen.add(key)
                 n_rs += 1
                 text = code_only(read_required(path, errors='ignore'))
                 blocks += len(re.findall(r'unsafe\s*\{', text))
