@@ -64,14 +64,22 @@ pub const WS_TLS_ENABLE_ABSENT: u8 = 2;
 /// at `NO_BASELINE` (the first cut) baselined the post-spawn edit silently and
 /// lost it.
 ///
-/// **Read non-strictly, deliberately.** `strict = false` matches the two loads
-/// whose record the seed stands in for: the admin GET itself
-/// (`config_from_file` → `load_client_config_with_presence(path, false)`) and the
-/// service reload (`load_client_config(&path, false)`). Parsing strictly would
-/// make the seed fail on a file the runtime accepts — any unknown field, under
-/// `--strict-config=false` — leaving `NO_BASELINE` and silently baselining the
-/// next edit. Pinned by `frpc/tests/admin_config_get_warning.rs`'s
-/// `seed_reads_the_file_non_strictly`, which is red when this flag is flipped.
+/// **Read non-strictly, deliberately.** `strict = false` is the flag the admin
+/// GET's own load uses — `config_from_file` →
+/// `load_client_config_with_presence(path, false)`, the load this cell
+/// deduplicates — and it is the safe direction for a seed, because a *stricter*
+/// parse than the runtime's would fail on a file the runtime accepted (any
+/// unknown field, under `--strict-config=false`), leave `NO_BASELINE`, and
+/// silently baseline the next edit. The other emitters this cell shadows are
+/// **not** all non-strict: the startup load passes the CLI's `--strict-config`
+/// (`frpc/src/main.rs`, the `-c`/`--config-dir` branches) and the reload passes
+/// its caller's flag — `Service::reload_from_sources(config_path, strict)`
+/// (`frp-client/src/service.rs`), called with `false` by `request_reload()` (the
+/// SIGUSR1 path), with `true` by `handle_put_config` (the admin PUT), and with
+/// the query/body value (default `false`) by `handle_reload`. Seeding is
+/// therefore deliberately *looser* than some of them, never stricter. Pinned by
+/// `frpc/tests/admin_config_get_warning.rs`'s `seed_reads_the_file_non_strictly`,
+/// which is red when this flag is flipped.
 ///
 /// Best-effort by design: no path, or a file that cannot be read or parsed,
 /// yields [`WS_TLS_ENABLE_NO_BASELINE`] and the first GET then baselines
@@ -1954,7 +1962,10 @@ passwd = "socks-pass"
     /// * seeded **`ABSENT`** (the file had no key at startup) with a file that
     ///   still has none → 0 records; and, the case the seed exists for, a
     ///   **hand-edit that adds the key** before the first GET → **1** record (the
-    ///   previous `NO_BASELINE` start lost it);
+    ///   previous `NO_BASELINE` start lost it). The cell is set to `ABSENT` here
+    ///   **explicitly**, i.e. this models the window *after the admin server has
+    ///   started*; an edit landing before the spawn would have seeded `WRITTEN`
+    ///   and is baselined — see `seed_web_server_tls_enable_seen`'s doc;
     /// * seeded **`WRITTEN`** (the file already had the key at startup) with the
     ///   key still there, three GETs → **0** (the startup record is not repeated);
     ///   the file rewritten without the key → 0; rewritten with it → **1**; polled

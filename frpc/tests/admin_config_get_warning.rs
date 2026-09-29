@@ -42,8 +42,12 @@
 //! `frp-core/tests/web_server_tls_enable_warning.rs`), the PUT path's cell reset
 //! (in-process, `admin_config_get_warns_once_per_state_change`), the admin API's
 //! routing/auth/status codes (`frpc/tests/admin_cli.rs`), and the seed's
-//! failure mode (asserted in-process). It also does not pin the *cadence* of any
-//! particular poller beyond "three GETs add nothing".
+//! **failure-mode mapping** — that a missing path or an unreadable file yields
+//! `NO_BASELINE` rather than `ABSENT` is asserted in-process by that same test's
+//! two `seed_web_server_tls_enable_seen(…) == WS_TLS_ENABLE_NO_BASELINE` cases
+//! (`None`, and a path that does not exist), which are red if `.unwrap_or` maps
+//! to `ABSENT`; this target only ever exercises readable files. It also does not
+//! pin the *cadence* of any particular poller beyond "three GETs add nothing".
 //!
 //! Bounded: every wait has a deadline, every child is killed and reaped by
 //! [`ChildGuard::drop`] even on panic, and each test picks its own ports from the
@@ -412,4 +416,63 @@ fn seed_reads_the_file_non_strictly() {
     assert!(response.contains("HTTP/1."), "the route must answer");
 
     child.assert_records(1, "the seed must have read the non-strict file");
+}
+
+/// The seed reads the file with the **loader**, not with a raw top-level parse of
+/// the TOML.
+///
+/// That distinction is invisible to the rows above: a seed that only looked at
+/// `web_server.tls.enable` / `webServer.tls.enable` **at the top level** passes
+/// them all, while the shipped dedup breaks for the two shapes here — the key
+/// arrives through the `[common]` flatten and the per-key section merge, or
+/// through an `includes` file, and only the loader resolves either. Measured on
+/// the shipped binary before this row existed: both shapes emit **1** record at
+/// 0 GETs and still **1** after 3.
+///
+/// Each sub-case asserts the no-duplicate property: the file wrote the key (so
+/// the startup load emits one record — asserted first, which is also what proves
+/// the shape reached the loader), then three admin GETs add **nothing**. A
+/// raw-parse seed records `ABSENT`, so the first GET sees a state change and
+/// emits a second record, and the total is 2 — red.
+///
+/// **What this does not cover.** The presence detector's own spelling matrix
+/// (pinned in `frp-core/tests/web_server_tls_enable_warning.rs`, which measures
+/// each `[common]`/cross-spelling row directly, and by
+/// `common_and_includes_spellings_set_the_flag`); this row only proves the seed
+/// goes through the same loader the detector does.
+#[test]
+fn seed_resolves_spellings_only_the_loader_does() {
+    // (a) `[common.webServer.tls] enable` beside a top-level `[web_server]`: the
+    //     `[common]` flatten lifts `webServer` and the per-key merge folds its
+    //     `tls` table into `web_server.tls`.
+    let dir = TempDir::new("loader-common");
+    let admin_port = free_port();
+    let cfg = dir.write(
+        "frpc.toml",
+        &frpc_config(admin_port, "[common.webServer.tls]\nenable = true\n"),
+    );
+    let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()]);
+    child.assert_records(1, "(a) the startup record for the [common] spelling");
+    for _ in 0..3 {
+        let response = admin_get(admin_port, "(a) common spelling");
+        assert!(response.contains("HTTP/1."), "the route must answer");
+    }
+    child.assert_records(1, "(a) three GETs over the [common] spelling");
+
+    // (b) The same key in an `includes` file, which `process_includes`
+    //     deep-merges before the detector runs.
+    let dir = TempDir::new("loader-includes");
+    let admin_port = free_port();
+    let cfg = dir.write(
+        "frpc.toml",
+        &format!("includes = [\"inc.toml\"]\n{}", frpc_config(admin_port, "")),
+    );
+    dir.write("inc.toml", "[common.webServer.tls]\nenable = true\n");
+    let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()]);
+    child.assert_records(1, "(b) the startup record for the includes spelling");
+    for _ in 0..3 {
+        let response = admin_get(admin_port, "(b) includes spelling");
+        assert!(response.contains("HTTP/1."), "the route must answer");
+    }
+    child.assert_records(1, "(b) three GETs over the includes spelling");
 }

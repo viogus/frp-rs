@@ -587,8 +587,15 @@ jobs:
         # to an empty binary and this step would guard nothing, which is why the
         # count is asserted rather than trusted. `FRPC_BIN` overrides the binary
         # it spawns, which is how the mutant runs are made (measured:
-        # `AtomicU8::new(0)` and `strict = true` each red exactly the rows named
-        # in the file's doc).
+        # `AtomicU8::new(0)`, `strict = true` and a raw top-level parse each red
+        # exactly the rows named in the file's doc).
+        #
+        # The `set -eo pipefail` + `status=` shape is copied verbatim from the two
+        # sibling warning-delivery steps, including its one wrinkle: when the test
+        # itself fails, `pipefail` aborts the shell at the `tee` pipeline and the
+        # `status=` diagnostics below never print — the step still fails (correctly)
+        # on the test's own output. Kept identical on purpose, so the three guards
+        # stay one shape to read and to change.
         shell: bash
         run: |
           set -eo pipefail
@@ -598,21 +605,21 @@ jobs:
           n=$(cargo test -p frpc --features admin --test admin_config_get_warning --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/admin_config_get_warning.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 3 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "3" ] || status=1
+          grep -q "test result: ok. 4 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "4" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frpc admin config-GET guard failed (status=$status, file=$n, log=$log)"
-            if [ -n "$n" ] && [ "$n" != "3" ]; then
-              if [ "$n" -lt "3" ]; then
-                echo "::error::frpc/tests/admin_config_get_warning.rs lists $n tests, this step expects 3 — tests were deleted or the file is not being run with --features admin; restore them rather than lowering this literal"
+            if [ -n "$n" ] && [ "$n" != "4" ]; then
+              if [ "$n" -lt "4" ]; then
+                echo "::error::frpc/tests/admin_config_get_warning.rs lists $n tests, this step expects 4 — tests were deleted or the file is not being run with --features admin; restore them rather than lowering this literal"
               else
-                echo "::error::frpc/tests/admin_config_get_warning.rs lists $n tests, this step expects 3: move the single literal in this shell step from 3 to $n"
+                echo "::error::frpc/tests/admin_config_get_warning.rs lists $n tests, this step expects 4: move the single literal in this shell step from 4 to $n"
               fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frpc admin config-GET guard ok: $n tests listed (expected 3), 0 failed"
+          echo "frpc admin config-GET guard ok: $n tests listed (expected 4), 0 failed"
       - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
         # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag
         # exit-code fix has to hold in the no-default-features build too — but

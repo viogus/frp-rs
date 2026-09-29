@@ -6246,7 +6246,8 @@ section; ledger now **24 open / 104 closed**.**
   binaries, and `docs/config.md`/`CHANGELOG.md` now state the limitation instead of overstating the
   diagnostic.
   Done: `ConfigPresence` gained `web_server_tls_enable_set`, read from the **pre-normalization** value
-  (the nested `tls` table is removed before serde, so the flag could not be recovered afterwards) and
+  (the nested `tls` table's mapped keys — `enable` included — are removed before serde, so the flag
+  could not be recovered afterwards) and
   surfaced by `load_server_config_uncompleted_with_presence` /
   `load_client_config_with_presence`. The loader no longer emits the record at all — one owner — and
   each binary warns once from `ConfigPresence::warn_inert_web_server_tls_enable` **after** its own

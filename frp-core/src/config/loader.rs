@@ -249,7 +249,10 @@ pub struct ConfigPresence {
 /// change**, not per request. Its `AdminState` cell is seeded from the file at
 /// admin-server startup, so a file that already wrote the key produces **0**
 /// extra records on the first GET (the startup load's record is not repeated) and
-/// only a later edit that adds the key emits. The one site that stays silent is
+/// only a later edit that adds the key emits — where "later" means after the
+/// admin server has started: an edit landing between the startup load and the
+/// spawn is baselined, because the seed reads the file at spawn. The one site
+/// that stays silent is
 /// the one with no sink at all: `frps verify` (it never installs a subscriber),
 /// which is why its one-line output stays one line.
 pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING: &str = "web_server.tls.enable has no \

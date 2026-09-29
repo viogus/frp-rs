@@ -4367,8 +4367,10 @@ impl Service {
             // Seed the admin config GET's dedup cell with the answer the startup
             // load just reported, so a GET does not repeat that record — and, the
             // reason it is seeded rather than left at `NO_BASELINE`, so a
-            // hand-edit that *adds* `[web_server.tls] enable` between startup and
-            // the first GET is still reported (the seed recorded "absent").
+            // hand-edit that *adds* `[web_server.tls] enable` **after the admin
+            // server has started** is still reported (the seed recorded
+            // "absent"). An edit landing between the startup load and this spawn
+            // is baselined instead, because the seed reads the file only here.
             // Best-effort: an unreadable file leaves `NO_BASELINE`, and the first
             // GET then baselines silently. See
             // `crate::admin::seed_web_server_tls_enable_seen`.
