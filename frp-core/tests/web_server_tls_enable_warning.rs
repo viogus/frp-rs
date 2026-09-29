@@ -330,7 +330,10 @@ fn common_and_includes_spellings_set_the_flag() {
 
     // Precedence: a top-level `[web_server]` makes the flatten discard
     // `common.web_server` whole, so this shape is inert *and* unflagged — the
-    // detector must not report a key the loader dropped.
+    // detector must not report a key the loader dropped. Only the **same**
+    // spelling is discarded: the two cross-spelling rows below keep the key and
+    // do warn, because `web_server` and `webServer` are different keys to the
+    // flatten and merge afterwards.
     let c = load_capturing(
         "bind_port = 7000\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
          [common.web_server.tls]\nenable = true\n",
@@ -341,6 +344,30 @@ fn common_and_includes_spellings_set_the_flag() {
         "a top-level `[web_server]` makes the flatten drop `common.web_server` whole"
     );
     assert_eq!(c.warning_records, 0);
+
+    // Cross-spelling: the `[common]` section keeps its own spelling, the
+    // top-level one is the other spelling, and the merge finds the key.
+    let c = load_capturing(
+        "bind_port = 7000\n[webServer]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [common.web_server.tls]\nenable = true\n",
+        false,
+    );
+    assert!(
+        c.presence.web_server_tls_enable_set(),
+        "`[common.web_server.tls] enable` beside a top-level `[webServer]` is not discarded"
+    );
+    assert_eq!(c.warning_records, 1);
+
+    let c = load_capturing(
+        "bind_port = 7000\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [common.webServer.tls]\nenable = true\n",
+        false,
+    );
+    assert!(
+        c.presence.web_server_tls_enable_set(),
+        "`[common.webServer.tls] enable` beside a top-level `[web_server]` is not discarded"
+    );
+    assert_eq!(c.warning_records, 1);
 }
 
 /// The flag's detector reproduces the normalizers' section resolution:
@@ -395,6 +422,38 @@ fn both_sections_present_the_flag_follows_the_merge() {
     assert_eq!(c.cert, "/snake.pem");
     assert!(!c.presence.web_server_tls_enable_set());
     assert_eq!(c.warning_records, 0);
+
+    // A `web_server.tls` that is present but **not a table**: `or_insert_deep`
+    // drops the camelCase `tls` sub-table whole, so the `enable` inside it never
+    // reaches the removal site and the flag must stay unset. Without the
+    // matching arm the detector claimed a key the loader had dropped (measured
+    // on the frozen tree: 1 record, both modes all-default).
+    let c = load_capturing(
+        "bind_port = 7000\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\ntls = \"scalar\"\n\
+         [webServer.tls]\nenable = true\n",
+        false,
+    );
+    assert!(
+        !c.presence.web_server_tls_enable_set(),
+        "the scalar `web_server.tls` makes the merge drop the camelCase `tls` table"
+    );
+    assert_eq!(c.warning_records, 0);
+    assert_eq!(c.cert, "", "and the loader really did drop it");
+
+    // The mirror image: a real snake table with no `enable` still receives the
+    // camelCase `tls` table's keys (the merge recurses into tables both sides
+    // define), so `enable` reaches the removal site and does warn.
+    let c = load_capturing(
+        "bind_port = 7000\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
+         [web_server.tls]\ncert_file = \"/snake.pem\"\n[webServer.tls]\nenable = true\n",
+        false,
+    );
+    assert!(
+        c.presence.web_server_tls_enable_set(),
+        "the camelCase `tls` table merges into the snake one"
+    );
+    assert_eq!(c.warning_records, 1);
+    assert_eq!(c.cert, "/snake.pem");
 }
 
 /// The **string** loader is silent too, and does not surface the flag at all.

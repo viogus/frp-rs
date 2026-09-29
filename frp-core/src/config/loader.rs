@@ -310,17 +310,28 @@ impl ConfigPresence {
     ///
     /// 1. `[common]`'s flatten is `table.entry(k).or_insert(v)`, so a top-level
     ///    key wins over the `[common]` one **whole** — for each of
-    ///    `web_server` and `webServer` independently;
+    ///    `web_server` and `webServer` independently. Only the *same* spelling
+    ///    is discarded: `[common.web_server.tls] enable` beside a top-level
+    ///    `[webServer]` still warns (measured 1, both binaries), because the
+    ///    two spellings are different keys to the flatten and merge afterwards;
     /// 2. the surviving `webServer` is then **merged per key** into the
     ///    surviving `web_server` (`merge_section_into`), with the snake_case
     ///    section winning each key it defines and nested tables merging
     ///    recursively.
     ///
-    /// So `enable` counts when the effective `web_server` table carries it
-    /// *or* the effective `webServer` table does — except when `web_server` is
-    /// present but is not a table, in which case `webServer` is dropped whole
-    /// and cannot contribute. (A present-but-not-a-table section stops the
-    /// normalizers too, exactly as the old whole-table `or_insert` did.)
+    /// So `enable` counts when the effective `web_server.tls` table carries it
+    /// *or* the effective `webServer.tls` table does — with the same two
+    /// structural exceptions the merge has:
+    ///
+    /// * `web_server` present but **not a table**: `webServer` is dropped whole
+    ///   by `merge_section_into` and cannot contribute;
+    /// * `web_server` a table whose `tls` key is present but **not a table**:
+    ///   `or_insert_deep` drops the camelCase `tls` sub-table, so only the
+    ///   (non-table) primary counts — nothing. Without this arm the detector
+    ///   claimed a key the loader had dropped (`[web_server] tls = "scalar"`
+    ///   beside `[webServer.tls] enable = true` emitted 1 record while both
+    ///   modes loaded all-default), which is exactly the invariant this function
+    ///   exists to keep.
     ///
     /// `.ini` matches: the INI reader expands a dotted section header into
     /// nested tables before this runs (`ini_to_toml` in
@@ -334,22 +345,30 @@ impl ConfigPresence {
         let pick = |key: &str| -> Option<&toml::Value> {
             table.get(key).or_else(|| common.and_then(|c| c.get(key)))
         };
-        let has_enable = |section: Option<&toml::Value>| -> bool {
+        /// The `tls` value of a candidate section, whatever its type.
+        fn tls_of(section: Option<&toml::Value>) -> Option<&toml::Value> {
             section
                 .and_then(toml::Value::as_table)
                 .and_then(|ws| ws.get("tls"))
-                .and_then(toml::Value::as_table)
-                .is_some_and(|tls| tls.contains_key("enable"))
+        }
+        let has_enable = |tls: Option<&toml::Value>| -> bool {
+            tls.and_then(toml::Value::as_table)
+                .is_some_and(|t| t.contains_key("enable"))
         };
         let snake = pick("web_server");
         let camel = pick("webServer");
-        match snake {
+        if snake.is_some_and(|v| v.as_table().is_none()) {
             // `web_server` present but not a table: the camelCase section is
             // dropped whole by `merge_section_into`.
-            Some(v) if v.as_table().is_none() => false,
-            Some(v) => has_enable(Some(v)) || has_enable(camel),
-            None => has_enable(camel),
+            return false;
         }
+        let snake_tls = tls_of(snake);
+        if snake_tls.is_some_and(|t| t.as_table().is_none()) {
+            // `web_server.tls` present but not a table: `or_insert_deep` drops
+            // the camelCase `tls` sub-table whole.
+            return false;
+        }
+        has_enable(snake_tls) || has_enable(tls_of(camel))
     }
 
     /// Whether the loaded file wrote `[webServer.tls]` / `[web_server.tls]`

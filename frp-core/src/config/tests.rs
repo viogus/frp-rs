@@ -6061,7 +6061,7 @@ fn nested_web_server_tls_spellings_reach_the_accessor_in_both_modes() {
             ),
             "nested snake_case, {mode}: the struct's own canonical names must \
              reach the accessor, and the nested struct stays unpopulated \
-             (normalization removes the table before serde)",
+             (normalization removes the table's mapped keys before serde)",
         );
     }
 
@@ -6451,6 +6451,175 @@ fn dotted_ini_section_headers_become_nested_tables_in_both_modes() {
             err.contains("conflicts with the value already set at `webServer.tls`"),
             "strict={strict}: got {err}"
         );
+    }
+}
+
+/// The **other** direction of the `.ini` dotted-header rule: a section whose
+/// name merely *looks* like a v1 path but is a legacy **proxy name** stays a
+/// proxy.
+///
+/// In the legacy INI dialect every section other than `[common]` is a proxy, and
+/// `collect_legacy_ini_proxy_sections` decides membership by the section's own
+/// `type` key. So `[auth.foo]`, `[store.frontend]` and `[log.svc]` are proxies
+/// *named* `auth.foo` / `store.frontend` / `log.svc`, not the `foo` /
+/// `frontend` / `svc` children of an `auth` / `store` / `log` table — Go's legacy
+/// loader looks sections up by their raw name too (`pkg/config/legacy/server.go`,
+/// `section.Name()`). The first cut of the dotted-header expansion split them on
+/// the first segment alone and the proxies **silently disappeared** (measured on
+/// the real binaries: base and Go v0.71.0 register them, `proxy added:
+/// [auth.foo]`; the frozen tree registered nothing), which is the silent drop
+/// item B's Done-when forbids. `ini_section_path` therefore holds a section back
+/// when it carries `type`.
+///
+/// **What this models.** Both loader modes on a real `.ini`, for the three
+/// v1-first-segment names the reviewers probed plus a non-v1 control
+/// (`[my.proxy]`), each asserting the proxy's `type` / `local_port` /
+/// `remote_port` survive; then the expansion direction in the same file family,
+/// so one test pins both.
+///
+/// **What it does not cover.** A v1 nested table that itself carries a `type`
+/// key (a `[visitors.plugin]`-style table in an `.ini`) does not expand either —
+/// that is the cost of the discriminator, it matches the base tree (which never
+/// expanded anything), and it is stated in `docs/config.md`. A legacy proxy
+/// section **without** a `type` key is not a proxy on either tree (the collector
+/// requires `type`), so its treatment is unchanged and unpinned here.
+#[test]
+fn dotted_ini_headers_that_are_legacy_proxy_names_stay_proxies() {
+    for name in ["auth.foo", "store.frontend", "log.svc", "my.proxy"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(
+            &path,
+            format!(
+                "server_addr = 127.0.0.1\nserver_port = 7000\ntoken = t\n\
+                 [{name}]\ntype = tcp\nlocal_port = 8080\nremote_port = 9080\n"
+            ),
+        )
+        .unwrap();
+        for strict in [false, true] {
+            let cfg = load_client_config(path.to_str().unwrap(), strict)
+                .unwrap_or_else(|e| panic!("[{name}], strict={strict}: {e}"));
+            let proxy = cfg
+                .proxies
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                    "[{name}], strict={strict}: the legacy proxy section must register; got {:?}",
+                    cfg.proxies.iter().map(|p| p.name.clone()).collect::<Vec<_>>()
+                )
+                });
+            assert_eq!(proxy.proxy_type, "tcp", "[{name}], strict={strict}");
+            assert_eq!(proxy.local_port, 8080, "[{name}], strict={strict}");
+            assert_eq!(proxy.remote_port, 9080, "[{name}], strict={strict}");
+        }
+    }
+
+    // …and the v1 direction still expands: the same `auth` first segment with no
+    // `type` key is a nested table, and `[webServer.tls]` still reaches the hoist.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(
+        &path,
+        "[common]\nbind_port = 7000\n[webServer]\nport = 7500\n\
+         [webServer.tls]\ncertFile = /nested/cert.pem\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_server_config(path.to_str().unwrap(), strict).unwrap();
+        assert_eq!(
+            cfg.web_server.tls_cert(),
+            "/nested/cert.pem",
+            "strict={strict}"
+        );
+    }
+}
+
+/// A **non-table** `webServer` / `web_server` (top level or under `[common]`)
+/// must still reach serde as a type error.
+///
+/// The whole-table `or_insert` this merge replaced *moved* the value whatever its
+/// type, so serde refused it: base `frps verify` rc 1 both modes with
+/// `invalid type: string "not a table", expected struct WebServerConfig`. The
+/// first cut of `merge_section_into` matched `Value::Table` **after**
+/// `table.remove(from)`, so a non-table `webServer` was deleted instead of being
+/// carried across and both modes returned rc 0 "syntax is ok" — on the server and
+/// the client, at the top level and under `[common]`. The merge now moves the
+/// value first and only pattern-matches in the `Occupied` arm.
+///
+/// **What this models.** Both loader modes on real files, server and client, for
+/// `webServer` and `web_server` at the top level and under `[common]`, as a
+/// string and as an integer.
+///
+/// **What it does not cover.** A non-table `web_server` *beside* a camelCase
+/// table: `into` wins and `from` is dropped, which is the old `or_insert`
+/// behaviour and is pinned by `both_web_server_sections_merge_per_key_in_both_modes`
+/// only for the table case.
+#[test]
+fn non_table_web_server_section_is_still_a_type_error() {
+    let server_shapes = [
+        (
+            "webServer = string",
+            "bind_port = 7000\nwebServer = \"not a table\"\n",
+        ),
+        ("web_server = int", "bind_port = 7000\nweb_server = 5\n"),
+        (
+            "[common] webServer = string",
+            "bind_port = 7000\n[common]\nwebServer = \"not a table\"\n",
+        ),
+        (
+            "[common] web_server = int",
+            "bind_port = 7000\n[common]\nweb_server = 5\n",
+        ),
+    ];
+    for (name, body) in server_shapes {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frps.toml");
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let err = format!(
+                "{}",
+                load_server_config(path.to_str().unwrap(), strict).unwrap_err()
+            );
+            assert!(
+                err.contains("WebServerConfig"),
+                "server {name}, strict={strict}: the non-table section must reach serde: {err}"
+            );
+        }
+    }
+
+    let client_shapes = [
+        (
+            "webServer = string",
+            "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\nwebServer = \"not a table\"\n",
+        ),
+        (
+            "web_server = int",
+            "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\nweb_server = 5\n",
+        ),
+        (
+            "[common] webServer = string",
+            "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\n[common]\nwebServer = \"not a table\"\n",
+        ),
+        (
+            "[common] web_server = int",
+            "server_addr = \"127.0.0.1\"\nserver_port = 7000\ntoken = \"t\"\n[common]\nweb_server = 5\n",
+        ),
+    ];
+    for (name, body) in client_shapes {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.toml");
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let err = format!(
+                "{}",
+                load_client_config(path.to_str().unwrap(), strict).unwrap_err()
+            );
+            assert!(
+                err.contains("WebServerConfig"),
+                "client {name}, strict={strict}: the non-table section must reach serde: {err}"
+            );
+        }
     }
 }
 

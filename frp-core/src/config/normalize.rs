@@ -532,17 +532,27 @@ fn flatten_to_table(table: &mut toml::Table, keys: &[&str], target: &str, strip_
 /// A present-but-not-a-table `into` keeps winning and `from` is dropped whole,
 /// exactly as `or_insert` did — and
 /// [`ConfigPresence::web_server_tls_enable_set_in`] mirrors that.
+///
+/// The `from` value is **moved whatever its type**, which matters: the pattern
+/// that matched `Value::Table` *after* `table.remove(from)` deleted a non-table
+/// `webServer` (`webServer = "not a table"`, `= 5`, and their `[common]` forms)
+/// instead of carrying it across, so serde never got the type error the base tree
+/// produced in both loader modes (measured: base `frps verify` rc 1, `invalid
+/// type: string "not a table", expected struct WebServerConfig`; the frozen tree
+/// rc 0 "syntax is ok", server and client, top level and `[common]`). Only the
+/// `Vacant` arm can insert a non-table; the `Occupied` arm drops it, as
+/// `or_insert` did.
 fn merge_section_into(table: &mut toml::Table, from: &str, into: &str) {
     use toml::Value;
-    let Some(Value::Table(src)) = table.remove(from) else {
+    let Some(src) = table.remove(from) else {
         return;
     };
     match table.entry(into.to_string()) {
         toml::map::Entry::Vacant(slot) => {
-            slot.insert(Value::Table(src));
+            slot.insert(src);
         }
         toml::map::Entry::Occupied(mut slot) => {
-            if let Some(dst) = slot.get_mut().as_table_mut() {
+            if let (Value::Table(dst), Value::Table(src)) = (slot.get_mut(), src) {
                 or_insert_deep(dst, src);
             }
         }
