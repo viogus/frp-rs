@@ -24,24 +24,32 @@
 //! top level, `tls_enable` under `[common]` (flattened by
 //! `normalize_server_config` via `table.entry(k).or_insert(v)`, so the top-level
 //! key wins), and a literal `tls_enable` inside `[transport.tls]` — the lift
-//! renames only its four Go keys and passes everything else through unchanged
-//! (`frp-core/src/config/normalize.rs:802-809`), so that key is hoisted onto the
-//! same field. Either way the key was *written*. An `includes` file counts too:
-//! `process_includes` deep-merges before the detector runs. The camelCase
-//! `tlsEnable` never matches — it is absent from `known_server_keys()`, so the
-//! lenient loader drops it (the field keeps its `false` default, which is
+//! renames its five Go keys
+//! (`force`/`certFile`/`keyFile`/`trustedCaFile`/`serverName`, the match at
+//! `frp-core/src/config/normalize.rs:869-878`) and passes everything else through
+//! unchanged, so that key is hoisted onto the
+//! same field. Either way the key was *written*. A nested
+//! `[common.transport.tls] tls_enable` counts **only when no top-level
+//! `transport` key is written**, because `[common]`'s flatten is `or_insert` on
+//! the whole value (`frp-core/src/config/normalize.rs:652-655`) — a leading
+//! `[transport]` table discards `[common]`'s whole, so the key is dropped before
+//! the lift and the detector must stay silent (pinned by
+//! `common_transport_tls_needs_no_competing_top_level_transport`). An `includes`
+//! file counts too: `process_includes` deep-merges before the detector runs. The
+//! camelCase `tlsEnable` never matches — it is absent from `known_server_keys()`,
+//! so the lenient loader drops it (the field keeps its `false` default, which is
 //! "unrecognized", not "inert") and the strict loader refuses it.
 //!
 //! **Why a written key warns but a synthesized one does not.** The server
 //! normalizer *synthesizes* `tls_enable = true` from the legacy
 //! `[transport.tls]` section when it carries `force = true`, `certFile` or
-//! `keyFile` (`frp-core/src/config/normalize.rs:798-816`,
+//! `keyFile` (`frp-core/src/config/normalize.rs:865-884`,
 //! `table.entry("tls_enable").or_insert(…)`) — a Go-shaped input, not a user
 //! writing the frp-rs-only field. After normalization the two are
 //! indistinguishable, so `ConfigPresence::server_tls_enable_set_in` reads the
 //! **raw** value. The `[transport.tls] enable` spelling is a deliberately
 //! *unrecognized* neighbour: the *server* lift has no `"enable"` arm (only the
-//! client's does, at `frp-core/src/config/normalize.rs:1363`), so it stays a
+//! client's does, at `frp-core/src/config/normalize.rs:1429-1437`), so it stays a
 //! top-level key literally named `enable` — ignored leniently, refused strictly —
 //! and never sets `tls_enable` at all. Every case is pinned below.
 //!
@@ -181,12 +189,17 @@ fn subscriber_for(
 }
 
 /// The message must be true in every combination: it has to name the inertness,
-/// the real switch, and how the acceptor's certificate is really obtained —
-/// including the auto-generated fallback the server takes when both file paths
-/// are empty (measured on `frps` v0.71.0: with no cert files configured it logs
-/// `TLS enabled with auto-generated self-signed certificate` and still emits
-/// this warning, so the old "non-empty pair" claim was false for the very config
-/// that fires it).
+/// the real switch, and how the acceptor's certificate is really obtained — the
+/// auto-generated fallback when **both** file paths are empty, and the startup
+/// refusal when **exactly one** is set. Both were measured on the real `frps`
+/// (`/tmp/tls-warn-probe/run-b.sh`, stdout and stderr captured separately):
+/// neither file → exit 0 and `TLS enabled with auto-generated self-signed
+/// certificate`; both files → exit 0 and `TLS enabled with cert: <path>`;
+/// exactly one → exit **1** and `Failed to initialize TLS: transport error: TLS
+/// requires both cert_file and key_file to be set; got only one` (the same exit
+/// 1 with `tls_enable` absent, so the abort is unconditional). The old
+/// "non-empty pair" claim was false for the very config that fires it (F1
+/// regression guard).
 #[test]
 fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
     assert!(
@@ -198,6 +211,7 @@ fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
         "`tls_only`",
         "`tls_cert_file`",
         "`tls_key_file`",
+        "refuses to start",
         "auto-generates a self-signed certificate pair",
     ] {
         assert!(
@@ -317,10 +331,11 @@ fn synthesized_tls_enable_stays_silent() {
 }
 
 /// A literal `tls_enable` written *inside* `[transport.tls]` is a third written
-/// spelling: the server lift renames only its four Go keys (`force`, `certFile`,
-/// `keyFile`, `trustedCaFile`) and passes every other key through unchanged
-/// (`frp-core/src/config/normalize.rs:802-809`), so this one is hoisted onto the
-/// very same inert field the warning is about.
+/// spelling: the server lift renames its five Go keys (`force`, `certFile`,
+/// `keyFile`, `trustedCaFile`, `serverName` — the match at
+/// `frp-core/src/config/normalize.rs:869-878`) and passes every other key through
+/// unchanged, so this one is hoisted onto the very same inert field the warning
+/// is about.
 #[test]
 fn literal_tls_enable_inside_the_transport_table_is_a_written_spelling() {
     for (body, mode, expected) in [
@@ -459,4 +474,77 @@ fn the_string_loader_stays_silent() {
     drop(guard);
     assert!(cfg.tls_enable, "the field still parses on the string path");
     assert_eq!(logged, "", "the string loader must not emit the diagnostic");
+}
+
+/// A nested `tls_enable` under `[common.transport.tls]` counts as written **only
+/// when no top-level `transport` key is written**, because `[common]`'s flatten
+/// is `table.entry(k).or_insert(v)` on the whole value
+/// (`frp-core/src/config/normalize.rs:652-655`): a written top-level `transport`
+/// — table or not — wins, and `[common]`'s `transport` (nested `tls` table and
+/// all) is discarded **before** the lift at
+/// `frp-core/src/config/normalize.rs:861-885` can hoist anything.
+///
+/// This is the invariant the sibling `web_server_tls_enable_set_in` already
+/// keeps ("without this arm the detector claimed a key the loader had dropped"):
+/// the flag must not claim a key that never reached the field. The message's own
+/// mechanism claim ("hoisted onto the same inert field") is false in the
+/// competing shape, so the detector is silent there rather than rewording the
+/// message to cover a config it does not model.
+///
+/// Measured on the real `frps` with stdout and stderr captured separately
+/// (`/tmp/tls-warn-probe/run-c.sh`): `[common.transport.tls] tls_enable = true`
+/// alone warns 1 (before **and** after this change); beside `[transport]
+/// heartbeat_timeout = 30` it warned 1 before and warns 0 after; a flat
+/// `[common] tls_enable = true` beside the same competing table still warns 1
+/// (a different key, and it survives the flatten); `transport = 30` (a
+/// top-level non-table) beside `[common.transport.tls]` fails the load with
+/// `invalid type: integer 30, expected struct ServerTransportConfig` (exit 1)
+/// before any warning can be emitted, which is why "absent **or not a table**"
+/// and "absent" are indistinguishable at the warning.
+#[test]
+fn common_transport_tls_needs_no_competing_top_level_transport() {
+    // Alone: the flatten inserts `[common]`'s `transport`, the lift removes its
+    // `tls` table and hoists the literal key onto the inert field.
+    let c = load_capturing(
+        "bind_port = 7000\n[common.transport.tls]\ntls_enable = true\n",
+        false,
+    );
+    assert!(
+        c.presence.server_tls_enable_set(),
+        "alone: the key does reach the lift"
+    );
+    assert!(
+        c.tls_enable,
+        "alone: the lift hoists it onto the inert field"
+    );
+    assert_eq!(c.warning_records, 1, "alone: exactly one record");
+
+    // Competing: the top-level `transport` wins the flatten whole, so the key is
+    // dropped before the lift and nothing is hoisted — the detector must not
+    // claim it and must stay silent.
+    let c = load_capturing(
+        "bind_port = 7000\n[transport]\nheartbeat_timeout = 30\n\
+         [common.transport.tls]\ntls_enable = true\n",
+        false,
+    );
+    assert!(
+        !c.presence.server_tls_enable_set(),
+        "competing: a dropped key must not be claimed"
+    );
+    assert!(!c.tls_enable, "competing: nothing reached the field");
+    assert_eq!(c.warning_records, 0, "competing: no record");
+
+    // A flat `tls_enable` under `[common]` is a different key and survives the
+    // same competing top-level table, so it still counts — pinned so the fix
+    // cannot swallow this shape too.
+    let c = load_capturing(
+        "bind_port = 7000\n[transport]\nheartbeat_timeout = 30\n[common]\ntls_enable = true\n",
+        false,
+    );
+    assert!(
+        c.presence.server_tls_enable_set(),
+        "flat `[common] tls_enable` still counts beside a competing transport"
+    );
+    assert!(c.tls_enable, "the flat key survives the flatten");
+    assert_eq!(c.warning_records, 1);
 }

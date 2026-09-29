@@ -278,8 +278,8 @@ pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING: &str = "web_server.tls.enable has
 pub const SERVER_TLS_ENABLE_INERT_WARNING: &str = "tls_enable has no effect on the \
     server: nothing in frp-server or frps reads it. The server's TLS switch is \
     `tls_only` (Go's `transport.tls.force`); the TLS acceptor is built from \
-    `tls_cert_file` + `tls_key_file`, and with neither set the server auto-generates \
-    a self-signed certificate pair";
+    `tls_cert_file` + `tls_key_file`, with only one of the two set the server refuses \
+    to start, and with neither set it auto-generates a self-signed certificate pair";
 
 impl ConfigPresence {
     pub(super) fn from_normalized_value(value: &toml::Value) -> Self {
@@ -390,28 +390,47 @@ impl ConfigPresence {
     /// `normalize_server_config` flattens `[common]` into the top level and then
     /// *synthesizes* `tls_enable = true` from the legacy `[transport.tls]`
     /// section when it carries `force = true`, `certFile` or `keyFile`
-    /// (`frp-core/src/config/normalize.rs:798-816`, `table.entry(…).or_insert(…)`),
+    /// (`frp-core/src/config/normalize.rs:865-884`, `table.entry(…).or_insert(…)`),
     /// so after normalization a written key and a synthesized one are
     /// indistinguishable.
     ///
-    /// Three spellings count. `[common]`'s flatten is `or_insert`, so a written
-    /// top-level key wins over a written `[common]` one — either way the key was
-    /// **written** and the flag is `true`. An `includes` file counts too:
+    /// Three spellings count. `[common]`'s flatten is
+    /// `table.entry(k).or_insert(v)` **on the whole value**
+    /// (`frp-core/src/config/normalize.rs:652-655`), so a written top-level key
+    /// wins over a written `[common]` one — either way the key was **written**
+    /// and the flag is `true`. An `includes` file counts too:
     /// `process_includes` deep-merges before this runs. The `[transport.tls]`
-    /// lift renames only four Go keys (`force`/`certFile`/`keyFile`/`trustedCaFile`)
-    /// and passes every other key through unchanged
-    /// (`frp-core/src/config/normalize.rs:802-809`), so a literal `tls_enable`
-    /// written *inside* that section is hoisted onto the same inert field — a
-    /// third written spelling, measured on the v0.71.0 `frps`: `tls_enable = "yes"`
-    /// there fails with `invalid type: string "yes", expected a boolean` (exit 1)
-    /// while `tls_enable = true` is accepted (exit 0) and warns.
+    /// lift renames five Go keys
+    /// (`force`/`certFile`/`keyFile`/`trustedCaFile`/`serverName`, the match at
+    /// `frp-core/src/config/normalize.rs:869-878`) and passes every other key
+    /// through unchanged, so a literal `tls_enable` written *inside* that section
+    /// is hoisted onto the same inert field — a third written spelling, measured
+    /// on the v0.71.0 `frps`: `tls_enable = "yes"` there fails with
+    /// `invalid type: string "yes", expected a boolean` (exit 1) while
+    /// `tls_enable = true` is accepted (exit 0) and warns.
+    ///
+    /// **The `[common]` nested spelling is conditional on the flatten.** Because
+    /// that flatten is `or_insert` on the whole `transport` value, a written
+    /// top-level `transport` key — table or not — wins and `[common]`'s
+    /// `transport` (nested `tls` table and all) is discarded before the lift can
+    /// hoist anything. So a nested `tls_enable` under `[common.transport.tls]`
+    /// counts **only** when no top-level `transport` key is written; otherwise
+    /// the key never reaches the field and claiming it would violate the
+    /// invariant the sibling [`Self::web_server_tls_enable_set_in`] keeps
+    /// ("without this arm the detector claimed a key the loader had dropped").
+    /// A flat `[common] tls_enable` is a different key and survives that
+    /// competing table, so it still counts. The "not a table" half is vacuous in
+    /// practice: a top-level `transport = 30` fails the load with
+    /// `invalid type: integer 30, expected struct ServerTransportConfig` (exit 1,
+    /// measured) before any warning can be emitted.
     ///
     /// `tlsEnable` never matches: `ServerConfig::tls_enable` carries no serde
     /// alias (unlike `bind_port`'s `bindPort`), and `"tlsEnable"` is not in
     /// `known_server_keys()`, so the lenient loader silently drops the key and
     /// the strict one refuses it. `[transport.tls] enable` never matches either:
-    /// the **server** lift has no `"enable"` arm (`frp-core/src/config/normalize.rs:802-809`;
-    /// only the **client** lift maps it, at `:1363`), so it stays a
+    /// the **server** lift has no `"enable"` arm
+    /// (`frp-core/src/config/normalize.rs:869-878`; only the **client** lift maps
+    /// it, at `frp-core/src/config/normalize.rs:1429-1437`), so it stays a
     /// top-level key literally named `enable`. Neither is a documented spelling.
     pub(super) fn server_tls_enable_set_in(value: &toml::Value) -> bool {
         let Some(table) = value.as_table() else {
@@ -419,7 +438,7 @@ impl ConfigPresence {
         };
         // A written flat key, at whatever level the caller passes in.
         let flat = |t: &toml::Table| t.contains_key("tls_enable");
-        // `[transport.tls]` keeps only its four *renamed* Go spellings; every
+        // `[transport.tls]` keeps only its five *renamed* Go spellings; every
         // other key — including a literal `tls_enable` — reaches the top level
         // unchanged and lands on the same inert field.
         let nested = |t: &toml::Table| {
@@ -429,12 +448,21 @@ impl ConfigPresence {
                 .and_then(toml::Value::as_table)
                 .is_some_and(|tls| tls.contains_key("tls_enable"))
         };
+        // `[common]`'s nested spelling only survives the flatten when the
+        // top-level `transport` key is absent, so consulting it unconditionally
+        // would claim a dropped key (see the doc comment).
+        let common_nested_survives = table.get("transport").is_none()
+            && table
+                .get("common")
+                .and_then(toml::Value::as_table)
+                .is_some_and(nested);
         flat(table)
             || nested(table)
             || table
                 .get("common")
                 .and_then(toml::Value::as_table)
-                .is_some_and(|common| flat(common) || nested(common))
+                .is_some_and(flat)
+            || common_nested_survives
     }
 
     /// Whether the loaded file wrote the flat `tls_enable` key — top-level,

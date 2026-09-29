@@ -739,7 +739,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   writes the now-warning key), and one `CHANGELOG.md` `### Fixed` bullet. Ledger after this close:
   28 open / 98 closed.
 
-- [ ] **The new server `tls_enable` warning's text is inaccurate on three measured points (#407).**
+- [x] **The new server `tls_enable` warning's text is inaccurate on three measured points (#407).**
   Filed from the two independent round-2 reviews of #407 (frozen `2e060b0432101a41a944111e25f6416382044495`,
   merged as `8ff41e05f90b9673ac25d8ae082f112018f18238`). Both reviewers returned MERGE and rated all three
   **non-blocking**; they were filed rather than fixed so that the merge did not overrun its window.
@@ -772,6 +772,59 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   the detector consults `[common]`'s `transport` only when the top-level `transport` is absent or not a table, or
   the mechanism prose is narrowed to what it actually models — the chosen behaviour pinned by a test that reds
   before the change.
+
+  Fix (all three points; every count re-measured on this tree).
+  (a) **Corrected at five carriers, not four.** A sentence-level sweep (`grep -rn -i four` over `*.rs`/`*.md`,
+  then reading each hit's sentence) found the four this item's table carried plus a fifth a phrase-level sweep
+  misses: `docs/config.md:176` — "The four Go-shaped TLS fields (`tls_only`, `tls_cert_file`, `tls_key_file`,
+  `tls_ca_file`) are carried by the nested `[transport.tls]` section instead" — which omits `tls_server_name`.
+  All five now say five and list `serverName` => `tls_server_name`: the `server_tls_enable_set_in` doc comment and
+  its inline comment in `frp-core/src/config/loader.rs`, `frp-core/tests/server_tls_enable_warning.rs:27` and
+  `:320`, and `docs/config.md:176`. The lift's five arms are measured by
+  `test_go_v0701_server_transport_tls_toml` (writes all five Go spellings, asserts all five flat fields; rc 0),
+  and the stale citation `normalize.rs:802-809` is corrected to the measured match at `:869-878` in every sentence
+  that carried it. A probe of the **real Go v0.71.0 `frps`** (`/private/tmp/frp_0.71.0_darwin_arm64/frps verify
+  -c` on a `[transport.tls]` with all five keys) exits 0 — so all five are Go's server spellings, not frp-rs
+  inventions (an unknown key in that table exits 1, `json: unknown field "bogusKey"`). The two other "four"
+  wordings are **different, genuinely four-key mappings** and were checked, not changed: `docs/config.md:375`
+  (client; the client lift's own arms were re-read) and `frp-core/src/config/tests.rs:5962` (`web_server.tls`).
+  (b) **Named the abort** — the first branch. The silent-pair branch was rejected because the warning is
+  presence-driven (`ConfigPresence` is set from a *written* key before normalization) and the detector never sees
+  the pair values, which live on the post-lift flat fields; gating the record on them would need the detector to
+  model the lift's precedence for two more keys. Measured on the real `frps` (`/tmp/tls-warn-probe/run-b.sh`,
+  stdout and stderr captured separately, every child bounded and reaped, exit status read from `wait`): neither
+  file -> exit **0**, stdout `TLS enabled with auto-generated self-signed certificate`, warning 1 stdout / 0
+  stderr; both files -> exit **0**, `TLS enabled with cert: <path>`, warning 1; exactly one file -> exit **1**,
+  `Failed to initialize TLS: transport error: TLS requires both cert_file and key_file to be set; got only one`,
+  warning 1 — and the same exit 1 with `tls_enable` absent (warning 0), so the abort is unconditional.
+  `SERVER_TLS_ENABLE_INERT_WARNING` now reads "…`tls_cert_file` + `tls_key_file`, with only one of the two set the
+  server refuses to start, and with neither set it auto-generates a self-signed certificate pair", and a new fact
+  string in `the_message_names_the_inertness_the_real_switch_and_the_certificate` pins "refuses to start" (it
+  failed pre-change).
+  (c) **Moved the detector** — the first branch; the sibling `web_server_tls_enable_set_in` already keeps the
+  invariant that the flag must not claim a key the loader dropped. `[common]`'s flatten is
+  `table.entry(k).or_insert(v)` on the whole value (`frp-core/src/config/normalize.rs:652-655`), so a written
+  top-level `transport` — table or not — discards `[common]`'s `transport` whole and the lift at
+  `frp-core/src/config/normalize.rs:861-885` never sees it; the nested `[common.transport.tls] tls_enable` now
+  counts **only** when no top-level `transport` key is written. Measured on the real `frps`
+  (`/tmp/tls-warn-probe/run-c.sh`): `[common.transport.tls] tls_enable` alone -> warn **1** before and after
+  (must keep warning); beside `[transport] heartbeat_timeout = 30` -> warn **1** before, **0** after; a flat
+  `[common] tls_enable` beside the same competing table -> **1** before and after; a top-level non-table
+  `transport = 30` -> the load itself fails (`invalid type: integer 30, expected struct ServerTransportConfig`,
+  exit 1) before any warning, so "absent or not a table" and "absent" are indistinguishable at the warning. The
+  new test `common_transport_tls_needs_no_competing_top_level_transport` pins all four shapes and **failed
+  pre-change** (`competing: a dropped key must not be claimed`, rc 101).
+  Gates (literal rc): `cargo fmt --all -- --check` **0**; `bash scripts/repo-health.sh` **0**;
+  `cargo test -p frp-core --lib config` **0** (342 passed); `cargo test -p frp-core --test
+  server_tls_enable_warning` **0** (8 passed); `cargo test -p frps --features dashboard --test warn_delivery`
+  **0** (12 passed); `cargo test -p frpc --test warn_delivery` **0** (8 passed); `cargo test -p frpc --features
+  admin --test admin_config_get_warning` **0** (4 passed); `cargo clippy -p frp-core -p frps -p frp-server
+  --all-targets --all-features -- -D warnings` **0**. All six CI count literals re-read with `-- --list` and
+  **unchanged**: frps 29, frpc-tiny 13, log_completion 5, frps warn_delivery 12, frpc warn_delivery 8,
+  admin_config_get_warning 4. Docs: `docs/config.md`'s `tls_enable` row gained the half-written-pair outcome and
+  the inert-fields note gained the `[common]`-nested condition; `CHANGELOG.md` gained one `### Fixed` bullet,
+  because both the message text and the set of configs that warn are user-visible. Ledger after this close:
+  **24 open / 106 closed**.
 
 - [x] **`docs/config.md` advertises four camelCase TLS aliases that no loader accepts.**
   The `tls_only`, `tls_cert_file`, `tls_key_file` and `tls_ca_file` rows at `docs/config.md:26-29`

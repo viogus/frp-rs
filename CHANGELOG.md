@@ -403,6 +403,21 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **The server `tls_enable` warning now names the half-written certificate pair,
+  and no longer fires for a `[common.transport.tls] tls_enable` that never
+  reaches the loader.** With only `tls_cert_file` (or only `tls_key_file`)
+  written, `frps` exits 1 with `TLS requires both cert_file and key_file to be
+  set; got only one`; the warning printed just before it described only what
+  happens with *neither* file set, so it now names that refusal too. Separately,
+  a literal `tls_enable` under `[common.transport.tls]` used to warn even when a
+  top-level `[transport]` table made `[common]`'s flatten drop the sub-table
+  whole before the lift could hoist anything; the detector now mirrors that drop
+  (as the dashboard's sibling detector already did) and stays silent, while
+  `[common.transport.tls] tls_enable` on its own and a flat `[common] tls_enable`
+  still warn. The warning's documentation also said the `[transport.tls]` lift
+  renamed "only four Go keys" while it renames five (`serverName` →
+  `tls_server_name`); the count is corrected there, in the test docs and in
+  `docs/config.md`.
 - **`[webServer]` and `[web_server]` are now the same section, merged per key.**
   A file that wrote both used to have the camelCase table discarded **whole** —
   so a nested `[webServer.tls]` never reached the loader and a flat
