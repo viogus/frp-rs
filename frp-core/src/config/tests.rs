@@ -2764,7 +2764,7 @@ mod proptest_tests {
         /// A proxy expressed with Go-format sub-tables
         /// ([proxies.transport] / [proxies.healthCheck] /
         /// [proxies.loadBalancer]) normalizes to the same TOML as the
-        /// equivalent flat fields. normalize_proxies (normalize.rs:1354)
+        /// equivalent flat fields. normalize_proxies (normalize.rs:1945)
         /// flattens the sub-tables in the order transport → healthCheck →
         /// loadBalancer; the flat form below lists the fields in exactly
         /// that order so the serialized outputs match.
@@ -2819,7 +2819,7 @@ mod proptest_tests {
     proptest! {
         /// Same equivalence for visitor sub-tables
         /// ([visitors.transport] / [visitors.natTraversal],
-        /// normalize_visitors at normalize.rs:1551).
+        /// normalize_visitors at normalize.rs:2197).
         #[test]
         fn visitor_subtables_flat_vs_nested_equivalent(
             use_enc in any::<bool>(),
