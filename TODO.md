@@ -6112,8 +6112,10 @@ nothing about whether the described behaviour still holds.
   positioning docs. `scripts/memory-baseline.sh` already accepts
   `FRPS_BIN`/`FRPC_BIN`, so pointing it at the Go binary is the starting point.
 
-**Findings filed by the `[web_server.tls]` fix round (all pre-existing, all measured 2026-09-29 at `ccff127`).**
-- [ ] **A file that defines both `[webServer]` and `[web_server]` silently discards the whole
+**Findings filed by the `[web_server.tls]` fix round (all pre-existing, all measured 2026-09-29 at `ccff127`).
+All six were closed in the `fix/webserver-tls-cluster` batch (A–F below, each with its own Done note and
+measured evidence); ledger after that batch: 23 open / 104 closed.**
+- [x] **A file that defines both `[webServer]` and `[web_server]` silently discards the whole
   `[webServer]` table — including a nested `[webServer.tls]`.** `normalize_server_config` renames the
   section with `table.entry("web_server").or_insert(v)` (`frp-core/src/config/normalize.rs`), an
   all-or-nothing move: when the snake_case section already exists the camelCase one is dropped, so a
@@ -6128,7 +6130,27 @@ nothing about whether the described behaviour still holds.
   `[webServer]` into `[web_server]` (making the nested table reachable and the claim true) or report the
   discarded table. **Done-when:** the chosen behaviour is pinned by a test in both loader modes, and the
   precedence doc names the shape either way.
-- [ ] **`.ini` files cannot use the nested `[webServer.tls]` section at all: the section name is stored
+
+  Done: the two sections now **merge per key**, `[web_server]` winning each key both define (the
+  order the old whole-table `or_insert` resolved in — not inverted), with nested tables merging
+  recursively: `merge_section_into` / `or_insert_deep` in `frp-core/src/config/normalize.rs`, called
+  from `normalize_server_config` and `normalize_client_config`. Measured with the probe harness
+  a temporary in-tree probe harness (before/after transcripts `/tmp/ws-probe-before.txt`,
+  `/tmp/ws-probe-after.txt`, reproduced in `/tmp/webserver-tls-cluster-report.md`), case A1 `[webServer.tls] cert_file = "/nested/cert.pem"` +
+  `[web_server] tls_cert_file = "/flat/cert.pem"`: before `tls_cert() == "/flat/cert.pem"` in both
+  loader modes, after `"/nested/cert.pem"`; A2 disjoint keys `user`/`port` written only under
+  `[webServer]` were dropped before (`user="" port=0`) and survive after (`user="camel" port=7501`);
+  A3 a key both sections define is still `[web_server]`'s (`user="snake"`); A5 two `tls` tables with
+  disjoint keys both survive; YAML and the client `[web_server]` behave the same. Pinned by
+  `both_web_server_sections_merge_per_key_in_both_modes` (`frp-core/src/config/tests.rs`). The
+  presence detector that mirrors the merge is
+  `ConfigPresence::web_server_tls_enable_set_in` (`frp-core/src/config/loader.rs`), pinned by
+  `both_sections_present_the_flag_follows_the_merge`
+  (`frp-core/tests/web_server_tls_enable_warning.rs`). The precedence prose was re-derived on
+  `normalize_web_server_section` (`frp-core/src/config/normalize.rs`), on `WebServerTlsConfig` and
+  `WebServerConfig::tls` (`frp-core/src/config/server.rs`) and in the `[web_server]` rows of
+  `docs/config.md`.
+- [x] **`.ini` files cannot use the nested `[webServer.tls]` section at all: the section name is stored
   verbatim as a top-level key.** `ini_to_toml` (`frp-core/src/config/format.rs`) inserts the bracket text
   as the key, so `[webServer.tls]` becomes the literal top-level key `"webServer.tls"` (and
   `[web_server.tls]` becomes `"web_server.tls"`) — never a `web_server` → `tls` table. Measured (probe
@@ -6140,7 +6162,27 @@ nothing about whether the described behaviour still holds.
   the dotted section name is expanded into nested tables before normalization (so `.ini` gets the same
   treatment as every other format) or the limitation is stated in `docs/config.md` with a test pinning
   the current message; a silent drop is not an option.
-- [ ] **`[web_server.tls] password = "…"` / `user = "…"` land on the real `web_server.password` /
+
+  Done: the first branch — a dotted header whose first segment is a v1 section name is expanded
+  into nested tables **before** normalization, so `.ini` reaches `normalize_web_server_section` like
+  every other format: `ini_to_toml` / `ini_section_path` / `ini_section_mut` /
+  `INI_NESTED_SECTION_ROOTS` in `frp-core/src/config/format.rs`. Measured before/after with the probe
+  harness (cases B1/B2): `[webServer.tls] certFile = /nested/cert.pem` loaded `tls_cert() == ""` with
+  strict reporting `unknown field "webServer.tls"` before, and `"/nested/cert.pem"` in **both** modes
+  after; `[web_server.tls] cert_file` likewise. The first-segment restriction is load-bearing, not
+  cosmetic: expanding every dotted header broke Go's shipped legacy fixture
+  (`legacy_ini_go_shipped_frps_fixture_loads_end_to_end` failed with `unknown field "plugin"`),
+  because Go's own `.ini` path is the *legacy* loader and keeps `[plugin.user-manager]` as one flat
+  section name — `pkg/config/legacy/server.go`, the `strings.HasPrefix(name, "plugin.")` loop over
+  `gopkg.in/ini.v1`'s `section.Name()` (v0.71.0 source). A literal top-level `webServer.tls = 1` key
+  stays a distinct unknown key, and a genuine path conflict (`[webServer] tls = 1` beside
+  `[webServer.tls]`) is reported rather than clobbered. Pinned by
+  `dotted_ini_section_headers_become_nested_tables_in_both_modes` (`frp-core/src/config/tests.rs`);
+  `docs/config.md` no longer says the section is unusable in `.ini`.
+  Parity note: the expansion is an frp-rs **extension** — Go never reads `[webServer.tls]` from an
+  `.ini` at all (its legacy loader ignores the section) — so `.ini` is documented as a first-class
+  spelling of the v1 config, not as Go parity.
+- [x] **`[web_server.tls] password = "…"` / `user = "…"` land on the real `web_server.password` /
   `web_server.user` fields.** `normalize_web_server_section` re-inserts every unmapped nested key at the
   parent level under its own name (`or_insert`), and `password` / `user` are real `WebServerConfig`
   fields, so a nested section's credentials silently *become* the dashboard Basic Auth credentials
@@ -6152,6 +6194,28 @@ nothing about whether the described behaviour still holds.
   field name is re-inserted rather than dropped. **Done-when:** the unmapped-key re-insert is restricted
   to keys that are not parent fields (or the nested table is refused outright), pinned by a test
   asserting a nested `password`/`user` does **not** change `web_server.password`/`web_server.user`.
+
+  Done: the re-insert is gone entirely — an unmapped nested key **stays inside `tls`**, so it can
+  never bind a real `WebServerConfig` field: the residue is written back as `web_server.tls` when
+  non-empty at the end of `normalize_web_server_section`
+  (`frp-core/src/config/normalize.rs`), and `check_strict` descends `web_server` -> `tls` against
+  `WEB_SERVER_TLS_KNOWN_KEYS` (`Ctx::WebServer` / `Ctx::WebServerTls`, `child_table_keys`,
+  `child_ctx` in `frp-core/src/config/strict.rs`). Every parent field name was checked, not just the
+  two in the item: `user`, `password`, `addr`, `port`, `enable_prometheus`/`enablePrometheus`,
+  `assets_dir`/`assetsDir`, `pprof_enable`/`pprofEnable`, `custom_404_page`/`custom404Page`,
+  `tls_cert_file`, `tls_key_file` — probe case C3 showed all of them landing on the parent field
+  before the fix. Measured before/after (probe C2): `[web_server.tls] user = "nested-user"` +
+  `password = "nested-secret"` loaded `web_server.user == "nested-user"` and
+  `web_server.password == "nested-secret"` in both loader modes before, and the defaults after, with
+  strict now naming `unknown field "web_server.tls.password"` / `...user` (before: silent in both
+  modes when there was no parent value). Go refuses both keys outright — probed on the v0.71.0 `frps`:
+  rc 1, stdout `json: unknown field "password"`. Pinned by
+  `nested_web_server_tls_credentials_do_not_become_the_parent_fields` and
+  `unknown_nested_web_server_tls_key_names_the_true_nested_path` (`frp-core/src/config/tests.rs`); the
+  meta-guard `strict_array_element_keys_match_struct_fields` now compares
+  `WEB_SERVER_TLS_KNOWN_KEYS` against `WebServerTlsConfig`. The old
+  `unknown_nested_web_server_tls_key_still_names_a_parent_level_path` (which pinned the fabricated
+  `web_server.bogus_key`) is replaced by the true-path test.
 - [x] **The `web_server.tls.enable` warning never reaches a `-c` user: the `-c` path loads the
   config before logging exists.** `normalize_web_server_section` warns
   (`frp-core/src/config/normalize.rs`) because `enable` is inert, but the warning is emitted from
@@ -6219,7 +6283,7 @@ nothing about whether the described behaviour still holds.
   directions: against the pre-change binaries (plain `-c` fails) and against the first-round binaries
   (the `[common]` and reload tests fail) — `/tmp/enable-warn-probe/out2-falsify-*.txt`. Remaining scope
   reduction, filed below.
-- [ ] **The `frpc` admin API's config GET no longer sees the `[web_server.tls] enable` diagnostic.**
+- [x] **The `frpc` admin API's config GET no longer sees the `[web_server.tls] enable` diagnostic.**
   `frp-client/src/admin.rs`'s `config_from_file` (the admin **GET** path: `/api/proxy/{name}/config`,
   `/api/visitor/{name}/config`, on **every request**) loads the file through
   `load_client_config` — the *file* API, not `load_*_config_from_str` — which is now silent, so the
@@ -6243,7 +6307,22 @@ nothing about whether the described behaviour still holds.
   **per-request GET** should warn once per poll or only on a state change — or the GET's silence is
   stated where a user of the admin API would look for it; the test target's "what it does not cover"
   and this item move together either way.
-- [ ] **A parent-level `certFile` alias beside the parent-level canonical `tls_cert_file` is a
+
+  Done: the first branch — `config_from_file` (`frp-client/src/admin.rs`) now loads through
+  `load_client_config_with_presence` and calls
+  `ConfigPresence::warn_inert_web_server_tls_enable` itself, **once per state change rather than once
+  per request**. The decision is recorded on the function and on
+  `AdminState::web_server_tls_enable_seen`: both routes are polled, so a per-request record would be a
+  log flood carrying no new information, while the fact is a property of the file; warning when the
+  answer becomes "written" (and again if the file is edited to remove and re-add the key) keeps the
+  signal and drops the noise. Measured in-process by `admin_config_get_warns_once_per_state_change`
+  (`frp-client/src/admin.rs`): three GETs over a file with the key -> 1 record; the file rewritten
+  without it -> still 1; rewritten back -> 2; a stable absent file -> 2. The pre-fix measurement the
+  item filed (3 GETs -> **+0** records, 3 PUTs -> +3) stands as the "before". The test target's "what
+  it does not cover" (`frp-core/tests/web_server_tls_enable_warning.rs`), the
+  `warn_inert_web_server_tls_enable` doc (`frp-core/src/config/loader.rs`) and the `docs/config.md`
+  site list moved with it — `frps verify` is now the only site that gets no record.
+- [x] **A parent-level `certFile` alias beside the parent-level canonical `tls_cert_file` is a
   `duplicate field` error — with no nested key involved at all.** serde binds `web_server.certFile`
   as an `alias` of `web_server.tls_cert_file`, so a file that writes both (in any spelling mix that
   puts two of those names at the parent level) fails to deserialize in **both** loader modes with
@@ -6259,7 +6338,19 @@ nothing about whether the described behaviour still holds.
   both refuse, the wording differs. **Done-when:** the duplicate is either closed (drop the
   parent-level alias whenever the canonical is present, not only when a nested value is) or the
   error names the two parent-level keys, pinned by a test in both modes.
-- [ ] **A nested empty value clears the flat value: `[web_server.tls] cert_file = ""` beside
+
+  Done: closed, by canonicalizing the whole four-spelling group in
+  `normalize_web_server_section` (`frp-core/src/config/normalize.rs`) — whichever spellings are
+  present, only the parent canonical `flat_key` survives, so serde can never see two names for one
+  field. This covers the nested-supplied cases and the collision a naive per-key section merge (item
+  A) would otherwise introduce (`[webServer] certFile` beside `[web_server] tls_cert_file`). Measured
+  before/after (probe cases E1/E2, and `frps verify -c` on the real debug binary): before, rc 1 with
+  `config validation error: duplicate field tls_cert_file` in **both** loader modes; after, the
+  canonical value loads in both modes (`tls_cert() == "/canon/cert.pem"`). The pair's winner is the
+  canonical (the struct's own field name); an empty canonical falls through to the alias, consistent
+  with item F. Pinned by `parent_alias_beside_parent_canonical_loads_in_both_modes`
+  (`frp-core/src/config/tests.rs`).
+- [x] **A nested empty value clears the flat value: `[web_server.tls] cert_file = ""` beside
   `[web_server] certFile = "/p.pem"` loads with `tls_cert() == ""`.** The hoist's `insert` treats an
   explicitly empty nested string as "the nested value wins" — consistent with the documented
   precedence, but surprising for a field whose emptiness means *disabled*: a cert written for the
@@ -6270,3 +6361,21 @@ nothing about whether the described behaviour still holds.
   string (nested wins, or an empty nested value is "unset" and falls through to the flat key) and
   pinned by a test in both modes, with the one-clause note in `docs/config.md` either kept or
   replaced by the implemented rule.
+
+
+  Done: decided that an explicitly **empty** nested value is *unset* — it falls through to the
+  flat or alias spelling rather than clearing it — with the resolution order nested snake -> nested
+  camel -> parent canonical -> parent alias, first **non-empty** spelling winning
+  (`normalize_web_server_section` + `is_empty_string`, `frp-core/src/config/normalize.rs`). Rationale:
+  emptiness is how these fields say *disabled*, so "empty wins" silently drops a configured
+  certificate and leaves the dashboard serving plaintext HTTP — a fail-open outcome for a
+  security-relevant field. Measured before/after (probe cases F1/F2):
+  `[web_server.tls] cert_file = ""` beside `[web_server] certFile = "/p.pem"` (and beside
+  `tls_cert_file = "/p.pem"`) loaded `tls_cert() == ""` in both loader modes before and `"/p.pem"`
+  after. The same rule one level down: an empty nested `cert_file` beside a set nested `certFile` now
+  yields the camelCase value (before: `""`, probe F4). Pinned by
+  `empty_nested_value_is_unset_in_both_modes` (`frp-core/src/config/tests.rs`) and stated in the
+  `tls_cert_file` / `tls_key_file` rows of `docs/config.md` in place of the removed "clears the flat
+  value" clause.
+  **Ledger after this batch: 23 open / 104 closed** (29 open / 98 closed before it, measured with
+  `grep -cE '^- \[ \]' TODO.md` / `grep -cE '^- \[x\]' TODO.md`).
