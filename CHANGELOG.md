@@ -403,6 +403,23 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **The `web_server.tls.enable` warning is now build-aware: in a build with no
+  dashboard it no longer claims the dashboard serves plaintext HTTP.** The key is
+  read behind `frp-server`'s `dashboard` feature (and `frpc`'s `admin`), but the
+  warning was not, so every tier that cannot build a dashboard — the default
+  `frps` (`full` does not include `frp-server/dashboard`), `frps-tiny`,
+  `frps-micro` and a default `frpc` — still told the user what the dashboard does
+  with `cert_file`/`key_file`. `frp-core` has neither feature, so the two texts
+  now live in `WEB_SERVER_TLS_ENABLE_INERT_WARNING` (unchanged, for a build that
+  compiles a dashboard) and the new
+  `WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD` ("web_server.tls.enable has
+  no effect: this build has no dashboard support, so nothing reads the key and no
+  dashboard HTTPS server is built"), with
+  `warn_inert_web_server_tls_enable(has_dashboard: bool)` picking between them;
+  each call site passes its own `cfg!`. Measured on the real binaries:
+  `frps-micro` and `frps-tiny` print the no-dashboard sentence and leave
+  `web_server.port` closed, the default `frps` prints it too, and
+  `frps --features dashboard` keeps the pair clause and listens.
 - **The server `tls_enable` warning now describes what actually happens to the
   certificate pair, in every build, and no longer fires for a
   `[common.transport.tls] tls_enable` that never reaches the loader.** With only

@@ -840,7 +840,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `### Fixed` bullet. Ledger after this close: **24 open / 106 closed**; the micro sibling filed below moves it
   to **25 open / 106 closed**.
 
-- [ ] **The sibling `web_server.tls.enable` warning makes the same build-unaware claim: in a build with no
+- [x] **The sibling `web_server.tls.enable` warning makes the same build-unaware claim: in a build with no
   dashboard it still says the dashboard serves plaintext HTTP (filed from the round-2 review of #407's follow-up).**
   R1 measured it and this round reproduced it. `WEB_SERVER_TLS_ENABLE_INERT_WARNING`
   (`frp-core/src/config/loader.rs:258`) ends "…the dashboard HTTPS server is enabled by a non-empty
@@ -859,6 +859,47 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `the_message_names_the_inertness_the_real_switch_and_the_certificate` in
   `frp-core/tests/server_tls_enable_warning.rs`; the sibling test file is
   `frp-core/tests/web_server_tls_enable_warning.rs`. Ledger after filing this item: **25 open / 106 closed**.
+
+  **Closed** with the caller-supplied shape, the same one `server_reader_present` uses
+  (`frp-server/src/service.rs:392`): `frp-core` has no `dashboard`/`admin` feature of its own, so a
+  `#[cfg(feature = "dashboard")]` inside it is constant `false` in **every** configuration and would pin
+  nothing. `WEB_SERVER_TLS_ENABLE_INERT_WARNING` keeps its exact text (the build that compiles a dashboard);
+  the new `WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD` (`frp-core/src/config/loader.rs:285`) says
+  "web_server.tls.enable has no effect: this build has no dashboard support, so nothing reads the key and no
+  dashboard HTTPS server is built"; and `warn_inert_web_server_tls_enable(&self, has_dashboard: bool)`
+  (`frp-core/src/config/loader.rs:590`) picks between them. All eight call sites now pass a `cfg!`:
+  `frps/src/main.rs:219`/`:311` and `frp-server/src/service.rs:2315` pass `cfg!(feature = "dashboard")`;
+  `frpc/src/main.rs:527`/`:602`/`:776`, `frp-client/src/service.rs:4457` and `frp-client/src/admin.rs:771`
+  pass `cfg!(feature = "admin")`. **Measured** on the real binaries (fresh `CARGO_TARGET_DIR` per tier,
+  tier-named binary, stdout and stderr captured separately, child bounded and reaped, `nc -z` run while the
+  process was still alive; `/tmp/wtls-probe`): `frps-micro` (build rc 0) and `frps-tiny` now print the
+  no-dashboard sentence, leave TCP 27500 **closed** (`nc -z` rc 1) and start only `frps listener started on
+  0.0.0.0:27381`; the **default** `frps` (`full`, no dashboard) prints it too (`nc -z` rc 1) — the shipped
+  `frps` is a no-dashboard build, which is exactly why the old clause was wrong for it; `frps --features
+  dashboard` keeps the pair clause and listens (`Dashboard listening on 127.0.0.1:27500`, `nc -z` rc 0);
+  default `frpc` prints the no-dashboard sentence (then exits 1 on its own, `login_fail_exit` default `true`)
+  and `frpc --features admin` the dashboard one. Pre-change, a pristine `66be9ce1` `frps-micro` built in a
+  `git archive` copy and probed by the same harness printed the dashboard clause while leaving 27500 closed.
+  **Pin:** `the_no_dashboard_build_names_no_dashboard_behaviour` in
+  `frp-core/tests/web_server_tls_enable_warning.rs` asserts the shared needle
+  `web_server.tls.enable has no effect` in both constants, that neither text contains the other (so the
+  dispatch assertions are not vacuous), that the no-dashboard text contains **none** of `cert_file` /
+  `key_file` / `plaintext HTTP` while stating its own build fact (`no dashboard support`, `no dashboard HTTPS
+  server is built`), and that a load emits the variant the caller's build asks for. Proved **red twice** in a
+  `git archive` copy with its own target dir: a mutant whose emitter ignores `has_dashboard` (rc **101**,
+  panic at `frp-core/tests/web_server_tls_enable_warning.rs:377`) and one that appends the dashboard clause
+  to the no-dashboard text (rc **101**, panic at `:335`). Gates (literal rc): `cargo fmt --all -- --check`
+  **0**; `bash scripts/repo-health.sh` **0**; `cargo test -p frp-core --lib config` **0**;
+  `cargo test -p frp-core --test web_server_tls_enable_warning` **0**; the same test with
+  `--no-default-features` **0**; `RUSTFLAGS="-D warnings" cargo clippy -p frp-server --no-default-features
+  --features dashboard --all-targets` **0**; `… clippy -p frp-client --no-default-features --all-targets`
+  **0**; `… check -p frp-core --no-default-features --all-targets` **0**. Six CI count literals re-read with
+  `-- --list` and unchanged (frps 29, frpc-tiny 13, `log_completion` 5, frps `warn_delivery` 12, frpc
+  `warn_delivery` 8, `admin_config_get_warning` 4). Docs: `docs/config.md:192` now names both variants and
+  which builds get each; `CHANGELOG.md` gained one `### Fixed` bullet. Ledger after this close: **25 open /
+  107 closed**, measured by `grep -c '^- \[ \]' TODO.md` / `grep -c '^- \[x\]' TODO.md` — those read **26**
+  open before this tick, so the filing note above already under-counted open by one; the closed count moves
+  106 → 107.
 
 - [x] **`docs/config.md` advertises four camelCase TLS aliases that no loader accepts.**
   The `tls_only`, `tls_cert_file`, `tls_key_file` and `tls_ca_file` rows at `docs/config.md:26-29`

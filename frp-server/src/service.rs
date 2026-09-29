@@ -2312,7 +2312,7 @@ impl Service {
         let (new_cfg, presence): (ServerConfig, _) =
             frp_core::config::load_server_config_with_presence(&config_path, false)
                 .map_err(|e| format!("Failed to reload config: {e}"))?;
-        presence.warn_inert_web_server_tls_enable();
+        presence.warn_inert_web_server_tls_enable(cfg!(feature = "dashboard"));
         // The flat server `tls_enable` is inert as well; this reload site has a
         // sink, so it delivers the record. Once per load — a reload adds one
         // rather than replacing the startup record.
@@ -2448,7 +2448,7 @@ impl Service {
         // `ServerConfig.tls_enable` is deliberately **not** compared here: no
         // code in `frp-server`/`frps` reads it. `grep -rn tls_enable
         // frp-server/src frps/src` returns only comment lines and call sites of
-        // the unrelated helper `presence.warn_inert_web_server_tls_enable()`,
+        // the unrelated helper `presence.warn_inert_web_server_tls_enable(has_dashboard)`,
         // which reads a different key, `[web_server.tls] enable`; zero field
         // reads. No hit count is pinned here: stating one is self-invalidating,
         // because this comment and any later comment that merely mentions the

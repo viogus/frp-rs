@@ -233,10 +233,22 @@ pub struct ConfigPresence {
     pub(super) server_tls_enable_set: bool,
 }
 
-/// The `[web_server.tls] enable` diagnostic, in one place so `frps` and `frpc`
-/// cannot drift. Callers gate it on
-/// [`ConfigPresence::web_server_tls_enable_set`]; it is emitted **after**
+/// The `[web_server.tls] enable` diagnostic for a build that **compiles a
+/// dashboard**, in one place so `frps` and `frpc` cannot drift. Callers gate it
+/// on [`ConfigPresence::web_server_tls_enable_set`]; it is emitted **after**
 /// `init_logging`, which is the whole point of the presence flag.
+///
+/// **Two variants, picked by the caller.** The `web_server` section is read only
+/// by code behind `frp-server`'s `dashboard` feature (the dashboard) and
+/// `frp-client`'s `admin` feature (the client's admin server), while this
+/// diagnostic lives in `frp-core`, which has **no** such feature — a
+/// `#[cfg(feature = "dashboard")]` here is constant `false` in every
+/// configuration and would pin nothing. The awareness is therefore supplied by
+/// the caller: [`ConfigPresence::warn_inert_web_server_tls_enable`] takes the
+/// build's answer and emits *this* constant or
+/// [`WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD`]. That mirrors
+/// `frp-server`'s `server_reader_present`, which resolves the features that
+/// crate owns.
 ///
 /// The sites that call it are the ones with a log sink: `frps`'s two startup
 /// paths, `frpc`'s two startup paths plus `frpc verify`, and the two in-process
@@ -258,6 +270,21 @@ pub struct ConfigPresence {
 pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING: &str = "web_server.tls.enable has no \
      effect: the dashboard HTTPS server is enabled by a non-empty `cert_file` + `key_file` \
      pair; without that pair the dashboard serves plaintext HTTP";
+
+/// The same diagnostic for a build that compiles **no dashboard** — the default
+/// `frps` (`full`, which does not include `frp-server/dashboard`), `frps-tiny`,
+/// `frps-micro`, and a default `frpc` (no `admin` feature).
+///
+/// It names the build's own inertness — nothing **in this build** reads the key
+/// — and carefully names **no dashboard behaviour**: this build has no dashboard
+/// listener to be plaintext or TLS, so it must not inherit the pair/plaintext
+/// clause of [`WEB_SERVER_TLS_ENABLE_INERT_WARNING`]. It is the counterpart of
+/// `SERVER_TLS_ENABLE_INERT_WARNING`'s `not(feature = "tls")` variant, which
+/// likewise says "no TLS support ... never builds a TLS acceptor" rather than
+/// describing a TLS acceptor.
+pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD: &str = "web_server.tls.enable \
+     has no effect: this build has no dashboard support, so nothing reads the key and no \
+     dashboard HTTPS server is built";
 
 /// The server-side flat `tls_enable` diagnostic, in one place so `frps` and
 /// `frp-server` cannot drift. Callers gate it on
@@ -529,8 +556,19 @@ impl ConfigPresence {
         }
     }
 
-    /// Emit [`WEB_SERVER_TLS_ENABLE_INERT_WARNING`] when the key was written,
+    /// Emit the `[web_server.tls] enable` diagnostic when the key was written,
     /// once per load.
+    ///
+    /// `has_dashboard` is the **caller's** build answer, not this crate's: every
+    /// caller is a crate that actually owns the gate (`frps`/`frp-server`:
+    /// `cfg!(feature = "dashboard")`; `frpc`/`frp-client`:
+    /// `cfg!(feature = "admin")`), so it passes `true` when it compiles a
+    /// dashboard server and the emitted message may describe one, `false`
+    /// otherwise, where the message must name none. See
+    /// [`WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD`] for why the choice
+    /// cannot live in this crate. Pinned by
+    /// `the_no_dashboard_build_names_no_dashboard_behaviour`
+    /// (`frp-core/tests/web_server_tls_enable_warning.rs`).
     ///
     /// Called by each load site that has a log sink — `frps`'s two startup
     /// paths, `frpc`'s two startup paths, `frpc verify`, both in-process
@@ -549,9 +587,16 @@ impl ConfigPresence {
     /// text is written to be true in every combination. Pinned by
     /// `nested_web_server_tls_enable_warns_once_and_stays_inert`
     /// (`frp-core/tests/web_server_tls_enable_warning.rs`).
-    pub fn warn_inert_web_server_tls_enable(&self) {
+    pub fn warn_inert_web_server_tls_enable(&self, has_dashboard: bool) {
         if self.web_server_tls_enable_set {
-            tracing::warn!("{}", WEB_SERVER_TLS_ENABLE_INERT_WARNING);
+            tracing::warn!(
+                "{}",
+                if has_dashboard {
+                    WEB_SERVER_TLS_ENABLE_INERT_WARNING
+                } else {
+                    WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD
+                }
+            );
         }
     }
 }

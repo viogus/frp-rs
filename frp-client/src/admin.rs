@@ -768,7 +768,7 @@ fn config_from_file(
         Ordering::Relaxed,
     );
     if written && previous != WS_TLS_ENABLE_NO_BASELINE && previous != WS_TLS_ENABLE_WRITTEN {
-        presence.warn_inert_web_server_tls_enable();
+        presence.warn_inert_web_server_tls_enable(cfg!(feature = "admin"));
     }
     Ok(cfg)
 }
