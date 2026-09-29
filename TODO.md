@@ -6637,3 +6637,47 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** (a)–(c) say what is actually true; (b) either adds the 7-line `Duration::ZERO` pin or drops
   the claim; (d) names the delegation bypass or pins it; (e) quotes a range or attributes the number.
 
+
+- [ ] **Three residuals from #410's round-2 reviews: the warning-message pin is a substring list, and
+  the feature split's reachable build shapes.** All three were marked **non-blocking** by both
+  reviewers, none makes an emitted sentence false in any build a lane or a release produces, and
+  PR #410 merged on two MERGE verdicts — so they are recorded rather than fixed.
+  (a) **The pin cannot detect a clause being added or dropped.** `frp-core/tests/server_tls_enable_warning.rs`
+  asserts a substring allow/deny list per variant. R1's mutant **G1** (`41010b14…`) appends an
+  unmeasured clause to the `tls` variant and stays **8/8 green**; R2's **M3** deletes the new
+  `" or unreadable"` clause and also stays **8/8 green**, while that clause is measured true
+  (`open cert file: No such file or directory (os error 2)`, rc 1 on a real `frps`). The `tls`
+  variant's text can therefore drift in either direction unnoticed. The same class as round-1 F4,
+  which the round-2 commit closed for the *detector* (`:622:9` is now load-bearing) but not for the
+  message.
+  **Done-when:** either the assertions pin each variant string end-to-end (or the clause list is
+  derived from the constants, so a new clause cannot slip in), or the test's "what it does not cover"
+  says plainly that clause-level drift is not caught.
+  (b) **The variant is keyed on frp-core's `tls`, not on the binary's acceptor gate.** The
+  `#[cfg(feature = "tls")]` split in `frp-core/src/config/loader.rs` is necessary but not sufficient
+  for an `frps` binary to build an acceptor: in the hand-rolled per-package mix
+  `cargo build -p frps -p frpc --no-default-features --features "frps/micro,frpc/tls"` (measured
+  normal-graph rustls = 11) frp-core's `tls` is on while frp-server's is off, so `frps-micro` would
+  print the "refused at startup / auto-generates" text with no acceptor — exactly the round-1 F1
+  defect. Measured: **no** lane produces that shape (`release.yml:100/102/108/110/159/162/210/213`
+  are workspace-root `cargo build … --no-default-features --features tiny|micro`; `ci.yml:921`/`:925`
+  the matching `cargo check --workspace … tiny|micro`), and frp-core cannot observe frp-server's
+  features, so the constants' own doc comment correctly keys on frp-core's feature.
+  **Done-when:** either the variant is gated on a cfg frp-core can actually see (or its text is
+  written to hold under either), or a note beside the constants names the mixed-feature build as a
+  known, unshipped shape.
+  (c) **The two variants are covered by two different CI lanes, not by one test.** The `#[cfg]` split
+  means the default run asserts nothing about the no-TLS text and the `--no-default-features` run
+  nothing about the `tls` text; both are exercised across `ci.yml:192` (default) and `:224`
+  (`--no-default-features --all-targets`), and both variants red under mutation (M1/M4 at `:622:9`;
+  M2 at `:261:9` / R1's narrower mutant at `:275:13`). No change requested by either reviewer;
+  recorded so the coverage is not mistaken for single-lane coverage.
+  **Done-when:** the note says which lane covers which variant — or the assertion is split across two
+  feature-gated targets so that each variant is named in the CI guard list.
+
+  **Not filed (deliberately):** R1's N1 — doc comments cite author-local `/tmp/tls-warn-probe/*.sh`
+  paths. Recording probe provenance that way is already this repository's style
+  (`frp-client/src/service.rs:1436` cites `/tmp/frp-source/client/service.go`,
+  `frp-core/src/config/normalize.rs:524` cites `/tmp/ws-probe-before.txt`,
+  `frp-client/tests/reload_warning_delivery.rs:11` cites `/tmp/enable-warn-probe/http_smoke.sh`), and
+  both reviewers reproduced the measurements independently, so no action is needed.
