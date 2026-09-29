@@ -6400,7 +6400,8 @@ section; ledger now **24 open / 104 closed**.**
   `empty_nested_value_is_unset_in_both_modes` (`frp-core/src/config/tests.rs`) and stated in the
   `tls_cert_file` / `tls_key_file` rows of `docs/config.md` in place of the removed "clears the flat
   value" clause.
-  **Ledger after this batch: 23 open / 104 closed** (29 open / 98 closed before it, measured with
+  **Ledger after this batch: 24 open / 104 closed** (29 open / 98 closed before it and 23 / 104 when this
+  note was first written — the `type`-less `.ini` item below was filed by the review afterwards), measured with
   `grep -cE '^- \[ \]' TODO.md` / `grep -cE '^- \[x\]' TODO.md`).
 
 - [ ] **A legacy `.ini` proxy section that omits `type` is dropped; Go v0.71.0 registers it as a `tcp`
@@ -6421,3 +6422,29 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** either accept a typeless legacy proxy section the way Go does (with the same `tcp`
   default, pinned in both loader modes) or state the `type` requirement in `docs/config.md` with a test
   pinning the current message and the `Proxies: 0` drop — a silent drop is not an option either way.
+
+
+- [ ] **Three pin-precision nits in `frpc/tests/admin_config_get_warning.rs`, filed by #408's final review
+  round.** All three are non-blocking, and all three were found after the fifth round had already returned
+  MERGE: the batch merged on two MERGE verdicts and these are recorded rather than re-reviewed.
+  (a) **A wrong mechanism claim in the new row's comment** (R2, R5-1). The
+  `seed_resolves_spellings_only_the_loader_does` comment attributes the row's discrimination to "the per-key
+  section merge". That path never consults it: `load_config_from_file` computes
+  `ConfigPresence::web_server_tls_enable_set_in(&value)` from the raw, includes-resolved value **before**
+  `normalize` (where `merge_section_into` lives), and the detector finds the `[common.webServer.tls]` shape
+  through its own fallback. Proof: a mutant that drops `merge_section_into`'s `Occupied` arm leaves the target
+  **4/4 green** while `both_web_server_sections_merge_per_key_in_both_modes` FAILS. The row does correctly pin
+  "the seed goes through the loader" — the merge is pinned by its own frp-core test. The same loose wording
+  sits in the frp-core detector test's "different keys to the flatten and merge afterwards" comment.
+  (b) **An unreached assertion described as reached** (R2, R5-2). The target's "what it does not cover" says
+  the two `NO_BASELINE` cases "are red" under the failure-mode mutant (`.unwrap_or(WS_TLS_ENABLE_NO_BASELINE)`
+  → `ABSENT`). Measured: the target stays **4/4 green** and the in-process test reds at
+  `frp-client/src/admin.rs:2044:9` (`left: 2 right: 0`) — the **`None`** assertion; the missing-path assertion
+  at `:2047-2052` is never reached because the test panics first. Both assertions encode `NO_BASELINE`, so the
+  substance (caught in-process, not by the target) is right.
+  (c) **The row does not pin that the seed honours its argument** (R1). A seed that ignores `config_path` and
+  reads `./frpc.toml` passes all four rows, because the harness always writes `frpc.toml` into the child's cwd;
+  the in-process test does red it (`left: 0, right: 1`). A fixture with a non-default filename closes it.
+  **Done-when:** (a) and (b) state what the row and the failure mode actually pin, and (c) is closed by a
+  non-default-filename fixture in the target — or the row's "what it does not cover" says plainly that the
+  argument is pinned in-process only.
