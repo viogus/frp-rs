@@ -425,11 +425,15 @@ fn no_warning_for_a_config_without_the_key() {
     assert_eq!(occurrences(&err, KEY), 0, "stderr:\n{err}");
 }
 
-/// The mixed-sections shape gets no record: a top-level `[web_server]` makes the
-/// rename discard the whole `[webServer]` table, nested `tls` included, so the
-/// key never reaches the removal site. The detector mirrors that on purpose.
+/// The mixed-sections shape warns: `[webServer]` and `[web_server]` are the same
+/// section, merged per key, so the camelCase `[webServer.tls]` table reaches the
+/// removal site and the client emits the record like any other nested spelling.
+/// (Before the merge a top-level `[web_server]` discarded the whole `[webServer]`
+/// table and this test pinned the silence, with the detector mirroring the
+/// discard so it would not report a dropped key. It now mirrors the merge — it
+/// must neither claim a dropped key nor miss a kept one.)
 #[test]
-fn no_warning_when_the_camelcase_table_is_discarded() {
+fn warning_when_the_camelcase_tls_table_is_merged_into_the_snake_section() {
     let dir = TempDir::new("mixed");
     let cfg = frpc_config(free_port(), free_port(), Section::MixedSections);
     let path = dir.write("frpc.toml", &cfg);
@@ -440,7 +444,11 @@ fn no_warning_when_the_camelcase_table_is_discarded() {
         out.contains(STARTUP_MARKER),
         "no startup line\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
     );
-    assert_eq!(occurrences(&out, KEY), 0, "stdout:\n{out}");
+    assert_eq!(
+        occurrences(&out, KEY),
+        1,
+        "exactly one record on the console sink\n--- stdout ---\n{out}"
+    );
     assert_eq!(occurrences(&err, KEY), 0, "stderr:\n{err}");
 }
 
