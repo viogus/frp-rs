@@ -420,12 +420,22 @@ User-facing release notes for frp-rs.
   expanded into nested tables, exactly as TOML/YAML/JSON write it. Two kinds of
   section are deliberately **not** split, and both stay exactly as they were: a
   legacy proxy section that carries a `type` key (`[auth.foo]`, `[store.frontend]`,
-  `[log.svc]` — in the legacy dialect any non-`[common]` section is a proxy, and
-  the name is a flat user-chosen identifier, as in Go's own `.ini` loader), and
-  anything whose first segment is not a v1 root (`[plugin.NAME]`). A genuine
-  conflict (`[webServer] tls = 1` beside `[webServer.tls]`) is reported instead of
-  silently clobbered; the one shape the expansion still cannot express is a v1
-  nested table that itself carries `type` (a `[visitors.plugin]`-style table). This is a frp-rs extension: Go's `.ini` path is the legacy
+  `[log.svc]`), and anything whose first segment is not a v1 root
+  (`[plugin.NAME]`). The first is needed because a legacy proxy's name is a flat,
+  user-chosen identifier — that is **Go's** `.ini` dialect, where every
+  non-`[common]` section is a proxy (`pkg/config/legacy/client.go`); frp-rs's own
+  `collect_legacy_ini_proxy_sections` additionally requires the `type` key, so a
+  typeless proxy section is dropped here (and on the base tree) where Go registers
+  it as a `tcp` proxy — a pre-existing parity gap, filed in `TODO.md` rather than
+  folded into this change. A genuine
+  conflict is reported instead of silently clobbered **when the containing section
+  comes first** (`[webServer] tls = 1` before `[webServer.tls]` → rc 1); in the
+  reverse order the later section's scalar wins and the nested table is dropped
+  with the file loading rc 0 (both orders pinned, both loader modes). The one
+  shape the expansion still cannot express is a v1 nested table that itself
+  carries `type` (a `[visitors.plugin]`-style table): it stays flat, so on the
+  client the legacy collector reads it as a proxy named after the header and
+  proxy validation refuses it. This is a frp-rs extension: Go's `.ini` path is the legacy
   loader and never reads these sections at all.
 - **A nested `[web_server.tls]` key can no longer silently become a real
   `[web_server]` field.** The hoist re-inserted every unmapped nested key at the
@@ -458,9 +468,10 @@ User-facing release notes for frp-rs.
   request — went through the silent file API, so three GETs added zero records
   while three PUTs added three. It now emits, **once per state change** rather
   than once per request: the route is polled, and the fact is a property of the
-  file, not of the request. The first GET after startup — or after a PUT's reload,
-  which resets the cell — only establishes the baseline silently, so the endpoint
-  neither repeats the startup record nor the reload's.
+  file, not of the request. The cell is seeded from the file when the admin server
+  starts, so the endpoint never repeats the startup record while a hand-edit that
+  adds the key after startup is still reported; a PUT's reload resets the cell, so
+  a following GET does not repeat that record either.
 - **A server config that writes `tls_enable` now says so instead of loading in
   silence.** The field is inert on the server — nothing in `frp-server` / `frps`
   reads it — so a `tls_enable = true` in `frps.toml` bought neither an effect nor

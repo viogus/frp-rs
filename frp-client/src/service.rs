@@ -4364,6 +4364,15 @@ impl Service {
                 &cfg_snapshot.web_server.addr,
                 cfg_snapshot.web_server.port,
             );
+            // Seed the admin config GET's dedup cell with the answer the startup
+            // load just reported, so a GET does not repeat that record — and, the
+            // reason it is seeded rather than left at `NO_BASELINE`, so a
+            // hand-edit that *adds* `[web_server.tls] enable` between startup and
+            // the first GET is still reported (the seed recorded "absent").
+            // Best-effort: an unreadable file leaves `NO_BASELINE`, and the first
+            // GET then baselines silently. See
+            // `crate::admin::seed_web_server_tls_enable_seen`.
+            let seeded = crate::admin::seed_web_server_tls_enable_seen(self.config_file.as_deref());
             let admin_state = AdminState {
                 proxy_metrics: self.proxy_metrics.clone(),
                 proxies: self.proxy_info_map.clone(),
@@ -4371,13 +4380,7 @@ impl Service {
                 stop_tx: stop_tx.clone(),
                 config_path: self.config_file.clone(),
                 store: self.store_source.clone(),
-                // The admin config GET deduplicates the inert
-                // `[web_server.tls] enable` record per state change (the route
-                // is polled). Starts at 0 = "no baseline yet, and the state the
-                // startup load just reported", so the first GET establishes the
-                // baseline silently instead of duplicating the startup record;
-                // see `config_from_file` in `frp-client/src/admin.rs`.
-                web_server_tls_enable_seen: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                web_server_tls_enable_seen: Arc::new(std::sync::atomic::AtomicU8::new(seeded)),
             };
             let admin_auth_user = cfg_snapshot.web_server.user.clone();
             let admin_auth_pwd = cfg_snapshot.web_server.password.clone();

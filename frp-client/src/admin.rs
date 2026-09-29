@@ -38,6 +38,46 @@ struct ProxyStatusEntry {
     source: Option<String>,
 }
 
+/// Cell values for [`AdminState::web_server_tls_enable_seen`].
+///
+/// `NO_BASELINE` means "no baseline yet, and the file's current state was already
+/// reported by another emitter" — the next GET then *establishes* the baseline
+/// silently instead of warning. `spawn_admin_server` seeds the cell from the file
+/// so this only happens when the file could not be read at startup, and
+/// `handle_put_config` resets it to `NO_BASELINE` after a reload has emitted.
+pub const WS_TLS_ENABLE_NO_BASELINE: u8 = 0;
+/// The last observed answer was "the file wrote `[web_server.tls] enable`".
+pub const WS_TLS_ENABLE_WRITTEN: u8 = 1;
+/// The last observed answer was "the file did not write it".
+pub const WS_TLS_ENABLE_ABSENT: u8 = 2;
+
+/// The seed for [`AdminState::web_server_tls_enable_seen`] of a freshly spawned
+/// admin server: the answer the **startup load** just reported.
+///
+/// Seeding (rather than starting at [`WS_TLS_ENABLE_NO_BASELINE`]) is what makes
+/// the endpoint's dedup correct in both directions: a file that already wrote
+/// `[web_server.tls] enable` at startup cannot produce a second record on the
+/// first GET, and a hand-edit that *adds* the key between startup and the first
+/// GET is still reported, because the seed recorded "absent". Starting at
+/// `NO_BASELINE` (the first cut) baselined that edit silently and lost it.
+///
+/// Best-effort by design: no path, or a file that cannot be read or parsed,
+/// yields [`WS_TLS_ENABLE_NO_BASELINE`] and the first GET then baselines
+/// silently — the same behaviour the endpoint had before seeding, and the right
+/// degradation for a file the admin server cannot load anyway.
+pub fn seed_web_server_tls_enable_seen(config_path: Option<&str>) -> u8 {
+    config_path
+        .and_then(|path| frp_core::config::load_client_config_with_presence(path, false).ok())
+        .map(|(_, presence)| {
+            if presence.web_server_tls_enable_set() {
+                WS_TLS_ENABLE_WRITTEN
+            } else {
+                WS_TLS_ENABLE_ABSENT
+            }
+        })
+        .unwrap_or(WS_TLS_ENABLE_NO_BASELINE)
+}
+
 #[derive(Clone)]
 pub struct AdminState {
     pub proxy_metrics: Arc<ProxyMetricsRegistry>,
@@ -54,7 +94,10 @@ pub struct AdminState {
     ///
     /// `0` = **no baseline yet** (and the file's current state has already been
     /// reported by another emitter — the startup load, or the reload a PUT
-    /// triggers), `1` = observed written, `2` = observed absent. The endpoint is
+    /// triggers), `1` = observed written, `2` = observed absent. The cell is
+    /// **seeded from the file** by `seed_web_server_tls_enable_seen` when the
+    /// admin server starts, so `0` is reached only when that read failed or
+    /// right after a PUT reset it. The endpoint is
     /// polled (`/api/proxy/{name}/config`, `/api/visitor/{name}/config`), so
     /// warning per request would be a log flood carrying no new information,
     /// while the fact being warned about is a property of the file, not of the
@@ -658,13 +701,17 @@ async fn handle_get_visitor_config(
 /// fact being warned about (`enable` was written in the file) is a property of
 /// the file, not of the request.
 ///
-/// The cell on `AdminState` holds the last answer **this endpoint** observed, and
-/// `0` means "no baseline yet, and the file's current state has already been
-/// reported by another emitter". The first GET after such an event therefore
-/// *establishes* the baseline silently rather than warning, which is what keeps
-/// the endpoint from duplicating the record the startup load already emitted (and
-/// the one the service reload emits for a PUT, which is why `handle_put_config`
-/// clears the cell after a successful reload). After that baseline, the record is
+/// The cell on `AdminState` holds the last answer observed, and
+/// [`WS_TLS_ENABLE_NO_BASELINE`] means "no baseline yet, and the file's current
+/// state was already reported by another emitter". `spawn_admin_server` **seeds**
+/// the cell from the file at startup, so in the ordinary run the cell already
+/// holds the state the startup load reported: a file that wrote the key produces
+/// **0** extra records on the first GET, and — the point of seeding rather than
+/// starting at `NO_BASELINE` — a hand-edit that *adds* the key after startup but
+/// before the first GET **is** reported, because the seed recorded "absent".
+/// `NO_BASELINE` is therefore reached only when the config file could not be read
+/// at startup, or right after `handle_put_config` reset it (the PUT's reload has
+/// already emitted for the file it read). After the baseline, the record is
 /// emitted only when the answer becomes "written" — so editing the file to drop
 /// the key and then re-adding it warns again, and a plain per-process `once` would
 /// be wrong in the other direction.
@@ -689,14 +736,16 @@ fn config_from_file(
                 format!("failed to load config: {e}"),
             )
         })?;
-    const NO_BASELINE: u8 = 0;
-    const WRITTEN: u8 = 1;
-    const ABSENT: u8 = 2;
     let written = presence.web_server_tls_enable_set();
-    let previous = state
-        .web_server_tls_enable_seen
-        .swap(if written { WRITTEN } else { ABSENT }, Ordering::Relaxed);
-    if written && previous != NO_BASELINE && previous != WRITTEN {
+    let previous = state.web_server_tls_enable_seen.swap(
+        if written {
+            WS_TLS_ENABLE_WRITTEN
+        } else {
+            WS_TLS_ENABLE_ABSENT
+        },
+        Ordering::Relaxed,
+    );
+    if written && previous != WS_TLS_ENABLE_NO_BASELINE && previous != WS_TLS_ENABLE_WRITTEN {
         presence.warn_inert_web_server_tls_enable();
     }
     Ok(cfg)
@@ -760,7 +809,9 @@ async fn handle_put_config(
     // repeating the reload's record. See `config_from_file`.
     let result = reload_and_wait(&state, true).await;
     if result.is_ok() {
-        state.web_server_tls_enable_seen.store(0, Ordering::Relaxed);
+        state
+            .web_server_tls_enable_seen
+            .store(WS_TLS_ENABLE_NO_BASELINE, Ordering::Relaxed);
     }
     result.map(|_| "update success")
 }
@@ -1881,28 +1932,38 @@ passwd = "socks-pass"
     /// emission is deduplicated: the route is polled, and the fact is a
     /// property of the file, not of the request.
     ///
-    /// **What this models.** The whole cell protocol, in order: a fresh cell
-    /// (`0`) with a file that wrote the key → the first GET **baselines
-    /// silently** and three GETs add **0** records (the startup load already
-    /// reported this file, so the endpoint must not repeat it); the file
-    /// rewritten without the key → still 0 (the change to "absent" warns
-    /// nothing); rewritten **with** the key → **1** (a real state change); a
-    /// stable written file polled again → still 1 (no per-poll flood); and after
-    /// `handle_put_config` resets the cell to `0`, the next GET baselines
-    /// silently again → still 1, so the reload's record is not duplicated. The
-    /// config itself is asserted to load in every case, so the emission cannot
-    /// have replaced the return value.
+    /// **What this models.** The seed plus the whole cell protocol, in order.
+    /// `seed_web_server_tls_enable_seen` (what `spawn_admin_server` calls) maps a
+    /// real file to `WRITTEN` / `ABSENT`, and a missing path or unreadable file
+    /// to `NO_BASELINE`. Then, against the shipped `config_from_file`:
+    ///
+    /// * seeded **`ABSENT`** (the file had no key at startup) with a file that
+    ///   still has none → 0 records; and, the case the seed exists for, a
+    ///   **hand-edit that adds the key** before the first GET → **1** record (the
+    ///   previous `NO_BASELINE` start lost it);
+    /// * seeded **`WRITTEN`** (the file already had the key at startup) with the
+    ///   key still there, three GETs → **0** (the startup record is not repeated);
+    ///   the file rewritten without the key → 0; rewritten with it → **1**; polled
+    ///   three more times → **1** (no per-poll flood);
+    /// * seeded **`NO_BASELINE`** (the seed's failure mode, and what
+    ///   `handle_put_config` resets to) with the key present → the first GET
+    ///   baselines silently → **0**, and a later add → **1**.
+    ///
+    /// The config itself is asserted to load in every case, so the emission
+    /// cannot have replaced the return value.
     ///
     /// **What it does not cover.** The HTTP layer itself (routing, auth,
     /// status codes) — other tests in this module cover the router, and the
-    /// handler's use of `config_from_file` is a one-line call; a real PUT +
-    /// reload round trip (the reset is asserted directly, and
-    /// `handle_put_config` is the only caller of the reset); a file edited
-    /// outside the admin API and a reload triggered by something else, which
-    /// deliberately emits twice (the reload's per-load record plus the GET's
-    /// state-change record — see `config_from_file`); the exact poll cadence of
-    /// any particular client; and the equivalent **server** admin paths, of
-    /// which there are none (this is a client-only API).
+    /// handler's use of `config_from_file` is a one-line call; the call to the
+    /// seed from `spawn_admin_server` (this pins the seed function and the cell
+    /// separately — the wiring is one line and needs a whole `Service` to
+    /// exercise); a real PUT + reload round trip (the reset is asserted
+    /// directly, and `handle_put_config` is the only caller of the reset); a file
+    /// edited *outside* the admin API with a reload triggered by something else,
+    /// which deliberately emits twice (the reload's per-load record plus the
+    /// GET's state-change record — see `config_from_file`); the exact poll
+    /// cadence of any particular client; and the equivalent **server** admin
+    /// paths, of which there are none (this is a client-only API).
     #[test]
     fn admin_config_get_warns_once_per_state_change() {
         let dir = tempfile::tempdir().unwrap();
@@ -1935,49 +1996,97 @@ passwd = "socks-pass"
             let cfg = config_from_file(state).expect("the GET load must succeed");
             assert_eq!(cfg.web_server.port, 7400);
         };
+        let seed = |state: &AdminState| {
+            let value = seed_web_server_tls_enable_seen(state.config_path.as_deref());
+            state
+                .web_server_tls_enable_seen
+                .store(value, std::sync::atomic::Ordering::Relaxed);
+            value
+        };
 
-        // Fresh cell (`0`), file writes the key: the first GET baselines
-        // silently — the startup load already reported this file — and the
-        // polls after it stay silent too.
+        // The seed itself: the answer the startup load reported, or `NO_BASELINE`
+        // when there is nothing to read.
         std::fs::write(&path, with_key).unwrap();
+        assert_eq!(
+            seed_web_server_tls_enable_seen(Some(path.to_str().unwrap())),
+            WS_TLS_ENABLE_WRITTEN
+        );
+        std::fs::write(&path, without_key).unwrap();
+        assert_eq!(
+            seed_web_server_tls_enable_seen(Some(path.to_str().unwrap())),
+            WS_TLS_ENABLE_ABSENT
+        );
+        assert_eq!(
+            seed_web_server_tls_enable_seen(None),
+            WS_TLS_ENABLE_NO_BASELINE
+        );
+        assert_eq!(
+            seed_web_server_tls_enable_seen(Some(
+                dir.path().join("missing.toml").to_str().unwrap()
+            )),
+            WS_TLS_ENABLE_NO_BASELINE
+        );
+
+        // Seeded ABSENT, file still without the key: silent.
+        assert_eq!(seed(&state), WS_TLS_ENABLE_ABSENT);
+        get(&state);
+        assert_eq!(records(&output), 0);
+
+        // The hand-edit window: the key is added after startup, before the next
+        // GET. The seed recorded "absent", so this is a real state change.
+        std::fs::write(&path, with_key).unwrap();
+        get(&state);
+        assert_eq!(
+            records(&output),
+            1,
+            "a hand-edit that adds the key after the seed is reported"
+        );
+
+        // Seeded WRITTEN, file with the key: the startup record is not repeated,
+        // even over three polls.
+        std::fs::write(&path, with_key).unwrap();
+        assert_eq!(seed(&state), WS_TLS_ENABLE_WRITTEN);
         for _ in 0..3 {
             get(&state);
         }
         assert_eq!(
             records(&output),
-            0,
-            "the first GET baselines; the startup record is not duplicated"
+            1,
+            "no second record for the startup state"
         );
 
         // The answer changes to "absent": no record, and the baseline moves.
         std::fs::write(&path, without_key).unwrap();
         get(&state);
-        assert_eq!(records(&output), 0, "a change to `absent` is not a warning");
+        assert_eq!(records(&output), 1, "a change to `absent` is not a warning");
 
-        // …and back: the state change warns.
+        // …and back: the state change warns, once.
         std::fs::write(&path, with_key).unwrap();
         get(&state);
-        assert_eq!(records(&output), 1, "re-adding the key warns again");
-
-        // A stable written file polled again emits nothing more: the dedup is
-        // per state change, not per request.
+        assert_eq!(records(&output), 2, "re-adding the key warns again");
         for _ in 0..3 {
             get(&state);
         }
-        assert_eq!(records(&output), 1, "no per-poll flood");
+        assert_eq!(records(&output), 2, "no per-poll flood");
 
-        // `handle_put_config` clears the cell after a successful reload (the
-        // reload emitted for the file it read), so the next GET baselines
-        // silently instead of repeating that record.
-        state
-            .web_server_tls_enable_seen
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        // `NO_BASELINE` — the seed's failure mode, and what `handle_put_config`
+        // resets to after the reload has emitted: the next GET baselines
+        // silently, and a later add still warns.
+        state.web_server_tls_enable_seen.store(
+            WS_TLS_ENABLE_NO_BASELINE,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         get(&state);
         assert_eq!(
             records(&output),
-            1,
+            2,
             "a GET after a PUT does not duplicate the reload's record"
         );
+        std::fs::write(&path, without_key).unwrap();
+        get(&state);
+        std::fs::write(&path, with_key).unwrap();
+        get(&state);
+        assert_eq!(records(&output), 3, "a later add still warns");
         drop(guard);
     }
 }

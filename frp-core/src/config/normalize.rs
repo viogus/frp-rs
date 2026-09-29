@@ -1700,13 +1700,16 @@ fn normalize_web_server_section(table: &mut toml::Table) {
     // `ConfigPresence::web_server_tls_enable_set`, and
     // `ConfigPresence::warn_inert_web_server_tls_enable` is called by every load
     // site that has a sink: `frps`'s two startup paths, `frpc`'s two plus
-    // `frpc verify`, the two in-process **reloads** (`frp-server`/`frp-client`,
-    // library crates) and the `frpc` admin API's config **GET**
-    // (`frp_client::admin::config_from_file`, deduplicated per state change).
-    // One site stays silent on purpose and is named in `docs/config.md`:
-    // `frps verify` (its logging is never initialised). Do not re-add an
-    // emission here: it would double the record wherever the sink is already
-    // installed (`--config-dir`, the reloads) while still being dropped on `-c`.
+    // `frpc verify`, and the two in-process **reloads**
+    // (`frp-server`/`frp-client`, library crates). One more site — the `frpc`
+    // admin API's config **GET** (`frp_client::admin::config_from_file`) — emits
+    // on a **state change** rather than per load, because that route is polled:
+    // its cell is seeded from the file at admin-server startup, so a GET does not
+    // repeat the startup record. One site stays silent on purpose and is named in
+    // `docs/config.md`: `frps verify` (its logging is never initialised). Do not
+    // re-add an emission here: it would double the record wherever the sink is
+    // already installed (`--config-dir`, the reloads) while still being dropped
+    // on `-c`.
     tls.remove("enable");
 
     // Anything left is a key this section does not have. It **stays nested**;

@@ -6117,7 +6117,9 @@ nothing about whether the described behaviour still holds.
 
 **Findings filed by the `[web_server.tls]` fix round (all pre-existing, all measured 2026-09-29 at `ccff127`).
 All six were closed in the `fix/webserver-tls-cluster` batch (A–F below, each with its own Done note and
-measured evidence); ledger after that batch: 23 open / 104 closed.**
+measured evidence); ledger after that batch: 23 open / 104 closed. A seventh finding — a legacy `.ini`
+proxy section without a `type` key, filed by the batch's review round — is open at the end of this
+section; ledger now **24 open / 104 closed**.**
 - [x] **A file that defines both `[webServer]` and `[web_server]` silently discards the whole
   `[webServer]` table — including a nested `[webServer.tls]`.** `normalize_server_config` renames the
   section with `table.entry("web_server").or_insert(v)` (`frp-core/src/config/normalize.rs`), an
@@ -6316,15 +6318,22 @@ measured evidence); ledger after that batch: 23 open / 104 closed.**
   `ConfigPresence::warn_inert_web_server_tls_enable` itself, **once per state change rather than once
   per request**. The decision is recorded on the function and on
   `AdminState::web_server_tls_enable_seen`: both routes are polled, so a per-request record would be a
-  log flood carrying no new information, while the fact is a property of the file; warning when the
-  answer becomes "written" (and again if the file is edited to remove and re-add the key) keeps the
-  signal and drops the noise. Measured in-process by `admin_config_get_warns_once_per_state_change`
-  (`frp-client/src/admin.rs`): three GETs over a file with the key -> 1 record; the file rewritten
-  without it -> still 1; rewritten back -> 2; a stable absent file -> 2. The pre-fix measurement the
+  log flood carrying no new information, while the fact is a property of the file. The cell holds
+  `0 = no baseline`, `1 = written`, `2 = absent`; `spawn_admin_server` **seeds it from the file** at
+  startup (so a file that already wrote the key produces no second record on the first GET, and a
+  hand-edit made after startup is still reported), the record fires when the answer becomes
+  "written", and `handle_put_config` resets the cell to `0` after a successful reload so a following
+  GET cannot repeat the reload's record. Measured in-process by
+  `admin_config_get_warns_once_per_state_change` (`frp-client/src/admin.rs`), the shipped numbers:
+  seeded cell + a file with the key, three GETs -> **0** (baseline; the startup record is not
+  repeated); rewritten without the key -> **0**; rewritten with it -> **1**; polled three more times
+  -> **1** (no per-poll flood); cell reset (the PUT path) + GET -> **1**; and a hand-edit that adds
+  the key after the seed -> **1** (the window the seed exists to cover). The pre-fix measurement the
   item filed (3 GETs -> **+0** records, 3 PUTs -> +3) stands as the "before". The test target's "what
   it does not cover" (`frp-core/tests/web_server_tls_enable_warning.rs`), the
-  `warn_inert_web_server_tls_enable` doc (`frp-core/src/config/loader.rs`) and the `docs/config.md`
-  site list moved with it — `frps verify` is now the only site that gets no record.
+  `warn_inert_web_server_tls_enable` doc (`frp-core/src/config/loader.rs`), the emission comment in
+  `normalize_web_server_section` (`frp-core/src/config/normalize.rs`) and the `docs/config.md` site
+  list moved with it — `frps verify` is now the only site that gets no record.
 - [x] **A parent-level `certFile` alias beside the parent-level canonical `tls_cert_file` is a
   `duplicate field` error — with no nested key involved at all.** serde binds `web_server.certFile`
   as an `alias` of `web_server.tls_cert_file`, so a file that writes both (in any spelling mix that
@@ -6382,3 +6391,22 @@ measured evidence); ledger after that batch: 23 open / 104 closed.**
   value" clause.
   **Ledger after this batch: 23 open / 104 closed** (29 open / 98 closed before it, measured with
   `grep -cE '^- \[ \]' TODO.md` / `grep -cE '^- \[x\]' TODO.md`).
+
+- [ ] **A legacy `.ini` proxy section that omits `type` is dropped; Go v0.71.0 registers it as a `tcp`
+  proxy.** Filed by the `fix/webserver-tls-cluster` review round while pinning the `.ini` dotted-header
+  expansion — not caused by it (base `d958711` behaves the same), and not specific to the dotted
+  spelling: a plain legacy name (`[myproxy]`) is dropped identically. **Go's legacy `.ini` dialect
+  treats every non-`[common]` section as a proxy** (`pkg/config/legacy/client.go`), while frp-rs's
+  `collect_legacy_ini_proxy_sections` (`frp-core/src/config/normalize.rs`) collects a section only when
+  its table carries a `type` key. Measured with the real binaries (probe `/tmp/wsprobe3/run2.sh`;
+  `--strict-config=false` and `--strict-config` both spelled out, because the flag defaults to **true**):
+  `[auth.foo]` and `[myproxy]`, each with `local_port` / `remote_port` and no `type` —
+  `frpc verify --strict-config=false` rc 0 with `Proxies: 0` (a **silent** drop) and
+  `--strict-config` rc 1 `unknown field "auth.foo"` / `"myproxy"`; a real frp-rs `frps`+`frpc` run
+  registers **0** proxies. Go v0.71.0: `frpc verify` rc 0 under both flag spellings for both shapes, and
+  a real Go `frps`+`frpc` run logs `proxy added: [auth.foo]` /
+  `[auth.foo] start proxy success` (likewise `[myproxy]`), with the server reporting
+  `new proxy [myproxy] type [tcp] success` — i.e. **Go defaults the missing type to `tcp`**.
+  **Done-when:** either accept a typeless legacy proxy section the way Go does (with the same `tcp`
+  default, pinned in both loader modes) or state the `type` requirement in `docs/config.md` with a test
+  pinning the current message and the `Proxies: 0` drop — a silent drop is not an option either way.

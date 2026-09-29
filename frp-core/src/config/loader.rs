@@ -239,17 +239,19 @@ pub struct ConfigPresence {
 /// `init_logging`, which is the whole point of the presence flag.
 ///
 /// The sites that call it are the ones with a log sink: `frps`'s two startup
-/// paths, `frpc`'s two startup paths plus `frpc verify`, the two in-process
+/// paths, `frpc`'s two startup paths plus `frpc verify`, and the two in-process
 /// **reloads** (`frp-server`'s `Service::reload`, `frp-client`'s
-/// `reload_from_sources`), and the `frpc` admin API's config **GET** — one
-/// record per load, so a reload adds one rather than replacing the startup
-/// record. The admin GET (`frp_client::admin::config_from_file`) polls a file on
-/// every request, so it emits only when the answer **changes** (see the code
-/// comment there); the admin **PUT** (`handle_put_config`) validates with
-/// `load_client_config_from_str`, which is silent, but then triggers the service
-/// reload, so it delivers once per request via the reload site. The one site
-/// that stays silent is the one with no sink at all: `frps verify` (it never
-/// installs a subscriber), which is why its one-line output stays one line.
+/// `reload_from_sources`) — one record per load, so a reload adds one rather than
+/// replacing the startup record.
+///
+/// The `frpc` admin API's config **GET** is the exception, because it is the only
+/// **polled** site: `frp_client::admin::config_from_file` emits on a **state
+/// change**, not per request. Its `AdminState` cell is seeded from the file at
+/// admin-server startup, so a file that already wrote the key produces **0**
+/// extra records on the first GET (the startup load's record is not repeated) and
+/// only a later edit that adds the key emits. The one site that stays silent is
+/// the one with no sink at all: `frps verify` (it never installs a subscriber),
+/// which is why its one-line output stays one line.
 pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING: &str = "web_server.tls.enable has no \
      effect: the dashboard HTTPS server is enabled by a non-empty `cert_file` + `key_file` \
      pair; without that pair the dashboard serves plaintext HTTP";

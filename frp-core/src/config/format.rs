@@ -269,7 +269,12 @@ const INI_NESTED_SECTION_ROOTS: &[&str] = &[
 ///   section there too. Expanding it dropped the proxy in both loader modes; the
 ///   guard keeps it. (The cost, documented in `docs/config.md`: a v1 nested
 ///   table that itself carries `type` — a `[visitors.plugin]`-style table in an
-///   `.ini` — does not expand either, which is also what the base tree did.)
+///   `.ini` — does not expand either, which is also what the base tree did. It is
+///   then read as any other flat section: on the **client** the legacy collector
+///   takes it for a proxy named after the header and proxy validation refuses it
+///   (measured: `[visitors.plugin] type = "https2http"` → rc 1, `proxy
+///   'visitors.plugin': invalid proxy_type 'https2http'`), on the **server** it is
+///   an unknown strict-mode field.)
 /// * **A non-v1 first segment, quoting, or an empty path segment** keeps the
 ///   header verbatim, so `[plugin.user-manager]` stays the flat key its
 ///   `starts_with("plugin.")` handling reads.
@@ -293,10 +298,23 @@ fn ini_section_path(section: &str, table: &toml::Table) -> Option<Vec<String>> {
 /// Insert one collected section into the root value, either under its verbatim
 /// header text or under the nesting path [`ini_section_path`] returned.
 ///
-/// A path that runs into a value which is not a table is a genuine conflict,
-/// reported rather than silently clobbering the value already set. A **verbatim**
-/// name that collides with an existing non-table value keeps that value and drops
-/// the section's keys, which is the long-standing `or_insert` behaviour.
+/// A path that runs into a value which is not a table is a conflict, and whether
+/// it is **reported** depends on the order the sections appear in:
+///
+/// * `[webServer] tls = 1` **before** `[webServer.tls]` — the expansion walks into
+///   the scalar and errors (`section [webServer.tls] conflicts with the value
+///   already set at \`webServer.tls\``, both loader modes, rc 1);
+/// * the reverse order — the expansion builds the table first and the later
+///   verbatim `[webServer]` section *merges* its keys into it, so `tls = 1`
+///   overwrites the table and the nested values are dropped with the file loading
+///   rc 0 and `tls_cert() == ""` (measured, both modes).
+///
+/// Both orders are pinned by
+/// `dotted_ini_section_headers_become_nested_tables_in_both_modes`; the asymmetry
+/// is a property of "later key wins" in the verbatim path, not of the conflict
+/// check. A **verbatim** name that collides with an existing non-table value keeps
+/// that value and drops the section's keys, which is the long-standing `or_insert`
+/// behaviour.
 fn insert_ini_section(
     root: &mut toml::Table,
     section: &str,

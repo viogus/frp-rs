@@ -5946,11 +5946,14 @@ custom404Page = "<h1>nope</h1>"
 
 /// The nested `[web_server.tls]` section is **hoisted** onto the flat
 /// `web_server.tls_*` fields by `normalize_web_server_section`
-/// (`frp-core/src/config/normalize.rs`), because the `tls` table is removed
-/// before serde (and before `check_strict`) ever sees it. Two claims about that
-/// hoist are pinned here, each in **both** loader modes and — for precedence —
-/// in **both** orders, because the input shape the claim is about is what
-/// differs:
+/// (`frp-core/src/config/normalize.rs`), because the `tls` table's **mapped**
+/// keys are removed before serde sees them. (The table itself survives whenever
+/// it holds an unmapped key, and that residue is exactly what `check_strict`
+/// walks to report `web_server.tls.<key>` — see
+/// `unknown_nested_web_server_tls_key_names_the_true_nested_path`.) Two claims
+/// about that hoist are pinned here, each in **both** loader modes and — for
+/// precedence — in **both** orders, because the input shape the claim is about is
+/// what differs:
 ///
 /// 1. **Both spelling families reach the field.** `WebServerTlsConfig` declares
 ///    `cert_file` / `key_file` / `trusted_ca_file` / `server_name` as its
@@ -6432,8 +6435,9 @@ fn dotted_ini_section_headers_become_nested_tables_in_both_modes() {
     );
     load_server_config(path.to_str().unwrap(), false).unwrap();
 
-    // A genuine conflict — a scalar where the expanded path needs a table — is
-    // reported, not silently clobbered (the item's "must not collide" clause).
+    // A conflict — a scalar where the expanded path needs a table — is reported
+    // when the containing section comes **first** (the item's "must not collide"
+    // clause) …
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("frps.ini");
     std::fs::write(
@@ -6451,6 +6455,32 @@ fn dotted_ini_section_headers_become_nested_tables_in_both_modes() {
             err.contains("conflicts with the value already set at `webServer.tls`"),
             "strict={strict}: got {err}"
         );
+    }
+
+    // … and the reverse order is pinned too, because it does **not** error: the
+    // expansion builds the table first and the later verbatim `[webServer]`
+    // section merges `tls = 1` into it, overwriting the table. The file loads in
+    // both modes with the nested values gone (`tls_cert() == ""`). The asymmetry
+    // is stated in `insert_ini_section`'s doc and in `CHANGELOG.md`; pinning it
+    // here is what keeps the "reported instead of silently clobbered" sentence
+    // from quietly becoming false again.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(
+        &path,
+        "[common]\nbind_port = 7000\n[webServer.tls]\ncertFile = /nested/cert.pem\n\
+         [webServer]\nport = 7500\ntls = 1\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_server_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("reverse order must load, strict={strict}: {e}"));
+        assert_eq!(
+            cfg.web_server.tls_cert(),
+            "",
+            "strict={strict}: the later scalar `tls` overwrites the expanded table"
+        );
+        assert_eq!(cfg.web_server.port, 7500, "strict={strict}");
     }
 }
 
