@@ -2183,29 +2183,42 @@ mod oidc_throttle_tests {
 
     /// How long the mock waits for one accepted client's complete request head.
     ///
-    /// The accepted socket's mode is **platform-defined**, and that is what made
-    /// the original mock lose the request. On macOS, `accept()` on a
+    /// The accepted socket's mode is **platform-defined**, and it decides which
+    /// of the pre-fix failures a given host could see. On macOS, `accept()` on a
     /// `set_nonblocking(true)` listener yields a **non-blocking** stream
     /// (measured on this host, rustc 1.98.1: the first `read` with nothing sent
     /// returns `Err(WouldBlock, os error 35)`), so a single `read` returned 0
-    /// bytes whenever the accept beat the client's write. On Linux the accepted
-    /// stream is **blocking** (measured in a `rust:1.98.1-slim` container on
-    /// kernel 6.8.0/Ubuntu 24.04: the read waited out a 500 ms `SO_RCVTIMEO`,
-    /// and a pre-fix-style single read — no mode change, no timeout — returned
-    /// the full request 304.7 ms after a client that slept 300 ms before
-    /// writing), so the pre-fix mock served that same delayed request correctly
-    /// there. Every `ci.yml` job is `ubuntu-latest`, so the pre-fix 404 did not
-    /// reproduce in CI; it was a local-macOS phenomenon. This wait does not
-    /// depend on either mode — it clears `O_NONBLOCK` explicitly — so it is
-    /// correct on both. Bounded so a client that connects and never sends cannot
-    /// hold the serving thread.
+    /// bytes whenever the accept beat the client's write. That
+    /// **accept-before-bytes race is macOS-only**: on Linux the accepted stream
+    /// is **blocking** (measured in a `rust:1.98.1-slim` container on kernel
+    /// 6.8.0/Ubuntu 24.04: a 500 ms `SO_RCVTIMEO` was waited out in 515 ms, and a
+    /// pre-fix-style single read with no mode change returned the full request
+    /// 304.7 ms after a client that slept 300 ms before writing).
+    ///
+    /// The pre-fix `unwrap_or(0)` had **two further failures that are not
+    /// platform-specific**, so this wait is not a Linux no-op. (1) An EOF makes
+    /// `read` return `Ok(0)`, which `unwrap_or(0)` cannot distinguish from
+    /// `WouldBlock`: a client that connects and half-closes before sending gives
+    /// `n=0` → the `/` fallback → 404 on **both** platforms (measured: 3.833 µs
+    /// on macOS, 1.625 µs on Linux). (2) A head split across writes mis-routes,
+    /// because the single read returns only the prefix (measured on Linux:
+    /// `n=16`, `path="/.well-known"` → 404 after 208 ms). Every `ci.yml` job is
+    /// `ubuntu-latest`, so the *race* cannot flake CI — but those EOF and split
+    /// shapes could still 404 there. What this wait does not do is depend on the
+    /// inherited mode — it clears `O_NONBLOCK` explicitly — so it is correct on
+    /// both. Bounded so a client that connects and never sends cannot hold the
+    /// serving thread.
     ///
     /// What this does **not** cover: the stop channel is read only at the top of
     /// the accept loop, so a stop sent while the thread is inside this wait is
-    /// not observed until the wait ends — up to the deadline later. The bound is
-    /// on the client's stall, not on stop latency; the mock's threads are
-    /// process-lifetime test scaffolding and no caller blocks on one, so the
-    /// gap is recorded rather than bounded.
+    /// not observed until the wait ends — up to the deadline later (measured by
+    /// review: stop observed after 1.357 s macOS / 1.386 s Linux of a 1500 ms
+    /// read). A **dropped** sender is not a stop at all: `try_recv()` returns
+    /// `Err(Disconnected)`, for which `is_ok()` is false (measured), so the mock
+    /// keeps serving after `_stop` is dropped — only an explicit `send(())`
+    /// breaks the loop. The bound is on the client's stall, not on stop latency;
+    /// the mock's threads are process-lifetime test scaffolding and no caller
+    /// blocks on one, so the gap is recorded rather than bounded.
     const MOCK_REQUEST_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// Upper bound on the request head the mock buffers before giving up.
@@ -2511,6 +2524,34 @@ mod oidc_throttle_tests {
         );
     }
 
+    /// A client that connects and closes before sending anything is an **EOF**,
+    /// not a stall: `Ok(0)` must become the named `Eof` promptly. This is the
+    /// third failure the pre-fix `unwrap_or(0)` hid, and unlike the
+    /// accept-before-bytes race it is **not** platform-specific — an EOF gives
+    /// `n=0` on macOS and Linux alike (measured: 3.833 µs / 1.625 µs), which the
+    /// old code could not distinguish from `WouldBlock`. The mutant this pin is
+    /// written against is `Ok(0) => continue`, which leaves all six other pins
+    /// green and turns this fast, named EOF into a busy-wait to the deadline.
+    #[test]
+    fn read_request_head_reports_eof_when_the_client_closes_before_sending() {
+        let (mut server, client) = nonblocking_accepted_pair();
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close the client");
+        let started = std::time::Instant::now();
+        let err = read_request_head(&mut server, std::time::Duration::from_secs(2))
+            .expect_err("EOF must be reported, not turned into an empty head");
+        let waited = started.elapsed();
+        assert!(
+            matches!(err, RequestHeadError::Eof),
+            "expected Eof, got {err:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_millis(500),
+            "EOF must fail fast, not wait out the deadline (waited {waited:?})"
+        );
+    }
+
     /// The reader must **accumulate across reads**: an HTTP head can arrive in
     /// more than one segment. Two split points are covered, the second cutting
     /// the `\r\n\r\n` terminator itself in half — so an implementation that
@@ -2635,6 +2676,43 @@ mod oidc_throttle_tests {
         assert!(
             after.lines().next().unwrap_or("").contains(" 200 "),
             "the mock must keep serving after an expired wait, got {after:?}"
+        );
+    }
+
+    /// End to end, and **red on the pre-fix mock on both platforms**: a client
+    /// that connects and half-closes before sending anything made the old single
+    /// `read` return `Ok(0)`, which `unwrap_or(0)` mapped to 0 bytes → the `/`
+    /// route → `404 OK` (measured shapes: `n=0` → 404 on macOS *and* Linux, so
+    /// this is not the macOS-only accept race). It must be an explicit error
+    /// naming the closed socket.
+    #[test]
+    fn mock_idp_answers_an_explicit_error_when_the_client_closes_before_sending() {
+        let (issuer, _stop) = oidc_mock_server_with_timeout(std::time::Duration::from_millis(500));
+        let addr = issuer.strip_prefix("http://").expect("issuer host");
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect mock");
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close before sending");
+        let started = std::time::Instant::now();
+        let mut resp = String::new();
+        let _ = Read::read_to_string(&mut stream, &mut resp);
+        let waited = started.elapsed();
+        let first = resp.lines().next().unwrap_or("");
+        assert!(
+            first.contains(" 500 "),
+            "a closed client must be an explicit 500, got {first:?} (full: {resp:?})"
+        );
+        assert!(
+            !first.contains(" 404 "),
+            "a closed client must not be a silent 404: {first:?}"
+        );
+        assert!(
+            resp.contains("closed the socket"),
+            "the 500 body must name the EOF, got {resp:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "EOF must not wait out the deadline (waited {waited:?})"
         );
     }
 
