@@ -2127,6 +2127,101 @@ fn test_flat_camelcase_tls_spellings_are_not_loader_spellings() {
     }
 }
 
+/// Regression pin for `docs/config.md`: the four flat client TLS rows used to
+/// advertise `tlsEnable` / `tlsCertFile` / `tlsKeyFile` / `tlsCaFile` (and the
+/// second `tlsTrustedCaFile` spelling of the `tls_ca_file` row) as their
+/// "Go frp Equivalent". No loader accepts them —
+/// `frp-core/src/config/client.rs:264-270` declares those fields with
+/// `#[serde(default)]` and no alias, and Go v0.71.0 carries them under the
+/// nested `[transport.tls]` section, which
+/// `frp-core/src/config/normalize.rs:1352-1367` maps onto the flat fields.
+/// This pins both directions (the five spellings stay rejected, the two real
+/// aliases stay accepted) so the table cannot drift back.
+#[test]
+fn test_flat_camelcase_client_tls_spellings_are_not_loader_spellings() {
+    let rejected = [
+        ("tlsEnable", "false"),
+        ("tlsCertFile", "\"/cc.crt\""),
+        ("tlsKeyFile", "\"/cc.key\""),
+        ("tlsCaFile", "\"/cc-ca.crt\""),
+        ("tlsTrustedCaFile", "\"/cc-ca.crt\""),
+    ];
+
+    // 1. Non-strict (the SIGUSR1 reload mode): ignored, every field stays at
+    //    its default — `tls_enable` keeps the client's `true` default, so a
+    //    flat `tlsEnable = false` must not clear it.
+    for &(key, value) in rejected.iter() {
+        let cfg =
+            load_client_config_from_str(&format!("server_addr = '127.0.0.1'\n{key} = {value}\n"))
+                .unwrap_or_else(|e| panic!("{key} must not fail the non-strict load: {e}"));
+        assert!(cfg.tls_enable, "{key} unexpectedly cleared tls_enable");
+        assert_eq!(
+            cfg.tls_cert_file, "",
+            "{key} unexpectedly set tls_cert_file"
+        );
+        assert_eq!(cfg.tls_key_file, "", "{key} unexpectedly set tls_key_file");
+        assert_eq!(cfg.tls_ca_file, "", "{key} unexpectedly set tls_ca_file");
+    }
+
+    // 2. Strict (frpc's default): each is refused, and the message names the
+    //    offending key.
+    for &(key, value) in rejected.iter() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "server_addr = '127.0.0.1'\n{key} = {value}\n").unwrap();
+        let err = super::file::load_client_config(file.path().to_str().unwrap(), true)
+            .expect_err("camelCase flat spelling must be refused in strict mode")
+            .to_string();
+        assert!(
+            err.contains(key),
+            "{key} refused, but the message does not name it: {err}"
+        );
+    }
+
+    // 3. The nested `[transport.tls]` spellings DO load, in both modes, and
+    //    land on the same flat fields.
+    let nested = "[transport.tls]\nenable = false\ncertFile = \"/n.crt\"\nkeyFile = \"/n.key\"\ntrustedCaFile = \"/n-ca.crt\"\n";
+    let cfg = load_client_config_from_str(&format!("server_addr = '127.0.0.1'\n{nested}")).unwrap();
+    assert!(!cfg.tls_enable);
+    assert_eq!(cfg.tls_cert_file, "/n.crt");
+    assert_eq!(cfg.tls_key_file, "/n.key");
+    assert_eq!(cfg.tls_ca_file, "/n-ca.crt");
+
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    write!(file, "server_addr = '127.0.0.1'\n{nested}").unwrap();
+    let cfg = super::file::load_client_config(file.path().to_str().unwrap(), true).unwrap();
+    assert!(!cfg.tls_enable);
+    assert_eq!(cfg.tls_cert_file, "/n.crt");
+    assert_eq!(cfg.tls_key_file, "/n.key");
+    assert_eq!(cfg.tls_ca_file, "/n-ca.crt");
+
+    // 4. The two flat aliases that DO work load in both modes, and the
+    //    strict-mode allow-list agrees: they are in it and the five camelCase
+    //    spellings are not. `known_client_keys` is `pub(super)` and this module
+    //    is a child of `config`, so it is reachable without widening its
+    //    visibility.
+    let aliases = "tlsServerName = \"frpc.example.com\"\ndisableCustomTLSFirstByte = false\n";
+    let cfg =
+        load_client_config_from_str(&format!("server_addr = '127.0.0.1'\n{aliases}")).unwrap();
+    assert_eq!(cfg.tls_server_name, "frpc.example.com");
+    assert!(!cfg.disable_custom_tls_first_byte);
+
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    write!(file, "server_addr = '127.0.0.1'\n{aliases}").unwrap();
+    let cfg = super::file::load_client_config(file.path().to_str().unwrap(), true).unwrap();
+    assert_eq!(cfg.tls_server_name, "frpc.example.com");
+    assert!(!cfg.disable_custom_tls_first_byte);
+
+    let known = super::strict::known_client_keys();
+    assert!(known.contains("tlsServerName"));
+    assert!(known.contains("disableCustomTLSFirstByte"));
+    for &(key, _) in rejected.iter() {
+        assert!(
+            !known.contains(key),
+            "{key} must not be in known_client_keys()"
+        );
+    }
+}
+
 #[test]
 fn test_client_disable_custom_tls_first_byte_defaults_match_go() {
     assert!(ClientConfig::default().disable_custom_tls_first_byte);
