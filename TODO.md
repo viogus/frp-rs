@@ -925,6 +925,39 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   the filing note above already under-counted open by one; the closed count moves 106 → 107. Filing the
   `admin`-without-`tls` item below moves it to **26 open / 107 closed**.
 
+  **Round 3 pinned the three call sites that were still unwitnessed** (both delta reviewers measured the
+  round-2 "all eight pinned" claim as false). Site by site: `frps/src/main.rs:219`/`:311` and
+  `frp-server/src/service.rs:2315` by `assert_clause_matches_this_build` in `frps/tests/warn_delivery.rs`,
+  observed by both `frps` lanes (12 passed each); `frpc/src/main.rs:527`/`:602` by the same helper in
+  `frpc/tests/warn_delivery.rs`, observed by the default step and — for `:527`, which only the
+  `--config-dir` tests reach — by a **new** count-guarded step running
+  `cargo test -p frpc --features admin --test warn_delivery` (8 passed), because before it the only lane
+  that ran that configuration was the non-CI invocation, so a hardcoded `false` at `:527` survived every
+  lane in CI; `:776` (`verify`) by the same helper through a new `assert_clause_matches_this_build_in(tag,
+  out, err)` entry point, and its test needed the nested key added anyway — it wrote no
+  `[web_server.tls]` section, so the record never fired and neither boolean was observable; and
+  `frp-client/src/service.rs:4457` (client reload) by a new `assert_clause_matches_this_build` in
+  `frp-client/tests/reload_warning_delivery.rs`, observed by the two existing `frp-client` lanes
+  (`--features admin`, and `--no-default-features --all-targets -j 1`), one branch each.
+  `frp-client/src/admin.rs:771` stays covered by `frpc/tests/admin_config_get_warning.rs` (4 passed).
+  Self-run mutants in a private `git archive` copy with its own target dir, each restored by file copy and
+  re-hashed to its saved value (`frpc/src/main.rs`
+  `c54ac42efb075ca0b0b1e2f908858d8cb2dfcb2db477e86e55aef0c491a20b55`, `frp-client/src/service.rs`
+  `ad749675ece8e0cc95fedd55c46cbbb29ea6daea334111988bfa015292c81104`, `frps/src/main.rs`
+  `e5edacf7dd83bccfc5e3d9e51a7a8cf3d68fdbdb663c20f10b7c3c82c80c9c04`): `:776` → `false` reds the
+  `--features admin` lane (rc **101**, `frpc/tests/warn_delivery.rs:403`) and is a no-op in the default
+  lane (that lane's correct value), `:776` → `true` reds the default lane (rc **101**, `:414`);
+  `:4457` → `false` reds `cargo test -p frp-client --features admin --test reload_warning_delivery`
+  (rc **101**, `frp-client/tests/reload_warning_delivery.rs:100`), `:4457` → `true` reds
+  `cargo test -p frp-client --no-default-features --test reload_warning_delivery` (rc **101**, `:111`);
+  `:527` → `false` reds the new admin lane's command (rc **101**, 2 of the `--config-dir` tests,
+  `frpc/tests/warn_delivery.rs:403`) while the default `frpc` lane and the admin config-GET lane stay
+  green; and the round-2 `frps` pair (`:219` → `false` is a no-op in the default lane and rc **101** in
+  the dashboard lane at `frps/tests/warn_delivery.rs:398`; `:219` → `true` rc **101** in the default lane
+  at `:409`) re-runs unchanged. No test count moved (12 / 8 / 8 / 4 / 1 / 5 / 5 / 342), and no source
+  crate was touched: `git diff 0ce218be -- '*/src/*'` is empty. Ledger unchanged by this round:
+  **26 open / 107 closed**.
+
 - [ ] **The dashboard clause of the `web_server.tls.enable` warning is still wrong for an `admin`-without-`tls`
   client build.** Filed by #411's round-2 adversarial review; the item above is the two-variant fix it
   reviews. That fix picks the text from the caller's `cfg!`, and `frp-client`'s admin path passes
@@ -939,8 +972,13 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   answer with `cfg!(all(feature = "admin", feature = "tls"))`, or a third text exists for "an admin server
   with no TLS" — whichever the maintainer prefers — and a test pins the emitted text in the
   `--no-default-features --features micro,admin` build, so the `admin`-without-`tls` combination names no
-  TLS acceptor it cannot build. `docs/config.md:192` then loses the `admin`-without-`tls` caveat this
-  filing added, because the sentence becomes unconditionally true again. Ledger after filing this item:
+  TLS acceptor it cannot build. **Entanglement (recorded by round 3, not fixed):** whichever condition
+  those two sites end up using, their pins must move with them — today
+  `frp-client/tests/reload_warning_delivery.rs`, `frpc/tests/admin_config_get_warning.rs` and
+  `frpc/tests/warn_delivery.rs` all key their clause assertion on `cfg!(feature = "admin")`, so a site
+  answering `cfg!(all(feature = "admin", feature = "tls"))` would make those three assertions wrong until
+  they are re-keyed. `docs/config.md:192` then loses the `admin`-without-`tls` caveat this filing added,
+  because the sentence becomes unconditionally true again. Ledger after filing this item:
   **26 open / 107 closed**.
 
 - [x] **`docs/config.md` advertises four camelCase TLS aliases that no loader accepts.**

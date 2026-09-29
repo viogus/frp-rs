@@ -576,10 +576,14 @@ jobs:
         # executed by the plain `cargo test -p frpc` step in this job, but that
         # step runs the whole package and cannot tell "6 passed" from "0 ran" —
         # so it gets its own count-guarded step, exactly like the `frps` one.
-        # (The client's *reload* row is pinned separately, in-process, by
-        # `frp-client/tests/reload_warning_delivery.rs` in the
-        # `Tests (client integration)` job: the client only processes a reload
-        # inside a live session.)
+        # This is the `admin`-off run, so its clause assertions expect the
+        # no-dashboard text; the matching `--features admin` run of the same file
+        # is its own step below and expects the dashboard text. The client's
+        # *reload* row is a different call site, pinned separately and in-process
+        # by `frp-client/tests/reload_warning_delivery.rs` in the
+        # `Tests (client integration)` job (the client only processes a reload
+        # inside a live session) — that file asserts the clause its own `cfg!`
+        # answer produced.
         #
         # No `--features` flag: the file is `#![cfg(feature = "full")]`-gated and
         # `full` is the default, so this is the same artifact the plain step
@@ -630,8 +634,8 @@ jobs:
         # sibling warning-delivery steps, including its one wrinkle: when the test
         # itself fails, `pipefail` aborts the shell at the `tee` pipeline and the
         # `status=` diagnostics below never print — the step still fails (correctly)
-        # on the test's own output. Kept identical on purpose, so the three guards
-        # stay one shape to read and to change.
+        # on the test's own output. Kept identical on purpose, so every
+        # count-guarded step in this job stays one shape to read and to change.
         shell: bash
         run: |
           set -eo pipefail
@@ -656,6 +660,38 @@ jobs:
             exit 1
           fi
           echo "frpc admin config-GET guard ok: $n tests listed (expected 4), 0 failed"
+      - name: Run frpc's `web_server.tls.enable` warning-delivery tests with the admin feature
+        # The `admin`-on half of the `frpc` warning-delivery pair, and the only
+        # lane that witnesses the `--config-dir` call site (`frpc/src/main.rs:527`)
+        # in an admin build: the step above this one runs the same file with
+        # `admin` off (the no-dashboard clause expected), and the admin config-GET
+        # step runs a different file, so before this step a hardcoded `false` at
+        # `:527` survived every lane in CI. Same three-check guard shape as its
+        # siblings, with the admin build already warm from the step above.
+        shell: bash
+        run: |
+          set -eo pipefail
+          log=/tmp/frpc-warn-delivery-admin-tests.log
+          cargo test -p frpc --features admin --test warn_delivery --color never 2>&1 | tee "$log"
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+          n=$(cargo test -p frpc --features admin --test warn_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          status=0
+          grep -q "Running tests/warn_delivery.rs" "$log.plain" || status=1
+          grep -q "test result: ok. 8 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "8" ] || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::frpc admin warning-delivery guard failed (status=$status, file=$n, log=$log)"
+            if [ -n "$n" ] && [ "$n" != "8" ]; then
+              if [ "$n" -lt "8" ]; then
+                echo "::error::frpc/tests/warn_delivery.rs lists $n tests with --features admin, this step expects 8 — tests were deleted or the file was not built with --features admin; restore them rather than lowering this literal"
+              else
+                echo "::error::frpc/tests/warn_delivery.rs lists $n tests with --features admin, this step expects 8: move the single literal in this shell step from 8 to $n"
+              fi
+            fi
+            cat "$log.plain"
+            exit 1
+          fi
+          echo "frpc admin warning-delivery guard ok: $n tests listed (expected 8), 0 failed"
       - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
         # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag
         # exit-code fix has to hold in the no-default-features build too — but

@@ -425,8 +425,14 @@ User-facing release notes for frp-rs.
   answered — a call site hardcoding the other variant compiled clean and stayed green.
   The clause is now asserted by `cfg!`-keyed checks inside the existing `frps` and
   `frpc` warning-delivery tests (and `frpc`'s admin-config test), keyed on
-  `plaintext HTTP` versus `no dashboard support`, and CI gained a default-feature
-  `frps` `warn_delivery` lane so the no-dashboard direction is observable at all.
+  `plaintext HTTP` versus `no dashboard support`. Round 3 finished that job: three of
+  the eight call sites were still unwitnessed — `frpc verify` (`frpc/src/main.rs:776`,
+  whose test wrote no nested key so the record never fired), the client reload
+  (`frp-client/src/service.rs:4457`, which had no clause assertion) and the
+  `frpc --config-dir` site (`frpc/src/main.rs:527`, whose pin no CI lane ran). The
+  clause is now asserted on all three, a new count-guarded `frpc --features admin`
+  `warn_delivery` step runs the configuration that witnesses `:527`, and the two
+  existing `frp-client` reload lanes (admin on and off) pin one branch each.
   `docs/config.md` also no longer states the `cert_file`/`key_file` pair rule
   unconditionally: an `admin`-without-`tls` client build has no TLS acceptor to hand
   the pair to, which is filed as its own item.
