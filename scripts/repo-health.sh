@@ -1154,11 +1154,17 @@ def floating_hits(text):
 
 
 files = []
+seen = set()   # a symlinked workflow is its target: scan the real file once
 for dirpath, _dirs, names in os.walk('.github/workflows', onerror=walk_error,
                                      followlinks=False):
     for fn in sorted(names):
         if fn.endswith(('.yml', '.yaml')):
-            files.append(os.path.join(dirpath, fn))
+            path = os.path.join(dirpath, fn)
+            real = os.path.realpath(path)
+            if real in seen:
+                continue
+            seen.add(real)
+            files.append(path)
 files.sort()
 top = os.path.join('.github', 'workflows')
 for path in files:
@@ -1355,11 +1361,16 @@ def walk_error(e):
     walk_errors.append('%s: %s' % (getattr(e, 'filename', '?'), e.strerror or e))
 
 
+seen = set()   # a symlinked archive file is its target: count the real file once
 for root, _dirs, files in os.walk(os.path.join('docs', 'archive'), onerror=walk_error):
     for fn in files:
         if not fn.endswith(('.md', '.json')):
             continue
         p = os.path.join(root, fn)
+        real = os.path.realpath(p)
+        if real in seen:
+            continue
+        seen.add(real)
         try:
             text = safe_read(p)
         except OSError as e:
