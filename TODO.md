@@ -5382,7 +5382,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   from — md5 `0893cb97642c7c462a62e1d1ab15baab` before deletion, and
   `git hash-object scripts/__pycache__/rust_comments.cpython-314.pyc` =
   `8bc4eaa077a244bcdc2f56903103e690910b8d18`.
-- [ ] **A symlinked `.rs` *file* is double-counted by the python source walks.** `ln -s
+- [x] **A symlinked `.rs` *file* is double-counted by the python source walks.** `ln -s
   kcp/session.rs frp-core/src/zz.rs` makes `unsafe_counts` (and the printed `Code size` walk) read
   the same file twice: the printed block count becomes 22 while the curated `CLAUDE.md` claim says
   21, so `DOC-FIGURES` fails and blames the docs for a tree that is merely symlinked. Measured
@@ -5391,6 +5391,74 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   as not covered). **Done-when:** a symlinked `.rs` whose target is inside the same crate root is
   counted once (by real path), or the `Code size` and unsafe counts both name the duplicate instead
   of silently disagreeing with the curated claim.
+  Done (measured 2026-09-29, `fix/symlink-double-count` cut from `main` @ `f177e493`): every counted
+  `.rs` walk keys each file on `os.path.realpath`, deduping **per scope** — `rs_texts`
+  (`scripts/repo-health.sh:290` the `seen` set, `:300`/`:309` the per-branch realpath) is called
+  twice per crate, once over `<crate>/src` for Code size / lines / SAFETY cmts (`:329`) and once over
+  the whole crate dir for the test-function / proptest counters (`:339`), so an alias outside `src/`
+  can neither mask the real file nor be attributed to no scope at all; the printed unsafe table
+  (`:530-536`), the SAFETY-justification gate (`:653-660`) and `unsafe_counts` (`:2147-2153`) carry
+  their own `seen`, and the comments at `:268-286`/`:320-326` describe that two-scope model.
+  Measured on one tree with
+  `ln -s kcp/session.rs frp-core/src/zz.rs` present: `bash scripts/repo-health.sh` rc **1**,
+  `frp-core` Code size **70 files / 78342 lines**, unsafe row **22/3/1/24**, test functions 2501,
+  `DOC-FIGURES: FAIL` (`FAIL #33 CLAUDE.md:172 says 21, the tree measures 22`) → rc **0**, **69 files
+  / 76510 lines**, **21/3/1/23**, 2481, `DOC-FIGURES: ok — 53 curated doc figure(s)`; with no symlink
+  the whole output is byte-identical before and after (`diff` of the two runs empty, so no figure
+  moved on a clean tree).
+
+  Round 1 shipped one shared walk for both scopes, and review caught a silent regression: with
+  `ln -s src/kcp/session.rs frp-core/zz_alias.rs` the alias won that shared `seen` and, being outside
+  `src/`, was attributed to no scope, so the real 1832-line `frp-core/src/kcp/session.rs` was counted
+  zero times — rc **0**, `frp-core` **68 files / 74678 lines**, unsafe **21/3/1/22**, `DOC-FIGURES:
+  ok`, against the pre-fix script's 69/76510 on the same tree. Per-scope walks fix it: rc **0**,
+  **69/76510**, **21/3/1/23**, 2481 for every alias — inside `src/`, in the crate root, in `tests/`
+  (`../src/kcp/session.rs`), and two aliases to one target — each byte-identical to the symlink-free
+  run.
+
+  Pinned by `scripts/probe-symlink-file-count.sh` (new, manual — deliberately not wired into CI,
+  which has no script-test harness): five alias legs (in `src/`, in the crate root, in `tests/`, two
+  aliases to one target) plus a symlinked *directory* leg, all asserting the Code size row, the
+  unsafe row and the `test functions` counter equal the symlink-free baseline, with every parsed
+  value asserted non-empty first so a parser matching nothing cannot pass vacuously (checked against
+  a fake `HEALTH` printing only `frp-core 1 1`). Against the pre-fix script
+  (`f177e493:scripts/repo-health.sh`) it fails at the `src/`, crate-root, `tests/` and two-alias legs
+  while the symlink-free leg stays green; it passes rc **0** against this fix.
+  Sweep of the same class: the `frp-server/tests` `.rs` walk was affected identically (test
+  functions 2481→2485, files with tests 208→209, `frp-server/tests` 250→254 with a symlinked `.rs`)
+  and shares this fix; a symlinked *directory* **inside a walked root** is still not followed
+  (`frp-core` 69/76510 either way); the non-`.rs` walks still double-count and are filed below;
+  `docs/README.md` indexing is name-based, not a count, so a symlinked `docs/*.md` is correctly
+  reported as an unindexed entry.
+  Two model boundaries remain and are filed below rather than fixed here: a symlink whose target is
+  in *another* crate is counted in both crates, and a hard link is not deduped.
+
+  Round 3 (review caught the change shipping a claim it falsified): the blanket "a symlinked
+  *directory* is still not followed" was too broad. `os.walk(root, ..., followlinks=False)` scandirs
+  its own root, so `followlinks=False` never applied to `<crate>/src` once round 2 made that a walk
+  root: with `mv frp-core/src /tmp/x && ln -s ../frp-server/src frp-core/src` the Code size row read
+  `frp-core` **32 files / 59146 lines** — frp-server's tree — and the SAFETY column **1**, where the
+  base script read **0 / 0** and **0**. `rs_texts` now refuses a scope root that is itself a symlink
+  (`scripts/repo-health.sh:287-289`, note + return), and the three other `<crate>/src` walks that
+  round 2 made root-level refuse it the same way: the printed unsafe table (`:523-528`), the
+  SAFETY-justification gate (`:648-652`), and `unsafe_counts` (`:2140-2145`, a `PartialTree` whose
+  detail says "is a symlink" rather than the misleading "is missing"). Measured after: rc **1**,
+  `frp-core` **0 / 0**, no `frp-core` row in the unsafe table, and the doc-figure gate names the
+  cause (`FAIL partial tree: frp-core/src is a symlink (scope root refused) — cannot measure the doc
+  figures`); the `top_only` `frp-server/tests` counter is refused too, so it reads **0** instead of
+  the **137** it printed while following `frp-client/tests` — a count the whole-crate walk never
+  included, so the report had been internally inconsistent. Legs 7-8 of
+  `scripts/probe-symlink-file-count.sh` pin both (rc != 0 and `0 / 0` / counter 0); against the
+  round-2 script the probe fails exactly there (32/59146, 137). A symlinked directory *inside* a
+  walked root remains not followed. The no-python3 `find -L` fallback still follows a symlinked scope
+  root — not covered, already red on that path.
+
+  Ledger: base **25 open / 108 closed** → round 1 **26 open / 109 closed** (this flip plus the two
+  filings below) → round 2 **27 open / 109 closed** (the boundary filing below; total 136); round 3
+  files nothing new (the finding is fixed here), so it stays **27 open / 109 closed**. No
+  CHANGELOG bullet: `## Unreleased` is user-facing
+  (Features/Changed/Fixed/Docs) and the recent tooling/test/doc-only commits `f177e493`,
+  `c4357fc5`, `66be9ce1` added none.
 - [ ] **A newline in a workflow filename is mis-parsed by the workflow-scan protocol.** The scan
   hands its hits to bash as `C <path>:<line>:<text>` / `D …` / `E …` lines on stdout and the wrapper
   parses them with `case`. A tracked file whose *name* contains a newline (git can track such names;
@@ -6827,3 +6895,42 @@ section; ledger now **24 open / 104 closed**.**
   `frp-core/src/config/normalize.rs:524` cites `/tmp/ws-probe-before.txt`,
   `frp-client/tests/reload_warning_delivery.rs:11` cites `/tmp/enable-warn-probe/http_smoke.sh`), and
   both reviewers reproduced the measurements independently, so no action is needed.
+
+- [ ] **A doc comment in `frp-core/src/transport/mod.rs` cites the wrong line for `connect_ws_raw`.**
+  `frp-core/src/transport/mod.rs:3281` says the helper is `#[cfg(feature = "websocket")]` and cites
+  `transport/mod.rs:2187`, but the definition is `pub async fn connect_ws_raw<S>(` at `:2254`
+  (stale at the base too: the same comment sits at `:3280` in `9fd76852`, where the definition is
+  also `:2254`). One-line comment correction found by the #412 adversarial review; that PR was
+  test-only, so it filed rather than fixed. **Done-when:** the citation names `:2254` (or drops the
+  line number), with the definition re-located at the fix's head.
+- [ ] **A symlinked non-`.rs` file is still double-counted by two `repo-health.sh` walks.** The `.rs`
+  walks dedupe on `os.path.realpath` (item above), but the `.github/workflows` yml scan
+  (`scripts/repo-health.sh:1157`) and the `docs/archive` md/json walk (`:1358`) still enumerate a
+  symlink as a second file. Measured 2026-09-29 on `fix/symlink-double-count`: an untracked
+  `.github/workflows/zz_probe.yml` holding `- run: rustup default stable` plus
+  `.github/workflows/zz_alias.yml -> zz_probe.yml` printed the same hit twice (`zz_alias.yml:4`,
+  `zz_probe.yml:4`) and `FAIL 2 floating toolchain selection(s) under .github/workflows/` for one
+  aliased file — the **gated** false-FAIL direction; a
+  `docs/archive/zz_symlink.md -> plans/2026-06-26-management-api.md` moved
+  `archive path refs: 20, resolvable via the docs/archive/ prefix: 19` to `21 / 20` at rc 0
+  (info-only). **Done-when:** both walks key their files on realpath like the `.rs` walks, or each
+  documents why a symlinked entry is a distinct path (as `docs/README.md` indexing legitimately
+  does), with the measured before/after for each.
+- [ ] **Two symlink shapes still defeat the `repo-health.sh` realpath dedupe: cross-crate targets and
+  hard links.** The `.rs` walks dedupe per scope on `os.path.realpath` (item above), which covers an
+  alias whose target is a normal path in the same crate, but not these two.
+  **(a) A target in another crate is counted in both crates**, because `seen` is per-walk and each
+  crate's walk reads the aliased file as its own. Measured 2026-09-29 on `fix/symlink-double-count`:
+  with `ln -s ../../frp-server/src/lib.rs frp-core/src/zz_xcrate.rs` (24-line target) present,
+  `bash scripts/repo-health.sh` gives rc **0**, `frp-core` Code size **70 files / 76534 lines**
+  against 69 / 76510 symlink-free, unsafe row **21/3/1/23** and test functions 2481 unchanged — the
+  same 24 lines are counted in `frp-core` *and* in `frp-server`. The rc stays 0 because no gate
+  compares a crate's file or line count to a curated figure.
+  **(b) A hard link is not deduped**, because `realpath` cannot see hard links. Measured on the same
+  tree: `ln frp-core/src/kcp/session.rs frp-core/src/zz_hard.rs` gives rc **1**, **70 files / 78342
+  lines**, unsafe row **22/3/1/24**, test functions 2501, and `FAIL #33 CLAUDE.md:172 says 21, the
+  tree measures 22 (unsafe-block count, Unsafe usage section)` — the hard link reproduces the
+  original defect exactly. **Done-when:** either both shapes are deduplicated (e.g. `(st_dev, st_ino)`
+  for hard links, and excluding a target outside the walk root from that crate's own scope), or the
+  gate names each shape instead of silently disagreeing with a curated claim, with a measured
+  before/after for both.
