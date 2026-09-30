@@ -68,7 +68,7 @@ fn strip_sgr(record: &str) -> String {
 /// The emitted record must be the one-line `tracing` prefix followed by `want`
 /// and **nothing else** but an optional trailing newline.
 ///
-/// Three rejections, each measured against a mutant:
+/// Four rejections, each measured against a mutant:
 ///
 /// * the message appears zero or twice, or is a different message — `contains`
 ///   + `match_indices`;
@@ -78,13 +78,18 @@ fn strip_sgr(record: &str) -> String {
 ///   `warn!("EXTRA {}", …)` fails the `anchor` assertions, because the prefix
 ///   then ends in `"EXTRA "` rather than `" <target>: "` (and the anchor must
 ///   occur exactly once, so a literal that itself ends in the target does not
-///   sneak through).
+///   sneak through);
+/// * the target **rewritten** to a longer key that ends in the expected one —
+///   `warn!(target: "x <target>", …)` used to pass: the anchor still occurred
+///   exactly once and still ended the prefix, so the extra `x` merely widened
+///   the bytes before the anchor. The level is therefore pinned to exactly
+///   `WARN`, which is the whole of that prefix field.
 ///
-/// The level itself is not pinned byte for byte: `tracing_subscriber`'s fmt
-/// format owns it (and may colour it), so only its one-line shape is required.
-/// Those colour sequences are stripped before the shape assertions, but every
-/// failure message quotes the **raw** record so a coloured capture is still
-/// diagnosable.
+/// The level is compared **trimmed and after `strip_sgr`**: that is the one
+/// `<target>:` field's own text, so pinning it to `WARN` is what rejects the
+/// rewritten-target mutant, while `tracing_subscriber`'s fmt format stays free
+/// to pad or colour the level. Every failure message quotes the **raw** record
+/// so a coloured capture is still diagnosable.
 pub fn assert_record_is_exactly_the_message(tag: &str, record: &str, want: &str, target: &str) {
     let clean = strip_sgr(record);
     assert!(
@@ -118,9 +123,12 @@ pub fn assert_record_is_exactly_the_message(tag: &str, record: &str, want: &str,
          {record:?}"
     );
     let level = &prefix[..prefix.len() - anchor.len()];
-    assert!(
-        level.contains("WARN") && !level.contains('\n'),
-        "{tag}: only the one-line tracing level may precede the target; got level: {level:?} \
-         from raw record: {record:?}"
+    assert_eq!(
+        level.trim(),
+        "WARN",
+        "{tag}: only the tracing level may precede the target, and it must be exactly `WARN`. An \
+         emit site that rewrites the target to a longer key ending in `{target}` (e.g. \
+         `x {target}`) leaves extra text here and must not pass; got level: {level:?} from raw \
+         record: {record:?}"
     );
 }
