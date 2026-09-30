@@ -254,6 +254,11 @@ fn subscriber_for(
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
         .without_time()
+        // The byte-exact pin (`common::assert_record_is_exactly_the_message`)
+        // must not depend on a shell variable: `tracing_subscriber::fmt`'s
+        // default layer colours the level and target whenever `NO_COLOR` is
+        // unset or empty, and CI runners do not set it (this dev shell does).
+        .with_ansi(false)
         .with_writer({
             let output = output.clone();
             move || CapturedLogs(output.clone())

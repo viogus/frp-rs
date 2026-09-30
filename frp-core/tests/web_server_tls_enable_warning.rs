@@ -176,6 +176,10 @@ fn load_capturing_files_as(
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
         .without_time()
+        // Byte-exact pins must not depend on a shell variable: the default fmt
+        // layer colours the level and target unless `NO_COLOR` is set and
+        // non-empty, and CI runners do not set it.
+        .with_ansi(false)
         .with_writer({
             let output = output.clone();
             move || CapturedLogs(output.clone())
@@ -756,6 +760,9 @@ fn the_string_loader_stays_silent() {
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
         .without_time()
+        // Same reason as the capture above: keep this one ANSI-free too, so
+        // the silence assertion reads the same bytes in every lane.
+        .with_ansi(false)
         .with_writer({
             let output = output.clone();
             move || CapturedLogs(output.clone())
