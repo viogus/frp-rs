@@ -303,15 +303,21 @@ def rs_texts(root, top_only=False, within=None):
 
     def fresh(path):
         # None = not this scope's file; otherwise the inode identity to dedupe
-        # on (falling back to the resolved path when the file cannot be stat'd,
-        # e.g. a broken symlink).
-        real = os.path.realpath(path)
-        if not real.startswith(within_real + os.sep):
-            return None
+        # on (falling back to the resolved path when the file cannot be stat'd).
+        # Readability is checked *before* containment: a broken symlink in this
+        # crate's own `src` resolves outside `within`, and dropping it there
+        # would hide the read error the caller reports (measured: a dangling
+        # `frp-core/src/zz_broken.rs` went from `scan error: … No such file or
+        # directory` + rc 1 to silence + `RESULT: invariants hold` when
+        # containment ran first). A stat failure falls through so the read below
+        # raises and is noted.
         try:
             st = os.stat(path)
         except OSError:
-            return real
+            return os.path.realpath(path)
+        real = os.path.realpath(path)
+        if not real.startswith(within_real + os.sep):
+            return None
         return (st.st_dev, st.st_ino)
 
     if top_only:
@@ -478,8 +484,19 @@ printf '  test functions      : %s\n' "${n_testfuncs:-0}"
 printf '  files with tests    : %s\n' "${n_testfiles:-0}"
 printf '  frp-server/tests    : %s\n' "${n_srvtest:-0}"
 printf '  proptest blocks     : %s\n' "${n_proptest:-0}"
+# An integration-test dir is a `tests/` dir that carries at least one `.rs` file.
+# A plain `-type d -name tests` find also matched `scripts/tests/` (the
+# repo-health fixture harness, shell only), which moved this printed metric from
+# 6 to 7 and made the *label* wrong, not just the number.
 printf '  integration test dirs: %s\n' \
-  "$(find . -path ./target -prune -o -type d -name tests -print 2>/dev/null | grep -vc '^\./\.' || true)"
+  "$(find . -path ./target -prune -o -type d -name tests -print 2>/dev/null \
+     | grep -v '^\./\.' \
+     | while IFS= read -r d; do
+         if [ -n "$(find "$d" -name '*.rs' -print -quit 2>/dev/null)" ]; then
+           printf '%s\n' "$d"
+         fi
+       done \
+     | wc -l | tr -d ' ' || true)"
 printf '\n  NOTE: the number of tests that *pass* is a runtime fact, not a static one.\n'
 printf '  Run: cargo test --workspace --all-features\n'
 
@@ -564,13 +581,18 @@ for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
             if fn.endswith('.rs'):
                 path = os.path.join(root, fn)
                 real = os.path.realpath(path)
-                if not real.startswith(within_real + os.sep):
-                    continue
                 try:
                     st = os.stat(path)
-                    key = (st.st_dev, st.st_ino)
                 except OSError:
+                    # Unreadable (e.g. a broken symlink): keep it so the read
+                    # below reports it. Checking containment first would drop it
+                    # silently whenever its unresolved target sits outside the
+                    # crate, hiding the scan error the caller would have noted.
                     key = real
+                else:
+                    if not real.startswith(within_real + os.sep):
+                        continue
+                    key = (st.st_dev, st.st_ino)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -697,13 +719,16 @@ for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
                 continue
             path = os.path.join(root, fn)
             real = os.path.realpath(path)
-            if not real.startswith(within_real + os.sep):
-                continue
             try:
                 st = os.stat(path)
-                key = (st.st_dev, st.st_ino)
             except OSError:
+                # Unreadable (e.g. a broken symlink): keep it so the read below
+                # reports it, rather than dropping it via containment.
                 key = real
+            else:
+                if not real.startswith(within_real + os.sep):
+                    continue
+                key = (st.st_dev, st.st_ino)
             if key in seen:
                 continue
             seen.add(key)
@@ -1206,22 +1231,24 @@ for dirpath, _dirs, names in os.walk('.github/workflows', onerror=walk_error,
                                      followlinks=False):
     for fn in sorted(names):
         if fn.endswith(('.yml', '.yaml')):
-            if '\n' in fn or '\r' in fn:
+            path = os.path.join(dirpath, fn)
+            if '\n' in path or '\r' in path:
                 # The scan hands hits to bash as `C <path>:<line>:<text>` lines,
-                # so a newline in a workflow's own name would split a hit and the
-                # fragment would be re-parsed as a hit of its own (measured: a
-                # tracked `a<LF>C forged.yml` produced a bogus
-                # `FAIL 1 toolchain: input(s)` naming `forged.yml:5`, while the
-                # real witness was truncated). Refuse the path fail-closed rather
-                # than escape it: nothing in that file is scanned, and the gate
-                # says so.
+                # so a newline anywhere in a workflow's path — its own name *or a
+                # directory component* — would split a hit and the fragment would
+                # be re-parsed as a hit of its own (measured: a workflow named
+                # `a<LF>C forged.yml` produced a bogus toolchain-input FAIL, and a
+                # *directory* `sub<LF>C forged.yml/` around a floating-hit
+                # `probe.yml` produced a fabricated `FAIL 1 toolchain: input(s)`;
+                # a basename-only guard missed the directory shape). Refuse the
+                # path fail-closed rather than escape it: nothing under it is
+                # scanned, and the gate says so.
                 state['bad'] = True
                 print('E   FAIL  workflow path with a newline in its name was not '
                       'scanned: %s'
-                      % fn.replace('\\', '\\\\').replace('\r', '\\r')
-                           .replace('\n', '\\n'))
+                      % path.replace('\\', '\\\\').replace('\r', '\\r')
+                            .replace('\n', '\\n'))
                 continue
-            path = os.path.join(dirpath, fn)
             real = os.path.realpath(path)
             if real in seen:
                 continue
@@ -2226,13 +2253,18 @@ def unsafe_counts(crate):
             if fn.endswith('.rs'):
                 path = os.path.join(root, fn)
                 real = os.path.realpath(path)
-                if not real.startswith(within_real + os.sep):
-                    continue
                 try:
                     st = os.stat(path)
-                    key = (st.st_dev, st.st_ino)
                 except OSError:
+                    # Unreadable (e.g. a broken symlink): keep it so the read
+                    # below reports it. Checking containment first would drop it
+                    # silently whenever its unresolved target sits outside the
+                    # crate, hiding the scan error the caller would have noted.
                     key = real
+                else:
+                    if not real.startswith(within_real + os.sep):
+                        continue
+                    key = (st.st_dev, st.st_ino)
                 if key in seen:
                     continue
                 seen.add(key)
