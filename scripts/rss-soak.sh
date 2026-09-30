@@ -481,6 +481,10 @@ if [ "$rs_frps_sha" = "$go_frps_sha" ] || [ "$rs_frpc_sha" = "$go_frpc_sha" ]; t
   exit 1
 fi
 echo "frp-rs $rs_version ($rs_sha_short) vs Go frp $go_version on $go_platform, ${cpu_cores} cores"
+# The frp-rs sha above is the TREE's, which is only the measured binary's when
+# the binary was built from it; print what was actually measured, and where it
+# came from, so a caller-supplied pair cannot be read as the tree's build.
+echo "measured frp-rs binaries: frps $rs_frps_sha / frpc $rs_frpc_sha ($RS_BIN_SOURCE)"
 echo "window ${DURATION}s, sample interval ${INTERVAL}s -> out $OUT"
 
 # ---------------------------------------------------------------- configs
