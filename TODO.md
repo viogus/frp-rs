@@ -8082,10 +8082,10 @@ section; ledger now **24 open / 104 closed**.**
   (d) are each fixed or recorded as deliberate with the mutant that shows the gap — for (d) that means
   the guard's total is replaced by, or supplemented with, a per-scenario shape assertion.
 
-- [ ] **A non-regular file named `*.{toml,ini,json,yaml,yml}` inside a `--config-dir` hangs the lane forever.**
+- [x] **A non-regular file named `*.{toml,ini,json,yaml,yml}` inside a `--config-dir` hangs the lane forever.**
   Filed by the #426 round-3 adversarial review while closing the `--config-dir` batch. `collect_config_files`
   admits any directory entry whose name carries a config extension without checking that it is a regular file
-  (`frp-core/src/config/file.rs:414-461`), and the read that follows blocks (`frp-core/src/config/file.rs:198`
+  (`frp-core/src/config/file.rs:414-461`), and the read that follows blocks (`frp-core/src/config/file.rs:303`
   `std::fs::read_to_string`), so `mkfifo zz.ini` in the directory hangs the process with no output and no
   timeout, before any service exists. Measured: Go `frpc` hangs identically on the same directory (killed after
   15 s, FIFO first and FIFO last), and Go `frps` has no `--config-dir` at all (`Error: unknown flag:
@@ -8095,7 +8095,8 @@ section; ledger now **24 open / 104 closed**.**
   fresh Go probe) or the lane bounds the read with a timeout, in either case with a test that pins the new
   behaviour.
 
-- [ ] **A `SIGTERM` that lands before `frps --config-dir` installs the per-service handler kills the process by signal (rc -15).**
+  **Done (2026-10-01, at `62a122f4` on `fix/configdir-residues`, PR #431).** The collector's extension-only admission is parity-bound, not a bug to fix: re-probed against Go frp v0.71.0, a FIFO named `*.toml` hangs **both** `frpc --config-dir` implementations unbounded (Go: still running after 5 s with a valid config present, killed `-9`; frp-rs: same), and Go `frps` has no `--config-dir` at all (`Error: unknown flag: --config-dir`, rc 1) — so a regular-file guard in the shared collector would *diverge*.`frp-core/src/config/file.rs:432` (`collect_config_files_inner`, extension test `:458-461`) is therefore unchanged; the `is_file()` checks live only in `simple_glob` (`:340`/`:363`), and the blocking read is `std::fs::read_to_string` at `file.rs:303` (the body's `:198` was stale — corrected). Pinned by `frp-core/src/config/tests.rs:3711` `test_collect_config_files_admits_a_non_regular_entry_by_extension` (an `if !path.is_file() { continue; }` guard reds it at `:3760`) and `frps/tests/cli_exit_codes.rs:1164` `config_dir_fifo_entry_wedges_the_lane_and_a_repeat_signal_ends_it`, which also pins the availability bound this round added: on a wedged lane the first `SIGTERM` is *recorded* instead of lost and a repeat request forces rc 143 with `SIGTERM requested again with no service registered to stop it; forcing exit 143` (pre-fix, the very first `SIGTERM` killed frps rc 143), so the lane is no longer unkillable-except-`SIGKILL`.
+- [x] **A `SIGTERM` that lands before `frps --config-dir` installs the per-service handler kills the process by signal (rc -15).**
   Filed by the #426 round-3 adversarial review as an accepted bound. The main task installs SIGUSR1
   (`frps/src/main.rs:295`), while SIGTERM is installed per service inside `Service::run`
   (`frp-server/src/service.rs:1855-1868`: `ctrl_c()` alone catches only SIGINT, so the unix handler is
@@ -8107,7 +8108,8 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** the main task owns the shutdown handler before any service is spawned (so the signal is
   recorded rather than lost) and a pin drives the window deterministically instead of racing it.
 
-- [ ] **The `frps` bin-unit guard's completion marker is self-referential: a body that prints it and returns passes with zero assertions.**
+  **Done (2026-10-01, at `62a122f4` on `fix/configdir-residues`, PR #431).** The main task now owns the shutdown handler before any service is spawned: `EarlyShutdown` (`frps/src/main.rs:123`, `impl` `:140`) is installed at `frps/src/main.rs:506`, before the config-dir startup line, records a `SIGTERM`/`SIGINT` that arrives inside the window, and hands it to each service at registration (`frps/src/main.rs:638` `if early_shutdown.watch(service.state())`), cancelling the token and logging `shutdown signal was recorded before this service installed its own handler`; the main loop's idle arm wakes on `early_shutdown.recorded()` (`:612`). The window is driven deterministically instead of raced: the debug-only `FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS` hold now also wakes on `recorded()`, and `frps/tests/cli_exit_codes.rs:1097` `config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorded_request` holds `30 000 ms`, sends `SIGTERM` after the startup line, and asserts exit `Some(0)` plus the recorded-signal log line and `Accept loop stopped for graceful shutdown` — the log assertion is what proves the exit came from the recorded path and not from the race won the other way. Mutants: `install()`'s `SIGTERM` arm replaced by `std::future::pending()`, and the `watch()` handoff deleted, each red that pin (`did not exit within 10s of a SIGTERM sent inside the pre-registration window`). The `-c` arm of the Done-when stays open on purpose: that lane has no delay hook, so a fix there could not be pinned deterministically.
+- [x] **The `frps` bin-unit guard's completion marker is self-referential: a body that prints it and returns passes with zero assertions.**
   Filed by the #426 round-5 adversarial review. The CI step now checks both the `-- --list` test name and the
   `dir-registry-pin: ok, recovered 3 entries` marker (`frps/src/main.rs:916`), which catches a renamed or
   deleted test and a bare early `return;` — but a body beginning
@@ -8117,13 +8119,16 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** the step asserts something the test body cannot emit without running (an assertion count from a
   custom harness) or the pin moves to a lane where the process exit code itself is the contract.
 
-- [ ] **The `frpc --config-dir` SIGTERM pins assert `Some(0)` where Go's plain tcp client dies by signal (rc 143).**
+  **Done (2026-10-01, at `62a122f4` on `fix/configdir-residues`, PR #431).** The contract is now the process exit code, not a marker the body can emit without asserting: a `#[cfg(debug_assertions)]` hook (`frps/src/main.rs:56`, `FRPS_DIR_REGISTRY_TEST_DISCARD`) makes `lock_dir_registry` recovery return an **emptied** registry, and the `Run frps bin unit tests` CI step (`.github/workflows/ci.yml:374`, `:404`) runs the pin a second time with the hook set and requires that run to FAIL — `test result: FAILED`, the pin named FAILED, marker absent (`ci.yml:429`). Measured on the extracted step: healthy exit 0 (`frps bin unit-test guard ok: 1 tests listed …, marker seen, 0 failed, sabotage reds it`), exit 1 with the hook renamed so it never fires, exit 1 with the pin body reduced to `println!("dir-registry-pin: ok, recovered 3 entries"); return;`. The stale half of the finding was re-measured first: the production mutant (`poisoned.into_inner()` recovered then `clear()`) already reds the pin's own assertions (`left: 0, right: 3`), because the fixture seeds three distinctly-named services and asserts length, order, `Arc::ptr_eq` per entry and the recovery log line.
+- [x] **The `frpc --config-dir` SIGTERM pins assert `Some(0)` where Go's plain tcp client dies by signal (rc 143).**
   Filed by the #426 round-4 and round-5 adversarial reviews as inherited from the `-c` lane. Go installs a
   shutdown handler only for the kcp/quic transports (`cmd/frpc/sub/root.go:207-210`), so a tcp client killed by
   SIGTERM exits by signal (`ExitStatus::code() == None`, shell rc 143), while the frp-rs config-dir pins assert
   `Some(0)`.
   **Done-when:** the pins assert what each side actually does (Go's signal death vs frp-rs's graceful 0) or the
   divergence is recorded where the lane's exit contract is documented.
+
+  **Done (2026-10-01, at `62a122f4` on `fix/configdir-residues`, PR #431) — recorded, not fixed.** Both sides are recorded as they actually behave. Go's frpc installs a shutdown handler for the kcp/quic transports only (`cmd/frpc/sub/root.go:207-210` skips the SIGTERM/SIGINT registration for plain tcp), so a tcp client killed by `SIGTERM` dies by signal — measured on the real binary (v0.71.0, darwin/arm64): rc **143** / `ExitStatus::code() == None`, for both `--config-dir` and `-c` — while frp-rs drains every service and exits `Some(0)`. frp-rs's behaviour is the better one and Go's own `frps` does not offer the flag, so the pins deliberately keep asserting `Some(0)`; the Go measurement is named in the assertion message and the divergence is documented next to the handler that produces it in `frpc/src/main.rs:442-465`, ending `Do not "fix" the pins to Go's signal death.`
 
 - [ ] **The RSS-soak fixture step has no outer pins.** The `health` job runs
   `bash scripts/tests/rss-soak-run-dir.sh` bare (`.github/workflows/ci.yml:135-136`), so a step whose
