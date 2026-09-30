@@ -326,18 +326,21 @@ pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD: &str = "web_server.t
 /// **Reachable build shapes.** This split is keyed on **frp-core's** `tls`,
 /// because frp-core cannot observe `frp-server`'s features. One hand-rolled
 /// per-package mix therefore compiles a shape no shipped lane builds:
-/// `cargo build -p frps -p frpc --no-default-features --features
-/// "frps/micro,frpc/tls"` turns frp-core's `tls` on (via frpc → frp-client) while
-/// frp-server's stays off — measured with `cargo tree -p frps -p frpc
-/// --no-default-features --features "frps/micro,frpc/tls" -e features -i`:
-/// `frp-core feature "tls"` is present and `frp-server` resolves to only
-/// `frps feature "micro" (command-line)`. That binary gates the acceptor off
+/// `cargo check -p frps -p frpc --no-default-features --features
+/// "frps/micro,frpc/tls"` exits 0, with frp-core's `tls` on (via frpc →
+/// frp-client) while frp-server's stays off. Measured with `cargo tree -p frps
+/// -p frpc --no-default-features --features "frps/micro,frpc/tls" -e features -i
+/// frp-core`, which ends `frp-core feature "tls"` (reached from `frpc feature
+/// "tls" (command-line)` → `frp-client feature "tls"`); the same command with
+/// `-i frp-server` shows frp-server's only branch as `frps feature "micro"
+/// (command-line)`, with no `tls` feature. That binary gates the acceptor off
 /// (`frp-server/src/service.rs:603` is `#[cfg(feature = "tls")]`, with the
 /// no-acceptor branch at `:635`), so this variant's certificate clauses would
 /// describe a path it cannot take. Every lane builds at the
-/// workspace root with `tiny`/`micro` (`release.yml:100/102/108/110/159/162/210/213`,
-/// `ci.yml:921/:925`), where the two crates' `tls` agree, so the mixed shape is a
-/// known, unshipped one.
+/// workspace root with `tiny`/`micro`
+/// (`.github/workflows/release.yml:100/102/108/110/159/162/210/213` and
+/// `.github/workflows/ci.yml:996`/`.github/workflows/ci.yml:1000`), where the
+/// two crates' `tls` agree, so the mixed shape is a known, unshipped one.
 #[cfg(feature = "tls")]
 pub const SERVER_TLS_ENABLE_INERT_WARNING: &str = "tls_enable has no effect on the \
     server: nothing in frp-server or frps reads it. The server's TLS switch is \

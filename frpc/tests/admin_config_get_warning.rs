@@ -473,7 +473,7 @@ fn seed_reads_the_file_non_strictly() {
 /// (`ConfigPresence::web_server_tls_enable_set_in`) reads the value **before**
 /// `normalize` (`frp-core/src/config/normalize.rs:621`), with its own "top level
 /// first, `[common]` second" fallback per spelling
-/// (`frp-core/src/config/loader.rs:409-411`). The per-key section merge
+/// (`frp-core/src/config/loader.rs:427-429`). The per-key section merge
 /// (`merge_section_into`) runs inside `normalize`, so it is not what the flag
 /// consults — the merge has its own frp-core pin. Measured on the shipped binary
 /// before this row existed: both shapes emit **1** record at 0 GETs and still
