@@ -5149,7 +5149,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `verify` refuses what the daemon refuses, and give each row above a measured pin; or record it
   as a deliberate divergence in `docs/developing.md` § CLI inputs **and** in the feature-surface
   policy, with the reason the two stages are allowed to differ. No sha.
-- [ ] **`frpc verify`'s success line is not Go's, and now differs from `frps verify`'s too.**
+- [x] **`frpc verify`'s success line is not Go's, and now differs from `frps verify`'s too.**
   Recorded as "a second, adjacent divergence left alone" by the output-shape round
   (`docs/developing.md` § Output stream and shape on a config-load failure) and mentioned in
   `CHANGELOG.md`; the `frps verify` round gave the **server** verify Go's exact line and
@@ -5167,7 +5167,24 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   stating) and move `frpc/tests/cli_exit_codes.rs`'s exact-bytes pins in the same commit, or record
   the divergence as deliberate **with the asymmetry to `frps verify` named** in
   `docs/developing.md`. No sha.
-- [ ] **`frps` does not register Go's `--vhost-http-timeout`, so an argv Go's `frps` accepts is
+  Done: fixed in #418 (`4e53bbe9`). `frpc verify -c <valid>` now prints Go's exact
+  sentence `frpc: the configuration file <path> syntax is ok` (`frpc/src/main.rs:800`;
+  Go `cmd/frpc/sub/verify.go:52`, measured on Go v0.71.0: stdout exactly that line,
+  stderr 0 B), followed by the three indented summary lines (`  Server:`, `  Proxies:`,
+  `  Visitors:`). Those three stay deliberately: they are an frp-rs addition Go does not
+  print, and `frpc/tests/legacy_ini_fixture.rs` observes the vendored Go legacy fixture's
+  43 proxies / 2 visitors through the `Proxies:`/`Visitors:` counts, so dropping them
+  would remove that test's only observation channel. The `frps verify` / `frpc verify`
+  asymmetry is therefore narrowed to the three lines, not the sentence. Measured at this
+  head on a minimal config (`g.toml`): Go stdout 52 B, frp-rs 104 B — the 52 B delta is
+  exactly the three summary lines. Pins: `frpc/tests/cli_exit_codes.rs::verify_good_config_exits_0`
+  moved from a `.contains("is valid")` substring to exact whole-stdout bytes, and the
+  `is valid` substring pins and prose rows in `frpc/tests/legacy_ini_fixture.rs`,
+  `frpc/tests/cli_inputs.rs`, `frp-client/src/service.rs` and
+  `frp-core/src/config/tests.rs` moved with it. No assertion was weakened and no test was
+  deleted. `docs/developing.md`'s "left alone" paragraph, its `--strict-config` table rows
+  and the byte-count rationale are corrected on the same branch.
+- [x] **`frps` does not register Go's `--vhost-http-timeout`, so an argv Go's `frps` accepts is
   refused here — on both paths.** Surfaced by the `frps verify` round's flag-surface work.
   Evidence, measured on Go v0.71.0 and the frp-rs debug binaries (own config and free port per row,
   streams separated, rc direct, children bounded and reaped):
@@ -5190,6 +5207,28 @@ agent commits), which matters because the *reason* for two reviewers is that no 
 
 ## P0 — hygiene
 
+  Done: fixed in #418 (`5e72947d`). The flag is registered on the shared
+  `SvrTransport` builder, so both the run path and `verify` (which inherits root flags
+  through `frps_build`) accept it, under both spellings — `--vhost-http-timeout` and
+  `--vhost_http_timeout` — matching Go's `WordSepNormalizeFunc`
+  (`pkg/config/flags.go:26-32`, measured on Go v0.71.0: both are rc 0 on `verify`).
+  Value: `Option<u64>` applied by `override_server_config` on the flags-only lane;
+  `ServerConfig::default()` already carries Go's 60 (`frp-core/src/config/server.rs:247`),
+  so an absent flag keeps 60, and with `-c` the file stays authoritative — the same rule
+  as the other transport flags. `VALUE_TAKING_LONG_FLAGS` gained both spellings so the
+  short-flag, help and rewrite passes agree that the flag consumes its value. Measured:
+  `frps verify --vhost-http-timeout 30 -c <valid>` was rc 1 (the bpaf refusal) and is now
+  rc 0 with Go's success line byte-identical; the run path starts and listens under both
+  spellings (bounded, Go rc 124). The rendered `--help` flag diff against Go v0.71.0 is
+  now **Go-only = {}** with frp-rs-only = {`config-dir`, `log-format`}, and the two
+  comments that counted this as the one Go-only flag are updated. Tests:
+  `vhost_http_timeout_flag_applied_to_server_config` (`frp-core/src/cli.rs`: both
+  spellings → `Some(30)` and applied, absent → 60) plus
+  `vhost_http_timeout_flag_starts_and_listens` and
+  `verify_accepts_vhost_http_timeout_both_spellings_and_prints_go_line`
+  (`frps/tests/cli_exit_codes.rs`); `ci.yml`'s `FRPS_CLI_TESTS` 29 → 31. Residual filed
+  below: the value is `u64` where Go's is `int64`, so `-1` is refused here and accepted
+  there.
 - [x] **`CLAUDE.md` health numbers were undated and stale.**
   Evidence: the table claimed 17 `unsafe` blocks in `frp-core`; the tree had 21.
   It also had no date or commit, so a reader could not tell how old any figure was.
@@ -6889,7 +6928,7 @@ section; ledger now **24 open / 104 closed**.**
   note was first written — the `type`-less `.ini` item below was filed by the review afterwards), measured with
   `grep -cE '^- \[ \]' TODO.md` / `grep -cE '^- \[x\]' TODO.md`).
 
-- [ ] **A legacy `.ini` proxy section that omits `type` is dropped; Go v0.71.0 registers it as a `tcp`
+- [x] **A legacy `.ini` proxy section that omits `type` is dropped; Go v0.71.0 registers it as a `tcp`
   proxy.** Filed by the `fix/webserver-tls-cluster` review round while pinning the `.ini` dotted-header
   expansion — not caused by it (base `d958711` behaves the same), and not specific to the dotted
   spelling: a plain legacy name (`[myproxy]`) is dropped identically. **Go's legacy `.ini` dialect
@@ -6909,6 +6948,40 @@ section; ledger now **24 open / 104 closed**.**
   pinning the current message and the `Proxies: 0` drop — a silent drop is not an option either way.
 
 
+  Done: fixed in #418 (`9747f131`, with the regression guard `a757afc6`). Go's legacy
+  `.ini` dialect treats every non-`[common]` section as a proxy and defaults a missing
+  `type` to `tcp` (`pkg/config/legacy/client.go`); frp-rs collected a section only when it
+  carried `type`. The file dialect is now threaded into the normalizers
+  (`normalize_(client|server)_config(&mut toml::Value, ConfigFormat)`, fed by the
+  `detect_format(path)` the loader already computed) and
+  `collect_legacy_ini_proxy_sections(table, is_ini)` collects a typeless section in the INI
+  dialect and fills `type = "tcp"` **before** the strict check and `normalize_proxies` see
+  it. The rule is `.ini`-only: an unknown top-level table in TOML/JSON/YAML still reaches
+  the strict check, as Go's v1 decoder does. Two boundaries: a `role = "visitor"` section
+  is **not** defaulted (Go refuses a typeless visitor in both modes, `failed to parse
+  visitor v, err: type shouldn't be empty`, so defaulting it would invent a divergence),
+  and `ini_section_path` keeps a dotted header verbatim — which makes it a legacy proxy —
+  exactly when its section carries `local_port` or `remote_port`, since a `.ini` proxy
+  always has one and no v1 nested sub-table does. Measured with the real binaries on
+  `[myproxy]`, `[auth.foo]` and `[my.proxy]` (each `[common]` plus
+  `local_port`/`remote_port`): before, `--strict-config=false` rc 0 `Proxies: 0` (silent
+  drop) and strict rc 1 `unknown field "myproxy"`; after, both modes rc 0 `Proxies: 1`,
+  and a real frps+frpc run logs `Registering proxy 'myproxy' type=tcp remote_port=18081`
+  where Go logs `new proxy [myproxy] type [tcp] success`. Tests:
+  `typeless_ini_proxy_section_defaults_to_tcp_in_both_modes`
+  (`frp-core/src/config/tests.rs`: `[myproxy]`/`[auth.foo]`/`[store.frontend]`/`[my.proxy]`
+  in both modes, the `role = "visitor"` exclusion, and a portless `[webServer.tls]` still
+  nesting) and `typeless_legacy_ini_proxy_verifies_in_both_modes`
+  (`frpc/tests/cli_exit_codes.rs`, exact stdout `Proxies: 2`); no existing assertion was
+  weakened, changed or moved. `ci.yml`'s guarded `FRPC_TINY_CLI_TESTS` 13 → 15. Follow-up
+  `a757afc6` closed a regression this collector introduced: its known-section filter listed
+  only the snake_case spelling of each v1 root, so a typeless camelCase `[webServer]` in a
+  client `.ini` was collected as a phantom proxy named `webServer` and the admin block was
+  silently lost (`Proxies: 1`); the filter now lists
+  `webServer`/`httpPlugins`/`sshTunnelGateway` beside their snake_case roots, closing the
+  whole alias set rather than `webServer` alone (`[webServer] zzz_unknown_key = 1` is back
+  to base's strict rc 1). Residuals filed below: `type = ""`, the typeless visitor's own
+  verdicts, and a dotted v1-root header without a port key.
 - [x] **Three pin-precision nits in `frpc/tests/admin_config_get_warning.rs`, filed by #408's final review
   round.** All three are non-blocking, and all three were found after the fifth round had already returned
   MERGE: the batch merged on two MERGE verdicts and these are recorded rather than re-reviewed.
@@ -7376,3 +7449,62 @@ section; ledger now **24 open / 104 closed**.**
   0.0.0.0:19961` and keeps running) and the corrected shutdown figure — `SIGTERM` rc 0 once the
   handler is installed (`frp-server/src/service.rs:1858`; a signal landing in the startup window dies
   with rc 143 on **both** lanes), per the adversarial round-2 measurement.
+- [ ] **Strict mode checks unknown keys in the legacy `.ini` dialect, where Go's legacy reader ignores them even with `strict_config` on.**
+  Measured while closing the typeless-`.ini` item (#418). A legacy-shaped `.ini`
+  (`[common]` plus sections) is decoded by Go's legacy reader, which accepts-and-ignores
+  unknown keys regardless of `--strict-config`; frp-rs runs the same section-level strict
+  check it runs for the v1 formats. Measured, `frpc verify -c <ini>`:
+  * `[common]` + `[webServer] zzz_unknown_key = 1` → Go rc **0** in both modes; frp-rs
+    `--strict-config=false` rc 0, `--strict-config` rc **1**
+    (`unknown field "web_server.zzz_unknown_key"`).
+  * `[common]` + `[webServer.foo] bar = 1` → Go rc **0** in both modes; frp-rs
+    `--strict-config=false` rc 0 with `Proxies: 0`, `--strict-config` rc **1**
+    (`unknown field "web_server.foo"`).
+  * v1 TOML control (unknown top-level key) → Go rc 1 by default and rc 0 with
+    `--strict-config=false`, frp-rs the same, so the gap is the legacy dialect and not the
+    strict setting.
+  The direction is a **false refusal**: frp-rs rejects a config Go accepts. The
+  element-level half of Go's accept-and-ignore is already implemented
+  (`strip_unknown_legacy_element_keys`); this is the section-level half.
+
+  Done-when: the legacy dialect is exempted from the section-level strict check (with the
+  `.ini`-only boundary stated in `docs/config.md`), or the stricter refusal is recorded as
+  deliberate in `docs/developing.md` with this measurement, and either way pinned by a test.
+
+- [ ] **A legacy `.ini` proxy section with `type = ""` is refused here and defaults to `tcp` on Go.**
+  Measured while closing the typeless-`.ini` item (#418). `frpc verify -c <ini>` on
+  `[common]` + `[p] type = "" local_port = 8080 remote_port = 18080`: Go rc **0** in both
+  loader modes (its legacy proxy config defaults an empty type the same way it defaults a
+  missing one) and frp-rs rc **1** in both modes with `proxy 'p': invalid proxy_type ''`.
+  The new rule covers a *missing* `type` key, but an explicitly empty one still reaches
+  validation, so this is a false refusal one step away from the item #418 closed.
+
+  Done-when: an empty `type` in the `.ini` dialect is defaulted like a missing one, or the
+  refusal is recorded as deliberate with this measurement, pinned in both loader modes.
+
+- [ ] **A typeless `role = "visitor"` section in a legacy `.ini` is dropped silently in non-strict mode and refused with a different message than Go's in strict mode.**
+  Measured while closing the typeless-`.ini` item (#418). The exclusion itself is
+  deliberate (Go refuses a typeless visitor, so defaulting it to a `tcp` *proxy* would be
+  worse), but neither verdict matches. Config: `[common]` + `[v] role = "visitor"` +
+  `server_name`. Go rc **1** in both loader modes, stdout `failed to parse visitor v, err:
+  type shouldn't be empty`. frp-rs: `--strict-config=false` rc **0** with `Proxies: 0` (the
+  section disappears with no diagnostic), and `--strict-config` rc **1** with
+  `unknown field "v" in config file … — did you mean 'v2'?` — a different code path and a
+  different message.
+
+  Done-when: a typeless visitor reports Go's `type shouldn't be empty` in both modes (or at
+  least is refused in non-strict mode instead of dropped), pinned in both modes.
+
+- [ ] **`--vhost-http-timeout` is modelled as `Option<u64>` where Go's is `int64`, so a negative value is refused here and accepted there.**
+  Residual from the `--vhost-http-timeout` item closed in #418. Go registers the flag with
+  `Int64VarP` (`pkg/config/flags.go:237`) and the config field is `int64`; frp-rs uses
+  `Option<u64>`. Measured on `frps verify -c <valid>`: `--vhost-http-timeout -1` → Go rc
+  **0** (`frps: the configuration file … syntax is ok`), frp-rs rc **1**
+  `Error: couldn't parse '-1': invalid digit found in string`; `--vhost-http-timeout 30`
+  agrees at rc 0 on both. A negative Go value is almost certainly meaningless downstream (a
+  `time.Duration` built from it), so the question is only whether to accept-and-ignore the
+  argv or refuse it loudly.
+
+  Done-when: the flag is typed to match Go's `int64` (accepting the same argv), or the
+  refusal is recorded as a deliberate divergence with this measurement, and a test pins
+  whichever answer is chosen.
