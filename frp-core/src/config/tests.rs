@@ -7477,7 +7477,7 @@ fn legacy_ini_typed_array_root_visitor_is_collected() {
 /// reserved-root bypass keys on the **port** keys and never on `type`, because
 /// keying it on `type` would collect every typed settings root and contradict
 /// `test_legacy_ini_known_section_with_type_not_collected`
-/// (`frp-core/src/config/tests.rs:9601`) and the `[web_server] type`-only v1
+/// (`frp-core/src/config/tests.rs:9890`) and the `[web_server] type`-only v1
 /// boundary. This test pins the strict verdict so the delta is measured rather
 /// than silent.
 #[test]
@@ -11072,7 +11072,7 @@ fn case_insensitive_proxy_array_key_is_refused_in_strict_mode() {
 ///   only at the parsed-value level, which is what this pin asserts: `env` is
 ///   read into the token source, `Env` leaves it empty.
 ///
-/// Already documented in `docs/deployment.md:719`
+/// Already documented in `docs/deployment.md:900`
 /// (`auth.tokenSource.exec.env` has no key set at `tokenSource`).
 #[test]
 fn case_insensitive_key_in_a_nested_table_is_dropped_in_strict_mode() {
@@ -12194,9 +12194,9 @@ fn legacy_ini_default_section_string_include_is_still_expanded() {
 /// hoist's `entry(k).or_insert(v)` (`frp-core/src/config/normalize.rs:1162-1166`)
 /// would let a DefaultSection `start` win and mask Go's refusals (round-5
 /// adversarial RF5-1), so the `[common]` value is captured before the hoist
-/// (`legacy_common_start`, `frp-core/src/config/normalize.rs:2491`) and written
+/// (`legacy_common_start`, `frp-core/src/config/normalize.rs:2488`) and written
 /// back after it (`legacy_start_override`,
-/// `frp-core/src/config/normalize.rs:2510`). Measured on Go v0.71.0, both loader
+/// `frp-core/src/config/normalize.rs:2507`). Measured on Go v0.71.0, both loader
 /// modes: the four shapes below are rc 1 with the message asserted, a
 /// DefaultSection-only `start` is rc 0 with both proxies (Go's list is empty,
 /// i.e. `startAll`), `[common] start` beats a DefaultSection `start`, and
@@ -12354,7 +12354,7 @@ fn v1_ini_scalar_section_collision_is_still_a_type_error() {
 /// be 'server' or 'visitor'`) and `[start] type = "custom"` is rc 1 (`failed to
 /// parse proxy start, err: invalid type [custom]`). The round-6 defect removed
 /// the root `start` key before collection (`legacy_start_override`,
-/// `frp-core/src/config/normalize.rs:2510`), which deleted the section and
+/// `frp-core/src/config/normalize.rs:2507`), which deleted the section and
 /// swallowed both refusals (rc 0); this test reds on `c7495cbd`.
 #[test]
 fn legacy_ini_start_section_refusals_like_go() {
@@ -12440,7 +12440,7 @@ fn legacy_ini_start_section_is_still_a_proxy() {
             assert_eq!(names, expected, "{label}, strict={strict}");
             // Go's `start` list itself: empty means `startAll`, and a
             // DefaultSection `start` must not survive into the runtime filter
-            // (`legacy_start_override`, `frp-core/src/config/normalize.rs:2510`).
+            // (`legacy_start_override`, `frp-core/src/config/normalize.rs:2507`).
             let mut started: Vec<&str> = cfg.start.iter().map(String::as_str).collect();
             started.sort_unstable();
             assert_eq!(started, expected_start, "{label}, strict={strict}");
@@ -12537,7 +12537,7 @@ fn legacy_ini_common_start_list_selects_named_sections() {
 /// matches no section, and `startAll` stays false. `frp-core/src/config/format.rs`
 /// instead infers a TOML array for `[..]` literals — a deliberate frp-rs
 /// extension for slice-typed fields — so the dispatch used to see the
-/// *elements*. `ini_value_for_key` (`frp-core/src/config/format.rs:414`) keeps
+/// *elements*. `ini_value_for_key` (`frp-core/src/config/format.rs:428`) keeps
 /// this one key as its text, and the trailing `cfg.start` assertions are those
 /// same pieces after Go's comma split and trim. Measured on Go v0.71.0 (rc 0,
 /// no proxy registered): `["start"]` beside a `[start]` section, `["p1","p2"]`,
