@@ -343,22 +343,45 @@ pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD: &str = "web_server.t
 /// `.github/workflows/ci.yml:996`/`.github/workflows/ci.yml:1000`), where the
 /// two crates' `tls` agree, so the mixed shape is a known, unshipped one.
 #[cfg(feature = "tls")]
-pub const SERVER_TLS_ENABLE_INERT_WARNING: &str = "tls_enable has no effect on the \
-    server: nothing in frp-server or frps reads it. The server's TLS switch is \
-    `tls_only` (Go's `transport.tls.force`); the TLS acceptor is built from \
-    `tls_cert_file` + `tls_key_file` — a half-written (only one of the two) or \
-    unreadable pair is refused at startup, a reload reports the failure and keeps the \
-    running acceptor, and with neither set the server auto-generates a self-signed \
-    certificate pair";
+pub const SERVER_TLS_ENABLE_INERT_TLS_CLAUSES: [&str; 2] = [
+    "tls_enable has no effect on the server: nothing in frp-server or frps reads it.",
+    "The server's TLS switch is `tls_only` (Go's `transport.tls.force`); the TLS \
+     acceptor is built from `tls_cert_file` + `tls_key_file` — a half-written (only \
+     one of the two) or unreadable pair is refused at startup, a reload reports the \
+     failure and keeps the running acceptor, and with neither set the server \
+     auto-generates a self-signed certificate pair",
+];
 
-/// The no-TLS variant of the server `tls_enable` diagnostic. The `tls`-build text
-/// (and the measurements behind the split) is on the `#[cfg(feature = "tls")]`
-/// definition above; this one names no certificate behaviour, because a build
-/// without the `tls` feature never builds a TLS acceptor.
+/// The no-TLS variant of the server `tls_enable` diagnostic, as its clauses. The
+/// `tls`-build clauses (and the measurements behind the split) are on
+/// [`SERVER_TLS_ENABLE_INERT_TLS_CLAUSES`] above; this one names no certificate
+/// behaviour, because a build without the `tls` feature never builds a TLS
+/// acceptor.
 #[cfg(not(feature = "tls"))]
-pub const SERVER_TLS_ENABLE_INERT_WARNING: &str = "tls_enable has no effect on the \
-    server: nothing in frp-server or frps reads it. This build has no TLS support \
-    (frp-core's `tls` feature is off), so the server never builds a TLS acceptor";
+pub const SERVER_TLS_ENABLE_INERT_NO_TLS_CLAUSES: [&str; 2] = [
+    "tls_enable has no effect on the server: nothing in frp-server or frps reads it.",
+    "This build has no TLS support (frp-core's `tls` feature is off), so the server \
+     never builds a TLS acceptor",
+];
+
+/// The written-`tls_enable` server diagnostic: this build shape's clause array
+/// ([`SERVER_TLS_ENABLE_INERT_TLS_CLAUSES`] /
+/// [`SERVER_TLS_ENABLE_INERT_NO_TLS_CLAUSES`]) joined with a single space, so the
+/// text is defined **once**. A `&str` const cannot join, hence the one-time
+/// `LazyLock`.
+///
+/// `frp-core/tests/server_tls_enable_warning.rs` derives its whole-text assertion
+/// from the same array, so a reworded clause cannot leave a copied literal behind
+/// in the test; the clause **count** is pinned there too, so a clause appended or
+/// dropped from the array still reds.
+pub static SERVER_TLS_ENABLE_INERT_WARNING: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        #[cfg(feature = "tls")]
+        let clauses = SERVER_TLS_ENABLE_INERT_TLS_CLAUSES;
+        #[cfg(not(feature = "tls"))]
+        let clauses = SERVER_TLS_ENABLE_INERT_NO_TLS_CLAUSES;
+        clauses.join(" ")
+    });
 
 impl ConfigPresence {
     pub(super) fn from_normalized_value(value: &toml::Value) -> Self {
@@ -572,7 +595,7 @@ impl ConfigPresence {
     /// (`frp-core/tests/server_tls_enable_warning.rs`).
     pub fn warn_inert_server_tls_enable(&self) {
         if self.server_tls_enable_set {
-            tracing::warn!("{}", SERVER_TLS_ENABLE_INERT_WARNING);
+            tracing::warn!("{}", SERVER_TLS_ENABLE_INERT_WARNING.as_str());
         }
     }
 

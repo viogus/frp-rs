@@ -2328,10 +2328,41 @@ mod oidc_throttle_tests {
         }
     }
 
+    /// What [`oidc_mock_server`] and [`oidc_mock_server_with_timeout`] hand back:
+    /// the serving thread's stop signal **plus** the request-head deadline that
+    /// call was actually built with.
+    ///
+    /// It derefs to the stop [`std::sync::mpsc::Sender`], so every existing
+    /// `let (issuer, _stop) = …` / `stop.send(())` call site is unchanged; the
+    /// extra field is what lets
+    /// `mock_default_ctor_delegates_the_pinned_deadline` observe the delegation
+    /// `oidc_mock_server() → oidc_mock_server_with_timeout(MOCK_REQUEST_HEAD_TIMEOUT)`
+    /// without waiting out the shipped 5 s.
+    struct MockServerHandle {
+        stop: std::sync::mpsc::Sender<()>,
+        request_head_timeout: std::time::Duration,
+    }
+
+    impl MockServerHandle {
+        /// The deadline this mock's serving thread reads a request head with.
+        fn request_head_timeout(&self) -> std::time::Duration {
+            self.request_head_timeout
+        }
+    }
+
+    impl std::ops::Deref for MockServerHandle {
+        type Target = std::sync::mpsc::Sender<()>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.stop
+        }
+    }
+
     /// Minimal OIDC discovery + JWKS mock on 127.0.0.1, plain HTTP, so an
     /// `OidcVerifier` can be built without external network access. Returns
-    /// the issuer URL and a stop signal for the serving thread.
-    fn oidc_mock_server() -> (String, std::sync::mpsc::Sender<()>) {
+    /// the issuer URL and a handle carrying the serving thread's stop signal and
+    /// the request-head deadline it was built with.
+    fn oidc_mock_server() -> (String, MockServerHandle) {
         oidc_mock_server_with_timeout(MOCK_REQUEST_HEAD_TIMEOUT)
     }
 
@@ -2340,7 +2371,7 @@ mod oidc_throttle_tests {
     /// test.
     fn oidc_mock_server_with_timeout(
         request_timeout: std::time::Duration,
-    ) -> (String, std::sync::mpsc::Sender<()>) {
+    ) -> (String, MockServerHandle) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock OIDC server");
         let addr = listener.local_addr().expect("mock OIDC address");
         let issuer = format!("http://{addr}");
@@ -2409,7 +2440,13 @@ mod oidc_throttle_tests {
                 }
             }
         });
-        (issuer, stop_tx)
+        (
+            issuer,
+            MockServerHandle {
+                stop: stop_tx,
+                request_head_timeout: request_timeout,
+            },
+        )
     }
 
     /// Deterministic regression pin for the accept-before-request-bytes race.
@@ -2695,18 +2732,8 @@ mod oidc_throttle_tests {
     /// every other test overrides it, so without this the constant could be raised
     /// to 60 s with the whole suite green (a round-3 review mutant). Pinned by
     /// value — see the constant's doc for why the end-to-end effect is not
-    /// exercised.
-    ///
-    /// What this pin does **not** guard: the delegation
-    /// `oidc_mock_server() → oidc_mock_server_with_timeout(MOCK_REQUEST_HEAD_TIMEOUT)`.
-    /// Wiring that call to `Duration::from_secs(60)` while the constant stays put
-    /// leaves this pin and the rest of the `oidc` suite green (measured by a
-    /// round-3 reviewer as `M_delegation_60s`) — every other test either sends at
-    /// once or overrides the deadline explicitly. Pinning it would mean either
-    /// waiting out the shipped 5 s, which this module deliberately avoids, or
-    /// returning the timeout out of the ctor, whose tuple is destructured at a
-    /// dozen call sites; the delegation is named here and in the constant's doc
-    /// instead.
+    /// exercised, and `mock_default_ctor_delegates_the_pinned_deadline` below for
+    /// the half this value pin cannot see.
     #[test]
     fn mock_default_request_head_deadline_is_pinned() {
         assert_eq!(
@@ -2715,6 +2742,28 @@ mod oidc_throttle_tests {
             "the shipped mock deadline changed: a stalled client now holds the \
              serving thread for {MOCK_REQUEST_HEAD_TIMEOUT:?}. If deliberate, \
              update the ledger's 5 s figures and this pin together."
+        );
+    }
+
+    /// The **delegation** `oidc_mock_server() → oidc_mock_server_with_timeout(MOCK_REQUEST_HEAD_TIMEOUT)`,
+    /// which the value pin above cannot see: it asserts only that the constant is
+    /// 5 s, so wiring the call to `Duration::from_secs(60)` — a round-3 review
+    /// mutant (`M_delegation_60s`) — left the whole `oidc` suite green, because
+    /// every other test either sends at once or overrides the deadline
+    /// explicitly.
+    ///
+    /// The returned handle carries the deadline its serving thread actually reads
+    /// with, so this costs nothing and does **not** wait out the shipped 5 s.
+    #[test]
+    fn mock_default_ctor_delegates_the_pinned_deadline() {
+        let (issuer, handle) = oidc_mock_server();
+        assert_eq!(
+            handle.request_head_timeout(),
+            MOCK_REQUEST_HEAD_TIMEOUT,
+            "oidc_mock_server() must pass the shipped MOCK_REQUEST_HEAD_TIMEOUT to \
+             oidc_mock_server_with_timeout; wiring it to any other value leaves every \
+             record-counting oidc test green (round-3 mutant M_delegation_60s). \
+             issuer={issuer}"
         );
     }
 

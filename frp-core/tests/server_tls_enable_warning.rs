@@ -79,6 +79,13 @@ use frp_core::config::{
     load_server_config_from_str, load_server_config_uncompleted_with_presence, ConfigPresence,
     SERVER_TLS_ENABLE_INERT_WARNING,
 };
+// The clause arrays the shipped text is *defined* as: the whole-text assertions
+// below derive their expected value from these instead of copying the text, so a
+// reworded clause cannot leave a stale literal behind in this file.
+#[cfg(not(feature = "tls"))]
+use frp_core::config::SERVER_TLS_ENABLE_INERT_NO_TLS_CLAUSES;
+#[cfg(feature = "tls")]
+use frp_core::config::SERVER_TLS_ENABLE_INERT_TLS_CLAUSES;
 
 /// The stable substring every assertion counts. If the `tracing::warn!` call is
 /// removed the counts drop to zero; if the message is reworded so this stops
@@ -238,13 +245,16 @@ fn subscriber_for(
 /// false for the very config that fires it (F1 regression guard).
 #[test]
 fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
+    // `SERVER_TLS_ENABLE_INERT_WARNING` is a `LazyLock<String>` (the clause array
+    // joined), so bind the `&str` the assertions interpolate.
+    let warning = SERVER_TLS_ENABLE_INERT_WARNING.as_str();
     assert!(
         SERVER_TLS_ENABLE_INERT_WARNING.contains(NEEDLE),
-        "the const must carry the needle the tests count: {SERVER_TLS_ENABLE_INERT_WARNING}"
+        "the const must carry the needle the tests count: {warning}"
     );
     assert!(
         SERVER_TLS_ENABLE_INERT_WARNING.contains("nothing in frp-server or frps reads it"),
-        "both variants must name the inertness: {SERVER_TLS_ENABLE_INERT_WARNING}"
+        "both variants must name the inertness: {warning}"
     );
 
     // A `tls` build names the pair's real outcomes, both delivery paths.
@@ -259,27 +269,30 @@ fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
     ] {
         assert!(
             SERVER_TLS_ENABLE_INERT_WARNING.contains(fact),
-            "the message must name {fact:?}: {SERVER_TLS_ENABLE_INERT_WARNING}"
+            "the message must name {fact:?}: {warning}"
         );
     }
 
     // …and the whole text, not just a list of clauses: a substring allow-list
     // cannot see a clause being **appended** or **dropped** — under both mutants
-    // the list above passed and only the assertion below failed (measured), so
-    // the variant string is pinned end to end here. Any intentional wording
-    // change must update this literal, the constant, and the measurements in the
-    // constant's doc together.
+    // the list above passed and only the assertion below failed (measured).
+    //
+    // The expected value is **derived** from the clause array the shipped text is
+    // defined as (`SERVER_TLS_ENABLE_INERT_TLS_CLAUSES` joined with one space), so
+    // there is no third copy to go stale: a reworded clause moves both together,
+    // while the clause-count pin below still reds if one is appended or dropped.
     #[cfg(feature = "tls")]
     assert_eq!(
-        SERVER_TLS_ENABLE_INERT_WARNING,
-        "tls_enable has no effect on the server: nothing in frp-server or frps \
-         reads it. The server's TLS switch is `tls_only` (Go's `transport.tls.force`); \
-         the TLS acceptor is built from `tls_cert_file` + `tls_key_file` — a \
-         half-written (only one of the two) or unreadable pair is refused at startup, \
-         a reload reports the failure and keeps the running acceptor, and with \
-         neither set the server auto-generates a self-signed certificate pair",
-        "the `tls` variant's text changed: a clause was added or dropped, which the \
-         substring list above cannot detect"
+        warning,
+        SERVER_TLS_ENABLE_INERT_TLS_CLAUSES.join(" "),
+        "the `tls` variant must be exactly its clause array joined by one space"
+    );
+    #[cfg(feature = "tls")]
+    assert_eq!(
+        SERVER_TLS_ENABLE_INERT_TLS_CLAUSES.len(),
+        2,
+        "a clause was appended to or dropped from the `tls` array — the substring \
+         list above cannot detect that"
     );
 
     // A no-TLS build must name *why* the key is inert and must not claim any
@@ -288,11 +301,11 @@ fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
     {
         assert!(
             SERVER_TLS_ENABLE_INERT_WARNING.contains("no TLS support"),
-            "the no-TLS variant must name the missing support: {SERVER_TLS_ENABLE_INERT_WARNING}"
+            "the no-TLS variant must name the missing support: {warning}"
         );
         assert!(
             SERVER_TLS_ENABLE_INERT_WARNING.contains("never builds a TLS acceptor"),
-            "the no-TLS variant must say no acceptor is built: {SERVER_TLS_ENABLE_INERT_WARNING}"
+            "the no-TLS variant must say no acceptor is built: {warning}"
         );
         for false_here in [
             "refused at startup",
@@ -302,22 +315,27 @@ fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
         ] {
             assert!(
                 !SERVER_TLS_ENABLE_INERT_WARNING.contains(false_here),
-                "a no-TLS build must not claim {false_here:?}: {SERVER_TLS_ENABLE_INERT_WARNING}"
+                "a no-TLS build must not claim {false_here:?}: {warning}"
             );
         }
     }
 
     // The whole no-TLS text as well: the deny-list above only rejects four known
     // clauses, so a *new* certificate claim — or a dropped one of the two
-    // positive clauses — would still be green.
+    // positive clauses — would still be green. Like the `tls` arm, the expected
+    // value is derived from the clause array the shipped text is defined as.
     #[cfg(not(feature = "tls"))]
     assert_eq!(
-        SERVER_TLS_ENABLE_INERT_WARNING,
-        "tls_enable has no effect on the server: nothing in frp-server or frps \
-         reads it. This build has no TLS support (frp-core's `tls` feature is off), \
-         so the server never builds a TLS acceptor",
-        "the no-TLS variant's text changed: a clause was added or dropped, which the \
-         deny-list above cannot detect"
+        warning,
+        SERVER_TLS_ENABLE_INERT_NO_TLS_CLAUSES.join(" "),
+        "the no-TLS variant must be exactly its clause array joined by one space"
+    );
+    #[cfg(not(feature = "tls"))]
+    assert_eq!(
+        SERVER_TLS_ENABLE_INERT_NO_TLS_CLAUSES.len(),
+        2,
+        "a clause was appended to or dropped from the no-TLS array — the deny-list \
+         above cannot detect that"
     );
 
     // The acceptor is *not* pair-gated in a `tls` build: with neither file set
@@ -326,7 +344,7 @@ fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
     // guard).
     assert!(
         !SERVER_TLS_ENABLE_INERT_WARNING.contains("non-empty"),
-        "the message must not claim a non-empty pair is required: {SERVER_TLS_ENABLE_INERT_WARNING}"
+        "the message must not claim a non-empty pair is required: {warning}"
     );
 }
 
