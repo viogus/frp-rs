@@ -132,6 +132,8 @@ jobs:
             exit 1
           fi
           echo "compat stray-guard fixture checks ok: 21 checks hold"
+      - name: RSS soak — run-dir guard + summary fixture
+        run: bash scripts/tests/rss-soak-run-dir.sh
 
   tests-unit:
     name: Tests (unit)

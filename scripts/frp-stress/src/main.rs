@@ -39,8 +39,10 @@ struct Cli {
     #[arg(long, default_value = "0")]
     streams: usize,
 
-    /// Per-stream throughput cap in MB/s for throughput mode (0 = unpaced).
-    /// A long-uptime soak caps this so sustained load cannot pin every core and
+    /// Per-stream throughput cap in MiB/s for throughput mode (0 = unpaced).
+    /// The cap is applied to COMBINED traffic — sent plus received — so
+    /// `--mbps 1` moves about 0.5 MiB/s of payload in each direction. A
+    /// long-uptime soak caps this so sustained load cannot pin every core and
     /// confound the comparison through thermal throttling.
     #[arg(long, default_value = "0")]
     mbps: u64,

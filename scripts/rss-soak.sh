@@ -44,7 +44,21 @@
 #                         rss-soak-<host>.jsonl). Set it for a throwaway
 #                         validation run so a real soak's artifact is not
 #                         clobbered.
-#   SOAK_RUN_DIR          scratch dir for configs/logs (default /tmp/rss-soak)
+#   SOAK_RUN_DIR          scratch dir for configs/logs (default /tmp/rss-soak).
+#                         Cleared of the previous run's traffic rows before the
+#                         window opens (see "traffic evidence" below); "" and "/"
+#                         are refused.
+#   SOAK_LOCK             single-run lock (default /tmp/rss-soak.lock)
+#   SOAK_RS_CONTROL       frp-rs frps control port     (default 18100)
+#   SOAK_RS_REMOTE        frp-rs frpc remote port      (default 18101)
+#   SOAK_RS_ECHO          frp-rs echo backend port     (default 18102)
+#   SOAK_GO_CONTROL       Go frps control port         (default 18200)
+#   SOAK_GO_REMOTE        Go frpc remote port          (default 18201)
+#   SOAK_GO_ECHO          Go echo backend port         (default 18202)
+#                         The six port overrides exist so a validation run can
+#                         stand beside a live soak without fighting for ports;
+#                         paired with its own SOAK_RUN_DIR/SOAK_OUT/SOAK_LOCK.
+#                         All six are validated and recorded in `meta`.
 #   SOAK_CHURN_CONNS      short-lived connections in flight (default 8)
 #   SOAK_CHURN_RATE       churn connection starts/s per stack (default 40;
 #                         0 = unpaced, which will exhaust ephemeral ports).
@@ -52,34 +66,74 @@
 #                         sockets in TIME_WAIT for ~30 s on macOS, so the
 #                         rate x TIME_WAIT x 2 stacks must stay well inside
 #                         the 16 384-port ephemeral range. The per-sample
-#                         `time_wait` count is the check.
+#                         `time_wait` count is the host-level check (it counts
+#                         the whole machine, so it is context, not one side's
+#                         number — see below).
 #   SOAK_STREAMS          long-lived byte streams per stack (default 3)
-#   SOAK_STREAM_MBPS      per-stream cap in MB/s (default 5; 0 = unpaced)
+#   SOAK_STREAM_MBPS      per-stream cap (default 5; 0 = unpaced). NOTE the cap
+#                         is applied to a counter that adds bytes SENT and
+#                         RECEIVED, so 5 means ~2.5 MiB/s of payload in each
+#                         direction, not 5 MiB/s in one.
 #   SOAK_MSG_BYTES        bytes per churn message (default 64)
 #
 # Output: scripts/frp-stress/baselines/rss-soak-<hostname>.jsonl
 #   one JSON object per line: one `meta` record, N `sample` records, one
 #   `summary` record. The summary is also printed to stdout. An artifact
-#   WITHOUT a trailing `summary` record is an incomplete (aborted) run.
+#   WITHOUT a trailing `summary` record is an incomplete run — that is a
+#   convention for whoever reads the series, NOT an enforced check: the script
+#   cannot append a record after a SIGKILL.
+#
+# Traffic evidence (why the run dir is cleared before the window opens):
+#   the achieved-load cross-check reads $SOAK_RUN_DIR/{rs,go}-{churn,steady}.json,
+#   and a generator only writes its row when it FINISHES. A generator that dies
+#   early would otherwise leave the PREVIOUS run's row in place, and the summary
+#   would publish that borrowed row under `"aborted": null`. So the four rows and
+#   the artifact are deleted after pre-flight passes and before the first sample,
+#   and the generators are given a tail longer than the window so that any one of
+#   them dying during the window is a fault with no grace period.
 #
 # Guards (abort rather than publish an apples-to-oranges series):
 #   * only one soak runs at a time (lock file), so a short validation run
 #     cannot steal the ports of, or overwrite the artifact of, a live soak
+#   * every cargo build used by the run must succeed (a stale binary is never
+#     used silently)
 #   * the Go binaries are for THIS os/arch (checked with `file`)
 #   * the Go binaries self-report the version frp-rs targets (`--version`)
 #   * the frp-rs binaries self-report that same version
 #   * a pre-flight churn on each side must complete at least one echo round
 #     trip before the window opens — a bridge that accepts but moves no bytes
-#     fails here rather than after three hours
-#   * any of the four frp processes, the two echo backends or the six traffic
-#     generators dying mid-window aborts the series
+#     fails here rather than after three hours. A pre-flight failure exits 1
+#     and writes NO artifact (the artifact is cleared only after pre-flight).
+#   * any of the four frp processes, the two echo backends or the four traffic
+#     generators dying mid-window aborts the series — including during the LAST
+#     sampling interval, because the liveness scan runs before the window-end
+#     test (the summary is appended with a non-null `aborted` reason and the
+#     script exits 3)
 #   * after the window, each side must have completed churn round trips and
-#     moved bytes on its long-lived streams
+#     moved bytes on its long-lived streams, with no torn-down stream, and the
+#     two sides must have achieved comparable volume (they are paced the same,
+#     so a large gap means one side was not handed the same work)
+#
+# The per-sample `time_wait` field is HOST-WIDE (netstat counts every socket on
+# the machine, other tenants included): it is context for the reader, not a
+# per-side check. The per-side check is the paced churn rate plus the achieved
+# round-trip count reconciled in the summary.
+#
+# Self-description: `meta` records the git HEAD, whether the tree was dirty, and
+# sha256 of the three harness files that produced the run, so an artifact can be
+# matched to the exact harness even when the commit alone is not enough.
 # =============================================================================
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR" || exit 1
+
+# Run-directory policy (degenerate-path refusal + clearing a previous run's
+# traffic rows). Separate file so the fixture scripts/tests/rss-soak-run-dir.sh
+# can drive the real thing instead of a copy of it.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=lib/rss-soak-run-dir.sh
+. "$SCRIPT_DIR/lib/rss-soak-run-dir.sh"
 
 DURATION="${1:-10800}"
 INTERVAL="${2:-45}"
@@ -92,8 +146,41 @@ if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || [ "$INTERVAL" -lt 1 ]; then
   exit 1
 fi
 
-RS_PORT=18100; RS_REMOTE=18101; RS_ECHO=18102
-GO_PORT=18200; GO_REMOTE=18201; GO_ECHO=18202
+# The traffic generators outlive the window by GENERATOR_TAIL seconds, so that
+# every one of them is still alive when the last sample is taken: a generator
+# dying inside the window is then a fault with NO grace period, with no
+# sensitivity to how late the post-launch `sleep` returned. Their result rows are
+# collected in a bounded wait after the window closes. With the old design
+# (generators ran ~2 s short of the window, death check disabled near the end) a
+# generator could die inside the last INTERVAL+5 s and the run would still say
+# "run completed".
+GENERATOR_TAIL=20
+GEN_DURATION=$(( DURATION + GENERATOR_TAIL ))
+
+validate_port() {
+  local name="$1" val="$2"
+  if ! [[ "$val" =~ ^[0-9]+$ ]] || [ "$val" -lt 1 ] || [ "$val" -gt 65535 ]; then
+    echo "error: $name must be a TCP port 1-65535 (got '$val')" >&2
+    exit 1
+  fi
+}
+
+RS_PORT="${SOAK_RS_CONTROL:-18100}"; validate_port SOAK_RS_CONTROL "$RS_PORT"
+RS_REMOTE="${SOAK_RS_REMOTE:-18101}"; validate_port SOAK_RS_REMOTE "$RS_REMOTE"
+RS_ECHO="${SOAK_RS_ECHO:-18102}"; validate_port SOAK_RS_ECHO "$RS_ECHO"
+GO_PORT="${SOAK_GO_CONTROL:-18200}"; validate_port SOAK_GO_CONTROL "$GO_PORT"
+GO_REMOTE="${SOAK_GO_REMOTE:-18201}"; validate_port SOAK_GO_REMOTE "$GO_REMOTE"
+GO_ECHO="${SOAK_GO_ECHO:-18202}"; validate_port SOAK_GO_ECHO "$GO_ECHO"
+ALL_PORTS="$RS_PORT $RS_REMOTE $RS_ECHO $GO_PORT $GO_REMOTE $GO_ECHO"
+for p in $ALL_PORTS; do
+  n=0
+  for q in $ALL_PORTS; do [ "$p" = "$q" ] && n=$(( n + 1 )); done
+  if [ "$n" -gt 1 ]; then
+    echo "error: port $p is used by more than one role ($ALL_PORTS)" >&2
+    exit 1
+  fi
+done
+
 TOKEN="rss-soak-token"
 CHURN_CONNS="${SOAK_CHURN_CONNS:-8}"
 CHURN_RATE="${SOAK_CHURN_RATE:-40}"
@@ -102,12 +189,43 @@ STREAM_MBPS="${SOAK_STREAM_MBPS:-5}"
 MSG_BYTES="${SOAK_MSG_BYTES:-64}"
 OUT="${SOAK_OUT:-scripts/frp-stress/baselines/rss-soak-$(hostname -s).jsonl}"
 RUN_DIR="${SOAK_RUN_DIR:-/tmp/rss-soak}"
-LOCK_FILE="/tmp/rss-soak.lock"
+LOCK_FILE="${SOAK_LOCK:-/tmp/rss-soak.lock}"
+
+# Validate every knob that feeds the traffic recipe. A knob that silently means
+# something else would make `meta` a lie: SOAK_STREAMS=0 would fall through to
+# the generator's clap default (100 streams) while `meta` recorded 0, and
+# SOAK_MSG_BYTES=0 becomes 1 byte inside the generator while `meta` recorded 0.
+validate_count() {
+  local name="$1" val="$2" min="$3"
+  if ! [[ "$val" =~ ^[0-9]+$ ]] || [ "$val" -lt "$min" ]; then
+    echo "error: $name must be an integer >= $min (got '$val')" >&2
+    exit 1
+  fi
+}
+validate_count SOAK_CHURN_CONNS "$CHURN_CONNS" 1
+validate_count SOAK_CHURN_RATE "$CHURN_RATE" 0
+validate_count SOAK_STREAMS "$STREAMS" 1
+validate_count SOAK_STREAM_MBPS "$STREAM_MBPS" 0
+validate_count SOAK_MSG_BYTES "$MSG_BYTES" 1
+
+# Resolve + create the run dir, create the artifact's directory, and echo the
+# resolved absolute path (recorded in `meta`); refuses "" and "/" outright.
+# Done BEFORE the lock: a rejected SOAK_RUN_DIR must not leave a lock file
+# behind (the EXIT trap is installed further down).
+RUN_DIR=$(rss_soak_prepare_run_dir "$RUN_DIR" "$OUT") || exit 1
 
 # ------------------------------------------------------------ one soak only
 # Two soaks would fight over the fixed ports and the last writer would own the
-# artifact. A stale lock from a SIGKILLed run is reclaimed, a live one is not.
-if [ -f "$LOCK_FILE" ]; then
+# artifact. The lock is taken with `set -o noclobber` — create-if-absent in ONE
+# atomic step: the previous test-then-`echo $$ >` sequence let two simultaneous
+# starts both pass the test and both believe they held the lock. A stale lock
+# (pid gone) is reclaimed and retried, bounded.
+# A validation run sharing the host needs its own SOAK_LOCK and its own ports.
+LOCK_ATTEMPTS=0
+while :; do
+  if ( set -o noclobber; echo $$ > "$LOCK_FILE" ) 2>/dev/null; then
+    break
+  fi
   old_lock=$(cat "$LOCK_FILE" 2>/dev/null || true)
   if [ -n "$old_lock" ] && kill -0 "$old_lock" 2>/dev/null; then
     echo "error: another rss-soak is already running (pid $old_lock)." >&2
@@ -115,20 +233,26 @@ if [ -f "$LOCK_FILE" ]; then
     exit 1
   fi
   echo "warning: reclaiming stale lock $LOCK_FILE (pid ${old_lock:-unknown} is gone)" >&2
-fi
-echo $$ > "$LOCK_FILE"
-
-mkdir -p "$RUN_DIR"
-mkdir -p "$(dirname "$OUT")"
+  rm -f "$LOCK_FILE"
+  LOCK_ATTEMPTS=$(( LOCK_ATTEMPTS + 1 ))
+  if [ "$LOCK_ATTEMPTS" -gt 5 ]; then
+    echo "error: could not acquire lock $LOCK_FILE after $LOCK_ATTEMPTS attempts" >&2
+    exit 1
+  fi
+done
 
 FRP_NAMES=(); FRP_PIDS=()
 GEN_NAMES=(); GEN_PIDS=()
+TRAFFIC_NAMES=(); TRAFFIC_PIDS=()
 ALL_PIDS=()
+WATCHDOG_PID=""
 add_frp() { FRP_NAMES+=("$1"); FRP_PIDS+=("$2"); ALL_PIDS+=("$2"); }
 add_gen() { GEN_NAMES+=("$1"); GEN_PIDS+=("$2"); ALL_PIDS+=("$2"); }
+add_traffic() { TRAFFIC_NAMES+=("$1"); TRAFFIC_PIDS+=("$2"); add_gen "$1" "$2"; }
 
 cleanup() {
   local p
+  [ -n "$WATCHDOG_PID" ] && kill "$WATCHDOG_PID" 2>/dev/null
   for p in "${ALL_PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
   sleep 1
   for p in "${ALL_PIDS[@]:-}"; do [ -n "$p" ] && kill -9 "$p" 2>/dev/null; done
@@ -153,13 +277,29 @@ on_signal() {
 trap cleanup EXIT
 trap on_signal INT TERM
 
+BUILD_LOG="$RUN_DIR/build.log"
 echo "=== Building the frp-stress traffic generator ==="
-(cd scripts/frp-stress && cargo build --release 2>&1 | tail -2)
+# Output goes to a log and the STATUS is checked: the old `cargo build … | tail -2`
+# turned every failure into success (the pipeline's status is tail's) and a stale
+# pre-built binary was then used silently.
+if ! (cd scripts/frp-stress && cargo build --release) >"$BUILD_LOG" 2>&1; then
+  echo "error: cargo build failed for scripts/frp-stress (log: $BUILD_LOG)" >&2
+  tail -5 "$BUILD_LOG" >&2
+  exit 1
+fi
+tail -2 "$BUILD_LOG"
 STRESS=./scripts/frp-stress/target/release/frp-stress
 
 if [ -z "${FRPS_BIN:-}" ] || [ -z "${FRPC_BIN:-}" ]; then
   echo "=== Building plain release frps/frpc (set FRPS_BIN/FRPC_BIN to skip) ==="
-  cargo build --release -p frps -p frpc 2>&1 | tail -2
+  if ! cargo build --release -p frps -p frpc >"$BUILD_LOG" 2>&1; then
+    echo "error: cargo build failed for -p frps -p frpc (log: $BUILD_LOG)" >&2
+    tail -5 "$BUILD_LOG" >&2
+    exit 1
+  fi
+  tail -2 "$BUILD_LOG"
+else
+  echo "=== Using FRPS_BIN=$FRPS_BIN FRPC_BIN=$FRPC_BIN (no build) ==="
 fi
 RS_FRPS="${FRPS_BIN:-./target/release/frps}"
 RS_FRPC="${FRPC_BIN:-./target/release/frpc}"
@@ -219,6 +359,18 @@ sha256_of() {
 rs_sha=$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)
 rs_sha_short=$(git -C "$PROJECT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)
 cpu_cores=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 0)
+# Self-description: `rs_dirty` is true when the working tree had uncommitted
+# changes to the harness itself, so an artifact cannot silently pass for a clean
+# commit's output; the three digests pin the exact harness files that ran (a
+# commit sha alone cannot, e.g. for a soak launched from a dirty tree).
+if [ -n "$(git -C "$PROJECT_DIR" status --porcelain -- scripts/rss-soak.sh scripts/lib 2>/dev/null)" ]; then
+  rs_dirty=true
+else
+  rs_dirty=false
+fi
+soak_sha=$(sha256_of "$SCRIPT_DIR/rss-soak.sh")
+run_dir_lib_sha=$(sha256_of "$SCRIPT_DIR/lib/rss-soak-run-dir.sh")
+summary_py_sha=$(sha256_of "$SCRIPT_DIR/lib/rss-soak-summary.py")
 echo "frp-rs $rs_version ($rs_sha_short) vs Go frp $go_version on $go_platform, ${cpu_cores} cores"
 echo "window ${DURATION}s, sample interval ${INTERVAL}s -> out $OUT"
 
@@ -371,32 +523,56 @@ echo "pre-flight OK: both bridges completed echo round trips"
 
 # ---------------------------------------------------------------- traffic
 # Identical recipe on both sides: paced short-lived connection churn plus a few
-# long-lived, rate-capped byte streams for the whole window. The churn rate is
-# fixed per stack so both are OFFERED the same connections/second; the achieved
-# round trips are recorded per side so a reader can check that both accepted it.
+# long-lived, rate-capped byte streams. The churn rate is fixed per stack so both
+# are OFFERED the same connections/second; the achieved round trips are recorded
+# per side and reconciled in the summary, so a reader can check both accepted it.
+# Both generators run for GEN_DURATION (the window plus GENERATOR_TAIL) so that
+# none of them ends while samples are still being taken.
 traffic() {
   local stack="$1" remote="$2" ctrl="$3"
   "$STRESS" --scenario memory --mode churn --port "$remote" --frps-addr "127.0.0.1:$ctrl" \
-    --concurrency "$CHURN_CONNS" --rate "$CHURN_RATE" --duration "$DURATION" --msg-bytes "$MSG_BYTES" \
+    --concurrency "$CHURN_CONNS" --rate "$CHURN_RATE" --duration "$GEN_DURATION" --msg-bytes "$MSG_BYTES" \
     --label "soak-churn-$stack" --json-out "$RUN_DIR/$stack-churn.json" --json-truncate \
-    >"$RUN_DIR/$stack-churn.log" 2>&1 & add_gen "$stack-churn" $!
+    >"$RUN_DIR/$stack-churn.log" 2>&1 & add_traffic "$stack-churn" $!
   "$STRESS" --scenario throughput --port "$remote" --frps-addr "127.0.0.1:$ctrl" \
-    --streams "$STREAMS" --mbps "$STREAM_MBPS" --duration "$DURATION" --label "soak-steady-$stack" --no-floor \
+    --streams "$STREAMS" --mbps "$STREAM_MBPS" --duration "$GEN_DURATION" --label "soak-steady-$stack" --no-floor \
     --json-out "$RUN_DIR/$stack-steady.json" --json-truncate \
-    >"$RUN_DIR/$stack-steady.log" 2>&1 & add_gen "$stack-steady" $!
+    >"$RUN_DIR/$stack-steady.log" 2>&1 & add_traffic "$stack-steady" $!
 }
 traffic rs "$RS_REMOTE" "$RS_PORT"
 traffic go "$GO_REMOTE" "$GO_PORT"
+
+# Hard-deadline orphan guard. `nohup … &` runs this script without job control,
+# so SIGINT is ignored by bash for the async children, and a `kill -9` of this
+# script runs no trap at all: the two echo backends and the four frp processes
+# would then outlive it forever (none of them has a self-imposed end). One
+# watchdog subshell polls this shell's pid and, once it is gone — however it
+# died — kills the whole child list and drops the lock. Normal teardown kills
+# the watchdog first, so it only ever acts on an abnormal exit.
+( parent=$$
+  while kill -0 "$parent" 2>/dev/null; do sleep 5; done
+  for p in "${ALL_PIDS[@]:-}"; do [ -n "$p" ] && kill -9 "$p" 2>/dev/null; done
+  if [ -f "$LOCK_FILE" ] && [ "$(cat "$LOCK_FILE" 2>/dev/null || true)" = "$parent" ]; then
+    rm -f "$LOCK_FILE"
+  fi ) >/dev/null 2>&1 &
+WATCHDOG_PID=$!
+
 sleep 2
 
 # ---------------------------------------------------------------- sample
-rm -f "$OUT"
+# Clear this run's evidence at the last safe moment: pre-flight passed (so the
+# bridges work), and this run's generators are alive so they cannot have written
+# anything yet. Without this, a generator that dies inside the window leaves the
+# PREVIOUS run's row in $RUN_DIR, and the summary publishes borrowed traffic
+# under "aborted": null. See scripts/lib/rss-soak-run-dir.sh.
+rss_soak_clear_run_artifacts "$RUN_DIR" "$OUT" || { echo "error: cannot clear run artifacts in $RUN_DIR" >&2; exit 1; }
 start_epoch=$(date +%s)
 start_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 started_load=$(load1)
-printf '{"kind":"meta","started_utc":"%s","duration_s":%s,"interval_s":%s,"host":"%s","platform":"%s","cpu_cores":%s,"frp_rs_version":"%s","frp_rs_sha":"%s","go_frp_version":"%s","go_frp_dir":"%s","rs_bin":"%s","rs_frpc_bin":"%s","traffic":{"churn_connections":%s,"churn_rate_per_stack":%s,"churn_msg_bytes":%s,"steady_streams":%s,"steady_mbps_per_stream":%s,"generator":"frp-stress","proxy_type":"tcp"},"ports":{"rs_control":%s,"rs_remote":%s,"rs_echo":%s,"go_control":%s,"go_remote":%s,"go_echo":%s},"bin_sha256":{"rs_frps":"%s","rs_frpc":"%s","go_frps":"%s","go_frpc":"%s"},"load1_start":%s,"caveats":["RSS is not live heap; it includes allocator retention and page-cache effects","both stacks share this host, so a machine-level effect moves both series","identical offered recipe, not guaranteed identical achieved volume; achieved round trips are recorded in the traffic summary","one TCP proxy per stack; other proxy types and encryption/compression/mux paths are not exercised"]}\n' \
-  "$start_utc" "$DURATION" "$INTERVAL" "$(hostname -s)" "$go_platform" "$cpu_cores" \
-  "$rs_version" "$rs_sha" "$go_version" "$GO_DIR" "$RS_FRPS" "$RS_FRPC" \
+printf '{"kind":"meta","started_utc":"%s","duration_s":%s,"interval_s":%s,"generator_duration_s":%s,"host":"%s","platform":"%s","cpu_cores":%s,"frp_rs_version":"%s","frp_rs_sha":"%s","frp_rs_dirty":%s,"harness_sha256":{"rss_soak_sh":"%s","run_dir_sh":"%s","summary_py":"%s"},"run_dir":"%s","go_frp_version":"%s","go_frp_dir":"%s","rs_bin":"%s","rs_frpc_bin":"%s","traffic":{"churn_connections":%s,"churn_rate_per_stack":%s,"churn_msg_bytes":%s,"steady_streams":%s,"steady_mbps_per_stream":%s,"generator":"frp-stress","proxy_type":"tcp"},"ports":{"rs_control":%s,"rs_remote":%s,"rs_echo":%s,"go_control":%s,"go_remote":%s,"go_echo":%s},"bin_sha256":{"rs_frps":"%s","rs_frpc":"%s","go_frps":"%s","go_frpc":"%s"},"load1_start":%s,"caveats":["RSS is not live heap; it includes allocator retention and page-cache effects","both stacks share this host, so a machine-level effect moves both series","the per-sample time_wait count is host-wide, not per-side","identical offered recipe, not guaranteed identical achieved volume; per-side achieved volume is recorded and compared, and a spread beyond SOAK_TRAFFIC_TOLERANCE aborts the run","one TCP proxy per stack; other proxy types and encryption/compression/mux paths are not exercised"]}\n' \
+  "$start_utc" "$DURATION" "$INTERVAL" "$GEN_DURATION" "$(hostname -s)" "$go_platform" "$cpu_cores" \
+  "$rs_version" "$rs_sha" "$rs_dirty" "$soak_sha" "$run_dir_lib_sha" "$summary_py_sha" "$RUN_DIR" \
+  "$go_version" "$GO_DIR" "$RS_FRPS" "$RS_FRPC" \
   "$CHURN_CONNS" "$CHURN_RATE" "$MSG_BYTES" "$STREAMS" "$STREAM_MBPS" \
   "$RS_PORT" "$RS_REMOTE" "$RS_ECHO" "$GO_PORT" "$GO_REMOTE" "$GO_ECHO" \
   "$(sha256_of "$RS_FRPS")" "$(sha256_of "$RS_FRPC")" "$(sha256_of "$GO_FRPS")" "$(sha256_of "$GO_FRPC")" \
@@ -405,180 +581,109 @@ printf '{"kind":"meta","started_utc":"%s","duration_s":%s,"interval_s":%s,"host"
 echo "=== soak running: $(date -u +%H:%M:%SZ), load1=$started_load ==="
 aborted=""
 samples=0
-# Generators stop on their own at ~duration-2 s; only their EARLY death is a
-# fault, hence the grace window on the generator check.
-generator_check_until=$(( DURATION - INTERVAL - 5 ))
+
+# Report HOW each dead process died, not just that it is gone: `wait` still
+# yields the remembered status of a child bash has reaped, and 127 means the
+# status was already collected. The status is recorded verbatim — it does NOT
+# identify a signal, because a process that handles SIGTERM exits 0 (frp-rs
+# does), so "(exit 0)" beside a name means "exited by itself or was asked to
+# stop", and only the elapsed time says which. Sets DEAD_SEEN in the CALLER's
+# shell (a `$( )` wrapper would run `wait` in a subshell with no job table).
+DEAD_SEEN=""
+scan_dead() { # <check_generators: 1|0>
+  local check_gen="$1" i p st
+  DEAD_SEEN=""
+  for i in "${!FRP_PIDS[@]}"; do
+    p="${FRP_PIDS[$i]}"
+    if ! alive "$p"; then
+      wait "$p" 2>/dev/null
+      st=$?
+      if [ "$st" = 127 ]; then DEAD_SEEN="${DEAD_SEEN}${FRP_NAMES[$i]} "
+      else DEAD_SEEN="${DEAD_SEEN}${FRP_NAMES[$i]}(exit $st) "; fi
+    fi
+  done
+  [ "$check_gen" = 1 ] || return 0
+  for i in "${!GEN_PIDS[@]}"; do
+    p="${GEN_PIDS[$i]}"
+    if ! alive "$p"; then
+      wait "$p" 2>/dev/null
+      st=$?
+      if [ "$st" = 127 ]; then DEAD_SEEN="${DEAD_SEEN}${GEN_NAMES[$i]} "
+      else DEAD_SEEN="${DEAD_SEEN}${GEN_NAMES[$i]}(exit $st) "; fi
+    fi
+  done
+}
+
+# The scan runs BEFORE the window-end test, so the last sampling interval is
+# examined too: with the scan after the break, a process that died at
+# DURATION-5 s was never seen and the series was published as "run completed".
+# The four frp processes and two echo backends have no self-imposed end, so any
+# death is a fault at any elapsed time. The four traffic generators DO end (by
+# design, GENERATOR_TAIL seconds past the window), so they are only checked
+# while the window is still open: a generator dying inside the window is a fault
+# with no grace period, and one that never wrote its result row is in any case
+# caught after the window by the summary's traffic reconciliation.
 while :; do
   if [ "$SIGNALLED" = 1 ]; then
     aborted="interrupted by signal (SIGINT/SIGTERM)"
     break
   fi
   elapsed=$(( $(date +%s) - start_epoch ))
-  if [ "$elapsed" -ge "$DURATION" ]; then break; fi
-
-  # Report HOW each dead process died, not just that it is gone: `wait` still
-  # yields the remembered status of a child bash has reaped, and 128+N vs a
-  # small code separates "someone sent a signal" from "the process exited".
-  dead=""
-  for i in "${!FRP_PIDS[@]}"; do
-    p="${FRP_PIDS[$i]}"
-    if ! alive "$p"; then
-      wait "$p" 2>/dev/null
-      st=$?
-      if [ "$st" = 127 ]; then dead="${dead}${FRP_NAMES[$i]} "
-      else dead="${dead}${FRP_NAMES[$i]}(exit $st) "; fi
-    fi
-  done
-  if [ "$elapsed" -lt "$generator_check_until" ]; then
-    for i in "${!GEN_PIDS[@]}"; do
-      p="${GEN_PIDS[$i]}"
-      if ! alive "$p"; then
-        wait "$p" 2>/dev/null
-        st=$?
-        if [ "$st" = 127 ]; then dead="${dead}${GEN_NAMES[$i]} "
-        else dead="${dead}${GEN_NAMES[$i]}(exit $st) "; fi
-      fi
-    done
-  fi
-  if [ -n "$dead" ]; then
-    aborted="process died at ${elapsed}s: ${dead}"
+  if [ "$elapsed" -lt "$DURATION" ]; then scan_dead 1; else scan_dead 0; fi
+  if [ -n "$DEAD_SEEN" ]; then
+    aborted="process died at ${elapsed}s: ${DEAD_SEEN}"
     echo "error: $aborted" >&2
     break
   fi
+  if [ "$elapsed" -ge "$DURATION" ]; then break; fi
 
   printf '{"kind":"sample","elapsed_s":%s,"ts":"%s","load1":%s,"time_wait":%s,"frp_rs_frps_kb":%s,"frp_rs_frpc_kb":%s,"go_frps_kb":%s,"go_frpc_kb":%s}\n' \
     "$elapsed" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(load1)" "$(time_wait_count)" \
     "$(rss_kb "$RS_FRPS_PID")" "$(rss_kb "$RS_FRPC_PID")" \
     "$(rss_kb "$GO_FRPS_PID")" "$(rss_kb "$GO_FRPC_PID")" >> "$OUT"
   samples=$((samples + 1))
-  sleep "$INTERVAL"
+  # `sleep` in the background + `wait`, not a bare `sleep`: a trapped SIGTERM
+  # interrupts `wait` immediately, so the loop notices it at once instead of
+  # only when the sleep returns (up to INTERVAL seconds later). Under the
+  # documented `nohup … &` launch bash ignores SIGINT for async commands and
+  # there is no job control, so SIGTERM is the signal that stops a detached soak.
+  sleep "$INTERVAL" &
+  sleep_pid=$!
+  wait "$sleep_pid" 2>/dev/null
+  :
 done
+
+# ------------------------------------------------------------ generator tail
+# The traffic generators were launched with GENERATOR_TAIL extra seconds, so they
+# should still be running here. Give them that tail to finish and write their
+# result rows (the summary reads those files), bounded, and only when the run has
+# not already faulted.
+if [ -z "$aborted" ]; then
+  gen_deadline=$(( $(date +%s) + GENERATOR_TAIL + 60 ))
+  while :; do
+    pending=""
+    for p in "${TRAFFIC_PIDS[@]:-}"; do
+      if [ -n "$p" ] && alive "$p"; then pending=yes; break; fi
+    done
+    [ -z "$pending" ] && break
+    if [ "$(date +%s)" -ge "$gen_deadline" ]; then
+      echo "warning: traffic generator(s) still running past the window; results may be incomplete" >&2
+      break
+    fi
+    sleep 2
+  done
+fi
 
 # ---------------------------------------------------------------- teardown
 cleanup
 trap - EXIT INT TERM
 
+# Summary + completeness reconciliation live in scripts/lib/rss-soak-summary.py
+# so the fixture can drive the real reader (see scripts/tests/rss-soak-run-dir.sh).
 summary_rc=0
-python3 - "$OUT" "$aborted" "$RUN_DIR/rs-churn.json" "$RUN_DIR/go-churn.json" \
-  "$RUN_DIR/rs-steady.json" "$RUN_DIR/go-steady.json" <<'PY' || summary_rc=$?
-import json, statistics, sys
-
-path, aborted = sys.argv[1], sys.argv[2]
-traffic_paths = {
-    "frp_rs_churn": sys.argv[3],
-    "go_churn": sys.argv[4],
-    "frp_rs_steady": sys.argv[5],
-    "go_steady": sys.argv[6],
-}
-
-def load_json(p):
-    try:
-        with open(p) as fh:
-            lines = [l for l in fh.read().splitlines() if l.strip()]
-        return json.loads(lines[-1]) if lines else None
-    except Exception:
-        return None
-
-rows = []
-with open(path) as fh:
-    for line in fh:
-        line = line.strip()
-        if line:
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
-samples = [r for r in rows if r.get("kind") == "sample"]
-meta = next((r for r in rows if r.get("kind") == "meta"), {})
-# Window for the first/last-hour means. max(1, ...) keeps the slice non-empty
-# when the sample interval is itself an hour or longer (fmean([]) would raise).
-window = max(1, 3600 // max(1, int(meta.get("interval_s") or 45)))
-cols = [
-    ("frp_rs_frps_kb", "frp-rs frps"),
-    ("frp_rs_frpc_kb", "frp-rs frpc"),
-    ("go_frps_kb", "Go frps"),
-    ("go_frpc_kb", "Go frpc"),
-]
-
-def block(vals):
-    if not vals:
-        return None
-    return {
-        "first": vals[0], "last": vals[-1], "min": min(vals), "max": max(vals),
-        "mean": round(statistics.fmean(vals), 1),
-        "first_hour_mean": round(statistics.fmean(vals[:window]), 1),
-        "last_hour_mean": round(statistics.fmean(vals[-window:]), 1),
-        "growth_pct_first_to_last": round(100.0 * (vals[-1] - vals[0]) / vals[0], 1) if vals[0] else None,
-    }
-
-data = {
-    key: block([r.get(key) for r in samples if r.get(key) is not None])
-    for key, _ in cols
-}
-loads = [r.get("load1") for r in samples if r.get("load1") is not None]
-waits = [r.get("time_wait") for r in samples if r.get("time_wait") is not None]
-
-traffic = {}
-for name, p in traffic_paths.items():
-    d = load_json(p)
-    if d:
-        traffic[name] = {
-            "connections": d.get("connections"),
-            "round_trips": d.get("round_trips"),
-            "bytes": d.get("bytes"),
-            "total_bytes": d.get("total_bytes"),
-            "mbps": d.get("mbps"),
-        }
-    else:
-        traffic[name] = None
-
-# A flat RSS line only means something if load was actually delivered on BOTH
-# sides. Refuse to stamp a series whose traffic evidence is missing or zero.
-if not aborted:
-    problems = []
-    for key, label in (("frp_rs_churn", "frp-rs"), ("go_churn", "Go")):
-        d = traffic.get(key)
-        if not d or not d.get("round_trips"):
-            problems.append(f"{label} churn completed no echo round trips")
-    for key, label in (("frp_rs_steady", "frp-rs"), ("go_steady", "Go")):
-        d = traffic.get(key)
-        if not d or not d.get("total_bytes"):
-            problems.append(f"{label} steady stream moved no bytes")
-    if problems:
-        aborted = "insufficient traffic evidence: " + "; ".join(problems)
-
-summary = {
-    "kind": "summary",
-    "samples": len(samples),
-    "aborted": aborted or None,
-    "load1": {"min": min(loads), "max": max(loads), "mean": round(statistics.fmean(loads), 2)} if loads else None,
-    "time_wait": {"min": min(waits), "max": max(waits), "mean": round(statistics.fmean(waits), 1)} if waits else None,
-    "traffic": traffic,
-    "rss_kb": data,
-}
-with open(path, "a") as fh:
-    fh.write(json.dumps(summary, sort_keys=True) + "\n")
-
-print("=== RSS soak summary (KB) ===")
-print(f"{'process':<12} {'first':>8} {'last':>8} {'min':>8} {'max':>8} {'mean':>9} {'1st-h mean':>11} {'last-h mean':>12}")
-for key, label in cols:
-    b = data[key] or {}
-    print(f"{label:<12} {b.get('first', 0):>8} {b.get('last', 0):>8} {b.get('min', 0):>8} "
-          f"{b.get('max', 0):>8} {b.get('mean', 0):>9} {b.get('first_hour_mean', 0):>11} "
-          f"{b.get('last_hour_mean', 0):>12}")
-print(f"samples: {len(samples)}; " + (f"ABORTED: {aborted}" if aborted else "run completed"))
-if summary["load1"]:
-    print(f"host load1: min {summary['load1']['min']} mean {summary['load1']['mean']} max {summary['load1']['max']}")
-if summary["time_wait"]:
-    print(f"TIME_WAIT: min {summary['time_wait']['min']} mean {summary['time_wait']['mean']} max {summary['time_wait']['max']}")
-for name, d in traffic.items():
-    if d:
-        print(f"traffic {name}: round_trips={d.get('round_trips')} bytes={d.get('bytes')} "
-              f"total_bytes={d.get('total_bytes')} mbps={d.get('mbps')}")
-    else:
-        print(f"traffic {name}: MISSING")
-sys.exit(3 if aborted else 0)
-PY
+python3 "$SCRIPT_DIR/lib/rss-soak-summary.py" "$OUT" "$aborted" \
+  "$RUN_DIR/rs-churn.json" "$RUN_DIR/go-churn.json" \
+  "$RUN_DIR/rs-steady.json" "$RUN_DIR/go-steady.json" || summary_rc=$?
 
 echo "=== soak artifact written: $OUT ($samples samples) ==="
 exit "$summary_rc"
