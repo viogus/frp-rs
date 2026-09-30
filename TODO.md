@@ -5015,12 +5015,13 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   two stale `FRPS_CLI_TESTS: "16"` quotes in this file. The `frpc verify` success-line divergence
   and the `frps help`/`completion` rc divergence are recorded — the first filed as an item below,
   the second in `docs/developing.md` § Maintenance policy: feature surface.
-  **Three things this does not claim.** (1) The `--allow-unsafe`/`TokenSourceExec` gate is not run:
-  Go's verify does run its post-load `ValidateServerConfig`
+  **Three things this does not claim.** (1) The `--allow-unsafe`/`TokenSourceExec` gate was not run
+  at this head: Go's verify does run its post-load `ValidateServerConfig`
   (`pkg/config/v1/validation/validator.go:22-27` via `auth.go:34-35`, reached from
   `cmd/frps/verify.go:46-48`), so `frps verify -c <exec tokenSource>` is Go rc **1**
-  (`unsafe feature "TokenSourceExec" is not enabled …`) and head rc **0** — the same pre-existing
-  divergence `frpc verify` has, now filed as its own item below. (2) Trailing
+  (`unsafe feature "TokenSourceExec" is not enabled …`) and the head was rc **0** — the same
+  pre-existing divergence `frpc verify` had, filed as its own item below and closed in `3798a727`
+  (see that item's Done block). (2) Trailing
   positionals: Go's `verifyCmd` sets no `Args` validator, so `frps verify -c <valid> junk` is Go
   rc **0** and head rc **1** — the same divergence `frpc verify -c <valid> junk` has (measured,
   Go 0 / frp-rs 1). (3) The run path's `frps -c a.toml -c b.toml` has no last-wins either before or
@@ -5120,7 +5121,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   match, because every reachable frps construction message contains `auth`/`token` — a substring
   mutant in `frps/src/main.rs` passes all 19 of that file's tests (verified by attempting it).
 
-- [ ] **`frps verify` / `frpc verify` do not run the post-load `--allow-unsafe` gate, so `verify`
+- [x] **`frps verify` / `frpc verify` do not run the post-load `--allow-unsafe` gate, so `verify`
   accepts a config the daemon refuses.** Found by the reviewers of the `frps verify` round; the
   sentence that pointed at "its own item" in `docs/developing.md` § CLI inputs named an item that
   did not exist, which is what filed this one.
@@ -5149,6 +5150,28 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `verify` refuses what the daemon refuses, and give each row above a measured pin; or record it
   as a deliberate divergence in `docs/developing.md` § CLI inputs **and** in the feature-surface
   policy, with the reason the two stages are allowed to differ. No sha.
+
+  **Done (`3798a727`).** Took the first branch. `run_verify` in both binaries now loads through
+  `load_server_config_checked` / `load_client_config_with_presence_checked`
+  (`frp-core/src/config/file.rs`), which call the new `check_server_unsafe_features` /
+  `check_client_unsafe_features` and reuse the daemons' own predicate
+  (`frp_core::auth::validate_token_source_unsafe`), so one place gates both binaries and both
+  commands. `--allow-unsafe` is read on the two `verify` subcommands
+  (`VerifyArgs { config, strict_config, allow_unsafe }`, `frp-core/src/cli.rs`) instead of
+  ignored, and the gate is fail-closed: `--allow-unsafe WrongFeature` is rc 1 (was rc 0). The
+  daemon path is untouched and still exits 3 `EXIT_AUTH` on the same config, the documented
+  frp-rs extension over Go's rc 1; that divergence is stated in the pins' doc tables
+  (`frps/tests/cli_exit_codes.rs:262-270`, `frpc/tests/cli_exit_codes.rs:376-383`) rather than
+  moved. Every row above now has a measured pin:
+  `verify_runs_the_post_load_allow_unsafe_gate_like_go` in `frps/tests/cli_exit_codes.rs:282`
+  and `frpc/tests/cli_exit_codes.rs:392`, plus the loader-level
+  `check_client_unsafe_features_gates_both_token_source_spellings` in
+  `frp-core/src/config/tests.rs` for the `auth.oidc.tokenSource` spelling, which has no
+  measured Go row of its own. Teeth: `Ok(())` for either checked wrapper reds the spawn pin's
+  refuse row (`frps/tests/cli_exit_codes.rs:297:5`, `frpc/tests/cli_exit_codes.rs:406:5`),
+  widening the predicate to `unsafe_features.is_empty()` reds the fail-closed row
+  (`frps/tests/cli_exit_codes.rs:340:5`, `frpc/tests/cli_exit_codes.rs:451:5`), and deleting
+  the `auth.oidc_token_source` arm reds `frp-core/src/config/tests.rs:10428:14`.
 - [x] **`frpc verify`'s success line is not Go's, and now differs from `frps verify`'s too.**
   Recorded as "a second, adjacent divergence left alone" by the output-shape round
   (`docs/developing.md` § Output stream and shape on a config-load failure) and mentioned in

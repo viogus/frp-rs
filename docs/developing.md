@@ -1648,18 +1648,21 @@ set per **struct** (`PROXY_KNOWN_KEYS` and friends in
     of its own and nothing inside it is visited either. Measured with
     `[auth.tokenSource] type = "exec"` +
     `[auth.tokenSource.exec] command = "echo tok"` and a capitalised `Env`:
-    frp-rs strict `verify` exits **0** and prints `is valid`, and it does so for
-    the correctly-spelled `env` too. frp-rs *does* have the `TokenSourceExec`
-    gate (`frp-core/src/unsafe_features.rs:10`, enforced by
-    `validate_token_source_unsafe` in `frp-core/src/auth.rs` and called from
-    `frp-client/src/service.rs`); it runs at **service start**, not in `verify`'s
-    load path, which is why `verify` cannot surface the drop either way —
-    measured, `frpc -c <that config>` is rc **3** with
+    frp-rs strict `verify` now exits **1** for both spellings, but not because it
+    sees the drop — the `TokenSourceExec` gate
+    (`frp-core/src/unsafe_features.rs:10`, enforced by
+    `validate_token_source_unsafe` in `frp-core/src/auth.rs`) is run by the shared
+    load path since `3798a727` (`frp-core/src/config/file.rs`), so verify refuses
+    the config *after* the walk and the spelling no longer changes its verdict;
+    `--allow-unsafe TokenSourceExec` restores `is valid`/rc 0, again for both.
+    The drop is therefore visible only at the parsed-value level, which is what
+    the pin below asserts: with the gate allowed, `env` is read into the
+    token-source struct, `Env` leaves it empty. Go refuses both spellings
+    unconditionally (`unsafe feature "TokenSourceExec" is not enabled …`), and the
+    daemon exits rc **3** with
     `auth.tokenSource exec blocked: TokenSourceExec not in UnsafeFeatures
     allowlist. Pass --allow-unsafe TokenSourceExec to enable.`, identical for
-    `Env` and `env`. So the drop is visible only at the parsed-value level:
-    `env` is read into the token-source struct, `Env` leaves it empty. Go refuses
-    both spellings (`unsafe feature "TokenSourceExec" is not enabled …`). Already
+    `Env` and `env` (the documented `EXIT_AUTH` extension). Already
     documented in
     [§ Deployment § Dashboard Web UI](deployment.md#dashboard-web-ui)
     (`auth.tokenSource.exec.env` has no key set at `tokenSource`), and pinned by
@@ -2096,29 +2099,29 @@ every child bounded and reaped.
 
 Three things this table does **not** claim:
 
-* **The config verdict is the client verify's, not the daemon's.** `run_verify`
-  (`frps/src/main.rs`) calls `load_server_config` — the same loader the run path
-  uses — and stops there. It does **not** run the service-construction gates,
-  `--allow-unsafe`/`TokenSourceExec` among them (`frp-server/src/service.rs`),
-  because they live after the load. Measured on Go v0.71.0 with
+* **The config verdict is the *load path's* verdict, and it is shared by both
+  binaries.** `run_verify` (`frps/src/main.rs`, `frpc/src/main.rs`) loads through
+  `load_server_config_checked` / `load_client_config_with_presence_checked`
+  (`frp-core/src/config/file.rs`), which run the post-load unsafe-feature gate —
+  `check_server_unsafe_features` / `check_client_unsafe_features`, on top of the
+  same predicate the daemons call, `frp_core::auth::validate_token_source_unsafe`
+  — before returning. The service-construction gates that live *after* the load
+  (`frp-server/src/service.rs`) are still not run, so a check added only there
+  would still not be visible here; the unsafe-feature gate sits on the load path
+  precisely because both commands share it. Measured on Go v0.71.0 with
   `[auth.tokenSource] type = "exec"`: `frps verify -c <that config>` is rc **1**,
   stdout `unsafe feature "TokenSourceExec" is not enabled. To enable it, ensure
   it is allowed in the configuration or command line flags`, stderr 0 B
   (`ValidateUnsafeFeature`, `pkg/config/v1/validation/validator.go:22-27`, called
   for `tokenSource.Type == "exec"` at `pkg/config/v1/validation/auth.go:34-35`
-  and reached from `cmd/frps/verify.go:46-48`, whose error arm is `:52-55`),
-  while the head prints `syntax is ok` (rc 0) — and
-  `--allow-unsafe TokenSourceExec` makes Go rc 0 as well, which the head also
-  matches. That gap is **pre-existing and
-  shared with `frpc verify`** — measured and recorded for the client in
-  `frp-core/src/config/tests.rs` ("Go refuses both spellings … frp-rs strict
-  `verify` exits 0") — and it is deliberately not closed here, because closing it
-  on one binary alone would make the two verifies disagree about the same config.
-  A fix belongs in the shared load path, and it is now filed:
-  `TODO.md`'s "`frps verify` / `frpc verify` do not run the post-load
-  `--allow-unsafe` gate" (which also records that Go's **run** path refuses the
-  same config, so the gate is a load/validate-time property there, not a
-  verify-only one).
+  and reached from `cmd/frps/verify.go:46-48`, whose error arm is `:52-55`); the
+  head is rc **1** as well, but prints its own one-line message, because the
+  predicate's wording is frp-rs's — the divergence is in the text, not the
+  verdict. `--allow-unsafe TokenSourceExec` makes both rc 0, and a wrong value is
+  fail-closed on both. One deliberate difference remains: Go's **run** path
+  refuses the same config with rc 1 while frp-rs's daemon exits 3 `EXIT_AUTH` —
+  the documented `EXIT_AUTH` extension, unchanged by this round and stated in the
+  pins' doc tables.
 * **The two frp-rs-only extensions are refused, but the run path still accepts
   both.** `frps --config-dir <dir>` is rc 2 on that path and rc 1
   `unknown flag` on Go; `frps --log-format json -c <cfg>` is accepted on that

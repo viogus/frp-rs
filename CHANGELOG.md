@@ -57,10 +57,12 @@ User-facing release notes for frp-rs.
   `--config-dir` and `--log-format` (Go's `frps` has neither, and accepting them
   would make an argv Go rejects — `unknown flag: …`, exit 1 — exit **0**, i.e. a
   validation command reporting success for a config it never looked at; the run
-  path keeps both as documented extensions), and it stops at the config loader,
-  so the post-load `--allow-unsafe` gate for an `exec` token source is not
-  applied — the same pre-existing gap `frpc verify` has, left alone here so the
-  two verifies keep agreeing with each other and filed in `TODO.md`.
+  path keeps both as documented extensions), and — at the time of this round —
+  it stopped at the config loader, so the post-load `--allow-unsafe` gate for an
+  `exec` token source was not applied, the same pre-existing gap `frpc verify`
+  had; it was left alone here so the two verifies kept agreeing with each other,
+  and filed in `TODO.md`. That gap is closed in this same Unreleased section (see
+  **Fixed**): `verify` now runs the gate and refuses what the daemon refuses.
 - **`frps` now resolves a subcommand that follows leading root flags, as Go's
   cobra does — and the claim that it did not need to was false.** The previous
   round's note here said `frps` was untouched because "Go's `frps` has no
@@ -469,6 +471,24 @@ User-facing release notes for frp-rs.
   a header that names a v1 root is still read as that root even in the camelCase spelling —
   `[webServer] type = "tcp"` stays a proxy, as at base — and only a section with no `type`
   that names `local_port`/`remote_port` is collected as one.
+- **`frps verify` and `frpc verify` now run the post-load `--allow-unsafe`
+  gate, so a config the daemon refuses is no longer reported as valid.** Both
+  verifies stopped at the config loader, while the daemon reaches
+  `validate_token_source_unsafe` during service construction — so
+  `[auth.tokenSource] type = "exec"` (and the `auth.oidc.tokenSource` spelling)
+  verified rc 0 here but rc 1 on Go, whose `ValidateServerConfig` runs the check
+  on the load/validate path that its verify shares. `run_verify` now loads
+  through `load_server_config_checked` / `load_client_config_with_presence_checked`
+  (`frp-core/src/config/file.rs`), which call `check_server_unsafe_features` /
+  `check_client_unsafe_features` on top of the daemons' own predicate, and
+  `--allow-unsafe` is read on both verify subcommands instead of ignored. The
+  gate is fail-closed — `--allow-unsafe WrongFeature` is rc 1, not rc 0 — and the
+  daemon path is unchanged, still exiting 3 `EXIT_AUTH` on the same config (the
+  documented frp-rs extension over Go's rc 1). Pinned by
+  `verify_runs_the_post_load_allow_unsafe_gate_like_go` in
+  `frps/tests/cli_exit_codes.rs` and `frpc/tests/cli_exit_codes.rs`, and by
+  `check_client_unsafe_features_gates_both_token_source_spellings` in
+  `frp-core/src/config/tests.rs`; closes TODO.md:5086.
 - **The `web_server.tls.enable` warning is now build-aware: in a build with no
   dashboard it no longer claims the dashboard serves plaintext HTTP.** The key is
   read behind `frp-server`'s `dashboard` feature (and `frpc`'s `admin`), but the

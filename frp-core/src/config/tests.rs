@@ -10113,12 +10113,13 @@ fn case_insensitive_proxy_array_key_is_refused_in_strict_mode() {
 ///
 /// * Go refuses **both** spellings — `unsafe feature "TokenSourceExec" is not
 ///   enabled …` — because it reads the key either way and then hits its gate.
-/// * frp-rs strict `verify` exits 0 and prints `syntax is ok` for **both** too, but
-///   not because it lacks the gate: `TokenSourceExec` is defined at
-///   `frp-core/src/unsafe_features.rs:10` and enforced by
-///   `validate_token_source_unsafe` (`frp-core/src/auth.rs`), called from
-///   `frp-client/src/service.rs` — i.e. at **service start**, outside `verify`'s
-///   load path. Measured: `frpc -c <this config>` is rc 3 with
+/// * frp-rs strict `verify` now exits 1 for **both** too: `TokenSourceExec` is
+///   defined at `frp-core/src/unsafe_features.rs:10` and enforced by
+///   `validate_token_source_unsafe` (`frp-core/src/auth.rs`), and since `3798a727`
+///   the shared load path runs it (`frp-core/src/config/file.rs`), so verify
+///   refuses the config after the walk and the spelling no longer changes its
+///   verdict; `--allow-unsafe TokenSourceExec` restores `is valid`/rc 0 for both.
+///   Measured: `frpc -c <this config>` is rc 3 with
 ///   `auth.tokenSource exec blocked: TokenSourceExec not in UnsafeFeatures
 ///   allowlist. …`, identical for `Env` and `env`. The drop is therefore visible
 ///   only at the parsed-value level, which is what this pin asserts: `env` is
