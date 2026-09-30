@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(any(feature = "websocket", feature = "kcp"))]
+#[cfg(feature = "kcp")]
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 
