@@ -155,7 +155,13 @@ jobs:
       # `verify_accepts_vhost_http_timeout_both_spellings_and_prints_go_line`),
       # the run-path and verify-path rows for the flag Go registers at
       # `pkg/config/flags.go:237`.
-      FRPS_CLI_TESTS: "31"
+      # 31 → 33 after the rebase onto `7c3d5707` (#419's `--config-dir` work):
+      # +2 (`config_dir_where_every_service_fails_init_exits_like_dash_c`,
+      # `config_dir_where_every_service_fails_to_run_exits_like_dash_c`),
+      # re-derived from this lane's own `-- --list` on the merged tree. A merged
+      # literal is the **sum** of two disjoint additions, never the larger of
+      # the two: the pre-merge branch measured 31 and `main` measured 31.
+      FRPS_CLI_TESTS: "33"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
       # 11 → 13 with the one `auth.method` policy: +2
