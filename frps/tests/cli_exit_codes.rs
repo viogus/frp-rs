@@ -918,6 +918,51 @@ fn config_dir_where_one_service_fails_keeps_serving_and_exits_zero() {
     drop(holder);
 }
 
+/// The same converse pin with the file order **swapped**: `a.toml` is the file
+/// whose service fails at run time and `b.toml` is the survivor.
+///
+/// The pin above cannot see a "the *first* file failed" short-circuit — its
+/// failing file is `b.toml`, at index 1 — so appending
+/// `|| failures.iter().any(|(file_index, _)| *file_index == 0)` to the all-failed
+/// comparison survived it (35 `cli_exit_codes` + 16 `warn_delivery` + 19 tiny +
+/// 18 full all green). Under that mutant this directory exits `a.toml`'s
+/// `EXIT_RUNTIME`/1 after SIGTERM instead of returning, so the surviving
+/// `b.toml` listener plus the `Some(0)` exit code are the teeth.
+#[test]
+fn config_dir_where_the_first_service_fails_keeps_serving_and_exits_zero() {
+    let dir = TempDir::new();
+    let conf_d = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    let port = ephemeral_port();
+    let (holder, held) = held_port();
+    std::fs::write(
+        conf_d.join("a.toml"),
+        format!("bindAddr = \"127.0.0.1\"\nbindPort = {held}\n[auth]\ntoken = \"cli-exit-test\"\n"),
+    )
+    .expect("write a.toml");
+    std::fs::write(
+        conf_d.join("b.toml"),
+        format!("bindAddr = \"127.0.0.1\"\nbindPort = {port}\n[auth]\ntoken = \"cli-exit-test\"\n"),
+    )
+    .expect("write b.toml");
+
+    // Waits for the surviving listener to accept *and* the SIGUSR1 ready
+    // marker, then sends SIGTERM and asserts the exit code is 0.
+    let log = start_listening_then_sigterm(
+        &["--config-dir", conf_d.to_str().expect("utf-8 temp path")],
+        port,
+        &dir,
+    );
+    assert!(
+        log.contains("frps service error for config file")
+            && log.contains("a.toml")
+            && log.contains("Address already in use"),
+        "a.toml's held-port service must really have failed at run time, or this pin \
+         would pass with no failure for the directory to survive; log={log:?}",
+    );
+    drop(holder);
+}
+
 /// A file that fails to **load** never becomes a task, so it could not reach
 /// the all-failed decision: at `d9f8e63c` a directory where every file failed
 /// to load exited `EXIT_CONFIG`/2 purely because `handles` came out empty,

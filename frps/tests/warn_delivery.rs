@@ -715,6 +715,63 @@ fn a_config_dir_sigusr1_reloads_every_service() {
     );
 }
 
+/// The registry must not keep counting a **dead** task: one file's task panics
+/// (the debug-only `FRPS_CFGDIR_TEST_PANIC` hook, which panics *after* the task
+/// registered) while the other three serve, and a later SIGUSR1 must report
+/// `3 of 3`, not `4 of 4`.
+///
+/// The removal used to live in `Service::run`'s error arm
+/// (`frps/src/main.rs`), which a panicking task never reaches — it unwinds past
+/// it — so the dead service stayed registered and the fan-out line counted it
+/// (`reloaded 4 of 4`, measured by reviewer 1). Registration now arms a drop
+/// guard (`DirRegistryEntry`) and unwinding runs it.
+///
+/// The signal is re-sent in a bounded loop because the panic hook runs *before*
+/// unwinding: a signal racing the unwind could still see the dead entry. Every
+/// later signal sees the fix and the mutant never does, so the loop is the
+/// deterministic form — it cannot pass without the guard and cannot flake with
+/// it.
+#[cfg(unix)]
+#[test]
+fn a_config_dir_sigusr1_does_not_count_a_panicking_service() {
+    const FILES: usize = 4;
+    const LIVE: usize = FILES - 1;
+    let dir = TempDir::new("cfgdir-panic-fanout");
+    let sub = dir.0.join("conf.d");
+    std::fs::create_dir_all(&sub).expect("create config dir");
+    let mut doomed = PathBuf::new();
+    for name in ["a.toml", "b.toml", "c.toml", "d.toml"] {
+        let path = sub.join(name);
+        let cfg = frps_config(free_port(), free_port(), Section::Nested);
+        std::fs::write(&path, &cfg).expect("write config");
+        if name == "d.toml" {
+            doomed = path;
+        }
+    }
+    let mut spawned = Spawned::spawn(
+        &dir,
+        &["--config-dir", sub.to_str().unwrap()],
+        &[("FRPS_CFGDIR_TEST_PANIC", doomed.to_str().unwrap())],
+    );
+
+    let fan_out = format!("SIGUSR1 fan-out: reloaded {LIVE} of {LIVE} services");
+    let mut seen = false;
+    for _ in 0..10 {
+        if spawned.sigusr1_and_reload() && spawned.streams().contains(&fan_out) {
+            seen = true;
+            break;
+        }
+    }
+    assert!(
+        seen,
+        "a panicking task must leave the registry, so the fan-out line must be \
+         {fan_out:?} (never `4 of 4`) within ten signals\n--- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        spawned.stdout(),
+        spawned.stderr(),
+    );
+}
+
 /// The registration-order pin. `SIGUSR1` is installed **before** the services
 /// are spawned — that is what keeps an early signal from killing the process —
 /// but the "reload ready" line must not be printed until every spawned task has

@@ -50,6 +50,34 @@ fn lock_dir_registry(
     }
 }
 
+/// Removes one service from the [`DirRegistry`] when the task that registered it
+/// stops — the graceful tail, a `run()` error, **or a panic**.
+///
+/// The last case is the whole reason this is a drop guard rather than the
+/// explicit removal the error arm used to do: a panicking task unwinds, so it
+/// never reaches that arm, and the dead service stayed registered — a later
+/// SIGUSR1 fan-out then counted it (`reloaded N of N` with one of the N already
+/// gone). Unwinding drops this guard, so the registration and the
+/// unregistration are symmetric for every exit path the task has.
+#[cfg(unix)]
+struct DirRegistryEntry {
+    registry: DirRegistry,
+    service: std::sync::Arc<Service>,
+}
+
+#[cfg(unix)]
+impl Drop for DirRegistryEntry {
+    fn drop(&mut self) {
+        let mut live = lock_dir_registry(&self.registry);
+        if let Some(pos) = live
+            .iter()
+            .position(|(svc, _)| std::sync::Arc::ptr_eq(svc, &self.service))
+        {
+            live.remove(pos);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     std::panic::set_hook(Box::new(|info| {
@@ -375,6 +403,18 @@ async fn run(mut cli: FrpsArgs) {
                                     .push((service.clone(), path_str.clone()));
                                 registration_barrier.add_permits(1);
                             }
+                            // Armed immediately after the push above and dropped
+                            // on **every** way out of this task — the graceful
+                            // tail, the `run()` error arm below, and unwinding
+                            // out of the panic hook in between. A panicking task
+                            // never reaches the error arm, so an explicit removal
+                            // there left the dead service in the registry and the
+                            // next SIGUSR1 counted it.
+                            #[cfg(unix)]
+                            let _registry_entry = DirRegistryEntry {
+                                registry: registry.clone(),
+                                service: service.clone(),
+                            };
                             // Debug-build-only hook for the spawn-level pin in
                             // `frps/tests/cli_exit_codes.rs`: when
                             // `FRPS_CFGDIR_TEST_PANIC` names *this* file, the
@@ -404,20 +444,11 @@ async fn run(mut cli: FrpsArgs) {
                                 // `config_dir_where_every_service_fails_to_run_exits_like_dash_c`
                                 // (`frps/tests/cli_exit_codes.rs`).
                                 tracing::error!(path = %path_str, error = %e, "frps service error for config file [{}]: {}", path_str, e);
-                                // Drop it from the registry first: its
-                                // listeners are gone, so a later SIGUSR1 must
-                                // not report a reload for a service that is no
-                                // longer running.
-                                #[cfg(unix)]
-                                {
-                                    let mut live = lock_dir_registry(&registry);
-                                    if let Some(pos) = live
-                                        .iter()
-                                        .position(|(svc, _)| std::sync::Arc::ptr_eq(svc, &service))
-                                    {
-                                        live.remove(pos);
-                                    }
-                                }
+                                // Its listeners are gone, so a later SIGUSR1
+                                // must not report a reload for a service that is
+                                // no longer running: `_registry_entry` above owns
+                                // that removal now, on this path and on the panic
+                                // path alike.
                                 return Err(frp_core::EXIT_RUNTIME);
                             }
                             // `Ok(())` = this task ran a service to a graceful
@@ -569,6 +600,14 @@ async fn run(mut cli: FrpsArgs) {
         // (`a.toml` no token → 3, `b.toml` held port → 1, so 3), and — through
         // the debug-only panic hook above —
         // `config_dir_where_every_task_panics_exits_nonzero`.
+        //
+        // The converse — a directory with a survivor — is pinned in **both**
+        // file orders: `config_dir_where_one_service_fails_keeps_serving_and_exits_zero`
+        // puts the failure second, and
+        // `config_dir_where_the_first_service_fails_keeps_serving_and_exits_zero`
+        // puts it first, so neither `if true` nor an "any file failed"
+        // short-circuit (`failures.iter().any(|(file_index, _)| *file_index == 0)`)
+        // can keep the process up on a code it must not exit.
         let mut failures: Vec<(usize, i32)> = load_failures;
         for (file_index, handle) in handles {
             match handle.await {
@@ -755,9 +794,11 @@ async fn run(mut cli: FrpsArgs) {
 /// would do it) would otherwise make every *later* signal panic inside
 /// `Mutex::lock().unwrap()` — a single failure silently escalating into "the
 /// reload lane is dead". `lock_dir_registry` recovers the *live list* and logs;
-/// this pin seeds the registry with a real service and captures the recovery's
-/// log, so recovering an emptied list, or dropping the log line, is red rather
-/// than indistinguishable from recovery.
+/// this pin seeds the registry with **three** distinct real services under three
+/// distinct names, in a deliberately non-sorted order, and captures the
+/// recovery's log — so recovering an emptied list, truncating it to one entry,
+/// reordering it, or dropping the log line is red rather than indistinguishable
+/// from recovery.
 #[cfg(all(test, unix))]
 mod dir_registry_tests {
     use super::{lock_dir_registry, DirRegistry};
@@ -787,15 +828,37 @@ mod dir_registry_tests {
 
     #[tokio::test]
     async fn lock_dir_registry_recovers_a_poisoned_registry() {
-        let mut cfg = frp_core::config::ServerConfig::default();
-        cfg.auth.token = "registry-pin".to_string();
-        let service = Arc::new(
-            frp_server::service::Service::with_unsafe_features(cfg, None, Default::default())
-                .await
-                .expect("construct a service for the registry fixture"),
-        );
-        let registry: DirRegistry =
-            Arc::new(Mutex::new(vec![(service.clone(), "live.toml".to_string())]));
+        // Three **distinct** services under three distinct file names, seeded in
+        // a deliberately non-sorted order. One entry is not enough: a recovery
+        // that truncates the list to its first element (`truncate(1)`, or
+        // `drain(..).take(1)`) hands back `len() == 1` too, and a recovery that
+        // sorts or dedups is only visible when the fixture is neither sorted nor
+        // duplicate-free. Every entry is checked by `Arc::ptr_eq` and by name, so
+        // "recovered the live list" cannot be satisfied by a fresh list of
+        // lookalikes either.
+        let mut live = Vec::new();
+        for (token, name) in [
+            ("registry-pin-c", "c.toml"),
+            ("registry-pin-a", "a.toml"),
+            ("registry-pin-b", "b.toml"),
+        ] {
+            let mut cfg = frp_core::config::ServerConfig::default();
+            cfg.auth.token = token.to_string();
+            live.push((
+                Arc::new(
+                    frp_server::service::Service::with_unsafe_features(
+                        cfg,
+                        None,
+                        Default::default(),
+                    )
+                    .await
+                    .expect("construct a service for the registry fixture"),
+                ),
+                name.to_string(),
+            ));
+        }
+        let names: Vec<&str> = live.iter().map(|(_, name)| name.as_str()).collect();
+        let registry: DirRegistry = Arc::new(Mutex::new(live.clone()));
 
         let poisoner = registry.clone();
         let _ = std::thread::spawn(move || {
@@ -820,14 +883,25 @@ mod dir_registry_tests {
 
         assert_eq!(
             guard.len(),
-            1,
-            "recovery must hand back the live list, not clear it"
+            live.len(),
+            "recovery must hand back the whole live list, not a truncated one"
         );
-        assert!(
-            Arc::ptr_eq(&guard[0].0, &service),
-            "the recovered entry must still be the live service"
+        assert_eq!(
+            guard
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>(),
+            names,
+            "recovery must hand back every live entry, in registration order"
         );
-        assert_eq!(guard[0].1, "live.toml");
+        for (recovered, expected) in guard.iter().zip(live.iter()) {
+            assert!(
+                Arc::ptr_eq(&recovered.0, &expected.0),
+                "the recovered entry for {} must still be that live service, not a \
+                 lookalike",
+                expected.1,
+            );
+        }
         let log = captured.text();
         assert!(
             log.contains("directory registry mutex was poisoned"),

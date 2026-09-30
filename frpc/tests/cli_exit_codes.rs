@@ -739,6 +739,115 @@ fn config_dir_where_one_service_fails_keeps_retrying_and_exits_zero() {
     );
 }
 
+/// The same converse pin with the file order **swapped**: `a.toml` is the file
+/// whose service stops at run time (its default `loginFailExit = true`) and
+/// `b.toml` is the survivor (`loginFailExit = false`).
+///
+/// The pin above cannot see a "the *first* file failed" short-circuit — its
+/// failing file is `b.toml`, at index 1 — so appending
+/// `|| failures.iter().any(|(file_index, _)| *file_index == 0)` to the comparison
+/// in `frpc/src/main.rs` survived it. Under that mutant this directory exits
+/// `a.toml`'s code (1) after SIGTERM instead of 0, so the survivor's retry-stop
+/// line and the `Some(0)` exit code are the teeth.
+#[test]
+fn config_dir_where_the_first_service_fails_keeps_retrying_and_exits_zero() {
+    let dir = TempDir::new();
+    // A port nothing listens on: login cannot succeed for either file.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let p = l.local_addr().expect("local_addr").port();
+        drop(l);
+        p
+    };
+    let conf_d = dir.path("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    std::fs::write(
+        std::path::Path::new(&conf_d).join("a.toml"),
+        format!("serverAddr = \"127.0.0.1\"\nserverPort = {closed}\n"),
+    )
+    .expect("write a.toml");
+    std::fs::write(
+        std::path::Path::new(&conf_d).join("b.toml"),
+        format!("serverAddr = \"127.0.0.1\"\nserverPort = {closed}\nloginFailExit = false\n"),
+    )
+    .expect("write b.toml");
+
+    // `run_frpc` cannot be used here: the surviving service must stay up until
+    // SIGTERM, so the child streams to a log file and this polls it for both
+    // services' markers before signalling.
+    let log_path = dir.path("frpc.log");
+    let log = std::fs::File::create(&log_path).expect("create frpc log");
+    let mut child = Command::new(BIN)
+        .args(["--config-dir", &conf_d])
+        .stdout(std::process::Stdio::from(
+            log.try_clone().expect("clone log"),
+        ))
+        .stderr(std::process::Stdio::from(log))
+        .spawn()
+        .expect("spawn frpc");
+    let read_log = || std::fs::read_to_string(&log_path).expect("read frpc log");
+
+    let deadline = std::time::Instant::now() + EXIT_TIMEOUT;
+    loop {
+        let text = read_log();
+        if text.contains("frpc service error for config file")
+            && text.contains("a.toml")
+            && text.contains("Login failed (attempt 1)")
+        {
+            break;
+        }
+        if let Some(status) = try_wait_or_kill(&mut child, "frpc") {
+            panic!(
+                "frpc --config-dir exited ({status:?}) before a.toml's task failed and \
+                 b.toml retried; log={:?}",
+                read_log(),
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "frpc --config-dir never logged a.toml's run failure plus a retry within \
+             {EXIT_TIMEOUT:?}; log={:?}",
+            read_log(),
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    let deadline = std::time::Instant::now() + EXIT_TIMEOUT;
+    let status = loop {
+        match try_wait_or_kill(&mut child, "frpc") {
+            Some(status) => break status,
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "frpc --config-dir did not exit within {EXIT_TIMEOUT:?} of SIGTERM; \
+                         log={:?}",
+                        read_log(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a directory whose surviving service stopped gracefully on SIGTERM must not \
+         exit the first file's code; log={:?}",
+        read_log(),
+    );
+    assert!(
+        read_log().contains("Stop requested while waiting to retry login"),
+        "the survivor must have been stopped through the retry-sleep path (`Ok(())`), \
+         which is what keeps it out of the failure count; log={:?}",
+        read_log(),
+    );
+}
+
 /// `EXIT_AUTH`/3, pinned on the one input where it is a *genuine* divergence
 /// rather than a hardening refusal: a `auth.tokenSource` whose file does not
 /// exist. Go frp v0.71.0 exits **1** here (`failed to resolve auth.tokenSource:
