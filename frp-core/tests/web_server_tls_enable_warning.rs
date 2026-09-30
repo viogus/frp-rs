@@ -462,6 +462,18 @@ fn the_no_dashboard_build_names_no_dashboard_behaviour() {
             "{reader:?}: the presence flag must survive the load"
         );
         assert_eq!(c.warning_records, 1, "{reader:?}: exactly one record");
+        // `expected_warning` is this file's restatement of the three-way choice
+        // the production reader makes. `Captured.expected` used to be read back
+        // only by the `WebServerTls` capture in
+        // `nested_web_server_tls_enable_warns_once_and_stays_inert`, so its
+        // `NoWebServer` and `WebServerNoTls` arms were dead and a wrong arm
+        // stayed green. Read it back for every caller answer here, against the
+        // loop's own literal (which stays the independent witness).
+        assert_eq!(
+            c.expected, expected,
+            "{reader:?}: `expected_warning` must map the caller's build answer to the emitted \
+             variant"
+        );
         // The record is exactly this variant's text — `contains(expected)` could
         // not see a clause appended at the emit site or a literal injected
         // before it, which is why the whole shape is pinned.
