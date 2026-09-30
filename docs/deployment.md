@@ -819,9 +819,12 @@ What the walk does **not** reach, each cell measured on Go frp v0.71.0
 * A **legacy-shaped top-level section** — any top-level mapping that carries a
   `type` key, in **any** config format, because the collector keys on the shape;
   since the typeless-`.ini` rule a section-like mapping carrying
-  `local_port`/`remote_port` is legacy-shaped too, in the one format where the
-  loader now passes the dialect down (the INI collector takes it as an argument,
-  while `normalize_client_config` still sees no format) — is fed through the
+  `local_port`/`remote_port` is legacy-shaped too, in the one format whose
+  loader passes the dialect down (`normalize_client_config` takes a
+  `ConfigFormat`, and the file path hands it `Ini` —
+  `frp-core/src/config/file.rs:132` → `frp-core/src/config/normalize.rs:1126`;
+  the TOML-from-string path passes `ConfigFormat::Toml`,
+  `frp-core/src/config/loader.rs:180`) — is fed through the
   same check, but with Go's accept-and-ignore semantics rather than the v1
   surface's rejection: the legacy collector folds the prefix mechanisms Go reads
   (`meta_*` → `metadatas`, `header_*` → `headers` for `type = "http"`,
