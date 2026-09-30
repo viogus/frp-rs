@@ -434,6 +434,18 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **The `web_server.tls.enable` warning no longer names a TLS acceptor a build does not have.** The text
+  was chosen from the caller's `cfg!`, so `cargo build -p frpc --no-default-features --features micro,admin`
+  — an `admin` build **without** `tls`, where the configured `cert_file`/`key_file` pair is discarded
+  (`frp-client/src/admin.rs:1164`) — told the user the dashboard HTTPS server was enabled by that pair while
+  its listener served plaintext HTTP. `frp-core` now exposes a three-valued reader
+  (`WebServerTlsEnableReader`, `frp-core/src/config/loader.rs:257`) and every load path asks the crate that
+  owns both features: `frp_client::web_server_tls_enable_reader()` (its `admin` + `tls`) and
+  `frp_server::service::web_server_tls_enable_reader()` (its `dashboard` + `tls`). A build without the
+  acceptor now says "nothing reads the key, and this build has no TLS support, so the dashboard/admin HTTPS
+  server is never built", so the three states — a server with `tls`, a server without `tls`, and no server at
+  all — each name their own build. The emitted record is pinned byte-exactly rather than by substring, and a
+  new count-guarded CI lane runs the `micro,admin` shape.
 - **`frps --config-dir`: a panicking service task is now counted.** A task that panicked was logged and
   dropped, so a directory in which every task panicked still exited 0 with nothing served. The panic now
   joins the same all-failed decision as the typed failures, and the lane exits non-zero.
@@ -539,7 +551,10 @@ User-facing release notes for frp-rs.
   existing `frp-client` reload lanes (admin on and off) pin one branch each.
   `docs/config.md` also no longer states the `cert_file`/`key_file` pair rule
   unconditionally: an `admin`-without-`tls` client build has no TLS acceptor to hand
-  the pair to, which is filed as its own item.
+  the pair to, which is filed as its own item. (Superseded later in the same release:
+  the text no longer depends on any caller's `cfg!` — `frp-core` exposes a three-valued
+  reader and the crate that owns the `dashboard`/`admin` **and** `tls` pair resolves it,
+  which adds the `admin`-without-`tls` text; see the entry at the head of this section.)
 - **The server `tls_enable` warning now describes what actually happens to the
   certificate pair, in every build, and no longer fires for a
   `[common.transport.tls] tls_enable` that never reaches the loader.** With only
