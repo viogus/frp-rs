@@ -36,9 +36,14 @@
 //! lane, own free port, stdout only and ANSI-stripped: 7 `INFO` records at startup
 //! = 1482 B raw / 915 B stripped (1480 / 913 at the four-digit pids of a later
 //! sample), 11 records over the full run = 2410–2412 B raw / 1471–1473 B stripped
-//! (2407–2410 / 1468–1471 at four-digit pids; the `elapsed_secs=` value width and
-//! the pid digits are the only variables, and raw − stripped is a constant 939 B
-//! in both samples). No `frps.log.*` file is created in either shape. The earlier
+//! (2407–2410 / 1468–1471 at four-digit pids; both ranges are for a five-digit
+//! ephemeral port). Three terms move those totals: the `elapsed_secs=` value
+//! width, the pid digit count, and the `bind_port` digit count — the config is
+//! echoed eight times across the startup block's four `run{…}` records plus once
+//! in each of the three shutdown records, so one port digit is 11 B (a forced
+//! four-digit port measures 2401 B raw / 1462 B stripped). raw − stripped is a
+//! constant 939 B in every sample. No `frps.log.*` file is created in either
+//! shape. The earlier
 //! `1498 B / 7 records` is the same lane and binary with this file's own template
 //! `bind_addr = "127.0.0.1"` (`config()` below) instead of the binary default
 //! `0.0.0.0`: the address is echoed eight times across the startup block's four
