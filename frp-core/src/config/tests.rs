@@ -7555,7 +7555,7 @@ fn legacy_ini_non_string_type_is_not_defaulted_to_tcp() {
 /// `frp-core/src/config/normalize.rs:611`, before the guard at `frp-core/src/config/normalize.rs:1968`, so the section was gone before
 /// anything could refuse it. A dotted `[includes.foo]` was never reached by that
 /// removal, but not because it is absent from the top level: `includes` is not in
-/// `INI_NESTED_SECTION_ROOTS` (`frp-core/src/config/format.rs:255-271`), so the
+/// `INI_NESTED_SECTION_ROOTS` (`frp-core/src/config/format.rs:259-275`), so the
 /// header is kept verbatim as the top-level key `includes.foo` and only the
 /// exact-key match in `process_includes` skipped it. The strict check then
 /// refuses `includes.foo` as an unknown field where Go v0.71.0 is rc 0 in both
@@ -11868,7 +11868,7 @@ path = "/tmp/does-not-matter"
 /// an `[includes]` *section* are independent in `gopkg.in/ini.v1`, and the legacy
 /// reader ignores every default-section key (`LoadAllProxyConfsFromIni` skips
 /// `ini.DefaultSection`, `pkg/config/legacy/client.go:255-257`) — the sections
-/// are what it parses. `insert_ini_section` (`frp-core/src/config/format.rs:372`)
+/// are what it parses. `insert_ini_section` (`frp-core/src/config/format.rs:376`)
 /// used to keep the scalar and drop the section's keys, which hid a real
 /// `[includes]` section from the typeless-visitor guard and the collector, and
 /// then the `.ini`-only scalar scrub
@@ -12338,6 +12338,193 @@ fn v1_ini_scalar_section_collision_is_still_a_type_error() {
                     .expect_err("a `[common]`-less .ini uses Go's v1 decoder")
             );
             assert!(err.contains(expected), "{body:?}, strict={strict}: {err}");
+        }
+    }
+}
+
+/// **A `[start]` section is still subject to Go's role/type refusals.**
+///
+/// Go collects a section named `start` when `[common]` has no `start` list
+/// (`startAll`, `pkg/config/legacy/client.go:232`) or when that list contains
+/// the section's own name (`if !startAll && !shouldStart { continue }`,
+/// `pkg/config/legacy/client.go:253-261`). The collected section is parsed like
+/// any other, so `role` defaults to `server` and the `switch default:` refusal
+/// (`pkg/config/legacy/client.go:283`) still fires. Measured on Go v0.71.0: a
+/// lone `[common]` + `[start] role = "weird"` is rc 1 (`proxy start role should
+/// be 'server' or 'visitor'`) and `[start] type = "custom"` is rc 1 (`failed to
+/// parse proxy start, err: invalid type [custom]`). The round-6 defect removed
+/// the root `start` key before collection (`legacy_start_override`,
+/// `frp-core/src/config/normalize.rs:2510`), which deleted the section and
+/// swallowed both refusals (rc 0); this test reds on `c7495cbd`.
+#[test]
+fn legacy_ini_start_section_refusals_like_go() {
+    let head = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
+    for (label, body, expected) in [
+        (
+            "a `[start]` role is validated",
+            format!("{head}[start]\nrole = \"weird\"\nlocal_port = 8080\nremote_port = 18080\n"),
+            "proxy start role should be 'server' or 'visitor'",
+        ),
+        (
+            "a `[start]` type is validated",
+            format!("{head}[start]\ntype = \"custom\"\nlocal_port = 8080\nremote_port = 18080\n"),
+            "invalid proxy_type 'custom'",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let err = format!(
+                "{}",
+                load_client_config(path.to_str().unwrap(), strict)
+                    .expect_err("a `[start]` section must be collected, not deleted")
+            );
+            assert!(err.contains(expected), "{label}, strict={strict}: {err}");
+        }
+    }
+}
+
+/// **A `[start]` section is collected by `startAll`.**
+///
+/// With no `[common] start` list Go's `startAll` is true
+/// (`pkg/config/legacy/client.go:232`) and every non-`common`/non-`range:`
+/// section is collected, `start` included
+/// (`pkg/config/legacy/client.go:253-261`). Measured on Go v0.71.0 through the
+/// admin API (the proxy *set*, not only the count): `[common]` + `p1` + a valid
+/// `[start]` registers `{"tcp":["p1","start"]}`, `[common]` + `[start]` alone
+/// registers `{"tcp":["start"]}`, a visitor-role `[start]` yields 1 proxy `p1`
+/// plus 1 visitor `start`, and a DefaultSection `start = p2` selects nothing
+/// (`startAll`). The round-6 defect deleted this section, so on `c7495cbd` the
+/// first case reports `proxies: []`.
+#[test]
+fn legacy_ini_start_section_is_still_a_proxy() {
+    let head = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
+    let p1 = "[p1]\ntype = tcp\nlocal_port = 8001\nremote_port = 18001\n";
+    let start = "[start]\ntype = tcp\nlocal_port = 8002\nremote_port = 18002\n";
+
+    for (label, body, expected, expected_start) in [
+        (
+            "startAll keeps p1 and the `start` section",
+            format!("{head}{p1}{start}"),
+            vec!["p1", "start"],
+            Vec::<&str>::new(),
+        ),
+        (
+            "startAll keeps a lone `start` section",
+            format!("{head}{start}"),
+            vec!["start"],
+            Vec::<&str>::new(),
+        ),
+        (
+            "a DefaultSection `start` selects nothing (`startAll`)",
+            format!("start = p2\n{head}{start}"),
+            vec!["start"],
+            Vec::<&str>::new(),
+        ),
+        (
+            "the control section is unaffected",
+            format!("{head}[starter]\ntype = tcp\nlocal_port = 8003\nremote_port = 18003\n"),
+            vec!["starter"],
+            Vec::<&str>::new(),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let cfg = load_client_config(path.to_str().unwrap(), strict)
+                .unwrap_or_else(|e| panic!("{label}, strict={strict}: {e}"));
+            let mut names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(names, expected, "{label}, strict={strict}");
+            // Go's `start` list itself: empty means `startAll`, and a
+            // DefaultSection `start` must not survive into the runtime filter
+            // (`legacy_start_override`, `frp-core/src/config/normalize.rs:2510`).
+            let mut started: Vec<&str> = cfg.start.iter().map(String::as_str).collect();
+            started.sort_unstable();
+            assert_eq!(started, expected_start, "{label}, strict={strict}");
+            assert_eq!(cfg.visitors.len(), 0, "{label}, strict={strict}");
+        }
+    }
+
+    // A visitor-role `[start]` is collected as a visitor, and the proxy beside
+    // it stays a proxy (Go: 1 proxy `p1` + 1 visitor `start`).
+    let start_visitor = "[start]\nrole = visitor\ntype = stcp\nserver_name = x\nsecret_key = y\nbind_addr = 127.0.0.1\nbind_port = 9000\n";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(&path, format!("{head}{p1}{start_visitor}")).unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("a visitor `[start]`, strict={strict}: {e}"));
+        assert_eq!(cfg.proxies.len(), 1, "strict={strict}");
+        assert_eq!(cfg.proxies[0].name, "p1", "strict={strict}");
+        assert_eq!(cfg.visitors.len(), 1, "strict={strict}");
+        assert_eq!(cfg.visitors[0].name, "start", "strict={strict}");
+    }
+}
+
+/// **A `[common] start` list selects the sections it names.**
+///
+/// Go tests the section's own name against the list
+/// (`if !startAll && !shouldStart { continue }`,
+/// `pkg/config/legacy/client.go:253-261`), so `[common] start = "start"`
+/// collects the `[start]` section — the same root key the list itself occupies
+/// — and skips every unlisted section; `"start,p1"` collects both. Measured on
+/// Go v0.71.0 (admin `/api/status`): `start = p1` + `p1` + `[start]` registers
+/// `{"tcp":["p1"]}`; `start = "start"` + `p1` + `[start]` registers
+/// `{"tcp":["start"]}`; `start = "start,p1"` registers `{"tcp":["p1","start"]}`;
+/// a spaced `start = " p1 , start "` registers both. The round-6 defect landed
+/// on the opposite side of this rule (the root `start` key was removed before
+/// collection, so `start = p1` kept the section and `start = "start"` dropped
+/// it); this test reds on `c7495cbd`.
+#[test]
+fn legacy_ini_common_start_list_selects_named_sections() {
+    let head = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
+    let p1 = "[p1]\ntype = tcp\nlocal_port = 8001\nremote_port = 18001\n";
+    let start = "[start]\ntype = tcp\nlocal_port = 8002\nremote_port = 18002\n";
+
+    for (label, body, expected) in [
+        (
+            "`start = p1` skips the unlisted `start` section",
+            format!("{head}start = p1\n{p1}{start}"),
+            vec!["p1"],
+        ),
+        (
+            "`start = \"start\"` selects the `start` section",
+            format!("{head}start = \"start\"\n{start}"),
+            vec!["start"],
+        ),
+        (
+            "`start = \"start\"` skips an unlisted p1",
+            format!("{head}start = \"start\"\n{p1}{start}"),
+            vec!["start"],
+        ),
+        (
+            "`start = \"start,p1\"` selects both",
+            format!("{head}start = \"start,p1\"\n{p1}{start}"),
+            vec!["p1", "start"],
+        ),
+        (
+            "a spaced `start = \" p1 , start \"` is trimmed and selects both",
+            format!("{head}start = \" p1 , start \"\n{p1}{start}"),
+            vec!["p1", "start"],
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let cfg = load_client_config(path.to_str().unwrap(), strict)
+                .unwrap_or_else(|e| panic!("{label}, strict={strict}: {e}"));
+            let mut names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(names, expected, "{label}, strict={strict}");
+            // The written-back list is the same one the dispatch used, so the
+            // runtime start filter cannot re-add a section the dispatch skipped.
+            let mut started: Vec<&str> = cfg.start.iter().map(String::as_str).collect();
+            started.sort_unstable();
+            assert_eq!(started, expected, "{label}, strict={strict}");
         }
     }
 }
