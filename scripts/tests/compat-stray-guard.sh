@@ -114,7 +114,10 @@ fails=0
 # sibling suite learned the hard way; that is a failure here too. So is a
 # zero-padded floor: `00`/`000` are all digits but denote 0, so the floor is
 # normalised before it is compared (R2-2), and the below-floor diagnostic prints
-# the decimal value rather than `printf`'s octal reading of it (R2-3).
+# the decimal value rather than `printf`'s octal reading of it (R2-3). Digits
+# alone were *not* sufficient either (R3-1): a floor above `9223372036854775807`
+# is unparseable as an integer, so the below-floor test is an ordered comparison
+# of digit strings and such a floor is a below-floor failure, not a status-2 skip.
 MIN_CHECKS=31
 # The ordered assertion anchors, one per `ok`/`bad` call in scenario order.
 # Dynamic parts (pids, elapsed seconds) are matched as substrings, so each entry
@@ -265,7 +268,9 @@ cleanup_all() {
     # false, so an unparseable floor used to skip every branch below and exit 0.
     # `enforce_shape` happened to mask that here (a deleted check moves `LABELS`),
     # but a comparison that cannot parse its operands must never be the guard of
-    # record — validate the digits first, exactly as the sibling suite does.
+    # record — validate the digits first, then compare the digit strings in
+    # order, exactly as the sibling suite does, so an all-digit floor too large
+    # for `-lt` is a below-floor failure rather than a status-2 skip (R3-1).
     case ${MIN_CHECKS:-} in
       ''|0)
         printf 'FAIL  the check floor is disabled (MIN_CHECKS=%s); the suite cannot vouch for itself\n' \
@@ -301,7 +306,12 @@ cleanup_all() {
               rc=1
               ;;
             *)
-              if [ "$checks" -lt "$MIN_CHECKS" ]; then
+              # Same ordered digit-string comparison as the sibling suite (see
+              # its R3-1 note): `[ … -lt … ]` returns status 2 on an all-digit
+              # floor above the signed 64-bit range, which `if` reads as false
+              # and which here would hand the floor's verdict to `enforce_shape`.
+              if [ "${#checks}" -lt "${#MIN_CHECKS}" ] ||
+                { [ "${#checks}" -eq "${#MIN_CHECKS}" ] && [ "$checks" \< "$MIN_CHECKS" ]; }; then
                 printf 'FAIL  suite exited 0 after only %s check(s); expected at least %s — scenarios did not run\n' \
                   "$checks" "$MIN_CHECKS" >&2
                 rc=1

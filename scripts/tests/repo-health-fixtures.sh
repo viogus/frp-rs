@@ -62,7 +62,12 @@ set -uo pipefail
 #     (or a non-numeric `checks`) makes `[ … -lt … ]` return status 2, which
 #     `if`/`elif` read as false — so both branches would be skipped and the suite
 #     would exit green on a floor it cannot parse. Everything is validated as
-#     digits first, and a floor that is not a number is a failure;
+#     digits first, and a floor that is not a number is a failure; digits alone
+#     were *not* enough, though — an all-digit floor above `9223372036854775807`
+#     is unparseable as an integer even though it parses fine as a string, so the
+#     below-floor test itself is an ordered comparison of digit strings, and such
+#     a floor is an ordinary below-floor failure rather than a status-2 skip
+#     (R3-1);
 #   * `exec true` in place of an ordinary exit still skips the EXIT trap — no
 #     in-file mechanism can intercept `exec`, and the sibling suite had the same
 #     hole. The closure for that one is outside the file: the CI step's own
@@ -90,7 +95,10 @@ cleanup_all() {
     # Fail closed: `[ NaN -lt 1 ]` is status 2, and `if`/`elif` read status 2 as
     # false, so an unparseable floor used to skip every branch below and exit 0
     # (measured: delete a scenario's assertions, set MIN_CHECKS=NaN, rc 0). The
-    # digits-only case arms run the comparisons only on values bash can compare.
+    # case arms reject a floor that is not a number, and the digits-only arm also
+    # rejects a zero-padded zero; the comparison under it is a string order
+    # (see below), so an all-digit floor *too large* to be an integer is a
+    # below-floor failure, not a status-2 skip.
     case ${MIN_CHECKS:-} in
       ''|0)
         printf 'FAIL  the check floor is disabled (MIN_CHECKS=%s); the suite cannot vouch for itself\n' \
@@ -126,7 +134,20 @@ cleanup_all() {
               rc=1
               ;;
             *)
-              if [ "$checks" -lt "$MIN_CHECKS" ]; then
+              # Ordered comparison of *digit strings* — length first, then
+              # left-to-right at equal length — never a bare `[ … -lt … ]`. An
+              # all-digit floor above the signed 64-bit range is unparseable as
+              # an integer but fine as a string: `[ "$checks" -lt "$MIN_CHECKS" ]`
+              # on `9223372036854775808` returns status 2 (stderr
+              # `[: 9223372036854775808: integer expression expected`), `if`
+              # reads status 2 as false, the below-floor branch is skipped and a
+              # gutted run still exits 0
+              # (R3-1; measured rc 0). The digits-only arm above cannot catch it
+              # — the value *is* all digits. After the leading-zero strip above,
+              # length-then-string order is exactly numeric order for digit
+              # strings and cannot return status 2 for any value.
+              if [ "${#checks}" -lt "${#MIN_CHECKS}" ] ||
+                { [ "${#checks}" -eq "${#MIN_CHECKS}" ] && [ "$checks" \< "$MIN_CHECKS" ]; }; then
                 printf 'FAIL  suite exited 0 after only %s check(s); expected at least %s — scenarios did not run\n' \
                   "$checks" "$MIN_CHECKS" >&2
                 rc=1
