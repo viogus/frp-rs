@@ -7823,10 +7823,12 @@ section; ledger now **24 open / 104 closed**.**
 
 - [ ] **`scripts/tests/repo-health-fixtures.sh` cannot detect its own neutering — the hole the compat guard's `MIN_CHECKS` just closed.**
   Filed by the coordinator from the `test-harness-strays` round-2 adversarial round (read at
-  `506f9465`). The suite ends with a bare `exit "$fails"` and keeps no total-count floor, so a
-  regression that stops the scenarios from running — an early `exit 0` after the `[ -f "$LIB" ]`
-  check, or an emptied scenario body — still exits 0 and prints `RESULT: 0 fixture check(s) hold`:
-  the `health` job reports green for a suite that tested nothing. The guard suite added by the same
+  `506f9465`). The suite ends with a bare `exit "$fail"` (`scripts/tests/repo-health-fixtures.sh:733`)
+  and keeps no total-count floor, so a regression that stops the scenarios from running still reports
+  green in the `health` job. The measured shapes (round-2 adversarial, on copies): an early `exit 0`
+  after the `RC_PY` preflight (`:78`) exits 0 with **no output at all**, so no `RESULT:` line exists;
+  a scenario body emptied still exits 0 printing `RESULT: 17 fixture check(s) hold`; only a suite that
+  runs no check at all prints `RESULT: 0`. The guard suite added by the same
   branch now pins the invariant from a trap installed before its first assertion (`MIN_CHECKS=21`,
   `scripts/tests/compat-stray-guard.sh:85`, message `suite exited 0 after only N check(s); expected
   at least 21 — scenarios did not run`).
