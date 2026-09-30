@@ -7873,7 +7873,7 @@ section; ledger now **24 open / 104 closed**.**
   (through `Captured.expected`), so its `NoWebServer` arm is dead code — either it is exercised or the arm is
   removed.
 
-- [ ] **`--allow-unsafe`'s comma grammar still differs from pflag's CSV reader, and the ignored-flag twin splits nothing at all.**
+- [x] **`--allow-unsafe`'s comma grammar still differs from pflag's CSV reader, and the ignored-flag twin splits nothing at all.**
   The read-path parser splits on `,` and trims each element (`frp-core/src/cli.rs:2637-2646`, inside
   `allow_unsafe_parser` at `:2632`), while Go's pflag parses a repeated string flag with
   `encoding/csv` (leading-space trimming off). Two spellings therefore diverge, measured at
@@ -7894,7 +7894,44 @@ section; ledger now **24 open / 104 closed**.**
   elements and the un-read twin splits the same way (or both divergences are documented as
   deliberate with these measured rows), and a test pins each row.
 
-- [ ] **The `--allow-unsafe` accumulation pins cannot see a duplicated value, a cap at 32, or a shrinking lane, and the two lane literals are equality guards rather than floors.**
+  **Done (2026-10-01, at code head `67f67e1b` on `fix/allow-unsafe-grammar`, PR #429).** The value is
+  now parsed with pflag's CSV reader: `split_allow_unsafe_csv` (`frp-core/src/cli.rs:2665`) feeds the
+  hand-rolled `read_csv_record` (`:2678`), `normalize_csv_input` (`:2799`) and `csv_error` (`:2864`),
+  so quotes are CSV syntax, `""` escapes a quote, leading spaces/tabs are significant, repeated flags
+  append, and the ignored-flag twin parses the same record instead of one opaque value. Every row of
+  this item's table reproduces against Go v0.71.0: the round-1 adversarial review's 3209-value corpus
+  carried 1353 mismatches at the base `55fff6e5` and matched 3209/3209 after the fix, and the widened
+  round-2 adversarial corpus matched 5455 values (corpus + targeted
+  multibyte/multiline/CRLF/NUL/70 kB + long lines) with 0 text/byte-column/line divergences plus a
+  165-row CLI differential over `frpc verify` / `frps verify` / plain `-c` with 0 rc and 0 reason
+  divergences. Two base-side divergences closed on the way: `--allow-unsafe="TokenSourceExec"` and a
+  CRLF/NL junk tail are now rc 0 like Go (base rc 1). The round-1 review's F1 regression (a leading
+  blank line — `$'\nTokenSourceExec'` — was refused where Go and the parent accept it, rc 3 on the run
+  path) is fixed, and a blank-only value now reports Go's
+  `invalid argument "…" for "--allow-unsafe" flag: EOF` instead of failing later at the semantic gate
+  (F4). Error positions now match Go's 1-based **byte** columns and its multi-line
+  `record on line N; parse error on line L, column C` shape (F2/F3), and the doc block above
+  `split_allow_unsafe_csv` no longer misstates the contract (F5; the round-3 comment delta then
+  corrected the measured rc cells of its table, which is why the table now says the bare
+  `"a""b"`/`"a,b"`/`a,,b` forms exit 1 on the feature gate). Pins:
+  `allow_unsafe_appends_and_comma_splits_on_every_reading_surface` (`:5472`),
+  `allow_unsafe_reads_pflags_csv_record_on_both_parsers` (`:5697`),
+  `allow_unsafe_csv_corners_are_go_shaped_and_never_trimmed` (`:5736`),
+  `allow_unsafe_skips_blank_lines_like_go_and_blank_only_is_an_eof_flag_error` (`:5815`) and
+  `allow_unsafe_error_positions_are_go_lines_and_byte_columns` (`:5886`). Mutants killed: the author's
+  round-1 M1–M6 and round-2 N1–N11 ("the occurrence list is unbounded — a cap of at most 40
+  occurrences drops the trailing enabling value" among them), and the reviewers' own batteries (the
+  round-1 M1o/M1e/M2/M3 set, the round-2 M-col/M-line/M-rune/M-skip/M-EOF set that killed the
+  round-1 `M-col` survivor, and the three from the round-2 verification) — matrices in
+  `/tmp/author429-round2.md:195-207` (the author's N1–N11), `/private/tmp/rev429-verify.md`,
+  `/private/tmp/rev429r2-attack.md:48-56` and `/private/tmp/rev429r2-verify.md` §5 (the round-2
+  verification's three), every restore sha256-verified. Reviews: round-1 verification
+  MERGE-with-findings (F1–F5 fixed here, F6 a body nit), round-2 adversarial CONFIRM at `7d806af8`
+  (F1–F3 closed), round-2 verification MERGE-with-findings (F7 the rc cells → fixed in `67f67e1b`,
+  F8 body staleness → fixed in the PR), and a round-3 comment-delta verification MERGE on
+  `7d806af8..67f67e1b` (its only finding, a pin-line bookkeeping nit, is folded into these cites).
+
+- [x] **The `--allow-unsafe` accumulation pins cannot see a duplicated value, a cap at 32, or a shrinking lane, and the two lane literals are equality guards rather than floors.**
   Filed by the coordinator from the round-3 adversarial review of the `--allow-unsafe` gate fix
   (`frp-core/src/cli.rs:5188` `allow_unsafe_appends_and_comma_splits_on_every_reading_surface`,
   `frps/tests/cli_exit_codes.rs:295`, `frpc/tests/cli_exit_codes.rs:651`).
@@ -7906,14 +7943,56 @@ section; ledger now **24 open / 104 closed**.**
   leaves the whole `frp-core` lib suite green (`997 passed; 0 failed`) and both spawn rows use at
   most four occurrences, so any cap ≥ 5 is invisible to them; loosening that one assertion to
   `>= wide_n - 1` also passes everything.
-  (c) `FRPS_CLI_TESTS` / `FRPC_TINY_CLI_TESTS` (`.github/workflows/ci.yml:194` / `:216`) compare the
-  file's test count to the literal for equality, so deleting a test and lowering the literal
-  together passes (measured 33/33/33), and the full `frpc` lane (`.github/workflows/ci.yml:312`,
-  18 tests) has no count guard at all.
+  (c) `FRPS_CLI_TESTS` / `FRPC_TINY_CLI_TESTS` (`.github/workflows/ci.yml:243` / `:315`, both in the
+  `tests-unit` job) compare the file's test count to the literal for equality
+  (`[ "$n" = "$FRPS_CLI_TESTS" ]`, `:567`), so deleting a test and lowering the literal together
+  passes by construction, and the full `frpc` lane — the step at `.github/workflows/ci.yml:443`
+  running `cargo test -p frpc` at `:494` — has no count guard at all.
   Done-when: a pin repeats one identical value and asserts both copies survive; the unbounded class
   is pinned past any plausible cap (or the assertion states the bound it really enforces); and each
   lane literal gets an absolute floor (or the full `frpc` lane gets a count guard), with the
   delete-plus-lower mutant red.
+
+  **Done (2026-10-01, at code head `67f67e1b` on `fix/allow-unsafe-grammar`, PR #429) for (a) and
+  (b); (c) is filed as its own item below.**
+  (a) `allow_unsafe_appends_and_comma_splits_on_every_reading_surface` (`frp-core/src/cli.rs:5472`)
+  now feeds one identical value twice and asserts both copies survive
+  (`an identical value repeated must be kept twice, not de-duplicated`, `:5641`; `the ignored twin
+  de-duplicates nothing either`, `:5647`), so a de-duplicating or equal-collapsing parser reddens a
+  pin. (b) The same test builds 40 occurrences (`let wide_n: usize = 40;`, `:5655`) and 40 CSV
+  elements inside one occurrence, so a cap at either site (`v.truncate(32)` on the accumulated vector,
+  `split(',').take(32)` in the reader) is dead — both cap-32 mutants were measured and killed. The
+  assertions still state the bound they enforce (`wide_n` is interpolated into the failure message),
+  so a future narrowing of the pin cannot silently become an exact-equality check. (c) is untouched
+  here and moved to the item below.
+
+- [ ] **The CLI-lane count guards in `.github/workflows/ci.yml` compare for equality, so a deleted test plus a lowered literal passes; the full `frpc` lane has no count guard at all.**
+  Filed by the coordinator when closing the `--allow-unsafe` accumulation item (its clause (c)).
+  `FRPS_CLI_TESTS` (`.github/workflows/ci.yml:243`) and `FRPC_TINY_CLI_TESTS` (`:315`) hold the lane's
+  expected test count and are compared for **equality** (`[ "$n" = "$FRPS_CLI_TESTS" ]`, `:567`) in
+  the `tests-unit` job (`.github/workflows/ci.yml:136`), so deleting a test and lowering the literal
+  together passes by construction — the guard checks self-consistency only, never an absolute floor —
+  and the full `frpc` lane (the step at `:443`, `run: cargo test -p frpc` at `:494`) has no count
+  guard at all.
+  **Done-when:** every guarded lane asserts an absolute **floor** (or keeps the exact count alongside
+  a floor) so a removal fails without a deliberate records bump, and the full `frpc` lane gets a
+  guard; the delete-plus-lower mutant must red. Note for whoever takes it: this edits
+  `.github/workflows/ci.yml` in two places — the count literals in the `tests-unit` job (`:136`) and the
+  compat-stray-guard literals in the `health` job (`:97`) — so it should land after PRs #424/#430, which
+  also touch that file, to avoid a literal conflict.
+
+- [ ] **Rust frpc runs the `auth.tokenSource` `exec` command twice per successful login where Go runs it once.**
+  Filed by the coordinator from the round-2 adversarial review of PR #429, which measured it and
+  confirmed it predates that change: with an exec token source whose command has an observable side
+  effect, `frpc -c exec.toml --allow-unsafe TokenSourceExec` against a live frps runs the command
+  twice on both the base `ea991757` (log `base\nbase\n`) and the reviewed head `67f67e1b`
+  (`head\nhead\n`), while Go v0.71.0 runs it once (`go\n`). The exec path lives in `frp-client`, which
+  #429 does not touch, so this is pre-existing and unrelated to the flag grammar. Source report:
+  `/private/tmp/rev429r2-attack.md`.
+  **Done-when:** the token-source read path executes the command once per login like Go, pinned by a
+  test that counts executions across a login (and, if the reload path re-reads the source, that path
+  is counted too), or the double read is documented as deliberate with the measured rows and the
+  reason it cannot be de-duplicated.
 - [ ] **`scripts/compat-test.sh`'s XTCP helper still kills by argument pattern — the class of kill the compat-leak item forbade for its own children.**
   Filed by the coordinator while closing the "`scripts/compat-test.sh` leaks its children" item above.
   Inside `run_xtcp_test` (`scripts/compat-test.sh:4331`), the pre-test cleanup is

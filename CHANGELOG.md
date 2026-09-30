@@ -446,6 +446,11 @@ User-facing release notes for frp-rs.
   server is never built", so the three states — a server with `tls`, a server without `tls`, and no server at
   all — each name their own build. The emitted record is pinned byte-exactly rather than by substring, and a
   new count-guarded CI lane runs the `micro,admin` shape.
+- `--allow-unsafe` now reads its value with pflag's CSV grammar: quotes and a doubled `""` are
+  syntax, leading spaces and tabs are significant (not trimmed), repeated flags append, and the
+  ignored-flag twin parses the same record instead of one opaque value. A blank-only value reports
+  Go's `EOF` flag error instead of failing later at the semantic gate, and a malformed value carries
+  Go's line number and 1-based byte column.
 - **`frps --config-dir`: a panicking service task is now counted.** A task that panicked was logged and
   dropped, so a directory in which every task panicked still exited 0 with nothing served. The panic now
   joins the same all-failed decision as the typed failures, and the lane exits non-zero.
