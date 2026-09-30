@@ -437,6 +437,40 @@ VirtualNet = true
 }
 
 #[test]
+fn test_vhost_http_timeout_is_go_signed_int64() {
+    // `TODO.md:7571`. Go's `VhostHTTPTimeout` field is `int64`
+    // (`pkg/config/v1/server.go`) and the flag is `Int64VarP`
+    // (`pkg/config/flags.go:237`), so the file lane accepts a negative value and
+    // refuses only what does not fit an `int64`. Measured on Go v0.71.0
+    // (`frps verify -c <file>`): `vhostHTTPTimeout = -1` rc 0,
+    // `-9223372036854775808` rc 0, `9999999999999999999` rc 1
+    // (`strconv.ParseInt: … value out of range`).
+    let negative: ServerConfig =
+        load_server_config_from_str("bindPort = 7000\nvhostHTTPTimeout = -1\n").unwrap();
+    assert_eq!(negative.vhost_http_timeout, -1);
+
+    let floor: ServerConfig = load_server_config_from_str(&format!(
+        "bindPort = 7000\nvhostHTTPTimeout = {}\n",
+        i64::MIN
+    ))
+    .unwrap();
+    assert_eq!(floor.vhost_http_timeout, i64::MIN);
+
+    let ceiling: ServerConfig = load_server_config_from_str(&format!(
+        "bindPort = 7000\nvhostHTTPTimeout = {}\n",
+        i64::MAX
+    ))
+    .unwrap();
+    assert_eq!(ceiling.vhost_http_timeout, i64::MAX);
+
+    assert!(
+        load_server_config_from_str("bindPort = 7000\nvhostHTTPTimeout = 9223372036854775808\n")
+            .is_err(),
+        "one past Go's int64 must be refused by the same boundary"
+    );
+}
+
+#[test]
 fn test_go_camelcase_client_sections_oidc_visitor_and_plugins() {
     let toml_str = r#"
 serverAddr = "127.0.0.1"

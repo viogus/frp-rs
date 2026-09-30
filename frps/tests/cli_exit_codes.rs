@@ -2314,6 +2314,52 @@ fn verify_accepts_vhost_http_timeout_both_spellings_and_prints_go_line() {
             stderr_of(&out),
         );
     }
+
+    // Signed rows on the same surface. Go's flag is `Int64VarP`
+    // (`pkg/config/flags.go:237`) and its config field is `int64`, so a negative
+    // value is accepted (`verify` ignores it) and only a value outside `int64` is
+    // refused. Measured on Go v0.71.0, streams separated, rc read from the child:
+    // `-1` and `-9223372036854775808` rc **0** with the same success line;
+    // `9223372036854775808` and `9999999999999999999` rc **1** on stderr
+    // (`strconv.ParseInt: … value out of range`) with 0 bytes on stdout.
+    for value in ["-1", "-9223372036854775808", "9223372036854775807"] {
+        let out = run_frps(&["verify", "--vhost-http-timeout", value, "-c", &cfg]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "`frps verify --vhost-http-timeout {value} -c <valid>` is inside Go's int64 \
+             and must exit 0 (stdout={:?} stderr={:?})",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        assert_eq!(
+            stdout_of(&out),
+            format!("frps: the configuration file {cfg} syntax is ok\n"),
+            "Go ignores the value on `verify`, so the success line is unchanged; stderr={:?}",
+            stderr_of(&out),
+        );
+    }
+    for value in ["9223372036854775808", "9999999999999999999"] {
+        let out = run_frps(&["verify", "--vhost-http-timeout", value, "-c", &cfg]);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "`frps verify --vhost-http-timeout {value} -c <valid>` is outside Go's int64 and \
+             must be refused like Go (stdout={:?} stderr={:?})",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        assert!(
+            !stdout_of(&out).contains("syntax is ok"),
+            "a refused value must not print the success line; stdout={:?}",
+            stdout_of(&out),
+        );
+        assert!(
+            stdout_of(&out).is_empty(),
+            "frp-rs reports the parse refusal on stderr like Go; stdout={:?}",
+            stdout_of(&out),
+        );
+    }
 }
 
 /// The failure half of the same surface, both shapes of "bad config": an unknown

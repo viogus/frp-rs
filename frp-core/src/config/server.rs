@@ -108,8 +108,10 @@ pub struct ServerConfig {
     pub max_conns_per_proxy: u64,
     /// Timeout in seconds for backend HTTP response in VHost handler.
     /// Go frp compat: VhostHTTPTimeout. Default: 60.
+    /// Signed like Go's `int64` field: Go's `Int64VarP` accepts a negative
+    /// value and only the downstream floor/clamp (frp-server) gives it meaning.
     #[serde(default = "default_vhost_http_timeout", alias = "vhostHTTPTimeout")]
-    pub vhost_http_timeout: u64,
+    pub vhost_http_timeout: i64,
     /// Idle timeout in seconds on user-facing proxy connections.
     /// Go frp compat: UserConnTimeout. Default: 10.
     #[serde(default = "default_user_conn_timeout", alias = "userConnTimeout")]
@@ -244,7 +246,7 @@ fn default_allow_port_start() -> u16 {
 fn default_allow_port_end() -> u16 {
     65535
 }
-fn default_vhost_http_timeout() -> u64 {
+fn default_vhost_http_timeout() -> i64 {
     60
 }
 fn default_user_conn_timeout() -> u64 {

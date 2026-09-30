@@ -529,7 +529,12 @@ pub struct FrpsArgs {
     /// means the flag was absent and the config value stands;
     /// `ServerConfig::default()` already carries Go's 60
     /// (`frp-core/src/config/server.rs:247`), so the absent case is Go's default.
-    pub vhost_http_timeout: Option<u64>,
+    /// The value is `i64`, matching `Int64VarP` and Go's `int64` config field:
+    /// Go accepts `--vhost-http-timeout -1` (its floor then applies) and refuses
+    /// only what does not fit an `int64` (measured on Go v0.71.0:
+    /// `-9223372036854775808` rc 0, `9223372036854775807` rc 0,
+    /// `9223372036854775808` rc 1 `value out of range`).
+    pub vhost_http_timeout: Option<i64>,
     pub strict_config: bool,
     pub show_version: bool,
 }
@@ -604,7 +609,7 @@ struct SvrTransport {
     quic_bind_port: Option<u16>,
     vhost_http_port: Option<u16>,
     vhost_https_port: Option<u16>,
-    vhost_http_timeout: Option<u64>,
+    vhost_http_timeout: Option<i64>,
     subdomain_host: Option<String>,
     max_ports_per_client: Option<u64>,
     tls_only: bool,
@@ -904,9 +909,11 @@ fn svr_transport() -> impl Parser<SvrTransport> {
     // two `vhost-http(s)-port` flags above; measured on Go v0.71.0:
     // `frps verify --vhost-http-timeout 30 -c <valid>` and
     // `frps verify --vhost_http_timeout 30 -c <valid>` are both rc 0.
+    // Signed, because Go's is `Int64VarP`/`int64`: `-1` is accepted there and
+    // the out-of-range boundary is the `int64` one, not `u64`'s.
     let vhost_http_timeout = long("vhost-http-timeout")
         .long("vhost_http_timeout")
-        .argument::<u64>("SECONDS")
+        .argument::<i64>("SECONDS")
         .optional();
     let subdomain_host = long("subdomain-host")
         .long("subdomain_host")
@@ -4417,6 +4424,49 @@ mod tests {
         let mut cfg = crate::config::ServerConfig::default();
         args.override_server_config(&mut cfg);
         assert_eq!(cfg.vhost_http_timeout, 60, "absent flag keeps Go's default");
+
+        // Go registers the flag with `Int64VarP` (`pkg/config/flags.go:237`) and
+        // its config field is `int64`, so the signed boundaries are accepted and
+        // only a value outside `int64` is refused. Measured on Go v0.71.0
+        // (`frps verify -c <valid>`): `-1` and `-9223372036854775808` rc 0,
+        // `9223372036854775807` rc 0, `9223372036854775808` and
+        // `9999999999999999999` rc 1 `strconv.ParseInt … value out of range`.
+        //
+        // A `-`-prefixed value needs the same preparation the binaries run
+        // ([`prepared_cli_argv`], `attach_flag_shaped_values`): bpaf alone reads
+        // `-1` as a flag, which is why the real `frps --vhost-http-timeout -1`
+        // parses (measured: it starts and exits on the config's own error, not
+        // on argv).
+        let parse_prepared = |argv: &[&str]| {
+            let prepared: Vec<OsString> = argv.iter().map(OsString::from).collect();
+            frps_args()
+                .to_options()
+                .run_inner(&prepared_cli_argv(&prepared, RootCommand::Frps)[..])
+        };
+        for (argv, expected) in [
+            ("-1", -1_i64),
+            ("-9223372036854775808", i64::MIN),
+            ("9223372036854775807", i64::MAX),
+        ] {
+            let args = parse_prepared(&["--vhost-http-timeout", argv]).unwrap();
+            assert_eq!(
+                args.vhost_http_timeout,
+                Some(expected),
+                "`{argv}` is inside Go's int64 range"
+            );
+            let mut cfg = crate::config::ServerConfig::default();
+            args.override_server_config(&mut cfg);
+            assert_eq!(
+                cfg.vhost_http_timeout, expected,
+                "`{argv}` must reach the config signed, not refused or wrapped"
+            );
+        }
+        for argv in ["9223372036854775808", "9999999999999999999"] {
+            assert!(
+                parse_prepared(&["--vhost-http-timeout", argv]).is_err(),
+                "`{argv}` is outside Go's int64, so `Int64VarP` refuses it too"
+            );
+        }
     }
 
     /// `--log-level ""`, `--log-file ""` and `--log-max-days 0` are Go's zero

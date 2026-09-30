@@ -79,7 +79,7 @@ async fn setup_auth_impl(
     http_user: Option<&str>,
     http_pwd: Option<&str>,
     route_by_http_user: Option<&str>,
-    vhost_http_timeout: u64,
+    vhost_http_timeout: i64,
 ) -> (
     SocketAddr,
     SocketAddr,
@@ -146,7 +146,7 @@ async fn setup_auth(
     domain: &str,
     http_user: Option<&str>,
     http_pwd: Option<&str>,
-    vhost_http_timeout: u64,
+    vhost_http_timeout: i64,
 ) -> (
     SocketAddr,
     SocketAddr,
