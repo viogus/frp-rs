@@ -147,6 +147,14 @@ User-facing release notes for frp-rs.
   negative value is accepted and means the deadline has already passed).
 
 ### Changed
+- **The compat lanes no longer install a Go toolchain nothing uses.** `compat.yml`
+  and `xtcp-compat.yml` ran `actions/setup-go` with a floating `>=1.22.0` range,
+  so which Go was present was a runner-image property, and nothing invoked it:
+  `git ls-files '*.go'` is empty and `scripts/download-go-frp.sh` fetches the
+  prebuilt release tarball. The `/tmp/frp-source-build/` cache path also survived
+  the removed builder it belonged to (`build_go_frp_v2()` exists nowhere). The
+  step and the orphaned path are gone, and the cache step is named `Cache cargo`
+  again. TODO.md:6005.
 - **`auth.method` is now compared exactly, and a typo is a config-load error
   instead of silently selecting token auth.** Go accepts exactly `"token"` and
   `"oidc"` (`pkg/config/v1/validation/validation.go:37-40`, compared with
@@ -419,6 +427,17 @@ User-facing release notes for frp-rs.
   process exits with the first **spawned** failure's code — the same value `frps -c` exits on for that file. A
   directory that still has one running (or gracefully shut down) service keeps the previous
   log-and-keep-serving behaviour.
+- **The Docker source build now compiles with the pinned toolchain, not the base
+  image's default.** `docker/Dockerfile.source` never copied `rust-toolchain.toml`
+  into the build context, and its `RUN rustup target add …` installed the musl
+  target into the base image's toolchain, so a naive `COPY` alone would have
+  produced a pinned compiler without that `rust-std` (E0463 `can't find crate for
+  std`). The context now carries the file, the install happens before the target
+  setup, and a fail-closed assertion refuses the build when the active toolchain
+  is not the file's channel or when `RUSTUP_TOOLCHAIN` overrode it. Measured:
+  dropping the `COPY` or a stray `RUSTUP_TOOLCHAIN=stable` each fail the stage
+  (rc 1), and a full uncached `docker buildx build` of the image succeeds and logs
+  the pinned toolchain. TODO.md:6031.
 - **The `web_server.tls.enable` warning is now build-aware: in a build with no
   dashboard it no longer claims the dashboard serves plaintext HTTP.** The key is
   read behind `frp-server`'s `dashboard` feature (and `frpc`'s `admin`), but the
