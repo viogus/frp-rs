@@ -29,7 +29,10 @@
 # site 4's crate-root row with a cross-crate alias (and with the count-inert
 # mutation that re-raises it); scenario 8 pins the kernel's symlink-chain refusal
 # that makes the in-script `readlink` bound unreachable; scenario 9 shows a failed
-# fixture setup stops the run instead of leaving three checks vacuous-green.
+# fixture setup stops the run — and pins that **nothing** below it runs at all;
+# scenario 10 pins the walk-error path against the false "no .rs files"
+# accusation (with both mutations of that guard); scenario 11 pins containment's
+# separator with a sibling whose name starts with the crate name.
 #
 # Self-contained: no network, no dependence on this repo's contents (the tree is
 # built from scratch and only the script under test is copied in), and the
@@ -56,10 +59,13 @@ esac
 # releases lack it, so loop on plain `readlink`, resolving each target against the
 # link's own directory. Bounded for defence in depth, but the bound is
 # unreachable in practice: `bash` cannot open this file through a cycle at all —
-# the kernel refuses the chain first (measured on this host: a 31-link chain to
-# this file runs green, a 32-link chain is refused with `Too many levels of
-# symbolic links`, rc 126; Linux allows 40 hops, Darwin 32, so the kernel always
-# fires before the counter passes 40). Scenario 8 pins that refusal.
+# the kernel refuses the chain first (measured on this host with a physical path:
+# a 32-link chain to this file runs green, a 33-link chain is refused with `Too
+# many levels of symbolic links`, rc 126; Linux allows 40 hops, Darwin 32, so the
+# kernel always fires before the counter passes 40). An earlier probe under
+# `/tmp` counted one hop fewer because `/tmp` is itself a symlink on this host,
+# and the prefix's symlinks count toward the same kernel limit; the number in
+# `02723f36`'s message is that earlier count. Scenario 8 pins the refusal.
 n=0
 while [ -L "$self" ]; do
   dir=$(cd -P -- "$(dirname -- "$self")" && pwd) || exit 1
@@ -194,6 +200,61 @@ open(p, 'w').write(s.replace(old, new, 1))
 PY
 }
 
+# mut_walkerr <tree> <b|c> — the two `unsafe_counts` walk-error mutants the
+# doc-figures block's guard exists for, both invisible to every other fixture
+# (each keeps rc 1 and prints no extra FAIL row):
+#   b: drop `onerror=walk_error` from the `unsafe_counts` walk. It is the walk
+#      that fills `walk_errors`, so the collection stays empty and the
+#      `n_present == 0` raise accuses a crate the walk could not read.
+#   c: drop `and not walk_errors` from that raise — the same false accusation
+#      while the walk error *was* collected.
+# `os.walk(src, onerror=walk_error)` occurs three times (the Unsafe usage table,
+# the SAFETY scan, `unsafe_counts` in file order); the anchor count is asserted
+# and the site is picked by index, so a refactor that moves the walk fails the
+# mutation loudly instead of mutating the wrong block.
+mut_walkerr() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+tree, shape = sys.argv[1], sys.argv[2]
+p = tree + '/scripts/repo-health.sh'
+s = open(p).read()
+if shape == 'b':
+    old = 'os.walk(src, onerror=walk_error)'
+    assert s.count(old) == 3, 'walk anchor found %d times' % s.count(old)
+    i = -1
+    for _ in range(3):
+        i = s.find(old, i + 1)
+    s = s[:i] + 'os.walk(src)' + s[i + len(old):]
+else:
+    old = 'if n_present == 0 and not walk_errors:'
+    assert s.count(old) == 1, 'walk_errors anchor found %d times' % s.count(old)
+    s = s.replace(old, 'if n_present == 0:', 1)
+open(p, 'w').write(s)
+PY
+}
+
+# mut_prefix <tree> — drop the separator from `unsafe_counts`' containment test,
+# so a sibling directory whose name merely *starts with* the crate name
+# (`frp-core-fake/` next to `frp-core/`) is treated as inside the crate and its
+# `.rs` files are counted in the crate's row. The anchor occurs four times
+# (`rs_texts.fresh` and the three inline walks); the fourth, in file order, is
+# `unsafe_counts`. The count is asserted and the site picked by index, so a
+# refactor fails loudly rather than mutating another walk.
+mut_prefix() {
+  python3 - "$1" <<'PY'
+import sys
+p = sys.argv[1] + '/scripts/repo-health.sh'
+s = open(p).read()
+old = 'if not real.startswith(within_real + os.sep):'
+assert s.count(old) == 4, 'containment anchor found %d times' % s.count(old)
+i = -1
+for _ in range(4):
+    i = s.find(old, i + 1)
+s = s[:i] + 'if not real.startswith(within_real):' + s[i + len(old):]
+open(p, 'w').write(s)
+PY
+}
+
 # tree <name> [full] — set TREE to a fresh throwaway root, or stop the harness
 # loudly. The helpers return non-zero when a `mkdir`/`cp` fails, but a bare
 # `t=$(new_tree …)` hides that status, and the scenario then ran against an empty
@@ -206,6 +267,19 @@ tree() {
     TREE=$(new_full_tree "$1") || setup_die "new_full_tree $1"
   else
     TREE=$(new_tree "$1") || setup_die "new_tree $1"
+  fi
+  # Second, independent stop: even if `setup_die` itself is mutated to return
+  # instead of exiting (scenario 9's mutant), an empty `TREE` must never reach a
+  # scenario. `"$TREE/frp-core/src"` is `/frp-core/src`; measured with that mutant
+  # the run reached `mkdir /.github` and `ln /docs/archive/bad.md` before this
+  # guard existed.
+  if [ -z "$TREE" ]; then
+    # `fixture abort:` rather than `fixture setup:`: scenario 9 skips exactly one
+    # `fixture setup:` row (the one `setup_die` printed) and then requires that
+    # nothing follows, so a second setup row would be indistinguishable from the
+    # vacuous `ok` rows this guard exists to prevent.
+    bad "fixture abort: tree $1 produced no root — refusing to run the scenario against /"
+    exit 1
   fi
 }
 
@@ -468,9 +542,10 @@ fi
 # still finds the repo root) and bounds the loop at 40 hops "so a symlink cycle
 # cannot hang the run". That branch cannot be reached: `bash` cannot open the file
 # through a cycle, because the kernel refuses the chain first (measured on this
-# host: a 31-link chain to this file runs green, a 32-link chain is refused; Linux
-# allows 40 hops, Darwin 32, so 41 hops below is refused on both). The assertable
-# half is that refusal — loud, immediate, and not a hang.
+# host with a physical path: a 32-link chain to this file runs green, a 33-link
+# chain is refused — the earlier "31/32" came from probing under `/tmp`, itself a
+# symlink; Linux allows 40 hops, Darwin 32, so 41 hops below is refused on both).
+# The assertable half is that refusal — loud, immediate, and not a hang.
 hdr
 printf '%s\n' 'scenario 8: a 41-link symlink chain is refused by the kernel, not by the bound'
 chain=$tmp/chain
@@ -505,7 +580,12 @@ fi
 # checks and `clean archive scan: no archive exit-3 row` — while the run was still
 # rc 1 for unrelated reasons. `tree` now stops at the failed setup. The fixture is
 # a *copy* of this harness (at `<root>/scripts/tests/`), so the repo's own script
-# is never chmod-ed and the copy fails its first `cp` for the same reason.
+# is never chmod-ed and the copy fails its first `cp` for the same reason. The
+# *abort* is the point, not the message: with `setup_die`'s `exit 1` mutated to
+# `return 0` the outer harness stayed at rc 0 / `RESULT: … hold` while the inner
+# run printed six vacuous `ok` rows past the FAIL — including scenarios 7 and 8's
+# own rows — and went on to attempt `mkdir -p /scripts/… /docs/archive
+# /.github/workflows`. The last check below pins that nothing follows the FAIL.
 hdr
 printf '%s\n' 'scenario 9: an unreadable script under test fails the run loudly'
 t=$tmp/selfcheck
@@ -521,9 +601,127 @@ else
   bad "unreadable script under test: expected rc 1, got $rc"
 fi
 if printf '%s\n' "$out" | grep -qF 'fixture setup: new_tree'; then
-  ok 'unreadable script under test: the failure names the setup step (no vacuous ok rows below it)'
+  ok 'unreadable script under test: the failure names the setup step'
 else
   bad "unreadable script under test: no setup FAIL row — the checks below it would go vacuous-green: $(printf '%s' "$out" | head -3)"
+fi
+past=$(printf '%s\n' "$out" | awk '
+  !seen && /^  FAIL  fixture setup: / { seen = 1; next }
+  seen && $0 !~ /^[[:space:]]*$/ { print }
+')
+if [ -z "$past" ]; then
+  ok 'unreadable script under test: nothing runs past the failed setup (the FAIL is the last row)'
+else
+  bad "unreadable script under test: rows ran past the failed setup: $(printf '%s' "$past" | head -3 | tr '\n' '|')"
+fi
+
+# unreadable_dir_tree <name> — a full tree whose `frp-vnet/src` holds an
+# unreadable subdirectory and no readable `.rs` of its own (frp-core/src keeps its
+# placeholder, so the tree still holds a readable `.rs` elsewhere). Both
+# `unsafe_counts` walk-error mutants turn this shape into the false
+# `frp-vnet/src has no .rs files` row.
+unreadable_dir_tree() {
+  tree "$1" full
+  rm -f "$TREE/frp-vnet/src/lib.rs"
+  mkdir -p "$TREE/frp-vnet/src/hidden" || setup_die "unreadable_dir_tree $1"
+  chmod 000 "$TREE/frp-vnet/src/hidden"
+}
+
+# --- scenario 10: a walk error is reported, not turned into "no .rs files" ----
+# The doc-figures walk is the only thing that fills `walk_errors`, and it is what
+# separates "this crate holds no `.rs` under `src/`" from "the walk could not read
+# part of it". Two `scripts/repo-health.sh` mutants are invisible to every other
+# fixture (each leaves rc 1 and prints no extra FAIL): dropping
+# `onerror=walk_error` from the `unsafe_counts` walk, and dropping
+# `and not walk_errors` from the raise below it. Both turn a crate that *has* a
+# readable `.rs` (or merely an unreadable subdirectory) into the accusation
+# `frp-vnet/src has no .rs files — cannot measure the doc figures`.
+hdr
+printf '%s\n' 'scenario 10: an unreadable directory is a walk error, not "no .rs files"'
+unreadable_dir_tree walkerr
+t=$TREE
+run_gate "$t"
+chmod 700 "$t/frp-vnet/src/hidden"
+if printf '%s\n' "$out" | grep -qF 'has no .rs files'; then
+  bad 'walk error: the crate is accused of holding no .rs files although the walk reported an unreadable directory'
+else
+  ok 'walk error: no "no .rs files" accusation while the crate walk reported an error'
+fi
+if printf '%s\n' "$out" | grep -qF 'walk error: '; then
+  ok 'walk error: the unreadable directory is named in a walk error row'
+else
+  bad 'walk error: no "walk error:" row for the unreadable directory'
+fi
+if printf '%s\n' "$out" | grep -qF 'doc figures not evaluated — the walk reported errors (exit 2)'; then
+  ok 'walk error: the doc-figures row reports the walk error (exit 2)'
+else
+  bad 'walk error: the doc-figures row does not report the walk error'
+fi
+for shape in b c; do
+  unreadable_dir_tree "walkerr-$shape"
+  t=$TREE
+  if mut_walkerr "$t" "$shape"; then
+    run_gate "$t"
+    chmod 700 "$t/frp-vnet/src/hidden"
+    if printf '%s\n' "$out" | grep -qF 'has no .rs files'; then
+      ok "walk error ($shape): the guard mutant re-raises the false accusation (check has teeth)"
+    else
+      bad "walk error ($shape): the mutant did not re-raise the accusation — the check would be vacuous"
+    fi
+  else
+    bad "walk error ($shape): mut_walkerr failed to apply — anchor missing, the check would be vacuous"
+  fi
+done
+
+# --- scenario 11: containment needs the path separator ------------------------
+# `unsafe_counts` excludes a file whose realpath is outside the crate root, so a
+# symlink pointing into a *sibling* directory is not counted for the crate. The
+# test is `real.startswith(within_real + os.sep)`: dropping the separator makes a
+# sibling named `frp-core-fake/` count as inside `frp-core/` (a pure prefix
+# match). The fixture places `frp-core-fake/leak.rs` (one `unsafe` block) next to
+# `frp-core/` and symlinks it into `frp-core/src/`, so the mutation is visible in
+# `unsafe_counts`' result — measured as the doc-figure row that reports what the
+# tree measures for `frp-core`'s unsafe-block claim (the fixture's CLAUDE.md does
+# not carry that claim, so the row always reports the measurement: `measures 0`
+# intact, `measures 1` mutated).
+#
+# `unsafe_counts` is the walk the mutation targets; the *Unsafe usage table* is a
+# second, separate walk in the script with its own copy of this test, so it stays
+# 0 under this mutation and is deliberately not the observable here.
+hdr
+printf '%s\n' 'scenario 11: a sibling whose name starts with the crate name is not the crate'
+tree prefix full
+t=$TREE
+mkdir -p "$t/frp-core-fake" || bad 'containment: cannot create the sibling directory'
+printf '%s\n' '// SAFETY: fixture only.' 'pub fn placeholder() {' '    unsafe {}' '}' > "$t/frp-core-fake/leak.rs"
+ln -s "$t/frp-core-fake/leak.rs" "$t/frp-core/src/leak.rs" || bad 'containment: cannot symlink the sibling file into frp-core/src'
+measured_unsafe() {
+  printf '%s\n' "$out" | awk '
+    index($0, "frp-core: ([0-9]+) blocks") > 0 {
+      for (i = 1; i <= NF; i++)
+        if ($i == "measures") { print $(i + 1); exit }
+    }
+  '
+}
+run_gate "$t"
+blocks=$(measured_unsafe)
+if [ -z "$blocks" ]; then
+  bad 'containment: no doc-figure row reports the measured frp-core unsafe-block count (the fixture must drive the doc-figures gate)'
+elif [ "$blocks" = "0" ]; then
+  ok 'containment: the out-of-crate alias is not counted in the doc-figure measurement for frp-core'
+else
+  bad "containment: the doc-figure measurement for frp-core is $blocks, expected 0 — a sibling directory leaked into it"
+fi
+if mut_prefix "$t"; then
+  run_gate "$t"
+  blocks=$(measured_unsafe)
+  if [ "$blocks" = "1" ]; then
+    ok 'containment: dropping the separator counts the sibling in the measurement (check has teeth)'
+  else
+    bad "containment: the within_real-without-separator mutation left the measurement at ${blocks:-absent}, expected 1"
+  fi
+else
+  bad 'containment: mut_prefix failed to apply — anchor missing, the check would be vacuous'
 fi
 
 # ---------------------------------------------------------------- summary
