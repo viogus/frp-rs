@@ -629,7 +629,7 @@ fn unresolvable_token_source_exits_3_where_go_exits_1() {
 ///
 /// | argv | Go | this file's base |
 /// |---|---|---|
-/// | `frpc verify -c <exec cfg>` | rc 1, stdout `unsafe feature "TokenSourceExec" is not enabled. To enable it, ensure it is allowed in the configuration or command line flags`, stderr 0 B | rc 0, `Config file <p> is valid` + summary |
+/// | `frpc verify -c <exec cfg>` | rc 1, stdout `unsafe feature "TokenSourceExec" is not enabled. To enable it, ensure it is allowed in the configuration or command line flags`, stderr 0 B | rc 0, `frpc: the configuration file <p> syntax is ok` + summary (the pre-#418 base printed `Config file <p> is valid`; #418 moved the sentence, so the accept rows below assert Go's) |
 /// | `frpc verify … --allow-unsafe TokenSourceExec` | rc 0, `frpc: the configuration file <p> syntax is ok` | rc 0 |
 /// | `frpc verify … --allow-unsafe WrongFeature` | rc 1 (fail-closed) | rc 0 (fail-open) |
 /// | `frpc verify … --allow-unsafe WrongFeature --allow-unsafe TokenSourceExec` | rc 0 (pflag `strings` appends) | rc 1 — bpaf refused the second occurrence |
@@ -695,9 +695,11 @@ fn verify_runs_the_post_load_allow_unsafe_gate_like_go() {
     assert_eq!(
         stdout_of(&accept),
         format!(
-            "Config file {cfg} is valid\n  Server: 127.0.0.1:7000\n  Proxies: 0\n  Visitors: 0\n"
+            "frpc: the configuration file {cfg} syntax is ok\n  Server: 127.0.0.1:7000\n  \
+             Proxies: 0\n  Visitors: 0\n"
         ),
-        "the accept row keeps the existing success shape; stderr={:?}",
+        "the accept row keeps the success shape Go prints (#418 moved the sentence); \
+         stderr={:?}",
         stderr_of(&accept),
     );
     assert!(
@@ -773,9 +775,11 @@ fn verify_runs_the_post_load_allow_unsafe_gate_like_go() {
         assert_eq!(
             stdout_of(&repeated),
             format!(
-                "Config file {cfg} is valid\n  Server: 127.0.0.1:7000\n  Proxies: 0\n  Visitors: 0\n"
+                "frpc: the configuration file {cfg} syntax is ok\n  Server: 127.0.0.1:7000\n  \
+                 Proxies: 0\n  Visitors: 0\n"
             ),
-            "the accepted repeat keeps the existing success shape; stderr={:?}",
+            "the accepted repeat keeps the success shape Go prints (#418 moved the sentence); \
+             stderr={:?}",
             stderr_of(&repeated),
         );
     }
