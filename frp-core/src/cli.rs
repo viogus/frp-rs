@@ -2624,9 +2624,11 @@ const CSV_BARE_QUOTE: &str = "bare \" in non-quoted-field";
 /// Go registers the flag as `StringSliceVarP` (frpc `cmd/frpc/sub/root.go:55`,
 /// frps `cmd/frps/root.go:47`), and pflag reads a `strings` value with its
 /// `readAsCSV` helper: Go's `encoding/csv` reader with `LazyQuotes=false` and
-/// `TrimLeadingSpace=false`, reading exactly **one** record. So the value is
-/// CSV — quotes are stripped, whitespace is **not** trimmed, and a malformed
-/// record is a flag error.
+/// `TrimLeadingSpace=false`, reading **one record**. So the value is CSV —
+/// matched quotes are stripped, whitespace is **not** trimmed, leading blank
+/// lines are skipped, and a malformed record is a flag error. Exactly one
+/// record is read: its terminator ends the read, and the rest of the value is
+/// never parsed.
 ///
 /// Measured on Go v0.71.0 with `frpc verify -c <exec tokenSource cfg>
 /// --allow-unsafe <value>` (rc 0 means the value enabled `TokenSourceExec`;
@@ -2648,112 +2650,224 @@ const CSV_BARE_QUOTE: &str = "bare \" in non-quoted-field";
 /// | `a"b` (bare quote) | error `bare " in non-quoted-field` | 1 |
 /// | `"TokenSourceExec"x` (junk after the quote) | error `extraneous or missing "` | 1 |
 /// | `"TokenSourceExec"\njunk` | `TokenSourceExec` (later records never read) | 0 |
+/// | `\nTokenSourceExec` | `TokenSourceExec` (leading blank lines are skipped) | 0 |
+/// | `\n`, `\r\n`, `\r` | error `EOF` (a blank-only value is a flag error) | 1 |
+/// | `\n"a` | error `parse error on line 2, column 3: …` (blank line skipped) | 1 |
 /// | ` TokenSourceExec`, `'TokenSourceExec'`, `A,\tTokenSourceExec` | kept verbatim | 1 |
 ///
 /// The empty value is pflag's `readAsCSV("")` special case and yields no
 /// features rather than one empty one. Error wording is frp-rs's, shaped after
-/// Go's (`parse error on line 1, column N: …`); what is pinned is the refusal,
-/// not the text.
+/// Go's `encoding/csv` `ParseError`: a 1-based **byte** column on a 1-based
+/// line, with Go's `record on line N; ` prefix when the record started on an
+/// earlier line than the error (a quoted field may span lines). What is pinned
+/// is the refusal and those numbers, not the sentence around them.
 fn split_allow_unsafe_csv(value: &str) -> Result<Vec<String>, String> {
     // pflag's `readAsCSV` returns an empty slice, not `[""]`, for "".
     if value.is_empty() {
         return Ok(Vec::new());
     }
-    let chars: Vec<char> = value.chars().collect();
-    let len = chars.len();
-    let mut fields: Vec<String> = Vec::new();
-    let mut i = 0;
-    // `csv.Reader.Read` reads exactly one record: after a record terminator the
-    // rest of the value is never parsed (measured — `A\n"unclosed` is rc 1 with
-    // the *gate* line, not a pflag parse error).
-    loop {
-        if chars.get(i) == Some(&'"') {
-            i += 1;
-            let mut field = String::new();
-            loop {
-                let c = match chars.get(i) {
-                    Some(&c) => c,
-                    None => return Err(csv_error(len + 1, CSV_MISSING_QUOTE)),
-                };
-                if c == '"' {
-                    if chars.get(i + 1) == Some(&'"') {
-                        field.push('"');
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    match chars.get(i) {
-                        None => {
-                            fields.push(field);
-                            return Ok(fields);
-                        }
-                        Some(&',') => {
-                            i += 1;
-                            break;
-                        }
-                        Some(&'\n') => {
-                            fields.push(field);
-                            return Ok(fields);
-                        }
-                        Some(&'\r') if chars.get(i + 1) == Some(&'\n') || i + 1 == len => {
-                            fields.push(field);
-                            return Ok(fields);
-                        }
-                        // Go reports `ErrQuote` at the closing quote's own
-                        // column, not the offending rune's (measured:
-                        // `"TokenSourceExec"x` is column 17, not 18).
-                        Some(_) => return Err(csv_error(i, CSV_MISSING_QUOTE)),
-                    }
-                }
-                // `\r\n` inside a quoted element is normalized to `\n`; a lone
-                // `\r` is data (measured: `"Token\rSourceExec"` is rc 1).
-                if c == '\r' && chars.get(i + 1) == Some(&'\n') {
-                    field.push('\n');
-                    i += 2;
-                    continue;
-                }
-                field.push(c);
-                i += 1;
-            }
-            fields.push(field);
+    read_csv_record(value)
+}
+
+/// Go's `encoding/csv` `Reader.Read` for one record, with `Comma=','`,
+/// `LazyQuotes=false` and `TrimLeadingSpace=false` — the configuration pflag's
+/// `readAsCSV` uses. Mirrors `readRecord`/`readLine` from Go 1.27.1's
+/// `$GOROOT/src/encoding/csv/reader.go`: blank lines before the record are skipped, a
+/// quoted field may span lines, and errors carry Go's `ParseError` numbers.
+fn read_csv_record(value: &str) -> Result<Vec<String>, String> {
+    // Go's `readLine` normalises `\r\n` to `\n` on every line and drops a
+    // trailing `\r` at end of input; both are properties of the byte stream, so
+    // they are applied once here and `CsvReader::read_line` stays a plain split.
+    let normalized = normalize_csv_input(value);
+    let mut reader = CsvReader::new(&normalized);
+    // Read the first non-blank line (Go's `readRecord` skip loop; comments are
+    // off for pflag's reader, so only the empty-line arm applies).
+    let (mut line, eof) = loop {
+        let (line, eof) = reader.read_line();
+        if !eof && line.len() == length_nl(line) {
             continue;
         }
-        let mut field = String::new();
+        break (line, eof);
+    };
+    // Blank lines only: Go's reader returns `io.EOF`, which pflag reports as
+    // `invalid argument … for "--allow-unsafe" flag: EOF`.
+    if eof {
+        return Err("EOF".to_string());
+    }
+    let start_line = reader.line;
+    let mut record: Vec<u8> = Vec::new();
+    let mut fields: Vec<Vec<u8>> = Vec::new();
+    let mut pos_line = reader.line;
+    let mut pos_col = 1usize;
+    'parse_field: loop {
+        if line.is_empty() || line[0] != b'"' {
+            // Non-quoted field: up to the next comma, or to the end of the line
+            // with the terminator removed.
+            let comma = line.iter().position(|&b| b == b',');
+            let end = comma.unwrap_or_else(|| line.len() - length_nl(line));
+            let field = &line[..end];
+            if let Some(j) = field.iter().position(|&b| b == b'"') {
+                return Err(csv_error(
+                    start_line,
+                    reader.line,
+                    pos_col + j,
+                    CSV_BARE_QUOTE,
+                ));
+            }
+            record.extend_from_slice(field);
+            fields.push(std::mem::take(&mut record));
+            if let Some(i) = comma {
+                line = &line[i + 1..];
+                pos_col += i + 1;
+                continue 'parse_field;
+            }
+            break 'parse_field;
+        }
+        // Quoted field: the opening quote is not part of the value.
+        line = &line[1..];
+        pos_col += 1;
         loop {
-            match chars.get(i) {
-                None => {
-                    fields.push(field);
-                    return Ok(fields);
+            if let Some(i) = line.iter().position(|&b| b == b'"') {
+                record.extend_from_slice(&line[..i]);
+                line = &line[i + 1..];
+                pos_col += i + 1;
+                match line.first() {
+                    // `""` sequence: one literal quote.
+                    Some(b'"') => {
+                        record.push(b'"');
+                        line = &line[1..];
+                        pos_col += 1;
+                    }
+                    // `",` sequence: end of field.
+                    Some(b',') => {
+                        line = &line[1..];
+                        pos_col += 1;
+                        fields.push(std::mem::take(&mut record));
+                        continue 'parse_field;
+                    }
+                    // The closing quote at the end of a line, or of the input,
+                    // ends both the field and the record.
+                    _ if length_nl(line) == line.len() => {
+                        fields.push(std::mem::take(&mut record));
+                        break 'parse_field;
+                    }
+                    // An invalid, non-escaped quote. Go reports `ErrQuote` at
+                    // the closing quote's own byte column, not at the offending
+                    // rune's (measured: `"TokenSourceExec"x` is column 17, not
+                    // 18).
+                    _ => {
+                        return Err(csv_error(
+                            start_line,
+                            pos_line,
+                            pos_col - 1,
+                            CSV_MISSING_QUOTE,
+                        ))
+                    }
                 }
-                Some(&',') => {
-                    i += 1;
-                    break;
+            } else if !line.is_empty() {
+                // Hit the end of the line inside a quoted field: the newline is
+                // data. Go's `if errRead != nil` arm here is a non-EOF read
+                // error, which a `&str` cannot produce.
+                record.extend_from_slice(line);
+                pos_col += line.len();
+                let (next, _) = reader.read_line();
+                line = next;
+                if !line.is_empty() {
+                    pos_line += 1;
+                    pos_col = 1;
                 }
-                Some(&'\n') => {
-                    fields.push(field);
-                    return Ok(fields);
-                }
-                // A `\r` immediately before `\n` or at end of input is the line
-                // terminator, so it is dropped rather than kept as data.
-                Some(&'\r') if chars.get(i + 1) == Some(&'\n') || i + 1 == len => {
-                    fields.push(field);
-                    return Ok(fields);
-                }
-                Some(&'"') => return Err(csv_error(i + 1, CSV_BARE_QUOTE)),
-                Some(&c) => {
-                    field.push(c);
-                    i += 1;
-                }
+            } else {
+                // Abrupt end of input inside a quoted field. Go has already
+                // cleared `readLine`'s `io.EOF` here, so the unterminated quote
+                // is always reported at the current position.
+                return Err(csv_error(start_line, pos_line, pos_col, CSV_MISSING_QUOTE));
             }
         }
-        fields.push(field);
+    }
+    Ok(fields
+        .into_iter()
+        .map(|field| String::from_utf8_lossy(&field).into_owned())
+        .collect())
+}
+
+/// Go's `encoding/csv` input normalisation, applied once so the reader can work
+/// on plain `\n`-separated lines: every `\r\n` becomes `\n` (Go's `readLine`
+/// rewrites the byte rather than dropping it), and a trailing `\r` with no
+/// `\n` after it is dropped ("for backwards compatibility", Go's `readLine`).
+/// A `\r` anywhere else is data.
+fn normalize_csv_input(value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' {
+            if i + 1 == bytes.len() {
+                // Drop the trailing \r before end of input.
+                break;
+            }
+            if bytes[i + 1] == b'\n' {
+                out.push(b'\n');
+                i += 2;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// The byte count of a line's trailing `\n`, Go's `lengthNL`.
+fn length_nl(line: &[u8]) -> usize {
+    usize::from(line.last() == Some(&b'\n'))
+}
+
+/// One record's worth of Go's `encoding/csv` input state: the bytes, the
+/// current byte offset, and the 1-based number of the last line read.
+struct CsvReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    /// Go's `Reader.numLine`.
+    line: usize,
+}
+
+impl<'a> CsvReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        CsvReader {
+            bytes,
+            offset: 0,
+            line: 0,
+        }
+    }
+
+    /// Go's `readLine` on already-normalised input: the next line *with* its
+    /// `\n` terminator. The bool is Go's `err == io.EOF` — true only when no
+    /// bytes were left at all.
+    fn read_line(&mut self) -> (&'a [u8], bool) {
+        let start = self.offset;
+        let mut end = start;
+        while end < self.bytes.len() && self.bytes[end] != b'\n' {
+            end += 1;
+        }
+        let had_newline = end < self.bytes.len();
+        let raw = &self.bytes[start..if had_newline { end + 1 } else { end }];
+        self.offset = start + raw.len();
+        self.line += 1;
+        (raw, raw.is_empty())
     }
 }
 
-/// Go's `parse error on line 1, column N: …` shape. `column` is 1-based over
-/// runes, matching Go's `encoding/csv` for the values a flag can carry.
-fn csv_error(column: usize, reason: &str) -> String {
-    format!("parse error on line 1, column {column}: {reason}")
+/// Go's `encoding/csv` `ParseError.Error` shape: a 1-based byte column on a
+/// 1-based line, with the `record on line N; ` prefix when the record started
+/// on an earlier line than the error (a quoted field may span lines).
+fn csv_error(start_line: usize, line: usize, column: usize, reason: &str) -> String {
+    if start_line == line {
+        format!("parse error on line {line}, column {column}: {reason}")
+    } else {
+        format!(
+            "record on line {start_line}; parse error on line {line}, column {column}: {reason}"
+        )
+    }
 }
 
 /// Every `--allow-unsafe` occurrence, read in order through
@@ -5693,6 +5807,171 @@ mod tests {
                 read_ignored_allow_unsafe(&["--allow-unsafe", bad]).is_err(),
                 "the ignored twin must refuse `{bad}` too"
             );
+        }
+    }
+
+    #[test]
+    fn allow_unsafe_skips_blank_lines_like_go_and_blank_only_is_an_eof_flag_error() {
+        // Go's `encoding/csv` `readRecord` skips blank lines while reading a
+        // record (`$GOROOT/src/encoding/csv/reader.go`), so a value that starts
+        // with one still parses — measured on Go v0.71.0, `frpc verify -c <exec
+        // cfg> --allow-unsafe $'\nTokenSourceExec'` is rc 0 while the head was
+        // rc 1 (its reader never skipped the blank).
+        for value in [
+            "\nTokenSourceExec",
+            "\n\nTokenSourceExec",
+            "\r\nTokenSourceExec",
+        ] {
+            let expected = vec!["TokenSourceExec".to_string()];
+            assert_eq!(
+                read_allow_unsafe(&["--allow-unsafe", value]).unwrap(),
+                expected,
+                "leading blank lines must be skipped for {value:?}"
+            );
+            assert_eq!(
+                read_ignored_allow_unsafe(&["--allow-unsafe", value]).unwrap(),
+                expected,
+                "the ignored twin must skip leading blank lines for {value:?}"
+            );
+        }
+        // A blank line *inside* a quoted field is data, not a separator
+        // (measured: `"a\n\nb"` is rc 1 with the gate line, not a parse error).
+        assert_eq!(
+            read_allow_unsafe(&["--allow-unsafe", "\"a\n\nb\""]).unwrap(),
+            ["a\n\nb"]
+        );
+        // A value that is nothing but blank lines leaves Go's reader with no
+        // record at all: `readRecord` returns `io.EOF`, which pflag reports as
+        // `invalid argument "\n" for "--allow-unsafe" flag: EOF` (measured, rc 1
+        // on stderr — not the `unsafe feature …` gate line).
+        for value in ["\n", "\r\n", "\n\n", "\r"] {
+            assert_eq!(
+                split_allow_unsafe_csv(value),
+                Err("EOF".to_string()),
+                "the reader must return Go's io.EOF for the blank-only value {value:?}"
+            );
+            for (label, parsed) in [
+                (
+                    "allow_unsafe_parser",
+                    read_allow_unsafe(&["--allow-unsafe", value]),
+                ),
+                (
+                    "ignored twin",
+                    read_ignored_allow_unsafe(&["--allow-unsafe", value]),
+                ),
+            ] {
+                let failure = parsed.expect_err(&format!("{label} must refuse {value:?}"));
+                let rendered = failure.unwrap_stderr();
+                assert!(
+                    rendered.contains(": EOF"),
+                    "{label} must report Go's EOF for {value:?}, got: {rendered}"
+                );
+            }
+        }
+        // The flip side of skipping blanks: the first record's terminator ends
+        // the read, so a later malformed record is never parsed (measured: Go is
+        // rc 1 on the gate line for `A\n"unclosed`).
+        assert_eq!(
+            read_allow_unsafe(&["--allow-unsafe", "A\n\"unclosed"]).unwrap(),
+            ["A"]
+        );
+        assert_eq!(
+            read_ignored_allow_unsafe(&["--allow-unsafe", "A\n\"unclosed"]).unwrap(),
+            ["A"]
+        );
+    }
+
+    #[test]
+    fn allow_unsafe_error_positions_are_go_lines_and_byte_columns() {
+        // Go's `encoding/csv` `ParseError` counts 1-based **byte** columns on
+        // 1-based lines, and prefixes `record on line N; ` when the error sits
+        // on a later line than the record started on
+        // (`$GOROOT/src/encoding/csv/reader.go`). Every row was measured on Go
+        // v0.71.0 with `frpc verify` and `frps verify` (byte-identical); only
+        // the `parse error …` tail is pinned, not frp-rs's surrounding sentence.
+        let rows: [(&str, &str); 11] = [
+            // The ASCII rows of the PR table keep their columns.
+            (
+                "\"abc",
+                "parse error on line 1, column 5: extraneous or missing \" in quoted-field",
+            ),
+            (
+                "\"TokenSourceExec\"x",
+                "parse error on line 1, column 17: extraneous or missing \" in quoted-field",
+            ),
+            (
+                "a\"b",
+                "parse error on line 1, column 2: bare \" in non-quoted-field",
+            ),
+            // Multi-byte input: the column is bytes, not runes.
+            (
+                "\"é",
+                "parse error on line 1, column 4: extraneous or missing \" in quoted-field",
+            ),
+            (
+                "é\"x",
+                "parse error on line 1, column 3: bare \" in non-quoted-field",
+            ),
+            (
+                "x,é\"y",
+                "parse error on line 1, column 5: bare \" in non-quoted-field",
+            ),
+            (
+                "\"abc\r",
+                "parse error on line 1, column 5: extraneous or missing \" in quoted-field",
+            ),
+            (
+                "\"\"\"",
+                "parse error on line 1, column 4: extraneous or missing \" in quoted-field",
+            ),
+            // A quoted field may span lines: the reported line advances and the
+            // `record on line N; ` prefix appears.
+            (
+                "\"a\nbc\"x",
+                "record on line 1; parse error on line 2, column 3: extraneous or missing \" in \
+                 quoted-field",
+            ),
+            (
+                "\"a\nb",
+                "record on line 1; parse error on line 2, column 2: extraneous or missing \" in \
+                 quoted-field",
+            ),
+            // The record itself starts on line 2 after the skipped blank, so
+            // there is no prefix (the record line is the error line).
+            (
+                "\n\"a",
+                "parse error on line 2, column 3: extraneous or missing \" in quoted-field",
+            ),
+        ];
+        for (value, expected) in rows {
+            // The reader's own message is Go's `ParseError` text exactly.
+            assert_eq!(
+                split_allow_unsafe_csv(value),
+                Err(expected.to_string()),
+                "the reader must place {value:?} at `{expected}`"
+            );
+            // And both parser surfaces must refuse it, since Go parses the
+            // persistent flag for every subcommand.
+            for (label, parsed) in [
+                (
+                    "allow_unsafe_parser",
+                    read_allow_unsafe(&["--allow-unsafe", value]),
+                ),
+                (
+                    "ignored twin",
+                    read_ignored_allow_unsafe(&["--allow-unsafe", value]),
+                ),
+            ] {
+                let failure = parsed.expect_err(&format!("{label} must refuse {value:?}"));
+                // bpaf re-wraps the sentence when it renders it, so compare it
+                // with whitespace collapsed.
+                let rendered = failure.unwrap_stderr();
+                let collapsed = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert!(
+                    collapsed.contains(expected),
+                    "{label} must relay `{expected}` for {value:?}, got: {rendered}"
+                );
+            }
         }
     }
 
