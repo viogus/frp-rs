@@ -472,7 +472,11 @@ User-facing release notes for frp-rs.
   `[webServer] type = "tcp"` stays a proxy, as at base — and only a section with no `type`
   that names `local_port`/`remote_port` is collected as one.
 - **`frps verify` and `frpc verify` now run the post-load `--allow-unsafe`
-  gate, so a config the daemon refuses is no longer reported as valid.** Both
+  gate, so a config the daemon refuses for its token source is no longer
+  reported as valid.** Scoped deliberately: `verify` still does not run every
+  daemon-side check — an OIDC config whose issuer is unreachable is rc 3 under
+  `frpc -c` but rc 0 under `frpc verify` — so the claim covers the
+  unsafe-feature gate only. Both
   verifies stopped at the config loader, while the daemon reaches
   `validate_token_source_unsafe` during service construction — so
   `[auth.tokenSource] type = "exec"` (and the `auth.oidc.tokenSource` spelling)
