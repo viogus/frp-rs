@@ -1252,7 +1252,10 @@ def floating_hits(text):
 
 
 files = []
-seen = set()   # a symlinked workflow is its target: scan the real file once
+# A symlinked workflow is its target and a hard link is the same inode: scan the
+# real file once. `realpath` alone missed the hard link (both names stay distinct
+# paths, so an aliased workflow was examined — and its hits printed — twice).
+seen = set()
 for dirpath, _dirs, names in os.walk('.github/workflows', onerror=walk_error,
                                      followlinks=False):
     for fn in sorted(names):
@@ -1275,10 +1278,18 @@ for dirpath, _dirs, names in os.walk('.github/workflows', onerror=walk_error,
                       % path.replace('\\', '\\\\').replace('\r', '\\r')
                             .replace('\n', '\\n'))
                 continue
-            real = os.path.realpath(path)
-            if real in seen:
+            try:
+                st = os.stat(path)
+            except OSError:
+                # Unreadable (e.g. a dangling symlink): key on the resolved path
+                # so two names for one missing target still collapse; the read
+                # below reports the error.
+                key = os.path.realpath(path)
+            else:
+                key = (st.st_dev, st.st_ino)
+            if key in seen:
                 continue
-            seen.add(real)
+            seen.add(key)
             files.append(path)
 files.sort()
 top = os.path.join('.github', 'workflows')
@@ -1476,16 +1487,26 @@ def walk_error(e):
     walk_errors.append('%s: %s' % (getattr(e, 'filename', '?'), e.strerror or e))
 
 
-seen = set()   # a symlinked archive file is its target: count the real file once
+seen = set()   # a symlinked archive file is its target, a hard link its inode:
+               # count the real file once (`realpath` missed the hard link, so an
+               # aliased report inflated `archive path refs` by 1 total / 1 resolved)
 for root, _dirs, files in os.walk(os.path.join('docs', 'archive'), onerror=walk_error):
     for fn in files:
         if not fn.endswith(('.md', '.json')):
             continue
         p = os.path.join(root, fn)
-        real = os.path.realpath(p)
-        if real in seen:
+        try:
+            st = os.stat(p)
+        except OSError:
+            # Unreadable (e.g. a dangling symlink): key on the resolved path so
+            # two names for one missing target still collapse; the read below
+            # reports the error.
+            key = os.path.realpath(p)
+        else:
+            key = (st.st_dev, st.st_ino)
+        if key in seen:
             continue
-        seen.add(real)
+        seen.add(key)
         try:
             text = safe_read(p)
         except OSError as e:
