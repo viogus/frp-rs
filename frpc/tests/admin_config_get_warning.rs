@@ -19,6 +19,7 @@
 //! | `seed_reads_the_file_non_strictly` | no `enable` + an unknown field, `--strict-config=false` | add `enable` | 1 | **1** |
 //! | `seed_resolves_spellings_only_the_loader_does` (a/b) | `[common]` / `includes` spelling | — | 3 | **1** (startup only) |
 //! | the same test's (c) | key in `admin-node.toml`, a key-less `frpc.toml` in the cwd | — | 3 | **1** (startup only) |
+//! | the same test's (d) | key-less `admin-node.toml` (`-c`), a keyed `frpc.toml` in the cwd | add `enable` to the `-c` file | 1 | **1** |
 //!
 //! **The strict-flag row.** `seed_web_server_tls_enable_seen` loads with
 //! `strict = false`, deliberately: the admin GET itself
@@ -488,10 +489,16 @@ fn seed_reads_the_file_non_strictly() {
 /// **What this does not cover.** The presence detector's own spelling matrix
 /// (pinned in `frp-core/tests/web_server_tls_enable_warning.rs`, which measures
 /// each `[common]`/cross-spelling row directly, and by
-/// `common_and_includes_spellings_set_the_flag`). Sub-case (c) *does* pin that
-/// the seed reads the path it was handed rather than a default filename: the
-/// child is started with a non-default filename carrying the key, while a
-/// `frpc.toml` **without** the key sits in its working directory.
+/// `common_and_includes_spellings_set_the_flag`). Sub-cases (c) and (d) pin the
+/// **path** the seed reads rather than a default filename, in both directions:
+/// (c) starts the child with a non-default filename carrying the key while a
+/// `frpc.toml` **without** the key sits in its working directory, and (d) starts
+/// it with a key-less `-c` file while the working directory's `frpc.toml` **has**
+/// the key, then adds the key to the `-c` file: the `-c` argument must win, so
+/// that edit is a real state change and the GET emits **1**. (d) is the row a
+/// "prefer `./frpc.toml` only when that file sets the key" seed reds (it would
+/// have baselined `WRITTEN` and emitted **0**); (c) cannot see that seed, because
+/// there the cwd file does not set the key.
 #[test]
 fn seed_resolves_spellings_only_the_loader_does() {
     // (a) `[common.webServer.tls] enable` beside a top-level `[web_server]`: the
@@ -547,4 +554,39 @@ fn seed_resolves_spellings_only_the_loader_does() {
         assert!(response.contains("HTTP/1."), "the route must answer");
     }
     child.assert_records(1, "(c) three GETs over a non-default filename");
+
+    // (d) The same precedence in the other direction: the `-c` file
+    //     (`admin-node.toml`) is **key-less**, while the working directory holds a
+    //     `frpc.toml` **with** the key. The `-c` argument must still win, so the
+    //     startup load emits nothing and the seed records `ABSENT` — which makes
+    //     adding the key to the `-c` file a real state change, so the next GET
+    //     emits **1** (a GET warns only when the file *becomes* written; see
+    //     `config_from_file`). A seed that preferred an *existing* keyed
+    //     `./frpc.toml` would record `WRITTEN`, and the same edit would then emit
+    //     **0** — red. Sub-case (c) catches only the plain "always prefer
+    //     `./frpc.toml`" seed (its keyed `-c` file makes that seed emit a second
+    //     record, 2 vs 1); this row is what catches the narrower "prefer the cwd
+    //     file only when it sets the key" fallback, which (c) cannot see because
+    //     there the cwd file does *not* set the key.
+    let dir = TempDir::new("loader-precedence");
+    let admin_port = free_port();
+    dir.write("frpc.toml", &frpc_config(admin_port, ENABLE));
+    let cfg = dir.write("admin-node.toml", &frpc_config(admin_port, ""));
+    let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()]);
+    assert_eq!(
+        child.records(),
+        0,
+        "(d) the `-c` file has no key at startup, so no record — a load that read \
+         the keyed ./frpc.toml instead would have emitted one"
+    );
+
+    // The hand-edit lands in the `-c` file, not in the cwd one, so only a seed
+    // that actually read the `-c` file sees the change.
+    std::fs::write(&cfg, frpc_config(admin_port, ENABLE)).expect("hand-edit the -c file");
+    let response = admin_get(admin_port, "(d) precedence");
+    assert!(
+        response.contains("HTTP/1."),
+        "the admin route must answer, got {response:?}"
+    );
+    child.assert_records(1, "(d) one GET after the `-c` file gains the key");
 }
