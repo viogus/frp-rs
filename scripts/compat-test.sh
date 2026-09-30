@@ -115,8 +115,18 @@ track_pid() {
 
 # Run Go binary with proxy env vars cleared
 # Surge/system proxies intercept localhost TCP otherwise.
+#
+# `exec` is load-bearing. Callers run `run_go ... &` and then `track_pid $!`.
+# Without `exec`, bash forks a subshell for the function, so `$!` is that
+# subshell (a `bash` process) and the Go binary is its child. Killing the
+# tracked pid then kills only the wrapper and reparents the server to init,
+# where it keeps its listeners bound — measured: one green run left 83 such
+# orphans (33 frps, 50 frpc), all with `PPID 1`. With `exec` the subshell
+# *becomes* the binary, so the tracked pid is the server itself. Every call
+# site is backgrounded (90/90); a foreground call would replace this shell,
+# so keep it backgrounded.
 run_go() {
-    env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+    exec env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
         -u http_proxy -u https_proxy -u all_proxy \
         "$@"
 }
@@ -143,12 +153,20 @@ ensure_go_frp_v2() {
 }
 
 cleanup() {
-    for pid in $PIDS; do
-        kill "$pid" 2>/dev/null || true
-    done
+    local rc=$?
+    # Reap tracked pids through the bounded wait + SIGKILL path. The trap used
+    # to send a single bare SIGTERM and exit, so a server that had not been
+    # recorded — or whose recorded pid was only a wrapper subshell — survived.
+    cleanup_pids
+    # A run may not leave a server behind: this names, reaps and fails on every
+    # scenario process this run started (see `assert_no_strays`).
+    if ! assert_no_strays; then
+        rc=1
+    fi
     if ! $KEEP_TMP; then
         rm -rf "$TEST_DIR"
     fi
+    exit "$rc"
 }
 
 # Kill all tracked PIDs without removing test dir.
@@ -175,6 +193,65 @@ cleanup_pids() {
     done
     wait 2>/dev/null || true
     PIDS=""
+}
+
+# =============================================================================
+# Stray-process guard
+# =============================================================================
+#
+# Every server this run starts holds a config under `$TEST_DIR`, and none may
+# outlive the run: a survivor keeps its listeners bound and races the next run
+# for the same ports. `cleanup_pids` reaps the pids `track_pid` recorded; this
+# guard is the regression test for that contract — it counts the scenario
+# servers still alive after cleanup and fails the run when any remain.
+#
+# Measured before the guard: a green `--ci` run (86 passed, 0 failed, rc 0)
+# left 83 reparented Go servers behind (33 `frps`, 50 `frpc`), every one with
+# `PPID 1` and `-c /tmp/frp-compat-test/<scenario>/...`.
+#
+# The match is a process name *plus* the scenario directory. The repository's
+# stray-process rule forbids name-only kills (a sibling worktree's `frps` is
+# not ours and must survive), and a bare `pgrep -x frps` would count it.
+scenario_strays() {
+    local pid cmd
+    for pid in $( { pgrep -x frps || true; pgrep -x frpc || true; } 2>/dev/null ); do
+        cmd=$(ps -p "$pid" -o command= 2>/dev/null) || continue
+        case "$cmd" in
+            *"$TEST_DIR/"*) printf '%s\n' "$pid" ;;
+        esac
+    done
+    return 0
+}
+
+# Servers already holding a scenario config when this run started (a sibling
+# agent's compat run). They are not ours to reap and must not fail the guard.
+STRAY_BASELINE=" $(scenario_strays | tr '\n' ' ') "
+
+# Name, reap and fail on the servers this run left behind. Only processes `ps`
+# still shows are counted, so one that exited between the scan and the check is
+# not reported; reaping is by the exact pids printed — never by name — so a
+# concurrent run's servers are untouched. Returns non-zero so the run's exit
+# status reports the regression.
+assert_no_strays() {
+    local pid line report="" survivors=""
+    for pid in $(scenario_strays); do
+        case "$STRAY_BASELINE" in
+            *" $pid "*) continue ;;
+        esac
+        line=$(ps -p "$pid" -o pid=,ppid=,command= 2>/dev/null) || continue
+        if [[ -z "$line" ]]; then
+            continue
+        fi
+        survivors="$survivors $pid"
+        report="${report}  ${line}
+"
+    done
+    if [[ -z "$survivors" ]]; then
+        return 0
+    fi
+    printf 'ERROR: compat run left stray server process(es) behind:\n%s' "$report" >&2
+    kill -9 $survivors 2>/dev/null || true
+    return 1
 }
 trap cleanup EXIT
 
