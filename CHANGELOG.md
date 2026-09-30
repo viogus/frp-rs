@@ -44,8 +44,8 @@ User-facing release notes for frp-rs.
   documented frp-rs extension and still warns on stderr). `frps verify` with no
   `-c` prints `frps: the configuration file is not specified` and exits 0, which
   is Go's own behaviour for frps's empty `-c` default. As on Go, the command
-  reads only the config path and the strict flag and accepts-and-ignores every
-  other root flag **frp-rs models** (`--bind-port`, `--allow-unsafe`,
+  reads only the config path, the strict flag and `--allow-unsafe`, and
+  accepts-and-ignores every other root flag **frp-rs models** (`--bind-port`,
   `--version`, …) — the qualifier is the precise claim, because a flag frp-rs
   models as a different *kind* is still not inert: the bare `--dashboard-tls-mode`
   spelling is read as `true` here where Go needs an argument (recorded in

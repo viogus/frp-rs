@@ -5161,18 +5161,39 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   ignored, and the gate is fail-closed: `--allow-unsafe WrongFeature` is rc 1 (was rc 0). The
   daemon path is untouched and still exits 3 `EXIT_AUTH` on the same config, the documented
   frp-rs extension over Go's rc 1; that divergence is stated in the pins' doc tables
-  (`frps/tests/cli_exit_codes.rs:262-270`, `frpc/tests/cli_exit_codes.rs:376-383`) rather than
+  (`frps/tests/cli_exit_codes.rs:273-281`, `frpc/tests/cli_exit_codes.rs:376-384`) rather than
   moved. Every row above now has a measured pin:
-  `verify_runs_the_post_load_allow_unsafe_gate_like_go` in `frps/tests/cli_exit_codes.rs:282`
-  and `frpc/tests/cli_exit_codes.rs:392`, plus the loader-level
+  `verify_runs_the_post_load_allow_unsafe_gate_like_go` in `frps/tests/cli_exit_codes.rs:293`
+  and `frpc/tests/cli_exit_codes.rs:395`, plus the loader-level
   `check_client_unsafe_features_gates_both_token_source_spellings` in
-  `frp-core/src/config/tests.rs` for the `auth.oidc.tokenSource` spelling, which has no
-  measured Go row of its own. Teeth: `Ok(())` for either checked wrapper reds the spawn pin's
-  refuse row (`frps/tests/cli_exit_codes.rs:297:5`, `frpc/tests/cli_exit_codes.rs:406:5`),
+  `frp-core/src/config/tests.rs` for the `auth.oidc.tokenSource` spelling, which this round's
+  probe table does not cover separately but Go gates through `validateOIDCConfig`
+  (`pkg/config/v1/validation/client.go`), so it is an exact-parity arm.
+  Teeth: `Ok(())` for either checked wrapper reds the spawn pin's refuse row
+  (`frps/tests/cli_exit_codes.rs:308:5`, `frpc/tests/cli_exit_codes.rs:409:5`),
   widening the predicate to `unsafe_features.is_empty()` reds the fail-closed row
-  (`frps/tests/cli_exit_codes.rs:340:5`, `frpc/tests/cli_exit_codes.rs:451:5`), and deleting
+  (`frps/tests/cli_exit_codes.rs:351:5`, `frpc/tests/cli_exit_codes.rs:454:5`), and deleting
   the `auth.oidc_token_source` arm reds `frp-core/src/config/tests.rs:10429:14` (the
   `.expect_err` line; the round-1 review measured this head).
+
+  **Round-1 review fixes (`b9ab5473` F1, `436a8130` F5).** Round 1 blocked on a regression
+  this fix introduced: `allow_unsafe_parser()` was declared without `.many()`, so a repeated
+  `--allow-unsafe` was refused (`Error: argument `--allow-unsafe` cannot be used multiple
+  times in this context`, rc 1) on `frps verify`, `frpc verify` and the run paths, where Go's
+  pflag appends and the pre-fix `verify` had accepted it. It is now `.many()` plus a flatten of
+  each trimmed comma-split occurrence, matching Go v0.71.0 on all three surfaces
+  (`--allow-unsafe WrongFeature --allow-unsafe TokenSourceExec` rc 0 in both value orders,
+  `--allow-unsafe Ignored,TokenSourceExec` rc 0, `WrongFeature` alone rc 1, no flag rc 1).
+  Pins: `allow_unsafe_appends_and_comma_splits_on_every_reading_surface`
+  (`frp-core/src/cli.rs:5134`) and three extra rows per binary inside
+  `verify_runs_the_post_load_allow_unsafe_gate_like_go`; teeth: a last-wins mutant reds
+  `frp-core/src/cli.rs:5154:9`, `frps/tests/cli_exit_codes.rs:382:9` and
+  `frpc/tests/cli_exit_codes.rs:485:9`, while removing `.many()` does not compile
+  (`frp-core/src/cli.rs:2621`, `E0599`/`E0631` — the closure's `Vec<String>` type is the
+  enforcement, so that mutation is killed by the checker rather than by a failing assertion).
+  F5: the comment in `frp-core/src/config/file.rs:167-197` now names both spellings and Go's
+  `validateOIDCConfig` (`pkg/config/v1/validation/client.go`), which gates
+  `auth.oidc.tokenSource` exec identically — an exact-parity arm, not an unmeasured one.
 - [x] **`frpc verify`'s success line is not Go's, and now differs from `frps verify`'s too.**
   Recorded as "a second, adjacent divergence left alone" by the output-shape round
   (`docs/developing.md` § Output stream and shape on a config-load failure) and mentioned in
@@ -5658,7 +5679,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   they still expected `4` (`test result: ok. 4 passed`, `[ "$n" = "4" ]`), and the log shows both
   `Running tests/cli_exit_codes.rs` and `test result: ok. 5 passed; 0 failed` — so those two `4`
   literals were the only red, and the guard failed closed (`:272`). The test that moved the count
-  is `space_form_strict_config_warns_on_stderr` (`frps/tests/cli_exit_codes.rs:282`), which the
+  is `space_form_strict_config_warns_on_stderr` (`frps/tests/cli_exit_codes.rs:844`), which the
   step's own comment names at `:232`.
   Two comments in that file are stale at this head:
   * `ci.yml:300` — the `tiny` lane's comment opens "Same three checks as the step above" and
