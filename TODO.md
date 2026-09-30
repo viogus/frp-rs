@@ -7823,15 +7823,18 @@ section; ledger now **24 open / 104 closed**.**
 
 - [ ] **`scripts/tests/repo-health-fixtures.sh` cannot detect its own neutering — the hole the compat guard's `MIN_CHECKS` just closed.**
   Filed by the coordinator from the `test-harness-strays` round-2 adversarial round (read at
-  `506f9465`). The suite ends with a bare `exit "$fail"` (`scripts/tests/repo-health-fixtures.sh:733`)
+  `506f9465`). The suite ends with a bare `exit "$fail"` (`scripts/tests/repo-health-fixtures.sh:371`)
   and keeps no total-count floor, so a regression that stops the scenarios from running still reports
   green in the `health` job. The measured shapes (round-2 adversarial, on copies): an early `exit 0`
   after the `RC_PY` preflight (`:78`) exits 0 with **no output at all**, so no `RESULT:` line exists;
-  a scenario body emptied still exits 0 printing `RESULT: 17 fixture check(s) hold`; only a suite that
-  runs no check at all prints `RESULT: 0`. The guard suite added by the same
-  branch now pins the invariant from a trap installed before its first assertion (`MIN_CHECKS=21`,
-  `scripts/tests/compat-stray-guard.sh:85`, message `suite exited 0 after only N check(s); expected
-  at least 21 — scenarios did not run`).
+  a scenario body emptied still exits 0, printing `RESULT: 17 fixture check(s) hold` for scenario 4
+  (18 for scenario 1); only a suite that runs no check at all prints `RESULT: 0`. The guard suite added by the same
+  branch now pins the invariant from a trap installed before its first assertion
+  (`MIN_CHECKS=21`, `scripts/tests/compat-stray-guard.sh:69`, checked at `:84-88` with the message
+  `suite exited 0 after only N check(s); expected at least 21 — scenarios did not run`) — and the
+  round-2 re-check showed that floor is itself bypassable from inside the file (`exec true` skips the
+  EXIT trap; `MIN_CHECKS=0` disables it), which is why the hardening round moves the assertion to
+  `.github/workflows/ci.yml:112`.
   **Done-when:** `scripts/tests/repo-health-fixtures.sh` enforces its own floor the same way (trap
   installed before the first `ok`/`bad`, the floor equal to the current check count), and emptying a
   scenario body — or inserting an early `exit 0` — reds the suite.
