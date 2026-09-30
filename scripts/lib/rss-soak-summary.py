@@ -63,7 +63,24 @@ COLUMNS = [
 # (SOAK_RSS_CEILING_KB), so a well-formed artifact never contains one; the check
 # is repeated here because the reader must also be safe against an artifact it
 # did not produce.
-DEFAULT_RSS_CEILING_KB = 104857600  # 100 GiB
+#
+# This is the FALLBACK for an artifact that does not record its own ceiling (an
+# older series, or a hand-written one). A `meta` record carrying `rss_ceiling_kb`
+# wins over both this and the ambient SOAK_RSS_CEILING_KB, so a published
+# artifact is judged by the bound it was produced under and cannot read
+# "completed" in one environment and rc 3 in another.
+#
+# 1 GiB, down from the previous 100 GiB. The committed memory baselines put a
+# real reading far below that: scripts/frp-stress/baselines/memory-Mac.jsonl
+# records rss_kb_frps / rss_kb_frpc of 17328/16176 (idle, plain), 29776/28880
+# (idle, encrypt), 17424/15440 (churn, plain) and 27312/17728 (churn, encrypt)
+# — a 15.4-29.8 MB band, i.e. 1 GiB is still ~35x the largest ever observed
+# here. It leaves room for a longer window and for a workload heavier than any
+# committed baseline while refusing the bands a stub actually produced — a
+# fabricated ~99.2 GiB band was accepted under the old default, and a ~84 TiB
+# one was accepted with the knob raised to vacuity. See
+# scripts/frp-stress/baselines/README.md for the full rationale.
+DEFAULT_RSS_CEILING_KB = 1048576  # 1 GiB
 # Absolute achieved-load floor. Far below what the default recipe produces in the
 # shortest allowed window (60 s: ~2400 churn round trips, hundreds of MiB of
 # steady traffic per side), so it only fires on a run that moved almost nothing.
@@ -160,12 +177,28 @@ def main(argv):
     # (fmean([]) would raise).
     window = max(1, 3600 // max(1, int(meta.get("interval_s") or 45)))
 
-    try:
-        rss_ceiling = int(os.environ.get("SOAK_RSS_CEILING_KB") or DEFAULT_RSS_CEILING_KB)
-    except ValueError:
-        rss_ceiling = DEFAULT_RSS_CEILING_KB
-    if rss_ceiling <= 0:
-        rss_ceiling = DEFAULT_RSS_CEILING_KB
+    # The artifact's OWN recorded ceiling wins over the ambient environment: the
+    # bound a run was produced under is part of its evidence, and re-reading the
+    # same artifact under a different SOAK_RSS_CEILING_KB must not flip its
+    # verdict (the same file used to read "completed" here and rc 3
+    # "implausible RSS reading(s) ignored" there). Env, then the default, is only
+    # the fallback for an artifact that records none.
+    recorded_ceiling = meta.get("rss_ceiling_kb")
+    if (isinstance(recorded_ceiling, int) and not isinstance(recorded_ceiling, bool)
+            and recorded_ceiling > 0):
+        rss_ceiling = recorded_ceiling
+        ceiling_source = "artifact meta"
+    else:
+        env_ceiling = os.environ.get("SOAK_RSS_CEILING_KB")
+        ceiling_source = "environment" if env_ceiling else "default"
+        try:
+            rss_ceiling = int(env_ceiling or DEFAULT_RSS_CEILING_KB)
+        except ValueError:
+            rss_ceiling = DEFAULT_RSS_CEILING_KB
+            ceiling_source = "default"
+        if rss_ceiling <= 0:
+            rss_ceiling = DEFAULT_RSS_CEILING_KB
+            ceiling_source = "default"
 
     def usable_rss(value):
         """A reading that could be a real process RSS, else None. Rejects a bool
@@ -213,6 +246,18 @@ def main(argv):
             traffic[name] = None
 
     problems = []
+    # The verdict is monotonic: an artifact that already carries an aborted
+    # summary stays aborted. The reader re-derives `aborted` from its inputs and
+    # APPENDS a summary, so without this a later invocation with healthy traffic
+    # rows (or with the faulty rows trimmed) would append "run completed" behind
+    # the death verdict, and a consumer that takes the last summary is misled.
+    # The generator clears $OUT before the window opens, so a normal run is
+    # unaffected; only a re-read/re-run over a live artifact can see this.
+    for prior in rows:
+        if prior.get("kind") == "summary" and prior.get("aborted"):
+            problems.append(
+                f"a previous summary already aborted this artifact ({prior['aborted']})"
+            )
     if aborted:
         problems.append(aborted)
 
@@ -318,6 +363,8 @@ def main(argv):
         "samples": len(samples),
         "aborted": aborted or None,
         "run_dir": meta.get("run_dir"),
+        "rss_ceiling_kb": rss_ceiling,
+        "rss_ceiling_source": ceiling_source,
         "load1": {"min": min(loads), "max": max(loads), "mean": round(statistics.fmean(loads), 2)} if loads else None,
         "time_wait": {"min": min(waits), "max": max(waits), "mean": round(statistics.fmean(waits), 1)} if waits else None,
         "traffic": traffic,
@@ -338,6 +385,7 @@ def main(argv):
         print(f"{label:<12} {fmt(b.get('first')):>8} {fmt(b.get('last')):>8} {fmt(b.get('min')):>8} "
               f"{fmt(b.get('max')):>8} {fmt(b.get('mean')):>9} {fmt(b.get('first_hour_mean')):>11} "
               f"{fmt(b.get('last_hour_mean')):>12}")
+    print(f"RSS ceiling: {rss_ceiling} KB (from {ceiling_source})")
     print(f"samples: {len(samples)}; " + (f"ABORTED: {aborted}" if aborted else "run completed"))
     if summary["load1"]:
         print(f"host load1: min {summary['load1']['min']} mean {summary['load1']['mean']} max {summary['load1']['max']}")

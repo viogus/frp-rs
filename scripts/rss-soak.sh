@@ -84,12 +84,17 @@
 #                         the summary's `spread > tolerance` test is silently
 #                         disabled by `nan` (compares false with everything).
 #   SOAK_RSS_CEILING_KB   largest RSS reading accepted as real (default
-#                         104857600 = 100 GiB). A value outside 1..ceiling, or a
+#                         1048576 = 1 GiB). A value outside 1..ceiling, or a
 #                         non-integer, is recorded as `null` (a missing reading)
 #                         rather than published: a stubbed or misparsing `ps`
 #                         that prints a constant, 0, or a huge number must not
 #                         produce a "perfectly flat" series. The reader applies
-#                         the same bound to an artifact it did not produce.
+#                         the artifact's OWN recorded ceiling to an artifact it
+#                         did not produce, so the verdict does not change with
+#                         the reader's environment; this variable is only the
+#                         fallback for an artifact that records none. The
+#                         default is justified by the committed baselines in
+#                         scripts/frp-stress/baselines/README.md.
 #
 # Output: scripts/frp-stress/baselines/rss-soak-<hostname>.jsonl
 #   one JSON object per line: one `meta` record, N `sample` records, one
@@ -253,7 +258,7 @@ validate_count SOAK_MSG_BYTES "$MSG_BYTES" 1
 TOLERANCE="${SOAK_TRAFFIC_TOLERANCE:-0.10}"
 rss_soak_validate_tolerance "$TOLERANCE" || exit 1
 export SOAK_TRAFFIC_TOLERANCE="$TOLERANCE"
-RSS_CEILING_KB="${SOAK_RSS_CEILING_KB:-104857600}"
+RSS_CEILING_KB="${SOAK_RSS_CEILING_KB:-1048576}"
 validate_count SOAK_RSS_CEILING_KB "$RSS_CEILING_KB" 1
 export SOAK_RSS_CEILING_KB="$RSS_CEILING_KB"
 
@@ -680,14 +685,20 @@ rss_soak_clear_run_artifacts "$RUN_DIR" "$OUT" || { echo "error: cannot clear ru
 start_epoch=$(date +%s)
 start_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 started_load=$(load1)
-printf '{"kind":"meta","started_utc":"%s","duration_s":%s,"interval_s":%s,"generator_duration_s":%s,"host":"%s","platform":"%s","cpu_cores":%s,"frp_rs_version":"%s","frp_rs_sha":"%s","frp_rs_dirty":%s,"harness_sha256":{"rss_soak_sh":"%s","run_dir_sh":"%s","summary_py":"%s","frp_stress_tree":"%s"},"rs_bin_source":"%s","run_dir":"%s","go_frp_version":"%s","go_frp_dir":"%s","rs_bin":"%s","rs_frpc_bin":"%s","traffic":{"churn_connections":%s,"churn_rate_per_stack":%s,"churn_msg_bytes":%s,"steady_streams":%s,"steady_mbps_per_stream":%s,"generator":"frp-stress","proxy_type":"tcp"},"ports":{"rs_control":%s,"rs_remote":%s,"rs_echo":%s,"go_control":%s,"go_remote":%s,"go_echo":%s},"bin_sha256":{"rs_frps":"%s","rs_frpc":"%s","go_frps":"%s","go_frpc":"%s"},"load1_start":%s,"caveats":["RSS is not live heap; it includes allocator retention and page-cache effects","both stacks share this host, so a machine-level effect moves both series","the per-sample time_wait count is host-wide, not per-side","identical offered recipe, not guaranteed identical achieved volume; per-side achieved volume is recorded and compared, and a spread beyond SOAK_TRAFFIC_TOLERANCE aborts the run","one TCP proxy per stack; other proxy types and encryption/compression/mux paths are not exercised"]}\n' \
+# The meta record is written by the shared, fixture-covered writer
+# (rss_soak_write_meta in scripts/lib/rss-soak-run-dir.sh): it JSON-escapes
+# every string field — notably $RUN_DIR, the binary paths and the host name —
+# and records $RSS_CEILING_KB so the artifact carries the bound it was produced
+# under. The reader prefers that recorded ceiling over its own environment, so
+# the same artifact gets the same verdict anywhere.
+rss_soak_write_meta "$OUT" \
   "$start_utc" "$DURATION" "$INTERVAL" "$GEN_DURATION" "$(hostname -s)" "$go_platform" "$cpu_cores" \
   "$rs_version" "$rs_sha" "$rs_dirty" "$soak_sha" "$run_dir_lib_sha" "$summary_py_sha" "$stress_tree_sha" "$RS_BIN_SOURCE" "$RUN_DIR" \
   "$go_version" "$GO_DIR" "$RS_FRPS" "$RS_FRPC" \
   "$CHURN_CONNS" "$CHURN_RATE" "$MSG_BYTES" "$STREAMS" "$STREAM_MBPS" \
   "$RS_PORT" "$RS_REMOTE" "$RS_ECHO" "$GO_PORT" "$GO_REMOTE" "$GO_ECHO" \
   "$rs_frps_sha" "$rs_frpc_sha" "$go_frps_sha" "$go_frpc_sha" \
-  "$started_load" >> "$OUT"
+  "$started_load" "$RSS_CEILING_KB" || { echo "error: cannot write meta to $OUT" >&2; exit 1; }
 
 echo "=== soak running: $(date -u +%H:%M:%SZ), load1=$started_load ==="
 aborted=""
@@ -762,7 +773,7 @@ while :; do
   if [ "$elapsed" -ge "$DURATION" ]; then break; fi
 
   printf '{"kind":"sample","elapsed_s":%s,"ts":"%s","load1":%s,"time_wait":%s,"frp_rs_frps_kb":%s,"frp_rs_frpc_kb":%s,"go_frps_kb":%s,"go_frpc_kb":%s}\n' \
-    "$elapsed" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(load1)" "$(time_wait_count)" \
+    "$elapsed" "$(rss_soak_json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")" "$(load1)" "$(time_wait_count)" \
     "$(rss_kb "$RS_FRPS_PID")" "$(rss_kb "$RS_FRPC_PID")" \
     "$(rss_kb "$GO_FRPS_PID")" "$(rss_kb "$GO_FRPC_PID")" >> "$OUT"
   samples=$((samples + 1))
@@ -796,6 +807,21 @@ if [ -z "$aborted" ]; then
     fi
     sleep 2
   done
+fi
+
+# A death AFTER the window closes does not invalidate the samples already taken,
+# but it must still be recorded. Nothing else looks at the frp processes between
+# the window-end break and the summary, so a `kill -9` during the generator tail
+# used to leave no trace at all: the series is complete and the run said "run
+# completed". The frp processes and echo backends have no self-imposed end, so
+# they are re-scanned here (generators are excluded — they are expected to have
+# exited by now, which is what the tail above waited for).
+if [ -z "$aborted" ]; then
+  scan_dead 0
+  if [ -n "$DEAD_SEEN" ]; then
+    aborted="process died after the window closed: ${DEAD_SEEN}"
+    echo "error: $aborted" >&2
+  fi
 fi
 
 # ---------------------------------------------------------------- teardown

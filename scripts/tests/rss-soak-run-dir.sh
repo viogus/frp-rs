@@ -15,7 +15,7 @@
 #     stream, neither of which used to abort the run.
 #
 # It exercises the real `rss_soak_prepare_run_dir` / `rss_soak_clear_run_artifacts`
-# / `rss_soak_validate_window` / `rss_soak_rss_kb` from
+# / `rss_soak_validate_window` / `rss_soak_rss_kb` / `rss_soak_write_meta` from
 # `scripts/lib/rss-soak-run-dir.sh` and the real reader
 # `scripts/lib/rss-soak-summary.py` against synthetic directories. No network, no
 # built binary and no real traffic, so it is safe and fast in the `health` job.
@@ -25,6 +25,13 @@
 # artifact whose columns are all one value, implausible magnitudes, a `nan`
 # tolerance that disabled the achieved-load check, one binary on both sides, and
 # degenerate totals.
+#
+# Round 4 adds: the JSON escaping of the meta writer (a `"`/`\` in the run dir
+# used to make the line unparseable and silently drop run_dir, the digests, the
+# ports and the same-binary guard), the artifact's own recorded RSS ceiling
+# taking precedence over the reader's environment, the one-reading abort path,
+# a monotonic (sticky) abort verdict, the 1 GiB default ceiling, and a marker per
+# scenario so a deleted case cannot be hidden by padding the check count.
 
 set -uo pipefail
 
@@ -37,17 +44,33 @@ SUMMARY="$ROOT/scripts/lib/rss-soak-summary.py"
 # early past one) leaves every remaining assertion green, so without this the
 # suite cannot detect its own neutering. Enforced from the EXIT trap below, which
 # is installed before the first assertion, and again explicitly before RESULT.
-MIN_CHECKS=67
+MIN_CHECKS=114
+# MIN_CHECKS is a COUNT and a count is not an identity: deleting case 6 and
+# padding with three dummy `ok` calls restored the floor while the constant
+# column — one of the two shapes this suite exists to refuse — went untested.
+# Each section/case therefore also leaves a marker, and the suite asserts that
+# every expected marker is present at the end. A deleted or skipped case loses
+# its marker even when the total count still clears the floor.
 
 checks=0
 fails=0
 floor_armed=1
 work=$(mktemp -d "${TMPDIR:-/tmp}/rss-soak-fixture.XXXXXX")
+MARKERS="$work/markers.log"
+: > "$MARKERS"
 cleanup() { rm -rf -- "$work"; }
 
 ok() { checks=$((checks + 1)); printf '  ok    %s\n' "$1"; }
 bad() { checks=$((checks + 1)); fails=$((fails + 1)); printf '  FAIL  %s\n' "$1"; }
 hdr() { printf '%s\n' "$1"; }
+mark() { printf '%s\n' "$1" >> "$MARKERS"; }
+require_marker() { # <name>
+    if grep -qxF -- "$1" "$MARKERS" 2>/dev/null; then
+        ok "scenario ran: $1"
+    else
+        bad "scenario missing: $1 (its checks were deleted or skipped)"
+    fi
+}
 
 floor_check() {
     [ "$floor_armed" = 1 ] || return 0
@@ -77,6 +100,7 @@ fi
 
 # --------------------------------------------------------------- run-dir guard
 hdr 'run directory guard'
+mark run-dir-guard
 
 if out=$(rss_soak_prepare_run_dir "" "$work/out.jsonl" 2>/dev/null); then
     bad 'prepare refuses an empty run dir'
@@ -130,6 +154,7 @@ if [ -e "$run/unrelated.txt" ]; then ok 'clear leaves unrelated files alone'; el
 
 # ------------------------------------------------------ window / tolerance
 hdr 'window and tolerance validators'
+mark window-tolerance
 
 if rss_soak_validate_window abc 30 >/dev/null 2>&1; then bad 'window refuses a non-numeric duration'; else ok 'window refuses a non-numeric duration'; fi
 if rss_soak_validate_window 59 30 >/dev/null 2>&1; then bad 'window refuses a duration below 60'; else ok 'window refuses a duration below 60'; fi
@@ -146,6 +171,7 @@ if rss_soak_validate_tolerance 0.10 >/dev/null 2>&1; then ok 'tolerance accepts 
 # the file and writes its pid in two steps, and stealing the lock in between
 # starts a second soak on the same ports.
 hdr 'lock policy'
+mark lock-policy
 
 empty_lock="$work/empty.lock"
 : > "$empty_lock"
@@ -164,15 +190,67 @@ lock_rc=$?
 expect_rc 1 "$lock_rc" 'a lock held by a live pid refuses a second soak'
 if printf '%s' "$lock_out" | grep -q 'already running'; then ok 'the live holder is named'; else bad 'the live holder was not named'; fi
 
+# ---------------------------------------------- meta writer (JSON escaping)
+# The `meta` record is JSON Lines and interpolates operator-supplied strings.
+# A `"` or `\` in the run dir (or a binary path, or the host name) used to make
+# the line unparseable, and the reader SILENTLY SKIPS an unparseable line: the
+# artifact lost run_dir, harness_sha256, bin_sha256, the ports and the recipe,
+# the identical-binaries guard never ran, and the run still printed
+# "run completed". These checks push such a string through the REAL writer
+# (rss_soak_write_meta) and parse the line back.
+hdr 'meta writer (JSON escaping)'
+mark meta-writer
+
+nasty_dir="$work/nasty\"dir\\x"
+nasty_bin="$work/bin\"q\\b/frps"
+nasty_host=$(printf 'host"name\ttab')
+nasty_meta="$work/nasty-meta.jsonl"
+if rss_soak_write_meta "$nasty_meta" \
+    '2026-01-01T00:00:00Z' 300 45 320 "$nasty_host" darwin 8 "0.71.0" deadbeef false \
+    h1 h2 h3 h4 'built-here' "$nasty_dir" "0.71.0" "$work/go\"dir" "$nasty_bin" "$work/frpc" \
+    8 40 64 3 5 18100 18101 18102 18200 18201 18202 \
+    aa bb cc dd 1.5 1048576; then
+    ok 'the writer accepts quotes and backslashes in its string fields'
+else
+    bad 'the writer refused a well-formed call'
+fi
+if python3 -c 'import json,sys
+m=json.loads(open(sys.argv[1]).read().splitlines()[0])
+sys.exit(0 if (m["run_dir"]==sys.argv[2] and m["rs_bin"]==sys.argv[3]
+               and m["host"]==sys.argv[4] and m["go_frp_dir"]==sys.argv[5]
+               and m["rss_ceiling_kb"]==1048576) else 1)' \
+        "$nasty_meta" "$nasty_dir" "$nasty_bin" "$nasty_host" "$work/go\"dir"; then
+    ok 'the meta line parses back to the same quoted paths and the ceiling'
+else
+    bad 'the meta line from a quoted run dir is not valid JSON or lost its values'
+fi
+if python3 -c 'import json,sys
+json.loads(open(sys.argv[1]).read().splitlines()[0])' "$nasty_meta" >/dev/null 2>&1; then
+    ok 'the reader (json) can parse the meta line it was handed'
+else
+    bad 'the meta line is invalid JSON (JSONDecodeError)'
+fi
+if rss_soak_write_meta "$work/bad-meta.jsonl" one two >/dev/null 2>&1; then
+    bad 'the writer accepted a truncated argument list'
+else
+    ok 'the writer refuses a truncated argument list'
+fi
+if [ -e "$work/bad-meta.jsonl" ]; then
+    bad 'a refused meta write still created the artifact'
+else
+    ok 'a refused meta write appends nothing'
+fi
+
 # ------------------------------------------------------- summary reader (real)
 hdr 'summary reader'
+mark summary-reader
 
 summary() { # <artifact> <aborted> <rs-churn> <go-churn> <rs-steady> <go-steady>
     python3 "$SUMMARY" "$@" > "$1.stdout" 2>&1
     return $?
 }
 
-artifact() { # <path> <run_dir> <mode: rising|nulls|const|huge|falling> [extra-meta-json]
+artifact() { # <path> <run_dir> <mode: rising|nulls|const|huge|falling|single|big2g> [extra-meta-json]
     local path="$1" dir="$2" mode="$3" extra="${4:-}" i kb
     printf '{"kind":"meta","duration_s":300,"interval_s":45,"run_dir":"%s","frp_rs_sha":"deadbeef"%s}\n' \
         "$dir" "$extra" > "$path"
@@ -183,6 +261,11 @@ artifact() { # <path> <run_dir> <mode: rising|nulls|const|huge|falling> [extra-m
             const)   kb=1234 ;;
             huge)    kb=999999999 ;;
             nulls)   kb="" ;;
+            # ~1.9 GiB: above the 1 GiB default the reader falls back to, below
+            # the old 100 GiB default.
+            big2g)   kb=2000000 ;;
+            # Exactly ONE sample: one reading per column cannot show stability.
+            single)  [ "$i" = 0 ] || break; kb=12000 ;;
             *) bad "unknown artifact mode '$mode'"; return 1 ;;
         esac
         if [ -z "$kb" ]; then
@@ -219,6 +302,7 @@ run_summary() { # <dir> <mode> [extra-meta] [aborted]
 # 1. A run whose generators died early: the rows on disk predate the run, and
 #    the soak clears them before the window opens. The summary must then abort
 #    and must not publish the earlier run's numbers.
+mark summary-case-01
 stale="$work/stale"
 stale_abs=$(rss_soak_prepare_run_dir "$stale" "$stale/out.jsonl")
 traffic_rows "$stale" 2376 999999
@@ -236,6 +320,7 @@ expect_no_grep 'run completed' "$stale/out.jsonl.stdout" 'not printed as complet
 
 # 2. No RSS readings at all (a stubbed `ps`): abort, and never print a reading
 #    that was not measured.
+mark summary-case-02
 norss="$work/norss"
 norss_abs=$(rss_soak_prepare_run_dir "$norss" "$norss/out.jsonl")
 artifact "$norss/out.jsonl" "$norss_abs" nulls
@@ -250,6 +335,7 @@ expect_no_grep 'run completed' "$norss/out.jsonl.stdout" 'not printed as complet
 
 # 3. A run with readings and symmetric traffic completes, and its summary carries
 #    the computed trend rather than relying on an eyeball.
+mark summary-case-03
 good="$work/good"
 good_abs=$(rss_soak_prepare_run_dir "$good" "$good/out.jsonl")
 artifact "$good/out.jsonl" "$good_abs" rising
@@ -270,6 +356,7 @@ else
 fi
 
 # 4. One side was handed half the work: not head-to-head, so abort.
+mark summary-case-04
 gap="$work/gap"
 gap_abs=$(rss_soak_prepare_run_dir "$gap" "$gap/out.jsonl")
 artifact "$gap/out.jsonl" "$gap_abs" rising
@@ -283,6 +370,7 @@ expect_rc 3 "$?" 'a one-sided traffic gap -> abort'
 expect_grep 'differs by' "$gap/out.jsonl" 'the gap is named as the abort reason'
 
 # 5. A steady path that lost a stream: the run is torn, so abort.
+mark summary-case-05
 torn="$work/torn"
 torn_abs=$(rss_soak_prepare_run_dir "$torn" "$torn/out.jsonl")
 artifact "$torn/out.jsonl" "$torn_abs" rising
@@ -298,6 +386,7 @@ expect_grep 'lost 2 stream' "$torn/out.jsonl" 'the torn path is named'
 # 6. `ps` printing a constant: every reading is well-formed, but a whole column
 #    that never moves is the shape of an UNMEASURED line, not of a stable
 #    process. This is the "perfectly flat" artifact a stubbed `ps` produced.
+mark summary-case-06
 const="$work/const"
 const_abs=$(rss_soak_prepare_run_dir "$const" "$const/out.jsonl")
 artifact "$const/out.jsonl" "$const_abs" const
@@ -311,6 +400,7 @@ expect_no_grep 'run completed' "$const/out.jsonl.stdout" 'a constant column is n
 # 7. Well-formed but implausible magnitudes (a hand-made artifact, or `ps`
 #    returning nonsense): refused by the reader even though the generator would
 #    never have written them.
+mark summary-case-07
 huge="$work/huge"
 huge_abs=$(rss_soak_prepare_run_dir "$huge" "$huge/out.jsonl")
 artifact "$huge/out.jsonl" "$huge_abs" huge
@@ -322,6 +412,7 @@ expect_grep 'implausible RSS reading' "$huge/out.jsonl" 'the implausible reading
 
 # 8. A `nan` tolerance used to slip past float() and disable the achieved-load
 #    reconciliation while the run still reported "run completed".
+mark summary-case-08
 nan="$work/nan"
 nan_abs=$(rss_soak_prepare_run_dir "$nan" "$nan/out.jsonl")
 artifact "$nan/out.jsonl" "$nan_abs" rising
@@ -337,6 +428,7 @@ expect_no_grep 'NaN' "$nan/out.jsonl" 'NaN is never recorded as a tolerance'
 
 # 9. The same binary on both sides is not a comparison. The soak refuses this
 #    before the window opens; a hand-edited artifact must not present it either.
+mark summary-case-09
 same="$work/same"
 same_abs=$(rss_soak_prepare_run_dir "$same" "$same/out.jsonl")
 artifact "$same/out.jsonl" "$same_abs" rising \
@@ -349,6 +441,7 @@ expect_grep 'same binary' "$same/out.jsonl" 'the shared binary is named'
 
 # 10. A run that moved almost nothing did measure something, but not enough to
 #     support any comparison: refused by an absolute floor.
+mark summary-case-10
 tiny="$work/tiny"
 tiny_abs=$(rss_soak_prepare_run_dir "$tiny" "$tiny/out.jsonl")
 artifact "$tiny/out.jsonl" "$tiny_abs" rising
@@ -361,6 +454,7 @@ expect_grep 'moved only 1 bytes' "$tiny/out.jsonl" 'the steady floor is named'
 
 # 11. A DECREASING series must produce a negative slope. A sign error in the
 #     trend computation otherwise leaves every "no growth" statement intact.
+mark summary-case-11
 fall="$work/fall"
 fall_abs=$(rss_soak_prepare_run_dir "$fall" "$fall/out.jsonl")
 artifact "$fall/out.jsonl" "$fall_abs" falling
@@ -378,8 +472,104 @@ else
     bad 'the trend did not report the falling series as falling'
 fi
 
+# 12. Exactly one reading per column is not a series: a single point cannot show
+#     that anything is stable. Columns with fewer than two readings used to be
+#     skipped, so this artifact printed "run completed".
+mark summary-case-12
+one="$work/one"
+one_abs=$(rss_soak_prepare_run_dir "$one" "$one/out.jsonl")
+artifact "$one/out.jsonl" "$one_abs" single
+traffic_rows "$one" 600 2000000
+summary "$one/out.jsonl" "" "$one/rs-churn.json" "$one/go-churn.json" \
+    "$one/rs-steady.json" "$one/go-steady.json"
+expect_rc 3 "$?" 'a single RSS reading per column -> abort'
+expect_grep 'has only 1 RSS reading' "$one/out.jsonl" 'the lone reading is named'
+expect_grep '"samples": 1' "$one/out.jsonl" 'the summary counted exactly one sample'
+expect_no_grep 'run completed' "$one/out.jsonl.stdout" 'one reading is not completed'
+
+# 13. The artifact's OWN recorded ceiling wins over the reader's environment.
+#     This series was produced under a 40000 KB ceiling and its readings sit
+#     under it, so a reader whose SOAK_RSS_CEILING_KB is a hostile 1 KB must
+#     still accept it. Before the fix the ceiling came from the env alone, so the
+#     SAME artifact read "run completed" here and rc 3 "implausible" there.
+mark summary-case-13
+ceil="$work/ceil"
+ceil_abs=$(rss_soak_prepare_run_dir "$ceil" "$ceil/out.jsonl")
+artifact "$ceil/out.jsonl" "$ceil_abs" rising ',"rss_ceiling_kb":40000'
+traffic_rows "$ceil" 600 2000000
+export SOAK_RSS_CEILING_KB=1
+summary "$ceil/out.jsonl" "" "$ceil/rs-churn.json" "$ceil/go-churn.json" \
+    "$ceil/rs-steady.json" "$ceil/go-steady.json"
+ceil_rc=$?
+unset SOAK_RSS_CEILING_KB
+expect_rc 0 "$ceil_rc" 'the artifact ceiling beats a hostile-low ambient env'
+expect_grep 'from artifact meta' "$ceil/out.jsonl.stdout" 'the ceiling source is the artifact'
+expect_grep '"rss_ceiling_kb": 40000' "$ceil/out.jsonl" 'the summary records the artifact ceiling'
+
+# 14. ... and the ambient env cannot RAISE it either: this artifact records a
+#     10000 KB ceiling while its readings are ~12-32 MB, so it must abort even
+#     though the reader's default ceiling (1 GiB) would have accepted them.
+mark summary-case-14
+lowceil="$work/lowceil"
+lowceil_abs=$(rss_soak_prepare_run_dir "$lowceil" "$lowceil/out.jsonl")
+artifact "$lowceil/out.jsonl" "$lowceil_abs" rising ',"rss_ceiling_kb":10000'
+traffic_rows "$lowceil" 600 2000000
+unset SOAK_RSS_CEILING_KB
+summary "$lowceil/out.jsonl" "" "$lowceil/rs-churn.json" "$lowceil/go-churn.json" \
+    "$lowceil/rs-steady.json" "$lowceil/go-steady.json"
+expect_rc 3 "$?" 'an artifact ceiling below its own readings -> abort'
+expect_grep 'outside 1..10000 KB' "$lowceil/out.jsonl" 'the artifact ceiling is the one applied'
+
+# 15. The verdict is monotonic. The reader APPENDS a summary, so re-running it
+#     over an artifact that already aborted used to append "run completed"
+#     behind the death verdict once the traffic rows were healthy (or trimmed):
+#     a consumer that takes the last summary was misled.
+mark summary-case-15
+sticky="$work/sticky"
+sticky_abs=$(rss_soak_prepare_run_dir "$sticky" "$sticky/out.jsonl")
+artifact "$sticky/out.jsonl" "$sticky_abs" rising
+printf '{"round_trips":600,"total_bytes":2000000,"failed_streams":0}\n' > "$sticky/rs-churn.json"
+printf '{"round_trips":600,"total_bytes":2000000,"failed_streams":0}\n' > "$sticky/go-churn.json"
+printf '{"total_bytes":2000000,"failed_streams":0}\n' > "$sticky/rs-steady.json"
+printf '{"total_bytes":2000000,"failed_streams":2}\n' > "$sticky/go-steady.json"
+summary "$sticky/out.jsonl" "" "$sticky/rs-churn.json" "$sticky/go-churn.json" \
+    "$sticky/rs-steady.json" "$sticky/go-steady.json"
+expect_rc 3 "$?" 'the torn run aborts and records the death verdict'
+printf '{"total_bytes":2000000,"failed_streams":0}\n' > "$sticky/go-steady.json"
+summary "$sticky/out.jsonl" "" "$sticky/rs-churn.json" "$sticky/go-churn.json" \
+    "$sticky/rs-steady.json" "$sticky/go-steady.json"
+expect_rc 3 "$?" 'a re-read cannot clear an existing abort verdict'
+expect_grep 'a previous summary already aborted' "$sticky/out.jsonl" 'the prior verdict is named'
+expect_grep 'ABORTED' "$sticky/out.jsonl.stdout" 'the re-read still prints ABORTED'
+expect_no_grep 'run completed' "$sticky/out.jsonl.stdout" 'the re-read does not print run completed'
+if python3 -c 'import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+s=[r for r in rows if r.get("kind")=="summary"]
+sys.exit(0 if len(s)==2 and all(r.get("aborted") for r in s) else 1)' "$sticky/out.jsonl"; then
+    ok 'both appended summaries carry an abort'
+else
+    bad 'an appended summary cleared the abort verdict'
+fi
+
+# 16. The reader's FALLBACK default (for an artifact that records no ceiling of
+#     its own — an older or hand-written series) is 1 GiB, not the old 100 GiB.
+#     These ~1.9 GiB readings must be refused; under the old default they were
+#     accepted and published as a completed run.
+mark summary-case-16
+nob="$work/nob"
+nob_abs=$(rss_soak_prepare_run_dir "$nob" "$nob/out.jsonl")
+artifact "$nob/out.jsonl" "$nob_abs" big2g
+traffic_rows "$nob" 600 2000000
+unset SOAK_RSS_CEILING_KB
+summary "$nob/out.jsonl" "" "$nob/rs-churn.json" "$nob/go-churn.json" \
+    "$nob/rs-steady.json" "$nob/go-steady.json"
+expect_rc 3 "$?" 'an artifact with no recorded ceiling gets the 1 GiB default'
+expect_grep 'outside 1..1048576 KB' "$nob/out.jsonl" 'the 1 GiB fallback default is applied'
+expect_grep 'from default' "$nob/out.jsonl.stdout" 'the ceiling source is the default'
+
 # ------------------------------------------------- rss reading guard (real fn)
 hdr 'rss reading guard'
+mark rss-reading-guard
 
 stub="$work/stub"
 mkdir -p -- "$stub"
@@ -417,6 +607,45 @@ if [ -n "$out" ] && [ "$out" != "null" ] && [ "$out" -gt 0 ] 2>/dev/null; then
 else
     bad "the real ps was not believed for this process (got '$out')"
 fi
+
+# The DEFAULT ceiling is 1 GiB (1048576 KB), justified by the committed memory
+# baselines (real RSS 15-30 MB). These pin it: under the old 100 GiB default a
+# 2000000 KB (~1.9 GiB) reading was accepted, and this fixture used to pass an
+# explicit ceiling everywhere, so the default itself was never exercised.
+stub_ps 'printf "2000000\n"'
+out=$(PATH="$stub:$PATH" rss_soak_rss_kb $$)
+if [ "$out" = "null" ]; then ok 'the default 1 GiB ceiling refuses a ~1.9 GiB reading'; else bad "2000000 yielded '$out' under the default ceiling"; fi
+
+stub_ps 'printf "20000\n"'
+out=$(PATH="$stub:$PATH" rss_soak_rss_kb $$)
+if [ "$out" = "20000" ]; then ok 'the default 1 GiB ceiling accepts a realistic 20 MB reading'; else bad "20000 yielded '$out' under the default ceiling"; fi
+
+# ---------------------------------------------------------------- coverage floor
+# MIN_CHECKS pins a count; these pin the IDENTITY of what ran. A case that is
+# deleted (or skipped by an early return) loses its marker even if the count is
+# padded back over the floor.
+require_marker run-dir-guard
+require_marker window-tolerance
+require_marker lock-policy
+require_marker meta-writer
+require_marker summary-reader
+require_marker summary-case-01
+require_marker summary-case-02
+require_marker summary-case-03
+require_marker summary-case-04
+require_marker summary-case-05
+require_marker summary-case-06
+require_marker summary-case-07
+require_marker summary-case-08
+require_marker summary-case-09
+require_marker summary-case-10
+require_marker summary-case-11
+require_marker summary-case-12
+require_marker summary-case-13
+require_marker summary-case-14
+require_marker summary-case-15
+require_marker summary-case-16
+require_marker rss-reading-guard
 
 floor_check
 printf '\nRESULT: %d fixture check(s) hold\n' "$((checks - fails))"

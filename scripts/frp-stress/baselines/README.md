@@ -45,9 +45,9 @@ One JSON object per line, in three parts:
 
 | `kind` | contents |
 |--------|----------|
-| `meta` | one first line: host, platform, cores, frp-rs version + git sha (with `frp_rs_dirty` covering the soak script, its helpers AND the `scripts/frp-stress` generator sources, `harness_sha256` for each of those parts plus `frp_stress_tree`, and `rs_bin_source` saying whether the measured frp-rs binaries were built here or supplied via `FRPS_BIN`/`FRPC_BIN`), Go frp version + dir, the four binary `sha256` values, the traffic recipe, the ports, the resolved run dir, and an explicit `caveats` list |
+| `meta` | one first line: host, platform, cores, frp-rs version + git sha (with `frp_rs_dirty` covering the soak script, its helpers AND the `scripts/frp-stress` generator sources, `harness_sha256` for each of those parts plus `frp_stress_tree`, and `rs_bin_source` saying whether the measured frp-rs binaries were built here or supplied via `FRPS_BIN`/`FRPC_BIN`), Go frp version + dir, the four binary `sha256` values, the traffic recipe, the ports, the resolved run dir, the RSS ceiling the run was produced under (`rss_ceiling_kb`), and an explicit `caveats` list. Every string field — the run dir, the binary paths, the host name — is JSON-escaped by the writer, so a `"` or `\` in a path cannot make the line unparseable (an unparseable `meta` line is skipped by the reader, which used to drop the digests, the ports and the same-binary guard from a run that still said "run completed") |
 | `sample` | one per interval: `elapsed_s`, UTC `ts`, `load1`, the host-wide `time_wait` socket count, and RSS in KB for all four processes (`null` when the reading was unusable — see below) |
-| `summary` | one last line: per-process `first`/`last`/`min`/`max`/`mean`/`first_hour_mean`/`last_hour_mean`/`growth_pct_first_to_last`, a computed `trend` per process (least-squares `slope_kb_per_hour`, first/last-quarter means, `monotonic_nondecreasing`), achieved `traffic` per side (including `failed_streams`), `achieved_equality` between the two sides, load and TIME_WAIT ranges, and `aborted` |
+| `summary` | one last line: per-process `first`/`last`/`min`/`max`/`mean`/`first_hour_mean`/`last_hour_mean`/`growth_pct_first_to_last`, a computed `trend` per process (least-squares `slope_kb_per_hour`, first/last-quarter means, `monotonic_nondecreasing`), achieved `traffic` per side (including `failed_streams`), `achieved_equality` between the two sides, load and TIME_WAIT ranges, the ceiling the verdict was computed under (`rss_ceiling_kb` and `rss_ceiling_source`), and `aborted` |
 
 **An artifact with no trailing `summary` line is an incomplete run.** That is a
 convention the reader of a series applies, not something the script can test
@@ -99,6 +99,38 @@ Two env knobs tune the refusals above, and both are documented by
   real; the bound is applied by the soak when it samples and again by the
   summary reader, so an artifact produced elsewhere cannot present an
   implausible value as evidence either.
+
+### The RSS ceiling
+
+`SOAK_RSS_CEILING_KB` is a **plausibility bound**, not a measurement of what the
+processes do: a reading outside it is recorded as a missing reading, never
+published. The run writes the bound it used into the artifact as
+`rss_ceiling_kb`, and the summary reader prefers **the artifact's own recorded
+ceiling** over the ambient `SOAK_RSS_CEILING_KB`. The verdict is then a property
+of the artifact rather than of the environment that reads it: before this, the
+same file read `"aborted": null` under one setting and
+`rc 3, "implausible RSS reading(s) ignored"` under another. The environment (and
+then the compiled-in default) is only the fallback for an artifact that records
+no ceiling of its own — an older or hand-written series.
+
+The fallback default is **1 GiB (`1048576` KB)**, down from 100 GiB. It comes
+from the committed baselines: `memory-Mac.jsonl` records
+`rss_kb_frps`/`rss_kb_frpc` of 17328/16176 KB (idle, plain), 29776/28880 KB
+(idle, encrypt), 17424/15440 KB (churn, plain) and 27312/17728 KB (churn,
+encrypt) — a 15.4-29.8 MB band, so 1 GiB still leaves roughly 35x headroom for a
+heavier workload or a longer window. The old default was wide enough to accept a
+fabricated ~99.2 GiB column while real readings are tens of MB, and a still
+wider setting (`SOAK_RSS_CEILING_KB=1000000000000`) accepted a ~84 TiB band. The
+knob remains settable, but a raised bound is now recorded in the artifact and
+echoed by the summary (`rss_ceiling_kb` plus `rss_ceiling_source`), so a vacuous
+bound is visible instead of silent. Being a magnitude bound, the ceiling cannot
+by itself distinguish a real series from a fabricated one whose values are
+plausible.
+
+A verdict already recorded in an artifact is **monotonic**: the reader appends a
+`summary` line and refuses to clear an earlier `aborted`, so re-reading or
+re-running the summary over a series that already aborted keeps the death
+verdict (`a previous summary already aborted this artifact …`).
 
 What the series does and does not establish:
 

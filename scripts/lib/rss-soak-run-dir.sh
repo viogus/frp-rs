@@ -158,6 +158,89 @@ rss_soak_validate_tolerance() {
     return 0
 }
 
+# rss_soak_json_str <text> -> <text> escaped for use inside a JSON string.
+#
+# The artifact is JSON Lines and its `meta` record interpolates strings the
+# caller supplies: the resolved run directory, the frp-rs/Go binary paths, the
+# host name. A `"` or `\` in any of them makes the line unparseable, and an
+# unparseable line is silently skipped by the reader
+# (scripts/lib/rss-soak-summary.py:90-101) — the artifact then loses run_dir,
+# harness_sha256, bin_sha256, the ports and the recipe, and the
+# identical-binaries guard never runs, while the soak still prints
+# "run completed". Escaping therefore lives here, and every string field of the
+# record goes through it (see rss_soak_write_meta), not the call site.
+#
+# Escapes the two characters that terminate/corrupt a JSON string (`"` and `\`)
+# plus every C0 control character (the named short forms, `\u00XX` otherwise):
+# a raw byte below 0x20 is not legal inside a JSON string. Bytes >= 0x20,
+# including non-ASCII UTF-8, are passed through unchanged, which JSON allows.
+rss_soak_json_str() {
+    local s="${1-}" out="" ch esc
+    while [ -n "$s" ]; do
+        ch="${s:0:1}"
+        s="${s:1}"
+        case "$ch" in
+            '"')   out="${out}\\\"" ;;
+            '\')   out="${out}\\\\" ;;
+            $'\b') out="${out}\\b" ;;
+            $'\f') out="${out}\\f" ;;
+            $'\n') out="${out}\\n" ;;
+            $'\r') out="${out}\\r" ;;
+            $'\t') out="${out}\\t" ;;
+            *)
+                if [[ "$ch" = [[:cntrl:]] ]]; then
+                    printf -v esc '\\u%04x' "'$ch"
+                    out="${out}${esc}"
+                else
+                    out="${out}${ch}"
+                fi
+                ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# rss_soak_write_meta <out> <37 values> -> appends the `meta` JSON line to <out>.#
+# The one and only meta writer. It used to be a printf inlined in
+# scripts/rss-soak.sh, which made the quoting bug (and any test of it)
+# unreachable from the fixture; it lives here now so
+# scripts/tests/rss-soak-run-dir.sh can push a run dir containing `"` and `\`
+# through the REAL writer and parse the line back.
+#
+# Values, in order (the call site mirrors this list; the arity check below is
+# what keeps the two from drifting silently):
+#   1 started_utc            2 duration_s             3 interval_s
+#   4 generator_duration_s   5 host                   6 platform
+#   7 cpu_cores              8 frp_rs_version         9 frp_rs_sha
+#  10 frp_rs_dirty          11 harness rss_soak_sh   12 harness run_dir_sh
+#  13 harness summary_py    14 harness frp_stress_tree
+#  15 rs_bin_source         16 run_dir               17 go_frp_version
+#  18 go_frp_dir            19 rs_bin                20 rs_frpc_bin
+#  21 churn_connections     22 churn_rate_per_stack  23 churn_msg_bytes
+#  24 steady_streams        25 steady_mbps_per_stream
+#  26-31 six ports          32-35 the four binary sha256 values
+#  36 load1_start           37 rss_ceiling_kb
+# Positions 1, 5, 6, 8, 9, 11-20 and 32-35 are STRING fields and are escaped
+# with rss_soak_json_str; the rest are numbers/booleans already validated by the
+# caller and are emitted raw.
+rss_soak_write_meta() {
+    if [ "$#" -ne 38 ]; then
+        printf 'ERROR: rss_soak_write_meta wants 38 arguments (out path + 37 values), got %s\n' "$#" >&2
+        return 1
+    fi
+    local out="$1"
+    shift  # drop the out path so $1..$37 are the values
+    printf '{"kind":"meta","started_utc":"%s","duration_s":%s,"interval_s":%s,"generator_duration_s":%s,"host":"%s","platform":"%s","cpu_cores":%s,"frp_rs_version":"%s","frp_rs_sha":"%s","frp_rs_dirty":%s,"harness_sha256":{"rss_soak_sh":"%s","run_dir_sh":"%s","summary_py":"%s","frp_stress_tree":"%s"},"rs_bin_source":"%s","run_dir":"%s","go_frp_version":"%s","go_frp_dir":"%s","rs_bin":"%s","rs_frpc_bin":"%s","traffic":{"churn_connections":%s,"churn_rate_per_stack":%s,"churn_msg_bytes":%s,"steady_streams":%s,"steady_mbps_per_stream":%s,"generator":"frp-stress","proxy_type":"tcp"},"ports":{"rs_control":%s,"rs_remote":%s,"rs_echo":%s,"go_control":%s,"go_remote":%s,"go_echo":%s},"bin_sha256":{"rs_frps":"%s","rs_frpc":"%s","go_frps":"%s","go_frpc":"%s"},"load1_start":%s,"rss_ceiling_kb":%s,"caveats":["RSS is not live heap; it includes allocator retention and page-cache effects","both stacks share this host, so a machine-level effect moves both series","the per-sample time_wait count is host-wide, not per-side","identical offered recipe, not guaranteed identical achieved volume; per-side achieved volume is recorded and compared, and a spread beyond SOAK_TRAFFIC_TOLERANCE aborts the run","one TCP proxy per stack; other proxy types and encryption/compression/mux paths are not exercised"]}\n' \
+        "$(rss_soak_json_str "$1")" "$2" "$3" "$4" "$(rss_soak_json_str "$5")" "$(rss_soak_json_str "$6")" "$7" \
+        "$(rss_soak_json_str "$8")" "$(rss_soak_json_str "$9")" "${10}" \
+        "$(rss_soak_json_str "${11}")" "$(rss_soak_json_str "${12}")" "$(rss_soak_json_str "${13}")" "$(rss_soak_json_str "${14}")" \
+        "$(rss_soak_json_str "${15}")" "$(rss_soak_json_str "${16}")" "$(rss_soak_json_str "${17}")" "$(rss_soak_json_str "${18}")" \
+        "$(rss_soak_json_str "${19}")" "$(rss_soak_json_str "${20}")" \
+        "${21}" "${22}" "${23}" "${24}" "${25}" "${26}" "${27}" "${28}" "${29}" "${30}" "${31}" \
+        "$(rss_soak_json_str "${32}")" "$(rss_soak_json_str "${33}")" "$(rss_soak_json_str "${34}")" "$(rss_soak_json_str "${35}")" \
+        "${36}" "${37}" >> "$out"
+}
+
 # rss_soak_rss_kb <pid> <ceiling_kb> -> KB on stdout, or the literal `null`.
 # A reading is published only when it is a positive integer within the ceiling.
 # The non-empty check alone was the round-2 fix, and it was not enough: a stubbed
@@ -169,12 +252,14 @@ rss_soak_validate_tolerance() {
 #   * empty output, a sign, a decimal point or any non-digit -> `null`;
 #   * more than 12 digits -> `null` (bounds the arithmetic below);
 #   * 0 or a negative value -> `null` (a process has resident memory);
-#   * above <ceiling_kb> -> `null` (default 100 GiB; no plausible bridge here).
+#   * above <ceiling_kb> -> `null` (default 1 GiB; no plausible bridge here).
 # A genuinely implausible constant reading still passes HERE — only a whole
 # column of identical readings is implausible, and that is checked by the
-# summary reader, which sees the series.
+# summary reader, which sees the series. The ceiling is a plausibility BOUND,
+# not a heuristic oracle: see the default-ceiling rationale in
+# scripts/frp-stress/baselines/README.md.
 rss_soak_rss_kb() {
-    local pid="${1:-}" ceiling="${2:-104857600}" v val
+    local pid="${1:-}" ceiling="${2:-1048576}" v val
 
     [ -n "$pid" ] || { printf 'null'; return 0; }
     v=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' \t')
