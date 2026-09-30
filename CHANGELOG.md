@@ -436,6 +436,18 @@ User-facing release notes for frp-rs.
 ### Fixed
 - **`frps --config-dir` no longer loses a `SIGTERM` that arrives while the first service is still starting.** The signal was installed per service, so one landing before that install killed the process by the signal (`ExitStatus::code() == None`; shell `rc 143`, `Terminated: 15`) — exactly when a directory of slow or wedged files most needs to be stoppable. The main task now owns the handler: it records an early `SIGTERM`/`SIGINT` and hands the request to every service as it registers, and a repeat signal with nothing registered forces exit `143` so a lane wedged on a FIFO can still be stopped.
 - **A `--config-dir` entry that is not a regular file is still admitted, now deliberately.** A FIFO named `*.toml` hangs the file read forever; Go's `frpc` hangs identically and Go's `frps` has no `--config-dir` at all, so the parity-bound behaviour is pinned by tests instead of "fixed" into a divergence.
+- **Three test-precision residues pin what their names claim, and one snapshot wait is no longer a
+  guess.** The `frp-server` OIDC mock's deadline accessor was only ever exercised through its 5 s
+  default, so a lying accessor kept every test green: `mock_handle_reports_the_override_it_was_built_with`
+  (`frp-server/src/control/login.rs:2785`) now drives two overrides (`125 ms`, `60 s`) and asserts the
+  stored field. `frpc/tests/admin_config_get_warning.rs` released its probe port between spawns, so a
+  re-taken port failed the fixture once (`frpc admin server failed: Address already in use`): a
+  `PortLease` (`:166`) now keeps the listener bound for the fixture's lifetime and `spawn_admin_ready`
+  retries `MAX_ADMIN_PORT_ATTEMPTS` (`:116`) attempts on fresh leased ports, each detected from the
+  child's own stdout record (`ADMIN_PORT_HELD`, `:112`) inside a 250 ms `FAST_FAIL_WINDOW` (`:107`).
+  `frpc/tests/warn_delivery.rs` no longer sleeps a fixed 500 ms `SETTLE` before freezing its counts:
+  `Expect` (`:219`) plus a bounded `wait_for_record` (`:256`, `RECORD_TIMEOUT = 10 s` at `:101`) wait for
+  the record itself, so a loaded host can no longer snapshot a record still in flight.
 - **The `web_server.tls.enable` warning no longer names a TLS acceptor a build does not have.** The text
   was chosen from the caller's `cfg!`, so `cargo build -p frpc --no-default-features --features micro,admin`
   — an `admin` build **without** `tls`, where the configured `cert_file`/`key_file` pair is discarded

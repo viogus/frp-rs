@@ -7861,11 +7861,28 @@ section; ledger now **24 open / 104 closed**.**
   `MOCK_REQUEST_HEAD_TIMEOUT` keeps all 19 oidc tests green. Done-when: the delegation pin
   (`:2758-2768`) or a sibling drives an override that differs from the constant and asserts the
   stored field.
+
+  **(b) Done (PR #432, code head `72423b4e`).** `frp-server/src/control/login.rs:2785`
+  `mock_handle_reports_the_override_it_was_built_with` loops two overrides (`125 ms`, `60 s`, both differ from the
+  5 s `MOCK_REQUEST_HEAD_TIMEOUT` at `:2235`) and asserts the handle's accessor (`fn request_head_timeout`
+  at `:2348`) returns the stored deadline. A lying accessor that returns `MOCK_REQUEST_HEAD_TIMEOUT` reds
+  it at `frp-server/src/control/login.rs:2791:13` (`left: 5s / right: 125ms`; `6 passed; 1 failed` under a
+  `mock` filter) while the two pre-existing mock pins stay green; a second mutant returning `60 s` also reds.
   (c) `frpc/tests/admin_config_get_warning.rs`'s `seed_resolves_spellings_only_the_loader_does`
   spawns four frpc children and calls `free_port()` per sub-case, so a released port can be re-taken
   between spawns: the round-2 run hit `frpc admin server failed: Address already in use (os error
   48)` once, passing on retry. Done-when: the port is held for the fixture's lifetime, or the test
   retries deterministically instead of depending on the race.
+
+  **(c) Done (PR #432, code head `72423b4e`).** `frpc/tests/admin_config_get_warning.rs:166` `struct PortLease`
+  keeps the probe listener bound for the fixture's lifetime, and `spawn_admin_ready` retries
+  `MAX_ADMIN_PORT_ATTEMPTS` (`:116`, 3) attempts on fresh leased ports, detecting the child's own stdout
+  record `ADMIN_PORT_HELD` (`:112`, `admin server failed: Address already in use`) inside a 250 ms
+  `FAST_FAIL_WINDOW` (`:107`) — the child does not exit, so the retry cannot rely on a wait status. New
+  `admin_port_retry_recovers_from_a_held_port` (`:411` is the retry loop) forces a real held port and
+  asserts a distinct retry PID, the captured failure text and both directions of `rival_bind_fails`; a
+  `MAX_ADMIN_PORT_ATTEMPTS = 1` mutant reds it at `frpc/tests/admin_config_get_warning.rs:440:5`
+  (`4 passed; 1 failed`). Lane: `cargo test -p frpc --features full,admin`.
   (d) The `-z "$TREE"` guard's own `exit 1` (`scripts/tests/repo-health-fixtures.sh:282`) is dormant
   while the `setup_die` path works and no scenario forces an empty root, so reverting it alone stays
   green; the case-variant symlink misclassification in `scripts/repo-health.sh` is pre-existing and
@@ -7894,6 +7911,19 @@ section; ledger now **24 open / 104 closed**.**
   (d) `expected_warning` (`frp-core/tests/web_server_tls_enable_warning.rs:113`) is read only at `:247`
   (through `Captured.expected`), so its `NoWebServer` arm is dead code — either it is exercised or the arm is
   removed.
+
+- [ ] **`frps/tests/warn_delivery.rs`'s TLS-enable captures count the record instead of pinning it — the gap #428 closed for the `frp-core` captures, still open on the server side.**
+  Filed by the coordinator while re-deriving part (a) of the item above at `80ed6a85`. The `frp-core`
+  captures now call `assert_record_is_exactly_the_message` (`frp-core/tests/common/mod.rs:88`), but the
+  `frps` capture still asserts only a count (`frps/tests/warn_delivery.rs:1113` `occurrences(&out, SERVER_KEY)`,
+  helper at `:463`; the other count sites `:539`, `:564`, `:968`). Measured on the merged tree: appending a
+  clause at the emit site (`frp-core/src/config/loader.rs:680` →
+  `tracing::warn!("{} but honestly", SERVER_TLS_ENABLE_INERT_WARNING.as_str())`) reds the `frp-core` lane
+  (`written_server_tls_enable_warns_once_and_stays_inert` FAILED at `frp-core/tests/common/mod.rs:102`,
+  `7 passed; 1 failed`) while `cargo test -p frps --test warn_delivery` stays **17 passed / 0 failed** — the
+  server-visible line can drift from the static unnoticed.
+  Done-when: the `frps` capture asserts the emitted record's bytes (equality, or the shared helper with the
+  `frps` target) and the appended-clause mutant reds it.
 
 - [x] **`--allow-unsafe`'s comma grammar still differs from pflag's CSV reader, and the ignored-flag twin splits nothing at all.**
   The read-path parser splits on `,` and trims each element (`frp-core/src/cli.rs:2637-2646`, inside
@@ -8028,7 +8058,7 @@ section; ledger now **24 open / 104 closed**.**
   (`scenario_strays`/`assert_no_strays` at `scripts/lib/compat-stray-guard.sh:90`/`:150`, or a per-scenario pid
   file), so a full XTCP run leaves no process it did not start, or record why the pattern kill is
   required there (e.g. a `fuser`/pid-file route is impossible for that shard's Go children).
-- [ ] **`frpc/tests/warn_delivery.rs` snapshots its counts after a fixed 500 ms settle — the same class of load-dependent wait `frps/tests/log_completion.rs` just lost.**
+- [x] **`frpc/tests/warn_delivery.rs` snapshots its counts after a fixed 500 ms settle — the same class of load-dependent wait `frps/tests/log_completion.rs` just lost.**
   Filed by the coordinator while closing the `log_completion` flake item above, correcting that
   close-out's own residual note. This file does **not** read a rotation file — its contract
   (`frpc/tests/warn_delivery.rs:52-57`) is the child's two captured streams — so the closed item's
@@ -8043,6 +8073,13 @@ section; ledger now **24 open / 104 closed**.**
   `#![cfg(feature = "full")]`) at load 39–41 — and replace the settle with a condition wait on the
   record itself, or record the non-reproduction with the recipe and the load figures (8 tests in the
   file).
+  **Done (PR #432, code head `72423b4e`).** The fixed sleep is gone: `frpc/tests/warn_delivery.rs:219`
+  `enum Expect` plus a bounded `wait_for_record` (`:256`) wait for the record itself
+  (`RECORD_TIMEOUT = 10 s`, `:101`), and `snapshot()` no longer falls back to the live buffers. Teeth: a
+  700 ms delay injected before the `--config-dir` emit (`frpc/src/main.rs:439` branch) passes with the new
+  wait and fails under emulated old behaviour (`left: 0 / right: 1`). Load: 10/10 sequential
+  `cargo test -p frpc --features full --test warn_delivery` runs green (8 passed each, 1.93-3.23 s) at load
+  28.0-34.0; the item's 39-41 recipe was not reachable during the window.
 
 - [ ] **`scripts/tests/repo-health-fixtures.sh` cannot detect its own neutering — the hole the compat guard's `MIN_CHECKS` just closed.**
   Filed by the coordinator from the `test-harness-strays` round-2 adversarial round (read at
