@@ -6867,8 +6867,8 @@ section; ledger now **24 open / 104 closed**.**
 
   Done: fixed in #417 (`e95ce68c`). (a) The comments now attribute the row's discrimination
   to the pre-`normalize` read (`frp-core/src/config/normalize.rs:621`) plus the detector's
-  `[common]` fallback (`frp-core/src/config/loader.rs:409-411`), not to the per-key section merge;
-  measured: emptying `merge_section_into`'s `Occupied` arm (`frp-core/src/config/normalize.rs:545`)
+  `[common]` fallback (`frp-core/src/config/loader.rs:427-429`), not to the per-key section merge;
+  measured: emptying `merge_section_into`'s `Occupied` arm (`frp-core/src/config/normalize.rs:554-558`)
   leaves `frpc/tests/admin_config_get_warning.rs` 4/4 green while
   `both_web_server_sections_merge_per_key_in_both_modes` reds at
   `frp-core/src/config/tests.rs:6241` (`A1: nested wins`). (b) The "what it does not cover"
@@ -6878,9 +6878,10 @@ section; ledger now **24 open / 104 closed**.**
   missing-path assertion at `:2048-2053`. (c) The new fixture launches the child with
   `-c admin-node.toml` while a key-less `frpc.toml` sits in its cwd: 1 startup record, still 1 after
   three GETs, and a seed that ignores `config_path` and reads `./frpc.toml` reds at
-  `frpc/tests/admin_config_get_warning.rs:262` (before: 4/4 green). The comment also records why a
+  `frpc/tests/admin_config_get_warning.rs:264:9` (before: 4/4 green). The comment also records why a
   cwd holding *no* `frpc.toml` cannot catch that shape — a `NO_BASELINE` seed baselines silently
-  (`previous != NO_BASELINE` gate at `frp-server/src/control/login.rs:770`).
+  (`previous != NO_BASELINE` gate at `frp-client/src/admin.rs:770`). The comment's own
+  `loader.rs` citation was corrected in `3ade4968`.
 - [x] **Three accuracy defects and two precision gaps in the `oidc_throttle_tests` mock note and pins
   (filed by #409's final round).** All five were marked **non-blocking** and "fileable as-is" by both
   reviewers after four rounds; PR #409 merged on two MERGE verdicts and these are recorded rather than fixed.
@@ -6912,13 +6913,15 @@ section; ledger now **24 open / 104 closed**.**
   Done: fixed in #417 (`77c987da`); (a) corrected where it was written. (b) The new pin
   `read_request_head_reports_a_zero_budget_as_a_named_timeout` calls
   `read_request_head(&mut s, Duration::ZERO)` directly: deleting the guard at
-  `frp-server/src/control/login.rs:2298` gives 17 passed / 1 failed with
+  `frp-server/src/control/login.rs:2301-2303` gives 17 passed / 1 failed with
   `got Io(Error { kind: InvalidInput, message: "cannot set a 0 duration timeout" })` (17/17 green
   before the pin). (c) The terminator pin's comment now says the equality assertion is the whole
   catch — `split_whitespace().nth(1)` yields `/jwks` with or without the pipelined tail. (d) The
   delegation `oidc_mock_server()` → `oidc_mock_server_with_timeout(MOCK_REQUEST_HEAD_TIMEOUT)` is
-  documented as unguarded, with why the pin is not taken (the constructor would have to carry its
-  timeout back out to ~12 destructuring sites, or the test would wait out the shipped 5 s);
+  documented as unguarded, with why the pin is not taken (seven bindings in
+  `frp-server/src/control/login.rs` call it — five through the default constructor, two through the
+  `_with_timeout` form — so the
+  constructor would have to carry its timeout back out, or the test would wait out the shipped 5 s);
   measured: wiring it to 60 s leaves 18 passed. (e) The constant's doc names the shape (`n=16`,
   `path="/.well-known"`) and quotes an attributed spread (10-run medians 7.583 µs macOS / 5.917 µs
   Linux, 20-trial spread 2–1576 µs, one-offs 192.08 µs and 1.635 ms) instead of one figure. (a) The
@@ -6969,16 +6972,19 @@ section; ledger now **24 open / 104 closed**.**
 
   Done: fixed in #417 (`fec27dd1`). (a) Both variants are now pinned with an exact `assert_eq!`
   on the whole sentence, so a clause added or dropped reds: dropping `" or unreadable"` reds at
-  `frp-core/tests/server_tls_enable_warning.rs:271:5` (7 passed / 1 failed) and appending
+  `frp-core/tests/server_tls_enable_warning.rs:273:5` (7 passed / 1 failed) and appending
   `", or an unmeasured claim"` reds the same way, where the substring allow/deny lists stayed 8/8
   green under both; shipped: 8 passed in the default lane and 8 passed under
-  `--no-default-features`. (b) A note beside the constants names the hand-rolled mixed-feature build
-  `cargo build -p frps -p frpc --no-default-features --features "frps/micro,frpc/tls"` as a known,
-  unshipped shape (measured with `cargo tree -e features -i`: frp-core's `tls` on, frp-server only
-  `micro`; the acceptor gate is `frp-server/src/service.rs:603`, its no-acceptor branch `:635`); no
-  lane in `.github/workflows/` produces it. (c) "What it does not cover" now names which lane covers
+  `--no-default-features`. (b) A note beside the constants names the hand-rolled mixed-feature shape
+  `-p frps -p frpc --no-default-features --features "frps/micro,frpc/tls"` as a known, unshipped one
+  (the note carries the measured `cargo check` and `cargo tree … -i
+  frp-core` / `-i frp-server`: frp-core's `tls` on via frp-client, frp-server resolving to only
+  `frps feature "micro"`; the acceptor gate is `frp-server/src/service.rs:603`, its no-acceptor
+  branch `:635`); no lane in `.github/workflows/` produces it. (c) "What it does not cover" now
+  names which lane covers
   which variant — `.github/workflows/ci.yml:191-194` (default) for the `tls` text and `:195-226`
-  (run at `:226`, `--no-default-features --all-targets`) for the no-TLS text.
+  (run at `:226`, `--no-default-features --all-targets`) for the no-TLS text. The citations the new
+  note introduced were corrected in `3ade4968`.
 - [x] **A doc comment in `frp-core/src/transport/mod.rs` cites the wrong line for `connect_ws_raw`.**
   `frp-core/src/transport/mod.rs:3281` says the helper is `#[cfg(feature = "websocket")]` and cites
   `transport/mod.rs:2187`, but the definition is `pub async fn connect_ws_raw<S>(` at `:2254`
@@ -7170,3 +7176,12 @@ section; ledger now **24 open / 104 closed**.**
   waiting out the shipped 5 s. **Done-when:** (a) the literals are derived from the constants (or a
   drift test compares them); (b) the delegation is asserted cheaply, or the record says plainly that
   it is unpinned.
+
+- [ ] **The (c) admin-warning fixture cannot distinguish "reads `-c` only" from "reads the cwd first,
+  then falls back to `-c`".** Filed by the `review-residue-precision` adversarial review. The fixture
+  launches the child with `-c admin-node.toml` while a key-less `frpc.toml` sits in its cwd, so it
+  proves the keyed argument file is read at all. Reviewer 1 measured the split: a seed that prefers
+  `./frpc.toml` whenever it exists **is** caught (3 passed / 1 failed, records 2 vs 1 — the failure
+  the fixture's comment documents), but a seed that falls back to the argument only when the cwd file
+  does not set the key stays 4/4 green. **Done-when:** a fixture with the cwd file keyed and the `-c` file
+  key-less pins the precedence, or the item records that precedence is deliberately not pinned.
