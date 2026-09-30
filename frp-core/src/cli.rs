@@ -3745,16 +3745,37 @@ impl FrpsArgs {
             cfg.proxy_bind_addr = v.clone();
         }
 
-        // Log
+        // Log. `--log-file ""`, `--log-level ""` and `--log-max-days 0` are
+        // Go's zero values, which `LogConfig::complete` fills with
+        // `console`/`info`/`3` (`frp-core/src/config/server.rs`). Writing the
+        // zero value into the config here would therefore *raise* a file's
+        // explicitly non-default `level`, `to` or `max_days` back to Go's
+        // default on the one lane that applies overrides, defeating the
+        // "empty/zero CLI means not supplied" rule the resolvers in
+        // `frp-core/src/logging.rs` already apply to both binaries:
+        // `resolve_log_level` filters `""`, `resolve_log_file` filters `""`
+        // and `resolve_log_max_days` filters `0`. Go's `-c` lane leaves the
+        // file's value too (both binaries, measured on v0.71.0), and this lane
+        // also read a config file (`config_path()` defaults to `frps.toml`),
+        // so the file's value must survive.
         if let Some(ref v) = self.log_file {
-            cfg.log.file = v.clone();
+            if !v.is_empty() {
+                cfg.log.file = v.clone();
+            }
         }
         if let Some(ref v) = self.log_level {
-            cfg.log.level = v.clone();
+            if !v.is_empty() {
+                cfg.log.level = v.clone();
+            }
         }
         if let Some(v) = self.log_max_days {
-            cfg.log.max_days = v;
+            if v != 0 {
+                cfg.log.max_days = v;
+            }
         }
+        // `--log-format` has no `LogConfig::complete` slot and no Go analogue
+        // on the file lane, so it keeps the raw write-through; see the
+        // `log_format_ignores_the_override_filter` pin below.
         if let Some(ref v) = self.log_format {
             cfg.log.format = v.clone();
         }
@@ -4396,6 +4417,70 @@ mod tests {
         let mut cfg = crate::config::ServerConfig::default();
         args.override_server_config(&mut cfg);
         assert_eq!(cfg.vhost_http_timeout, 60, "absent flag keeps Go's default");
+    }
+
+    /// `--log-level ""`, `--log-file ""` and `--log-max-days 0` are Go's zero
+    /// values, and `LogConfig::complete` fills them with `info`/`console`/`3`
+    /// (`frp-core/src/config/server.rs`). Writing them through this override
+    /// therefore silently **raised** a config file's explicit
+    /// `[log] level = "warn"` back to `info` on the one lane that applies
+    /// overrides — measured at the parent commit, frps run with `frps.toml`
+    /// (`[log] level = "warn"`, `to = "console"`) in the cwd and no `-c`:
+    /// `--log-level ""` → 2412 B stdout / 11 `INFO` records, versus 0 B / 0
+    /// records with no flag at all. Go v0.71.0 leaves the file's `warn` on
+    /// **both** binaries whenever a config file is used (`-c`; no `-c` flag is
+    /// bound on `frpc`'s run path at all), and this lane also read a config
+    /// file, so the file's value must survive. The resolvers already model the
+    /// zero values as absent for both binaries
+    /// (`resolve_log_level`/`resolve_log_file`/`resolve_log_max_days`,
+    /// `frp-core/src/logging.rs:68`, `:107`, `:161`).
+    #[test]
+    fn log_flag_zero_values_do_not_override_the_config_file() {
+        let mut cfg = crate::config::ServerConfig::default();
+        cfg.log.level = "warn".to_string();
+        cfg.log.file = "logs/frps.log".to_string();
+        cfg.log.max_days = 5;
+
+        let args =
+            parse_frps(&["--log-level", "", "--log-file", "", "--log-max-days", "0"]).unwrap();
+        args.override_server_config(&mut cfg);
+        // The real order (`frps/src/main.rs`): override first, then Go's completion.
+        cfg.complete();
+        assert_eq!(
+            cfg.log.level, "warn",
+            "an empty --log-level is not supplied"
+        );
+        assert_eq!(
+            cfg.log.file, "logs/frps.log",
+            "an empty --log-file is not supplied"
+        );
+        assert_eq!(cfg.log.max_days, 5, "a zero --log-max-days is not supplied");
+
+        // Non-zero flags still win, so this is a zero-value filter and not
+        // "ignore the CLI log flags".
+        let mut cfg = crate::config::ServerConfig::default();
+        cfg.log.level = "warn".to_string();
+        cfg.log.max_days = 5;
+        let args = parse_frps(&["--log-level", "trace", "--log-max-days", "7"]).unwrap();
+        args.override_server_config(&mut cfg);
+        // The real order (`frps/src/main.rs`): override first, then Go's completion.
+        cfg.complete();
+        assert_eq!(cfg.log.level, "trace", "a non-empty --log-level still wins");
+        assert_eq!(cfg.log.max_days, 7, "a non-zero --log-max-days still wins");
+
+        // Deliberate residue, pinned so it cannot change silently:
+        // `--log-format` has no `LogConfig::complete` slot (Go has no
+        // completion for it either), so it keeps the raw write-through.
+        let mut cfg = crate::config::ServerConfig::default();
+        cfg.log.format = "json".to_string();
+        let args = parse_frps(&["--log-format", ""]).unwrap();
+        args.override_server_config(&mut cfg);
+        // The real order (`frps/src/main.rs`): override first, then Go's completion.
+        cfg.complete();
+        assert_eq!(
+            cfg.log.format, "",
+            "--log-format keeps the raw write-through (no zero-value filter)"
+        );
     }
 
     #[test]

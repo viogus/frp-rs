@@ -8,6 +8,14 @@
 //! | `--dashboard-addr ""` (credentials set, `./frps.toml` with `[webServer] port`) | `dashboard listen on 127.0.0.1:<port>`, `TCP 127.0.0.1:<port> (LISTEN)` | `Dashboard web UI starting on :<port>` + `failed to lookup address information`; **nothing** listening |
 //! | `--bind-addr ""` (`./frps.toml` with `bindPort`) | `frps tcp listen on 0.0.0.0:<port>`, `TCP *:<port> (LISTEN)` | `frps starting on :<port>` + `failed to lookup address information`, exits 1, binds nothing |
 //!
+//! A third shape covers the **log-level zero value** on the same override lane:
+//! with `[log] level = "warn"` in `./frps.toml` and no `-c`, `--log-level ""`
+//! must leave the file's `warn` alone rather than being completed to `info`
+//! (measured at the parent commit: 0 records / 0 B with no flag vs 2412 B / 11
+//! `INFO` records with the empty flag; Go emits 0 records whenever a config
+//! file supplies the level). See
+//! `cli_empty_log_level_keeps_the_config_files_level`.
+//!
 //! The child's **own** bound-address report is the assertion, and the socket is
 //! additionally proved live from outside with a real `TcpStream::connect` to
 //! `127.0.0.1:<port>` (which is impossible while the child has exited — the
@@ -211,17 +219,35 @@ impl Spawned {
     /// Run `frps` with `argv` in a scratch dir holding `config` as
     /// `./frps.toml`.
     fn start(config: &str, argv: &[&str]) -> Self {
+        Self::start_with_rust_log(config, argv, Some("info"))
+    }
+
+    /// [`Spawned::start`] with `RUST_LOG` **removed** from the child, so the
+    /// level resolved from the config/CLI is the one that actually applies: an
+    /// explicit `RUST_LOG` outranks it
+    /// (`frp-core/src/logging.rs::filter_from_env`, pinned by
+    /// `filter_from_env_outranks_the_configured_level`), which would mask the
+    /// shape `cli_empty_log_level_keeps_the_config_files_level` tests. Every
+    /// other test in this file wants the full `INFO` stream and keeps the
+    /// default set by `start`.
+    fn start_without_rust_log(config: &str, argv: &[&str]) -> Self {
+        Self::start_with_rust_log(config, argv, None)
+    }
+
+    fn start_with_rust_log(config: &str, argv: &[&str], rust_log: Option<&str>) -> Self {
         let dir = TempDir::new();
         dir.write_default_config(config);
 
-        let mut child = Command::new(bin())
-            .args(argv)
+        let mut cmd = Command::new(bin());
+        cmd.args(argv)
             .current_dir(&dir.0)
-            .env("RUST_LOG", "info")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn frps");
+            .stderr(Stdio::piped());
+        match rust_log {
+            Some(value) => cmd.env("RUST_LOG", value),
+            None => cmd.env_remove("RUST_LOG"),
+        };
+        let mut child = cmd.spawn().expect("spawn frps");
 
         let out = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let err = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -313,6 +339,27 @@ fn assert_streams_clean_of(tag: &str, spawned: &Spawned, needle: &str) {
         spawned.stdout(),
         spawned.stderr(),
     );
+}
+
+/// Strip SGR (`ESC [ … m`) sequences so a level token can be matched as text.
+/// The child colours its records even when stdout is a pipe
+/// (`resolve_ansi(false)` → `with_ansi(true)`), so the raw stream holds
+/// `INFO\x1b[0m` and a plain `" INFO "` search would miss it.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// `--dashboard-addr ""` must reach the dashboard as `127.0.0.1` (Go's
@@ -568,4 +615,70 @@ fn config_dir_empty_bind_addr_binds_wildcard() {
         "failed to lookup address information",
     );
     assert_loopback_listens(bind_port);
+}
+
+/// **The third shape: the log-level zero value on the override lane.** Go's
+/// `LogConfig.Complete()` fills an empty level with `info`
+/// (`pkg/config/v1/common.go:121`), so `--log-level ""` means "use the
+/// default" wherever the flag is actually read — but with a config file Go
+/// ignores its CLI log flags entirely, and frp-rs's no-`-c` lane also reads a
+/// config file (`config_path()` defaults to `./frps.toml`), so an empty flag
+/// must leave the file's explicit level alone instead of completing it to Go's
+/// zero value.
+///
+/// Measured at the parent commit (Go v0.71.0 binaries and frp-rs, stdout and
+/// stderr captured separately, 3 s bounded runs, `[log] level = "warn"` in the
+/// file): Go `frps -c <cfg>` emits **0 records** with `--log-level ""`, with
+/// `--log-level info` and with no flag; frp-rs with `./frps.toml` in the cwd
+/// and no `-c` emitted **2412 B / 11 `INFO` records** with `--log-level ""`
+/// but **0 B / 0 records** with no flag — the empty value was written into the
+/// config and completion raised the file's `warn` back to `info`.
+///
+/// The first spawn below is the pin; the second is its non-vacuous control:
+/// the same file with `--log-level info` must still produce `INFO` records, so
+/// "zero `INFO` records" cannot pass because the observation channel is
+/// broken. `RUST_LOG` is removed from both children
+/// ([`Spawned::start_without_rust_log`]) because it outranks the configured
+/// level.
+#[test]
+fn cli_empty_log_level_keeps_the_config_files_level() {
+    let warn_config = |port: u16| {
+        format!(
+            "bind_addr = \"127.0.0.1\"\nbind_port = {port}\n\n\
+             [auth]\nmethod = \"token\"\ntoken = \"cli-completion-test\"\n\n\
+             [log]\nlevel = \"warn\"\nto = \"console\"\n"
+        )
+    };
+
+    // No `-c`: the one lane where frp-rs overlays CLI flags onto the config.
+    let bind_port = free_port();
+    let empty = Spawned::start_without_rust_log(&warn_config(bind_port), &["--log-level", ""]);
+    // Liveness cannot be the `INFO` startup line here (the level under test
+    // suppresses it), so the socket is the witness; the settle lets every
+    // record the child would have written reach the drain threads.
+    assert_loopback_listens(bind_port);
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        !strip_ansi(&format!("{}{}", empty.stdout(), empty.stderr())).contains(" INFO "),
+        "`--log-level \"\"` is Go's zero value, so it must leave the config file's `warn` \
+         alone: an empty CLI level must not be completed to `info` on the override lane \
+         (Go emits 0 records in this shape and 0 with no flag).\n--- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        empty.stdout(),
+        empty.stderr(),
+    );
+
+    // The control: a *non-empty* level still reaches the logger.
+    let level_port = free_port();
+    let explicit =
+        Spawned::start_without_rust_log(&warn_config(level_port), &["--log-level", "info"]);
+    assert_loopback_listens(level_port);
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        strip_ansi(&explicit.stdout()).contains(" INFO "),
+        "`--log-level info` must still produce `INFO` records, so the zero-record assertion \
+         above is a measurement and not a broken channel.\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        explicit.stdout(),
+        explicit.stderr(),
+    );
 }
