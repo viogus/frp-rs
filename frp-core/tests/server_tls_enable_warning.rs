@@ -92,6 +92,38 @@ use frp_core::config::SERVER_TLS_ENABLE_INERT_TLS_CLAUSES;
 /// appearing, the tests fail on the needle rather than passing vacuously.
 const NEEDLE: &str = "tls_enable has no effect on the server";
 
+/// Deliberate goldens for the **rendered bytes**. The clause arrays above are the
+/// definition, and the whole-text assertions derive from them — so on their own
+/// they move *with* the definition and cannot see a reworded or reordered clause
+/// (measured: swapping the two `tls` clauses, or `reads it.` → `reads it at
+/// all.`, left every derived assertion green while the rendered message
+/// changed). These two literals are the bytes actually shipped by the build the
+/// `tls` feature selects: **update them deliberately** when the wording is
+/// intentionally changed, and never re-derive them from the array — that is the
+/// whole point.
+///
+/// The hash is FNV-1a 64, chosen because it is stable by specification: not
+/// `std::hash::DefaultHasher` (its output is explicitly not stable across
+/// releases) and not `sha2` (not a dependency of this crate — it is in
+/// `Cargo.lock` only through the vendored `russh`).
+#[cfg(feature = "tls")]
+const TLS_RENDERED_LEN: usize = 433;
+#[cfg(feature = "tls")]
+const TLS_RENDERED_FNV1A: u64 = 0x0a17_2261_4d74_606e;
+#[cfg(not(feature = "tls"))]
+const NO_TLS_RENDERED_LEN: usize = 186;
+#[cfg(not(feature = "tls"))]
+const NO_TLS_RENDERED_FNV1A: u64 = 0x948e_8cf8_368e_4c41;
+
+/// FNV-1a (64-bit) over the string's UTF-8 bytes; see the goldens above.
+fn fnv1a(s: &str) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    s.as_bytes().iter().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    })
+}
+
 #[derive(Clone)]
 struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
@@ -294,6 +326,24 @@ fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
         "a clause was appended to or dropped from the `tls` array — the substring \
          list above cannot detect that"
     );
+    // …and the **rendered bytes**, which the derived assertion above cannot see: a
+    // reworded clause or a reordered array keeps the derivation green while the
+    // shipped message changes. These goldens are the bytes to update deliberately
+    // (see `TLS_RENDERED_LEN`), never re-derive them from the array.
+    #[cfg(feature = "tls")]
+    assert_eq!(
+        warning.len(),
+        TLS_RENDERED_LEN,
+        "the rendered `tls` message changed length — if the new wording is intended, update \
+         the golden deliberately"
+    );
+    #[cfg(feature = "tls")]
+    assert_eq!(
+        fnv1a(warning),
+        TLS_RENDERED_FNV1A,
+        "the rendered `tls` message changed bytes — if the new wording is intended, update \
+         the golden deliberately: {warning}"
+    );
 
     // A no-TLS build must name *why* the key is inert and must not claim any
     // certificate behaviour — the clause the micro tier made false.
@@ -336,6 +386,21 @@ fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
         2,
         "a clause was appended to or dropped from the no-TLS array — the deny-list \
          above cannot detect that"
+    );
+    // The rendered bytes for this variant too; see `NO_TLS_RENDERED_LEN`.
+    #[cfg(not(feature = "tls"))]
+    assert_eq!(
+        warning.len(),
+        NO_TLS_RENDERED_LEN,
+        "the rendered no-TLS message changed length — if the new wording is intended, update \
+         the golden deliberately"
+    );
+    #[cfg(not(feature = "tls"))]
+    assert_eq!(
+        fnv1a(warning),
+        NO_TLS_RENDERED_FNV1A,
+        "the rendered no-TLS message changed bytes — if the new wording is intended, update \
+         the golden deliberately: {warning}"
     );
 
     // The acceptor is *not* pair-gated in a `tls` build: with neither file set
