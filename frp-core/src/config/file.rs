@@ -247,6 +247,7 @@ pub fn load_client_config_with_presence_checked(
 pub(super) fn process_includes(
     value: &mut toml::Value,
     base_dir: &Path,
+    format: ConfigFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use toml::Value;
 
@@ -254,6 +255,26 @@ pub(super) fn process_includes(
         Some(t) => t,
         None => return Ok(()),
     };
+
+    // A legacy `.ini` with `[common]` is not parsed as v1 by Go at all: the
+    // presence of that section selects the legacy reader (`DetectLegacyINIFormat`,
+    // `pkg/config/load.go:65`; `strict` is never passed to that branch), and the
+    // reader skips `ini.DefaultSection` (`pkg/config/legacy/client.go:204`),
+    // taking its include list from `[common]` alone
+    // (`IncludeConfigFiles []string \`ini:"includes"\``,
+    // `pkg/config/legacy/client.go:166`). A scalar `includes = 1` in the
+    // section-less top level — or nested in `[common]` — is therefore inert on
+    // Go: rc 0 in both loader modes (measured on v0.71.0). frp-rs carried it into
+    // the v1 `includes: Vec<String>` decode and refused the file
+    // (`invalid type: integer \`1\`, expected a sequence`, rc 1 in both modes).
+    // Scrub the scalar spellings here, while the raw dialect is still visible:
+    // after the `[common]` hoist at `frp-core/src/config/normalize.rs:1156-1160`
+    // the two spellings are indistinguishable, and a `.ini` *without* `[common]`
+    // goes down Go's v1 path too, so its type error (`includes = 1` there is rc 1
+    // in both modes) must stay.
+    if format == ConfigFormat::Ini && matches!(table.get("common"), Some(Value::Table(_))) {
+        drop_ini_scalar_include_keys(table);
+    }
 
     // Extract includes list (support both "includes" and "include" keys). Only
     // the v1 shapes — a string or an array — are a file list; any other value is
@@ -399,6 +420,80 @@ fn drop_legacy_ini_include_tables(value: &mut toml::Value, format: ConfigFormat)
         }
     }
 }
+
+/// Remove a scalar `includes`/`include` from a legacy `.ini` with `[common]`.
+///
+/// Covers both spellings of the section-less top level and the `[common]`
+/// section itself; see the call site in [`process_includes`] for the Go
+/// readings. A string or an array is the v1 file list (removed and processed
+/// there instead) and a table is an ordinary legacy section
+/// ([`drop_legacy_ini_include_tables`] handles what survives normalization), so
+/// only the remaining scalar shapes are inert.
+fn drop_ini_scalar_include_keys(table: &mut toml::Table) {
+    use toml::Value;
+    let is_scalar = |v: Option<&Value>| {
+        matches!(
+            v,
+            Some(Value::Integer(_) | Value::Float(_) | Value::Boolean(_) | Value::Datetime(_))
+        )
+    };
+    for key in ["includes", "include"] {
+        if is_scalar(table.get(key)) {
+            table.remove(key);
+        }
+    }
+    if let Some(Value::Table(common)) = table.get_mut("common") {
+        for key in ["includes", "include"] {
+            if is_scalar(common.get(key)) {
+                common.remove(key);
+            }
+        }
+    }
+}
+
+// Known bounds in this area — pre-existing divergences measured during round 4
+// (Go v0.71.0 binaries, both loader modes). The detector used throughout is
+// `sub_bad.ini` = `[p1] role = "visitor"`: Go's legacy reader refuses it with
+// `failed to parse visitor p1, err: type shouldn't be empty`, so a reader that
+// merges the file must fail on it. None of these is introduced by the
+// legacy-`.ini` parity work and none is pinned by a test — they are recorded
+// here because this is where the include handling lives, and so that a later
+// fix knows it is changing measured behaviour rather than "cleaning up".
+//
+// * `[common] includes = "<file>"`: Go reads the include list from `[common]`
+//   (`UnmarshalClientConfFromIni`, `pkg/config/legacy/client.go:195-213`) and
+//   merges the file. [`process_includes`] runs on the raw top-level table
+//   *before* the `[common]` hoist
+//   (`frp-core/src/config/normalize.rs:1156-1160`), so the pattern is never
+//   expanded; the hoisted string is then read as a one-element list by the
+//   type-directed `.ini` reader (`deserialize_seq` on `Value::String`,
+//   `frp-core/src/config/ini_lenient.rs:175-183`). With a valid include both
+//   readers are rc 0 and the cost is silent config loss (Go loads that file's
+//   proxies, frp-rs loads none); with `sub_bad.ini` Go is rc 1 and frp-rs rc 0,
+//   in both modes, for a relative and an absolute pattern alike.
+// * The mirror shape: a top-level `includes = "<file>"` in a file that also has
+//   `[common]`. Go never reads it (only `[common]` is mapped by
+//   `UnmarshalClientConfFromIni`), while frp-rs expands it here and merges the
+//   file — rc 1 in both modes with `sub_bad.ini` against Go's rc 0, and rc 0 in
+//   both when the include is valid (frp-rs loads a proxy Go does not).
+// * A `.ini` *without* `[common]` plus `includes = "<valid file>"`: frp-rs
+//   expands the pattern and merges (rc 0 in both modes), where Go's v1 decode
+//   refuses the string (rc 1 in both modes: strict `json: cannot unmarshal
+//   string into Go value of type v1.rawClientConfig`, non-strict `error
+//   unmarshaling JSON: while decoding JSON: json: cannot unmarshal string into
+//   Go value of type v1.ClientConfig`). This is the shape the new scalar pins
+//   deliberately exclude: their no-`[common]` case uses `includes = 1`, which
+//   both readers refuse.
+// * `[includes] type = "custom"` (no ports): Go's legacy collector turns the
+//   section into a proxy and refuses its type (`failed to parse proxy includes,
+//   err: invalid type [custom]`, rc 1 in both modes), while here the section is
+//   skipped by the collector and then dropped as an inert table by
+//   [`drop_legacy_ini_include_tables`] (rc 0 in both modes).
+//
+// Also surfaced by these probes, unrelated to the list above: `-c <bare
+// relative name>` leaves `base_dir` empty, so a relative include pattern fails
+// with `include: directory of  not exist` (resolution comment in
+// [`process_includes`]); `-c ./<name>` or an absolute path resolves.
 
 /// Simple glob matching that supports a single `*` wildcard per path component.
 /// Returns sorted list of matching file paths.

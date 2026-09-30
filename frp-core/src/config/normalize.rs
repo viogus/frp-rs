@@ -608,7 +608,7 @@ pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
     let mut value: toml::Value =
         parse_to_toml_value(&content, format).map_err(|e| format!("{path}: parse error: {e}"))?;
     let base_dir = Path::new(path).parent().unwrap_or(Path::new("."));
-    process_includes(&mut value, base_dir)?;
+    process_includes(&mut value, base_dir, format)?;
     // Expand `${ENV_VAR}` references here, after includes are deep-merged
     // (so include-file values are covered) and before normalization (which
     // renames/restructures keys). See `expand_env_vars` for the exact subset.
@@ -2116,6 +2116,33 @@ fn collect_legacy_ini_proxy_sections(
         .cloned()
         .collect();
 
+    // Go reads `role` **before** it decides what a section is, and refuses the
+    // whole file when it is neither `server`, `visitor` nor empty
+    // (`LoadAllProxyConfsFromIni`, `pkg/config/legacy/client.go:255-285`: the
+    // missing/empty default is `server`, and the `default:` arm errors with this
+    // exact text, using the raw header as the name). The scan covers every
+    // top-level section, not just the ones the collector takes: measured on Go
+    // v0.71.0, `[proxies]`, `[visitors]`, `[foo]` and `[p]` with `role =
+    // "weird"`, `role = "Server"` or `role = 1` are rc 1 in both loader modes
+    // (`proxy proxies role should be 'server' or 'visitor'`, …), while those same
+    // headers with `role = "server"`, no `role` at all, or `role = ""` are rc 0.
+    // A `range:` header is skipped here: Go refuses a bad role there only after
+    // expansion, under the generated `{prefix}_{i}` name (see the expansion
+    // below), and it reports a missing port before that.
+    if is_ini {
+        for name in table.keys() {
+            if name.starts_with("range:") {
+                continue;
+            }
+            let Some(Value::Table(t)) = table.get(name) else {
+                continue;
+            };
+            if ini_role(t).is_none() {
+                return Err(format!("proxy {name} role should be 'server' or 'visitor'"));
+            }
+        }
+    }
+
     for section_name in sections {
         let Value::Table(mut st) = table.remove(&section_name).unwrap() else {
             continue;
@@ -2268,7 +2295,20 @@ fn collect_legacy_ini_proxy_sections(
             // uses, and record its index there: the strip pass keeps the
             // visitor-only keys (`bind_addr`, `bind_port`, `server_name`) only
             // when the element is known to be a visitor.
-            let role_is_visitor = st.get("role").and_then(Value::as_str) == Some("visitor");
+            let role_is_visitor = match ini_role(&st) {
+                Some(IniRole::Visitor) => true,
+                Some(IniRole::Server) => false,
+                // Go's generated `{prefix}_{i}` sections are dispatched like any
+                // other, so a refused role is reported under the generated name:
+                // measured, `[range:p] role = "weird" local_port = 8080
+                // remote_port = 18080` is rc 1 in both loader modes with
+                // `proxy p_0 role should be 'server' or 'visitor'`.
+                None => {
+                    return Err(format!(
+                        "proxy {prefix}_0 role should be 'server' or 'visitor'"
+                    ))
+                }
+            };
             for (i, (lp, rp)) in local_ports.into_iter().zip(remote_ports).enumerate() {
                 let mut t = st.clone();
                 t.insert("name".to_string(), Value::String(format!("{prefix}_{i}")));
@@ -2322,6 +2362,30 @@ fn collect_legacy_ini_proxy_sections(
         }
     }
     Ok((proxy_indices, visitor_indices))
+}
+
+/// The two `role` values Go's legacy reader accepts (`server` is also the
+/// default for a missing or empty key).
+enum IniRole {
+    Server,
+    Visitor,
+}
+
+/// Classify a legacy `.ini` section's `role` key, or `None` when Go refuses the
+/// section.
+///
+/// `pkg/config/legacy/client.go:257-268`: `roleType := section.Key("role")
+/// .String()`, `if roleType == "" { roleType = "server" }`, then a switch whose
+/// `default:` arm is `proxy %s role should be 'server' or 'visitor'`. The
+/// comparison is exact and case-sensitive, and Go sees the *text* of the value,
+/// so a non-string spelling (an unquoted `role = 1`) is a refusal too.
+fn ini_role(t: &toml::Table) -> Option<IniRole> {
+    match t.get("role") {
+        None => Some(IniRole::Server),
+        Some(toml::Value::String(s)) if s.is_empty() || s == "server" => Some(IniRole::Server),
+        Some(toml::Value::String(s)) if s == "visitor" => Some(IniRole::Visitor),
+        Some(_) => None,
+    }
 }
 
 /// Normalize Go-format proxy sub-tables onto each `proxies` element.
