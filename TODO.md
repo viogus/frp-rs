@@ -5179,8 +5179,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   **Round-1 review fixes (`b9ab5473` F1, `436a8130` F5).** Round 1 blocked on a regression
   this fix introduced: `allow_unsafe_parser()` was declared without `.many()`, so a repeated
   `--allow-unsafe` was refused (`Error: argument `--allow-unsafe` cannot be used multiple
-  times in this context`, rc 1) on `frps verify`, `frpc verify` and the run paths, where Go's
-  pflag appends and the pre-fix `verify` had accepted it. It is now `.many()` plus a flatten of
+  times in this context`, rc 1) on both verify commands and the run paths, where Go's pflag
+  appends. That regressed `frpc verify` (the base `971e0fa0` routed it through the
+  `.many()`-bearing `ignored_allow_unsafe()`, so it had accepted repeats) and kept
+  `frps verify`'s pre-existing refusal (its base inline parser already rejected them). It is now `.many()` plus a flatten of
   each trimmed comma-split occurrence, matching Go v0.71.0 on all three surfaces
   (`--allow-unsafe WrongFeature --allow-unsafe TokenSourceExec` rc 0 in both value orders,
   `--allow-unsafe Ignored,TokenSourceExec` rc 0, `WrongFeature` alone rc 1, no flag rc 1).
@@ -5189,8 +5191,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `verify_runs_the_post_load_allow_unsafe_gate_like_go`; teeth: a last-wins mutant reds
   `frp-core/src/cli.rs:5154:9`, `frps/tests/cli_exit_codes.rs:382:9` and
   `frpc/tests/cli_exit_codes.rs:485:9`, while removing `.many()` does not compile
-  (`frp-core/src/cli.rs:2621`, `E0599`/`E0631` — the closure's `Vec<String>` type is the
-  enforcement, so that mutation is killed by the checker rather than by a failing assertion).
+  (the deleted `.many()` at `frp-core/src/cli.rs:2611`; the diagnostic labels
+  `.fallback(vec![])` at `:2622` and the unsatisfied closure at `:2612`, `E0599`/`E0631` — the
+  closure's `Vec<String>` type is the enforcement, so that mutation is killed by the checker
+  rather than by a failing assertion).
   F5: the comment in `frp-core/src/config/file.rs:167-197` now names both spellings and Go's
   `validateOIDCConfig` (`pkg/config/v1/validation/client.go`), which gates
   `auth.oidc.tokenSource` exec identically — an exact-parity arm, not an unmeasured one.

@@ -817,8 +817,9 @@ User-facing release notes for frp-rs.
   define them, so `frpc tcp --local-port 5 --remote-port 6 --proxy-name x -c
   noweb.toml` started the proxy on Go and exited **1** here with ``Error: `-c`
   is not expected in this context``; `--config-dir` and the other three behaved
-  the same way. All twelve `frpc` subcommands now accept and drop them (the four
-  admin commands already declared `-c` and `--strict-config`). Two pflag
+  the same way. All twelve `frpc` subcommands now accept them and drop all but
+  `--allow-unsafe` on `verify`, which reads it and decides that command's verdict
+  (the four admin commands already declared `-c` and `--strict-config`). Two pflag
   spellings come with it: a repeated flag is last-wins (or appending for
   `--allow-unsafe`) and never an error, and a `-`-prefixed token after `-c` is
   consumed as that flag's **value** — `frpc status -c --strict-config=false -c
