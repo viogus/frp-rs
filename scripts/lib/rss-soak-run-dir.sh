@@ -149,21 +149,28 @@ rss_soak_validate_window() {
 # spread pass. `awk` is used rather than a bash pattern so the value is parsed as
 # the same float Python will parse.
 #
+# The interval is the OPEN (0, 1), not (0, 1]: the spread is
+# |a - b| / max(a, b), which is in [0, 1) for any two positive counts, so
+# `tolerance = 1` can never fail and silently disables the reconciliation — a 90%
+# one-sided gap read "run completed" with `traffic tolerance: 1`. Round 6
+# accepted `<= 1` here and in the reader; a hand-written or recorded `1` was
+# therefore a supported way to switch the check off.
+#
 # The value is also required to be a JSON number token, because the run records
 # it verbatim in the artifact's `meta` line: `awk` happily accepts `.5`, `+0.5`
-# and `01`, all of which make that line invalid JSON — and the reader skips an
-# invalid line, so the whole `meta` record (run dir, digests, ports, the
-# same-binary guard) would be lost while the run still printed
+# and `01`, all of which make that line invalid JSON — and a reader that cannot
+# parse a `meta` line refuses the whole artifact, so the run dir, the digests,
+# the ports and the same-binary guard would be lost while the soak still printed
 # "run completed".
 rss_soak_validate_tolerance() {
     local val="${1:-}"
 
     if ! [[ "$val" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$ ]]; then
-        printf "error: SOAK_TRAFFIC_TOLERANCE must be a finite number in (0, 1] written as a JSON number (got '%s')\n" "$val" >&2
+        printf "error: SOAK_TRAFFIC_TOLERANCE must be a finite number in (0, 1) written as a JSON number (got '%s')\n" "$val" >&2
         return 1
     fi
-    if ! awk -v v="$val" 'BEGIN { x = v + 0; exit !(x == x && x > 0 && x <= 1) }' </dev/null; then
-        printf "error: SOAK_TRAFFIC_TOLERANCE must be a finite number in (0, 1] (got '%s')\n" "$val" >&2
+    if ! awk -v v="$val" 'BEGIN { x = v + 0; exit !(x == x && x > 0 && x < 1) }' </dev/null; then
+        printf "error: SOAK_TRAFFIC_TOLERANCE must be a finite number in (0, 1) (got '%s')\n" "$val" >&2
         return 1
     fi
     return 0
@@ -174,11 +181,11 @@ rss_soak_validate_tolerance() {
 # The artifact is JSON Lines and its `meta` record interpolates strings the
 # caller supplies: the resolved run directory, the frp-rs/Go binary paths, the
 # host name. A `"` or `\` in any of them makes the line unparseable, and an
-# unparseable line is silently skipped by the reader
-# (scripts/lib/rss-soak-summary.py:90-101) — the artifact then loses run_dir,
+# unparseable line now refuses the whole artifact in the reader
+# (scripts/lib/rss-soak-summary.py) with rc 2 — the artifact then loses run_dir,
 # harness_sha256, bin_sha256, the ports and the recipe, and the
-# identical-binaries guard never runs, while the soak still prints
-# "run completed". Escaping therefore lives here, and every string field of the
+# identical-binaries guard never runs, but at least it is never published as a
+# completed run. Escaping therefore lives here, and every string field of the
 # record goes through it (see rss_soak_write_meta), not the call site.
 #
 # Escapes the two characters that terminate/corrupt a JSON string (`"` and `\`)
@@ -307,4 +314,26 @@ rss_soak_rss_kb() {
         return 0
     fi
     printf '%s' "$val"
+}
+
+# rss_soak_append_summary <artifact> <record-file> -> 0 when the record was
+# appended, 1 when there was nothing to append.
+#
+# The summary reader is READ-ONLY: it writes its closing record to a file the
+# CALLER owns (its optional `<summary-out>` argument) and never touches the
+# artifact, so re-reading a published artifact cannot change it and cannot
+# fabricate a verdict over a series that never closed out. What a bare `cat`
+# then gets wrong is the separator: a soak killed mid-`printf` can leave a last
+# line with no trailing newline, and gluing the record to it makes BOTH lines
+# unparseable — which is exactly what hides the previous abort verdict the
+# monotonic rule depends on. So terminate the previous line first.
+rss_soak_append_summary() {
+    local out="${1:-}" record="${2:-}"
+
+    [ -n "$out" ] && [ -n "$record" ] || return 1
+    [ -s "$record" ] || return 1
+    if [ -s "$out" ] && [ -n "$(tail -c 1 -- "$out")" ]; then
+        printf '\n' >> "$out" || return 1
+    fi
+    cat -- "$record" >> "$out"
 }

@@ -80,11 +80,14 @@
 #   SOAK_TRAFFIC_TOLERANCE
 #                         allowed relative spread between the two sides'
 #                         achieved volume (default 0.10 = 10%). A finite number
-#                         in (0, 1] written as a JSON number (`.5` and `+0.5`
-#                         are refused, so the value cannot corrupt the `meta`
-#                         line); anything else is refused up front, because the
-#                         summary's `spread > tolerance` test is silently
-#                         disabled by `nan` (compares false with everything).
+#                         in the OPEN (0, 1) written as a JSON number (`.5` and
+#                         `+0.5` are refused, so the value cannot corrupt the
+#                         `meta` line); anything else is refused up front,
+#                         because the summary's `spread > tolerance` test is
+#                         silently disabled by `nan` (compares false with
+#                         everything) and by exactly 1 (the spread is
+#                         |a - b| / max(a, b), always below 1 for positive
+#                         counts, so 1 can never fail).
 #                         The run records the value it used in `meta`, and the
 #                         summary prefers that recorded value over the ambient
 #                         variable, so re-reading the same artifact cannot flip
@@ -108,9 +111,11 @@
 # Output: scripts/frp-stress/baselines/rss-soak-<hostname>.jsonl
 #   one JSON object per line: one `meta` record, N `sample` records, one
 #   `summary` record. The summary is also printed to stdout. An artifact
-#   WITHOUT a trailing `summary` record is an incomplete run — that is a
-#   convention for whoever reads the series, NOT an enforced check: the script
-#   cannot append a record after a SIGKILL.
+#   WITHOUT a trailing `summary` record is an incomplete run, and the reader
+#   enforces that: it never writes to an artifact, and reading one whose final
+#   line is not a parseable closing record exits 3 naming the condition instead
+#   of inventing a verdict. The script cannot append a record after a SIGKILL,
+#   so a killed run leaves exactly such an artifact.
 #
 # Traffic evidence (why the run dir is cleared before the window opens):
 #   the achieved-load cross-check reads $SOAK_RUN_DIR/{rs,go}-{churn,steady}.json,
@@ -843,10 +848,22 @@ trap - EXIT INT TERM
 
 # Summary + completeness reconciliation live in scripts/lib/rss-soak-summary.py
 # so the fixture can drive the real reader (see scripts/tests/rss-soak-run-dir.sh).
+# The reader NEVER writes to the artifact: it hands the closing record to a file
+# this script owns and appends it here. That is what keeps a later re-read of
+# $OUT read-only — round 6 had the reader appending its own summary, so
+# re-reading the artifact of a run killed before it closed out (`kill -9`) added
+# `"aborted": null` and printed "run completed" over an incomplete series.
+summary_tmp="${OUT}.summary.$$"
 summary_rc=0
 python3 "$SCRIPT_DIR/lib/rss-soak-summary.py" "$OUT" "$aborted" \
   "$RUN_DIR/rs-churn.json" "$RUN_DIR/go-churn.json" \
-  "$RUN_DIR/rs-steady.json" "$RUN_DIR/go-steady.json" || summary_rc=$?
+  "$RUN_DIR/rs-steady.json" "$RUN_DIR/go-steady.json" "$summary_tmp" || summary_rc=$?
+if rss_soak_append_summary "$OUT" "$summary_tmp"; then
+  :
+else
+  echo "warning: no summary record was produced for $OUT (the artifact stays without a closing verdict)" >&2
+fi
+rm -f -- "$summary_tmp"
 
 echo "=== soak artifact written: $OUT ($samples samples) ==="
 exit "$summary_rc"
