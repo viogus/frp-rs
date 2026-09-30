@@ -120,17 +120,20 @@ fn test_visitor_config_validation_matches_go() {
         })
         .unwrap_err()
     };
+    // Go interpolates the name unquoted (`visitor %s: %v`). The empty-name arm
+    // keeps frp-rs's own wording: Go prints `visitor : name is required` there
+    // (measured), a disclosed divergence left for the coordinator.
     assert_eq!(
         err(mk("", "s", 7000, "kcp")),
         "visitor config: name is required"
     );
     assert_eq!(
         err(mk("v", "", 7000, "kcp")),
-        "visitor 'v': server name is required"
+        "visitor v: server name is required"
     );
     assert_eq!(
         err(mk("v", "s", 0, "kcp")),
-        "visitor 'v': bind port is required"
+        "visitor v: bind port is required"
     );
     assert_eq!(
         err(mk("v", "s", 7000, "tcp")),
@@ -7258,6 +7261,268 @@ fn legacy_ini_headers_naming_v1_roots_are_still_proxies() {
                 "{label}, strict={strict}: an INI header cannot build a v1 visitor"
             );
         }
+    }
+}
+
+/// **Legacy-dialect parity, typeless visitor at any depth.** A
+/// `role = "visitor"` `.ini` section with a missing or empty `type` is refused in
+/// **both** loader modes with Go's message, whatever its header names and
+/// wherever that header puts it.
+///
+/// Go dispatches on `role` *before* it looks at the header
+/// (`LoadAllProxyConfsFromIni`, `pkg/config/legacy/client.go:204`) and iterates
+/// `f.Sections()`, which `gopkg.in/ini.v1` never expands: `[auth.foo]` is one
+/// section literally named `auth.foo` and `[v]` is one named `v`. frp-rs
+/// *expands* a dotted header under an `INI_NESTED_SECTION_ROOTS` entry into a v1
+/// sub-table, so the pre-collection refusal has to walk the expanded tree to see
+/// the same section. Iterating the top level only missed `[auth.foo] role =
+/// "visitor" server_name = s` and let it load (rc 0 in both modes, `Proxies: 0`)
+/// where Go v0.71.0 is rc 1 in both modes with `failed to parse visitor
+/// auth.foo, err: type shouldn't be empty`; the portless `[v]` spelling was the
+/// same silent drop in lenient mode.
+#[test]
+fn legacy_ini_typeless_visitor_is_refused_at_any_depth() {
+    let head = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "portless top level",
+            "[v]\nrole = \"visitor\"\nserver_name = s\n",
+            "v",
+        ),
+        (
+            "port-carrying top level",
+            "[v]\nrole = \"visitor\"\nlocal_port = 1\nremote_port = 2\n",
+            "v",
+        ),
+        (
+            "dotted settings root",
+            "[auth.foo]\nrole = \"visitor\"\nserver_name = s\n",
+            "auth.foo",
+        ),
+        (
+            "dotted camelCase settings root",
+            "[webServer.foo]\nrole = \"visitor\"\nserver_name = s\n",
+            "webServer.foo",
+        ),
+        (
+            "dotted store root",
+            "[store.frontend]\nrole = \"visitor\"\nserver_name = s\n",
+            "store.frontend",
+        ),
+        (
+            "port-carrying reserved root",
+            "[transport]\nlocal_port = 8080\nrole = \"visitor\"\n",
+            "transport",
+        ),
+        (
+            "port-carrying camelCase reserved root",
+            "[webServer]\nlocal_port = 8080\nrole = \"visitor\"\n",
+            "webServer",
+        ),
+    ];
+    for (label, body, want_name) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(&path, format!("{head}{body}")).unwrap();
+        for strict in [false, true] {
+            let err = format!(
+                "{}",
+                load_client_config(path.to_str().unwrap(), strict)
+                    .expect_err("a typeless visitor is refused in both modes, at any depth")
+            );
+            assert!(
+                err.contains(&format!(
+                    "failed to parse visitor {want_name}, err: type shouldn't be empty"
+                )),
+                "{label}, strict={strict}: Go's refusal under the raw header name; got {err}"
+            );
+        }
+    }
+}
+
+/// **Legacy-dialect parity, typed visitor naming a reserved settings root.** A
+/// typed `role = "visitor"` section is a **visitor** even when its header names a
+/// v1 settings root or carries proxy port keys — `role` is authoritative in Go,
+/// where it is read before the header.
+///
+/// Measured on Go v0.71.0, rc 1 in both loader modes: `[web_server] type = "stcp"
+/// local_port = 8080 role = "visitor" server_name = s` → `visitor web_server:
+/// bind port is required`, and `[auth] remote_port = 7500 role = "visitor" type =
+/// "stcp" server_name = s` → `visitor auth: bind port is required`. The untyped
+/// spelling of both was already refused with Go's `type shouldn't be empty`; the
+/// typed one was dropped in lenient mode (`Proxies: 0`, `Visitors: 0`) and, for
+/// the reserved-root spelling, accepted in strict mode too, where origin/main had
+/// refused it with `unknown field "web_server.local_port"`. Adding a bind port
+/// must still register the visitor, so the section is genuinely collected rather
+/// than rejected for an unrelated reason.
+#[test]
+fn legacy_ini_typed_reserved_root_visitor_is_refused_like_go() {
+    let head = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "reserved root, type and ports",
+            "[web_server]\ntype = \"stcp\"\nlocal_port = 8080\nrole = \"visitor\"\nserver_name = s\n",
+            "visitor web_server: bind port is required",
+        ),
+        (
+            "reserved root, port only",
+            "[auth]\nremote_port = 7500\nrole = \"visitor\"\ntype = \"stcp\"\nserver_name = s\n",
+            "visitor auth: bind port is required",
+        ),
+        (
+            "reserved root, no port at all",
+            "[log]\ntype = \"stcp\"\nrole = \"visitor\"\nserver_name = s\n",
+            "visitor log: bind port is required",
+        ),
+    ];
+    for (label, body, want) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(&path, format!("{head}{body}")).unwrap();
+        for strict in [false, true] {
+            let err = format!(
+                "{}",
+                load_client_config(path.to_str().unwrap(), strict)
+                    .expect_err("the missing bind port is refused in both modes")
+            );
+            assert!(
+                err.contains(want),
+                "{label}, strict={strict}: Go's visitor validation message; got {err}"
+            );
+        }
+    }
+
+    // The same shape with a bind port is the visitor it says it is.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        format!(
+            "{head}[web_server]\ntype = \"stcp\"\nlocal_port = 8080\nrole = \"visitor\"\n\
+             bind_port = 19000\nserver_name = s\n"
+        ),
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict).unwrap_or_else(|e| {
+            panic!("a reserved-root visitor with a port, strict={strict}: {e}")
+        });
+        assert!(cfg.proxies.is_empty(), "strict={strict}: not a proxy");
+        assert_eq!(cfg.visitors.len(), 1, "strict={strict}");
+        assert_eq!(cfg.visitors[0].name, "web_server", "strict={strict}");
+        assert_eq!(cfg.visitors[0].visitor_type, "stcp", "strict={strict}");
+        assert_eq!(cfg.visitors[0].bind_port, 19000, "strict={strict}");
+    }
+}
+
+/// A typed `.ini` header naming a v1 **array** root is collected under its raw
+/// name, and `role = "visitor"` sends it to `[visitors]` — the type-dispatching
+/// half of `legacy_ini_headers_naming_v1_roots_are_still_proxies`, which covers
+/// the typeless and proxy spellings.
+#[test]
+fn legacy_ini_typed_array_root_visitor_is_collected() {
+    let head = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
+    for (header, want_name) in [
+        ("visitors.foo", "visitors.foo"),
+        ("proxies.foo", "proxies.foo"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(
+            &path,
+            format!(
+                "{head}[{header}]\ntype = \"stcp\"\nrole = \"visitor\"\nbind_port = 19100\n\
+                 server_name = s\n"
+            ),
+        )
+        .unwrap();
+        for strict in [false, true] {
+            let cfg = load_client_config(path.to_str().unwrap(), strict).unwrap_or_else(|e| {
+                panic!("typed array-root visitor [{header}], strict={strict}: {e}")
+            });
+            assert!(cfg.proxies.is_empty(), "[{header}], strict={strict}");
+            assert_eq!(cfg.visitors.len(), 1, "[{header}], strict={strict}");
+            assert_eq!(
+                cfg.visitors[0].name, want_name,
+                "[{header}], strict={strict}"
+            );
+            assert_eq!(
+                cfg.visitors[0].visitor_type, "stcp",
+                "[{header}], strict={strict}"
+            );
+        }
+    }
+}
+
+/// **Disclosed residual.** A typed v1 **settings** root in an `.ini` stays the
+/// settings table frp-rs has always read it as, in both loader modes, where Go
+/// reads it as a legacy proxy and refuses it.
+///
+/// `[log] type = "custom" disable_print_color = true`: Go v0.71.0 is rc 1 in both
+/// modes with `failed to parse proxy log, err: invalid type [custom]`; frp-rs is
+/// rc 0 in both with `Proxies: 0`. origin/main happened to be rc 1 in strict mode
+/// for an unrelated reason (`unknown field "log.type"`, which the section-level
+/// `.ini` strict exemption removed). The rc-0 verdict is deliberate: the
+/// reserved-root bypass keys on the **port** keys and never on `type`, because
+/// keying it on `type` would collect every typed settings root and contradict
+/// `test_legacy_ini_known_section_with_type_not_collected` and the `[web_server]
+/// type`-only v1 boundary. This test pins the strict verdict so the delta is
+/// measured rather than silent.
+#[test]
+fn legacy_ini_typed_settings_root_with_type_stays_a_settings_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [log]\ntype = \"custom\"\ndisable_print_color = true\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict).unwrap_or_else(|e| {
+            panic!("residual: frp-rs accepts what Go refuses, strict={strict}: {e}")
+        });
+        assert!(
+            cfg.proxies.is_empty(),
+            "strict={strict}: stays a settings table"
+        );
+        assert!(
+            cfg.log.disable_print_color,
+            "strict={strict}: the log section is still read"
+        );
+    }
+}
+
+/// A **non-string** `type` in a legacy `.ini` section is not the empty string.
+///
+/// Go reads `section.Key("type").String()` (`pkg/config/legacy/proxy.go:78`), so
+/// `type = 1` is the text `"1"` and `DefaultProxyConf` has no such variant:
+/// measured on Go v0.71.0, `[p] type = 1 local_port = 8080 remote_port = 18080`
+/// is rc 1 in both loader modes with `failed to parse proxy p, err: invalid type
+/// [1]`. frp-rs refuses it too, through the v1 type check and with its own
+/// wording. Only a *string* `type` may be defaulted to `tcp`, so a value of any
+/// other shape must not be treated as missing — that would turn this rc-1 file
+/// into an rc-0 `tcp` proxy.
+#[test]
+fn legacy_ini_non_string_type_is_not_defaulted_to_tcp() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [p]\ntype = 1\nlocal_port = 8080\nremote_port = 18080\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let err = format!(
+            "{}",
+            load_client_config(path.to_str().unwrap(), strict)
+                .expect_err("a non-string type is not a tcp default")
+        );
+        assert!(
+            err.contains("invalid proxy_type '1'"),
+            "strict={strict}: Go refuses `type = 1`; got {err}"
+        );
     }
 }
 

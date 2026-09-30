@@ -1042,11 +1042,24 @@ pub(super) fn validate_client_config(cfg: &mut ClientConfig) -> Result<(), Strin
         if v.name.is_empty() {
             return Err("visitor config: name is required".to_string());
         }
+        // Go's wording is `visitor %s: %v` — the name is interpolated **without**
+        // quotes (`pkg/config/v1/validation/client.go:216` wraps with
+        // `fmt.Errorf("visitor %s: %v", c.GetBaseConfig().Name, err)`, message
+        // text in `pkg/config/v1/validation/visitor.go`). Measured on Go v0.71.0
+        // for a missing `serverName` / `bindPort` in TOML and for the legacy
+        // `.ini` spellings: `visitor v: server name is required` /
+        // `visitor v: bind port is required`. These two messages previously
+        // quoted the name (`visitor 'v': …`), which made a legacy `.ini` refusal
+        // that reaches this validator — the reserved-root visitor of
+        // `collect_legacy_ini_proxy_sections` — differ from Go's text for no
+        // reason. The empty-name arm above keeps its own wording, and the
+        // unknown-type arm below keeps the v1 wording the strict-mode pins
+        // assert; both are disclosed divergences, not parity.
         if v.server_name.is_empty() {
-            return Err(format!("visitor '{}': server name is required", v.name));
+            return Err(format!("visitor {}: server name is required", v.name));
         }
         if v.bind_port == 0 {
-            return Err(format!("visitor '{}': bind port is required", v.name));
+            return Err(format!("visitor {}: bind port is required", v.name));
         }
         // Round-8 blocker: Go v0.71.0 dispatches visitors by a type switch
         // over stcp/sudp/xtcp (validation/visitor.go ValidateVisitorConfigurer)
