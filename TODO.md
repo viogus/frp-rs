@@ -4222,7 +4222,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   reviewer's full run left **167** reparented Go processes, reaped the same way. A third piece of
   evidence, from CI rather than a local run: **#397's** failed Cross-Compat run had the runner
   terminate **two dozen** orphans.
-  The script's own cleanup is `cleanup()`/`cleanup_pids()` (`scripts/compat-test.sh:145-176`), a
+  The script's own cleanup is `cleanup()` (`scripts/compat-test.sh:164`) and `cleanup_pids()` (`scripts/lib/compat-stray-guard.sh:57`), a
   `kill` over a `PIDS` list plus a bounded wait and `kill -9`; the leak is the paths that do not
   reach it — a `run_go` background child that has already been reparented when the trap runs, or a
   scenario that aborts between spawn and `track_pid`.
@@ -4233,19 +4233,19 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   repository's stray rules forbid name-only kills.
   **Done (2026-09-30, at `10a86d3a` on `fix/test-harness-strays`, based on `971e0fa0`).** One
   commit, `10a86d3a` "fix(compat): exec the Go servers so tracked pids are the servers". (a) Root
-  cause, seen in vivo: `run_go()` (`scripts/compat-test.sh:128`) is a shell function, so each
+  cause, seen in vivo: `run_go()` (`scripts/compat-test.sh:137`) is a shell function, so each
   backgrounded `run_go … &` call forked a **subshell**; `track_pid $!` recorded that wrapper
   (`bash`) and `cleanup_pids` killed only it, leaving the real Go servers reparented — the
   before-census's Go children carried wrapper pids as `PPID` (17046/17091/17230, sampled while
   the run was still alive; once the wrappers exit and the script is gone the orphans reparent
   to `PPID 1`, which is the census the item above records) while the Rust
   children's `PPID` was the main script. Fixed by `exec`ing inside `run_go`
-  (`scripts/compat-test.sh:128-132`), with the invariant stated in the comment above it (`:126-127`):
+  (`scripts/compat-test.sh:137-141`), with the invariant stated in the comment above it (`:135-136`):
   all 90 call sites were audited and every one is backgrounded, so `exec` cannot replace the script
   shell. (b) The done-when asked for the script's own means and forbade name-only kills: the new
-  pkill-free `scenario_strays` (`:215`) + `assert_no_strays` (`:235`) match a process name **and**
-  the run's own `$TEST_DIR/` prefix, subtract a baseline captured at `:228`, print `pid ppid command`
-  for each survivor, reap by those exact pids and return non-zero; the `EXIT` trap (`:256`) runs
+  pkill-free `scenario_strays` (`scripts/lib/compat-stray-guard.sh:90`) + `assert_no_strays` (`:150`) match a process name **and**
+  the run's own `$TEST_DIR/` prefix, subtract a baseline captured at `:143`, print `pid ppid command`
+  for each survivor, reap by those exact pids and return non-zero; the `EXIT` trap (`scripts/compat-test.sh:188`) runs
   `cleanup_pids` and lets the guard set the status. (c) Measured with
   `bash scripts/compat-test.sh --ci` (the `GO_FRP_V2=1` this recipe first carried was
   **inert** — V2 is gated by `ensure_go_frp_v2` on the Go binaries being present,
@@ -4264,8 +4264,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `bash scripts/repo-health.sh` → `RESULT: invariants hold`. No `CHANGELOG.md` entry: developer
   script only, matching the #415/#416 repo-health precedent — the suite's scenario count, wire
   surface and CLI are unchanged. Residue filed, not fixed: the XTCP helper's pre-existing
-  `pkill -f "frpc -c"` / `pkill -f "frps -c"` (`scripts/compat-test.sh:4411-4412`, inside
-  `run_xtcp_test` at `:4399`) — pattern kills of the class this item forbade for its own children.
+  `pkill -f "frpc -c"` / `pkill -f "frps -c"` (`scripts/compat-test.sh:4343-4344`, inside
+  `run_xtcp_test` at `:4331`) — pattern kills of the class this item forbade for its own children.
 - [x] **`frps/tests/log_completion.rs` is a load-dependent flake: the child never writes its log
   file inside the readiness window.**
   Found by the first reviewer on this branch (the file is **outside** that change's diff, and it
@@ -4299,7 +4299,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   (c) Fix: the wait is now for the appender's **own record** — `fresh_log_reached_appender`
   (`frps/tests/log_completion.rs:485`) requires the fresh file's contents to contain
   `STARTUP_MARKER` (`:91`, the first line `frps` emits after `init_tracing` returns;
-  `frps/src/main.rs:317`), and `aged_file_survives` (`:501-537`) fails fast with
+  `frps/src/main.rs:461`, `init_logging` at `:444`), and `aged_file_survives` (`:501-537`) fails fast with
   `{tag}: frps exited ({status}) before the appender recorded {STARTUP_MARKER:?} in …` instead of
   waiting out the full `READY_TIMEOUT` when the child dies first. (d) Pin + teeth: the new test
   `readiness_gate_needs_the_appenders_own_record` (`:605`) requires that an empty dir and a dir
@@ -7801,7 +7801,7 @@ section; ledger now **24 open / 104 closed**.**
   repository's stray rules say "never by name alone"; name-plus-argument is the same hazard in a
   weaker form.
   **Done-when:** replace the two `pkill -f` calls with the pid-exact sweep the closed item added
-  (`scenario_strays`/`assert_no_strays` at `scripts/compat-test.sh:215`/`:235`, or a per-scenario pid
+  (`scenario_strays`/`assert_no_strays` at `scripts/lib/compat-stray-guard.sh:90`/`:150`, or a per-scenario pid
   file), so a full XTCP run leaves no process it did not start, or record why the pattern kill is
   required there (e.g. a `fuser`/pid-file route is impossible for that shard's Go children).
 - [ ] **`frpc/tests/warn_delivery.rs` snapshots its counts after a fixed 500 ms settle — the same class of load-dependent wait `frps/tests/log_completion.rs` just lost.**
