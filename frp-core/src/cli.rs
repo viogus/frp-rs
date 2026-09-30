@@ -3782,7 +3782,7 @@ impl FrpsArgs {
         }
         // `--log-format` has no `LogConfig::complete` slot and no Go analogue
         // on the file lane, so it keeps the raw write-through; see the
-        // `log_format_ignores_the_override_filter` pin below.
+        // `log_flag_zero_values_do_not_override_the_config_file` pin below.
         if let Some(ref v) = self.log_format {
             cfg.log.format = v.clone();
         }

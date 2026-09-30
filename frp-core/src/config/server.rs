@@ -430,20 +430,22 @@ impl ServerConfig {
         // `ProxyBindAddr` fills at `:110-114`. frp-core had no Auth completion
         // step; the two now run in Go's order.
         //
-        // Why it is needed at all: an explicit `--log-level ""` / `--log-file ""`
-        // / `--log-max-days 0` is written into the struct by
-        // `FrpsArgs::override_server_config` (`frp-core/src/cli.rs`) BEFORE this
-        // call, and the serde defaults on `LogConfig` fire only for an ABSENT
-        // key — so without this fill the empty/zero value reaches
-        // `init_logging` (`frps/src/main.rs`) and the server goes **silent while
-        // its listener still binds**. Measured on the pre-fix binary, own free
-        // port, flags-only lane, stdout/stderr counted separately before any
-        // signal: `--log-level ""` → 0 B stdout / 0 B stderr (tracing-core maps
-        // `LevelFilter::from_str("")` to `ERROR` — `metadata.rs:798` — and every
-        // startup record is `INFO`), `--log-file ""` → 0 B / 0 B **and** a
-        // `frps.log.<date>` file created in the CWD instead. Go v0.71.0 with the
-        // same flags logs its startup lines on stdout (measured: 282 B / 3
-        // `INFO` lines, 0 B stderr, listener up).
+        // Why it is needed: the *config file's* empty/zero values need Go's
+        // `util.EmptyOr` fill. The serde defaults on `LogConfig` fire only for an
+        // ABSENT key, and the resolvers in `frp-core/src/logging.rs` filter only
+        // the **CLI** arm — so an explicit `level = ""` reaches `init_logging`
+        // (`frps/src/main.rs`) and the server goes **silent while its listener
+        // still binds** (measured on the pre-fix binary, own free port,
+        // stdout/stderr counted separately before any signal: `--log-level ""` →
+        // 0 B stdout / 0 B stderr, tracing-core maps `LevelFilter::from_str("")`
+        // to `ERROR` — `metadata.rs:798` — and every startup record is `INFO`).
+        // The CLI arm no longer arrives here as a zero: `override_server_config`
+        // skips an empty `--log-level`/`--log-file` and a zero `--log-max-days`,
+        // so this call is Go's config-side fill (`level = ""` → `info`,
+        // `to = ""` → `console`, `max_days = 0` → `3`) and can no longer rewrite
+        // a flag's zero over a file's explicit value. Go v0.71.0 with the same
+        // flags logs its startup lines on stdout (measured: 282 B / 3 `INFO`
+        // lines, 0 B stderr, listener up).
         //
         // The Go call sits after `Auth.Complete()`, which can fail and return
         // early; frp-rs has no fallible completion before this point, so there

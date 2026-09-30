@@ -31,40 +31,34 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// `LogConfig::complete` (`frp-core/src/config/server.rs`) for the config-side
 /// half of the same fill.
 ///
-/// **Which value the fall-through reaches differs between the two binaries when
-/// the config file sets a non-default `level`, and that is a recorded
-/// divergence, not an accident of this function.** Only `frps` overlays its CLI
-/// flags onto the loaded config (`FrpsArgs::override_server_config`), so its
-/// `cfg_level` is the *post-overlay, post-completion* value: an empty
-/// `--log-level ""` is written into `[log] level` and then filled to `"info"` by
-/// `LogConfig::complete`, so the empty CLI falls through to `"info"` — measured
-/// with `[log] level = "warn"` plus `--log-level ""`: **1498 raw bytes, 7
-/// records, all `INFO`, 0 `WARN`**, listener up. `frpc` never overlays its CLI
-/// flags, so its `cfg_level` stays the file's value and `warn` is honoured:
-/// **0 `INFO` records in every shape measured**, with the record *composition*
-/// depending on the client's `login_fail_exit` (default `true`) and on whether a
-/// server is live. All three rows below are `[log] level = "warn"`, one tcp
-/// proxy, own dir and free port, 3 s settle, pre-signal, **raw-stream bytes**
-/// (ANSI-stripped totals in brackets), and each is identical with and without
-/// `--log-level ""` — which is the point:
+/// Where the fall-through reaches is the same on both binaries: an empty CLI
+/// value counts as *not supplied*, so the config file's `level` wins whether the
+/// caller is `frps` or `frpc`, and the built-in default applies only when no
+/// config file supplied one. `frps` is the only binary that overlays its CLI
+/// flags onto the loaded config (`FrpsArgs::override_server_config`), and that
+/// overlay now skips the same zero values this function filters — an empty
+/// `--log-level`/`--log-file` and a zero `--log-max-days` — because
+/// `LogConfig::complete` (`frp-core/src/config/server.rs`) would otherwise fill
+/// the overlaid zero to Go's zero value (`info`/`console`/`3`) and *raise* a
+/// file's explicit `warn`. Before that filter the two binaries disagreed
+/// whenever the file set a non-default `level`: measured at the parent commit
+/// with `[log] level = "warn"` and no `-c`, `frps` produced 0 B / 0 records with
+/// no flag but **2412 B / 11 `INFO` records** with `--log-level ""`, while
+/// `frpc` honoured the file (0 `INFO` in every shape measured).
 ///
-/// | `frpc` shape | raw bytes | records | composition |
-/// |---|---|---|---|
-/// | live server, proxy registers | 478 B (445 B) | 1 | 1 `WARN` — the TLS-verification-disabled banner |
-/// | no server, `login_fail_exit = false` (retries) | 624 B (494 B) | 2 | 2 `WARN` |
-/// | no server, no `login_fail_exit` line (defaults `true`, gives up) | 569 B (455 B) | 2 | 1 `WARN` (login failed) + 1 `ERROR` (`frpc error: …`) |
-///
-/// The `login_fail_exit` default is what produces the third row's `ERROR`
-/// record: with it `true` the client gives up after the first failed login
-/// instead of retrying, and `frp_client::service` logs the failure at `WARN`
-/// before `frpc` reports the fatal error. A carrier that quotes the
-/// composition without the shape has quoted a context, not a rule — the
-/// rule-shaped part is the `0 INFO` column. Controls: `frps` with the config's
-/// `warn` and **no** flag → 0 B / 0 records, so the empty flag is what raises it
-/// to `info`; with no `[log] level` in the file both binaries resolve to
-/// `"info"`. Filed as its own `TODO.md` item; aligning them would mean making
-/// `frps` skip an empty `--log-level` rather than complete it to Go's zero
-/// value, which is a product call.
+/// Go v0.71.0 has no disagreement to copy: its file-backed lane (`-c <file>`,
+/// same `[log] level = "warn"`) emits **0 records** with no flag, with
+/// `--log-level ""` and with `--log-level info` on both binaries, because `-c`
+/// discards the pflag-bound struct (`pkg/config/load.go:313,318-321`); its
+/// flags-only lane (`frps --log-level ""`, no config file) completes the empty
+/// value to `info` (`util.EmptyOr(Level, "info")`, `pkg/config/v1/common.go:121`)
+/// — measured: 186 B / 1 `[I]` record, listener up. `frpc`'s run path has no
+/// `--log-level` flag at all (Go v0.71.0: `Error: unknown flag: --log-level`,
+/// rc 1, 1343 B stderr), so the two binaries can be compared on the value they
+/// resolve but not on the flag surface. Pinned by
+/// `frp-core/src/cli.rs::log_flag_zero_values_do_not_override_the_config_file`
+/// and
+/// `frps/tests/cli_completion.rs::cli_empty_log_level_keeps_the_config_files_level`.
 pub fn resolve_log_level(
     cli_level: Option<String>,
     cfg_level: Option<&str>,
