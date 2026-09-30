@@ -201,6 +201,12 @@ jobs:
       # `config_dir_where_every_service_fails_to_run_exits_like_dash_c` was
       # tightened from "non-zero" to the exact `3` (a re-point, net zero).
       # Re-derived after the rebase onto `3f66d823` (#422): 33 + 1 + 2 = 36.
+      # 35 → 36 with round 3 of the same round: +1
+      # (`config_dir_where_one_service_fails_keeps_serving_and_exits_zero`), the
+      # **converse** of the all-failed decision — one file's service fails at run
+      # time and the other serves, so the lane must return 0 (it was unpinned:
+      # `if true` in place of `failures.len() == files.len()` kept every
+      # all-failed pin green).
       FRPS_CLI_TESTS: "36"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
@@ -233,6 +239,11 @@ jobs:
       # (`config_dir_where_every_service_fails_to_run_exits_like_dash_c`), which
       # is deliberately ungated so it also runs in this `tiny` lane.
       # Re-derived after the rebase onto `3f66d823` (#422): 18 + 1 + 1 = 20.
+      # 19 → 20 with round 3 of the same round: +1
+      # (`config_dir_where_one_service_fails_keeps_retrying_and_exits_zero`),
+      # the converse pin — one file's service stops at run time, the other keeps
+      # retrying (`loginFailExit = false`, honoured by `frpc-tiny`) and the lane
+      # exits 0 on SIGTERM — ungated for the same reason.
       FRPC_TINY_CLI_TESTS: "20"
     steps:
       - uses: actions/checkout@v4
@@ -260,10 +271,38 @@ jobs:
         # `dir_registry_tests::lock_dir_registry_recovers_a_poisoned_registry`
         # pins the `--config-dir` SIGUSR1 registry's poisoned-mutex recovery
         # (TODO.md `--config-dir` residue item 7), and until this step existed
-        # that pin executed in no CI lane. No count literal: the module is
-        # inline in `frps/src/main.rs`, so adding or removing one of its tests
-        # must not require touching this job's `FRPS_CLI_TESTS` guard.
-        run: cargo test -p frps --bin frps --all-features
+        # that pin executed in no CI lane. The count is asserted for the reason
+        # the steps below document: a bare `cargo test --bin frps` cannot tell
+        # "1 passed" from "0 ran" — with the module's only `#[test]` deleted this
+        # step printed `running 0 tests` / `test result: ok. 0 passed; 0 failed`
+        # and still exited 0. The literal is this **bin** target's own count, not
+        # `FRPS_CLI_TESTS` (that env var counts the integration target
+        # `frps/tests/cli_exit_codes.rs`), so adding or removing a test in this
+        # inline module moves only the single literal in this step.
+        shell: bash
+        run: |
+          set -eo pipefail
+          log=/tmp/frps-bin-unit-tests.log
+          cargo test -p frps --bin frps --all-features --color never 2>&1 | tee "$log"
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+          n=$(cargo test -p frps --bin frps --all-features --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          status=0
+          grep -q "Running unittests src/main.rs" "$log.plain" || status=1
+          grep -q "test result: ok. 1 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "1" ] || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::frps bin unit-test guard failed (status=$status, file=$n, log=$log)"
+            if [ -n "$n" ] && [ "$n" != "1" ]; then
+              if [ "$n" -lt "1" ]; then
+                echo "::error::the inline test module in frps/src/main.rs lists $n tests, this step expects 1 — its tests were deleted or the module was disabled; restore them rather than lowering this literal"
+              else
+                echo "::error::the inline test module in frps/src/main.rs lists $n tests, this step expects 1: move the single literal in this shell step from 1 to $n"
+              fi
+            fi
+            cat "$log.plain"
+            exit 1
+          fi
+          echo "frps bin unit-test guard ok: $n tests listed (expected 1), 0 failed"
       - name: Run vnet unit tests (nathole membership/cap guards)
         # frps/frpc default features exclude `vnet`, so the default-feature
         # `cargo test --workspace` steps never compile the nathole.rs vnet
@@ -680,8 +719,14 @@ jobs:
         # No `--features` flag: the file is `#![cfg(feature = "full")]`-gated and
         # `full` is the default, so this is the same artifact the plain step
         # builds. `FRPC_BIN` overrides the binary the file spawns, which is how
-        # it is falsified against the pre-change and first-round binaries
-        # (measured: `/tmp/enable-warn-probe/out2-falsify-frpc-{base,reviewed}.txt`).
+        # it is falsified in both directions — the runs and their failure sets
+        # are recorded in that file's own header (`frpc/tests/warn_delivery.rs`,
+        # "Falsification (measured)"): against the pre-change binary the plain
+        # `-c` test fails (`stdout: 0`) while `--config-dir` passes, and against
+        # the first-round binary the `[common]` test fails while the plain ones
+        # pass. Like the `frps` twin above, the falsification lives in the file
+        # rather than in this step, because the probe trees it was measured in
+        # are gone.
         shell: bash
         run: |
           set -eo pipefail

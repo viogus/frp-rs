@@ -754,18 +754,49 @@ async fn run(mut cli: FrpsArgs) {
 /// so a panic while the lock is held (a service task panicking mid-rotation
 /// would do it) would otherwise make every *later* signal panic inside
 /// `Mutex::lock().unwrap()` — a single failure silently escalating into "the
-/// reload lane is dead". `lock_dir_registry` recovers the live list and logs;
-/// this pins the recovery so it cannot regress to `unwrap()` unnoticed.
+/// reload lane is dead". `lock_dir_registry` recovers the *live list* and logs;
+/// this pin seeds the registry with a real service and captures the recovery's
+/// log, so recovering an emptied list, or dropping the log line, is red rather
+/// than indistinguishable from recovery.
 #[cfg(all(test, unix))]
 mod dir_registry_tests {
     use super::{lock_dir_registry, DirRegistry};
+    use std::sync::{Arc, Mutex};
 
-    #[test]
-    fn lock_dir_registry_recovers_a_poisoned_registry() {
-        let registry: DirRegistry = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(
-            std::sync::Arc<frp_server::service::Service>,
-            String,
-        )>::new()));
+    /// An in-memory `tracing` writer: the recovery log has to be asserted, and
+    /// `tracing_subscriber` is already a bin dependency (`init_logging`).
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("capture lock").clone()).expect("utf-8 log")
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_dir_registry_recovers_a_poisoned_registry() {
+        let mut cfg = frp_core::config::ServerConfig::default();
+        cfg.auth.token = "registry-pin".to_string();
+        let service = Arc::new(
+            frp_server::service::Service::with_unsafe_features(cfg, None, Default::default())
+                .await
+                .expect("construct a service for the registry fixture"),
+        );
+        let registry: DirRegistry =
+            Arc::new(Mutex::new(vec![(service.clone(), "live.toml".to_string())]));
+
         let poisoner = registry.clone();
         let _ = std::thread::spawn(move || {
             let _held = poisoner.lock().expect("fresh lock");
@@ -777,10 +808,30 @@ mod dir_registry_tests {
             "the mutex must actually be poisoned, or this pin proves nothing"
         );
 
-        let guard = lock_dir_registry(&registry);
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let captured = captured.clone();
+                move || captured.clone()
+            })
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::with_default(subscriber, || lock_dir_registry(&registry));
+
+        assert_eq!(
+            guard.len(),
+            1,
+            "recovery must hand back the live list, not clear it"
+        );
         assert!(
-            guard.is_empty(),
-            "recovery must hand back the live service list (empty here), not unwind"
+            Arc::ptr_eq(&guard[0].0, &service),
+            "the recovered entry must still be the live service"
+        );
+        assert_eq!(guard[0].1, "live.toml");
+        let log = captured.text();
+        assert!(
+            log.contains("directory registry mutex was poisoned"),
+            "recovery must log the poison it recovered from; log={log:?}"
         );
     }
 }
