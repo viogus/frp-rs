@@ -1868,21 +1868,36 @@ fn collect_legacy_ini_proxy_sections(
     let mut visitor_indices = Vec::new();
 
     // Known non-proxy top-level sections are never collected even if they
-    // happen to carry a `type` key.
+    // happen to carry a `type` key. The camelCase alias of each v1 root is
+    // listed beside its snake_case spelling (`webServer`/`web_server`,
+    // `httpPlugins`/`http_plugins`, `sshTunnelGateway`/`ssh_tunnel_gateway`) —
+    // the same spellings the INI reader expands into nested tables
+    // (`format.rs` `INI_NESTED_SECTION_ROOTS`) and every loader format merges
+    // into the snake_case section (`merge_section_into`). Without the aliases a
+    // `type`-less `.ini` `[webServer]` was collected as a phantom proxy named
+    // after its header, before `merge_section_into(table, "webServer",
+    // "web_server")` could run: measured, a client `.ini` with
+    // `[webServer] port = 7500` loaded with `Proxies: 1` and admin port 0, and
+    // `[webServer] zzz_unknown_key = 1` passed strict mode (legacy proxy
+    // sections are strict-exempt) where base `b8e1dd6d` reported
+    // `unknown field "web_server.zzz_unknown_key"`.
     const KNOWN_SECTIONS: &[&str] = &[
         "common",
         "proxies",
         "visitors",
         "web_server",
+        "webServer",
         "auth",
         "log",
         "transport",
         "plugins",
         "http_plugins",
+        "httpPlugins",
         "feature",
         "featureGates",
         "includes",
         "ssh_tunnel_gateway",
+        "sshTunnelGateway",
         "observability",
         "vnet",
         "store",

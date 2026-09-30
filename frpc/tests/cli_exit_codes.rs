@@ -343,6 +343,50 @@ fn typeless_legacy_ini_proxy_verifies_in_both_modes() {
     }
 }
 
+/// A typeless **camelCase** `[webServer]` in a client `.ini` is frpc's admin
+/// block, not a legacy proxy: `verify` must report `Proxies: 0`.
+///
+/// Regression pin for the phantom-proxy bug in the known-section filter of
+/// `collect_legacy_ini_proxy_sections` — see
+/// `frp-core/src/config/tests.rs::typeless_camelcase_web_server_ini_is_not_a_phantom_proxy`.
+/// Measured on the commit that added the typeless `.ini` proxy default: this
+/// file gave `Proxies: 1` (with the admin section dropped), where base
+/// `b8e1dd6d` gave `Proxies: 0`.
+#[test]
+fn typeless_camelcase_web_server_ini_is_not_a_proxy() {
+    let dir = TempDir::new();
+    let cfg = dir.write(
+        "web_admin.ini",
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [webServer]\nport = 7500\n",
+    );
+
+    for strict in ["--strict-config=false", "--strict-config"] {
+        let out = run_frpc(&["verify", strict, "-c", &cfg]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "frpc verify {strict} -c <[webServer] ini> must exit 0; stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        assert_eq!(
+            stdout_of(&out),
+            format!(
+                "frpc: the configuration file {cfg} syntax is ok\n  Server: 127.0.0.1:7000\n  \
+                 Proxies: 0\n  Visitors: 0\n"
+            ),
+            "[webServer] must stay the admin block, not a proxy ({strict}); stderr={:?}",
+            stderr_of(&out),
+        );
+        assert!(
+            stderr_of(&out).is_empty(),
+            "verify writes nothing to stderr on success; stderr={:?}",
+            stderr_of(&out),
+        );
+    }
+}
+
 /// Deliberate divergence, pinned so it cannot drift silently: Go's
 /// `frpc --config-dir` returns **0** for a directory that does not exist, is
 /// empty, or holds a config that fails to parse (the bad case prints only

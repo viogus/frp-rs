@@ -6576,6 +6576,139 @@ fn dotted_ini_headers_that_are_legacy_proxy_names_stay_proxies() {
     }
 }
 
+/// A `type`-less **camelCase** `[webServer]` in a client `.ini` is frpc's admin
+/// block, not a phantom legacy proxy.
+///
+/// `collect_legacy_ini_proxy_sections` also collects a `type`-less section in
+/// the `.ini` dialect (Go's legacy default: the section is a `tcp` proxy — see
+/// `typeless_ini_proxy_section_defaults_to_tcp_in_both_modes`). Its
+/// known-section filter listed only the snake_case spelling of each v1 root, so
+/// while `[web_server]` was safe, a typeless `[webServer]` was stolen **before**
+/// `merge_section_into(table, "webServer", "web_server")` could run. Measured on
+/// the commit that added the typeless rule: a client `.ini` with
+/// `[webServer] port = 7500` loaded with `Proxies: 1` and `web_server.port == 0`
+/// (base `b8e1dd6d`: `Proxies: 0`, port 7500), and `[webServer]
+/// zzz_unknown_key = 1` passed strict mode — a collected legacy section is
+/// strict-exempt — where base reported `unknown field
+/// "web_server.zzz_unknown_key"`. The fix lists the camelCase aliases
+/// (`webServer`, `httpPlugins`, `sshTunnelGateway`) in the collector's
+/// known-section set, the same spellings the INI reader expands.
+///
+/// **What this models.** Both loader modes on a real client `.ini`, for the flat
+/// `[webServer]`, the nested `[webServer.tls]`, the nested-under-`[common]`
+/// `[common.webServer.tls]`, and the documented `[webServer]` + `[web_server]`
+/// per-key merge; plus the strict-mode report for an unknown key under
+/// `[webServer]`.
+///
+/// **What it does not cover.** The server path never runs the collector, so it
+/// was never affected (frps `[webServer]` / `[webServer.tls]` is pinned in
+/// `dotted_ini_headers_that_are_legacy_proxy_names_stay_proxies`); the two
+/// other alias pairs have no `.ini`-reachable admin table to assert after the
+/// collection step; and a camelCase root that *does* carry `type` is still a
+/// legacy proxy on the client, by the same `type` discriminator as its
+/// snake_case spelling. The `[common.webServer.tls]` row is written **alone**:
+/// a top-level `[webServer]` beside it drops the `[common]` table whole, the
+/// pre-existing `or_insert` flatten of `[common]` pinned in
+/// `both_web_server_sections_merge_per_key_in_both_modes`, not this collector.
+#[test]
+fn typeless_camelcase_web_server_ini_is_not_a_phantom_proxy() {
+    fn write(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(&path, body).unwrap();
+        (dir, path)
+    }
+    const HEAD: &str = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
+
+    // The flat camelCase admin block: loaded, and not taken as a proxy.
+    let (_d, p) = write(&format!("{HEAD}[webServer]\nport = 7500\n"));
+    for strict in [false, true] {
+        let cfg = load_client_config(p.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("[webServer] strict={strict}: {e}"));
+        assert_eq!(cfg.web_server.port, 7500, "strict={strict}");
+        assert!(
+            cfg.proxies.is_empty(),
+            "[webServer] must not become a proxy, strict={strict}; got {:?}",
+            cfg.proxies
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // The nested camelCase TLS table, on its own and under `[common]`.
+    for (label, body) in [
+        (
+            "[webServer.tls]",
+            format!(
+                "{HEAD}[webServer]\nport = 7500\n[webServer.tls]\n\
+                 certFile = /nested/cert.pem\nkeyFile = /nested/key.pem\n"
+            ),
+        ),
+        (
+            "[common.webServer.tls]",
+            format!(
+                "{HEAD}[common.webServer]\nport = 7500\n[common.webServer.tls]\n\
+                 certFile = /nested/cert.pem\nkeyFile = /nested/key.pem\n"
+            ),
+        ),
+    ] {
+        let (_d, p) = write(&body);
+        for strict in [false, true] {
+            let cfg = load_client_config(p.to_str().unwrap(), strict)
+                .unwrap_or_else(|e| panic!("{label} strict={strict}: {e}"));
+            assert_eq!(cfg.web_server.port, 7500, "{label} strict={strict}");
+            assert_eq!(
+                cfg.web_server.tls_cert(),
+                "/nested/cert.pem",
+                "{label} strict={strict}"
+            );
+            assert_eq!(
+                cfg.web_server.tls_key(),
+                "/nested/key.pem",
+                "{label} strict={strict}"
+            );
+            assert!(cfg.proxies.is_empty(), "{label} strict={strict}");
+        }
+    }
+
+    // The documented per-key merge: `[web_server]` (snake) wins every key both
+    // sections define, and the camelCase table is not stolen first.
+    let (_d, p) = write(&format!(
+        "{HEAD}[webServer]\nuser = camel\nport = 7500\n\
+         [web_server]\npassword = snake\nport = 7501\n"
+    ));
+    for strict in [false, true] {
+        let cfg = load_client_config(p.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("merge strict={strict}: {e}"));
+        assert_eq!(cfg.web_server.user, "camel", "strict={strict}");
+        assert_eq!(cfg.web_server.password, "snake", "strict={strict}");
+        assert_eq!(
+            cfg.web_server.port, 7501,
+            "the snake spelling wins; strict={strict}"
+        );
+        assert!(cfg.proxies.is_empty(), "merge strict={strict}");
+    }
+
+    // A key the admin block does not name stays a strict-mode unknown field —
+    // a collected legacy proxy section would have exempted it.
+    let (_d, p) = write(&format!("{HEAD}[webServer]\nzzz_unknown_key = 1\n"));
+    let err = format!(
+        "{}",
+        load_client_config(p.to_str().unwrap(), true)
+            .expect_err("strict mode must report the unknown key")
+    );
+    assert!(
+        err.contains("unknown field \"web_server.zzz_unknown_key\""),
+        "the unknown key must be reported under web_server: {err}"
+    );
+    let cfg = load_client_config(p.to_str().unwrap(), false).expect("non-strict loads");
+    assert!(
+        cfg.proxies.is_empty(),
+        "non-strict: still not a proxy, the unknown key is dropped"
+    );
+}
+
 /// A typeless legacy `.ini` proxy section is Go's `tcp` proxy, in **both** loader
 /// modes, while a `role = "visitor"` section is not defaulted.
 ///

@@ -150,6 +150,11 @@ jobs:
       # client's half of the same change does not move *this* literal: it added
       # tests to `frpc/tests/cli_exit_codes.rs` (the other literal below) and to
       # `frp-client`'s lib tests, which no guarded lane counts.
+      # 29 → 31 with the `--vhost-http-timeout` registration: +2
+      # (`vhost_http_timeout_flag_starts_and_listens`,
+      # `verify_accepts_vhost_http_timeout_both_spellings_and_prints_go_line`),
+      # the run-path and verify-path rows for the flag Go registers at
+      # `pkg/config/flags.go:237`.
       FRPS_CLI_TESTS: "31"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
@@ -159,7 +164,13 @@ jobs:
       # runs `frpc-tiny`, so it is also the only *spawn-level* witness that an
       # oidc-less build refuses `"OIDC"` with Go's text instead of starting a
       # token client.
-      FRPC_TINY_CLI_TESTS: "13"
+      # 13 → 15 with the typeless legacy `.ini` proxy default (Go's `tcp`): +1
+      # (`typeless_legacy_ini_proxy_verifies_in_both_modes`), then +1 for the
+      # regression it introduced, the phantom-proxy steal of a typeless
+      # camelCase `[webServer]`
+      # (`typeless_camelcase_web_server_ini_is_not_a_proxy`). Both are plain
+      # (un-gated) tests, so `frpc-tiny` reaches them.
+      FRPC_TINY_CLI_TESTS: "15"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
