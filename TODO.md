@@ -7293,7 +7293,7 @@ section; ledger now **24 open / 104 closed**.**
   (`expected 2, got 1`). The harness is 19 checks / ~4.6 s, its own step in the `health` job
   (`timeout-minutes: 5`).
 
-- [ ] **Residual fixture-harness coverage nits from the `repo-health-residue` reviews.** Both
+- [x] **Residual fixture-harness coverage nits from the `repo-health-residue` reviews.** Both
   reviewers confirmed the four items closed; these are the leftovers neither could pin.
   **(a)** Scenario 4's per-site revert checks accept any count different from the mutated baseline
   rather than the exact expected drop (site 1 → 2, sites 2/3 → 3), so a walk that drops *more* than
@@ -7313,7 +7313,30 @@ section; ledger now **24 open / 104 closed**.**
   it is not a gate false-green). **Done-when:** each is either asserted (with the measured
   before/after) or its limitation is stated where the check lives.
 
-- [ ] **Two precision residues from the `review-residue-precision` batch.** Both were found while
+  **Done (2026-10-01, at `0544b481` on `fix/test-precision-residue`, based on `origin/main` =
+  `7c3d5707`).** The two `scripts/tests/repo-health-fixtures.sh` commits (`6b399b66`, `bdd56f2e`
+  post-rebase) close all four. (a) Scenario 4's per-site revert checks now assert the **exact**
+  remainder, not "anything but the baseline": `case "$site" in 1) want=2 ;; *) want=3` with the
+  measured baseline of 4 (`scripts/tests/repo-health-fixtures.sh:457-463`), so a walk that drops
+  more than its own evidence is a `bad`, not an `ok`. (b) Scenario 7 (`:507-539`) pins site 4's
+  crate-root row with a hard link from one crate's `src` into another crate's tree — the alias
+  resolves inside its own crate (containment passes) but its inode is already claimed — plus the
+  count-inert mutation that re-raises the row (`mut_npresent`, `:182-198`, moving `n_present += 1`
+  past the dedupe `continue`) as its tooth. (c) Scenario 8 (`:540-575`) pins what is actually
+  assertable — the kernel refusing a 41-link chain — and the harness comment now records the
+  measured bound (32-link chain green / 33 refused on this host, Darwin `MAXSYMLINKS` = 32; the
+  earlier "31/32" came from probing under `/tmp`, itself a symlink; Linux allows 40, so 41 is
+  refused on both) and states that the in-script `> 40` branch is therefore unreachable. (d)
+  `new_tree`/`new_full_tree`'s rc is no longer discarded (`d=$(new_tree "$1") || return 1` at
+  `:130`; `TREE=$(new_tree "$1") || setup_die "new_tree $1"` at `:269`), and scenario 9
+  (`:576-629`) shows an unreadable script under test fails the run loudly: with `setup_die`'s
+  `exit 1` reverted to `return 0` (`:286`) the outer harness goes rc 1 and the run is refused on
+  the `fixture setup: new_tree` row asserted at `:603`, with no `^  ok` row after the setup FAIL.
+  Harness checks 19 → 24 → **32** (counter at `:730`; `RESULT: 32 fixture check(s) hold`). No
+  `CHANGELOG.md` entry: fixture-harness only, the #415/#416 precedent. Gates on the rebased branch:
+  fmt/clippy clean, `bash scripts/repo-health.sh` → `RESULT: invariants hold`, fixture harness 32/32.
+
+- [x] **Two precision residues from the `review-residue-precision` batch.** Both were found while
   closing the three items above; neither is a false green.
   **(a)** The exact `assert_eq!`s in `frp-core/tests/server_tls_enable_warning.rs` duplicate both
   variant strings, so a wording change must move the constant, the literal and the doc measurements
@@ -7325,7 +7348,28 @@ section; ledger now **24 open / 104 closed**.**
   drift test compares them); (b) the delegation is asserted cheaply, or the record says plainly that
   it is unpinned.
 
-- [ ] **The (c) admin-warning fixture cannot distinguish "reads `-c` only" from "reads the cwd first,
+  **Done (2026-10-01, at `0544b481` on `fix/test-precision-residue`).** Commit `48f009c9`
+  (rebased) closes both — (a) through goldens over the **rendered bytes** and (b) through an
+  accessor that makes the delegation observable. (a) The duplicated variant literals are gone: the
+  shipped message is defined once per variant in `frp-core/src/config/loader.rs` (`WEB_SERVER_TLS_ENABLE_INERT_WARNING`
+  `:270`, its no-dashboard sibling `:285`, and `SERVER_TLS_ENABLE_INERT_TLS_CLAUSES` `:345`), and
+  `frp-core/tests/server_tls_enable_warning.rs` now pins length + FNV-1a over the string the code
+  produces (`TLS_RENDERED_LEN = 433` / `TLS_RENDERED_FNV1A = 0x0a17_2261_4d74_606e` at `:110-116`,
+  with the comment at `:331-345`/`:390-403` saying the goldens are to be updated **deliberately**,
+  never re-derived from the clause array). Teeth: swapping the two `SERVER_TLS_ENABLE_INERT_TLS_CLAUSES`
+  elements panics at `:341`, and rewording `reads it.` → `reads it at all.` panics at `:334`
+  (`left 440 / right 433`). Deviation from the obvious choice: dependency-free FNV-1a rather than
+  sha256, because `sha2` is not a `frp-core` dependency and `DefaultHasher` is not stable across
+  releases. (b) `oidc_mock_server_with_timeout` now stores its deadline and exposes
+  `request_head_timeout()` (`frp-server/src/control/login.rs:2343-2349`), and
+  `mock_default_ctor_delegates_the_pinned_deadline` (`:2758-2768`) asserts that the handle
+  `oidc_mock_server()` returns reports `MOCK_REQUEST_HEAD_TIMEOUT` (`:2235`) — the exact wiring the
+  reviewers' `M_delegation_60s` mutant changed while all 18 `oidc` tests stayed green; the literal
+  itself is pinned by `mock_default_request_head_deadline_is_pinned` (`:2738-2746`). No
+  `CHANGELOG.md` entry: no shipped byte or behaviour changed — the goldens exist precisely to hold
+  the rendered bytes fixed — and the only non-test edit is hoisting the diagnostics into constants.
+
+- [x] **The (c) admin-warning fixture cannot distinguish "reads `-c` only" from "reads the cwd first,
   then falls back to `-c`".** Filed by the `review-residue-precision` adversarial review. The fixture
   launches the child with `-c admin-node.toml` while a key-less `frpc.toml` sits in its cwd, so it
   proves the keyed argument file is read at all. Reviewer 1 measured the split: a seed that prefers
@@ -7333,6 +7377,16 @@ section; ledger now **24 open / 104 closed**.**
   the fixture's comment documents), but a seed that falls back to the argument only when the cwd file
   does not set the key stays 4/4 green. **Done-when:** a fixture with the cwd file keyed and the `-c` file
   key-less pins the precedence, or the item records that precedence is deliberately not pinned.
+
+  **Done (2026-10-01, at `0544b481` on `fix/test-precision-residue`).** Commit `a6f4f55f` (rebased)
+  gives sub-case (d) provenance instead of a record count. The `-c` file now declares the only
+  `main` proxy with a distinctive `local_port` (`MAIN_PROXY`, `frpc/tests/admin_config_get_warning.rs:357-361`),
+  while the cwd `frpc.toml` declares none, and (d) asserts the GET body itself carries
+  `"local_port":45999` (`:611-615`). A seed that reads the key-less cwd file first therefore no
+  longer passes at 4/4: it answers `HTTP/1.0 404 … proxy "main" not found` and the assertion panics
+  at `:607`. Combined with the pre-existing assertions, precedence is now pinned in the direction the
+  item asked for (the `-c` file wins over a keyed cwd file — the sibling (c) fixture covers the
+  opposite split) rather than dropped. No `CHANGELOG.md` entry: test fixture only.
 
 - [ ] **A `SIGUSR1` sent to `frps --config-dir` in the pre-registration window silently reloads only the registered subset.**
   Filed by the #419 adversarial review. The handler task logs `SIGUSR1 reload ready (pid=…)` as soon
