@@ -1844,10 +1844,1022 @@ fn cli_args(argv: &[OsString]) -> (Option<String>, Vec<OsString>) {
     (name, rest)
 }
 
+// ===========================================================================
+// The `--help` document: cobra's, rendered from bpaf's parser metadata
+// ===========================================================================
+//
+// Go frp prints **cobra's** help document; frp-rs printed bpaf's. The measured
+// difference (TODO.md:253) is a different *document*, not merely a different
+// layout: `frpc status --help` is 627 B of cobra — an `Overview of all proxies
+// status` first line, a `Usage: frpc status [flags]` line, `Flags:` and
+// `Global Flags:` sections aligned on a 30-column grid, `-h, --help  help for
+// status` — against 1604 B of bpaf.
+//
+// [`render_cobra_help`] rebuilds that document from
+//
+// 1. the **surface**: `frps`/`frpc` itself, or one of its child commands,
+//    derived from the argv [`prepared_cli_argv`] produced (`argv[0]` is the
+//    command word cobra's `Find` would resolve, or a flag when the root is what
+//    resolved), and
+// 2. the **flag surface** of that command, read back out of bpaf's own help
+//    rendering (`Doc::monochrome`) — so the rows cannot drift from the flags the
+//    parser accepts, and the two-entries-per-bool shape bpaf prints
+//    (`--strict-config=BOOL` beside `--strict-config`, the pair
+//    [`go_bool_flag_impl`] builds) collapses to cobra's single row.
+//
+// bpaf cannot supply the flag *texts*: `bpaf::Item` is not nameable outside bpaf
+// (`mod item` is private, `bpaf-0.9.27/src/lib.rs:182`) and `Metavar` has no
+// public accessor (`bpaf-0.9.27/src/meta_help.rs:12`), so every row's varname and
+// usage come from the tables below, measured on the released Go v0.71.0 binary.
+//
+// Only the two `verify` surfaces render byte-identically to Go's document; the
+// other seven are **stated replacements**, because frp-rs's flag surface itself
+// differs from Go's (different proxy flags, `frp-rs`-only log/admin flags, no
+// `nathole`/`completion`/`help` commands). Printing a row for a flag the binary
+// rejects, or hiding a flag it accepts, would be fake parity: the document
+// describes what this binary actually parses.
+
+/// One row of Go frp v0.71.0's pflag flag table.
+///
+/// `varname` is the pflag **type word** pflag prints after the flag name —
+/// `string`, `int`, `duration`, `strings`, `stringToString` — not a metavar:
+/// pflag derives it from the flag's `Value.Type()` (`UnquoteUsage`,
+/// `pflag-1.0.5/flag.go`) and prints nothing at all for a bool. `usage` carries
+/// pflag's ` (default …)` suffix verbatim when the flag's default is non-zero.
+///
+/// `short` is Go's shorthand. It is **checked against** the parser's, never
+/// rendered from here: Go gives `frpc tcp` shorthands (`-i`, `-l`, `-r`, `-s`,
+/// `-P`, `-n`) that frp-rs never implemented, and advertising a shorthand the
+/// parser would reject is exactly the fake parity this layer removes.
+#[derive(Clone, Copy, Debug)]
+struct GoFlagRow {
+    long: &'static str,
+    short: Option<char>,
+    varname: Option<&'static str>,
+    usage: &'static str,
+}
+
+/// `frps`'s root flags, measured from the released Go frp **v0.71.0**
+/// darwin/arm64 binary (`frps --help`, stdout, 2394 B). Order is pflag's own
+/// (byte order of the long name, which is how the binary prints it, and how the
+/// renderer sorts), so the table stays diffable against the measurement.
+///
+/// The set is exactly the flags `frps verify --help` repeats under
+/// `Global Flags` — i.e. Go's persistent `rootCmd` set, and the list a row here
+/// is *missing* from is the interesting half: a flag absent from this table is
+/// either an frp-rs extension ([`FRPS_EXTENSION_FLAGS`]) or a flag frp-rs does
+/// not have.
+const FRPS_GO_FLAGS: &[GoFlagRow] = &[
+    GoFlagRow {
+        long: "allow-ports",
+        short: None,
+        varname: Some("string"),
+        usage: "allow ports",
+    },
+    GoFlagRow {
+        long: "allow-unsafe",
+        short: None,
+        varname: Some("strings"),
+        usage: "allowed unsafe features, one or more of: TokenSourceExec",
+    },
+    GoFlagRow {
+        long: "bind-addr",
+        short: None,
+        varname: Some("string"),
+        usage: "bind address (default \"0.0.0.0\")",
+    },
+    GoFlagRow {
+        long: "bind-port",
+        short: Some('p'),
+        varname: Some("int"),
+        usage: "bind port (default 7000)",
+    },
+    GoFlagRow {
+        long: "config",
+        short: Some('c'),
+        varname: Some("string"),
+        usage: "config file of frps",
+    },
+    GoFlagRow {
+        long: "dashboard-addr",
+        short: None,
+        varname: Some("string"),
+        usage: "dashboard address (default \"0.0.0.0\")",
+    },
+    GoFlagRow {
+        long: "dashboard-port",
+        short: None,
+        varname: Some("int"),
+        usage: "dashboard port",
+    },
+    GoFlagRow {
+        long: "dashboard-pwd",
+        short: None,
+        varname: Some("string"),
+        usage: "dashboard password (default \"admin\")",
+    },
+    GoFlagRow {
+        long: "dashboard-tls-cert-file",
+        short: None,
+        varname: Some("string"),
+        usage: "dashboard tls cert file",
+    },
+    GoFlagRow {
+        long: "dashboard-tls-key-file",
+        short: None,
+        varname: Some("string"),
+        usage: "dashboard tls key file",
+    },
+    GoFlagRow {
+        long: "dashboard-tls-mode",
+        short: None,
+        varname: None,
+        usage: "if enable dashboard tls mode",
+    },
+    GoFlagRow {
+        long: "dashboard-user",
+        short: None,
+        varname: Some("string"),
+        usage: "dashboard user (default \"admin\")",
+    },
+    GoFlagRow {
+        long: "disable-log-color",
+        short: None,
+        varname: None,
+        usage: "disable log color in console",
+    },
+    GoFlagRow {
+        long: "enable-prometheus",
+        short: None,
+        varname: None,
+        usage: "enable prometheus dashboard",
+    },
+    GoFlagRow {
+        long: "kcp-bind-port",
+        short: None,
+        varname: Some("int"),
+        usage: "kcp bind udp port",
+    },
+    GoFlagRow {
+        long: "log-file",
+        short: None,
+        varname: Some("string"),
+        usage: "log file (default \"console\")",
+    },
+    GoFlagRow {
+        long: "log-level",
+        short: None,
+        varname: Some("string"),
+        usage: "log level (default \"info\")",
+    },
+    GoFlagRow {
+        long: "log-max-days",
+        short: None,
+        varname: Some("int"),
+        usage: "log max days (default 3)",
+    },
+    GoFlagRow {
+        long: "max-ports-per-client",
+        short: None,
+        varname: Some("int"),
+        usage: "max ports per client",
+    },
+    GoFlagRow {
+        long: "proxy-bind-addr",
+        short: None,
+        varname: Some("string"),
+        usage: "proxy bind address (default \"0.0.0.0\")",
+    },
+    GoFlagRow {
+        long: "quic-bind-port",
+        short: None,
+        varname: Some("int"),
+        usage: "quic bind udp port",
+    },
+    GoFlagRow {
+        long: "strict-config",
+        short: None,
+        varname: None,
+        usage: "strict config parsing mode, unknown fields will cause errors (default true)",
+    },
+    GoFlagRow {
+        long: "subdomain-host",
+        short: None,
+        varname: Some("string"),
+        usage: "subdomain host",
+    },
+    GoFlagRow {
+        long: "tls-only",
+        short: None,
+        varname: None,
+        usage: "frps tls only",
+    },
+    GoFlagRow {
+        long: "token",
+        short: Some('t'),
+        varname: Some("string"),
+        usage: "auth token",
+    },
+    GoFlagRow {
+        long: "version",
+        short: Some('v'),
+        varname: None,
+        usage: "version of frps",
+    },
+    GoFlagRow {
+        long: "vhost-http-port",
+        short: None,
+        varname: Some("int"),
+        usage: "vhost http port",
+    },
+    GoFlagRow {
+        long: "vhost-http-timeout",
+        short: None,
+        varname: Some("int"),
+        usage: "vhost http response header timeout (default 60)",
+    },
+    GoFlagRow {
+        long: "vhost-https-port",
+        short: None,
+        varname: Some("int"),
+        usage: "vhost https port",
+    },
+];
+
+/// `frpc`'s persistent root flags, measured the same way (`frpc --help`,
+/// 1370 B; `frpc verify --help` repeats exactly these under `Global Flags`).
+const FRPC_ROOT_GO_FLAGS: &[GoFlagRow] = &[
+    GoFlagRow {
+        long: "allow-unsafe",
+        short: None,
+        varname: Some("strings"),
+        usage: "allowed unsafe features, one or more of: TokenSourceExec",
+    },
+    GoFlagRow {
+        long: "config",
+        short: Some('c'),
+        varname: Some("string"),
+        usage: "config file of frpc (default \"./frpc.ini\")",
+    },
+    GoFlagRow {
+        long: "config-dir",
+        short: None,
+        varname: Some("string"),
+        usage: "config directory, run one frpc service for each file in config directory",
+    },
+    GoFlagRow {
+        long: "strict-config",
+        short: None,
+        varname: None,
+        usage: "strict config parsing mode, unknown fields will cause an errors (default true)",
+    },
+    GoFlagRow {
+        long: "version",
+        short: Some('v'),
+        varname: None,
+        usage: "version of frpc",
+    },
+];
+
+/// The `status`/`reload`/`stop` flags Go registers on the command itself
+/// (`cmd/frpc/sub/admin.go`): one row, `--api-timeout`.
+const FRPC_ADMIN_GO_FLAGS: &[GoFlagRow] = &[GoFlagRow {
+    long: "api-timeout",
+    short: None,
+    varname: Some("duration"),
+    usage: "Timeout for admin API calls (default 30s)",
+}];
+
+/// The union of the eight single-proxy commands' own flags on Go v0.71.0
+/// (`frpc tcp --help` 2211 B and `frpc https --help` 2269 B, minus `-h`).
+///
+/// frp-rs's proxy parsers accept a much smaller set than Go's, and only
+/// `--token` with a shorthand, so most of these rows are never looked up — the
+/// table is the *lookup* source, not the surface. The names frp-rs spells out
+/// where Go abbreviates (`--use-encryption`/`--use-compression` against Go's
+/// `--ue`/`--uc`) live in [`FRPC_PROXY_EXTENSION_FLAGS`].
+const FRPC_PROXY_GO_FLAGS: &[GoFlagRow] = &[
+    GoFlagRow {
+        long: "allow-users",
+        short: None,
+        varname: Some("strings"),
+        usage: "allow visitor users",
+    },
+    GoFlagRow {
+        long: "annotations",
+        short: None,
+        varname: Some("stringToString"),
+        usage: "annotation key-value pairs (e.g., key1=value1,key2=value2) (default [])",
+    },
+    GoFlagRow {
+        long: "bandwidth-limit",
+        short: None,
+        varname: Some("string"),
+        usage: "bandwidth limit (e.g. 100KB or 1MB)",
+    },
+    GoFlagRow {
+        long: "bandwidth-limit-mode",
+        short: None,
+        varname: Some("string"),
+        usage: "bandwidth limit mode (default \"client\")",
+    },
+    GoFlagRow {
+        long: "client-id",
+        short: None,
+        varname: Some("string"),
+        usage: "unique identifier for this frpc instance",
+    },
+    GoFlagRow {
+        long: "custom-domain",
+        short: Some('d'),
+        varname: Some("strings"),
+        usage: "custom domains",
+    },
+    GoFlagRow {
+        long: "disable-log-color",
+        short: None,
+        varname: None,
+        usage: "disable log color in console",
+    },
+    GoFlagRow {
+        long: "dns-server",
+        short: None,
+        varname: Some("string"),
+        usage: "specify dns server instead of using system default one",
+    },
+    GoFlagRow {
+        long: "host-header-rewrite",
+        short: None,
+        varname: Some("string"),
+        usage: "host header rewrite",
+    },
+    GoFlagRow {
+        long: "http-pwd",
+        short: None,
+        varname: Some("string"),
+        usage: "http auth password",
+    },
+    GoFlagRow {
+        long: "http-user",
+        short: None,
+        varname: Some("string"),
+        usage: "http auth user",
+    },
+    GoFlagRow {
+        long: "local-ip",
+        short: Some('i'),
+        varname: Some("string"),
+        usage: "local ip (default \"127.0.0.1\")",
+    },
+    GoFlagRow {
+        long: "local-port",
+        short: Some('l'),
+        varname: Some("int"),
+        usage: "local port",
+    },
+    GoFlagRow {
+        long: "locations",
+        short: None,
+        varname: Some("strings"),
+        usage: "locations",
+    },
+    GoFlagRow {
+        long: "log-file",
+        short: None,
+        varname: Some("string"),
+        usage: "console or file path (default \"console\")",
+    },
+    GoFlagRow {
+        long: "log-level",
+        short: None,
+        varname: Some("string"),
+        usage: "log level (default \"info\")",
+    },
+    GoFlagRow {
+        long: "log-max-days",
+        short: None,
+        varname: Some("int"),
+        usage: "log file reversed days (default 3)",
+    },
+    GoFlagRow {
+        long: "metadatas",
+        short: None,
+        varname: Some("stringToString"),
+        usage: "metadata key-value pairs (e.g., key1=value1,key2=value2) (default [])",
+    },
+    GoFlagRow {
+        long: "mux",
+        short: None,
+        varname: Some("string"),
+        usage: "multiplexer",
+    },
+    GoFlagRow {
+        long: "protocol",
+        short: Some('p'),
+        varname: Some("string"),
+        usage: "optional values are [tcp kcp quic websocket wss] (default \"tcp\")",
+    },
+    GoFlagRow {
+        long: "proxy-name",
+        short: Some('n'),
+        varname: Some("string"),
+        usage: "proxy name",
+    },
+    GoFlagRow {
+        long: "remote-port",
+        short: Some('r'),
+        varname: Some("int"),
+        usage: "remote port",
+    },
+    GoFlagRow {
+        long: "sd",
+        short: None,
+        varname: Some("string"),
+        usage: "sub domain",
+    },
+    GoFlagRow {
+        long: "server-addr",
+        short: Some('s'),
+        varname: Some("string"),
+        usage: "frp server's address (default \"127.0.0.1\")",
+    },
+    GoFlagRow {
+        long: "server-port",
+        short: Some('P'),
+        varname: Some("int"),
+        usage: "frp server's port (default 7000)",
+    },
+    GoFlagRow {
+        long: "sk",
+        short: None,
+        varname: Some("string"),
+        usage: "secret key",
+    },
+    GoFlagRow {
+        long: "tls-enable",
+        short: None,
+        varname: None,
+        usage: "enable frpc tls (default true)",
+    },
+    GoFlagRow {
+        long: "tls-server-name",
+        short: None,
+        varname: Some("string"),
+        usage: "specify the custom server name of tls certificate",
+    },
+    GoFlagRow {
+        long: "token",
+        short: Some('t'),
+        varname: Some("string"),
+        usage: "auth token",
+    },
+    GoFlagRow {
+        long: "uc",
+        short: None,
+        varname: None,
+        usage: "use compression",
+    },
+    GoFlagRow {
+        long: "ue",
+        short: None,
+        varname: None,
+        usage: "use encryption",
+    },
+    GoFlagRow {
+        long: "user",
+        short: Some('u'),
+        varname: Some("string"),
+        usage: "user",
+    },
+];
+
+/// frp-rs flags on `frps` that Go v0.71.0 has no row for: the two the run path
+/// adds beside Go's surface. Their usage text is frp-rs's own (the config
+/// defaults they fall back to are stated the way pflag states its defaults).
+const FRPS_EXTENSION_FLAGS: &[GoFlagRow] = &[
+    GoFlagRow {
+        long: "config-dir",
+        short: None,
+        varname: Some("string"),
+        usage: "config directory, run one frps service for each file in config directory",
+    },
+    GoFlagRow {
+        long: "log-format",
+        short: None,
+        varname: Some("string"),
+        usage: "log format (default \"text\")",
+    },
+];
+
+/// frp-rs flags on the `frpc` root that Go's `frpc` does not register: measured
+/// on Go v0.71.0, `frpc --log-file x --help`, `--log-level`, `--log-max-days`,
+/// `--log-format` and `--disable-log-color` are all `unknown flag` there.
+const FRPC_ROOT_EXTENSION_FLAGS: &[GoFlagRow] = &[
+    GoFlagRow {
+        long: "log-file",
+        short: None,
+        varname: Some("string"),
+        usage: "log file (default \"console\")",
+    },
+    GoFlagRow {
+        long: "log-level",
+        short: Some('L'),
+        varname: Some("string"),
+        usage: "log level (default \"info\")",
+    },
+    GoFlagRow {
+        long: "log-max-days",
+        short: None,
+        varname: Some("int"),
+        usage: "log max days (default 3)",
+    },
+    GoFlagRow {
+        long: "log-format",
+        short: None,
+        varname: Some("string"),
+        usage: "log format (default \"text\")",
+    },
+    GoFlagRow {
+        long: "disable-log-color",
+        short: None,
+        varname: None,
+        usage: "disable log color in console",
+    },
+];
+
+/// frp-rs flags on `frpc status`/`reload`/`stop` that Go has no row for. Go's
+/// admin commands reach the same API through the config file and register only
+/// `--api-timeout`, so these five are frp-rs extensions on every one of the
+/// three (`--json` on `status` only).
+const FRPC_ADMIN_EXTENSION_FLAGS: &[GoFlagRow] = &[
+    GoFlagRow {
+        long: "admin-addr",
+        short: None,
+        varname: Some("string"),
+        usage: "admin address",
+    },
+    GoFlagRow {
+        long: "admin-port",
+        short: None,
+        varname: Some("int"),
+        usage: "admin port",
+    },
+    GoFlagRow {
+        long: "admin-pwd",
+        short: None,
+        varname: Some("string"),
+        usage: "admin password",
+    },
+    GoFlagRow {
+        long: "admin-user",
+        short: None,
+        varname: Some("string"),
+        usage: "admin user",
+    },
+    GoFlagRow {
+        long: "json",
+        short: None,
+        varname: None,
+        usage: "Output the status as JSON",
+    },
+];
+
+/// frp-rs's names for the pair Go spells `--ue`/`--uc` on its single-proxy
+/// commands. The usage text is the parser's own `.help()` (`tcp_cmd`), so the
+/// document says what the flag does rather than what Go's abbreviation does.
+const FRPC_PROXY_EXTENSION_FLAGS: &[GoFlagRow] = &[
+    // frp-rs spellings of Go's `--custom-domain` / `--sd`, which the parser
+    // implements under different names; the parsed type is a single string, so
+    // the pflag type word is `string`, not Go's `strings`.
+    GoFlagRow {
+        long: "custom-domains",
+        short: None,
+        varname: Some("string"),
+        usage: "custom domains",
+    },
+    GoFlagRow {
+        long: "mux-port",
+        short: None,
+        varname: Some("int"),
+        usage: "multiplexer port",
+    },
+    GoFlagRow {
+        long: "server-name",
+        short: None,
+        varname: Some("string"),
+        usage: "server name",
+    },
+    GoFlagRow {
+        long: "subdomain",
+        short: None,
+        varname: Some("string"),
+        usage: "sub domain",
+    },
+    GoFlagRow {
+        long: "use-compression",
+        short: None,
+        varname: None,
+        usage: "Use compression",
+    },
+    GoFlagRow {
+        long: "use-encryption",
+        short: None,
+        varname: None,
+        usage: "Use encryption",
+    },
+];
+
+/// Go's root-command description line (`rootCmd.Short`), which cobra prints
+/// first, followed by a blank line. Measured on the released v0.71.0 binary;
+/// frp-rs's own `.descr()` says `frp-rs` where Go says `frp`, and the document
+/// is Go's — the parser's `.descr()` is a separate, untouched string.
+const FRPS_DESCR: &str = "frps is the server of frp (https://github.com/fatedier/frp)";
+const FRPC_DESCR: &str = "frpc is the client of frp (https://github.com/fatedier/frp)";
+
+/// Go's `Short` text for each implemented child command, as both the
+/// `Available Commands:` line and (for a leaf) the document's first line.
+///
+/// `Verify that the configures is valid` is **Go's own typo** — it reads
+/// "configures" for "configuration" — and it is what the released v0.71.0
+/// binary prints on `frps verify --help` and `frpc verify --help` alike. Those
+/// two documents are the byte-exact witness for this layer, so the typo is
+/// load-bearing: do not "fix" it.
+const FRPS_COMMAND_SHORTS: &[(&str, &str)] = &[("verify", "Verify that the configures is valid")];
+
+const FRPC_COMMAND_SHORTS: &[(&str, &str)] = &[
+    ("http", "Run frpc with a single http proxy"),
+    ("https", "Run frpc with a single https proxy"),
+    ("reload", "Hot-Reload frpc configuration"),
+    ("status", "Overview of all proxies status"),
+    ("stcp", "Run frpc with a single stcp proxy"),
+    ("stop", "Stop the running frpc"),
+    ("sudp", "Run frpc with a single sudp proxy"),
+    ("tcp", "Run frpc with a single tcp proxy"),
+    ("tcpmux", "Run frpc with a single tcpmux proxy"),
+    ("udp", "Run frpc with a single udp proxy"),
+    ("verify", "Verify that the configures is valid"),
+    ("xtcp", "Run frpc with a single xtcp proxy"),
+];
+
+/// The root command's own name, as cobra's `Use`/`Name()` spells it. Never
+/// argv[0]: the document names the command, not the path it was invoked by.
+fn root_name(root: RootCommand) -> &'static str {
+    match root {
+        RootCommand::Frps => "frps",
+        RootCommand::Frpc => "frpc",
+    }
+}
+
+fn root_descr(root: RootCommand) -> &'static str {
+    match root {
+        RootCommand::Frps => FRPS_DESCR,
+        RootCommand::Frpc => FRPC_DESCR,
+    }
+}
+
+/// Go's short text for one of this root's commands; empty when the command has
+/// no measured text (which the module tests reject).
+fn command_short(root: RootCommand, command: &str) -> &'static str {
+    let table = match root {
+        RootCommand::Frps => FRPS_COMMAND_SHORTS,
+        RootCommand::Frpc => FRPC_COMMAND_SHORTS,
+    };
+    table
+        .iter()
+        .find(|(name, _)| *name == command)
+        .map_or("", |(_, short)| *short)
+}
+
+/// The flags cobra registers **persistently** on this root — the ones every
+/// child command inherits and prints under `Global Flags`. Measured: `frps
+/// verify --help` repeats all 29 [`FRPS_GO_FLAGS`] longs there and `frpc verify
+/// --help` all 5 [`FRPC_ROOT_GO_FLAGS`] longs, both ways (module test).
+fn root_persistent_flags(root: RootCommand) -> &'static [GoFlagRow] {
+    match root {
+        RootCommand::Frps => FRPS_GO_FLAGS,
+        RootCommand::Frpc => FRPC_ROOT_GO_FLAGS,
+    }
+}
+
+/// The tables whose rows may describe one surface, in lookup order: the first
+/// table with the long name wins, so a surface's own rows shadow the root's.
+///
+/// The `frpc` admin surfaces consult the proxy table not at all and the root's
+/// tables last; the proxy surfaces take their own union first. An frp-rs flag
+/// with no Go counterpart is found in the matching `*_EXTENSION_FLAGS` table,
+/// and a flag in none of them renders with an empty usage — which is a test
+/// failure, not a silently narrower document.
+fn help_flag_tables(root: RootCommand, command: Option<&str>) -> Vec<&'static [GoFlagRow]> {
+    match (root, command) {
+        (RootCommand::Frps, _) => vec![FRPS_GO_FLAGS, FRPS_EXTENSION_FLAGS],
+        (RootCommand::Frpc, None | Some("verify")) => {
+            vec![FRPC_ROOT_GO_FLAGS, FRPC_ROOT_EXTENSION_FLAGS]
+        }
+        (RootCommand::Frpc, Some("status" | "reload" | "stop")) => vec![
+            FRPC_ADMIN_GO_FLAGS,
+            FRPC_ADMIN_EXTENSION_FLAGS,
+            FRPC_ROOT_GO_FLAGS,
+            FRPC_ROOT_EXTENSION_FLAGS,
+        ],
+        (RootCommand::Frpc, Some(_proxy)) => vec![
+            FRPC_PROXY_GO_FLAGS,
+            FRPC_PROXY_EXTENSION_FLAGS,
+            FRPC_ROOT_GO_FLAGS,
+            FRPC_ROOT_EXTENSION_FLAGS,
+        ],
+    }
+}
+
+/// Go's row for `long` on this surface, if there is one.
+fn go_flag_row(tables: &[&'static [GoFlagRow]], long: &str) -> Option<&'static GoFlagRow> {
+    tables
+        .iter()
+        .find_map(|table| table.iter().find(|row| row.long == long))
+}
+
+/// A flag as bpaf's own help rendering exposes it.
+///
+/// `bool_switch` is true when **any** spelling of the long name is a bare
+/// switch: bpaf prints the value entry (`--strict-config=BOOL`) and the switch
+/// entry (`--strict-config`) of [`go_bool_flag_impl`]'s pair as two lines, and
+/// cobra has one row for the flag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BpafFlag {
+    long: String,
+    short: Option<char>,
+    bool_switch: bool,
+}
+
+/// A flag row ready to print: the parser's shorthand, plus pflag's varname
+/// (`None` for a bool — pflag prints no type word for one) and usage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RenderedFlag {
+    long: String,
+    short: Option<char>,
+    varname: Option<&'static str>,
+    usage: String,
+}
+
+/// Read a command's flag surface back out of bpaf's own help rendering.
+///
+/// bpaf emits one option line per *spelling*, so the rows are merged by
+/// canonical long name: Go's `WordSepNormalizeFunc` rewrites every `_` to `-`
+/// before a lookup (`pkg/config/flags.go:31-36`), which is why `--config_dir`
+/// and `--config-dir` are one flag for pflag and one row here. `--help` is
+/// dropped, not merged: cobra synthesizes `-h, --help` per command, so it is
+/// not part of the surface this function is describing.
+///
+/// A flag line is recognised positionally, which is how bpaf emits it: the long
+/// token begins at column 8 (`    -x, ` or four blanks), while a wrapped usage
+/// continuation is indented to the usage column (always > 8) and anything else
+/// in the document — `Available commands:` entries, subsection headers,
+/// positional items — sits at a different column. Order of first appearance is
+/// preserved; the caller sorts.
+fn bpaf_help_flags(doc: &Doc) -> Vec<BpafFlag> {
+    let mut flags: Vec<BpafFlag> = Vec::new();
+    for line in doc.monochrome(true).lines() {
+        let Some(head) = line.get(..8) else { continue };
+        let short = match head.as_bytes() {
+            [b' ', b' ', b' ', b' ', b'-', short, b',', b' '] => Some(*short as char),
+            bytes if bytes.iter().all(|byte| *byte == b' ') => None,
+            _ => continue,
+        };
+        let Some(rest) = line.get(8..) else { continue };
+        if !rest.starts_with("--") {
+            continue;
+        }
+        // `--long` or `--long=VARNAME`; the usage text follows after a run of
+        // blanks, so splitting at the first blank isolates the flag token.
+        let word = rest.split(' ').next().unwrap_or(rest);
+        let (name, has_varname) = match word.split_once('=') {
+            Some((name, _)) => (name, true),
+            None => (word, false),
+        };
+        let long = name.trim_start_matches("--").replace('_', "-");
+        if long == "help" {
+            continue;
+        }
+        match flags.iter_mut().find(|flag| flag.long == long) {
+            Some(flag) => {
+                flag.short = flag.short.or(short);
+                flag.bool_switch |= !has_varname;
+            }
+            None => flags.push(BpafFlag {
+                long,
+                short,
+                bool_switch: !has_varname,
+            }),
+        }
+    }
+    flags
+}
+
+/// pflag's `FlagUsagesWrapped(0)` line prefix for one flag: `  -x, --long` when
+/// the parser has a shorthand, four blanks and `--long` when it does not, then
+/// the type word.
+fn flag_prefix(flag: &RenderedFlag) -> String {
+    let mut prefix = match flag.short {
+        Some(short) => format!("  -{short}, --{}", flag.long),
+        None => format!("      --{}", flag.long),
+    };
+    if let Some(varname) = flag.varname {
+        prefix.push(' ');
+        prefix.push_str(varname);
+    }
+    prefix
+}
+
+/// pflag's `FlagUsagesWrapped(0)`: one line per flag, each prefix padded to one
+/// blank past the longest prefix of its block (`maxlen = max(len(prefix) + 1)`
+/// in `pflag-1.0.5/flag.go`, printed as `prefix`, `maxlen - len(prefix)` blanks,
+/// usage), which is the 30-column grid the measured documents show.
+///
+/// The caller sorts by long name first: pflag sorts its own list that way
+/// (`--tls-only`, `--token`, `--version`, `--vhost-http-port` on `frps --help`),
+/// *not* by a union with the shorthands. A row with no usage still gets its
+/// blanks, exactly as pflag's `Fprintln` writes them; cobra's
+/// `trimTrailingWhitespaces` then trims only the end of the block, which is why
+/// the document has no trailing blank line. No measured surface has such a row
+/// (module test).
+fn flag_usages(flags: &[RenderedFlag]) -> String {
+    let prefixes: Vec<String> = flags.iter().map(flag_prefix).collect();
+    let longest = prefixes.iter().map(String::len).max().unwrap_or(0);
+    let mut out = String::new();
+    for (prefix, flag) in prefixes.iter().zip(flags) {
+        out.push_str(prefix);
+        for _ in 0..(longest - prefix.len() + 3) {
+            out.push(' ');
+        }
+        out.push_str(&flag.usage);
+        out.push('\n');
+    }
+    out
+}
+
+/// Render cobra's help document for `command` (the root when `None`) from the
+/// `Doc` bpaf produced for that command, in the shape the released Go v0.71.0
+/// binary prints.
+///
+/// The template is cobra's usage template with every branch measured on the
+/// oracle: an optional description line and blank line, `Usage:` plus the
+/// `UseLine` (and, for a root with commands, a second `<name> [command]` line),
+/// `Available Commands:` padded to `max(11, longest name)`, `Flags:` (the
+/// surface's own flags plus cobra's synthesized `-h, --help`) and `Global
+/// Flags:` (the root's persistent set), and — for a root only — cobra's
+/// `Use "… [command] --help"` footer. cobra's `trimTrailingWhitespaces` on the
+/// flag blocks is `trim_end` here, and the document ends with exactly one `\n`.
+///
+/// The rendered document describes **this** binary's surface: a row is printed
+/// only for a flag bpaf actually accepted, and a flag with no row prints with an
+/// empty usage (a test failure, never a shipped document).
+fn render_cobra_help(root: RootCommand, command: Option<&str>, doc: &Doc) -> String {
+    let name = root_name(root);
+    let flags = bpaf_help_flags(doc);
+    let tables = help_flag_tables(root, command);
+    let persistent = root_persistent_flags(root);
+    let own_name = command.unwrap_or(name);
+
+    let mut local: Vec<RenderedFlag> = Vec::new();
+    let mut global: Vec<RenderedFlag> = Vec::new();
+    for flag in &flags {
+        let row = go_flag_row(&tables, &flag.long);
+        // Go's shorthand is an invariant to check, never the value to print.
+        // Where the parser has one it must be Go's — that is what keeps the two
+        // `verify` documents byte-exact (`frps -c/-p/-t/-v`) — but the converse
+        // does not hold: frp-rs never implemented `frpc tcp`'s `-i/-l/-r/-s/-P/-n`,
+        // and the document must not advertise a shorthand the parser rejects.
+        debug_assert!(
+            flag.short.is_none() || row.is_none_or(|row| row.short == flag.short),
+            "the parser's shorthand for --{} is {:?}, which is not Go's {:?}",
+            flag.long,
+            flag.short,
+            row.and_then(|row| row.short)
+        );
+        let rendered = RenderedFlag {
+            long: flag.long.clone(),
+            short: flag.short,
+            varname: if flag.bool_switch {
+                None
+            } else {
+                row.and_then(|row| row.varname)
+            },
+            usage: row.map_or("", |row| row.usage).to_owned(),
+        };
+        if command.is_some() && persistent.iter().any(|row| row.long == flag.long) {
+            global.push(rendered);
+        } else {
+            local.push(rendered);
+        }
+    }
+    // cobra's built-in help flag, local to every command and named after the
+    // command it describes (`help for frps`, `help for verify`).
+    local.push(RenderedFlag {
+        long: "help".to_owned(),
+        short: Some('h'),
+        varname: None,
+        usage: format!("help for {own_name}"),
+    });
+    local.sort_by(|a, b| a.long.cmp(&b.long));
+    global.sort_by(|a, b| a.long.cmp(&b.long));
+
+    let mut out = String::new();
+    let descr = match command {
+        Some(command) => command_short(root, command),
+        None => root_descr(root),
+    };
+    if !descr.is_empty() {
+        out.push_str(descr);
+        out.push_str("\n\n");
+    }
+    let path = match command {
+        Some(command) => format!("{name} {command}"),
+        None => name.to_owned(),
+    };
+    out.push_str("Usage:\n  ");
+    out.push_str(&path);
+    out.push_str(" [flags]");
+
+    let mut commands = root.subcommands().to_vec();
+    commands.sort_unstable();
+    if command.is_none() && !commands.is_empty() {
+        out.push_str("\n  ");
+        out.push_str(name);
+        out.push_str(" [command]");
+        out.push_str("\n\nAvailable Commands:");
+        let padding = commands
+            .iter()
+            .map(|name| name.len())
+            .max()
+            .unwrap_or(0)
+            .max(11);
+        for command in commands {
+            out.push_str(&format!(
+                "\n  {command:<padding$} {}",
+                command_short(root, command)
+            ));
+        }
+    }
+    if !local.is_empty() {
+        out.push_str("\n\nFlags:\n");
+        out.push_str(flag_usages(&local).trim_end());
+    }
+    if !global.is_empty() {
+        out.push_str("\n\nGlobal Flags:\n");
+        out.push_str(flag_usages(&global).trim_end());
+    }
+    if command.is_none() && !root.subcommands().is_empty() {
+        out.push_str(&format!(
+            "\n\nUse \"{name} [command] --help\" for more information about a command."
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+/// What a help request is about: the binary's root command, plus the child
+/// command word the prepared argv resolved, if any.
+#[derive(Clone, Copy, Debug)]
+struct HelpRequest {
+    root: RootCommand,
+    command: Option<&'static str>,
+}
+
+/// The surface [`render_cobra_help`] renders for this argv.
+///
+/// `argv` is the argv [`prepared_cli_argv`] produced, in which the resolved
+/// subcommand — when there is one — is at index 0, exactly the word cobra's
+/// `Find` would resolve. `--help <word>` has already been resolved to the root
+/// by then (measured: `frpc --help status` prints the *root* document on both
+/// Go and frp-rs, while `frpc --help=true status` prints `status`'s).
+fn help_request(root: RootCommand, argv: &[OsString]) -> HelpRequest {
+    let command = argv
+        .first()
+        .and_then(|token| token.to_str())
+        .and_then(|word| {
+            root.subcommands()
+                .iter()
+                .copied()
+                .find(|name| *name == word)
+        });
+    HelpRequest { root, command }
+}
+
 /// Run an `OptionParser` over the argv [`cli_args`] produced and exit the way
 /// `OptionParser::run` does (`err.print_message(self.info.max_width)`, then
-/// `err.exit_code()`).
-fn run_cli<T>(parser: bpaf::OptionParser<T>, name: Option<String>, rest: &[OsString]) -> T {
+/// `err.exit_code()`) — except for a help request, which is printed as cobra's
+/// document ([`render_cobra_help`]) instead of bpaf's.
+///
+/// `help` names the surface to render when `rest` is a `--help` invocation.
+/// A help request is the **only** stdout failure bpaf can produce here: frp-rs
+/// disables bpaf's `help_if_no_args` (a bare `frps`/`frpc` runs), and the
+/// `autocomplete` feature that `ParseFailure::Completion` requires is off, so
+/// `ParseFailure::Stdout` is exactly the document to replace.
+fn run_cli<T>(
+    parser: bpaf::OptionParser<T>,
+    name: Option<String>,
+    rest: &[OsString],
+    help: HelpRequest,
+) -> T {
     let args = bpaf::Args::from(rest);
     // `set_name` only when there *is* one: `Args::current_args` leaves the name
     // unset for an unreadable argv[0], and bpaf renders that case differently.
@@ -1858,6 +2870,10 @@ fn run_cli<T>(parser: bpaf::OptionParser<T>, name: Option<String>, rest: &[OsStr
     match parser.run_inner(args) {
         Ok(value) => value,
         Err(err) => {
+            if let bpaf::ParseFailure::Stdout(doc, _) = &err {
+                print!("{}", render_cobra_help(help.root, help.command, doc));
+                std::process::exit(0);
+            }
             err.print_message(CLI_OUTPUT_WIDTH);
             std::process::exit(err.exit_code());
         }
@@ -2325,6 +3341,7 @@ pub fn parse_frps_args() -> FrpsCmd {
             .descr("frps is the server of frp-rs (https://github.com/fatedier/frp)"),
         name,
         &parse_argv,
+        help_request(RootCommand::Frps, &parse_argv),
     );
     // Only reached when the argv parsed: the failure path above exits the
     // process, so the warning can never fire for a refused argv, and the
@@ -3687,6 +4704,7 @@ pub fn parse_frpc_args() -> FrpcCmd {
             .descr("frpc is the client of frp-rs (https://github.com/fatedier/frp)"),
         name,
         &parse_argv,
+        help_request(RootCommand::Frpc, &parse_argv),
     );
     // See `parse_frps_args`: printed only for a successfully parsed argv whose
     // `--strict-config` token was followed by a consumed bool value — i.e. the
@@ -7579,6 +8597,452 @@ mod hoist_tests {
             assert!(
                 err.contains("is not expected in this context"),
                 "{args:?} must be a leftover-token refusal naming the flag, got {err:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod help_doc_tests {
+    use super::*;
+
+    /// Render the document the binary prints for `--help` on one surface.
+    ///
+    /// Goes through the same preparation and the same parsers the binaries use
+    /// (`prepared_cli_argv`, then `run_inner`), and takes the `Doc` out of the
+    /// `ParseFailure::Stdout` that `run_cli` intercepts — never through
+    /// `run_cli` itself, which exits the test process.
+    fn surface_document(root: RootCommand, command: Option<&str>) -> String {
+        let mut argv: Vec<OsString> = Vec::new();
+        if let Some(command) = command {
+            argv.push(command.into());
+        }
+        argv.push("--help".into());
+        let argv = prepared_cli_argv(&argv, root);
+        let argv = &argv[..];
+        let failure = match root {
+            RootCommand::Frps => frps_parser()
+                .to_options()
+                .run_inner(bpaf::Args::from(argv))
+                .err(),
+            RootCommand::Frpc => frpc_parser()
+                .to_options()
+                .run_inner(bpaf::Args::from(argv))
+                .err(),
+        }
+        .expect("--help must be reported as a ParseFailure");
+        let bpaf::ParseFailure::Stdout(doc, _) = failure else {
+            panic!("--help must be a Stdout failure: {failure:?}");
+        };
+        render_cobra_help(root, command, &doc)
+    }
+
+    /// Every surface this layer renders: `(label, root, command, rendered bytes,
+    /// Go frp v0.71.0 bytes)` for the same command line.
+    ///
+    /// Two of them are Go's document **byte for byte** — the `verify` pair, which
+    /// is also pinned in full text by `verify_documents_match_go_byte_for_byte`.
+    /// The other thirteen are *stated replacements*, and the count is the witness
+    /// that the replacement is stable: frp-rs renders cobra's shape over the flag
+    /// surface its parser actually accepts, so it never advertises a flag or a
+    /// shorthand it does not implement, and never hides one it does.
+    ///
+    /// Where the replacement is larger or smaller than Go's:
+    ///
+    /// - `frps`: `--config-dir`/`--log-format` are frp-rs-only, and frp-rs has no
+    ///   `completion`/`help` built-in commands (Go's root lists both).
+    /// - `frpc`: the five `--log-*`/`--disable-log-color` extensions, and no
+    ///   `nathole`/`completion`/`help` command lines.
+    /// - `frpc status|reload|stop`: `--admin-addr/-port/-user/-pwd` (plus `--json`
+    ///   for `status`) are frp-rs-only; Go's admin commands have only
+    ///   `--api-timeout`.
+    /// - the eight proxy commands: frp-rs implements a smaller proxy flag set and
+    ///   only `--token`'s `-t` shorthand, where Go also has `-i/-l/-r/-s/-P/-n`.
+    const SURFACES: [(&str, RootCommand, Option<&str>, usize, usize); 15] = [
+        ("frps", RootCommand::Frps, None, 2467, 2394),
+        ("frps verify", RootCommand::Frps, Some("verify"), 2103, 2103),
+        ("frpc", RootCommand::Frpc, None, 1517, 1370),
+        ("frpc tcp", RootCommand::Frpc, Some("tcp"), 992, 2211),
+        ("frpc udp", RootCommand::Frpc, Some("udp"), 903, 2211),
+        ("frpc http", RootCommand::Frpc, Some("http"), 1233, 2482),
+        ("frpc https", RootCommand::Frpc, Some("https"), 979, 2269),
+        ("frpc stcp", RootCommand::Frpc, Some("stcp"), 906, 2436),
+        ("frpc xtcp", RootCommand::Frpc, Some("xtcp"), 906, 2436),
+        ("frpc sudp", RootCommand::Frpc, Some("sudp"), 906, 2436),
+        ("frpc tcpmux", RootCommand::Frpc, Some("tcpmux"), 917, 2432),
+        ("frpc verify", RootCommand::Frpc, Some("verify"), 543, 543),
+        ("frpc reload", RootCommand::Frpc, Some("reload"), 801, 626),
+        ("frpc status", RootCommand::Frpc, Some("status"), 859, 627),
+        ("frpc stop", RootCommand::Frpc, Some("stop"), 789, 614),
+    ];
+
+    /// `frps verify --help` as Go frp v0.71.0 prints it (`/tmp` oracle, measured
+    /// in the same session as the implementation).
+    const GO_FRPS_VERIFY: &str = r##"Verify that the configures is valid
+
+Usage:
+  frps verify [flags]
+
+Flags:
+  -h, --help   help for verify
+
+Global Flags:
+      --allow-ports string               allow ports
+      --allow-unsafe strings             allowed unsafe features, one or more of: TokenSourceExec
+      --bind-addr string                 bind address (default "0.0.0.0")
+  -p, --bind-port int                    bind port (default 7000)
+  -c, --config string                    config file of frps
+      --dashboard-addr string            dashboard address (default "0.0.0.0")
+      --dashboard-port int               dashboard port
+      --dashboard-pwd string             dashboard password (default "admin")
+      --dashboard-tls-cert-file string   dashboard tls cert file
+      --dashboard-tls-key-file string    dashboard tls key file
+      --dashboard-tls-mode               if enable dashboard tls mode
+      --dashboard-user string            dashboard user (default "admin")
+      --disable-log-color                disable log color in console
+      --enable-prometheus                enable prometheus dashboard
+      --kcp-bind-port int                kcp bind udp port
+      --log-file string                  log file (default "console")
+      --log-level string                 log level (default "info")
+      --log-max-days int                 log max days (default 3)
+      --max-ports-per-client int         max ports per client
+      --proxy-bind-addr string           proxy bind address (default "0.0.0.0")
+      --quic-bind-port int               quic bind udp port
+      --strict-config                    strict config parsing mode, unknown fields will cause errors (default true)
+      --subdomain-host string            subdomain host
+      --tls-only                         frps tls only
+  -t, --token string                     auth token
+  -v, --version                          version of frps
+      --vhost-http-port int              vhost http port
+      --vhost-http-timeout int           vhost http response header timeout (default 60)
+      --vhost-https-port int             vhost https port
+"##;
+
+    /// `frpc verify --help` as Go frp v0.71.0 prints it.
+    const GO_FRPC_VERIFY: &str = r##"Verify that the configures is valid
+
+Usage:
+  frpc verify [flags]
+
+Flags:
+  -h, --help   help for verify
+
+Global Flags:
+      --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
+  -c, --config string          config file of frpc (default "./frpc.ini")
+      --config-dir string      config directory, run one frpc service for each file in config directory
+      --strict-config          strict config parsing mode, unknown fields will cause an errors (default true)
+  -v, --version                version of frpc
+"##;
+
+    #[test]
+    fn verify_documents_match_go_byte_for_byte() {
+        assert_eq!(
+            surface_document(RootCommand::Frps, Some("verify")),
+            GO_FRPS_VERIFY,
+            "frps verify --help must be Go's document, byte for byte"
+        );
+        assert_eq!(
+            surface_document(RootCommand::Frpc, Some("verify")),
+            GO_FRPC_VERIFY,
+            "frpc verify --help must be Go's document, byte for byte"
+        );
+    }
+
+    #[test]
+    fn every_surface_is_pinned_by_its_byte_count() {
+        let mut mismatched: Vec<String> = Vec::new();
+        for (label, root, command, rendered, go) in SURFACES {
+            let document = surface_document(root, command);
+            if document.len() != rendered {
+                mismatched.push(format!(
+                    "{label}: {} bytes (pinned {rendered}, Go v0.71.0 {go})",
+                    document.len()
+                ));
+            }
+        }
+        assert!(
+            mismatched.is_empty(),
+            "the rendered documents changed size; re-measure and update SURFACES:\n{}",
+            mismatched.join("\n")
+        );
+    }
+
+    /// Split one pflag row into `(head, long, usage)`: `head` is the flag token
+    /// with its shorthand and varname, `long` the long name without dashes.
+    fn split_row(line: &str) -> (String, String, String) {
+        let start = line.len() - line.trim_start().len();
+        let gap = start
+            + line[start..]
+                .find("   ")
+                .expect("pflag always leaves at least a three-space gap");
+        let head = line[..gap].trim_end();
+        let usage = line[gap..].trim_start();
+        let long = head
+            .split_whitespace()
+            .find(|word| word.starts_with("--"))
+            .expect("every rendered row names a long flag")
+            .trim_start_matches('-')
+            .to_string();
+        (head.to_string(), long, usage.to_string())
+    }
+
+    /// The rows under a `Flags:` / `Global Flags:` heading.
+    fn section_rows(document: &str, heading: &str) -> Vec<(String, String, String)> {
+        let mut rows = Vec::new();
+        let mut inside = false;
+        for line in document.lines() {
+            if line == heading {
+                inside = true;
+                continue;
+            }
+            if !inside {
+                continue;
+            }
+            if line.is_empty() || !line.starts_with(' ') {
+                break;
+            }
+            rows.push(split_row(line));
+        }
+        rows
+    }
+
+    fn printed_short(head: &str) -> Option<char> {
+        let rest = head.trim_start().strip_prefix('-')?;
+        if rest.starts_with('-') {
+            return None;
+        }
+        rest.chars().next()
+    }
+
+    /// The item's second requirement: a bool flag built by `go_bool_flag_impl!`
+    /// is a bpaf `Or` of an `Argument` and a `Flag`, which bpaf's own renderer
+    /// prints as two rows (`--strict-config=BOOL` and `--strict-config`). Cobra
+    /// prints one. No `=` may survive, no long name may appear twice, and each
+    /// section is sorted by long name.
+    #[test]
+    fn bool_flags_collapse_to_one_row_each() {
+        for (label, root, command, _, _) in SURFACES {
+            let document = surface_document(root, command);
+            let mut seen: Vec<String> = Vec::new();
+            for heading in ["Flags:", "Global Flags:"] {
+                let mut longs: Vec<String> = section_rows(&document, heading)
+                    .into_iter()
+                    .map(|(head, long, _)| {
+                        assert!(
+                            !head.contains('='),
+                            "{label}: bpaf's `{head}` spelling survived the bool collapse"
+                        );
+                        long
+                    })
+                    .collect();
+                let mut sorted = longs.clone();
+                sorted.sort();
+                assert_eq!(
+                    longs, sorted,
+                    "{label}: {heading} rows are not sorted by long name"
+                );
+                longs.dedup();
+                seen.append(&mut longs);
+            }
+            let mut unique = seen.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(
+                seen.len(),
+                unique.len(),
+                "{label}: a flag is rendered more than once: {seen:?}"
+            );
+            assert!(
+                !document.contains("=BOOL")
+                    && !document.contains("=FILE")
+                    && !document.contains("=DIR"),
+                "{label}: a bpaf `--flag=VALUE` row survived"
+            );
+        }
+        assert_eq!(
+            surface_document(RootCommand::Frps, None)
+                .matches("--strict-config")
+                .count(),
+            1,
+            "frps --strict-config must be one row, not bpaf's two"
+        );
+    }
+
+    /// No flag may render without a description: the renderer has no fallback to
+    /// bpaf's own text, so a new flag added to a parser but not to a text table
+    /// must fail here rather than ship an empty row.
+    #[test]
+    fn every_rendered_flag_has_a_usage_text() {
+        let mut missing: Vec<String> = Vec::new();
+        for (label, root, command, _, _) in SURFACES {
+            let document = surface_document(root, command);
+            for heading in ["Flags:", "Global Flags:"] {
+                for (head, _, usage) in section_rows(&document, heading) {
+                    if usage.is_empty() {
+                        missing.push(format!("{label}: `{}`", head.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these flags render with no usage text (add a GoFlagRow to the text tables): {missing:#?}"
+        );
+    }
+
+    /// A leaf's inherited flags are exactly the root's persistent set, and the
+    /// root itself has no `Global Flags:` section — cobra's rule, and the reason
+    /// `frps verify` can be Go's document byte for byte.
+    #[test]
+    fn leaf_global_flags_are_the_root_persistent_flags() {
+        for (label, root, command, _, _) in SURFACES {
+            let document = surface_document(root, command);
+            let globals: Vec<String> = section_rows(&document, "Global Flags:")
+                .into_iter()
+                .map(|(_, long, _)| long)
+                .collect();
+            if command.is_none() {
+                assert!(
+                    globals.is_empty() && !document.contains("Global Flags:"),
+                    "{label}: the root command must not have a Global Flags section"
+                );
+                continue;
+            }
+            let mut expected: Vec<String> = root_persistent_flags(root)
+                .iter()
+                .map(|row| row.long.replace('_', "-"))
+                .collect();
+            expected.sort();
+            assert_eq!(
+                globals, expected,
+                "{label}: inherited flags must be exactly the root's persistent flags"
+            );
+            let locals: Vec<String> = section_rows(&document, "Flags:")
+                .into_iter()
+                .map(|(_, long, _)| long)
+                .collect();
+            let mut local_sorted = locals.clone();
+            local_sorted.sort();
+            assert!(
+                !locals.iter().any(|long| expected.contains(long)),
+                "{label}: a persistent flag is also rendered as a local one"
+            );
+            assert_eq!(locals, local_sorted);
+        }
+    }
+
+    /// Cobra adds `-h, --help` to every command, with `help for <its own name>`.
+    /// bpaf's help flag lives in its `Info`, not in the parser metadata, so the
+    /// renderer synthesizes it — exactly once, in `Flags:`.
+    #[test]
+    fn help_row_is_synthesized_for_every_command() {
+        for (label, root, command, _, _) in SURFACES {
+            let document = surface_document(root, command);
+            let name = command.unwrap_or_else(|| root_name(root));
+            let rows = section_rows(&document, "Flags:");
+            let help: Vec<&(String, String, String)> =
+                rows.iter().filter(|(_, long, _)| long == "help").collect();
+            assert_eq!(help.len(), 1, "{label}: exactly one help row");
+            assert_eq!(help[0].0.trim_start(), "-h, --help");
+            assert_eq!(help[0].2, format!("help for {name}"));
+            assert!(
+                section_rows(&document, "Global Flags:")
+                    .iter()
+                    .all(|(_, long, _)| long != "help"),
+                "{label}: the help flag is local to every command, never inherited"
+            );
+        }
+    }
+
+    /// `Available Commands:` lists exactly the subcommands frp-rs implements, in
+    /// cobra's sorted order — never Go's `completion`/`help` built-ins or the
+    /// unimplemented `nathole`.
+    #[test]
+    fn available_commands_are_the_implemented_ones_only() {
+        for (root, name) in [(RootCommand::Frps, "frps"), (RootCommand::Frpc, "frpc")] {
+            let document = surface_document(root, None);
+            let commands: Vec<&str> = document
+                .lines()
+                .skip_while(|line| *line != "Available Commands:")
+                .skip(1)
+                .take_while(|line| !line.is_empty())
+                .map(|line| {
+                    line.split_whitespace()
+                        .next()
+                        .expect("a command row has a name")
+                })
+                .collect();
+            let mut expected: Vec<&str> = root.subcommands().to_vec();
+            expected.sort_unstable();
+            assert_eq!(
+                commands, expected,
+                "{name}: Available Commands must be exactly the implemented subcommands"
+            );
+            for builtin in ["completion", "help", "nathole"] {
+                assert!(
+                    !commands.contains(&builtin),
+                    "{name} must not advertise the unimplemented `{builtin}`"
+                );
+            }
+        }
+    }
+
+    /// The surface bpaf resolves is the surface the document describes; `--help
+    /// <word>` is Go's root help, `--help=true <word>` the subcommand's.
+    #[test]
+    fn help_request_resolves_the_surface_cobra_resolves() {
+        let request = |args: &[&str]| {
+            let argv: Vec<OsString> = args.iter().map(Into::into).collect();
+            let prepared = prepared_cli_argv(&argv, RootCommand::Frpc);
+            help_request(RootCommand::Frpc, &prepared).command
+        };
+        assert_eq!(request(&["--help"]), None);
+        assert_eq!(request(&["status", "--help"]), Some("status"));
+        assert_eq!(request(&["--help=true", "status"]), Some("status"));
+        // Go prints the root document here too: `--help` consumes the next token.
+        assert_eq!(request(&["--help", "status"]), None);
+        assert_eq!(request(&["status", "-h"]), Some("status"));
+    }
+
+    /// Where the parser has a shorthand it is Go's; where frp-rs never
+    /// implemented Go's shorthand the document must not print it (Go's rows are
+    /// an invariant to check, never the value to print).
+    #[test]
+    fn parser_shorthands_agree_with_go_where_the_parser_has_one() {
+        for (label, root, command, _, _) in SURFACES {
+            let document = surface_document(root, command);
+            let tables = help_flag_tables(root, command);
+            for heading in ["Flags:", "Global Flags:"] {
+                for (head, long, _) in section_rows(&document, heading) {
+                    let Some(printed) = printed_short(&head) else {
+                        continue;
+                    };
+                    // `-h, --help` is synthesized per command; it is not one of
+                    // Go's flag rows (which the tables deliberately exclude).
+                    if long == "help" {
+                        continue;
+                    }
+                    let go = go_flag_row(&tables, &long);
+                    assert_eq!(
+                        Some(printed),
+                        go.and_then(|row| row.short),
+                        "{label}: --{long} prints -{printed}, Go has {:?}",
+                        go.and_then(|row| row.short)
+                    );
+                }
+            }
+        }
+        let tcp = surface_document(RootCommand::Frpc, Some("tcp"));
+        for (head, long, _) in section_rows(&tcp, "Flags:") {
+            if long == "help" {
+                continue;
+            }
+            let expected = if long == "token" { Some('t') } else { None };
+            assert_eq!(
+                printed_short(&head),
+                expected,
+                "frpc tcp --{long}: frp-rs implements no Go shorthand for it"
             );
         }
     }
