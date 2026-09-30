@@ -6326,6 +6326,12 @@ nothing about whether the described behaviour still holds.
   why a habit of re-running, or of pushing past, cannot tell the sixth apart from a real
   regression. Nothing above is fixed, and this round claims no fix.
 
+  A further occurrence on this branch: PR #421's `compat` run `36688056654` (job `109798401463`)
+  failed the protocol-matrix step with `8 passed, 3 failed` — `kcp-tls` and `kcp-tls-mux` with zero
+  throughput and `quic` with its proxy port not reachable — while the compat suite step itself was
+  green, the same suite-green/matrix-red shape as the sweep's two extra runs above. The failed job
+  was re-run (`109804152976`).
+
 - [x] **`Tests (server integration)` fails intermittently, and it turns `main` red.**
   Evidence: on 2026-09-17 the CI run for the merge commit `d9ca98b` failed on
   `Tests (server integration)` — **13 passed, 1 failed** —
@@ -7330,9 +7336,15 @@ section; ledger now **24 open / 104 closed**.**
   `new_tree`/`new_full_tree`'s rc is no longer discarded (`d=$(new_tree "$1") || return 1` at
   `:130`; `TREE=$(new_tree "$1") || setup_die "new_tree $1"` at `:269`), and scenario 9
   (`:576-629`) shows an unreadable script under test fails the run loudly: with `setup_die`'s
-  `exit 1` reverted to `return 0` (`:286`) the outer harness goes rc 1 and the run is refused on
-  the `fixture setup: new_tree` row asserted at `:603`, with no `^  ok` row after the setup FAIL.
-  Harness checks 19 → 24 → **32** (counter at `:730`; `RESULT: 32 fixture check(s) hold`). No
+  `exit 1` reverted to `return 0` (`:288`) the outer harness goes rc 1, because the awk check at
+  `scripts/tests/repo-health-fixtures.sh:608-616` (FAIL emitted at `:615`) refuses any non-blank row
+  after the `fixture setup: ` FAIL; the `:603` grep only asserts that the failure names the setup
+  step.
+  Scenarios 10 and 11 cover the doc-figure walk's failure paths: an unreadable subdirectory must
+  print `walk error: ` and must not accuse the crate of holding no `.rs` files (`mut_walkerr b` at
+  `scripts/repo-health.sh:2308`, `mut_walkerr c` at `:2337`), and a sibling-directory symlink into
+  `frp-core/src` must not be counted (`mut_prefix` at `:2322`). Harness checks 19 → 24 → **32**
+  (counter at `:730`; `RESULT: 32 fixture check(s) hold`). No
   `CHANGELOG.md` entry: fixture-harness only, the #415/#416 precedent. Gates on the rebased branch:
   fmt/clippy clean, `bash scripts/repo-health.sh` → `RESULT: invariants hold`, fixture harness 32/32.
 
@@ -7380,11 +7392,11 @@ section; ledger now **24 open / 104 closed**.**
 
   **Done (2026-10-01, at `0544b481` on `fix/test-precision-residue`).** Commit `a6f4f55f` (rebased)
   gives sub-case (d) provenance instead of a record count. The `-c` file now declares the only
-  `main` proxy with a distinctive `local_port` (`MAIN_PROXY`, `frpc/tests/admin_config_get_warning.rs:357-361`),
+  `main` proxy with a distinctive `local_port` (`MAIN_PROXY`, `frpc/tests/admin_config_get_warning.rs:360-361`),
   while the cwd `frpc.toml` declares none, and (d) asserts the GET body itself carries
-  `"local_port":45999` (`:611-615`). A seed that reads the key-less cwd file first therefore no
+  `"local_port":45999` (the `assert!` at `:610-615`). A seed that reads the key-less cwd file first therefore no
   longer passes at 4/4: it answers `HTTP/1.0 404 … proxy "main" not found` and the assertion panics
-  at `:607`. Combined with the pre-existing assertions, precedence is now pinned in the direction the
+  at `:610:5`. Combined with the pre-existing assertions, precedence is now pinned in the direction the
   item asked for (the `-c` file wins over a keyed cwd file — the sibling (c) fixture covers the
   opposite split) rather than dropped. No `CHANGELOG.md` entry: test fixture only.
 
@@ -7509,6 +7521,7 @@ section; ledger now **24 open / 104 closed**.**
   0.0.0.0:19961` and keeps running) and the corrected shutdown figure — `SIGTERM` rc 0 once the
   handler is installed (`frp-server/src/service.rs:1858`; a signal landing in the startup window dies
   with rc 143 on **both** lanes), per the adversarial round-2 measurement.
+
 - [ ] **Strict mode checks unknown keys in the legacy `.ini` dialect, where Go's legacy reader ignores them even with `strict_config` on.**
   Measured while closing the typeless-`.ini` item (#418). A legacy-shaped `.ini`
   (`[common]` plus sections) is decoded by Go's legacy reader, which accepts-and-ignores
@@ -7593,3 +7606,31 @@ section; ledger now **24 open / 104 closed**.**
 
   Done-when: a portless dotted spelling of a typed root is treated as the section it looks like (or
   the refusal is recorded as deliberate with this measurement), pinned in both loader modes.
+
+- [ ] **Four more test-precision residues the `test-precision-residue` round-2 reviews measured.**
+  Same class as `TODO.md:7205`: a test that pins less than its name claims, so a real regression
+  stays green.
+  (a) The pinned warning bytes are the shipped static, but the **emitted** record is only
+  substring-checked: `frp-core/tests/server_tls_enable_warning.rs:441` asserts
+  `c.logged_by_warning_call.contains(NEEDLE)` (`NEEDLE` at `:93`), never equality against
+  `SERVER_TLS_ENABLE_INERT_WARNING`. Measured: appending a clause at the emit site
+  (`frp-core/src/config/loader.rs:597` → `tracing::warn!("{} (see docs/tls.md)", …)`) keeps all 8
+  tests green while the user-visible log line drifts from the static. Done-when: the assertion pins
+  the emitted record (equality, or a suffix check that tolerates only the tracing prefix) and the
+  appended-clause mutant reds.
+  (b) `frp-server/src/control/login.rs`'s `request_head_timeout()` accessor is not pinned to a
+  non-constant override: a lying accessor that ignores the stored field (`:2343-2349`) and returns
+  `MOCK_REQUEST_HEAD_TIMEOUT` keeps all 19 oidc tests green. Done-when: the delegation pin
+  (`:2758-2768`) or a sibling drives an override that differs from the constant and asserts the
+  stored field.
+  (c) `frpc/tests/admin_config_get_warning.rs`'s `seed_resolves_spellings_only_the_loader_does`
+  spawns four frpc children and calls `free_port()` per sub-case, so a released port can be re-taken
+  between spawns: the round-2 run hit `frpc admin server failed: Address already in use (os error
+  48)` once, passing on retry. Done-when: the port is held for the fixture's lifetime, or the test
+  retries deterministically instead of depending on the race.
+  (d) The `-z "$TREE"` guard's own `exit 1` (`scripts/tests/repo-health-fixtures.sh:282`) is dormant
+  while the `setup_die` path works and no scenario forces an empty root, so reverting it alone stays
+  green; the case-variant symlink misclassification in `scripts/repo-health.sh` is pre-existing and
+  unreachable on a case-sensitive filesystem. Done-when: either a scenario exercises an empty root
+  (killing that guard) or the dormant branch is removed, and the case-insensitive-volume limitation
+  is recorded where the containment check is documented.
