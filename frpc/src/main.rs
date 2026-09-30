@@ -12,8 +12,8 @@ use frp_core::cli::{
     StopArgs,
 };
 use frp_core::config::{
-    collect_config_files, load_client_config, load_client_config_with_presence, ClientConfig,
-    ProxyConfig,
+    collect_config_files, load_client_config, load_client_config_with_presence,
+    load_client_config_with_presence_checked, ClientConfig, ProxyConfig,
 };
 use frp_core::logging;
 use frp_core::unsafe_features::UnsafeFeatures;
@@ -352,7 +352,9 @@ async fn main() {
             )
             .await
         }
-        FrpcCmd::Verify(args) => run_verify(&args.config, args.strict_config).await,
+        FrpcCmd::Verify(args) => {
+            run_verify(&args.config, args.strict_config, &args.allow_unsafe).await
+        }
         FrpcCmd::Reload(args) => run_reload(args).await,
         FrpcCmd::Status(args) => run_status(args).await,
         FrpcCmd::Stop(args) => run_stop(args).await,
@@ -761,13 +763,24 @@ async fn run_single_proxy(
     }
 }
 
-async fn run_verify(config_path: &str, strict_config: bool) {
+async fn run_verify(config_path: &str, strict_config: bool, allow_unsafe: &[String]) {
     logging::init_console_logger();
 
     // Go frp v0.70.1: `frpc verify` honors the persistent strictConfigMode
     // root flag (cmd/frpc/sub/verify.go) — with --strict-config=false, unknown
     // fields are accepted.
-    match load_client_config_with_presence(config_path, strict_config) {
+    //
+    // The loader is the post-load-gated one: `auth.tokenSource`/
+    // `auth.oidc.tokenSource` pointing at an `exec` command needs the
+    // `--allow-unsafe TokenSourceExec` allow-list on **this** path too, because
+    // Go's verify runs `ValidateClientConfig`'s unsafe-feature gate (measured on
+    // Go v0.71.0: `frpc verify -c <exec cfg>` is rc 1 with the
+    // `unsafe feature "TokenSourceExec" is not enabled. …` line and rc 0 with
+    // `--allow-unsafe TokenSourceExec`). Without it this command certified a
+    // config the daemon refuses at construction with rc 3.
+    let refs: Vec<&str> = allow_unsafe.iter().map(|s| s.as_str()).collect();
+    let unsafe_features = UnsafeFeatures::new(&refs);
+    match load_client_config_with_presence_checked(config_path, strict_config, &unsafe_features) {
         Ok((cfg, presence)) => {
             // This path installs its console logger **before** the load, so the
             // sink exists: emit the `[web_server.tls] enable` diagnostic here to
@@ -807,7 +820,8 @@ async fn run_verify(config_path: &str, strict_config: bool) {
             // os.Exit(1)` (`cmd/frpc/sub/verify.go`) — the refusal goes to
             // **stdout**, not stderr. Measured against the Go binary with the
             // two streams captured separately (Go: stdout 38 bytes, stderr 0);
-            // pinned by `frpc/tests/cli_exit_codes.rs`.
+            // pinned by `frpc/tests/cli_exit_codes.rs`. The `--allow-unsafe`
+            // gate's refusal arrives on this same arm, through the loader.
             println!("Config file {} is invalid: {}", config_path, e);
             // Go v0.71.0 `frpc verify -c <bad>` exits 1; measured against the Go
             // binary and pinned by `frpc/tests/cli_exit_codes.rs`.

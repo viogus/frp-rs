@@ -161,7 +161,11 @@ jobs:
       # re-derived from this lane's own `-- --list` on the merged tree. A merged
       # literal is the **sum** of two disjoint additions, never the larger of
       # the two: the pre-merge branch measured 31 and `main` measured 31.
-      FRPS_CLI_TESTS: "33"
+      # 33 → 34 with the `--allow-unsafe` gate on the load path (#422): +1
+      # (`verify_runs_the_post_load_allow_unsafe_gate_like_go`), the `frps` half.
+      # The same commit adds the mirrored client test, which the tiny literal
+      # below counts (the `full` lane that also runs it has no literal).
+      FRPS_CLI_TESTS: "34"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
       # 11 → 13 with the one `auth.method` policy: +2
@@ -183,7 +187,13 @@ jobs:
       # 17 → 18 with the pin for the exclusion clause itself: +1
       # (`typeless_port_carrying_ini_visitor_is_not_a_proxy` — a port-carrying
       # `role = "visitor"` section, un-gated).
-      FRPC_TINY_CLI_TESTS: "18"
+      # 18 → 19 with the `--allow-unsafe` gate on the load path (#422): +1
+      # (`verify_runs_the_post_load_allow_unsafe_gate_like_go`) — the file is
+      # `#![cfg(any(feature = "full", feature = "tiny"))]` and the test is not
+      # further gated, so both client lanes gain it. Measured with
+      # `cargo test -p frpc --no-default-features --features tiny --test
+      # cli_exit_codes -- --list`.
+      FRPC_TINY_CLI_TESTS: "19"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4

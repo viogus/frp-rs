@@ -620,6 +620,183 @@ fn unresolvable_token_source_exits_3_where_go_exits_1() {
     );
 }
 
+/// The client half of the batch-7 pin: `frpc verify` now runs the post-load
+/// `--allow-unsafe` gate, so it refuses the config the daemon refuses at
+/// construction.
+///
+/// Measured on Go frp v0.71.0 with the two streams captured separately (a fresh
+/// config and a fresh free port per row, every child bounded and reaped):
+///
+/// | argv | Go | this file's base |
+/// |---|---|---|
+/// | `frpc verify -c <exec cfg>` | rc 1, stdout `unsafe feature "TokenSourceExec" is not enabled. To enable it, ensure it is allowed in the configuration or command line flags`, stderr 0 B | rc 0, `frpc: the configuration file <p> syntax is ok` + summary (the pre-#418 base printed `Config file <p> is valid`; #418 moved the sentence, so the accept rows below assert Go's) |
+/// | `frpc verify … --allow-unsafe TokenSourceExec` | rc 0, `frpc: the configuration file <p> syntax is ok` | rc 0 |
+/// | `frpc verify … --allow-unsafe WrongFeature` | rc 1 (fail-closed) | rc 0 (fail-open) |
+/// | `frpc verify … --allow-unsafe WrongFeature --allow-unsafe TokenSourceExec` | rc 0 (pflag `strings` appends) | rc 1 — bpaf refused the second occurrence |
+/// | `frpc verify … --allow-unsafe TokenSourceExec --allow-unsafe WrongFeature` | rc 0 (a later unrelated value does not cancel an earlier enabling one) | rc 1 |
+/// | `frpc verify … --allow-unsafe Ignored,TokenSourceExec` | rc 0 (each occurrence is comma-split) | rc 0 |
+/// | `frpc verify … --allow-unsafe WrongFeature --allow-unsafe Ignored --allow-unsafe TokenSourceExec` | rc 0 (three occurrences append too — the enabling value need not be within the first two) | rc 1 — bpaf refused the second occurrence |
+/// | `frpc verify … --allow-unsafe A --allow-unsafe B --allow-unsafe Cc --allow-unsafe TokenSourceExec` | rc 0 (four occurrences append too; Go accepts five as well — pflag's `strings` has no cap) | rc 1 — bpaf refused the second occurrence |
+/// | `frpc -c <exec cfg>` (run) | rc 1, the same stdout line | rc 3, `EXIT_AUTH` |
+///
+/// frp-rs's wording stays its own predicate message and its own `Config file <p>
+/// is invalid: …` wrapper; the **lane** is what is pinned (stdout, stderr empty,
+/// rc 1, the same arm a parse failure uses). The run row stays **3**.
+///
+/// Teeth: deleting the `check_client_unsafe_features` call from
+/// `load_client_config_with_presence_checked` makes the first row exit 0
+/// (`left: Some(0)`); making the allow-list check always true makes the
+/// `WrongFeature` row exit 0.
+#[test]
+fn verify_runs_the_post_load_allow_unsafe_gate_like_go() {
+    let dir = TempDir::new();
+    let cfg = dir.write(
+        "execsource.toml",
+        &format!(
+            "{BASE_CONFIG}[auth]\nmethod = \"token\"\n\
+             [auth.tokenSource]\ntype = \"exec\"\n\
+             [auth.tokenSource.exec]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"printf tok\"]\n"
+        ),
+    );
+    const GATE_MSG: &str = "auth.tokenSource exec blocked: TokenSourceExec not in UnsafeFeatures \
+                            allowlist. Pass --allow-unsafe TokenSourceExec to enable.";
+
+    let refuse = run_frpc(&["verify", "-c", &cfg]);
+    assert_eq!(
+        refuse.status.code(),
+        Some(1),
+        "Go refuses an exec tokenSource on verify with rc 1; the load-path gate must \
+         reproduce that lane; stdout={:?} stderr={:?}",
+        stdout_of(&refuse),
+        stderr_of(&refuse),
+    );
+    assert_eq!(
+        stdout_of(&refuse),
+        format!("Config file {cfg} is invalid: {GATE_MSG}\n"),
+        "the refusal must go to **stdout** through the existing load-failure arm \
+         (`Config file <p> is invalid: …`), with no log prefix and no ANSI; stderr={:?}",
+        stderr_of(&refuse),
+    );
+    assert!(
+        stderr_of(&refuse).is_empty(),
+        "Go prints nothing on stderr for a verify refusal; stderr={:?}",
+        stderr_of(&refuse),
+    );
+
+    let accept = run_frpc(&["verify", "-c", &cfg, "--allow-unsafe", "TokenSourceExec"]);
+    assert_eq!(
+        accept.status.code(),
+        Some(0),
+        "--allow-unsafe TokenSourceExec must satisfy the gate (measured rc 0 on Go); \
+         stdout={:?} stderr={:?}",
+        stdout_of(&accept),
+        stderr_of(&accept),
+    );
+    assert_eq!(
+        stdout_of(&accept),
+        format!(
+            "frpc: the configuration file {cfg} syntax is ok\n  Server: 127.0.0.1:7000\n  \
+             Proxies: 0\n  Visitors: 0\n"
+        ),
+        "Go prints that sentence and nothing else; the three summary lines are frp-rs's own \
+         extension (#418 moved the sentence here); stderr={:?}",
+        stderr_of(&accept),
+    );
+    assert!(
+        stderr_of(&accept).is_empty(),
+        "stderr={:?}",
+        stderr_of(&accept)
+    );
+
+    let wrong = run_frpc(&["verify", "-c", &cfg, "--allow-unsafe", "WrongFeature"]);
+    assert_eq!(
+        wrong.status.code(),
+        Some(1),
+        "the allow-list is fail-closed: an unrelated feature does not enable \
+         TokenSourceExec (measured rc 1 on Go); stdout={:?} stderr={:?}",
+        stdout_of(&wrong),
+        stderr_of(&wrong),
+    );
+
+    // pflag's `strings` **appends** on repetition and comma-splits every
+    // occurrence, so Go's verify honours all five spellings below (measured
+    // rc 0 on v0.71.0 for each, in both value orders; Go also accepts four and
+    // five occurrences, so there is no bound to pin — the rows are one step each).
+    // The `TokenSourceExec`-first row separates appending from a last-wins
+    // reading; the three-occurrence row kills a parser that caps at two
+    // (`.many().map(|mut v: Vec<String>| { v.truncate(2); v })`) and the
+    // four-occurrence row kills the same mutant one step out (`v.truncate(3)`).
+    // The unbounded class is pinned in `frp-core`'s unit test, which builds 32
+    // occurrences rather than a literal row.
+    for extra in [
+        vec![
+            "--allow-unsafe",
+            "WrongFeature",
+            "--allow-unsafe",
+            "TokenSourceExec",
+        ],
+        vec![
+            "--allow-unsafe",
+            "TokenSourceExec",
+            "--allow-unsafe",
+            "WrongFeature",
+        ],
+        vec!["--allow-unsafe", "Ignored,TokenSourceExec"],
+        vec![
+            "--allow-unsafe",
+            "WrongFeature",
+            "--allow-unsafe",
+            "Ignored",
+            "--allow-unsafe",
+            "TokenSourceExec",
+        ],
+        vec![
+            "--allow-unsafe",
+            "A",
+            "--allow-unsafe",
+            "B",
+            "--allow-unsafe",
+            "Cc",
+            "--allow-unsafe",
+            "TokenSourceExec",
+        ],
+    ] {
+        let mut argv = vec!["verify", "-c", cfg.as_str()];
+        argv.extend(extra.iter().copied());
+        let repeated = run_frpc(&argv);
+        assert_eq!(
+            repeated.status.code(),
+            Some(0),
+            "Go accepts `--allow-unsafe {extra:?}` on verify (measured rc 0): a repeated \
+             pflag `strings` appends and each occurrence is comma-split; stdout={:?} stderr={:?}",
+            stdout_of(&repeated),
+            stderr_of(&repeated),
+        );
+        assert_eq!(
+            stdout_of(&repeated),
+            format!(
+                "frpc: the configuration file {cfg} syntax is ok\n  Server: 127.0.0.1:7000\n  \
+                 Proxies: 0\n  Visitors: 0\n"
+            ),
+            "Go prints that sentence and nothing else; the three summary lines are frp-rs's own \
+             extension (#418 moved the sentence here); stderr={:?}",
+            stderr_of(&repeated),
+        );
+    }
+
+    // The run path is untouched: the same config is still refused by
+    // construction with the typed EXIT_AUTH/3, not by the loader.
+    let run = run_frpc(&["-c", &cfg]);
+    assert_eq!(
+        run.status.code(),
+        Some(3),
+        "the run path must keep the EXIT_AUTH/3 construction refusal; the load-path \
+         gate exists for verify only; stdout={:?} stderr={:?}",
+        stdout_of(&run),
+        stderr_of(&run),
+    );
+}
+
 /// `EXIT_BIND`/4 is **not** specifically about bind errors: it is the daemons'
 /// tag for any service-*construction* failure that is not an auth one. A
 /// `[store] path` pointing at a file that is not JSON reaches it without any

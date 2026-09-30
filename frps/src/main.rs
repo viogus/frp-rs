@@ -3,7 +3,7 @@ use std::process;
 
 use frp_core::cli::{parse_frps_args, FrpsArgs, FrpsCmd};
 use frp_core::config::{
-    collect_config_files, load_server_config, load_server_config_uncompleted_with_presence,
+    collect_config_files, load_server_config_checked, load_server_config_uncompleted_with_presence,
     load_server_config_with_presence, ServerConfig,
 };
 use frp_core::logging;
@@ -33,7 +33,7 @@ async fn main() {
         // `verify` exits inside the call (`process::exit` on a bad config) and
         // returns to the runtime's exit 0 otherwise — the same shape as the root
         // command returning from `RunE` with a nil error.
-        FrpsCmd::Verify(args) => run_verify(&args.config, args.strict_config),
+        FrpsCmd::Verify(args) => run_verify(&args.config, args.strict_config, &args.allow_unsafe),
         FrpsCmd::Run(args) => run(args).await,
     }
 }
@@ -52,25 +52,33 @@ async fn main() {
 /// * success is `frps: the configuration file %s syntax is ok` on **stdout**,
 ///   exit 0 (`:56`).
 ///
-/// The loader is [`load_server_config`] — the same parse-and-validate path the
-/// run path uses: the run path's single-config branch calls
-/// [`load_server_config_uncompleted`] (the same function minus
+/// The loader is [`load_server_config_checked`] — [`load_server_config`] plus
+/// [`frp_core::config::check_server_unsafe_features`]. The parse-and-validate
+/// half is the same path the run path uses: the run path's single-config branch
+/// calls [`load_server_config_uncompleted`] (the same function minus
 /// `ServerConfig::complete`) and completes the merged config itself, and both go
 /// through `load_config_from_file` with `known_server_keys` and
 /// `validate_server_config`. `verify` has no CLI overrides to merge, so it takes
 /// the completing wrapper. The consequence is that `verify` accepts exactly the
-/// configs `frps -c` accepts and refuses the ones it refuses at **load** time.
-/// It does **not** run the later service-construction gates (the
-/// `--allow-unsafe`/`TokenSourceExec` check, applied in
-/// `frp-server/src/service.rs`), which is where Go differs: Go's verify *does*
-/// run its post-load `ValidateServerConfig` gate (`cmd/frps/verify.go:46-48`), so
-/// an `auth.tokenSource` with `type = "exec"` and no
-/// `--allow-unsafe TokenSourceExec` is rc 1 on Go and rc 0 here — the same
-/// pre-existing divergence `frpc verify` has, recorded in `docs/developing.md`
-/// § CLI inputs and measured for the client in `frp-core/src/config/tests.rs`. It
-/// is not closed here because both verify commands must report the same verdict
-/// for the same config; a fix belongs in the shared load path, not in one
-/// binary's verify.
+/// configs `frps -c` accepts and refuses the ones it refuses: parse and
+/// validation failures at **load** time, and an `auth.tokenSource` with
+/// `type = "exec"` through the post-load `--allow-unsafe` gate, which is the
+/// same predicate the daemon reaches at service construction
+/// (`frp-server/src/service.rs`).
+///
+/// That gate is where Go and frp-rs once differed in *stage*: Go runs
+/// `ValidateUnsafeFeature` from inside `ValidateServerConfig`
+/// (`pkg/config/v1/validation/validator.go:22-27`, called for
+/// `tokenSource.Type == "exec"` at `pkg/config/v1/validation/auth.go:34-35`), so
+/// Go's verify (`cmd/frps/verify.go:46-48`) and its run path both refuse with
+/// rc 1 and Go's own
+/// `unsafe feature "TokenSourceExec" is not enabled. …` line. frp-rs now
+/// refuses on this lane too (Go's rc **1**; the message is frp-rs's predicate
+/// wording, the one the daemon already printed). The run path keeps its
+/// construction-time refusal — `tracing::error!` + `EXIT_AUTH`/**3**, a
+/// documented frp-rs extension, not Go's rc 1 — because moving the gate into
+/// the loader would silently move that refusal onto this lane. Measured on the
+/// branch head and pinned by `frps/tests/cli_exit_codes.rs`.
 ///
 /// Logging is deliberately **not** initialised: Go installs its logger only in
 /// `runServer` (`cmd/frps/root.go:112`), never on the verify path, and the
@@ -78,14 +86,16 @@ async fn main() {
 /// the one success line with stderr empty. Leaving `tracing` uninitialised drops
 /// the lenient-load warnings the run path would emit, which is what keeps that
 /// one-line shape (`tracing` records are a no-op without a subscriber).
-fn run_verify(config_path: &str, strict_config: bool) {
+fn run_verify(config_path: &str, strict_config: bool, allow_unsafe: &[String]) {
     if config_path.is_empty() {
         // Go: `fmt.Println("frps: the configuration file is not specified")`,
         // then `return nil` — rc 0, not an error.
         println!("frps: the configuration file is not specified");
         return;
     }
-    match load_server_config(config_path, strict_config) {
+    let refs: Vec<&str> = allow_unsafe.iter().map(|s| s.as_str()).collect();
+    let unsafe_features = UnsafeFeatures::new(&refs);
+    match load_server_config_checked(config_path, strict_config, &unsafe_features) {
         Ok(_) => {
             // Go: `fmt.Printf("frps: the configuration file %s syntax is ok\n",
             // cfgFile)` (`cmd/frps/verify.go:56`).
@@ -94,7 +104,9 @@ fn run_verify(config_path: &str, strict_config: bool) {
         Err(e) => {
             // Go: `fmt.Println(err); os.Exit(1)` (`cmd/frps/verify.go:42-44`) —
             // the same bare stdout line and rc the run path's load failure
-            // prints (`frps/src/main.rs`, single-config branch).
+            // prints (`frps/src/main.rs`, single-config branch). The
+            // `--allow-unsafe` refusal arrives on this arm too, through the
+            // loader's gate, which is why it needs no arm of its own.
             println!("{e}");
             process::exit(frp_core::EXIT_RUNTIME);
         }

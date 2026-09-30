@@ -5015,12 +5015,13 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   two stale `FRPS_CLI_TESTS: "16"` quotes in this file. The `frpc verify` success-line divergence
   and the `frps help`/`completion` rc divergence are recorded — the first filed as an item below,
   the second in `docs/developing.md` § Maintenance policy: feature surface.
-  **Three things this does not claim.** (1) The `--allow-unsafe`/`TokenSourceExec` gate is not run:
-  Go's verify does run its post-load `ValidateServerConfig`
+  **Three things this does not claim.** (1) The `--allow-unsafe`/`TokenSourceExec` gate was not run
+  at this head: Go's verify does run its post-load `ValidateServerConfig`
   (`pkg/config/v1/validation/validator.go:22-27` via `auth.go:34-35`, reached from
   `cmd/frps/verify.go:46-48`), so `frps verify -c <exec tokenSource>` is Go rc **1**
-  (`unsafe feature "TokenSourceExec" is not enabled …`) and head rc **0** — the same pre-existing
-  divergence `frpc verify` has, now filed as its own item below. (2) Trailing
+  (`unsafe feature "TokenSourceExec" is not enabled …`) and the head was rc **0** — the same
+  pre-existing divergence `frpc verify` had, filed as its own item below and closed in `3798a727`
+  (see that item's Done block). (2) Trailing
   positionals: Go's `verifyCmd` sets no `Args` validator, so `frps verify -c <valid> junk` is Go
   rc **0** and head rc **1** — the same divergence `frpc verify -c <valid> junk` has (measured,
   Go 0 / frp-rs 1). (3) The run path's `frps -c a.toml -c b.toml` has no last-wins either before or
@@ -5120,7 +5121,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   match, because every reachable frps construction message contains `auth`/`token` — a substring
   mutant in `frps/src/main.rs` passes all 19 of that file's tests (verified by attempting it).
 
-- [ ] **`frps verify` / `frpc verify` do not run the post-load `--allow-unsafe` gate, so `verify`
+- [x] **`frps verify` / `frpc verify` do not run the post-load `--allow-unsafe` gate, so `verify`
   accepts a config the daemon refuses.** Found by the reviewers of the `frps verify` round; the
   sentence that pointed at "its own item" in `docs/developing.md` § CLI inputs named an item that
   did not exist, which is what filed this one.
@@ -5149,6 +5150,54 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `verify` refuses what the daemon refuses, and give each row above a measured pin; or record it
   as a deliberate divergence in `docs/developing.md` § CLI inputs **and** in the feature-surface
   policy, with the reason the two stages are allowed to differ. No sha.
+
+  **Done (`3798a727`).** Took the first branch. `run_verify` in both binaries now loads through
+  `load_server_config_checked` / `load_client_config_with_presence_checked`
+  (`frp-core/src/config/file.rs`), which call the new `check_server_unsafe_features` /
+  `check_client_unsafe_features` and reuse the daemons' own predicate
+  (`frp_core::auth::validate_token_source_unsafe`), so one place gates both binaries and both
+  commands. `--allow-unsafe` is read on the two `verify` subcommands
+  (`VerifyArgs { config, strict_config, allow_unsafe }`, `frp-core/src/cli.rs`) instead of
+  ignored, and the gate is fail-closed: `--allow-unsafe WrongFeature` is rc 1 (was rc 0). The
+  daemon path is untouched and still exits 3 `EXIT_AUTH` on the same config, the documented
+  frp-rs extension over Go's rc 1; that divergence is stated in the pins' doc tables
+  (`frps/tests/cli_exit_codes.rs:273-282`, `frpc/tests/cli_exit_codes.rs:630-639`) rather than
+  moved. Every row above now has a measured pin:
+  `verify_runs_the_post_load_allow_unsafe_gate_like_go` in `frps/tests/cli_exit_codes.rs:295`
+  and `frpc/tests/cli_exit_codes.rs:651`, plus the loader-level
+  `check_client_unsafe_features_gates_both_token_source_spellings` in
+  `frp-core/src/config/tests.rs:10825` for the `auth.oidc.tokenSource` spelling, which this round's
+  probe table does not cover separately but Go gates through `validateOIDCConfig`
+  (`pkg/config/v1/validation/client.go`), so it is an exact-parity arm.
+  Teeth: `Ok(())` for either checked wrapper reds the spawn pin's refuse row
+  (`frps/tests/cli_exit_codes.rs:310:5`, `frpc/tests/cli_exit_codes.rs:665:5`),
+  widening the predicate to `unsafe_features.is_empty()` reds the fail-closed row
+  (`frps/tests/cli_exit_codes.rs:353:5`, `frpc/tests/cli_exit_codes.rs:712:5`), and deleting
+  the `auth.oidc_token_source` arm reds `frp-core/src/config/tests.rs:10890:14` (the
+  `.expect_err` line; the round-1 review measured this head).
+
+  **Round-1 review fixes (`b9ab5473` F1, `436a8130` F5).** Round 1 blocked on a regression
+  this fix introduced: `allow_unsafe_parser()` was declared without `.many()`, so a repeated
+  `--allow-unsafe` was refused (`Error: argument `--allow-unsafe` cannot be used multiple
+  times in this context`, rc 1) on both verify commands and the run paths, where Go's pflag
+  appends. That regressed `frpc verify` (the base `971e0fa0` routed it through the
+  `.many()`-bearing `ignored_allow_unsafe()`, so it had accepted repeats) and kept
+  `frps verify`'s pre-existing refusal (its base inline parser already rejected them). It is now `.many()` plus a flatten of
+  each trimmed comma-split occurrence, matching Go v0.71.0 on all three surfaces
+  (`--allow-unsafe WrongFeature --allow-unsafe TokenSourceExec` rc 0 in both value orders,
+  `--allow-unsafe Ignored,TokenSourceExec` rc 0, `WrongFeature` alone rc 1, no flag rc 1).
+  Pins: `allow_unsafe_appends_and_comma_splits_on_every_reading_surface`
+  (`frp-core/src/cli.rs:5188`) and three extra rows per binary inside
+  `verify_runs_the_post_load_allow_unsafe_gate_like_go`; teeth: a last-wins mutant reds
+  `frp-core/src/cli.rs:5207:9`, `frps/tests/cli_exit_codes.rs:408:9` and
+  `frpc/tests/cli_exit_codes.rs:767:9`, while removing `.many()` does not compile
+  (the deleted `.many()` at `frp-core/src/cli.rs:2636`; the diagnostic labels
+  `.fallback(vec![])` at `:2647` and the unsatisfied closure at `:2637`, `E0599`/`E0631` — the
+  closure's `Vec<String>` type is the enforcement, so that mutation is killed by the checker
+  rather than by a failing assertion).
+  F5: the comment in `frp-core/src/config/file.rs:167-193` now names both spellings and Go's
+  `validateOIDCConfig` (`pkg/config/v1/validation/client.go`), which gates
+  `auth.oidc.tokenSource` exec identically — an exact-parity arm, not an unmeasured one.
 - [x] **`frpc verify`'s success line is not Go's, and now differs from `frps verify`'s too.**
   Recorded as "a second, adjacent divergence left alone" by the output-shape round
   (`docs/developing.md` § Output stream and shape on a config-load failure) and mentioned in
@@ -5634,7 +5683,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   they still expected `4` (`test result: ok. 4 passed`, `[ "$n" = "4" ]`), and the log shows both
   `Running tests/cli_exit_codes.rs` and `test result: ok. 5 passed; 0 failed` — so those two `4`
   literals were the only red, and the guard failed closed (`:272`). The test that moved the count
-  is `space_form_strict_config_warns_on_stderr` (`frps/tests/cli_exit_codes.rs:282`), which the
+  is `space_form_strict_config_warns_on_stderr` (`frps/tests/cli_exit_codes.rs:844`), which the
   step's own comment names at `:232`.
   Two comments in that file are stale at this head:
   * `ci.yml:300` — the `tiny` lane's comment opens "Same three checks as the step above" and
@@ -7634,3 +7683,45 @@ section; ledger now **24 open / 104 closed**.**
   unreachable on a case-sensitive filesystem. Done-when: either a scenario exercises an empty root
   (killing that guard) or the dormant branch is removed, and the case-insensitive-volume limitation
   is recorded where the containment check is documented.
+
+- [ ] **`--allow-unsafe`'s comma grammar still differs from pflag's CSV reader, and the ignored-flag twin splits nothing at all.**
+  The read-path parser splits on `,` and trims each element (`frp-core/src/cli.rs:2637-2646`, inside
+  `allow_unsafe_parser` at `:2632`), while Go's pflag parses a repeated string flag with
+  `encoding/csv` (leading-space trimming off). Two spellings therefore diverge, measured at
+  `a26a5f76` against Go v0.71.0 with an `auth.tokenSource` exec config
+  (`frpc verify -c exec.toml --allow-unsafe <value>`): `'"TokenSourceExec"'` → frp-rs rc **1** /
+  Go rc **0** (the quotes are CSV syntax to Go and literal bytes here); `'A, TokenSourceExec'` →
+  frp-rs rc **0** / Go rc **1** (the space is significant to Go and trimmed here). The agreeing rows:
+  `TokenSourceExec` 0/0, `Ignored,TokenSourceExec` 0/0, no flag 1/1. Inherited from the pre-existing
+  `.split(',')` reading, not introduced by the repeated-flag fix. The un-read twin
+  `ignored_allow_unsafe()` (`frp-core/src/cli.rs:2656-2661`) has `.many()` but no comma-split at
+  all, so on the reload/status/stop surfaces a comma form that Go accepts as several features is one
+  opaque value here. Its doc comment at `:2650-2652` claims only that repeats append and that the
+  value is dropped (`Same spellings … repeats append; the value is dropped here either way`), which
+  is true; the missing split is unobservable on those surfaces because
+  `ignored_admin_root_flags()` discards the vector.
+
+  Done-when: the flag's value grammar matches pflag's CSV reader for quoted and space-padded
+  elements and the un-read twin splits the same way (or both divergences are documented as
+  deliberate with these measured rows), and a test pins each row.
+
+- [ ] **The `--allow-unsafe` accumulation pins cannot see a duplicated value, a cap at 32, or a shrinking lane, and the two lane literals are equality guards rather than floors.**
+  Filed by the coordinator from the round-3 adversarial review of the `--allow-unsafe` gate fix
+  (`frp-core/src/cli.rs:5188` `allow_unsafe_appends_and_comma_splits_on_every_reading_surface`,
+  `frps/tests/cli_exit_codes.rs:295`, `frpc/tests/cli_exit_codes.rs:651`).
+  (a) Every repeated value in the pins is distinct (`frp-core/src/cli.rs:5175` uses `"a"`/`"b"`,
+  `frpc/tests/cli_persistent_flags.rs:384-387` likewise), so a parser that de-duplicates or
+  collapses equal repeats keeps the unit test and both spawn pins green: "appends like pflag" is
+  pinned for distinct values only.
+  (b) "No cap" rests on the single wide row that builds 32 occurrences. Measured: `v.truncate(32)`
+  leaves the whole `frp-core` lib suite green (`997 passed; 0 failed`) and both spawn rows use at
+  most four occurrences, so any cap ≥ 5 is invisible to them; loosening that one assertion to
+  `>= wide_n - 1` also passes everything.
+  (c) `FRPS_CLI_TESTS` / `FRPC_TINY_CLI_TESTS` (`.github/workflows/ci.yml:194` / `:216`) compare the
+  file's test count to the literal for equality, so deleting a test and lowering the literal
+  together passes (measured 33/33/33), and the full `frpc` lane (`.github/workflows/ci.yml:312`,
+  18 tests) has no count guard at all.
+  Done-when: a pin repeats one identical value and asserts both copies survive; the unbounded class
+  is pinned past any plausible cap (or the assertion states the bound it really enforces); and each
+  lane literal gets an absolute floor (or the full `frpc` lane gets a count guard), with the
+  delete-plus-lower mutant red.

@@ -780,15 +780,7 @@ fn svr_auth() -> impl Parser<SvrAuth> {
         .long("allow_ports")
         .argument::<String>("RANGES")
         .optional();
-    let allow_unsafe = long("allow-unsafe")
-        .long("allow_unsafe")
-        .argument::<String>("FEATURES")
-        .map(|s| {
-            s.split(',')
-                .map(|x| x.trim().to_string())
-                .collect::<Vec<_>>()
-        })
-        .fallback(vec![]);
+    let allow_unsafe = allow_unsafe_parser();
     construct!(SvrAuth {
         token,
         allow_ports,
@@ -991,16 +983,22 @@ fn frps_parser() -> impl Parser<FrpsCmd> {
 /// The `frps verify` subcommand, mirroring Go's `verifyCmd`
 /// (`cmd/frps/verify.go`, registered on `rootCmd` at `:29`).
 ///
-/// Go's `verifyCmd` reads exactly two persistent root flags — `cfgFile` and
-/// `strictConfigMode` (`cmd/frps/verify.go:36,40`) — and **accepts and ignores**
-/// every other flag Go's `frps` root registers, because they hang off `rootCmd`:
-/// `config.RegisterServerConfigFlags(rootCmd, &serverCfg)` (`cmd/frps/root.go:50`)
-/// plus `--version` and `--allow-unsafe` (`:44-48`). Measured on Go v0.71.0:
+/// Go's `verifyCmd` reads exactly two persistent root flags itself — `cfgFile`
+/// and `strictConfigMode` (`cmd/frps/verify.go:36,40`) — and **accepts and
+/// ignores** every other flag Go's `frps` root registers, because they hang off
+/// `rootCmd`: `config.RegisterServerConfigFlags(rootCmd, &serverCfg)`
+/// (`cmd/frps/root.go:50`) plus `--version` and `--allow-unsafe` (`:44-48`).
+/// One of those "ignored" flags is not really ignored on either side:
+/// `--allow-unsafe` is consulted by the post-load unsafe-feature gate that Go
+/// runs from `ValidateServerConfig` (measured on v0.71.0: `frps verify -c <exec
+/// tokenSource cfg>` is rc 1 without it, rc 0 with it), so frp-rs reads it here
+/// too and hands it to `run_verify` — see [`VerifyArgs::allow_unsafe`]. Measured
+/// on Go v0.71.0:
 /// `frps verify --help` prints the whole surface under `Global Flags`, and
 /// `frps verify --bind-port <free> -c <valid>`,
 /// `frps verify --allow-unsafe X -c <valid>` and
 /// `frps verify --version -c <valid>` are all rc 0 with the *verify* output (no
-/// version line). Parsing through [`frps_build`] and keeping only the two fields
+/// version line). Parsing through [`frps_build`] and keeping only the three fields
 /// reproduces that acceptance without a second hand-written flag list — for
 /// **every root flag frp-rs models**, which is the precise claim. The one such
 /// flag that used to be missing was Go's `--vhost-http-timeout`, so `frps
@@ -1038,6 +1036,7 @@ fn frps_verify_cmd() -> impl Parser<FrpsCmd> {
     .map(|b| VerifyArgs {
         config: b.meta.config.unwrap_or_default(),
         strict_config: b.meta.strict_config,
+        allow_unsafe: b.auth.allow_unsafe,
     });
     args.to_options()
         .command("verify")
@@ -2501,6 +2500,20 @@ pub struct VerifyArgs {
     /// passes the flag to its config loader (`cmd/frpc/sub/verify.go:37`,
     /// `cmd/frps/verify.go:40`).
     pub strict_config: bool,
+    /// The `--allow-unsafe` allow-list, **read** on both verify commands (see
+    /// [`allow_unsafe_parser`]).
+    ///
+    /// Go's verify path consults it because the gate lives inside the
+    /// validation the loaded config goes through: measured on Go v0.71.0,
+    /// `frps verify -c <exec tokenSource cfg>` is rc 1 with stdout
+    /// `unsafe feature "TokenSourceExec" is not enabled. …` and rc 0 with
+    /// `--allow-unsafe TokenSourceExec` (identical for `frpc verify`). frp-rs's
+    /// load path runs the same predicate from
+    /// [`crate::config::load_server_config_checked`] /
+    /// [`crate::config::load_client_config_with_presence_checked`], so the
+    /// value has to reach `run_verify` — dropping it here is what made `verify`
+    /// accept a config the daemon refuses.
+    pub allow_unsafe: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2598,9 +2611,48 @@ fn ignored_config_dir() -> impl Parser<Option<String>> {
         .optional()
 }
 
-/// `--allow-unsafe`, as an ignored persistent root flag. Go registers it as a
-/// pflag `strings` (comma-separated, repeatable), so repeats append; the value
-/// is dropped here either way.
+/// `--allow-unsafe`, **read** rather than ignored: Go registers it as a pflag
+/// `strings` (comma-separated, repeatable), and the value feeds
+/// [`UnsafeFeatures`](crate::unsafe_features::UnsafeFeatures) on the run paths
+/// and on both `verify` commands (Go's own `verify` consults the same persistent
+/// flag through `ValidateServerConfig`/`ValidateClientConfig`: measured on
+/// v0.71.0, `frps verify -c <exec cfg>` is rc 1 without it and rc 0 with
+/// `--allow-unsafe TokenSourceExec`).
+///
+/// pflag's `strings` value **appends** on repetition and comma-splits every
+/// occurrence, so the parser is `.many()` plus a flatten. Measured on v0.71.0:
+/// `frps verify -c <exec cfg> --allow-unsafe WrongFeature --allow-unsafe
+/// TokenSourceExec` and the same argv with the two values swapped are both rc 0
+/// (and `--allow-unsafe Ignored,TokenSourceExec` is rc 0), i.e. an unrelated
+/// value in any position does not cancel the enabling one. Without `.many()`
+/// bpaf refuses the second occurrence with ``argument `--allow-unsafe` cannot be
+/// used multiple times in this context`` — rc 1 on `frps verify`, `frpc verify`
+/// and `frpc -c` alike, which is the divergence the repeated-flag rows of
+/// `frps/tests/cli_exit_codes.rs` and `frpc/tests/cli_exit_codes.rs` pin.
+fn allow_unsafe_parser() -> impl Parser<Vec<String>> {
+    long("allow-unsafe")
+        .long("allow_unsafe")
+        .argument::<String>("FEATURES")
+        .many()
+        .map(|values: Vec<String>| {
+            values
+                .into_iter()
+                .flat_map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .fallback(vec![])
+}
+
+/// `--allow-unsafe`, as an ignored persistent root flag. Same spellings as the
+/// run-mode flag (hyphen plus the frp-rs underscore alias) and Go's pflag
+/// `strings` semantics: repeats append; the value is dropped here either way.
+///
+/// Only the subcommands that do not read it use this — `verify` reads
+/// [`allow_unsafe_parser`] instead (Go's verify *does* consult the value).
 fn ignored_allow_unsafe() -> impl Parser<Vec<String>> {
     long("allow-unsafe")
         .long("allow_unsafe")
@@ -2617,8 +2669,8 @@ fn ignored_version() -> impl Parser<bool> {
     go_bool_flag!("version", None, Some('v'), "Version of frpc").last()
 }
 
-/// The persistent root flags the four config-reading subcommands
-/// (`verify`/`reload`/`status`/`stop`) did not declare: `-c` and
+/// The persistent root flags the config-reading subcommands that do not read
+/// `--allow-unsafe` (`reload`/`status`/`stop`) did not declare: `-c` and
 /// `--strict-config` are already fields of their own parsers.
 fn ignored_admin_root_flags() -> impl Parser<()> {
     construct!(
@@ -2627,6 +2679,15 @@ fn ignored_admin_root_flags() -> impl Parser<()> {
         ignored_version()
     )
     .map(|_| ())
+}
+
+/// [`ignored_admin_root_flags`] minus `--allow-unsafe`, for `frpc verify` — the
+/// one config-reading subcommand that **reads** it ([`allow_unsafe_parser`],
+/// because the load-path gate consults the value). The two parsers cannot
+/// coexist in one `construct!`: bpaf would have to consume the same named
+/// argument twice.
+fn ignored_admin_root_flags_except_allow_unsafe() -> impl Parser<()> {
+    construct!(ignored_config_dir(), ignored_version()).map(|_| ())
 }
 
 /// All five persistent rootCmd flags, accepted and ignored on the eight
@@ -2735,15 +2796,7 @@ fn run_mode() -> impl Parser<FrpcRunArgs> {
         .argument::<String>("DIR")
         .optional();
     let strict_config = strict_config_parser();
-    let allow_unsafe = long("allow-unsafe")
-        .long("allow_unsafe")
-        .argument::<String>("FEATURES")
-        .map(|s| {
-            s.split(',')
-                .map(|x| x.trim().to_string())
-                .collect::<Vec<_>>()
-        })
-        .fallback(vec![]);
+    let allow_unsafe = allow_unsafe_parser();
     let show_version = go_bool_flag!("version", None, Some('v'), "Version of frpc");
     let log_file = long("log-file")
         .long("log_file")
@@ -3160,11 +3213,18 @@ fn verify_cmd() -> impl Parser<FrpcCmd> {
     // With strict off, verify accepts unknown fields, matching Go
     // (cmd/frpc/sub/verify.go passes strictConfigMode to LoadClientConfig).
     let strict_config = strict_config_parser();
+    // `--allow-unsafe` is **read** here, not ignored: Go's verify consults the
+    // same persistent flag through `ValidateClientConfig` (measured: rc 1
+    // without `--allow-unsafe TokenSourceExec`, rc 0 with it), and frp-rs's
+    // load path now runs that gate — see
+    // [`crate::config::load_client_config_with_presence_checked`].
+    let allow_unsafe = allow_unsafe_parser();
     let args = construct!(VerifyArgs {
         config,
-        strict_config
+        strict_config,
+        allow_unsafe
     });
-    construct!(args, ignored_admin_root_flags())
+    construct!(args, ignored_admin_root_flags_except_allow_unsafe())
         .map(|(args, _)| args)
         .to_options()
         .command("verify")
@@ -5122,6 +5182,160 @@ mod tests {
                 "repeated {extra:?} refused"
             );
         }
+    }
+
+    #[test]
+    fn allow_unsafe_appends_and_comma_splits_on_every_reading_surface() {
+        // pflag's `strings` value **appends** on repetition — it is not
+        // last-wins — and Go comma-splits every occurrence. Measured on v0.71.0:
+        // `frps verify`/`frpc verify` exit 0 for both value orders (and for
+        // `Ignored,TokenSourceExec`), because any occurrence that enables
+        // `TokenSourceExec` is enough. A last-wins reading would let a later
+        // unrelated value cancel an earlier enabling one and so refuse a config
+        // Go accepts, which is exactly the regression this pins.
+        let verify = parse_frpc_verify(&[
+            "verify",
+            "-c",
+            "p7520.toml",
+            "--allow-unsafe",
+            "WrongFeature",
+            "--allow-unsafe",
+            "Ignored,TokenSourceExec",
+        ])
+        .unwrap();
+        assert_eq!(
+            verify.allow_unsafe,
+            ["WrongFeature", "Ignored", "TokenSourceExec"].map(String::from),
+            "a repeated `--allow-unsafe` must append in order and comma-split each occurrence"
+        );
+
+        // Three occurrences, with the enabling value **last**. Every earlier pin
+        // fed at most two occurrences, so a parser that capped the accumulation
+        // at two stayed green while the shared parser regressed — measured: with
+        // `.many().map(|mut v: Vec<String>| { v.truncate(2); v })` the gate
+        // refused this row (rc 1) where the head and Go v0.71.0 are rc 0. The
+        // full ordered vector is asserted, so truncation anywhere shows up here.
+        let three = parse_frpc_verify(&[
+            "verify",
+            "-c",
+            "p7520.toml",
+            "--allow-unsafe",
+            "WrongFeature",
+            "--allow-unsafe",
+            "Ignored",
+            "--allow-unsafe",
+            "TokenSourceExec",
+        ])
+        .unwrap();
+        assert_eq!(
+            three.allow_unsafe,
+            ["WrongFeature", "Ignored", "TokenSourceExec"].map(String::from),
+            "three occurrences must accumulate in order — capping at two drops the enabling value"
+        );
+
+        // Four occurrences, enabling value last: the next step out. Measured on
+        // Go v0.71.0, four *and* five occurrences are each rc 0 on `frps verify`
+        // and `frpc verify` — pflag's `strings` value has no cap at all — so a
+        // literal row here buys one step rather than the class.
+        let four = parse_frpc_verify(&[
+            "verify",
+            "-c",
+            "p7520.toml",
+            "--allow-unsafe",
+            "A",
+            "--allow-unsafe",
+            "B",
+            "--allow-unsafe",
+            "Cc",
+            "--allow-unsafe",
+            "TokenSourceExec",
+        ])
+        .unwrap();
+        assert_eq!(
+            four.allow_unsafe,
+            ["A", "B", "Cc", "TokenSourceExec"].map(String::from),
+            "four occurrences must accumulate in order — capping at three drops the enabling value"
+        );
+
+        // The class itself: the accumulation is unbounded, so assert a wide
+        // occurrence list instead of chasing the next `truncate(n)` one step at a
+        // time. Any cap of at most 31 dies here; the literal rows above and the
+        // two spawn pins keep the process-level rows honest (a spawn pin cannot
+        // generate argv).
+        let wide_n: usize = 32;
+        let mut wide_argv = vec![
+            "verify".to_string(),
+            "-c".to_string(),
+            "p7520.toml".to_string(),
+        ];
+        let mut wide_expected: Vec<String> =
+            (0..wide_n - 1).map(|i| format!("Filler{i}")).collect();
+        for value in &wide_expected {
+            wide_argv.push("--allow-unsafe".to_string());
+            wide_argv.push(value.clone());
+        }
+        wide_expected.push("TokenSourceExec".to_string());
+        wide_argv.push("--allow-unsafe".to_string());
+        wide_argv.push("TokenSourceExec".to_string());
+        let wide = parse_frpc_verify(&wide_argv.iter().map(String::as_str).collect::<Vec<&str>>())
+            .unwrap();
+        assert_eq!(
+            wide.allow_unsafe, wide_expected,
+            "the occurrence list is unbounded — any cap of at most {wide_n} occurrences drops the \
+             trailing enabling value"
+        );
+
+        let frps_verify = parse_frps_verify(&[
+            "verify",
+            "-c",
+            "p7520.toml",
+            "--allow-unsafe",
+            "TokenSourceExec",
+            "--allow-unsafe",
+            "WrongFeature",
+        ])
+        .unwrap();
+        assert_eq!(
+            frps_verify.allow_unsafe,
+            ["TokenSourceExec", "WrongFeature"].map(String::from),
+            "the frps verify surface reads the same value and must append too"
+        );
+
+        // Both run paths read the value as well (the construction gate consumes
+        // it), and Go accepts the repetition there: measured, `frps -c <exec
+        // cfg> --allow-unsafe WrongFeature --allow-unsafe TokenSourceExec`
+        // starts and logs its listener.
+        let run = parse_frpc_run(&[
+            "-c",
+            "p7520.toml",
+            "--allow-unsafe",
+            "WrongFeature",
+            "--allow-unsafe",
+            "TokenSourceExec",
+        ])
+        .unwrap();
+        assert_eq!(
+            run.allow_unsafe,
+            ["WrongFeature", "TokenSourceExec"].map(String::from)
+        );
+        // Three occurrences in the wrong order on the frps run path too: every
+        // value survives, so an accumulation cap cannot hide here either.
+        let frps_run = parse_frps(&[
+            "-c",
+            "p7520.toml",
+            "--allow-unsafe",
+            "TokenSourceExec",
+            "--allow-unsafe",
+            "Ignored",
+            "--allow-unsafe",
+            "WrongFeature",
+        ])
+        .unwrap();
+        assert_eq!(
+            frps_run.allow_unsafe,
+            ["TokenSourceExec", "Ignored", "WrongFeature"].map(String::from),
+            "a wrong-order three-occurrence run path keeps every value as well"
+        );
     }
 
     #[test]

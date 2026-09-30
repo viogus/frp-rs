@@ -263,6 +263,177 @@ fn unresolvable_token_source_exits_3_where_go_exits_1() {
     );
 }
 
+/// The post-load `--allow-unsafe` gate runs on **verify**, because it now runs
+/// on the load path — so `verify` refuses the same
+/// `auth.tokenSource = { type = "exec" }` the daemon refuses at construction.
+///
+/// Measured on Go frp v0.71.0 with the two streams captured separately (a fresh
+/// config and a fresh free port per row, every child bounded and reaped):
+///
+/// | argv | Go | this file's base |
+/// |---|---|---|
+/// | `frps verify -c <exec cfg>` | rc 1, stdout `unsafe feature "TokenSourceExec" is not enabled. To enable it, ensure it is allowed in the configuration or command line flags`, stderr 0 B | rc 0, `syntax is ok` |
+/// | `frps verify … --allow-unsafe TokenSourceExec` | rc 0, `frps: the configuration file <p> syntax is ok` | rc 0 (the gate was never run) |
+/// | `frps verify … --allow-unsafe WrongFeature` | rc 1 (fail-closed) | rc 0 (fail-open) |
+/// | `frps verify … --allow-unsafe WrongFeature --allow-unsafe TokenSourceExec` | rc 0 (pflag `strings` appends) | rc 1 — bpaf refused the second occurrence |
+/// | `frps verify … --allow-unsafe TokenSourceExec --allow-unsafe WrongFeature` | rc 0 (a later unrelated value does not cancel an earlier enabling one) | rc 1 |
+/// | `frps verify … --allow-unsafe Ignored,TokenSourceExec` | rc 0 (each occurrence is comma-split) | rc 0 |
+/// | `frps verify … --allow-unsafe WrongFeature --allow-unsafe Ignored --allow-unsafe TokenSourceExec` | rc 0 (three occurrences append too — the enabling value need not be within the first two) | rc 1 — bpaf refused the second occurrence |
+/// | `frps verify … --allow-unsafe A --allow-unsafe B --allow-unsafe Cc --allow-unsafe TokenSourceExec` | rc 0 (four occurrences append too; Go accepts five as well — pflag's `strings` has no cap) | rc 1 — bpaf refused the second occurrence |
+/// | `frps -c <exec cfg>` (run) | rc 1, the same stdout line | rc 3, `EXIT_AUTH` |
+///
+/// frp-rs's wording stays its own predicate message; what is pinned is the
+/// **lane**: the refusal is one bare line on stdout with stderr empty and rc 1,
+/// the same lane the parse failures take, and the run row stays **3** because
+/// the gate is not moved out of service construction (that would silently move
+/// the documented `EXIT_AUTH`/3 extension onto Go's rc 1).
+///
+/// Teeth: deleting the `check_server_unsafe_features` call from
+/// `load_server_config_checked` makes the first row exit 0 (`left: Some(0)`);
+/// making the allow-list check always true makes the `WrongFeature` row exit 0.
+#[test]
+fn verify_runs_the_post_load_allow_unsafe_gate_like_go() {
+    let dir = TempDir::new();
+    // No real port is needed: every refusing row exits before anything binds,
+    // and the one row that would bind (`--allow-unsafe` on the run path) is not
+    // exercised here.
+    let cfg = dir.write(
+        "execsource.toml",
+        "bindPort = 7500\n[auth]\nmethod = \"token\"\n\
+         [auth.tokenSource]\ntype = \"exec\"\n\
+         [auth.tokenSource.exec]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"printf tok\"]\n",
+    );
+    const GATE_MSG: &str = "auth.tokenSource exec blocked: TokenSourceExec not in UnsafeFeatures \
+                            allowlist. Pass --allow-unsafe TokenSourceExec to enable.";
+
+    let refuse = run_frps(&["verify", "-c", &cfg]);
+    assert_eq!(
+        refuse.status.code(),
+        Some(1),
+        "Go refuses an exec tokenSource on verify with rc 1; the load-path gate must \
+         reproduce that lane; stdout={:?} stderr={:?}",
+        stdout_of(&refuse),
+        stderr_of(&refuse),
+    );
+    assert_eq!(
+        stdout_of(&refuse),
+        format!("{GATE_MSG}\n"),
+        "the refusal must be one bare line on **stdout** (no log prefix, no ANSI), \
+         like Go's `fmt.Println(err)`; stderr={:?}",
+        stderr_of(&refuse),
+    );
+    assert!(
+        stderr_of(&refuse).is_empty(),
+        "Go prints nothing on stderr for a verify refusal; stderr={:?}",
+        stderr_of(&refuse),
+    );
+
+    let accept = run_frps(&["verify", "-c", &cfg, "--allow-unsafe", "TokenSourceExec"]);
+    assert_eq!(
+        accept.status.code(),
+        Some(0),
+        "--allow-unsafe TokenSourceExec must satisfy the gate (measured rc 0 on Go); \
+         stdout={:?} stderr={:?}",
+        stdout_of(&accept),
+        stderr_of(&accept),
+    );
+    assert_eq!(
+        stdout_of(&accept),
+        format!("frps: the configuration file {cfg} syntax is ok\n"),
+        "the accept row keeps Go's success line and empty stderr; stderr={:?}",
+        stderr_of(&accept),
+    );
+    assert!(
+        stderr_of(&accept).is_empty(),
+        "stderr={:?}",
+        stderr_of(&accept)
+    );
+
+    let wrong = run_frps(&["verify", "-c", &cfg, "--allow-unsafe", "WrongFeature"]);
+    assert_eq!(
+        wrong.status.code(),
+        Some(1),
+        "the allow-list is fail-closed: an unrelated feature does not enable \
+         TokenSourceExec (measured rc 1 on Go); stdout={:?} stderr={:?}",
+        stdout_of(&wrong),
+        stderr_of(&wrong),
+    );
+
+    // pflag's `strings` **appends** on repetition and comma-splits every
+    // occurrence, so Go's verify honours all five spellings below (measured
+    // rc 0 on v0.71.0 for each, in both value orders; Go also accepts four and
+    // five occurrences, so there is no bound to pin — the rows are one step each).
+    // The `TokenSourceExec`-first row separates appending from a last-wins
+    // reading; the three-occurrence row kills a parser that caps at two
+    // (`.many().map(|mut v: Vec<String>| { v.truncate(2); v })`) and the
+    // four-occurrence row kills the same mutant one step out (`v.truncate(3)`).
+    // The unbounded class is pinned in `frp-core`'s unit test, which builds 32
+    // occurrences rather than a literal row.
+    for extra in [
+        vec![
+            "--allow-unsafe",
+            "WrongFeature",
+            "--allow-unsafe",
+            "TokenSourceExec",
+        ],
+        vec![
+            "--allow-unsafe",
+            "TokenSourceExec",
+            "--allow-unsafe",
+            "WrongFeature",
+        ],
+        vec!["--allow-unsafe", "Ignored,TokenSourceExec"],
+        vec![
+            "--allow-unsafe",
+            "WrongFeature",
+            "--allow-unsafe",
+            "Ignored",
+            "--allow-unsafe",
+            "TokenSourceExec",
+        ],
+        vec![
+            "--allow-unsafe",
+            "A",
+            "--allow-unsafe",
+            "B",
+            "--allow-unsafe",
+            "Cc",
+            "--allow-unsafe",
+            "TokenSourceExec",
+        ],
+    ] {
+        let mut argv = vec!["verify", "-c", cfg.as_str()];
+        argv.extend(extra.iter().copied());
+        let repeated = run_frps(&argv);
+        assert_eq!(
+            repeated.status.code(),
+            Some(0),
+            "Go accepts `--allow-unsafe {extra:?}` on verify (measured rc 0): a repeated \
+             pflag `strings` appends and each occurrence is comma-split; stdout={:?} stderr={:?}",
+            stdout_of(&repeated),
+            stderr_of(&repeated),
+        );
+        assert_eq!(
+            stdout_of(&repeated),
+            format!("frps: the configuration file {cfg} syntax is ok\n"),
+            "the accepted repeat keeps Go's success line and empty stderr; stderr={:?}",
+            stderr_of(&repeated),
+        );
+    }
+
+    // The run path is untouched: the same config is still refused by
+    // construction with the typed EXIT_AUTH/3, not by the loader.
+    let run = run_frps(&["-c", &cfg]);
+    assert_eq!(
+        run.status.code(),
+        Some(3),
+        "the run path must keep the EXIT_AUTH/3 construction refusal; the load-path \
+         gate exists for verify only; stdout={:?} stderr={:?}",
+        stdout_of(&run),
+        stderr_of(&run),
+    );
+}
+
 /// The hardening divergence `:3313` names: `[auth] method = "token"` with an
 /// empty `token` is refused at construction with **3**, whereas Go frps has no
 /// such check and **starts and keeps running** (`frps started successfully`,
