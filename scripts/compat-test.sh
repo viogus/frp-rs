@@ -28,7 +28,13 @@ GO_FRPC="$GO_FRP_DIR/frpc"
 RUST_FRPS="$PROJECT_DIR/target/release/frps"
 RUST_FRPC="$PROJECT_DIR/target/release/frpc"
 CERT_DIR="$PROJECT_DIR/frp-core/tests/certs"
-TEST_DIR="/tmp/frp-compat-test"
+# Per-run scratch directory. Overridable with FRP_COMPAT_TEST_DIR so that two
+# runs — a sibling worktree's, or a local run beside a CI job — do not share it:
+# the stray guard scopes itself to `$TEST_DIR/` and would otherwise count and
+# reap the other run's servers (see scripts/lib/compat-stray-guard.sh). An empty
+# or `/` override is refused outright there. The default is kept so existing
+# `--keep-tmp` debugging recipes still find the logs.
+TEST_DIR="${FRP_COMPAT_TEST_DIR:-/tmp/frp-compat-test}"
 
 # --- State ---
 PASS=0
@@ -82,6 +88,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --xtcp-only       Run only XTCP tests (skip all other phases)"
             echo "  --shard INDEX/TOTAL  Shard XTCP tests across N jobs (e.g. 0/4)"
             echo "  --go-version VER  Go frp version (default: 0.71.0)"
+            echo ""
+            echo "Env: FRP_COMPAT_TEST_DIR  Scratch dir (default: /tmp/frp-compat-test)."
+            echo "     Set it per run so concurrent compat runs never share a scratch dir."
             exit 0
             ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
@@ -169,90 +178,13 @@ cleanup() {
     exit "$rc"
 }
 
-# Kill all tracked PIDs without removing test dir.
-# Resets PIDS so subsequent tests start fresh.
-cleanup_pids() {
-    for pid in $PIDS; do
-        kill "$pid" 2>/dev/null || true
-    done
-    # Bounded grace period after SIGTERM (graceful drain), then force-kill.
-    # Without this, a process whose SIGTERM handler stalls makes the bare
-    # `wait` hang the whole compat run (observed on CI: 25m job timeout with
-    # 60+ orphaned frps/frpc processes after the socks5 scenario).
-    local deadline=$((SECONDS + 10))
-    while (( SECONDS < deadline )); do
-        local alive=""
-        for pid in $PIDS; do
-            kill -0 "$pid" 2>/dev/null && alive="$alive $pid"
-        done
-        [[ -z "$alive" ]] && break
-        sleep 0.2
-    done
-    for pid in $PIDS; do
-        kill -9 "$pid" 2>/dev/null || true
-    done
-    wait 2>/dev/null || true
-    PIDS=""
-}
+# Tracked-pid reaping and the stray guard live in a unit of their own so that
+# the fixture test `scripts/tests/compat-stray-guard.sh` can drive them against
+# synthetic servers; `cleanup()` above calls both. The contract, the measured
+# pre-guard leak, and the hard-failure rules are documented there.
+# shellcheck source=scripts/lib/compat-stray-guard.sh
+source "$SCRIPT_DIR/lib/compat-stray-guard.sh"
 
-# =============================================================================
-# Stray-process guard
-# =============================================================================
-#
-# Every server this run starts holds a config under `$TEST_DIR`, and none may
-# outlive the run: a survivor keeps its listeners bound and races the next run
-# for the same ports. `cleanup_pids` reaps the pids `track_pid` recorded; this
-# guard is the regression test for that contract — it counts the scenario
-# servers still alive after cleanup and fails the run when any remain.
-#
-# Measured before the guard: a green `--ci` run (86 passed, 0 failed, rc 0)
-# left 83 reparented Go servers behind (33 `frps`, 50 `frpc`), every one with
-# `PPID 1` and `-c /tmp/frp-compat-test/<scenario>/...`.
-#
-# The match is a process name *plus* the scenario directory. The repository's
-# stray-process rule forbids name-only kills (a sibling worktree's `frps` is
-# not ours and must survive), and a bare `pgrep -x frps` would count it.
-scenario_strays() {
-    local pid cmd
-    for pid in $( { pgrep -x frps || true; pgrep -x frpc || true; } 2>/dev/null ); do
-        cmd=$(ps -p "$pid" -o command= 2>/dev/null) || continue
-        case "$cmd" in
-            *"$TEST_DIR/"*) printf '%s\n' "$pid" ;;
-        esac
-    done
-    return 0
-}
-
-# Servers already holding a scenario config when this run started (a sibling
-# agent's compat run). They are not ours to reap and must not fail the guard.
-STRAY_BASELINE=" $(scenario_strays | tr '\n' ' ') "
-
-# Name, reap and fail on the servers this run left behind. Only processes `ps`
-# still shows are counted, so one that exited between the scan and the check is
-# not reported; reaping is by the exact pids printed — never by name — so a
-# concurrent run's servers are untouched. Returns non-zero so the run's exit
-# status reports the regression.
-assert_no_strays() {
-    local pid line report="" survivors=""
-    for pid in $(scenario_strays); do
-        case "$STRAY_BASELINE" in
-            *" $pid "*) continue ;;
-        esac
-        line=$(ps -p "$pid" -o pid=,ppid=,command= 2>/dev/null) || continue
-        if [[ -z "$line" ]]; then
-            continue
-        fi
-        survivors="$survivors $pid"
-        report="${report}  ${line}
-"
-    done
-    if [[ -z "$survivors" ]]; then
-        return 0
-    fi
-    printf 'ERROR: compat run left stray server process(es) behind:\n%s' "$report" >&2
-    kill -9 $survivors 2>/dev/null || true
-    return 1
-}
 trap cleanup EXIT
 
 random_port() {

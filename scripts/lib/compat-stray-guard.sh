@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Stray-process guard for the cross-compat harness
+# =============================================================================
+#
+# Sourced by `scripts/compat-test.sh`, and — on its own — by the fixture test
+# `scripts/tests/compat-stray-guard.sh`, which drives these functions against
+# synthetic `frps` processes. It needs only `TEST_DIR` (the run's scratch
+# directory) and `PIDS` (the pids `track_pid` recorded); the caller owns
+# `cleanup()` and the `EXIT` trap.
+#
+# Why this file exists as a unit: the guard is the only thing that catches a
+# leaked server, and "it passed" is indistinguishable from "it did not run" — so
+# it has to be exercisable without starting a 3-minute compat run.
+#
+# The contract
+# ------------
+# Every server a compat run starts holds a config under `$TEST_DIR`, and none
+# may outlive the run: a survivor keeps its listeners bound and races the next
+# run for the same ports. `cleanup_pids` reaps the pids `track_pid` recorded;
+# `assert_no_strays` is the regression test for that contract — it names, reaps
+# and fails on the scenario servers still alive after cleanup.
+#
+# The match is a process name *plus* the scratch directory. The repository's
+# stray-process rule forbids name-only kills (a sibling worktree's `frps` is not
+# ours and must survive), so `pgrep -x frps` alone is never enough, and reaping
+# is by the exact pids printed — never by name.
+#
+# Measured before the guard (2026-09, `scripts/compat-test.sh --ci`): a green
+# run (86 passed, 0 failed, rc 0) left 83 reparented Go servers behind
+# (33 `frps`, 50 `frpc`), every one with `PPID 1` and
+# `-c /tmp/frp-compat-test/<scenario>/...`.
+#
+# Hard failure, never a vacuous pass
+# ----------------------------------
+# The census tools are load-bearing: if `pgrep` is missing or errors, the guard
+# would report "no strays" and pass — the exact failure it exists to catch. A
+# missing tool, a failing probe, or a degenerate `TEST_DIR` is therefore a hard
+# error that refuses to run, not an empty census.
+#
+# `TEST_DIR=""` also has to be refused: the ownership pattern `*"$TEST_DIR/"*`
+# degrades to `*/*` and would flag and kill an unrelated process whose command
+# line merely contains a slash.
+
+: "${TEST_DIR:?scripts/lib/compat-stray-guard.sh requires TEST_DIR to be set}"
+PIDS="${PIDS:-}"
+
+case "$TEST_DIR" in
+    ""|/)
+        printf 'ERROR: refusing to guard with TEST_DIR=%q: the ownership match would degrade to "anything under a slash"\n' "$TEST_DIR" >&2
+        exit 1
+        ;;
+esac
+
+# Kill all tracked PIDs without removing test dir.
+# Resets PIDS so subsequent tests start fresh.
+cleanup_pids() {
+    for pid in $PIDS; do
+        kill "$pid" 2>/dev/null || true
+    done
+    # Bounded grace period after SIGTERM (graceful drain), then force-kill.
+    # Without this, a process whose SIGTERM handler stalls makes the `wait`
+    # below hang the whole compat run (observed on CI: 25m job timeout with
+    # 60+ orphaned frps/frpc processes after the socks5 scenario).
+    local deadline=$((SECONDS + 10))
+    while (( SECONDS < deadline )); do
+        local alive=""
+        for pid in $PIDS; do
+            kill -0 "$pid" 2>/dev/null && alive="$alive $pid"
+        done
+        [[ -z "$alive" ]] && break
+        sleep 0.2
+    done
+    for pid in $PIDS; do
+        kill -9 "$pid" 2>/dev/null || true
+    done
+    # Reap the tracked pids only. A bare `wait` also collects every other live
+    # child, so an untracked long-lived child — a helper this script did not
+    # start or record — hangs the run here, before the stray guard ever runs.
+    for pid in $PIDS; do
+        wait "$pid" 2>/dev/null || true
+    done
+    PIDS=""
+}
+
+# Print the pids of this run's scenario servers still alive, one per line.
+# Returns 2, after printing why, when the census cannot be taken; never a
+# silent empty census. `pgrep` exits 1 when nothing matched — a legitimate
+# empty result — and >= 2 on a real failure.
+scenario_strays() {
+    if ! command -v pgrep >/dev/null 2>&1; then
+        printf 'ERROR: the stray guard requires `pgrep`, which is not on PATH; refusing to report an empty census\n' >&2
+        return 2
+    fi
+    if ! command -v ps >/dev/null 2>&1; then
+        printf 'ERROR: the stray guard requires `ps`, which is not on PATH; refusing to report an empty census\n' >&2
+        return 2
+    fi
+    local name pid cmd found pids=""
+    for name in frps frpc; do
+        if found="$(pgrep -x "$name" 2>/dev/null)"; then
+            :
+        else
+            local rc=$?
+            if (( rc != 1 )); then
+                printf 'ERROR: `pgrep -x %s` failed (status %d); refusing to report an empty census\n' "$name" "$rc" >&2
+                return 2
+            fi
+            found=""
+        fi
+        pids="$pids $found"
+    done
+    # Ownership is "the command line contains `$TEST_DIR/`". A scenario server
+    # started through a subshell that `cd`s into the scenario dir first — e.g.
+    # `( cd "$dir" && exec "$bin" -c frps.toml )` — would carry a relative `-c`
+    # and evade the predicate. That shape does not exist in the harness today:
+    # all 90 `run_go` call sites pass an absolute `-c "$TEST_DIR/<name>/..."`.
+    # If one is ever added, extend this match rather than adding a name-only
+    # fallback.
+    for pid in $pids; do
+        cmd=$(ps -p "$pid" -o command= 2>/dev/null) || continue
+        case "$cmd" in
+            *"$TEST_DIR/"*) printf '%s\n' "$pid" ;;
+        esac
+    done
+    return 0
+}
+
+# Servers already holding a scenario config when this run started (a sibling
+# agent's compat run). They are not ours to reap and must not fail the guard.
+#
+# **By design, the question is "did *this* run add a stray", not "is any scenario
+# server alive"**: a server that predates the run — an earlier crashed run, or a
+# sibling's — is forgiven by the baseline. The counterpart: a *different* compat
+# run started **after** this baseline still lands in the census and is killed as
+# a stray, so two runs must not share a scratch dir — hence
+# `TEST_DIR="${FRP_COMPAT_TEST_DIR:-/tmp/frp-compat-test}"` in
+# `scripts/compat-test.sh`, which the harness documents in `--help`.
+if ! _stray_baseline="$(scenario_strays)"; then
+    printf 'ERROR: cannot take the stray baseline (see above); refusing to run with a census that cannot be trusted\n' >&2
+    exit 1
+fi
+STRAY_BASELINE=" $(printf '%s\n' "$_stray_baseline" | tr '\n' ' ') "
+unset _stray_baseline
+
+# Name, reap and fail on the servers this run left behind. Only processes `ps`
+# still shows are counted, so one that exited between the scan and the check is
+# not reported; reaping is by the exact pids printed. Returns 1 so the run's
+# exit status reports the regression, and 2 when the census itself failed.
+assert_no_strays() {
+    local pid line report="" survivors="" strays
+    if ! strays="$(scenario_strays)"; then
+        return 2
+    fi
+    for pid in $strays; do
+        case "$STRAY_BASELINE" in
+            *" $pid "*) continue ;;
+        esac
+        line=$(ps -p "$pid" -o pid=,ppid=,command= 2>/dev/null) || continue
+        if [[ -z "$line" ]]; then
+            continue
+        fi
+        survivors="$survivors $pid"
+        report="${report}  ${line}
+"
+    done
+    if [[ -z "$survivors" ]]; then
+        return 0
+    fi
+    printf 'ERROR: compat run left stray server process(es) behind:\n%s' "$report" >&2
+    kill -9 $survivors 2>/dev/null || true
+    return 1
+}
