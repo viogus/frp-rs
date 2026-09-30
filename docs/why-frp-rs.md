@@ -51,11 +51,13 @@ has the figures. More importantly, Rust has no garbage collector: the heap canno
 grow to roughly 2× live the way Go's can, and there is no stop-the-world component in
 the tail.
 
-**This is the claim that most needs more evidence.** Every committed baseline
-measures frp-rs against itself; there is no long-uptime head-to-head yet. The
-harness now takes `FRPS_BIN`/`FRPC_BIN`, so that measurement is one environment
-variable away — it is an open item in [`TODO.md`](../TODO.md), and until it is done,
-treat "stable RSS over weeks" as a hypothesis rather than a result.
+**This is the claim that most needs more evidence.** A committed head-to-head
+series now exists — 3 hours at 45-second intervals, with an identical proxy set and
+traffic for both binaries
+([`scripts/frp-stress/baselines/rss-soak-Mac.jsonl`](../scripts/frp-stress/baselines/rss-soak-Mac.jsonl))
+— and it supports the claim at that horizon. Weeks-scale evidence is still missing, so
+treat "stable RSS over weeks" as a hypothesis rather than a result; what remains is an
+open item in [`TODO.md`](../TODO.md).
 
 #### 4. Operational knobs Go frp does not have
 
@@ -141,7 +143,7 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 空闲 RSS 约为 Go frp 默认档位的三分之一——具体数字见同一张自动生成的表。更重要的是 Rust 没有垃圾回收器：堆不会像 Go 那样涨到约 2× live，尾部延迟里也没有 stop-the-world 分量。
 
-**这一条最需要更多证据。** 现有基线全是 frp-rs 对自己的测量，尚无长时对拍。基线脚本现已支持 `FRPS_BIN`/`FRPC_BIN`，那个测量只差一条环境变量——它是 [`TODO.md`](../TODO.md) 里的未决项。在完成之前，"连续数周 RSS 稳定"应视为假设而非结论。
+**这一条最需要更多证据。** 现在已有一组提交入库的对拍序列——3 小时、45 秒间隔，两侧使用完全相同的代理集与流量（[`scripts/frp-stress/baselines/rss-soak-Mac.jsonl`](../scripts/frp-stress/baselines/rss-soak-Mac.jsonl)）——它在这个时间尺度上支持该结论。数周尺度的证据仍然缺失，因此"连续数周 RSS 稳定"仍应视为假设而非结论；剩余工作记录在 [`TODO.md`](../TODO.md)。
 
 #### 4. Go frp 没有的运维旋钮
 

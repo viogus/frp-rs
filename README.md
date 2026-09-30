@@ -265,8 +265,9 @@ The full argument, including what frp-rs is *not*, is in
 2. **It runs where a 17 MB binary does not fit.** The `tiny` and `micro` tiers are a
    *new deployment* rather than a replacement: OpenWrt, IoT, size-capped images.
 3. **No GC.** A stable heap instead of one that grows to roughly 2× live, and no
-   stop-the-world tail. *(Long-uptime head-to-head RSS is still open in
-   [TODO.md](TODO.md) — until then, treat "stable over weeks" as a hypothesis.)*
+   stop-the-world tail. *(A 3-hour head-to-head RSS series against Go frp is published in
+   [scripts/frp-stress/baselines/rss-soak-Mac.jsonl](scripts/frp-stress/baselines/rss-soak-Mac.jsonl);
+   "stable over weeks" remains a hypothesis, see [TODO.md](TODO.md).)*
 4. **Operational knobs Go frp lacks:** UDP bandwidth limiting, SSH gateway per-IP
    login throttling plus `ssh_session_idle_timeout`, and
    `frpc verify --strict-config`.
