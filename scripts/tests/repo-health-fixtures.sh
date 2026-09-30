@@ -24,13 +24,39 @@
 # temporary tree is removed on exit.
 #
 # Usage: bash scripts/tests/repo-health-fixtures.sh
+#        (also correct when the harness itself is invoked through a symlink)
 set -uo pipefail
 
 self=${BASH_SOURCE[0]:-$0}
 case "$self" in
   */*) ;;
-  *) self=$PWD/$self ;;
+  *) if [ -e "$self" ]; then
+       self=$PWD/$self
+     else
+       self=$(command -v -- "$self") || {
+         printf 'FAIL  cannot locate the harness: %s\n' "$0"; exit 1; }
+     fi ;;
 esac
+# Follow symlinks to the real file before deriving the repo root. Without this,
+# invoking the harness through a symlink (a `ln -s … /tmp/rhfx.sh`, or a wrapper
+# in another directory) resolved `../..` against the *link's* directory and looked
+# for `//scripts/repo-health.sh`. `readlink -f` is not POSIX and older macOS/BSD
+# releases lack it, so loop on plain `readlink`, resolving each target against the
+# link's own directory. Bounded so a symlink cycle cannot hang the run.
+n=0
+while [ -L "$self" ]; do
+  dir=$(cd -P -- "$(dirname -- "$self")" && pwd) || exit 1
+  link=$(readlink -- "$self") || exit 1
+  case "$link" in
+    /*) self=$link ;;
+    *)  self=$dir/$link ;;
+  esac
+  n=$((n + 1))
+  if [ "$n" -gt 40 ]; then
+    printf 'FAIL  cannot resolve the harness path (symlink cycle?): %s\n' "$0"
+    exit 1
+  fi
+done
 cd -P -- "$(dirname -- "$self")/../.." || exit 1
 RH=$PWD/scripts/repo-health.sh
 if [ ! -f "$RH" ]; then
