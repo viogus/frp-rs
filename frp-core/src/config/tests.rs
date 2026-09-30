@@ -12184,3 +12184,160 @@ fn legacy_ini_default_section_string_include_is_still_expanded() {
             .unwrap_or_else(|e| panic!("scalar includes, strict={strict}: {e}"));
     }
 }
+
+/// **A DefaultSection `start` never filters; `[common] start` does.**
+///
+/// Go fills the legacy common config from `[common]` alone
+/// (`UnmarshalClientConfFromIni`: `GetSection("common")` + `MapTo`,
+/// `pkg/config/legacy/client.go:173-200`) and `start` is one of those keys
+/// (`Start []string \`ini:"start"\``, `pkg/config/legacy/client.go:119`). The
+/// hoist's `entry(k).or_insert(v)` (`frp-core/src/config/normalize.rs:1162-1166`)
+/// would let a DefaultSection `start` win and mask Go's refusals (round-5
+/// adversarial RF5-1), so the `[common]` value is captured before the hoist
+/// (`legacy_common_start`, `frp-core/src/config/normalize.rs:2491`) and written
+/// back after it (`legacy_start_override`,
+/// `frp-core/src/config/normalize.rs:2510`). Measured on Go v0.71.0, both loader
+/// modes: the four shapes below are rc 1 with the message asserted, a
+/// DefaultSection-only `start` is rc 0 with both proxies (Go's list is empty,
+/// i.e. `startAll`), `[common] start` beats a DefaultSection `start`, and
+/// `[common] start = p2` still skips a bad `[p1]`.
+#[test]
+fn legacy_ini_start_comes_from_the_common_section_only() {
+    let head = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
+    let valid_p2 = "[p2]\nlocal_port = 8081\nremote_port = 18081\n";
+    let bad_p1 = "[p1]\nrole = \"weird\"\nlocal_port = 8080\nremote_port = 18080\n";
+    for (label, body, expected) in [
+        (
+            "a DefaultSection start cannot mask a bad role",
+            format!("start = p2\n{head}{bad_p1}{valid_p2}"),
+            "proxy p1 role should be 'server' or 'visitor'",
+        ),
+        (
+            "a DefaultSection start cannot mask an invalid proxy type",
+            format!(
+                "start = p2\n{head}[p1]\ntype = \"custom\"\nlocal_port = 8080\nremote_port = 18080\n{valid_p2}"
+            ),
+            "invalid proxy_type 'custom'",
+        ),
+        (
+            "a DefaultSection start cannot mask a typeless visitor",
+            format!("start = p2\n{head}[p1]\nrole = \"visitor\"\nserver_name = s\n{valid_p2}"),
+            "failed to parse visitor p1, err: type shouldn't be empty",
+        ),
+        (
+            "a DefaultSection start cannot mask [common] start",
+            format!(
+                "start = p1\n{head}start = p2\n[p1]\nlocal_port = 8080\nremote_port = 18080\n[p2]\nrole = \"weird\"\nlocal_port = 8081\nremote_port = 18081\n"
+            ),
+            "proxy p2 role should be 'server' or 'visitor'",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let err = format!(
+                "{}",
+                load_client_config(path.to_str().unwrap(), strict).expect_err(
+                    "a DefaultSection start must not change Go's legacy dispatch"
+                )
+            );
+            assert!(err.contains(expected), "{label}, strict={strict}: {err}");
+        }
+    }
+
+    // A DefaultSection-only `start` is ignored, so Go's list is empty
+    // (`startAll`) and both proxies load.
+    let all = format!("start = p2\n{head}[p1]\nlocal_port = 8080\nremote_port = 18080\n{valid_p2}");
+    // `[common] start = p2` wins over a DefaultSection `start = p1`.
+    let common_wins = format!(
+        "start = p1\n{head}start = p2\n[p1]\nlocal_port = 8080\nremote_port = 18080\n{valid_p2}"
+    );
+    // Control: `[common] start = p2` skips the bad `[p1]`.
+    let control = format!("{head}start = p2\n{bad_p1}{valid_p2}");
+    for (label, body, expected_len) in [
+        ("DefaultSection start is ignored", all, 2usize),
+        ("[common] start wins", common_wins, 1usize),
+        ("[common] start skips p1", control, 1usize),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let cfg = load_client_config(path.to_str().unwrap(), strict)
+                .unwrap_or_else(|e| panic!("{label}, strict={strict}: {e}"));
+            assert_eq!(cfg.proxies.len(), expected_len, "{label}, strict={strict}");
+            if !label.starts_with("DefaultSection") {
+                assert_eq!(cfg.proxies[0].name, "p2", "{label}, strict={strict}");
+            }
+        }
+    }
+}
+
+/// **The section-wins collision rule is legacy-`.ini` only.**
+///
+/// Go's detector is the `[common]` section (`DetectLegacyINIFormat`,
+/// `pkg/config/load.go:65`), so a `.ini` without it is decoded by the v1
+/// decoder, where a DefaultSection scalar colliding with a same-named section is
+/// a type error — measured on Go v0.71.0, both loader modes: `webServer = 1` +
+/// `[webServer]` is rc 1 (`json: cannot unmarshal string into Go value of type
+/// v1.rawClientConfig`), and `log`, two collisions, and the server twins
+/// `webServer` / `log` / `transport` likewise. The replacement at
+/// `frp-core/src/config/format.rs:389` is therefore gated on `legacy_ini`
+/// (`frp-core/src/config/format.rs:223`); the legacy `[common]` case keeps the
+/// section (`legacy_ini_scalar_and_section_collision_keeps_the_section_like_go`,
+/// `frp-core/src/config/tests.rs:11824`).
+#[test]
+fn v1_ini_scalar_section_collision_is_still_a_type_error() {
+    for (body, expected) in [
+        (
+            "webServer = 1\n[webServer]\ntls_cert_file = \"x\"\n",
+            "expected struct WebServerConfig",
+        ),
+        ("log = 1\n[log]\nto = \"x\"\n", "expected struct LogConfig"),
+        (
+            "includes = 1\n[includes]\nlocal_port = 8080\nremote_port = 18080\n",
+            "expected a sequence",
+        ),
+        (
+            "log = 1\n[log]\nto = \"x\"\nwebServer = 1\n[webServer]\ntls_cert_file = \"x\"\n",
+            "expected struct LogConfig",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let err = format!(
+                "{}",
+                load_client_config(path.to_str().unwrap(), strict)
+                    .expect_err("a `[common]`-less .ini uses Go's v1 decoder")
+            );
+            assert!(err.contains(expected), "{body:?}, strict={strict}: {err}");
+        }
+    }
+
+    for (body, expected) in [
+        (
+            "webServer = 1\n[webServer]\ntls_cert_file = \"x\"\n",
+            "expected struct WebServerConfig",
+        ),
+        ("log = 1\n[log]\nto = \"x\"\n", "expected struct LogConfig"),
+        (
+            "transport = 1\n[transport]\ntcp_mux = true\n",
+            "expected struct ServerTransportConfig",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frps.ini");
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let err = format!(
+                "{}",
+                load_server_config(path.to_str().unwrap(), strict)
+                    .expect_err("a `[common]`-less .ini uses Go's v1 decoder")
+            );
+            assert!(err.contains(expected), "{body:?}, strict={strict}: {err}");
+        }
+    }
+}

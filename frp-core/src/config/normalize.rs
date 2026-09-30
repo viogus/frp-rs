@@ -1153,18 +1153,18 @@ pub(super) fn normalize_client_config(
     use toml::Value;
     if let Some(table) = value.as_table_mut() {
         // Go detects the legacy `.ini` dialect by the `[common]` section
-        // (`DetectLegacyINIFormat`, pkg/config/load.go:65); the hoist below
-        // would hide it, and the collector's role refusal and `start` filter are
-        // gated on it (a `[common]`-less `.ini` is Go's v1 path).
+        // (`DetectLegacyINIFormat`, pkg/config/load.go:65); the hoist below hides
+        // it and reads the common config — including `start` — from `[common]`
+        // alone (`GetSection("common")` + `MapTo`, legacy/client.go:173-200).
         let legacy_ini =
             format == ConfigFormat::Ini && matches!(table.get("common"), Some(Value::Table(_)));
-        // Handle [common] section
+        let common_start = legacy_common_start(table, legacy_ini);
         if let Some(Value::Table(common_table)) = table.remove("common") {
             for (k, v) in common_table {
                 table.entry(k).or_insert(v);
             }
         }
-
+        legacy_start_override(table, legacy_ini, common_start);
         // Go legacy INI proxy/visitor sections ([web], [ssh], [range:xxx],
         // [plugin:xxx]): every non-known top-level section is a proxy (or a
         // visitor when role=visitor) and a missing `type` is Go's `tcp`; the
@@ -2475,6 +2475,45 @@ fn ini_start_names(table: &toml::Table) -> Option<std::collections::HashSet<Stri
         None
     } else {
         Some(names.into_iter().collect())
+    }
+}
+
+/// Capture Go's legacy `start` list from the `[common]` table, before the hoist
+/// removes it.
+///
+/// Go fills the legacy common config — including `Start []string \`ini:"start"\``
+/// (`pkg/config/legacy/client.go:119`) — from the `[common]` section alone
+/// (`UnmarshalClientConfFromIni`: `GetSection("common")` + `MapTo`,
+/// `pkg/config/legacy/client.go:173-200`), so a `start = …` key in the
+/// DefaultSection is ignored there. The hoist's `or_insert` would instead let
+/// such a key win, and `ini_section_started` reads the root, so the `[common]`
+/// value is captured here and written back by [`legacy_start_override`].
+fn legacy_common_start(table: &toml::Table, legacy_ini: bool) -> Option<toml::Value> {
+    if !legacy_ini {
+        return None;
+    }
+    table
+        .get("common")
+        .and_then(toml::Value::as_table)
+        .and_then(|common| common.get("start"))
+        .cloned()
+}
+
+/// Write the captured `[common] start` back over the hoisted root, so the start
+/// filter and the runtime `[common]`-only reading agree with Go.
+///
+/// A DefaultSection `start` is dropped when `[common]` has none: Go's list is
+/// then empty, i.e. `startAll`. Measured on Go v0.71.0: a DefaultSection
+/// `start = p2` before `[common]` still refuses `[p1] role = "weird"` (rc 1,
+/// `proxy p1 role should be 'server' or 'visitor'`), while `[common] start = p1`
+/// plus a DefaultSection `start = p2` dispatches `p2`.
+fn legacy_start_override(table: &mut toml::Table, legacy_ini: bool, start: Option<toml::Value>) {
+    if !legacy_ini {
+        return;
+    }
+    table.remove("start");
+    if let Some(start) = start {
+        table.insert("start".to_string(), start);
     }
 }
 

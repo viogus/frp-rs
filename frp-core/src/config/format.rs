@@ -217,8 +217,12 @@ fn ini_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>>
         }
     }
 
+    // Go's legacy detector is a whole-file `GetSection("common")`
+    // (`DetectLegacyINIFormat`, pkg/config/load.go:65), so the dialect is known
+    // before any section is inserted, whatever the order of the headers.
+    let legacy_ini = sections.iter().any(|(name, _)| name == "common");
     for (name, table) in sections {
-        insert_ini_section(&mut root, &name, table)?;
+        insert_ini_section(&mut root, &name, table, legacy_ini)?;
     }
 
     Ok(toml::Value::Table(root))
@@ -357,31 +361,32 @@ fn ini_section_path(section: &str, table: &toml::Table) -> Option<Vec<String>> {
 ///
 /// A **verbatim** name that collides with an already-present *non-table* value
 /// (a root scalar, e.g. `includes = 1` next to an `[includes]` section) keeps
-/// the section: the slot is replaced by a fresh table and the section's keys are
-/// inserted. Go keeps the two namespaces apart — a `[name]` section and a
-/// DefaultSection key `name = …` are independent in `gopkg.in/ini.v1`, and the
-/// legacy reader ignores every DefaultSection key (`LoadAllProxyConfsFromIni`
-/// skips `ini.DefaultSection`, `pkg/config/legacy/client.go:255-257`); the
-/// settings come from `[common]`. The long-standing `or_insert` behaviour (keep
-/// the scalar, drop the section's keys) hid a real `[includes]` section from the
-/// collector: measured on Go v0.71.0, `includes = 1` plus an `[includes]`
-/// section holding `type = "custom"` and the two ports is rc 1 in both modes
-/// (`failed to parse proxy includes, err: invalid type [custom]`), while the
-/// same scalar next to an `[includes]` section with only the two ports is rc 0
-/// with one tcp proxy *named* `includes`.
+/// the **section** — but only in the legacy dialect, i.e. a `.ini` that has a
+/// `[common]` section. Go keeps the two namespaces apart there — a `[name]`
+/// section and a DefaultSection key `name = …` are independent in
+/// `gopkg.in/ini.v1`, and the legacy reader ignores every DefaultSection key
+/// (`LoadAllProxyConfsFromIni` skips `ini.DefaultSection`,
+/// `pkg/config/legacy/client.go:255-257`) — so the section's keys (which the
+/// collector reads) must survive the collision. On the **v1** path a
+/// `[common]`-less `.ini` is decoded into one Go struct, so the same collision
+/// is a type error Go reports (`json: cannot unmarshal string into Go value of
+/// type v1.rawClientConfig`) and the scalar has to be kept: measured rc 1 in
+/// both loader modes on Go v0.71.0, the parent and this tree, where
+/// `webServer = 1` precedes `[webServer] tls_cert_file = "x"`.
 fn insert_ini_section(
     root: &mut toml::Table,
     section: &str,
     table: toml::Table,
+    legacy_ini: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(path) = ini_section_path(section, &table) else {
         let slot = root
             .entry(section.to_string())
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        // The section wins a collision with a non-table value (see the doc
-        // comment above): Go reads its `[name]` sections and ignores the
-        // DefaultSection keys, so the section must survive.
-        if slot.as_table().is_none() {
+        // Only the legacy dialect lets the section win (see the doc comment
+        // above): on the v1 path the colliding scalar is what Go decodes, so it
+        // survives and fails the v1 type check.
+        if legacy_ini && slot.as_table().is_none() {
             *slot = toml::Value::Table(toml::Table::new());
         }
         if let Some(dst) = slot.as_table_mut() {
