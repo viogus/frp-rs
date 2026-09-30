@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use super::client::ClientConfig;
-use super::format::{detect_format, parse_to_toml_value};
+use super::format::{detect_format, parse_to_toml_value, ConfigFormat};
 use super::loader::{validate_client_config, validate_server_config, ConfigPresence};
 use super::normalize::{load_config_from_file, normalize_client_config, normalize_server_config};
 use super::server::ServerConfig;
@@ -80,7 +80,7 @@ pub fn load_server_config_uncompleted_with_presence(
         path,
         strict_config,
         known_server_keys,
-        normalize_server_config,
+        normalize_server_config_with_legacy_include_cleanup,
         validate_server_config,
     )?;
     cfg.transport
@@ -125,7 +125,7 @@ pub fn load_client_config_with_presence(
         path,
         strict_config,
         known_client_keys,
-        normalize_client_config,
+        normalize_client_config_with_legacy_include_cleanup,
         validate_client_config,
     )?;
     cfg.complete_with_heartbeat_set(
@@ -255,8 +255,30 @@ pub(super) fn process_includes(
         None => return Ok(()),
     };
 
-    // Extract includes list (support both "includes" and "include" keys)
-    let patterns: Vec<String> = match table.remove("includes").or_else(|| table.remove("include")) {
+    // Extract includes list (support both "includes" and "include" keys). Only
+    // the v1 shapes — a string or an array — are a file list; any other value is
+    // left where it is. In the legacy `.ini` dialect a *table* is an ordinary
+    // section, not a directive: Go reads its include list from the `[common]`
+    // section (`IncludeConfigFiles []string \`ini:"includes"\``,
+    // `pkg/config/legacy/client.go:166`) and treats every other section as a
+    // legacy proxy or visitor named after its header. Removing a table here made
+    // real user config vanish: `[includes] local_port = 8080 remote_port = 18080`
+    // silently dropped the tcp proxy named `includes` that Go v0.71.0 registers
+    // (rc 0 in both modes), and `[includes] role = "visitor" server_name = s` hid
+    // the section from the typeless-visitor refusal (Go rc 1 in both modes,
+    // `failed to parse visitor includes, err: type shouldn't be empty`). A
+    // table-shaped `includes` in TOML/JSON/YAML now reaches the decoder as well,
+    // which is what Go's own `cannot unmarshal object into []string` does.
+    let is_file_list =
+        |v: Option<&Value>| matches!(v, Some(Value::String(_)) | Some(Value::Array(_)));
+    let includes = if is_file_list(table.get("includes")) {
+        table.remove("includes")
+    } else if is_file_list(table.get("include")) {
+        table.remove("include")
+    } else {
+        None
+    };
+    let patterns: Vec<String> = match includes {
         Some(Value::Array(arr)) => arr
             .into_iter()
             .filter_map(|v| match v {
@@ -320,6 +342,62 @@ pub(super) fn process_includes(
     }
 
     Ok(())
+}
+
+/// The `normalize` step for the server load: [`normalize_server_config`], then the
+/// legacy-`.ini` include cleanup.
+///
+/// [`process_includes`] leaves a table-shaped `includes`/`include` where it is so
+/// that the legacy guard and collector can see it, but the server has no
+/// collector: Go's legacy server reader reads only `[common]` and ignores every
+/// other section, so such a table is nothing either reader turns into a setting
+/// and it must not reach `ServerConfig::includes`
+/// (`frp-core/src/config/server.rs:163`). `.ini` only; in TOML/JSON/YAML a table
+/// there is a type error in Go too.
+fn normalize_server_config_with_legacy_include_cleanup(
+    value: &mut toml::Value,
+    format: ConfigFormat,
+) -> Result<(), String> {
+    normalize_server_config(value, format)?;
+    drop_legacy_ini_include_tables(value, format);
+    Ok(())
+}
+
+/// The client half of [`normalize_server_config_with_legacy_include_cleanup`].
+///
+/// The client's collector (`collect_legacy_ini_proxy_sections`) has already turned
+/// the sections Go turns into proxies or visitors into `proxies`/`visitors`
+/// entries and removed them; this drops what it did **not** consume — a
+/// `[includes] foo = 1` section, which Go v0.71.0 loads and ignores (rc 0 in both
+/// loader modes) but which would otherwise fail the `includes: Vec<String>` decode
+/// at `frp-core/src/config/client.rs:256`.
+fn normalize_client_config_with_legacy_include_cleanup(
+    value: &mut toml::Value,
+    format: ConfigFormat,
+) -> Result<(), String> {
+    normalize_client_config(value, format)?;
+    drop_legacy_ini_include_tables(value, format);
+    Ok(())
+}
+
+/// Drop a table-shaped `includes`/`include` that survived normalization.
+///
+/// In the legacy `.ini` dialect such a table is an ordinary section, not a file
+/// list ([`process_includes`] deliberately leaves it in place); once the legacy
+/// guard and collector have run, whatever is still there is a section neither Go
+/// reader acts on, so it must not reach the v1 `includes: Vec<String>` decode.
+fn drop_legacy_ini_include_tables(value: &mut toml::Value, format: ConfigFormat) {
+    use toml::Value;
+    if format != ConfigFormat::Ini {
+        return;
+    }
+    if let Some(table) = value.as_table_mut() {
+        for key in ["includes", "include"] {
+            if matches!(table.get(key), Some(Value::Table(_))) {
+                table.remove(key);
+            }
+        }
+    }
 }
 
 /// Simple glob matching that supports a single `*` wildcard per path component.
