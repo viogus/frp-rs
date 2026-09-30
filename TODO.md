@@ -6072,7 +6072,7 @@ nothing about whether the described behaviour still holds.
   `compat.yml:48`) are the pre-change state and no longer resolve. Re-measured at the new
   head: `git ls-files '*.go'` is still empty, `scripts/download-go-frp.sh:29` still
   fetches the prebuilt release tarball, `build_go_frp_v2()` exists nowhere, and all seven
-  workflow YAMLs parse. `actions/setup-go` survives only in records (`CHANGELOG.md:2325`,
+  workflow YAMLs parse. `actions/setup-go` survives only in records (`CHANGELOG.md:2344`,
   this file, `docs/archive/plans/2026-06-28-xtcp-testing.md`). No gate update was owed —
   `scripts/repo-health.sh`'s toolchain checks match `rustup default` and
   `setup-rust-toolchain` only, never `setup-go` — and the `compat` lane is green at the
