@@ -2767,6 +2767,40 @@ mod oidc_throttle_tests {
         );
     }
 
+    /// [`MockServerHandle::request_head_timeout`] reports the **stored** field,
+    /// not a constant — the half the default-ctor pin above cannot see.
+    ///
+    /// `mock_default_ctor_delegates_the_pinned_deadline` calls the accessor once
+    /// and compares it to `MOCK_REQUEST_HEAD_TIMEOUT`, so an accessor that
+    /// ignores `self.request_head_timeout` and returns the constant keeps every
+    /// oidc test green — measured: all 19 `oidc` tests stay green with the
+    /// accessor body replaced by `MOCK_REQUEST_HEAD_TIMEOUT` (TODO.md:7797 (b)).
+    /// Two **distinct** overrides keep that mutant red twice over: a distilled
+    /// accessor can return at most one of the two values, so `/8` or `/60` fails
+    /// whichever value it happened to pick. They are also different from the 5 s
+    /// constant, so a body that returns `MOCK_REQUEST_HEAD_TIMEOUT` fails both.
+    /// No sleeping: the handle is produced by `oidc_mock_server_with_timeout`
+    /// without waiting out either deadline.
+    #[test]
+    fn mock_handle_reports_the_override_it_was_built_with() {
+        for override_timeout in [
+            std::time::Duration::from_millis(125),
+            std::time::Duration::from_secs(60),
+        ] {
+            let (issuer, handle) = oidc_mock_server_with_timeout(override_timeout);
+            assert_eq!(
+                handle.request_head_timeout(),
+                override_timeout,
+                "request_head_timeout() must return the stored deadline the handle was \
+                 built with ({override_timeout:?}), not a constant: a distilled accessor \
+                 returning MOCK_REQUEST_HEAD_TIMEOUT ({MOCK_REQUEST_HEAD_TIMEOUT:?}) or a \
+                 different override's value is invisible to \
+                 mock_default_ctor_delegates_the_pinned_deadline, whose only comparison is \
+                 against the shipped constant. issuer={issuer}"
+            );
+        }
+    }
+
     /// End to end: a client that connects and never sends gets an explicit
     /// `500` naming the cause — never the `/` route's silent `404 OK` — and the
     /// mock's serving thread stays usable for the next connection.
