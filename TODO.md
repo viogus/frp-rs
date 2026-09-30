@@ -7366,7 +7366,7 @@ section; ledger now **24 open / 104 closed**.**
   shipped message is defined once per variant in `frp-core/src/config/loader.rs` (`WEB_SERVER_TLS_ENABLE_INERT_WARNING`
   `:270`, its no-dashboard sibling `:285`, and `SERVER_TLS_ENABLE_INERT_TLS_CLAUSES` `:345`), and
   `frp-core/tests/server_tls_enable_warning.rs` now pins length + FNV-1a over the string the code
-  produces (`TLS_RENDERED_LEN = 433` / `TLS_RENDERED_FNV1A = 0x0a17_2261_4d74_606e` at `:112-118`,
+  produces (`TLS_RENDERED_LEN = 433` / `TLS_RENDERED_FNV1A = 0x0a17_2261_4d74_606e` at `:110-116`,
   with the comment at `:331-345`/`:390-403` saying the goldens are to be updated **deliberately**,
   never re-derived from the clause array). Teeth: swapping the two `SERVER_TLS_ENABLE_INERT_TLS_CLAUSES`
   elements panics at `:341`, and rewording `reads it.` → `reads it at all.` panics at `:334`
