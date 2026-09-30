@@ -5535,7 +5535,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `scripts/repo-health.sh:1452` `sys.exit(3)` -> `sys.exit(0)` reds it; that row's annotation
   reworded reds it; the basename-only newline guard reds it (scenario 3); containment-before-
   readability reds it (scenario 4). The harness runs as its own step in the `health` job of
-  `.github/workflows/ci.yml` (no `continue-on-error`): `RESULT: 12 fixture check(s) hold`, ~0.9 s,
+  `.github/workflows/ci.yml` (no `continue-on-error`): `RESULT: 12 fixture check(s) hold`, ~0.9 s at
+  the time (the follow-up batch grew the harness to 19 checks, ~4.6 s),
   cwd/HOME/locale/`TMPDIR`-robust and leak-free.
 
 - [x] **`ci.yml` spells the guarded test counts out by hand in two lanes, so every added test moves a literal.**
@@ -6999,7 +7000,7 @@ section; ledger now **24 open / 104 closed**.**
   root — is still counted in both crates; filed as a new item below.
 
 
-- [ ] **A cross-crate *hard link* is still counted in both crates by `repo-health.sh`.** The
+- [x] **A cross-crate *hard link* is still counted in both crates by `repo-health.sh`.** The
   `(st_dev, st_ino)` key added in #415 lives in each walk's own `seen` set, and the containment
   rule excludes a *symlink* whose realpath leaves the crate — but a hard link has no realpath in
   common with its twin and its own directory entry is inside its own crate's root. Measured
@@ -7009,7 +7010,21 @@ section; ledger now **24 open / 104 closed**.**
   a curated figure, so this is a silent count divergence, not a red). **Done-when:** the inode set
   is shared across the four walks while preserving the per-scope row semantics `within` protects (or
   the shape is otherwise counted once, or named), with the measured before/after.
-- [ ] **A *hard link* inside `.github/workflows/` or `docs/archive/` still double-counts.** #415
+  Done: fixed in #416 (`1f6aedcc`). The four `.rs` walks now share their inode sets across
+  the crate loop instead of carrying one `seen` per walk, so a hard link whose twin sits inside its
+  own crate's root is counted once. The sets stay split per measurement **scope** (`seen_src` for
+  `<crate>/src`, `seen_wide` for the crate directory) so a file legitimately counted in both scopes
+  is not treated as a duplicate. Measured 2026-09-30 at `902ba6f4`:
+  `ln frp-core/src/kcp/session.rs frp-server/src/zz_hardlink.rs` moves `frp-server` from `33 files /
+  60978 lines` + unsafe `1/0/0/2` to `32 / 59146` + `0/0/0/1` at rc 0 (`frp-core` stays
+  `69/76510`); a three-way link (`session.rs` aliased into frp-server *and* frp-client) also
+  collapses to one count, and a repeat run is byte-identical. The clean-tree gate output is
+  byte-identical to the base. **Trade-off (recorded, not fixed):** the first crate in `CRATES`
+  order claims the inode, so in the reverse direction
+  `ln frp-server/src/lib.rs frp-core/src/zz_hl_rev.rs` gives frp-core `70/76534` and frp-server
+  `31/59122` — counted once, but attributed to the earlier crate; the `rs_texts` docstring states
+  this convention and `docs/developing.md` records it.
+- [x] **A *hard link* inside `.github/workflows/` or `docs/archive/` still double-counts.** #415
   gave those two walks a `realpath` key, which sees a symlink but not a hard link. Measured
   2026-09-30 at `8efa9aa5`: an untracked `.github/workflows/zz_probe.yml` holding
   `- run: rustup default stable` plus
@@ -7020,7 +7035,17 @@ section; ledger now **24 open / 104 closed**.**
   `archive path refs: 20, resolvable via the docs/archive/ prefix: 19` to `21 / 20` at rc 0.
   **Done-when:** both walks key on `(st_dev, st_ino)` like the `.rs` walks, with the measured
   before/after for each.
-- [ ] **`scripts/tests/repo-health-fixtures.sh` fails when invoked through a symlink.** It resolves
+  Done: fixed in #416 (`258037f9`). Both walks now key on `(st_dev, st_ino)` via `os.stat`
+  and fall back to `os.path.realpath` only when the stat raises `OSError`, so two names for one
+  *missing* target still collapse to a single read error. Measured 2026-09-30 at `902ba6f4`:
+  `.github/workflows/zz_probe.yml` holding `- run: rustup default stable` plus a hard-link twin
+  prints `FAIL  1 floating toolchain selection(s)` (was 2) at rc 1; three hard links added to it
+  (four counted names) print 1 (was 4); a hard-link + symlink pair prints 1 (was 2);
+  `ln docs/archive/plans/2026-06-26-management-api.md docs/archive/zz_hard.md` gives
+  `archive path refs: 20, resolvable via the docs/archive/ prefix: 19` (was `21 / 20`), and two
+  hard links (was `22 / 21`) and a hard-link + symlink pair (was `21 / 20`) both give `20 / 19`.
+  A directory symlink stays undescended on both versions.
+- [x] **`scripts/tests/repo-health-fixtures.sh` fails when invoked through a symlink.** It resolves
   the script under test from an unresolved `BASH_SOURCE`, unlike `repo-health.sh` itself. Measured
   2026-09-30 at `8efa9aa5`: `ln -sf <tree>/scripts/tests/repo-health-fixtures.sh /tmp/rhfx.sh &&
   bash /tmp/rhfx.sh` prints `FAIL  cannot find the script under test: //scripts/repo-health.sh` and
@@ -7028,7 +7053,16 @@ section; ledger now **24 open / 104 closed**.**
   closing it needs the same `readlink` resolution loop `repo-health.sh` carries. **Done-when:** the
   harness resolves its own path so a symlink invocation runs green, or its header states the
   limitation.
-- [ ] **Three coverage gaps in the new `repo-health.sh` fixture harness.** The round-2 reviews of
+  Done: fixed in #416 (`6977481f`). The harness resolves its own path through a bounded
+  `readlink` loop, the same shape `repo-health.sh` carries. Measured 2026-09-30 at `902ba6f4`:
+  `ln -sf <tree>/scripts/tests/repo-health-fixtures.sh /tmp/rhfx.sh && bash /tmp/rhfx.sh` → rc 0,
+  `RESULT: 19 fixture check(s) hold` (was `FAIL  cannot find the script under test:
+  //scripts/repo-health.sh`, rc 1). Also green: a 3-hop relative chain, a 30-hop chain, a path
+  containing a newline, and a bare-name `PATH` lookup. **Residual (filed):** the loop's `> 40` cycle
+  bound never prints on macOS — the kernel refuses the chain long before 40 hops (`Too many levels
+  of symbolic links`, rc 126: 30 links green and 31 refused in Reviewer 1's sweep, 26 refused in
+  the coordinator's) — so it is a dead fail-closed backstop.
+- [x] **Three coverage gaps in the new `repo-health.sh` fixture harness.** The round-2 reviews of
   #415 found all three; none is a gate false-green today (each needs a mutation that also disables
   the check itself, or touches a printed metric no figure depends on).
   **(a) The exit-code scenario has no negative control.** It asserts that the
@@ -7047,4 +7081,37 @@ section; ledger now **24 open / 104 closed**.**
   supplies a `rust_comments.py` stub so all four sites are exercised, or the item records why the
   superset argument is sufficient; (c) the metric is asserted, or the heuristic is stated where the
   metric is read — each with the measured before/after.
+  Done: fixed in #416 (`450fc72f`, `902ba6f4`). (a) Scenario 5 is the clean-tree negative
+  control for the archive `(exit 3)` row: a wrapper that hardcodes
+  `  FAIL  archive path scan failed (exit 3)` while the archive gate exits 0 reds it
+  (`clean archive scan: the archive exit-3 row was printed anyway`), while scenario 1 stays green.
+  (b) Scenario 4 builds a full fixture tree (stub preflight inputs, the real
+  `scripts/rust_comments.py` copied in) and reverts each of the four walk sites; each site reds its
+  own evidence — site 1 `4 → 2` scan-error lines, sites 2/3 `4 → 3`, site 4 the
+  `partial tree: frp-core/src/zz_broken.rs is missing` row — reproduced independently by both
+  reviewers **in the real script**, not only through `mut_rwalk`; a mutation whose anchor is
+  missing now reds loudly
+  (`unreadable src: site N mutation failed to apply`) instead of printing `ok` (`902ba6f4`).
+  (c) Scenario 6 asserts `integration test dirs: 2`; a `-maxdepth 1` mutation reds it
+  (`expected 2, got 1`). The harness is 19 checks / ~4.6 s, its own step in the `health` job
+  (`timeout-minutes: 5`).
 
+- [ ] **Residual fixture-harness coverage nits from the `repo-health-residue` reviews.** Both
+  reviewers confirmed the four items closed; these are the leftovers neither could pin.
+  **(a)** Scenario 4's per-site revert checks accept any count different from the mutated baseline
+  rather than the exact expected drop (site 1 → 2, sites 2/3 → 3), so a walk that drops *more* than
+  its own evidence still reads `ok` (the positive control pins the baseline, so it is not a gate
+  false-green). **(b)** No check pins site 4's `n_present` semantics — that the crate-root
+  `has no .rs files` row is *suppressed* when the directory holds only cross-crate aliases (the
+  increment runs before the dedupe `continue`, so the row does not appear); Reviewer 1 had to
+  build a synthetic cross-crate-aliased tree to pin it (moving the increment after the `continue`
+  is count-inert and only changes the row). **(c)** The harness's `readlink` cycle bound (`> 40`)
+  is unreachable: the kernel refuses the chain long before 40 hops (`Too many levels of symbolic
+  links`, rc 126 — 30 links green / 31 refused in Reviewer 1's sweep, 26 refused in the
+  coordinator's), so the `FAIL  cannot resolve the harness path (symlink cycle?)` branch never
+  prints. **(d)** `new_tree`/`new_full_tree`'s rc is unchecked, the same class as the `mut_rwalk`
+  hole fixed above: with `chmod 000 scripts/repo-health.sh` (so the harness's copy of the script
+  under test fails) three checks go vacuous-green — both `newline … no forged hit from the split
+  path` checks and `clean archive scan: no archive exit-3 row` — while the run is rc 1 overall (so
+  it is not a gate false-green). **Done-when:** each is either asserted (with the measured
+  before/after) or its limitation is stated where the check lives.

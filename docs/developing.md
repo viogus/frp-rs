@@ -3017,10 +3017,18 @@ environment is sanitised. A refusal prints the reason and never an `ok`; a scan
 whose file set was incomplete prints `not evaluated`. Known, deliberate holes are
 listed next to the code (a directory named `*.yml`, a symlinked directory under
 `.github/workflows/`), and a workflow *path* containing a newline is refused outright rather than
-scanned (fail-closed, with its own `FAIL` row). The scan walks dedupe on `(st_dev, st_ino)` — and
-on `realpath` for the two non-`.rs` walks — so a symlink or a hard link inside one scope is counted
-once; the shapes still recorded in `TODO.md` are the cross-crate hard link and the two non-`.rs`
-hard-link shapes. The gate's exit-code mapping is pinned by `scripts/tests/repo-health-fixtures.sh`
+scanned (fail-closed, with its own `FAIL` row). All six scan walks dedupe on `(st_dev, st_ino)`;
+the two non-`.rs` walks fall back to `realpath` only when `stat` fails, so two names for one
+*missing* target still collapse. `rs_texts` shares its inode set per measurement scope
+(`<crate>/src` and the crate directory, so a file counted in both scopes is not read as a
+duplicate), while the three inline `.rs` walks each hold one set over the `<crate>/src` scope; a
+file reachable by two names is counted once **in the first crate in `CRATES`
+order that claims its inode** — a hard link has no canonical name, so a cross-crate alias is
+attributed to the earlier crate and the crate that owns the tracked name can under-count by that
+file's lines (measured: `ln frp-server/src/lib.rs frp-core/src/zz_hl_rev.rs` gives frp-core
+`70/76534` and frp-server `31/59122`, down from `32/59146`); no curated figure names a per-crate
+total, so this cannot turn a gate green. The gate's exit-code mapping is pinned by
+`scripts/tests/repo-health-fixtures.sh`
 (its own step in the `health` job), which builds a throwaway tree and asserts both the process rc
 and the `archive path scan failed (exit 3)` row.
 
