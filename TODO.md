@@ -7262,15 +7262,19 @@ section; ledger now **24 open / 104 closed**.**
 
 - [ ] **The `frps --config-dir` SIGUSR1 fan-out has no record of being untested off unix.**
   Filed by the #419 round-2 review. The handler lives behind `#[cfg(unix)]` (SIGUSR1 is a unix
-  signal), so on a non-unix build the reload path does not exist and the two fan-out pins
-  (`frps/tests/warn_delivery.rs:606`, `:636`) cannot run — which is defensible, but no record states
-  it, so a non-unix build's coverage of the lane is invisible.
+  signal), gated in `frps/src/main.rs` (`:218`, `:220`, `:238`, `:257`, `:278`, `:314`, `:393`),
+  so on a non-unix build the reload path does not exist — and the two fan-out pins
+  (`frps/tests/warn_delivery.rs:606`, `:636`) carry **no** gating of their own (`grep -c 'cfg('`
+  over that file is 0) while both wait on `SIGNAL_READY_MARKER` (`:92`, used at `:227`/`:247`) and
+  shell out to `Command::new("kill")` (`:229`/`:250`): off unix they still compile and would
+  **fail**, rather than being skipped — which is defensible, but no record states it, so a non-unix
+  build's coverage of the lane is invisible.
 
   Done-when: the unix-only nature is either recorded where the lane is documented and in the test
   file's own gating, or a non-unix no-op arm is pinned, so the omission is deliberate and visible.
 
 - [ ] **The mixed init-fail + run-fail `--config-dir` exit code is a probe value, not a pinned one.**
-  Filed by the #419 round-2 review. The `TODO.md:3175` Done block records "mixed init-fail + run-fail
+  Filed by the #419 round-2 review. The `TODO.md:3231` Done block records "mixed init-fail + run-fail
   → rc 3, nothing listening", but the pinned tests (`frps/tests/cli_exit_codes.rs:581` all-init-fail,
   `:633` all-run-fail) only assert a non-zero rc with no `listener started` record; the exact `3` for
   the mixed shape comes from a one-off probe.
