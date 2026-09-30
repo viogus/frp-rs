@@ -322,6 +322,22 @@ pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD: &str = "web_server.t
 /// directory`); on a SIGUSR1 reload the same shapes keep the server running and
 /// report `TLS certificate reload FAILED: … (keeping old config)`. The text
 /// therefore says "refused at startup", not "the server refuses to start".
+///
+/// **Reachable build shapes.** This split is keyed on **frp-core's** `tls`,
+/// because frp-core cannot observe `frp-server`'s features. One hand-rolled
+/// per-package mix therefore compiles a shape no shipped lane builds:
+/// `cargo build -p frps -p frpc --no-default-features --features
+/// "frps/micro,frpc/tls"` turns frp-core's `tls` on (via frpc → frp-client) while
+/// frp-server's stays off — measured with `cargo tree -p frps -p frpc
+/// --no-default-features --features "frps/micro,frpc/tls" -e features -i`:
+/// `frp-core feature "tls"` is present and `frp-server` resolves to only
+/// `frps feature "micro" (command-line)`. That binary gates the acceptor off
+/// (`frp-server/src/service.rs:603` is `#[cfg(feature = "tls")]`, with the
+/// no-acceptor branch at `:635`), so this variant's certificate clauses would
+/// describe a path it cannot take. Every lane builds at the
+/// workspace root with `tiny`/`micro` (`release.yml:100/102/108/110/159/162/210/213`,
+/// `ci.yml:921/:925`), where the two crates' `tls` agree, so the mixed shape is a
+/// known, unshipped one.
 #[cfg(feature = "tls")]
 pub const SERVER_TLS_ENABLE_INERT_WARNING: &str = "tls_enable has no effect on the \
     server: nothing in frp-server or frps reads it. The server's TLS switch is \
