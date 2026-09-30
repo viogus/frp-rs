@@ -45,8 +45,8 @@ One JSON object per line, in three parts:
 
 | `kind` | contents |
 |--------|----------|
-| `meta` | one first line: host, platform, cores, frp-rs version + git sha (with an `frp_rs_dirty` flag when the tree had uncommitted changes, and `harness_sha256` for the soak script and its two helpers), Go frp version + dir, the four binary `sha256` values, the traffic recipe, the ports, the resolved run dir, and an explicit `caveats` list |
-| `sample` | one per interval: `elapsed_s`, UTC `ts`, `load1`, the host-wide `time_wait` socket count, and RSS in KB for all four processes (`null` when a process was momentarily unreadable) |
+| `meta` | one first line: host, platform, cores, frp-rs version + git sha (with `frp_rs_dirty` covering the soak script, its helpers AND the `scripts/frp-stress` generator sources, `harness_sha256` for each of those parts plus `frp_stress_tree`, and `rs_bin_source` saying whether the measured frp-rs binaries were built here or supplied via `FRPS_BIN`/`FRPC_BIN`), Go frp version + dir, the four binary `sha256` values, the traffic recipe, the ports, the resolved run dir, and an explicit `caveats` list |
+| `sample` | one per interval: `elapsed_s`, UTC `ts`, `load1`, the host-wide `time_wait` socket count, and RSS in KB for all four processes (`null` when the reading was unusable — see below) |
 | `summary` | one last line: per-process `first`/`last`/`min`/`max`/`mean`/`first_hour_mean`/`last_hour_mean`/`growth_pct_first_to_last`, a computed `trend` per process (least-squares `slope_kb_per_hour`, first/last-quarter means, `monotonic_nondecreasing`), achieved `traffic` per side (including `failed_streams`), `achieved_equality` between the two sides, load and TIME_WAIT ranges, and `aborted` |
 
 **An artifact with no trailing `summary` line is an incomplete run.** That is a
@@ -59,18 +59,46 @@ The faults are:
 
 - a process that died at any point in the window, **including during the last
   sampling interval** (the liveness scan runs before the window-end test);
-- any RSS column with zero readings — `ps` never returned a number for it;
+- any RSS column with zero usable readings — `ps` never returned a number for it;
+- an RSS reading outside `1..SOAK_RSS_CEILING_KB` (default 100 GiB), or a column
+  whose readings are **all identical** across the series. Either shape can only
+  come from `ps` not reporting real processes: a stubbed `ps` printing `0`
+  produced a table of zeros, and one printing a constant produced exactly the
+  "perfectly flat" line this artifact is meant to test for. The identical-values
+  rule is deliberately strict — real RSS over hours always moves, so a
+  legitimately flat short validation is a cheap re-run, whereas a constant is
+  otherwise indistinguishable from the strongest possible result;
 - either side's churn completing no echo round trips, or its steady stream
   moving no bytes;
+- either side's totals below the absolute floor (10 churn round trips, 1 MiB of
+  steady traffic) — a run that moved almost nothing measured almost nothing,
+  even though it did measure it;
 - either side's steady path reporting `failed_streams > 0` (a torn-down path);
+- the recorded `bin_sha256` showing the frp-rs and Go binaries of a pair to be
+  the same file — one implementation run on both sides is not a comparison (the
+  soak refuses this before the window opens too);
 - the two sides' achieved volume differing by more than `SOAK_TRAFFIC_TOLERANCE`
   (default `0.10`) — both are handed the same paced recipe, so a large gap means
-  the comparison is not head-to-head.
+  the comparison is not head-to-head. The value must be a finite number in
+  `(0, 1]`: `nan` compares false against everything and used to disable the
+  check while the run still reported `"aborted": null`.
 
 A missing reading prints `-`, never a fabricated `0`, and a column with no
 readings at all prints `NO READINGS`. `scripts/tests/rss-soak-run-dir.sh` (run
 by the `health` CI job, no network or built binary needed) drives the real
-run-dir helpers and the real summary reader over these cases.
+run-dir helpers and the real summary reader over these cases, including the
+stubbed-`ps` shapes above; it enforces a floor on its own check count so that
+deleting a case cannot silently pass.
+
+Two env knobs tune the refusals above, and both are documented by
+`bash scripts/rss-soak.sh --help` along with the rest:
+
+- `SOAK_TRAFFIC_TOLERANCE` (default `0.10`) — relative achieved-volume spread
+  allowed between the two sides.
+- `SOAK_RSS_CEILING_KB` (default `104857600`) — largest RSS reading accepted as
+  real; the bound is applied by the soak when it samples and again by the
+  summary reader, so an artifact produced elsewhere cannot present an
+  implausible value as evidence either.
 
 What the series does and does not establish:
 
