@@ -2607,4 +2607,26 @@ mod tests {
         cfg.method = AuthMethod::Oidc;
         assert!(cfg.validate_login(None, Some(1_700_000_000)).is_err());
     }
+
+    /// Pin which `web_server.tls.enable` message this build's resolver selects.
+    ///
+    /// Before this test no lane witnessed `web_server_tls_enable_reader()`:
+    /// every frps lane linked frp-server with `tls` on, so its
+    /// `cfg!(feature = "tls")` argument could be replaced by the literal `true`
+    /// and stay green — a dashboard-on/tls-off build would then emit the
+    /// "TLS is available" text and name a switch it cannot honour. The
+    /// `-p frp-server --no-default-features --features dashboard` CI step runs
+    /// exactly this test in the shape that catches that mutant.
+    #[test]
+    fn web_server_tls_enable_reader_answers_from_this_build() {
+        use frp_core::config::WebServerTlsEnableReader;
+
+        let got = web_server_tls_enable_reader();
+        #[cfg(all(feature = "dashboard", feature = "tls"))]
+        assert_eq!(got, WebServerTlsEnableReader::WebServerTls);
+        #[cfg(all(feature = "dashboard", not(feature = "tls")))]
+        assert_eq!(got, WebServerTlsEnableReader::WebServerNoTls);
+        #[cfg(not(feature = "dashboard"))]
+        assert_eq!(got, WebServerTlsEnableReader::NoWebServer);
+    }
 }
