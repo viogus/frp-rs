@@ -51,11 +51,9 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         if: steps.check.outputs.configured == 'true'
 
-      - uses: actions/setup-go@v5
-        if: steps.check.outputs.configured == 'true'
-        with:
-          go-version: '>=1.22.0'
-
+      # No Go toolchain is needed: the Go frp side is downloaded as a prebuilt
+      # release tarball by `scripts/download-go-frp.sh`, which is exactly why
+      # `/tmp/frp_0.71.0_linux_amd64/` below is the one Go path worth caching.
       - name: Cache cargo + go-frp
         if: steps.check.outputs.configured == 'true'
         uses: actions/cache@v4
