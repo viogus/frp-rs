@@ -150,7 +150,7 @@ jobs:
       # client's half of the same change does not move *this* literal: it added
       # tests to `frpc/tests/cli_exit_codes.rs` (the other literal below) and to
       # `frp-client`'s lib tests, which no guarded lane counts.
-      FRPS_CLI_TESTS: "29"
+      FRPS_CLI_TESTS: "30"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
       # 11 → 13 with the one `auth.method` policy: +2

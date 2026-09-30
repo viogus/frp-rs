@@ -235,8 +235,15 @@ async fn run(mut cli: FrpsArgs) {
                         let service = match Service::with_unsafe_features(cfg, Some(path_str.clone()), uf).await {
                             Ok(s) => std::sync::Arc::new(s),
                             Err(e) => {
+                                // Carry the **typed** code out of the task: the
+                                // single-config path below exits on this same
+                                // value, and a directory that started no service
+                                // must not report success (measured at b8e1dd6d
+                                // with one valid-but-rejected file: `-c` exited 3
+                                // and `--config-dir` exited 0).
+                                let code = e.kind().exit_code();
                                 tracing::error!(path = %path_str, error = %e, "frps service init failed for [{}]: {}", path_str, e);
-                                return;
+                                return Err(code);
                             }
                         };
                         // Registered before `run()`, so the soonest possible
@@ -246,6 +253,9 @@ async fn run(mut cli: FrpsArgs) {
                         if let Err(e) = service.run().await {
                             tracing::error!(path = %path_str, error = %e, "frps service error for config file [{}]: {}", path_str, e);
                         }
+                        // `Ok(())` = this task constructed a service and ran it
+                        // to completion; `Err(code)` = it never started.
+                        Ok(())
                     }));
                 }
                 Err(e) => {
@@ -297,9 +307,24 @@ async fn run(mut cli: FrpsArgs) {
             })
         };
 
+        // A task that failed construction reports its typed exit code; one that
+        // ran a service reports `Ok(())`. If **every** spawned task failed, the
+        // directory started nothing at all, and the process must exit like the
+        // single-config path does — with the first failure's typed code — rather
+        // than 0. A mix (at least one service actually ran) keeps the historical
+        // log-and-keep-serving behaviour.
+        let spawned = handles.len();
+        let mut init_failures: Vec<i32> = Vec::new();
         for handle in handles {
-            if let Err(e) = handle.await {
-                tracing::error!(error = %e, "frps service task panicked: {}", e);
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(code)) => init_failures.push(code),
+                Err(e) => tracing::error!(error = %e, "frps service task panicked: {}", e),
+            }
+        }
+        if init_failures.len() == spawned {
+            if let Some(code) = init_failures.first() {
+                process::exit(*code);
             }
         }
 

@@ -558,6 +558,48 @@ fn config_dir_extension_refuses_nonexistent_dir_with_2() {
     );
 }
 
+/// `--config-dir` must not report success when **every** file in the directory
+/// fails service construction (as opposed to failing to load). At `b8e1dd6d`
+/// the lane pushed its `tokio::spawn` handle *before* the service was built, so
+/// `handles` was non-empty even when every task returned early inside
+/// `Service::with_unsafe_features`; the `handles.is_empty()` guard never fired,
+/// the already-finished tasks were awaited, and the process exited **0** — for a
+/// server that started no listener.
+///
+/// The fixture file carries no `[auth].token`, so construction is refused on the
+/// auth lane: `-c <that file>` exits 3 (`EXIT_AUTH`), and the directory lane must
+/// exit on the same typed code.
+#[test]
+fn config_dir_where_every_service_fails_init_exits_like_dash_c() {
+    let port = ephemeral_port();
+    let dir = TempDir::new();
+    let conf_d = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    let file = conf_d.join("frps.toml");
+    std::fs::write(&file, format!("bindPort = {port}\n")).expect("write config");
+    let file = file.to_str().expect("utf-8 temp path");
+
+    let control = run_frps(&["-c", file]);
+    assert_eq!(
+        control.status.code(),
+        Some(3),
+        "control: an empty-token config on `-c` must exit 3 (EXIT_AUTH); \
+         stdout={:?} stderr={:?}",
+        stdout_of(&control),
+        stderr_of(&control),
+    );
+
+    let out = run_frps(&["--config-dir", conf_d.to_str().expect("utf-8 temp path")]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "every file failing service init must exit on the same typed lane as \
+         `-c` (3), not 0; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
 /// The frp-rs space-separated `--strict-config` extension is made **loud** on
 /// `frps` too: exactly one stderr line, and silence for the Go-faithful shapes
 /// (`--strict-config=false`, the bare switch, absent). `BAD_CONFIG` carries no
