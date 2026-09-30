@@ -1839,12 +1839,22 @@ fn fold_prefixed_keys_into(st: &mut toml::Table, prefix: &str, target: &str) {
 ///   **every** section other than `common`/`range:*`/the default section as a
 ///   proxy: `role` defaults to `"server"`, and a missing `type` becomes `tcp`
 ///   (measured on Go v0.71.0: `[myproxy]` with only `local_port`/`remote_port`
-///   is `new proxy [myproxy] type [tcp] success`; `frpc verify` rc 0 in both
-///   strict modes). So an INI section is collected on shape alone and the
-///   missing `type` is filled with `tcp` here. A `role = "visitor"` section is
-///   **not** given the proxy default: measured on Go v0.71.0, such a section is
-///   refused (`failed to parse visitor v1, err: type shouldn't be empty`, rc 1),
-///   never quietly turned into a tcp proxy.
+///   is registered by frps as `new proxy [myproxy] type [tcp] success` and by
+///   frpc as `[myproxy] start proxy success`, and `frpc verify` is rc 0 in both
+///   strict modes). frp-rs collects on shape instead, and the shape it accepts
+///   is Go's own membership key plus one narrower `.ini` case: a `type` key, or
+///   a `type`-less section carrying `local_port`/`remote_port`. The second case
+///   is **narrower than Go** on purpose — a `type`-less `.ini` table with
+///   neither port key would be a `tcp` proxy with port 0 on Go, while here it
+///   stays a v1 section (measured: rc 1 in strict mode with `unknown field
+///   "myproxy" in config file …`) — because the same key set is what
+///   `format.rs`'s nest gate reads to decide a dotted header is a *flat* name,
+///   and it is what keeps a `type`-less camelCase admin block out of the
+///   collector. The missing `type` of a collected section is filled with `tcp`
+///   here. A `role = "visitor"` section is **not** given the proxy default:
+///   measured on Go v0.71.0, such a section is refused (`failed to parse visitor
+///   v1, err: type shouldn't be empty`, rc 1), never quietly turned into a tcp
+///   proxy.
 /// * **TOML/JSON/YAML** (`is_ini == false`) — Go's v1 decoder rejects an unknown
 ///   top-level table (`unknown field "myproxy"`), so the `type` key stays the
 ///   membership discriminator and an unknown table keeps its current meaning.
@@ -1868,36 +1878,36 @@ fn collect_legacy_ini_proxy_sections(
     let mut visitor_indices = Vec::new();
 
     // Known non-proxy top-level sections are never collected even if they
-    // happen to carry a `type` key. The camelCase alias of each v1 root is
-    // listed beside its snake_case spelling (`webServer`/`web_server`,
-    // `httpPlugins`/`http_plugins`, `sshTunnelGateway`/`ssh_tunnel_gateway`) —
-    // the same spellings the INI reader expands into nested tables
-    // (`format.rs` `INI_NESTED_SECTION_ROOTS`) and every loader format merges
-    // into the snake_case section (`merge_section_into`). Without the aliases a
-    // `type`-less `.ini` `[webServer]` was collected as a phantom proxy named
-    // after its header, before `merge_section_into(table, "webServer",
-    // "web_server")` could run: measured, a client `.ini` with
-    // `[webServer] port = 7500` loaded with `Proxies: 1` and admin port 0, and
-    // `[webServer] zzz_unknown_key = 1` passed strict mode (legacy proxy
-    // sections are strict-exempt) where base `b8e1dd6d` reported
-    // `unknown field "web_server.zzz_unknown_key"`.
+    // happen to carry a `type` key.
+    //
+    // Only the **snake_case** spelling of a v1 root is listed. Its camelCase
+    // alias is deliberately *not*: Go's legacy loader takes a section by shape,
+    // so `[webServer] type = "tcp"` (and `[httpPlugins]` / `[sshTunnelGateway]`)
+    // is a proxy *named* after the header there, while a `type`-less
+    // `[webServer] port = 7500` is the admin block. Reserving the camelCase name
+    // would re-drop the typed proxy; listing it and relying on the filter would
+    // repeat the phantom-proxy bug this comment's sibling clause below fixes.
+    // The `local_port`/`remote_port` clause of that clause is what separates the
+    // two: no admin block carries either key. (Measured on the real v0.71.0
+    // binaries: `.ini` files typing all three headers give `frpc verify` rc 0 in
+    // both strict modes, and a real run logs `proxy added: [httpPlugins
+    // sshTunnelGateway webServer]` on frpc and one `new proxy [<header>] type
+    // [tcp] success` per header on frps; base971 gave `Proxies: 1` for each
+    // before this PR touched the filter.)
     const KNOWN_SECTIONS: &[&str] = &[
         "common",
         "proxies",
         "visitors",
         "web_server",
-        "webServer",
         "auth",
         "log",
         "transport",
         "plugins",
         "http_plugins",
-        "httpPlugins",
         "feature",
         "featureGates",
         "includes",
         "ssh_tunnel_gateway",
-        "sshTunnelGateway",
         "observability",
         "vnet",
         "store",
@@ -1915,9 +1925,18 @@ fn collect_legacy_ini_proxy_sections(
                 return true;
             }
             // A `type`-less section is a proxy only in the legacy `.ini`
-            // dialect — and never when it declares itself a visitor, which Go
-            // refuses instead of defaulting (`type shouldn't be empty`).
-            is_ini && t.get("role").and_then(Value::as_str) != Some("visitor")
+            // dialect and only when it names a port — the same key set the nest
+            // gate in `format.rs` uses to declare a dotted header flat, which is
+            // what keeps a `type`-less camelCase admin block (`[webServer] port
+            // = 7500`, `[webServer]` + `[webServer.tls]`, `[common.webServer]`,
+            // the `[webServer]`+`[web_server]` merge, `[webServer]
+            // zzz_unknown_key = 1`) out of the collector while
+            // `[myproxy]`/`[auth.foo]` with ports stay proxies. Never when the
+            // section declares itself a visitor, which Go refuses instead of
+            // defaulting (`type shouldn't be empty`).
+            is_ini
+                && (t.contains_key("local_port") || t.contains_key("remote_port"))
+                && t.get("role").and_then(Value::as_str) != Some("visitor")
         })
         .cloned()
         .collect();

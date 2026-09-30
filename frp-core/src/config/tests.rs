@@ -6590,9 +6590,13 @@ fn dotted_ini_headers_that_are_legacy_proxy_names_stay_proxies() {
 /// (base `b8e1dd6d`: `Proxies: 0`, port 7500), and `[webServer]
 /// zzz_unknown_key = 1` passed strict mode — a collected legacy section is
 /// strict-exempt — where base reported `unknown field
-/// "web_server.zzz_unknown_key"`. The fix lists the camelCase aliases
-/// (`webServer`, `httpPlugins`, `sshTunnelGateway`) in the collector's
-/// known-section set, the same spellings the INI reader expands.
+/// "web_server.zzz_unknown_key"`. The fix narrows the typeless rule to a
+/// section that names a port (`local_port`/`remote_port`) — the same
+/// discriminator `format.rs`'s nest gate uses, and a key no admin block
+/// carries. The first cut instead listed the camelCase aliases (`webServer`,
+/// `httpPlugins`, `sshTunnelGateway`) in the known-section set, which traded
+/// this bug for its mirror image: a *typed* `[webServer]` proxy was dropped
+/// (base971 and the final rule both give `Proxies: 1`).
 ///
 /// **What this models.** Both loader modes on a real client `.ini`, for the flat
 /// `[webServer]`, the nested `[webServer.tls]`, the nested-under-`[common]`
@@ -6602,11 +6606,12 @@ fn dotted_ini_headers_that_are_legacy_proxy_names_stay_proxies() {
 ///
 /// **What it does not cover.** The server path never runs the collector, so it
 /// was never affected (frps `[webServer]` / `[webServer.tls]` is pinned in
-/// `dotted_ini_headers_that_are_legacy_proxy_names_stay_proxies`); the two
-/// other alias pairs have no `.ini`-reachable admin table to assert after the
-/// collection step; and a camelCase root that *does* carry `type` is still a
-/// legacy proxy on the client, by the same `type` discriminator as its
-/// snake_case spelling. The `[common.webServer.tls]` row is written **alone**:
+/// `dotted_ini_headers_that_are_legacy_proxy_names_stay_proxies`); a typeless
+/// section with no port key at all is pinned in
+/// `typeless_ini_section_without_ports_stays_a_v1_section`; and the
+/// mirror-image row — a camelCase root that *does* carry `type` — is pinned in
+/// `typed_camelcase_v1_root_headers_are_still_legacy_proxies`. The
+/// `[common.webServer.tls]` row is written **alone**:
 /// a top-level `[webServer]` beside it drops the `[common]` table whole, the
 /// pre-existing `or_insert` flatten of `[common]` pinned in
 /// `both_web_server_sections_merge_per_key_in_both_modes`, not this collector.
@@ -6823,6 +6828,120 @@ fn typeless_ini_proxy_section_defaults_to_tcp_in_both_modes() {
             "strict={strict}"
         );
     }
+}
+
+/// A **typed** `.ini` section whose header is a camelCase v1 root name is still
+/// Go's legacy proxy, named after the header.
+///
+/// Go's legacy loader looks sections up by raw name, so `[webServer]` is one
+/// section there too, and frp-rs's known-section list holds only the snake_case
+/// spellings — the camelCase ones are exactly the headers whose INI nesting
+/// `ini_section_path` expands, so reserving them would drop the proxy.
+/// Measured with the final rule, `frpc verify` on `[webServer] type = tcp` with
+/// `local_port`/`remote_port`, `[httpPlugins] type = tcp ports = …` and
+/// `[sshTunnelGateway] type = tcp ports = …`: rc 0 with `Proxies: 1` under both
+/// `--strict-config` values, exactly as base971 (`971e0fa0`); the alias list the
+/// first cut added made those same rows `Proxies: 0` (lenient) / rc 1 (strict).
+///
+/// **Mutation teeth.** Re-adding any of the three names to `KNOWN_SECTIONS`
+/// fails the `find` below for that row; deleting the `if t.contains_key("type")`
+/// clause fails the two `ports`-only rows, which carry no `local_port` /
+/// `remote_port` to satisfy the typeless clause either.
+#[test]
+fn typed_camelcase_v1_root_headers_are_still_legacy_proxies() {
+    for (name, body) in [
+        (
+            "webServer",
+            "[webServer]\ntype = tcp\nlocal_port = 8080\nremote_port = 9080\n",
+        ),
+        (
+            "httpPlugins",
+            "[httpPlugins]\ntype = tcp\nports = 7000,7001\n",
+        ),
+        (
+            "sshTunnelGateway",
+            "[sshTunnelGateway]\ntype = tcp\nports = 7000,7001\n",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(
+            &path,
+            format!("[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n{body}"),
+        )
+        .unwrap();
+        for strict in [false, true] {
+            let cfg = load_client_config(path.to_str().unwrap(), strict)
+                .unwrap_or_else(|e| panic!("[{name}], strict={strict}: {e}"));
+            let proxy = cfg
+                .proxies
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "[{name}], strict={strict}: the typed legacy proxy must register; got {:?}",
+                        cfg.proxies
+                            .iter()
+                            .map(|p| p.name.clone())
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert_eq!(
+                proxy.proxy_type, "tcp",
+                "[{name}], strict={strict}: the declared type must win"
+            );
+            if name == "webServer" {
+                assert_eq!(proxy.local_port, 8080, "strict={strict}");
+                assert_eq!(proxy.remote_port, 9080, "strict={strict}");
+            }
+        }
+    }
+}
+
+/// A `type`-less `.ini` section that names **no** port stays a v1 section — the
+/// deliberately narrow half of frp-rs's `.ini` proxy rule, pinned in both modes.
+///
+/// Go's legacy loader would make it a `tcp` proxy named after its header (with
+/// port 0); frp-rs collects a typeless section only when it carries
+/// `local_port`/`remote_port`, the discriminator that also keeps the typeless
+/// `[webServer]` admin block out of the collector. Measured with the final rule
+/// and on base971 (`971e0fa0`), `frpc verify` on `[myproxy] custom_domains =
+/// a.com`: non-strict rc 0 with `Proxies: 0` (the table is dropped as an unknown
+/// field), strict rc 1 `unknown field "myproxy" in config file …`.
+///
+/// **Mutation teeth.** Deleting the `local_port`/`remote_port` clause makes the
+/// non-strict load register a phantom `tcp` proxy (the `is_empty` assert below
+/// fails, as do all four shapes in
+/// `typeless_camelcase_web_server_ini_is_not_a_phantom_proxy`) and lets this
+/// strict mode load (the `unwrap_err` below fails).
+#[test]
+fn typeless_ini_section_without_ports_stays_a_v1_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [myproxy]\ncustom_domains = a.com\n",
+    )
+    .unwrap();
+    let lenient = load_client_config(path.to_str().unwrap(), false).unwrap();
+    assert!(
+        lenient.proxies.is_empty(),
+        "a typeless, port-less section must not become a tcp proxy; got {:?}",
+        lenient
+            .proxies
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>()
+    );
+    let err = format!(
+        "{}",
+        load_client_config(path.to_str().unwrap(), true).unwrap_err()
+    );
+    assert!(
+        err.contains("unknown field \"myproxy\""),
+        "strict mode must still report the typeless, port-less section: {err}"
+    );
 }
 
 /// A **non-table** `webServer` / `web_server` (top level or under `[common]`)

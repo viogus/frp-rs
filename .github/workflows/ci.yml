@@ -170,7 +170,11 @@ jobs:
       # camelCase `[webServer]`
       # (`typeless_camelcase_web_server_ini_is_not_a_proxy`). Both are plain
       # (un-gated) tests, so `frpc-tiny` reaches them.
-      FRPC_TINY_CLI_TESTS: "15"
+      # 15 → 17 with the corrected narrowing: +2
+      # (`typed_camelcase_v1_root_ini_sections_verify_as_proxies`,
+      # `bogus_type_on_a_camelcase_legacy_proxy_is_refused`) — the mirror-image
+      # rows for a *typed* camelCase v1-root header, both un-gated.
+      FRPC_TINY_CLI_TESTS: "17"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4

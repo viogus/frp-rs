@@ -303,8 +303,9 @@ fn verify_good_config_exits_0() {
 ///
 /// Measured on the real v0.71.0 binaries: `.ini` files whose only section is a
 /// typeless `[myproxy]` (with `local_port`/`remote_port`) give `frpc verify` rc 0
-/// under both `--strict-config` values, and a real run logs `new proxy [myproxy]
-/// type [tcp] success`. frp-rs used to print `Proxies: 0` in lenient mode (the
+/// under both `--strict-config` values, a real frps run logs `new proxy [myproxy]
+/// type [tcp] success` and a real frpc run logs `[myproxy] start proxy success`.
+/// frp-rs used to print `Proxies: 0` in lenient mode (the
 /// silent drop) and refuse the file in strict mode with `unknown field
 /// "myproxy" in config file …`.
 #[test]
@@ -382,6 +383,93 @@ fn typeless_camelcase_web_server_ini_is_not_a_proxy() {
         assert!(
             stderr_of(&out).is_empty(),
             "verify writes nothing to stderr on success; stderr={:?}",
+            stderr_of(&out),
+        );
+    }
+}
+
+/// A **typed** `.ini` section named after a camelCase v1 root is still Go's
+/// legacy proxy — the mirror image of the phantom fix above, and the row a
+/// reviewer blocked on.
+///
+/// `collect_legacy_ini_proxy_sections` reserves only the snake_case spellings of
+/// the v1 roots; the camelCase headers are the ones the INI reader expands, so
+/// reserving them dropped `[webServer] type = tcp` (and `[httpPlugins]` /
+/// `[sshTunnelGateway]`) whole: lenient `Proxies: 0`, strict rc 1 `unknown field
+/// "web_server.type"`. Measured with the final rule, one `.ini` holding all
+/// three: rc 0 with `Proxies: 3` under both `--strict-config` values, matching
+/// base971 (`971e0fa0`) exactly.
+#[test]
+fn typed_camelcase_v1_root_ini_sections_verify_as_proxies() {
+    let dir = TempDir::new();
+    let cfg = dir.write(
+        "camel_typed.ini",
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [webServer]\ntype = tcp\nlocal_port = 8080\nremote_port = 9080\n\
+         [httpPlugins]\ntype = tcp\nports = 7000,7001\n\
+         [sshTunnelGateway]\ntype = tcp\nports = 7000,7001\n",
+    );
+
+    for strict in ["--strict-config=false", "--strict-config"] {
+        let out = run_frpc(&["verify", strict, "-c", &cfg]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "frpc verify {strict} -c <typed camelCase ini> must exit 0; stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        assert_eq!(
+            stdout_of(&out),
+            format!(
+                "frpc: the configuration file {cfg} syntax is ok\n  Server: 127.0.0.1:7000\n  \
+                 Proxies: 3\n  Visitors: 0\n"
+            ),
+            "all three typed camelCase roots must register as proxies ({strict}); stderr={:?}",
+            stderr_of(&out),
+        );
+        assert!(
+            stderr_of(&out).is_empty(),
+            "verify writes nothing to stderr on success; stderr={:?}",
+            stderr_of(&out),
+        );
+    }
+}
+
+/// A bogus `type` on one of those sections is refused by frp-rs's own
+/// proxy-type check, in both loader modes — never the silent `Proxies: 0` the
+/// dropped-section cut produced.
+///
+/// Measured: `[webServer] type = "bogus"` with ports gives rc 1 under both
+/// `--strict-config` values with `proxy 'webServer': invalid proxy_type
+/// 'bogus'`, identical to base971 (`971e0fa0`); Go v0.71.0 refuses it as
+/// `failed to parse proxy webServer, err: invalid type [bogus]`.
+#[test]
+fn bogus_type_on_a_camelcase_legacy_proxy_is_refused() {
+    let dir = TempDir::new();
+    let cfg = dir.write(
+        "camel_bogus.ini",
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [webServer]\ntype = bogus\nlocal_port = 8080\nremote_port = 9080\n",
+    );
+
+    for strict in ["--strict-config=false", "--strict-config"] {
+        let out = run_frpc(&["verify", strict, "-c", &cfg]);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "a bogus proxy type must be refused ({strict}); stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        assert!(
+            stdout_of(&out).contains("proxy 'webServer': invalid proxy_type 'bogus'"),
+            "the refusal must name the proxy and the type ({strict}); stdout={:?}",
+            stdout_of(&out),
+        );
+        assert!(
+            stderr_of(&out).is_empty(),
+            "the refusal goes to stdout, Go-style; stderr={:?}",
             stderr_of(&out),
         );
     }

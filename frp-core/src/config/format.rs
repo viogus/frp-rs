@@ -263,8 +263,9 @@ const INI_NESTED_SECTION_ROOTS: &[&str] = &[
 ///   the legacy INI dialect every section other than `[common]` is a proxy whose
 ///   name is a flat, user-chosen identifier, and
 ///   `collect_legacy_ini_proxy_sections` decides membership by the presence of
-///   `type` — or, in the `.ini` dialect, by the section not declaring
-///   `role = "visitor"` — so `[auth.foo]` with `type = tcp` is a proxy *named*
+///   `type` — or, in the `.ini` dialect, by the section carrying
+///   `local_port`/`remote_port` and not declaring `role = "visitor"` — so
+///   `[auth.foo]` with `type = tcp` is a proxy *named*
 ///   `auth.foo`, not the `foo` child of an `auth` table. Go does
 ///   the same: its legacy loader looks sections up by their raw name
 ///   (`pkg/config/legacy/server.go`, `section.Name()`), so `[auth.foo]` is one
@@ -281,14 +282,21 @@ const INI_NESTED_SECTION_ROOTS: &[&str] = &[
 ///   The same holds for a section that carries `local_port` or `remote_port` but
 ///   no `type`: Go's legacy loader defaults the missing proxy type to `tcp`
 ///   (measured on the real v0.71.0 binaries: an `.ini` `[myproxy]` with only
-///   `local_port`/`remote_port` gives `frpc verify` rc 0, and a real run logs
-///   `new proxy [myproxy] type [tcp] success`), so `[auth.foo]` with ports is a
+///   `local_port`/`remote_port` gives `frpc verify` rc 0, a real frps run logs
+///   `new proxy [myproxy] type [tcp] success` and a real frpc run logs
+///   `[myproxy] start proxy success`), so `[auth.foo]` with ports is a
 ///   proxy *named* `auth.foo`, not the `auth.foo` v1 child table. No v1 nested
 ///   sub-table in either schema carries `local_port`/`remote_port`, so those keys
 ///   discriminate without affecting the `[auth.oidc]` / `[webServer.tls]`
 ///   nesting. Without this guard the section stayed nested under `auth`, which
 ///   `collect_legacy_ini_proxy_sections` skips as a known section, and the proxy
 ///   was dropped (`frpc verify` rc 0 with `Proxies: 0`).
+///
+///   The collector reads the same two keys, which is why a `type`-less,
+///   port-less `.ini` section is **not** a proxy there (Go's legacy loader would
+///   make it a port-0 `tcp` proxy named after the header; measured `frpc verify`
+///   on `[myproxy] custom_domains = a.com`: non-strict rc 0 `Proxies: 0`, strict
+///   rc 1 `unknown field "myproxy"`).
 /// * **A non-v1 first segment, quoting, or an empty path segment** keeps the
 ///   header verbatim, so `[plugin.user-manager]` stays the flat key its
 ///   `starts_with("plugin.")` handling reads.
