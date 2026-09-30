@@ -6944,6 +6944,63 @@ fn typeless_ini_section_without_ports_stays_a_v1_section() {
     );
 }
 
+/// A typeless `.ini` section that declares itself a **visitor** *and* names a
+/// port is still not collected: the `role != "visitor"` clause of the collector
+/// is what buys the exclusion.
+///
+/// The port-key discriminator alone cannot separate this shape from a typeless
+/// proxy — `local_port`/`remote_port` are the very keys it tests for — so without
+/// the role clause the section is collected and, because it says
+/// `role = "visitor"`, routed into `[visitors]` carrying a synthetic
+/// `type = "tcp"` that Go never writes.
+///
+/// **Measured behaviour (pinned as-is, including the ugly half).** Go v0.71.0
+/// refuses a typeless visitor in *both* loader modes (`failed to parse visitor v,
+/// err: type shouldn't be empty`); frp-rs loads rc 0 with nothing collected in
+/// non-strict mode and refuses in strict mode with `unknown field "v"`. That is
+/// the pre-existing divergence filed as TODO residue, deliberately left unfixed
+/// here so this pin isolates the exclusion clause.
+///
+/// **Mutation teeth.** Replacing the clause with `true` collects the section and
+/// routes it into `[visitors]`, so even the lenient load fails client validation
+/// (`visitor 'v': server name is required`) and this test panics on the `unwrap`
+/// — the `visitors.is_empty()` assertion is never reached.
+#[test]
+fn typeless_port_carrying_ini_visitor_is_not_collected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [v]\nrole = \"visitor\"\nlocal_port = 1\nremote_port = 2\n",
+    )
+    .unwrap();
+
+    let lenient = load_client_config(path.to_str().unwrap(), false).unwrap();
+    assert!(
+        lenient.proxies.is_empty(),
+        "a typeless visitor must not become a tcp proxy; got {:?}",
+        lenient
+            .proxies
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        lenient.visitors.is_empty(),
+        "a typeless visitor must not be registered with an invented type either"
+    );
+
+    let err = format!(
+        "{}",
+        load_client_config(path.to_str().unwrap(), true).unwrap_err()
+    );
+    assert!(
+        err.contains("unknown field \"v\""),
+        "strict mode must still report the uncollected section as the unknown field it is: {err}"
+    );
+}
+
 /// A **non-table** `webServer` / `web_server` (top level or under `[common]`)
 /// must still reach serde as a type error.
 ///
