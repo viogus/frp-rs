@@ -48,11 +48,35 @@ RUN ARCH="$(uname -m)" && \
     | tar xJ --strip-components=1 -C /usr/local/cargo/bin && \
     chmod +x /usr/local/cargo/bin/cargo-zigbuild
 
-# Add the cross-compilation target (musl for fully static binary)
+# ── Toolchain pin ──────────────────────────────────────────
+# `rust:1-slim-bookworm` floats: its default toolchain is whatever `stable`
+# the upstream image carried at pull time. Copy the repo pin in and install
+# exactly what it names, so the compiler here is the one `rust-toolchain.toml`
+# selects — a `channel` bump there is the whole compiler bump.
+WORKDIR /build
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install --no-self-update
+
+# Fail closed if the shims are not using the copied pin. rustup reports the
+# file as the override (measured on this image's rustup, 1.29.1); a dropped
+# COPY or a stray RUSTUP_TOOLCHAIN makes it report the base image default and
+# the build would float again without saying so.
+RUN active="$(rustup show active-toolchain)"; \
+    echo "Docker source build toolchain: ${active}"; \
+    case "${active}" in \
+      *"overridden by '/build/rust-toolchain.toml'"*) ;; \
+      *) echo "ERROR: docker source build is not using the pinned toolchain" >&2; exit 1 ;; \
+    esac; \
+    rustc --version
+
+# Add the cross-compilation target (musl for fully static binary) to the
+# pinned toolchain. This MUST stay after the COPY above: run first, it installs
+# the target into the base image's floating default toolchain instead, and the
+# pinned toolchain has no `std` for it ("can't find crate for `std`") as soon
+# as the base image's default differs from the pin.
 RUN rustup target add $(cat /tmp/rust_target)
 
 # Build frp-rs from source
-WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
 # vendored rustls (SNI patch) — required by [patch.crates-io] in Cargo.toml
 COPY vendor/ vendor/
