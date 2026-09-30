@@ -80,6 +80,8 @@
 //! format cases. The measured before/after table lives in `docs/config.md` and
 //! `CHANGELOG.md`.
 
+mod common;
+
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
@@ -103,9 +105,23 @@ impl Write for CapturedLogs {
     }
 }
 
+/// The one message the emit site is allowed to render for `reader` — the same
+/// three-way choice [`WebServerTlsEnableReader`] makes. Its `warning()` is
+/// crate-private, so the test restates the mapping; the dispatch assertions in
+/// `the_no_dashboard_build_names_no_dashboard_behaviour` are the independent
+/// witness that the emit site agrees with it.
+fn expected_warning(reader: WebServerTlsEnableReader) -> &'static str {
+    match reader {
+        WebServerTlsEnableReader::NoWebServer => WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD,
+        WebServerTlsEnableReader::WebServerNoTls => WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS,
+        WebServerTlsEnableReader::WebServerTls => WEB_SERVER_TLS_ENABLE_INERT_WARNING,
+    }
+}
+
 /// One captured load: the text emitted **during the load**, the text the
 /// `warn_inert_web_server_tls_enable` call appended (with its record count), the
-/// presence flag, and the effective cert/key pair.
+/// presence flag, the effective cert/key pair, and the full message the caller's
+/// answer selects.
 struct Captured {
     logged_during_load: String,
     warning_records: usize,
@@ -113,6 +129,7 @@ struct Captured {
     presence: ConfigPresence,
     cert: String,
     key: String,
+    expected: &'static str,
 }
 
 fn snapshot(output: &Arc<Mutex<Vec<u8>>>) -> String {
@@ -188,6 +205,7 @@ fn load_capturing_files_as(
         presence,
         cert,
         key,
+        expected: expected_warning(reader),
     }
 }
 
@@ -214,16 +232,16 @@ fn nested_web_server_tls_enable_warns_once_and_stays_inert() {
         "exactly one warning per load; got: {}",
         c.logged_by_warning_call
     );
-    assert!(
-        c.logged_by_warning_call.contains("cert_file")
-            && c.logged_by_warning_call.contains("key_file"),
-        "the warning names the pair that actually drives the dashboard TLS; got: {}",
-        c.logged_by_warning_call
-    );
-    assert!(
-        c.logged_by_warning_call.contains("plaintext HTTP"),
-        "with no pair the warning must say what the dashboard actually serves; got: {}",
-        c.logged_by_warning_call
+    // The **whole record**, not a substring of it: it names the pair that
+    // actually drives the dashboard TLS (`cert_file` + `key_file`) and what the
+    // dashboard serves without one (`plaintext HTTP`), and nothing may be
+    // appended to that message. The helper rejects the appended-clause mutant
+    // measured against the previous `contains` assertions.
+    common::assert_record_is_exactly_the_message(
+        "enable = true, no pair",
+        &c.logged_by_warning_call,
+        c.expected,
+        common::WARNING_TARGET,
     );
 
     // The four `enable`/pair combinations. Every one of them sets the flag and
@@ -349,6 +367,30 @@ fn the_no_dashboard_build_names_no_dashboard_behaviour() {
         }
     }
 
+    // Markers each variant alone may carry. The whole-constant loop above cannot
+    // see a **shared** marker phrase added to a third text — measured: appending
+    // `" no TLS support"` to the dashboard text survives it (no variant contains
+    // another whole text), while the emitted record would then claim another
+    // build's fact. So cross-check the markers themselves.
+    for (owner, marker) in [
+        ("dashboard", "cert_file"),
+        ("dashboard", "key_file"),
+        ("dashboard", "plaintext HTTP"),
+        ("no-tls", "no TLS support"),
+        ("no-dashboard", "no dashboard support"),
+        ("no-dashboard", "no dashboard HTTPS server is built"),
+    ] {
+        for (name, text) in texts {
+            if name != owner {
+                assert!(
+                    !text.contains(marker),
+                    "the {name} variant must not carry the {owner} variant's marker `{marker}`; \
+                     got: {text}"
+                );
+            }
+        }
+    }
+
     // Facts that only a build whose web server can serve HTTPS may state.
     for fact in ["cert_file", "key_file", "plaintext HTTP"] {
         assert!(
@@ -416,10 +458,14 @@ fn the_no_dashboard_build_names_no_dashboard_behaviour() {
             "{reader:?}: the presence flag must survive the load"
         );
         assert_eq!(c.warning_records, 1, "{reader:?}: exactly one record");
-        assert!(
-            c.logged_by_warning_call.contains(expected),
-            "{reader:?} must emit its own variant; got: {}",
-            c.logged_by_warning_call
+        // The record is exactly this variant's text — `contains(expected)` could
+        // not see a clause appended at the emit site or a literal injected
+        // before it, which is why the whole shape is pinned.
+        common::assert_record_is_exactly_the_message(
+            &format!("{reader:?}"),
+            &c.logged_by_warning_call,
+            expected,
+            common::WARNING_TARGET,
         );
         for other in absent {
             assert!(
@@ -434,7 +480,7 @@ fn the_no_dashboard_build_names_no_dashboard_behaviour() {
 /// The **third** text: a build that compiles a web server (so the no-dashboard
 /// text would be false) but not the `tls` feature that gates its acceptor (so
 /// the dashboard text would be false) — the `frpc --no-default-features
-/// --features admin` shape.
+/// --features micro,admin` shape.
 ///
 /// It must stay disjoint from both siblings, because the delivery pins dispatch
 /// on substrings: it names neither the `cert_file` + `key_file` pair nor

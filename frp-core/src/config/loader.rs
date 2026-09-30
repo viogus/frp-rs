@@ -348,7 +348,7 @@ pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD: &str = "web_server.t
 
 /// The same diagnostic for a build that compiles a **web server without the
 /// `tls` feature** that gates its HTTPS acceptor — `frpc` built
-/// `--no-default-features --features admin` (and its `micro,admin` tier). It is
+/// `--no-default-features --features micro,admin`. It is
 /// the third answer, and neither of the other two is true here: the dashboard
 /// clause would describe an acceptor this build never compiles (the pair is
 /// *discarded*, `frp-client/src/admin.rs`, the `not(feature = "tls")` arm),

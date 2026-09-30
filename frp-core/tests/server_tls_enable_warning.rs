@@ -72,6 +72,8 @@
 //! one. A change to either text is therefore only seen by the
 //! lane whose feature set selects it.
 
+mod common;
+
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
@@ -417,45 +419,13 @@ fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
     );
 }
 
-/// The emit site writes [`SERVER_TLS_ENABLE_INERT_WARNING`] and **nothing else**.
-///
-/// `contains(NEEDLE)` — the assertion this replaced — cannot see an appended
-/// clause: measured by appending `" but honestly"` to the
-/// `tracing::warn!` at `frp-core/src/config/loader.rs:680`, which left every
-/// `contains`/`fnv1a` assertion in this file green while the shipped record
-/// changed. So this pins the record's **tail** instead: the message must appear
-/// exactly once, only the one-line `tracing` prefix may precede it, and after it
-/// there may be a trailing newline and nothing else. That is a suffix check that
-/// tolerates only the prefix — it is not a `contains`, and a reworded, truncated
-/// or extended message fails it.
-///
-/// The prefix is not pinned byte for byte because `tracing_subscriber`'s fmt
-/// format owns it (level, target, optional ANSI); the guard is its shape, not its
-/// spelling.
-fn assert_record_is_exactly_the_message(tag: &str, record: &str) {
-    let want = SERVER_TLS_ENABLE_INERT_WARNING.as_str();
-    assert!(
-        record.contains(NEEDLE),
-        "{tag}: the record must carry the message; got: {record:?}"
-    );
-    assert_eq!(
-        record.match_indices(want).count(),
-        1,
-        "{tag}: the message must appear exactly once in the record; got: {record:?}"
-    );
-    let at = record.find(want).expect("checked just above");
-    let prefix = &record[..at];
-    let tail = &record[at + want.len()..];
-    assert!(
-        tail.is_empty() || tail == "\n",
-        "{tag}: the emit site appended bytes after the message (only a trailing newline is \
-         allowed); got tail: {tail:?} from record: {record:?}"
-    );
-    assert!(
-        prefix.contains("WARN") && !prefix.contains('\n'),
-        "{tag}: only the one-line tracing prefix may precede the message; got prefix: {prefix:?}"
-    );
-}
+// The record-shape pin lives in `frp-core/tests/common/mod.rs` so the sibling
+// `web_server` capture uses the *same* rule: the emit site writes
+// [`SERVER_TLS_ENABLE_INERT_WARNING`] and nothing else — the message once, only
+// the one-line `tracing` prefix before it, and after it no byte but an optional
+// trailing newline. `contains(NEEDLE)` cannot see an appended clause (measured by
+// appending `" but honestly"` to the `tracing::warn!` at
+// `frp-core/src/config/loader.rs:680`), which is why the tail is pinned there.
 
 /// A written `tls_enable`, in either value, is inert — so it warns, exactly
 /// once, in both strict modes, and the loader itself stays silent.
@@ -481,9 +451,11 @@ fn written_server_tls_enable_warns_once_and_stays_inert() {
             c.warning_records, 1,
             "strict={mode}, tls_enable={written}: exactly one record per load"
         );
-        assert_record_is_exactly_the_message(
+        common::assert_record_is_exactly_the_message(
             &format!("strict={mode}, tls_enable={written}"),
             &c.logged_by_warning_call,
+            SERVER_TLS_ENABLE_INERT_WARNING.as_str(),
+            common::WARNING_TARGET,
         );
         // The field really parses to the written value — it is inert because no
         // reader exists, not because the value is lost.
