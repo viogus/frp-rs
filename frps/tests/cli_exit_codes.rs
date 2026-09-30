@@ -40,6 +40,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_frps");
+
+/// Overridable binary, the same hook `frps/tests/warn_delivery.rs` carries: a
+/// falsification run points `FRPS_BIN` at a pre-fix build (`FRPS_BIN=<base>
+/// cargo test -p frps --test cli_exit_codes <pin>`), and the default is
+/// unchanged.
+fn bin() -> String {
+    std::env::var("FRPS_BIN").unwrap_or_else(|_| BIN.to_string())
+}
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The child's own **progress witness**: the SIGUSR1 task logs this line after
 /// its `tokio::signal::unix::signal` call returns (`frps/src/main.rs:207-215`),
@@ -107,7 +115,7 @@ fn try_wait_or_kill(child: &mut Child, what: &str) -> Option<std::process::ExitS
 }
 
 fn run_frps(args: &[&str]) -> Output {
-    let mut child = Command::new(BIN)
+    let mut child = Command::new(bin())
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -413,7 +421,7 @@ fn oidc_without_an_issuer_is_refused_with_3_where_go_panics() {
 fn start_listening_then_sigterm(args: &[&str], port: u16, dir: &TempDir) -> String {
     let log_path = dir.path("frps.log");
     let log = std::fs::File::create(&log_path).expect("create log");
-    let mut child: Child = Command::new(BIN)
+    let mut child: Child = Command::new(bin())
         .args(args)
         .stdout(std::process::Stdio::from(
             log.try_clone().expect("clone log"),
@@ -598,6 +606,87 @@ fn config_dir_where_every_service_fails_init_exits_like_dash_c() {
         stdout_of(&out),
         stderr_of(&out),
     );
+}
+
+/// The **run**-failure sibling of the pin above: a directory whose every file
+/// loads and constructs but whose services cannot start must not report success
+/// either. The fixture is [`valid_config`] — a token and a real port — with the
+/// port **held** ([`held_port`]), so `Service::run` fails on
+/// `Address already in use (os error 48)`; that is the shape the `-c` control
+/// exits 1 on (`EXIT_RUNTIME`, the single-config lane's mapping for any `run()`
+/// error).
+///
+/// At `9a0df13d` the lane counted only *construction* failures: a task whose
+/// `run()` failed reported `Ok(())`, so the exit guard's failure list stayed
+/// empty and `frps --config-dir` exited **0** with zero listeners — measured
+/// with `/tmp/frps-cfgdir-probe/probe-bind.py`: `-c` rc 1, `--config-dir` rc 0,
+/// `listener started` count 0.
+///
+/// The second half pins the **mixed** shape — one file that cannot be
+/// constructed (no `[auth].token`) plus one whose port is held — which also
+/// exited 0 with nothing listening. Both files are spawned, so the pair now
+/// exits on the first *spawned* failure's code; the assertion is deliberately
+/// "non-zero, nothing listening" rather than a specific code, because that code
+/// is the first spawned failure's, not the directory's single worst one (the
+/// guard's comment in `frps/src/main.rs` states the ordering).
+#[test]
+fn config_dir_where_every_service_fails_to_run_exits_like_dash_c() {
+    let (holder, port) = held_port();
+    let dir = TempDir::new();
+    let cfg = valid_config(&dir, port);
+    let conf_d = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    let file = conf_d.join("frps.toml");
+    std::fs::copy(&cfg, &file).expect("copy the held-port config into conf.d");
+    let file = file.to_str().expect("utf-8 temp path");
+
+    let control = run_frps(&["-c", file]);
+    assert_eq!(
+        control.status.code(),
+        Some(1),
+        "control: a config whose bindPort is held on `-c` must exit 1 \
+         (EXIT_RUNTIME); stdout={:?} stderr={:?}",
+        stdout_of(&control),
+        stderr_of(&control),
+    );
+
+    let out = run_frps(&["--config-dir", conf_d.to_str().expect("utf-8 temp path")]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "every file failing to run must exit on the same lane as `-c` (1), not 0; \
+         stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        !stdout_of(&out).contains("listener started"),
+        "no listener can start on a held port; stdout={:?}",
+        stdout_of(&out),
+    );
+    drop(holder);
+
+    // Mixed shape: one unconstructible file plus one whose port is held.
+    let (holder, port) = held_port();
+    let mixed = dir.0.join("mixed.d");
+    std::fs::create_dir_all(&mixed).expect("create mixed.d");
+    std::fs::write(mixed.join("a.toml"), format!("bindPort = {port}\n")).expect("write a.toml");
+    std::fs::copy(valid_config(&dir, port), mixed.join("b.toml")).expect("copy b.toml");
+    let mixed_out = run_frps(&["--config-dir", mixed.to_str().expect("utf-8 temp path")]);
+    let code = mixed_out.status.code();
+    assert!(
+        code.is_some_and(|c| c != 0),
+        "a directory where every spawned service failed must exit non-zero, got {code:?}; \
+         stdout={:?} stderr={:?}",
+        stdout_of(&mixed_out),
+        stderr_of(&mixed_out),
+    );
+    assert!(
+        !stdout_of(&mixed_out).contains("listener started"),
+        "no listener can start on a held port; stdout={:?}",
+        stdout_of(&mixed_out),
+    );
+    drop(holder);
 }
 
 /// The frp-rs space-separated `--strict-config` extension is made **loud** on

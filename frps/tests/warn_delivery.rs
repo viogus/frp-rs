@@ -237,6 +237,43 @@ impl Spawned {
         seen
     }
 
+    /// Send `SIGUSR1` and wait until the reload-summary count has grown by
+    /// `expect_extra`, then settle, snapshot and return the **total** count.
+    ///
+    /// The count-based sibling of [`Self::sigusr1_and_reload`]: with two
+    /// services one signal prints two summaries, and a presence wait would
+    /// return on the *previous* signal's line instead of the new ones.
+    fn sigusr1_and_wait_for_reloads(&mut self, expect_extra: usize) -> usize {
+        self.wait_for_marker(SIGNAL_READY_MARKER, RELOAD_READY_TIMEOUT);
+        let before = occurrences(&self.peek_streams(), RELOAD_MARKER);
+        let pid = self._guard.child.id();
+        let status = Command::new("kill")
+            .args(["-USR1", &pid.to_string()])
+            .status()
+            .expect("run kill -USR1");
+        assert!(status.success(), "kill -USR1 {pid} failed: {status}");
+        let deadline = Instant::now() + RELOAD_TIMEOUT;
+        while occurrences(&self.peek_streams(), RELOAD_MARKER) < before + expect_extra
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        std::thread::sleep(SETTLE);
+        self.snapshot();
+        occurrences(&self.streams(), RELOAD_MARKER)
+    }
+
+    /// Both streams concatenated: the reload summaries are `tracing` records,
+    /// and this file counts other markers on stdout alone — counting both keeps
+    /// this helper independent of which stream `tracing` is wired to.
+    fn peek_streams(&self) -> String {
+        format!("{}{}", self.peek_stdout(), self.peek_stderr())
+    }
+
+    fn streams(&self) -> String {
+        format!("{}{}", self.stdout(), self.stderr())
+    }
+
     /// Wait until either stream carries `marker`.
     fn wait_for_marker(&mut self, marker: &str, timeout: Duration) {
         assert!(
@@ -583,6 +620,51 @@ fn a_config_dir_process_survives_sigusr1_and_reloads() {
         spawned.is_alive(),
         "frps --config-dir must survive SIGUSR1, not take its default disposition\n\
          --- stdout ---\n{}",
+        spawned.stdout()
+    );
+}
+
+/// The fan-out pin: one `--config-dir` holding **two** config files, one
+/// signal — two reload summaries, and two more on the next signal. A regression
+/// that reloaded only `svcs.first()` (or dropped a registry entry) leaves the
+/// single-file test above green, so the count is the guard here. Reviewer 1
+/// measured the same shape by hand with two and three services
+/// (`summaries=2` after one signal, `4` after two; `3`/`6` with three) and the
+/// wording is byte-identical to `-c` (`SIGUSR1: config reloaded: no changes
+/// detected`), which the single-config pins already assert.
+#[test]
+fn a_config_dir_sigusr1_reloads_every_service() {
+    let dir = TempDir::new("cfgdir-fanout");
+    let sub = dir.0.join("conf.d");
+    std::fs::create_dir_all(&sub).expect("create config dir");
+    // Distinct ports per service — the default config binds each file's own
+    // `bindPort`, and two files sharing one port would fail one of them at
+    // startup rather than test the fan-out.
+    for name in ["a.toml", "b.toml"] {
+        let cfg = frps_config(free_port(), free_port(), Section::Nested);
+        std::fs::write(sub.join(name), &cfg).expect("write config");
+    }
+    let mut spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
+
+    let after_one = spawned.sigusr1_and_wait_for_reloads(2);
+    assert_eq!(
+        after_one,
+        2,
+        "one signal must reload both services (two summary lines), not just the first\n\
+         --- stdout ---\n{}",
+        spawned.stdout()
+    );
+    let after_two = spawned.sigusr1_and_wait_for_reloads(2);
+    assert_eq!(
+        after_two,
+        4,
+        "a second signal must reload both again (four summaries total)\n\
+         --- stdout ---\n{}",
+        spawned.stdout()
+    );
+    assert!(
+        spawned.is_alive(),
+        "frps --config-dir must survive repeated SIGUSR1\n--- stdout ---\n{}",
         spawned.stdout()
     );
 }
