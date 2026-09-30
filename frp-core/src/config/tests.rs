@@ -10795,14 +10795,23 @@ fn test_ini_yes_no_bool_inference() {
     assert!(!cfg.tcp_mux);
 }
 
-/// The load-path `--allow-unsafe` gate covers **both** client fields the daemon
-/// gates at construction: `auth.tokenSource` and `auth.oidc.tokenSource`
-/// (`frp-client/src/service.rs:936`/`:990`). Go's verdict for the OIDC spelling
-/// was **not** measured (a minimal load-valid OIDC config was not built), so the
-/// criterion pinned here is the daemon's own field set, not a Go row; the
-/// `auth.tokenSource` spelling is the one with a measured Go row (frps/frpc
-/// `verify` → rc 1, see `frps/tests/cli_exit_codes.rs` and
-/// `frpc/tests/cli_exit_codes.rs`).
+/// The load-path `--allow-unsafe` gate is fail-closed over **both** client
+/// fields the daemon can gate at construction: `auth.tokenSource` and
+/// `auth.oidc.tokenSource`. Go's verdict for the OIDC spelling is measured on
+/// v0.71.0: a minimal `[auth] method = "token"` config carrying
+/// `[auth.oidc.tokenSource] type = "exec"` makes `frpc verify` rc 1 with
+/// `unsafe feature "TokenSourceExec" is not enabled. …` and rc 0 once
+/// `--allow-unsafe TokenSourceExec` is passed (so that refusal *is* the gate);
+/// the `auth.tokenSource` spelling behaves the same (frps/frpc `verify` → rc 1,
+/// see `frps/tests/cli_exit_codes.rs` and `frpc/tests/cli_exit_codes.rs`).
+///
+/// The field *set* is the daemon's, but the *condition* is not: this gate
+/// refuses either spelling on `verify` regardless of `auth_method`, while the
+/// daemon gates `auth.tokenSource` unconditionally and `auth.oidc_token_source`
+/// only under `auth_method == AuthMethod::Oidc` (`frp-client/src/service.rs:988-991`)
+/// — measured, `frpc -c` on the `method = "token"` OIDC config above starts and
+/// logs its connection attempts where Go's `frpc -c` exits 1 on the gate line.
+/// The third loop arm pins the fail-closed condition.
 ///
 /// The configs are parsed with `toml::from_str` rather than through
 /// `load_client_config_with_presence*`, so the test pins the *gate's* field set
@@ -10810,7 +10819,8 @@ fn test_ini_yes_no_bool_inference() {
 /// `[auth.oidc] tokenSource` into `oidc_token_source`.
 ///
 /// Teeth: deleting `oidc_token_source` from `check_client_unsafe_features` makes
-/// the second loop arm fail (the `expect_err` returns `Ok(())`).
+/// the second and third loop arms fail (their `expect_err` returns `Ok(())`);
+/// narrowing that arm to `auth.method == "oidc"` fails only the third.
 #[test]
 fn check_client_unsafe_features_gates_both_token_source_spellings() {
     use crate::unsafe_features::{UnsafeFeatures, TOKEN_SOURCE_EXEC};
@@ -10847,12 +10857,34 @@ command = "/bin/echo"
 "#,
     )
     .expect("parse the auth.oidc tokenSource config");
+    // The same OIDC spelling under `method = "token"`: the daemon skips it
+    // (its `auth_method == AuthMethod::Oidc` branch), this gate must not.
+    let oidc_source_token_method: ClientConfig = toml::from_str(
+        r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[auth]
+method = "token"
+
+[auth.oidc_token_source]
+type = "exec"
+
+[auth.oidc_token_source.exec]
+command = "/bin/echo"
+"#,
+    )
+    .expect("parse the method=token auth.oidc tokenSource config");
 
     let blocked = UnsafeFeatures::new(&[]);
     let allowed = UnsafeFeatures::new(&[TOKEN_SOURCE_EXEC]);
     for (label, cfg) in [
         ("auth.tokenSource", &token_source),
         ("auth.oidc.tokenSource", &oidc_source),
+        (
+            "auth.oidc.tokenSource under method = \"token\"",
+            &oidc_source_token_method,
+        ),
     ] {
         let err = super::check_client_unsafe_features(cfg, &blocked)
             .expect_err(&format!("{label} exec must be refused without the feature"));
