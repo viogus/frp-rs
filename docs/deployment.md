@@ -856,6 +856,18 @@ What the walk does **not** reach, each cell measured on Go frp v0.71.0
   check every 2.0 s whether or not `_seconds = 99` is also set, `_seconds = 2`
   alone is ignored (one check, then the 10 s default), and `_s = 99` +
   `_seconds = 2` gives one check.
+  * **Consequence for an `.ini` extension table that names a port.** A section
+    the extension surface also reads (`[webServer]`, `[webServer.tls]`) is
+    collected as a proxy as soon as it carries `local_port`/`remote_port`, so
+    the extension keys in that section are dropped with it. Measured with
+    `[webServer] port = 7500` + `user = admin` + `local_port`/`remote_port`:
+    before this change the dashboard settings loaded and no proxy existed
+    (`webServer` port 7500, user `admin`, `Proxies: 0`); now the dashboard
+    settings are empty and one `webServer` `tcp` proxy exists, and a nested
+    `[webServer.tls] certFile`/`keyFile` is dropped the same way. Go registers
+    the header as a proxy in both shapes, so this is the Go-faithful side — keep
+    dashboard and nested-TLS settings in a section that carries no
+    `local_port`/`remote_port`.
   * **Divergence for a legacy-shaped section in a non-INI file.** Go's v1
     decoder rejects the *section name* outright, while frp-rs collects it into a
     proxy and (after this change) ignores the same key again. Measured on
