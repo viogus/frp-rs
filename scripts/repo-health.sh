@@ -265,13 +265,13 @@ def walk_error(e):
     note('%s: %s' % (getattr(e, 'filename', '?'), e.strerror or e))
 
 
-def rs_texts(root, top_only=False, within=None):
+def rs_texts(root, top_only=False, within=None, seen=None):
     """Yield the text of every `.rs` file under `root`, reading each with the
     O_NONBLOCK guard. `top_only` matches a `root/*.rs` glob (not a recursive
     grep): only the directory's own entries.
 
-    Two alias shapes are excluded. Each *real* file is yielded once per call,
-    keyed on `(st_dev, st_ino)` rather than on `os.path.realpath`: the walk
+    Two alias shapes are excluded. Each *real* file is yielded once per `seen`
+    set, keyed on `(st_dev, st_ino)` rather than on `os.path.realpath`: the walk
     still lists a symlinked `.rs` next to its target, and `os.stat` follows the
     link, so the inode key catches that *and* a hard link, which `realpath`
     cannot see (measured: `ln frp-core/src/kcp/session.rs frp-core/src/zz_hard.rs`
@@ -284,6 +284,18 @@ def rs_texts(root, top_only=False, within=None):
     Callers that measure two scopes (`<crate>/src` and the whole crate dir)
     call this once per scope, so the dedupe never crosses a scope boundary; each
     passes `within=<crate root>` so one crate's row cannot absorb another's file.
+
+    Within one scope the caller passes the *same* `seen` set for every crate, so
+    a **cross-crate hard link** is counted once. Containment cannot exclude that
+    shape — a hard link has no realpath in common with its twin and its own
+    directory entry is inside its own crate root — and each call's private set
+    used to let both crates claim it (measured: `ln frp-core/src/kcp/session.rs
+    frp-server/src/zz_hardlink.rs` moved frp-server `32/59146` -> `33/60978` at rc
+    0 while frp-core stayed `69/76510`). Ownership is a stated convention, since
+    a hard link has no "original" name: **the first crate in `CRATES` order
+    claims the inode**, so a link placed in a later crate is skipped rather than
+    attributed to it. A file excluded by `within` is *not* added to `seen`, so a
+    cross-crate symlink cannot mask the real file's own crate.
 
     A scope root that is itself a symlink yields nothing and is recorded as an
     error: `os.walk(root, ..., followlinks=False)` scandirs its own root, so
@@ -299,7 +311,8 @@ def rs_texts(root, top_only=False, within=None):
         note('%s: scope root is a symlink — not walked' % root)
         return
     within_real = os.path.realpath(within if within else root)
-    seen = set()
+    if seen is None:
+        seen = set()
 
     def fresh(path):
         # None = not this scope's file; otherwise the inode identity to dedupe
@@ -348,17 +361,25 @@ files = {c: 0 for c in CRATES}
 lines = {c: 0 for c in CRATES}
 safety = {c: 0 for c in GATED}
 testfuncs = testfiles = proptest = 0
+# One `seen` per scope, shared across the crate loop: a cross-crate hard link is
+# one file, and the first crate in `CRATES` order claims its inode. The two
+# scopes stay separate (a `<crate>/src` file is measured for files/lines/SAFETY
+# *and* re-read for test functions by the whole-crate scope, which is not a
+# duplicate). `frp-server/tests` below keeps its own set: it is a third,
+# top-level-only measurement of files the whole-crate scope already read.
+seen_src = set()
+seen_wide = set()
 for crate in CRATES:
     # The historical scopes differ: Code size and SAFETY cmts read <crate>/src,
     # while the test-function/proptest greps recursed over the whole crate dir
     # (so `tests/` and `benches/` count). Walk the two scopes separately: each
-    # `rs_texts` call owns its own `seen`, so a symlinked `.rs` is deduped
-    # *within* a scope. A single shared walk would let an alias outside `src/`
+    # scope's `seen` is shared across crates but never across scopes. A single
+    # shared walk would let an alias outside `src/`
     # (`ln -s src/kcp/session.rs frp-core/zz_alias.rs`) mask the real file and
     # then, being outside `src/`, attribute it to no scope at all.
     if not os.path.isdir(crate):
         continue
-    for p in rs_texts(os.path.join(crate, 'src'), within=crate):
+    for p in rs_texts(os.path.join(crate, 'src'), within=crate, seen=seen_src):
         try:
             text = safe_read(p)
         except OSError as e:
@@ -368,7 +389,7 @@ for crate in CRATES:
         lines[crate] += text.count('\n')
         if crate in safety:
             safety[crate] += text.count('// SAFETY')
-    for p in rs_texts(crate, within=crate):
+    for p in rs_texts(crate, within=crate, seen=seen_wide):
         try:
             text = safe_read(p)
         except OSError as e:
@@ -556,6 +577,10 @@ def walk_error(e):
     note('%s: %s' % (getattr(e, 'filename', '?'), e.strerror or e))
 
 
+# One `seen` for the whole crate loop: a cross-crate hard link is one file, and
+# the first crate in this scan order claims its inode (see `rs_texts` for why
+# ownership is a convention rather than a property of the file).
+seen = set()
 for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
     src = os.path.join(crate, 'src')
     if not os.path.isdir(src):
@@ -571,7 +596,6 @@ for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
         note('%s: scope root is a symlink — not walked' % src)
         continue
     blocks = fns = impls = 0
-    seen = set()
     # Dedupe on the inode (a symlink and a hard link to one source share it;
     # `realpath` misses the hard link) and keep this crate's row to files whose
     # realpath is inside the crate, so a cross-crate symlink is not counted here.
@@ -697,6 +721,8 @@ def walk_error(e):
     note('%s: %s' % (getattr(e, 'filename', '?'), e.strerror or e))
 
 
+# One `seen` for the whole crate loop, as in the unsafe-count walks above.
+seen = set()
 for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
     src = os.path.join(crate, 'src')
     if not os.path.isdir(src):
@@ -710,8 +736,8 @@ for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
         # rather than scan (and justify) whatever crate it points at.
         note('%s: scope root is a symlink — not walked' % src)
         continue
-    seen = set()
-    # Inode dedupe + own-crate scope, as in the unsafe-count walks above.
+    # Inode dedupe + own-crate scope, as in the unsafe-count walks above, with
+    # `seen` shared across the crate loop (the first crate claims a hard link).
     within_real = os.path.realpath(crate)
     for root, _dirs, files in os.walk(src, onerror=walk_error):
         for fn in files:
@@ -2230,7 +2256,7 @@ def n_group(path):
 # comment-stripped raw occurrence counts, so a doc comment that merely mentions
 # an attribute cannot inflate the figure (frp-core/src/mux.rs has such a
 # mention). Only frp-core and frp-vnet carry unsafe code.
-def unsafe_counts(crate):
+def unsafe_counts(crate, seen=None):
     src = os.path.join(crate, 'src')
     if not os.path.isdir(src):
         # A partial tree must not read as "0 unsafe blocks": the counts are
@@ -2243,10 +2269,13 @@ def unsafe_counts(crate):
         # Not `PartialTree(src)` alone — that would print "is missing" for a
         # directory that is present.
         raise PartialTree(src, detail='%s is a symlink (scope root refused)' % src)
-    blocks = fns = impls = n_rs = 0
-    seen = set()
+    blocks = fns = impls = n_present = 0
+    if seen is None:
+        seen = set()
     # Inode dedupe (`realpath` misses a hard link to the same source) + this
-    # crate's own scope, so a cross-crate symlink is another crate's file.
+    # crate's own scope, so a cross-crate symlink is another crate's file. The
+    # caller passes one `seen` for both crates, so a cross-crate hard link is
+    # claimed by the first crate (see `rs_texts` for the convention).
     within_real = os.path.realpath(crate)
     for root, _d, files in os.walk(src, onerror=walk_error):
         for fn in files:
@@ -2265,15 +2294,19 @@ def unsafe_counts(crate):
                     if not real.startswith(within_real + os.sep):
                         continue
                     key = (st.st_dev, st.st_ino)
+                # Counted before the shared dedupe: this is "the root carries a
+                # .rs file", which a link already claimed by the first crate
+                # must not make false (that would raise the misleading "no .rs
+                # files" partial tree for a populated directory).
+                n_present += 1
                 if key in seen:
                     continue
                 seen.add(key)
-                n_rs += 1
                 text = code_only(read_required(path, errors='ignore'))
                 blocks += len(re.findall(r'unsafe\s*\{', text))
                 fns += len(re.findall(r'unsafe fn', text))
                 impls += len(re.findall(r'unsafe impl', text))
-    if n_rs == 0 and not walk_errors:
+    if n_present == 0 and not walk_errors:
         # An emptied <crate>/src measures (0,0,0), which the CLAIMS below would
         # report as "the tree measures 0" — a false accusation against the docs.
         # A source directory with no .rs file is not the source those counts come
@@ -2284,9 +2317,10 @@ def unsafe_counts(crate):
         raise PartialTree(src, reason='no .rs files')
     return (blocks, fns, impls)
 
+u_seen = set()
 try:
-    u_core = unsafe_counts('frp-core')
-    u_vnet = unsafe_counts('frp-vnet')
+    u_core = unsafe_counts('frp-core', u_seen)
+    u_vnet = unsafe_counts('frp-vnet', u_seen)
 except PartialTree as e:
     report_partial([e])
 
