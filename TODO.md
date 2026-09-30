@@ -7608,8 +7608,8 @@ section; ledger now **24 open / 104 closed**.**
   the refusal is recorded as deliberate with this measurement), pinned in both loader modes.
 
 - [ ] **Four more test-precision residues the `test-precision-residue` round-2 reviews measured.**
-  Same class as `TODO.md:7205`: a test that pins less than its name claims, so a real regression
-  stays green.
+  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7191`): a
+  test that pins less than its name claims, so a real regression stays green.
   (a) The pinned warning bytes are the shipped static, but the **emitted** record is only
   substring-checked: `frp-core/tests/server_tls_enable_warning.rs:441` asserts
   `c.logged_by_warning_call.contains(NEEDLE)` (`NEEDLE` at `:93`), never equality against
