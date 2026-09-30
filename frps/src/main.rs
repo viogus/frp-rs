@@ -205,6 +205,14 @@ async fn run(mut cli: FrpsArgs) {
             files.len()
         );
         let mut handles = Vec::new();
+        // Each task publishes its `Arc<Service>` here once construction succeeds,
+        // so the SIGUSR1 handler below reloads the *same* objects the runners are
+        // using. A task still constructing has nothing to reload yet — and on
+        // `-c` a signal sent before the handler is installed still takes the
+        // default disposition, so that window is not new.
+        #[cfg(unix)]
+        let registry: std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<Service>>>> =
+            Default::default();
         for path in &files {
             let path_str = path.display().to_string();
             // Go frp v0.70.1 parity: with --config-dir each file is
@@ -221,14 +229,20 @@ async fn run(mut cli: FrpsArgs) {
                     // one-record-per-load rule.
                     presence.warn_inert_server_tls_enable();
                     let uf = unsafe_features.clone();
+                    #[cfg(unix)]
+                    let registry = registry.clone();
                     handles.push(tokio::spawn(async move {
                         let service = match Service::with_unsafe_features(cfg, Some(path_str.clone()), uf).await {
-                            Ok(s) => s,
+                            Ok(s) => std::sync::Arc::new(s),
                             Err(e) => {
                                 tracing::error!(path = %path_str, error = %e, "frps service init failed for [{}]: {}", path_str, e);
                                 return;
                             }
                         };
+                        // Registered before `run()`, so the soonest possible
+                        // SIGUSR1 already finds this service.
+                        #[cfg(unix)]
+                        registry.lock().unwrap().push(service.clone());
                         if let Err(e) = service.run().await {
                             tracing::error!(path = %path_str, error = %e, "frps service error for config file [{}]: {}", path_str, e);
                         }
@@ -243,11 +257,54 @@ async fn run(mut cli: FrpsArgs) {
             tracing::error!("No services started — all config files failed to load");
             process::exit(frp_core::EXIT_CONFIG);
         }
+
+        // SIGUSR1 reload handler (Unix only) — kill -USR1 <pid>, the same
+        // handler the single-config path installs below. One signal reloads
+        // every service built from the directory, each from its **own** config
+        // file (`Service::config_file` is that file's path), and each logs its
+        // own summary. Without this task the flag kept its default disposition
+        // and killed the process: measured on the base binary, `frps
+        // --config-dir <dir>` + `kill -USR1` exited `unix_wait_status(158)`
+        // (128+30, "User defined signal 1: 30") with no reload record.
+        #[cfg(unix)]
+        let reload_handle = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                {
+                    Ok(mut sig) => {
+                        tracing::info!(pid = %std::process::id(), "SIGUSR1 reload ready (pid={})", std::process::id());
+                        loop {
+                            sig.recv().await;
+                            // Copy the handles out and release the lock: the
+                            // reload awaits, and holding a std mutex across an
+                            // await would block registration (and duplicate the
+                            // service list).
+                            let svcs: Vec<std::sync::Arc<Service>> =
+                                { registry.lock().unwrap().clone() };
+                            for svc in &svcs {
+                                match svc.reload().await {
+                                    Ok(summary) => {
+                                        tracing::info!(summary = %summary, "SIGUSR1: {}", summary)
+                                    }
+                                    Err(e) => tracing::error!(error = %e, "SIGUSR1 reload: {}", e),
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "SIGUSR1 unavailable: {}", e),
+                }
+            })
+        };
+
         for handle in handles {
             if let Err(e) = handle.await {
                 tracing::error!(error = %e, "frps service task panicked: {}", e);
             }
         }
+
+        #[cfg(unix)]
+        reload_handle.abort();
         return;
     }
 

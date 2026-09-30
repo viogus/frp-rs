@@ -290,6 +290,13 @@ impl Spawned {
         self.stderr = self.peek_stderr();
     }
 
+    /// `true` while the child is still running. `Ok(None)` is the only
+    /// still-running answer; an already-exited child is reaped here and an OS
+    /// error means the child is gone too.
+    fn is_alive(&mut self) -> bool {
+        matches!(self._guard.child.try_wait(), Ok(None))
+    }
+
     fn peek_stdout(&self) -> String {
         self.stdout_buf.lock().unwrap().clone()
     }
@@ -545,6 +552,39 @@ fn web_server_tls_enable_warning_reaches_a_config_dir_user_with_the_common_spell
     std::fs::write(sub.join("frps.toml"), &cfg).expect("write config");
     let spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
     assert_one_warning_on_stdout("frps --config-dir ([common] spelling)", &spawned);
+}
+
+/// The `--config-dir` lane installs the **same** SIGUSR1 handler as `-c`, so the
+/// signal reloads every service built from the directory instead of killing the
+/// process. The defect this pins was a hard exit: on the base binary a
+/// `--config-dir` process that had logged its startup line died on `SIGUSR1`
+/// with `unix_wait_status(158)` (`128+30`, shell message "User defined signal 1:
+/// 30", measured by `/tmp/frps-cfgdir-probe/probe.sh`) and logged no summary.
+///
+/// The config is left **unchanged** across the signal, so the summary's wording
+/// (`config reloaded: no changes detected`) is not what is asserted — only that
+/// a summary arrived, i.e. that `Service::reload` ran on a process that is still
+/// alive afterwards.
+#[test]
+fn a_config_dir_process_survives_sigusr1_and_reloads() {
+    let dir = TempDir::new("cfgdir-reload");
+    let cfg = frps_config(free_port(), free_port(), Section::Nested);
+    let sub = dir.0.join("conf.d");
+    std::fs::create_dir_all(&sub).expect("create config dir");
+    std::fs::write(sub.join("frps.toml"), &cfg).expect("write config");
+    let mut spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
+
+    assert!(
+        spawned.sigusr1_and_reload(),
+        "the --config-dir reload never logged {RELOAD_MARKER:?}\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+    assert!(
+        spawned.is_alive(),
+        "frps --config-dir must survive SIGUSR1, not take its default disposition\n\
+         --- stdout ---\n{}",
+        spawned.stdout()
+    );
 }
 
 /// The reload is an in-process load with the sink already installed, so it gets
