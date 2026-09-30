@@ -2618,13 +2618,30 @@ fn ignored_config_dir() -> impl Parser<Option<String>> {
 /// flag through `ValidateServerConfig`/`ValidateClientConfig`: measured on
 /// v0.71.0, `frps verify -c <exec cfg>` is rc 1 without it and rc 0 with
 /// `--allow-unsafe TokenSourceExec`).
+///
+/// pflag's `strings` value **appends** on repetition and comma-splits every
+/// occurrence, so the parser is `.many()` plus a flatten. Measured on v0.71.0:
+/// `frps verify -c <exec cfg> --allow-unsafe WrongFeature --allow-unsafe
+/// TokenSourceExec` and the same argv with the two values swapped are both rc 0
+/// (and `--allow-unsafe Ignored,TokenSourceExec` is rc 0), i.e. an unrelated
+/// value in any position does not cancel the enabling one. Without `.many()`
+/// bpaf refuses the second occurrence with ``argument `--allow-unsafe` cannot be
+/// used multiple times in this context`` — rc 1 on `frps verify`, `frpc verify`
+/// and `frpc -c` alike, which is the divergence the repeated-flag rows of
+/// `frps/tests/cli_exit_codes.rs` and `frpc/tests/cli_exit_codes.rs` pin.
 fn allow_unsafe_parser() -> impl Parser<Vec<String>> {
     long("allow-unsafe")
         .long("allow_unsafe")
         .argument::<String>("FEATURES")
-        .map(|s| {
-            s.split(',')
-                .map(|x| x.trim().to_string())
+        .many()
+        .map(|values: Vec<String>| {
+            values
+                .into_iter()
+                .flat_map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .collect::<Vec<_>>()
+                })
                 .collect::<Vec<_>>()
         })
         .fallback(vec![])
@@ -5165,6 +5182,79 @@ mod tests {
                 "repeated {extra:?} refused"
             );
         }
+    }
+
+    #[test]
+    fn allow_unsafe_appends_and_comma_splits_on_every_reading_surface() {
+        // pflag's `strings` value **appends** on repetition — it is not
+        // last-wins — and Go comma-splits every occurrence. Measured on v0.71.0:
+        // `frps verify`/`frpc verify` exit 0 for both value orders (and for
+        // `Ignored,TokenSourceExec`), because any occurrence that enables
+        // `TokenSourceExec` is enough. A last-wins reading would let a later
+        // unrelated value cancel an earlier enabling one and so refuse a config
+        // Go accepts, which is exactly the regression this pins.
+        let verify = parse_frpc_verify(&[
+            "verify",
+            "-c",
+            "p7520.toml",
+            "--allow-unsafe",
+            "WrongFeature",
+            "--allow-unsafe",
+            "Ignored,TokenSourceExec",
+        ])
+        .unwrap();
+        assert_eq!(
+            verify.allow_unsafe,
+            ["WrongFeature", "Ignored", "TokenSourceExec"].map(String::from),
+            "a repeated `--allow-unsafe` must append in order and comma-split each occurrence"
+        );
+
+        let frps_verify = parse_frps_verify(&[
+            "verify",
+            "-c",
+            "p7520.toml",
+            "--allow-unsafe",
+            "TokenSourceExec",
+            "--allow-unsafe",
+            "WrongFeature",
+        ])
+        .unwrap();
+        assert_eq!(
+            frps_verify.allow_unsafe,
+            ["TokenSourceExec", "WrongFeature"].map(String::from),
+            "the frps verify surface reads the same value and must append too"
+        );
+
+        // Both run paths read the value as well (the construction gate consumes
+        // it), and Go accepts the repetition there: measured, `frps -c <exec
+        // cfg> --allow-unsafe WrongFeature --allow-unsafe TokenSourceExec`
+        // starts and logs its listener.
+        let run = parse_frpc_run(&[
+            "-c",
+            "p7520.toml",
+            "--allow-unsafe",
+            "WrongFeature",
+            "--allow-unsafe",
+            "TokenSourceExec",
+        ])
+        .unwrap();
+        assert_eq!(
+            run.allow_unsafe,
+            ["WrongFeature", "TokenSourceExec"].map(String::from)
+        );
+        let frps_run = parse_frps(&[
+            "-c",
+            "p7520.toml",
+            "--allow-unsafe",
+            "WrongFeature",
+            "--allow-unsafe",
+            "TokenSourceExec",
+        ])
+        .unwrap();
+        assert_eq!(
+            frps_run.allow_unsafe,
+            ["WrongFeature", "TokenSourceExec"].map(String::from)
+        );
     }
 
     #[test]

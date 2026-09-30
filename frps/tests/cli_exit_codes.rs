@@ -275,6 +275,9 @@ fn unresolvable_token_source_exits_3_where_go_exits_1() {
 /// | `frps verify -c <exec cfg>` | rc 1, stdout `unsafe feature "TokenSourceExec" is not enabled. To enable it, ensure it is allowed in the configuration or command line flags`, stderr 0 B | rc 0, `syntax is ok` |
 /// | `frps verify … --allow-unsafe TokenSourceExec` | rc 0, `frps: the configuration file <p> syntax is ok` | rc 0 (the gate was never run) |
 /// | `frps verify … --allow-unsafe WrongFeature` | rc 1 (fail-closed) | rc 0 (fail-open) |
+/// | `frps verify … --allow-unsafe WrongFeature --allow-unsafe TokenSourceExec` | rc 0 (pflag `strings` appends) | rc 1 — bpaf refused the second occurrence |
+/// | `frps verify … --allow-unsafe TokenSourceExec --allow-unsafe WrongFeature` | rc 0 (a later unrelated value does not cancel an earlier enabling one) | rc 1 |
+/// | `frps verify … --allow-unsafe Ignored,TokenSourceExec` | rc 0 (each occurrence is comma-split) | rc 0 |
 /// | `frps -c <exec cfg>` (run) | rc 1, the same stdout line | rc 3, `EXIT_AUTH` |
 ///
 /// frp-rs's wording stays its own predicate message; what is pinned is the
@@ -353,6 +356,44 @@ fn verify_runs_the_post_load_allow_unsafe_gate_like_go() {
         stdout_of(&wrong),
         stderr_of(&wrong),
     );
+
+    // pflag's `strings` **appends** on repetition and comma-splits every
+    // occurrence, so Go's verify honours all three spellings below (measured
+    // rc 0 on v0.71.0 for each, in both value orders). The `TokenSourceExec`-first
+    // row is what separates appending from a last-wins reading.
+    for extra in [
+        vec![
+            "--allow-unsafe",
+            "WrongFeature",
+            "--allow-unsafe",
+            "TokenSourceExec",
+        ],
+        vec![
+            "--allow-unsafe",
+            "TokenSourceExec",
+            "--allow-unsafe",
+            "WrongFeature",
+        ],
+        vec!["--allow-unsafe", "Ignored,TokenSourceExec"],
+    ] {
+        let mut argv = vec!["verify", "-c", cfg.as_str()];
+        argv.extend(extra.iter().copied());
+        let repeated = run_frps(&argv);
+        assert_eq!(
+            repeated.status.code(),
+            Some(0),
+            "Go accepts `--allow-unsafe {extra:?}` on verify (measured rc 0): a repeated \
+             pflag `strings` appends and each occurrence is comma-split; stdout={:?} stderr={:?}",
+            stdout_of(&repeated),
+            stderr_of(&repeated),
+        );
+        assert_eq!(
+            stdout_of(&repeated),
+            format!("frps: the configuration file {cfg} syntax is ok\n"),
+            "the accepted repeat keeps Go's success line and empty stderr; stderr={:?}",
+            stderr_of(&repeated),
+        );
+    }
 
     // The run path is untouched: the same config is still refused by
     // construction with the typed EXIT_AUTH/3, not by the loader.
