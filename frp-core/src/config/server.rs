@@ -442,9 +442,10 @@ impl ServerConfig {
         // `level = ""` → `info`, `to = ""` → `console`, `max_days = 0` → `3`.
         // Measured with `-c` on a config `bindPort = 17532`,
         // `[auth] token = "rev427token"`, `[log] level = ""`: both binaries then
-        // log at `info` — frp-rs 1473 B ANSI-stripped / 11 `INFO` records, Go
-        // 238 B / 1 `[I]` record — reached on the Go side through
-        // `pkg/config/load.go:318-321`, since `-c` bypasses its pflag struct.
+        // log at `info` — frp-rs 11 `INFO` records, Go **3** `[I]` records
+        // (271 B raw stdout / 238 B ANSI-stripped, 0 B stderr) — reached on the
+        // Go side through `pkg/config/load.go:318-321`, since `-c` bypasses its
+        // pflag struct.
         //
         // The CLI arm no longer arrives here as a zero either:
         // `override_server_config` skips an empty `--log-level`/`--log-file` and

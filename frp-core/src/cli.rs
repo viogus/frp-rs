@@ -4474,13 +4474,14 @@ mod tests {
     /// (`frp-core/src/config/server.rs`). Writing them through this override
     /// therefore silently **raised** a config file's explicit
     /// `[log] level = "warn"` back to `info` on the one lane that applies
-    /// overrides — measured at the parent commit, frps run with `frps.toml`
-    /// (`[log] level = "warn"`) in the cwd and no `-c`: `--log-level ""`
-    /// resolved to `info` (11 `INFO` records) where no flag gave 0. That
-    /// resolved-`info` output is the one this head binary still prints for
-    /// `--log-level info` on the same lane: **1473 B** of ANSI-stripped stdout
-    /// (**2412 B** raw), 11 `INFO` records, config `bindPort = 17531`,
-    /// `[auth] token = "rev427token"`, `[log] level = "warn"`.
+    /// overrides — on the pre-fix revision `3f66d823` (before `a75c79eb`),
+    /// frps run with `frps.toml` (`[log] level = "warn"`) in the cwd and no
+    /// `-c`: the empty flag was written into `[log] level` and completed to
+    /// `info`, so `--log-level ""` resolved to `info` (11 `INFO` records) where
+    /// no flag gave 0. That resolved-`info` output is the one this head binary
+    /// still prints for `--log-level info` on the same lane: 11 `INFO` records,
+    /// config `bindPort = 17531`, `[auth] token = "rev427token"`,
+    /// `[log] level = "warn"`.
     /// Go v0.71.0 has no parity to claim on the *non-empty* value — with `-c`
     /// it discards the pflag-bound struct, so its file's `warn` survives an
     /// absent, empty **or** non-empty `--log-level` (0 records in all three) —
@@ -4490,7 +4491,7 @@ mod tests {
     /// `frpc`, which never overlays, honoured the file throughout. The resolvers
     /// already model the zero values as absent for both binaries
     /// (`resolve_log_level`/`resolve_log_file`/`resolve_log_max_days`,
-    /// `frp-core/src/logging.rs:90`, `:125`, `:180`).
+    /// `frp-core/src/logging.rs:97`, `:134`, `:189`).
     #[test]
     fn log_flag_zero_values_do_not_override_the_config_file() {
         let mut cfg = crate::config::ServerConfig::default();

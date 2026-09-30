@@ -20,9 +20,13 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// its default (`pkg/config/flags.go:161` registers `--log_level` with
 /// `"info"`), so `--log_level ""` leaves the struct empty and
 /// `LogConfig.Complete()`'s `util.EmptyOr(c.Level, "info")`
-/// (`pkg/config/v1/common.go:121`) fills it — measured on Go v0.71.0, where
-/// `frps --log-level ""` still logs its 3 startup `INFO` lines (282 B on stdout,
-/// 0 B stderr, listener up — flags-only lane). Treating `Some("")` as a value
+/// (`pkg/config/v1/common.go:121`) fills it — measured on Go v0.71.0's
+/// flags-only lane, where `frps --log_level ""` (no config file) still starts
+/// the server and logs its **3 `[I]` records**: 282 B raw stdout / 249 B
+/// ANSI-stripped, 0 B stderr on a free port. With the default port 7000 already
+/// occupied on this host that lane instead exits 1 after a single `[I]` record
+/// (186 B raw / 175 B stripped, then `create server listener error, listen tcp
+/// 0.0.0.0:7000: bind: address already in use`). Treating `Some("")` as a value
 /// instead routed the empty string to `parse_level`, where
 /// `LevelFilter::from_str("")` is `Ok(ERROR)` — tracing-core 0.1.36 maps the
 /// empty string to `ERROR` (`metadata.rs:798`) — and every startup record is
@@ -43,12 +47,15 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// (`frp-core/src/config/server.rs`) would otherwise fill the overlaid zero to
 /// Go's zero value (`info`/`console`/`3`) and *raise* a file's explicit `warn`.
 /// Before that skip the two binaries disagreed whenever the file set a
-/// non-default `level`: on the implicit `./frps.toml` lane, parent-commit `frps`
-/// resolved `--log-level ""` to `info` (0 records with no flag, 11 `INFO`
-/// records with the empty flag), while `frpc` honoured the file. That resolved
-/// `info` output is what this head binary still prints for `--log-level info` on
-/// the same lane — **1473 B** of ANSI-stripped stdout (**2412 B** raw), 11
-/// `INFO` records — with config `bindPort = 17531`,
+/// non-default `level`: on the implicit `./frps.toml` lane, `frps` **before
+/// `a75c79eb`** wrote the empty flag into `[log] level` (`override_server_config`
+/// took every `Some`, empty or not) and `LogConfig::complete` then filled it to
+/// `"info"`, so `--log-level ""` produced 11 `INFO` records where no flag gave
+/// 0, while `frpc` honoured the file. That resolved-`info` output is what this
+/// head binary still prints for `--log-level info` on the same lane: **11 `INFO`
+/// records** (1471 B ANSI-stripped / 2410 B raw — the
+/// `SIGUSR1 reload ready (pid=…)` record names the pid twice, so each extra pid
+/// digit adds 2 B) with config `bindPort = 17531`,
 /// `[auth] token = "rev427token"`, `[log] level = "warn"`.
 ///
 /// **Go v0.71.0 has no disagreement to copy on the *empty* value.** With `-c`
@@ -60,8 +67,8 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// `-c frps.toml --log-level info` alike. Go's only lane that completes an empty
 /// level to `info` is the flags-only one: `frps --log_level ""` with no config
 /// file fills `""` → `info` (`util.EmptyOr(Level, "info")`,
-/// `pkg/config/v1/common.go:121`) and logs 1 `[I]` record (186 B; the record is
-/// `frps uses command line arguments for config`). frp-rs has no counterpart
+/// `pkg/config/v1/common.go:121`) and logs the 3 `[I]` records quoted above, the
+/// first being `frps uses command line arguments for config`. frp-rs has no counterpart
 /// lane — without `-c` it still reads `./frps.toml` (a missing file exits 1),
 /// and `--config-dir` takes the `init_logging(&cli, None)` path
 /// (`frps/src/main.rs:193`). `frpc`'s Go run path binds no `--log-level` flag at
@@ -70,8 +77,8 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 ///
 /// **Known open divergence (R1), not parity.** The *non-empty* CLI value on the
 /// `-c` lane still does not match Go: on the config above,
-/// `frps -c frps.toml --log-level info` prints 11 `INFO` records (1473 B
-/// ANSI-stripped / 2412 B raw) where Go prints **0**. frp-rs gates only
+/// `frps -c frps.toml --log-level info` prints 11 `INFO` records where Go
+/// prints **0**. frp-rs gates only
 /// `override_server_config` on `cli_overrides_enabled`
 /// (`frps/src/main.rs:451-452`), while `init_logging` (`:456`, body at `:118`)
 /// still reads the raw CLI value. That is pre-existing and is *not* what this
@@ -113,7 +120,9 @@ pub fn resolve_log_level(
 /// 0 B stderr **and** a `frps.log.<date>` created in the CWD, because the empty
 /// path reached `tracing_appender::rolling::daily` (whose `file_name()` is
 /// `None`, so it fell back to the default log name). Go v0.71.0 with
-/// `--log-file ""` logs on stdout (282 B, 0 B stderr).
+/// `--log_file ""` on the flags-only lane also logs on stdout — `""` is filled
+/// to `console` by the same `Complete()` (`pkg/config/v1/common.go:120`) —
+/// measured as 3 `[I]` records / 282 B raw / 0 B stderr on a free port.
 ///
 /// Only the **CLI** value is filtered. An empty *config* value was already
 /// resolved to `console` by this function before the completion existed (the
@@ -159,8 +168,8 @@ pub fn resolve_log_file(cli_file: Option<String>, cfg_file: &str) -> Option<Stri
 /// `pkg/util/log/log.go:53-58` constructs the writer with
 /// `Mode: RotateFileModeDaily` and calls only `Init()`, so **Go's cleanup is
 /// midnight-only and never runs at startup** — no bounded probe can observe a
-/// `MaxDays` difference on the Go binary, and the Go row above (282 B / 3
-/// records) cannot discriminate this field. The corollary is worth recording:
+/// `MaxDays` difference on the Go binary, and the Go flags-only row above
+/// (3 `[I]` records) cannot discriminate this field. The corollary is worth recording:
 /// frp-rs's synchronous startup sweep is itself a pre-existing *timing*
 /// divergence from Go, which is what makes the aged-file method work against
 /// frp-rs and not against Go. `clearFiles()` also returns early when
