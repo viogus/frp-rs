@@ -2314,14 +2314,28 @@ fn verify_accepts_vhost_http_timeout_both_spellings_and_prints_go_line() {
             stderr_of(&out),
         );
     }
+}
 
-    // Signed rows on the same surface. Go's flag is `Int64VarP`
-    // (`pkg/config/flags.go:237`) and its config field is `int64`, so a negative
-    // value is accepted (`verify` ignores it) and only a value outside `int64` is
-    // refused. Measured on Go v0.71.0, streams separated, rc read from the child:
-    // `-1` and `-9223372036854775808` rc **0** with the same success line;
-    // `9223372036854775808` and `9999999999999999999` rc **1** on stderr
-    // (`strconv.ParseInt: … value out of range`) with 0 bytes on stdout.
+/// Signed `int64` rows on the same `verify` surface. Go's flag is `Int64VarP`
+/// (`pkg/config/flags.go:237`) and its config field is `int64`, so a negative
+/// value is accepted (`verify` ignores it) and only a value outside `int64` is
+/// refused. Measured on Go v0.71.0, streams separated, rc read from the child:
+/// `-1` and `-9223372036854775808` rc **0** with the same success line;
+/// `9223372036854775808` and `9999999999999999999` rc **1** on stderr
+/// (`strconv.ParseInt: … value out of range`) with 0 bytes on stdout.
+///
+/// This is a separate `#[test]` from
+/// `verify_accepts_vhost_http_timeout_both_spellings_and_prints_go_line` so the
+/// `FRPS_CLI_TESTS` count guard in `.github/workflows/ci.yml` covers these rows:
+/// a count guard counts test functions, so rows folded into another function can
+/// be deleted without moving the count. The config's `bindPort` is held for the
+/// whole run, as in `verify_valid_config_prints_go_line_and_exits_0`.
+#[test]
+fn verify_handles_vhost_http_timeout_go_signed_int64_range() {
+    let (_held, port) = held_port();
+    let dir = TempDir::new();
+    let cfg = valid_config(&dir, port);
+
     for value in ["-1", "-9223372036854775808", "9223372036854775807"] {
         let out = run_frps(&["verify", "--vhost-http-timeout", value, "-c", &cfg]);
         assert_eq!(

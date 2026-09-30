@@ -31,31 +31,54 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// `LogConfig::complete` (`frp-core/src/config/server.rs`) for the config-side
 /// half of the same fill.
 ///
-/// Where the fall-through reaches is the same on both binaries: an empty CLI
+/// Where the fall-through *reaches* is the same on both binaries: an empty CLI
 /// value counts as *not supplied*, so the config file's `level` wins whether the
 /// caller is `frps` or `frpc`, and the built-in default applies only when no
-/// config file supplied one. `frps` is the only binary that overlays its CLI
-/// flags onto the loaded config (`FrpsArgs::override_server_config`), and that
-/// overlay now skips the same zero values this function filters — an empty
-/// `--log-level`/`--log-file` and a zero `--log-max-days` — because
-/// `LogConfig::complete` (`frp-core/src/config/server.rs`) would otherwise fill
-/// the overlaid zero to Go's zero value (`info`/`console`/`3`) and *raise* a
-/// file's explicit `warn`. Before that filter the two binaries disagreed
-/// whenever the file set a non-default `level`: measured at the parent commit
-/// with `[log] level = "warn"` and no `-c`, `frps` produced 0 B / 0 records with
-/// no flag but **2412 B / 11 `INFO` records** with `--log-level ""`, while
-/// `frpc` honoured the file (0 `INFO` in every shape measured).
+/// config file supplied one.
 ///
-/// Go v0.71.0 has no disagreement to copy: its file-backed lane (`-c <file>`,
-/// same `[log] level = "warn"`) emits **0 records** with no flag, with
-/// `--log-level ""` and with `--log-level info` on both binaries, because `-c`
-/// discards the pflag-bound struct (`pkg/config/load.go:313,318-321`); its
-/// flags-only lane (`frps --log-level ""`, no config file) completes the empty
-/// value to `info` (`util.EmptyOr(Level, "info")`, `pkg/config/v1/common.go:121`)
-/// — measured: 186 B / 1 `[I]` record, listener up. `frpc`'s run path has no
-/// `--log-level` flag at all (Go v0.71.0: `Error: unknown flag: --log-level`,
-/// rc 1, 1343 B stderr), so the two binaries can be compared on the value they
-/// resolve but not on the flag surface. Pinned by
+/// `frps` is the only binary that overlays its CLI flags onto the loaded config
+/// (`FrpsArgs::override_server_config`), and that overlay now skips the same
+/// zero values this function filters — an empty `--log-level`/`--log-file` and
+/// a zero `--log-max-days` — because `LogConfig::complete`
+/// (`frp-core/src/config/server.rs`) would otherwise fill the overlaid zero to
+/// Go's zero value (`info`/`console`/`3`) and *raise* a file's explicit `warn`.
+/// Before that skip the two binaries disagreed whenever the file set a
+/// non-default `level`: on the implicit `./frps.toml` lane, parent-commit `frps`
+/// resolved `--log-level ""` to `info` (0 records with no flag, 11 `INFO`
+/// records with the empty flag), while `frpc` honoured the file. That resolved
+/// `info` output is what this head binary still prints for `--log-level info` on
+/// the same lane — **1473 B** of ANSI-stripped stdout (**2412 B** raw), 11
+/// `INFO` records — with config `bindPort = 17531`,
+/// `[auth] token = "rev427token"`, `[log] level = "warn"`.
+///
+/// **Go v0.71.0 has no disagreement to copy on the *empty* value.** With `-c`
+/// Go discards the pflag-bound struct entirely (`cmd/frps/root.go:67-83`: the
+/// `serverCfg` the flags were bound onto never reaches `runServer`), completing
+/// the file's own struct instead (`pkg/config/load.go:313,318-321`) — which is
+/// why the Go binary prints **0 records** on the config above for
+/// `-c frps.toml`, `-c frps.toml --log-level ""` and even
+/// `-c frps.toml --log-level info` alike. Go's only lane that completes an empty
+/// level to `info` is the flags-only one: `frps --log_level ""` with no config
+/// file fills `""` → `info` (`util.EmptyOr(Level, "info")`,
+/// `pkg/config/v1/common.go:121`) and logs 1 `[I]` record (186 B; the record is
+/// `frps uses command line arguments for config`). frp-rs has no counterpart
+/// lane — without `-c` it still reads `./frps.toml` (a missing file exits 1),
+/// and `--config-dir` takes the `init_logging(&cli, None)` path
+/// (`frps/src/main.rs:193`). `frpc`'s Go run path binds no `--log-level` flag at
+/// all (`Error: unknown flag: --log-level`, rc 1), so the two binaries can be
+/// compared on the value they resolve but not on the flag surface.
+///
+/// **Known open divergence (R1), not parity.** The *non-empty* CLI value on the
+/// `-c` lane still does not match Go: on the config above,
+/// `frps -c frps.toml --log-level info` prints 11 `INFO` records (1473 B
+/// ANSI-stripped / 2412 B raw) where Go prints **0**. frp-rs gates only
+/// `override_server_config` on `cli_overrides_enabled`
+/// (`frps/src/main.rs:451-452`), while `init_logging` (`:456`, body at `:118`)
+/// still reads the raw CLI value. That is pre-existing and is *not* what this
+/// function's zero-value filter fixes — the empty-value rows are the ones that
+/// now agree.
+///
+/// Pinned by
 /// `frp-core/src/cli.rs::log_flag_zero_values_do_not_override_the_config_file`
 /// and
 /// `frps/tests/cli_completion.rs::cli_empty_log_level_keeps_the_config_files_level`.
