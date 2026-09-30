@@ -354,6 +354,12 @@ fn frpc_config(admin_port: u16, extra: &str) -> String {
 /// The key's section, as a config fragment.
 const ENABLE: &str = "[web_server.tls]\nenable = true\n";
 
+/// A proxy whose `local_port` is distinctive, so a GET body proves **which**
+/// file answered: only the `-c` file of sub-case (d) declares it, while the cwd
+/// file there holds no proxies at all.
+const MAIN_PROXY: &str =
+    "\n[[proxies]]\nname = \"main\"\ntype = \"tcp\"\nlocalPort = 45999\nremotePort = 45999\n";
+
 /// The headline behaviour change of the seeding round: a hand-edit that **adds**
 /// `[web_server.tls] enable` after the admin server has started is reported by
 /// the next admin config GET.
@@ -568,10 +574,16 @@ fn seed_resolves_spellings_only_the_loader_does() {
     //     record, 2 vs 1); this row is what catches the narrower "prefer the cwd
     //     file only when it sets the key" fallback, which (c) cannot see because
     //     there the cwd file does *not* set the key.
+    //
+    //     The `-c` file also declares the only `main` proxy (distinctive
+    //     `local_port = 45999`); the cwd file declares none. So the GET body, not
+    //     just the record count, says which file answered: a load that preferred
+    //     the proxy-less cwd file still emits the same single record, but answers
+    //     `404 proxy "main" not found` instead of describing the proxy.
     let dir = TempDir::new("loader-precedence");
     let admin_port = free_port();
     dir.write("frpc.toml", &frpc_config(admin_port, ENABLE));
-    let cfg = dir.write("admin-node.toml", &frpc_config(admin_port, ""));
+    let cfg = dir.write("admin-node.toml", &frpc_config(admin_port, MAIN_PROXY));
     let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()]);
     assert_eq!(
         child.records(),
@@ -581,12 +593,24 @@ fn seed_resolves_spellings_only_the_loader_does() {
     );
 
     // The hand-edit lands in the `-c` file, not in the cwd one, so only a seed
-    // that actually read the `-c` file sees the change.
-    std::fs::write(&cfg, frpc_config(admin_port, ENABLE)).expect("hand-edit the -c file");
+    // that actually read the `-c` file sees the change. It keeps the proxy.
+    std::fs::write(
+        &cfg,
+        frpc_config(admin_port, &format!("{MAIN_PROXY}{ENABLE}")),
+    )
+    .expect("hand-edit the -c file");
     let response = admin_get(admin_port, "(d) precedence");
     assert!(
         response.contains("HTTP/1."),
         "the admin route must answer, got {response:?}"
     );
     child.assert_records(1, "(d) one GET after the `-c` file gains the key");
+    // Provenance, not just the count: `main` exists only in the `-c` file, so a
+    // body describing it can only have come from there.
+    assert!(
+        response.contains("\"local_port\":45999"),
+        "(d) the GET body must describe the `main` proxy declared in the `-c` file \
+         — a load that read the proxy-less cwd ./frpc.toml answers 404 instead\n\
+         --- response ---\n{response}"
+    );
 }
