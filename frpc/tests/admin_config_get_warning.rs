@@ -17,6 +17,8 @@
 //! | `hand_edit_after_startup_is_reported` | no `enable` | add `enable` | 1 | **1** |
 //! | `startup_record_is_not_repeated_by_a_get` | has `enable` | — | 3 | **1** (startup only) |
 //! | `seed_reads_the_file_non_strictly` | no `enable` + an unknown field, `--strict-config=false` | add `enable` | 1 | **1** |
+//! | `seed_resolves_spellings_only_the_loader_does` (a/b) | `[common]` / `includes` spelling | — | 3 | **1** (startup only) |
+//! | the same test's (c) | key in `admin-node.toml`, a key-less `frpc.toml` in the cwd | — | 3 | **1** (startup only) |
 //!
 //! **The strict-flag row.** `seed_web_server_tls_enable_seen` loads with
 //! `strict = false`, deliberately: the admin GET itself
@@ -42,12 +44,15 @@
 //! `frp-core/tests/web_server_tls_enable_warning.rs`), the PUT path's cell reset
 //! (in-process, `admin_config_get_warns_once_per_state_change`), the admin API's
 //! routing/auth/status codes (`frpc/tests/admin_cli.rs`), and the seed's
-//! **failure-mode mapping** — that a missing path or an unreadable file yields
-//! `NO_BASELINE` rather than `ABSENT` is asserted in-process by that same test's
-//! two `seed_web_server_tls_enable_seen(…) == WS_TLS_ENABLE_NO_BASELINE` cases
-//! (`None`, and a path that does not exist), which are red if `.unwrap_or` maps
-//! to `ABSENT`; this target only ever exercises readable files. It also does not
-//! pin the *cadence* of any particular poller beyond "three GETs add nothing".
+//! **failure-mode mapping** — that a missing path yields `NO_BASELINE` rather
+//! than `ABSENT` is asserted in-process by that same test's two
+//! `seed_web_server_tls_enable_seen(…) == WS_TLS_ENABLE_NO_BASELINE` cases
+//! (`None`, then a path that does not exist). Under a `.unwrap_or(ABSENT)` mutant
+//! **this** target stays green while the in-process one reds on the `None` case
+//! (`frp-client/src/admin.rs:2044`), so the missing-path case is never reached;
+//! either way the mapping is caught in-process, not here — this target only ever
+//! exercises readable files. It also does not pin the *cadence* of any
+//! particular poller beyond "three GETs add nothing".
 //!
 //! Bounded: every wait has a deadline, every child is killed and reaped by
 //! [`ChildGuard::drop`] even on panic, and each test picks its own ports from the
@@ -461,11 +466,18 @@ fn seed_reads_the_file_non_strictly() {
 ///
 /// That distinction is invisible to the rows above: a seed that only looked at
 /// `web_server.tls.enable` / `webServer.tls.enable` **at the top level** passes
-/// them all, while the shipped dedup breaks for the two shapes here — the key
-/// arrives through the `[common]` flatten and the per-key section merge, or
-/// through an `includes` file, and only the loader resolves either. Measured on
-/// the shipped binary before this row existed: both shapes emit **1** record at
-/// 0 GETs and still **1** after 3.
+/// them all, while the shipped seed resolves both shapes here — the key sits
+/// under `[common]`, in either spelling, or in an `includes` file. Neither shape
+/// reaches a raw top-level parse: `process_includes` deep-merges the include
+/// (`frp-core/src/config/normalize.rs:600`) and the presence detector
+/// (`ConfigPresence::web_server_tls_enable_set_in`) reads the value **before**
+/// `normalize` (`frp-core/src/config/normalize.rs:621`), with its own "top level
+/// first, `[common]` second" fallback per spelling
+/// (`frp-core/src/config/loader.rs:409-411`). The per-key section merge
+/// (`merge_section_into`) runs inside `normalize`, so it is not what the flag
+/// consults — the merge has its own frp-core pin. Measured on the shipped binary
+/// before this row existed: both shapes emit **1** record at 0 GETs and still
+/// **1** after 3.
 ///
 /// Each sub-case asserts the no-duplicate property: the file wrote the key (so
 /// the startup load emits one record — asserted first, which is also what proves
@@ -476,13 +488,16 @@ fn seed_reads_the_file_non_strictly() {
 /// **What this does not cover.** The presence detector's own spelling matrix
 /// (pinned in `frp-core/tests/web_server_tls_enable_warning.rs`, which measures
 /// each `[common]`/cross-spelling row directly, and by
-/// `common_and_includes_spellings_set_the_flag`); this row only proves the seed
-/// goes through the same loader the detector does.
+/// `common_and_includes_spellings_set_the_flag`). Sub-case (c) *does* pin that
+/// the seed reads the path it was handed rather than a default filename: the
+/// child is started with a non-default filename carrying the key, while a
+/// `frpc.toml` **without** the key sits in its working directory.
 #[test]
 fn seed_resolves_spellings_only_the_loader_does() {
     // (a) `[common.webServer.tls] enable` beside a top-level `[web_server]`: the
-    //     `[common]` flatten lifts `webServer` and the per-key merge folds its
-    //     `tls` table into `web_server.tls`.
+    //     two spellings are different keys, so the flatten keeps `webServer` and
+    //     the presence detector finds its `tls` through the `[common]` fallback —
+    //     read before `normalize`, so the per-key merge is not what keeps it.
     let dir = TempDir::new("loader-common");
     let admin_port = free_port();
     let cfg = dir.write(
@@ -513,4 +528,23 @@ fn seed_resolves_spellings_only_the_loader_does() {
         assert!(response.contains("HTTP/1."), "the route must answer");
     }
     child.assert_records(1, "(b) three GETs over the includes spelling");
+
+    // (c) The seed must read the path it was handed, not a default filename: the
+    //     child is started with `-c admin-node.toml` (carrying the key) while its
+    //     working directory holds a `frpc.toml` **without** the key. A seed that
+    //     read `./frpc.toml` instead would record `ABSENT`, and the first GET would
+    //     then report the key as a state change — a second record. (A default-name
+    //     read of an *absent* `frpc.toml` is not caught here: `NO_BASELINE`
+    //     baselines silently on the first GET, so the counts would match.)
+    let dir = TempDir::new("loader-argument");
+    let admin_port = free_port();
+    dir.write("frpc.toml", &frpc_config(admin_port, ""));
+    let cfg = dir.write("admin-node.toml", &frpc_config(admin_port, ENABLE));
+    let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()]);
+    child.assert_records(1, "(c) the startup record for a non-default filename");
+    for _ in 0..3 {
+        let response = admin_get(admin_port, "(c) non-default filename");
+        assert!(response.contains("HTTP/1."), "the route must answer");
+    }
+    child.assert_records(1, "(c) three GETs over a non-default filename");
 }
