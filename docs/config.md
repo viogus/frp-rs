@@ -836,6 +836,17 @@ Scope and residuals, measured on Go frp v0.71.0:
   applies to the shape-based legacy `[range:...]` collector in **every** format
   (before it, an array there was dropped with `WARN … invalid local_port`; a
   JSON `"local_port": [6010, "6011-6012"]` now expands).
+- The section-level strict check is a **v1-format** check. Go never passes `strict_config` to its
+  legacy reader: `LoadClientConfigResult` branches on `DetectLegacyINIFormat` first and
+  `legacy.ParseClientConfig` reads sections by hand, ignoring any key its typed struct does not
+  name. An unknown key *inside* a legacy `.ini` section therefore loads in both loader modes, as it
+  does on Go — measured `frpc verify -c <ini>`: `[webServer] zzz_unknown_key = 1` and
+  `[webServer.foo] bar = 1` are rc 0 with and without `--strict-config`, where the top level of the
+  same `.ini` and every v1 format keep the full check (an unknown top-level key is still rc 1
+  strict, rc 0 with `--strict-config=false`). One merged-key exception is **deliberate**: a key
+  hoisted out of `[common]` (`zzz_unknown_common = 1`) is at the top level before the check and is
+  still refused in strict mode where Go is rc 0, because exempting the keys the `[common]` merge
+  created would also blind the top-level half to a genuine v1 typo.
 - `007`, `+5`, `1.50`, `1e3`, `YES`, `1e19` and `10000000000000000000`
   keep their text for a string field (this is what makes `token = 007` the token
   `"007"`, not `"7"`); for an integer/float/bool field the same text is parsed —

@@ -484,6 +484,18 @@ User-facing release notes for frp-rs.
   ignored-flag twin parses the same record instead of one opaque value. A blank-only value reports
   Go's `EOF` flag error instead of failing later at the semantic gate, and a malformed value carries
   Go's line number and 1-based byte column.
+- **`frpc`'s legacy `.ini` reader now follows Go on five shapes it used to refuse or drop.** An
+  unknown key *inside* a legacy `.ini` section is accepted in both loader modes (Go never passes
+  `strict_config` to its legacy reader; the top level of an `.ini` and every v1 format keep the
+  full check); an explicitly empty `type = ""` defaults to `tcp` exactly as a missing one does; a
+  typeless `role = "visitor"` section is refused with Go's `failed to parse visitor v, err: type
+  shouldn't be empty` in both modes instead of being dropped silently in lenient mode and refused
+  with a v1 message in strict mode; a section named exactly a reserved settings root (`[web_server]`,
+  `[transport]`) that carries `local_port`/`remote_port` is a legacy proxy again, as Go registers
+  it; and `[visitors.NAME]`/`[proxies.NAME]` are read as flat legacy sections instead of being
+  expanded into a v1 sub-table and refused with `invalid type: map, expected a sequence`. The
+  section-level strict exception is `.ini`-only and documented in `docs/config.md`. TODO.md:7712,
+  :7751, :7774, :7817, :7844.
 - **`frps --config-dir`: a panicking service task is now counted.** A task that panicked was logged and
   dropped, so a directory in which every task panicked still exited 0 with nothing served. The panic now
   joins the same all-failed decision as the typed failures, and the lane exits non-zero.

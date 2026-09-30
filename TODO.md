@@ -7750,7 +7750,7 @@ section; ledger now **24 open / 104 closed**.**
   handler is installed (`frp-server/src/service.rs:1858`; a signal landing in the startup window dies
   with rc 143 on **both** lanes), per the adversarial round-2 measurement.
 
-- [ ] **Strict mode checks unknown keys in the legacy `.ini` dialect, where Go's legacy reader ignores them even with `strict_config` on.**
+- [x] **Strict mode checks unknown keys in the legacy `.ini` dialect, where Go's legacy reader ignores them even with `strict_config` on.**
   Measured while closing the typeless-`.ini` item (#418). A legacy-shaped `.ini`
   (`[common]` plus sections) is decoded by Go's legacy reader, which accepts-and-ignores
   unknown keys regardless of `--strict-config`; frp-rs runs the same section-level strict
@@ -7772,7 +7772,24 @@ section; ledger now **24 open / 104 closed**.**
   `.ini`-only boundary stated in `docs/config.md`), or the stricter refusal is recorded as
   deliberate in `docs/developing.md` with this measurement, and either way pinned by a test.
 
-- [ ] **A legacy `.ini` proxy section with `type = ""` is refused here and defaults to `tcp` on Go.**
+  **Done (2026-09-30, at `a575c867` on `fix/legacy-ini-parity`).** The section-level strict walk is split in two:
+  `frp-core/src/config/strict.rs:456 run_strict_check_top_level` delegates to
+  `frp-core/src/config/strict.rs:464 run_strict_check_scoped(.., recurse)` and the descent into
+  sub-tables stops at `frp-core/src/config/strict.rs:903` (`if !recurse { continue; }`); the `.ini`
+  path takes the top-level-only walk while every v1 format keeps the full one. Measured `frpc
+  verify -c <ini>`: `i1a.ini` (`[common]` + `[webServer] zzz_unknown_key = 1`) Go rc 0/0, before
+  frp-rs rc 0/1 `unknown field "web_server.zzz_unknown_key"`, now rc 0/0; `i1b.ini`
+  (`[webServer.foo] bar = 1`) Go rc 0/0, before rc 0/1 `unknown field "web_server.foo"`, now
+  rc 0/0; the v1 TOML control `i1c.toml` (unknown top-level key) stays rc 0/1 on both, so the
+  exemption is `.ini`-only. The **top level** of an `.ini` therefore still carries the full check —
+  the boundary is stated in `docs/config.md` (§ Supported Formats, scope bullets). Pinned by
+  `legacy_ini_section_keys_are_exempt_from_strict_only_in_ini`
+  (`frp-core/src/config/tests.rs:7016`); replacing the dispatch with a bare `run_strict_check`
+  reddens it. Residue: an unknown key merged out of `[common]` (`c1.ini`,
+  `zzz_unknown_common = 1`) is hoisted to the top level before the check and is still refused in
+  strict mode where Go is rc 0 — deliberate, filed below.
+
+- [x] **A legacy `.ini` proxy section with `type = ""` is refused here and defaults to `tcp` on Go.**
   Measured while closing the typeless-`.ini` item (#418). `frpc verify -c <ini>` on
   `[common]` + `[p] type = "" local_port = 8080 remote_port = 18080`: Go rc **0** in both
   loader modes (its legacy proxy config defaults an empty type the same way it defaults a
@@ -7783,7 +7800,19 @@ section; ledger now **24 open / 104 closed**.**
   Done-when: an empty `type` in the `.ini` dialect is defaulted like a missing one, or the
   refusal is recorded as deliberate with this measurement, pinned in both loader modes.
 
-- [ ] **A typeless `role = "visitor"` section in a legacy `.ini` is dropped silently in non-strict mode and refused with a different message than Go's in strict mode.**
+  **Done (2026-09-30, at `a575c867` on `fix/legacy-ini-parity`).** Go's legacy collector reads the type with
+  `section.Key("type").String()`, which cannot distinguish an absent key from an empty one
+  (`proxyType == ""` defaults to `ProxyTypeTCP`), while frp-rs defaulted only a *missing* key. New
+  `frp-core/src/config/normalize.rs:1948 type_missing_or_empty` (None → true, `String("")` →
+  true, anything else → false) is consulted where the default is applied. Measured `frpc verify -c
+  i2.ini` (`[p] type = "" local_port = 8080 remote_port = 18080`): Go rc 0/0 and the frps log
+  shows `new proxy [p] type [tcp]`; before frp-rs rc 1/1 `proxy 'p': invalid proxy_type ''`; now
+  rc 0/0 with `Proxies: 1`. The v1 control `t4.toml` (`type = ""`) stays rc 1/1 on both (Go
+  `unknown proxy type: `, frp-rs `invalid proxy_type ''`), so the defaulting is `.ini`-only.
+  Pinned by `legacy_ini_empty_type_defaults_to_tcp_like_go` (`frp-core/src/config/tests.rs:7090`);
+  reverting the empty-string arm of `type_missing_or_empty` to `false` reddens it.
+
+- [x] **A typeless `role = "visitor"` section in a legacy `.ini` is dropped silently in non-strict mode and refused with a different message than Go's in strict mode.**
   Measured while closing the typeless-`.ini` item (#418). The exclusion itself is
   deliberate (Go refuses a typeless visitor, so defaulting it to a `tcp` *proxy* would be
   worse), but neither verdict matches. Config: `[common]` + `[v] role = "visitor"` +
@@ -7795,6 +7824,19 @@ section; ledger now **24 open / 104 closed**.**
 
   Done-when: a typeless visitor reports Go's `type shouldn't be empty` in both modes (or at
   least is refused in non-strict mode instead of dropped), pinned in both modes.
+
+  **Done (2026-09-30, at `a575c867` on `fix/legacy-ini-parity`).** A typeless section whose `role` is `visitor` is now
+  refused **before** collection, in both loader modes, with Go's message: the guard at
+  `frp-core/src/config/normalize.rs:1989` returns the error built at
+  `frp-core/src/config/normalize.rs:1997` (`failed to parse visitor {name}, err: type shouldn't be
+  empty`), and it is applied at any depth — the collector walks the top level *and* every nested
+  table, so `[auth.foo] role = "visitor" server_name = s`, which the top-level-only walk missed,
+  is refused too. Measured `frpc verify -c i3.ini` (`[v] role = "visitor" server_name = s`): Go
+  rc 1/1 `failed to parse visitor v, err: type shouldn't be empty`; before frp-rs rc 0 (lenient,
+  `Proxies: 0`) / rc 1 `unknown field "v" … did you mean 'v2'?` (strict); now rc 1/1 with Go's
+  message. Pinned by `legacy_ini_typeless_visitor_is_refused_at_any_depth`
+  (`frp-core/src/config/tests.rs:7228`); disabling the guard reddens it. The v1 `[[visitors]]` /
+  `[visitors.foo]` typed path is untouched.
 
 - [ ] **`--vhost-http-timeout` is modelled as `Option<u64>` where Go's is `int64`, so a negative value is refused here and accepted there.**
   Residual from the `--vhost-http-timeout` item closed in #418. Go registers the flag with
@@ -7813,7 +7855,7 @@ section; ledger now **24 open / 104 closed**.**
   what Go refuses), or the refusal is recorded as a deliberate divergence with both
   measurements, and a test pins whichever answer is chosen.
 
-- [ ] **An `.ini` section named exactly a reserved settings root cannot be a legacy proxy, so the proxy is lost in lenient mode and refused in strict mode where Go registers one.**
+- [x] **An `.ini` section named exactly a reserved settings root cannot be a legacy proxy, so the proxy is lost in lenient mode and refused in strict mode where Go registers one.**
   Measured at base971 and at the #418 fixed head by that PR's round-3 adversarial review.
   `[web_server] type = "tcp"` + `local_port`/`remote_port`, and `[transport] local_port`, give
   frp-rs `--strict-config=false` rc 0 with `Proxies: 0` (the section stays a settings table) and
@@ -7825,7 +7867,22 @@ section; ledger now **24 open / 104 closed**.**
   Done-when: the reserved-root exemption stops applying to a section carrying `type` or the port
   keys, or the loss is recorded as deliberate with this measurement and pinned by a test.
 
-- [ ] **A `[visitors.NAME]` / `[proxies.NAME]` legacy `.ini` section with no port key is refused with `invalid type: map, expected a sequence` where Go accepts it.**
+  **Done (2026-09-30, at `a575c867` on `fix/legacy-ini-parity`) for the port-carrying spelling.** A reserved-root section
+  that carries `local_port`/`remote_port` is collected as a legacy proxy again, keyed on the
+  **ports** and never on `type`
+  (`frp-core/src/config/normalize.rs:2097`: `is_ini && (local_port || remote_port)`), so
+  `[web_server]` itself, the portless `[web_server] port = 7500` admin block and
+  `[log] type = "custom"` all stay settings tables. Measured: `[web_server] type = "tcp"
+  local_port = 8080 remote_port = 18080` Go rc 0/0 with `new proxy [web_server] type [tcp]
+  success`, before frp-rs rc 0 (`Proxies: 0`) / rc 1 `unknown field "web_server.local_port"`, now
+  rc 0/0 with `Proxies: 1`; `[transport] local_port = 8080` likewise (before strict
+  `unknown field "local_port"`). Pinned by `legacy_ini_headers_naming_v1_roots_are_still_proxies`
+  (`frp-core/src/config/tests.rs:7159`), whose port-only clause is the discriminator, with the
+  counterpart `legacy_ini_typed_settings_root_with_type_stays_a_settings_table`
+  (`frp-core/src/config/tests.rs:7428`) recording the opposite verdict for a `type`-only root. The
+  `type`-only half is the open residue filed below.
+
+- [x] **A `[visitors.NAME]` / `[proxies.NAME]` legacy `.ini` section with no port key is refused with `invalid type: map, expected a sequence` where Go accepts it.**
   Measured at the #418 fixed head by that PR's round-3 adversarial review. `[visitors.foo]` and
   `[proxies.foo]` without `local_port`/`remote_port` give frp-rs rc **1** `invalid type: map,
   expected a sequence` — the dotted header expands to a v1 sub-table, so the legacy collector no
@@ -7834,6 +7891,20 @@ section; ledger now **24 open / 104 closed**.**
 
   Done-when: a portless dotted spelling of a typed root is treated as the section it looks like (or
   the refusal is recorded as deliberate with this measurement), pinned in both loader modes.
+
+  **Done (2026-09-30, at `a575c867` on `fix/legacy-ini-parity`).** `proxies`/`visitors` were removed from
+  `format::INI_NESTED_SECTION_ROOTS` (`frp-core/src/config/format.rs:259`), so `[visitors.NAME]` /
+  `[proxies.NAME]` is no longer expanded into a v1 sub-table, and the collector filter keeps a
+  dotted header that names one of those array roots (`normalize.rs:1936 names_an_ini_array_root`,
+  used at `frp-core/src/config/normalize.rs:2077`) instead of dropping it. Measured: `[visitors.foo]
+  server_name = s` and `[proxies.foo]` — Go rc 0/0, before frp-rs rc 1/1 `config validation error:
+  invalid type: map, expected a sequence`, now rc 0/0; `[visitors.foo] role = "visitor" type =
+  "stcp" …` → `Visitors: 1`; `[proxies.foo] type = "tcp"` + ports → `Proxies: 1`; a bare
+  `[visitors]` → Go registers `new proxy [visitors] type [tcp]` and frp-rs reports `Proxies: 1`.
+  Pinned by `legacy_ini_headers_naming_v1_roots_are_still_proxies`
+  (`frp-core/src/config/tests.rs:7159`, the array-root clause) and
+  `legacy_ini_typed_array_root_visitor_is_collected` (`frp-core/src/config/tests.rs:7378`);
+  re-adding the two roots to `INI_NESTED_SECTION_ROOTS` reddens the first.
 
 - [ ] **Four more test-precision residues the `test-precision-residue` round-2 reviews measured.**
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7191`): a
@@ -8295,3 +8366,94 @@ section; ledger now **24 open / 104 closed**.**
   (`scripts/tests/repo-health-fixtures.sh`, `scripts/tests/compat-stray-guard.sh`,
   `scripts/tests/rss-soak-run-dir.sh`).
   **Done-when:** the comment names the three.
+- [ ] **Legacy `.ini` spellings Go reads as a proxy (or ignores) and frp-rs does not: reserved-root `type`-only sections, portless shapes, and the server side.**
+  Measured across the #425 rounds 3-7 against real Go frp v0.71.0 binaries in both loader modes;
+  the full per-fixture matrices are in PR #425. Grouped by what a fix has to decide:
+  * A section named exactly a reserved settings root carrying `type` but **no** port: `i4c.ini`
+    (`[web_server] type = "tcp"`) makes Go register `new proxy [web_server] type [tcp]` (listen
+    port 0) while frp-rs reports `Proxies: 0`. Keying the reserved-root bypass on `type` instead
+    of the ports would also collect `[log] type = "custom" disable_print_color = true` as a proxy
+    where Go is rc 1 `failed to parse proxy log, err: invalid type [custom]` and frp-rs rc 0, and
+    would contradict `test_legacy_ini_known_section_with_type_not_collected`
+    (`frp-core/src/config/tests.rs`), which pins that opposite verdict. Choosing between the two
+    spellings is a decision about whether frp-rs keeps supporting v1 settings roots in `.ini` at
+    all — a design question, not a parity patch.
+  * Portless typeless section carrying `custom_domains` (`c2.ini`): strict Go rc 0 / frp-rs rc 1
+    `unknown field "p"`; pre-existing and pinned by
+    `typeless_ini_section_without_ports_stays_a_v1_section` (`frp-core/src/config/tests.rs`).
+  * Server side (there is no server-side legacy collector): frps `[proxies.foo]` without a port
+    key is strict rc 1 `unknown field "proxies.foo"` where Go is rc 0/0 (`s2.ini`), and
+    `[http_plugins.foo]` / `[httpPlugins.foo]` is rc 1/1 `invalid type: map, expected a sequence`
+    where Go is rc 0/0 (`i6a.ini`). The strict-only rows `s5`/`s6`/`s7`/`s9`/`sx7` and the
+    `[proxies]`/`[visitors]`/`[foo]`/`[Includes]`/`[includes.foo]` unknown-field refusals are
+    pre-existing and identical in a pristine build.
+  * The reverse gap: frps `[plugin.user] ops = login` (`i6b.ini`) → Go rc 1 `invalid http plugin
+    ops, optional values are [Login NewProxy CloseProxy Ping NewWorkConn NewUserConn]`, frp-rs
+    rc 0; and `[feature.foo] x = true` (`i7.ini`) → frp-rs rc 1 `invalid type: map, expected a
+    boolean`, Go rc 0.
+  **Done-when:** each spelling is collected (or ignored, or refused) as Go does, or the divergence
+  is recorded as deliberate in `docs/config.md` with its measurement, pinned in both loader modes.
+
+- [ ] **`includes` in a legacy `.ini` is processed before the `[common]` hoist, so a `[common]`-only `includes` is never expanded and a top-level one is expanded where Go ignores it.**
+  Measured by the #425 rounds 4-7. `process_includes` (`frp-core/src/config/file.rs:247`) runs
+  **before** the `[common]` hoist (`frp-core/src/config/normalize.rs:1163`), so
+  `[common] includes = "<file>"` merges that file on Go (Go expands includes from `[common]`,
+  `pkg/config/legacy/client.go`) while frp-rs silently keeps its own config — with a bad included
+  file Go rc 1 against frp-rs rc 0 (`x12`). The mirror shape: a top-level `includes = "<file>"` in
+  a file that also has `[common]` is expanded by frp-rs and ignored by Go, so frp-rs loads a proxy
+  Go does not; and a `.ini` with no `[common]` at all plus `includes = "<valid file>"` is rc 0
+  here (it merges) against Go rc 1 in both modes. `[includes] type = "custom"` with no ports
+  (`x2`) is rc 0 here — the section is dropped as an inert table by
+  `drop_legacy_ini_include_tables` — against Go rc 1 `failed to parse proxy includes, err: invalid
+  type [custom]`, under the port-only clause at `frp-core/src/config/normalize.rs:2097`.
+  `[Includes] foo = 1` / `[includes.foo] foo = 1` are over-refused in strict mode where Go is rc 0
+  (round 4 corrected the comment that misdescribed this; the behaviour remains), and a scalar
+  `includes` spelling still reaches the collector (`h1c`/`h1d`).
+  **Done-when:** the include walk and the `[common]` hoist are ordered as Go orders them (or each
+  divergence is recorded with its measurement), with the include spellings pinned in both modes.
+
+- [ ] **The two legacy-format detectors disagree for a `[common.foo]`-only `.ini`, and the v1-path `[DEFAULT]`, dotted-root and range-render shapes still diverge.**
+  Measured by the #425 round-6/7 reviews. For a file containing only `[common.foo]`, the detector
+  in `frp-core/src/config/normalize.rs:1161` and the one in `frp-core/src/config/format.rs:223`
+  reach different verdicts, so `q4` is Go strict 1 / loose 0 against frp-rs 1|1 — loose-only and
+  identical on the parent, so a follow-up rather than a blocker. Also open from the #425 sweep:
+  `[DEFAULT]` is treated as a normal section (`y10`/`y11`), the range render gaps `y14`/`y16`, and
+  the `r_toml.ini` hybrid (`.ini` carrying `server_addr` plus `[[proxies]] name = "p" role =
+  "weird"`), where the verdict agrees (both rc 1) but the message does not — frp-rs
+  `proxy [proxies] role should be 'server' or 'visitor'` against Go strict `json: unknown field
+  "server_addr"` / non-strict `decode proxy at index 0: unknown proxy type: `.
+  **Done-when:** each shape is pinned to Go's verdict, or recorded as deliberate with its
+  measurement.
+
+- [ ] **`[common] start` is read from the wrong place for a `[common]`-less `.ini`, and that spelling has no pin.**
+  Measured by the #425 round-6/7 adversarial reviews. Round 6's `legacy_start_override`
+  (`frp-core/src/config/normalize.rs:2510`) removed `start` unconditionally and so deleted a
+  legitimate legacy proxy section named `[start]`: `s90` (`[common]` + `[p1]` + a valid `[start]`)
+  gave Go rc 0 with **2** proxies and the round-6 head 1; `s92` (`[start]` only) Go 1 / head 0;
+  `s93`/`s95` masked Go's `proxy start role should be 'server' or 'visitor'` / `failed to parse
+  proxy start, err: invalid type [custom]` refusals to rc 0; `s97` lost a visitor. Round 7 fixed
+  the deletion by capturing the pre-hoist `[common] start` and threading it through the collector
+  and the override (`frp-core/src/config/normalize.rs:1173 legacy_start_override(table, legacy_ini,
+  common_start)`), which restores `s90`→2 and `s92`→1, with pins
+  `legacy_ini_start_section_is_still_a_proxy` (`frp-core/src/config/tests.rs:12345`),
+  `legacy_ini_start_section_refusals_like_go` (`frp-core/src/config/tests.rs:12304`),
+  `legacy_ini_start_comes_from_the_common_section_only`
+  (`frp-core/src/config/tests.rs:12149`) and `legacy_ini_common_start_list_selects_named_sections`
+  (`frp-core/src/config/tests.rs:12426`). What is still open is the `[common]`-less spelling: a
+  `DefaultSection start = p2` beside a `[start]` section gave Go **1** proxy named `start`, round 5
+  `4113b413` 1, round 6 head **0**, and nothing in the suite pins it.
+  **Done-when:** `start` is read exactly where Go reads it in every spelling (or the remaining
+  spelling is recorded as deliberate with its measurement) and the `[common]`-less case is pinned.
+
+- [ ] **An unknown key merged out of `[common]` is still refused in strict mode, where Go's legacy reader accepts it.**
+  Measured by the #425 item-1 round: `c1.ini` (`[common] server_addr = 127.0.0.1` + `[common]
+  zzz_unknown_common = 1`) gives Go rc 0 in both loader modes (its legacy reader ignores a key its
+  typed struct does not name), while frp-rs is rc 0 loose / rc 1 strict `unknown field
+  "zzz_unknown_common"` — the `[common]` merge (`frp-core/src/config/normalize.rs:1163`) moves the
+  key to the top level *before* the top-level strict walk, so the `.ini` exemption does not cover
+  it. This is **deliberate**: exempting the keys the merge created would also blind the top-level
+  half to a genuine v1 typo spelled under `[common]`, and the item's Done-when allows the
+  measurement instead. Filed so the exemption is visible rather than silent.
+  **Done-when:** the merged keys are told apart from the file's own top-level keys (so a key that
+  only exists because of `[common]` is accepted) without weakening the top-level check, or the
+  divergence is recorded as deliberate in `docs/config.md` with this measurement, pinned.
