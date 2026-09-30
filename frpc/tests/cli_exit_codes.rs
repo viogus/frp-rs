@@ -635,6 +635,7 @@ fn unresolvable_token_source_exits_3_where_go_exits_1() {
 /// | `frpc verify … --allow-unsafe WrongFeature --allow-unsafe TokenSourceExec` | rc 0 (pflag `strings` appends) | rc 1 — bpaf refused the second occurrence |
 /// | `frpc verify … --allow-unsafe TokenSourceExec --allow-unsafe WrongFeature` | rc 0 (a later unrelated value does not cancel an earlier enabling one) | rc 1 |
 /// | `frpc verify … --allow-unsafe Ignored,TokenSourceExec` | rc 0 (each occurrence is comma-split) | rc 0 |
+/// | `frpc verify … --allow-unsafe WrongFeature --allow-unsafe Ignored --allow-unsafe TokenSourceExec` | rc 0 (three occurrences append too — the enabling value need not be within the first two) | rc 1 — bpaf refused the second occurrence |
 /// | `frpc -c <exec cfg>` (run) | rc 1, the same stdout line | rc 3, `EXIT_AUTH` |
 ///
 /// frp-rs's wording stays its own predicate message and its own `Config file <p>
@@ -715,9 +716,12 @@ fn verify_runs_the_post_load_allow_unsafe_gate_like_go() {
     );
 
     // pflag's `strings` **appends** on repetition and comma-splits every
-    // occurrence, so Go's verify honours all three spellings below (measured
+    // occurrence, so Go's verify honours all four spellings below (measured
     // rc 0 on v0.71.0 for each, in both value orders). The `TokenSourceExec`-first
-    // row is what separates appending from a last-wins reading.
+    // row separates appending from a last-wins reading; the three-occurrence row
+    // is what kills a parser that caps the accumulation — measured, feeding at
+    // most two occurrences left `.many().map(|mut v: Vec<String>| { v.truncate(2);
+    // v })` green while this row regressed to rc 1.
     for extra in [
         vec![
             "--allow-unsafe",
@@ -732,6 +736,14 @@ fn verify_runs_the_post_load_allow_unsafe_gate_like_go() {
             "WrongFeature",
         ],
         vec!["--allow-unsafe", "Ignored,TokenSourceExec"],
+        vec![
+            "--allow-unsafe",
+            "WrongFeature",
+            "--allow-unsafe",
+            "Ignored",
+            "--allow-unsafe",
+            "TokenSourceExec",
+        ],
     ] {
         let mut argv = vec!["verify", "-c", cfg.as_str()];
         argv.extend(extra.iter().copied());

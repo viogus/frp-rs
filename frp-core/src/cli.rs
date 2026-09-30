@@ -5209,6 +5209,30 @@ mod tests {
             "a repeated `--allow-unsafe` must append in order and comma-split each occurrence"
         );
 
+        // Three occurrences, with the enabling value **last**. Every earlier pin
+        // fed at most two occurrences, so a parser that capped the accumulation
+        // at two stayed green while the shared parser regressed — measured: with
+        // `.many().map(|mut v: Vec<String>| { v.truncate(2); v })` the gate
+        // refused this row (rc 1) where the head and Go v0.71.0 are rc 0. The
+        // full ordered vector is asserted, so truncation anywhere shows up here.
+        let three = parse_frpc_verify(&[
+            "verify",
+            "-c",
+            "p7520.toml",
+            "--allow-unsafe",
+            "WrongFeature",
+            "--allow-unsafe",
+            "Ignored",
+            "--allow-unsafe",
+            "TokenSourceExec",
+        ])
+        .unwrap();
+        assert_eq!(
+            three.allow_unsafe,
+            ["WrongFeature", "Ignored", "TokenSourceExec"].map(String::from),
+            "three occurrences must accumulate in order — capping at two drops the enabling value"
+        );
+
         let frps_verify = parse_frps_verify(&[
             "verify",
             "-c",
@@ -5242,18 +5266,23 @@ mod tests {
             run.allow_unsafe,
             ["WrongFeature", "TokenSourceExec"].map(String::from)
         );
+        // Three occurrences in the wrong order on the frps run path too: every
+        // value survives, so an accumulation cap cannot hide here either.
         let frps_run = parse_frps(&[
             "-c",
             "p7520.toml",
             "--allow-unsafe",
-            "WrongFeature",
-            "--allow-unsafe",
             "TokenSourceExec",
+            "--allow-unsafe",
+            "Ignored",
+            "--allow-unsafe",
+            "WrongFeature",
         ])
         .unwrap();
         assert_eq!(
             frps_run.allow_unsafe,
-            ["WrongFeature", "TokenSourceExec"].map(String::from)
+            ["TokenSourceExec", "Ignored", "WrongFeature"].map(String::from),
+            "a wrong-order three-occurrence run path keeps every value as well"
         );
     }
 
