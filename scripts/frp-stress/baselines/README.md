@@ -45,17 +45,32 @@ One JSON object per line, in three parts:
 
 | `kind` | contents |
 |--------|----------|
-| `meta` | one first line: host, platform, cores, frp-rs version + git sha, Go frp version + dir, the four binary `sha256` values, the traffic recipe, the ports, and an explicit `caveats` list |
+| `meta` | one first line: host, platform, cores, frp-rs version + git sha (with an `frp_rs_dirty` flag when the tree had uncommitted changes, and `harness_sha256` for the soak script and its two helpers), Go frp version + dir, the four binary `sha256` values, the traffic recipe, the ports, the resolved run dir, and an explicit `caveats` list |
 | `sample` | one per interval: `elapsed_s`, UTC `ts`, `load1`, the host-wide `time_wait` socket count, and RSS in KB for all four processes (`null` when a process was momentarily unreadable) |
-| `summary` | one last line: per-process `first`/`last`/`min`/`max`/`mean`/`first_hour_mean`/`last_hour_mean`/`growth_pct_first_to_last`, achieved `traffic` per side, load and TIME_WAIT ranges, and `aborted` |
+| `summary` | one last line: per-process `first`/`last`/`min`/`max`/`mean`/`first_hour_mean`/`last_hour_mean`/`growth_pct_first_to_last`, a computed `trend` per process (least-squares `slope_kb_per_hour`, first/last-quarter means, `monotonic_nondecreasing`), achieved `traffic` per side (including `failed_streams`), `achieved_equality` between the two sides, load and TIME_WAIT ranges, and `aborted` |
 
-**An artifact with no trailing `summary` line is an incomplete run.** The
-summary's `aborted` field is `null` for a completed window; otherwise it names
-the fault (a process that died, a propagation signal, or traffic that moved
-nothing). `scripts/rss-soak.sh` exits non-zero in that case, and also when
-either side's churn completed no echo round trips or its steady stream moved no
-bytes — a flat RSS line is only evidence if load was actually delivered on both
-sides.
+**An artifact with no trailing `summary` line is an incomplete run.** That is a
+convention the reader of a series applies, not something the script can test
+for, because a run killed with `kill -9` never reaches the summary at all. When
+the summary *is* written, `aborted` is `null` only for a completed window;
+otherwise it names every fault found and `scripts/rss-soak.sh` exits 3. A
+pre-flight failure (no usable bridge) instead exits 1 and writes no artifact.
+The faults are:
+
+- a process that died at any point in the window, **including during the last
+  sampling interval** (the liveness scan runs before the window-end test);
+- any RSS column with zero readings — `ps` never returned a number for it;
+- either side's churn completing no echo round trips, or its steady stream
+  moving no bytes;
+- either side's steady path reporting `failed_streams > 0` (a torn-down path);
+- the two sides' achieved volume differing by more than `SOAK_TRAFFIC_TOLERANCE`
+  (default `0.10`) — both are handed the same paced recipe, so a large gap means
+  the comparison is not head-to-head.
+
+A missing reading prints `-`, never a fabricated `0`, and a column with no
+readings at all prints `NO READINGS`. `scripts/tests/rss-soak-run-dir.sh` (run
+by the `health` CI job, no network or built binary needed) drives the real
+run-dir helpers and the real summary reader over these cases.
 
 What the series does and does not establish:
 
@@ -67,13 +82,27 @@ What the series does and does not establish:
   "allocator never returned memory". It also does not cover weeks (only the
   measured window), an isolated stack (both share the host, so a machine-level
   effect moves both series — that is why they run concurrently and why `load1`
-  is logged every sample), guaranteed equal *achieved* volume (the recipe is
-  identical and the churn rate is fixed, and achieved volume is recorded per
-  side), or any proxy type other than one TCP proxy.
+  is logged every sample), exactly equal *achieved* volume (the recipe is
+  identical and the churn rate is fixed, but pacing is applied to combined
+  sent+received bytes and each side's achieved volume is recorded and compared —
+  a spread beyond `SOAK_TRAFFIC_TOLERANCE` aborts the run), or any proxy type
+  other than one TCP proxy.
 
-Keep `SOAK_CHURN_RATE` modest: each closed connection parks sockets in
-TIME_WAIT (~30 s on macOS, 16 384-port ephemeral range), so the per-sample
-`time_wait` count is the check that a run is not drifting into port exhaustion.
+`SOAK_STREAM_MBPS` is a MiB/s ceiling on **combined** traffic (sent plus
+received) per stream, so the default `5` moves roughly 2.5 MiB/s of payload in
+each direction; the unpaced default (`0`) is what the throughput baseline uses.
+
+Keep `SOAK_CHURN_RATE` modest: each closed connection parks sockets in TIME_WAIT
+(~30 s on macOS, 16 384-port ephemeral range), so the per-sample `time_wait`
+count is the host-level check that a run is not drifting into port exhaustion.
+It is counted host-wide and is not attributable to one stack, so read it as a
+property of the run rather than as a difference between the two sides.
+
+The run directory defaults to `/tmp/rss-soak` for every run, and the soak clears
+its own traffic rows and artifact there after pre-flight and before the window
+opens. Without that clear, a generator dying early would leave the previous
+run's row for the summary to publish as this run's load — which is exactly the
+kind of borrowed evidence the fixture above pins down.
 
 All are host-specific like the throughput baseline — compare only against
 same-host runs. Regenerate commands:
@@ -83,13 +112,20 @@ bash scripts/latency-baseline.sh
 bash scripts/memory-baseline.sh
 # duration_s interval_s — a real soak wants hours; the short form just validates
 bash scripts/rss-soak.sh 10800 45
-# a throwaway validation run, so a live soak's artifact is not clobbered:
-SOAK_OUT=/tmp/rss-soak-validation.jsonl bash scripts/rss-soak.sh 180 30
+# a throwaway validation run: its own artifact, run dir, lock and ports, so a
+# live soak is neither disturbed nor clobbered
+SOAK_OUT=/tmp/rss-soak-validation.jsonl SOAK_RUN_DIR=/tmp/rss-soak-validation \
+  SOAK_LOCK=/tmp/rss-soak-validation.lock \
+  SOAK_RS_CONTROL=18300 SOAK_RS_REMOTE=18301 SOAK_RS_ECHO=18302 \
+  SOAK_GO_CONTROL=18400 SOAK_GO_REMOTE=18401 SOAK_GO_ECHO=18402 \
+  bash scripts/rss-soak.sh 180 30
 ```
 
-Only one soak runs at a time (lock file `/tmp/rss-soak.lock`); a validation run
-is refused while a real soak is live rather than allowed to steal its ports or
-overwrite its artifact. Start a long run detached so it survives the shell:
+Only one soak runs at a time (lock file `/tmp/rss-soak.lock`, override with
+`SOAK_LOCK`); a validation run is refused while a real soak is live rather than
+allowed to steal its ports or overwrite its artifact. Start a long run detached
+so it survives the shell — SIGTERM stops it promptly, and a `kill -9` still
+leaves no orphans because a watchdog reaps the children when the script dies:
 
 ```bash
 nohup bash scripts/rss-soak.sh 10800 45 > /tmp/rss-soak.log 2>&1 &
