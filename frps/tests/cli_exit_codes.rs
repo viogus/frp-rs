@@ -115,12 +115,25 @@ fn try_wait_or_kill(child: &mut Child, what: &str) -> Option<std::process::ExitS
 }
 
 fn run_frps(args: &[&str]) -> Output {
-    let mut child = Command::new(bin())
-        .args(args)
+    run_frps_inner(args, &[])
+}
+
+/// [`run_frps`] with extra environment variables set on the child, for the
+/// debug-build-only hooks in `frps/src/main.rs` that make a spawn-level failure
+/// (a panicking service task) deterministic.
+fn run_frps_with_env(args: &[&str], envs: &[(&str, &str)]) -> Output {
+    run_frps_inner(args, envs)
+}
+
+fn run_frps_inner(args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(bin());
+    cmd.args(args)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn frps");
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn().expect("spawn frps");
     let deadline = Instant::now() + EXIT_TIMEOUT;
     loop {
         match try_wait_or_kill(&mut child, "frps") {
@@ -789,17 +802,18 @@ fn config_dir_where_every_service_fails_init_exits_like_dash_c() {
 ///
 /// At `9a0df13d` the lane counted only *construction* failures: a task whose
 /// `run()` failed reported `Ok(())`, so the exit guard's failure list stayed
-/// empty and `frps --config-dir` exited **0** with zero listeners — measured
-/// with `/tmp/frps-cfgdir-probe/probe-bind.py`: `-c` rc 1, `--config-dir` rc 0,
-/// `listener started` count 0.
+/// empty and `frps --config-dir` exited **0** with zero listeners.
 ///
 /// The second half pins the **mixed** shape — one file that cannot be
 /// constructed (no `[auth].token`) plus one whose port is held — which also
-/// exited 0 with nothing listening. Both files are spawned, so the pair now
-/// exits on the first *spawned* failure's code; the assertion is deliberately
-/// "non-zero, nothing listening" rather than a specific code, because that code
-/// is the first spawned failure's, not the directory's single worst one (the
-/// guard's comment in `frps/src/main.rs` states the ordering).
+/// exited 0 with nothing listening. `collect_config_files` returns files in
+/// sorted order, so `a.toml` (construction failure, `EXIT_AUTH`/3) is position
+/// 0 and `b.toml` (run failure, `EXIT_RUNTIME`/1) is position 1; the all-failed
+/// decision exits the **file-order first** failure's code, exactly the code
+/// `-c a.toml` exits on, so the pair exits 3. (The assertion used to be only
+/// "non-zero" because the guard exited on whichever task the runtime happened
+/// to complete first, which made the code scheduling-dependent — the guard in
+/// `frps/src/main.rs` now sorts by the file's position in `files`.)
 #[test]
 fn config_dir_where_every_service_fails_to_run_exits_like_dash_c() {
     let (holder, port) = held_port();
@@ -844,11 +858,12 @@ fn config_dir_where_every_service_fails_to_run_exits_like_dash_c() {
     std::fs::write(mixed.join("a.toml"), format!("bindPort = {port}\n")).expect("write a.toml");
     std::fs::copy(valid_config(&dir, port), mixed.join("b.toml")).expect("copy b.toml");
     let mixed_out = run_frps(&["--config-dir", mixed.to_str().expect("utf-8 temp path")]);
-    let code = mixed_out.status.code();
-    assert!(
-        code.is_some_and(|c| c != 0),
-        "a directory where every spawned service failed must exit non-zero, got {code:?}; \
-         stdout={:?} stderr={:?}",
+    assert_eq!(
+        mixed_out.status.code(),
+        Some(3),
+        "a directory where every service failed must exit the file-order first \
+         failure's code — `a.toml`'s construction refusal (3), the same code \
+         `-c a.toml` exits on; stdout={:?} stderr={:?}",
         stdout_of(&mixed_out),
         stderr_of(&mixed_out),
     );
@@ -858,6 +873,87 @@ fn config_dir_where_every_service_fails_to_run_exits_like_dash_c() {
         stdout_of(&mixed_out),
     );
     drop(holder);
+}
+
+/// A file that fails to **load** never becomes a task, so it could not reach
+/// the all-failed decision: at `d9f8e63c` a directory where every file failed
+/// to load exited `EXIT_CONFIG`/2 purely because `handles` came out empty,
+/// while `-c` on the same file exits 1 (`EXIT_RUNTIME`, the single-config
+/// lane's mapping for every load error). The lane now records the load failure
+/// in file order and exits that same code, so the two lanes agree.
+#[test]
+fn config_dir_where_every_file_fails_to_load_exits_like_dash_c() {
+    let dir = TempDir::new();
+    let conf_d = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    let file = conf_d.join("frps.toml");
+    // Not valid TOML: rejected in the loader, before any service is constructed.
+    std::fs::write(&file, "this is not valid toml\n").expect("write config");
+    let file = file.to_str().expect("utf-8 temp path");
+
+    let control = run_frps(&["-c", file]);
+    assert_eq!(
+        control.status.code(),
+        Some(1),
+        "control: `-c` on an unparseable config must exit 1 (EXIT_RUNTIME); \
+         stdout={:?} stderr={:?}",
+        stdout_of(&control),
+        stderr_of(&control),
+    );
+
+    let out = run_frps(&["--config-dir", conf_d.to_str().expect("utf-8 temp path")]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "every file failing to load must exit the same code `-c` does (1), not \
+         the old EXIT_CONFIG 2; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
+/// A **panicking** service task must count toward the all-failed decision, not
+/// merely be logged. The guard pushed `Ok(Err(code))` only, so a `JoinError`
+/// was logged at `frps/src/main.rs` and dropped: with a directory whose every
+/// task panicked, `failures.len() == files.len()` could never hold, nothing
+/// stayed up, and the process exited **0**.
+///
+/// The panic is driven by the debug-only `FRPS_CFGDIR_TEST_PANIC` hook — gated
+/// on `debug_assertions`, so it does not exist in a release binary — which
+/// panics the task named by the value **after** it registered, i.e. exactly the
+/// task shape the guard must count. The fixture needs no free port beyond the
+/// config itself: the task panics before `Service::run`, so no listener starts;
+/// the point is that the lane cannot report success with nothing served.
+#[test]
+fn config_dir_where_every_task_panics_exits_nonzero() {
+    let port = ephemeral_port();
+    let dir = TempDir::new();
+    let conf_d = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    let cfg = valid_config(&dir, port);
+    let file = conf_d.join("frps.toml");
+    std::fs::copy(&cfg, &file).expect("copy the valid config into conf.d");
+    let file = file.to_str().expect("utf-8 temp path");
+
+    let out = run_frps_with_env(
+        &["--config-dir", conf_d.to_str().expect("utf-8 temp path")],
+        &[("FRPS_CFGDIR_TEST_PANIC", file)],
+    );
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a directory whose only task panicked served nothing and must not exit 0; \
+         stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        combined(&out).contains("frps service task panicked"),
+        "the panic must still be logged; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
 }
 
 /// The frp-rs space-separated `--strict-config` extension is made **loud** on

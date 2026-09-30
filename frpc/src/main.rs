@@ -517,8 +517,9 @@ async fn run_normal(mut args: FrpcRunArgs) {
             frp_core::VERSION,
             files.len()
         );
-        let mut handles = Vec::new();
-        for path in &files {
+        let mut handles: Vec<(usize, tokio::task::JoinHandle<Result<(), i32>>)> = Vec::new();
+        let mut load_failures: Vec<(usize, i32)> = Vec::new();
+        for (file_index, path) in files.iter().enumerate() {
             let path_str = path.display().to_string();
             match load_client_config_with_presence(&path_str, args.strict_config) {
                 Ok((cfg, presence)) => {
@@ -530,38 +531,76 @@ async fn run_normal(mut args: FrpcRunArgs) {
                     let uf = unsafe_features.clone();
                     #[cfg(unix)]
                     let stop_services = stop_services.clone();
-                    handles.push(tokio::spawn(async move {
-                        let service = match Service::with_unsafe_features(cfg, Some(path_str.clone()), uf).await {
-                            Ok(svc) => svc,
-                            Err(e) => {
-                                tracing::error!(config_file = %path_str, error = %e, "frpc service init error for config file [{}]: {}", path_str, e);
-                                return;
+                    handles.push((
+                        file_index,
+                        tokio::spawn(async move {
+                            let service = match Service::with_unsafe_features(cfg, Some(path_str.clone()), uf).await {
+                                Ok(svc) => svc,
+                                Err(e) => {
+                                    tracing::error!(config_file = %path_str, error = %e, "frpc service init error for config file [{}]: {}", path_str, e);
+                                    // A file that never became a service served
+                                    // nothing; carry its code out of the task so
+                                    // an all-failed directory cannot report
+                                    // success. Same code `-c <file>` exits with
+                                    // (`e.kind().exit_code()`, above).
+                                    return Err(e.kind().exit_code());
+                                }
+                            };
+                            let service = Arc::new(service);
+                            #[cfg(unix)]
+                            stop_services.lock().unwrap().push(service.clone());
+                            #[cfg(unix)]
+                            if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+                                service.request_stop();
                             }
-                        };
-                        let service = Arc::new(service);
-                        #[cfg(unix)]
-                        stop_services.lock().unwrap().push(service.clone());
-                        #[cfg(unix)]
-                        if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
-                            service.request_stop();
-                        }
-                        if let Err(e) = service.run().await {
-                            tracing::error!(config_file = %path_str, error = %e, "frpc service error for config file [{}]: {}", path_str, e);
-                        }
-                    }));
+                            if let Err(e) = service.run().await {
+                                tracing::error!(config_file = %path_str, error = %e, "frpc service error for config file [{}]: {}", path_str, e);
+                                // Match `-c`: a service that failed to run did
+                                // not serve, so the directory lane must be able
+                                // to report the failure instead of exiting 0.
+                                return Err(EXIT_RUNTIME);
+                            }
+                            Ok(())
+                        }),
+                    ));
                 }
                 Err(e) => {
                     tracing::error!(path = %path_str, error = %e, "Failed to load config from [{}]: {}", path_str, e);
+                    // Keep the lane's pre-existing refusal code (see the
+                    // `collect_config_files` comment above): a file that fails
+                    // to load still counts toward the all-failed decision, and
+                    // file order decides which code wins when several failed.
+                    load_failures.push((file_index, EXIT_CONFIG));
                 }
             }
         }
         if handles.is_empty() {
             tracing::error!("No services started — all config files failed to load");
-            process::exit(EXIT_CONFIG);
+            let code = load_failures
+                .first()
+                .map(|(_, code)| *code)
+                .unwrap_or(EXIT_CONFIG);
+            process::exit(code);
         }
-        for handle in handles {
-            if let Err(e) = handle.await {
-                tracing::error!(error = %e, "frpc service task panicked: {}", e);
+        // A task that returned `Err(code)` — construction or `run()` — served
+        // nothing. If **every** file failed (load or run), exit the file-order
+        // first failure's code, exactly as `frps --config-dir` does, instead of
+        // reporting success for a directory that serves nothing.
+        let mut failures = load_failures;
+        for (file_index, handle) in handles {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(code)) => failures.push((file_index, code)),
+                Err(e) => {
+                    tracing::error!(error = %e, "frpc service task panicked: {}", e);
+                    failures.push((file_index, EXIT_RUNTIME));
+                }
+            }
+        }
+        if failures.len() == files.len() {
+            failures.sort_by_key(|(file_index, _)| *file_index);
+            if let Some((_, code)) = failures.first() {
+                process::exit(*code);
             }
         }
         return;
@@ -598,9 +637,11 @@ async fn run_normal(mut args: FrpcRunArgs) {
     // load, `cmd/frpc/sub/root.go:191`), so a `tracing::warn` inside the loader
     // reaches no subscriber. The fact is carried out of the loader on
     // `ConfigPresence` and emitted here, once; the `--config-dir` branch above
-    // warns at its own load site, so no path double-warns (measured, probe
-    // `/tmp/enable-warn-probe/run-probe.sh`: 1 on stdout, 0 on stderr, both
-    // paths, both binaries).
+    // warns at its own load site, so no path double-warns — pinned by the
+    // `warn_delivery` lanes, which assert exactly one record on stdout and none
+    // on stderr for both paths
+    // (`frpc/tests/warn_delivery.rs::web_server_tls_enable_warning_reaches_a_dash_c_user`
+    // and its `config_dir` sibling).
     presence.warn_inert_web_server_tls_enable(cfg!(feature = "admin"));
 
     tracing::info!(version = %frp_core::VERSION, "frpc (Rust) v{} connecting...", frp_core::VERSION);

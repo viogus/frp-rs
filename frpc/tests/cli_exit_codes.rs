@@ -581,6 +581,53 @@ fn config_dir_refusals_exit_2_where_go_exits_0() {
 
 // ── the extension codes: 3 (auth) and 4 (the construction fallback) ─────────
 
+/// The client and server lanes must agree on a failed *service*: `frps
+/// --config-dir` exits non-zero when nothing serves, and `frpc --config-dir`
+/// used to exit **0** even when its only service never logged in — the task's
+/// `run()` error was logged and dropped, and the lane then fell off the end of
+/// `main`. The single-config path already exits `EXIT_RUNTIME`/1 on the same
+/// failure, so the lane matches `-c` here without disturbing the
+/// Go-compatible *refusal* codes pinned above (a directory that does not exist,
+/// is empty, or holds a config that fails to load still exits 2).
+#[test]
+fn config_dir_where_every_service_fails_to_run_exits_like_dash_c() {
+    let dir = TempDir::new();
+    // A port nothing listens on: the login fails immediately (the default
+    // `login_fail_exit = true`), so the only service in the directory stops.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let p = l.local_addr().expect("local_addr").port();
+        drop(l);
+        p
+    };
+    let cfg = format!("serverAddr = \"127.0.0.1\"\nserverPort = {closed}\n");
+    let file = dir.write("frpc.toml", &cfg);
+    let conf_d = dir.path("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    std::fs::write(std::path::Path::new(&conf_d).join("frpc.toml"), &cfg)
+        .expect("write conf.d config");
+
+    let control = run_frpc(&["-c", &file]);
+    assert_eq!(
+        control.status.code(),
+        Some(1),
+        "control: `-c` on a service that cannot log in must exit 1 (EXIT_RUNTIME); \
+         stdout={:?} stderr={:?}",
+        stdout_of(&control),
+        stderr_of(&control),
+    );
+
+    let out = run_frpc(&["--config-dir", &conf_d]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a directory whose only service failed to run served nothing and must not \
+         exit 0; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
 /// `EXIT_AUTH`/3, pinned on the one input where it is a *genuine* divergence
 /// rather than a hardening refusal: a `auth.tokenSource` whose file does not
 /// exist. Go frp v0.71.0 exits **1** here (`failed to resolve auth.tokenSource:
