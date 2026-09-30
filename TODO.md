@@ -6054,7 +6054,7 @@ nothing about whether the described behaviour still holds.
   `git grep -nE '(^|[^a-zA-Z_/.-])go (build|run)' -- scripts/ .github/` finds
   nothing, and `scripts/download-go-frp.sh:29` fetches the **prebuilt** release
   tarball (`https://github.com/fatedier/frp/releases/download/v${VERSION}/…`).
-  It is a leftover of a removed path that `CHANGELOG.md:1329-1330` (0.3.1)
+  It is a leftover of a removed path that `CHANGELOG.md:2359-2360` (0.3.1)
   records — `build_go_frp_v2()` (clone + `go build`, cached to
   `/tmp/frp-source-build/`) exists nowhere in the tree, yet
   `.github/workflows/compat.yml:48` still caches that orphaned
@@ -6072,7 +6072,7 @@ nothing about whether the described behaviour still holds.
   `compat.yml:48`) are the pre-change state and no longer resolve. Re-measured at the new
   head: `git ls-files '*.go'` is still empty, `scripts/download-go-frp.sh:29` still
   fetches the prebuilt release tarball, `build_go_frp_v2()` exists nowhere, and all seven
-  workflow YAMLs parse. `actions/setup-go` survives only in records (`CHANGELOG.md:2344`,
+  workflow YAMLs parse. `actions/setup-go` survives only in records (`CHANGELOG.md:2360`,
   this file, `docs/archive/plans/2026-06-28-xtcp-testing.md`). No gate update was owed —
   `scripts/repo-health.sh`'s toolchain checks match `rustup default` and
   `setup-rust-toolchain` only, never `setup-go` — and the `compat` lane is green at the
