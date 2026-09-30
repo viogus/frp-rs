@@ -1382,8 +1382,10 @@ fi
 #     its `run:` line (`cd x && rustup default stable`), a **quoted scalar**
 #     (`run: "rustup default stable"`), a `rustup default` inside a script or
 #     Makefile the job invokes, and a compiler floated by a container base image.
-#     The Docker source build is one instance of that last case and has its own
-#     TODO.md item; this gate does not cover it.
+#     The Docker source build is one instance of that last case; it is covered
+#     by `docker/Dockerfile.source`'s own fail-closed toolchain assertion (the
+#     `COPY rust-toolchain.toml` + install + active-toolchain check), while
+#     this gate still scans `.github/workflows/` only.
 #   * check (c) above is scoped to the setup-action step and so does not see a
 #     `toolchain:` key that some other action might consume.
 # `floating` was filled by the python scan above (the `D …` hits), which read the

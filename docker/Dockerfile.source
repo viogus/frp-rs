@@ -2,7 +2,7 @@
 # Multi-arch source build for frp-rs Docker images.
 # Supports linux/amd64, linux/arm64, linux/arm/v7 via cargo-zigbuild.
 #
-# Pattern: alpine builder → musl-static binary → scratch runtime (~2 MB total).
+# Pattern: Debian builder → musl-static binary → scratch runtime (~2 MB total).
 # Reference: ~/Codes/scripts/docker/frp/Dockerfile
 #
 # Usage:
