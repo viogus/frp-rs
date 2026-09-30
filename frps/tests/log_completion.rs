@@ -12,10 +12,10 @@
 //! | shape | frp-rs before | Go v0.71.0 |
 //! |---|---|---|
 //! | `[log] level = ""` in the file | **0 B stdout / 0 B stderr**, listener up on `127.0.0.1:<port>` | 273 B on stdout, 3 `INFO` records |
-//! | `[log] maxDays = 0` in the file | logs (1498 B / 7 records), but retention disabled | logs, retains 3 days |
+//! | `[log] maxDays = 0` in the file | logs — 7 `INFO` records at startup (1482 B raw / 915 B stripped, implicit `./frps.toml` lane), 11 records / 2410–2412 B raw over the full run — but retention disabled | logs, retains 3 days |
 //! | `--log-level ""` (CLI) | 0 B / 0 B, listener up | 282 B on stdout, 3 `INFO` records |
 //! | `--log-file ""` (CLI) | 0 B / 0 B **and** a `frps.log.<date>` in the CWD | logs on stdout |
-//! | `[log] to = ""` in the file | logs (1498 B / 7 records), no file created | logs on stdout |
+//! | `[log] to = ""` in the file | logs — same 7-record startup shape (1482 B raw / 915 B stripped), **no** `frps.log.*` file created | logs on stdout |
 //!
 //! The Go rows are the **flags-only** lane (`--bind-port <free>`, 282 B / 3
 //! `INFO` records) or the **config-file** lane (273 B / 3 `INFO` records),
@@ -29,6 +29,15 @@
 //! file. Only the **flag** arm (`--log-file ""`) was broken, and only `level`
 //! and `max_days` had a config-value defect. The pre-fix rows above are the
 //! measured ones, with the false row removed.
+//!
+//! The two `logs` cells are re-measured on the HEAD binary, implicit `./frps.toml`
+//! lane, own free port, stdout only and ANSI-stripped: 7 `INFO` records at startup
+//! = 1482 B raw / 915 B stripped, 11 records over the full run = 2410–2412 B raw
+//! / 1466–1473 B stripped (the `elapsed_secs=` width moves the total by a few
+//! bytes; the pid digits move it by two each). No `frps.log.*` file is created in
+//! either shape. The earlier `1498 B / 7 records` reproduced on neither binary nor
+//! lane; for these two rows the record *shape* is the same on both sides of the
+//! completion fix, which changed retention only (and not `to = ""` at all).
 //!
 //! **What this file models.** The end-to-end effect on the two streams and on the
 //! CWD for the shipped `frps` binary, over two lanes: the config-file lane

@@ -2109,7 +2109,7 @@ fn test_flat_camelcase_tls_spellings_are_not_loader_spellings() {
 
     // 1. Non-strict (the SIGUSR1 reload mode): ignored, every field stays at
     //    its default. In particular `tlsCaFile` must not trigger the
-    //    ca-implies-only fill at `frp-core/src/config/server.rs:524-525`.
+    //    ca-implies-only fill at `frp-core/src/config/server.rs:539-540`.
     for &(key, value) in rejected.iter() {
         let cfg = load_server_config_from_str(&format!("bind_port = 7000\n{key} = {value}\n"))
             .unwrap_or_else(|e| panic!("{key} must not fail the non-strict load: {e}"));

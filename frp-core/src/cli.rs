@@ -904,7 +904,7 @@ fn svr_transport() -> impl Parser<SvrTransport> {
         .argument::<u16>("PORT")
         .optional();
     // Go registers the name with underscores and turns every `_` into `-` via
-    // `WordSepNormalizeFunc` (`pkg/config/flags.go:26-32`), so both spellings
+    // `WordSepNormalizeFunc` (`pkg/config/flags.go:31-36`), so both spellings
     // are accepted and `--help` renders the hyphen form. Same pairing as the
     // two `vhost-http(s)-port` flags above; measured on Go v0.71.0:
     // `frps verify --vhost-http-timeout 30 -c <valid>` and
