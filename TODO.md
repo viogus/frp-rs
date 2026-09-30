@@ -7873,7 +7873,6 @@ section; ledger now **24 open / 104 closed**.**
   (through `Captured.expected`), so its `NoWebServer` arm is dead code — either it is exercised or the arm is
   removed.
 
-- [ ] **`--allow-unsafe`'s comma grammar still differs from pflag's CSV reader, and the ignored-flag twin splits nothing at all.**
 - [x] **`--allow-unsafe`'s comma grammar still differs from pflag's CSV reader, and the ignored-flag twin splits nothing at all.**
   The read-path parser splits on `,` and trims each element (`frp-core/src/cli.rs:2637-2646`, inside
   `allow_unsafe_parser` at `:2632`), while Go's pflag parses a repeated string flag with
@@ -7924,8 +7923,9 @@ section; ledger now **24 open / 104 closed**.**
   occurrences drops the trailing enabling value" among them), and the reviewers' own batteries (the
   round-1 M1o/M1e/M2/M3 set, the round-2 M-col/M-line/M-rune/M-skip/M-EOF set that killed the
   round-1 `M-col` survivor, and the three from the round-2 verification) — matrices in
-  `/private/tmp/rev429-verify.md` and `/private/tmp/rev429r2-attack.md`, every restore
-  sha256-verified. Reviews: round-1 verification
+  `/tmp/author429-round2.md:195-207` (the author's N1–N11), `/private/tmp/rev429-verify.md`,
+  `/private/tmp/rev429r2-attack.md:48-56` and `/private/tmp/rev429r2-verify.md` §5 (the round-2
+  verification's three), every restore sha256-verified. Reviews: round-1 verification
   MERGE-with-findings (F1–F5 fixed here, F6 a body nit), round-2 adversarial CONFIRM at `7d806af8`
   (F1–F3 closed), round-2 verification MERGE-with-findings (F7 the rc cells → fixed in `67f67e1b`,
   F8 body staleness → fixed in the PR), and a round-3 comment-delta verification MERGE on
@@ -7976,9 +7976,10 @@ section; ledger now **24 open / 104 closed**.**
   guard at all.
   **Done-when:** every guarded lane asserts an absolute **floor** (or keeps the exact count alongside
   a floor) so a removal fails without a deliberate records bump, and the full `frpc` lane gets a
-  guard; the delete-plus-lower mutant must red. Note for whoever takes it: this edits the same
-  `health` job region as the RSS-soak step and the compat-stray-guard literals, so it should land
-  after PRs #424/#430 to avoid a literal conflict.
+  guard; the delete-plus-lower mutant must red. Note for whoever takes it: this edits
+  `.github/workflows/ci.yml` in two places — the count literals in the `tests-unit` job (`:136`) and the
+  compat-stray-guard literals in the `health` job (`:97`) — so it should land after PRs #424/#430, which
+  also touch that file, to avoid a literal conflict.
 
 - [ ] **Rust frpc runs the `auth.tokenSource` `exec` command twice per successful login where Go runs it once.**
   Filed by the coordinator from the round-2 adversarial review of PR #429, which measured it and
