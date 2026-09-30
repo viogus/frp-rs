@@ -990,7 +990,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `docs/config.md:192` then loses the `admin`-without-`tls` caveat this filing added,
   because the sentence becomes unconditionally true again. Ledger after filing this item:
   **26 open / 107 closed**.
-  **Done (PR #428).** No caller picks the text any more. `frp-core` exposes a three-valued
+  **Done (PR #428, head `dbcf5cbf`).** No caller picks the text any more. `frp-core` exposes a three-valued
   `WebServerTlsEnableReader` (`frp-core/src/config/loader.rs:257`; `from_features` `:276`, `warning` `:286`;
   the three texts at `:330` dashboard, `:345` no-dashboard, `:368` no-TLS) and the crate that owns the
   feature pair answers it: `frp_client::web_server_tls_enable_reader()` (`frp-client/src/lib.rs:38`, its
@@ -1001,7 +1001,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   server with no `tls`, the build this filing measured printing the dashboard clause — now gets the
   "this build has no TLS support" text. Pinned by the four cells of
   `frp-core/tests/web_server_tls_enable_warning.rs` and by the emitted **record** being compared
-  byte-exactly through `frp-core/tests/common/mod.rs:40` `assert_record_is_exactly_the_message`; the
+  byte-exactly through `frp-core/tests/common/mod.rs:88` `assert_record_is_exactly_the_message`; the
   `micro,admin` shape gets a count-guarded lane (`.github/workflows/ci.yml:1185`, literal 1). The re-key the
   filing's "Entanglement" paragraph demanded was therefore unnecessary — the condition lives in the owning
   crate, not at the sites — and `docs/config.md:192` now states the three-way rule. **Supersedes** the
@@ -7824,15 +7824,15 @@ section; ledger now **24 open / 104 closed**.**
   tests green while the user-visible log line drifts from the static. Done-when: the assertion pins
   the emitted record (equality, or a suffix check that tolerates only the tracing prefix) and the
   appended-clause mutant reds.
-  **(a) Done (PR #428).** The emitted record is now pinned byte-exactly:
-  `frp-core/tests/common/mod.rs:40` `assert_record_is_exactly_the_message(tag, record, want, target)` asserts
+  **(a) Done (PR #428, head `dbcf5cbf`).** The emitted record is now pinned byte-exactly:
+  `frp-core/tests/common/mod.rs:88` `assert_record_is_exactly_the_message(tag, record, want, target)` asserts
   the whole record — `contains(want)`, exactly one occurrence, a tail that is empty or a single `\n`, and a
   prefix that ends with `" frp_core::config::loader: "` — and both captures call it
-  (`frp-core/tests/server_tls_enable_warning.rs:454`,
-  `frp-core/tests/web_server_tls_enable_warning.rs:240` and `:464`). The append-a-clause mutant at the
+  (`frp-core/tests/server_tls_enable_warning.rs:459`,
+  `frp-core/tests/web_server_tls_enable_warning.rs:244` and `:468`). The append-a-clause mutant at the
   web_server emit site (`frp-core/src/config/loader.rs:723`) now reds `4 passed; 2 failed` at
-  `frp-core/tests/common/mod.rs:53` (`got tail: " (see docs/tls.md)\n"`), and an `EXTRA ` prefix mutant at the
-  server site (`:680`) reds `7/1` at `common/mod.rs:65` (`got prefix: " WARN
+  `frp-core/tests/common/mod.rs:102` (`got tail: " (see docs/tls.md)\n"`), and an `EXTRA ` prefix mutant at the
+  server site (`:680`) reds `7/1` at `common/mod.rs:114` (`got prefix: " WARN
   frp_core::config::loader: EXTRA "`). Parts (b), (c) and (d) are untouched.
   (b) `frp-server/src/control/login.rs`'s `request_head_timeout()` accessor is not pinned to a
   non-constant override: a lying accessor that ignores the stored field (`:2343-2349`) and returns
@@ -7854,7 +7854,7 @@ section; ledger now **24 open / 104 closed**.**
 - [ ] **Four residues #428's round-2 adversarial review measured in the new warning pins.** Same
   test-precision class as the item above; none blocks the fix.
   (a) The shared record helper anchors the tracing target only as a counted suffix
-  (`frp-core/tests/common/mod.rs:40` checks `prefix.matches(" frp_core::config::loader: ").count() == 1`
+  (`frp-core/tests/common/mod.rs:88` checks `prefix.matches(" frp_core::config::loader: ").count() == 1`
   and `prefix.ends_with(…)`), so a rewritten `frp-core/src/config/loader.rs:723`
   `warn!(target: "x frp_core::config::loader", …)` keeps the web_server capture green (measured 6/0) while
   the emitted target changes. Done-when: the anchor rejects a prefix key that differs from the constant, or
@@ -7869,7 +7869,7 @@ section; ledger now **24 open / 104 closed**.**
   `frp-core/tests/{server,web_server}_tls_enable_warning.rs`, so `#[ignore]` on
   `the_no_tls_build_names_no_tls_behaviour` yields `5 passed / 1 ignored / exit 0` where every sibling
   delivery lane has a guard. Done-when: both targets get an `-- --list`-derived count literal.
-  (d) `expected_warning` (`frp-core/tests/web_server_tls_enable_warning.rs:113`) is read only at `:243`
+  (d) `expected_warning` (`frp-core/tests/web_server_tls_enable_warning.rs:113`) is read only at `:247`
   (through `Captured.expected`), so its `NoWebServer` arm is dead code — either it is exercised or the arm is
   removed.
 
