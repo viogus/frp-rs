@@ -340,7 +340,9 @@ async fn run(mut cli: FrpsArgs) {
                     // exists; the loader cannot warn (it would be silent on `-c`),
                     // so the binary owns the diagnostic and this path emits it
                     // exactly once, here, like the `-c` branch below.
-                    presence.warn_inert_web_server_tls_enable(cfg!(feature = "dashboard"));
+                    presence.warn_inert_web_server_tls_enable(
+                        frp_server::service::web_server_tls_enable_reader(),
+                    );
                     // The flat server `tls_enable` is inert too; same sink, same
                     // one-record-per-load rule.
                     presence.warn_inert_server_tls_enable();
@@ -690,7 +692,7 @@ async fn run(mut cli: FrpsArgs) {
     // on stderr for both binaries and both paths
     // (`frps/tests/warn_delivery.rs::web_server_tls_enable_warning_reaches_a_dash_c_user`
     // and its `config_dir` sibling).
-    presence.warn_inert_web_server_tls_enable(cfg!(feature = "dashboard"));
+    presence.warn_inert_web_server_tls_enable(frp_server::service::web_server_tls_enable_reader());
     // The flat server `tls_enable` is inert too — no code in `frp-server` or
     // `frps` reads `ServerConfig::tls_enable`, and a restart cannot make it take
     // effect. Same sink, same one-record-per-load rule.

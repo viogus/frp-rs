@@ -72,6 +72,8 @@
 //! one. A change to either text is therefore only seen by the
 //! lane whose feature set selects it.
 
+mod common;
+
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
@@ -90,6 +92,10 @@ use frp_core::config::SERVER_TLS_ENABLE_INERT_TLS_CLAUSES;
 /// The stable substring every assertion counts. If the `tracing::warn!` call is
 /// removed the counts drop to zero; if the message is reworded so this stops
 /// appearing, the tests fail on the needle rather than passing vacuously.
+///
+/// A **counting** needle only: a clause *appended* at the emit site leaves it
+/// green, which is why [`assert_record_is_exactly_the_message`] pins the record's
+/// tail as well.
 const NEEDLE: &str = "tls_enable has no effect on the server";
 
 /// Deliberate goldens for the **rendered bytes**. The clause arrays above are the
@@ -248,6 +254,11 @@ fn subscriber_for(
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
         .without_time()
+        // The byte-exact pin (`common::assert_record_is_exactly_the_message`)
+        // must not depend on a shell variable: `tracing_subscriber::fmt`'s
+        // default layer colours the level and target whenever `NO_COLOR` is
+        // unset or empty, and CI runners do not set it (this dev shell does).
+        .with_ansi(false)
         .with_writer({
             let output = output.clone();
             move || CapturedLogs(output.clone())
@@ -413,6 +424,14 @@ fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
     );
 }
 
+// The record-shape pin lives in `frp-core/tests/common/mod.rs` so the sibling
+// `web_server` capture uses the *same* rule: the emit site writes
+// [`SERVER_TLS_ENABLE_INERT_WARNING`] and nothing else — the message once, only
+// the one-line `tracing` prefix before it, and after it no byte but an optional
+// trailing newline. `contains(NEEDLE)` cannot see an appended clause (measured by
+// appending `" but honestly"` to the `tracing::warn!` at
+// `frp-core/src/config/loader.rs:680`), which is why the tail is pinned there.
+
 /// A written `tls_enable`, in either value, is inert — so it warns, exactly
 /// once, in both strict modes, and the loader itself stays silent.
 #[test]
@@ -437,9 +456,11 @@ fn written_server_tls_enable_warns_once_and_stays_inert() {
             c.warning_records, 1,
             "strict={mode}, tls_enable={written}: exactly one record per load"
         );
-        assert!(
-            c.logged_by_warning_call.contains(NEEDLE),
-            "strict={mode}: the record must be the server message"
+        common::assert_record_is_exactly_the_message(
+            &format!("strict={mode}, tls_enable={written}"),
+            &c.logged_by_warning_call,
+            SERVER_TLS_ENABLE_INERT_WARNING.as_str(),
+            common::WARNING_TARGET,
         );
         // The field really parses to the written value — it is inert because no
         // reader exists, not because the value is lost.

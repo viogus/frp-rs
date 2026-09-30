@@ -51,10 +51,11 @@
 //! **What these tests assert, and what they do not.** Real binary, real config
 //! file, the two streams captured separately, the **number of records per
 //! stream**, that the binary reached its post-`init_logging` startup line, and —
-//! through `assert_clause_matches_this_build` — **which of the two clauses this
-//! build's `cfg!` answer produced**. They do **not** pin the exact log line or
-//! the position of the record; the full text of both clauses is pinned by
-//! `frp-core/tests/web_server_tls_enable_warning.rs`.
+//! through `assert_clause_matches_this_build` — **which of the clauses this
+//! build's reader answer produced**, plus a negative control that it never emits
+//! the no-TLS clause this binary cannot produce. They do **not** pin the exact log
+//! line or the position of the record; the full text of all three clauses is
+//! pinned by `frp-core/tests/web_server_tls_enable_warning.rs`.
 //!
 //! **What it does not cover.** `frps` (the sibling file
 //! `frps/tests/warn_delivery.rs`, which also pins the server's SIGUSR1 reload
@@ -102,9 +103,15 @@ const KEY: &str = "web_server.tls.enable";
 /// server must never print.
 const DASHBOARD_CLAUSE: &str = "plaintext HTTP";
 /// The marker unique to the **no-dashboard-build** clause
-/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD`). The two clauses share
-/// their whole first half, so `KEY` above is in both and cannot tell them apart.
+/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD`). The three texts share
+/// their whole first half, so `KEY` above is in all of them and cannot tell them
+/// apart; these three markers are pairwise disjoint.
 const NO_DASHBOARD_CLAUSE: &str = "no dashboard support";
+/// The marker unique to the **no-TLS-build** clause
+/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS`). Unreachable from this binary —
+/// see `assert_clause_matches_this_build_in` — so it is used only as a negative
+/// control.
+const NO_TLS_CLAUSE: &str = "no TLS support";
 /// The **server-side** flat `tls_enable` diagnostic. It must never appear in
 /// `frpc`: `ClientConfig::tls_enable` is live (it decides whether the control
 /// connection is encrypted — `frp-client/src/control.rs`), so the "no effect"
@@ -377,18 +384,27 @@ fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
 /// The clause the emitted record must carry — decided by **this build**, not by
 /// a literal argument.
 ///
-/// Both variants open with the same `web_server.tls.enable has no effect: …`, so
-/// the count assertions above pass either way: a call site that hardcodes the
-/// other answer still compiles and still emits one `KEY` record. The call sites
-/// this file reaches are `frpc/src/main.rs:527` (`--config-dir`), `:602` (`-c`)
-/// and `:776` (`verify`). `frp-core`'s own dispatch test passes `has_dashboard`
-/// as an argument, so only this `cfg!`-keyed assertion on the captured output can
-/// see what the binary answered.
+/// All three variants open with the same `web_server.tls.enable has no effect: …`,
+/// so the count assertions above pass either way: a call site that hardcodes
+/// another answer still compiles and still emits one `KEY` record. The call sites
+/// this file reaches are `frpc/src/main.rs:529` (`--config-dir`), `:606` (`-c`)
+/// and `:791` (`verify`). `frp-core`'s own dispatch test passes the caller's
+/// answer as an argument, so only this assertion on the captured output can see
+/// what the binary answered.
 ///
 /// Keyed on **`admin`**, the client's own word (`frp-client`'s `admin` feature,
 /// which `frpc` forwards) — not on `dashboard`, which `frpc` does not have. The
 /// plain `cargo test -p frpc` lane runs with `admin` off, so the no-dashboard
 /// direction is pinned there without a new lane.
+///
+/// The **no-TLS** clause is unreachable from this file by construction: it is
+/// gated on `full`, and `full = ["frp-client/default"]` always turns
+/// `frp-client/tls` on, so `frp_client::web_server_tls_enable_reader()` can only
+/// answer `WebServerTls` (admin on) or `NoWebServer` (admin off). The negative
+/// control below holds that in every combination in which this file compiles;
+/// the positive pin for the no-TLS clause is
+/// `frp-client/tests/reload_warning_delivery.rs` in the `--no-default-features
+/// --features admin` lane.
 fn assert_clause_matches_this_build(tag: &str, spawned: &Spawned) {
     let out = spawned.stdout();
     let err = spawned.stderr();
@@ -399,6 +415,15 @@ fn assert_clause_matches_this_build(tag: &str, spawned: &Spawned) {
 /// `verify` row below), so exactly one place decides which clause this build
 /// must carry.
 fn assert_clause_matches_this_build_in(tag: &str, out: &str, err: &str) {
+    // This binary cannot be the no-TLS build: the file is gated on `full`, and
+    // `full` always enables `frp-client/tls`. A call site that answered
+    // `WebServerNoTls` is wrong here even though its text would still contain
+    // `KEY`, so this is the file's only guard against that answer.
+    assert!(
+        !out.contains(NO_TLS_CLAUSE),
+        "{tag}: this binary always links frp-client's `tls` feature, so it must never emit the \
+         no-TLS clause ({NO_TLS_CLAUSE:?})\n--- stdout ---\n{out}"
+    );
     if cfg!(feature = "admin") {
         assert!(
             out.contains(DASHBOARD_CLAUSE),
@@ -553,7 +578,7 @@ fn no_server_tls_enable_warning_in_frpc_where_the_field_is_live() {
 fn frpc_verify_says_nothing_about_the_server_tls_enable_key() {
     let dir = TempDir::new("srv-key-verify");
     // The nested key is what lets this row witness the `verify` call site
-    // (`frpc/src/main.rs:776`): with no `[web_server.tls] enable` the presence
+    // (`frpc/src/main.rs:791`): with no `[web_server.tls] enable` the presence
     // flag stays unset and the record never fires, so a hardcoded answer there
     // was invisible to every lane.
     let cfg = format!(

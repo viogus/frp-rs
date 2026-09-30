@@ -37,9 +37,11 @@
 //! `request_reload()` (that is `frpc/src/main.rs`; the probe exercises it end to
 //! end with the real binary and a real `kill -USR1`), the server's reload
 //! (`frps/tests/warn_delivery.rs::a_sigusr1_reload_delivers_the_warning_again`),
-//! and the exact log line: this file asserts the clause this crate's `cfg!`
-//! answer produced, while the full text of both clauses is pinned by
-//! `frp-core/tests/web_server_tls_enable_warning.rs`.
+//! and the exact log line: this file asserts the clause this crate's
+//! `web_server_tls_enable_reader()` answer produced, while the full text of all
+//! three clauses is pinned by `frp-core/tests/web_server_tls_enable_warning.rs`.
+//! It is the only target that pins the **no-TLS** clause in the crate that emits
+//! it (`frp-client --no-default-features --features admin`).
 
 mod common;
 
@@ -58,9 +60,15 @@ const KEY: &str = "web_server.tls.enable";
 /// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING`).
 const DASHBOARD_CLAUSE: &str = "plaintext HTTP";
 /// The marker unique to the **no-dashboard-build** clause
-/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD`). The two texts share
-/// their whole first half, so `KEY` is in both and cannot tell them apart.
+/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD`). The texts share their
+/// whole first half, so `KEY` is in all of them and cannot tell them apart.
 const NO_DASHBOARD_CLAUSE: &str = "no dashboard support";
+/// The marker unique to the **no-TLS-build** clause
+/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS`) — the `admin`-without-`tls`
+/// shape, which compiles an admin server but no acceptor for it. This is the
+/// clause the `--no-default-features --features admin` lane exists to pin; the
+/// three markers are pairwise disjoint.
+const NO_TLS_CLAUSE: &str = "no TLS support";
 const TOKEN: &str = "reload-warning-token";
 /// How long the reload may take to emit the record.
 const RELOAD_TIMEOUT: Duration = Duration::from_secs(20);
@@ -89,34 +97,32 @@ fn occurrences(haystack: &str, needle: &str) -> usize {
 
 /// The clause the reloaded record must carry — decided by **this crate's**
 /// build, not by a literal argument. `Service::reload_from_sources`
-/// (`frp-client/src/service.rs:4457`) passes `cfg!(feature = "admin")`, so a
-/// site that hardcodes the other answer still compiles and still emits one
-/// `KEY` record; only this `cfg!`-keyed assertion can see what this build
-/// answered. Both CI configurations exercise this target, one per branch:
-/// `-p frp-client --features admin` (admin on) and
-/// `-p frp-client --no-default-features --all-targets` (admin off).
+/// (`frp-client/src/service.rs:4458`) passes
+/// `frp_client::web_server_tls_enable_reader()`, which answers from this crate's
+/// own `admin` and `tls` features; a site that hardcodes any of the three
+/// answers still compiles and still emits one `KEY` record, so only a
+/// `cfg!`-keyed assertion can see what this build answered. CI exercises all
+/// three answers, one per lane: `-p frp-client --features admin` (admin + tls →
+/// the dashboard clause), `-p frp-client --no-default-features --all-targets`
+/// (neither → the no-dashboard clause) and `-p frp-client --no-default-features
+/// --features admin` (admin without tls → the no-TLS clause).
 fn assert_clause_matches_this_build(tag: &str, logged: &str) {
-    if cfg!(feature = "admin") {
+    // The same question `WebServerTlsEnableReader::from_features` asks, in the
+    // same order: `admin` decides whether this build compiles a server at all,
+    // and `tls` whether that server can accept HTTPS.
+    let (expected, absent) = match (cfg!(feature = "admin"), cfg!(feature = "tls")) {
+        (true, true) => (DASHBOARD_CLAUSE, [NO_DASHBOARD_CLAUSE, NO_TLS_CLAUSE]),
+        (true, false) => (NO_TLS_CLAUSE, [DASHBOARD_CLAUSE, NO_DASHBOARD_CLAUSE]),
+        (false, _) => (NO_DASHBOARD_CLAUSE, [DASHBOARD_CLAUSE, NO_TLS_CLAUSE]),
+    };
+    assert!(
+        logged.contains(expected),
+        "{tag}: the record must carry this build's clause ({expected:?})\n--- captured ---\n{logged}"
+    );
+    for other in absent {
         assert!(
-            logged.contains(DASHBOARD_CLAUSE),
-            "{tag}: an admin build's record must keep the dashboard clause \
-             ({DASHBOARD_CLAUSE:?})\n--- captured ---\n{logged}"
-        );
-        assert!(
-            !logged.contains(NO_DASHBOARD_CLAUSE),
-            "{tag}: an admin build's record must not claim it has no dashboard support \
-             ({NO_DASHBOARD_CLAUSE:?})\n--- captured ---\n{logged}"
-        );
-    } else {
-        assert!(
-            logged.contains(NO_DASHBOARD_CLAUSE),
-            "{tag}: a build with no admin server must name its own build fact rather than the \
-             dashboard's ({NO_DASHBOARD_CLAUSE:?})\n--- captured ---\n{logged}"
-        );
-        assert!(
-            !logged.contains(DASHBOARD_CLAUSE),
-            "{tag}: a build with no admin server must not describe the dashboard's TLS \
-             ({DASHBOARD_CLAUSE:?})\n--- captured ---\n{logged}"
+            !logged.contains(other),
+            "{tag}: the record must not carry another build's clause ({other:?})\n--- captured ---\n{logged}"
         );
     }
 }

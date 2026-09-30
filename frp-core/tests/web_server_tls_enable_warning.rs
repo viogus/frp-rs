@@ -47,17 +47,23 @@
 //! record for `enable = false` with no pair. All four are pinned below; the
 //! message text is written to be true in every one of them.
 //!
-//! **Two variants, one per build.** The `web_server` reader lives behind
+//! **Three variants, one per build.** The `web_server` reader lives behind
 //! `frp-server`'s `dashboard` feature (the dashboard) and `frp-client`'s `admin`
 //! feature (the client's admin server/API) — and `frp-core` has **neither**, so a
 //! `#[cfg(feature = "dashboard")]` here would be constant `false` in every
 //! configuration and pin nothing. The awareness is therefore supplied by the
-//! caller: `warn_inert_web_server_tls_enable(has_dashboard)` emits the dashboard
-//! variant when the caller compiles one and the no-dashboard variant when it does
-//! not. The variants are the two constants this file exercises directly, and
-//! `the_no_dashboard_build_names_no_dashboard_behaviour` pins both the text and
-//! the selection; the callers pass `cfg!(feature = "dashboard")` (`frps`,
-//! `frp-server`) or `cfg!(feature = "admin")` (`frpc`, `frp-client`).
+//! caller: `warn_inert_web_server_tls_enable(reader)` takes the
+//! [`WebServerTlsEnableReader`] that the crate owning **both** features resolved
+//! (`frp_client::web_server_tls_enable_reader` /
+//! `frp_server::service::web_server_tls_enable_reader`) and emits the dashboard
+//! variant when that build has a web server that can serve HTTPS, the no-TLS
+//! variant when it has a web server but not the `tls` feature that gates its
+//! acceptor, and the no-dashboard variant when it has no web server at all. It is
+//! deliberately **not** the binary's own `cfg!`: `frpc/tls` is off in every
+//! default build while `frp-client/tls` is on. The variants are the three
+//! constants this file exercises directly, and
+//! `the_no_dashboard_build_names_no_dashboard_behaviour` /
+//! `the_no_tls_build_names_no_tls_behaviour` pin the texts and the selection.
 //!
 //! **What it does not cover.** Delivery on a real binary is
 //! `frps/tests/warn_delivery.rs` and `frpc/tests/warn_delivery.rs` (real
@@ -74,12 +80,15 @@
 //! format cases. The measured before/after table lives in `docs/config.md` and
 //! `CHANGELOG.md`.
 
+mod common;
+
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 use frp_core::config::{
-    load_server_config_uncompleted_with_presence, ConfigPresence,
+    load_server_config_uncompleted_with_presence, ConfigPresence, WebServerTlsEnableReader,
     WEB_SERVER_TLS_ENABLE_INERT_WARNING, WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD,
+    WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS,
 };
 
 #[derive(Clone)]
@@ -96,9 +105,23 @@ impl Write for CapturedLogs {
     }
 }
 
+/// The one message the emit site is allowed to render for `reader` — the same
+/// three-way choice [`WebServerTlsEnableReader`] makes. Its `warning()` is
+/// crate-private, so the test restates the mapping; the dispatch assertions in
+/// `the_no_dashboard_build_names_no_dashboard_behaviour` are the independent
+/// witness that the emit site agrees with it.
+fn expected_warning(reader: WebServerTlsEnableReader) -> &'static str {
+    match reader {
+        WebServerTlsEnableReader::NoWebServer => WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD,
+        WebServerTlsEnableReader::WebServerNoTls => WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS,
+        WebServerTlsEnableReader::WebServerTls => WEB_SERVER_TLS_ENABLE_INERT_WARNING,
+    }
+}
+
 /// One captured load: the text emitted **during the load**, the text the
 /// `warn_inert_web_server_tls_enable` call appended (with its record count), the
-/// presence flag, and the effective cert/key pair.
+/// presence flag, the effective cert/key pair, and the full message the caller's
+/// answer selects.
 struct Captured {
     logged_during_load: String,
     warning_records: usize,
@@ -106,6 +129,7 @@ struct Captured {
     presence: ConfigPresence,
     cert: String,
     key: String,
+    expected: &'static str,
 }
 
 fn snapshot(output: &Arc<Mutex<Vec<u8>>>) -> String {
@@ -115,27 +139,33 @@ fn snapshot(output: &Arc<Mutex<Vec<u8>>>) -> String {
 /// Load `body` through the real loader and then call the binaries' entry point,
 /// all under one capturing subscriber, and return what each phase emitted.
 ///
-/// Models a caller that **compiles a dashboard** — the `frps --features
+/// Models a caller that **compiles a dashboard with TLS** — the `frps --features
 /// dashboard` / `frpc --features admin` shape the pair clause describes. This
-/// crate has no `dashboard` feature and so cannot derive that answer; the
-/// no-dashboard shape is [`load_capturing_as`] with `has_dashboard = false`.
+/// crate has no `dashboard`/`admin` feature and so cannot derive that answer;
+/// the other two shapes are [`load_capturing_as`] with
+/// [`WebServerTlsEnableReader::NoWebServer`] and
+/// [`WebServerTlsEnableReader::WebServerNoTls`].
 fn load_capturing(body: &str, strict: bool) -> Captured {
-    load_capturing_as(body, strict, true)
+    load_capturing_as(body, strict, WebServerTlsEnableReader::WebServerTls)
 }
 
 /// [`load_capturing`] with the caller's build answer given explicitly, so the
-/// no-dashboard variant is exercised too.
-fn load_capturing_as(body: &str, strict: bool, has_dashboard: bool) -> Captured {
-    load_capturing_files_as(&[("frps.toml", body)], strict, has_dashboard)
+/// no-dashboard and no-TLS variants are exercised too.
+fn load_capturing_as(body: &str, strict: bool, reader: WebServerTlsEnableReader) -> Captured {
+    load_capturing_files_as(&[("frps.toml", body)], strict, reader)
 }
 
 /// [`load_capturing`] with extra files in the same directory, so the `includes`
 /// spelling (which is deep-merged before the detector runs) can be exercised.
 fn load_capturing_files(files: &[(&str, &str)], strict: bool) -> Captured {
-    load_capturing_files_as(files, strict, true)
+    load_capturing_files_as(files, strict, WebServerTlsEnableReader::WebServerTls)
 }
 
-fn load_capturing_files_as(files: &[(&str, &str)], strict: bool, has_dashboard: bool) -> Captured {
+fn load_capturing_files_as(
+    files: &[(&str, &str)],
+    strict: bool,
+    reader: WebServerTlsEnableReader,
+) -> Captured {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("frps.toml");
     for (name, body) in files {
@@ -146,6 +176,10 @@ fn load_capturing_files_as(files: &[(&str, &str)], strict: bool, has_dashboard: 
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
         .without_time()
+        // Byte-exact pins must not depend on a shell variable: the default fmt
+        // layer colours the level and target unless `NO_COLOR` is set and
+        // non-empty, and CI runners do not set it.
+        .with_ansi(false)
         .with_writer({
             let output = output.clone();
             move || CapturedLogs(output.clone())
@@ -164,7 +198,7 @@ fn load_capturing_files_as(files: &[(&str, &str)], strict: bool, has_dashboard: 
     let key = cfg.web_server.tls_key().to_string();
 
     let before = output.lock().unwrap().len();
-    presence.warn_inert_web_server_tls_enable(has_dashboard);
+    presence.warn_inert_web_server_tls_enable(reader);
     let appended = String::from_utf8(output.lock().unwrap()[before..].to_vec()).unwrap();
     drop(guard);
 
@@ -175,6 +209,7 @@ fn load_capturing_files_as(files: &[(&str, &str)], strict: bool, has_dashboard: 
         presence,
         cert,
         key,
+        expected: expected_warning(reader),
     }
 }
 
@@ -201,16 +236,16 @@ fn nested_web_server_tls_enable_warns_once_and_stays_inert() {
         "exactly one warning per load; got: {}",
         c.logged_by_warning_call
     );
-    assert!(
-        c.logged_by_warning_call.contains("cert_file")
-            && c.logged_by_warning_call.contains("key_file"),
-        "the warning names the pair that actually drives the dashboard TLS; got: {}",
-        c.logged_by_warning_call
-    );
-    assert!(
-        c.logged_by_warning_call.contains("plaintext HTTP"),
-        "with no pair the warning must say what the dashboard actually serves; got: {}",
-        c.logged_by_warning_call
+    // The **whole record**, not a substring of it: it names the pair that
+    // actually drives the dashboard TLS (`cert_file` + `key_file`) and what the
+    // dashboard serves without one (`plaintext HTTP`), and nothing may be
+    // appended to that message. The helper rejects the appended-clause mutant
+    // measured against the previous `contains` assertions.
+    common::assert_record_is_exactly_the_message(
+        "enable = true, no pair",
+        &c.logged_by_warning_call,
+        c.expected,
+        common::WARNING_TARGET,
     );
 
     // The four `enable`/pair combinations. Every one of them sets the flag and
@@ -298,45 +333,86 @@ fn nested_web_server_tls_enable_warns_once_and_stays_inert() {
 /// `admin` feature, so it cannot resolve this itself — a
 /// `#[cfg(feature = "dashboard")]` inside it would be constant `false` in every
 /// configuration and would pin nothing. The caller answers instead, and these are
-/// the two texts it chooses between. The first half pins the texts; the second
-/// drives the real loader and entry point both ways, so a variant that ignored
-/// `has_dashboard` — or a no-dashboard text that inherited a dashboard fact —
-/// fails here.
+/// the three texts it chooses between. The first half pins the texts; the second
+/// drives the real loader and entry point all three ways, so a variant that
+/// ignored the caller's answer — or a text that inherited a fact of a different
+/// build — fails here. The **third** text (a web server with no `tls`) has its
+/// own test, `the_no_tls_build_names_no_tls_behaviour`.
 #[test]
 fn the_no_dashboard_build_names_no_dashboard_behaviour() {
     const NEEDLE: &str = "web_server.tls.enable has no effect";
 
-    // Both texts are still the same diagnostic, and they are distinct: the
-    // dispatch assertions below use `contains`, so one must not be a substring of
-    // the other.
-    for text in [
-        WEB_SERVER_TLS_ENABLE_INERT_WARNING,
-        WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD,
-    ] {
+    // All three texts are the same diagnostic, and they are pairwise distinct:
+    // the dispatch assertions below use `contains`, so no one may be a substring
+    // of another.
+    let texts = [
+        ("dashboard", WEB_SERVER_TLS_ENABLE_INERT_WARNING),
+        ("no-tls", WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS),
+        (
+            "no-dashboard",
+            WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD,
+        ),
+    ];
+    for (name, text) in texts {
         assert!(
             text.contains(NEEDLE),
-            "both variants name the key; got: {text}"
+            "every variant names the key; the {name} variant got: {text}"
         );
     }
-    assert!(
-        !WEB_SERVER_TLS_ENABLE_INERT_WARNING
-            .contains(WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD)
-            && !WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD
-                .contains(WEB_SERVER_TLS_ENABLE_INERT_WARNING),
-        "the two variants must be distinct texts, not one a substring of the other"
-    );
+    for (name, text) in texts {
+        for (other, other_text) in texts {
+            if other != name {
+                assert!(
+                    !text.contains(other_text),
+                    "the {name} variant must not contain the {other} variant's text, because the \
+                     delivery pins dispatch on substrings; got: {text}"
+                );
+            }
+        }
+    }
 
-    // Facts that only a build with a dashboard may state.
+    // Markers each variant alone may carry. The whole-constant loop above cannot
+    // see a **shared** marker phrase added to a third text — measured: appending
+    // `" no TLS support"` to the dashboard text survives it (no variant contains
+    // another whole text), while the emitted record would then claim another
+    // build's fact. So cross-check the markers themselves.
+    for (owner, marker) in [
+        ("dashboard", "cert_file"),
+        ("dashboard", "key_file"),
+        ("dashboard", "plaintext HTTP"),
+        ("no-tls", "no TLS support"),
+        ("no-dashboard", "no dashboard support"),
+        ("no-dashboard", "no dashboard HTTPS server is built"),
+    ] {
+        for (name, text) in texts {
+            if name != owner {
+                assert!(
+                    !text.contains(marker),
+                    "the {name} variant must not carry the {owner} variant's marker `{marker}`; \
+                     got: {text}"
+                );
+            }
+        }
+    }
+
+    // Facts that only a build whose web server can serve HTTPS may state.
     for fact in ["cert_file", "key_file", "plaintext HTTP"] {
         assert!(
             WEB_SERVER_TLS_ENABLE_INERT_WARNING.contains(fact),
             "the dashboard variant names `{fact}`"
         );
-        assert!(
-            !WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD.contains(fact),
-            "a build with no dashboard must not name `{fact}`; got: \
-             {WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD}"
-        );
+        for (name, text) in [
+            ("no-tls", WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS),
+            (
+                "no-dashboard",
+                WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD,
+            ),
+        ] {
+            assert!(
+                !text.contains(fact),
+                "the {name} variant must not name `{fact}`; got: {text}"
+            );
+        }
     }
 
     // What the no-dashboard variant says instead: the build's own inertness.
@@ -349,44 +425,111 @@ fn the_no_dashboard_build_names_no_dashboard_behaviour() {
     }
 
     // The selection itself, through the real loader and entry point. Same body,
-    // two caller answers, two different records.
+    // three caller answers, three different records — each of them exactly one,
+    // and each carrying only its own variant's text.
     let body = "bind_port = 7000\ntoken = \"t\"\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
                 [web_server.tls]\nenable = true\n";
 
-    let with_dashboard = load_capturing_as(body, false, true);
-    assert!(with_dashboard.presence.web_server_tls_enable_set());
-    assert_eq!(with_dashboard.warning_records, 1);
-    assert!(
-        with_dashboard
-            .logged_by_warning_call
-            .contains(WEB_SERVER_TLS_ENABLE_INERT_WARNING),
-        "a dashboard build emits the dashboard variant; got: {}",
-        with_dashboard.logged_by_warning_call
-    );
-    assert!(
-        !with_dashboard
-            .logged_by_warning_call
-            .contains(WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD),
-        "a dashboard build must not emit the no-dashboard variant; got: {}",
-        with_dashboard.logged_by_warning_call
-    );
+    for (reader, expected, absent) in [
+        (
+            WebServerTlsEnableReader::WebServerTls,
+            WEB_SERVER_TLS_ENABLE_INERT_WARNING,
+            [
+                WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS,
+                WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD,
+            ],
+        ),
+        (
+            WebServerTlsEnableReader::WebServerNoTls,
+            WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS,
+            [
+                WEB_SERVER_TLS_ENABLE_INERT_WARNING,
+                WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD,
+            ],
+        ),
+        (
+            WebServerTlsEnableReader::NoWebServer,
+            WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD,
+            [
+                WEB_SERVER_TLS_ENABLE_INERT_WARNING,
+                WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS,
+            ],
+        ),
+    ] {
+        let c = load_capturing_as(body, false, reader);
+        assert!(
+            c.presence.web_server_tls_enable_set(),
+            "{reader:?}: the presence flag must survive the load"
+        );
+        assert_eq!(c.warning_records, 1, "{reader:?}: exactly one record");
+        // The record is exactly this variant's text — `contains(expected)` could
+        // not see a clause appended at the emit site or a literal injected
+        // before it, which is why the whole shape is pinned.
+        common::assert_record_is_exactly_the_message(
+            &format!("{reader:?}"),
+            &c.logged_by_warning_call,
+            expected,
+            common::WARNING_TARGET,
+        );
+        for other in absent {
+            assert!(
+                !c.logged_by_warning_call.contains(other),
+                "{reader:?} must not emit another build's variant (`{other}`); got: {}",
+                c.logged_by_warning_call
+            );
+        }
+    }
+}
 
-    let without_dashboard = load_capturing_as(body, false, false);
-    assert!(without_dashboard.presence.web_server_tls_enable_set());
-    assert_eq!(without_dashboard.warning_records, 1);
-    assert!(
-        without_dashboard
-            .logged_by_warning_call
-            .contains(WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD),
-        "a build with no dashboard emits the no-dashboard variant; got: {}",
-        without_dashboard.logged_by_warning_call
+/// The **third** text: a build that compiles a web server (so the no-dashboard
+/// text would be false) but not the `tls` feature that gates its acceptor (so
+/// the dashboard text would be false) — the `frpc --no-default-features
+/// --features micro,admin` shape.
+///
+/// It must stay disjoint from both siblings, because the delivery pins dispatch
+/// on substrings: it names neither the `cert_file` + `key_file` pair nor
+/// `plaintext HTTP` (the dashboard clause's facts) nor `no dashboard support`
+/// (the no-dashboard clause's). `from_features` is pinned here too, including
+/// the `(false, true)` cell: a build with no web server at all is
+/// [`WebServerTlsEnableReader::NoWebServer`] whatever its `tls` feature says,
+/// because that feature gates an acceptor that build never compiles.
+#[test]
+fn the_no_tls_build_names_no_tls_behaviour() {
+    for fact in ["web_server.tls.enable has no effect", "no TLS support"] {
+        assert!(
+            WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS.contains(fact),
+            "the no-TLS variant names `{fact}`; got: {WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS}"
+        );
+    }
+    for forbidden in [
+        "cert_file",
+        "key_file",
+        "plaintext HTTP",
+        "no dashboard support",
+    ] {
+        assert!(
+            !WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS.contains(forbidden),
+            "the no-TLS variant must not claim a fact of another build (`{forbidden}`); got: \
+             {WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS}"
+        );
+    }
+
+    use WebServerTlsEnableReader::{NoWebServer, WebServerNoTls, WebServerTls};
+    assert_eq!(
+        WebServerTlsEnableReader::from_features(true, true),
+        WebServerTls
     );
-    assert!(
-        !without_dashboard
-            .logged_by_warning_call
-            .contains(WEB_SERVER_TLS_ENABLE_INERT_WARNING),
-        "a build with no dashboard must not emit the dashboard variant; got: {}",
-        without_dashboard.logged_by_warning_call
+    assert_eq!(
+        WebServerTlsEnableReader::from_features(true, false),
+        WebServerNoTls
+    );
+    assert_eq!(
+        WebServerTlsEnableReader::from_features(false, false),
+        NoWebServer
+    );
+    assert_eq!(
+        WebServerTlsEnableReader::from_features(false, true),
+        NoWebServer
     );
 }
 
@@ -617,6 +760,9 @@ fn the_string_loader_stays_silent() {
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
         .without_time()
+        // Same reason as the capture above: keep this one ANSI-free too, so
+        // the silence assertion reads the same bytes in every lane.
+        .with_ansi(false)
         .with_writer({
             let output = output.clone();
             move || CapturedLogs(output.clone())
