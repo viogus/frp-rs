@@ -1,6 +1,8 @@
 use crate::Cli;
 use anyhow::{Context, Result};
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -21,7 +23,20 @@ pub async fn run(cli: &Cli) -> Result<()> {
     };
     let payload = vec![0xABu8; PAYLOAD_SIZE];
     let deadline = tokio::time::Instant::now() + Duration::from_secs(cli.duration);
-    let mut total_bytes: u64 = 0;
+    // Bytes are accumulated through a shared counter rather than returned by
+    // each task, so a stream that moves gigabytes and *then* fails still has
+    // its progress recorded. Returning per-task totals discarded the partial
+    // count on error, which made a killed mid-run bridge look like it had
+    // transferred nothing at all.
+    let total = Arc::new(AtomicU64::new(0));
+    // Optional per-stream byte-rate ceiling. `--mbps 0` (the default) keeps the
+    // historical unpaced behaviour that the throughput baseline depends on;
+    // a soak sets it so hours of traffic do not saturate the host.
+    let per_stream_bps = if cli.mbps > 0 {
+        cli.mbps as f64 * 1024.0 * 1024.0
+    } else {
+        0.0
+    };
     // Per-read/write/connect cap: keep it below the test window so a stalled
     // bridge cannot swallow the whole run, but never smaller than 2s.
     let io_timeout = Duration::from_secs(cli.duration.clamp(2, 5));
@@ -39,12 +54,14 @@ pub async fn run(cli: &Cli) -> Result<()> {
     for i in 0..streams {
         let target = target.clone();
         let payload = payload.clone();
+        let total = total.clone();
         handles.push(tokio::spawn(async move {
             let mut stream = tokio::time::timeout(io_timeout, TcpStream::connect(&target))
                 .await
                 .map_err(|_| anyhow::anyhow!("stream {} connect timed out", i))?
                 .with_context(|| format!("stream {} connect failed", i))?;
             let mut bytes = 0u64;
+            let stream_start = tokio::time::Instant::now();
             let mut buf = vec![0u8; PAYLOAD_SIZE];
             while tokio::time::Instant::now() < deadline {
                 tokio::time::timeout(io_timeout, stream.write_all(&payload))
@@ -58,15 +75,23 @@ pub async fn run(cli: &Cli) -> Result<()> {
                         anyhow::anyhow!("stream {} read timed out (stalled bridge?)", i)
                     })??;
                 bytes += (PAYLOAD_SIZE * 2) as u64; // sent + received
+                total.fetch_add((PAYLOAD_SIZE * 2) as u64, Ordering::Relaxed);
+                if per_stream_bps > 0.0 {
+                    let target = Duration::from_secs_f64(bytes as f64 / per_stream_bps);
+                    let spent = stream_start.elapsed();
+                    if spent < target {
+                        tokio::time::sleep(target - spent).await;
+                    }
+                }
             }
-            Ok::<u64, anyhow::Error>(bytes)
+            Ok::<(), anyhow::Error>(())
         }));
     }
 
     let mut failed_streams = 0usize;
     for h in handles {
         match h.await {
-            Ok(Ok(bytes)) => total_bytes += bytes,
+            Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 failed_streams += 1;
                 tracing::error!(error = ?e, "Throughput stream failed: {:#}", e)
@@ -77,6 +102,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
             }
         }
     }
+    let total_bytes = total.load(Ordering::Relaxed);
 
     let mbps = (total_bytes as f64 / (1024.0 * 1024.0)) / cli.duration as f64;
     tracing::info!(
@@ -96,7 +122,9 @@ pub async fn run(cli: &Cli) -> Result<()> {
             "label": cli.label,
             "streams": streams,
             "duration_s": cli.duration,
+            "mbps_cap_per_stream": cli.mbps,
             "total_bytes": total_bytes,
+            "failed_streams": failed_streams,
             "mbps": mbps,
         });
         let mut opts = std::fs::OpenOptions::new();
@@ -118,6 +146,15 @@ pub async fn run(cli: &Cli) -> Result<()> {
     if total_bytes == 0 && failed_streams > 0 {
         anyhow::bail!(
             "throughput invalid: {failed_streams}/{streams} streams failed, 0 bytes transferred"
+        );
+    }
+    // A partial failure still yields a number, but it is not a measurement of
+    // the bridge: refuse to publish it unless the caller explicitly opted out
+    // (the soak does, because a torn-down stack is reported by its own abort
+    // path and the partial byte count is wanted as evidence).
+    if failed_streams > 0 && !cli.no_floor {
+        anyhow::bail!(
+            "throughput invalid: {failed_streams}/{streams} streams failed after {total_bytes} bytes"
         );
     }
 

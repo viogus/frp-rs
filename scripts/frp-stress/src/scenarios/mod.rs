@@ -1,21 +1,26 @@
-pub mod memory;
-pub mod connections;
-pub mod throughput;
-pub mod longevity;
 pub mod burst;
-pub mod mixed;
+pub mod connections;
 pub mod echo;
 pub mod latency;
+pub mod longevity;
+pub mod memory;
+pub mod mixed;
+pub mod throughput;
 
 use crate::Cli;
 use anyhow::Result;
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 
 /// Run all scenarios sequentially. Each exits non-zero on failure.
 pub async fn run_all(cli: &Cli) -> Result<()> {
-    let scenarios: &[(&str, fn(&Cli) -> Pin<Box<dyn Future<Output = Result<()>> + '_>>)] = &[
-        ("memory", |c| Box::pin(memory::run_with_mode(c, "idle_hold"))),
+    let scenarios: &[(
+        &str,
+        fn(&Cli) -> Pin<Box<dyn Future<Output = Result<()>> + '_>>,
+    )] = &[
+        ("memory", |c| {
+            Box::pin(memory::run_with_mode(c, "idle_hold"))
+        }),
         ("connections", |c| Box::pin(connections::run(c))),
         ("throughput", |c| Box::pin(throughput::run(c))),
         ("longevity", |c| Box::pin(longevity::run(c))),
