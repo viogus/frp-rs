@@ -780,15 +780,7 @@ fn svr_auth() -> impl Parser<SvrAuth> {
         .long("allow_ports")
         .argument::<String>("RANGES")
         .optional();
-    let allow_unsafe = long("allow-unsafe")
-        .long("allow_unsafe")
-        .argument::<String>("FEATURES")
-        .map(|s| {
-            s.split(',')
-                .map(|x| x.trim().to_string())
-                .collect::<Vec<_>>()
-        })
-        .fallback(vec![]);
+    let allow_unsafe = allow_unsafe_parser();
     construct!(SvrAuth {
         token,
         allow_ports,
@@ -991,16 +983,22 @@ fn frps_parser() -> impl Parser<FrpsCmd> {
 /// The `frps verify` subcommand, mirroring Go's `verifyCmd`
 /// (`cmd/frps/verify.go`, registered on `rootCmd` at `:29`).
 ///
-/// Go's `verifyCmd` reads exactly two persistent root flags — `cfgFile` and
-/// `strictConfigMode` (`cmd/frps/verify.go:36,40`) — and **accepts and ignores**
-/// every other flag Go's `frps` root registers, because they hang off `rootCmd`:
-/// `config.RegisterServerConfigFlags(rootCmd, &serverCfg)` (`cmd/frps/root.go:50`)
-/// plus `--version` and `--allow-unsafe` (`:44-48`). Measured on Go v0.71.0:
+/// Go's `verifyCmd` reads exactly two persistent root flags itself — `cfgFile`
+/// and `strictConfigMode` (`cmd/frps/verify.go:36,40`) — and **accepts and
+/// ignores** every other flag Go's `frps` root registers, because they hang off
+/// `rootCmd`: `config.RegisterServerConfigFlags(rootCmd, &serverCfg)`
+/// (`cmd/frps/root.go:50`) plus `--version` and `--allow-unsafe` (`:44-48`).
+/// One of those "ignored" flags is not really ignored on either side:
+/// `--allow-unsafe` is consulted by the post-load unsafe-feature gate that Go
+/// runs from `ValidateServerConfig` (measured on v0.71.0: `frps verify -c <exec
+/// tokenSource cfg>` is rc 1 without it, rc 0 with it), so frp-rs reads it here
+/// too and hands it to `run_verify` — see [`VerifyArgs::allow_unsafe`]. Measured
+/// on Go v0.71.0:
 /// `frps verify --help` prints the whole surface under `Global Flags`, and
 /// `frps verify --bind-port <free> -c <valid>`,
 /// `frps verify --allow-unsafe X -c <valid>` and
 /// `frps verify --version -c <valid>` are all rc 0 with the *verify* output (no
-/// version line). Parsing through [`frps_build`] and keeping only the two fields
+/// version line). Parsing through [`frps_build`] and keeping only the three fields
 /// reproduces that acceptance without a second hand-written flag list — for
 /// **every root flag frp-rs models**, which is the precise claim. The one such
 /// flag that used to be missing was Go's `--vhost-http-timeout`, so `frps
@@ -1038,6 +1036,7 @@ fn frps_verify_cmd() -> impl Parser<FrpsCmd> {
     .map(|b| VerifyArgs {
         config: b.meta.config.unwrap_or_default(),
         strict_config: b.meta.strict_config,
+        allow_unsafe: b.auth.allow_unsafe,
     });
     args.to_options()
         .command("verify")
@@ -2501,6 +2500,20 @@ pub struct VerifyArgs {
     /// passes the flag to its config loader (`cmd/frpc/sub/verify.go:37`,
     /// `cmd/frps/verify.go:40`).
     pub strict_config: bool,
+    /// The `--allow-unsafe` allow-list, **read** on both verify commands (see
+    /// [`allow_unsafe_parser`]).
+    ///
+    /// Go's verify path consults it because the gate lives inside the
+    /// validation the loaded config goes through: measured on Go v0.71.0,
+    /// `frps verify -c <exec tokenSource cfg>` is rc 1 with stdout
+    /// `unsafe feature "TokenSourceExec" is not enabled. …` and rc 0 with
+    /// `--allow-unsafe TokenSourceExec` (identical for `frpc verify`). frp-rs's
+    /// load path runs the same predicate from
+    /// [`crate::config::load_server_config_checked`] /
+    /// [`crate::config::load_client_config_with_presence_checked`], so the
+    /// value has to reach `run_verify` — dropping it here is what made `verify`
+    /// accept a config the daemon refuses.
+    pub allow_unsafe: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2598,9 +2611,31 @@ fn ignored_config_dir() -> impl Parser<Option<String>> {
         .optional()
 }
 
-/// `--allow-unsafe`, as an ignored persistent root flag. Go registers it as a
-/// pflag `strings` (comma-separated, repeatable), so repeats append; the value
-/// is dropped here either way.
+/// `--allow-unsafe`, **read** rather than ignored: Go registers it as a pflag
+/// `strings` (comma-separated, repeatable), and the value feeds
+/// [`UnsafeFeatures`](crate::unsafe_features::UnsafeFeatures) on the run paths
+/// and on both `verify` commands (Go's own `verify` consults the same persistent
+/// flag through `ValidateServerConfig`/`ValidateClientConfig`: measured on
+/// v0.71.0, `frps verify -c <exec cfg>` is rc 1 without it and rc 0 with
+/// `--allow-unsafe TokenSourceExec`).
+fn allow_unsafe_parser() -> impl Parser<Vec<String>> {
+    long("allow-unsafe")
+        .long("allow_unsafe")
+        .argument::<String>("FEATURES")
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .fallback(vec![])
+}
+
+/// `--allow-unsafe`, as an ignored persistent root flag. Same spellings as the
+/// run-mode flag (hyphen plus the frp-rs underscore alias) and Go's pflag
+/// `strings` semantics: repeats append; the value is dropped here either way.
+///
+/// Only the subcommands that do not read it use this — `verify` reads
+/// [`allow_unsafe_parser`] instead (Go's verify *does* consult the value).
 fn ignored_allow_unsafe() -> impl Parser<Vec<String>> {
     long("allow-unsafe")
         .long("allow_unsafe")
@@ -2617,8 +2652,8 @@ fn ignored_version() -> impl Parser<bool> {
     go_bool_flag!("version", None, Some('v'), "Version of frpc").last()
 }
 
-/// The persistent root flags the four config-reading subcommands
-/// (`verify`/`reload`/`status`/`stop`) did not declare: `-c` and
+/// The persistent root flags the config-reading subcommands that do not read
+/// `--allow-unsafe` (`reload`/`status`/`stop`) did not declare: `-c` and
 /// `--strict-config` are already fields of their own parsers.
 fn ignored_admin_root_flags() -> impl Parser<()> {
     construct!(
@@ -2627,6 +2662,15 @@ fn ignored_admin_root_flags() -> impl Parser<()> {
         ignored_version()
     )
     .map(|_| ())
+}
+
+/// [`ignored_admin_root_flags`] minus `--allow-unsafe`, for `frpc verify` — the
+/// one config-reading subcommand that **reads** it ([`allow_unsafe_parser`],
+/// because the load-path gate consults the value). The two parsers cannot
+/// coexist in one `construct!`: bpaf would have to consume the same named
+/// argument twice.
+fn ignored_admin_root_flags_except_allow_unsafe() -> impl Parser<()> {
+    construct!(ignored_config_dir(), ignored_version()).map(|_| ())
 }
 
 /// All five persistent rootCmd flags, accepted and ignored on the eight
@@ -2735,15 +2779,7 @@ fn run_mode() -> impl Parser<FrpcRunArgs> {
         .argument::<String>("DIR")
         .optional();
     let strict_config = strict_config_parser();
-    let allow_unsafe = long("allow-unsafe")
-        .long("allow_unsafe")
-        .argument::<String>("FEATURES")
-        .map(|s| {
-            s.split(',')
-                .map(|x| x.trim().to_string())
-                .collect::<Vec<_>>()
-        })
-        .fallback(vec![]);
+    let allow_unsafe = allow_unsafe_parser();
     let show_version = go_bool_flag!("version", None, Some('v'), "Version of frpc");
     let log_file = long("log-file")
         .long("log_file")
@@ -3160,11 +3196,18 @@ fn verify_cmd() -> impl Parser<FrpcCmd> {
     // With strict off, verify accepts unknown fields, matching Go
     // (cmd/frpc/sub/verify.go passes strictConfigMode to LoadClientConfig).
     let strict_config = strict_config_parser();
+    // `--allow-unsafe` is **read** here, not ignored: Go's verify consults the
+    // same persistent flag through `ValidateClientConfig` (measured: rc 1
+    // without `--allow-unsafe TokenSourceExec`, rc 0 with it), and frp-rs's
+    // load path now runs that gate — see
+    // [`crate::config::load_client_config_with_presence_checked`].
+    let allow_unsafe = allow_unsafe_parser();
     let args = construct!(VerifyArgs {
         config,
-        strict_config
+        strict_config,
+        allow_unsafe
     });
-    construct!(args, ignored_admin_root_flags())
+    construct!(args, ignored_admin_root_flags_except_allow_unsafe())
         .map(|(args, _)| args)
         .to_options()
         .command("verify")

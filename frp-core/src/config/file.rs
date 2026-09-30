@@ -6,6 +6,7 @@ use super::loader::{validate_client_config, validate_server_config, ConfigPresen
 use super::normalize::{load_config_from_file, normalize_client_config, normalize_server_config};
 use super::server::ServerConfig;
 use super::strict::{known_client_keys, known_server_keys};
+use crate::unsafe_features::UnsafeFeatures;
 
 /// Load a server configuration from a file path, auto-detecting format by extension.
 /// When `strict_config` is true, unknown fields cause an error (Go frp default).
@@ -131,6 +132,92 @@ pub fn load_client_config_with_presence(
         presence.client_heartbeat_interval_set,
         presence.client_heartbeat_timeout_set,
     );
+    Ok((cfg, presence))
+}
+
+// ─── the post-load `--allow-unsafe` gate ──────────────────────────────────────
+
+/// The **post-load** half of the `--allow-unsafe` gate for a server config:
+/// refuses an `auth.tokenSource` that needs
+/// [`crate::unsafe_features::TOKEN_SOURCE_EXEC`] when the allow-list does not
+/// carry it.
+///
+/// Go runs this predicate from inside validation — `ValidateUnsafeFeature`
+/// (`pkg/config/v1/validation/validator.go:22-27`), called for
+/// `tokenSource.Type == "exec"` at `pkg/config/v1/validation/auth.go:34-35` —
+/// so on Go the gate is part of **load**, and both `frps -c` and
+/// `frps verify -c` hit it. frp-rs reaches the predicate
+/// ([`crate::auth::validate_token_source_unsafe`], the same function both use
+/// here) only from service construction (`frp-server/src/service.rs`), which
+/// `verify` never runs. This function is the load-path half that
+/// [`load_server_config_checked`] adds, so `verify` refuses exactly what the
+/// daemon refuses; the daemon's own refusal is left where it is, because it is
+/// the documented `EXIT_AUTH`/3 extension (`tracing::error!` + `process::exit`),
+/// not Go's bare stdout line + rc 1.
+pub fn check_server_unsafe_features(
+    cfg: &ServerConfig,
+    unsafe_features: &UnsafeFeatures,
+) -> Result<(), String> {
+    if let Some(source) = &cfg.auth.token_source {
+        crate::auth::validate_token_source_unsafe(source, unsafe_features)?;
+    }
+    Ok(())
+}
+
+/// The client half of [`check_server_unsafe_features`]: the same predicate over
+/// the two token sources a client config can carry — `auth.tokenSource` and
+/// `auth.oidc.tokenSource` — which is exactly the pair the client daemon gates
+/// at construction (`frp-client/src/service.rs`).
+///
+/// Go's client validation gates the `auth.tokenSource` spelling (measured:
+/// `frpc verify -c <exec cfg>` is rc 1 on v0.71.0); the OIDC spelling is gated
+/// to match the frp-rs daemon's own field set, which is the stated criterion for
+/// this gate (`verify` refuses what the daemon refuses).
+pub fn check_client_unsafe_features(
+    cfg: &ClientConfig,
+    unsafe_features: &UnsafeFeatures,
+) -> Result<(), String> {
+    if let Some(auth) = &cfg.auth {
+        if let Some(source) = &auth.token_source {
+            crate::auth::validate_token_source_unsafe(source, unsafe_features)?;
+        }
+        if let Some(source) = &auth.oidc_token_source {
+            crate::auth::validate_token_source_unsafe(source, unsafe_features)?;
+        }
+    }
+    Ok(())
+}
+
+/// [`load_server_config`], plus [`check_server_unsafe_features`].
+///
+/// `frps verify` is the caller (`frps/src/main.rs`): the whole point is that a
+/// config it certifies is one the daemon will accept. The run path deliberately
+/// does **not** use it — its refusal stays the construction-time
+/// `EXIT_AUTH`/3 one, and moving the gate into the loader would silently move
+/// that refusal to this lane's bare rc 1 (`docs/developing.md` § CLI exit codes
+/// records 3 as a frp-rs extension).
+pub fn load_server_config_checked(
+    path: &str,
+    strict_config: bool,
+    unsafe_features: &UnsafeFeatures,
+) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+    let cfg = load_server_config(path, strict_config)?;
+    check_server_unsafe_features(&cfg, unsafe_features)?;
+    Ok(cfg)
+}
+
+/// [`load_client_config_with_presence`], plus [`check_client_unsafe_features`].
+///
+/// Returns the presence flags with the config because `frpc verify` — the only
+/// caller — emits the `[web_server.tls] enable` diagnostic from them, exactly
+/// as it did through [`load_client_config_with_presence`].
+pub fn load_client_config_with_presence_checked(
+    path: &str,
+    strict_config: bool,
+    unsafe_features: &UnsafeFeatures,
+) -> Result<(ClientConfig, ConfigPresence), Box<dyn std::error::Error>> {
+    let (cfg, presence) = load_client_config_with_presence(path, strict_config)?;
+    check_client_unsafe_features(&cfg, unsafe_features)?;
     Ok((cfg, presence))
 }
 

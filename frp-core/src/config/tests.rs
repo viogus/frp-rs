@@ -10793,3 +10793,91 @@ fn test_ini_yes_no_bool_inference() {
     assert!(cfg.login_fail_exit);
     assert!(!cfg.tcp_mux);
 }
+
+/// The load-path `--allow-unsafe` gate covers **both** client fields the daemon
+/// gates at construction: `auth.tokenSource` and `auth.oidc.tokenSource`
+/// (`frp-client/src/service.rs:936`/`:990`). Go's verdict for the OIDC spelling
+/// was **not** measured (a minimal load-valid OIDC config was not built), so the
+/// criterion pinned here is the daemon's own field set, not a Go row; the
+/// `auth.tokenSource` spelling is the one with a measured Go row (frps/frpc
+/// `verify` → rc 1, see `frps/tests/cli_exit_codes.rs` and
+/// `frpc/tests/cli_exit_codes.rs`).
+///
+/// The configs are parsed with `toml::from_str` rather than through
+/// `load_client_config_with_presence*`, so the test pins the *gate's* field set
+/// independently of loader validation and of the normalizer that rewrites
+/// `[auth.oidc] tokenSource` into `oidc_token_source`.
+///
+/// Teeth: deleting `oidc_token_source` from `check_client_unsafe_features` makes
+/// the second loop arm fail (the `expect_err` returns `Ok(())`).
+#[test]
+fn check_client_unsafe_features_gates_both_token_source_spellings() {
+    use crate::unsafe_features::{UnsafeFeatures, TOKEN_SOURCE_EXEC};
+
+    let token_source: ClientConfig = toml::from_str(
+        r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[auth]
+method = "token"
+
+[auth.tokenSource]
+type = "exec"
+
+[auth.tokenSource.exec]
+command = "/bin/echo"
+"#,
+    )
+    .expect("parse the auth.tokenSource config");
+    let oidc_source: ClientConfig = toml::from_str(
+        r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[auth]
+method = "oidc"
+
+[auth.oidc_token_source]
+type = "exec"
+
+[auth.oidc_token_source.exec]
+command = "/bin/echo"
+"#,
+    )
+    .expect("parse the auth.oidc tokenSource config");
+
+    let blocked = UnsafeFeatures::new(&[]);
+    let allowed = UnsafeFeatures::new(&[TOKEN_SOURCE_EXEC]);
+    for (label, cfg) in [
+        ("auth.tokenSource", &token_source),
+        ("auth.oidc.tokenSource", &oidc_source),
+    ] {
+        let err = super::check_client_unsafe_features(cfg, &blocked)
+            .expect_err(&format!("{label} exec must be refused without the feature"));
+        assert!(err.contains("TokenSourceExec"), "{label}: {err}");
+        assert!(
+            super::check_client_unsafe_features(cfg, &allowed).is_ok(),
+            "{label} exec must be accepted with --allow-unsafe TokenSourceExec"
+        );
+    }
+
+    // A `file` source is not an unsafe feature and is never gated.
+    let file_source: ClientConfig = toml::from_str(
+        r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[auth.tokenSource]
+type = "file"
+
+[auth.tokenSource.file]
+path = "/tmp/does-not-matter"
+"#,
+    )
+    .expect("parse the auth.tokenSource=file config");
+    assert!(
+        super::check_client_unsafe_features(&file_source, &blocked).is_ok(),
+        "file sources are not unsafe features"
+    );
+}

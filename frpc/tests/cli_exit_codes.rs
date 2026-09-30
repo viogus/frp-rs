@@ -620,6 +620,110 @@ fn unresolvable_token_source_exits_3_where_go_exits_1() {
     );
 }
 
+/// The client half of the batch-7 pin: `frpc verify` now runs the post-load
+/// `--allow-unsafe` gate, so it refuses the config the daemon refuses at
+/// construction.
+///
+/// Measured on Go frp v0.71.0 with the two streams captured separately (a fresh
+/// config and a fresh free port per row, every child bounded and reaped):
+///
+/// | argv | Go | this file's base |
+/// |---|---|---|
+/// | `frpc verify -c <exec cfg>` | rc 1, stdout `unsafe feature "TokenSourceExec" is not enabled. To enable it, ensure it is allowed in the configuration or command line flags`, stderr 0 B | rc 0, `Config file <p> is valid` + summary |
+/// | `frpc verify … --allow-unsafe TokenSourceExec` | rc 0, `frpc: the configuration file <p> syntax is ok` | rc 0 |
+/// | `frpc verify … --allow-unsafe WrongFeature` | rc 1 (fail-closed) | rc 0 (fail-open) |
+/// | `frpc -c <exec cfg>` (run) | rc 1, the same stdout line | rc 3, `EXIT_AUTH` |
+///
+/// frp-rs's wording stays its own predicate message and its own `Config file <p>
+/// is invalid: …` wrapper; the **lane** is what is pinned (stdout, stderr empty,
+/// rc 1, the same arm a parse failure uses). The run row stays **3**.
+///
+/// Teeth: deleting the `check_client_unsafe_features` call from
+/// `load_client_config_with_presence_checked` makes the first row exit 0
+/// (`left: Some(0)`); making the allow-list check always true makes the
+/// `WrongFeature` row exit 0.
+#[test]
+fn verify_runs_the_post_load_allow_unsafe_gate_like_go() {
+    let dir = TempDir::new();
+    let cfg = dir.write(
+        "execsource.toml",
+        &format!(
+            "{BASE_CONFIG}[auth]\nmethod = \"token\"\n\
+             [auth.tokenSource]\ntype = \"exec\"\n\
+             [auth.tokenSource.exec]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"printf tok\"]\n"
+        ),
+    );
+    const GATE_MSG: &str = "auth.tokenSource exec blocked: TokenSourceExec not in UnsafeFeatures \
+                            allowlist. Pass --allow-unsafe TokenSourceExec to enable.";
+
+    let refuse = run_frpc(&["verify", "-c", &cfg]);
+    assert_eq!(
+        refuse.status.code(),
+        Some(1),
+        "Go refuses an exec tokenSource on verify with rc 1; the load-path gate must \
+         reproduce that lane; stdout={:?} stderr={:?}",
+        stdout_of(&refuse),
+        stderr_of(&refuse),
+    );
+    assert_eq!(
+        stdout_of(&refuse),
+        format!("Config file {cfg} is invalid: {GATE_MSG}\n"),
+        "the refusal must go to **stdout** through the existing load-failure arm \
+         (`Config file <p> is invalid: …`), with no log prefix and no ANSI; stderr={:?}",
+        stderr_of(&refuse),
+    );
+    assert!(
+        stderr_of(&refuse).is_empty(),
+        "Go prints nothing on stderr for a verify refusal; stderr={:?}",
+        stderr_of(&refuse),
+    );
+
+    let accept = run_frpc(&["verify", "-c", &cfg, "--allow-unsafe", "TokenSourceExec"]);
+    assert_eq!(
+        accept.status.code(),
+        Some(0),
+        "--allow-unsafe TokenSourceExec must satisfy the gate (measured rc 0 on Go); \
+         stdout={:?} stderr={:?}",
+        stdout_of(&accept),
+        stderr_of(&accept),
+    );
+    assert_eq!(
+        stdout_of(&accept),
+        format!(
+            "Config file {cfg} is valid\n  Server: 127.0.0.1:7000\n  Proxies: 0\n  Visitors: 0\n"
+        ),
+        "the accept row keeps the existing success shape; stderr={:?}",
+        stderr_of(&accept),
+    );
+    assert!(
+        stderr_of(&accept).is_empty(),
+        "stderr={:?}",
+        stderr_of(&accept)
+    );
+
+    let wrong = run_frpc(&["verify", "-c", &cfg, "--allow-unsafe", "WrongFeature"]);
+    assert_eq!(
+        wrong.status.code(),
+        Some(1),
+        "the allow-list is fail-closed: an unrelated feature does not enable \
+         TokenSourceExec (measured rc 1 on Go); stdout={:?} stderr={:?}",
+        stdout_of(&wrong),
+        stderr_of(&wrong),
+    );
+
+    // The run path is untouched: the same config is still refused by
+    // construction with the typed EXIT_AUTH/3, not by the loader.
+    let run = run_frpc(&["-c", &cfg]);
+    assert_eq!(
+        run.status.code(),
+        Some(3),
+        "the run path must keep the EXIT_AUTH/3 construction refusal; the load-path \
+         gate exists for verify only; stdout={:?} stderr={:?}",
+        stdout_of(&run),
+        stderr_of(&run),
+    );
+}
+
 /// `EXIT_BIND`/4 is **not** specifically about bind errors: it is the daemons'
 /// tag for any service-*construction* failure that is not an auth one. A
 /// `[store] path` pointing at a file that is not JSON reaches it without any
