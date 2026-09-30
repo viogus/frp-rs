@@ -15,8 +15,8 @@ User-facing release notes for frp-rs.
 - **`frps --config-dir` now honours `SIGUSR1`, like `frps -c` does.** The directory lane returned
   before installing the reload handler, so the signal kept its default disposition and **killed the
   server** (`unix_wait_status(158)`, 128 + 30) where the single-config lane reloads in place. It now
-  installs the same handler: one task holds the live services and every `SIGUSR1` reloads every registered
-  them from its own config file, one `SIGUSR1: <summary>` record per service with a `path=` field
+  installs the same handler: one task holds the live services and every `SIGUSR1` reloads every
+  registered service from its own config file, one `SIGUSR1: <summary>` record per service with a `path=` field
   naming the file it came from. `SIGTERM`/`SIGINT` still shut the lane down cleanly (rc 0). This is
   an frp-rs extension flag — Go's `frps` rejects `--config-dir` outright — so the comparison is
   against frp-rs's own `-c` lane.
