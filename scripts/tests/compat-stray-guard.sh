@@ -8,7 +8,9 @@
 # of that, so the guard is driven here against synthetic `frps` processes whose
 # name is real and whose command line is the only thing that distinguishes them.
 #
-# A synthetic server is a symlink named `frps` to `sleep`:
+# A synthetic server is a symlink named `frps` to `sleep` (scenario 5's two
+# helpers use the same trick under the name `helper`, where the process name is
+# not the point):
 # `pgrep -x frps` sees the name (the kernel names a process after the path it was
 # exec'd through, symlink included), `ps -o command=` shows that path, and the
 # process is long-lived and port-free. No compat server, no ports, no repo
@@ -58,6 +60,7 @@ while [ -L "$self" ]; do
 done
 ROOT=$(cd -P -- "$(dirname -- "$self")/../.." && pwd)
 LIB="$ROOT/scripts/lib/compat-stray-guard.sh"
+self_name=$(basename -- "$self")   # `wait_exec` uses this to spot a pre-exec fork
 
 checks=0
 fails=0
@@ -67,7 +70,10 @@ fails=0
 # on every exit path, and it is installed before this file's first failure
 # point, so an early `exit 0` — a neutered scenario body, say — cannot skip it.
 MIN_CHECKS=21
-LIVE=""   # every synthetic pid we start, for the exit trap
+# Every synthetic pid we start. The trap reaps each one that is still ours,
+# including the scenario-5 helpers, so no scenario has to be the only net under
+# a process it spawned.
+LIVE=""
 WORK=""
 
 cleanup_all() {
@@ -102,28 +108,37 @@ sleep_bin=$(command -v sleep) || { printf 'FAIL  cannot find sleep\n'; exit 1; }
 BASH_BIN=${BASH:-/bin/bash}
 command -v pgrep >/dev/null 2>&1 || { printf 'FAIL  this fixture harness needs pgrep on PATH\n'; exit 1; }
 
-# spawn_fake <dir-under-which-the-symlink-lives> -> echoes the pid on stdout
-# The symlink is `<dir>/frps`; running it puts `<dir>/frps` in the command line,
-# which is what makes the process match (or not match) `$TEST_DIR/`.
+# spawn_fake <dir-under-which-the-symlink-lives> [name] -> echoes the pid
+# The symlink is `<dir>/<name>` (default `frps`); running it puts that path in
+# the command line, which is what makes the process match (or not match)
+# `$TEST_DIR/` and what the exit trap's ownership predicate matches on.
 spawn_fake() {
-  mkdir -p "$1"
-  ln -sfn "$sleep_bin" "$1/frps"
-  "$1/frps" 300 >/dev/null 2>&1 &
+  local dir=$1 name=${2:-frps}
+  mkdir -p "$dir"
+  ln -sfn "$sleep_bin" "$dir/$name"
+  "$dir/$name" 300 >/dev/null 2>&1 &
   printf '%s' "$!"
 }
 
-# wait_exec <pid> — wait until the child has exec'd the helper image, so a signal
-# sent to it is delivered to `sleep` instead of blocking in the fork. A child that
-# has not exec'd yet still reports *this* shell's argv (scenario 5's helper is
-# `sleep`, so the image is recognisable by that word). Without this the SIGTERM
-# misses, `cleanup_pids` runs its full 10 s grace deadline, and the wall-clock
-# assertion below reds on a healthy run — measured ~1 run in 5 at load 28-40.
-# Returns 1 if the image never changed within 2 s.
+# wait_exec <pid> — synchronise on the child's own image before signalling it: a
+# child signalled before it has exec'd may not have taken the signal yet, so
+# scenario 5 waits here before `cleanup_pids` sends SIGTERM. The pre-fix shape
+# (signalling first, with the untracked helper bounded at 6 s) reddened ~1 run in
+# 5 at load 28-40 with `cleanup_pids took 10s`; that red's mechanism could not be
+# reproduced in the round-2 re-check (300/300 immediate SIGTERMs to a freshly
+# spawned `sleep 30` landed within 0.25 s, and 25/25 old-shape runs at load 42-47
+# were fast), so this is a cheap defensive synchronisation, not a reproduced
+# root-cause fix. Returns 0 once the image changed, 1 if it never did within 2 s,
+# and 2 when the `ps` probe itself fails: "could not synchronise" must not read as
+# "synced".
 wait_exec() {
   local pid=$1 i=0 cmd
   while (( i < 100 )); do
-    cmd=$(ps -o command= -p "$pid" 2>/dev/null) || return 0
-    case "$cmd" in *sleep*) return 0 ;; esac
+    if ! cmd=$(ps -o command= -p "$pid" 2>/dev/null); then
+      printf 'wait_exec: ps -p %s failed; cannot tell whether the helper has exec-ed yet\n' "$pid" >&2
+      return 2
+    fi
+    case "$cmd" in *"$self_name"*) ;; *) return 0 ;; esac
     sleep 0.02
     i=$((i + 1))
   done
@@ -252,19 +267,26 @@ hdr 'scenario 5: cleanup_pids does not wait on an untracked child'
 export TEST_DIR="$WORK/run5"
 # shellcheck source=/dev/null
 source "$LIB"
-sleep 30 &                # untracked: must not be waited on by cleanup_pids
-untracked=$!
-sleep 30 &                # tracked: reaped by cleanup_pids
-tracked=$!
+# Both helpers are synthetic servers under `$WORK` (symlinks to `sleep`, exactly
+# like `spawn_fake`'s), so the exit trap's directory-scoped predicate reaps them
+# and "every synthetic pid we start" is true rather than aspirational: deleting
+# the explicit leg below cannot leave the untracked one behind. `cleanup_pids`
+# only ever sees the tracked one.
+untracked=$(spawn_fake "$WORK/run5-untracked" helper)
+tracked=$(spawn_fake "$WORK/run5-tracked" helper)
+LIVE="$LIVE $untracked $tracked"
 PIDS="$tracked"
-# Synchronise before signalling: signals are not delivered to a fork child that
-# has not exec'd yet, so `kill` here would miss and the grace loop would burn its
-# full 10 s deadline on a healthy run. See `wait_exec`.
-if wait_exec "$tracked"; then
-  ok "tracked helper $tracked is running its own image"
-else
-  bad "tracked helper $tracked is still the forked shell after the 2s sync deadline"
-fi
+# Synchronise before signalling: a child signalled before it has exec'd may not
+# have taken the signal yet, so `kill` here could miss and let the grace loop run
+# its full 10 s deadline on a healthy run (see `wait_exec` for what was and was
+# not reproducible about the pre-fix red). rc 2 means the `ps` probe itself
+# failed, which must be reported rather than read as "synced".
+wait_exec "$tracked"; wrc=$?
+case "$wrc" in
+  0) ok "tracked helper $tracked has exec'd its own image" ;;
+  1) bad "tracked helper $tracked is still the forked shell after the 2s sync deadline" ;;
+  *) bad "could not synchronise on tracked helper $tracked: \`ps\` failed (wait_exec rc $wrc)" ;;
+esac
 started=$SECONDS
 cleanup_pids
 elapsed=$((SECONDS - started))
@@ -273,7 +295,7 @@ elapsed=$((SECONDS - started))
 # up to 10 s on a tracked server that ignores SIGTERM, so a tight `elapsed < N`
 # reds on healthy runs. A bare `wait` cannot return while the untracked child
 # lives, so this liveness check is the tooth; the 20 s bound below is only a hang
-# guard (slack over the 10 s grace, well under the helper's 30 s).
+# guard (slack over the 10 s grace, well under the helper's 300 s).
 if kill -0 "$untracked" 2>/dev/null; then
   ok 'untracked child was still running when cleanup_pids returned'
 else

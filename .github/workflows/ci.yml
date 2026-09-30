@@ -109,7 +109,29 @@ jobs:
       # guard's match is the scratch directory *and* the process name — a
       # name-only match kills a sibling worktree's server and must red this.
       - name: Stray guard — fixture checks (compat harness teardown)
-        run: bash scripts/tests/compat-stray-guard.sh
+        # The suite floors its own check count (`MIN_CHECKS`, in its EXIT trap),
+        # but a floor inside the file it guards cannot survive an `exec`: `exec
+        # true` planted after the library check never runs the trap and exits 0
+        # with no output at all, and a lowered `MIN_CHECKS=0` is quiet too. So the
+        # total is pinned *outside*, the way the `log_completion` step below pins
+        # its own 6: this step requires the suite's summary line verbatim, and 21
+        # is what the scenarios in scripts/tests/compat-stray-guard.sh print. A
+        # scenario added or removed there moves this literal — restore the checks
+        # rather than lowering it.
+        shell: bash
+        run: |
+          set -o pipefail
+          log=/tmp/frp-compat-stray-guard-fixtures.log
+          status=0
+          bash scripts/tests/compat-stray-guard.sh 2>&1 | tee "$log" || status=1
+          grep -qF 'RESULT: 21 fixture check(s) hold' "$log" || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::compat stray-guard fixture checks did not report 21 checks"
+            echo "::error::scripts/tests/compat-stray-guard.sh must end with 'RESULT: 21 fixture check(s) hold'; a smaller total, a failure line or no output means scenarios were skipped, neutered or swallowed by an \`exec\` — restore them rather than lowering this literal"
+            cat "$log"
+            exit 1
+          fi
+          echo "compat stray-guard fixture checks ok: 21 checks hold"
 
   tests-unit:
     name: Tests (unit)
