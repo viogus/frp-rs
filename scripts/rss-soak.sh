@@ -34,8 +34,10 @@
 #
 # Usage:
 #   bash scripts/rss-soak.sh [duration_s] [interval_s]
+#   bash scripts/rss-soak.sh -h | --help
 #     duration_s   soak window; default 10800 (3 h), minimum 60
 #     interval_s   sample interval; default 45 (the item asks for 30-60 s)
+#   -h / --help prints this header and exits 0.
 #
 # Env:
 #   FRPS_BIN / FRPC_BIN   frp-rs binaries; set both to skip the cargo build
@@ -75,6 +77,19 @@
 #                         RECEIVED, so 5 means ~2.5 MiB/s of payload in each
 #                         direction, not 5 MiB/s in one.
 #   SOAK_MSG_BYTES        bytes per churn message (default 64)
+#   SOAK_TRAFFIC_TOLERANCE
+#                         allowed relative spread between the two sides'
+#                         achieved volume (default 0.10 = 10%). A finite number
+#                         in (0, 1]; anything else is refused up front, because
+#                         the summary's `spread > tolerance` test is silently
+#                         disabled by `nan` (compares false with everything).
+#   SOAK_RSS_CEILING_KB   largest RSS reading accepted as real (default
+#                         104857600 = 100 GiB). A value outside 1..ceiling, or a
+#                         non-integer, is recorded as `null` (a missing reading)
+#                         rather than published: a stubbed or misparsing `ps`
+#                         that prints a constant, 0, or a huge number must not
+#                         produce a "perfectly flat" series. The reader applies
+#                         the same bound to an artifact it did not produce.
 #
 # Output: scripts/frp-stress/baselines/rss-soak-<hostname>.jsonl
 #   one JSON object per line: one `meta` record, N `sample` records, one
@@ -104,24 +119,46 @@
 #     trip before the window opens — a bridge that accepts but moves no bytes
 #     fails here rather than after three hours. A pre-flight failure exits 1
 #     and writes NO artifact (the artifact is cleared only after pre-flight).
-#   * any of the four frp processes, the two echo backends or the four traffic
-#     generators dying mid-window aborts the series — including during the LAST
-#     sampling interval, because the liveness scan runs before the window-end
-#     test (the summary is appended with a non-null `aborted` reason and the
+#   * the four frp processes and the two echo backends have no self-imposed end,
+#     so they are scanned at EVERY iteration, including the last one — the scan
+#     runs before the window-end test, so a death anywhere in the window is a
+#     fault (the summary is appended with a non-null `aborted` reason and the
 #     script exits 3)
+#   * the four traffic generators DO end by design (GENERATOR_TAIL seconds past
+#     the window), so they are scanned only while the window is open; one that
+#     dies inside the window is a fault, and one that never wrote its result row
+#     is caught after the window by the summary's traffic reconciliation
+#   * an RSS reading is published only when it is a positive integer within
+#     SOAK_RSS_CEILING_KB; anything else becomes `null`, so a stubbed `ps`
+#     cannot produce a flat series, and the reader additionally refuses a column
+#     in which every reading is identical (see SOAK_RSS_CEILING_KB above)
+#   * the frp-rs and Go binaries must not be the same file or carry the same
+#     sha256 — running one implementation on both sides would be published as a
+#     head-to-head comparison otherwise (the reader re-checks this in `meta`)
 #   * after the window, each side must have completed churn round trips and
-#     moved bytes on its long-lived streams, with no torn-down stream, and the
-#     two sides must have achieved comparable volume (they are paced the same,
-#     so a large gap means one side was not handed the same work)
+#     moved bytes on its long-lived streams, with no torn-down stream, with
+#     those totals above a documented floor, and the two sides must have
+#     achieved comparable volume (they are paced the same, so a large gap means
+#     one side was not handed the same work)
+#
+# Death reasons: `aborted` names each dead process with the raw `wait` status,
+# which is NOT a signal classification — frp-rs traps SIGTERM and exits 0, so
+# `frps(exit 0)` means "stopped by itself or was asked to stop", and a
+# signal-killed process shows 128+N (`137` for SIGKILL). Only the elapsed time
+# and the traffic cross-check say which of those it was.
 #
 # The per-sample `time_wait` field is HOST-WIDE (netstat counts every socket on
 # the machine, other tenants included): it is context for the reader, not a
 # per-side check. The per-side check is the paced churn rate plus the achieved
 # round-trip count reconciled in the summary.
 #
-# Self-description: `meta` records the git HEAD, whether the tree was dirty, and
-# sha256 of the three harness files that produced the run, so an artifact can be
-# matched to the exact harness even when the commit alone is not enough.
+# Self-description: `meta` records the git HEAD, whether the HARNESS corpus
+# (this script, its helpers and the traffic generator under scripts/frp-stress)
+# had uncommitted changes, and sha256 digests of each part, so an artifact can
+# be matched to the exact code that produced it even when the commit alone is
+# not enough. `rs_bin_source` says whether the measured frp-rs binaries were
+# built from that tree or supplied by the caller; `bin_sha256` is the identity
+# of the binaries that were actually measured either way.
 # =============================================================================
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -135,16 +172,20 @@ cd "$PROJECT_DIR" || exit 1
 # shellcheck source=lib/rss-soak-run-dir.sh
 . "$SCRIPT_DIR/lib/rss-soak-run-dir.sh"
 
+# `-h`/`--help` prints this header (the leading comment block) and stops before
+# any side effect: awk strips the `# ` so the text above IS the help.
+case "${1:-}" in
+  -h|--help)
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+    exit 0
+    ;;
+esac
+
 DURATION="${1:-10800}"
 INTERVAL="${2:-45}"
-if ! [[ "$DURATION" =~ ^[0-9]+$ ]] || [ "$DURATION" -lt 60 ]; then
-  echo "error: duration_s must be an integer >= 60 (got '${1:-}')" >&2
-  exit 1
-fi
-if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || [ "$INTERVAL" -lt 1 ]; then
-  echo "error: interval_s must be an integer >= 1 (got '${2:-}')" >&2
-  exit 1
-fi
+# Refusal lives in the sourced lib so the fixture can prove it without starting
+# a run; see scripts/lib/rss-soak-run-dir.sh.
+rss_soak_validate_window "$DURATION" "$INTERVAL" || exit 1
 
 # The traffic generators outlive the window by GENERATOR_TAIL seconds, so that
 # every one of them is still alive when the last sample is taken: a generator
@@ -207,6 +248,14 @@ validate_count SOAK_CHURN_RATE "$CHURN_RATE" 0
 validate_count SOAK_STREAMS "$STREAMS" 1
 validate_count SOAK_STREAM_MBPS "$STREAM_MBPS" 0
 validate_count SOAK_MSG_BYTES "$MSG_BYTES" 1
+# Refused up front (not only in the reader) so a bad tolerance cannot cost a
+# three-hour window; exported so the reader validates the SAME value.
+TOLERANCE="${SOAK_TRAFFIC_TOLERANCE:-0.10}"
+rss_soak_validate_tolerance "$TOLERANCE" || exit 1
+export SOAK_TRAFFIC_TOLERANCE="$TOLERANCE"
+RSS_CEILING_KB="${SOAK_RSS_CEILING_KB:-104857600}"
+validate_count SOAK_RSS_CEILING_KB "$RSS_CEILING_KB" 1
+export SOAK_RSS_CEILING_KB="$RSS_CEILING_KB"
 
 # Resolve + create the run dir, create the artifact's directory, and echo the
 # resolved absolute path (recorded in `meta`); refuses "" and "/" outright.
@@ -219,7 +268,9 @@ RUN_DIR=$(rss_soak_prepare_run_dir "$RUN_DIR" "$OUT") || exit 1
 # artifact. The lock is taken with `set -o noclobber` — create-if-absent in ONE
 # atomic step: the previous test-then-`echo $$ >` sequence let two simultaneous
 # starts both pass the test and both believe they held the lock. A stale lock
-# (pid gone) is reclaimed and retried, bounded.
+# (non-empty pid that is gone) is reclaimed and retried, bounded; an EMPTY lock
+# is treated as held, because the winner has a two-command create-then-write
+# window and stealing it there is what the atomic create was meant to prevent.
 # A validation run sharing the host needs its own SOAK_LOCK and its own ports.
 LOCK_ATTEMPTS=0
 while :; do
@@ -227,7 +278,18 @@ while :; do
     break
   fi
   old_lock=$(cat "$LOCK_FILE" 2>/dev/null || true)
-  if [ -n "$old_lock" ] && kill -0 "$old_lock" 2>/dev/null; then
+  # An EMPTY lock is HELD, not stale. The winner creates the file with
+  # `set -o noclobber` and writes its pid in the very next command, so a second
+  # start that read the file between those two steps used to see `old_lock=''`,
+  # call the lock stale, `rm` it and take it — two soaks on the same ports. The
+  # cost of refusing is a manual `rm` only when a crash happened inside that same
+  # two-command window.
+  if [ -z "$old_lock" ]; then
+    echo "error: lock $LOCK_FILE exists but is empty (another soak is starting up, or a crash left it)." >&2
+    echo "       Refusing to steal it; remove $LOCK_FILE by hand only if no soak is running." >&2
+    exit 1
+  fi
+  if kill -0 "$old_lock" 2>/dev/null; then
     echo "error: another rss-soak is already running (pid $old_lock)." >&2
     echo "       Refusing to start; stop it or remove $LOCK_FILE if it is stale." >&2
     exit 1
@@ -242,11 +304,16 @@ while :; do
 done
 
 FRP_NAMES=(); FRP_PIDS=()
+# Echo backends are tracked separately from the traffic generators: they have no
+# self-imposed end, so they are scanned at every iteration (a generator that runs
+# past the window is not a fault — see GENERATOR_TAIL).
+ECHO_NAMES=(); ECHO_PIDS=()
 GEN_NAMES=(); GEN_PIDS=()
 TRAFFIC_NAMES=(); TRAFFIC_PIDS=()
 ALL_PIDS=()
 WATCHDOG_PID=""
 add_frp() { FRP_NAMES+=("$1"); FRP_PIDS+=("$2"); ALL_PIDS+=("$2"); }
+add_echo() { ECHO_NAMES+=("$1"); ECHO_PIDS+=("$2"); ALL_PIDS+=("$2"); }
 add_gen() { GEN_NAMES+=("$1"); GEN_PIDS+=("$2"); ALL_PIDS+=("$2"); }
 add_traffic() { TRAFFIC_NAMES+=("$1"); TRAFFIC_PIDS+=("$2"); add_gen "$1" "$2"; }
 
@@ -303,6 +370,13 @@ else
 fi
 RS_FRPS="${FRPS_BIN:-./target/release/frps}"
 RS_FRPC="${FRPC_BIN:-./target/release/frpc}"
+# Recorded in `meta` so a reader can tell whether the measured frp-rs binaries
+# came from the recorded commit or were handed in by the caller.
+if [ -n "${FRPS_BIN:-}" ] && [ -n "${FRPC_BIN:-}" ]; then
+  RS_BIN_SOURCE="caller-supplied FRPS_BIN/FRPC_BIN"
+else
+  RS_BIN_SOURCE="built from the working tree"
+fi
 
 # ---------------------------------------------------------------- versions
 rs_version=$(grep -m1 'pub const VERSION' frp-core/src/lib.rs | sed -E 's/.*"([^"]+)".*/\1/')
@@ -355,22 +429,57 @@ sha256_of() {
     echo "unavailable"
   fi
 }
+sha256_stream() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | cut -d' ' -f1
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | cut -d' ' -f1
+  else
+    echo "unavailable"
+  fi
+}
 
 rs_sha=$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)
 rs_sha_short=$(git -C "$PROJECT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)
 cpu_cores=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 0)
 # Self-description: `rs_dirty` is true when the working tree had uncommitted
-# changes to the harness itself, so an artifact cannot silently pass for a clean
-# commit's output; the three digests pin the exact harness files that ran (a
-# commit sha alone cannot, e.g. for a soak launched from a dirty tree).
-if [ -n "$(git -C "$PROJECT_DIR" status --porcelain -- scripts/rss-soak.sh scripts/lib 2>/dev/null)" ]; then
+# changes to the HARNESS corpus — this script, its helpers AND the traffic
+# generator under scripts/frp-stress, which is what actually writes the traffic
+# rows — so an artifact cannot silently pass for a clean commit's output. The
+# digests pin the exact harness files that ran: a commit sha alone cannot,
+# because a soak can be launched from a dirty tree, and the measured frp-rs
+# binary is not always built from the recorded commit at all (see
+# `rs_bin_source`).
+HARNESS_PATHS=(scripts/rss-soak.sh scripts/lib scripts/frp-stress/src scripts/frp-stress/Cargo.toml)
+if [ -n "$(git -C "$PROJECT_DIR" status --porcelain -- "${HARNESS_PATHS[@]}" 2>/dev/null)" ]; then
   rs_dirty=true
 else
   rs_dirty=false
 fi
+# Digest of the generator sources AS THEY EXIST ON DISK (path + content hash per
+# file), so a published artifact can be matched to the generator that produced
+# it even when the tree was clean at a different commit.
+stress_tree_sha=$(
+  cd "$PROJECT_DIR" || exit 1
+  find scripts/frp-stress/src scripts/frp-stress/Cargo.toml -type f -print 2>/dev/null \
+    | LC_ALL=C sort \
+    | while IFS= read -r f; do printf '%s ' "$f"; sha256_of "$f"; printf '\n'; done
+)
+stress_tree_sha=$(printf '%s\n' "$stress_tree_sha" | sha256_stream)
 soak_sha=$(sha256_of "$SCRIPT_DIR/rss-soak.sh")
 run_dir_lib_sha=$(sha256_of "$SCRIPT_DIR/lib/rss-soak-run-dir.sh")
 summary_py_sha=$(sha256_of "$SCRIPT_DIR/lib/rss-soak-summary.py")
+# The identity of the binaries that were ACTUALLY measured. Comparing the two
+# sides here is what stops a run in which the caller pointed FRPS_BIN/FRPC_BIN at
+# the Go binaries from being published as a head-to-head comparison.
+rs_frps_sha=$(sha256_of "$RS_FRPS"); rs_frpc_sha=$(sha256_of "$RS_FRPC")
+go_frps_sha=$(sha256_of "$GO_FRPS"); go_frpc_sha=$(sha256_of "$GO_FRPC")
+if [ "$rs_frps_sha" = "$go_frps_sha" ] || [ "$rs_frpc_sha" = "$go_frpc_sha" ]; then
+  echo "error: the frp-rs and Go binaries are identical (sha256 $rs_frps_sha / $rs_frpc_sha);" >&2
+  echo "       this would publish one implementation against itself. Point FRPS_BIN/FRPC_BIN at a" >&2
+  echo "       real frp-rs build, or unset them to build from this tree." >&2
+  exit 1
+fi
 echo "frp-rs $rs_version ($rs_sha_short) vs Go frp $go_version on $go_platform, ${cpu_cores} cores"
 echo "window ${DURATION}s, sample interval ${INTERVAL}s -> out $OUT"
 
@@ -437,14 +546,12 @@ alive() { kill -0 "$1" 2>/dev/null; }
 # port_open <host:port> -> 0 when a TCP connect succeeds (proxy registered).
 port_open() { (exec 3<>"/dev/tcp/${1%:*}/${1#*:}") 2>/dev/null; }
 
-# RSS in KB, or the JSON literal `null` when the process is momentarily
-# unreadable. Emitting an empty string here would corrupt the JSONL line and
-# make the whole published artifact unparseable.
-rss_kb() {
-  local v
-  v=$(ps -o rss= -p "$1" 2>/dev/null | tr -d ' ')
-  if [ -z "$v" ]; then printf 'null'; else printf '%s' "$v"; fi
-}
+# RSS in KB, or the JSON literal `null` when the reading is not usable. The
+# plausibility rules (positive integer within SOAK_RSS_CEILING_KB) live in
+# scripts/lib/rss-soak-run-dir.sh so the fixture can drive them against a stubbed
+# `ps` without starting a soak; see rss_soak_rss_kb there for why a non-empty
+# check alone is not enough.
+rss_kb() { rss_soak_rss_kb "$1" "$RSS_CEILING_KB"; }
 load1() {
   local v
   v=$(uptime | sed -E 's/.*load average[s]?: ([0-9.]+).*/\1/')
@@ -469,8 +576,8 @@ except Exception:
 }
 
 # ---------------------------------------------------------------- stand up
-"$STRESS" --scenario echo --port "$RS_ECHO" >"$RUN_DIR/rs-echo.log" 2>&1 & add_gen "rs-echo" $!
-"$STRESS" --scenario echo --port "$GO_ECHO" >"$RUN_DIR/go-echo.log" 2>&1 & add_gen "go-echo" $!
+"$STRESS" --scenario echo --port "$RS_ECHO" >"$RUN_DIR/rs-echo.log" 2>&1 & add_echo "rs-echo" $!
+"$STRESS" --scenario echo --port "$GO_ECHO" >"$RUN_DIR/go-echo.log" 2>&1 & add_echo "go-echo" $!
 sleep 1
 
 "$RS_FRPS" -c "$RUN_DIR/rs-frps.toml" >"$RUN_DIR/rs-frps.log" 2>&1 & add_frp "frp-rs-frps" $!
@@ -569,13 +676,13 @@ rss_soak_clear_run_artifacts "$RUN_DIR" "$OUT" || { echo "error: cannot clear ru
 start_epoch=$(date +%s)
 start_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 started_load=$(load1)
-printf '{"kind":"meta","started_utc":"%s","duration_s":%s,"interval_s":%s,"generator_duration_s":%s,"host":"%s","platform":"%s","cpu_cores":%s,"frp_rs_version":"%s","frp_rs_sha":"%s","frp_rs_dirty":%s,"harness_sha256":{"rss_soak_sh":"%s","run_dir_sh":"%s","summary_py":"%s"},"run_dir":"%s","go_frp_version":"%s","go_frp_dir":"%s","rs_bin":"%s","rs_frpc_bin":"%s","traffic":{"churn_connections":%s,"churn_rate_per_stack":%s,"churn_msg_bytes":%s,"steady_streams":%s,"steady_mbps_per_stream":%s,"generator":"frp-stress","proxy_type":"tcp"},"ports":{"rs_control":%s,"rs_remote":%s,"rs_echo":%s,"go_control":%s,"go_remote":%s,"go_echo":%s},"bin_sha256":{"rs_frps":"%s","rs_frpc":"%s","go_frps":"%s","go_frpc":"%s"},"load1_start":%s,"caveats":["RSS is not live heap; it includes allocator retention and page-cache effects","both stacks share this host, so a machine-level effect moves both series","the per-sample time_wait count is host-wide, not per-side","identical offered recipe, not guaranteed identical achieved volume; per-side achieved volume is recorded and compared, and a spread beyond SOAK_TRAFFIC_TOLERANCE aborts the run","one TCP proxy per stack; other proxy types and encryption/compression/mux paths are not exercised"]}\n' \
+printf '{"kind":"meta","started_utc":"%s","duration_s":%s,"interval_s":%s,"generator_duration_s":%s,"host":"%s","platform":"%s","cpu_cores":%s,"frp_rs_version":"%s","frp_rs_sha":"%s","frp_rs_dirty":%s,"harness_sha256":{"rss_soak_sh":"%s","run_dir_sh":"%s","summary_py":"%s","frp_stress_tree":"%s"},"rs_bin_source":"%s","run_dir":"%s","go_frp_version":"%s","go_frp_dir":"%s","rs_bin":"%s","rs_frpc_bin":"%s","traffic":{"churn_connections":%s,"churn_rate_per_stack":%s,"churn_msg_bytes":%s,"steady_streams":%s,"steady_mbps_per_stream":%s,"generator":"frp-stress","proxy_type":"tcp"},"ports":{"rs_control":%s,"rs_remote":%s,"rs_echo":%s,"go_control":%s,"go_remote":%s,"go_echo":%s},"bin_sha256":{"rs_frps":"%s","rs_frpc":"%s","go_frps":"%s","go_frpc":"%s"},"load1_start":%s,"caveats":["RSS is not live heap; it includes allocator retention and page-cache effects","both stacks share this host, so a machine-level effect moves both series","the per-sample time_wait count is host-wide, not per-side","identical offered recipe, not guaranteed identical achieved volume; per-side achieved volume is recorded and compared, and a spread beyond SOAK_TRAFFIC_TOLERANCE aborts the run","one TCP proxy per stack; other proxy types and encryption/compression/mux paths are not exercised"]}\n' \
   "$start_utc" "$DURATION" "$INTERVAL" "$GEN_DURATION" "$(hostname -s)" "$go_platform" "$cpu_cores" \
-  "$rs_version" "$rs_sha" "$rs_dirty" "$soak_sha" "$run_dir_lib_sha" "$summary_py_sha" "$RUN_DIR" \
+  "$rs_version" "$rs_sha" "$rs_dirty" "$soak_sha" "$run_dir_lib_sha" "$summary_py_sha" "$stress_tree_sha" "$RS_BIN_SOURCE" "$RUN_DIR" \
   "$go_version" "$GO_DIR" "$RS_FRPS" "$RS_FRPC" \
   "$CHURN_CONNS" "$CHURN_RATE" "$MSG_BYTES" "$STREAMS" "$STREAM_MBPS" \
   "$RS_PORT" "$RS_REMOTE" "$RS_ECHO" "$GO_PORT" "$GO_REMOTE" "$GO_ECHO" \
-  "$(sha256_of "$RS_FRPS")" "$(sha256_of "$RS_FRPC")" "$(sha256_of "$GO_FRPS")" "$(sha256_of "$GO_FRPC")" \
+  "$rs_frps_sha" "$rs_frpc_sha" "$go_frps_sha" "$go_frpc_sha" \
   "$started_load" >> "$OUT"
 
 echo "=== soak running: $(date -u +%H:%M:%SZ), load1=$started_load ==="
@@ -602,6 +709,19 @@ scan_dead() { # <check_generators: 1|0>
       else DEAD_SEEN="${DEAD_SEEN}${FRP_NAMES[$i]}(exit $st) "; fi
     fi
   done
+  # The echo backends have no self-imposed end either, so they are scanned at
+  # EVERY iteration, including the last one.
+  for i in "${!ECHO_PIDS[@]}"; do
+    p="${ECHO_PIDS[$i]}"
+    if ! alive "$p"; then
+      wait "$p" 2>/dev/null
+      st=$?
+      if [ "$st" = 127 ]; then DEAD_SEEN="${DEAD_SEEN}${ECHO_NAMES[$i]} "
+      else DEAD_SEEN="${DEAD_SEEN}${ECHO_NAMES[$i]}(exit $st) "; fi
+    fi
+  done
+  # The traffic generators end by design (GENERATOR_TAIL past the window), so
+  # they are only scanned while the window is open; see the loop below.
   [ "$check_gen" = 1 ] || return 0
   for i in "${!GEN_PIDS[@]}"; do
     p="${GEN_PIDS[$i]}"
@@ -617,9 +737,9 @@ scan_dead() { # <check_generators: 1|0>
 # The scan runs BEFORE the window-end test, so the last sampling interval is
 # examined too: with the scan after the break, a process that died at
 # DURATION-5 s was never seen and the series was published as "run completed".
-# The four frp processes and two echo backends have no self-imposed end, so any
-# death is a fault at any elapsed time. The four traffic generators DO end (by
-# design, GENERATOR_TAIL seconds past the window), so they are only checked
+# The four frp processes and the two echo backends have no self-imposed end, so
+# any death is a fault at any elapsed time. The four traffic generators DO end
+# (by design, GENERATOR_TAIL seconds past the window), so they are only checked
 # while the window is still open: a generator dying inside the window is a fault
 # with no grace period, and one that never wrote its result row is in any case
 # caught after the window by the summary's traffic reconciliation.

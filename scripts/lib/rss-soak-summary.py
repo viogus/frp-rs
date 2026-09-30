@@ -16,13 +16,29 @@ Completeness is decided HERE and nowhere else. A series is aborted when any of
 these holds:
 
   * the caller passed a reason (a process died mid-window, a signal, ...);
-  * any of the four RSS columns has ZERO readings (a stubbed/unavailable `ps`
-    used to yield a full table of zeros printed next to "run completed");
+  * any of the four RSS columns has ZERO usable readings (a stubbed/unavailable
+    `ps` used to yield a full table of zeros printed next to "run completed");
+  * an RSS reading is outside 1..SOAK_RSS_CEILING_KB, or a column's readings are
+    ALL IDENTICAL across the series — either shape can only come from `ps` not
+    reporting real processes, and a fabricated flat line is exactly what this
+    artifact must not present as evidence. The identical-values rule is
+    deliberately strict: real RSS over a multi-hour series always moves (page
+    cache, allocator behaviour), so a legitimately flat short validation is a
+    cheap re-run, while a stubbed `ps` printing a constant is otherwise
+    indistinguishable from the strongest possible result;
   * either side completed no churn round trips or moved no steady bytes;
+  * either side's totals are below the absolute floor (MIN_CHURN_ROUND_TRIPS /
+    MIN_STEADY_TOTAL_BYTES): a run that moved almost nothing measured almost
+    nothing, even though it did measure it;
   * either side lost a steady stream (`failed_streams` > 0);
   * the two sides' achieved volume differs by more than SOAK_TRAFFIC_TOLERANCE
     (default 0.10) — both are paced identically, so a large gap means one side
-    was not handed the same work and the comparison is not head-to-head.
+    was not handed the same work and the comparison is not head-to-head. The
+    tolerance must be a finite positive number: `nan` compares false against
+    everything and used to disable this check while the run still reported
+    `"aborted": null`;
+  * the recorded frp-rs and Go binary sha256 are equal, i.e. one implementation
+    was run on both sides.
 
 An artifact with no trailing `summary` record is an incomplete run; that is a
 convention the READER of the series applies, not something this script tests for
@@ -30,6 +46,7 @@ convention the READER of the series applies, not something this script tests for
 """
 
 import json
+import math
 import os
 import statistics
 import sys
@@ -40,6 +57,19 @@ COLUMNS = [
     ("go_frps_kb", "Go frps"),
     ("go_frpc_kb", "Go frpc"),
 ]
+
+# A reading outside this range cannot be a real process RSS here and is treated
+# as no reading at all. The generator applies the same bound before writing
+# (SOAK_RSS_CEILING_KB), so a well-formed artifact never contains one; the check
+# is repeated here because the reader must also be safe against an artifact it
+# did not produce.
+DEFAULT_RSS_CEILING_KB = 104857600  # 100 GiB
+# Absolute achieved-load floor. Far below what the default recipe produces in the
+# shortest allowed window (60 s: ~2400 churn round trips, hundreds of MiB of
+# steady traffic per side), so it only fires on a run that moved almost nothing.
+MIN_CHURN_ROUND_TRIPS = 10
+MIN_STEADY_TOTAL_BYTES = 1048576  # 1 MiB
+
 
 
 def load_json(path):
@@ -130,10 +160,40 @@ def main(argv):
     # (fmean([]) would raise).
     window = max(1, 3600 // max(1, int(meta.get("interval_s") or 45)))
 
-    data = {
-        key: block([r.get(key) for r in samples if r.get(key) is not None], window)
-        for key, _ in COLUMNS
-    }
+    try:
+        rss_ceiling = int(os.environ.get("SOAK_RSS_CEILING_KB") or DEFAULT_RSS_CEILING_KB)
+    except ValueError:
+        rss_ceiling = DEFAULT_RSS_CEILING_KB
+    if rss_ceiling <= 0:
+        rss_ceiling = DEFAULT_RSS_CEILING_KB
+
+    def usable_rss(value):
+        """A reading that could be a real process RSS, else None. Rejects a bool
+        (JSON `true`), a non-integer, and anything outside 1..ceiling: a stubbed
+        or misparsing `ps` that prints 0, a constant, or a huge number must not
+        end up as published evidence."""
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value if 0 < value <= rss_ceiling else None
+
+    rss_values = {}
+    rejected = {}
+    data = {}
+    for key, _ in COLUMNS:
+        vals = []
+        bad = 0
+        for r in samples:
+            raw = r.get(key)
+            if raw is None:
+                continue
+            v = usable_rss(raw)
+            if v is None:
+                bad += 1
+            else:
+                vals.append(v)
+        rss_values[key] = vals
+        rejected[key] = bad
+        data[key] = block(vals, window)
     loads = [r.get("load1") for r in samples if r.get("load1") is not None]
     waits = [r.get("time_wait") for r in samples if r.get("time_wait") is not None]
 
@@ -156,28 +216,81 @@ def main(argv):
     if aborted:
         problems.append(aborted)
 
-    # A flat RSS line only means something if it was measured at all, and if load
-    # was actually delivered on BOTH sides.
+    # A flat RSS line only means something if it was measured, plausibly, and
+    # more than once.
     for key, label in COLUMNS:
-        if not data[key]:
+        vals = rss_values[key]
+        if rejected[key]:
+            problems.append(
+                f"{label}: {rejected[key]} implausible RSS reading(s) ignored "
+                f"(outside 1..{rss_ceiling} KB)"
+            )
+        if not vals:
             problems.append(f"no RSS measurements for {label}")
+        elif len(vals) < 2:
+            problems.append(f"{label} has only {len(vals)} RSS reading(s); one reading cannot show stability")
+        elif len(set(vals)) == 1:
+            problems.append(
+                f"{label} reported the identical RSS ({vals[0]} KB) in all {len(vals)} samples; "
+                "real RSS moves, so this reads as a column that was not measured"
+            )
+
+    # Load was actually delivered on BOTH sides, above an absolute floor: a run
+    # that moved almost nothing measured almost nothing.
     for key, label in (("frp_rs_churn", "frp-rs"), ("go_churn", "Go")):
         d = traffic.get(key)
         if not d or not d.get("round_trips"):
             problems.append(f"{label} churn completed no echo round trips")
+        elif d["round_trips"] < MIN_CHURN_ROUND_TRIPS:
+            problems.append(
+                f"{label} churn completed only {d['round_trips']} round trips "
+                f"(< {MIN_CHURN_ROUND_TRIPS}); too little traffic to compare"
+            )
     for key, label in (("frp_rs_steady", "frp-rs"), ("go_steady", "Go")):
         d = traffic.get(key)
         if not d or not d.get("total_bytes"):
             problems.append(f"{label} steady stream moved no bytes")
+        elif d["total_bytes"] < MIN_STEADY_TOTAL_BYTES:
+            problems.append(
+                f"{label} steady stream moved only {d['total_bytes']} bytes "
+                f"(< {MIN_STEADY_TOTAL_BYTES}); too little traffic to compare"
+            )
         if d and d.get("failed_streams"):
             problems.append(f"{label} steady path lost {d['failed_streams']} stream(s)")
 
+    # One implementation on both sides is not a comparison. The generator refuses
+    # this before the window opens; the check is repeated so a hand-edited
+    # artifact cannot present it either.
+    bins = meta.get("bin_sha256") or {}
+    for rs_key, go_key, rs_label, go_label in (
+        ("rs_frps", "go_frps", "frp-rs frps", "Go frps"),
+        ("rs_frpc", "go_frpc", "frp-rs frpc", "Go frpc"),
+    ):
+        a, b = bins.get(rs_key), bins.get(go_key)
+        if a and b and a == b:
+            problems.append(
+                f"{rs_label} and {go_label} are the same binary (sha256 {a}); "
+                "this is not a head-to-head comparison"
+            )
+
     # Achieved-volume reconciliation: both sides are offered the same paced
-    # recipe, so a large gap means one side was given less work.
+    # recipe, so a large gap means one side was given less work. The tolerance
+    # must be a finite positive number: `nan` slips past float() and compares
+    # false against everything, which silently disables the check.
+    tolerance_raw = os.environ.get("SOAK_TRAFFIC_TOLERANCE") or "0.10"
+    tolerance = None
     try:
-        tolerance = float(os.environ.get("SOAK_TRAFFIC_TOLERANCE") or "0.10")
+        parsed = float(tolerance_raw)
+        if math.isfinite(parsed) and parsed > 0:
+            tolerance = parsed
     except ValueError:
-        tolerance = 0.10
+        pass
+    if tolerance is None:
+        problems.append(
+            f"SOAK_TRAFFIC_TOLERANCE is not a finite positive number ({tolerance_raw!r}); "
+            "the achieved-load reconciliation cannot be trusted"
+        )
+        tolerance = 0.10  # display/recording fallback only; the run has aborted
     achieved_equality = {}
     for key_rs, key_go, field, label in (
         ("frp_rs_churn", "go_churn", "round_trips", "churn round trips"),
