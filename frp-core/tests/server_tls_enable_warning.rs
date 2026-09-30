@@ -62,6 +62,15 @@
 //! that absence is pinned by the existing `frpc` warning-delivery tests plus the
 //! grep recorded in the item. YAML and `.ini` spellings are out of scope (only
 //! TOML is exercised).
+//!
+//! **The two variants are covered by two different lanes, not by one run.** The
+//! `#[cfg]` split means a default-features run asserts only the `tls` text and a
+//! `--no-default-features` run only the no-TLS text: `.github/workflows/ci.yml:191-194`
+//! (`cargo test -p frp-core`, default features) covers the `tls` variant, and
+//! `.github/workflows/ci.yml:195-226` (`cargo test -p frp-core --no-default-features
+//! --all-targets`, the `run:` at `.github/workflows/ci.yml:226`) covers the no-TLS
+//! one. A change to either text is therefore only seen by the
+//! lane whose feature set selects it.
 
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
@@ -254,6 +263,25 @@ fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
         );
     }
 
+    // …and the whole text, not just a list of clauses: a substring allow-list
+    // cannot see a clause being **appended** or **dropped** — under both mutants
+    // the list above passed and only the assertion below failed (measured), so
+    // the variant string is pinned end to end here. Any intentional wording
+    // change must update this literal, the constant, and the measurements in the
+    // constant's doc together.
+    #[cfg(feature = "tls")]
+    assert_eq!(
+        SERVER_TLS_ENABLE_INERT_WARNING,
+        "tls_enable has no effect on the server: nothing in frp-server or frps \
+         reads it. The server's TLS switch is `tls_only` (Go's `transport.tls.force`); \
+         the TLS acceptor is built from `tls_cert_file` + `tls_key_file` — a \
+         half-written (only one of the two) or unreadable pair is refused at startup, \
+         a reload reports the failure and keeps the running acceptor, and with \
+         neither set the server auto-generates a self-signed certificate pair",
+        "the `tls` variant's text changed: a clause was added or dropped, which the \
+         substring list above cannot detect"
+    );
+
     // A no-TLS build must name *why* the key is inert and must not claim any
     // certificate behaviour — the clause the micro tier made false.
     #[cfg(not(feature = "tls"))]
@@ -278,6 +306,19 @@ fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
             );
         }
     }
+
+    // The whole no-TLS text as well: the deny-list above only rejects four known
+    // clauses, so a *new* certificate claim — or a dropped one of the two
+    // positive clauses — would still be green.
+    #[cfg(not(feature = "tls"))]
+    assert_eq!(
+        SERVER_TLS_ENABLE_INERT_WARNING,
+        "tls_enable has no effect on the server: nothing in frp-server or frps \
+         reads it. This build has no TLS support (frp-core's `tls` feature is off), \
+         so the server never builds a TLS acceptor",
+        "the no-TLS variant's text changed: a clause was added or dropped, which the \
+         deny-list above cannot detect"
+    );
 
     // The acceptor is *not* pair-gated in a `tls` build: with neither file set
     // the server auto-generates a self-signed pair. A "non-empty pair" claim

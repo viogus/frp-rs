@@ -465,8 +465,11 @@ fn common_and_includes_spellings_set_the_flag() {
     // `common.web_server` whole, so this shape is inert *and* unflagged — the
     // detector must not report a key the loader dropped. Only the **same**
     // spelling is discarded: the two cross-spelling rows below keep the key and
-    // do warn, because `web_server` and `webServer` are different keys to the
-    // flatten and merge afterwards.
+    // do warn, because `web_server` and `webServer` are different keys, so the
+    // flatten keeps both — and the detector reads the flag from the
+    // pre-`normalize` value with its own `[common]` fallback
+    // (`ConfigPresence::web_server_tls_enable_set_in`), not from the per-key
+    // merge that runs afterwards.
     let c = load_capturing(
         "bind_port = 7000\n[web_server]\naddr = \"127.0.0.1\"\nport = 7500\n\
          [common.web_server.tls]\nenable = true\n",
@@ -479,7 +482,8 @@ fn common_and_includes_spellings_set_the_flag() {
     assert_eq!(c.warning_records, 0);
 
     // Cross-spelling: the `[common]` section keeps its own spelling, the
-    // top-level one is the other spelling, and the merge finds the key.
+    // top-level one is the other spelling, and the detector's `[common]`
+    // fallback finds the key — before any per-key merge runs.
     let c = load_capturing(
         "bind_port = 7000\n[webServer]\naddr = \"127.0.0.1\"\nport = 7500\n\
          [common.web_server.tls]\nenable = true\n",

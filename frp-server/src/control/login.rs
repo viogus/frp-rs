@@ -2201,11 +2201,14 @@ mod oidc_throttle_tests {
     /// `WouldBlock`: a client that connects and half-closes before sending gives
     /// `n=0` → the `/` fallback → 404 on **both** platforms (measured: 3.833 µs
     /// on macOS, 1.625 µs on Linux). (2) A head split across writes mis-routes,
-    /// because the single read returns only the prefix (measured on Linux; the
-    /// elapsed figure is shape-dependent, so it is named with its shape — with the
-    /// first write ~200 ms after the accept, `n=16`, `path="/.well-known"` → 404
-    /// in ~208 ms, while an immediate first write gives the same `n=16` and the
-    /// same mis-route in 192 µs). Every `ci.yml` job is
+    /// because the single read returns only the prefix (measured on Linux). The
+    /// elapsed figures are shape- and host-dependent, so they are named with their
+    /// shape: with the first write ~200 ms after the accept, `n=16`,
+    /// `path="/.well-known"` → 404 in ~208 ms, while an immediate first write
+    /// gives the same `n=16` and the same mis-route in single-digit microseconds
+    /// to ~1.6 ms depending on host and run — reviewer samples: 10-run medians
+    /// 7.583 µs macOS / 5.917 µs Linux, a 20-trial spread of 2–1576 µs, and
+    /// one-off figures of 192.08 µs and 1.635 ms). Every `ci.yml` job is
     /// `ubuntu-latest`, so the *race* cannot flake CI — but those EOF and split
     /// shapes could still 404 there. What this wait does not do is depend on the
     /// inherited mode — it clears `O_NONBLOCK` explicitly — so it is correct on
@@ -2534,6 +2537,25 @@ mod oidc_throttle_tests {
         );
     }
 
+    /// A budget that is **already expired** is a named `TimedOut(0ns)`, not an OS
+    /// error: the `remaining.is_zero()` guard is the only thing keeping the
+    /// `set_read_timeout(Some(ZERO))` below from being reached, and that call fails
+    /// with `Io(InvalidInput "cannot set a 0 duration timeout")` (measured). No
+    /// clock control and no socket timing — the deadline is expired the moment it
+    /// is computed — so the mutant a round-3 review listed as needing "a read that
+    /// lands exactly on the expired budget, a controlled clock, not a socket" is
+    /// in fact a direct call away.
+    #[test]
+    fn read_request_head_reports_a_zero_budget_as_a_named_timeout() {
+        let (mut server, _client) = nonblocking_accepted_pair();
+        let err = read_request_head(&mut server, std::time::Duration::ZERO)
+            .expect_err("an expired budget cannot return a head");
+        assert!(
+            matches!(err, RequestHeadError::TimedOut(d) if d.is_zero()),
+            "a zero budget must be a named TimedOut(0ns), got {err:?}"
+        );
+    }
+
     /// A client that connects and closes before sending anything is an **EOF**,
     /// not a stall: `Ok(0)` must become the named `Eof` promptly. This is the
     /// third failure the pre-fix `unwrap_or(0)` hid, and unlike the
@@ -2647,7 +2669,9 @@ mod oidc_throttle_tests {
     /// The returned head ends **at** the terminator: bytes that arrive in the same
     /// read past it are consumed and discarded, not appended. The target is the
     /// `buf.truncate(end + 4)` mutant, which would return the pipelined tail as
-    /// part of the head (and would hand the routing step a different path).
+    /// part of the head. Routing (`req.split_whitespace().nth(1)`) yields `/jwks`
+    /// either way — the pipelined `GET` is a third token, not the second — so the
+    /// equality assertion below is the entire catch, not a path difference.
     #[test]
     fn read_request_head_stops_at_the_terminator() {
         let (mut server, mut client) = nonblocking_accepted_pair();
@@ -2672,6 +2696,17 @@ mod oidc_throttle_tests {
     /// to 60 s with the whole suite green (a round-3 review mutant). Pinned by
     /// value — see the constant's doc for why the end-to-end effect is not
     /// exercised.
+    ///
+    /// What this pin does **not** guard: the delegation
+    /// `oidc_mock_server() → oidc_mock_server_with_timeout(MOCK_REQUEST_HEAD_TIMEOUT)`.
+    /// Wiring that call to `Duration::from_secs(60)` while the constant stays put
+    /// leaves this pin and the rest of the `oidc` suite green (measured by a
+    /// round-3 reviewer as `M_delegation_60s`) — every other test either sends at
+    /// once or overrides the deadline explicitly. Pinning it would mean either
+    /// waiting out the shipped 5 s, which this module deliberately avoids, or
+    /// returning the timeout out of the ctor, whose tuple is destructured at a
+    /// dozen call sites; the delegation is named here and in the constant's doc
+    /// instead.
     #[test]
     fn mock_default_request_head_deadline_is_pinned() {
         assert_eq!(
