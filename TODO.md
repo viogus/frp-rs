@@ -7683,3 +7683,21 @@ section; ledger now **24 open / 104 closed**.**
   unreachable on a case-sensitive filesystem. Done-when: either a scenario exercises an empty root
   (killing that guard) or the dormant branch is removed, and the case-insensitive-volume limitation
   is recorded where the containment check is documented.
+
+- [ ] **`--allow-unsafe`'s comma grammar still differs from pflag's CSV reader, and the ignored-flag twin splits nothing at all.**
+  The read-path parser splits on `,` and trims each element (`frp-core/src/cli.rs:2612-2621`, inside
+  `allow_unsafe_parser` at `:2607`), while Go's pflag parses a repeated string flag with
+  `encoding/csv` (leading-space trimming off). Two spellings therefore diverge, measured at
+  `a26a5f76` against Go v0.71.0 with an `auth.tokenSource` exec config
+  (`frpc verify -c exec.toml --allow-unsafe <value>`): `'"TokenSourceExec"'` → frp-rs rc **1** /
+  Go rc **0** (the quotes are CSV syntax to Go and literal bytes here); `'A, TokenSourceExec'` →
+  frp-rs rc **0** / Go rc **1** (the space is significant to Go and trimmed here). The agreeing rows:
+  `TokenSourceExec` 0/0, `Ignored,TokenSourceExec` 0/0, no flag 1/1. Inherited from the pre-existing
+  `.split(',')` reading, not introduced by the repeated-flag fix. The un-read twin
+  `ignored_allow_unsafe()` (`frp-core/src/cli.rs:2631-2636`) has `.many()` but no comma-split at
+  all, so on the reload/status/stop surfaces a comma form that Go accepts as several features is one
+  opaque value here; its doc comment at `:2626-2627` claims the same pflag `strings` semantics.
+
+  Done-when: the flag's value grammar matches pflag's CSV reader for quoted and space-padded
+  elements and the un-read twin splits the same way (or both divergences are documented as
+  deliberate with these measured rows), and a test pins each row.
