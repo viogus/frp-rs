@@ -5161,19 +5161,19 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   ignored, and the gate is fail-closed: `--allow-unsafe WrongFeature` is rc 1 (was rc 0). The
   daemon path is untouched and still exits 3 `EXIT_AUTH` on the same config, the documented
   frp-rs extension over Go's rc 1; that divergence is stated in the pins' doc tables
-  (`frps/tests/cli_exit_codes.rs:273-281`, `frpc/tests/cli_exit_codes.rs:376-384`) rather than
+  (`frps/tests/cli_exit_codes.rs:273-282`, `frpc/tests/cli_exit_codes.rs:630-639`) rather than
   moved. Every row above now has a measured pin:
-  `verify_runs_the_post_load_allow_unsafe_gate_like_go` in `frps/tests/cli_exit_codes.rs:293`
-  and `frpc/tests/cli_exit_codes.rs:395`, plus the loader-level
+  `verify_runs_the_post_load_allow_unsafe_gate_like_go` in `frps/tests/cli_exit_codes.rs:295`
+  and `frpc/tests/cli_exit_codes.rs:651`, plus the loader-level
   `check_client_unsafe_features_gates_both_token_source_spellings` in
-  `frp-core/src/config/tests.rs` for the `auth.oidc.tokenSource` spelling, which this round's
+  `frp-core/src/config/tests.rs:10825` for the `auth.oidc.tokenSource` spelling, which this round's
   probe table does not cover separately but Go gates through `validateOIDCConfig`
   (`pkg/config/v1/validation/client.go`), so it is an exact-parity arm.
   Teeth: `Ok(())` for either checked wrapper reds the spawn pin's refuse row
-  (`frps/tests/cli_exit_codes.rs:308:5`, `frpc/tests/cli_exit_codes.rs:409:5`),
+  (`frps/tests/cli_exit_codes.rs:310:5`, `frpc/tests/cli_exit_codes.rs:665:5`),
   widening the predicate to `unsafe_features.is_empty()` reds the fail-closed row
-  (`frps/tests/cli_exit_codes.rs:351:5`, `frpc/tests/cli_exit_codes.rs:454:5`), and deleting
-  the `auth.oidc_token_source` arm reds `frp-core/src/config/tests.rs:10429:14` (the
+  (`frps/tests/cli_exit_codes.rs:353:5`, `frpc/tests/cli_exit_codes.rs:712:5`), and deleting
+  the `auth.oidc_token_source` arm reds `frp-core/src/config/tests.rs:10890:14` (the
   `.expect_err` line; the round-1 review measured this head).
 
   **Round-1 review fixes (`b9ab5473` F1, `436a8130` F5).** Round 1 blocked on a regression
@@ -5187,15 +5187,15 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   (`--allow-unsafe WrongFeature --allow-unsafe TokenSourceExec` rc 0 in both value orders,
   `--allow-unsafe Ignored,TokenSourceExec` rc 0, `WrongFeature` alone rc 1, no flag rc 1).
   Pins: `allow_unsafe_appends_and_comma_splits_on_every_reading_surface`
-  (`frp-core/src/cli.rs:5134`) and three extra rows per binary inside
+  (`frp-core/src/cli.rs:5188`) and three extra rows per binary inside
   `verify_runs_the_post_load_allow_unsafe_gate_like_go`; teeth: a last-wins mutant reds
-  `frp-core/src/cli.rs:5154:9`, `frps/tests/cli_exit_codes.rs:382:9` and
-  `frpc/tests/cli_exit_codes.rs:485:9`, while removing `.many()` does not compile
-  (the deleted `.many()` at `frp-core/src/cli.rs:2611`; the diagnostic labels
-  `.fallback(vec![])` at `:2622` and the unsatisfied closure at `:2612`, `E0599`/`E0631` — the
+  `frp-core/src/cli.rs:5207:9`, `frps/tests/cli_exit_codes.rs:408:9` and
+  `frpc/tests/cli_exit_codes.rs:767:9`, while removing `.many()` does not compile
+  (the deleted `.many()` at `frp-core/src/cli.rs:2636`; the diagnostic labels
+  `.fallback(vec![])` at `:2647` and the unsatisfied closure at `:2637`, `E0599`/`E0631` — the
   closure's `Vec<String>` type is the enforcement, so that mutation is killed by the checker
   rather than by a failing assertion).
-  F5: the comment in `frp-core/src/config/file.rs:167-197` now names both spellings and Go's
+  F5: the comment in `frp-core/src/config/file.rs:167-193` now names both spellings and Go's
   `validateOIDCConfig` (`pkg/config/v1/validation/client.go`), which gates
   `auth.oidc.tokenSource` exec identically — an exact-parity arm, not an unmeasured one.
 - [x] **`frpc verify`'s success line is not Go's, and now differs from `frps verify`'s too.**
@@ -7704,3 +7704,24 @@ section; ledger now **24 open / 104 closed**.**
   Done-when: the flag's value grammar matches pflag's CSV reader for quoted and space-padded
   elements and the un-read twin splits the same way (or both divergences are documented as
   deliberate with these measured rows), and a test pins each row.
+
+- [ ] **The `--allow-unsafe` accumulation pins cannot see a duplicated value, a cap at 32, or a shrinking lane, and the two lane literals are equality guards rather than floors.**
+  Filed by the coordinator from the round-3 adversarial review of the `--allow-unsafe` gate fix
+  (`frp-core/src/cli.rs:5188` `allow_unsafe_appends_and_comma_splits_on_every_reading_surface`,
+  `frps/tests/cli_exit_codes.rs:295`, `frpc/tests/cli_exit_codes.rs:651`).
+  (a) Every repeated value in the pins is distinct (`frp-core/src/cli.rs:5175` uses `"a"`/`"b"`,
+  `frpc/tests/cli_persistent_flags.rs:384-387` likewise), so a parser that de-duplicates or
+  collapses equal repeats keeps the unit test and both spawn pins green: "appends like pflag" is
+  pinned for distinct values only.
+  (b) "No cap" rests on the single wide row that builds 32 occurrences. Measured: `v.truncate(32)`
+  leaves the whole `frp-core` lib suite green (`997 passed; 0 failed`) and both spawn rows use at
+  most four occurrences, so any cap ≥ 5 is invisible to them; loosening that one assertion to
+  `>= wide_n - 1` also passes everything.
+  (c) `FRPS_CLI_TESTS` / `FRPC_TINY_CLI_TESTS` (`.github/workflows/ci.yml:194` / `:216`) compare the
+  file's test count to the literal for equality, so deleting a test and lowering the literal
+  together passes (measured 33/33/33), and the full `frpc` lane (`.github/workflows/ci.yml:312`,
+  18 tests) has no count guard at all.
+  Done-when: a pin repeats one identical value and asserts both copies survive; the unbounded class
+  is pinned past any plausible cap (or the assertion states the bound it really enforces); and each
+  lane literal gets an absolute floor (or the full `frpc` lane gets a count guard), with the
+  delete-plus-lower mutant red.
