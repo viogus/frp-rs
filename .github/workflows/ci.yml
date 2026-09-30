@@ -473,17 +473,29 @@ jobs:
         # `dashboard::v2::tests::test_serverinfo_go_shape` reads `kcpBindPort`,
         # which a kcp-less build does not produce. The count guard still pins
         # that exactly one test ran.
+        #
+        # The guard is not count-only, for the same reason the frps bin unit
+        # step above is not: renaming the test (still one test, still green) and
+        # returning early as the body's first statement (one test, `1 passed`,
+        # zero assertions) both survive a count. So the step also greps the
+        # pin's `--nocapture` completion marker, which is printed only after
+        # every assertion has run and names the variant this shape resolved to.
         shell: bash
         run: |
           set -eo pipefail
           log=/tmp/frp-server-resolver-no-tls-test.log
-          cargo test -p frp-server --no-default-features --features dashboard --lib --color never web_server_tls_enable_reader 2>&1 | tee "$log"
+          # `--nocapture` puts the pin's own completion marker in the log: a body
+          # that returns before its assertions still reports `1 passed`, and only
+          # the marker distinguishes "ran the assertions" from "ran early".
+          cargo test -p frp-server --no-default-features --features dashboard --lib --color never web_server_tls_enable_reader -- --nocapture 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+          marker="web-server-tls-enable-reader-pin: ok, WebServerNoTls"
           n=$(cargo test -p frp-server --no-default-features --features dashboard --lib --color never web_server_tls_enable_reader -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running unittests src/lib.rs" "$log.plain" || status=1
           grep -q "test result: ok. 1 passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "1" ] || status=1
+          grep -q "$marker" "$log.plain" || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frp-server warning-resolver guard failed (status=$status, file=$n, log=$log)"
             if [ -n "$n" ] && [ "$n" != "1" ]; then
@@ -493,10 +505,13 @@ jobs:
                 echo "::error::frp-server/src/service.rs lists $n tests matching web_server_tls_enable_reader, this step expects 1: move the single literal in this shell step from 1 to $n"
               fi
             fi
+            if [ "$(grep -c "$marker" "$log.plain" || true)" = "0" ]; then
+              echo "::error::the frp-server resolver pin did not print its completion marker (\"$marker\") — a body that returns before its assertions passes libtest while asserting nothing; restore the assertions"
+            fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frp-server warning-resolver guard ok: $n tests listed (expected 1), 0 failed"
+          echo "frp-server warning-resolver guard ok: $n tests listed (expected 1), marker seen, 0 failed"
       - name: Run frp-core lib + integration tests (kcp/mux/xtcp_p2p/yamux_rst)
         # frp-core's tests/ are pure Rust<->Rust (no frps/frpc binaries), so
         # they belong with the unit lane and don't need the integration build.
