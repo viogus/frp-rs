@@ -3016,7 +3016,13 @@ every git call is bounded (15 s there, 30 s in the path scan), and the git
 environment is sanitised. A refusal prints the reason and never an `ok`; a scan
 whose file set was incomplete prints `not evaluated`. Known, deliberate holes are
 listed next to the code (a directory named `*.yml`, a symlinked directory under
-`.github/workflows/`); the symlinked `.rs` double count is recorded in `TODO.md`.
+`.github/workflows/`), and a workflow *path* containing a newline is refused outright rather than
+scanned (fail-closed, with its own `FAIL` row). The scan walks dedupe on `(st_dev, st_ino)` — and
+on `realpath` for the two non-`.rs` walks — so a symlink or a hard link inside one scope is counted
+once; the shapes still recorded in `TODO.md` are the cross-crate hard link and the two non-`.rs`
+hard-link shapes. The gate's exit-code mapping is pinned by `scripts/tests/repo-health-fixtures.sh`
+(its own step in the `health` job), which builds a throwaway tree and asserts both the process rc
+and the `archive path scan failed (exit 3)` row.
 
 ## 6. Release Process
 
