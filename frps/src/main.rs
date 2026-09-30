@@ -189,16 +189,26 @@ impl EarlyShutdown {
     /// Record a delivered shutdown signal and fan it out to every service that
     /// registered before it arrived.
     ///
-    /// A *repeat* request while nothing has registered is the one case this
-    /// cannot serve by cancelling: the config-directory lane is still blocked in
-    /// `collect_config_files`/`read_to_string` (a pipe or FIFO named `*.toml`
-    /// never returns), so no service exists to stop and there is nothing for the
-    /// main task to observe. Left alone, the process would sit in that read
-    /// forever, and the recorded request would have converted "dies on SIGTERM"
-    /// into "unkillable except by SIGKILL" — the pre-fix and Go behaviour is
-    /// signal death (`rc 143`). A second request therefore forces an exit; one
-    /// signal is still always recorded and honoured, which is what the
-    /// registration-window pin relies on.
+    /// A *repeat* request while nothing has **ever** registered is the one case
+    /// this cannot serve by cancelling: the config-directory lane is still
+    /// blocked in `collect_config_files`/`read_to_string` (a pipe or FIFO named
+    /// `*.toml` never returns), so no service exists to stop and there is
+    /// nothing for the main task to observe. Left alone, the process would sit
+    /// in that read forever, and the recorded request would have converted "dies
+    /// on SIGTERM" into "deaf to SIGTERM" — on a FIFO-only directory the
+    /// pre-fix and Go behaviour is signal death (`rc 143`). A second request
+    /// therefore forces an exit; one signal is still always recorded and
+    /// honoured, which is what the registration-window pin relies on.
+    ///
+    /// `states` is append-only, so "nothing has ever registered" above is exact:
+    /// when the directory's *first* entry loads and the FIFO comes later, one
+    /// service registers, this escalation cannot fire, and the lane stays deaf
+    /// to `SIGTERM` exactly as the pre-fix binary is. Measured on that mixed
+    /// shape (valid `a.toml` + FIFO `b.toml`): base `ea991757` and this tree
+    /// both log `starting 2 services`, both survive four SIGTERMs, and only
+    /// `SIGKILL` ends them (`wait rc 137`). Making that shape killable is a
+    /// behaviour change, not claimed here or by the FIFO pin (FIFO-only
+    /// fixture).
     fn record(&self, forced_exit: i32, name: &'static str) {
         // Store before taking `states`: `watch` reads `requested` **while
         // holding** the same lock, so a call that interleaves here either sees
@@ -599,20 +609,36 @@ async fn run(mut cli: FrpsArgs) {
                                 .ok()
                                 .and_then(|v| v.parse::<u64>().ok())
                             {
-                                // A recorded shutdown signal ends the hold early.
-                                // A spawn-level pin can then set a delay longer
-                                // than the test itself and send `SIGTERM` the
-                                // instant the startup line appears: the hold
-                                // ends because the main task *recorded* the
-                                // signal, so the pin proves the recorded path
-                                // instead of racing the registration.
-                                #[cfg(unix)]
-                                tokio::select! {
-                                    _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {}
-                                    _ = early_shutdown.recorded() => {}
+                                // Optional per-file filter
+                                // (`FRPS_CFGDIR_TEST_REGISTRATION_DELAY_FILES`,
+                                // comma-separated path fragments): hold only the
+                                // matching files, so a pin can park one file
+                                // across a delivered signal while the others
+                                // register — the pre-registration half of the
+                                // recorder's fan-out pin, whose
+                                // post-registration half is the hold below.
+                                let held = std::env::var("FRPS_CFGDIR_TEST_REGISTRATION_DELAY_FILES")
+                                    .ok()
+                                    .map(|files| {
+                                        files.split(',').any(|f| path_str.contains(f.trim()))
+                                    })
+                                    .unwrap_or(true);
+                                if held {
+                                    // A recorded shutdown signal ends the hold early.
+                                    // A spawn-level pin can then set a delay longer
+                                    // than the test itself and send `SIGTERM` the
+                                    // instant the startup line appears: the hold
+                                    // ends because the main task *recorded* the
+                                    // signal, so the pin proves the recorded path
+                                    // instead of racing the registration.
+                                    #[cfg(unix)]
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {}
+                                        _ = early_shutdown.recorded() => {}
+                                    }
+                                    #[cfg(not(unix))]
+                                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                                 }
-                                #[cfg(not(unix))]
-                                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                             }
                             // Registered before `run()`, so the soonest possible
                             // SIGUSR1 already finds this service. Releasing the
@@ -642,6 +668,40 @@ async fn run(mut cli: FrpsArgs) {
                                          installed its own handler; stopping it through the \
                                          recorded request"
                                     );
+                                }
+                            }
+                            // Debug-build-only hold (review round 2, F7), sibling
+                            // of the pre-registration hook above: when it names
+                            // *this* file, park the task **after** its state went
+                            // into the recorder's fan-out list and **before**
+                            // `Service::run` installs the service's own `SIGTERM`
+                            // handler. In that interval only `record()`'s fan-out
+                            // can cancel this token, so a pin can deliver one
+                            // signal and observe whether the fan-out did its job.
+                            // The `recorded()` arm keeps the hold from outliving
+                            // the signal, so the pin measures the fan-out rather
+                            // than a sleep.
+                            #[cfg(all(unix, debug_assertions))]
+                            if let Some(ms) =
+                                std::env::var("FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS")
+                                    .ok()
+                                    .and_then(|v| v.parse::<u64>().ok())
+                            {
+                                let held = std::env::var(
+                                    "FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_FILES",
+                                )
+                                .ok()
+                                .map(|files| files.split(',').any(|f| path_str.contains(f.trim())))
+                                .unwrap_or(true);
+                                if held {
+                                    tracing::info!(
+                                        path = %path_str,
+                                        "test hold: registered for the shutdown fan-out"
+                                    );
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {}
+                                        _ = early_shutdown.recorded() => {}
+                                    }
                                 }
                             }
                             // Armed immediately after the push above and dropped
@@ -679,7 +739,7 @@ async fn run(mut cli: FrpsArgs) {
                                 // (`frp-server/src/service.rs:2276`) — so this
                                 // arm means the service stopped for good. The
                                 // single-config path maps any `run()` error to
-                                // `EXIT_RUNTIME` (`frps/src/main.rs:540-542`),
+                                // `EXIT_RUNTIME` (`frps/src/main.rs:1079-1082`),
                                 // and this lane carries the same code out,
                                 // pinned on both lanes by
                                 // `config_dir_where_every_service_fails_to_run_exits_like_dash_c`

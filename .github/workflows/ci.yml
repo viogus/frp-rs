@@ -256,7 +256,20 @@ jobs:
       # forces the exit). Both are `#[cfg(unix)]`, and every runner for this lane
       # is `ubuntu-latest`. Re-derived on this tree with
       # `cargo test -p frps --test cli_exit_codes -- --list`.
-      FRPS_CLI_TESTS: "42"
+      # 42 → 43 with the round-2 review fix: +1
+      # `config_dir_recorded_signal_fans_out_to_an_already_registered_service`
+      # (the recorder's **fan-out** half, which round 2 found unpinned — the
+      # window pin above only exercises the `watch()` handoff, and deleting the
+      # fan-out loop left the whole lane green). Its sibling debug-only hold
+      # `FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS` (`..._DELAY_FILES`) parks
+      # one service inside the interval where its token belongs to the recorder
+      # and its own `SIGTERM` handler does not exist yet, so deleting
+      # `record()`'s `for state in states.iter() { state.shutdown_token.cancel(); }`
+      # loop leaves that service running on a live token with the main task
+      # awaiting it and reds the pin. `#[cfg(unix)]` like its siblings, and every
+      # runner for this lane is `ubuntu-latest`. Re-derived on this tree with
+      # `cargo test -p frps --test cli_exit_codes -- --list`.
+      FRPS_CLI_TESTS: "43"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
       # 11 → 13 with the one `auth.method` policy: +2

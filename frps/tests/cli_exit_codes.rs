@@ -50,7 +50,8 @@ fn bin() -> String {
 }
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The child's own **progress witness**: the SIGUSR1 task logs this line after
-/// its `tokio::signal::unix::signal` call returns (`frps/src/main.rs:207-215`),
+/// its `tokio::signal::unix::signal` call returns (`frps/src/main.rs:499`/`:829`
+/// in the `--config-dir` lane, `:1020`/`:1022` on `-c`),
 /// which a `frps` that is still pre-init cannot have printed. It is *not* proof
 /// that SIGTERM's handler is installed — tokio registers signals per kind and
 /// lazily (`tokio-1.53.1/src/signal/unix.rs:283-300`), so the SIGTERM
@@ -539,7 +540,7 @@ fn oidc_without_an_issuer_is_refused_with_3_where_go_panics() {
 ///
 /// The port is taken from an ephemeral bind and released immediately:
 /// `bindPort = 0` is *not* "any port" here — frp-rs normalizes 0 back to the
-/// default 7000 (`frp-core/src/config/server.rs:394-395`), which on macOS is
+/// default 7000 (`frp-core/src/config/server.rs:487-489`), which on macOS is
 /// held by Control Center. The released-port window is microseconds and this
 /// test only needs the listener to come up.
 /// Spawn `frps` with `args` against the listener `port`, wait until the port
@@ -584,8 +585,8 @@ fn oidc_without_an_issuer_is_refused_with_3_where_go_panics() {
 ///
 /// So the barrier is a **child-specific progress witness**: the SIGUSR1 task
 /// logs `SIGUSR1 reload ready` after its `tokio::signal::unix::signal` call
-/// returns (`frps/src/main.rs:295` installs the handler, `frps/src/main.rs:528`
-/// logs the marker; the `-c` lane's twin is `frps/src/main.rs:719`/`:721`),
+/// returns (`frps/src/main.rs:499` installs the handler, `frps/src/main.rs:829`
+/// logs the marker; the `-c` lane's twin is `frps/src/main.rs:1020`/`:1022`),
 /// i.e. only after that `frps` is past its
 /// own startup logging. A foreign listener cannot fake it — only the child under
 /// test writes to that log path. If the line never appears (a platform without
@@ -703,7 +704,7 @@ fn start_listening_then_sigterm(args: &[&str], port: u16, dir: &TempDir) -> Stri
 
 /// An ephemeral port, released immediately: `bindPort = 0` is *not* "any port"
 /// here — frp-rs normalizes 0 back to the default 7000
-/// (`frp-core/src/config/server.rs:394-395`), which on macOS is held by Control
+/// (`frp-core/src/config/server.rs:487-489`), which on macOS is held by Control
 /// Center. The released-port window is microseconds and these tests only need
 /// the listener to come up.
 fn ephemeral_port() -> u16 {
@@ -1130,6 +1131,149 @@ fn config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorde
     );
 }
 
+/// `TODO.md:7946`, the **fan-out** half of the recorder (review round 2, F7):
+/// `record()` must cancel the tokens of services that registered *before* the
+/// signal, not only let a later one observe it through the `watch()` handoff.
+///
+/// The interval where that matters is narrow. From the moment
+/// `early_shutdown.watch(...)` puts a service into the fan-out list until
+/// `Service::run` installs the service's own `SIGTERM` handler
+/// (`frp-server/src/service.rs:1876-1903`), only the recorder can cancel that
+/// token. The debug-only post-registration hold
+/// (`FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS=30_000` with
+/// `..._DELAY_FILES=a.toml`) parks `a.toml`'s task inside exactly that interval
+/// and logs `test hold: registered for the shutdown fan-out` once it is in the
+/// list. The second file is held by the *pre*-registration hook
+/// (`FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS=30_000` with
+/// `..._DELAY_FILES=c.toml`), so it registers after the signal and takes the
+/// `watch()` handoff.
+///
+/// Both holds are longer than `EXIT_TIMEOUT` on purpose: their early wake comes
+/// from `EarlyShutdown.recorded()`, so a regression that stops waking them shows
+/// up as this pin timing out instead of as a hold that simply sleeps out.
+///
+/// After the hold line appears the pin sends one `SIGTERM` and requires:
+///
+/// 1. exit **0**. The held `a.toml` service's own `SIGTERM` handler does not
+///    exist when the signal is delivered and the pin sends no second signal, so
+///    only the recorder's fan-out can cancel its token; deleting that loop
+///    leaves the service running on a live token with the main task awaiting it,
+///    and this pin times out.
+/// 2. the log carries the recorded-signal line, which the pre-registration-held
+///    `c.toml` service can only print by registering after the signal and going
+///    through `watch()` — so one run exercises both halves of the handoff.
+/// 3. two graceful accept-loop stops: the fan-out service (woken by the recorded
+///    request, running with a cancelled token) and the `watch()` one both
+///    drained, which is what makes the exit code attributable to the recorder
+///    rather than to one service happening to finish.
+#[cfg(unix)]
+#[test]
+fn config_dir_recorded_signal_fans_out_to_an_already_registered_service() {
+    let dir = TempDir::new();
+    let conf_d = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    let first_port = ephemeral_port();
+    let second_port = ephemeral_port();
+    std::fs::write(
+        conf_d.join("a.toml"),
+        format!(
+            "bindAddr = \"127.0.0.1\"\nbindPort = {first_port}\n[auth]\ntoken = \"cli-exit-test\"\n"
+        ),
+    )
+    .expect("write a.toml");
+    std::fs::write(
+        conf_d.join("c.toml"),
+        format!(
+            "bindAddr = \"127.0.0.1\"\nbindPort = {second_port}\n[auth]\ntoken = \"cli-exit-test\"\n"
+        ),
+    )
+    .expect("write c.toml");
+
+    let args = ["--config-dir", conf_d.to_str().expect("utf-8 temp path")];
+    let log_path = dir.path("frps-fanout.log");
+    let log = std::fs::File::create(&log_path).expect("create log");
+    let mut child: Child = Command::new(bin())
+        .args(args)
+        .env("FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS", "30000")
+        .env("FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_FILES", "a.toml")
+        .env("FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS", "30000")
+        .env("FRPS_CFGDIR_TEST_REGISTRATION_DELAY_FILES", "c.toml")
+        .stdout(std::process::Stdio::from(
+            log.try_clone().expect("clone log"),
+        ))
+        .stderr(std::process::Stdio::from(log))
+        .spawn()
+        .expect("spawn frps");
+    let read_log = || std::fs::read_to_string(&log_path).expect("read frps diagnostic log");
+
+    // The hold line is the witness that `a.toml` is in the recorder's fan-out
+    // list, which is the state this pin has to deliver the signal in.
+    let ready_deadline = Instant::now() + EXIT_TIMEOUT;
+    loop {
+        if read_log().contains("test hold: registered for the shutdown fan-out") {
+            break;
+        }
+        if let Some(status) = try_wait_or_kill(&mut child, "frps") {
+            panic!(
+                "frps {args:?} exited ({status:?}) before the fan-out service registered; \
+                 log={:?}",
+                read_log()
+            );
+        }
+        if Instant::now() >= ready_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the fan-out service never registered within {EXIT_TIMEOUT:?}; log={:?}",
+                read_log()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+
+    let deadline = Instant::now() + EXIT_TIMEOUT;
+    let status = loop {
+        match try_wait_or_kill(&mut child, "frps") {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "frps {args:?} did not exit within {EXIT_TIMEOUT:?} of a SIGTERM sent after the \
+                     fan-out service registered: the recorder must cancel the tokens of services \
+                     that registered **before** the signal (without the fan-out that service runs \
+                     on with a token nobody cancels and the main task awaits it forever); log={:?}",
+                    read_log()
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    let log = read_log();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "both services must drain to a clean 0 through the recorded request; \
+         status={status:?} log={log:?}",
+    );
+    assert!(
+        log.contains("shutdown signal was recorded before this service installed its own handler"),
+        "the service held across the signal must register through the `watch()` handoff; \
+         log={log:?}",
+    );
+    assert_eq!(
+        log.matches("Accept loop stopped for graceful shutdown")
+            .count(),
+        2,
+        "the already-registered service (fan-out) and the held one (`watch()`) must both drain \
+         through the graceful accept-loop arm; log={log:?}",
+    );
+}
+
 /// `TODO.md:7933`, **recorded** rather than fixed: the collector admits a
 /// directory entry by lowercased extension with no regular-file check
 /// (`frp-core/src/config/file.rs:414`/`:432`; the `is_file()` guards live only in
@@ -1148,17 +1292,27 @@ fn config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorde
 /// an `if !path.is_file() { continue; }` guard reds it); this pin records the
 /// process-level consequence and the one way out.
 ///
-/// Measured before/after the main task owns the recorder (`EarlyShutdown`):
+/// Measured before/after the main task owns the recorder (`EarlyShutdown`), on a
+/// FIFO-only directory (nothing ever registers):
 ///
 /// | `frps --config-dir` on a FIFO-only directory | 1st SIGTERM | 2nd SIGTERM |
 /// | --- | --- | --- |
-/// | HEAD binary (no main-task recorder) | died, rc 143 | — |
+/// | base binary (`ea991757`, no main-task recorder) | died, rc 143 | — |
 /// | this tree | alive (recorded, no service to stop) | exit 143 |
 ///
-/// Both halves are load-bearing. Without the recorder the first signal kills the
-/// child (so "still alive after the first SIGTERM" reds), and without the
-/// repeat-request escalation the second one is swallowed too (so the pin times
-/// out), which would leave a FIFO-wedged lane unkillable by `SIGTERM` at all.
+/// Both halves are load-bearing **for this fixture**. Without the recorder the
+/// first signal kills the child (so "still alive after the first SIGTERM" reds),
+/// and without the repeat-request escalation the second one is swallowed too (so
+/// the pin times out).
+///
+/// **What this does not cover.** The escalation only fires while *no* service has
+/// ever registered (`EarlyShutdown.states` is append-only, so "empty" cannot mean
+/// "none running"). With a valid `a.toml` loaded first and the FIFO at `b.toml`,
+/// one service registers and the lane is deaf to `SIGTERM` on both the base
+/// binary and this tree: measured, both log `starting 2 services`, both survive
+/// four SIGTERMs, and only `SIGKILL` ends them (`wait rc 137`). That is
+/// pre-existing behaviour, not a regression from the recorder, and making it
+/// killable is a behaviour change rather than a comment fix.
 #[cfg(unix)]
 #[test]
 fn config_dir_fifo_entry_wedges_the_lane_and_a_repeat_signal_ends_it() {
@@ -1699,7 +1853,7 @@ fn version_short_shorthand_clusters_and_equals_spelling_match_go() {
 /// consumed `=false` but stored `true` would still pass this test. The value
 /// actually being applied is pinned in
 /// `disable_log_color_value_spelling_is_applied`, whose flag *is* read from the
-/// CLI (`frps/src/main.rs:55-56`).
+/// CLI (`frps/src/main.rs:405`).
 #[test]
 fn tls_only_false_value_starts_and_listens() {
     let port = ephemeral_port();
@@ -1741,7 +1895,7 @@ fn vhost_http_timeout_flag_starts_and_listens() {
 /// carries. `--disable-log-color` is the observable one: the frps log
 /// initialiser reads it straight off the CLI
 /// (`logging::resolve_ansi(!disable)` → `with_ansi(ansi)`,
-/// `frps/src/main.rs:55-56`), so the child's own output shows which value won.
+/// `frps/src/main.rs:405`), so the child's own output shows which value won.
 ///
 /// Measured at this head with a valid config and a bounded runner, on the
 /// `ESC [` sequences in the child's combined output:
