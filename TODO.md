@@ -7830,11 +7830,31 @@ section; ledger now **24 open / 104 closed**.**
   a scenario body emptied still exits 0, printing `RESULT: 17 fixture check(s) hold` for scenario 4
   (18 for scenario 1); only a suite that runs no check at all prints `RESULT: 0`. The guard suite added by the same
   branch now pins the invariant from a trap installed before its first assertion
-  (`MIN_CHECKS=21`, `scripts/tests/compat-stray-guard.sh:69`, checked at `:84-88` with the message
+  (`MIN_CHECKS=21`, `scripts/tests/compat-stray-guard.sh:72`, checked at `:90-94` with the message
   `suite exited 0 after only N check(s); expected at least 21 — scenarios did not run`) — and the
   round-2 re-check showed that floor is itself bypassable from inside the file (`exec true` skips the
-  EXIT trap; `MIN_CHECKS=0` disables it), which is why the hardening round moves the assertion to
-  `.github/workflows/ci.yml:112`.
+  EXIT trap; `MIN_CHECKS=0` disables it), which is why the hardening round moves the assertion outside
+  the file, into the `Stray guard — fixture checks (compat harness teardown)` step
+  (`.github/workflows/ci.yml:111`) whose `grep -qF 'RESULT: 21 fixture check(s) hold'` sits at `:127`.
   **Done-when:** `scripts/tests/repo-health-fixtures.sh` enforces its own floor the same way (trap
   installed before the first `ok`/`bad`, the floor equal to the current check count), and emptying a
   scenario body — or inserting an early `exit 0` — reds the suite.
+
+- [ ] **Four more `scripts/tests/compat-stray-guard.sh` residues the delta-3 reviews measured — each is a way the guard can report green while doing less.**
+  Filed by the coordinator from the `test-harness-strays` delta-3 round (R1 and R2 both read
+  `0a350583`; R1 measured the trait at `scripts/tests/compat-stray-guard.sh:79-86`, R2 at `:86`,
+  `:44-60` and `:141`). (a) The trap's own ownership probe treats "`ps` could not run" as "this pid is
+  not ours": `cmd=$(ps -o command= -p "$p" 2>/dev/null) || continue` (`:86`), so every LIVE synthetic
+  outlives a `ps` failure; R2's fix is
+  `cmd=$(ps -o command= -p "$p" 2>/dev/null) || { kill -9 "$p" 2>/dev/null || true; continue; }`.
+  (b) `wait_exec`'s "has the child exec-ed yet" test is defeated when the suite is invoked through a
+  symlink — the script resolves itself through symlinks (`:44-60`) while the child's pre-exec argv
+  carries the `$0` alias, so the match succeeds before the exec and `wait_exec` returns 0; CI calls the
+  direct path, so it is latent. (c) A `ps` that exits 0 with empty output is read as "the image
+  changed" (`:141`). (d) `MIN_CHECKS=21` is a total, not a shape: deleting four checks and adding four
+  dummy `ok` lines keeps the count and exits 0. R2's two remaining notes are accepted as bounded rather
+  than fixed: the fixed `/tmp` log path is defended only by `tee` truncation, and a SIGKILL leaves an
+  orphan bounded by the 300 s pre-`exec` sleep.
+  **Done-when:** (a) uses the kill-then-continue form or the leak is proven unreachable; (b), (c) and
+  (d) are each fixed or recorded as deliberate with the mutant that shows the gap — for (d) that means
+  the guard's total is replaced by, or supplemented with, a per-scenario shape assertion.
