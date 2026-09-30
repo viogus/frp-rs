@@ -3,7 +3,7 @@ use std::path::Path;
 use super::file::process_includes;
 use super::format::{detect_format, parse_to_toml_value, ConfigFormat};
 use super::loader::ConfigPresence;
-use super::strict::{run_strict_check, HTTP_PLUGIN_KNOWN_KEYS};
+use super::strict::{run_strict_check, run_strict_check_top_level, HTTP_PLUGIN_KNOWN_KEYS};
 
 /// Convert a toml::Value to a serde_json::Value for deserialization.
 /// This is needed because toml::Value can't be directly deserialized into
@@ -586,7 +586,14 @@ pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
     // `type`-less sections are **INI-only** (see
     // `collect_legacy_ini_proxy_sections`), so a TOML/JSON/YAML file cannot
     // reuse the client normalizer's `.ini` behaviour.
-    normalize: fn(&mut toml::Value, ConfigFormat),
+    //
+    // `Result` because the legacy reader is not purely a rewrite: a section the
+    // legacy dialect refuses has to fail the load from the normalizer, where the
+    // section is still visible, rather than from the v1-shaped validator that
+    // runs after it (a typeless `role = "visitor"` section would otherwise be
+    // reported with the v1 visitor message — see
+    // `collect_legacy_ini_proxy_sections`).
+    normalize: fn(&mut toml::Value, ConfigFormat) -> Result<(), String>,
     // `&mut` because a validator may *complete* a field as well as check it —
     // `validate_server_config`/`validate_client_config` run Go's
     // `Auth.Complete()` (the empty `auth.method` → `token` fill,
@@ -628,12 +635,24 @@ pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
     // `certFile`, `keyFile`), so afterwards a user-written key and a synthesized
     // one are indistinguishable.
     let server_tls_enable_set = ConfigPresence::server_tls_enable_set_in(&value);
-    normalize(&mut value, format);
+    // No path prefix: the refusal inside carries Go's own text
+    // (`failed to parse visitor v, err: type shouldn't be empty`), and the
+    // caller already names the file.
+    normalize(&mut value, format)?;
     let mut presence = ConfigPresence::from_normalized_value(&value);
     presence.web_server_tls_enable_set = web_server_tls_enable_set;
     presence.server_tls_enable_set = server_tls_enable_set;
     if strict_config {
-        run_strict_check(&value, &known_keys(), path)?;
+        // The legacy `.ini` dialect is exempt from the strict check *inside*
+        // sections: Go's legacy reader is accept-and-ignore, so an unknown key in
+        // an `.ini` section cannot refuse a file Go loads. The top level is still
+        // checked, because that is where a `.ini` DefaultSection's v1 spelling
+        // lands (`webServer.tls = 1`) — see `run_strict_check_top_level`.
+        if format == ConfigFormat::Ini {
+            run_strict_check_top_level(&value, &known_keys(), path)?;
+        } else {
+            run_strict_check(&value, &known_keys(), path)?;
+        }
     }
     let json_value = toml_to_json(value);
     // Go's legacy INI loader reads every value as text and lets the target
@@ -650,7 +669,10 @@ pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
     Ok((cfg, presence))
 }
 
-pub(super) fn normalize_server_config(value: &mut toml::Value, _format: ConfigFormat) {
+pub(super) fn normalize_server_config(
+    value: &mut toml::Value,
+    _format: ConfigFormat,
+) -> Result<(), String> {
     use toml::Value;
     if let Some(table) = value.as_table_mut() {
         // Handle [common] section: merge into top level
@@ -1121,9 +1143,13 @@ pub(super) fn normalize_server_config(value: &mut toml::Value, _format: ConfigFo
                 .or_insert(toml::Value::Table(meta_map));
         }
     }
+    Ok(())
 }
 
-pub(super) fn normalize_client_config(value: &mut toml::Value, format: ConfigFormat) {
+pub(super) fn normalize_client_config(
+    value: &mut toml::Value,
+    format: ConfigFormat,
+) -> Result<(), String> {
     use toml::Value;
     if let Some(table) = value.as_table_mut() {
         // Handle [common] section
@@ -1144,7 +1170,7 @@ pub(super) fn normalize_client_config(value: &mut toml::Value, format: ConfigFor
         // renderRangeProxyTemplates — local/remote port lists must match in
         // length).
         let (legacy_proxy_indices, legacy_visitor_indices) =
-            collect_legacy_ini_proxy_sections(table, format == ConfigFormat::Ini);
+            collect_legacy_ini_proxy_sections(table, format == ConfigFormat::Ini)?;
 
         // Go legacy INI keys: top-level admin_* -> [web_server] (Go
         // pkg/config/legacy conversion.go AdminAddr/Port/User/Pwd/...).
@@ -1503,6 +1529,7 @@ pub(super) fn normalize_client_config(value: &mut toml::Value, format: ConfigFor
                 .or_insert(toml::Value::Table(meta_map));
         }
     }
+    Ok(())
 }
 
 /// Hoist the nested `[webServer.tls]` / `[web_server.tls]` table onto the flat
@@ -1868,14 +1895,78 @@ fn fold_prefixed_keys_into(st: &mut toml::Table, prefix: &str, target: &str) {
 /// `MapTo`), while the strict check on a *v1* `[[proxies]]` element rejects it.
 /// Stripping the leftovers keeps the legacy surface at Go's accept-and-ignore
 /// semantics without loosening the v1 check.
+///
+/// # Errors
+///
+/// One section shape has no representation here and is refused before
+/// collection, with Go's own message: a `role = "visitor"` `.ini` section whose
+/// `type` is missing or empty. Go's `NewVisitorConfFromIni`
+/// (`pkg/config/legacy/visitor.go:168`) starts from `DefaultVisitorConf`, which
+/// is `nil` for an empty type, and `LoadAllProxyConfsFromIni` wraps the failure
+/// as `failed to parse visitor <name>, err: …` (`pkg/config/legacy/client.go`).
+/// The variant name in the message (`v1` above) is the version of the legacy
+/// reader; the section name is what Go interpolates. Refusing it *here* rather
+/// than letting the section fall through to the v1 visitor validator is what
+/// keeps Go's wording: a section that is never collected would be reported as
+/// `visitor '<name>': unknown visitor type ''`, which is the v1 message and a
+/// different refusal.
 fn collect_legacy_ini_proxy_sections(
     table: &mut toml::Table,
     is_ini: bool,
-) -> (Vec<usize>, Vec<usize>) {
+) -> Result<(Vec<usize>, Vec<usize>), String> {
     use toml::Value;
 
     let mut proxy_indices = Vec::new();
     let mut visitor_indices = Vec::new();
+
+    /// The v1 **array** roots (`ClientConfig::proxies` / `ClientConfig::visitors`
+    /// are `Vec`s): an INI header naming one of these is a legacy section, never
+    /// the array. See `format::INI_NESTED_SECTION_ROOTS` for why they are not
+    /// nested roots.
+    const INI_ARRAY_ROOTS: &[&str] = &["proxies", "visitors"];
+
+    /// Is `name` an array root, or a dotted path *under* one?
+    fn names_an_ini_array_root(name: &str) -> bool {
+        INI_ARRAY_ROOTS.iter().any(|root| {
+            name == *root
+                || name
+                    .strip_prefix(root)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        })
+    }
+
+    /// Go's `ini.Key.String() == ""` test: the key is absent, or present and the
+    /// empty string. A non-string `type` is left alone — Go reads it as its
+    /// literal text and `DefaultProxyConf` refuses it (`invalid type [..]`).
+    fn type_missing_or_empty(t: &toml::Table) -> bool {
+        match t.get("type") {
+            None => true,
+            Some(Value::String(s)) => s.is_empty(),
+            Some(_) => false,
+        }
+    }
+
+    // Go's visitor refusal, before any collection: `role = "visitor"` without a
+    // usable `type`. Runs over the top level only, which after the `[common]`
+    // merge is exactly the set of `.ini` sections (Go skips the section named
+    // `common`, and `[common] role = …` is a merged scalar here, not a table).
+    // A `type`-less visitor that carries ports is refused the same way: Go
+    // dispatches on `role` before it ever reads a port.
+    if is_ini {
+        for (name, value) in table.iter() {
+            let Some(t) = value.as_table() else {
+                continue;
+            };
+            if t.get("role").and_then(Value::as_str) != Some("visitor") {
+                continue;
+            }
+            if type_missing_or_empty(t) {
+                return Err(format!(
+                    "failed to parse visitor {name}, err: type shouldn't be empty"
+                ));
+            }
+        }
+    }
 
     // Known non-proxy top-level sections are never collected even if they
     // happen to carry a `type` key.
@@ -1915,12 +2006,43 @@ fn collect_legacy_ini_proxy_sections(
     let sections: Vec<String> = table
         .keys()
         .filter(|k| {
-            if KNOWN_SECTIONS.contains(&k.as_str()) {
-                return false;
-            }
             let Some(Value::Table(t)) = table.get(*k) else {
                 return false;
             };
+            let role_is_visitor = t.get("role").and_then(Value::as_str) == Some("visitor");
+
+            // A `.ini` header naming a v1 **array** root is the legacy section
+            // it looks like, whatever keys it carries and whether or not it is
+            // dotted. It cannot be the v1 array — an INI header has no way to
+            // build one — and Go never expands it (its legacy loader reads the
+            // section under its raw name), so the proxy keeps Go's name and
+            // Go's `tcp` default. Without this the portless spelling stayed a
+            // map where the deserializer wants a sequence: `frpc verify` on
+            // `[visitors.foo] server_name = s` was rc 1 in both modes with
+            // `invalid type: map, expected a sequence`, and Go v0.71.0 is rc 0
+            // in both. A typed array-root header is collected as a visitor when
+            // it says so, exactly like the flat case below.
+            if is_ini && names_an_ini_array_root(k) {
+                return !role_is_visitor || t.contains_key("type");
+            }
+
+            if KNOWN_SECTIONS.contains(&k.as_str()) {
+                // …unless the reserved name carries a **proxy port**. A v1
+                // settings root never does, so a section that names one is the
+                // legacy proxy Go registers under that same name — measured:
+                // `[web_server] type = tcp local_port = … remote_port = …` and
+                // `[transport] local_port = …` are rc 0 with one proxy on Go
+                // v0.71.0 in both strict modes, while frp-rs dropped the proxy
+                // (non-strict `Proxies: 0`) and refused the file in strict mode
+                // (`unknown field "web_server.local_port"`). The clause is
+                // deliberately the *port* keys and not `type`: `[log] type =
+                // "custom"` is a settings table Go ignores as a proxy-shaped
+                // section, and `type` alone would steal it.
+                return is_ini
+                    && (t.contains_key("local_port") || t.contains_key("remote_port"))
+                    && !role_is_visitor;
+            }
+
             if t.contains_key("type") {
                 return true;
             }
@@ -1936,7 +2058,7 @@ fn collect_legacy_ini_proxy_sections(
             // defaulting (`type shouldn't be empty`).
             is_ini
                 && (t.contains_key("local_port") || t.contains_key("remote_port"))
-                && t.get("role").and_then(Value::as_str) != Some("visitor")
+                && !role_is_visitor
         })
         .cloned()
         .collect();
@@ -1946,14 +2068,15 @@ fn collect_legacy_ini_proxy_sections(
             continue;
         };
 
-        // Go's legacy proxy default: a section with no `type` is a `tcp` proxy
-        // (`LoadAllProxyConfsFromIni` → `NewProxyConfFromIni` →
+        // Go's legacy proxy default: a section with no `type` — or an **empty**
+        // one, which its `ini.Key.String()` cannot tell from a missing key — is a
+        // `tcp` proxy (`LoadAllProxyConfsFromIni` → `NewProxyConfFromIni` →
         // `pkg/config/legacy/proxy.go`, which starts from the tcp-variant
         // struct). Written in explicitly so every downstream stage — the strict
         // check, `normalize_proxies`, serde — sees the same concrete type Go
         // does. The filter above kept `role = "visitor"` sections out, so this
         // only ever fills a *proxy*'s type.
-        if is_ini && !st.contains_key("type") {
+        if is_ini && type_missing_or_empty(&st) {
             st.insert("type".to_string(), Value::String("tcp".to_string()));
         }
 
@@ -2144,7 +2267,7 @@ fn collect_legacy_ini_proxy_sections(
             arr.push(Value::Table(st));
         }
     }
-    (proxy_indices, visitor_indices)
+    Ok((proxy_indices, visitor_indices))
 }
 
 /// Normalize Go-format proxy sub-tables onto each `proxies` element.

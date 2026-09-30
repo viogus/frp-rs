@@ -151,7 +151,11 @@ pub fn load_server_config_from_str(
     expand_template_functions(&mut value);
     let web_server_tls_enable_set = ConfigPresence::web_server_tls_enable_set_in(&value);
     let server_tls_enable_set = ConfigPresence::server_tls_enable_set_in(&value);
-    normalize_server_config(&mut value, ConfigFormat::Toml);
+    // TOML cannot carry a legacy `.ini` section, so the collector's refusal
+    // (a typeless `role = "visitor"` section — see
+    // `collect_legacy_ini_proxy_sections`) is unreachable on this path.
+    normalize_server_config(&mut value, ConfigFormat::Toml)
+        .expect("TOML has no legacy INI sections");
     let mut presence = ConfigPresence::from_normalized_value(&value);
     presence.web_server_tls_enable_set = web_server_tls_enable_set;
     // Kept in lockstep with `load_config_from_file`'s capture. This entry point
@@ -177,7 +181,10 @@ pub fn load_client_config_from_str(
     expand_env_vars(&mut value);
     expand_template_functions(&mut value);
     let web_server_tls_enable_set = ConfigPresence::web_server_tls_enable_set_in(&value);
-    normalize_client_config(&mut value, ConfigFormat::Toml);
+    // Same as the server path above: not the legacy `.ini` dialect, so the
+    // collector's visitor refusal cannot fire here.
+    normalize_client_config(&mut value, ConfigFormat::Toml)
+        .expect("TOML has no legacy INI sections");
     let mut presence = ConfigPresence::from_normalized_value(&value);
     presence.web_server_tls_enable_set = web_server_tls_enable_set;
     let mut cfg: ClientConfig = serde_json::from_value(toml_to_json(value))

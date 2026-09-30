@@ -2444,14 +2444,14 @@ fn test_ssh_tunnel_gateway_default_disabled() {
 /// and return the re-serialized TOML (post-normalization).
 fn normalize_server_toml(toml_str: &str) -> String {
     let mut val: toml::Value = toml::from_str(toml_str).unwrap();
-    normalize_server_config(&mut val, super::format::ConfigFormat::Toml);
+    normalize_server_config(&mut val, super::format::ConfigFormat::Toml).unwrap();
     toml::to_string(&val).unwrap()
 }
 
 /// Helper: normalize a TOML string through the full client config pipeline.
 fn normalize_client_toml(toml_str: &str) -> String {
     let mut val: toml::Value = toml::from_str(toml_str).unwrap();
-    normalize_client_config(&mut val, super::format::ConfigFormat::Toml);
+    normalize_client_config(&mut val, super::format::ConfigFormat::Toml).unwrap();
     toml::to_string(&val).unwrap()
 }
 
@@ -3439,7 +3439,7 @@ max_pool_count = 10
 fn load_server_config_from_yaml(yaml: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let mut value = super::format::parse_to_toml_value(yaml, super::format::ConfigFormat::Yaml)?;
     expand_env_vars(&mut value);
-    normalize_server_config(&mut value, super::format::ConfigFormat::Yaml);
+    normalize_server_config(&mut value, super::format::ConfigFormat::Yaml)?;
     let presence = super::loader::ConfigPresence::from_normalized_value(&value);
     let json_value = super::normalize::toml_to_json(value);
     let mut cfg: ServerConfig =
@@ -3456,7 +3456,7 @@ fn load_server_config_from_yaml(yaml: &str) -> Result<ServerConfig, Box<dyn std:
 fn load_client_config_from_yaml(yaml: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
     let mut value = super::format::parse_to_toml_value(yaml, super::format::ConfigFormat::Yaml)?;
     expand_env_vars(&mut value);
-    normalize_client_config(&mut value, super::format::ConfigFormat::Yaml);
+    normalize_client_config(&mut value, super::format::ConfigFormat::Yaml)?;
     let presence = super::loader::ConfigPresence::from_normalized_value(&value);
     let mut cfg: ClientConfig = serde_json::from_value(super::normalize::toml_to_json(value))
         .map_err(|e| format!("config validation error: {e}"))?;
@@ -3770,7 +3770,7 @@ fn test_collect_config_files_admits_a_non_regular_entry_by_extension() {
 fn load_client_config_from_json(json: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
     let mut value = super::format::parse_to_toml_value(json, super::format::ConfigFormat::Json)?;
     expand_env_vars(&mut value);
-    normalize_client_config(&mut value, super::format::ConfigFormat::Json);
+    normalize_client_config(&mut value, super::format::ConfigFormat::Json)?;
     let presence = super::loader::ConfigPresence::from_normalized_value(&value);
     let mut cfg: ClientConfig = serde_json::from_value(super::normalize::toml_to_json(value))
         .map_err(|e| format!("config validation error: {e}"))?;
@@ -6657,8 +6657,9 @@ fn dotted_ini_headers_that_are_legacy_proxy_names_stay_proxies() {
 /// **What this models.** Both loader modes on a real client `.ini`, for the flat
 /// `[webServer]`, the nested `[webServer.tls]`, the nested-under-`[common]`
 /// `[common.webServer.tls]`, and the documented `[webServer]` + `[web_server]`
-/// per-key merge; plus the strict-mode report for an unknown key under
-/// `[webServer]`.
+/// per-key merge; plus that an unknown key under `[webServer]` is ignored in
+/// **both** loader modes (Go's INI reader ignores section keys, item 1 of the
+/// legacy-dialect parity work).
 ///
 /// **What it does not cover.** The server path never runs the collector, so it
 /// was never affected (frps `[webServer]` / `[webServer.tls]` is pinned in
@@ -6751,23 +6752,20 @@ fn typeless_camelcase_web_server_ini_is_not_a_phantom_proxy() {
         assert!(cfg.proxies.is_empty(), "merge strict={strict}");
     }
 
-    // A key the admin block does not name stays a strict-mode unknown field —
-    // a collected legacy proxy section would have exempted it.
+    // A key the admin block does not name is *ignored* in both modes, exactly as
+    // Go's legacy INI reader ignores it (item 1 of the legacy-dialect parity
+    // work): the `.ini` dialect is exempt from the section-level strict check, so
+    // `strict_config` cannot refuse a file Go loads. It must still not be taken
+    // for a proxy.
     let (_d, p) = write(&format!("{HEAD}[webServer]\nzzz_unknown_key = 1\n"));
-    let err = format!(
-        "{}",
-        load_client_config(p.to_str().unwrap(), true)
-            .expect_err("strict mode must report the unknown key")
-    );
-    assert!(
-        err.contains("unknown field \"web_server.zzz_unknown_key\""),
-        "the unknown key must be reported under web_server: {err}"
-    );
-    let cfg = load_client_config(p.to_str().unwrap(), false).expect("non-strict loads");
-    assert!(
-        cfg.proxies.is_empty(),
-        "non-strict: still not a proxy, the unknown key is dropped"
-    );
+    for strict in [false, true] {
+        let cfg = load_client_config(p.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("unknown section key strict={strict}: {e}"));
+        assert!(
+            cfg.proxies.is_empty(),
+            "not a proxy, and the unknown key is dropped; strict={strict}"
+        );
+    }
 }
 
 /// A typeless legacy `.ini` proxy section is Go's `tcp` proxy, in **both** loader
@@ -6833,8 +6831,11 @@ fn typeless_ini_proxy_section_defaults_to_tcp_in_both_modes() {
         }
     }
 
-    // Go refuses a typeless visitor in both modes, so nothing may be registered
-    // as a proxy for it (a `tcp` default here would be an invented divergence).
+    // Go refuses a typeless visitor in **both** modes, before it ever reads a
+    // port, so nothing may be registered for it and the refusal must carry Go's
+    // own wording (`failed to parse visitor v1, err: type shouldn't be empty`) —
+    // not the v1 validator's `visitor 'v1': unknown visitor type ''`, which is
+    // what a section that silently fell through to the v1 path would produce.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("visitor.ini");
     std::fs::write(
@@ -6843,28 +6844,17 @@ fn typeless_ini_proxy_section_defaults_to_tcp_in_both_modes() {
          [v1]\nrole = visitor\nserver_name = s1\nbind_addr = 127.0.0.1\nbind_port = 18100\n",
     )
     .unwrap();
-    let lenient = load_client_config(path.to_str().unwrap(), false).unwrap();
-    assert!(
-        lenient.proxies.is_empty(),
-        "a typeless visitor must not become a tcp proxy; got {:?}",
-        lenient
-            .proxies
-            .iter()
-            .map(|p| p.name.clone())
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        lenient.visitors.is_empty(),
-        "a typeless visitor is not registered as a visitor either"
-    );
-    let err = format!(
-        "{}",
-        load_client_config(path.to_str().unwrap(), true).unwrap_err()
-    );
-    assert!(
-        err.contains("v1"),
-        "strict mode must still report the typeless visitor section; got {err}"
-    );
+    for strict in [false, true] {
+        let err = format!(
+            "{}",
+            load_client_config(path.to_str().unwrap(), strict)
+                .expect_err("a typeless visitor is refused in both modes")
+        );
+        assert!(
+            err.contains("failed to parse visitor v1, err: type shouldn't be empty"),
+            "strict={strict}: Go's typeless-visitor message; got {err}"
+        );
+    }
 
     // The port-key discriminator must not swallow the v1 nesting: a portless
     // dotted sub-table under a nested root still expands.
@@ -7001,28 +6991,30 @@ fn typeless_ini_section_without_ports_stays_a_v1_section() {
 }
 
 /// A typeless `.ini` section that declares itself a **visitor** *and* names a
-/// port is still not collected: the `role != "visitor"` clause of the collector
-/// is what buys the exclusion.
+/// port is refused in **both** loader modes, with Go's own message — the
+/// port-key discriminator must never turn it into a tcp proxy, and it must never
+/// be dropped either.
 ///
 /// The port-key discriminator alone cannot separate this shape from a typeless
-/// proxy — `local_port`/`remote_port` are the very keys it tests for — so without
-/// the role clause the section is collected and, because it says
-/// `role = "visitor"`, routed into `[visitors]` carrying a synthetic
-/// `type = "tcp"` that Go never writes.
+/// proxy — `local_port`/`remote_port` are the very keys it tests for — so the
+/// `role` clause is what keeps it out of `[proxies]`, and the visitor refusal in
+/// `collect_legacy_ini_proxy_sections` is what replaces the silent drop that used
+/// to happen when such a section was neither collected nor deserialized.
 ///
-/// **Measured behaviour (pinned as-is, including the ugly half).** Go v0.71.0
-/// refuses a typeless visitor in *both* loader modes (`failed to parse visitor v,
-/// err: type shouldn't be empty`); frp-rs loads rc 0 with nothing collected in
-/// non-strict mode and refuses in strict mode with `unknown field "v"`. That is
-/// the pre-existing divergence filed as TODO residue, deliberately left unfixed
-/// here so this pin isolates the exclusion clause.
+/// **Measured.** Go v0.71.0 refuses it in *both* loader modes (`failed to parse
+/// visitor v, err: type shouldn't be empty` — `LoadAllProxyConfsFromIni`
+/// dispatches on `role` before it reads a port, `pkg/config/legacy/client.go`).
+/// Before this change frp-rs loaded rc 0 in non-strict mode with nothing
+/// collected and refused in strict mode with `unknown field "v"`; both halves of
+/// that were a different verdict from Go's.
 ///
-/// **Mutation teeth.** Replacing the clause with `true` collects the section and
-/// routes it into `[visitors]`, so even the lenient load fails client validation
-/// (`visitor 'v': server name is required`) and this test panics on the `unwrap`
-/// — the `visitors.is_empty()` assertion is never reached.
+/// **Mutation teeth.** Replacing the `role` clause with `true` collects the
+/// section and routes it into `[visitors]` carrying an invented `type = "tcp"`,
+/// so the load succeeds and the `expect_err` below fails; removing the
+/// pre-collection visitor refusal restores the old silent drop, so the same
+/// assertion fails with a loaded config instead of a refusal.
 #[test]
-fn typeless_port_carrying_ini_visitor_is_not_collected() {
+fn typeless_port_carrying_ini_visitor_is_refused_with_go_message() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("frpc.ini");
     std::fs::write(
@@ -7032,29 +7024,241 @@ fn typeless_port_carrying_ini_visitor_is_not_collected() {
     )
     .unwrap();
 
-    let lenient = load_client_config(path.to_str().unwrap(), false).unwrap();
-    assert!(
-        lenient.proxies.is_empty(),
-        "a typeless visitor must not become a tcp proxy; got {:?}",
-        lenient
-            .proxies
-            .iter()
-            .map(|p| p.name.clone())
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        lenient.visitors.is_empty(),
-        "a typeless visitor must not be registered with an invented type either"
-    );
+    for strict in [false, true] {
+        let err = format!(
+            "{}",
+            load_client_config(path.to_str().unwrap(), strict)
+                .expect_err("a typeless visitor is refused in both modes")
+        );
+        assert!(
+            err.contains("failed to parse visitor v, err: type shouldn't be empty"),
+            "strict={strict}: Go's typeless-visitor message; got {err}"
+        );
+    }
+}
 
+/// **Legacy-dialect parity, item 1.** An unknown key *inside* an `.ini` section is
+/// accepted in **both** loader modes, because Go never applies `strict_config` to
+/// the legacy dialect at all: `LoadClientConfigResult` (`pkg/config/load.go`)
+/// branches on `DetectLegacyINIFormat` first and hands a legacy file to
+/// `legacy.ParseClientConfig` / `legacy.UnmarshalServerConfFromIni`, whose
+/// `gopkg.in/ini` reads ignore a key the typed struct does not name. Measured on
+/// the real v0.71.0 binaries: `[common]` + `[webServer] zzz_unknown_key = 1` and
+/// `[common]` + `[webServer.foo] bar = 1` give `frpc verify` rc 0 under both
+/// `--strict-config` values (frps rc 0 for the server-side spelling); before this
+/// change frp-rs was rc 1 in strict mode with `unknown field
+/// "web_server.zzz_unknown_key"` / `unknown field "web_server.foo"`.
+///
+/// The exemption is **section-level and `.ini`-only**, which the two sibling
+/// halves below pin:
+///
+/// * the same key in **TOML** is still refused in strict mode, exactly as Go's v1
+///   decoder refuses it (`json: unknown field "web_server"`, rc 1);
+/// * a **top-level** `.ini` key is still refused, because a DefaultSection key is
+///   a v1 spelling (`webServer.tls = 1`) — pinned by
+///   `dotted_ini_section_headers_become_nested_tables_in_both_modes`.
+///
+/// **Residual, measured and deliberately not fixed.** `[common]` is merged onto
+/// the top level *before* the strict check, so an unknown key written there is
+/// still reported by the top-level half (strict rc 1) where Go is rc 0. Closing
+/// that means exempting the keys the `[common]` merge created, which would also
+/// blind the top-level check to a genuine v1 typo spelled under `[common]`; the
+/// item's Done-when allows the measurement instead, and the last block below is
+/// that measurement.
+#[test]
+fn legacy_ini_section_keys_are_exempt_from_strict_only_in_ini() {
+    let head = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
+
+    // `.ini`: the unknown section key is ignored, in both modes, and the section
+    // stays the settings table it looks like.
+    let dir = tempfile::tempdir().unwrap();
+    let ini = dir.path().join("frpc.ini");
+    std::fs::write(&ini, format!("{head}[webServer]\nzzz_unknown_key = 1\n")).unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(ini.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("unknown section key, strict={strict}: {e}"));
+        assert!(cfg.proxies.is_empty(), "still not a proxy, strict={strict}");
+    }
+
+    // TOML: the identical key is a strict-mode unknown field — the v1 dialect
+    // keeps the check Go's v1 decoder applies.
+    let dir = tempfile::tempdir().unwrap();
+    let toml_path = dir.path().join("frpc.toml");
+    std::fs::write(
+        &toml_path,
+        "serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[web_server]\nzzz_unknown_key = 1\n",
+    )
+    .unwrap();
+    assert!(
+        load_client_config(toml_path.to_str().unwrap(), false).is_ok(),
+        "lenient TOML still loads"
+    );
     let err = format!(
         "{}",
-        load_client_config(path.to_str().unwrap(), true).unwrap_err()
+        load_client_config(toml_path.to_str().unwrap(), true).unwrap_err()
     );
     assert!(
-        err.contains("unknown field \"v\""),
-        "strict mode must still report the uncollected section as the unknown field it is: {err}"
+        err.contains("unknown field \"web_server.zzz_unknown_key\""),
+        "TOML must keep refusing it in strict mode: {err}"
     );
+
+    // Residual: the `[common]` merge puts the key at the top level, where the
+    // exemption does not reach. Go accepts this file (rc 0) in both modes.
+    let dir = tempfile::tempdir().unwrap();
+    let common = dir.path().join("frpc_common.ini");
+    std::fs::write(
+        &common,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nzzz_unknown_common = 1\n",
+    )
+    .unwrap();
+    assert!(
+        load_client_config(common.to_str().unwrap(), false).is_ok(),
+        "lenient mode drops it"
+    );
+    let err = format!(
+        "{}",
+        load_client_config(common.to_str().unwrap(), true).unwrap_err()
+    );
+    assert!(
+        err.contains("unknown field \"zzz_unknown_common\""),
+        "residual: Go is rc 0 here, frp-rs reports the merged top-level key: {err}"
+    );
+}
+
+/// **Legacy-dialect parity, item 2.** An **empty** `type` in an `.ini` section is
+/// Go's `tcp`, exactly like a missing one.
+///
+/// `NewProxyConfFromIni` reads `section.Key("type").String()`
+/// (`pkg/config/legacy/proxy.go:78`) and `ini.Key.String()` cannot tell an absent
+/// key from an empty value, so `type = ""` falls into the same `== ""` branch.
+/// Measured on the real v0.71.0 binaries: `[p] type = "" local_port = 8080
+/// remote_port = 18080` gives `frpc verify` rc 0 in both modes with one proxy
+/// registered; frp-rs was rc 1 in both modes with `proxy 'p': invalid proxy_type
+/// ''`.
+///
+/// The empty-string default is **`.ini`-only**, and the TOML half below pins that
+/// boundary: Go's v1 decoder still refuses an empty `type` (`decode proxy at
+/// index 0: unknown proxy type: `, rc 1), and so does frp-rs.
+#[test]
+fn legacy_ini_empty_type_defaults_to_tcp_like_go() {
+    let head = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
+
+    let dir = tempfile::tempdir().unwrap();
+    let ini = dir.path().join("frpc.ini");
+    std::fs::write(
+        &ini,
+        format!("{head}[p]\ntype = \"\"\nlocal_port = 8080\nremote_port = 18080\n"),
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(ini.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("empty type, strict={strict}: {e}"));
+        let proxy = cfg
+            .proxies
+            .iter()
+            .find(|p| p.name == "p")
+            .unwrap_or_else(|| panic!("the section must register, strict={strict}"));
+        assert_eq!(proxy.proxy_type, "tcp", "strict={strict}");
+        assert_eq!(proxy.local_port, 8080, "strict={strict}");
+        assert_eq!(proxy.remote_port, 18080, "strict={strict}");
+    }
+
+    // The v1 dialect keeps the refusal: an empty type is not a `tcp` default there.
+    let dir = tempfile::tempdir().unwrap();
+    let toml_path = dir.path().join("frpc.toml");
+    std::fs::write(
+        &toml_path,
+        "serverAddr = \"127.0.0.1\"\nserverPort = 7000\n[[proxies]]\nname = \"p\"\n\
+         type = \"\"\nlocalPort = 8080\nremotePort = 18080\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let err = format!(
+            "{}",
+            load_client_config(toml_path.to_str().unwrap(), strict)
+                .expect_err("TOML keeps refusing an empty type")
+        );
+        assert!(
+            err.contains("invalid proxy_type ''"),
+            "strict={strict}: the v1 refusal; got {err}"
+        );
+    }
+}
+
+/// **Legacy-dialect parity, items 4 and 5.** An `.ini` section whose **header**
+/// names a v1 root is the legacy section Go reads under that raw name, not the
+/// root it looks like — for the reserved settings roots (`web_server`,
+/// `transport`) when the section carries a proxy port, and for the v1 **array**
+/// roots (`proxies`, `visitors`) always.
+///
+/// Go's legacy loader has no reserved-name list at all: `LoadAllProxyConfsFromIni`
+/// skips only the default section, `common` and `range:*`, and uses
+/// `section.Name()` as the proxy name, while `ini.v1` never expands a dotted
+/// header — so `[web_server]` with ports, `[transport]` with a port and
+/// `[visitors.foo]`/`[proxies.foo]` are each one proxy named after the header
+/// (`pkg/config/legacy/client.go:204`). Measured on the real v0.71.0 binaries: all
+/// of these give `frpc verify` rc 0 in both modes. Before this change frp-rs
+/// dropped the proxy in lenient mode (`Proxies: 0`) and refused the file in strict
+/// mode (`unknown field "web_server.local_port"`), while the dotted array-root
+/// spellings failed in **both** modes with `invalid type: map, expected a
+/// sequence` — the header had been expanded into a v1 sub-table, so the collector
+/// never saw a section to collect.
+///
+/// The reserved-root bypass keys on the **port** keys, never on `type`:
+/// `[log] type = "custom"` must stay a settings table, and a portless
+/// `[web_server] port = 7500` must stay the admin block (pinned by
+/// `typeless_camelcase_web_server_ini_is_not_a_phantom_proxy`).
+#[test]
+fn legacy_ini_headers_naming_v1_roots_are_still_proxies() {
+    let head = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "reserved settings root with type and ports",
+            "[web_server]\ntype = \"tcp\"\nlocal_port = 8080\nremote_port = 18080\n",
+            "web_server",
+        ),
+        (
+            "reserved settings root with a port only",
+            "[transport]\nlocal_port = 8080\n",
+            "transport",
+        ),
+        (
+            "dotted v1 array root, no port",
+            "[visitors.foo]\nserver_name = s\n",
+            "visitors.foo",
+        ),
+        (
+            "dotted v1 array root, empty",
+            "[proxies.foo]\n",
+            "proxies.foo",
+        ),
+        ("bare v1 array root", "[visitors]\n", "visitors"),
+        (
+            "dotted v1 array root with a type",
+            "[proxies.foo]\ntype = \"tcp\"\nlocal_port = 8081\nremote_port = 18081\n",
+            "proxies.foo",
+        ),
+    ];
+    for (label, body, want_name) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(&path, format!("{head}{body}")).unwrap();
+        for strict in [false, true] {
+            let cfg = load_client_config(path.to_str().unwrap(), strict)
+                .unwrap_or_else(|e| panic!("{label}, strict={strict}: {e}"));
+            let names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(
+                names,
+                vec![*want_name],
+                "{label}, strict={strict}: Go registers one proxy named after the header"
+            );
+            assert_eq!(cfg.proxies[0].proxy_type, "tcp", "{label}, strict={strict}");
+            assert!(
+                cfg.visitors.is_empty(),
+                "{label}, strict={strict}: an INI header cannot build a v1 visitor"
+            );
+        }
+    }
 }
 
 /// A **non-table** `webServer` / `web_server` (top level or under `[common]`)
@@ -8082,7 +8286,7 @@ fn load_client_ini(content: &str) -> Result<ClientConfig, Box<dyn std::error::Er
     if let Some(table) = value.as_table_mut() {
         super::normalize::canonicalize_legacy_ini_bools(table);
     }
-    super::normalize::normalize_client_config(&mut value, super::format::ConfigFormat::Ini);
+    super::normalize::normalize_client_config(&mut value, super::format::ConfigFormat::Ini)?;
     // `.ini` inputs read values by target type, exactly as
     // `load_config_from_file` does (Go's legacy INI model) — not the strict
     // serde path TOML/JSON/YAML use.
@@ -8099,7 +8303,7 @@ fn load_server_ini(content: &str) -> Result<ServerConfig, Box<dyn std::error::Er
     if let Some(table) = value.as_table_mut() {
         super::normalize::canonicalize_legacy_ini_bools(table);
     }
-    super::normalize::normalize_server_config(&mut value, super::format::ConfigFormat::Ini);
+    super::normalize::normalize_server_config(&mut value, super::format::ConfigFormat::Ini)?;
     let mut cfg: ServerConfig =
         super::ini_lenient::deserialize_ini(&super::normalize::toml_to_json(value))
             .map_err(|e| format!("config validation error: {e}"))?;
@@ -8250,7 +8454,8 @@ fn legacy_ini_go_shipped_fixture_passes_strict_mode() {
         super::format::ConfigFormat::Ini,
     )
     .unwrap();
-    super::normalize::normalize_client_config(&mut value, super::format::ConfigFormat::Ini);
+    super::normalize::normalize_client_config(&mut value, super::format::ConfigFormat::Ini)
+        .unwrap();
     super::strict::run_strict_check(
         &value,
         &super::strict::known_client_keys(),

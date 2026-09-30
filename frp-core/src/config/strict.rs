@@ -434,8 +434,45 @@ pub(super) fn run_strict_check(
     known: &std::collections::HashSet<&str>,
     config_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_strict_check_scoped(value, known, config_path, true)
+}
+
+/// The same check, **top level only**: unknown keys of the root table are still
+/// refused, unknown keys *inside* a section are not.
+///
+/// This is the check the legacy `.ini` dialect loads under. Go never applies
+/// `strict_config` to that dialect at all: `LoadClientConfigResult`
+/// (`pkg/config/load.go`) branches on `DetectLegacyINIFormat` first and hands a
+/// legacy file to `legacy.ParseClientConfig` / `legacy.UnmarshalServerConfFromIni`,
+/// which read sections by hand (`gopkg.in/ini`) and silently ignore a key their
+/// typed struct does not name. So an `.ini` section key can never refuse a file
+/// Go loads, and the check that remains is only the one v1-spelled keys still
+/// need: a DefaultSection key (`webServer.tls = 1`) deserializes as a real v1
+/// field, and Go's legacy reader is the *legacy* branch — it does not reach
+/// `RejectUnknownMembers`, but frp-rs's `.ini` reader shares the v1 structs, so a
+/// top-level typo there is still a load failure either way. Keeping the top-level
+/// half is what preserves the v1 boundary; exempting the section half is what
+/// matches Go.
+pub(super) fn run_strict_check_top_level(
+    value: &toml::Value,
+    known: &std::collections::HashSet<&str>,
+    config_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_strict_check_scoped(value, known, config_path, false)
+}
+
+fn run_strict_check_scoped(
+    value: &toml::Value,
+    known: &std::collections::HashSet<&str>,
+    config_path: &str,
+    recurse: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let toml::Value::Table(ref table) = value {
-        let errors = check_strict(table, known, "", config_path);
+        let errors = if recurse {
+            check_strict(table, known, "", config_path)
+        } else {
+            check_strict_in(table, known, "", config_path, Ctx::Root, false)
+        };
         if !errors.is_empty() {
             return Err(errors.join("\n").into());
         }
@@ -786,15 +823,20 @@ pub(super) fn check_strict(
     path: &str,
     config_path: &str,
 ) -> Vec<String> {
-    check_strict_in(table, known, path, config_path, Ctx::Root)
+    check_strict_in(table, known, path, config_path, Ctx::Root, true)
 }
 
+/// `recurse == false` checks `table`'s own keys and stops: no descent into a
+/// known sub-table or array. Used for the legacy `.ini` dialect (see
+/// [`run_strict_check_top_level`]), where Go's own reader is accept-and-ignore
+/// inside sections but a v1-spelled top-level key still has to be a real field.
 fn check_strict_in(
     table: &toml::Table,
     known: &std::collections::HashSet<&str>,
     path: &str,
     config_path: &str,
     ctx: Ctx,
+    recurse: bool,
 ) -> Vec<String> {
     let mut errors = Vec::new();
     // Sections whose keys are wildcards (HashMap via #[serde(flatten)])
@@ -854,6 +896,13 @@ fn check_strict_in(
         // arrays; before this recursion the key set was per *section* and an
         // array value never reached the lookup, so an unknown element key was
         // accepted (the exemption the tests used to pin).
+        //
+        // Only for the v1 dialects: the legacy `.ini` call site passes
+        // `recurse == false` because Go's own reader for that dialect ignores
+        // an unknown key inside a section (see `run_strict_check_top_level`).
+        if !recurse {
+            continue;
+        }
         match table.get(key) {
             Some(toml::Value::Table(sub)) => {
                 if let Some(sub_keys) = child_table_keys(ctx, key) {
@@ -863,6 +912,7 @@ fn check_strict_in(
                         &full_key,
                         config_path,
                         child_ctx(ctx, key),
+                        true,
                     ));
                 }
             }
@@ -876,6 +926,7 @@ fn check_strict_in(
                                 &format!("{}[{}]", full_key, index),
                                 config_path,
                                 element_ctx,
+                                true,
                             ));
                         }
                     }

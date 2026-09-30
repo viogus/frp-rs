@@ -234,6 +234,24 @@ fn ini_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>>
 /// is what the legacy dialect needs (`plugin.user-manager`, `web01`,
 /// `my.proxy`), and so does a header in the set that carries a `type` key — see
 /// [`ini_section_path`].
+///
+/// The v1 **array** roots are deliberately absent. `proxies`, `visitors` and
+/// `http_plugins` are `Vec`s in the v1 schema, and an INI header cannot nest
+/// into an array: expanding `[visitors.foo]` built
+/// `visitors = { foo = { … } }`, a map where the deserializer wants a
+/// sequence, so the file was refused with `invalid type: map, expected a
+/// sequence` in *both* loader modes where Go v0.71.0 accepts it (measured:
+/// `frpc verify` on `[visitors.foo] server_name = s` and on a port-carrying
+/// `[proxies.foo]`, and `frps verify` on a portless `[http_plugins.foo]`, are
+/// rc 0 on Go under both `--strict-config` values). Go's legacy loader does not
+/// expand at all (`gopkg.in/ini.v1` has no dotted-path notion): the section is
+/// named literally `visitors.foo` there. It is listed as a *known section* for
+/// the client by `collect_legacy_ini_proxy_sections`, which reads it as the
+/// legacy proxy section its header names — `visitors`/`proxies` are therefore
+/// in that function's array-root list. `http_plugins`/`httpPlugins` are kept
+/// here: the server has no collector, so un-nesting the header would only move
+/// the failure from a type error to `unknown field "http_plugins.foo"` without
+/// reaching Go (recorded as a residual, `TODO.md`).
 const INI_NESTED_SECTION_ROOTS: &[&str] = &[
     "common",
     "web_server",
@@ -241,8 +259,6 @@ const INI_NESTED_SECTION_ROOTS: &[&str] = &[
     "auth",
     "transport",
     "log",
-    "proxies",
-    "visitors",
     "http_plugins",
     "httpPlugins",
     "feature",
@@ -271,12 +287,12 @@ const INI_NESTED_SECTION_ROOTS: &[&str] = &[
 ///   (`pkg/config/legacy/server.go`, `section.Name()`), so `[auth.foo]` is one
 ///   section there too. Expanding it dropped the proxy in both loader modes; the
 ///   guard keeps it. (The cost, documented in `docs/config.md`: a v1 nested
-///   table that itself carries `type` — a `[visitors.plugin]`-style table in an
+///   table that itself carries `type` — an `[auth.plugin]`-style table in an
 ///   `.ini` — does not expand either, which is also what the base tree did. It is
 ///   then read as any other flat section: on the **client** the legacy collector
 ///   takes it for a proxy named after the header and proxy validation refuses it
-///   (measured: `[visitors.plugin] type = "https2http"` → rc 1, `proxy
-///   'visitors.plugin': invalid proxy_type 'https2http'`), on the **server** it is
+///   (measured: `[auth.plugin] type = "https2http"` → rc 1, `proxy
+///   'auth.plugin': invalid proxy_type 'https2http'`), on the **server** it is
 ///   an unknown strict-mode field.)
 ///
 ///   The same holds for a section that carries `local_port` or `remote_port` but
