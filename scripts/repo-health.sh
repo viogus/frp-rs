@@ -291,10 +291,17 @@ def rs_texts(root, top_only=False, within=None, seen=None):
     directory entry is inside its own crate root — and each call's private set
     used to let both crates claim it (measured: `ln frp-core/src/kcp/session.rs
     frp-server/src/zz_hardlink.rs` moved frp-server `32/59146` -> `33/60978` at rc
-    0 while frp-core stayed `69/76510`). Ownership is a stated convention, since
-    a hard link has no "original" name: **the first crate in `CRATES` order
-    claims the inode**, so a link placed in a later crate is skipped rather than
-    attributed to it. A file excluded by `within` is *not* added to `seen`, so a
+    0 while frp-core stayed `69/76510`). Claim order is a stated convention, not
+    an ownership claim, because a hard link has no "original" name: **the first
+    crate in `CRATES` order claims the inode**, so a link placed in a later crate
+    is skipped rather than attributed to it. The asymmetry is real and
+    deliberate: when the alias sits in an *earlier* crate than the tracked name,
+    the crate that owns the tracked name loses that file's lines from its own
+    row. Measured — `ln frp-server/src/lib.rs frp-core/src/zz_hl_rev.rs` gives
+    frp-core `70/76534` and frp-server `31/59122` (down from `32/59146`):
+    frp-server's own tracked `lib.rs` is counted in the frp-core row. The
+    contract is "counted once, in the first claiming crate", **not** per-crate
+    attribution. A file excluded by `within` is *not* added to `seen`, so a
     cross-crate symlink cannot mask the real file's own crate.
 
     A scope root that is itself a symlink yields nothing and is recorded as an

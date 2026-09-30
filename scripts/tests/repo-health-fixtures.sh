@@ -299,7 +299,14 @@ fi
 for site in 1 2 3 4; do
   t=$(new_full_tree "unreadable-mut$site")
   ln -s nowhere "$t/frp-core/src/zz_broken.rs"
-  mut_rwalk "$t" "$site"
+  # A mutation that does not apply must be a hard failure, not a silently absent
+  # edit: the site check below would then pass on the un-mutated tree and report
+  # "check has teeth" for the wrong reason. (set -u/-o pipefail, no -e, and the
+  # python `assert` is unchecked by the caller, so test the rc here.)
+  if ! mut_rwalk "$t" "$site"; then
+    bad "unreadable src: site $site mutation failed to apply — anchor missing, the site check would be vacuous"
+    continue
+  fi
   run_gate "$t"
   if [ "$site" -eq 4 ]; then
     # Site 4 emits no `scan error:` line (it raises out of the whole block), so
