@@ -252,6 +252,18 @@ jobs:
         run: rustup toolchain install --no-self-update
       - name: Run all-features lib tests (QUIC admission and feature combos)
         run: cargo test --workspace --all-features --lib
+      - name: Run frps bin unit tests (the `--lib` sweep cannot see them)
+        # `frps` has no lib target, so its `#[cfg(test)] mod` unit tests live in
+        # the bin target and the `--lib` sweep above never runs them
+        # (`cargo test -p frps --lib` is `error: no library targets found`).
+        # They are not decorative: `frps/src/main.rs`'s
+        # `dir_registry_tests::lock_dir_registry_recovers_a_poisoned_registry`
+        # pins the `--config-dir` SIGUSR1 registry's poisoned-mutex recovery
+        # (TODO.md `--config-dir` residue item 7), and until this step existed
+        # that pin executed in no CI lane. No count literal: the module is
+        # inline in `frps/src/main.rs`, so adding or removing one of its tests
+        # must not require touching this job's `FRPS_CLI_TESTS` guard.
+        run: cargo test -p frps --bin frps --all-features
       - name: Run vnet unit tests (nathole membership/cap guards)
         # frps/frpc default features exclude `vnet`, so the default-feature
         # `cargo test --workspace` steps never compile the nathole.rs vnet
@@ -351,12 +363,13 @@ jobs:
         # The runner was not measured.
         run: cargo test -p frpc
       - name: Run frps CLI tests (config-failure exit codes)
-        # The `frps` sibling of the step above. No lane ran a `cargo test`
-        # target of the `frps` package before this step: the two `--lib` steps
-        # restrict to lib targets, `frps` has no lib, and the `Lint` lane only
-        # *compiles* the test targets (`cargo clippy --workspace --all-targets
-        # --all-features`). So `frps/tests/cli_exit_codes.rs` — added with the
-        # CLI config-failure fix (`TODO.md:1503`) — executed in no lane, and
+        # The `frps` sibling of the step above. No lane ran the
+        # `frps/tests/cli_exit_codes.rs` *integration* target before this step:
+        # the two `--lib` steps restrict to lib targets, `frps` has no lib (its
+        # bin-target unit tests are covered by `Run frps bin unit tests` above),
+        # and the `Lint` lane only *compiles* the test targets (`cargo clippy
+        # --workspace --all-targets --all-features`). So that file — added with
+        # the CLI config-failure fix (`TODO.md:1503`) — executed in no lane, and
         # the frps half of that fix had no executing pin.
         #
         # Measured warm, macOS arm64: 2.47 s wall for the package (4 tests, the
