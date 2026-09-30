@@ -1016,7 +1016,7 @@ valid config (plus the variations named):
 | `frpc verify -c <method = "OIDC">` | 1 | **1** — `Config file <path> is invalid: <path>: invalid auth method, …` on stdout, stderr 0 B (was **0**, `is valid`, before the shared policy) |
 | `frpc verify -c <method = "oidc">` with **no** `auth.oidc.clientID`/`tokenEndpointURL` | 1 — **both** missing fields, joined: `auth.oidc.clientID is required; auth.oidc.tokenEndpointURL is required` (**71 B** stdout, 0 B stderr) | **1** — only the first: `auth.oidc.clientID is required`. Recorded divergence: Go's `ValidateOIDCClientCredentialsConfig` accumulates **every** message and joins them with `"; "` (`pkg/config/v1/validation/oidc.go:25-57`, called from `validation/client.go:113-117`), while frp-rs's `validate_oidc_client_config` returns at the first |
 | `frpc --config-dir <nonexistent\|empty\|bad>` | **0** | **2** (deliberate) |
-| `frpc --config-dir <good>`, service cannot run | 0 (0.026 s) | 0 (0.026 s) |
+| `frpc --config-dir <good>`, service cannot run | 0 (0.027 s) | **1** (0.03 s) — the client lane now carries the service failure out, like `frps`; was **0** with nothing served |
 | `frps --config-dir <…>` | 1 — `unknown flag: --config-dir` | 2 (extension flag) |
 | `frps --config-dir -x` / `--config-dir --strict-config=false` | 1 — `unknown flag: --config-dir` | 2 (extension flag; the dash-shaped token is the value, so the directory read runs — was rc 1 ``--config-dir` requires an argument `DIR`` before the shared `-c <dash-value>` pass, see § CLI inputs) |
 | `frpc -c empty.toml` (defaults only, peer accepts and never answers) | 1 after 10.04 s | 1 after 30.07 s |
@@ -1025,16 +1025,22 @@ valid config (plus the variations named):
 
 The good-directory row is deliberately qualified: a directory whose service
 actually *runs* is long-running on both sides and has no natural exit code, so a
-`0` obtained by signalling a live process must never be recorded here. The `0`
-above is measured for the case where the service cannot run (the example config
-points at a closed port: both exit in 0.026 s, Go after
-`connect to server error`, frp-rs after `frpc service error for config file
-[...]`), and it is the only directory-mode `0` this table asserts. The same
-`--config-dir` shape pointed at a peer that accepts TCP and never answers also
-returns **0** on both sides, but slowly: re-measured with the directory's config
-dialling `127.0.0.1:7000` (macOS Control Center accepts and stays silent) →
-**Go 0 at 10.06 s, frp-rs 0 at 30.06 s**, twice each. Those are the same
-timeouts as the `empty.toml` row, not the ~0.03 s of the refused case.
+`0` obtained by signalling a live process must never be recorded here. The `0` in
+the Go column is measured for the case where the service cannot run (the example
+config points at a closed port: Go exits 0 in 0.027 s after `frpc service error
+for config file [frpc.toml]`), and it is the only directory-mode `0` this table
+asserts. The frp-rs column exits **1** for that shape, in 0.03 s, after
+`ERROR frpc: frpc service error for config file [<path>]: transport error: dial to
+127.0.0.1:1: Connection refused (os error 61)`; the `-c` twin exits **1** in
+0.02 s with the same transport error, so the two lanes agree again — this is the
+`frpc --config-dir` item, where the lane used to report success while nothing was
+served. The same `--config-dir` shape pointed at a peer that accepts TCP and never
+answers is slower and no longer a `0` on this side either: re-measured with the
+directory's config dialling `127.0.0.1:7000` (macOS Control Center accepts and
+stays silent) → **Go 0 at 10.02 s, frp-rs 1 at 30.03 s** (`transport error: TLS
+connect: TLS handshake did not complete within 30s` on stdout, stderr 0 B). Those
+are the same timeouts as the `empty.toml` row, not the ~0.03 s of the refused
+case.
 
 The `frpc -c empty.toml` rows exist because the durations are **peer-dependent,
 not a bound**. The default empty config dials `127.0.0.1:7000`; on the host these

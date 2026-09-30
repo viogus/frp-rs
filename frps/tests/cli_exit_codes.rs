@@ -115,12 +115,25 @@ fn try_wait_or_kill(child: &mut Child, what: &str) -> Option<std::process::ExitS
 }
 
 fn run_frps(args: &[&str]) -> Output {
-    let mut child = Command::new(bin())
-        .args(args)
+    run_frps_inner(args, &[])
+}
+
+/// [`run_frps`] with extra environment variables set on the child, for the
+/// debug-build-only hooks in `frps/src/main.rs` that make a spawn-level failure
+/// (a panicking service task) deterministic.
+fn run_frps_with_env(args: &[&str], envs: &[(&str, &str)]) -> Output {
+    run_frps_inner(args, envs)
+}
+
+fn run_frps_inner(args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(bin());
+    cmd.args(args)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn frps");
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn().expect("spawn frps");
     let deadline = Instant::now() + EXIT_TIMEOUT;
     loop {
         match try_wait_or_kill(&mut child, "frps") {
@@ -571,7 +584,9 @@ fn oidc_without_an_issuer_is_refused_with_3_where_go_panics() {
 ///
 /// So the barrier is a **child-specific progress witness**: the SIGUSR1 task
 /// logs `SIGUSR1 reload ready` after its `tokio::signal::unix::signal` call
-/// returns (`frps/src/main.rs:207-215`), i.e. only after that `frps` is past its
+/// returns (`frps/src/main.rs:295` installs the handler, `frps/src/main.rs:528`
+/// logs the marker; the `-c` lane's twin is `frps/src/main.rs:719`/`:721`),
+/// i.e. only after that `frps` is past its
 /// own startup logging. A foreign listener cannot fake it — only the child under
 /// test writes to that log path. If the line never appears (a platform without
 /// the handler), the helper panics with the log rather than silently weakening
@@ -789,17 +804,18 @@ fn config_dir_where_every_service_fails_init_exits_like_dash_c() {
 ///
 /// At `9a0df13d` the lane counted only *construction* failures: a task whose
 /// `run()` failed reported `Ok(())`, so the exit guard's failure list stayed
-/// empty and `frps --config-dir` exited **0** with zero listeners — measured
-/// with `/tmp/frps-cfgdir-probe/probe-bind.py`: `-c` rc 1, `--config-dir` rc 0,
-/// `listener started` count 0.
+/// empty and `frps --config-dir` exited **0** with zero listeners.
 ///
 /// The second half pins the **mixed** shape — one file that cannot be
 /// constructed (no `[auth].token`) plus one whose port is held — which also
-/// exited 0 with nothing listening. Both files are spawned, so the pair now
-/// exits on the first *spawned* failure's code; the assertion is deliberately
-/// "non-zero, nothing listening" rather than a specific code, because that code
-/// is the first spawned failure's, not the directory's single worst one (the
-/// guard's comment in `frps/src/main.rs` states the ordering).
+/// exited 0 with nothing listening. `collect_config_files` returns files in
+/// sorted order, so `a.toml` (construction failure, `EXIT_AUTH`/3) is position
+/// 0 and `b.toml` (run failure, `EXIT_RUNTIME`/1) is position 1; the all-failed
+/// decision exits the **file-order first** failure's code, exactly the code
+/// `-c a.toml` exits on, so the pair exits 3. (The assertion used to be only
+/// "non-zero" because the guard exited on whichever task the runtime happened
+/// to complete first, which made the code scheduling-dependent — the guard in
+/// `frps/src/main.rs` now sorts by the file's position in `files`.)
 #[test]
 fn config_dir_where_every_service_fails_to_run_exits_like_dash_c() {
     let (holder, port) = held_port();
@@ -844,11 +860,12 @@ fn config_dir_where_every_service_fails_to_run_exits_like_dash_c() {
     std::fs::write(mixed.join("a.toml"), format!("bindPort = {port}\n")).expect("write a.toml");
     std::fs::copy(valid_config(&dir, port), mixed.join("b.toml")).expect("copy b.toml");
     let mixed_out = run_frps(&["--config-dir", mixed.to_str().expect("utf-8 temp path")]);
-    let code = mixed_out.status.code();
-    assert!(
-        code.is_some_and(|c| c != 0),
-        "a directory where every spawned service failed must exit non-zero, got {code:?}; \
-         stdout={:?} stderr={:?}",
+    assert_eq!(
+        mixed_out.status.code(),
+        Some(3),
+        "a directory where every service failed must exit the file-order first \
+         failure's code — `a.toml`'s construction refusal (3), the same code \
+         `-c a.toml` exits on; stdout={:?} stderr={:?}",
         stdout_of(&mixed_out),
         stderr_of(&mixed_out),
     );
@@ -858,6 +875,259 @@ fn config_dir_where_every_service_fails_to_run_exits_like_dash_c() {
         stdout_of(&mixed_out),
     );
     drop(holder);
+}
+
+/// The **converse** of the two all-failed pins above, and the shape that makes
+/// the all-failed comparison itself load-bearing: one file's service fails at
+/// run time (its `bindPort` is held, so its task returns `Err(EXIT_RUNTIME)`),
+/// the other binds and serves. `failures.len() == files.len()` is false there,
+/// so the directory has a survivor and must return normally — the process stays
+/// up, keeps accepting connections on the surviving port, and exits 0 on
+/// SIGTERM. Replacing that comparison with `if true` exits the failure's code
+/// for this directory too; both all-failed pins stay green under that mutant
+/// (every file in their fixtures fails), which is why this pin exists.
+#[test]
+fn config_dir_where_one_service_fails_keeps_serving_and_exits_zero() {
+    let dir = TempDir::new();
+    let conf_d = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    let port = ephemeral_port();
+    let (holder, held) = held_port();
+    std::fs::write(
+        conf_d.join("a.toml"),
+        format!("bindAddr = \"127.0.0.1\"\nbindPort = {port}\n[auth]\ntoken = \"cli-exit-test\"\n"),
+    )
+    .expect("write a.toml");
+    std::fs::write(
+        conf_d.join("b.toml"),
+        format!("bindAddr = \"127.0.0.1\"\nbindPort = {held}\n[auth]\ntoken = \"cli-exit-test\"\n"),
+    )
+    .expect("write b.toml");
+
+    // Waits for the surviving listener to accept *and* the SIGUSR1 ready
+    // marker, then sends SIGTERM and asserts the exit code is 0.
+    let log = start_listening_then_sigterm(
+        &["--config-dir", conf_d.to_str().expect("utf-8 temp path")],
+        port,
+        &dir,
+    );
+    assert!(
+        log.contains("frps service error for config file")
+            && log.contains("Address already in use"),
+        "b.toml's held-port service must really have failed at run time, or this pin \
+         would pass with no failure for the directory to survive; log={log:?}",
+    );
+    drop(holder);
+}
+
+/// The same converse pin with the file order **swapped**: `a.toml` is the file
+/// whose service fails at run time and `b.toml` is the survivor.
+///
+/// The pin above cannot see a "the *first* file failed" short-circuit — its
+/// failing file is `b.toml`, at index 1 — so appending
+/// `|| failures.iter().any(|(file_index, _)| *file_index == 0)` to the all-failed
+/// comparison survived it (35 `cli_exit_codes` + 16 `warn_delivery` + 19 tiny +
+/// 18 full all green). Under that mutant this directory exits `a.toml`'s
+/// `EXIT_RUNTIME`/1 after SIGTERM instead of returning, so the surviving
+/// `b.toml` listener plus the `Some(0)` exit code are the teeth.
+#[test]
+fn config_dir_where_the_first_service_fails_keeps_serving_and_exits_zero() {
+    let dir = TempDir::new();
+    let conf_d = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    let port = ephemeral_port();
+    let (holder, held) = held_port();
+    std::fs::write(
+        conf_d.join("a.toml"),
+        format!("bindAddr = \"127.0.0.1\"\nbindPort = {held}\n[auth]\ntoken = \"cli-exit-test\"\n"),
+    )
+    .expect("write a.toml");
+    std::fs::write(
+        conf_d.join("b.toml"),
+        format!("bindAddr = \"127.0.0.1\"\nbindPort = {port}\n[auth]\ntoken = \"cli-exit-test\"\n"),
+    )
+    .expect("write b.toml");
+
+    // Waits for the surviving listener to accept *and* the SIGUSR1 ready
+    // marker, then sends SIGTERM and asserts the exit code is 0.
+    let log = start_listening_then_sigterm(
+        &["--config-dir", conf_d.to_str().expect("utf-8 temp path")],
+        port,
+        &dir,
+    );
+    assert!(
+        log.contains("frps service error for config file")
+            && log.contains("a.toml")
+            && log.contains("Address already in use"),
+        "a.toml's held-port service must really have failed at run time, or this pin \
+         would pass with no failure for the directory to survive; log={log:?}",
+    );
+    drop(holder);
+}
+
+/// A file that fails to **load** never becomes a task, so it could not reach
+/// the all-failed decision: at `d9f8e63c` a directory where every file failed
+/// to load exited `EXIT_CONFIG`/2 purely because `handles` came out empty,
+/// while `-c` on the same file exits 1 (`EXIT_RUNTIME`, the single-config
+/// lane's mapping for every load error). The lane now records the load failure
+/// in file order and exits that same code, so the two lanes agree.
+#[test]
+fn config_dir_where_every_file_fails_to_load_exits_like_dash_c() {
+    let dir = TempDir::new();
+    let conf_d = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    let file = conf_d.join("frps.toml");
+    // Not valid TOML: rejected in the loader, before any service is constructed.
+    std::fs::write(&file, "this is not valid toml\n").expect("write config");
+    let file = file.to_str().expect("utf-8 temp path");
+
+    let control = run_frps(&["-c", file]);
+    assert_eq!(
+        control.status.code(),
+        Some(1),
+        "control: `-c` on an unparseable config must exit 1 (EXIT_RUNTIME); \
+         stdout={:?} stderr={:?}",
+        stdout_of(&control),
+        stderr_of(&control),
+    );
+
+    let out = run_frps(&["--config-dir", conf_d.to_str().expect("utf-8 temp path")]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "every file failing to load must exit the same code `-c` does (1), not \
+         the old EXIT_CONFIG 2; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
+/// The **file-order sort** in the all-failed decision is load-bearing for
+/// exactly one mix: a *later* file failing to **load** — recorded in file order
+/// by the construction loop — plus an *earlier* file whose task fails **after**
+/// the loop, so the two entries are appended out of order. Every other
+/// all-failed fixture here fails in a single phase (or in file order within a
+/// phase), so deleting `failures.sort_by_key(|(file_index, _)| *file_index)` in
+/// `frps/src/main.rs` left the whole lane green — the review's F1.
+///
+/// `a.toml` carries no `[auth].token`, so its **task** returns
+/// `Err(EXIT_AUTH)`/3 after the loop, while `b.toml` is unparseable and pushes
+/// its load failure (`EXIT_RUNTIME`/1) into `load_failures` first. Sorted by
+/// index the file-order first failure is `a.toml`'s 3 — the code `-c a.toml`
+/// exits on — while with the sort deleted the lane exits `b.toml`'s 1.
+#[test]
+fn config_dir_exits_the_first_files_code_when_a_later_file_fails_to_load() {
+    let dir = TempDir::new();
+    let conf_d = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    let port = ephemeral_port();
+    // No `[auth].token`: construction is refused with `EXIT_AUTH`/3 *inside the
+    // task*, i.e. after the loop has already recorded `b.toml`'s load failure.
+    std::fs::write(conf_d.join("a.toml"), format!("bindPort = {port}\n")).expect("write a.toml");
+    // Not valid TOML: rejected in the loader, so this file never becomes a task.
+    std::fs::write(conf_d.join("b.toml"), "this is not valid toml\n").expect("write b.toml");
+    let a = conf_d.join("a.toml");
+    let a = a.to_str().expect("utf-8 temp path");
+
+    let control = run_frps(&["-c", a]);
+    assert_eq!(
+        control.status.code(),
+        Some(3),
+        "control: `-c a.toml` (no auth token) must exit 3 (EXIT_AUTH), the code \
+         the sorted all-failed decision must reproduce; stdout={:?} stderr={:?}",
+        stdout_of(&control),
+        stderr_of(&control),
+    );
+
+    let out = run_frps(&["--config-dir", conf_d.to_str().expect("utf-8 temp path")]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "the all-failed decision must exit the **file-order first** failure's code \
+         (a.toml's EXIT_AUTH/3), not the entry appended last (b.toml's load \
+         failure, 1); stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
+/// An **existing but empty** `--config-dir` must be refused with
+/// `EXIT_CONFIG`/2 and the empty-directory diagnostic, not fall through to the
+/// all-load-failed arm below. The client's twin is pinned in
+/// `frpc/tests/cli_exit_codes.rs::config_dir_refusals_exit_2_where_go_exits_0`;
+/// on the server only the **message** discriminates: with `files.is_empty()`
+/// deleted the directory still exits 2, because the all-load-failed arm's
+/// `unwrap_or(EXIT_CONFIG)` fires when there are no load failures, but it
+/// reports "No services started — all config files failed to load" instead.
+/// This pin asserts both the code and that diagnostic.
+#[test]
+fn config_dir_refuses_an_empty_directory_with_2() {
+    let dir = TempDir::new();
+    let conf_d = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+
+    let out = run_frps(&["--config-dir", conf_d.to_str().expect("utf-8 temp path")]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an existing but empty --config-dir must exit 2 (EXIT_CONFIG); \
+         stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        combined(&out).contains("No config files found in directory"),
+        "the empty-directory refusal must name the condition — the \
+         all-load-failed arm's message means `files.is_empty()` was skipped; \
+         stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
+/// A **panicking** service task must count toward the all-failed decision, not
+/// merely be logged. The guard pushed `Ok(Err(code))` only, so a `JoinError`
+/// was logged at `frps/src/main.rs` and dropped: with a directory whose every
+/// task panicked, `failures.len() == files.len()` could never hold, nothing
+/// stayed up, and the process exited **0**.
+///
+/// The panic is driven by the debug-only `FRPS_CFGDIR_TEST_PANIC` hook — gated
+/// on `debug_assertions`, so it does not exist in a release binary — which
+/// panics the task named by the value **after** it registered, i.e. exactly the
+/// task shape the guard must count. The fixture needs no free port beyond the
+/// config itself: the task panics before `Service::run`, so no listener starts;
+/// the point is that the lane cannot report success with nothing served.
+#[test]
+fn config_dir_where_every_task_panics_exits_nonzero() {
+    let port = ephemeral_port();
+    let dir = TempDir::new();
+    let conf_d = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    let cfg = valid_config(&dir, port);
+    let file = conf_d.join("frps.toml");
+    std::fs::copy(&cfg, &file).expect("copy the valid config into conf.d");
+    let file = file.to_str().expect("utf-8 temp path");
+
+    let out = run_frps_with_env(
+        &["--config-dir", conf_d.to_str().expect("utf-8 temp path")],
+        &[("FRPS_CFGDIR_TEST_PANIC", file)],
+    );
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a directory whose only task panicked served nothing and must not exit 0; \
+         stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        combined(&out).contains("frps service task panicked"),
+        "the panic must still be logged; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
 }
 
 /// The frp-rs space-separated `--strict-config` extension is made **loud** on

@@ -75,8 +75,16 @@ const BIN: &str = env!("CARGO_BIN_EXE_frps");
 /// How long a shape may take from spawn to its startup line being visible.
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the SIGUSR1 handler may take to come up after the startup line.
+///
+/// Unix-only, like the lane it serves: `frps`'s SIGUSR1 handling (and the
+/// `--config-dir` reload fan-out built on it) lives behind `#[cfg(unix)]`, so
+/// every test and helper below that drives it carries the same gate rather than
+/// compiling on a non-unix target and failing there. `SETTLE`, by contrast, is
+/// used by the plain startup path and stays ungated.
+#[cfg(unix)]
 const RELOAD_READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the reload may take to log its summary after SIGUSR1.
+#[cfg(unix)]
 const RELOAD_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a killed child may take to disappear before the guard gives up.
 const REAP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -87,10 +95,15 @@ const SETTLE: Duration = Duration::from_millis(600);
 /// seeing it proves the load succeeded and a subscriber exists. Without it, an
 /// empty warning count would be indistinguishable from "the binary never ran".
 const STARTUP_MARKER: &str = "frps (Rust) v";
-/// The SIGUSR1 task's own progress witness: it is printed once the handler is
-/// installed, so a signal sent after it cannot be lost to a startup race.
+/// The SIGUSR1 task's own progress witness. Gated on registration completing:
+/// the handler is installed *before* the services are spawned (so an early
+/// signal cannot kill the process), but this line is only printed once every
+/// spawned task has registered, so a signal sent after it reaches a fully
+/// populated registry. Unix-only (see `RELOAD_READY_TIMEOUT`).
+#[cfg(unix)]
 const SIGNAL_READY_MARKER: &str = "SIGUSR1 reload ready";
-/// The server's reload summary line (`frps/src/main.rs`).
+/// The server's reload summary line (`frps/src/main.rs`). Unix-only.
+#[cfg(unix)]
 const RELOAD_MARKER: &str = "SIGUSR1:";
 /// The key, as the message names it.
 const KEY: &str = "web_server.tls.enable";
@@ -218,9 +231,34 @@ impl Spawned {
         spawned
     }
 
+    /// Spawn `frps` with `argv` and extra `env` vars from `dir`, wait (bounded)
+    /// for [`STARTUP_MARKER`], and snapshot — but **without** [`SETTLE`].
+    ///
+    /// The registration-order pin needs the window right after the startup line
+    /// left open: it signals as soon as [`SIGNAL_READY_MARKER`] appears, so a
+    /// fixed settle would hide the race it exists to catch. Unix-only, like the
+    /// signal it is built to drive.
+    #[cfg(unix)]
+    fn spawn(dir: &TempDir, argv: &[&str], envs: &[(&str, &str)]) -> Self {
+        let mut cmd = Command::new(bin());
+        cmd.args(argv)
+            .current_dir(&dir.0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        let child = cmd.spawn().expect("spawn frps");
+        let mut spawned = Self::from_child(child);
+        spawned.wait_for_marker(STARTUP_MARKER, READY_TIMEOUT);
+        spawned.snapshot();
+        spawned
+    }
+
     /// Send `SIGUSR1`, wait (bounded) for the reload summary, settle, and
     /// re-snapshot. Returns `true` when the summary line was seen; the counts
     /// the caller reads afterwards are the post-reload ones.
+    #[cfg(unix)]
     fn sigusr1_and_reload(&mut self) -> bool {
         // The handler prints this once installed; a signal sent earlier can be
         // lost, which would look exactly like the defect under test.
@@ -243,6 +281,7 @@ impl Spawned {
     /// The count-based sibling of [`Self::sigusr1_and_reload`]: with two
     /// services one signal prints two summaries, and a presence wait would
     /// return on the *previous* signal's line instead of the new ones.
+    #[cfg(unix)]
     fn sigusr1_and_wait_for_reloads(&mut self, expect_extra: usize) -> usize {
         self.wait_for_marker(SIGNAL_READY_MARKER, RELOAD_READY_TIMEOUT);
         let before = occurrences(&self.peek_streams(), RELOAD_MARKER);
@@ -266,10 +305,14 @@ impl Spawned {
     /// Both streams concatenated: the reload summaries are `tracing` records,
     /// and this file counts other markers on stdout alone — counting both keeps
     /// this helper independent of which stream `tracing` is wired to.
+    #[cfg(unix)]
     fn peek_streams(&self) -> String {
         format!("{}{}", self.peek_stdout(), self.peek_stderr())
     }
 
+    /// The frozen snapshot of both streams. Unix-only, like its only readers:
+    /// the SIGUSR1 fan-out pins that count summaries.
+    #[cfg(unix)]
     fn streams(&self) -> String {
         format!("{}{}", self.stdout(), self.stderr())
     }
@@ -330,6 +373,7 @@ impl Spawned {
     /// `true` while the child is still running. `Ok(None)` is the only
     /// still-running answer; an already-exited child is reaped here and an OS
     /// error means the child is gone too.
+    #[cfg(unix)]
     fn is_alive(&mut self) -> bool {
         matches!(self._guard.child.try_wait(), Ok(None))
     }
@@ -595,13 +639,14 @@ fn web_server_tls_enable_warning_reaches_a_config_dir_user_with_the_common_spell
 /// signal reloads every service built from the directory instead of killing the
 /// process. The defect this pins was a hard exit: on the base binary a
 /// `--config-dir` process that had logged its startup line died on `SIGUSR1`
-/// with `unix_wait_status(158)` (`128+30`, shell message "User defined signal 1:
-/// 30", measured by `/tmp/frps-cfgdir-probe/probe.sh`) and logged no summary.
+/// with `unix_wait_status(158)` (`128+30`, shell message "User defined signal
+/// 1: 30") and logged no summary.
 ///
 /// The config is left **unchanged** across the signal, so the summary's wording
 /// (`config reloaded: no changes detected`) is not what is asserted — only that
 /// a summary arrived, i.e. that `Service::reload` ran on a process that is still
 /// alive afterwards.
+#[cfg(unix)]
 #[test]
 fn a_config_dir_process_survives_sigusr1_and_reloads() {
     let dir = TempDir::new("cfgdir-reload");
@@ -632,6 +677,7 @@ fn a_config_dir_process_survives_sigusr1_and_reloads() {
 /// (`summaries=2` after one signal, `4` after two; `3`/`6` with three) and the
 /// wording is byte-identical to `-c` (`SIGUSR1: config reloaded: no changes
 /// detected`), which the single-config pins already assert.
+#[cfg(unix)]
 #[test]
 fn a_config_dir_sigusr1_reloads_every_service() {
     let dir = TempDir::new("cfgdir-fanout");
@@ -669,11 +715,218 @@ fn a_config_dir_sigusr1_reloads_every_service() {
     );
 }
 
+/// The registry must not keep counting a **dead** task: one file's task panics
+/// (the debug-only `FRPS_CFGDIR_TEST_PANIC` hook, which panics *after* the task
+/// registered) while the other three serve, and a later SIGUSR1 must report
+/// `3 of 3`, not `4 of 4`.
+///
+/// The removal used to live in `Service::run`'s error arm
+/// (`frps/src/main.rs`), which a panicking task never reaches — it unwinds past
+/// it — so the dead service stayed registered and the fan-out line counted it
+/// (`reloaded 4 of 4`, measured by reviewer 1). Registration now arms a drop
+/// guard (`DirRegistryEntry`) and unwinding runs it.
+///
+/// The signal is re-sent in a bounded loop because the panic hook runs *before*
+/// unwinding: a signal racing the unwind could still see the dead entry. Every
+/// later signal sees the fix and the mutant never does, so the loop is the
+/// deterministic form — it cannot pass without the guard and cannot flake with
+/// it.
+#[cfg(unix)]
+#[test]
+fn a_config_dir_sigusr1_does_not_count_a_panicking_service() {
+    const FILES: usize = 4;
+    const LIVE: usize = FILES - 1;
+    let dir = TempDir::new("cfgdir-panic-fanout");
+    let sub = dir.0.join("conf.d");
+    std::fs::create_dir_all(&sub).expect("create config dir");
+    let mut doomed = PathBuf::new();
+    for name in ["a.toml", "b.toml", "c.toml", "d.toml"] {
+        let path = sub.join(name);
+        let cfg = frps_config(free_port(), free_port(), Section::Nested);
+        std::fs::write(&path, &cfg).expect("write config");
+        if name == "d.toml" {
+            doomed = path;
+        }
+    }
+    let mut spawned = Spawned::spawn(
+        &dir,
+        &["--config-dir", sub.to_str().unwrap()],
+        &[("FRPS_CFGDIR_TEST_PANIC", doomed.to_str().unwrap())],
+    );
+
+    let fan_out = format!("SIGUSR1 fan-out: reloaded {LIVE} of {LIVE} services");
+    let mut seen = false;
+    for _ in 0..10 {
+        if spawned.sigusr1_and_reload() && spawned.streams().contains(&fan_out) {
+            seen = true;
+            break;
+        }
+    }
+    assert!(
+        seen,
+        "a panicking task must leave the registry, so the fan-out line must be \
+         {fan_out:?} (never `4 of 4`) within ten signals\n--- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        spawned.stdout(),
+        spawned.stderr(),
+    );
+}
+
+/// The registration-order pin. `SIGUSR1` is installed **before** the services
+/// are spawned — that is what keeps an early signal from killing the process —
+/// but the "reload ready" line must not be printed until every spawned task has
+/// pushed itself into the registry, or a signal sent right after it reloads
+/// only the registered subset. The measured window (delay 0: `12` files →
+/// `10/12` summaries once in four runs, `40` files → `39/40` twice in four;
+/// clean at `0.3 s`) is exactly that subset.
+///
+/// The debug-only `FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS` hook holds the
+/// pre-registration window open deterministically: each task sleeps after
+/// construction and before registering, so with the barrier in place the ready
+/// marker cannot appear for ~1.2 s, and the fan-out line must name **every**
+/// file. Without the barrier the marker appears at once, the signal lands on an
+/// empty registry, and the count collapses to `0` — which is what this asserts
+/// against. The `> 800 ms` lower bound is the same gate seen from the timing
+/// side; slowness only widens it, so it cannot flake.
+#[cfg(unix)]
+#[test]
+fn a_config_dir_sigusr1_immediately_after_the_ready_marker_reloads_everything() {
+    const FILES: usize = 4;
+    const DELAY_MS: &str = "1200";
+    let dir = TempDir::new("cfgdir-prereg");
+    let sub = dir.0.join("conf.d");
+    std::fs::create_dir_all(&sub).expect("create config dir");
+    for name in ["a.toml", "b.toml", "c.toml", "d.toml"] {
+        let cfg = frps_config(free_port(), free_port(), Section::Nested);
+        std::fs::write(sub.join(name), &cfg).expect("write config");
+    }
+    let mut spawned = Spawned::spawn(
+        &dir,
+        &["--config-dir", sub.to_str().unwrap()],
+        &[("FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS", DELAY_MS)],
+    );
+
+    let start = Instant::now();
+    spawned.wait_for_marker(SIGNAL_READY_MARKER, RELOAD_READY_TIMEOUT);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(800),
+        "the ready marker must be gated on registration completing: every task was \
+         still sleeping its {DELAY_MS} ms pre-registration delay when the marker \
+         appeared after only {elapsed:?}\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+
+    let total = spawned.sigusr1_and_wait_for_reloads(FILES);
+    assert_eq!(
+        total,
+        FILES,
+        "a signal sent immediately after the ready marker must reload all {FILES} \
+         services, not the registered subset\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+    let fan_out = format!("SIGUSR1 fan-out: reloaded {FILES} of {FILES} services");
+    assert!(
+        spawned.streams().contains(&fan_out),
+        "the reload must report the full fan-out ({fan_out:?})\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+}
+
+/// The file set is fixed at startup, and this pins that as deliberate: the
+/// directory is read **once** (`collect_config_files`) and the registry only
+/// ever holds the files that constructed at startup.
+///
+/// Three legs, one signal each: a file added after startup is never loaded; a
+/// file whose construction failed is never retried; a file removed on disk
+/// keeps its service running (its reload now fails loudly, exactly the measured
+/// `SIGUSR1 reload: Failed to reload config: <path>: failed to read config file:
+/// No such file or directory (os error 2)`) while its listener still accepts.
+/// `c.toml` has no `[auth].token`, so it fails construction and is the
+/// never-retried leg. Option B — rescan and retry on every signal — would make
+/// all three assertions move; the code comment above the read in
+/// `frps/src/main.rs` states the choice.
+#[cfg(unix)]
+#[test]
+fn a_config_dir_reload_keeps_the_startup_file_set() {
+    let dir = TempDir::new("cfgdir-fileset");
+    let sub = dir.0.join("conf.d");
+    std::fs::create_dir_all(&sub).expect("create config dir");
+    let port_a = free_port();
+    std::fs::write(
+        sub.join("a.toml"),
+        frps_config(port_a, free_port(), Section::Nested),
+    )
+    .expect("write a.toml");
+    std::fs::write(
+        sub.join("b.toml"),
+        frps_config(free_port(), free_port(), Section::Nested),
+    )
+    .expect("write b.toml");
+    // Construction failure: no `[auth].token`. Never becomes a service.
+    std::fs::write(
+        sub.join("c.toml"),
+        format!("bindAddr = \"127.0.0.1\"\nbindPort = {}\n", free_port()),
+    )
+    .expect("write c.toml");
+    let mut spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
+
+    let first = spawned.sigusr1_and_wait_for_reloads(2);
+    assert_eq!(
+        first,
+        2,
+        "only the two files that constructed at startup are in the registry — \
+         c.toml failed construction and is never served\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+
+    std::fs::write(
+        sub.join("d.toml"),
+        frps_config(free_port(), free_port(), Section::Nested),
+    )
+    .expect("write d.toml");
+    let second = spawned.sigusr1_and_wait_for_reloads(2);
+    assert_eq!(
+        second,
+        4,
+        "a file added after startup is never loaded: the reload re-reads the \
+         startup set, not the directory\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+
+    std::fs::remove_file(sub.join("a.toml")).expect("remove a.toml");
+    let third = spawned.sigusr1_and_wait_for_reloads(1);
+    assert_eq!(
+        third,
+        5,
+        "a.toml was removed on disk: its service keeps running but its reload now \
+         fails (no summary), while b.toml still reloads — one more summary only\n\
+         --- stdout ---\n{}",
+        spawned.stdout()
+    );
+    assert!(
+        spawned.streams().contains("No such file or directory"),
+        "the removed file's reload must fail loudly, not silently\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+    assert!(
+        spawned.is_alive(),
+        "the process must keep serving after a file disappears\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+    assert!(
+        TcpStream::connect(("127.0.0.1", port_a)).is_ok(),
+        "the removed file's listener must still be accepting on {port_a}\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+}
+
 /// The reload is an in-process load with the sink already installed, so it gets
 /// its **own** record — one per load, on top of the one the startup emitted. The
 /// loader cannot supply it (it is silent on every path), so the reload site
 /// emits it; without that, the base binary's record (measured +1 in the reload
 /// window) is lost, and `enable` has no field for the reload summary to report.
+#[cfg(unix)]
 #[test]
 fn a_sigusr1_reload_delivers_the_warning_again() {
     let dir = TempDir::new("reload");
@@ -818,6 +1071,7 @@ fn no_server_tls_enable_warning_when_it_was_synthesized_from_transport_tls() {
 
 /// The reload is a second in-process load with the sink already installed, so it
 /// adds its own record: startup 1, reload 2. One per load.
+#[cfg(unix)]
 #[test]
 fn a_sigusr1_reload_delivers_the_server_tls_enable_warning_again() {
     let dir = TempDir::new("srv-reload");

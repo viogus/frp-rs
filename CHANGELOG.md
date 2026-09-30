@@ -434,6 +434,19 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **`frps --config-dir`: a panicking service task is now counted.** A task that panicked was logged and
+  dropped, so a directory in which every task panicked still exited 0 with nothing served. The panic now
+  joins the same all-failed decision as the typed failures, and the lane exits non-zero.
+- **`frps --config-dir`: a directory where every file fails to load now exits with `-c`'s code.** A load
+  failure never becomes a task, so the lane could not see it and answered `2` where `-c` on the same file
+  answers `1`; a mixed load/construction failure now exits with the first file's code in file order.
+- **`frpc --config-dir`: a directory whose service cannot run now exits 1, not 0.** The client lane
+  reported success while nothing was served, and the two `--config-dir` lanes disagreed for the same
+  failure. Go keeps its historical `0`; the divergence is recorded in `docs/developing.md`.
+- **`frps --config-dir`: the `SIGUSR1 reload ready` marker is printed only after every service has
+  registered.** A signal arriving between the marker and a registration reloaded only the registered
+  subset and said nothing about it; the reload now fans out over a registry that is complete when the
+  marker appears.
 - **`frps --config-dir` no longer exits 0 when no service started.** The directory lane pushed each
   task handle before its service was constructed, so the "no services started" guard never fired:
   with **every** config file failing, the process reported success while nothing was served — a

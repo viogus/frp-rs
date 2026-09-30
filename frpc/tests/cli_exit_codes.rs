@@ -581,6 +581,377 @@ fn config_dir_refusals_exit_2_where_go_exits_0() {
 
 // ── the extension codes: 3 (auth) and 4 (the construction fallback) ─────────
 
+/// The client and server lanes must agree on a failed *service*: `frps
+/// --config-dir` exits non-zero when nothing serves, and `frpc --config-dir`
+/// used to exit **0** even when its only service never logged in — the task's
+/// `run()` error was logged and dropped, and the lane then fell off the end of
+/// `main`. The single-config path already exits `EXIT_RUNTIME`/1 on the same
+/// failure, so the lane matches `-c` here without disturbing the
+/// Go-compatible *refusal* codes pinned above (a directory that does not exist,
+/// is empty, or holds a config that fails to load still exits 2).
+#[test]
+fn config_dir_where_every_service_fails_to_run_exits_like_dash_c() {
+    let dir = TempDir::new();
+    // A port nothing listens on: the login fails immediately (the default
+    // `login_fail_exit = true`), so the only service in the directory stops.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let p = l.local_addr().expect("local_addr").port();
+        drop(l);
+        p
+    };
+    let cfg = format!("serverAddr = \"127.0.0.1\"\nserverPort = {closed}\n");
+    let file = dir.write("frpc.toml", &cfg);
+    let conf_d = dir.path("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    std::fs::write(std::path::Path::new(&conf_d).join("frpc.toml"), &cfg)
+        .expect("write conf.d config");
+
+    let control = run_frpc(&["-c", &file]);
+    assert_eq!(
+        control.status.code(),
+        Some(1),
+        "control: `-c` on a service that cannot log in must exit 1 (EXIT_RUNTIME); \
+         stdout={:?} stderr={:?}",
+        stdout_of(&control),
+        stderr_of(&control),
+    );
+
+    let out = run_frpc(&["--config-dir", &conf_d]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a directory whose only service failed to run served nothing and must not \
+         exit 0; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
+/// The client half of the file-order sort pin
+/// (`frps/tests/cli_exit_codes.rs::config_dir_exits_the_first_files_code_when_a_later_file_fails_to_load`).
+/// `frpc/src/main.rs`'s all-failed decision sorts `failures` by file index. This
+/// fixture observes the sort's **removal**, not its key: `a.toml`'s service
+/// stops at **run** time — its task returns `Err(EXIT_RUNTIME)`/1 *after* the
+/// loop — while `b.toml` fails to **load** (`EXIT_CONFIG`/2, recorded in file
+/// order first), so the pre-sort vector is `[(1, 2), (0, 1)]`. Sorted, the
+/// file-order first failure is `a.toml`'s 1; with
+/// `failures.sort_by_key(|(file_index, _)| *file_index)` deleted the lane exits
+/// `b.toml`'s 2 instead. Removing the sort is all this shape can see —
+/// `failures.reverse()` and `sort_by_key(|(_, code)| *code)` both put
+/// `(0, 1)` first here and stay green — which is why the mirror fixture
+/// `config_dir_exits_the_first_files_code_when_a_load_failure_precedes_a_run_failure`
+/// exists below to pin the comparator itself.
+#[test]
+fn config_dir_exits_the_first_files_code_when_a_later_file_fails_to_load() {
+    let dir = TempDir::new();
+    // A port nothing listens on: a.toml's login fails immediately (the default
+    // `loginFailExit = true`), so its task returns `Err(EXIT_RUNTIME)`.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let p = l.local_addr().expect("local_addr").port();
+        drop(l);
+        p
+    };
+    let conf_d = dir.path("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    std::fs::write(
+        std::path::Path::new(&conf_d).join("a.toml"),
+        format!("serverAddr = \"127.0.0.1\"\nserverPort = {closed}\n"),
+    )
+    .expect("write a.toml");
+    // Not valid TOML: rejected in the loader, so this file never becomes a task.
+    std::fs::write(
+        std::path::Path::new(&conf_d).join("b.toml"),
+        "this is not valid toml\n",
+    )
+    .expect("write b.toml");
+
+    let out = run_frpc(&["--config-dir", &conf_d]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the all-failed decision must exit the **file-order first** failure's code \
+         (a.toml's EXIT_RUNTIME/1), not the entry appended last (b.toml's load \
+         failure, 2); stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
+/// The **mirror** of the pin above: together the pair pins the sort *key*, not
+/// just the sort's existence.
+///
+/// The all-failed decision in `frpc/src/main.rs` must exit the
+/// **lowest-file-index** failure's code. Here `a.toml` fails to **load**
+/// (`EXIT_CONFIG`/2, recorded in file order first) and `b.toml` fails at **run**
+/// time (`EXIT_RUNTIME`/1, appended by the handle loop), so the pre-sort vector
+/// `[(0, 2), (1, 1)]` is already in file order — a deleted sort leaves this pin
+/// green (the pin above catches that) while any comparator that reorders by
+/// something other than the file index reds it: `failures.reverse()` puts
+/// `(1, 1)` first → rc 1, and `sort_by_key(|(_, code)| *code)` does the same →
+/// rc 1, where file order requires **2**.
+#[test]
+fn config_dir_exits_the_first_files_code_when_a_load_failure_precedes_a_run_failure() {
+    let dir = TempDir::new();
+    let conf_d = dir.path("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    // Not valid TOML: rejected in the loader, so this file never becomes a task
+    // and its failure is recorded first, in file order, as `(0, EXIT_CONFIG)`.
+    std::fs::write(
+        std::path::Path::new(&conf_d).join("a.toml"),
+        "this is not valid toml\n",
+    )
+    .expect("write a.toml");
+    // A port nothing listens on: b.toml's login fails immediately (the default
+    // `loginFailExit = true`), so its task returns `Err(EXIT_RUNTIME)` and is
+    // appended as `(1, EXIT_RUNTIME)` **after** the loop.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let p = l.local_addr().expect("local_addr").port();
+        drop(l);
+        p
+    };
+    std::fs::write(
+        std::path::Path::new(&conf_d).join("b.toml"),
+        format!("serverAddr = \"127.0.0.1\"\nserverPort = {closed}\n"),
+    )
+    .expect("write b.toml");
+
+    let out = run_frpc(&["--config-dir", &conf_d]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the all-failed decision must exit the **file-order first** failure's code \
+         (a.toml's EXIT_CONFIG/2), not the smallest code or the last inserted entry \
+         (b.toml's EXIT_RUNTIME/1); stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
+/// The **converse** of the pin above, and the shape that makes the all-failed
+/// comparison in `frpc/src/main.rs` load-bearing: one file's service cannot log
+/// in and stops at run time (its task returns `Err(EXIT_RUNTIME)`), the other
+/// keeps retrying because it sets `loginFailExit = false`. One failure is
+/// recorded, but one task is still `Ok(())` — the comparison is
+/// `failures.len() == files.len()`, so the lane must stay up while the survivor
+/// retries and must exit **0** on SIGTERM. Replacing that comparison with
+/// `if true` exits 1 for this directory; the all-failed pin above stays green
+/// under that mutant (its only file fails, so the two arms agree there), which
+/// is why this pin exists.
+#[test]
+fn config_dir_where_one_service_fails_keeps_retrying_and_exits_zero() {
+    let dir = TempDir::new();
+    // A port nothing listens on: login cannot succeed for either file. The
+    // default `loginFailExit = true` makes `b.toml`'s task stop at run time;
+    // `a.toml` disables it, so its task survives in the retry loop.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let p = l.local_addr().expect("local_addr").port();
+        drop(l);
+        p
+    };
+    let conf_d = dir.path("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    std::fs::write(
+        std::path::Path::new(&conf_d).join("a.toml"),
+        format!("serverAddr = \"127.0.0.1\"\nserverPort = {closed}\nloginFailExit = false\n"),
+    )
+    .expect("write a.toml");
+    std::fs::write(
+        std::path::Path::new(&conf_d).join("b.toml"),
+        format!("serverAddr = \"127.0.0.1\"\nserverPort = {closed}\n"),
+    )
+    .expect("write b.toml");
+
+    // `run_frpc` cannot be used here: the surviving service must stay up until
+    // SIGTERM, so the child streams to a log file and this polls it for both
+    // services' markers before signalling.
+    let log_path = dir.path("frpc.log");
+    let log = std::fs::File::create(&log_path).expect("create frpc log");
+    let mut child = Command::new(BIN)
+        .args(["--config-dir", &conf_d])
+        .stdout(std::process::Stdio::from(
+            log.try_clone().expect("clone log"),
+        ))
+        .stderr(std::process::Stdio::from(log))
+        .spawn()
+        .expect("spawn frpc");
+    let read_log = || std::fs::read_to_string(&log_path).expect("read frpc log");
+
+    let deadline = std::time::Instant::now() + EXIT_TIMEOUT;
+    loop {
+        let text = read_log();
+        if text.contains("frpc service error for config file")
+            && text.contains("b.toml")
+            && text.contains("Login failed (attempt 1)")
+        {
+            break;
+        }
+        if let Some(status) = try_wait_or_kill(&mut child, "frpc") {
+            panic!(
+                "frpc --config-dir exited ({status:?}) before b.toml's task failed and \
+                 a.toml retried; log={:?}",
+                read_log(),
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "frpc --config-dir never logged b.toml's run failure plus a retry within \
+             {EXIT_TIMEOUT:?}; log={:?}",
+            read_log(),
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    let deadline = std::time::Instant::now() + EXIT_TIMEOUT;
+    let status = loop {
+        match try_wait_or_kill(&mut child, "frpc") {
+            Some(status) => break status,
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "frpc --config-dir did not exit within {EXIT_TIMEOUT:?} of SIGTERM; \
+                         log={:?}",
+                        read_log(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a directory whose surviving service stopped gracefully on SIGTERM must not \
+         exit the failed file's code; log={:?}",
+        read_log(),
+    );
+    assert!(
+        read_log().contains("Stop requested while waiting to retry login"),
+        "the survivor must have been stopped through the retry-sleep path (`Ok(())`), \
+         which is what keeps it out of the failure count; log={:?}",
+        read_log(),
+    );
+}
+
+/// The same converse pin with the file order **swapped**: `a.toml` is the file
+/// whose service stops at run time (its default `loginFailExit = true`) and
+/// `b.toml` is the survivor (`loginFailExit = false`).
+///
+/// The pin above cannot see a "the *first* file failed" short-circuit — its
+/// failing file is `b.toml`, at index 1 — so appending
+/// `|| failures.iter().any(|(file_index, _)| *file_index == 0)` to the comparison
+/// in `frpc/src/main.rs` survived it. Under that mutant this directory exits
+/// `a.toml`'s code (1) after SIGTERM instead of 0, so the survivor's retry-stop
+/// line and the `Some(0)` exit code are the teeth.
+#[test]
+fn config_dir_where_the_first_service_fails_keeps_retrying_and_exits_zero() {
+    let dir = TempDir::new();
+    // A port nothing listens on: login cannot succeed for either file.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let p = l.local_addr().expect("local_addr").port();
+        drop(l);
+        p
+    };
+    let conf_d = dir.path("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    std::fs::write(
+        std::path::Path::new(&conf_d).join("a.toml"),
+        format!("serverAddr = \"127.0.0.1\"\nserverPort = {closed}\n"),
+    )
+    .expect("write a.toml");
+    std::fs::write(
+        std::path::Path::new(&conf_d).join("b.toml"),
+        format!("serverAddr = \"127.0.0.1\"\nserverPort = {closed}\nloginFailExit = false\n"),
+    )
+    .expect("write b.toml");
+
+    // `run_frpc` cannot be used here: the surviving service must stay up until
+    // SIGTERM, so the child streams to a log file and this polls it for both
+    // services' markers before signalling.
+    let log_path = dir.path("frpc.log");
+    let log = std::fs::File::create(&log_path).expect("create frpc log");
+    let mut child = Command::new(BIN)
+        .args(["--config-dir", &conf_d])
+        .stdout(std::process::Stdio::from(
+            log.try_clone().expect("clone log"),
+        ))
+        .stderr(std::process::Stdio::from(log))
+        .spawn()
+        .expect("spawn frpc");
+    let read_log = || std::fs::read_to_string(&log_path).expect("read frpc log");
+
+    let deadline = std::time::Instant::now() + EXIT_TIMEOUT;
+    loop {
+        let text = read_log();
+        if text.contains("frpc service error for config file")
+            && text.contains("a.toml")
+            && text.contains("Login failed (attempt 1)")
+        {
+            break;
+        }
+        if let Some(status) = try_wait_or_kill(&mut child, "frpc") {
+            panic!(
+                "frpc --config-dir exited ({status:?}) before a.toml's task failed and \
+                 b.toml retried; log={:?}",
+                read_log(),
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "frpc --config-dir never logged a.toml's run failure plus a retry within \
+             {EXIT_TIMEOUT:?}; log={:?}",
+            read_log(),
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    let deadline = std::time::Instant::now() + EXIT_TIMEOUT;
+    let status = loop {
+        match try_wait_or_kill(&mut child, "frpc") {
+            Some(status) => break status,
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "frpc --config-dir did not exit within {EXIT_TIMEOUT:?} of SIGTERM; \
+                         log={:?}",
+                        read_log(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a directory whose surviving service stopped gracefully on SIGTERM must not \
+         exit the first file's code; log={:?}",
+        read_log(),
+    );
+    assert!(
+        read_log().contains("Stop requested while waiting to retry login"),
+        "the survivor must have been stopped through the retry-sleep path (`Ok(())`), \
+         which is what keeps it out of the failure count; log={:?}",
+        read_log(),
+    );
+}
+
 /// `EXIT_AUTH`/3, pinned on the one input where it is a *genuine* divergence
 /// rather than a hardening refusal: a `auth.tokenSource` whose file does not
 /// exist. Go frp v0.71.0 exits **1** here (`failed to resolve auth.tokenSource:
