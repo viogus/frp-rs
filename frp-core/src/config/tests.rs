@@ -3706,6 +3706,62 @@ fn test_collect_config_files_symlink_cycle_terminates() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn test_collect_config_files_admits_a_non_regular_entry_by_extension() {
+    // This pins **admission**, and the fact that it is extension-only: the
+    // collector has no regular-file check, so a FIFO (or any other
+    // non-regular entry) whose name ends in a config extension is collected
+    // like a file. The `is_file()` guards live only in the `[include]`
+    // `simple_glob` path (`frp-core/src/config/file.rs:340`, `:363`), not at
+    // the push site in `collect_config_files_inner`.
+    //
+    // That is deliberately Go-parity, not an oversight: Go frp v0.71.0's
+    // `--config-dir` walk filters directory entries by extension
+    // (`cmd/frpc/sub/root.go`) and then reads each match, so a FIFO named
+    // `b.toml` is admitted by both implementations and the shared loader's
+    // first `std::fs::read_to_string` (`frp-core/src/config/file.rs:303`)
+    // then blocks with no writer. Measured against the real Go binaries
+    // (v0.71.0, darwin/arm64, `/private/tmp/frp_0.71.0_darwin_arm64/frpc`):
+    //   * `frpc --config-dir <fifo-only>` still running after 15 s, 0 log bytes;
+    //   * `frpc --config-dir <a.toml + FIFO>` still running after 4 s, after
+    //     already logging the valid file's `connect to server error`.
+    //
+    // Consequence for anyone tempted to "fix" this here: adding
+    // `if !path.is_file() { continue; }` at the push site is an intentional
+    // divergence from Go (it turns the FIFO-only directory into the existing
+    // empty-directory rc 2 path, and the mixed directory into a
+    // serve-the-valid-file path), so it must red **this** test and be argued
+    // against a fresh Go probe rather than land silently. A bounded read in
+    // the loader is the other option the residue names; this test only pins
+    // collection, where no read happens.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.toml"), "").unwrap();
+    let fifo = dir.path().join("b.toml");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo must be runnable to build this fixture");
+    assert!(status.success(), "mkfifo {fifo:?} failed: {status:?}");
+
+    // `collect_config_files` must *return* here: it only stats entries, so a
+    // non-regular entry can never block collection itself.
+    let files = super::collect_config_files(dir.path()).unwrap();
+    let names: Vec<String> = files
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.contains(&"a.toml".to_string()),
+        "regular config file missing from collection: {names:?}"
+    );
+    assert!(
+        names.contains(&"b.toml".to_string()),
+        "a non-regular entry with a config extension must be admitted \
+         (extension-only admission, Go parity); got {names:?}"
+    );
+}
+
 // ─── JSON config support (Go frp Viper parity) ───────────────────────
 
 /// Parse a JSON client config through the full pipeline (JSON → toml::Value

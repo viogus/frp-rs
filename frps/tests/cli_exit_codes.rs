@@ -35,7 +35,7 @@
 #![cfg(feature = "full")]
 
 use std::path::PathBuf;
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command, ExitStatus, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -602,6 +602,23 @@ fn oidc_without_an_issuer_is_refused_with_3_where_go_panics() {
 /// retrying it away, and why a future CI flake here should be diagnosed as this
 /// window before anything else.
 ///
+/// **That window is now closed for `--config-dir` — and only there**
+/// (`TODO.md:7946`). main installs its own `SIGTERM`/`SIGINT` recorder
+/// (`EarlyShutdown` in `frps/src/main.rs`) *before* the startup line, and each
+/// per-file task hands its `AppState` to that recorder when it registers, so a
+/// `SIGTERM` that lands in this window is recorded and the service's shutdown
+/// token is cancelled instead of the process dying by signal. `-c` is
+/// deliberately unchanged and still carries the window: its single service has
+/// no registration hook a test could drive, so owning the handler *there*
+/// without a pinned handoff could only turn the signal death into a lost
+/// `SIGTERM`, which is worse. The window path for `--config-dir` has its own
+/// deterministic pin (below rather than spread over this helper):
+/// `config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorded_request`.
+///
+/// The marker stays the readiness barrier for the tests using this helper — for
+/// `--config-dir` it is no longer the *only* thing standing between a connect
+/// and a signal death.
+///
 /// Output goes to a file, not a pipe: a child whose piped stdout nobody reads
 /// can block on a full pipe.
 fn start_listening_then_sigterm(args: &[&str], port: u16, dir: &TempDir) -> String {
@@ -963,6 +980,301 @@ fn config_dir_where_the_first_service_fails_keeps_serving_and_exits_zero() {
          would pass with no failure for the directory to survive; log={log:?}",
     );
     drop(holder);
+}
+
+/// The startup line main logs **after** installing its `SIGTERM`/`SIGINT`
+/// recorder and **before** spawning any per-file task (`frps/src/main.rs`), so it
+/// is a hard lower bound for "the main task owns the signal" — the opposite
+/// bound from [`SIGNAL_READY_MARKER`], which needs a *registered* service.
+const STARTUP_LINE_FRAGMENT: &str = "starting 1 services from config directory";
+
+/// Spawn `frps --config-dir` with the debug-only registration hold
+/// (`FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS`) set far longer than this helper's
+/// own timeout, wait only for the **startup line**, then SIGTERM and return the
+/// exit status with the log.
+///
+/// [`start_listening_then_sigterm`] cannot drive this pin: it waits for
+/// [`SIGNAL_READY_MARKER`], which the SIGUSR1 task logs only *after* the
+/// registration barrier opens — i.e. after the very window this pin needs to
+/// signal in. With the hold set, that marker arrives only once the hold is
+/// released, so waiting for it would defeat the pin.
+///
+/// The hold is deliberately longer than `EXIT_TIMEOUT`: if the recorder's early
+/// wake regresses, the child must fail this pin (by not exiting in time) instead
+/// of quietly sleeping out the hold, registering afterwards, and shutting down
+/// gracefully for the wrong reason.
+#[cfg(unix)]
+fn sigterm_inside_the_registration_window(
+    args: &[&str],
+    dir: &TempDir,
+    hold_ms: u64,
+) -> (ExitStatus, String) {
+    let log_path = dir.path("frps-window.log");
+    let log = std::fs::File::create(&log_path).expect("create log");
+    let mut child: Child = Command::new(bin())
+        .args(args)
+        .env(
+            "FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS",
+            hold_ms.to_string(),
+        )
+        .stdout(std::process::Stdio::from(
+            log.try_clone().expect("clone log"),
+        ))
+        .stderr(std::process::Stdio::from(log))
+        .spawn()
+        .expect("spawn frps");
+    let read_log = || std::fs::read_to_string(&log_path).expect("read frps diagnostic log");
+
+    let ready_deadline = Instant::now() + EXIT_TIMEOUT;
+    loop {
+        if read_log().contains(STARTUP_LINE_FRAGMENT) {
+            break;
+        }
+        if let Some(status) = try_wait_or_kill(&mut child, "frps") {
+            panic!(
+                "frps {args:?} exited ({status:?}) before logging its startup line; log={:?}",
+                read_log()
+            );
+        }
+        if Instant::now() >= ready_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "frps {args:?} never logged its startup line within {EXIT_TIMEOUT:?}; log={:?}",
+                read_log()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+
+    let started = Instant::now();
+    let deadline = started + EXIT_TIMEOUT;
+    loop {
+        match try_wait_or_kill(&mut child, "frps") {
+            Some(status) => return (status, read_log()),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "frps {args:?} did not exit within {EXIT_TIMEOUT:?} of a SIGTERM sent inside \
+                     the pre-registration window (the hold is longer than this timeout, so it \
+                     should have been ended by the recorded signal); log={:?}",
+                    read_log()
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}
+
+/// `TODO.md:7946`, the window driven **deterministically** instead of raced: the
+/// debug-only `FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS` parks the per-file task
+/// *before* it registers — therefore before `Service::run` installs its own
+/// `SIGTERM` handler — and the hold is far longer than this pin's timeout, so
+/// only the main task's recorder can end it.
+///
+/// Both assertions are causal:
+///
+/// 1. the child exits **0**. Before this fix, tokio's per-kind registration left
+///    `SIGTERM` on the kernel's default disposition in this window and the child
+///    died by signal (`code() == None`, shell rc 143); a lost signal would take
+///    the same shape.
+/// 2. the log carries `shutdown signal was recorded before this service installed
+///    its own handler`, which the handoff can only print when it finds the signal
+///    *already recorded* — so the exit came from the recorded request, not from a
+///    race that happened to be won in the other order.
+///
+/// Assertion 1 alone would pass on any path that happened to drain gracefully;
+/// assertion 2 is what proves *which* path did it. Falsification: remove the
+/// recorder (no `EarlyShutdown::install()`, or no `early_shutdown.watch(...)`
+/// handoff) and the child dies by signal inside the hold, failing both.
+#[cfg(unix)]
+#[test]
+fn config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorded_request() {
+    let dir = TempDir::new();
+    let conf_d = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    let port = ephemeral_port();
+    std::fs::write(
+        conf_d.join("a.toml"),
+        format!("bindAddr = \"127.0.0.1\"\nbindPort = {port}\n[auth]\ntoken = \"cli-exit-test\"\n"),
+    )
+    .expect("write a.toml");
+
+    // 30 s: longer than `EXIT_TIMEOUT`, so the hold cannot end on its own.
+    let (status, log) = sigterm_inside_the_registration_window(
+        &["--config-dir", conf_d.to_str().expect("utf-8 temp path")],
+        &dir,
+        30_000,
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a SIGTERM recorded before the service registered must still drain to a clean 0 \
+         (without the main-task recorder the child dies by signal here, so code() would be \
+         None); status={status:?} log={log:?}",
+    );
+    assert!(
+        log.contains("shutdown signal was recorded before this service installed its own handler"),
+        "the exit must come from the **recorded** signal path: this line is emitted only when \
+         the service's registration handoff finds the signal already recorded; log={log:?}",
+    );
+    assert!(
+        log.contains("Accept loop stopped for graceful shutdown"),
+        "the recorded signal must reach the service through the same graceful arm a \
+         post-registration SIGTERM uses; log={log:?}",
+    );
+}
+
+/// `TODO.md:7933`, **recorded** rather than fixed: the collector admits a
+/// directory entry by lowercased extension with no regular-file check
+/// (`frp-core/src/config/file.rs:414`/`:432`; the `is_file()` guards live only in
+/// the include-path `simple_glob` at `:340`/`:363`), and the loader then does a
+/// blocking `std::fs::read_to_string` (`:303`). A FIFO named `*.toml` therefore
+/// wedges the lane instead of being refused: the startup line is logged and the
+/// per-file loop never gets past the read, so no service is ever constructed.
+///
+/// Go frp v0.71.0 is bounded the same way, measured on the real binaries
+/// (`/private/tmp/frp_0.71.0_darwin_arm64/`): `frpc --config-dir` on a FIFO-only
+/// directory was still running after 15 s with 0 bytes of log, and on FIFO +
+/// valid file likewise; Go's `frps` has no `--config-dir` at all
+/// (`Error: unknown flag: --config-dir`, rc 1, measured). The admission rule
+/// itself is pinned in `frp-core`
+/// (`test_collect_config_files_admits_a_non_regular_entry_by_extension`, where
+/// an `if !path.is_file() { continue; }` guard reds it); this pin records the
+/// process-level consequence and the one way out.
+///
+/// Measured before/after the main task owns the recorder (`EarlyShutdown`):
+///
+/// | `frps --config-dir` on a FIFO-only directory | 1st SIGTERM | 2nd SIGTERM |
+/// | --- | --- | --- |
+/// | HEAD binary (no main-task recorder) | died, rc 143 | — |
+/// | this tree | alive (recorded, no service to stop) | exit 143 |
+///
+/// Both halves are load-bearing. Without the recorder the first signal kills the
+/// child (so "still alive after the first SIGTERM" reds), and without the
+/// repeat-request escalation the second one is swallowed too (so the pin times
+/// out), which would leave a FIFO-wedged lane unkillable by `SIGTERM` at all.
+#[cfg(unix)]
+#[test]
+fn config_dir_fifo_entry_wedges_the_lane_and_a_repeat_signal_ends_it() {
+    let dir = TempDir::new();
+    let conf_d = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    let fifo = conf_d.join("a.toml");
+    let mkfifo = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(mkfifo.success(), "mkfifo {fifo:?} failed: {mkfifo:?}");
+
+    let log_path = dir.path("frps-fifo.log");
+    let log = std::fs::File::create(&log_path).expect("create log");
+    let mut child = Command::new(bin())
+        .args(["--config-dir", conf_d.to_str().expect("utf-8 temp path")])
+        .stdout(std::process::Stdio::from(
+            log.try_clone().expect("clone log"),
+        ))
+        .stderr(std::process::Stdio::from(log))
+        .spawn()
+        .expect("spawn frps");
+    let read_log = || std::fs::read_to_string(&log_path).expect("read frps diagnostic log");
+
+    // The startup line proves the directory was *collected* (so the FIFO was
+    // admitted, not refused) and the loop then blocked on the read.
+    let ready_deadline = Instant::now() + EXIT_TIMEOUT;
+    loop {
+        if read_log().contains(STARTUP_LINE_FRAGMENT) {
+            break;
+        }
+        if let Some(status) = try_wait_or_kill(&mut child, "frps") {
+            panic!(
+                "frps exited ({status:?}) instead of wedging on the FIFO; log={:?}",
+                read_log()
+            );
+        }
+        if Instant::now() >= ready_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "frps never logged its startup line within {EXIT_TIMEOUT:?}; log={:?}",
+                read_log()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    std::thread::sleep(Duration::from_secs(1));
+    match child.try_wait() {
+        Ok(None) => {}
+        other => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the read on the FIFO is unbounded, so the lane must still be running a second \
+                 after its startup line (Go's `frpc` matches); try_wait={other:?} log={:?}",
+                read_log()
+            );
+        }
+    }
+
+    // 1st SIGTERM: the main task records it, but no service exists to cancel —
+    // and the fix must not turn "dies on SIGTERM" into "signal lost".
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    std::thread::sleep(Duration::from_millis(1500));
+    match child.try_wait() {
+        Ok(None) => {}
+        other => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "one recorded SIGTERM with nothing registered to stop cannot end this lane \
+                 (HEAD died 143 here, and Go's client dies of the signal); try_wait={other:?} \
+                 log={:?}",
+                read_log()
+            );
+        }
+    }
+
+    // 2nd SIGTERM: nothing to cancel, so the recorder forces the exit — the lane
+    // stays reversible without SIGKILL.
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    let deadline = Instant::now() + EXIT_TIMEOUT;
+    let status = loop {
+        if let Some(status) = try_wait_or_kill(&mut child, "frps") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "a repeat SIGTERM with no registered service must force an exit within \
+                 {EXIT_TIMEOUT:?}, otherwise a FIFO wedges the lane unkillably; log={:?}",
+                read_log()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(
+        status.code(),
+        Some(143),
+        "the forced exit must report SIGTERM's 128 + 15 (not a graceful 0, which would claim a \
+         service drained); status={status:?} log={:?}",
+        read_log()
+    );
+    assert!(
+        read_log().contains("requested again with no service registered to stop it"),
+        "the forced exit must be diagnosed in the log; log={:?}",
+        read_log()
+    );
 }
 
 /// A file that fails to **load** never becomes a task, so it could not reach

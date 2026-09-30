@@ -448,6 +448,21 @@ async fn run_normal(mut args: FrpcRunArgs) {
         // one signal, so the handler cannot rely on re-firing — and the flag
         // is re-checked at registration time to stop a just-registered
         // service immediately.
+        //
+        // This is deliberately **not** Go's client contract, and the two
+        // `frpc --config-dir` SIGTERM pins in `frpc/tests/cli_exit_codes.rs`
+        // (`config_dir_where_one_service_fails_keeps_retrying_and_exits_zero`
+        // and `..._the_first_service_fails_...`) assert ours rather than Go's.
+        // Go frp v0.71.0 installs its graceful shutdown handler for `kcp`/`quic`
+        // only (`cmd/frpc/sub/root.go:207-210` skips the SIGTERM/SIGINT
+        // goroutine for the default tcp listener), so a plain tcp client dies
+        // by signal — measured on the real binary (v0.71.0, darwin/arm64,
+        // `/private/tmp/frp_0.71.0_darwin_arm64/frpc`): `frpc --config-dir
+        // <plain tcp>` + SIGTERM → rc 143 with `ExitStatus::code() == None`,
+        // and the same config through `-c` → rc 143 as well. frp-rs installs
+        // SIGTERM handling for every service, so both lanes drain and exit
+        // `Some(0)`; that difference is the record, and the pins assert the
+        // frp-rs number. Do not "fix" the pins to Go's signal death.
         #[cfg(unix)]
         static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
