@@ -5171,7 +5171,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   refuse row (`frps/tests/cli_exit_codes.rs:297:5`, `frpc/tests/cli_exit_codes.rs:406:5`),
   widening the predicate to `unsafe_features.is_empty()` reds the fail-closed row
   (`frps/tests/cli_exit_codes.rs:340:5`, `frpc/tests/cli_exit_codes.rs:451:5`), and deleting
-  the `auth.oidc_token_source` arm reds `frp-core/src/config/tests.rs:10428:14`.
+  the `auth.oidc_token_source` arm reds `frp-core/src/config/tests.rs:10429:14` (the
+  `.expect_err` line; the round-1 review measured this head).
 - [x] **`frpc verify`'s success line is not Go's, and now differs from `frps verify`'s too.**
   Recorded as "a second, adjacent divergence left alone" by the output-shape round
   (`docs/developing.md` § Output stream and shape on a config-load failure) and mentioned in

@@ -488,7 +488,7 @@ User-facing release notes for frp-rs.
   `verify_runs_the_post_load_allow_unsafe_gate_like_go` in
   `frps/tests/cli_exit_codes.rs` and `frpc/tests/cli_exit_codes.rs`, and by
   `check_client_unsafe_features_gates_both_token_source_spellings` in
-  `frp-core/src/config/tests.rs`; closes TODO.md:5086.
+  `frp-core/src/config/tests.rs`; closes TODO.md:5124.
 - **The `web_server.tls.enable` warning is now build-aware: in a build with no
   dashboard it no longer claims the dashboard serves plaintext HTTP.** The key is
   read behind `frp-server`'s `dashboard` feature (and `frpc`'s `admin`), but the
