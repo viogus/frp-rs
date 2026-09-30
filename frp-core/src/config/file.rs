@@ -166,8 +166,16 @@ pub fn check_server_unsafe_features(
 
 /// The client half of [`check_server_unsafe_features`]: the same predicate over
 /// the two token sources a client config can carry — `auth.tokenSource` and
-/// `auth.oidc.tokenSource` — which is exactly the pair the client daemon gates
-/// at construction (`frp-client/src/service.rs`).
+/// `auth.oidc.tokenSource`. It is the same field *set* the client daemon gates
+/// at construction (`frp-client/src/service.rs`), but not under the same
+/// *condition*: this gate is fail-closed, refusing either spelling on `verify`
+/// regardless of `auth_method`, while the daemon gates `auth.tokenSource`
+/// unconditionally and `auth.oidc_token_source` only inside its
+/// `auth_method == AuthMethod::Oidc` branch (`frp-client/src/service.rs:988-991`;
+/// measured: with `method = "token"` plus an exec `auth.oidc.tokenSource`,
+/// `frpc -c` starts and logs its connection attempts, while `frpc verify` and
+/// Go's `frpc -c`/`frpc verify` all exit 1 — the daemon side is the looser of
+/// the two, not the parity claim below).
 ///
 /// Go's client validation gates **both** spellings. `auth.tokenSource` is gated
 /// by `pkg/config/v1/validation/auth.go` (measured: `frpc verify -c <exec cfg>`
@@ -176,11 +184,13 @@ pub fn check_server_unsafe_features(
 /// (`pkg/config/v1/validation/client.go`) — measured on the same binary, a
 /// config carrying `[auth.oidc.tokenSource] type = "exec"` prints
 /// `unsafe feature "TokenSourceExec" is not enabled. …` and that line
-/// disappears once `--allow-unsafe TokenSourceExec` is passed (Go's remaining
-/// rc 1 there is its own "cannot specify both auth.oidc.tokenSource and any
-/// other field of auth.oidc" rule, not the gate). The two-field set here is
-/// therefore exact Go parity, not a frp-rs extension, and it is also the pair
-/// the client daemon gates at construction (`frp-client/src/service.rs`).
+/// disappears once `--allow-unsafe TokenSourceExec` is passed — a config that
+/// also sets other `[auth.oidc]` fields keeps Go's own "cannot specify both
+/// auth.oidc.tokenSource and any other field of auth.oidc" rc 1, which is not
+/// the gate). The two-field *set* gated here is therefore exact Go parity, not a
+/// frp-rs extension; the *condition* is this loader's own (fail-closed on
+/// `verify` regardless of `auth_method`), not the daemon's, which skips
+/// `auth.oidc_token_source` unless `auth_method == AuthMethod::Oidc`.
 pub fn check_client_unsafe_features(
     cfg: &ClientConfig,
     unsafe_features: &UnsafeFeatures,
