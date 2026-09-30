@@ -7900,8 +7900,9 @@ section; ledger now **24 open / 104 closed**.**
   hand-rolled `read_csv_record` (`:2678`), `normalize_csv_input` (`:2799`) and `csv_error` (`:2864`),
   so quotes are CSV syntax, `""` escapes a quote, leading spaces/tabs are significant, repeated flags
   append, and the ignored-flag twin parses the same record instead of one opaque value. Every row of
-  this item's table reproduces against Go v0.71.0: the round-1 verification matched a 3209-value
-  corpus 3209/3209, and the round-2 adversarial review matched 5455 values (corpus + targeted
+  this item's table reproduces against Go v0.71.0: the round-1 adversarial review's 3209-value corpus
+  carried 1353 mismatches at the base `55fff6e5` and matched 3209/3209 after the fix, and the widened
+  round-2 adversarial corpus matched 5455 values (corpus + targeted
   multibyte/multiline/CRLF/NUL/70 kB + long lines) with 0 text/byte-column/line divergences plus a
   165-row CLI differential over `frpc verify` / `frps verify` / plain `-c` with 0 rc and 0 reason
   divergences. Two base-side divergences closed on the way: `--allow-unsafe="TokenSourceExec"` and a
@@ -7919,9 +7920,12 @@ section; ledger now **24 open / 104 closed**.**
   `allow_unsafe_csv_corners_are_go_shaped_and_never_trimmed` (`:5736`),
   `allow_unsafe_skips_blank_lines_like_go_and_blank_only_is_an_eof_flag_error` (`:5815`) and
   `allow_unsafe_error_positions_are_go_lines_and_byte_columns` (`:5886`). Mutants killed: the author's
-  M1o/M1e (cap 32 at either accumulation site), M2 (`""` escape dropped), M3 (the twin loses the
-  reader) and M-col/M-line/M-rune/M-skip/M-EOF (each reds a round-2 pin); the reviewers killed four
-  more of their own in round 1 and three in round 2. Reviews: round-1 verification
+  round-1 M1–M6 and round-2 N1–N11 ("the occurrence list is unbounded — a cap of at most 40
+  occurrences drops the trailing enabling value" among them), and the reviewers' own batteries (the
+  round-1 M1o/M1e/M2/M3 set, the round-2 M-col/M-line/M-rune/M-skip/M-EOF set that killed the
+  round-1 `M-col` survivor, and the three from the round-2 verification) — matrices in
+  `/private/tmp/rev429-verify.md` and `/private/tmp/rev429r2-attack.md`, every restore
+  sha256-verified. Reviews: round-1 verification
   MERGE-with-findings (F1–F5 fixed here, F6 a body nit), round-2 adversarial CONFIRM at `7d806af8`
   (F1–F3 closed), round-2 verification MERGE-with-findings (F7 the rc cells → fixed in `67f67e1b`,
   F8 body staleness → fixed in the PR), and a round-3 comment-delta verification MERGE on
@@ -7939,10 +7943,11 @@ section; ledger now **24 open / 104 closed**.**
   leaves the whole `frp-core` lib suite green (`997 passed; 0 failed`) and both spawn rows use at
   most four occurrences, so any cap ≥ 5 is invisible to them; loosening that one assertion to
   `>= wide_n - 1` also passes everything.
-  (c) `FRPS_CLI_TESTS` / `FRPC_TINY_CLI_TESTS` (`.github/workflows/ci.yml:194` / `:216`) compare the
-  file's test count to the literal for equality, so deleting a test and lowering the literal
-  together passes (measured 33/33/33), and the full `frpc` lane (`.github/workflows/ci.yml:312`,
-  18 tests) has no count guard at all.
+  (c) `FRPS_CLI_TESTS` / `FRPC_TINY_CLI_TESTS` (`.github/workflows/ci.yml:243` / `:315`, both in the
+  `tests-unit` job) compare the file's test count to the literal for equality
+  (`[ "$n" = "$FRPS_CLI_TESTS" ]`, `:567`), so deleting a test and lowering the literal together
+  passes by construction, and the full `frpc` lane — the step at `.github/workflows/ci.yml:443`
+  running `cargo test -p frpc` at `:494` — has no count guard at all.
   Done-when: a pin repeats one identical value and asserts both copies survive; the unbounded class
   is pinned past any plausible cap (or the assertion states the bound it really enforces); and each
   lane literal gets an absolute floor (or the full `frpc` lane gets a count guard), with the
@@ -7964,9 +7969,11 @@ section; ledger now **24 open / 104 closed**.**
 - [ ] **The CLI-lane count guards in `.github/workflows/ci.yml` compare for equality, so a deleted test plus a lowered literal passes; the full `frpc` lane has no count guard at all.**
   Filed by the coordinator when closing the `--allow-unsafe` accumulation item (its clause (c)).
   `FRPS_CLI_TESTS` (`.github/workflows/ci.yml:243`) and `FRPC_TINY_CLI_TESTS` (`:315`) hold the lane's
-  expected test count and are compared for **equality** (`[ "$n" = "$FRPS_CLI_TESTS" ]`, `:567`), so
-  deleting a test and lowering the literal together passes — measured 33/33/33 in the round-3
-  adversarial review of the gate fix — and the full `frpc` lane (`:312`) has no count guard at all.
+  expected test count and are compared for **equality** (`[ "$n" = "$FRPS_CLI_TESTS" ]`, `:567`) in
+  the `tests-unit` job (`.github/workflows/ci.yml:136`), so deleting a test and lowering the literal
+  together passes by construction — the guard checks self-consistency only, never an absolute floor —
+  and the full `frpc` lane (the step at `:443`, `run: cargo test -p frpc` at `:494`) has no count
+  guard at all.
   **Done-when:** every guarded lane asserts an absolute **floor** (or keeps the exact count alongside
   a floor) so a removal fails without a deliberate records bump, and the full `frpc` lane gets a
   guard; the delete-plus-lower mutant must red. Note for whoever takes it: this edits the same
