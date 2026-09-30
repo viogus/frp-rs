@@ -28,7 +28,13 @@ GO_FRPC="$GO_FRP_DIR/frpc"
 RUST_FRPS="$PROJECT_DIR/target/release/frps"
 RUST_FRPC="$PROJECT_DIR/target/release/frpc"
 CERT_DIR="$PROJECT_DIR/frp-core/tests/certs"
-TEST_DIR="/tmp/frp-compat-test"
+# Per-run scratch directory. Overridable with FRP_COMPAT_TEST_DIR so that two
+# runs — a sibling worktree's, or a local run beside a CI job — do not share it:
+# the stray guard scopes itself to `$TEST_DIR/` and would otherwise count and
+# reap the other run's servers (see scripts/lib/compat-stray-guard.sh). An empty
+# or `/` override is refused outright there. The default is kept so existing
+# `--keep-tmp` debugging recipes still find the logs.
+TEST_DIR="${FRP_COMPAT_TEST_DIR:-/tmp/frp-compat-test}"
 
 # --- State ---
 PASS=0
@@ -82,6 +88,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --xtcp-only       Run only XTCP tests (skip all other phases)"
             echo "  --shard INDEX/TOTAL  Shard XTCP tests across N jobs (e.g. 0/4)"
             echo "  --go-version VER  Go frp version (default: 0.71.0)"
+            echo ""
+            echo "Env: FRP_COMPAT_TEST_DIR  Scratch dir (default: /tmp/frp-compat-test)."
+            echo "     Set it per run so concurrent compat runs never share a scratch dir."
             exit 0
             ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
@@ -115,8 +124,18 @@ track_pid() {
 
 # Run Go binary with proxy env vars cleared
 # Surge/system proxies intercept localhost TCP otherwise.
+#
+# `exec` is load-bearing. Callers run `run_go ... &` and then `track_pid $!`.
+# Without `exec`, bash forks a subshell for the function, so `$!` is that
+# subshell (a `bash` process) and the Go binary is its child. Killing the
+# tracked pid then kills only the wrapper and reparents the server to init,
+# where it keeps its listeners bound — measured: one green run left 83 such
+# orphans (33 frps, 50 frpc), all with `PPID 1`. With `exec` the subshell
+# *becomes* the binary, so the tracked pid is the server itself. Every call
+# site is backgrounded (90/90); a foreground call would replace this shell,
+# so keep it backgrounded.
 run_go() {
-    env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+    exec env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
         -u http_proxy -u https_proxy -u all_proxy \
         "$@"
 }
@@ -143,39 +162,29 @@ ensure_go_frp_v2() {
 }
 
 cleanup() {
-    for pid in $PIDS; do
-        kill "$pid" 2>/dev/null || true
-    done
+    local rc=$?
+    # Reap tracked pids through the bounded wait + SIGKILL path. The trap used
+    # to send a single bare SIGTERM and exit, so a server that had not been
+    # recorded — or whose recorded pid was only a wrapper subshell — survived.
+    cleanup_pids
+    # A run may not leave a server behind: this names, reaps and fails on every
+    # scenario process this run started (see `assert_no_strays`).
+    if ! assert_no_strays; then
+        rc=1
+    fi
     if ! $KEEP_TMP; then
         rm -rf "$TEST_DIR"
     fi
+    exit "$rc"
 }
 
-# Kill all tracked PIDs without removing test dir.
-# Resets PIDS so subsequent tests start fresh.
-cleanup_pids() {
-    for pid in $PIDS; do
-        kill "$pid" 2>/dev/null || true
-    done
-    # Bounded grace period after SIGTERM (graceful drain), then force-kill.
-    # Without this, a process whose SIGTERM handler stalls makes the bare
-    # `wait` hang the whole compat run (observed on CI: 25m job timeout with
-    # 60+ orphaned frps/frpc processes after the socks5 scenario).
-    local deadline=$((SECONDS + 10))
-    while (( SECONDS < deadline )); do
-        local alive=""
-        for pid in $PIDS; do
-            kill -0 "$pid" 2>/dev/null && alive="$alive $pid"
-        done
-        [[ -z "$alive" ]] && break
-        sleep 0.2
-    done
-    for pid in $PIDS; do
-        kill -9 "$pid" 2>/dev/null || true
-    done
-    wait 2>/dev/null || true
-    PIDS=""
-}
+# Tracked-pid reaping and the stray guard live in a unit of their own so that
+# the fixture test `scripts/tests/compat-stray-guard.sh` can drive them against
+# synthetic servers; `cleanup()` above calls both. The contract, the measured
+# pre-guard leak, and the hard-failure rules are documented there.
+# shellcheck source=scripts/lib/compat-stray-guard.sh
+source "$SCRIPT_DIR/lib/compat-stray-guard.sh"
+
 trap cleanup EXIT
 
 random_port() {

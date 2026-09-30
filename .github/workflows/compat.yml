@@ -62,8 +62,6 @@ jobs:
         run: bash scripts/download-go-frp.sh "$GO_FRP_VERSION"
 
       - name: Run compat tests
-        env:
-          GO_FRP_V2: "1"
         run: bash scripts/compat-test.sh --ci --go-version "$GO_FRP_VERSION"
 
       - name: Protocol connectivity matrix

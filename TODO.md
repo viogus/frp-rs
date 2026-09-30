@@ -4208,7 +4208,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   pattern. No `CHANGELOG.md` entry: test-harness only.
   `scripts/compat-test.sh` is not relevant (no wire surface). Full evidence, including the orphan
   table and a "least sure" section: `/tmp/reload-guards-report.md`.
-- [ ] **`scripts/compat-test.sh` leaks its children: a full run left 83 reparented Go processes, and
+- [x] **`scripts/compat-test.sh` leaks its children: a full run left 83 reparented Go processes, and
   the first reviewer measured 167 in one run.**
   This is the same class as the two items above (`TODO.md`'s "Two test-harness hazards" and the
   `reload_integration.rs` orphan item) but in `scripts/`, **outside the test harnesses those items
@@ -4222,7 +4222,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   reviewer's full run left **167** reparented Go processes, reaped the same way. A third piece of
   evidence, from CI rather than a local run: **#397's** failed Cross-Compat run had the runner
   terminate **two dozen** orphans.
-  The script's own cleanup is `cleanup()`/`cleanup_pids()` (`scripts/compat-test.sh:145-176`), a
+  The script's own cleanup is `cleanup()` (`scripts/compat-test.sh:164`) and `cleanup_pids()` (`scripts/lib/compat-stray-guard.sh:57`), a
   `kill` over a `PIDS` list plus a bounded wait and `kill -9`; the leak is the paths that do not
   reach it — a `run_go` background child that has already been reparented when the trap runs, or a
   scenario that aborts between spawn and `track_pid`.
@@ -4231,13 +4231,49 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   over the scenario's own children) rather than by hand, pinned by a check that counts strays after
   a full run and fails when the count is non-zero. Do **not** close it with `pkill -x frps`: the
   repository's stray rules forbid name-only kills.
-- [ ] **`frps/tests/log_completion.rs` is a load-dependent flake: the child never writes its log
+  **Done (2026-09-30, at `10a86d3a` on `fix/test-harness-strays`, based on `971e0fa0`).** One
+  commit, `10a86d3a` "fix(compat): exec the Go servers so tracked pids are the servers". (a) Root
+  cause, seen in vivo: `run_go()` (`scripts/compat-test.sh:137`) is a shell function, so each
+  backgrounded `run_go … &` call forked a **subshell**; `track_pid $!` recorded that wrapper
+  (`bash`) and `cleanup_pids` killed only it, leaving the real Go servers reparented — the
+  before-census's Go children carried wrapper pids as `PPID` (17046/17091/17230, sampled while
+  the run was still alive; once the wrappers exit and the script is gone the orphans reparent
+  to `PPID 1`, which is the census the item above records) while the Rust
+  children's `PPID` was the main script. Fixed by `exec`ing inside `run_go`
+  (`scripts/compat-test.sh:137-141`), with the invariant stated in the comment above it (`:135-136`):
+  all 90 call sites were audited and every one is backgrounded, so `exec` cannot replace the script
+  shell. (b) The done-when asked for the script's own means and forbade name-only kills: the new
+  pkill-free `scenario_strays` (`scripts/lib/compat-stray-guard.sh:90`) + `assert_no_strays` (`:150`) match a process name **and**
+  the run's own `$TEST_DIR/` prefix, subtract a baseline captured at `:143`, print `pid ppid command`
+  for each survivor, reap by those exact pids and return non-zero; the `EXIT` trap (`scripts/compat-test.sh:188`) runs
+  `cleanup_pids` and lets the guard set the status. (c) Measured with
+  `bash scripts/compat-test.sh --ci` (the `GO_FRP_V2=1` this recipe first carried was
+  **inert** — V2 is gated by `ensure_go_frp_v2` on the Go binaries being present,
+  `scripts/compat-test.sh:149-161`, and the workflow no longer sets it): **before** (pristine
+  `971e0fa0`) `86 passed,
+  0 failed`, rc 0, 3 m 23 s, and then `pgrep -x frps` = **33** / `pgrep -x frpc` = **50** (**83**
+  strays, every one `PPID 1`, every one `/tmp/frp_0.71.0_darwin_arm64/{frps,frpc} -c
+  /tmp/frp-compat-test/<scenario>/…`); **after** `86 passed, 0 failed`, rc 0, 3 m 30 s,
+  `frps` = **0** / `frpc` = **0**, zero guard errors in the log. (d) Teeth: deleting the single
+  `exec` makes `--test go-to-rust-tcp-plain` exit 1 and report
+  `  30478     1 /tmp/frp_0.71.0_darwin_arm64/frpc -c /tmp/frp-compat-test/go-to-rust-tcp-plain/frpc.toml`;
+  with `exec` the same filter exits 0. (e) Gates: `bash -n scripts/compat-test.sh` ok; the
+  `-- --list` inventory is still **86**, so the "86 scenarios" figures at `docs/architecture.md:186`
+  and `docs/developing.md:688` stay true; `cargo fmt --all -- --check` rc 0,
+  `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --all-features` rc 0,
+  `bash scripts/repo-health.sh` → `RESULT: invariants hold`. No `CHANGELOG.md` entry: developer
+  script only, matching the #415/#416 repo-health precedent — the suite's scenario count, wire
+  surface and CLI are unchanged. Residue filed, not fixed: the XTCP helper's pre-existing
+  `pkill -f "frpc -c"` / `pkill -f "frps -c"` (`scripts/compat-test.sh:4343-4344`, inside
+  `run_xtcp_test` at `:4331`) — pattern kills of the class this item forbade for its own children.
+- [x] **`frps/tests/log_completion.rs` is a load-dependent flake: the child never writes its log
   file inside the readiness window.**
   Found by the first reviewer on this branch (the file is **outside** that change's diff, and it
   landed in **#396**, the `log_completion` step): **2 of 7** runs failed, panicking at
   `frps/tests/log_completion.rs:502` — the first arms of
   `max_days_zero_is_completed_to_three_on_the_cli_and_in_the_file`, whose failure text is
-  `aged_file_survives`'s readiness panic (`:465-496`: *"no fresh `logs/frps.log.<date>` was written
+  `aged_file_survives`'s readiness panic (`:465-496` on the pre-fix tree; `:513`/`:524` after
+  the fix below: *"no fresh `logs/frps.log.<date>` was written
   within {READY_TIMEOUT:?}, so the child never reached the appender"*). So the atomicity that test
   needs — a backdated `logs/frps.log.2020-01-01` plus a *fresh* daily file written by the child — is
   racy under load, and the assertion that then fails is about **retention**, reported as if the
@@ -4250,6 +4286,37 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   run under load — with the CI lane's own guard literal (`log_completion`'s step counts **5** in
   `.github/workflows/ci.yml`, not one of the two `env.*_CLI_TESTS` values) moved in the same commit
   if tests are added or removed.
+  **Done (2026-09-30, at `58812ebf` on `fix/test-harness-strays`, based on `971e0fa0`).** One
+  commit, `58812ebf` "fix(tests): wait for the appender's own record in log_completion". (a) The
+  item's repro, re-run here: 10 sequential
+  `cargo test -p frps --features dashboard --test log_completion` at load average 39–41 from sibling
+  builds → **8 pass, 2 fail**, panicking at `frps/tests/log_completion.rs:539` (the config-file
+  retention arm) and `:502` (the control no-flag arm); the baseline clean run was `5 passed` in
+  3.24 s. (b) Root cause, exactly as the item suspected: the readiness wait proved only that a fresh
+  `logs/frps.log.<date>` *existed*, and `tracing_appender::rolling::daily` creates that file at
+  `frp-core/src/logging.rs:378` **before** `cleanup_expired_logs` runs at `:401-402`, so the
+  retention assertion could be read before the retention decision — the same defect in both arms.
+  (c) Fix: the wait is now for the appender's **own record** — `fresh_log_reached_appender`
+  (`frps/tests/log_completion.rs:485`) requires the fresh file's contents to contain
+  `STARTUP_MARKER` (`:91`, the first line `frps` emits after `init_tracing` returns;
+  `frps/src/main.rs:461`, `init_logging` at `:444`), and `aged_file_survives` (`:501-537`) fails fast with
+  `{tag}: frps exited ({status}) before the appender recorded {STARTUP_MARKER:?} in …` instead of
+  waiting out the full `READY_TIMEOUT` when the child dies first. (d) Pin + teeth: the new test
+  `readiness_gate_needs_the_appenders_own_record` (`:605`) requires that an empty dir and a dir
+  holding only an old-dated file do **not** satisfy the gate (`:614`) while a file carrying the
+  marker does (`:644`); the two stated mutations are an existence-only predicate (reds the first
+  assertion) and dropping the aged-file exclusion (reds the second). (e) The CI lane's own guard
+  literal moved 5 → **6** in the same commit (`.github/workflows/ci.yml:472-473`, `:476-478`, `:480`,
+  with the guard's success line at `:486` and the prose at `:453`/`:459`)
+  after the step's own `-- --list` counted 6; `env.FRPS_CLI_TESTS` / `env.FRPC_TINY_CLI_TESTS` are
+  untouched. No `CHANGELOG.md` entry: test-harness only, as the sibling items above (and as #396,
+  which introduced this file). Residue filed, not fixed: `frpc/tests/warn_delivery.rs` — measured
+  here, it does **not** read a rotation file (its contract at `:52-57` is the two captured streams),
+  so this item's fix does not apply to it; what it shares is a fixed settle: `SETTLE = 500 ms`
+  (`:92-94`) is slept at `:214` after `wait_for_marker` (`:219` defines it; the call is `:213`)
+  sees the startup marker, and only
+  then are the exact per-stream counts snapshotted — the same class of load-dependent assumption,
+  never re-measured under load (8 tests in that file).
 - [x] **`frpc`'s eight single-proxy subcommands reject `-c`/`--config`, which Go accepts and
   ignores.** Go's `-c` is a persistent rootCmd flag, so every subcommand parses it; the single-proxy
   commands simply never read the value. frp-rs's bpaf parsers for `tcp`/`udp`/`http`/`https`/`stcp`/
@@ -7725,3 +7792,69 @@ section; ledger now **24 open / 104 closed**.**
   is pinned past any plausible cap (or the assertion states the bound it really enforces); and each
   lane literal gets an absolute floor (or the full `frpc` lane gets a count guard), with the
   delete-plus-lower mutant red.
+- [ ] **`scripts/compat-test.sh`'s XTCP helper still kills by argument pattern — the class of kill the compat-leak item forbade for its own children.**
+  Filed by the coordinator while closing the "`scripts/compat-test.sh` leaks its children" item above.
+  Inside `run_xtcp_test` (`scripts/compat-test.sh:4331`), the pre-test cleanup is
+  `pkill -f "frpc -c"` / `pkill -f "frps -c"` (`:4343-4344`, under the comment at `:4340-4342`), i.e.
+  a kill over *any* process on the host whose command line matches that pattern — including a
+  developer's unrelated `frpc -c …` run — whereas the guard the closed item added matches a process
+  name **and** the run's own `$TEST_DIR/` prefix, subtracts a baseline, and reaps by exact pid. The
+  repository's stray rules say "never by name alone"; name-plus-argument is the same hazard in a
+  weaker form.
+  **Done-when:** replace the two `pkill -f` calls with the pid-exact sweep the closed item added
+  (`scenario_strays`/`assert_no_strays` at `scripts/lib/compat-stray-guard.sh:90`/`:150`, or a per-scenario pid
+  file), so a full XTCP run leaves no process it did not start, or record why the pattern kill is
+  required there (e.g. a `fuser`/pid-file route is impossible for that shard's Go children).
+- [ ] **`frpc/tests/warn_delivery.rs` snapshots its counts after a fixed 500 ms settle — the same class of load-dependent wait `frps/tests/log_completion.rs` just lost.**
+  Filed by the coordinator while closing the `log_completion` flake item above, correcting that
+  close-out's own residual note. This file does **not** read a rotation file — its contract
+  (`frpc/tests/warn_delivery.rs:52-57`) is the child's two captured streams — so the closed item's
+  appender-record gate does not apply. What it shares is a fixed sleep: `wait_for_marker` (`:219`)
+  returns as soon as `STARTUP_MARKER` appears on stdout/stderr, then `SETTLE = 500 ms` (`:92-94`) is
+  slept at `:214` before `snapshot()` freezes the buffers, and the tests then assert exact
+  per-stream record counts. On a host loaded like the one that produced the sibling item's 2/10
+  failure rate (load average 39–41), a record the logger gates can still be in flight at the
+  snapshot.
+  **Done-when:** reproduce a failure under that recipe — 10 sequential
+  `cargo test -p frpc --features full --test warn_delivery` (the file is
+  `#![cfg(feature = "full")]`) at load 39–41 — and replace the settle with a condition wait on the
+  record itself, or record the non-reproduction with the recipe and the load figures (8 tests in the
+  file).
+
+- [ ] **`scripts/tests/repo-health-fixtures.sh` cannot detect its own neutering — the hole the compat guard's `MIN_CHECKS` just closed.**
+  Filed by the coordinator from the `test-harness-strays` round-2 adversarial round (read at
+  `506f9465`). The suite ends with a bare `exit "$fail"` (`scripts/tests/repo-health-fixtures.sh:371`)
+  and keeps no total-count floor, so a regression that stops the scenarios from running still reports
+  green in the `health` job. The measured shapes (round-2 adversarial, on copies): an early `exit 0`
+  after the `RC_PY` preflight (`:78`) exits 0 with **no output at all**, so no `RESULT:` line exists;
+  a scenario body emptied still exits 0, printing `RESULT: 17 fixture check(s) hold` for scenario 4
+  (18 for scenario 1); only a suite that runs no check at all prints `RESULT: 0`. The guard suite added by the same
+  branch now pins the invariant from a trap installed before its first assertion
+  (`MIN_CHECKS=21`, `scripts/tests/compat-stray-guard.sh:72`, checked at `:90-94` with the message
+  `suite exited 0 after only N check(s); expected at least 21 — scenarios did not run`) — and the
+  round-2 re-check showed that floor is itself bypassable from inside the file (`exec true` skips the
+  EXIT trap; `MIN_CHECKS=0` disables it), which is why the hardening round moves the assertion outside
+  the file, into the `Stray guard — fixture checks (compat harness teardown)` step
+  (`.github/workflows/ci.yml:111`) whose `grep -qF 'RESULT: 21 fixture check(s) hold'` sits at `:127`.
+  **Done-when:** `scripts/tests/repo-health-fixtures.sh` enforces its own floor the same way (trap
+  installed before the first `ok`/`bad`, the floor equal to the current check count), and emptying a
+  scenario body — or inserting an early `exit 0` — reds the suite.
+
+- [ ] **Four more `scripts/tests/compat-stray-guard.sh` residues the delta-3 reviews measured — each is a way the guard can report green while doing less.**
+  Filed by the coordinator from the `test-harness-strays` delta-3 round (R1 and R2 both read
+  `0a350583`; R1 measured the trait at `scripts/tests/compat-stray-guard.sh:79-86`, R2 at `:86`,
+  `:44-60` and `:141`). (a) The trap's own ownership probe treats "`ps` could not run" as "this pid is
+  not ours": `cmd=$(ps -o command= -p "$p" 2>/dev/null) || continue` (`:86`), so every LIVE synthetic
+  outlives a `ps` failure; R2's fix is
+  `cmd=$(ps -o command= -p "$p" 2>/dev/null) || { kill -9 "$p" 2>/dev/null || true; continue; }`.
+  (b) `wait_exec`'s "has the child exec-ed yet" test is defeated when the suite is invoked through a
+  symlink — the script resolves itself through symlinks (`:44-60`) while the child's pre-exec argv
+  carries the `$0` alias, so the match succeeds before the exec and `wait_exec` returns 0; CI calls the
+  direct path, so it is latent. (c) A `ps` that exits 0 with empty output is read as "the image
+  changed" (`:141`). (d) `MIN_CHECKS=21` is a total, not a shape: deleting four checks and adding four
+  dummy `ok` lines keeps the count and exits 0. R2's two remaining notes are accepted as bounded rather
+  than fixed: the fixed `/tmp` log path is defended only by `tee` truncation, and a SIGKILL leaves an
+  orphan bounded by the 300 s pre-`exec` sleep.
+  **Done-when:** (a) uses the kill-then-continue form or the leak is proven unreachable; (b), (c) and
+  (d) are each fixed or recorded as deliberate with the mutant that shows the gap — for (d) that means
+  the guard's total is replaced by, or supplemented with, a per-scenario shape assertion.

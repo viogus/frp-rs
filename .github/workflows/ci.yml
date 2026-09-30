@@ -84,7 +84,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   # Cheapest job in the matrix (~seconds: no Rust toolchain, no cache, reads
-  # files with grep/find only). It turns a rule that was previously enforced by
+  # files with grep/find only, plus two fixture scripts that drive the
+  # repo-health and stray-guard rules against synthetic inputs). It turns a rule
+  # that was previously enforced by
   # memory into a machine gate: frp-rs versions must stay aligned with the Go frp
   # release number across 5 crates + the VERSION constant + the download script +
   # the README (see "Versioning (mandatory)" in CLAUDE.md).
@@ -102,6 +104,34 @@ jobs:
         run: bash scripts/repo-health.sh
       - name: Repo health — fixture checks (gate exit-code mapping)
         run: bash scripts/tests/repo-health-fixtures.sh
+      # The compat harness's stray-process guard, driven against synthetic
+      # `frps`/`frpc` peers (no Go toolchain, no compat run): it pins that the
+      # guard's match is the scratch directory *and* the process name — a
+      # name-only match kills a sibling worktree's server and must red this.
+      - name: Stray guard — fixture checks (compat harness teardown)
+        # The suite floors its own check count (`MIN_CHECKS`, in its EXIT trap),
+        # but a floor inside the file it guards cannot survive an `exec`: `exec
+        # true` planted after the library check never runs the trap and exits 0
+        # with no output at all, and a lowered `MIN_CHECKS=0` is quiet too. So the
+        # total is pinned *outside*, the way the `log_completion` step below pins
+        # its own 6: this step requires the suite's summary line verbatim, and 21
+        # is what the scenarios in scripts/tests/compat-stray-guard.sh print. A
+        # scenario added or removed there moves this literal — restore the checks
+        # rather than lowering it.
+        shell: bash
+        run: |
+          set -o pipefail
+          log=/tmp/frp-compat-stray-guard-fixtures.log
+          status=0
+          bash scripts/tests/compat-stray-guard.sh 2>&1 | tee "$log" || status=1
+          grep -qF 'RESULT: 21 fixture check(s) hold' "$log" || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::compat stray-guard fixture checks did not report 21 checks"
+            echo "::error::scripts/tests/compat-stray-guard.sh must end with 'RESULT: 21 fixture check(s) hold'; a smaller total, a failure line or no output means scenarios were skipped, neutered or swallowed by an \`exec\` — restore them rather than lowering this literal"
+            cat "$log"
+            exit 1
+          fi
+          echo "compat stray-guard fixture checks ok: 21 checks hold"
 
   tests-unit:
     name: Tests (unit)
@@ -476,13 +506,13 @@ jobs:
         # pinned); this step does not set it.
         #
         # **This step asserts the count, because a bare `cargo test --test <f>`
-        # cannot tell "5 passed" from "0 ran".** Measured: with the file's
+        # cannot tell "6 passed" from "0 ran".** Measured: with the file's
         # cfg gate mutated to a feature that does not exist (the disable
         # mutation), the plain invocation prints `running 0 tests` /
         # `test result: ok. 0 passed; 0 failed` and exits **0** — a gate quieter
         # than the `cli_exit_codes` step beside it, which is why this one repeats
         # that step's three checks (the target ran; the summary says
-        # `ok. 5 passed; 0 failed`; `-- --list` counts 5). The literal is a
+        # `ok. 6 passed; 0 failed`; `-- --list` counts 6). The literal is a
         # property of the *file*, not a shared env value: it lives here, next to
         # the invariant it guards, because `env.FRPS_CLI_TESTS` counts a
         # different target and must not be moved for this one.
@@ -495,21 +525,21 @@ jobs:
           n=$(cargo test -p frps --features dashboard --test log_completion --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/log_completion.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 5 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "5" ] || status=1
+          grep -q "test result: ok. 6 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "6" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frps log-completion guard failed (status=$status, file=$n, log=$log)"
-            if [ -n "$n" ] && [ "$n" != "5" ]; then
-              if [ "$n" -lt "5" ]; then
-                echo "::error::frps/tests/log_completion.rs lists $n tests, this step expects 5 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
+            if [ -n "$n" ] && [ "$n" != "6" ]; then
+              if [ "$n" -lt "6" ]; then
+                echo "::error::frps/tests/log_completion.rs lists $n tests, this step expects 6 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
               else
-                echo "::error::frps/tests/log_completion.rs lists $n tests, this step expects 5: move the single literal in this shell step from 5 to $n"
+                echo "::error::frps/tests/log_completion.rs lists $n tests, this step expects 6: move the single literal in this shell step from 6 to $n"
               fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frps log-completion guard ok: $n tests listed (expected 5), 0 failed"
+          echo "frps log-completion guard ok: $n tests listed (expected 6), 0 failed"
       - name: Run frps's `web_server.tls.enable` warning-delivery spawn tests
         # `frps/tests/warn_delivery.rs` pins what a **user** sees when a config
         # writes `[web_server.tls] enable`: the diagnostic must reach stdout on

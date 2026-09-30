@@ -268,6 +268,16 @@ impl Spawned {
     fn stderr(&self) -> String {
         self.stderr.lock().unwrap().clone()
     }
+
+    /// `Some(status)` once the child has exited (non-blocking), so a shape that
+    /// can never satisfy its readiness gate reports the child's own exit instead
+    /// of burning [`READY_TIMEOUT`] on a process that is already gone.
+    fn exited(&mut self) -> Option<std::process::ExitStatus> {
+        match self._guard.child.try_wait() {
+            Ok(Some(status)) => Some(status),
+            _ => None,
+        }
+    }
 }
 
 /// Read a child's pipe to EOF on its own thread, appending into `sink`.
@@ -437,8 +447,8 @@ fn cli_empty_log_file_keeps_logging_on_stdout() {
 // config logs to a file, so stdout carries no startup record, and its
 // `TcpStream::connect` liveness probe would inject a WARN record into the stream
 // a byte-count assertion would be reading (the sibling shapes' 1498 B / 7-record
-// convention is measured with no connect). Liveness here is the appearance of
-// today's rotation file, which only the running appender writes.
+// convention is measured with no connect). Liveness here is the appender's own
+// `STARTUP_MARKER` record in that file, not the file's existence — see `fresh_log_reached_appender`.
 
 /// 2020-01-01T00:00:00Z — far outside any `max_days` this test uses.
 const AGED: SystemTime = UNIX_EPOCH;
@@ -451,39 +461,70 @@ fn file_lane_config(port: u16, log_section: &str) -> String {
     )
 }
 
+/// The fresh rotation file the appender created under `logs/`, if it is on disk
+/// yet: today's `frps.log.<date>`, never the backdated fixture.
+fn fresh_rotation_file(dir: &TempDir) -> Option<PathBuf> {
+    dir.files_in("logs")
+        .into_iter()
+        .find(|f| f.starts_with("frps.log.") && f != "frps.log.2020-01-01")
+        .map(|f| dir.0.join("logs").join(f))
+}
+
+/// True when the fresh rotation file already carries the record `frps` writes
+/// **after** `init_logging` returns ([`STARTUP_MARKER`], `frps/src/main.rs:317`).
+///
+/// Mere existence is not evidence that anything ran: `tracing_appender::rolling::daily`
+/// creates `logs/frps.log.<date>` eagerly when it is constructed
+/// (`frp-core/src/logging.rs:378`), *before* the subscriber is installed and
+/// before `cleanup_expired_logs` runs (`frp-core/src/logging.rs:401-402`). A
+/// probe that stops at the file's appearance can therefore read the aged file's
+/// fate too early — measured on this host at load average ~40, 2 of 10 runs
+/// failed a retention assertion although the cleanup deletes the file a moment
+/// later. The marker is only reachable once `cleanup_expired_logs` has returned,
+/// which is what makes the wait deterministic.
+fn fresh_log_reached_appender(dir: &TempDir) -> bool {
+    fresh_rotation_file(dir)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|contents| contents.contains(STARTUP_MARKER))
+}
+
 /// Spawn in a scratch dir holding a backdated `logs/frps.log.2020-01-01`, then
 /// report whether it survived startup. Bounded: every wait has a deadline, and
 /// the child is reaped by [`ChildGuard`] on every path.
 ///
-/// The wait is for the **fresh** rotation file, not for the aged one: startup
-/// cleanup runs in `init_tracing` after the subscriber is installed and before
-/// the first record of `run()`, and `cleanup_expired_logs` is itself the first
-/// thing that can write (its "removed expired log file" record). So the
-/// appearance of a fresh `logs/frps.log.<date>` means the cleanup call has
-/// already decided the aged file's fate — which makes this a ~millisecond probe
-/// instead of a 15-second timeout.
+/// The wait is for the appender's own record ([`fresh_log_reached_appender`]),
+/// not for the fresh file's existence and not for the aged file: the readiness
+/// gate has to be strictly *after* the retention decision, or a surviving aged
+/// file is reported as a retention outcome when it is only a timing artifact.
+/// The child's own exit is checked on every poll, so a shape that can never
+/// satisfy the gate reports *that* (with its streams) instead of a timeout.
 fn aged_file_survives(tag: &str, config: &str, argv: &[&str]) -> bool {
     let dir = TempDir::new("aged");
     dir.write("frps.toml", config);
     let aged = dir.write_backdated("logs/frps.log.2020-01-01", "aged\n", AGED);
-    let spawned = Spawned::start_in(dir, argv);
+    let mut spawned = Spawned::start_in(dir, argv);
 
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
-        let fresh: Vec<String> = spawned
-            .dir
-            .files_in("logs")
-            .into_iter()
-            .filter(|f| f.starts_with("frps.log.") && f != "frps.log.2020-01-01")
-            .collect();
-        if !fresh.is_empty() {
+        if fresh_log_reached_appender(&spawned.dir) {
             break;
+        }
+        if let Some(status) = spawned.exited() {
+            panic!(
+                "{tag}: frps exited ({status}) before the appender recorded {STARTUP_MARKER:?} in \
+                 a fresh `logs/frps.log.<date>`, so the aged file's survival would not be evidence \
+                 of a retention decision\n--- stdout ({}) ---\n{}\n--- stderr ({}) ---\n{}",
+                spawned.stdout().len(),
+                spawned.stdout(),
+                spawned.stderr().len(),
+                spawned.stderr(),
+            );
         }
         if Instant::now() >= deadline {
             panic!(
-                "{tag}: no fresh `logs/frps.log.<date>` was written within {READY_TIMEOUT:?}, so \
-                 the child never reached the appender — the aged file's survival would not be \
-                 evidence of a retention decision\n--- stdout ({}) ---\n{}\n--- stderr ({}) ---\n{}",
+                "{tag}: no appender record reached a fresh `logs/frps.log.<date>` within \
+                 {READY_TIMEOUT:?}, so the child never reached the appender — the aged file's \
+                 survival would not be evidence of a retention decision\n--- stdout ({}) ---\n{}\n--- stderr ({}) ---\n{}",
                 spawned.stdout().len(),
                 spawned.stdout(),
                 spawned.stderr().len(),
@@ -543,5 +584,90 @@ fn max_days_zero_is_completed_to_three_on_the_cli_and_in_the_file() {
             &["--bind-port", &port.to_string()],
         ),
         "`[log] max_days = 0` must be completed to 3 in the config"
+    );
+}
+
+/// **Readiness-gate pin.** An existing but record-free rotation file must not
+/// satisfy [`fresh_log_reached_appender`], and the aged fixture must never be
+/// mistaken for the fresh one.
+///
+/// Mutations that must turn this test red (all three measured): (1) restore the
+/// pre-fix predicate — `fresh_rotation_file(dir).is_some()` — as
+/// [`fresh_log_reached_appender`]'s body: the first assertion then fails at
+/// this test's `assert!` line, because `rolling::daily` has already created the
+/// empty file (`frp-core/src/logging.rs:378`) while nothing has been written to
+/// it; (2) drop the `frps.log.2020-01-01` exclusion from
+/// [`fresh_rotation_file`]: the second assertion fails, since `files_in` sorts
+/// and the aged fixture comes first; (3) delete the `spawned.exited()` arm in
+/// [`aged_file_survives`]: the last arm below then receives the 15 s timeout
+/// panic instead of the exit-status one, and fails on its wording.
+#[test]
+fn readiness_gate_needs_the_appenders_own_record() {
+    let dir = TempDir::new("readiness");
+    // The aged fixture is present and non-empty, and is never "fresh".
+    dir.write_backdated("logs/frps.log.2020-01-01", "an aged record\n", AGED);
+    // What `rolling::daily` leaves behind between constructing the appender and
+    // the first record: a fresh rotation file with no content at all.
+    let fresh = dir.0.join("logs").join("frps.log.2999-01-01");
+    std::fs::write(&fresh, "").expect("write empty fresh rotation file");
+
+    assert!(
+        !fresh_log_reached_appender(&dir),
+        "an empty rotation file must not satisfy the readiness gate — the file exists from \
+         `frp-core/src/logging.rs:378`, before `cleanup_expired_logs` decides anything"
+    );
+    assert_eq!(
+        fresh_rotation_file(&dir),
+        Some(fresh.clone()),
+        "the aged fixture must never be reported as the fresh rotation file"
+    );
+
+    // The gate keys on the **full** post-`init_logging` record, not on the
+    // program name that every record in this file carries: a record holding the
+    // name alone must still not satisfy it. Measured at head, the file holds
+    // exactly one record before the gate opens — the marker line itself — so this
+    // is the sharper form of the assertion above, and it is what makes a marker
+    // weakened to a bare program name red.
+    std::fs::write(&fresh, "INFO frps: starting\n").expect("write a name-only record");
+    assert!(
+        !fresh_log_reached_appender(&dir),
+        "a name-only record must not satisfy the readiness gate — the marker is the appender's own \
+         post-`init_logging` line, not the program name"
+    );
+
+    // The appender's own post-`init_logging` record is the evidence.
+    std::fs::write(
+        &fresh,
+        format!("an earlier record\nINFO {STARTUP_MARKER}0.71.0 starting...\n"),
+    )
+    .expect("write the appender's own record");
+    assert!(
+        fresh_log_reached_appender(&dir),
+        "the appender's own startup record must satisfy the readiness gate"
+    );
+
+    // Fail-fast arm: a child that can never satisfy the gate — here one whose
+    // `--bind-port` is unparsable, so it is gone before `init_logging` — must be
+    // reported by its own exit status and its streams, not by burning
+    // [`READY_TIMEOUT`] on a process that is already gone. Measured at head:
+    // this arm panics ~1.6 s in at [`aged_file_survives`]'s `spawned.exited()`
+    // panic; without that arm the same input reaches the timeout panic ~15 s in.
+    let port = free_port();
+    let exited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        aged_file_survives(
+            "fail-fast arm: unparsable --bind-port",
+            &file_lane_config(port, ""),
+            &["--bind-port", "not-a-port"],
+        )
+    }))
+    .expect_err("a child that cannot start must panic, not return a retention verdict");
+    let message = exited
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| exited.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_default();
+    assert!(
+        message.contains("before the appender recorded"),
+        "the readiness gate must report the child's own exit; got: {message}"
     );
 }
