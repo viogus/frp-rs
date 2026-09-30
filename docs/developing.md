@@ -1472,6 +1472,12 @@ completes, and `ServerConfig::complete` gained Go's
 (`pkg/config/v1/server.go:110`, before the `ProxyBindAddr` inheritance at
 `:112-114` and the `BindPort` fill at `:111`).
 
+Since #427 the three zero-valued log flags (`--log-level ""`, `--log-file ""`,
+`--log-max-days 0`) are skipped entirely by the override lane rather than written
+through and completed, so a file's `[log]` values survive a deliberately empty flag;
+`--log-format` still writes through because it is an frp-rs-only flag with no Go
+completion to mirror (`TODO.md` residues R1-R3 record the two adjacent divergences).
+
 Measured against Go frp **v0.71.0** (darwin/arm64) and frp-rs (base `80199f4`),
 cwd holding a `frps.toml`, one free control port and one free dashboard port per
 row, `[auth] token` set and `[webServer] user`/`password` set, address read back

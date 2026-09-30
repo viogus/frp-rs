@@ -1134,6 +1134,20 @@ User-facing release notes for frp-rs.
   `ConstructError` implements `Display`/`Error`, so `?`-based callers that only
   print or propagate keep working; callers that matched on `String` or compared
   the error text need the `kind()` method.
+- **An explicitly empty log flag no longer raises the config file's level on `frps`.** `frps`
+  overlaid every log CLI value onto the loaded config, so `--log-level ""` wrote `""` into
+  `[log] level` and the Go-compatible completion then filled it with `info` — a file's `warn`
+  produced 11 `INFO` records where Go's `-c` lane emits none. An empty `--log-level`/`--log-file`
+  and `--log-max-days 0` are now "not supplied": the file's value survives, matching `frpc` and
+  Go's `-c` lane. `--log-format` still writes through, because it is an frp-rs-only flag with no
+  Go completion to mirror; the two adjacent divergences (`-c` plus a non-empty log flag, and the
+  implicit-config lane) are recorded in `TODO.md`.
+- **`--vhost-http-timeout` is now Go's signed `int64`.** It was `u64` here, so
+  `--vhost-http-timeout -1` was refused where Go accepts it and a value above `i64::MAX` was
+  accepted where Go refuses it. The flag and `ServerConfig::vhost_http_timeout` are `i64`; the
+  internal clamp still treats a non-positive value as "no timeout". The refusal *text* for an
+  out-of-range value is still Rust's rather than Go's `strconv.ParseInt` wording (recorded in
+  `TODO.md`).
 
 ### Changed
 - **The space-separated `--strict-config <bool>` extension now prints a warning
