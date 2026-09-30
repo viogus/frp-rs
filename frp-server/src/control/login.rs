@@ -2773,20 +2773,40 @@ mod oidc_throttle_tests {
     /// `mock_default_ctor_delegates_the_pinned_deadline` calls the accessor once
     /// and compares it to `MOCK_REQUEST_HEAD_TIMEOUT`, so an accessor that
     /// ignores `self.request_head_timeout` and returns the constant keeps every
-    /// oidc test green — measured: all 19 `oidc` tests stay green with the
-    /// accessor body replaced by `MOCK_REQUEST_HEAD_TIMEOUT` (TODO.md:7797 (b)).
-    /// Two **distinct** overrides keep that mutant red twice over: a distilled
-    /// accessor can return at most one of the two values, so `/8` or `/60` fails
-    /// whichever value it happened to pick. They are also different from the 5 s
-    /// constant, so a body that returns `MOCK_REQUEST_HEAD_TIMEOUT` fails both.
+    /// other `oidc` test green — measured: on the pre-pin tree all 19 `oidc`
+    /// tests stayed green with the accessor body replaced by
+    /// `MOCK_REQUEST_HEAD_TIMEOUT` (there are 20 at this head, this pin
+    /// included; TODO.md:7837 (b)).
+    /// Three **distinct** overrides keep that mutant red three times over: a
+    /// distilled accessor can return at most one of the three values, so
+    /// `125 ms`, `60 s` or `31.337 ms` fails whichever value it happened to pick.
+    /// They are also all different from the 5 s constant, so a body that returns
+    /// `MOCK_REQUEST_HEAD_TIMEOUT` fails all three — and, because they are the
+    /// same values the assertions use, the test is its own control.
+    ///
+    /// The third override is deliberately **sub-100 ms and non-round**. A body
+    /// that special-cases a round threshold ("`< 100 ms` → the constant, else the
+    /// stored field") is right for `125 ms` and `60 s` alone and was measured
+    /// green against the two-value loop; so is a body that hardcodes exactly the
+    /// two originally pinned values. Both die on `31.337 ms`.
     /// No sleeping: the handle is produced by `oidc_mock_server_with_timeout`
-    /// without waiting out either deadline.
+    /// without waiting out any of the deadlines.
     #[test]
     fn mock_handle_reports_the_override_it_was_built_with() {
+        // Not a shipped constant and not a round number an accessor could
+        // special-case: below any plausible threshold, and small enough that the
+        // mock never waits it out (the handle is built without a connection).
+        let third = std::time::Duration::from_micros(31_337);
         for override_timeout in [
             std::time::Duration::from_millis(125),
             std::time::Duration::from_secs(60),
+            third,
         ] {
+            assert_ne!(
+                override_timeout, MOCK_REQUEST_HEAD_TIMEOUT,
+                "each override must differ from the shipped constant, or the accessor \
+                 could return either one and stay green"
+            );
             let (issuer, handle) = oidc_mock_server_with_timeout(override_timeout);
             assert_eq!(
                 handle.request_head_timeout(),
