@@ -265,7 +265,7 @@ async fn run(mut cli: FrpsArgs) {
                             // (`frp-server/src/service.rs:2276`) — so this arm
                             // means the service stopped for good. The
                             // single-config path maps any `run()` error to
-                            // `EXIT_RUNTIME` (`frps/src/main.rs:478-481`), and
+                            // `EXIT_RUNTIME` (`frps/src/main.rs:540-542`), and
                             // this lane must carry the same code out: measured
                             // with one config whose `bindPort` is already held
                             // (probe `/tmp/frps-cfgdir-probe/probe-bind.py`),
