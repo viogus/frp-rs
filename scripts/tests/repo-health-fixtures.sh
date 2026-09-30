@@ -25,7 +25,11 @@
 # fall-through in the tree's own copy of the script, one at a time, so the checks
 # are shown to red on the right edit; scenario 5 is the clean-tree negative
 # control for scenario 1's row; scenario 6 asserts the integration-test-dir
-# metric, whose `scripts/tests/` blind spot is why it exists.
+# metric, whose `scripts/tests/` blind spot is why it exists; scenario 7 pins
+# site 4's crate-root row with a cross-crate alias (and with the count-inert
+# mutation that re-raises it); scenario 8 pins the kernel's symlink-chain refusal
+# that makes the in-script `readlink` bound unreachable; scenario 9 shows a failed
+# fixture setup stops the run instead of leaving three checks vacuous-green.
 #
 # Self-contained: no network, no dependence on this repo's contents (the tree is
 # built from scratch and only the script under test is copied in), and the
@@ -50,7 +54,12 @@ esac
 # in another directory) resolved `../..` against the *link's* directory and looked
 # for `//scripts/repo-health.sh`. `readlink -f` is not POSIX and older macOS/BSD
 # releases lack it, so loop on plain `readlink`, resolving each target against the
-# link's own directory. Bounded so a symlink cycle cannot hang the run.
+# link's own directory. Bounded for defence in depth, but the bound is
+# unreachable in practice: `bash` cannot open this file through a cycle at all —
+# the kernel refuses the chain first (measured on this host: a 31-link chain to
+# this file runs green, a 32-link chain is refused with `Too many levels of
+# symbolic links`, rc 126; Linux allows 40 hops, Darwin 32, so the kernel always
+# fires before the counter passes 40). Scenario 8 pins that refusal.
 n=0
 while [ -L "$self" ]; do
   dir=$(cd -P -- "$(dirname -- "$self")" && pwd) || exit 1
@@ -61,10 +70,17 @@ while [ -L "$self" ]; do
   esac
   n=$((n + 1))
   if [ "$n" -gt 40 ]; then
+    # Defensive only: unreachable while the kernel's own limit is <= 40 hops
+    # (see the comment above and scenario 8). Kept so a platform that does
+    # resolve deeper still fails loudly here instead of looping.
     printf 'FAIL  cannot resolve the harness path (symlink cycle?): %s\n' "$0"
     exit 1
   fi
 done
+# Make `$self` absolute before scenario 8 links to it: it can still be the
+# relative path the caller typed (`scripts/tests/repo-health-fixtures.sh`), which
+# only resolves from the repo root — a link created under `$tmp` would dangle.
+self=$(cd -P -- "$(dirname -- "$self")" && pwd)/$(basename -- "$self")
 cd -P -- "$(dirname -- "$self")/../.." || exit 1
 RH=$PWD/scripts/repo-health.sh
 if [ ! -f "$RH" ]; then
@@ -92,8 +108,8 @@ printf '%s\n' 'repo-health.sh fixture checks'
 # test at scripts/repo-health.sh and an empty docs/archive/.
 new_tree() {
   d=$tmp/$1
-  mkdir -p "$d/scripts" "$d/docs/archive" "$d/.github/workflows"
-  cp "$RH" "$d/scripts/repo-health.sh"
+  mkdir -p "$d/scripts" "$d/docs/archive" "$d/.github/workflows" || return 1
+  cp "$RH" "$d/scripts/repo-health.sh" || return 1
   printf '%s\n' "$d"
 }
 
@@ -105,14 +121,14 @@ new_tree() {
 # are deliberately minimal — the doc-figure claims below them will not match, so
 # the tree is red anyway; that is fine, the checks read per-walk rows.
 new_full_tree() {
-  d=$(new_tree "$1")
+  d=$(new_tree "$1") || return 1
   mkdir -p "$d/frp-core/src" "$d/frp-vnet/src" "$d/frp-core/benches" \
            "$d/frp-server/benches" "$d/vendor/rustls" "$d/vendor/yamux" \
-           "$d/vendor/russh"
-  cp "$RC_PY" "$d/scripts/rust_comments.py"
+           "$d/vendor/russh" || return 1
+  cp "$RC_PY" "$d/scripts/rust_comments.py" || return 1
   # `--list` must yield a non-empty token list or count_compat() reports a
   # partial tree and exits before unsafe_counts (site 4) runs.
-  cat > "$d/scripts/compat-test.sh" <<'STUB'
+  cat > "$d/scripts/compat-test.sh" <<'STUB' || return 1
 #!/usr/bin/env bash
 if [ "${1:-}" = "--list" ]; then printf 'test_alpha\ntest_beta\n'; fi
 exit 0
@@ -157,6 +173,47 @@ open(p, 'w').write(s)
 PY
 }
 
+# mut_npresent <tree> — move the site-4 `n_present` increment past the shared
+# dedupe `continue`. That refactor is count-inert (blocks/fns/impls are unchanged
+# — the deduped file was never going to be counted) and only changes the
+# crate-root row, which is exactly what scenario 7 pins. The anchor is asserted
+# so a refactor that moves the code fails loudly instead of mutating nothing.
+mut_npresent() {
+  python3 - "$1" <<'PY'
+import sys
+p = sys.argv[1] + '/scripts/repo-health.sh'
+s = open(p).read()
+old = ('                n_present += 1\n'
+       '                if key in seen:\n'
+       '                    continue\n')
+new = ('                if key in seen:\n'
+       '                    continue\n'
+       '                n_present += 1\n')
+assert s.count(old) == 1, 'n_present anchor found %d times' % s.count(old)
+open(p, 'w').write(s.replace(old, new, 1))
+PY
+}
+
+# tree <name> [full] — set TREE to a fresh throwaway root, or stop the harness
+# loudly. The helpers return non-zero when a `mkdir`/`cp` fails, but a bare
+# `t=$(new_tree …)` hides that status, and the scenario then ran against an empty
+# tree: measured with `chmod 000 scripts/repo-health.sh`, both `newline … no forged
+# hit from the split path` checks and `clean archive scan: no archive exit-3 row`
+# went vacuous-green while the run was still rc 1 for unrelated reasons.
+# Scenario 9 pins this failure.
+tree() {
+  if [ -n "${2:-}" ]; then
+    TREE=$(new_full_tree "$1") || setup_die "new_full_tree $1"
+  else
+    TREE=$(new_tree "$1") || setup_die "new_tree $1"
+  fi
+}
+
+setup_die() {
+  bad "fixture setup: $1 failed (mkdir/cp rc) — every check below it would be vacuous"
+  exit 1
+}
+
 # out_count <needle> — how many lines of the last run_gate output contain it.
 out_count() { printf '%s\n' "$out" | grep -cF -- "$1"; }
 
@@ -190,7 +247,8 @@ assert_exit_mapping() {
 # read error and exit 3; the wrapper must still return 1 and say `(exit 3)`.
 hdr
 printf '%s\n' 'scenario 1: a gate exits 3 (dangling docs/archive symlink)'
-t=$(new_tree exit3)
+tree exit3
+t=$TREE
 ln -s nowhere.md "$t/docs/archive/bad.md"
 run_gate "$t"
 assert_exit_mapping 'exit-3 gate' '  FAIL  archive path scan failed (exit 3)'
@@ -206,7 +264,8 @@ fi
 # scanned, and no forged hit is printed.
 hdr
 printf '%s\n' 'scenario 2: a workflow filename containing a newline'
-t=$(new_tree newline)
+tree newline
+t=$TREE
 wf="$t/.github/workflows/"$'a\nC forged.yml'
 printf 'name: probe\non: push\njobs:\n  a:\n    steps:\n      - uses: actions-rust-lang/setup-rust-toolchain@v1\n        with:\n          toolchain: 1.98.0\n' > "$wf"
 run_gate "$t"
@@ -239,7 +298,8 @@ fi
 # `toolchain:` input (measured: `FAIL 1 toolchain: input(s)`).
 hdr
 printf '%s\n' 'scenario 3: a workflow directory containing a newline'
-t=$(new_tree newline-dir)
+tree newline-dir
+t=$TREE
 dir="$t/.github/workflows/"$'sub\nC forged.yml'
 mkdir -p "$dir"
 printf 'name: probe\non: push\njobs:\n  a:\n    steps:\n      - run: rustup default stable\n' > "$dir/probe.yml"
@@ -277,7 +337,8 @@ fi
 # fall-through at any one site drops its line(s), or the partial-tree row.
 hdr
 printf '%s\n' "scenario 4: an unreadable .rs reaches every walk site"
-t=$(new_full_tree unreadable)
+tree unreadable full
+t=$TREE
 ln -s nowhere "$t/frp-core/src/zz_broken.rs"
 run_gate "$t"
 n=$(out_count 'scan error: frp-core/src/zz_broken.rs')
@@ -297,7 +358,8 @@ else
   bad "unreadable src: process rc is $rc (expected 1)"
 fi
 for site in 1 2 3 4; do
-  t=$(new_full_tree "unreadable-mut$site")
+  tree "unreadable-mut$site" full
+  t=$TREE
   ln -s nowhere "$t/frp-core/src/zz_broken.rs"
   # A mutation that does not apply must be a hard failure, not a silently absent
   # edit: the site check below would then pass on the un-mutated tree and report
@@ -317,11 +379,16 @@ for site in 1 2 3 4; do
       ok "unreadable src: site $site revert drops the partial-tree row (check has teeth)"
     fi
   else
+    # Exact remainder, not "anything but 4": site 1 walks two scopes, so its
+    # revert drops two of the four lines; sites 2/3 drop one each. Measured
+    # (baseline 4): site 1 -> 2, sites 2/3 -> 3. A walk that dropped *more* than
+    # its own evidence would be a real regression and must not read `ok`.
+    case "$site" in 1) want=2 ;; *) want=3 ;; esac
     n=$(out_count 'scan error: frp-core/src/zz_broken.rs')
-    if [ "$n" -eq 4 ]; then
-      bad "unreadable src: site $site reverted but all 4 scan-error lines survived"
+    if [ "$n" -eq "$want" ]; then
+      ok "unreadable src: site $site revert leaves exactly $want of 4 scan-error lines ($n — check has teeth)"
     else
-      ok "unreadable src: site $site revert drops its line(s) ($n left — check has teeth)"
+      bad "unreadable src: site $site revert left $n scan-error line(s); measured baseline 4, this site's drop is 4 -> $want"
     fi
   fi
 done
@@ -332,7 +399,8 @@ done
 # longer reflects the gate at all.
 hdr
 printf '%s\n' 'scenario 5: the archive exit-3 row is absent when the scan succeeds'
-t=$(new_tree clean-archive)
+tree clean-archive
+t=$TREE
 run_gate "$t"
 if printf '%s\n' "$out" | grep -qF '  FAIL  archive path scan failed'; then
   bad 'clean archive scan: the archive exit-3 row was printed anyway'
@@ -349,7 +417,8 @@ fi
 # and the "has a .rs" rule at once.
 hdr
 printf '%s\n' 'scenario 6: the integration-test-dir metric counts only .rs-bearing tests/'
-t=$(new_tree testdirs)
+tree testdirs
+t=$TREE
 mkdir -p "$t/scripts/tests" "$t/frp-core/tests" "$t/frp-vnet/tests/deep"
 printf '#!/bin/sh\n:\n' > "$t/scripts/tests/not-rust.sh"
 printf 'fn t() {}\n' > "$t/frp-core/tests/it.rs"
@@ -359,6 +428,102 @@ if printf '%s\n' "$out" | grep -qF 'integration test dirs: 2'; then
   ok 'integration test dirs: 2 (scripts/tests dropped; nested .rs counted)'
 else
   bad "integration test dirs: expected 2, got $(printf '%s\n' "$out" | grep -F 'integration test dirs' || echo none)"
+fi
+
+# --- scenario 7: site 4 counts an aliased crate root as present --------------
+# `unsafe_counts` increments `n_present` *before* the shared-inode dedupe
+# `continue`, deliberately: "this root carries a .rs file" must not become false
+# because the first crate claimed the inode. A hard link from one crate's `src`
+# into another crate's tree is exactly that case — the alias resolves inside its
+# own crate (so containment passes), yet its inode was already claimed — and with
+# the increment moved after the `continue` the crate would raise the misleading
+# `has no .rs files` partial-tree row. An intra-crate alias cannot pin this (the
+# count would change too), and a `new_full_tree` without the aliased root always
+# has its own placeholder. The mutation is count-inert, so only this row moves.
+hdr
+printf '%s\n' 'scenario 7: a crate root holding only a cross-crate alias is not "no .rs files"'
+tree aliased full
+t=$TREE
+rm -f "$t/frp-vnet/src/lib.rs"
+ln "$t/frp-core/src/lib.rs" "$t/frp-vnet/src/alias.rs" || bad 'aliased root: cannot hard-link the alias'
+run_gate "$t"
+if printf '%s\n' "$out" | grep -qF 'frp-vnet/src has no .rs files'; then
+  bad 'aliased root: the crate-root row fired although the directory holds a .rs alias'
+else
+  ok 'aliased root: the crate-root row is suppressed (the increment precedes the dedupe continue)'
+fi
+if mut_npresent "$t"; then
+  run_gate "$t"
+  if printf '%s\n' "$out" | grep -qF 'frp-vnet/src has no .rs files'; then
+    ok 'aliased root: moving the increment past the dedupe re-raises the row (check has teeth)'
+  else
+    bad 'aliased root: the increment-after-dedupe mutation did not re-raise the row'
+  fi
+else
+  bad 'aliased root: mut_npresent failed to apply — anchor missing, the check would be vacuous'
+fi
+
+# --- scenario 8: the readlink bound is defensive; the kernel fires first -----
+# The harness resolves its own symlink chain (so a wrapper or `ln -s` invocation
+# still finds the repo root) and bounds the loop at 40 hops "so a symlink cycle
+# cannot hang the run". That branch cannot be reached: `bash` cannot open the file
+# through a cycle, because the kernel refuses the chain first (measured on this
+# host: a 31-link chain to this file runs green, a 32-link chain is refused; Linux
+# allows 40 hops, Darwin 32, so 41 hops below is refused on both). The assertable
+# half is that refusal — loud, immediate, and not a hang.
+hdr
+printf '%s\n' 'scenario 8: a 41-link symlink chain is refused by the kernel, not by the bound'
+chain=$tmp/chain
+mkdir -p "$chain" || bad 'symlink chain: cannot create its directory'
+chain_ok=1
+prev=$self
+entry=
+i=0
+while [ "$i" -le 40 ]; do
+  if ! ln -s "$prev" "$chain/l$i"; then chain_ok=0; break; fi
+  prev=$chain/l$i
+  entry=$chain/l$i
+  i=$((i + 1))
+done
+if [ "$chain_ok" -ne 1 ]; then
+  bad 'symlink chain: could not build the 41-link chain'
+else
+  # Enter at the **tail** of the chain: `l0` points straight at this harness, so
+  # running it would re-run the whole suite instead of traversing 41 links.
+  out=$(bash "$entry" 2>&1); rc=$?
+  if [ "$rc" -eq 126 ] && printf '%s\n' "$out" | grep -qF 'Too many levels of symbolic links'; then
+    ok 'symlink chain: 41 hops is refused by the kernel (rc 126, ELOOP) — the in-script bound is unreachable'
+  else
+    bad "symlink chain: expected the kernel refusal (rc 126 + ELOOP), got rc=$rc, first line: $(printf '%s' "$out" | head -1)"
+  fi
+fi
+
+# --- scenario 9: a failed fixture setup stops the run ------------------------
+# `new_tree`/`new_full_tree` used to ignore their `mkdir`/`cp` rc: with the script
+# under test unreadable (`chmod 000`) the copy silently did not happen and three
+# checks went vacuous-green — both `newline … no forged hit from the split path`
+# checks and `clean archive scan: no archive exit-3 row` — while the run was still
+# rc 1 for unrelated reasons. `tree` now stops at the failed setup. The fixture is
+# a *copy* of this harness (at `<root>/scripts/tests/`), so the repo's own script
+# is never chmod-ed and the copy fails its first `cp` for the same reason.
+hdr
+printf '%s\n' 'scenario 9: an unreadable script under test fails the run loudly'
+t=$tmp/selfcheck
+mkdir -p "$t/scripts/tests" "$t/docs/archive" "$t/.github/workflows" || bad 'setup-failure fixture: cannot create its root'
+cp "$self" "$t/scripts/tests/harness.sh" || bad 'setup-failure fixture: cannot copy this harness'
+cp "$RH" "$t/scripts/repo-health.sh" || bad 'setup-failure fixture: cannot copy the script under test'
+cp "$RC_PY" "$t/scripts/rust_comments.py" || bad 'setup-failure fixture: cannot copy rust_comments.py'
+chmod 000 "$t/scripts/repo-health.sh"
+out=$(cd "$t/scripts/tests" && bash harness.sh 2>&1); rc=$?
+if [ "$rc" -eq 1 ]; then
+  ok 'unreadable script under test: the copied harness exits 1'
+else
+  bad "unreadable script under test: expected rc 1, got $rc"
+fi
+if printf '%s\n' "$out" | grep -qF 'fixture setup: new_tree'; then
+  ok 'unreadable script under test: the failure names the setup step (no vacuous ok rows below it)'
+else
+  bad "unreadable script under test: no setup FAIL row — the checks below it would go vacuous-green: $(printf '%s' "$out" | head -3)"
 fi
 
 # ---------------------------------------------------------------- summary
