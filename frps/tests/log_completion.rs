@@ -39,12 +39,13 @@
 //! (2407–2410 / 1468–1471 at four-digit pids; the `elapsed_secs=` value width and
 //! the pid digits are the only variables, and raw − stripped is a constant 939 B
 //! in both samples). No `frps.log.*` file is created in either shape. The earlier
-//! `1498 B / 7 records` is the same lane and binary with the template's
-//! `bind_addr = "127.0.0.1"` instead of the lane's default `0.0.0.0`: the address
-//! is echoed eight times across the startup block's four `run{…}` records, so its
-//! two extra characters add 16 B (1498 − 1482; 1496 B at a four-digit pid). For
-//! these two rows the record *shape* is the same on both sides of the completion
-//! fix, which changed retention only (and not `to = ""` at all).
+//! `1498 B / 7 records` is the same lane and binary with this file's own template
+//! `bind_addr = "127.0.0.1"` (`config()` below) instead of the binary default
+//! `0.0.0.0`: the address is echoed eight times across the startup block's four
+//! `run{…}` records, so its two extra characters add 16 B (1498 − 1482; 1496 B at
+//! a four-digit pid). For these two rows the record *shape* is the same on both
+//! sides of the completion fix, which changed retention only (and not `to = ""` at
+//! all).
 //!
 //! **What this file models.** The end-to-end effect on the two streams and on the
 //! CWD for the shipped `frps` binary, over two lanes: the config-file lane
