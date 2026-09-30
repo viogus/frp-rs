@@ -4236,7 +4236,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   cause, seen in vivo: `run_go()` (`scripts/compat-test.sh:128`) is a shell function, so each
   backgrounded `run_go … &` call forked a **subshell**; `track_pid $!` recorded that wrapper
   (`bash`) and `cleanup_pids` killed only it, leaving the real Go servers reparented — the
-  before-census's Go children carried wrapper pids as `PPID` (17046/17091/17230) while the Rust
+  before-census's Go children carried wrapper pids as `PPID` (17046/17091/17230, sampled while
+  the run was still alive; once the wrappers exit and the script is gone the orphans reparent
+  to `PPID 1`, which is the census the item above records) while the Rust
   children's `PPID` was the main script. Fixed by `exec`ing inside `run_go`
   (`scripts/compat-test.sh:128-132`), with the invariant stated in the comment above it (`:126-127`):
   all 90 call sites were audited and every one is backgrounded, so `exec` cannot replace the script
@@ -4245,7 +4247,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   the run's own `$TEST_DIR/` prefix, subtract a baseline captured at `:228`, print `pid ppid command`
   for each survivor, reap by those exact pids and return non-zero; the `EXIT` trap (`:256`) runs
   `cleanup_pids` and lets the guard set the status. (c) Measured with
-  `GO_FRP_V2=1 bash scripts/compat-test.sh --ci`: **before** (pristine `971e0fa0`) `86 passed,
+  `bash scripts/compat-test.sh --ci` (the `GO_FRP_V2=1` this recipe first carried was
+  **inert** — V2 is gated by `ensure_go_frp_v2` on the Go binaries being present,
+  `scripts/compat-test.sh:149-161`, and the workflow no longer sets it): **before** (pristine
+  `971e0fa0`) `86 passed,
   0 failed`, rc 0, 3 m 23 s, and then `pgrep -x frps` = **33** / `pgrep -x frpc` = **50** (**83**
   strays, every one `PPID 1`, every one `/tmp/frp_0.71.0_darwin_arm64/{frps,frpc} -c
   /tmp/frp-compat-test/<scenario>/…`); **after** `86 passed, 0 failed`, rc 0, 3 m 30 s,
@@ -4267,7 +4272,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   landed in **#396**, the `log_completion` step): **2 of 7** runs failed, panicking at
   `frps/tests/log_completion.rs:502` — the first arms of
   `max_days_zero_is_completed_to_three_on_the_cli_and_in_the_file`, whose failure text is
-  `aged_file_survives`'s readiness panic (`:465-496`: *"no fresh `logs/frps.log.<date>` was written
+  `aged_file_survives`'s readiness panic (`:465-496` on the pre-fix tree; `:513`/`:524` after
+  the fix below: *"no fresh `logs/frps.log.<date>` was written
   within {READY_TIMEOUT:?}, so the child never reached the appender"*). So the atomicity that test
   needs — a backdated `logs/frps.log.2020-01-01` plus a *fresh* daily file written by the child — is
   racy under load, and the assertion that then fails is about **retention**, reported as if the
@@ -4293,12 +4299,12 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   (c) Fix: the wait is now for the appender's **own record** — `fresh_log_reached_appender`
   (`frps/tests/log_completion.rs:485`) requires the fresh file's contents to contain
   `STARTUP_MARKER` (`:91`, the first line `frps` emits after `init_tracing` returns;
-  `frps/src/main.rs:317`), and `aged_file_survives` (`:495-514`) fails fast with
+  `frps/src/main.rs:317`), and `aged_file_survives` (`:501-537`) fails fast with
   `{tag}: frps exited ({status}) before the appender recorded {STARTUP_MARKER:?} in …` instead of
   waiting out the full `READY_TIMEOUT` when the child dies first. (d) Pin + teeth: the new test
-  `readiness_gate_needs_the_appenders_own_record` (`:603`) requires that an empty dir and a dir
-  holding only an old-dated file do **not** satisfy the gate (`:613`) while a file carrying the
-  marker does (`:630`); the two stated mutations are an existence-only predicate (reds the first
+  `readiness_gate_needs_the_appenders_own_record` (`:605`) requires that an empty dir and a dir
+  holding only an old-dated file do **not** satisfy the gate (`:614`) while a file carrying the
+  marker does (`:644`); the two stated mutations are an existence-only predicate (reds the first
   assertion) and dropping the aged-file exclusion (reds the second). (e) The CI lane's own guard
   literal moved 5 → **6** in the same commit (`.github/workflows/ci.yml:451,464,465,468,469,470,472,478`)
   after the step's own `-- --list` counted 6; `env.FRPS_CLI_TESTS` / `env.FRPC_TINY_CLI_TESTS` are
@@ -4306,7 +4312,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   which introduced this file). Residue filed, not fixed: `frpc/tests/warn_delivery.rs` — measured
   here, it does **not** read a rotation file (its contract at `:52-57` is the two captured streams),
   so this item's fix does not apply to it; what it shares is a fixed settle: `SETTLE = 500 ms`
-  (`:92-94`) is slept at `:214` after `wait_for_marker` (`:219`) sees the startup marker, and only
+  (`:92-94`) is slept at `:214` after `wait_for_marker` (`:219` defines it; the call is `:213`)
+  sees the startup marker, and only
   then are the exact per-stream counts snapshotted — the same class of load-dependent assumption,
   never re-measured under load (8 tests in that file).
 - [x] **`frpc`'s eight single-proxy subcommands reject `-c`/`--config`, which Go accepts and
