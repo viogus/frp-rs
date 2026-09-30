@@ -2628,5 +2628,12 @@ mod tests {
         assert_eq!(got, WebServerTlsEnableReader::WebServerNoTls);
         #[cfg(not(feature = "dashboard"))]
         assert_eq!(got, WebServerTlsEnableReader::NoWebServer);
+
+        // Printed only after every assertion above. The CI step runs this test
+        // with `-- --nocapture` and greps this marker, so a body that returns
+        // before its assertions (still `1 passed` under libtest) cannot pass
+        // the step while asserting nothing. The marker names the answer, so it
+        // also witnesses *which* variant this shape resolved to.
+        println!("web-server-tls-enable-reader-pin: ok, {got:?}");
     }
 }
