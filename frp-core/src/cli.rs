@@ -5233,6 +5233,58 @@ mod tests {
             "three occurrences must accumulate in order — capping at two drops the enabling value"
         );
 
+        // Four occurrences, enabling value last: the next step out. Measured on
+        // Go v0.71.0, four *and* five occurrences are each rc 0 on `frps verify`
+        // and `frpc verify` — pflag's `strings` value has no cap at all — so a
+        // literal row here buys one step rather than the class.
+        let four = parse_frpc_verify(&[
+            "verify",
+            "-c",
+            "p7520.toml",
+            "--allow-unsafe",
+            "A",
+            "--allow-unsafe",
+            "B",
+            "--allow-unsafe",
+            "Cc",
+            "--allow-unsafe",
+            "TokenSourceExec",
+        ])
+        .unwrap();
+        assert_eq!(
+            four.allow_unsafe,
+            ["A", "B", "Cc", "TokenSourceExec"].map(String::from),
+            "four occurrences must accumulate in order — capping at three drops the enabling value"
+        );
+
+        // The class itself: the accumulation is unbounded, so assert a wide
+        // occurrence list instead of chasing the next `truncate(n)` one step at a
+        // time. Any cap of at most 31 dies here; the literal rows above and the
+        // two spawn pins keep the process-level rows honest (a spawn pin cannot
+        // generate argv).
+        let wide_n: usize = 32;
+        let mut wide_argv = vec![
+            "verify".to_string(),
+            "-c".to_string(),
+            "p7520.toml".to_string(),
+        ];
+        let mut wide_expected: Vec<String> =
+            (0..wide_n - 1).map(|i| format!("Filler{i}")).collect();
+        for value in &wide_expected {
+            wide_argv.push("--allow-unsafe".to_string());
+            wide_argv.push(value.clone());
+        }
+        wide_expected.push("TokenSourceExec".to_string());
+        wide_argv.push("--allow-unsafe".to_string());
+        wide_argv.push("TokenSourceExec".to_string());
+        let wide = parse_frpc_verify(&wide_argv.iter().map(String::as_str).collect::<Vec<&str>>())
+            .unwrap();
+        assert_eq!(
+            wide.allow_unsafe, wide_expected,
+            "the occurrence list is unbounded — any cap of at most {wide_n} occurrences drops the \
+             trailing enabling value"
+        );
+
         let frps_verify = parse_frps_verify(&[
             "verify",
             "-c",

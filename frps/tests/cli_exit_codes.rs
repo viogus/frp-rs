@@ -279,6 +279,7 @@ fn unresolvable_token_source_exits_3_where_go_exits_1() {
 /// | `frps verify … --allow-unsafe TokenSourceExec --allow-unsafe WrongFeature` | rc 0 (a later unrelated value does not cancel an earlier enabling one) | rc 1 |
 /// | `frps verify … --allow-unsafe Ignored,TokenSourceExec` | rc 0 (each occurrence is comma-split) | rc 0 |
 /// | `frps verify … --allow-unsafe WrongFeature --allow-unsafe Ignored --allow-unsafe TokenSourceExec` | rc 0 (three occurrences append too — the enabling value need not be within the first two) | rc 1 — bpaf refused the second occurrence |
+/// | `frps verify … --allow-unsafe A --allow-unsafe B --allow-unsafe Cc --allow-unsafe TokenSourceExec` | rc 0 (four occurrences append too; Go accepts five as well — pflag's `strings` has no cap) | rc 1 — bpaf refused the second occurrence |
 /// | `frps -c <exec cfg>` (run) | rc 1, the same stdout line | rc 3, `EXIT_AUTH` |
 ///
 /// frp-rs's wording stays its own predicate message; what is pinned is the
@@ -359,12 +360,15 @@ fn verify_runs_the_post_load_allow_unsafe_gate_like_go() {
     );
 
     // pflag's `strings` **appends** on repetition and comma-splits every
-    // occurrence, so Go's verify honours all four spellings below (measured
-    // rc 0 on v0.71.0 for each, in both value orders). The `TokenSourceExec`-first
-    // row separates appending from a last-wins reading; the three-occurrence row
-    // is what kills a parser that caps the accumulation — measured, feeding at
-    // most two occurrences left `.many().map(|mut v: Vec<String>| { v.truncate(2);
-    // v })` green while this row regressed to rc 1.
+    // occurrence, so Go's verify honours all five spellings below (measured
+    // rc 0 on v0.71.0 for each, in both value orders; Go also accepts four and
+    // five occurrences, so there is no bound to pin — the rows are one step each).
+    // The `TokenSourceExec`-first row separates appending from a last-wins
+    // reading; the three-occurrence row kills a parser that caps at two
+    // (`.many().map(|mut v: Vec<String>| { v.truncate(2); v })`) and the
+    // four-occurrence row kills the same mutant one step out (`v.truncate(3)`).
+    // The unbounded class is pinned in `frp-core`'s unit test, which builds 32
+    // occurrences rather than a literal row.
     for extra in [
         vec![
             "--allow-unsafe",
@@ -384,6 +388,16 @@ fn verify_runs_the_post_load_allow_unsafe_gate_like_go() {
             "WrongFeature",
             "--allow-unsafe",
             "Ignored",
+            "--allow-unsafe",
+            "TokenSourceExec",
+        ],
+        vec![
+            "--allow-unsafe",
+            "A",
+            "--allow-unsafe",
+            "B",
+            "--allow-unsafe",
+            "Cc",
             "--allow-unsafe",
             "TokenSourceExec",
         ],
