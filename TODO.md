@@ -3188,7 +3188,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `left: 1 right: 2` at `frps/tests/warn_delivery.rs:650`. Adversarial review measured the dangerous
   direction: one run-failure + one healthy file keeps the healthy listener accepting, SIGUSR1 emits
   exactly one summary (the dead entry is dropped from the registry, the live one kept), no deadlock;
-  `SIGINT`/`SIGTERM` rc 0; 48 repeat runs green (20 + 20 exact-filter, 8 whole-file).
+  `SIGINT`/`SIGTERM` rc 0; 48 repeat runs green (20 + 20 exact-filter, 8 whole-file), measured by
+  Reviewer 1 in its round 1 — not by the adversarial round, which measured the dangerous direction
+  above and the mutant matrix instead.
 - [x] **`frps --config-dir` exits 0 when every config file fails service initialisation.**
   Same `--config-dir` branch as the item above, and the same reason it is worth recording next to
   it. `frps/src/main.rs:221` pushes the `tokio::spawn` handle *before* the service is
@@ -7258,6 +7260,24 @@ section; ledger now **24 open / 104 closed**.**
   Done-when: a load-failing file is tracked in the same all-failed decision so the lane matches
   `-c`'s code, or the divergence is documented as deliberate with the measured table, and pinned.
 
+- [ ] **The `frps --config-dir` SIGUSR1 fan-out has no record of being untested off unix.**
+  Filed by the #419 round-2 review. The handler lives behind `#[cfg(unix)]` (SIGUSR1 is a unix
+  signal), so on a non-unix build the reload path does not exist and the two fan-out pins
+  (`frps/tests/warn_delivery.rs:606`, `:636`) cannot run — which is defensible, but no record states
+  it, so a non-unix build's coverage of the lane is invisible.
+
+  Done-when: the unix-only nature is either recorded where the lane is documented and in the test
+  file's own gating, or a non-unix no-op arm is pinned, so the omission is deliberate and visible.
+
+- [ ] **The mixed init-fail + run-fail `--config-dir` exit code is a probe value, not a pinned one.**
+  Filed by the #419 round-2 review. The `TODO.md:3175` Done block records "mixed init-fail + run-fail
+  → rc 3, nothing listening", but the pinned tests (`frps/tests/cli_exit_codes.rs:581` all-init-fail,
+  `:633` all-run-fail) only assert a non-zero rc with no `listener started` record; the exact `3` for
+  the mixed shape comes from a one-off probe.
+
+  Done-when: a pin asserts the exact code for the mixed shape (or the record says explicitly that only
+  non-zero is contractual for it).
+
 - [ ] **The `frps --config-dir` code comments cite probe scripts that are not in the repo.**
   Filed by the #419 adversarial round-2 review. Three comments in `frps/src/main.rs` justify their
   measured numbers by pointing at scratch probes under `/tmp` — `:214`
@@ -7305,7 +7325,7 @@ section; ledger now **24 open / 104 closed**.**
   or `docs/developing.md` records the asymmetry as deliberate with a measurement of both lanes, and
   a test pins the client's rc.
 
-- [ ] **`docs/developing.md:1471`'s `--config-dir`/`bindAddr = ""` row is a superseded stage record.**
+- [x] **`docs/developing.md:1471`'s `--config-dir`/`bindAddr = ""` row is a superseded stage record.**
   The row's frp-rs column still reads "**rc 0 with nothing bound**" for `--config-dir` with
   `bindAddr = ""`, with `-c` exiting 1 on a lookup error and "the defect is that exit code".
   Measured at `971e0fa0`: `bind_addr = ""` is completed to `0.0.0.0` on both paths —
@@ -7315,3 +7335,8 @@ section; ledger now **24 open / 104 closed**.**
 
   Done-when: the row carries a superseded note (or its "now" column is re-measured), so it cannot be
   read as today's behaviour.
+  Done: fixed in #419 (`e050b1df`, wording corrected in `52a40a36`). The row now carries the
+  superseded note with the measured fill (`frps --config-dir` with that file logs `listener started on
+  0.0.0.0:19961` and keeps running) and the corrected shutdown figure — `SIGTERM` rc 0 once the
+  handler is installed (`frp-server/src/service.rs:1858`; a signal landing in the startup window dies
+  with rc 143 on **both** lanes), per the adversarial round-2 measurement.
