@@ -134,8 +134,12 @@ impl TempDir {
         Self(dir)
     }
 
+    fn path(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+
     fn write(&self, name: &str, contents: &str) -> PathBuf {
-        let path = self.0.join(name);
+        let path = self.path(name);
         std::fs::write(&path, contents).expect("write config");
         path
     }
@@ -263,27 +267,6 @@ struct Spawned {
 }
 
 impl Spawned {
-    /// Spawn on an already-released port and wait for both markers.
-    ///
-    /// The plain path (no retry): the caller owns the [`PortLease`] and calls
-    /// [`PortLease::release`] immediately before this, so the port it names is
-    /// still *its* port at the moment of the handover. Tests that can tolerate a
-    /// retry use [`spawn_admin_ready`] instead.
-    fn run(dir: &TempDir, argv: &[&str], admin_port: u16) -> Self {
-        let child = Command::new(bin())
-            .args(argv)
-            .current_dir(&dir.0)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn frpc");
-        let mut spawned = Self::from_child(child, admin_port);
-        spawned.wait_for(STARTUP_MARKER);
-        spawned.wait_for(ADMIN_MARKER);
-        std::thread::sleep(SETTLE);
-        spawned
-    }
-
     fn from_child(mut child: Child, admin_port: u16) -> Self {
         let out = Arc::new(Mutex::new(String::new()));
         let err = Arc::new(Mutex::new(String::new()));
@@ -302,15 +285,9 @@ impl Spawned {
         self.admin_port
     }
 
-    /// Wait until `marker` appears on either stream, or panic with both.
-    fn wait_for(&mut self, marker: &str) {
-        if let Err(why) = self.wait_until(marker) {
-            panic!("{why}");
-        }
-    }
-
-    /// [`Spawned::wait_for`] without the panic, so a **retryable** startup
-    /// failure ([`spawn_admin_ready`]) can report it and try another port. The
+    /// Wait until `marker` appears on either stream, or return why it did not, so
+    /// a **retryable** startup failure ([`spawn_admin_ready`]) can report it and
+    /// try another port instead of panicking out the whole readiness timeout. The
     /// first line of the message is stable ("exited"/"never"), so callers and
     /// logs can tell the two apart.
     fn wait_until(&mut self, marker: &str) -> Result<(), String> {
@@ -382,6 +359,51 @@ impl Spawned {
         );
         assert_clause_is_the_dashboard_one(tag, &out);
     }
+}
+
+/// Fresh, **releasable** leases for [`spawn_ready`]: one per attempt, so a port
+/// another process re-took during the handover costs one retry rather than the
+/// whole readiness timeout.
+struct FreePorts;
+
+impl Iterator for FreePorts {
+    type Item = PortSource;
+
+    fn next(&mut self) -> Option<PortSource> {
+        Some(PortSource::releasable(free_port()))
+    }
+}
+
+/// The spawn every test in this file uses: pick a fresh leased port, hand it to
+/// the child, and wait for the admin listener — **retrying on another leased
+/// port** if the child cannot bind the one it was given.
+///
+/// There is no plain one-shot path any more. A number picked from the ephemeral
+/// range and released just before the spawn can be taken by another process on
+/// this host in the handover window, and the child does **not** exit on
+/// `AddrInUse` (it keeps retrying its own server), so a one-shot "wait for the
+/// admin marker" spends the whole [`READY_TIMEOUT`] and then fails a test that
+/// had nothing wrong with it — the round-2 flake this closes. Going through
+/// [`spawn_admin_ready`] makes a lost port recoverable; panics are reserved for
+/// "every attempt failed on a distinct port", which is not contention.
+fn spawn_ready(dir: &TempDir, argv: &[&str], write_config: impl Fn(&PortSource)) -> Spawned {
+    let mut ports = FreePorts;
+    // Nothing is deliberately held on this path, so the leases never escape the
+    // loop; the forced-failure `admin_port_retry_recovers_from_a_held_port` owns
+    // and asserts against its own held lease.
+    let mut held_alive = Vec::new();
+    // No test here asserts on the per-attempt reasons, but `spawn_admin_ready`
+    // prints each one as it happens and includes them in its panic if the retry
+    // budget runs out.
+    let mut failures = Vec::new();
+    spawn_admin_ready(
+        dir,
+        argv,
+        write_config,
+        &mut ports,
+        &mut held_alive,
+        &mut failures,
+    )
 }
 
 /// Spawn the child and wait for its admin listener, **retrying with a fresh
@@ -590,13 +612,12 @@ const MAIN_PROXY: &str =
 #[test]
 fn hand_edit_after_startup_is_reported() {
     let dir = TempDir::new("hand-edit");
-    let admin_port = free_port();
-    let cfg = dir.write("frpc.toml", &frpc_config(admin_port.port(), ""));
-    // `release()` closes our probe socket and hands the number to the child; the
-    // lease is dead from here on, so later reads go through `child.admin_port()`.
-    let child_port = admin_port.port();
-    admin_port.release();
-    let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()], child_port);
+    let cfg = dir.path("frpc.toml");
+    // Each attempt writes the port that attempt uses; `spawn_ready` releases the
+    // lease and retries with a fresh one if the child cannot bind it.
+    let child = spawn_ready(&dir, &["-c", cfg.to_str().unwrap()], |source| {
+        dir.write("frpc.toml", &frpc_config(source.lease.port(), ""));
+    });
     assert_eq!(
         child.records(),
         0,
@@ -629,13 +650,10 @@ fn hand_edit_after_startup_is_reported() {
 #[test]
 fn startup_record_is_not_repeated_by_a_get() {
     let dir = TempDir::new("no-dup");
-    let admin_port = free_port();
-    let cfg = dir.write("frpc.toml", &frpc_config(admin_port.port(), ENABLE));
-    // `release()` closes our probe socket and hands the number to the child; the
-    // lease is dead from here on, so later reads go through `child.admin_port()`.
-    let child_port = admin_port.port();
-    admin_port.release();
-    let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()], child_port);
+    let cfg = dir.path("frpc.toml");
+    let child = spawn_ready(&dir, &["-c", cfg.to_str().unwrap()], |source| {
+        dir.write("frpc.toml", &frpc_config(source.lease.port(), ENABLE));
+    });
     child.assert_records(1, "the startup record");
 
     for i in 0..3 {
@@ -660,22 +678,21 @@ fn startup_record_is_not_repeated_by_a_get() {
 #[test]
 fn seed_reads_the_file_non_strictly() {
     let dir = TempDir::new("non-strict");
-    let admin_port = free_port();
+    let cfg = dir.path("frpc.toml");
     // An unknown top-level field: accepted by the runtime only because the run
     // is non-strict, and enough to make a strict seed fail.
-    let cfg = dir.write(
-        "frpc.toml",
-        &format!(
-            "unknown_top_level_field = 1\n{}",
-            frpc_config(admin_port.port(), "")
-        ),
-    );
-    let child_port = admin_port.port();
-    admin_port.release();
-    let child = Spawned::run(
+    let child = spawn_ready(
         &dir,
         &["--strict-config=false", "-c", cfg.to_str().unwrap()],
-        child_port,
+        |source| {
+            dir.write(
+                "frpc.toml",
+                &format!(
+                    "unknown_top_level_field = 1\n{}",
+                    frpc_config(source.lease.port(), "")
+                ),
+            );
+        },
     );
     assert_eq!(child.records(), 0, "no key at startup");
 
@@ -737,16 +754,16 @@ fn seed_resolves_spellings_only_the_loader_does() {
     //     the presence detector finds its `tls` through the `[common]` fallback —
     //     read before `normalize`, so the per-key merge is not what keeps it.
     let dir = TempDir::new("loader-common");
-    let admin_port = free_port();
-    let cfg = dir.write(
-        "frpc.toml",
-        &frpc_config(admin_port.port(), "[common.webServer.tls]\nenable = true\n"),
-    );
-    // `release()` closes our probe socket and hands the number to the child; the
-    // lease is dead from here on, so later reads go through `child.admin_port()`.
-    let child_port = admin_port.port();
-    admin_port.release();
-    let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()], child_port);
+    let cfg = dir.path("frpc.toml");
+    let child = spawn_ready(&dir, &["-c", cfg.to_str().unwrap()], |source| {
+        dir.write(
+            "frpc.toml",
+            &frpc_config(
+                source.lease.port(),
+                "[common.webServer.tls]\nenable = true\n",
+            ),
+        );
+    });
     child.assert_records(1, "(a) the startup record for the [common] spelling");
     for _ in 0..3 {
         let response = admin_get(child.admin_port(), "(a) common spelling");
@@ -757,20 +774,17 @@ fn seed_resolves_spellings_only_the_loader_does() {
     // (b) The same key in an `includes` file, which `process_includes`
     //     deep-merges before the detector runs.
     let dir = TempDir::new("loader-includes");
-    let admin_port = free_port();
-    let cfg = dir.write(
-        "frpc.toml",
-        &format!(
-            "includes = [\"inc.toml\"]\n{}",
-            frpc_config(admin_port.port(), "")
-        ),
-    );
-    dir.write("inc.toml", "[common.webServer.tls]\nenable = true\n");
-    // `release()` closes our probe socket and hands the number to the child; the
-    // lease is dead from here on, so later reads go through `child.admin_port()`.
-    let child_port = admin_port.port();
-    admin_port.release();
-    let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()], child_port);
+    let cfg = dir.path("frpc.toml");
+    let child = spawn_ready(&dir, &["-c", cfg.to_str().unwrap()], |source| {
+        dir.write(
+            "frpc.toml",
+            &format!(
+                "includes = [\"inc.toml\"]\n{}",
+                frpc_config(source.lease.port(), "")
+            ),
+        );
+        dir.write("inc.toml", "[common.webServer.tls]\nenable = true\n");
+    });
     child.assert_records(1, "(b) the startup record for the includes spelling");
     for _ in 0..3 {
         let response = admin_get(child.admin_port(), "(b) includes spelling");
@@ -786,14 +800,14 @@ fn seed_resolves_spellings_only_the_loader_does() {
     //     read of an *absent* `frpc.toml` is not caught here: `NO_BASELINE`
     //     baselines silently on the first GET, so the counts would match.)
     let dir = TempDir::new("loader-argument");
-    let admin_port = free_port();
-    dir.write("frpc.toml", &frpc_config(admin_port.port(), ""));
-    let cfg = dir.write("admin-node.toml", &frpc_config(admin_port.port(), ENABLE));
-    // `release()` closes our probe socket and hands the number to the child; the
-    // lease is dead from here on, so later reads go through `child.admin_port()`.
-    let child_port = admin_port.port();
-    admin_port.release();
-    let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()], child_port);
+    let cfg = dir.path("admin-node.toml");
+    let child = spawn_ready(&dir, &["-c", cfg.to_str().unwrap()], |source| {
+        // Both files name the port this attempt actually uses, so a retry cannot
+        // leave the cwd file pointing at a port another attempt owns.
+        let port = source.lease.port();
+        dir.write("frpc.toml", &frpc_config(port, ""));
+        dir.write("admin-node.toml", &frpc_config(port, ENABLE));
+    });
     child.assert_records(1, "(c) the startup record for a non-default filename");
     for _ in 0..3 {
         let response = admin_get(child.admin_port(), "(c) non-default filename");
@@ -821,17 +835,12 @@ fn seed_resolves_spellings_only_the_loader_does() {
     //     the proxy-less cwd file still emits the same single record, but answers
     //     `404 proxy "main" not found` instead of describing the proxy.
     let dir = TempDir::new("loader-precedence");
-    let admin_port = free_port();
-    dir.write("frpc.toml", &frpc_config(admin_port.port(), ENABLE));
-    let cfg = dir.write(
-        "admin-node.toml",
-        &frpc_config(admin_port.port(), MAIN_PROXY),
-    );
-    // `release()` closes our probe socket and hands the number to the child; the
-    // lease is dead from here on, so later reads go through `child.admin_port()`.
-    let child_port = admin_port.port();
-    admin_port.release();
-    let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()], child_port);
+    let cfg = dir.path("admin-node.toml");
+    let child = spawn_ready(&dir, &["-c", cfg.to_str().unwrap()], |source| {
+        let port = source.lease.port();
+        dir.write("frpc.toml", &frpc_config(port, ENABLE));
+        dir.write("admin-node.toml", &frpc_config(port, MAIN_PROXY));
+    });
     assert_eq!(
         child.records(),
         0,
