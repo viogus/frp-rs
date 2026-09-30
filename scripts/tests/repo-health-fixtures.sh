@@ -58,16 +58,19 @@ set -uo pipefail
 #     before the comparison, so no spelling of zero slips past the `0)` arm, and
 #     diagnostics print the decimal value — `printf '%d'` reads `032` as octal
 #     26, so it is not used (R2-2/R2-3);
-#   * the floor comparisons are *guarded*, not bare: a non-numeric `MIN_CHECKS`
-#     (or a non-numeric `checks`) makes `[ … -lt … ]` return status 2, which
-#     `if`/`elif` read as false — so both branches would be skipped and the suite
-#     would exit green on a floor it cannot parse. Everything is validated as
-#     digits first, and a floor that is not a number is a failure; digits alone
-#     were *not* enough, though — an all-digit floor above `9223372036854775807`
-#     is unparseable as an integer even though it parses fine as a string, so the
-#     below-floor test itself is an ordered comparison of digit strings, and such
-#     a floor is an ordinary below-floor failure rather than a status-2 skip
-#     (R3-1);
+#   * the floor is never compared with `[ … -lt … ]` on the values: a floor that
+#     is not a number is rejected by the `case` arms below — an empty or
+#     non-digit `MIN_CHECKS` (and a non-digit `checks`) is a failure, not a skip
+#     — and the below-floor test is an ordered comparison of digit strings:
+#     length first (`[ "${#checks}" -lt "${#MIN_CHECKS}" ]`, with `-eq` on the
+#     lengths to reach the tie-break), then left-to-right at equal length
+#     (`[ "$checks" \< "$MIN_CHECKS" ]`). So `-lt` only ever sees two *lengths* —
+#     short decimal numbers — and cannot return status 2 on an all-digit floor,
+#     however long: a value above `9223372036854775807` is unparseable as an
+#     integer but fine as a string, so it lands as an ordinary below-floor
+#     failure rather than a skipped branch (R3-1). Length-then-string order is
+#     exactly numeric order for digit strings, which is what makes it fail
+#     closed;
 #   * `exec true` in place of an ordinary exit still skips the EXIT trap — no
 #     in-file mechanism can intercept `exec`, and the sibling suite had the same
 #     hole. The closure for that one is outside the file: the CI step's own
@@ -77,8 +80,14 @@ set -uo pipefail
 # A total is also not a *shape*, so `delete N checks, add N dummy ok lines`
 # keeps it; the sibling pins its ordered assertion list for that reason. Here the
 # assertion set is loop-driven (scenario 4 walks four sites, scenario 10 two
-# shapes), so the count is what can be pinned without a second instrumented
-# counter per scenario; that residual gap is recorded in the batch-E report.
+# shapes), and there is no per-scenario tally to pin: `checks` is one run-wide
+# counter, initialised to 0 and bumped once by every `ok()` and every `bad()`
+# call, so the floor it feeds (`MIN_CHECKS`) bounds the number of assertions
+# *attempted* across the whole run — passed and failed alike, with no
+# per-scenario breakdown and no relation to the number of `ok` lines printed.
+# Pinning an ordered assertion list would need a second instrumented counter per
+# scenario, which this suite does not keep; the count is what can be pinned, and
+# that residual gap is recorded in the batch-E report.
 MIN_CHECKS=32
 checks=0
 fail=0
