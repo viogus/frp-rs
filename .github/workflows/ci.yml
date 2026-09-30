@@ -476,7 +476,7 @@ jobs:
         # pinned); this step does not set it.
         #
         # **This step asserts the count, because a bare `cargo test --test <f>`
-        # cannot tell "5 passed" from "0 ran".** Measured: with the file's
+        # cannot tell "6 passed" from "0 ran".** Measured: with the file's
         # cfg gate mutated to a feature that does not exist (the disable
         # mutation), the plain invocation prints `running 0 tests` /
         # `test result: ok. 0 passed; 0 failed` and exits **0** — a gate quieter

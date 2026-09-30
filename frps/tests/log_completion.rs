@@ -447,8 +447,8 @@ fn cli_empty_log_file_keeps_logging_on_stdout() {
 // config logs to a file, so stdout carries no startup record, and its
 // `TcpStream::connect` liveness probe would inject a WARN record into the stream
 // a byte-count assertion would be reading (the sibling shapes' 1498 B / 7-record
-// convention is measured with no connect). Liveness here is the appearance of
-// today's rotation file, which only the running appender writes.
+// convention is measured with no connect). Liveness here is the appender's own
+// `STARTUP_MARKER` record in that file, not the file's existence — see `fresh_log_reached_appender`.
 
 /// 2020-01-01T00:00:00Z — far outside any `max_days` this test uses.
 const AGED: SystemTime = UNIX_EPOCH;
@@ -591,14 +591,16 @@ fn max_days_zero_is_completed_to_three_on_the_cli_and_in_the_file() {
 /// satisfy [`fresh_log_reached_appender`], and the aged fixture must never be
 /// mistaken for the fresh one.
 ///
-/// Mutations that must turn this test red (both measured): (1) restore the
+/// Mutations that must turn this test red (all three measured): (1) restore the
 /// pre-fix predicate — `fresh_rotation_file(dir).is_some()` — as
 /// [`fresh_log_reached_appender`]'s body: the first assertion then fails at
 /// this test's `assert!` line, because `rolling::daily` has already created the
 /// empty file (`frp-core/src/logging.rs:378`) while nothing has been written to
 /// it; (2) drop the `frps.log.2020-01-01` exclusion from
 /// [`fresh_rotation_file`]: the second assertion fails, since `files_in` sorts
-/// and the aged fixture comes first.
+/// and the aged fixture comes first; (3) delete the `spawned.exited()` arm in
+/// [`aged_file_survives`]: the last arm below then receives the 15 s timeout
+/// panic instead of the exit-status one, and fails on its wording.
 #[test]
 fn readiness_gate_needs_the_appenders_own_record() {
     let dir = TempDir::new("readiness");
@@ -620,6 +622,19 @@ fn readiness_gate_needs_the_appenders_own_record() {
         "the aged fixture must never be reported as the fresh rotation file"
     );
 
+    // The gate keys on the **full** post-`init_logging` record, not on the
+    // program name that every record in this file carries: a record holding the
+    // name alone must still not satisfy it. Measured at head, the file holds
+    // exactly one record before the gate opens — the marker line itself — so this
+    // is the sharper form of the assertion above, and it is what makes a marker
+    // weakened to a bare program name red.
+    std::fs::write(&fresh, "INFO frps: starting\n").expect("write a name-only record");
+    assert!(
+        !fresh_log_reached_appender(&dir),
+        "a name-only record must not satisfy the readiness gate — the marker is the appender's own \
+         post-`init_logging` line, not the program name"
+    );
+
     // The appender's own post-`init_logging` record is the evidence.
     std::fs::write(
         &fresh,
@@ -629,5 +644,30 @@ fn readiness_gate_needs_the_appenders_own_record() {
     assert!(
         fresh_log_reached_appender(&dir),
         "the appender's own startup record must satisfy the readiness gate"
+    );
+
+    // Fail-fast arm: a child that can never satisfy the gate — here one whose
+    // `--bind-port` is unparsable, so it is gone before `init_logging` — must be
+    // reported by its own exit status and its streams, not by burning
+    // [`READY_TIMEOUT`] on a process that is already gone. Measured at head:
+    // this arm panics ~1.6 s in at [`aged_file_survives`]'s `spawned.exited()`
+    // panic; without that arm the same input reaches the timeout panic ~15 s in.
+    let port = free_port();
+    let exited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        aged_file_survives(
+            "fail-fast arm: unparsable --bind-port",
+            &file_lane_config(port, ""),
+            &["--bind-port", "not-a-port"],
+        )
+    }))
+    .expect_err("a child that cannot start must panic, not return a retention verdict");
+    let message = exited
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| exited.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_default();
+    assert!(
+        message.contains("before the appender recorded"),
+        "the readiness gate must report the child's own exit; got: {message}"
     );
 }
