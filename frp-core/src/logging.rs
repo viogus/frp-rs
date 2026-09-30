@@ -49,7 +49,7 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// Go's zero value (`info`/`console`/`3`) and *raise* a file's explicit `warn`.
 /// Before that skip the two binaries disagreed whenever the file set a
 /// non-default `level`: on the implicit `./frps.toml` lane, `frps` **before
-/// `a75c79eb`** wrote the empty flag into `[log] level` (`override_server_config`
+/// `c8451157`** wrote the empty flag into `[log] level` (`override_server_config`
 /// took every `Some`, empty or not) and `LogConfig::complete` then filled it to
 /// `"info"`, so `--log-level ""` produced 11 `INFO` records where no flag gave
 /// 0, while `frpc` honoured the file. That resolved-`info` output is what this
@@ -75,7 +75,7 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// first being `frps uses command line arguments for config`. frp-rs has no counterpart
 /// lane — without `-c` it still reads `./frps.toml` (a missing file exits 1),
 /// and `--config-dir` takes the `init_logging(&cli, None)` path
-/// (`frps/src/main.rs:193`). `frpc`'s Go run path binds no `--log-level` flag at
+/// (`frps/src/main.rs:467`). `frpc`'s Go run path binds no `--log-level` flag at
 /// all (`Error: unknown flag: --log-level`, rc 1), so the two binaries can be
 /// compared on the value they resolve but not on the flag surface.
 ///
@@ -84,7 +84,7 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// `frps -c frps.toml --log-level info` prints 11 `INFO` records where Go
 /// prints **0**. frp-rs gates only
 /// `override_server_config` on `cli_overrides_enabled`
-/// (`frps/src/main.rs:451-452`), while `init_logging` (`:456`, body at `:118`)
+/// (`frps/src/main.rs:986-988`), while `init_logging` (`:991`, defined at `:392`)
 /// still reads the raw CLI value. That is pre-existing and is *not* what this
 /// function's zero-value filter fixes — the empty-value rows are the ones that
 /// now agree.

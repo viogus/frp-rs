@@ -4474,7 +4474,7 @@ mod tests {
     /// (`frp-core/src/config/server.rs`). Writing them through this override
     /// therefore silently **raised** a config file's explicit
     /// `[log] level = "warn"` back to `info` on the one lane that applies
-    /// overrides — on the pre-fix revision `3f66d823` (before `a75c79eb`),
+    /// overrides — on the pre-fix revision `3f66d823` (before `c8451157`),
     /// frps run with `frps.toml` (`[log] level = "warn"`) in the cwd and no
     /// `-c`: the empty flag was written into `[log] level` and completed to
     /// `info`, so `--log-level ""` resolved to `info` (11 `INFO` records) where
