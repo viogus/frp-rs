@@ -801,7 +801,9 @@ What the walk does **not** reach, each cell measured on Go frp v0.71.0
   `normalize_proxies` removes those tables before the check, keeping only their
   `set` map. Measured: `[proxies.requestHeaders] notAKnownRhKey = 1` →
   Go `decode proxy at index 0: unmarshal ProxyConfig error: json: unknown field
-  "notAKnownRhKey"`, exit 1; frp-rs `Config file … is valid`, exit 0.
+  "notAKnownRhKey"`, exit 1; frp-rs `Config file … is valid`, exit 0 (the
+  success line has since moved to Go's `frpc: the configuration file …
+  syntax is ok`).
 * A mis-cased key is refused where Go accepts **and applies** it. Go's
   `encoding/json` decoder matches object keys case-insensitively, so
   `[[proxies]] … RemotePort = 7198` is read as `remotePort`; frp-rs's lists match
@@ -815,8 +817,11 @@ What the walk does **not** reach, each cell measured on Go frp v0.71.0
   walk: `SERVERADDR` at the top level is Go-accepted (exit 0, measured) and
   frp-rs-refused (`unknown field "SERVERADDR"`, exit 1).
 * A **legacy-shaped top-level section** — any top-level mapping that carries a
-  `type` key, in **any** config format, because the collector keys on the shape
-  and `normalize_client_config` never sees the file format — is fed through the
+  `type` key, in **any** config format, because the collector keys on the shape;
+  since the typeless-`.ini` rule a section-like mapping carrying
+  `local_port`/`remote_port` is legacy-shaped too, in the one format where the
+  loader now passes the dialect down (the INI collector takes it as an argument,
+  while `normalize_client_config` still sees no format) — is fed through the
   same check, but with Go's accept-and-ignore semantics rather than the v1
   surface's rejection: the legacy collector folds the prefix mechanisms Go reads
   (`meta_*` → `metadatas`, `header_*` → `headers` for `type = "http"`,
