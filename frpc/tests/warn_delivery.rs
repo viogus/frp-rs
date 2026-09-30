@@ -94,11 +94,20 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(10);
 /// replaces the old fixed `SETTLE` sleep: a sleep is a guess about the
 /// scheduler, and under load the reader thread can be scheduled late enough that
 /// a record already in the pipe is not yet in the buffer (the failure recorded
-/// in `TODO.md:7879`: the snapshot ran after 500 ms and the count was 0).
-/// Waiting on the record is load-independent — the record either arrives or the
-/// wait fails loudly. It never grows a mutant's count: the assertion still runs
-/// against the frozen snapshot.
+/// in `TODO.md:7960`, the `frpc/tests/warn_delivery.rs` "snapshots its counts
+/// after a fixed 500 ms settle" item: the snapshot ran after 500 ms and the count
+/// was 0). Waiting on the record is load-independent — the record either arrives
+/// or the wait fails loudly.
 const RECORD_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the count must **stop changing** before it is frozen.
+/// [`Spawned::wait_for_record`] waits for "at least `want`" records, so on its
+/// own it returns on the first poll that sees one and a duplicate emitted one
+/// poll later is frozen out of the snapshot — the `exactly one` assertion then
+/// never sees it (measured against the pre-quiet-period wait: a child emitting
+/// the same record twice 150 ms apart stayed green 8/8, while the fixed `SETTLE`
+/// this file replaced caught it). Requiring quiet after the **last** change
+/// restores that detection while keeping the wait load-independent.
+const QUIET_PERIOD: Duration = Duration::from_millis(500);
 /// A substring of the first record `frpc` emits **after** `init_logging`, so
 /// seeing it proves the load succeeded and a subscriber exists.
 const STARTUP_MARKER: &str = "frpc (Rust) v";
@@ -217,15 +226,16 @@ struct Spawned {
 /// [`Spawned::run`] can wait on the **record** rather than on a fixed sleep.
 #[derive(Clone, Copy)]
 enum Expect {
-    /// Exactly one [`KEY`] record. Waits (bounded) for it to appear, because the
-    /// startup line is *not* a barrier for it: on `--config-dir` the line is
-    /// printed by `frpc/src/main.rs:516` **before** the per-file loop emits at
-    /// `:530`, and even on `-c` (`:645` before `:647`) the reader thread may not
-    /// have appended the bytes yet.
+    /// Exactly one [`KEY`] record. Waits (bounded) for it to appear **and for
+    /// the count to stop moving**, because the startup line is *not* a barrier
+    /// for it: on `--config-dir` the line is printed by `frpc/src/main.rs:516`
+    /// **before** the per-file loop emits at `:530`, and even on `-c` (`:647`
+    /// before `:649`) the reader thread may not have appended the bytes yet. The
+    /// quiet period is what makes the asserted count final — see [`QUIET_PERIOD`].
     Warning,
     /// No [`KEY`] record. Every row that expects silence is a `-c` row, where
-    /// the call site emits the record **before** the startup line (`:645` vs
-    /// `:647`) on the same sink — so once the reader has appended the line it has
+    /// the call site emits the record **before** the startup line (`:647` vs
+    /// `:649`) on the same sink — so once the reader has appended the line it has
     /// already appended any earlier record, and the startup line is a sound
     /// barrier. No sleep is needed, and none is used.
     Silence,
@@ -250,14 +260,25 @@ impl Spawned {
     }
 
     /// Wait (bounded) until at least `want` [`KEY`] records are visible on
-    /// stdout, then return. Replaces the fixed settle: the condition is the
-    /// record, so a slow scheduler delays the wait instead of falsifying the
-    /// count.
+    /// stdout **and the count has held still for [`QUIET_PERIOD`]**, then return.
+    /// Replaces the fixed settle: the condition is the record, so a slow
+    /// scheduler delays the wait instead of falsifying the count. The quiet
+    /// requirement is the other half — an "at least" wait alone returns on the
+    /// first poll that sees `want` records, so a duplicate that arrives one poll
+    /// later is frozen out of the snapshot and the `exactly one` assertion never
+    /// sees it.
     fn wait_for_record(&mut self, want: usize) {
         let deadline = Instant::now() + RECORD_TIMEOUT;
+        let mut seen = 0;
+        let mut quiet_since = Instant::now();
         loop {
             let out = self.peek_stdout();
-            if occurrences(&out, KEY) >= want {
+            let count = occurrences(&out, KEY);
+            if count != seen {
+                seen = count;
+                quiet_since = Instant::now();
+            }
+            if count >= want && quiet_since.elapsed() >= QUIET_PERIOD {
                 return;
             }
             let err = self.peek_stderr();
@@ -271,8 +292,9 @@ impl Spawned {
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "frpc never emitted {want} {KEY:?} record(s) on stdout within \
-                     {RECORD_TIMEOUT:?}\n--- stdout ({}) ---\n{out}\n--- stderr ({}) ---\n{err}",
+                    "frpc never emitted {want} {KEY:?} record(s) on stdout and left the count \
+                     unchanged for {QUIET_PERIOD:?} within {RECORD_TIMEOUT:?}\n\
+                     --- stdout ({}) ---\n{out}\n--- stderr ({}) ---\n{err}",
                     out.len(),
                     err.len(),
                 );
@@ -442,8 +464,8 @@ fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
 /// All three variants open with the same `web_server.tls.enable has no effect: …`,
 /// so the count assertions above pass either way: a call site that hardcodes
 /// another answer still compiles and still emits one `KEY` record. The call sites
-/// this file reaches are `frpc/src/main.rs:529` (`--config-dir`), `:606` (`-c`)
-/// and `:791` (`verify`). `frp-core`'s own dispatch test passes the caller's
+/// this file reaches are `frpc/src/main.rs:530` (`--config-dir`), `:647` (`-c`)
+/// and `:832` (`verify`). `frp-core`'s own dispatch test passes the caller's
 /// answer as an argument, so only this assertion on the captured output can see
 /// what the binary answered.
 ///
@@ -641,7 +663,7 @@ fn no_server_tls_enable_warning_in_frpc_where_the_field_is_live() {
 fn frpc_verify_says_nothing_about_the_server_tls_enable_key() {
     let dir = TempDir::new("srv-key-verify");
     // The nested key is what lets this row witness the `verify` call site
-    // (`frpc/src/main.rs:791`): with no `[web_server.tls] enable` the presence
+    // (`frpc/src/main.rs:832`): with no `[web_server.tls] enable` the presence
     // flag stays unset and the record never fires, so a hardcoded answer there
     // was invisible to every lane.
     let cfg = format!(
