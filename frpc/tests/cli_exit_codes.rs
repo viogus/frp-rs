@@ -698,8 +698,8 @@ fn verify_runs_the_post_load_allow_unsafe_gate_like_go() {
             "frpc: the configuration file {cfg} syntax is ok\n  Server: 127.0.0.1:7000\n  \
              Proxies: 0\n  Visitors: 0\n"
         ),
-        "the accept row keeps the success shape Go prints (#418 moved the sentence); \
-         stderr={:?}",
+        "Go prints that sentence and nothing else; the three summary lines are frp-rs's own \
+         extension (#418 moved the sentence here); stderr={:?}",
         stderr_of(&accept),
     );
     assert!(
@@ -778,8 +778,8 @@ fn verify_runs_the_post_load_allow_unsafe_gate_like_go() {
                 "frpc: the configuration file {cfg} syntax is ok\n  Server: 127.0.0.1:7000\n  \
                  Proxies: 0\n  Visitors: 0\n"
             ),
-            "the accepted repeat keeps the success shape Go prints (#418 moved the sentence); \
-             stderr={:?}",
+            "Go prints that sentence and nothing else; the three summary lines are frp-rs's own \
+             extension (#418 moved the sentence here); stderr={:?}",
             stderr_of(&repeated),
         );
     }
