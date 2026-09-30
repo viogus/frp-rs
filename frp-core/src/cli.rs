@@ -2642,9 +2642,10 @@ const CSV_BARE_QUOTE: &str = "bare \" in non-quoted-field";
 /// | `A, TokenSourceExec` | `A`, ` TokenSourceExec` (space kept) | 1 |
 /// | `TokenSourceExec` | `TokenSourceExec` | 0 |
 /// | `Ignored,TokenSourceExec` | `Ignored`, `TokenSourceExec` | 0 |
-/// | `""` inside an element (`"a""b"`) | `a"b` | 0 |
-/// | `"a,b"` (comma inside quotes) | `a,b` | 0 |
-/// | `a,,b` (empty element) | `a`, ``, `b` | 0 |
+/// | `"a""b"` (doubled quote inside a field) | `a"b` | 1 |
+/// | `"a,b"` (comma inside quotes) | `a,b` | 1 |
+/// | `a,,b` (empty element) | `a`, ``, `b` | 1 |
+/// | `"a""b",TokenSourceExec`, `"a,b",TokenSourceExec`, `a,,b,TokenSourceExec` | those fields plus `TokenSourceExec` | 0 |
 /// | `TokenSourceExec\r` | `TokenSourceExec` (trailing CR is a terminator) | 0 |
 /// | `"abc` (unclosed quote) | error `extraneous or missing " in quoted-field` | 1 |
 /// | `a"b` (bare quote) | error `bare " in non-quoted-field` | 1 |
