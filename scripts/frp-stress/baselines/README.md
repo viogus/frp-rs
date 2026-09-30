@@ -60,13 +60,19 @@ The faults are:
 - a process that died at any point in the window, **including during the last
   sampling interval** (the liveness scan runs before the window-end test);
 - any RSS column with zero usable readings — `ps` never returned a number for it;
-- an RSS reading outside `1..SOAK_RSS_CEILING_KB` (default 100 GiB), or a column
-  whose readings are **all identical** across the series. Either shape can only
-  come from `ps` not reporting real processes: a stubbed `ps` printing `0`
-  produced a table of zeros, and one printing a constant produced exactly the
-  "perfectly flat" line this artifact is meant to test for. The identical-values
-  rule is deliberately strict — real RSS over hours always moves, so a
-  legitimately flat short validation is a cheap re-run, whereas a constant is
+- an RSS reading outside the ceiling the artifact records (`rss_ceiling_kb`;
+  `SOAK_RSS_CEILING_KB`, then 1 GiB, when it records none), or a column whose
+  readings are **all identical** across the series. These are magnitude and shape
+  guards, not proof that `ps` measured a real process: a stub printing `0` yields
+  a rejected all-zero column, and one printing a constant yields exactly the
+  "perfectly flat" line this artifact is meant to test for, but a stub that
+  returns a **different** plausible number for every sample (e.g.
+  `printf "%s\n" $(( 50000 + ($$ % 9000) ))`) passes every rule here and is
+  published as a completed run. The series therefore establishes the absence of
+  the fault modes named above plus a curve consistent with a live process — not
+  that the numbers came from the kernel rather than from a stubbed `ps`. The
+  identical-values rule is deliberately strict: real RSS over hours always moves,
+  so a legitimately flat short validation is a cheap re-run, whereas a constant is
   otherwise indistinguishable from the strongest possible result;
 - either side's churn completing no echo round trips, or its steady stream
   moving no bytes;
@@ -95,10 +101,12 @@ Two env knobs tune the refusals above, and both are documented by
 
 - `SOAK_TRAFFIC_TOLERANCE` (default `0.10`) — relative achieved-volume spread
   allowed between the two sides.
-- `SOAK_RSS_CEILING_KB` (default `104857600`) — largest RSS reading accepted as
-  real; the bound is applied by the soak when it samples and again by the
-  summary reader, so an artifact produced elsewhere cannot present an
-  implausible value as evidence either.
+- `SOAK_RSS_CEILING_KB` (default `1048576`, 1 GiB) — largest RSS reading accepted
+  as real; a reading outside the bound is a missing reading, and the bound a run
+  used is recorded in its artifact as `rss_ceiling_kb`, so the reader judges the
+  artifact by its own bound rather than by its environment (see "The RSS ceiling"
+  below). It is a plausibility bound, not an oracle: an artifact produced
+  elsewhere can still present a fabricated *plausible* value as evidence.
 
 ### The RSS ceiling
 
