@@ -630,13 +630,18 @@ fn config_dir_where_every_service_fails_to_run_exits_like_dash_c() {
 
 /// The client half of the file-order sort pin
 /// (`frps/tests/cli_exit_codes.rs::config_dir_exits_the_first_files_code_when_a_later_file_fails_to_load`).
-/// `frpc/src/main.rs`'s all-failed decision sorts `failures` by file index, and
-/// the only fixture that observes that sort is this mix: `a.toml`'s service
+/// `frpc/src/main.rs`'s all-failed decision sorts `failures` by file index. This
+/// fixture observes the sort's **removal**, not its key: `a.toml`'s service
 /// stops at **run** time — its task returns `Err(EXIT_RUNTIME)`/1 *after* the
 /// loop — while `b.toml` fails to **load** (`EXIT_CONFIG`/2, recorded in file
-/// order first). Sorted, the file-order first failure is `a.toml`'s 1; with
+/// order first), so the pre-sort vector is `[(1, 2), (0, 1)]`. Sorted, the
+/// file-order first failure is `a.toml`'s 1; with
 /// `failures.sort_by_key(|(file_index, _)| *file_index)` deleted the lane exits
-/// `b.toml`'s 2 instead.
+/// `b.toml`'s 2 instead. Removing the sort is all this shape can see —
+/// `failures.reverse()` and `sort_by_key(|(_, code)| *code)` both put
+/// `(0, 1)` first here and stay green — which is why the mirror fixture
+/// `config_dir_exits_the_first_files_code_when_a_load_failure_precedes_a_run_failure`
+/// exists below to pin the comparator itself.
 #[test]
 fn config_dir_exits_the_first_files_code_when_a_later_file_fails_to_load() {
     let dir = TempDir::new();
@@ -670,6 +675,58 @@ fn config_dir_exits_the_first_files_code_when_a_later_file_fails_to_load() {
         "the all-failed decision must exit the **file-order first** failure's code \
          (a.toml's EXIT_RUNTIME/1), not the entry appended last (b.toml's load \
          failure, 2); stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
+/// The **mirror** of the pin above: together the pair pins the sort *key*, not
+/// just the sort's existence.
+///
+/// The all-failed decision in `frpc/src/main.rs` must exit the
+/// **lowest-file-index** failure's code. Here `a.toml` fails to **load**
+/// (`EXIT_CONFIG`/2, recorded in file order first) and `b.toml` fails at **run**
+/// time (`EXIT_RUNTIME`/1, appended by the handle loop), so the pre-sort vector
+/// `[(0, 2), (1, 1)]` is already in file order — a deleted sort leaves this pin
+/// green (the pin above catches that) while any comparator that reorders by
+/// something other than the file index reds it: `failures.reverse()` puts
+/// `(1, 1)` first → rc 1, and `sort_by_key(|(_, code)| *code)` does the same →
+/// rc 1, where file order requires **2**.
+#[test]
+fn config_dir_exits_the_first_files_code_when_a_load_failure_precedes_a_run_failure() {
+    let dir = TempDir::new();
+    let conf_d = dir.path("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    // Not valid TOML: rejected in the loader, so this file never becomes a task
+    // and its failure is recorded first, in file order, as `(0, EXIT_CONFIG)`.
+    std::fs::write(
+        std::path::Path::new(&conf_d).join("a.toml"),
+        "this is not valid toml\n",
+    )
+    .expect("write a.toml");
+    // A port nothing listens on: b.toml's login fails immediately (the default
+    // `loginFailExit = true`), so its task returns `Err(EXIT_RUNTIME)` and is
+    // appended as `(1, EXIT_RUNTIME)` **after** the loop.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let p = l.local_addr().expect("local_addr").port();
+        drop(l);
+        p
+    };
+    std::fs::write(
+        std::path::Path::new(&conf_d).join("b.toml"),
+        format!("serverAddr = \"127.0.0.1\"\nserverPort = {closed}\n"),
+    )
+    .expect("write b.toml");
+
+    let out = run_frpc(&["--config-dir", &conf_d]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the all-failed decision must exit the **file-order first** failure's code \
+         (a.toml's EXIT_CONFIG/2), not the smallest code or the last inserted entry \
+         (b.toml's EXIT_RUNTIME/1); stdout={:?} stderr={:?}",
         stdout_of(&out),
         stderr_of(&out),
     );

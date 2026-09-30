@@ -207,11 +207,16 @@ jobs:
       # time and the other serves, so the lane must return 0 (it was unpinned:
       # `if true` in place of `failures.len() == files.len()` kept every
       # all-failed pin green).
-      # 36 → 38 re-derived on this tree: the rebase resolution kept **this
-      # branch's own parent** `b49adaf0` (`32a0e8d2` after the rebase), which
-      # measured 36 — `main` `3f66d823` has neither of this branch's rounds and
-      # measures 34 — but the merged tree already measured **37** (the converse
-      # pin above is part
+      # 36 → 38 re-derived on this tree: the rebase resolution kept an earlier
+      # pre-rebase incarnation of this branch — `b49adaf0`, patch-id
+      # `68dc4ccbc6ee…` (`git show b49adaf0 | git patch-id --stable`) — which
+      # measured 36; after the rebase that commit is `32a0e8d2`, patch-id
+      # `fbcbecae5df3…`, also 36. The patch-ids differ, so `b49adaf0` is **not**
+      # an ancestor of this branch (`git merge-base --is-ancestor b49adaf0 HEAD`
+      # fails); both simply carry this lane's 36. `59bf2a2c` is the commit that
+      # moved this lane 34 → 36. `main` `3f66d823` has neither of this branch's
+      # rounds and measures 34 — but the merged tree already measured **37** (the
+      # converse pin above is part
       # of it), and round 3's second half adds the **swapped file order** (+1)
       # (`config_dir_where_the_first_service_fails_keeps_serving_and_exits_zero`) —
       # the failure sits in `a.toml` and the survivor in `b.toml`, so the
@@ -221,9 +226,10 @@ jobs:
       # 38 → 40 with round 4: +2, both un-gated so this lane and the
       # `--all-features` sweep each gain them:
       # `config_dir_exits_the_first_files_code_when_a_later_file_fails_to_load`
-      # (the deleted-`sort_by_key` discriminator — a *later* file's load failure
-      # plus an *earlier* file's task failure, the only mix that observes the
-      # sort) and `config_dir_refuses_an_empty_directory_with_2` (the
+      # (the `sort_by_key` discriminator — a *later* file's load failure plus an
+      # *earlier* file's task failure, the only mix whose pre-sort order differs
+      # from file order; in frps it reds both a deleted sort and a by-code one)
+      # and `config_dir_refuses_an_empty_directory_with_2` (the
       # `files.is_empty()` arm, whose only discriminating observable is the
       # empty-directory message: the fall-through exits 2 as well). Re-derived
       # on this tree with `cargo test -p frps --test cli_exit_codes -- --list`.
@@ -264,9 +270,13 @@ jobs:
       # the converse pin — one file's service stops at run time, the other keeps
       # retrying (`loginFailExit = false`, honoured by `frpc-tiny`) and the lane
       # exits 0 on SIGTERM — ungated for the same reason.
-      # 20 → 22 re-derived on this tree: the rebase resolution kept **this
-      # branch's own parent** `b49adaf0` (`32a0e8d2` after the rebase), which
-      # measured 20 — `main` `3f66d823` has neither of this branch's rounds and
+      # 20 → 22 re-derived on this tree: the rebase resolution kept an earlier
+      # pre-rebase incarnation of this branch — `b49adaf0`, patch-id
+      # `68dc4ccbc6ee…` — which measured 20; after the rebase that commit is
+      # `32a0e8d2`, patch-id `fbcbecae5df3…`, also 20. The patch-ids differ, so
+      # `b49adaf0` is **not** an ancestor of this branch; both simply carry this
+      # lane's 20. `59bf2a2c` is the commit that moved this lane 19 → 20. `main`
+      # `3f66d823` has neither of this branch's rounds and
       # measures 19 — but the merged tree already measured **21** (the converse pin above), and
       # round 3's second half adds the **swapped file order** (+1)
       # (`config_dir_where_the_first_service_fails_keeps_retrying_and_exits_zero`) —
@@ -275,13 +285,18 @@ jobs:
       # so the `any(file_index == 0)` mutant is red. Measured with
       # `cargo test -p frpc --no-default-features --features tiny --test
       # cli_exit_codes -- --list`.
-      # 22 → 23 with round 4: +1
-      # (`config_dir_exits_the_first_files_code_when_a_later_file_fails_to_load`),
-      # the deleted-`sort_by_key` discriminator — a *later* file's load failure
-      # plus an *earlier* file's run failure — ungated, so `frpc-tiny` reaches
-      # it. Re-derived with `cargo test -p frpc --no-default-features --features
-      # tiny --test cli_exit_codes -- --list`.
-      FRPC_TINY_CLI_TESTS: "23"
+      # 22 → 24 with rounds 4-5: +2
+      # (`config_dir_exits_the_first_files_code_when_a_later_file_fails_to_load`,
+      # the sort-removal discriminator — a *later* file's load failure plus an
+      # *earlier* file's run failure — and round 5's mirror
+      # `config_dir_exits_the_first_files_code_when_a_load_failure_precedes_a_run_failure`,
+      # which pins the sort **key**: a load failure at index 0 (code 2) plus a run
+      # failure at index 1 (code 1), so `failures.reverse()` and
+      # `sort_by_key(|(_, code)| *code)` both exit 1 where file order requires 2).
+      # Both are ungated, so `frpc-tiny` reaches them. Re-derived with
+      # `cargo test -p frpc --no-default-features --features tiny --test
+      # cli_exit_codes -- --list`.
+      FRPC_TINY_CLI_TESTS: "24"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
