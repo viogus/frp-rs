@@ -4306,7 +4306,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   holding only an old-dated file do **not** satisfy the gate (`:614`) while a file carrying the
   marker does (`:644`); the two stated mutations are an existence-only predicate (reds the first
   assertion) and dropping the aged-file exclusion (reds the second). (e) The CI lane's own guard
-  literal moved 5 → **6** in the same commit (`.github/workflows/ci.yml:451,464,465,468,469,470,472,478`)
+  literal moved 5 → **6** in the same commit (`.github/workflows/ci.yml:472-473`, `:476-478`, `:480`,
+  with the guard's success line at `:486` and the prose at `:453`/`:459`)
   after the step's own `-- --list` counted 6; `env.FRPS_CLI_TESTS` / `env.FRPC_TINY_CLI_TESTS` are
   untouched. No `CHANGELOG.md` entry: test-harness only, as the sibling items above (and as #396,
   which introduced this file). Residue filed, not fixed: `frpc/tests/warn_delivery.rs` — measured
