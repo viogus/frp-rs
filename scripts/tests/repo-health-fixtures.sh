@@ -19,6 +19,14 @@
 # *failed* gate — it reaches the gate under test regardless of the unrelated
 # FAILs a bare tree produces.
 #
+# Later scenarios go past the exit-code mapping, because a positive check alone
+# cannot show that the fixture drives the code it claims to: scenario 4 builds
+# the stub inputs that let all four `.rs` walks run and then reverts each walk's
+# fall-through in the tree's own copy of the script, one at a time, so the checks
+# are shown to red on the right edit; scenario 5 is the clean-tree negative
+# control for scenario 1's row; scenario 6 asserts the integration-test-dir
+# metric, whose `scripts/tests/` blind spot is why it exists.
+#
 # Self-contained: no network, no dependence on this repo's contents (the tree is
 # built from scratch and only the script under test is copied in), and the
 # temporary tree is removed on exit.
@@ -63,6 +71,11 @@ if [ ! -f "$RH" ]; then
   printf 'FAIL  cannot find the script under test: %s\n' "$RH"
   exit 1
 fi
+RC_PY=$PWD/scripts/rust_comments.py
+if [ ! -f "$RC_PY" ]; then
+  printf 'FAIL  cannot find the module the script under test imports: %s\n' "$RC_PY"
+  exit 1
+fi
 
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
@@ -83,6 +96,69 @@ new_tree() {
   cp "$RH" "$d/scripts/repo-health.sh"
   printf '%s\n' "$d"
 }
+
+# new_full_tree <name> — new_tree plus the stub measurement inputs that let every
+# `.rs` walk actually run. A bare tree cannot show that: the Unsafe usage table
+# and the SAFETY scan die on `import rust_comments` (no scripts/ module), and the
+# fourth walk (`unsafe_counts` in the doc-figures block) is never reached because
+# the preflight reports the missing measurement inputs first and exits. The stubs
+# are deliberately minimal — the doc-figure claims below them will not match, so
+# the tree is red anyway; that is fine, the checks read per-walk rows.
+new_full_tree() {
+  d=$(new_tree "$1")
+  mkdir -p "$d/frp-core/src" "$d/frp-vnet/src" "$d/frp-core/benches" \
+           "$d/frp-server/benches" "$d/vendor/rustls" "$d/vendor/yamux" \
+           "$d/vendor/russh"
+  cp "$RC_PY" "$d/scripts/rust_comments.py"
+  # `--list` must yield a non-empty token list or count_compat() reports a
+  # partial tree and exits before unsafe_counts (site 4) runs.
+  cat > "$d/scripts/compat-test.sh" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--list" ]; then printf 'test_alpha\ntest_beta\n'; fi
+exit 0
+STUB
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$d/scripts/protocol-matrix.sh"
+  printf '[package]\nname = "frp-core"\nversion = "0.71.0"\n' > "$d/frp-core/Cargo.toml"
+  for v in rustls yamux russh; do
+    printf '[package]\nname = "%s"\nversion = "1.2.3"\n' "$v" > "$d/vendor/$v/Cargo.toml"
+  done
+  printf 'pub fn placeholder() {}\n' > "$d/frp-core/src/lib.rs"
+  printf 'pub fn placeholder() {}\n' > "$d/frp-vnet/src/lib.rs"
+  printf 'pub fn placeholder() {}\n' > "$d/frp-core/benches/crypto_bridge.rs"
+  printf 'pub fn placeholder() {}\n' > "$d/frp-server/benches/nathole.rs"
+  printf '%s\n' "$d"
+}
+
+# mut_rwalk <tree> <site> — revert, in the tree's copy of the script, the "a file
+# that cannot be stat-ed is still read, so its error is reported" fall-through at
+# one of the four `.rs` walk sites. Site 1 is `rs_texts`' `fresh()`; sites 2-4 are
+# the three inline walks in file order (Unsafe usage table, SAFETY scan,
+# unsafe_counts). The anchor count is asserted, so a refactor that moves the code
+# fails the mutation loudly instead of mutating nothing — which would leave the
+# teeth-checks vacuously green.
+mut_rwalk() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+tree, site = sys.argv[1], int(sys.argv[2])
+p = tree + '/scripts/repo-health.sh'
+s = open(p).read()
+if site == 1:
+    old = '        except OSError:\n            return os.path.realpath(path)'
+    assert s.count(old) == 1, 'site 1 anchor found %d times' % s.count(old)
+    s = s.replace(old, '        except OSError:\n            return None', 1)
+else:
+    old = 'key = real'
+    assert s.count(old) == 3, 'site 2-4 anchor found %d times' % s.count(old)
+    i = -1
+    for _ in range(site - 1):
+        i = s.find(old, i + 1)
+    s = s[:i] + 'continue' + s[i + len(old):]
+open(p, 'w').write(s)
+PY
+}
+
+# out_count <needle> — how many lines of the last run_gate output contain it.
+out_count() { printf '%s\n' "$out" | grep -cF -- "$1"; }
 
 # run_gate <tree> — run the copied script from inside the tree; sets rc and out.
 run_gate() {
@@ -189,26 +265,93 @@ else
   bad "newline dir: process rc is $rc (expected 1)"
 fi
 
-# --- scenario 4: an unreadable .rs inside a crate's own src -----------------
+# --- scenario 4: an unreadable .rs reaches every walk site ------------------
 # Containment must not be checked before readability: a dangling symlink in
 # `frp-core/src/` resolves *outside* the crate, and skipping it there hides the
-# read error, so the source-count gate would print `ok` over an unreadable
-# input. The gate must report the path and go red.
+# read error, so a source-count gate would print `ok` over an unreadable input.
+# Four separate `.rs` walks exist, and a bare tree pins only the first, so the
+# fixture supplies the stub inputs that let all four run and pins each site's own
+# evidence: the path is reported by the three read-scope walks (site 1 walks two
+# scopes, hence 4 lines) and named by the doc-figures block as a partial tree.
+# The four mutants below are what give those two checks teeth — reverting the
+# fall-through at any one site drops its line(s), or the partial-tree row.
 hdr
-printf '%s\n' "scenario 4: an unreadable .rs inside a crate's src"
-t=$(new_tree unreadable)
-mkdir -p "$t/frp-core/src"
-ln -s ../../../zz_nowhere.rs "$t/frp-core/src/zz_broken.rs"
+printf '%s\n' "scenario 4: an unreadable .rs reaches every walk site"
+t=$(new_full_tree unreadable)
+ln -s nowhere "$t/frp-core/src/zz_broken.rs"
 run_gate "$t"
-if printf '%s\n' "$out" | grep -q 'scan error: frp-core/src/zz_broken.rs'; then
-  ok 'unreadable src: the broken path is reported as a scan error'
+n=$(out_count 'scan error: frp-core/src/zz_broken.rs')
+if [ "$n" -eq 4 ]; then
+  ok 'unreadable src: reported by all three read-scope walks (4 = src + crate scope)'
 else
-  bad 'unreadable src: the broken path was silently dropped'
+  bad "unreadable src: expected 4 scan-error lines, got $n"
+fi
+if printf '%s\n' "$out" | grep -qF 'partial tree: frp-core/src/zz_broken.rs is missing'; then
+  ok 'unreadable src: the doc-figures block reports it as a partial tree (site 4)'
+else
+  bad 'unreadable src: unsafe_counts dropped the broken path (site 4)'
 fi
 if [ "$rc" -eq 1 ]; then
   ok 'unreadable src: process rc is 1'
 else
   bad "unreadable src: process rc is $rc (expected 1)"
+fi
+for site in 1 2 3 4; do
+  t=$(new_full_tree "unreadable-mut$site")
+  ln -s nowhere "$t/frp-core/src/zz_broken.rs"
+  mut_rwalk "$t" "$site"
+  run_gate "$t"
+  if [ "$site" -eq 4 ]; then
+    # Site 4 emits no `scan error:` line (it raises out of the whole block), so
+    # its revert is pinned by the partial-tree row instead of the count.
+    if printf '%s\n' "$out" | grep -qF 'partial tree: frp-core/src/zz_broken.rs is missing'; then
+      bad "unreadable src: site $site reverted but the partial-tree row survived"
+    else
+      ok "unreadable src: site $site revert drops the partial-tree row (check has teeth)"
+    fi
+  else
+    n=$(out_count 'scan error: frp-core/src/zz_broken.rs')
+    if [ "$n" -eq 4 ]; then
+      bad "unreadable src: site $site reverted but all 4 scan-error lines survived"
+    else
+      ok "unreadable src: site $site revert drops its line(s) ($n left — check has teeth)"
+    fi
+  fi
+done
+
+# --- scenario 5: the archive (exit 3) row is not printed unconditionally ----
+# Negative control for scenario 1: a wrapper that printed the `(exit 3)` row
+# without the gate having exited 3 would satisfy scenario 1 while the report no
+# longer reflects the gate at all.
+hdr
+printf '%s\n' 'scenario 5: the archive exit-3 row is absent when the scan succeeds'
+t=$(new_tree clean-archive)
+run_gate "$t"
+if printf '%s\n' "$out" | grep -qF '  FAIL  archive path scan failed'; then
+  bad 'clean archive scan: the archive exit-3 row was printed anyway'
+else
+  ok 'clean archive scan: no archive exit-3 row'
+fi
+
+# --- scenario 6: the integration-test-dir metric, with its heuristic ---------
+# The metric counts `tests/` directories that carry at least one `.rs` file
+# beneath them (a `.rs` anywhere below counts, however deep; a `tests/` dir with
+# no `.rs` is dropped). Asserted, not described: a `scripts/tests/` holding a
+# non-Rust file must not count, so this pins the F4 fix that stopped the harness'
+# own script directory from inflating the number, and both the nested-file rule
+# and the "has a .rs" rule at once.
+hdr
+printf '%s\n' 'scenario 6: the integration-test-dir metric counts only .rs-bearing tests/'
+t=$(new_tree testdirs)
+mkdir -p "$t/scripts/tests" "$t/frp-core/tests" "$t/frp-vnet/tests/deep"
+printf '#!/bin/sh\n:\n' > "$t/scripts/tests/not-rust.sh"
+printf 'fn t() {}\n' > "$t/frp-core/tests/it.rs"
+printf 'fn u() {}\n' > "$t/frp-vnet/tests/deep/nested.rs"
+run_gate "$t"
+if printf '%s\n' "$out" | grep -qF 'integration test dirs: 2'; then
+  ok 'integration test dirs: 2 (scripts/tests dropped; nested .rs counted)'
+else
+  bad "integration test dirs: expected 2, got $(printf '%s\n' "$out" | grep -F 'integration test dirs' || echo none)"
 fi
 
 # ---------------------------------------------------------------- summary
