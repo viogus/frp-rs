@@ -7517,3 +7517,25 @@ section; ledger now **24 open / 104 closed**.**
   Done-when: the flag is typed to match Go's `int64` (accepting the same argv, and refusing
   what Go refuses), or the refusal is recorded as a deliberate divergence with both
   measurements, and a test pins whichever answer is chosen.
+
+- [ ] **An `.ini` section named exactly a reserved settings root cannot be a legacy proxy, so the proxy is lost in lenient mode and refused in strict mode where Go registers one.**
+  Measured at base971 and at the #418 fixed head by that PR's round-3 adversarial review.
+  `[web_server] type = "tcp"` + `local_port`/`remote_port`, and `[transport] local_port`, give
+  frp-rs `--strict-config=false` rc 0 with `Proxies: 0` (the section stays a settings table) and
+  `--strict-config` rc 1 `unknown field "web_server.local_port"`; Go v0.71.0 is rc **0** in both
+  modes. The exemption is pre-existing and is what keeps `[web_server]` itself a settings table, so
+  the fix has to be key-based rather than name-based: on Go, a reserved-root section that carries
+  proxy keys (`type`, or `local_port`/`remote_port`) is a proxy.
+
+  Done-when: the reserved-root exemption stops applying to a section carrying `type` or the port
+  keys, or the loss is recorded as deliberate with this measurement and pinned by a test.
+
+- [ ] **A `[visitors.NAME]` / `[proxies.NAME]` legacy `.ini` section with no port key is refused with `invalid type: map, expected a sequence` where Go accepts it.**
+  Measured at the #418 fixed head by that PR's round-3 adversarial review. `[visitors.foo]` and
+  `[proxies.foo]` without `local_port`/`remote_port` give frp-rs rc **1** `invalid type: map,
+  expected a sequence` — the dotted header expands to a v1 sub-table, so the legacy collector no
+  longer sees a section to collect — where Go v0.71.0 is rc **0** in both loader modes. The
+  typeless-with-ports rule closed the port-carrying half of this shape only.
+
+  Done-when: a portless dotted spelling of a typed root is treated as the section it looks like (or
+  the refusal is recorded as deliberate with this measurement), pinned in both loader modes.
