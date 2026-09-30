@@ -4491,7 +4491,7 @@ mod tests {
     /// `frpc`, which never overlays, honoured the file throughout. The resolvers
     /// already model the zero values as absent for both binaries
     /// (`resolve_log_level`/`resolve_log_file`/`resolve_log_max_days`,
-    /// `frp-core/src/logging.rs:97`, `:134`, `:189`).
+    /// `frp-core/src/logging.rs:101`, `:140`, `:195`).
     #[test]
     fn log_flag_zero_values_do_not_override_the_config_file() {
         let mut cfg = crate::config::ServerConfig::default();

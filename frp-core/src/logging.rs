@@ -24,10 +24,11 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// flags-only lane, where `frps --log_level ""` (no config file) still starts
 /// the server and logs its **3 `[I]` records**: 282 B raw stdout / 249 B
 /// ANSI-stripped, 0 B stderr on a free port. With the default port 7000 already
-/// occupied on this host that lane instead exits 1 after a single `[I]` record
-/// (186 B raw / 175 B stripped, then `create server listener error, listen tcp
-/// 0.0.0.0:7000: bind: address already in use`). Treating `Some("")` as a value
-/// instead routed the empty string to `parse_level`, where
+/// occupied on this host that lane instead exits 1: one 90 B `[I]` record
+/// (`frps uses command line arguments for config`) plus an 83 B non-record
+/// `create server listener error, listen tcp 0.0.0.0:7000: bind: address
+/// already in use` line, 175 B stripped / 186 B raw in total. Treating
+/// `Some("")` as a value instead routed the empty string to `parse_level`, where
 /// `LevelFilter::from_str("")` is `Ok(ERROR)` — tracing-core 0.1.36 maps the
 /// empty string to `ERROR` (`metadata.rs:798`) — and every startup record is
 /// `INFO`. Measured on the pre-fix frp-rs binary: `--log-level ""` → 0 B stdout
@@ -53,10 +54,13 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// `"info"`, so `--log-level ""` produced 11 `INFO` records where no flag gave
 /// 0, while `frpc` honoured the file. That resolved-`info` output is what this
 /// head binary still prints for `--log-level info` on the same lane: **11 `INFO`
-/// records** (1471 B ANSI-stripped / 2410 B raw — the
-/// `SIGUSR1 reload ready (pid=…)` record names the pid twice, so each extra pid
-/// digit adds 2 B) with config `bindPort = 17531`,
-/// `[auth] token = "rev427token"`, `[log] level = "warn"`.
+/// records** with config `bindPort = 17531`, `[auth] token = "rev427token"`,
+/// `[log] level = "warn"`. The record *count* is the stable observable, the byte
+/// total is not: the `SIGUSR1 reload ready (pid=…)` record names the pid twice
+/// (+2 B per pid digit) and the shutdown record's `elapsed_secs` width varies
+/// (+1 B per character, 7–11 observed). ANSI-stripped that gave 1470–1473 B
+/// across eight runs at this host's 5-digit pids (1471 B in the 4-digit sample),
+/// with raw = stripped + 939 B of ANSI escapes.
 ///
 /// **Go v0.71.0 has no disagreement to copy on the *empty* value.** With `-c`
 /// Go discards the pflag-bound struct entirely (`cmd/frps/root.go:67-83`: the
@@ -127,8 +131,10 @@ pub fn resolve_log_level(
 /// Only the **CLI** value is filtered. An empty *config* value was already
 /// resolved to `console` by this function before the completion existed (the
 /// `cfg_file.is_empty()` arm below), so the file-lane `to = ""` shape was
-/// **never** silent — measured on the pre-fix binary: `[log] to = ""` logged
-/// 1498 B / 7 records and created no file. The defect this filter closes is the
+/// **never** silent — measured at this head on the implicit `./frps.toml` lane
+/// with `[log] to = ""` (`bindPort = 17533`): the 7 startup `INFO` records still
+/// print and no log file is created in the CWD (that lane passes no CLI flag, so
+/// the branch's filter cannot change it). The defect this filter closes is the
 /// flag arm.
 pub fn resolve_log_file(cli_file: Option<String>, cfg_file: &str) -> Option<String> {
     cli_file.filter(|f| !f.is_empty()).or_else(|| {

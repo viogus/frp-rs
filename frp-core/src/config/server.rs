@@ -440,12 +440,15 @@ impl ServerConfig {
         // `metadata.rs:798` — and every startup record is `INFO`). This call is
         // Go's `LogConfig.Complete()` fill (`pkg/config/v1/common.go:119-123`):
         // `level = ""` → `info`, `to = ""` → `console`, `max_days = 0` → `3`.
-        // Measured with `-c` on a config `bindPort = 17532`,
-        // `[auth] token = "rev427token"`, `[log] level = ""`: both binaries then
-        // log at `info` — frp-rs 11 `INFO` records, Go **3** `[I]` records
-        // (271 B raw stdout / 238 B ANSI-stripped, 0 B stderr) — reached on the
-        // Go side through `pkg/config/load.go:318-321`, since `-c` bypasses its
-        // pflag struct.
+        // Measured on a config `bindPort = 17532`, `[auth] token =
+        // "rev427token"`, `[log] level = ""` run as `frps -c frps.toml` from the
+        // config's own directory: both binaries then log at `info` — frp-rs 11
+        // `INFO` records, Go **3** `[I]` records (271 B raw stdout / 238 B
+        // ANSI-stripped, 0 B stderr). That Go total is invocation-dependent: its
+        // first record echoes the `-c` path, so a longer path adds its extra
+        // length (an absolute `/tmp/…/frps.toml` measured 295 B raw / 262 B
+        // stripped). The fill is reached on the Go side through
+        // `pkg/config/load.go:318-321`, since `-c` bypasses its pflag struct.
         //
         // The CLI arm no longer arrives here as a zero either:
         // `override_server_config` skips an empty `--log-level`/`--log-file` and
@@ -459,8 +462,9 @@ impl ServerConfig {
         // is no early-return path whose ordering this could change.
         //
         // `[log] to = ""` in a **file** was never part of this: `resolve_log_file`
-        // already mapped an empty config value to `console`, so that shape
-        // logged 1498 B / 7 records on the pre-fix binary and created no file.
+        // already mapped an empty config value to `console`, so that shape still
+        // logged its 7 startup `INFO` records and created no file (measured at
+        // this head; the lane passes no CLI flag, so the branch does not touch it).
         // The empty-config defects were `level = ""` (silent) and `max_days = 0`
         // (cleanup disabled, which the fill fixes).
         self.log.complete();
