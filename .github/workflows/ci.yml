@@ -114,8 +114,11 @@ jobs:
         # true` planted after the library check never runs the trap and exits 0
         # with no output at all, and a lowered `MIN_CHECKS=0` is quiet too. So the
         # total is pinned *outside*, the way the `log_completion` step below pins
-        # its own 6: this step requires the suite's summary line verbatim, and 21
-        # is what the scenarios in scripts/tests/compat-stray-guard.sh print. A
+        # its own 6: this step requires the suite's summary line verbatim, and 29
+        # is what the scenarios in scripts/tests/compat-stray-guard.sh print (21
+        # before the `TODO.md:7914` round added the ordered `SHAPE` anchors, the
+        # symlink `wait_exec` probe, the empty-`ps` branch and the failed-probe
+        # kill-then-continue case). A
         # scenario added or removed there moves this literal — restore the checks
         # rather than lowering it.
         shell: bash
@@ -124,14 +127,14 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           bash scripts/tests/compat-stray-guard.sh 2>&1 | tee "$log" || status=1
-          grep -qF 'RESULT: 21 fixture check(s) hold' "$log" || status=1
+          grep -qF 'RESULT: 29 fixture check(s) hold' "$log" || status=1
           if [ "$status" != "0" ]; then
-            echo "::error::compat stray-guard fixture checks did not report 21 checks"
-            echo "::error::scripts/tests/compat-stray-guard.sh must end with 'RESULT: 21 fixture check(s) hold'; a smaller total, a failure line or no output means scenarios were skipped, neutered or swallowed by an \`exec\` — restore them rather than lowering this literal"
+            echo "::error::compat stray-guard fixture checks did not report 29 checks"
+            echo "::error::scripts/tests/compat-stray-guard.sh must end with 'RESULT: 29 fixture check(s) hold'; a smaller total, a failure line or no output means scenarios were skipped, neutered or swallowed by an \`exec\` — restore them rather than lowering this literal"
             cat "$log"
             exit 1
           fi
-          echo "compat stray-guard fixture checks ok: 21 checks hold"
+          echo "compat stray-guard fixture checks ok: 29 checks hold"
       - name: RSS soak — run-dir guard + summary fixture
         run: bash scripts/tests/rss-soak-run-dir.sh
 
