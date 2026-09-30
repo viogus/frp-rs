@@ -465,7 +465,10 @@ User-facing release notes for frp-rs.
   decoder refuses it — a typeless `role = "visitor"` section is deliberately *not*
   defaulted, because Go refuses that shape, and a dotted header under a v1 root
   (`[auth.foo]`) counts as a legacy proxy only when its section carries
-  `local_port`/`remote_port`.
+  `local_port`/`remote_port`. The collector's known-section filter stays snake_case-only, so
+  a header that names a v1 root is still read as that root even in the camelCase spelling —
+  `[webServer] type = "tcp"` stays a proxy, as at base — and only a section with no `type`
+  that names `local_port`/`remote_port` is collected as one.
 - **The `web_server.tls.enable` warning is now build-aware: in a build with no
   dashboard it no longer claims the dashboard serves plaintext HTTP.** The key is
   read behind `frp-server`'s `dashboard` feature (and `frpc`'s `admin`), but the

@@ -6973,14 +6973,20 @@ section; ledger now **24 open / 104 closed**.**
   in both modes, the `role = "visitor"` exclusion, and a portless `[webServer.tls]` still
   nesting) and `typeless_legacy_ini_proxy_verifies_in_both_modes`
   (`frpc/tests/cli_exit_codes.rs`, exact stdout `Proxies: 2`); no existing assertion was
-  weakened, changed or moved. `ci.yml`'s guarded `FRPC_TINY_CLI_TESTS` 13 → 15. Follow-up
-  `a757afc6` closed a regression this collector introduced: its known-section filter listed
-  only the snake_case spelling of each v1 root, so a typeless camelCase `[webServer]` in a
-  client `.ini` was collected as a phantom proxy named `webServer` and the admin block was
-  silently lost (`Proxies: 1`); the filter now lists
-  `webServer`/`httpPlugins`/`sshTunnelGateway` beside their snake_case roots, closing the
-  whole alias set rather than `webServer` alone (`[webServer] zzz_unknown_key = 1` is back
-  to base's strict rc 1). Residuals filed below: `type = ""`, the typeless visitor's own
+  weakened, changed or moved. `ci.yml`'s guarded `FRPC_TINY_CLI_TESTS` 13 → 17 (two more
+  pins arrived with the follow-up below). `a757afc6` then closed the phantom-proxy
+  regression (`[webServer] port = 7500` collected as a proxy named `webServer`, the admin
+  block silently lost, `Proxies: 1`) by listing the camelCase spellings beside their
+  snake_case roots — but that in turn swallowed a **typed** camelCase root
+  (`[webServer] type = "tcp"` plus ports), which base had registered. `e1fcd9e3` settles
+  it: `KNOWN_SECTIONS` is snake_case-only again, and the typeless branch is narrowed to a
+  section that names `local_port` or `remote_port` — the key set `format.rs`'s nest gate
+  already used — so the phantom stays closed (`[webServer] port = 7500` → `Proxies: 0`;
+  `[webServer] zzz_unknown_key = 1` → base's strict rc 1) while typed camelCase roots
+  register exactly as at base971 (`Proxies: 1`, and `[webServer] type = "bogus"` is still
+  `proxy 'webServer': invalid proxy_type 'bogus'`) and a port-carrying `type`-less section
+  under any root is collected as the `tcp` proxy this item asked for. Residuals filed
+  below: `type = ""`, the typeless visitor's own
   verdicts, and a dotted v1-root header without a port key.
 - [x] **Three pin-precision nits in `frpc/tests/admin_config_get_warning.rs`, filed by #408's final review
   round.** All three are non-blocking, and all three were found after the fifth round had already returned
@@ -7501,10 +7507,13 @@ section; ledger now **24 open / 104 closed**.**
   `Option<u64>`. Measured on `frps verify -c <valid>`: `--vhost-http-timeout -1` → Go rc
   **0** (`frps: the configuration file … syntax is ok`), frp-rs rc **1**
   `Error: couldn't parse '-1': invalid digit found in string`; `--vhost-http-timeout 30`
-  agrees at rc 0 on both. A negative Go value is almost certainly meaningless downstream (a
+  agrees at rc 0 on both. The gap is two-sided, not only negative: a value that fits `u64`
+  but not Go's `int64` diverges the other way — `--vhost-http-timeout 9999999999999999999`
+  is rc **0** here (`syntax is ok`) and Go rc **1** (out of range), measured by #418's
+  round-2 review. A negative Go value is almost certainly meaningless downstream (a
   `time.Duration` built from it), so the question is only whether to accept-and-ignore the
   argv or refuse it loudly.
 
-  Done-when: the flag is typed to match Go's `int64` (accepting the same argv), or the
-  refusal is recorded as a deliberate divergence with this measurement, and a test pins
-  whichever answer is chosen.
+  Done-when: the flag is typed to match Go's `int64` (accepting the same argv, and refusing
+  what Go refuses), or the refusal is recorded as a deliberate divergence with both
+  measurements, and a test pins whichever answer is chosen.
