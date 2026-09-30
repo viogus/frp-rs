@@ -9684,7 +9684,7 @@ fn case_insensitive_proxy_array_key_is_refused_in_strict_mode() {
 ///
 /// * Go refuses **both** spellings — `unsafe feature "TokenSourceExec" is not
 ///   enabled …` — because it reads the key either way and then hits its gate.
-/// * frp-rs strict `verify` exits 0 and prints `is valid` for **both** too, but
+/// * frp-rs strict `verify` exits 0 and prints `syntax is ok` for **both** too, but
 ///   not because it lacks the gate: `TokenSourceExec` is defined at
 ///   `frp-core/src/unsafe_features.rs:10` and enforced by
 ///   `validate_token_source_unsafe` (`frp-core/src/auth.rs`), called from
@@ -9750,7 +9750,7 @@ fn case_insensitive_key_in_a_nested_table_is_dropped_in_strict_mode() {
 ///
 /// Measured against Go v0.71.0: Go's `verify -c` on the `Address` spelling fails
 /// with `VirtualNet feature is not enabled; enable it by setting the appropriate
-/// feature gate flag`, while frp-rs's `verify` exits 0 and prints `is valid`, and
+/// feature gate flag`, while frp-rs's `verify` exits 0 and prints `syntax is ok`, and
 /// the strict load returns `Ok` with `virtual_net.address == ""`. The dropped key
 /// also *hides* the feature-gate refusal, because an empty address means no vnet
 /// config is seen at all. `[virtual_net] Address` and `[virtualNet] address`

@@ -36,7 +36,7 @@
 //! silently dropped: `check_strict` recurses into the proxy/visitor/plugin
 //! arrays with exact-match key sets. It is recorded in
 //! `docs/developing.md` § CLI inputs with its measurement and scope. The
-//! case-shaped tests in this file pin what a CLI can see (`rc`, `is valid`,
+//! case-shaped tests in this file pin what a CLI can see (`rc`, `syntax is ok`,
 //! the `unknown field` lines); the **values** are asserted at the config layer,
 //! because a future serde alias would keep a CLI-level test green while
 //! honouring the key. Citation pairs (each verified against
@@ -588,7 +588,8 @@ fn verify_repeated_config_flag_is_last_wins() {
     assert_eq!(exit_code(&out), 0, "stderr={:?}", stderr_of(&out));
     let stdout = stdout_of(&out);
     assert!(
-        stdout.contains("Config file") && stdout.contains("second.toml is valid"),
+        stdout.contains("frpc: the configuration file")
+            && stdout.contains("second.toml syntax is ok"),
         "the last -c must be the file verified; stdout={stdout:?}"
     );
     assert!(
@@ -921,7 +922,7 @@ fn case_insensitive_proxy_array_keys_are_refused_in_strict_mode() {
         stderr_of(&out)
     );
     assert!(
-        stdout_of(&out).contains("is valid"),
+        stdout_of(&out).contains("syntax is ok"),
         "stdout={:?}",
         stdout_of(&out)
     );
@@ -957,7 +958,7 @@ fn case_insensitive_key_in_a_walked_section_is_refused_in_strict_mode() {
     let out = run_frpc(&["verify", "--strict-config=false", "-c", &cfg]);
     assert_eq!(exit_code(&out), 0, "stderr={:?}", stderr_of(&out));
     assert!(
-        stdout_of(&out).contains("is valid"),
+        stdout_of(&out).contains("syntax is ok"),
         "stdout={:?}",
         stdout_of(&out)
     );
@@ -967,7 +968,7 @@ fn case_insensitive_key_in_a_walked_section_is_refused_in_strict_mode() {
 //
 // `verify` carries the whole matrix without a listener: a strict load of an
 // unknown top-level key exits 1 with the unknown-field line, a lenient one
-// exits 0 with `is valid`. That is what makes the two forms distinguishable
+// exits 0 with `syntax is ok`. That is what makes the two forms distinguishable
 // here — the difference is *which config load happened*, not only an exit code.
 //
 // Every row also pins the **warning** (`frp_core::cli::STRICT_CONFIG_SPACE_FORM_WARNING`,
@@ -989,7 +990,7 @@ fn case_insensitive_key_in_a_walked_section_is_refused_in_strict_mode() {
 // | `--strict-config ""` | rc 1 unknown field here (rc **0** with a valid config: the empty token is a positional) | rc 1, `` `` is not expected ``, silent |
 // | `=true =false` (repeated) | rc 0 — pflag is last-wins, so lenient | rc 1 `cannot be used multiple times`, silent |
 // | `=false =true` (repeated) | rc 1 unknown field (last-wins → strict) | rc 1, same refusal, silent |
-// | `-c bad --strict-config false` | rc 1 unknown field (position does not matter) | rc 0 `is valid` — **extension**, warns |
+// | `-c bad --strict-config false` | rc 1 unknown field (position does not matter) | rc 0 `syntax is ok` — **extension**, warns |
 //
 // The full table (including `run`/`reload`/`status`/`stop`/`frps`), the measured
 // drop branch and the reason the space form is kept are in
@@ -1033,7 +1034,7 @@ fn verify_strict_config_spellings_match_their_measured_rows() {
     ] {
         let out = run_frpc(args);
         assert_eq!(exit_code(&out), 0, "{args:?} stderr={:?}", stderr_of(&out));
-        assert!(stdout_of(&out).contains("is valid"), "{args:?}");
+        assert!(stdout_of(&out).contains("syntax is ok"), "{args:?}");
         assert!(
             !stderr_of(&out).contains(warning),
             "{args:?} is Go-faithful and must stay silent: stderr={:?}",
@@ -1051,7 +1052,7 @@ fn verify_strict_config_spellings_match_their_measured_rows() {
     ] {
         let out = run_frpc(args);
         assert_eq!(exit_code(&out), 0, "{args:?} stderr={:?}", stderr_of(&out));
-        assert!(stdout_of(&out).contains("is valid"), "{args:?}");
+        assert!(stdout_of(&out).contains("syntax is ok"), "{args:?}");
         assert!(
             stderr_of(&out).contains(warning),
             "{args:?} must warn on stderr: stderr={:?}",
@@ -1064,7 +1065,7 @@ fn verify_strict_config_spellings_match_their_measured_rows() {
     // position.
     let out = run_frpc(&["verify", "-c", &cfg, "--strict-config", "false"]);
     assert_eq!(exit_code(&out), 0, "stderr={:?}", stderr_of(&out));
-    assert!(stdout_of(&out).contains("is valid"));
+    assert!(stdout_of(&out).contains("syntax is ok"));
     assert!(
         stderr_of(&out).contains(warning),
         "stderr={:?}",

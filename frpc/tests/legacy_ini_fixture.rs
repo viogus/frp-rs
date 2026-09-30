@@ -42,8 +42,8 @@ fn verify_accepts_the_vendored_go_legacy_fixture() {
         "stdout={stdout} stderr={stderr}"
     );
     assert!(
-        stdout.contains("is valid"),
-        "verify must report the file valid: {stdout}"
+        stdout.contains("frpc: the configuration file") && stdout.contains("syntax is ok"),
+        "verify must report the file valid with Go's success sentence: {stdout}"
     );
     assert!(
         stdout.contains("Proxies: 43"),

@@ -268,6 +268,11 @@ fn verify_missing_config_exits_1() {
 
 /// Positive control: a valid config still verifies with rc 0, so the tests
 /// above pin "bad config → 1" rather than "verify always fails".
+///
+/// Exact bytes, because the success sentence is now Go's
+/// (`frpc: the configuration file <path> syntax is ok`,
+/// `cmd/frpc/sub/verify.go:52`); the three indented summary lines after it are
+/// the frp-rs addition kept for `frpc/tests/legacy_ini_fixture.rs`.
 #[test]
 fn verify_good_config_exits_0() {
     let dir = TempDir::new();
@@ -282,10 +287,14 @@ fn verify_good_config_exits_0() {
         stdout_of(&out),
         stderr_of(&out),
     );
-    assert!(
-        stdout_of(&out).contains("is valid"),
-        "got stdout={:?}",
-        stdout_of(&out)
+    assert_eq!(
+        stdout_of(&out),
+        format!(
+            "frpc: the configuration file {cfg} syntax is ok\n  Server: 127.0.0.1:7000\n  \
+             Proxies: 0\n  Visitors: 0\n"
+        ),
+        "the success line must be Go's exact sentence; stderr={:?}",
+        stderr_of(&out),
     );
 }
 

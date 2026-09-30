@@ -788,7 +788,16 @@ async fn run_verify(config_path: &str, strict_config: bool) {
                 // Go v0.71.0 `frpc verify -c <bad>` exits 1 (`cmd/frpc/sub/verify.go`).
                 process::exit(EXIT_RUNTIME);
             }
-            println!("Config file {} is valid", config_path);
+            // Go v0.71.0 `cmd/frpc/sub/verify.go:52` prints exactly
+            // `frpc: the configuration file <path> syntax is ok` — the same
+            // sentence shape `frps verify` already prints (`frps/src/main.rs`).
+            // Measured against the Go v0.71.0 binary: stdout
+            // `frpc: the configuration file good.toml syntax is ok`, stderr 0 B.
+            // The three summary lines below are a frp-rs addition Go does not
+            // print; they are kept deliberately because
+            // `frpc/tests/legacy_ini_fixture.rs` observes the 43-proxy/2-visitor
+            // legacy fixture through the `Proxies:`/`Visitors:` counts.
+            println!("frpc: the configuration file {} syntax is ok", config_path);
             println!("  Server: {}:{}", cfg.server_addr, cfg.server_port);
             println!("  Proxies: {}", cfg.proxies.len());
             println!("  Visitors: {}", cfg.visitors.len());
