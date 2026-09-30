@@ -200,28 +200,35 @@ jobs:
       # `config_dir_where_every_task_panics_exits_nonzero`); the mixed half of
       # `config_dir_where_every_service_fails_to_run_exits_like_dash_c` was
       # tightened from "non-zero" to the exact `3` (a re-point, net zero).
-      # Re-derived after the rebase onto `3f66d823` (#422): 33 + 1 + 2 = 36.
-      # 35 → 36 with round 3 of the same round: +1
+      # Re-derived after the rebase onto `3f66d823` (#422): 33 + 1 + 2 = 36 —
+      # 36 is the **pre-rebase chain**'s declared literal, the value `b49adaf0`
+      # carries; the post-rebase tree that becomes `32a0e8d2` lists 37 (below).
+      # 35 → 36 in that pre-rebase chain with round 3 of the same round: +1
       # (`config_dir_where_one_service_fails_keeps_serving_and_exits_zero`), the
       # **converse** of the all-failed decision — one file's service fails at run
       # time and the other serves, so the lane must return 0 (it was unpinned:
       # `if true` in place of `failures.len() == files.len()` kept every
-      # all-failed pin green).
+      # all-failed pin green). That same pin is counted inside the 37 and 38
+      # below; the 35 → 36 label belongs to the pre-rebase numbering only.
       # 36 → 38 re-derived on this tree: the rebase resolution kept an earlier
       # pre-rebase incarnation of this branch — `b49adaf0`, patch-id
-      # `68dc4ccbc6ee…` (`git show b49adaf0 | git patch-id --stable`) — which
-      # measured 36; after the rebase that commit is `32a0e8d2`, patch-id
-      # `fbcbecae5df3…`, also 36. The patch-ids differ, so `b49adaf0` is **not**
-      # an ancestor of this branch (`git merge-base --is-ancestor b49adaf0 HEAD`
-      # fails); both simply carry this lane's 36. `59bf2a2c` is the commit that
-      # moved this lane 34 → 36. `main` `3f66d823` has neither of this branch's
-      # rounds and measures 34 — but the merged tree already measured **37** (the
-      # converse pin above is part
-      # of it), and round 3's second half adds the **swapped file order** (+1)
+      # `68dc4ccbc6ee…` (`git show b49adaf0 | git patch-id --stable`) — whose
+      # `ci.yml` **declared this lane's literal as 36**; after the rebase that
+      # commit is `32a0e8d2`, patch-id `fbcbecae5df3…`, which declared 36 as well
+      # although its own tree already **listed 37** tests, so that intermediate
+      # commit's count guard was one stale — `1a56b2c5` then moves the literal by
+      # +2 (36 → 38): +1 to catch up with the tree and +1 for round 3's second
+      # half. The patch-ids differ, so `b49adaf0` is **not** an ancestor of this
+      # branch (`git merge-base --is-ancestor b49adaf0 HEAD` fails); both simply
+      # carried 36 as the declared literal. `59bf2a2c` is the commit that moved
+      # this lane 34 → 36 in the pre-rebase chain. `main` `3f66d823` has neither
+      # of this branch's rounds and lists 34 — but the rebased tree already lists
+      # **37** (the converse pin above is part of it), and round 3's second half
+      # adds the **swapped file order** (+1)
       # (`config_dir_where_the_first_service_fails_keeps_serving_and_exits_zero`) —
       # the failure sits in `a.toml` and the survivor in `b.toml`, so the
       # `... || failures.iter().any(|(file_index, _)| *file_index == 0)` mutant,
-      # which the survivor-first pin above cannot see, is red. Measured with
+      # which the survivor-first pin above cannot see, is red. Counted with
       # `cargo test -p frps --test cli_exit_codes -- --list`.
       # 38 → 40 with round 4: +2, both un-gated so this lane and the
       # `--all-features` sweep each gain them:
@@ -264,25 +271,34 @@ jobs:
       # 18 → 19 with the `--config-dir` residue round: +1
       # (`config_dir_where_every_service_fails_to_run_exits_like_dash_c`), which
       # is deliberately ungated so it also runs in this `tiny` lane.
-      # Re-derived after the rebase onto `3f66d823` (#422): 18 + 1 + 1 = 20.
-      # 19 → 20 with round 3 of the same round: +1
+      # Re-derived after the rebase onto `3f66d823` (#422): 18 + 1 + 1 = 20 —
+      # 20 is the **pre-rebase chain**'s declared literal, the value `b49adaf0`
+      # carries; the post-rebase tree that becomes `32a0e8d2` lists 21 (below).
+      # 19 → 20 in that pre-rebase chain with round 3 of the same round: +1
       # (`config_dir_where_one_service_fails_keeps_retrying_and_exits_zero`),
       # the converse pin — one file's service stops at run time, the other keeps
       # retrying (`loginFailExit = false`, honoured by `frpc-tiny`) and the lane
-      # exits 0 on SIGTERM — ungated for the same reason.
+      # exits 0 on SIGTERM — ungated for the same reason. That same pin is
+      # counted inside the 21 and 22 below; the 19 → 20 label belongs to the
+      # pre-rebase numbering only.
       # 20 → 22 re-derived on this tree: the rebase resolution kept an earlier
       # pre-rebase incarnation of this branch — `b49adaf0`, patch-id
-      # `68dc4ccbc6ee…` — which measured 20; after the rebase that commit is
-      # `32a0e8d2`, patch-id `fbcbecae5df3…`, also 20. The patch-ids differ, so
-      # `b49adaf0` is **not** an ancestor of this branch; both simply carry this
-      # lane's 20. `59bf2a2c` is the commit that moved this lane 19 → 20. `main`
-      # `3f66d823` has neither of this branch's rounds and
-      # measures 19 — but the merged tree already measured **21** (the converse pin above), and
+      # `68dc4ccbc6ee…` — whose `ci.yml` **declared this lane's literal as 20**;
+      # after the rebase that commit is `32a0e8d2`, patch-id `fbcbecae5df3…`,
+      # which declared 20 as well although its own tree already **listed 21**
+      # tests, so that intermediate commit's count guard was one stale —
+      # `1a56b2c5` then moves the literal by +2 (20 → 22): +1 to catch up with the
+      # tree and +1 for round 3's second half. The patch-ids differ, so
+      # `b49adaf0` is **not** an ancestor of this branch; both simply carried 20
+      # as the declared literal. `59bf2a2c` is the commit that moved this lane
+      # 19 → 20 in the pre-rebase chain. `main` `3f66d823` has neither of this
+      # branch's rounds and lists 19 — but the rebased tree already lists **21**
+      # (the converse pin above is part of it), and
       # round 3's second half adds the **swapped file order** (+1)
       # (`config_dir_where_the_first_service_fails_keeps_retrying_and_exits_zero`) —
       # `a.toml` holds the closed-port service with the default
       # `loginFailExit = true` (it fails first) and `b.toml` the retrying survivor,
-      # so the `any(file_index == 0)` mutant is red. Measured with
+      # so the `any(file_index == 0)` mutant is red. Counted with
       # `cargo test -p frpc --no-default-features --features tiny --test
       # cli_exit_codes -- --list`.
       # 22 → 24 with rounds 4-5: +2
