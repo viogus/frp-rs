@@ -112,9 +112,15 @@ const KEY: &str = "web_server.tls.enable";
 /// dashboard must never print.
 const DASHBOARD_CLAUSE: &str = "plaintext HTTP";
 /// The marker unique to the **no-dashboard-build** clause
-/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD`). The two clauses share
-/// their whole first half, so `KEY` above is in both and cannot tell them apart.
+/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD`). The three texts share
+/// their whole first half, so `KEY` above is in all of them and cannot tell them
+/// apart; these three markers are pairwise disjoint.
 const NO_DASHBOARD_CLAUSE: &str = "no dashboard support";
+/// The marker unique to the **no-TLS-build** clause
+/// (`WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS`). Unreachable from this binary —
+/// see `assert_clause_matches_this_build` — so it is used only as a negative
+/// control.
+const NO_TLS_CLAUSE: &str = "no TLS support";
 /// The **second** diagnostic this file now pins: the flat server `tls_enable` is
 /// inert too (`TODO.md` item), and it warns from the same three sites. Kept as a
 /// substring of `SERVER_TLS_ENABLE_INERT_WARNING` so a count of it cannot match
@@ -469,19 +475,31 @@ fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
 /// The clause the emitted record must carry — decided by **this build**, not by
 /// a literal argument.
 ///
-/// The two variants share their whole first half (`web_server.tls.enable has no
-/// effect: …`), so every count assertion in this file passes for either one: a
-/// call site that hardcodes the other answer still compiles, still emits exactly
-/// one `KEY` record, and still satisfies `frp-core`'s own dispatch test — that
-/// one passes `has_dashboard` as an argument, so it never sees a real build's
-/// answer. Only a `cfg!`-keyed assertion on the captured stdout can, and that is
-/// what binds `frps/src/main.rs:219`/`:311` (and the reload site,
-/// `frp-server/src/service.rs:2315`) to the build under test. The lane that runs
-/// this file **without** `--features dashboard` is what makes the other
+/// All three variants share their whole first half (`web_server.tls.enable has no
+/// effect: …`), so every count assertion in this file passes for any of them: a
+/// call site that hardcodes another answer still compiles, still emits exactly one
+/// `KEY` record, and still satisfies `frp-core`'s own dispatch test — that one
+/// passes the caller's answer as an argument, so it never sees a real build's
+/// answer. Only an assertion on the captured stdout can, and that is what binds
+/// `frps/src/main.rs:245`/`:469` (and the reload site,
+/// `frp-server/src/service.rs:2333`) to the build under test. The lane that runs
+/// this file **without** `--features dashboard` is what makes the no-dashboard
 /// direction observable.
+///
+/// The **no-TLS** clause is unreachable from this binary's lanes: `dashboard`
+/// decides the first question, and every lane that runs this file links
+/// `frp-server/default`, which includes `tls`. A build with the dashboard on but
+/// `tls` off is only linted (`cargo clippy -p frp-server --no-default-features
+/// --features dashboard --all-targets`), never run. The negative control below
+/// holds that in every combination in which this file is exercised.
 fn assert_clause_matches_this_build(tag: &str, spawned: &Spawned) {
     let out = spawned.stdout();
     let err = spawned.stderr();
+    assert!(
+        !out.contains(NO_TLS_CLAUSE),
+        "{tag}: this binary's lanes always link frp-server's `tls` feature, so it must never emit \
+         the no-TLS clause ({NO_TLS_CLAUSE:?})\n--- stdout ---\n{out}"
+    );
     if cfg!(feature = "dashboard") {
         assert!(
             out.contains(DASHBOARD_CLAUSE),

@@ -804,11 +804,13 @@ jobs:
         # no-dashboard text; the matching `--features admin` run of the same file
         # is its own step below and expects the dashboard text. The client's
         # *reload* row is a different call site, pinned separately and in-process
-        # by `frp-client/tests/reload_warning_delivery.rs`, which runs twice: in
-        # `Tests (unit)` with no features and in `Tests (client integration)` with
-        # `--features admin` — one lane pins each clause (the client only processes
-        # a reload inside a live session); that file asserts the clause its own
-        # `cfg!` answer produced.
+        # by `frp-client/tests/reload_warning_delivery.rs`, whose three shapes are
+        # each executed by a lane: `Tests (unit)` with no features (`cfg!` answers
+        # admin off, tls off), `Tests (client integration)` with `--features admin`
+        # (admin on, tls on) and the admin-without-TLS step below (admin on, tls
+        # off) — one lane per text of the three-way reader (the client only
+        # processes a reload inside a live session); that file asserts the clause
+        # its own `cfg!` answer produced.
         #
         # No `--features` flag: the file is `#![cfg(feature = "full")]`-gated and
         # `full` is the default, so this is the same artifact the plain step
@@ -893,7 +895,7 @@ jobs:
           echo "frpc admin config-GET guard ok: $n tests listed (expected 4), 0 failed"
       - name: Run frpc's `web_server.tls.enable` warning-delivery tests with the admin feature
         # The `admin`-on half of the `frpc` warning-delivery pair, and the only
-        # lane that witnesses the `--config-dir` call site (`frpc/src/main.rs:527`)
+        # lane that witnesses the `--config-dir` call site (`frpc/src/main.rs:529`)
         # in an admin build: the step above this one runs the same file with
         # `admin` off (the no-dashboard clause expected), and the admin config-GET
         # step runs a different file, so before this step a hardcoded `false` at
@@ -1180,6 +1182,46 @@ jobs:
         env:
           FRPS_BIN: ${{ github.workspace }}/target/debug/frps
           FRPC_BIN: ${{ github.workspace }}/target/debug/frpc
+      - name: Run the admin-without-TLS warning-delivery lane
+        # The third answer of `WebServerTlsEnableReader::from_features`. `admin`
+        # compiles the client's admin server; `tls` gates the acceptor that
+        # server builds (`frp-client/src/admin.rs:1149`, with the
+        # `not(feature = "tls")` discard arm at `:1164`). The step above
+        # (`--features admin`, frp-client's defaults) always has `tls`, and the
+        # `--no-default-features --all-targets` lanes have neither feature — so
+        # until this step no lane EXECUTED `reload_warning_delivery` in the third
+        # shape, admin on with `tls` off. That is the only shape whose record is
+        # `WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS`, so without this step the
+        # no-TLS clause text and the `(true, false)` cell of `from_features` are
+        # pinned by no lane. `--test reload_warning_delivery` is the narrowest
+        # scope: it is the one target that reads that clause, and it asserts the
+        # clause this crate's own `cfg!` answer produced, so a call site that
+        # hardcodes another answer reds here. The count literal below is this
+        # lane's own `-- --list` value, never another lane's.
+        shell: bash
+        run: |
+          set -eo pipefail
+          log=/tmp/frp-client-admin-no-tls-warning.log
+          cargo test -p frp-client --no-default-features --features admin --test reload_warning_delivery --color never 2>&1 | tee "$log"
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+          n=$(cargo test -p frp-client --no-default-features --features admin --test reload_warning_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          status=0
+          grep -q "Running tests/reload_warning_delivery.rs" "$log.plain" || status=1
+          grep -q "test result: ok. 1 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "1" ] || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::frp-client admin-without-TLS warning guard failed (status=$status, file=$n, log=$log)"
+            if [ -n "$n" ] && [ "$n" != "1" ]; then
+              if [ "$n" -lt "1" ]; then
+                echo "::error::frp-client/tests/reload_warning_delivery.rs lists $n tests, this step expects 1 — the test was deleted or the file was disabled; restore it rather than lowering this literal"
+              else
+                echo "::error::frp-client/tests/reload_warning_delivery.rs lists $n tests, this step expects 1: move the single literal in this shell step from 1 to $n"
+              fi
+            fi
+            cat "$log.plain"
+            exit 1
+          fi
+          echo "frp-client admin-without-TLS warning guard ok: $n tests listed (expected 1), 0 failed"
 
   verify:
     name: Verify (bench + feature sets)

@@ -4455,7 +4455,7 @@ impl Service {
         let (mut new_cfg, presence) =
             frp_core::config::load_client_config_with_presence(config_path, strict)
                 .map_err(|e| format!("failed to load config: {e}"))?;
-        presence.warn_inert_web_server_tls_enable(cfg!(feature = "admin"));
+        presence.warn_inert_web_server_tls_enable(crate::web_server_tls_enable_reader());
         if let Some(ref store) = self.store_source {
             if let Err(e) = store.reload() {
                 tracing::warn!(error = %e, "store reload failed, using in-memory state");

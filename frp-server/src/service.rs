@@ -406,6 +406,24 @@ fn server_reader_present(reader: frp_core::config::ServerReader) -> bool {
     }
 }
 
+/// The `[web_server.tls] enable` diagnostic answer for **this crate's** build:
+/// whether the dashboard is compiled (`dashboard`) and whether this crate can
+/// serve it over HTTPS (`tls`).
+///
+/// The sibling of [`server_reader_present`]: this crate owns both features, so
+/// it resolves them here instead of letting a binary's `cfg!` answer for it.
+/// `frps`'s own `tls` feature is off in every default build (`full` forwards
+/// `frp-server/default`), so a `cfg!(feature = "tls")` inside `frps/src/main.rs`
+/// would say `false` for a build whose dashboard does serve HTTPS. The gate is
+/// the dashboard's acceptor, compiled behind `#[cfg(feature = "tls")]`
+/// (`frp-server/src/dashboard.rs`, `frp-server/src/service.rs`).
+pub const fn web_server_tls_enable_reader() -> frp_core::config::WebServerTlsEnableReader {
+    frp_core::config::WebServerTlsEnableReader::from_features(
+        cfg!(feature = "dashboard"),
+        cfg!(feature = "tls"),
+    )
+}
+
 /// Spawn a boxed future with type erasure. Reduces binary size by
 /// preventing monomorphization of `tokio::spawn` for every concrete
 /// future type — the unsizing coercion from `Pin<Box<ConcreteFut>>`
@@ -2312,7 +2330,7 @@ impl Service {
         let (new_cfg, presence): (ServerConfig, _) =
             frp_core::config::load_server_config_with_presence(&config_path, false)
                 .map_err(|e| format!("Failed to reload config: {e}"))?;
-        presence.warn_inert_web_server_tls_enable(cfg!(feature = "dashboard"));
+        presence.warn_inert_web_server_tls_enable(web_server_tls_enable_reader());
         // The flat server `tls_enable` is inert as well; this reload site has a
         // sink, so it delivers the record. Once per load — a reload adds one
         // rather than replacing the startup record.
@@ -2448,7 +2466,8 @@ impl Service {
         // `ServerConfig.tls_enable` is deliberately **not** compared here: no
         // code in `frp-server`/`frps` reads it. `grep -rn tls_enable
         // frp-server/src frps/src` returns only comment lines and call sites of
-        // the unrelated helper `presence.warn_inert_web_server_tls_enable(has_dashboard)`,
+        // the unrelated helper `presence.warn_inert_web_server_tls_enable(reader)`
+        // (whose `reader` comes from `web_server_tls_enable_reader()`),
         // which reads a different key, `[web_server.tls] enable`; zero field
         // reads. No hit count is pinned here: stating one is self-invalidating,
         // because this comment and any later comment that merely mentions the
