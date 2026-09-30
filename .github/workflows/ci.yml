@@ -108,8 +108,9 @@ jobs:
         # first failure point, but a floor inside the file it guards cannot
         # survive an `exec` — `exec true` planted after the trap never runs it
         # and exits 0 with no output at all, and a lowered `MIN_CHECKS=0` (or a
-        # floor that is not a number) is quiet too. So the total is pinned
-        # *outside*: this step requires the suite's summary line verbatim, and 32
+        # floor that is not a number, or a zero-padded all-zero floor like `00`)
+        # is quiet too. So the total is pinned *outside*: this step requires the
+        # suite's summary line verbatim, and 32
         # is what the scenarios in scripts/tests/repo-health-fixtures.sh print
         # (the `TODO.md:7895` round added the in-file floor; a scenario added or
         # removed there moves this literal — restore the checks rather than
@@ -148,9 +149,11 @@ jobs:
         # kill-then-continue case; 31 after the round-2 pins exercised the loop's
         # empty-`cmd` guard, the exit-0-empty reap arm, and the second half of the
         # XTCP pre-test cleanup). In-file, `enforce_substance` additionally
-        # checksums scenario 10's two assertion blocks, so a body gutted behind
-        # its `ok` label reds there. A scenario added or removed here moves this
-        # literal — restore the checks rather than lowering it.
+        # checksums scenario 10's region byte-for-byte — the `compat_src=` input
+        # derivation plus both assertions — so forging the text those checks read
+        # reds there as well (as does gutting either verdict in place). A scenario
+        # added or removed here moves this literal — restore the checks rather
+        # than lowering it.
         shell: bash
         run: |
           set -o pipefail

@@ -52,8 +52,12 @@ set -uo pipefail
 # scenario body drops the count below it and reds (TODO.md:7895).
 #
 # Three limits are stated rather than hidden:
-#   * a floor of 0 (or an unset floor) would disable the guard from inside, so
-#     that is itself a failure;
+#   * a floor of 0 (or an unset floor, or a zero-padded all-zero floor such as
+#     `00`/`000`, which denote 0 but are still all digits) would disable the
+#     guard from inside, so each is itself a failure: leading zeros are stripped
+#     before the comparison, so no spelling of zero slips past the `0)` arm, and
+#     diagnostics print the decimal value — `printf '%d'` reads `032` as octal
+#     26, so it is not used (R2-2/R2-3);
 #   * the floor comparisons are *guarded*, not bare: a non-numeric `MIN_CHECKS`
 #     (or a non-numeric `checks`) makes `[ … -lt … ]` return status 2, which
 #     `if`/`elif` read as false — so both branches would be skipped and the suite
@@ -80,7 +84,7 @@ bad() { checks=$((checks + 1)); fail=1; printf '  FAIL  %s\n' "$1"; }
 hdr() { printf '%s\n' "------------------------------------------------------------"; }
 
 cleanup_all() {
-  local rc=$?
+  local rc=$? min_raw
   [ -z "$tmp" ] || rm -rf "$tmp"
   if [ "$rc" -eq 0 ]; then
     # Fail closed: `[ NaN -lt 1 ]` is status 2, and `if`/`elif` read status 2 as
@@ -99,20 +103,37 @@ cleanup_all() {
         rc=1
         ;;
       *)
-        case $checks in
-          ''|*[!0-9]*)
-            printf 'FAIL  the check counter is not a number (%s); the suite cannot vouch for itself\n' \
-              "$checks" >&2
-            rc=1
-            ;;
-          *)
-            if [ "$checks" -lt "$MIN_CHECKS" ]; then
-              printf 'FAIL  suite exited 0 after only %d check(s); expected at least %d — scenarios did not run\n' \
-                "$checks" "$MIN_CHECKS" >&2
+        # The digits-only arm above still lets a zero-padded floor through:
+        # `00`/`000` denote 0 but never reach the `0)` arm, so the floor was
+        # silently off (R2-2, measured `RESULT: 32` rc 0 with the floor written
+        # `000`). Strip the leading zeros — a plain string strip, not
+        # `$(( … ))`, whose base detection is the thing being avoided — and treat
+        # the result as the floor; `min_raw` keeps the author's spelling for the
+        # diagnostic. Only zeros leave an empty string, i.e. the disabled case.
+        min_raw=$MIN_CHECKS
+        while [ "${MIN_CHECKS#0}" != "$MIN_CHECKS" ]; do
+          MIN_CHECKS=${MIN_CHECKS#0}
+        done
+        if [ -z "$MIN_CHECKS" ]; then
+          printf 'FAIL  the check floor is disabled (MIN_CHECKS=%s); the suite cannot vouch for itself\n' \
+            "$min_raw" >&2
+          rc=1
+        else
+          case $checks in
+            ''|*[!0-9]*)
+              printf 'FAIL  the check counter is not a number (%s); the suite cannot vouch for itself\n' \
+                "$checks" >&2
               rc=1
-            fi
-            ;;
-        esac
+              ;;
+            *)
+              if [ "$checks" -lt "$MIN_CHECKS" ]; then
+                printf 'FAIL  suite exited 0 after only %s check(s); expected at least %s — scenarios did not run\n' \
+                  "$checks" "$MIN_CHECKS" >&2
+                rc=1
+              fi
+              ;;
+          esac
+        fi
         ;;
     esac
   fi
