@@ -20,6 +20,16 @@ User-facing release notes for frp-rs.
   naming the file it came from. `SIGTERM`/`SIGINT` still shut the lane down cleanly (rc 0). This is
   an frp-rs extension flag — Go's `frps` rejects `--config-dir` outright — so the comparison is
   against frp-rs's own `-c` lane.
+- **`frps` now registers Go's `--vhost-http-timeout` (default 60, both spellings).**
+  Go's `frps` reads the flag and frp-rs refused it on both paths with
+  `` `--vhost-http-timeout` is not expected in this context ``. It is registered on the
+  shared transport builder, so `frps --vhost-http-timeout 30 -c <cfg>` and
+  `frps verify --vhost-http-timeout 30 -c <cfg>` are both accepted; the value is applied
+  on the flags-only lane, and `ServerConfig::default()` already carries Go's 60, so an
+  absent flag keeps 60 and with `-c` the file stays authoritative. With this the rendered
+  `--help` flag diff against Go v0.71.0 has **no Go-only flags**; frp-rs-only remain
+  `config-dir` and `log-format`. `--vhost_http_timeout` is accepted too, as Go normalizes
+  `_` to `-`.
 - **`frps verify` now exists**, so a script that validates a server config can
   use frp-rs at all. Go has had the subcommand all along; frp-rs's server CLI
   registered only the run path, so `frps verify -c frps.toml` on a **valid**
@@ -36,11 +46,12 @@ User-facing release notes for frp-rs.
   is Go's own behaviour for frps's empty `-c` default. As on Go, the command
   reads only the config path and the strict flag and accepts-and-ignores every
   other root flag **frp-rs models** (`--bind-port`, `--allow-unsafe`,
-  `--version`, …) — the qualifier is the precise claim, because Go's
-  `--vhost-http-timeout` is a flag frp-rs's `frps` does not model on either path
-  and is therefore refused, and the bare `--dashboard-tls-mode` spelling is read
-  as `true` here where Go needs an argument (both recorded in
-  `docs/developing.md` § CLI inputs).
+  `--version`, …) — the qualifier is the precise claim, because a flag frp-rs
+  models as a different *kind* is still not inert: the bare `--dashboard-tls-mode`
+  spelling is read as `true` here where Go needs an argument (recorded in
+  `docs/developing.md` § CLI inputs). Go's `--vhost-http-timeout`, which this
+  paragraph used to name as the unmodelled flag, is registered now — see the
+  Features entry above.
   Three things it deliberately does **not** do, all recorded in
   `docs/developing.md` § CLI inputs: it refuses the two frp-rs-only root flags
   `--config-dir` and `--log-format` (Go's `frps` has neither, and accepting them
@@ -294,9 +305,11 @@ User-facing release notes for frp-rs.
   `did you mean 'x'?` suggestion, where Go prints the codec's
   `json: unknown field "x"` with no path — matching that byte-for-byte would mean
   a literal `json: ` prefix on a message also emitted for TOML/YAML/INI and the
-  loss of the file identity in `--config-dir` mode. `frpc verify`'s success line
-  (`Config file … is valid` plus a short summary) is also unchanged; Go prints a
-  single `frpc: the configuration file … syntax is ok`. `--strict-config=foo` is
+  loss of the file identity in `--config-dir` mode. `frpc verify`'s success line now
+  prints Go's `frpc: the configuration file … syntax is ok`; the three summary
+  lines that follow it are a frp-rs addition Go does not print (kept because the
+  vendored legacy-`.ini` fixture test observes its proxy/visitor counts through
+  them). `--strict-config=foo` is
   untouched: both binaries already write that refusal to stderr. The
   `--config-dir` extension keeps its `tracing` output — Go's counterpart there is
   a different line and a different exit code (0). Measured on Go v0.71.0 with
@@ -438,6 +451,24 @@ User-facing release notes for frp-rs.
   dropping the `COPY` or a stray `RUSTUP_TOOLCHAIN=stable` each fail the stage
   (rc 1), and a full uncached `docker buildx build` of the image succeeds and logs
   the pinned toolchain. TODO.md:6081.
+- **`frpc verify` prints Go's exact success sentence.** It printed
+  `Config file <path> is valid` where Go prints `frpc: the configuration file <path>
+  syntax is ok`, so the client and server verify subcommands disagreed with each other. The
+  first line is now Go's; the three indented summary lines that follow it stay (Go prints
+  none) because the vendored legacy-`.ini` fixture test observes its proxy/visitor counts
+  through them.
+- **A typeless legacy `.ini` proxy section now loads as a `tcp` proxy, as Go's legacy
+  reader does.** `[myproxy]` carrying only `local_port`/`remote_port` was dropped silently
+  (rc 0, `Proxies: 0`) in non-strict mode and refused as `unknown field "myproxy"` in
+  strict mode, while Go registers it as a `tcp` proxy. The rule is `.ini`-only — a typeless
+  top-level table in TOML/JSON/YAML is still refused by the strict check, as Go's v1
+  decoder refuses it — a typeless `role = "visitor"` section is deliberately *not*
+  defaulted, because Go refuses that shape, and a dotted header under a v1 root
+  (`[auth.foo]`) counts as a legacy proxy only when its section carries
+  `local_port`/`remote_port`. The collector's known-section filter stays snake_case-only, so
+  a header that names a v1 root is still read as that root even in the camelCase spelling —
+  `[webServer] type = "tcp"` stays a proxy, as at base — and only a section with no `type`
+  that names `local_port`/`remote_port` is collected as one.
 - **The `web_server.tls.enable` warning is now build-aware: in a build with no
   dashboard it no longer claims the dashboard serves plaintext HTTP.** The key is
   read behind `frp-server`'s `dashboard` feature (and `frpc`'s `admin`), but the
@@ -514,10 +545,10 @@ User-facing release notes for frp-rs.
   (`[plugin.NAME]`). The first is needed because a legacy proxy's name is a flat,
   user-chosen identifier — that is **Go's** `.ini` dialect, where every
   non-`[common]` section is a proxy (`pkg/config/legacy/client.go`); frp-rs's own
-  `collect_legacy_ini_proxy_sections` additionally requires the `type` key, so a
-  typeless proxy section is dropped here (and on the base tree) where Go registers
-  it as a `tcp` proxy — a pre-existing parity gap, filed in `TODO.md` rather than
-  folded into this change. A genuine
+  `collect_legacy_ini_proxy_sections` used to require the `type` key, so a
+  typeless proxy section was dropped where Go registers it as a `tcp` proxy; that
+  parity gap is closed (see the Fixed entry above), and the section-level strict
+  difference it leaves behind is filed in `TODO.md`. A genuine
   conflict is reported instead of silently clobbered **when the containing section
   comes first** (`[webServer] tls = 1` before `[webServer.tls]` → rc 1); in the
   reverse order the later section's scalar wins and the nested table is dropped

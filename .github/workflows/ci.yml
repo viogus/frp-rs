@@ -150,7 +150,18 @@ jobs:
       # client's half of the same change does not move *this* literal: it added
       # tests to `frpc/tests/cli_exit_codes.rs` (the other literal below) and to
       # `frp-client`'s lib tests, which no guarded lane counts.
-      FRPS_CLI_TESTS: "31"
+      # 29 → 31 with the `--vhost-http-timeout` registration: +2
+      # (`vhost_http_timeout_flag_starts_and_listens`,
+      # `verify_accepts_vhost_http_timeout_both_spellings_and_prints_go_line`),
+      # the run-path and verify-path rows for the flag Go registers at
+      # `pkg/config/flags.go:237`.
+      # 31 → 33 after the rebase onto `7c3d5707` (#419's `--config-dir` work):
+      # +2 (`config_dir_where_every_service_fails_init_exits_like_dash_c`,
+      # `config_dir_where_every_service_fails_to_run_exits_like_dash_c`),
+      # re-derived from this lane's own `-- --list` on the merged tree. A merged
+      # literal is the **sum** of two disjoint additions, never the larger of
+      # the two: the pre-merge branch measured 31 and `main` measured 31.
+      FRPS_CLI_TESTS: "33"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
       # 11 → 13 with the one `auth.method` policy: +2
@@ -159,7 +170,20 @@ jobs:
       # runs `frpc-tiny`, so it is also the only *spawn-level* witness that an
       # oidc-less build refuses `"OIDC"` with Go's text instead of starting a
       # token client.
-      FRPC_TINY_CLI_TESTS: "13"
+      # 13 → 15 with the typeless legacy `.ini` proxy default (Go's `tcp`): +1
+      # (`typeless_legacy_ini_proxy_verifies_in_both_modes`), then +1 for the
+      # regression it introduced, the phantom-proxy steal of a typeless
+      # camelCase `[webServer]`
+      # (`typeless_camelcase_web_server_ini_is_not_a_proxy`). Both are plain
+      # (un-gated) tests, so `frpc-tiny` reaches them.
+      # 15 → 17 with the corrected narrowing: +2
+      # (`typed_camelcase_v1_root_ini_sections_verify_as_proxies`,
+      # `bogus_type_on_a_camelcase_legacy_proxy_is_refused`) — the mirror-image
+      # rows for a *typed* camelCase v1-root header, both un-gated.
+      # 17 → 18 with the pin for the exclusion clause itself: +1
+      # (`typeless_port_carrying_ini_visitor_is_not_a_proxy` — a port-carrying
+      # `role = "visitor"` section, un-gated).
+      FRPC_TINY_CLI_TESTS: "18"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4

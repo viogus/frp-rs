@@ -726,7 +726,8 @@ fn next_ping_backoff(prev: Option<Duration>, interval: Duration) -> Duration {
 ///
 /// Shared by [`Service::with_unsafe_features`] (so `frpc run` refuses) and by
 /// `frpc verify`, which only *loads* the config — without this, `verify` would
-/// print `Config file … is valid` and exit 0 for a config that `run` exits 3 on.
+/// print `frpc: the configuration file … syntax is ok` and exit 0 for a config
+/// that `run` exits 3 on.
 ///
 /// The method match is `frp_core::auth`'s exact policy, not a local
 /// `== "oidc"`: the string comparison this replaced accepted every non-exact

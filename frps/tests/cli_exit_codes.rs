@@ -956,6 +956,34 @@ fn tls_only_false_value_starts_and_listens() {
     start_listening_then_sigterm(&["--tls-only=false", "-c", &cfg], port, &dir);
 }
 
+/// Go v0.71.0 accepts `--vhost-http-timeout 30 -c <valid>` on the run path and
+/// starts (bounded run: rc 124). Before the flag was registered, frp-rs answered
+/// rc **1** with stderr `` `--vhost-http-timeout` is not expected in this
+/// context `` — an argv Go's `frps` accepts, refused.
+///
+/// Go registers the name with underscores
+/// (`cmd.PersistentFlags().Int64VarP(&c.VhostHTTPTimeout, "vhost_http_timeout",
+/// "", 60, …)`, `pkg/config/flags.go:237`) and rewrites every `_` to `-`
+/// (`WordSepNormalizeFunc`, `:26-32`), so both spellings are valid flags and
+/// this row runs both through the same bounded helper.
+///
+/// As with `--tls-only=false` above, "started" is proved by the bind port
+/// accepting a connection, not by an exit code. **What this does not prove:**
+/// with `-c` the file is authoritative (`cli_overrides_enabled()` is false,
+/// `frp-core/src/cli.rs`), so the parsed value never reaches the service here.
+/// That the value is applied on the lane where it *is* read (no `-c`) is pinned
+/// by `frp-core/src/cli.rs::vhost_http_timeout_flag_applied_to_server_config`.
+#[test]
+fn vhost_http_timeout_flag_starts_and_listens() {
+    for spelling in ["--vhost-http-timeout", "--vhost_http_timeout"] {
+        let port = ephemeral_port();
+        let dir = TempDir::new();
+        let cfg = valid_config(&dir, port);
+
+        start_listening_then_sigterm(&[spelling, "30", "-c", &cfg], port, &dir);
+    }
+}
+
 /// The `=value` spelling is not merely accepted — it is the value the flag
 /// carries. `--disable-log-color` is the observable one: the frps log
 /// initialiser reads it straight off the CLI
@@ -1336,6 +1364,49 @@ fn verify_valid_config_prints_go_line_and_exits_0() {
         "Go writes nothing on stderr for this row; stderr={:?}",
         stderr_of(&out),
     );
+}
+
+/// The `verify` side of the same flag. Go's `verifyCmd` reads only `cfgFile` and
+/// `strictConfigMode` and **ignores** this value, so the success bytes are the
+/// ones the row above pins. Measured on Go v0.71.0, streams separated, rc read
+/// from the child: `frps verify --vhost-http-timeout 30 -c <valid>` and
+/// `frps verify --vhost_http_timeout 30 -c <valid>` are both rc **0** with
+/// stdout exactly `frps: the configuration file <path> syntax is ok\n` and
+/// stderr 0 bytes. Before the flag was registered, frp-rs refused both spellings
+/// with rc **1** and the same bpaf `` is not expected in this context `` line.
+///
+/// The config's `bindPort` is held for the whole run, as in
+/// `verify_valid_config_prints_go_line_and_exits_0`: `verify` never binds, so a
+/// version that fell through to the run path fails here instead of passing.
+#[test]
+fn verify_accepts_vhost_http_timeout_both_spellings_and_prints_go_line() {
+    let (_held, port) = held_port();
+    let dir = TempDir::new();
+    let cfg = valid_config(&dir, port);
+
+    for spelling in ["--vhost-http-timeout", "--vhost_http_timeout"] {
+        let out = run_frps(&["verify", spelling, "30", "-c", &cfg]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "`frps verify {spelling} 30 -c <valid>` must exit 0 like Go \
+             (stdout={:?} stderr={:?})",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        assert_eq!(
+            stdout_of(&out),
+            format!("frps: the configuration file {cfg} syntax is ok\n"),
+            "Go ignores the value on `verify`, so the success line is unchanged — one bare \
+             stdout line, no ANSI and no log prefix; stderr={:?}",
+            stderr_of(&out),
+        );
+        assert!(
+            stderr_of(&out).is_empty(),
+            "Go writes nothing on stderr for this row; stderr={:?}",
+            stderr_of(&out),
+        );
+    }
 }
 
 /// The failure half of the same surface, both shapes of "bad config": an unknown

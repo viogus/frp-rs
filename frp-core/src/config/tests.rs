@@ -2444,14 +2444,14 @@ fn test_ssh_tunnel_gateway_default_disabled() {
 /// and return the re-serialized TOML (post-normalization).
 fn normalize_server_toml(toml_str: &str) -> String {
     let mut val: toml::Value = toml::from_str(toml_str).unwrap();
-    normalize_server_config(&mut val);
+    normalize_server_config(&mut val, super::format::ConfigFormat::Toml);
     toml::to_string(&val).unwrap()
 }
 
 /// Helper: normalize a TOML string through the full client config pipeline.
 fn normalize_client_toml(toml_str: &str) -> String {
     let mut val: toml::Value = toml::from_str(toml_str).unwrap();
-    normalize_client_config(&mut val);
+    normalize_client_config(&mut val, super::format::ConfigFormat::Toml);
     toml::to_string(&val).unwrap()
 }
 
@@ -3439,7 +3439,7 @@ max_pool_count = 10
 fn load_server_config_from_yaml(yaml: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let mut value = super::format::parse_to_toml_value(yaml, super::format::ConfigFormat::Yaml)?;
     expand_env_vars(&mut value);
-    normalize_server_config(&mut value);
+    normalize_server_config(&mut value, super::format::ConfigFormat::Yaml);
     let presence = super::loader::ConfigPresence::from_normalized_value(&value);
     let json_value = super::normalize::toml_to_json(value);
     let mut cfg: ServerConfig =
@@ -3456,7 +3456,7 @@ fn load_server_config_from_yaml(yaml: &str) -> Result<ServerConfig, Box<dyn std:
 fn load_client_config_from_yaml(yaml: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
     let mut value = super::format::parse_to_toml_value(yaml, super::format::ConfigFormat::Yaml)?;
     expand_env_vars(&mut value);
-    normalize_client_config(&mut value);
+    normalize_client_config(&mut value, super::format::ConfigFormat::Yaml);
     let presence = super::loader::ConfigPresence::from_normalized_value(&value);
     let mut cfg: ClientConfig = serde_json::from_value(super::normalize::toml_to_json(value))
         .map_err(|e| format!("config validation error: {e}"))?;
@@ -3714,7 +3714,7 @@ fn test_collect_config_files_symlink_cycle_terminates() {
 fn load_client_config_from_json(json: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
     let mut value = super::format::parse_to_toml_value(json, super::format::ConfigFormat::Json)?;
     expand_env_vars(&mut value);
-    normalize_client_config(&mut value);
+    normalize_client_config(&mut value, super::format::ConfigFormat::Json);
     let presence = super::loader::ConfigPresence::from_normalized_value(&value);
     let mut cfg: ClientConfig = serde_json::from_value(super::normalize::toml_to_json(value))
         .map_err(|e| format!("config validation error: {e}"))?;
@@ -6491,22 +6491,26 @@ fn dotted_ini_section_headers_become_nested_tables_in_both_modes() {
 ///
 /// In the legacy INI dialect every section other than `[common]` is a proxy, and
 /// `collect_legacy_ini_proxy_sections` decides membership by the section's own
-/// `type` key. So `[auth.foo]`, `[store.frontend]` and `[log.svc]` are proxies
-/// *named* `auth.foo` / `store.frontend` / `log.svc`, not the `foo` /
-/// `frontend` / `svc` children of an `auth` / `store` / `log` table — Go's legacy
-/// loader looks sections up by their raw name too (`pkg/config/legacy/server.go`,
+/// `type` key — or, since the typeless-default fix, by a `local_port` /
+/// `remote_port` pair, because Go defaults a missing proxy `type` to `tcp`. So
+/// `[auth.foo]`, `[store.frontend]` and `[log.svc]` are proxies *named*
+/// `auth.foo` / `store.frontend` / `log.svc`, not the `foo` / `frontend` / `svc`
+/// children of an `auth` / `store` / `log` table — Go's legacy loader looks
+/// sections up by their raw name too (`pkg/config/legacy/server.go`,
 /// `section.Name()`). The first cut of the dotted-header expansion split them on
 /// the first segment alone and the proxies **silently disappeared** (measured on
 /// the real binaries: base and Go v0.71.0 register them, `proxy added:
 /// [auth.foo]`; the frozen tree registered nothing), which is the silent drop
 /// item B's Done-when forbids. `ini_section_path` therefore holds a section back
-/// when it carries `type`.
+/// when it carries `type` or a proxy port.
 ///
 /// **What this models.** Both loader modes on a real `.ini`, for the three
 /// v1-first-segment names the reviewers probed plus a non-v1 control
-/// (`[my.proxy]`), each asserting the proxy's `type` / `local_port` /
-/// `remote_port` survive; then the expansion direction in the same file family,
-/// so one test pins both.
+/// (`[my.proxy]`), each with an explicit `type = tcp`, asserting the proxy's
+/// `type` / `local_port` / `remote_port` survive; then the expansion direction in
+/// the same file family, so one test pins both. The typeless half of the
+/// dialect is pinned separately by
+/// `typeless_ini_proxy_section_defaults_to_tcp_in_both_modes`.
 ///
 /// **What it does not cover.** A v1 nested table that itself carries a `type`
 /// key (a `[visitors.plugin]`-style table in an `.ini`) is not merely "left
@@ -6516,10 +6520,9 @@ fn dotted_ini_section_headers_become_nested_tables_in_both_modes() {
 /// 'visitors.plugin': invalid proxy_type 'https2http'`; on the server it is an
 /// unknown strict-mode field). That is the cost of the discriminator, it matches
 /// the base tree (which never expanded anything), and it is stated in
-/// `docs/config.md` and `ini_section_path`'s doc. A legacy proxy section
-/// **without** a `type` key is dropped here *and* on base, where Go registers it
-/// as a `tcp` proxy — a pre-existing parity gap filed as its own `TODO.md` item,
-/// not pinned here.
+/// `docs/config.md` and `ini_section_path`'s doc. It shares the port-based
+/// discriminator documented there: a dotted v1 sub-table with neither `type` nor
+/// a proxy port still expands, one with a port is a proxy.
 #[test]
 fn dotted_ini_headers_that_are_legacy_proxy_names_stay_proxies() {
     for name in ["auth.foo", "store.frontend", "log.svc", "my.proxy"] {
@@ -6552,8 +6555,9 @@ fn dotted_ini_headers_that_are_legacy_proxy_names_stay_proxies() {
         }
     }
 
-    // …and the v1 direction still expands: the same `auth` first segment with no
-    // `type` key is a nested table, and `[webServer.tls]` still reaches the hoist.
+    // …and the v1 direction still expands: a portless `[webServer.tls]` reaches
+    // the hoist, and a portless `[auth.*]` sub-table is still a nested table
+    // (the port-key discriminator only fires on a proxy's own section).
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("frps.ini");
     std::fs::write(
@@ -6570,6 +6574,431 @@ fn dotted_ini_headers_that_are_legacy_proxy_names_stay_proxies() {
             "strict={strict}"
         );
     }
+}
+
+/// A `type`-less **camelCase** `[webServer]` in a client `.ini` is frpc's admin
+/// block, not a phantom legacy proxy.
+///
+/// `collect_legacy_ini_proxy_sections` also collects a `type`-less section in
+/// the `.ini` dialect (Go's legacy default: the section is a `tcp` proxy — see
+/// `typeless_ini_proxy_section_defaults_to_tcp_in_both_modes`). Its
+/// known-section filter listed only the snake_case spelling of each v1 root, so
+/// while `[web_server]` was safe, a typeless `[webServer]` was stolen **before**
+/// `merge_section_into(table, "webServer", "web_server")` could run. Measured on
+/// the commit that added the typeless rule: a client `.ini` with
+/// `[webServer] port = 7500` loaded with `Proxies: 1` and `web_server.port == 0`
+/// (base `b8e1dd6d`: `Proxies: 0`, port 7500), and `[webServer]
+/// zzz_unknown_key = 1` passed strict mode — a collected legacy section is
+/// strict-exempt — where base reported `unknown field
+/// "web_server.zzz_unknown_key"`. The fix narrows the typeless rule to a
+/// section that names a port (`local_port`/`remote_port`) — the same
+/// discriminator `format.rs`'s nest gate uses, and a key no admin block
+/// carries. The first cut instead listed the camelCase aliases (`webServer`,
+/// `httpPlugins`, `sshTunnelGateway`) in the known-section set, which traded
+/// this bug for its mirror image: a *typed* `[webServer]` proxy was dropped
+/// (base971 and the final rule both give `Proxies: 1`).
+///
+/// **What this models.** Both loader modes on a real client `.ini`, for the flat
+/// `[webServer]`, the nested `[webServer.tls]`, the nested-under-`[common]`
+/// `[common.webServer.tls]`, and the documented `[webServer]` + `[web_server]`
+/// per-key merge; plus the strict-mode report for an unknown key under
+/// `[webServer]`.
+///
+/// **What it does not cover.** The server path never runs the collector, so it
+/// was never affected (frps `[webServer]` / `[webServer.tls]` is pinned in
+/// `dotted_ini_headers_that_are_legacy_proxy_names_stay_proxies`); a typeless
+/// section with no port key at all is pinned in
+/// `typeless_ini_section_without_ports_stays_a_v1_section`; and the
+/// mirror-image row — a camelCase root that *does* carry `type` — is pinned in
+/// `typed_camelcase_v1_root_headers_are_still_legacy_proxies`. The
+/// `[common.webServer.tls]` row is written **alone**:
+/// a top-level `[webServer]` beside it drops the `[common]` table whole, the
+/// pre-existing `or_insert` flatten of `[common]` pinned in
+/// `both_web_server_sections_merge_per_key_in_both_modes`, not this collector.
+#[test]
+fn typeless_camelcase_web_server_ini_is_not_a_phantom_proxy() {
+    fn write(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(&path, body).unwrap();
+        (dir, path)
+    }
+    const HEAD: &str = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
+
+    // The flat camelCase admin block: loaded, and not taken as a proxy.
+    let (_d, p) = write(&format!("{HEAD}[webServer]\nport = 7500\n"));
+    for strict in [false, true] {
+        let cfg = load_client_config(p.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("[webServer] strict={strict}: {e}"));
+        assert_eq!(cfg.web_server.port, 7500, "strict={strict}");
+        assert!(
+            cfg.proxies.is_empty(),
+            "[webServer] must not become a proxy, strict={strict}; got {:?}",
+            cfg.proxies
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // The nested camelCase TLS table, on its own and under `[common]`.
+    for (label, body) in [
+        (
+            "[webServer.tls]",
+            format!(
+                "{HEAD}[webServer]\nport = 7500\n[webServer.tls]\n\
+                 certFile = /nested/cert.pem\nkeyFile = /nested/key.pem\n"
+            ),
+        ),
+        (
+            "[common.webServer.tls]",
+            format!(
+                "{HEAD}[common.webServer]\nport = 7500\n[common.webServer.tls]\n\
+                 certFile = /nested/cert.pem\nkeyFile = /nested/key.pem\n"
+            ),
+        ),
+    ] {
+        let (_d, p) = write(&body);
+        for strict in [false, true] {
+            let cfg = load_client_config(p.to_str().unwrap(), strict)
+                .unwrap_or_else(|e| panic!("{label} strict={strict}: {e}"));
+            assert_eq!(cfg.web_server.port, 7500, "{label} strict={strict}");
+            assert_eq!(
+                cfg.web_server.tls_cert(),
+                "/nested/cert.pem",
+                "{label} strict={strict}"
+            );
+            assert_eq!(
+                cfg.web_server.tls_key(),
+                "/nested/key.pem",
+                "{label} strict={strict}"
+            );
+            assert!(cfg.proxies.is_empty(), "{label} strict={strict}");
+        }
+    }
+
+    // The documented per-key merge: `[web_server]` (snake) wins every key both
+    // sections define, and the camelCase table is not stolen first.
+    let (_d, p) = write(&format!(
+        "{HEAD}[webServer]\nuser = camel\nport = 7500\n\
+         [web_server]\npassword = snake\nport = 7501\n"
+    ));
+    for strict in [false, true] {
+        let cfg = load_client_config(p.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("merge strict={strict}: {e}"));
+        assert_eq!(cfg.web_server.user, "camel", "strict={strict}");
+        assert_eq!(cfg.web_server.password, "snake", "strict={strict}");
+        assert_eq!(
+            cfg.web_server.port, 7501,
+            "the snake spelling wins; strict={strict}"
+        );
+        assert!(cfg.proxies.is_empty(), "merge strict={strict}");
+    }
+
+    // A key the admin block does not name stays a strict-mode unknown field —
+    // a collected legacy proxy section would have exempted it.
+    let (_d, p) = write(&format!("{HEAD}[webServer]\nzzz_unknown_key = 1\n"));
+    let err = format!(
+        "{}",
+        load_client_config(p.to_str().unwrap(), true)
+            .expect_err("strict mode must report the unknown key")
+    );
+    assert!(
+        err.contains("unknown field \"web_server.zzz_unknown_key\""),
+        "the unknown key must be reported under web_server: {err}"
+    );
+    let cfg = load_client_config(p.to_str().unwrap(), false).expect("non-strict loads");
+    assert!(
+        cfg.proxies.is_empty(),
+        "non-strict: still not a proxy, the unknown key is dropped"
+    );
+}
+
+/// A typeless legacy `.ini` proxy section is Go's `tcp` proxy, in **both** loader
+/// modes, while a `role = "visitor"` section is not defaulted.
+///
+/// Go's legacy loader (`pkg/config/legacy/client.go`) treats every section other
+/// than `[common]`/`range:*` as a proxy, and its proxy config defaults a missing
+/// `type` to `tcp`. Measured on the real v0.71.0 binaries: `.ini` files whose
+/// only section is a typeless `[myproxy]`, `[auth.foo]`, `[store.frontend]` or
+/// `[my.proxy]` give `frpc verify` rc 0 (`frpc: the configuration file <f>
+/// syntax is ok`) under both `--strict-config` values, and a real run logs `new
+/// proxy [myproxy] type [tcp] success`; a typeless `role = "visitor"` section is
+/// refused in both modes (`failed to parse visitor v1, err: type shouldn't be
+/// empty`, rc 1). frp-rs required `type`: non-strict `frpc verify` returned rc 0
+/// with `Proxies: 0` (the silent drop `TODO.md`'s item forbids) and strict mode
+/// rc 1 `unknown field "myproxy" in config file …`.
+///
+/// **What this models.** Both loader modes on a real `.ini` for a flat name, a
+/// v1-first-segment name, and a non-v1 dotted name, asserting the defaulted
+/// `type` plus the surviving ports; then the visitor exclusion; then a portless
+/// v1 dotted section (`[webServer.tls]`) still nesting on the server side.
+///
+/// **What it does not cover.** The typeless visitor **divergence** is pinned as
+/// it is, not fixed: Go exits 1 in both modes where frp-rs non-strict loads the
+/// file with nothing registered (rc 0). Defaulting a typeless visitor to a
+/// proxy would invent a *new* divergence — Go never does — so the strict-mode
+/// refusal is asserted and no `tcp` proxy may appear.
+#[test]
+fn typeless_ini_proxy_section_defaults_to_tcp_in_both_modes() {
+    for name in ["myproxy", "auth.foo", "store.frontend", "my.proxy"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(
+            &path,
+            format!(
+                "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+                 [{name}]\nlocal_port = 8080\nremote_port = 9080\n"
+            ),
+        )
+        .unwrap();
+        for strict in [false, true] {
+            let cfg = load_client_config(path.to_str().unwrap(), strict)
+                .unwrap_or_else(|e| panic!("[{name}], strict={strict}: {e}"));
+            let proxy = cfg
+                .proxies
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "[{name}], strict={strict}: the typeless legacy proxy must register; got {:?}",
+                        cfg.proxies
+                            .iter()
+                            .map(|p| p.name.clone())
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert_eq!(
+                proxy.proxy_type, "tcp",
+                "[{name}], strict={strict}: Go defaults the missing type to tcp"
+            );
+            assert_eq!(proxy.local_port, 8080, "[{name}], strict={strict}");
+            assert_eq!(proxy.remote_port, 9080, "[{name}], strict={strict}");
+        }
+    }
+
+    // Go refuses a typeless visitor in both modes, so nothing may be registered
+    // as a proxy for it (a `tcp` default here would be an invented divergence).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("visitor.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [v1]\nrole = visitor\nserver_name = s1\nbind_addr = 127.0.0.1\nbind_port = 18100\n",
+    )
+    .unwrap();
+    let lenient = load_client_config(path.to_str().unwrap(), false).unwrap();
+    assert!(
+        lenient.proxies.is_empty(),
+        "a typeless visitor must not become a tcp proxy; got {:?}",
+        lenient
+            .proxies
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        lenient.visitors.is_empty(),
+        "a typeless visitor is not registered as a visitor either"
+    );
+    let err = format!(
+        "{}",
+        load_client_config(path.to_str().unwrap(), true).unwrap_err()
+    );
+    assert!(
+        err.contains("v1"),
+        "strict mode must still report the typeless visitor section; got {err}"
+    );
+
+    // The port-key discriminator must not swallow the v1 nesting: a portless
+    // dotted sub-table under a nested root still expands.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(
+        &path,
+        "[common]\nbind_port = 7000\n[webServer]\nport = 7500\n\
+         [webServer.tls]\ncertFile = /nested/cert.pem\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_server_config(path.to_str().unwrap(), strict).unwrap();
+        assert_eq!(
+            cfg.web_server.tls_cert(),
+            "/nested/cert.pem",
+            "strict={strict}"
+        );
+    }
+}
+
+/// A **typed** `.ini` section whose header is a camelCase v1 root name is still
+/// Go's legacy proxy, named after the header.
+///
+/// Go's legacy loader looks sections up by raw name, so `[webServer]` is one
+/// section there too, and frp-rs's known-section list holds only the snake_case
+/// spellings — the camelCase ones are exactly the headers whose INI nesting
+/// `ini_section_path` expands, so reserving them would drop the proxy.
+/// Measured with the final rule, `frpc verify` on `[webServer] type = tcp` with
+/// `local_port`/`remote_port`, `[httpPlugins] type = tcp ports = …` and
+/// `[sshTunnelGateway] type = tcp ports = …`: rc 0 with `Proxies: 1` under both
+/// `--strict-config` values, exactly as base971 (`971e0fa0`); the alias list the
+/// first cut added made those same rows `Proxies: 0` (lenient) / rc 1 (strict).
+///
+/// **Mutation teeth.** Re-adding any of the three names to `KNOWN_SECTIONS`
+/// fails the `find` below for that row; deleting the `if t.contains_key("type")`
+/// clause fails the two `ports`-only rows, which carry no `local_port` /
+/// `remote_port` to satisfy the typeless clause either.
+#[test]
+fn typed_camelcase_v1_root_headers_are_still_legacy_proxies() {
+    for (name, body) in [
+        (
+            "webServer",
+            "[webServer]\ntype = tcp\nlocal_port = 8080\nremote_port = 9080\n",
+        ),
+        (
+            "httpPlugins",
+            "[httpPlugins]\ntype = tcp\nports = 7000,7001\n",
+        ),
+        (
+            "sshTunnelGateway",
+            "[sshTunnelGateway]\ntype = tcp\nports = 7000,7001\n",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(
+            &path,
+            format!("[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n{body}"),
+        )
+        .unwrap();
+        for strict in [false, true] {
+            let cfg = load_client_config(path.to_str().unwrap(), strict)
+                .unwrap_or_else(|e| panic!("[{name}], strict={strict}: {e}"));
+            let proxy = cfg
+                .proxies
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "[{name}], strict={strict}: the typed legacy proxy must register; got {:?}",
+                        cfg.proxies
+                            .iter()
+                            .map(|p| p.name.clone())
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert_eq!(
+                proxy.proxy_type, "tcp",
+                "[{name}], strict={strict}: the declared type must win"
+            );
+            if name == "webServer" {
+                assert_eq!(proxy.local_port, 8080, "strict={strict}");
+                assert_eq!(proxy.remote_port, 9080, "strict={strict}");
+            }
+        }
+    }
+}
+
+/// A `type`-less `.ini` section that names **no** port stays a v1 section — the
+/// deliberately narrow half of frp-rs's `.ini` proxy rule, pinned in both modes.
+///
+/// Go's legacy loader would make it a `tcp` proxy named after its header (with
+/// port 0); frp-rs collects a typeless section only when it carries
+/// `local_port`/`remote_port`, the discriminator that also keeps the typeless
+/// `[webServer]` admin block out of the collector. Measured with the final rule
+/// and on base971 (`971e0fa0`), `frpc verify` on `[myproxy] custom_domains =
+/// a.com`: non-strict rc 0 with `Proxies: 0` (the table is dropped as an unknown
+/// field), strict rc 1 `unknown field "myproxy" in config file …`.
+///
+/// **Mutation teeth.** Deleting the `local_port`/`remote_port` clause makes the
+/// non-strict load register a phantom `tcp` proxy (the `is_empty` assert below
+/// fails, as do all four shapes in
+/// `typeless_camelcase_web_server_ini_is_not_a_phantom_proxy`) and lets this
+/// strict mode load (the `unwrap_err` below fails).
+#[test]
+fn typeless_ini_section_without_ports_stays_a_v1_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [myproxy]\ncustom_domains = a.com\n",
+    )
+    .unwrap();
+    let lenient = load_client_config(path.to_str().unwrap(), false).unwrap();
+    assert!(
+        lenient.proxies.is_empty(),
+        "a typeless, port-less section must not become a tcp proxy; got {:?}",
+        lenient
+            .proxies
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>()
+    );
+    let err = format!(
+        "{}",
+        load_client_config(path.to_str().unwrap(), true).unwrap_err()
+    );
+    assert!(
+        err.contains("unknown field \"myproxy\""),
+        "strict mode must still report the typeless, port-less section: {err}"
+    );
+}
+
+/// A typeless `.ini` section that declares itself a **visitor** *and* names a
+/// port is still not collected: the `role != "visitor"` clause of the collector
+/// is what buys the exclusion.
+///
+/// The port-key discriminator alone cannot separate this shape from a typeless
+/// proxy — `local_port`/`remote_port` are the very keys it tests for — so without
+/// the role clause the section is collected and, because it says
+/// `role = "visitor"`, routed into `[visitors]` carrying a synthetic
+/// `type = "tcp"` that Go never writes.
+///
+/// **Measured behaviour (pinned as-is, including the ugly half).** Go v0.71.0
+/// refuses a typeless visitor in *both* loader modes (`failed to parse visitor v,
+/// err: type shouldn't be empty`); frp-rs loads rc 0 with nothing collected in
+/// non-strict mode and refuses in strict mode with `unknown field "v"`. That is
+/// the pre-existing divergence filed as TODO residue, deliberately left unfixed
+/// here so this pin isolates the exclusion clause.
+///
+/// **Mutation teeth.** Replacing the clause with `true` collects the section and
+/// routes it into `[visitors]`, so even the lenient load fails client validation
+/// (`visitor 'v': server name is required`) and this test panics on the `unwrap`
+/// — the `visitors.is_empty()` assertion is never reached.
+#[test]
+fn typeless_port_carrying_ini_visitor_is_not_collected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [v]\nrole = \"visitor\"\nlocal_port = 1\nremote_port = 2\n",
+    )
+    .unwrap();
+
+    let lenient = load_client_config(path.to_str().unwrap(), false).unwrap();
+    assert!(
+        lenient.proxies.is_empty(),
+        "a typeless visitor must not become a tcp proxy; got {:?}",
+        lenient
+            .proxies
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        lenient.visitors.is_empty(),
+        "a typeless visitor must not be registered with an invented type either"
+    );
+
+    let err = format!(
+        "{}",
+        load_client_config(path.to_str().unwrap(), true).unwrap_err()
+    );
+    assert!(
+        err.contains("unknown field \"v\""),
+        "strict mode must still report the uncollected section as the unknown field it is: {err}"
+    );
 }
 
 /// A **non-table** `webServer` / `web_server` (top level or under `[common]`)
@@ -7597,7 +8026,7 @@ fn load_client_ini(content: &str) -> Result<ClientConfig, Box<dyn std::error::Er
     if let Some(table) = value.as_table_mut() {
         super::normalize::canonicalize_legacy_ini_bools(table);
     }
-    super::normalize::normalize_client_config(&mut value);
+    super::normalize::normalize_client_config(&mut value, super::format::ConfigFormat::Ini);
     // `.ini` inputs read values by target type, exactly as
     // `load_config_from_file` does (Go's legacy INI model) — not the strict
     // serde path TOML/JSON/YAML use.
@@ -7614,7 +8043,7 @@ fn load_server_ini(content: &str) -> Result<ServerConfig, Box<dyn std::error::Er
     if let Some(table) = value.as_table_mut() {
         super::normalize::canonicalize_legacy_ini_bools(table);
     }
-    super::normalize::normalize_server_config(&mut value);
+    super::normalize::normalize_server_config(&mut value, super::format::ConfigFormat::Ini);
     let mut cfg: ServerConfig =
         super::ini_lenient::deserialize_ini(&super::normalize::toml_to_json(value))
             .map_err(|e| format!("config validation error: {e}"))?;
@@ -7765,7 +8194,7 @@ fn legacy_ini_go_shipped_fixture_passes_strict_mode() {
         super::format::ConfigFormat::Ini,
     )
     .unwrap();
-    super::normalize::normalize_client_config(&mut value);
+    super::normalize::normalize_client_config(&mut value, super::format::ConfigFormat::Ini);
     super::strict::run_strict_check(
         &value,
         &super::strict::known_client_keys(),
@@ -9684,7 +10113,7 @@ fn case_insensitive_proxy_array_key_is_refused_in_strict_mode() {
 ///
 /// * Go refuses **both** spellings — `unsafe feature "TokenSourceExec" is not
 ///   enabled …` — because it reads the key either way and then hits its gate.
-/// * frp-rs strict `verify` exits 0 and prints `is valid` for **both** too, but
+/// * frp-rs strict `verify` exits 0 and prints `syntax is ok` for **both** too, but
 ///   not because it lacks the gate: `TokenSourceExec` is defined at
 ///   `frp-core/src/unsafe_features.rs:10` and enforced by
 ///   `validate_token_source_unsafe` (`frp-core/src/auth.rs`), called from
@@ -9750,7 +10179,7 @@ fn case_insensitive_key_in_a_nested_table_is_dropped_in_strict_mode() {
 ///
 /// Measured against Go v0.71.0: Go's `verify -c` on the `Address` spelling fails
 /// with `VirtualNet feature is not enabled; enable it by setting the appropriate
-/// feature gate flag`, while frp-rs's `verify` exits 0 and prints `is valid`, and
+/// feature gate flag`, while frp-rs's `verify` exits 0 and prints `syntax is ok`, and
 /// the strict load returns `Ok` with `virtual_net.address == ""`. The dropped key
 /// also *hides* the feature-gate refusal, because an empty address means no vnet
 /// config is seen at all. `[virtual_net] Address` and `[virtualNet] address`

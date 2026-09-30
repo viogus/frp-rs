@@ -801,7 +801,9 @@ What the walk does **not** reach, each cell measured on Go frp v0.71.0
   `normalize_proxies` removes those tables before the check, keeping only their
   `set` map. Measured: `[proxies.requestHeaders] notAKnownRhKey = 1` →
   Go `decode proxy at index 0: unmarshal ProxyConfig error: json: unknown field
-  "notAKnownRhKey"`, exit 1; frp-rs `Config file … is valid`, exit 0.
+  "notAKnownRhKey"`, exit 1; frp-rs `Config file … is valid`, exit 0 (the
+  success line has since moved to Go's `frpc: the configuration file …
+  syntax is ok`).
 * A mis-cased key is refused where Go accepts **and applies** it. Go's
   `encoding/json` decoder matches object keys case-insensitively, so
   `[[proxies]] … RemotePort = 7198` is read as `remotePort`; frp-rs's lists match
@@ -815,8 +817,15 @@ What the walk does **not** reach, each cell measured on Go frp v0.71.0
   walk: `SERVERADDR` at the top level is Go-accepted (exit 0, measured) and
   frp-rs-refused (`unknown field "SERVERADDR"`, exit 1).
 * A **legacy-shaped top-level section** — any top-level mapping that carries a
-  `type` key, in **any** config format, because the collector keys on the shape
-  and `normalize_client_config` never sees the file format — is fed through the
+  `type` key, in **any** config format, because the collector keys on the shape;
+  since the typeless-`.ini` rule a section-like mapping carrying
+  `local_port`/`remote_port` is legacy-shaped too, in the one format whose
+  loader passes the dialect down (`normalize_client_config` takes a
+  `ConfigFormat`, and the file path hands it `Ini` —
+  `frp-core/src/config/file.rs:123` passes it to `load_config_from_file`, which
+  detects the extension at `frp-core/src/config/normalize.rs:600` and applies it
+  at `:631`; the TOML-from-string path passes `ConfigFormat::Toml`,
+  `frp-core/src/config/loader.rs:180`) — is fed through the
   same check, but with Go's accept-and-ignore semantics rather than the v1
   surface's rejection: the legacy collector folds the prefix mechanisms Go reads
   (`meta_*` → `metadatas`, `header_*` → `headers` for `type = "http"`,
@@ -847,6 +856,25 @@ What the walk does **not** reach, each cell measured on Go frp v0.71.0
   check every 2.0 s whether or not `_seconds = 99` is also set, `_seconds = 2`
   alone is ignored (one check, then the 10 s default), and `_s = 99` +
   `_seconds = 2` gives one check.
+  * **Consequence for an `.ini` extension table that names a port.** On the
+    client, a section its extension surface also reads (`[webServer]`,
+    `[webServer.tls]`) is collected as a proxy as soon as it carries
+    `local_port`/`remote_port`, so the extension keys in that section are dropped
+    with it. Measured with `[webServer] port = 7500` + `user = admin` +
+    `local_port`/`remote_port` (or only `local_port`):
+    before this change the dashboard settings loaded and no proxy existed
+    (`webServer` port 7500, user `admin`, `Proxies: 0`); now the dashboard
+    settings are empty and one `webServer` `tcp` proxy exists, and a nested
+    `[webServer.tls] certFile`/`keyFile` is dropped the same way. Go registers
+    the header as a proxy in both shapes, so this is the Go-faithful side — keep
+    dashboard and nested-TLS settings in a section that carries no
+    `local_port`/`remote_port`. Three limits of the rule: it is the client's
+    collector only (`collect_legacy_ini_proxy_sections` is called from
+    `normalize_client_config`; on `frps` the same section still loads as settings
+    and only strict mode refuses it — `unknown field "web_server.local_port"`),
+    it covers the camelCase spellings this table lists (a snake-case
+    `[web_server]` root with ports is **not** collected: client `Proxies: 0`
+    lenient, strict `unknown field`), and one port key is enough.
   * **Divergence for a legacy-shaped section in a non-INI file.** Go's v1
     decoder rejects the *section name* outright, while frp-rs collects it into a
     proxy and (after this change) ignores the same key again. Measured on
