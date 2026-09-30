@@ -39,6 +39,22 @@ struct Cli {
     #[arg(long, default_value = "0")]
     streams: usize,
 
+    /// Per-stream throughput cap in MiB/s for throughput mode (0 = unpaced).
+    /// The cap is applied to COMBINED traffic — sent plus received — so
+    /// `--mbps 1` moves about 0.5 MiB/s of payload in each direction. A
+    /// long-uptime soak caps this so sustained load cannot pin every core and
+    /// confound the comparison through thermal throttling.
+    #[arg(long, default_value = "0")]
+    mbps: u64,
+
+    /// Connection-start rate cap for memory/churn mode, in connections per
+    /// second across ALL workers (0 = unpaced). An unpaced churn loop is paced
+    /// by each stack's own capacity and exhausts the client ephemeral-port
+    /// range with TIME_WAIT sockets; a fixed rate gives both stacks the same
+    /// offered churn and lets a multi-hour run survive.
+    #[arg(long, default_value = "0")]
+    rate: u64,
+
     /// Write structured JSON result to this path (append mode unless --json-truncate)
     #[arg(long)]
     json_out: Option<String>,

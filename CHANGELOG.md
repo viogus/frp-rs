@@ -1149,6 +1149,16 @@ User-facing release notes for frp-rs.
   are in `docs/developing.md` § `--strict-config`: the space-separated value
   form.
 
+### CI & Tooling
+
+- **RSS soak harness and a published head-to-head series**: `scripts/rss-soak.sh` runs a 3-hour,
+  45-second-interval RSS comparison of frp-rs and Go frp over an identical proxy set and traffic,
+  guards its run directory (`scripts/lib/rss-soak-run-dir.sh`), writes a machine-readable summary
+  (`scripts/lib/rss-soak-summary.py`), and is covered by a fixture suite
+  (`scripts/tests/rss-soak-run-dir.sh`, 269 checks) in the `health` CI job. The first published
+  series is `scripts/frp-stress/baselines/rss-soak-Mac.jsonl`; the measured numbers and their
+  caveats are recorded in `TODO.md`.
+
 ## v0.71.0 — re-release (2026-09-13)
 
 Supersedes the 2026-08-16 v0.71.0 build (PR #246 era). Same version number,

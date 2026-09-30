@@ -6767,7 +6767,7 @@ nothing about whether the described behaviour still holds.
   differentiator (Go is memory-safe too; the Rust-specific claims are no GC, no
   runtime, and compile-time data-race freedom). Part (c) is split out below.
 
-- [ ] **The "no GC ⇒ stable RSS over weeks" claim has no long-uptime evidence.**
+- [x] **The "no GC ⇒ stable RSS over weeks" claim has no long-uptime evidence.**
   Evidence: every committed baseline measures frp-rs against itself, and the
   idle-RSS figures (9.9 MB frps / 9.2 MB frpc) are single samples, not a time
   series. Go's heap growing to roughly 2× live is a real mechanism, but this
@@ -6779,6 +6779,28 @@ nothing about whether the described behaviour still holds.
   harness used, showing RSS over time for both — or the claim is dropped from the
   positioning docs. `scripts/memory-baseline.sh` already accepts
   `FRPS_BIN`/`FRPC_BIN`, so pointing it at the Go binary is the starting point.
+
+  **Done (2026-09-30, code head `5b154c91` on `measure/rss-soak`, PR #424).** The 3-hour head-to-head
+  series is published as `scripts/frp-stress/baselines/rss-soak-Mac.jsonl`: `bash scripts/rss-soak.sh
+  10800 45` on macOS arm64, 2026-09-30T18:47:54Z → 21:47:54Z, **240 paired samples** at 45 s, one TCP
+  proxy per stack over the same proxy set and the same offered traffic (8-connection churn at 40/s plus
+  three 5 Mbps steady streams). RSS (KB): frp-rs `frps` 12336 → 10208 (min 9936, max 12592, mean
+  10982.3, slope −532.13 KB/h, last-quarter mean −10.1 % against the first), frp-rs `frpc` 11632 → 9344
+  (min 9344, max 11872, mean 10316.9, slope −525.92 KB/h, −10.5 %); Go `frps` 33856 → 30064 (min 29568,
+  max 37600, mean 31026.7, slope −30.71 KB/h, 0.0 %), Go `frpc` 24288 → 24448 (min 23616, max 25648,
+  mean 24627.1, slope +80.1 KB/h, +1.1 %). Neither frp-rs series is monotonically non-decreasing and
+  both *decline* over the window, ending at roughly **one third** of Go's RSS (10208 against 30064 KB
+  for `frps`, 9344 against 24448 KB for `frpc`), so the claim is **supported at this horizon** — 3 hours
+  is not "weeks", and the series makes no claim beyond it. Traffic parity is exact inside the harness's
+  10 % tolerance (achieved spread **0.0**): 427200 against 427206 churn round trips, 170183884800
+  steady bytes per stack, **0 failed streams**. The host was loaded across the run (1-minute load
+  2.27–93.93, mean 28.42; `TIME_WAIT` up to 5108), so the window includes busy periods. The harness
+  contribution is separable from the number: `scripts/lib/rss-soak-run-dir.sh` binds every sample and
+  the summary to one run directory (a run cannot publish a summary built from another run's samples)
+  and `scripts/lib/rss-soak-summary.py` writes the record, both covered by
+  `scripts/tests/rss-soak-run-dir.sh` (269 fixture checks) in the `health` CI job. The accepted bound —
+  a `ps` stub printing a different plausible value on every sample passes every guard — is recorded in
+  `scripts/frp-stress/baselines/README.md`.
 
 **Findings filed by the `[web_server.tls]` fix round (all pre-existing, all measured 2026-09-29 at `ccff127`).
 All six were closed in the `fix/webserver-tls-cluster` batch (A–F below, each with its own Done note and
@@ -8102,3 +8124,16 @@ section; ledger now **24 open / 104 closed**.**
   `Some(0)`.
   **Done-when:** the pins assert what each side actually does (Go's signal death vs frp-rs's graceful 0) or the
   divergence is recorded where the lane's exit contract is documented.
+
+- [ ] **The RSS-soak fixture step has no outer pins.** The `health` job runs
+  `bash scripts/tests/rss-soak-run-dir.sh` bare (`.github/workflows/ci.yml:135-136`), so a step whose
+  script is replaced by `exit 0`, or whose checks are skipped, still passes; the `Stray guard` step
+  above it wraps the same shape with a `RESULT:` literal and an error branch. Mirror that pattern.
+  **Done-when:** the step asserts the script's `RESULT: 269 fixture check(s) hold` line in both
+  directions (missing and failed) rather than only its exit code.
+
+- [ ] **Stale "two fixture scripts" comment in the health job.** `.github/workflows/ci.yml:86-88`
+  still says the job reads "files with grep/find only, plus two fixture scripts"; it now runs three
+  (`scripts/tests/repo-health-fixtures.sh`, `scripts/tests/compat-stray-guard.sh`,
+  `scripts/tests/rss-soak-run-dir.sh`).
+  **Done-when:** the comment names the three.
