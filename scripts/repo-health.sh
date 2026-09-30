@@ -265,14 +265,25 @@ def walk_error(e):
     note('%s: %s' % (getattr(e, 'filename', '?'), e.strerror or e))
 
 
-def rs_texts(root, top_only=False):
+def rs_texts(root, top_only=False, within=None):
     """Yield the text of every `.rs` file under `root`, reading each with the
     O_NONBLOCK guard. `top_only` matches a `root/*.rs` glob (not a recursive
-    grep): only the directory's own entries. Each *real* file is yielded once
-    per call: the walk still lists a symlinked `.rs` next to its target, so
-    keying on `os.path.realpath` keeps that one source from counting twice.
+    grep): only the directory's own entries.
+
+    Two alias shapes are excluded. Each *real* file is yielded once per call,
+    keyed on `(st_dev, st_ino)` rather than on `os.path.realpath`: the walk
+    still lists a symlinked `.rs` next to its target, and `os.stat` follows the
+    link, so the inode key catches that *and* a hard link, which `realpath`
+    cannot see (measured: `ln frp-core/src/kcp/session.rs frp-core/src/zz_hard.rs`
+    inflated the unsafe-block count, `#33` measuring 22 against a doc figure of
+    21). And a file whose realpath is outside `within` (default: `root`) is
+    another scope's file, not this one's (measured:
+    `ln -s ../../frp-server/src/lib.rs frp-core/src/zz_xcrate.rs` added 24
+    files/lines to the frp-core row while staying in frp-server's own count).
+
     Callers that measure two scopes (`<crate>/src` and the whole crate dir)
-    call this once per scope, so the dedupe never crosses a scope boundary.
+    call this once per scope, so the dedupe never crosses a scope boundary; each
+    passes `within=<crate root>` so one crate's row cannot absorb another's file.
 
     A scope root that is itself a symlink yields nothing and is recorded as an
     error: `os.walk(root, ..., followlinks=False)` scandirs its own root, so
@@ -287,7 +298,28 @@ def rs_texts(root, top_only=False):
     if os.path.islink(root):
         note('%s: scope root is a symlink — not walked' % root)
         return
+    within_real = os.path.realpath(within if within else root)
     seen = set()
+
+    def fresh(path):
+        # None = not this scope's file; otherwise the inode identity to dedupe
+        # on (falling back to the resolved path when the file cannot be stat'd).
+        # Readability is checked *before* containment: a broken symlink in this
+        # crate's own `src` resolves outside `within`, and dropping it there
+        # would hide the read error the caller reports (measured: a dangling
+        # `frp-core/src/zz_broken.rs` went from `scan error: … No such file or
+        # directory` + rc 1 to silence + `RESULT: invariants hold` when
+        # containment ran first). A stat failure falls through so the read below
+        # raises and is noted.
+        try:
+            st = os.stat(path)
+        except OSError:
+            return os.path.realpath(path)
+        real = os.path.realpath(path)
+        if not real.startswith(within_real + os.sep):
+            return None
+        return (st.st_dev, st.st_ino)
+
     if top_only:
         try:
             names = sorted(os.listdir(root))
@@ -297,18 +329,18 @@ def rs_texts(root, top_only=False):
         for fn in names:
             if fn.endswith('.rs'):
                 path = os.path.join(root, fn)
-                real = os.path.realpath(path)
-                if real not in seen:
-                    seen.add(real)
+                key = fresh(path)
+                if key is not None and key not in seen:
+                    seen.add(key)
                     yield path
         return
     for dirpath, _dirs, names in os.walk(root, onerror=walk_error, followlinks=False):
         for fn in names:
             if fn.endswith('.rs'):
                 path = os.path.join(dirpath, fn)
-                real = os.path.realpath(path)
-                if real not in seen:
-                    seen.add(real)
+                key = fresh(path)
+                if key is not None and key not in seen:
+                    seen.add(key)
                     yield path
 
 
@@ -326,7 +358,7 @@ for crate in CRATES:
     # then, being outside `src/`, attribute it to no scope at all.
     if not os.path.isdir(crate):
         continue
-    for p in rs_texts(os.path.join(crate, 'src')):
+    for p in rs_texts(os.path.join(crate, 'src'), within=crate):
         try:
             text = safe_read(p)
         except OSError as e:
@@ -336,7 +368,7 @@ for crate in CRATES:
         lines[crate] += text.count('\n')
         if crate in safety:
             safety[crate] += text.count('// SAFETY')
-    for p in rs_texts(crate):
+    for p in rs_texts(crate, within=crate):
         try:
             text = safe_read(p)
         except OSError as e:
@@ -350,7 +382,8 @@ for crate in CRATES:
             testfiles += 1
 
 srvtest = 0
-for p in rs_texts(os.path.join('frp-server', 'tests'), top_only=True):
+for p in rs_texts(os.path.join('frp-server', 'tests'), top_only=True,
+                  within='frp-server'):
     try:
         text = safe_read(p)
     except OSError as e:
@@ -451,8 +484,19 @@ printf '  test functions      : %s\n' "${n_testfuncs:-0}"
 printf '  files with tests    : %s\n' "${n_testfiles:-0}"
 printf '  frp-server/tests    : %s\n' "${n_srvtest:-0}"
 printf '  proptest blocks     : %s\n' "${n_proptest:-0}"
+# An integration-test dir is a `tests/` dir that carries at least one `.rs` file.
+# A plain `-type d -name tests` find also matched `scripts/tests/` (the
+# repo-health fixture harness, shell only), which moved this printed metric from
+# 6 to 7 and made the *label* wrong, not just the number.
 printf '  integration test dirs: %s\n' \
-  "$(find . -path ./target -prune -o -type d -name tests -print 2>/dev/null | grep -vc '^\./\.' || true)"
+  "$(find . -path ./target -prune -o -type d -name tests -print 2>/dev/null \
+     | grep -v '^\./\.' \
+     | while IFS= read -r d; do
+         if [ -n "$(find "$d" -name '*.rs' -print -quit 2>/dev/null)" ]; then
+           printf '%s\n' "$d"
+         fi
+       done \
+     | wc -l | tr -d ' ' || true)"
 printf '\n  NOTE: the number of tests that *pass* is a runtime fact, not a static one.\n'
 printf '  Run: cargo test --workspace --all-features\n'
 
@@ -527,15 +571,31 @@ for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
         note('%s: scope root is a symlink — not walked' % src)
         continue
     blocks = fns = impls = 0
-    seen = set()   # a symlinked `.rs` is its target: count the real file once
+    seen = set()
+    # Dedupe on the inode (a symlink and a hard link to one source share it;
+    # `realpath` misses the hard link) and keep this crate's row to files whose
+    # realpath is inside the crate, so a cross-crate symlink is not counted here.
+    within_real = os.path.realpath(crate)
     for root, _d, files in os.walk(src, onerror=walk_error):
         for fn in files:
             if fn.endswith('.rs'):
                 path = os.path.join(root, fn)
                 real = os.path.realpath(path)
-                if real in seen:
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    # Unreadable (e.g. a broken symlink): keep it so the read
+                    # below reports it. Checking containment first would drop it
+                    # silently whenever its unresolved target sits outside the
+                    # crate, hiding the scan error the caller would have noted.
+                    key = real
+                else:
+                    if not real.startswith(within_real + os.sep):
+                        continue
+                    key = (st.st_dev, st.st_ino)
+                if key in seen:
                     continue
-                seen.add(real)
+                seen.add(key)
                 try:
                     text = code_only(safe_read(path))
                 except OSError as e:
@@ -650,16 +710,28 @@ for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
         # rather than scan (and justify) whatever crate it points at.
         note('%s: scope root is a symlink — not walked' % src)
         continue
-    seen = set()   # a symlinked `.rs` is its target: scan the real file once
+    seen = set()
+    # Inode dedupe + own-crate scope, as in the unsafe-count walks above.
+    within_real = os.path.realpath(crate)
     for root, _dirs, files in os.walk(src, onerror=walk_error):
         for fn in files:
             if not fn.endswith('.rs'):
                 continue
             path = os.path.join(root, fn)
             real = os.path.realpath(path)
-            if real in seen:
+            try:
+                st = os.stat(path)
+            except OSError:
+                # Unreadable (e.g. a broken symlink): keep it so the read below
+                # reports it, rather than dropping it via containment.
+                key = real
+            else:
+                if not real.startswith(within_real + os.sep):
+                    continue
+                key = (st.st_dev, st.st_ino)
+            if key in seen:
                 continue
-            seen.add(real)
+            seen.add(key)
             try:
                 raw = safe_read(path)
             except OSError as e:
@@ -1154,11 +1226,34 @@ def floating_hits(text):
 
 
 files = []
+seen = set()   # a symlinked workflow is its target: scan the real file once
 for dirpath, _dirs, names in os.walk('.github/workflows', onerror=walk_error,
                                      followlinks=False):
     for fn in sorted(names):
         if fn.endswith(('.yml', '.yaml')):
-            files.append(os.path.join(dirpath, fn))
+            path = os.path.join(dirpath, fn)
+            if '\n' in path or '\r' in path:
+                # The scan hands hits to bash as `C <path>:<line>:<text>` lines,
+                # so a newline anywhere in a workflow's path — its own name *or a
+                # directory component* — would split a hit and the fragment would
+                # be re-parsed as a hit of its own (measured: a workflow named
+                # `a<LF>C forged.yml` produced a bogus toolchain-input FAIL, and a
+                # *directory* `sub<LF>C forged.yml/` around a floating-hit
+                # `probe.yml` produced a fabricated `FAIL 1 toolchain: input(s)`;
+                # a basename-only guard missed the directory shape). Refuse the
+                # path fail-closed rather than escape it: nothing under it is
+                # scanned, and the gate says so.
+                state['bad'] = True
+                print('E   FAIL  workflow path with a newline in its name was not '
+                      'scanned: %s'
+                      % path.replace('\\', '\\\\').replace('\r', '\\r')
+                            .replace('\n', '\\n'))
+                continue
+            real = os.path.realpath(path)
+            if real in seen:
+                continue
+            seen.add(real)
+            files.append(path)
 files.sort()
 top = os.path.join('.github', 'workflows')
 for path in files:
@@ -1355,11 +1450,16 @@ def walk_error(e):
     walk_errors.append('%s: %s' % (getattr(e, 'filename', '?'), e.strerror or e))
 
 
+seen = set()   # a symlinked archive file is its target: count the real file once
 for root, _dirs, files in os.walk(os.path.join('docs', 'archive'), onerror=walk_error):
     for fn in files:
         if not fn.endswith(('.md', '.json')):
             continue
         p = os.path.join(root, fn)
+        real = os.path.realpath(p)
+        if real in seen:
+            continue
+        seen.add(real)
         try:
             text = safe_read(p)
         except OSError as e:
@@ -2144,15 +2244,30 @@ def unsafe_counts(crate):
         # directory that is present.
         raise PartialTree(src, detail='%s is a symlink (scope root refused)' % src)
     blocks = fns = impls = n_rs = 0
-    seen = set()   # a symlinked `.rs` is its target: count the real file once
+    seen = set()
+    # Inode dedupe (`realpath` misses a hard link to the same source) + this
+    # crate's own scope, so a cross-crate symlink is another crate's file.
+    within_real = os.path.realpath(crate)
     for root, _d, files in os.walk(src, onerror=walk_error):
         for fn in files:
             if fn.endswith('.rs'):
                 path = os.path.join(root, fn)
                 real = os.path.realpath(path)
-                if real in seen:
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    # Unreadable (e.g. a broken symlink): keep it so the read
+                    # below reports it. Checking containment first would drop it
+                    # silently whenever its unresolved target sits outside the
+                    # crate, hiding the scan error the caller would have noted.
+                    key = real
+                else:
+                    if not real.startswith(within_real + os.sep):
+                        continue
+                    key = (st.st_dev, st.st_ino)
+                if key in seen:
                     continue
-                seen.add(real)
+                seen.add(key)
                 n_rs += 1
                 text = code_only(read_required(path, errors='ignore'))
                 blocks += len(re.findall(r'unsafe\s*\{', text))

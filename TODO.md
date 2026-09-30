@@ -5472,7 +5472,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   CHANGELOG bullet: `## Unreleased` is user-facing
   (Features/Changed/Fixed/Docs) and the recent tooling/test/doc-only commits `f177e493`,
   `c4357fc5`, `66be9ce1` added none.
-- [ ] **A newline in a workflow filename is mis-parsed by the workflow-scan protocol.** The scan
+- [x] **A newline in a workflow filename is mis-parsed by the workflow-scan protocol.** The scan
   hands its hits to bash as `C <path>:<line>:<text>` / `D …` / `E …` lines on stdout and the wrapper
   parses them with `case`. A tracked file whose *name* contains a newline (git can track such names;
   the path scan already handles them with `surrogateescape`) splits a hit line, and the fragment is
@@ -5481,7 +5481,20 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `forged.yml:5` while the real witness was truncated to `.github/workflows/a`. False-FAIL direction
   only — no false green, and the real violation is still reported. **Done-when:** the wrapper refuses
   or skips a workflow path containing a newline (or the protocol escapes it), pinned by a probe.
-- [ ] **The exit-code mapping between the gate's python blocks and `repo-health.sh` is unpinned.**
+
+  Done: fixed in #415 (`38517d2d`). `wf_scan` now joins the path first and refuses any workflow
+  **path** — filename or directory component — containing a newline (or CR) before it reaches the
+  `C`/`D`/`E` protocol: `FAIL  workflow path with a newline in its name was not scanned: <path>`
+  (newline escaped in the message) plus both `…scan not evaluated — a workflow file could not be
+  read` rows, rc 1, fail-closed. Measured: the review's `a<LF>C forged.yml` filename shape forged
+  `forged.yml:8:          toolchain: 1.98.0` and a fabricated `FAIL` row for the `toolchain:` input
+  check before the fix, and is refused after it (the item's `FAIL 1` was the first cut's count; the
+  measured values are 2 for this shape and 1 for the directory shape, and the script comment states
+  both shapes without a count); the **directory** shape
+  `sub<LF>C forged.yml/probe.yml`, which defeated the first
+  cut because its guard tested the basename only, is refused too. Both shapes are pinned in
+  `scripts/tests/repo-health-fixtures.sh` (scenarios 2 and 3).
+- [x] **The exit-code mapping between the gate's python blocks and `repo-health.sh` is unpinned.**
   Measured 2026-09-26 at this branch's head: the script itself can only exit **0 or 1** — every
   assignment is `fail=0`/`fail=1` (`grep -n "fail=" scripts/repo-health.sh`; `grep -c "fail=[234]"`
   is 0), the explicit early exits are `exit 1` (`:55`, `:73`) plus the `|| exit 1` fallbacks on the
@@ -5511,6 +5524,19 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   asserts both the process rc the wrapper returns (**1**, never 3) and the `(exit 3)` annotation on
   the corresponding `FAIL` row, so a future bare `exit 3`/`fail=3` regression, or a re-drifted
   "the gate exits 3" claim, fails a test.
+
+  Done: fixed in #415 (`12b49bb7`, hardened in `8efa9aa5`). New
+  `scripts/tests/repo-health-fixtures.sh` builds a throwaway tree, runs the gate against it, and
+  asserts both halves on the *named* row: the process rc is **1** (not the python block's 3) and
+  the `FAIL  archive path scan failed (exit 3)` row is printed — matched by `grep -qF` on the row
+  text, because a partial tree already prints two unrelated `(exit 3)` rows
+  (`path-reference scan produced no result`, `doc figures not evaluated — the tree is partial`), so
+  an any-row assertion was vacuous. Teeth measured by four mutations, each reverted byte-identical:
+  `scripts/repo-health.sh:1452` `sys.exit(3)` -> `sys.exit(0)` reds it; that row's annotation
+  reworded reds it; the basename-only newline guard reds it (scenario 3); containment-before-
+  readability reds it (scenario 4). The harness runs as its own step in the `health` job of
+  `.github/workflows/ci.yml` (no `continue-on-error`): `RESULT: 12 fixture check(s) hold`, ~0.9 s,
+  cwd/HOME/locale/`TMPDIR`-robust and leak-free.
 
 - [x] **`ci.yml` spells the guarded test counts out by hand in two lanes, so every added test moves a literal.**
   Evidence (read at this head, `79478ca`): the `frps` CLI exit-code guard asserts its expected
@@ -6909,14 +6935,19 @@ section; ledger now **24 open / 104 closed**.**
   `frp-client/tests/reload_warning_delivery.rs:11` cites `/tmp/enable-warn-probe/http_smoke.sh`), and
   both reviewers reproduced the measurements independently, so no action is needed.
 
-- [ ] **A doc comment in `frp-core/src/transport/mod.rs` cites the wrong line for `connect_ws_raw`.**
+- [x] **A doc comment in `frp-core/src/transport/mod.rs` cites the wrong line for `connect_ws_raw`.**
   `frp-core/src/transport/mod.rs:3281` says the helper is `#[cfg(feature = "websocket")]` and cites
   `transport/mod.rs:2187`, but the definition is `pub async fn connect_ws_raw<S>(` at `:2254`
   (stale at the base too: the same comment sits at `:3280` in `9fd76852`, where the definition is
   also `:2254`). One-line comment correction found by the #412 adversarial review; that PR was
   test-only, so it filed rather than fixed. **Done-when:** the citation names `:2254` (or drops the
   line number), with the definition re-located at the fix's head.
-- [ ] **A symlinked non-`.rs` file is still double-counted by two `repo-health.sh` walks.** The `.rs`
+
+  Done: fixed in #415 (`66c72345`): the comment at `frp-core/src/transport/mod.rs:3281` now cites
+  `:2254`, re-located at the fix's head — `pub async fn connect_ws_raw<S>(` at
+  `frp-core/src/transport/mod.rs:2254` with its `#[cfg(feature = "websocket")]` at `:2253`. One
+  comment line changed (1+/1−).
+- [x] **A symlinked non-`.rs` file is still double-counted by two `repo-health.sh` walks.** The `.rs`
   walks dedupe on `os.path.realpath` (item above), but the `.github/workflows` yml scan
   (`scripts/repo-health.sh:1157`) and the `docs/archive` md/json walk (`:1358`) still enumerate a
   symlink as a second file. Measured 2026-09-29 on `fix/symlink-double-count`: an untracked
@@ -6929,7 +6960,14 @@ section; ledger now **24 open / 104 closed**.**
   (info-only). **Done-when:** both walks key their files on realpath like the `.rs` walks, or each
   documents why a symlinked entry is a distinct path (as `docs/README.md` indexing legitimately
   does), with the measured before/after for each.
-- [ ] **Two symlink shapes still defeat the `repo-health.sh` realpath dedupe: cross-crate targets and
+
+  Done: fixed in #415 (`83c9d537`): both walks key their files on `os.path.realpath`, like the `.rs`
+  walks. Measured on the item's shapes: `.github/workflows/zz_alias.yml -> zz_probe.yml` holding
+  `- run: rustup default stable` goes `FAIL 2 floating toolchain selection(s)…` -> `FAIL 1`;
+  `docs/archive/zz_alias.md -> plans/2026-06-26-management-api.md` goes `archive path refs: 21,
+  resolvable…: 20` -> the clean `20 / 19`. A **hard link** in either walk is still double-counted —
+  filed as a new item below.
+- [x] **Two symlink shapes still defeat the `repo-health.sh` realpath dedupe: cross-crate targets and
   hard links.** The `.rs` walks dedupe per scope on `os.path.realpath` (item above), which covers an
   alias whose target is a normal path in the same crate, but not these two.
   **(a) A target in another crate is counted in both crates**, because `seen` is per-walk and each
@@ -6947,3 +6985,66 @@ section; ledger now **24 open / 104 closed**.**
   for hard links, and excluding a target outside the walk root from that crate's own scope), or the
   gate names each shape instead of silently disagreeing with a curated claim, with a measured
   before/after for both.
+
+  Done: fixed in #415 (`587735eb`, hardened in `8efa9aa5`): all four `.rs` walks key on
+  `(st_dev, st_ino)` and each crate's walk contains the file to its own root. Measured:
+  `ln -s ../../frp-server/src/lib.rs frp-core/src/zz_xcrate.rs` moves `frp-core` `70 / 76534` ->
+  `69 / 76510` with `frp-server` unchanged at `32 / 59146`; `ln frp-core/src/kcp/session.rs
+  frp-core/src/zz_hard.rs` moves `70 / 78342`, unsafe `22/3/1/24`, `FAIL #33 CLAUDE.md:172 says 21,
+  the tree measures 22`, rc **1** -> `69 / 76510`, `21/3/1/23`, rc 0. The same round closed a false
+  green the first cut introduced: the containment `continue` ran before the readability check, so an
+  unreadable in-crate alias was dropped silently (base rc 1 with `scan error: …` x5, first cut rc 0
+  `RESULT: invariants hold`); the stat now runs first. Residual: a **cross-crate hard link** — a
+  shape neither key reaches, because `seen` is per scope and the twin sits inside its own crate's
+  root — is still counted in both crates; filed as a new item below.
+
+
+- [ ] **A cross-crate *hard link* is still counted in both crates by `repo-health.sh`.** The
+  `(st_dev, st_ino)` key added in #415 lives in each walk's own `seen` set, and the containment
+  rule excludes a *symlink* whose realpath leaves the crate — but a hard link has no realpath in
+  common with its twin and its own directory entry is inside its own crate's root. Measured
+  2026-09-30 at `8efa9aa5`: with `ln frp-core/src/kcp/session.rs frp-server/src/zz_hardlink.rs` in
+  place, `frp-core` stays `69 files / 76510 lines` while `frp-server` moves `32 / 59146` ->
+  `33 / 60978` and its unsafe row `0/0/0/1` -> `1/0/0/2`, at rc 0 (no gate compares a crate against
+  a curated figure, so this is a silent count divergence, not a red). **Done-when:** the inode set
+  is shared across the four walks while preserving the per-scope row semantics `within` protects (or
+  the shape is otherwise counted once, or named), with the measured before/after.
+- [ ] **A *hard link* inside `.github/workflows/` or `docs/archive/` still double-counts.** #415
+  gave those two walks a `realpath` key, which sees a symlink but not a hard link. Measured
+  2026-09-30 at `8efa9aa5`: an untracked `.github/workflows/zz_probe.yml` holding
+  `- run: rustup default stable` plus
+  `ln .github/workflows/zz_probe.yml .github/workflows/zz_hard.yml` prints
+  ``FAIL  2 floating toolchain selection(s) under .github/workflows/ (rustup default ...)`` and
+  `RESULT: FAILURES above` at rc 1 for one aliased file (the gated false-FAIL direction); a
+  `ln docs/archive/plans/2026-06-26-management-api.md docs/archive/zz_hard.md` moves the info row
+  `archive path refs: 20, resolvable via the docs/archive/ prefix: 19` to `21 / 20` at rc 0.
+  **Done-when:** both walks key on `(st_dev, st_ino)` like the `.rs` walks, with the measured
+  before/after for each.
+- [ ] **`scripts/tests/repo-health-fixtures.sh` fails when invoked through a symlink.** It resolves
+  the script under test from an unresolved `BASH_SOURCE`, unlike `repo-health.sh` itself. Measured
+  2026-09-30 at `8efa9aa5`: `ln -sf <tree>/scripts/tests/repo-health-fixtures.sh /tmp/rhfx.sh &&
+  bash /tmp/rhfx.sh` prints `FAIL  cannot find the script under test: //scripts/repo-health.sh` and
+  exits 1. CI invokes it by real path, so this is a developer-convenience hole, not a false green;
+  closing it needs the same `readlink` resolution loop `repo-health.sh` carries. **Done-when:** the
+  harness resolves its own path so a symlink invocation runs green, or its header states the
+  limitation.
+- [ ] **Three coverage gaps in the new `repo-health.sh` fixture harness.** The round-2 reviews of
+  #415 found all three; none is a gate false-green today (each needs a mutation that also disables
+  the check itself, or touches a printed metric no figure depends on).
+  **(a) The exit-code scenario has no negative control.** It asserts that the
+  `  FAIL  archive path scan failed (exit 3)` row is present when the archive scan fails, but nothing
+  asserts its **absence** on a clean scan, so a wrapper that hardcoded that row while the archive
+  gate exited 0 stays green (mutation A4, measured by Reviewer 2; one assertion on a clean throwaway
+  tree closes it). **(b) Scenario 4 pins only one of the four walk sites.** In a throwaway tree the
+  three inline blocks die earlier on `ModuleNotFoundError: No module named 'rust_comments'`
+  (`  FAIL  unsafe usage counts not evaluated (exit 1)`), so reverting sites 2–4 alone leaves the
+  harness green; it is safe only because `fresh`'s `<crate>/src` walk is a coverage superset —
+  measured: a crate-root `frp-core/zz_root_broken.rs` is reported by `fresh` alone (2 errors fixed /
+  1 with `fresh` reverted, 1 under `all3`). **(c) The `integration test dirs` metric is untested**
+  and the restored rule is a heuristic: a `tests/` directory with no `.rs` anywhere beneath it is
+  dropped (measured: `zz-crate/tests/notes.txt` keeps 6, adding `x.rs` makes 7); no curated doc
+  figure names it. **Done-when:** (a) a clean-tree negative control exists; (b) either the fixture
+  supplies a `rust_comments.py` stub so all four sites are exercised, or the item records why the
+  superset argument is sufficient; (c) the metric is asserted, or the heuristic is stated where the
+  metric is read — each with the measured before/after.
+

@@ -3278,7 +3278,7 @@ fn test_parse_dns_response_malformed_never_panics() {
     // below is still parsed; the pointer target is never dereferenced.
     assert!(ok.is_ok(), "pointer is not followed; got: {ok:?}");
 }
-// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (transport/mod.rs:2187).
+// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (transport/mod.rs:2254).
 #[cfg(feature = "websocket")]
 #[tokio::test]
 async fn test_connect_ws_raw_rejects_accept_mismatch() {
