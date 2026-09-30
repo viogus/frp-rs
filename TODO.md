@@ -3232,7 +3232,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   and `config_dir_where_every_service_fails_init_exits_like_dash_c` (`:581`); deleting the
   `task_failures.len() == spawned` guard (`frps/src/main.rs:387`) reds both (`Some(0)` vs `Some(1)` at
   `:654`; `Some(0)` vs `Some(3)` at `:601`), and a `FRPS_BIN`-retargeted run fails the run pin with
-  `left: Some(0) right: Some(1)`. The comment at `frps/src/main.rs:358-377` states "first **spawned**
+  `left: Some(0) right: Some(1)`. The comment at `frps/src/main.rs:368-370` states "first **spawned**
   failure" exactly and records the pre-existing load-lane divergence (empty-config-file set, or every
   file failing to **load**, is refused earlier at `handles.is_empty()` with `EXIT_CONFIG`/2).
 - [x] **The space-separated `--strict-config false` form is an frp-rs extension presented as Go
@@ -7253,14 +7253,25 @@ section; ledger now **24 open / 104 closed**.**
   fails to load exits **2** (`handles.is_empty()` → `EXIT_CONFIG`, `frps/src/main.rs:301-304`) where
   `-c` on the same file exits **1**; a directory mixing `a.toml` (unknown key → load failure) with
   `b.toml` (no token → construction failure) exits **3** — `b.toml`'s code — where `-c a.toml` is 1.
-  Pre-existing on this lane and recorded in the code comment at `frps/src/main.rs:370-378`.
+  Pre-existing on this lane and recorded in the code comment at `frps/src/main.rs:370-377`.
 
   Done-when: a load-failing file is tracked in the same all-failed decision so the lane matches
   `-c`'s code, or the divergence is documented as deliberate with the measured table, and pinned.
 
+- [ ] **The `frps --config-dir` code comments cite probe scripts that are not in the repo.**
+  Filed by the #419 adversarial round-2 review. Three comments in `frps/src/main.rs` justify their
+  measured numbers by pointing at scratch probes under `/tmp` — `:214`
+  (`/tmp/frps-cfgdir-probe/probe-early.py`, the 8/8 `unix_wait_status(158)` window), `:271`
+  (`/tmp/frps-cfgdir-probe/probe-bind.py`, the held-port `-c` 1 / `--config-dir` 0 row) and `:372`
+  (`/tmp/frps-cfgdir-probe/probe-shapes.py`, the mixed load+construction code table) — so a reader of
+  the tree cannot reproduce the figures behind them and the files vanish with the temp directory.
+
+  Done-when: the numbers the comments lean on are either pinned by a test (preferred) or reproduced
+  by a command/recipe the comment itself spells out, and no shipped comment points at `/tmp`.
+
 - [ ] **`registry.lock().unwrap()` in the `frps --config-dir` reload path has no poisoned-mutex test.**
   Filed by the #419 adversarial review as a residual. The registry is a
-  `Arc<Mutex<Vec<(Arc<Service>, String)>>>` (`frps/src/main.rs:215-218`) locked with `.unwrap()` at
+  `Arc<Mutex<Vec<(Arc<Service>, String)>>>` (`frps/src/main.rs:218-219`) locked with `.unwrap()` at
   `frps/src/main.rs:259`, `:280` and `:329`; a panic while one of those locks is held would poison
   it and turn every later registration or reload into a panic. No test exercises a poisoned lock.
 
@@ -7299,7 +7310,7 @@ section; ledger now **24 open / 104 closed**.**
   `bindAddr = ""`, with `-c` exiting 1 on a lookup error and "the defect is that exit code".
   Measured at `971e0fa0`: `bind_addr = ""` is completed to `0.0.0.0` on both paths —
   `frps --config-dir <dir>` with that file logs `listener started on 0.0.0.0:19961` and keeps
-  running (SIGTERM rc 143), and `frps -c <file>` binds `0.0.0.0:19955`. `CHANGELOG.md`'s
+  running; `SIGTERM` rc 0 once the shutdown handler is installed (`frp-server/src/service.rs:1858`; a signal in the startup window dies with rc 143 on both lanes), and `frps -c <file>` binds `0.0.0.0:19955`. `CHANGELOG.md`'s
   bind-address round already records the fill that made the row stale; only the qualifier is missing.
 
   Done-when: the row carries a superseded note (or its "now" column is re-measured), so it cannot be
