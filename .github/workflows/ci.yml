@@ -482,7 +482,7 @@ jobs:
         # `test result: ok. 0 passed; 0 failed` and exits **0** — a gate quieter
         # than the `cli_exit_codes` step beside it, which is why this one repeats
         # that step's three checks (the target ran; the summary says
-        # `ok. 5 passed; 0 failed`; `-- --list` counts 5). The literal is a
+        # `ok. 6 passed; 0 failed`; `-- --list` counts 6). The literal is a
         # property of the *file*, not a shared env value: it lives here, next to
         # the invariant it guards, because `env.FRPS_CLI_TESTS` counts a
         # different target and must not be moved for this one.
@@ -495,21 +495,21 @@ jobs:
           n=$(cargo test -p frps --features dashboard --test log_completion --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/log_completion.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 5 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "5" ] || status=1
+          grep -q "test result: ok. 6 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "6" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frps log-completion guard failed (status=$status, file=$n, log=$log)"
-            if [ -n "$n" ] && [ "$n" != "5" ]; then
-              if [ "$n" -lt "5" ]; then
-                echo "::error::frps/tests/log_completion.rs lists $n tests, this step expects 5 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
+            if [ -n "$n" ] && [ "$n" != "6" ]; then
+              if [ "$n" -lt "6" ]; then
+                echo "::error::frps/tests/log_completion.rs lists $n tests, this step expects 6 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
               else
-                echo "::error::frps/tests/log_completion.rs lists $n tests, this step expects 5: move the single literal in this shell step from 5 to $n"
+                echo "::error::frps/tests/log_completion.rs lists $n tests, this step expects 6: move the single literal in this shell step from 6 to $n"
               fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frps log-completion guard ok: $n tests listed (expected 5), 0 failed"
+          echo "frps log-completion guard ok: $n tests listed (expected 6), 0 failed"
       - name: Run frps's `web_server.tls.enable` warning-delivery spawn tests
         # `frps/tests/warn_delivery.rs` pins what a **user** sees when a config
         # writes `[web_server.tls] enable`: the diagnostic must reach stdout on
