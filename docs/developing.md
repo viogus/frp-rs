@@ -2132,17 +2132,23 @@ Three things this table does **not** claim:
   above closed the last Go-only flag.
 * **"Every other root flag is accepted and ignored" is true of Go and nearly so
   of frp-rs; the exception is named rather than rounded away.** For Go the
-  sentence is exact — `verifyCmd` reads two fields and every other registered
-  flag is inert. For frp-rs the precise claim is "every root flag frp-rs
-  **models**", and the surviving exception is a flag it models as a different
-  *kind*: `--dashboard-tls-mode` (a string on Go, a bool here) is refused in the
-  `=auto`/space spellings and **read as `true`** in the bare trailing spelling —
-  which Go answers with `flag needs an argument` and frp-rs answers `syntax is
-  ok`, rc 0. That row is a false **ok**, not an ignore, and it is why the
-  sentence in `frp-core/src/cli.rs` and `CHANGELOG.md` says "every root flag
-  frp-rs models". The other exception this bullet used to name — a flag frp-rs
-  did not model at all, `--vhost-http-timeout` — is registered and no longer
-  applies.
+  sentence needs one carve-out: `verifyCmd` itself reads two fields (`cfgFile`,
+  `strictConfigMode`) and every other flag it declares is inert, but
+  `--allow-unsafe` is consulted one level down by the post-load unsafe-feature
+  gate (`ValidateServerConfig`) — measured on v0.71.0, `frps verify -c <exec
+  tokenSource cfg>` is rc 1 without it and rc 0 with `--allow-unsafe
+  TokenSourceExec` (the rows the bullet above measures). frp-rs's `verify` reads
+  the same three fields — `cfgFile`, `strictConfigMode` and `--allow-unsafe`
+  (`VerifyArgs` in `frp-core/src/cli.rs`) — and the precise claim is "every root
+  flag frp-rs **models**"; the surviving exception is a flag frp-rs models as a
+  different *kind*: `--dashboard-tls-mode` (a string on Go, a bool here) is
+  refused in the `=auto`/space spellings and **read as `true`** in the bare
+  trailing spelling — which Go answers with `flag needs an argument` and frp-rs
+  answers `syntax is ok`, rc 0. That row is a false **ok**, not an ignore, and it
+  is why the sentence in `frp-core/src/cli.rs` and `CHANGELOG.md` says "every
+  root flag frp-rs models". The other exception this bullet used to name — a
+  flag frp-rs did not model at all, `--vhost-http-timeout` — is registered and
+  no longer applies.
 * **The `frps -c a.toml -c b.toml` run-path divergence is untouched.** That path
   still has no last-wins (its `-c` is [`svr_config`], not `config_arg`), while
   `verify`'s `-c` is `config_arg` — pflag last-wins — because Go's `verifyCmd`
