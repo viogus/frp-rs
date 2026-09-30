@@ -353,9 +353,22 @@ fn ini_section_path(section: &str, table: &toml::Table) -> Option<Vec<String>> {
 /// Both orders are pinned by
 /// `dotted_ini_section_headers_become_nested_tables_in_both_modes`; the asymmetry
 /// is a property of "later key wins" in the verbatim path, not of the conflict
-/// check. A **verbatim** name that collides with an existing non-table value keeps
-/// that value and drops the section's keys, which is the long-standing `or_insert`
-/// behaviour.
+/// check.
+///
+/// A **verbatim** name that collides with an already-present *non-table* value
+/// (a root scalar, e.g. `includes = 1` next to an `[includes]` section) keeps
+/// the section: the slot is replaced by a fresh table and the section's keys are
+/// inserted. Go keeps the two namespaces apart — a `[name]` section and a
+/// DefaultSection key `name = …` are independent in `gopkg.in/ini.v1`, and the
+/// legacy reader ignores every DefaultSection key (`LoadAllProxyConfsFromIni`
+/// skips `ini.DefaultSection`, `pkg/config/legacy/client.go:255-257`); the
+/// settings come from `[common]`. The long-standing `or_insert` behaviour (keep
+/// the scalar, drop the section's keys) hid a real `[includes]` section from the
+/// collector: measured on Go v0.71.0, `includes = 1` plus an `[includes]`
+/// section holding `type = "custom"` and the two ports is rc 1 in both modes
+/// (`failed to parse proxy includes, err: invalid type [custom]`), while the
+/// same scalar next to an `[includes]` section with only the two ports is rc 0
+/// with one tcp proxy *named* `includes`.
 fn insert_ini_section(
     root: &mut toml::Table,
     section: &str,
@@ -365,6 +378,12 @@ fn insert_ini_section(
         let slot = root
             .entry(section.to_string())
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        // The section wins a collision with a non-table value (see the doc
+        // comment above): Go reads its `[name]` sections and ignores the
+        // DefaultSection keys, so the section must survive.
+        if slot.as_table().is_none() {
+            *slot = toml::Value::Table(toml::Table::new());
+        }
         if let Some(dst) = slot.as_table_mut() {
             for (key, value) in table {
                 dst.insert(key, value);

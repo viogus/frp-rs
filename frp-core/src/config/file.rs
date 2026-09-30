@@ -268,7 +268,7 @@ pub(super) fn process_includes(
     // the v1 `includes: Vec<String>` decode and refused the file
     // (`invalid type: integer \`1\`, expected a sequence`, rc 1 in both modes).
     // Scrub the scalar spellings here, while the raw dialect is still visible:
-    // after the `[common]` hoist at `frp-core/src/config/normalize.rs:1156-1160`
+    // after the `[common]` hoist at `frp-core/src/config/normalize.rs:1162-1166`
     // the two spellings are indistinguishable, and a `.ini` *without* `[common]`
     // goes down Go's v1 path too, so its type error (`includes = 1` there is rc 1
     // in both modes) must stay.
@@ -464,7 +464,7 @@ fn drop_ini_scalar_include_keys(table: &mut toml::Table) {
 //   (`UnmarshalClientConfFromIni`, `pkg/config/legacy/client.go:195-213`) and
 //   merges the file. [`process_includes`] runs on the raw top-level table
 //   *before* the `[common]` hoist
-//   (`frp-core/src/config/normalize.rs:1156-1160`), so the pattern is never
+//   (`frp-core/src/config/normalize.rs:1162-1166`), so the pattern is never
 //   expanded; the hoisted string is then read as a one-element list by the
 //   type-directed `.ini` reader (`deserialize_seq` on `Value::String`,
 //   `frp-core/src/config/ini_lenient.rs:175-183`). With a valid include both
