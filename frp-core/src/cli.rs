@@ -522,6 +522,14 @@ pub struct FrpsArgs {
     pub tls_only: bool,
     pub vhost_http_port: Option<u16>,
     pub vhost_https_port: Option<u16>,
+    /// VHost HTTP response-header timeout, in seconds. Go frp registers this as
+    /// a **persistent root flag** with default 60
+    /// (`cmd.PersistentFlags().Int64VarP(&c.VhostHTTPTimeout, "vhost_http_timeout", "", 60, …)`,
+    /// `pkg/config/flags.go:237`), so `frps verify` inherits it too. `None`
+    /// means the flag was absent and the config value stands;
+    /// `ServerConfig::default()` already carries Go's 60
+    /// (`frp-core/src/config/server.rs:247`), so the absent case is Go's default.
+    pub vhost_http_timeout: Option<u64>,
     pub strict_config: bool,
     pub show_version: bool,
 }
@@ -596,6 +604,7 @@ struct SvrTransport {
     quic_bind_port: Option<u16>,
     vhost_http_port: Option<u16>,
     vhost_https_port: Option<u16>,
+    vhost_http_timeout: Option<u64>,
     subdomain_host: Option<String>,
     max_ports_per_client: Option<u64>,
     tls_only: bool,
@@ -641,6 +650,7 @@ impl From<FrpsBuild> for FrpsArgs {
             quic_bind_port: b.transport.quic_bind_port,
             vhost_http_port: b.transport.vhost_http_port,
             vhost_https_port: b.transport.vhost_https_port,
+            vhost_http_timeout: b.transport.vhost_http_timeout,
             subdomain_host: b.transport.subdomain_host,
             max_ports_per_client: b.transport.max_ports_per_client,
             tls_only: b.transport.tls_only,
@@ -682,9 +692,10 @@ fn svr_config_dir() -> impl Parser<Option<String>> {
 ///
 /// Go's frps has no such flag either, and its `frps --help` proves it rather
 /// than a grep: diffing the two binaries' rendered flag sets gives
-/// **frp-rs-only = {`config-dir`, `log-format`}** and **Go-only =
-/// {`vhost-http-timeout`}** (measured on the head binary and the Go v0.71.0
-/// binary). So this is the second of exactly two extension slots, and the
+/// **frp-rs-only = {`config-dir`, `log-format`}** (measured on the head binary
+/// and the Go v0.71.0 binary; the Go-only `vhost-http-timeout` this note used to
+/// list is now registered — see `svr_transport`). So this is the second of
+/// exactly two extension slots, and the
 /// `verify` subcommand refuses it for the same reason it refuses the first:
 /// measured, `frps verify --log-format json -c <valid>` is Go rc **1**
 /// (`Error: unknown flag: --log-format` + usage, stderr, stdout 0 B) while
@@ -895,6 +906,16 @@ fn svr_transport() -> impl Parser<SvrTransport> {
         .long("vhost_https_port")
         .argument::<u16>("PORT")
         .optional();
+    // Go registers the name with underscores and turns every `_` into `-` via
+    // `WordSepNormalizeFunc` (`pkg/config/flags.go:26-32`), so both spellings
+    // are accepted and `--help` renders the hyphen form. Same pairing as the
+    // two `vhost-http(s)-port` flags above; measured on Go v0.71.0:
+    // `frps verify --vhost-http-timeout 30 -c <valid>` and
+    // `frps verify --vhost_http_timeout 30 -c <valid>` are both rc 0.
+    let vhost_http_timeout = long("vhost-http-timeout")
+        .long("vhost_http_timeout")
+        .argument::<u64>("SECONDS")
+        .optional();
     let subdomain_host = long("subdomain-host")
         .long("subdomain_host")
         .argument::<String>("HOST")
@@ -909,6 +930,7 @@ fn svr_transport() -> impl Parser<SvrTransport> {
         quic_bind_port,
         vhost_http_port,
         vhost_https_port,
+        vhost_http_timeout,
         subdomain_host,
         max_ports_per_client,
         tls_only,
@@ -980,14 +1002,15 @@ fn frps_parser() -> impl Parser<FrpsCmd> {
 /// `frps verify --version -c <valid>` are all rc 0 with the *verify* output (no
 /// version line). Parsing through [`frps_build`] and keeping only the two fields
 /// reproduces that acceptance without a second hand-written flag list — for
-/// **every root flag frp-rs models**, which is the precise claim: frp-rs does
-/// not model Go's `--vhost-http-timeout` at all, so `frps verify
-/// --vhost-http-timeout 30 -c <valid>` is rc **1** here and rc **0** on Go,
-/// identically on the run path (`frps --vhost-http-timeout 30 -c <valid>`
-/// starts on Go and is refused on both the base and this head). That is a
-/// pre-existing run-path parser gap, recorded in `docs/developing.md` § CLI
-/// inputs and in `TODO.md`'s "`frps` does not register Go's
-/// `--vhost-http-timeout`" item — not a `verify`-specific defect.
+/// **every root flag frp-rs models**, which is the precise claim. The one such
+/// flag that used to be missing was Go's `--vhost-http-timeout`, so `frps
+/// verify --vhost-http-timeout 30 -c <valid>` was rc **1** here and rc **0** on
+/// Go, identically on the run path; it is now registered on `SvrTransport` in
+/// `svr_transport()` and accepted on both paths (measured here: both spellings
+/// rc 0 on `verify`, both start a listener on the run path), so `verify` inherits
+/// it through the one shared builder. It stays unread by `verifyCmd` in Go too —
+/// the value is applied only on the flags-only lane
+/// ([`FrpsArgs::cli_overrides_enabled`]).
 ///
 /// The three slots where this differs from the run path are the
 /// [`FrpsRootSlots`] fields: `-c` is [`config_arg`] (pflag last-wins; Go's
@@ -1437,8 +1460,10 @@ const VALUE_TAKING_LONG_FLAGS: &[&str] = &[
     "subdomain_host",
     "token",
     "vhost-http-port",
+    "vhost-http-timeout",
     "vhost-https-port",
     "vhost_http_port",
+    "vhost_http_timeout",
     "vhost_https_port",
 ];
 
@@ -3419,6 +3444,9 @@ impl FrpsArgs {
         if let Some(v) = self.vhost_https_port {
             cfg.vhost_https_port = v;
         }
+        if let Some(v) = self.vhost_http_timeout {
+            cfg.vhost_http_timeout = v;
+        }
         if let Some(ref v) = self.subdomain_host {
             cfg.sub_domain_host = v.clone();
         }
@@ -3998,6 +4026,32 @@ mod tests {
         let mut cfg = crate::config::ServerConfig::default();
         args.override_server_config(&mut cfg);
         assert_eq!(cfg.web_server.addr, "1.2.3.4");
+    }
+
+    /// `--vhost-http-timeout` is Go's `vhost_http_timeout`, registered on the
+    /// persistent root so it is accepted on both the run and `verify` paths.
+    /// This pins the parts a parse-only check would miss: the value reaches
+    /// `ServerConfig` on the override lane, and an absent flag leaves Go's
+    /// default (60, `frp-core/src/config/server.rs:247`) alone.
+    #[test]
+    fn vhost_http_timeout_flag_applied_to_server_config() {
+        for spelling in ["--vhost-http-timeout", "--vhost_http_timeout"] {
+            let args = parse_frps(&[spelling, "30"]).unwrap();
+            assert_eq!(
+                args.vhost_http_timeout,
+                Some(30),
+                "`{spelling} 30` must parse as 30"
+            );
+            let mut cfg = crate::config::ServerConfig::default();
+            args.override_server_config(&mut cfg);
+            assert_eq!(cfg.vhost_http_timeout, 30, "`{spelling}` must be applied");
+        }
+
+        let args = parse_frps(&[]).unwrap();
+        assert_eq!(args.vhost_http_timeout, None);
+        let mut cfg = crate::config::ServerConfig::default();
+        args.override_server_config(&mut cfg);
+        assert_eq!(cfg.vhost_http_timeout, 60, "absent flag keeps Go's default");
     }
 
     #[test]
@@ -6477,8 +6531,9 @@ mod hoist_tests {
     /// The two **frp-rs-only** `frps` root flags must not ride into `verify`,
     /// where Go's `frps` answers `unknown flag: …` with rc 1. They are the
     /// complete extension set, measured by diffing the two binaries' rendered
-    /// `--help` flag lists: frp-rs-only = {`config-dir`, `log-format`}, Go-only =
-    /// {`vhost-http-timeout`}.
+    /// `--help` flag lists: frp-rs-only = {`config-dir`, `log-format`}, with no
+    /// Go-only flag left (the former Go-only `vhost-http-timeout` is now
+    /// registered on `svr_transport`).
     ///
     /// Measured on Go v0.71.0, stdout 0 B and stderr 1 line + usage in both
     /// cases: `frps verify --log-format json -c <valid>` → rc **1** `Error:
