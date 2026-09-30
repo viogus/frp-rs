@@ -31,12 +31,14 @@ these holds:
     MIN_STEADY_TOTAL_BYTES): a run that moved almost nothing measured almost
     nothing, even though it did measure it;
   * either side lost a steady stream (`failed_streams` > 0);
-  * the two sides' achieved volume differs by more than SOAK_TRAFFIC_TOLERANCE
+  * the two sides' achieved volume differs by more than the traffic tolerance
     (default 0.10) — both are paced identically, so a large gap means one side
     was not handed the same work and the comparison is not head-to-head. The
     tolerance must be a finite positive number: `nan` compares false against
     everything and used to disable this check while the run still reported
-    `"aborted": null`;
+    `"aborted": null`. Like the RSS ceiling, an artifact that records its own
+    `traffic_tolerance` is judged by that value and not by the ambient
+    `SOAK_TRAFFIC_TOLERANCE`;
   * the recorded frp-rs and Go binary sha256 are equal, i.e. one implementation
     was run on both sides.
 
@@ -81,6 +83,14 @@ COLUMNS = [
 # one was accepted with the knob raised to vacuity. See
 # scripts/frp-stress/baselines/README.md for the full rationale.
 DEFAULT_RSS_CEILING_KB = 1048576  # 1 GiB
+# FALLBACK traffic tolerance for an artifact that does not record its own (an
+# older series, or a hand-written one). A `meta` record carrying
+# `traffic_tolerance` wins over both this and the ambient
+# SOAK_TRAFFIC_TOLERANCE, for the same reason as the ceiling above: the allowed
+# spread a run was produced under is part of its evidence, and re-reading the
+# same artifact under a different SOAK_TRAFFIC_TOLERANCE used to flip its verdict
+# (two byte-identical artifacts read "run completed" at 0.6 and rc 3 at 0.10).
+DEFAULT_TRAFFIC_TOLERANCE = 0.10
 # Absolute achieved-load floor. Far below what the default recipe produces in the
 # shortest allowed window (60 s: ~2400 churn round trips, hundreds of MiB of
 # steady traffic per side), so it only fires on a run that moved almost nothing.
@@ -99,16 +109,50 @@ def load_json(path):
         return None
 
 
+class ArtifactEncodingError(Exception):
+    """The artifact file is not decodable as UTF-8.
+
+    The writer is byte-preserving on purpose (see rss_soak_json_str in
+    scripts/lib/rss-soak-run-dir.sh): it never rewrites a path, so a `run_dir`
+    that is not valid UTF-8 is passed through raw and the line cannot be decoded.
+    Failing here, loudly and with the byte offset, is the alternative to the two
+    silent failure modes this module exists to avoid — substituting U+FFFD (a
+    path that is not the one on disk) or skipping the line (losing run_dir, the
+    digests, the ports and the same-binary guard from a run that still prints
+    "run completed").
+    """
+
+
 def read_rows(path):
+    """Parsed JSON lines, skipping lines that are valid UTF-8 but not JSON.
+
+    A line that is not valid UTF-8 is NOT skipped: it raises
+    ArtifactEncodingError naming the artifact and the byte offset, because the
+    bytes that cannot be decoded are exactly the string values (run_dir, binary
+    paths, host name) whose silent loss this reader must not accept.
+    """
     rows = []
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if line:
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
+    with open(path, "rb") as fh:
+        data = fh.read()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ArtifactEncodingError(
+            f"{path}: not valid UTF-8 ({exc.reason} at byte offset {exc.start}); "
+            "the artifact was written byte-exactly, so a run dir or binary path "
+            "in it is not a valid UTF-8 string"
+        ) from exc
+    # Split on "\n" only. str.splitlines() also breaks on U+000B/U+000C/U+0085/
+    # U+2028/U+2029, which are legal unescaped bytes inside a JSON string here
+    # (the writer only escapes 0x01..0x1F), so it would shred a line whose run
+    # dir contained one.
+    for line in text.split("\n"):
+        line = line.strip()
+        if line:
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
     return rows
 
 
@@ -166,6 +210,9 @@ def main(argv):
 
     try:
         rows = read_rows(path)
+    except ArtifactEncodingError as exc:
+        print(f"error: cannot read artifact {exc}", file=sys.stderr)
+        return 2
     except OSError as exc:
         print(f"error: cannot read artifact {path}: {exc}", file=sys.stderr)
         return 2
@@ -319,23 +366,49 @@ def main(argv):
             )
 
     # Achieved-volume reconciliation: both sides are offered the same paced
-    # recipe, so a large gap means one side was given less work. The tolerance
-    # must be a finite positive number: `nan` slips past float() and compares
-    # false against everything, which silently disables the check.
-    tolerance_raw = os.environ.get("SOAK_TRAFFIC_TOLERANCE") or "0.10"
-    tolerance = None
-    try:
-        parsed = float(tolerance_raw)
-        if math.isfinite(parsed) and parsed > 0:
-            tolerance = parsed
-    except ValueError:
-        pass
-    if tolerance is None:
-        problems.append(
-            f"SOAK_TRAFFIC_TOLERANCE is not a finite positive number ({tolerance_raw!r}); "
-            "the achieved-load reconciliation cannot be trusted"
-        )
-        tolerance = 0.10  # display/recording fallback only; the run has aborted
+    # recipe, so a large gap means one side was given less work. Exactly like the
+    # ceiling above, the artifact's OWN recorded tolerance wins over the ambient
+    # environment: the allowed spread a run was produced under is part of its
+    # evidence, and a re-read under a different SOAK_TRAFFIC_TOLERANCE must not
+    # flip its verdict. Env, then the default, is only the fallback for an
+    # artifact that records none. A recorded tolerance that is present but
+    # unusable is itself an abort rather than a fall-through to the environment —
+    # otherwise such an artifact's verdict would again depend on who reads it.
+    recorded_tolerance = meta.get("traffic_tolerance")
+    # float() rather than the value itself so an integer too large for a float
+    # (a 400-digit JSON integer) is "unusable", not an OverflowError traceback.
+    recorded_value = None
+    if isinstance(recorded_tolerance, (int, float)) and not isinstance(recorded_tolerance, bool):
+        try:
+            recorded_value = float(recorded_tolerance)
+        except OverflowError:
+            recorded_value = None
+    if recorded_value is not None and math.isfinite(recorded_value) and recorded_value > 0:
+        tolerance = recorded_value
+        tolerance_source = "artifact meta"
+    else:
+        if recorded_tolerance is not None:
+            problems.append(
+                f"the artifact records an unusable traffic tolerance "
+                f"({recorded_tolerance!r}); the achieved-load reconciliation "
+                "cannot be trusted"
+            )
+        env_tolerance = os.environ.get("SOAK_TRAFFIC_TOLERANCE")
+        tolerance_raw = env_tolerance or str(DEFAULT_TRAFFIC_TOLERANCE)
+        tolerance_source = "environment" if env_tolerance else "default"
+        tolerance = None
+        try:
+            parsed = float(tolerance_raw)
+            if math.isfinite(parsed) and parsed > 0:
+                tolerance = parsed
+        except ValueError:
+            pass
+        if tolerance is None:
+            problems.append(
+                f"SOAK_TRAFFIC_TOLERANCE is not a finite positive number ({tolerance_raw!r}); "
+                "the achieved-load reconciliation cannot be trusted"
+            )
+            tolerance = DEFAULT_TRAFFIC_TOLERANCE  # display/recording fallback only; the run has aborted
     achieved_equality = {}
     for key_rs, key_go, field, label in (
         ("frp_rs_churn", "go_churn", "round_trips", "churn round trips"),
@@ -365,6 +438,8 @@ def main(argv):
         "run_dir": meta.get("run_dir"),
         "rss_ceiling_kb": rss_ceiling,
         "rss_ceiling_source": ceiling_source,
+        "traffic_tolerance": tolerance,
+        "traffic_tolerance_source": tolerance_source,
         "load1": {"min": min(loads), "max": max(loads), "mean": round(statistics.fmean(loads), 2)} if loads else None,
         "time_wait": {"min": min(waits), "max": max(waits), "mean": round(statistics.fmean(waits), 1)} if waits else None,
         "traffic": traffic,
@@ -386,6 +461,7 @@ def main(argv):
               f"{fmt(b.get('max')):>8} {fmt(b.get('mean')):>9} {fmt(b.get('first_hour_mean')):>11} "
               f"{fmt(b.get('last_hour_mean')):>12}")
     print(f"RSS ceiling: {rss_ceiling} KB (from {ceiling_source})")
+    print(f"traffic tolerance: {tolerance:g} (from {tolerance_source})")
     print(f"samples: {len(samples)}; " + (f"ABORTED: {aborted}" if aborted else "run completed"))
     if summary["load1"]:
         print(f"host load1: min {summary['load1']['min']} mean {summary['load1']['mean']} max {summary['load1']['max']}")

@@ -148,9 +148,20 @@ rss_soak_validate_window() {
 # reports `"aborted": null`, and `inf`/a huge value does the same by making every
 # spread pass. `awk` is used rather than a bash pattern so the value is parsed as
 # the same float Python will parse.
+#
+# The value is also required to be a JSON number token, because the run records
+# it verbatim in the artifact's `meta` line: `awk` happily accepts `.5`, `+0.5`
+# and `01`, all of which make that line invalid JSON — and the reader skips an
+# invalid line, so the whole `meta` record (run dir, digests, ports, the
+# same-binary guard) would be lost while the run still printed
+# "run completed".
 rss_soak_validate_tolerance() {
     local val="${1:-}"
 
+    if ! [[ "$val" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$ ]]; then
+        printf "error: SOAK_TRAFFIC_TOLERANCE must be a finite number in (0, 1] written as a JSON number (got '%s')\n" "$val" >&2
+        return 1
+    fi
     if ! awk -v v="$val" 'BEGIN { x = v + 0; exit !(x == x && x > 0 && x <= 1) }' </dev/null; then
         printf "error: SOAK_TRAFFIC_TOLERANCE must be a finite number in (0, 1] (got '%s')\n" "$val" >&2
         return 1
@@ -174,7 +185,28 @@ rss_soak_validate_tolerance() {
 # plus every C0 control character (the named short forms, `\u00XX` otherwise):
 # a raw byte below 0x20 is not legal inside a JSON string. Bytes >= 0x20,
 # including non-ASCII UTF-8, are passed through unchanged, which JSON allows.
+#
+# The C locale pin below is load-bearing, not cosmetic. `[[:cntrl:]]` and the
+# `${s:0:1}` slice are LOCALE-SENSITIVE in bash 3.2: under any UTF-8 locale the
+# class also matches the Unicode Cc/Cf code points, so a multi-byte character
+# took the `\u` branch, and `printf "'$ch"` sign-extends its first UTF-8 byte to
+# a negative integer, printing sixteen hex digits — U+200B became
+# `\uffffffffffffffe2`. That is still valid JSON, so it parsed cleanly and the
+# run_dir silently came back as mojibake. With LC_ALL=C both the class and the
+# slice are byte-oriented: only bytes 0x01..0x1F and 0x7F are escaped, and every
+# byte >= 0x80 (valid or not) passes through unchanged. For any valid UTF-8
+# input the value that comes back out of json.loads is therefore byte-identical
+# to the input, under every locale. `local` confines the pin to this function,
+# so the caller's locale is restored on return.
+#
+# Byte-preserving also means NOT valid-UTF-8 input stays byte-exact and the
+# resulting line is not decodable; the reader refuses such an artifact loudly
+# (see read_rows in scripts/lib/rss-soak-summary.py) rather than substituting a
+# replacement character, because a silently rewritten path is the bug class this
+# function exists to prevent. A bash string cannot hold a NUL byte at all, so a
+# path containing U+0000 is structurally unreachable.
 rss_soak_json_str() {
+    local LC_ALL=C
     local s="${1-}" out="" ch esc
     while [ -n "$s" ]; do
         ch="${s:0:1}"
@@ -200,7 +232,7 @@ rss_soak_json_str() {
     printf '%s' "$out"
 }
 
-# rss_soak_write_meta <out> <37 values> -> appends the `meta` JSON line to <out>.#
+# rss_soak_write_meta <out> <38 values> -> appends the `meta` JSON line to <out>.#
 # The one and only meta writer. It used to be a printf inlined in
 # scripts/rss-soak.sh, which made the quoting bug (and any test of it)
 # unreachable from the fixture; it lives here now so
@@ -219,18 +251,20 @@ rss_soak_json_str() {
 #  21 churn_connections     22 churn_rate_per_stack  23 churn_msg_bytes
 #  24 steady_streams        25 steady_mbps_per_stream
 #  26-31 six ports          32-35 the four binary sha256 values
-#  36 load1_start           37 rss_ceiling_kb
+#  36 load1_start           37 rss_ceiling_kb        38 traffic_tolerance
 # Positions 1, 5, 6, 8, 9, 11-20 and 32-35 are STRING fields and are escaped
 # with rss_soak_json_str; the rest are numbers/booleans already validated by the
-# caller and are emitted raw.
+# caller and are emitted raw. `traffic_tolerance` is emitted raw too, so it MUST
+# already be a JSON number token — rss_soak_validate_tolerance refuses any value
+# (e.g. `.5` or `+0.5`) that awk would accept but JSON would not.
 rss_soak_write_meta() {
-    if [ "$#" -ne 38 ]; then
-        printf 'ERROR: rss_soak_write_meta wants 38 arguments (out path + 37 values), got %s\n' "$#" >&2
+    if [ "$#" -ne 39 ]; then
+        printf 'ERROR: rss_soak_write_meta wants 39 arguments (out path + 38 values), got %s\n' "$#" >&2
         return 1
     fi
     local out="$1"
-    shift  # drop the out path so $1..$37 are the values
-    printf '{"kind":"meta","started_utc":"%s","duration_s":%s,"interval_s":%s,"generator_duration_s":%s,"host":"%s","platform":"%s","cpu_cores":%s,"frp_rs_version":"%s","frp_rs_sha":"%s","frp_rs_dirty":%s,"harness_sha256":{"rss_soak_sh":"%s","run_dir_sh":"%s","summary_py":"%s","frp_stress_tree":"%s"},"rs_bin_source":"%s","run_dir":"%s","go_frp_version":"%s","go_frp_dir":"%s","rs_bin":"%s","rs_frpc_bin":"%s","traffic":{"churn_connections":%s,"churn_rate_per_stack":%s,"churn_msg_bytes":%s,"steady_streams":%s,"steady_mbps_per_stream":%s,"generator":"frp-stress","proxy_type":"tcp"},"ports":{"rs_control":%s,"rs_remote":%s,"rs_echo":%s,"go_control":%s,"go_remote":%s,"go_echo":%s},"bin_sha256":{"rs_frps":"%s","rs_frpc":"%s","go_frps":"%s","go_frpc":"%s"},"load1_start":%s,"rss_ceiling_kb":%s,"caveats":["RSS is not live heap; it includes allocator retention and page-cache effects","both stacks share this host, so a machine-level effect moves both series","the per-sample time_wait count is host-wide, not per-side","identical offered recipe, not guaranteed identical achieved volume; per-side achieved volume is recorded and compared, and a spread beyond SOAK_TRAFFIC_TOLERANCE aborts the run","one TCP proxy per stack; other proxy types and encryption/compression/mux paths are not exercised"]}\n' \
+    shift  # drop the out path so $1..$38 are the values
+    printf '{"kind":"meta","started_utc":"%s","duration_s":%s,"interval_s":%s,"generator_duration_s":%s,"host":"%s","platform":"%s","cpu_cores":%s,"frp_rs_version":"%s","frp_rs_sha":"%s","frp_rs_dirty":%s,"harness_sha256":{"rss_soak_sh":"%s","run_dir_sh":"%s","summary_py":"%s","frp_stress_tree":"%s"},"rs_bin_source":"%s","run_dir":"%s","go_frp_version":"%s","go_frp_dir":"%s","rs_bin":"%s","rs_frpc_bin":"%s","traffic":{"churn_connections":%s,"churn_rate_per_stack":%s,"churn_msg_bytes":%s,"steady_streams":%s,"steady_mbps_per_stream":%s,"generator":"frp-stress","proxy_type":"tcp"},"ports":{"rs_control":%s,"rs_remote":%s,"rs_echo":%s,"go_control":%s,"go_remote":%s,"go_echo":%s},"bin_sha256":{"rs_frps":"%s","rs_frpc":"%s","go_frps":"%s","go_frpc":"%s"},"load1_start":%s,"rss_ceiling_kb":%s,"traffic_tolerance":%s,"caveats":["RSS is not live heap; it includes allocator retention and page-cache effects","both stacks share this host, so a machine-level effect moves both series","the per-sample time_wait count is host-wide, not per-side","identical offered recipe, not guaranteed identical achieved volume; per-side achieved volume is recorded and compared, and a spread beyond the artifact-recorded traffic_tolerance aborts the run","one TCP proxy per stack; other proxy types and encryption/compression/mux paths are not exercised"]}\n' \
         "$(rss_soak_json_str "$1")" "$2" "$3" "$4" "$(rss_soak_json_str "$5")" "$(rss_soak_json_str "$6")" "$7" \
         "$(rss_soak_json_str "$8")" "$(rss_soak_json_str "$9")" "${10}" \
         "$(rss_soak_json_str "${11}")" "$(rss_soak_json_str "${12}")" "$(rss_soak_json_str "${13}")" "$(rss_soak_json_str "${14}")" \
@@ -238,7 +272,7 @@ rss_soak_write_meta() {
         "$(rss_soak_json_str "${19}")" "$(rss_soak_json_str "${20}")" \
         "${21}" "${22}" "${23}" "${24}" "${25}" "${26}" "${27}" "${28}" "${29}" "${30}" "${31}" \
         "$(rss_soak_json_str "${32}")" "$(rss_soak_json_str "${33}")" "$(rss_soak_json_str "${34}")" "$(rss_soak_json_str "${35}")" \
-        "${36}" "${37}" >> "$out"
+        "${36}" "${37}" "${38}" >> "$out"
 }
 
 # rss_soak_rss_kb <pid> <ceiling_kb> -> KB on stdout, or the literal `null`.

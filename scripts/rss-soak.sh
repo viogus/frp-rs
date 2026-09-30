@@ -80,9 +80,16 @@
 #   SOAK_TRAFFIC_TOLERANCE
 #                         allowed relative spread between the two sides'
 #                         achieved volume (default 0.10 = 10%). A finite number
-#                         in (0, 1]; anything else is refused up front, because
-#                         the summary's `spread > tolerance` test is silently
+#                         in (0, 1] written as a JSON number (`.5` and `+0.5`
+#                         are refused, so the value cannot corrupt the `meta`
+#                         line); anything else is refused up front, because the
+#                         summary's `spread > tolerance` test is silently
 #                         disabled by `nan` (compares false with everything).
+#                         The run records the value it used in `meta`, and the
+#                         summary prefers that recorded value over the ambient
+#                         variable, so re-reading the same artifact cannot flip
+#                         its verdict; this variable is only the fallback for an
+#                         artifact that records none.
 #   SOAK_RSS_CEILING_KB   largest RSS reading accepted as real (default
 #                         1048576 = 1 GiB). A value outside 1..ceiling, or a
 #                         non-integer, is recorded as `null` (a missing reading)
@@ -113,8 +120,9 @@
 #   them dying during the window is a fault with no grace period.
 #
 # Guards (abort rather than publish an apples-to-oranges series):
-#   * only one soak runs at a time (lock file), so a short validation run
-#     cannot steal the ports of, or overwrite the artifact of, a live soak
+#   * one soak per lock file, so a second run sharing this lock aborts at once
+#     instead of fighting a live soak for its ports or its artifact (a run given
+#     its own SOAK_LOCK, ports and run dir stands beside it safely)
 #   * every cargo build used by the run must succeed (a stale binary is never
 #     used silently)
 #   * the Go binaries are for THIS os/arch (checked with `file`)
@@ -254,7 +262,9 @@ validate_count SOAK_STREAMS "$STREAMS" 1
 validate_count SOAK_STREAM_MBPS "$STREAM_MBPS" 0
 validate_count SOAK_MSG_BYTES "$MSG_BYTES" 1
 # Refused up front (not only in the reader) so a bad tolerance cannot cost a
-# three-hour window; exported so the reader validates the SAME value.
+# three-hour window; exported for the reader's fallback path, and recorded in
+# `meta` so an artifact is judged by the tolerance it was produced under rather
+# than by the environment that reads it.
 TOLERANCE="${SOAK_TRAFFIC_TOLERANCE:-0.10}"
 rss_soak_validate_tolerance "$TOLERANCE" || exit 1
 export SOAK_TRAFFIC_TOLERANCE="$TOLERANCE"
@@ -688,9 +698,10 @@ started_load=$(load1)
 # The meta record is written by the shared, fixture-covered writer
 # (rss_soak_write_meta in scripts/lib/rss-soak-run-dir.sh): it JSON-escapes
 # every string field — notably $RUN_DIR, the binary paths and the host name —
-# and records $RSS_CEILING_KB so the artifact carries the bound it was produced
-# under. The reader prefers that recorded ceiling over its own environment, so
-# the same artifact gets the same verdict anywhere.
+# and records $RSS_CEILING_KB and $TOLERANCE so the artifact carries the bound
+# and the tolerance it was produced under. The reader prefers those recorded
+# values over its own environment, so the same artifact gets the same verdict
+# anywhere.
 rss_soak_write_meta "$OUT" \
   "$start_utc" "$DURATION" "$INTERVAL" "$GEN_DURATION" "$(hostname -s)" "$go_platform" "$cpu_cores" \
   "$rs_version" "$rs_sha" "$rs_dirty" "$soak_sha" "$run_dir_lib_sha" "$summary_py_sha" "$stress_tree_sha" "$RS_BIN_SOURCE" "$RUN_DIR" \
@@ -698,7 +709,7 @@ rss_soak_write_meta "$OUT" \
   "$CHURN_CONNS" "$CHURN_RATE" "$MSG_BYTES" "$STREAMS" "$STREAM_MBPS" \
   "$RS_PORT" "$RS_REMOTE" "$RS_ECHO" "$GO_PORT" "$GO_REMOTE" "$GO_ECHO" \
   "$rs_frps_sha" "$rs_frpc_sha" "$go_frps_sha" "$go_frpc_sha" \
-  "$started_load" "$RSS_CEILING_KB" || { echo "error: cannot write meta to $OUT" >&2; exit 1; }
+  "$started_load" "$RSS_CEILING_KB" "$TOLERANCE" || { echo "error: cannot write meta to $OUT" >&2; exit 1; }
 
 echo "=== soak running: $(date -u +%H:%M:%SZ), load1=$started_load ==="
 aborted=""

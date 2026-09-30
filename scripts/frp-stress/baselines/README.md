@@ -45,9 +45,9 @@ One JSON object per line, in three parts:
 
 | `kind` | contents |
 |--------|----------|
-| `meta` | one first line: host, platform, cores, frp-rs version + git sha (with `frp_rs_dirty` covering the soak script, its helpers AND the `scripts/frp-stress` generator sources, `harness_sha256` for each of those parts plus `frp_stress_tree`, and `rs_bin_source` saying whether the measured frp-rs binaries were built here or supplied via `FRPS_BIN`/`FRPC_BIN`), Go frp version + dir, the four binary `sha256` values, the traffic recipe, the ports, the resolved run dir, the RSS ceiling the run was produced under (`rss_ceiling_kb`), and an explicit `caveats` list. Every string field — the run dir, the binary paths, the host name — is JSON-escaped by the writer, so a `"` or `\` in a path cannot make the line unparseable (an unparseable `meta` line is skipped by the reader, which used to drop the digests, the ports and the same-binary guard from a run that still said "run completed") |
+| `meta` | one first line: host, platform, cores, frp-rs version + git sha (with `frp_rs_dirty` covering the soak script, its helpers AND the `scripts/frp-stress` generator sources, `harness_sha256` for each of those parts plus `frp_stress_tree`, and `rs_bin_source` saying whether the measured frp-rs binaries were built here or supplied via `FRPS_BIN`/`FRPC_BIN`), Go frp version + dir, the four binary `sha256` values, the traffic recipe, the ports, the resolved run dir, the bounds the run was produced under (`rss_ceiling_kb` and `traffic_tolerance`), and an explicit `caveats` list. Every string field — the run dir, the binary paths, the host name — is JSON-escaped by the writer, so a `"` or `\` in a path cannot make the line unparseable (an unparseable `meta` line is skipped by the reader, which used to drop the digests, the ports and the same-binary guard from a run that still said "run completed"). The escaper is byte-preserving and locale-independent — it does not depend on the reader's `LC_*` — and it emits U+0080-U+009F and other Cc/Cf code points verbatim, so a run dir containing them survives the round trip instead of turning into `\uffffffffffffffe2`-style junk; a run dir that is **not** valid UTF-8 cannot be represented in a JSON string at all, so the writer leaves it byte-exact and the reader refuses the artifact by name and byte offset rather than substituting replacement characters |
 | `sample` | one per interval: `elapsed_s`, UTC `ts`, `load1`, the host-wide `time_wait` socket count, and RSS in KB for all four processes (`null` when the reading was unusable — see below) |
-| `summary` | one last line: per-process `first`/`last`/`min`/`max`/`mean`/`first_hour_mean`/`last_hour_mean`/`growth_pct_first_to_last`, a computed `trend` per process (least-squares `slope_kb_per_hour`, first/last-quarter means, `monotonic_nondecreasing`), achieved `traffic` per side (including `failed_streams`), `achieved_equality` between the two sides, load and TIME_WAIT ranges, the ceiling the verdict was computed under (`rss_ceiling_kb` and `rss_ceiling_source`), and `aborted` |
+| `summary` | one last line: per-process `first`/`last`/`min`/`max`/`mean`/`first_hour_mean`/`last_hour_mean`/`growth_pct_first_to_last`, a computed `trend` per process (least-squares `slope_kb_per_hour`, first/last-quarter means, `monotonic_nondecreasing`), achieved `traffic` per side (including `failed_streams`), `achieved_equality` between the two sides, load and TIME_WAIT ranges, the bounds the verdict was computed under (`rss_ceiling_kb`/`rss_ceiling_source` and `traffic_tolerance`/`traffic_tolerance_source`), and `aborted` |
 
 **An artifact with no trailing `summary` line is an incomplete run.** That is a
 convention the reader of a series applies, not something the script can test
@@ -83,11 +83,14 @@ The faults are:
 - the recorded `bin_sha256` showing the frp-rs and Go binaries of a pair to be
   the same file — one implementation run on both sides is not a comparison (the
   soak refuses this before the window opens too);
-- the two sides' achieved volume differing by more than `SOAK_TRAFFIC_TOLERANCE`
-  (default `0.10`) — both are handed the same paced recipe, so a large gap means
-  the comparison is not head-to-head. The value must be a finite number in
-  `(0, 1]`: `nan` compares false against everything and used to disable the
-  check while the run still reported `"aborted": null`.
+- the two sides' achieved volume differing by more than the tolerance the
+  artifact records (`traffic_tolerance`; `SOAK_TRAFFIC_TOLERANCE`, then `0.10`,
+  when it records none) — both are handed the same paced recipe, so a large gap
+  means the comparison is not head-to-head. The value must be a finite number in
+  `(0, 1]` **written as a JSON number**, so `nan` (which compares false against
+  everything and used to disable the check while the run still reported
+  `"aborted": null`) and `.5`/`+0.5`/`01` (which awk accepts but JSON does not —
+  they made the `meta` line unparseable) are both refused up front.
 
 A missing reading prints `-`, never a fabricated `0`, and a column with no
 readings at all prints `NO READINGS`. `scripts/tests/rss-soak-run-dir.sh` (run
@@ -97,31 +100,47 @@ stubbed-`ps` shapes above; it enforces a floor on its own check count so that
 deleting a case cannot silently pass.
 
 Two env knobs tune the refusals above, and both are documented by
-`bash scripts/rss-soak.sh --help` along with the rest:
+`bash scripts/rss-soak.sh --help` along with the rest. Both are recorded in the
+artifact, and the reader prefers the artifact's own recorded value over the
+ambient variable, so re-reading a series cannot flip its verdict (see "The
+recorded bounds" below):
 
 - `SOAK_TRAFFIC_TOLERANCE` (default `0.10`) — relative achieved-volume spread
-  allowed between the two sides.
+  allowed between the two sides. Recorded as `traffic_tolerance`; must be a
+  finite number in `(0, 1]` written as a JSON number.
 - `SOAK_RSS_CEILING_KB` (default `1048576`, 1 GiB) — largest RSS reading accepted
   as real; a reading outside the bound is a missing reading, and the bound a run
   used is recorded in its artifact as `rss_ceiling_kb`, so the reader judges the
-  artifact by its own bound rather than by its environment (see "The RSS ceiling"
-  below). It is a plausibility bound, not an oracle: an artifact produced
+  artifact by its own bound rather than by its environment (see "The recorded
+  bounds" below). It is a plausibility bound, not an oracle: an artifact produced
   elsewhere can still present a fabricated *plausible* value as evidence.
 
-### The RSS ceiling
+### The recorded bounds
 
-`SOAK_RSS_CEILING_KB` is a **plausibility bound**, not a measurement of what the
-processes do: a reading outside it is recorded as a missing reading, never
-published. The run writes the bound it used into the artifact as
-`rss_ceiling_kb`, and the summary reader prefers **the artifact's own recorded
-ceiling** over the ambient `SOAK_RSS_CEILING_KB`. The verdict is then a property
-of the artifact rather than of the environment that reads it: before this, the
-same file read `"aborted": null` under one setting and
-`rc 3, "implausible RSS reading(s) ignored"` under another. The environment (and
-then the compiled-in default) is only the fallback for an artifact that records
-no ceiling of its own — an older or hand-written series.
+Two knobs are part of a run's evidence rather than of whoever reads it: the RSS
+ceiling and the achieved-volume tolerance. Each is written into the artifact's
+`meta` line as `rss_ceiling_kb` and `traffic_tolerance`, and the summary reader
+prefers **the artifact's own recorded value** over the ambient
+`SOAK_RSS_CEILING_KB` / `SOAK_TRAFFIC_TOLERANCE`. For an artifact that records
+them — every artifact this harness writes — the verdict is therefore a property
+of the artifact rather than of the environment that reads it. Before round 5 the
+tolerance was read only from the environment, so two **byte-identical** files
+read `"aborted": null` under `SOAK_TRAFFIC_TOLERANCE=0.6` and
+`rc 3, "achieved churn round trips differs by 50.0%"` under the default; the
+ceiling was fixed the same way in an earlier round (`rc 3, "implausible RSS
+reading(s) ignored"`). The environment (and then the compiled-in default) is
+only the fallback for a value the artifact does not record — an older or
+hand-written series. A
+recorded tolerance that is present but unusable is itself an abort, never a
+fall-through to the environment, so such an artifact cannot be environment-flipped
+either. (The ceiling keeps the older fall-through for a present-but-unusable
+value; the writer always records a usable one, so that path needs a hand-edited
+artifact.)
 
-The fallback default is **1 GiB (`1048576` KB)**, down from 100 GiB. It comes
+`SOAK_RSS_CEILING_KB` itself is a **plausibility bound**, not a measurement of
+what the processes do: a reading outside it is recorded as a missing reading,
+never published. The fallback default is **1 GiB (`1048576` KB)**, down from
+100 GiB. It comes
 from the committed baselines: `memory-Mac.jsonl` records
 `rss_kb_frps`/`rss_kb_frpc` of 17328/16176 KB (idle, plain), 29776/28880 KB
 (idle, encrypt), 17424/15440 KB (churn, plain) and 27312/17728 KB (churn,
@@ -134,6 +153,15 @@ echoed by the summary (`rss_ceiling_kb` plus `rss_ceiling_source`), so a vacuous
 bound is visible instead of silent. Being a magnitude bound, the ceiling cannot
 by itself distinguish a real series from a fabricated one whose values are
 plausible.
+
+`SOAK_TRAFFIC_TOLERANCE` is likewise a **head-to-head guard**: both sides are
+handed the same paced recipe, so a spread beyond the tolerance means one side was
+not given the same work and the comparison is invalid. The fallback default is
+`0.10` (10%). The value must be a finite number in `(0, 1]` written as a JSON
+number, because it is stored verbatim in `meta`: `nan` (always false, so it used
+to disable the check while the run still reported `"aborted": null`) and
+`.5`/`+0.5`/`01` (which awk accepts but JSON does not, making the `meta` line
+unparseable and hence silently skipped) are refused before the window opens.
 
 A verdict already recorded in an artifact is **monotonic**: the reader appends a
 `summary` line and refuses to clear an earlier `aborted`, so re-reading or
@@ -153,7 +181,7 @@ What the series does and does not establish:
   is logged every sample), exactly equal *achieved* volume (the recipe is
   identical and the churn rate is fixed, but pacing is applied to combined
   sent+received bytes and each side's achieved volume is recorded and compared —
-  a spread beyond `SOAK_TRAFFIC_TOLERANCE` aborts the run), or any proxy type
+  a spread beyond the recorded `traffic_tolerance` aborts the run), or any proxy type
   other than one TCP proxy.
 
 `SOAK_STREAM_MBPS` is a MiB/s ceiling on **combined** traffic (sent plus
@@ -189,9 +217,13 @@ SOAK_OUT=/tmp/rss-soak-validation.jsonl SOAK_RUN_DIR=/tmp/rss-soak-validation \
   bash scripts/rss-soak.sh 180 30
 ```
 
-Only one soak runs at a time (lock file `/tmp/rss-soak.lock`, override with
-`SOAK_LOCK`); a validation run is refused while a real soak is live rather than
-allowed to steal its ports or overwrite its artifact. Start a long run detached
+Only one soak runs at a time per lock file (default `/tmp/rss-soak.lock`,
+override with `SOAK_LOCK`), and every run binds the ports it was given, so two
+runs that share a lock or a port family fail fast instead of stealing ports or
+clobbering each other's artifact. The validation command above sidesteps both on
+purpose — its own `SOAK_LOCK`, `SOAK_RUN_DIR` and `SOAK_OUT`, and remapped
+ports — so it is deliberately **not** refused while a real soak is live; what
+keeps it safe is the remapping, not the lock. Start a long run detached
 so it survives the shell — SIGTERM stops it promptly, and a `kill -9` still
 leaves no orphans because a watchdog reaps the children when the script dies:
 

@@ -40,11 +40,21 @@ ROOT=$(cd -P -- "$(dirname -- "$self")/../.." && pwd)
 LIB="$ROOT/scripts/lib/rss-soak-run-dir.sh"
 SUMMARY="$ROOT/scripts/lib/rss-soak-summary.py"
 
+# A UTF-8 locale for the round-5 locale-independence checks: the escaper bug is
+# only reachable with one active, and `C` alone cannot see it. `C` itself is
+# always available. (No pipe here: the suite sets `pipefail`, and `grep -q` exits
+# early, so `locale -a | grep -q ...` reports 141 via SIGPIPE even on a match.)
+utf8_locale=""
+available_locales=$(locale -a 2>/dev/null || true)
+for cand in en_US.UTF-8 C.UTF-8 en_US.utf8 C.utf8; do
+    if grep -qxF -- "$cand" <<<"$available_locales"; then utf8_locale="$cand"; break; fi
+done
+
 # Floor on the number of checks that must run. Deleting a case (or returning
 # early past one) leaves every remaining assertion green, so without this the
 # suite cannot detect its own neutering. Enforced from the EXIT trap below, which
 # is installed before the first assertion, and again explicitly before RESULT.
-MIN_CHECKS=114
+MIN_CHECKS=158
 # MIN_CHECKS is a COUNT and a count is not an identity: deleting case 6 and
 # padding with three dummy `ok` calls restored the floor while the constant
 # column — one of the two shapes this suite exists to refuse — went untested.
@@ -164,6 +174,12 @@ if rss_soak_validate_tolerance nan >/dev/null 2>&1; then bad 'tolerance refuses 
 if rss_soak_validate_tolerance 0 >/dev/null 2>&1; then bad 'tolerance refuses 0'; else ok 'tolerance refuses 0'; fi
 if rss_soak_validate_tolerance 1.5 >/dev/null 2>&1; then bad 'tolerance refuses a value above 1'; else ok 'tolerance refuses a value above 1'; fi
 if rss_soak_validate_tolerance 0.10 >/dev/null 2>&1; then ok 'tolerance accepts the default 0.10'; else bad 'tolerance refused 0.10'; fi
+# The tolerance is recorded verbatim in `meta`; awk accepts these but JSON does
+# not, and an unparseable meta line is silently skipped by the reader.
+if rss_soak_validate_tolerance .5 >/dev/null 2>&1; then bad 'tolerance accepts .5 (invalid JSON number)'; else ok 'tolerance refuses .5 (invalid JSON number)'; fi
+if rss_soak_validate_tolerance +0.5 >/dev/null 2>&1; then bad 'tolerance accepts +0.5 (invalid JSON number)'; else ok 'tolerance refuses +0.5 (invalid JSON number)'; fi
+if rss_soak_validate_tolerance 01 >/dev/null 2>&1; then bad 'tolerance accepts 01 (invalid JSON number)'; else ok 'tolerance refuses 01 (invalid JSON number)'; fi
+if rss_soak_validate_tolerance 1e-1 >/dev/null 2>&1; then ok 'tolerance accepts the JSON number 1e-1'; else bad 'tolerance refused 1e-1'; fi
 
 # -------------------------------------------------------------- lock policy
 # The lock is taken before the builds, so these run in well under a second and
@@ -209,7 +225,7 @@ if rss_soak_write_meta "$nasty_meta" \
     '2026-01-01T00:00:00Z' 300 45 320 "$nasty_host" darwin 8 "0.71.0" deadbeef false \
     h1 h2 h3 h4 'built-here' "$nasty_dir" "0.71.0" "$work/go\"dir" "$nasty_bin" "$work/frpc" \
     8 40 64 3 5 18100 18101 18102 18200 18201 18202 \
-    aa bb cc dd 1.5 1048576; then
+    aa bb cc dd 1.5 1048576 0.10; then
     ok 'the writer accepts quotes and backslashes in its string fields'
 else
     bad 'the writer refused a well-formed call'
@@ -218,9 +234,10 @@ if python3 -c 'import json,sys
 m=json.loads(open(sys.argv[1]).read().splitlines()[0])
 sys.exit(0 if (m["run_dir"]==sys.argv[2] and m["rs_bin"]==sys.argv[3]
                and m["host"]==sys.argv[4] and m["go_frp_dir"]==sys.argv[5]
-               and m["rss_ceiling_kb"]==1048576) else 1)' \
+               and m["rss_ceiling_kb"]==1048576
+               and m["traffic_tolerance"]==0.10) else 1)' \
         "$nasty_meta" "$nasty_dir" "$nasty_bin" "$nasty_host" "$work/go\"dir"; then
-    ok 'the meta line parses back to the same quoted paths and the ceiling'
+    ok 'the meta line parses back to the same quoted paths, ceiling and tolerance'
 else
     bad 'the meta line from a quoted run dir is not valid JSON or lost its values'
 fi
@@ -239,6 +256,113 @@ if [ -e "$work/bad-meta.jsonl" ]; then
     bad 'a refused meta write still created the artifact'
 else
     ok 'a refused meta write appends nothing'
+fi
+
+# -------------------------------------------- meta writer (locale independence)
+# round 5: the escaper was LOCALE-DEPENDENT. `[[:cntrl:]]` and `${s:0:1}` are
+# byte-oriented only in the C locale; under any UTF-8 locale bash 3.2 matched the
+# Unicode Cc/Cf categories too, so U+200B took the `\u` branch and
+# `printf "'$ch"` sign-extended its first byte into `\uffffffffffffffe2` — valid
+# JSON, silently wrong value. These teeth sweep the code points through the REAL
+# function and round-trip a REAL artifact whose run dir contains U+200B, U+00AD
+# and a combining mark, under a UTF-8 locale and under C.
+hdr 'meta writer (locale independence)'
+mark meta-escaper-locale
+
+escaper_cases="$work/escaper-cases.sh"
+python3 - "$escaper_cases" <<'PY'
+import sys
+# U+0001..U+00FF (U+0000 is unreachable: a bash string cannot hold a NUL byte),
+# plus the Unicode Cc/Cf points bash 3.2's [[:cntrl:]] also matched in a UTF-8
+# locale, plus the named-escape targets the escaper must keep in short form.
+extra = [
+    0x0600, 0x0601, 0x0602, 0x0603, 0x0604, 0x0605, 0x061C, 0x06DD, 0x070F,
+    0x0890, 0x0891, 0x08E2, 0x180E,
+    0x200B, 0x200C, 0x200D, 0x200E, 0x200F,
+    0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
+    0x2060, 0x2061, 0x2062, 0x2063, 0x2064, 0x2066, 0x2069,
+    0xFFF9, 0xFFFA, 0xFFFB, 0xE0001, 0xE0020,
+    0x0008, 0x0009, 0x000A, 0x000C, 0x000D,
+]
+points = list(range(1, 0x100)) + extra
+out = ["CASES=()"]
+for cp in points:
+    # bash 3.2's printf has no \u escape, and $'...' carries the raw bytes just
+    # as well: emit the UTF-8 encoding as \xNN byte escapes.
+    out.append("CASES+=( $'%s' )" % "".join("\\x%02x" % b for b in chr(cp).encode("utf-8")))
+open(sys.argv[1], "w").write("\n".join(out) + "\n")
+PY
+sweep_n=$(grep -c 'CASES+=' "$escaper_cases")
+
+escaper_sweep() { # <env arg>... -> NUL-delimited (input, escaped) records on stdout
+    env "$@" bash -c '
+        set -uo pipefail
+        . "$1"
+        . "$2"
+        for ch in "${CASES[@]}"; do
+            printf "%s\0%s\0" "$ch" "$(rss_soak_json_str "$ch")"
+        done
+    ' _ "$LIB" "$escaper_cases"
+}
+
+sweep_roundtrips() { # <file> <locale> -> 0 if every record decodes back
+    python3 - "$1" "$2" "$sweep_n" <<'PY'
+import json, sys
+raw = open(sys.argv[1], "rb").read()
+fields = raw.split(b"\0")
+if fields and fields[-1] == b"":
+    fields.pop()
+if len(fields) != 2 * int(sys.argv[3]):
+    print(f"swept {len(fields) // 2} case(s), expected {sys.argv[3]}", file=sys.stderr)
+    sys.exit(1)
+bad = 0
+for i in range(0, len(fields), 2):
+    src, esc = fields[i], fields[i + 1]
+    try:
+        got = json.loads(b'"' + esc + b'"').encode("utf-8")
+    except Exception:
+        got = None
+    if got != src:
+        bad += 1
+        if bad <= 3:
+            print(f"{src.hex()} -> {esc!r} -> {None if got is None else got.hex()}", file=sys.stderr)
+sys.exit(1 if bad else 0)
+PY
+}
+
+sweep_one() { # <label> <env arg>...
+    local label="$1"
+    shift
+    if escaper_sweep "$@" > "$work/sweep.bin" 2> "$work/sweep.err" \
+       && sweep_roundtrips "$work/sweep.bin" "$label"; then
+        ok "$sweep_n code points round-trip through rss_soak_json_str under $label"
+    else
+        bad "rss_soak_json_str does not round-trip every code point under $label"
+        sed 's/^/      /' "$work/sweep.err"
+    fi
+}
+
+if [ -z "$utf8_locale" ]; then
+    bad 'no UTF-8 locale is installed, so the escaper cannot be tested as documented'
+else
+    # The environments round 5 named, plus C. The defect was that the escape
+    # branch consulted the ambient locale at all, so each of them has to hold.
+    sweep_one "LC_ALL=$utf8_locale" "LC_ALL=$utf8_locale" "LC_CTYPE=$utf8_locale"
+    sweep_one "LANG=$utf8_locale (LC_ALL and LC_CTYPE unset)" -u LC_ALL -u LC_CTYPE "LANG=$utf8_locale"
+    sweep_one 'LC_ALL=C.UTF-8' 'LC_ALL=C.UTF-8' 'LC_CTYPE=C.UTF-8'
+    sweep_one 'LC_CTYPE=C' -u LC_ALL -u LANG 'LC_CTYPE=C'
+fi
+
+esc_01=$(rss_soak_json_str $'\x01')
+esc_7f=$(rss_soak_json_str $'\x7f')
+esc_nl=$(rss_soak_json_str $'\n')
+esc_bs=$(rss_soak_json_str '\')
+esc_q=$(rss_soak_json_str '"')
+if [ "$esc_01" = '\u0001' ] && [ "$esc_7f" = '\u007f' ] && [ "$esc_nl" = '\n' ] \
+   && [ "$esc_bs" = '\\' ] && [ "$esc_q" = '\"' ]; then
+    ok 'the ASCII control/quote/backslash escapes keep their exact short forms'
+else
+    bad "ASCII escapes changed: 0x01=$esc_01 0x7F=$esc_7f NL=$esc_nl BS=$esc_bs Q=$esc_q"
 fi
 
 # ------------------------------------------------------- summary reader (real)
@@ -298,6 +422,49 @@ run_summary() { # <dir> <mode> [extra-meta] [aborted]
     summary "$dir/out.jsonl" "$aborted" "$dir/rs-churn.json" "$dir/go-churn.json" \
         "$dir/rs-steady.json" "$dir/go-steady.json"
 }
+
+# meta writer (locale independence), part 2: writer -> reader through a REAL
+# artifact whose run dir carries U+200B, U+00AD, a combining mark (U+0301) and
+# the two line-ish separators (U+0085, U+2028) that a `str.splitlines()`-based
+# reader would shred. The writer runs under the locale under test; the reader
+# must hand the same bytes back in the summary record. (Part 1, the direct sweep,
+# is above; this half needs the reader helpers defined.)
+zwsp=$'\xe2\x80\x8b'
+shy=$'\xc2\xad'
+comb=$'e\xcc\x81'
+nel=$'\xc2\x85'
+lsep=$'\xe2\x80\xa8'
+for loc in "$utf8_locale" C; do
+    [ -n "$loc" ] || continue
+    rt="$work/roundtrip-$loc"
+    mkdir -p -- "$rt"
+    rt_abs=$(rss_soak_prepare_run_dir "$rt/run-$zwsp$shy-$comb$nel$lsep" "$rt/out.jsonl")
+    if LC_ALL="$loc" LC_CTYPE="$loc" rss_soak_write_meta "$rt/out.jsonl" \
+        '2026-01-01T00:00:00Z' 300 45 320 'host' darwin 8 "0.71.0" deadbeef false \
+        h1 h2 h3 h4 'built-here' "$rt_abs" "0.71.0" "$rt/go" "$rt/frps" "$rt/frpc" \
+        8 40 64 3 5 18100 18101 18102 18200 18201 18202 \
+        aa bb cc dd 1.5 1048576 0.10; then
+        ok "the writer accepts a run dir with U+200B/U+00AD/U+0301 under LC_ALL=$loc"
+    else
+        bad "the writer refused a UTF-8 run dir under LC_ALL=$loc"
+    fi
+    for i in 0 45 90 135 180; do
+        printf '{"kind":"sample","elapsed_s":%d,"load1":3.1,"time_wait":400,"frp_rs_frps_kb":%d,"frp_rs_frpc_kb":%d,"go_frps_kb":%d,"go_frpc_kb":%d}\n' \
+            "$i" $((12000 + i * 10)) $((12010 + i * 10)) $((32000 + i * 10)) $((24000 + i * 10)) \
+            >> "$rt/out.jsonl"
+    done
+    traffic_rows "$rt" 600 2000000
+    summary "$rt/out.jsonl" "" "$rt/rs-churn.json" "$rt/go-churn.json" "$rt/rs-steady.json" "$rt/go-steady.json"
+    expect_rc 0 $? "a real artifact with a UTF-8 run dir reads clean under LC_ALL=$loc"
+    if python3 -c 'import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
+s=[r for r in rows if r.get("kind")=="summary"][-1]
+sys.exit(0 if s.get("run_dir")==sys.argv[2] else 1)' "$rt/out.jsonl" "$rt_abs"; then
+        ok "the reader returns the UTF-8 run dir byte-identically under LC_ALL=$loc"
+    else
+        bad "the reader returned a different run dir under LC_ALL=$loc"
+    fi
+done
 
 # 1. A run whose generators died early: the rows on disk predate the run, and
 #    the soak clears them before the window opens. The summary must then abort
@@ -567,6 +734,78 @@ expect_rc 3 "$?" 'an artifact with no recorded ceiling gets the 1 GiB default'
 expect_grep 'outside 1..1048576 KB' "$nob/out.jsonl" 'the 1 GiB fallback default is applied'
 expect_grep 'from default' "$nob/out.jsonl.stdout" 'the ceiling source is the default'
 
+# 17. round 5: the traffic tolerance, like the ceiling, is recorded in the
+#     artifact and preferred over the reader's environment. Before this, two
+#     BYTE-IDENTICAL artifacts got opposite verdicts from SOAK_TRAFFIC_TOLERANCE
+#     alone: the default env read rc 3 ("differs by 50.0%"), an ambient 0.6 read
+#     rc 0 ("run completed"). An artifact that records nothing must still behave
+#     exactly as before (env, then 0.10).
+mark summary-case-17
+
+tolerance_case() { # <dir> <recorded|-|> <ambient|-|> <want-rc> <msg>
+    local dir="$1" recorded="$2" ambient="$3" want="$4" msg="$5"
+    local abs extra="" rc
+    mkdir -p -- "$dir"
+    abs=$(rss_soak_prepare_run_dir "$dir" "$dir/out.jsonl")
+    [ "$recorded" = "-" ] || extra=",\"traffic_tolerance\":$recorded"
+    artifact "$dir/out.jsonl" "$abs" rising "$extra"
+    # A 50% churn gap: 600 frp-rs round trips vs 300 Go ones.
+    printf '{"connections":40,"round_trips":600,"bytes":2000000,"total_bytes":2000000,"mbps":1.0,"failed_streams":0}\n' > "$dir/rs-churn.json"
+    printf '{"connections":40,"round_trips":300,"bytes":2000000,"total_bytes":2000000,"mbps":1.0,"failed_streams":0}\n' > "$dir/go-churn.json"
+    printf '{"connections":3,"bytes":2000000,"total_bytes":2000000,"mbps":1.0,"failed_streams":0}\n' > "$dir/rs-steady.json"
+    cp -- "$dir/rs-steady.json" "$dir/go-steady.json"
+    if [ "$ambient" = "-" ]; then unset SOAK_TRAFFIC_TOLERANCE; else export SOAK_TRAFFIC_TOLERANCE="$ambient"; fi
+    summary "$dir/out.jsonl" "" "$dir/rs-churn.json" "$dir/go-churn.json" \
+        "$dir/rs-steady.json" "$dir/go-steady.json"
+    rc=$?
+    unset SOAK_TRAFFIC_TOLERANCE
+    if [ "$rc" = "$want" ]; then ok "$msg (rc=$rc)"; else bad "$msg (want rc=$want, got rc=$rc)"; fi
+}
+
+tolerance_case "$work/tol-rec06-a" 0.6  -    0 'an artifact recording 0.6 completes with the env unset'
+tolerance_case "$work/tol-rec06-b" 0.6  0.10 0 'an artifact recording 0.6 beats an ambient 0.10'
+tolerance_case "$work/tol-rec06-c" 0.6  0.6  0 'an artifact recording 0.6 agrees with an ambient 0.6'
+tolerance_case "$work/tol-rec01-a" 0.10 -    3 'an artifact recording 0.10 aborts with the env unset'
+tolerance_case "$work/tol-rec01-b" 0.10 0.10 3 'an artifact recording 0.10 aborts against an ambient 0.10'
+tolerance_case "$work/tol-rec01-c" 0.10 0.6  3 'an artifact recording 0.10 beats an ambient 0.6'
+tolerance_case "$work/tol-none-a"  -    -    3 'an artifact recording nothing keeps the 0.10 default'
+tolerance_case "$work/tol-none-b"  -    0.10 3 'an artifact recording nothing reads an ambient 0.10'
+tolerance_case "$work/tol-none-c"  -    0.6  0 'an artifact recording nothing still reads an ambient 0.6'
+# A value that is PRESENT but unusable must abort rather than fall through to the
+# environment: otherwise a hand-edited artifact is environment-flippable again.
+tolerance_case "$work/tol-bogus-a" '"bogus"' -   3 'an artifact recording a string tolerance aborts'
+tolerance_case "$work/tol-bogus-b" '"bogus"' 0.6 3 'a recorded string tolerance is not environment-flipped'
+# A 400-digit JSON integer overflows float(); it must be "unusable", not a
+# traceback rc 1.
+huge=$(python3 -c 'print(10 ** 400)')
+tolerance_case "$work/tol-huge"    "$huge"   -   3 'a recorded integer too large for a float aborts'
+# JSON `null` means "recorded nothing", so env-then-default still applies.
+tolerance_case "$work/tol-null-a"  null      -   3 'an artifact recording null keeps the default'
+tolerance_case "$work/tol-null-b"  null      0.6 0 'an artifact recording null still reads an ambient 0.6'
+
+expect_grep '"traffic_tolerance": 0.6' "$work/tol-rec06-a/out.jsonl" 'the summary records the artifact tolerance'
+expect_grep '"traffic_tolerance_source": "artifact meta"' "$work/tol-rec06-a/out.jsonl" 'the summary names the artifact as the tolerance source'
+expect_grep 'traffic tolerance: 0.6 (from artifact meta)' "$work/tol-rec06-a/out.jsonl.stdout" 'the printed table names the artifact as the tolerance source'
+expect_grep 'traffic tolerance: 0.1 (from default)' "$work/tol-none-a/out.jsonl.stdout" 'the printed table names the default when the artifact records none'
+expect_grep 'traffic tolerance: 0.6 (from environment)' "$work/tol-none-c/out.jsonl.stdout" 'the printed table names the environment when the artifact records none'
+expect_grep 'records an unusable traffic tolerance' "$work/tol-bogus-a/out.jsonl" 'an unusable recorded tolerance is named'
+expect_no_grep 'Traceback' "$work/tol-huge/out.stdout" 'a giant recorded tolerance is refused, not a traceback'
+
+# 18. round 5: a non-UTF-8 artifact is an UNUSABLE artifact — refused loudly with
+#     the artifact name and the byte offset, not a bare traceback and not a
+#     silent U+FFFD substitution (the writer stays byte-preserving by design).
+mark summary-case-18
+badenc="$work/badenc"
+mkdir -p -- "$badenc"
+printf '{"kind":"meta","run_dir":"/tmp/\377\376"}\n' > "$badenc/out.jsonl"
+python3 "$SUMMARY" "$badenc/out.jsonl" "" "$badenc/x" "$badenc/y" "$badenc/z" "$badenc/w" \
+    > "$badenc/out.stdout" 2>&1
+expect_rc 2 "$?" 'a non-UTF-8 artifact is an unusable artifact (rc 2)'
+expect_grep 'not valid UTF-8' "$badenc/out.stdout" 'the decoding failure is named'
+expect_grep 'byte offset' "$badenc/out.stdout" 'the failing byte offset is named'
+expect_grep 'out\.jsonl' "$badenc/out.stdout" 'the artifact path is named'
+expect_no_grep 'Traceback' "$badenc/out.stdout" 'the failure is not a bare traceback'
+
 # ------------------------------------------------- rss reading guard (real fn)
 hdr 'rss reading guard'
 mark rss-reading-guard
@@ -628,6 +867,7 @@ require_marker run-dir-guard
 require_marker window-tolerance
 require_marker lock-policy
 require_marker meta-writer
+require_marker meta-escaper-locale
 require_marker summary-reader
 require_marker summary-case-01
 require_marker summary-case-02
@@ -645,6 +885,8 @@ require_marker summary-case-13
 require_marker summary-case-14
 require_marker summary-case-15
 require_marker summary-case-16
+require_marker summary-case-17
+require_marker summary-case-18
 require_marker rss-reading-guard
 
 floor_check
