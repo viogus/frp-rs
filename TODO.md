@@ -7772,7 +7772,7 @@ section; ledger now **24 open / 104 closed**.**
   `.ini`-only boundary stated in `docs/config.md`), or the stricter refusal is recorded as
   deliberate in `docs/developing.md` with this measurement, and either way pinned by a test.
 
-  **Done (2026-09-30, at `a575c867` on `fix/legacy-ini-parity`).** The section-level strict walk is split in two:
+  **Done (2026-09-30, at `8211fcd9` on `fix/legacy-ini-parity`).** The section-level strict walk is split in two:
   `frp-core/src/config/strict.rs:456 run_strict_check_top_level` delegates to
   `frp-core/src/config/strict.rs:464 run_strict_check_scoped(.., recurse)` and the descent into
   sub-tables stops at `frp-core/src/config/strict.rs:903` (`if !recurse { continue; }`); the `.ini`
@@ -7800,7 +7800,7 @@ section; ledger now **24 open / 104 closed**.**
   Done-when: an empty `type` in the `.ini` dialect is defaulted like a missing one, or the
   refusal is recorded as deliberate with this measurement, pinned in both loader modes.
 
-  **Done (2026-09-30, at `a575c867` on `fix/legacy-ini-parity`).** Go's legacy collector reads the type with
+  **Done (2026-09-30, at `8211fcd9` on `fix/legacy-ini-parity`).** Go's legacy collector reads the type with
   `section.Key("type").String()`, which cannot distinguish an absent key from an empty one
   (`proxyType == ""` defaults to `ProxyTypeTCP`), while frp-rs defaulted only a *missing* key. New
   `frp-core/src/config/normalize.rs:1948 type_missing_or_empty` (None → true, `String("")` →
@@ -7825,10 +7825,10 @@ section; ledger now **24 open / 104 closed**.**
   Done-when: a typeless visitor reports Go's `type shouldn't be empty` in both modes (or at
   least is refused in non-strict mode instead of dropped), pinned in both modes.
 
-  **Done (2026-09-30, at `a575c867` on `fix/legacy-ini-parity`).** A typeless section whose `role` is `visitor` is now
-  refused **before** collection, in both loader modes, with Go's message: the guard at
-  `frp-core/src/config/normalize.rs:1989` returns the error built at
-  `frp-core/src/config/normalize.rs:1997` (`failed to parse visitor {name}, err: type shouldn't be
+  **Done (2026-09-30, at `8211fcd9` on `fix/legacy-ini-parity`).** A typeless section whose `role` is `visitor` is now
+  refused **before** collection, in both loader modes, with Go's message: the guards at
+  `frp-core/src/config/normalize.rs:1989` (the nested walk) and `:1995` (the top level) return the
+  error built at `frp-core/src/config/normalize.rs:1996-1998` (`failed to parse visitor {name}, err: type shouldn't be
   empty`), and it is applied at any depth — the collector walks the top level *and* every nested
   table, so `[auth.foo] role = "visitor" server_name = s`, which the top-level-only walk missed,
   is refused too. Measured `frpc verify -c i3.ini` (`[v] role = "visitor" server_name = s`): Go
@@ -7867,7 +7867,7 @@ section; ledger now **24 open / 104 closed**.**
   Done-when: the reserved-root exemption stops applying to a section carrying `type` or the port
   keys, or the loss is recorded as deliberate with this measurement and pinned by a test.
 
-  **Done (2026-09-30, at `a575c867` on `fix/legacy-ini-parity`) for the port-carrying spelling.** A reserved-root section
+  **Done (2026-09-30, at `8211fcd9` on `fix/legacy-ini-parity`) for the port-carrying spelling.** A reserved-root section
   that carries `local_port`/`remote_port` is collected as a legacy proxy again, keyed on the
   **ports** and never on `type`
   (`frp-core/src/config/normalize.rs:2097`: `is_ini && (local_port || remote_port)`), so
@@ -7892,7 +7892,7 @@ section; ledger now **24 open / 104 closed**.**
   Done-when: a portless dotted spelling of a typed root is treated as the section it looks like (or
   the refusal is recorded as deliberate with this measurement), pinned in both loader modes.
 
-  **Done (2026-09-30, at `a575c867` on `fix/legacy-ini-parity`).** `proxies`/`visitors` were removed from
+  **Done (2026-09-30, at `8211fcd9` on `fix/legacy-ini-parity`).** `proxies`/`visitors` were removed from
   `format::INI_NESTED_SECTION_ROOTS` (`frp-core/src/config/format.rs:259`), so `[visitors.NAME]` /
   `[proxies.NAME]` is no longer expanded into a v1 sub-table, and the collector filter keeps a
   dotted header that names one of those array roots (`normalize.rs:1936 names_an_ini_array_root`,
@@ -8414,7 +8414,7 @@ section; ledger now **24 open / 104 closed**.**
 
 - [ ] **The two legacy-format detectors disagree for a `[common.foo]`-only `.ini`, and the v1-path `[DEFAULT]`, dotted-root and range-render shapes still diverge.**
   Measured by the #425 round-6/7 reviews. For a file containing only `[common.foo]`, the detector
-  in `frp-core/src/config/normalize.rs:1161` and the one in `frp-core/src/config/format.rs:223`
+  in `frp-core/src/config/normalize.rs:1160` and the one in `frp-core/src/config/format.rs:223`
   reach different verdicts, so `q4` is Go strict 1 / loose 0 against frp-rs 1|1 — loose-only and
   identical on the parent, so a follow-up rather than a blocker. Also open from the #425 sweep:
   `[DEFAULT]` is treated as a normal section (`y10`/`y11`), the range render gaps `y14`/`y16`, and
@@ -8427,7 +8427,7 @@ section; ledger now **24 open / 104 closed**.**
 
 - [ ] **`[common] start` is read from the wrong place for a `[common]`-less `.ini`, and that spelling has no pin.**
   Measured by the #425 round-6/7 adversarial reviews. Round 6's `legacy_start_override`
-  (`frp-core/src/config/normalize.rs:2510`) removed `start` unconditionally and so deleted a
+  (`frp-core/src/config/normalize.rs:2507`) removed `start` unconditionally and so deleted a
   legitimate legacy proxy section named `[start]`: `s90` (`[common]` + `[p1]` + a valid `[start]`)
   gave Go rc 0 with **2** proxies and the round-6 head 1; `s92` (`[start]` only) Go 1 / head 0;
   `s93`/`s95` masked Go's `proxy start role should be 'server' or 'visitor'` / `failed to parse
