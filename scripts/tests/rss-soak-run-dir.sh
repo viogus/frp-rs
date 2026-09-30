@@ -54,7 +54,7 @@ done
 # early past one) leaves every remaining assertion green, so without this the
 # suite cannot detect its own neutering. Enforced from the EXIT trap below, which
 # is installed before the first assertion, and again explicitly before RESULT.
-MIN_CHECKS=158
+MIN_CHECKS=187
 # MIN_CHECKS is a COUNT and a count is not an identity: deleting case 6 and
 # padding with three dummy `ok` calls restored the floor while the constant
 # column — one of the two shapes this suite exists to refuse — went untested.
@@ -590,7 +590,7 @@ summary "$nan/out.jsonl" "" "$nan/rs-churn.json" "$nan/go-churn.json" \
 nan_rc=$?
 unset SOAK_TRAFFIC_TOLERANCE
 expect_rc 3 "$nan_rc" 'a nan tolerance -> abort'
-expect_grep 'not a finite positive number' "$nan/out.jsonl" 'the nan tolerance is named'
+expect_grep 'not a finite number in (0, 1]' "$nan/out.jsonl" 'the nan tolerance is named'
 expect_no_grep 'NaN' "$nan/out.jsonl" 'NaN is never recorded as a tolerance'
 
 # 9. The same binary on both sides is not a comparison. The soak refuses this
@@ -779,9 +779,20 @@ tolerance_case "$work/tol-bogus-b" '"bogus"' 0.6 3 'a recorded string tolerance 
 # traceback rc 1.
 huge=$(python3 -c 'print(10 ** 400)')
 tolerance_case "$work/tol-huge"    "$huge"   -   3 'a recorded integer too large for a float aborts'
-# JSON `null` means "recorded nothing", so env-then-default still applies.
-tolerance_case "$work/tol-null-a"  null      -   3 'an artifact recording null keeps the default'
-tolerance_case "$work/tol-null-b"  null      0.6 0 'an artifact recording null still reads an ambient 0.6'
+# JSON `null` is a RECORDED value: the key is present, so it must be usable and
+# the run must abort. Treating null as "recorded nothing" let the ambient
+# environment flip two byte-identical artifacts (a 5% spread read rc 0 with the
+# env unset and rc 3 with SOAK_TRAFFIC_TOLERANCE=0.01).
+tolerance_case "$work/tol-null-a"  null      -   3 'a recorded null tolerance is present-but-unusable'
+tolerance_case "$work/tol-null-b"  null      0.6 3 'a recorded null tolerance is not environment-flipped'
+tolerance_case "$work/tol-true-a"  true      -   3 'a recorded boolean tolerance is present-but-unusable'
+tolerance_case "$work/tol-true-b"  true      0.6 3 'a recorded boolean tolerance is not environment-flipped'
+# Above the writer's (0, 1] contract. Any finite value > 0 used to be accepted,
+# so a recorded 100 let a 90% spread read "run completed".
+tolerance_case "$work/tol-100-a"   100       -   3 'a recorded tolerance above 1 aborts'
+tolerance_case "$work/tol-100-b"   100       0.6 3 'a recorded tolerance above 1 is not environment-flipped'
+tolerance_case "$work/tol-1e9"     1e9       -   3 'a recorded tolerance of 1e9 aborts'
+tolerance_case "$work/tol-zero"    0         -   3 'a recorded tolerance of 0 aborts'
 
 expect_grep '"traffic_tolerance": 0.6' "$work/tol-rec06-a/out.jsonl" 'the summary records the artifact tolerance'
 expect_grep '"traffic_tolerance_source": "artifact meta"' "$work/tol-rec06-a/out.jsonl" 'the summary names the artifact as the tolerance source'
@@ -789,7 +800,13 @@ expect_grep 'traffic tolerance: 0.6 (from artifact meta)' "$work/tol-rec06-a/out
 expect_grep 'traffic tolerance: 0.1 (from default)' "$work/tol-none-a/out.jsonl.stdout" 'the printed table names the default when the artifact records none'
 expect_grep 'traffic tolerance: 0.6 (from environment)' "$work/tol-none-c/out.jsonl.stdout" 'the printed table names the environment when the artifact records none'
 expect_grep 'records an unusable traffic tolerance' "$work/tol-bogus-a/out.jsonl" 'an unusable recorded tolerance is named'
+expect_grep 'records an unusable traffic tolerance' "$work/tol-null-a/out.jsonl" 'a recorded null is named as the unusable tolerance, not merely aborted for the spread'
+expect_grep 'a finite number in (0, 1]' "$work/tol-100-a/out.jsonl" 'the usable range is named for a too-large tolerance'
+expect_grep 'traffic tolerance: 0.1 (from artifact meta, unusable)' "$work/tol-null-b/out.jsonl.stdout" \
+    'the printed table reports the unusable recorded tolerance, not the environment'
+expect_no_grep 'from environment' "$work/tol-null-b/out.jsonl.stdout" 'a recorded null does not fall back to the environment'
 expect_no_grep 'Traceback' "$work/tol-huge/out.stdout" 'a giant recorded tolerance is refused, not a traceback'
+expect_no_grep 'Traceback' "$work/tol-100-a/out.jsonl.stdout" 'a too-large recorded tolerance is refused, not a traceback'
 
 # 18. round 5: a non-UTF-8 artifact is an UNUSABLE artifact — refused loudly with
 #     the artifact name and the byte offset, not a bare traceback and not a
@@ -805,6 +822,56 @@ expect_grep 'not valid UTF-8' "$badenc/out.stdout" 'the decoding failure is name
 expect_grep 'byte offset' "$badenc/out.stdout" 'the failing byte offset is named'
 expect_grep 'out\.jsonl' "$badenc/out.stdout" 'the artifact path is named'
 expect_no_grep 'Traceback' "$badenc/out.stdout" 'the failure is not a bare traceback'
+
+# 19. round 6: a summary appended to an artifact whose last line has no trailing
+#     newline must not be glued to it. A soak killed mid-`printf` leaves such a
+#     line; gluing makes BOTH lines unparseable, so the aborted summary the
+#     monotonic rule depends on becomes invisible and the re-read prints
+#     "run completed" over a real abort.
+mark summary-case-19
+unterm="$work/unterminated"
+mkdir -p -- "$unterm"
+unterm_abs=$(rss_soak_prepare_run_dir "$unterm" "$unterm/out.jsonl")
+artifact "$unterm/out.jsonl" "$unterm_abs" rising ""
+traffic_rows "$unterm" 600 2000000
+printf '%s' '{"kind":"summary","aborted":"previous run died without a newline","samples":1}' >> "$unterm/out.jsonl"
+if [ "$(tail -c 1 -- "$unterm/out.jsonl" | od -An -tx1 | tr -d ' \n')" = "7d" ]; then
+    ok 'the fixture artifact really ends without a newline'
+else
+    bad 'the fixture artifact already ends with a newline (fixture bug)'
+fi
+summary "$unterm/out.jsonl" "" "$unterm/rs-churn.json" "$unterm/go-churn.json" \
+    "$unterm/rs-steady.json" "$unterm/go-steady.json"
+expect_rc 3 "$?" 'an unterminated prior summary still aborts the re-read'
+expect_grep 'a previous summary already aborted this artifact' "$unterm/out.jsonl.stdout" \
+    'the re-read sees the abort verdict the separator keeps visible'
+if python3 -c '
+import json, sys
+lines = [l for l in open(sys.argv[1], "rb").read().decode("utf-8").split("\n") if l.strip()]
+assert len(lines) >= 8, [len(lines), lines[-1][:60]]
+rows = [json.loads(l) for l in lines]
+assert rows[-1]["kind"] == "summary" and rows[-1]["aborted"], rows[-1]
+' "$unterm/out.jsonl"; then
+    ok 'the appended summary is its own parseable line (one JSON object per line)'
+else
+    bad 'the appended summary is not a parseable line of its own'
+fi
+
+# 20. round 6: a line that is VALID JSON but not an object used to kill the
+#     reader with an AttributeError traceback (rc 1). It is a corrupt artifact and
+#     must take the documented rc 2 path, naming the artifact, the line and the
+#     JSON type.
+mark summary-case-20
+for spec in 'null:null' '123:number' '"x":string' '[1,2]:array'; do
+    line="${spec%%:*}"; word="${spec##*:}"
+    nd="$work/nondict-${word}"
+    mkdir -p -- "$nd"
+    printf '{"kind":"meta","run_dir":"/tmp/x"}\n%s\n' "$line" > "$nd/out.jsonl"
+    python3 "$SUMMARY" "$nd/out.jsonl" "" "$nd/a" "$nd/b" "$nd/c" "$nd/d" > "$nd/out.stdout" 2>&1
+    expect_rc 2 "$?" "a JSON $word line is an unusable artifact (rc 2)"
+    expect_grep "line 2 is a JSON $word, not an object" "$nd/out.stdout" "the $word line and its number are named"
+    expect_no_grep 'Traceback' "$nd/out.stdout" "a JSON $word line is not a traceback"
+done
 
 # ------------------------------------------------- rss reading guard (real fn)
 hdr 'rss reading guard'
@@ -887,6 +954,8 @@ require_marker summary-case-15
 require_marker summary-case-16
 require_marker summary-case-17
 require_marker summary-case-18
+require_marker summary-case-19
+require_marker summary-case-20
 require_marker rss-reading-guard
 
 floor_check

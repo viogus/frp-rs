@@ -33,12 +33,16 @@ these holds:
   * either side lost a steady stream (`failed_streams` > 0);
   * the two sides' achieved volume differs by more than the traffic tolerance
     (default 0.10) — both are paced identically, so a large gap means one side
-    was not handed the same work and the comparison is not head-to-head. The
-    tolerance must be a finite positive number: `nan` compares false against
+    was not handed the same work and the comparison is not head-to-head. A
+    tolerance must be a finite number in (0, 1]: `nan` compares false against
     everything and used to disable this check while the run still reported
-    `"aborted": null`. Like the RSS ceiling, an artifact that records its own
-    `traffic_tolerance` is judged by that value and not by the ambient
-    `SOAK_TRAFFIC_TOLERANCE`;
+    `"aborted": null`, and a tolerance above 1 accepts any spread. Like the RSS
+    ceiling, an artifact that records its own `traffic_tolerance` is judged by
+    that value and not by the ambient `SOAK_TRAFFIC_TOLERANCE`. What counts is
+    that the KEY IS PRESENT: a recorded value must be usable, and a recorded
+    `null` (or `true`, a string, 0, a list, a 400-digit integer, ...) is
+    present-but-unusable and aborts the run rather than falling through to the
+    environment the reader happens to carry;
   * the recorded frp-rs and Go binary sha256 are equal, i.e. one implementation
     was run on both sides.
 
@@ -90,6 +94,10 @@ DEFAULT_RSS_CEILING_KB = 1048576  # 1 GiB
 # spread a run was produced under is part of its evidence, and re-reading the
 # same artifact under a different SOAK_TRAFFIC_TOLERANCE used to flip its verdict
 # (two byte-identical artifacts read "run completed" at 0.6 and rc 3 at 0.10).
+# The recorded KEY must be present AND usable — a recorded `null` used to be
+# indistinguishable from an absent key, so `{"traffic_tolerance": null}` still
+# read "run completed" at 5% spread under an unset environment and rc 3 under
+# `SOAK_TRAFFIC_TOLERANCE=0.01`.
 DEFAULT_TRAFFIC_TOLERANCE = 0.10
 # Absolute achieved-load floor. Far below what the default recipe produces in the
 # shortest allowed window (60 s: ~2400 churn round trips, hundreds of MiB of
@@ -100,16 +108,32 @@ MIN_STEADY_TOTAL_BYTES = 1048576  # 1 MiB
 
 
 def load_json(path):
-    """Last non-empty line of a traffic row, or None if unreadable/empty."""
+    """Last non-empty line of a traffic row, or None if unreadable/empty.
+
+    Only an object is a traffic row. A line that is valid JSON but not an object
+    (a bare `null`, `123`, `"x"` or `[1, 2]`) returns None, i.e. "MISSING", the
+    same as an unreadable file: callers read the result with `.get`, and a
+    non-dict would kill the reader with an AttributeError traceback (rc 1)
+    instead of reporting the missing measurement as a problem (rc 3)."""
     try:
         with open(path) as fh:
             lines = [l for l in fh.read().splitlines() if l.strip()]
-        return json.loads(lines[-1]) if lines else None
+        row = json.loads(lines[-1]) if lines else None
+        return row if isinstance(row, dict) else None
     except Exception:
         return None
 
 
-class ArtifactEncodingError(Exception):
+class ArtifactError(Exception):
+    """The artifact file cannot be read as the line-oriented JSON it must be.
+
+    Raised instead of a bare traceback so `main` can exit 2 ("the artifact itself
+    is unusable") with a message that names the artifact. Both subclasses below
+    are faults in the file, not in this reader.
+    """
+
+
+class ArtifactEncodingError(ArtifactError):
     """The artifact file is not decodable as UTF-8.
 
     The writer is byte-preserving on purpose (see rss_soak_json_str in
@@ -123,6 +147,31 @@ class ArtifactEncodingError(Exception):
     """
 
 
+class ArtifactLineTypeError(ArtifactError):
+    """A line is valid JSON but not a JSON object.
+
+    `read_rows` yields rows that `main` reads with `.get`, so a line holding
+    `null`, a number, a string or an array used to die as an AttributeError
+    traceback with rc 1 — the one outcome this reader must never produce, because
+    an unusable artifact has to be visibly unusable (rc 2) and not a crash.
+    """
+
+
+def json_type_name(value):
+    """The word a reader expects for a JSON value's type, not Python's."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    return "object"
+
+
 def read_rows(path):
     """Parsed JSON lines, skipping lines that are valid UTF-8 but not JSON.
 
@@ -130,6 +179,10 @@ def read_rows(path):
     ArtifactEncodingError naming the artifact and the byte offset, because the
     bytes that cannot be decoded are exactly the string values (run_dir, binary
     paths, host name) whose silent loss this reader must not accept.
+
+    A line that IS valid JSON but not an object is not skipped either: it raises
+    ArtifactLineTypeError naming the artifact and the 1-based line number, since
+    a file carrying one is corrupt rather than merely noisy.
     """
     rows = []
     with open(path, "rb") as fh:
@@ -146,13 +199,20 @@ def read_rows(path):
     # U+2028/U+2029, which are legal unescaped bytes inside a JSON string here
     # (the writer only escapes 0x01..0x1F), so it would shred a line whose run
     # dir contained one.
-    for line in text.split("\n"):
+    for number, line in enumerate(text.split("\n"), start=1):
         line = line.strip()
         if line:
             try:
-                rows.append(json.loads(line))
+                row = json.loads(line)
             except json.JSONDecodeError:
                 pass
+            else:
+                if not isinstance(row, dict):
+                    raise ArtifactLineTypeError(
+                        f"{path}: line {number} is a JSON {json_type_name(row)}, not an "
+                        "object; the artifact itself is unusable"
+                    )
+                rows.append(row)
     return rows
 
 
@@ -199,6 +259,27 @@ def fmt(value):
     return "-" if value is None else str(value)
 
 
+def append_summary_line(path, summary):
+    """Append the summary as its own line, writing the separator first when the
+    file does not already end with one.
+
+    A soak killed mid-`printf` can leave the artifact's last line unterminated.
+    Appending straight onto it glues the verdict to the truncated line, so the
+    line stops being JSON: the summary that says "aborted" is then invisible to
+    the next read, whose monotonic rule ("an artifact that already carries an
+    aborted summary stays aborted") can no longer see it, and that read prints
+    "run completed" over a real abort. One byte restores the line structure.
+    """
+    line = (json.dumps(summary, sort_keys=True) + "\n").encode("utf-8")
+    with open(path, "a+b") as fh:
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() > 0:
+            fh.seek(-1, os.SEEK_END)
+            if fh.read(1) != b"\n":
+                fh.write(b"\n")
+        fh.write(line)
+
+
 def main(argv):
     path, aborted = argv[1], argv[2]
     traffic_paths = {
@@ -210,7 +291,7 @@ def main(argv):
 
     try:
         rows = read_rows(path)
-    except ArtifactEncodingError as exc:
+    except ArtifactError as exc:
         print(f"error: cannot read artifact {exc}", file=sys.stderr)
         return 2
     except OSError as exc:
@@ -370,10 +451,14 @@ def main(argv):
     # ceiling above, the artifact's OWN recorded tolerance wins over the ambient
     # environment: the allowed spread a run was produced under is part of its
     # evidence, and a re-read under a different SOAK_TRAFFIC_TOLERANCE must not
-    # flip its verdict. Env, then the default, is only the fallback for an
-    # artifact that records none. A recorded tolerance that is present but
-    # unusable is itself an abort rather than a fall-through to the environment —
-    # otherwise such an artifact's verdict would again depend on who reads it.
+    # flip its verdict. What counts is that the KEY IS PRESENT, not that its value
+    # is truthy: a recorded tolerance must be usable (a finite number in (0, 1],
+    # the same contract the writer enforces), and `null`, `true`, a string, 0 or a
+    # 400-digit integer is present-but-unusable and aborts — never a fall-through
+    # to the ambient environment, which would make the verdict a property of the
+    # reader again. Only an artifact that records NO key falls back to the
+    # environment, then to the default.
+    records_tolerance = "traffic_tolerance" in meta
     recorded_tolerance = meta.get("traffic_tolerance")
     # float() rather than the value itself so an integer too large for a float
     # (a 400-digit JSON integer) is "unusable", not an OverflowError traceback.
@@ -383,29 +468,35 @@ def main(argv):
             recorded_value = float(recorded_tolerance)
         except OverflowError:
             recorded_value = None
-    if recorded_value is not None and math.isfinite(recorded_value) and recorded_value > 0:
+    if recorded_value is not None and math.isfinite(recorded_value) and 0 < recorded_value <= 1:
         tolerance = recorded_value
         tolerance_source = "artifact meta"
+    elif records_tolerance:
+        problems.append(
+            f"the artifact records an unusable traffic tolerance "
+            f"({recorded_tolerance!r}); a usable one is a finite number in (0, 1], "
+            "so the achieved-load reconciliation cannot be trusted"
+        )
+        # Display/recording fallback only, and deliberately NOT the environment:
+        # the run has already aborted, and consulting the ambient variable here
+        # would let the reader's environment change which artifact reads aborted
+        # and why.
+        tolerance = DEFAULT_TRAFFIC_TOLERANCE
+        tolerance_source = "artifact meta, unusable"
     else:
-        if recorded_tolerance is not None:
-            problems.append(
-                f"the artifact records an unusable traffic tolerance "
-                f"({recorded_tolerance!r}); the achieved-load reconciliation "
-                "cannot be trusted"
-            )
         env_tolerance = os.environ.get("SOAK_TRAFFIC_TOLERANCE")
         tolerance_raw = env_tolerance or str(DEFAULT_TRAFFIC_TOLERANCE)
         tolerance_source = "environment" if env_tolerance else "default"
         tolerance = None
         try:
             parsed = float(tolerance_raw)
-            if math.isfinite(parsed) and parsed > 0:
+            if math.isfinite(parsed) and 0 < parsed <= 1:
                 tolerance = parsed
         except ValueError:
             pass
         if tolerance is None:
             problems.append(
-                f"SOAK_TRAFFIC_TOLERANCE is not a finite positive number ({tolerance_raw!r}); "
+                f"SOAK_TRAFFIC_TOLERANCE is not a finite number in (0, 1] ({tolerance_raw!r}); "
                 "the achieved-load reconciliation cannot be trusted"
             )
             tolerance = DEFAULT_TRAFFIC_TOLERANCE  # display/recording fallback only; the run has aborted
@@ -447,8 +538,7 @@ def main(argv):
         "rss_kb": data,
         "trend": {key: trend(samples, key) for key, _ in COLUMNS},
     }
-    with open(path, "a") as fh:
-        fh.write(json.dumps(summary, sort_keys=True) + "\n")
+    append_summary_line(path, summary)
 
     print("=== RSS soak summary (KB) ===")
     print(f"{'process':<12} {'first':>8} {'last':>8} {'min':>8} {'max':>8} {'mean':>9} {'1st-h mean':>11} {'last-h mean':>12}")

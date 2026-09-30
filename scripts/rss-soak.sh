@@ -89,7 +89,9 @@
 #                         summary prefers that recorded value over the ambient
 #                         variable, so re-reading the same artifact cannot flip
 #                         its verdict; this variable is only the fallback for an
-#                         artifact that records none.
+#                         artifact with no `traffic_tolerance` key at all (a
+#                         recorded `null` counts as recorded, and aborts the
+#                         re-read instead of being read as this variable).
 #   SOAK_RSS_CEILING_KB   largest RSS reading accepted as real (default
 #                         1048576 = 1 GiB). A value outside 1..ceiling, or a
 #                         non-integer, is recorded as `null` (a missing reading)

@@ -84,9 +84,10 @@ The faults are:
   the same file — one implementation run on both sides is not a comparison (the
   soak refuses this before the window opens too);
 - the two sides' achieved volume differing by more than the tolerance the
-  artifact records (`traffic_tolerance`; `SOAK_TRAFFIC_TOLERANCE`, then `0.10`,
-  when it records none) — both are handed the same paced recipe, so a large gap
-  means the comparison is not head-to-head. The value must be a finite number in
+  artifact records (`traffic_tolerance` — only an artifact with no such key at
+  all falls back to `SOAK_TRAFFIC_TOLERANCE`, then `0.10`; see "The recorded
+  bounds" below) — both are handed the same paced recipe, so a large gap
+  means the comparison is not head-to-head. A tolerance must be a finite number in
   `(0, 1]` **written as a JSON number**, so `nan` (which compares false against
   everything and used to disable the check while the run still reported
   `"aborted": null`) and `.5`/`+0.5`/`01` (which awk accepts but JSON does not —
@@ -96,8 +97,15 @@ A missing reading prints `-`, never a fabricated `0`, and a column with no
 readings at all prints `NO READINGS`. `scripts/tests/rss-soak-run-dir.sh` (run
 by the `health` CI job, no network or built binary needed) drives the real
 run-dir helpers and the real summary reader over these cases, including the
-stubbed-`ps` shapes above; it enforces a floor on its own check count so that
-deleting a case cannot silently pass.
+stubbed-`ps` shapes above. It pins two things about its own shape: a floor on its
+total check count (`MIN_CHECKS`, `scripts/tests/rss-soak-run-dir.sh:57`) and, per
+scenario, a completion marker (`require_marker()`, `:77`). Neither bounds the
+suite's shape: deleting four real checks and padding with four dummy `ok` lines
+still clears the floor and still ends with `RESULT: 186 fixture check(s) hold`,
+and deleting a case that shares a marker with its neighbours loses no marker.
+What the pair does rule out is the cheaper neutering — dropping a case wholesale
+(or returning early past one), which fails the floor and, for a marked scenario,
+the marker check.
 
 Two env knobs tune the refusals above, and both are documented by
 `bash scripts/rss-soak.sh --help` along with the rest. Both are recorded in the
@@ -107,7 +115,8 @@ recorded bounds" below):
 
 - `SOAK_TRAFFIC_TOLERANCE` (default `0.10`) — relative achieved-volume spread
   allowed between the two sides. Recorded as `traffic_tolerance`; must be a
-  finite number in `(0, 1]` written as a JSON number.
+  finite number in `(0, 1]` written as a JSON number. It is read only for an
+  artifact whose `meta` has no `traffic_tolerance` key at all.
 - `SOAK_RSS_CEILING_KB` (default `1048576`, 1 GiB) — largest RSS reading accepted
   as real; a reading outside the bound is a missing reading, and the bound a run
   used is recorded in its artifact as `rss_ceiling_kb`, so the reader judges the
@@ -128,12 +137,23 @@ tolerance was read only from the environment, so two **byte-identical** files
 read `"aborted": null` under `SOAK_TRAFFIC_TOLERANCE=0.6` and
 `rc 3, "achieved churn round trips differs by 50.0%"` under the default; the
 ceiling was fixed the same way in an earlier round (`rc 3, "implausible RSS
-reading(s) ignored"`). The environment (and then the compiled-in default) is
-only the fallback for a value the artifact does not record — an older or
-hand-written series. A
-recorded tolerance that is present but unusable is itself an abort, never a
-fall-through to the environment, so such an artifact cannot be environment-flipped
-either. (The ceiling keeps the older fall-through for a present-but-unusable
+reading(s) ignored"`).
+
+The environment (and then the compiled-in default) is only the fallback for a
+value the artifact does not record — an older or hand-written series. What
+decides that is the **presence of the key**, not the truthiness of its value:
+`{"traffic_tolerance": null}` is a recorded value, and since `null` is not usable
+it aborts the run rather than falling through to the environment. Round 5 treated
+a recorded `null` as "recorded nothing", so a 5% spread in two byte-identical
+artifacts read `rc 0` with the environment unset and `rc 3` under
+`SOAK_TRAFFIC_TOLERANCE=0.01`. A recorded tolerance must be a finite number in
+`(0, 1]`, the same contract the writer enforces: `null`, `true`, a string, `0`,
+or a value above `1` — a recorded `100` used to accept a 90% spread as
+`run completed` — all abort, so such an artifact cannot be environment-flipped
+either. The summary prints which source was used
+(`traffic tolerance: 0.6 (from artifact meta)`), and for a present-but-unusable
+value it says so (`from artifact meta, unusable`) instead of naming the
+environment. (The ceiling keeps the older fall-through for a present-but-unusable
 value; the writer always records a usable one, so that path needs a hand-edited
 artifact.)
 
@@ -208,8 +228,10 @@ bash scripts/latency-baseline.sh
 bash scripts/memory-baseline.sh
 # duration_s interval_s — a real soak wants hours; the short form just validates
 bash scripts/rss-soak.sh 10800 45
-# a throwaway validation run: its own artifact, run dir, lock and ports, so a
-# live soak is neither disturbed nor clobbered
+# a throwaway validation run: its own artifact, run dir, lock and ports, so it
+# cannot clobber a live soak's artifact or steal its ports — but it does NOT
+# leave the live soak undisturbed: it runs its own cargo build and traffic on the
+# same host, and host load moves both series (see the "Does not" note above)
 SOAK_OUT=/tmp/rss-soak-validation.jsonl SOAK_RUN_DIR=/tmp/rss-soak-validation \
   SOAK_LOCK=/tmp/rss-soak-validation.lock \
   SOAK_RS_CONTROL=18300 SOAK_RS_REMOTE=18301 SOAK_RS_ECHO=18302 \
