@@ -3153,7 +3153,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `frpc -c <that config>` returns 1 both before and after this change, but for the *wrong*
     reason: the config is accepted and the process then fails to connect (a runtime exit),
     not a config refusal. The exit code agrees with Go by coincidence on that one row.
-- [ ] **`frps --config-dir` never installs the SIGUSR1 handler, so `kill -USR1` kills the server.**
+- [x] **`frps --config-dir` never installs the SIGUSR1 handler, so `kill -USR1` kills the server.**
   `frps/src/main.rs:180-248` is the `--config-dir` branch: it spawns one service task per file at
   `:221`, awaits the finished tasks at `:243-247`, and `return`s at `:248` — before the
   single-config path constructs the service at `:312-323` and installs the reload handler at
@@ -3172,7 +3172,26 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   the divergence and pins it with a test), and a test drives a real `--config-dir` process, sends
   SIGUSR1, and asserts the process stays alive and emits the reload summary.
 
-- [ ] **`frps --config-dir` exits 0 when every config file fails service initialisation.**
+  Done: fixed in #419 (`eee8f588`). `--config-dir` now installs the same SIGUSR1 handler the
+  single-config path does (`frps/src/main.rs:307-355`): one task holds a registry of the live
+  `(Arc<Service>, path)` pairs, copies it out under the lock (so the reload cannot block
+  registration), and reloads every registered service on each signal, logging one
+  `SIGUSR1: <summary>` per service with a `path=<abs>` field naming its file. Measured on a real
+  `--config-dir` process at this head: one config (`bind_port = 47233`) logs `SIGUSR1 reload ready
+  (pid=…)` (`frps/src/main.rs:321`) before binding, `kill -USR1` logs `SIGUSR1: config reloaded: no
+  changes detected`, the process stays alive and `SIGTERM` is rc 0 — the base binary died
+  `unix_wait_status(158)` (128 + 30) with no reload record. Pinned by
+  `a_config_dir_sigusr1_reloads_every_service` (`frps/tests/warn_delivery.rs:636`) and
+  `a_config_dir_process_survives_sigusr1_and_reloads` (`:606`); the fan-out pin's count-based wait
+  (`sigusr1_and_wait_for_reloads`, `frps/tests/warn_delivery.rs:246`, 20 s deadline) fails loudly on
+  a stalled fan-out — the mutation `svcs.iter().take(1)` (`frps/src/main.rs:330`) reds it rc 101
+  `left: 1 right: 2` at `frps/tests/warn_delivery.rs:650`. Adversarial review measured the dangerous
+  direction: one run-failure + one healthy file keeps the healthy listener accepting, SIGUSR1 emits
+  exactly one summary (the dead entry is dropped from the registry, the live one kept), no deadlock;
+  `SIGINT`/`SIGTERM` rc 0; 48 repeat runs green (20 + 20 exact-filter, 8 whole-file), measured by
+  Reviewer 1 in its round 1 — not by the adversarial round, which measured the dangerous direction
+  above and the mutant matrix instead.
+- [x] **`frps --config-dir` exits 0 when every config file fails service initialisation.**
   Same `--config-dir` branch as the item above, and the same reason it is worth recording next to
   it. `frps/src/main.rs:221` pushes the `tokio::spawn` handle *before* the service is
   constructed, so `handles` is non-empty even when every config fails inside the task
@@ -3200,6 +3219,24 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   Done-when: `frps --config-dir` with every file failing service initialisation exits non-zero
   (the same typed exit-code lane as `-c`), and a test runs a real `--config-dir` process over an
   all-failing directory and asserts the non-zero rc.
+  Done: fixed in #419 (`b6b5884a`, `89bc4a4d`). Each spawned task now reports its outcome:
+  `Ok(Err(code))` carries the typed construction code (`e.kind().exit_code()`) or `EXIT_RUNTIME`
+  when `run()` failed, `Ok(())` only on `Service::run`'s single graceful-shutdown return
+  (`frp-server/src/service.rs:2276`). The lane collects them and, when **every** spawned task
+  reported `Err` (`frps/src/main.rs:387-390`), exits with the **first spawned** failure's code
+  instead of 0; the `run()`-error arm also drops the dead service from the registry first
+  (`frps/src/main.rs:275-295`) so a later SIGUSR1 cannot report a reload for a listener that is gone.
+  Measured at this head (one fresh free port per row): one config whose `bindPort` is already held →
+  `-c` rc **1** and `--config-dir` rc **1** (base: dir rc 0 with zero listeners); all-init-fail (no
+  token) → `-c` 3, dir 3; mixed init-fail + run-fail → rc 3, nothing listening; one failure + one
+  healthy file → the healthy listener still accepts, `SIGTERM` rc 0. Pinned by
+  `config_dir_where_every_service_fails_to_run_exits_like_dash_c` (`frps/tests/cli_exit_codes.rs:633`)
+  and `config_dir_where_every_service_fails_init_exits_like_dash_c` (`:581`); deleting the
+  `task_failures.len() == spawned` guard (`frps/src/main.rs:387`) reds both (`Some(0)` vs `Some(1)` at
+  `:654`; `Some(0)` vs `Some(3)` at `:601`), and a `FRPS_BIN`-retargeted run fails the run pin with
+  `left: Some(0) right: Some(1)`. The comment at `frps/src/main.rs:368-370` states "first **spawned**
+  failure" exactly and records the pre-existing load-lane divergence (empty-config-file set, or every
+  file failing to **load**, is refused earlier at `handles.is_empty()` with `EXIT_CONFIG`/2).
 - [x] **The space-separated `--strict-config false` form is an frp-rs extension presented as Go
   pflag semantics, and it parses differently from Go.** Measured on Go v0.71.0 and frp-rs
   (`frp-core/src/cli.rs`), with the same unknown-key config:
@@ -7185,3 +7222,125 @@ section; ledger now **24 open / 104 closed**.**
   the fixture's comment documents), but a seed that falls back to the argument only when the cwd file
   does not set the key stays 4/4 green. **Done-when:** a fixture with the cwd file keyed and the `-c` file
   key-less pins the precedence, or the item records that precedence is deliberately not pinned.
+
+- [ ] **A `SIGUSR1` sent to `frps --config-dir` in the pre-registration window silently reloads only the registered subset.**
+  Filed by the #419 adversarial review. The handler task logs `SIGUSR1 reload ready (pid=…)` as soon
+  as the handler is installed (`frps/src/main.rs:321`), but the registry is filled later, once each
+  task has constructed its service (`frps/src/main.rs:258-262`); the observed order is startup line
+  → ready → bind. A signal landing between the marker and a registration therefore reloads only the
+  services registered so far, and nothing indicates that any were missed. Measured (adversarial
+  review, own probe tree): 12 config files → 10/12 summaries once in 4 runs at delay 0; 40 files →
+  39/40 twice in 4; clean at 0.3 s. Strictly better than the pre-fix death, but silent — a partial
+  reload reads exactly like a complete one. The two-file fan-out pin is structurally exposed too:
+  its only population guard is a fixed 600 ms settle after the startup marker, measured 8/8 stable
+  (and 48 green runs overall).
+
+  Done-when: the ready marker is gated on registration completing, or the reload logs `reloaded N of
+  M`, with a test that sends the signal immediately after the marker and asserts the count.
+
+- [ ] **A panicking `frps --config-dir` service task is logged but not counted, so a directory where every task panics would still exit 0.**
+  Found independently by both reviewers of #419. The aggregation pushes only `Ok(Err(code))` into
+  `task_failures` (`frps/src/main.rs:383`); a `JoinError` is logged at `frps/src/main.rs:384`
+  ("frps service task panicked") and dropped, so `task_failures.len() == spawned` can never hold when
+  the failures are panics and the process falls through to exit 0. Not reachable from a config file
+  in either reviewer's probes (the reachable failures are typed `Err` returns) and pre-existing
+  log-and-keep-serving behaviour — but it is the same class as the item #419 fixed.
+
+  Done-when: a panicking task contributes to the all-failed decision, or the panic arm is documented
+  as deliberately non-fatal, with a test that makes one task panic.
+
+- [ ] **`frps --config-dir`'s load-failure exit code still diverges from `-c`'s.**
+  The rework in #419 covers *spawned* tasks only: a file whose **load** fails never becomes a task,
+  so it cannot reach the all-failed decision. Measured at `d9f8e63c`: a directory where every file
+  fails to load exits **2** (`handles.is_empty()` → `EXIT_CONFIG`, `frps/src/main.rs:301-304`) where
+  `-c` on the same file exits **1**; a directory mixing `a.toml` (unknown key → load failure) with
+  `b.toml` (no token → construction failure) exits **3** — `b.toml`'s code — where `-c a.toml` is 1.
+  Pre-existing on this lane and recorded in the code comment at `frps/src/main.rs:370-377`.
+
+  Done-when: a load-failing file is tracked in the same all-failed decision so the lane matches
+  `-c`'s code, or the divergence is documented as deliberate with the measured table, and pinned.
+
+- [ ] **The `frps --config-dir` SIGUSR1 fan-out has no record of being untested off unix.**
+  Filed by the #419 round-2 review. The handler lives behind `#[cfg(unix)]` (SIGUSR1 is a unix
+  signal), gated in `frps/src/main.rs` (`:218`, `:220`, `:238`, `:257`, `:278`, `:314`, `:393`),
+  so on a non-unix build the reload path does not exist — and the two fan-out pins
+  (`frps/tests/warn_delivery.rs:606`, `:636`) carry **no** gating of their own (`grep -c 'cfg('`
+  over that file is 0) while both wait on `SIGNAL_READY_MARKER` (`:92`, used at `:227`/`:247`) and
+  shell out to `Command::new("kill")` (`:229`/`:250`): off unix they still compile and would
+  **fail**, rather than being skipped — which is defensible, but no record states it, so a non-unix
+  build's coverage of the lane is invisible.
+
+  Done-when: the unix-only nature is either recorded where the lane is documented and in the test
+  file's own gating, or a non-unix no-op arm is pinned, so the omission is deliberate and visible.
+
+- [ ] **The mixed init-fail + run-fail `--config-dir` exit code is a probe value, not a pinned one.**
+  Filed by the #419 round-2 review. The `TODO.md:3231` Done block records "mixed init-fail + run-fail
+  → rc 3, nothing listening", but the pinned tests (`frps/tests/cli_exit_codes.rs:581` all-init-fail,
+  `:633` all-run-fail) only assert a non-zero rc with no `listener started` record; the exact `3` for
+  the mixed shape comes from a one-off probe.
+
+  Done-when: a pin asserts the exact code for the mixed shape (or the record says explicitly that only
+  non-zero is contractual for it).
+
+- [ ] **The `frps --config-dir` code comments cite probe scripts that are not in the repo.**
+  Filed by the #419 adversarial round-2 review. Three comments in `frps/src/main.rs` justify their
+  measured numbers by pointing at scratch probes under `/tmp` — `:214`
+  (`/tmp/frps-cfgdir-probe/probe-early.py`, the 8/8 `unix_wait_status(158)` window), `:271`
+  (`/tmp/frps-cfgdir-probe/probe-bind.py`, the held-port `-c` 1 / `--config-dir` 0 row) and `:372`
+  (`/tmp/frps-cfgdir-probe/probe-shapes.py`, the mixed load+construction code table) — so a reader of
+  the tree cannot reproduce the figures behind them and the files vanish with the temp directory.
+
+  Done-when: the numbers the comments lean on are either pinned by a test (preferred) or reproduced
+  by a command/recipe the comment itself spells out, and no shipped comment points at `/tmp`.
+
+- [ ] **`registry.lock().unwrap()` in the `frps --config-dir` reload path has no poisoned-mutex test.**
+  Filed by the #419 adversarial review as a residual. The registry is a
+  `Arc<Mutex<Vec<(Arc<Service>, String)>>>` (`frps/src/main.rs:218-219`) locked with `.unwrap()` at
+  `frps/src/main.rs:259`, `:280` and `:329`; a panic while one of those locks is held would poison
+  it and turn every later registration or reload into a panic. No test exercises a poisoned lock.
+
+  Done-when: either the lock is handled without `unwrap()` (a poisoned lock logged and skipped), or a
+  test pins the panic-on-poison behaviour as intended.
+
+- [ ] **`frps --config-dir` freezes its config-file set at startup: a file added later is never loaded, a construction-failed file is never retried, and a removed file keeps serving.**
+  Measured by the #419 verification review and re-measured by its adversarial review. The directory
+  is read once (`collect_config_files`, `frps/src/main.rs:190`), one task per file is spawned, and the
+  registry only ever shrinks (the `run()`-error arm removes the dead entry,
+  `frps/src/main.rs:275-295`); nothing rescans the directory or retries a failed construction.
+  Measured: a file deleted after startup leaves the process alive and logs
+  `SIGUSR1 reload: Failed to reload config: <path>: failed to read config file: No such file or
+  directory (os error 2)`; a file created after startup is never picked up, and a config whose
+  service failed to construct is never retried on a later signal.
+
+  Done-when: either the lane documents and pins "the file set is fixed at startup; reload only
+  re-reads those files", or it rescans the directory on each `SIGUSR1` and retries failed
+  constructions.
+
+- [ ] **`frpc --config-dir` still exits 0 when its service cannot run, so the client and server lanes now disagree.**
+  `docs/developing.md:1013` records `frpc --config-dir <good>, service cannot run` as rc **0** — the
+  same shape #419 fixed on the `frps` side (where the code comment at `frps/src/main.rs:183-188`
+  notes the divergence from Go's *client* directory mode, which exits 0 for a missing or invalid
+  directory). With the `frps` lane now exiting 1
+  (`config_dir_where_every_service_fails_to_run_exits_like_dash_c`,
+  `frps/tests/cli_exit_codes.rs:633`), the two `--config-dir` lanes answer differently for the same
+  failure, and the client is the one reporting success while nothing is served.
+
+  Done-when: `frpc --config-dir` carries its service failure out of the lane the way `frps` now does,
+  or `docs/developing.md` records the asymmetry as deliberate with a measurement of both lanes, and
+  a test pins the client's rc.
+
+- [x] **`docs/developing.md:1471`'s `--config-dir`/`bindAddr = ""` row is a superseded stage record.**
+  The row's frp-rs column still reads "**rc 0 with nothing bound**" for `--config-dir` with
+  `bindAddr = ""`, with `-c` exiting 1 on a lookup error and "the defect is that exit code".
+  Measured at `971e0fa0`: `bind_addr = ""` is completed to `0.0.0.0` on both paths —
+  `frps --config-dir <dir>` with that file logs `listener started on 0.0.0.0:19961` and keeps
+  running; `SIGTERM` rc 0 once the shutdown handler is installed (`frp-server/src/service.rs:1858`; a signal in the startup window dies with rc 143 on both lanes), and `frps -c <file>` binds `0.0.0.0:19955`. `CHANGELOG.md`'s
+  bind-address round already records the fill that made the row stale; only the qualifier is missing.
+
+  Done-when: the row carries a superseded note (or its "now" column is re-measured), so it cannot be
+  read as today's behaviour.
+  Done: fixed in #419 (`e050b1df`, wording corrected in `52a40a36`). The row now carries the
+  superseded note with the measured fill (`frps --config-dir` with that file logs `listener started on
+  0.0.0.0:19961` and keeps running) and the corrected shutdown figure — `SIGTERM` rc 0 once the
+  handler is installed (`frp-server/src/service.rs:1858`; a signal landing in the startup window dies
+  with rc 143 on **both** lanes), per the adversarial round-2 measurement.

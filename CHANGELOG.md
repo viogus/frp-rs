@@ -12,6 +12,14 @@ User-facing release notes for frp-rs.
 ## Unreleased
 
 ### Features
+- **`frps --config-dir` now honours `SIGUSR1`, like `frps -c` does.** The directory lane returned
+  before installing the reload handler, so the signal kept its default disposition and **killed the
+  server** (`unix_wait_status(158)`, 128 + 30) where the single-config lane reloads in place. It now
+  installs the same handler: one task holds the live services and every `SIGUSR1` reloads every
+  registered service from its own config file, one `SIGUSR1: <summary>` record per service with a `path=` field
+  naming the file it came from. `SIGTERM`/`SIGINT` still shut the lane down cleanly (rc 0). This is
+  an frp-rs extension flag — Go's `frps` rejects `--config-dir` outright — so the comparison is
+  against frp-rs's own `-c` lane.
 - **`frps verify` now exists**, so a script that validates a server config can
   use frp-rs at all. Go has had the subcommand all along; frp-rs's server CLI
   registered only the run path, so `frps verify -c frps.toml` on a **valid**
@@ -403,6 +411,14 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **`frps --config-dir` no longer exits 0 when no service started.** The directory lane pushed each
+  task handle before its service was constructed, so the "no services started" guard never fired:
+  with **every** config file failing, the process reported success while nothing was served — a
+  supervisor saw exit 0 and no listener. Each spawned task now reports its typed exit code (the
+  construction code, or `EXIT_RUNTIME` when `run()` failed), and when every spawned task failed the
+  process exits with the first **spawned** failure's code — the same value `frps -c` exits on for that file. A
+  directory that still has one running (or gracefully shut down) service keeps the previous
+  log-and-keep-serving behaviour.
 - **The `web_server.tls.enable` warning is now build-aware: in a build with no
   dashboard it no longer claims the dashboard serves plaintext HTTP.** The key is
   read behind `frp-server`'s `dashboard` feature (and `frpc`'s `admin`), but the

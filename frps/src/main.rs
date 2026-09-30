@@ -205,6 +205,20 @@ async fn run(mut cli: FrpsArgs) {
             files.len()
         );
         let mut handles = Vec::new();
+        // Each task publishes its `Arc<Service>` **and its path** here once
+        // construction succeeds, so the SIGUSR1 handler below reloads the *same*
+        // objects the runners are using and can name the file each summary came
+        // from. A task still constructing has nothing to reload yet — and a
+        // signal sent into that window is not a new hazard: with SIGUSR1
+        // delivered immediately after spawn (probe
+        // `/tmp/frps-cfgdir-probe/probe-early.py`, 8 trials per lane) the process
+        // died on **both** lanes with `unix_wait_status(158)` (128+30, "User
+        // defined signal 1: 30") — 8/8 on `--config-dir` and 8/8 on `-c` —
+        // because each lane installs its handler only once the service exists.
+        #[cfg(unix)]
+        type DirRegistry = std::sync::Arc<std::sync::Mutex<Vec<(std::sync::Arc<Service>, String)>>>;
+        #[cfg(unix)]
+        let registry: DirRegistry = Default::default();
         for path in &files {
             let path_str = path.display().to_string();
             // Go frp v0.70.1 parity: with --config-dir each file is
@@ -221,17 +235,62 @@ async fn run(mut cli: FrpsArgs) {
                     // one-record-per-load rule.
                     presence.warn_inert_server_tls_enable();
                     let uf = unsafe_features.clone();
+                    #[cfg(unix)]
+                    let registry = registry.clone();
                     handles.push(tokio::spawn(async move {
                         let service = match Service::with_unsafe_features(cfg, Some(path_str.clone()), uf).await {
-                            Ok(s) => s,
+                            Ok(s) => std::sync::Arc::new(s),
                             Err(e) => {
+                                // Carry the **typed** code out of the task: the
+                                // single-config path below exits on this same
+                                // value, and a directory that started no service
+                                // must not report success (measured at b8e1dd6d
+                                // with one valid-but-rejected file: `-c` exited 3
+                                // and `--config-dir` exited 0).
+                                let code = e.kind().exit_code();
                                 tracing::error!(path = %path_str, error = %e, "frps service init failed for [{}]: {}", path_str, e);
-                                return;
+                                return Err(code);
                             }
                         };
+                        // Registered before `run()`, so the soonest possible
+                        // SIGUSR1 already finds this service.
+                        #[cfg(unix)]
+                        registry
+                            .lock()
+                            .unwrap()
+                            .push((service.clone(), path_str.clone()));
                         if let Err(e) = service.run().await {
+                            // `Service::run` has exactly one `Ok(())` return —
+                            // its graceful-shutdown tail
+                            // (`frp-server/src/service.rs:2276`) — so this arm
+                            // means the service stopped for good. The
+                            // single-config path maps any `run()` error to
+                            // `EXIT_RUNTIME` (`frps/src/main.rs:540-542`), and
+                            // this lane must carry the same code out: measured
+                            // with one config whose `bindPort` is already held
+                            // (probe `/tmp/frps-cfgdir-probe/probe-bind.py`),
+                            // `-c` exited 1 while `--config-dir` exited **0**
+                            // with zero listeners.
                             tracing::error!(path = %path_str, error = %e, "frps service error for config file [{}]: {}", path_str, e);
+                            // Drop it from the registry first: its listeners
+                            // are gone, so a later SIGUSR1 must not report a
+                            // reload for a service that is no longer running.
+                            #[cfg(unix)]
+                            {
+                                let mut live = registry.lock().unwrap();
+                                if let Some(pos) = live
+                                    .iter()
+                                    .position(|(svc, _)| std::sync::Arc::ptr_eq(svc, &service))
+                                {
+                                    live.remove(pos);
+                                }
+                            }
+                            return Err(frp_core::EXIT_RUNTIME);
                         }
+                        // `Ok(())` = this task ran a service to a graceful
+                        // shutdown; `Err(code)` = it never started, or its
+                        // `run()` failed above.
+                        Ok(())
                     }));
                 }
                 Err(e) => {
@@ -243,11 +302,96 @@ async fn run(mut cli: FrpsArgs) {
             tracing::error!("No services started — all config files failed to load");
             process::exit(frp_core::EXIT_CONFIG);
         }
+
+        // SIGUSR1 reload handler (Unix only) — kill -USR1 <pid>, the same
+        // handler the single-config path installs below. One signal reloads
+        // every service built from the directory, each from its **own** config
+        // file (`Service::config_file` is that file's path), and each logs its
+        // own summary. Without this task the flag kept its default disposition
+        // and killed the process: measured on the base binary, `frps
+        // --config-dir <dir>` + `kill -USR1` exited `unix_wait_status(158)`
+        // (128+30, "User defined signal 1: 30") with no reload record.
+        #[cfg(unix)]
+        let reload_handle = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                {
+                    Ok(mut sig) => {
+                        tracing::info!(pid = %std::process::id(), "SIGUSR1 reload ready (pid={})", std::process::id());
+                        loop {
+                            sig.recv().await;
+                            // Copy the handles out and release the lock: the
+                            // reload awaits, and holding a std mutex across an
+                            // await would block registration (and duplicate the
+                            // service list).
+                            let svcs: Vec<(std::sync::Arc<Service>, String)> =
+                                { registry.lock().unwrap().clone() };
+                            for (svc, path) in &svcs {
+                                // The `path` field attributes each summary when
+                                // several services reload from one signal; the
+                                // **message** stays byte-identical to the
+                                // single-config lane's (`SIGUSR1: <summary>`),
+                                // which the existing pins match on.
+                                match svc.reload().await {
+                                    Ok(summary) => tracing::info!(
+                                        path = %path,
+                                        summary = %summary,
+                                        "SIGUSR1: {}",
+                                        summary
+                                    ),
+                                    Err(e) => tracing::error!(
+                                        path = %path,
+                                        error = %e,
+                                        "SIGUSR1 reload: {}",
+                                        e
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "SIGUSR1 unavailable: {}", e),
+                }
+            })
+        };
+
+        // A task reports `Err(code)` when its service never started — the typed
+        // code out of construction, or `EXIT_RUNTIME` when `run()` failed — and
+        // `Ok(())` only when the service ran to a graceful shutdown, the sole
+        // `Ok` return in `Service::run`
+        // (`frp-server/src/service.rs:2276`). If **every** spawned task reports
+        // `Err`, nothing stayed up and the process exits with the first spawned
+        // failure's code rather than 0 — the same value `-c` exits on for that
+        // file. A mix (at least one service ran and shut down gracefully) keeps
+        // the historical log-and-keep-serving behaviour.
+        //
+        // "First **spawned** failure" is exact: a file whose *load* failed never
+        // becomes a task, so its refusal is not in this list — and if every file
+        // fails to load, the run is refused earlier at `handles.is_empty()` with
+        // `EXIT_CONFIG`/2. Measured (probe
+        // `/tmp/frps-cfgdir-probe/probe-shapes.py`): a directory of `a.toml`
+        // (unknown key) + `b.toml` (no token) exits **3** (the token file's
+        // code), while `-c a.toml` is 1 and `-c b.toml` is 3; an
+        // all-files-fail-to-**load** directory is 2 where `-c` on that same file
+        // is 1 — the load-lane divergence, pre-existing on this lane and
+        // recorded separately.
+        let spawned = handles.len();
+        let mut task_failures: Vec<i32> = Vec::new();
         for handle in handles {
-            if let Err(e) = handle.await {
-                tracing::error!(error = %e, "frps service task panicked: {}", e);
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(code)) => task_failures.push(code),
+                Err(e) => tracing::error!(error = %e, "frps service task panicked: {}", e),
             }
         }
+        if task_failures.len() == spawned {
+            if let Some(code) = task_failures.first() {
+                process::exit(*code);
+            }
+        }
+
+        #[cfg(unix)]
+        reload_handle.abort();
         return;
     }
 
