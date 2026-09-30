@@ -91,12 +91,18 @@ fails=0
 # A total is not a *shape* though: deleting N assertions and adding N dummy
 # `ok` lines keeps the total and still exits 0 (measured against the count as
 # the only guard — that mutant is in the batch-E record), which is residue (d)
-# of TODO.md:7914. `SHAPE` below pins the ordered list of assertions, so a
-# scenario that stops running, a check that is replaced or reordered, or a
-# dummy added anywhere, all red. A floor of 0 (or an unset floor) disables the
-# guard from inside, which the sibling suite learned the hard way; that is a
-# failure here too.
-MIN_CHECKS=29
+# of TODO.md:7914. `SHAPE` below pins the count, the order and the *label* of
+# every assertion, so a scenario that stops running, a check that is deleted,
+# reordered, or a dummy added anywhere, all red. It compares labels, not bodies:
+# a check whose body is gutted behind an unchanged `ok` label is not a shape
+# failure, and the mutant that replaces scenario 10's `hits=$(grep …)` with
+# `hits=''` exits 0 on `SHAPE` alone. That class is narrowed, not closed —
+# `enforce_substance` below checksums the two scenario-10 assertion blocks (the
+# ones that pin TODO.md:7866's fix), so gutting either of those bodies reds; a
+# body gutted anywhere else still needs a reviewer. A floor of 0 (or an unset
+# floor) disables the guard from inside, which the sibling suite learned the
+# hard way; that is a failure here too.
+MIN_CHECKS=31
 # The ordered assertion anchors, one per `ok`/`bad` call in scenario order.
 # Dynamic parts (pids, elapsed seconds) are matched as substrings, so each entry
 # is the stable prefix/skeleton of the assertion it pins.
@@ -124,9 +130,11 @@ SHAPE=(
   '--help documents FRP_COMPAT_TEST_DIR'
   'symlink invocation: wait_exec returned 1 for the pre-exec fork'
   'wait_exec reports rc 2 when ps prints nothing'
+  'wait_exec reports rc 2 when ps prints nothing for the child'
   'ps failure: unidentifiable synthetic'
+  'ps exit-0-empty: unidentifiable synthetic'
   'compat-test.sh: no pkill/killall/pgrep -f in its code'
-  'compat-test.sh: the XTCP pre-test sweep is reap_scoped_strays'
+  'compat-test.sh: run_xtcp_test sweeps with cleanup_pids and reap_scoped_strays'
   'pre-test sweep: reaped the in-TEST_DIR stray'
   'pre-test sweep: left the baseline server alone'
   'pre-test sweep: left the out-of-tree peer alone'
@@ -194,22 +202,93 @@ enforce_shape() {
   return 0
 }
 
+# enforce_substance — the substance half of the floor, for the two assertions
+# that pin TODO.md:7866's fix. `enforce_shape` compares labels, and a label
+# survives a replaced body (`hits=''` behind the same `ok`), so the exact source
+# text of scenario 10's two assertion blocks is checksummed. The blocks are
+# delimited by the `substance pin:` markers in scenario 10; an edit inside one
+# reds until its constant below is updated, and the failure text prints the
+# value to paste. It adds no `ok`/`bad` call of its own, so it can never move the
+# fixture count — or the ci.yml literal that pins it — by itself.
+SCEN10_DETECTOR_SHA='6ebc52af28f1a8258b29562fd919e88d0b8704a6524e42a1f5b9c41740d851b6'
+SCEN10_EXTRACTOR_SHA='cbb7ca6a8df2d955860c2d4d9c8db5bb5eb485d70eac790df4d37ed6ed23452d'
+scen10_sha_of() {
+  local name=$1 tool
+  if command -v sha256sum >/dev/null 2>&1; then
+    tool='sha256sum'
+  elif command -v shasum >/dev/null 2>&1; then
+    tool='shasum -a 256'
+  else
+    printf 'FAIL  no sha256 tool on PATH (need sha256sum or shasum); cannot check scenario 10 substance\n' >&2
+    return 1
+  fi
+  # shellcheck disable=SC2086  # $tool is the word-split "shasum -a 256"
+  sed -n "/^# --- substance pin: ${name} /,/^# --- end substance pin: ${name} ---/p" "$self" |
+    $tool | awk '{print $1}'
+}
+enforce_substance() {
+  local got
+  got=$(scen10_sha_of detector)
+  if [ "$got" != "$SCEN10_DETECTOR_SHA" ]; then
+    printf 'FAIL  scenario 10 detector assertion changed: sha256 %s, pinned %s\n' \
+      "${got:-<none>}" "$SCEN10_DETECTOR_SHA" >&2
+    printf '      deliberate edit? set SCEN10_DETECTOR_SHA in %s to the value above\n' \
+      "${self:-this script}" >&2
+    return 1
+  fi
+  got=$(scen10_sha_of extractor)
+  if [ "$got" != "$SCEN10_EXTRACTOR_SHA" ]; then
+    printf 'FAIL  scenario 10 extractor assertion changed: sha256 %s, pinned %s\n' \
+      "${got:-<none>}" "$SCEN10_EXTRACTOR_SHA" >&2
+    printf '      deliberate edit? set SCEN10_EXTRACTOR_SHA in %s to the value above\n' \
+      "${self:-this script}" >&2
+    return 1
+  fi
+  return 0
+}
+
 cleanup_all() {
   local rc=$?
   reap_own_synthetic
   [ -z "$WORK" ] || rm -rf "$WORK"
   if [ "$rc" -eq 0 ]; then
-    if [ "${MIN_CHECKS:-0}" -lt 1 ]; then
-      printf 'FAIL  the check floor is disabled (MIN_CHECKS=%s); the suite cannot vouch for itself\n' \
-        "${MIN_CHECKS:-<unset>}" >&2
-      rc=1
-    elif [ "$checks" -lt "$MIN_CHECKS" ]; then
-      printf 'FAIL  suite exited 0 after only %d check(s); expected at least %d — scenarios did not run\n' \
-        "$checks" "$MIN_CHECKS" >&2
-      rc=1
-    elif ! enforce_shape; then
-      rc=1
-    fi
+    # Fail closed: `[ NaN -lt 1 ]` is status 2, and `if`/`elif` read status 2 as
+    # false, so an unparseable floor used to skip every branch below and exit 0.
+    # `enforce_shape` happened to mask that here (a deleted check moves `LABELS`),
+    # but a comparison that cannot parse its operands must never be the guard of
+    # record — validate the digits first, exactly as the sibling suite does.
+    case ${MIN_CHECKS:-} in
+      ''|0)
+        printf 'FAIL  the check floor is disabled (MIN_CHECKS=%s); the suite cannot vouch for itself\n' \
+          "${MIN_CHECKS:-<unset>}" >&2
+        rc=1
+        ;;
+      *[!0-9]*)
+        printf 'FAIL  the check floor is not a number (MIN_CHECKS=%s); the suite cannot vouch for itself\n' \
+          "$MIN_CHECKS" >&2
+        rc=1
+        ;;
+      *)
+        case $checks in
+          ''|*[!0-9]*)
+            printf 'FAIL  the check counter is not a number (%s); the suite cannot vouch for itself\n' \
+              "$checks" >&2
+            rc=1
+            ;;
+          *)
+            if [ "$checks" -lt "$MIN_CHECKS" ]; then
+              printf 'FAIL  suite exited 0 after only %d check(s); expected at least %d — scenarios did not run\n' \
+                "$checks" "$MIN_CHECKS" >&2
+              rc=1
+            elif ! enforce_shape; then
+              rc=1
+            elif ! enforce_substance; then
+              rc=1
+            fi
+            ;;
+        esac
+        ;;
+    esac
   fi
   exit "$rc"
 }
@@ -524,6 +603,33 @@ else
   bad "wait_exec returned $wrc (message pinned: $msg) when ps printed nothing (expected rc 2 — 'cannot tell' must not read as 'synced')"
 fi
 
+# --- scenario 8b: the same read, but for the *child* probe --------------------
+# Reviewer 1's residue. Scenario 8 hands `wait_exec` a `ps` that prints nothing
+# for every pid, so it returns at the `$$` guard and the loop's own empty-`cmd`
+# guard is never the one that fires; deleting that guard stayed green against
+# scenario 8 alone (measured). Here the fake `ps` answers every pid *except* the
+# child with a non-empty argv, so the `$$` guard passes and the loop guard is
+# the only one that can produce the rc 2.
+hdr 'scenario 8b: wait_exec reads empty ps output for the child as "cannot tell"'
+child_victim=$(spawn_fake "$WORK/run8b-victim")
+LIVE="$LIVE $child_victim"
+# The one pid that gets no output is baked in at generation time, so the stub
+# never has to reason about `$$` inside a command substitution. Any other pid —
+# including the `me` probe — gets a non-empty line the child's cannot match.
+fakeps_child_empty="$WORK/fakeps-child-empty"
+printf '#!/bin/sh\nlast=\nfor a in "$@"; do last=$a; done\nif [ "$last" != "%s" ]; then printf "fixture-parent-argv\\n"; fi\nexit 0\n' \
+  "$child_victim" > "$fakeps_child_empty"
+chmod +x "$fakeps_child_empty"
+cout=$(run_with_probe_ps "$fakeps_child_empty" wait_exec "$child_victim" 2>&1); crc=$?
+cmsg=false
+case "$cout" in *"ps -p $child_victim printed nothing"*) cmsg=true ;; esac
+if [ "$crc" -eq 2 ] && $cmsg; then
+  ok 'wait_exec reports rc 2 when ps prints nothing for the child'
+else
+  bad "wait_exec returned $crc (child message pinned: $cmsg) when ps printed nothing for the child (expected rc 2 — the parent probe answered, so only the loop's empty-cmd guard can fire)"
+fi
+kill -9 "$child_victim" 2>/dev/null || true
+
 # --- scenario 9: a failed ownership probe does not forgive a live synthetic --
 # Residue (a) of TODO.md:7914. The victim is a real synthetic of this run, under
 # `$WORK`, so the *real* predicate would match it; the point is that a probe
@@ -540,6 +646,25 @@ if wait_gone "$victim"; then
 else
   bad "ps failure: synthetic $victim survived — a probe that could not run was read as 'not ours'"
   kill -9 "$victim" 2>/dev/null || true
+fi
+
+# --- scenario 9b: an exit-0-empty probe still reaps a live synthetic ----------
+# Reviewer 1's residue. Scenario 9's fake `ps` exits 1, so it exercises only the
+# failed-probe arm at `reap_own_synthetic`'s first branch; the neighbouring
+# `'') kill -9 "$p"` arm — the probe that runs and says nothing — was therefore
+# unverified, and deleting that arm stayed green (measured). Scenario 8's
+# `$fakeps_empty` (exit 0, no output) is exactly the probe that reaches it. The
+# subshell scopes `LIVE` to the single victim so this sweep cannot touch another
+# scenario's servers.
+hdr 'scenario 9b: an exit-0-empty ps probe does not forgive a live synthetic'
+victim9b=$(spawn_fake "$WORK/run9b-victim")
+LIVE="$LIVE $victim9b"
+( LIVE="$victim9b"; run_with_probe_ps "$fakeps_empty" reap_own_synthetic )
+if wait_gone "$victim9b"; then
+  ok "ps exit-0-empty: unidentifiable synthetic $victim9b was killed"
+else
+  bad "ps exit-0-empty: synthetic $victim9b survived — a probe that ran and said nothing was read as 'not ours'"
+  kill -9 "$victim9b" 2>/dev/null || true
 fi
 
 # --- scenario 10: the XTCP pre-test cleanup is pid-exact (TODO.md:7866) ------
@@ -564,17 +689,30 @@ compat_code=$(sed 's/[[:space:]]*#.*$//' "$compat_src")
 # reports `printf: write error: Broken pipe` on stderr (measured) — noise in the
 # CI log for a check that passed.
 printf '%s\n' "$compat_code" > "$WORK/compat-test.code"
+# --- substance pin: detector (checksummed by enforce_substance) ---
 hits=$(grep -nE '(^|[^[:alnum:]_])(pkill|killall)([[:space:]]|$)|(^|[^[:alnum:]_])pgrep[[:space:]]+-[^[:space:]]*f' "$WORK/compat-test.code" || true)
 if [ -z "$hits" ]; then
   ok 'compat-test.sh: no pkill/killall/pgrep -f in its code'
 else
   bad "compat-test.sh kills by pattern again: $(printf '%s' "$hits" | tr '\n' ' ')"
 fi
+# --- end substance pin: detector ---
+# --- substance pin: extractor (checksummed by enforce_substance) ---
 xtcp_body=$(awk '/^run_xtcp_test\(\)/{f=1} f{print} f&&/^}/{exit}' "$WORK/compat-test.code")
-case "$xtcp_body" in
-  *'reap_scoped_strays'*) ok 'compat-test.sh: the XTCP pre-test sweep is reap_scoped_strays' ;;
-  *) bad 'compat-test.sh: run_xtcp_test does not sweep with the pid-exact reap_scoped_strays helper' ;;
-esac
+# TODO.md:7866 replaced *two* pattern kills with a pid-exact pair, so the
+# scenario has to see both halves inside `run_xtcp_test`: the tracked-pid reaper
+# (`cleanup_pids`, TODO 7866's first replacement) and the guard's baseline-aware
+# census sweep (`reap_scoped_strays`). Pinning only the latter let a mutant that
+# deleted the `cleanup_pids` call stay green (measured, reviewer 1).
+xtcp_calls=$(printf '%s\n' "$xtcp_body" | grep -cE '^[[:space:]]*cleanup_pids([[:space:]]|$)' || true)
+xtcp_sweep=false
+case "$xtcp_body" in *'reap_scoped_strays'*) xtcp_sweep=true ;; esac
+if $xtcp_sweep && [ "$xtcp_calls" -ge 1 ]; then
+  ok 'compat-test.sh: run_xtcp_test sweeps with cleanup_pids and reap_scoped_strays'
+else
+  bad "compat-test.sh: run_xtcp_test's pre-test cleanup is incomplete (reap_scoped_strays=$xtcp_sweep, cleanup_pids calls=$xtcp_calls) — TODO.md:7866 needs both, one per pkill -f it replaced"
+fi
+# --- end substance pin: extractor ---
 
 # --- scenario 11: the pre-test sweep itself, driven against real servers ------
 # Scenario 10 only reads the source; the helper it names has to *run* somewhere

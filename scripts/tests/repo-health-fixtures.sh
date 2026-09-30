@@ -51,14 +51,20 @@ set -uo pipefail
 # the measured check count of a green run; with an exact floor, emptying any
 # scenario body drops the count below it and reds (TODO.md:7895).
 #
-# Two limits are stated rather than hidden:
+# Three limits are stated rather than hidden:
 #   * a floor of 0 (or an unset floor) would disable the guard from inside, so
 #     that is itself a failure;
+#   * the floor comparisons are *guarded*, not bare: a non-numeric `MIN_CHECKS`
+#     (or a non-numeric `checks`) makes `[ … -lt … ]` return status 2, which
+#     `if`/`elif` read as false — so both branches would be skipped and the suite
+#     would exit green on a floor it cannot parse. Everything is validated as
+#     digits first, and a floor that is not a number is a failure;
 #   * `exec true` in place of an ordinary exit still skips the EXIT trap — no
 #     in-file mechanism can intercept `exec`, and the sibling suite had the same
 #     hole. The closure for that one is outside the file: the CI step's own
-#     `grep -qF 'RESULT: %d fixture check(s) hold'` on the captured output
-#     (`.github/workflows/ci.yml`), which sees a missing RESULT line.
+#     `grep -qF 'RESULT: %d fixture check(s) hold'` plus its `  ok` line count on
+#     the captured output (`.github/workflows/ci.yml`), which see a missing
+#     RESULT line and a planted one with no assertions behind it.
 # A total is also not a *shape*, so `delete N checks, add N dummy ok lines`
 # keeps it; the sibling pins its ordered assertion list for that reason. Here the
 # assertion set is loop-driven (scenario 4 walks four sites, scenario 10 two
@@ -77,15 +83,38 @@ cleanup_all() {
   local rc=$?
   [ -z "$tmp" ] || rm -rf "$tmp"
   if [ "$rc" -eq 0 ]; then
-    if [ "${MIN_CHECKS:-0}" -lt 1 ]; then
-      printf 'FAIL  the check floor is disabled (MIN_CHECKS=%s); the suite cannot vouch for itself\n' \
-        "${MIN_CHECKS:-<unset>}" >&2
-      rc=1
-    elif [ "$checks" -lt "$MIN_CHECKS" ]; then
-      printf 'FAIL  suite exited 0 after only %d check(s); expected at least %d — scenarios did not run\n' \
-        "$checks" "$MIN_CHECKS" >&2
-      rc=1
-    fi
+    # Fail closed: `[ NaN -lt 1 ]` is status 2, and `if`/`elif` read status 2 as
+    # false, so an unparseable floor used to skip every branch below and exit 0
+    # (measured: delete a scenario's assertions, set MIN_CHECKS=NaN, rc 0). The
+    # digits-only case arms run the comparisons only on values bash can compare.
+    case ${MIN_CHECKS:-} in
+      ''|0)
+        printf 'FAIL  the check floor is disabled (MIN_CHECKS=%s); the suite cannot vouch for itself\n' \
+          "${MIN_CHECKS:-<unset>}" >&2
+        rc=1
+        ;;
+      *[!0-9]*)
+        printf 'FAIL  the check floor is not a number (MIN_CHECKS=%s); the suite cannot vouch for itself\n' \
+          "$MIN_CHECKS" >&2
+        rc=1
+        ;;
+      *)
+        case $checks in
+          ''|*[!0-9]*)
+            printf 'FAIL  the check counter is not a number (%s); the suite cannot vouch for itself\n' \
+              "$checks" >&2
+            rc=1
+            ;;
+          *)
+            if [ "$checks" -lt "$MIN_CHECKS" ]; then
+              printf 'FAIL  suite exited 0 after only %d check(s); expected at least %d — scenarios did not run\n' \
+                "$checks" "$MIN_CHECKS" >&2
+              rc=1
+            fi
+            ;;
+        esac
+        ;;
+    esac
   fi
   exit "$rc"
 }
