@@ -298,6 +298,51 @@ fn verify_good_config_exits_0() {
     );
 }
 
+/// The `.ini` half of the same positive control: a **typeless** legacy proxy
+/// section is Go's `tcp` proxy, in both loader modes.
+///
+/// Measured on the real v0.71.0 binaries: `.ini` files whose only section is a
+/// typeless `[myproxy]` (with `local_port`/`remote_port`) give `frpc verify` rc 0
+/// under both `--strict-config` values, and a real run logs `new proxy [myproxy]
+/// type [tcp] success`. frp-rs used to print `Proxies: 0` in lenient mode (the
+/// silent drop) and refuse the file in strict mode with `unknown field
+/// "myproxy" in config file …`.
+#[test]
+fn typeless_legacy_ini_proxy_verifies_in_both_modes() {
+    let dir = TempDir::new();
+    let cfg = dir.write(
+        "typeless.ini",
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [myproxy]\nlocal_port = 18080\nremote_port = 18081\n\
+         [auth.foo]\nlocal_port = 18082\nremote_port = 18083\n",
+    );
+
+    for strict in ["--strict-config=false", "--strict-config"] {
+        let out = run_frpc(&["verify", strict, "-c", &cfg]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "frpc verify {strict} -c <typeless ini> must exit 0; stdout={:?} stderr={:?}",
+            stdout_of(&out),
+            stderr_of(&out),
+        );
+        assert_eq!(
+            stdout_of(&out),
+            format!(
+                "frpc: the configuration file {cfg} syntax is ok\n  Server: 127.0.0.1:7000\n  \
+                 Proxies: 2\n  Visitors: 0\n"
+            ),
+            "both typeless sections must register as proxies ({strict}); stderr={:?}",
+            stderr_of(&out),
+        );
+        assert!(
+            stderr_of(&out).is_empty(),
+            "verify writes nothing to stderr on success; stderr={:?}",
+            stderr_of(&out),
+        );
+    }
+}
+
 /// Deliberate divergence, pinned so it cannot drift silently: Go's
 /// `frpc --config-dir` returns **0** for a directory that does not exist, is
 /// empty, or holds a config that fails to parse (the bad case prints only

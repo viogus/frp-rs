@@ -1,4 +1,5 @@
 use super::client::{AuthClientConfig, ClientConfig, ProxyConfig, VisitorConfig};
+use super::format::ConfigFormat;
 use super::normalize::{
     expand_env_vars, expand_template_functions, normalize_client_config, normalize_server_config,
     toml_to_json,
@@ -150,7 +151,7 @@ pub fn load_server_config_from_str(
     expand_template_functions(&mut value);
     let web_server_tls_enable_set = ConfigPresence::web_server_tls_enable_set_in(&value);
     let server_tls_enable_set = ConfigPresence::server_tls_enable_set_in(&value);
-    normalize_server_config(&mut value);
+    normalize_server_config(&mut value, ConfigFormat::Toml);
     let mut presence = ConfigPresence::from_normalized_value(&value);
     presence.web_server_tls_enable_set = web_server_tls_enable_set;
     // Kept in lockstep with `load_config_from_file`'s capture. This entry point
@@ -176,7 +177,7 @@ pub fn load_client_config_from_str(
     expand_env_vars(&mut value);
     expand_template_functions(&mut value);
     let web_server_tls_enable_set = ConfigPresence::web_server_tls_enable_set_in(&value);
-    normalize_client_config(&mut value);
+    normalize_client_config(&mut value, ConfigFormat::Toml);
     let mut presence = ConfigPresence::from_normalized_value(&value);
     presence.web_server_tls_enable_set = web_server_tls_enable_set;
     let mut cfg: ClientConfig = serde_json::from_value(toml_to_json(value))
