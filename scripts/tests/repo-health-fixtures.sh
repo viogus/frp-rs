@@ -42,6 +42,55 @@
 #        (also correct when the harness itself is invoked through a symlink)
 set -uo pipefail
 
+# --- self-defence: assert a floor on every exit path --------------------------
+# This suite is the only thing that pins `scripts/repo-health.sh`, so a suite
+# that silently stops checking must not exit green: `exit "$fail"` alone is happy
+# with `RESULT: 0 fixture check(s) hold`. The trap is installed here — before the
+# path resolution, the two preflights and the first `ok`/`bad` — so an early
+# `exit 0` anywhere below it still has to answer to the floor. `MIN_CHECKS` is
+# the measured check count of a green run; with an exact floor, emptying any
+# scenario body drops the count below it and reds (TODO.md:7895).
+#
+# Two limits are stated rather than hidden:
+#   * a floor of 0 (or an unset floor) would disable the guard from inside, so
+#     that is itself a failure;
+#   * `exec true` in place of an ordinary exit still skips the EXIT trap — no
+#     in-file mechanism can intercept `exec`, and the sibling suite had the same
+#     hole. The closure for that one is outside the file: the CI step's own
+#     `grep -qF 'RESULT: %d fixture check(s) hold'` on the captured output
+#     (`.github/workflows/ci.yml`), which sees a missing RESULT line.
+# A total is also not a *shape*, so `delete N checks, add N dummy ok lines`
+# keeps it; the sibling pins its ordered assertion list for that reason. Here the
+# assertion set is loop-driven (scenario 4 walks four sites, scenario 10 two
+# shapes), so the count is what can be pinned without a second instrumented
+# counter per scenario; that residual gap is recorded in the batch-E report.
+MIN_CHECKS=32
+checks=0
+fail=0
+tmp=""
+
+ok()  { checks=$((checks + 1)); printf '  ok    %s\n' "$1"; }
+bad() { checks=$((checks + 1)); fail=1; printf '  FAIL  %s\n' "$1"; }
+hdr() { printf '%s\n' "------------------------------------------------------------"; }
+
+cleanup_all() {
+  local rc=$?
+  [ -z "$tmp" ] || rm -rf "$tmp"
+  if [ "$rc" -eq 0 ]; then
+    if [ "${MIN_CHECKS:-0}" -lt 1 ]; then
+      printf 'FAIL  the check floor is disabled (MIN_CHECKS=%s); the suite cannot vouch for itself\n' \
+        "${MIN_CHECKS:-<unset>}" >&2
+      rc=1
+    elif [ "$checks" -lt "$MIN_CHECKS" ]; then
+      printf 'FAIL  suite exited 0 after only %d check(s); expected at least %d — scenarios did not run\n' \
+        "$checks" "$MIN_CHECKS" >&2
+      rc=1
+    fi
+  fi
+  exit "$rc"
+}
+trap cleanup_all EXIT
+
 self=${BASH_SOURCE[0]:-$0}
 case "$self" in
   */*) ;;
@@ -100,13 +149,6 @@ if [ ! -f "$RC_PY" ]; then
 fi
 
 tmp=$(mktemp -d) || exit 1
-trap 'rm -rf "$tmp"' EXIT
-
-checks=0
-fail=0
-ok()  { checks=$((checks + 1)); printf '  ok    %s\n' "$1"; }
-bad() { checks=$((checks + 1)); fail=1; printf '  FAIL  %s\n' "$1"; }
-hdr() { printf '%s\n' "------------------------------------------------------------"; }
 
 printf '%s\n' 'repo-health.sh fixture checks'
 

@@ -171,3 +171,30 @@ assert_no_strays() {
     kill -9 $survivors 2>/dev/null || true
     return 1
 }
+
+# Reap the in-`$TEST_DIR` strays this run did not inherit, by the exact pids the
+# census printed, honouring the baseline like `assert_no_strays` does: a server
+# that predates this run (a sibling's, or an earlier crashed run's) is not ours
+# and is left alone. This is the mid-run sweep for a helper that starts several
+# servers per scenario (`run_xtcp_test`, which used to `pkill -f "frpc -c"` /
+# `pkill -f "frps -c"`): it stops a previous scenario's leftover from holding a
+# port or reconnecting with a stale token, before the next scenario's servers
+# start. No argument pattern is ever matched here.
+#
+# Best effort by design: if the census itself fails (missing `pgrep`, a failing
+# `ps`), there is nothing to reap and this returns 0 rather than guessing; the
+# *failure* signal belongs to `assert_no_strays` in the run's exit trap, which
+# refuses an unusable census instead of sweeping on a hunch.
+reap_scoped_strays() {
+    local pid strays
+    if ! strays="$(scenario_strays)"; then
+        return 0
+    fi
+    for pid in $strays; do
+        case "$STRAY_BASELINE" in
+            *" $pid "*) continue ;;
+        esac
+        kill -9 "$pid" 2>/dev/null || true
+    done
+    return 0
+}

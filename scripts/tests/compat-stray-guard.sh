@@ -32,6 +32,19 @@
 #      still running when the teardown returns, rather than being waited on.
 #   6  the scratch dir is documented as overridable, so a concurrent compat run
 #      does not share this run's census.
+#   7  `wait_exec`'s "has the child exec-ed yet" anchor still works when this
+#      file is invoked through a symlink whose name differs from the real one
+#      (the anchor must not be derived from the resolved script name).
+#   8  a `ps` that exits 0 with empty output is "cannot tell", not "the image
+#      changed" — it must not be read as "the helper has exec-ed".
+#   9  a `ps` that fails in the exit trap does not turn a live synthetic of ours
+#      into a stranger: an unidentifiable pid we started is still killed.
+#   10 `scripts/compat-test.sh` carries no pattern kill and its XTCP pre-test
+#      sweep is the pid-exact `reap_scoped_strays` (TODO.md:7866).
+#   11 that sweep, driven against three real synthetic servers: the
+#      in-`$TEST_DIR` leak started after the baseline is reaped, while the
+#      baseline server and the same-named out-of-tree peer are left alone. This
+#      is what keeps the helper from rotting behind scenario 10's source read.
 #
 # Self-contained: no network, no compat run, no dependence on this repo's
 # binaries. Temporary trees and synthetic processes are removed on exit.
@@ -60,7 +73,13 @@ while [ -L "$self" ]; do
 done
 ROOT=$(cd -P -- "$(dirname -- "$self")/../.." && pwd)
 LIB="$ROOT/scripts/lib/compat-stray-guard.sh"
-self_name=$(basename -- "$self")   # `wait_exec` uses this to spot a pre-exec fork
+
+# The census probe. A seam, not a constant, because the two "cannot tell"
+# failure directions it has — a probe that *fails*, and a probe that succeeds
+# with empty output — are only observable by handing `wait_exec` and the exit
+# trap a probe that does exactly that (scenarios 8 and 9).
+PROBE_PS_DEFAULT=${PROBE_PS:-ps}
+PROBE_PS=$PROBE_PS_DEFAULT
 
 checks=0
 fails=0
@@ -69,28 +88,128 @@ fails=0
 # happy with `RESULT: 0 fixture check(s) hold`. `cleanup_all` enforces the floor
 # on every exit path, and it is installed before this file's first failure
 # point, so an early `exit 0` — a neutered scenario body, say — cannot skip it.
-MIN_CHECKS=21
+# A total is not a *shape* though: deleting N assertions and adding N dummy
+# `ok` lines keeps the total and still exits 0 (measured against the count as
+# the only guard — that mutant is in the batch-E record), which is residue (d)
+# of TODO.md:7914. `SHAPE` below pins the ordered list of assertions, so a
+# scenario that stops running, a check that is replaced or reordered, or a
+# dummy added anywhere, all red. A floor of 0 (or an unset floor) disables the
+# guard from inside, which the sibling suite learned the hard way; that is a
+# failure here too.
+MIN_CHECKS=29
+# The ordered assertion anchors, one per `ok`/`bad` call in scenario order.
+# Dynamic parts (pids, elapsed seconds) are matched as substrings, so each entry
+# is the stable prefix/skeleton of the assertion it pins.
+SHAPE=(
+  'pgrep -x frps sees synthetic server pid'
+  'clean run: assert_no_strays returned 0'
+  'baseline server survived'
+  'out-of-tree peer survived'
+  'stray present: assert_no_strays returned 1'
+  'report names the stray pid'
+  'was reaped'
+  'out-of-tree peer still survives'
+  'missing pgrep: load failed with rc'
+  'missing pgrep: the error names pgrep'
+  'empty TEST_DIR: refused'
+  'empty TEST_DIR: the error names TEST_DIR'
+  'TEST_DIR=/: refused'
+  'TEST_DIR=/: the error explains the degradation'
+  "has exec'd its own image"
+  'untracked child was still running when cleanup_pids returned'
+  'cleanup_pids returned in'
+  'tracked pid was reaped'
+  'PIDS reset after cleanup_pids'
+  'compat-test.sh --help exits 0'
+  '--help documents FRP_COMPAT_TEST_DIR'
+  'symlink invocation: wait_exec returned 1 for the pre-exec fork'
+  'wait_exec reports rc 2 when ps prints nothing'
+  'ps failure: unidentifiable synthetic'
+  'compat-test.sh: no pkill/killall/pgrep -f in its code'
+  'compat-test.sh: the XTCP pre-test sweep is reap_scoped_strays'
+  'pre-test sweep: reaped the in-TEST_DIR stray'
+  'pre-test sweep: left the baseline server alone'
+  'pre-test sweep: left the out-of-tree peer alone'
+)
+LABELS=()
 # Every synthetic pid we start. The trap reaps each one that is still ours,
 # including the scenario-5 helpers, so no scenario has to be the only net under
 # a process it spawned.
 LIVE=""
 WORK=""
 
-cleanup_all() {
-  local rc=$? p cmd
+# reap_own_synthetic — kill each synthetic this suite started that is still
+# ours. Ownership is still the scratch dir's basename in the argv (it survives
+# `/var` -> `/private/var` normalisation); what changed is the failure
+# direction. A `ps` probe that cannot run leaves the pid *unidentifiable*, and
+# an unidentifiable live child we started is ours to kill — reading it as "not
+# ours" is how every live synthetic outlived a `ps` failure (residue (a) of
+# TODO.md:7914). A pid the guard already reaped can be recycled before this trap
+# runs, and killing a stranger is the hazard this suite pins; the probe is what
+# tells those apart, so only a probe we can trust is allowed to *forgive*.
+reap_own_synthetic() {
+  local p cmd
   for p in $LIVE; do
-    # Reap only this run's own synthetics. A pid the guard already reaped can be
-    # recycled before this trap runs, and killing a stranger is the hazard this
-    # whole suite pins; the scratch dir's basename is still in the argv of
-    # anything we started, and survives `/var` -> `/private/var` normalisation.
-    cmd=$(ps -o command= -p "$p" 2>/dev/null) || continue
-    case "$cmd" in *"/${WORK##*/}/"*) kill -9 "$p" 2>/dev/null || true ;; esac
+    if ! cmd=$("$PROBE_PS" -o command= -p "$p" 2>/dev/null); then
+      kill -9 "$p" 2>/dev/null || true
+      continue
+    fi
+    case "$cmd" in
+      '') kill -9 "$p" 2>/dev/null || true ;;
+      *"/${WORK##*/}/"*) kill -9 "$p" 2>/dev/null || true ;;
+    esac
   done
+}
+
+# run_with_probe_ps <fake-ps> <command...> — run a command against a fake `ps`
+# and restore the real probe on every path, so the exit trap never inherits a
+# stub and the scenarios below cannot leak a seam into each other.
+run_with_probe_ps() {
+  local fake=$1 rc=0
+  shift
+  PROBE_PS="$fake"
+  "$@" || rc=$?
+  PROBE_PS=$PROBE_PS_DEFAULT
+  return "$rc"
+}
+
+# enforce_shape — the ordered-assertion half of the floor.
+enforce_shape() {
+  local i n=${#SHAPE[@]} want got
+  if [ "${#LABELS[@]}" -ne "$n" ]; then
+    printf 'FAIL  check shape changed: %d assertion(s) ran, expected %d\n' \
+      "${#LABELS[@]}" "$n" >&2
+    return 1
+  fi
+  for (( i = 0; i < n; i++ )); do
+    want=${SHAPE[i]}
+    got=${LABELS[i]}
+    case "$got" in
+      *"$want"*) ;;
+      *) printf 'FAIL  check %d is not the expected assertion: got %q, wanted one matching %q\n' \
+           "$((i + 1))" "$got" "$want" >&2
+         return 1 ;;
+    esac
+  done
+  return 0
+}
+
+cleanup_all() {
+  local rc=$?
+  reap_own_synthetic
   [ -z "$WORK" ] || rm -rf "$WORK"
-  if [ "$rc" -eq 0 ] && [ "$checks" -lt "$MIN_CHECKS" ]; then
-    printf 'FAIL  suite exited 0 after only %d check(s); expected at least %d — scenarios did not run\n' \
-      "$checks" "$MIN_CHECKS" >&2
-    rc=1
+  if [ "$rc" -eq 0 ]; then
+    if [ "${MIN_CHECKS:-0}" -lt 1 ]; then
+      printf 'FAIL  the check floor is disabled (MIN_CHECKS=%s); the suite cannot vouch for itself\n' \
+        "${MIN_CHECKS:-<unset>}" >&2
+      rc=1
+    elif [ "$checks" -lt "$MIN_CHECKS" ]; then
+      printf 'FAIL  suite exited 0 after only %d check(s); expected at least %d — scenarios did not run\n' \
+        "$checks" "$MIN_CHECKS" >&2
+      rc=1
+    elif ! enforce_shape; then
+      rc=1
+    fi
   fi
   exit "$rc"
 }
@@ -98,8 +217,11 @@ trap cleanup_all EXIT
 
 [ -f "$LIB" ] || { printf 'FAIL  guard library not found: %s\n' "$LIB"; exit 1; }
 
-ok()  { checks=$((checks + 1)); printf '  ok    %s\n' "$1"; }
-bad() { checks=$((checks + 1)); fails=$((fails + 1)); printf '  FAIL  %s\n' "$1"; }
+# `LABELS` records every assertion in the order it ran (both verdicts), which is
+# what `enforce_shape` compares against `SHAPE` on a green exit: a total alone
+# cannot tell a scenario that stopped running from four dummy `ok` lines.
+ok()  { checks=$((checks + 1)); LABELS+=("$1"); printf '  ok    %s\n' "$1"; }
+bad() { checks=$((checks + 1)); fails=$((fails + 1)); LABELS+=("$1"); printf '  FAIL  %s\n' "$1"; }
 hdr() { printf '\n%s\n' "$1"; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/compat-guard.XXXXXX")"
@@ -129,16 +251,36 @@ spawn_fake() {
 # spawned `sleep 30` landed within 0.25 s, and 25/25 old-shape runs at load 42-47
 # were fast), so this is a cheap defensive synchronisation, not a reproduced
 # root-cause fix. Returns 0 once the image changed, 1 if it never did within 2 s,
-# and 2 when the `ps` probe itself fails: "could not synchronise" must not read as
-# "synced".
+# and 2 when the `ps` probe itself fails or prints nothing: "could not
+# synchronise" must not read as "synced".
+#
+# The anchor is this shell's own command line, read from the same probe: a
+# forked, not-yet-exec'd child has an identical argv, and after `exec` it can
+# never match. It used to be `basename` of the *resolved* script path, which the
+# child's argv does not carry when the suite is invoked through a symlink with a
+# different name — the match failed before the exec and `wait_exec` returned 0
+# (residue (b) of TODO.md:7914). Nothing here depends on the file's name, so
+# there is no alias to get wrong.
 wait_exec() {
-  local pid=$1 i=0 cmd
+  local pid=$1 i=0 cmd me
+  if ! me=$("$PROBE_PS" -o command= -p "$$" 2>/dev/null); then
+    printf 'wait_exec: ps -p %s failed; cannot tell whether the helper has exec-ed yet\n' "$$" >&2
+    return 2
+  fi
+  if [ -z "$me" ]; then
+    printf 'wait_exec: ps -p %s printed nothing; cannot tell whether the helper has exec-ed yet\n' "$$" >&2
+    return 2
+  fi
   while (( i < 100 )); do
-    if ! cmd=$(ps -o command= -p "$pid" 2>/dev/null); then
+    if ! cmd=$("$PROBE_PS" -o command= -p "$pid" 2>/dev/null); then
       printf 'wait_exec: ps -p %s failed; cannot tell whether the helper has exec-ed yet\n' "$pid" >&2
       return 2
     fi
-    case "$cmd" in *"$self_name"*) ;; *) return 0 ;; esac
+    if [ -z "$cmd" ]; then
+      printf 'wait_exec: ps -p %s printed nothing; cannot tell whether the helper has exec-ed yet\n' "$pid" >&2
+      return 2
+    fi
+    case "$cmd" in "$me") ;; *) return 0 ;; esac
     sleep 0.02
     i=$((i + 1))
   done
@@ -157,6 +299,23 @@ wait_gone() {
   done
   return 1
 }
+
+# --- probe mode: measure `wait_exec` from a deliberately aliased invocation ---
+# Scenario 7 runs this file through a symlink whose name differs from the real
+# one, so the child's argv carries the alias; before the fix the anchor was the
+# *resolved* script name, which that argv does not contain, and the "has it
+# exec-ed yet" test matched before the exec. This block is the only way to
+# observe that from inside the file (there is no other window between fork and
+# exec), and it exits before the first assertion so it can never move a fixture
+# count. `wait_exec "$$"` asks about the child *running this block*: it has not
+# exec-ed, so the only correct answer is 1.
+if [ -n "${FRP_STRAY_GUARD_PROBE:-}" ]; then
+  wait_exec "$$"; _probe_rc=$?
+  printf 'probe wait_exec self rc=%d\n' "$_probe_rc"
+  trap - EXIT
+  [ -z "$WORK" ] || rm -rf "$WORK"
+  exit 0
+fi
 
 # --- fixture self-check: the synthetic server must be visible at all ---------
 # Without this the whole file could pass because `pgrep -x frps` never matched
@@ -328,6 +487,132 @@ case "$out" in
   *FRP_COMPAT_TEST_DIR*) ok '--help documents FRP_COMPAT_TEST_DIR' ;;
   *) bad '--help does not document FRP_COMPAT_TEST_DIR' ;;
 esac
+
+# --- scenario 7: `wait_exec`'s anchor survives an aliased invocation ---------
+# Residue (b) of TODO.md:7914. The probe child is this same file under a
+# different name: `wait_exec "$$"` must still see its own pre-exec fork and
+# return 1. Any anchor derived from the script's own name fails here, which is
+# exactly the latent bug CI (which calls the direct path) could not see.
+hdr 'scenario 7: wait_exec still sees its own pre-exec fork through a symlink'
+alias_link="$WORK/alias-probe.sh"
+# `self` may be a relative path (this script never `cd`s), and a relative
+# symlink target would be resolved against `$WORK`, not the caller's cwd.
+alias_target=$self
+case "$alias_target" in /*) ;; *) alias_target=$PWD/$alias_target ;; esac
+ln -sfn "$alias_target" "$alias_link"
+out=$(env FRP_STRAY_GUARD_PROBE=1 "$BASH_BIN" "$alias_link" 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = 'probe wait_exec self rc=1' ]; then
+  ok 'symlink invocation: wait_exec returned 1 for the pre-exec fork'
+else
+  bad "symlink invocation: expected 'probe wait_exec self rc=1' with rc 0, got rc $rc: $(printf '%s' "$out" | tr '\n' ' ')"
+fi
+
+# --- scenario 8: empty `ps` output is "cannot tell", not "the image changed" -
+# Residue (c) of TODO.md:7914. A probe that exits 0 with no output used to fall
+# through to the `*) return 0` arm — an empty string does not contain the anchor
+# — so "the tool told us nothing" was read as "the helper has exec-ed".
+hdr 'scenario 8: wait_exec reads empty ps output as "cannot tell"'
+fakeps_empty="$WORK/fakeps-empty"
+printf '#!/bin/sh\nexit 0\n' > "$fakeps_empty"
+chmod +x "$fakeps_empty"
+wout=$(run_with_probe_ps "$fakeps_empty" wait_exec "$$" 2>&1); wrc=$?
+msg=false
+case "$wout" in *'printed nothing'*) msg=true ;; esac
+if [ "$wrc" -eq 2 ] && $msg; then
+  ok 'wait_exec reports rc 2 when ps prints nothing'
+else
+  bad "wait_exec returned $wrc (message pinned: $msg) when ps printed nothing (expected rc 2 — 'cannot tell' must not read as 'synced')"
+fi
+
+# --- scenario 9: a failed ownership probe does not forgive a live synthetic --
+# Residue (a) of TODO.md:7914. The victim is a real synthetic of this run, under
+# `$WORK`, so the *real* predicate would match it; the point is that a probe
+# which cannot run must not be read as "not ours" and let it outlive the suite.
+hdr 'scenario 9: a failed ps probe does not turn a live synthetic into a stranger'
+fakeps_fail="$WORK/fakeps-fail"
+printf '#!/bin/sh\nexit 1\n' > "$fakeps_fail"
+chmod +x "$fakeps_fail"
+victim=$(spawn_fake "$WORK/run9-victim")
+LIVE="$LIVE $victim"
+run_with_probe_ps "$fakeps_fail" reap_own_synthetic
+if wait_gone "$victim"; then
+  ok "ps failure: unidentifiable synthetic $victim was killed"
+else
+  bad "ps failure: synthetic $victim survived — a probe that could not run was read as 'not ours'"
+  kill -9 "$victim" 2>/dev/null || true
+fi
+
+# --- scenario 10: the XTCP pre-test cleanup is pid-exact (TODO.md:7866) ------
+# `run_xtcp_test` used two `pkill -f "frpc -c"` / `pkill -f "frps -c"` calls,
+# which select any process on the host whose command line carries that pattern —
+# a developer's unrelated run, or a sibling worktree's compat run. The
+# replacement is the reaper the closed compat-leak item added, driven by the
+# pids this run recorded, and that is what the two assertions below pin. The
+# pattern kill itself is not executed here (the repository forbids running one
+# at all), so this is the source-shape half of the mutant that reds the fix.
+hdr 'scenario 10: compat-test.sh kills by pid, not by argument pattern'
+compat_src="$ROOT/scripts/compat-test.sh"
+# Comments are stripped first, and both checks below read the stripped text: a
+# comment naming a forbidden command (the replacement's own rationale names
+# `pkill -f`, and `cleanup_pids` appears in comments above the call) is neither a
+# kill nor a sweep. Reading the raw source let a mutant that replaced the
+# `cleanup_pids` call with `:` stay green off the surrounding comment — measured
+# on the mutant below, not hypothetical.
+compat_code=$(sed 's/[[:space:]]*#.*$//' "$compat_src")
+# Both reads go through a file, not `printf | …`: `awk` stops at the function's
+# closing brace, and a builtin `printf` on the far end of that closed pipe
+# reports `printf: write error: Broken pipe` on stderr (measured) — noise in the
+# CI log for a check that passed.
+printf '%s\n' "$compat_code" > "$WORK/compat-test.code"
+hits=$(grep -nE '(^|[^[:alnum:]_])(pkill|killall)([[:space:]]|$)|(^|[^[:alnum:]_])pgrep[[:space:]]+-[^[:space:]]*f' "$WORK/compat-test.code" || true)
+if [ -z "$hits" ]; then
+  ok 'compat-test.sh: no pkill/killall/pgrep -f in its code'
+else
+  bad "compat-test.sh kills by pattern again: $(printf '%s' "$hits" | tr '\n' ' ')"
+fi
+xtcp_body=$(awk '/^run_xtcp_test\(\)/{f=1} f{print} f&&/^}/{exit}' "$WORK/compat-test.code")
+case "$xtcp_body" in
+  *'reap_scoped_strays'*) ok 'compat-test.sh: the XTCP pre-test sweep is reap_scoped_strays' ;;
+  *) bad 'compat-test.sh: run_xtcp_test does not sweep with the pid-exact reap_scoped_strays helper' ;;
+esac
+
+# --- scenario 11: the pre-test sweep itself, driven against real servers ------
+# Scenario 10 only reads the source; the helper it names has to *run* somewhere
+# or the sweep rots behind a green shape check (the lesson of scenario 10's own
+# mutant, which matched a comment). This drives `reap_scoped_strays` against
+# three synthetic `frps` servers: one started before the guard loaded (baseline),
+# one outside `$TEST_DIR` (a sibling's, same process name), and one in-`$TEST_DIR`
+# leak started after the baseline. Only the leak may be reaped.
+hdr 'scenario 11: the pre-test sweep reaps an in-TEST_DIR leak and nothing else'
+td11="$WORK/run11"
+mkdir -p "$td11"
+baseline11=$(spawn_fake "$td11/baseline-old")
+LIVE="$LIVE $baseline11"
+export TEST_DIR="$td11"
+# shellcheck source=/dev/null
+source "$LIB"
+peer11=$(spawn_fake "$WORK/run11-peer")
+LIVE="$LIVE $peer11"
+leak11=$(spawn_fake "$td11/provider")
+LIVE="$LIVE $leak11"
+sleep 0.3
+reap_scoped_strays
+if wait_gone "$leak11"; then
+  ok "pre-test sweep: reaped the in-TEST_DIR stray $leak11"
+else
+  bad "pre-test sweep: in-TEST_DIR stray $leak11 survived — the sweep found nothing to reap"
+fi
+if kill -0 "$baseline11" 2>/dev/null; then
+  ok 'pre-test sweep: left the baseline server alone'
+else
+  bad 'pre-test sweep: the baseline server was reaped — the sweep ignored the baseline'
+fi
+if kill -0 "$peer11" 2>/dev/null; then
+  ok 'pre-test sweep: left the out-of-tree peer alone'
+else
+  bad 'pre-test sweep: the out-of-tree peer was reaped — the sweep matched on name alone'
+fi
+kill -9 "$baseline11" "$peer11" 2>/dev/null || true
 
 # ---------------------------------------------------------------- summary
 hdr 'summary'
