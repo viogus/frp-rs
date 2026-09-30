@@ -2455,15 +2455,12 @@ fn ini_section_started(start: Option<&toml::Value>, name: &str, legacy_ini: bool
 /// Go's `Start []string \`ini:"start"\`` (`pkg/config/legacy/client.go:119`) is
 /// filled by `gopkg.in/ini`'s reflection reader, which trims each comma element
 /// (`Key.Strings(",")`, key.go:492), so `start = p2, p1` selects both (measured:
-/// the `[p1] role = "weird"` refusal names `p1`, not ` p1`). The INI reader here
-/// produced a verbatim `Array` only when the text rendered back exactly, so a
-/// `String` is split with the same trimming splitter.
-fn ini_start_names(value: &toml::Value) -> Option<std::collections::HashSet<String>> {
+/// the `[p1] role = "weird"` refusal names `p1`, not ` p1`). An `Array` here is
+/// the reader's lossless spelling of that same text, so its elements are
+/// re-rendered; a `String` is split with the same trimming splitter.
+pub(super) fn ini_start_names(value: &toml::Value) -> Option<std::collections::HashSet<String>> {
     let names: Vec<String> = match value {
-        toml::Value::Array(items) => items
-            .iter()
-            .filter_map(|item| item.as_str().map(str::to_string))
-            .collect(),
+        toml::Value::Array(items) => items.iter().map(super::format::ini_value_text).collect(),
         toml::Value::String(s) => super::format::split_ini_list(s),
         toml::Value::Integer(i) => vec![i.to_string()],
         toml::Value::Float(f) => vec![f.to_string()],

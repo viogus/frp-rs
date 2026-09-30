@@ -204,7 +204,7 @@ fn ini_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>>
                 continue;
             }
 
-            let parsed_value = infer_ini_value(value_str);
+            let parsed_value = ini_value_for_key(value_str, &key, current, &sections);
 
             match current {
                 Some(index) => {
@@ -410,6 +410,40 @@ fn insert_ini_section(
         cur.insert(key, value);
     }
     Ok(())
+}
+
+/// The value a `key = value` line contributes, applying Go's legacy-`start`
+/// text model to the one `[common] start` key.
+///
+/// `gopkg.in/ini.v1` never parses a value into a list: Go fills the legacy
+/// `Start []string` (`pkg/config/legacy/client.go:119`) through
+/// `Key.Strings(",")`, which splits the **raw value text** (key.go:492), so the
+/// field sees the text the file wrote. Everything `infer_ini_value` produces
+/// renders back to exactly that text (`ini_value_text`) except a `[a, b]`
+/// bracket literal, which is parsed into an `Array`; for this one key that loss
+/// decides which sections Go dispatches, so the literal is handed back as text.
+/// Measured on Go v0.71.0: `[common] start = ["start"]` next to a `[start]`
+/// section registers no proxy (`startProxy` is the single piece `["start"]`),
+/// while a bare `start = p1,p2` selects both sections.
+fn ini_value_for_key(
+    value_str: &str,
+    key: &str,
+    current: Option<usize>,
+    sections: &[(String, toml::Table)],
+) -> toml::Value {
+    let parsed_value = infer_ini_value(value_str);
+    let common_start = key == "start"
+        && matches!(parsed_value, toml::Value::Array(_))
+        && !round_trips(&parsed_value, value_str)
+        && current.is_some_and(|index| {
+            sections
+                .get(index)
+                .is_some_and(|(name, _)| name == "common")
+        });
+    if common_start {
+        return toml::Value::String(value_str.to_string());
+    }
+    parsed_value
 }
 
 /// Deepest legitimate nesting for infer_ini_value (array literal inside a

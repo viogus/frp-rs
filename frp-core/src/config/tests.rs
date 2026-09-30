@@ -12528,3 +12528,246 @@ fn legacy_ini_common_start_list_selects_named_sections() {
         }
     }
 }
+
+/// **An array literal in `[common] start` names no section.**
+///
+/// Go fills `Start []string` (`pkg/config/legacy/client.go:119`) through
+/// `gopkg.in/ini.v1`, whose `Key.Strings(",")` splits the **raw value text**
+/// (key.go:492): `start = ["start"]` is the single piece `["start"]`, which
+/// matches no section, and `startAll` stays false. `frp-core/src/config/format.rs`
+/// instead infers a TOML array for `[..]` literals — a deliberate frp-rs
+/// extension for slice-typed fields — so the dispatch used to see the
+/// *elements*. `ini_value_for_key` (`frp-core/src/config/format.rs:414`) keeps
+/// this one key as its text, and the trailing `cfg.start` assertions are those
+/// same pieces after Go's comma split and trim. Measured on Go v0.71.0 (rc 0,
+/// no proxy registered): `["start"]` beside a `[start]` section, `["p1","p2"]`,
+/// `[]`, and `[p1, 2, p2]`.
+#[test]
+fn legacy_ini_start_array_literal_selects_nothing_like_go() {
+    let head = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
+    let p1 = "[p1]\ntype = tcp\nlocal_port = 8001\nremote_port = 18001\n";
+    let p2 = "[p2]\ntype = tcp\nlocal_port = 8003\nremote_port = 18003\n";
+    let start = "[start]\ntype = tcp\nlocal_port = 8002\nremote_port = 18002\n";
+
+    for (label, body, expected) in [
+        (
+            "a quoted name is one bracket-carrying piece",
+            format!("{head}start = [\"start\"]\n{p1}{start}"),
+            vec!["[\"start\"]"],
+        ),
+        (
+            "two quoted names match no section either",
+            format!("{head}start = [\"p1\",\"p2\"]\n{p1}{p2}{start}"),
+            vec!["[\"p1\"", "\"p2\"]"],
+        ),
+        (
+            "an empty literal is the piece `[]`",
+            format!("{head}start = []\n{p1}{start}"),
+            vec!["[]"],
+        ),
+        (
+            "a mixed literal keeps its brackets and trims each piece",
+            format!("{head}start = [p1, 2, p2]\n{p1}{p2}{start}"),
+            vec!["[p1", "2", "p2]"],
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let cfg = load_client_config(path.to_str().unwrap(), strict)
+                .unwrap_or_else(|e| panic!("{label}, strict={strict}: {e}"));
+            assert!(
+                cfg.proxies.is_empty(),
+                "{label}, strict={strict}: {:?}",
+                cfg.proxies.iter().map(|p| &p.name).collect::<Vec<_>>()
+            );
+            let pieces: Vec<&str> = cfg.start.iter().map(String::as_str).collect();
+            assert_eq!(pieces, expected, "{label}, strict={strict}");
+        }
+    }
+}
+
+/// **A comma list of non-string scalars keeps every piece.**
+///
+/// `start = 1,2` is Go's pieces `1` and `2` through `Key.Strings(",")`
+/// (key.go:492) — no section carries those names, so nothing is dispatched —
+/// while `start = p1,2` still selects `[p1]`; measured on Go v0.71.0: rc 0 with
+/// no proxy, and rc 0 with proxy `p1`. Such a list round-trips against its raw
+/// text, so `frp-core/src/config/format.rs` keeps it an array and
+/// `ini_start_names` renders each element as Go's text
+/// (`frp-core/src/config/normalize.rs:2461`). Dropping the non-string element
+/// instead emptied the list and let `startAll` collect every section.
+#[test]
+fn legacy_ini_numeric_start_list_selects_nothing_like_go() {
+    let head = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
+    let p1 = "[p1]\ntype = tcp\nlocal_port = 8001\nremote_port = 18001\n";
+    let start = "[start]\ntype = tcp\nlocal_port = 8002\nremote_port = 18002\n";
+
+    for (label, body, expected) in [
+        (
+            "a numeric list names no section",
+            format!("{head}start = 1,2\n{p1}{start}"),
+            Vec::<&str>::new(),
+        ),
+        (
+            "a mixed list still selects the named section",
+            format!("{head}start = p1,2\n{p1}{start}"),
+            vec!["p1"],
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let cfg = load_client_config(path.to_str().unwrap(), strict)
+                .unwrap_or_else(|e| panic!("{label}, strict={strict}: {e}"));
+            let mut names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(names, expected, "{label}, strict={strict}");
+        }
+    }
+}
+
+/// **An empty `[common] start` selects every section like Go's `startAll`.**
+///
+/// `Key.Strings(",")` returns an empty slice for empty text (key.go:492), so
+/// `startProxy` is empty, `startAll` is true (`pkg/config/legacy/client.go:232`)
+/// and every section is collected — including one whose `role` is invalid, which
+/// is then refused (`pkg/config/legacy/client.go:283`). Measured on Go v0.71.0:
+/// `start = ""` beside a valid `[p1]` and `[start]` registers both, while the
+/// same value beside `[p1] role = "weird"` is rc 1 with `proxy p1 role should be
+/// 'server' or 'visitor'`; `start =` (blank) behaves identically. The empty set
+/// must stay `None`, not `Some({})`: treating it as a list selects nothing and
+/// silently swallows the refusal.
+#[test]
+fn legacy_ini_empty_start_dispatches_every_section_like_go() {
+    let head = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
+    let p1 = "[p1]\ntype = tcp\nlocal_port = 8001\nremote_port = 18001\n";
+    let start = "[start]\ntype = tcp\nlocal_port = 8002\nremote_port = 18002\n";
+
+    for (label, body) in [
+        ("a blank value", format!("{head}start =\n{p1}{start}")),
+        (
+            "an empty string",
+            format!("{head}start = \"\"\n{p1}{start}"),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let cfg = load_client_config(path.to_str().unwrap(), strict)
+                .unwrap_or_else(|e| panic!("{label}, strict={strict}: {e}"));
+            let mut names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(names, vec!["p1", "start"], "{label}, strict={strict}");
+        }
+    }
+
+    for (label, body) in [
+        (
+            "a blank value still role-checks",
+            format!("{head}start =\n[p1]\nrole = \"weird\"\n"),
+        ),
+        (
+            "an empty string still role-checks",
+            format!("{head}start = \"\"\n[p1]\nrole = \"weird\"\n"),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let err = format!(
+                "{}",
+                load_client_config(path.to_str().unwrap(), strict)
+                    .expect_err("startAll must dispatch every section")
+            );
+            assert!(
+                err.contains("proxy p1 role should be 'server' or 'visitor'"),
+                "{label}, strict={strict}: {err}"
+            );
+        }
+    }
+}
+
+/// **A section the `[common] start` list does not name is never role-checked.**
+///
+/// Go continues before the role switch when the list does not name the section
+/// (`if !startAll && !shouldStart { continue }`,
+/// `pkg/config/legacy/client.go:253-261`), so a `[p2] role = "weird"` without
+/// `type`/ports — not a collector candidate, hence never removed — is never
+/// parsed: measured on Go v0.71.0, `[common] start = p1` beside a valid `[p1]`
+/// and that `[p2]` is rc 0 with proxy `p1`. Non-strict frp-rs matches; the strict
+/// checker still reports the leftover table (`unknown field "p2"`), the
+/// pre-existing residue of a non-candidate section documented at
+/// `frp-core/src/config/tests.rs:11907`. Without the `ini_section_started`
+/// guard the role scan at `frp-core/src/config/normalize.rs:2164` refuses the
+/// file (rc 1, `proxy p2 role should be 'server' or 'visitor'`).
+#[test]
+fn legacy_ini_start_skips_role_scan_for_unlisted_sections() {
+    let body = concat!(
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nstart = p1\n",
+        "[p1]\ntype = tcp\nlocal_port = 8001\nremote_port = 18001\n",
+        "[p2]\nrole = \"weird\"\n",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(&path, body).unwrap();
+
+    let cfg = load_client_config(path.to_str().unwrap(), false)
+        .expect("the unlisted section must be skipped, not role-checked");
+    let names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["p1"]);
+
+    let err = format!(
+        "{}",
+        load_client_config(path.to_str().unwrap(), true)
+            .expect_err("strict mode still reports the leftover table")
+    );
+    assert!(err.contains("unknown field \"p2\""), "{err}");
+    assert!(!err.contains("role should be"), "{err}");
+}
+
+/// **`ini_start_names` maps a `[common] start` value to Go's names.**
+///
+/// Unit tooth for the dispatch helper (`frp-core/src/config/normalize.rs:2461`),
+/// whose `Table` arm is masked end to end: a nested `[common.start]` header is a
+/// section of its own in Go's `gopkg.in/ini.v1`, so `[common]` has no `start` key
+/// and `startAll` is true, while frp-rs nests the table under `common` and then
+/// writes it back to the root `start` — the resulting `invalid type: map,
+/// expected a sequence` (the disclosed residual `a8`/`a9`) hides whichever
+/// proxies the dispatch picked. The mapping is therefore pinned directly: text
+/// splits into Go's `Key.Strings(",")` pieces, empty text is `startAll` (`None`),
+/// a comma array keeps each element's text, and a nested table is `None` — never
+/// its keys.
+#[test]
+fn legacy_ini_start_names_maps_go_text_and_nested_tables() {
+    use std::collections::HashSet;
+
+    let table = toml::Value::Table(
+        [("zzz".to_string(), toml::Value::Integer(1))]
+            .into_iter()
+            .collect(),
+    );
+    assert_eq!(super::normalize::ini_start_names(&table), None);
+
+    let text = toml::Value::String("p2, p1".to_string());
+    assert_eq!(
+        super::normalize::ini_start_names(&text),
+        Some(HashSet::from(["p2".to_string(), "p1".to_string()]))
+    );
+
+    let empty = toml::Value::String(String::new());
+    assert_eq!(super::normalize::ini_start_names(&empty), None);
+
+    let array = toml::Value::Array(vec![
+        toml::Value::String("p1".to_string()),
+        toml::Value::Integer(2),
+    ]);
+    assert_eq!(
+        super::normalize::ini_start_names(&array),
+        Some(HashSet::from(["p1".to_string(), "2".to_string()]))
+    );
+}
