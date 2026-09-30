@@ -29,13 +29,24 @@ Besides the throughput matrix, this directory also tracks:
 - `memory-<hostname>.jsonl` — live-heap bytes and RSS per mode
   (`idle_plain`, `idle_encrypt`, `churn_plain`, …) at 500 connections,
   produced by `scripts/memory-baseline.sh`.
+- `rss-soak-<hostname>.jsonl` — a **head-to-head RSS time series**: frp-rs
+  `frps`+`frpc` and the Go frp release `frps`+`frpc` run concurrently with the
+  same proxy set and the same traffic (short-lived connection churn plus a few
+  long-lived byte streams), sampled every 30–60 s for hours, produced by
+  `scripts/rss-soak.sh`. Unlike `memory-<hostname>.jsonl` this uses plain
+  release binaries and reads RSS only, because the mem-profile allocator
+  counters do not exist in Go. It is the evidence for (or against) the
+  "no GC ⇒ stable RSS" positioning claim; `memory-baseline.sh` remains the
+  frp-rs-only, allocator-counter baseline.
 
-Both are host-specific like the throughput baseline — compare only against
+All are host-specific like the throughput baseline — compare only against
 same-host runs. Regenerate commands:
 
 ```bash
 bash scripts/latency-baseline.sh
 bash scripts/memory-baseline.sh
+# duration_s interval_s — a real soak wants hours; the short form just validates
+bash scripts/rss-soak.sh 10800 45
 ```
 
 ## Regenerate
