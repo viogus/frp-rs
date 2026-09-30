@@ -907,5 +907,12 @@ mod dir_registry_tests {
             log.contains("directory registry mutex was poisoned"),
             "recovery must log the poison it recovered from; log={log:?}"
         );
+        // Reached only after **every** assertion above has run. The
+        // `Run frps bin unit tests` CI step greps this line out of the
+        // `--nocapture` output, so a test that returns early — and therefore
+        // asserts nothing — reds that lane even though libtest still reports
+        // `1 passed` for the name: a count/name check alone cannot see a gutted
+        // body.
+        println!("dir-registry-pin: ok, recovered {} entries", guard.len());
     }
 }

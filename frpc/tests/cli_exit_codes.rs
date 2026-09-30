@@ -628,6 +628,53 @@ fn config_dir_where_every_service_fails_to_run_exits_like_dash_c() {
     );
 }
 
+/// The client half of the file-order sort pin
+/// (`frps/tests/cli_exit_codes.rs::config_dir_exits_the_first_files_code_when_a_later_file_fails_to_load`).
+/// `frpc/src/main.rs`'s all-failed decision sorts `failures` by file index, and
+/// the only fixture that observes that sort is this mix: `a.toml`'s service
+/// stops at **run** time — its task returns `Err(EXIT_RUNTIME)`/1 *after* the
+/// loop — while `b.toml` fails to **load** (`EXIT_CONFIG`/2, recorded in file
+/// order first). Sorted, the file-order first failure is `a.toml`'s 1; with
+/// `failures.sort_by_key(|(file_index, _)| *file_index)` deleted the lane exits
+/// `b.toml`'s 2 instead.
+#[test]
+fn config_dir_exits_the_first_files_code_when_a_later_file_fails_to_load() {
+    let dir = TempDir::new();
+    // A port nothing listens on: a.toml's login fails immediately (the default
+    // `loginFailExit = true`), so its task returns `Err(EXIT_RUNTIME)`.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let p = l.local_addr().expect("local_addr").port();
+        drop(l);
+        p
+    };
+    let conf_d = dir.path("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    std::fs::write(
+        std::path::Path::new(&conf_d).join("a.toml"),
+        format!("serverAddr = \"127.0.0.1\"\nserverPort = {closed}\n"),
+    )
+    .expect("write a.toml");
+    // Not valid TOML: rejected in the loader, so this file never becomes a task.
+    std::fs::write(
+        std::path::Path::new(&conf_d).join("b.toml"),
+        "this is not valid toml\n",
+    )
+    .expect("write b.toml");
+
+    let out = run_frpc(&["--config-dir", &conf_d]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the all-failed decision must exit the **file-order first** failure's code \
+         (a.toml's EXIT_RUNTIME/1), not the entry appended last (b.toml's load \
+         failure, 2); stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
 /// The **converse** of the pin above, and the shape that makes the all-failed
 /// comparison in `frpc/src/main.rs` load-bearing: one file's service cannot log
 /// in and stops at run time (its task returns `Err(EXIT_RUNTIME)`), the other

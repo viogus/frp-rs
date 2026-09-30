@@ -584,7 +584,9 @@ fn oidc_without_an_issuer_is_refused_with_3_where_go_panics() {
 ///
 /// So the barrier is a **child-specific progress witness**: the SIGUSR1 task
 /// logs `SIGUSR1 reload ready` after its `tokio::signal::unix::signal` call
-/// returns (`frps/src/main.rs:207-215`), i.e. only after that `frps` is past its
+/// returns (`frps/src/main.rs:295` installs the handler, `frps/src/main.rs:528`
+/// logs the marker; the `-c` lane's twin is `frps/src/main.rs:719`/`:721`),
+/// i.e. only after that `frps` is past its
 /// own startup logging. A foreign listener cannot fake it — only the child under
 /// test writes to that log path. If the line never appears (a platform without
 /// the handler), the helper panics with the log rather than silently weakening
@@ -995,6 +997,90 @@ fn config_dir_where_every_file_fails_to_load_exits_like_dash_c() {
         Some(1),
         "every file failing to load must exit the same code `-c` does (1), not \
          the old EXIT_CONFIG 2; stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
+/// The **file-order sort** in the all-failed decision is load-bearing for
+/// exactly one mix: a *later* file failing to **load** — recorded in file order
+/// by the construction loop — plus an *earlier* file whose task fails **after**
+/// the loop, so the two entries are appended out of order. Every other
+/// all-failed fixture here fails in a single phase (or in file order within a
+/// phase), so deleting `failures.sort_by_key(|(file_index, _)| *file_index)` in
+/// `frps/src/main.rs` left the whole lane green — the review's F1.
+///
+/// `a.toml` carries no `[auth].token`, so its **task** returns
+/// `Err(EXIT_AUTH)`/3 after the loop, while `b.toml` is unparseable and pushes
+/// its load failure (`EXIT_RUNTIME`/1) into `load_failures` first. Sorted by
+/// index the file-order first failure is `a.toml`'s 3 — the code `-c a.toml`
+/// exits on — while with the sort deleted the lane exits `b.toml`'s 1.
+#[test]
+fn config_dir_exits_the_first_files_code_when_a_later_file_fails_to_load() {
+    let dir = TempDir::new();
+    let conf_d = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+    let port = ephemeral_port();
+    // No `[auth].token`: construction is refused with `EXIT_AUTH`/3 *inside the
+    // task*, i.e. after the loop has already recorded `b.toml`'s load failure.
+    std::fs::write(conf_d.join("a.toml"), format!("bindPort = {port}\n")).expect("write a.toml");
+    // Not valid TOML: rejected in the loader, so this file never becomes a task.
+    std::fs::write(conf_d.join("b.toml"), "this is not valid toml\n").expect("write b.toml");
+    let a = conf_d.join("a.toml");
+    let a = a.to_str().expect("utf-8 temp path");
+
+    let control = run_frps(&["-c", a]);
+    assert_eq!(
+        control.status.code(),
+        Some(3),
+        "control: `-c a.toml` (no auth token) must exit 3 (EXIT_AUTH), the code \
+         the sorted all-failed decision must reproduce; stdout={:?} stderr={:?}",
+        stdout_of(&control),
+        stderr_of(&control),
+    );
+
+    let out = run_frps(&["--config-dir", conf_d.to_str().expect("utf-8 temp path")]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "the all-failed decision must exit the **file-order first** failure's code \
+         (a.toml's EXIT_AUTH/3), not the entry appended last (b.toml's load \
+         failure, 1); stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+}
+
+/// An **existing but empty** `--config-dir` must be refused with
+/// `EXIT_CONFIG`/2 and the empty-directory diagnostic, not fall through to the
+/// all-load-failed arm below. The client's twin is pinned in
+/// `frpc/tests/cli_exit_codes.rs::config_dir_refusals_exit_2_where_go_exits_0`;
+/// on the server only the **message** discriminates: with `files.is_empty()`
+/// deleted the directory still exits 2, because the all-load-failed arm's
+/// `unwrap_or(EXIT_CONFIG)` fires when there are no load failures, but it
+/// reports "No services started — all config files failed to load" instead.
+/// This pin asserts both the code and that diagnostic.
+#[test]
+fn config_dir_refuses_an_empty_directory_with_2() {
+    let dir = TempDir::new();
+    let conf_d = dir.0.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("create conf.d");
+
+    let out = run_frps(&["--config-dir", conf_d.to_str().expect("utf-8 temp path")]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an existing but empty --config-dir must exit 2 (EXIT_CONFIG); \
+         stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out),
+    );
+    assert!(
+        combined(&out).contains("No config files found in directory"),
+        "the empty-directory refusal must name the condition — the \
+         all-load-failed arm's message means `files.is_empty()` was skipped; \
+         stdout={:?} stderr={:?}",
         stdout_of(&out),
         stderr_of(&out),
     );

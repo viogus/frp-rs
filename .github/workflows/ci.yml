@@ -207,15 +207,27 @@ jobs:
       # time and the other serves, so the lane must return 0 (it was unpinned:
       # `if true` in place of `failures.len() == files.len()` kept every
       # all-failed pin green).
-      # 36 → 38 re-derived on this tree: the rebase resolution kept `main`'s 36,
-      # but the merged tree already measured **37** (the converse pin above is part
+      # 36 → 38 re-derived on this tree: the rebase resolution kept **this
+      # branch's own parent** `b49adaf0` (`32a0e8d2` after the rebase), which
+      # measured 36 — `main` `3f66d823` has neither of this branch's rounds and
+      # measures 34 — but the merged tree already measured **37** (the converse
+      # pin above is part
       # of it), and round 3's second half adds the **swapped file order** (+1)
       # (`config_dir_where_the_first_service_fails_keeps_serving_and_exits_zero`) —
       # the failure sits in `a.toml` and the survivor in `b.toml`, so the
       # `... || failures.iter().any(|(file_index, _)| *file_index == 0)` mutant,
       # which the survivor-first pin above cannot see, is red. Measured with
       # `cargo test -p frps --test cli_exit_codes -- --list`.
-      FRPS_CLI_TESTS: "38"
+      # 38 → 40 with round 4: +2, both un-gated so this lane and the
+      # `--all-features` sweep each gain them:
+      # `config_dir_exits_the_first_files_code_when_a_later_file_fails_to_load`
+      # (the deleted-`sort_by_key` discriminator — a *later* file's load failure
+      # plus an *earlier* file's task failure, the only mix that observes the
+      # sort) and `config_dir_refuses_an_empty_directory_with_2` (the
+      # `files.is_empty()` arm, whose only discriminating observable is the
+      # empty-directory message: the fall-through exits 2 as well). Re-derived
+      # on this tree with `cargo test -p frps --test cli_exit_codes -- --list`.
+      FRPS_CLI_TESTS: "40"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
       # 11 → 13 with the one `auth.method` policy: +2
@@ -252,8 +264,10 @@ jobs:
       # the converse pin — one file's service stops at run time, the other keeps
       # retrying (`loginFailExit = false`, honoured by `frpc-tiny`) and the lane
       # exits 0 on SIGTERM — ungated for the same reason.
-      # 20 → 22 re-derived on this tree: the rebase resolution kept `main`'s 20,
-      # but the merged tree already measured **21** (the converse pin above), and
+      # 20 → 22 re-derived on this tree: the rebase resolution kept **this
+      # branch's own parent** `b49adaf0` (`32a0e8d2` after the rebase), which
+      # measured 20 — `main` `3f66d823` has neither of this branch's rounds and
+      # measures 19 — but the merged tree already measured **21** (the converse pin above), and
       # round 3's second half adds the **swapped file order** (+1)
       # (`config_dir_where_the_first_service_fails_keeps_retrying_and_exits_zero`) —
       # `a.toml` holds the closed-port service with the default
@@ -261,7 +275,13 @@ jobs:
       # so the `any(file_index == 0)` mutant is red. Measured with
       # `cargo test -p frpc --no-default-features --features tiny --test
       # cli_exit_codes -- --list`.
-      FRPC_TINY_CLI_TESTS: "22"
+      # 22 → 23 with round 4: +1
+      # (`config_dir_exits_the_first_files_code_when_a_later_file_fails_to_load`),
+      # the deleted-`sort_by_key` discriminator — a *later* file's load failure
+      # plus an *earlier* file's run failure — ungated, so `frpc-tiny` reaches
+      # it. Re-derived with `cargo test -p frpc --no-default-features --features
+      # tiny --test cli_exit_codes -- --list`.
+      FRPC_TINY_CLI_TESTS: "23"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
@@ -296,19 +316,36 @@ jobs:
         # `FRPS_CLI_TESTS` (that env var counts the integration target
         # `frps/tests/cli_exit_codes.rs`), so adding or removing a test in this
         # inline module moves only the single literal in this step.
+        #
+        # The guard is not count-only. Round 4 measured two mutants that a count
+        # of 1 cannot see: renaming the test (still one test, still green) and
+        # returning early as the body's first statement (one test, `1 passed`,
+        # zero assertions). So the step also greps the exact list entry and the
+        # pin's `--nocapture` completion marker, which is printed only after
+        # every assertion has run.
         shell: bash
         run: |
           set -eo pipefail
           log=/tmp/frps-bin-unit-tests.log
-          cargo test -p frps --bin frps --all-features --color never 2>&1 | tee "$log"
+          # `--nocapture` puts the pin's own completion marker in the log: a body
+          # that returns before its assertions still reports `1 passed`, and only
+          # the marker distinguishes "ran the assertions" from "ran early".
+          cargo test -p frps --bin frps --all-features --color never -- --nocapture 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
-          n=$(cargo test -p frps --bin frps --all-features --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          expected="dir_registry_tests::lock_dir_registry_recovers_a_poisoned_registry"
+          marker="dir-registry-pin: ok, recovered 3 entries"
+          list=/tmp/frps-bin-unit-tests.list
+          cargo test -p frps --bin frps --all-features --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
+          n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
+          named=$(grep -E -c "^${expected}: test$" "$list" || true)
           status=0
           grep -q "Running unittests src/main.rs" "$log.plain" || status=1
           grep -q "test result: ok. 1 passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "1" ] || status=1
+          [ "$named" = "1" ] || status=1
+          grep -q "$marker" "$log.plain" || status=1
           if [ "$status" != "0" ]; then
-            echo "::error::frps bin unit-test guard failed (status=$status, file=$n, log=$log)"
+            echo "::error::frps bin unit-test guard failed (status=$status, file=$n, named=$named, log=$log)"
             if [ -n "$n" ] && [ "$n" != "1" ]; then
               if [ "$n" -lt "1" ]; then
                 echo "::error::the inline test module in frps/src/main.rs lists $n tests, this step expects 1 — its tests were deleted or the module was disabled; restore them rather than lowering this literal"
@@ -316,10 +353,16 @@ jobs:
                 echo "::error::the inline test module in frps/src/main.rs lists $n tests, this step expects 1: move the single literal in this shell step from 1 to $n"
               fi
             fi
+            if [ "$named" != "1" ]; then
+              echo "::error::the inline test module in frps/src/main.rs does not list ${expected} — the pin was renamed, deleted, or cfg'd out; restore it rather than re-pointing this name"
+            fi
+            if [ "$(grep -c "$marker" "$log.plain" || true)" = "0" ]; then
+              echo "::error::the inline pin did not print its completion marker (\"$marker\") — a body that returns before its assertions passes libtest while asserting nothing; restore the assertions"
+            fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frps bin unit-test guard ok: $n tests listed (expected 1), 0 failed"
+          echo "frps bin unit-test guard ok: $n tests listed (expected 1, ${expected}), marker seen, 0 failed"
       - name: Run vnet unit tests (nathole membership/cap guards)
         # frps/frpc default features exclude `vnet`, so the default-feature
         # `cargo test --workspace` steps never compile the nathole.rs vnet
