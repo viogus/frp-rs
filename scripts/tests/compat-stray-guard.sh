@@ -26,8 +26,10 @@
 #   4  degenerate `TEST_DIR`: empty and `/` are refused outright (with
 #      `TEST_DIR=""` the ownership pattern `*"$TEST_DIR/"*` becomes `*/*` and
 #      would match an unrelated process).
-#   5  cleanup_pids waits on the tracked pids only: an untracked live child does
-#      not hang the teardown before the guard can run.
+#   5  cleanup_pids waits on the tracked pids only: an untracked live child is
+#      still running when the teardown returns, rather than being waited on.
+#   6  the scratch dir is documented as overridable, so a concurrent compat run
+#      does not share this run's census.
 #
 # Self-contained: no network, no compat run, no dependence on this repo's
 # binaries. Temporary trees and synthetic processes are removed on exit.
@@ -57,22 +59,44 @@ done
 ROOT=$(cd -P -- "$(dirname -- "$self")/../.." && pwd)
 LIB="$ROOT/scripts/lib/compat-stray-guard.sh"
 
-[ -f "$LIB" ] || { printf 'FAIL  guard library not found: %s\n' "$LIB"; exit 1; }
-
 checks=0
 fails=0
+# Pinned total. This suite is the only thing that pins the guard, so a suite
+# that silently stops checking must not exit green: `exit "$fails"` alone is
+# happy with `RESULT: 0 fixture check(s) hold`. `cleanup_all` enforces the floor
+# on every exit path, and it is installed before this file's first failure
+# point, so an early `exit 0` — a neutered scenario body, say — cannot skip it.
+MIN_CHECKS=21
+LIVE=""   # every synthetic pid we start, for the exit trap
+WORK=""
+
+cleanup_all() {
+  local rc=$? p cmd
+  for p in $LIVE; do
+    # Reap only this run's own synthetics. A pid the guard already reaped can be
+    # recycled before this trap runs, and killing a stranger is the hazard this
+    # whole suite pins; the scratch dir's basename is still in the argv of
+    # anything we started, and survives `/var` -> `/private/var` normalisation.
+    cmd=$(ps -o command= -p "$p" 2>/dev/null) || continue
+    case "$cmd" in *"/${WORK##*/}/"*) kill -9 "$p" 2>/dev/null || true ;; esac
+  done
+  [ -z "$WORK" ] || rm -rf "$WORK"
+  if [ "$rc" -eq 0 ] && [ "$checks" -lt "$MIN_CHECKS" ]; then
+    printf 'FAIL  suite exited 0 after only %d check(s); expected at least %d — scenarios did not run\n' \
+      "$checks" "$MIN_CHECKS" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap cleanup_all EXIT
+
+[ -f "$LIB" ] || { printf 'FAIL  guard library not found: %s\n' "$LIB"; exit 1; }
+
 ok()  { checks=$((checks + 1)); printf '  ok    %s\n' "$1"; }
 bad() { checks=$((checks + 1)); fails=$((fails + 1)); printf '  FAIL  %s\n' "$1"; }
 hdr() { printf '\n%s\n' "$1"; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/compat-guard.XXXXXX")"
-LIVE=""   # every synthetic pid we start, for the exit trap
-
-cleanup_all() {
-  for p in $LIVE; do kill -9 "$p" 2>/dev/null || true; done
-  rm -rf "$WORK"
-}
-trap cleanup_all EXIT
 
 sleep_bin=$(command -v sleep) || { printf 'FAIL  cannot find sleep\n'; exit 1; }
 BASH_BIN=${BASH:-/bin/bash}
@@ -86,6 +110,37 @@ spawn_fake() {
   ln -sfn "$sleep_bin" "$1/frps"
   "$1/frps" 300 >/dev/null 2>&1 &
   printf '%s' "$!"
+}
+
+# wait_exec <pid> — wait until the child has exec'd the helper image, so a signal
+# sent to it is delivered to `sleep` instead of blocking in the fork. A child that
+# has not exec'd yet still reports *this* shell's argv (scenario 5's helper is
+# `sleep`, so the image is recognisable by that word). Without this the SIGTERM
+# misses, `cleanup_pids` runs its full 10 s grace deadline, and the wall-clock
+# assertion below reds on a healthy run — measured ~1 run in 5 at load 28-40.
+# Returns 1 if the image never changed within 2 s.
+wait_exec() {
+  local pid=$1 i=0 cmd
+  while (( i < 100 )); do
+    cmd=$(ps -o command= -p "$pid" 2>/dev/null) || return 0
+    case "$cmd" in *sleep*) return 0 ;; esac
+    sleep 0.02
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# wait_gone <pid> — SIGKILL delivery and reaping are asynchronous, so `kill -0`
+# succeeding immediately after a `kill -9` is not "the process survived the
+# guard". Polls for up to 2 s and returns 1 only if the pid is still there.
+wait_gone() {
+  local pid=$1 i=0
+  while (( i < 100 )); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.02
+    i=$((i + 1))
+  done
+  return 1
 }
 
 # --- fixture self-check: the synthetic server must be visible at all ---------
@@ -141,6 +196,7 @@ export TEST_DIR="$td2"
 # shellcheck source=/dev/null
 source "$LIB"
 straypid=$(spawn_fake "$td2/scenario")
+LIVE="$LIVE $straypid"   # the guard should reap it; the exit trap is the net
 sleep 0.3
 out=$(assert_no_strays 2>&1); rc=$?
 if [ "$rc" -eq 1 ]; then
@@ -152,10 +208,10 @@ case "$out" in
   *"$straypid"*) ok "report names the stray pid $straypid" ;;
   *) bad "report does not name the stray pid: $(printf '%s' "$out" | tr '\n' ' ')" ;;
 esac
-if kill -0 "$straypid" 2>/dev/null; then
-  bad "stray $straypid survived the guard"
-else
+if wait_gone "$straypid"; then
   ok "stray $straypid was reaped"
+else
+  bad "stray $straypid survived the guard"
 fi
 if kill -0 "$peerpid" 2>/dev/null; then
   ok 'out-of-tree peer still survives (name-only match would have killed it)'
@@ -196,33 +252,53 @@ hdr 'scenario 5: cleanup_pids does not wait on an untracked child'
 export TEST_DIR="$WORK/run5"
 # shellcheck source=/dev/null
 source "$LIB"
-sleep 6 &                 # untracked: must not be waited on by cleanup_pids
+sleep 30 &                # untracked: must not be waited on by cleanup_pids
 untracked=$!
 sleep 30 &                # tracked: reaped by cleanup_pids
 tracked=$!
-LIVE="$LIVE $untracked"
 PIDS="$tracked"
+# Synchronise before signalling: signals are not delivered to a fork child that
+# has not exec'd yet, so `kill` here would miss and the grace loop would burn its
+# full 10 s deadline on a healthy run. See `wait_exec`.
+if wait_exec "$tracked"; then
+  ok "tracked helper $tracked is running its own image"
+else
+  bad "tracked helper $tracked is still the forked shell after the 2s sync deadline"
+fi
 started=$SECONDS
 cleanup_pids
 elapsed=$((SECONDS - started))
-if [ "$elapsed" -lt 3 ]; then
+# The property is "cleanup_pids returned while the untracked child was still
+# running", not a wall-clock bound: the grace loop above may legitimately spend
+# up to 10 s on a tracked server that ignores SIGTERM, so a tight `elapsed < N`
+# reds on healthy runs. A bare `wait` cannot return while the untracked child
+# lives, so this liveness check is the tooth; the 20 s bound below is only a hang
+# guard (slack over the 10 s grace, well under the helper's 30 s).
+if kill -0 "$untracked" 2>/dev/null; then
+  ok 'untracked child was still running when cleanup_pids returned'
+else
+  bad 'untracked child was gone when cleanup_pids returned — cleanup_pids waited on it'
+fi
+if [ "$elapsed" -lt 20 ]; then
   ok "cleanup_pids returned in ${elapsed}s with an untracked live child"
 else
   bad "cleanup_pids took ${elapsed}s — it waited on an untracked child (bare \`wait\`)"
 fi
-if kill -0 "$tracked" 2>/dev/null; then
-  bad "tracked pid $tracked survived cleanup_pids"
-else
+if wait_gone "$tracked"; then
   ok 'tracked pid was reaped'
+else
+  bad "tracked pid $tracked survived cleanup_pids"
 fi
 if [ -z "$PIDS" ]; then ok 'PIDS reset after cleanup_pids'; else bad "PIDS not reset: $PIDS"; fi
 kill -9 "$untracked" 2>/dev/null || true
+wait "$untracked" 2>/dev/null || true
 
 # --- scenario 6: the scratch dir is documented as overridable ---------------
 # The guard scopes itself to `$TEST_DIR/`, so two concurrent runs sharing the
 # default would count and reap each other's servers; the fix is that the path is
-# overridable (`scripts/compat-test.sh` line ~31). `--help` exits before the
-# harness sources the guard, so this is a cheap, deterministic check.
+# overridable (`scripts/compat-test.sh` sets
+# `TEST_DIR="${FRP_COMPAT_TEST_DIR:-/tmp/frp-compat-test}"`). `--help` exits
+# before the harness sources the guard, so this is a cheap, deterministic check.
 hdr 'scenario 6: FRP_COMPAT_TEST_DIR is documented in --help'
 out=$("$BASH_BIN" "$ROOT/scripts/compat-test.sh" --help 2>&1); rc=$?
 if [ "$rc" -eq 0 ]; then ok 'compat-test.sh --help exits 0'; else bad "compat-test.sh --help rc $rc"; fi
