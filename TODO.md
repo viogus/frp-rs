@@ -6039,7 +6039,7 @@ nothing about whether the described behaviour still holds.
   Windows/macOS release lanes, the Docker image's compiler, and the other
   workflows' install cost.
 
-- [ ] **The compat lanes install a floating Go toolchain that nothing uses.**
+- [x] **The compat lanes install a floating Go toolchain that nothing uses.**
   Evidence: `.github/workflows/compat.yml:37-39` and
   `.github/workflows/xtcp-compat.yml:54-57` run `actions/setup-go@v5` with
   `go-version: '>=1.22.0'`, so which Go actually gets used is a property of the
@@ -6054,7 +6054,7 @@ nothing about whether the described behaviour still holds.
   `git grep -nE '(^|[^a-zA-Z_/.-])go (build|run)' -- scripts/ .github/` finds
   nothing, and `scripts/download-go-frp.sh:29` fetches the **prebuilt** release
   tarball (`https://github.com/fatedier/frp/releases/download/v${VERSION}/…`).
-  It is a leftover of a removed path that `CHANGELOG.md:1329-1330` (0.3.1)
+  It is a leftover of a removed path that `CHANGELOG.md:2359-2360` (0.3.1)
   records — `build_go_frp_v2()` (clone + `go build`, cached to
   `/tmp/frp-source-build/`) exists nowhere in the tree, yet
   `.github/workflows/compat.yml:48` still caches that orphaned
@@ -6065,7 +6065,20 @@ nothing about whether the described behaviour still holds.
   nothing consumes it, and the `>=` range makes the resolved version a
   runner-image property.
 
-- [ ] **The Docker source build is outside the toolchain pin and floats its own compiler.**
+  **Done (`6c2a9a1a`).** Took the first branch: the `actions/setup-go` step is gone from
+  both lanes and the orphaned `/tmp/frp-source-build/` cache path with it
+  (`.github/workflows/compat.yml:42-51`, the step now simply named `Cache cargo`). The
+  citations in the evidence above (`compat.yml:37-39`, `xtcp-compat.yml:54-57`,
+  `compat.yml:48`) are the pre-change state and no longer resolve. Re-measured at the new
+  head: `git ls-files '*.go'` is still empty, `scripts/download-go-frp.sh:29` still
+  fetches the prebuilt release tarball, `build_go_frp_v2()` exists nowhere, and all seven
+  workflow YAMLs parse. `actions/setup-go` survives only in records (`CHANGELOG.md:2360`,
+  this file, `docs/archive/plans/2026-06-28-xtcp-testing.md`). No gate update was owed —
+  `scripts/repo-health.sh`'s toolchain checks match `rustup default` and
+  `setup-rust-toolchain` only, never `setup-go` — and the `compat` lane is green at the
+  head.
+
+- [x] **The Docker source build is outside the toolchain pin and floats its own compiler.**
   Evidence, read from `docker/Dockerfile.source` — the Docker build was **not**
   run, so this is a code-read, not a measurement of the image: `:12`
   `FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS builder`, a floating
@@ -6089,6 +6102,25 @@ nothing about whether the described behaviour still holds.
   toolchain file in the build context and reorder/extend the target setup so the
   musl target is installed for the pinned toolchain — in both cases with a
   measured `docker buildx build` for at least one component.
+
+  **Done (`6c2a9a1a`).** Took the second branch. `docker/Dockerfile.source:56-58` is now
+  `WORKDIR /build` → `COPY rust-toolchain.toml ./` →
+  `RUN rustup toolchain install --no-self-update`; the fail-closed assertion follows
+  (`:64-70`) and only then `RUN rustup target add $(cat /tmp/rust_target)` (`:77`), ahead
+  of `COPY Cargo.toml Cargo.lock* ./` (`:80`). The citations in the evidence above (`:52`,
+  `:56-64`) are the pre-change numbering. The base tag still floats (`rust:1-slim-bookworm`,
+  `:12`), but the compiler no longer does: the assertion refuses the build when the active
+  toolchain is not the file's channel, or when `RUSTUP_TOOLCHAIN` overrode it. Measured on
+  the real context with `docker buildx build --platform linux/amd64`: pinned/COPY present →
+  `1.98.1-aarch64-unknown-linux-gnu (overridden by '/build/rust-toolchain.toml')`, assertion
+  rc 0; COPY dropped → rc 1; stray `RUSTUP_TOOLCHAIN=stable` → rc 1 (the reordering tooth
+  with a divergent pin showed the old order leaving the musl target in the base default
+  toolchain — `OLD_TARGET=MISSING`, the E0463 `can't find crate for std` root cause — and
+  the new order has it present). A full uncached
+  `docker buildx build --no-cache … -f docker/Dockerfile.source` then succeeded, logging the
+  pinned toolchain (`Finished release profile [optimized] in 5m 19s`, image 3.94 MB). The
+  before-image never completed — the default 2 CPU/2 GiB colima VM was OOM-killed — so its
+  compiler line comes from the old Dockerfile plus a diagnostic `RUN`, as the PR records.
 
 - [ ] **The compat gate is flaky, which weakens the project's strongest claim.**
   Evidence: on 2026-09-17 the `compat` CI job failed **2 of 3 consecutive runs on

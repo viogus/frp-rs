@@ -268,11 +268,17 @@ dotted key (`toolchain.channel = "..."`), but the `repo-health.sh` gate parses
 the section form only and **fails closed** on those two spellings rather than
 accepting a form it does not check.
 
-**Not covered:** the Docker source build. `docker/Dockerfile.source` starts from
-a floating `rust:1-slim-bookworm` and does not copy `rust-toolchain.toml` into
-the build context, so images built from it are outside the pin. That is recorded
-as an open item in `TODO.md` ("The Docker source build is outside the toolchain
-pin and floats its own compiler").
+**Covered by construction:** the Docker source build. `docker/Dockerfile.source`
+copies `rust-toolchain.toml` into the build context **before** it installs the
+toolchain and the musl target (`WORKDIR /build` → `COPY rust-toolchain.toml ./` →
+`RUN rustup toolchain install --no-self-update` → assertion →
+`RUN rustup target add $(cat /tmp/rust_target)`), so an image built from it uses
+the pinned compiler even though the base tag still floats. The assertion exists
+because the base image's own default toolchain is *not* the pin: it fails the
+build when the active toolchain is not the file's channel, or when the
+environment overrode it (`RUSTUP_TOOLCHAIN`), both measured. `scripts/repo-health.sh`'s
+gate still scans `.github/workflows/` only; this file is covered by its own
+assertion.
 
 To bump:
 

@@ -11,11 +11,14 @@
 # reviewable change to this file instead of a race with whatever `stable` a
 # runner image or a developer's `rustup default` happens to carry.
 #
-# NOT covered: the Docker source build. `docker/Dockerfile.source` starts from a
-# floating `rust:1-slim-bookworm` and never copies this file into the build
-# context, so images built from it are compiled by a toolchain this pin does not
-# reach. That is a recorded open item — see the "Docker source build" entry in
-# `TODO.md`.
+# Also covered: the Docker source build. `docker/Dockerfile.source` copies this
+# file into the build context, runs `rustup toolchain install --no-self-update`,
+# and then asserts that `rustup show active-toolchain` reports this file as the
+# override before it compiles anything — so an image build fails closed instead
+# of silently floating if that COPY is dropped or a stray `RUSTUP_TOOLCHAIN` is
+# set. The base image tag still floats, but it no longer picks the compiler:
+# this file does. (The musl `rustup target add` must stay after that COPY, or the
+# target lands in the base image's default toolchain instead.)
 #
 # `channel` is an EXACT version on purpose. `channel = "stable"` — or a floating
 # `"1.98"` — would follow new releases, which is the hazard this file exists to

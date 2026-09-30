@@ -30,8 +30,10 @@ cargo run --bin frpc -- -c frpc.toml
 RUST_LOG=debug cargo run --bin frps -- -c frps.toml  # Enable debug logging
 ```
 
-**Toolchain:** `rust-toolchain.toml` pins an exact `channel` (rustup-based jobs
-only — not the Docker build); bump deliberately — [§ Toolchain pinning](docs/developing.md#toolchain-pinning).
+**Toolchain:** `rust-toolchain.toml` pins an exact `channel`, and every cargo/rustup
+invocation reads it — the CI jobs and the Docker source build (which copies it into
+the build context and asserts the active compiler); bump deliberately —
+[§ Toolchain pinning](docs/developing.md#toolchain-pinning).
 
 ### Integration Tests Without Building
 
