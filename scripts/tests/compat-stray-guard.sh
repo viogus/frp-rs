@@ -231,7 +231,7 @@ enforce_shape() {
 # reds until the constant below is updated, and the failure text prints the
 # value to paste. It adds no `ok`/`bad` call of its own, so it can never move the
 # fixture count — or the ci.yml literal that pins it — by itself.
-SCEN10_REGION_SHA='880e656a2cfef7d9b6a1b9d08c42c455cbc136afb5a512ed74d0b5367414ef3f'
+SCEN10_REGION_SHA='d8430f18448caeff61ff025c59cd62ed34a55214fa0f785e3fc44102e5006211'
 scen10_region_sha() {
   local tool
   if command -v sha256sum >/dev/null 2>&1; then
