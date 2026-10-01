@@ -2799,7 +2799,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `join_all` teardown — work-conn, `frp-client/src/service.rs:4108` — drops its handles after a
   timeout instead of re-awaiting them; the `timeout(&mut handle)` sites only ever poll again after a
   *Pending* poll (ssh_gateway's `terminate_ssh_session`, the control writer); the `select!` arm on
-  `&mut session_task` (`frp-server/src/ssh_gateway.rs:4326`) consumes its one `Ready` and the `None`
+  `&mut session_task` (`frp-server/src/ssh_gateway.rs:2534`) consumes its one `Ready` and the `None`
   branch is the only path that polls further; and every `JoinSet` drain uses
   `join_next`/`try_join_next`, which remove the completed task from the set, so no task is polled
   twice. Details and per-site reasons: the PR body.
@@ -6804,6 +6804,17 @@ nothing about whether the described behaviour still holds.
   of this file. `#[inline(never)]` travelled with `verify_login_auth` and was not applied to the
   three new helpers (recorded as an accepted LOW). The client half
   (`frp-client/src/work_conn.rs`) is untouched.
+
+  **Progress (2026-10-01, code head `51568e80` on `refactor/fileify-bridge-ssh-tests`, PR #451).** The
+  first P0 file-ification landed, one commit per file: `frp-server/src/control/bridge.rs` 5449 → 3324
+  (+ `frp-server/src/control/bridge/tests.rs`, 2096 lines) and `frp-server/src/ssh_gateway.rs`
+  4864 → 2749 (+ `ssh_gateway/tests.rs` 1778, `key_tests.rs` 76, `virtual_ctrl_tests.rs` 139,
+  `preauth_tests.rs` 103), commits `79f7494b` / `51568e80`. The test bodies move verbatim apart from
+  one indent level (1963 + 2026 lines de-indented; 161 + 10 left byte-verbatim because they begin
+  inside a multi-line literal), so the extracted literal-value multiset is unchanged (563 / 817
+  literals) and `-- --list` is the same 460 names (bridge 46, `ssh_gateway::*` 70). P8 Step 0 names
+  only `ssh_gateway/tests.rs`, but the ~2740 target it states needs all four inline modules; see
+  [`docs/refactor-large-modules.md`](docs/refactor-large-modules.md) "Landed so far".
 
 - [x] **Three vendored crates are a standing maintenance liability.**
   Evidence: `vendor/rustls` (TLS, patched), `vendor/yamux` (5 patches),
