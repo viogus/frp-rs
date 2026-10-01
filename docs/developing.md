@@ -148,7 +148,7 @@ Contents:
 - [2.3 Registration: `ProxyManager` and every site a type appears in](#23-registration-proxymanager-and-every-site-a-type-appears-in)
 - [2.4 Listeners and bridging](#24-listeners-and-bridging)
 - [2.5 Tests](#25-tests)
-- [2.6 The Go cross-compat scenario](#26-the-go-cross-compat-scenario)
+- [2.6 The cross-compat scenario](#26-the-cross-compat-scenario)
 - [2.7 Reviews and the records you do not own](#27-reviews-and-the-records-you-do-not-own)
 - [2.8 Adding a client plugin instead](#28-adding-a-client-plugin-instead)
 - [2.9 If you are a new maintainer](#29-if-you-are-a-new-maintainer)
@@ -178,7 +178,7 @@ error when you miss one. Section 2.2 and 2.3 list the sites that exist at
 `9b2acefb`, but the list is only as good as that commit — re-run the grep.
 
 ```bash
-# every non-test place a TCP-like type is named (the list you must walk)
+# every place a TCP-like type is named, tests included (the list you must walk)
 grep -rn '"tcp"' frp-core/src frp-server/src frp-client/src
 ```
 
@@ -201,10 +201,16 @@ Add a field only for a genuinely new knob, and then follow the house rules:
   `frp-core/src/config/server.rs:1400`.
 
 **The type name itself is validated by an allow-list, and this is the first wall.**
-`fn validate_proxy_configs` (`frp-core/src/config/loader.rs:730`) checks
-`p.proxy_type` against `const VALID_PROXY_TYPES` (`frp-core/src/config/loader.rs:731`).
-Miss it and *every* config file using your type fails to load. Observed with the
-real binary before the fix:
+`fn validate_proxy_configs` (`frp-core/src/config/loader.rs:731`) checks
+`p.proxy_type` against `const VALID_PROXY_TYPES` (`frp-core/src/config/loader.rs:732`).
+It is reached only from `fn validate_client_config`
+(`frp-core/src/config/loader.rs:1027`); the server path has no equivalent, so a
+stray `[[proxies]]` block in `frps.toml` is rejected by the *parser* as
+`unknown field "proxies" in config file`, not by this allow-list. Miss the list and
+*every* frpc config file using your type fails to load. (The transcripts in §2.2–§2.6
+come from a throwaway type walked through this path while it was being written —
+none of them describe a type that landed in the tree. Reproduce them with your own
+name.) Observed with the real binary before the fix:
 
 ```console
 $ ./target/debug/frpc -c /tmp/mytcp-bad.toml
@@ -218,26 +224,35 @@ the list**, inline at `frp-core/src/config/loader.rs:739`. Adding the name to th
 `const` and not to the message leaves the error text lying about what is valid.
 Change both, in the same commit.
 
-**Every allow-list you must visit.** Five exist at `9b2acefb`, in three crates and
-behind three optional features. Each one fails differently, and the last two are
-the easiest to miss because they are behind feature flags that are not on by
-default:
+**Every allow-list you must visit.** Six exist at `9b2acefb`, in three crates.
+Four sit behind opt-in features a default build does not compile (`admin`, `ssh`,
+`dashboard`), which is exactly why they are the easiest to miss. Each one fails
+differently:
 
 | # | Site | What it gates | If you skip it |
 |---|---|---|---|
-| 1 | `const VALID_PROXY_TYPES` — `frp-core/src/config/loader.rs:731` (+ the message at `:739`) | frpc/frps config-file load | Fatal at startup: `invalid proxy_type '<type>'` (above). **The first wall, always** |
+| 1 | `const VALID_PROXY_TYPES` — `frp-core/src/config/loader.rs:732` (+ the message at `:739`), checked by `validate_proxy_configs` at `frp-core/src/config/loader.rs:731` | frpc config-file load | Fatal at startup: `invalid proxy_type '<type>'` (above). **The first wall, always** |
 | 2 | `const VALID_PROXY_TYPES` — `frp-client/src/store.rs:16`, used by `validate_proxy` at `frp-client/src/store.rs:258` | The runtime config store behind the admin API (`/api/store/*`) | Store writes are rejected with `invalid proxy type: <type>`, and an existing store file that contains your type **fails to load** |
-| 3 | the seed list in `by_type` — `frp-client/src/admin.rs:391` | `/api/proxy/<type>` (Go parity: every known type appears, even empty) | Cosmetic: the endpoint returns no entry for your type |
+| 3 | the seed list in `by_type` — `frp-client/src/admin.rs:391` (feature `admin`) | `/api/proxy/<type>` (Go parity: every known type appears, even empty) | Cosmetic: the endpoint returns no entry for your type |
 | 4 | `const VALID_PROXY_TYPES` — `frp-server/src/ssh_gateway.rs:737` (feature `ssh`) | Proxy types accepted over the SSH tunnel gateway | `invalid proxy type: <type>, support types: [tcp http https tcpmux stcp]` |
-| 5 | `let valid_types = [...]` — `frp-server/src/dashboard.rs:662` (feature `dashboard`) | The dashboard's per-type endpoint | `404` for your type (a deliberate divergence from Go, which returns an empty list) |
+| 5 | `let valid_types = [...]` — `frp-server/src/dashboard.rs:659`, guard at `:662` (feature `dashboard`) | The dashboard v1 API's per-type endpoint | `404` for your type (a deliberate divergence from Go, which returns an empty list) |
+| 6 | `const VALID_TYPES` — `frp-server/src/dashboard.rs:1577`, enforced by `fn validate_type` at `frp-server/src/dashboard.rs:2145` (called at `:2690`; feature `dashboard`) | The dashboard v2 API's `proxy_type` filter | `400 BAD_REQUEST`: `type must be one of tcp, udp, http, https, tcpmux, stcp, xtcp, sudp` (`frp-server/src/dashboard.rs:2151`) |
 
-Lists 2, 4 and 5 are exactly the ones a Rust↔Rust round-trip test will not catch.
-Proven for list 2 with a throwaway unit test against `validate_proxy`:
+Lists 2, 4, 5 and 6 are exactly the ones a Rust↔Rust round-trip test will not
+catch. Proven for list 2 with a throwaway unit test against `validate_proxy`:
 
 ```console
 thread 'store::tests::throwaway_mytcp_store_accepts' panicked:
 mytcp must be an accepted store proxy type: Err(InvalidArgument("invalid proxy type: mytcp"))
 ```
+
+Two neighbouring lists are **not** on this path, and it is worth knowing why so
+you do not hunt them: `const VALID_VISITOR_TYPES` (`frp-client/src/store.rs:19`,
+`["stcp", "sudp", "xtcp"]`) enumerates *visitor* types, and `const
+FRPC_SUBCOMMANDS` (`frp-core/src/cli.rs:2047`, a `[&str; 12]` pinned in both
+directions by the tests beside it) enumerates `frpc <subcommand>` names — it needs
+your type only if you are also adding an `frpc <type>` subcommand, which the
+minimal path does not.
 
 **There is no server-side allow-list, and that is a trap in the opposite
 direction.** `validate_new_proxy` (`frp-server/src/control/proxy_ops.rs:891`)
@@ -297,12 +312,12 @@ optional:
 
 | # | Line | Site | Purpose |
 |---|---|---|---|
-| 1 | `frp-server/src/control/proxy_ops.rs:671` | `fn proxy_consumes_client_port` | The mirror of the registration increments, shared by the removal path and the sweep |
-| 2 | `frp-server/src/control/proxy_ops.rs:823` | `let replaceable = matches!(...)` | Whether re-registering the same name replaces or is rejected |
-| 3 | `frp-server/src/control/proxy_ops.rs:855` | the replaced-entry release condition | Releasing the **old** entry's port slot when a replacement lands |
-| 4 | `frp-server/src/control/proxy_ops.rs:874` | the `client_ports_used` increment | Go's `portsUsedNum`; what `max_ports_per_client` counts |
-| 5 | `frp-server/src/control/proxy_ops.rs:1947` | `let consumes_port = matches!(...)` in `handle_new_proxy` | The admission check for `max_ports_per_client` |
-| 6 | `frp-server/src/control/proxy_ops.rs:1796` | the `tcp` listener branch of `setup_proxy_listeners` | Binds the per-proxy listener. **Load-bearing — see 2.4** |
+| 1 | `frp-server/src/control/proxy_ops.rs:670` | `fn proxy_consumes_client_port` | The mirror of the registration increments, shared by the removal path and the sweep |
+| 2 | `frp-server/src/control/proxy_ops.rs:821` | `let replaceable = matches!(...)` | Whether re-registering the same name replaces or is rejected |
+| 3 | `frp-server/src/control/proxy_ops.rs:852` | the replaced-entry release condition | Releasing the **old** entry's port slot when a replacement lands |
+| 4 | `frp-server/src/control/proxy_ops.rs:877` | the `client_ports_used` increment (`*c += 1`, under the guard at `:871`) | Go's `portsUsedNum`; what `max_ports_per_client` counts |
+| 5 | `frp-server/src/control/proxy_ops.rs:1944` | `let consumes_port = matches!(...)` in `handle_new_proxy` | The admission check for `max_ports_per_client` |
+| 6 | `frp-server/src/control/proxy_ops.rs:1793` | the `tcp` listener branch of `setup_proxy_listeners` | Binds the per-proxy listener. **Load-bearing — see 2.4** |
 
 Do not pattern-match this table blindly; decide by asking what your type *is*.
 The neighbouring types show the branches that exist: `register_sk_index`
@@ -312,6 +327,12 @@ The neighbouring types show the branches that exist: `register_sk_index`
 for `tcpmux`. A type that routes by domain or by secret key belongs in the
 corresponding predicate; a type with a real remote port belongs in the port
 accounting; a type with a private listener belongs in the listener branch.
+
+Those six are complete for a minimal non-group TCP-like type. A type that can also
+join a **group** touches more: the group replacement check
+(`frp-server/src/control/proxy_ops.rs:587` and `:2029`), the group-kind routing in
+`frp-server/src/control/proxy.rs:80`, `:109` and `:154`, and the pool filter at
+`frp-server/src/control/pool.rs:702`.
 
 **How much of that the round-trip test actually pins: one site.** Reverting site
 6 alone makes the test fail; reverting all five accounting sites (1–5) together
@@ -329,7 +350,7 @@ test result: ok. 1 passed; 0 failed
 So the port accounting has **no test coverage** for a new type and will not be
 caught by the obvious end-to-end test. Either add the targeted tests described in
 2.5, or state in the PR that the sites were changed by inspection —
-and expect the adversarial reviewer to ask which of the five you can show failing
+and expect the adversarial reviewer to ask which of the six you can show failing
 without the change.
 
 ### 2.4 Listeners and bridging
@@ -359,22 +380,32 @@ keep their socket in `AppState::udp_sockets`. That is the whole lifecycle: spawn
 register the handle, drop the handle to stop it.
 
 `setup_proxy_listeners` (`frp-server/src/control/proxy_ops.rs:1456`) is where a
-type chooses its shape. Existing branches:
+type chooses its shape, and the shape is a raw `if`/`else if` chain, not a list of
+peer branches. It has three *type* branches, a group branch, and a fall-through:
 
-- `udp` / `sudp` — bind an `Arc<UdpSocket>` and pull work connections with
+- `udp` / `sudp` (`frp-server/src/control/proxy_ops.rs:1484`) — bind an
+  `Arc<UdpSocket>` and pull work connections with
   `InternalMsg::UdpNeedsWorkConn`; SUDP reuses the socket on `EADDRINUSE`.
-- `tcp` — bind a per-proxy `TcpListener` via `bind_tcp_proxy_with_retry`, then
-  spawn `listen_and_proxy` and record the handle. Your TCP-like type goes here.
-- `http` / `https` — no per-proxy listener; the shared VHost listener routes by
-  host/domain (`frp-server/src/vhost.rs:271`).
-- `stcp` / `xtcp` — no remote port and no per-proxy listener; visitors connect
-  back over a work connection.
-- `tcpmux` — no per-proxy listener; the shared tcpmux listener routes by
-  `HTTP CONNECT` host (`frp-server/src/tcpmux.rs:34`).
+- the `is_nat_hole` predicate — `stcp`/`xtcp`/`tcpmux`
+  (`frp-server/src/control/proxy_ops.rs:1470-1471`, branch at `:1588`) — no remote
+  port and no per-proxy listener; STCP/XTCP visitors connect back over a work
+  connection, and TCPMux routes by `HTTP CONNECT` host
+  (`frp-server/src/tcpmux.rs:34`).
+- `tcp` (`frp-server/src/control/proxy_ops.rs:1793`, after the group branch at
+  `:1590`) — bind a per-proxy `TcpListener` via `bind_tcp_proxy_with_retry`, then
+  spawn `listen_and_proxy` and record the handle. **Your TCP-like type goes here.**
+- the `} else {` fall-through (`frp-server/src/control/proxy_ops.rs:1827`) —
+  everything else, including `http` and `https`. There is no per-proxy listener:
+  the shared VHost listener routes by host/domain
+  (`frp-server/src/vhost.rs:271`).
+
+Note the asymmetry: `http`/`https` are *not* a branch of their own, they fall
+through. A type that forgets to add itself lands here rather than hitting an `else`
+that could have rejected it.
 
 **The listener site fails silently, and this is the trap worth internalising.**
 There is no `else` that errors. The fall-through branch
-(`frp-server/src/control/proxy_ops.rs:1830`) logs:
+(`frp-server/src/control/proxy_ops.rs:1832`) logs:
 
 ```
 "{} proxy '{}' registered (shared listener, port {})"
@@ -470,29 +501,34 @@ harness is `frp-client/tests/common/mod.rs`. It builds a full
 add a constructor that takes a proxy type, or build the config explicitly in your
 test file**. Note that the harness's own `ProxyConfig` literal sets
 `enabled: true` explicitly (`frp-client/tests/common/mod.rs:302`) — that is not
-decoration, see 2.4. The shape that worked:
+decoration, see 2.4. The shape that worked — this is the whole file, copy-pasteable:
 
 ```rust
-// frp-client/tests/<type>_throwaway.rs   (throwaway while walking the path)
+// frp-client/tests/mytcp_throwaway.rs   (throwaway while walking the path)
 mod common;
-use common::{allocate_port, init_tracing, start_echo_server, start_frps, wait_for_port};
+
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use common::{allocate_port, init_tracing, start_echo_server, start_frps, wait_for_port};
+use frp_client::service::Service as ClientService;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 #[tokio::test]
 async fn mytcp_round_trip() {
-    init_tracing();
-    let echo_port = allocate_port();
+    init_tracing(); // frp-client/tests/common/mod.rs:15
+    let echo_port = allocate_port(); // :38
     let server_port = allocate_port();
     let proxy_port = allocate_port();
-    let _echo = start_echo_server(echo_port);                 // sync, JoinHandle
-    let _server = start_frps(server_port, "test-token").await; // async, JoinHandle
+
+    let _echo = start_echo_server(echo_port); // :87 — sync, returns a JoinHandle
+    let _server = start_frps(server_port, "test-token").await; // :153 — async, JoinHandle
     wait_for_port(
         SocketAddr::from(([127, 0, 0, 1], server_port)),
         Duration::from_secs(5),
-    )
+    ) // :183
     .await
-    .unwrap();
+    .expect("server did not start");
 
     let cfg = frp_core::config::ClientConfig {
         server_addr: "127.0.0.1".into(),
@@ -513,19 +549,38 @@ async fn mytcp_round_trip() {
         }],
         ..Default::default()
     };
-    // ClientService::new(cfg, None).run() in a task; poll TcpStream::connect on
-    // proxy_port for 10s; write a payload and read it back byte-for-byte.
+
+    // `Service::new` builds the client; `run()` drives it until the task is dropped.
+    let client = ClientService::new(cfg, None).await.expect("create client");
+    let _client = tokio::spawn(async move {
+        let _ = client.run().await;
+    });
+
+    // Registration is asynchronous: poll the remote port until something accepts.
+    let proxy_addr = SocketAddr::from(([127, 0, 0, 1], proxy_port));
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(proxy_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    const PAYLOAD: &[u8] = b"mytcp round trip\n";
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("mytcp remote port never became reachable");
+    stream.write_all(PAYLOAD).await.unwrap();
+    let mut buf = vec![0u8; PAYLOAD.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(buf, &PAYLOAD[..]);
 }
 ```
 
 ```bash
-cargo build -j 2 -p frps -p frpc          # integration tests need a real frps binary
+# No build step: `start_frps` boots frps in-process (`frp-client/tests/common/mod.rs:172`),
+# so this test needs no frps/frpc binary on disk at all.
 cargo test -j 2 -p frp-client --test mytcp_throwaway -- --nocapture
 ```
-
-Harness signatures, so the snippet above is not guesswork:
-`start_echo_server` `frp-client/tests/common/mod.rs:87`, `start_frps` `:153`,
-`wait_for_port` `:183`, `allocate_port` `:38`, `init_tracing` `:15`.
 
 For a server-side test that speaks the raw V1 protocol, the harness is
 `frp-server/tests/common/mod.rs`: `register_tcp_proxy`, `open_tcp_proxy_bridge`
@@ -554,100 +609,179 @@ touched:
 
 ```bash
 cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -D warnings
 cargo test -j 2 -p frp-core
 cargo test -j 2 -p frp-server
 cargo test -j 2 -p frp-client
 ```
 
-### 2.6 The Go cross-compat scenario
+### 2.6 The cross-compat scenario
 
 The unit and integration suites pin **frp-rs's own** behaviour. They cannot show
 Go compatibility; only `scripts/compat-test.sh` against a real Go binary can (see
 [§ What a green test run does and does not prove](#what-a-green-test-run-does-and-does-not-prove)).
-If your type claims Go parity, it needs a scenario here and the scenario must
-actually run.
+There are two cases, and they are not the same amount of work:
+
+- **Your type exists in Go frp** — then it needs a `go-to-rust` (or `rust-to-go`)
+  scenario in `scripts/compat-test.sh`, and the scenario must actually run.
+- **Your type is a Rust-only extension** — the normal case for a type you invent,
+  because Go frpc's config decoder rejects the name before it ever dials. Do
+  **not** write a `go-to-rust` scenario for it. Measured, verbatim, against the Go
+  frp v0.71.0 binary:
+
+  ```console
+  $ frpc -c frpc.toml       # [[proxies]] type = "revtcp"  (Rust-only type)
+  decode proxy at index 0: unknown proxy type: revtcp
+  $ echo $?
+  1
+  ```
+
+  What you add instead is a **Rust↔Rust** scenario in the same runner
+  (`test_kcp_rust_to_rust`, `scripts/compat-test.sh:4948`, is the existing
+  template). It still drives the real `frps` and `frpc` binaries and the real wire
+  protocol, and it is what a reviewer will ask for. Say in the PR that compat with
+  Go frpc is *not applicable* rather than leaving the section empty.
 
 **What the harness gives you, and what it does not.** `write_frps_config`
 (`scripts/compat-test.sh:713`) is type-agnostic. `write_frpc_config`
 (`scripts/compat-test.sh:776`) is **not**: it hard-codes `type = "tcp"` in both
-the Go and the Rust branch. A new type cannot reuse it. Either add a `type`
-parameter to the writer **and** update every existing caller, or write the frpc
-TOML inline in your scenario the way the special-case scenarios do. Inline is
-usually the smaller diff and the one to prefer.
+the Go (`:817`) and the Rust (`:845`) branch, so a new type cannot reuse it. Either
+add a `type` parameter to the writer **and** update every existing caller, or write
+the frpc TOML inline in your scenario the way the special-case scenarios do.
+Inline is usually the smaller diff and the one to prefer.
 
-Add a scenario function next to the existing ones and register it at the bottom of
-the file beside the other `run_test` lines (e.g.
-`scripts/compat-test.sh:5564` for `run_test test_g2r_tcp_plain`):
+**Prerequisites — and the one that costs an hour if nobody says it.** Before any
+selector runs, the runner checks (a) that all four binaries exist and are
+executable — `GO_FRPS`, `GO_FRPC`, `$PROJECT_DIR/target/release/frps`,
+`$PROJECT_DIR/target/release/frpc` (`scripts/compat-test.sh:4929-4934`), and
+(b) that `frp-core/tests/certs/` holds `ca.crt`, `server.crt` and `server.key`
+(`:30`, checked at `:4936-4941`). Three consequences:
+
+- The Rust paths are **hard-coded to `target/release/`**
+  (`scripts/compat-test.sh:28-29`) and are not environment-overridable. A debug
+  build does not satisfy them, so build release before running *any* selector,
+  including the Rust↔Rust one:
+  ```bash
+  cargo build --release -j 2 -p frps -p frpc
+  ```
+  This is the only build §2.6 needs; the in-process test in §2.5 needs none.
+- The Go pair must be present even for a Rust↔Rust scenario, because the preflight
+  checks all four paths. `scripts/download-go-frp.sh` fetches it (`--go-version`
+  overrides the default `0.71.0`).
+- The certs are checked for every scenario, TLS-less ones included.
+
+Add your scenario function beside the existing ones and register it with the other
+`run_test` lines at the bottom of the file (`run_test test_g2r_tcp_plain` is at
+`scripts/compat-test.sh:5564`). This is the Rust↔Rust shape:
 
 ```bash
-test_g2r_mytcp_plain() {
-    local name="go-to-rust-mytcp-plain"          # the DISPLAY name
+test_r2r_mytcp_plain() {
+    local name="rust-to-rust-mytcp-plain"        # the DISPLAY name
     should_run_test "$name" || return 0
     log "=== $name ==="
     local frps_port=$(random_port)
     local proxy_port=$(random_port)
     local echo_port=$(random_port)
-    local token="test-token-g2r-mytcp"
+    local token="test-token-r2r-mytcp"
     mkdir -p "$TEST_DIR/$name"
 
     start_echo_server "$echo_port"
-    wait_for_port 127.0.0.1 "$echo_port" 3 || { fail_test "$name" "echo server did not start"; return; }
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
 
+    # Rust frps: write_frps_config is type-agnostic.
     write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
-    wait_for_port 127.0.0.1 "$frps_port" 5 || { fail_test "$name" "Rust frps did not start"; return; }
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
 
-    # write_frpc_config cannot emit this type - write the frpc TOML inline.
-    # Mirror the Go branch of write_frpc_config for the no-TLS, no-mux case, or
-    # the two sides disagree about tcpMux and the run fails for the wrong reason.
+    # write_frpc_config hard-codes type = "tcp" (Go :817, Rust :845), so write the
+    # Rust frpc TOML inline. Mirror its `rust` branch: snake_case keys. A camelCase
+    # key is silently dropped by frp-core and the run fails for the wrong reason.
     cat > "$TEST_DIR/$name/frpc.toml" <<EOF
-serverAddr = "127.0.0.1"
-serverPort = $frps_port
-
-auth.token = "$token"
-
-transport.tls.enable = false
-transport.tcpMux = false
-
-log.to = "$TEST_DIR/$name/go-frpc.log"
-log.level = "debug"
+server_addr = "127.0.0.1"
+server_port = $frps_port
+token = "$token"
+tcp_mux = false
+login_fail_exit = true
+pool_count = 1
+tls_enable = false
 
 [[proxies]]
 name = "mytcp-compat"
 type = "mytcp"
-localIP = "127.0.0.1"
-localPort = $echo_port
-remotePort = $proxy_port
+local_ip = "127.0.0.1"
+local_port = $echo_port
+remote_port = $proxy_port
 EOF
-    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
-    wait_for_port_safe 127.0.0.1 "$proxy_port" 10 || { fail_test "$name" "proxy port not reachable"; return; }
+    wait_for_port_safe 127.0.0.1 "$proxy_port" 10 || {
+        fail_test "$name" "proxy port not reachable"
+        return
+    }
     local result
     result=$(send_and_expect "$proxy_port" "hello-mytcp" "hello-mytcp" 5)
-    [[ "$result" == OK:* ]] && pass_test "$name" || fail_test "$name" "expected OK: got $result"
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "expected OK: got $result"
+    fi
 }
 
 # ...at the bottom of the file, with the other registrations:
-run_test test_g2r_mytcp_plain
+run_test test_r2r_mytcp_plain
 ```
 
-Helper line numbers for orientation: `run_go` `scripts/compat-test.sh:137`,
-`start_echo_server` `:277`, `send_and_expect` `:304`, `log` `:659`. The Go binary
-comes from `scripts/download-go-frp.sh`, driven at version `0.71.0` by default
-(`--go-version` overrides it).
+One config trap worth repeating, because it fails with an unreadable error:
+`tcp_mux` must agree on both sides. The `rust` branch of `write_frps_config`
+writes `tcp_mux = false`, so the inline client config matches it. Write the
+camelCase Go spelling (`transport.tcpMux = false`) into a **Rust** frpc config and
+frp-core silently drops the unknown key, the client keeps the default
+`tcp_mux = true`, and the server rejects the first frame with `invalid V1 msg
+length: 144116287587483648 (max: 10240), raw header: 000200010000000000`. The
+working snake_case form is the Rust branch of `write_frpc_config`
+(`scripts/compat-test.sh:825-852`).
+
+Helper line numbers for orientation: `start_echo_server`
+`scripts/compat-test.sh:277`, `send_and_expect` `:304`, `log` `:659`,
+`should_run_test` `:694`. `run_go` (`:137`) is only for the Go-driving scenarios;
+a Rust↔Rust scenario invokes `"$RUST_FRPS"` / `"$RUST_FRPC"` directly, as above.
+
+**What a passing run prints.** Use the display name and paste the `N passed` line
+into the PR:
+
+```console
+$ bash scripts/compat-test.sh --test rust-to-rust-mytcp-plain
+...
+[LOG] === rust-to-rust-mytcp-plain ===
+[PASS] rust-to-rust-mytcp-plain
+...
+=============================================
+ RESULTS: 1 passed, 0 failed
+=============================================
+
+All tests passed!
+$ echo $?
+0
+```
 
 **`--test` takes the display name; `--list` prints the function name. They do not
 match, and the mismatch exits 0.** `should_run_test`
-(`scripts/compat-test.sh:693`) compares the selector against the `local name=`
+(`scripts/compat-test.sh:694`) compares the selector against the `local name=`
 inside the function, while `--list` (`scripts/compat-test.sh:75`) prints the
 function names:
 
 ```console
-$ bash scripts/compat-test.sh --list | grep tcp_plain
-test_g2r_tcp_plain
-$ bash scripts/compat-test.sh --test test_g2r_tcp_plain      # WRONG: function name
+$ bash scripts/compat-test.sh --list | grep mytcp
+test_r2r_mytcp_plain
+$ bash scripts/compat-test.sh --test test_r2r_mytcp_plain     # WRONG: function name
 =============================================
  RESULTS: 0 passed, 0 failed
 =============================================
@@ -662,7 +796,7 @@ ran, so a wrong name is a **silent false green**, not an error. Use the display
 name, and always confirm the count is at least 1:
 
 ```bash
-bash scripts/compat-test.sh --test go-to-rust-mytcp-plain --verbose
+bash scripts/compat-test.sh --test rust-to-rust-mytcp-plain --verbose
 ```
 
 **CI lanes that must see it.** There is no per-scenario list to update —
@@ -710,7 +844,7 @@ the code:
 
 - the grep you ran, and the sites you decided were not applicable, with the
   reason (2.3);
-- which of the five allow-lists you changed, and the observed failure text for
+- which of the six allow-lists you changed, and the observed failure text for
   each before the change — the failure text is the evidence that the site mattered;
 - that the end-to-end test passes **and** what it does not cover (the port
   accounting, 2.3);
