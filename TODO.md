@@ -6794,8 +6794,8 @@ nothing about whether the described behaviour still holds.
   prefix comparison, so `RUST_LOG=frp_server::service=debug` still enables them, and as in #436 the
   round ships no `CHANGELOG.md` bullet for it. The remaining blocks (HTTP vhost, HTTPS vhost,
   TCPMux, SSH tunnel gateway, QUIC, dashboard, `tasks.rs`) are tracked in the plan doc, which
-  records this seam as landed too. Ledger at this head: **13 open / 189 closed** — unchanged, the
-  item stays open.
+  records this seam as landed too. Ledger at this head: **14 open / 189 closed** (base `01fb93e3`:
+  14 open / 189 closed) — unchanged; its `TODO.md:<n>` cites are re-derived by content.
 
   **Progress (2026-10-01, code head `7ff46a60` on `refactor/fileify-vhost-tests`, PR #452, based on
   `f881d15e`, rebased onto `18bcd1ad`).** The P0/P7 split landed: `frp-server/src/vhost.rs`'s inline
@@ -8165,6 +8165,7 @@ section; ledger now **24 open / 104 closed**.**
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7617`): a
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7616`): a
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7220`): a
+  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7236`): a
   test that pins less than its name claims, so a real regression stays green.
   (a) The pinned warning bytes are the shipped static, but the **emitted** record is only
   substring-checked: `frp-core/tests/server_tls_enable_warning.rs:441` asserts
@@ -9305,7 +9306,7 @@ section; ledger now **24 open / 104 closed**.**
 - [x] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
   Filed by the coordinator while closing `TODO.md:8533` (PR #430), which removed the two local `pkill -f`
 - [ ] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
-  Filed by the coordinator while closing `TODO.md:8454` (PR #430), which removed the two local `pkill -f`
+  Filed by the coordinator while closing `TODO.md:8470` (PR #430), which removed the two local `pkill -f`
   calls in `scripts/compat-test.sh`: `scripts/remote-frps.sh:195` and `:339` still run
   `pkill -f 'frps -c frps.toml'` and `:409` uses `pgrep -f` on the same text, over ssh, to manage the
   comparison server on a remote VPS. Name-plus-argument is the same hazard the local sweep just lost — a

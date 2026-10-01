@@ -394,10 +394,14 @@ fn run_verify(config_path: &str, strict_config: bool, allow_unsafe: &[String]) {
 
 fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
 <<<<<<< HEAD
+<<<<<<< HEAD
     // Go frp parity (TODO.md:8990): with an explicit `-c` the config file is
 =======
     // Go frp parity (TODO.md:8860): with an explicit `-c` the config file is
 >>>>>>> 198ddfc8 (docs(records): apply the #450 review findings and re-derive the shifted TODO.md cites)
+=======
+    // Go frp parity (TODO.md:8876): with an explicit `-c` the config file is
+>>>>>>> 332fd2f9 (docs(records): re-derive every TODO.md cite at the #452 rebase head)
     // authoritative for the whole `[log]` section, exactly as it is for the
     // config flags — the `-c` branch of `main` skips `override_server_config`
     // (`frps/src/main.rs:1025-1027`), so consulting the CLI log flags here would
@@ -447,10 +451,14 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     // (`cmd/frps/root.go:112`), so `frps -c frps.toml --disable-log-color=true`
     // is ignored by Go while frp-rs still honours it. Unlike the four log flags
 <<<<<<< HEAD
+<<<<<<< HEAD
     // masked above, this one is not named by R1 (TODO.md:8990) and
 =======
     // masked above, this one is not named by R1 (TODO.md:8860) and
 >>>>>>> 198ddfc8 (docs(records): apply the #450 review findings and re-derive the shifted TODO.md cites)
+=======
+    // masked above, this one is not named by R1 (TODO.md:8876) and
+>>>>>>> 332fd2f9 (docs(records): re-derive every TODO.md cite at the #452 rebase head)
     // `frps/tests/cli_exit_codes.rs:1945` (`disable_log_color_value_spelling_is_applied`)
     // pins the current behaviour, so changing it is a separate item.
     let ansi = logging::resolve_ansi(

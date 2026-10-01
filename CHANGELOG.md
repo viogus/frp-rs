@@ -525,6 +525,7 @@ User-facing release notes for frp-rs.
   expanded into a v1 sub-table and refused with `invalid type: map, expected a sequence`. The
   section-level strict exception is `.ini`-only and documented in `docs/config.md`. TODO.md:7774,
   section-level strict exception is `.ini`-only and documented in `docs/config.md`. TODO.md:7782,
+  section-level strict exception is `.ini`-only and documented in `docs/config.md`. TODO.md:7798,
   :7792, :7815, :7858, :7885.
   section-level strict exception is `.ini`-only and documented in `docs/config.md`. TODO.md:7911,
   :7950, :7973, :8030, :8057.

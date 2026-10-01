@@ -605,10 +605,14 @@ fn oidc_without_an_issuer_is_refused_with_3_where_go_panics() {
 ///
 /// **That window is now closed for `--config-dir` — and only there**
 <<<<<<< HEAD
+<<<<<<< HEAD
 /// (`TODO.md:8682`). main installs its own `SIGTERM`/`SIGINT` recorder
 =======
 /// (`TODO.md:7975`). main installs its own `SIGTERM`/`SIGINT` recorder
 >>>>>>> 198ddfc8 (docs(records): apply the #450 review findings and re-derive the shifted TODO.md cites)
+=======
+/// (`TODO.md:7991`). main installs its own `SIGTERM`/`SIGINT` recorder
+>>>>>>> 332fd2f9 (docs(records): re-derive every TODO.md cite at the #452 rebase head)
 /// (`EarlyShutdown` in `frps/src/main.rs`) *before* the startup line, and each
 /// per-file task hands its `AppState` to that recorder when it registers, so a
 /// `SIGTERM` that lands in this window is recorded and the service's shutdown
@@ -1077,10 +1081,14 @@ fn sigterm_inside_the_registration_window(
 }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 /// `TODO.md:8682`, the window driven **deterministically** instead of raced: the
 =======
 /// `TODO.md:7975`, the window driven **deterministically** instead of raced: the
 >>>>>>> 198ddfc8 (docs(records): apply the #450 review findings and re-derive the shifted TODO.md cites)
+=======
+/// `TODO.md:7991`, the window driven **deterministically** instead of raced: the
+>>>>>>> 332fd2f9 (docs(records): re-derive every TODO.md cite at the #452 rebase head)
 /// debug-only `FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS` parks the per-file task
 /// *before* it registers — therefore before `Service::run` installs its own
 /// `SIGTERM` handler — and the hold is far longer than this pin's timeout, so
@@ -1153,10 +1161,14 @@ fn config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorde
 }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 /// `TODO.md:8682`, the **fan-out** half of the recorder (review round 2, F7):
 =======
 /// `TODO.md:7975`, the **fan-out** half of the recorder (review round 2, F7):
 >>>>>>> 198ddfc8 (docs(records): apply the #450 review findings and re-derive the shifted TODO.md cites)
+=======
+/// `TODO.md:7991`, the **fan-out** half of the recorder (review round 2, F7):
+>>>>>>> 332fd2f9 (docs(records): re-derive every TODO.md cite at the #452 rebase head)
 /// `record()` must cancel the tokens of services that registered *before* the
 /// signal, not only let a later one observe it through the `watch()` handoff.
 ///
@@ -1310,10 +1322,14 @@ fn config_dir_recorded_signal_fans_out_to_an_already_registered_service() {
 }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 /// `TODO.md:8667`, **recorded** rather than fixed: the collector admits a
 =======
 /// `TODO.md:7962`, **recorded** rather than fixed: the collector admits a
 >>>>>>> 198ddfc8 (docs(records): apply the #450 review findings and re-derive the shifted TODO.md cites)
+=======
+/// `TODO.md:7978`, **recorded** rather than fixed: the collector admits a
+>>>>>>> 332fd2f9 (docs(records): re-derive every TODO.md cite at the #452 rebase head)
 /// directory entry by lowercased extension with no regular-file check
 /// (`frp-core/src/config/file.rs:414`/`:432`; the `is_file()` guards live only in
 /// the include-path `simple_glob` at `:340`/`:363`), and the loader then does a
@@ -2380,10 +2396,14 @@ fn verify_accepts_vhost_http_timeout_both_spellings_and_prints_go_line() {
 /// hyphen form and 0 bytes on stdout.
 ///
 <<<<<<< HEAD
+<<<<<<< HEAD
 /// **Which parts of the refusal are contractual (R4, `TODO.md:9033`).** The
 =======
 /// **Which parts of the refusal are contractual (R4, `TODO.md:8903`).** The
 >>>>>>> 198ddfc8 (docs(records): apply the #450 review findings and re-derive the shifted TODO.md cites)
+=======
+/// **Which parts of the refusal are contractual (R4, `TODO.md:8919`).** The
+>>>>>>> 332fd2f9 (docs(records): re-derive every TODO.md cite at the #452 rebase head)
 /// sentence is not: frp-rs prints 84 B
 /// ``Error: couldn't parse `9999999999999999999`: number too large to fit in
 /// target type`` — bpaf's wording — where Go prints 2214 B (`strconv.ParseInt`'s
@@ -2472,10 +2492,14 @@ fn verify_handles_vhost_http_timeout_go_signed_int64_range() {
 }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 /// `-l` is **not** a shorthand on `frps` (R5, `TODO.md:9043`). Go registers
 =======
 /// `-l` is **not** a shorthand on `frps` (R5, `TODO.md:8913`). Go registers
 >>>>>>> 198ddfc8 (docs(records): apply the #450 review findings and re-derive the shifted TODO.md cites)
+=======
+/// `-l` is **not** a shorthand on `frps` (R5, `TODO.md:8929`). Go registers
+>>>>>>> 332fd2f9 (docs(records): re-derive every TODO.md cite at the #452 rebase head)
 /// `log_level` with an empty shorthand (`pkg/config/flags.go:244`,
 /// `cmd.PersistentFlags().StringVarP(&c.Log.Level, "log_level", "", …)`), so
 /// `frps -c cfg -l ""` is rc **1** there too — but pflag's wording is

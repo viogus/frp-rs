@@ -653,10 +653,14 @@ fn cli_empty_log_level_does_not_raise_the_files_warn() {
 // ── `-c <file>`: the file is authoritative for the whole `[log]` section ─────
 //
 <<<<<<< HEAD
+<<<<<<< HEAD
 // R1 (`TODO.md:8990`). On Go's `-c` lane the pflag-bound struct is discarded
 =======
 // R1 (`TODO.md:8860`). On Go's `-c` lane the pflag-bound struct is discarded
 >>>>>>> 198ddfc8 (docs(records): apply the #450 review findings and re-derive the shifted TODO.md cites)
+=======
+// R1 (`TODO.md:8876`). On Go's `-c` lane the pflag-bound struct is discarded
+>>>>>>> 332fd2f9 (docs(records): re-derive every TODO.md cite at the #452 rebase head)
 // wholesale — `cmd/frps/root.go:67-83` takes the file branch, so `runServer` at
 // `cmd/frps/root.go:112` inits the logger from the *file's* `cfg.Log` — and
 // `frps -c frps.toml --log-level info` over a file with `[log] level = "warn"`
