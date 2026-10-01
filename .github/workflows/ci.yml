@@ -114,9 +114,12 @@ jobs:
         # suite's summary line verbatim, and 32 is what the scenarios in
         # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:8127` round
         # added the in-file floor; a scenario added or removed there moves this
-        # literal — restore the checks rather than lowering it). The `ok`-line
-        # count is the second half of the pin: `printf 'RESULT: 32 …'; exec true`
-        # satisfies the literal but prints no assertion lines at all.
+        # literal — restore the checks rather than lowering it). In-file,
+        # `enforce_substance` also checksums the scenario-6 metric check and the
+        # scenario-7 aliased-crate-root check byte-for-byte, so gutting either
+        # verdict reds there too. The `ok`-line count is the second half of the
+        # pin: `printf 'RESULT: 32 …'; exec true` satisfies the literal but
+        # prints no assertion lines at all.
         shell: bash
         run: |
           set -o pipefail
@@ -138,7 +141,7 @@ jobs:
       # name-only match kills a sibling worktree's server and must red this.
       - name: Stray guard — fixture checks (compat harness teardown)
         # The suite floors its own check count (`MIN_CHECKS`, in its EXIT trap)
-        # and checksums two of its regions, and both are enforced in-file: a
+        # and checksums four of its regions, and both are enforced in-file: a
         # lowered (`0`), zero-padded (`00`), non-numeric or uncomparably large
         # `MIN_CHECKS` reds there (measured). What no in-file mechanism can
         # survive is `exec`: `exec true` planted after the library check never
@@ -150,14 +153,16 @@ jobs:
         # `wait_exec` probe, the empty-`ps` branch and the failed-probe
         # kill-then-continue case; 31 after the round-2 pins exercised the loop's
         # empty-`cmd` guard, the exit-0-empty reap arm, and the second half of the
-        # XTCP pre-test cleanup; 40 after the round-6 pins added the
-        # trailing-slash-`TEST_DIR` scenario, the three untrusted-`ps` probes and
-        # the scenario-2 substance pin). In-file, `enforce_substance` additionally
-        # checksums the scenario-2 verdict and scenario 10's region byte-for-byte
-        # — the `compat_src=` input derivation plus both assertions — so forging
-        # the text those checks read reds there as well (as does gutting either
-        # verdict in place). A scenario added or removed here moves this literal —
-        # restore the checks rather than lowering it.
+        # XTCP pre-test cleanup; 40 after the round-6 regression tests added the
+        # three trailing-slash-`TEST_DIR` checks and the six untrusted-`ps` checks
+        # — the substance pins described below add a checksum, never an assertion
+        # line). In-file, `enforce_substance` additionally checksums the
+        # scenario-2, scenario-10, scenario-12 and scenario-13 regions
+        # byte-for-byte — for scenario 10 the `compat_src=` input derivation plus
+        # both assertions, for the others the whole scenario body — so forging the
+        # text those checks read reds there as well (as does gutting a verdict in
+        # place). A scenario added or removed here moves this literal — restore
+        # the checks rather than lowering it.
         shell: bash
         run: |
           set -o pipefail

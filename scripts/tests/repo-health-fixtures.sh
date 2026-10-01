@@ -97,22 +97,24 @@ ok()  { checks=$((checks + 1)); printf '  ok    %s\n' "$1"; }
 bad() { checks=$((checks + 1)); fail=1; printf '  FAIL  %s\n' "$1"; }
 hdr() { printf '%s\n' "------------------------------------------------------------"; }
 
-# enforce_substance — the substance half of the floor, for the scenario-6
-# metric check (RH-M2). `MIN_CHECKS` only bounds how many assertions ran, and
-# every label is spelled at the call site, so replacing scenario 6's condition
-# with `if true; then` kept the total at 32 and the suite green (measured by the
-# adversarial reviewer). The region marked `substance pin: scenario-6` is
-# therefore checksummed byte-for-byte, exactly as scenario 10's is in
-# `scripts/tests/compat-stray-guard.sh`; an edit inside it reds until the
-# constant below is updated, and the failure text prints the value to paste. It
-# adds no `ok`/`bad` call of its own, so it cannot move the count — or the
-# ci.yml literal that pins it — by itself. `self` is resolved further down this
-# file, which is fine: the check only runs from the EXIT trap, after it is set.
+# enforce_substance — the substance half of the floor. `MIN_CHECKS` only bounds
+# how many assertions ran, and every label is spelled at the call site, so
+# replacing a condition kept the total and the suite green: `if true; then` on
+# scenario 6's metric check (RH-M2) and `if false; then` on scenario 7's
+# aliased-crate-root check (N1/C3), both measured by the adversarial reviewer.
+# Every region marked `substance pin:` is therefore checksummed byte-for-byte,
+# the way scenarios 2/10/12/13 are in `scripts/tests/compat-stray-guard.sh`; an
+# edit inside one reds until the matching constant below is updated, and the
+# failure text prints the value to paste. The pins add no `ok`/`bad` call of
+# their own, so they cannot move the count — or the ci.yml literal that pins it
+# — by themselves. `self` is resolved further down this file, which is fine: the
+# check only runs from the EXIT trap, after it is set.
 SCEN6_REGION_SHA='7d31d2b613e1e578c7050a5328cb677f4aac2eba1c6d9a7248f0216d1dd06af7'
-scen6_region_sha() {
-  local tool
+SCEN7_REGION_SHA='941be4f7805b74ff79b691e463f91dd011a1b549cd17995f09542ff8d3f40500'
+region_sha() {   # $1 = region name, spelled as between the `substance pin:` markers
+  local name=$1 tool
   if [ -z "${self:-}" ]; then
-    printf 'FAIL  cannot locate %s to checksum the scenario-6 region\n' "$0" >&2
+    printf 'FAIL  cannot locate %s to checksum the %s region\n' "$0" "$name" >&2
     return 1
   fi
   if command -v sha256sum >/dev/null 2>&1; then
@@ -120,23 +122,29 @@ scen6_region_sha() {
   elif command -v shasum >/dev/null 2>&1; then
     tool='shasum -a 256'
   else
-    printf 'FAIL  no sha256 tool on PATH (need sha256sum or shasum); cannot check the scenario-6 region\n' >&2
+    printf 'FAIL  no sha256 tool on PATH (need sha256sum or shasum); cannot check the %s region\n' "$name" >&2
     return 1
   fi
   # shellcheck disable=SC2086  # $tool is the word-split "shasum -a 256"
-  sed -n '/^# --- substance pin: scenario-6 /,/^# --- end substance pin: scenario-6 ---/p' "$self" |
+  sed -n "/^# --- substance pin: ${name} /,/^# --- end substance pin: ${name} ---/p" "$self" |
     $tool | awk '{print $1}'
 }
 enforce_substance() {
-  local got
-  got=$(scen6_region_sha) || return 1
-  if [ "$got" != "$SCEN6_REGION_SHA" ]; then
-    printf 'FAIL  scenario 6 region changed: sha256 %s, pinned %s\n' \
-      "${got:-<none>}" "$SCEN6_REGION_SHA" >&2
-    printf '      deliberate edit? set SCEN6_REGION_SHA in %s to the value above\n' \
-      "${self:-this script}" >&2
-    return 1
-  fi
+  local name const got want
+  for name in scenario-6 scenario-7; do
+    case $name in
+      scenario-6) const=SCEN6_REGION_SHA; want=$SCEN6_REGION_SHA ;;
+      scenario-7) const=SCEN7_REGION_SHA; want=$SCEN7_REGION_SHA ;;
+    esac
+    got=$(region_sha "$name") || return 1
+    if [ "$got" != "$want" ]; then
+      printf 'FAIL  %s region changed: sha256 %s, pinned %s\n' \
+        "$name" "${got:-<none>}" "$want" >&2
+      printf '      deliberate edit? set %s in %s to the value above\n' \
+        "$const" "${self:-this script}" >&2
+      return 1
+    fi
+  done
   return 0
 }
 
@@ -682,6 +690,7 @@ fi
 # `has no .rs files` partial-tree row. An intra-crate alias cannot pin this (the
 # count would change too), and a `new_full_tree` without the aliased root always
 # has its own placeholder. The mutation is count-inert, so only this row moves.
+# --- substance pin: scenario-7 (checksummed by enforce_substance) ---
 hdr
 printf '%s\n' 'scenario 7: a crate root holding only a cross-crate alias is not "no .rs files"'
 tree aliased full
@@ -704,6 +713,7 @@ if mut_npresent "$t"; then
 else
   bad 'aliased root: mut_npresent failed to apply — anchor missing, the check would be vacuous'
 fi
+# --- end substance pin: scenario-7 ---
 
 # --- scenario 8: the readlink bound is defensive; the kernel fires first -----
 # The harness resolves its own symlink chain (so a wrapper or `ln -s` invocation

@@ -106,17 +106,19 @@ fails=0
 # failure, and the mutant that replaces scenario 10's `hits=$(grep …)` with
 # `hits=''` exits 0 on `SHAPE` alone.
 #
-# `enforce_substance` below narrows that label-only class for scenario 10: it
-# checksums the scenario-10 region byte-for-byte, from the `compat_src=` input
-# derivation through both assertion blocks, so editing the grep, gutting either
-# verdict in place, forging the text either one reads, or dropping a marker all
-# red. It does not authenticate *behaviour*: relocating the pinned region
-# verbatim behind `if false; then … fi` and leaving a bare `ok` with the same
-# label in the live path keeps the region byte-identical, and that mutant still
-# exits 0 (measured). That is a declared residue, not a defence — closing it
-# needs a construct that cannot be relocated, and the batch-E round-3 report
-# records it for TODO.md. Only scenario 10 gets even this much; a body gutted
-# anywhere else still needs a reviewer.
+# `enforce_substance` below narrows that label-only class for the scenarios the
+# reviews demonstrated: scenario 2 (SG-M1), scenario 10 (R2-1/LIE) and the two
+# round-6 regression tests, scenario 12 (F2) and scenario 13 (F3). Each named
+# region is checksummed byte-for-byte — scenario 10 from the `compat_src=` input
+# derivation through both assertion blocks, the other three whole — so editing
+# the grep, gutting a verdict in place, forging the text a check reads, or
+# dropping a marker all red. It does not authenticate *behaviour*: relocating a
+# pinned region verbatim behind `if false; then … fi` and leaving a bare `ok`
+# with the same label in the live path keeps the region byte-identical, and that
+# mutant still exits 0 (measured). That is a declared residue (N4), not a
+# defence — closing it needs a construct that cannot be relocated, and the
+# batch-E report records it for TODO.md. The scenarios outside those regions
+# (1, 3–9b, 11) are unpinned; a body gutted there still needs a reviewer.
 #
 # A floor of 0 (or an unset floor) disables the guard from inside, which the
 # sibling suite learned the hard way; that is a failure here too. So is a
@@ -252,6 +254,15 @@ enforce_shape() {
 #                `cleanup_pids` and `reap_scoped_strays`, with
 #                `scripts/compat-test.sh` never opened — kept both checksums and
 #                stayed green (reviewer 2, R2-1/LIE; measured).
+#   scenario-12  the round-6 F2 regression test: the `TEST_DIR="$td12/"` load,
+#                the spawn and all three verdicts. Without it, replacing the
+#                body with three unconditional `ok` lines carrying the same
+#                labels kept the count, the shape and CI green (N1/C1, measured
+#                by the adversarial reviewer).
+#   scenario-13  the round-6 F3 regression test: both untrusted-`ps` loads and
+#                the report-probe invocation, with all six verdicts. Without it,
+#                stubbing the outcomes (`out='ERROR: …'; rc=2`) behind the same
+#                labels kept the suite green (N1/C2, measured).
 #
 # An edit inside a pinned region reds until the matching constant below is
 # updated, and the failure text prints the value to paste. The pins add no
@@ -259,6 +270,8 @@ enforce_shape() {
 # the ci.yml literal that pins it — by themselves.
 SCEN2_REGION_SHA='672f7e60063731363e7b1583a7f415cee46b5c2fc2710f82792df75f9cb18886'
 SCEN10_REGION_SHA='23ae23793f1912e7df3f3d98dec5d46b6f8fd2c771e8597ca2510233674ea356'
+SCEN12_REGION_SHA='6742cb4ea68f2ecb9baa13910fd0ba250507e44368935085711b4cd68d8fa159'
+SCEN13_REGION_SHA='071ade36c23aa45df0908f633a3e2f9686574fd672c9d83796526bdf0db24a67'
 region_sha() {   # $1 = region name, spelled as between the `substance pin:` markers
   local name=$1 tool
   if command -v sha256sum >/dev/null 2>&1; then
@@ -275,10 +288,12 @@ region_sha() {   # $1 = region name, spelled as between the `substance pin:` mar
 }
 enforce_substance() {
   local name const got want
-  for name in scenario-2 scenario-10; do
+  for name in scenario-2 scenario-10 scenario-12 scenario-13; do
     case $name in
       scenario-2)  const=SCEN2_REGION_SHA;  want=$SCEN2_REGION_SHA ;;
       scenario-10) const=SCEN10_REGION_SHA; want=$SCEN10_REGION_SHA ;;
+      scenario-12) const=SCEN12_REGION_SHA; want=$SCEN12_REGION_SHA ;;
+      scenario-13) const=SCEN13_REGION_SHA; want=$SCEN13_REGION_SHA ;;
     esac
     got=$(region_sha "$name") || return 1
     if [ "$got" != "$want" ]; then
@@ -834,6 +849,7 @@ kill -9 "$baseline11" "$peer11" 2>/dev/null || true
 # `assert_no_strays` returned 0 with a live stray. The library normalises the
 # spelling once at load, so this drives the real guard with `$td12/` and
 # requires the full tooth: a named, reaped stray and rc 1.
+# --- substance pin: scenario-12 (checksummed by enforce_substance) ---
 hdr 'scenario 12: a trailing-slash TEST_DIR still counts an in-dir stray'
 td12="$WORK/run12"
 mkdir -p "$td12"
@@ -858,6 +874,7 @@ if wait_gone "$stray12"; then
 else
   bad "trailing-slash TEST_DIR: stray $stray12 survived the guard"
 fi
+# --- end substance pin: scenario-12 ---
 
 # --- scenario 13: an untrusted `ps` in the shipped census is a hard error ----
 # F3 (adversarial reviewer): `scenario_strays` read a per-pid `ps` that failed
@@ -865,6 +882,7 @@ fi
 # a live in-`$TEST_DIR` stray was forgiven — the opposite of the header's
 # promise. The first two cases drive the real library with such a `ps` first on
 # `PATH`; the baseline census at load has to refuse rather than report nothing.
+# --- substance pin: scenario-13 (checksummed by enforce_substance) ---
 hdr 'scenario 13: the shipped census refuses a ps probe it cannot trust'
 td13="$WORK/run13"
 mkdir -p "$td13"
@@ -920,6 +938,7 @@ case "$out" in
   *'census that cannot be trusted'*) ok 'untrusted report probe: the error explains the untrusted census' ;;
   *) bad "untrusted report probe: unexpected output: $(printf '%s' "$out" | tr '\n' ' ')" ;;
 esac
+# --- end substance pin: scenario-13 ---
 
 # ---------------------------------------------------------------- summary
 hdr 'summary'
