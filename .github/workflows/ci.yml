@@ -1648,6 +1648,45 @@ jobs:
         env:
           FRPS_BIN: ${{ github.workspace }}/target/debug/frps
           FRPC_BIN: ${{ github.workspace }}/target/debug/frpc
+      - name: Run the dedicated-websocket_port e2e target and assert its count
+        # This is the only lane that runs
+        # frp-server/tests/transport_e2e_websocket_port.rs (the step above's
+        # `--features dashboard` sits on frp-server's defaults, websocket +
+        # tcp-mux), so this is where its count guard belongs. The file is
+        # whole-file `#![cfg(all(feature = "websocket", feature = "tcp-mux"))]`,
+        # so dropping either feature from this lane makes it compile to an empty
+        # crate and `cargo test` reports "0 passed" without failing; deleting the
+        # file makes cargo pick no target at all. Both are caught here: the
+        # target name must appear in the run log, the run must be green, and
+        # `-- --list` must report the expected count. `expected` is the single
+        # literal every comparison below reads.
+        shell: bash
+        run: |
+          set -eo pipefail
+          expected=2
+          log=/tmp/frp-server-ws-dedicated-port.log
+          run_status=0
+          cargo test -p frp-server --features dashboard --test transport_e2e_websocket_port --color never 2>&1 | tee "$log" || run_status=$?
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+          n=$(cargo test -p frp-server --features dashboard --test transport_e2e_websocket_port --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          status=0
+          [ "$run_status" = "0" ] || status=1
+          grep -q "Running tests/transport_e2e_websocket_port.rs" "$log.plain" || status=1
+          grep -q "test result: ok. $expected passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "$expected" ] || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::frp-server dedicated-websocket_port guard failed (status=$status, cargo=$run_status, file=$n, expected=$expected, log=$log)"
+            if [ -n "$n" ] && [ "$n" != "$expected" ]; then
+              if [ "$n" -lt "$expected" ]; then
+                echo "::error::frp-server/tests/transport_e2e_websocket_port.rs lists $n tests, this step expects $expected — the tests were deleted, or the file's #![cfg(all(feature = \"websocket\", feature = \"tcp-mux\"))] gate is false because this lane lost websocket or tcp-mux; restore the tests and the features rather than lowering the literal"
+              else
+                echo "::error::frp-server/tests/transport_e2e_websocket_port.rs lists $n tests, this step expects $expected: move the single literal in the 'expected=$expected' line at the top of this step to $n"
+              fi
+            fi
+            cat "$log.plain"
+            exit 1
+          fi
+          echo "frp-server dedicated-websocket_port guard ok: $n tests listed (expected $expected), 0 failed"
       - name: Run frp-server's tests with no features (runtime half of frp-server's tier gate)
         # The `verify` lane's `cargo check -p frp-server --no-default-features
         # --all-targets` is compile-only, so it cannot see a missing #[cfg] on a
@@ -1887,20 +1926,28 @@ jobs:
         # Caveat, measured — the bound is on the code that is *compiled*, not on
         # the targets. A whole-file-cfg'd target compiles to nothing, and inside
         # a target that does compile, any #[cfg]-excluded item is unchecked the
-        # same way. 9 of frp-server's 35 `tests/*.rs` targets are
-        # whole-file-cfg'd *empty* here: dashboard_integration.rs and
-        # dashboard_v2_integration.rs (#![cfg(feature = "dashboard")]),
-        # ssh_gateway.rs (#![cfg(feature = "ssh")]), transport_e2e_kcp.rs
-        # (#![cfg(feature = "kcp")]), transport_e2e_quic.rs and v2_quic_r2r.rs
-        # (#![cfg(feature = "quic")]), vhost_h2c.rs,
-        # http_plugin.rs and http_plugin_ping.rs (#![cfg(feature =
-        # "http-proxy")] — the last two are the pair this change gated).
-        # `cargo test -p frp-server --no-default-features --test <t> --
-        # --list` reports 0 tests for each. Item-by-item escapes exist too:
-        # vhost_audit_fixes.rs declares 21 tests, 2 tls-gated per item, so 19 are
-        # compiled and those 2 are not. (mock_oidc.rs also reports 0 tests but is
-        # not whole-file-cfg'd empty — no inner #[cfg], compiled as its own test
-        # target, simply declaring no tests.)
+        # same way. Two counts, and the rule for each: `M` is every `tests/*.rs`
+        # file at the top level of `frp-server/tests/` — Cargo auto-discovers
+        # each as its own integration-test target (`frp-server/tests/common/`
+        # is a shared module directory, not a target) — and `N` is how many of
+        # those files carry a crate-level `#![cfg(...)]` inner attribute that is
+        # false in this `--no-default-features` configuration, i.e. compile to
+        # an empty crate. Measured at `634a273e`: M = 41, N = 12. The 12, by
+        # gate: dashboard_integration.rs, dashboard_v2_integration.rs and
+        # frps_binary_guard.rs (#![cfg(feature = "dashboard")]);
+        # server_reload_auth.rs (#![cfg(feature = "oidc")]); ssh_gateway.rs
+        # (#![cfg(feature = "ssh")]); transport_e2e_kcp.rs (#![cfg(feature =
+        # "kcp")]); transport_e2e_quic.rs and v2_quic_r2r.rs (#![cfg(feature =
+        # "quic")]); transport_e2e_websocket_port.rs (#![cfg(all(feature =
+        # "websocket", feature = "tcp-mux"))]); vhost_h2c.rs, http_plugin.rs and
+        # http_plugin_ping.rs (#![cfg(feature = "http-proxy")] — the last two
+        # are the pair this change gated). `cargo test -p frp-server
+        # --no-default-features --test <t> -- --list` reports 0 tests for each.
+        # Item-by-item escapes exist too: vhost_audit_fixes.rs declares 21
+        # tests, 2 tls-gated per item, so 19 are compiled and those 2 are not.
+        # (mock_oidc.rs also reports 0 tests but is not whole-file-cfg'd empty —
+        # no inner #[cfg], compiled as its own test target, simply declaring no
+        # tests.)
         #
         # Note that frp-core is *not* feature-off in this graph: frp-server's
         # dev-dependency on frp-client (default features, frp-server/Cargo.toml)
@@ -2099,14 +2146,20 @@ jobs:
         # The frp-server WebSocket line is the one no other lane reaches:
         # frp-server's websocket-ON lanes all carry kcp as well (its `default`
         # and frps's `full`), and the lanes that turn kcp off also turn
-        # websocket off, so `websocket` without `kcp` exists only via `-p`.
+        # websocket off, so `websocket` without `kcp` exists only via `-p`. It
+        # also carries `tcp-mux`, because the test target added alongside this
+        # line — frp-server/tests/transport_e2e_websocket_port.rs — is
+        # `#![cfg(all(feature = "websocket", feature = "tcp-mux"))]`: with
+        # tcp-mux off the whole file is cfg'd out and the check sees an empty
+        # crate, so a compile error in the test body would be invisible. Same
+        # cost class, and `tcp-mux` is not `kcp`, so the property above stands.
         #
         # `set -e` short-circuits, so the first red configuration fails the
         # step and prints its own compiler output.
         run: |
           set -e
           cargo check -p frp-server --no-default-features --features vnet --all-targets
-          cargo check -p frp-server --no-default-features --features websocket --all-targets
+          cargo check -p frp-server --no-default-features --features websocket,tcp-mux --all-targets
           cargo check -p frp-client --no-default-features --features quic
           cargo check -p frp-client --no-default-features --features vnet --all-targets
           cargo check -p frp-core --no-default-features --features kcp --all-targets
