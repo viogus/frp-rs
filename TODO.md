@@ -4144,6 +4144,50 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   of this file: **R1** (`-c` plus a **non-empty** log flag is still honoured here, Go discards it)
   and **R2** (the implicit-config lane has no Go counterpart). `--log-format` keeps its
   write-through (**R3**).
+  **Done (2026-10-01, at `5e2f2398`, PR #440).** The rest of the Done-when: the `docs/config.md`
+  `[log]` rows now state what an explicitly supplied empty/zero *flag* means against Go's two lanes,
+  per field, and the resolution-order list (`docs/config.md:1006-1012`) says an empty `--log-level ""`
+  falls through to the file's value on both binaries. Both binaries carry spawn pins that assert the
+  emitted records instead of an exit status: `frps/tests/log_completion.rs::
+  cli_empty_log_level_does_not_raise_the_files_warn` uses `[log] level = "warn"` plus a written
+  `[web_server.tls] enable = true`, so "inert-key `WARN` present, banner `INFO` absent" pins the level
+  at exactly `warn`, with a third arm passing `--log-level info` as the banner's own control (the
+  11-`INFO` figure in the paragraph above counts that arm's post-`SIGTERM` lines; 7 records precede
+  the signal, `docs/config.md:84`);
+  `::cli_empty_log_file_keeps_the_files_destination` requires the records to land in
+  `logs/frps.log.<date>` and not on stdout; `::cli_zero_log_max_days_keeps_the_files_retention`
+  requires a five-day-old rotation file to survive `--log-max-days 0` under `[log] max_days = 7` and to
+  die under `--log-max-days 3`. `frpc/tests/log_completion.rs::
+  cli_empty_log_level_does_not_raise_the_files_warn` is the client control (`login_fail_exit = false`,
+  spelled `loginFailExit` in the test's TOML; against a closed port it makes attempt 1 log a `WARN`,
+  and the test waits on that record), so a
+  write-through `frpc` overlay — which does not exist today — is what would red it.
+  `frp-core/src/cli.rs::cli::tests::log_flag_zero_values_do_not_override_the_config_file` gained the
+  assertions it lacked (four `assert_eq!`s in two groups): the three
+  zero values still parse as *supplied* (it is the overlay, not the parser, that treats them as
+  absent), and `--log-max-days=-1` survives `complete()` — only the zero value is filtered. The
+  `frpc` count guard is new (`.github/workflows/ci.yml:712` `expected=1`, in the step this PR adds);
+  the `frps` step already carried the same three checks with `6` written into every count comparison
+  and message (the `Running tests/…` grep and the failure header carry no count), so there the delta
+  is the hoist to the single `expected=9` (`:921`) and the 6 → 9 move for the three spawn pins this
+  PR adds. Each guard proves the target ran, that `-- --list` counted that
+  many, and that the summary read `test result: ok. N passed; 0 failed`, with direction-naming
+  `::error::` text — a cfg-disabled integration file prints `running 0 tests` /
+  `ok. 0 passed; 0 failed` and exits 0, which a bare invocation cannot tell from success. The Go rows
+  behind the prose (v0.71.0 `-c`: `--log_level ""` and `--log_file ""` leave the records as if the
+  flag were omitted — the two `--log_file ""` rows carry the same three records, and with the port and
+  the `-c` path held constant their bytes differ only in Go's per-record millisecond timestamps (an
+  identical argv re-run differs the same way), so only the record set is claimed, not the byte total —
+  while `--log_max_days 0` emits no
+  comparable bytes at startup, so its retention effect is only observable later, through
+  `golib@v0.8.2/log/output_rotatefile.go:103`; `cmd/frps/root.go:66-84` discards the pflag-bound
+  struct; the flags-only lane completes the empty values via `util.EmptyOr`) are in the PR body and
+  the commit messages. The old test name this PR retires,
+  `max_days_zero_is_completed_to_three_on_the_cli_and_in_the_file`, becomes
+  `max_days_zero_does_not_disable_cleanup_on_the_cli_or_in_the_file`
+  (`frps/tests/log_completion.rs:927`). It stood at two sites outside this item: `TODO.md:4361` at
+  base `fdb39c6b` (this PR's insertion moved the repaired text to `:4406`), repaired here, and
+  `docs/history/development-log.md:84`, repaired in the devlog commit that follows this one.
 - [x] **Two test-harness hazards: a feature swap that breaks the dashboard lane silently, and
   `FrpsHandle::start` orphaning its child on the panic path.**
   * **(a) `cargo test -p frps` and a clippy run that compiles `frps` replace `target/debug/frps`
@@ -4358,7 +4402,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   Found by the first reviewer on this branch (the file is **outside** that change's diff, and it
   landed in **#396**, the `log_completion` step): **2 of 7** runs failed, panicking at
   `frps/tests/log_completion.rs:502` — the first arms of
-  `max_days_zero_is_completed_to_three_on_the_cli_and_in_the_file`, whose failure text is
+  `max_days_zero_does_not_disable_cleanup_on_the_cli_or_in_the_file` (named
+  `max_days_zero_is_completed_to_three_on_the_cli_and_in_the_file` when the failure was observed),
+  whose failure text is
   `aged_file_survives`'s readiness panic (`:465-496` on the pre-fix tree; `:513`/`:524` after
   the fix below: *"no fresh `logs/frps.log.<date>` was written
   within {READY_TIMEOUT:?}, so the child never reached the appender"*). So the atomicity that test
