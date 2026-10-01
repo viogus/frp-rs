@@ -8323,7 +8323,7 @@ section; ledger now **24 open / 104 closed**.**
   its own `SETTLE = 500 ms` (used once at `:504`) because its legacy `records() == 0` assertions need a
   negative guarantee a positive condition-wait cannot express.
 
-- [ ] **The `frpc/tests/warn_delivery.rs` condition wait is a quiet window, not a finality guarantee: a duplicate emitted more than one `QUIET_PERIOD` behind the first is a false pass.**
+- [x] **The `frpc/tests/warn_delivery.rs` condition wait is a quiet window, not a finality guarantee: a duplicate emitted more than one `QUIET_PERIOD` behind the first is a false pass.**
   Filed by the coordinator from PR #432's round-2 delta adversarial, which re-ran the closed item's own teeth with
   the delay moved: a second `--config-dir` emit 150 ms behind the first (`frpc/src/main.rs:545`) reds the pin
   (`frpc/tests/warn_delivery.rs:448:5`, `left: 2`), but the same mutant at **700 ms** — past `QUIET_PERIOD`
@@ -8335,7 +8335,27 @@ section; ledger now **24 open / 104 closed**.**
   exit status and its own emitted-record count), or the bound is stated next to `wait_for_record` and a witness
   shows a duplicate inside the window is caught while one outside it is recorded as undetectable.
 
-- [ ] **`frpc/tests/cli_inputs.rs`'s `a_config_file_named_after_a_subcommand_stays_a_config_file` fails whenever the `admin` feature is on, so `cargo test -p frpc --features full,admin` is red for a reason no CI lane runs.**
+  **Done (PR #441, code head `f7319c3c`).** The bound is gone rather than documented: the oracle is now the
+  child's own exit. `Spawned::run` waits for the child to exit and then joins both pipe-drain threads, so the
+  capture is at EOF before anything asserts on it, and `QUIET_PERIOD`, `wait_for_record` and the live-buffer
+  fallback are deleted; the one read-error direction is disclosed at `frpc/tests/warn_delivery.rs:83` (`drain`'s
+  `Ok(0) | Err(_) => break` at `:355`). Teeth re-measured in all three review rounds: the duplicate
+  `--config-dir` emit at **+700 ms** — the delay that left the pre-fix pin printing `ok. 8 passed` — now reds at
+  `frpc/tests/warn_delivery.rs:407:5` (`left: 2`), the +150 ms and 0 ms variants red with it, and the honest
+  lane is `ok. 8 passed`. The round-2 adversarial could not construct a false negative for the new oracle: its
+  strongest shape, a duplicate 700 ms behind a 512 KB stdout burst, reds with all 1536 padding lines drained to
+  EOF (no truncation, no deadlock).
+
+- [ ] **`frpc/tests/warn_delivery.rs`'s drain treats any read error as EOF, so a transport error can end a wait early.**
+  Filed by the coordinator from PR #441's rounds 1-3. `drain`'s read loop breaks on `Ok(0) | Err(_)`
+  (`frpc/tests/warn_delivery.rs:355`, disclosed in the module doc at `:83`), so a pipe that errors instead of
+  reaching EOF makes the joined capture look final. For a count row that fails safe (fewer records than the
+  child emitted reds the pin), but for a silence row ("nothing on this stream") it can hide a record that was
+  never read.
+  **Done-when:** an `Err` other than `ErrorKind::Interrupted` is distinguished from EOF and asserted absent (or
+  the join reports it), or the fail-safe direction is argued for both row kinds.
+
+- [x] **`frpc/tests/cli_inputs.rs`'s `a_config_file_named_after_a_subcommand_stays_a_config_file` fails whenever the `admin` feature is on, so `cargo test -p frpc --features full,admin` is red for a reason no CI lane runs.**
   Filed by the coordinator from PR #432's round-2 delta adversarial while correcting that batch's lane quote.
   Measured at the branch head: `cargo test -p frpc --features full,admin --test cli_inputs` → `33 passed; 1 failed`,
   panicking at `frpc/tests/cli_inputs.rs:1485:9` because the config's `[webServer]` port appears in the child's
@@ -8345,6 +8365,27 @@ section; ledger now **24 open / 104 closed**.**
   to `9b2acefb`), but no lane runs `-p frpc` with both features, so it stays invisible.
   **Done-when:** the assertion distinguishes the admin startup line from a dial (or the test is gated to the feature
   combinations a lane actually runs), and a lane runs `cargo test -p frpc --features full,admin`.
+
+  **Done (PR #441, code head `f7319c3c`).** The assertion that could not tell a dial from the child's own
+  listener is deleted, with its reasoning recorded in place (`frpc/tests/cli_inputs.rs:1485-1495`, naming
+  `frpc admin server starting on 127.0.0.1:<port>` from `frp-client/src/service.rs:4414`), and the claim it
+  meant to make is carried where it is observable: `!text.contains("Proxy Status") && !text.contains("NAME  TYPE")`
+  (`:1498` — a `status` run that reached the mock prints exactly those headers) plus the mock staying silent
+  after the loop (`:1506`, `rx.try_recv().is_err()`). Measured: restoring the base's
+  `!text.contains(&port.to_string())` reds at `frpc/tests/cli_inputs.rs:1485:9` (the original failure), the head
+  is 34/34, and `--features admin` and `--features full,admin` list the same 34 names. The lane half of the
+  done-when shipped **scoped**: `Run frpc's CLI-input tests with the admin feature`
+  (`.github/workflows/ci.yml:1124`) runs `cargo test -p frpc --features admin --test cli_inputs`
+  (`:1124`-`1194`) behind a fail-closed count guard (`FRPC_ADMIN_CLI_INPUTS_TESTS: "34"` at `:363`; zero and
+  non-numeric values rejected at `:1169`; the `--list` count and `test result: ok. 34 passed; 0 failed` both
+  checked at `:1180-1181`; the honest lane prints `frpc admin CLI-input guard ok: 34 tests listed (expected 34),
+  0 failed` at `:1194`). The package-wide `cargo test -p frpc --features full,admin` literal in this done-when
+  was **rejected**, with the exposure it would have covered stated in the step's own comment (`:1133`-`1152`):
+  `frpc/tests/admin_cli.rs` is `#![cfg(feature = "full")]` (`frpc/tests/admin_cli.rs:50`), so `admin` never
+  selected a different set of its 25 tests — it only changes which `frp-client` features they compile against —
+  and the whole-package run would re-run 77 tests the steps above already execute in this job while doubling its
+  exposure to the `api_timeout_before_the_subcommand_reaches_the_command` flake (1322 ms measured against its
+  5 s bound).
 
 - [ ] **`scripts/tests/repo-health-fixtures.sh` cannot detect its own neutering — the hole the compat guard's `MIN_CHECKS` just closed.**
   Filed by the coordinator from the `test-harness-strays` round-2 adversarial round (read at

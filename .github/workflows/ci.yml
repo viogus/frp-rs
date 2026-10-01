@@ -139,13 +139,14 @@ jobs:
     name: Tests (unit)
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    # The two guarded test counts, one value each. The lane that owns a value
-    # reads it in both of its count assertions — the `test result: ok. N passed;
-    # 0 failed` grep over the captured log, and the `[ "$n" = ... ]` comparison
-    # against the count from `-- --list` — and prints it in its own status lines,
-    # so a test added to (or removed from) a guarded file moves exactly one
-    # literal here. The values stay hard-coded: a count derived from the file a
-    # lane checks would stay green if that file's tests were removed altogether.
+    # The three guarded test counts in `env:` below, one value each. The lane
+    # that owns a value reads it in both of its count assertions — the
+    # `test result: ok. N passed; 0 failed` grep over the captured log, and the
+    # `[ "$n" = ... ]` comparison against the count from `-- --list` — and
+    # prints it in its own status lines, so a test added to (or removed from) a
+    # guarded file moves exactly one literal here. The values stay hard-coded: a
+    # count derived from the file a lane checks would stay green if that file's
+    # tests were removed altogether.
     env:
       # frps/tests/cli_exit_codes.rs — "Run frps CLI tests (config-failure exit codes)"
       # 16 → 19 with the typed exit-code classification: +3 server-side pins
@@ -352,6 +353,14 @@ jobs:
       # `cargo test -p frpc --no-default-features --features tiny --test
       # cli_exit_codes -- --list`.
       FRPC_TINY_CLI_TESTS: "24"
+      # frpc/tests/cli_inputs.rs under `--features admin` — "Run frpc's CLI-input
+      # tests with the admin feature". The `admin` flag changes the linked
+      # client: the child binds its `[webServer]` and announces it
+      # (`frp-client/src/service.rs:4414`), which is what made the pre-fix
+      # assertion in `a_config_file_named_after_a_subcommand_stays_a_config_file`
+      # a false positive. Re-derived on this tree with
+      # `cargo test -p frpc --features admin --test cli_inputs -- --list`.
+      FRPC_ADMIN_CLI_INPUTS_TESTS: "34"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
@@ -1110,6 +1119,79 @@ jobs:
             exit 1
           fi
           echo "frpc admin warning-delivery guard ok: $n tests listed (expected 8), 0 failed"
+      - name: Run frpc's CLI-input tests with the admin feature
+        # The `admin`-on half of `frpc/tests/cli_inputs.rs`, and the only lane
+        # that ever ran that file with `admin` on: `Run frpc CLI tests (admin
+        # address resolution)` above runs the package with the default (`full`)
+        # features, and the two admin steps above this one run a single
+        # *different* file each, so
+        # `a_config_file_named_after_a_subcommand_stays_a_config_file` was
+        # invisible in this configuration. That hid a red: it read run mode's own
+        # admin bind line (`frpc admin server starting on 127.0.0.1:<port>`,
+        # `frp-client/src/service.rs:4414`) as a dial of the config's
+        # `[webServer]` port.
+        #
+        # Scoped to the one target that needs the flag rather than the whole
+        # package: `frpc`'s default feature set is already `full`, so
+        # `--features admin` is the same set as `--features full,admin` for this
+        # target, and a whole-package run would re-run 77 tests the steps above
+        # already execute in this job while doubling the per-run exposure to
+        # `frpc/tests/admin_cli.rs`'s timing flake (`frpc/tests/admin_cli.rs:178`,
+        # 5 s `EXIT_TIMEOUT` against a 1 s `--api-timeout`).
+        #
+        # Exposure this scoping gives up, stated plainly: no lane runs
+        # `frpc/tests/admin_cli.rs` (25 tests) with `admin` on any more. It runs
+        # in `Run frpc CLI tests (admin address resolution)` above, under the
+        # default (`full`) features. That file's own gate is
+        # `#![cfg(feature = "full")]` (`frpc/tests/admin_cli.rs:50`), so `admin`
+        # never selected a different set of its tests — the flag would only
+        # change which `frp-client` feature set they compile against. Accepted
+        # knowingly: the alternative, the whole-package run, re-runs those same
+        # 25 tests and doubles this job's exposure to the flake named above.
+        #
+        # Count-guarded like the `cli_exit_codes` step below, and for the same
+        # reason: `cargo test` exits 0 when a `#[cfg]` change compiles this file
+        # to zero tests (measured: with the file's gate changed `full` → `tiny`
+        # it prints `running 0 tests` and exits 0), so "cargo exited 0" is not a
+        # guard. The single literal lives in
+        # `env.FRPC_ADMIN_CLI_INPUTS_TESTS` on this job, and it must be at least
+        # 1: a literal of `0` would be satisfied by the very zero-test state this
+        # guard exists to catch (measured: `0` + the broken gate listed 0 tests,
+        # passed 0 and exited 0 before this check was added). With the literal
+        # rejected below and `n` required to equal it, `n >= 1` follows — no
+        # separate check on `n` is needed, and one that could never fire alone is
+        # not written.
+        shell: bash
+        run: |
+          set -eo pipefail
+          case "$FRPC_ADMIN_CLI_INPUTS_TESTS" in
+            ''|*[!0-9]*|0)
+              echo "::error::frpc admin CLI-input guard: env.FRPC_ADMIN_CLI_INPUTS_TESTS must be a positive integer (got '$FRPC_ADMIN_CLI_INPUTS_TESTS')"
+              exit 1
+              ;;
+          esac
+          log=/tmp/frpc-admin-cli-inputs-tests.log
+          cargo test -p frpc --features admin --test cli_inputs --color never 2>&1 | tee "$log"
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+          n=$(cargo test -p frpc --features admin --test cli_inputs --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          log_n=$(grep -E -o 'test result: ok\. [0-9]+ passed; 0 failed' "$log.plain" | head -1 | sed -E 's/^test result: ok\. ([0-9]+) passed; 0 failed$/\1/' || true)
+          status=0
+          grep -q "Running tests/cli_inputs.rs" "$log.plain" || status=1
+          grep -q "test result: ok. $FRPC_ADMIN_CLI_INPUTS_TESTS passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "$FRPC_ADMIN_CLI_INPUTS_TESTS" ] || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::frpc admin CLI-input guard failed (status=$status, env=$FRPC_ADMIN_CLI_INPUTS_TESTS, file=$n, log=$log_n)"
+            if [ -n "$log_n" ] && [ "$log_n" = "$n" ] && [ "$n" != "$FRPC_ADMIN_CLI_INPUTS_TESTS" ]; then
+              if [ "$n" -gt "$FRPC_ADMIN_CLI_INPUTS_TESTS" ]; then
+                echo "::error::frpc/tests/cli_inputs.rs lists $n tests, env.FRPC_ADMIN_CLI_INPUTS_TESTS is $FRPC_ADMIN_CLI_INPUTS_TESTS: move the single env.FRPC_ADMIN_CLI_INPUTS_TESTS value on the tests-unit job in .github/workflows/ci.yml from $FRPC_ADMIN_CLI_INPUTS_TESTS to $n"
+              else
+                echo "::error::frpc/tests/cli_inputs.rs lists $n tests, env.FRPC_ADMIN_CLI_INPUTS_TESTS is $FRPC_ADMIN_CLI_INPUTS_TESTS — the listed count DECREASED: if you deleted tests, restore them; do not lower this value"
+              fi
+            fi
+            cat "$log.plain"
+            exit 1
+          fi
+          echo "frpc admin CLI-input guard ok: $n tests listed (expected $FRPC_ADMIN_CLI_INPUTS_TESTS), 0 failed"
       - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
         # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag
         # exit-code fix has to hold in the no-default-features build too — but
