@@ -4072,7 +4072,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `docs/config.md` `[log] level` row rewritten to one consequence-free sentence. Until then the
   divergence is stated in `docs/config.md`, in `resolve_log_level`'s doc comment
   (`frp-core/src/logging.rs`) and here.
-  **Done (2026-10-01, at `d8b867b3` on `fix/cli-flag-binding`, PR #427).** The first branch of the
+  **Done (2026-10-01, at `4b9c9951` on `fix/cli-flag-binding`, PR #427).** The first branch of the
   Done-when: `FrpsArgs::override_server_config` now skips an **empty** `--log-level`/`--log-file`
   and a **zero** `--log-max-days`, so the file's `[log]` values survive instead of being completed
   to `info`. Measured post-fix with `[log] level = "warn"`: the implicit-config lane with
@@ -7862,7 +7862,7 @@ section; ledger now **24 open / 104 closed**.**
   what Go refuses), or the refusal is recorded as a deliberate divergence with both
   measurements, and a test pins whichever answer is chosen.
 
-  **Done (2026-10-01, at `d8b867b3` on `fix/cli-flag-binding`, PR #427).** The first branch: the
+  **Done (2026-10-01, at `4b9c9951` on `fix/cli-flag-binding`, PR #427).** The first branch: the
   flag and `ServerConfig::vhost_http_timeout` are `i64`, matching Go's `Int64VarP`
   (`/tmp/frp-go-src/pkg/config/flags.go:237`) and Go's `int64` field; the internal
   `clamp_vhost_timeout` keeps its `u64` return and its `<= 0` floor, so `--vhost-http-timeout -1`
@@ -7872,7 +7872,7 @@ section; ledger now **24 open / 104 closed**.**
   (`frps/tests/cli_exit_codes.rs:2289`). The refusal **text** for an out-of-range value is still
   Rust's rather than Go's `strconv.ParseInt` wording plus the `Usage:` block (**R4** at the end of
   this file).
-  Ledger after this batch: **30 open / 162 closed** (base `6420d77a`: 26 open / 160 closed; the
+  Ledger after this batch: **29 open / 163 closed** (base `f503b4e7`: 25 open / 161 closed; the
   batch closes the two log-flag/`--vhost-http-timeout` items and files six residues R1–R6 at the end
   of this file).
 
@@ -8499,8 +8499,8 @@ section; ledger now **24 open / 104 closed**.**
   only exists because of `[common]` is accepted) without weakening the top-level check, or the
   divergence is recorded as deliberate in `docs/config.md` with this measurement, pinned.
 - [ ] **R1 — With `-c`, a *non-empty* log flag is still honoured on `frps` where Go discards the whole pflag-bound struct.**
-  Residual from the empty-`--log-level` item closed in #427. `frps/src/main.rs:986-988` gates only
-  `override_server_config` on `cli_overrides_enabled()`; `frps/src/main.rs:991` then calls
+  Residual from the empty-`--log-level` item closed in #427. `frps/src/main.rs:989-991` gates only
+  `override_server_config` on `cli_overrides_enabled()`; `frps/src/main.rs:994` then calls
   `init_logging(&cli, Some(&cfg))` with the **raw** CLI values, so `frps -c frps.toml --log-level info`
   emits 11 `INFO` records where Go's `-c` lane emits 0 (`/tmp/frp-go-src/cmd/frps/root.go:67-83`),
   contradicting the contract stated at `frp-core/src/cli.rs:3724-3731`. Same for `--log-file`,
@@ -8533,7 +8533,7 @@ section; ledger now **24 open / 104 closed**.**
 - [ ] **R6 — Two bounds on the "accept-and-ignore matches Go" claim for `--vhost-http-timeout`.**
   (a) `frps --config-dir …` with an empty `--log-level` resolves to `info` (not `debug`, which only
   the opt-in `debug-logs` feature reaches — `frp-core/src/logging.rs:101-112`) because the config-dir
-  lane calls `init_logging(&cli, None)` (`frps/src/main.rs:467`), i.e. it never reads the loaded
+  lane calls `init_logging(&cli, None)` (`frps/src/main.rs:470`), i.e. it never reads the loaded
   config's `[log]`; (b) the 24 h cap is frp-rs-only — `VHOST_TIMEOUT_CAP_SECS`
   (`frp-server/src/vhost.rs:654`, applied by `clamp_vhost_timeout` at `:710`) has no Go counterpart,
   so "accept-and-ignore matches Go" is bounded to values `<= 0` or below the cap.
