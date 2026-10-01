@@ -2095,7 +2095,7 @@ tlsServerName = "frps.example.com"
 /// "Go frp Equivalent". No loader accepts them — `frp-core/src/config/server.rs:42-56`
 /// declares those fields with `#[serde(default)]` and no alias, and Go
 /// v0.71.0 carries them under the nested `[transport.tls]` section, which
-/// `frp-core/src/config/normalize.rs:865-884` maps onto the flat fields.
+/// `frp-core/src/config/normalize.rs:908-935` maps onto the flat fields.
 /// This pins both directions (the four stay rejected, the two real aliases
 /// stay accepted) so the table cannot drift back.
 #[test]
@@ -2171,7 +2171,7 @@ fn test_flat_camelcase_tls_spellings_are_not_loader_spellings() {
 /// `frp-core/src/config/client.rs:264-270` declares those fields with
 /// `#[serde(default)]` and no alias, and Go v0.71.0 carries them under the
 /// nested `[transport.tls]` section, which
-/// `frp-core/src/config/normalize.rs:1429-1437` maps onto the flat fields.
+/// `frp-core/src/config/normalize.rs:1443-1454` maps onto the flat fields.
 /// This pins both directions (the five spellings stay rejected, the two real
 /// aliases stay accepted) so the table cannot drift back.
 #[test]
@@ -2801,7 +2801,7 @@ mod proptest_tests {
         /// A proxy expressed with Go-format sub-tables
         /// ([proxies.transport] / [proxies.healthCheck] /
         /// [proxies.loadBalancer]) normalizes to the same TOML as the
-        /// equivalent flat fields. normalize_proxies (normalize.rs:1945)
+        /// equivalent flat fields. normalize_proxies (normalize.rs:2547)
         /// flattens the sub-tables in the order transport → healthCheck →
         /// loadBalancer; the flat form below lists the fields in exactly
         /// that order so the serialized outputs match.
@@ -2856,7 +2856,7 @@ mod proptest_tests {
     proptest! {
         /// Same equivalence for visitor sub-tables
         /// ([visitors.transport] / [visitors.natTraversal],
-        /// normalize_visitors at normalize.rs:2197).
+        /// normalize_visitors at normalize.rs:2799).
         #[test]
         fn visitor_subtables_flat_vs_nested_equivalent(
             use_enc in any::<bool>(),
@@ -3749,15 +3749,18 @@ fn test_collect_config_files_admits_a_non_regular_entry_by_extension() {
     // This pins **admission**, and the fact that it is extension-only: the
     // collector has no regular-file check, so a FIFO (or any other
     // non-regular entry) whose name ends in a config extension is collected
-    // like a file. The `is_file()` guards live only in the `[include]`
-    // `simple_glob` path (`frp-core/src/config/file.rs:340`, `:363`), not at
-    // the push site in `collect_config_files_inner`.
+    // like a file. The tree's only non-regular filter is on the `[include]`
+    // `glob_in_dir` path, and it skips *directories* by the directory entry's
+    // own type — `if entry.file_type()?.is_dir()`
+    // (`frp-core/src/config/file.rs:879`) — never by `is_file()`, so it admits
+    // a FIFO just as this collector does. `collect_config_files_inner` has no
+    // filter at all.
     //
     // That is deliberately Go-parity, not an oversight: Go frp v0.71.0's
     // `--config-dir` walk filters directory entries by extension
     // (`cmd/frpc/sub/root.go`) and then reads each match, so a FIFO named
     // `b.toml` is admitted by both implementations and the shared loader's
-    // first `std::fs::read_to_string` (`frp-core/src/config/file.rs:303`)
+    // first `std::fs::read_to_string` (`frp-core/src/config/normalize.rs:628`)
     // then blocks with no writer. Measured against the real Go binaries
     // (v0.71.0, darwin/arm64, `/private/tmp/frp_0.71.0_darwin_arm64/frpc`):
     //   * `frpc --config-dir <fifo-only>` still running after 15 s, 0 log bytes;
@@ -7457,8 +7460,8 @@ fn legacy_ini_typed_reserved_root_visitor_is_refused_like_go() {
 /// This pin is about the *routing* (a `visitors.foo` / `proxies.foo` header with
 /// `role = "visitor"` ends up in `cfg.visitors` under its raw name, not in
 /// `cfg.proxies`), not about which collector clause collects it: both the
-/// authoritative-`role` clause (`frp-core/src/config/normalize.rs:2061-2063`) and
-/// the array-root clause (`frp-core/src/config/normalize.rs:2077-2079`) accept
+/// authoritative-`role` clause (`frp-core/src/config/normalize.rs:2084-2086`) and
+/// the array-root clause (`frp-core/src/config/normalize.rs:2100-2102`) accept
 /// this input, so deleting either one alone leaves this test green. Each clause
 /// has its own single-path pin instead — the `role` clause via
 /// `legacy_ini_typed_reserved_root_visitor_is_refused_like_go`, the array-root
@@ -7585,8 +7588,8 @@ fn legacy_ini_non_string_type_is_not_defaulted_to_tcp() {
 /// empty`; `[include]` singular gives the same with `include`. frp-rs returned
 /// rc 0 with `Proxies: 0 Visitors: 0` — `process_includes` removed the table
 /// whatever its shape (`frp-core/src/config/file.rs:154` on b4b60b91; the shape
-/// gate is now `frp-core/src/config/file.rs:293`) and it runs from
-/// `frp-core/src/config/normalize.rs:611`, before the guard at `frp-core/src/config/normalize.rs:1968`, so the section was gone before
+/// gate is now `frp-core/src/config/file.rs:298-299`) and it runs from
+/// `frp-core/src/config/normalize.rs:634`, before the guard at `frp-core/src/config/normalize.rs:1991`, so the section was gone before
 /// anything could refuse it. A dotted `[includes.foo]` was never reached by that
 /// removal, but not because it is absent from the top level: `includes` is not in
 /// `INI_NESTED_SECTION_ROOTS` (`frp-core/src/config/format.rs:259-275`), so the
@@ -7660,12 +7663,12 @@ fn legacy_ini_includes_section_with_ports_is_a_proxy() {
 /// Go: `[includes] foo = 1` loads rc 0 in both dialects, on the client and on the
 /// server (the server legacy reader only reads `[common]`, and the client's
 /// proxy-name rule finds no `type`/port to act on). The shape gate at
-/// `frp-core/src/config/file.rs:293` deliberately lets the table through so the
-/// typeless-visitor guard (`frp-core/src/config/normalize.rs:1968`) and the
+/// `frp-core/src/config/file.rs:298-299` deliberately lets the table through so the
+/// typeless-visitor guard (`frp-core/src/config/normalize.rs:1991`) and the
 /// collector can see it, so the loader drops whatever table is still there after
-/// normalization (`frp-core/src/config/file.rs:410`, run by the two `normalize`
-/// wrappers at `frp-core/src/config/file.rs:378` and
-/// `frp-core/src/config/file.rs:395`, `.ini` only). Without
+/// normalization (`frp-core/src/config/file.rs:485`, run by the two `normalize`
+/// wrappers at `frp-core/src/config/file.rs:453` and
+/// `frp-core/src/config/file.rs:470`, `.ini` only). Without
 /// that drop the leftover reached the v1 `includes: Vec<String>` decode and frp-rs
 /// refused a file Go loads: client rc 1 both modes, server rc 1 both modes for
 /// `[includes] foo = 1` and `[include] foo = 1` in strict mode.
@@ -7709,9 +7712,9 @@ fn legacy_ini_table_shaped_include_without_proxy_keys_is_inert() {
 /// client and the server. frp-rs carried it into the v1 `includes: Vec<String>`
 /// decode and refused a file Go loads (client and server rc 1 in both modes,
 /// `invalid type: integer \`1\`, expected a sequence`), which
-/// `drop_ini_scalar_include_keys` (`frp-core/src/config/file.rs:432`) removes. A
+/// `drop_ini_scalar_include_keys` (`frp-core/src/config/file.rs:507`) removes. A
 /// `.ini` **without** `[common]` goes down Go's v1 path too, so its type error
-/// must stay, in both modes (the other include shapes that diverge from Go are listed in the "Known bounds" comment above `simple_glob` in `frp-core/src/config/file.rs`).
+/// must stay, in both modes (the other include shapes that diverge from Go are listed in the "Known bounds" comment above `go_dir` in `frp-core/src/config/file.rs:529`).
 #[test]
 fn legacy_ini_scalar_includes_is_inert_like_go() {
     let client_head = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
@@ -7780,9 +7783,9 @@ fn legacy_ini_scalar_includes_is_inert_like_go() {
 
 /// **v1 formats keep the table-shaped `includes` type error.** The `.ini`-only
 /// cleanup (`drop_legacy_ini_include_tables`,
-/// `frp-core/src/config/file.rs:410`) is gated on the format
+/// `frp-core/src/config/file.rs:485`) is gated on the format
 /// (`if format != ConfigFormat::Ini { return; }`,
-/// `frp-core/src/config/file.rs:412`). Without that gate a table-shaped
+/// `frp-core/src/config/file.rs:487`). Without that gate a table-shaped
 /// `includes` in TOML/YAML/JSON is dropped and frp-rs loads a file Go refuses:
 /// measured on Go v0.71.0, all three formats are rc 1 in both loader modes with
 /// `field "ClientCommonConfig.includes": cannot unmarshal object into []string`
@@ -11627,6 +11630,48 @@ fn test_includes_glob_pattern_merged() {
 }
 
 #[test]
+fn test_include_glob_entries_are_processed_in_sorted_order() {
+    // glob_in_dir ends with `results.sort()` to mirror `os.ReadDir`, whose
+    // contract is "sorted by filename" (`pkg/config/legacy/parse.go:78`,
+    // repeated at `pkg/config/load.go:513`). `deep_merge_toml` CONCATENATES
+    // arrays (base + overlay), so the merged `[[proxies]]` order *is* the
+    // include processing order. Six files, each contributing one proxy, make a
+    // filesystem readdir order fail loudly: this APFS returns the six
+    // `incN.toml` names in an order like inc2,inc3,inc4,inc5,inc6,inc1, which
+    // is not sorted, so deleting `results.sort()` reorders the merged array and
+    // reddens this test. The teeth are host-filesystem-conditional, though:
+    // they hold only while readdir returns those six names out of sorted order.
+    // On a filesystem whose readdir is already name-ordered the same mutant
+    // would stay green, so this is a strong check on the hosts we run, not a
+    // portable one.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("frpc.toml"),
+        "server_addr = \"127.0.0.1\"\nincludes = [\"inc*.toml\"]\n",
+    )
+    .unwrap();
+    for i in 1..=6 {
+        std::fs::write(
+            dir.path().join(format!("inc{i}.toml")),
+            format!(
+                "[[proxies]]\nname = \"p{i}\"\ntype = \"tcp\"\nlocal_port = {}\nremote_port = {}\n",
+                1000 + i,
+                2000 + i
+            ),
+        )
+        .unwrap();
+    }
+    let cfg = load_client_config(dir.path().join("frpc.toml").to_str().unwrap(), false).unwrap();
+    let names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["p1", "p2", "p3", "p4", "p5", "p6"],
+        "include glob results must be processed in os.ReadDir (name-sorted) order"
+    );
+    assert_eq!(cfg.proxies[5].remote_port, 2006);
+}
+
+#[test]
 fn test_include_array_concatenation_deep_merge() {
     // file.rs deep_merge_toml: arrays CONCATENATE (base + overlay) — the
     // include file's [[proxies]] entries append to the main config's.
@@ -11906,7 +11951,7 @@ path = "/tmp/does-not-matter"
 /// used to keep the scalar and drop the section's keys, which hid a real
 /// `[includes]` section from the typeless-visitor guard and the collector, and
 /// then the `.ini`-only scalar scrub
-/// (`frp-core/src/config/file.rs:432`) deleted the scalar too. Measured on Go
+/// (`frp-core/src/config/file.rs:507`) deleted the scalar too. Measured on Go
 /// v0.71.0, the three shapes below are rc 1 in **both** loader modes with Go's
 /// own message, and the typed port-carrying one is rc 0 with one `tcp` proxy
 /// *named* `includes`.
@@ -11987,11 +12032,11 @@ fn legacy_ini_scalar_and_section_collision_keeps_the_section_like_go() {
 /// `LoadAllProxyConfsFromIni` builds `startProxy` from the list and skips every
 /// named section that is not in it (`pkg/config/legacy/client.go:227-262`), and
 /// the generated `{prefix}_{i}` range sections are filtered by their *generated*
-/// names. The role refusal (`frp-core/src/config/normalize.rs:2162`) and the
-/// collector's candidate list (`frp-core/src/config/normalize.rs:2131`) both
+/// names. The role refusal (`frp-core/src/config/normalize.rs:2185`) and the
+/// collector's candidate list (`frp-core/src/config/normalize.rs:2154`) both
 /// apply it now; the `[common] start` list is read after the hoist
-/// (`frp-core/src/config/normalize.rs:1159-1160`,
-/// `ini_start_names` at `frp-core/src/config/normalize.rs:2461`, which trims each
+/// (`frp-core/src/config/normalize.rs:1183-1184`,
+/// `ini_start_names` at `frp-core/src/config/normalize.rs:2484`, which trims each
 /// element exactly like Go's `Key.Strings(",")`).
 ///
 /// One half remains pre-existing: a *non-started* section that is not a
@@ -12127,7 +12172,7 @@ fn legacy_ini_common_start_is_applied_before_role_and_collection() {
 /// switch does not exist: `[foo] role = "weird"` is rc 1 **strict** with
 /// `json: unknown field "foo"` but **rc 0 non-strict** (measured on Go v0.71.0).
 /// The role scan is therefore gated on the `[common]` presence captured before
-/// the hoist (`frp-core/src/config/normalize.rs:1159-1160`) and must not refuse
+/// the hoist (`frp-core/src/config/normalize.rs:1183-1184`) and must not refuse
 /// the file where Go loads it.
 #[test]
 fn nocommon_ini_weird_role_is_not_a_role_refusal() {
@@ -12178,8 +12223,8 @@ fn nocommon_ini_weird_role_is_not_a_role_refusal() {
 /// ignores default-section keys, so the expansion here is a pre-existing frp-rs
 /// extension (the Go-measured shape is rc 0 with no proxies), but it must not be
 /// *silently dropped*: the `.ini`-only scalar scrub
-/// (`frp-core/src/config/file.rs:432`, `is_scalar` at
-/// `frp-core/src/config/file.rs:434`) accepts Integer/Float/Boolean/Datetime and
+/// (`frp-core/src/config/file.rs:507`, `is_scalar` at
+/// `frp-core/src/config/file.rs:509`) accepts Integer/Float/Boolean/Datetime and
 /// must keep leaving a String alone. A mutant that also accepts `String` deletes
 /// the include pattern and this file loads with zero proxies.
 #[test]
@@ -12219,18 +12264,916 @@ fn legacy_ini_default_section_string_include_is_still_expanded() {
     }
 }
 
+/// **Item 4: a DefaultSection `start = p2` beside a `[start]` section keeps the
+/// section.**
+///
+/// This is the `w8_start_scalar_plus_start_section.ini` shape measured against
+/// Go v0.71.0: a DefaultSection key is not part of the legacy common config
+/// (`UnmarshalClientConfFromIni` reads `[common]` alone), so Go's `start` list
+/// stays empty (`startAll`) and the `[start]` section runs as an ordinary typeless
+/// legacy proxy — 1 proxy named `start` in a real frps+frpc run
+/// (`[start] start proxy success`). Round 5 kept that section, round 6 deleted it
+/// (0 proxies) with the unconditional `start` removal, and round 7 restored it;
+/// this pin fixes the exact shape in both loader modes.
+#[test]
+fn legacy_ini_default_section_start_beside_start_section_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "start = p2\n[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [start]\nlocal_port = 18080\nremote_port = 19080\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("strict={strict}: {e}"));
+        assert_eq!(cfg.proxies.len(), 1, "strict={strict}");
+        assert_eq!(cfg.proxies[0].name, "start", "strict={strict}");
+        assert!(
+            cfg.start.is_empty(),
+            "strict={strict}: Go's [common] list is empty, so every section starts"
+        );
+    }
+}
+
+/// **[common]-less `.ini` with a scalar `start` beside `[start]`: the v1 path.**
+///
+/// With no `[common]` section Go's `DetectLegacyINIFormat`
+/// (`pkg/config/load.go:65`) is false, so the file is not read by the legacy
+/// reader at all: the scalar `start = p2` reaches the v1 decode and Go is rc 1 in
+/// both loader modes (`json: cannot unmarshal string into Go value of type
+/// v1.rawClientConfig`). frp-rs keeps its v1 reading instead — rc 0, zero proxies
+/// (the scalar wins the section-name collision, `insert_ini_section`,
+/// `frp-core/src/config/format.rs:376`). This pin records the measured,
+/// deliberate divergence so a later change cannot pick it up silently.
+#[test]
+fn legacy_ini_without_common_start_scalar_is_a_v1_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "start = p2\n[start]\ntype = tcp\nlocal_port = 8080\nremote_port = 18080\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("strict={strict}: {e}"));
+        assert_eq!(
+            cfg.proxies.len(),
+            0,
+            "strict={strict}: frp-rs v1 reading keeps the scalar and drops the section"
+        );
+    }
+}
+
+/// **Item 5: an unknown key merged out of `[common]` is still refused in strict
+/// mode (recorded divergence, `c1.ini`).**
+///
+/// Go v0.71.0 reads `[common]` into a typed struct that ignores a key it does not
+/// name, so `c1.ini` (`[common] server_addr + zzz_unknown_common = 1`) is rc 0 in
+/// both loader modes. frp-rs is rc 0 loose but rc 1 strict
+/// (`unknown field "zzz_unknown_common"`), because the `[common]` hoist
+/// (`frp-core/src/config/normalize.rs:1185`) moves the key to the top level before
+/// the top-level strict walk and the `.ini` exemption does not reach it. The
+/// item's Done-when allows the measurement instead of a fix — exempting the keys
+/// the merge created would also blind the top-level check to a genuine v1 typo
+/// spelled under `[common]`. The recommended `docs/config.md` wording is carried
+/// in the batch report; this pin keeps the residual visible.
+#[test]
+fn legacy_ini_common_unknown_key_residual_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c1.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nzzz_unknown_common = 1\n",
+    )
+    .unwrap();
+    assert!(
+        load_client_config(path.to_str().unwrap(), false).is_ok(),
+        "loose mode drops it, exactly like Go"
+    );
+    let err = format!(
+        "{}",
+        load_client_config(path.to_str().unwrap(), true).unwrap_err()
+    );
+    assert!(
+        err.contains("unknown field \"zzz_unknown_common\""),
+        "strict residual: Go is rc 0 here, frp-rs reports the merged top-level key: {err}"
+    );
+}
+
+/// **Item 2: a `[common] includes` is expanded, exactly as Go's legacy reader
+/// expands it.**
+///
+/// The legacy reader fills its include list from `[common]` alone
+/// (`UnmarshalClientConfFromIni` reads only that section,
+/// `pkg/config/legacy/client.go:172-200`; `ParseClientConfig` then renders
+/// `cfg.IncludeConfigFiles`, `pkg/config/legacy/parse.go:50`), and the included
+/// sections join the same parse buffer (`LoadAllProxyConfsFromIni`,
+/// `pkg/config/legacy/parse.go:59`) — so an include named inside `[common]`
+/// contributes proxies. frp-rs ran `process_includes` on the top level before
+/// the `[common]` hoist and therefore never saw the nested key: `x12_main.ini`
+/// was rc 0 with zero proxies against Go rc 1 (the include was never read).
+/// Read it from `[common]` while the raw dialect is still visible
+/// (`frp-core/src/config/file.rs:251`).
+#[test]
+fn legacy_ini_common_include_is_expanded_like_go() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("sub.ini"),
+        "[p1]\ntype = tcp\nlocal_port = 8080\nremote_port = 18080\n",
+    )
+    .unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nincludes = \"sub.ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("strict={strict}: {e}"));
+        assert_eq!(cfg.proxies.len(), 1, "strict={strict}");
+        assert_eq!(cfg.proxies[0].name, "p1", "strict={strict}");
+        assert_eq!(cfg.proxies[0].local_port, 8080, "strict={strict}");
+        assert_eq!(cfg.proxies[0].remote_port, 18080, "strict={strict}");
+    }
+}
+
+/// **Item 2: a `[common]` include whose directory is missing aborts the load,
+/// like Go.**
+///
+/// `x12_main.ini` (`[common] includes = <unreadable pattern>`) is rc 1 in both
+/// Go loader modes (`getIncludeContents error: ...`; the pattern's directory is
+/// checked in `ClientCommonConf.Validate`, `pkg/config/legacy/client.go:393`,
+/// `include: directory of %s not exist`). frp-rs was rc 0 because the nested
+/// include was never read; the wording of its own error is
+/// `include: directory of <dir> not exist (included by pattern <p>)`
+/// (`frp-core/src/config/file.rs:412`), but the load must fail. A mutant that
+/// drops the `[common]` extraction reads zero patterns and returns `Ok`.
+///
+/// The `missing/` spelling is the trailing-separator case: Go's `Dir` drops the
+/// trailing separator and checks `missing` (`filepath.Dir("missing/") ==
+/// "missing"`), while the old `base_dir.join(pattern).parent()` rule took the
+/// parent of the *join result* — a path that still ends in a separator, so the
+/// parent was the (existing) config directory and the missing directory went
+/// unnoticed. That spelling was rc 0 before round 5 in the relative and absolute
+/// `-c` shapes; it must refuse now.
+#[test]
+fn legacy_ini_common_include_missing_dir_refuses_like_go() {
+    let dir = tempfile::tempdir().unwrap();
+    for pattern in ["no_such_dir/missing.ini", "missing/"] {
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(
+            &path,
+            format!(
+                "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+                 includes = \"{pattern}\"\n"
+            ),
+        )
+        .unwrap();
+        for strict in [false, true] {
+            let err = format!(
+                "{}",
+                load_client_config(path.to_str().unwrap(), strict).unwrap_err()
+            );
+            assert!(
+                err.contains("include:"),
+                "pattern={pattern} strict={strict}: a [common] include must be attempted: {err}"
+            );
+        }
+    }
+}
+
+/// **Item 2 / F2: a `[common] includes` *glob* expands, exactly as Go's
+/// `getIncludeContents` does.**
+///
+/// `getIncludeContents` (`pkg/config/legacy/parse.go:68-97`) resolves each
+/// pattern with `filepath.Match` over the directory listing, so
+/// `includes = "sub*.ini"` is a real glob: with `sub_bad.ini`
+/// (`[p1] role = "visitor"`) beside the config, Go v0.71.0 is rc 1 in both
+/// loader modes (`failed to parse visitor p1, err: type shouldn't be empty`).
+/// frp-rs's [`process_includes`] uses the same single-`*`-per-component glob
+/// (`glob_in_dir`, `frp-core/src/config/file.rs:855`), so the matched file must
+/// be merged and refused the same way.
+#[test]
+fn legacy_ini_common_include_glob_is_expanded_like_go() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("sub_bad.ini"), "[p1]\nrole = \"visitor\"\n").unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nincludes = \"sub*.ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let err = format!(
+            "{}",
+            load_client_config(path.to_str().unwrap(), strict).unwrap_err()
+        );
+        assert!(
+            err.contains("failed to parse visitor p1") && err.contains("type shouldn't be empty"),
+            "strict={strict}: the glob must expand and the included visitor be refused: {err}"
+        );
+    }
+}
+
+/// **Round-8 F2(a): the `*`-suffix half of the legacy glob is load-bearing.**
+///
+/// Go builds the match pattern as `filepath.Join(absDir, filepath.Base(path))`
+/// and tests it with `filepath.Match` (`pkg/config/legacy/parse.go:87`), so
+/// everything after the `*` is a literal suffix that must still match. A test
+/// that only kept `name.starts_with(prefix)` (`frp-core/src/config/file.rs:904`)
+/// survived the whole suite because the extension pre-filter
+/// (`frp-core/src/config/file.rs:894-902`) already rejects the obvious cases
+/// (e.g. `z*.ini` against `zebra.txt`, where the extensions differ). This pin
+/// uses `z*ini`: the star is followed by no `.`, so `Path::extension()` is
+/// `None` and the pre-filter is skipped — only the suffix test can reject
+/// `zebra.txt`, whose detector body would otherwise merge and fail the load.
+/// Measured: GO v0.71.0 rc 0 and HEAD r8 rc 0 for `z*ini` (and for `z*.ini`),
+/// where `z*` and `*a.txt` are rc 1 in both (the `*.txt` pattern carries the
+/// extension `txt`, so the pre-filter passes there).
+#[test]
+fn legacy_ini_common_include_glob_suffix_is_matched_like_go() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("zebra.txt"), "[p1]\nrole = \"visitor\"\n").unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nincludes = \"z*ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict).unwrap_or_else(|e| {
+            panic!("strict={strict}: `z*ini` matches nothing, so the load must succeed: {e}")
+        });
+        assert!(
+            cfg.proxies.is_empty(),
+            "strict={strict}: `z*ini` must not match `zebra.txt` — Go's Match requires \
+             the `ini` suffix after the star"
+        );
+    }
+}
+
+/// **Round-7 F2: a `[common] includes` naming a symlink-to-directory refuses
+/// like Go, because the directory filter uses each entry's *own* type.**
+///
+/// Go's `getIncludeContents` enumerates with `os.ReadDir` and skips only real
+/// directory entries — `if fi.IsDir() { continue }`
+/// (`pkg/config/legacy/parse.go:83`), where `DirEntry.IsDir()` is the directory
+/// entry's own type and is **false for a symlink whatever it points at**. So a
+/// symlink that resolves to a directory is matched, read, and fails the load.
+/// Measured on Go v0.71.0, both loader modes and all three `-c` forms:
+/// `includes = "lnk"` (with `lnk -> realdir`) is rc 1 `getIncludeContents
+/// error: render extra config <abs>/lnk error: read <abs>/lnk: is a
+/// directory`, where frp-rs's old `Path::is_file()` filter made it rc 0
+/// (nothing matched at all). This pin fixes rc 1 in both loader modes.
+#[cfg(unix)]
+#[test]
+fn legacy_ini_common_include_symlink_to_dir_refuses_like_go() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("realdir")).unwrap();
+    std::fs::write(
+        dir.path().join("realdir").join("x.ini"),
+        "[p1]\ntype = tcp\nlocal_port = 8080\nremote_port = 18080\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("realdir", dir.path().join("lnk")).unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nincludes = \"lnk\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let err = format!(
+            "{}",
+            load_client_config(path.to_str().unwrap(), strict).unwrap_err()
+        );
+        assert!(
+            err.contains("include: read included file") && err.contains("Is a directory"),
+            "strict={strict}: a symlink to a directory must be matched and read, so the \
+             read fails like Go's `read <abs>/lnk: is a directory`: {err}"
+        );
+    }
+}
+
+/// **Round-7 F2: a `[common] includes` naming a dangling symlink refuses like
+/// Go, for the same reason.**
+///
+/// `DirEntry::is_dir()` is false for a symlink even when its target does not
+/// exist, so Go matches `dangling.ini -> nowhere.ini` and fails when it reads
+/// it. Measured on v0.71.0, both loader modes and all three `-c` forms: rc 1
+/// `getIncludeContents error: render extra config <abs>/dangling.ini error:
+/// open <abs>/dangling.ini: no such file or directory`; the old `is_file()`
+/// filter made frp-rs rc 0.
+#[cfg(unix)]
+#[test]
+fn legacy_ini_common_include_dangling_symlink_refuses_like_go() {
+    let dir = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink("nowhere.ini", dir.path().join("dangling.ini")).unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nincludes = \"dangling.ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let err = format!(
+            "{}",
+            load_client_config(path.to_str().unwrap(), strict).unwrap_err()
+        );
+        assert!(
+            err.contains("include: read included file")
+                && err.contains("No such file or directory"),
+            "strict={strict}: a dangling symlink must be matched and read, so the read \
+             fails like Go's `open <abs>/dangling.ini: no such file or directory`: {err}"
+        );
+    }
+}
+
+/// **Round-7 F2: the same entry-type filter under a glob, with the real
+/// directory held out as the control.**
+///
+/// Both shapes above are reachable through `*` too, and the glob must not
+/// start admitting real directories while it admits them. Measured on v0.71.0
+/// in one directory holding `realdir/`, `lnk -> realdir` and
+/// `dangling.ini -> nowhere.ini`, both loader modes and all three `-c` forms:
+/// `l*` and `dang*.ini` are rc 1 (Go: `read <abs>/lnk: is a directory`,
+/// `open <abs>/dangling.ini: no such file or directory`), while `reald*` — a
+/// real directory entry, which both implementations skip with `fi.IsDir()` — is
+/// rc 0 with zero proxies.
+#[cfg(unix)]
+#[test]
+fn legacy_ini_common_include_symlink_globs_refuse_like_go() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("realdir")).unwrap();
+    std::fs::write(
+        dir.path().join("realdir").join("x.ini"),
+        "[p1]\ntype = tcp\nlocal_port = 8080\nremote_port = 18080\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("realdir", dir.path().join("lnk")).unwrap();
+    std::os::unix::fs::symlink("nowhere.ini", dir.path().join("dangling.ini")).unwrap();
+    let path = dir.path().join("frpc.ini");
+
+    for (pattern, needle) in [
+        ("l*", "Is a directory"),
+        ("dang*.ini", "No such file or directory"),
+    ] {
+        std::fs::write(
+            &path,
+            format!(
+                "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nincludes = \"{pattern}\"\n"
+            ),
+        )
+        .unwrap();
+        for strict in [false, true] {
+            let err = format!(
+                "{}",
+                load_client_config(path.to_str().unwrap(), strict).unwrap_err()
+            );
+            assert!(
+                err.contains("include: read included file") && err.contains(needle),
+                "pattern={pattern} strict={strict}: the glob must admit the symlink entry \
+                 and fail on the read: {err}"
+            );
+        }
+    }
+
+    // Control: a *real* directory is skipped by the entry-type filter, exactly
+    // as Go's `fi.IsDir()` skips it, so the load succeeds with zero proxies
+    // (frp-rs does not recurse into it, and neither does Go).
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nincludes = \"reald*\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict).unwrap_or_else(|e| {
+            panic!("strict={strict}: a real directory entry must be skipped: {e}")
+        });
+        assert_eq!(cfg.proxies.len(), 0, "strict={strict}");
+    }
+}
+
+/// **Item 2 / F2: only the string `includes` spelling is Go's.**
+///
+/// Go maps `IncludeConfigFiles []string \`ini:"includes"\``
+/// (`pkg/config/legacy/client.go:166`) out of `[common]`. Measured on v0.71.0,
+/// both loader modes: `[common] include = "<file>"` (the singular, a key Go
+/// never reads) is rc 0 with zero proxies, and `[common] includes = ["<file>"]`
+/// (an array, which `ini.MapTo` turns into the literal bracketed string) is
+/// rc 0 with zero proxies for a *bare* relative name — the shape pinned here.
+/// (The array's path shape is a pre-existing divergence: `["./bad.ini"]` and
+/// absolute entries are Go rc 1 `parse config error: include: directory of
+/// ["./bad.ini"] not exist`, frp-rs rc 0 for all shapes.) The string form loads
+/// the file; frp-rs must ignore the two ignored spellings rather than expand
+/// them.
+#[test]
+fn legacy_ini_common_include_ignored_spellings_both_modes() {
+    for (label, line) in [
+        ("singular include", "include = \"sub.ini\"".to_string()),
+        ("array includes", "includes = [\"sub.ini\"]".to_string()),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("sub.ini"),
+            "[p1]\ntype = tcp\nlocal_port = 8080\nremote_port = 18080\n",
+        )
+        .unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(
+            &path,
+            format!("[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n{line}\n"),
+        )
+        .unwrap();
+        for strict in [false, true] {
+            let cfg = load_client_config(path.to_str().unwrap(), strict)
+                .unwrap_or_else(|e| panic!("{label}, strict={strict}: {e}"));
+            assert_eq!(
+                cfg.proxies.len(),
+                0,
+                "{label}, strict={strict}: frp-rs must not expand it (Go yields zero proxies for this bare-relative form)"
+            );
+        }
+    }
+}
+
+/// **Round-4 F1: an empty `[common] includes` means "no includes", not a
+/// directory-less pattern.**
+///
+/// Go maps `includes = ""` onto `IncludeConfigFiles []string` as `[]string{""}`
+/// (`pkg/config/legacy/client.go:166`); `getIncludeContents`
+/// (`pkg/config/legacy/parse.go:68-97`) then stats `filepath.Dir("")` = `.`
+/// (present), reads that directory, and matches every entry against
+/// `filepath.Match(".", absFile)`, which never matches an absolute path — so Go
+/// v0.71.0 is rc 0 with zero proxies in both loader modes. frp-rs instead joined
+/// the empty pattern onto the config directory, and for the `./name` form
+/// (`base_dir == "."`) `Path::new(".").join("")` has an empty parent, so the
+/// missing-directory guard fired: rc 1
+/// `include: directory of  not exist (included by pattern )`.
+///
+/// The pin drives [`super::file::process_includes`] with that exact base
+/// directory, because a unit test's config path is absolute and the absolute
+/// form never hit the empty-parent branch (the regression was `./`-form only).
+/// The end-to-end half then asserts the recorded result, zero proxies in both
+/// modes. A mutant that stops filtering empty patterns reds the first half.
+#[test]
+fn legacy_ini_common_include_empty_pattern_is_no_includes_both_modes() {
+    // The raw dialect value the loader sees for `[common] includes = ""`, with
+    // the base directory the `./name` CLI form produces.
+    let mut value: toml::Value = toml::from_str("[common]\nincludes = \"\"\n").unwrap();
+    super::file::process_includes(
+        &mut value,
+        std::path::Path::new("."),
+        super::format::ConfigFormat::Ini,
+        super::normalize::ConfigSide::Client,
+    )
+    .expect("an empty include pattern is no includes, exactly like Go");
+    assert!(
+        value["common"].get("includes").is_none(),
+        "the empty pattern must be consumed, not left for a later pass"
+    );
+
+    // End to end: rc 0, zero proxies, both loader modes.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nincludes = \"\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("strict={strict}: an empty include is not an error: {e}"));
+        assert_eq!(cfg.proxies.len(), 0, "strict={strict}");
+    }
+}
+
+/// **Round-5 blocker: `[common] includes = "."` (and `"./"`, `"././"`) is the
+/// config's own directory, not a missing one.**
+///
+/// Go resolves the *pattern's* own directory — `absDir = filepath.Abs(
+/// filepath.Dir(pattern))` (`pkg/config/legacy/parse.go:71`, repeated for the v1
+/// path at `pkg/config/load.go:506`) — and `filepath.Dir` is `Clean` of the
+/// prefix **through** the last separator, so `Dir(".") = Dir("./") =
+/// Dir("././") = "."` (`internal/filepathlite/path.go`, `Dir`). The match name
+/// is `filepath.Base(pattern) = "."`, which equals no directory entry, so Go
+/// v0.71.0 is rc 0 with zero proxies in both loader modes and all three `-c`
+/// forms.
+///
+/// frp-rs used `base_dir.join(pattern).parent()` instead. For `base_dir == "."`
+/// (the `-c ./name` form, `frp-core/src/config/normalize.rs:633`) that is
+/// `Path::new("./.")`, whose parent is `Some("")`, and `Path::new("").exists()`
+/// is false — so the missing-directory guard fired: rc 1
+/// `include: directory of  not exist (included by pattern .)`. The pin drives
+/// [`super::file::process_includes`] with the base directory that CLI form
+/// produces, because no hermetic in-process config path can make
+/// `Path::parent()` return `"."` (a tempdir path is absolute); the `./`-form
+/// end-to-end half is a real CLI pin in `frpc/tests/legacy_ini_fixture.rs`. A
+/// mutant that goes back to `base_dir.join(pattern).parent()` reds this.
+#[test]
+fn legacy_ini_common_include_dot_spellings_both_modes() {
+    for pattern in [".", "./", "././"] {
+        let mut value: toml::Value =
+            toml::from_str(&format!("[common]\nincludes = \"{pattern}\"\n")).unwrap();
+        super::file::process_includes(
+            &mut value,
+            std::path::Path::new("."),
+            super::format::ConfigFormat::Ini,
+            super::normalize::ConfigSide::Client,
+        )
+        .unwrap_or_else(|e| {
+            panic!("`includes = \"{pattern}\"` names the config's own directory, like Go: {e}")
+        });
+        assert!(
+            value["common"].get("includes").is_none(),
+            "`{pattern}` must be consumed, not left for a later pass"
+        );
+    }
+}
+
+/// **Round-5: a separator-less `[common] includes` resolves even when `base_dir`
+/// is empty.**
+///
+/// `-c <bare relative name>` makes `Path::new(name).parent()` `Some("")`
+/// (`frp-core/src/config/normalize.rs:633`) — an empty base directory, not the
+/// current directory spelled as a path. `base_dir.join(pattern)` then has an
+/// empty parent for *every* separator-less pattern, so each one failed the same
+/// guard: rc 1 `include: directory of  not exist`. Go has no such shape: it
+/// always starts from `filepath.Abs(filepath.Dir(pattern))`, and
+/// `Dir(<bare name>)` is `"."`. Measured on v0.71.0, both loader modes, bare
+/// `-c`: rc 0 with zero proxies for a name that matches no file, and rc 0 with
+/// the included proxy for a name that does.
+///
+/// This is the same defect as the `"."` pin above — one rule, not a special
+/// case — which is why the fix is `go_dir`/`go_base` rather than a guard on the
+/// empty string. A mutant that goes back to `base_dir.join(pattern).parent()`
+/// reds this too.
+#[test]
+fn legacy_ini_common_include_dot_spellings_bare_config_both_modes() {
+    for pattern in ["", ".", "./", "nope.ini"] {
+        let mut value: toml::Value =
+            toml::from_str(&format!("[common]\nincludes = \"{pattern}\"\n")).unwrap();
+        super::file::process_includes(
+            &mut value,
+            std::path::Path::new(""),
+            super::format::ConfigFormat::Ini,
+            super::normalize::ConfigSide::Client,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "`includes = \"{pattern}\"` under `-c <name>` resolves against the config's \
+                 directory (`.`) in Go, never against a missing empty one: {e}"
+            )
+        });
+    }
+}
+
+/// **Round-5: `[common] includes = ".."` matches nothing — it is not a glob
+/// wildcard.**
+///
+/// Go matches each directory entry against `filepath.Match(filepath.Join(absDir,
+/// filepath.Base(path)), absFile)` (`pkg/config/legacy/parse.go:87`). `Base("..")
+/// = ".."`, so the matcher's pattern is the literal `<dir>/..`, which equals no
+/// entry: Go v0.71.0 is rc 0 with zero proxies in both loader modes and all
+/// three `-c` forms.
+///
+/// frp-rs took `Path::file_name()`, which is `None` for `".."`, and
+/// `unwrap_or("*")` turned the pattern into a wildcard over the config's
+/// directory (`frp-core/src/config/file.rs`, former `simple_glob`) — so rc 1.
+/// Here the directory holds `decoy.ini`, a legacy visitor the collector refuses
+/// (`failed to parse visitor bad`), which makes that merge visible. A mutant
+/// that restores the `file_name().unwrap_or("*")` fallback reds this.
+#[test]
+fn legacy_ini_common_include_dotdot_is_not_a_wildcard_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("decoy.ini"), "[bad]\nrole = \"visitor\"\n").unwrap();
+    let mut value: toml::Value = toml::from_str("[common]\nincludes = \"..\"\n").unwrap();
+    super::file::process_includes(
+        &mut value,
+        dir.path(),
+        super::format::ConfigFormat::Ini,
+        super::normalize::ConfigSide::Client,
+    )
+    .expect("`..` is a directory name, not a wildcard: Go's Match selects no entry");
+    assert!(
+        value["common"].get("includes").is_none(),
+        "the pattern must be consumed, not left for a later pass"
+    );
+    assert!(
+        value.get("bad").is_none(),
+        "the decoy visitor beside the config must not be merged: `..` is not a wildcard"
+    );
+
+    // End to end: rc 0 and zero proxies, both loader modes. Before the fix the
+    // absolute base directory made `..` glob its own directory and merge the
+    // decoy.
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nincludes = \"..\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("strict={strict}: `..` must not glob a directory: {e}"));
+        assert_eq!(cfg.proxies.len(), 0, "strict={strict}");
+    }
+}
+
+/// **Round-5 F1: the include resolver folds an interior `..` with Go's
+/// `filepath.Clean` rule — it does not merely spell the same directory.**
+///
+/// Go resolves the pattern's own directory with `filepath.Abs(filepath.Dir(p))`
+/// (`pkg/config/legacy/parse.go:71`), and `Abs` Cleans, so
+/// `Dir("a/../b") = Clean("a/../") = "."` even when `a` does not exist. frp-rs at
+/// `c5b4f9ed` Cleaned without folding, leaving `"a/.."` — a path whose
+/// `exists()` is false — so the missing-directory guard fired and the four
+/// interior-`..` spellings were GO rc 0 / HEAD rc 1 (measured on v0.71.0, all
+/// three `-c` forms, both loader modes):
+/// `a/../b`, `./x/../y`, `x/../sub.ini`, `nonexistent/../sub.ini`. The fix is in
+/// [`super::file::go_clean`]; this pin drives [`super::file::process_includes`]
+/// with the same base directory the `./name` CLI form produces, so a mutant that
+/// drops the `..` fold reds the `:410` guard here.
+#[test]
+fn legacy_ini_common_include_interior_dotdot_is_cleaned_like_go() {
+    let dir = tempfile::tempdir().unwrap();
+    // A decoy beside the config: a legacy visitor the collector would refuse.
+    // It must not be merged — `a/../b` is not `*`, and after Clean it is `b` in
+    // the config's own directory, which does not exist.
+    std::fs::write(dir.path().join("bad.ini"), "[bad]\nrole = \"visitor\"\n").unwrap();
+    for pattern in [
+        "a/../b",
+        "./x/../y",
+        "x/../sub.ini",
+        "nonexistent/../sub.ini",
+    ] {
+        let mut value: toml::Value =
+            toml::from_str(&format!("[common]\nincludes = \"{pattern}\"\n")).unwrap();
+        super::file::process_includes(
+            &mut value,
+            dir.path(),
+            super::format::ConfigFormat::Ini,
+            super::normalize::ConfigSide::Client,
+        )
+        .unwrap_or_else(|e| {
+            panic!("`includes = \"{pattern}\"` must Clean to `.` and resolve, like Go: {e}")
+        });
+        assert!(
+            value["common"].get("includes").is_none(),
+            "`{pattern}` must be consumed, not left for a later pass"
+        );
+        assert!(
+            value.get("bad").is_none(),
+            "`{pattern}` must not merge the decoy beside the config"
+        );
+    }
+}
+
+/// **Round-5 F4: a separator-terminated pattern whose `Base` names a regular
+/// entry is matched.**
+///
+/// `filepath.Base("sub/sub/") = "sub"` (Go's `Base` strips the trailing
+/// separator) and `Dir("sub/sub/") = "sub/sub"`, so `includes = "sub/sub/"`
+/// matches the file `sub/sub/sub` and merges it. frp-rs reproduced that via the
+/// trailing-separator strip in [`super::file::go_base`]. Dropping that strip
+/// makes `Base` the slash-only `"/"`, which matches nothing: silent rc 0 where
+/// Go merges the file. Measured on v0.71.0 in both loader modes: GO rc 1
+/// `failed to parse visitor pbad, err: type shouldn't be empty` with this
+/// detector; the pre-`go_base` rule and the strip-removed mutant are rc 0. The
+/// detector is a *visitor*, so Go's "no `[common]`/`[proxies]` wrapper needed"
+/// reader and frp-rs both refuse it and the merge is observable as rc 1.
+#[test]
+fn legacy_ini_common_include_trailing_separator_base_names_a_file_like_go() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("sub/sub")).unwrap();
+    // A regular file named `sub`, i.e. `Base("sub/sub/")`.
+    std::fs::write(
+        dir.path().join("sub/sub/sub"),
+        "[pbad]\nrole = \"visitor\"\n",
+    )
+    .unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nincludes = \"sub/sub/\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let err = format!(
+            "{}",
+            load_client_config(path.to_str().unwrap(), strict).unwrap_err()
+        );
+        assert!(
+            err.contains("failed to parse visitor pbad") && err.contains("type shouldn't be empty"),
+            "strict={strict}: `Base(\"sub/sub/\")` is `sub`, so the file `sub/sub/sub` merges: {err}"
+        );
+    }
+}
+
+/// **Go's `Clean`, spelled out: the `..` fold, the literal-`..` survival, and
+/// the rooted clamp.**
+///
+/// Every case is a `filepath.Clean` measurement on Go v0.71.0, written as
+/// `(input, expected)` so a reader can `go run` the same list. The interesting
+/// families are the ones [`super::file::go_clean`] has to get right beyond
+/// dropping `.`/empty elements:
+/// * the fold over a *non-existent* element (`a/../b` → `b`), which is what
+///   fixes the interior-`..` rc divergence;
+/// * `..` surviving when it has nothing to cancel (`../x/../` → `..`,
+///   `a/../../b` → `../b`, `x/../../..` → `../..`);
+/// * the rooted clamp (`/..` → `/`, `//` → `/`), where Go never emits `..`;
+/// * the *non-trivial* rooted results (`//x` → `/x`, `/a/b` → `/a/b`,
+///   `/a/../b` → `/b`, `/a/b/..` → `/a`), which are what keep a mutant that
+///   short-circuits every rooted input to `"/"` from passing: before round 7
+///   every rooted row here expected exactly `"/"`, so that mutant was invisible
+///   to the whole suite.
+#[test]
+fn go_clean_has_go_clean_semantics() {
+    for (input, expected) in [
+        ("", "."),
+        (".", "."),
+        ("./", "."),
+        ("././", "."),
+        ("///", "/"),
+        ("//", "/"),
+        ("/", "/"),
+        ("/..", "/"),
+        ("/../..", "/"),
+        ("/a/../", "/"),
+        ("//x", "/x"),
+        ("/a/b", "/a/b"),
+        ("/a/../b", "/b"),
+        ("/a/b/..", "/a"),
+        ("/..//x", "/x"),
+        ("..", ".."),
+        ("../", ".."),
+        ("../x/../", ".."),
+        ("a/..", "."),
+        ("a/../", "."),
+        ("a/../b", "b"),
+        ("a/./../b", "b"),
+        ("a/b/../../", "."),
+        ("a/b/../../c", "c"),
+        ("a/../../", ".."),
+        ("a/../../b", "../b"),
+        ("a//b/../", "a"),
+        ("a/..//b", "b"),
+        ("x/../../..", "../.."),
+        ("sub/", "sub"),
+        ("sub/./", "sub"),
+        ("sub/../x", "x"),
+        ("nonexistent/../sub.ini", "sub.ini"),
+    ] {
+        assert_eq!(
+            super::file::go_clean(input),
+            expected,
+            "Go Clean({input:?}) is {expected:?}"
+        );
+    }
+}
+
+/// **Round-4 F6: the `format == ConfigFormat::Ini` half of the `[common]`
+/// include guard is load-bearing.**
+///
+/// A TOML client config has a real `ClientConfig.includes: Vec<String>` field
+/// (`frp-core/src/config/client.rs:256`), so a *string* `[common] includes` is a
+/// type error that the v1 validator reports: both loader modes are rc 1
+/// `config validation error: invalid type: string "sub.ini", expected a
+/// sequence`. The legacy `.ini` extractor only exists to reproduce Go's legacy
+/// reader, which no other dialect reaches; if it ran for TOML it would consume
+/// the key as an include list and that error would disappear (and the merged
+/// `[p1]` would appear as a proxy). The pin fixes the current verdict so a
+/// mutant that drops `format == ConfigFormat::Ini` cannot pass.
+#[test]
+fn legacy_ini_common_include_does_not_apply_to_toml_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("sub.ini"),
+        "[p1]\ntype = tcp\nlocal_port = 8080\nremote_port = 18080\n",
+    )
+    .unwrap();
+    let path = dir.path().join("frpc.toml");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = \"127.0.0.1\"\nserver_port = 7000\nincludes = \"sub.ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let err = format!(
+            "{}",
+            load_client_config(path.to_str().unwrap(), strict).unwrap_err()
+        );
+        assert!(
+            err.contains("invalid type: string \"sub.ini\", expected a sequence"),
+            "strict={strict}: a TOML includes string is a v1 type error, not a legacy include: {err}"
+        );
+    }
+}
+
+/// **Item 2 / F1: the frps load ignores `[common] includes` entirely, matching
+/// Go.**
+///
+/// The legacy `.ini` `[common]` include list is read on the *client* load only.
+/// `LoadServerConfig` (`pkg/config/load.go:295`) maps `[common]` onto
+/// `legacy.ServerCommonConf` (`pkg/config/legacy/server.go:220`), which has no
+/// `includes` field, and the only expansion (`LoadAdditionalClientConfigs`,
+/// `pkg/config/load.go:381-382`) is inside `LoadClientConfigResult`
+/// (`pkg/config/load.go:346`). (A *top-level* `includes` is a v1 `ServerConfig`
+/// field and stays live on the server, at base and head alike.) Measured on
+/// v0.71.0, both loader modes, all rc 0: an include holding `[p1]` (which the
+/// client-side fix would merge and, under frps's strict default, refuse as
+/// `unknown field "p1"`), an include holding a visitor the legacy collector
+/// refuses, a missing include directory, and an include holding
+/// `[common] log_level = "debug"` (a silent server-semantics change). The frps
+/// load must stay rc 0 and keep its own log level.
+#[test]
+fn legacy_ini_server_ignores_common_includes_both_modes() {
+    // Case 1: an include holding a proxy section — merging it would add an
+    // unknown top-level `p1` under frps's strict default.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("srv_p1.ini"),
+        "[p1]\ntype = tcp\nlocal_port = 8080\nremote_port = 18080\n",
+    )
+    .unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(
+        &path,
+        "[common]\nbind_port = 17703\nincludes = \"srv_p1.ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        load_server_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("include holding [p1], strict={strict}: {e}"));
+    }
+
+    // Case 2: an include the client-side collector would refuse.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("srv_bad.ini"), "[p1]\nrole = \"visitor\"\n").unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(
+        &path,
+        "[common]\nbind_port = 17703\nincludes = \"srv_bad.ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        load_server_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("include holding a bad visitor, strict={strict}: {e}"));
+    }
+
+    // Case 3: a missing include directory is not an error for frps.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(
+        &path,
+        "[common]\nbind_port = 17703\nincludes = \"no_such_dir/missing.ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        load_server_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("missing include dir, strict={strict}: {e}"));
+    }
+
+    // Case 4: the include cannot change server semantics silently — the
+    // included `[common] log_level = "debug"` must not reach the merged config.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("srv_log.ini"),
+        "[common]\nlog_level = \"debug\"\n",
+    )
+    .unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(
+        &path,
+        "[common]\nbind_port = 17705\nincludes = \"srv_log.ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_server_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("log include, strict={strict}: {e}"));
+        assert_eq!(
+            cfg.log.level, "info",
+            "strict={strict}: the server's own log level must not come from an ignored include"
+        );
+    }
+}
+
 /// **A DefaultSection `start` never filters; `[common] start` does.**
 ///
 /// Go fills the legacy common config from `[common]` alone
 /// (`UnmarshalClientConfFromIni`: `GetSection("common")` + `MapTo`,
 /// `pkg/config/legacy/client.go:173-200`) and `start` is one of those keys
 /// (`Start []string \`ini:"start"\``, `pkg/config/legacy/client.go:119`). The
-/// hoist's `entry(k).or_insert(v)` (`frp-core/src/config/normalize.rs:1162-1166`)
+/// hoist's `entry(k).or_insert(v)` (`frp-core/src/config/normalize.rs:1185-1189`)
 /// would let a DefaultSection `start` win and mask Go's refusals (round-5
 /// adversarial RF5-1), so the `[common]` value is captured before the hoist
-/// (`legacy_common_start`, `frp-core/src/config/normalize.rs:2488`) and written
+/// (`legacy_common_start`, `frp-core/src/config/normalize.rs:2511`) and written
 /// back after it (`legacy_start_override`,
-/// `frp-core/src/config/normalize.rs:2507`). Measured on Go v0.71.0, both loader
+/// `frp-core/src/config/normalize.rs:2530`). Measured on Go v0.71.0, both loader
 /// modes: the four shapes below are rc 1 with the message asserted, a
 /// DefaultSection-only `start` is rc 0 with both proxies (Go's list is empty,
 /// i.e. `startAll`), `[common] start` beats a DefaultSection `start`, and
@@ -12320,7 +13263,7 @@ fn legacy_ini_start_comes_from_the_common_section_only() {
 /// `frp-core/src/config/format.rs:389` is therefore gated on `legacy_ini`
 /// (`frp-core/src/config/format.rs:223`); the legacy `[common]` case keeps the
 /// section (`legacy_ini_scalar_and_section_collision_keeps_the_section_like_go`,
-/// `frp-core/src/config/tests.rs:11824`).
+/// `frp-core/src/config/tests.rs:11959`).
 #[test]
 fn v1_ini_scalar_section_collision_is_still_a_type_error() {
     for (body, expected) in [
@@ -12388,7 +13331,7 @@ fn v1_ini_scalar_section_collision_is_still_a_type_error() {
 /// be 'server' or 'visitor'`) and `[start] type = "custom"` is rc 1 (`failed to
 /// parse proxy start, err: invalid type [custom]`). The round-6 defect removed
 /// the root `start` key before collection (`legacy_start_override`,
-/// `frp-core/src/config/normalize.rs:2507`), which deleted the section and
+/// `frp-core/src/config/normalize.rs:2530`), which deleted the section and
 /// swallowed both refusals (rc 0); this test reds on `c7495cbd`.
 #[test]
 fn legacy_ini_start_section_refusals_like_go() {
@@ -12474,7 +13417,7 @@ fn legacy_ini_start_section_is_still_a_proxy() {
             assert_eq!(names, expected, "{label}, strict={strict}");
             // Go's `start` list itself: empty means `startAll`, and a
             // DefaultSection `start` must not survive into the runtime filter
-            // (`legacy_start_override`, `frp-core/src/config/normalize.rs:2507`).
+            // (`legacy_start_override`, `frp-core/src/config/normalize.rs:2530`).
             let mut started: Vec<&str> = cfg.start.iter().map(String::as_str).collect();
             started.sort_unstable();
             assert_eq!(started, expected_start, "{label}, strict={strict}");
@@ -12630,7 +13573,7 @@ fn legacy_ini_start_array_literal_selects_nothing_like_go() {
 /// no proxy, and rc 0 with proxy `p1`. Such a list round-trips against its raw
 /// text, so `frp-core/src/config/format.rs` keeps it an array and
 /// `ini_start_names` renders each element as Go's text
-/// (`frp-core/src/config/normalize.rs:2461`). Dropping the non-string element
+/// (`frp-core/src/config/normalize.rs:2484`). Dropping the non-string element
 /// instead emptied the list and let `startAll` collect every section.
 #[test]
 fn legacy_ini_numeric_start_list_selects_nothing_like_go() {
@@ -12736,8 +13679,8 @@ fn legacy_ini_empty_start_dispatches_every_section_like_go() {
 /// and that `[p2]` is rc 0 with proxy `p1`. Non-strict frp-rs matches; the strict
 /// checker still reports the leftover table (`unknown field "p2"`), the
 /// pre-existing residue of a non-candidate section documented at
-/// `frp-core/src/config/tests.rs:11907`. Without the `ini_section_started`
-/// guard the role scan at `frp-core/src/config/normalize.rs:2164` refuses the
+/// `frp-core/src/config/tests.rs:12154`. Without the `ini_section_started`
+/// guard the role scan at `frp-core/src/config/normalize.rs:2187` refuses the
 /// file (rc 1, `proxy p2 role should be 'server' or 'visitor'`).
 #[test]
 fn legacy_ini_start_skips_role_scan_for_unlisted_sections() {
@@ -12766,7 +13709,7 @@ fn legacy_ini_start_skips_role_scan_for_unlisted_sections() {
 
 /// **`ini_start_names` maps a `[common] start` value to Go's names.**
 ///
-/// Unit tooth for the dispatch helper (`frp-core/src/config/normalize.rs:2461`),
+/// Unit tooth for the dispatch helper (`frp-core/src/config/normalize.rs:2484`),
 /// whose `Table` arm is masked end to end: a nested `[common.start]` header is a
 /// section of its own in Go's `gopkg.in/ini.v1`, so `[common]` has no `start` key
 /// and `startAll` is true, while frp-rs nests the table under `common` and then
@@ -12804,4 +13747,274 @@ fn legacy_ini_start_names_maps_go_text_and_nested_tables() {
         super::normalize::ini_start_names(&array),
         Some(HashSet::from(["p1".to_string(), "2".to_string()]))
     );
+}
+
+/// **Item 3: a `[common.foo]`-only `.ini` reaches the legacy collector in frp-rs
+/// but not in Go (recorded divergence).**
+///
+/// `q4_dotted_common_role_only.ini` (`[common.foo] role = "weird"`) measured on
+/// Go v0.71.0: strict rc 1 `json: unknown field "common"`, non-strict rc 0. Go
+/// asks `GetSection("common")` in `DetectLegacyINIFormat`
+/// (`pkg/config/load.go:65`), and a literal `common.foo` header does not satisfy
+/// it, so the file never reaches the legacy reader. frp-rs nests the dotted
+/// header under `common` (`ini_section_path`, `frp-core/src/config/format.rs:323`)
+/// and the collector's own detector (`frp-core/src/config/normalize.rs:1183`)
+/// therefore sees a `common` table, hoists its `foo` subtable and refuses it as a
+/// proxy: rc 1 in **both** modes. The strict verdict agrees with Go, the
+/// non-strict refusal is the loose-only divergence the item calls a follow-up.
+/// Recorded deliberate: making the two detectors agree would mean dropping
+/// `common` from the dotted-section roots, which the `[common.webServer.tls]`
+/// spelling pinned at `frp-core/src/config/tests.rs:6714` still needs. A mutant
+/// that forces `legacy_ini` false in the collector loads this file non-strict.
+#[test]
+fn dotted_common_only_section_is_legacy_for_the_collector_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("q4_dotted_common_role_only.ini");
+    std::fs::write(&path, "[common.foo]\nrole = \"weird\"\n").unwrap();
+    for strict in [false, true] {
+        let err = format!(
+            "{}",
+            load_client_config(path.to_str().unwrap(), strict)
+                .expect_err("the hoisted foo table is refused as a proxy role")
+        );
+        assert!(
+            err.contains("proxy foo role should be 'server' or 'visitor'"),
+            "strict={strict}: {err}"
+        );
+    }
+}
+
+/// **Item 3: a `[DEFAULT]` header is an ordinary section in frp-rs (recorded
+/// divergence).**
+///
+/// `y10`/`y11` measured on Go v0.71.0: rc 1 in both loader modes. `[DEFAULT]` is
+/// not a TOML table, so Go's first decode fails
+/// (`json: cannot unmarshal array into Go value of type v1.rawClientConfig`) and
+/// the YAML/JSON fallback that an `.ini` extension falls through to rejects it as
+/// well. frp-rs spells the header as a section literally named `DEFAULT`: strict
+/// reports `unknown field "DEFAULT"`, non-strict keeps it as an inert table and
+/// loads `[p1]` through the v1 path. Recorded deliberate — matching Go would mean
+/// routing a `[common]`-less `.ini` into the YAML/JSON fallback frp-rs does not
+/// have. Both modes pinned.
+#[test]
+fn default_section_header_is_an_ordinary_section_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("y10_default.ini");
+    std::fs::write(
+        &path,
+        "[DEFAULT]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [p1]\ntype = tcp\nlocal_port = 8080\nremote_port = 18080\n",
+    )
+    .unwrap();
+    let cfg = load_client_config(path.to_str().unwrap(), false)
+        .expect("non-strict keeps DEFAULT as an inert section");
+    assert_eq!(cfg.proxies.len(), 1);
+    assert_eq!(cfg.proxies[0].name, "p1");
+    let err = format!(
+        "{}",
+        load_client_config(path.to_str().unwrap(), true)
+            .expect_err("strict reports the DEFAULT table as unknown")
+    );
+    assert!(err.contains("unknown field \"DEFAULT\""), "{err}");
+}
+
+/// **Item 3: the `r_toml.ini` `.ini`/TOML hybrid is a v1 shape in frp-rs
+/// (recorded divergence).**
+///
+/// `server_addr` plus a `[[proxies]]` array-of-tables header measured on Go
+/// v0.71.0: rc 1 in both modes (strict `json: unknown field "server_addr"`,
+/// non-strict `decode proxy at index 0: unknown proxy type:`). frp-rs's `.ini`
+/// reader spells `[[proxies]]` as a section literally named `[proxies]`: strict
+/// reports `unknown field "[proxies]"`, non-strict keeps the scalar `server_addr`
+/// and loads zero proxies. The strict rc agrees; only the message and the
+/// non-strict verdict diverge, and matching Go's non-strict message would mean
+/// addressing the array element as `proxies[0]`, which the `.ini` reader does not
+/// do (pinned as out of scope at `frp-core/src/config/tests.rs:12196`). Both
+/// modes pinned.
+#[test]
+fn r_toml_hybrid_ini_is_a_v1_shape_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r_toml.ini");
+    std::fs::write(
+        &path,
+        "server_addr = \"127.0.0.1\"\nserver_port = 7000\n\
+         [[proxies]]\nname = \"p\"\nrole = \"weird\"\n",
+    )
+    .unwrap();
+    let cfg = load_client_config(path.to_str().unwrap(), false)
+        .expect("non-strict keeps server_addr and loads no proxy");
+    assert_eq!(cfg.server_addr, "127.0.0.1");
+    assert!(cfg.proxies.is_empty());
+    let err = format!(
+        "{}",
+        load_client_config(path.to_str().unwrap(), true)
+            .expect_err("strict reports the literal [proxies] section")
+    );
+    assert!(err.contains("unknown field \"[proxies]\""), "{err}");
+}
+
+/// **Item 3: a `[range:...]` section missing a port is skipped with a warning in
+/// frp-rs where Go fails the load (recorded divergence).**
+///
+/// `y16_default_start_masks_range_render_error.ini` (`start = p2`, `[common]`,
+/// `[range:p] local_port = 8080` with no `remote_port`, and a valid `[p2]`)
+/// measured on Go v0.71.0: rc 1 in both modes, `failed to render template for
+/// proxy range:p: local_port or remote_port is empty`
+/// (`renderRangeProxyTemplates`, `pkg/config/legacy/client.go:289`). frp-rs logs
+/// `legacy INI [range:...] section: missing or invalid remote_port; skipped`
+/// (`frp-core/src/config/normalize.rs:2331`) and loads `p2`, rc 0. Recorded
+/// deliberate: making a missing port fatal is a separate design question, and the
+/// sibling skip paths are pinned as intentional at
+/// `frp-core/src/config/tests.rs:9896` / `:9921`. Both modes pinned.
+#[test]
+fn range_section_without_remote_port_is_skipped_not_fatal_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("y16_range_render.ini");
+    std::fs::write(
+        &path,
+        "start = p2\n[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [range:p]\nlocal_port = 8080\n\
+         [p2]\ntype = tcp\nlocal_port = 8081\nremote_port = 18081\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("strict={strict}: the range section is skipped: {e}"));
+        let names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["p2"], "strict={strict}");
+    }
+}
+
+/// **Item 1, reserved-root `type`-only sections: frp-rs keeps them as v1
+/// settings (recorded design decision).**
+///
+/// `i4c.ini` (`[common]` + `[web_server] type = "tcp"`) measured on Go v0.71.0:
+/// rc 0 in both loader modes, and the legacy collector registers a proxy named
+/// `web_server` of type `tcp` with listen port 0 — Go's
+/// `LoadAllProxyConfsFromIni` skips only the default section, `common` and
+/// `range:`, so every other header is a proxy regardless of its name. frp-rs
+/// keeps its known-settings-root guard (`KNOWN_SECTIONS` in
+/// `frp-core/src/config/normalize.rs:2042`) and reports `Proxies: 0`, rc 0 in
+/// both modes. Keying the bypass on `type` instead of the ports would also
+/// collect `[log] type = "custom" disable_print_color = true` (Go rc 1
+/// `failed to parse proxy log, err: invalid type [custom]`, frp-rs rc 0 today)
+/// and would contradict `test_legacy_ini_known_section_with_type_not_collected`
+/// (`frp-core/src/config/tests.rs:9946`). The item calls this a design question
+/// about whether frp-rs keeps supporting v1 settings roots in `.ini` at all, so
+/// the divergence is recorded deliberate rather than forced. The sibling
+/// typeless/port-less shape (`c2.ini`, `[p] custom_domains = ["a.com"]`) is
+/// pinned the same way both modes: Go collects `p` (rc 0), frp-rs keeps it a v1
+/// section (`unknown field "p"` strict, rc 0 non-strict), matching
+/// `typeless_ini_section_without_ports_stays_a_v1_section`
+/// (`frp-core/src/config/tests.rs:6967`).
+#[test]
+fn legacy_ini_reserved_root_type_only_section_is_not_collected_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let i4c = dir.path().join("i4c.ini");
+    std::fs::write(
+        &i4c,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [web_server]\ntype = \"tcp\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(i4c.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("i4c strict={strict}: frp-rs keeps the settings root: {e}"));
+        assert!(
+            cfg.proxies.is_empty(),
+            "i4c strict={strict}: Go registers [web_server] as a type-tcp proxy, frp-rs does not"
+        );
+    }
+
+    let c2 = dir.path().join("c2.ini");
+    std::fs::write(
+        &c2,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [p]\ncustom_domains = [\"a.com\"]\n",
+    )
+    .unwrap();
+    let lenient = load_client_config(c2.to_str().unwrap(), false).unwrap();
+    assert!(lenient.proxies.is_empty(), "c2 non-strict");
+    let err = format!(
+        "{}",
+        load_client_config(c2.to_str().unwrap(), true).unwrap_err()
+    );
+    assert!(
+        err.contains("unknown field \"p\""),
+        "c2 strict keeps the typeless, port-less section a v1 shape: {err}"
+    );
+}
+
+/// **Item 1, server side: no legacy collector means a dotted or reserved root
+/// stays a v1 key, and Go's legacy server reader simply ignores those headers.**
+///
+/// The four `frps` shapes measured on Go v0.71.0 (a `[common]` header makes the
+/// file legacy for Go, whose server reader then reads its typed `[common]`
+/// fields and ignores every other section):
+/// * `s2.ini` `[proxies.foo] type = tcp`: Go rc 0 in both loader modes; frp-rs
+///   strict rc 1 `unknown field "proxies.foo"`, non-strict rc 0.
+/// * `i6a.ini` `[http_plugins.foo] name = "u"`: Go rc 0 both; frp-rs rc 1 both
+///   `invalid type: map, expected a sequence`.
+/// * `i6b.ini` `[plugin.user] ops = login`: Go rc 1 both `invalid http plugin
+///   ops, optional values are [Login NewProxy CloseProxy Ping NewWorkConn
+///   NewUserConn]`; frp-rs rc 1 both `server config: http_plugins entry 'user'
+///   has no addr` — the refusal agrees, the message does not.
+/// * `i7.ini` `[feature.foo] x = true`: Go rc 0 both; frp-rs rc 1 both
+///   `invalid type: map, expected a boolean`.
+///
+/// frp-rs has no server-side legacy collector (the item says so explicitly), so
+/// these are recorded as deliberate divergences rather than forced to Go's
+/// verdicts: `[feature]`/`[http_plugins]` are typed v1 settings roots, and
+/// accepting an arbitrary subtable would weaken those types. Both modes pinned.
+#[test]
+fn legacy_ini_server_side_dotted_and_reserved_roots_stay_v1_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let cases: [(&str, &str, Option<&str>); 4] = [
+        (
+            "s2.ini",
+            "[common]\nbind_port = 7000\n[proxies.foo]\ntype = tcp\n",
+            Some("unknown field \"proxies.foo\""),
+        ),
+        (
+            "i6a.ini",
+            "[common]\nbind_port = 7000\n[http_plugins.foo]\nname = \"u\"\n",
+            Some("invalid type: map, expected a sequence"),
+        ),
+        (
+            "i6b.ini",
+            "[common]\nbind_port = 7000\n[plugin.user]\nops = login\n",
+            Some("http_plugins entry 'user' has no addr"),
+        ),
+        (
+            "i7.ini",
+            "[common]\nbind_port = 7000\n[feature.foo]\nx = true\n",
+            Some("invalid type: map, expected a boolean"),
+        ),
+    ];
+    for (name, body, strict_err) in cases {
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let outcome = load_server_config(path.to_str().unwrap(), strict);
+            match (name, strict, strict_err) {
+                // The one shape where frp-rs agrees with Go in non-strict mode.
+                ("s2.ini", false, _) => {
+                    outcome.unwrap_or_else(|e| panic!("s2 non-strict must load: {e}"));
+                }
+                (_, _, Some(fragment)) => {
+                    let err = match outcome {
+                        Err(e) => format!("{e}"),
+                        Ok(_) => panic!(
+                            "{name} strict={strict} loaded, expected an error containing {fragment:?}"
+                        ),
+                    };
+                    assert!(
+                        err.contains(fragment),
+                        "{name} strict={strict}: expected {fragment:?}, got {err}"
+                    );
+                }
+                (_, _, None) => unreachable!("every case names its strict error"),
+            }
+        }
+    }
 }

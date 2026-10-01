@@ -577,10 +577,33 @@ fn or_insert_deep(dst: &mut toml::Table, src: toml::Table) {
     }
 }
 
+/// Which binary's file [`load_config_from_file`] is reading.
+///
+/// Exactly one legacy-`.ini` rule depends on this: the `[common] includes`
+/// include list. Go's **client** legacy reader has the field
+/// (`IncludeConfigFiles []string \`ini:"includes"\``,
+/// `pkg/config/legacy/client.go:166`; `ParseClientConfig` renders it,
+/// `pkg/config/legacy/parse.go:50`). The **server** side never reads that list:
+/// `LoadServerConfig` (`pkg/config/load.go:295`) unmarshals `[common]`
+/// into `legacy.ServerCommonConf` (`pkg/config/legacy/server.go:220`), a struct
+/// with no `includes` field, and the only expansion
+/// (`LoadAdditionalClientConfigs`, `pkg/config/load.go:381-382`) sits inside
+/// `LoadClientConfigResult` (`pkg/config/load.go:346`). Passing the side down to
+/// [`process_includes`] is what keeps the server load byte-for-byte what it was
+/// before `[common] includes` support existed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ConfigSide {
+    Client,
+    Server,
+}
+
 /// Generic config loader shared by `load_server_config` and `load_client_config`.
 pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
     path: &str,
     strict_config: bool,
+    // Which side is loading, for the one legacy-`.ini` rule that differs
+    // between them (see [`ConfigSide`]).
+    side: ConfigSide,
     known_keys: fn() -> std::collections::HashSet<&'static str>,
     // The normalizer must know the dialect: the legacy `.ini` rules for
     // `type`-less sections are **INI-only** (see
@@ -608,7 +631,7 @@ pub(super) fn load_config_from_file<C: serde::de::DeserializeOwned>(
     let mut value: toml::Value =
         parse_to_toml_value(&content, format).map_err(|e| format!("{path}: parse error: {e}"))?;
     let base_dir = Path::new(path).parent().unwrap_or(Path::new("."));
-    process_includes(&mut value, base_dir, format)?;
+    process_includes(&mut value, base_dir, format, side)?;
     // Expand `${ENV_VAR}` references here, after includes are deep-merged
     // (so include-file values are covered) and before normalization (which
     // renames/restructures keys). See `expand_env_vars` for the exact subset.

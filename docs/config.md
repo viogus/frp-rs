@@ -912,6 +912,57 @@ the legacy INI collector's `role` dispatch, in the explicit `[x]` and
 `[range:...]` shapes. Canonical TOML/JSON/YAML configs have no legacy `role`
 key and are unaffected, and every other legacy key reads as described above.
 
+#### Legacy `.ini` residues are measured, not silently different
+
+The shapes where frp-rs's legacy `.ini` reader still differs from Go v0.71.0 are pinned by measurement
+rather than left to prose. One is fixed; the rest are **recorded rather than fixed**, because each is a
+decision about how far the v1 `.ini` dialect is supported at all. Every row below is measured in both
+loader modes and pinned in `frp-core/src/config/tests.rs`.
+
+`[common] includes = "<file>"` **is** expanded now, as Go expands it
+(`pkg/config/legacy/client.go:166,172-200`): `process_includes` runs before the `[common]` hoist, so the
+client `.ini` loader takes that string key out of the raw `[common]` table while it is still visible
+(`frp-core/src/config/file.rs:339-346`) and appends it to the include walk ahead of the top-level
+spellings (`:368`). Measured with `frpc verify -c`: `x12_good.ini` (`[common] includes` naming a file that
+holds one `[p1]` proxy) is rc 0 on Go and now rc 0 with `Proxies: 1` here, where nothing was loaded
+before; `x12_missing.ini` (an include under a nonexistent directory) is Go rc 1 `include: directory of …
+not exist` and now rc 1 here, where it was rc 0. The pins are
+`legacy_ini_common_include_is_expanded_like_go` and `legacy_ini_common_include_missing_dir_refuses_like_go`.
+Three spellings stay deliberately different: a top-level `includes` beside `[common]` is still expanded
+here where Go ignores the default section (`legacy_ini_default_section_string_include_is_still_expanded`),
+a `[common]`-less string scalar `includes`/`include` is still merged where Go is rc 1 in both modes, and
+includes are still not `text/template`-rendered, so a render-invalid include Go rejects is merged as-is.
+
+The recorded residues, each pinned in both loader modes:
+
+- **A reserved settings root carrying `type` but no port** (`[web_server] type = "tcp"`) registers a
+  proxy named after the root on Go (listen port 0) and stays a v1 settings root here (`Proxies: 0`) —
+  `legacy_ini_reserved_root_type_only_section_is_not_collected_both_modes`. Keying the reserved-root
+  bypass on `type` instead of the ports would also collect `[log] type = "custom"` (Go rc 1 `failed to
+  parse proxy log, err: invalid type [custom]`) and contradict
+  `test_legacy_ini_known_section_with_type_not_collected`, so the two spellings cannot both be honoured;
+  `legacy_ini_server_side_dotted_and_reserved_roots_stay_v1_both_modes` pins the server-side rows
+  (`[proxies.foo]`, `[http_plugins.foo]`, `[plugin.user]`, `[feature.foo]`) with their per-mode verdicts.
+- **A `[common.foo]`-only `.ini`** is loose-only between the two detectors (Go strict 1 / loose 0 against
+  frp-rs 1|1) — `dotted_common_only_section_is_legacy_for_the_collector_both_modes`.
+- **`[DEFAULT]` is an ordinary section here** and a **portless `[range:p]` is skipped with a warning
+  rather than refused** — `default_section_header_is_an_ordinary_section_both_modes`,
+  `range_section_without_remote_port_is_skipped_not_fatal_both_modes`; the **`r_toml.ini` hybrid** agrees
+  with Go on the strict verdict only (frp-rs strict rc 1 `unknown field "[proxies]" in config file
+  r_toml.ini — did you mean 'proxies'?` against Go's `json: unknown field "server_addr"`), while the
+  non-strict verdicts diverge — Go rc 1 `decode proxy at index 0: unknown proxy type:` against frp-rs
+  rc 0 with `Proxies: 0` — `r_toml_hybrid_ini_is_a_v1_shape_both_modes`.
+- **A scalar `start` with no `[common]`** is one of Go's v1 type errors against rc 0 here —
+  `legacy_ini_without_common_start_scalar_is_a_v1_shape`; a `DefaultSection start = p2` beside a
+  `[start]` section gives both one proxy named `start` —
+  `legacy_ini_default_section_start_beside_start_section_both_modes`.
+- **An unknown key merged out of `[common]`** (`[common] zzz_unknown_common = 1`) loads on Go in both
+  modes while frp-rs is rc 0 loose / rc 1 strict `unknown field "zzz_unknown_common"`, because the
+  `[common]` merge (`frp-core/src/config/normalize.rs:1185-1188`) moves the key to the top level before
+  the top-level walk (`frp-core/src/config/strict.rs:474`). Exempting the keys that merge created would
+  blind the top-level half to a genuine v1 typo spelled under `[common]`, so this is recorded rather than
+  fixed — `legacy_ini_common_unknown_key_residual_both_modes`.
+
 ---
 
 ## Environment Variable Expansion
