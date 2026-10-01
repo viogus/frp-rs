@@ -238,10 +238,12 @@ differently:
 | 5 | `let valid_types = [...]` — `frp-server/src/dashboard.rs:659`, guard at `:662` (feature `dashboard`) | The dashboard v1 API's per-type endpoint | `404` for your type (a deliberate divergence from Go, which returns an empty list) |
 | 6 | `const VALID_TYPES` — `frp-server/src/dashboard.rs:1577`, enforced by `fn validate_type` at `frp-server/src/dashboard.rs:2145` (called at `:2690`; feature `dashboard`) | The dashboard v2 API's `proxy_type` filter | `400 BAD_REQUEST`: `type must be one of tcp, udp, http, https, tcpmux, stcp, xtcp, sudp` (`frp-server/src/dashboard.rs:2151`) |
 
-**The SSH gateway has two gates, not one.** List 4 is only the first: each flag is
-also scoped by proxy type (`FlagScope::Types`, matched by `FlagScope::allows` at
-`frp-server/src/ssh_gateway.rs:322`; the scope table is
-`frp-server/src/ssh_gateway.rs:395-445`). `remote_port` is scoped to `&["tcp"]`
+**The SSH gateway has two gates, not one.** List 4 is only the first: every flag
+also carries a scope, matched by `FlagScope::allows`
+(`frp-server/src/ssh_gateway.rs:322`) against the `FLAG_SPELLINGS` table
+(`frp-server/src/ssh_gateway.rs:361-495`): most base/common flags are
+`FlagScope::Any` (every proxy type) and the restricted ones use
+`FlagScope::Types`. `remote_port` is scoped to `&["tcp"]`
 (`frp-server/src/ssh_gateway.rs:399`), so a Rust-only TCP-like type added to list 4
 is *accepted* over SSH but cannot set `remote_port` — the out-of-scope flag is
 rejected as `unknown flag: --remote_port` (`frp-server/src/ssh_gateway.rs:189`),
@@ -340,9 +342,9 @@ corresponding predicate; a type with a real remote port belongs in the port
 accounting; a type with a private listener belongs in the listener branch.
 
 Those six are complete for a minimal non-group TCP-like type. A type that can also
-join a **TCP** group touches seven more predicate sites — the group port and its
-shared listener are owned by the group, so missing one releases them while a
-sibling is still live:
+join a **TCP** group touches seven more predicate sites across six bullets (the
+close handler alone has two) — the group port and its shared listener are owned by
+the group, so missing one releases them while a sibling is still live:
 
 - the replacement release in `free_replaced_port`
   (`frp-server/src/control/proxy_ops.rs:587`);
@@ -772,10 +774,10 @@ One config trap worth repeating, because it fails with an unreadable error:
 `tcp_mux` must agree on both sides. The `rust` branch of `write_frps_config`
 writes `tcp_mux = false`, so the inline client config must too — the working
 spelling is the snake_case `tcp_mux` of the Rust `write_frpc_config` branch
-(`scripts/compat-test.sh:825-852`). What *is* dropped, silently, is the **top-level**
-camelCase key: `tcpMux = false` written at the top level (with no `[transport]`
-table) is accepted by the config parser but has no serde alias on `tcp_mux`
-(`frp-core/src/config/client.rs:321-322`), so the client keeps the default
+(`scripts/compat-test.sh:776-852`). What *is* dropped, silently, is the **top-level**
+camelCase key: `tcpMux = false` written at the top level is accepted by the
+config parser whether or not a `[transport]` table is present, but it has no serde
+alias on `tcp_mux` (`frp-core/src/config/client.rs:321-322`), so the client keeps the default
 `tcp_mux = true` and the server rejects the first frame with `invalid V1 msg
 length: 144116287587483648 (max: 10240), raw header: 000200010000000000`. A plain
 mismatch — server `tcp_mux = false`, client snake_case `tcp_mux = true` — fails
