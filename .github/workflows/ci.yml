@@ -1029,6 +1029,28 @@ jobs:
         # 10 test targets and the bench touched (forced rebuild). The runner's
         # cost — Linux, cold cache — was not measured.
         run: cargo test -p frp-core --no-default-features --all-targets
+      - name: Run frp-core's help-document pins in the two mixed feature shapes
+        # `frp-core/src/cli.rs`'s help-document pins are feature-sensitive:
+        # `feature_adjusted_pin` keeps `--kcp-bind-port` only when `kcp` is on
+        # and `--quic-bind-port` only when `quic` is on, so the pins have four
+        # shapes. Only two were executed — default features (both on, the step
+        # above this one) and `--no-default-features` (both off, the step
+        # immediately above) — while kcp-only and quic-only were compiled by the
+        # feature-matrix `cargo check` lanes and never run. A pin that reads a
+        # feature it never varies is exactly the class this closes.
+        #
+        # Measured 2026-10-01, macOS arm64: 19 passed / 0 failed in each mixed
+        # shape; 38.44 s for the first (cold, kcp-only) and 0.03 s of test time
+        # per shape. `--lib` plus the `help_doc_tests` filter keeps the step to
+        # the pins; the runner's cost on Linux is not measured.
+        shell: bash
+        run: |
+          set -eo pipefail
+          for features in kcp quic; do
+            echo "::group::frp-core help-document pins (--no-default-features --features $features)"
+            cargo test -p frp-core --no-default-features --features "$features" --lib -- help_doc_tests
+            echo "::endgroup::"
+          done
       - name: Run frp-core's server `tls_enable` warning pin (count guard)
         # `frp-core/tests/server_tls_enable_warning.rs` is executed today only by
         # the two generic frp-core sweeps above, which is why the file is named
