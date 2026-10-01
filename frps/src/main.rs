@@ -396,7 +396,7 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     // Go frp parity (TODO.md:8831): with an explicit `-c` the config file is
     // authoritative for the whole `[log]` section, exactly as it is for the
     // config flags — the `-c` branch of `main` skips `override_server_config`
-    // (`frps/src/main.rs:1019-1021`), so consulting the CLI log flags here would
+    // (`frps/src/main.rs:1025-1027`), so consulting the CLI log flags here would
     // silently re-honour the very flags that gate exists to discard. Measured
     // on Go v0.71.0: `frps -c frps.toml --log-level info` over a file with
     // `[log] level = "warn"` emits 0 `INFO` records; before this gate frp-rs
@@ -785,10 +785,10 @@ async fn run(mut cli: FrpsArgs) {
                             if let Err(e) = service.run().await {
                                 // `Service::run` has exactly one `Ok(())`
                                 // return — its graceful-shutdown tail
-                                // (`frp-server/src/service.rs:2276`) — so this
+                                // (`frp-server/src/service.rs:2281`) — so this
                                 // arm means the service stopped for good. The
                                 // single-config path maps any `run()` error to
-                                // `EXIT_RUNTIME` (`frps/src/main.rs:1122-1125`),
+                                // `EXIT_RUNTIME` (`frps/src/main.rs:1132-1135`),
                                 // and this lane carries the same code out,
                                 // pinned on both lanes by
                                 // `config_dir_where_every_service_fails_to_run_exits_like_dash_c`
@@ -930,7 +930,7 @@ async fn run(mut cli: FrpsArgs) {
         // code out of construction, or `EXIT_RUNTIME` when `run()` failed — and
         // `Ok(())` only when the service ran to a graceful shutdown, the sole
         // `Ok` return in `Service::run`
-        // (`frp-server/src/service.rs:2276`). A **panicking** task reports
+        // (`frp-server/src/service.rs:2281`). A **panicking** task reports
         // `Err(JoinError)`; it is counted as an `EXIT_RUNTIME` failure rather
         // than merely logged, because `Service::run` cannot have returned
         // `Ok(())` on a panic and dropping it let a directory where every task
