@@ -356,7 +356,7 @@ pub(super) fn process_includes(
     // The list is kept verbatim, empty entries included. Go maps `includes = ""`
     // to `[]string{""}` and hands it to `getIncludeContents`, where
     // `filepath.Dir("")` = `"."` and `filepath.Base("")` = `"."` make it match
-    // nothing (`pkg/config/legacy/parse.go:69`, `:86`), so an empty pattern is
+    // nothing (`pkg/config/legacy/parse.go:71`, `:87`), so an empty pattern is
     // "no includes" by Go's own rule and needs no filter. Round 4 dropped the
     // empties here instead, which repaired the empty-parent guard but only for
     // this exact string: every other separator-less spelling (`"."`, `"./"`,
@@ -527,11 +527,13 @@ fn drop_ini_scalar_include_keys(table: &mut toml::Table) {
 }
 
 // Known bounds in this area — pre-existing divergences measured during round 4
-// (Go v0.71.0 binaries, both loader modes). The detector used throughout is
-// `sub_bad.ini` = `[p1] role = "visitor"`: Go's legacy reader refuses it with
-// `failed to parse visitor p1, err: type shouldn't be empty`, so a reader that
-// merges the file must fail on it. None of the remaining ones is introduced by
-// the legacy-`.ini` parity work and none is pinned by a test — they are recorded
+// (Go v0.71.0 binaries, both loader modes). The detector used throughout is the
+// two-line body `[p1]` + `role = "visitor"` — usually written as the file
+// `sub_bad.ini`: Go's legacy reader refuses it with `failed to parse visitor
+// p1, err: type shouldn't be empty`, so a reader that merges the file must fail
+// on it. Fixtures below reuse that body under other file names; the detector is
+// the body, not the name. None of the remaining ones is introduced by the
+// legacy-`.ini` parity work and none is pinned by a test — they are recorded
 // here because this is where the include handling lives, and so that a later
 // fix knows it is changing measured behaviour rather than "cleaning up".
 //
@@ -561,33 +563,41 @@ fn drop_ini_scalar_include_keys(table: &mut toml::Table) {
 //   err: invalid type [custom]`, rc 1 in both modes), while here the section is
 //   skipped by the collector and then dropped as an inert table by
 //   [`drop_legacy_ini_include_tables`] (rc 0 in both modes).
-// * **The glob is not `filepath.Match`: `?`, `[...]`, multi-`*` and `\` are
-//   silently ignored.** Go matches each directory entry against
+// * **The glob is not `filepath.Match`: `?`, `[...]` and `\` are matched as
+//   literals.** Go matches each directory entry against
 //   `filepath.Match(filepath.Join(absDir, filepath.Base(pattern)), absFile)`
 //   (`pkg/config/legacy/parse.go:87`, repeated at `pkg/config/load.go:513-522`),
 //   while [`glob_in_dir`] implements exactly one `*` (first-star split, then a
-//   prefix/suffix test plus a vestigial `extension()` filter). The decisive
-//   shape is a name a *single* `*` reaches and a `Match` superset does too;
-//   measured in a directory holding `z.ini` plus a same-content `sub_bad.ini`,
-//   `[common] includes = "<pat>"`, both loader modes, `./`-form and bare
-//   `-c <name>`. GO rc 1 (both files merge and the detector is refused) against
-//   HEAD rc 0 (nothing matches — the pattern needs a second `*`, a `?`, a class
-//   or an escape that `glob_in_dir` does not implement); MID `6d801655` and BASE
-//   `f679e822` are rc 0 as well, so this bound is pre-existing and not a
-//   regression of this work:
-//     `"?." + "ini"`        GO rc 1 `failed to parse proxy pz, err: invalid type [bogustype]`
-//     `"[z].ini"`           GO rc 1 (same)                — `?`/`[...]` classes
-//     `"z?.ini"`            GO rc 1 (same)                — `?` after a literal
-//     `"[!z].ini"`          GO rc 1 (same)                — negated class
-//     `"*z*.ini"`           GO rc 1 (same)                — a second `*`
-//     `"s*b*.ini"`          GO rc 1 (same)                — a second `*`
-//     `"sub\*.ini"`         GO rc 1 (same), and it matches the literal file
-//                           `sub*.ini`: `\` is Go `Match`'s escape, not a
-//                           separator, so the whole pattern still carries one `*`
-//     `"z*.ini"`, `"sub*.ini"` GO rc 1, HEAD rc 1 — the one-`*` subset agrees;
-//                           BASE rc 0, i.e. even `*` started matching only at MID.
-//   Implementing `Match` is out of scope for the legacy-`.ini` residue work; this
-//   row exists so a later fix changes measured behaviour knowingly.
+//   prefix/suffix test). One fixture reproduces every cell below: a directory
+//   holding `z.ini`, `zz.ini`, `sub.ini` and `sub_bad.ini`, each with the
+//   detector body, plus `[common] includes = "<pat>"`; measured on Go v0.71.0
+//   and the round-7 build, both loader modes and all three `-c` forms:
+//     pattern        GO  HEAD  why
+//     `?.ini`        1   0     `?` is a `Match` metachar; HEAD wants a literal `?`
+//     `[z].ini`      1   0     `[z]` is a class, and `z.ini` is in it
+//     `z?.ini`       1   0     `?` after a literal
+//     `[!z].ini`     1   0     `!` is *not* `Match` negation — it is an ordinary
+//                              class member, so `[!z]` matches `z.ini`. Go
+//                              negates with `[^...]`
+//                              (`$GOROOT/src/path/filepath/match.go:141`)
+//     `[^z].ini`     0   0     the negation that *does* work, and it matches
+//                              nothing in this fixture
+//     `*z*.ini`      1   0     a second `*`; HEAD keeps the literal `z*` in its
+//                              suffix, which no entry satisfies
+//     `s*b*.ini`     1   0     a second `*`; HEAD wants a name ending `b*.ini`
+//     `z*.ini`       1   1     one `*` — the subset both implement
+//     `sub*.ini`     1   1     one `*` — the subset both implement
+//   `\` is `Match`'s escape, so `sub\*.ini` matches nothing unless the literal
+//   file `sub*.ini` is in the directory. Adding that one file flips two rows:
+//   `sub\*.ini` becomes GO rc 1 (it matches the literal) / HEAD rc 0 (HEAD's
+//   prefix is the literal `sub\`), and `s*b*.ini` becomes rc 1 **at HEAD too**,
+//   because the literal is a name HEAD's naive prefix/suffix test accepts — so
+//   no single fixture produces both "`s*b*.ini` HEAD rc 0" and "`sub\*.ini`
+//   `GO rc 1`". MID `6d801655` and BASE `f679e822` are rc 0 on every GO-rc-1
+//   row above except `z*.ini`/`sub*.ini` (rc 1 at MID, rc 0 at BASE), so the
+//   bound is pre-existing, and even a bare `*` started matching only at MID.
+//   Implementing `Match` is out of scope for the legacy-`.ini` residue work;
+//   this row exists so a later fix changes measured behaviour knowingly.
 //
 // The empty-parent resolution bug measured during round 4 is fixed by
 // [`go_dir`]/[`go_base`]: the pattern's own directory is resolved (Go's
@@ -603,14 +613,19 @@ fn drop_ini_scalar_include_keys(table: &mut toml::Table) {
 // The interior-`..` residue measured during round 5 is fixed in the same helper:
 // [`go_clean`] now folds `..` with Go's `Clean` rule, so
 // `Dir("a/../b") = "."` and the guard sees an existing directory. Pin:
-// `legacy_ini_common_include_interior_dotdot_is_cleaned_like_go`. The remaining
-// shape in this area is only a message difference (rc parity): a
+// `legacy_ini_common_include_interior_dotdot_is_cleaned_like_go`. The
 // separator-terminated pattern naming a regular file, `includes = "sub.ini/"`,
-// is GO rc 1 `getIncludeContents error: open <abs>/sub.ini: not a directory`
-// against HEAD rc 1 `include: directory of ./sub.ini not exist (included by
-// pattern sub.ini/)` — the `:410` guard collapses Go's stat-missing and
-// ReadDir-ENOTDIR failure modes into one message. `..../sub.ini` likewise prints
-// the cleaned dir where Go prints the raw pattern.
+// is a *message* difference only: GO rc 1 `getIncludeContents error: open
+// <abs>/sub.ini: not a directory` against HEAD rc 1 `include: directory of
+// ./sub.ini not exist (included by pattern sub.ini/)` — the `:410` guard
+// collapses Go's stat-missing and `ReadDir`-ENOTDIR failure modes into one
+// message, and `..../sub.ini` likewise prints the cleaned dir where Go prints
+// the raw pattern. That shape is **not** the area's only remaining bound: the
+// glob row above is the other, still rc-divergent one. The symlink shapes that
+// were a third bound (`includes = "lnk"` to a directory, `includes =
+// "dangling.ini"`, and the globs `l*` / `dang*.ini`) are rc-parity as of round
+// 7 — [`glob_in_dir`] skips directories by the entry's own type, so Go and
+// frp-rs both try to read them and both fail (rc 1).
 
 /// Go's `filepath.Dir` (`internal/filepathlite/path.go`, `Dir`): scan back to
 /// the last path separator and `Clean` everything up to **and including** it; a
@@ -699,7 +714,7 @@ fn is_sep_char(c: char) -> bool {
 /// The fold is load-bearing, not cosmetic. Round 5 left it out on the theory
 /// that `"a/../b"` and `"b"` "spell the same directory, so `exists()`/`read_dir`
 /// agree"; they do not, because the guard only ever sees the spelling. Go's
-/// `filepath.Abs` Cleans `Dir` (`pkg/config/legacy/parse.go:69-70`), so
+/// `filepath.Abs` Cleans `Dir` (`pkg/config/legacy/parse.go:71`), so
 /// `Dir("a/../b") = Clean("a/../") = "."` and `os.Stat(".")` succeeds even
 /// though `a` does not exist — while the unfolded `"a/.."` is a path whose
 /// `exists()` is false, so frp-rs refused with
@@ -745,34 +760,49 @@ pub(super) fn go_clean(path: &str) -> String {
     }
 }
 
-/// `filepath.Match`-style single-`*` glob over the regular files **directly
-/// inside** `dir` — the `os.ReadDir(absDir)` + `filepath.Match(filepath.Join(
-/// absDir, filepath.Base(pattern)), absFile)` loop of
+/// `filepath.Match`-style single-`*` glob over the entries **directly inside**
+/// `dir` — the `os.ReadDir(absDir)` + `filepath.Match(filepath.Join(absDir,
+/// filepath.Base(pattern)), absFile)` loop of
 /// `pkg/config/legacy/parse.go:78-95`, which `pkg/config/load.go:513-522`
 /// repeats verbatim for the v1 path. Callers pass the directory from [`go_dir`]
 /// and the name from [`go_base`], so `name_pattern` carries no separator (Go's
 /// only separator-bearing `Base` result is the slash-only `"/"`, which matches
 /// no entry).
 ///
+/// The loop mirrors Go's filter exactly, and that filter is `parse.go:83`
+/// `if fi.IsDir() { continue }` — the **`DirEntry`'s own type**, which never
+/// follows a symlink. The distinction is observable and was a real divergence
+/// until round 7: `Path::is_file()` *does* follow symlinks, so it silently
+/// dropped (a) a symlink that resolves to a directory and (b) a dangling
+/// symlink, while Go keeps both, tries to read them, and fails the load
+/// (rc 1). Measured on Go v0.71.0 (`/private/tmp/frp_0.71.0_darwin_arm64/frpc`)
+/// against this build, in a scratch directory holding `realdir/` (a real
+/// directory), `lnk -> realdir`, `dangling.ini -> nowhere.ini` and a second
+/// symlink `sub -> realdir`, with `[common] includes = "<pat>"`, both loader
+/// modes and all three `-c` forms: `lnk`, `l*`, `dangling.ini`, `dang*.ini`,
+/// `sub` and `s*` are GO rc 1 against HEAD rc 0 *before* the fix and GO rc 1 /
+/// HEAD rc 1 after it (24/24 cells agree), while the real directory `realdir`
+/// and the glob `reald*` stay rc 0 in both. Pins:
+/// `legacy_ini_common_include_symlink_to_dir_refuses_like_go`,
+/// `legacy_ini_common_include_dangling_symlink_refuses_like_go`,
+/// `legacy_ini_common_include_symlink_globs_refuse_like_go`.
+///
+/// Go reaches this enumeration even when the pattern carries no `*`: `Match`
+/// degenerates to string equality with the entry name, so the no-wildcard
+/// branch compares the entry's own name rather than stat-ing
+/// `dir.join(pattern)`. `"."`/`".."` are never returned by `ReadDir`, so they
+/// match nothing, as in Go.
+///
 /// Returns sorted list of matching file paths.
 fn glob_in_dir(
     dir: &Path,
     name_pattern: &str,
 ) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
-    if !name_pattern.contains('*') {
-        // No wildcard — Go's `Match` degenerates to string equality with the
-        // entry name, i.e. an exact file in `dir`. `"."`/`".."` name a
-        // directory and so match nothing, as they do in Go.
-        let path = dir.join(name_pattern);
-        if path.is_file() {
-            return Ok(vec![path]);
-        }
-        return Ok(Vec::new());
-    }
-
     if !dir.exists() || !dir.is_dir() {
         return Ok(Vec::new());
     }
+
+    let has_star = name_pattern.contains('*');
 
     // Build prefix/suffix for matching
     let (prefix, suffix) = if let Some(pos) = name_pattern.find('*') {
@@ -786,14 +816,29 @@ fn glob_in_dir(
     let mut results = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
+        // Go's `fi.IsDir()` — the directory entry's own type, no symlink
+        // follow, so a symlink→dir and a dangling symlink are *not* skipped.
+        if entry.file_type()?.is_dir() {
             continue;
         }
-        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !has_star {
+            // No wildcard — `filepath.Match` degenerates to string equality
+            // with the entry name.
+            if name == name_pattern {
+                results.push(path);
+            }
+            continue;
+        }
         // Match extension
         if let Some(ext) = ext {
-            if path.extension().and_then(|s| s.to_str()) != Some(ext) {
+            if Path::new(name.as_ref())
+                .extension()
+                .and_then(|s| s.to_str())
+                != Some(ext)
+            {
                 continue;
             }
         }
