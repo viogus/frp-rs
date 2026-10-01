@@ -1171,3 +1171,89 @@ fn readiness_gate_needs_the_appenders_own_record() {
         "the readiness gate must report the child's own exit; got: {message}"
     );
 }
+
+// ── the `-c` lane discards **all four** log flags, not just `--log-level` ───
+//
+// The mask at `frps/src/main.rs:413` withholds four CLI values at once
+// (`log_level`, `log_file`, `log_max_days`, `log_format`), but
+// `cli_nonempty_log_level_flag_does_not_override_the_config_file` above drives
+// `--log-level` only — so a regression that masked just one of the other three
+// passed every pin in this file. Each arm below drives one of them on a `-c`
+// lane whose file names the opposite behaviour, so unmasking that one value
+// turns its arm red. Go's `-c` lane is the arbiter for all three: it discards
+// the whole pflag-bound struct (`/tmp/frp-go-src/cmd/frps/root.go:67-83`).
+#[test]
+fn cli_file_retention_and_format_flags_do_not_override_the_config_file() {
+    // Arm 1 — `--log-file console`. The file names `logs/frps.log`, so the flag
+    // must be discarded and the records must land there, never in a rotation
+    // file named after the flag's own value. Measured on Go v0.71.0:
+    // `-c cfg(to=filelogs/frps.log) --log_file console` wrote `filelogs/frps.log`
+    // (the flag-bound struct is discarded); unmasking `log_file` alone writes
+    // `console.<date>` in the child's CWD (that row and the masked row differ
+    // only in destination — stdout stays empty in both).
+    let port = free_port();
+    let dir = TempDir::new("cli-c-file");
+    dir.write("frps.toml", &file_lane_config(port, "level = \"info\"\n"));
+    let mut spawned = Spawned::start_in(dir, &["-c", "frps.toml", "--log-file", "console"]);
+    assert_loopback_listens(port);
+    // `init_logging` opens the appender's file before the listener binds, so on
+    // this lane the diversion (if any) is already on disk — the failing
+    // direction needs no wait, and the successful direction still gets the
+    // appender-record wait below.
+    std::thread::sleep(SETTLE);
+    let diverted: Vec<String> = spawned
+        .dir
+        .files()
+        .into_iter()
+        .filter(|f| f.starts_with("console"))
+        .collect();
+    assert!(
+        diverted.is_empty(),
+        "`-c` must discard `--log-file console`: the file's `to` governs, but the log was \
+         diverted to {diverted:?} (dir listing: {:?})",
+        spawned.dir.files(),
+    );
+    wait_for_the_appenders_own_record("cli -c --log-file console", &mut spawned);
+    assert!(
+        spawned
+            .dir
+            .files_in("logs")
+            .iter()
+            .any(|f| f.starts_with("frps.log.")),
+        "`-c` must keep the file's `to`: no `frps.log.<date>` under `logs/` (dir listing: {:?})",
+        spawned.dir.files(),
+    );
+
+    // Arm 2 — `--log-max-days 3`. The file sets `max_days = 7`; a five-day-old
+    // fixture is expired at 3 and alive at 7, so unmasking `log_max_days` alone
+    // deletes it.
+    let port = free_port();
+    assert!(
+        aged_file_survives_with(
+            "file max_days = 7 + -c + --log-max-days 3",
+            &file_lane_config(port, "max_days = 7\n"),
+            &["-c", "frps.toml", "--log-max-days", "3"],
+            SystemTime::now() - OLDER_THAN_THE_DEFAULT,
+        ),
+        "`-c` must discard `--log-max-days 3`: the file's `max_days = 7` governs, so the \
+         five-day-old fixture survives; unmasking `log_max_days` alone applies the flag's 3 and \
+         deletes it"
+    );
+
+    // Arm 3 — `--log-format json`. The file says `format = "text"`, so the
+    // records must stay text: unmasking `log_format` alone turns stdout into
+    // `"level":"INFO"` JSON records (the startup marker text still appears inside
+    // the JSON `message` field, which is why the assertion keys on the level
+    // field and not on the marker).
+    let port = free_port();
+    let cfg = config(port, "\n[log]\nlevel = \"info\"\nformat = \"text\"\n");
+    let spawned = Spawned::start(&cfg, &["-c", "frps.toml", "--log-format", "json"]);
+    assert_logged_and_listening("cli -c --log-format json", &spawned, port);
+    let out = spawned.stdout();
+    assert!(
+        !out.contains("\"level\":\"INFO\""),
+        "`-c` must discard `--log-format json`: the file's `format = \"text\"` governs, but the \
+         records arrived as JSON\n--- stdout ({} B) ---\n{out}",
+        out.len(),
+    );
+}

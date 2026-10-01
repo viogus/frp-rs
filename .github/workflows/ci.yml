@@ -1047,10 +1047,17 @@ jobs:
         # (`TODO.md:8819`). It is the count of `#[test]`s in that one file, and
         # it lives in exactly one place in this step — the `expected=` line — so
         # a new pin means editing one number, not hunting a duplicated one.
+        #
+        # 10 → 11 with
+        # `cli_file_retention_and_format_flags_do_not_override_the_config_file`,
+        # which closes the coverage hole the four-value `-c` mask left: the
+        # `--log-level` pin alone let a mutant that unmasked `log_file`,
+        # `log_max_days` or `log_format` survive (measured: 10 passed / 0 failed),
+        # so each of the other three withheld values now has its own arm.
         shell: bash
         run: |
           set -eo pipefail
-          expected=10
+          expected=11
           log=/tmp/frps-log-completion-tests.log
           cargo test -p frps --features dashboard --test log_completion --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
