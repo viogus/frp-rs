@@ -534,6 +534,17 @@ pub struct FrpsArgs {
     /// only what does not fit an `int64` (measured on Go v0.71.0:
     /// `-9223372036854775808` rc 0, `9223372036854775807` rc 0,
     /// `9223372036854775808` rc 1 `value out of range`).
+    ///
+    /// **R6(b) (`TODO.md:8737`): "accept-and-ignore matches Go" is bounded.**
+    /// The flag surface is Go's (the full `int64` accepted above), but the value
+    /// that reaches the vhost handler is clamped: `<= 0` floors at 60 s and
+    /// anything above 24 h is capped, where Go has no comparable cap. So the
+    /// bound is "values `<= 0` or below the cap behave like Go"; a positive value
+    /// above 24 h is accepted here and then silently shortened. Measured by the
+    /// unit pin `frp-server/src/vhost.rs:3431` (`test_clamp_vhost_timeout`):
+    /// `0 → 60`, `-1 → 60`, `86400 → 86400`, `86401 → 86400`, `i64::MAX →
+    /// 86400`; the cap is `frp-server/src/vhost.rs:654`
+    /// (`VHOST_TIMEOUT_CAP_SECS`).
     pub vhost_http_timeout: Option<i64>,
     pub strict_config: bool,
     pub show_version: bool,
@@ -686,6 +697,18 @@ fn svr_config() -> impl Parser<Option<String>> {
 /// Go's frps has no such flag (`unknown flag: --config-dir`, rc 1). It is
 /// deliberately **not** part of the `verify` subcommand's surface — see
 /// [`FrpsRootSlots`].
+///
+/// **R6(a) (`TODO.md:8737`): this lane does not read the loaded config's `[log]`
+/// section.** `init_logging(&cli, None)` (`frps/src/main.rs:497`) runs before
+/// `collect_config_files` (`frps/src/main.rs:513`), so the effective log level
+/// comes from the flags alone. Measured over a config dir whose `frps.toml`
+/// writes `[log] level = "warn"`: `frps --config-dir cfg` and
+/// `frps --config-dir cfg --log-level ""` both log at `info` (11 `INFO` records,
+/// 2491–2492 B) with the file's `warn` never consulted, and only an explicit
+/// non-empty `--log-level warn` reaches 0 `INFO`. The empty value resolves to
+/// `info` rather than `frp-core/src/logging.rs:108`'s `_debug_default`,
+/// because that default is compiled in only under the opt-in `debug-logs`
+/// feature. Recorded, not parity: Go has no `--config-dir` lane at all.
 fn svr_config_dir() -> impl Parser<Option<String>> {
     long("config-dir")
         .long("config_dir")
@@ -4747,6 +4770,19 @@ pub fn parse_frpc_args() -> FrpcCmd {
 impl FrpsArgs {
     /// Config file path to load. Falls back to "frps.toml" when `-c` was
     /// not given on the command line.
+    ///
+    /// **R2 (`TODO.md:8715`): this implicit-`./frps.toml` lane is an frp-rs
+    /// extension, not Go parity.** Go binds a server config file only through
+    /// `-c`; with no `-c` its run path keeps the flags-only struct
+    /// (`cmd/frps/root.go:82`) and logs `frps uses command line arguments for
+    /// config` (`cmd/frps/root.go:114-118`), while frp-rs loads `./frps.toml`
+    /// here. The "not supplied" rule for the empty log flags therefore defers
+    /// to a *file* Go would never have read on this lane: measured with a file
+    /// writing `[log] level = "warn"`, `--log-level ""` keeps `warn`
+    /// (0 `INFO`) and `--log-level info` raises it (11 `INFO`) — pinned by
+    /// `frps/tests/log_completion.rs:605`. Making the lane argv-identical to
+    /// Go's flags-only lane is a product decision, not a bug fix; the
+    /// divergence is recorded in `docs/config.md` § `log.level`.
     pub fn config_path(&self) -> String {
         self.config
             .clone()
@@ -5530,7 +5566,7 @@ mod tests {
     /// `frpc`, which never overlays, honoured the file throughout. The resolvers
     /// already model the zero values as absent for both binaries
     /// (`resolve_log_level`/`resolve_log_file`/`resolve_log_max_days`,
-    /// `frp-core/src/logging.rs:101`, `:140`, `:195`).
+    /// `frp-core/src/logging.rs:113`, `:152`, `:207`).
     #[test]
     fn log_flag_zero_values_do_not_override_the_config_file() {
         let mut cfg = crate::config::ServerConfig::default();

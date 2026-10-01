@@ -700,7 +700,7 @@ fn cli_nonempty_log_level_flag_does_not_override_the_config_file() {
 
     // Arm 3: the *implicit* lane's own control. The same flag without `-c` must
     // still raise the level — that is the override #427 kept and the contract at
-    // `frp-core/src/cli.rs:4779-4786`, and it is what proves the mask is scoped
+    // `frp-core/src/cli.rs:4792-4799`, and it is what proves the mask is scoped
     // to the `-c` lane rather than disabling the CLI log flags wholesale.
     let port = free_port();
     let cfg = level_config(port, "warn");

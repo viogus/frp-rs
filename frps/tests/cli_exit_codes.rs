@@ -1881,7 +1881,7 @@ fn version_short_shorthand_clusters_and_equals_spelling_match_go() {
 ///
 /// **What this does not prove.** Only that the argv was *accepted* and a server
 /// came up: with `-c` the config file is authoritative for the transport
-/// section (`cli_overrides_enabled()` is false, `frp-core/src/cli.rs:4784`), so
+/// section (`cli_overrides_enabled()` is false, `frp-core/src/cli.rs:4797`), so
 /// the parsed `tls_only = false` never reaches the service — a mutant that
 /// consumed `=false` but stored `true` would still pass this test. The value
 /// actually being applied is pinned in
