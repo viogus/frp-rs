@@ -172,7 +172,7 @@ async fn stale_failure_cannot_unregister_superseding_control() {
 /// and asserts `plugin_manager.user_info` is `Some`, but the
 /// `#[cfg(not(feature = "http-proxy"))]` stub at
 /// frp-server/src/plugin/mod.rs:8-34 makes the first a no-op (:29) and
-/// the second return `None` (:30-32), so the `assert_eq!` at :3814 cannot
+/// the second return `None` (:30-32), so the `assert_eq!` at :202 cannot
 /// hold in that configuration. Measured: `cargo test -p frp-server
 /// --no-default-features --lib unregister_generation_tests` ->
 /// `48 passed; 1 failed` (`left: None`, `right: Some("fresh")`); with

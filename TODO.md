@@ -1563,7 +1563,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `tests/http_plugin_ping.rs` 4 failed / 1 passed (both files carried no
     `cfg(feature ...)` before this change, measured), plus the lib test
     `control::proxy_ops::unregister_generation_tests::
-    stale_unregister_keeps_fresh_user_record` (in `frp-server/src/control/proxy_ops.rs`; its
+    stale_unregister_keeps_fresh_user_record` (in `frp-server/src/control/proxy_ops/unregister_generation_tests.rs`; its
     `assert_eq!` on `plugin_manager.user_info(...)`) which expects that to be `Some` while the
     `#[cfg(not(feature = "http-proxy"))]` stub (`frp-server/src/plugin/mod.rs:8-34`) makes
     `record_login_user` a no-op (`:29`) and `user_info` return `None` (`:30-32`); the real impl
@@ -1610,10 +1610,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   - `frp-server/tests/http_plugin_ping.rs` — whole-file `#![cfg(feature = "http-proxy")]`.
     Ungated: 1 passed / 4 failed. Gated: 0 tests here, `--features http-proxy --test
     http_plugin_ping` 5 passed / 0 failed.
-  - `frp-server/src/control/proxy_ops.rs`
+  - `frp-server/src/control/proxy_ops/unregister_generation_tests.rs`
     `control::proxy_ops::unregister_generation_tests::stale_unregister_keeps_fresh_user_record`
     — `#[cfg(feature = "http-proxy")]`. Ungated: `--lib unregister_generation_tests` 48 passed /
-    1 failed, `assert_eq!` at `:3814`, `left: None` vs `right: Some("fresh")`. Gated:
+    1 failed, `assert_eq!` at `:202`, `left: None` vs `right: Some("fresh")`. Gated:
     `--features http-proxy` 49 passed / 0 failed.
   - `frp-server/tests/server_protocol.rs` — `#[cfg(feature = "websocket")]` on
     `test_login_via_websocket` (ungated: `WS dial: Transport(Other("WS raw connect read:
@@ -6741,7 +6741,7 @@ nothing about whether the described behaviour still holds.
   over. Measured properly (`scripts/large-functions.sh`, production code only):
   30–55% of the "large" files are inline tests and 36–77% of the "giant" functions
   are comments. By production lines the worst file is `frp-client/src/service.rs`
-  (4930), not `control/proxy_ops/` (3611, of which 4443 of its 8054 raw lines are
+  (4930), not `control/proxy_ops/` (3610, of which 4444 of its 8054 raw lines are
   tests). And **file size hides the real problem**: the largest production function
   in the repository is `run` in `frp-server/src/service.rs` — **1291 code lines**,
   in a file that ranks only 11th by size. Churn agrees: `frp-client/src/service.rs`
@@ -6838,17 +6838,23 @@ nothing about whether the described behaviour still holds.
   in the item.
 
   **Progress (2026-10-01, code head `643dce03` on `refactor/fileify-proxy-ops`, PR #453).** P4
+  **Progress (2026-10-01, code head `2c52916c` on `refactor/fileify-proxy-ops`, PR #453).** P4
   (`frp-server/src/control/proxy_ops`) landed Step 0 plus seams 1–2 as three pure-move commits:
-  `ae91be58` file-ified the inline tests (`proxy_ops.rs` 8054 → `proxy_ops/mod.rs` 3618 +
+  `a4f9064b` file-ified the inline tests (`proxy_ops.rs` (pre-move) 8054 → `proxy_ops/mod.rs` 3618 +
   `unregister_generation_tests.rs` 3790 / `subdomain_conflict_tests.rs` 155 /
-  `tcp_auto_bind_retry_tests.rs` 430), `95af8a32` extracted `validate_new_proxy` + `duplicate_domain`
-  into `proxy_ops/validate.rs` (108), `643dce03` extracted `register_http_vhost` +
-  `register_https_vhost` into `proxy_ops/vhost.rs` (498); `mod.rs` is now 3049 (3039 production) and
-  no file outside `proxy_ops/` was edited in any commit. Evidence: `rustfmt(dedent(body))`
-  `cmp`-identical bodies, identical `-- --list` name sets (68 `proxy_ops` / 460 lib), and a
+  `tcp_auto_bind_retry_tests.rs` 430), `a305ccad` extracted `validate_new_proxy` + `duplicate_domain`
+  into `proxy_ops/validate.rs` (108), `2c52916c` extracted `register_http_vhost` +
+  `register_https_vhost` into `proxy_ops/vhost.rs` (498); `mod.rs` is now 3049 (3040 production, the
+  same boundary as the plan doc — every line before the first `#[cfg(test)]`) and no file outside
+  `frp-server/src/control/proxy_ops/` was edited by the three **code** commits (the records commit
+  touches `TODO.md` + four `docs/*` files). Operator-visible delta, recorded not pinned: the six log
+  sites that moved to `vhost.rs` render `target: frp_server::control::proxy_ops::vhost` instead of
+  `...::proxy_ops` (console/logfile/JSON text; `RUST_LOG` prefix filtering unaffected). Evidence: `rustfmt(dedent(body))`
+  `cmp`-identical bodies at the code head (`unregister_generation_tests.rs` later took one comment-only
+  self-cite fix, review finding F1), identical `-- --list` name sets (68 `proxy_ops` / 460 lib), and a
   literal-VALUE multiset unchanged apart from one added `#[path]` value that keeps
-  `subdomain_conflict_tests`' module path — and its 12 test names — intact. The plan's
-  `8044 / 4432 / 3612` proved stale: re-measured 8054 / 4443 / 3611, and seams 3–8 re-anchored.
+  `subdomain_conflict_tests`' module path — and its 11 test names (12 `fn`s, one a helper) — intact. The plan's
+  `8044 / 4432 / 3612` proved stale: re-measured 8054 / 4444 / 3610, and seams 3–8 re-anchored.
 
 - [x] **Three vendored crates are a standing maintenance liability.**
   Evidence: `vendor/rustls` (TLS, patched), `vendor/yamux` (5 patches),
@@ -8127,6 +8133,7 @@ section; ledger now **24 open / 104 closed**.**
 
 - [x] **Four more test-precision residues the `test-precision-residue` round-2 reviews measured.**
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7630`): a
+  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7204`): a
   test that pins less than its name claims, so a real regression stays green.
   (a) The pinned warning bytes are the shipped static, but the **emitted** record is only
   substring-checked: `frp-core/tests/server_tls_enable_warning.rs:441` asserts
@@ -9266,6 +9273,15 @@ section; ledger now **24 open / 104 closed**.**
 
 - [x] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
   Filed by the coordinator while closing `TODO.md:8533` (PR #430), which removed the two local `pkill -f`
+- [ ] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
+  Filed by the coordinator while closing `TODO.md:8438` (PR #430), which removed the two local `pkill -f`
+  calls in `scripts/compat-test.sh`: `scripts/remote-frps.sh:195` and `:339` still run
+  `pkill -f 'frps -c frps.toml'` and `:409` uses `pgrep -f` on the same text, over ssh, to manage the
+  comparison server on a remote VPS. Name-plus-argument is the same hazard the local sweep just lost — a
+  process on the remote host whose command line merely contains that text is reaped too — but the local
+  `$TEST_DIR/`-prefix baseline and baseline subtraction the new sweep relies on do not exist on the remote
+  side, so the fix needs its own design (a remote pid file, or a port-scoped `fuser` route) rather than a copy
+  of `reap_scoped_strays`. PR #430's residue table names the three call sites.
   **Done-when:** the remote helper reaps by exact pid (a pid file written where it starts the server, or a
   port-scoped lookup) instead of `pkill -f`/`pgrep -f`, or the pattern kill is recorded as required with the
   measurement that shows a pid route is impossible over that ssh path.

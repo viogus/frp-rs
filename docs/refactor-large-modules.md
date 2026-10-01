@@ -105,14 +105,17 @@ re-running the script before acting on them.
 > `frp-server/src/control/proxy_ops/` directory (Step 0, plus seams 1 and 2 —
 > see the seam table below). Rows that name the directory carry those same
 > pre-Step-0 counts unless noted. The Step 0 figures were re-measured at
-> `643dce03` and corrected from the originally recorded `8044 / 4432 / 3612` to
-> `8054 / 4443 / 3611`.
+> `2c52916c` and corrected from the originally recorded `8044 / 4432 / 3612` to
+> `8054 / 4444 / 3610`. **Boundary convention, used consistently below:
+> production = every line before the first `#[cfg(test)]`** (base lines 1–3610;
+> head `mod.rs` lines 1–3040); the remainder is the inline-test /
+> test-declaration region.
 
 | File | Total | Inline tests | **Production** |
 |---|---:|---:|---:|
 | `frp-client/src/service.rs` | 6382 | 1452 | **4930** |
 | `frp-client/src/visitor.rs` | 3850 | 165 | **3685** |
-| `frp-server/src/control/proxy_ops.rs` (pre-Step-0) | 8054 | 4443 | **3611** |
+| `frp-server/src/control/proxy_ops.rs` (pre-Step-0) | 8054 | 4444 | **3610** |
 | `frp-server/src/control/bridge.rs` | 5445 | 2122 | **3323** |
 | `frp-server/src/vhost.rs` | 6331 | 3151 ✅ | **3180** |
 | `frp-server/src/dashboard.rs` | 3910 | 987 | 2923 |
@@ -149,7 +152,7 @@ Last 400 commits, and the subset whose subject matches
 | File | Commits touching it | Touches in fix/audit commits | Production lines |
 |---|---:|---:|---:|
 | `frp-client/src/service.rs` | **53** | **230** | **4930** |
-| `frp-server/src/control/proxy_ops/` | 47 | 112 | 3611 |
+| `frp-server/src/control/proxy_ops/` | 47 | 112 | 3610 |
 | `frp-server/src/vhost.rs` | 40 | 94 | 3180 |
 | `frp-server/src/control/login.rs` | 40 | — | — |
 | `frp-client/src/work_conn.rs` | 37 | 85 | — |
@@ -213,7 +216,7 @@ only textual change is one level of de-indentation.
 
 | File | Now | After | Reduction |
 |---|---:|---:|---:|
-| `frp-server/src/control/proxy_ops.rs` | 8054 | 3611 | **55%** |
+| `frp-server/src/control/proxy_ops.rs` | 8054 | 3610 | **55%** |
 | `frp-server/src/vhost.rs` | 6331 | **3179** | **50%** ✅ |
 | `frp-server/src/control/bridge.rs` | 5445 | ~3320 | 39% |
 | `frp-server/src/ssh_gateway.rs` | 4865 | ~2740 | 44% |
@@ -228,14 +231,14 @@ the 3 module-scaffolding lines (`#[cfg(test)]`, `mod tests {`, the closing `}`).
 **landed**: the body now lives formatted (3144 lines) in `frp-server/src/vhost/tests.rs` and
 `frp-server/src/vhost.rs` is **3179** lines. See P7.
 
-**Landed** (`refactor/fileify-proxy-ops`, PR #453, commit `ae91be58`): the base
+**Landed** (`refactor/fileify-proxy-ops`, PR #453, commit `a4f9064b`): the base
 file measured 8054 lines (not 8044); it split into
 `frp-server/src/control/proxy_ops/mod.rs` (3618 lines) plus
 `unregister_generation_tests.rs` (3790), `subdomain_conflict_tests.rs` (155) and
-`tcp_auto_bind_retry_tests.rs` (430) — production lines 3611, i.e. the row above
+`tcp_auto_bind_retry_tests.rs` (430) — production lines 3610, i.e. the row above
 was re-measured and the stale `8044 / 4432 / 3612` corrected to
-`8054 / 4443 / 3611`. The same PR then landed seams 1 and 2, taking `mod.rs` to
-3049 lines (3039 production). Caveat: `scripts/large-functions.sh` treats the
+`8054 / 4444 / 3610`. The same PR then landed seams 1 and 2, taking `mod.rs` to
+3049 lines (3040 production, same boundary). Caveat: `scripts/large-functions.sh` treats the
 sibling test files as production now that they are ordinary `.rs` files, so read
 `frp-server/src/control/proxy_ops/` as a whole rather than trusting its per-file
 table.
@@ -265,12 +268,16 @@ Constraints that make it safe:
   `handle_new_proxy`, `unregister_control`,
   `release_udp_port_with_owner_check` and
   `remove_proxy_and_release_client_counts` keep resolving at their original
-  visibility. `git diff --name-only` for `ae91be58` lists only the five
+  visibility. `git diff --name-only` for `a4f9064b` lists only the five
   `proxy_ops*` paths — no external referencing file was touched. (There is also an
   eighth production caller, `frp-server/src/service.rs:1678`
   `crate::control::proxy_ops::unregister_control(`, which resolves the same way.)
 - Validation: `cargo test -p frp-server --lib -- --list` must report an identical
-  test-name set; `git diff -M` must show the move.
+  test-name set; and the move must be visible in `git diff -M --name-only`.
+  **Correction (PR #453):** do *not* require `git diff -M` to report the move as a
+  rename — it does not. The `proxy_ops.rs` → `proxy_ops/mod.rs` split measures 38%
+  similarity (3049/8054), below git's 50% default, so `--summary` reports
+  `delete` + `create`. `--name-only` is the checkable form.
 - **Correction to the "empty literal grep" hard check.** `git diff -U0 |
   grep -E '^[+-].*"'` **cannot** be empty for any file-to-file move: a move emits
   every relocated line as both a `-` and a `+`, so every relocated string literal
@@ -479,15 +486,15 @@ little to catch a mistake in the moved code. Recommend doing this **after**
 (`frp-server/tests/xtcp_hole_punch.rs`, `frp-core/tests/xtcp_p2p.rs`) and the daily
 `xtcp-compat.yml` matrix.
 
-### P4 — `frp-server/src/control/proxy_ops/` (3611 production lines at base, 34 production fns)
+### P4 — `frp-server/src/control/proxy_ops/` (3610 production lines at base, 34 production fns)
 
-At base, production code was lines 1–3610 and the remaining 4443 lines were inline
-tests. **Step 0 landed in PR #453** (`ae91be58`): `proxy_ops.rs` (8054 lines) became
+At base, production code was lines 1–3610 and the remaining 4444 lines were inline
+tests. **Step 0 landed in PR #453** (`a4f9064b`): `proxy_ops.rs` (8054 lines) became
 `proxy_ops/mod.rs` (3618) plus three sibling test files, taking the production file
-to 3611 lines with no logic and no path change. Re-measured figures are
-8054 / 4443 / 3611 — not the originally recorded 8044 / 4432 / 3612. Seams 1 and 2
-then landed as `95af8a32` and `643dce03`, taking `mod.rs` to 3049 lines (3039
-production).
+to 3610 lines with no logic and no path change. Re-measured figures are
+8054 / 4444 / 3610 (same boundary as the provenance note above) — not the originally
+recorded 8044 / 4432 / 3612. Seams 1 and 2 then landed as `a305ccad` and
+`2c52916c`, taking `mod.rs` to 3049 lines (3040 production).
 
 Two structural facts dominate everything after that:
 
@@ -501,20 +508,20 @@ Two structural facts dominate everything after that:
 directory keeps **every external path byte-identical** *without* any
 `pub(crate) use` re-export: a file module and an inline module have the same module
 path, so the originals' visibility carries over unchanged. Measured in PR #453 —
-`git diff --name-only` for `ae91be58` lists only the five `proxy_ops*` paths.
+`git diff --name-only` for `a4f9064b` lists only the five `proxy_ops*` paths.
 
 **(b) No `AppState` field is private** (only the three group controllers are
 `pub(crate)`), so **no field-visibility change is needed for any seam**. There is
 no `unsafe` in the file.
 
 Seams, in the order they should be attempted (line numbers for the remaining rows
-are current `mod.rs` positions at `643dce03`):
+are current `mod.rs` positions at `2c52916c`):
 
 | Order | New module | Moves | Risk |
 |---|---|---|---|
-| 0 | *(directory + test modules)* — **landed `ae91be58`** | see Step 0: `mod.rs` + `unregister_generation_tests.rs`, `subdomain_conflict_tests.rs`, `tcp_auto_bind_retry_tests.rs` | **lowest** |
-| 1 | `proxy_ops/validate.rs` — **landed `95af8a32`** | `validate_new_proxy` (was 891–961, pure), `duplicate_domain` (was 68–77) + its test module (now `validate/subdomain_conflict_tests.rs`) | low — zero `AppState` coupling, self-testing |
-| 2 | `proxy_ops/vhost.rs` — **landed `643dce03`** | `register_http_vhost` (was 968–1213), `register_https_vhost` (was 1221–1441) | low — already fully extracted; no test region references them |
+| 0 | *(directory + test modules)* — **landed `a4f9064b`** | see Step 0: `mod.rs` + `unregister_generation_tests.rs`, `subdomain_conflict_tests.rs`, `tcp_auto_bind_retry_tests.rs` | **lowest** |
+| 1 | `proxy_ops/validate.rs` — **landed `a305ccad`** | `validate_new_proxy` (was 891–961, pure), `duplicate_domain` (was 68–77) + its test module (now `validate/subdomain_conflict_tests.rs`) | low — zero `AppState` coupling, self-testing |
+| 2 | `proxy_ops/vhost.rs` — **landed `2c52916c`** | `register_http_vhost` (was 968–1213), `register_https_vhost` (was 1221–1441) | low — already fully extracted; no test region references them |
 | 3 | `proxy_ops/tcp_group.rs` | `tcp_group_listener` (`mod.rs:2703–2856`), `handle_tcp_group_member_registration` (`mod.rs:2867–2977`) | low — leaves, owned args |
 | 4 | `proxy_ops/registry.rs` | `build_proxy_info` (`mod.rs:404`), `register_sk_index` (`mod.rs:483`), `register_proxy_entry` (`mod.rs:784–871`), the three `rollback_*` (`mod.rs:502`, `710`, `731`, `753`), `remove_proxy_and_release_client_counts` (`mod.rs:679–699`) | medium-low |
 | 5 | `proxy_ops/ports.rs` | `PortError`, `allocate_proxy_port` (`mod.rs:161–399`), the rollback/free helpers, the reservation pruner + its `impl AppState` (`mod.rs:2984`, `2995`) | medium-low |
