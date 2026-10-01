@@ -109,10 +109,10 @@ impl Drop for DirRegistryEntry {
 ///
 /// So this type records instead: [`Self::record`] is called by the main task's
 /// listener the moment a signal is delivered, and it (a) sets `requested`,
-/// (b) wakes [`Self::recorded`] waiters, and (c) cancels the shutdown token of
-/// every service that registered through [`Self::watch`]. `watch` and `record`
-/// read `requested` and `states` in orders that cannot both miss a service —
-/// see the call site in the per-file task.
+/// (b) wakes the test-profile `recorded()` waiters, and (c) cancels the shutdown
+/// token of every service that registered through [`Self::watch`]. `watch` and
+/// `record` read `requested` and `states` in orders that cannot both miss a
+/// service — see the call site in the per-file task.
 ///
 /// A *second* request is a different matter: with nothing registered there is no
 /// service to cancel and the caller may be stuck before its first one, so
@@ -122,7 +122,7 @@ impl Drop for DirRegistryEntry {
 #[cfg(unix)]
 struct EarlyShutdown {
     /// Set by the recorder the moment a shutdown signal is delivered. Read by
-    /// [`Self::watch`] (inline cancel) and [`Self::recorded`].
+    /// [`Self::watch`] (inline cancel) and by the test-profile `recorded()`.
     requested: std::sync::atomic::AtomicBool,
     /// Woken on the same edge so a task held open by the debug-only
     /// registration window (`FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS`) can
@@ -253,6 +253,15 @@ impl EarlyShutdown {
 
     /// Resolves once a shutdown signal has been recorded — at once if one
     /// already was.
+    ///
+    /// Test-profile only. Both callers are spawn-level holds behind
+    /// `debug_assertions` (`FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS` and
+    /// `FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS`), so a release build has no
+    /// way to await this and the release CI jobs (`-D warnings`) would fail the
+    /// build on the dead method. The gate sits on the method itself: an
+    /// `allow(dead_code)` would hide the same warning for anything else that
+    /// later becomes release-dead.
+    #[cfg(debug_assertions)]
     async fn recorded(&self) {
         if self.requested.load(std::sync::atomic::Ordering::SeqCst) {
             return;
@@ -316,12 +325,13 @@ async fn main() {
 /// * success is `frps: the configuration file %s syntax is ok` on **stdout**,
 ///   exit 0 (`:56`).
 ///
-/// The loader is [`load_server_config_checked`] — [`load_server_config`] plus
+/// The loader is [`load_server_config_checked`] —
+/// [`frp_core::config::load_server_config`] plus
 /// [`frp_core::config::check_server_unsafe_features`]. The parse-and-validate
 /// half is the same path the run path uses: the run path's single-config branch
-/// calls [`load_server_config_uncompleted`] (the same function minus
-/// `ServerConfig::complete`) and completes the merged config itself, and both go
-/// through `load_config_from_file` with `known_server_keys` and
+/// calls [`frp_core::config::load_server_config_uncompleted`] (the same function
+/// minus `ServerConfig::complete`) and completes the merged config itself, and
+/// both go through `load_config_from_file` with `known_server_keys` and
 /// `validate_server_config`. `verify` has no CLI overrides to merge, so it takes
 /// the completing wrapper. The consequence is that `verify` accepts exactly the
 /// configs `frps -c` accepts and refuses the ones it refuses: parse and
