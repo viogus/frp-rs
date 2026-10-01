@@ -258,8 +258,10 @@ jobs:
           # `scripts/tests/repo-health-fixtures.sh:666`) plus the mandatory
           # `SCEN7_REGION_SHA` refresh left this step green at exit 0 with
           # `RESULT: 32 fixture check(s) hold` and `pinned regions verified 2/2`.
-          # (scenario-7, not scenario-6: the canary hashes scenario-6's region off
-          # the real file, so a scenario-6 decoy already reds in-suite.) So an
+          # Any `SCEN*` region works for this recipe once its pin is refreshed:
+          # with the decoy pair placed *before* the real region, `region_lines`
+          # hashes the decoy, so the scenario-6 canary accepts the refreshed pin
+          # and stays green (measured with a scenario-6 decoy as well as 7). So an
           # emitted failure line is fatal here on its own: the evidence chain may
           # not report a green run that reported a failure. An honest run prints no
           # such line (measured: zero lines starting with `FAIL` or `  FAIL`), and
@@ -384,8 +386,8 @@ jobs:
         # closed — examples: `region_lines` stops at the first end marker (a decoy
         # end marker truncates the hashed text); the unguarded accept-direction
         # `region_pin_check` in `enforce_substance`'s mutation-probe caller loop
-        # (`scripts/tests/compat-stray-guard.sh:828`) is a one-file neuter; and that
-        # loop's ledger assertion (`scripts/tests/compat-stray-guard.sh:833`) is the
+        # (`scripts/tests/compat-stray-guard.sh:842`) is a one-file neuter; and that
+        # loop's ledger assertion (`scripts/tests/compat-stray-guard.sh:847`) is the
         # sole catcher of a forged `MUTATION_PROBE_RECORD`. The list is not
         # exhaustive — the reject-direction block above the assertion and the
         # `region_hash_verdict … || return 1` call are the same shape.
@@ -401,7 +403,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=f1d2a51eb2aa2c350c45c8ae141b585c90eaa9d90819674cdcf20be1fece6ceb
+          guard_pin=d59194f48fe1594582286a86111bbd9cc3d08024f32ce44bd998ac774f547a42
           # R12-1 (adversarial round 13): the enforcer's *implementation* lives in
           # the library the scenarios `source` (the `LIB=` assignment at :96 only
           # names it), so pinning only the suite left the "two-file change" claim
@@ -490,7 +492,7 @@ jobs:
           # `FAIL  pinned-region set changed: markers name [scenario-2
           # scenario-10 scenario-10 scenario-12 scenario-13], expected …`;
           # neutering that one call (`|| return 1` → `|| true`,
-          # `scripts/tests/compat-stray-guard.sh:879`) plus the mandatory in-file
+          # `scripts/tests/compat-stray-guard.sh:885`) plus the mandatory in-file
           # pin refresh left this step green at exit 0. So an emitted failure line
           # is fatal here on its own: the evidence chain may not report a green
           # run that reported a failure. An honest run prints no such line

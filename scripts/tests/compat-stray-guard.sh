@@ -190,21 +190,27 @@ fails=0
 # decoy `# --- end substance pin: scenario-10 ---` truncates the hashed text
 # (still needs a refreshed pin to stay green); the accept-direction line in
 # `enforce_substance`'s mutation-probe caller loop
-# (`scripts/tests/compat-stray-guard.sh:828`,
+# (`scripts/tests/compat-stray-guard.sh:842`,
 # `region_pin_check "$name" "$const" "$got" "$copy" 2>/dev/null || mutated_fail=1`)
 # is a single unguarded command that a one-file edit can neuter; and that loop's
-# ledger assertion (`scripts/tests/compat-stray-guard.sh:833`) is the sole catcher
+# ledger assertion (`scripts/tests/compat-stray-guard.sh:847`) is the sole catcher
 # of a forged `MUTATION_PROBE_RECORD` — neutering it alone stays green on a healthy
 # guard. The list is not exhaustive: the reject-direction block just above the
 # assertion and the `region_hash_verdict … || return 1` call are the same shape.
 # R18 (F1, adversarial round 17) named the third one and changed its disposition:
 # `region_set_verdict "$found" "${PINNED_REGIONS:-}" || return 1`
-# (`scripts/tests/compat-stray-guard.sh:879`) is a one-file neuter that leaves this
+# (`scripts/tests/compat-stray-guard.sh:885`) is a one-file neuter that leaves this
 # suite printing `FAIL  pinned-region set changed: …` and still exiting 0 with
 # `RESULT: 40 fixture check(s) hold` (measured). The call is not repaired here —
-# it stays declared — but the `Stray guard` CI step now refuses any emitted
-# failure line, so that mutant reds in CI even with the caller neutered
-# (measured), and an un-neutered failure is fatal in both places.
+# it stays declared — but the `Stray guard` CI step now rejects a log line
+# starting with `FAIL` or `  FAIL` (the two shapes the suites emit: this suite at
+# column 0, the sibling's `bad()` with two leading spaces), so that mutant reds in
+# CI even with the caller neutered (measured), and an un-neutered failure is fatal
+# in both places. The net is prefix-literal, deliberately not a substring match:
+# the sibling's honest run prints two `  ok` sentences containing the word
+# mid-line, so `*FAIL*` would red a passing run (measured). Rewriting the failure
+# text to ` fail` or a TAB prefix would slip past, but that is an L2-class
+# pinned-suite edit — the declared residue above, not a boundary of this net.
 #
 # A floor of 0 (or an unset floor) disables the guard from inside, which the
 # sibling suite learned the hard way; that is a failure here too. So is a
