@@ -1305,6 +1305,123 @@ jobs:
         # shortest aborted at the first failing lib target). `--no-fail-fast`
         # keeps every later target running when an unrelated lib test fails.
         run: cargo test -p frp-client --no-default-features --all-targets -j 1 --no-fail-fast
+  # The release-profile CLI lane. `cargo test --release -p frps --test
+  # cli_exit_codes` used to be red in every release build (41 passed / 3 failed)
+  # because three pins drive `#[cfg(debug_assertions)]` hooks in
+  # `frps/src/main.rs` (`:620`, `:697`, `:741`) that a release binary does not
+  # compile. Those three tests now carry
+  # `#[cfg_attr(not(debug_assertions), ignore = "<reason>")]`; `ignore` (not
+  # `#[cfg]`) is what keeps them compiled and *counted* in both profiles, and
+  # `FRPS_RELEASE_CLI_TESTS` below is the same 44 as the tests-unit lane's
+  # `FRPS_CLI_TESTS` on purpose.
+  #
+  # This job is what makes the skip observable: it asserts the exact summary
+  # line (41 passed; 0 failed; 3 ignored) and the exact three ignored names, so
+  # the release lane cannot widen its own skip set, drop a test, or lose the
+  # target and still pass.
+  #
+  # What this lane does *not* defend: turning those three attributes into an
+  # unconditional `#[ignore]`. That yields byte-identical release output, so the
+  # guard below exits 0 by design. Blanket ignoring is caught by the
+  # pre-existing debug lane in `tests-unit` instead: `FRPS_CLI_TESTS: "44"`
+  # (`:278`) requires `test result: ok. 44 passed; 0 failed` (`:747`), so an
+  # unconditional `#[ignore]` fails hard there. The two guards cover different
+  # axes and neither makes the other redundant.
+  #
+  # Deliberately absent from `build`'s `needs` list: a cold release build costs
+  # ~5m at `-j 2` and must not serialize the artifact job. A red lane here
+  # blocks a merge only if branch protection names it ("Tests (release
+  # profile)").
+  release-tests:
+    name: Tests (release profile)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FRPS_RELEASE_CLI_TESTS: "44"
+      # Exactly these three and no more: the test function names, in file order
+      # (the guard sorts both sides), that carry the release-only skip in
+      # `frps/tests/cli_exit_codes.rs`.
+      FRPS_RELEASE_CLI_IGNORED: "config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorded_request config_dir_recorded_signal_fans_out_to_an_already_registered_service config_dir_where_every_task_panics_exits_nonzero"
+    steps:
+      - uses: actions/checkout@v4
+      # Restore only. Two lanes SAVE this cache, each under its own key
+      # namespace — `tests-server` (`${os}-cargo-…`) and `build`
+      # (`${os}-cargo-release-…`) — so a third saver here would only race them.
+      # The `-cargo-release-` restore-key picks up `build`'s release artifacts
+      # when they exist (main/tag pushes); otherwise this falls back to the
+      # shared cache and pays a cold, LTO-free release build.
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-cargo-release-tests-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-cargo-
+      # Compiler from `rust-toolchain.toml` (see `docs/developing.md` § Toolchain
+      # pinning); `rustup toolchain install` with no argument resolves that file's
+      # channel, while the image's `stable` would not satisfy a version pin.
+      - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
+        run: rustup toolchain install --no-self-update
+      # Same profile the `build` job uses, so its release artifacts come back from
+      # the cache and the binary under test is built exactly as this lane
+      # describes. The one axis left untested is fat-LTO codegen; `debug_assertions`
+      # — the axis these pins depend on — is identical either way.
+      - name: Use the CI release profile (LTO disabled for CI speed)
+        run: |
+          mkdir -p .cargo
+          printf '[profile.release]\nlto = false\nopt-level = 2\n' >> .cargo/config.toml
+      - name: Run frps CLI exit-code pins in the release profile
+        shell: bash
+        run: |
+          set -eo pipefail
+          log=/tmp/frps-release-cli-tests.log
+          cargo test --release -p frps --test cli_exit_codes --color never 2>&1 | tee "$log"
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+
+          expected_ignored=$(printf '%s\n' $FRPS_RELEASE_CLI_IGNORED | wc -l | tr -d ' ')
+          expected_passed=$((FRPS_RELEASE_CLI_TESTS - expected_ignored))
+
+          if ! grep -q 'Running tests/cli_exit_codes.rs' "$log.plain"; then
+            echo "error: the release run never built tests/cli_exit_codes.rs:" >&2
+            cat "$log.plain" >&2
+            exit 1
+          fi
+
+          if ! grep -q "test result: ok. ${expected_passed} passed; 0 failed; ${expected_ignored} ignored;" "$log.plain"; then
+            echo "error: expected 'test result: ok. ${expected_passed} passed; 0 failed; ${expected_ignored} ignored;'." >&2
+            echo "       a widened release skip (or a pin that stopped being skipped)" >&2
+            echo "       must not pass this lane. Every 'test result' line:" >&2
+            grep 'test result' "$log.plain" >&2 || true
+            exit 1
+          fi
+
+          # Both sides are sorted before comparing: the env var lists the three
+          # names in the order the tests appear in the file, not alphabetically.
+          expected_ignored_sorted=$(printf '%s\n' $FRPS_RELEASE_CLI_IGNORED \
+            | sort | tr '\n' ' ' | sed -E 's/ +$//')
+          ignored=$(sed -nE 's/^test (.*) \.\.\. ignored.*$/\1/p' "$log.plain" \
+            | sort | tr '\n' ' ' | sed -E 's/ +$//')
+          if [[ "$ignored" != "$expected_ignored_sorted" ]]; then
+            echo "error: the ignored set is not the three release-only pins." >&2
+            echo "       expected: $expected_ignored_sorted" >&2
+            echo "       actual:   $ignored" >&2
+            exit 1
+          fi
+
+          # `ignore` keeps both profiles listing the same tests; assert that
+          # rather than trusting the summary line alone.
+          n=$(cargo test --release -p frps --test cli_exit_codes --color never -- --list 2>&1 \
+            | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          if [[ "$n" != "$FRPS_RELEASE_CLI_TESTS" ]]; then
+            echo "error: release lists $n tests, expected $FRPS_RELEASE_CLI_TESTS (the same set the" >&2
+            echo "       debug lane pins with FRPS_CLI_TESTS). Update both literals together." >&2
+            exit 1
+          fi
+
+          echo "release cli_exit_codes lane ok: $n listed, ${expected_passed} passed, ${expected_ignored} ignored (${ignored// /, }), 0 failed"
   tests-server:
     name: Tests (server integration)
     runs-on: ubuntu-latest
