@@ -133,6 +133,21 @@ fails=0
 # batch-E report records it for TODO.md. The scenarios outside those regions
 # (1, 3–9b, 11) are unpinned; a body gutted there still needs a reviewer.
 #
+# Round 12 closes the one-line routes the round-10 adversarial reopened: a
+# `case` whitelist over the expectations, a `case` that skips every name but one,
+# a `region_sha` that fabricates a digest, or replacing the real pin loop's call
+# with an assigned count — each used to leave every in-file check green while the
+# regions went unhashed. The count is now the hasher's own `name=digest` ledger
+# (`region_hash_verdict`), so no call site can claim a count it did not earn; a
+# content-mutation probe hashes a one-byte-different copy of two pinned regions
+# and requires the honest comparison to reject it; and the `health` CI step pins
+# this file's own sha256 *before* running it, so weakening the enforcer here also
+# requires editing `.github/workflows/ci.yml`. That is the honest boundary: the
+# guard catches careless single-region edits, and an edit to the guard itself is
+# now a two-file change a reviewer sees. It does not prevent pin removal — an
+# edit here plus a refreshed `SCEN*_REGION_SHA` (L2), or a forged summary and
+# evidence block (L1), is still green. Those stay declared residues, not defences.
+#
 # A floor of 0 (or an unset floor) disables the guard from inside, which the
 # sibling suite learned the hard way; that is a failure here too. So is a
 # zero-padded floor: `00`/`000` are all digits but denote 0, so the floor is
@@ -325,12 +340,24 @@ find_hash_tool() {
   return 1
 }
 HASH_TOOL=$(find_hash_tool) || HASH_TOOL=''
+# The hasher's own ledger (round 12, R10-1). `REGION_HASHED` counts the digests
+# `region_sha` actually computed and `REGION_HASHED_RECORD` is the `name=digest`
+# list it produced, so a caller that bypasses the real `run_pin_checks`
+# invocation — even by assigning the count it expects — leaves the ledger short
+# and reds `region_hash_verdict`. `region_sha` is only ever called directly from
+# this shell (never in a `$( … )` subshell), so the writes escape.
+REGION_HASHED=0
+REGION_HASHED_RECORD=''
+REGION_SHA_VALUE=''
 
 region_sha() {   # $1 = region name, spelled as between the `substance pin:` markers
   # $2 = the file to read the region from. The *caller* chooses the path, so the
   # callee cannot report an input of its own choosing (round 9, F3), and the
-  # read-path canary in `enforce_substance` proves the read follows it.
+  # read-path canary in `enforce_substance` proves the read follows it. The
+  # digest is returned in `REGION_SHA_VALUE` rather than on stdout (round 12) so
+  # the callers stay in the current shell and the ledger above is real.
   local name=$1 file=$2 hash
+  REGION_SHA_VALUE=''
   if [ -z "${HASH_TOOL:-}" ]; then
     printf 'FAIL  no sha256 tool at an absolute path (need sha256sum or shasum); cannot check the %s substance pin\n' "$name" >&2
     return 1
@@ -342,7 +369,10 @@ region_sha() {   # $1 = region name, spelled as between the `substance pin:` mar
   # shellcheck disable=SC2086  # $HASH_TOOL is the word-split "<abs path> -a 256"
   hash=$(sed -n "/^# --- substance pin: ${name} /,/^# --- end substance pin: ${name} ---/p" "$file" |
     $HASH_TOOL | awk '{print $1}')
-  printf '%s\n' "$hash"
+  REGION_HASHED=$((REGION_HASHED + 1))
+  REGION_HASHED_RECORD="${REGION_HASHED_RECORD:+$REGION_HASHED_RECORD }${name}=${hash}"
+  REGION_SHA_VALUE=$hash
+  return 0
 }
 # --- the enforcer's comparisons, in one place each ----------------------------
 # The real checks and the canary in `enforce_substance` both go through these,
@@ -354,18 +384,22 @@ region_set_mismatch() { [ "$1" != "$2" ]; }
 region_count_mismatch() { [ "$1" -ne "$2" ]; }
 
 # $1 = region name, $2 = pinned constant name (for the diagnostic), $3 = the
-# pinned expectation. Hashes the region the enforcer was started from: the path
-# comes from `SELF_REAL`, frozen at startup, never from `$self`, so reassigning
-# `self` after startup cannot move the bytes being read (round 9, F3) — and that
-# reassignment is itself a failure below.
+# pinned expectation, $4 = the file to read the region from (defaults to
+# `SELF_REAL`, the file the enforcer was started from). The path comes from
+# `SELF_REAL`, frozen at startup, never from `$self`, so reassigning `self` after
+# startup cannot move the bytes being read (round 9, F3) — and that reassignment
+# is itself a failure below. The content-mutation probe passes a deliberately
+# mutated copy so this same comparison is exercised against bytes the pin must
+# reject (round 12, M3).
 region_pin_check() {
-  local name=$1 const=$2 want=$3 got
+  local name=$1 const=$2 want=$3 file=${4:-${SELF_REAL:-}} got
   if [ -z "${SELF_REAL:-}" ] || [ "${self:-}" != "${SELF_REAL:-}" ]; then
     printf 'FAIL  %s substance pin: the enforcer path changed after startup (self=%s, bound at startup=%s)\n' \
       "$name" "${self:-<unset>}" "${SELF_REAL:-<unset>}" >&2
     return 1
   fi
-  got=$(region_sha "$name" "$SELF_REAL") || return 1
+  region_sha "$name" "$file" || return 1
+  got=$REGION_SHA_VALUE
   if [ "$got" != "$want" ]; then
     printf 'FAIL  %s region changed: sha256 %s, pinned %s\n' \
       "$name" "${got:-<none>}" "$want" >&2
@@ -411,14 +445,67 @@ region_count_verdict() {
   return 0
 }
 
-# One checked region, counted whether or not it matched. Both the real loop and
-# the canary call this, so swallowing a mismatch (`|| true`) or dropping the
-# call leaves the counters the canary inspects unchanged. `PIN_CHECKED` and
-# `PIN_FAILS` are globals initialised at the top of `enforce_substance`;
-# `record_pin_check` is always called directly, never in a `$( … )` subshell, so
-# the increments do escape.
+# $1 = the `name=digest` record `region_sha` accumulated, $2 = the record the
+# pinned entries imply. Round 12, R10-1: a caller can assign a *count*
+# (`PIN_CHECKED=$PINNED_REGION_COUNT` was the round-10 bypass), so the count
+# alone cannot prove the loop ran — this record can only be produced by hashing
+# every pinned region, and a bypass of the real `run_pin_checks` invocation
+# leaves it empty.
+region_hash_verdict() {
+  if region_set_mismatch "$1" "$2"; then
+    printf 'FAIL  the region hasher recorded [%s], expected [%s]: the real pin loop did not hash every pinned region\n' \
+      "${1:-<none>}" "${2:-<none>}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# $1 = region name, $2 = pinned constant name, $3 = the pinned digest, $4 = a
+# directory to build the mutated copy in. Round 12 (M3): the shape-identical pin
+# canary only ever feeds a `want` outside the pinned set, so it cannot see a
+# comparison that returns a verdict without reading the bytes. This probe
+# requires (a) `region_sha` of the same region to differ between the real file
+# and a copy that differs by one byte, (b) the honest comparison to reject that
+# copy, and (c) it to accept the same copy against the digest the copy really
+# has. A name-keyed `region_sha`, a path whitelist or a `got=$want` comparison
+# cannot satisfy all three for two different regions.
+mutation_probe() {
+  local name=$1 const=$2 want=$3 dir=$4 copy honest mutated
+  if [ -z "${SELF_REAL:-}" ]; then
+    printf 'FAIL  enforcer canary: cannot run the content-mutation probe without the enforcer path\n' >&2
+    return 1
+  fi
+  copy=$dir/mutated-$name.sh
+  if ! sed "s/^# --- substance pin: ${name} /&mutated /" "$SELF_REAL" > "$copy" 2>/dev/null; then
+    printf 'FAIL  enforcer canary: cannot build the one-byte-different %s copy for the content probe\n' "$name" >&2
+    return 1
+  fi
+  region_sha "$name" "$SELF_REAL" || return 1
+  honest=$REGION_SHA_VALUE
+  region_sha "$name" "$copy" || return 1
+  mutated=$REGION_SHA_VALUE
+  if [ "$honest" = "$mutated" ]; then
+    printf 'FAIL  enforcer canary: region_sha returned %s for both the %s region and a one-byte-different copy; the comparison is not reading the bytes it is given\n' \
+      "${honest:-<none>}" "$name" >&2
+    return 1
+  fi
+  if region_pin_check "$name" "$const" "$want" "$copy" 2>/dev/null; then
+    printf 'FAIL  enforcer canary: the comparison accepted a one-byte-different %s copy as matching its pin; the pin is not bound to the bytes\n' "$name" >&2
+    return 1
+  fi
+  if ! region_pin_check "$name" "$const" "$mutated" "$copy" 2>/dev/null; then
+    printf 'FAIL  enforcer canary: the comparison rejected the mutated %s copy even against the digest that copy really has; the comparison is not bound to the path it is given\n' "$name" >&2
+    return 1
+  fi
+  return 0
+}
+
+# One checked region, its mismatch counted. Both the real loop and the canary
+# call this, so swallowing a mismatch (`|| true`) or dropping the call leaves
+# `PIN_FAILS` unchanged and the canary reds. The *number* of regions checked is
+# not counted here (round 12, R10-1): that ledger lives inside `region_sha`, so
+# no call site can spoof the count without actually hashing.
 record_pin_check() {   # $1 = region name, $2 = constant name, $3 = expectation
-  PIN_CHECKED=$((PIN_CHECKED + 1))
   region_pin_check "$1" "$2" "$3" || PIN_FAILS=$((PIN_FAILS + 1))
 }
 
@@ -447,20 +534,19 @@ EOF
 }
 
 enforce_substance() {
-  local name const want found region_entries
+  local name const want found region_entries expected_record mutation_dir
   local canary_right canary_wrong canary_missing
-  local canary_checked canary_fails canary_ok_checked canary_ok_fails
+  local canary_hashed canary_fails canary_ok_hashed canary_ok_fails
   # F2 (adversarial round 5): every guarded read below uses `${var:-}` so that a
   # deleted definition reaches an explicit FAIL instead of expanding unbound.
   # Under `set -u` an unbound expansion *inside the EXIT trap* prints its error,
   # leaves bash exiting 0 and silently skips the gate (measured: delete
   # `PINNED_REGION_COUNT` → rc 0, CI green). The trap calls are also wrapped in
   # subshells so any future fatal error becomes a nonzero rc rather than exit 0.
-  PIN_CHECKED=0
   PIN_FAILS=0
   found=$(sed -n 's/^# --- substance pin: \([^ ]*\).*/\1/p' "${SELF_REAL:-}" | tr '\n' ' ')
   found=${found% }
-  # --- the enforcer canary (round 5 F7; loop-driven, round 9 F1/F2) -----------
+  # --- the enforcer canary (round 5 F7; loop-driven, round 9 F1/F2; 12) --------
   # The pins only mean something while the code that reads them works, and that
   # code lives here in the same unpinned prologue. So the canary injects a
   # *shape-identical* wrong expectation — the real pin with every hex digit
@@ -468,49 +554,85 @@ enforce_substance() {
   # outcomes: the wrong value must be recorded as a mismatch and the real value
   # must be accepted. Neutering the comparison (`got=$want`, `if false`),
   # whitelisting a sentinel shape, rejecting everything, or bypassing the loop's
-  # call site all leave one of the outcomes wrong and red the suite here.
+  # call site all leave one of the outcomes wrong and red the suite here. The
+  # hasher's own ledger is asserted too, so a path that reports a verdict
+  # without reading the file reds even when the verdict looks right.
   canary_right=${SCEN2_REGION_SHA:-}
   canary_wrong=$(flip_hex "$canary_right")
-  PIN_CHECKED=0
   PIN_FAILS=0
+  REGION_HASHED=0
+  REGION_HASHED_RECORD=''
   run_pin_checks "scenario-2 SCEN2_REGION_SHA ${canary_wrong}" 2>/dev/null
-  canary_checked=$PIN_CHECKED
+  canary_hashed=$REGION_HASHED
   canary_fails=$PIN_FAILS
-  PIN_CHECKED=0
   PIN_FAILS=0
+  REGION_HASHED=0
+  REGION_HASHED_RECORD=''
   run_pin_checks "scenario-2 SCEN2_REGION_SHA ${canary_right}" 2>/dev/null
-  canary_ok_checked=$PIN_CHECKED
+  canary_ok_hashed=$REGION_HASHED
   canary_ok_fails=$PIN_FAILS
-  if [ "$canary_checked" -ne 1 ] || [ "$canary_fails" -ne 1 ]; then
-    printf 'FAIL  enforcer canary: an injected wrong pin was not recorded as a mismatch (checked=%s, fails=%s); the region comparison is neutered or the loop call site is bypassed\n' \
-      "$canary_checked" "$canary_fails" >&2
+  if [ "$canary_hashed" -ne 1 ] || [ "$canary_fails" -ne 1 ]; then
+    printf 'FAIL  enforcer canary: an injected wrong pin was not hashed and recorded as a mismatch (hashed=%s, fails=%s); the region comparison is neutered, the loop call site is bypassed or the hasher never ran\n' \
+      "$canary_hashed" "$canary_fails" >&2
     return 1
   fi
-  if [ "$canary_ok_checked" -ne 1 ] || [ "$canary_ok_fails" -ne 0 ]; then
-    printf 'FAIL  enforcer canary: a correct pin was not accepted (checked=%s, fails=%s); the region comparison no longer accepts matching digests\n' \
-      "$canary_ok_checked" "$canary_ok_fails" >&2
+  if [ "$canary_ok_hashed" -ne 1 ] || [ "$canary_ok_fails" -ne 0 ]; then
+    printf 'FAIL  enforcer canary: a correct pin was not hashed and accepted (hashed=%s, fails=%s); the region comparison no longer accepts matching digests\n' \
+      "$canary_ok_hashed" "$canary_ok_fails" >&2
     return 1
   fi
-  # The same comparison probed by return status rather than by the counters the
-  # loop maintains, so asserting those counters in the prologue is not enough.
+  # The same comparison probed by return status rather than by the ledger the
+  # loop maintains, so asserting that ledger in the prologue is not enough.
+  REGION_HASHED=0
   if region_pin_check scenario-2 SCEN2_REGION_SHA "$canary_wrong" 2>/dev/null; then
     printf 'FAIL  enforcer canary: the region comparison accepted an injected wrong pin; it is neutered\n' >&2
     return 1
   fi
+  if [ "$REGION_HASHED" -ne 1 ]; then
+    printf 'FAIL  enforcer canary: the rejected wrong pin was not hashed (hasher ran %s time(s), expected 1)\n' \
+      "$REGION_HASHED" >&2
+    return 1
+  fi
+  REGION_HASHED=0
   if ! region_pin_check scenario-2 SCEN2_REGION_SHA "$canary_right" 2>/dev/null; then
     printf 'FAIL  enforcer canary: the region comparison rejected a correct pin; it rejects everything\n' >&2
+    return 1
+  fi
+  if [ "$REGION_HASHED" -ne 1 ]; then
+    printf 'FAIL  enforcer canary: the accepted correct pin was not hashed (hasher ran %s time(s), expected 1)\n' \
+      "$REGION_HASHED" >&2
     return 1
   fi
   # The hashing read must follow the path it is given: a `sed` redirected to a
   # frozen pristine copy would hash that copy and leave every pin inert while the
   # report stayed honest (round 9, R9-2). A path that cannot exist must hash to
   # the digest of empty input; a redirected read returns the copy's digest.
-  canary_missing=$(region_sha scenario-2 "$CANARY_MISSING_PATH" 2>/dev/null)
+  REGION_HASHED=0
+  region_sha scenario-2 "$CANARY_MISSING_PATH" 2>/dev/null
+  canary_missing=$REGION_SHA_VALUE
   if [ "$canary_missing" != "$EMPTY_SHA256" ]; then
     printf 'FAIL  enforcer canary: hashing does not follow the path it is given (missing-file digest %s, expected %s); a redirected read would not be detected\n' \
       "${canary_missing:-<none>}" "$EMPTY_SHA256" >&2
     return 1
   fi
+  if [ "$REGION_HASHED" -ne 1 ]; then
+    printf 'FAIL  enforcer canary: the missing-path probe did not hash the path it was given\n' >&2
+    return 1
+  fi
+  # --- content-mutation probe (round 12, M3) ----------------------------------
+  # `$WORK` is already removed by `cleanup_all` before the enforcers run, so the
+  # probe builds its own directory under the system temp dir.
+  mutation_dir=$(mktemp -d "${TMPDIR:-/tmp}/enforcer-mutation.XXXXXX") || mutation_dir=''
+  if [ -z "$mutation_dir" ]; then
+    printf 'FAIL  enforcer canary: cannot create the content-mutation probe directory\n' >&2
+    return 1
+  fi
+  if ! mutation_probe scenario-2 SCEN2_REGION_SHA "${SCEN2_REGION_SHA:-}" "$mutation_dir" ||
+    ! mutation_probe scenario-13 SCEN13_REGION_SHA "${SCEN13_REGION_SHA:-}" "$mutation_dir"; then
+    rm -rf "$mutation_dir"
+    return 1
+  fi
+  rm -rf "$mutation_dir"
   # Same functions the real checks below call, driven with a deliberately wrong
   # expectation in each direction; their diagnostics are the point of the
   # exercise, so they are discarded here.
@@ -530,6 +652,14 @@ enforce_substance() {
     printf 'FAIL  enforcer canary: the count comparison is neutered\n' >&2
     return 1
   fi
+  if region_hash_verdict 'a=1' 'a=1' 2>/dev/null; then :; else
+    printf 'FAIL  enforcer canary: the hash-record comparison is neutered\n' >&2
+    return 1
+  fi
+  if region_hash_verdict 'a=1' 'a=2' 2>/dev/null; then
+    printf 'FAIL  enforcer canary: the hash-record comparison is neutered\n' >&2
+    return 1
+  fi
   # Positive evidence that the canary ran, printed only after it passed; the
   # `health` CI step greps this exact literal, so deleting or neutering the
   # canary reds CI even when the summary looks intact.
@@ -537,9 +667,11 @@ enforce_substance() {
   region_set_verdict "$found" "${PINNED_REGIONS:-}" || return 1
   # The pinned set goes through the same loop the canary exercised above. The
   # entries are built first so the region check itself stays one call site
-  # (round 9, F1): bypassing that call reds the canary, and a shortened or
-  # reordered set still reds the set verdict and the count gate.
+  # (round 9, F1); the expected `name=digest` record is built beside them, so the
+  # hasher's own ledger can be checked against what the pins imply (round 12,
+  # R10-1) — a copied count cannot produce that record.
   region_entries=''
+  expected_record=''
   # shellcheck disable=SC2086  # intentional word split: PINNED_REGIONS is a name list
   for name in ${PINNED_REGIONS:-}; do
     case $name in
@@ -554,22 +686,26 @@ enforce_substance() {
     esac
     region_entries="${region_entries}${name} ${const} ${want}
 "
+    expected_record="${expected_record:+$expected_record }${name}=${want}"
   done
-  PIN_CHECKED=0
   PIN_FAILS=0
+  REGION_HASHED=0
+  REGION_HASHED_RECORD=''
   run_pin_checks "$region_entries"
   if [ "$PIN_FAILS" -ne 0 ]; then
     printf 'FAIL  %s pinned region(s) changed; see the diagnostics above\n' "$PIN_FAILS" >&2
     return 1
   fi
-  region_count_verdict "$PIN_CHECKED" "${PINNED_REGION_COUNT:-}" || return 1
+  region_count_verdict "$REGION_HASHED" "${PINNED_REGION_COUNT:-}" || return 1
+  region_hash_verdict "$REGION_HASHED_RECORD" "$expected_record" || return 1
   # F3/F4 (adversarial round 5): positive evidence that this check ran, printed
   # only on the success path. It names the regions in order and the `health` CI
   # step greps this exact literal, so the expected set lives *outside* the
   # guarded file: `trap - EXIT`, `elif false`, a removed call or a shortened
-  # list all leave the line absent and the step red. Nothing else prints it.
+  # list all leave the line absent and the step red. Nothing else prints it. The
+  # count it names is the hasher's own ledger (round 12), not a caller's tally.
   printf 'pinned regions verified %s/%s: %s\n' \
-    "$PIN_CHECKED" "$PINNED_REGION_COUNT" "$PINNED_REGIONS"
+    "$REGION_HASHED" "$PINNED_REGION_COUNT" "$PINNED_REGIONS"
   return 0
 }
 

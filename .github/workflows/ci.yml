@@ -129,11 +129,37 @@ jobs:
         # instead of sailing through with the summary intact. The `ok`-line count
         # is the second half of the pin: `printf 'RESULT: 32 …'; exec true`
         # satisfies the literal but prints no assertion lines at all.
+        #
+        # Round 12 (R1/R1b/R2/R3): the suite's own bytes are pinned *here*,
+        # before it runs, because the round-10 adversarial reopened every
+        # remaining defeat as a one-line edit inside the guarded file — a `case`
+        # whitelist over the expectations, a `case` that skips all but one name,
+        # a `region_sha` that fabricates a digest, or replacing the real pin
+        # loop's call with an assigned count. Those leave the in-file checks
+        # green, so the file's sha256 is the outer pin: weakening the enforcer
+        # now also requires editing `guard_pin` in this step, i.e. a two-file
+        # change a reviewer sees. The claim is that narrow — the guard catches
+        # careless single-region edits; an edit here plus a refreshed
+        # `SCEN*_REGION_SHA`, or a forged summary/evidence block, is still green
+        # (declared residues L1/L2). Update `guard_pin` with the digest named in
+        # the failure message when the guard legitimately changes.
         shell: bash
         run: |
           set -o pipefail
           log=/tmp/frp-repo-health-fixtures.log
           status=0
+          guard_file=scripts/tests/repo-health-fixtures.sh
+          guard_pin=dfa955bb48992d2357a95abd488f66f28870e23667aff86463c307579db9bd51
+          if command -v sha256sum >/dev/null 2>&1; then
+            guard_sha=$(sha256sum "$guard_file" 2>/dev/null | awk '{print $1}') || true
+          else
+            guard_sha=$(shasum -a 256 "$guard_file" 2>/dev/null | awk '{print $1}') || true
+          fi
+          if [ "$guard_sha" != "$guard_pin" ]; then
+            echo "::error::$guard_file is not the pinned revision (sha256 ${guard_sha:-<none>}; expected $guard_pin)"
+            echo "::error::an edit to the guard — including one that weakens its own checks — must also update guard_pin in the 'Repo health — fixture checks (gate exit-code mapping)' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended"
+            exit 1
+          fi
           bash scripts/tests/repo-health-fixtures.sh 2>&1 | tee "$log" || status=1
           grep -qF 'RESULT: 32 fixture check(s) hold' "$log" || status=1
           [ "$(grep -c '^  ok ' "$log" || true)" = "32" ] || status=1
@@ -199,11 +225,34 @@ jobs:
         # one-line `got=$want`/`if false` that neuters the comparison reds here.
         # A scenario added or removed here moves the `pinned regions` literal —
         # restore the checks rather than lowering it.
+        #
+        # Round 12 (R1/R1b/R2/R3): same out-of-band file pin as the repo-health
+        # step above. Every reopened defeat was a one-line edit inside this
+        # guarded file (a `case` whitelist, a `case` skipping all but one name, a
+        # `region_sha` that fabricates a digest, an assigned count in place of the
+        # real pin loop), so the file's sha256 is checked here before the suite
+        # runs and an edit that weakens the enforcer also has to move `guard_pin`
+        # in this step — a two-file change a reviewer sees. The claim stays
+        # narrow: careless single-region edits are caught; an in-file edit plus a
+        # refreshed `SCEN*_REGION_SHA`, or a forged summary/evidence block, is
+        # still green (declared residues L1/L2).
         shell: bash
         run: |
           set -o pipefail
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
+          guard_file=scripts/tests/compat-stray-guard.sh
+          guard_pin=5de495aca5c186eb76dc427b8c961b6d5add7687ce6a2f143b4948bc1783d9ac
+          if command -v sha256sum >/dev/null 2>&1; then
+            guard_sha=$(sha256sum "$guard_file" 2>/dev/null | awk '{print $1}') || true
+          else
+            guard_sha=$(shasum -a 256 "$guard_file" 2>/dev/null | awk '{print $1}') || true
+          fi
+          if [ "$guard_sha" != "$guard_pin" ]; then
+            echo "::error::$guard_file is not the pinned revision (sha256 ${guard_sha:-<none>}; expected $guard_pin)"
+            echo "::error::an edit to the guard — including one that weakens its own checks — must also update guard_pin in the 'Stray guard — fixture checks (compat harness teardown)' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended"
+            exit 1
+          fi
           bash scripts/tests/compat-stray-guard.sh 2>&1 | tee "$log" || status=1
           grep -qF 'RESULT: 40 fixture check(s) hold' "$log" || status=1
           [ "$(grep -c '^  ok ' "$log" || true)" = "40" ] || status=1
