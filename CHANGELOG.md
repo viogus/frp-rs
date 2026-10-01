@@ -1256,6 +1256,16 @@ User-facing release notes for frp-rs.
   `load_server_config_uncompleted_with_presence` (`frps/src/main.rs:967`); it now states the relationship
   (the presence-carrying form of the plain loader, i.e. the completing loader minus
   `ServerConfig::complete`).
+- **`docs/developing.md` § 2 is now an end-to-end contributor path for a new proxy type.** It walks
+  the whole path — reading order and what to skip, the six config allow-lists, the registration and
+  port-accounting sites, the listener/bridge split, the test ladder, the cross-compat scenario and
+  the records a contributor does not own — with one worked `mytcp` example, plus a § 2.8 for a client
+  plugin and a § 2.9 entry point for a new maintainer. It is validated rather than merely written:
+  the round-1 review followed only the document and landed a working TCP-like type (config gate with
+  the real binary, unit test red → green, in-process e2e, real `frps` + `frpc` round trip) before the
+  defects that walk turned up were fixed. It also corrects two load-bearing claims: `[transport]
+  tcpMux` is *normalized* (only a **top-level** camelCase `tcpMux` is silently dropped), and a
+  TCP-group-capable type touches seven more predicate sites.
 
 ### CI & Tooling
 
