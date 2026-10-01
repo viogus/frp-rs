@@ -1233,6 +1233,7 @@ User-facing release notes for frp-rs.
 
 ### CI & Tooling
 
+- **Two `frpc` test pitfalls are closed, and the lane that would have caught one of them now runs.** `frpc/tests/warn_delivery.rs` no longer decides a record count from a quiet window: it waits for the child to exit and joins both pipe drains, so the capture is final at EOF, and a duplicate `--config-dir` record emitted 700 ms behind the first — which the previous 500 ms quiet period let pass — now fails the test. `frpc/tests/cli_inputs.rs`'s config-file-named-after-a-subcommand test dropped an assertion that could not tell the child's own admin listener (`frpc admin server starting on 127.0.0.1:<port>`) from a dial, and a count-guarded `tests-unit` step now runs that file with the `admin` feature on.
 - **RSS soak harness and a published head-to-head series**: `scripts/rss-soak.sh` runs a 3-hour,
   45-second-interval RSS comparison of frp-rs and Go frp over an identical proxy set and traffic,
   guards its run directory (`scripts/lib/rss-soak-run-dir.sh`), writes a machine-readable summary
