@@ -84,9 +84,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   # Cheapest job in the matrix (~seconds: no Rust toolchain, no cache, reads
-  # files with grep/find only, plus two fixture scripts that drive the
-  # repo-health and stray-guard rules against synthetic inputs). It turns a rule
-  # that was previously enforced by
+  # files with grep/find only, plus three fixture scripts that drive the
+  # repo-health, stray-guard and RSS-soak run-dir rules against synthetic
+  # inputs). It turns a rule that was previously enforced by
   # memory into a machine gate: frp-rs versions must stay aligned with the Go frp
   # release number across 5 crates + the VERSION constant + the download script +
   # the README (see "Versioning (mandatory)" in CLAUDE.md).
