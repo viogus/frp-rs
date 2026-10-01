@@ -9035,7 +9035,7 @@ section; ledger now **24 open / 104 closed**.**
   `drain` distinguishes a read error from EOF the way the `frpc` one now does (or each residue is argued
   unreachable with a measurement).
 
-- [ ] **`docs/config.md:22` names `websocketPort` as the Go frp v0.71.0 spelling of `websocket_port`, but Go's `frps` has no such field.**
+- [x] **`docs/config.md:22` names `websocketPort` as the Go frp v0.71.0 spelling of `websocket_port`, but Go's `frps` has no such field.**
   Filed by the coordinator from PR #436's delta adversarial (INFO). Measured with the real v0.71.0 binary:
   a server config carrying `websocketPort` is refused with exactly `json: unknown field "websocketPort"`
   and binds neither port; Go's `pkg/config/v1` server config names no WebSocket port at all, and Go's
@@ -9048,3 +9048,24 @@ section; ledger now **24 open / 104 closed**.**
   server key with no Go counterpart.
   **Done-when:** `docs/config.md:22` either gets the `—` shape (`frp-rs` accepts the spelling and Go's `frps`
   has no such option, so it is an frp-rs extension), or the Go mapping is re-measured and kept.
+  **Done (2026-10-01, at code head `26c5a480` on `docs/config-websocketport-go-column`, PR #448, based on `e4c23b2f`) — row reshaped; the Go claim re-measured and the extension recorded.**
+  `docs/config.md:22` no longer names `websocketPort` as the Go spelling: its Go column now uses the `—`
+  shape of the neighbouring `tls_enable` row (`docs/config.md:25`) — `` `—` (no Go server field; Go's
+  `frps` carries WebSocket upgrades on `bindPort`, and Go's `pkg/config/v1` server config names no
+  WebSocket port at all) `` — and the description states the key is an frp-rs extension, citing both
+  frp-rs acceptance paths live: the serde alias immediately above the feature-gated field
+  (`frp-core/src/config/server.rs:39-41`), the strict parser's `known_server_keys()` entry
+  (`frp-core/src/config/strict.rs:105`), and the pin that the alias really drives the field
+  (`frp-core/src/config/tests.rs:270`/`:286`). The Go side was **re-measured**, not carried over: with
+  the real v0.71.0 `frps` (`bash scripts/download-go-frp.sh`), `frps verify -c` on a config with
+  `bindPort = 17000` + `websocketPort = 7500` prints exactly `json: unknown field "websocketPort"` and
+  exits 1 (rc 0 with `--strict-config=false`; the plain `bindPort` control is `syntax is ok`), and the
+  run path binds neither 17000 nor 7500 — so the row's Go column was the claim the measurement
+  contradicted, and the mapping is **not** kept. `docs/config.md:176`'s camelCase exception is scoped to
+  the TLS fields and needed no touch, and the edited row still parses as the same 5-field table row as
+  its neighbours. Found and reported but deliberately **not** fixed (out of scope for a docs PR): in a
+  build without the `websocket` feature (`cargo build -p frps --no-default-features --features micro`)
+  `known_server_keys()` still accepts `websocket_port`/`websocketPort` while the serde field is
+  `#[cfg]`-gated away, so `--strict-config` accepts the key and the running server silently ignores it
+  with no warning — a real strict-parser/serde divergence left open. Ledger after this close:
+  **15 open / 186 closed** (base `e4c23b2f`: 16 open / 185 closed).
