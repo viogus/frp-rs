@@ -9298,7 +9298,7 @@ section; ledger now **24 open / 104 closed**.**
   `#[cfg(feature …)]` at all, so `known_client_keys()` (`frp-core/src/config/strict.rs:131-237`) has nothing that can
   go stale, and neither `quic_options` nor `virtual_net` is gated.
   **Done-when:** a load that carries a feature-gated key the build cannot honour is either refused or warned about once per load, in every build shape, with tests pinning both a feature-enabled and a feature-disabled build.
-  **Done (2026-10-02, at code head `5067d8c7`, records `PLACEHOLDER_RECORDS_SHA`, PR #455, based on `f881d15e`) — warned, once per load, for a non-zero port; the key stays accepted.**
+  **Done (2026-10-02, at code head `5067d8c7`, records `da7f7a209bba1aea4802f05cd15a1c2a68db5afb`, PR #455, based on `f881d15e`) — warned, once per load, for a non-zero port; the key stays accepted.**
   The new `ConfigPresence::warn_unhonoured_server_feature_keys()` (`frp-core/src/config/loader.rs`) is called from the
   three server load sites that own a log sink — the two post-`init_logging` `frps` startup branches
   (`frps/src/main.rs`) and the SIGUSR1 reload (`frp-server/src/service.rs`) — and emits one `tracing::warn!` per
