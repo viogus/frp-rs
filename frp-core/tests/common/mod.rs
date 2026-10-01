@@ -68,7 +68,7 @@ fn strip_sgr(record: &str) -> String {
 /// The emitted record must be the one-line `tracing` prefix followed by `want`
 /// and **nothing else** but an optional trailing newline.
 ///
-/// Three rejections, each measured against a mutant:
+/// Four rejections, each measured against a mutant:
 ///
 /// * the message appears zero or twice, or is a different message — `contains`
 ///   + `match_indices`;
@@ -78,13 +78,24 @@ fn strip_sgr(record: &str) -> String {
 ///   `warn!("EXTRA {}", …)` fails the `anchor` assertions, because the prefix
 ///   then ends in `"EXTRA "` rather than `" <target>: "` (and the anchor must
 ///   occur exactly once, so a literal that itself ends in the target does not
-///   sneak through).
+///   sneak through);
+/// * the target **rewritten** to a longer key that ends in the expected one —
+///   `warn!(target: "x <target>", …)` used to pass: the anchor still occurred
+///   exactly once and still ended the prefix, so the extra `x` merely widened
+///   the bytes before the anchor. The level is therefore compared **exactly**
+///   against the whole field, `" WARN"`.
 ///
-/// The level itself is not pinned byte for byte: `tracing_subscriber`'s fmt
-/// format owns it (and may colour it), so only its one-line shape is required.
-/// Those colour sequences are stripped before the shape assertions, but every
-/// failure message quotes the **raw** record so a coloured capture is still
-/// diagnosable.
+/// The level comparison must stay **untrimmed**: `trim()` erases injected
+/// whitespace while the anchor still matches as a suffix, so
+/// `target: "\n <target>"`, `target: " <target>"` and `target: "\t <target>"`
+/// leave `" WARN \n"`, `" WARN "` and `" WARN \t"` — every one of which
+/// `trim()` folded back to `"WARN"` and accepted.
+///
+/// The level is compared after `strip_sgr`, so `tracing_subscriber`'s fmt
+/// format stays free to colour the level; it is not free to add anything else,
+/// because the untrimmed field is the whole text between the start of the
+/// record and the target separator. Every failure message quotes the **raw**
+/// record so a coloured capture is still diagnosable.
 pub fn assert_record_is_exactly_the_message(tag: &str, record: &str, want: &str, target: &str) {
     let clean = strip_sgr(record);
     assert!(
@@ -118,9 +129,12 @@ pub fn assert_record_is_exactly_the_message(tag: &str, record: &str, want: &str,
          {record:?}"
     );
     let level = &prefix[..prefix.len() - anchor.len()];
-    assert!(
-        level.contains("WARN") && !level.contains('\n'),
-        "{tag}: only the one-line tracing level may precede the target; got level: {level:?} \
-         from raw record: {record:?}"
+    assert_eq!(
+        level, " WARN",
+        "{tag}: only the tracing level may precede the target, and it must be exactly `\" WARN\"`. \
+         An emit site that rewrites the target to a longer key ending in `{target}` (e.g. \
+         `x {target}`) or prefixes it with whitespace (`\\n {target}`, `\\t {target}`) leaves extra \
+         bytes here — compared **untrimmed** so none of them are erased — and must not pass; got \
+         level: {level:?} from raw record: {record:?}"
     );
 }

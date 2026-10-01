@@ -457,6 +457,61 @@ jobs:
         # silently drop the gate. --lib: the vnet-gated tests are unit
         # tests in nathole.rs (no vnet-gated integration bins exist).
         run: cargo test -p frp-server --features vnet --lib
+      - name: Run frp-server's `web_server.tls.enable` resolver test without TLS (count guard)
+        # `frp-server/src/service.rs`'s `web_server_tls_enable_reader()` picks the
+        # emitted warning variant from this crate's own `dashboard` and `tls`
+        # features. Every other lane links frp-server with `tls` on (the `full`
+        # and `tiny` tiers and the `--all-features` sweeps), so replacing its
+        # `cfg!(feature = "tls")` argument with the literal `true` stayed green:
+        # in a tls-on build the expected variant is the same either way. This is
+        # the one shape that separates them — dashboard on, tls off — which the
+        # `verify` lane otherwise only *lints* (`cargo clippy -p frp-server
+        # --no-default-features --features dashboard --all-targets`).
+        #
+        # The name filter keeps this off the rest of the lib tests: this shape
+        # cannot run them all, because
+        # `dashboard::v2::tests::test_serverinfo_go_shape` reads `kcpBindPort`,
+        # which a kcp-less build does not produce. The count guard still pins
+        # that exactly one test ran.
+        #
+        # The guard is not count-only, for the same reason the frps bin unit
+        # step above is not: renaming the test (still one test, still green) and
+        # returning early as the body's first statement (one test, `1 passed`,
+        # zero assertions) both survive a count. So the step also greps the
+        # pin's `--nocapture` completion marker, which is printed only after
+        # every assertion has run and names the variant this shape resolved to.
+        shell: bash
+        run: |
+          set -eo pipefail
+          log=/tmp/frp-server-resolver-no-tls-test.log
+          # `--nocapture` puts the pin's own completion marker in the log: a body
+          # that returns before its assertions still reports `1 passed`, and only
+          # the marker distinguishes "ran the assertions" from "ran early".
+          cargo test -p frp-server --no-default-features --features dashboard --lib --color never web_server_tls_enable_reader -- --nocapture 2>&1 | tee "$log"
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+          marker="web-server-tls-enable-reader-pin: ok, WebServerNoTls"
+          n=$(cargo test -p frp-server --no-default-features --features dashboard --lib --color never web_server_tls_enable_reader -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          status=0
+          grep -q "Running unittests src/lib.rs" "$log.plain" || status=1
+          grep -q "test result: ok. 1 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "1" ] || status=1
+          grep -q "$marker" "$log.plain" || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::frp-server warning-resolver guard failed (status=$status, file=$n, log=$log)"
+            if [ -n "$n" ] && [ "$n" != "1" ]; then
+              if [ "$n" -lt "1" ]; then
+                echo "::error::frp-server/src/service.rs lists $n tests matching web_server_tls_enable_reader, this step expects 1 — the resolver pin was deleted or renamed; restore it rather than lowering this literal"
+              else
+                echo "::error::frp-server/src/service.rs lists $n tests matching web_server_tls_enable_reader, this step expects 1: move the single literal in this shell step from 1 to $n"
+              fi
+            fi
+            if [ "$(grep -c "$marker" "$log.plain" || true)" = "0" ]; then
+              echo "::error::the frp-server resolver pin did not print its completion marker (\"$marker\") — a body that returns before its assertions passes libtest while asserting nothing; restore the assertions"
+            fi
+            cat "$log.plain"
+            exit 1
+          fi
+          echo "frp-server warning-resolver guard ok: $n tests listed (expected 1), marker seen, 0 failed"
       - name: Run frp-core lib + integration tests (kcp/mux/xtcp_p2p/yamux_rst)
         # frp-core's tests/ are pure Rust<->Rust (no frps/frpc binaries), so
         # they belong with the unit lane and don't need the integration build.
@@ -493,6 +548,69 @@ jobs:
         # 10 test targets and the bench touched (forced rebuild). The runner's
         # cost — Linux, cold cache — was not measured.
         run: cargo test -p frp-core --no-default-features --all-targets
+      - name: Run frp-core's server `tls_enable` warning pin (count guard)
+        # `frp-core/tests/server_tls_enable_warning.rs` is executed today only by
+        # the two generic frp-core sweeps above, which is why the file is named
+        # in neither: a bare `cargo test -p frp-core` cannot tell "8 passed" from
+        # "0 ran" or from "7 passed, 1 ignored" — an `#[ignore]`d test still
+        # leaves `test result: ok.` and exit 0. This step pins the count from the
+        # target's own `-- --list`, like every sibling delivery lane. The count is
+        # feature-independent (8 with and without `--no-default-features`), so
+        # the one default-feature lane guards both directions.
+        shell: bash
+        run: |
+          set -eo pipefail
+          log=/tmp/frp-core-server-tls-enable-warning-tests.log
+          cargo test -p frp-core --test server_tls_enable_warning --color never 2>&1 | tee "$log"
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+          n=$(cargo test -p frp-core --test server_tls_enable_warning --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          status=0
+          grep -q "Running tests/server_tls_enable_warning.rs" "$log.plain" || status=1
+          grep -q "test result: ok. 8 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "8" ] || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::frp-core server tls_enable warning guard failed (status=$status, file=$n, log=$log)"
+            if [ -n "$n" ] && [ "$n" != "8" ]; then
+              if [ "$n" -lt "8" ]; then
+                echo "::error::frp-core/tests/server_tls_enable_warning.rs lists $n tests, this step expects 8 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
+              else
+                echo "::error::frp-core/tests/server_tls_enable_warning.rs lists $n tests, this step expects 8: move the single literal in this shell step from 8 to $n"
+              fi
+            fi
+            cat "$log.plain"
+            exit 1
+          fi
+          echo "frp-core server tls_enable warning guard ok: $n tests listed (expected 8), 0 failed"
+      - name: Run frp-core's web-server `tls_enable` warning pin (count guard)
+        # The sibling of the step above, for
+        # `frp-core/tests/web_server_tls_enable_warning.rs`: same reason (no
+        # guard can see a deleted or `#[ignore]`d test through the generic
+        # sweeps), same `-- --list`-derived literal (6 with and without
+        # `--no-default-features`).
+        shell: bash
+        run: |
+          set -eo pipefail
+          log=/tmp/frp-core-web-server-tls-enable-warning-tests.log
+          cargo test -p frp-core --test web_server_tls_enable_warning --color never 2>&1 | tee "$log"
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+          n=$(cargo test -p frp-core --test web_server_tls_enable_warning --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          status=0
+          grep -q "Running tests/web_server_tls_enable_warning.rs" "$log.plain" || status=1
+          grep -q "test result: ok. 6 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "6" ] || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::frp-core web-server tls_enable warning guard failed (status=$status, file=$n, log=$log)"
+            if [ -n "$n" ] && [ "$n" != "6" ]; then
+              if [ "$n" -lt "6" ]; then
+                echo "::error::frp-core/tests/web_server_tls_enable_warning.rs lists $n tests, this step expects 6 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
+              else
+                echo "::error::frp-core/tests/web_server_tls_enable_warning.rs lists $n tests, this step expects 6: move the single literal in this shell step from 6 to $n"
+              fi
+            fi
+            cat "$log.plain"
+            exit 1
+          fi
+          echo "frp-core web-server tls_enable warning guard ok: $n tests listed (expected 6), 0 failed"
       - name: Run frpc CLI tests (admin address resolution)
         # No lane ran a `cargo test` target of the `frpc` package before this
         # step (`ab-matrix.yml` only *builds* `-p frpc`; the two `--lib` steps —
