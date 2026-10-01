@@ -10955,48 +10955,62 @@ Global Flags:
     }
 
     /// The `FRPC_PROXY_GO_FLAGS` rows every one of frp-rs's eight proxy commands
-    /// renders, with that command's own extras beside it.
+    /// renders, with Go's shorthand for each.
     ///
     /// `help_flag_tables` hands all eight surfaces the same 32-row union, and
-    /// `go_flag_row` takes the first match, so a surface can render a row another
-    /// surface's parser would reject. The union pin above cannot see that; this one
-    /// can, because it compares **each surface's** rendered rows against Go's set
-    /// for **that surface**. It reds if a surface starts rendering a Go row it does
-    /// not implement, or drops one it does.
-    const GO_PROXY_ROWS_UNIVERSAL: [&str; 8] = [
-        "local-ip",
-        "local-port",
-        "proxy-name",
-        "server-addr",
-        "server-port",
-        "token",
-        "uc",
-        "ue",
+    /// `go_flag_row` takes the first match, so a surface can pick up another
+    /// surface's row — including its **shorthand**. That is how `.short('r')` on
+    /// sudp's long-only `--remote-port` passed every other test in this module:
+    /// the union lookup returned Go's tcp/udp row, whose `short` is `Some('r')`,
+    /// and the loop in
+    /// [`parser_shorthands_agree_with_go_where_the_parser_has_one`] only compares
+    /// what that lookup returns. This per-surface pin compares each surface
+    /// against Go's set for **that surface**, longs *and* shorthands, so it reds
+    /// when a surface starts rendering a Go row it does not implement, drops one
+    /// it does, or prints a shorthand that belongs to a different surface's row.
+    /// One Go row as frp-rs renders it: the long name and the shorthand the
+    /// surface actually prints (`None` when Go's own row carries no shorthand).
+    type GoRowPin = (&'static str, Option<char>);
+
+    const GO_PROXY_ROWS_UNIVERSAL: [GoRowPin; 8] = [
+        ("local-ip", Some('i')),
+        ("local-port", Some('l')),
+        ("proxy-name", Some('n')),
+        ("server-addr", Some('s')),
+        ("server-port", Some('P')),
+        ("token", Some('t')),
+        ("uc", None),
+        ("ue", None),
     ];
 
     /// Measured from the Go v0.71.0 binary: `frpc <surface> --help` renders the
     /// eight universal rows above on every proxy command, plus these. Go binds more
     /// than this on each surface (that is `GO_ONLY_PROXY_ROWS`); this is the part
-    /// frp-rs implements.
-    const GO_PROXY_ROWS_PER_SURFACE: [(&str, &[&str]); 8] = [
-        ("frpc tcp", &["remote-port"]),
-        ("frpc udp", &["remote-port"]),
+    /// frp-rs implements. Sudp's `remote-port` is the one deliberate divergence:
+    /// Go registers the row on tcp/udp only, and frp-rs keeps the long form on sudp
+    /// as an extension, so the shorthand is `None` there where tcp/udp print `-r`.
+    const GO_PROXY_ROWS_PER_SURFACE: [(&str, &[GoRowPin]); 8] = [
+        ("frpc tcp", &[("remote-port", Some('r'))]),
+        ("frpc udp", &[("remote-port", Some('r'))]),
         (
             "frpc http",
             &[
-                "custom-domain",
-                "host-header-rewrite",
-                "http-pwd",
-                "http-user",
-                "locations",
-                "sd",
+                ("custom-domain", Some('d')),
+                ("host-header-rewrite", None),
+                ("http-pwd", None),
+                ("http-user", None),
+                ("locations", None),
+                ("sd", None),
             ],
         ),
-        ("frpc https", &["custom-domain", "sd"]),
-        ("frpc stcp", &["sk", "tls-server-name"]),
-        ("frpc xtcp", &["sk", "tls-server-name"]),
-        ("frpc sudp", &["remote-port", "sk"]),
-        ("frpc tcpmux", &["custom-domain", "mux", "sd"]),
+        ("frpc https", &[("custom-domain", Some('d')), ("sd", None)]),
+        ("frpc stcp", &[("sk", None), ("tls-server-name", None)]),
+        ("frpc xtcp", &[("sk", None), ("tls-server-name", None)]),
+        ("frpc sudp", &[("remote-port", None), ("sk", None)]),
+        (
+            "frpc tcpmux",
+            &[("custom-domain", Some('d')), ("mux", None), ("sd", None)],
+        ),
     ];
 
     #[test]
@@ -11008,31 +11022,46 @@ Global Flags:
                 .into_iter()
                 .find(|(candidate, ..)| *candidate == label)
                 .unwrap_or_else(|| panic!("`{label}` names no SURFACES row"));
-            let mut expected: std::collections::BTreeSet<&str> =
+            let mut expected: std::collections::BTreeMap<&str, Option<char>> =
                 GO_PROXY_ROWS_UNIVERSAL.into_iter().collect();
-            for extra in extras {
+            for (long, short) in extras {
                 assert!(
-                    go_longs.contains(extra),
-                    "`{label}`'s expected row `{extra}` is not a Go proxy row at all"
+                    go_longs.contains(long),
+                    "`{label}`'s expected row `{long}` is not a Go proxy row at all"
                 );
-                expected.insert(extra);
+                assert!(
+                    expected.insert(long, *short).is_none(),
+                    "`{label}` records `{long}` twice"
+                );
             }
-            let rendered: std::collections::BTreeSet<String> = surface_document(root, command)
-                .lines()
-                .filter_map(row_long_flag)
-                .map(|long| long.trim_start_matches("--").to_owned())
-                .collect();
-            let actual: std::collections::BTreeSet<&str> = rendered
+            let rendered: Vec<(String, Option<char>)> =
+                section_rows(&surface_document(root, command), "Flags:")
+                    .into_iter()
+                    .filter(|(_, long, _)| long != "help")
+                    .map(|(head, long, _)| (long, printed_short(&head)))
+                    .collect();
+            let actual_longs: std::collections::BTreeSet<&str> = rendered
                 .iter()
-                .map(String::as_str)
+                .map(|(long, _)| long.as_str())
                 .filter(|long| go_longs.contains(long))
                 .collect();
+            let expected_longs: std::collections::BTreeSet<&str> =
+                expected.keys().copied().collect();
             assert_eq!(
-                actual, expected,
+                actual_longs, expected_longs,
                 "`{label}` must render exactly Go's own rows for that surface: Go registers \
                  them all, and every one frp-rs implements must print (a row Go has on this \
                  surface but frp-rs does not implement, or vice versa, shows up here)"
             );
+            for (long, short) in &rendered {
+                if let Some(expected_short) = expected.get(long.as_str()) {
+                    assert_eq!(
+                        short, expected_short,
+                        "`{label}` must print Go's own shorthand for `--{long}` on this \
+                         surface ({expected_short:?}), not another surface row's shorthand"
+                    );
+                }
+            }
         }
     }
 
