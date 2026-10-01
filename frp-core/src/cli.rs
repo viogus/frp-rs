@@ -3284,7 +3284,7 @@ fn consumes_value(s: &OsStr, root: RootCommand) -> bool {
 }
 
 /// Move a **leading** subcommand token to the front of the argv, the way cobra
-/// resolves a command that follows leading root flags (`TODO.md:2566`).
+/// resolves a command that follows leading root flags (`TODO.md:2619`).
 ///
 /// [`RootCommand`] selects which root command's flag and command sets are
 /// emulated; both binaries run the same resolution, because Go's `frps` declares
