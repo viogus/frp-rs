@@ -8476,16 +8476,55 @@ section; ledger now **24 open / 104 closed**.**
   (base `9b2acefb`: 26 open / 149 closed; the batch closes the four `--config-dir` residues and the two new
   residues the delta reviews measured are filed below).
 
-- [ ] **The release-profile test lane is red wherever it is run — three `frps/tests/cli_exit_codes.rs` pins drive `#[cfg(debug_assertions)]` hooks, and no CI job runs tests in release.**
+- [x] **The release-profile test lane is red wherever it is run — three `frps/tests/cli_exit_codes.rs` pins drive `#[cfg(debug_assertions)]` hooks, and no CI job runs tests in release.**
   Filed by the coordinator from PR #431's delta adversarial. `cargo test --release -p frps --test
-  cli_exit_codes` is 40 passed / 3 failed at `frps/tests/cli_exit_codes.rs:1122:5`, `:1226:13` and `:145:17`,
+  cli_exit_codes` is 41 passed / 3 failed at `frps/tests/cli_exit_codes.rs:1122:5`, `:1226:13` and `:145:17`,
   byte-identically at the parent `89826daf` — not a regression, but the reason the project has no release-mode pin
   coverage. The three failures are the pins that drive the debug-only holds (`FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS`
-  at `frps/src/main.rs:618`, `FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS` at `:696`, `FRPS_CFGDIR_TEST_PANIC` at
-  `:739`); `cargo test --release -p frps --bins` is green (`1 passed`,
+  at `frps/src/main.rs:620`, `FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS` at `:697`, `FRPS_CFGDIR_TEST_PANIC` at
+  `:741`); `cargo test --release -p frps --bins` is green (`1 passed`,
   `dir_registry_tests::lock_dir_registry_recovers_a_poisoned_registry`).
   **Done-when:** either a CI job runs `cargo test --release -p frps --test cli_exit_codes` with the three pins
   skipped behind a stated reason (so the lane is honest about what it covers), or the pins become release-runnable.
+
+  **Done (PR #443, code head `ec24f7a2`).** The three pins now carry
+  `#[cfg_attr(not(debug_assertions), ignore = "<reason>")]` — `frps/tests/cli_exit_codes.rs:1107-1108`,
+  `:1190-1191`, `:1597-1598`, each reason naming the hook it needs, with the rationale in the comments at
+  `:1098`, `:1185`, `:1590`. `ignore` rather than `#[cfg(debug_assertions)]` is the load-bearing choice: a
+  `#[cfg]` would remove the tests from the release count, so no guard could then assert that the release lane
+  still lists the same 44 tests debug does. Measured: base release
+  `test result: FAILED. 41 passed; 3 failed`, exit 101 at `frps/tests/cli_exit_codes.rs:1122:5`, `:1226:13`,
+  `:145:17`; head release `test result: ok. 41 passed; 0 failed; 3 ignored` (2.79 s) and head debug
+  `ok. 44 passed; 0 failed; 0 ignored`; `--list` 44 in both; no profile in the workspace sets
+  `debug-assertions` (`Cargo.toml:105`, `:115-117`), so `not(debug_assertions)` is exactly the axis this lane
+  covers, and a fat-LTO run gives the same numbers. A new additive job, `release-tests` / `Tests (release
+  profile)` (`.github/workflows/ci.yml:1253-1345`, `timeout-minutes: 30` at `:1256`), runs
+  `cargo test --release -p frps --test cli_exit_codes` in the same release profile the `build` job uses
+  (`lto = false`, `opt-level = 2`, `:1290-1292`) and fails closed on four things: the target was really built,
+  the summary is exactly `test result: ok. 41 passed; 0 failed; 3 ignored;`, the ignored **names** are the
+  three pins in `FRPS_RELEASE_CLI_IGNORED` (both sides sorted), and `--list` equals
+  `FRPS_RELEASE_CLI_TESTS` = 44 (`:1336-1342`, "Update both literals together"). Teeth, re-measured by both
+  reviewers: 9 of 11 mutants caught — 41→40 drift, a stray fourth `ignored`, the target missing, 0 tests, an
+  unconditional `#[ignore]` on a fourth pin, the pins `#[cfg]`'d out, a rename, the wrong test ignored with the
+  count unchanged, an extra passing test; the summary substring is not end-anchored and the reasons are never
+  read back, both accepted. What the lane does **not** defend is written down rather than implied
+  (`ci.yml:1243-1248`): turning the three attributes into an unconditional `#[ignore]` gives byte-identical
+  release output and this guard exits 0 by design, because that case belongs to the pre-existing debug lane
+  (`FRPS_CLI_TESTS: "44"` at `:278`, asserted at `:747`). The job is deliberately absent from `build`'s
+  `needs` (`ci.yml:1843`) so a cold release build cannot serialize the artifact job, which means it gates a
+  merge only once branch protection names "Tests (release profile)" (`:1249-1252`). Cold release build: 5m07s
+  at `-j 2`, 9m51s under load, inside the 30-minute cap.
+
+- [ ] **Release-mode test coverage is this one file: no CI job builds or runs any other test target in the `release` profile.**
+  Filed by the coordinator while closing the release-profile lane item above. `release-tests`
+  (`.github/workflows/ci.yml:1253-1345`) compiles and runs `frps/tests/cli_exit_codes.rs` and nothing else, so
+  every other test target — `frp-core`'s config and CLI suites, `frps/tests/warn_delivery.rs`, `frpc/tests/*` —
+  is only ever built with `debug_assertions` on. Code a release binary compiles differently
+  (`#[cfg(debug_assertions)]` hooks, `debug_assert!`, overflow checks) is therefore pinned in debug only, and
+  the `build` job's release artifacts are built, never executed.
+  **Done-when:** the workspace's `--release --all-targets` build plus at least one more release test target
+  runs in CI with its own count guard, or the decision to cover exactly the pins that need it is recorded with
+  the reasoning and the measurements.
 
 - [x] **`frps/src/main.rs:332`'s re-pointed doc link names the wrong loader for the run path it describes.**
   Filed by the coordinator from PR #431's delta adversarial (F1). The link now resolves to

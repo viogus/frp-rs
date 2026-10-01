@@ -1306,26 +1306,41 @@ jobs:
         # keeps every later target running when an unrelated lib test fails.
         run: cargo test -p frp-client --no-default-features --all-targets -j 1 --no-fail-fast
   # The release-profile CLI lane. `cargo test --release -p frps --test
-  # cli_exit_codes` used to be red in every release build (40 passed / 3 failed)
+  # cli_exit_codes` used to be red in every release build (41 passed / 3 failed)
   # because three pins drive `#[cfg(debug_assertions)]` hooks in
-  # `frps/src/main.rs` (`:618`, `:696`, `:739`) that a release binary does not
+  # `frps/src/main.rs` (`:620`, `:697`, `:741`) that a release binary does not
   # compile. Those three tests now carry
-  # `#[cfg_attr(not(debug_assertions), ignore = "<reason>")]`, and this job is
-  # what makes the skip observable: it asserts the exact summary line (41
-  # passed; 0 failed; 3 ignored) and the exact three ignored names, so a
-  # blanket `#[ignore]` — a lane that silently covers nothing — fails the
-  # guard instead of reporting "0 failed". `ignore` (not `#[cfg]`) is what
-  # keeps the three tests compiled and counted in both profiles; the
-  # `FRPS_RELEASE_CLI_TESTS` literal below is the same 44 as the tests-unit
-  # lane's `FRPS_CLI_TESTS` on purpose.
+  # `#[cfg_attr(not(debug_assertions), ignore = "<reason>")]`; `ignore` (not
+  # `#[cfg]`) is what keeps them compiled and *counted* in both profiles, and
+  # `FRPS_RELEASE_CLI_TESTS` below is the same 44 as the tests-unit lane's
+  # `FRPS_CLI_TESTS` on purpose.
+  #
+  # This job is what makes the skip observable: it asserts the exact summary
+  # line (41 passed; 0 failed; 3 ignored) and the exact three ignored names, so
+  # the release lane cannot widen its own skip set, drop a test, or lose the
+  # target and still pass.
+  #
+  # What this lane does *not* defend: turning those three attributes into an
+  # unconditional `#[ignore]`. That yields byte-identical release output, so the
+  # guard below exits 0 by design. Blanket ignoring is caught by the
+  # pre-existing debug lane in `tests-unit` instead: `FRPS_CLI_TESTS: "44"`
+  # (`:278`) requires `test result: ok. 44 passed; 0 failed` (`:747`), so an
+  # unconditional `#[ignore]` fails hard there. The two guards cover different
+  # axes and neither makes the other redundant.
+  #
+  # Deliberately absent from `build`'s `needs` list: a cold release build costs
+  # ~5m at `-j 2` and must not serialize the artifact job. A red lane here
+  # blocks a merge only if branch protection names it ("Tests (release
+  # profile)").
   release-tests:
     name: Tests (release profile)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       FRPS_RELEASE_CLI_TESTS: "44"
-      # Exactly these three and no more; the value is the ignore reason each
-      # test carries in `frps/tests/cli_exit_codes.rs`.
+      # Exactly these three and no more: the test function names, in file order
+      # (the guard sorts both sides), that carry the release-only skip in
+      # `frps/tests/cli_exit_codes.rs`.
       FRPS_RELEASE_CLI_IGNORED: "config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorded_request config_dir_recorded_signal_fans_out_to_an_already_registered_service config_dir_where_every_task_panics_exits_nonzero"
     steps:
       - uses: actions/checkout@v4
@@ -1377,7 +1392,7 @@ jobs:
 
           if ! grep -q "test result: ok. ${expected_passed} passed; 0 failed; ${expected_ignored} ignored;" "$log.plain"; then
             echo "error: expected 'test result: ok. ${expected_passed} passed; 0 failed; ${expected_ignored} ignored;'." >&2
-            echo "       A blanket #[ignore] (or a pin that began running in release and failed)" >&2
+            echo "       a widened release skip (or a pin that stopped being skipped)" >&2
             echo "       must not pass this lane. Every 'test result' line:" >&2
             grep 'test result' "$log.plain" >&2 || true
             exit 1
