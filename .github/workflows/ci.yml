@@ -112,7 +112,7 @@ jobs:
         # is quiet too. So the total is pinned *outside*: this step requires the
         # suite's summary line verbatim, and 32
         # is what the scenarios in scripts/tests/repo-health-fixtures.sh print
-        # (the `TODO.md:7895` round added the in-file floor; a scenario added or
+        # (the `TODO.md:8127` round added the in-file floor; a scenario added or
         # removed there moves this literal — restore the checks rather than
         # lowering it). The `ok`-line count is the second half of the pin:
         # `printf 'RESULT: 32 …'; exec true` satisfies the literal but prints no
@@ -144,7 +144,7 @@ jobs:
         # total is pinned *outside*, the way the `log_completion` step below pins
         # its own 6: this step requires the suite's summary line verbatim, and 31
         # is what the scenarios in scripts/tests/compat-stray-guard.sh print (21
-        # before the `TODO.md:7914` round added the ordered `SHAPE` anchors, the
+        # before the `TODO.md:8146` round added the ordered `SHAPE` anchors, the
         # symlink `wait_exec` probe, the empty-`ps` branch and the failed-probe
         # kill-then-continue case; 31 after the round-2 pins exercised the loop's
         # empty-`cmd` guard, the exit-0-empty reap arm, and the second half of the

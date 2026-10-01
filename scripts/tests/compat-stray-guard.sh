@@ -40,7 +40,7 @@
 #   9  a `ps` that fails in the exit trap does not turn a live synthetic of ours
 #      into a stranger: an unidentifiable pid we started is still killed.
 #   10 `scripts/compat-test.sh` carries no pattern kill and its XTCP pre-test
-#      sweep is the pid-exact `reap_scoped_strays` (TODO.md:7866).
+#      sweep is the pid-exact `reap_scoped_strays` (TODO.md:8063).
 #   11 that sweep, driven against three real synthetic servers: the
 #      in-`$TEST_DIR` leak started after the baseline is reaped, while the
 #      baseline server and the same-named out-of-tree peer are left alone. This
@@ -91,7 +91,7 @@ fails=0
 # A total is not a *shape* though: deleting N assertions and adding N dummy
 # `ok` lines keeps the total and still exits 0 (measured against the count as
 # the only guard — that mutant is in the batch-E record), which is residue (d)
-# of TODO.md:7914. `SHAPE` below pins the count, the order and the *label* of
+# of TODO.md:8146. `SHAPE` below pins the count, the order and the *label* of
 # every assertion, so a scenario that stops running, a check that is deleted,
 # reordered, or a dummy added anywhere, all red. It compares labels, not bodies:
 # a check whose body is gutted behind an unchanged `ok` label is not a shape
@@ -168,7 +168,7 @@ WORK=""
 # direction. A `ps` probe that cannot run leaves the pid *unidentifiable*, and
 # an unidentifiable live child we started is ours to kill — reading it as "not
 # ours" is how every live synthetic outlived a `ps` failure (residue (a) of
-# TODO.md:7914). A pid the guard already reaped can be recycled before this trap
+# TODO.md:8146). A pid the guard already reaped can be recycled before this trap
 # runs, and killing a stranger is the hazard this suite pins; the probe is what
 # tells those apart, so only a probe we can trust is allowed to *forgive*.
 reap_own_synthetic() {
@@ -219,7 +219,7 @@ enforce_shape() {
 }
 
 # enforce_substance — the substance half of the floor, for the scenario-10
-# region that pins TODO.md:7866's fix. `enforce_shape` compares labels, and a
+# region that pins TODO.md:8063's fix. `enforce_shape` compares labels, and a
 # label survives a replaced body (`hits=''` behind the same `ok`), so that
 # region's exact source text is checksummed: the input derivation
 # (`compat_src=`, the comment strip) *and* both assertion blocks. Pinning only
@@ -374,7 +374,7 @@ spawn_fake() {
 # never match. It used to be `basename` of the *resolved* script path, which the
 # child's argv does not carry when the suite is invoked through a symlink with a
 # different name — the match failed before the exec and `wait_exec` returned 0
-# (residue (b) of TODO.md:7914). Nothing here depends on the file's name, so
+# (residue (b) of TODO.md:8146). Nothing here depends on the file's name, so
 # there is no alias to get wrong.
 wait_exec() {
   local pid=$1 i=0 cmd me
@@ -604,7 +604,7 @@ case "$out" in
 esac
 
 # --- scenario 7: `wait_exec`'s anchor survives an aliased invocation ---------
-# Residue (b) of TODO.md:7914. The probe child is this same file under a
+# Residue (b) of TODO.md:8146. The probe child is this same file under a
 # different name: `wait_exec "$$"` must still see its own pre-exec fork and
 # return 1. Any anchor derived from the script's own name fails here, which is
 # exactly the latent bug CI (which calls the direct path) could not see.
@@ -623,7 +623,7 @@ else
 fi
 
 # --- scenario 8: empty `ps` output is "cannot tell", not "the image changed" -
-# Residue (c) of TODO.md:7914. A probe that exits 0 with no output used to fall
+# Residue (c) of TODO.md:8146. A probe that exits 0 with no output used to fall
 # through to the `*) return 0` arm — an empty string does not contain the anchor
 # — so "the tool told us nothing" was read as "the helper has exec-ed".
 hdr 'scenario 8: wait_exec reads empty ps output as "cannot tell"'
@@ -667,7 +667,7 @@ fi
 kill -9 "$child_victim" 2>/dev/null || true
 
 # --- scenario 9: a failed ownership probe does not forgive a live synthetic --
-# Residue (a) of TODO.md:7914. The victim is a real synthetic of this run, under
+# Residue (a) of TODO.md:8146. The victim is a real synthetic of this run, under
 # `$WORK`, so the *real* predicate would match it; the point is that a probe
 # which cannot run must not be read as "not ours" and let it outlive the suite.
 hdr 'scenario 9: a failed ps probe does not turn a live synthetic into a stranger'
@@ -703,7 +703,7 @@ else
   kill -9 "$victim9b" 2>/dev/null || true
 fi
 
-# --- scenario 10: the XTCP pre-test cleanup is pid-exact (TODO.md:7866) ------
+# --- scenario 10: the XTCP pre-test cleanup is pid-exact (TODO.md:8063) ------
 # `run_xtcp_test` used two `pkill -f "frpc -c"` / `pkill -f "frps -c"` calls,
 # which select any process on the host whose command line carries that pattern —
 # a developer's unrelated run, or a sibling worktree's compat run. The
@@ -733,7 +733,7 @@ else
   bad "compat-test.sh kills by pattern again: $(printf '%s' "$hits" | tr '\n' ' ')"
 fi
 xtcp_body=$(awk '/^run_xtcp_test\(\)/{f=1} f{print} f&&/^}/{exit}' "$WORK/compat-test.code")
-# TODO.md:7866 replaced *two* pattern kills with a pid-exact pair, so the
+# TODO.md:8063 replaced *two* pattern kills with a pid-exact pair, so the
 # scenario has to see both halves inside `run_xtcp_test`: the tracked-pid reaper
 # (`cleanup_pids`, TODO 7866's first replacement) and the guard's baseline-aware
 # census sweep (`reap_scoped_strays`). Pinning only the latter let a mutant that
@@ -744,7 +744,7 @@ case "$xtcp_body" in *'reap_scoped_strays'*) xtcp_sweep=true ;; esac
 if $xtcp_sweep && [ "$xtcp_calls" -ge 1 ]; then
   ok 'compat-test.sh: run_xtcp_test sweeps with cleanup_pids and reap_scoped_strays'
 else
-  bad "compat-test.sh: run_xtcp_test's pre-test cleanup is incomplete (reap_scoped_strays=$xtcp_sweep, cleanup_pids calls=$xtcp_calls) — TODO.md:7866 needs both, one per pkill -f it replaced"
+  bad "compat-test.sh: run_xtcp_test's pre-test cleanup is incomplete (reap_scoped_strays=$xtcp_sweep, cleanup_pids calls=$xtcp_calls) — TODO.md:8063 needs both, one per pkill -f it replaced"
 fi
 # --- end substance pin: scenario-10 ---
 
