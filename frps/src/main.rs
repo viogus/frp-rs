@@ -393,21 +393,24 @@ fn run_verify(config_path: &str, strict_config: bool, allow_unsafe: &[String]) {
 // ── Logging / tracing init ────────────────────────────────────────────────────
 
 fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
-    // Go frp parity (TODO.md:8705): with an explicit `-c` the config file is
+    // Go frp parity (TODO.md:8733): with an explicit `-c` the config file is
     // authoritative for the whole `[log]` section, exactly as it is for the
     // config flags — the `-c` branch of `main` skips `override_server_config`
-    // (`frps/src/main.rs:1016-1018`), so consulting the CLI log flags here would
+    // (`frps/src/main.rs:1019-1021`), so consulting the CLI log flags here would
     // silently re-honour the very flags that gate exists to discard. Measured
     // on Go v0.71.0: `frps -c frps.toml --log-level info` over a file with
     // `[log] level = "warn"` emits 0 `INFO` records; before this gate frp-rs
     // emitted 11.
     //
-    // The predicate is `cli.config.is_none()`, not `!cli.cli_overrides_enabled()`:
-    // `--config-dir` is an frp-rs-only extension whose lane *does* honour the CLI
-    // log flags — its `init_logging(&cli, None)` call (`frps/src/main.rs:497`)
-    // has no config to defer to, and masking would be a no-op there only by
-    // accident of ordering (`collect_config_files` at `:513` runs after it).
-    let cli_log_flags_apply = cli.config.is_none();
+    // The predicate is `cli.config.is_none() || cli.config_dir.is_some()`, not
+    // `!cli.cli_overrides_enabled()`: `--config-dir` is an frp-rs-only extension
+    // whose lane *does* honour the CLI log flags — its `init_logging(&cli, None)`
+    // call (`frps/src/main.rs:500`) has no config to defer to, so masking there
+    // would silently drop the flag to the built-in default. When `-c` and
+    // `--config-dir` are given together it is the config-dir branch
+    // (`frps/src/main.rs:499`) that runs, so `cli.config_dir.is_some()` must
+    // override `cli.config.is_some()`.
+    let cli_log_flags_apply = cli.config.is_none() || cli.config_dir.is_some();
     let (cli_level, cli_file, cli_max_days, cli_format) = if cli_log_flags_apply {
         (
             cli.log_level.clone(),
@@ -439,7 +442,7 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     // `log.InitLogger` the *file's* `Log.DisablePrintColor`
     // (`cmd/frps/root.go:112`), so `frps -c frps.toml --disable-log-color=true`
     // is ignored by Go while frp-rs still honours it. Unlike the four log flags
-    // masked above, this one is not named by R1 (TODO.md:8705) and
+    // masked above, this one is not named by R1 (TODO.md:8733) and
     // `frps/tests/cli_exit_codes.rs:1945` (`disable_log_color_value_spelling_is_applied`)
     // pins the current behaviour, so changing it is a separate item.
     let ansi = logging::resolve_ansi(
@@ -779,7 +782,7 @@ async fn run(mut cli: FrpsArgs) {
                                 // (`frp-server/src/service.rs:2276`) — so this
                                 // arm means the service stopped for good. The
                                 // single-config path maps any `run()` error to
-                                // `EXIT_RUNTIME` (`frps/src/main.rs:1119-1122`),
+                                // `EXIT_RUNTIME` (`frps/src/main.rs:1122-1125`),
                                 // and this lane carries the same code out,
                                 // pinned on both lanes by
                                 // `config_dir_where_every_service_fails_to_run_exits_like_dash_c`

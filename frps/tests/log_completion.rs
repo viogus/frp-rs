@@ -507,8 +507,8 @@ fn cli_empty_log_file_keeps_logging_on_stdout() {
 // `[web_server.tls] enable = true`: the inert-key warning is a `WARN` record
 // emitted on every build right after `init_logging`
 // (`presence.warn_inert_web_server_tls_enable`, called at
-// `frps/src/main.rs:1034`), while the startup marker is an `INFO` record
-// (`frps/src/main.rs:1040`). So
+// `frps/src/main.rs:1037`), while the startup marker is an `INFO` record
+// (`frps/src/main.rs:1043`). So
 // "`web_server.tls.enable has no effect` present **and** `frps (Rust) v` absent"
 // pins the effective level at *exactly* `warn`: `info` would add the marker,
 // `error` would drop the warning.
@@ -652,17 +652,19 @@ fn cli_empty_log_level_does_not_raise_the_files_warn() {
 
 // ── `-c <file>`: the file is authoritative for the whole `[log]` section ─────
 //
-// R1 (`TODO.md:8705`). On Go's `-c` lane the pflag-bound struct is discarded
+// R1 (`TODO.md:8733`). On Go's `-c` lane the pflag-bound struct is discarded
 // wholesale — `cmd/frps/root.go:67-83` takes the file branch, so `runServer` at
 // `cmd/frps/root.go:112` inits the logger from the *file's* `cfg.Log` — and
 // `frps -c frps.toml --log-level info` over a file with `[log] level = "warn"`
 // therefore prints **0** records. Pre-fix, frp-rs gated only
-// `override_server_config` on `cli_overrides_enabled` (`frps/src/main.rs:1016-1018`)
-// while `init_logging` (`frps/src/main.rs:1021`) still read the raw CLI value:
+// `override_server_config` on `cli_overrides_enabled` (`frps/src/main.rs:1019-1021`)
+// while `init_logging` (`frps/src/main.rs:1024`) still read the raw CLI value:
 // measured on that binary the same argv printed **11** `INFO` records (2434 B)
 // and `--log-level debug` printed 11 `INFO` + 3 `DEBUG` (2860 B), while the
-// no-flag control printed 0 B. `init_logging` now masks the four CLI log flags
-// whenever a `-c` config was loaded.
+// no-flag control printed 231 B / 0 `INFO` / 1 `WARN` — `level_config` always
+// adds the inert `[web_server.tls] enable` warning, which `assert_exactly_warn`
+// requires. `init_logging` now masks the four CLI log flags whenever a `-c`
+// config was loaded and no `--config-dir` is in play.
 //
 // Reverting the mask (an `init_logging` that always reads the CLI) reds arm 1
 // below inside `assert_exactly_warn`'s startup-marker assertion with 11 `INFO`
@@ -717,6 +719,38 @@ fn cli_nonempty_log_level_flag_does_not_override_the_config_file() {
             "implicit lane: a non-empty flag must still raise the level; no \
              `{STARTUP_MARKER}` record on stdout\n--- stdout ({} B) ---\n{out}",
             out.len(),
+        );
+    }
+
+    // Arm 4: `-c` and `--config-dir` **together**. The config-dir branch
+    // (`frps/src/main.rs:499`) is the one that runs, and its
+    // `init_logging(&cli, None)` (`frps/src/main.rs:500`) honours the CLI flags,
+    // so `--log-level warn` must still be applied. Masking on
+    // `cli.config.is_some()` alone made this arm print 11 `INFO` records
+    // (2092 B on this scratch fixture), byte-identical to dropping the flag.
+    let port = free_port();
+    let cfg = level_config(port, "warn");
+    {
+        let dir = TempDir::new("spawn-cfgdir");
+        dir.write("frps.toml", &cfg);
+        std::fs::create_dir_all(dir.0.join("cfgdir")).expect("create cfgdir");
+        dir.write("cfgdir/frps.toml", &cfg);
+        let spawned = Spawned::start_in(
+            dir,
+            &[
+                "-c",
+                "frps.toml",
+                "--config-dir",
+                "cfgdir",
+                "--log-level",
+                "warn",
+            ],
+        );
+        assert_loopback_listens(port);
+        std::thread::sleep(SETTLE);
+        assert_exactly_warn(
+            "-c frps.toml --config-dir cfgdir --log-level warn",
+            &spawned,
         );
     }
 }
@@ -791,7 +825,7 @@ fn fresh_rotation_file(dir: &TempDir) -> Option<PathBuf> {
 }
 
 /// True when the fresh rotation file already carries the record `frps` writes
-/// **after** `init_logging` returns ([`STARTUP_MARKER`], `frps/src/main.rs:1040`).
+/// **after** `init_logging` returns ([`STARTUP_MARKER`], `frps/src/main.rs:1043`).
 ///
 /// Mere existence is not evidence that anything ran: `tracing_appender::rolling::daily`
 /// creates `logs/frps.log.<date>` eagerly when it is constructed
