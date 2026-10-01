@@ -315,15 +315,17 @@ Block inventory, from the function's own comment landmarks:
   the `TODO.md` progress paragraph.
 
 - Inline tests of `frp-server/src/control/bridge.rs` → `frp-server/src/control/bridge/tests.rs`
-  (parent file kept, sibling module dir, as in the entry above) — PR #451 at code head `51568e80`
-  (based on `f881d15e`), commit `79f7494b`: 5449 → 3324 lines. Every body line is identical apart
-  from one indent level (1963 of the 2124 body lines de-indented; 161 kept byte-verbatim because they
-  begin inside a multi-line literal), so the 563 extracted string/char literal values are identical
-  before and after, and `-- --list` is the same 46 `control::bridge::tests::*` names.
+  (parent file kept, sibling module dir, as in the entry above) — PR #451 at code head `0531827c`
+  (based on `18bcd1ad`), commit `0e2c83fc`: 5449 → 3324 lines. Every body line is identical apart
+  from one indent level (of the module's 2124 body lines, 1963 are de-indented exactly one level and
+  161 stay byte-verbatim — 142 blank and 19 beginning inside a multi-line literal), so the 563
+  extracted string/char literal values are identical before and after, and `-- --list` is the same 46
+  `control::bridge::tests::*` names.
 - Inline tests of `frp-server/src/ssh_gateway.rs` → `frp-server/src/ssh_gateway/tests.rs` (plus
-  `key_tests.rs`, `virtual_ctrl_tests.rs`, `preauth_tests.rs`) — PR #451 at code head `51568e80`
-  (based on `f881d15e`), commit `51568e80`: 4864 → 2749 lines. Same invariants (2026 of the 2123
-  body lines de-indented, 10 byte-verbatim, 817 literal values unchanged, the same 70
+  `key_tests.rs`, `virtual_ctrl_tests.rs`, `preauth_tests.rs`) — PR #451 at code head `0531827c`
+  (based on `18bcd1ad`), commit `0531827c`: 4864 → 2749 lines. Same invariants (of the four bodies'
+  2111 lines, 1960 are de-indented exactly one level and 151 stay byte-verbatim — 141 blank and 10
+  beginning inside a multi-line literal; 817 literal values unchanged; the same 70
   `ssh_gateway::*` names). **Plan correction:** the P8 Step-0 table lists only `ssh_gateway/tests.rs`
   (1992–3785, 1794 lines), but the ~2740 target stated for this file is its 2742 production lines, so
   all four inline modules moved in the one commit.
