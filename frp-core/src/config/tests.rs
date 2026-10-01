@@ -12282,6 +12282,42 @@ fn legacy_ini_without_common_start_scalar_is_a_v1_shape() {
     }
 }
 
+/// **Item 5: an unknown key merged out of `[common]` is still refused in strict
+/// mode (recorded divergence, `c1.ini`).**
+///
+/// Go v0.71.0 reads `[common]` into a typed struct that ignores a key it does not
+/// name, so `c1.ini` (`[common] server_addr + zzz_unknown_common = 1`) is rc 0 in
+/// both loader modes. frp-rs is rc 0 loose but rc 1 strict
+/// (`unknown field "zzz_unknown_common"`), because the `[common]` hoist
+/// (`frp-core/src/config/normalize.rs:1162`) moves the key to the top level before
+/// the top-level strict walk and the `.ini` exemption does not reach it. The
+/// item's Done-when allows the measurement instead of a fix — exempting the keys
+/// the merge created would also blind the top-level check to a genuine v1 typo
+/// spelled under `[common]`. The recommended `docs/config.md` wording is carried
+/// in the batch report; this pin keeps the residual visible.
+#[test]
+fn legacy_ini_common_unknown_key_residual_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c1.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nzzz_unknown_common = 1\n",
+    )
+    .unwrap();
+    assert!(
+        load_client_config(path.to_str().unwrap(), false).is_ok(),
+        "loose mode drops it, exactly like Go"
+    );
+    let err = format!(
+        "{}",
+        load_client_config(path.to_str().unwrap(), true).unwrap_err()
+    );
+    assert!(
+        err.contains("unknown field \"zzz_unknown_common\""),
+        "strict residual: Go is rc 0 here, frp-rs reports the merged top-level key: {err}"
+    );
+}
+
 /// **A DefaultSection `start` never filters; `[common] start` does.**
 ///
 /// Go fills the legacy common config from `[common]` alone
