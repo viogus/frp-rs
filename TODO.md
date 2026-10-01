@@ -6756,6 +6756,18 @@ nothing about whether the described behaviour still holds.
   ranking, block inventory, validation bar and hazards:
   [`docs/refactor-large-modules.md`](docs/refactor-large-modules.md).
 
+  **Progress (2026-10-01, code head `174f1a02` on `refactor/extract-ws-listener`, PR #436).** The
+  first P1 seam landed: the dedicated-`websocket_port` accept loop moved byte-for-byte out of
+  `frp-server/src/service.rs::run` into `frp-server/src/service/listeners.rs` as
+  `pub(super) async fn start_websocket_listener(&self, rate_limiter_enabled: bool)` — 289 payload
+  lines / 23 677 bytes `cmp`-identical, `frp-server/src/service.rs` 2671 → 2386 lines. The extracted
+  block had **no** coverage at all (every lane that enables `websocket` also enables `kcp`, and
+  `websocket_port` defaults to 0), so the round adds
+  `frp-server/tests/transport_e2e_websocket_port.rs` (in-process frps + frpc over the dedicated port,
+  256 KiB then 64 KiB echo, `tcp_mux` off and on) and the `websocket`-without-`kcp` curated CI lane.
+  The remaining blocks (HTTP vhost, HTTPS vhost, TCPMux, SSH tunnel gateway, KCP, QUIC, dashboard,
+  `tasks.rs`) are tracked in the plan doc, which now records what has landed.
+
 - [x] **Three vendored crates are a standing maintenance liability.**
   Evidence: `vendor/rustls` (TLS, patched), `vendor/yamux` (5 patches),
   `vendor/russh` (2 patches). `[patch.crates-io]` pins them: upstream security
