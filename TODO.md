@@ -9282,3 +9282,41 @@ section; ledger now **24 open / 104 closed**.**
   reordered shapes, so for the gate and run_id orders a plugin-hook-invocation or pre-auth log-line
   assertion is needed, not a response-text one — and `throttled_login_error`'s LoginResp message text
   is asserted the way the gate's is in `frp-server/tests/login_replay_throttle.rs`.
+
+- [x] **A server config that writes `kcp_bind_port` / `quic_bind_port` / `websocket_port` without its feature was accepted by strict mode and then silently dropped by the run path.**
+  In a build without the feature, `known_server_keys()` (`frp-core/src/config/strict.rs:9-129`) lists all six spellings
+  (`:16`, `:17`, `:21` for the snake forms, `:100`, `:101`, `:105` for the `kcpBindPort`/`quicBindPort`/`websocketPort`
+  aliases) while the three `ServerConfig` fields are `#[cfg(feature = "…")]`-gated (`frp-core/src/config/server.rs:23-25`,
+  `:26-28`, `:39-41`, mirrored at `:201`/`:203`/`:226`/`:228`/`:344`/`:346`/`:351`), so serde drops the key during
+  `from_value` and frp-server's only readers — the `> 0` gates at `frp-server/src/service.rs:771`, `:1275`, `:1290` and
+  `frp-server/src/service/listeners.rs:19-20` — never see it. Measured at base `f881d15e` on
+  `cargo build -p frps --no-default-features --features micro` (binary `target/debug/frps-micro`, 31 724 264 bytes):
+  a config carrying `websocketPort = 7500` gave `frps: the configuration file … syntax is ok` rc 0 from **both**
+  `verify -c` and `verify --strict-config -c`, while the control `zzzPort = 7500` was still refused with
+  `unknown field "zzzPort" in config file …` rc 1 — strict mode was live, just blind to this class; the run path
+  bound only `bindPort` and logged nothing. Scope is the server only: `frp-core/src/config/client.rs` carries no
+  `#[cfg(feature …)]` at all, so `known_client_keys()` (`frp-core/src/config/strict.rs:131-237`) has nothing that can
+  go stale, and neither `quic_options` nor `virtual_net` is gated.
+  **Done-when:** a load that carries a feature-gated key the build cannot honour is either refused or warned about once per load, in every build shape, with tests pinning both a feature-enabled and a feature-disabled build.
+  **Done (2026-10-02, at code head `5067d8c7`, records `PLACEHOLDER_RECORDS_SHA`, PR #455, based on `f881d15e`) — warned, once per load, for a non-zero port; the key stays accepted.**
+  The new `ConfigPresence::warn_unhonoured_server_feature_keys()` (`frp-core/src/config/loader.rs`) is called from the
+  three server load sites that own a log sink — the two post-`init_logging` `frps` startup branches
+  (`frps/src/main.rs`) and the SIGUSR1 reload (`frp-server/src/service.rs`) — and emits one `tracing::warn!` per
+  non-zero ungated port, naming both spellings and the remedy (`<key> = 0`, the documented "disabled" value, or
+  rebuild with the feature). `= 0` and absent stay silent because every build shape honours `0`. Rejection was
+  rejected: `docs/deployment.md:779-782` names refusal the "false 400" direction this accepted-key class deliberately
+  avoids, and `strict_config` defaults to true (`frp-core/src/cli.rs:550`) while the repo's own documented
+  `frps.toml:21-23` writes non-zero `kcp_bind_port`/`quic_bind_port`, so rejecting would make `frps -c frps.toml`
+  refuse to start in every micro/tiny build and break the `known_server_keys()` invariant at
+  `frp-core/src/config/strict.rs:123-127`. `frps verify` stays silent, exactly like the `tls_enable` diagnostic.
+  Both directions are pinned in `frp-core/src/config/tests.rs:290-580`: three `#[cfg(feature = "…")]`
+  `…_enabled_honours_the_port` tests (default lane, `5 passed`), six `#[cfg(not(feature = "…"))]`
+  `…_disabled_reports_the_dropped_port` / `…_disabled_is_silent_for_zero_or_absent` tests over both spellings ×
+  {top level, `[common]`} (`--no-default-features` lane, `8 passed`), plus two class pins that run in every shape —
+  `feature_gated_server_ports_stay_known_to_strict_mode_in_every_build` (`:528`) and
+  `feature_gated_server_field_set_matches_the_pinned_scope` (`:559`). Neutering `fn port_requested`
+  (`frp-core/src/config/loader.rs:565`) reds the three report tests at `frp-core/src/config/tests.rs:372:13`, `:428:13`,
+  `:485:13`. The `+159`/`+292`/`+5`/`+10` inserted lines moved 31 `path:line` cites, repointed in the same branch
+  (`28564342`; 308 live cites re-checked by content, 0 mismatches).
+  Ledger after this batch: **19 open / 182 closed** (base `f881d15e`: 19 open / 181 closed; the item is filed and
+  closed in the same PR, so only the closed count moves).
