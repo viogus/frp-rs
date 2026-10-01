@@ -8134,6 +8134,7 @@ section; ledger now **24 open / 104 closed**.**
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7630`): a
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7204`): a
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7617`): a
+  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7616`): a
   test that pins less than its name claims, so a real regression stays green.
   (a) The pinned warning bytes are the shipped static, but the **emitted** record is only
   substring-checked: `frp-core/tests/server_tls_enable_warning.rs:441` asserts
@@ -9274,7 +9275,7 @@ section; ledger now **24 open / 104 closed**.**
 - [x] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
   Filed by the coordinator while closing `TODO.md:8533` (PR #430), which removed the two local `pkill -f`
 - [ ] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
-  Filed by the coordinator while closing `TODO.md:8460` (PR #430), which removed the two local `pkill -f`
+  Filed by the coordinator while closing `TODO.md:8459` (PR #430), which removed the two local `pkill -f`
   calls in `scripts/compat-test.sh`: `scripts/remote-frps.sh:195` and `:339` still run
   `pkill -f 'frps -c frps.toml'` and `:409` uses `pgrep -f` on the same text, over ssh, to manage the
   comparison server on a remote VPS. Name-plus-argument is the same hazard the local sweep just lost — a
