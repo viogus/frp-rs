@@ -117,9 +117,18 @@ jobs:
         # literal — restore the checks rather than lowering it). In-file,
         # `enforce_substance` also checksums the scenario-6 metric check and the
         # scenario-7 aliased-crate-root check byte-for-byte, so gutting either
-        # verdict reds there too. The `ok`-line count is the second half of the
-        # pin: `printf 'RESULT: 32 …'; exec true` satisfies the literal but
-        # prints no assertion lines at all.
+        # verdict reds there too. The step additionally pins the enforcer's own
+        # success line, `pinned regions verified 2/2: scenario-6 scenario-7`, so a
+        # disabled EXIT trap or a skipped check reds here even when the summary
+        # looks intact, and that literal carries the expected region set outside
+        # the guarded file. It also pins the enforcer's live canary line,
+        # `enforcer canary: injected mismatch detected, injected count mismatch
+        # detected`, which the suite prints only after it has injected a wrong
+        # hash, a wrong set and a wrong count and seen each recorded — so a
+        # one-line `got=$want`/`if false` that neuters the comparison reds here
+        # instead of sailing through with the summary intact. The `ok`-line count
+        # is the second half of the pin: `printf 'RESULT: 32 …'; exec true`
+        # satisfies the literal but prints no assertion lines at all.
         shell: bash
         run: |
           set -o pipefail
@@ -128,13 +137,30 @@ jobs:
           bash scripts/tests/repo-health-fixtures.sh 2>&1 | tee "$log" || status=1
           grep -qF 'RESULT: 32 fixture check(s) hold' "$log" || status=1
           [ "$(grep -c '^  ok ' "$log" || true)" = "32" ] || status=1
+          # F3/F4 (adversarial round 5): the suite must *say* it verified the
+          # substance pins, and name the regions in order. The in-file checks
+          # were previously CI-invisible — `trap - EXIT` or `elif false` printed
+          # the 32 `ok` lines and the RESULT line and exited 0 — and pinning only
+          # the total let a coordinated marker+hash+list edit drop a region
+          # silently. This literal is the only record of the expected set
+          # outside the guarded file, so any of those leaves it absent and reds
+          # the step.
+          grep -qF 'pinned regions verified 2/2: scenario-6 scenario-7' "$log" || status=1
+          # F7 (adversarial round 5 addendum): the `pinned regions verified` line
+          # above proves the loop ran, not that its *comparison* still works — a
+          # one-line `got=$want`/`if false` in the enforcer made every pin compare
+          # equal while that line still printed. So the suite must also prove it
+          # detected a mismatch it injected on purpose: it canaries the region
+          # hash, the region set and the count, and prints the literal below only
+          # after all three fire. Its absence means the detection is neutered.
+          grep -qF 'enforcer canary: injected mismatch detected, injected count mismatch detected' "$log" || status=1
           if [ "$status" != "0" ]; then
-            echo "::error::repo-health fixture checks did not report 32 checks"
-            echo "::error::scripts/tests/repo-health-fixtures.sh must print 32 '  ok' lines and end with 'RESULT: 32 fixture check(s) hold'; a smaller total, a failure line or no output means scenarios were skipped, neutered or swallowed by an \`exec\` — restore them rather than lowering this literal"
+            echo "::error::repo-health fixture checks did not report 32 checks, verified pins and a live enforcer canary"
+            echo "::error::scripts/tests/repo-health-fixtures.sh must print 32 '  ok' lines, end with 'RESULT: 32 fixture check(s) hold', print 'pinned regions verified 2/2: scenario-6 scenario-7' and print 'enforcer canary: injected mismatch detected, injected count mismatch detected'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped substance check or a neutered comparison means scenarios were skipped, neutered or swallowed — restore them rather than lowering this literal"
             cat "$log"
             exit 1
           fi
-          echo "repo-health fixture checks ok: 32 checks hold"
+          echo "repo-health fixture checks ok: 32 checks hold, pins verified 2/2, enforcer canary live"
       # The compat harness's stray-process guard, driven against synthetic
       # `frps`/`frpc` peers (no Go toolchain, no compat run): it pins that the
       # guard's match is the scratch directory *and* the process name — a
@@ -161,8 +187,17 @@ jobs:
         # byte-for-byte — for scenario 10 the `compat_src=` input derivation plus
         # both assertions, for the others the whole scenario body — so forging the
         # text those checks read reds there as well (as does gutting a verdict in
-        # place). A scenario added or removed here moves this literal — restore
-        # the checks rather than lowering it.
+        # place). The step additionally pins the enforcer's own success line,
+        # `pinned regions verified 4/4: scenario-2 scenario-10 scenario-12
+        # scenario-13`, so a disabled EXIT trap or a skipped check reds here even
+        # when the summary looks intact, and that literal carries the expected
+        # region set outside the guarded file. It also pins the enforcer's live
+        # canary line, `enforcer canary: injected mismatch detected, injected
+        # count mismatch detected`, printed only after the suite injected a wrong
+        # hash, a wrong set and a wrong count and saw each recorded — so a
+        # one-line `got=$want`/`if false` that neuters the comparison reds here.
+        # A scenario added or removed here moves the `pinned regions` literal —
+        # restore the checks rather than lowering it.
         shell: bash
         run: |
           set -o pipefail
@@ -171,13 +206,24 @@ jobs:
           bash scripts/tests/compat-stray-guard.sh 2>&1 | tee "$log" || status=1
           grep -qF 'RESULT: 40 fixture check(s) hold' "$log" || status=1
           [ "$(grep -c '^  ok ' "$log" || true)" = "40" ] || status=1
+          # F3/F4 (adversarial round 5): same positive-evidence pin as the
+          # repo-health step above. `trap - EXIT` or `elif false` used to keep
+          # this step green while the substance check never ran, and pinning only
+          # the total let three coordinated edits drop scenario-13. This literal
+          # carries the expected region set outside the guarded file.
+          grep -qF 'pinned regions verified 4/4: scenario-2 scenario-10 scenario-12 scenario-13' "$log" || status=1
+          # F7 (adversarial round 5 addendum): same live-canary pin as the
+          # repo-health step above — the region check, the set check and the count
+          # check each had a mismatch injected and each had to be recorded. A
+          # `got=$want` or `if false` in the enforcer leaves this line absent.
+          grep -qF 'enforcer canary: injected mismatch detected, injected count mismatch detected' "$log" || status=1
           if [ "$status" != "0" ]; then
-            echo "::error::compat stray-guard fixture checks did not report 40 checks"
-            echo "::error::scripts/tests/compat-stray-guard.sh must print 40 '  ok' lines and end with 'RESULT: 40 fixture check(s) hold'; a smaller total, a failure line or no output means scenarios were skipped, neutered or swallowed by an \`exec\` — restore them rather than lowering this literal"
+            echo "::error::compat stray-guard fixture checks did not report 40 checks, verified pins and a live enforcer canary"
+            echo "::error::scripts/tests/compat-stray-guard.sh must print 40 '  ok' lines, end with 'RESULT: 40 fixture check(s) hold', print 'pinned regions verified 4/4: scenario-2 scenario-10 scenario-12 scenario-13' and print 'enforcer canary: injected mismatch detected, injected count mismatch detected'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped substance check or a neutered comparison means scenarios were skipped, neutered or swallowed — restore them rather than lowering this literal"
             cat "$log"
             exit 1
           fi
-          echo "compat stray-guard fixture checks ok: 40 checks hold"
+          echo "compat stray-guard fixture checks ok: 40 checks hold, pins verified 4/4, enforcer canary live"
       - name: RSS soak — run-dir guard + summary fixture
         run: bash scripts/tests/rss-soak-run-dir.sh
 

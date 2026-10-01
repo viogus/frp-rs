@@ -79,6 +79,19 @@ while [ -L "$self" ]; do
     *)  self=$dir/$link ;;
   esac
 done
+# F1 (adversarial round 5): bind the resolved path, and have the enforcer compare
+# what `region_sha` read against *that* binding instead of against `$self`
+# itself. While `region_sha` reported `$self` and `enforce_substance` compared it
+# with `$self`, the check was a tautology — the same mutable global on both
+# sides — so one inserted `self=<unmodified copy>` line redirected every pin to
+# a file the edit never touched (measured GREEN on both suites). `readonly self`
+# alone is not enough either: on bash 3.2 (macOS) a reassignment of a readonly
+# is reported but *ignored* — the old value survives and the script still exits
+# 0 — so the guarantee has to live in the comparison. `SELF_REAL` is captured
+# once here, before anything else can run, and is the value `region_pin_check`
+# holds every checksum path against: a pre-call `self=<copy>` now reads the
+# wrong file and reds on every bash.
+readonly SELF_REAL="$self"
 ROOT=$(cd -P -- "$(dirname -- "$self")/../.." && pwd)
 LIB="$ROOT/scripts/lib/compat-stray-guard.sh"
 
@@ -300,47 +313,163 @@ region_sha() {   # $1 = region name, spelled as between the `substance pin:` mar
     $tool | awk '{print $1}')
   printf '%s\n%s\n' "$self" "$hash"
 }
-enforce_substance() {
-  local name const got want found checked=0 expected_self=${self:-} out='' sha_file=''
-  found=$(sed -n 's/^# --- substance pin: \([^ ]*\).*/\1/p' "$self" | tr '\n' ' ')
-  found=${found% }
-  if [ "$found" != "$PINNED_REGIONS" ]; then
+# --- the enforcer's comparisons, in one place each ----------------------------
+# The real checks and the canary in `enforce_substance` both go through these,
+# so an edit that makes a comparison trivially true (`got=$want`, `if false`,
+# `|| true`) stops the canary from seeing the mismatch it injects and the suite
+# reds. This is the whole point: the pins are worthless if the code that reads
+# them can be neutered while the summary stays green (adversarial round 5, F7).
+region_set_mismatch() { [ "$1" != "$2" ]; }
+region_count_mismatch() { [ "$1" -ne "$2" ]; }
+
+# $1 = region name, $2 = pinned constant name (for the diagnostic), $3 = the
+# pinned expectation. Hashes the region from *this* file and returns 0 only if
+# the hash came from here and equals $3.
+region_pin_check() {
+  local name=$1 const=$2 want=$3 out sha_file got
+  out=$(region_sha "$name") || return 1
+  sha_file=${out%%$'\n'*}
+  got=${out#*$'\n'}
+  if [ "$sha_file" != "${SELF_REAL:-}" ]; then
+    printf 'FAIL  %s substance pin was checksummed from %s, expected %s — the enforcer read the wrong file\n' \
+      "$name" "${sha_file:-<unset>}" "${SELF_REAL:-<unset>}" >&2
+    return 1
+  fi
+  if [ "$got" != "$want" ]; then
+    printf 'FAIL  %s region changed: sha256 %s, pinned %s\n' \
+      "$name" "${got:-<none>}" "$want" >&2
+    printf '      deliberate edit? set %s in %s to the value above\n' \
+      "$const" "${self:-this script}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# $1 = the marker set actually found, $2 = the expected set. Prints the FAIL and
+# returns 1 on a mismatch. The canary below calls this same function with a
+# deliberately wrong pair, so an edit that makes the comparison trivially true
+# (`if false`, `|| true`, `return 0` first) stops the canary from seeing its
+# injected mismatch and reds the suite.
+region_set_verdict() {
+  if region_set_mismatch "$1" "$2"; then
     printf 'FAIL  pinned-region set changed: markers name [%s], expected [%s]\n' \
-      "$found" "$PINNED_REGIONS" >&2
+      "$1" "${2:-<unset>}" >&2
     printf '      restore the `substance pin:` markers (or move PINNED_REGIONS with them) in %s\n' \
       "${self:-this script}" >&2
     return 1
   fi
-  # shellcheck disable=SC2086  # intentional word split: PINNED_REGIONS is a name list
-  for name in $PINNED_REGIONS; do
-    case $name in
-      scenario-2)  const=SCEN2_REGION_SHA;  want=$SCEN2_REGION_SHA ;;
-      scenario-10) const=SCEN10_REGION_SHA; want=$SCEN10_REGION_SHA ;;
-      scenario-12) const=SCEN12_REGION_SHA; want=$SCEN12_REGION_SHA ;;
-      scenario-13) const=SCEN13_REGION_SHA; want=$SCEN13_REGION_SHA ;;
-    esac
-    out=$(region_sha "$name") || return 1
-    sha_file=${out%%$'\n'*}
-    got=${out#*$'\n'}
-    if [ "$sha_file" != "$expected_self" ]; then
-      printf 'FAIL  %s substance pin was checksummed from %s, expected %s — the enforcer read the wrong file\n' \
-        "$name" "${sha_file:-<unset>}" "${expected_self:-<unset>}" >&2
+  return 0
+}
+
+# $1 = the number of regions actually checksummed, $2 = the expected count.
+# Fails closed and visibly on a missing or non-numeric expectation (F2): the
+# compare must never expand unbound inside the EXIT trap.
+region_count_verdict() {
+  case ${2:-} in
+    '' | *[!0-9]*)
+      printf 'FAIL  the pinned-region count is missing or not a number (PINNED_REGION_COUNT=%s); the count gate cannot run\n' \
+        "${2:-<unset>}" >&2
       return 1
-    fi
-    if [ "$got" != "$want" ]; then
-      printf 'FAIL  %s region changed: sha256 %s, pinned %s\n' \
-        "$name" "${got:-<none>}" "$want" >&2
-      printf '      deliberate edit? set %s in %s to the value above\n' \
-        "$const" "${self:-this script}" >&2
-      return 1
-    fi
-    checked=$((checked + 1))
-  done
-  if [ "$checked" -ne "$PINNED_REGION_COUNT" ]; then
+      ;;
+  esac
+  if region_count_mismatch "$1" "$2"; then
     printf 'FAIL  substance check verified %s region(s), expected %s [%s]\n' \
-      "$checked" "$PINNED_REGION_COUNT" "$PINNED_REGIONS" >&2
+      "$1" "$2" "${PINNED_REGIONS:-<unset>}" >&2
     return 1
   fi
+  return 0
+}
+
+# One checked region, counted whether or not it matched. Both the real loop and
+# the canary call this, so swallowing a mismatch (`|| true`) or dropping the
+# call leaves the counters the canary inspects unchanged. `PIN_CHECKED` and
+# `PIN_FAILS` are globals initialised at the top of `enforce_substance`;
+# `record_pin_check` is always called directly, never in a `$( … )` subshell, so
+# the increments do escape.
+record_pin_check() {   # $1 = region name, $2 = constant name, $3 = expectation
+  PIN_CHECKED=$((PIN_CHECKED + 1))
+  region_pin_check "$1" "$2" "$3" || PIN_FAILS=$((PIN_FAILS + 1))
+}
+
+enforce_substance() {
+  local name const want found canary_checked canary_fails
+  # F2 (adversarial round 5): every guarded read below uses `${var:-}` so that a
+  # deleted definition reaches an explicit FAIL instead of expanding unbound.
+  # Under `set -u` an unbound expansion *inside the EXIT trap* prints its error,
+  # leaves bash exiting 0 and silently skips the gate (measured: delete
+  # `PINNED_REGION_COUNT` → rc 0, CI green). The trap calls are also wrapped in
+  # subshells so any future fatal error becomes a nonzero rc rather than exit 0.
+  PIN_CHECKED=0
+  PIN_FAILS=0
+  found=$(sed -n 's/^# --- substance pin: \([^ ]*\).*/\1/p' "$self" | tr '\n' ' ')
+  found=${found% }
+  # --- enforcer canary (F7, adversarial round 5) ------------------------------
+  # The pins only mean something while the mismatch detection itself works, and
+  # that detection lives here in the same unpinned prologue. So inject a
+  # deliberately wrong expectation and require the enforcer's own counters to
+  # record it: if a comparison has been neutered (`got=$want`, `if false`,
+  # `|| true`), the injected mismatch reads as a match, `canary_fails` stays 0
+  # and the suite reds here. The expected diagnostic is discarded.
+  record_pin_check scenario-2 SCEN2_REGION_SHA 'enforcer-canary-not-a-sha' 2>/dev/null
+  canary_checked=$PIN_CHECKED
+  canary_fails=$PIN_FAILS
+  PIN_CHECKED=0
+  PIN_FAILS=0
+  if [ "$canary_fails" -eq 0 ] || [ "$canary_checked" -ne 1 ]; then
+    printf 'FAIL  enforcer canary: an injected wrong pin was not recorded as a mismatch (checked=%s, fails=%s); the region comparison is neutered\n' \
+      "$canary_checked" "$canary_fails" >&2
+    return 1
+  fi
+  # Same functions the real checks below call, driven with a deliberately wrong
+  # expectation in each direction; their diagnostics are the point of the
+  # exercise, so they are discarded here.
+  if region_set_verdict "$found" "$found" 2>/dev/null; then :; else
+    printf 'FAIL  enforcer canary: the pinned-region set comparison is neutered\n' >&2
+    return 1
+  fi
+  if region_set_verdict "$found" "${found}-enforcer-canary" 2>/dev/null; then
+    printf 'FAIL  enforcer canary: the pinned-region set comparison is neutered\n' >&2
+    return 1
+  fi
+  if region_count_verdict 1 1 2>/dev/null; then :; else
+    printf 'FAIL  enforcer canary: the count comparison is neutered\n' >&2
+    return 1
+  fi
+  if region_count_verdict 1 2 2>/dev/null; then
+    printf 'FAIL  enforcer canary: the count comparison is neutered\n' >&2
+    return 1
+  fi
+  # Positive evidence that the canary ran, printed only after it passed; the
+  # `health` CI step greps this exact literal, so deleting or neutering the
+  # canary reds CI even when the summary looks intact.
+  printf 'enforcer canary: injected mismatch detected, injected count mismatch detected\n'
+  region_set_verdict "$found" "${PINNED_REGIONS:-}" || return 1
+  # shellcheck disable=SC2086  # intentional word split: PINNED_REGIONS is a name list
+  for name in ${PINNED_REGIONS:-}; do
+    case $name in
+      scenario-2)  const=SCEN2_REGION_SHA;  want=${SCEN2_REGION_SHA:-} ;;
+      scenario-10) const=SCEN10_REGION_SHA; want=${SCEN10_REGION_SHA:-} ;;
+      scenario-12) const=SCEN12_REGION_SHA; want=${SCEN12_REGION_SHA:-} ;;
+      scenario-13) const=SCEN13_REGION_SHA; want=${SCEN13_REGION_SHA:-} ;;
+      *)
+        printf 'FAIL  unguarded region name in PINNED_REGIONS: %s\n' "$name" >&2
+        return 1
+        ;;
+    esac
+    record_pin_check "$name" "$const" "$want"
+  done
+  if [ "$PIN_FAILS" -ne 0 ]; then
+    printf 'FAIL  %s pinned region(s) changed; see the diagnostics above\n' "$PIN_FAILS" >&2
+    return 1
+  fi
+  region_count_verdict "$PIN_CHECKED" "${PINNED_REGION_COUNT:-}" || return 1
+  # F3/F4 (adversarial round 5): positive evidence that this check ran, printed
+  # only on the success path. It names the regions in order and the `health` CI
+  # step greps this exact literal, so the expected set lives *outside* the
+  # guarded file: `trap - EXIT`, `elif false`, a removed call or a shortened
+  # list all leave the line absent and the step red. Nothing else prints it.
+  printf 'pinned regions verified %s/%s: %s\n' \
+    "$PIN_CHECKED" "$PINNED_REGION_COUNT" "$PINNED_REGIONS"
   return 0
 }
 
@@ -400,9 +529,12 @@ cleanup_all() {
                 printf 'FAIL  suite exited 0 after only %s check(s); expected at least %s — scenarios did not run\n' \
                   "$checks" "$MIN_CHECKS" >&2
                 rc=1
-              elif ! enforce_shape; then
+              # F2 (adversarial round 5): the enforcers run in subshells so that a
+              # `set -u` fatal inside one (an unbound expansion in the trap) yields
+              # a nonzero rc here instead of bash exiting 0 with the gate skipped.
+              elif ! ( enforce_shape ); then
                 rc=1
-              elif ! enforce_substance; then
+              elif ! ( enforce_substance ); then
                 rc=1
               fi
               ;;
