@@ -847,7 +847,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `normalize.rs` ranges rather than the new ones and corrected every live carrier: `docs/config.md:25`,
   `docs/config.md:375` and two source doc comments at `frp-core/src/config/tests.rs:2061` / `:2137` now carry the
   measured ranges (`:869-878` arm match, `:865-884` synthesis, `:652-655` `[common]` flatten, `:1429-1437` client
-  match, `:1379-1399` client fold). Older closed ledger entries (the #407 item above, `TODO.md:695`/`:696`) keep
+  match, `:1379-1399` client fold). Older closed ledger entries (the #407 item above, `TODO.md:800`/`:696`) keep
   their era's line numbers, which is why the round-1 "in every sentence" claim was dropped. `docs/config.md:375`
   was also **reworded**: both reviewers read its four-spelling list differently, and the client lift measurably
   maps **six** nested spellings (`normalize.rs:1429-1437`), so it now scopes the four to the four alias-less
@@ -2541,7 +2541,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `healthCheckHTTPHeaders`, `healthCheckIntervalS`, `healthCheckTimeoutS`, `healthCheckMaxFailed`,
     and the per-proxy `virtualNet`, which in Go is a *top-level client* key, `client.go:66`); those
     rows now name the nested Go spelling and flag the change. The report's earlier "the retracted
-    wording is not repeated anywhere" was wrong — the old closed item at `TODO.md:1140` quoted it
+    wording is not repeated anywhere" was wrong — the old closed item at `TODO.md:1127` quoted it
     verbatim and cited the deleted `strict.rs` comment; both are repaired above. The item's own
     `frp-server/src/config/server.rs` path was wrong and is corrected in place.
   * pre-existing legacy-INI gap found while using Go's fixture: a bare numeric INI value for a string
@@ -6809,7 +6809,7 @@ nothing about whether the described behaviour still holds.
   first P0 file-ification landed, one commit per file: `frp-server/src/control/bridge.rs` 5449 → 3324
   (+ `frp-server/src/control/bridge/tests.rs`, 2096 lines) and `frp-server/src/ssh_gateway.rs`
   4864 → 2749 (+ `ssh_gateway/tests.rs` 1778, `key_tests.rs` 76, `virtual_ctrl_tests.rs` 139,
-  `preauth_tests.rs` 103), commits `0e2c83fc` / `0531827c`. The test bodies move verbatim apart from
+  `preauth_tests.rs` 103), commits `3b57e709` / `9f064385`. The test bodies move verbatim apart from
   one indent level, measured per body rather than in aggregate: the bridge module's 2124 body lines
   are 1963 de-indented exactly one level + 161 byte-verbatim (142 blank, 19 beginning inside a
   multi-line literal), and the four ssh bodies' 2111 lines are 1960 + 151 the same way (141 blank, 10
@@ -6817,7 +6817,7 @@ nothing about whether the described behaviour still holds.
   unchanged (563 / 817) and `-- --list` is the same 460 names (bridge 46, `ssh_gateway::*` 70). P8
   Step 0 names only `ssh_gateway/tests.rs`, but the ~2740 target it states needs all four inline
   modules; see [`docs/refactor-large-modules.md`](docs/refactor-large-modules.md) "Landed so far".
-  Ledger after this round: **14 open / 189 closed** (base `18bcd1ad`: 13 open / 189 closed — the round
+  Ledger after this round: **15 open / 189 closed** (base `01fb93e3`: 14 open / 189 closed — the round
   files the item below).
 
 - [ ] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
@@ -8113,7 +8113,7 @@ section; ledger now **24 open / 104 closed**.**
   re-adding the two roots to `INI_NESTED_SECTION_ROOTS` reddens the first.
 
 - [x] **Four more test-precision residues the `test-precision-residue` round-2 reviews measured.**
-  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7212`): a
+  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7630`): a
   test that pins less than its name claims, so a real regression stays green.
   (a) The pinned warning bytes are the shipped static, but the **emitted** record is only
   substring-checked: `frp-core/tests/server_tls_enable_warning.rs:441` asserts
@@ -9254,7 +9254,7 @@ section; ledger now **24 open / 104 closed**.**
 - [x] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
   Filed by the coordinator while closing `TODO.md:8533` (PR #430), which removed the two local `pkill -f`
 - [ ] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
-  Filed by the coordinator while closing `TODO.md:8446` (PR #430), which removed the two local `pkill -f`
+  Filed by the coordinator while closing `TODO.md:8473` (PR #430), which removed the two local `pkill -f`
   calls in `scripts/compat-test.sh`: `scripts/remote-frps.sh:195` and `:339` still run
   `pkill -f 'frps -c frps.toml'` and `:409` uses `pgrep -f` on the same text, over ssh, to manage the
   comparison server on a remote VPS. Name-plus-argument is the same hazard the local sweep just lost — a

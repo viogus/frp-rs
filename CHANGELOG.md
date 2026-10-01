@@ -178,7 +178,7 @@ User-facing release notes for frp-rs.
   prebuilt release tarball. The `/tmp/frp-source-build/` cache path also survived
   the removed builder it belonged to (`build_go_frp_v2()` exists nowhere). The
   step and the orphaned path are gone, and the cache step is named `Cache cargo`
-  again. TODO.md:6042.
+  again. TODO.md:6035.
 - **`auth.method` is now compared exactly, and a typo is a config-load error
   instead of silently selecting token auth.** Go accepts exactly `"token"` and
   `"oidc"` (`pkg/config/v1/validation/validation.go:37-40`, compared with
@@ -556,7 +556,7 @@ User-facing release notes for frp-rs.
   is not the file's channel or when `RUSTUP_TOOLCHAIN` overrode it. Measured:
   dropping the `COPY` or a stray `RUSTUP_TOOLCHAIN=stable` each fail the stage
   (rc 1), and a full uncached `docker buildx build` of the image succeeds and logs
-  the pinned toolchain. TODO.md:6081.
+  the pinned toolchain. TODO.md:6096.
 - **`frpc verify` prints Go's exact success sentence.** It printed
   `Config file <path> is valid` where Go prints `frpc: the configuration file <path>
   syntax is ok`, so the client and server verify subcommands disagreed with each other. The
