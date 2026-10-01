@@ -329,8 +329,11 @@ async fn main() {
 /// [`frp_core::config::load_server_config`] plus
 /// [`frp_core::config::check_server_unsafe_features`]. The parse-and-validate
 /// half is the same path the run path uses: the run path's single-config branch
-/// calls [`frp_core::config::load_server_config_uncompleted`] (the same function
-/// minus `ServerConfig::complete`) and completes the merged config itself, and
+/// calls [`frp_core::config::load_server_config_uncompleted_with_presence`] —
+/// the presence-carrying form of
+/// [`frp_core::config::load_server_config_uncompleted`], i.e. the completing
+/// loader minus `ServerConfig::complete` — and completes the merged config
+/// itself, and
 /// both go through `load_config_from_file` with `known_server_keys` and
 /// `validate_server_config`. `verify` has no CLI overrides to merge, so it takes
 /// the completing wrapper. The consequence is that `verify` accepts exactly the
