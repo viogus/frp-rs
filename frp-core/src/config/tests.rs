@@ -287,6 +287,298 @@ auth.token = "test"
     assert_eq!(cfg.proxy_bind_addr, "10.0.0.1", "proxyBindAddr");
 }
 
+/// The `#[cfg(feature = …)]`-gated `ServerConfig` listener ports, each with the
+/// two spellings serde accepts (a bare field and its Go-inspired `alias`) and the
+/// feature that compiles the field.
+///
+/// This is the whole class. `frp-core/src/config/server.rs` is the only server
+/// config struct with feature-gated fields, and it holds exactly these three; no
+/// client config struct has any (`frp-core/src/config/client.rs` carries no
+/// `#[cfg(feature …)]` at all), so `known_client_keys()` has nothing to go stale
+/// on. Both facts are pinned by
+/// `feature_gated_server_field_set_matches_the_pinned_scope` and the
+/// `feature_gated_server_port_*` tests below.
+const FEATURE_GATED_SERVER_PORTS: [(&str, &str, &str); 3] = [
+    ("kcp_bind_port", "kcpBindPort", "kcp"),
+    ("quic_bind_port", "quicBindPort", "quic"),
+    ("websocket_port", "websocketPort", "websocket"),
+];
+
+/// Write `body` into its own temp dir and load it through the entry point the
+/// `frps` startup paths use, with **strict** mode on.
+///
+/// Strict mode is the interesting arm: it is the default for `frps -c`, and it is
+/// where the key is *accepted* in both build shapes (see
+/// `feature_gated_server_ports_stay_known_to_strict_mode_in_every_build`), so the
+/// load succeeding here is part of the pin rather than an accident of the test.
+fn load_server_with_presence(body: &str) -> (ServerConfig, ConfigPresence) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.toml");
+    std::fs::write(&path, body).unwrap();
+    load_server_config_uncompleted_with_presence(path.to_str().unwrap(), true)
+        .unwrap_or_else(|e| panic!("strict mode must load this:\n{e}\nbody:\n{body}"))
+}
+
+/// The whole-text pin for one of the three `#[cfg(not(feature = …))]`
+/// diagnostics: the text is the clause array **joined**, so it is defined once
+/// and a reworded clause cannot leave a copied literal behind in a test; the
+/// array still carries both clauses; and the record names the key it reports.
+#[cfg(not(all(feature = "kcp", feature = "quic", feature = "websocket")))]
+fn assert_unhonoured_diagnostic(clauses: &[&str], warning: &str, key: &str) {
+    assert_eq!(clauses.len(), 2, "{key}: clause count");
+    assert!(clauses.iter().all(|c| !c.is_empty()), "{key}: empty clause");
+    assert_eq!(
+        warning,
+        clauses.join(" ").as_str(),
+        "{key}: text is the clause join"
+    );
+    assert!(warning.contains(key), "{key}: the record must name `{key}`");
+}
+
+// ─── kcp_bind_port / kcpBindPort (the `kcp` feature) ─────────────────────
+
+/// Enabled direction: the field exists, so strict mode accepting the key is
+/// *correct* and the port reaches its reader (`frp-server` creates the KCP
+/// listener when the port is `> 0`). No diagnostic can exist in this build
+/// shape — `SERVER_KCP_BIND_PORT_UNHONOURED_WARNING` and the presence flag it
+/// reads are `#[cfg(not(feature = "kcp"))]`, so "this build warns about it" is
+/// not a compilable statement, which is the strongest available form of "no
+/// warning".
+#[cfg(feature = "kcp")]
+#[test]
+fn feature_gated_server_port_kcp_enabled_honours_the_port() {
+    for (key, expected) in [("kcp_bind_port", 7100u16), ("kcpBindPort", 7101)] {
+        let (cfg, _presence) =
+            load_server_with_presence(&format!("bind_port = 7000\n{key} = {expected}\n"));
+        assert_eq!(cfg.kcp_bind_port, expected, "`{key}` must reach the field");
+    }
+}
+
+/// Disabled direction: `ServerConfig` has no `kcp_bind_port` field, so serde
+/// drops the key and `frp-server` never compiles the listener. Strict mode still
+/// **accepts** the key — it is in `known_server_keys()` unconditionally, the
+/// deliberate "never a false 400" direction — so before this flag the load was
+/// completely silent about a port that will stay closed.
+#[cfg(not(feature = "kcp"))]
+#[test]
+fn feature_gated_server_port_kcp_disabled_reports_the_dropped_port() {
+    for (key, port) in [("kcp_bind_port", "7100"), ("kcpBindPort", "7101")] {
+        for body in [
+            format!("bind_port = 7000\n{key} = {port}\n"),
+            format!("bind_port = 7000\n[common]\n{key} = {port}\n"),
+        ] {
+            let (cfg, presence) = load_server_with_presence(&body);
+            assert_eq!(cfg.bind_port, 7000, "body:\n{body}");
+            assert!(
+                presence.server_kcp_bind_port_unhonoured,
+                "`{key}` asks for a listener this build cannot create; body:\n{body}"
+            );
+        }
+    }
+    assert_unhonoured_diagnostic(
+        &SERVER_KCP_BIND_PORT_UNHONOURED_CLAUSES,
+        SERVER_KCP_BIND_PORT_UNHONOURED_WARNING.as_str(),
+        "kcp_bind_port",
+    );
+}
+
+/// `0` is the documented "disabled" value for every one of the three ports, it
+/// is what the field's own default is, and a capable build's reader gates on
+/// `> 0` — so a written `0` is fully honoured in every shape and must not
+/// produce a record. An absent key is not a request either.
+#[cfg(not(feature = "kcp"))]
+#[test]
+fn feature_gated_server_port_kcp_disabled_is_silent_for_zero_or_absent() {
+    for body in [
+        "bind_port = 7000\n".to_string(),
+        "bind_port = 7000\nkcp_bind_port = 0\n".to_string(),
+        "bind_port = 7000\nkcpBindPort = 0\n".to_string(),
+        "bind_port = 7000\n[common]\nkcp_bind_port = 0\n".to_string(),
+    ] {
+        let (_cfg, presence) = load_server_with_presence(&body);
+        assert!(!presence.server_kcp_bind_port_unhonoured, "body:\n{body}");
+    }
+}
+
+// ─── quic_bind_port / quicBindPort (the `quic` feature) ──────────────────
+
+/// The `quic` twin of `feature_gated_server_port_kcp_enabled_honours_the_port`.
+#[cfg(feature = "quic")]
+#[test]
+fn feature_gated_server_port_quic_enabled_honours_the_port() {
+    for (key, expected) in [("quic_bind_port", 7200u16), ("quicBindPort", 7201)] {
+        let (cfg, _presence) =
+            load_server_with_presence(&format!("bind_port = 7000\n{key} = {expected}\n"));
+        assert_eq!(cfg.quic_bind_port, expected, "`{key}` must reach the field");
+    }
+}
+
+/// The `quic` twin of
+/// `feature_gated_server_port_kcp_disabled_reports_the_dropped_port`.
+#[cfg(not(feature = "quic"))]
+#[test]
+fn feature_gated_server_port_quic_disabled_reports_the_dropped_port() {
+    for (key, port) in [("quic_bind_port", "7200"), ("quicBindPort", "7201")] {
+        for body in [
+            format!("bind_port = 7000\n{key} = {port}\n"),
+            format!("bind_port = 7000\n[common]\n{key} = {port}\n"),
+        ] {
+            let (cfg, presence) = load_server_with_presence(&body);
+            assert_eq!(cfg.bind_port, 7000, "body:\n{body}");
+            assert!(
+                presence.server_quic_bind_port_unhonoured,
+                "`{key}` asks for a listener this build cannot create; body:\n{body}"
+            );
+        }
+    }
+    assert_unhonoured_diagnostic(
+        &SERVER_QUIC_BIND_PORT_UNHONOURED_CLAUSES,
+        SERVER_QUIC_BIND_PORT_UNHONOURED_WARNING.as_str(),
+        "quic_bind_port",
+    );
+}
+
+/// The `quic` twin of
+/// `feature_gated_server_port_kcp_disabled_is_silent_for_zero_or_absent`.
+#[cfg(not(feature = "quic"))]
+#[test]
+fn feature_gated_server_port_quic_disabled_is_silent_for_zero_or_absent() {
+    for body in [
+        "bind_port = 7000\n".to_string(),
+        "bind_port = 7000\nquic_bind_port = 0\n".to_string(),
+        "bind_port = 7000\nquicBindPort = 0\n".to_string(),
+        "bind_port = 7000\n[common]\nquic_bind_port = 0\n".to_string(),
+    ] {
+        let (_cfg, presence) = load_server_with_presence(&body);
+        assert!(!presence.server_quic_bind_port_unhonoured, "body:\n{body}");
+    }
+}
+
+// ─── websocket_port / websocketPort (the `websocket` feature) ────────────
+
+/// The `websocket` twin of
+/// `feature_gated_server_port_kcp_enabled_honours_the_port`. This is the key the
+/// defect was measured with (`frps-micro verify --strict-config` on a config
+/// carrying `websocketPort = 7500` printed `syntax is ok` and bound nothing).
+#[cfg(feature = "websocket")]
+#[test]
+fn feature_gated_server_port_websocket_enabled_honours_the_port() {
+    for (key, expected) in [("websocket_port", 7500u16), ("websocketPort", 7501)] {
+        let (cfg, _presence) =
+            load_server_with_presence(&format!("bind_port = 7000\n{key} = {expected}\n"));
+        assert_eq!(cfg.websocket_port, expected, "`{key}` must reach the field");
+    }
+}
+
+/// The `websocket` twin of
+/// `feature_gated_server_port_kcp_disabled_reports_the_dropped_port`.
+#[cfg(not(feature = "websocket"))]
+#[test]
+fn feature_gated_server_port_websocket_disabled_reports_the_dropped_port() {
+    for (key, port) in [("websocket_port", "7500"), ("websocketPort", "7501")] {
+        for body in [
+            format!("bind_port = 7000\n{key} = {port}\n"),
+            format!("bind_port = 7000\n[common]\n{key} = {port}\n"),
+        ] {
+            let (cfg, presence) = load_server_with_presence(&body);
+            assert_eq!(cfg.bind_port, 7000, "body:\n{body}");
+            assert!(
+                presence.server_websocket_port_unhonoured,
+                "`{key}` asks for a listener this build cannot create; body:\n{body}"
+            );
+        }
+    }
+    assert_unhonoured_diagnostic(
+        &SERVER_WEBSOCKET_PORT_UNHONOURED_CLAUSES,
+        SERVER_WEBSOCKET_PORT_UNHONOURED_WARNING.as_str(),
+        "websocket_port",
+    );
+}
+
+/// The `websocket` twin of
+/// `feature_gated_server_port_kcp_disabled_is_silent_for_zero_or_absent`.
+#[cfg(not(feature = "websocket"))]
+#[test]
+fn feature_gated_server_port_websocket_disabled_is_silent_for_zero_or_absent() {
+    for body in [
+        "bind_port = 7000\n".to_string(),
+        "bind_port = 7000\nwebsocket_port = 0\n".to_string(),
+        "bind_port = 7000\nwebsocketPort = 0\n".to_string(),
+        "bind_port = 7000\n[common]\nwebsocket_port = 0\n".to_string(),
+    ] {
+        let (_cfg, presence) = load_server_with_presence(&body);
+        assert!(!presence.server_websocket_port_unhonoured, "body:\n{body}");
+    }
+}
+
+// ─── The class pins (every build shape) ─────────────────────────────────
+
+/// Each feature-gated listener port is still declared to strict mode in **both**
+/// spellings, and `server.rs` still gates a field on that feature.
+///
+/// Strict mode accepting the key is deliberate and stays that way: refusing it
+/// would be the "false 400" direction that `docs/deployment.md` rules out, and
+/// the repo's own `frps.toml` carries `kcp_bind_port = 17000` +
+/// `quic_bind_port = 17001` (and `frp-core/src/config/fixtures/frps_legacy_full.ini`
+/// `kcp_bind_port = 7000`), so rejection would stop a `micro`/`tiny` build from
+/// loading the documented example at all — the invariant
+/// `frp-core/src/config/strict.rs` records next to `subdomain_host`. What the
+/// fix changed is only that the load is no longer **silent**.
+#[test]
+fn feature_gated_server_ports_stay_known_to_strict_mode_in_every_build() {
+    let known = super::strict::known_server_keys();
+    let server_rs = include_str!("server.rs");
+    for (snake, camel, feature) in FEATURE_GATED_SERVER_PORTS {
+        assert!(
+            known.contains(snake),
+            "strict mode must keep accepting `{snake}`"
+        );
+        assert!(
+            known.contains(camel),
+            "strict mode must keep accepting `{camel}`"
+        );
+        assert!(
+            server_rs.contains(&format!("#[cfg(feature = \"{feature}\")]")),
+            "`{snake}` is no longer gated on `{feature}` — FEATURE_GATED_SERVER_PORTS \
+             and the loader's detector have to follow"
+        );
+    }
+}
+
+/// The scope pin: `server.rs` gates fields on **exactly** the features this
+/// table names, so a fourth feature-gated server field cannot slip past the
+/// loader's detector without this test (and the table it guards) going red.
+///
+/// It catches a new **feature name**. A *second* field reusing one of the three
+/// — `ServerConfigSnapshot` already does that for `kcp`/`quic` — is invisible to
+/// it, which is why the value-level pins above are per field. Neither
+/// `known_server_keys()` nor `known_client_keys()` is covered by the existing
+/// `strict_array_element_keys_match_struct_fields` drift guard (that one walks
+/// the `pub(super) const … *KNOWN_KEYS` arrays, and these are function-local).
+#[test]
+fn feature_gated_server_field_set_matches_the_pinned_scope() {
+    let mut found: Vec<&str> = include_str!("server.rs")
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("#[cfg(feature = \"")?
+                .strip_suffix("\")]")
+        })
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    let mut pinned: Vec<&str> = FEATURE_GATED_SERVER_PORTS
+        .iter()
+        .map(|(_, _, feature)| *feature)
+        .collect();
+    pinned.sort_unstable();
+    assert_eq!(
+        found, pinned,
+        "a feature-gated server field was added or removed: `server.rs` gates \
+         fields on {found:?}, the detector's scope table names {pinned:?}"
+    );
+}
+
 #[test]
 fn test_go_format_client_with_plugin_toml() {
     let toml_str = r#"

@@ -604,6 +604,12 @@ async fn run(mut cli: FrpsArgs) {
                     // The flat server `tls_enable` is inert too; same sink, same
                     // one-record-per-load rule.
                     presence.warn_inert_server_tls_enable();
+                    // And the listener ports this build's `frp-core` features
+                    // cannot deserialize (`kcp_bind_port`, `quic_bind_port`,
+                    // `websocket_port`): serde drops the key and the listener is
+                    // not compiled, so this record is the only signal that the
+                    // named port stays closed.
+                    presence.warn_unhonoured_server_feature_keys();
                     let uf = unsafe_features.clone();
                     #[cfg(unix)]
                     let registry = registry.clone();
@@ -1039,6 +1045,10 @@ async fn run(mut cli: FrpsArgs) {
     // `frps` reads `ServerConfig::tls_enable`, and a restart cannot make it take
     // effect. Same sink, same one-record-per-load rule.
     presence.warn_inert_server_tls_enable();
+    // ... and for the feature-gated listener ports this build has no field for:
+    // the `--config-dir` branch above warns at its own load site, so no path
+    // double-warns here either.
+    presence.warn_unhonoured_server_feature_keys();
 
     tracing::info!(version = %frp_core::VERSION, "frps (Rust) v{} starting...", frp_core::VERSION);
     let config_path = Some(config_path);
