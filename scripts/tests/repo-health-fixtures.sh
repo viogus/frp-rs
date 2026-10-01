@@ -49,7 +49,7 @@ set -uo pipefail
 # path resolution, the two preflights and the first `ok`/`bad` — so an early
 # `exit 0` anywhere below it still has to answer to the floor. `MIN_CHECKS` is
 # the measured check count of a green run; with an exact floor, emptying any
-# scenario body drops the count below it and reds (TODO.md:8271).
+# scenario body drops the count below it and reds (TODO.md:8464).
 #
 # Three limits are stated rather than hidden:
 #   * a floor of 0 (or an unset floor, or a zero-padded all-zero floor such as
@@ -158,14 +158,18 @@ hdr() { printf '%s\n' "---------------------------------------------------------
 # pin onto the correct one and reds, and a directory from `mktemp` cannot forge
 # the ledger the caller re-derives from the copies. (R14-c) a shadowed `bash`
 # (the interpreter) or a replaced absolute `/usr/bin/sha256sum` owns the process
-# and is out of scope. Two L2-class fragilities are declared too, not closed:
+# and is out of scope. L2-class fragilities declared here, not closed — examples:
 # `region_lines` stops at the first end marker, so a decoy
-# `# --- end substance pin: scenario-6 ---` truncates the hashed text; and the
+# `# --- end substance pin: scenario-6 ---` truncates the hashed text; the
 # accept-direction line in the mutation-probe caller loop
-# (`scripts/tests/repo-health-fixtures.sh:619`,
+# (`scripts/tests/repo-health-fixtures.sh:623`,
 # `region_pin_check "$name" "$const" "$got" "$copy" 2>/dev/null || mutated_fail=1`)
-# is a single unguarded command a one-file edit can neuter. Both still need the
-# pin refreshed to stay green.
+# is a single unguarded command a one-file edit can neuter; and that loop's ledger
+# assertion (`scripts/tests/repo-health-fixtures.sh:628`) is the sole catcher of a
+# forged `MUTATION_PROBE_RECORD` — neutering it alone stays green on a healthy
+# guard. The list is not exhaustive: the reject-direction block just above the
+# assertion and the `region_hash_verdict … || return 1` call are the same shape.
+# Each still needs the pin refreshed to stay green.
 SCEN6_REGION_SHA='7d31d2b613e1e578c7050a5328cb677f4aac2eba1c6d9a7248f0216d1dd06af7'
 SCEN7_REGION_SHA='941be4f7805b74ff79b691e463f91dd011a1b549cd17995f09542ff8d3f40500'
 PINNED_REGIONS='scenario-6 scenario-7'

@@ -4343,18 +4343,18 @@ run_xtcp_test() {
     # stood here; they matched *any* `frpc -c …` command line on the host,
     # including a developer's unrelated run or a sibling worktree's compat run.
     # The repository's stray rules forbid a kill by name alone, and
-    # name-plus-argument is the same hazard in a weaker form (TODO.md:8207).
+    # name-plus-argument is the same hazard in a weaker form (TODO.md:8359).
     #
     # Every server a scenario leaves behind is tracked: `run_go`'s `exec` makes
     # `$!` the binary itself, not a wrapper subshell, and `start_echo_server`
     # tracks its python child — so `cleanup_pids` (the closed compat-leak item's
-    # reaper, `scripts/lib/compat-stray-guard.sh:57`) covers the stale-token
+    # reaper, `scripts/lib/compat-stray-guard.sh:75`) covers the stale-token
     # reconnect noise and port conflicts the pattern kill was aimed at, by pid.
     cleanup_pids
     # Belt and braces for a server that somehow escaped `track_pid`: the guard's
     # own mid-run sweep, which reaps exactly the pids its census printed and
     # honours the baseline — so it cannot reach a server that predates the run
-    # (a sibling's), and it never matches an argument pattern (TODO.md:8207).
+    # (a sibling's), and it never matches an argument pattern (TODO.md:8359).
     # The fixture suite drives this helper against real synthetic servers
     # (`scripts/tests/compat-stray-guard.sh`, "the pre-test sweep"), so it is
     # executed by CI rather than merely read. Untracked strays from this run are

@@ -112,7 +112,7 @@ jobs:
         # `exec true` planted after the trap never runs it and exits 0 with no
         # output at all. So the total is pinned *outside*: this step requires the
         # suite's summary line verbatim, and 32 is what the scenarios in
-        # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:8271` round
+        # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:8464` round
         # added the in-file floor; a scenario added or removed there moves this
         # literal — restore the checks rather than lowering it). In-file,
         # `enforce_substance` also checksums the scenario-6 metric check and the
@@ -161,7 +161,7 @@ jobs:
           log=/tmp/frp-repo-health-fixtures.log
           status=0
           guard_file=scripts/tests/repo-health-fixtures.sh
-          guard_pin=16057d157c6fc44531aaa7b3403524f68d300c7bd064d6ea33700d5a8dfeae9a
+          guard_pin=e53cf4ceda8f473648bda156c732cca706295120ea2de116e40f771857cb6e31
           # R12-2 (adversarial round 13): resolve the hasher to an absolute path
           # and prove it with a known vector — the same candidate order and the
           # same fail-closed mode as the guard's own `find_hash_tool()`.
@@ -290,7 +290,7 @@ jobs:
         # *outside*, the way the `log_completion` step below pins its own 6: this
         # step requires the suite's summary line verbatim, and 40 is what the
         # scenarios in scripts/tests/compat-stray-guard.sh print (21 before the
-        # `TODO.md:8290` round added the ordered `SHAPE` anchors, the symlink
+        # `TODO.md:8483` round added the ordered `SHAPE` anchors, the symlink
         # `wait_exec` probe, the empty-`ps` branch and the failed-probe
         # kill-then-continue case; 31 after the round-2 pins exercised the loop's
         # empty-`cmd` guard, the exit-0-empty reap arm, and the second half of the
@@ -352,11 +352,15 @@ jobs:
         # `mktemp` probe directory are fail-closed only; and a shadowed `bash`
         # interpreter or a replaced absolute candidate (`/usr/bin/sha256sum` …) is
         # out of scope — verifying the verifier's own toolchain needs something
-        # that toolchain cannot supply. Two L2-class fragilities are declared, not
-        # denied: `region_lines` stops at the first end marker (a decoy end marker
-        # truncates the hashed text) and the unguarded accept-direction
+        # that toolchain cannot supply. L2-class fragilities declared here, not
+        # closed — examples: `region_lines` stops at the first end marker (a decoy
+        # end marker truncates the hashed text); the unguarded accept-direction
         # `region_pin_check` in `enforce_substance`'s mutation-probe caller loop
-        # (`scripts/tests/compat-stray-guard.sh:824`) is a one-file neuter.
+        # (`scripts/tests/compat-stray-guard.sh:828`) is a one-file neuter; and that
+        # loop's ledger assertion (`scripts/tests/compat-stray-guard.sh:833`) is the
+        # sole catcher of a forged `MUTATION_PROBE_RECORD`. The list is not
+        # exhaustive — the reject-direction block above the assertion and the
+        # `region_hash_verdict … || return 1` call are the same shape.
         #
         # The claim stays narrow: careless single-region edits are caught; an
         # in-file edit plus a refreshed `SCEN*_REGION_SHA`, or a forged
@@ -369,7 +373,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=ef7ce03342f78156961fafb90bd3dc9139d3c3cfbd0fab043974319d7b3e4193
+          guard_pin=ea9364447bf8c77b20a35509e27b178c698b35cd04d1d3050a41375c1b2069a1
           # R12-1 (adversarial round 13): the enforcer's *implementation* lives in
           # the library the scenarios `source` (the `LIB=` assignment at :96 only
           # names it), so pinning only the suite left the "two-file change" claim
@@ -1215,7 +1219,7 @@ jobs:
         # bin-target unit tests are covered by `Run frps bin unit tests` above),
         # and the `Lint` lane only *compiles* the test targets (`cargo clippy
         # --workspace --all-targets --all-features`). So that file — added with
-        # the CLI config-failure fix (`TODO.md:3071`) — executed in no lane, and
+        # the CLI config-failure fix (`TODO.md:3129`) — executed in no lane, and
         # the frps half of that fix had no executing pin.
         #
         # Measured warm, macOS arm64: 2.47 s wall for the package (4 tests, the
