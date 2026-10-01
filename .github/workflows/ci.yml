@@ -105,18 +105,18 @@ jobs:
       - name: Repo health — fixture checks (gate exit-code mapping)
         # Same shape as the stray-guard step below, and for the same reason: the
         # suite floors its own check count in an EXIT trap installed above its
-        # first failure point, but a floor inside the file it guards cannot
-        # survive an `exec` — `exec true` planted after the trap never runs it
-        # and exits 0 with no output at all, and a lowered `MIN_CHECKS=0` (or a
-        # floor that is not a number, or a zero-padded all-zero floor like `00`)
-        # is quiet too. So the total is pinned *outside*: this step requires the
-        # suite's summary line verbatim, and 32
-        # is what the scenarios in scripts/tests/repo-health-fixtures.sh print
-        # (the `TODO.md:8127` round added the in-file floor; a scenario added or
-        # removed there moves this literal — restore the checks rather than
-        # lowering it). The `ok`-line count is the second half of the pin:
-        # `printf 'RESULT: 32 …'; exec true` satisfies the literal but prints no
-        # assertion lines at all.
+        # first failure point, and that in-file floor *is* enforced — a floor
+        # that is lowered (`0`), zero-padded (`00`/`000`), not a number, or even
+        # an all-digit value too large for `[ -lt ]` reds inside the suite
+        # (measured). What no in-file mechanism can survive is `exec`:
+        # `exec true` planted after the trap never runs it and exits 0 with no
+        # output at all. So the total is pinned *outside*: this step requires the
+        # suite's summary line verbatim, and 32 is what the scenarios in
+        # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:8127` round
+        # added the in-file floor; a scenario added or removed there moves this
+        # literal — restore the checks rather than lowering it). The `ok`-line
+        # count is the second half of the pin: `printf 'RESULT: 32 …'; exec true`
+        # satisfies the literal but prints no assertion lines at all.
         shell: bash
         run: |
           set -o pipefail
@@ -137,38 +137,42 @@ jobs:
       # guard's match is the scratch directory *and* the process name — a
       # name-only match kills a sibling worktree's server and must red this.
       - name: Stray guard — fixture checks (compat harness teardown)
-        # The suite floors its own check count (`MIN_CHECKS`, in its EXIT trap),
-        # but a floor inside the file it guards cannot survive an `exec`: `exec
-        # true` planted after the library check never runs the trap and exits 0
-        # with no output at all, and a lowered `MIN_CHECKS=0` is quiet too. So the
-        # total is pinned *outside*, the way the `log_completion` step below pins
-        # its own 6: this step requires the suite's summary line verbatim, and 31
-        # is what the scenarios in scripts/tests/compat-stray-guard.sh print (21
-        # before the `TODO.md:8146` round added the ordered `SHAPE` anchors, the
-        # symlink `wait_exec` probe, the empty-`ps` branch and the failed-probe
+        # The suite floors its own check count (`MIN_CHECKS`, in its EXIT trap)
+        # and checksums two of its regions, and both are enforced in-file: a
+        # lowered (`0`), zero-padded (`00`), non-numeric or uncomparably large
+        # `MIN_CHECKS` reds there (measured). What no in-file mechanism can
+        # survive is `exec`: `exec true` planted after the library check never
+        # runs the trap and exits 0 with no output at all. So the total is pinned
+        # *outside*, the way the `log_completion` step below pins its own 6: this
+        # step requires the suite's summary line verbatim, and 40 is what the
+        # scenarios in scripts/tests/compat-stray-guard.sh print (21 before the
+        # `TODO.md:8146` round added the ordered `SHAPE` anchors, the symlink
+        # `wait_exec` probe, the empty-`ps` branch and the failed-probe
         # kill-then-continue case; 31 after the round-2 pins exercised the loop's
         # empty-`cmd` guard, the exit-0-empty reap arm, and the second half of the
-        # XTCP pre-test cleanup). In-file, `enforce_substance` additionally
-        # checksums scenario 10's region byte-for-byte — the `compat_src=` input
-        # derivation plus both assertions — so forging the text those checks read
-        # reds there as well (as does gutting either verdict in place). A scenario
-        # added or removed here moves this literal — restore the checks rather
-        # than lowering it.
+        # XTCP pre-test cleanup; 40 after the round-6 pins added the
+        # trailing-slash-`TEST_DIR` scenario, the three untrusted-`ps` probes and
+        # the scenario-2 substance pin). In-file, `enforce_substance` additionally
+        # checksums the scenario-2 verdict and scenario 10's region byte-for-byte
+        # — the `compat_src=` input derivation plus both assertions — so forging
+        # the text those checks read reds there as well (as does gutting either
+        # verdict in place). A scenario added or removed here moves this literal —
+        # restore the checks rather than lowering it.
         shell: bash
         run: |
           set -o pipefail
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           bash scripts/tests/compat-stray-guard.sh 2>&1 | tee "$log" || status=1
-          grep -qF 'RESULT: 31 fixture check(s) hold' "$log" || status=1
-          [ "$(grep -c '^  ok ' "$log" || true)" = "31" ] || status=1
+          grep -qF 'RESULT: 40 fixture check(s) hold' "$log" || status=1
+          [ "$(grep -c '^  ok ' "$log" || true)" = "40" ] || status=1
           if [ "$status" != "0" ]; then
-            echo "::error::compat stray-guard fixture checks did not report 31 checks"
-            echo "::error::scripts/tests/compat-stray-guard.sh must print 31 '  ok' lines and end with 'RESULT: 31 fixture check(s) hold'; a smaller total, a failure line or no output means scenarios were skipped, neutered or swallowed by an \`exec\` — restore them rather than lowering this literal"
+            echo "::error::compat stray-guard fixture checks did not report 40 checks"
+            echo "::error::scripts/tests/compat-stray-guard.sh must print 40 '  ok' lines and end with 'RESULT: 40 fixture check(s) hold'; a smaller total, a failure line or no output means scenarios were skipped, neutered or swallowed by an \`exec\` — restore them rather than lowering this literal"
             cat "$log"
             exit 1
           fi
-          echo "compat stray-guard fixture checks ok: 31 checks hold"
+          echo "compat stray-guard fixture checks ok: 40 checks hold"
       - name: RSS soak — run-dir guard + summary fixture
         run: bash scripts/tests/rss-soak-run-dir.sh
 

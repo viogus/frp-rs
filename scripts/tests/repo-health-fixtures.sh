@@ -97,6 +97,49 @@ ok()  { checks=$((checks + 1)); printf '  ok    %s\n' "$1"; }
 bad() { checks=$((checks + 1)); fail=1; printf '  FAIL  %s\n' "$1"; }
 hdr() { printf '%s\n' "------------------------------------------------------------"; }
 
+# enforce_substance — the substance half of the floor, for the scenario-6
+# metric check (RH-M2). `MIN_CHECKS` only bounds how many assertions ran, and
+# every label is spelled at the call site, so replacing scenario 6's condition
+# with `if true; then` kept the total at 32 and the suite green (measured by the
+# adversarial reviewer). The region marked `substance pin: scenario-6` is
+# therefore checksummed byte-for-byte, exactly as scenario 10's is in
+# `scripts/tests/compat-stray-guard.sh`; an edit inside it reds until the
+# constant below is updated, and the failure text prints the value to paste. It
+# adds no `ok`/`bad` call of its own, so it cannot move the count — or the
+# ci.yml literal that pins it — by itself. `self` is resolved further down this
+# file, which is fine: the check only runs from the EXIT trap, after it is set.
+SCEN6_REGION_SHA='7d31d2b613e1e578c7050a5328cb677f4aac2eba1c6d9a7248f0216d1dd06af7'
+scen6_region_sha() {
+  local tool
+  if [ -z "${self:-}" ]; then
+    printf 'FAIL  cannot locate %s to checksum the scenario-6 region\n' "$0" >&2
+    return 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    tool='sha256sum'
+  elif command -v shasum >/dev/null 2>&1; then
+    tool='shasum -a 256'
+  else
+    printf 'FAIL  no sha256 tool on PATH (need sha256sum or shasum); cannot check the scenario-6 region\n' >&2
+    return 1
+  fi
+  # shellcheck disable=SC2086  # $tool is the word-split "shasum -a 256"
+  sed -n '/^# --- substance pin: scenario-6 /,/^# --- end substance pin: scenario-6 ---/p' "$self" |
+    $tool | awk '{print $1}'
+}
+enforce_substance() {
+  local got
+  got=$(scen6_region_sha) || return 1
+  if [ "$got" != "$SCEN6_REGION_SHA" ]; then
+    printf 'FAIL  scenario 6 region changed: sha256 %s, pinned %s\n' \
+      "${got:-<none>}" "$SCEN6_REGION_SHA" >&2
+    printf '      deliberate edit? set SCEN6_REGION_SHA in %s to the value above\n' \
+      "${self:-this script}" >&2
+    return 1
+  fi
+  return 0
+}
+
 cleanup_all() {
   local rc=$? min_raw
   [ -z "$tmp" ] || rm -rf "$tmp"
@@ -159,6 +202,8 @@ cleanup_all() {
                 { [ "${#checks}" -eq "${#MIN_CHECKS}" ] && [ "$checks" \< "$MIN_CHECKS" ]; }; then
                 printf 'FAIL  suite exited 0 after only %s check(s); expected at least %s — scenarios did not run\n' \
                   "$checks" "$MIN_CHECKS" >&2
+                rc=1
+              elif ! enforce_substance; then
                 rc=1
               fi
               ;;
@@ -605,6 +650,12 @@ fi
 # non-Rust file must not count, so this pins the F4 fix that stopped the harness'
 # own script directory from inflating the number, and both the nested-file rule
 # and the "has a .rs" rule at once.
+#
+# The verdict is a `substance pin` region: the count floor can only see how many
+# assertions ran, so replacing this check's condition with `if true; then` kept
+# the total (32), every label, and CI green (RH-M2, measured by the adversarial
+# reviewer). `enforce_substance` checksums the region instead.
+# --- substance pin: scenario-6 (checksummed by enforce_substance) ---
 hdr
 printf '%s\n' 'scenario 6: the integration-test-dir metric counts only .rs-bearing tests/'
 tree testdirs
@@ -619,6 +670,7 @@ if printf '%s\n' "$out" | grep -qF 'integration test dirs: 2'; then
 else
   bad "integration test dirs: expected 2, got $(printf '%s\n' "$out" | grep -F 'integration test dirs' || echo none)"
 fi
+# --- end substance pin: scenario-6 ---
 
 # --- scenario 7: site 4 counts an aliased crate root as present --------------
 # `unsafe_counts` increments `n_present` *before* the shared-inode dedupe

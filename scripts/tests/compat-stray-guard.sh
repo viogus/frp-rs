@@ -45,6 +45,14 @@
 #      in-`$TEST_DIR` leak started after the baseline is reaped, while the
 #      baseline server and the same-named out-of-tree peer are left alone. This
 #      is what keeps the helper from rotting behind scenario 10's source read.
+#   12 a trailing-slash `TEST_DIR` — the documented `FRP_COMPAT_TEST_DIR`
+#      override as shell completion spells it — still counts, names and reaps an
+#      in-`$TEST_DIR` stray: the library normalises the spelling, so it cannot
+#      silently empty the census.
+#   13 an untrusted `ps` in the shipped census is a hard error, not an empty
+#      census: a probe that fails, one that exits 0 with no output, and one that
+#      fails only for the exit trap's report format all refuse instead of
+#      forgiving a live in-`$TEST_DIR` stray.
 #
 # Self-contained: no network, no compat run, no dependence on this repo's
 # binaries. Temporary trees and synthetic processes are removed on exit.
@@ -118,7 +126,7 @@ fails=0
 # alone were *not* sufficient either (R3-1): a floor above `9223372036854775807`
 # is unparseable as an integer, so the below-floor test is an ordered comparison
 # of digit strings and such a floor is a below-floor failure, not a status-2 skip.
-MIN_CHECKS=31
+MIN_CHECKS=40
 # The ordered assertion anchors, one per `ok`/`bad` call in scenario order.
 # Dynamic parts (pids, elapsed seconds) are matched as substrings, so each entry
 # is the stable prefix/skeleton of the assertion it pins.
@@ -154,6 +162,15 @@ SHAPE=(
   'pre-test sweep: reaped the in-TEST_DIR stray'
   'pre-test sweep: left the baseline server alone'
   'pre-test sweep: left the out-of-tree peer alone'
+  'trailing-slash TEST_DIR: assert_no_strays returned 1'
+  'trailing-slash TEST_DIR: report names the stray pid'
+  'trailing-slash TEST_DIR: stray'
+  'untrusted ps (fail): the guard load refused with rc'
+  'untrusted ps (fail): the error explains the untrusted census'
+  'untrusted ps (empty): the guard load refused with rc'
+  'untrusted ps (empty): the error explains the untrusted census'
+  'untrusted report probe: assert_no_strays returned 2'
+  'untrusted report probe: the error explains the untrusted census'
 )
 LABELS=()
 # Every synthetic pid we start. The trap reaps each one that is still ours,
@@ -218,44 +235,60 @@ enforce_shape() {
   return 0
 }
 
-# enforce_substance — the substance half of the floor, for the scenario-10
-# region that pins TODO.md:8063's fix. `enforce_shape` compares labels, and a
-# label survives a replaced body (`hits=''` behind the same `ok`), so that
-# region's exact source text is checksummed: the input derivation
-# (`compat_src=`, the comment strip) *and* both assertion blocks. Pinning only
-# the two verdict blocks left the line that produces the text they read
-# unpinned, so a forged input — a literal string containing `cleanup_pids` and
-# `reap_scoped_strays`, with `scripts/compat-test.sh` never opened — kept both
-# checksums and stayed green (reviewer 2, R2-1/LIE; measured). The region is
-# delimited by the `substance pin:` markers in scenario 10; an edit inside it
-# reds until the constant below is updated, and the failure text prints the
-# value to paste. It adds no `ok`/`bad` call of its own, so it can never move the
-# fixture count — or the ci.yml literal that pins it — by itself.
-SCEN10_REGION_SHA='d8430f18448caeff61ff025c59cd62ed34a55214fa0f785e3fc44102e5006211'
-scen10_region_sha() {
-  local tool
+# enforce_substance — the substance half of the floor. `enforce_shape` compares
+# labels, and a label survives a replaced body (`hits=''` behind the same `ok`,
+# or a whole verdict swapped for a dummy), so every region delimited by a
+# `substance pin:` marker pair is checksummed byte-for-byte:
+#
+#   scenario-2   the in-`$TEST_DIR` stray verdict — the spawn, the census call,
+#                all three verdicts and the out-of-tree peer survival check.
+#                Without it, replacing that body with a forged `rc=1`/`out`
+#                behind the identical labels left the suite green (SG-M1,
+#                measured by the adversarial reviewer).
+#   scenario-10  TODO.md:8063's fix: the input derivation (`compat_src=`, the
+#                comment strip) *and* both assertion blocks. Pinning only the
+#                two verdict blocks left the line that produces the text they
+#                read unpinned, so a forged input — a literal string containing
+#                `cleanup_pids` and `reap_scoped_strays`, with
+#                `scripts/compat-test.sh` never opened — kept both checksums and
+#                stayed green (reviewer 2, R2-1/LIE; measured).
+#
+# An edit inside a pinned region reds until the matching constant below is
+# updated, and the failure text prints the value to paste. The pins add no
+# `ok`/`bad` call of their own, so they can never move the fixture count — or
+# the ci.yml literal that pins it — by themselves.
+SCEN2_REGION_SHA='672f7e60063731363e7b1583a7f415cee46b5c2fc2710f82792df75f9cb18886'
+SCEN10_REGION_SHA='23ae23793f1912e7df3f3d98dec5d46b6f8fd2c771e8597ca2510233674ea356'
+region_sha() {   # $1 = region name, spelled as between the `substance pin:` markers
+  local name=$1 tool
   if command -v sha256sum >/dev/null 2>&1; then
     tool='sha256sum'
   elif command -v shasum >/dev/null 2>&1; then
     tool='shasum -a 256'
   else
-    printf 'FAIL  no sha256 tool on PATH (need sha256sum or shasum); cannot check scenario 10 substance\n' >&2
+    printf 'FAIL  no sha256 tool on PATH (need sha256sum or shasum); cannot check the %s substance pin\n' "$name" >&2
     return 1
   fi
   # shellcheck disable=SC2086  # $tool is the word-split "shasum -a 256"
-  sed -n '/^# --- substance pin: scenario-10 /,/^# --- end substance pin: scenario-10 ---/p' "$self" |
+  sed -n "/^# --- substance pin: ${name} /,/^# --- end substance pin: ${name} ---/p" "$self" |
     $tool | awk '{print $1}'
 }
 enforce_substance() {
-  local got
-  got=$(scen10_region_sha) || return 1
-  if [ "$got" != "$SCEN10_REGION_SHA" ]; then
-    printf 'FAIL  scenario 10 region changed: sha256 %s, pinned %s\n' \
-      "${got:-<none>}" "$SCEN10_REGION_SHA" >&2
-    printf '      deliberate edit? set SCEN10_REGION_SHA in %s to the value above\n' \
-      "${self:-this script}" >&2
-    return 1
-  fi
+  local name const got want
+  for name in scenario-2 scenario-10; do
+    case $name in
+      scenario-2)  const=SCEN2_REGION_SHA;  want=$SCEN2_REGION_SHA ;;
+      scenario-10) const=SCEN10_REGION_SHA; want=$SCEN10_REGION_SHA ;;
+    esac
+    got=$(region_sha "$name") || return 1
+    if [ "$got" != "$want" ]; then
+      printf 'FAIL  %s region changed: sha256 %s, pinned %s\n' \
+        "$name" "${got:-<none>}" "$want" >&2
+      printf '      deliberate edit? set %s in %s to the value above\n' \
+        "$const" "${self:-this script}" >&2
+      return 1
+    fi
+  done
   return 0
 }
 
@@ -476,6 +509,12 @@ kill -0 "$prepid" 2>/dev/null && ok 'baseline server survived' || bad 'baseline 
 kill -0 "$peerpid" 2>/dev/null && ok 'out-of-tree peer survived' || bad 'out-of-tree peer was reaped'
 
 # --- scenario 2: an in-`$TEST_DIR` stray is named, reaped and fails the run --
+# The verdict body is a `substance pin` region: `enforce_shape` only compares
+# labels, so replacing this whole scenario with a dummy `rc=1` behind the same
+# labels kept the total, the shape and CI green (SG-M1, measured by the
+# adversarial reviewer). Checksumming the region closes that class here the way
+# scenario 10's pin closes it there.
+# --- substance pin: scenario-2 (checksummed by enforce_substance) ---
 hdr 'scenario 2: in-TEST_DIR stray is reaped and returns 1; peer still survives'
 td2="$WORK/run2"
 mkdir -p "$td2"
@@ -507,6 +546,7 @@ if kill -0 "$peerpid" 2>/dev/null; then
 else
   bad 'out-of-tree peer was killed — the predicate matched on name alone'
 fi
+# --- end substance pin: scenario-2 ---
 
 # --- scenario 3: a missing pgrep is a hard failure, not an empty census ------
 hdr 'scenario 3: missing pgrep refuses to run'
@@ -735,7 +775,7 @@ fi
 xtcp_body=$(awk '/^run_xtcp_test\(\)/{f=1} f{print} f&&/^}/{exit}' "$WORK/compat-test.code")
 # TODO.md:8063 replaced *two* pattern kills with a pid-exact pair, so the
 # scenario has to see both halves inside `run_xtcp_test`: the tracked-pid reaper
-# (`cleanup_pids`, TODO 7866's first replacement) and the guard's baseline-aware
+# (`cleanup_pids`, TODO.md:8063's first replacement) and the guard's baseline-aware
 # census sweep (`reap_scoped_strays`). Pinning only the latter let a mutant that
 # deleted the `cleanup_pids` call stay green (measured, reviewer 1).
 xtcp_calls=$(printf '%s\n' "$xtcp_body" | grep -cE '^[[:space:]]*cleanup_pids([[:space:]]|$)' || true)
@@ -785,6 +825,101 @@ else
   bad 'pre-test sweep: the out-of-tree peer was reaped — the sweep matched on name alone'
 fi
 kill -9 "$baseline11" "$peer11" 2>/dev/null || true
+
+# --- scenario 12: a trailing-slash TEST_DIR does not empty the census --------
+# F2 (adversarial reviewer): the ownership match is the literal `"$TEST_DIR/"`,
+# so a run dir spelled with a trailing slash — `FRP_COMPAT_TEST_DIR=/tmp/x/`,
+# which `scripts/compat-test.sh:92` documents — matched `…/x//` and never a
+# command line carrying `…/x/`: the census came back empty and
+# `assert_no_strays` returned 0 with a live stray. The library normalises the
+# spelling once at load, so this drives the real guard with `$td12/` and
+# requires the full tooth: a named, reaped stray and rc 1.
+hdr 'scenario 12: a trailing-slash TEST_DIR still counts an in-dir stray'
+td12="$WORK/run12"
+mkdir -p "$td12"
+export TEST_DIR="$td12/"
+# shellcheck source=/dev/null
+source "$LIB"
+stray12=$(spawn_fake "$td12/scenario")
+LIVE="$LIVE $stray12"
+sleep 0.3
+out=$(assert_no_strays 2>&1); rc=$?
+if [ "$rc" -eq 1 ]; then
+  ok 'trailing-slash TEST_DIR: assert_no_strays returned 1'
+else
+  bad "trailing-slash TEST_DIR: assert_no_strays returned $rc (expected 1) — the spelling emptied the census"
+fi
+case "$out" in
+  *"$stray12"*) ok "trailing-slash TEST_DIR: report names the stray pid $stray12" ;;
+  *) bad "trailing-slash TEST_DIR: report does not name the stray pid: $(printf '%s' "$out" | tr '\n' ' ')" ;;
+esac
+if wait_gone "$stray12"; then
+  ok "trailing-slash TEST_DIR: stray $stray12 was reaped"
+else
+  bad "trailing-slash TEST_DIR: stray $stray12 survived the guard"
+fi
+
+# --- scenario 13: an untrusted `ps` in the shipped census is a hard error ----
+# F3 (adversarial reviewer): `scenario_strays` read a per-pid `ps` that failed
+# (or exited 0 with no output) as "not ours", so the census came back empty and
+# a live in-`$TEST_DIR` stray was forgiven — the opposite of the header's
+# promise. The first two cases drive the real library with such a `ps` first on
+# `PATH`; the baseline census at load has to refuse rather than report nothing.
+hdr 'scenario 13: the shipped census refuses a ps probe it cannot trust'
+td13="$WORK/run13"
+mkdir -p "$td13"
+victim13=$(spawn_fake "$td13/scenario")
+LIVE="$LIVE $victim13"
+# The fake `ps` is only observable if `pgrep` really lists the victim first.
+for _ in $(seq 1 50); do
+  pgrep -x frps 2>/dev/null | grep -qx "$victim13" && break
+  sleep 0.1
+done
+fakebin13="$WORK/fakebin13"
+mkdir -p "$fakebin13"
+for kind in fail empty; do
+  case $kind in
+    fail)  printf '#!/bin/sh\nexit 1\n' > "$fakebin13/ps" ;;
+    empty) printf '#!/bin/sh\nexit 0\n' > "$fakebin13/ps" ;;
+  esac
+  chmod +x "$fakebin13/ps"
+  out=$(env PATH="$fakebin13:$PATH" TEST_DIR="$td13" "$BASH_BIN" -c 'source "$1"' _ "$LIB" 2>&1); rc=$?
+  if [ "$rc" -ne 0 ]; then
+    ok "untrusted ps ($kind): the guard load refused with rc $rc"
+  else
+    bad "untrusted ps ($kind): the guard loaded and reported an empty census — a live stray was forgiven"
+  fi
+  case "$out" in
+    *'census that cannot be trusted'*) ok "untrusted ps ($kind): the error explains the untrusted census" ;;
+    *) bad "untrusted ps ($kind): unexpected output: $(printf '%s' "$out" | tr '\n' ' ')" ;;
+  esac
+done
+# The census itself is trustworthy here; only the exit trap's *report* format
+# fails, so `assert_no_strays`'s own per-pid read is the branch under test: a
+# live pid it cannot describe must not be read as "the stray went away".
+real_ps=$(command -v ps)
+{
+  printf '#!/bin/sh\n'
+  printf 'for a in "$@"; do\n  case "$a" in *ppid*) exit 1 ;; esac\ndone\n'
+  printf 'exec %s "$@"\n' "$real_ps"
+} > "$fakebin13/ps"
+chmod +x "$fakebin13/ps"
+export TEST_DIR="$td13"
+# shellcheck source=/dev/null
+source "$LIB"
+victim13b=$(spawn_fake "$td13/late")
+LIVE="$LIVE $victim13b"
+sleep 0.3
+out=$( PATH="$fakebin13:$PATH"; assert_no_strays 2>&1 ); rc=$?
+if [ "$rc" -eq 2 ]; then
+  ok 'untrusted report probe: assert_no_strays returned 2'
+else
+  bad "untrusted report probe: assert_no_strays returned $rc (expected 2) — a live stray it could not describe was read as gone"
+fi
+case "$out" in
+  *'census that cannot be trusted'*) ok 'untrusted report probe: the error explains the untrusted census' ;;
+  *) bad "untrusted report probe: unexpected output: $(printf '%s' "$out" | tr '\n' ' ')" ;;
+esac
 
 # ---------------------------------------------------------------- summary
 hdr 'summary'
