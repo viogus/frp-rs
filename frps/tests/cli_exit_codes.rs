@@ -2456,14 +2456,9 @@ fn verify_handles_vhost_http_timeout_go_signed_int64_range() {
 /// `cmd.PersistentFlags().StringVarP(&c.Log.Level, "log_level", "", …)`), so
 /// `frps -c cfg -l ""` is rc **1** there too — but pflag's wording is
 /// `unknown shorthand flag: 'l' in -l`. frp-rs registers no `-l` short at all:
-/// `svr_log` gives `log-level` only the long spellings
-/// (`frp-core/src/cli.rs:878`), so bpaf refuses the short before any file is
-/// read. The refusal is **not** because `-l` is absent from
-/// `VALUE_TAKING_SHORTS_FRPS_ROOT` (`frp-core/src/cli.rs:1171`,
-/// `[char; 3] = ['c', 'p', 't']`) — that table's own doc says its only purpose
-/// is to make a **two-character** `-xy` token produce pflag's
-/// `flag needs an argument` line instead of bpaf's help, so a lone `-l` never
-/// consults it. Measured on this base, over a *valid*
+/// `svr_log` has only the long spellings (`frp-core/src/cli.rs:878`), and
+/// `VALUE_TAKING_SHORTS_FRPS_ROOT` (`frp-core/src/cli.rs:1171`) is not the reason
+/// — it only governs a **two-character** `-xy` token. Measured over a *valid*
 /// config and over a missing one alike: rc **1**, **0 B stdout**, 44 B stderr
 /// ``Error: `-l` is not expected in this context``.
 ///
