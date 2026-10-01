@@ -8436,7 +8436,7 @@ section; ledger now **24 open / 104 closed**.**
   file), so a full XTCP run leaves no process it did not start, or record why the pattern kill is
   required there (e.g. a `fuser`/pid-file route is impossible for that shard's Go children).
 
-  **Done (PR #430, code head `458f60a3`).** The two `pkill -f` calls are gone: `run_xtcp_test` now calls
+  **Done (PR #430, code head `5266df6d`).** The two `pkill -f` calls are gone: `run_xtcp_test` now calls
   `cleanup_pids` (`scripts/compat-test.sh:4353`) and then `reap_scoped_strays` (`:4363`) — the exact-pid route
   the closed compat-leak item added (`cleanup_pids`/`reap_scoped_strays` at
   `scripts/lib/compat-stray-guard.sh:75`/`:227`), which subtracts the run's baseline, keeps to the run's own
@@ -8566,7 +8566,7 @@ section; ledger now **24 open / 104 closed**.**
   installed before the first `ok`/`bad`, the floor equal to the current check count), and emptying a
   scenario body — or inserting an early `exit 0` — reds the suite.
 
-  **Done (PR #430, code head `458f60a3`).** `scripts/tests/repo-health-fixtures.sh` now installs its EXIT trap
+  **Done (PR #430, code head `5266df6d`).** `scripts/tests/repo-health-fixtures.sh` now installs its EXIT trap
   before the path resolution, the preflights and the first `ok`/`bad` — `trap cleanup_all EXIT` (`:787`), above the
   path resolution (`:789`), the preflights (`:847-857`) and the first check (`:1058`); the block comment at `:44-52`
   still reads as if the install were up there and is left for a comment pass — and it enforces a floor equal to the
@@ -8598,7 +8598,7 @@ section; ledger now **24 open / 104 closed**.**
   (d) are each fixed or recorded as deliberate with the mutant that shows the gap — for (d) that means
   the guard's total is replaced by, or supplemented with, a per-scenario shape assertion.
 
-  **Done (PR #430, code head `458f60a3`).** All four residues are closed in place. (a) the ownership probe now
+  **Done (PR #430, code head `5266df6d`).** All four residues are closed in place. (a) the ownership probe now
   kills and continues when `ps` cannot run (`reap_own_synthetic`, `scripts/tests/compat-stray-guard.sh:289`) and on
   an empty `ps` (`:293-294`) instead of forgiving a live synthetic. (b) `wait_exec` no longer anchors on the
   suite's own resolved path: it reads this shell's own command line from the same probe (`:1052`) and requires the
@@ -8613,7 +8613,7 @@ section; ledger now **24 open / 104 closed**.**
   `MIN_CHECKS=40` (`:223`) and the CI step keeps both its count literal (`.github/workflows/ci.yml:524`) and the
   FAIL-line arm (`:532`, diagnostic `:537`). The two accepted bounds the item recorded (the fixed `/tmp` log path,
   the SIGKILL orphan) are unchanged.
-  Ledger after this close: **14 open / 188 closed** (base `084f7865`: 19 open / 180 closed; this branch closes
+  Ledger after this close: **14 open / 188 closed** (base `e4c23b2f`: 16 open / 185 closed; this branch closes
   three items and files one residue item, below).
 
 - [x] **A non-regular file named `*.{toml,ini,json,yaml,yml}` inside a `--config-dir` hangs the lane forever.**
