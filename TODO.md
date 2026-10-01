@@ -4072,7 +4072,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `docs/config.md` `[log] level` row rewritten to one consequence-free sentence. Until then the
   divergence is stated in `docs/config.md`, in `resolve_log_level`'s doc comment
   (`frp-core/src/logging.rs`) and here.
-  **Done (2026-10-01, at `cc73d457` on `fix/cli-flag-binding`, PR #427).** The first branch of the
+  **Done (2026-10-01, at `d8b867b3` on `fix/cli-flag-binding`, PR #427).** The first branch of the
   Done-when: `FrpsArgs::override_server_config` now skips an **empty** `--log-level`/`--log-file`
   and a **zero** `--log-max-days`, so the file's `[log]` values survive instead of being completed
   to `info`. Measured post-fix with `[log] level = "warn"`: the implicit-config lane with
@@ -7862,17 +7862,17 @@ section; ledger now **24 open / 104 closed**.**
   what Go refuses), or the refusal is recorded as a deliberate divergence with both
   measurements, and a test pins whichever answer is chosen.
 
-  **Done (2026-10-01, at `cc73d457` on `fix/cli-flag-binding`, PR #427).** The first branch: the
+  **Done (2026-10-01, at `d8b867b3` on `fix/cli-flag-binding`, PR #427).** The first branch: the
   flag and `ServerConfig::vhost_http_timeout` are `i64`, matching Go's `Int64VarP`
   (`/tmp/frp-go-src/pkg/config/flags.go:237`) and Go's `int64` field; the internal
   `clamp_vhost_timeout` keeps its `u64` return and its `<= 0` floor, so `--vhost-http-timeout -1`
   is accepted and ignored like Go while `--vhost-http-timeout 9999999999999999999` is refused like
   Go. Pinned end to end by
   `frps/tests/cli_exit_codes.rs::verify_accepts_vhost_http_timeout_both_spellings_and_prints_go_line`
-  (`frps/tests/cli_exit_codes.rs:1823`). The refusal **text** for an out-of-range value is still
+  (`frps/tests/cli_exit_codes.rs:2289`). The refusal **text** for an out-of-range value is still
   Rust's rather than Go's `strconv.ParseInt` wording plus the `Usage:` block (**R4** at the end of
   this file).
-  Ledger after this batch: **30 open / 156 closed** (base `2e8b1d52`: 26 open / 154 closed; the
+  Ledger after this batch: **30 open / 162 closed** (base `6420d77a`: 26 open / 160 closed; the
   batch closes the two log-flag/`--vhost-http-timeout` items and files six residues R1–R6 at the end
   of this file).
 
