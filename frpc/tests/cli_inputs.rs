@@ -1482,8 +1482,25 @@ fn a_config_file_named_after_a_subcommand_stays_a_config_file() {
             text.contains("dial to 127.0.0.1:1") || text.contains("connect to 127.0.0.1:1"),
             "{argv:?} must load the config named `status` and dial its server port in run mode: {text:?}"
         );
+        // With the `admin` feature on, run mode also *binds* `[webServer]` and
+        // says so (`frpc admin server starting on 127.0.0.1:<port>`,
+        // `frp-client/src/service.rs`; `… listening on …` comes from
+        // `frp-client/src/admin.rs`). Those lines are the child describing its
+        // own listener, not a dial, so strike them and then require the port to
+        // be absent from everything that remains: any other mention would be a
+        // *reached* admin endpoint, which only the `status` command (or a
+        // dropped subcommand falling through to run mode) produces. The mock
+        // staying silent below is the feature-independent half of the claim.
+        let without_admin_self_lines: String = text
+            .lines()
+            .filter(|line| {
+                !line.contains("frpc admin server starting on")
+                    && !line.contains("frpc admin server listening on")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            !text.contains(&port.to_string()),
+            !without_admin_self_lines.contains(&port.to_string()),
             "{argv:?} must not reach the config's admin port: {text:?}"
         );
         assert!(

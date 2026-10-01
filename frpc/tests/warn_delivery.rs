@@ -36,11 +36,18 @@
 //! the flag was never set, and the record was lost on exactly the paths where the
 //! base binary delivered it (`--config-dir`).
 //!
-//! **Why the child stays up.** `[web_server] port` is a free port and
-//! `login_fail_exit = false`, so `frpc` retries the (deliberately absent) server
-//! instead of exiting; the startup line and the warning are both emitted before
-//! the first connect attempt, so the ordering does not matter — the retry just
-//! keeps the child alive until the guard reaps it.
+//! **Why the child exits, and why that exit is the oracle.** `[web_server] port`
+//! is a free port and `server_port` points at one with no listener, so the load
+//! succeeds, the warning is emitted, and the login attempt is refused. The
+//! configs take the default `login_fail_exit = true`, so the child then exits on
+//! its own; [`Spawned::run`] waits for that exit, joins both reader threads (the
+//! pipes are at EOF once the child is gone) and only then freezes the snapshot.
+//! The asserted count is therefore **final**: nothing can emit after the process
+//! that emits is gone, so there is no quiet window to fall behind and no fixed
+//! sleep to outrun. The previous shape kept the child alive with
+//! `login_fail_exit = false` and froze the count once the capture had held still
+//! for 500 ms — measured, a duplicate emitted +700 ms behind the first left this
+//! file green 8/8, while one +150 ms behind was caught.
 //!
 //! **Falsification (measured).** With
 //! `FRPC_BIN=/tmp/enable-warn-probe/before/frpc` (the pre-change binary) the
@@ -50,7 +57,8 @@
 //!
 //! **What these tests assert, and what they do not.** Real binary, real config
 //! file, the two streams captured separately, the **number of records per
-//! stream**, that the binary reached its post-`init_logging` startup line, and —
+//! stream** read only after the child has exited and both pipes are at EOF, that
+//! the binary reached its post-`init_logging` startup line, and —
 //! through `assert_clause_matches_this_build` — **which of the clauses this
 //! build's reader answer produced**, plus a negative control that it never emits
 //! the no-TLS clause this binary cannot produce. They do **not** pin the exact log
@@ -86,28 +94,8 @@ use std::time::{Duration, Instant};
 /// The binary under test: the one `cargo test -p frpc` built for this target.
 /// `FRPC_BIN` overrides it, which is how the pre-change falsification runs.
 const BIN: &str = env!("CARGO_BIN_EXE_frpc");
-/// How long a shape may take from spawn to its startup line being visible.
-const READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a killed child may take to disappear before the guard gives up.
 const REAP_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long the **record itself** may take to become visible on stdout. This
-/// replaces the old fixed `SETTLE` sleep: a sleep is a guess about the
-/// scheduler, and under load the reader thread can be scheduled late enough that
-/// a record already in the pipe is not yet in the buffer (the failure recorded
-/// in `TODO.md:8104`, the `frpc/tests/warn_delivery.rs` "snapshots its counts
-/// after a fixed 500 ms settle" item: the snapshot ran after 500 ms and the count
-/// was 0). Waiting on the record is load-independent — the record either arrives
-/// or the wait fails loudly.
-const RECORD_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long the count must **stop changing** before it is frozen.
-/// [`Spawned::wait_for_record`] waits for "at least `want`" records, so on its
-/// own it returns on the first poll that sees one and a duplicate emitted one
-/// poll later is frozen out of the snapshot — the `exactly one` assertion then
-/// never sees it (measured against the pre-quiet-period wait: a child emitting
-/// the same record twice 150 ms apart stayed green 8/8, while the fixed `SETTLE`
-/// this file replaced caught it). Requiring quiet after the **last** change
-/// restores that detection while keeping the wait load-independent.
-const QUIET_PERIOD: Duration = Duration::from_millis(500);
 /// A substring of the first record `frpc` emits **after** `init_logging`, so
 /// seeing it proves the load succeeded and a subscriber exists.
 const STARTUP_MARKER: &str = "frpc (Rust) v";
@@ -133,7 +121,11 @@ const NO_TLS_CLAUSE: &str = "no TLS support";
 /// claim would be false. These tests are the client half's negative control; the
 /// `frps` half is `frps/tests/warn_delivery.rs`.
 const SERVER_KEY: &str = "tls_enable has no effect on the server";
-/// How long `frpc verify` may take to exit before the test kills it.
+/// How long a child may take to terminate before the test gives up and kills it.
+/// This bounds a **hung child** (a wrong config, or a hijacked `server_port`
+/// that accepted the login), not the condition the count depends on: the oracle
+/// is the process reaching a state `wait(2)` reports, after which it cannot emit
+/// again. Used by every [`Spawned::run`] shape and by the `verify` row.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn bin() -> String {
@@ -213,36 +205,30 @@ impl Drop for ChildGuard {
 }
 
 /// A spawned `frpc` whose stdout and stderr are drained by reader threads (a
-/// full pipe can never block the child) and snapshotted **before** any signal.
+/// full pipe can never block the child), run to a definite exit, and only then
+/// snapshotted.
 struct Spawned {
     _guard: ChildGuard,
     stdout_buf: Arc<Mutex<String>>,
     stderr_buf: Arc<Mutex<String>>,
+    stdout_drain: Option<std::thread::JoinHandle<()>>,
+    stderr_drain: Option<std::thread::JoinHandle<()>>,
     stdout: String,
     stderr: String,
 }
 
-/// What the config under test is expected to make the binary emit, so
-/// [`Spawned::run`] can wait on the **record** rather than on a fixed sleep.
-#[derive(Clone, Copy)]
-enum Expect {
-    /// Exactly one [`KEY`] record. Waits (bounded) for it to appear **and for
-    /// the count to stop moving**, because the startup line is *not* a barrier
-    /// for it: on `--config-dir` the line is printed by `frpc/src/main.rs:531`
-    /// **before** the per-file loop emits at `:545`, and even on `-c` (`:662`
-    /// before `:664`) the reader thread may not have appended the bytes yet. The
-    /// quiet period is what makes the asserted count final — see [`QUIET_PERIOD`].
-    Warning,
-    /// No [`KEY`] record. Every row that expects silence is a `-c` row, where
-    /// the call site emits the record **before** the startup line (`:662` vs
-    /// `:664`) on the same sink — so once the reader has appended the line it has
-    /// already appended any earlier record, and the startup line is a sound
-    /// barrier. No sleep is needed, and none is used.
-    Silence,
-}
-
 impl Spawned {
-    fn run(dir: &TempDir, argv: &[&str], expect: Expect) -> Self {
+    /// Spawn `frpc` on `argv`, wait for it to **exit on its own**, join both
+    /// reader threads, and only then freeze the snapshot.
+    ///
+    /// The configs under test take `login_fail_exit = true` and point
+    /// `server_port` at a port with no listener, so the child loads its config,
+    /// emits whatever it is going to emit, fails the login and exits — no
+    /// signal, no settle window, no fixed sleep. Once the child is gone and both
+    /// pipes have hit EOF, the captured count is final by construction: whatever
+    /// the process emitted, it emitted before `wait(2)` returned. That is the
+    /// whole point — see the module header's "Why the child exits".
+    fn run(dir: &TempDir, argv: &[&str]) -> Self {
         let child = Command::new(bin())
             .args(argv)
             .current_dir(&dir.0)
@@ -251,99 +237,65 @@ impl Spawned {
             .spawn()
             .expect("spawn frpc");
         let mut spawned = Self::from_child(child);
-        spawned.wait_for_marker();
-        if matches!(expect, Expect::Warning) {
-            spawned.wait_for_record(1);
-        }
+        spawned.wait_for_exit();
+        spawned.join_drains();
         spawned.snapshot();
         spawned
     }
 
-    /// Wait (bounded) until at least `want` [`KEY`] records are visible on
-    /// stdout **and the count has held still for [`QUIET_PERIOD`]**, then return.
-    /// Replaces the fixed settle: the condition is the record, so a slow
-    /// scheduler delays the wait instead of falsifying the count. The quiet
-    /// requirement is the other half — an "at least" wait alone returns on the
-    /// first poll that sees `want` records, so a duplicate that arrives one poll
-    /// later is frozen out of the snapshot and the `exactly one` assertion never
-    /// sees it.
-    fn wait_for_record(&mut self, want: usize) {
-        let deadline = Instant::now() + RECORD_TIMEOUT;
-        let mut seen = 0;
-        let mut quiet_since = Instant::now();
+    /// Wait (bounded) for the child to terminate. The oracle is the process
+    /// reaching a state `wait(2)` reports — after that it cannot emit — so the
+    /// deadline only turns a hung child into a loud failure instead of a hang;
+    /// it is not the condition the count depends on.
+    fn wait_for_exit(&mut self) {
+        let deadline = Instant::now() + EXIT_TIMEOUT;
         loop {
-            let out = self.peek_stdout();
-            let count = occurrences(&out, KEY);
-            if count != seen {
-                seen = count;
-                quiet_since = Instant::now();
+            match self._guard.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Ok(None) => {
+                    let out = self.peek_stdout();
+                    let err = self.peek_stderr();
+                    let _ = self._guard.child.kill();
+                    let _ = self._guard.child.wait();
+                    panic!(
+                        "frpc did not exit within {EXIT_TIMEOUT:?}; the exit is this file's \
+                         finality oracle, so a hung child is a failure rather than a count to \
+                         freeze\n--- stdout ({}) ---\n{out}\n--- stderr ({}) ---\n{err}",
+                        out.len(),
+                        err.len(),
+                    );
+                }
+                Err(e) => panic!("try_wait on frpc: {e}"),
             }
-            if count >= want && quiet_since.elapsed() >= QUIET_PERIOD {
-                return;
-            }
-            let err = self.peek_stderr();
-            if let Ok(Some(status)) = self._guard.child.try_wait() {
-                panic!(
-                    "frpc exited ({status}) before it emitted {want} {KEY:?} record(s)\n\
-                     --- stdout ({}) ---\n{out}\n--- stderr ({}) ---\n{err}",
-                    out.len(),
-                    err.len(),
-                );
-            }
-            if Instant::now() >= deadline {
-                panic!(
-                    "frpc never emitted {want} {KEY:?} record(s) on stdout and left the count \
-                     unchanged for {QUIET_PERIOD:?} within {RECORD_TIMEOUT:?}\n\
-                     --- stdout ({}) ---\n{out}\n--- stderr ({}) ---\n{err}",
-                    out.len(),
-                    err.len(),
-                );
-            }
-            std::thread::sleep(Duration::from_millis(25));
         }
     }
 
-    fn wait_for_marker(&mut self) {
-        let deadline = Instant::now() + READY_TIMEOUT;
-        loop {
-            if self.peek_stdout().contains(STARTUP_MARKER)
-                || self.peek_stderr().contains(STARTUP_MARKER)
-            {
-                return;
-            }
-            if let Ok(Some(status)) = self._guard.child.try_wait() {
-                panic!(
-                    "frpc exited ({status}) before its startup line\n--- stdout ({} B) ---\n{}\n\
-                     --- stderr ({} B) ---\n{}",
-                    self.peek_stdout().len(),
-                    self.peek_stdout(),
-                    self.peek_stderr().len(),
-                    self.peek_stderr(),
-                );
-            }
-            if Instant::now() >= deadline {
-                panic!(
-                    "frpc never logged {STARTUP_MARKER:?} within {READY_TIMEOUT:?}\n\
-                     --- stdout ({} B) ---\n{}\n--- stderr ({} B) ---\n{}",
-                    self.peek_stdout().len(),
-                    self.peek_stdout(),
-                    self.peek_stderr().len(),
-                    self.peek_stderr(),
-                );
-            }
-            std::thread::sleep(Duration::from_millis(25));
+    /// Join both reader threads. Called only after [`Spawned::wait_for_exit`],
+    /// so both pipes are at EOF and the joins return promptly; after this the
+    /// buffers are immutable and [`Spawned::snapshot`] is a true freeze.
+    fn join_drains(&mut self) {
+        if let Some(handle) = self.stdout_drain.take() {
+            handle.join().expect("stdout reader thread panicked");
+        }
+        if let Some(handle) = self.stderr_drain.take() {
+            handle.join().expect("stderr reader thread panicked");
         }
     }
 
     fn from_child(mut child: Child) -> Self {
         let out = Arc::new(Mutex::new(String::new()));
         let err = Arc::new(Mutex::new(String::new()));
-        drain(child.stdout.take().expect("child stdout"), out.clone());
-        drain(child.stderr.take().expect("child stderr"), err.clone());
+        let stdout_drain = drain(child.stdout.take().expect("child stdout"), out.clone());
+        let stderr_drain = drain(child.stderr.take().expect("child stderr"), err.clone());
         Self {
             _guard: ChildGuard { child },
             stdout_buf: out,
             stderr_buf: err,
+            stdout_drain: Some(stdout_drain),
+            stderr_drain: Some(stderr_drain),
             stdout: String::new(),
             stderr: String::new(),
         }
@@ -377,8 +329,14 @@ impl Spawned {
     }
 }
 
-/// Read a child's pipe to EOF on its own thread, appending into `sink`.
-fn drain<R: Read + Send + 'static>(mut pipe: R, sink: Arc<Mutex<String>>) {
+/// Read a child's pipe to EOF on its own thread, appending into `sink`. The
+/// handle is kept so the caller can join it after the child exits, which is what
+/// turns "the reader has probably caught up" into "the pipe is at EOF and the
+/// buffer is final".
+fn drain<R: Read + Send + 'static>(
+    mut pipe: R,
+    sink: Arc<Mutex<String>>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -390,7 +348,7 @@ fn drain<R: Read + Send + 'static>(mut pipe: R, sink: Arc<Mutex<String>>) {
                     .push_str(&String::from_utf8_lossy(&buf[..n])),
             }
         }
-    });
+    })
 }
 
 /// Which spelling of the nested TLS section the config uses. All three named
@@ -405,12 +363,13 @@ enum Section {
     None,
 }
 
-/// `server_port` points at nothing (a fresh ephemeral port); `login_fail_exit =
-/// false` keeps the retrying child alive. The dashboard section is there because
-/// it is what the warning is about.
+/// `server_port` points at nothing (a fresh ephemeral port) and the config takes
+/// `login_fail_exit = true`, so the refused login makes the child exit on its own
+/// — the definite exit [`Spawned::run`] counts after. The dashboard section is
+/// there because it is what the warning is about.
 fn frpc_config(server_port: u16, admin_port: u16, section: Section) -> String {
     let head = format!(
-        "server_addr = \"127.0.0.1\"\nserver_port = {server_port}\nlogin_fail_exit = false\n"
+        "server_addr = \"127.0.0.1\"\nserver_port = {server_port}\nlogin_fail_exit = true\n"
     );
     match section {
         Section::Nested => format!(
@@ -531,7 +490,7 @@ fn web_server_tls_enable_warning_reaches_a_dash_c_user() {
     let dir = TempDir::new("dashc");
     let cfg = frpc_config(free_port(), free_port(), Section::Nested);
     let path = dir.write("frpc.toml", &cfg);
-    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()], Expect::Warning);
+    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
     assert_one_warning_on_stdout("frpc -c", &spawned);
 }
 
@@ -542,11 +501,7 @@ fn web_server_tls_enable_warning_reaches_a_config_dir_user() {
     let sub = dir.0.join("conf.d");
     std::fs::create_dir_all(&sub).expect("create config dir");
     std::fs::write(sub.join("frpc.toml"), &cfg).expect("write config");
-    let spawned = Spawned::run(
-        &dir,
-        &["--config-dir", sub.to_str().unwrap()],
-        Expect::Warning,
-    );
+    let spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
     assert_one_warning_on_stdout("frpc --config-dir", &spawned);
 }
 
@@ -561,7 +516,7 @@ fn web_server_tls_enable_warning_reaches_a_dash_c_user_with_the_common_spelling(
     let dir = TempDir::new("dashc-common");
     let cfg = frpc_config(free_port(), free_port(), Section::CommonNested);
     let path = dir.write("frpc.toml", &cfg);
-    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()], Expect::Warning);
+    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
     assert_one_warning_on_stdout("frpc -c ([common] spelling)", &spawned);
 }
 
@@ -572,11 +527,7 @@ fn web_server_tls_enable_warning_reaches_a_config_dir_user_with_the_common_spell
     let sub = dir.0.join("conf.d");
     std::fs::create_dir_all(&sub).expect("create config dir");
     std::fs::write(sub.join("frpc.toml"), &cfg).expect("write config");
-    let spawned = Spawned::run(
-        &dir,
-        &["--config-dir", sub.to_str().unwrap()],
-        Expect::Warning,
-    );
+    let spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
     assert_one_warning_on_stdout("frpc --config-dir ([common] spelling)", &spawned);
 }
 
@@ -587,7 +538,7 @@ fn no_warning_for_a_config_without_the_key() {
     let dir = TempDir::new("nokey");
     let cfg = frpc_config(free_port(), free_port(), Section::None);
     let path = dir.write("frpc.toml", &cfg);
-    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()], Expect::Silence);
+    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
     let out = spawned.stdout();
     let err = spawned.stderr();
     assert!(
@@ -610,7 +561,7 @@ fn warning_when_the_camelcase_tls_table_is_merged_into_the_snake_section() {
     let dir = TempDir::new("mixed");
     let cfg = frpc_config(free_port(), free_port(), Section::MixedSections);
     let path = dir.write("frpc.toml", &cfg);
-    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()], Expect::Warning);
+    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
     let out = spawned.stdout();
     let err = spawned.stderr();
     assert!(
@@ -634,12 +585,12 @@ fn warning_when_the_camelcase_tls_table_is_merged_into_the_snake_section() {
 fn no_server_tls_enable_warning_in_frpc_where_the_field_is_live() {
     let dir = TempDir::new("srv-key-live");
     let cfg = format!(
-        "server_addr = \"127.0.0.1\"\nserver_port = {}\nlogin_fail_exit = false\n\
+        "server_addr = \"127.0.0.1\"\nserver_port = {}\nlogin_fail_exit = true\n\
          tls_enable = false\n",
         free_port()
     );
     let path = dir.write("frpc.toml", &cfg);
-    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()], Expect::Silence);
+    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
     let out = spawned.stdout();
     let err = spawned.stderr();
     assert!(

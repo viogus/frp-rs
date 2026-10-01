@@ -1110,6 +1110,31 @@ jobs:
             exit 1
           fi
           echo "frpc admin warning-delivery guard ok: $n tests listed (expected 8), 0 failed"
+      - name: Run frpc's integration tests with the admin feature (whole package)
+        # The `full,admin` combination had no lane: the two admin steps above run
+        # one file each (`--test warn_delivery`, `--test
+        # admin_config_get_warning`) and `Run frpc CLI tests (admin address
+        # resolution)` above runs the package with the default (`full`) features,
+        # so every other `frpc/tests/*.rs` target never executed with `admin` on.
+        # That hid a red: `frpc/tests/cli_inputs.rs`'s
+        # `a_config_file_named_after_a_subcommand_stays_a_config_file` read run
+        # mode's own admin bind line (`frpc admin server starting on
+        # 127.0.0.1:<port>`, `frp-client/src/service.rs:4414`) as a dial of the
+        # config's `[webServer]` port. This step is that lane.
+        #
+        # Measured warm, macOS arm64: 111 tests over 8 targets, 0 failed (`frpc`
+        # unit 8 + `admin_cli` 25 + `admin_config_get_warning` 5 +
+        # `cli_exit_codes` 23 + `cli_inputs` 34 + `cli_persistent_flags` 7 +
+        # `legacy_ini_fixture` 1 + `warn_delivery` 8); the admin build is already
+        # warm from the step above. No count guard: the guards above pin a single
+        # file, and a per-file literal here would red this whole-suite step when
+        # an unrelated file's count moves. `frpc/tests/admin_cli.rs:178` is
+        # timing-flaky under host load (5 s `EXIT_TIMEOUT` against a 1 s
+        # `--api-timeout`) and is admin-independent — the same test red once in
+        # default features on this host; that exposure already exists in `Run
+        # frpc CLI tests (admin address resolution)` above, and this step does not
+        # add to it beyond running the suite a second time.
+        run: cargo test -p frpc --features full,admin
       - name: Run frpc's CLI exit-code tests under `tiny` (tier runtime half)
         # `frpc/src/main-tiny.rs` is `include!("main.rs")`, so the config/flag
         # exit-code fix has to hold in the no-default-features build too — but
