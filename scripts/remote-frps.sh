@@ -26,6 +26,14 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+# The remote reap route (a pid file written where the server is started, read
+# back by exact pid) lives in a unit of its own so the fixture test
+# `scripts/tests/remote-frps-reap.sh` can drive the real fragments against
+# synthetic servers; the contract and the `pkill -f`/`pgrep -f` hazard it
+# replaces are documented there.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=lib/remote-frps-reap.sh
+source "$SCRIPT_DIR/lib/remote-frps-reap.sh"
 VPS_USER="${XTCP_VPS_USER:-frp-test}"
 GO_FRP_VERSION="${GO_FRP_VERSION:-0.71.0}"
 # VPS target is always linux/amd64
@@ -172,17 +180,13 @@ cmd_start() {
     local remote_dir
     if [[ -n "$shard" ]]; then
         # CI matrix isolation: deterministic per-shard directory.
-        # Only touches THIS shard's process and directory.
+        # The previous shard server is reaped by the pid its own start recorded
+        # in `$remote_dir/frps.pid`; the port scan below is the port-scoped
+        # fallback (each shard owns a reserved 100-port band) and is the only
+        # route here that does not name a pid.
         remote_dir="/tmp/frp-xtcp-shard-${shard}"
         ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-            "if [ -f '$remote_dir/frps.pid' ]; then \
-               pid=\$(cat '$remote_dir/frps.pid' 2>/dev/null); \
-               if [ -n \"\$pid\" ]; then \
-                 kill -0 \"\$pid\" 2>/dev/null && kill \"\$pid\" 2>/dev/null || true; \
-                 sleep 0.3; \
-                 kill -0 \"\$pid\" 2>/dev/null && kill -9 \"\$pid\" 2>/dev/null || true; \
-               fi; \
-             fi; \
+            "$(remote_reap_pidfile_snippet "$remote_dir/frps.pid")
                           for p in \$(seq $((17000 + shard * 100)) $((17000 + shard * 100 + 99))); do \
                             fpid=\$(ss -tlnp 2>/dev/null | grep \":\${p}\b\" | grep -o 'pid=[0-9]*' | cut -d= -f2); \
                             if [ -n "\$fpid" ]; then kill "\$fpid" 2>/dev/null || true; fi; \
@@ -190,12 +194,12 @@ cmd_start() {
              rm -rf '$remote_dir'; \
              mkdir -p '$remote_dir'" 2>/dev/null || true
     else
-        # Backward compat (single runner): global pkill + mktemp
+        # Backward compat (single runner): reap every leftover run directory by
+        # the pid its own start recorded, then remove it. The old sweep here was
+        # `pkill -f 'frps -c frps.toml'`, which reaped any process on the VPS
+        # whose command line merely contained that text.
         ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-            "pkill -f 'frps -c frps.toml' 2>/dev/null; \
-             for d in /tmp/frp-xtcp-?????? /tmp/frp-xtcp-test; do \
-                 if [ -d \"\$d\" ]; then rm -rf \"\$d\" 2>/dev/null; fi; \
-             done; \
+            "$(remote_reap_rundirs_snippet /tmp)
              rm -f /tmp/.frp-xtcp-dir 2>/dev/null" 2>/dev/null || true
     fi
 
@@ -267,8 +271,12 @@ cmd_start() {
     # session, keeping SSH connection open. We fire-and-forget the SSH
     # process and verify frps startup via port check instead of SSH exit code.
     echo "DBG: starting frps via background SSH on $host:$actual_port dir=$remote_dir" >&2
+    # The start command writes the server's exact pid to `$remote_dir/frps.pid`
+    # in the same remote command that starts it; every later reap and liveness
+    # decision on this ssh path reads that pid back (see
+    # `scripts/lib/remote-frps-reap.sh`).
     ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
-        "cd $remote_dir && chmod +x frps && nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null &" \
+        "$(remote_start_snippet "$remote_dir")" \
         >/dev/null 2>&1 &
     echo "DBG: frps start command sent (SSH backgrounded)" >&2
 
@@ -310,18 +318,13 @@ cmd_stop() {
 
     local result
     if [[ -n "$shard" ]]; then
-        # CI matrix isolation: only kill this shard's frps, only clean its dir
+        # CI matrix isolation: only kill this shard's frps, only clean its dir.
+        # Exact pid from the pid file first; the port scan is the port-scoped
+        # fallback for a server left by a pre-pid-file helper version.
         local base_port=$((17000 + shard * 100))
         local remote_dir="/tmp/frp-xtcp-shard-${shard}"
         result=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-            "if [ -f '$remote_dir/frps.pid' ]; then \
-               pid=\$(cat '$remote_dir/frps.pid' 2>/dev/null); \
-               if [ -n \"\$pid\" ]; then \
-                 kill -0 \"\$pid\" 2>/dev/null && kill \"\$pid\" 2>/dev/null || true; \
-                 sleep 0.3; \
-                 kill -0 \"\$pid\" 2>/dev/null && kill -9 \"\$pid\" 2>/dev/null || true; \
-               fi; \
-             fi; \
+            "$(remote_reap_pidfile_snippet "$remote_dir/frps.pid")
                           for p in \$(seq ${base_port} $((base_port + 99))); do \
                             fpid=\$(ss -tlnp 2>/dev/null | grep \":\${p}\b\" | grep -o 'pid=[0-9]*' | cut -d= -f2); \
                             if [ -n "\$fpid" ]; then \
@@ -334,12 +337,11 @@ cmd_stop() {
             return 1
         }
     else
-        # Backward compat: kill all frps, clean all mktemp dirs
+        # Backward compat: reap every run directory by the pid its start
+        # recorded, then clean it. The old sweep here was
+        # `pkill -f 'frps -c frps.toml'`.
         result=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-            "pkill -f 'frps -c frps.toml' 2>/dev/null; \
-             for d in /tmp/frp-xtcp-?????? /tmp/frp-xtcp-test; do \
-                 if [ -d \"\$d\" ]; then rm -rf \"\$d\" 2>/dev/null; fi; \
-             done; \
+            "$(remote_reap_rundirs_snippet /tmp)
              rm -f /tmp/.frp-xtcp-dir 2>/dev/null; \
              echo ok" 2>&1) || {
             echo "WARNING: remote stop on $host failed: $result" >&2
@@ -375,43 +377,14 @@ cmd_status() {
         return
     fi
 
-    # Backward compat: check all frp-xtcp temp dirs
+    # Backward compat: census the pid files under the remote /tmp. The old
+    # fallback here was `pgrep -f "frps -c frps.toml"`, which answered
+    # `running (no pid file)` for any process whose command line carried that
+    # text; a live process this helper has no pid on record for is now reported
+    # as `stopped` rather than named by a match.
     local running
-    running=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" "bash -s" 2>/dev/null <<'REMOTE_SCRIPT'
-# Check all frp-xtcp temp dirs
-found=0
-for d in /tmp/frp-xtcp-??????; do
-    if [[ -d "$d" ]]; then
-        found=1
-        PID_FILE="$d/frps.pid"
-        if [[ -f "$PID_FILE" ]]; then
-            pid=$(cat "$PID_FILE")
-            if kill -0 "$pid" 2>/dev/null; then
-                echo "running (pid=$pid, dir=$d)"
-                exit 0
-            else
-                echo "stopped (stale pid=$pid, dir=$d)"
-            fi
-        fi
-    fi
-done
-# Also check legacy dir
-if [[ -f "/tmp/frp-xtcp-test/frps.pid" ]]; then
-    pid=$(cat "/tmp/frp-xtcp-test/frps.pid")
-    if kill -0 "$pid" 2>/dev/null; then
-        echo "running (pid=$pid)"
-        exit 0
-    fi
-fi
-if [[ $found -eq 1 ]]; then
-    echo "stopped (stale)"
-else
-    if pgrep -f "frps -c frps.toml" > /dev/null 2>&1; then
-        echo "running (no pid file)"
-    else
-        echo "stopped"
-    fi
-fi
+    running=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" "bash -s" 2>/dev/null <<REMOTE_SCRIPT
+$(remote_status_scan_snippet /tmp)
 REMOTE_SCRIPT
 ) || running="unknown (ssh failed)"
 
