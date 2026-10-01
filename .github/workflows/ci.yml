@@ -1029,26 +1029,73 @@ jobs:
         # 10 test targets and the bench touched (forced rebuild). The runner's
         # cost — Linux, cold cache — was not measured.
         run: cargo test -p frp-core --no-default-features --all-targets
-      - name: Run frp-core's help-document pins in the two mixed feature shapes
+      - name: Run frp-core's help-document pins in the two mixed feature shapes (count guard)
         # `frp-core/src/cli.rs`'s help-document pins are feature-sensitive:
         # `feature_adjusted_pin` keeps `--kcp-bind-port` only when `kcp` is on
         # and `--quic-bind-port` only when `quic` is on, so the pins have four
-        # shapes. Only two were executed — default features (both on, the step
+        # shapes. Two were executed — default features (both on, the step
         # above this one) and `--no-default-features` (both off, the step
-        # immediately above) — while kcp-only and quic-only were compiled by the
-        # feature-matrix `cargo check` lanes and never run. A pin that reads a
-        # feature it never varies is exactly the class this closes.
+        # immediately above); kcp-only and quic-only had no lane of their own.
+        # The feature-matrix step's `cargo check` lines do not cover them for
+        # frp-core: one is `-p frp-client --no-default-features --features quic`
+        # and the other `-p frp-core --no-default-features --features kcp`, so
+        # frp-core's help pins had never been *run* under either mixed shape (and
+        # the quic-only frp-core shape had not even been compiled). A pin that
+        # reads a feature it never varies is exactly the class this closes.
         #
         # Measured 2026-10-01, macOS arm64: 19 passed / 0 failed in each mixed
         # shape; 38.44 s for the first (cold, kcp-only) and 0.03 s of test time
         # per shape. `--lib` plus the `help_doc_tests` filter keeps the step to
-        # the pins; the runner's cost on Linux is not measured.
+        # the pins; the runner's cost on Linux is not measured. Round 2 raised the
+        # filter's own count to 20 by adding
+        # `every_proxy_surface_renders_exactly_the_go_rows_that_surface_implements`
+        # and `every_proxy_surface_accepts_go_bool_names_and_their_frp_rs_aliases`.
+        #
+        # Count guard (round 2): the filter used to be a bare name, so renaming
+        # `help_doc_tests` (or its module) ran zero tests and the step stayed
+        # green — libtest exits 0 on an empty filter match (measured: `1053
+        # filtered out`, rc 0). Each shape now takes the filter's own `-- --list`
+        # count, requires it to equal 20, and requires the run's own
+        # `test result:` count to equal it, so a renamed filter reds here instead
+        # of passing vacuously.
         shell: bash
         run: |
           set -eo pipefail
           for features in kcp quic; do
             echo "::group::frp-core help-document pins (--no-default-features --features $features)"
-            cargo test -p frp-core --no-default-features --features "$features" --lib -- help_doc_tests
+            log="/tmp/frp-core-help-docs-$features.log"
+            cargo test -p frp-core --no-default-features --features "$features" \
+              --lib --color never -- help_doc_tests 2>&1 | tee "$log"
+            sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+            list="/tmp/frp-core-help-docs-$features.list"
+            cargo test -p frp-core --no-default-features --features "$features" \
+              --lib --color never -- --list help_doc_tests 2>&1 \
+              | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
+            n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
+            # The run's *own* summary is the other half of the count: a literal
+            # taken only from `-- --list` cannot see a listed test that reported
+            # nothing.
+            n_run=$(sed -n -e 's/^test result: ok\. \([0-9][0-9]*\) passed; 0 failed.*$/\1/p' "$log.plain" | tail -n 1)
+            status=0
+            [ -n "$n_run" ] || status=1
+            [ "$n_run" = "$n" ] || status=1
+            [ "$n" = "20" ] || status=1
+            if [ "$status" != "0" ]; then
+              echo "::error::frp-core help_doc_tests guard failed for --features $features (list=$n, run=$n_run, log=$log)"
+              if [ -n "$n" ] && [ "$n" != "20" ]; then
+                if [ "$n" -lt "20" ]; then
+                  echo "::error::the help_doc_tests filter lists $n tests under --features $features, this step expects 20 — tests were deleted, renamed, or cfg'd out; restore them rather than lowering this literal. If the *filter name* is what changed, re-point the filter (and this literal) instead."
+                else
+                  echo "::error::the help_doc_tests filter lists $n tests under --features $features, this step expects 20: move the literal in this shell step from 20 to $n"
+                fi
+              fi
+              if [ -n "$n_run" ] && [ "$n_run" != "$n" ]; then
+                echo "::error::the help_doc_tests run completed $n_run tests but -- --list reports $n under --features $features — a listed test did not run or reported nothing; restore it rather than re-pointing this count"
+              fi
+              cat "$log.plain"
+              exit 1
+            fi
+            echo "frp-core help-document guard ok ($features): $n listed, $n_run passed, 0 failed"
             echo "::endgroup::"
           done
       - name: Run frp-core's server `tls_enable` warning pin (count guard)
