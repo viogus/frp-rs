@@ -467,7 +467,7 @@ User-facing release notes for frp-rs.
 - **Two test-precision residues pin what their names claim, and one snapshot wait is no longer a
   guess.** The `frp-server` OIDC mock's deadline accessor was only ever exercised through its 5 s
   default, so a lying accessor kept every test green: `mock_handle_reports_the_override_it_was_built_with`
-  (`frp-server/src/control/login.rs:2795`) now drives three overrides (`125 ms`, `60 s`, and a non-round
+  (`frp-server/src/control/login.rs:2377`) now drives three overrides (`125 ms`, `60 s`, and a non-round
   `31.337 ms`) and asserts the stored field, so an accessor that special-cases a round threshold or
   hardcodes the two original values is red too. `frpc/tests/admin_config_get_warning.rs` released its
   probe port between spawns, so a re-taken port failed the fixture once
