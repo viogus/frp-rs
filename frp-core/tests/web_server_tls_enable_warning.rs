@@ -111,6 +111,19 @@ impl Write for CapturedLogs {
 /// `the_no_dashboard_build_names_no_dashboard_behaviour` are the independent
 /// witness that the emit site agrees with it.
 fn expected_warning(reader: WebServerTlsEnableReader) -> &'static str {
+    // Debug-only sabotage hook for the count-guard step `Run frp-core's
+    // web-server tls_enable warning pin (count guard)`: that step runs
+    // `the_no_dashboard_build_names_no_dashboard_behaviour` a second time with
+    // `FRP_WARNING_PIN_SABOTAGE` set and requires the run to **fail**. Returning
+    // text that no variant renders is exactly the mutant the
+    // `assert_eq!(c.expected, expected, ..)` below asserts against, so a body
+    // that deletes that assertion, or returns before it, passes the sabotaged
+    // run — nothing at log level can tell such a body from a real one, but a
+    // vacuous pin cannot be made to fail. Never set outside that step.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("FRP_WARNING_PIN_SABOTAGE").is_some() {
+        return "<frp-warning-pin-sabotage: expected_warning() deliberately unmapped>";
+    }
     match reader {
         WebServerTlsEnableReader::NoWebServer => WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD,
         WebServerTlsEnableReader::WebServerNoTls => WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS,

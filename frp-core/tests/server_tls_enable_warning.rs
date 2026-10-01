@@ -443,6 +443,21 @@ fn written_server_tls_enable_warns_once_and_stays_inert() {
         ("false", true),
     ] {
         let value = written == "true";
+        // Debug-only sabotage hook for the count-guard step `Run frp-core's
+        // server tls_enable warning pin (count guard)`: that step runs this test
+        // a second time with `FRP_WARNING_PIN_SABOTAGE` set and requires the run
+        // to **fail**. Expecting the flipped value is exactly the mutant the
+        // final `assert_eq!(c.tls_enable, value, ..)` asserts against, so a body
+        // that deletes that assertion, or returns before it, passes the
+        // sabotaged run — nothing at log level can tell such a body from a real
+        // one, but a vacuous pin cannot be made to fail. Never set outside that
+        // step.
+        #[cfg(debug_assertions)]
+        let value = if std::env::var_os("FRP_WARNING_PIN_SABOTAGE").is_some() {
+            !value
+        } else {
+            value
+        };
         let c = load_capturing(&format!("bind_port = 7000\ntls_enable = {written}\n"), mode);
         assert_eq!(
             c.logged_during_load, "",

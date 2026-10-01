@@ -8190,7 +8190,7 @@ section; ledger now **24 open / 104 closed**.**
   `cargo test -p frps --test warn_delivery` 17/0 with and without `--features dashboard`,
   `cargo test -p frp-core --test server_tls_enable_warning` 8/0 and `--test web_server_tls_enable_warning` 6/0.
   Ledger after this close: **31 open / 165 closed** (base `a1ae6a9d`: 31 open / 164 closed).
-- [ ] **The three CI-guard strengths the `warning-pin` round-2 adversarial measured: the guards prove the tests ran, not that they asserted anything.**
+- [x] **The three CI-guard strengths the `warning-pin` round-2 adversarial measured: the guards prove the tests ran, not that they asserted anything.**
   Filed by the coordinator from the round-2 adversarial report (`/private/tmp/rev-g1r2-attack.md`); none blocks
   PR #433. (a) The resolver pin's completion marker is self-reported: deleting its three `assert_eq!`s while
   keeping the `println!`, or hoisting the print before an early `return;`, or renaming the test and adding a
@@ -8207,6 +8207,34 @@ section; ledger now **24 open / 104 closed**.**
   and a legitimate `WebServerTlsEnableReader` variant rename would fire the same way, because the marker
   embeds the `Debug` spelling. Done-when: the marker and the diagnostics are keyed on something a variant
   rename does not move, or "no marker" and "no assertions" are reported apart.
+  **Done (2026-10-01, at `785ac18a`, PR #444).** Each measured weakness now fails closed.
+  (a) The resolver lane no longer takes a self-reported marker as proof of shape: the step pins the exact
+  `-- --list` entry (`.github/workflows/ci.yml:517`
+  `expected="service::tests::web_server_tls_enable_reader_answers_from_this_build"`, which `grep -E -c
+  "^${expected}: test$"` must find exactly once), the marker is variant-free (`:521`
+  `web-server-tls-enable-reader-pin: assertions ran`, matched with `grep -q -x -F`) and the step adds a
+  converse run (`:538` `FRP_WARNING_PIN_SABOTAGE=1`) requiring the pinned test's own `FAILED` line
+  (`:542-543`, diagnostic `:562`), so a renamed test plus a same-named stub that only prints the marker
+  now reds with `lists 2 tests … expects 1` instead of passing. (b) Both count guards require the run's own
+  `N passed; 0 failed` summary to equal the `-- --list` count (`n_run` at `.github/workflows/ci.yml:655`
+  for the server step and `:720` for the web-server step; honest echoes `:695`/`:759`), so a listed test
+  that silently does not run reds the lane. The deleted-assertion and early-`return` shapes are **not**
+  caught by that equality — both leave the summary at `N passed; 0 failed` — but by each step's own
+  converse run (`.github/workflows/ci.yml:668-670`/`:732-735`, `FAILED` check `:672-673`/`:736-737`,
+  diagnostic `:690`/`:754`), which is the mechanism the lane really relies on; the count equality is a
+  redundant second witness for the shapes it can see. (c) The removal diagnostics are keyed on the
+  sabotage marker (`:544`/`:546`, predicate `:572`): a stripped `println!` now reports "restore the
+  println!; the assertions are intact" (`:578`) rather than "restore the assertions", and the honest-split
+  branch is gated so the `hookonly_before` case emits the status header plus exactly one cause message —
+  the marker-before-assertion `elif` at `:567` — never the contradicting pair. The 19-row mutant matrix is
+  the PR body's own table (each row reverted with `git reset --hard`; the round-2 verification's "13
+  scenarios" is that round's smaller matrix). The declared residue is unchanged — the converse run is
+  black-box, so a body that deletes the pinned assertion and adds another hook-gated failure
+  (`stub_plus_panic`), or replaces it with one that keeps the same sabotage sensitivity (`weak_assert`),
+  stays green. Three review notes are recorded rather than changed: the honest-split predicate (`:572`)
+  tests `sabotage_marker = 0` and not `named = 1`, so a deleted pin also collects one extra "restore the
+  assertions" message (r3 verification F2), and the r3 adversarial's two INFO notes
+  (`/private/tmp/rev8069-attack-r3.md`) stand as filed.
 
 - [x] **`--allow-unsafe`'s comma grammar still differs from pflag's CSV reader, and the ignored-flag twin splits nothing at all.**
   The read-path parser splits on `,` and trims each element (`frp-core/src/cli.rs:2637-2646`, inside

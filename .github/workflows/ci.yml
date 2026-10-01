@@ -494,11 +494,17 @@ jobs:
         # that exactly one test ran.
         #
         # The guard is not count-only, for the same reason the frps bin unit
-        # step above is not: renaming the test (still one test, still green) and
-        # returning early as the body's first statement (one test, `1 passed`,
-        # zero assertions) both survive a count. So the step also greps the
-        # pin's `--nocapture` completion marker, which is printed only after
-        # every assertion has run and names the variant this shape resolved to.
+        # step above is not: renaming the test (still one test, still green),
+        # returning early as the body's first statement, and deleting the
+        # `assert_eq!`s while keeping the marker (still `1 passed`, zero
+        # assertions) all survive the count. So the step also pins the exact
+        # list entry, greps the pin's `--nocapture` completion marker, and —
+        # the part a log line cannot fake — runs the pin a second time with
+        # `FRP_WARNING_PIN_SABOTAGE=1`, which flips the variant the pin expects,
+        # and requires that run to FAIL. A body that skips its assertions cannot
+        # be made to fail, so it reds this step; a marker alone cannot tell such
+        # a body from a real one. The marker deliberately names no variant (the
+        # `assert_eq!` pins it), so a legitimate variant rename does not move it.
         shell: bash
         run: |
           set -eo pipefail
@@ -508,15 +514,40 @@ jobs:
           # the marker distinguishes "ran the assertions" from "ran early".
           cargo test -p frp-server --no-default-features --features dashboard --lib --color never web_server_tls_enable_reader -- --nocapture 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
-          marker="web-server-tls-enable-reader-pin: ok, WebServerNoTls"
-          n=$(cargo test -p frp-server --no-default-features --features dashboard --lib --color never web_server_tls_enable_reader -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          expected="service::tests::web_server_tls_enable_reader_answers_from_this_build"
+          # No enum-variant spelling: the pin's own `assert_eq!` pins the variant,
+          # and embedding its `Debug` text here made a legitimate rename of
+          # `WebServerTlsEnableReader` red this step with a misleading message.
+          marker="web-server-tls-enable-reader-pin: assertions ran"
+          list=/tmp/frp-server-resolver-no-tls-test.list
+          cargo test -p frp-server --no-default-features --features dashboard --lib --color never web_server_tls_enable_reader -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
+          n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
+          named=$(grep -E -c "^${expected}: test$" "$list" || true)
           status=0
           grep -q "Running unittests src/lib.rs" "$log.plain" || status=1
           grep -q "test result: ok. 1 passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "1" ] || status=1
-          grep -q "$marker" "$log.plain" || status=1
+          [ "$named" = "1" ] || status=1
+          # `-x` (whole line): a plain substring grep counted a marker with
+          # anything appended — `... assertions ranXYZ` — as the marker.
+          grep -q -x -F "$marker" "$log.plain" || status=1
+          # Converse run: the pin must be *able* to fail, or a body that prints
+          # the marker and returns would satisfy every line above. `--exact` also
+          # pins the name: a renamed pin leaves this run with no test to fail.
+          sabotage=/tmp/frp-server-resolver-no-tls-test-sabotaged.log
+          FRP_WARNING_PIN_SABOTAGE=1 \
+            cargo test -p frp-server --no-default-features --features dashboard --lib --color never \
+            -- --exact "$expected" --nocapture > "$sabotage" 2>&1 || true
+          sed -e 's/\x1b\[[0-9;]*m//g' "$sabotage" > "$sabotage.plain"
+          sabotaged=$(grep -E -c "^test ${expected} \.\.\. FAILED$" "$sabotage.plain" || true)
+          [ "$sabotaged" = "1" ] || status=1
+          sabotage_marker=0
+          if grep -q -x -F "$marker" "$sabotage.plain"; then
+            sabotage_marker=1
+            status=1
+          fi
           if [ "$status" != "0" ]; then
-            echo "::error::frp-server warning-resolver guard failed (status=$status, file=$n, log=$log)"
+            echo "::error::frp-server warning-resolver guard failed (status=$status, file=$n, named=$named, log=$log, sabotage=$sabotage)"
             if [ -n "$n" ] && [ "$n" != "1" ]; then
               if [ "$n" -lt "1" ]; then
                 echo "::error::frp-server/src/service.rs lists $n tests matching web_server_tls_enable_reader, this step expects 1 — the resolver pin was deleted or renamed; restore it rather than lowering this literal"
@@ -524,13 +555,35 @@ jobs:
                 echo "::error::frp-server/src/service.rs lists $n tests matching web_server_tls_enable_reader, this step expects 1: move the single literal in this shell step from 1 to $n"
               fi
             fi
-            if [ "$(grep -c "$marker" "$log.plain" || true)" = "0" ]; then
-              echo "::error::the frp-server resolver pin did not print its completion marker (\"$marker\") — a body that returns before its assertions passes libtest while asserting nothing; restore the assertions"
+            if [ "$named" != "1" ]; then
+              echo "::error::frp-server/src/service.rs does not list ${expected} — the resolver pin was renamed, deleted, or cfg'd out; restore it rather than re-pointing this name"
+            fi
+            if [ "$sabotaged" != "1" ]; then
+              echo "::error::the sabotaged run (FRP_WARNING_PIN_SABOTAGE=1) did not fail ${expected} — the resolver pin cannot be made to fail, so a body that skips its assertions, or a same-named stub that only prints the marker, passes while asserting nothing; restore the assertions"
+            elif [ "$sabotage_marker" = "1" ]; then
+              # Only reachable when the sabotaged run *did* fail, so the marker
+              # it printed cannot be the pass-path marker of a vacuous pin:
+              # the body printed it before the assertion it is meant to follow.
+              echo "::error::the sabotaged run printed the completion marker (\"$marker\") while failing ${expected} — the marker is printed before the assertions it is supposed to witness; move it back after them"
+            fi
+            # `sabotage_marker = 1` means the `elif` above already owns the
+            # diagnosis (a marker printed before the assertion it witnesses), so
+            # this branch must stay out of that case or the two contradict.
+            if [ "$sabotage_marker" = "0" ] && [ "$(grep -c -x -F "$marker" "$log.plain" || true)" = "0" ]; then
+              # "No marker" and "no assertions" are different edits, and the
+              # sabotaged run tells them apart: it still fails when the
+              # assertions are intact, so a marker-only edit is not sent after
+              # assertions that were never touched.
+              if [ "$sabotaged" = "1" ]; then
+                echo "::error::the frp-server resolver pin ran its assertions (the sabotaged run still failed) but printed no completion marker (\"$marker\") — restore the println!; the assertions are intact"
+              else
+                echo "::error::the frp-server resolver pin printed no completion marker (\"$marker\") and the sabotaged run passed — a body that returns before its assertions passes libtest while asserting nothing; restore the assertions"
+              fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frp-server warning-resolver guard ok: $n tests listed (expected 1), marker seen, 0 failed"
+          echo "frp-server warning-resolver guard ok: $n tests listed (expected 1, ${expected}), marker seen, 0 failed, sabotage reds it"
       - name: Run frp-core lib + integration tests (kcp/mux/xtcp_p2p/yamux_rst)
         # frp-core's tests/ are pure Rust<->Rust (no frps/frpc binaries), so
         # they belong with the unit lane and don't need the integration build.
@@ -576,19 +629,50 @@ jobs:
         # target's own `-- --list`, like every sibling delivery lane. The count is
         # feature-independent (8 with and without `--no-default-features`), so
         # the one default-feature lane guards both directions.
+        #
+        # A count is not strength enough on its own: deleting the witness test's
+        # own assertion, or making its first statement `return;`, still lists 8
+        # and still reports `8 passed`, so the step stayed green. It therefore
+        # also reads the count the run itself reports and requires it to equal
+        # the `-- --list` count, pins the witness test's name, and runs that one
+        # test a second time with `FRP_WARNING_PIN_SABOTAGE=1` — which flips the
+        # value its assertion expects — requiring the run to FAIL. A vacuous pin
+        # cannot be made to fail, so it reds this step.
         shell: bash
         run: |
           set -eo pipefail
           log=/tmp/frp-core-server-tls-enable-warning-tests.log
           cargo test -p frp-core --test server_tls_enable_warning --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
-          n=$(cargo test -p frp-core --test server_tls_enable_warning --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          list=/tmp/frp-core-server-tls-enable-warning-tests.list
+          cargo test -p frp-core --test server_tls_enable_warning --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
+          n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
+          witness="written_server_tls_enable_warns_once_and_stays_inert"
+          named=$(grep -E -c "^${witness}: test$" "$list" || true)
+          # The run's *own* summary is the other half of the count: a literal
+          # taken only from `-- --list` cannot see a listed test that reported
+          # nothing. Read it back instead of trusting the target's list.
+          n_run=$(sed -n -e 's/^test result: ok\. \([0-9][0-9]*\) passed; 0 failed.*$/\1/p' "$log.plain" | tail -n 1)
           status=0
           grep -q "Running tests/server_tls_enable_warning.rs" "$log.plain" || status=1
           grep -q "test result: ok. 8 passed; 0 failed" "$log.plain" || status=1
+          [ -n "$n_run" ] || status=1
+          [ "$n_run" = "$n" ] || status=1
           [ "$n" = "8" ] || status=1
+          [ "$named" = "1" ] || status=1
+          # Converse run: the witness assertion must be *able* to fail, or a body
+          # that deletes it — or returns before it — passes while still reporting
+          # `8 passed`. The sabotage flips the value the witness expects; a
+          # vacuous pin cannot be made to fail.
+          sabotage=/tmp/frp-core-server-tls-enable-warning-tests-sabotaged.log
+          FRP_WARNING_PIN_SABOTAGE=1 \
+            cargo test -p frp-core --test server_tls_enable_warning --color never \
+            -- --exact "$witness" --nocapture > "$sabotage" 2>&1 || true
+          sed -e 's/\x1b\[[0-9;]*m//g' "$sabotage" > "$sabotage.plain"
+          sabotaged=$(grep -E -c "^test ${witness} \.\.\. FAILED$" "$sabotage.plain" || true)
+          [ "$sabotaged" = "1" ] || status=1
           if [ "$status" != "0" ]; then
-            echo "::error::frp-core server tls_enable warning guard failed (status=$status, file=$n, log=$log)"
+            echo "::error::frp-core server tls_enable warning guard failed (status=$status, file=$n, run=$n_run, named=$named, log=$log, sabotage=$sabotage)"
             if [ -n "$n" ] && [ "$n" != "8" ]; then
               if [ "$n" -lt "8" ]; then
                 echo "::error::frp-core/tests/server_tls_enable_warning.rs lists $n tests, this step expects 8 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
@@ -596,29 +680,63 @@ jobs:
                 echo "::error::frp-core/tests/server_tls_enable_warning.rs lists $n tests, this step expects 8: move the single literal in this shell step from 8 to $n"
               fi
             fi
+            if [ -n "$n_run" ] && [ "$n_run" != "$n" ]; then
+              echo "::error::frp-core/tests/server_tls_enable_warning.rs completed $n_run tests but its -- --list reports $n — a listed test did not run or reported nothing; restore it rather than re-pointing this literal"
+            fi
+            if [ "$named" != "1" ]; then
+              echo "::error::frp-core/tests/server_tls_enable_warning.rs does not list ${witness} — the witness pin was renamed, deleted, or cfg'd out; restore it rather than re-pointing this name"
+            fi
+            if [ "$sabotaged" != "1" ]; then
+              echo "::error::the sabotaged run (FRP_WARNING_PIN_SABOTAGE=1) did not fail ${witness} — this pin cannot be made to fail, so a body that deletes its assertions, or returns before them, passes while still reporting $n passed; restore its assertions"
+            fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frp-core server tls_enable warning guard ok: $n tests listed (expected 8), 0 failed"
+          echo "frp-core server tls_enable warning guard ok: $n tests listed (expected 8), $n_run passed, 0 failed, sabotage reds it"
       - name: Run frp-core's web-server `tls_enable` warning pin (count guard)
         # The sibling of the step above, for
         # `frp-core/tests/web_server_tls_enable_warning.rs`: same reason (no
         # guard can see a deleted or `#[ignore]`d test through the generic
         # sweeps), same `-- --list`-derived literal (6 with and without
-        # `--no-default-features`).
+        # `--no-default-features`), and the same three additions — a run-count
+        # cross-check, a pinned witness name, and a `FRP_WARNING_PIN_SABOTAGE=1`
+        # converse run of
+        # `the_no_dashboard_build_names_no_dashboard_behaviour`, the test whose
+        # `assert_eq!(c.expected, expected, ..)` a round-2 adversary deleted while
+        # this step stayed green at `6 tests listed (expected 6), 0 failed`.
         shell: bash
         run: |
           set -eo pipefail
           log=/tmp/frp-core-web-server-tls-enable-warning-tests.log
           cargo test -p frp-core --test web_server_tls_enable_warning --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
-          n=$(cargo test -p frp-core --test web_server_tls_enable_warning --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          list=/tmp/frp-core-web-server-tls-enable-warning-tests.list
+          cargo test -p frp-core --test web_server_tls_enable_warning --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
+          n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
+          witness="the_no_dashboard_build_names_no_dashboard_behaviour"
+          named=$(grep -E -c "^${witness}: test$" "$list" || true)
+          # The run's own summary must agree with the target's list; see the
+          # sibling step.
+          n_run=$(sed -n -e 's/^test result: ok\. \([0-9][0-9]*\) passed; 0 failed.*$/\1/p' "$log.plain" | tail -n 1)
           status=0
           grep -q "Running tests/web_server_tls_enable_warning.rs" "$log.plain" || status=1
           grep -q "test result: ok. 6 passed; 0 failed" "$log.plain" || status=1
+          [ -n "$n_run" ] || status=1
+          [ "$n_run" = "$n" ] || status=1
           [ "$n" = "6" ] || status=1
+          [ "$named" = "1" ] || status=1
+          # Converse run: see the sibling step. Without it, deleting the
+          # witness's own assertion reads as `6 tests listed (expected 6),
+          # 0 failed` and exits 0.
+          sabotage=/tmp/frp-core-web-server-tls-enable-warning-tests-sabotaged.log
+          FRP_WARNING_PIN_SABOTAGE=1 \
+            cargo test -p frp-core --test web_server_tls_enable_warning --color never \
+            -- --exact "$witness" --nocapture > "$sabotage" 2>&1 || true
+          sed -e 's/\x1b\[[0-9;]*m//g' "$sabotage" > "$sabotage.plain"
+          sabotaged=$(grep -E -c "^test ${witness} \.\.\. FAILED$" "$sabotage.plain" || true)
+          [ "$sabotaged" = "1" ] || status=1
           if [ "$status" != "0" ]; then
-            echo "::error::frp-core web-server tls_enable warning guard failed (status=$status, file=$n, log=$log)"
+            echo "::error::frp-core web-server tls_enable warning guard failed (status=$status, file=$n, run=$n_run, named=$named, log=$log, sabotage=$sabotage)"
             if [ -n "$n" ] && [ "$n" != "6" ]; then
               if [ "$n" -lt "6" ]; then
                 echo "::error::frp-core/tests/web_server_tls_enable_warning.rs lists $n tests, this step expects 6 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
@@ -626,10 +744,19 @@ jobs:
                 echo "::error::frp-core/tests/web_server_tls_enable_warning.rs lists $n tests, this step expects 6: move the single literal in this shell step from 6 to $n"
               fi
             fi
+            if [ -n "$n_run" ] && [ "$n_run" != "$n" ]; then
+              echo "::error::frp-core/tests/web_server_tls_enable_warning.rs completed $n_run tests but its -- --list reports $n — a listed test did not run or reported nothing; restore it rather than re-pointing this literal"
+            fi
+            if [ "$named" != "1" ]; then
+              echo "::error::frp-core/tests/web_server_tls_enable_warning.rs does not list ${witness} — the witness pin was renamed, deleted, or cfg'd out; restore it rather than re-pointing this name"
+            fi
+            if [ "$sabotaged" != "1" ]; then
+              echo "::error::the sabotaged run (FRP_WARNING_PIN_SABOTAGE=1) did not fail ${witness} — this pin cannot be made to fail, so a body that deletes its assertions, or returns before them, passes while still reporting $n passed; restore its assertions"
+            fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frp-core web-server tls_enable warning guard ok: $n tests listed (expected 6), 0 failed"
+          echo "frp-core web-server tls_enable warning guard ok: $n tests listed (expected 6), $n_run passed, 0 failed, sabotage reds it"
       - name: Run frpc CLI tests (admin address resolution)
         # No lane ran a `cargo test` target of the `frpc` package before this
         # step (`ab-matrix.yml` only *builds* `-p frpc`; the two `--lib` steps —
