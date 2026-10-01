@@ -84,9 +84,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   # Cheapest job in the matrix (~seconds: no Rust toolchain, no cache, reads
-  # files with grep/find only, plus two fixture scripts that drive the
-  # repo-health and stray-guard rules against synthetic inputs). It turns a rule
-  # that was previously enforced by
+  # files with grep/find only, plus three fixture scripts that drive the
+  # repo-health, stray-guard and RSS-soak run-dir rules against synthetic
+  # inputs). It turns a rule that was previously enforced by
   # memory into a machine gate: frp-rs versions must stay aligned with the Go frp
   # release number across 5 crates + the VERSION constant + the download script +
   # the README (see "Versioning (mandatory)" in CLAUDE.md).
@@ -278,7 +278,7 @@ jobs:
       # `cargo test -p frps --test cli_exit_codes -- --list`.
       # 44 → 45 with the `-l`-shorthand refusal pin
       # `short_l_is_not_a_frps_shorthand_and_the_refusal_is_pinned`
-      # (`TODO.md:8884`): +1. Re-derived with the same `--list` command.
+      # (`TODO.md:8954`): +1. Re-derived with the same `--list` command.
       FRPS_CLI_TESTS: "45"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
@@ -1044,7 +1044,7 @@ jobs:
         # `--log-max-days 0`, both arbited by Go's `-c` lane — see the file's own
         # section comments), and 9 → 10 with the `-c`-lane non-empty-flag pin
         # `cli_nonempty_log_level_flag_does_not_override_the_config_file`
-        # (`TODO.md:8831`). It is the count of `#[test]`s in that one file, and
+        # (`TODO.md:8901`). It is the count of `#[test]`s in that one file, and
         # it lives in exactly one place in this step — the `expected=` line — so
         # a new pin means editing one number, not hunting a duplicated one.
         #
@@ -1218,21 +1218,21 @@ jobs:
           n=$(cargo test -p frpc --test warn_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/warn_delivery.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 8 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "8" ] || status=1
+          grep -q "test result: ok. 11 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "11" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frpc warning-delivery guard failed (status=$status, file=$n, log=$log)"
-            if [ -n "$n" ] && [ "$n" != "8" ]; then
-              if [ "$n" -lt "8" ]; then
-                echo "::error::frpc/tests/warn_delivery.rs lists $n tests, this step expects 8 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
+            if [ -n "$n" ] && [ "$n" != "11" ]; then
+              if [ "$n" -lt "11" ]; then
+                echo "::error::frpc/tests/warn_delivery.rs lists $n tests, this step expects 11 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
               else
-                echo "::error::frpc/tests/warn_delivery.rs lists $n tests, this step expects 8: move the single literal in this shell step from 8 to $n"
+                echo "::error::frpc/tests/warn_delivery.rs lists $n tests, this step expects 11: move the single literal in this shell step from 11 to $n"
               fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frpc warning-delivery guard ok: $n tests listed (expected 8), 0 failed"
+          echo "frpc warning-delivery guard ok: $n tests listed (expected 11), 0 failed"
       - name: Run frpc's admin config-GET delivery tests
         # `frpc/tests/admin_config_get_warning.rs` is the only test that starts a
         # **real** `frpc` (built with `--features admin`), hits the real admin
@@ -1300,21 +1300,21 @@ jobs:
           n=$(cargo test -p frpc --features admin --test warn_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/warn_delivery.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 8 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "8" ] || status=1
+          grep -q "test result: ok. 11 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "11" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frpc admin warning-delivery guard failed (status=$status, file=$n, log=$log)"
-            if [ -n "$n" ] && [ "$n" != "8" ]; then
-              if [ "$n" -lt "8" ]; then
-                echo "::error::frpc/tests/warn_delivery.rs lists $n tests with --features admin, this step expects 8 — tests were deleted or the file was not built with --features admin; restore them rather than lowering this literal"
+            if [ -n "$n" ] && [ "$n" != "11" ]; then
+              if [ "$n" -lt "11" ]; then
+                echo "::error::frpc/tests/warn_delivery.rs lists $n tests with --features admin, this step expects 11 — tests were deleted or the file was not built with --features admin; restore them rather than lowering this literal"
               else
-                echo "::error::frpc/tests/warn_delivery.rs lists $n tests with --features admin, this step expects 8: move the single literal in this shell step from 8 to $n"
+                echo "::error::frpc/tests/warn_delivery.rs lists $n tests with --features admin, this step expects 11: move the single literal in this shell step from 11 to $n"
               fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frpc admin warning-delivery guard ok: $n tests listed (expected 8), 0 failed"
+          echo "frpc admin warning-delivery guard ok: $n tests listed (expected 11), 0 failed"
       - name: Run frpc's CLI-input tests with the admin feature
         # The `admin`-on half of `frpc/tests/cli_inputs.rs`, and the only lane
         # that ever ran that file with `admin` on: `Run frpc CLI tests (admin

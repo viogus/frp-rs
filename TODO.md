@@ -8043,7 +8043,7 @@ section; ledger now **24 open / 104 closed**.**
   `legacy_ini_typed_array_root_visitor_is_collected` (`frp-core/src/config/tests.rs:7378`);
   re-adding the two roots to `INI_NESTED_SECTION_ROOTS` reddens the first.
 
-- [ ] **Four more test-precision residues the `test-precision-residue` round-2 reviews measured.**
+- [x] **Four more test-precision residues the `test-precision-residue` round-2 reviews measured.**
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7191`): a
   test that pins less than its name claims, so a real regression stays green.
   (a) The pinned warning bytes are the shipped static, but the **emitted** record is only
@@ -8108,6 +8108,14 @@ section; ledger now **24 open / 104 closed**.**
   unreachable on a case-sensitive filesystem. Done-when: either a scenario exercises an empty root
   (killing that guard) or the dormant branch is removed, and the case-insensitive-volume limitation
   is recorded where the containment check is documented.
+
+  **(d) Done (this batch, code head `3020174c`).** The dormant `if [ -z "$TREE" ]` guard was removed from
+  `scripts/tests/repo-health-fixtures.sh`: with it gone the suite still reports `RESULT: 32 fixture check(s) hold`,
+  and the `setup_die`-returns mutant is still rejected by scenario 9 itself (`rows ran past the failed
+  setup: ln: /docs/archive/bad.md: No such file or directory`); the removed guard's `exit 1` was reachable only under that same mutant, where it fired an extra `fixture abort:` row (the file's own comment at `scripts/tests/repo-health-fixtures.sh:265-269`). The `mut_prefix` containment anchor still counts 4 sites. The
+  case-insensitive-volume limitation is recorded where the containment check is documented
+  (`scripts/repo-health.sh:284-299`, with pointers at `:626-627`, `:767-768`, `:2330-2331`). Limit: the
+  empty-root trigger itself is recorded, not pinned — no in-tree scenario forces it.
   Ledger after this batch: **26 open / 154 closed** (base `bebe888e`: 24 open / 153 closed; the
   fixed-settle flip moves one item open→closed and this batch files three new residues — the round-2
   TLS-enable capture item and the two the round-2 delta review measured below).
@@ -8447,7 +8455,7 @@ section; ledger now **24 open / 104 closed**.**
   `:101`) returns only once `count >= want` **and** the capture has been quiet for `QUIET_PERIOD` (`:281`),
   so the count is final before `snapshot()` (`:354`) freezes it (no fallback to the live buffers). Teeth:
   a second `--config-dir` emit 150 ms behind the first (`frpc/src/main.rs:545`) leaves the pre-fix file
-  `ok. 8 passed` and reds the fixed one `FAILED. 6 passed; 2 failed` at `frpc/tests/warn_delivery.rs:448:5`
+  `ok. 8 passed` and reds the fixed one `FAILED. 6 passed; 2 failed` at `frpc/tests/warn_delivery.rs:532:5`
   (`left: 2`, the two records 152 ms apart; the 0 ms variant also reds), while the honest lane is
   `ok. 8 passed` in 2.59 s — the condition wait costs ~500 ms per `Warning` row. Load: 10/10 sequential
   `cargo test -p frpc --features full --test warn_delivery` runs green at load 28.0-34.0; the item's 39-41
@@ -8458,7 +8466,7 @@ section; ledger now **24 open / 104 closed**.**
 - [x] **The `frpc/tests/warn_delivery.rs` condition wait is a quiet window, not a finality guarantee: a duplicate emitted more than one `QUIET_PERIOD` behind the first is a false pass.**
   Filed by the coordinator from PR #432's round-2 delta adversarial, which re-ran the closed item's own teeth with
   the delay moved: a second `--config-dir` emit 150 ms behind the first (`frpc/src/main.rs:545`) reds the pin
-  (`frpc/tests/warn_delivery.rs:448:5`, `left: 2`), but the same mutant at **700 ms** — past `QUIET_PERIOD`
+  (`frpc/tests/warn_delivery.rs:532:5`, `left: 2`), but the same mutant at **700 ms** — past `QUIET_PERIOD`
   (500 ms, `:110`) — leaves `ok. 8 passed`. `wait_for_record` (`:270`) returns once `count >= want` **and** the
   capture has been quiet for `QUIET_PERIOD` (`:281`), so an emit that lands after the last quiet window closes and
   before `snapshot()` (`:354`) freezes the capture is invisible: the pin's detection power is bounded by how long
@@ -8470,22 +8478,32 @@ section; ledger now **24 open / 104 closed**.**
   **Done (PR #441, code head `f7319c3c`).** The bound is gone rather than documented: the oracle is now the
   child's own exit. `Spawned::run` waits for the child to exit and then joins both pipe-drain threads, so the
   capture is at EOF before anything asserts on it, and `QUIET_PERIOD`, `wait_for_record` and the live-buffer
-  fallback are deleted; the one read-error direction is disclosed at `frpc/tests/warn_delivery.rs:83` (`drain`'s
-  `Ok(0) | Err(_) => break` at `:355`). Teeth re-measured in all three review rounds: the duplicate
+  fallback are deleted; the one read-error direction is disclosed at `frpc/tests/warn_delivery.rs:83` (the pre-batch
+  `drain` arm `Ok(0) | Err(_) => break`, at `:355` then and now `Ok(0) => return Ok(())`/the `Interrupted` retry/
+  `Err(e) => return Err(e)` at `:374`/`:379`/`:380`). Teeth re-measured in all three review rounds: the duplicate
   `--config-dir` emit at **+700 ms** — the delay that left the pre-fix pin printing `ok. 8 passed` — now reds at
-  `frpc/tests/warn_delivery.rs:407:5` (`left: 2`), the +150 ms and 0 ms variants red with it, and the honest
+  `frpc/tests/warn_delivery.rs:532:5` (`left: 2`), the +150 ms and 0 ms variants red with it, and the honest
   lane is `ok. 8 passed`. The round-2 adversarial could not construct a false negative for the new oracle: its
   strongest shape, a duplicate 700 ms behind a 512 KB stdout burst, reds with all 1536 padding lines drained to
   EOF (no truncation, no deadlock).
 
-- [ ] **`frpc/tests/warn_delivery.rs`'s drain treats any read error as EOF, so a transport error can end a wait early.**
+- [x] **`frpc/tests/warn_delivery.rs`'s drain treats any read error as EOF, so a transport error can end a wait early.**
   Filed by the coordinator from PR #441's rounds 1-3. `drain`'s read loop breaks on `Ok(0) | Err(_)`
-  (`frpc/tests/warn_delivery.rs:355`, disclosed in the module doc at `:83`), so a pipe that errors instead of
+  (`frpc/tests/warn_delivery.rs:355` before this batch's fix; the arms are now `Ok(0) => return Ok(())` /
+  `Interrupted` retry / `Err(e) => return Err(e)` at `:374`/`:379`/`:380`, disclosed in the module doc at `:83`), so a pipe that errors instead of
   reaching EOF makes the joined capture look final. For a count row that fails safe (fewer records than the
   child emitted reds the pin), but for a silence row ("nothing on this stream") it can hide a record that was
   never read.
   **Done-when:** an `Err` other than `ErrorKind::Interrupted` is distinguished from EOF and asserted absent (or
   the join reports it), or the fail-safe direction is argued for both row kinds.
+
+  **Done (this batch, code head `3020174c`).** `drain` now returns `std::io::Result<()>`: `Ok(0)` is EOF,
+  `ErrorKind::Interrupted` retries the read, and any other error is returned to `Spawned::join_drains`, which
+  reports the capture as truncated rather than final. A new `mod drain_tests` covers the three shapes, and a
+  mutant that folds a non-EOF error back into `Ok(())` (the old `Err(_) => return Ok(())` shape) reds
+  `frpc/tests/warn_delivery.rs:457:26` ("a non-EOF read error must be reported, not folded into EOF") and
+  `:468:9` (`left: "" right: "kept\n"`). The frps-side fire-and-forget `drain` (`frps/tests/warn_delivery.rs:413`)
+  is out of scope and untouched.
 
 - [x] **`frpc/tests/cli_inputs.rs`'s `a_config_file_named_after_a_subcommand_stays_a_config_file` fails whenever the `admin` feature is on, so `cargo test -p frpc --features full,admin` is red for a reason no CI lane runs.**
   Filed by the coordinator from PR #432's round-2 delta adversarial while correcting that batch's lane quote.
@@ -8692,11 +8710,17 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** the step asserts the script's `RESULT: 269 fixture check(s) hold` line in both
   directions (missing and failed) rather than only its exit code.
 
-- [ ] **Stale "two fixture scripts" comment in the health job.** `.github/workflows/ci.yml:86-88`
+- [x] **Stale "two fixture scripts" comment in the health job.** `.github/workflows/ci.yml:86-88`
   still says the job reads "files with grep/find only, plus two fixture scripts"; it now runs three
   (`scripts/tests/repo-health-fixtures.sh`, `scripts/tests/compat-stray-guard.sh`,
   `scripts/tests/rss-soak-run-dir.sh`).
   **Done-when:** the comment names the three.
+
+  **Done (this batch, code head `3020174c`).** `.github/workflows/ci.yml:87-89` now reads "files with
+  grep/find only, plus three fixture scripts that drive the repo-health, stray-guard and RSS-soak run-dir
+  rules against synthetic inputs", naming exactly the three it runs (`scripts/tests/repo-health-fixtures.sh`
+  at `ci.yml:106`, `scripts/tests/compat-stray-guard.sh` at `:126`, `scripts/tests/rss-soak-run-dir.sh`
+  at `:136`). Comment-only: 3 lines replaced by 3 (`@@ -84,9 +84,9 @@`), nothing else in the file changed.
 - [x] **Legacy `.ini` spellings Go reads as a proxy (or ignores) and frp-rs does not: reserved-root `type`-only sections, portless shapes, and the server side.**
   Measured across the #425 rounds 3-7 against real Go frp v0.71.0 binaries in both loader modes;
   the full per-fixture matrices are in PR #425. Grouped by what a fix has to decide:
@@ -8957,7 +8981,7 @@ section; ledger now **24 open / 104 closed**.**
   Ledger after this batch: **19 open / 180 closed** (base `799ce048`: 25 open / 174 closed; this batch closes
   the six R1–R6 log-flag residues).
 
-- [ ] **The `frps` dashboard `web_server.tls.enable` captures still count their record, and the ported byte-pin helper is weaker than the `frp-core` original on two points.**
+- [x] **The `frps` dashboard `web_server.tls.enable` captures still count their record, and the ported byte-pin helper is weaker than the `frp-core` original on two points.**
   Filed by the coordinator from PR #439's two review rounds. (a) The dashboard `KEY` captures
   (`frps/tests/warn_delivery.rs:471`, `:1100`, `:1113`, `:1177`, `:1224`) still assert a count plus a clause —
   `assert_clause_matches_this_build` (`:495`) pins which build-shape clause is expected, not the record's
@@ -8973,6 +8997,43 @@ section; ledger now **24 open / 104 closed**.**
   are caught by the unchanged `frp-core` lanes, so no coverage is lost relative to the base.
   **Done-when:** the `frps` dashboard captures pin the record's bytes, the level is compared untrimmed, the
   following-line bytes are covered, and each of the three mutants reds the `frps` lane itself.
+
+  **Done (this batch, code head `3020174c`).** The `frps` dashboard lane is now a catcher, not a
+  count-plus-clause reader: `records_containing` (`frps/tests/warn_delivery.rs:724`) keeps each record's
+  terminating newline and `assert_records_are_exactly_the_message` (`:760`) byte-pins it, with
+  `assert_web_server_tls_enable_records_are_exactly_the_message` (`:809`) selecting the expected text by
+  `cfg!(feature = "dashboard")` exactly as `assert_clause_matches_this_build` does; both are wired into
+  `assert_one_warning_on_stdout` (`:474`), the reload test (`:1242` / `:1260`) and the two negative controls
+  (`:1329`, `:1381`, with the 0-record pin in `assert_no_warning` at `:835`). The level is compared untrimmed —
+  `assert_eq!(level, " WARN", …)` after the new `is_tracing_timestamp` (`:681`) strips the
+  timestamp the in-process `frp-core` capture never has — and `starts_a_fresh_tracing_record` (`:746`) rejects
+  bytes after a record that do not begin a fresh `tracing` record or end the capture, so the following-line
+  case is reachable again. Five mutants at the emit site (`frp-core/src/config/loader.rs:730`) each red 6 of
+  the file's 17 tests (`11 passed; 6 failed`): `"{} but honestly"` at `frps/tests/warn_delivery.rs:641:5`
+  (`the emit site appended bytes after the message … got tail: " but honestly\n"`), `target: "evil
+  frp_core::config::loader"` and `target: " frp_core::config::loader"` both at `:668:5` (`left: " WARN evil"` /
+  `left: " WARN "` against `right: " WARN"`), `"{}\nEXTRA"` at `:776:9`, and `"{}\n"` at `:641:5`
+  (`got tail: "\n\n"`). Limit: the `cfg!(feature = "dashboard")` branch was verified green, but only the
+  no-dashboard build was mutant-tested; the doc comment now claims the same four rejections as the shared helper
+  (`:609-626`).
+  Ledger after this close: **16 open / 185 closed** (base `f881d15e`: 19 open / 181 closed; this batch closes
+  four items — one whole item each for the drain error, the stale health-job comment and the dashboard
+  captures, plus part (d) completing the four-residue item — and files the one residue below).
+
+- [ ] **The ported `frps` warning-capture oracle is weaker than the `frp-core` original in three ways the H2 batch did not close.**
+  Filed by the coordinator from the H2 batch's adversarial review (`/private/tmp/rev-h2-attack.md`, measured at
+  the pre-rebase code head, patch-identical to `3020174c`, on base `ed2d71a3`); all three are coverage gaps the mutant matrix did not reach, not false
+  assertions. (a) An emit-site mutant that appends a *well-formed* `tracing` record — a second `warn!` rather
+  than trailing bytes — stays green across all 17 `frps` tests (`frps/tests/warn_delivery.rs`), because
+  `assert_records_are_exactly_the_message` (`:760`) byte-pins the records it is handed, not the number the child
+  emitted. (b) Bytes *before* the first matching record are never examined, so a prefix emitted ahead of the
+  warning is invisible to `records_containing` (`:724`). (c) `frps/tests/warn_delivery.rs`'s own capture is
+  still a 600 ms live snapshot whose `drain` breaks on `Ok(0) | Err(_)` — the shape item B fixed in
+  `frpc/tests/warn_delivery.rs` — so a read error on the `frps` side can still make the capture look final.
+  **Done-when:** the `frps` oracle asserts the record count (or runs a converse no-extra-record re-run) so an
+  appended well-formed record reds it, examines the bytes before the first matching record, and `frps`'s own
+  `drain` distinguishes a read error from EOF the way the `frpc` one now does (or each residue is argued
+  unreachable with a measurement).
 
 - [ ] **`docs/config.md:22` names `websocketPort` as the Go frp v0.71.0 spelling of `websocket_port`, but Go's `frps` has no such field.**
   Filed by the coordinator from PR #436's delta adversarial (INFO). Measured with the real v0.71.0 binary:

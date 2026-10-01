@@ -465,10 +465,13 @@ fn occurrences(haystack: &str, needle: &str) -> usize {
 }
 
 /// The shared assertion: one record on **stdout**, none on **stderr**, the
-/// binary really did start, and the record carries the clause **this build**
-/// answers with.
+/// binary really did start, and the record is byte-for-byte this build's message
+/// — the count plus the clause is not enough, because all three variants share
+/// their first half (`web_server.tls.enable has no effect: …`), so an appended
+/// clause at the emit site leaves both green.
 fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
     assert_one_warning_on_stdout_for(tag, spawned, KEY);
+    assert_web_server_tls_enable_records_are_exactly_the_message(tag, &spawned.stdout(), 1);
     assert_clause_matches_this_build(tag, spawned);
 }
 
@@ -481,10 +484,10 @@ fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
 /// `KEY` record, and still satisfies `frp-core`'s own dispatch test — that one
 /// passes the caller's answer as an argument, so it never sees a real build's
 /// answer. Only an assertion on the captured stdout can, and that is what binds
-/// `frps/src/main.rs:245`/`:469` (and the reload site,
-/// `frp-server/src/service.rs:2333`) to the build under test. The lane that runs
-/// this file **without** `--features dashboard` is what makes the no-dashboard
-/// direction observable.
+/// the two `frps/src/main.rs` emit sites (`:1037` on the `-c` path, `:601` on the
+/// `--config-dir` path) and the reload site `frp-server/src/service.rs:2048` to the
+/// build under test. The lane that runs this file **without** `--features dashboard`
+/// is what makes the no-dashboard direction observable.
 ///
 /// The **no-TLS** clause is unreachable from this binary's lanes: `dashboard`
 /// decides the first question, and every lane that runs this file links
@@ -606,16 +609,21 @@ fn strip_sgr(record: &str) -> String {
 /// The emitted record must be the one-line `tracing` prefix followed by `want`
 /// and **nothing else** but an optional trailing newline. Port of
 /// `assert_record_is_exactly_the_message` (`frp-core/tests/common/mod.rs`), with
-/// the same three rejections:
+/// the same four rejections:
 ///
 /// * the message appears zero or twice, or is a different message;
 /// * bytes appended after the message — the `"{} but honestly"` mutant this
 ///   file was missing;
-/// * a literal injected between the target and the message.
+/// * a literal injected between the target and the message;
+/// * the target rewritten to a longer key that ends in the expected one
+///   (`target: "evil {target}"`), or prefixed with whitespace
+///   (`target: " {target}"`), which leaves extra bytes in the level field.
 ///
-/// Unlike the `frp-core` captures, the record here carries a timestamp before
-/// the level, so only the one-line shape of the level is required, exactly as
-/// the shared helper does.
+/// Unlike the `frp-core` captures, the record here carries a `tracing_subscriber`
+/// timestamp before the level. That field is validated and stripped first, and
+/// the level is then compared with the shared helper's **untrimmed**
+/// `assert_eq!(level, " WARN")`; the previous `level.contains("WARN")` passed
+/// both rewrites above.
 fn assert_record_is_exactly_the_message(tag: &str, record: &str, want: &str, target: &str) {
     let clean = strip_sgr(record);
     assert!(
@@ -648,12 +656,131 @@ fn assert_record_is_exactly_the_message(tag: &str, record: &str, want: &str, tar
          prefix must end with {anchor:?} (SGR stripped), got prefix: {prefix:?} from raw record: \
          {record:?}"
     );
-    let level = &prefix[..prefix.len() - anchor.len()];
+    let mut fields = prefix[..prefix.len() - anchor.len()].splitn(2, ' ');
+    let stamp = fields.next().expect("prefix is non-empty");
+    let level = fields.next().unwrap_or("");
     assert!(
-        level.contains("WARN") && !level.contains('\n'),
-        "{tag}: only the one-line tracing level may precede the target; got level: {level:?} \
-         from raw record: {record:?}"
+        is_tracing_timestamp(stamp),
+        "{tag}: the record must begin with the `tracing_subscriber` timestamp, which is the only \
+         field this port strips before comparing the level; got: {stamp:?} from raw record: \
+         {record:?}"
     );
+    assert_eq!(
+        level, " WARN",
+        "{tag}: only the tracing level may precede the target, and it must be exactly `\" WARN\"` \
+         (compared untrimmed, as the shared helper does); got level: {level:?} from raw record: \
+         {record:?}"
+    );
+}
+
+/// Is `field` a `tracing_subscriber` timestamp? The default `SystemTime` timer
+/// prints `YYYY-MM-DDTHH:MM:SS[.fraction]Z`. The `frp-core` lane has no
+/// timestamp to validate (it captures one in-process record), so this port
+/// checks the field it strips rather than letting a rewritten prefix smuggle
+/// bytes past the level comparison above.
+fn is_tracing_timestamp(field: &str) -> bool {
+    let Some(body) = field.strip_suffix('Z') else {
+        return false;
+    };
+    let (secs, frac) = match body.split_once('.') {
+        Some((secs, frac)) => (secs, Some(frac)),
+        None => (body, None),
+    };
+    if secs.len() != 19 {
+        return false;
+    }
+    let bytes = secs.as_bytes();
+    if !(bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':')
+    {
+        return false;
+    }
+    if !secs
+        .bytes()
+        .enumerate()
+        .all(|(i, c)| matches!(i, 4 | 7 | 10 | 13 | 16) || c.is_ascii_digit())
+    {
+        return false;
+    }
+    match frac {
+        None => true,
+        Some(frac) => {
+            !frac.is_empty() && frac.len() <= 9 && frac.bytes().all(|c| c.is_ascii_digit())
+        }
+    }
+}
+
+/// Slice every occurrence of `want` out of an SGR-stripped capture as the record
+/// the emit site produced: the whole line from its start through its terminating
+/// newline, **plus any further newlines the emit appended**, so a bare extra
+/// newline lands in the record and the helper's `tail == "\n"` guard stays live.
+/// `clean.lines()` cannot express that — it drops the terminator — and it
+/// silently discards an appended non-record line. The second half of each pair
+/// is what follows the record, so the caller can require a fresh record (or the
+/// end of the capture) there.
+fn records_containing<'a>(clean: &'a str, want: &str) -> Vec<(&'a str, &'a str)> {
+    let mut found = Vec::new();
+    let mut search = 0;
+    while let Some(offset) = clean[search..].find(want) {
+        let at = search + offset;
+        let start = clean[..at].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = clean[at..].find('\n').map_or(clean.len(), |i| at + i);
+        let mut end = line_end;
+        while end < clean.len() && clean.as_bytes()[end] == b'\n' {
+            end += 1;
+        }
+        found.push((&clean[start..end], &clean[end..]));
+        search = end.max(at + want.len());
+    }
+    found
+}
+
+/// Does `rest` — the text after a record — begin a fresh `tracing_subscriber`
+/// record? A `warn!("{}\nEXTRA", …)` mutant appends a following line that is not
+/// one, so this is the "no following line" half of the shared helper's
+/// `tail.is_empty() || tail == "\n"` guard, made reachable for a line-oriented
+/// capture.
+fn starts_a_fresh_tracing_record(rest: &str) -> bool {
+    let Some((stamp, after)) = rest.split_once(' ') else {
+        return false;
+    };
+    is_tracing_timestamp(stamp)
+        && ["ERROR ", " WARN ", " INFO ", "DEBUG ", "TRACE "]
+            .iter()
+            .any(|level| after.starts_with(level))
+}
+
+/// Byte-pin every stdout record carrying `want`: there must be exactly
+/// `expected` of them, each must be the message with the one-line `tracing`
+/// prefix, and nothing may follow a record but a fresh record or the end of the
+/// capture.
+fn assert_records_are_exactly_the_message(tag: &str, out: &str, want: &str, expected: usize) {
+    let clean = strip_sgr(out);
+    let records = records_containing(&clean, want);
+    assert_eq!(
+        records.len(),
+        expected,
+        "{tag}: expected {expected} record(s) carrying `{want}`, found {}\n--- stdout ---\n{out}",
+        records.len()
+    );
+    for (i, (record, rest)) in records.iter().enumerate() {
+        assert_record_is_exactly_the_message(
+            &format!("{tag} (record {} of {expected})", i + 1),
+            record,
+            want,
+            WARNING_TARGET,
+        );
+        assert!(
+            rest.is_empty() || starts_a_fresh_tracing_record(rest),
+            "{tag} (record {} of {expected}): the emit site appended a following line — the bytes \
+             after the record must begin a fresh tracing record or end the capture; got {:?}",
+            i + 1,
+            rest.chars().take(120).collect::<String>()
+        );
+    }
 }
 
 /// Byte-pin every stdout line carrying the server `tls_enable` message: there
@@ -666,23 +793,30 @@ fn assert_record_is_exactly_the_message(tag: &str, record: &str, want: &str, tar
 /// asserts the same count through both so the "one per load" intent stays
 /// explicit.
 fn assert_server_tls_enable_records_are_exactly_the_message(tag: &str, out: &str, expected: usize) {
-    let want = frp_core::config::SERVER_TLS_ENABLE_INERT_WARNING.as_str();
-    let clean = strip_sgr(out);
-    let records: Vec<&str> = clean.lines().filter(|line| line.contains(want)).collect();
-    assert_eq!(
-        records.len(),
+    assert_records_are_exactly_the_message(
+        tag,
+        out,
+        frp_core::config::SERVER_TLS_ENABLE_INERT_WARNING.as_str(),
         expected,
-        "{tag}: expected {expected} server `tls_enable` record(s) on stdout, found {}\n--- stdout ---\n{out}",
-        records.len()
     );
-    for (i, record) in records.iter().enumerate() {
-        assert_record_is_exactly_the_message(
-            &format!("{tag} (record {} of {expected})", i + 1),
-            record,
-            want,
-            WARNING_TARGET,
-        );
-    }
+}
+
+/// [`assert_server_tls_enable_records_are_exactly_the_message`] for the dashboard
+/// `web_server.tls.enable` diagnostic. The expected text is the clause **this
+/// build** answers with, selected exactly as [`assert_clause_matches_this_build`]
+/// selects it, so a build whose reader answers the other way is pinned to the
+/// other message instead of passing on the clause the three variants share.
+fn assert_web_server_tls_enable_records_are_exactly_the_message(
+    tag: &str,
+    out: &str,
+    expected: usize,
+) {
+    let want = if cfg!(feature = "dashboard") {
+        frp_core::config::WEB_SERVER_TLS_ENABLE_INERT_WARNING
+    } else {
+        frp_core::config::WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD
+    };
+    assert_records_are_exactly_the_message(tag, out, want, expected);
 }
 
 /// [`assert_one_warning_on_stdout_for`] for the flat server `tls_enable`
@@ -693,9 +827,12 @@ fn assert_one_server_tls_enable_warning(tag: &str, spawned: &Spawned) {
 }
 
 /// The shared "no record at all" assertion, with the startup line still there so
-/// the silence is a decision and not a failed run.
+/// the silence is a decision and not a failed run. The byte-pin runs with
+/// `expected = 0` so the silence is stated in the same terms as the presence
+/// rows: no variant of this build's message, anywhere in the capture.
 fn assert_no_warning(tag: &str, spawned: &Spawned) {
     assert_no_warning_for(tag, spawned, KEY);
+    assert_web_server_tls_enable_records_are_exactly_the_message(tag, &spawned.stdout(), 0);
 }
 
 /// [`assert_no_warning`] for an arbitrary key.
@@ -1102,6 +1239,11 @@ fn a_sigusr1_reload_delivers_the_warning_again() {
         "startup: one record\n--- stdout ---\n{}",
         spawned.stdout()
     );
+    assert_web_server_tls_enable_records_are_exactly_the_message(
+        "frps reload (startup)",
+        &spawned.stdout(),
+        1,
+    );
 
     assert!(
         spawned.sigusr1_and_reload(),
@@ -1115,6 +1257,11 @@ fn a_sigusr1_reload_delivers_the_warning_again() {
         "startup + reload = exactly 2 records, one per load\n--- stdout ---\n{out}"
     );
     assert_eq!(occurrences(&spawned.stderr(), KEY), 0);
+    assert_web_server_tls_enable_records_are_exactly_the_message(
+        "frps reload (startup + reload)",
+        &out,
+        2,
+    );
     assert_clause_matches_this_build("frps reload", &spawned);
 }
 
@@ -1179,6 +1326,11 @@ fn server_tls_enable_warning_reaches_a_dash_c_user() {
         "the dashboard key was not written, so its diagnostic must not fire\n--- stdout ---\n{}",
         spawned.stdout()
     );
+    assert_web_server_tls_enable_records_are_exactly_the_message(
+        "frps -c (dashboard key not written)",
+        &spawned.stdout(),
+        0,
+    );
 }
 
 /// The same key reached through the `[common]` flatten, on both startup paths.
@@ -1225,6 +1377,11 @@ fn no_server_tls_enable_warning_when_it_was_synthesized_from_transport_tls() {
         0,
         "no dashboard key either\n--- stdout ---\n{}",
         spawned.stdout()
+    );
+    assert_web_server_tls_enable_records_are_exactly_the_message(
+        "frps -c (synthesized tls_enable)",
+        &spawned.stdout(),
+        0,
     );
 }
 
