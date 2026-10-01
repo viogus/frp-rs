@@ -1178,8 +1178,7 @@ User-facing release notes for frp-rs.
   `TODO.md`).
 - **`frpc` ran an `auth.tokenSource` `exec` command twice per successful login; it now runs it
   once, as Go does.** `frp-client/src/service.rs:939` already resolved the source, but `:952` (pre-fix numbering; the
-  post-fix `None` is `:965`) also
-  stored the same `ValueSource` in `AuthConfig.token_source`, so every Login, Ping and NewWorkConn
+  post-fix `None` is `:965`) also stored the same `ValueSource` in `AuthConfig.token_source`, so every Login, Ping and NewWorkConn
   re-executed it; Go resolves once in `NewService` (`client/service.go:168`). The stored source is
   dropped and the behaviour is pinned by `frp-client/tests/token_source_single_exec.rs` (one
   execution after construction, after two logins, and after three reloads — including a refused
