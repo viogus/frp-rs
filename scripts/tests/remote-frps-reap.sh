@@ -31,9 +31,16 @@
 #   F  the status census answers from pid files only: a live process whose
 #      command line carries the matched text, with no pid file anywhere, is
 #      `stopped` — never `running (no pid file)`.
-#   G  the helper's own code carries no `pkill`/`killall`/`pgrep -f` and routes
-#      start/reap/status through the library (the source-shape half; without a
-#      run of the fragments a source check alone can rot behind a comment).
+#   G  the helper's own code carries no argument-pattern kill — `pkill`,
+#      `killall`, `pidof`, `fuser`, a pattern `pgrep`, an `xargs kill`, or a
+#      `kill` of a command substitution — and routes start/reap/status through
+#      the library (the source-shape half; without a run of the fragments a
+#      source check alone can rot behind a comment). The guard is driven against
+#      the reviewer's `ps | grep | xargs kill` mutant and an honest `kill` line,
+#      so a narrowed regex cannot pass silently.
+#   H  only a positive integer in the pid file is a pid: `0`, a negative, an
+#      empty, a non-numeric and a multi-line pid are all refused before `kill`
+#      is reached (`kill 0` would signal the remote process group).
 #
 # Self-contained: no network, no ssh, no dependence on this repo's binaries.
 # Synthetic servers and the scratch tree are removed on exit.
@@ -51,7 +58,7 @@ fails=0
 # Pinned floor. A suite that exits early — a neutered scenario body, a deleted
 # case — leaves every remaining assertion green, so the count has to be
 # enforced from the EXIT trap, which is installed before the first check.
-MIN_CHECKS=31
+MIN_CHECKS=37
 
 ok()  { checks=$((checks + 1)); printf '  ok    %s\n' "$1"; }
 bad() { checks=$((checks + 1)); fails=$((fails + 1)); printf '  FAIL  %s\n' "$1"; }
@@ -180,13 +187,26 @@ strip_comments() {  # <file>
     sed 's/[[:space:]]*#.*$//' "$1"
 }
 
-# `pkill -f`/`pgrep -f` match a process's full command line; this argument-pattern
-# regex is what the replacement must not reintroduce (comments are stripped
-# first, because the rationale for the route names the commands it replaced).
+# Every shape of "select the process by its command line and kill it" that the
+# replacement must not reintroduce. `pkill -f` / `pgrep -f` match a process's
+# full command line; the same selection can be spelled with `ps` + `grep` +
+# `xargs kill`, or `kill $(...)` over a `ps | grep`, or `pidof`/`fuser` — the
+# reviewer's mutant used the first and stayed green under a
+# `pkill|killall|pgrep -f`-only regex, so the regex is structural instead:
+#   * the tools that select by name or command line (pkill, killall, pidof, fuser)
+#   * any `pgrep` (name or command-line selection; the old route used -f)
+#   * any `xargs` (with flags) whose command is `kill`
+#   * a `kill` (with optional flags) of a `$( ... )` or backtick substitution
+#   * a pipeline straight into `kill`
+# Comments are stripped before the file scan, because the rationale for the
+# exact-pid route names the commands it replaced.
+# shellcheck disable=SC2016  # an ERE, matched literally by grep -E below
+PATTERN_KILL_RE='(^|[^[:alnum:]_])(pkill|killall|pidof|fuser|pgrep)([[:space:]]|$)|(^|[^[:alnum:]_])xargs([[:space:]]+-[^[:space:]]+)*[[:space:]]+kill|(^|[^[:alnum:]_])kill([[:space:]]+-[^[:space:]]+)*[[:space:]]+[$(`]|[|][[:space:]]*kill([[:space:]]|$)'
 pattern_hits() {  # <file>
-    strip_comments "$1" \
-        | grep -nE '(^|[^[:alnum:]_])(pkill|killall)([[:space:]]|$)|(^|[^[:alnum:]_])pgrep[[:space:]]+-[^[:space:]]*f' \
-        || true
+    strip_comments "$1" | grep -nE "$PATTERN_KILL_RE" || true
+}
+pattern_hits_text() {  # <text>
+    printf '%s\n' "$1" | grep -nE "$PATTERN_KILL_RE" || true
 }
 
 # ------------------------------------------------------------------ scenario A
@@ -328,6 +348,19 @@ legacy_pid=$start_pid
 outside_dir="$WORK/outside"
 start_server "$outside_dir"
 outside_pid=$start_pid
+# The sweep ends with `rm -rf`, and the synthetic server is a shell script: if
+# bash has not reached its `exec` yet, deleting the script file alone kills the
+# process and satisfies the assertions without a single pid being reaped
+# (measured: a `: reap-disabled` mutant that keeps `rm -rf` stayed green here).
+# Wait for each run-directory server to be exec-ed before the sweep, exactly as
+# scenarios A/B/F do.
+if cmdline_carries "$rd1_pid" "$root/frp-xtcp-AAAAAA/frps" \
+   && cmdline_carries "$rd2_pid" "$root/frp-xtcp-BBBBBB/frps" \
+   && cmdline_carries "$legacy_pid" "$root/frp-xtcp-test/frps"; then
+    ok 'rundirs: all three run-directory servers are exec-ed before the sweep (rm -rf cannot rescue it)'
+else
+    bad 'rundirs: a run-directory server had not exec-ed; the sweep could be satisfied by rm -rf alone'
+fi
 run_fragment "$(remote_reap_rundirs_snippet "$root")"
 reap_rc=$?
 if [ "$reap_rc" -eq 0 ]; then
@@ -421,15 +454,38 @@ fi
 hdr 'scenario G: the helper routes start/reap/status through the library'
 hits=$(pattern_hits "$HELPER")
 if [ -z "$hits" ]; then
-    ok 'remote-frps.sh: no pkill/killall/pgrep -f in its code'
+    ok 'remote-frps.sh: no argument-pattern kill in its code'
 else
     bad "remote-frps.sh kills by pattern again: $(printf '%s' "$hits" | tr '\n' ' ')"
 fi
 hits=$(pattern_hits "$LIB")
 if [ -z "$hits" ]; then
-    ok 'remote-frps-reap.sh: no pkill/killall/pgrep -f in its code'
+    ok 'remote-frps-reap.sh: no argument-pattern kill in its code'
 else
     bad "remote-frps-reap.sh kills by pattern: $(printf '%s' "$hits" | tr '\n' ' ')"
+fi
+# The guard's own teeth, driven the way the reviewer's mutant was: the same
+# selection spelled with `ps | grep | xargs kill`, and with `kill $( ... )`,
+# must red; the honest lines of the route must not. A regex narrowed back to
+# `pkill|killall|pgrep -f` passes the two checks above and fails these.
+# shellcheck disable=SC2016  # the sample text is matched literally, not expanded
+if [ -n "$(pattern_hits_text "ps -eo pid,args | grep 'frps -c frps.toml' | grep -v grep | awk '{print \$1}' | xargs -r kill")" ]; then
+    ok 'guard: catches ps|grep|xargs kill (the reviewer mutant pattern)'
+else
+    bad 'guard: ps|grep|xargs kill is not caught — the source check is narrower than the route'
+fi
+# shellcheck disable=SC2016  # the sample text is matched literally, not expanded
+if [ -n "$(pattern_hits_text 'kill -9 $(ps -eo pid,args | grep "frps -c frps.toml" | cut -d" " -f1)')" ]; then
+    ok 'guard: catches kill of a ps|grep command substitution'
+else
+    bad 'guard: kill of a ps|grep substitution is not caught'
+fi
+# shellcheck disable=SC2016  # both honest samples are matched literally
+if [ -z "$(pattern_hits_text 'kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null || true')" ] \
+   && [ -z "$(pattern_hits_text 'ss -tlnp 2>/dev/null | grep ":\${p}\b" | grep -o '"'"'pid=[0-9]*'"'"' | cut -d= -f2')" ]; then
+    ok 'guard: leaves the route own kill-by-recorded-pid and ss|grep lines alone'
+else
+    bad 'guard: flags an honest line of the route'
 fi
 helper_code=$(strip_comments "$HELPER")
 missing=""
@@ -449,4 +505,33 @@ if [ -z "$missing" ]; then
     ok 'remote-frps.sh: sources the library and calls the start/reap/rundirs/status fragments'
 else
     bad "remote-frps.sh: does not route through the library (missing:$missing)"
+fi
+
+# ------------------------------------------------------------------ scenario H
+hdr 'scenario H: only a positive integer in the pid file is a pid'
+guard_frag=$(remote_reap_pidfile_snippet "$WORK/nonexistent/frps.pid")
+# shellcheck disable=SC2016  # the fragment text is matched literally
+case "$guard_frag" in
+    *'[ "$pid" -gt 0 ]'*)
+        ok 'guard: the emitted reap fragment tests the pid before signalling' ;;
+    *)
+        bad "guard: the emitted reap fragment has no positive-integer test: $guard_frag" ;;
+esac
+# The boundary the fragment uses, driven over the shapes a pid file can hold:
+# `0` is the one that matters (kill 0 signals the caller's whole process group)
+# and it is deliberately not executed here; the multi-line case is the declared
+# bound recorded with the route.
+unexpected=""
+for bad_pid in '0' '-1' '' 'abc' '   ' $'1234\n5678'; do
+    if bash -c '[ "$1" -gt 0 ] 2>/dev/null' _ "$bad_pid"; then
+        unexpected="$unexpected [${bad_pid:-<empty>}]"
+    fi
+done
+if bash -c '[ "$1" -gt 0 ] 2>/dev/null' _ 4321; then
+    positive_ok=yes
+fi
+if [ -z "$unexpected" ] && [ "${positive_ok:-no}" = yes ]; then
+    ok 'guard: 0, -1, empty, non-numeric, whitespace and multi-line pids are refused; a positive pid is accepted'
+else
+    bad "guard: boundary expression accepts a non-pid (unexpectedly accepted:$unexpected, 4321 accepted=${positive_ok:-no})"
 fi

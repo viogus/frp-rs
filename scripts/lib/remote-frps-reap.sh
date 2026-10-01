@@ -46,6 +46,14 @@
 # command line, which is the same argument-pattern match again, only anchored to
 # a path; it is deliberately not here.
 #
+# Only a positive integer is a pid. `0` is not: `kill -0 0` succeeds and `kill 0`
+# signals the calling process's whole process group, and a negative value
+# signals a process group too. The guard is therefore `[ "$pid" -gt 0 ]`, not
+# `[ -n "$pid" ]` — which also rejects an empty file and a *multi-line* one,
+# whose `cat` yields embedded newlines. The multi-line case is a declared bound,
+# not a fix: the pid is refused (so no wrong process is signalled) while
+# `remote_reap_rundirs_snippet` still removes the directory, so the live target
+# is missed until the port band or a manual clean-up catches it.
 # Emitted text, not remote functions
 # ----------------------------------
 # What crosses the ssh hop is a shell string, so these functions *emit* the
@@ -84,7 +92,7 @@ remote_reap_pidfile_snippet() {
     printf '%s\n' \
         "if [ -f \"$pidfile\" ]; then" \
         "    pid=\$(cat \"$pidfile\" 2>/dev/null)" \
-        "    if [ -n \"\$pid\" ]; then" \
+        "    if [ \"\$pid\" -gt 0 ] 2>/dev/null; then" \
         "        kill -0 \"\$pid\" 2>/dev/null && kill \"\$pid\" 2>/dev/null || true" \
         "        sleep 0.3" \
         "        kill -0 \"\$pid\" 2>/dev/null && kill -9 \"\$pid\" 2>/dev/null || true" \
