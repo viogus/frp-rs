@@ -7862,14 +7862,14 @@ section; ledger now **24 open / 104 closed**.**
   (`:2758-2768`) or a sibling drives an override that differs from the constant and asserts the
   stored field.
 
-  **(b) Done (PR #432, code head `108d4d90`).** `frp-server/src/control/login.rs:2795`
+  **(b) Done (PR #432, code head `df78c203`).** `frp-server/src/control/login.rs:2795`
   `mock_handle_reports_the_override_it_was_built_with` loops three overrides — `125 ms`, `60 s` and a
   deliberately sub-100 ms non-round `Duration::from_micros(31_337)` (`:2799`) — each checked in an in-loop
   `assert_ne!` (`:2805`) against the 5 s `MOCK_REQUEST_HEAD_TIMEOUT` (`:2235`), and asserts the handle's
   accessor (`fn request_head_timeout` at `:2348`) returns the stored deadline (`:2811`). A lying accessor
-  that returns `MOCK_REQUEST_HEAD_TIMEOUT` reds it at `frp-server/src/control/login.rs:2815:13`
+  that returns `MOCK_REQUEST_HEAD_TIMEOUT` reds it at `frp-server/src/control/login.rs:2811:13`
   (`left: 5s / right: 31.337ms`), and one that special-cases a round threshold or hardcodes the two
-  originally pinned values reds at `:2818:13` — both survived the round-1 two-value pin (`1 passed`) while
+  originally pinned values reds the same assertion (`:2811:13`) — both survived the round-1 two-value pin (`1 passed`) while
   the two pre-existing mock pins stay green.
   (c) `frpc/tests/admin_config_get_warning.rs`'s `seed_resolves_spellings_only_the_loader_does`
   spawns four frpc children and calls `free_port()` per sub-case, so a released port can be re-taken
@@ -7877,7 +7877,7 @@ section; ledger now **24 open / 104 closed**.**
   48)` once, passing on retry. Done-when: the port is held for the fixture's lifetime, or the test
   retries deterministically instead of depending on the race.
 
-  **(c) Done (PR #432, code head `108d4d90`).** All five admin tests now spawn through `spawn_ready`
+  **(c) Done (PR #432, code head `df78c203`).** All five admin tests now spawn through `spawn_ready`
   (`frpc/tests/admin_config_get_warning.rs:389`) → `spawn_admin_ready` (`:425`), which for each of
   `MAX_ADMIN_PORT_ATTEMPTS` (`:116`, 3) attempts writes the config with **that attempt's** freshly leased
   port and re-runs `admin_port_attempt` (`:471`); a lost port is recognized from the child's own stdout
@@ -7888,17 +7888,21 @@ section; ledger now **24 open / 104 closed**.**
   failure mode, not the release→bind window itself. `admin_port_retry_recovers_from_a_held_port` (`:885`)
   forces a deliberately held first port, asserts the printed per-attempt reason, a distinct retry **port**
   (`:911`; the test asserts a port, not a PID) and both directions of `rival_bind_fails` (`:510`); with
-  `MAX_ADMIN_PORT_ATTEMPTS = 1` it reds at `:462:5` (`4 passed; 1 failed`), and the lane was 13/13 green
-  (8 runs under four CPU burners plus 5 gate runs). Lane: `cargo test -p frpc --features full,admin`
-  (the plain command compiles the file away — it is `#![cfg(all(feature = "full", feature = "admin"))]`).
+  `MAX_ADMIN_PORT_ATTEMPTS = 1` it reds at `:462:5` (`4 passed; 1 failed`), and the two admin files are 13/13
+  green (8 runs under four CPU burners plus 5 gate runs). Lane: `cargo test -p frpc --features full,admin
+  --test admin_config_get_warning --test warn_delivery` — the unfiltered `cargo test -p frpc --features
+  full,admin` is red for a reason this batch did not introduce (`frpc/tests/cli_inputs.rs:1485:9`, `33 passed;
+  1 failed`, filed below), so the filtered form is the reproducible lane; with neither feature the plain command
+  compiles `admin_config_get_warning.rs` away — it is `#![cfg(all(feature = "full", feature = "admin"))]`.
   (d) The `-z "$TREE"` guard's own `exit 1` (`scripts/tests/repo-health-fixtures.sh:282`) is dormant
   while the `setup_die` path works and no scenario forces an empty root, so reverting it alone stays
   green; the case-variant symlink misclassification in `scripts/repo-health.sh` is pre-existing and
   unreachable on a case-sensitive filesystem. Done-when: either a scenario exercises an empty root
   (killing that guard) or the dormant branch is removed, and the case-insensitive-volume limitation
   is recorded where the containment check is documented.
-  Ledger after this batch: **26 open / 150 closed** (base `9b2acefb`: 26 open / 149 closed; the
-  fixed-settle flip moves one item open→closed and this batch files one new residue).
+  Ledger after this batch: **26 open / 154 closed** (base `bebe888e`: 24 open / 153 closed; the
+  fixed-settle flip moves one item open→closed and this batch files three new residues — the round-2
+  TLS-enable capture item and the two the round-2 delta review measured below).
 
 - [ ] **Four residues #428's round-2 adversarial review measured in the new warning pins.** Same
   test-precision class as the item above; none blocks the fix.
@@ -8084,11 +8088,11 @@ section; ledger now **24 open / 104 closed**.**
   `#![cfg(feature = "full")]`) at load 39–41 — and replace the settle with a condition wait on the
   record itself, or record the non-reproduction with the recipe and the load figures (8 tests in the
   file).
-  **Done (PR #432, code head `108d4d90`).** The fixed sleep is gone: `QUIET_PERIOD` (500 ms,
+  **Done (PR #432, code head `df78c203`).** The fixed sleep is gone: `QUIET_PERIOD` (500 ms,
   `frpc/tests/warn_delivery.rs:110`) plus a bounded `wait_for_record` (`:270`, `RECORD_TIMEOUT = 10 s` at
   `:101`) returns only once `count >= want` **and** the capture has been quiet for `QUIET_PERIOD` (`:281`),
   so the count is final before `snapshot()` (`:354`) freezes it (no fallback to the live buffers). Teeth:
-  a second `--config-dir` emit 150 ms behind the first (`frpc/src/main.rs:530`) leaves the pre-fix file
+  a second `--config-dir` emit 150 ms behind the first (`frpc/src/main.rs:545`) leaves the pre-fix file
   `ok. 8 passed` and reds the fixed one `FAILED. 6 passed; 2 failed` at `frpc/tests/warn_delivery.rs:448:5`
   (`left: 2`, the two records 152 ms apart; the 0 ms variant also reds), while the honest lane is
   `ok. 8 passed` in 2.59 s — the condition wait costs ~500 ms per `Warning` row. Load: 10/10 sequential
@@ -8096,6 +8100,29 @@ section; ledger now **24 open / 104 closed**.**
   recipe was not reachable during the window. Residue: `frpc/tests/admin_config_get_warning.rs:98` keeps
   its own `SETTLE = 500 ms` (used once at `:504`) because its legacy `records() == 0` assertions need a
   negative guarantee a positive condition-wait cannot express.
+
+- [ ] **The `frpc/tests/warn_delivery.rs` condition wait is a quiet window, not a finality guarantee: a duplicate emitted more than one `QUIET_PERIOD` behind the first is a false pass.**
+  Filed by the coordinator from PR #432's round-2 delta adversarial, which re-ran the closed item's own teeth with
+  the delay moved: a second `--config-dir` emit 150 ms behind the first (`frpc/src/main.rs:545`) reds the pin
+  (`frpc/tests/warn_delivery.rs:448:5`, `left: 2`), but the same mutant at **700 ms** — past `QUIET_PERIOD`
+  (500 ms, `:110`) — leaves `ok. 8 passed`. `wait_for_record` (`:270`) returns once `count >= want` **and** the
+  capture has been quiet for `QUIET_PERIOD` (`:281`), so an emit that lands after the last quiet window closes and
+  before `snapshot()` (`:354`) freezes the capture is invisible: the pin's detection power is bounded by how long
+  the mutant delays, not by the child's own exit.
+  **Done-when:** the count is final without picking a window (e.g. assert the captured records against the child's
+  exit status and its own emitted-record count), or the bound is stated next to `wait_for_record` and a witness
+  shows a duplicate inside the window is caught while one outside it is recorded as undetectable.
+
+- [ ] **`frpc/tests/cli_inputs.rs`'s `a_config_file_named_after_a_subcommand_stays_a_config_file` fails whenever the `admin` feature is on, so `cargo test -p frpc --features full,admin` is red for a reason no CI lane runs.**
+  Filed by the coordinator from PR #432's round-2 delta adversarial while correcting that batch's lane quote.
+  Measured at the branch head: `cargo test -p frpc --features full,admin --test cli_inputs` → `33 passed; 1 failed`,
+  panicking at `frpc/tests/cli_inputs.rs:1485:9` because the config's `[webServer]` port appears in the child's
+  output — with `admin` on, frpc's run path logs `frpc admin server starting on 127.0.0.1:<port>`, which the
+  assertion `!text.contains(&port.to_string())` reads as "reached the config's admin port". The failure is not
+  reachable from #432's diff (`frpc` does not depend on `frp-server`, and `frpc/tests/cli_inputs.rs` is byte-identical
+  to `9b2acefb`), but no lane runs `-p frpc` with both features, so it stays invisible.
+  **Done-when:** the assertion distinguishes the admin startup line from a dial (or the test is gated to the feature
+  combinations a lane actually runs), and a lane runs `cargo test -p frpc --features full,admin`.
 
 - [ ] **`scripts/tests/repo-health-fixtures.sh` cannot detect its own neutering — the hole the compat guard's `MIN_CHECKS` just closed.**
   Filed by the coordinator from the `test-harness-strays` round-2 adversarial round (read at

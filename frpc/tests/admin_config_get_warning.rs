@@ -517,7 +517,7 @@ fn rival_bind_fails(port: u16) -> bool {
 /// feature = "admin"))]`), so the build under test can serve HTTPS (`full`
 /// forwards `frp-client/default`, which includes `tls`) and answers "a web server
 /// with a TLS acceptor exists", and a record that says otherwise means a call
-/// site answered wrongly. The call sites this file reaches are `frpc/src/main.rs:606`
+/// site answered wrongly. The call sites this file reaches are `frpc/src/main.rs:621`
 /// (the `-c` startup load) and `frp-client/src/admin.rs:771` (the admin config-GET
 /// handler runs `config_from_file`); it never drives the reload, so
 /// `frp-client/src/service.rs:4458` is not visible here — that site is pinned by
