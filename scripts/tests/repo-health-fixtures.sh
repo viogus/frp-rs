@@ -122,9 +122,14 @@ hdr() { printf '%s\n' "---------------------------------------------------------
 # hasher's own `name=digest` ledger (`region_hash_verdict`), so a caller cannot
 # claim a count it did not earn; a content-mutation probe hashes a
 # one-byte-different copy of both pinned regions and requires the honest
-# comparison to reject it; and the `health` CI step pins this file's own sha256
-# *before* running it, so weakening the enforcer here also requires editing
-# `.github/workflows/ci.yml`. The honest claim is that it catches careless
+# comparison to reject it. Round 13 records each completed probe in a ledger
+# `enforce_substance` asserts, so gutting the probe reds in-suite, and computes
+# the copy's digest independently of `region_sha`, so a path-keyed fake cannot
+# satisfy the probe. The `health` CI step pins this file's own sha256 *before*
+# running it, so weakening the enforcer here also requires editing
+# `.github/workflows/ci.yml`. This suite sources nothing from
+# `scripts/lib/compat-stray-guard.sh`, so — unlike the stray-guard step — no
+# library pin is needed here. The honest claim is that it catches careless
 # single-region edits and makes an edit to the guard itself a two-file change a
 # reviewer sees — not that it prevents pin removal: an edit here plus a refreshed
 # `SCEN*_REGION_SHA` (L2), or a forged summary and evidence block (L1), is still
@@ -172,6 +177,14 @@ HASH_TOOL=$(find_hash_tool) || HASH_TOOL=''
 REGION_HASHED=0
 REGION_HASHED_RECORD=''
 REGION_SHA_VALUE=''
+# The content-mutation probe's own ledger (round 13, R12-3). `mutation_probe`
+# records each probe it *completed* — i.e. after it saw the honest comparison
+# reject the mutated copy and accept it against that copy's real digest — and
+# `enforce_substance` asserts the ledger, so replacing the probe's body with
+# `return 0` reds in-suite instead of silently dropping the probe (the file pin
+# in ci.yml is the outer defence, not the only one).
+MUTATION_PROBES=0
+MUTATION_PROBE_RECORD=''
 
 region_sha() {   # $1 = region name, spelled as between the `substance pin:` markers
   # $2 = the file to read the region from. The *caller* chooses the path, so the
@@ -287,15 +300,24 @@ region_hash_verdict() {
 # directory to build the mutated copy in. Round 12 (M3): the shape-identical pin
 # canary only ever feeds a `want` outside the pinned set, so it cannot see a
 # comparison that returns a verdict without reading the bytes. This probe
-# requires (a) `region_sha` of the same region to differ between the real file
-# and a copy that differs by one byte, (b) the honest comparison to reject that
-# copy, and (c) it to accept the same copy against the digest the copy really
-# has. A name-keyed `region_sha`, a path whitelist or a `got=$want` comparison
-# cannot satisfy all three for two different regions.
+# requires (a) the region's digest to differ between the real file and a copy
+# that differs by one byte, (b) the honest comparison to reject that copy, and
+# (c) it to accept the same copy against the digest the copy really has.
+# Round 13 (R12-4): that third digest is computed here, independently of
+# `region_sha`, and `region_sha` is required to agree with it — otherwise a
+# `region_sha` keyed on the path it is handed (the real file → the pinned
+# constant, anything else → empty) satisfies (a) and (b) and is only caught by
+# (c), which is exactly the hole this closes. A `got=$want` comparison fails (b),
+# and rejecting everything fails (c). Round 13 (R12-3): a completed probe is
+# recorded in the ledger above, which `enforce_substance` asserts.
 mutation_probe() {
-  local name=$1 const=$2 want=$3 dir=$4 copy honest mutated
+  local name=$1 const=$2 want=$3 dir=$4 copy honest reported mutated
   if [ -z "${SELF_REAL:-}" ]; then
     printf 'FAIL  enforcer canary: cannot run the content-mutation probe without the enforcer path\n' >&2
+    return 1
+  fi
+  if [ -z "${HASH_TOOL:-}" ]; then
+    printf 'FAIL  enforcer canary: cannot run the content-mutation probe without a sha256 tool\n' >&2
     return 1
   fi
   copy=$dir/mutated-$name.sh
@@ -306,10 +328,24 @@ mutation_probe() {
   region_sha "$name" "$SELF_REAL" || return 1
   honest=$REGION_SHA_VALUE
   region_sha "$name" "$copy" || return 1
-  mutated=$REGION_SHA_VALUE
+  reported=$REGION_SHA_VALUE
+  # The copy's real digest, taken the same way but *not* through `region_sha`, so
+  # a self-consistent fake has nothing to agree with.
+  # shellcheck disable=SC2086  # $HASH_TOOL is the word-split "<abs path> [-a 256]"
+  mutated=$(sed -n "/^# --- substance pin: ${name} /,/^# --- end substance pin: ${name} ---/p" "$copy" |
+    $HASH_TOOL | awk '{print $1}')
+  if [ -z "$mutated" ]; then
+    printf 'FAIL  enforcer canary: cannot compute the %s copy digest for the content probe\n' "$name" >&2
+    return 1
+  fi
   if [ "$honest" = "$mutated" ]; then
-    printf 'FAIL  enforcer canary: region_sha returned %s for both the %s region and a one-byte-different copy; the comparison is not reading the bytes it is given\n' \
-      "${honest:-<none>}" "$name" >&2
+    printf 'FAIL  enforcer canary: the %s region and its one-byte-different copy both hash to %s; the copy is not different\n' \
+      "$name" "${honest:-<none>}" >&2
+    return 1
+  fi
+  if [ "$reported" != "$mutated" ]; then
+    printf 'FAIL  enforcer canary: region_sha reported %s for the %s copy, but that copy really hashes to %s; the hasher is not reading the bytes of the path it is given\n' \
+      "${reported:-<none>}" "$name" "$mutated" >&2
     return 1
   fi
   if region_pin_check "$name" "$const" "$want" "$copy" 2>/dev/null; then
@@ -320,6 +356,8 @@ mutation_probe() {
     printf 'FAIL  enforcer canary: the comparison rejected the mutated %s copy even against the digest that copy really has; the comparison is not bound to the path it is given\n' "$name" >&2
     return 1
   fi
+  MUTATION_PROBES=$((MUTATION_PROBES + 1))
+  MUTATION_PROBE_RECORD="${MUTATION_PROBE_RECORD:+$MUTATION_PROBE_RECORD }${name}"
   return 0
 }
 
@@ -446,7 +484,7 @@ enforce_substance() {
     printf 'FAIL  enforcer canary: the missing-path probe did not hash the path it was given\n' >&2
     return 1
   fi
-  # --- content-mutation probe (round 12, M3) ----------------------------------
+  # --- content-mutation probe (round 12, M3; ledger round 13, R12-3) ----------
   # `$tmp` is already removed by `cleanup_all` before the enforcers run, so the
   # probe builds its own directory under the system temp dir.
   mutation_dir=$(mktemp -d "${TMPDIR:-/tmp}/enforcer-mutation.XXXXXX") || mutation_dir=''
@@ -454,12 +492,23 @@ enforce_substance() {
     printf 'FAIL  enforcer canary: cannot create the content-mutation probe directory\n' >&2
     return 1
   fi
+  MUTATION_PROBES=0
+  MUTATION_PROBE_RECORD=''
   if ! mutation_probe scenario-6 SCEN6_REGION_SHA "${SCEN6_REGION_SHA:-}" "$mutation_dir" ||
     ! mutation_probe scenario-7 SCEN7_REGION_SHA "${SCEN7_REGION_SHA:-}" "$mutation_dir"; then
     rm -rf "$mutation_dir"
     return 1
   fi
   rm -rf "$mutation_dir"
+  # The probe's own ledger: both regions must have completed a probe. A `return 0`
+  # body, a probe that skips its assertions or a call that was dropped leaves the
+  # ledger short and reds here — the file pin in ci.yml is the outer defence, not
+  # the only one (round 13, R12-3).
+  if [ "$MUTATION_PROBES" -ne 2 ] || [ "$MUTATION_PROBE_RECORD" != 'scenario-6 scenario-7' ]; then
+    printf 'FAIL  enforcer canary: the content-mutation probe recorded [%s] (%s completed), expected [scenario-6 scenario-7] (2 completed); the probe did not run against both regions\n' \
+      "${MUTATION_PROBE_RECORD:-<none>}" "$MUTATION_PROBES" >&2
+    return 1
+  fi
   # Same functions the real checks below call, driven with a deliberately wrong
   # expectation in each direction; their diagnostics are the point of the
   # exercise, so they are discarded here.
