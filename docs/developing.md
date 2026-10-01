@@ -140,18 +140,19 @@ type reuses those fields, no config changes are needed.
 
 ### Step 2: Register in ProxyManager
 
-`handle_new_proxy` (`frp-server/src/control/proxy_ops.rs:1849`) is the NewProxy
-entry point and delegates to `register_proxy_entry` (`proxy_ops.rs:794`), which
-inserts into `ProxyManager` (`frp-server/src/proxy.rs:116`); most proxy types
-reuse that existing registration logic. If your proxy type needs special
-registration:
+`handle_new_proxy` (`frp-server/src/control/proxy_ops/mod.rs:1279`) is the NewProxy
+entry point and delegates to `register_proxy_entry`
+(`frp-server/src/control/proxy_ops/mod.rs:784`), which inserts into `ProxyManager`
+(`frp-server/src/proxy.rs:116`); most proxy types reuse that existing registration
+logic. If your proxy type needs special registration:
 
 - **Port allocation**: `register_proxy_entry` allocates via
   `allocate_port_multi()` (`frp-server/src/proxy.rs:821`). SUDP proxies get
   special shared-port handling.
 - **sk_index**: STCP/XTCP/SUDP proxies register in `sk_index`
-  (`register_sk_index`, `proxy_ops.rs:493`) for secret-key routing. Add your
-  proxy type to that predicate if it uses sk-based routing.
+  (`register_sk_index`, `frp-server/src/control/proxy_ops/mod.rs:483`) for
+  secret-key routing. Add your proxy type to that predicate if it uses sk-based
+  routing.
 - **VHost routing**: HTTP/HTTPS proxies register in `VhostManager`
   (`frp-server/src/vhost.rs:265`). Add your proxy type here if it uses
   domain-based routing.
@@ -161,12 +162,12 @@ registration:
 ### Step 3: Add Listener Setup
 
 Listener setup/invocation is `setup_proxy_listeners`
-(`frp-server/src/control/proxy_ops.rs:1456`). Its branches: `udp`/`sudp` bind an
+(`frp-server/src/control/proxy_ops/mod.rs:886`). Its branches: `udp`/`sudp` bind an
 `Arc<UdpSocket>` directly and request work connections with
 `InternalMsg::UdpNeedsWorkConn`; `stcp`/`xtcp`/`tcpmux` start **no** per-proxy
 listener (NAT hole punch and shared listeners respectively); `tcp` binds a
 per-proxy listener and spawns `listen_and_proxy`
-(`frp-server/src/control/proxy_ops.rs:2781`) as its accept loop. HTTP/HTTPS use
+(`frp-server/src/control/proxy_ops/mod.rs:2211`) as its accept loop. HTTP/HTTPS use
 the shared VHost listeners.
 
 For a new proxy type that needs a different listener pattern:

@@ -6657,10 +6657,10 @@ nothing about whether the described behaviour still holds.
   carried the authoritative version. The other **8 carry 13 `file:line` anchors
   naming the symbol**, each verified by opening that exact line in this worktree
   (`ProxyConfig` at `frp-core/src/config/client.rs:585`; `handle_new_proxy`
-  `proxy_ops.rs:1849`; `register_proxy_entry` `proxy_ops.rs:794`;
-  `allocate_port_multi` `proxy.rs:821`; `register_sk_index` `proxy_ops.rs:493`;
-  `setup_proxy_listeners` `proxy_ops.rs:1456`; `listen_and_proxy`
-  `proxy_ops.rs:2781`; `ProxyManager` `proxy.rs:116`; `VhostManager`
+  `proxy_ops/mod.rs:1279`; `register_proxy_entry` `proxy_ops/mod.rs:784`;
+  `allocate_port_multi` `proxy.rs:821`; `register_sk_index` `proxy_ops/mod.rs:483`;
+  `setup_proxy_listeners` `proxy_ops/mod.rs:886`; `listen_and_proxy`
+  `proxy_ops/mod.rs:2211`; `ProxyManager` `proxy.rs:116`; `VhostManager`
   `vhost.rs:265`; `TcpMuxManager` `tcpmux.rs:34`; `InternalMsg::ProxyUserConn`
   `state.rs:344`; `assign_work_to_proxy` `bridge.rs:3117`;
   `run_work_bridge` `bridge.rs:2430`). **Two live errors were found and fixed en
@@ -6741,7 +6741,7 @@ nothing about whether the described behaviour still holds.
   over. Measured properly (`scripts/large-functions.sh`, production code only):
   30–55% of the "large" files are inline tests and 36–77% of the "giant" functions
   are comments. By production lines the worst file is `frp-client/src/service.rs`
-  (4930), not `control/proxy_ops.rs` (3612, of which 4432 of its 8044 raw lines are
+  (4930), not `control/proxy_ops/` (3611, of which 4443 of its 8054 raw lines are
   tests). And **file size hides the real problem**: the largest production function
   in the repository is `run` in `frp-server/src/service.rs` — **1291 code lines**,
   in a file that ranks only 11th by size. Churn agrees: `frp-client/src/service.rs`
@@ -6836,6 +6836,19 @@ nothing about whether the described behaviour still holds.
   2726) and `key_tests.rs` / `virtual_ctrl_tests.rs` / `preauth_tests.rs` each read **0** production —
   with the script's existing `tests.rs` / `tests/` behaviour preserved, or the change to it justified
   in the item.
+
+  **Progress (2026-10-01, code head `643dce03` on `refactor/fileify-proxy-ops`, PR #453).** P4
+  (`frp-server/src/control/proxy_ops`) landed Step 0 plus seams 1–2 as three pure-move commits:
+  `ae91be58` file-ified the inline tests (`proxy_ops.rs` 8054 → `proxy_ops/mod.rs` 3618 +
+  `unregister_generation_tests.rs` 3790 / `subdomain_conflict_tests.rs` 155 /
+  `tcp_auto_bind_retry_tests.rs` 430), `95af8a32` extracted `validate_new_proxy` + `duplicate_domain`
+  into `proxy_ops/validate.rs` (108), `643dce03` extracted `register_http_vhost` +
+  `register_https_vhost` into `proxy_ops/vhost.rs` (498); `mod.rs` is now 3049 (3039 production) and
+  no file outside `proxy_ops/` was edited in any commit. Evidence: `rustfmt(dedent(body))`
+  `cmp`-identical bodies, identical `-- --list` name sets (68 `proxy_ops` / 460 lib), and a
+  literal-VALUE multiset unchanged apart from one added `#[path]` value that keeps
+  `subdomain_conflict_tests`' module path — and its 12 test names — intact. The plan's
+  `8044 / 4432 / 3612` proved stale: re-measured 8054 / 4443 / 3611, and seams 3–8 re-anchored.
 
 - [x] **Three vendored crates are a standing maintenance liability.**
   Evidence: `vendor/rustls` (TLS, patched), `vendor/yamux` (5 patches),
