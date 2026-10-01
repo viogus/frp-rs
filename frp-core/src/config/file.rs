@@ -596,6 +596,28 @@ fn drop_ini_scalar_include_keys(table: &mut toml::Table) {
 //   `GO rc 1`". MID `6d801655` and BASE `f679e822` are rc 0 on every GO-rc-1
 //   row above except `z*.ini`/`sub*.ini` (rc 1 at MID, rc 0 at BASE), so the
 //   bound is pre-existing, and even a bare `*` started matching only at MID.
+//   Two further cells belong to this row and were measured during the round-7
+//   review; they are the same "the whole absolute path is matched" bound, seen
+//   from the two ends:
+//     * A `Match` metacharacter in the **resolved directory path**. With the
+//       detector in the directory `a[bc]/z.ini` and `[common] includes =
+//       "a[bc]/z*.ini"` — or even the star-less `"a[bc]/z.ini"` and
+//       `"a[bc]/*.ini"` — Go matches `filepath.Join(absDir, base)` with
+//       `filepath.Match`, whose `[bc]` is a **class** that cannot match the
+//       literal `[`/`]` characters of the real directory name, so nothing
+//       matches: GO rc 0. HEAD never interprets metacharacters in the
+//       directory part — the pattern is split at its last separator and only
+//       cleaned, never `Match`-interpreted — and the entry name is
+//       compared against `go_base(pattern)` (`z.ini`, or the `*.ini`
+//       prefix/suffix) — so it merges the detector and fails: rc 1.
+//     * A file literally named `[z].ini` with `includes = "[z].ini"`. `Match`
+//       reads `[z]` as a class and never matches the literal brackets: GO
+//       rc 0. HEAD's star-less branch compares the entry name for equality and
+//       merges it: rc 1. (In the row's main fixture `[z].ini` is GO rc 1 only
+//       because a real `z.ini` is present and the class matches *that*.)
+//   Both cells are GO 0 / HEAD 1 at r6, r7 and r8, MID `6d801655` 1 and BASE
+//   `f679e822` 0, in all three `-c` forms and both loader modes — MID already
+//   had them, so like the rest of the row the bound predates this work.
 //   Implementing `Match` is out of scope for the legacy-`.ini` residue work;
 //   this row exists so a later fix changes measured behaviour knowingly.
 //
@@ -626,6 +648,16 @@ fn drop_ini_scalar_include_keys(table: &mut toml::Table) {
 // "dangling.ini"`, and the globs `l*` / `dang*.ini`) are rc-parity as of round
 // 7 — [`glob_in_dir`] skips directories by the entry's own type, so Go and
 // frp-rs both try to read them and both fail (rc 1).
+//
+// The same round-7 fix also made a **FIFO** (named pipe) include match, because
+// the entry's own type is not a directory; reading it then blocks forever,
+// exactly as Go's `os.ReadFile` does. Measured with `mkfifo fifo.ini` and
+// `[common] includes = "fifo.ini"` (and `"f*.ini"`): GO v0.71.0, r7 and r8 all
+// still have no exit after 4 s, whereas r6 and BASE returned rc 0 (they skipped
+// it as a non-regular file) and MID returned rc 1. Blocking is Go's behaviour,
+// so this is not a divergence — but it is an unlisted behaviour change of the
+// round-7 fix, and it means the loader has no termination bound on a tree that
+// contains such a name; a caller that needs one must impose its own timeout.
 
 /// Go's `filepath.Dir` (`internal/filepathlite/path.go`, `Dir`): scan back to
 /// the last path separator and `Clean` everything up to **and including** it; a
@@ -781,7 +813,8 @@ pub(super) fn go_clean(path: &str) -> String {
 /// symlink `sub -> realdir`, with `[common] includes = "<pat>"`, both loader
 /// modes and all three `-c` forms: `lnk`, `l*`, `dangling.ini`, `dang*.ini`,
 /// `sub` and `s*` are GO rc 1 against HEAD rc 0 *before* the fix and GO rc 1 /
-/// HEAD rc 1 after it (24/24 cells agree), while the real directory `realdir`
+/// HEAD rc 1 after it (36/36 cells agree: 6 patterns × 3 `-c` forms × 2 loader
+/// modes), while the real directory `realdir`
 /// and the glob `reald*` stay rc 0 in both. Pins:
 /// `legacy_ini_common_include_symlink_to_dir_refuses_like_go`,
 /// `legacy_ini_common_include_dangling_symlink_refuses_like_go`,
@@ -791,9 +824,24 @@ pub(super) fn go_clean(path: &str) -> String {
 /// degenerates to string equality with the entry name, so the no-wildcard
 /// branch compares the entry's own name rather than stat-ing
 /// `dir.join(pattern)`. `"."`/`".."` are never returned by `ReadDir`, so they
-/// match nothing, as in Go.
+/// match nothing, as in Go. That comparison is `name.to_string_lossy() ==
+/// name_pattern`, which is a raw-byte comparison in Go; the lossy conversion can
+/// only differ for a *non-UTF-8* file name, which APFS refuses to create at all
+/// (EILSEQ), so it is latent on this platform and can only surface on a
+/// filesystem that allows such names (e.g. Linux under a non-UTF-8 locale).
+///
+/// The `dir` guard above is **unreachable defence in depth** in the current
+/// tree: the only caller ([`process_includes`], `file.rs:410-416`) refuses a
+/// missing or non-directory `search_dir` with Go's `include: directory of …
+/// not exist` error first, so the `Ok(Vec::new())` arm never runs. Measured by
+/// deleting the guard and running `cargo test -p frp-core --lib`: the suite
+/// stays green, including `legacy_ini_common_include_missing_dir_refuses_like_go`,
+/// which still reports the caller's message. It stays because a future second
+/// caller would otherwise silently swallow a missing directory as "no matches".
 ///
 /// Returns sorted list of matching file paths.
+/// (`results.sort()` mirrors `os.ReadDir`, whose entries come back ordered by
+/// file name — pin `test_include_glob_entries_are_processed_in_sorted_order`.)
 fn glob_in_dir(
     dir: &Path,
     name_pattern: &str,

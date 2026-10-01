@@ -3752,7 +3752,7 @@ fn test_collect_config_files_admits_a_non_regular_entry_by_extension() {
     // like a file. The tree's only non-regular filter is on the `[include]`
     // `glob_in_dir` path, and it skips *directories* by the directory entry's
     // own type — `if entry.file_type()?.is_dir()`
-    // (`frp-core/src/config/file.rs:821`) — never by `is_file()`, so it admits
+    // (`frp-core/src/config/file.rs:869`) — never by `is_file()`, so it admits
     // a FIFO just as this collector does. `collect_config_files_inner` has no
     // filter at all.
     //
@@ -11630,6 +11630,44 @@ fn test_includes_glob_pattern_merged() {
 }
 
 #[test]
+fn test_include_glob_entries_are_processed_in_sorted_order() {
+    // glob_in_dir ends with `results.sort()` to mirror `os.ReadDir`, whose
+    // contract is "sorted by filename" (`pkg/config/legacy/parse.go:78`,
+    // repeated at `pkg/config/load.go:513`). `deep_merge_toml` CONCATENATES
+    // arrays (base + overlay), so the merged `[[proxies]]` order *is* the
+    // include processing order. Six files, each contributing one proxy, make a
+    // filesystem readdir order fail loudly: this APFS returns the six
+    // `incN.toml` names in an order like inc2,inc3,inc4,inc5,inc6,inc1, which
+    // is not sorted, so deleting `results.sort()` reorders the merged array and
+    // reddens this test.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("frpc.toml"),
+        "server_addr = \"127.0.0.1\"\nincludes = [\"inc*.toml\"]\n",
+    )
+    .unwrap();
+    for i in 1..=6 {
+        std::fs::write(
+            dir.path().join(format!("inc{i}.toml")),
+            format!(
+                "[[proxies]]\nname = \"p{i}\"\ntype = \"tcp\"\nlocal_port = {}\nremote_port = {}\n",
+                1000 + i,
+                2000 + i
+            ),
+        )
+        .unwrap();
+    }
+    let cfg = load_client_config(dir.path().join("frpc.toml").to_str().unwrap(), false).unwrap();
+    let names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["p1", "p2", "p3", "p4", "p5", "p6"],
+        "include glob results must be processed in os.ReadDir (name-sorted) order"
+    );
+    assert_eq!(cfg.proxies[5].remote_port, 2006);
+}
+
+#[test]
 fn test_include_array_concatenation_deep_merge() {
     // file.rs deep_merge_toml: arrays CONCATENATE (base + overlay) — the
     // include file's [[proxies]] entries append to the main config's.
@@ -12413,7 +12451,7 @@ fn legacy_ini_common_include_missing_dir_refuses_like_go() {
 /// (`[p1] role = "visitor"`) beside the config, Go v0.71.0 is rc 1 in both
 /// loader modes (`failed to parse visitor p1, err: type shouldn't be empty`).
 /// frp-rs's [`process_includes`] uses the same single-`*`-per-component glob
-/// (`glob_in_dir`, `frp-core/src/config/file.rs:797`), so the matched file must
+/// (`glob_in_dir`, `frp-core/src/config/file.rs:845`), so the matched file must
 /// be merged and refused the same way.
 #[test]
 fn legacy_ini_common_include_glob_is_expanded_like_go() {
@@ -12433,6 +12471,43 @@ fn legacy_ini_common_include_glob_is_expanded_like_go() {
         assert!(
             err.contains("failed to parse visitor p1") && err.contains("type shouldn't be empty"),
             "strict={strict}: the glob must expand and the included visitor be refused: {err}"
+        );
+    }
+}
+
+/// **Round-8 F2(a): the `*`-suffix half of the legacy glob is load-bearing.**
+///
+/// Go builds the match pattern as `filepath.Join(absDir, filepath.Base(path))`
+/// and tests it with `filepath.Match` (`pkg/config/legacy/parse.go:87`), so
+/// everything after the `*` is a literal suffix that must still match. A test
+/// that only kept `name.starts_with(prefix)` (`frp-core/src/config/file.rs:894`)
+/// survived the whole suite because the extension pre-filter
+/// (`frp-core/src/config/file.rs:884-892`) already rejects the obvious cases
+/// (e.g. `z*.ini` against `zebra.txt`, where the extensions differ). This pin
+/// uses `z*ini`: the star is followed by no `.`, so `Path::extension()` is
+/// `None` and the pre-filter is skipped — only the suffix test can reject
+/// `zebra.txt`, whose detector body would otherwise merge and fail the load.
+/// Measured: GO v0.71.0 rc 0 and HEAD r8 rc 0 for `z*ini` (and for `z*.ini`),
+/// where `z*` and `*a.txt` are rc 1 in both (the `*.txt` pattern carries the
+/// extension `txt`, so the pre-filter passes there).
+#[test]
+fn legacy_ini_common_include_glob_suffix_is_matched_like_go() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("zebra.txt"), "[p1]\nrole = \"visitor\"\n").unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nincludes = \"z*ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict).unwrap_or_else(|e| {
+            panic!("strict={strict}: `z*ini` matches nothing, so the load must succeed: {e}")
+        });
+        assert!(
+            cfg.proxies.is_empty(),
+            "strict={strict}: `z*ini` must not match `zebra.txt` — Go's Match requires \
+             the `ini` suffix after the star"
         );
     }
 }
