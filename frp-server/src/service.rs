@@ -2623,17 +2623,36 @@ mod tests {
 
         let got = web_server_tls_enable_reader();
         #[cfg(all(feature = "dashboard", feature = "tls"))]
-        assert_eq!(got, WebServerTlsEnableReader::WebServerTls);
+        let want = WebServerTlsEnableReader::WebServerTls;
         #[cfg(all(feature = "dashboard", not(feature = "tls")))]
-        assert_eq!(got, WebServerTlsEnableReader::WebServerNoTls);
+        let want = WebServerTlsEnableReader::WebServerNoTls;
         #[cfg(not(feature = "dashboard"))]
-        assert_eq!(got, WebServerTlsEnableReader::NoWebServer);
+        let want = WebServerTlsEnableReader::NoWebServer;
 
-        // Printed only after every assertion above. The CI step runs this test
-        // with `-- --nocapture` and greps this marker, so a body that returns
-        // before its assertions (still `1 passed` under libtest) cannot pass
-        // the step while asserting nothing. The marker names the answer, so it
-        // also witnesses *which* variant this shape resolved to.
-        println!("web-server-tls-enable-reader-pin: ok, {got:?}");
+        // Debug-only sabotage hook for the resolver CI step: that step runs this
+        // test a second time with `FRP_WARNING_PIN_SABOTAGE` set and requires the
+        // run to **fail**, mirroring `FRPS_DIR_REGISTRY_TEST_DISCARD` in the frps
+        // bin unit step. Expecting the wrong variant is exactly the mutant this
+        // pin asserts against, so a body whose `assert_eq!` was deleted, made
+        // unreachable, or replaced by a marker-printing stub passes the sabotaged
+        // run — nothing at log level can tell such a stub from a real body, but a
+        // vacuous pin cannot be made to fail. Never set outside that step.
+        #[cfg(debug_assertions)]
+        let want = if std::env::var_os("FRP_WARNING_PIN_SABOTAGE").is_some() {
+            WebServerTlsEnableReader::from_features(true, true)
+        } else {
+            want
+        };
+
+        assert_eq!(got, want);
+
+        // Printed only after the assertion above. The CI step runs this test with
+        // `-- --nocapture` and greps this line, so a body that returns before its
+        // assertions (still `1 passed` under libtest) cannot pass the step while
+        // asserting nothing. The marker deliberately names no variant: the
+        // assertion pins the variant, and spelling it here coupled the step to
+        // `WebServerTlsEnableReader`'s `Debug` text, so a legitimate variant
+        // rename reddened the step for a reason its message could not diagnose.
+        println!("web-server-tls-enable-reader-pin: assertions ran");
     }
 }
