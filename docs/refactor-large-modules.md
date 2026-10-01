@@ -287,6 +287,15 @@ Block inventory, from the function's own comment landmarks:
 | ~1769–1908 | Main accept loop | **stays in `run`** |
 | ~1909–1949 | Graceful drain + OIDC stop | **stays in `run`** |
 
+**Landed so far** (one block per PR, pure move, per the bar below):
+
+- WebSocket listener → `frp-server/src/service/listeners.rs`,
+  `pub(super) async fn start_websocket_listener(&self, rate_limiter_enabled: bool)` — PR #436 at
+  code head `0f1b94c2` (based on `13a29d26`): 289 payload lines byte-identical, and because no test
+  had ever reached the dedicated port the move was shipped with
+  `frp-server/tests/transport_e2e_websocket_port.rs` and the `websocket`-without-`kcp` CI lane. See
+  the `TODO.md` progress paragraph.
+
 Recommended method: extract **one listener block at a time**, as an
 `async fn start_kcp_listener(&self) -> Result<()>`-shaped method, starting with
 KCP (largest) or WebSocket. No ordering change, no control-flow change, no error
