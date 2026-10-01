@@ -8418,9 +8418,9 @@ section; ledger now **24 open / 104 closed**.**
   `[auth]`-changing reload is refused (`reload::auth_reload_refusal`, `frp-client/src/service.rs:4511-4514`).
   The round-1 verification's F1 (the fix's rewrite had deleted the only e2e oracle for the failed-Ping
   skip + `interval.reset_after(delay)` arm) was closed in round 2 by restoring
-  `skipped_ping_rearms_interval_on_two_second_backoff` (`frp-client/tests/heartbeat_wire_order.rs:669`,
+  `skipped_ping_rearms_interval_on_two_second_backoff` (`frp-client/tests/heartbeat_wire_order.rs:676`,
   `#[cfg(feature = "oidc")]`, event-driven): deleting `interval.reset_after(delay)`
-  (`frp-client/src/service.rs:3541`) reddens it at `heartbeat_wire_order.rs:774:9`, and the measured
+  (`frp-client/src/service.rs:3541`) reddens it at `heartbeat_wire_order.rs:781:9`, and the measured
   re-arm is 2009.6 ms against `Ping#2−T2 ∈ [1.0 s, 6.0 s]` with the Ping#3 cadence back at 9997 ms
   (#449 replaced that range with the `PING_FIRST_BACKOFF`-derived `[1 s, 3 s]`).
   Reviews: verification round 1 MERGE-with-findings (that F1), round 2 delta MERGE; adversarial
@@ -8429,7 +8429,7 @@ section; ledger now **24 open / 104 closed**.**
   one `Arc<AuthConfig>`, `frp-client/src/service.rs:1214-1220`), F3 records, F4 INFO.
   The round-2 delta adversarial retracted F2 to LOW (coverage only) and added F5 LOW (the re-arm
   window below, now filed as its own item), F6 INFO (the comment at
-  `frp-client/tests/heartbeat_wire_order.rs:644-650` says "~5x the upper bound" where the measured
+  `frp-client/tests/heartbeat_wire_order.rs:652-654` says "~5x the upper bound" where the measured
   ratio is about 1.67x, applied in round 4 so the comment now reads `~1.7×` for the 5 s mutant; #449
   re-derived the `reset_after`-deletion ratio to `~3.3×` against its tightened 3 s bound), F7 INFO (the wrong line cite in this paragraph, corrected here) and F8 INFO
   (the records row recorded only the round-1 adversarial verdict; closed by this text). Residues
@@ -8456,10 +8456,10 @@ section; ledger now **24 open / 104 closed**.**
   `pub const PING_FIRST_BACKOFF: Duration = Duration::from_secs(2)`) is what `next_ping_backoff` returns for
   `prev == None` (`frp-client/src/service.rs:730`), and the e2e oracle derives its window from it —
   `let rearm_min = PING_FIRST_BACKOFF / 2;` / `let rearm_max = PING_FIRST_BACKOFF + PING_FIRST_BACKOFF / 2;`
-  (`frp-client/tests/heartbeat_wire_order.rs:772-773`, `assert!` at `:774:9`) — instead of the hand-written
+  (`frp-client/tests/heartbeat_wire_order.rs:779-780`, `assert!` at `:781:9`) — instead of the hand-written
   `[1.0 s, 6.0 s]`, which is exactly what let a wrong-but-fast call-site backoff stay green. Teeth, measured
   with each helper restored from git afterwards: a 5 s literal replacing the `next_ping_backoff` call at the
-  call site (`frp-client/src/service.rs:3539`) is RED — `panicked at frp-client/tests/heartbeat_wire_order.rs:774:9: Ping#2 arrived 5007ms after the failed tick` — while the SAME mutant passes the old range (`test result: ok. 1 passed; 0 failed`), reproducing this item's premise; deleting
+  call site (`frp-client/src/service.rs:3539`) is RED — `panicked at frp-client/tests/heartbeat_wire_order.rs:781:9: Ping#2 arrived 5007ms after the failed tick` — while the SAME mutant passes the old range (`test result: ok. 1 passed; 0 failed`), reproducing this item's premise; deleting
   `interval.reset_after(delay)` (`frp-client/src/service.rs:3541`) is still RED (9982 ms), so the tightened
   window keeps the teeth it was created for; and a drifted constant (3 s) is RED in the unit test's new value
   pin (`assert_eq!(PING_FIRST_BACKOFF, Duration::from_secs(2), …)` at `frp-client/src/service.rs:5171:9`,
@@ -8488,7 +8488,7 @@ section; ledger now **24 open / 104 closed**.**
   two items filed below are the +2).
 
   Filed from the round-2 adversarial review of `fix/tokensource-single-exec` (the item above).
-  `skipped_ping_rearms_interval_on_two_second_backoff` (`frp-client/tests/heartbeat_wire_order.rs:669`)
+  `skipped_ping_rearms_interval_on_two_second_backoff` (`frp-client/tests/heartbeat_wire_order.rs:676`)
   asserts the re-arm only inside `Ping#2-T2 in [1.0 s, 6.0 s]`, so hardcoding a 5 s backoff at the
   call site (`frp-client/src/service.rs:3539`) stays green -- the exact 2 s is pinned only by the unit
   test at `frp-client/src/service.rs:5171-5175` (the literal pin; the pre-#449 block is now `:5177-5181`).
@@ -8500,7 +8500,7 @@ section; ledger now **24 open / 104 closed**.**
   covered or its absence explained.
 - [ ] **The re-arm e2e oracle sees only the first consecutive failure, so a call-site rewrite that returns `PING_FIRST_BACKOFF` instead of consulting the progression stays green.**
   Filed from the R2 adversarial review of PR #449 (the item above). The oracle derives its window from
-  `PING_FIRST_BACKOFF` (`frp-client/tests/heartbeat_wire_order.rs:772-773`) but the OIDC exec source fails on
+  `PING_FIRST_BACKOFF` (`frp-client/tests/heartbeat_wire_order.rs:779-780`) but the OIDC exec source fails on
   exactly one tick, so only the FIRST failure's re-arm is measured. Replacing the call site's
   `next_ping_backoff(ctx.ping_retry_backoff, interval.period())` (`frp-client/src/service.rs:3539`) with
   `let delay = PING_FIRST_BACKOFF;` -- and `interval.reset_after(delay)` (`:3541`) with
