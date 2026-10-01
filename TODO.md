@@ -7862,7 +7862,7 @@ section; ledger now **24 open / 104 closed**.**
   (`:2758-2768`) or a sibling drives an override that differs from the constant and asserts the
   stored field.
 
-  **(b) Done (PR #432, code head `77048726`).** `frp-server/src/control/login.rs:2795`
+  **(b) Done (PR #432, code head `108d4d90`).** `frp-server/src/control/login.rs:2795`
   `mock_handle_reports_the_override_it_was_built_with` loops three overrides — `125 ms`, `60 s` and a
   deliberately sub-100 ms non-round `Duration::from_micros(31_337)` (`:2799`) — each checked in an in-loop
   `assert_ne!` (`:2805`) against the 5 s `MOCK_REQUEST_HEAD_TIMEOUT` (`:2235`), and asserts the handle's
@@ -7877,7 +7877,7 @@ section; ledger now **24 open / 104 closed**.**
   48)` once, passing on retry. Done-when: the port is held for the fixture's lifetime, or the test
   retries deterministically instead of depending on the race.
 
-  **(c) Done (PR #432, code head `77048726`).** All five admin tests now spawn through `spawn_ready`
+  **(c) Done (PR #432, code head `108d4d90`).** All five admin tests now spawn through `spawn_ready`
   (`frpc/tests/admin_config_get_warning.rs:389`) → `spawn_admin_ready` (`:425`), which for each of
   `MAX_ADMIN_PORT_ATTEMPTS` (`:116`, 3) attempts writes the config with **that attempt's** freshly leased
   port and re-runs `admin_port_attempt` (`:471`); a lost port is recognized from the child's own stdout
@@ -8084,7 +8084,7 @@ section; ledger now **24 open / 104 closed**.**
   `#![cfg(feature = "full")]`) at load 39–41 — and replace the settle with a condition wait on the
   record itself, or record the non-reproduction with the recipe and the load figures (8 tests in the
   file).
-  **Done (PR #432, code head `77048726`).** The fixed sleep is gone: `QUIET_PERIOD` (500 ms,
+  **Done (PR #432, code head `108d4d90`).** The fixed sleep is gone: `QUIET_PERIOD` (500 ms,
   `frpc/tests/warn_delivery.rs:110`) plus a bounded `wait_for_record` (`:270`, `RECORD_TIMEOUT = 10 s` at
   `:101`) returns only once `count >= want` **and** the capture has been quiet for `QUIET_PERIOD` (`:281`),
   so the count is final before `snapshot()` (`:354`) freezes it (no fallback to the live buffers). Teeth:
