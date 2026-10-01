@@ -1176,6 +1176,15 @@ User-facing release notes for frp-rs.
   internal clamp still treats a non-positive value as "no timeout". The refusal *text* for an
   out-of-range value is still Rust's rather than Go's `strconv.ParseInt` wording (recorded in
   `TODO.md`).
+- **`frpc` ran an `auth.tokenSource` `exec` command twice per successful login; it now runs it
+  once, as Go does.** `frp-client/src/service.rs:939` already resolved the source, but `:965` also
+  stored the same `ValueSource` in `AuthConfig.token_source`, so every Login, Ping and NewWorkConn
+  re-executed it; Go resolves once in `NewService` (`client/service.go:168`). The stored source is
+  dropped and the behaviour is pinned by `frp-client/tests/token_source_single_exec.rs` (one
+  execution after construction, after two logins, and after three reloads — including a refused
+  `[auth]` change) and by the restored ping re-arm oracle
+  `frp-client/tests/heartbeat_wire_order.rs:660`. Measured with real binaries, one login:
+  pre-fix **2** executions, fixed **1**, Go **1**.
 
 ### Changed
 - **The space-separated `--strict-config <bool>` extension now prints a warning

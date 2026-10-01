@@ -8356,7 +8356,41 @@ section; ledger now **24 open / 104 closed**.**
   compat-stray-guard literals in the `health` job (`:97`) — so it should land after PRs #424/#430, which
   also touch that file, to avoid a literal conflict.
 
-- [ ] **Rust frpc runs the `auth.tokenSource` `exec` command twice per successful login where Go runs it once.**
+- [x] **Rust frpc runs the `auth.tokenSource` `exec` command twice per successful login where Go runs it once.**
+  **Done (2026-10-01, at fix `61236591` / oracle `9f9cb110` on `fix/tokensource-single-exec`, PR #437, based on `ed2d71a3`; earlier heads `801a75fb` on `a0c16c83` and `b8a916a6` on `f503b4e7`, both patches `=` under `git range-diff` at each rebase.)** The source was
+  resolved once at `frp-client/src/service.rs:939` but the same `ValueSource` was *also* stored in
+  `AuthConfig.token_source` at `:965`, so every Login (`frp-client/src/control.rs:369` →
+  `frp-core/src/auth.rs:427-428`), Ping (`frp-client/src/service.rs:3497`) and NewWorkConn
+  (`frp-client/src/work_conn.rs:1770`) re-ran the command; Go resolves once in `NewService`
+  (`client/service.go:168`, reused `:201`/`:316`) and only hashes the cached string. The stored
+  source is now dropped (`frp-client/src/service.rs:965` `token_source: None`), with doc-only notes
+  in `frp-core/src/auth.rs:96-106` and `:336-347`. Measured with real binaries on one login: pre-fix
+  **2** executions (`exec\nexec\n`), fixed **1** (`exec\n`), Go **1** — the item's `base\nbase\n`
+  vs `go\n` reproduced. New pin `frp-client/tests/token_source_single_exec.rs` counts through the
+  real client login path: 1 after construction, 1 after two logins, and still 1 after three real
+  reloads (accepted add, accepted move, refused auth change last) — reloads add **0** executions
+  because `Service::auth_cfg` is assigned only at `frp-client/src/service.rs:949` and an
+  `[auth]`-changing reload is refused (`reload::auth_reload_refusal`, `frp-client/src/service.rs:4493-4496`).
+  The round-1 verification's F1 (the fix's rewrite had deleted the only e2e oracle for the failed-Ping
+  skip + `interval.reset_after(delay)` arm) was closed in round 2 by restoring
+  `skipped_ping_rearms_interval_on_two_second_backoff` (`frp-client/tests/heartbeat_wire_order.rs:660`,
+  `#[cfg(feature = "oidc")]`, event-driven): deleting `interval.reset_after(delay)`
+  (`frp-client/src/service.rs:3523`) reddens it at `heartbeat_wire_order.rs:757:9`, and the measured
+  re-arm is 2009.6 ms against `Ping#2−T2 ∈ [1.0 s, 6.0 s]` with the Ping#3 cadence back at 9997 ms.
+  Reviews: verification round 1 MERGE-with-findings (that F1), round 2 delta MERGE; adversarial
+  round 1 MERGE-with-findings — F1 the same coverage regression (closed), F2 the NewWorkConn token
+  path is not directly exercised (no realistic partial fix isolates it: Login/Ping/NewWorkConn share
+  one `Arc<AuthConfig>`, `frp-client/src/service.rs:1196-1202`), F3 records, F4 INFO.
+  The round-2 delta adversarial retracted F2 to LOW (coverage only) and added F5 LOW (the re-arm
+  window below, now filed as its own item), F6 INFO (the comment at
+  `frp-client/tests/heartbeat_wire_order.rs:644-650` says "~5x the upper bound" where the measured
+  ratio is about 1.67x), F7 INFO (the wrong line cite in this paragraph, corrected here) and F8 INFO
+  (this list). Residues recorded, not fixed: `frps` re-resolves the source per
+  verification where Go's `BuildServerAuth` caches it (`pkg/auth/auth.go:106`); `method = "oidc"` plus `auth.tokenSource` executes once here
+  and zero times in Go; `auth.oidc.tokenSource` stays per-operation (matches Go). Ledger after this
+  close: **29 open / 170 closed** (base `ed2d71a3`: 29 open / 169 closed; the residue
+  item below is the +1).
+
   Filed by the coordinator from the round-2 adversarial review of PR #429, which measured it and
   confirmed it predates that change: with an exec token source whose command has an observable side
   effect, `frpc -c exec.toml --allow-unsafe TokenSourceExec` against a live frps runs the command
@@ -8368,6 +8402,17 @@ section; ledger now **24 open / 104 closed**.**
   test that counts executions across a login (and, if the reload path re-reads the source, that path
   is counted too), or the double read is documented as deliberate with the measured rows and the
   reason it cannot be de-duplicated.
+- [ ] **The restored `tokenSource` re-arm oracle cannot see a wrong-but-fast backoff, and the NewWorkConn token path is uncovered.**
+  Filed from the round-2 adversarial review of `fix/tokensource-single-exec` (the item above).
+  `skipped_ping_rearms_interval_on_two_second_backoff` (`frp-client/tests/heartbeat_wire_order.rs:660`)
+  asserts the re-arm only inside `Ping#2-T2 in [1.0 s, 6.0 s]`, so hardcoding a 5 s backoff at the
+  call site (`frp-client/src/service.rs:3521`) stays green -- the exact 2 s is pinned only by the unit
+  test at `frp-client/src/service.rs:5148-5152`. And no test drives a `ReqWorkConn` carrying a token
+  source (`frp-client/src/work_conn.rs:1758-1780`), although no realistic partial fix isolates it
+  (Login/Ping/NewWorkConn share one `Arc<AuthConfig>`, `frp-client/src/service.rs:1196-1202`).
+  **Done-when:** the e2e window is tight enough that a wrong call-site backoff reds it (or the
+  assertion compares against the pinned constant rather than a range), and the NewWorkConn path is
+  covered or its absence explained.
 - [ ] **`scripts/compat-test.sh`'s XTCP helper still kills by argument pattern — the class of kill the compat-leak item forbade for its own children.**
   Filed by the coordinator while closing the "`scripts/compat-test.sh` leaks its children" item above.
   Inside `run_xtcp_test` (`scripts/compat-test.sh:4331`), the pre-test cleanup is
