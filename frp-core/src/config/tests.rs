@@ -12318,6 +12318,77 @@ fn legacy_ini_common_unknown_key_residual_both_modes() {
     );
 }
 
+/// **Item 2: a `[common] includes` is expanded, exactly as Go's legacy reader
+/// expands it.**
+///
+/// The legacy reader fills its include list from `[common]` alone
+/// (`UnmarshalClientConfFromIni` reads only that section,
+/// `pkg/config/legacy/client.go:172-200`; `ParseClientConfig` then renders
+/// `cfg.IncludeConfigFiles`, `pkg/config/legacy/parse.go:50`), and the included
+/// sections join the same parse buffer (`LoadAllProxyConfsFromIni`,
+/// `pkg/config/legacy/parse.go:59`) — so an include named inside `[common]`
+/// contributes proxies. frp-rs ran `process_includes` on the top level before
+/// the `[common]` hoist and therefore never saw the nested key: `x12_main.ini`
+/// was rc 0 with zero proxies against Go rc 1 (the include was never read).
+/// Read it from `[common]` while the raw dialect is still visible
+/// (`frp-core/src/config/file.rs:247`).
+#[test]
+fn legacy_ini_common_include_is_expanded_like_go() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("sub.ini"),
+        "[p1]\ntype = tcp\nlocal_port = 8080\nremote_port = 18080\n",
+    )
+    .unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nincludes = \"sub.ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("strict={strict}: {e}"));
+        assert_eq!(cfg.proxies.len(), 1, "strict={strict}");
+        assert_eq!(cfg.proxies[0].name, "p1", "strict={strict}");
+        assert_eq!(cfg.proxies[0].local_port, 8080, "strict={strict}");
+        assert_eq!(cfg.proxies[0].remote_port, 18080, "strict={strict}");
+    }
+}
+
+/// **Item 2: a `[common]` include whose directory is missing aborts the load,
+/// like Go.**
+///
+/// `x12_main.ini` (`[common] includes = <unreadable pattern>`) is rc 1 in both
+/// Go loader modes (`getIncludeContents error: ...`; the pattern's directory is
+/// checked in `ClientCommonConf.Validate`, `pkg/config/legacy/client.go:393`,
+/// `include: directory of %s not exist`). frp-rs was rc 0 because the nested
+/// include was never read; the wording of its own error is
+/// `include: directory of <dir> not exist (included by pattern <p>)`
+/// (`frp-core/src/config/file.rs:338`), but the load must fail. A mutant that
+/// drops the `[common]` extraction reads zero patterns and returns `Ok`.
+#[test]
+fn legacy_ini_common_include_missing_dir_refuses_like_go() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         includes = \"no_such_dir/missing.ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let err = format!(
+            "{}",
+            load_client_config(path.to_str().unwrap(), strict).unwrap_err()
+        );
+        assert!(
+            err.contains("include:"),
+            "strict={strict}: a [common] include must be attempted: {err}"
+        );
+    }
+}
+
 /// **A DefaultSection `start` never filters; `[common] start` does.**
 ///
 /// Go fills the legacy common config from `[common]` alone

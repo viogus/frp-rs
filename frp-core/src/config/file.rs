@@ -292,6 +292,35 @@ pub(super) fn process_includes(
     // which is what Go's own `cannot unmarshal object into []string` does.
     let is_file_list =
         |v: Option<&Value>| matches!(v, Some(Value::String(_)) | Some(Value::Array(_)));
+
+    // The legacy `.ini` reader fills its include list from `[common]` alone
+    // (`UnmarshalClientConfFromIni` reads only that section,
+    // `pkg/config/legacy/client.go:172-200`; `ParseClientConfig` then renders
+    // `cfg.IncludeConfigFiles`, `pkg/config/legacy/parse.go:50`), so a
+    // `[common] includes` has to be expanded even though it sits one table
+    // below the top level. Reading it here — before the `[common]` hoist at
+    // `frp-core/src/config/normalize.rs:1162` — is what orders the walk the way
+    // Go orders it (common first, included sections after). The section-less
+    // top-level spelling below stays an frp-rs extension: Go skips
+    // `ini.DefaultSection` (`pkg/config/legacy/client.go:204`) and ignores it
+    // (measured: rc 0, zero proxies), which the pin
+    // `legacy_ini_default_section_string_include_is_still_expanded` records.
+    let legacy_common_includes = if format == ConfigFormat::Ini {
+        match table.get_mut("common").and_then(Value::as_table_mut) {
+            Some(common) => {
+                if is_file_list(common.get("includes")) {
+                    common.remove("includes")
+                } else if is_file_list(common.get("include")) {
+                    common.remove("include")
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     let includes = if is_file_list(table.get("includes")) {
         table.remove("includes")
     } else if is_file_list(table.get("include")) {
@@ -299,17 +328,17 @@ pub(super) fn process_includes(
     } else {
         None
     };
-    let patterns: Vec<String> = match includes {
-        Some(Value::Array(arr)) => arr
-            .into_iter()
-            .filter_map(|v| match v {
+    let mut patterns: Vec<String> = Vec::new();
+    for includes in [legacy_common_includes, includes] {
+        match includes {
+            Some(Value::Array(arr)) => patterns.extend(arr.into_iter().filter_map(|v| match v {
                 Value::String(s) => Some(s),
                 _ => None,
-            })
-            .collect(),
-        Some(Value::String(s)) => vec![s],
-        _ => Vec::new(),
-    };
+            })),
+            Some(Value::String(s)) => patterns.push(s),
+            _ => {}
+        }
+    }
 
     if patterns.is_empty() {
         return Ok(());
