@@ -2186,7 +2186,7 @@ Pinned by `verify_valid_config_prints_go_line_and_exits_0`,
 #### `--strict-config`: the space-separated value form
 
 `--strict-config false` (a space, two argv tokens) is an **frp-rs extension**,
-kept, documented and made **loud** rather than dropped (`TODO.md:1613`). Go frp
+kept, documented and made **loud** rather than dropped (`TODO.md:3313`). Go frp
 v0.71.0 registers `strict_config` as a pflag bool on both binaries, and a pflag
 bool never consumes a following token — so the same argv behaves differently.
 The `=` spelling (`--strict-config=false`) is the **Go-faithful** one and is the

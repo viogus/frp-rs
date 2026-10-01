@@ -6837,15 +6837,14 @@ nothing about whether the described behaviour still holds.
   with the script's existing `tests.rs` / `tests/` behaviour preserved, or the change to it justified
   in the item.
 
-  **Progress (2026-10-01, code head `643dce03` on `refactor/fileify-proxy-ops`, PR #453).** P4
-  **Progress (2026-10-01, code head `2c52916c` on `refactor/fileify-proxy-ops`, PR #453).** P4
+  **Progress (2026-10-01, code head `a618f281` on `refactor/fileify-proxy-ops`, PR #453).** P4
   (`frp-server/src/control/proxy_ops`) landed Step 0 plus seams 1–2 as three pure-move commits:
-  `a4f9064b` file-ified the inline tests (`proxy_ops.rs` (pre-move) 8054 → `proxy_ops/mod.rs` 3618 +
+  `aae3a484` file-ified the inline tests (`proxy_ops.rs` (pre-move) 8054 → `proxy_ops/mod.rs` 3618 +
   `unregister_generation_tests.rs` 3790 / `subdomain_conflict_tests.rs` 155 /
-  `tcp_auto_bind_retry_tests.rs` 430), `a305ccad` extracted `validate_new_proxy` + `duplicate_domain`
-  into `proxy_ops/validate.rs` (108), `2c52916c` extracted `register_http_vhost` +
+  `tcp_auto_bind_retry_tests.rs` 430), `92a454b3` extracted `validate_new_proxy` + `duplicate_domain`
+  into `proxy_ops/validate.rs` (108), `a618f281` extracted `register_http_vhost` +
   `register_https_vhost` into `proxy_ops/vhost.rs` (498); `mod.rs` is now 3049 (3040 production, the
-  same boundary as the plan doc — every line before the first `#[cfg(test)]`) and no file outside
+  same boundary the plan doc's `proxy_ops` row uses — every line before the first `#[cfg(test)]`) and no file outside
   `frp-server/src/control/proxy_ops/` was edited by the three **code** commits (the records commit
   touches `TODO.md` + four `docs/*` files). Operator-visible delta, recorded not pinned: the six log
   sites that moved to `vhost.rs` render `target: frp_server::control::proxy_ops::vhost` instead of
@@ -8134,6 +8133,7 @@ section; ledger now **24 open / 104 closed**.**
 - [x] **Four more test-precision residues the `test-precision-residue` round-2 reviews measured.**
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7630`): a
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7204`): a
+  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7617`): a
   test that pins less than its name claims, so a real regression stays green.
   (a) The pinned warning bytes are the shipped static, but the **emitted** record is only
   substring-checked: `frp-core/tests/server_tls_enable_warning.rs:441` asserts
@@ -9274,7 +9274,7 @@ section; ledger now **24 open / 104 closed**.**
 - [x] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
   Filed by the coordinator while closing `TODO.md:8533` (PR #430), which removed the two local `pkill -f`
 - [ ] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
-  Filed by the coordinator while closing `TODO.md:8438` (PR #430), which removed the two local `pkill -f`
+  Filed by the coordinator while closing `TODO.md:8460` (PR #430), which removed the two local `pkill -f`
   calls in `scripts/compat-test.sh`: `scripts/remote-frps.sh:195` and `:339` still run
   `pkill -f 'frps -c frps.toml'` and `:409` uses `pgrep -f` on the same text, over ssh, to manage the
   comparison server on a remote VPS. Name-plus-argument is the same hazard the local sweep just lost — a
