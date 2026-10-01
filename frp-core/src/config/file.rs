@@ -3,7 +3,9 @@ use std::path::Path;
 use super::client::ClientConfig;
 use super::format::{detect_format, parse_to_toml_value, ConfigFormat};
 use super::loader::{validate_client_config, validate_server_config, ConfigPresence};
-use super::normalize::{load_config_from_file, normalize_client_config, normalize_server_config};
+use super::normalize::{
+    load_config_from_file, normalize_client_config, normalize_server_config, ConfigSide,
+};
 use super::server::ServerConfig;
 use super::strict::{known_client_keys, known_server_keys};
 use crate::unsafe_features::UnsafeFeatures;
@@ -79,6 +81,7 @@ pub fn load_server_config_uncompleted_with_presence(
     let (mut cfg, presence) = load_config_from_file::<ServerConfig>(
         path,
         strict_config,
+        ConfigSide::Server,
         known_server_keys,
         normalize_server_config_with_legacy_include_cleanup,
         validate_server_config,
@@ -124,6 +127,7 @@ pub fn load_client_config_with_presence(
     let (mut cfg, presence) = load_config_from_file::<ClientConfig>(
         path,
         strict_config,
+        ConfigSide::Client,
         known_client_keys,
         normalize_client_config_with_legacy_include_cleanup,
         validate_client_config,
@@ -248,6 +252,7 @@ pub(super) fn process_includes(
     value: &mut toml::Value,
     base_dir: &Path,
     format: ConfigFormat,
+    side: ConfigSide,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use toml::Value;
 
@@ -293,8 +298,8 @@ pub(super) fn process_includes(
     let is_file_list =
         |v: Option<&Value>| matches!(v, Some(Value::String(_)) | Some(Value::Array(_)));
 
-    // The legacy `.ini` reader fills its include list from `[common]` alone
-    // (`UnmarshalClientConfFromIni` reads only that section,
+    // The legacy `.ini` **client** reader fills its include list from `[common]`
+    // alone (`UnmarshalClientConfFromIni` reads only that section,
     // `pkg/config/legacy/client.go:172-200`; `ParseClientConfig` then renders
     // `cfg.IncludeConfigFiles`, `pkg/config/legacy/parse.go:50`), so a
     // `[common] includes` has to be expanded even though it sits one table
@@ -305,18 +310,35 @@ pub(super) fn process_includes(
     // `ini.DefaultSection` (`pkg/config/legacy/client.go:204`) and ignores it
     // (measured: rc 0, zero proxies), which the pin
     // `legacy_ini_default_section_string_include_is_still_expanded` records.
-    let legacy_common_includes = if format == ConfigFormat::Ini {
+    //
+    // Client only. Go has no include handling on the server path:
+    // `LoadServerConfig` (`pkg/config/load.go:295`) maps `[common]` onto
+    // `legacy.ServerCommonConf` (`pkg/config/legacy/server.go:220`), a struct
+    // with no `includes` field, and the only expansion
+    // (`LoadAdditionalClientConfigs`, `pkg/config/load.go:381-382`) is inside
+    // `LoadClientConfigResult` (`pkg/config/load.go:346`). A `[common] includes`
+    // in a frps config is therefore inert on Go — measured rc 0 in both loader
+    // modes, with a valid include, a missing include directory and an include
+    // holding a server setting alike. Extracting it here made frps (which
+    // defaults to strict) refuse files Go and the pre-`[common]`-include frp-rs
+    // both accept, and silently merged a server key in the non-strict mode.
+    //
+    // The spelling is Go's exactly: only the **string** key `includes`
+    // (`IncludeConfigFiles []string \`ini:"includes"\``,
+    // `pkg/config/legacy/client.go:166`). Measured on v0.71.0: `include =
+    // "<file>"` and `includes = ["<file>"]` both yield rc 0 with zero proxies
+    // (the singular is a key Go never maps; the array is a literal string to
+    // Go's reader, so it matches no file), while the string and a string glob
+    // (`includes = "sub*.ini"`, `getIncludeContents`'s `filepath.Match`,
+    // `pkg/config/legacy/parse.go:87`) both expand. Leaving the two ignored
+    // spellings in place keeps the pre-fix behaviour; the earlier `is_file_list`
+    // widening let them expand where Go yields nothing.
+    let legacy_common_includes = if side == ConfigSide::Client && format == ConfigFormat::Ini {
         match table.get_mut("common").and_then(Value::as_table_mut) {
-            Some(common) => {
-                if is_file_list(common.get("includes")) {
-                    common.remove("includes")
-                } else if is_file_list(common.get("include")) {
-                    common.remove("include")
-                } else {
-                    None
-                }
+            Some(common) if matches!(common.get("includes"), Some(Value::String(_))) => {
+                common.remove("includes")
             }
-            None => None,
+            _ => None,
         }
     } else {
         None
@@ -484,22 +506,19 @@ fn drop_ini_scalar_include_keys(table: &mut toml::Table) {
 // (Go v0.71.0 binaries, both loader modes). The detector used throughout is
 // `sub_bad.ini` = `[p1] role = "visitor"`: Go's legacy reader refuses it with
 // `failed to parse visitor p1, err: type shouldn't be empty`, so a reader that
-// merges the file must fail on it. None of these is introduced by the
-// legacy-`.ini` parity work and none is pinned by a test — they are recorded
+// merges the file must fail on it. None of the remaining ones is introduced by
+// the legacy-`.ini` parity work and none is pinned by a test — they are recorded
 // here because this is where the include handling lives, and so that a later
 // fix knows it is changing measured behaviour rather than "cleaning up".
 //
-// * `[common] includes = "<file>"`: Go reads the include list from `[common]`
-//   (`UnmarshalClientConfFromIni`, `pkg/config/legacy/client.go:195-213`) and
-//   merges the file. [`process_includes`] runs on the raw top-level table
-//   *before* the `[common]` hoist
-//   (`frp-core/src/config/normalize.rs:1162-1166`), so the pattern is never
-//   expanded; the hoisted string is then read as a one-element list by the
-//   type-directed `.ini` reader (`deserialize_seq` on `Value::String`,
-//   `frp-core/src/config/ini_lenient.rs:175-183`). With a valid include both
-//   readers are rc 0 and the cost is silent config loss (Go loads that file's
-//   proxies, frp-rs loads none); with `sub_bad.ini` Go is rc 1 and frp-rs rc 0,
-//   in both modes, for a relative and an absolute pattern alike.
+// (The `[common] includes = "<file>"` gap this list originally opened with is
+// fixed: [`process_includes`] expands that list on the **client** load, matching
+// Go, and ignores it on the **server** load, also matching Go. Pins:
+// `legacy_ini_common_include_is_expanded_like_go`,
+// `legacy_ini_common_include_missing_dir_refuses_like_go`,
+// `legacy_ini_common_include_glob_is_expanded_like_go`,
+// `legacy_ini_common_include_ignored_spellings_both_modes`,
+// `legacy_ini_server_ignores_common_includes_both_modes`.)
 // * The mirror shape: a top-level `includes = "<file>"` in a file that also has
 //   `[common]`. Go never reads it (only `[common]` is mapped by
 //   `UnmarshalClientConfFromIni`), while frp-rs expands it here and merges the

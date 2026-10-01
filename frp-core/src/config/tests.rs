@@ -12389,6 +12389,164 @@ fn legacy_ini_common_include_missing_dir_refuses_like_go() {
     }
 }
 
+/// **Item 2 / F2: a `[common] includes` *glob* expands, exactly as Go's
+/// `getIncludeContents` does.**
+///
+/// `getIncludeContents` (`pkg/config/legacy/parse.go:68-97`) resolves each
+/// pattern with `filepath.Match` over the directory listing, so
+/// `includes = "sub*.ini"` is a real glob: with `sub_bad.ini`
+/// (`[p1] role = "visitor"`) beside the config, Go v0.71.0 is rc 1 in both
+/// loader modes (`failed to parse visitor p1, err: type shouldn't be empty`).
+/// frp-rs's [`process_includes`] uses the same single-`*`-per-component glob
+/// (`simple_glob`, `frp-core/src/config/file.rs:549`), so the matched file must
+/// be merged and refused the same way.
+#[test]
+fn legacy_ini_common_include_glob_is_expanded_like_go() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("sub_bad.ini"), "[p1]\nrole = \"visitor\"\n").unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nincludes = \"sub*.ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let err = format!(
+            "{}",
+            load_client_config(path.to_str().unwrap(), strict).unwrap_err()
+        );
+        assert!(
+            err.contains("failed to parse visitor p1") && err.contains("type shouldn't be empty"),
+            "strict={strict}: the glob must expand and the included visitor be refused: {err}"
+        );
+    }
+}
+
+/// **Item 2 / F2: only the string `includes` spelling is Go's.**
+///
+/// Go maps `IncludeConfigFiles []string \`ini:"includes"\``
+/// (`pkg/config/legacy/client.go:166`) out of `[common]`. Measured on v0.71.0,
+/// both loader modes: `[common] include = "<file>"` (the singular, a key Go
+/// never reads) and `[common] includes = ["<file>"]` (an array, which
+/// `ini.MapTo` turns into a literal string that matches no file) are each rc 0
+/// with zero proxies, while the string form loads the file. frp-rs must ignore
+/// the two ignored spellings rather than expand them.
+#[test]
+fn legacy_ini_common_include_ignored_spellings_both_modes() {
+    for (label, line) in [
+        ("singular include", "include = \"sub.ini\"".to_string()),
+        ("array includes", "includes = [\"sub.ini\"]".to_string()),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("sub.ini"),
+            "[p1]\ntype = tcp\nlocal_port = 8080\nremote_port = 18080\n",
+        )
+        .unwrap();
+        let path = dir.path().join("frpc.ini");
+        std::fs::write(
+            &path,
+            format!("[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n{line}\n"),
+        )
+        .unwrap();
+        for strict in [false, true] {
+            let cfg = load_client_config(path.to_str().unwrap(), strict)
+                .unwrap_or_else(|e| panic!("{label}, strict={strict}: {e}"));
+            assert_eq!(
+                cfg.proxies.len(),
+                0,
+                "{label}, strict={strict}: Go ignores this spelling"
+            );
+        }
+    }
+}
+
+/// **Item 2 / F1: the frps load ignores `[common] includes` entirely, matching
+/// Go.**
+///
+/// Go has no include handling on the server path: `LoadServerConfig`
+/// (`pkg/config/load.go:295`) maps `[common]` onto `legacy.ServerCommonConf`
+/// (`pkg/config/legacy/server.go:220`), which has no `includes` field, and the
+/// only expansion (`LoadAdditionalClientConfigs`, `pkg/config/load.go:381-382`)
+/// is inside `LoadClientConfigResult` (`pkg/config/load.go:346`). Measured on
+/// v0.71.0, both loader modes, all rc 0: an include holding `[p1]` (which the
+/// client-side fix would merge and, under frps's strict default, refuse as
+/// `unknown field "p1"`), an include holding a visitor the legacy collector
+/// refuses, a missing include directory, and an include holding
+/// `[common] log_level = "debug"` (a silent server-semantics change). The frps
+/// load must stay rc 0 and keep its own log level.
+#[test]
+fn legacy_ini_server_ignores_common_includes_both_modes() {
+    // Case 1: an include holding a proxy section — merging it would add an
+    // unknown top-level `p1` under frps's strict default.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("srv_p1.ini"),
+        "[p1]\ntype = tcp\nlocal_port = 8080\nremote_port = 18080\n",
+    )
+    .unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(
+        &path,
+        "[common]\nbind_port = 17703\nincludes = \"srv_p1.ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        load_server_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("include holding [p1], strict={strict}: {e}"));
+    }
+
+    // Case 2: an include the client-side collector would refuse.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("srv_bad.ini"), "[p1]\nrole = \"visitor\"\n").unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(
+        &path,
+        "[common]\nbind_port = 17703\nincludes = \"srv_bad.ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        load_server_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("include holding a bad visitor, strict={strict}: {e}"));
+    }
+
+    // Case 3: a missing include directory is not an error for frps.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(
+        &path,
+        "[common]\nbind_port = 17703\nincludes = \"no_such_dir/missing.ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        load_server_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("missing include dir, strict={strict}: {e}"));
+    }
+
+    // Case 4: the include cannot change server semantics silently — the
+    // included `[common] log_level = "debug"` must not reach the merged config.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("srv_log.ini"),
+        "[common]\nlog_level = \"debug\"\n",
+    )
+    .unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(
+        &path,
+        "[common]\nbind_port = 17705\nincludes = \"srv_log.ini\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_server_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("log include, strict={strict}: {e}"));
+        assert_eq!(
+            cfg.log.level, "info",
+            "strict={strict}: the server's own log level must not come from an ignored include"
+        );
+    }
+}
+
 /// **A DefaultSection `start` never filters; `[common] start` does.**
 ///
 /// Go fills the legacy common config from `[common]` alone
