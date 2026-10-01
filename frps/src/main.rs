@@ -45,6 +45,19 @@ fn lock_dir_registry(
                 "SIGUSR1 directory registry mutex was poisoned; \
                  recovering the live service list"
             );
+            // Debug-only sabotage hook for the `Run frps bin unit tests` CI step:
+            // that step runs the poisoned-registry pin a second time with this
+            // variable set and requires the run to **fail**, because a pin whose
+            // body prints its completion marker and returns asserts nothing while
+            // still reporting `1 passed`. Emptying the recovered list is exactly
+            // the mutant the pin asserts against, so a vacuous pin cannot be made
+            // to fail and the step reds. Never set outside that step.
+            #[cfg(debug_assertions)]
+            if std::env::var_os("FRPS_DIR_REGISTRY_TEST_DISCARD").is_some() {
+                let mut guard = poisoned.into_inner();
+                guard.clear();
+                return guard;
+            }
             poisoned.into_inner()
         }
     }
@@ -75,6 +88,206 @@ impl Drop for DirRegistryEntry {
         {
             live.remove(pos);
         }
+    }
+}
+
+/// Main-task ownership of `SIGTERM`/`SIGINT` for the `--config-dir` lane.
+///
+/// The Unix `SIGTERM` handler lives inside `Service::run` — it is installed by a
+/// task `run()` spawns at its top (`frp-server/src/service.rs:1854-1893`, the
+/// same task that also takes `ctrl_c()`) — so a `SIGTERM` that lands between the
+/// startup line and that registration takes the kernel's default disposition
+/// and kills `frps` (`rc = -15`) instead of draining. The measured window is
+/// ~0.16 ms median / 1.10 ms max.
+///
+/// Installing a main-task handler *without* recording would not fix that: tokio
+/// keeps one `EventInfo` per signal kind, and its broadcast flips `pending` and
+/// does a single `watch::Sender::send` (`tokio/…/signal/registry.rs`), so a
+/// service whose own `Signal` is created later never sees a delivery that
+/// happened before it existed. The race would become a **lost** `SIGTERM`,
+/// which is worse than a signal death.
+///
+/// So this type records instead: [`Self::record`] is called by the main task's
+/// listener the moment a signal is delivered, and it (a) sets `requested`,
+/// (b) wakes the test-profile `recorded()` waiters, and (c) cancels the shutdown
+/// token of every service that registered through [`Self::watch`]. `watch` and
+/// `record` read `requested` and `states` in orders that cannot both miss a
+/// service — see the call site in the per-file task.
+///
+/// A *second* request is a different matter: with nothing registered there is no
+/// service to cancel and the caller may be stuck before its first one, so
+/// [`Self::record`] forces an exit instead of leaving a process that no
+/// `SIGTERM` can end (measured: pre-fix `frps` and Go `frpc` both die `rc 143`
+/// in that lane).
+#[cfg(unix)]
+struct EarlyShutdown {
+    /// Set by the recorder the moment a shutdown signal is delivered. Read by
+    /// [`Self::watch`] (inline cancel) and by the test-profile `recorded()`.
+    requested: std::sync::atomic::AtomicBool,
+    /// Woken on the same edge so a task held open by the debug-only
+    /// registration window (`FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS`) can
+    /// register immediately instead of sleeping out a delay a spawn-level pin
+    /// deliberately set longer than the pin itself.
+    arrived: tokio::sync::watch::Sender<bool>,
+    /// The `AppState` of every service that registered before the signal.
+    /// `frps` depends on `tokio`, not `tokio-util`, so the cancellation token is
+    /// reached through the service's own state (`Service::state`) rather than
+    /// named here.
+    states: std::sync::Mutex<Vec<std::sync::Arc<frp_server::state::AppState>>>,
+}
+
+#[cfg(unix)]
+impl EarlyShutdown {
+    /// Install the handler, before anything is spawned and before the startup
+    /// line, and return the recorder.
+    fn install() -> std::sync::Arc<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        // The OS registration is what actually narrows the window, so it happens
+        // first — a signal delivered while the directory is still being
+        // constructed is queued by tokio and delivered to this listener.
+        let sigterm = match signal(SignalKind::terminate()) {
+            Ok(sig) => Some(sig),
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGTERM unavailable: {}", e);
+                None
+            }
+        };
+        let sigint = match signal(SignalKind::interrupt()) {
+            Ok(sig) => Some(sig),
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGINT unavailable: {}", e);
+                None
+            }
+        };
+        let (arrived, _) = tokio::sync::watch::channel(false);
+        let early = std::sync::Arc::new(Self {
+            requested: std::sync::atomic::AtomicBool::new(false),
+            arrived,
+            states: std::sync::Mutex::new(Vec::new()),
+        });
+        if sigterm.is_none() && sigint.is_none() {
+            return early;
+        }
+        let recorder = std::sync::Arc::clone(&early);
+        tokio::spawn(async move {
+            let mut sigterm = sigterm;
+            let mut sigint = sigint;
+            loop {
+                tokio::select! {
+                    _ = recv_shutdown_signal(&mut sigterm) => {
+                        recorder.record(128 + 15, "SIGTERM");
+                    }
+                    _ = recv_shutdown_signal(&mut sigint) => {
+                        recorder.record(128 + 2, "SIGINT");
+                    }
+                }
+            }
+        });
+        early
+    }
+
+    /// Record a delivered shutdown signal and fan it out to every service that
+    /// registered before it arrived.
+    ///
+    /// A *repeat* request while nothing has **ever** registered is the one case
+    /// this cannot serve by cancelling: the config-directory lane is still
+    /// blocked in `collect_config_files`/`read_to_string` (a pipe or FIFO named
+    /// `*.toml` never returns), so no service exists to stop and there is
+    /// nothing for the main task to observe. Left alone, the process would sit
+    /// in that read forever, and the recorded request would have converted "dies
+    /// on SIGTERM" into "deaf to SIGTERM" — on a FIFO-only directory the
+    /// pre-fix and Go behaviour is signal death (`rc 143`). A second request
+    /// therefore forces an exit; one signal is still always recorded and
+    /// honoured, which is what the registration-window pin relies on.
+    ///
+    /// `states` is append-only, so "nothing has ever registered" above is exact:
+    /// when the directory's *first* entry loads and the FIFO comes later, one
+    /// service registers, this escalation cannot fire, and the lane stays deaf
+    /// to `SIGTERM` exactly as the pre-fix binary is. Measured on that mixed
+    /// shape (valid `a.toml` + FIFO `b.toml`): base `ea991757` and this tree
+    /// both log `starting 2 services`, both survive four SIGTERMs, and only
+    /// `SIGKILL` ends them (`wait rc 137`). Making that shape killable is a
+    /// behaviour change, not claimed here or by the FIFO pin (FIFO-only
+    /// fixture).
+    fn record(&self, forced_exit: i32, name: &'static str) {
+        // Store before taking `states`: `watch` reads `requested` **while
+        // holding** the same lock, so a call that interleaves here either sees
+        // `requested` already true (and cancels inline) or is already in
+        // `states` below — never neither. The reverse order would open a gap in
+        // which a service registers and the fan-out misses it.
+        let already_requested = self
+            .requested
+            .swap(true, std::sync::atomic::Ordering::SeqCst);
+        let states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if already_requested && states.is_empty() {
+            tracing::error!(
+                "{name} requested again with no service registered to stop it; forcing exit \
+                 {forced_exit}"
+            );
+            std::process::exit(forced_exit);
+        }
+        let _ = self.arrived.send(true);
+        for state in states.iter() {
+            state.shutdown_token.cancel();
+        }
+    }
+
+    /// Register `state` for the recorded-shutdown fan-out. Returns `true`, after
+    /// cancelling it, when the signal was recorded before this call — i.e. this
+    /// service started inside the window this type exists to close.
+    fn watch(&self, state: std::sync::Arc<frp_server::state::AppState>) -> bool {
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.requested.load(std::sync::atomic::Ordering::SeqCst) {
+            state.shutdown_token.cancel();
+            return true;
+        }
+        states.push(state);
+        false
+    }
+
+    /// Resolves once a shutdown signal has been recorded — at once if one
+    /// already was.
+    ///
+    /// Test-profile only. Both callers are spawn-level holds behind
+    /// `debug_assertions` (`FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS` and
+    /// `FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS`), so a release build has no
+    /// way to await this and the release CI jobs (`-D warnings`) would fail the
+    /// build on the dead method. The gate sits on the method itself: an
+    /// `allow(dead_code)` would hide the same warning for anything else that
+    /// later becomes release-dead.
+    #[cfg(debug_assertions)]
+    async fn recorded(&self) {
+        if self.requested.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        // `watch` (not `Notify`): every waiter must wake, and `subscribe` +
+        // the re-check below makes the subscribe/send race impossible in either
+        // direction — a send before `subscribe` is caught by the second check, a
+        // send after it by `changed()`.
+        let mut arrived = self.arrived.subscribe();
+        if self.requested.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let _ = arrived.changed().await;
+    }
+}
+
+/// Await the next delivery on an optional signal, or never if its handler could
+/// not be installed — `select!` needs a future on every branch even when one of
+/// the two signals is unavailable.
+#[cfg(unix)]
+async fn recv_shutdown_signal(sig: &mut Option<tokio::signal::unix::Signal>) {
+    match sig {
+        Some(sig) => {
+            sig.recv().await;
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -112,12 +325,13 @@ async fn main() {
 /// * success is `frps: the configuration file %s syntax is ok` on **stdout**,
 ///   exit 0 (`:56`).
 ///
-/// The loader is [`load_server_config_checked`] — [`load_server_config`] plus
+/// The loader is [`load_server_config_checked`] —
+/// [`frp_core::config::load_server_config`] plus
 /// [`frp_core::config::check_server_unsafe_features`]. The parse-and-validate
 /// half is the same path the run path uses: the run path's single-config branch
-/// calls [`load_server_config_uncompleted`] (the same function minus
-/// `ServerConfig::complete`) and completes the merged config itself, and both go
-/// through `load_config_from_file` with `known_server_keys` and
+/// calls [`frp_core::config::load_server_config_uncompleted`] (the same function
+/// minus `ServerConfig::complete`) and completes the merged config itself, and
+/// both go through `load_config_from_file` with `known_server_keys` and
 /// `validate_server_config`. `verify` has no CLI overrides to merge, so it takes
 /// the completing wrapper. The consequence is that `verify` accepts exactly the
 /// configs `frps -c` accepts and refuses the ones it refuses: parse and
@@ -299,6 +513,17 @@ async fn run(mut cli: FrpsArgs) {
                     None
                 }
             };
+        // The same "before anything is spawned and before the startup line"
+        // ownership argument as SIGUSR1 above, for `SIGTERM`/`SIGINT`. These are
+        // also installed per service inside `Service::run`, and tokio does *not*
+        // replay a delivery to a listener created after it — so a second handler
+        // alone would turn the pre-registration signal death into a lost
+        // `SIGTERM` (see [`EarlyShutdown`]). The main task therefore owns the
+        // handler first and **records** what it saw; each service hands its
+        // `AppState` over after it registers, and either that handoff cancels the
+        // token in time or the recorder's fan-out does.
+        #[cfg(unix)]
+        let early_shutdown = EarlyShutdown::install();
         tracing::info!(
             version = %frp_core::VERSION,
             count = %files.len(),
@@ -351,6 +576,8 @@ async fn run(mut cli: FrpsArgs) {
                     let registry = registry.clone();
                     #[cfg(unix)]
                     let registration_barrier = registration_barrier.clone();
+                    #[cfg(unix)]
+                    let early_shutdown = early_shutdown.clone();
                     handles.push((
                         file_index,
                         tokio::spawn(async move {
@@ -392,7 +619,36 @@ async fn run(mut cli: FrpsArgs) {
                                 .ok()
                                 .and_then(|v| v.parse::<u64>().ok())
                             {
-                                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                                // Optional per-file filter
+                                // (`FRPS_CFGDIR_TEST_REGISTRATION_DELAY_FILES`,
+                                // comma-separated path fragments): hold only the
+                                // matching files, so a pin can park one file
+                                // across a delivered signal while the others
+                                // register — the pre-registration half of the
+                                // recorder's fan-out pin, whose
+                                // post-registration half is the hold below.
+                                let held = std::env::var("FRPS_CFGDIR_TEST_REGISTRATION_DELAY_FILES")
+                                    .ok()
+                                    .map(|files| {
+                                        files.split(',').any(|f| path_str.contains(f.trim()))
+                                    })
+                                    .unwrap_or(true);
+                                if held {
+                                    // A recorded shutdown signal ends the hold early.
+                                    // A spawn-level pin can then set a delay longer
+                                    // than the test itself and send `SIGTERM` the
+                                    // instant the startup line appears: the hold
+                                    // ends because the main task *recorded* the
+                                    // signal, so the pin proves the recorded path
+                                    // instead of racing the registration.
+                                    #[cfg(unix)]
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {}
+                                        _ = early_shutdown.recorded() => {}
+                                    }
+                                    #[cfg(not(unix))]
+                                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                                }
                             }
                             // Registered before `run()`, so the soonest possible
                             // SIGUSR1 already finds this service. Releasing the
@@ -404,6 +660,59 @@ async fn run(mut cli: FrpsArgs) {
                                 lock_dir_registry(&registry)
                                     .push((service.clone(), path_str.clone()));
                                 registration_barrier.add_permits(1);
+                                // Hand the state to the main-task recorder
+                                // **after** the push. `watch` and `record` read
+                                // `requested`/`states` in orders that cannot both
+                                // miss this service: `record` stores `requested`
+                                // before it takes `states`, while `watch` holds
+                                // `states` and reads `requested`. So either the
+                                // signal was already recorded (this call cancels
+                                // the token inline and returns true, meaning this
+                                // service started inside the window the fix
+                                // closes) or it arrives after the push and the
+                                // recorder's fan-out cancels it. Never neither.
+                                if early_shutdown.watch(service.state()) {
+                                    tracing::info!(
+                                        path = %path_str,
+                                        "shutdown signal was recorded before this service \
+                                         installed its own handler; stopping it through the \
+                                         recorded request"
+                                    );
+                                }
+                            }
+                            // Debug-build-only hold (review round 2, F7), sibling
+                            // of the pre-registration hook above: when it names
+                            // *this* file, park the task **after** its state went
+                            // into the recorder's fan-out list and **before**
+                            // `Service::run` installs the service's own `SIGTERM`
+                            // handler. In that interval only `record()`'s fan-out
+                            // can cancel this token, so a pin can deliver one
+                            // signal and observe whether the fan-out did its job.
+                            // The `recorded()` arm keeps the hold from outliving
+                            // the signal, so the pin measures the fan-out rather
+                            // than a sleep.
+                            #[cfg(all(unix, debug_assertions))]
+                            if let Some(ms) =
+                                std::env::var("FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS")
+                                    .ok()
+                                    .and_then(|v| v.parse::<u64>().ok())
+                            {
+                                let held = std::env::var(
+                                    "FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_FILES",
+                                )
+                                .ok()
+                                .map(|files| files.split(',').any(|f| path_str.contains(f.trim())))
+                                .unwrap_or(true);
+                                if held {
+                                    tracing::info!(
+                                        path = %path_str,
+                                        "test hold: registered for the shutdown fan-out"
+                                    );
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {}
+                                        _ = early_shutdown.recorded() => {}
+                                    }
+                                }
                             }
                             // Armed immediately after the push above and dropped
                             // on **every** way out of this task — the graceful
@@ -440,7 +749,7 @@ async fn run(mut cli: FrpsArgs) {
                                 // (`frp-server/src/service.rs:2276`) — so this
                                 // arm means the service stopped for good. The
                                 // single-config path maps any `run()` error to
-                                // `EXIT_RUNTIME` (`frps/src/main.rs:540-542`),
+                                // `EXIT_RUNTIME` (`frps/src/main.rs:1079-1082`),
                                 // and this lane carries the same code out,
                                 // pinned on both lanes by
                                 // `config_dir_where_every_service_fails_to_run_exits_like_dash_c`

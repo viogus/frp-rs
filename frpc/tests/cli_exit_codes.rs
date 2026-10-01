@@ -742,6 +742,17 @@ fn config_dir_exits_the_first_files_code_when_a_load_failure_precedes_a_run_fail
 /// `if true` exits 1 for this directory; the all-failed pin above stays green
 /// under that mutant (its only file fails, so the two arms agree there), which
 /// is why this pin exists.
+///
+/// The SIGTERM half of this pin asserts **frp-rs's** exit contract, not Go's.
+/// Go frp v0.71.0 installs a graceful shutdown handler for `kcp`/`quic` only
+/// (`cmd/frpc/sub/root.go:207-210` skips the SIGTERM/SIGINT goroutine for the
+/// default tcp listener), so its plain tcp client dies by signal and the shell
+/// sees 143 — measured on the real binary (v0.71.0, darwin/arm64,
+/// `/private/tmp/frp_0.71.0_darwin_arm64/frpc`) for both `--config-dir` and
+/// `-c`, with `ExitStatus::code() == None`. frp-rs stops every service
+/// gracefully, so `Some(0)` is the deliberate divergence and the value pinned
+/// here. The record lives at the `SHUTDOWN_REQUESTED` handler in
+/// `frpc/src/main.rs`; do not re-point this pin at Go's signal death.
 #[test]
 fn config_dir_where_one_service_fails_keeps_retrying_and_exits_zero() {
     let dir = TempDir::new();
@@ -832,7 +843,9 @@ fn config_dir_where_one_service_fails_keeps_retrying_and_exits_zero() {
         status.code(),
         Some(0),
         "a directory whose surviving service stopped gracefully on SIGTERM must not \
-         exit the failed file's code; log={:?}",
+         exit the failed file's code; Go's plain tcp client dies by signal here \
+         (rc 143 / `code() == None`, measured against v0.71.0), so `Some(0)` is \
+         frp-rs's own contract rather than a Go-parity claim; log={:?}",
         read_log(),
     );
     assert!(
@@ -853,6 +866,10 @@ fn config_dir_where_one_service_fails_keeps_retrying_and_exits_zero() {
 /// in `frpc/src/main.rs` survived it. Under that mutant this directory exits
 /// `a.toml`'s code (1) after SIGTERM instead of 0, so the survivor's retry-stop
 /// line and the `Some(0)` exit code are the teeth.
+///
+/// Its SIGTERM contract is the same frp-rs-specific `Some(0)` the pin above
+/// records (Go's plain tcp client dies by signal there, rc 143 /
+/// `code() == None`).
 #[test]
 fn config_dir_where_the_first_service_fails_keeps_retrying_and_exits_zero() {
     let dir = TempDir::new();

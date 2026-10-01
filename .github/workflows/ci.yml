@@ -242,7 +242,34 @@ jobs:
       # `files.is_empty()` arm, whose only discriminating observable is the
       # empty-directory message: the fall-through exits 2 as well). Re-derived
       # on this tree with `cargo test -p frps --test cli_exit_codes -- --list`.
-      FRPS_CLI_TESTS: "40"
+      # 40 → 42 with the `--config-dir` signal-handling residue round (batch D):
+      # +1 `config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorded_request`
+      # (the pre-registration `SIGTERM` window driven *deterministically* through
+      # the debug-only `FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS` hold; main now
+      # owns `SIGTERM` before the startup line and records what it saw, and the
+      # pin's log assertion is what proves the exit came from the recorded path
+      # rather than a race won in the other order) and +1
+      # `config_dir_fifo_entry_wedges_the_lane_and_a_repeat_signal_ends_it` (the
+      # record for the non-regular-entry hang: a FIFO named `*.toml` is admitted
+      # by extension, so the lane wedges instead of being refused; the first
+      # `SIGTERM` is recorded with no service to cancel, and a *repeat* request
+      # forces the exit). Both are `#[cfg(unix)]`, and every runner for this lane
+      # is `ubuntu-latest`. Re-derived on this tree with
+      # `cargo test -p frps --test cli_exit_codes -- --list`.
+      # 42 → 43 with the round-2 review fix: +1
+      # `config_dir_recorded_signal_fans_out_to_an_already_registered_service`
+      # (the recorder's **fan-out** half, which round 2 found unpinned — the
+      # window pin above only exercises the `watch()` handoff, and deleting the
+      # fan-out loop left the whole lane green). Its sibling debug-only hold
+      # `FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS` (`..._DELAY_FILES`) parks
+      # one service inside the interval where its token belongs to the recorder
+      # and its own `SIGTERM` handler does not exist yet, so deleting
+      # `record()`'s `for state in states.iter() { state.shutdown_token.cancel(); }`
+      # loop leaves that service running on a live token with the main task
+      # awaiting it and reds the pin. `#[cfg(unix)]` like its siblings, and every
+      # runner for this lane is `ubuntu-latest`. Re-derived on this tree with
+      # `cargo test -p frps --test cli_exit_codes -- --list`.
+      FRPS_CLI_TESTS: "43"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
       # 11 → 13 with the one `auth.method` policy: +2
@@ -356,6 +383,13 @@ jobs:
         # zero assertions). So the step also greps the exact list entry and the
         # pin's `--nocapture` completion marker, which is printed only after
         # every assertion has run.
+        #
+        # Neither is the guard marker-only: a body that prints that marker and
+        # returns would satisfy every line above. The step therefore runs the pin
+        # a second time with `FRPS_DIR_REGISTRY_TEST_DISCARD=1`, which makes
+        # `lock_dir_registry` recover the poisoned registry and then empty it —
+        # exactly the mutant the pin asserts against — and requires that run to
+        # FAIL. A vacuous pin cannot be made to fail, so it reds this step.
         shell: bash
         run: |
           set -eo pipefail
@@ -377,8 +411,22 @@ jobs:
           [ "$n" = "1" ] || status=1
           [ "$named" = "1" ] || status=1
           grep -q "$marker" "$log.plain" || status=1
+          # Converse run: the pin must also be *able* to fail, or a body that
+          # prints the marker and returns would satisfy every line above. The
+          # sabotage empties the registry the pin asserts against, so this run
+          # must report FAILED — for this test, not for anything else.
+          sabotage=/tmp/frps-bin-unit-tests-sabotaged.log
+          FRPS_DIR_REGISTRY_TEST_DISCARD=1 \
+            cargo test -p frps --bin frps --all-features --color never -- --nocapture \
+            > "$sabotage" 2>&1 || true
+          sed -e 's/\x1b\[[0-9;]*m//g' "$sabotage" > "$sabotage.plain"
+          grep -q "test result: FAILED" "$sabotage.plain" || status=1
+          grep -qE "^test ${expected} \.\.\. FAILED$" "$sabotage.plain" || status=1
+          if grep -q "$marker" "$sabotage.plain"; then
+            status=1
+          fi
           if [ "$status" != "0" ]; then
-            echo "::error::frps bin unit-test guard failed (status=$status, file=$n, named=$named, log=$log)"
+            echo "::error::frps bin unit-test guard failed (status=$status, file=$n, named=$named, log=$log, sabotage=$sabotage)"
             if [ -n "$n" ] && [ "$n" != "1" ]; then
               if [ "$n" -lt "1" ]; then
                 echo "::error::the inline test module in frps/src/main.rs lists $n tests, this step expects 1 — its tests were deleted or the module was disabled; restore them rather than lowering this literal"
@@ -392,10 +440,13 @@ jobs:
             if [ "$(grep -c "$marker" "$log.plain" || true)" = "0" ]; then
               echo "::error::the inline pin did not print its completion marker (\"$marker\") — a body that returns before its assertions passes libtest while asserting nothing; restore the assertions"
             fi
+            if [ "$(grep -c "test result: FAILED" "$sabotage.plain" || true)" = "0" ]; then
+              echo "::error::the sabotaged run (FRPS_DIR_REGISTRY_TEST_DISCARD=1) passed — the poisoned-registry pin cannot distinguish an emptied registry from the recovered live list, so it asserts nothing; restore its assertions"
+            fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frps bin unit-test guard ok: $n tests listed (expected 1, ${expected}), marker seen, 0 failed"
+          echo "frps bin unit-test guard ok: $n tests listed (expected 1, ${expected}), marker seen, 0 failed, sabotage reds it"
       - name: Run vnet unit tests (nathole membership/cap guards)
         # frps/frpc default features exclude `vnet`, so the default-feature
         # `cargo test --workspace` steps never compile the nathole.rs vnet
