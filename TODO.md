@@ -413,7 +413,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
     auth, and nothing in the reload output mentions auth.
   * **Shape B — swapped without a verifier.** The same, with the token changed too →
     `SIGUSR1: auth token updated`. `reload()` then assigns the whole new `AuthConfig`
-    (`frp-server/src/service.rs:2068-2072`; the item first cited `:2057-2061`, which is the
+    (`frp-server/src/service.rs:1568-1572`; the item first cited `:2057-2061`, which is the
     `allow_ports` arm — corrected when this item was closed), so the live `auth_cfg.method`
     becomes `Oidc`, while
     `state.oidc.verifier` is built **once** at startup (`frp-server/src/service.rs:215`, `if
@@ -4632,7 +4632,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `unix_wait_status(15)`. Two mechanisms, both measured with the helper as the **only** difference
     (40 iterations of the whole file per arm): (a) the SIGTERM task is spawned from the same async
     fn as the accept loop and can be unpolled when the connection is accepted
-    (`frp-server/src/service.rs:1579-1619`); (b) **the load-bearing one** — `ephemeral_port()`
+    (`frp-server/src/service.rs:1079-1119`); (b) **the load-bearing one** — `ephemeral_port()`
     releases its port before the child binds it and tests run in parallel, so the connect witness
     can be satisfied by a *foreign* listener (every failure in both A/B arms had an **empty child
     log** although a connect had succeeded, and one reviewer failure ended in `Address already in
@@ -6767,6 +6767,24 @@ nothing about whether the described behaviour still holds.
   256 KiB then 64 KiB echo, `tcp_mux` off and on) and the `websocket`-without-`kcp` curated CI lane.
   The remaining blocks (HTTP vhost, HTTPS vhost, TCPMux, SSH tunnel gateway, KCP, QUIC, dashboard,
   `tasks.rs`) are tracked in the plan doc, which now records what has landed.
+  **Progress (2026-10-01, code head `88da2d38` on `refactor/extract-kcp-listener`, PR #450).** The
+  second P1 seam landed: `run`'s inline KCP listener block (the `// Start KCP listener if configured`
+  landmark through the block's closing brace) moved byte-for-byte into
+  `frp-server/src/service/listeners.rs` as
+  `pub(super) async fn start_kcp_listener(&self, rate_limiter_enabled: bool)` — 501 payload lines /
+  44 390 bytes `cmp`-identical (sha256
+  `349e49b2d12cede91389630dbd9b5dd9eae0e56b82f935570b82e9785a4a014d`), `frp-server/src/service.rs`
+  2386 → 1886 lines. Unlike the WebSocket seam the extracted block is already reached by shipped
+  lanes (`scripts/protocol-matrix.sh`'s KCP rows and `scripts/compat-test.sh`'s KCP+TLS and
+  KCP+tcpMux scenarios), so the round adds no test; the evidence is the byte-identical move plus
+  those lanes. `mod listeners` is now gated on `any(websocket, kcp)` with a feature gate per method,
+  so a `--no-default-features --features kcp` build still compiles. The cites this
+  move invalidated were repointed — 11 `frp-server/src/service.rs:NNN` occurrences plus the
+  `listeners.rs` cite in the #436 development-log row; cites already stale at base `f881d15e` were
+  left as pre-existing staleness outside this move's scope. The remaining
+  blocks (HTTP vhost, HTTPS vhost, TCPMux, SSH tunnel gateway, QUIC, dashboard, `tasks.rs`) are
+  tracked in the plan doc, which now records this seam as landed too. Ledger at this head:
+  **19 open / 181 closed** — unchanged, the item stays open.
 
   **Progress (2026-10-01, code head `7ff46a60` on `refactor/fileify-vhost-tests`, PR #452, based on
   `f881d15e`, rebased onto `18bcd1ad`).** The P0/P7 split landed: `frp-server/src/vhost.rs`'s inline

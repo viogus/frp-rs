@@ -259,7 +259,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 **Files:**
 - Read: `scripts/compat-test.sh:3848-3947` (KCP test functions)
-- Read: `frp-server/src/service.rs:871-891` (KCP plain V1 dispatch)
+- Read: `frp-server/src/service/listeners.rs:421-441` (KCP plain V1 dispatch)
 - Read: `frp-core/src/kcp.rs:1-190` (KCP stream wrapper)
 
 **Context:** Both KCP Go↔Rust tests fail with "proxy port not reachable". Control login works — `NewWorkConn` handling is the suspected failure point. `KcpCompatSession` in `kcp_compat.rs` is dead code — not wired into any production path. Actual KCP FEC is handled by `rust_tokio_kcp`'s built-in Reed-Solomon.

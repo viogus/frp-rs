@@ -48,9 +48,9 @@ label); each close is a separate necessity judgment. 0 open issues remain.
 Reconciliation confirmed all of these landed after the doc's original scan:
 
 **Parity / protocol**
-- 1.1 V2 full transport wiring — V2 over bare TCP, QUIC, KCP, WebSocket (not just yamux). `frp-client/src/control.rs:178-256`, `frp-server/src/service.rs:289-302,371-376,520-556,1024-1039,1958-1986`
+- 1.1 V2 full transport wiring — V2 over bare TCP, QUIC, KCP, WebSocket (not just yamux). `frp-client/src/control.rs:178-256`, `frp-server/src/service.rs:289-302,371-376,520-556,1458-1486`, `frp-server/src/service/listeners.rs:574-589`
 - 2.1 V2 + QUIC interop — composed; old `control.rs:147` TODO gone. `frp-client/src/control.rs:220-254`
-- 2.2 V2 without yamux (bare TCP) — accept + dial paths. `frp-server/src/service.rs:1958-1986`, `frp-client/src/work_conn.rs:207-269`
+- 2.2 V2 without yamux (bare TCP) — accept + dial paths. `frp-server/src/service.rs:1458-1486`, `frp-client/src/work_conn.rs:207-269`
 - 2.3 `CloseProxyResp` + `Error` V2 type IDs — assigned 19/20, in roundtrip tests. `frp-core/src/msg.rs:57-58,587-588`
 - 1.2 Server plugin hooks Ping/NewWorkConn/NewUserConn — all fire. `frp-server/src/control/mod.rs:1043,525,551`, `handlers.rs:614`
 - 1.3 Virtual Net (L3 VPN) — `frp-vnet` crate behind `vnet` feature
