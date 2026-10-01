@@ -122,7 +122,7 @@ async fn no_ping_before_login_resp_pings_begin_after_registration() {
         // (service.rs: register_proxies Phase 4 -> run_message_loop
         // Phase 6 — pings physically cannot leave before this point, the
         // writer task is not spawned until Phase 5). The heartbeat interval
-        // is armed at login success (service.rs:1690, tokio `interval()`:
+        // is armed at login success (service.rs:1812-1815, tokio `interval()`:
         // tick 1's deadline is the arm instant) and polled for the first
         // time at loop start, so tick 1 fires immediately: Ping#1 must
         // reach the wire ~ms after this write.
@@ -380,7 +380,7 @@ async fn ping_reuses_startup_token_snapshot_when_source_becomes_unreadable() {
             .expect("write LoginResp");
 
         // Oracle-1 immediacy anchor: the client arms its heartbeat interval
-        // when it processes this LoginResp (service.rs:1690, tokio
+        // when it processes this LoginResp (service.rs:1812-1815, tokio
         // `interval()`: tick 1's deadline is the arm instant). This session
         // has no proxies or visitors, so the registration phase
         // (service.rs register_proxies — nothing pending) and the loop
@@ -643,7 +643,7 @@ fn assert_oidc_ping_key(frame: &FrpMessage, token: &str) {
 ///   (2) every Ping carries the raw OIDC token and no timestamp;
 ///   (3) `Ping#2 − T2 ∈ [1.0s, 6.0s]` — the re-armed tick. Nominal 2s; with
 ///       `interval.reset_after(delay)` deleted the interval keeps its 10s
-///       period and the next attempt lands ~10s after T2, so the gap is ~5×
+///       period and the next attempt lands ~10s after T2, so the gap is ~1.7×
 ///       the upper bound — RED. The window is centered on the 2s/10s pair with
 ///       ≥4s of slack on each side, deliberately generous: under host load the
 ///       measured gap can only grow, so the load-sensitive edge is the upper
