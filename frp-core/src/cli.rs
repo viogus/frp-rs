@@ -8657,11 +8657,14 @@ mod help_doc_tests {
     ///
     /// All fifteen are pinned by their **whole text** in `SURFACE_DOCUMENTS`,
     /// compared byte for byte by `every_surface_matches_its_whole_text_pin`; the
-    /// byte counts here are the cheap first check that reports the sizes.
+    /// byte counts here are the cheap first check that reports the sizes, and
+    /// `pinned_surfaces_are_exactly_the_parsers_surfaces` holds the set itself to
+    /// the parser's command set.
     ///
     /// Two of them are Go's document **byte for byte** — the `verify` pair, whose
     /// whole-text pins *are* the Go oracle constants and are additionally
-    /// asserted against the render by `verify_documents_match_go_byte_for_byte`.
+    /// asserted against the render by
+    /// `verify_documents_match_the_go_oracle_after_the_feature_adjustment`.
     /// The other thirteen are *stated replacements*: frp-rs renders cobra's shape
     /// over the flag surface its parser actually accepts, so it never advertises
     /// a flag or a shorthand it does not implement, and never hides one it does.
@@ -9199,23 +9202,66 @@ Global Flags:
         expected
     }
 
-    /// `document` without the row whose long flag is `long`, byte for byte.
+    /// `document` without the row whose long flag is exactly `long`, byte for byte.
     ///
-    /// Panics when the row is absent: the caller only asks for a row the
-    /// full-feature pin is known to carry, so a miss means the pin and the
-    /// feature gate have drifted apart.
+    /// Panics unless **exactly one** line carries that long flag. The caller only
+    /// asks for a row the full-feature pin is known to carry, so zero matches mean
+    /// the pin and the feature gate have drifted apart, and two mean the pin
+    /// renders the row twice and dropping one of them would leave the expectation
+    /// silently wrong.
     fn strip_pinned_row(document: &str, long: &str) -> String {
         let mut stripped = String::with_capacity(document.len());
-        let mut removed = false;
+        let mut removed = 0usize;
         for line in document.split_inclusive('\n') {
-            if line.trim_start().starts_with(long) {
-                removed = true;
+            if row_long_flag(line) == Some(long) {
+                removed += 1;
             } else {
                 stripped.push_str(line);
             }
         }
-        assert!(removed, "the full-feature pin must carry a `{long}` row");
+        assert_eq!(
+            removed, 1,
+            "the full-feature pin must carry exactly one `{long}` row, found {removed}"
+        );
         stripped
+    }
+
+    /// The long flag of one rendered pflag row, if `line` is a row at all:
+    /// `--config` for both `  -c, --config string    config file` and
+    /// `      --config string         config file`, `None` for a heading, a blank
+    /// line, or a wrapped usage continuation.
+    ///
+    /// The non-panicking sibling of [`split_row`]: rows are indented two spaces
+    /// (a shorthand is printed) or six (it is not), and the grid separates the
+    /// head from the usage text with a run of spaces, so the head is everything
+    /// before the first two-space gap. The long flag is the `--…` word of that
+    /// head, compared as a whole token — which is what keeps `--config` from
+    /// matching `--config-dir`.
+    fn row_long_flag(line: &str) -> Option<&str> {
+        let start = line.len() - line.trim_start().len();
+        if start > 6 {
+            return None;
+        }
+        let trimmed = line.trim_start();
+        let head = &trimmed[..trimmed.find("  ").unwrap_or(trimmed.len())];
+        head.split_whitespace().find(|word| word.starts_with("--"))
+    }
+
+    /// A row is taken by its long-flag **token**, not by prefix, and exactly one
+    /// row is taken: `frps` renders both `--config` and `--config-dir`, and a
+    /// prefix match would strip the wrong one.
+    #[test]
+    fn stripping_a_row_matches_the_long_token_and_takes_exactly_one() {
+        let document = "      --config string         config file\n\
+                        \x20     --config-dir string     config directory\n";
+        assert_eq!(
+            strip_pinned_row(document, "--config"),
+            "      --config-dir string     config directory\n"
+        );
+        assert_eq!(
+            strip_pinned_row(document, "--config-dir"),
+            "      --config string         config file\n"
+        );
     }
 
     /// Where a rendered document left its pin: the first line that differs, or
@@ -9238,19 +9284,34 @@ Global Flags:
         )
     }
 
+    /// The two `verify` surfaces are the ones whose pin **is** Go's own document,
+    /// so this asserts them against the Go v0.71.0 oracle directly — through the
+    /// same feature adjustment every other pin gets, because the oracle, too, is
+    /// the full-feature shape and a build without `kcp`/`quic` cannot render the
+    /// two `Global Flags` rows Go prints there.
+    ///
+    /// `frpc` renders neither row, so [`feature_adjusted_pin`] is the identity for
+    /// it and the `frpc` half below is Go's stdout **verbatim in every feature
+    /// shape**. The `frps` half is Go's stdout byte for byte whenever `kcp` and
+    /// `quic` are both compiled in (frp-core's default), and Go's document minus
+    /// exactly those two rows otherwise.
     #[test]
-    fn verify_documents_match_go_byte_for_byte() {
-        // The Go oracle is the full-feature shape too, so it loses exactly the
-        // same two `Global Flags` rows when `kcp`/`quic` are compiled out.
+    fn verify_documents_match_the_go_oracle_after_the_feature_adjustment() {
         assert_eq!(
             surface_document(RootCommand::Frps, Some("verify")),
             feature_adjusted_pin(RootCommand::Frps, GO_FRPS_VERIFY),
-            "frps verify --help must be Go's document, byte for byte"
+            "frps verify --help must be Go's document, byte for byte, once only the rows \
+             this build cannot render are removed"
+        );
+        assert_eq!(
+            feature_adjusted_pin(RootCommand::Frpc, GO_FRPC_VERIFY),
+            GO_FRPC_VERIFY,
+            "frpc renders no feature-gated row, so its pin must never be adjusted"
         );
         assert_eq!(
             surface_document(RootCommand::Frpc, Some("verify")),
-            feature_adjusted_pin(RootCommand::Frpc, GO_FRPC_VERIFY),
-            "frpc verify --help must be Go's document, byte for byte"
+            GO_FRPC_VERIFY,
+            "frpc verify --help must be Go's document, byte for byte, in every feature shape"
         );
     }
 
@@ -9267,7 +9328,8 @@ Global Flags:
             let document = surface_document(root, command);
             if document.len() != expected_len {
                 mismatched.push(format!(
-                    "{label}: {} bytes (pinned {rendered}, Go v0.71.0 {go})",
+                    "{label}: {} bytes, this build expects {expected_len} \
+                     (the full-feature pin is {rendered} bytes, Go v0.71.0 {go})",
                     document.len()
                 ));
             }
@@ -9277,6 +9339,39 @@ Global Flags:
             "the rendered documents changed size; re-measure and update SURFACES:\n{}",
             mismatched.join("\n")
         );
+    }
+
+    /// The pinned surface set is exactly the parser's own command set: the root
+    /// document plus every subcommand [`RootCommand::subcommands`] resolves, each
+    /// pinned exactly once.
+    ///
+    /// `subcommands()` is already pinned against the parser in both directions
+    /// (`the_known_subcommand_list_is_exactly_the_parser_branches`,
+    /// `the_frps_command_list_is_exactly_the_parser_branches`) and against the
+    /// rendered `Available Commands:` by
+    /// `available_commands_are_the_implemented_ones_only`, so this closes the last
+    /// gap: a subcommand the parser grows but `SURFACES` never pins — or pins
+    /// twice — now fails here instead of quietly leaving the new document
+    /// unpinned.
+    #[test]
+    fn pinned_surfaces_are_exactly_the_parsers_surfaces() {
+        for root in [RootCommand::Frps, RootCommand::Frpc] {
+            let mut pinned: Vec<Option<&str>> = SURFACES
+                .iter()
+                .filter(|(_, surface_root, ..)| *surface_root == root)
+                .map(|(_, _, command, ..)| *command)
+                .collect();
+            pinned.sort_unstable();
+            let mut expected: Vec<Option<&str>> = std::iter::once(None)
+                .chain(root.subcommands().iter().copied().map(Some))
+                .collect();
+            expected.sort_unstable();
+            assert_eq!(
+                pinned, expected,
+                "{root:?}: SURFACES must pin the root document and every subcommand \
+                 exactly once"
+            );
+        }
     }
 
     /// Split one pflag row into `(head, long, usage)`: `head` is the flag token
