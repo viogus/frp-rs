@@ -8347,12 +8347,32 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** either a CI job runs `cargo test --release -p frps --test cli_exit_codes` with the three pins
   skipped behind a stated reason (so the lane is honest about what it covers), or the pins become release-runnable.
 
-- [ ] **`frps/src/main.rs:332`'s re-pointed doc link names the wrong loader for the run path it describes.**
+- [x] **`frps/src/main.rs:332`'s re-pointed doc link names the wrong loader for the run path it describes.**
   Filed by the coordinator from PR #431's delta adversarial (F1). The link now resolves to
   `frp_core::config::load_server_config_uncompleted`, but the run path the sentence describes calls
-  `load_server_config_uncompleted_with_presence` at `frps/src/main.rs:964`; the imprecision predates the link fix,
+  `load_server_config_uncompleted_with_presence` at `frps/src/main.rs:967`; the imprecision predates the link fix,
   which only qualified the path.
   **Done-when:** the sentence names the function the run path actually calls (or states the difference deliberately).
+
+  **Done (2026-10-01, at `e4a313b5` on `fix/frps-doclink-loader`, PR #438).** The sentence at
+  `frps/src/main.rs:332` now names `frp_core::config::load_server_config_uncompleted_with_presence`, the function
+  the `-c` single-config run path calls at `frps/src/main.rs:967` (then the flag overlay at `:990` and
+  `cfg.complete()` at `:993`), described as "the presence-carrying form of
+  `load_server_config_uncompleted`, i.e. the completing loader minus `ServerConfig::complete`" — which is literally
+  true: `frp-core/src/config/file.rs:18-25` is `:22 load_server_config_uncompleted(...)?` followed by
+  `:23 cfg.complete();`, while `load_server_config_uncompleted_with_presence` (`file.rs:75`) returns
+  `(cfg, presence)` after `load_config_from_file` plus the transport completion (`file.rs:79-88`), so the only
+  config-side delta is `ServerConfig::complete()`. The map is complete for `frps/src/main.rs` (`verify` →
+  `load_server_config_checked` `:375`; `--config-dir` → `load_server_config_with_presence` `:565`; `-c` run →
+  `:967`); the fourth workspace site (`frp-server/src/service.rs:2331`, the SIGUSR1 reload) is outside the
+  sentence's scope. Verified by both round-1 reviews: the diff is one comment sentence (`+5/−2`, no non-comment
+  token changed), the link resolves and is resolution-sensitive (a typo'd target yields
+  `warning: unresolved link to …` and rc 101 under `RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links"`), and
+  `cargo fmt --all -- --check`, `clippy -p frps --all-targets -D warnings`, `cargo build -p frps` and
+  `bash scripts/repo-health.sh` (`RESULT: invariants hold`) are green. The reviewers' remaining items are the
+  same-class stale attributions outside this sentence (`frps/src/main.rs:960`, `docs/developing.md:1469`,
+  `:1487`, `frps/tests/cli_completion.rs:508-510`) plus the standing note that no CI job runs `cargo doc`.
+  Ledger after this close: **25 open / 161 closed** (base `6420d77a`: 26 open / 160 closed).
 
 - [ ] **The RSS-soak fixture step has no outer pins.** The `health` job runs
   `bash scripts/tests/rss-soak-run-dir.sh` bare (`.github/workflows/ci.yml:135-136`), so a step whose
