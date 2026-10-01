@@ -546,6 +546,20 @@ repository's top ten by code size:
 These are the clearest illustration of why this document exists: **file-size
 ranking would never have found them.**
 
+**Landed so far (server half — PR #454 at code head `c82ab3eb`, based on `f881d15e`):** the
+auth-method split. `authenticate` stays the ordered orchestrator (throttle gate → run_id
+validation → plugin hook → `VerifyLogin` → replay → admit/activate) and the auth work moved into
+two sibling modules of `frp-server/src/control/login.rs` — the same parent-file + child-module
+layout as the landed `frp-server/src/service/listeners.rs` seam, not `mod.rs`:
+`frp-server/src/control/login/throttle.rs` (`pub(super) async fn pre_auth_throttle_gate`,
+`pub(super) async fn throttled_login_error`) and `frp-server/src/control/login/auth.rs`
+(`pub(super) async fn verify_login_auth` plus `verify_oidc_login` / `verify_token_login` /
+`check_token_replay`). `authenticate` 510 → 492 code lines (838 → 811 total),
+`frp-server/src/control/login.rs:645` → `:254`; `frp-server/src/control/login.rs` 3361 → 2943
+lines. Pure move proved mechanically (literal multiset, whole-file token multiset, per-unit body
+identity, strictly-increasing order markers) — see the `TODO.md` progress paragraph. The client
+half (`frp-client/src/work_conn.rs`) is untouched.
+
 *Risk:* medium for `authenticate` (auth ordering, throttle/replay semantics),
 low for the work-conn pair.
 

@@ -6783,6 +6783,21 @@ nothing about whether the described behaviour still holds.
   MERGE-with-findings and their two doc findings are applied in the plan doc. Ledger after the
   rebase onto `18bcd1ad`: **13 open / 189 closed**, plus the one residue item this round files →
   **14 open / 189 closed**.
+  **Progress (2026-10-01, code head `c82ab3eb` on `refactor/split-login-authenticate`, PR #454).**
+  The P5 server half landed: `frp-server/src/control/login.rs::authenticate` split **by auth
+  method** (token / OIDC / replay+throttle), never by reordering, into sibling child modules of
+  the parent file — the `frp-server/src/service.rs` + `frp-server/src/service/listeners.rs`
+  layout, not `mod.rs`. New `frp-server/src/control/login/throttle.rs` (`pub(super) async fn
+  pre_auth_throttle_gate`, `pub(super) async fn throttled_login_error`) and
+  `frp-server/src/control/login/auth.rs` (`verify_login_auth` dispatcher plus `verify_oidc_login`
+  / `verify_token_login` / `check_token_replay`). `authenticate` stays the ordered orchestrator at
+  510 → 492 code lines (838 → 811 total), `frp-server/src/control/login.rs:645` → `:254`;
+  `frp-server/src/control/login.rs` 3361 → 2943 lines. Pure move proved mechanically: the old
+  file's 359 string literals equal the new files' 321 + 32 + 6 with an empty residual multiset,
+  the whole-file token multiset loses **no** token, every extracted body is token-identical to
+  its original statements modulo the enumerated adapter tails, and the order markers inside
+  `authenticate` stay strictly increasing. The client half (`frp-client/src/work_conn.rs`) is
+  untouched; the plan doc records what landed.
 
 - [x] **Three vendored crates are a standing maintenance liability.**
   Evidence: `vendor/rustls` (TLS, patched), `vendor/yamux` (5 patches),
