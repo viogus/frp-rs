@@ -445,6 +445,13 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **The three zero-valued `[log]` CLI flags are pinned by record assertions on both binaries (three on `frps`, the level control on `frpc`), and the `[log]` reference rows now state the measured behaviour.** `--log-level ""`, `--log-file ""` and `--log-max-days 0` mean "not supplied", so the file's `[log] level`/`to`/`max_days` survive on `frps` (the overlay skip) and on `frpc` (the resolver filter).
+  New spawn pins: empty `--log-level` keeps `warn` on both binaries (on `frps` the inert-key `WARN` is present while the banner `INFO` is absent; on `frpc` the pin waits on the `Login failed (attempt 1)` record),
+  `--log-file ""` keeps the configured `logs/frps.log.<date>` with 0 B on stdout, and `--log-max-days 0` keeps a five-day-old rotation file alive
+  under `[log] max_days = 7` while `--log-max-days 3` deletes it. `docs/config.md`'s `[log]` rows are rewritten to Go's two lanes (the `-c` lane
+  discards every CLI log flag; the flags-only lane completes the empty values via `util.EmptyOr`), and both `log_completion` targets now carry
+  the count guard that a cfg-disabled file would otherwise pass with `ok. 0 passed; 0 failed` — the `frpc` step is new (`.github/workflows/ci.yml:712`,
+  `expected=1`) because this change adds that file, while the `frps` step's existing literal is hoisted to the single `expected=9` and moved 6 → 9 for the pins it adds (`:921`).
 - **The `frps` TLS-enable warning capture now pins the record instead of counting it.** `frps/tests/warn_delivery.rs`
   asserted only `occurrences(&out, SERVER_KEY)`, so an emit site that appended a clause
   (`frp-core/src/config/loader.rs:680`) red the `frp-core` captures while `cargo test -p frps --test warn_delivery`

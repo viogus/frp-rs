@@ -4767,6 +4767,13 @@ impl FrpsArgs {
     /// Callers should skip this entirely when
     /// [`cli_overrides_enabled`](FrpsArgs::cli_overrides_enabled) is false
     /// (Go frp v0.70.1 gives the config file precedence when `-c` is given).
+    ///
+    /// The three `[log]` fields are the exception that keeps this overlay from
+    /// being destructive: an explicitly supplied but **empty** `--log-level ""`
+    /// / `--log-file ""`, and an explicitly supplied `--log-max-days 0`, are all
+    /// treated as *not supplied*, so the file's `[log]` value survives. Each is
+    /// Go's `util.EmptyOr` zero value and each would otherwise be filled by
+    /// `LogConfig::complete` before the resolver saw it; see the log arms below.
     pub fn override_server_config(&self, cfg: &mut crate::config::ServerConfig) {
         if let Some(ref v) = self.token {
             cfg.auth.token = v.clone();
@@ -5533,6 +5540,11 @@ mod tests {
 
         let args =
             parse_frps(&["--log-level", "", "--log-file", "", "--log-max-days", "0"]).unwrap();
+        // The zero values still parse as *supplied*: it is the overlay, not the
+        // parser, that treats them as absent.
+        assert_eq!(args.log_level.as_deref(), Some(""));
+        assert_eq!(args.log_file.as_deref(), Some(""));
+        assert_eq!(args.log_max_days, Some(0));
         args.override_server_config(&mut cfg);
         // The real order (`frps/src/main.rs`): override first, then Go's completion.
         cfg.complete();
@@ -5571,6 +5583,33 @@ mod tests {
             cfg.log.format, "",
             "--log-format keeps the raw write-through (no zero-value filter)"
         );
+
+        // A negative `--log-max-days` is explicit on Go too
+        // (`util.EmptyOr(-1, 3)` is `-1`) and must pass through: only the zero
+        // value is filtered. The `=` spelling below is a property of the
+        // raw-argv helpers (`parse_frps`, `parse_frps_run` and the other
+        // test-local `run_inner` call sites), not of the binaries: they hand
+        // tokens straight to `run_inner`, so bpaf sees them raw and refuses the
+        // space form — measured, "`--log-max-days` requires an argument DAYS,
+        // got a flag -1, try `--log-max-days=-1` to use it as an argument". The
+        // binaries accept both spellings, because `prepared_cli_argv` runs
+        // `attach_flag_shaped_values`, which hands a `-`-shaped next token to
+        // any listed value-taking long flag before bpaf sees it
+        // (`VALUE_TAKING_LONG_FLAGS`; see `claims_the_next_token`). No real entry
+        // point reaches the raw path: the two production paths pass
+        // `prepared_cli_argv` output into `run_cli`. Measured on the built
+        // binary: `frps --log-max-days -1` and `frps --log-max-days=-1` both
+        // start the listener and both leave a five-day-old rotation file alive
+        // (`-1` disables cleanup), and `frps --log-max-days -x` fails with
+        // "couldn't parse `-x`: invalid digit found in string" — the token did
+        // arrive as the value.
+        let mut cfg = crate::config::ServerConfig::default();
+        cfg.log.max_days = 5;
+        let args = parse_frps(&["--log-max-days=-1"]).unwrap();
+        args.override_server_config(&mut cfg);
+        // The real order (`frps/src/main.rs`): override first, then Go's completion.
+        cfg.complete();
+        assert_eq!(cfg.log.max_days, -1, "only the zero value is filtered");
     }
 
     #[test]

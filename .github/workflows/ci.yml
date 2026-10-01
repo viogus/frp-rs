@@ -682,6 +682,55 @@ jobs:
         # cold no-feature graph, with the integration file compiled to 0 tests.
         # The runner was not measured.
         run: cargo test -p frpc
+      - name: Run frpc's log-completion spawn test (the client control)
+        # `frpc/tests/log_completion.rs` is the **control** for the empty-CLI-value
+        # rule the `frps` log-completion step below pins. The client has never
+        # overlaid its flags onto the loaded config — `frpc/src/main.rs:367-371`
+        # passes `cli.log_level` straight to `resolve_log_level` — so "an empty
+        # `--log-level` leaves the file's `[log] level` alone" is the outcome it
+        # has always had, on both the `-c` and the `--config-dir` lane. The file
+        # makes that an executable contract: a future "alignment" that gives
+        # `frpc` the `frps` overlay goes red rather than silently agreeing.
+        #
+        # Why this is its own step: the plain `cargo test -p frpc` step above
+        # **does** execute the file, but nothing there notices if the file stops
+        # running. It is `#![cfg(feature = "full")]` (the `frpc` bin requires
+        # `full`), so a `--no-default-features` invocation — or any edit that
+        # neuters the gate — compiles it to 0 tests, prints
+        # `test result: ok. 0 passed; 0 failed` and exits **0**. Measured: the
+        # bare invocation cannot tell "1 passed" from "0 ran". That is exactly
+        # the hole `ci.yml`'s `frps` log-completion guard closes for its own
+        # file, and the same `#![cfg(feature = "full")]` note the step above
+        # carries for `frpc/tests/admin_cli.rs`.
+        #
+        # The literal is a property of the *file* (one `#[test]`), not a shared
+        # env value: `env.FRPC_TINY_CLI_TESTS` counts `frpc/tests/cli_exit_codes.rs`
+        # and must not be moved for this target.
+        shell: bash
+        run: |
+          set -eo pipefail
+          expected=1
+          log=/tmp/frpc-log-completion-tests.log
+          cargo test -p frpc --test log_completion --color never 2>&1 | tee "$log"
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+          n=$(cargo test -p frpc --test log_completion --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          status=0
+          grep -q "Running tests/log_completion.rs" "$log.plain" || status=1
+          grep -q "test result: ok. $expected passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "$expected" ] || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::frpc log-completion guard failed (status=$status, file=$n, expected=$expected, log=$log)"
+            if [ -n "$n" ] && [ "$n" != "$expected" ]; then
+              if [ "$n" -lt "$expected" ]; then
+                echo "::error::frpc/tests/log_completion.rs lists $n tests, *fewer* than the expected $expected — the file was disabled or tests were deleted (it is \`#![cfg(feature = \"full\")]\`-gated, so a feature change compiles it to 0 tests); restore them rather than lowering this literal"
+              else
+                echo "::error::frpc/tests/log_completion.rs lists $n tests, *more* than the expected $expected — tests were added: move the single literal in this shell step from $expected to $n"
+              fi
+            fi
+            cat "$log.plain"
+            exit 1
+          fi
+          echo "frpc log-completion guard ok: $n tests listed (expected $expected), 0 failed"
       - name: Run frps CLI tests (config-failure exit codes)
         # The `frps` sibling of the step above. No lane ran the
         # `frps/tests/cli_exit_codes.rs` *integration* target before this step:
@@ -849,40 +898,48 @@ jobs:
         # pinned); this step does not set it.
         #
         # **This step asserts the count, because a bare `cargo test --test <f>`
-        # cannot tell "6 passed" from "0 ran".** Measured: with the file's
+        # cannot tell "9 passed" from "0 ran".** Measured: with the file's
         # cfg gate mutated to a feature that does not exist (the disable
         # mutation), the plain invocation prints `running 0 tests` /
         # `test result: ok. 0 passed; 0 failed` and exits **0** — a gate quieter
         # than the `cli_exit_codes` step beside it, which is why this one repeats
         # that step's three checks (the target ran; the summary says
-        # `ok. 6 passed; 0 failed`; `-- --list` counts 6). The literal is a
+        # `ok. 9 passed; 0 failed`; `-- --list` counts 9). The literal is a
         # property of the *file*, not a shared env value: it lives here, next to
         # the invariant it guards, because `env.FRPS_CLI_TESTS` counts a
         # different target and must not be moved for this one.
+        #
+        # The literal moved 6 → 7 when the empty-`--log-level` pin landed and
+        # 7 → 9 with the two sibling zero-value pins (`--log-file ""` and
+        # `--log-max-days 0`, both arbited by Go's `-c` lane — see the file's own
+        # section comments). It is the count of `#[test]`s in that one file, and
+        # it lives in exactly one place in this step — the `expected=` line — so
+        # a new pin means editing one number, not hunting a duplicated one.
         shell: bash
         run: |
           set -eo pipefail
+          expected=9
           log=/tmp/frps-log-completion-tests.log
           cargo test -p frps --features dashboard --test log_completion --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           n=$(cargo test -p frps --features dashboard --test log_completion --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/log_completion.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 6 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "6" ] || status=1
+          grep -q "test result: ok. $expected passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "$expected" ] || status=1
           if [ "$status" != "0" ]; then
-            echo "::error::frps log-completion guard failed (status=$status, file=$n, log=$log)"
-            if [ -n "$n" ] && [ "$n" != "6" ]; then
-              if [ "$n" -lt "6" ]; then
-                echo "::error::frps/tests/log_completion.rs lists $n tests, this step expects 6 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
+            echo "::error::frps log-completion guard failed (status=$status, file=$n, expected=$expected, log=$log)"
+            if [ -n "$n" ] && [ "$n" != "$expected" ]; then
+              if [ "$n" -lt "$expected" ]; then
+                echo "::error::frps/tests/log_completion.rs lists $n tests, *fewer* than the expected $expected — tests were deleted or the file was disabled; restore them rather than lowering the \`expected=\` line of this step"
               else
-                echo "::error::frps/tests/log_completion.rs lists $n tests, this step expects 6: move the single literal in this shell step from 6 to $n"
+                echo "::error::frps/tests/log_completion.rs lists $n tests, *more* than the expected $expected — tests were added: bump the single \`expected=\` line of this step from $expected to $n"
               fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frps log-completion guard ok: $n tests listed (expected 6), 0 failed"
+          echo "frps log-completion guard ok: $n tests listed (expected $expected), 0 failed"
       - name: Run frps's `web_server.tls.enable` warning-delivery spawn tests
         # `frps/tests/warn_delivery.rs` pins what a **user** sees when a config
         # writes `[web_server.tls] enable`: the diagnostic must reach stdout on
