@@ -803,9 +803,7 @@ $ bash scripts/compat-test.sh --test rust-to-rust-mytcp-plain
 [LOG] === rust-to-rust-mytcp-plain ===
 [PASS] rust-to-rust-mytcp-plain
 ...
-=============================================
  RESULTS: 1 passed, 0 failed
-=============================================
 
 All tests passed!
 $ echo $?
@@ -822,9 +820,7 @@ function names:
 $ bash scripts/compat-test.sh --list | grep mytcp
 test_r2r_mytcp_plain
 $ bash scripts/compat-test.sh --test test_r2r_mytcp_plain     # WRONG: function name
-=============================================
  RESULTS: 0 passed, 0 failed
-=============================================
 
 All tests passed!
 $ echo $?
