@@ -507,8 +507,8 @@ fn cli_empty_log_file_keeps_logging_on_stdout() {
 // `[web_server.tls] enable = true`: the inert-key warning is a `WARN` record
 // emitted on every build right after `init_logging`
 // (`presence.warn_inert_web_server_tls_enable`, called at
-// `frps/src/main.rs:1007`), while the startup marker is an `INFO` record
-// (`frps/src/main.rs:1013`). So
+// `frps/src/main.rs:1034`), while the startup marker is an `INFO` record
+// (`frps/src/main.rs:1040`). So
 // "`web_server.tls.enable has no effect` present **and** `frps (Rust) v` absent"
 // pins the effective level at *exactly* `warn`: `info` would add the marker,
 // `error` would drop the warning.
@@ -650,6 +650,77 @@ fn cli_empty_log_level_does_not_raise_the_files_warn() {
     }
 }
 
+// ── `-c <file>`: the file is authoritative for the whole `[log]` section ─────
+//
+// R1 (`TODO.md:8705`). On Go's `-c` lane the pflag-bound struct is discarded
+// wholesale — `cmd/frps/root.go:67-83` takes the file branch, so `runServer` at
+// `cmd/frps/root.go:112` inits the logger from the *file's* `cfg.Log` — and
+// `frps -c frps.toml --log-level info` over a file with `[log] level = "warn"`
+// therefore prints **0** records. Pre-fix, frp-rs gated only
+// `override_server_config` on `cli_overrides_enabled` (`frps/src/main.rs:1016-1018`)
+// while `init_logging` (`frps/src/main.rs:1021`) still read the raw CLI value:
+// measured on that binary the same argv printed **11** `INFO` records (2434 B)
+// and `--log-level debug` printed 11 `INFO` + 3 `DEBUG` (2860 B), while the
+// no-flag control printed 0 B. `init_logging` now masks the four CLI log flags
+// whenever a `-c` config was loaded.
+//
+// Reverting the mask (an `init_logging` that always reads the CLI) reds arm 1
+// below inside `assert_exactly_warn`'s startup-marker assertion with 11 `INFO`
+// records on stdout; arms 2 and 3 stay green — measured on that reverted binary,
+// `-c frps.toml` prints 231 B / 0 `INFO` / 1 `WARN` and the implicit lane prints
+// 2434 B / 11 `INFO`. That pair is what distinguishes "the flag was ignored" from
+// "the whole `[log]` section was ignored".
+
+/// **The pin:** with `-c`, a non-empty `--log-level` is discarded like every
+/// other CLI config flag — the file's `[log] level = "warn"` stands.
+#[test]
+fn cli_nonempty_log_level_flag_does_not_override_the_config_file() {
+    // Arm 1: the flag under test, on the `-c` lane. `Spawned::start` runs the
+    // child in a scratch dir holding `./frps.toml`, which is what the relative
+    // `-c frps.toml` resolves against.
+    let port = free_port();
+    let cfg = level_config(port, "warn");
+    {
+        let spawned = Spawned::start(&cfg, &["-c", "frps.toml", "--log-level", "info"]);
+        assert_loopback_listens(port);
+        std::thread::sleep(SETTLE);
+        assert_exactly_warn("-c frps.toml --log-level info", &spawned);
+    }
+
+    // Arm 2: the same config and lane with the flag omitted. The two arms must
+    // look identical if and only if the flag is genuinely ignored here.
+    let port = free_port();
+    let cfg = level_config(port, "warn");
+    {
+        let spawned = Spawned::start(&cfg, &["-c", "frps.toml"]);
+        assert_loopback_listens(port);
+        std::thread::sleep(SETTLE);
+        assert_exactly_warn("-c frps.toml (control)", &spawned);
+    }
+
+    // Arm 3: the *implicit* lane's own control. The same flag without `-c` must
+    // still raise the level — that is the override #427 kept and the contract at
+    // `frp-core/src/cli.rs:4779-4786`, and it is what proves the mask is scoped
+    // to the `-c` lane rather than disabling the CLI log flags wholesale.
+    let port = free_port();
+    let cfg = level_config(port, "warn");
+    {
+        let spawned = Spawned::start(
+            &cfg,
+            &["--bind-port", &port.to_string(), "--log-level", "info"],
+        );
+        assert_loopback_listens(port);
+        std::thread::sleep(SETTLE);
+        let out = spawned.stdout();
+        assert!(
+            out.contains(STARTUP_MARKER),
+            "implicit lane: a non-empty flag must still raise the level; no \
+             `{STARTUP_MARKER}` record on stdout\n--- stdout ({} B) ---\n{out}",
+            out.len(),
+        );
+    }
+}
+
 // ── `--log-max-days 0` / `[log] max_days = 0`: the retention observable ──────
 //
 // The item's third field has one **synchronous** observable, and it is not a
@@ -720,12 +791,12 @@ fn fresh_rotation_file(dir: &TempDir) -> Option<PathBuf> {
 }
 
 /// True when the fresh rotation file already carries the record `frps` writes
-/// **after** `init_logging` returns ([`STARTUP_MARKER`], `frps/src/main.rs:317`).
+/// **after** `init_logging` returns ([`STARTUP_MARKER`], `frps/src/main.rs:1040`).
 ///
 /// Mere existence is not evidence that anything ran: `tracing_appender::rolling::daily`
 /// creates `logs/frps.log.<date>` eagerly when it is constructed
-/// (`frp-core/src/logging.rs:378`), *before* the subscriber is installed and
-/// before `cleanup_expired_logs` runs (`frp-core/src/logging.rs:401-402`). A
+/// (`frp-core/src/logging.rs:443`), *before* the subscriber is installed and
+/// before `cleanup_expired_logs` runs (`frp-core/src/logging.rs:467`). A
 /// probe that stops at the file's appearance can therefore read the aged file's
 /// fate too early — measured on this host at load average ~40, 2 of 10 runs
 /// failed a retention assertion although the cleanup deletes the file a moment
@@ -990,7 +1061,7 @@ fn max_days_zero_does_not_disable_cleanup_on_the_cli_or_in_the_file() {
 /// pre-fix predicate — `fresh_rotation_file(dir).is_some()` — as
 /// [`fresh_log_reached_appender`]'s body: the first assertion then fails at
 /// this test's `assert!` line, because `rolling::daily` has already created the
-/// empty file (`frp-core/src/logging.rs:378`) while nothing has been written to
+/// empty file (`frp-core/src/logging.rs:443`) while nothing has been written to
 /// it; (2) drop the `frps.log.2020-01-01` exclusion from
 /// [`fresh_rotation_file`]: the second assertion fails, since `files_in` sorts
 /// and the aged fixture comes first; (3) delete the `spawned.exited()` arm in
@@ -1009,7 +1080,7 @@ fn readiness_gate_needs_the_appenders_own_record() {
     assert!(
         !fresh_log_reached_appender(&dir),
         "an empty rotation file must not satisfy the readiness gate — the file exists from \
-         `frp-core/src/logging.rs:378`, before `cleanup_expired_logs` decides anything"
+         `frp-core/src/logging.rs:443`, before `cleanup_expired_logs` decides anything"
     );
     assert_eq!(
         fresh_rotation_file(&dir),

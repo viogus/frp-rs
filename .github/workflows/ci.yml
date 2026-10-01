@@ -1031,21 +1031,23 @@ jobs:
         # `test result: ok. 0 passed; 0 failed` and exits **0** — a gate quieter
         # than the `cli_exit_codes` step beside it, which is why this one repeats
         # that step's three checks (the target ran; the summary says
-        # `ok. 9 passed; 0 failed`; `-- --list` counts 9). The literal is a
+        # `ok. 10 passed; 0 failed`; `-- --list` counts 10). The literal is a
         # property of the *file*, not a shared env value: it lives here, next to
         # the invariant it guards, because `env.FRPS_CLI_TESTS` counts a
         # different target and must not be moved for this one.
         #
-        # The literal moved 6 → 7 when the empty-`--log-level` pin landed and
+        # The literal moved 6 → 7 when the empty-`--log-level` pin landed,
         # 7 → 9 with the two sibling zero-value pins (`--log-file ""` and
         # `--log-max-days 0`, both arbited by Go's `-c` lane — see the file's own
-        # section comments). It is the count of `#[test]`s in that one file, and
+        # section comments), and 9 → 10 with the `-c`-lane non-empty-flag pin
+        # `cli_nonempty_log_level_flag_does_not_override_the_config_file`
+        # (`TODO.md:8705`). It is the count of `#[test]`s in that one file, and
         # it lives in exactly one place in this step — the `expected=` line — so
         # a new pin means editing one number, not hunting a duplicated one.
         shell: bash
         run: |
           set -eo pipefail
-          expected=9
+          expected=10
           log=/tmp/frps-log-completion-tests.log
           cargo test -p frps --features dashboard --test log_completion --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
