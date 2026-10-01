@@ -403,7 +403,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=d59194f48fe1594582286a86111bbd9cc3d08024f32ce44bd998ac774f547a42
+          guard_pin=977aec65da3f0df4cfc96c8164141c1579c679a2e0d5266403e2e942a21f93be
           # R12-1 (adversarial round 13): the enforcer's *implementation* lives in
           # the library the scenarios `source` (the `LIB=` assignment at :96 only
           # names it), so pinning only the suite left the "two-file change" claim

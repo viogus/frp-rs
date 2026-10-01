@@ -203,8 +203,8 @@ fails=0
 # suite printing `FAIL  pinned-region set changed: …` and still exiting 0 with
 # `RESULT: 40 fixture check(s) hold` (measured). The call is not repaired here —
 # it stays declared — but the `Stray guard` CI step now rejects a log line
-# starting with `FAIL` or `  FAIL` (the two shapes the suites emit: this suite at
-# column 0, the sibling's `bad()` with two leading spaces), so that mutant reds in
+# starting with `FAIL` or `  FAIL` (the two shapes the suites print: a column-0
+# `FAIL` from the region checks, and `bad()`'s two-space `  FAIL`), so that mutant reds in
 # CI even with the caller neutered (measured), and an un-neutered failure is fatal
 # in both places. The net is prefix-literal, deliberately not a substring match:
 # the sibling's honest run prints two `  ok` sentences containing the word
