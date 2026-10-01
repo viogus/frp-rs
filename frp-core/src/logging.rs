@@ -118,9 +118,9 @@ pub fn resolve_log_level(
 /// means a rolling file at `path`. The CLI value wins over the config value.
 ///
 /// An **empty** CLI value counts as *not supplied*, the same rule as
-/// [`resolve_log_level`]: `--log-file ""` must mean "use the config", i.e.
-/// `console` in every default shape — not "roll a file at the empty path".
-/// Measured on the pre-fix frp-rs binary: `--log-file ""` → 0 B stdout /
+/// [`resolve_log_level`]: `--log-file ""` must mean "use the config's `to`"
+/// (which is `console` in every default shape), not "roll a file at the empty
+/// path". Measured on the pre-fix frp-rs binary: `--log-file ""` → 0 B stdout /
 /// 0 B stderr **and** a `frps.log.<date>` created in the CWD, because the empty
 /// path reached `tracing_appender::rolling::daily` (whose `file_name()` is
 /// `None`, so it fell back to the default log name). Go v0.71.0 with
@@ -136,6 +136,24 @@ pub fn resolve_log_level(
 /// print and no log file is created in the CWD (that lane passes no CLI flag, so
 /// the branch's filter cannot change it). The defect this filter closes is the
 /// flag arm.
+///
+/// **The empty CLI value is filtered twice, and the second filter is what
+/// makes the file's destination survive.** `FrpsArgs::override_server_config`
+/// (`frp-core/src/cli.rs`) skips an empty `--log-file ""`, so the loaded file's
+/// `to` reaches this function; without that skip, `LogConfig::complete` would
+/// fill the clobbered `""` with the concrete `"console"`
+/// (`EmptyOr(c.To, "console")`, `pkg/config/v1/common.go:120`) and this filter
+/// would fall through to the completed value instead of the file's. Measured at
+/// head with `[log] to = "logs/frps.log"`: no CLI flag → 0 B stdout and
+/// `logs/frps.log.<date>` written; `--log-file ""` → the same file lane and 0 B
+/// stdout (pre-fix: 2735 B stdout and `logs/` never created).
+///
+/// Go's `-c` lane arbitrates this field the same way — measured `frps -c
+/// cfg.toml --log_file ""` → stdout 0 B with the configured file written — so
+/// the file's destination governs on every lane that has a config file. Go's
+/// *flags-only* lane has no file value to preserve and completes its empty flag
+/// to `"console"` (measured `--log_file ""` byte-identical to omitting it,
+/// 282 B / 3 `INFO` records), which is what this filter produces there too.
 pub fn resolve_log_file(cli_file: Option<String>, cfg_file: &str) -> Option<String> {
     cli_file.filter(|f| !f.is_empty()).or_else(|| {
         if cfg_file.is_empty() || cfg_file == "console" {
@@ -183,13 +201,16 @@ pub fn resolve_log_file(cli_file: Option<String>, cfg_file: &str) -> Option<Stri
 /// `MaxDays` disables cleanup" is Go-true as well.
 ///
 /// The frp-rs observable **is** synchronous startup cleanup (`init_tracing`
-/// calls [`cleanup_expired_logs`] before the process serves): measured with a
-/// backdated `logs/frps.log.2020-01-01` and `[log] to = "logs/frps.log"`, the
-/// pre-fix binary left the file in place under `--log-max-days 0` (cleanup
-/// disabled) while the default, `--log-max-days 3`, `5` and the config-file
-/// `max_days = 0` all deleted it. Only the zero value is filtered: a negative
-/// CLI value is explicit on Go too (`util.EmptyOr(-1, 3)` is `-1`, cleanup
-/// disabled) and passes through.
+/// calls [`cleanup_expired_logs`] before the process serves). Measured at head
+/// with a backdated `logs/frps.log.2020-01-01` whose mtime is five days old and
+/// `[log] to = "logs/frps.log"` + `max_days = 7`: the fixture **survives** both
+/// with no flag and with `--log-max-days 0` — the overlay skips the zero, so the
+/// file's 7 governs — and is **deleted** by `--log-max-days 3`, a non-zero value
+/// that still wins. With no `[log] max_days` key in the file, the absent key
+/// takes serde's default 3 and `--log-max-days 0` deletes the same fixture, so
+/// the flag is observationally absent there too. Only the zero value is filtered:
+/// a negative CLI value is explicit on Go too (`util.EmptyOr(-1, 3)` is `-1`,
+/// cleanup disabled) and passes through.
 pub fn resolve_log_max_days(cli_max_days: Option<i32>, cfg_max_days: Option<i32>) -> i32 {
     cli_max_days
         .filter(|d| *d != 0)

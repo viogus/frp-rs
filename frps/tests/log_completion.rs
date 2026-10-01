@@ -52,12 +52,27 @@
 //! sides of the completion fix, which changed retention only (and not `to = ""` at
 //! all).
 //!
+//! A later fix sits one layer **above** completion and is pinned by the
+//! `cli_empty_log_level_does_not_raise_the_files_warn`,
+//! `cli_empty_log_file_keeps_the_files_destination` and
+//! `cli_zero_log_max_days_keeps_the_files_retention` sections below:
+//! `FrpsArgs::override_server_config` (`frp-core/src/cli.rs`) now treats every
+//! zero value in the three Go `[log]` CLI fields as "flag not supplied" — an
+//! empty `--log-level ""`, an empty `--log-file ""` and an explicit
+//! `--log-max-days 0` leave the loaded file's `[log]` value in place, so
+//! completion has nothing to fill and nothing outranks the file. The rows above
+//! all use a config *without* `[log] level`/`file`/`max_days`, which is why they
+//! are unchanged by it — there the completion fills the empty/zero value exactly
+//! as Go's `EmptyOr` does. Go's `-c` lane arbitrates all three (the Go table is
+//! in the level section below); only the `--log-max-days` retention *observable*
+//! has no Go startup counterpart, which that section says explicitly.
+//!
 //! **What this file models.** The end-to-end effect on the two streams and on the
 //! CWD for the shipped `frps` binary, over two lanes: the config-file lane
 //! (`-c`, which is where Go also completes a fresh struct,
 //! `pkg/config/load.go:313-321`) and the CLI-override lane (no `-c`; frp-rs's
-//! `cli_overrides_enabled` + `override_server_config`, which writes the flag
-//! value into the struct **before** `cfg.complete()` runs).
+//! `cli_overrides_enabled` + `override_server_config`, which writes a non-zero
+//! flag value into the struct **before** `cfg.complete()` runs).
 //!
 //! **What it panics on.** (1) The child exiting before its post-`init_logging`
 //! startup line appears, (2) the startup line never appearing within
@@ -80,7 +95,8 @@
 //! (302 B). The byte figures in the table above are therefore measured with
 //! `lsof` as the liveness probe (see `/tmp/log-complete-report.md`), and this
 //! file asserts *content* (the startup marker is present), never a byte count. It does not cover `--log-format`
-//! (frp-rs-only; Go answers `unknown flag`), the `--config-dir` lane, or `frpc`.
+//! (frp-rs-only; Go answers `unknown flag`) or the `--config-dir` lane; the
+//! `frpc` control lives in `frpc/tests/log_completion.rs`.
 //! It deliberately does **not** set `RUST_LOG`: that variable outranks the
 //! configured level in `logging::filter_from_env`, so setting it would mask
 //! exactly the defect under test (the sibling file
@@ -420,9 +436,13 @@ fn cli_empty_log_level_still_logs() {
     assert_logged_and_listening("cli --log-level \"\"", &spawned, port);
 }
 
-/// **CLI-override lane, the file half**: `--log-file ""` must resolve to
-/// `console` (stdout) and must not create `frps.log.<date>`. `--log-max-days 0`
-/// rides along so the third Go field is exercised in the same spawn.
+/// **CLI-override lane, the file half, with no `[log] file` in the config**:
+/// `--log-file ""` is treated as *not supplied*, so the file's own value governs
+/// — here that is serde's default `"console"`, so the shape logs on stdout and
+/// must not create `frps.log.<date>`. `--log-max-days 0` rides along for the
+/// same reason (it too is skipped, and the file's default `3` governs). The
+/// discriminating file shape — a config that *names* a destination — is
+/// `cli_empty_log_file_keeps_the_files_destination` below.
 #[test]
 fn cli_empty_log_file_keeps_logging_on_stdout() {
     let port = free_port();
@@ -442,6 +462,186 @@ fn cli_empty_log_file_keeps_logging_on_stdout() {
     assert_no_log_file_created("cli --log-file \"\"", &spawned);
 }
 
+// ── the three `[log]` CLI zero values are "flag not supplied" ───────────────
+//
+// The lane matrix above ends at completion. This section pins the **overlay**
+// one layer up: `FrpsArgs::override_server_config` (`frp-core/src/cli.rs`) writes
+// CLI values into the struct before `cfg.complete()` runs, so an empty
+// `--log-level ""` used to overwrite the file's `[log] level` with `""` and
+// completion then filled it to `"info"` — *raising* the level. The same rewrite
+// corrupted the two sibling fields: an empty `--log-file ""` became the concrete
+// `"console"` and an explicit `--log-max-days 0` became `3`, each outranking the
+// file it was supposed to leave alone.
+//
+// Go's `-c` lane discards every CLI flag outright (`cmd/frps/root.go:66-84` loads
+// the file into a fresh struct and never merges the flag-bound `serverCfg`), so
+// it arbitrates all three — measured on the real v0.71.0 binary, own free port,
+// both streams captured, before any signal:
+//
+// | Go row | stdout | the file |
+// |---|---|---|
+// | `frps -c cfg(level=warn) --log_level ""` | 0 B | — (level stayed `warn`) |
+// | `frps -c cfg(level=warn)` | 0 B | — |
+// | `frps -c cfg(to=<dir>/frps-out.log) --log_file ""` | 0 B | 3 `INFO` written |
+// | `frps -c cfg(to=<dir>/frps-out.log)` | 0 B | 3 `INFO` written (byte-identical) |
+// | `frps -c cfg(to=…, maxDays=7) --log_max_days 0` + 5-day-old fixture | 0 B | fixture survives |
+// | `frps -c cfg(to=…, maxDays=7)` + 5-day-old fixture | 0 B | fixture survives |
+//
+// The file-row byte total is **not** a constant and is deliberately not quoted:
+// the first record echoes the `-c` path (`frps uses config file: <path>`,
+// `cmd/frps/root.go:115`), so the same file measures 300 B with the absolute
+// `-c` path of a scratch dir and 237 B with a relative one. What is constant —
+// and what arbitrates the flag — is stdout 0 B, three `INFO` records, and the
+// byte-for-byte identity of the two rows.
+//
+// The last two rows are the honest edge: Go's retention sweep is **midnight-only**
+// (`golib@v0.8.2/log/output_rotatefile.go:103`), so no Go lane can *observe* a
+// retention difference at startup. `--log-max-days 0` is Go-parity by
+// construction there — the flag is discarded on the `-c` lane — and the arm
+// below is stated as an observable pin of *our* rule, not as a Go measurement.
+// `frpc` has no overlay at all, so its resolver's existing empty-CLI filter
+// already keeps the file's value; that is pinned as a *control* in
+// `frpc/tests/log_completion.rs`.
+//
+// The level's discriminating shape is `[log] level = "warn"` plus a written
+// `[web_server.tls] enable = true`: the inert-key warning is a `WARN` record
+// emitted on every build right after `init_logging`
+// (`presence.warn_inert_web_server_tls_enable`, called at
+// `frps/src/main.rs:1007`), while the startup marker is an `INFO` record
+// (`frps/src/main.rs:1013`). So
+// "`web_server.tls.enable has no effect` present **and** `frps (Rust) v` absent"
+// pins the effective level at *exactly* `warn`: `info` would add the marker,
+// `error` would drop the warning.
+//
+// Measured at head **with `--features dashboard`** (the CI feature shape — the
+// inert-key clause is longer there than on the default build,
+// `frp-core/src/config/loader.rs:337-354`), at the observation point the test
+// itself uses: one loopback `TcpStream::connect` (`assert_loopback_listens`)
+// followed by [`SETTLE`], both streams read **before** the child is signalled.
+// (A run with *zero* connects gives 268 B / 235 B and **one** `WARN`; the
+// post-`SIGTERM` shutdown records are excluded throughout.)
+//
+// | arm | stdout | records |
+// |---|---|---|
+// | `level = "warn"` + `--log-level ""` | 570 B / 472 B | 2 `WARN`, 0 `INFO`, marker absent |
+// | `level = "warn"`, no flag | 570 B / 472 B | 2 `WARN`, 0 `INFO`, marker absent |
+// | `level = "error"` + `--log-level ""` | 0 B | none |
+// | `level = "warn"` + `--log-level info` (arm 3) | 2068 B / 1403 B | 7 `INFO` + 2 `WARN`, marker present |
+//
+// The `info` arm is the falsification control that proves the marker exists in
+// this config shape, so its absence above is the file's `warn` rather than a
+// missing record. Reverting the empty-value rule reds arm 1 on the marker
+// assertion: the flag writes `""` into `[log] level`, completion fills it to
+// `"info"`, and arm 1 becomes byte-for-byte the `info` arm (2068 B / 1403 B,
+// 7 `INFO` + 2 `WARN`) instead of 0 `INFO`.
+//
+// Why this table quotes *pre-signal* counts: the same run read to EOF after
+// `SIGTERM` measures 3004 B / 1967 B and **11** `INFO` records, because the
+// graceful-shutdown sequence adds four more of them (`Received SIGTERM,
+// initiating graceful shutdown...`, `Accept loop stopped...`, `Draining 0 active
+// connections...`, `All connections drained in 0.0s`). Counting after the signal
+// is what produced the older "11 `INFO`" figures.
+
+/// The inert-key `WARN` that `[web_server.tls] enable = true` produces on every
+/// build. Its text varies by build (`frps/tests/warn_delivery.rs` pins the three
+/// clauses apart); the shared first half is stable and is all this file needs.
+const INERT_TLS_WARN: &str = "web_server.tls.enable has no effect";
+
+/// `[log] level = "{level}"` and the inert-key warning switched on, on its own
+/// port so the two arms can run back to back without racing for the bind.
+fn level_config(port: u16, level: &str) -> String {
+    config(
+        port,
+        &format!("\n[log]\nlevel = \"{level}\"\n\n[web_server.tls]\nenable = true\n"),
+    )
+}
+
+/// Assert, from the emitted records alone, that the effective level is exactly
+/// the file's `warn`: a `WARN` record was admitted and no `INFO` record was.
+fn assert_exactly_warn(tag: &str, spawned: &Spawned) {
+    let out = spawned.stdout();
+    let err = spawned.stderr();
+    assert!(
+        out.contains(INERT_TLS_WARN),
+        "{tag}: no `{INERT_TLS_WARN}` WARN record reached stdout, so the \
+         effective level is not the file's `warn` (or nothing logged)\n\
+         --- stdout ({} B) ---\n{out}\n--- stderr ({} B) ---\n{err}",
+        out.len(),
+        err.len(),
+    );
+    assert!(
+        !out.contains(STARTUP_MARKER),
+        "{tag}: the `{STARTUP_MARKER}` startup marker appeared, so the effective \
+         level fell to `info` — the empty flag raised it above the file's `warn`\n\
+         --- stdout ({} B) ---\n{out}\n--- stderr ({} B) ---\n{err}",
+        out.len(),
+        err.len(),
+    );
+    assert!(
+        !out.contains(" INFO"),
+        "{tag}: an INFO record reached stdout, so the effective level is not \
+         the file's `warn`\n--- stdout ({} B) ---\n{out}",
+        out.len(),
+    );
+    assert!(
+        err.is_empty(),
+        "{tag}: stderr must stay empty, got {} B:\n{err}",
+        err.len()
+    );
+}
+
+/// **The pin:** an explicitly supplied but empty `--log-level ""` is not a
+/// level — it leaves the file's `[log] level = "warn"` alone, so the two
+/// binaries agree and the empty flag is observationally absent.
+#[test]
+fn cli_empty_log_level_does_not_raise_the_files_warn() {
+    // Arm 1: the flag under test.
+    let port = free_port();
+    let cfg = level_config(port, "warn");
+    {
+        let spawned = Spawned::start(&cfg, &["--bind-port", &port.to_string(), "--log-level", ""]);
+        assert_loopback_listens(port);
+        std::thread::sleep(SETTLE);
+        assert_exactly_warn("--log-level \"\"", &spawned);
+    }
+
+    // Arm 2: the same config with the flag omitted. The empty flag's *presence*
+    // must make no difference, which is what "treated as not supplied" means.
+    let port = free_port();
+    let cfg = level_config(port, "warn");
+    {
+        let spawned = Spawned::start(&cfg, &["--bind-port", &port.to_string()]);
+        assert_loopback_listens(port);
+        std::thread::sleep(SETTLE);
+        assert_exactly_warn("no flag (control)", &spawned);
+    }
+
+    // Arm 3: the marker's own control. A *non-empty* flag still wins, which
+    // proves both that the marker is emitted at `info` in this config shape and
+    // that the overlay was not disabled wholesale.
+    let port = free_port();
+    let cfg = level_config(port, "warn");
+    {
+        let spawned = Spawned::start(
+            &cfg,
+            &["--bind-port", &port.to_string(), "--log-level", "info"],
+        );
+        assert_loopback_listens(port);
+        std::thread::sleep(SETTLE);
+        let out = spawned.stdout();
+        assert!(
+            out.contains(STARTUP_MARKER),
+            "--log-level info: a non-empty flag must still raise the level; no \
+             `{STARTUP_MARKER}` record on stdout\n--- stdout ({} B) ---\n{out}",
+            out.len(),
+        );
+        assert!(
+            out.contains(INERT_TLS_WARN),
+            "--log-level info: the WARN record must still be admitted"
+        );
+    }
+}
+
 // ── `--log-max-days 0` / `[log] max_days = 0`: the retention observable ──────
 //
 // The item's third field has one **synchronous** observable, and it is not a
@@ -451,20 +651,27 @@ fn cli_empty_log_file_keeps_logging_on_stdout() {
 // `[log] to = "logs/frps.log"` and a backdated `logs/frps.log.2020-01-01`, that
 // makes "was `--log-max-days 0` completed to 3?" a file-existence question.
 //
-// Pre-fix this shape is **red** in exactly one arm, and the other three arms are
-// the falsification controls that keep it honest:
+// The CLI-zero half of this field moved one layer up in the empty-value commit:
+// an explicit `--log-max-days 0` is now skipped by the overlay, so the *file's*
+// `max_days` governs. The discriminating shape therefore needs a file value that
+// differs from Go's zero default, and it is pinned by
+// `cli_zero_log_max_days_keeps_the_files_retention` below. This test keeps the
+// arms that pin what **completion** still owns; all of them are unchanged at
+// head, and the table records why:
 //
-// | shape | pre-fix | at head |
+// | shape here | pre-fix | at head |
 // |---|---|---|
-// | `--log-max-days 0` (CLI) | **SURVIVES** (cleanup disabled) | deleted |
-// | no flag (defaults to 3) | deleted | deleted — the fixture is genuinely expired |
+// | no flag, no `max_days` key (defaults to 3) | deleted | deleted — the fixture is genuinely expired |
+// | `--log-max-days 0`, no `max_days` key | **SURVIVES** (zero completed to 3 on the old overlay) | deleted — the flag is skipped, and the file's default 3 governs |
 // | `--log-max-days -1` (CLI) | survives | survives — only the zero value is filtered |
-// | `[log] max_days = 0` in the file | **SURVIVES** | deleted |
+// | `[log] max_days = 0` in the file | **SURVIVES** | deleted — the file's own zero completes to 3 |
 //
 // The `[log] max_days = 0` arm was already fixed by `LogConfig::complete` in the
 // previous commit; it is asserted here so the two halves of the same Go field
 // are pinned in one place, and so a future change that drops the config-side
-// fill fails loudly rather than silently.
+// fill fails loudly rather than silently. The second row's *observable* is
+// unchanged by the overlay skip but its mechanism is not — which is exactly why
+// the 7-vs-0 pin exists alongside it.
 //
 // This test deliberately does **not** use `assert_logged_and_listening`: the
 // config logs to a file, so stdout carries no startup record, and its
@@ -473,8 +680,19 @@ fn cli_empty_log_file_keeps_logging_on_stdout() {
 // convention is measured with no connect). Liveness here is the appender's own
 // `STARTUP_MARKER` record in that file, not the file's existence — see `fresh_log_reached_appender`.
 
-/// 2020-01-01T00:00:00Z — far outside any `max_days` this test uses.
+/// The fixture's mtime for the shapes that must be *expired under any positive
+/// window*: `UNIX_EPOCH`, far outside any `max_days` these tests use. Retention
+/// compares the file's **mtime**, not the date in its name
+/// (`frp-core/src/logging.rs` `cleanup_expired_logs` → `is_log_expired(modified,
+/// now, max_days)`), which is why the fixture is named `…2020-01-01` while its
+/// mtime is the epoch — the name is decoration.
 const AGED: SystemTime = UNIX_EPOCH;
+
+/// A fixture that is expired at `max_days = 3` but alive at `max_days = 7` — the
+/// window the `--log-max-days 0` pin needs in order to tell "the flag was
+/// skipped (file's 7 governs)" from "the flag's 0 was completed to 3 and the
+/// default governed".
+const OLDER_THAN_THE_DEFAULT: Duration = Duration::from_secs(5 * 24 * 60 * 60);
 
 fn file_lane_config(port: u16, log_section: &str) -> String {
     format!(
@@ -511,32 +729,29 @@ fn fresh_log_reached_appender(dir: &TempDir) -> bool {
         .is_some_and(|contents| contents.contains(STARTUP_MARKER))
 }
 
-/// Spawn in a scratch dir holding a backdated `logs/frps.log.2020-01-01`, then
-/// report whether it survived startup. Bounded: every wait has a deadline, and
-/// the child is reaped by [`ChildGuard`] on every path.
+/// Block until the appender's own post-`init_logging` record has reached the
+/// fresh rotation file, or fail with a diagnostic that says which of the two
+/// ways it did not happen — a child that exited, or a gate that never opened.
 ///
 /// The wait is for the appender's own record ([`fresh_log_reached_appender`]),
-/// not for the fresh file's existence and not for the aged file: the readiness
-/// gate has to be strictly *after* the retention decision, or a surviving aged
-/// file is reported as a retention outcome when it is only a timing artifact.
-/// The child's own exit is checked on every poll, so a shape that can never
-/// satisfy the gate reports *that* (with its streams) instead of a timeout.
-fn aged_file_survives(tag: &str, config: &str, argv: &[&str]) -> bool {
-    let dir = TempDir::new("aged");
-    dir.write("frps.toml", config);
-    let aged = dir.write_backdated("logs/frps.log.2020-01-01", "aged\n", AGED);
-    let mut spawned = Spawned::start_in(dir, argv);
-
+/// not for the fresh file's existence and not for any caller's fixture: the
+/// readiness gate has to be strictly *after* the retention decision (and after
+/// `init_logging` returns), or a surviving fixture is reported as a retention
+/// outcome when it is only a timing artifact. The child's own exit is checked on
+/// every poll, so a shape that can never satisfy the gate reports *that* (with
+/// its streams) instead of burning [`READY_TIMEOUT`].
+fn wait_for_the_appenders_own_record(tag: &str, spawned: &mut Spawned) {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
         if fresh_log_reached_appender(&spawned.dir) {
-            break;
+            return;
         }
         if let Some(status) = spawned.exited() {
             panic!(
                 "{tag}: frps exited ({status}) before the appender recorded {STARTUP_MARKER:?} in \
-                 a fresh `logs/frps.log.<date>`, so the aged file's survival would not be evidence \
-                 of a retention decision\n--- stdout ({}) ---\n{}\n--- stderr ({}) ---\n{}",
+                 a fresh `logs/frps.log.<date>`, so nothing measured after that point would be \
+                 evidence about the child's configuration\n--- stdout ({}) ---\n{}\n--- stderr \
+                 ({}) ---\n{}",
                 spawned.stdout().len(),
                 spawned.stdout(),
                 spawned.stderr().len(),
@@ -546,8 +761,8 @@ fn aged_file_survives(tag: &str, config: &str, argv: &[&str]) -> bool {
         if Instant::now() >= deadline {
             panic!(
                 "{tag}: no appender record reached a fresh `logs/frps.log.<date>` within \
-                 {READY_TIMEOUT:?}, so the child never reached the appender — the aged file's \
-                 survival would not be evidence of a retention decision\n--- stdout ({}) ---\n{}\n--- stderr ({}) ---\n{}",
+                 {READY_TIMEOUT:?}, so the child never reached the appender\n--- stdout ({}) \
+                 ---\n{}\n--- stderr ({}) ---\n{}",
                 spawned.stdout().len(),
                 spawned.stdout(),
                 spawned.stderr().len(),
@@ -556,11 +771,152 @@ fn aged_file_survives(tag: &str, config: &str, argv: &[&str]) -> bool {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Spawn in a scratch dir holding a backdated `logs/frps.log.2020-01-01`, then
+/// report whether it survived startup. Bounded: every wait has a deadline, and
+/// the child is reaped by [`ChildGuard`] on every path.
+fn aged_file_survives(tag: &str, config: &str, argv: &[&str]) -> bool {
+    aged_file_survives_with(tag, config, argv, AGED)
+}
+
+/// [`aged_file_survives`] with the fixture's mtime set explicitly. The epoch
+/// fixture is expired under every positive window, which cannot distinguish a
+/// window of `3` from a window of `7`; passing `SystemTime::now() - age`
+/// produces the fixture that can.
+fn aged_file_survives_with(tag: &str, config: &str, argv: &[&str], when: SystemTime) -> bool {
+    let dir = TempDir::new("aged");
+    dir.write("frps.toml", config);
+    let aged = dir.write_backdated("logs/frps.log.2020-01-01", "aged\n", when);
+    let mut spawned = Spawned::start_in(dir, argv);
+    wait_for_the_appenders_own_record(tag, &mut spawned);
     aged.exists()
 }
 
+/// **The `--log-file ""` pin:** an explicitly supplied empty value is treated as
+/// *not supplied*, so a config that names a destination keeps it — the records
+/// must land in `logs/frps.log.<date>` and **not** on stdout.
+///
+/// Measured at head (`--features dashboard`, the file lane's own observation
+/// point — `wait_for_the_appenders_own_record`, so no loopback connect and no
+/// signal): stdout 0 B, and `logs/frps.log.2026-10-01` written with the startup
+/// marker in it — the same observable as the identical config with no flag at
+/// all. Go's `-c` lane is the arbiter:
+/// `frps -c cfg(to=<dir>/frps-out.log) --log_file ""` → stdout 0 B and the file
+/// written (three `INFO` records, byte-identical to the no-flag row — the byte
+/// total varies with the `-c` path form, `cmd/frps/root.go:115`); Go's
+/// flags-only lane completes the empty value to `"console"` (282 B / 3 `INFO`),
+/// which is the same outcome, because it has no file value to preserve.
+/// Pre-fix this shape wrote **2735 B to stdout and never created `logs/`**,
+/// because completion had already rewritten the empty flag to the concrete
+/// `"console"` before the resolver's own empty filter could see it.
 #[test]
-fn max_days_zero_is_completed_to_three_on_the_cli_and_in_the_file() {
+fn cli_empty_log_file_keeps_the_files_destination() {
+    let port = free_port();
+    let dir = TempDir::new("cli-empty-file");
+    dir.write("frps.toml", &file_lane_config(port, "level = \"info\"\n"));
+    let mut spawned = Spawned::start_in(dir, &["--bind-port", &port.to_string(), "--log-file", ""]);
+    wait_for_the_appenders_own_record("cli --log-file \"\"", &mut spawned);
+
+    let out = spawned.stdout();
+    assert!(
+        !out.contains(STARTUP_MARKER),
+        "cli --log-file \"\": the file's `to` must still govern, but the {STARTUP_MARKER:?} \
+         startup marker reached stdout — the empty flag diverted the log to `console`\n\
+         --- stdout ({} B) ---\n{out}\n--- stderr ({} B) ---\n{}",
+        out.len(),
+        spawned.stderr().len(),
+        spawned.stderr(),
+    );
+    assert!(
+        spawned
+            .dir
+            .files_in("logs")
+            .iter()
+            .any(|f| f.starts_with("frps.log.")),
+        "cli --log-file \"\": no `frps.log.<date>` under `logs/`, so the records went nowhere \
+         (dir listing: {:?})",
+        spawned.dir.files(),
+    );
+}
+
+/// **The `--log-max-days 0` pin:** the zero is treated as *not supplied*, so a
+/// file that sets `max_days = 7` keeps a five-day-old fixture alive.
+///
+/// The discriminating shape needs a file value that differs from Go's zero
+/// default **and** a fixture that the two candidate windows disagree about: with
+/// `[log] max_days = 7` and a `logs/frps.log.2020-01-01` whose **mtime** is five
+/// days old (expired at `3`, alive at `7`), pre-fix the flag's zero was written
+/// into the struct and then completed to `3`, so the fixture was **deleted**; at
+/// head the flag is skipped and the file's `7` governs, so it **survives**.
+/// Measured at head (the file lane's own observation point, no liveness connect):
+/// survives with `--log-max-days 0` and with no flag; **deleted** with
+/// `--log-max-days 3`, which is the control that a non-zero flag still wins.
+/// Go cannot observe this at startup — its sweep is midnight-only
+/// (`golib@v0.8.2/log/output_rotatefile.go:103`), so `frps -c cfg(maxDays=7)
+/// --log_max_days 0` and the no-flag row are indistinguishable (both leave the
+/// fixture) — but its `-c` lane discards the flag the same way, so "the file's
+/// value governs" is the Go-parity direction, not a guess.
+#[test]
+fn cli_zero_log_max_days_keeps_the_files_retention() {
+    // The pin: the flag's zero leaves the file's 7 in place.
+    let port = free_port();
+    assert!(
+        aged_file_survives_with(
+            "file max_days = 7 + --log-max-days 0",
+            &file_lane_config(port, "max_days = 7\n"),
+            &["--bind-port", &port.to_string(), "--log-max-days", "0"],
+            SystemTime::now() - OLDER_THAN_THE_DEFAULT,
+        ),
+        "`--log-max-days 0` must be treated as `flag not given` and leave the file's \
+         max_days = 7 in place; pre-fix the zero was completed to 3 and deleted this 5-day-old \
+         fixture"
+    );
+
+    // Control 1: a non-zero flag still wins over the file.
+    let port = free_port();
+    assert!(
+        !aged_file_survives_with(
+            "file max_days = 7 + --log-max-days 3",
+            &file_lane_config(port, "max_days = 7\n"),
+            &["--bind-port", &port.to_string(), "--log-max-days", "3"],
+            SystemTime::now() - OLDER_THAN_THE_DEFAULT,
+        ),
+        "a non-zero `--log-max-days 3` must still win over the file's 7 and delete the fixture"
+    );
+
+    // Control 2: with no flag at all the file's own 7 governs, so the fixture
+    // survives — the same observable the pin asserts, from the other direction.
+    let port = free_port();
+    assert!(
+        aged_file_survives_with(
+            "file max_days = 7, no flag",
+            &file_lane_config(port, "max_days = 7\n"),
+            &["--bind-port", &port.to_string()],
+            SystemTime::now() - OLDER_THAN_THE_DEFAULT,
+        ),
+        "control: the file's max_days = 7 alone must preserve a 5-day-old fixture"
+    );
+}
+
+/// **An explicit `0` never disables cleanup.** Go completes it to the default `3`
+/// (`util.EmptyOr(0, 3)`, `pkg/config/v1/common.go:122`) whether it arrives from
+/// `--log-max-days 0` or from `[log] max_days = 0`, so both shapes delete a
+/// backdated fixture.
+///
+/// The two halves of the title are carried by different shapes. The CLI half is
+/// exact because the overlay skips the zero, so the value that governs this
+/// shape is serde's own default `3`; the shape that isolates the CLI zero against
+/// a file value is `[log] max_days = 7` + `--log-max-days 0`, pinned by
+/// [`cli_zero_log_max_days_keeps_the_files_retention`] above. The file half is the
+/// last arm here: its fixture is five days old
+/// ([`OLDER_THAN_THE_DEFAULT`]), so it dies only if the file's `0` really filled
+/// to **3** — an uncompleted `0` disables cleanup and keeps it, and a wrong fill
+/// such as `7` keeps it too. One pair stays unseparable and is not claimed:
+/// `max_days = 0` and an absent `max_days` key are observationally identical,
+/// because serde's default for the field is Go's `3` as well.
+#[test]
+fn max_days_zero_does_not_disable_cleanup_on_the_cli_or_in_the_file() {
     // Control: the fixture is genuinely expired, so the default deletes it.
     let port = free_port();
     assert!(
@@ -572,8 +928,10 @@ fn max_days_zero_is_completed_to_three_on_the_cli_and_in_the_file() {
         "a backdated frps.log.2020-01-01 must be deleted with the default max_days = 3"
     );
 
-    // The defect: `--log-max-days 0` is Go's zero value, completed to 3, so
-    // cleanup must still run. Pre-fix this arm alone leaves the file behind.
+    // The completion defect: `--log-max-days 0` is Go's zero value, completed to
+    // 3, so cleanup must still run. (The overlay also skips the zero now, so the
+    // value governing this shape is the file's absent `max_days` → serde's 3;
+    // the shape that isolates the overlay skip is the `max_days = 7` pin above.)
     let port = free_port();
     assert!(
         !aged_file_survives(
@@ -598,13 +956,19 @@ fn max_days_zero_is_completed_to_three_on_the_cli_and_in_the_file() {
         "a negative --log-max-days is explicit and must disable cleanup (Go parity)"
     );
 
-    // The config-file half of the same Go field.
+    // The config-file half of the same Go field, and the arm that makes the
+    // "in the file" half of this test's title discriminating: the fixture is five
+    // days old, so it is deleted only if the file's `0` really completed to the
+    // default **3**. (An uncompleted `0` would disable cleanup and keep it; a
+    // wrong fill such as `7` would also keep it. The epoch fixture above cannot
+    // tell those apart — see this test's doc comment.)
     let port = free_port();
     assert!(
-        !aged_file_survives(
+        !aged_file_survives_with(
             "config max_days = 0",
             &file_lane_config(port, "max_days = 0\n"),
             &["--bind-port", &port.to_string()],
+            SystemTime::now() - OLDER_THAN_THE_DEFAULT,
         ),
         "`[log] max_days = 0` must be completed to 3 in the config"
     );
