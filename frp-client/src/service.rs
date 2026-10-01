@@ -693,6 +693,24 @@ fn reg_frame_payload_read(
     })
 }
 
+/// The delay the heartbeat loop re-arms to after the **first** consecutive
+/// auth-skipped ping: Go frp v0.71.0 doubles `InitDurationIfFail` even on the
+/// first consecutive error (`wait.FastBackoffOptions{InitDurationIfFail: 1s,
+/// Factor: 2}`, so 1s × 2), which is the delay [`next_ping_backoff`] returns
+/// for `prev == None`.
+///
+/// This constant is the **single source of truth** for that value, and the
+/// re-arm oracle asserts the observed wall-clock gap against *it* rather than
+/// against a hand-written window: `heartbeat_ping_backoff_progression` in this
+/// file compares [`next_ping_backoff`] to it, and the end-to-end test
+/// `skipped_ping_rearms_interval_on_two_second_backoff` in
+/// `frp-client/tests/heartbeat_wire_order.rs` derives its tolerance from it, so
+/// a wrong-but-in-range backoff hard-coded at the `interval.reset_after(delay)`
+/// call site (5s satisfied the old `[1.0s, 6.0s]` window) now reds the e2e test
+/// (TODO.md:8406). A duplicated literal in either place is what this constant
+/// exists to prevent.
+pub const PING_FIRST_BACKOFF: Duration = Duration::from_secs(2);
+
 /// Delay before the next heartbeat attempt after a consecutive
 /// auth-skipped ping, mirroring the Go frp v0.71.0 client heartbeat
 /// backoff exactly (client/control.go heartbeatWorker runs sendHeartBeat
@@ -701,18 +719,18 @@ fn reg_frame_payload_read(
 /// Jitter: 0.1} — pkg/util/wait/backoff.go). Go's manager doubles
 /// InitDurationIfFail too (fastBackoffImpl: on the FIRST consecutive
 /// error, duration = InitDurationIfFail, then `duration * Factor`), so
-/// the retry sequence is 2s, 4s, 8s, … capped at the heartbeat interval
-/// — a long outage still probes at most every interval after reaching
-/// the cap. The 0.1 jitter is skipped (wire-invisible, and it exists
-/// only to desynchronize independent Go processes).
+/// the retry sequence is [`PING_FIRST_BACKOFF`], 4s, 8s, … capped at the
+/// heartbeat interval — a long outage still probes at most every interval
+/// after reaching the cap. The 0.1 jitter is skipped (wire-invisible, and
+/// it exists only to desynchronize independent Go processes).
 ///
 /// `prev` is the previous consecutive failure's delay; None means the
 /// last attempt succeeded (or no failure has happened yet) and this is
 /// the first failure of a streak.
 fn next_ping_backoff(prev: Option<Duration>, interval: Duration) -> Duration {
     let next = match prev {
-        // First failure: InitDurationIfFail(1s) × Factor(2) = 2s.
-        None => Duration::from_secs(2),
+        // First failure: InitDurationIfFail(1s) × Factor(2).
+        None => PING_FIRST_BACKOFF,
         Some(prev) => prev.saturating_mul(2),
     };
     next.min(interval)
@@ -5144,14 +5162,25 @@ mod tests {
         // the FIRST consecutive failure re-arms at InitDurationIfFail ×
         // Factor = 2s (fastBackoffImpl doubles the init too), then the
         // delay doubles per consecutive failure, capped at the interval.
+        //
+        // This is the ONE place the literal 2s is allowed to appear. It pins
+        // the value of `PING_FIRST_BACKOFF`, which is what the production call
+        // site and the e2e re-arm oracle both read: without this comparison a
+        // drift in the constant would be silently agreed to by all three
+        // (TODO.md:8406).
+        assert_eq!(
+            PING_FIRST_BACKOFF,
+            Duration::from_secs(2),
+            "Go parity: InitDurationIfFail(1s) x Factor(2) is the first re-arm delay"
+        );
         let interval = Duration::from_secs(10);
         assert_eq!(
             next_ping_backoff(None, interval),
-            Duration::from_secs(2),
+            PING_FIRST_BACKOFF,
             "first failure of a streak re-arms at InitDurationIfFail(1s) x Factor(2)"
         );
         assert_eq!(
-            next_ping_backoff(Some(Duration::from_secs(2)), interval),
+            next_ping_backoff(Some(PING_FIRST_BACKOFF), interval),
             Duration::from_secs(4)
         );
         assert_eq!(
@@ -5175,7 +5204,7 @@ mod tests {
         assert_eq!(next_ping_backoff(None, small), small);
         // A success ends the streak (the ping arm clears the state): the
         // next failure restarts at 2s again.
-        assert_eq!(next_ping_backoff(None, interval), Duration::from_secs(2));
+        assert_eq!(next_ping_backoff(None, interval), PING_FIRST_BACKOFF);
     }
 
     #[cfg(feature = "vnet")]
