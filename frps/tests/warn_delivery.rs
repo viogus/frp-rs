@@ -44,9 +44,14 @@
 //! **What these tests assert, and what they do not.** Real binary, real config
 //! file, the two streams captured separately, and the **number of records per
 //! stream** — plus the order-independent fact that the process reached its
-//! post-`init_logging` startup line. They do **not** pin the message text, the
-//! exact log line, or the position of the record relative to other records; the
-//! text is pinned by `frp-core/tests/web_server_tls_enable_warning.rs`.
+//! post-`init_logging` startup line. The count is exact in both directions:
+//! `assert_records_are_exactly_the_message` pins the **total** `tracing` record
+//! count of the capture (the expected warnings plus a measured boot baseline),
+//! so a record emitted beyond the counted ones — appended after the warning or
+//! emitted ahead of it — reds, and every counted record is byte-pinned to the
+//! message. What is **not** pinned is the text of the other (boot) records, only
+//! their number; the warning's own text is pinned here and in
+//! `frp-core/tests/web_server_tls_enable_warning.rs`.
 //!
 //! **Falsification (measured).** Run with
 //! `FRPS_BIN=/tmp/enable-warn-probe/before/frps` (the pre-change binary): the
@@ -135,6 +140,41 @@ const NO_TLS_CLAUSE: &str = "no TLS support";
 /// substring of `SERVER_TLS_ENABLE_INERT_WARNING` so a count of it cannot match
 /// the dashboard message, and vice versa.
 const SERVER_KEY: &str = "tls_enable has no effect on the server";
+
+/// How many `tracing` records a running `frps` emits on stdout **beside** the
+/// diagnostic a row counts, at the moment [`Spawned::run`] snapshots it: the
+/// baseline the total-record pin in [`assert_records_are_exactly_the_message`]
+/// adds to its expected count.
+///
+/// Measured (not derived) from this harness — not from a short-lived probe: the
+/// debug binary started with each test's own config, its stdout read to the
+/// point [`Spawned::run`] freezes it, and the `tracing` records listed. On `-c`
+/// the **seven** records are `frps (Rust) v0.71.0 starting...`, `no existing
+/// store file, starting fresh`, `frps starting on …`, `No TLS cert files
+/// configured — auto-generating …`, `SIGUSR1 reload ready`, `TLS enabled with
+/// auto-generated …`, and `frps listener started on …`; a shape that warns adds
+/// its warning as an eighth, first on this path (the loader runs before
+/// `init_logging`). The `--config-dir` boot emits the same seven — its
+/// `starting 1 services from config directory` line replaces nothing and its
+/// warning lands **second**, after the directory line — so a `--config-dir` row
+/// with a warning also totals 8.
+///
+/// This is a boot baseline, not an invariant of the product: a change to the
+/// startup log set moves it, and the count assertion reds with the actual total
+/// and both addends in the message. That is the point — the set was previously
+/// uncounted, so an emit-site mutant that appended a **second well-formed
+/// `warn!`** left the whole lane green.
+const BOOT_RECORDS_DASH_C: usize = 7;
+/// [`BOOT_RECORDS_DASH_C`] for the `--config-dir` startup path. Measured equal
+/// to `-c`, but kept named because the two boots are different code paths and
+/// only a measurement says they agree.
+const BOOT_RECORDS_CONFIG_DIR: usize = 7;
+/// The records a SIGUSR1 reload adds on the single-config `-c` path when the
+/// config is unchanged: `main.rs` logs `SIGUSR1: config reloaded: no changes
+/// detected`. (The re-emitted diagnostic a reload row counts is its own extra
+/// `want`, so it is not in here.) Measured with the same harness run: 8 records
+/// before the signal, 9 after.
+const RELOAD_EXTRA_RECORDS: usize = 1;
 
 fn bin() -> String {
     std::env::var("FRPS_BIN").unwrap_or_else(|_| BIN.to_string())
@@ -668,8 +708,18 @@ fn occurrences(haystack: &str, needle: &str) -> usize {
 /// their first half (`web_server.tls.enable has no effect: …`), so an appended
 /// clause at the emit site leaves both green.
 fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
+    assert_one_warning_on_stdout_with_boot(tag, spawned, BOOT_RECORDS_DASH_C);
+}
+
+/// [`assert_one_warning_on_stdout`] for the `--config-dir` startup path, whose
+/// boot emits one record more than `-c` (see [`BOOT_RECORDS_CONFIG_DIR`]).
+fn assert_one_warning_on_stdout_from_config_dir(tag: &str, spawned: &Spawned) {
+    assert_one_warning_on_stdout_with_boot(tag, spawned, BOOT_RECORDS_CONFIG_DIR);
+}
+
+fn assert_one_warning_on_stdout_with_boot(tag: &str, spawned: &Spawned, boot: usize) {
     assert_one_warning_on_stdout_for(tag, spawned, KEY);
-    assert_web_server_tls_enable_records_are_exactly_the_message(tag, &spawned.stdout(), 1);
+    assert_web_server_tls_enable_records_are_exactly_the_message(tag, &spawned.stdout(), 1, boot);
     assert_clause_matches_this_build(tag, spawned);
 }
 
@@ -951,11 +1001,59 @@ fn starts_a_fresh_tracing_record(rest: &str) -> bool {
             .any(|level| after.starts_with(level))
 }
 
-/// Byte-pin every stdout record carrying `want`: there must be exactly
-/// `expected` of them, each must be the message with the one-line `tracing`
-/// prefix, and nothing may follow a record but a fresh record or the end of the
-/// capture.
-fn assert_records_are_exactly_the_message(tag: &str, out: &str, want: &str, expected: usize) {
+/// The starts of every `tracing` record in an SGR-stripped capture: a line that
+/// begins with an RFC 3339 timestamp, a space and a level — the same shape
+/// [`is_tracing_timestamp`] validates in the helper above. A line that merely
+/// *contains* a timestamp (a log message quoting one, say) does not begin with
+/// one, so it is not a record.
+fn tracing_record_starts(clean: &str) -> Vec<usize> {
+    /// `YYYY-MM-DDTHH:MM:SS[.fraction]Z` is at least this long; the fraction
+    /// widens the stamp leftwards from the `Z`, so this is the widest start.
+    const STAMP: usize = 27;
+    let mut found = Vec::new();
+    let mut search = 0;
+    while let Some(offset) = clean[search..].find('Z') {
+        let at = search + offset;
+        if at + 1 >= STAMP {
+            let start = at + 1 - STAMP;
+            if clean.as_bytes().get(at + 1) == Some(&b' ')
+                && is_tracing_timestamp(&clean[start..=at])
+            {
+                found.push(start);
+                search = at + 1;
+                continue;
+            }
+        }
+        search = at + 1;
+    }
+    found
+}
+
+/// Byte-pin every record carrying `want` **and pin the total record count**:
+/// there must be exactly `expected` records carrying `want`, the capture must
+/// hold exactly `expected + others` records in total (`others` is the caller's
+/// measured boot baseline, see [`BOOT_RECORDS_DASH_C`]), each matching record
+/// must be the message with the one-line `tracing` prefix, and nothing may
+/// follow a record but a fresh record or the end of the capture.
+///
+/// The count is the half that makes an emit-site mutant appending a **second
+/// well-formed `warn!`** red: byte-pinning the records it is handed cannot see a
+/// record it was not handed, and the orphan-line guard below accepts a fresh
+/// record. It also covers a record emitted *before* the warning — the other
+/// direction the helper was blind to — because that shifts the total by one too.
+///
+/// The residual the count shares with the baseline: a capture in which a record
+/// was **swapped** for a record that is not `want` (a second boot line, say)
+/// keeps `expected + others` and stays green. That shape is indistinguishable
+/// from the honest boot output by construction — the boot lines are not pinned,
+/// only counted — and it is not the shape this closes.
+fn assert_records_are_exactly_the_message(
+    tag: &str,
+    out: &str,
+    want: &str,
+    expected: usize,
+    others: usize,
+) {
     let clean = strip_sgr(out);
     let records = records_containing(&clean, want);
     assert_eq!(
@@ -963,6 +1061,16 @@ fn assert_records_are_exactly_the_message(tag: &str, out: &str, want: &str, expe
         expected,
         "{tag}: expected {expected} record(s) carrying `{want}`, found {}\n--- stdout ---\n{out}",
         records.len()
+    );
+    let total = tracing_record_starts(&clean).len();
+    assert_eq!(
+        total,
+        expected + others,
+        "{tag}: the capture must hold exactly {} `tracing` record(s) — {expected} carrying `{want}` \
+         and the {others} this shape emits besides it; found {total}. A record emitted beyond \
+         those (an appended well-formed `warn!`, or one ahead of the warning) reds here.\n\
+         --- stdout ---\n{out}",
+        expected + others
     );
     for (i, (record, rest)) in records.iter().enumerate() {
         assert_record_is_exactly_the_message(
@@ -981,21 +1089,28 @@ fn assert_records_are_exactly_the_message(tag: &str, out: &str, want: &str, expe
     }
 }
 
-/// Byte-pin every stdout line carrying the server `tls_enable` message: there
-/// must be exactly `expected` of them, and each must be the message with the
-/// one-line `tracing` prefix and no other bytes.
+/// Byte-pin every stdout record carrying the server `tls_enable` message: there
+/// must be exactly `expected` of them, `others` records beside them, and
+/// each must be the message with the one-line `tracing` prefix and no other
+/// bytes.
 ///
 /// `expected` mirrors the caller's occurrence count, so this **can stand in
 /// for** the count-only assertion rather than being a second, independently
 /// driftable check: the wrapper below uses it that way, and the reload test
 /// asserts the same count through both so the "one per load" intent stays
 /// explicit.
-fn assert_server_tls_enable_records_are_exactly_the_message(tag: &str, out: &str, expected: usize) {
+fn assert_server_tls_enable_records_are_exactly_the_message(
+    tag: &str,
+    out: &str,
+    expected: usize,
+    others: usize,
+) {
     assert_records_are_exactly_the_message(
         tag,
         out,
         frp_core::config::SERVER_TLS_ENABLE_INERT_WARNING.as_str(),
         expected,
+        others,
     );
 }
 
@@ -1008,20 +1123,30 @@ fn assert_web_server_tls_enable_records_are_exactly_the_message(
     tag: &str,
     out: &str,
     expected: usize,
+    others: usize,
 ) {
     let want = if cfg!(feature = "dashboard") {
         frp_core::config::WEB_SERVER_TLS_ENABLE_INERT_WARNING
     } else {
         frp_core::config::WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD
     };
-    assert_records_are_exactly_the_message(tag, out, want, expected);
+    assert_records_are_exactly_the_message(tag, out, want, expected, others);
 }
 
 /// [`assert_one_warning_on_stdout_for`] for the flat server `tls_enable`
 /// diagnostic: exactly one record, and its bytes are pinned to the message.
 fn assert_one_server_tls_enable_warning(tag: &str, spawned: &Spawned) {
+    assert_one_server_tls_enable_warning_with_boot(tag, spawned, BOOT_RECORDS_DASH_C);
+}
+
+/// [`assert_one_server_tls_enable_warning`] for the `--config-dir` startup path.
+fn assert_one_server_tls_enable_warning_from_config_dir(tag: &str, spawned: &Spawned) {
+    assert_one_server_tls_enable_warning_with_boot(tag, spawned, BOOT_RECORDS_CONFIG_DIR);
+}
+
+fn assert_one_server_tls_enable_warning_with_boot(tag: &str, spawned: &Spawned, boot: usize) {
     assert_one_warning_on_stdout_for(tag, spawned, SERVER_KEY);
-    assert_server_tls_enable_records_are_exactly_the_message(tag, &spawned.stdout(), 1);
+    assert_server_tls_enable_records_are_exactly_the_message(tag, &spawned.stdout(), 1, boot);
 }
 
 /// The shared "no record at all" assertion, with the startup line still there so
@@ -1030,7 +1155,12 @@ fn assert_one_server_tls_enable_warning(tag: &str, spawned: &Spawned) {
 /// rows: no variant of this build's message, anywhere in the capture.
 fn assert_no_warning(tag: &str, spawned: &Spawned) {
     assert_no_warning_for(tag, spawned, KEY);
-    assert_web_server_tls_enable_records_are_exactly_the_message(tag, &spawned.stdout(), 0);
+    assert_web_server_tls_enable_records_are_exactly_the_message(
+        tag,
+        &spawned.stdout(),
+        0,
+        BOOT_RECORDS_DASH_C,
+    );
 }
 
 /// [`assert_no_warning`] for an arbitrary key.
@@ -1043,6 +1173,84 @@ fn assert_no_warning_for(tag: &str, spawned: &Spawned, key: &str) {
     );
     assert_eq!(occurrences(&out, key), 0, "{tag}: stdout:\n{out}");
     assert_eq!(occurrences(&err, key), 0, "{tag}: stderr:\n{err}");
+}
+
+/// Teeth for the two properties [`assert_records_are_exactly_the_message`] gained
+/// over the H2 batch: the capture must hold exactly `expected + others` records,
+/// so a **second well-formed `warn!`** appended at the emit site — the mutant the
+/// record byte-pin could not see, because it byte-pins the records it is handed —
+/// reds, and so does a record emitted **ahead** of the warning.
+///
+/// These drive the assertion directly on synthetic captures instead of mutating
+/// the product: a real emit-site mutant would also red `frp-core`'s captures and
+/// has to be reverted, while the count is what this file owns. The honest-fixed
+/// captures below are the same shape the binary writes (SGR, timestamp, level,
+/// target, message, newline), so the three tests are green on the unmutated
+/// shapes and red only on the two mutated ones.
+#[cfg(test)]
+mod record_count_tests {
+    use super::assert_records_are_exactly_the_message;
+
+    /// One synthetic diagnostic, SGR and all, as the console sink writes it.
+    fn diagnostic(message: &str) -> String {
+        format!(
+            "\u{1b}[2m2026-10-01T18:50:19.791487Z\u{1b}[0m \u{1b}[33m WARN\u{1b}[0m \
+             \u{1b}[2mfrp_core::config::loader\u{1b}[0m\u{1b}[2m:\u{1b}[0m {message}\n"
+        )
+    }
+
+    /// A synthetic boot record with the same skeleton as the real ones.
+    fn boot(level: &str, body: &str) -> String {
+        format!(
+            "\u{1b}[2m2026-10-01T18:50:19.791644Z\u{1b}[0m \u{1b}[32m {level}\u{1b}[0m \
+             \u{1b}[2mfrps\u{1b}[0m\u{1b}[2m:\u{1b}[0m {body}\n"
+        )
+    }
+
+    const WANT: &str = "the warning this row counts";
+
+    /// The honest shape: one warning, two boot records. Green.
+    #[test]
+    fn the_honest_capture_stays_green() {
+        let capture = format!(
+            "{}{}{}",
+            diagnostic(WANT),
+            boot("INFO", "starting..."),
+            boot("INFO", "listening")
+        );
+        assert_records_are_exactly_the_message("honest", &capture, WANT, 1, 2);
+    }
+
+    /// The mutant the item names: the emit site appends a **second well-formed
+    /// record**. Every record it hands the byte-pin is still exact, so only the
+    /// count can see it.
+    #[test]
+    #[should_panic(expected = "must hold exactly 3")]
+    fn an_appended_well_formed_record_reds_the_count() {
+        let capture = format!(
+            "{}{}{}{}",
+            diagnostic(WANT),
+            boot("INFO", "starting..."),
+            boot("INFO", "listening"),
+            diagnostic("a second, well-formed warning record")
+        );
+        assert_records_are_exactly_the_message("appended", &capture, WANT, 1, 2);
+    }
+
+    /// The other blind direction: a well-formed record emitted **before** the
+    /// warning, which `records_containing` never looked at.
+    #[test]
+    #[should_panic(expected = "must hold exactly 3")]
+    fn a_record_ahead_of_the_warning_reds_the_count() {
+        let capture = format!(
+            "{}{}{}{}",
+            diagnostic("a record ahead of the warning"),
+            diagnostic(WANT),
+            boot("INFO", "starting..."),
+            boot("INFO", "listening")
+        );
+        assert_records_are_exactly_the_message("prefixed", &capture, WANT, 1, 2);
+    }
 }
 
 /// A `frps` config that writes the **flat** server `tls_enable` (the frp-rs-only
@@ -1106,7 +1314,7 @@ fn web_server_tls_enable_warning_reaches_a_config_dir_user() {
     std::fs::create_dir_all(&sub).expect("create config dir");
     std::fs::write(sub.join("frps.toml"), &cfg).expect("write config");
     let spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
-    assert_one_warning_on_stdout("frps --config-dir", &spawned);
+    assert_one_warning_on_stdout_from_config_dir("frps --config-dir", &spawned);
 }
 
 /// The `[common]` spelling: `[common]` is flattened onto the top level before the
@@ -1130,7 +1338,7 @@ fn web_server_tls_enable_warning_reaches_a_config_dir_user_with_the_common_spell
     std::fs::create_dir_all(&sub).expect("create config dir");
     std::fs::write(sub.join("frps.toml"), &cfg).expect("write config");
     let spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
-    assert_one_warning_on_stdout("frps --config-dir ([common] spelling)", &spawned);
+    assert_one_warning_on_stdout_from_config_dir("frps --config-dir ([common] spelling)", &spawned);
 }
 
 /// The `--config-dir` lane installs the **same** SIGUSR1 handler as `-c`, so the
@@ -1441,6 +1649,7 @@ fn a_sigusr1_reload_delivers_the_warning_again() {
         "frps reload (startup)",
         &spawned.stdout(),
         1,
+        BOOT_RECORDS_DASH_C,
     );
 
     assert!(
@@ -1459,6 +1668,7 @@ fn a_sigusr1_reload_delivers_the_warning_again() {
         "frps reload (startup + reload)",
         &out,
         2,
+        BOOT_RECORDS_DASH_C + RELOAD_EXTRA_RECORDS,
     );
     assert_clause_matches_this_build("frps reload", &spawned);
 }
@@ -1524,10 +1734,14 @@ fn server_tls_enable_warning_reaches_a_dash_c_user() {
         "the dashboard key was not written, so its diagnostic must not fire\n--- stdout ---\n{}",
         spawned.stdout()
     );
+    // The seven others here are the six `-c` boot records plus the flat
+    // `tls_enable` warning this shape does emit: the web diagnostic is absent,
+    // but the capture is not otherwise quiet, so the total is still 8.
     assert_web_server_tls_enable_records_are_exactly_the_message(
         "frps -c (dashboard key not written)",
         &spawned.stdout(),
         0,
+        BOOT_RECORDS_DASH_C + 1,
     );
 }
 
@@ -1540,7 +1754,10 @@ fn server_tls_enable_warning_reaches_a_config_dir_user_with_the_common_spelling(
     std::fs::create_dir_all(&sub).expect("create config dir");
     std::fs::write(sub.join("frps.toml"), &cfg).expect("write config");
     let spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
-    assert_one_server_tls_enable_warning("frps --config-dir ([common] tls_enable)", &spawned);
+    assert_one_server_tls_enable_warning_from_config_dir(
+        "frps --config-dir ([common] tls_enable)",
+        &spawned,
+    );
 
     let dir = TempDir::new("srv-dashc-common");
     let cfg = frps_config_server_tls(free_port(), ServerTls::CommonWritten);
@@ -1580,6 +1797,7 @@ fn no_server_tls_enable_warning_when_it_was_synthesized_from_transport_tls() {
         "frps -c (synthesized tls_enable)",
         &spawned.stdout(),
         0,
+        BOOT_RECORDS_DASH_C,
     );
 }
 
@@ -1602,6 +1820,7 @@ fn a_sigusr1_reload_delivers_the_server_tls_enable_warning_again() {
         "startup (tls_enable = true)",
         &spawned.stdout(),
         1,
+        BOOT_RECORDS_DASH_C,
     );
 
     assert!(
@@ -1619,6 +1838,7 @@ fn a_sigusr1_reload_delivers_the_server_tls_enable_warning_again() {
         "startup + SIGUSR1 reload (tls_enable = true)",
         &out,
         2,
+        BOOT_RECORDS_DASH_C + RELOAD_EXTRA_RECORDS,
     );
     assert_eq!(occurrences(&spawned.stderr(), SERVER_KEY), 0);
 }
