@@ -276,7 +276,10 @@ jobs:
       # +1, so this count guard can see those rows (it counts test functions, not
       # assertions). Re-derived on this tree with
       # `cargo test -p frps --test cli_exit_codes -- --list`.
-      FRPS_CLI_TESTS: "44"
+      # 44 → 45 with the `-l`-shorthand refusal pin
+      # `short_l_is_not_a_frps_shorthand_and_the_refusal_is_pinned`
+      # (`TODO.md:8732`): +1. Re-derived with the same `--list` command.
+      FRPS_CLI_TESTS: "45"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
       # 11 → 13 with the one `auth.method` policy: +2
@@ -1498,19 +1501,19 @@ jobs:
   # compile. Those three tests now carry
   # `#[cfg_attr(not(debug_assertions), ignore = "<reason>")]`; `ignore` (not
   # `#[cfg]`) is what keeps them compiled and *counted* in both profiles, and
-  # `FRPS_RELEASE_CLI_TESTS` below is the same 44 as the tests-unit lane's
+  # `FRPS_RELEASE_CLI_TESTS` below is the same 45 as the tests-unit lane's
   # `FRPS_CLI_TESTS` on purpose.
   #
   # This job is what makes the skip observable: it asserts the exact summary
-  # line (41 passed; 0 failed; 3 ignored) and the exact three ignored names, so
+  # line (42 passed; 0 failed; 3 ignored) and the exact three ignored names, so
   # the release lane cannot widen its own skip set, drop a test, or lose the
   # target and still pass.
   #
   # What this lane does *not* defend: turning those three attributes into an
   # unconditional `#[ignore]`. That yields byte-identical release output, so the
   # guard below exits 0 by design. Blanket ignoring is caught by the
-  # pre-existing debug lane in `tests-unit` instead: `FRPS_CLI_TESTS: "44"`
-  # (`:278`) requires `test result: ok. 44 passed; 0 failed` (`:747`), so an
+  # pre-existing debug lane in `tests-unit` instead: `FRPS_CLI_TESTS: "45"`
+  # (`:282`) requires `test result: ok. 45 passed; 0 failed` (`:935`), so an
   # unconditional `#[ignore]` fails hard there. The two guards cover different
   # axes and neither makes the other redundant.
   #
@@ -1523,7 +1526,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      FRPS_RELEASE_CLI_TESTS: "44"
+      FRPS_RELEASE_CLI_TESTS: "45"
       # Exactly these three and no more: the test function names, in file order
       # (the guard sorts both sides), that carry the release-only skip in
       # `frps/tests/cli_exit_codes.rs`.
