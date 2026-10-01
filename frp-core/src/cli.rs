@@ -1911,6 +1911,14 @@ struct GoFlagRow {
 /// is *missing* from is the interesting half: a flag absent from this table is
 /// either an frp-rs extension ([`FRPS_EXTENSION_FLAGS`]) or a flag frp-rs does
 /// not have.
+///
+/// Two of Go's rows describe flags frp-rs registers only under a feature:
+/// `--kcp-bind-port` (`#[cfg(feature = "kcp")]`) and `--quic-bind-port`
+/// (`#[cfg(feature = "quic")]`) in [`svr_transport`]. They are gated here for
+/// the same reason: a build without the feature does not register the flag, so
+/// it is not part of that build's persistent set and must not be expected under
+/// `Global Flags`. With frp-core's default features on all 29 rows are present,
+/// which is the shape [`FRPS_GO_FLAGS`] was measured in.
 const FRPS_GO_FLAGS: &[GoFlagRow] = &[
     GoFlagRow {
         long: "allow-ports",
@@ -1996,6 +2004,7 @@ const FRPS_GO_FLAGS: &[GoFlagRow] = &[
         varname: None,
         usage: "enable prometheus dashboard",
     },
+    #[cfg(feature = "kcp")]
     GoFlagRow {
         long: "kcp-bind-port",
         short: None,
@@ -2032,6 +2041,7 @@ const FRPS_GO_FLAGS: &[GoFlagRow] = &[
         varname: Some("string"),
         usage: "proxy bind address (default \"0.0.0.0\")",
     },
+    #[cfg(feature = "quic")]
     GoFlagRow {
         long: "quic-bind-port",
         short: None,
@@ -2535,7 +2545,9 @@ fn command_short(root: RootCommand, command: &str) -> &'static str {
 /// The flags cobra registers **persistently** on this root — the ones every
 /// child command inherits and prints under `Global Flags`. Measured: `frps
 /// verify --help` repeats all 29 [`FRPS_GO_FLAGS`] longs there and `frpc verify
-/// --help` all 5 [`FRPC_ROOT_GO_FLAGS`] longs, both ways (module test).
+/// --help` all 5 [`FRPC_ROOT_GO_FLAGS`] longs, both ways (module test). The
+/// frps table is the compiled surface, so a build without `kcp`/`quic` repeats
+/// 27 longs there, not 29.
 fn root_persistent_flags(root: RootCommand) -> &'static [GoFlagRow] {
     match root {
         RootCommand::Frps => FRPS_GO_FLAGS,
@@ -9134,15 +9146,15 @@ Global Flags:
     #[test]
     fn every_surface_matches_its_whole_text_pin() {
         let mut mismatched: Vec<String> = Vec::new();
-        for ((label, root, command, pinned, _), expected) in
-            SURFACES.into_iter().zip(SURFACE_DOCUMENTS)
-        {
+        for ((label, root, command, _, _), full) in SURFACES.into_iter().zip(SURFACE_DOCUMENTS) {
+            let expected = feature_adjusted_pin(root, full);
             let document = surface_document(root, command);
             if document != expected {
                 mismatched.push(format!(
-                    "{label}: {} bytes (pinned {pinned}) -- first difference: {}",
+                    "{label}: {} bytes (pinned {}) -- first difference: {}",
                     document.len(),
-                    first_difference(expected, &document)
+                    expected.len(),
+                    first_difference(&expected, &document)
                 ));
             }
         }
@@ -9152,6 +9164,58 @@ Global Flags:
              built binaries:\n{}",
             mismatched.join("\n")
         );
+    }
+
+    /// A whole-text pin adjusted from the **full-feature** shape to the features
+    /// this build actually compiled in.
+    ///
+    /// `SURFACE_DOCUMENTS` and [`GO_FRPS_VERIFY`] are the default-features
+    /// record: `svr_transport` registers `--kcp-bind-port` under
+    /// `#[cfg(feature = "kcp")]` and `--quic-bind-port` under
+    /// `#[cfg(feature = "quic")]`, so with the default features on the `frps`
+    /// and `frps verify` documents each carry those two rows. A build without a
+    /// feature cannot render its row, so the expected document is the pin
+    /// **minus exactly that one line**.
+    ///
+    /// Nothing else is relaxed: every other byte still comes from the frozen
+    /// constant, so the default-features lane compares against the pin unchanged
+    /// and any other change to a rendered document still fails. Only the `frps`
+    /// pins carry those rows (`frpc` never renders them, and [`FRPC_DOC`] etc.
+    /// have none), so a `frpc` pin is returned untouched.
+    fn feature_adjusted_pin(root: RootCommand, full: &str) -> String {
+        if root != RootCommand::Frps {
+            return full.to_owned();
+        }
+        let mut expected = full.to_owned();
+        for (enabled, long) in [
+            (cfg!(feature = "kcp"), "--kcp-bind-port"),
+            (cfg!(feature = "quic"), "--quic-bind-port"),
+        ] {
+            if enabled {
+                continue;
+            }
+            expected = strip_pinned_row(&expected, long);
+        }
+        expected
+    }
+
+    /// `document` without the row whose long flag is `long`, byte for byte.
+    ///
+    /// Panics when the row is absent: the caller only asks for a row the
+    /// full-feature pin is known to carry, so a miss means the pin and the
+    /// feature gate have drifted apart.
+    fn strip_pinned_row(document: &str, long: &str) -> String {
+        let mut stripped = String::with_capacity(document.len());
+        let mut removed = false;
+        for line in document.split_inclusive('\n') {
+            if line.trim_start().starts_with(long) {
+                removed = true;
+            } else {
+                stripped.push_str(line);
+            }
+        }
+        assert!(removed, "the full-feature pin must carry a `{long}` row");
+        stripped
     }
 
     /// Where a rendered document left its pin: the first line that differs, or
@@ -9176,14 +9240,16 @@ Global Flags:
 
     #[test]
     fn verify_documents_match_go_byte_for_byte() {
+        // The Go oracle is the full-feature shape too, so it loses exactly the
+        // same two `Global Flags` rows when `kcp`/`quic` are compiled out.
         assert_eq!(
             surface_document(RootCommand::Frps, Some("verify")),
-            GO_FRPS_VERIFY,
+            feature_adjusted_pin(RootCommand::Frps, GO_FRPS_VERIFY),
             "frps verify --help must be Go's document, byte for byte"
         );
         assert_eq!(
             surface_document(RootCommand::Frpc, Some("verify")),
-            GO_FRPC_VERIFY,
+            feature_adjusted_pin(RootCommand::Frpc, GO_FRPC_VERIFY),
             "frpc verify --help must be Go's document, byte for byte"
         );
     }
@@ -9191,9 +9257,15 @@ Global Flags:
     #[test]
     fn every_surface_is_pinned_by_its_byte_count() {
         let mut mismatched: Vec<String> = Vec::new();
-        for (label, root, command, rendered, go) in SURFACES {
+        for ((label, root, command, rendered, go), full) in
+            SURFACES.into_iter().zip(SURFACE_DOCUMENTS)
+        {
+            let expected = feature_adjusted_pin(root, full);
+            // `rendered` pins the full-feature document; a feature-adjusted pin
+            // is that many bytes shorter, so the count shrinks with it.
+            let expected_len = rendered - (full.len() - expected.len());
             let document = surface_document(root, command);
-            if document.len() != rendered {
+            if document.len() != expected_len {
                 mismatched.push(format!(
                     "{label}: {} bytes (pinned {rendered}, Go v0.71.0 {go})",
                     document.len()
