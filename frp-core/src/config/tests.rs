@@ -12219,6 +12219,69 @@ fn legacy_ini_default_section_string_include_is_still_expanded() {
     }
 }
 
+/// **Item 4: a DefaultSection `start = p2` beside a `[start]` section keeps the
+/// section.**
+///
+/// This is the `w8_start_scalar_plus_start_section.ini` shape measured against
+/// Go v0.71.0: a DefaultSection key is not part of the legacy common config
+/// (`UnmarshalClientConfFromIni` reads `[common]` alone), so Go's `start` list
+/// stays empty (`startAll`) and the `[start]` section runs as an ordinary typeless
+/// legacy proxy — 1 proxy named `start` in a real frps+frpc run
+/// (`[start] start proxy success`). Round 5 kept that section, round 6 deleted it
+/// (0 proxies) with the unconditional `start` removal, and round 7 restored it;
+/// this pin fixes the exact shape in both loader modes.
+#[test]
+fn legacy_ini_default_section_start_beside_start_section_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "start = p2\n[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [start]\nlocal_port = 18080\nremote_port = 19080\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("strict={strict}: {e}"));
+        assert_eq!(cfg.proxies.len(), 1, "strict={strict}");
+        assert_eq!(cfg.proxies[0].name, "start", "strict={strict}");
+        assert!(
+            cfg.start.is_empty(),
+            "strict={strict}: Go's [common] list is empty, so every section starts"
+        );
+    }
+}
+
+/// **[common]-less `.ini` with a scalar `start` beside `[start]`: the v1 path.**
+///
+/// With no `[common]` section Go's `DetectLegacyINIFormat`
+/// (`pkg/config/load.go:65`) is false, so the file is not read by the legacy
+/// reader at all: the scalar `start = p2` reaches the v1 decode and Go is rc 1 in
+/// both loader modes (`json: cannot unmarshal string into Go value of type
+/// v1.rawClientConfig`). frp-rs keeps its v1 reading instead — rc 0, zero proxies
+/// (the scalar wins the section-name collision, `insert_ini_section`,
+/// `frp-core/src/config/format.rs:378`). This pin records the measured,
+/// deliberate divergence so a later change cannot pick it up silently.
+#[test]
+fn legacy_ini_without_common_start_scalar_is_a_v1_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "start = p2\n[start]\ntype = tcp\nlocal_port = 8080\nremote_port = 18080\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("strict={strict}: {e}"));
+        assert_eq!(
+            cfg.proxies.len(),
+            0,
+            "strict={strict}: frp-rs v1 reading keeps the scalar and drops the section"
+        );
+    }
+}
+
 /// **A DefaultSection `start` never filters; `[common] start` does.**
 ///
 /// Go fills the legacy common config from `[common]` alone
