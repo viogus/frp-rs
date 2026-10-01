@@ -198,13 +198,13 @@ Add a field only for a genuinely new knob, and then follow the house rules:
   ignored* by Go frp — the config is accepted and the setting is dropped. This is
   the single most expensive compatibility bug class in this repository.
 - The client plugin config struct is separate: `PluginConfig` at
-  `frp-core/src/config/server.rs:1400`.
+  `frp-core/src/config/server.rs:1415`.
 
 **The type name itself is validated by an allow-list, and this is the first wall.**
-`fn validate_proxy_configs` (`frp-core/src/config/loader.rs:731`) checks
-`p.proxy_type` against `const VALID_PROXY_TYPES` (`frp-core/src/config/loader.rs:732`).
+`fn validate_proxy_configs` (`frp-core/src/config/loader.rs:738`) checks
+`p.proxy_type` against `const VALID_PROXY_TYPES` (`frp-core/src/config/loader.rs:739`).
 It is reached only from `fn validate_client_config`
-(`frp-core/src/config/loader.rs:1027`); the server path has no equivalent, so a
+(`frp-core/src/config/loader.rs:1034`); the server path has no equivalent, so a
 stray `[[proxies]]` block in `frps.toml` is rejected by the *parser* as
 `unknown field "proxies" in config file`, not by this allow-list. Miss the list and
 *every* frpc config file using your type fails to load. (The transcripts in §2.2–§2.6
@@ -220,7 +220,7 @@ $ echo $?
 ```
 
 Note what that demands of you: the message is a **second, hand-maintained copy of
-the list**, inline at `frp-core/src/config/loader.rs:739`. Adding the name to the
+the list**, inline at `frp-core/src/config/loader.rs:746`. Adding the name to the
 `const` and not to the message leaves the error text lying about what is valid.
 Change both, in the same commit.
 
@@ -231,7 +231,7 @@ differently:
 
 | # | Site | What it gates | If you skip it |
 |---|---|---|---|
-| 1 | `const VALID_PROXY_TYPES` — `frp-core/src/config/loader.rs:732` (+ the message at `:739`), checked by `validate_proxy_configs` at `frp-core/src/config/loader.rs:731` | frpc config-file load | Fatal at startup: `invalid proxy_type '<type>'` (above). **The first wall, always** |
+| 1 | `const VALID_PROXY_TYPES` — `frp-core/src/config/loader.rs:739` (+ the message at `:746`), checked by `validate_proxy_configs` at `frp-core/src/config/loader.rs:738` | frpc config-file load | Fatal at startup: `invalid proxy_type '<type>'` (above). **The first wall, always** |
 | 2 | `const VALID_PROXY_TYPES` — `frp-client/src/store.rs:16`, used by `validate_proxy` at `frp-client/src/store.rs:258` | The runtime config store behind the admin API (`/api/store/*`) | Store writes are rejected with `invalid proxy type: <type>`, and an existing store file that contains your type **fails to load** |
 | 3 | the seed list in `by_type` — `frp-client/src/admin.rs:391` (feature `admin`) | `/api/proxy/<type>` (Go parity: every known type appears, even empty) | Cosmetic: the endpoint returns no entry for your type |
 | 4 | `const VALID_PROXY_TYPES` — `frp-server/src/ssh_gateway.rs:737` (feature `ssh`) | Proxy types accepted over the SSH tunnel gateway | `invalid proxy type: <type>, support types: [tcp http https tcpmux stcp]` |
@@ -262,7 +262,7 @@ mytcp must be an accepted store proxy type: Err(InvalidArgument("invalid proxy t
 Two neighbouring lists are **not** on this path, and it is worth knowing why so
 you do not hunt them: `const VALID_VISITOR_TYPES` (`frp-client/src/store.rs:19`,
 `["stcp", "sudp", "xtcp"]`) enumerates *visitor* types, and `const
-FRPC_SUBCOMMANDS` (`frp-core/src/cli.rs:2047`, a `[&str; 12]` pinned in both
+FRPC_SUBCOMMANDS` (`frp-core/src/cli.rs:3084`, a `[&str; 12]` pinned in both
 directions by the tests beside it) enumerates `frpc <subcommand>` names — it needs
 your type only if you are also adding an `frpc <type>` subcommand, which the
 minimal path does not.
@@ -495,7 +495,7 @@ give it a test next to the existing ones in `frp-core/src/config/tests.rs`. Call
 the loader bare, not as `frp_core::config::…`: the file starts with
 `use super::*;` (`frp-core/src/config/tests.rs:3`), and inside the crate its own
 name is not a valid path prefix. `load_client_config_from_str` is defined at
-`frp-core/src/config/loader.rs:172`:
+`frp-core/src/config/loader.rs:176`:
 
 ```rust
 #[test]
@@ -783,9 +783,9 @@ length: 144116287587483648 (max: 10240), raw header: 000200010000000000`. A plai
 mismatch — server `tcp_mux = false`, client snake_case `tcp_mux = true` — fails
 identically. Do not generalise the drop to every camelCase key: `transport.tcpMux`
 under a `[transport]` table is **not** dropped — `normalize_client_config`
-(`frp-core/src/config/normalize.rs:1126`, called from
-`frp-core/src/config/loader.rs:180`) flattens `[transport]` and maps
-`"tcpMux" => "tcp_mux"` (`frp-core/src/config/normalize.rs:1397`), so that
+(`frp-core/src/config/normalize.rs:1172`, called from
+`frp-core/src/config/loader.rs:186`) flattens `[transport]` and maps
+`"tcpMux" => "tcp_mux"` (`frp-core/src/config/normalize.rs:1446`), so that
 spelling logs in and registers fine.
 
 Helper line numbers for orientation: `start_echo_server`
