@@ -137,11 +137,15 @@ Last 400 commits, and the subset whose subject matches
 |---|---:|---:|---:|
 | `frp-client/src/service.rs` | **53** | **230** | **4930** |
 | `frp-server/src/control/proxy_ops.rs` | 47 | 112 | 3612 |
-| `frp-server/src/vhost.rs` | 40 | 94 | 3164 |
+| `frp-server/src/vhost.rs` | 40 | 94 | 3180 |
 | `frp-server/src/control/login.rs` | 40 | — | — |
 | `frp-client/src/work_conn.rs` | 37 | 85 | — |
 | `frp-server/src/control/bridge.rs` | 36 | 100 | 3323 |
 | `frp-client/src/visitor.rs` | 31 | 85 | 3685 |
+
+The `Production lines` column uses the same **pre-extraction** basis as the `Production`
+column of the measurement table above (`Total` minus inline tests): `frp-server/src/vhost.rs`
+therefore reads **3180** here while the file is now **3179** lines.
 
 This **validates** the backlog's claim that defect-prone code clusters in these
 files — and it is why the corrected priority is `service.rs`.
