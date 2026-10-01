@@ -45,6 +45,24 @@
 : "${TEST_DIR:?scripts/lib/compat-stray-guard.sh requires TEST_DIR to be set}"
 PIDS="${PIDS:-}"
 
+# Normalise trailing slashes away *before* the refusals below. Every ownership
+# match is the literal `"$TEST_DIR/"` (see `scenario_strays`), so a run dir
+# spelled with a trailing slash — `FRP_COMPAT_TEST_DIR=/tmp/x/`, which
+# `scripts/compat-test.sh:92` documents and shell tab-completion produces —
+# became `…/x//` and never matched a command line carrying `…/x/`: the census
+# came back empty, the sweep was a no-op, and `assert_no_strays` returned 0 with
+# the stray still alive (F2, measured by the adversarial reviewer).
+#
+# Refusing the spelling loudly was the alternative; normalising was chosen
+# because `…/x/` and `…/x` denote the same run directory and it is the guard,
+# not the caller, that requires one spelling — a refusal would break an
+# override that is otherwise correct. `""` and `/` are still refused below:
+# stripping trailing slashes can only shorten a path toward those, never away
+# from them.
+while [ "$TEST_DIR" != "/" ] && [ "${TEST_DIR%/}" != "$TEST_DIR" ]; do
+    TEST_DIR=${TEST_DIR%/}
+done
+
 case "$TEST_DIR" in
     ""|/)
         printf 'ERROR: refusing to guard with TEST_DIR=%q: the ownership match would degrade to "anything under a slash"\n' "$TEST_DIR" >&2
@@ -118,7 +136,20 @@ scenario_strays() {
     # If one is ever added, extend this match rather than adding a name-only
     # fallback.
     for pid in $pids; do
-        cmd=$(ps -p "$pid" -o command= 2>/dev/null) || continue
+        # A probe that cannot describe a *live* pid is not an answer and must not
+        # be read as "not ours": that is how a failing `ps` emptied the census
+        # while a live in-`TEST_DIR` stray stayed alive (F3, measured by the
+        # adversarial reviewer). A pid `pgrep` listed may legitimately have
+        # exited before this probe runs — `kill -0` tells that apart from a probe
+        # we cannot trust, so the exit race still reads as "not a stray".
+        if ! cmd=$(ps -p "$pid" -o command= 2>/dev/null) || [ -z "$cmd" ]; then
+            if kill -0 "$pid" 2>/dev/null; then
+                printf 'ERROR: cannot read the command line of live pid %s (`ps -p %s -o command=` failed or printed nothing); refusing to report a census that cannot be trusted\n' \
+                    "$pid" "$pid" >&2
+                return 2
+            fi
+            continue
+        fi
         case "$cmd" in
             *"$TEST_DIR/"*) printf '%s\n' "$pid" ;;
         esac
@@ -156,8 +187,16 @@ assert_no_strays() {
         case "$STRAY_BASELINE" in
             *" $pid "*) continue ;;
         esac
-        line=$(ps -p "$pid" -o pid=,ppid=,command= 2>/dev/null) || continue
-        if [[ -z "$line" ]]; then
+        # Same rule as the census: a probe that cannot describe a live pid is a
+        # census that cannot be trusted, not "the stray went away". A pid that
+        # genuinely exited between the scan and this read is still skipped (see
+        # above), which `kill -0` is what distinguishes (F3).
+        if ! line=$(ps -p "$pid" -o pid=,ppid=,command= 2>/dev/null) || [[ -z "$line" ]]; then
+            if kill -0 "$pid" 2>/dev/null; then
+                printf 'ERROR: cannot read the command line of live stray pid %s (`ps -p %s -o pid=,ppid=,command=` failed or printed nothing); refusing to report a census that cannot be trusted\n' \
+                    "$pid" "$pid" >&2
+                return 2
+            fi
             continue
         fi
         survivors="$survivors $pid"
@@ -170,4 +209,31 @@ assert_no_strays() {
     printf 'ERROR: compat run left stray server process(es) behind:\n%s' "$report" >&2
     kill -9 $survivors 2>/dev/null || true
     return 1
+}
+
+# Reap the in-`$TEST_DIR` strays this run did not inherit, by the exact pids the
+# census printed, honouring the baseline like `assert_no_strays` does: a server
+# that predates this run (a sibling's, or an earlier crashed run's) is not ours
+# and is left alone. This is the mid-run sweep for a helper that starts several
+# servers per scenario (`run_xtcp_test`, which used to `pkill -f "frpc -c"` /
+# `pkill -f "frps -c"`): it stops a previous scenario's leftover from holding a
+# port or reconnecting with a stale token, before the next scenario's servers
+# start. No argument pattern is ever matched here.
+#
+# Best effort by design: if the census itself fails (missing `pgrep`, a failing
+# `ps`), there is nothing to reap and this returns 0 rather than guessing; the
+# *failure* signal belongs to `assert_no_strays` in the run's exit trap, which
+# refuses an unusable census instead of sweeping on a hunch.
+reap_scoped_strays() {
+    local pid strays
+    if ! strays="$(scenario_strays)"; then
+        return 0
+    fi
+    for pid in $strays; do
+        case "$STRAY_BASELINE" in
+            *" $pid "*) continue ;;
+        esac
+        kill -9 "$pid" 2>/dev/null || true
+    done
+    return 0
 }

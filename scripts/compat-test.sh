@@ -4337,11 +4337,30 @@ run_xtcp_test() {
     fi
     should_run_test "$name" || return 0
 
-    # Kill any frpc/frps processes leaked from previous tests.
-    # Old Go frpc processes keep trying to reconnect with stale tokens,
-    # causing noise ("token doesn't match") and potential port conflicts.
-    pkill -f "frpc -c" 2>/dev/null || true
-    pkill -f "frps -c" 2>/dev/null || true
+    # Reap the servers the previous scenarios started, by the exact pids this
+    # run recorded (`track_pid`, `scripts/compat-test.sh:121`) — never by
+    # argument pattern. Two `pkill -f "frpc -c"` / `pkill -f "frps -c"` calls
+    # stood here; they matched *any* `frpc -c …` command line on the host,
+    # including a developer's unrelated run or a sibling worktree's compat run.
+    # The repository's stray rules forbid a kill by name alone, and
+    # name-plus-argument is the same hazard in a weaker form (TODO.md:8425).
+    #
+    # Every server a scenario leaves behind is tracked: `run_go`'s `exec` makes
+    # `$!` the binary itself, not a wrapper subshell, and `start_echo_server`
+    # tracks its python child — so `cleanup_pids` (the closed compat-leak item's
+    # reaper, `scripts/lib/compat-stray-guard.sh:75`) covers the stale-token
+    # reconnect noise and port conflicts the pattern kill was aimed at, by pid.
+    cleanup_pids
+    # Belt and braces for a server that somehow escaped `track_pid`: the guard's
+    # own mid-run sweep, which reaps exactly the pids its census printed and
+    # honours the baseline — so it cannot reach a server that predates the run
+    # (a sibling's), and it never matches an argument pattern (TODO.md:8425).
+    # The fixture suite drives this helper against real synthetic servers
+    # (`scripts/tests/compat-stray-guard.sh`, "the pre-test sweep"), so it is
+    # executed by CI rather than merely read. Untracked strays from this run are
+    # what the EXIT trap fails on; this only stops one perturbing the next XTCP
+    # scenario.
+    reap_scoped_strays
     sleep 0.5
     # Also kill local processes bound to our shard's base port
     local _sp

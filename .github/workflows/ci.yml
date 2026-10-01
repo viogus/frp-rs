@@ -103,35 +103,441 @@ jobs:
       - name: Repo health — gates version alignment
         run: bash scripts/repo-health.sh
       - name: Repo health — fixture checks (gate exit-code mapping)
-        run: bash scripts/tests/repo-health-fixtures.sh
+        # Same shape as the stray-guard step below, and for the same reason: the
+        # suite floors its own check count in an EXIT trap installed above its
+        # first failure point, and that in-file floor *is* enforced — a floor
+        # that is lowered (`0`), zero-padded (`00`/`000`), not a number, or even
+        # an all-digit value too large for `[ -lt ]` reds inside the suite
+        # (measured). What no in-file mechanism can survive is `exec`:
+        # `exec true` planted after the trap never runs it and exits 0 with no
+        # output at all. So the total is pinned *outside*: this step requires the
+        # suite's summary line verbatim, and 32 is what the scenarios in
+        # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:8550` round
+        # added the in-file floor; a scenario added or removed there moves this
+        # literal — restore the checks rather than lowering it). In-file,
+        # `enforce_substance` also checksums the scenario-6 metric check and the
+        # scenario-7 aliased-crate-root check byte-for-byte, so gutting either
+        # verdict reds there too. The step additionally pins the enforcer's own
+        # success line, `pinned regions verified 2/2: scenario-6 scenario-7`, so a
+        # disabled EXIT trap or a skipped check reds here even when the summary
+        # looks intact, and that literal carries the expected region set outside
+        # the guarded file. It also pins the enforcer's live canary line,
+        # `enforcer canary: injected mismatch detected, injected count mismatch
+        # detected`, which the suite prints only after it has injected a wrong
+        # hash, a wrong set and a wrong count and seen each recorded — so a
+        # one-line `got=$want`/`if false` that neuters the comparison reds here
+        # instead of sailing through with the summary intact. The `ok`-line count
+        # is the second half of the pin: `printf 'RESULT: 32 …'; exec true`
+        # satisfies the literal but prints no assertion lines at all.
+        #
+        # Round 12 (R1/R1b/R2/R3): the suite's own bytes are pinned *here*,
+        # before it runs, because the round-10 adversarial reopened every
+        # remaining defeat as a one-line edit inside the guarded file — a `case`
+        # whitelist over the expectations, a `case` that skips all but one name,
+        # a `region_sha` that fabricates a digest, or replacing the real pin
+        # loop's call with an assigned count. Those leave the in-file checks
+        # green, so the file's sha256 is the outer pin: weakening the enforcer
+        # now also requires editing `guard_pin` in this step, i.e. a two-file
+        # change a reviewer sees.
+        #
+        # Round 13: the digest is taken with an absolute, vector-proven hasher
+        # (R12-2) — `command -v sha256sum` honours a shell function and then
+        # $PATH, so a shadow planted earlier on PATH used to defeat this check.
+        # This suite sources nothing from `scripts/lib/compat-stray-guard.sh`, so
+        # it needs one pin; the stray-guard step below pins two files.
+        #
+        # The claim is that narrow — the guard catches careless single-region
+        # edits; an edit here plus a refreshed `SCEN*_REGION_SHA`, or a forged
+        # summary/evidence block, is still green (declared residues L1/L2).
+        # Round 14 moved the digest reads and the evidence matching to builtins
+        # only; the residues that remain — the fixture's own `grep`/`awk` over
+        # other files, `flip_hex`'s `tr`, a shadowed interpreter, a decoy end
+        # marker, a neutered accept line — are declared and worded in the suite.
+        # Update `guard_pin` with the digest named in the failure message when the
+        # guard legitimately changes.
+        shell: bash
+        run: |
+          set -o pipefail
+          log=/tmp/frp-repo-health-fixtures.log
+          status=0
+          guard_file=scripts/tests/repo-health-fixtures.sh
+          guard_pin=66d4af028e0c31a709c789d67c12415577028a73710267ceee4a466bee15fb39
+          # R12-2 (adversarial round 13): resolve the hasher to an absolute path
+          # and prove it with a known vector — the same candidate order and the
+          # same fail-closed mode as the guard's own `find_hash_tool()`.
+          # `command -v sha256sum` honours a shell function and then $PATH, so a
+          # `bin/sha256sum` planted earlier on PATH could return the pinned digest
+          # for bytes that changed while this check "passed".
+          # R14 (F1, adversarial round 13): the probe and `verify_guard` used to
+          # pipe the hasher through an unqualified `awk '{print $1}'`. An `awk`
+          # shim — or an exported `awk` function — earlier on PATH mapped the
+          # drifted digests back to the pins and left a genuine regression in the
+          # guarded suite green while the step still printed its pins line and
+          # exited 0 (measured on the stray-guard step, which shares this code).
+          # `${probe%% *}` is a shell expansion, so no PATH lookup stands between
+          # the absolute, vector-proven hasher and its comparison. The evidence
+          # matching further down is builtins for the same reason (see the
+          # comment there), and the guarded suite's own digest reads are
+          # PATH-free too (round 14).
+          guard_hasher=''
+          guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+          for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
+            [ -x "$cand" ] || continue
+            guard_probe=$(printf 'abc' | "$cand" 2>/dev/null)
+            [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+            guard_hasher=$cand
+            break
+          done
+          if [ -z "$guard_hasher" ]; then
+            for cand in /usr/bin/shasum /bin/shasum /usr/local/bin/shasum; do
+              [ -x "$cand" ] || continue
+              guard_probe=$(printf 'abc' | "$cand" -a 256 2>/dev/null)
+              [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+              guard_hasher="$cand -a 256"
+              break
+            done
+          fi
+          if [ -z "$guard_hasher" ]; then
+            echo "::error::no sha256 tool at an absolute path reproduces the known sha256 vector (need sha256sum or shasum); cannot verify $guard_file"
+            exit 1
+          fi
+          # $1 = file, $2 = its expected digest, $3 = the variable holding that
+          # digest (named in the failure message).
+          # shellcheck disable=SC2086  # $guard_hasher is the word-split "<abs path> [-a 256]"
+          verify_guard() {
+            local out sha
+            out=$($guard_hasher "$1" 2>/dev/null) || true
+            sha=${out%% *}
+            if [ "$sha" != "$2" ]; then
+              echo "::error::$1 is not the pinned revision (sha256 ${sha:-<none>}; expected $2)"
+              echo "::error::an edit to the guard — including one that weakens its own checks — must also update $3 in the 'Repo health — fixture checks (gate exit-code mapping)' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended, otherwise revert it"
+              return 1
+            fi
+            return 0
+          }
+          verify_guard "$guard_file" "$guard_pin" guard_pin || exit 1
+          # This suite sources nothing from `scripts/lib/compat-stray-guard.sh`
+          # (checked: no `.`/`source` of the library here), so this step needs one
+          # pin. The stray-guard step below pins two files for that reason.
+          # R14 (F1, adversarial round 13): the log used to be produced by
+          # `| tee "$log"` and matched with `grep`/`cat`, so a shadowed `tee`
+          # could write a log the suite never produced and a shadowed `grep`
+          # could vouch for it. Both jobs now use the shell's own redirection and
+          # builtins only: `$(<"$log")` reads the file back, `case`/`[ ]` match
+          # it, and the captured text is echoed once so the checks are still
+          # visible in the CI log (that replaces both the old live `tee` and the
+          # failure-path `cat`).
+          bash scripts/tests/repo-health-fixtures.sh > "$log" 2>&1 || status=1
+          guard_log=$(<"$log")
+          printf '%s\n' "$guard_log"
+          # F3/F4 (adversarial round 5): the suite must *say* it verified the
+          # substance pins, and name the regions in order. The in-file checks
+          # were previously CI-invisible — `trap - EXIT` or `elif false` printed
+          # the 32 `ok` lines and the RESULT line and exited 0 — and pinning only
+          # the total let a coordinated marker+hash+list edit drop a region
+          # silently. These two literals are the only record of the expected set
+          # outside the guarded file, so any of those leaves one of them absent
+          # and reds the step. The region line is matched as a *whole* line
+          # (round 9, F4), so a near-miss that merely embeds the literal —
+          # `… (SKIPPED)` — fails.
+          # F7 (adversarial round 5 addendum): the region line below proves the
+          # loop ran, not that its *comparison* still works — a one-line
+          # `got=$want`/`if false` in the enforcer made every pin compare equal
+          # while that line still printed. So the suite must also prove it
+          # detected a mismatch it injected on purpose: it canaries the region
+          # hash, the region set and the count, and prints the canary literal
+          # below only after all three fire. Its absence means the detection is
+          # neutered.
+          # R18 (F1, adversarial round 17): the suite can print its own failure
+          # line and still end with the pinned `RESULT: 32 … hold` and pins
+          # literal. Measured: a duplicate `scenario-7` substance-marker pair
+          # inserted ahead of the real region makes `region_set_verdict` print
+          # `FAIL  pinned-region set changed: markers name [scenario-6
+          # scenario-7 scenario-7], expected [scenario-6 scenario-7]`; neutering
+          # that one call (`|| return 1` → `|| true`,
+          # `scripts/tests/repo-health-fixtures.sh:666`) plus the mandatory
+          # `SCEN7_REGION_SHA` refresh left this step green at exit 0 with
+          # `RESULT: 32 fixture check(s) hold` and `pinned regions verified 2/2`.
+          # Any `SCEN*` region works for this recipe once its pin is refreshed:
+          # with the decoy pair placed *before* the real region, `region_lines`
+          # hashes the decoy, so the scenario-6 canary accepts the refreshed pin
+          # and stays green (measured with a scenario-6 decoy as well as 7). So an
+          # emitted failure line is fatal here on its own: the evidence chain may
+          # not report a green run that reported a failure. An honest run prints no
+          # such line (measured: zero lines starting with `FAIL` or `  FAIL`), and
+          # the match is a `case` — `grep` is deliberately not used on this path,
+          # for the round-14 reason recorded above.
+          guard_ok=0
+          guard_result=0
+          guard_regions=0
+          guard_canary=0
+          guard_fail=0
+          guard_fail_text=''
+          while IFS= read -r guard_line; do
+            case $guard_line in
+              '  ok '*) guard_ok=$((guard_ok + 1)) ;;
+              'FAIL'*|'  FAIL'*)
+                guard_fail=$((guard_fail + 1))
+                guard_fail_text="${guard_fail_text}${guard_line}"$'\n'
+                ;;
+            esac
+            if [ "$guard_line" = 'pinned regions verified 2/2: scenario-6 scenario-7' ]; then
+              guard_regions=1
+            fi
+            if [ "$guard_line" = 'enforcer canary: injected mismatch detected, injected count mismatch detected' ]; then
+              guard_canary=1
+            fi
+          done <<< "$guard_log"
+          case $guard_log in
+            *'RESULT: 32 fixture check(s) hold'*) guard_result=1 ;;
+          esac
+          [ "$guard_result" = "1" ] || status=1
+          [ "$guard_ok" = "32" ] || status=1
+          [ "$guard_regions" = "1" ] || status=1
+          [ "$guard_canary" = "1" ] || status=1
+          [ "$guard_fail" = "0" ] || status=1
+          if [ "$guard_fail" != "0" ]; then
+            echo "::error::the repo-health fixture suite printed $guard_fail failure line(s); a run that reported a failure cannot be reported as a green step:"
+            printf '%s' "$guard_fail_text"
+          fi
+          if [ "$status" != "0" ]; then
+            echo "::error::repo-health fixture checks did not report 32 checks, verified pins and a live enforcer canary"
+            echo "::error::scripts/tests/repo-health-fixtures.sh must print 32 '  ok' lines, end with 'RESULT: 32 fixture check(s) hold', print 'pinned regions verified 2/2: scenario-6 scenario-7' and print 'enforcer canary: injected mismatch detected, injected count mismatch detected'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped substance check or a neutered comparison means scenarios were skipped, neutered or swallowed — restore them rather than lowering this literal"
+            exit 1
+          fi
+          echo "repo-health fixture checks ok: 32 checks hold, pins verified 2/2, enforcer canary live"
       # The compat harness's stray-process guard, driven against synthetic
       # `frps`/`frpc` peers (no Go toolchain, no compat run): it pins that the
       # guard's match is the scratch directory *and* the process name — a
       # name-only match kills a sibling worktree's server and must red this.
       - name: Stray guard — fixture checks (compat harness teardown)
-        # The suite floors its own check count (`MIN_CHECKS`, in its EXIT trap),
-        # but a floor inside the file it guards cannot survive an `exec`: `exec
-        # true` planted after the library check never runs the trap and exits 0
-        # with no output at all, and a lowered `MIN_CHECKS=0` is quiet too. So the
-        # total is pinned *outside*, the way the `log_completion` step below pins
-        # its own 6: this step requires the suite's summary line verbatim, and 21
-        # is what the scenarios in scripts/tests/compat-stray-guard.sh print. A
-        # scenario added or removed there moves this literal — restore the checks
-        # rather than lowering it.
+        # The suite floors its own check count (`MIN_CHECKS`, in its EXIT trap)
+        # and checksums four of its regions, and both are enforced in-file: a
+        # lowered (`0`), zero-padded (`00`), non-numeric or uncomparably large
+        # `MIN_CHECKS` reds there (measured). What no in-file mechanism can
+        # survive is `exec`: `exec true` planted after the library check never
+        # runs the trap and exits 0 with no output at all. So the total is pinned
+        # *outside*, the way the `log_completion` step below pins its own 6: this
+        # step requires the suite's summary line verbatim, and 40 is what the
+        # scenarios in scripts/tests/compat-stray-guard.sh print (21 before the
+        # `TODO.md:8582` round added the ordered `SHAPE` anchors, the symlink
+        # `wait_exec` probe, the empty-`ps` branch and the failed-probe
+        # kill-then-continue case; 31 after the round-2 pins exercised the loop's
+        # empty-`cmd` guard, the exit-0-empty reap arm, and the second half of the
+        # XTCP pre-test cleanup; 40 after the round-6 regression tests added the
+        # three trailing-slash-`TEST_DIR` checks and the six untrusted-`ps` checks
+        # — the substance pins described below add a checksum, never an assertion
+        # line). In-file, `enforce_substance` additionally checksums the
+        # scenario-2, scenario-10, scenario-12 and scenario-13 regions
+        # byte-for-byte — for scenario 10 the `compat_src=` input derivation plus
+        # both assertions, for the others the whole scenario body — so forging the
+        # text those checks read reds there as well (as does gutting a verdict in
+        # place). The step additionally pins the enforcer's own success line,
+        # `pinned regions verified 4/4: scenario-2 scenario-10 scenario-12
+        # scenario-13`, so a disabled EXIT trap or a skipped check reds here even
+        # when the summary looks intact, and that literal carries the expected
+        # region set outside the guarded file. It also pins the enforcer's live
+        # canary line, `enforcer canary: injected mismatch detected, injected
+        # count mismatch detected`, printed only after the suite injected a wrong
+        # hash, a wrong set and a wrong count and saw each recorded — so a
+        # one-line `got=$want`/`if false` that neuters the comparison reds here.
+        # A scenario added or removed here moves the `pinned regions` literal —
+        # restore the checks rather than lowering it.
+        #
+        # Round 12 (R1/R1b/R2/R3): same out-of-band file pin as the repo-health
+        # step above. Every reopened defeat was a one-line edit inside this
+        # guarded file (a `case` whitelist, a `case` skipping all but one name, a
+        # `region_sha` that fabricates a digest, an assigned count in place of the
+        # real pin loop), so this file's sha256 is checked here before the suite
+        # runs.
+        #
+        # Round 13 (R12-1): pinning only this suite left the claim false — the
+        # enforcer's implementation lives in `scripts/lib/compat-stray-guard.sh`,
+        # which the suite's scenarios `source` (the `LIB=` assignment at :96 only
+        # names the path; the `source` calls are further down the file), and one
+        # edited library could stub the assertions and print both evidence
+        # literals while the suite stayed byte-identical. Both files are pinned
+        # here, so weakening either half of the guard means editing this step too
+        # — a two-file change a reviewer sees, within the residues named below.
+        # R12-2: the digests are taken with an absolute, vector-proven
+        # hasher, because `command -v sha256sum` honours a shell function and then
+        # $PATH, and a shadow planted earlier on PATH defeated the round-12 check.
+        # R12-3: the suite's content-mutation probe carries its own ledger
+        # (`MUTATION_PROBES` / `MUTATION_PROBE_RECORD`), so a `return 0` body reds
+        # in-suite as well as here.
+        #
+        # Round 14 (F1/F2/F3): the digests are parsed and the evidence lines are
+        # matched with shell builtins only. `awk` used to be piped into on both
+        # the vector proof and `verify_guard`, and `tee`/`grep`/`cat` sat between
+        # the suite and the evidence checks, so a shim (or an exported function)
+        # for any of them earlier on PATH could map a drifted digest back to the
+        # pin — demonstrated: an `awk` shim kept a real regression in this suite
+        # green at exit 0, and a hostile `tee` forged the evidence line; both red
+        # now. Residues, named rather than denied: the fixtures' own
+        # `grep`/`sed`/`awk` over *other* files are still PATH-resolved — a `grep`
+        # shim answering "no hits" is a real false negative for the scenario that
+        # watches the unpinned `scripts/compat-test.sh`, never a defeated pin —
+        # and an unpinned in-repo file (or the repo-health step above) can put such
+        # a shim ahead on `$PATH` via `$GITHUB_PATH`; `flip_hex`'s `tr` and the
+        # `mktemp` probe directory are fail-closed only; and a shadowed `bash`
+        # interpreter or a replaced absolute candidate (`/usr/bin/sha256sum` …) is
+        # out of scope — verifying the verifier's own toolchain needs something
+        # that toolchain cannot supply. L2-class fragilities declared here, not
+        # closed — examples: `region_lines` stops at the first end marker (a decoy
+        # end marker truncates the hashed text); the unguarded accept-direction
+        # `region_pin_check` in `enforce_substance`'s mutation-probe caller loop
+        # (`scripts/tests/compat-stray-guard.sh:842`) is a one-file neuter; and that
+        # loop's ledger assertion (`scripts/tests/compat-stray-guard.sh:847`) is the
+        # sole catcher of a forged `MUTATION_PROBE_RECORD`. The list is not
+        # exhaustive — the reject-direction block above the assertion and the
+        # `region_hash_verdict … || return 1` call are the same shape.
+        #
+        # The claim stays narrow: careless single-region edits are caught; an
+        # in-file edit plus a refreshed `SCEN*_REGION_SHA`, or a forged
+        # summary/evidence block, is still green (declared residues L1/L2). Files
+        # still outside the pinned set: `scripts/compat-test.sh` (the wider compat
+        # harness, not run by this step) and the other fixture suites.
         shell: bash
         run: |
           set -o pipefail
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
-          bash scripts/tests/compat-stray-guard.sh 2>&1 | tee "$log" || status=1
-          grep -qF 'RESULT: 21 fixture check(s) hold' "$log" || status=1
-          if [ "$status" != "0" ]; then
-            echo "::error::compat stray-guard fixture checks did not report 21 checks"
-            echo "::error::scripts/tests/compat-stray-guard.sh must end with 'RESULT: 21 fixture check(s) hold'; a smaller total, a failure line or no output means scenarios were skipped, neutered or swallowed by an \`exec\` — restore them rather than lowering this literal"
-            cat "$log"
+          guard_file=scripts/tests/compat-stray-guard.sh
+          guard_pin=4f2df348b816f664d79613a7ee46417163e839450d948f82dae303996a4fe246
+          # R12-1 (adversarial round 13): the enforcer's *implementation* lives in
+          # the library the scenarios `source` (the `LIB=` assignment at :96 only
+          # names it), so pinning only the suite left the "two-file change" claim
+          # false — one edited library could stub the assertions and print both
+          # evidence literals while the suite stayed byte-identical. Both files are
+          # pinned here.
+          guard_lib=scripts/lib/compat-stray-guard.sh
+          guard_lib_pin=a335320e87c65f36aff05ec79d83bb51f996fdb1e9125c0c9daa12ad3b658189
+          # R12-2 (adversarial round 13): resolve the hasher to an absolute path
+          # and prove it with a known vector — the same candidate order and the
+          # same fail-closed mode as the guard's own `find_hash_tool()`.
+          # `command -v sha256sum` honours a shell function and then $PATH, so a
+          # `bin/sha256sum` planted earlier on PATH could return the pinned digest
+          # for bytes that changed while this check "passed".
+          # R14 (F1, adversarial round 13): the probe and `verify_guard` used to
+          # pipe the hasher through an unqualified `awk '{print $1}'`. An `awk`
+          # shim — or an exported `awk` function — earlier on PATH mapped the
+          # drifted digests back to the pins and left a genuine regression in the
+          # guarded suite green while the step printed `pins verified 4/4` and
+          # exited 0 (measured). `${probe%% *}` is a shell expansion, so no PATH
+          # lookup stands between the absolute, vector-proven hasher and its
+          # comparison. The evidence matching further down is builtins for the
+          # same reason (see the comment there).
+          guard_hasher=''
+          guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+          for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
+            [ -x "$cand" ] || continue
+            guard_probe=$(printf 'abc' | "$cand" 2>/dev/null)
+            [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+            guard_hasher=$cand
+            break
+          done
+          if [ -z "$guard_hasher" ]; then
+            for cand in /usr/bin/shasum /bin/shasum /usr/local/bin/shasum; do
+              [ -x "$cand" ] || continue
+              guard_probe=$(printf 'abc' | "$cand" -a 256 2>/dev/null)
+              [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+              guard_hasher="$cand -a 256"
+              break
+            done
+          fi
+          if [ -z "$guard_hasher" ]; then
+            echo "::error::no sha256 tool at an absolute path reproduces the known sha256 vector (need sha256sum or shasum); cannot verify $guard_file"
             exit 1
           fi
-          echo "compat stray-guard fixture checks ok: 21 checks hold"
+          # $1 = file, $2 = its expected digest, $3 = the variable holding that
+          # digest (named in the failure message).
+          # shellcheck disable=SC2086  # $guard_hasher is the word-split "<abs path> [-a 256]"
+          verify_guard() {
+            local out sha
+            out=$($guard_hasher "$1" 2>/dev/null) || true
+            sha=${out%% *}
+            if [ "$sha" != "$2" ]; then
+              echo "::error::$1 is not the pinned revision (sha256 ${sha:-<none>}; expected $2)"
+              echo "::error::an edit to the guard — including one that weakens its own checks — must also update $3 in the 'Stray guard — fixture checks (compat harness teardown)' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended, otherwise revert it"
+              return 1
+            fi
+            return 0
+          }
+          verify_guard "$guard_file" "$guard_pin" guard_pin || exit 1
+          verify_guard "$guard_lib" "$guard_lib_pin" guard_lib_pin || exit 1
+          # R14 (F1, adversarial round 13): as in the repo-health step above, the
+          # log is produced by the shell's own redirection and matched with
+          # builtins only — `tee`, `grep` and `cat` used to sit between the suite
+          # and this step's evidence checks, so a shadowed one could vouch for a
+          # log the suite never wrote. The captured text is echoed once, which
+          # replaces the old live `tee` and the failure-path `cat`.
+          bash scripts/tests/compat-stray-guard.sh > "$log" 2>&1 || status=1
+          guard_log=$(<"$log")
+          printf '%s\n' "$guard_log"
+          # F3/F4 (adversarial round 5): same positive-evidence pin as the
+          # repo-health step above. `trap - EXIT` or `elif false` used to keep
+          # this step green while the substance check never ran, and pinning only
+          # the total let three coordinated edits drop scenario-13. This literal
+          # carries the expected region set outside the guarded file, and it is
+          # matched as a whole line (round 9, F4) rather than as a substring, so a
+          # near-miss such as `... (SKIPPED)` fails.
+          # F7 (adversarial round 5 addendum): same live-canary pin as the
+          # repo-health step above — the region check, the set check and the count
+          # check each had a mismatch injected and each had to be recorded. A
+          # `got=$want` or `if false` in the enforcer leaves this line absent.
+          # R18 (F1, adversarial round 17): the suite can print its own failure
+          # line and still end with the pinned `RESULT: 40 … hold` and pins
+          # literal. Measured: a duplicate `scenario-10` substance-marker pair
+          # inserted ahead of the real region makes `region_set_verdict` print
+          # `FAIL  pinned-region set changed: markers name [scenario-2
+          # scenario-10 scenario-10 scenario-12 scenario-13], expected …`;
+          # neutering that one call (`|| return 1` → `|| true`,
+          # `scripts/tests/compat-stray-guard.sh:885`) plus the mandatory in-file
+          # pin refresh left this step green at exit 0. So an emitted failure line
+          # is fatal here on its own: the evidence chain may not report a green
+          # run that reported a failure. An honest run prints no such line
+          # (measured: zero lines starting with `FAIL` or `  FAIL`), and the match
+          # is a `case` — `grep` is deliberately not used on this path, for the
+          # round-14 reason recorded above.
+          guard_ok=0
+          guard_result=0
+          guard_regions=0
+          guard_canary=0
+          guard_fail=0
+          guard_fail_text=''
+          while IFS= read -r guard_line; do
+            case $guard_line in
+              '  ok '*) guard_ok=$((guard_ok + 1)) ;;
+              'FAIL'*|'  FAIL'*)
+                guard_fail=$((guard_fail + 1))
+                guard_fail_text="${guard_fail_text}${guard_line}"$'\n'
+                ;;
+            esac
+            if [ "$guard_line" = 'pinned regions verified 4/4: scenario-2 scenario-10 scenario-12 scenario-13' ]; then
+              guard_regions=1
+            fi
+            if [ "$guard_line" = 'enforcer canary: injected mismatch detected, injected count mismatch detected' ]; then
+              guard_canary=1
+            fi
+          done <<< "$guard_log"
+          case $guard_log in
+            *'RESULT: 40 fixture check(s) hold'*) guard_result=1 ;;
+          esac
+          [ "$guard_result" = "1" ] || status=1
+          [ "$guard_ok" = "40" ] || status=1
+          [ "$guard_regions" = "1" ] || status=1
+          [ "$guard_canary" = "1" ] || status=1
+          [ "$guard_fail" = "0" ] || status=1
+          if [ "$guard_fail" != "0" ]; then
+            echo "::error::the stray-guard fixture suite printed $guard_fail failure line(s); a run that reported a failure cannot be reported as a green step:"
+            printf '%s' "$guard_fail_text"
+          fi
+          if [ "$status" != "0" ]; then
+            echo "::error::compat stray-guard fixture checks did not report 40 checks, verified pins and a live enforcer canary"
+            echo "::error::scripts/tests/compat-stray-guard.sh must print 40 '  ok' lines, end with 'RESULT: 40 fixture check(s) hold', print 'pinned regions verified 4/4: scenario-2 scenario-10 scenario-12 scenario-13' and print 'enforcer canary: injected mismatch detected, injected count mismatch detected'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped substance check or a neutered comparison means scenarios were skipped, neutered or swallowed — restore them rather than lowering this literal"
+            exit 1
+          fi
+          echo "compat stray-guard fixture checks ok: 40 checks hold, pins verified 4/4, enforcer canary live"
       - name: RSS soak — run-dir guard + summary fixture
         run: bash scripts/tests/rss-soak-run-dir.sh
 
@@ -868,7 +1274,7 @@ jobs:
         # bin-target unit tests are covered by `Run frps bin unit tests` above),
         # and the `Lint` lane only *compiles* the test targets (`cargo clippy
         # --workspace --all-targets --all-features`). So that file — added with
-        # the CLI config-failure fix (`TODO.md:1503`) — executed in no lane, and
+        # the CLI config-failure fix (`TODO.md:3129`) — executed in no lane, and
         # the frps half of that fix had no executing pin.
         #
         # Measured warm, macOS arm64: 2.47 s wall for the package (4 tests, the

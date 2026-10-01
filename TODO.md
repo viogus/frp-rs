@@ -8422,7 +8422,7 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** the e2e window is tight enough that a wrong call-site backoff reds it (or the
   assertion compares against the pinned constant rather than a range), and the NewWorkConn path is
   covered or its absence explained.
-- [ ] **`scripts/compat-test.sh`'s XTCP helper still kills by argument pattern — the class of kill the compat-leak item forbade for its own children.**
+- [x] **`scripts/compat-test.sh`'s XTCP helper still kills by argument pattern — the class of kill the compat-leak item forbade for its own children.**
   Filed by the coordinator while closing the "`scripts/compat-test.sh` leaks its children" item above.
   Inside `run_xtcp_test` (`scripts/compat-test.sh:4331`), the pre-test cleanup is
   `pkill -f "frpc -c"` / `pkill -f "frps -c"` (`:4343-4344`, under the comment at `:4340-4342`), i.e.
@@ -8432,9 +8432,19 @@ section; ledger now **24 open / 104 closed**.**
   repository's stray rules say "never by name alone"; name-plus-argument is the same hazard in a
   weaker form.
   **Done-when:** replace the two `pkill -f` calls with the pid-exact sweep the closed item added
-  (`scenario_strays`/`assert_no_strays` at `scripts/lib/compat-stray-guard.sh:90`/`:150`, or a per-scenario pid
+  (`scenario_strays`/`assert_no_strays` at `scripts/lib/compat-stray-guard.sh:108`/`:181`, or a per-scenario pid
   file), so a full XTCP run leaves no process it did not start, or record why the pattern kill is
   required there (e.g. a `fuser`/pid-file route is impossible for that shard's Go children).
+
+  **Done (PR #430, code head `340b48bf`).** The two `pkill -f` calls are gone: `run_xtcp_test` now calls
+  `cleanup_pids` (`scripts/compat-test.sh:4353`) and then `reap_scoped_strays` (`:4363`) — the exact-pid route
+  the closed compat-leak item added (`cleanup_pids`/`reap_scoped_strays` at
+  `scripts/lib/compat-stray-guard.sh:75`/`:227`), which subtracts the run's baseline, keeps to the run's own
+  `$TEST_DIR/` prefix and signals by pid, so a developer's unrelated `frpc -c …` is untouched. The replaced lines
+  survive as the comment at `scripts/compat-test.sh:4342`. Teeth: fixture scenario 10 reads `run_xtcp_test`'s
+  body and requires both helpers (`scripts/tests/compat-stray-guard.sh:1419`/`:1421`, verdict `:1423`, asserted as
+  the ordered label at `:255`) and then drives `reap_scoped_strays` against live synthetics (`:1449`); the fixture
+  suite itself is digest-pinned at `.github/workflows/ci.yml:406`, so a reverted sweep reds the `health` job.
 - [x] **`frpc/tests/warn_delivery.rs` snapshots its counts after a fixed 500 ms settle — the same class of load-dependent wait `frps/tests/log_completion.rs` just lost.**
   Filed by the coordinator while closing the `log_completion` flake item above, correcting that
   close-out's own residual note. This file does **not** read a rotation file — its contract
@@ -8537,9 +8547,9 @@ section; ledger now **24 open / 104 closed**.**
   exposure to the `api_timeout_before_the_subcommand_reaches_the_command` flake (1322 ms measured against its
   5 s bound).
 
-- [ ] **`scripts/tests/repo-health-fixtures.sh` cannot detect its own neutering — the hole the compat guard's `MIN_CHECKS` just closed.**
+- [x] **`scripts/tests/repo-health-fixtures.sh` cannot detect its own neutering — the hole the compat guard's `MIN_CHECKS` just closed.**
   Filed by the coordinator from the `test-harness-strays` round-2 adversarial round (read at
-  `506f9465`). The suite ends with a bare `exit "$fail"` (`scripts/tests/repo-health-fixtures.sh:371`)
+  `506f9465`). The suite ends with a bare `exit "$fail"` (`scripts/tests/repo-health-fixtures.sh:1493`)
   and keeps no total-count floor, so a regression that stops the scenarios from running still reports
   green in the `health` job. The measured shapes (round-2 adversarial, on copies): an early `exit 0`
   after the `RC_PY` preflight (`:78`) exits 0 with **no output at all**, so no `RESULT:` line exists;
@@ -8556,7 +8566,20 @@ section; ledger now **24 open / 104 closed**.**
   installed before the first `ok`/`bad`, the floor equal to the current check count), and emptying a
   scenario body — or inserting an early `exit 0` — reds the suite.
 
-- [ ] **Four more `scripts/tests/compat-stray-guard.sh` residues the delta-3 reviews measured — each is a way the guard can report green while doing less.**
+  **Done (PR #430, code head `340b48bf`).** `scripts/tests/repo-health-fixtures.sh` now installs its EXIT trap
+  before the path resolution, the preflights and the first `ok`/`bad` — `trap cleanup_all EXIT` (`:787`), above the
+  path resolution (`:789`), the preflights (`:847-857`) and the first check (`:1058`); the block comment at `:44-52`
+  still reads as if the install were up there and is left for a comment pass — and it enforces a floor equal to the
+  measured green count — `MIN_CHECKS=32` (`:91`), with a disabled or non-numeric floor rejected (`:720-739`) — and
+  `enforce_substance()` (`:484`) asserts the suite's own pins rather than only the total, so the suite answers for
+  its own neutering instead of relying on the `health` job's grep alone. An early `exit 0` or an emptied scenario
+  body now drops the count below the floor (or skips the trap) and reds; the job keeps the outside-the-file half —
+  `RESULT: 32 fixture check(s) hold` (`.github/workflows/ci.yml:292`, diagnostic `:305`) — so the floor is asserted
+  both inside and outside the file. The count is the pin this suite can keep: pinning an ordered assertion list
+  would need a second instrumented counter per scenario, and that residual is recorded in the batch's author
+  report for the filing round (summarised in PR #430's round history).
+
+- [x] **Four more `scripts/tests/compat-stray-guard.sh` residues the delta-3 reviews measured — each is a way the guard can report green while doing less.**
   Filed by the coordinator from the `test-harness-strays` delta-3 round (R1 and R2 both read
   `0a350583`; R1 measured the trait at `scripts/tests/compat-stray-guard.sh:79-86`, R2 at `:86`,
   `:44-60` and `:141`). (a) The trap's own ownership probe treats "`ps` could not run" as "this pid is
@@ -8574,6 +8597,24 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** (a) uses the kill-then-continue form or the leak is proven unreachable; (b), (c) and
   (d) are each fixed or recorded as deliberate with the mutant that shows the gap — for (d) that means
   the guard's total is replaced by, or supplemented with, a per-scenario shape assertion.
+
+  **Done (PR #430, code head `340b48bf`).** All four residues are closed in place. (a) the ownership probe now
+  kills and continues when `ps` cannot run (`reap_own_synthetic`, `scripts/tests/compat-stray-guard.sh:289`) and on
+  an empty `ps` (`:293-294`) instead of forgiving a live synthetic. (b) `wait_exec` no longer anchors on the
+  suite's own resolved path: it reads this shell's own command line from the same probe (`:1052`) and requires the
+  child's line to differ from it (`:1069`), so a symlinked invocation no longer matches the child's pre-exec `$0`
+  alias — the resolved-path anchor was the old bug, as the in-file comment (`:1043-1048`) records; the probe-mode
+  block (`:1089`+) measures it and the fork-level pins at `:249-251` cover the pre-exec fork and both "`ps`
+  printed nothing" arms. (c) a `ps` that exits 0 with empty
+  output is no longer read as "the image changed": `wait_exec` (`:1050`) returns rc 2 with "printed nothing;
+  cannot tell whether the helper has exec-ed yet" (`:1057`/`:1066`). (d) the total is supplemented by
+  `enforce_shape()` (`:312`), which compares the run's ordered `LABELS` list against the expected per-scenario
+  shape, so deleting four checks and adding four dummy `ok` lines no longer keeps the guard green. The floor stays
+  `MIN_CHECKS=40` (`:223`) and the CI step keeps both its count literal (`.github/workflows/ci.yml:524`) and the
+  FAIL-line arm (`:532`, diagnostic `:537`). The two accepted bounds the item recorded (the fixed `/tmp` log path,
+  the SIGKILL orphan) are unchanged.
+  Ledger after this close: **13 open / 189 closed** (base `366bbcaa`: 15 open / 186 closed; this branch closes
+  three items and files one residue item, below).
 
 - [x] **A non-regular file named `*.{toml,ini,json,yaml,yml}` inside a `--config-dir` hangs the lane forever.**
   Filed by the #426 round-3 adversarial review while closing the `--config-dir` batch. `collect_config_files`
@@ -9069,3 +9110,16 @@ section; ledger now **24 open / 104 closed**.**
   `#[cfg]`-gated away, so `--strict-config` accepts the key and the running server silently ignores it
   with no warning — a real strict-parser/serde divergence left open. Ledger after this close:
   **15 open / 186 closed** (base `e4c23b2f`: 16 open / 185 closed).
+
+- [ ] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
+  Filed by the coordinator while closing `TODO.md:8425` (PR #430), which removed the two local `pkill -f`
+  calls in `scripts/compat-test.sh`: `scripts/remote-frps.sh:195` and `:339` still run
+  `pkill -f 'frps -c frps.toml'` and `:409` uses `pgrep -f` on the same text, over ssh, to manage the
+  comparison server on a remote VPS. Name-plus-argument is the same hazard the local sweep just lost — a
+  process on the remote host whose command line merely contains that text is reaped too — but the local
+  `$TEST_DIR/`-prefix baseline and baseline subtraction the new sweep relies on do not exist on the remote
+  side, so the fix needs its own design (a remote pid file, or a port-scoped `fuser` route) rather than a copy
+  of `reap_scoped_strays`. PR #430's residue table names the three call sites.
+  **Done-when:** the remote helper reaps by exact pid (a pid file written where it starts the server, or a
+  port-scoped lookup) instead of `pkill -f`/`pgrep -f`, or the pattern kill is recorded as required with the
+  measurement that shows a pid route is impossible over that ssh path.
