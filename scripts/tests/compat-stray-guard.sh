@@ -189,8 +189,10 @@ fails=0
 # declared rather than denied: `region_lines` stops at the first end marker, so a
 # decoy `# --- end substance pin: scenario-10 ---` truncates the hashed text
 # (still needs a refreshed pin to stay green), and the accept-direction line in
-# `enforce_substance` is a single unguarded command that a one-file edit can
-# neuter.
+# `enforce_substance`'s mutation-probe caller loop
+# (`scripts/tests/compat-stray-guard.sh:824`,
+# `region_pin_check "$name" "$const" "$got" "$copy" 2>/dev/null || mutated_fail=1`)
+# is a single unguarded command that a one-file edit can neuter.
 #
 # A floor of 0 (or an unset floor) disables the guard from inside, which the
 # sibling suite learned the hard way; that is a failure here too. So is a

@@ -161,7 +161,7 @@ jobs:
           log=/tmp/frp-repo-health-fixtures.log
           status=0
           guard_file=scripts/tests/repo-health-fixtures.sh
-          guard_pin=05a072275b747b3cbc0ec13f4004923dfb7dbd811d2e6431f55ddb118a395791
+          guard_pin=16057d157c6fc44531aaa7b3403524f68d300c7bd064d6ea33700d5a8dfeae9a
           # R12-2 (adversarial round 13): resolve the hasher to an absolute path
           # and prove it with a known vector — the same candidate order and the
           # same fail-closed mode as the guard's own `find_hash_tool()`.
@@ -354,8 +354,9 @@ jobs:
         # out of scope — verifying the verifier's own toolchain needs something
         # that toolchain cannot supply. Two L2-class fragilities are declared, not
         # denied: `region_lines` stops at the first end marker (a decoy end marker
-        # truncates the hashed text) and the accept-direction line in
-        # `enforce_substance` is a single unguarded command.
+        # truncates the hashed text) and the unguarded accept-direction
+        # `region_pin_check` in `enforce_substance`'s mutation-probe caller loop
+        # (`scripts/tests/compat-stray-guard.sh:824`) is a one-file neuter.
         #
         # The claim stays narrow: careless single-region edits are caught; an
         # in-file edit plus a refreshed `SCEN*_REGION_SHA`, or a forged
@@ -368,7 +369,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=fb3361d1480d509b336b2cc103a95498417965df4bc3a17ad606bd4ae5d55c12
+          guard_pin=ef7ce03342f78156961fafb90bd3dc9139d3c3cfbd0fab043974319d7b3e4193
           # R12-1 (adversarial round 13): the enforcer's *implementation* lives in
           # the library the scenarios `source` (the `LIB=` assignment at :96 only
           # names it), so pinning only the suite left the "two-file change" claim
