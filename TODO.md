@@ -6768,6 +6768,18 @@ nothing about whether the described behaviour still holds.
   The remaining blocks (HTTP vhost, HTTPS vhost, TCPMux, SSH tunnel gateway, KCP, QUIC, dashboard,
   `tasks.rs`) are tracked in the plan doc, which now records what has landed.
 
+  **Progress (2026-10-01, code head `35497f66` on `refactor/fileify-vhost-tests`, PR #452).** The
+  P0/P7 split landed: `frp-server/src/vhost.rs`'s inline `#[cfg(test)] mod tests` moved into
+  `frp-server/src/vhost/tests.rs` as a uniform 4-space dedent plus stock `cargo fmt`
+  (`rustfmt(dedent(original body))` is byte-identical to the committed file; zero hand edits), so
+  the production file drops **6331 → 3179 lines (−49.8%)**. `vhost.rs:1-3177` are byte-identical
+  to base and the only added production line is `mod tests;`; the 7 rustfmt re-wrap sites leave the
+  string/byte/char literal-value multiset unchanged (1377 tokens), and all 765 `-- --list` names
+  (61 under `vhost::tests::`) and every `crate::vhost::` caller are unchanged. The literal
+  `git diff -U0 | grep -E '^[+-].*"'` check is non-zero (2346) **by construction** for a
+  file-to-file move, so it is replaced by those byte-identity and literal-value proofs (calibrated
+  the same way on the merged pure move `771294a3`: 1520). Ledger unchanged: **19 open / 181 closed**.
+
 - [x] **Three vendored crates are a standing maintenance liability.**
   Evidence: `vendor/rustls` (TLS, patched), `vendor/yamux` (5 patches),
   `vendor/russh` (2 patches). `[patch.crates-io]` pins them: upstream security
