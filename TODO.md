@@ -8448,7 +8448,34 @@ section; ledger now **24 open / 104 closed**.**
   test that counts executions across a login (and, if the reload path re-reads the source, that path
   is counted too), or the double read is documented as deliberate with the measured rows and the
   reason it cannot be de-duplicated.
-- [ ] **The restored `tokenSource` re-arm oracle cannot see a wrong-but-fast backoff, and the NewWorkConn token path is uncovered.**
+- [x] **The restored `tokenSource` re-arm oracle cannot see a wrong-but-fast backoff, and the NewWorkConn token path is uncovered.**
+  **Done (2026-10-02, at fix `cd0f92ab` on `fix/tokensource-rearm-oracle`, PR #449, based on `f881d15e`).** Both
+  oracles now read one constant: `PING_FIRST_BACKOFF` (`frp-client/src/service.rs:712`,
+  `pub const PING_FIRST_BACKOFF: Duration = Duration::from_secs(2)`) is what `next_ping_backoff` returns for
+  `prev == None` (`frp-client/src/service.rs:730`), and the e2e oracle derives its window from it —
+  `let rearm_min = PING_FIRST_BACKOFF / 2;` / `let rearm_max = PING_FIRST_BACKOFF + PING_FIRST_BACKOFF / 2;`
+  (`frp-client/tests/heartbeat_wire_order.rs:772-773`, `assert!` at `:774:9`) — instead of the hand-written
+  `[1.0 s, 6.0 s]`, which is exactly what let a wrong-but-fast call-site backoff stay green. Teeth, measured
+  with each helper restored from git afterwards: a 5 s literal replacing the `next_ping_backoff` call at the
+  call site (`frp-client/src/service.rs:3539`) is RED — `panicked at frp-client/tests/heartbeat_wire_order.rs:774:9: Ping#2 arrived 5007ms after the failed tick` — while the SAME mutant passes the old range (`test result: ok. 1 passed; 0 failed`), reproducing this item's premise; deleting
+  `interval.reset_after(delay)` (`frp-client/src/service.rs:3541`) is still RED (9982 ms), so the tightened
+  window keeps the teeth it was created for; and a drifted constant (3 s) is RED in the unit test's new value
+  pin (`assert_eq!(PING_FIRST_BACKOFF, Duration::from_secs(2), …)` at `frp-client/src/service.rs:5171:9`,
+  `left: 3s` / `right: 2s`) — the division of labour this close rests on is that the unit test owns the exact
+  Go-parity value and the e2e window owns substitution at the call site. The NewWorkConn token path is now
+  **covered, not explained**: `oidc_token_source_fills_new_work_conn_privilege_key`
+  (`frp-client/src/work_conn.rs:2524`, `#[cfg(feature = "oidc")]`) drives the real `spawn_work_conn` against a
+  loopback listener with `client_auth_scopes = ["NewWorkConns"]` and an OIDC client built on an exec
+  `tokenSource`, reads the plaintext V1 `NewWorkConn`, and asserts `privilege_key == Some("nwc-oidc-token")`
+  (the raw source output, not a hash), `timestamp.is_none()`, and exactly one exec invocation; skipping the
+  auth block (`frp-client/src/work_conn.rs:1759`) reds it at `:2599:17` with `left: None`, so the pin is the
+  key on the wire, not the frame's arrival. No user-visible behaviour changed — oracle and new test only, the
+  re-arm semantics shipped in #437 — so no `CHANGELOG.md` bullet. Residue stated, not hidden: the e2e window
+  `[P/2, 3P/2]` (`[1 s, 3 s]`) still passes a wrong literal *close* to 2 s (e.g. 2.2 s), because a tighter
+  window is not stable against e2e tick timing; the unit test's exact-value pin is what covers that class, and
+  the two tests red for different mutants. Ledger after this close: **18 open / 182 closed** (base `f881d15e`:
+  19 open / 181 closed).
+
   Filed from the round-2 adversarial review of `fix/tokensource-single-exec` (the item above).
   `skipped_ping_rearms_interval_on_two_second_backoff` (`frp-client/tests/heartbeat_wire_order.rs:660`)
   asserts the re-arm only inside `Ping#2-T2 in [1.0 s, 6.0 s]`, so hardcoding a 5 s backoff at the
