@@ -278,7 +278,7 @@ jobs:
       # `cargo test -p frps --test cli_exit_codes -- --list`.
       # 44 → 45 with the `-l`-shorthand refusal pin
       # `short_l_is_not_a_frps_shorthand_and_the_refusal_is_pinned`
-      # (`TODO.md:8884`): +1. Re-derived with the same `--list` command.
+      # (`TODO.md:8954`): +1. Re-derived with the same `--list` command.
       FRPS_CLI_TESTS: "45"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
@@ -1044,7 +1044,7 @@ jobs:
         # `--log-max-days 0`, both arbited by Go's `-c` lane — see the file's own
         # section comments), and 9 → 10 with the `-c`-lane non-empty-flag pin
         # `cli_nonempty_log_level_flag_does_not_override_the_config_file`
-        # (`TODO.md:8831`). It is the count of `#[test]`s in that one file, and
+        # (`TODO.md:8901`). It is the count of `#[test]`s in that one file, and
         # it lives in exactly one place in this step — the `expected=` line — so
         # a new pin means editing one number, not hunting a duplicated one.
         #

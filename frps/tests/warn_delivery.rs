@@ -484,10 +484,10 @@ fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
 /// `KEY` record, and still satisfies `frp-core`'s own dispatch test — that one
 /// passes the caller's answer as an argument, so it never sees a real build's
 /// answer. Only an assertion on the captured stdout can, and that is what binds
-/// `frps/src/main.rs:245`/`:469` (and the reload site,
-/// `frp-server/src/service.rs:2333`) to the build under test. The lane that runs
-/// this file **without** `--features dashboard` is what makes the no-dashboard
-/// direction observable.
+/// the two `frps/src/main.rs` emit sites (`:1037` on the `-c` path, `:601` on the
+/// `--config-dir` path) and the reload site `frp-server/src/service.rs:2048` to the
+/// build under test. The lane that runs this file **without** `--features dashboard`
+/// is what makes the no-dashboard direction observable.
 ///
 /// The **no-TLS** clause is unreachable from this binary's lanes: `dashboard`
 /// decides the first question, and every lane that runs this file links

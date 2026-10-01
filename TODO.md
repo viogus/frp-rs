@@ -8109,7 +8109,7 @@ section; ledger now **24 open / 104 closed**.**
   (killing that guard) or the dormant branch is removed, and the case-insensitive-volume limitation
   is recorded where the containment check is documented.
 
-  **(d) Done (this batch, code head `9871b9eb`).** The dormant `if [ -z "$TREE" ]` guard was removed from
+  **(d) Done (this batch, code head `3020174c`).** The dormant `if [ -z "$TREE" ]` guard was removed from
   `scripts/tests/repo-health-fixtures.sh`: with it gone the suite still reports `RESULT: 32 fixture check(s) hold`,
   and the `setup_die`-returns mutant is still rejected by scenario 9 itself (`rows ran past the failed
   setup: ln: /docs/archive/bad.md: No such file or directory`); the removed guard's `exit 1` was reachable only under that same mutant, where it fired an extra `fixture abort:` row (the file's own comment at `scripts/tests/repo-health-fixtures.sh:265-269`). The `mut_prefix` containment anchor still counts 4 sites. The
@@ -8497,7 +8497,7 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** an `Err` other than `ErrorKind::Interrupted` is distinguished from EOF and asserted absent (or
   the join reports it), or the fail-safe direction is argued for both row kinds.
 
-  **Done (this batch, code head `9871b9eb`).** `drain` now returns `std::io::Result<()>`: `Ok(0)` is EOF,
+  **Done (this batch, code head `3020174c`).** `drain` now returns `std::io::Result<()>`: `Ok(0)` is EOF,
   `ErrorKind::Interrupted` retries the read, and any other error is returned to `Spawned::join_drains`, which
   reports the capture as truncated rather than final. A new `mod drain_tests` covers the three shapes, and a
   mutant that folds a non-EOF error back into `Ok(())` (the old `Err(_) => return Ok(())` shape) reds
@@ -8716,7 +8716,7 @@ section; ledger now **24 open / 104 closed**.**
   `scripts/tests/rss-soak-run-dir.sh`).
   **Done-when:** the comment names the three.
 
-  **Done (this batch, code head `9871b9eb`).** `.github/workflows/ci.yml:87-89` now reads "files with
+  **Done (this batch, code head `3020174c`).** `.github/workflows/ci.yml:87-89` now reads "files with
   grep/find only, plus three fixture scripts that drive the repo-health, stray-guard and RSS-soak run-dir
   rules against synthetic inputs", naming exactly the three it runs (`scripts/tests/repo-health-fixtures.sh`
   at `ci.yml:106`, `scripts/tests/compat-stray-guard.sh` at `:126`, `scripts/tests/rss-soak-run-dir.sh`
@@ -8998,7 +8998,7 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** the `frps` dashboard captures pin the record's bytes, the level is compared untrimmed, the
   following-line bytes are covered, and each of the three mutants reds the `frps` lane itself.
 
-  **Done (this batch, code head `9871b9eb`).** The `frps` dashboard lane is now a catcher, not a
+  **Done (this batch, code head `3020174c`).** The `frps` dashboard lane is now a catcher, not a
   count-plus-clause reader: `records_containing` (`frps/tests/warn_delivery.rs:724`) keeps each record's
   terminating newline and `assert_records_are_exactly_the_message` (`:760`) byte-pins it, with
   `assert_web_server_tls_enable_records_are_exactly_the_message` (`:809`) selecting the expected text by
@@ -9016,13 +9016,13 @@ section; ledger now **24 open / 104 closed**.**
   (`got tail: "\n\n"`). Limit: the `cfg!(feature = "dashboard")` branch was verified green, but only the
   no-dashboard build was mutant-tested; the doc comment now claims the same four rejections as the shared helper
   (`:609-626`).
-  Ledger after this close: **22 open / 178 closed** (base `799ce048`: 25 open / 174 closed; this batch closes
+  Ledger after this close: **16 open / 185 closed** (base `f881d15e`: 19 open / 181 closed; this batch closes
   four items — one whole item each for the drain error, the stale health-job comment and the dashboard
   captures, plus part (d) completing the four-residue item — and files the one residue below).
 
 - [ ] **The ported `frps` warning-capture oracle is weaker than the `frp-core` original in three ways the H2 batch did not close.**
   Filed by the coordinator from the H2 batch's adversarial review (`/private/tmp/rev-h2-attack.md`, measured at
-  head `4006a23a` on base `ed2d71a3`); all three are coverage gaps the mutant matrix did not reach, not false
+  the pre-rebase code head, patch-identical to `3020174c`, on base `ed2d71a3`); all three are coverage gaps the mutant matrix did not reach, not false
   assertions. (a) An emit-site mutant that appends a *well-formed* `tracing` record — a second `warn!` rather
   than trailing bytes — stays green across all 17 `frps` tests (`frps/tests/warn_delivery.rs`), because
   `assert_records_are_exactly_the_message` (`:760`) byte-pins the records it is handed, not the number the child
