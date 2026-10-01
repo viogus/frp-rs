@@ -353,22 +353,25 @@ pub(super) fn process_includes(
     } else {
         None
     };
-    // An empty pattern means "no includes", not a directory-less pattern. Go
-    // maps `includes = ""` to `[]string{""}`; `getIncludeContents` stats
-    // `filepath.Dir("")` = `.` (which exists), reads that directory, and then
-    // matches every entry against `filepath.Match(".", absFile)`, which never
-    // matches an absolute path — so the load succeeds with zero includes
-    // (`pkg/config/legacy/parse.go:68-97`, `legacy/client.go:166`). Keeping the
-    // empty string would instead join it onto the config directory and trip the
-    // missing-directory guard below with an empty `parent`.
+    // The list is kept verbatim, empty entries included. Go maps `includes = ""`
+    // to `[]string{""}` and hands it to `getIncludeContents`, where
+    // `filepath.Dir("")` = `"."` and `filepath.Base("")` = `"."` make it match
+    // nothing (`pkg/config/legacy/parse.go:69`, `:86`), so an empty pattern is
+    // "no includes" by Go's own rule and needs no filter. Round 4 dropped the
+    // empties here instead, which repaired the empty-parent guard but only for
+    // this exact string: every other separator-less spelling (`"."`, `"./"`,
+    // `"././"`, and any bare name under `-c <name>`) still tripped it, and the
+    // filter also hid the section-less top-level `includes = ""` from the
+    // resolver. Both lists carry their entries now;
+    // [`go_dir`]/[`go_base`] resolve them below.
     let mut patterns: Vec<String> = Vec::new();
     for includes in [legacy_common_includes, includes] {
         match includes {
             Some(Value::Array(arr)) => patterns.extend(arr.into_iter().filter_map(|v| match v {
-                Value::String(s) if !s.is_empty() => Some(s),
+                Value::String(s) => Some(s),
                 _ => None,
             })),
-            Some(Value::String(s)) if !s.is_empty() => patterns.push(s),
+            Some(Value::String(s)) => patterns.push(s),
             _ => {}
         }
     }
@@ -378,13 +381,24 @@ pub(super) fn process_includes(
     }
 
     for pattern in &patterns {
-        let full_pattern = if Path::new(pattern).is_absolute() {
-            pattern.clone()
+        // Go resolves the **pattern's own** directory, not the parent of the
+        // joined path: `absDir = filepath.Abs(filepath.Dir(pattern))`, then
+        // `os.Stat(absDir)` (`pkg/config/legacy/parse.go:69-72`,
+        // `pkg/config/load.go:506-512`), with the pattern's last element used as
+        // the match name (`filepath.Base`, `pkg/config/legacy/parse.go:87`).
+        // `base_dir.join(pattern).parent()` was the wrong rule and made the
+        // guard below fire on every shape where `Path::join` produces a path
+        // with no separator before its last component: the empty pattern
+        // (`"." + ""` → `"./"`), `"."`/`"./"`/`"././"`, and — the same bug, not
+        // a separate one — any separator-less pattern under `-c <name>`, where
+        // `base_dir` itself is empty. All of them are `"."` to Go.
+        let pattern_dir = go_dir(pattern);
+        let search_dir = if pattern_dir.is_absolute() {
+            pattern_dir
         } else {
-            base_dir.join(pattern).to_string_lossy().to_string()
+            base_dir.join(pattern_dir)
         };
 
-        let full_path = Path::new(&full_pattern);
         // Go frp fails hard when an include's directory is missing
         // (pkg/config/load.go `LoadAdditionalClientConfigs`: `os.Stat(absDir)`
         // error; legacy/client.go:393 "include: directory of %s not exist").
@@ -393,16 +407,15 @@ pub(super) fn process_includes(
         // fatal error: a missing directory is a config bug, not a silent
         // merge-nothing. A glob that matches nothing in an EXISTING dir stays
         // silent, exactly like Go's zero-match loop.
-        let parent = full_path.parent().unwrap_or(Path::new("."));
-        if !parent.exists() || !parent.is_dir() {
+        if !search_dir.exists() || !search_dir.is_dir() {
             return Err(format!(
                 "include: directory of {} not exist (included by pattern {pattern})",
-                parent.display()
+                search_dir.display()
             )
             .into());
         }
         // Directory read errors are fatal too (Go `os.ReadDir` error).
-        let paths = simple_glob(&full_pattern)?;
+        let paths = glob_in_dir(&search_dir, &go_base(pattern))?;
 
         for path in &paths {
             let content = std::fs::read_to_string(path).map_err(|e| {
@@ -549,47 +562,159 @@ fn drop_ini_scalar_include_keys(table: &mut toml::Table) {
 //   skipped by the collector and then dropped as an inert table by
 //   [`drop_legacy_ini_include_tables`] (rc 0 in both modes).
 //
-// Also surfaced by these probes, unrelated to the list above: `-c <bare
-// relative name>` leaves `base_dir` empty, so a relative include pattern fails
-// with `include: directory of  not exist` (resolution comment in
-// [`process_includes`]); `-c ./<name>` or an absolute path resolves.
+// The empty-parent resolution bug measured during round 4 is fixed by
+// [`go_dir`]/[`go_base`]: the pattern's own directory is resolved (Go's
+// `filepath.Dir`), not the parent of `base_dir.join(pattern)`. That covers
+// `includes = ""`, `"."`, `"./"`, `"././"`, `".."`, `"../"` and the
+// `-c <bare relative name>` empty-`base_dir` case, all in the three `-c` forms
+// and both loader modes; `includes = ".."` no longer globs the config's
+// directory into itself. Pins:
+// `legacy_ini_common_include_dot_spellings_both_modes`,
+// `legacy_ini_common_include_dot_spellings_bare_config_both_modes`,
+// `legacy_ini_common_include_dotdot_is_not_a_wildcard_both_modes`.
 
-/// Simple glob matching that supports a single `*` wildcard per path component.
+/// Go's `filepath.Dir` (`internal/filepathlite/path.go`, `Dir`): scan back to
+/// the last path separator and `Clean` everything up to **and including** it; a
+/// pattern with no separator at all leaves an empty prefix, and `Clean("")` is
+/// `"."`.
+///
+/// This is the rule the include walk has to use in place of `Path::parent()`.
+/// `base_dir.join(pattern).parent()` produced a `Some("")` — which
+/// `Path::exists()` reports as missing — for exactly the shapes Go resolves to
+/// the current directory: the empty pattern, `"."`, `"./"`, `"././"`, and any
+/// separator-less pattern when `base_dir` is empty (`-c <name>`). Measured Go
+/// v0.71.0 (`Dir`): `""`→`"."`, `"."`→`"."`, `"./"`→`"."`, `"././"`→`"."`,
+/// `".."`→`"."`, `"../"`→`".."`, `"sub"`→`"."`, `"sub/"`→`"sub"`,
+/// `"*.ini"`→`"."`, `"sub/*.ini"`→`"sub"`, `"nonexistent/"`→`"nonexistent"`.
+fn go_dir(pattern: &str) -> std::path::PathBuf {
+    let bytes = pattern.as_bytes();
+    let mut i: isize = bytes.len() as isize - 1;
+    while i >= 0 && !is_path_separator(bytes[i as usize]) {
+        i -= 1;
+    }
+    // `pattern[..i + 1]` is the prefix through the last separator, or `""` when
+    // there is no separator (`i == -1`); the byte at `i` is ASCII when >= 0.
+    std::path::PathBuf::from(go_clean(&pattern[..(i + 1) as usize]))
+}
+
+/// Go's `filepath.Base` (`internal/filepathlite/path.go`, `Base`): the final
+/// element with trailing separators stripped; `""` and slash-only spellings
+/// yield `"."`.
+///
+/// `Path::file_name()` is `None` for `"."`, `".."` and every trailing-separator
+/// spelling, and the glob's `unwrap_or("*")` raised that to `"*"` — so
+/// `includes = ".."` merged every file of the config's directory (Go matches
+/// nothing: `filepath.Match(Join(absDir, ".."), absFile)` never equals an entry)
+/// and `includes = "sub/"` matched a file named `sub` in `sub/`. Measured Go
+/// v0.71.0 (`Base`): `""`→`"."`, `"."`→`"."`, `"./"`→`"."`, `"././"`→`"."`,
+/// `".."`→`".."`, `"../"`→`".."`, `"sub"`→`"sub"`, `"sub/"`→`"sub"`,
+/// `"nonexistent/"`→`"nonexistent"`.
+fn go_base(pattern: &str) -> String {
+    let bytes = pattern.as_bytes();
+    if bytes.is_empty() {
+        return ".".to_string();
+    }
+    let mut end = bytes.len();
+    while end > 0 && is_path_separator(bytes[end - 1]) {
+        end -= 1;
+    }
+    // Go's `Base` also drops a volume name here; no include pattern in the frp
+    // corpus is volume-qualified, and [`Path::is_absolute`] already routes one
+    // down the absolute branch of the walk above.
+    let trimmed = &pattern[..end];
+    let start = trimmed.rfind(is_sep_char).map_or(0, |p| p + 1);
+    let base = &trimmed[start..];
+    if base.is_empty() {
+        std::path::MAIN_SEPARATOR.to_string()
+    } else {
+        base.to_string()
+    }
+}
+
+/// Host path separator, for the byte-wise scans above (Go's
+/// `IsPathSeparator`: `/` everywhere, plus `\` on Windows).
+fn is_path_separator(b: u8) -> bool {
+    #[cfg(windows)]
+    {
+        b == b'/' || b == b'\\'
+    }
+    #[cfg(not(windows))]
+    {
+        b == b'/'
+    }
+}
+
+/// Char form of [`is_path_separator`], for `str::split`/`rfind`.
+fn is_sep_char(c: char) -> bool {
+    c.is_ascii() && is_path_separator(c as u8)
+}
+
+/// The `Clean` half of `filepath.Dir`: drop empty and `.` elements and rebuild
+/// with the host separator; a rooted path keeps one leading separator and an
+/// all-dots path becomes `"."`.
+///
+/// Unlike Go's `Clean` this does not fold `..` back over a real element
+/// (`"a/../b"` stays `"a/../b"` rather than `"b"`). The two spell the same
+/// directory, so `exists()`/`read_dir` agree; only the guard's message text can
+/// differ, and only for a pattern with an interior `..` — no cell of the pinned
+/// matrix, and Go's own message prints the raw pattern.
+fn go_clean(path: &str) -> String {
+    let sep = std::path::MAIN_SEPARATOR;
+    let rooted = path.starts_with(is_sep_char);
+    let parts: Vec<&str> = path
+        .split(is_sep_char)
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    let joined = parts.join(&sep.to_string());
+    if rooted {
+        format!("{sep}{joined}")
+    } else if joined.is_empty() {
+        ".".to_string()
+    } else {
+        joined
+    }
+}
+
+/// `filepath.Match`-style single-`*` glob over the regular files **directly
+/// inside** `dir` — the `os.ReadDir(absDir)` + `filepath.Match(filepath.Join(
+/// absDir, filepath.Base(pattern)), absFile)` loop of
+/// `pkg/config/legacy/parse.go:78-95`, which `pkg/config/load.go:513-522`
+/// repeats verbatim for the v1 path. Callers pass the directory from [`go_dir`]
+/// and the name from [`go_base`], so `name_pattern` carries no separator (Go's
+/// only separator-bearing `Base` result is the slash-only `"/"`, which matches
+/// no entry).
+///
 /// Returns sorted list of matching file paths.
-fn simple_glob(pattern: &str) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
-    let pattern_path = Path::new(pattern);
-
-    // Split into: base directory (non-wildcard prefix) + wildcard component
-    let parent = pattern_path.parent().unwrap_or(Path::new("."));
-    let filename_part = pattern_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("*");
-
-    if !filename_part.contains('*') {
-        // No wildcard — check if exact file exists
-        let path = Path::new(pattern);
+fn glob_in_dir(
+    dir: &Path,
+    name_pattern: &str,
+) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
+    if !name_pattern.contains('*') {
+        // No wildcard — Go's `Match` degenerates to string equality with the
+        // entry name, i.e. an exact file in `dir`. `"."`/`".."` name a
+        // directory and so match nothing, as they do in Go.
+        let path = dir.join(name_pattern);
         if path.is_file() {
-            return Ok(vec![path.to_path_buf()]);
+            return Ok(vec![path]);
         }
         return Ok(Vec::new());
     }
 
-    if !parent.exists() || !parent.is_dir() {
+    if !dir.exists() || !dir.is_dir() {
         return Ok(Vec::new());
     }
 
     // Build prefix/suffix for matching
-    let (prefix, suffix) = if let Some(pos) = filename_part.find('*') {
-        (&filename_part[..pos], &filename_part[pos + 1..])
+    let (prefix, suffix) = if let Some(pos) = name_pattern.find('*') {
+        (&name_pattern[..pos], &name_pattern[pos + 1..])
     } else {
-        (filename_part, "")
+        (name_pattern, "")
     };
 
-    let ext = pattern_path.extension().and_then(|s| s.to_str());
+    let ext = Path::new(name_pattern).extension().and_then(|s| s.to_str());
 
     let mut results = Vec::new();
-    for entry in std::fs::read_dir(parent)? {
+    for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if !path.is_file() {
