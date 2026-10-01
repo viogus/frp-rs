@@ -2743,7 +2743,9 @@ fn verify_resolves_leading_root_flags_and_ignores_the_rest() {
 /// deliberately not covered.
 #[test]
 fn dash_help_after_config_is_a_value_not_a_help_request() {
-    const HELP_MARKER: &str = "frps is the server of frp-rs";
+    // The first line of the rendered root document (Go's description, which the
+    // cobra-shaped renderer prints verbatim). Only a help request can produce it.
+    const HELP_MARKER: &str = "frps is the server of frp (https://github.com/fatedier/frp)";
 
     let out = run_frps(&["-c", "--help"]);
     assert_eq!(

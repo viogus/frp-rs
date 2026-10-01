@@ -1697,8 +1697,10 @@ fn reject_pflag_shorthand_cluster_that_needs_a_value(argv: &[OsString], root: Ro
 /// Surrounding behaviour that is deliberately left as it is: bare `--help`, `-h`
 /// and `--help <word>` keep reaching bpaf exactly as before (`--help <word>`
 /// consumes `<word>`, which is Go's own `stripFlags` reading — see
-/// [`consumes_value`]); and the *document* printed for a help request is still
-/// bpaf's, not cobra's (recorded divergence).
+/// [`consumes_value`]). bpaf still decides **whether** a request is a help
+/// request and builds the flag/usage model; the *document* printed for one is
+/// rendered in cobra's shape by [`render_cobra_help`] — Go's own document byte
+/// for byte on the two `verify` surfaces.
 ///
 /// The bpaf argv after the `--help=<bool>` tokens have been resolved the way
 /// pflag and cobra resolve them.
@@ -7887,8 +7889,9 @@ mod hoist_tests {
         assert_eq!(attach(&["--", "-t", "-h"]), ["--", "-t", "-h"]);
     }
 
-    /// The *document* is still bpaf's, but the **value grammar** and the
-    /// rejection are pflag's: `--help=<anything not a `strconv.ParseBool`
+    /// The **value grammar** and the rejection are pflag's even though the
+    /// *document* is now cobra's (rendered by `render_cobra_help`):
+    /// `--help=<anything not a `strconv.ParseBool`
     /// spelling>` is refused with pflag's line and rc 1, which is a different
     /// answer from the base head's root help (measured: Go rc 1, 698 B on
     /// stderr for `--help=foo status`; base head rc 0, 1604 B of `status` usage
@@ -8640,12 +8643,16 @@ mod help_doc_tests {
     /// Every surface this layer renders: `(label, root, command, rendered bytes,
     /// Go frp v0.71.0 bytes)` for the same command line.
     ///
-    /// Two of them are Go's document **byte for byte** — the `verify` pair, which
-    /// is also pinned in full text by `verify_documents_match_go_byte_for_byte`.
-    /// The other thirteen are *stated replacements*, and the count is the witness
-    /// that the replacement is stable: frp-rs renders cobra's shape over the flag
-    /// surface its parser actually accepts, so it never advertises a flag or a
-    /// shorthand it does not implement, and never hides one it does.
+    /// All fifteen are pinned by their **whole text** in `SURFACE_DOCUMENTS`,
+    /// compared byte for byte by `every_surface_matches_its_whole_text_pin`; the
+    /// byte counts here are the cheap first check that reports the sizes.
+    ///
+    /// Two of them are Go's document **byte for byte** — the `verify` pair, whose
+    /// whole-text pins *are* the Go oracle constants and are additionally
+    /// asserted against the render by `verify_documents_match_go_byte_for_byte`.
+    /// The other thirteen are *stated replacements*: frp-rs renders cobra's shape
+    /// over the flag surface its parser actually accepts, so it never advertises
+    /// a flag or a shorthand it does not implement, and never hides one it does.
     ///
     /// Where the replacement is larger or smaller than Go's:
     ///
@@ -8734,6 +8741,438 @@ Global Flags:
       --strict-config          strict config parsing mode, unknown fields will cause an errors (default true)
   -v, --version                version of frpc
 "##;
+
+    /// `frps --help` as the built binary prints it (2467 bytes).
+    const FRPS_DOC: &str = r#"frps is the server of frp (https://github.com/fatedier/frp)
+
+Usage:
+  frps [flags]
+  frps [command]
+
+Available Commands:
+  verify      Verify that the configures is valid
+
+Flags:
+      --allow-ports string               allow ports
+      --allow-unsafe strings             allowed unsafe features, one or more of: TokenSourceExec
+      --bind-addr string                 bind address (default "0.0.0.0")
+  -p, --bind-port int                    bind port (default 7000)
+  -c, --config string                    config file of frps
+      --config-dir string                config directory, run one frps service for each file in config directory
+      --dashboard-addr string            dashboard address (default "0.0.0.0")
+      --dashboard-port int               dashboard port
+      --dashboard-pwd string             dashboard password (default "admin")
+      --dashboard-tls-cert-file string   dashboard tls cert file
+      --dashboard-tls-key-file string    dashboard tls key file
+      --dashboard-tls-mode               if enable dashboard tls mode
+      --dashboard-user string            dashboard user (default "admin")
+      --disable-log-color                disable log color in console
+      --enable-prometheus                enable prometheus dashboard
+  -h, --help                             help for frps
+      --kcp-bind-port int                kcp bind udp port
+      --log-file string                  log file (default "console")
+      --log-format string                log format (default "text")
+      --log-level string                 log level (default "info")
+      --log-max-days int                 log max days (default 3)
+      --max-ports-per-client int         max ports per client
+      --proxy-bind-addr string           proxy bind address (default "0.0.0.0")
+      --quic-bind-port int               quic bind udp port
+      --strict-config                    strict config parsing mode, unknown fields will cause errors (default true)
+      --subdomain-host string            subdomain host
+      --tls-only                         frps tls only
+  -t, --token string                     auth token
+  -v, --version                          version of frps
+      --vhost-http-port int              vhost http port
+      --vhost-http-timeout int           vhost http response header timeout (default 60)
+      --vhost-https-port int             vhost https port
+
+Use "frps [command] --help" for more information about a command.
+"#;
+
+    /// `frpc --help` as the built binary prints it (1517 bytes).
+    const FRPC_DOC: &str = r#"frpc is the client of frp (https://github.com/fatedier/frp)
+
+Usage:
+  frpc [flags]
+  frpc [command]
+
+Available Commands:
+  http        Run frpc with a single http proxy
+  https       Run frpc with a single https proxy
+  reload      Hot-Reload frpc configuration
+  status      Overview of all proxies status
+  stcp        Run frpc with a single stcp proxy
+  stop        Stop the running frpc
+  sudp        Run frpc with a single sudp proxy
+  tcp         Run frpc with a single tcp proxy
+  tcpmux      Run frpc with a single tcpmux proxy
+  udp         Run frpc with a single udp proxy
+  verify      Verify that the configures is valid
+  xtcp        Run frpc with a single xtcp proxy
+
+Flags:
+      --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
+  -c, --config string          config file of frpc (default "./frpc.ini")
+      --config-dir string      config directory, run one frpc service for each file in config directory
+      --disable-log-color      disable log color in console
+  -h, --help                   help for frpc
+      --log-file string        log file (default "console")
+      --log-format string      log format (default "text")
+  -L, --log-level string       log level (default "info")
+      --log-max-days int       log max days (default 3)
+      --strict-config          strict config parsing mode, unknown fields will cause an errors (default true)
+  -v, --version                version of frpc
+
+Use "frpc [command] --help" for more information about a command.
+"#;
+
+    /// `frpc tcp --help` as the built binary prints it (992 bytes).
+    const FRPC_TCP_DOC: &str = r#"Run frpc with a single tcp proxy
+
+Usage:
+  frpc tcp [flags]
+
+Flags:
+  -h, --help                 help for tcp
+      --local-ip string      local ip (default "127.0.0.1")
+      --local-port int       local port
+      --proxy-name string    proxy name
+      --remote-port int      remote port
+      --server-addr string   frp server's address (default "127.0.0.1")
+      --server-port int      frp server's port (default 7000)
+  -t, --token string         auth token
+      --use-compression      Use compression
+      --use-encryption       Use encryption
+
+Global Flags:
+      --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
+  -c, --config string          config file of frpc (default "./frpc.ini")
+      --config-dir string      config directory, run one frpc service for each file in config directory
+      --strict-config          strict config parsing mode, unknown fields will cause an errors (default true)
+  -v, --version                version of frpc
+"#;
+
+    /// `frpc udp --help` as the built binary prints it (903 bytes).
+    const FRPC_UDP_DOC: &str = r#"Run frpc with a single udp proxy
+
+Usage:
+  frpc udp [flags]
+
+Flags:
+  -h, --help                 help for udp
+      --local-ip string      local ip (default "127.0.0.1")
+      --local-port int       local port
+      --proxy-name string    proxy name
+      --remote-port int      remote port
+      --server-addr string   frp server's address (default "127.0.0.1")
+      --server-port int      frp server's port (default 7000)
+  -t, --token string         auth token
+
+Global Flags:
+      --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
+  -c, --config string          config file of frpc (default "./frpc.ini")
+      --config-dir string      config directory, run one frpc service for each file in config directory
+      --strict-config          strict config parsing mode, unknown fields will cause an errors (default true)
+  -v, --version                version of frpc
+"#;
+
+    /// `frpc http --help` as the built binary prints it (1233 bytes).
+    const FRPC_HTTP_DOC: &str = r#"Run frpc with a single http proxy
+
+Usage:
+  frpc http [flags]
+
+Flags:
+      --custom-domains string        custom domains
+  -h, --help                         help for http
+      --host-header-rewrite string   host header rewrite
+      --http-pwd string              http auth password
+      --http-user string             http auth user
+      --local-ip string              local ip (default "127.0.0.1")
+      --local-port int               local port
+      --locations strings            locations
+      --proxy-name string            proxy name
+      --server-addr string           frp server's address (default "127.0.0.1")
+      --server-port int              frp server's port (default 7000)
+      --subdomain string             sub domain
+  -t, --token string                 auth token
+
+Global Flags:
+      --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
+  -c, --config string          config file of frpc (default "./frpc.ini")
+      --config-dir string      config directory, run one frpc service for each file in config directory
+      --strict-config          strict config parsing mode, unknown fields will cause an errors (default true)
+  -v, --version                version of frpc
+"#;
+
+    /// `frpc https --help` as the built binary prints it (979 bytes).
+    const FRPC_HTTPS_DOC: &str = r#"Run frpc with a single https proxy
+
+Usage:
+  frpc https [flags]
+
+Flags:
+      --custom-domains string   custom domains
+  -h, --help                    help for https
+      --local-ip string         local ip (default "127.0.0.1")
+      --local-port int          local port
+      --proxy-name string       proxy name
+      --server-addr string      frp server's address (default "127.0.0.1")
+      --server-port int         frp server's port (default 7000)
+      --subdomain string        sub domain
+  -t, --token string            auth token
+
+Global Flags:
+      --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
+  -c, --config string          config file of frpc (default "./frpc.ini")
+      --config-dir string      config directory, run one frpc service for each file in config directory
+      --strict-config          strict config parsing mode, unknown fields will cause an errors (default true)
+  -v, --version                version of frpc
+"#;
+
+    /// `frpc stcp --help` as the built binary prints it (906 bytes).
+    const FRPC_STCP_DOC: &str = r#"Run frpc with a single stcp proxy
+
+Usage:
+  frpc stcp [flags]
+
+Flags:
+  -h, --help                 help for stcp
+      --local-ip string      local ip (default "127.0.0.1")
+      --local-port int       local port
+      --server-addr string   frp server's address (default "127.0.0.1")
+      --server-name string   server name
+      --server-port int      frp server's port (default 7000)
+      --sk string            secret key
+  -t, --token string         auth token
+
+Global Flags:
+      --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
+  -c, --config string          config file of frpc (default "./frpc.ini")
+      --config-dir string      config directory, run one frpc service for each file in config directory
+      --strict-config          strict config parsing mode, unknown fields will cause an errors (default true)
+  -v, --version                version of frpc
+"#;
+
+    /// `frpc xtcp --help` as the built binary prints it (906 bytes).
+    const FRPC_XTCP_DOC: &str = r#"Run frpc with a single xtcp proxy
+
+Usage:
+  frpc xtcp [flags]
+
+Flags:
+  -h, --help                 help for xtcp
+      --local-ip string      local ip (default "127.0.0.1")
+      --local-port int       local port
+      --server-addr string   frp server's address (default "127.0.0.1")
+      --server-name string   server name
+      --server-port int      frp server's port (default 7000)
+      --sk string            secret key
+  -t, --token string         auth token
+
+Global Flags:
+      --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
+  -c, --config string          config file of frpc (default "./frpc.ini")
+      --config-dir string      config directory, run one frpc service for each file in config directory
+      --strict-config          strict config parsing mode, unknown fields will cause an errors (default true)
+  -v, --version                version of frpc
+"#;
+
+    /// `frpc sudp --help` as the built binary prints it (906 bytes).
+    const FRPC_SUDP_DOC: &str = r#"Run frpc with a single sudp proxy
+
+Usage:
+  frpc sudp [flags]
+
+Flags:
+  -h, --help                 help for sudp
+      --local-ip string      local ip (default "127.0.0.1")
+      --local-port int       local port
+      --proxy-name string    proxy name
+      --remote-port int      remote port
+      --server-addr string   frp server's address (default "127.0.0.1")
+      --server-port int      frp server's port (default 7000)
+  -t, --token string         auth token
+
+Global Flags:
+      --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
+  -c, --config string          config file of frpc (default "./frpc.ini")
+      --config-dir string      config directory, run one frpc service for each file in config directory
+      --strict-config          strict config parsing mode, unknown fields will cause an errors (default true)
+  -v, --version                version of frpc
+"#;
+
+    /// `frpc tcpmux --help` as the built binary prints it (917 bytes).
+    const FRPC_TCPMUX_DOC: &str = r#"Run frpc with a single tcpmux proxy
+
+Usage:
+  frpc tcpmux [flags]
+
+Flags:
+  -h, --help                 help for tcpmux
+      --local-ip string      local ip (default "127.0.0.1")
+      --local-port int       local port
+      --mux-port int         multiplexer port
+      --proxy-name string    proxy name
+      --server-addr string   frp server's address (default "127.0.0.1")
+      --server-port int      frp server's port (default 7000)
+  -t, --token string         auth token
+
+Global Flags:
+      --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
+  -c, --config string          config file of frpc (default "./frpc.ini")
+      --config-dir string      config directory, run one frpc service for each file in config directory
+      --strict-config          strict config parsing mode, unknown fields will cause an errors (default true)
+  -v, --version                version of frpc
+"#;
+
+    /// `frpc reload --help` as the built binary prints it (801 bytes).
+    const FRPC_RELOAD_DOC: &str = r#"Hot-Reload frpc configuration
+
+Usage:
+  frpc reload [flags]
+
+Flags:
+      --admin-addr string      admin address
+      --admin-port int         admin port
+      --admin-pwd string       admin password
+      --admin-user string      admin user
+      --api-timeout duration   Timeout for admin API calls (default 30s)
+  -h, --help                   help for reload
+
+Global Flags:
+      --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
+  -c, --config string          config file of frpc (default "./frpc.ini")
+      --config-dir string      config directory, run one frpc service for each file in config directory
+      --strict-config          strict config parsing mode, unknown fields will cause an errors (default true)
+  -v, --version                version of frpc
+"#;
+
+    /// `frpc status --help` as the built binary prints it (859 bytes).
+    const FRPC_STATUS_DOC: &str = r#"Overview of all proxies status
+
+Usage:
+  frpc status [flags]
+
+Flags:
+      --admin-addr string      admin address
+      --admin-port int         admin port
+      --admin-pwd string       admin password
+      --admin-user string      admin user
+      --api-timeout duration   Timeout for admin API calls (default 30s)
+  -h, --help                   help for status
+      --json                   Output the status as JSON
+
+Global Flags:
+      --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
+  -c, --config string          config file of frpc (default "./frpc.ini")
+      --config-dir string      config directory, run one frpc service for each file in config directory
+      --strict-config          strict config parsing mode, unknown fields will cause an errors (default true)
+  -v, --version                version of frpc
+"#;
+
+    /// `frpc stop --help` as the built binary prints it (789 bytes).
+    const FRPC_STOP_DOC: &str = r#"Stop the running frpc
+
+Usage:
+  frpc stop [flags]
+
+Flags:
+      --admin-addr string      admin address
+      --admin-port int         admin port
+      --admin-pwd string       admin password
+      --admin-user string      admin user
+      --api-timeout duration   Timeout for admin API calls (default 30s)
+  -h, --help                   help for stop
+
+Global Flags:
+      --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
+  -c, --config string          config file of frpc (default "./frpc.ini")
+      --config-dir string      config directory, run one frpc service for each file in config directory
+      --strict-config          strict config parsing mode, unknown fields will cause an errors (default true)
+  -v, --version                version of frpc
+"#;
+
+    /// The exact stdout of every surface, in `SURFACES` order.
+    ///
+    /// The two `verify` entries are the Go oracle constants: those documents
+    /// *are* Go's, byte for byte, so one text serves as both the oracle and the
+    /// pin and appears exactly once in this file.
+    ///
+    /// This freezes the *usage text* as well as the flag names. Each row's usage
+    /// string is a hand-written Go transcription (`GoFlagRow::usage`), which is
+    /// intended for a compatibility surface: the document is a contract with Go's
+    /// output, not a description the parser generates. A future flag addition,
+    /// row re-wording or default change must therefore regenerate these constants
+    /// from the rebuilt binaries and re-pin the byte count in `SURFACES` — the
+    /// pins are the record, and the tests fail until they are updated.
+    const SURFACE_DOCUMENTS: [&str; 15] = [
+        FRPS_DOC,
+        GO_FRPS_VERIFY,
+        FRPC_DOC,
+        FRPC_TCP_DOC,
+        FRPC_UDP_DOC,
+        FRPC_HTTP_DOC,
+        FRPC_HTTPS_DOC,
+        FRPC_STCP_DOC,
+        FRPC_XTCP_DOC,
+        FRPC_SUDP_DOC,
+        FRPC_TCPMUX_DOC,
+        GO_FRPC_VERIFY,
+        FRPC_RELOAD_DOC,
+        FRPC_STATUS_DOC,
+        FRPC_STOP_DOC,
+    ];
+
+    /// The whole-text pin for all 15 surfaces: the rendered document must equal
+    /// the recorded stdout byte for byte. `SURFACE_DOCUMENTS` is generated
+    /// mechanically from the built binaries (`frps --help`, `frpc tcp --help`,
+    /// …), never retyped.
+    ///
+    /// This is the assertion; `every_surface_is_pinned_by_its_byte_count` stays
+    /// alongside it as the cheap first check that reports the sizes.
+    #[test]
+    fn every_surface_matches_its_whole_text_pin() {
+        let mut mismatched: Vec<String> = Vec::new();
+        for ((label, root, command, pinned, _), expected) in
+            SURFACES.into_iter().zip(SURFACE_DOCUMENTS)
+        {
+            let document = surface_document(root, command);
+            if document != expected {
+                mismatched.push(format!(
+                    "{label}: {} bytes (pinned {pinned}) -- first difference: {}",
+                    document.len(),
+                    first_difference(expected, &document)
+                ));
+            }
+        }
+        assert!(
+            mismatched.is_empty(),
+            "the rendered documents changed; regenerate SURFACE_DOCUMENTS from the \
+             built binaries:\n{}",
+            mismatched.join("\n")
+        );
+    }
+
+    /// Where a rendered document left its pin: the first line that differs, or
+    /// the line/byte-count gap when one text is a prefix of the other.
+    fn first_difference(expected: &str, actual: &str) -> String {
+        for (index, (pinned, rendered)) in expected.lines().zip(actual.lines()).enumerate() {
+            if pinned != rendered {
+                return format!(
+                    "line {}: pinned `{pinned}`, rendered `{rendered}`",
+                    index + 1
+                );
+            }
+        }
+        format!(
+            "{} bytes / {} lines pinned, {} bytes / {} lines rendered",
+            expected.len(),
+            expected.lines().count(),
+            actual.len(),
+            actual.lines().count()
+        )
+    }
 
     #[test]
     fn verify_documents_match_go_byte_for_byte() {
