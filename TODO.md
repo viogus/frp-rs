@@ -6987,7 +6987,7 @@ nothing about whether the described behaviour still holds.
   by someone else following it. (`docs/developing.md § Adding a New Proxy Type` is
   the closest existing artefact.)
 
-  **Done (2026-10-01, code head `2293cc85` on `feat/contributor-path`, PR #435, rebased onto `13a29d26`; pre-rebase code head `a7ec18b9` on `f503b4e7` — `git range-diff f503b4e7..25c3b1d2 13a29d26..HEAD` reports the four docs commits as `=`, and only the records commit as rewritten).**
+  **Done (2026-10-01, code head `eb76e623` on `feat/contributor-path`, PR #435, rebased onto `084f7865` (from `799ce048`, itself rebased from `f503b4e7`, where the code head was `a7ec18b9`), rebase tip `e1cf281d` (the cite re-derivation this rebase required), with this records fix-up on top — the `799ce048` rebase's `range-diff` reports the four docs commits as `=` with the cite re-derivation and the fix-up as added rows, and the `084f7865` rebase's reports the four docs commits and that cite re-derivation as `=`, rewrites the records commit, and replaces the fix-up — the replacement re-deriving the single §2 cite the new base moved).**
   `docs/developing.md § 2 — Adding a Proxy Type or a Client Plugin` is now that path: § 2.1 reading
   order and what to skip, § 2.2 the six config allow-lists, § 2.3 registration plus the seven
   TCP-group predicate sites, § 2.4 listeners and bridging, § 2.5 the test ladder, § 2.6 the
@@ -6998,8 +6998,8 @@ nothing about whether the described behaviour still holds.
   a unit test red → green, an in-process e2e, a real `frps` + `frpc` round trip) and returned
   `MERGE-with-findings` on the two load-bearing claims that were wrong; both were fixed, along with
   a second round's precision notes, and the delta validator's final verdict at the head is
-  **MERGE** (no blocking finding). Ledger after this close: **23 open / 175 closed** (base
-  `13a29d26`: 24 open / 174 closed). A `CHANGELOG.md` `### Docs` bullet and a
+  **MERGE** (no blocking finding). Ledger after this close: **18 open / 181 closed** (base
+  `084f7865`: 19 open / 180 closed). A `CHANGELOG.md` `### Docs` bullet and a
   `docs/history/development-log.md` row record it.
 
 - [x] **Differentiation: measured, and now argued where users read it.**

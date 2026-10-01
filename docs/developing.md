@@ -262,7 +262,7 @@ mytcp must be an accepted store proxy type: Err(InvalidArgument("invalid proxy t
 Two neighbouring lists are **not** on this path, and it is worth knowing why so
 you do not hunt them: `const VALID_VISITOR_TYPES` (`frp-client/src/store.rs:19`,
 `["stcp", "sudp", "xtcp"]`) enumerates *visitor* types, and `const
-FRPC_SUBCOMMANDS` (`frp-core/src/cli.rs:3084`, a `[&str; 12]` pinned in both
+FRPC_SUBCOMMANDS` (`frp-core/src/cli.rs:3107`, a `[&str; 12]` pinned in both
 directions by the tests beside it) enumerates `frpc <subcommand>` names — it needs
 your type only if you are also adding an `frpc <type>` subcommand, which the
 minimal path does not.
