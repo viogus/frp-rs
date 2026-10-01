@@ -12,6 +12,17 @@ User-facing release notes for frp-rs.
 ## Unreleased
 
 ### Features
+- **Every `--help` surface now renders cobra's document, not bpaf's.** The help documents were
+  different *documents* from Go's, not merely laid out differently: wrong first line, different section
+  names, a different flag grid, bpaf's `-h, --help  Prints help information`, and two rows for every
+  `--flag=<bool>` where cobra prints one. One rendering layer (`render_cobra_help` in
+  `frp-core/src/cli.rs`, wired into `run_cli` on `bpaf::ParseFailure::Stdout` only) rebuilds cobra's
+  shape from the flag surface read back out of bpaf's own rendering, so the document follows the parser
+  rather than a hand-maintained list. `frps verify --help` (**2103 B**) and `frpc verify --help`
+  (**543 B**) are Go v0.71.0's documents byte-for-byte; the nine surfaces of `TODO.md:253` all move and
+  are pinned whole-text and by byte count (`frps` 2467, `frpc` 1517, `frpc status` 859, `frpc tcp` 992,
+  `frpc reload` 801, `frpc stop` 789, `frpc https` 979), plus six further surfaces. Error text,
+  streams and exit codes are untouched.
 - **`frps --config-dir` now honours `SIGUSR1`, like `frps -c` does.** The directory lane returned
   before installing the reload handler, so the signal kept its default disposition and **killed the
   server** (`unix_wait_status(158)`, 128 + 30) where the single-config lane reloads in place. It now
