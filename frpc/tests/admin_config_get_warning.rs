@@ -520,7 +520,7 @@ fn rival_bind_fails(port: u16) -> bool {
 /// site answered wrongly. The call sites this file reaches are `frpc/src/main.rs:621`
 /// (the `-c` startup load) and `frp-client/src/admin.rs:771` (the admin config-GET
 /// handler runs `config_from_file`); it never drives the reload, so
-/// `frp-client/src/service.rs:4458` is not visible here — that site is pinned by
+/// `frp-client/src/service.rs:4471` is not visible here — that site is pinned by
 /// `frp-client/tests/reload_warning_delivery.rs`. `KEY` is the shared prefix of
 /// all three texts and cannot tell them apart; these markers are the whole
 /// assertion. Every test in this file reaches it through [`assert_records`];

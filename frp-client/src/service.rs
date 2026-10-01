@@ -949,7 +949,20 @@ impl Service {
         let auth_cfg = AuthConfig {
             method: auth_method.clone(),
             token,
-            token_source: auth_token_source,
+            // Deliberately NOT the source again: `token` above is this
+            // service's resolved snapshot, and Go frp resolves a
+            // `tokenSource` exactly once, at client-service construction
+            // (`client/service.go:168 auth.BuildClientAuth`), then hands the
+            // same cached auth runtime to every login/reconnect
+            // (`client/service.go:316`; `pkg/auth/token.go` SetLogin/SetPing/
+            // SetNewWorkConn only call `util.GetAuthKey(auth.token, ts)`).
+            // Carrying the source here made `AuthConfig::resolve_token()`
+            // re-execute it a second time on the first login (and on every
+            // later Ping/NewWorkConn), which is the divergence this
+            // construction-time snapshot closes. The server keeps its live
+            // source (frp-server/src/service.rs build_auth_config) so a
+            // server-side refresh still re-reads per verification.
+            token_source: None,
             oidc_issuer: cfg
                 .auth
                 .as_ref()

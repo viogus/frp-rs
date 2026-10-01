@@ -96,6 +96,15 @@ pub struct AuthConfig {
     /// Dynamic source used to resolve the current token on demand.
     /// When set, `resolve_token()` returns a fresh value for each auth
     /// operation instead of the startup snapshot in `token`.
+    ///
+    /// The frpc login path does **not** set this: it resolves the source once
+    /// at service construction and stores only the snapshot in `token`, so a
+    /// login/ping/NewWorkConn cannot execute the source again — Go frp builds
+    /// one auth runtime per client service (`client/service.go:168`) and
+    /// reuses it (`:316`). `frps` does set it (`build_auth_config`), its
+    /// verifier resolving per verification — a deliberate `frp-rs` divergence
+    /// from Go's `BuildServerAuth`, which resolves the source once
+    /// (`pkg/auth/auth.go:106`).
     pub token_source: Option<crate::config::ValueSource>,
     pub oidc_issuer: String,
     pub oidc_audience: String,
@@ -327,6 +336,14 @@ impl AuthConfig {
     /// When `token_source` is configured, the source is re-read / re-executed
     /// so the latest value is used for each Login, Ping, or NewWorkConn auth
     /// operation. Otherwise the static `token` is returned.
+    ///
+    /// That per-operation refresh is a deliberate **`frp-rs` divergence** kept
+    /// for `frps` (it re-verifies each operation against a rotated token);
+    /// Go's `BuildServerAuth` (`pkg/auth/auth.go:106`) resolves the source
+    /// once instead. The `frpc` login path leaves `token_source` unset and
+    /// passes the construction-time snapshot in `token`, matching Go's
+    /// one-auth-runtime-per-service client (`client/service.go:168` / `:316`),
+    /// so a login cannot re-run the source a second time.
     pub fn resolve_token(&self) -> Result<String, String> {
         match &self.token_source {
             Some(source) => source
