@@ -2767,6 +2767,60 @@ mod oidc_throttle_tests {
         );
     }
 
+    /// [`MockServerHandle::request_head_timeout`] reports the **stored** field,
+    /// not a constant — the half the default-ctor pin above cannot see.
+    ///
+    /// `mock_default_ctor_delegates_the_pinned_deadline` calls the accessor once
+    /// and compares it to `MOCK_REQUEST_HEAD_TIMEOUT`, so an accessor that
+    /// ignores `self.request_head_timeout` and returns the constant keeps every
+    /// other `oidc` test green — measured: on the pre-pin tree all 19 `oidc`
+    /// tests stayed green with the accessor body replaced by
+    /// `MOCK_REQUEST_HEAD_TIMEOUT` (there are 20 at this head, this pin
+    /// included; TODO.md:7838 (b)).
+    /// Three **distinct** overrides keep that mutant red three times over: a
+    /// distilled accessor can return at most one of the three values, so
+    /// `125 ms`, `60 s` or `31.337 ms` fails whichever value it happened to pick.
+    /// They are also all different from the 5 s constant, so a body that returns
+    /// `MOCK_REQUEST_HEAD_TIMEOUT` fails all three — and, because they are the
+    /// same values the assertions use, the test is its own control.
+    ///
+    /// The third override is deliberately **sub-100 ms and non-round**. A body
+    /// that special-cases a round threshold ("`< 100 ms` → the constant, else the
+    /// stored field") is right for `125 ms` and `60 s` alone and was measured
+    /// green against the two-value loop; so is a body that hardcodes exactly the
+    /// two originally pinned values. Both die on `31.337 ms`.
+    /// No sleeping: the handle is produced by `oidc_mock_server_with_timeout`
+    /// without waiting out any of the deadlines.
+    #[test]
+    fn mock_handle_reports_the_override_it_was_built_with() {
+        // Not a shipped constant and not a round number an accessor could
+        // special-case: below any plausible threshold, and small enough that the
+        // mock never waits it out (the handle is built without a connection).
+        let third = std::time::Duration::from_micros(31_337);
+        for override_timeout in [
+            std::time::Duration::from_millis(125),
+            std::time::Duration::from_secs(60),
+            third,
+        ] {
+            assert_ne!(
+                override_timeout, MOCK_REQUEST_HEAD_TIMEOUT,
+                "each override must differ from the shipped constant, or the accessor \
+                 could return either one and stay green"
+            );
+            let (issuer, handle) = oidc_mock_server_with_timeout(override_timeout);
+            assert_eq!(
+                handle.request_head_timeout(),
+                override_timeout,
+                "request_head_timeout() must return the stored deadline the handle was \
+                 built with ({override_timeout:?}), not a constant: a distilled accessor \
+                 returning MOCK_REQUEST_HEAD_TIMEOUT ({MOCK_REQUEST_HEAD_TIMEOUT:?}) or a \
+                 different override's value is invisible to \
+                 mock_default_ctor_delegates_the_pinned_deadline, whose only comparison is \
+                 against the shipped constant. issuer={issuer}"
+            );
+        }
+    }
+
     /// End to end: a client that connects and never sends gets an explicit
     /// `500` naming the cause — never the `/` route's silent `404 OK` — and the
     /// mock's serving thread stays usable for the next connection.

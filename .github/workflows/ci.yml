@@ -926,26 +926,30 @@ jobs:
         run: |
           set -eo pipefail
           log=/tmp/frpc-admin-config-get-tests.log
+          # The only count literal in this guard: when
+          # `frpc/tests/admin_config_get_warning.rs` gains or loses a test, move
+          # this line and nothing else.
+          want=5
           cargo test -p frpc --features admin --test admin_config_get_warning --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           n=$(cargo test -p frpc --features admin --test admin_config_get_warning --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/admin_config_get_warning.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 4 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "4" ] || status=1
+          grep -q "test result: ok. $want passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "$want" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frpc admin config-GET guard failed (status=$status, file=$n, log=$log)"
-            if [ -n "$n" ] && [ "$n" != "4" ]; then
-              if [ "$n" -lt "4" ]; then
-                echo "::error::frpc/tests/admin_config_get_warning.rs lists $n tests, this step expects 4 — tests were deleted or the file is not being run with --features admin; restore them rather than lowering this literal"
+            if [ -n "$n" ] && [ "$n" != "$want" ]; then
+              if [ "$n" -lt "$want" ]; then
+                echo "::error::frpc/tests/admin_config_get_warning.rs lists $n tests, this step expects $want — tests were deleted or the file is not being run with --features admin; restore them rather than lowering this literal"
               else
-                echo "::error::frpc/tests/admin_config_get_warning.rs lists $n tests, this step expects 4: move the single literal in this shell step from 4 to $n"
+                echo "::error::frpc/tests/admin_config_get_warning.rs lists $n tests, this step expects $want: move the single literal in this shell step from $want to $n"
               fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frpc admin config-GET guard ok: $n tests listed (expected 4), 0 failed"
+          echo "frpc admin config-GET guard ok: $n tests listed (expected $want), 0 failed"
       - name: Run frpc's `web_server.tls.enable` warning-delivery tests with the admin feature
         # The `admin`-on half of the `frpc` warning-delivery pair, and the only
         # lane that witnesses the `--config-dir` call site (`frpc/src/main.rs:529`)

@@ -100,6 +100,20 @@ const SETTLE: Duration = Duration::from_millis(500);
 /// milliseconds; this only stops a *failing* assertion from waiting out
 /// [`READY_TIMEOUT`].
 const COUNT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a spawn gets to *fail visibly* after its startup line: either the
+/// child exited, or it logged [`ADMIN_PORT_HELD`]. Both happen microseconds after
+/// `init_logging`, so this only bounds the observation — and it is what keeps a
+/// port-contention retry from waiting out [`READY_TIMEOUT`].
+const FAST_FAIL_WINDOW: Duration = Duration::from_millis(250);
+/// The fatal record `frp-client`'s service logs when its admin listener cannot
+/// bind. The child does **not** exit on it (it keeps retrying the control
+/// connection), so the log is the only signal — the round-2 failure:
+/// `frpc admin server failed: Address already in use (os error 48)`.
+const ADMIN_PORT_HELD: &str = "admin server failed: Address already in use";
+/// How many ports [`spawn_admin_ready`] may burn before it gives up. Startup
+/// failures that survive three fresh ports are not port contention, so retrying
+/// further would only hide a real breakage.
+const MAX_ADMIN_PORT_ATTEMPTS: usize = 3;
 
 fn bin() -> String {
     std::env::var("FRPC_BIN").unwrap_or_else(|_| BIN.to_string())
@@ -120,8 +134,12 @@ impl TempDir {
         Self(dir)
     }
 
+    fn path(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+
     fn write(&self, name: &str, contents: &str) -> PathBuf {
-        let path = self.0.join(name);
+        let path = self.path(name);
         std::fs::write(&path, contents).expect("write config");
         path
     }
@@ -133,14 +151,77 @@ impl Drop for TempDir {
     }
 }
 
-/// A free port from the ephemeral range, deduplicated inside this process.
-fn free_port() -> u16 {
+/// An ephemeral port that this process **keeps bound** until [`PortLease`] is
+/// dropped or [`PortLease::release`] is called.
+///
+/// The old `free_port() -> u16` returned a number and immediately closed the
+/// probe socket, so the kernel could hand the same port to any other process on
+/// the host between that call and the child's bind — a window that is open for
+/// as long as the test spends writing config files, which is exactly the window
+/// the round-2 run lost: the child died with `frpc admin server failed: Address
+/// already in use (os error 48)`. Holding the listener turns that race into a
+/// *deterministic* failure here in the parent (our own bind, which we can see)
+/// rather than an intermittent one in the child, and it is what lets
+/// [`spawn_admin_ready`] and `admin_port_retry_recovers_from_a_held_port` force
+/// the `AddrInUse` path on purpose instead of waiting for it to happen.
+///
+/// `release()` is the "hand the port over to the child" step and must be called
+/// immediately before spawning; the lease stays useful for `.port()` either way.
+struct PortLease {
+    listener: std::net::TcpListener,
+}
+
+impl PortLease {
+    fn port(&self) -> u16 {
+        self.listener.local_addr().expect("lease local_addr").port()
+    }
+
+    /// Close the probe socket so the child can bind the port. Idempotent in
+    /// effect (a later `release` re-binds and re-closes the same port, which
+    /// keeps it withdrawn from the rest of the host for that instant).
+    fn release(self) {
+        drop(self.listener);
+    }
+}
+
+/// A free port from the ephemeral range, deduplicated inside this process and
+/// **held bound** — see [`PortLease`]. Release it right before spawning.
+fn free_port() -> PortLease {
     loop {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
-        let port = probe.local_addr().expect("local_addr").port();
-        drop(probe);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+        let port = listener.local_addr().expect("local_addr").port();
         if used_ports().lock().unwrap().insert(port) {
-            return port;
+            return PortLease { listener };
+        }
+    }
+}
+
+/// One port handed to [`spawn_admin_ready`]: the lease **and** whether the helper
+/// is allowed to release it.
+///
+/// Retrying requires releasing (the child must be able to bind), while the
+/// `AddrInUse` demonstration requires the lease to stay bound. Leaving the choice
+/// to the caller keeps one code path honest about both.
+struct PortSource {
+    lease: PortLease,
+    released: bool,
+}
+
+impl PortSource {
+    /// Hand the port to the child.
+    fn releasable(lease: PortLease) -> Self {
+        Self {
+            lease,
+            released: true,
+        }
+    }
+
+    /// Keep the port for the duration — the child is not supposed to be able to
+    /// bind it.
+    fn held(lease: PortLease) -> Self {
+        Self {
+            lease,
+            released: false,
         }
     }
 }
@@ -180,25 +261,13 @@ struct Spawned {
     _guard: ChildGuard,
     stdout_buf: Arc<Mutex<String>>,
     stderr_buf: Arc<Mutex<String>>,
+    /// The `web_server.port` the child was configured with, so a test can talk
+    /// to it without threading the number through separately.
+    admin_port: u16,
 }
 
 impl Spawned {
-    fn run(dir: &TempDir, argv: &[&str]) -> Self {
-        let child = Command::new(bin())
-            .args(argv)
-            .current_dir(&dir.0)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn frpc");
-        let mut spawned = Self::from_child(child);
-        spawned.wait_for(STARTUP_MARKER);
-        spawned.wait_for(ADMIN_MARKER);
-        std::thread::sleep(SETTLE);
-        spawned
-    }
-
-    fn from_child(mut child: Child) -> Self {
+    fn from_child(mut child: Child, admin_port: u16) -> Self {
         let out = Arc::new(Mutex::new(String::new()));
         let err = Arc::new(Mutex::new(String::new()));
         drain(child.stdout.take().expect("child stdout"), out.clone());
@@ -207,33 +276,43 @@ impl Spawned {
             _guard: ChildGuard { child },
             stdout_buf: out,
             stderr_buf: err,
+            admin_port,
         }
     }
 
-    /// Wait until `marker` appears on either stream, or panic with both.
-    fn wait_for(&mut self, marker: &str) {
+    /// The admin port this child was configured with.
+    fn admin_port(&self) -> u16 {
+        self.admin_port
+    }
+
+    /// Wait until `marker` appears on either stream, or return why it did not, so
+    /// a **retryable** startup failure ([`spawn_admin_ready`]) can report it and
+    /// try another port instead of panicking out the whole readiness timeout. The
+    /// first line of the message is stable ("exited"/"never"), so callers and
+    /// logs can tell the two apart.
+    fn wait_until(&mut self, marker: &str) -> Result<(), String> {
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
             let out = self.peek_stdout();
             let err = self.peek_stderr();
             if out.contains(marker) || err.contains(marker) {
-                return;
+                return Ok(());
             }
             if let Ok(Some(status)) = self._guard.child.try_wait() {
-                panic!(
+                return Err(format!(
                     "frpc exited ({status}) before {marker:?}\n--- stdout ({} B) ---\n{out}\n\
                      --- stderr ({} B) ---\n{err}",
                     out.len(),
                     err.len(),
-                );
+                ));
             }
             if Instant::now() >= deadline {
-                panic!(
+                return Err(format!(
                     "frpc never logged {marker:?} within {READY_TIMEOUT:?}\n\
                      --- stdout ({} B) ---\n{out}\n--- stderr ({} B) ---\n{err}",
                     out.len(),
                     err.len(),
-                );
+                ));
             }
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -241,6 +320,11 @@ impl Spawned {
 
     fn peek_stdout(&self) -> String {
         self.stdout_buf.lock().unwrap().clone()
+    }
+
+    /// Non-blocking: the child's exit status, if it has already died.
+    fn peek_exit(&mut self) -> Option<std::process::ExitStatus> {
+        self._guard.child.try_wait().ok().flatten()
     }
 
     fn peek_stderr(&self) -> String {
@@ -277,13 +361,163 @@ impl Spawned {
     }
 }
 
+/// Fresh, **releasable** leases for [`spawn_ready`]: one per attempt, so a port
+/// another process re-took during the handover costs one retry rather than the
+/// whole readiness timeout.
+struct FreePorts;
+
+impl Iterator for FreePorts {
+    type Item = PortSource;
+
+    fn next(&mut self) -> Option<PortSource> {
+        Some(PortSource::releasable(free_port()))
+    }
+}
+
+/// The spawn every test in this file uses: pick a fresh leased port, hand it to
+/// the child, and wait for the admin listener — **retrying on another leased
+/// port** if the child cannot bind the one it was given.
+///
+/// There is no plain one-shot path any more. A number picked from the ephemeral
+/// range and released just before the spawn can be taken by another process on
+/// this host in the handover window, and the child does **not** exit on
+/// `AddrInUse` (it keeps retrying its own server), so a one-shot "wait for the
+/// admin marker" spends the whole [`READY_TIMEOUT`] and then fails a test that
+/// had nothing wrong with it — the round-2 flake this closes. Going through
+/// [`spawn_admin_ready`] makes a lost port recoverable; panics are reserved for
+/// "every attempt failed on a distinct port", which is not contention.
+fn spawn_ready(dir: &TempDir, argv: &[&str], write_config: impl Fn(&PortSource)) -> Spawned {
+    let mut ports = FreePorts;
+    // Nothing is deliberately held on this path, so the leases never escape the
+    // loop; the forced-failure `admin_port_retry_recovers_from_a_held_port` owns
+    // and asserts against its own held lease.
+    let mut held_alive = Vec::new();
+    // No test here asserts on the per-attempt reasons, but `spawn_admin_ready`
+    // prints each one as it happens and includes them in its panic if the retry
+    // budget runs out.
+    let mut failures = Vec::new();
+    spawn_admin_ready(
+        dir,
+        argv,
+        write_config,
+        &mut ports,
+        &mut held_alive,
+        &mut failures,
+    )
+}
+
+/// Spawn the child and wait for its admin listener, **retrying with a fresh
+/// leased port** when the child dies before it gets there.
+///
+/// `write_config` is called with each attempt's lease, so the file the child
+/// reads always names the port that attempt actually uses — a retry that reused
+/// the same port would just fail again and hide the point. A distinct port is
+/// pulled from `port_source` per attempt, so a port another process on this host
+/// grabbed is used at most once. `failures` collects the per-attempt reasons (and
+/// is what `admin_port_retry_recovers_from_a_held_port` asserts on), and
+/// `held_alive` keeps every [`PortSource::held`] lease bound for as long as the
+/// caller needs it.
+///
+/// The child is only considered ready when both markers are visible **and** it is
+/// still alive: a child that fails to bind the admin port logs
+/// [`ADMIN_PORT_HELD`] immediately after `init_logging` (without exiting, because
+/// it keeps retrying its server), so the startup marker alone is not readiness.
+fn spawn_admin_ready(
+    dir: &TempDir,
+    argv: &[&str],
+    write_config: impl Fn(&PortSource),
+    port_source: &mut dyn Iterator<Item = PortSource>,
+    held_alive: &mut Vec<PortLease>,
+    failures: &mut Vec<String>,
+) -> Spawned {
+    for attempt in 1..=MAX_ADMIN_PORT_ATTEMPTS {
+        let source = port_source
+            .next()
+            .unwrap_or_else(|| panic!("port source exhausted after {} attempt(s)", attempt - 1));
+        write_config(&source);
+        let port = source.lease.port();
+        let PortSource { lease, released } = source;
+        if released {
+            lease.release();
+        } else {
+            // Keep it bound past this iteration — dropping it here would free
+            // the port and make the "held" case indistinguishable from the
+            // releasable one, which is what the caller is asserting against.
+            held_alive.push(lease);
+        }
+        match admin_port_attempt(dir, argv, port) {
+            Ok(mut spawned) => {
+                spawned.admin_port = port;
+                return spawned;
+            }
+            Err(reason) => {
+                eprintln!(
+                    "spawn attempt {attempt}/{MAX_ADMIN_PORT_ATTEMPTS} on port {port} failed: \
+                     {reason}; retrying with a fresh leased port"
+                );
+                failures.push(reason);
+            }
+        }
+    }
+    panic!(
+        "frpc never reached its admin listener in {MAX_ADMIN_PORT_ATTEMPTS} attempts, each on a \
+         distinct leased port — this is not port contention\n--- attempts ---\n{}",
+        failures.join("\n--- attempt ---\n")
+    );
+}
+
+/// One [`spawn_admin_ready`] attempt: report **why** it failed rather than
+/// panicking, so the caller can retry.
+fn admin_port_attempt(dir: &TempDir, argv: &[&str], port: u16) -> Result<Spawned, String> {
+    let child = Command::new(bin())
+        .args(argv)
+        .current_dir(&dir.0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn frpc: {e}"))?;
+    let mut spawned = Spawned::from_child(child, port);
+    // A startup failure is retryable by the caller, so propagate it instead of
+    // panicking (`wait_for` is the panicking wrapper for the non-retrying path).
+    spawned.wait_until(STARTUP_MARKER)?;
+    // Fast-fail window: the held-port record (or a dead child) shows up here, so
+    // the retry costs the window rather than the whole readiness timeout.
+    std::thread::sleep(FAST_FAIL_WINDOW);
+    if let Some(status) = spawned.peek_exit() {
+        return Err(format!(
+            "frpc exited ({status}) before its admin listener\n--- stdout ---\n{}\n\
+             --- stderr ---\n{}",
+            spawned.peek_stdout(),
+            spawned.peek_stderr(),
+        ));
+    }
+    if spawned.peek_stdout().contains(ADMIN_PORT_HELD) {
+        return Err(format!(
+            "frpc could not bind the admin port ({ADMIN_PORT_HELD:?}), and kept running\n\
+             --- stdout ---\n{}",
+            spawned.peek_stdout(),
+        ));
+    }
+    if let Err(why) = spawned.wait_until(ADMIN_MARKER) {
+        return Err(format!("frpc never reached its admin listener\n{why}"));
+    }
+    std::thread::sleep(SETTLE);
+    Ok(spawned)
+}
+
+/// Provenance check used by the retry test: a second bind of `port` must fail
+/// while the lease is alive, so the test can state that the port really was held.
+fn rival_bind_fails(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+}
+
 /// The clause the emitted record must carry in **this** target.
 ///
 /// The file compiles only when `admin` is on (`#![cfg(all(feature = "full",
 /// feature = "admin"))]`), so the build under test can serve HTTPS (`full`
 /// forwards `frp-client/default`, which includes `tls`) and answers "a web server
 /// with a TLS acceptor exists", and a record that says otherwise means a call
-/// site answered wrongly. The call sites this file reaches are `frpc/src/main.rs:606`
+/// site answered wrongly. The call sites this file reaches are `frpc/src/main.rs:621`
 /// (the `-c` startup load) and `frp-client/src/admin.rs:771` (the admin config-GET
 /// handler runs `config_from_file`); it never drives the reload, so
 /// `frp-client/src/service.rs:4458` is not visible here — that site is pinned by
@@ -378,9 +612,12 @@ const MAIN_PROXY: &str =
 #[test]
 fn hand_edit_after_startup_is_reported() {
     let dir = TempDir::new("hand-edit");
-    let admin_port = free_port();
-    let cfg = dir.write("frpc.toml", &frpc_config(admin_port, ""));
-    let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()]);
+    let cfg = dir.path("frpc.toml");
+    // Each attempt writes the port that attempt uses; `spawn_ready` releases the
+    // lease and retries with a fresh one if the child cannot bind it.
+    let child = spawn_ready(&dir, &["-c", cfg.to_str().unwrap()], |source| {
+        dir.write("frpc.toml", &frpc_config(source.lease.port(), ""));
+    });
     assert_eq!(
         child.records(),
         0,
@@ -388,8 +625,8 @@ fn hand_edit_after_startup_is_reported() {
     );
 
     // The hand-edit: add the key while the child runs, then poll once.
-    std::fs::write(&cfg, frpc_config(admin_port, ENABLE)).expect("hand-edit the config");
-    let response = admin_get(admin_port, "hand-edit");
+    std::fs::write(&cfg, frpc_config(child.admin_port(), ENABLE)).expect("hand-edit the config");
+    let response = admin_get(child.admin_port(), "hand-edit");
     assert!(
         response.contains("HTTP/1."),
         "the admin route must answer, got {response:?}"
@@ -413,13 +650,14 @@ fn hand_edit_after_startup_is_reported() {
 #[test]
 fn startup_record_is_not_repeated_by_a_get() {
     let dir = TempDir::new("no-dup");
-    let admin_port = free_port();
-    let cfg = dir.write("frpc.toml", &frpc_config(admin_port, ENABLE));
-    let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()]);
+    let cfg = dir.path("frpc.toml");
+    let child = spawn_ready(&dir, &["-c", cfg.to_str().unwrap()], |source| {
+        dir.write("frpc.toml", &frpc_config(source.lease.port(), ENABLE));
+    });
     child.assert_records(1, "the startup record");
 
     for i in 0..3 {
-        let response = admin_get(admin_port, "no-dup");
+        let response = admin_get(child.admin_port(), "no-dup");
         assert!(response.contains("HTTP/1."), "GET {i} must answer");
     }
     child.assert_records(1, "three GETs over an unchanged file");
@@ -440,19 +678,21 @@ fn startup_record_is_not_repeated_by_a_get() {
 #[test]
 fn seed_reads_the_file_non_strictly() {
     let dir = TempDir::new("non-strict");
-    let admin_port = free_port();
+    let cfg = dir.path("frpc.toml");
     // An unknown top-level field: accepted by the runtime only because the run
     // is non-strict, and enough to make a strict seed fail.
-    let cfg = dir.write(
-        "frpc.toml",
-        &format!(
-            "unknown_top_level_field = 1\n{}",
-            frpc_config(admin_port, "")
-        ),
-    );
-    let child = Spawned::run(
+    let child = spawn_ready(
         &dir,
         &["--strict-config=false", "-c", cfg.to_str().unwrap()],
+        |source| {
+            dir.write(
+                "frpc.toml",
+                &format!(
+                    "unknown_top_level_field = 1\n{}",
+                    frpc_config(source.lease.port(), "")
+                ),
+            );
+        },
     );
     assert_eq!(child.records(), 0, "no key at startup");
 
@@ -460,11 +700,11 @@ fn seed_reads_the_file_non_strictly() {
         &cfg,
         format!(
             "unknown_top_level_field = 1\n{}",
-            frpc_config(admin_port, ENABLE)
+            frpc_config(child.admin_port(), ENABLE)
         ),
     )
     .expect("hand-edit the config");
-    let response = admin_get(admin_port, "non-strict");
+    let response = admin_get(child.admin_port(), "non-strict");
     assert!(response.contains("HTTP/1."), "the route must answer");
 
     child.assert_records(1, "the seed must have read the non-strict file");
@@ -514,15 +754,19 @@ fn seed_resolves_spellings_only_the_loader_does() {
     //     the presence detector finds its `tls` through the `[common]` fallback —
     //     read before `normalize`, so the per-key merge is not what keeps it.
     let dir = TempDir::new("loader-common");
-    let admin_port = free_port();
-    let cfg = dir.write(
-        "frpc.toml",
-        &frpc_config(admin_port, "[common.webServer.tls]\nenable = true\n"),
-    );
-    let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()]);
+    let cfg = dir.path("frpc.toml");
+    let child = spawn_ready(&dir, &["-c", cfg.to_str().unwrap()], |source| {
+        dir.write(
+            "frpc.toml",
+            &frpc_config(
+                source.lease.port(),
+                "[common.webServer.tls]\nenable = true\n",
+            ),
+        );
+    });
     child.assert_records(1, "(a) the startup record for the [common] spelling");
     for _ in 0..3 {
-        let response = admin_get(admin_port, "(a) common spelling");
+        let response = admin_get(child.admin_port(), "(a) common spelling");
         assert!(response.contains("HTTP/1."), "the route must answer");
     }
     child.assert_records(1, "(a) three GETs over the [common] spelling");
@@ -530,16 +774,20 @@ fn seed_resolves_spellings_only_the_loader_does() {
     // (b) The same key in an `includes` file, which `process_includes`
     //     deep-merges before the detector runs.
     let dir = TempDir::new("loader-includes");
-    let admin_port = free_port();
-    let cfg = dir.write(
-        "frpc.toml",
-        &format!("includes = [\"inc.toml\"]\n{}", frpc_config(admin_port, "")),
-    );
-    dir.write("inc.toml", "[common.webServer.tls]\nenable = true\n");
-    let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()]);
+    let cfg = dir.path("frpc.toml");
+    let child = spawn_ready(&dir, &["-c", cfg.to_str().unwrap()], |source| {
+        dir.write(
+            "frpc.toml",
+            &format!(
+                "includes = [\"inc.toml\"]\n{}",
+                frpc_config(source.lease.port(), "")
+            ),
+        );
+        dir.write("inc.toml", "[common.webServer.tls]\nenable = true\n");
+    });
     child.assert_records(1, "(b) the startup record for the includes spelling");
     for _ in 0..3 {
-        let response = admin_get(admin_port, "(b) includes spelling");
+        let response = admin_get(child.admin_port(), "(b) includes spelling");
         assert!(response.contains("HTTP/1."), "the route must answer");
     }
     child.assert_records(1, "(b) three GETs over the includes spelling");
@@ -552,13 +800,17 @@ fn seed_resolves_spellings_only_the_loader_does() {
     //     read of an *absent* `frpc.toml` is not caught here: `NO_BASELINE`
     //     baselines silently on the first GET, so the counts would match.)
     let dir = TempDir::new("loader-argument");
-    let admin_port = free_port();
-    dir.write("frpc.toml", &frpc_config(admin_port, ""));
-    let cfg = dir.write("admin-node.toml", &frpc_config(admin_port, ENABLE));
-    let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()]);
+    let cfg = dir.path("admin-node.toml");
+    let child = spawn_ready(&dir, &["-c", cfg.to_str().unwrap()], |source| {
+        // Both files name the port this attempt actually uses, so a retry cannot
+        // leave the cwd file pointing at a port another attempt owns.
+        let port = source.lease.port();
+        dir.write("frpc.toml", &frpc_config(port, ""));
+        dir.write("admin-node.toml", &frpc_config(port, ENABLE));
+    });
     child.assert_records(1, "(c) the startup record for a non-default filename");
     for _ in 0..3 {
-        let response = admin_get(admin_port, "(c) non-default filename");
+        let response = admin_get(child.admin_port(), "(c) non-default filename");
         assert!(response.contains("HTTP/1."), "the route must answer");
     }
     child.assert_records(1, "(c) three GETs over a non-default filename");
@@ -583,10 +835,12 @@ fn seed_resolves_spellings_only_the_loader_does() {
     //     the proxy-less cwd file still emits the same single record, but answers
     //     `404 proxy "main" not found` instead of describing the proxy.
     let dir = TempDir::new("loader-precedence");
-    let admin_port = free_port();
-    dir.write("frpc.toml", &frpc_config(admin_port, ENABLE));
-    let cfg = dir.write("admin-node.toml", &frpc_config(admin_port, MAIN_PROXY));
-    let child = Spawned::run(&dir, &["-c", cfg.to_str().unwrap()]);
+    let cfg = dir.path("admin-node.toml");
+    let child = spawn_ready(&dir, &["-c", cfg.to_str().unwrap()], |source| {
+        let port = source.lease.port();
+        dir.write("frpc.toml", &frpc_config(port, ENABLE));
+        dir.write("admin-node.toml", &frpc_config(port, MAIN_PROXY));
+    });
     assert_eq!(
         child.records(),
         0,
@@ -598,10 +852,10 @@ fn seed_resolves_spellings_only_the_loader_does() {
     // that actually read the `-c` file sees the change. It keeps the proxy.
     std::fs::write(
         &cfg,
-        frpc_config(admin_port, &format!("{MAIN_PROXY}{ENABLE}")),
+        frpc_config(child.admin_port(), &format!("{MAIN_PROXY}{ENABLE}")),
     )
     .expect("hand-edit the -c file");
-    let response = admin_get(admin_port, "(d) precedence");
+    let response = admin_get(child.admin_port(), "(d) precedence");
     assert!(
         response.contains("HTTP/1."),
         "the admin route must answer, got {response:?}"
@@ -614,5 +868,85 @@ fn seed_resolves_spellings_only_the_loader_does() {
         "(d) the GET body must describe the `main` proxy declared in the `-c` file \
          — a load that read the proxy-less cwd ./frpc.toml answers 404 instead\n\
          --- response ---\n{response}"
+    );
+}
+
+/// The retry path of [`spawn_admin_ready`], driven **on purpose**: the first port
+/// handed to the retry loop is one this process deliberately keeps bound, so the
+/// child cannot bind it and dies with the round-2 `Address already in use (os
+/// error 48)`. The loop must recognize that early exit and try a second, fresh
+/// port — under the old "pick a number, spawn once" flow the same situation
+/// flakes instead of being reported, which is what this test keeps from coming
+/// back.
+///
+/// The held port is bound **throughout** the call, so "the child bound it anyway"
+/// is impossible; the rival-bind check at the end states that in the assertion.
+#[test]
+fn admin_port_retry_recovers_from_a_held_port() {
+    let dir = TempDir::new("retry");
+    // Attempt 1's lease is never released, so the child cannot bind it and dies.
+    let held = free_port();
+    let held_port = held.port();
+    // Attempt 2 gets a releasable lease; this is the port the child survives on.
+    let second = free_port();
+    let second_port = second.port();
+    let mut source = std::iter::once(PortSource::held(held))
+        .chain(std::iter::once(PortSource::releasable(second)));
+    // Keeps attempt 1's lease bound for the whole call (see `spawn_admin_ready`).
+    let mut held_alive = Vec::new();
+    let mut failures = Vec::new();
+    // Each attempt gets a config naming the port that attempt actually uses.
+    let child = spawn_admin_ready(
+        &dir,
+        &["-c", "frpc.toml"],
+        |source| {
+            dir.write("frpc.toml", &frpc_config(source.lease.port(), ENABLE));
+        },
+        &mut source,
+        &mut held_alive,
+        &mut failures,
+    );
+    assert_eq!(
+        child.admin_port(),
+        second_port,
+        "the surviving child must be the retry, on the second leased port (held_port={held_port})"
+    );
+
+    // Provenance of the failure: attempt 1 must have died before its admin
+    // listener, and the loop recorded it instead of panicking.
+    assert_eq!(
+        failures.len(),
+        1,
+        "exactly one attempt must be retried\n--- failures ---\n{}",
+        failures.join("\n--- failure ---\n")
+    );
+    // The child logs the bind failure and keeps running, so the loop must have
+    // recognized the *record*, not a process exit.
+    assert!(
+        failures[0].contains("could not bind the admin port")
+            && failures[0].contains("Address already in use"),
+        "the retried attempt must be the held port's bind failure, not a timeout: {}",
+        failures[0]
+    );
+
+    // The child is alive and serving on its own second port; the held port is
+    // still ours, so the failure this test forces cannot be blamed on the child.
+    let response = admin_get(child.admin_port(), "(retry) recovered");
+    assert!(
+        response.contains("HTTP/1."),
+        "the retried child must serve the admin route, got {response:?}"
+    );
+    assert!(
+        rival_bind_fails(held_port),
+        "the deliberately held port {held_port} must still be bound"
+    );
+    // Two-way control: once the caller lets the lease go, the same port binds —
+    // so the assertion above is about the *held* lease, not about
+    // `rival_bind_fails` being unable to succeed on this host.
+    drop(held_alive);
+    assert!(
+        !rival_bind_fails(held_port),
+        "the port must become bindable once the held lease is dropped, or the \
+         check above proves nothing"
     );
 }
