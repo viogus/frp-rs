@@ -269,7 +269,13 @@ jobs:
       # awaiting it and reds the pin. `#[cfg(unix)]` like its siblings, and every
       # runner for this lane is `ubuntu-latest`. Re-derived on this tree with
       # `cargo test -p frps --test cli_exit_codes -- --list`.
-      FRPS_CLI_TESTS: "43"
+      # 43 → 44 with #427's `--vhost-http-timeout` int64 rows split out of
+      # `verify_accepts_vhost_http_timeout_both_spellings_and_prints_go_line`
+      # into their own `verify_handles_vhost_http_timeout_go_signed_int64_range`:
+      # +1, so this count guard can see those rows (it counts test functions, not
+      # assertions). Re-derived on this tree with
+      # `cargo test -p frps --test cli_exit_codes -- --list`.
+      FRPS_CLI_TESTS: "44"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
       # 11 → 13 with the one `auth.method` policy: +2

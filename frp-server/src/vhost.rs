@@ -658,6 +658,14 @@ const VHOST_TIMEOUT_CAP_SECS: u64 = 24 * 60 * 60;
 /// `<= 0` value floors at 60s (Go parity for the floor), positive values
 /// pass through unchanged.
 ///
+/// The input is Go's signed `int64` (config field and flag alike), so a
+/// negative value reaches here instead of being refused at parse time; the
+/// `<= 0` floor is what gives it meaning, exactly as Go's own use of the
+/// value tolerates a negative `Duration` from the same field. Values above
+/// the cap saturate at [`VHOST_TIMEOUT_CAP_SECS`], which is why the return
+/// type stays `u64` — every caller feeds it to `Duration::from_secs` or an
+/// `Instant` addition.
+///
 /// Role split of `vhost_http_timeout` (Go-mirrored since rounds 13/14;
 /// the audit-r7 "plain HTTP/1.1 bridge is raw forward" reading is stale):
 /// Go's config feeds the ReverseProxy backend response-head wait —
@@ -693,14 +701,14 @@ const VHOST_TIMEOUT_CAP_SECS: u64 = 24 * 60 * 60;
 /// the deadline sites below (serve_vhost_request head deadline,
 /// serve_h2c_request handshake deadline), and std `Instant` PANICS when the
 /// add overflows — under the release `panic=abort` profile a hostile
-/// `vhost_http_timeout = u64::MAX` config would abort frps on the first
+/// `vhost_http_timeout = i64::MAX` config would abort frps on the first
 /// vhost request, before any read is attempted (audit finding S1). The
 /// `tokio::time::timeout(duration)` call sites (HTTPS SNI, h2c/HTTP
 /// response head) cannot overflow — tokio's checked_add degrades a huge
 /// duration to a far-future deadline — but share the same clamp so the
 /// config has one bounded semantic everywhere.
-pub(crate) fn clamp_vhost_timeout(t: u64) -> u64 {
-    let floored = if t > 0 { t } else { 60 };
+pub(crate) fn clamp_vhost_timeout(t: i64) -> u64 {
+    let floored = if t > 0 { t as u64 } else { 60 };
     floored.min(VHOST_TIMEOUT_CAP_SECS)
 }
 
@@ -3422,24 +3430,30 @@ mod tests {
     #[test]
     fn test_clamp_vhost_timeout() {
         // Go parity: `<= 0` floors at 60s; positive values pass through up
-        // to the 24h cap. Above it (incl. u64::MAX from a hostile config)
+        // to the 24h cap. Above it (incl. i64::MAX from a hostile config)
         // the value would overflow the `Instant::now() + from_secs` deadline
         // add at serve_vhost_request / serve_h2c_request — an abort under
         // the release `panic=abort` profile — so it clamps instead.
         assert_eq!(clamp_vhost_timeout(0), 60);
+        assert_eq!(
+            clamp_vhost_timeout(-1),
+            60,
+            "Go's int64 accepts a negative flag/config value; the floor is what gives it meaning"
+        );
+        assert_eq!(clamp_vhost_timeout(i64::MIN), 60);
         assert_eq!(clamp_vhost_timeout(1), 1);
         assert_eq!(clamp_vhost_timeout(30), 30);
         assert_eq!(clamp_vhost_timeout(60), 60);
         assert_eq!(clamp_vhost_timeout(120), 120);
         assert_eq!(
-            clamp_vhost_timeout(VHOST_TIMEOUT_CAP_SECS),
+            clamp_vhost_timeout(VHOST_TIMEOUT_CAP_SECS as i64),
             VHOST_TIMEOUT_CAP_SECS
         );
         assert_eq!(
-            clamp_vhost_timeout(VHOST_TIMEOUT_CAP_SECS + 1),
+            clamp_vhost_timeout(VHOST_TIMEOUT_CAP_SECS as i64 + 1),
             VHOST_TIMEOUT_CAP_SECS
         );
-        assert_eq!(clamp_vhost_timeout(u64::MAX), VHOST_TIMEOUT_CAP_SECS);
+        assert_eq!(clamp_vhost_timeout(i64::MAX), VHOST_TIMEOUT_CAP_SECS);
     }
 
     #[test]

@@ -2316,6 +2316,75 @@ fn verify_accepts_vhost_http_timeout_both_spellings_and_prints_go_line() {
     }
 }
 
+/// Signed `int64` rows on the same `verify` surface, for **both** flag
+/// spellings. Go's flag is `Int64VarP` (`pkg/config/flags.go:237`) and its config
+/// field is `int64`, so a negative value is accepted (`verify` ignores it) and
+/// only a value outside `int64` is refused. Go also normalizes `_` to `-` before
+/// parsing (`cmd/frps/root.go:105`
+/// `SetGlobalNormalizationFunc(config.WordSepNormalizeFunc)`), so
+/// `--vhost_http_timeout` takes the same range as the hyphen spelling. Measured
+/// on Go v0.71.0 for every row below, streams separated, rc read from the child:
+/// `0`, `-1`, `-9223372036854775808` and `9223372036854775807` are rc **0** under
+/// both spellings with the same success line; `9223372036854775808` and
+/// `9999999999999999999` are rc **1** under both spellings, with
+/// `strconv.ParseInt: … value out of range` on stderr naming the flag in its
+/// hyphen form and 0 bytes on stdout.
+///
+/// This is a separate `#[test]` from
+/// `verify_accepts_vhost_http_timeout_both_spellings_and_prints_go_line` so the
+/// `FRPS_CLI_TESTS` count guard in `.github/workflows/ci.yml` covers these rows:
+/// a count guard counts test functions, so rows folded into another function can
+/// be deleted without moving the count. The config's `bindPort` is held for the
+/// whole run, as in `verify_valid_config_prints_go_line_and_exits_0`.
+#[test]
+fn verify_handles_vhost_http_timeout_go_signed_int64_range() {
+    let (_held, port) = held_port();
+    let dir = TempDir::new();
+    let cfg = valid_config(&dir, port);
+
+    for spelling in ["--vhost-http-timeout", "--vhost_http_timeout"] {
+        for value in ["0", "-1", "-9223372036854775808", "9223372036854775807"] {
+            let out = run_frps(&["verify", spelling, value, "-c", &cfg]);
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "`frps verify {spelling} {value} -c <valid>` is inside Go's int64 \
+                 and must exit 0 (stdout={:?} stderr={:?})",
+                stdout_of(&out),
+                stderr_of(&out),
+            );
+            assert_eq!(
+                stdout_of(&out),
+                format!("frps: the configuration file {cfg} syntax is ok\n"),
+                "Go ignores the value on `verify`, so the success line is unchanged — one bare \
+                 stdout line, no ANSI and no log prefix; stderr={:?}",
+                stderr_of(&out),
+            );
+        }
+        for value in ["9223372036854775808", "9999999999999999999"] {
+            let out = run_frps(&["verify", spelling, value, "-c", &cfg]);
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "`frps verify {spelling} {value} -c <valid>` is outside Go's int64 and \
+                 must be refused like Go (stdout={:?} stderr={:?})",
+                stdout_of(&out),
+                stderr_of(&out),
+            );
+            assert!(
+                !stdout_of(&out).contains("syntax is ok"),
+                "a refused value must not print the success line; stdout={:?}",
+                stdout_of(&out),
+            );
+            assert!(
+                stdout_of(&out).is_empty(),
+                "frp-rs reports the parse refusal on stderr like Go; stdout={:?}",
+                stdout_of(&out),
+            );
+        }
+    }
+}
+
 /// The failure half of the same surface, both shapes of "bad config": an unknown
 /// key under the default (strict) mode and a value that does not fit its type.
 /// Measured on Go v0.71.0, streams separated, rc read directly — both are rc

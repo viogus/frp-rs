@@ -11,15 +11,17 @@
 //!
 //! | shape | frp-rs before | Go v0.71.0 |
 //! |---|---|---|
-//! | `[log] level = ""` in the file | **0 B stdout / 0 B stderr**, listener up on `127.0.0.1:<port>` | 273 B on stdout, 3 `INFO` records |
-//! | `[log] maxDays = 0` in the file | logs (1498 B / 7 records), but retention disabled | logs, retains 3 days |
+//! | `[log] level = ""` in the file | **0 B stdout / 0 B stderr**, listener up on `127.0.0.1:<port>` | 273 B raw on stdout (`frps -c ./frps.toml`; `-c frps.toml` gives 271 B), 3 `INFO` records |
+//! | `[log] maxDays = 0` in the file | logs — 7 `INFO` records at startup (1482 B raw / 915 B stripped, implicit `./frps.toml` lane), 11 records / 2410–2412 B raw over the full run — but retention disabled | logs, retains 3 days |
 //! | `--log-level ""` (CLI) | 0 B / 0 B, listener up | 282 B on stdout, 3 `INFO` records |
 //! | `--log-file ""` (CLI) | 0 B / 0 B **and** a `frps.log.<date>` in the CWD | logs on stdout |
-//! | `[log] to = ""` in the file | logs (1498 B / 7 records), no file created | logs on stdout |
+//! | `[log] to = ""` in the file | logs — same 7-record startup shape (1482 B raw / 915 B stripped), **no** `frps.log.*` file created | logs on stdout |
 //!
 //! The Go rows are the **flags-only** lane (`--bind-port <free>`, 282 B / 3
-//! `INFO` records) or the **config-file** lane (273 B / 3 `INFO` records),
-//! whichever matches the shape; the line count is `INFO` **records**, not
+//! `INFO` records) or the **config-file** lane, whichever matches the shape. The
+//! config-file row is `frps -c ./frps.toml`: 273 B raw / 240 B stripped, 3 `INFO`
+//! records, and its first record echoes the `-c` argument, so `-c frps.toml`
+//! measures 271 / 238. The line count is `INFO` **records**, not
 //! `grep -c .` on the raw stream, which over-counts by one on a trailing ANSI
 //! reset (the item's "4 lines" was that artifact).
 //!
@@ -29,6 +31,26 @@
 //! file. Only the **flag** arm (`--log-file ""`) was broken, and only `level`
 //! and `max_days` had a config-value defect. The pre-fix rows above are the
 //! measured ones, with the false row removed.
+//!
+//! The two `logs` cells are re-measured on the HEAD binary, implicit `./frps.toml`
+//! lane, own free port, stdout only and ANSI-stripped: 7 `INFO` records at startup
+//! = 1482 B raw / 915 B stripped (1480 / 913 at the four-digit pids of a later
+//! sample), 11 records over the full run = 2410–2412 B raw / 1471–1473 B stripped
+//! (2407–2410 / 1468–1471 at four-digit pids; both ranges are for a five-digit
+//! ephemeral port). Three terms move those totals: the `elapsed_secs=` value
+//! width, the pid digit count, and the `bind_port` digit count — the config is
+//! echoed eight times across the startup block's four `run{…}` records plus once
+//! in each of the three shutdown records, so one port digit is 11 B (a forced
+//! four-digit port measures 2401 B raw / 1462 B stripped). raw − stripped is a
+//! constant 939 B in every sample. No `frps.log.*` file is created in either
+//! shape. The earlier
+//! `1498 B / 7 records` is the same lane and binary with this file's own template
+//! `bind_addr = "127.0.0.1"` (`config()` below) instead of the binary default
+//! `0.0.0.0`: the address is echoed eight times across the startup block's four
+//! `run{…}` records, so its two extra characters add 16 B (1498 − 1482; 1496 B at
+//! a four-digit pid). For these two rows the record *shape* is the same on both
+//! sides of the completion fix, which changed retention only (and not `to = ""` at
+//! all).
 //!
 //! **What this file models.** The end-to-end effect on the two streams and on the
 //! CWD for the shipped `frps` binary, over two lanes: the config-file lane
@@ -51,8 +73,9 @@
 //! assert the **absolute** byte count or record count of a healthy run, for two
 //! reasons: those are run-dependent, and this file's own liveness probe
 //! (`assert_loopback_listens`, a bare `TcpStream::connect`) is itself a writer —
-//! measured on `frps --bind-port <free>`: 1498 B / 7 records before the connect,
-//! **1800 B / 8 records after it**, the extra record being
+//! measured on `frps --bind-port <free>` with `bind_addr = "127.0.0.1"`: 1498 B
+//! / 7 records before the connect (1496 B at a four-digit pid), **1800 B / 8
+//! records after it**, the extra record being
 //! `WARN frp_server::service: Failed to detect connection type … early eof`
 //! (302 B). The byte figures in the table above are therefore measured with
 //! `lsof` as the liveness probe (see `/tmp/log-complete-report.md`), and this

@@ -529,7 +529,12 @@ pub struct FrpsArgs {
     /// means the flag was absent and the config value stands;
     /// `ServerConfig::default()` already carries Go's 60
     /// (`frp-core/src/config/server.rs:247`), so the absent case is Go's default.
-    pub vhost_http_timeout: Option<u64>,
+    /// The value is `i64`, matching `Int64VarP` and Go's `int64` config field:
+    /// Go accepts `--vhost-http-timeout -1` (its floor then applies) and refuses
+    /// only what does not fit an `int64` (measured on Go v0.71.0:
+    /// `-9223372036854775808` rc 0, `9223372036854775807` rc 0,
+    /// `9223372036854775808` rc 1 `value out of range`).
+    pub vhost_http_timeout: Option<i64>,
     pub strict_config: bool,
     pub show_version: bool,
 }
@@ -604,7 +609,7 @@ struct SvrTransport {
     quic_bind_port: Option<u16>,
     vhost_http_port: Option<u16>,
     vhost_https_port: Option<u16>,
-    vhost_http_timeout: Option<u64>,
+    vhost_http_timeout: Option<i64>,
     subdomain_host: Option<String>,
     max_ports_per_client: Option<u64>,
     tls_only: bool,
@@ -899,14 +904,16 @@ fn svr_transport() -> impl Parser<SvrTransport> {
         .argument::<u16>("PORT")
         .optional();
     // Go registers the name with underscores and turns every `_` into `-` via
-    // `WordSepNormalizeFunc` (`pkg/config/flags.go:26-32`), so both spellings
+    // `WordSepNormalizeFunc` (`pkg/config/flags.go:31-36`), so both spellings
     // are accepted and `--help` renders the hyphen form. Same pairing as the
     // two `vhost-http(s)-port` flags above; measured on Go v0.71.0:
     // `frps verify --vhost-http-timeout 30 -c <valid>` and
     // `frps verify --vhost_http_timeout 30 -c <valid>` are both rc 0.
+    // Signed, because Go's is `Int64VarP`/`int64`: `-1` is accepted there and
+    // the out-of-range boundary is the `int64` one, not `u64`'s.
     let vhost_http_timeout = long("vhost-http-timeout")
         .long("vhost_http_timeout")
-        .argument::<u64>("SECONDS")
+        .argument::<i64>("SECONDS")
         .optional();
     let subdomain_host = long("subdomain-host")
         .long("subdomain_host")
@@ -3745,16 +3752,37 @@ impl FrpsArgs {
             cfg.proxy_bind_addr = v.clone();
         }
 
-        // Log
+        // Log. `--log-file ""`, `--log-level ""` and `--log-max-days 0` are
+        // Go's zero values, which `LogConfig::complete` fills with
+        // `console`/`info`/`3` (`frp-core/src/config/server.rs`). Writing the
+        // zero value into the config here would therefore *raise* a file's
+        // explicitly non-default `level`, `to` or `max_days` back to Go's
+        // default on the one lane that applies overrides, defeating the
+        // "empty/zero CLI means not supplied" rule the resolvers in
+        // `frp-core/src/logging.rs` already apply to both binaries:
+        // `resolve_log_level` filters `""`, `resolve_log_file` filters `""`
+        // and `resolve_log_max_days` filters `0`. Go's `-c` lane leaves the
+        // file's value too (both binaries, measured on v0.71.0), and this lane
+        // also read a config file (`config_path()` defaults to `frps.toml`),
+        // so the file's value must survive.
         if let Some(ref v) = self.log_file {
-            cfg.log.file = v.clone();
+            if !v.is_empty() {
+                cfg.log.file = v.clone();
+            }
         }
         if let Some(ref v) = self.log_level {
-            cfg.log.level = v.clone();
+            if !v.is_empty() {
+                cfg.log.level = v.clone();
+            }
         }
         if let Some(v) = self.log_max_days {
-            cfg.log.max_days = v;
+            if v != 0 {
+                cfg.log.max_days = v;
+            }
         }
+        // `--log-format` has no `LogConfig::complete` slot and no Go analogue
+        // on the file lane, so it keeps the raw write-through; see the
+        // `log_flag_zero_values_do_not_override_the_config_file` pin below.
         if let Some(ref v) = self.log_format {
             cfg.log.format = v.clone();
         }
@@ -4396,6 +4424,121 @@ mod tests {
         let mut cfg = crate::config::ServerConfig::default();
         args.override_server_config(&mut cfg);
         assert_eq!(cfg.vhost_http_timeout, 60, "absent flag keeps Go's default");
+
+        // Go registers the flag with `Int64VarP` (`pkg/config/flags.go:237`) and
+        // its config field is `int64`, so the signed boundaries are accepted and
+        // only a value outside `int64` is refused. Measured on Go v0.71.0
+        // (`frps verify -c <valid>`): `-1` and `-9223372036854775808` rc 0,
+        // `9223372036854775807` rc 0, `9223372036854775808` and
+        // `9999999999999999999` rc 1 `strconv.ParseInt … value out of range`.
+        //
+        // A `-`-prefixed value needs the same preparation the binaries run
+        // ([`prepared_cli_argv`], `attach_flag_shaped_values`): bpaf alone reads
+        // `-1` as a flag, which is why the real `frps --vhost-http-timeout -1`
+        // parses (measured: it starts and exits on the config's own error, not
+        // on argv).
+        let parse_prepared = |argv: &[&str]| {
+            let prepared: Vec<OsString> = argv.iter().map(OsString::from).collect();
+            frps_args()
+                .to_options()
+                .run_inner(&prepared_cli_argv(&prepared, RootCommand::Frps)[..])
+        };
+        for (argv, expected) in [
+            ("-1", -1_i64),
+            ("-9223372036854775808", i64::MIN),
+            ("9223372036854775807", i64::MAX),
+        ] {
+            let args = parse_prepared(&["--vhost-http-timeout", argv]).unwrap();
+            assert_eq!(
+                args.vhost_http_timeout,
+                Some(expected),
+                "`{argv}` is inside Go's int64 range"
+            );
+            let mut cfg = crate::config::ServerConfig::default();
+            args.override_server_config(&mut cfg);
+            assert_eq!(
+                cfg.vhost_http_timeout, expected,
+                "`{argv}` must reach the config signed, not refused or wrapped"
+            );
+        }
+        for argv in ["9223372036854775808", "9999999999999999999"] {
+            assert!(
+                parse_prepared(&["--vhost-http-timeout", argv]).is_err(),
+                "`{argv}` is outside Go's int64, so `Int64VarP` refuses it too"
+            );
+        }
+    }
+
+    /// `--log-level ""`, `--log-file ""` and `--log-max-days 0` are Go's zero
+    /// values, and `LogConfig::complete` fills them with `info`/`console`/`3`
+    /// (`frp-core/src/config/server.rs`). Writing them through this override
+    /// therefore silently **raised** a config file's explicit
+    /// `[log] level = "warn"` back to `info` on the one lane that applies
+    /// overrides — on the pre-fix revision `3f66d823` (before `c8451157`),
+    /// frps run with `frps.toml` (`[log] level = "warn"`) in the cwd and no
+    /// `-c`: the empty flag was written into `[log] level` and completed to
+    /// `info`, so `--log-level ""` resolved to `info` (11 `INFO` records) where
+    /// no flag gave 0. That resolved-`info` output is the one this head binary
+    /// still prints for `--log-level info` on the same lane: 11 `INFO` records,
+    /// config `bindPort = 17531`, `[auth] token = "rev427token"`,
+    /// `[log] level = "warn"`.
+    /// Go v0.71.0 has no parity to claim on the *non-empty* value — with `-c`
+    /// it discards the pflag-bound struct, so its file's `warn` survives an
+    /// absent, empty **or** non-empty `--log-level` (0 records in all three) —
+    /// and frp-rs still honours a non-empty one (open divergence R1). The shape
+    /// this test pins is the *empty* value on the implicit `./frps.toml` lane,
+    /// where `--log-level ""` now keeps the file's `warn` (0 `INFO` records);
+    /// `frpc`, which never overlays, honoured the file throughout. The resolvers
+    /// already model the zero values as absent for both binaries
+    /// (`resolve_log_level`/`resolve_log_file`/`resolve_log_max_days`,
+    /// `frp-core/src/logging.rs:101`, `:140`, `:195`).
+    #[test]
+    fn log_flag_zero_values_do_not_override_the_config_file() {
+        let mut cfg = crate::config::ServerConfig::default();
+        cfg.log.level = "warn".to_string();
+        cfg.log.file = "logs/frps.log".to_string();
+        cfg.log.max_days = 5;
+
+        let args =
+            parse_frps(&["--log-level", "", "--log-file", "", "--log-max-days", "0"]).unwrap();
+        args.override_server_config(&mut cfg);
+        // The real order (`frps/src/main.rs`): override first, then Go's completion.
+        cfg.complete();
+        assert_eq!(
+            cfg.log.level, "warn",
+            "an empty --log-level is not supplied"
+        );
+        assert_eq!(
+            cfg.log.file, "logs/frps.log",
+            "an empty --log-file is not supplied"
+        );
+        assert_eq!(cfg.log.max_days, 5, "a zero --log-max-days is not supplied");
+
+        // Non-zero flags still win, so this is a zero-value filter and not
+        // "ignore the CLI log flags".
+        let mut cfg = crate::config::ServerConfig::default();
+        cfg.log.level = "warn".to_string();
+        cfg.log.max_days = 5;
+        let args = parse_frps(&["--log-level", "trace", "--log-max-days", "7"]).unwrap();
+        args.override_server_config(&mut cfg);
+        // The real order (`frps/src/main.rs`): override first, then Go's completion.
+        cfg.complete();
+        assert_eq!(cfg.log.level, "trace", "a non-empty --log-level still wins");
+        assert_eq!(cfg.log.max_days, 7, "a non-zero --log-max-days still wins");
+
+        // Deliberate residue, pinned so it cannot change silently:
+        // `--log-format` has no `LogConfig::complete` slot (Go has no
+        // completion for it either), so it keeps the raw write-through.
+        let mut cfg = crate::config::ServerConfig::default();
+        cfg.log.format = "json".to_string();
+        let args = parse_frps(&["--log-format", ""]).unwrap();
+        args.override_server_config(&mut cfg);
+        // The real order (`frps/src/main.rs`): override first, then Go's completion.
+        cfg.complete();
+        assert_eq!(
+            cfg.log.format, "",
+            "--log-format keeps the raw write-through (no zero-value filter)"
+        );
     }
 
     #[test]

@@ -108,8 +108,10 @@ pub struct ServerConfig {
     pub max_conns_per_proxy: u64,
     /// Timeout in seconds for backend HTTP response in VHost handler.
     /// Go frp compat: VhostHTTPTimeout. Default: 60.
+    /// Signed like Go's `int64` field: Go's `Int64VarP` accepts a negative
+    /// value and only the downstream floor/clamp (frp-server) gives it meaning.
     #[serde(default = "default_vhost_http_timeout", alias = "vhostHTTPTimeout")]
-    pub vhost_http_timeout: u64,
+    pub vhost_http_timeout: i64,
     /// Idle timeout in seconds on user-facing proxy connections.
     /// Go frp compat: UserConnTimeout. Default: 10.
     #[serde(default = "default_user_conn_timeout", alias = "userConnTimeout")]
@@ -244,7 +246,7 @@ fn default_allow_port_start() -> u16 {
 fn default_allow_port_end() -> u16 {
     65535
 }
-fn default_vhost_http_timeout() -> u64 {
+fn default_vhost_http_timeout() -> i64 {
     60
 }
 fn default_user_conn_timeout() -> u64 {
@@ -394,7 +396,7 @@ impl ServerConfig {
     /// `svrCfg = &v1.ServerConfig{}` (`pkg/config/load.go:313`), unmarshals the
     /// file into that, and completes **it** (`load.go:318-321`); the
     /// pflag-bound `serverCfg` is never completed and is dropped, which is why
-    /// Go ignores the flags in that lane (`frp-core/src/cli.rs:2862` records the
+    /// Go ignores the flags in that lane (`frp-core/src/cli.rs:3454-3461` records the
     /// same rule: flags apply only when `cfgFile == ""`). frp-rs mirrors both
     /// lanes — on `-c` it also ignores the flags, and on its override lane it
     /// overlays and *then* completes: the same **order** as Go's flags-only path,
@@ -428,28 +430,41 @@ impl ServerConfig {
         // `ProxyBindAddr` fills at `:110-114`. frp-core had no Auth completion
         // step; the two now run in Go's order.
         //
-        // Why it is needed at all: an explicit `--log-level ""` / `--log-file ""`
-        // / `--log-max-days 0` is written into the struct by
-        // `FrpsArgs::override_server_config` (`frp-core/src/cli.rs`) BEFORE this
-        // call, and the serde defaults on `LogConfig` fire only for an ABSENT
-        // key — so without this fill the empty/zero value reaches
-        // `init_logging` (`frps/src/main.rs`) and the server goes **silent while
-        // its listener still binds**. Measured on the pre-fix binary, own free
-        // port, flags-only lane, stdout/stderr counted separately before any
-        // signal: `--log-level ""` → 0 B stdout / 0 B stderr (tracing-core maps
-        // `LevelFilter::from_str("")` to `ERROR` — `metadata.rs:798` — and every
-        // startup record is `INFO`), `--log-file ""` → 0 B / 0 B **and** a
-        // `frps.log.<date>` file created in the CWD instead. Go v0.71.0 with the
-        // same flags logs its startup lines on stdout (measured: 282 B / 3
-        // `INFO` lines, 0 B stderr, listener up).
+        // Why it is needed: the *config file's* explicit empty/zero values need
+        // Go's `util.EmptyOr` fill. The serde defaults on `LogConfig` fire only
+        // for an ABSENT key, and the resolvers in `frp-core/src/logging.rs`
+        // filter only the **CLI** arm — so without this fill an explicit
+        // `level = ""` would reach `init_logging` (`frps/src/main.rs`)
+        // unresolved and the server would go **silent while its listener still
+        // binds** (tracing-core maps `LevelFilter::from_str("")` to `ERROR` —
+        // `metadata.rs:798` — and every startup record is `INFO`). This call is
+        // Go's `LogConfig.Complete()` fill (`pkg/config/v1/common.go:119-123`):
+        // `level = ""` → `info`, `to = ""` → `console`, `max_days = 0` → `3`.
+        // Measured on a config `bindPort = 17532`, `[auth] token =
+        // "rev427token"`, `[log] level = ""` run as `frps -c frps.toml` from the
+        // config's own directory: both binaries then log at `info` — frp-rs 11
+        // `INFO` records, Go **3** `[I]` records (271 B raw stdout / 238 B
+        // ANSI-stripped, 0 B stderr). That Go total is invocation-dependent: its
+        // first record echoes the `-c` path, so a longer path adds its extra
+        // length (an absolute `/tmp/…/frps.toml` measured 295 B raw / 262 B
+        // stripped). The fill is reached on the Go side through
+        // `pkg/config/load.go:318-321`, since `-c` bypasses its pflag struct.
+        //
+        // The CLI arm no longer arrives here as a zero either:
+        // `override_server_config` skips an empty `--log-level`/`--log-file` and
+        // a zero `--log-max-days`, so this call can no longer rewrite a file's
+        // explicit `warn` from a flag's zero value — on the implicit
+        // `./frps.toml` lane `--log-level ""` now keeps the file's level
+        // (measured: 0 B stdout / 0 `INFO` records).
         //
         // The Go call sits after `Auth.Complete()`, which can fail and return
         // early; frp-rs has no fallible completion before this point, so there
         // is no early-return path whose ordering this could change.
         //
         // `[log] to = ""` in a **file** was never part of this: `resolve_log_file`
-        // already mapped an empty config value to `console`, so that shape
-        // logged 1498 B / 7 records on the pre-fix binary and created no file.
+        // already mapped an empty config value to `console`, so that shape still
+        // logged its 7 startup `INFO` records and created no file (measured at
+        // this head; the lane passes no CLI flag, so the branch does not touch it).
         // The empty-config defects were `level = ""` (silent) and `max_days = 0`
         // (cleanup disabled, which the fill fixes).
         self.log.complete();
@@ -875,9 +890,9 @@ impl LogConfig {
     /// **What it is and is not.** It rewrites the *completion input*; it does
     /// not resolve CLI-vs-config precedence — `frps`/`frpc` call
     /// `logging::resolve_*` with the CLI value first, so an explicit non-empty
-    /// flag still wins and an empty `--log-file ""` (which reaches
-    /// `LogConfig::file` through `override_server_config`) is filled here
-    /// before `init_logging` sees the config.
+    /// flag still wins. An empty `--log-file ""` no longer reaches this field
+    /// through `override_server_config` (that overlay skips the zero value), so
+    /// the config file's `file` stands and this fill has nothing to rewrite.
     pub fn complete(&mut self) {
         if self.file.is_empty() {
             self.file = default_log_file();

@@ -1026,7 +1026,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   * `tlsOnly = true` → ignored; `tls_only` stays `false`.
   * `tlsCaFile = "/cc-ca.crt"` → ignored; `tls_ca_file` stays `""` and `tls_only` stays `false`, so
     it does not even trigger the `tls_ca_file`-implies-`tls_only` fill at
-    `frp-core/src/config/server.rs:524-525`.
+    `frp-core/src/config/server.rs:539-540`.
   * all four together in strict mode → `unknown field "tlsCaFile" in config file <path>`,
     `unknown field "tlsCertFile" …`, `unknown field "tlsKeyFile" …`, and
     `unknown field "tlsOnly" in config file <path> — did you mean 'tls_only'?`; the snake_case
@@ -1054,7 +1054,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
     `unknown field "tlsCertFile" in config file <path>`.
   * `tlsKeyFile = "/cc.key"` → same shape, `unknown field "tlsKeyFile" …`.
   * `tlsCaFile = "/cc-ca.crt"` → non-strict ignored, `tls_ca_file` stays `""` and `tls_only` stays
-    `false` (it never reaches the fill at `frp-core/src/config/server.rs:524-525`); strict
+    `false` (it never reaches the fill at `frp-core/src/config/server.rs:539-540`); strict
     `unknown field "tlsCaFile" …`.
   * controls: `tlsServerName` and `tls_trusted_ca_file` load in both modes.
 
@@ -1148,7 +1148,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   spellings (`certFile` → `tls_cert_file`, …); every other key keeps its name, so `cert_file` becomes
   `web_server.cert_file`, which is not a field — dropped in non-strict mode, an unknown-field error in
   strict mode. Three things make that a defect rather than a quirk: (1)
-  `frp-core/src/config/server.rs:926-938` declares the nested section with `cert_file` / `key_file` /
+  `frp-core/src/config/server.rs:968` declares the nested section with `cert_file` / `key_file` /
   `trusted_ca_file` / `server_name` as the **canonical serde names** and the camelCase spellings only as
   `alias`es, so the spelling that fails is frp-rs's own and the one that works is Go's; (2) the same
   struct's doc says the section is "Merged with the flat `tls_cert_file`/`tls_key_file` fields — the
@@ -2495,7 +2495,6 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   * `scripts/compat-test.sh` was **not** run: the diff is config-load only (no protocol, transport,
     encryption or proxy path), so it cannot reach the wire.
 
-
 - [x] **Legacy INI still diverges from Go in three measured ways (value inference, `[range:...]`
   list and role handling).** Discovered while closing `:1193`; all three are pre-existing (identical
   at `97fdd38` and at the current head) and none of them is caused by the strict-mode array walk.
@@ -2663,7 +2662,6 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     **not** run: the diff is config-load only (no protocol, transport, encryption or proxy path) and the
     script generates no `.ini` config at all, so it cannot reach the wire.
 
-
 - [x] **A legacy section with an invalid `role` is accepted as a proxy where Go exits 1.** Found
   while closing `:1359` (R1), measured on Go v0.71.0 and frp-rs head. Go dispatches a legacy section
   on `role` after expanding a `[range:...]` template and errors on anything but `server`/`visitor`
@@ -2692,7 +2690,6 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `Config file /tmp/lip/f5/role_bad.ini is valid` + `Proxies: 3` (98 B). The refusal itself is still
   unimplemented — the legacy collector cannot fail as it stands (`normalize_client_config` returns
   `()`), which is why the item closes by documentation. Ledger effect: **closes 1 item**.
-
 
 - [x] **`frpc` panics on SIGTERM when more than one visitor shares a `bind_port` (pre-existing;
   now reachable from a `[range:...]` template).** Found by R1 while reviewing `:1359`, reproduced
@@ -2748,7 +2745,6 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   branch is the only path that polls further; and every `JoinSet` drain uses
   `join_next`/`try_join_next`, which remove the completed task from the set, so no task is polled
   twice. Details and per-site reasons: the PR body.
-
 
 - [x] **`frpc reload` / `frpc status` silently ignore a config that fails to load, and talk to
   `127.0.0.1:7400` instead.** `resolve_admin_connection` (`frpc/src/main.rs:29`) loads the
@@ -3815,7 +3811,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     overrides are not order-sensitive — each either feeds no completion or cannot disagree with one:
     `auth.token`, `allow_ports`, the port numbers, `max_ports_per_client` and the dashboard TLS
     paths are read by nothing in `complete()`; `tls_only` **is** read
-    (`frp-core/src/config/server.rs:483`, `if !self.tls_ca_file.is_empty() && !self.tls_only`), but
+    (`frp-core/src/config/server.rs:539`, `if !self.tls_ca_file.is_empty() && !self.tls_only`), but
     the only write there sets it `true` and the CLI's `--tls-only` also sets it `true`, so no order
     can make them disagree. (The Go entry for `tls_only` is true for a different reason:
     `Transport.Complete()` does not read `TLS.Force`.) **`log.*` is different and
@@ -4043,7 +4039,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   tiny `cargo test -p frpc --no-default-features --features tiny --test cli_exit_codes` 11/0,
   `bash scripts/repo-health.sh` rc 0. `scripts/compat-test.sh` is **not relevant**: this is a
   config-completion change on the logging surface and moves no wire byte.
-- [ ] **P1 — An empty `--log-level ""` means `info` on `frps` and "the file's level" on `frpc`, so the
+- [x] **P1 — An empty `--log-level ""` means `info` on `frps` and "the file's level" on `frpc`, so the
   two binaries disagree whenever the config sets a non-default `level`.** Found while closing the
   `Log.Complete()` item above and deliberately **not** fixed there (the reviewers classified it as a
   product call, and this item is the record of it). Only `frps` overlays its CLI flags onto the loaded
@@ -4076,6 +4072,20 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `docs/config.md` `[log] level` row rewritten to one consequence-free sentence. Until then the
   divergence is stated in `docs/config.md`, in `resolve_log_level`'s doc comment
   (`frp-core/src/logging.rs`) and here.
+  **Done (2026-10-01, at `4b9c9951` on `fix/cli-flag-binding`, PR #427).** The first branch of the
+  Done-when: `FrpsArgs::override_server_config` now skips an **empty** `--log-level`/`--log-file`
+  and a **zero** `--log-max-days`, so the file's `[log]` values survive instead of being completed
+  to `info`. Measured post-fix with `[log] level = "warn"`: the implicit-config lane with
+  `--log-level ""` → **0 `INFO`** records (was 11 pre-fix), `-c` with `--log-level ""` → 0 `INFO`,
+  `--log-level info` → 11 `INFO`. That matches Go's `-c` lane, which discards the whole
+  pflag-bound struct (`/tmp/frp-go-src/cmd/frps/root.go:67-83`: `--log-level ""`/`info`/`trace`
+  all emit 0 records) and matches `frpc`. Pinned by
+  `frp-core/src/cli.rs::log_flag_zero_values_do_not_override_the_config_file` (`frp-core/src/cli.rs:4496`)
+  and `frps/tests/cli_completion.rs::cli_empty_log_level_keeps_the_config_files_level`
+  (`frps/tests/cli_completion.rs:644`). Two adjacent divergences stay open and are filed at the end
+  of this file: **R1** (`-c` plus a **non-empty** log flag is still honoured here, Go discards it)
+  and **R2** (the implicit-config lane has no Go counterpart). `--log-format` keeps its
+  write-through (**R3**).
 - [x] **Two test-harness hazards: a feature swap that breaks the dashboard lane silently, and
   `FrpsHandle::start` orphaning its child on the panic path.**
   * **(a) `cargo test -p frps` and a clippy run that compiles `frps` replace `target/debug/frps`
@@ -5122,7 +5132,8 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   missing `--vhost-http-timeout`) take the open count from 17 to **20** — 84 closed / 20 open.
 - [x] **The `3`-vs-`4` exit code is chosen by a substring match on the formatted error, so the
   *same* failure exits differently depending on a path or URL inside it.** `is_token_error`
-  (`frp-core/src/logging.rs:474`) is `msg.contains("token") || msg.contains("auth")`, and the
+  (in `frp-core/src/logging.rs` until #418 deleted it; the tombstone comment is now at
+  `frp-core/src/logging.rs:647`) is `msg.contains("token") || msg.contains("auth")`, and the
   daemons call it on `e.to_string()` of a service-construction error
   (`frpc/src/main.rs:583`, `frps/src/main.rs`'s init-error arm). The error text embeds the config
   path and any URL from the config, so an unrelated substring decides the code. Measured with the
@@ -5346,7 +5357,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `SvrTransport` builder, so both the run path and `verify` (which inherits root flags
   through `frps_build`) accept it, under both spellings — `--vhost-http-timeout` and
   `--vhost_http_timeout` — matching Go's `WordSepNormalizeFunc`
-  (`pkg/config/flags.go:26-32`, measured on Go v0.71.0: both are rc 0 on `verify`).
+  (`pkg/config/flags.go:31-36`, measured on Go v0.71.0: both are rc 0 on `verify`).
   Value: `Option<u64>` applied by `override_server_config` on the flags-only lane;
   `ServerConfig::default()` already carries Go's 60 (`frp-core/src/config/server.rs:247`),
   so an absent flag keeps 60, and with `-c` the file stays authoritative — the same rule
@@ -7072,7 +7083,6 @@ section; ledger now **24 open / 104 closed**.**
   pinned by a test in both modes, with the one-clause note in `docs/config.md` either kept or
   replaced by the implemented rule.
 
-
   Done: decided that an explicitly **empty** nested value is *unset* — it falls through to the
   flat or alias spelling rather than clearing it — with the resolution order nested snake -> nested
   camel -> parent canonical -> parent alias, first **non-empty** spelling winning
@@ -7109,7 +7119,6 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** either accept a typeless legacy proxy section the way Go does (with the same `tcp`
   default, pinned in both loader modes) or state the `type` requirement in `docs/config.md` with a test
   pinning the current message and the `Proxies: 0` drop — a silent drop is not an option either way.
-
 
   Done: fixed in #418 (`9747f131`, with the regression guard `a757afc6`). Go's legacy
   `.ini` dialect treats every non-`[common]` section as a proxy and defaults a missing
@@ -7219,7 +7228,6 @@ section; ledger now **24 open / 104 closed**.**
   attribute the figure, and keep `n=16` / `path` as the durable fact.
   **Done-when:** (a)–(c) say what is actually true; (b) either adds the 7-line `Duration::ZERO` pin or drops
   the claim; (d) names the delegation bypass or pins it; (e) quotes a range or attributes the number.
-
 
   Done: fixed in #417 (`77c987da`); (a) corrected where it was written. (b) The new pin
   `read_request_head_reports_a_zero_budget_as_a_named_timeout` calls
@@ -7358,7 +7366,6 @@ section; ledger now **24 open / 104 closed**.**
   `RESULT: invariants hold`); the stat now runs first. Residual: a **cross-crate hard link** — a
   shape neither key reaches, because `seen` is per scope and the twin sits inside its own crate's
   root — is still counted in both crates; filed as a new item below.
-
 
 - [x] **A cross-crate *hard link* is still counted in both crates by `repo-health.sh`.** The
   `(st_dev, st_ino)` key added in #415 lives in each walk's own `seen` set, and the containment
@@ -7838,7 +7845,7 @@ section; ledger now **24 open / 104 closed**.**
   (`frp-core/src/config/tests.rs:7228`); disabling the guard reddens it. The v1 `[[visitors]]` /
   `[visitors.foo]` typed path is untouched.
 
-- [ ] **`--vhost-http-timeout` is modelled as `Option<u64>` where Go's is `int64`, so a negative value is refused here and accepted there.**
+- [x] **`--vhost-http-timeout` is modelled as `Option<u64>` where Go's is `int64`, so a negative value is refused here and accepted there.**
   Residual from the `--vhost-http-timeout` item closed in #418. Go registers the flag with
   `Int64VarP` (`pkg/config/flags.go:237`) and the config field is `int64`; frp-rs uses
   `Option<u64>`. Measured on `frps verify -c <valid>`: `--vhost-http-timeout -1` → Go rc
@@ -7854,6 +7861,20 @@ section; ledger now **24 open / 104 closed**.**
   Done-when: the flag is typed to match Go's `int64` (accepting the same argv, and refusing
   what Go refuses), or the refusal is recorded as a deliberate divergence with both
   measurements, and a test pins whichever answer is chosen.
+
+  **Done (2026-10-01, at `4b9c9951` on `fix/cli-flag-binding`, PR #427).** The first branch: the
+  flag and `ServerConfig::vhost_http_timeout` are `i64`, matching Go's `Int64VarP`
+  (`/tmp/frp-go-src/pkg/config/flags.go:237`) and Go's `int64` field; the internal
+  `clamp_vhost_timeout` keeps its `u64` return and its `<= 0` floor, so `--vhost-http-timeout -1`
+  is accepted and ignored like Go while `--vhost-http-timeout 9999999999999999999` is refused like
+  Go. Pinned end to end by
+  `frps/tests/cli_exit_codes.rs::verify_accepts_vhost_http_timeout_both_spellings_and_prints_go_line`
+  (`frps/tests/cli_exit_codes.rs:2289`). The refusal **text** for an out-of-range value is still
+  Rust's rather than Go's `strconv.ParseInt` wording plus the `Usage:` block (**R4** at the end of
+  this file).
+  Ledger after this batch: **29 open / 163 closed** (base `f503b4e7`: 25 open / 161 closed; the
+  batch closes the two log-flag/`--vhost-http-timeout` items and files six residues R1–R6 at the end
+  of this file).
 
 - [x] **An `.ini` section named exactly a reserved settings root cannot be a legacy proxy, so the proxy is lost in lenient mode and refused in strict mode where Go registers one.**
   Measured at base971 and at the #418 fixed head by that PR's round-3 adversarial review.
@@ -8477,3 +8498,44 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** the merged keys are told apart from the file's own top-level keys (so a key that
   only exists because of `[common]` is accepted) without weakening the top-level check, or the
   divergence is recorded as deliberate in `docs/config.md` with this measurement, pinned.
+- [ ] **R1 — With `-c`, a *non-empty* log flag is still honoured on `frps` where Go discards the whole pflag-bound struct.**
+  Residual from the empty-`--log-level` item closed in #427. `frps/src/main.rs:989-991` gates only
+  `override_server_config` on `cli_overrides_enabled()`; `frps/src/main.rs:994` then calls
+  `init_logging(&cli, Some(&cfg))` with the **raw** CLI values, so `frps -c frps.toml --log-level info`
+  emits 11 `INFO` records where Go's `-c` lane emits 0 (`/tmp/frp-go-src/cmd/frps/root.go:67-83`),
+  contradicting the contract stated at `frp-core/src/cli.rs:3724-3731`. Same for `--log-file`,
+  `--log-max-days` and `--log-format`. Verified pre-existing (`git show 3f66d823:frps/src/main.rs`
+  is identical in this respect).
+  **Done-when:** `init_logging` is gated on `cli_overrides_enabled()` too, or the divergence is
+  recorded where `-c`'s override contract is documented and pinned by a test.
+- [ ] **R2 — The implicit-config lane (`frps --log-level ""` with an in-tree `frps.toml`) has no Go counterpart.**
+  Post-#427 it keeps the file's `warn` (0 `INFO`); Go without `-c` never reads a file and emits 1
+  `INFO` (`frps uses command line arguments for config`, 186 B). The lane is an frp-rs extension
+  (`FrpsArgs::config_path`, `frp-core/src/cli.rs:3718-3722`).
+  **Done-when:** recorded as an extension where the implicit-config behaviour is documented, or made
+  argv-identical to Go's flags-only lane.
+- [ ] **R3 — `--log-format ""` still writes through, unlike the other three log flags.**
+  `--log-format` is frp-rs-only (no Go answer, no `LogConfig::complete` slot), so there is nothing to
+  align it with; it is kept intentional and pinned as such by #427.
+  **Done-when:** documented at the flag (done: `docs/config.md` `[log] format` row states the
+  exception) or made "not supplied" like the other three.
+- [ ] **R4 — The out-of-range `--vhost-http-timeout` refusal text is Rust's, not Go's `strconv.ParseInt` wording.**
+  Residual from the `int64` item closed in #427: `--vhost-http-timeout 9999999999999999999` is rc 1 on
+  both, but frp-rs prints 84 B ``Error: couldn't parse `9999999999999999999`: number too large to fit
+  in target type`` where Go prints 2214 B (its `strconv.ParseInt` message plus the `Usage:` block).
+  The new rows pin rc and empty stdout only.
+  **Done-when:** the text is matched, or which parts of the diagnostic are contractual is recorded.
+- [ ] **R5 — `-l` is not a shorthand on `frps`, so its refusal wording differs from pflag's.**
+  `frp-core/src/cli.rs:1148` `VALUE_TAKING_SHORTS_FRPS_ROOT: [char; 3] = ['c', 'p', 't']`, so
+  `frps -c cfg -l ""` → rc 1 ``Error: `-l` is not expected in this context`` against Go's rc 1
+  `unknown shorthand flag: 'l' in -l`. rc parity; wording differs; untested.
+  **Done-when:** pflag's wording is matched or rc-only parity is pinned.
+- [ ] **R6 — Two bounds on the "accept-and-ignore matches Go" claim for `--vhost-http-timeout`.**
+  (a) `frps --config-dir …` with an empty `--log-level` resolves to `info` (not `debug`, which only
+  the opt-in `debug-logs` feature reaches — `frp-core/src/logging.rs:101-112`) because the config-dir
+  lane calls `init_logging(&cli, None)` (`frps/src/main.rs:470`), i.e. it never reads the loaded
+  config's `[log]`; (b) the 24 h cap is frp-rs-only — `VHOST_TIMEOUT_CAP_SECS`
+  (`frp-server/src/vhost.rs:654`, applied by `clamp_vhost_timeout` at `:710`) has no Go counterpart,
+  so "accept-and-ignore matches Go" is bounded to values `<= 0` or below the cap.
+  **Done-when:** the `--config-dir` lane resolves from the loaded config, or both bounds are recorded
+  at the flags with their measurements.

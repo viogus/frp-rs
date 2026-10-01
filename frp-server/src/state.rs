@@ -1400,7 +1400,7 @@ pub struct AppState {
     /// round-robin. Members register through `register_member`; accepted
     /// CONNECTs pick a member via `choose_endpoint` at dispatch time.
     pub(crate) tcpmux_group_ctl: TcpMuxGroupController,
-    pub vhost_http_timeout: u64,
+    pub vhost_http_timeout: i64,
     pub user_conn_timeout: u64,
     pub tcp_mux_passthrough: bool,
     /// Custom 404 page body (HTML) from WebServerConfig.
@@ -1553,7 +1553,7 @@ impl AppState {
         tls_only: bool,
         oidc_verifier: Option<Arc<OidcVerifier>>,
         sudp_port: u16,
-        vhost_http_timeout: u64,
+        vhost_http_timeout: i64,
         user_conn_timeout: u64,
         tcp_mux_passthrough: bool,
         custom_404_page: String,

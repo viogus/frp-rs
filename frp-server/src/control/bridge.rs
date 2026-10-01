@@ -3101,7 +3101,7 @@ async fn run_sudp_message_bridge(
 /// 60 }`), so an unset value is 60s, never "no deadline" — and positive
 /// values cap at 24h (Rust-only hardening against hostile huge configs; Go
 /// has no cap).
-fn http_leg_head_deadline(vhost_http_timeout_secs: u64) -> u64 {
+fn http_leg_head_deadline(vhost_http_timeout_secs: i64) -> u64 {
     crate::vhost::clamp_vhost_timeout(vhost_http_timeout_secs)
 }
 
@@ -5097,16 +5097,21 @@ mod tests {
         assert_eq!(http_leg_head_deadline(59), 59);
         assert_eq!(http_leg_head_deadline(60), 60);
         assert_eq!(http_leg_head_deadline(61), 61);
-        let cap = 24 * 60 * 60;
-        assert_eq!(http_leg_head_deadline(cap), cap);
+        let cap: i64 = 24 * 60 * 60;
+        assert_eq!(http_leg_head_deadline(cap), cap as u64);
         assert_eq!(
             http_leg_head_deadline(cap + 1),
-            cap,
+            cap as u64,
             "positive values cap at 24h"
         );
         assert_eq!(
-            http_leg_head_deadline(u64::MAX),
-            cap,
+            http_leg_head_deadline(-1),
+            60,
+            "a negative signed config value floors like Go"
+        );
+        assert_eq!(
+            http_leg_head_deadline(i64::MAX),
+            cap as u64,
             "hostile huge config must not overflow Instant arithmetic"
         );
     }
