@@ -369,7 +369,7 @@ enforce_shape() {
 # name, deleting a marker or reassigning `self` all red instead of silently
 # shrinking the guarded set.
 SCEN2_REGION_SHA='672f7e60063731363e7b1583a7f415cee46b5c2fc2710f82792df75f9cb18886'
-SCEN10_REGION_SHA='dc301853db44ecc30795f5b9544293cfc7ce7ce15ad48d217228919a95b051f4'
+SCEN10_REGION_SHA='f350105c4956647e62b7cd643bdb05da409abf28d031d4b7d74f563f0cab7658'
 SCEN12_REGION_SHA='6742cb4ea68f2ecb9baa13910fd0ba250507e44368935085711b4cd68d8fa159'
 SCEN13_REGION_SHA='071ade36c23aa45df0908f633a3e2f9686574fd672c9d83796526bdf0db24a67'
 PINNED_REGIONS='scenario-2 scenario-10 scenario-12 scenario-13'
