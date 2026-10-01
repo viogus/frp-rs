@@ -524,10 +524,10 @@ fn cli_empty_log_file_keeps_logging_on_stdout() {
 // Byte totals are the one machine-dependent column, and nothing asserts them:
 // the timestamp is fixed-width but the pid and port digits are not, so the same
 // shape drifts by a few bytes run to run (the header above records `1482 B /
-// 915 B` becoming `1480 / 913` at a four-digit pid, and a four-digit port is
-// worth ~2 B on its own). Read them as "≈", the way `docs/config.md` does; every
-// assertion below is on record composition instead — `WARN` present, marker and
-// ` INFO` absent, stderr empty.
+// 915 B` becoming `1480 / 913` at a four-digit pid — worth ~2 B here — while one
+// port digit is 8 B in this startup block and 11 B over the full run). Read them
+// as "≈", the way `docs/config.md` does; every assertion below is on record
+// composition instead — `WARN` present, marker and ` INFO` absent, stderr empty.
 //
 // | arm | stdout | records |
 // |---|---|---|

@@ -5586,14 +5586,18 @@ mod tests {
 
         // A negative `--log-max-days` is explicit on Go too
         // (`util.EmptyOr(-1, 3)` is `-1`) and must pass through: only the zero
-        // value is filtered. The `=` spelling below is a property of **this
-        // helper**, not of the binaries: `parse_frps` calls `run_inner`
-        // directly, so bpaf sees the tokens raw and refuses the space form —
-        // measured, "`--log-max-days` requires an argument DAYS, got a flag -1,
-        // try `--log-max-days=-1` to use it as an argument". The binaries accept
-        // both spellings, because `prepared_cli_argv` runs
+        // value is filtered. The `=` spelling below is a property of the
+        // raw-argv helpers (`parse_frps`, `parse_frps_run` and the other
+        // test-local `run_inner` call sites), not of the binaries: they hand
+        // tokens straight to `run_inner`, so bpaf sees them raw and refuses the
+        // space form — measured, "`--log-max-days` requires an argument DAYS,
+        // got a flag -1, try `--log-max-days=-1` to use it as an argument". The
+        // binaries accept both spellings, because `prepared_cli_argv` runs
         // `attach_flag_shaped_values`, which hands a `-`-shaped next token to
-        // any value-taking long flag before bpaf sees it. Measured on the built
+        // any listed value-taking long flag before bpaf sees it
+        // (`VALUE_TAKING_LONG_FLAGS`; see `claims_the_next_token`). No real entry
+        // point reaches the raw path: the two production paths pass
+        // `prepared_cli_argv` output into `run_cli`. Measured on the built
         // binary: `frps --log-max-days -1` and `frps --log-max-days=-1` both
         // start the listener and both leave a five-day-old rotation file alive
         // (`-1` disables cleanup), and `frps --log-max-days -x` fails with
