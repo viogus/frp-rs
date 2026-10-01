@@ -148,33 +148,64 @@ const SERVER_KEY: &str = "tls_enable has no effect on the server";
 ///
 /// Measured (not derived) from this harness — not from a short-lived probe: the
 /// debug binary started with each test's own config, its stdout read to the
-/// point [`Spawned::run`] freezes it, and the `tracing` records listed. On `-c`
-/// the **seven** records are `frps (Rust) v0.71.0 starting...`, `no existing
-/// store file, starting fresh`, `frps starting on …`, `No TLS cert files
-/// configured — auto-generating …`, `SIGUSR1 reload ready`, `TLS enabled with
-/// auto-generated …`, and `frps listener started on …`; a shape that warns adds
-/// its warning as an eighth, first on this path (the loader runs before
-/// `init_logging`). The `--config-dir` boot emits the same seven — its
-/// `starting 1 services from config directory` line replaces nothing and its
-/// warning lands **second**, after the directory line — so a `--config-dir` row
-/// with a warning also totals 8.
+/// point [`Spawned::run`] freezes it, and the `tracing` records listed. Two
+/// shapes exist in this file, and the count depends on the shape, not on the
+/// feature alone:
+///
+/// * [`BOOT_RECORDS_NO_DASHBOARD`] — the config writes no `[web_server]` section
+///   (every `frps_config_server_tls` shape). The seven records are the same with
+///   and without the `dashboard` feature, because no dashboard task is built:
+///   `frps (Rust) v0.71.0 starting...`, `no existing store file, starting
+///   fresh`, `frps starting on …`, `No TLS cert files configured —
+///   auto-generating …`, `SIGUSR1 reload ready`, `TLS enabled with
+///   auto-generated …`, `frps listener started on …` — the warning a row counts
+///   is one more (first on `-c`; on `--config-dir` second, after the `starting 1
+///   services from config directory` line that replaces nothing).
+/// * [`BOOT_RECORDS_WITH_DASHBOARD`] — the config writes `[web_server]` (every
+///   `frps_config` shape), so a dashboard build logs three more records
+///   (`Dashboard web UI starting on …`, `Dashboard: no admin auth configured
+///   …`, `Dashboard listening on …`) and the baseline is ten. Without the
+///   `dashboard` feature those three do not exist and
+///   [`BOOT_RECORDS_NO_DASHBOARD`] applies.
 ///
 /// This is a boot baseline, not an invariant of the product: a change to the
 /// startup log set moves it, and the count assertion reds with the actual total
 /// and both addends in the message. That is the point — the set was previously
 /// uncounted, so an emit-site mutant that appended a **second well-formed
 /// `warn!`** left the whole lane green.
-const BOOT_RECORDS_DASH_C: usize = 7;
-/// [`BOOT_RECORDS_DASH_C`] for the `--config-dir` startup path. Measured equal
-/// to `-c`, but kept named because the two boots are different code paths and
-/// only a measurement says they agree.
-const BOOT_RECORDS_CONFIG_DIR: usize = 7;
+const BOOT_RECORDS_NO_DASHBOARD: usize = 7;
+/// [`BOOT_RECORDS_NO_DASHBOARD`] for the shapes that **do** configure a
+/// dashboard, in a build that compiles one.
+#[cfg(feature = "dashboard")]
+const BOOT_RECORDS_WITH_DASHBOARD: usize = 10;
 /// The records a SIGUSR1 reload adds on the single-config `-c` path when the
 /// config is unchanged: `main.rs` logs `SIGUSR1: config reloaded: no changes
-/// detected`. (The re-emitted diagnostic a reload row counts is its own extra
-/// `want`, so it is not in here.) Measured with the same harness run: 8 records
-/// before the signal, 9 after.
+/// detected`. The re-emitted diagnostic a reload row counts is its own extra
+/// `want`, so it is not in here. Measured with the same harness run (the flat
+/// lane: its capture totals 8 before the signal and 9 after).
 const RELOAD_EXTRA_RECORDS: usize = 1;
+/// The baseline for a `-c` row whose counted warning is the **flat**
+/// `tls_enable` diagnostic. `frps_config_server_tls` shapes write no
+/// `[web_server]` section, so no dashboard task exists even when the feature is
+/// compiled in, and the seven are [`BOOT_RECORDS_NO_DASHBOARD`] unchanged; the
+/// flat warning the row counts is one more (capture total 8). Measured equal in
+/// both feature shapes. The one row that counts the **web** diagnostic while the
+/// flat one is present (a written `tls_enable` with no `web_server.tls.enable`)
+/// adds 1 itself, because for it the flat warning is a sibling, not the `want`.
+const BOOT_RECORDS_FLAT_TLS_ENABLE: usize = BOOT_RECORDS_NO_DASHBOARD;
+
+/// The `-c` boot baseline for tests whose config writes `[web_server]`: the
+/// dashboard build's larger baseline when there is one, the plain one otherwise.
+fn boot_records_with_dashboard() -> usize {
+    #[cfg(feature = "dashboard")]
+    {
+        BOOT_RECORDS_WITH_DASHBOARD
+    }
+    #[cfg(not(feature = "dashboard"))]
+    {
+        BOOT_RECORDS_NO_DASHBOARD
+    }
+}
 
 fn bin() -> String {
     std::env::var("FRPS_BIN").unwrap_or_else(|_| BIN.to_string())
@@ -708,13 +739,13 @@ fn occurrences(haystack: &str, needle: &str) -> usize {
 /// their first half (`web_server.tls.enable has no effect: …`), so an appended
 /// clause at the emit site leaves both green.
 fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
-    assert_one_warning_on_stdout_with_boot(tag, spawned, BOOT_RECORDS_DASH_C);
+    assert_one_warning_on_stdout_with_boot(tag, spawned, boot_records_with_dashboard());
 }
 
-/// [`assert_one_warning_on_stdout`] for the `--config-dir` startup path, whose
-/// boot emits one record more than `-c` (see [`BOOT_RECORDS_CONFIG_DIR`]).
+/// [`assert_one_warning_on_stdout`] for the `--config-dir` startup path. Same
+/// baseline as `-c` (see [`BOOT_RECORDS_NO_DASHBOARD`]).
 fn assert_one_warning_on_stdout_from_config_dir(tag: &str, spawned: &Spawned) {
-    assert_one_warning_on_stdout_with_boot(tag, spawned, BOOT_RECORDS_CONFIG_DIR);
+    assert_one_warning_on_stdout_with_boot(tag, spawned, boot_records_with_dashboard());
 }
 
 fn assert_one_warning_on_stdout_with_boot(tag: &str, spawned: &Spawned, boot: usize) {
@@ -1032,7 +1063,7 @@ fn tracing_record_starts(clean: &str) -> Vec<usize> {
 /// Byte-pin every record carrying `want` **and pin the total record count**:
 /// there must be exactly `expected` records carrying `want`, the capture must
 /// hold exactly `expected + others` records in total (`others` is the caller's
-/// measured boot baseline, see [`BOOT_RECORDS_DASH_C`]), each matching record
+/// measured boot baseline, see [`BOOT_RECORDS_NO_DASHBOARD`]), each matching record
 /// must be the message with the one-line `tracing` prefix, and nothing may
 /// follow a record but a fresh record or the end of the capture.
 ///
@@ -1135,13 +1166,13 @@ fn assert_web_server_tls_enable_records_are_exactly_the_message(
 
 /// [`assert_one_warning_on_stdout_for`] for the flat server `tls_enable`
 /// diagnostic: exactly one record, and its bytes are pinned to the message.
-fn assert_one_server_tls_enable_warning(tag: &str, spawned: &Spawned) {
-    assert_one_server_tls_enable_warning_with_boot(tag, spawned, BOOT_RECORDS_DASH_C);
+fn assert_one_server_tls_enable_warning(tag: &str, spawned: &Spawned, boot: usize) {
+    assert_one_server_tls_enable_warning_with_boot(tag, spawned, boot);
 }
 
 /// [`assert_one_server_tls_enable_warning`] for the `--config-dir` startup path.
 fn assert_one_server_tls_enable_warning_from_config_dir(tag: &str, spawned: &Spawned) {
-    assert_one_server_tls_enable_warning_with_boot(tag, spawned, BOOT_RECORDS_CONFIG_DIR);
+    assert_one_server_tls_enable_warning_with_boot(tag, spawned, BOOT_RECORDS_NO_DASHBOARD);
 }
 
 fn assert_one_server_tls_enable_warning_with_boot(tag: &str, spawned: &Spawned, boot: usize) {
@@ -1153,14 +1184,9 @@ fn assert_one_server_tls_enable_warning_with_boot(tag: &str, spawned: &Spawned, 
 /// the silence is a decision and not a failed run. The byte-pin runs with
 /// `expected = 0` so the silence is stated in the same terms as the presence
 /// rows: no variant of this build's message, anywhere in the capture.
-fn assert_no_warning(tag: &str, spawned: &Spawned) {
+fn assert_no_warning(tag: &str, spawned: &Spawned, boot: usize) {
     assert_no_warning_for(tag, spawned, KEY);
-    assert_web_server_tls_enable_records_are_exactly_the_message(
-        tag,
-        &spawned.stdout(),
-        0,
-        BOOT_RECORDS_DASH_C,
-    );
+    assert_web_server_tls_enable_records_are_exactly_the_message(tag, &spawned.stdout(), 0, boot);
 }
 
 /// [`assert_no_warning`] for an arbitrary key.
@@ -1649,7 +1675,7 @@ fn a_sigusr1_reload_delivers_the_warning_again() {
         "frps reload (startup)",
         &spawned.stdout(),
         1,
-        BOOT_RECORDS_DASH_C,
+        boot_records_with_dashboard(),
     );
 
     assert!(
@@ -1668,7 +1694,7 @@ fn a_sigusr1_reload_delivers_the_warning_again() {
         "frps reload (startup + reload)",
         &out,
         2,
-        BOOT_RECORDS_DASH_C + RELOAD_EXTRA_RECORDS,
+        boot_records_with_dashboard() + RELOAD_EXTRA_RECORDS,
     );
     assert_clause_matches_this_build("frps reload", &spawned);
 }
@@ -1681,7 +1707,10 @@ fn no_warning_for_a_config_without_the_key() {
     let cfg = frps_config(free_port(), free_port(), Section::None);
     let path = dir.write("frps.toml", &cfg);
     let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
-    assert_no_warning("frps -c (no key)", &spawned);
+    // No `[web_server]` section, so no dashboard task and the plain baseline.
+    // The config writes `[web_server]`, so a dashboard build logs its three
+    // records; the plain shape has no warning at all.
+    assert_no_warning("frps -c (no key)", &spawned, boot_records_with_dashboard());
 }
 
 /// The mixed-sections shape **does** warn: `[webServer]` and `[web_server]` are
@@ -1727,21 +1756,30 @@ fn server_tls_enable_warning_reaches_a_dash_c_user() {
     let cfg = frps_config_server_tls(port, ServerTls::WrittenTrue);
     let path = dir.write("frps.toml", &cfg);
     let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
-    assert_one_server_tls_enable_warning("frps -c (tls_enable = true)", &spawned);
+    assert_one_server_tls_enable_warning(
+        "frps -c (tls_enable = true)",
+        &spawned,
+        BOOT_RECORDS_FLAT_TLS_ENABLE,
+    );
     assert_eq!(
         occurrences(&spawned.stdout(), KEY),
         0,
         "the dashboard key was not written, so its diagnostic must not fire\n--- stdout ---\n{}",
         spawned.stdout()
     );
-    // The seven others here are the six `-c` boot records plus the flat
-    // `tls_enable` warning this shape does emit: the web diagnostic is absent,
-    // but the capture is not otherwise quiet, so the total is still 8.
+    // The others here are the boot records this shape emits **plus** the flat
+    // `tls_enable` warning it does emit: the web diagnostic is absent, but the
+    // capture is not otherwise quiet.
+    // This row's config writes no `[web_server]` section, but it does write
+    // the flat `tls_enable`, so the capture is the plain boot plus that
+    // warning — which is what [`BOOT_RECORDS_FLAT_TLS_ENABLE`] does **not**
+    // include (it is the baseline *beside* the flat warning, used by the rows
+    // that count it).
     assert_web_server_tls_enable_records_are_exactly_the_message(
         "frps -c (dashboard key not written)",
         &spawned.stdout(),
         0,
-        BOOT_RECORDS_DASH_C + 1,
+        BOOT_RECORDS_FLAT_TLS_ENABLE + 1,
     );
 }
 
@@ -1763,7 +1801,11 @@ fn server_tls_enable_warning_reaches_a_config_dir_user_with_the_common_spelling(
     let cfg = frps_config_server_tls(free_port(), ServerTls::CommonWritten);
     let path = dir.write("frps.toml", &cfg);
     let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
-    assert_one_server_tls_enable_warning("frps -c ([common] tls_enable)", &spawned);
+    assert_one_server_tls_enable_warning(
+        "frps -c ([common] tls_enable)",
+        &spawned,
+        BOOT_RECORDS_FLAT_TLS_ENABLE,
+    );
 }
 
 /// `tls_enable = false` is just as inert as `true`, and just as likely to be
@@ -1774,7 +1816,11 @@ fn server_tls_enable_warning_reaches_a_dash_c_user_for_a_written_false() {
     let cfg = frps_config_server_tls(free_port(), ServerTls::WrittenFalse);
     let path = dir.write("frps.toml", &cfg);
     let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
-    assert_one_server_tls_enable_warning("frps -c (tls_enable = false)", &spawned);
+    assert_one_server_tls_enable_warning(
+        "frps -c (tls_enable = false)",
+        &spawned,
+        BOOT_RECORDS_FLAT_TLS_ENABLE,
+    );
 }
 
 /// Negative control: `[transport.tls] force = true` **synthesizes**
@@ -1797,7 +1843,7 @@ fn no_server_tls_enable_warning_when_it_was_synthesized_from_transport_tls() {
         "frps -c (synthesized tls_enable)",
         &spawned.stdout(),
         0,
-        BOOT_RECORDS_DASH_C,
+        BOOT_RECORDS_NO_DASHBOARD,
     );
 }
 
@@ -1820,7 +1866,7 @@ fn a_sigusr1_reload_delivers_the_server_tls_enable_warning_again() {
         "startup (tls_enable = true)",
         &spawned.stdout(),
         1,
-        BOOT_RECORDS_DASH_C,
+        BOOT_RECORDS_NO_DASHBOARD,
     );
 
     assert!(
@@ -1838,7 +1884,7 @@ fn a_sigusr1_reload_delivers_the_server_tls_enable_warning_again() {
         "startup + SIGUSR1 reload (tls_enable = true)",
         &out,
         2,
-        BOOT_RECORDS_DASH_C + RELOAD_EXTRA_RECORDS,
+        BOOT_RECORDS_FLAT_TLS_ENABLE + RELOAD_EXTRA_RECORDS,
     );
     assert_eq!(occurrences(&spawned.stderr(), SERVER_KEY), 0);
 }
