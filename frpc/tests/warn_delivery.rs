@@ -80,6 +80,13 @@
 //! today: it runs only after `wait_for_exit` has reaped the child, so both pipes
 //! are at EOF and the joins return promptly — a fixture that spawned a
 //! pipe-inheriting process outliving the child would be the first to need one.
+//! [`drain`] stops on any read error, not only on EOF (`Ok(0) | Err(_) => break`
+//! in `frpc/tests/warn_delivery.rs`), so a pipe that fails for another reason
+//! truncates the capture rather than hanging it. That is fail-safe on the rows
+//! whose assertion demands a count — a truncated capture drops below the expected
+//! `1` and reds — but on the rows that assert silence it could hide a warning
+//! emitted before the error. That direction is carried, not fixed: it is LOW-4
+//! from the #441 review and is invisible to any count-based oracle.
 //! Counts are read **before** any signal.
 //!
 //! Gated on `full` for the same reason as `admin_cli.rs`: the `frpc` bin carries
