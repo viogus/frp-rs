@@ -9288,8 +9288,8 @@ section; ledger now **24 open / 104 closed**.**
   (`:16`, `:17`, `:21` for the snake forms, `:100`, `:101`, `:105` for the `kcpBindPort`/`quicBindPort`/`websocketPort`
   aliases) while the three `ServerConfig` fields are `#[cfg(feature = "…")]`-gated (`frp-core/src/config/server.rs:23-25`,
   `:26-28`, `:39-41`, mirrored at `:201`/`:203`/`:226`/`:228`/`:344`/`:346`/`:351`), so serde drops the key during
-  `from_value` and frp-server's only readers — the `> 0` gates at `frp-server/src/service.rs:771`, `:1275`, `:1290` and
-  `frp-server/src/service/listeners.rs:19-20` — never see it. Measured at base `f881d15e` on
+  `from_value` and frp-server's only readers — the three `> 0` gates at `frp-server/src/service.rs:771`, `:1275` and
+  `frp-server/src/service/listeners.rs:19` — never see it. Measured at base `f881d15e` on
   `cargo build -p frps --no-default-features --features micro` (binary `target/debug/frps-micro`, 31 724 264 bytes):
   a config carrying `websocketPort = 7500` gave `frps: the configuration file … syntax is ok` rc 0 from **both**
   `verify -c` and `verify --strict-config -c`, while the control `zzzPort = 7500` was still refused with
@@ -9305,7 +9305,7 @@ section; ledger now **24 open / 104 closed**.**
   non-zero ungated port, naming both spellings and the remedy (`<key> = 0`, the documented "disabled" value, or
   rebuild with the feature). `= 0` and absent stay silent in TOML/JSON/YAML because every build shape honours the integer `0`; the legacy-`.ini` spellings `"0"` / `+0` / `00` are **not** silent — the INI reader leaves them as strings that `ini_lenient` parses to `0` later, and the detector's value gate cannot see that (`TODO.md:9197`). Rejection was
   rejected: `docs/deployment.md:779-782` names refusal the "false 400" direction this accepted-key class deliberately
-  avoids, and `strict_config` defaults to true (`frp-core/src/cli.rs:549`) while the repo's own documented
+  avoids, and `strict_config` defaults to true (`frp-core/src/cli.rs:139`) while the repo's own documented
   `frps.toml:21-23` writes non-zero `kcp_bind_port`/`quic_bind_port`, so rejecting would make `frps -c frps.toml`
   refuse to start in every micro/tiny build and break the `known_server_keys()` invariant at
   `frp-core/src/config/strict.rs:123-127`. `frps verify` stays silent, exactly like the `tls_enable` diagnostic — a residue the reviewers filed as `TODO.md:9214`.
@@ -9344,9 +9344,9 @@ section; ledger now **24 open / 104 closed**.**
   `tiny`/`micro`. The same frp-core-vs-frp-server split is already recorded here:
   `frp-core/src/config/restart_only.rs:28-30` names `cargo test -p frp-server --no-default-features --all-targets`
   as a lane where `frp-core/kcp` is on while `frp-server/kcp` is off, and `frp-core/src/config/loader.rs:435-452`
-  calls the mixed shape "a known, unshipped one". Measured there too: a micro build with
-  `--features "micro,frp-core/kcp,frp-core/quic,frp-core/websocket"` warns 3 times for the three-key config and
-  still opens no listener.
+  calls the mixed shape "a known, unshipped one". Measured there too on the three-key config: the plain `micro`
+  build warns **3** times and opens no kcp/quic/websocket listener, while the mixed build with the three
+  `frp-core` features on (`--features "micro,frp-core/kcp,frp-core/quic,frp-core/websocket"`) warns **0** and opens none either.
   **Done-when:** a load that names `web_server.port` (or the Go spelling `webServer.port`) in a build without
   `frp-server/dashboard`, or `ssh_tunnel_gateway.bind_port` in a build without `frp-server/ssh`, is warned about
   once per load, or the two `docs/config.md` rows record the reader-feature gap — either way pinned by a test in
