@@ -9718,6 +9718,22 @@ Global Flags:
         FRPC_STOP_DOC,
     ];
 
+    /// `SURFACES` and `SURFACE_DOCUMENTS` are index-aligned, and both pairing
+    /// loops use `.zip(...)`, which **truncates to the shorter list**. A sixteenth
+    /// surface added to one table and not the other would therefore leave the new
+    /// document entirely unpinned — and, in the reverse direction, a pin added
+    /// without its surface row would never be rendered or checked. The length
+    /// equality is asserted before both zips so the truncation cannot happen
+    /// silently.
+    fn assert_surface_tables_are_aligned() {
+        assert_eq!(
+            SURFACES.len(),
+            SURFACE_DOCUMENTS.len(),
+            "SURFACES and SURFACE_DOCUMENTS must be the same length; the `zip` in both \
+             pairing loops truncates to the shorter list, leaving the extra surface unpinned"
+        );
+    }
+
     /// The whole-text pin for all 15 surfaces: the rendered document must equal
     /// the recorded stdout byte for byte. `SURFACE_DOCUMENTS` is generated
     /// mechanically from the built binaries (`frps --help`, `frpc tcp --help`,
@@ -9727,6 +9743,7 @@ Global Flags:
     /// alongside it as the cheap first check that reports the sizes.
     #[test]
     fn every_surface_matches_its_whole_text_pin() {
+        assert_surface_tables_are_aligned();
         let mut mismatched: Vec<String> = Vec::new();
         for ((label, root, command, _, _), full) in SURFACES.into_iter().zip(SURFACE_DOCUMENTS) {
             let expected = feature_adjusted_pin(root, full);
@@ -9808,22 +9825,70 @@ Global Flags:
     /// The long flag of one rendered pflag row, if `line` is a row at all:
     /// `--config` for both `  -c, --config string    config file` and
     /// `      --config string         config file`, `None` for a heading, a blank
-    /// line, or a wrapped usage continuation.
+    /// line, a wrapped usage continuation, or cobra's footer.
     ///
     /// The non-panicking sibling of [`split_row`]: rows are indented two spaces
-    /// (a shorthand is printed) or six (it is not), and the grid separates the
-    /// head from the usage text with a run of spaces, so the head is everything
-    /// before the first two-space gap. The long flag is the `--…` word of that
-    /// head, compared as a whole token — which is what keeps `--config` from
-    /// matching `--config-dir`.
+    /// (a shorthand is printed) or six (it is not) and the grid separates the head
+    /// from the usage text with a run of spaces, so the head is everything before
+    /// the first two-space gap. The long flag is the `--…` word of that head,
+    /// compared as a whole token — which is what keeps `--config` from matching
+    /// `--config-dir`.
+    ///
+    /// All three shapes are required, and each is load-bearing: the indent pins
+    /// the row grid (a wrapped continuation is indented to the usage column, far
+    /// past six), the leading `-` rejects `Usage:`/`Available Commands:` rows, and
+    /// the grid gap rejects cobra's footer
+    /// `Use "frps [command] --help" for more information about a command.` — that
+    /// sentence contains `--help` and starts in column zero, so without the indent
+    /// and gap checks it reads as a `--help` row.
     fn row_long_flag(line: &str) -> Option<&str> {
         let start = line.len() - line.trim_start().len();
-        if start > 6 {
+        if start != 2 && start != 6 {
             return None;
         }
         let trimmed = line.trim_start();
-        let head = &trimmed[..trimmed.find("  ").unwrap_or(trimmed.len())];
+        if !trimmed.starts_with('-') {
+            return None;
+        }
+        let gap = trimmed.find("  ")?;
+        let head = &trimmed[..gap];
         head.split_whitespace().find(|word| word.starts_with("--"))
+    }
+
+    /// [`row_long_flag`] is the only reader of the rendered grid, so its three
+    /// shape guards are pinned directly: the 2/6 indent, the leading `-`, and the
+    /// two-space grid gap. Each assertion is a shape that a weaker reader (the
+    /// `start > 6` this replaced, or a `> 60` weakening of it) would misread.
+    #[test]
+    fn row_long_flag_requires_a_row_indent_a_leading_dash_and_a_grid_gap() {
+        assert_eq!(
+            row_long_flag("  -c, --config string    config file of frpc\n"),
+            Some("--config")
+        );
+        assert_eq!(
+            row_long_flag("      --config string         config file of frpc\n"),
+            Some("--config")
+        );
+        // Not a row: too deep (a wrapped usage continuation), too shallow (prose),
+        // no leading dash (a `Usage:`/`Available Commands:` row), no grid gap.
+        assert_eq!(
+            row_long_flag("            --config string         config file\n"),
+            None,
+            "a 12-space indent is a wrapped continuation, not a row"
+        );
+        assert_eq!(row_long_flag("--config string    config file\n"), None);
+        assert_eq!(row_long_flag("  Usage:\n  frpc tcpmux [flags]\n"), None);
+        assert_eq!(row_long_flag("  -c, --config=config file\n"), None);
+        // cobra's footer, verbatim from FRPS_DOC/FRPC_DOC: it mentions `--help`
+        // but is not a row, and `strip_pinned_row(doc, "--help")` must not take it.
+        assert_eq!(
+            row_long_flag("Use \"frps [command] --help\" for more information about a command.\n"),
+            None,
+            "cobra's footer is not a flag row"
+        );
+        assert_eq!(row_long_flag("\n"), None);
+        assert_eq!(row_long_flag("Flags:\n"), None);
+        assert_eq!(row_long_flag(""), None);
     }
 
     /// A row is taken by its long-flag **token**, not by prefix, and exactly one
@@ -9840,6 +9905,31 @@ Global Flags:
         assert_eq!(
             strip_pinned_row(document, "--config-dir"),
             "      --config string         config file\n"
+        );
+    }
+
+    /// [`strip_pinned_row`] must **count**, not merely find. The two directions
+    /// fail differently, and only one of them can see the `>= 1` weakening: with
+    /// 0 matches the stronger `assert_eq!(removed, 1)` and the weaker
+    /// `assert!(removed >= 1)` both panic, so the **missing-row** pin catches only
+    /// dropping or inverting the count, while the `>= 1` weakening itself is
+    /// caught by the **duplicated-row** pin (2 matches), where it passes and
+    /// silently strips the row twice. Both directions are pinned as panics.
+    #[test]
+    #[should_panic(expected = "must carry exactly one `--config` row, found 0")]
+    fn strip_pinned_row_panics_on_a_missing_row() {
+        strip_pinned_row(
+            "      --config-dir string     config directory\n",
+            "--config",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must carry exactly one `--config` row, found 2")]
+    fn strip_pinned_row_panics_on_a_duplicated_row() {
+        strip_pinned_row(
+            "      --config string    config file\n      --config string    config file\n",
+            "--config",
         );
     }
 
@@ -9874,6 +9964,14 @@ Global Flags:
     /// shape**. The `frps` half is Go's stdout byte for byte whenever `kcp` and
     /// `quic` are both compiled in (frp-core's default), and Go's document minus
     /// exactly those two rows otherwise.
+    ///
+    /// The assertion that makes the two **oracle texts** falsifiable is the loop
+    /// below: `GO_FRPS_VERIFY` must actually carry both gated rows (or
+    /// `feature_adjusted_pin` would be stripping nothing and the feature-shape path
+    /// would be dead), and `GO_FRPC_VERIFY` must carry neither (or the frpc claim
+    /// would be an unexamined assumption rather than a fact about the data).
+    /// `feature_adjusted_pin` itself is pinned on a synthetic document by
+    /// [`feature_adjusted_pin_strips_exactly_the_rows_this_build_cannot_render`].
     #[test]
     fn verify_documents_match_the_go_oracle_after_the_feature_adjustment() {
         assert_eq!(
@@ -9882,11 +9980,27 @@ Global Flags:
             "frps verify --help must be Go's document, byte for byte, once only the rows \
              this build cannot render are removed"
         );
-        assert_eq!(
-            feature_adjusted_pin(RootCommand::Frpc, GO_FRPC_VERIFY),
-            GO_FRPC_VERIFY,
-            "frpc renders no feature-gated row, so its pin must never be adjusted"
-        );
+        for long in ["--kcp-bind-port", "--quic-bind-port"] {
+            assert!(
+                GO_FRPS_VERIFY
+                    .lines()
+                    .any(|line| row_long_flag(line) == Some(long)),
+                "frps's oracle must carry {long}, or feature_adjusted_pin strips nothing \
+                 and this test never exercises the feature-shape path"
+            );
+            assert!(
+                GO_FRPC_VERIFY
+                    .lines()
+                    .all(|line| row_long_flag(line) != Some(long)),
+                "frpc's oracle must not carry {long}: the frpc path is never adjusted"
+            );
+        }
+        // A former assertion here was `feature_adjusted_pin(Frpc, GO_FRPC_VERIFY) ==
+        // GO_FRPC_VERIFY`. It only restated the helper's first line (`if root !=
+        // RootCommand::Frps { return full.to_owned(); }`) and could not fail. The
+        // contract it was reaching for is pinned on a synthetic document, in every
+        // feature shape, by
+        // `feature_adjusted_pin_strips_exactly_the_rows_this_build_cannot_render`.
         assert_eq!(
             surface_document(RootCommand::Frpc, Some("verify")),
             GO_FRPC_VERIFY,
@@ -9894,8 +10008,47 @@ Global Flags:
         );
     }
 
+    /// `feature_adjusted_pin`'s contract, pinned on a synthetic document so the
+    /// assertion holds in every feature shape: it must drop each feature-gated row
+    /// exactly when that feature is off, must leave every unrelated row alone, and
+    /// must never touch a non-`frps` pin.
+    ///
+    /// This is what replaces the former vacuous identity. With the helper stripping
+    /// a row whose feature is *on* it fails here; in the `kcp`-less / `quic`-less
+    /// shapes (`.github/workflows/ci.yml`'s feature-split lanes) it also fails if the
+    /// helper stops stripping at all — the two mutants the identity could not see.
+    #[test]
+    fn feature_adjusted_pin_strips_exactly_the_rows_this_build_cannot_render() {
+        let synthetic = concat!(
+            "      --kcp-bind-port int          kcp bind port\n",
+            "      --quic-bind-port int         quic bind port\n",
+            "      --other string               untouched\n",
+        );
+        let adjusted = feature_adjusted_pin(RootCommand::Frps, synthetic);
+        for (enabled, long) in [
+            (cfg!(feature = "kcp"), "--kcp-bind-port"),
+            (cfg!(feature = "quic"), "--quic-bind-port"),
+        ] {
+            assert_eq!(
+                adjusted.contains(long),
+                enabled,
+                "feature_adjusted_pin must keep {long} exactly when its feature is on"
+            );
+        }
+        assert!(
+            adjusted.contains("--other"),
+            "feature_adjusted_pin must leave unrelated rows alone"
+        );
+        assert_eq!(
+            feature_adjusted_pin(RootCommand::Frpc, synthetic),
+            synthetic,
+            "frpc renders no feature-gated row, so its pin must never be adjusted"
+        );
+    }
+
     #[test]
     fn every_surface_is_pinned_by_its_byte_count() {
+        assert_surface_tables_are_aligned();
         let mut mismatched: Vec<String> = Vec::new();
         for ((label, root, command, rendered, go), full) in
             SURFACES.into_iter().zip(SURFACE_DOCUMENTS)
@@ -10248,5 +10401,173 @@ Global Flags:
             rendered, expected,
             "frpc tcp must render Go's seven shorthanded rows plus the two frp-rs-only bools"
         );
+    }
+
+    /// True when `help_flag_tables` lists `key`'s table for this surface — the
+    /// tables are identified by their first row's `long`, which is unique among
+    /// them (`config-dir`, `log-file`, `admin-addr`, `mux-port`, `allow-users`,
+    /// `--allow-unsafe`'s `allow-unsafe`, …).
+    fn surface_consults(root: RootCommand, command: Option<&str>, key: &str) -> bool {
+        help_flag_tables(root, command)
+            .into_iter()
+            .any(|table| table.first().is_some_and(|row| row.long == key))
+    }
+
+    /// Every row of every **extension** table describes a flag frp-rs implements,
+    /// so it must be rendered by at least one surface that consults that table.
+    ///
+    /// This is what makes the extension tables' data *live*: before it, a bogus
+    /// `GoFlagRow` added to `FRPC_PROXY_EXTENSION_FLAGS` (or `FRPS_EXTENSION_FLAGS`)
+    /// was consulted by no assertion at all, so every test in this module stayed
+    /// green. The Go tables are the opposite case — they carry rows for flags
+    /// frp-rs has no flag for at all, which are deliberately never rendered; those
+    /// live rows are pinned by `the_go_only_proxy_rows_are_exactly_the_recorded_set`.
+    #[test]
+    fn every_extension_table_row_is_rendered_by_a_surface_that_consults_it() {
+        let rendered: Vec<(&str, std::collections::BTreeSet<String>)> = SURFACES
+            .into_iter()
+            .map(|(label, root, command, _, _)| {
+                let longs = surface_document(root, command)
+                    .lines()
+                    .filter_map(row_long_flag)
+                    .map(|long| long.trim_start_matches("--").to_owned())
+                    .collect();
+                (label, longs)
+            })
+            .collect();
+        for table in [
+            FRPS_EXTENSION_FLAGS,
+            FRPC_ROOT_EXTENSION_FLAGS,
+            FRPC_ADMIN_EXTENSION_FLAGS,
+            FRPC_PROXY_EXTENSION_FLAGS,
+        ] {
+            let rows: Vec<&str> = table.iter().map(|row| row.long).collect();
+            let key = rows[0];
+            let labels: Vec<&str> = SURFACES
+                .into_iter()
+                .filter(|(_, root, command, _, _)| surface_consults(*root, *command, key))
+                .map(|(label, ..)| label)
+                .collect();
+            assert!(
+                !labels.is_empty(),
+                "extension table {rows:?} is consulted by no surface in SURFACES"
+            );
+            for row in table {
+                assert!(
+                    SURFACES
+                        .into_iter()
+                        .filter(|(_, root, command, _, _)| surface_consults(*root, *command, key))
+                        .any(|(label, ..)| rendered
+                            .iter()
+                            .find(|(candidate, _)| *candidate == label)
+                            .is_some_and(|(_, longs)| longs.contains(row.long))),
+                    "extension table {rows:?} carries `{}`, but none of the surfaces that \
+                     consult it ({labels:?}) renders that row: the row is unreachable data",
+                    row.long
+                );
+            }
+        }
+    }
+
+    /// The `FRPC_PROXY_GO_FLAGS` rows frp-rs's eight proxies do **not** implement:
+    /// Go v0.71.0's own proxy rows that have no frp-rs flag at all. Nothing renders
+    /// them, so no other assertion in this module is falsified by editing them —
+    /// this explicit set is the only pin on their `long`s.
+    ///
+    /// RESIDUE: their `short` and `usage` cells are hand-transcribed Go help text
+    /// that no test renders (`SURFACES` carries only Go's *byte count*, not its
+    /// text), so re-wording such a row still leaves every test green. That is the
+    /// limit of the available evidence — the Go binary is an oracle the build does
+    /// not depend on. Every *rendered* row's text, by contrast, is pinned byte for
+    /// byte by the `FRPC_*_DOC` whole-text constants.
+    const GO_ONLY_PROXY_ROWS: [&str; 16] = [
+        "allow-users",
+        "annotations",
+        "bandwidth-limit",
+        "bandwidth-limit-mode",
+        "client-id",
+        "disable-log-color",
+        "dns-server",
+        "log-file",
+        "log-level",
+        "log-max-days",
+        "metadatas",
+        "protocol",
+        "tls-enable",
+        "uc",
+        "ue",
+        "user",
+    ];
+
+    #[test]
+    fn the_go_only_proxy_rows_are_exactly_the_recorded_set() {
+        let mut rendered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (_, root, command, _, _) in SURFACES {
+            if !surface_consults(root, command, "allow-users") {
+                continue;
+            }
+            for line in surface_document(root, command).lines() {
+                if let Some(long) = row_long_flag(line) {
+                    rendered.insert(long.trim_start_matches("--").to_owned());
+                }
+            }
+        }
+        let unrendered: Vec<&str> = FRPC_PROXY_GO_FLAGS
+            .iter()
+            .map(|row| row.long)
+            .filter(|long| !rendered.contains(*long))
+            .collect();
+        assert_eq!(
+            unrendered,
+            GO_ONLY_PROXY_ROWS.to_vec(),
+            "the set of Go proxy rows frp-rs never renders changed: a row that became \
+             implemented must be dropped from `GO_ONLY_PROXY_ROWS` (and its doc pins \
+             regenerated), and a newly recorded Go row must appear in both"
+        );
+    }
+
+    /// The two `SURFACES` columns no other assertion reads: the `label` (used only
+    /// in failure messages) and the Go byte count (read only by
+    /// `every_surface_is_pinned_by_its_byte_count`'s message). Both are derived, so
+    /// they are re-derived here — a label must name its own root/command, and the
+    /// two `verify` rows' Go column must be the byte length of the Go oracle
+    /// constant that duplicates it.
+    ///
+    /// RESIDUE: the other thirteen Go byte counts were measured from the real Go
+    /// binary in one session; `go-frp` is not a build dependency, so no in-tree
+    /// artifact can re-measure them. They stay hand-transcribed documentation.
+    #[test]
+    fn surface_labels_and_the_verify_go_byte_counts_are_derived() {
+        for (label, root, command, _, go) in SURFACES {
+            let expected = match (root, command) {
+                (RootCommand::Frps, None) => "frps".to_owned(),
+                (RootCommand::Frps, Some(name)) => format!("frps {name}"),
+                (RootCommand::Frpc, None) => "frpc".to_owned(),
+                (RootCommand::Frpc, Some(name)) => format!("frpc {name}"),
+            };
+            assert_eq!(
+                label,
+                expected.as_str(),
+                "the SURFACES label must name its own surface"
+            );
+            let oracle = match (root, command) {
+                (RootCommand::Frps, Some("verify")) => Some(GO_FRPS_VERIFY),
+                (RootCommand::Frpc, Some("verify")) => Some(GO_FRPC_VERIFY),
+                _ => None,
+            };
+            if let Some(oracle) = oracle {
+                assert_eq!(
+                    go,
+                    oracle.len(),
+                    "{label}'s Go column must be the byte length of the Go oracle it duplicates"
+                );
+            }
+            assert!(go > 0, "{label} must carry a measured Go byte count");
+        }
+        let mut labels: Vec<&str> = SURFACES.into_iter().map(|(label, ..)| label).collect();
+        let count = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), count, "every SURFACES label must be unique");
     }
 }
