@@ -8477,9 +8477,12 @@ section; ledger now **24 open / 104 closed**.**
   key on the wire, not the frame's arrival. No user-visible behaviour changed — oracle and new test only, the
   re-arm semantics shipped in #437 -- so no `CHANGELOG.md` bullet. Residue stated, not hidden: the window
   `[P/2, 3P/2]` = `[1 s, 3 s]` admits ANY call-site literal in that class -- the review's measured survivors
-  1 s, 2.5 s and 2.9 s all pass -- because a tighter window is not stable against e2e tick timing; only the
-  unit test's exact-value pin (`frp-client/src/service.rs:5171-5175`) covers that class, and the two tests
-  red for different mutants. A second residue is filed as its own item below: the oracle observes only the
+  1 s, 2.5 s and 2.9 s all pass -- because a tighter window is not stable against e2e tick timing. The unit
+  test's exact-value pin (`frp-client/src/service.rs:5171-5175`) covers constant drift only: it calls
+  `next_ping_backoff` directly and cannot see the call site, so an in-band call-site literal
+  (`let delay = Duration::from_secs(1);` at `frp-client/src/service.rs:3539`) leaves it green. No test
+  covers an in-band call-site literal at all; that gap is one residue with the progression bypass, filed as
+  its own item below: the oracle observes only the
   FIRST consecutive failure, so returning the constant instead of the progression survives. Ledger after
   this close: **14 open / 190 closed** (base `18bcd1ad`: 13 open / 189 closed; this close is the -1 and the
   two items filed below are the +2).
