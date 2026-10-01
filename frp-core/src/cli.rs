@@ -5586,8 +5586,19 @@ mod tests {
 
         // A negative `--log-max-days` is explicit on Go too
         // (`util.EmptyOr(-1, 3)` is `-1`) and must pass through: only the zero
-        // value is filtered. bpaf needs the `=` spelling to read a leading `-`
-        // as the argument rather than as a flag.
+        // value is filtered. The `=` spelling below is a property of **this
+        // helper**, not of the binaries: `parse_frps` calls `run_inner`
+        // directly, so bpaf sees the tokens raw and refuses the space form —
+        // measured, "`--log-max-days` requires an argument DAYS, got a flag -1,
+        // try `--log-max-days=-1` to use it as an argument". The binaries accept
+        // both spellings, because `prepared_cli_argv` runs
+        // `attach_flag_shaped_values`, which hands a `-`-shaped next token to
+        // any value-taking long flag before bpaf sees it. Measured on the built
+        // binary: `frps --log-max-days -1` and `frps --log-max-days=-1` both
+        // start the listener and both leave a five-day-old rotation file alive
+        // (`-1` disables cleanup), and `frps --log-max-days -x` fails with
+        // "couldn't parse `-x`: invalid digit found in string" — the token did
+        // arrive as the value.
         let mut cfg = crate::config::ServerConfig::default();
         cfg.log.max_days = 5;
         let args = parse_frps(&["--log-max-days=-1"]).unwrap();

@@ -912,31 +912,34 @@ jobs:
         # The literal moved 6 → 7 when the empty-`--log-level` pin landed and
         # 7 → 9 with the two sibling zero-value pins (`--log-file ""` and
         # `--log-max-days 0`, both arbited by Go's `-c` lane — see the file's own
-        # section comments). It is the count of `#[test]`s in that one file.
+        # section comments). It is the count of `#[test]`s in that one file, and
+        # it lives in exactly one place in this step — the `expected=` line — so
+        # a new pin means editing one number, not hunting a duplicated one.
         shell: bash
         run: |
           set -eo pipefail
+          expected=9
           log=/tmp/frps-log-completion-tests.log
           cargo test -p frps --features dashboard --test log_completion --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           n=$(cargo test -p frps --features dashboard --test log_completion --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/log_completion.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 9 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "9" ] || status=1
+          grep -q "test result: ok. $expected passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "$expected" ] || status=1
           if [ "$status" != "0" ]; then
-            echo "::error::frps log-completion guard failed (status=$status, file=$n, log=$log)"
-            if [ -n "$n" ] && [ "$n" != "9" ]; then
-              if [ "$n" -lt "9" ]; then
-                echo "::error::frps/tests/log_completion.rs lists $n tests, this step expects 9 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
+            echo "::error::frps log-completion guard failed (status=$status, file=$n, expected=$expected, log=$log)"
+            if [ -n "$n" ] && [ "$n" != "$expected" ]; then
+              if [ "$n" -lt "$expected" ]; then
+                echo "::error::frps/tests/log_completion.rs lists $n tests, *fewer* than the expected $expected — tests were deleted or the file was disabled; restore them rather than lowering the \`expected=\` line of this step"
               else
-                echo "::error::frps/tests/log_completion.rs lists $n tests, this step expects 9: move the single literal in this shell step from 9 to $n"
+                echo "::error::frps/tests/log_completion.rs lists $n tests, *more* than the expected $expected — tests were added: bump the single \`expected=\` line of this step from $expected to $n"
               fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frps log-completion guard ok: $n tests listed (expected 9), 0 failed"
+          echo "frps log-completion guard ok: $n tests listed (expected $expected), 0 failed"
       - name: Run frps's `web_server.tls.enable` warning-delivery spawn tests
         # `frps/tests/warn_delivery.rs` pins what a **user** sees when a config
         # writes `[web_server.tls] enable`: the diagnostic must reach stdout on

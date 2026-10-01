@@ -35,11 +35,12 @@
 //! | 3.0 s | 624 B / 494 B stripped, 2 `WARN`, 0 `INFO` | 624 B / 494 B, 2 `WARN`, 0 `INFO` |
 //!
 //! (retry interval ≈2.1 s). No byte total is asserted, because the count depends
-//! on the window: the test waits for the record with [`Spawned::wait_for`] and
-//! then asserts *composition*. The `info` falsification control for the marker
-//! assertion measures **1066 B / 2 `INFO` + 2 `WARN`** at a 3 s window
-//! (pre-`SIGTERM`; the graceful-shutdown sequence adds three more `INFO`
-//! records), and is kept below.
+//! on the window — and even at a fixed window the pid and port digits move the
+//! total by a few bytes, so read both columns as "≈". The test waits for the
+//! record with [`Spawned::wait_for`] and then asserts *composition*. The `info`
+//! falsification control for the marker assertion measures **1066 B / 2 `INFO` +
+//! 2 `WARN`** at a 3 s window (pre-`SIGTERM`; the graceful-shutdown sequence adds
+//! three more `INFO` records), and is kept below.
 //!
 //! Gated on `full` because the `frpc` bin carries `required-features = ["full"]`,
 //! so without the gate this file would fail to compile in the no-default-features
