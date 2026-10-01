@@ -561,6 +561,33 @@ fn drop_ini_scalar_include_keys(table: &mut toml::Table) {
 //   err: invalid type [custom]`, rc 1 in both modes), while here the section is
 //   skipped by the collector and then dropped as an inert table by
 //   [`drop_legacy_ini_include_tables`] (rc 0 in both modes).
+// * **The glob is not `filepath.Match`: `?`, `[...]`, multi-`*` and `\` are
+//   silently ignored.** Go matches each directory entry against
+//   `filepath.Match(filepath.Join(absDir, filepath.Base(pattern)), absFile)`
+//   (`pkg/config/legacy/parse.go:87`, repeated at `pkg/config/load.go:513-522`),
+//   while [`glob_in_dir`] implements exactly one `*` (first-star split, then a
+//   prefix/suffix test plus a vestigial `extension()` filter). The decisive
+//   shape is a name a *single* `*` reaches and a `Match` superset does too;
+//   measured in a directory holding `z.ini` plus a same-content `sub_bad.ini`,
+//   `[common] includes = "<pat>"`, both loader modes, `./`-form and bare
+//   `-c <name>`. GO rc 1 (both files merge and the detector is refused) against
+//   HEAD rc 0 (nothing matches — the pattern needs a second `*`, a `?`, a class
+//   or an escape that `glob_in_dir` does not implement); MID `6d801655` and BASE
+//   `f679e822` are rc 0 as well, so this bound is pre-existing and not a
+//   regression of this work:
+//     `"?." + "ini"`        GO rc 1 `failed to parse proxy pz, err: invalid type [bogustype]`
+//     `"[z].ini"`           GO rc 1 (same)                — `?`/`[...]` classes
+//     `"z?.ini"`            GO rc 1 (same)                — `?` after a literal
+//     `"[!z].ini"`          GO rc 1 (same)                — negated class
+//     `"*z*.ini"`           GO rc 1 (same)                — a second `*`
+//     `"s*b*.ini"`          GO rc 1 (same)                — a second `*`
+//     `"sub\*.ini"`         GO rc 1 (same), and it matches the literal file
+//                           `sub*.ini`: `\` is Go `Match`'s escape, not a
+//                           separator, so the whole pattern still carries one `*`
+//     `"z*.ini"`, `"sub*.ini"` GO rc 1, HEAD rc 1 — the one-`*` subset agrees;
+//                           BASE rc 0, i.e. even `*` started matching only at MID.
+//   Implementing `Match` is out of scope for the legacy-`.ini` residue work; this
+//   row exists so a later fix changes measured behaviour knowingly.
 //
 // The empty-parent resolution bug measured during round 4 is fixed by
 // [`go_dir`]/[`go_base`]: the pattern's own directory is resolved (Go's
@@ -572,6 +599,18 @@ fn drop_ini_scalar_include_keys(table: &mut toml::Table) {
 // `legacy_ini_common_include_dot_spellings_both_modes`,
 // `legacy_ini_common_include_dot_spellings_bare_config_both_modes`,
 // `legacy_ini_common_include_dotdot_is_not_a_wildcard_both_modes`.
+//
+// The interior-`..` residue measured during round 5 is fixed in the same helper:
+// [`go_clean`] now folds `..` with Go's `Clean` rule, so
+// `Dir("a/../b") = "."` and the guard sees an existing directory. Pin:
+// `legacy_ini_common_include_interior_dotdot_is_cleaned_like_go`. The remaining
+// shape in this area is only a message difference (rc parity): a
+// separator-terminated pattern naming a regular file, `includes = "sub.ini/"`,
+// is GO rc 1 `getIncludeContents error: open <abs>/sub.ini: not a directory`
+// against HEAD rc 1 `include: directory of ./sub.ini not exist (included by
+// pattern sub.ini/)` — the `:410` guard collapses Go's stat-missing and
+// ReadDir-ENOTDIR failure modes into one message. `..../sub.ini` likewise prints
+// the cleaned dir where Go prints the raw pattern.
 
 /// Go's `filepath.Dir` (`internal/filepathlite/path.go`, `Dir`): scan back to
 /// the last path separator and `Clean` everything up to **and including** it; a
@@ -585,7 +624,10 @@ fn drop_ini_scalar_include_keys(table: &mut toml::Table) {
 /// separator-less pattern when `base_dir` is empty (`-c <name>`). Measured Go
 /// v0.71.0 (`Dir`): `""`→`"."`, `"."`→`"."`, `"./"`→`"."`, `"././"`→`"."`,
 /// `".."`→`"."`, `"../"`→`".."`, `"sub"`→`"."`, `"sub/"`→`"sub"`,
-/// `"*.ini"`→`"."`, `"sub/*.ini"`→`"sub"`, `"nonexistent/"`→`"nonexistent"`.
+/// `"*.ini"`→`"."`, `"sub/*.ini"`→`"sub"`, `"nonexistent/"`→`"nonexistent"`,
+/// and — the interior-`..` shapes [`go_clean`] now folds — `"a/../b"`→`"."`,
+/// `"./x/../y"`→`"."`, `"x/../sub.ini"`→`"."`,
+/// `"nonexistent/../sub.ini"`→`"."`, `"a/../../b"`→`".."`.
 fn go_dir(pattern: &str) -> std::path::PathBuf {
     let bytes = pattern.as_bytes();
     let mut i: isize = bytes.len() as isize - 1;
@@ -649,24 +691,52 @@ fn is_sep_char(c: char) -> bool {
     c.is_ascii() && is_path_separator(c as u8)
 }
 
-/// The `Clean` half of `filepath.Dir`: drop empty and `.` elements and rebuild
-/// with the host separator; a rooted path keeps one leading separator and an
-/// all-dots path becomes `"."`.
+/// Go's `filepath.Clean` in full (`internal/filepathlite/path.go`, `Clean`):
+/// drop empty and `.` elements, rebuild with the host separator, keep one
+/// leading separator for a rooted path, and **fold `..` back over the preceding
+/// element**.
 ///
-/// Unlike Go's `Clean` this does not fold `..` back over a real element
-/// (`"a/../b"` stays `"a/../b"` rather than `"b"`). The two spell the same
-/// directory, so `exists()`/`read_dir` agree; only the guard's message text can
-/// differ, and only for a pattern with an interior `..` — no cell of the pinned
-/// matrix, and Go's own message prints the raw pattern.
-fn go_clean(path: &str) -> String {
+/// The fold is load-bearing, not cosmetic. Round 5 left it out on the theory
+/// that `"a/../b"` and `"b"` "spell the same directory, so `exists()`/`read_dir`
+/// agree"; they do not, because the guard only ever sees the spelling. Go's
+/// `filepath.Abs` Cleans `Dir` (`pkg/config/legacy/parse.go:69-70`), so
+/// `Dir("a/../b") = Clean("a/../") = "."` and `os.Stat(".")` succeeds even
+/// though `a` does not exist — while the unfolded `"a/.."` is a path whose
+/// `exists()` is false, so frp-rs refused with
+/// `include: directory of ./a/.. not exist`. Measured on Go v0.71.0, the four
+/// interior-`..` spellings (`a/../b`, `./x/../y`, `x/../sub.ini`,
+/// `nonexistent/../sub.ini`) are rc 0 in all three `-c` forms and both loader
+/// modes once the fold is in place, and were rc 1 at `c5b4f9ed`. Pin:
+/// `legacy_ini_common_include_interior_dotdot_is_cleaned_like_go`.
+///
+/// Go's rule for the two `..` shapes: `..` cancels the previous element when
+/// there is one and it is not itself `..` (`"a/.."` → `"."`, `"a/../b"` →
+/// `"b"`), and otherwise survives as a literal `..` (`"../x/../"` → `".."`,
+/// `"a/../../b"` → `"../b"`, `"x/../../.."` → `"../.."`); a rooted path never
+/// yields a `..` (`"/.."` → `"/"`). Every spelling below is measured on Go
+/// v0.71.0; [`go_clean_has_go_clean_semantics`] pins them.
+pub(super) fn go_clean(path: &str) -> String {
     let sep = std::path::MAIN_SEPARATOR;
     let rooted = path.starts_with(is_sep_char);
-    let parts: Vec<&str> = path
-        .split(is_sep_char)
-        .filter(|p| !p.is_empty() && *p != ".")
-        .collect();
-    let joined = parts.join(&sep.to_string());
+    let mut out: Vec<&str> = Vec::new();
+    for part in path.split(is_sep_char) {
+        match part {
+            "" | "." => {}
+            ".." => match out.last() {
+                Some(&last) if last != ".." => {
+                    out.pop();
+                }
+                // Go keeps a leading `..` only when the path is not rooted.
+                Some(_) => out.push(part),
+                None if !rooted => out.push(part),
+                None => {}
+            },
+            _ => out.push(part),
+        }
+    }
+    let joined = out.join(&sep.to_string());
     if rooted {
+        // A rooted path is `"/" + rest`; an empty `rest` is still `"/"`.
         format!("{sep}{joined}")
     } else if joined.is_empty() {
         ".".to_string()

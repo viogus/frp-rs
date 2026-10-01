@@ -2095,7 +2095,7 @@ tlsServerName = "frps.example.com"
 /// "Go frp Equivalent". No loader accepts them — `frp-core/src/config/server.rs:42-56`
 /// declares those fields with `#[serde(default)]` and no alias, and Go
 /// v0.71.0 carries them under the nested `[transport.tls]` section, which
-/// `frp-core/src/config/normalize.rs:888-907` maps onto the flat fields.
+/// `frp-core/src/config/normalize.rs:908-935` maps onto the flat fields.
 /// This pins both directions (the four stay rejected, the two real aliases
 /// stay accepted) so the table cannot drift back.
 #[test]
@@ -2801,7 +2801,7 @@ mod proptest_tests {
         /// A proxy expressed with Go-format sub-tables
         /// ([proxies.transport] / [proxies.healthCheck] /
         /// [proxies.loadBalancer]) normalizes to the same TOML as the
-        /// equivalent flat fields. normalize_proxies (normalize.rs:1968)
+        /// equivalent flat fields. normalize_proxies (normalize.rs:2547)
         /// flattens the sub-tables in the order transport → healthCheck →
         /// loadBalancer; the flat form below lists the fields in exactly
         /// that order so the serialized outputs match.
@@ -2856,7 +2856,7 @@ mod proptest_tests {
     proptest! {
         /// Same equivalence for visitor sub-tables
         /// ([visitors.transport] / [visitors.natTraversal],
-        /// normalize_visitors at normalize.rs:2220).
+        /// normalize_visitors at normalize.rs:2799).
         #[test]
         fn visitor_subtables_flat_vs_nested_equivalent(
             use_enc in any::<bool>(),
@@ -12657,6 +12657,148 @@ fn legacy_ini_common_include_dotdot_is_not_a_wildcard_both_modes() {
         let cfg = load_client_config(path.to_str().unwrap(), strict)
             .unwrap_or_else(|e| panic!("strict={strict}: `..` must not glob a directory: {e}"));
         assert_eq!(cfg.proxies.len(), 0, "strict={strict}");
+    }
+}
+
+/// **Round-5 F1: the include resolver folds an interior `..` with Go's
+/// `filepath.Clean` rule — it does not merely spell the same directory.**
+///
+/// Go resolves the pattern's own directory with `filepath.Abs(filepath.Dir(p))`
+/// (`pkg/config/legacy/parse.go:69-70`), and `Abs` Cleans, so
+/// `Dir("a/../b") = Clean("a/../") = "."` even when `a` does not exist. frp-rs at
+/// `c5b4f9ed` Cleaned without folding, leaving `"a/.."` — a path whose
+/// `exists()` is false — so the missing-directory guard fired and the four
+/// interior-`..` spellings were GO rc 0 / HEAD rc 1 (measured on v0.71.0, all
+/// three `-c` forms, both loader modes):
+/// `a/../b`, `./x/../y`, `x/../sub.ini`, `nonexistent/../sub.ini`. The fix is in
+/// [`super::file::go_clean`]; this pin drives [`super::file::process_includes`]
+/// with the same base directory the `./name` CLI form produces, so a mutant that
+/// drops the `..` fold reds the `:410` guard here.
+#[test]
+fn legacy_ini_common_include_interior_dotdot_is_cleaned_like_go() {
+    let dir = tempfile::tempdir().unwrap();
+    // A decoy beside the config: a legacy visitor the collector would refuse.
+    // It must not be merged — `a/../b` is not `*`, and after Clean it is `b` in
+    // the config's own directory, which does not exist.
+    std::fs::write(dir.path().join("bad.ini"), "[bad]\nrole = \"visitor\"\n").unwrap();
+    for pattern in [
+        "a/../b",
+        "./x/../y",
+        "x/../sub.ini",
+        "nonexistent/../sub.ini",
+    ] {
+        let mut value: toml::Value =
+            toml::from_str(&format!("[common]\nincludes = \"{pattern}\"\n")).unwrap();
+        super::file::process_includes(
+            &mut value,
+            dir.path(),
+            super::format::ConfigFormat::Ini,
+            super::normalize::ConfigSide::Client,
+        )
+        .unwrap_or_else(|e| {
+            panic!("`includes = \"{pattern}\"` must Clean to `.` and resolve, like Go: {e}")
+        });
+        assert!(
+            value["common"].get("includes").is_none(),
+            "`{pattern}` must be consumed, not left for a later pass"
+        );
+        assert!(
+            value.get("bad").is_none(),
+            "`{pattern}` must not merge the decoy beside the config"
+        );
+    }
+}
+
+/// **Round-5 F4: a separator-terminated pattern whose `Base` names a regular
+/// entry is matched.**
+///
+/// `filepath.Base("sub/sub/") = "sub"` (Go's `Base` strips the trailing
+/// separator) and `Dir("sub/sub/") = "sub/sub"`, so `includes = "sub/sub/"`
+/// matches the file `sub/sub/sub` and merges it. frp-rs reproduced that via the
+/// trailing-separator strip in [`super::file::go_base`]. Dropping that strip
+/// makes `Base` the slash-only `"/"`, which matches nothing: silent rc 0 where
+/// Go merges the file. Measured on v0.71.0 in both loader modes: GO rc 1
+/// `failed to parse visitor pbad, err: type shouldn't be empty` with this
+/// detector; the pre-`go_base` rule and the strip-removed mutant are rc 0. The
+/// detector is a *visitor*, so Go's "no `[common]`/`[proxies]` wrapper needed"
+/// reader and frp-rs both refuse it and the merge is observable as rc 1.
+#[test]
+fn legacy_ini_common_include_trailing_separator_base_names_a_file_like_go() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("sub/sub")).unwrap();
+    // A regular file named `sub`, i.e. `Base("sub/sub/")`.
+    std::fs::write(
+        dir.path().join("sub/sub/sub"),
+        "[pbad]\nrole = \"visitor\"\n",
+    )
+    .unwrap();
+    let path = dir.path().join("frpc.ini");
+    std::fs::write(
+        &path,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\nincludes = \"sub/sub/\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let err = format!(
+            "{}",
+            load_client_config(path.to_str().unwrap(), strict).unwrap_err()
+        );
+        assert!(
+            err.contains("failed to parse visitor pbad") && err.contains("type shouldn't be empty"),
+            "strict={strict}: `Base(\"sub/sub/\")` is `sub`, so the file `sub/sub/sub` merges: {err}"
+        );
+    }
+}
+
+/// **Go's `Clean`, spelled out: the `..` fold, the literal-`..` survival, and
+/// the rooted clamp.**
+///
+/// Every case is a `filepath.Clean` measurement on Go v0.71.0, written as
+/// `(input, expected)` so a reader can `go run` the same list. The interesting
+/// families are the ones [`super::file::go_clean`] has to get right beyond
+/// dropping `.`/empty elements:
+/// * the fold over a *non-existent* element (`a/../b` → `b`), which is what
+///   fixes the interior-`..` rc divergence;
+/// * `..` surviving when it has nothing to cancel (`../x/../` → `..`,
+///   `a/../../b` → `../b`, `x/../../..` → `../..`);
+/// * the rooted clamp (`/..` → `/`, `//` → `/`), where Go never emits `..`.
+#[test]
+fn go_clean_has_go_clean_semantics() {
+    for (input, expected) in [
+        ("", "."),
+        (".", "."),
+        ("./", "."),
+        ("././", "."),
+        ("///", "/"),
+        ("//", "/"),
+        ("/", "/"),
+        ("/..", "/"),
+        ("/../..", "/"),
+        ("/a/../", "/"),
+        ("..", ".."),
+        ("../", ".."),
+        ("../x/../", ".."),
+        ("a/..", "."),
+        ("a/../", "."),
+        ("a/../b", "b"),
+        ("a/./../b", "b"),
+        ("a/b/../../", "."),
+        ("a/b/../../c", "c"),
+        ("a/../../", ".."),
+        ("a/../../b", "../b"),
+        ("a//b/../", "a"),
+        ("a/..//b", "b"),
+        ("x/../../..", "../.."),
+        ("sub/", "sub"),
+        ("sub/./", "sub"),
+        ("sub/../x", "x"),
+        ("nonexistent/../sub.ini", "sub.ini"),
+    ] {
+        assert_eq!(
+            super::file::go_clean(input),
+            expected,
+            "Go Clean({input:?}) is {expected:?}"
+        );
     }
 }
 
