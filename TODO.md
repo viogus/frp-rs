@@ -9367,7 +9367,7 @@ section; ledger now **24 open / 104 closed**.**
   appended well-formed record reds it, examines the bytes before the first matching record, and `frps`'s own
   `drain` distinguishes a read error from EOF the way the `frpc` one now does (or each residue is argued
   unreachable with a measurement).
-  **Done (2026-10-02, at code head `5b74bdbb` on `fix/frps-warn-oracle`, PR #TBD, based on `18bcd1ad`) — all three closed; three real emit-site mutants red the lane.**
+  **Done (2026-10-02, at code head `5b74bdbb` on `fix/frps-warn-oracle`, PR #457, based on `18bcd1ad`) — all three closed; three real emit-site mutants red the lane.**
   (a)+(b) `assert_records_are_exactly_the_message` (`frps/tests/warn_delivery.rs:1081`) now pins the capture's
   **total** `tracing` record count to `expected + others`, with `tracing_record_starts` (`:1040`) scanning the
   SGR-stripped capture for record starts, so a record emitted beyond the counted ones reds no matter which side
