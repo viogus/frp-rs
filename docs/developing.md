@@ -1475,8 +1475,10 @@ completes, and `ServerConfig::complete` gained Go's
 Since #427 the three zero-valued log flags (`--log-level ""`, `--log-file ""`,
 `--log-max-days 0`) are skipped entirely by the override lane rather than written
 through and completed, so a file's `[log]` values survive a deliberately empty flag;
-`--log-format` still writes through because it is an frp-rs-only flag with no Go
-completion to mirror (`TODO.md` residues R1-R3 record the two adjacent divergences).
+`--log-format` still writes through on that lane because it is an frp-rs-only flag
+with no Go completion to mirror (`TODO.md` residue R2 records the remaining adjacent
+divergence — R1, the `-c`-only lane's non-empty log flag, is closed by the mask at
+`frps/src/main.rs:413`, which withholds all four log flags there).
 
 Measured against Go frp **v0.71.0** (darwin/arm64) and frp-rs (base `80199f4`),
 cwd holding a `frps.toml`, one free control port and one free dashboard port per

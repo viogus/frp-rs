@@ -393,28 +393,58 @@ fn run_verify(config_path: &str, strict_config: bool, allow_unsafe: &[String]) {
 // ── Logging / tracing init ────────────────────────────────────────────────────
 
 fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
-    let level = logging::resolve_log_level(
-        cli.log_level.clone(),
-        cfg.map(|c| c.log.level.as_str()),
-        "debug",
-    );
-    let file = logging::resolve_log_file(
-        cli.log_file.clone(),
-        cfg.map(|c| c.log.file.as_str()).unwrap_or(""),
-    );
+    // Go frp parity (TODO.md:8831): with an explicit `-c` the config file is
+    // authoritative for the whole `[log]` section, exactly as it is for the
+    // config flags — the `-c` branch of `main` skips `override_server_config`
+    // (`frps/src/main.rs:1019-1021`), so consulting the CLI log flags here would
+    // silently re-honour the very flags that gate exists to discard. Measured
+    // on Go v0.71.0: `frps -c frps.toml --log-level info` over a file with
+    // `[log] level = "warn"` emits 0 `INFO` records; before this gate frp-rs
+    // emitted 11.
+    //
+    // The predicate is `cli.config.is_none() || cli.config_dir.is_some()`, not
+    // `!cli.cli_overrides_enabled()`: `--config-dir` is an frp-rs-only extension
+    // whose lane *does* honour the CLI log flags — its `init_logging(&cli, None)`
+    // call (`frps/src/main.rs:500`) has no config to defer to, so masking there
+    // would silently drop the flag to the built-in default. When `-c` and
+    // `--config-dir` are given together it is the config-dir branch
+    // (`frps/src/main.rs:499`) that runs, so `cli.config_dir.is_some()` must
+    // override `cli.config.is_some()`.
+    let cli_log_flags_apply = cli.config.is_none() || cli.config_dir.is_some();
+    let (cli_level, cli_file, cli_max_days, cli_format) = if cli_log_flags_apply {
+        (
+            cli.log_level.clone(),
+            cli.log_file.clone(),
+            cli.log_max_days,
+            cli.log_format.clone(),
+        )
+    } else {
+        (None, None, None, None)
+    };
+    let level = logging::resolve_log_level(cli_level, cfg.map(|c| c.log.level.as_str()), "debug");
+    let file = logging::resolve_log_file(cli_file, cfg.map(|c| c.log.file.as_str()).unwrap_or(""));
     // `resolve_log_max_days` filters the CLI zero value (Go's `util.EmptyOr(0,
     // 3)`), so `--log-max-days 0` uses the completed config value — which this
     // lane has just set to 3 — instead of disabling startup cleanup. The
     // observable is synchronous: `init_tracing` calls `cleanup_expired_logs`
     // when `max_days > 0`.
-    let max_days = logging::resolve_log_max_days(cli.log_max_days, cfg.map(|c| c.log.max_days));
+    let max_days = logging::resolve_log_max_days(cli_max_days, cfg.map(|c| c.log.max_days));
     let format = logging::resolve_log_format(
-        cli.log_format.clone(),
+        cli_format,
         cfg.map(|c| c.log.format.as_str()).unwrap_or("text"),
     );
     // Go frp v0.70.1 compat: log.disablePrintColor from the config file is
     // honored (audit task 9 finding 9); the CLI --disable-log-color flag
     // takes precedence when both are set.
+    //
+    // Known divergence from Go on the `-c` lane, deliberately left open and
+    // pinned: Go's `-c` branch discards the whole pflag-bound struct and hands
+    // `log.InitLogger` the *file's* `Log.DisablePrintColor`
+    // (`cmd/frps/root.go:112`), so `frps -c frps.toml --disable-log-color=true`
+    // is ignored by Go while frp-rs still honours it. Unlike the four log flags
+    // masked above, this one is not named by R1 (TODO.md:8831) and
+    // `frps/tests/cli_exit_codes.rs:1945` (`disable_log_color_value_spelling_is_applied`)
+    // pins the current behaviour, so changing it is a separate item.
     let ansi = logging::resolve_ansi(
         cli.disable_log_color || cfg.map(|c| c.log.disable_print_color).unwrap_or(false),
     );
@@ -752,7 +782,7 @@ async fn run(mut cli: FrpsArgs) {
                                 // (`frp-server/src/service.rs:2276`) — so this
                                 // arm means the service stopped for good. The
                                 // single-config path maps any `run()` error to
-                                // `EXIT_RUNTIME` (`frps/src/main.rs:1079-1082`),
+                                // `EXIT_RUNTIME` (`frps/src/main.rs:1122-1125`),
                                 // and this lane carries the same code out,
                                 // pinned on both lanes by
                                 // `config_dir_where_every_service_fails_to_run_exits_like_dash_c`

@@ -276,7 +276,10 @@ jobs:
       # +1, so this count guard can see those rows (it counts test functions, not
       # assertions). Re-derived on this tree with
       # `cargo test -p frps --test cli_exit_codes -- --list`.
-      FRPS_CLI_TESTS: "44"
+      # 44 → 45 with the `-l`-shorthand refusal pin
+      # `short_l_is_not_a_frps_shorthand_and_the_refusal_is_pinned`
+      # (`TODO.md:8884`): +1. Re-derived with the same `--list` command.
+      FRPS_CLI_TESTS: "45"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
       # 11 → 13 with the one `auth.method` policy: +2
@@ -1031,21 +1034,30 @@ jobs:
         # `test result: ok. 0 passed; 0 failed` and exits **0** — a gate quieter
         # than the `cli_exit_codes` step beside it, which is why this one repeats
         # that step's three checks (the target ran; the summary says
-        # `ok. 9 passed; 0 failed`; `-- --list` counts 9). The literal is a
+        # `ok. 10 passed; 0 failed`; `-- --list` counts 10). The literal is a
         # property of the *file*, not a shared env value: it lives here, next to
         # the invariant it guards, because `env.FRPS_CLI_TESTS` counts a
         # different target and must not be moved for this one.
         #
-        # The literal moved 6 → 7 when the empty-`--log-level` pin landed and
+        # The literal moved 6 → 7 when the empty-`--log-level` pin landed,
         # 7 → 9 with the two sibling zero-value pins (`--log-file ""` and
         # `--log-max-days 0`, both arbited by Go's `-c` lane — see the file's own
-        # section comments). It is the count of `#[test]`s in that one file, and
+        # section comments), and 9 → 10 with the `-c`-lane non-empty-flag pin
+        # `cli_nonempty_log_level_flag_does_not_override_the_config_file`
+        # (`TODO.md:8831`). It is the count of `#[test]`s in that one file, and
         # it lives in exactly one place in this step — the `expected=` line — so
         # a new pin means editing one number, not hunting a duplicated one.
+        #
+        # 10 → 11 with
+        # `cli_file_retention_and_format_flags_do_not_override_the_config_file`,
+        # which closes the coverage hole the four-value `-c` mask left: the
+        # `--log-level` pin alone let a mutant that unmasked `log_file`,
+        # `log_max_days` or `log_format` survive (measured: 10 passed / 0 failed),
+        # so each of the other three withheld values now has its own arm.
         shell: bash
         run: |
           set -eo pipefail
-          expected=9
+          expected=11
           log=/tmp/frps-log-completion-tests.log
           cargo test -p frps --features dashboard --test log_completion --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
@@ -1492,23 +1504,23 @@ jobs:
   # The release-profile CLI lane. `cargo test --release -p frps --test
   # cli_exit_codes` used to be red in every release build (41 passed / 3 failed)
   # because three pins drive `#[cfg(debug_assertions)]` hooks in
-  # `frps/src/main.rs` (`:620`, `:697`, `:741`) that a release binary does not
+  # `frps/src/main.rs` (`:650`, `:727`, `:771`) that a release binary does not
   # compile. Those three tests now carry
   # `#[cfg_attr(not(debug_assertions), ignore = "<reason>")]`; `ignore` (not
   # `#[cfg]`) is what keeps them compiled and *counted* in both profiles, and
-  # `FRPS_RELEASE_CLI_TESTS` below is the same 44 as the tests-unit lane's
+  # `FRPS_RELEASE_CLI_TESTS` below is the same 45 as the tests-unit lane's
   # `FRPS_CLI_TESTS` on purpose.
   #
   # This job is what makes the skip observable: it asserts the exact summary
-  # line (41 passed; 0 failed; 3 ignored) and the exact three ignored names, so
+  # line (42 passed; 0 failed; 3 ignored) and the exact three ignored names, so
   # the release lane cannot widen its own skip set, drop a test, or lose the
   # target and still pass.
   #
   # What this lane does *not* defend: turning those three attributes into an
   # unconditional `#[ignore]`. That yields byte-identical release output, so the
   # guard below exits 0 by design. Blanket ignoring is caught by the
-  # pre-existing debug lane in `tests-unit` instead: `FRPS_CLI_TESTS: "44"`
-  # (`:278`) requires `test result: ok. 44 passed; 0 failed` (`:747`), so an
+  # pre-existing debug lane in `tests-unit` instead: `FRPS_CLI_TESTS: "45"`
+  # (`:282`) requires `test result: ok. 45 passed; 0 failed` (`:935`), so an
   # unconditional `#[ignore]` fails hard there. The two guards cover different
   # axes and neither makes the other redundant.
   #
@@ -1521,7 +1533,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      FRPS_RELEASE_CLI_TESTS: "44"
+      FRPS_RELEASE_CLI_TESTS: "45"
       # Exactly these three and no more: the test function names, in file order
       # (the guard sorts both sides), that carry the release-only skip in
       # `frps/tests/cli_exit_codes.rs`.

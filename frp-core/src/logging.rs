@@ -75,24 +75,36 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// first being `frps uses command line arguments for config`. frp-rs has no counterpart
 /// lane — without `-c` it still reads `./frps.toml` (a missing file exits 1),
 /// and `--config-dir` takes the `init_logging(&cli, None)` path
-/// (`frps/src/main.rs:467`). `frpc`'s Go run path binds no `--log-level` flag at
+/// (`frps/src/main.rs:500`). `frpc`'s Go run path binds no `--log-level` flag at
 /// all (`Error: unknown flag: --log-level`, rc 1), so the two binaries can be
 /// compared on the value they resolve but not on the flag surface.
 ///
-/// **Known open divergence (R1), not parity.** The *non-empty* CLI value on the
-/// `-c` lane still does not match Go: on the config above,
-/// `frps -c frps.toml --log-level info` prints 11 `INFO` records where Go
-/// prints **0**. frp-rs gates only
+/// **R1 (closed): the *non-empty* CLI value on the `-c` lane now matches Go.**
+/// Before the fix, on the config above `frps -c frps.toml --log-level info`
+/// printed 11 `INFO` records where Go prints **0**: frp-rs gated only
 /// `override_server_config` on `cli_overrides_enabled`
-/// (`frps/src/main.rs:986-988`), while `init_logging` (`:991`, defined at `:392`)
-/// still reads the raw CLI value. That is pre-existing and is *not* what this
-/// function's zero-value filter fixes — the empty-value rows are the ones that
-/// now agree.
+/// (`frps/src/main.rs:1019-1021`), while `init_logging` (`:1024`, defined at `:395`)
+/// still read the raw CLI value. `init_logging` now masks the four CLI log flags
+/// (`--log-level`, `--log-file`, `--log-max-days`, `--log-format`) whenever a
+/// `-c` config was loaded, so the file's `[log]` section is authoritative there
+/// exactly as it is for the config flags. Measured on the fixed binary over the
+/// same file: `-c frps.toml --log-level info` → **0 B**, and
+/// `-c frps.toml --log-level debug` → **0 B** too (the pre-fix binary answered
+/// 11 `INFO` + 3 `DEBUG`), while the no-`-c` lane is unchanged at 11 `INFO`.
+///
+/// Not masked, and still divergent on that lane: `--disable-log-color`. Go's
+/// `-c` branch discards the whole pflag-bound struct and hands
+/// `log.InitLogger` the *file's* `Log.DisablePrintColor`
+/// (`cmd/frps/root.go:112`), so Go ignores the flag there;
+/// frp-rs still honours it, deliberately, and
+/// `frps/tests/cli_exit_codes.rs::disable_log_color_value_spelling_is_applied`
+/// pins that. R1 does not name the flag, so it is left for a separate item.
 ///
 /// Pinned by
-/// `frp-core/src/cli.rs::log_flag_zero_values_do_not_override_the_config_file`
+/// `frp-core/src/cli.rs::log_flag_zero_values_do_not_override_the_config_file`,
+/// `frps/tests/cli_completion.rs::cli_empty_log_level_keeps_the_config_files_level`
 /// and
-/// `frps/tests/cli_completion.rs::cli_empty_log_level_keeps_the_config_files_level`.
+/// `frps/tests/log_completion.rs::cli_nonempty_log_level_flag_does_not_override_the_config_file`.
 pub fn resolve_log_level(
     cli_level: Option<String>,
     cfg_level: Option<&str>,
