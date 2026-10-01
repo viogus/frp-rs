@@ -8357,7 +8357,7 @@ section; ledger now **24 open / 104 closed**.**
   also touch that file, to avoid a literal conflict.
 
 - [x] **Rust frpc runs the `auth.tokenSource` `exec` command twice per successful login where Go runs it once.**
-  **Done (2026-10-01, at fix `663e1d38` / oracle `98166cb5` on `fix/tokensource-single-exec`, PR #437, based on `799ce048`; pre-rebase `61236591`/`9f9cb110` on `ed2d71a3` and `b8a916a6` on `f503b4e7`, originally `801a75fb` on `a0c16c83`, the code patches `=` under `git range-diff` at each rebase, though the `ed2d71a3`-era restructure also folded a cite-fix commit (`6472ab21`) into the fix while the rebases themselves stayed patch-`=`; the commits that produced these records are `5ca5fedd`, `3e7a90c9` and `79d664db` (TODO/CHANGELOG) and `f0da796f` (devlog), with the cites `e7f27906` and the r3 fixes `3f705caa`, the records reconcile `3e7a90c9`, the cite repoint `79d664db`, and the later records review fixes.)** The source was
+  **Done (2026-10-01, at fix `42245c7f` / oracle `a2e7546f` on `fix/tokensource-single-exec`, PR #437, based on `084f7865`; pre-rebase `663e1d38`/`98166cb5` on `799ce048`, `61236591`/`9f9cb110` on `ed2d71a3` and `b8a916a6` on `f503b4e7`, originally `801a75fb` on `a0c16c83`, the code patches `=` under `git range-diff` at each rebase, though the `ed2d71a3`-era restructure also folded a cite-fix commit (`6472ab21`) into the fix while the rebases themselves stayed patch-`=`; the commits that produced these records are `e98cc53b`, `0d5f2139` and `edf11e69` (TODO/CHANGELOG) and `5847aac6` (devlog), with the cites `6c76bf8f` and the r3 fixes `74f7084c`, the records reconcile `0d5f2139`, the cite repoint `edf11e69`, and the later records review fixes.)** The source was
   resolved once at `frp-client/src/service.rs:939` but the same `ValueSource` was *also* stored in
   `AuthConfig.token_source` at `:952` (pre-fix numbering; the post-fix `None` is `:965`), so every Login (`frp-client/src/control.rs:369` →
   `frp-core/src/auth.rs:427-428`), Ping (`frp-client/src/service.rs:3497`) and NewWorkConn
@@ -8389,7 +8389,7 @@ section; ledger now **24 open / 104 closed**.**
   recorded, not fixed: `frps` re-resolves the source per
   verification where Go's `BuildServerAuth` caches it (`pkg/auth/auth.go:106`); `method = "oidc"` plus `auth.tokenSource` executes once here
   and zero times in Go; `auth.oidc.tokenSource` stays per-operation (matches Go). Ledger after this
-  close: **25 open / 175 closed** (base `799ce048`: 25 open / 174 closed; the residue
+  close: **19 open / 181 closed** (base `084f7865`: 19 open / 180 closed; the residue
   item below is the +1).
 
   Filed by the coordinator from the round-2 adversarial review of PR #429, which measured it and
