@@ -418,7 +418,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
     becomes `Oidc`, while
     `state.oidc.verifier` is built **once** at startup (`frp-server/src/service.rs:215`, `if
     auth_cfg.method == AuthMethod::Oidc`) and is still `None`. The login dispatch keys off the
-    **verifier's presence**, not the method (`frp-server/src/control/login.rs:299`, `else if let
+    **verifier's presence**, not the method (`frp-server/src/control/login/auth.rs:123`, `else if let
     Some(ref verifier) = state.oidc.verifier`), so logins still take the token branch — with the new
     token. It fails closed only by accident of that dispatch; the config and the running auth
     disagree.
@@ -458,7 +458,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   already documents as restart-required. The reload now applies the fields it can re-key in place —
   `auth.token` / `auth.tokenSource`, `auth.additionalAuthScopes`, and
   `auth.authenticationTimeout` / `auth.tokenAuthTimeout` (both read from the live `auth_cfg` on
-  every use: `frp-server/src/control/login.rs:486-527`,
+  every use: `frp-server/src/control/login/auth.rs:332-372`,
   `frp-server/src/handlers/dispatch.rs:68`/`:552`,
   `frp-server/src/control/nathole.rs:380`/`:575`) — and reports the rest as
   restart-required (`auth.method: token -> oidc (restart required)`, the existing
@@ -473,7 +473,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   struct, which is what made Shape B — so `auth_cfg.method` is the method the startup verifier was
   built for for the process's lifetime and `method == Oidc` ⟺ `verifier.is_some()`; that invariant
   is why the login dispatch is **not** changed and keeps keying off `Option<verifier>` (stated with
-  its mechanism and its failure mode at `frp-server/src/control/login.rs:297-323`).
+  its mechanism and its failure mode at `frp-server/src/control/login/auth.rs:93-119`).
   Pins: `frp-server/tests/server_reload_auth.rs`, 6 tests (own config file in a `TempDir`, own free
   port and in-process `Service` each; live state read through `Service::state()`; real V1 token
   logins through `common::raw_login`) — Shape A (summary is not `no changes detected` and carries
@@ -510,7 +510,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   independent reviewers had measured it): the token arm is **`:2068-2072`**, and `:2070`
   (`r.auth_cfg = Arc::new(new_auth_cfg)`) is the line that caused Shape B; the original
   `:2057-2061` is the `allow_ports` arm (`:2061` is `if *r.allow_ports != new_allow_ports`). `:215`,
-  `control/login.rs:299` and `:2132-2142` check out as written. Both occurrences in this item's text
+  `frp-server/src/control/login/auth.rs:123` and `frp-server/src/control/login.rs:1714-1724` check out as written. Both occurrences in this item's text
   are corrected above.
   The field list is compiler-enforced: `note_auth_restart_changes` destructures
   `AuthServerConfig` twice with **no `..`**, so a new `[auth]` field is an E0027 compile error —
@@ -7364,7 +7364,7 @@ section; ledger now **24 open / 104 closed**.**
   Done: fixed in #417 (`77c987da`); (a) corrected where it was written. (b) The new pin
   `read_request_head_reports_a_zero_budget_as_a_named_timeout` calls
   `read_request_head(&mut s, Duration::ZERO)` directly: deleting the guard at
-  `frp-server/src/control/login.rs:2301-2303` gives 17 passed / 1 failed with
+  `frp-server/src/control/login.rs:1883-1885` gives 17 passed / 1 failed with
   `got Io(Error { kind: InvalidInput, message: "cannot set a 0 duration timeout" })` (17/17 green
   before the pin). (c) The terminator pin's comment now says the equality assertion is the whole
   catch — `split_whitespace().nth(1)` yields `/jwks` with or without the pipelined tail. (d) The
@@ -7669,11 +7669,11 @@ section; ledger now **24 open / 104 closed**.**
   (`left 440 / right 433`). Deviation from the obvious choice: dependency-free FNV-1a rather than
   sha256, because `sha2` is not a `frp-core` dependency and `DefaultHasher` is not stable across
   releases. (b) `oidc_mock_server_with_timeout` now stores its deadline and exposes
-  `request_head_timeout()` (`frp-server/src/control/login.rs:2343-2349`), and
-  `mock_default_ctor_delegates_the_pinned_deadline` (`:2758-2768`) asserts that the handle
-  `oidc_mock_server()` returns reports `MOCK_REQUEST_HEAD_TIMEOUT` (`:2235`) — the exact wiring the
+  `request_head_timeout()` (`frp-server/src/control/login.rs:1925-1931`), and
+  `mock_default_ctor_delegates_the_pinned_deadline` (`:2340-2350`) asserts that the handle
+  `oidc_mock_server()` returns reports `MOCK_REQUEST_HEAD_TIMEOUT` (`:1817`) — the exact wiring the
   reviewers' `M_delegation_60s` mutant changed while all 18 `oidc` tests stayed green; the literal
-  itself is pinned by `mock_default_request_head_deadline_is_pinned` (`:2738-2746`). No
+  itself is pinned by `mock_default_request_head_deadline_is_pinned` (`:2320-2328`). No
   `CHANGELOG.md` entry: no shipped byte or behaviour changed — the goldens exist precisely to hold
   the rendered bytes fixed — and the only non-test edit is hoisting the diagnostics into constants.
 
@@ -8081,19 +8081,19 @@ section; ledger now **24 open / 104 closed**.**
   server site (`:680`) reds `7/1` at `common/mod.rs:114` (`got prefix: " WARN
   frp_core::config::loader: EXTRA "`). Parts (b), (c) and (d) are untouched.
   (b) `frp-server/src/control/login.rs`'s `request_head_timeout()` accessor is not pinned to a
-  non-constant override: a lying accessor that ignores the stored field (`:2343-2349`) and returns
+  non-constant override: a lying accessor that ignores the stored field (`:1925-1931`) and returns
   `MOCK_REQUEST_HEAD_TIMEOUT` keeps all 19 oidc tests green. Done-when: the delegation pin
-  (`:2758-2768`) or a sibling drives an override that differs from the constant and asserts the
+  (`:2340-2350`) or a sibling drives an override that differs from the constant and asserts the
   stored field.
 
-  **(b) Done (PR #432, code head `df78c203`).** `frp-server/src/control/login.rs:2795`
+  **(b) Done (PR #432, code head `df78c203`).** `frp-server/src/control/login.rs:2377`
   `mock_handle_reports_the_override_it_was_built_with` loops three overrides — `125 ms`, `60 s` and a
-  deliberately sub-100 ms non-round `Duration::from_micros(31_337)` (`:2799`) — each checked in an in-loop
-  `assert_ne!` (`:2805`) against the 5 s `MOCK_REQUEST_HEAD_TIMEOUT` (`:2235`), and asserts the handle's
-  accessor (`fn request_head_timeout` at `:2348`) returns the stored deadline (`:2811`). A lying accessor
-  that returns `MOCK_REQUEST_HEAD_TIMEOUT` reds it at `frp-server/src/control/login.rs:2811:13`
+  deliberately sub-100 ms non-round `Duration::from_micros(31_337)` (`:2381`) — each checked in an in-loop
+  `assert_ne!` (`:2387`) against the 5 s `MOCK_REQUEST_HEAD_TIMEOUT` (`:1817`), and asserts the handle's
+  accessor (`fn request_head_timeout` at `:1930`) returns the stored deadline (`:2393`). A lying accessor
+  that returns `MOCK_REQUEST_HEAD_TIMEOUT` reds it at `frp-server/src/control/login.rs:2393:13`
   (`left: 5s / right: 31.337ms`), and one that special-cases a round threshold or hardcodes the two
-  originally pinned values reds the same assertion (`:2811:13`) — both survived the round-1 two-value pin (`1 passed`) while
+  originally pinned values reds the same assertion (`:2393:13`) — both survived the round-1 two-value pin (`1 passed`) while
   the two pre-existing mock pins stay green.
   (c) `frpc/tests/admin_config_get_warning.rs`'s `seed_resolves_spellings_only_the_loader_does`
   spawns four frpc children and calls `free_port()` per sub-case, so a released port can be re-taken

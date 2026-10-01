@@ -2126,7 +2126,7 @@ impl Service {
             // every use, so re-keying them here reaches every reader and they
             // are applied rather than reported: the login timestamp window and
             // the replay table's prune
-            // (`frp-server/src/control/login.rs:486-527`), the scoped-message
+            // (`frp-server/src/control/login/auth.rs:332-372`), the scoped-message
             // freshness gate (`frp-server/src/handlers/dispatch.rs:68`, `:552`)
             // and the nathole pre-check (`frp-server/src/control/nathole.rs:380`,
             // `:575`). Pre-fix the reload never compared them, so a change to
@@ -2188,7 +2188,7 @@ impl Service {
         // because this comment and any later comment that merely mentions the
         // identifier change the number. The earlier "seven hits" was already
         // wrong for that reason, missed
-        // `frp-server/src/control/login.rs:1367`, and was raised by the lines
+        // `frp-server/src/control/login.rs:949`, and was raised by the lines
         // asserting it. So neither a reload nor a restart can make a change to
         // it take effect and a "restart required" line would be false. The same
         // disposition `auth.useEncryption` has in

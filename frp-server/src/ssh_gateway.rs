@@ -1180,7 +1180,7 @@ impl Handler for SshSession {
         // Per-IP throttle, fail-closed PRE-AUTH gate (round-12 audit A1):
         // an IP inside its throttle window is denied BEFORE the constant-
         // time compare, so no guess is evaluated during the window —
-        // mirroring login.rs:680 `is_login_throttled`. Round-11 ran the
+        // mirroring frp-server/src/control/login.rs:289 `is_login_throttled`. Round-11 ran the
         // deny only on the mismatch branch (after the compare): fail-open
         // meant an armed IP still got one full credential evaluation per
         // fresh connection (online guessing of the actual password was
@@ -2152,7 +2152,7 @@ mod tests {
         // A FRESH connection from the same IP within the window is denied
         // without a USERAUTH_FAILURE round-trip (same state table, shared
         // below). Round-12 pin (audit A1): the deny is now a FAIL-CLOSED
-        // pre-auth gate (login.rs:680 `is_login_throttled` parity) that
+        // pre-auth gate (frp-server/src/control/login.rs:289 `is_login_throttled` parity) that
         // runs BEFORE the constant-time compare — an armed IP's guess is
         // never evaluated, and even a CORRECT password from an armed IP is
         // denied for the window. Round-11's deny ran only on the mismatch
