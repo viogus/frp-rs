@@ -134,6 +134,20 @@ hdr() { printf '%s\n' "---------------------------------------------------------
 # reviewer sees — not that it prevents pin removal: an edit here plus a refreshed
 # `SCEN*_REGION_SHA` (L2), or a forged summary and evidence block (L1), is still
 # green. Those stay declared residues.
+#
+# Round 14 (F1): the digest *read* is PATH-free by construction — `region_lines`
+# uses `read`/`case`/`printf`, `${x%% *}` splits the hasher's output and
+# `$HASH_TOOL` is absolute and vector-proven — so a shadowed `awk` or `sed` can no
+# longer mint a region's bytes or its digest. Round 14 (F3) records the copy's
+# real digest in the probe's ledger and has `enforce_substance` re-hash the copies
+# and re-run the comparison against each, so a ledger written without the work
+# reds instead of staying green. Residues that remain, measured rather than
+# assumed: (R14-a) the *fixtures'* inspections of other files still resolve
+# through PATH, so a shadowed `grep`/`sed` can make one scenario's assertion
+# vacuous without editing this file — a weakened scenario, not a defeated pin;
+# (R14-b) `flip_hex`'s `tr` and the `mktemp` probe directory are PATH-resolved but
+# fail-closed only; (R14-c) a shadowed `bash` (the interpreter) or a replaced
+# absolute `/usr/bin/sha256sum` owns the process and is out of scope.
 SCEN6_REGION_SHA='7d31d2b613e1e578c7050a5328cb677f4aac2eba1c6d9a7248f0216d1dd06af7'
 SCEN7_REGION_SHA='941be4f7805b74ff79b691e463f91dd011a1b549cd17995f09542ff8d3f40500'
 PINNED_REGIONS='scenario-6 scenario-7'
@@ -149,19 +163,27 @@ CANARY_MISSING_PATH='/nonexistent-enforcer-canary'
 # PATH — could return a pinned digest for bytes that changed while every check
 # "passed" (adversarial round 9, F3). An absolute path cannot be shadowed that
 # way, and a wrong tool fails the vector instead of being trusted.
+# Round 14 (F1): that vector proof used to be read back through an unqualified
+# `awk '{print $1}'`, so a directory prepended to PATH holding an `awk` that
+# answers only that exact invocation could make a wrong candidate look right (or,
+# more to the point, make every digest below look like its pin) while the step
+# still printed its success line and exited 0 (measured on the sibling suite).
+# `${probe%% *}` is a shell expansion: it performs no PATH lookup, so nothing
+# resolves between the absolute, vector-proven hasher and its comparison. The
+# same removal is applied to `region_sha` and the content-mutation probe below.
 find_hash_tool() {
   local cand probe
   for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
     [ -x "$cand" ] || continue
-    probe=$(printf 'abc' | "$cand" 2>/dev/null | awk '{print $1}')
-    [ "$probe" = "$ABC_SHA256" ] || continue
+    probe=$(printf 'abc' | "$cand" 2>/dev/null)
+    [ "${probe%% *}" = "$ABC_SHA256" ] || continue
     printf '%s\n' "$cand"
     return 0
   done
   for cand in /usr/bin/shasum /bin/shasum /usr/local/bin/shasum; do
     [ -x "$cand" ] || continue
-    probe=$(printf 'abc' | "$cand" -a 256 2>/dev/null | awk '{print $1}')
-    [ "$probe" = "$ABC_SHA256" ] || continue
+    probe=$(printf 'abc' | "$cand" -a 256 2>/dev/null)
+    [ "${probe%% *}" = "$ABC_SHA256" ] || continue
     printf '%s -a 256\n' "$cand"
     return 0
   done
@@ -186,13 +208,41 @@ REGION_SHA_VALUE=''
 MUTATION_PROBES=0
 MUTATION_PROBE_RECORD=''
 
+# The lines of a `substance pin: $1` region in file `$2`, printed exactly as
+# `sed -n "/^# --- substance pin: $1 /,/^# --- end substance pin: $1 ---/p"`
+# would: from the first start marker through the first end marker (both
+# inclusive), through EOF when there is no end marker, and nothing at all when
+# there is no start marker. Round 14 (F1): the region text used to reach the
+# hasher through a PATH-resolved `sed`, which a shadow earlier on PATH could
+# point at a frozen pristine copy and so hash the wrong bytes. `read`, `case`
+# and `printf` are shell builtins, so no PATH lookup stands between a pinned
+# file's bytes and the absolute, vector-proven hasher. Always returns 0: an
+# unreadable file yields no lines, which hashes to `$EMPTY_SHA256` and is caught
+# by the callers (the read-path canary and the empty-digest check in the probe).
+region_lines() {   # $1 = region name, $2 = file to read
+  local name=$1 file=$2 line started=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$started" -eq 0 ]; then
+      case $line in
+        "# --- substance pin: $name "*) started=1 ;;
+        *) continue ;;
+      esac
+    fi
+    printf '%s\n' "$line"
+    case $line in
+      "# --- end substance pin: $name ---") return 0 ;;
+    esac
+  done < "$file"
+  return 0
+}
+
 region_sha() {   # $1 = region name, spelled as between the `substance pin:` markers
   # $2 = the file to read the region from. The *caller* chooses the path, so the
   # callee cannot report an input of its own choosing (round 9, F3), and the
   # read-path canary in `enforce_substance` proves the read follows it. The
   # digest is returned in `REGION_SHA_VALUE` rather than on stdout (round 12) so
   # the callers stay in the current shell and the ledger above is real.
-  local name=$1 file=$2 hash
+  local name=$1 file=$2 hash out
   REGION_SHA_VALUE=''
   if [ -z "${HASH_TOOL:-}" ]; then
     printf 'FAIL  no sha256 tool at an absolute path (need sha256sum or shasum); cannot check the %s region\n' "$name" >&2
@@ -202,9 +252,11 @@ region_sha() {   # $1 = region name, spelled as between the `substance pin:` mar
     printf 'FAIL  no file given to checksum the %s region from\n' "$name" >&2
     return 1
   fi
+  # Round 14 (F1): `region_lines` (builtins) replaces `sed`, and `${out%% *}`
+  # replaces `awk`, so this read is PATH-free end to end.
   # shellcheck disable=SC2086  # $HASH_TOOL is the word-split "<abs path> -a 256"
-  hash=$(sed -n "/^# --- substance pin: ${name} /,/^# --- end substance pin: ${name} ---/p" "$file" |
-    $HASH_TOOL | awk '{print $1}')
+  out=$(region_lines "$name" "$file" | $HASH_TOOL)
+  hash=${out%% *}
   REGION_HASHED=$((REGION_HASHED + 1))
   REGION_HASHED_RECORD="${REGION_HASHED_RECORD:+$REGION_HASHED_RECORD }${name}=${hash}"
   REGION_SHA_VALUE=$hash
@@ -311,7 +363,7 @@ region_hash_verdict() {
 # and rejecting everything fails (c). Round 13 (R12-3): a completed probe is
 # recorded in the ledger above, which `enforce_substance` asserts.
 mutation_probe() {
-  local name=$1 const=$2 want=$3 dir=$4 copy honest reported mutated
+  local name=$1 const=$2 want=$3 dir=$4 copy honest reported mutated line
   if [ -z "${SELF_REAL:-}" ]; then
     printf 'FAIL  enforcer canary: cannot run the content-mutation probe without the enforcer path\n' >&2
     return 1
@@ -321,10 +373,20 @@ mutation_probe() {
     return 1
   fi
   copy=$dir/mutated-$name.sh
-  if ! sed "s/^# --- substance pin: ${name} /&mutated /" "$SELF_REAL" > "$copy" 2>/dev/null; then
-    printf 'FAIL  enforcer canary: cannot build the one-byte-different %s copy for the content probe\n' "$name" >&2
+  if [ ! -r "$SELF_REAL" ]; then
+    printf 'FAIL  enforcer canary: cannot read %s to build the one-byte-different %s copy for the content probe\n' \
+      "$SELF_REAL" "$name" >&2
     return 1
   fi
+  # `sed "s/^# --- substance pin: ${name} /&mutated /"`, in the shell: insert
+  # `mutated ` after the start marker's name on its own line only.
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+      "# --- substance pin: $name "*)
+        printf '%s\n' "# --- substance pin: $name mutated ${line#"# --- substance pin: $name "}" ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$SELF_REAL" > "$copy"
   region_sha "$name" "$SELF_REAL" || return 1
   honest=$REGION_SHA_VALUE
   region_sha "$name" "$copy" || return 1
@@ -332,8 +394,8 @@ mutation_probe() {
   # The copy's real digest, taken the same way but *not* through `region_sha`, so
   # a self-consistent fake has nothing to agree with.
   # shellcheck disable=SC2086  # $HASH_TOOL is the word-split "<abs path> [-a 256]"
-  mutated=$(sed -n "/^# --- substance pin: ${name} /,/^# --- end substance pin: ${name} ---/p" "$copy" |
-    $HASH_TOOL | awk '{print $1}')
+  mutated=$(region_lines "$name" "$copy" | $HASH_TOOL)
+  mutated=${mutated%% *}
   if [ -z "$mutated" ]; then
     printf 'FAIL  enforcer canary: cannot compute the %s copy digest for the content probe\n' "$name" >&2
     return 1
@@ -356,8 +418,11 @@ mutation_probe() {
     printf 'FAIL  enforcer canary: the comparison rejected the mutated %s copy even against the digest that copy really has; the comparison is not bound to the path it is given\n' "$name" >&2
     return 1
   fi
+  # Recorded only now, after the copy was built, hashed and compared in both
+  # directions — and with the digest, not a bare name, so the caller can tell a
+  # ledger written without the work from one the probe earned (round 14, F3).
   MUTATION_PROBES=$((MUTATION_PROBES + 1))
-  MUTATION_PROBE_RECORD="${MUTATION_PROBE_RECORD:+$MUTATION_PROBE_RECORD }${name}"
+  MUTATION_PROBE_RECORD="${MUTATION_PROBE_RECORD:+$MUTATION_PROBE_RECORD }${name}=${mutated}"
   return 0
 }
 
@@ -398,6 +463,7 @@ enforce_substance() {
   local name const want found region_entries expected_record mutation_dir
   local canary_right canary_wrong canary_missing
   local canary_hashed canary_fails canary_ok_hashed canary_ok_fails
+  local line rest copy got mutated_record mutated_fail
   if [ -z "${self:-}" ]; then
     printf 'FAIL  cannot locate %s to check the substance pins\n' "$0" >&2
     return 1
@@ -409,7 +475,20 @@ enforce_substance() {
   # `PINNED_REGION_COUNT` → rc 0, CI green). The trap call is also wrapped in a
   # subshell so any future fatal error becomes a nonzero rc rather than exit 0.
   PIN_FAILS=0
-  found=$(sed -n 's/^# --- substance pin: \([^ ]*\).*/\1/p' "${SELF_REAL:-}" | tr '\n' ' ')
+  # The marker census, in the shell (round 14, F1): the `sed`+`tr` pipeline that
+  # used to build this ran through PATH, so a shadowed `sed` could forge the
+  # region set while a marker was deleted. `read`/`case` are builtins.
+  found=''
+  if [ -n "${SELF_REAL:-}" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case $line in
+        '# --- substance pin: '*)
+          rest=${line#'# --- substance pin: '}
+          found="${found}${rest%% *} "
+          ;;
+      esac
+    done < "$SELF_REAL"
+  fi
   found=${found% }
   # --- the enforcer canary (round 5 F7; loop-driven, round 9 F1/F2; 12) --------
   # The pins only mean something while the code that reads them works, and that
@@ -468,9 +547,9 @@ enforce_substance() {
       "$REGION_HASHED" >&2
     return 1
   fi
-  # The hashing read must follow the path it is given: a `sed` redirected to a
-  # frozen pristine copy would hash that copy and leave every pin inert while the
-  # report stayed honest (round 9, R9-2). A path that cannot exist must hash to
+  # The hashing read must follow the path it is given: a `region_lines` redirected
+  # to a frozen pristine copy would hash that copy and leave every pin inert while
+  # the report stayed honest (round 9, R9-2). A path that cannot exist must hash to
   # the digest of empty input; a redirected read returns the copy's digest.
   REGION_HASHED=0
   region_sha scenario-6 "$CANARY_MISSING_PATH" 2>/dev/null
@@ -499,16 +578,38 @@ enforce_substance() {
     rm -rf "$mutation_dir"
     return 1
   fi
-  rm -rf "$mutation_dir"
-  # The probe's own ledger: both regions must have completed a probe. A `return 0`
-  # body, a probe that skips its assertions or a call that was dropped leaves the
-  # ledger short and reds here — the file pin in ci.yml is the outer defence, not
-  # the only one (round 13, R12-3).
-  if [ "$MUTATION_PROBES" -ne 2 ] || [ "$MUTATION_PROBE_RECORD" != 'scenario-6 scenario-7' ]; then
-    printf 'FAIL  enforcer canary: the content-mutation probe recorded [%s] (%s completed), expected [scenario-6 scenario-7] (2 completed); the probe did not run against both regions\n' \
-      "${MUTATION_PROBE_RECORD:-<none>}" "$MUTATION_PROBES" >&2
+  # The probe's own ledger: both regions must have completed a probe. Round 14
+  # (F3) records each copy's real digest instead of a bare name, and the loop
+  # below re-hashes the copies on disk and re-runs the comparison against each in
+  # both directions — so moving the ledger write to the top of `mutation_probe`
+  # and returning 0 reds here instead of staying green (measured). The file pin
+  # in ci.yml is the outer defence, not the only one (round 13, R12-3).
+  mutated_record=''
+  mutated_fail=0
+  # shellcheck disable=SC2086  # intentional word split: PINNED_REGIONS is a name list
+  for name in ${PINNED_REGIONS:-}; do
+    case $name in
+      scenario-6) const=SCEN6_REGION_SHA; want=${SCEN6_REGION_SHA:-} ;;
+      scenario-7) const=SCEN7_REGION_SHA; want=${SCEN7_REGION_SHA:-} ;;
+      *) continue ;;
+    esac
+    copy=$mutation_dir/mutated-$name.sh
+    # shellcheck disable=SC2086  # $HASH_TOOL is the word-split "<abs path> [-a 256]"
+    got=$(region_lines "$name" "$copy" | $HASH_TOOL)
+    got=${got%% *}
+    mutated_record="${mutated_record:+$mutated_record }${name}=${got}"
+    region_pin_check "$name" "$const" "$got" "$copy" 2>/dev/null || mutated_fail=1
+    if region_pin_check "$name" "$const" "$want" "$copy" 2>/dev/null; then
+      mutated_fail=1
+    fi
+  done
+  if [ "$MUTATION_PROBES" -ne 2 ] || [ "$MUTATION_PROBE_RECORD" != "$mutated_record" ] || [ "$mutated_fail" -ne 0 ]; then
+    printf 'FAIL  enforcer canary: the content-mutation probe recorded [%s] (%s completed) and the copies this caller independently re-hashed imply [%s]; the probe did not run against both pinned regions, its ledger was written without hashing the copies, or the pin comparison did not reject the mutated copies and accept their real digests\n' \
+      "${MUTATION_PROBE_RECORD:-<none>}" "$MUTATION_PROBES" "${mutated_record:-<none>}" >&2
+    rm -rf "$mutation_dir"
     return 1
   fi
+  rm -rf "$mutation_dir"
   # Same functions the real checks below call, driven with a deliberately wrong
   # expectation in each direction; their diagnostics are the point of the
   # exercise, so they are discarded here.
