@@ -8829,11 +8829,11 @@ section; ledger now **24 open / 104 closed**.**
   Ledger after this batch: **24 open / 174 closed** (base `ed2d71a3`: 29 open / 169 closed; this batch
   closes the five legacy-`.ini` residue items).
 - [x] **R1 — With `-c`, a *non-empty* log flag is still honoured on `frps` where Go discards the whole pflag-bound struct.**
-  Residual from the empty-`--log-level` item closed in #427. `frps/src/main.rs:989-991` gates only
-  `override_server_config` on `cli_overrides_enabled()`; `frps/src/main.rs:994` then calls
+  Residual from the empty-`--log-level` item closed in #427. `frps/src/main.rs:989-991` (head `:1019-1021`) gates only
+  `override_server_config` on `cli_overrides_enabled()`; `frps/src/main.rs:994` (head `:1024`) then calls
   `init_logging(&cli, Some(&cfg))` with the **raw** CLI values, so `frps -c frps.toml --log-level info`
   emits 11 `INFO` records where Go's `-c` lane emits 0 (`/tmp/frp-go-src/cmd/frps/root.go:67-83`),
-  contradicting the contract stated at `frp-core/src/cli.rs:3724-3731`. Same for `--log-file`,
+  contradicting the contract stated at `frp-core/src/cli.rs:4792-4797`. Same for `--log-file`,
   `--log-max-days` and `--log-format`. Verified pre-existing (`git show 3f66d823:frps/src/main.rs`
   is identical in this respect).
   **Done-when:** `init_logging` is gated on `cli_overrides_enabled()` too, or the divergence is
@@ -8851,11 +8851,11 @@ section; ledger now **24 open / 104 closed**.**
 - [x] **R2 — The implicit-config lane (`frps --log-level ""` with an in-tree `frps.toml`) has no Go counterpart.**
   Post-#427 it keeps the file's `warn` (0 `INFO`); Go without `-c` never reads a file and emits 1
   `INFO` (`frps uses command line arguments for config`, 186 B). The lane is an frp-rs extension
-  (`FrpsArgs::config_path`, `frp-core/src/cli.rs:3718-3722`).
+  (`FrpsArgs::config_path`, `frp-core/src/cli.rs:4786`).
   **Done-when:** recorded as an extension where the implicit-config behaviour is documented, or made
   argv-identical to Go's flags-only lane.
   **Done (2026-10-01, at code head `4258cabe` on `fix/cli-log-override-r1r6`, PR #446, based on `799ce048`) — recorded as an extension.**
-  The lane is frp-rs-only (`FrpsArgs::config_path`, `frp-core/src/cli.rs:3718-3722`): with an in-tree
+  The lane is frp-rs-only (`FrpsArgs::config_path`, `frp-core/src/cli.rs:4786`): with an in-tree
   `frps.toml` and no `-c` the file is read, where Go with no `-c` reads none and logs
   `frps uses command line arguments for config`. The 186 B this item quoted is the **bind-failure** shape,
   not the healthy one: Go's flags-only lane on a free port emits **3 `[I]` records / 282 B raw stdout /
@@ -8882,7 +8882,7 @@ section; ledger now **24 open / 104 closed**.**
   `` number too large to fit in target type `` against Go's 2 214 B `strconv.ParseInt` message plus the
   `Usage:` block (`frps/tests/cli_exit_codes.rs:2366`; rc assert at `:2417:13`).
 - [x] **R5 — `-l` is not a shorthand on `frps`, so its refusal wording differs from pflag's.**
-  `frp-core/src/cli.rs:1148` `VALUE_TAKING_SHORTS_FRPS_ROOT: [char; 3] = ['c', 'p', 't']`, so
+  `frp-core/src/cli.rs:1171` `VALUE_TAKING_SHORTS_FRPS_ROOT: [char; 3] = ['c', 'p', 't']`, so
   `frps -c cfg -l ""` → rc 1 ``Error: `-l` is not expected in this context`` against Go's rc 1
   `unknown shorthand flag: 'l' in -l`. rc parity; wording differs; untested.
   **Done-when:** pflag's wording is matched or rc-only parity is pinned.
@@ -8894,8 +8894,8 @@ section; ledger now **24 open / 104 closed**.**
   short list for the refusal.
 - [x] **R6 — Two bounds on the "accept-and-ignore matches Go" claim for `--vhost-http-timeout`.**
   (a) `frps --config-dir …` with an empty `--log-level` resolves to `info` (not `debug`, which only
-  the opt-in `debug-logs` feature reaches — `frp-core/src/logging.rs:101-112`) because the config-dir
-  lane calls `init_logging(&cli, None)` (`frps/src/main.rs:470`), i.e. it never reads the loaded
+  the opt-in `debug-logs` feature reaches — `frp-core/src/logging.rs:116-120`) because the config-dir
+  lane calls `init_logging(&cli, None)` (`frps/src/main.rs:500`), i.e. it never reads the loaded
   config's `[log]`; (b) the 24 h cap is frp-rs-only — `VHOST_TIMEOUT_CAP_SECS`
   (`frp-server/src/vhost.rs:654`, applied by `clamp_vhost_timeout` at `:710`) has no Go counterpart,
   so "accept-and-ignore matches Go" is bounded to values `<= 0` or below the cap.
@@ -8904,7 +8904,7 @@ section; ledger now **24 open / 104 closed**.**
   **Done (2026-10-01, at code head `4258cabe` on `fix/cli-log-override-r1r6`, PR #446, based on `799ce048`) — both bounds recorded.**
   (a) On the `--config-dir` lane the CLI log flags apply (`init_logging(&cli, None)`, `frps/src/main.rs:500`),
   so an empty `--log-level` resolves to `info` and never `debug` (that needs the opt-in `debug-logs` feature,
-  `frp-core/src/logging.rs:101-112`) because the lane never reads the loaded config's `[log]`; (b) the 24 h cap
+  `frp-core/src/logging.rs:116-120`) because the lane never reads the loaded config's `[log]`; (b) the 24 h cap
   is frp-rs-only (`VHOST_TIMEOUT_CAP_SECS`, `frp-server/src/vhost.rs:654`, applied by `clamp_vhost_timeout` at
   `:710`, no Go counterpart), so "accept-and-ignore matches Go" is bounded to values `<= 0` or below the cap.
   Both are recorded at the flags (`frp-core/src/cli.rs:701` for (a), `:538` for (b)).
