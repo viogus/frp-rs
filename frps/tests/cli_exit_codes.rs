@@ -1094,6 +1094,17 @@ fn sigterm_inside_the_registration_window(
 /// recorder (no `EarlyShutdown::install()`, or no `early_shutdown.watch(...)`
 /// handoff) and the child dies by signal inside the hold, failing both.
 #[cfg(unix)]
+// The `FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS` pin this drives is
+// `#[cfg(debug_assertions)]` (`frps/src/main.rs:618`), so a release binary
+// ignores it and the child outlives the SIGTERM hold the test needs. `ignore`
+// (not `#[cfg]`) keeps the test compiled and *counted* in release: the
+// `release-tests` lane in `.github/workflows/ci.yml` asserts the exact
+// `41 passed; 0 failed; 3 ignored` summary and the three ignored names, so a
+// skip that goes blanket fails there instead of passing as "0 failed".
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS hook (frps/src/main.rs:618)"
+)]
 #[test]
 fn config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorded_request() {
     let dir = TempDir::new();
@@ -1167,6 +1178,16 @@ fn config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorde
 ///    drained, which is what makes the exit code attributable to the recorder
 ///    rather than to one service happening to finish.
 #[cfg(unix)]
+// Same release skip as the sibling above: this pin additionally drives
+// `FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS`
+// (`#[cfg(all(unix, debug_assertions))]`, `frps/src/main.rs:696`), so in a
+// release binary the fan-out service never reaches its hold and the run has
+// nothing to observe. The `release-tests` lane's expected ignored-name set is
+// what keeps this skip from spreading to tests that *can* run in release.
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS / FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS hooks (frps/src/main.rs:618,696)"
+)]
 #[test]
 fn config_dir_recorded_signal_fans_out_to_an_already_registered_service() {
     let dir = TempDir::new();
@@ -1564,6 +1585,15 @@ fn config_dir_refuses_an_empty_directory_with_2() {
 /// task shape the guard must count. The fixture needs no free port beyond the
 /// config itself: the task panics before `Service::run`, so no listener starts;
 /// the point is that the lane cannot report success with nothing served.
+// The `FRPS_CFGDIR_TEST_PANIC` pin this drives is `#[cfg(debug_assertions)]`
+// (`frps/src/main.rs:739`), so in a release binary the task panics at the
+// ordinary startup path (or not at all) and the exit code this test asserts is
+// not the code under test. The `release-tests` lane checks the ignored-name
+// set, so this test cannot silently drop out of the debug lane either.
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_PANIC hook (frps/src/main.rs:739)"
+)]
 #[test]
 fn config_dir_where_every_task_panics_exits_nonzero() {
     let port = ephemeral_port();
