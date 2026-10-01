@@ -1043,19 +1043,19 @@ jobs:
         # the quic-only frp-core shape had not even been compiled). A pin that
         # reads a feature it never varies is exactly the class this closes.
         #
-        # Measured 2026-10-01, macOS arm64: 19 passed / 0 failed in each mixed
+        # Measured 2026-10-01, macOS arm64: 21 passed / 0 failed in each mixed
         # shape; 38.44 s for the first (cold, kcp-only) and 0.03 s of test time
         # per shape. `--lib` plus the `help_doc_tests` filter keeps the step to
         # the pins; the runner's cost on Linux is not measured. Round 2 raised the
-        # filter's own count to 20 by adding
-        # `every_proxy_surface_renders_exactly_the_go_rows_that_surface_implements`
-        # and `every_proxy_surface_accepts_go_bool_names_and_their_frp_rs_aliases`.
+        # filter's own count from 19 to 20 with
+        # `every_proxy_surface_renders_exactly_the_go_rows_that_surface_implements`,
+        # and round 3 raised it from 20 to 21 with the unrendered-row witness.
         #
         # Count guard (round 2): the filter used to be a bare name, so renaming
         # `help_doc_tests` (or its module) ran zero tests and the step stayed
         # green — libtest exits 0 on an empty filter match (measured: `1053
         # filtered out`, rc 0). Each shape now takes the filter's own `-- --list`
-        # count, requires it to equal 20, and requires the run's own
+        # count, requires it to equal 21, and requires the run's own
         # `test result:` count to equal it, so a renamed filter reds here instead
         # of passing vacuously.
         shell: bash
@@ -1079,14 +1079,14 @@ jobs:
             status=0
             [ -n "$n_run" ] || status=1
             [ "$n_run" = "$n" ] || status=1
-            [ "$n" = "20" ] || status=1
+            [ "$n" = "21" ] || status=1
             if [ "$status" != "0" ]; then
               echo "::error::frp-core help_doc_tests guard failed for --features $features (list=$n, run=$n_run, log=$log)"
-              if [ -n "$n" ] && [ "$n" != "20" ]; then
-                if [ "$n" -lt "20" ]; then
-                  echo "::error::the help_doc_tests filter lists $n tests under --features $features, this step expects 20 — tests were deleted, renamed, or cfg'd out; restore them rather than lowering this literal. If the *filter name* is what changed, re-point the filter (and this literal) instead."
+              if [ -n "$n" ] && [ "$n" != "21" ]; then
+                if [ "$n" -lt "21" ]; then
+                  echo "::error::the help_doc_tests filter lists $n tests under --features $features, this step expects 21 — tests were deleted, renamed, or cfg'd out; restore them rather than lowering this literal. If the *filter name* is what changed, re-point the filter (and this literal) instead."
                 else
-                  echo "::error::the help_doc_tests filter lists $n tests under --features $features, this step expects 20: move the literal in this shell step from 20 to $n"
+                  echo "::error::the help_doc_tests filter lists $n tests under --features $features, this step expects 21: move the literal in this shell step from 21 to $n"
                 fi
               fi
               if [ -n "$n_run" ] && [ "$n_run" != "$n" ]; then

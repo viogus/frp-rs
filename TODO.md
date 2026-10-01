@@ -300,7 +300,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   the old spelling as an alias), not a rendering change. **Done-when:** every proxy flag Go accepts is
   accepted here under Go's spelling, pinned by an argv probe per surface, and the rendered document
   shows Go's name.
-  **Done** (at fix `858212c8` with the round-2 pins `be88049a`, on `fix/cli-flag-parity`, based on `799ce048`).
+  **Done** (at fix `1a31ee31` with the round-2 pins `962d94c9`, on `fix/cli-flag-parity`, based on `084f7865`).
   Go's spelling is now each flag's *primary* long: `-d`/`--custom-domain` and `--sd` on http/https/tcpmux,
   `--sk` on stcp/xtcp/sudp, `--mux` on tcpmux (frp-rs's `--mux-port` is **not** a Go name — Go v0.71.0 answers
   `unknown flag: --mux-port` — so it stays that row's alias, port optional, defaulting to 0 with `httpconnect`),
@@ -322,7 +322,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   implemented them, so `frpc tcp` renders only `-t` (`--token`) and every shorthand above is rejected.
   Filed with the same round's residue (`TODO.md:253`). **Done-when:** each shorthand parses to its Go
   flag, pinned by an argv probe, and the rendered row matches Go's.
-  **Done** (at fix `858212c8` with the round-2 pins `049adaf2`, on `fix/cli-flag-parity`, based on `799ce048`).
+  **Done** (at fix `1a31ee31` with the round-2 pins `018522e6`, on `fix/cli-flag-parity`, based on `084f7865`).
   Every shorthand Go registers on a surface now parses: `-i`/`--local-ip`, `-l`/`--local-port`,
   `-s`/`--server-addr`, `-P`/`--server-port`, `-t`/`--token` and `-n`/`--proxy-name` on the eight proxies,
   and `-r`/`--remote-port` on tcp/udp only (Go's set per surface), pinned per surface by
@@ -357,8 +357,8 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
      `:10493`), so a sixteenth surface in one list survives.
   **Done-when:** each of the six is either fixed or shown to be unreachable, with the mutant that
   demonstrated it now red.
-  **Done** (at `fe8a1366` for the pins, the CI lane `df31e14f`, hardened by the round-2 count guard `44245f9b`,
-  on `fix/cli-flag-parity`, based on `799ce048`).
+  **Done** (at `6d840100` for the pins, the CI lane `025b0ec3`, hardened by the round-2 count guard `deff30eb`,
+  on `fix/cli-flag-parity`, based on `084f7865`).
   (1) every extension-table row must be rendered by a surface that consults it
   (`help_doc_tests::every_extension_table_row_is_rendered_by_a_surface_that_consults_it`,
   `frp-core/src/cli.rs:10865`), and the never-rendered Go rows are pinned as an explicit set
@@ -368,8 +368,8 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `row_long_flag_requires_a_row_indent_a_leading_dash_and_a_grid_gap`, `:10291`); (3)
   `.github/workflows/ci.yml:626` now runs the pins in the two mixed feature shapes as well as both-on/both-off,
   and its count guard (`:676`) requires the run's own `test result:` count to equal the `--list` count **and**
-  both to equal 20, with red proven for both rename shapes (filter renamed in `--list` only →
-  `list=0, run=20`, rc 1; renamed in both → `running 0 tests`, cargo rc 0, guard rc 1); (4) the vacuous
+  both to equal 21, with red proven for both rename shapes (filter renamed in `--list` only →
+  `list=0, run=21`, rc 1; renamed in both → `running 0 tests`, cargo rc 0, guard rc 1); (4) the vacuous
   `feature_adjusted_pin` identity assertion is replaced by
   `feature_adjusted_pin_strips_exactly_the_rows_this_build_cannot_render` (`frp-core/src/cli.rs:10460`); (5)
   `strip_pinned_row`'s count is pinned as a panic in both directions (`:10359`, `:10368`); (6) both `zip` loops call
