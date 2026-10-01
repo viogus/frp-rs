@@ -281,6 +281,23 @@ def rs_texts(root, top_only=False, within=None, seen=None):
     `ln -s ../../frp-server/src/lib.rs frp-core/src/zz_xcrate.rs` added 24
     files/lines to the frp-core row while staying in frp-server's own count).
 
+    Containment itself is a *textual* prefix test on `os.path.realpath`, so it is
+    case-sensitive even on a case-insensitive volume (macOS, where this gate is
+    developed): `realpath` preserves the caller's spelling of every component, so
+    a file reached through a case-variant directory component is not
+    `startswith(within_real + os.sep)` even though `os.stat` reports the same
+    inode as the `within` spelling. Measured on this host: the resolved path of
+    an alias under a directory spelled `Crate` came back under `CRATE` — the
+    spelling it was given — and the prefix test was false while the two spellings
+    shared `st_ino`. Every caller here spells the crate identically for the walked
+    root and for `within`, so the only visible effect is that a case-variant alias
+    whose real name the walk also yields is dropped instead of deduped, and no
+    measured row changes. A *future* caller that spells `within` differently from
+    the walked root would silently drop every file in the scope. Unreachable on a
+    case-sensitive filesystem (the Linux CI runners); recorded next to the check
+    rather than pinned, because no fixture can force a case-insensitive volume in
+    CI.
+
     Callers that measure two scopes (`<crate>/src` and the whole crate dir)
     call this once per scope, so the dedupe never crosses a scope boundary; each
     passes `within=<crate root>` so one crate's row cannot absorb another's file.
@@ -606,6 +623,8 @@ for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
     # Dedupe on the inode (a symlink and a hard link to one source share it;
     # `realpath` misses the hard link) and keep this crate's row to files whose
     # realpath is inside the crate, so a cross-crate symlink is not counted here.
+    # Textual, case-sensitive prefix test -- see `rs_texts` for the note on
+    # case-insensitive volumes.
     within_real = os.path.realpath(crate)
     for root, _d, files in os.walk(src, onerror=walk_error):
         for fn in files:
@@ -745,6 +764,8 @@ for crate in ('frp-core', 'frp-server', 'frp-client', 'frp-vnet'):
         continue
     # Inode dedupe + own-crate scope, as in the unsafe-count walks above, with
     # `seen` shared across the crate loop (the first crate claims a hard link).
+    # Textual, case-sensitive prefix test -- see `rs_texts` for the note on
+    # case-insensitive volumes.
     within_real = os.path.realpath(crate)
     for root, _dirs, files in os.walk(src, onerror=walk_error):
         for fn in files:
@@ -2306,6 +2327,8 @@ def unsafe_counts(crate, seen=None):
     # crate's own scope, so a cross-crate symlink is another crate's file. The
     # caller passes one `seen` for both crates, so a cross-crate hard link is
     # claimed by the first crate (see `rs_texts` for the convention).
+    # Textual, case-sensitive prefix test -- see `rs_texts` for the note on
+    # case-insensitive volumes.
     within_real = os.path.realpath(crate)
     for root, _d, files in os.walk(src, onerror=walk_error):
         for fn in files:

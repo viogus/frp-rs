@@ -261,25 +261,19 @@ PY
 # tree: measured with `chmod 000 scripts/repo-health.sh`, both `newline … no forged
 # hit from the split path` checks and `clean archive scan: no archive exit-3 row`
 # went vacuous-green while the run was still rc 1 for unrelated reasons.
-# Scenario 9 pins this failure.
+# Scenario 9 pins this failure, and `setup_die` is the only stop: the helpers
+# return non-zero exactly when they printed no root, so a successful call always
+# sets a non-empty `TREE`. A second `[ -z "$TREE" ]` guard used to stand here; it
+# was reachable only under scenario 9's mutant (`setup_die`'s `exit 1` changed to
+# `return 0`), where it fired as an extra `fixture abort:` row that scenario 9
+# reads as a row running past the setup FAIL. Pinning it with a scenario was
+# rejected: forcing an empty root drives every other scenario, and re-enters this
+# harness's own self-copy, against the filesystem root.
 tree() {
   if [ -n "${2:-}" ]; then
     TREE=$(new_full_tree "$1") || setup_die "new_full_tree $1"
   else
     TREE=$(new_tree "$1") || setup_die "new_tree $1"
-  fi
-  # Second, independent stop: even if `setup_die` itself is mutated to return
-  # instead of exiting (scenario 9's mutant), an empty `TREE` must never reach a
-  # scenario. `"$TREE/frp-core/src"` is `/frp-core/src`; measured with that mutant
-  # the run reached `mkdir /.github` and `ln /docs/archive/bad.md` before this
-  # guard existed.
-  if [ -z "$TREE" ]; then
-    # `fixture abort:` rather than `fixture setup:`: scenario 9 skips exactly one
-    # `fixture setup:` row (the one `setup_die` printed) and then requires that
-    # nothing follows, so a second setup row would be indistinguishable from the
-    # vacuous `ok` rows this guard exists to prevent.
-    bad "fixture abort: tree $1 produced no root — refusing to run the scenario against /"
-    exit 1
   fi
 }
 
