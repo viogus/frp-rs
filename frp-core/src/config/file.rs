@@ -653,15 +653,17 @@ fn drop_ini_scalar_include_keys(table: &mut toml::Table) {
 // the entry's own type is not a directory; reading it then blocks forever,
 // exactly as Go's `os.ReadFile` does. Measured with `mkfifo fifo.ini` and
 // `[common] includes = "fifo.ini"` (and `"f*.ini"`): GO v0.71.0, r7 and r8 all
-// still have no exit after 4 s, whereas r6, MID and BASE returned rc 0 on the
-// `./c.ini` and absolute forms (r6 and BASE skipped the entry as a non-regular
-// file; MID additionally returns rc 1 on the bare `c.ini` form, but that is
-// MID's bare-name path resolution, not the pipe — with `-c c.ini` MID is rc 1
-// with no matching entry at all, with a regular `fifo.ini`, and with a FIFO
-// alike). Blocking is Go's behaviour, so this is not a divergence — but it is
-// an unlisted behaviour change of the round-7 fix, and it means the loader has
-// no termination bound on a tree that contains such a name; a caller that needs
-// one must impose its own timeout.
+// still have no exit after 4 s. r6 and MID returned rc 0 on the `./c.ini` and
+// absolute forms, and BASE returned rc 0 on every form. r6 skips the FIFO as a
+// non-regular file — with a *regular* `fifo.ini` it is rc 1 — whereas BASE does
+// not honour the legacy `[common] includes` key at all and is rc 0 even when the
+// included entry is an ordinary readable file. MID additionally returns rc 1 on
+// the bare `c.ini` form, but that is MID's bare-name path resolution, not the
+// pipe — with `-c c.ini` MID is rc 1 with no matching entry at all, with a
+// regular `fifo.ini`, and with a FIFO alike. Blocking is Go's behaviour, so this
+// is not a divergence — but it is an unlisted behaviour change of the round-7
+// fix, and it means the loader has no termination bound on a tree that contains
+// such a name; a caller that needs one must impose its own timeout.
 
 /// Go's `filepath.Dir` (`internal/filepathlite/path.go`, `Dir`): scan back to
 /// the last path separator and `Clean` everything up to **and including** it; a

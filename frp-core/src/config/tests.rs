@@ -3752,7 +3752,7 @@ fn test_collect_config_files_admits_a_non_regular_entry_by_extension() {
     // like a file. The tree's only non-regular filter is on the `[include]`
     // `glob_in_dir` path, and it skips *directories* by the directory entry's
     // own type — `if entry.file_type()?.is_dir()`
-    // (`frp-core/src/config/file.rs:877`) — never by `is_file()`, so it admits
+    // (`frp-core/src/config/file.rs:879`) — never by `is_file()`, so it admits
     // a FIFO just as this collector does. `collect_config_files_inner` has no
     // filter at all.
     //
@@ -12455,7 +12455,7 @@ fn legacy_ini_common_include_missing_dir_refuses_like_go() {
 /// (`[p1] role = "visitor"`) beside the config, Go v0.71.0 is rc 1 in both
 /// loader modes (`failed to parse visitor p1, err: type shouldn't be empty`).
 /// frp-rs's [`process_includes`] uses the same single-`*`-per-component glob
-/// (`glob_in_dir`, `frp-core/src/config/file.rs:853`), so the matched file must
+/// (`glob_in_dir`, `frp-core/src/config/file.rs:855`), so the matched file must
 /// be merged and refused the same way.
 #[test]
 fn legacy_ini_common_include_glob_is_expanded_like_go() {
@@ -12484,9 +12484,9 @@ fn legacy_ini_common_include_glob_is_expanded_like_go() {
 /// Go builds the match pattern as `filepath.Join(absDir, filepath.Base(path))`
 /// and tests it with `filepath.Match` (`pkg/config/legacy/parse.go:87`), so
 /// everything after the `*` is a literal suffix that must still match. A test
-/// that only kept `name.starts_with(prefix)` (`frp-core/src/config/file.rs:902`)
+/// that only kept `name.starts_with(prefix)` (`frp-core/src/config/file.rs:904`)
 /// survived the whole suite because the extension pre-filter
-/// (`frp-core/src/config/file.rs:892-900`) already rejects the obvious cases
+/// (`frp-core/src/config/file.rs:894-902`) already rejects the obvious cases
 /// (e.g. `z*.ini` against `zebra.txt`, where the extensions differ). This pin
 /// uses `z*ini`: the star is followed by no `.`, so `Path::extension()` is
 /// `None` and the pre-filter is skipped — only the suffix test can reject
@@ -13263,7 +13263,7 @@ fn legacy_ini_start_comes_from_the_common_section_only() {
 /// `frp-core/src/config/format.rs:389` is therefore gated on `legacy_ini`
 /// (`frp-core/src/config/format.rs:223`); the legacy `[common]` case keeps the
 /// section (`legacy_ini_scalar_and_section_collision_keeps_the_section_like_go`,
-/// `frp-core/src/config/tests.rs:11824`).
+/// `frp-core/src/config/tests.rs:11959`).
 #[test]
 fn v1_ini_scalar_section_collision_is_still_a_type_error() {
     for (body, expected) in [
@@ -13679,7 +13679,7 @@ fn legacy_ini_empty_start_dispatches_every_section_like_go() {
 /// and that `[p2]` is rc 0 with proxy `p1`. Non-strict frp-rs matches; the strict
 /// checker still reports the leftover table (`unknown field "p2"`), the
 /// pre-existing residue of a non-candidate section documented at
-/// `frp-core/src/config/tests.rs:11907`. Without the `ini_section_started`
+/// `frp-core/src/config/tests.rs:12154`. Without the `ini_section_started`
 /// guard the role scan at `frp-core/src/config/normalize.rs:2187` refuses the
 /// file (rc 1, `proxy p2 role should be 'server' or 'visitor'`).
 #[test]
@@ -13829,7 +13829,7 @@ fn default_section_header_is_an_ordinary_section_both_modes() {
 /// and loads zero proxies. The strict rc agrees; only the message and the
 /// non-strict verdict diverge, and matching Go's non-strict message would mean
 /// addressing the array element as `proxies[0]`, which the `.ini` reader does not
-/// do (pinned as out of scope at `frp-core/src/config/tests.rs:12117`). Both
+/// do (pinned as out of scope at `frp-core/src/config/tests.rs:12196`). Both
 /// modes pinned.
 #[test]
 fn r_toml_hybrid_ini_is_a_v1_shape_both_modes() {
