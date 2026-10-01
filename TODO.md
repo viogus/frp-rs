@@ -8613,7 +8613,7 @@ section; ledger now **24 open / 104 closed**.**
   `MIN_CHECKS=40` (`:223`) and the CI step keeps both its count literal (`.github/workflows/ci.yml:524`) and the
   FAIL-line arm (`:532`, diagnostic `:537`). The two accepted bounds the item recorded (the fixed `/tmp` log path,
   the SIGKILL orphan) are unchanged.
-  Ledger after this close: **14 open / 188 closed** (base `e4c23b2f`: 16 open / 185 closed; this branch closes
+  Ledger after this close: **13 open / 189 closed** (base `366bbcaa`: 15 open / 186 closed; this branch closes
   three items and files one residue item, below).
 
 - [x] **A non-regular file named `*.{toml,ini,json,yaml,yml}` inside a `--config-dir` hangs the lane forever.**
