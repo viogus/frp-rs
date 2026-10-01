@@ -6641,6 +6641,11 @@ mod tests {
     /// names are frp-rs extensions, accepted so existing command lines keep
     /// working. This test is what holds the alias half of that decision: a later
     /// edit that dropped an alias would otherwise leave the whole suite green.
+    ///
+    /// Both frp-rs spellings are parsed **per surface** here, hyphen included:
+    /// `GO_BOOL_SITES` carries only the underscore form on `frpc tcp`, so leaving
+    /// `--use-compression` to that table would let any surface drop the hyphen
+    /// alias with the whole suite still green.
     #[test]
     fn every_proxy_surface_accepts_go_bool_names_and_their_frp_rs_aliases() {
         const SURFACES: [(&str, &[&str]); 8] = [
@@ -6681,6 +6686,8 @@ mod tests {
                 ("--use-encryption", true),
                 ("--use_encryption", true),
                 ("--uc", false),
+                ("--use-compression", false),
+                ("--use_compression", false),
             ] {
                 let mut argv = base.clone();
                 argv.push(flag);
@@ -10302,6 +10309,17 @@ Global Flags:
         );
         assert_eq!(row_long_flag("--config string    config file\n"), None);
         assert_eq!(row_long_flag("  Usage:\n  frpc tcpmux [flags]\n"), None);
+        // The shape the leading-`-` guard rejects *by itself*: a line at a
+        // row-like indent with a two-space grid gap whose head still carries a
+        // `--…` token. The `Usage:` rows above do not red when the guard is
+        // deleted (their head ends before any flag), and neither does the footer
+        // below (column zero already fails the indent guard), so this probe is
+        // what pins the guard.
+        assert_eq!(
+            row_long_flag("  Use \"frps --help\"  for more information about a command.\n"),
+            None,
+            "prose at a row-like indent that mentions a --flag is not a row"
+        );
         assert_eq!(row_long_flag("  -c, --config=config file\n"), None);
         // cobra's footer, verbatim from FRPS_DOC/FRPC_DOC: it mentions `--help`
         // but is not a row, and `strip_pinned_row(doc, "--help")` must not take it.
@@ -10904,12 +10922,13 @@ Global Flags:
     /// complement is pinned separately by
     /// [`every_proxy_surface_renders_exactly_the_go_rows_that_surface_implements`].
     ///
-    /// RESIDUE: their `short` and `usage` cells are hand-transcribed Go help text
-    /// that no test renders (`SURFACES` carries only Go's *byte count*, not its
-    /// text), so re-wording such a row still leaves every test green. That is the
-    /// limit of the available evidence — the Go binary is an oracle the build does
-    /// not depend on. Every *rendered* row's text, by contrast, is pinned byte for
-    /// byte by the `FRPC_*_DOC` whole-text constants.
+    /// RESIDUE: these rows render nothing, so their `long`s are pinned here and
+    /// their `short`/`varname`/`usage` cells by [`GO_ONLY_PROXY_ROW_TEXT`].
+    /// Without that table they were the "inert pin data" class: `SURFACES`
+    /// carries only Go's *byte count*, not its text, so re-wording a row's
+    /// hand-transcribed help left every test green. Every *rendered* row's text,
+    /// by contrast, is pinned byte for byte by the `FRPC_*_DOC` whole-text
+    /// constants.
     const GO_ONLY_PROXY_ROWS: [&str; 14] = [
         "allow-users",
         "annotations",
@@ -10925,6 +10944,88 @@ Global Flags:
         "protocol",
         "tls-enable",
         "user",
+    ];
+
+    /// The byte-exact witness for the [`FRPC_PROXY_GO_FLAGS`] rows frp-rs never
+    /// renders ([`GO_ONLY_PROXY_ROWS`]) — `(long, short, varname, usage)`, in the
+    /// table's own pflag byte order.
+    ///
+    /// These cells are hand-transcribed Go v0.71.0 help text that no other
+    /// assertion reads, so this table is their only witness: it freezes the
+    /// transcription, making a change deliberate and reviewable against the Go
+    /// binary instead of a silent drift. It is *not* a parity oracle — the Go
+    /// binary stays out of the build — so a wrong transcription is preserved
+    /// here until it is re-measured.
+    const GO_ONLY_PROXY_ROW_TEXT: [(&str, Option<char>, Option<&str>, &str); 14] = [
+        ("allow-users", None, Some("strings"), "allow visitor users"),
+        (
+            "annotations",
+            None,
+            Some("stringToString"),
+            "annotation key-value pairs (e.g., key1=value1,key2=value2) (default [])",
+        ),
+        (
+            "bandwidth-limit",
+            None,
+            Some("string"),
+            "bandwidth limit (e.g. 100KB or 1MB)",
+        ),
+        (
+            "bandwidth-limit-mode",
+            None,
+            Some("string"),
+            "bandwidth limit mode (default \"client\")",
+        ),
+        (
+            "client-id",
+            None,
+            Some("string"),
+            "unique identifier for this frpc instance",
+        ),
+        (
+            "disable-log-color",
+            None,
+            None,
+            "disable log color in console",
+        ),
+        (
+            "dns-server",
+            None,
+            Some("string"),
+            "specify dns server instead of using system default one",
+        ),
+        (
+            "log-file",
+            None,
+            Some("string"),
+            "console or file path (default \"console\")",
+        ),
+        (
+            "log-level",
+            None,
+            Some("string"),
+            "log level (default \"info\")",
+        ),
+        (
+            "log-max-days",
+            None,
+            Some("int"),
+            "log file reversed days (default 3)",
+        ),
+        (
+            "metadatas",
+            None,
+            Some("stringToString"),
+            "metadata key-value pairs (e.g., key1=value1,key2=value2) (default [])",
+        ),
+        (
+            "protocol",
+            Some('p'),
+            Some("string"),
+            "optional values are [tcp kcp quic websocket wss] (default \"tcp\")",
+        ),
+        ("tls-enable", None, None, "enable frpc tls (default true)"),
+        ("user", Some('u'), Some("string"), "user"),
     ];
 
     #[test]
@@ -10951,6 +11052,22 @@ Global Flags:
             "the set of Go proxy rows frp-rs never renders changed: a row that became \
              implemented must be dropped from `GO_ONLY_PROXY_ROWS` (and its doc pins \
              regenerated), and a newly recorded Go row must appear in both"
+        );
+    }
+
+    #[test]
+    fn the_go_only_proxy_rows_carry_their_recorded_help_text() {
+        let actual: Vec<(&str, Option<char>, Option<&str>, &str)> = FRPC_PROXY_GO_FLAGS
+            .iter()
+            .filter(|row| GO_ONLY_PROXY_ROWS.contains(&row.long))
+            .map(|row| (row.long, row.short, row.varname, row.usage))
+            .collect();
+        assert_eq!(
+            actual,
+            GO_ONLY_PROXY_ROW_TEXT.to_vec(),
+            "an unrendered Go proxy row's recorded help text changed: these cells are \
+             never rendered, so `GO_ONLY_PROXY_ROW_TEXT` is their only witness — \
+             re-transcribe the row from Go v0.71.0 instead of editing the witness"
         );
     }
 
