@@ -445,6 +445,13 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **The `frps` TLS-enable warning capture now pins the record instead of counting it.** `frps/tests/warn_delivery.rs`
+  asserted only `occurrences(&out, SERVER_KEY)`, so an emit site that appended a clause
+  (`frp-core/src/config/loader.rs:680`) red the `frp-core` captures while `cargo test -p frps --test warn_delivery`
+  stayed 17 passed / 0 failed. The file now carries a local port of the `frp-core` byte pin and the same mutant
+  gives `13 passed; 4 failed` at `frps/tests/warn_delivery.rs:633:5`. The dashboard `KEY` captures and two
+  weaknesses in the ported helper (a `contains("WARN")` level check and `.lines()` blinding the port to
+  following-line bytes) are filed as one residue row rather than silently inherited.
 - **`frps --config-dir` no longer loses a `SIGTERM` that arrives while the first service is still starting.** The signal was installed per service, so one landing before that install killed the process by the signal (`ExitStatus::code() == None`; shell `rc 143`, `Terminated: 15`) — exactly when a directory of slow or wedged files most needs to be stoppable. The main task now owns the handler: it records an early `SIGTERM`/`SIGINT` and hands the request to every service as it registers, and a repeat signal with nothing registered forces exit `143` so a lane wedged on a FIFO can still be stopped.
 - **A `--config-dir` entry that is not a regular file is still admitted, now deliberately.** A FIFO named `*.toml` hangs the file read forever; Go's `frpc` hangs identically and Go's `frps` has no `--config-dir` at all, so the parity-bound behaviour is pinned by tests instead of "fixed" into a divergence.
 - **Two test-precision residues pin what their names claim, and one snapshot wait is no longer a

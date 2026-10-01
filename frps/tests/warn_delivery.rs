@@ -547,6 +547,151 @@ fn assert_one_warning_on_stdout_for(tag: &str, spawned: &Spawned, key: &str) {
     );
 }
 
+// ── Byte pinning for the flat server `tls_enable` record ─────────────────────
+//
+// The `frp-core` captures pin their emitted record byte-for-byte
+// (`assert_record_is_exactly_the_message`, `frp-core/tests/common/mod.rs`), but
+// this file's `SERVER_KEY` captures only **counted** it. Appending a clause at
+// the emit site (`frp-core/src/config/loader.rs`,
+// `tracing::warn!("{} but honestly", SERVER_TLS_ENABLE_INERT_WARNING.as_str())`)
+// therefore left `cargo test -p frps --test warn_delivery` green while the
+// `frp-core` lane reddened — the server-visible line could drift unnoticed.
+//
+// The helpers below are a **local port** of that pin. The shared helper cannot
+// be `use`d from here: an integration test reaches another crate's public
+// library surface, not its `tests/` tree, and nothing outside both crates can
+// hold the single copy without adding a dependency (banned by the repo's
+// dependency policy). Keep this copy in step with
+// `frp-core/tests/common/mod.rs`; the only difference is how the record is
+// obtained — one **line of the spawned binary's stdout**, which also carries a
+// timestamp, rather than a single-record in-process capture.
+
+/// The `tracing` target of the server `tls_enable` emit site
+/// (`frp-core/src/config/loader.rs`, `warn_inert_server_tls_enable`) — the
+/// module path `tracing::warn!` records there. Identical for this binary's
+/// console sink and for `frp-core`'s own captures.
+const WARNING_TARGET: &str = "frp_core::config::loader";
+
+/// Drop well-formed ANSI SGR sequences (`ESC [ <digits and ';'> m`) from a
+/// captured record, copying every other byte through unchanged. Port of the
+/// helper of the same name in `frp-core/tests/common/mod.rs`; needed here
+/// because `frps` turns colour **on** by default (`--disable-log-color` is what
+/// turns it off, `frp-core/src/logging.rs::resolve_ansi`), so the console
+/// sink's level and target carry SGR even when stdout is a pipe.
+fn strip_sgr(record: &str) -> String {
+    let bytes = record.as_bytes();
+    let mut out = String::with_capacity(record.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
+            let mut j = i + 2;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            if bytes.get(j) == Some(&b'm') {
+                i = j + 1;
+                continue;
+            }
+        }
+        let ch = record[i..]
+            .chars()
+            .next()
+            .expect("i stays on a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// The emitted record must be the one-line `tracing` prefix followed by `want`
+/// and **nothing else** but an optional trailing newline. Port of
+/// `assert_record_is_exactly_the_message` (`frp-core/tests/common/mod.rs`), with
+/// the same three rejections:
+///
+/// * the message appears zero or twice, or is a different message;
+/// * bytes appended after the message — the `"{} but honestly"` mutant this
+///   file was missing;
+/// * a literal injected between the target and the message.
+///
+/// Unlike the `frp-core` captures, the record here carries a timestamp before
+/// the level, so only the one-line shape of the level is required, exactly as
+/// the shared helper does.
+fn assert_record_is_exactly_the_message(tag: &str, record: &str, want: &str, target: &str) {
+    let clean = strip_sgr(record);
+    assert!(
+        clean.contains(want),
+        "{tag}: the record must carry the message; got raw record: {record:?}"
+    );
+    assert_eq!(
+        clean.match_indices(want).count(),
+        1,
+        "{tag}: the message must appear exactly once in the record; got raw record: {record:?}"
+    );
+    let at = clean.find(want).expect("checked just above");
+    let prefix = &clean[..at];
+    let tail = &clean[at + want.len()..];
+    assert!(
+        tail.is_empty() || tail == "\n",
+        "{tag}: the emit site appended bytes after the message (only a trailing newline is \
+         allowed); got tail: {tail:?} from raw record: {record:?}"
+    );
+    let anchor = format!(" {target}: ");
+    assert_eq!(
+        prefix.matches(&anchor).count(),
+        1,
+        "{tag}: the tracing prefix must carry the target `{target}: ` exactly once (SGR stripped); \
+         got prefix: {prefix:?} from raw record: {record:?}"
+    );
+    assert!(
+        prefix.ends_with(&anchor),
+        "{tag}: the emit site inserted bytes between the tracing prefix and the message; the \
+         prefix must end with {anchor:?} (SGR stripped), got prefix: {prefix:?} from raw record: \
+         {record:?}"
+    );
+    let level = &prefix[..prefix.len() - anchor.len()];
+    assert!(
+        level.contains("WARN") && !level.contains('\n'),
+        "{tag}: only the one-line tracing level may precede the target; got level: {level:?} \
+         from raw record: {record:?}"
+    );
+}
+
+/// Byte-pin every stdout line carrying the server `tls_enable` message: there
+/// must be exactly `expected` of them, and each must be the message with the
+/// one-line `tracing` prefix and no other bytes.
+///
+/// `expected` mirrors the caller's occurrence count, so this **can stand in
+/// for** the count-only assertion rather than being a second, independently
+/// driftable check: the wrapper below uses it that way, and the reload test
+/// asserts the same count through both so the "one per load" intent stays
+/// explicit.
+fn assert_server_tls_enable_records_are_exactly_the_message(tag: &str, out: &str, expected: usize) {
+    let want = frp_core::config::SERVER_TLS_ENABLE_INERT_WARNING.as_str();
+    let clean = strip_sgr(out);
+    let records: Vec<&str> = clean.lines().filter(|line| line.contains(want)).collect();
+    assert_eq!(
+        records.len(),
+        expected,
+        "{tag}: expected {expected} server `tls_enable` record(s) on stdout, found {}\n--- stdout ---\n{out}",
+        records.len()
+    );
+    for (i, record) in records.iter().enumerate() {
+        assert_record_is_exactly_the_message(
+            &format!("{tag} (record {} of {expected})", i + 1),
+            record,
+            want,
+            WARNING_TARGET,
+        );
+    }
+}
+
+/// [`assert_one_warning_on_stdout_for`] for the flat server `tls_enable`
+/// diagnostic: exactly one record, and its bytes are pinned to the message.
+fn assert_one_server_tls_enable_warning(tag: &str, spawned: &Spawned) {
+    assert_one_warning_on_stdout_for(tag, spawned, SERVER_KEY);
+    assert_server_tls_enable_records_are_exactly_the_message(tag, &spawned.stdout(), 1);
+}
+
 /// The shared "no record at all" assertion, with the startup line still there so
 /// the silence is a decision and not a failed run.
 fn assert_no_warning(tag: &str, spawned: &Spawned) {
@@ -1027,7 +1172,7 @@ fn server_tls_enable_warning_reaches_a_dash_c_user() {
     let cfg = frps_config_server_tls(port, ServerTls::WrittenTrue);
     let path = dir.write("frps.toml", &cfg);
     let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
-    assert_one_warning_on_stdout_for("frps -c (tls_enable = true)", &spawned, SERVER_KEY);
+    assert_one_server_tls_enable_warning("frps -c (tls_enable = true)", &spawned);
     assert_eq!(
         occurrences(&spawned.stdout(), KEY),
         0,
@@ -1045,17 +1190,13 @@ fn server_tls_enable_warning_reaches_a_config_dir_user_with_the_common_spelling(
     std::fs::create_dir_all(&sub).expect("create config dir");
     std::fs::write(sub.join("frps.toml"), &cfg).expect("write config");
     let spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
-    assert_one_warning_on_stdout_for(
-        "frps --config-dir ([common] tls_enable)",
-        &spawned,
-        SERVER_KEY,
-    );
+    assert_one_server_tls_enable_warning("frps --config-dir ([common] tls_enable)", &spawned);
 
     let dir = TempDir::new("srv-dashc-common");
     let cfg = frps_config_server_tls(free_port(), ServerTls::CommonWritten);
     let path = dir.write("frps.toml", &cfg);
     let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
-    assert_one_warning_on_stdout_for("frps -c ([common] tls_enable)", &spawned, SERVER_KEY);
+    assert_one_server_tls_enable_warning("frps -c ([common] tls_enable)", &spawned);
 }
 
 /// `tls_enable = false` is just as inert as `true`, and just as likely to be
@@ -1066,7 +1207,7 @@ fn server_tls_enable_warning_reaches_a_dash_c_user_for_a_written_false() {
     let cfg = frps_config_server_tls(free_port(), ServerTls::WrittenFalse);
     let path = dir.write("frps.toml", &cfg);
     let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
-    assert_one_warning_on_stdout_for("frps -c (tls_enable = false)", &spawned, SERVER_KEY);
+    assert_one_server_tls_enable_warning("frps -c (tls_enable = false)", &spawned);
 }
 
 /// Negative control: `[transport.tls] force = true` **synthesizes**
@@ -1102,6 +1243,11 @@ fn a_sigusr1_reload_delivers_the_server_tls_enable_warning_again() {
         "startup: one record\n--- stdout ---\n{}",
         spawned.stdout()
     );
+    assert_server_tls_enable_records_are_exactly_the_message(
+        "startup (tls_enable = true)",
+        &spawned.stdout(),
+        1,
+    );
 
     assert!(
         spawned.sigusr1_and_reload(),
@@ -1113,6 +1259,11 @@ fn a_sigusr1_reload_delivers_the_server_tls_enable_warning_again() {
         occurrences(&out, SERVER_KEY),
         2,
         "startup + reload = exactly 2 records, one per load\n--- stdout ---\n{out}"
+    );
+    assert_server_tls_enable_records_are_exactly_the_message(
+        "startup + SIGUSR1 reload (tls_enable = true)",
+        &out,
+        2,
     );
     assert_eq!(occurrences(&spawned.stderr(), SERVER_KEY), 0);
 }
