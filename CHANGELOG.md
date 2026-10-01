@@ -1276,6 +1276,15 @@ User-facing release notes for frp-rs.
   newline and an extra following line each red the `frps` lane itself. The `health` job's comment now names
   the three fixture scripts it runs (not two), and the fixture suite no longer carries an unreachable
   empty-root guard; its case-insensitive-volume limit is recorded where the containment check lives.
+- **Both fixture suites now fail closed, and the XTCP shard no longer sweeps by argument pattern.**
+  `scripts/compat-test.sh`'s XTCP helper reaps through the pid-exact sweep the compat-leak fix added
+  (`cleanup_pids` + `reap_scoped_strays`) instead of `pkill -f`, and the stray-guard fixtures read that helper's
+  body and drive the sweep against live synthetics. `scripts/tests/repo-health-fixtures.sh` installs a
+  `MIN_CHECKS=32` floor trap before its first check and asserts its own substance, and
+  `scripts/tests/compat-stray-guard.sh` closed four further ways it could report green while doing less: a failed
+  `ps` can no longer forgive a live synthetic, a symlinked invocation can no longer defeat `wait_exec`, an empty
+  `ps` is an error rather than "the image changed", and the total is supplemented by an ordered per-scenario shape
+  assertion.
 
 ## v0.71.0 — re-release (2026-09-13)
 
