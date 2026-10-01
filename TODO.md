@@ -250,7 +250,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   sides), the client's admin-triggered `reload` never re-derives auth, and `oidc_throttle_tests` —
   filed here as load-dependent, since fixed: the mock IdP could read 0 bytes after accepting because
   the accepted socket inherited the listener's non-blocking mode (see the item below).
-- [ ] **The help *document* is bpaf's, not cobra's — every `--help` surface is a different
+- [x] **The help *document* is bpaf's, not cobra's — every `--help` surface is a different
   document from Go's, not just a different layout.** Filed by the `--help=<bool>` round
   (`TODO.md:3274`), which matched the *behaviour* of every help argv and deliberately left the
   rendering. Measured 2026-09-28 on Go v0.71.0 darwin/arm64 against frp-rs `b8b0ffc`, stdout and
@@ -272,6 +272,64 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   counts above (or their replacements, stated per surface) as the witness, **and** the bool-flag
   collapse from two entries to one. It is a flag-surface-wide row: it covers argv the
   `--help=<bool>` item never touched, so it is filed here rather than closed there. No sha.
+
+  Done: closed on `feat/cobra-help-rendering` (four commits `762e2246` -> `54921885` -> `235ac0cc` ->
+  `3abc7ebf`, rebased onto `a0c16c83` as `936f0458`, replayed onto `f503b4e7` as `da8e9d8d` ->
+  `57f7d415` -> `58dcfab5`, then onto `f679e822` as `af0c2713` -> `df4e6764` -> `808d27f8`; `frp-core/src/cli.rs` +2082 and
+  `frps/tests/cli_exit_codes.rs` +4/-1). One rendering layer -- `render_cobra_help`, called from
+  `run_cli` on `bpaf::ParseFailure::Stdout` only -- reconstructs cobra's document from the flag
+  surface read back out of bpaf's own rendering (`bpaf_help_flags`, `frp-core/src/cli.rs:2611`), so
+  the document follows the parser rather than a hand-maintained list. `frps verify --help` (**2103 B**)
+  and `frpc verify --help` (**543 B**) are Go v0.71.0's documents byte-for-byte; the seven other
+  surfaces of the item are stated replacements -- `frps` 2467 (Go 2394), `frpc` 1517 (1370),
+  `frpc status` 859 (627), `frpc tcp` 992 (2211), `frpc reload` 801 (626), `frpc stop` 789 (614),
+  `frpc https` 979 (2269) -- and six further surfaces are pinned as well. All fifteen are pinned
+  whole-text **and** by byte count, the bool-flag collapse is asserted
+  (`bool_flags_collapse_to_one_row_each`), and the eleven alternate argv forms resolve to Go's surface.
+  Done-when met: one layer, cobra's shape, the nine byte counts (two exact, seven stated per surface),
+  the collapse. Ledger after this batch: **31 open / 164 closed** (base `f679e822`: 29 open / 163
+  closed; this batch closes the cobra help-document item and files the three residues below). Review record in the PR (four rounds; the round-2 adversarial BLOCK was a red
+  `cargo test -p frp-core --no-default-features --all-targets` lane -- 749 passed / 4 failed because
+  the pins baked in the kcp/quic rows -- fixed by `235ac0cc`). Residues filed below.
+
+- [ ] **frp-rs's proxy-command flag *names* differ from Go's, not just their rendered text.**
+  Filed by the `--help` cobra-rendering round (`TODO.md:253`), which prints the parser's own names with
+  translated usage text. The proxy commands spell `--custom-domains`, `--subdomain`, `--mux-port`,
+  `--server-name` where Go v0.71.0 has `--custom-domain` (shorthand `-d`), `--sd`, `--mux` (and `--sk`
+  on stcp/xtcp). Closing the gap is a **parser** change (add Go's names as aliases, or rename and keep
+  the old spelling as an alias), not a rendering change. **Done-when:** every proxy flag Go accepts is
+  accepted here under Go's spelling, pinned by an argv probe per surface, and the rendered document
+  shows Go's name.
+
+- [ ] **Go's proxy-command shorthands are unimplemented.**
+  Go v0.71.0's proxy commands carry `-i` (`--local-ip`), `-l` (`--local-port`), `-r` (`--remote-port`),
+  `-s` (`--server-addr`), `-P` (`--server-port`) and `-n` (`--proxy-name`); frp-rs's parser never
+  implemented them, so `frpc tcp` renders only `-t` (`--token`) and every shorthand above is rejected.
+  Filed with the same round's residue (`TODO.md:253`). **Done-when:** each shorthand parses to its Go
+  flag, pinned by an argv probe, and the rendered row matches Go's.
+
+- [ ] **Six residual weaknesses in the help-document pins.**
+  Measured by the `feat/cobra-help-rendering` round-4 adversarial review (`TODO.md:253`), all LOW/NIT
+  and none blocking the render:
+  1. **Inert pin data**: a bogus `GoFlagRow` in `FRPS_EXTENSION_FLAGS`
+     (`frp-core/src/cli.rs:2344`), a re-worded `allow-users` row (`:2148`), or a wrong `SURFACES`
+     Go-byte/label column (`:8540-8556`) leaves all twelve tests green -- the pins that read those
+     fields are not themselves falsified by the data they read.
+  2. **`row_long_flag` misreads cobra's footer**: `frp-core/src/cli.rs:9097-9105` returns
+     `Some("--help\"")` for `Use "frps [command] --help" for more information about a command.`
+     (`FRPS_DOC:8661`, `FRPC_DOC:8698`), contradicting its own doc comment (`:9086-9089`); inert
+     today, so a two-line fix (require indent 2/6 with a leading `-`, or bail when the line has no
+     two-space grid gap).
+  3. **CI never runs the feature-split shapes**: the pins run with kcp and quic both off or both on;
+     kcp-only and quic-only are compiled (`.github/workflows/ci.yml:1487`, `:1507`, `:1534`) but
+     never executed.
+  4. **An unreachable assertion**: `frp-core/src/cli.rs:9160-9167` cannot fail with teeth.
+  5. **Weakening survives**: `assert_eq!(removed, 1, ...)` (`frp-core/src/cli.rs:9079-9082`) back to
+     `>= 1`, or `:9099` `> 6` -> `> 60`, keeps all twelve tests green.
+  6. **`zip(SURFACE_DOCUMENTS)` truncates** (`frp-core/src/cli.rs:8981`, `:9006-9027`,
+     `:9175-9199`), so a sixteenth surface in one list survives.
+  **Done-when:** each of the six is either fixed or shown to be unreachable, with the mutant that
+  demonstrated it now red.
 - [x] **`auth.method` parsing is inconsistent across its three sites; a typo silently selects token
   auth.** Measured 2026-09-25 by the adversarial review on this branch, with real binaries:
   - *Client*: `frp-client` compares `ac.method == "oidc"` (feature-on arm, the new refusal helper and
