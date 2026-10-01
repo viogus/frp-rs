@@ -248,13 +248,36 @@ jobs:
           # hash, the region set and the count, and prints the canary literal
           # below only after all three fire. Its absence means the detection is
           # neutered.
+          # R18 (F1, adversarial round 17): the suite can print its own failure
+          # line and still end with the pinned `RESULT: 32 … hold` and pins
+          # literal. Measured: a duplicate `scenario-7` substance-marker pair
+          # inserted ahead of the real region makes `region_set_verdict` print
+          # `FAIL  pinned-region set changed: markers name [scenario-6
+          # scenario-7 scenario-7], expected [scenario-6 scenario-7]`; neutering
+          # that one call (`|| return 1` → `|| true`,
+          # `scripts/tests/repo-health-fixtures.sh:666`) plus the mandatory
+          # `SCEN7_REGION_SHA` refresh left this step green at exit 0 with
+          # `RESULT: 32 fixture check(s) hold` and `pinned regions verified 2/2`.
+          # (scenario-7, not scenario-6: the canary hashes scenario-6's region off
+          # the real file, so a scenario-6 decoy already reds in-suite.) So an
+          # emitted failure line is fatal here on its own: the evidence chain may
+          # not report a green run that reported a failure. An honest run prints no
+          # such line (measured: zero lines starting with `FAIL` or `  FAIL`), and
+          # the match is a `case` — `grep` is deliberately not used on this path,
+          # for the round-14 reason recorded above.
           guard_ok=0
           guard_result=0
           guard_regions=0
           guard_canary=0
+          guard_fail=0
+          guard_fail_text=''
           while IFS= read -r guard_line; do
             case $guard_line in
               '  ok '*) guard_ok=$((guard_ok + 1)) ;;
+              'FAIL'*|'  FAIL'*)
+                guard_fail=$((guard_fail + 1))
+                guard_fail_text="${guard_fail_text}${guard_line}"$'\n'
+                ;;
             esac
             if [ "$guard_line" = 'pinned regions verified 2/2: scenario-6 scenario-7' ]; then
               guard_regions=1
@@ -270,6 +293,11 @@ jobs:
           [ "$guard_ok" = "32" ] || status=1
           [ "$guard_regions" = "1" ] || status=1
           [ "$guard_canary" = "1" ] || status=1
+          [ "$guard_fail" = "0" ] || status=1
+          if [ "$guard_fail" != "0" ]; then
+            echo "::error::the repo-health fixture suite printed $guard_fail failure line(s); a run that reported a failure cannot be reported as a green step:"
+            printf '%s' "$guard_fail_text"
+          fi
           if [ "$status" != "0" ]; then
             echo "::error::repo-health fixture checks did not report 32 checks, verified pins and a live enforcer canary"
             echo "::error::scripts/tests/repo-health-fixtures.sh must print 32 '  ok' lines, end with 'RESULT: 32 fixture check(s) hold', print 'pinned regions verified 2/2: scenario-6 scenario-7' and print 'enforcer canary: injected mismatch detected, injected count mismatch detected'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped substance check or a neutered comparison means scenarios were skipped, neutered or swallowed — restore them rather than lowering this literal"
@@ -373,7 +401,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=ea9364447bf8c77b20a35509e27b178c698b35cd04d1d3050a41375c1b2069a1
+          guard_pin=f1d2a51eb2aa2c350c45c8ae141b585c90eaa9d90819674cdcf20be1fece6ceb
           # R12-1 (adversarial round 13): the enforcer's *implementation* lives in
           # the library the scenarios `source` (the `LIB=` assignment at :96 only
           # names it), so pinning only the suite left the "two-file change" claim
@@ -455,13 +483,33 @@ jobs:
           # repo-health step above — the region check, the set check and the count
           # check each had a mismatch injected and each had to be recorded. A
           # `got=$want` or `if false` in the enforcer leaves this line absent.
+          # R18 (F1, adversarial round 17): the suite can print its own failure
+          # line and still end with the pinned `RESULT: 40 … hold` and pins
+          # literal. Measured: a duplicate `scenario-10` substance-marker pair
+          # inserted ahead of the real region makes `region_set_verdict` print
+          # `FAIL  pinned-region set changed: markers name [scenario-2
+          # scenario-10 scenario-10 scenario-12 scenario-13], expected …`;
+          # neutering that one call (`|| return 1` → `|| true`,
+          # `scripts/tests/compat-stray-guard.sh:879`) plus the mandatory in-file
+          # pin refresh left this step green at exit 0. So an emitted failure line
+          # is fatal here on its own: the evidence chain may not report a green
+          # run that reported a failure. An honest run prints no such line
+          # (measured: zero lines starting with `FAIL` or `  FAIL`), and the match
+          # is a `case` — `grep` is deliberately not used on this path, for the
+          # round-14 reason recorded above.
           guard_ok=0
           guard_result=0
           guard_regions=0
           guard_canary=0
+          guard_fail=0
+          guard_fail_text=''
           while IFS= read -r guard_line; do
             case $guard_line in
               '  ok '*) guard_ok=$((guard_ok + 1)) ;;
+              'FAIL'*|'  FAIL'*)
+                guard_fail=$((guard_fail + 1))
+                guard_fail_text="${guard_fail_text}${guard_line}"$'\n'
+                ;;
             esac
             if [ "$guard_line" = 'pinned regions verified 4/4: scenario-2 scenario-10 scenario-12 scenario-13' ]; then
               guard_regions=1
@@ -477,6 +525,11 @@ jobs:
           [ "$guard_ok" = "40" ] || status=1
           [ "$guard_regions" = "1" ] || status=1
           [ "$guard_canary" = "1" ] || status=1
+          [ "$guard_fail" = "0" ] || status=1
+          if [ "$guard_fail" != "0" ]; then
+            echo "::error::the stray-guard fixture suite printed $guard_fail failure line(s); a run that reported a failure cannot be reported as a green step:"
+            printf '%s' "$guard_fail_text"
+          fi
           if [ "$status" != "0" ]; then
             echo "::error::compat stray-guard fixture checks did not report 40 checks, verified pins and a live enforcer canary"
             echo "::error::scripts/tests/compat-stray-guard.sh must print 40 '  ok' lines, end with 'RESULT: 40 fixture check(s) hold', print 'pinned regions verified 4/4: scenario-2 scenario-10 scenario-12 scenario-13' and print 'enforcer canary: injected mismatch detected, injected count mismatch detected'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped substance check or a neutered comparison means scenarios were skipped, neutered or swallowed — restore them rather than lowering this literal"

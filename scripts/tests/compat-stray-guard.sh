@@ -197,6 +197,14 @@ fails=0
 # of a forged `MUTATION_PROBE_RECORD` — neutering it alone stays green on a healthy
 # guard. The list is not exhaustive: the reject-direction block just above the
 # assertion and the `region_hash_verdict … || return 1` call are the same shape.
+# R18 (F1, adversarial round 17) named the third one and changed its disposition:
+# `region_set_verdict "$found" "${PINNED_REGIONS:-}" || return 1`
+# (`scripts/tests/compat-stray-guard.sh:879`) is a one-file neuter that leaves this
+# suite printing `FAIL  pinned-region set changed: …` and still exiting 0 with
+# `RESULT: 40 fixture check(s) hold` (measured). The call is not repaired here —
+# it stays declared — but the `Stray guard` CI step now refuses any emitted
+# failure line, so that mutant reds in CI even with the caller neutered
+# (measured), and an un-neutered failure is fatal in both places.
 #
 # A floor of 0 (or an unset floor) disables the guard from inside, which the
 # sibling suite learned the hard way; that is a failure here too. So is a
