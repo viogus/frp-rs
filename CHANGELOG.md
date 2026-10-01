@@ -1266,6 +1266,16 @@ User-facing release notes for frp-rs.
   (`scripts/tests/rss-soak-run-dir.sh`, 269 checks) in the `health` CI job. The first published
   series is `scripts/frp-stress/baselines/rss-soak-Mac.jsonl`; the measured numbers and their
   caveats are recorded in `TODO.md`.
+- **Four test-precision residues are closed, and the `frps` dashboard warning pins now witness the
+  record bytes rather than a count plus a clause.** `frpc/tests/warn_delivery.rs`'s `drain` returns an
+  `io::Result` — EOF only on `Ok(0)`, `ErrorKind::Interrupted` retried, any other read error surfaced as a
+  truncated capture instead of being folded into EOF — so a transport error can no longer make a joined
+  capture look final. The `frps` dashboard captures share a record extractor that keeps each record's
+  terminating newline and byte-pins it, compare the level untrimmed (`" WARN"`), and reject bytes after a
+  record that do not begin a fresh `tracing` record, so an appended clause, a renamed target, a bare extra
+  newline and an extra following line each red the `frps` lane itself. The `health` job's comment now names
+  the three fixture scripts it runs (not two), and the fixture suite no longer carries an unreachable
+  empty-root guard; its case-insensitive-volume limit is recorded where the containment check lives.
 
 ## v0.71.0 — re-release (2026-09-13)
 
