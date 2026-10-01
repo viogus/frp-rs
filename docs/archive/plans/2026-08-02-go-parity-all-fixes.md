@@ -189,7 +189,7 @@
 
 **Interfaces:**
 - Consumes: `DialOptions.tls_enable`, `tls_cert_file`, `tls_key_file`, `tls_ca_file`, `tls_server_name`
-- Produces: KCP transport wraps the KCP stream with TLS when `tls_enable` is true, matching the server accept path in `frp-server/src/service/listeners.rs:556-597`
+- Produces: KCP transport wraps the KCP stream with TLS when `tls_enable` is true, matching the server accept path in `frp-server/src/service.rs:1006-1047`
 
 **Goal:** Rust frpc with `protocol="kcp"` and TLS enabled must actually wrap KCP in TLS and advertise `tls=true` truthfully in V2 ClientHello.
 
@@ -397,7 +397,7 @@
 **Files:**
 - Modify: `frp-server/src/vhost.rs:442-600`
 - Modify: `frp-server/src/control/proxy_ops.rs:540-610,681-714`
-- Modify: `frp-server/src/service.rs:573`, `frp-server/src/service/listeners.rs:362-415`
+- Modify: `frp-server/src/service.rs:573,812-865`
 - Test: `frp-server/tests/dashboard_integration.rs`, `frp-server/tests/tcpmux.rs`, new vhost HTTP tests
 
 **Interfaces:**

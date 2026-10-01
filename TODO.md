@@ -6774,17 +6774,28 @@ nothing about whether the described behaviour still holds.
   `pub(super) async fn start_kcp_listener(&self, rate_limiter_enabled: bool)` — 501 payload lines /
   44 390 bytes `cmp`-identical (sha256
   `349e49b2d12cede91389630dbd9b5dd9eae0e56b82f935570b82e9785a4a014d`), `frp-server/src/service.rs`
-  2386 → 1886 lines. Unlike the WebSocket seam the extracted block is already reached by shipped
-  lanes (`scripts/protocol-matrix.sh`'s KCP rows and `scripts/compat-test.sh`'s KCP+TLS and
-  KCP+tcpMux scenarios), so the round adds no test; the evidence is the byte-identical move plus
-  those lanes. `mod listeners` is now gated on `any(websocket, kcp)` with a feature gate per method,
-  so a `--no-default-features --features kcp` build still compiles. The cites this
-  move invalidated were repointed — 11 `frp-server/src/service.rs:NNN` occurrences plus the
-  `listeners.rs` cite in the #436 development-log row; cites already stale at base `f881d15e` were
-  left as pre-existing staleness outside this move's scope. The remaining
-  blocks (HTTP vhost, HTTPS vhost, TCPMux, SSH tunnel gateway, QUIC, dashboard, `tasks.rs`) are
-  tracked in the plan doc, which now records this seam as landed too. Ledger at this head:
-  **19 open / 181 closed** — unchanged, the item stays open.
+  2386 → 1886 lines (`git diff` is four hunks: two dead-import deletions, a +5/−1 module
+  comment/gate hunk, and the 501→1 call site). Unlike the WebSocket seam the extracted block is
+  already reached by shipped lanes (`scripts/protocol-matrix.sh`'s KCP rows and
+  `scripts/compat-test.sh`'s KCP+TLS and KCP+tcpMux scenarios), so the round adds no test; the
+  evidence is the byte-identical move plus those lanes (`11 passed, 0 failed` on a quiet host).
+  `mod listeners` is now gated on `any(websocket, kcp)` with a feature gate per method, so a
+  `--no-default-features --features kcp` build still compiles. **12 `path:line` cites were
+  repointed** for this move — counted as locator occurrences whose line text changed
+  (`feature-backlog.md:51`, `server_protocol.rs:678` and the #436 development-log row each
+  contribute two); every one was re-located by content and `cmp`-checked against its base slice, and
+  the full old → new table is in the PR. Cites into `docs/archive/**` keep their era's line numbers
+  instead: that tree is point-in-time by its own README (`docs/archive/README.md`), so the three
+  archive repoints an earlier revision of this round made were reverted. The cites already stale at
+  base `f881d15e` were deliberately left alone rather than treated as regressions — the adversarial
+  counted 23, most of which now point past `service.rs`'s 1886-line end. The moved block's
+  `tracing` records now render `target: frp_server::service::listeners` instead of
+  `frp_server::service` (`module_path!()` follows the module); `RUST_LOG` target matching is a
+  prefix comparison, so `RUST_LOG=frp_server::service=debug` still enables them, and as in #436 the
+  round ships no `CHANGELOG.md` bullet for it. The remaining blocks (HTTP vhost, HTTPS vhost,
+  TCPMux, SSH tunnel gateway, QUIC, dashboard, `tasks.rs`) are tracked in the plan doc, which
+  records this seam as landed too. Ledger at this head: **13 open / 189 closed** — unchanged, the
+  item stays open.
 
   **Progress (2026-10-01, code head `7ff46a60` on `refactor/fileify-vhost-tests`, PR #452, based on
   `f881d15e`, rebased onto `18bcd1ad`).** The P0/P7 split landed: `frp-server/src/vhost.rs`'s inline
@@ -8153,6 +8164,7 @@ section; ledger now **24 open / 104 closed**.**
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7204`): a
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7617`): a
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7616`): a
+  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7220`): a
   test that pins less than its name claims, so a real regression stays green.
   (a) The pinned warning bytes are the shipped static, but the **emitted** record is only
   substring-checked: `frp-core/tests/server_tls_enable_warning.rs:441` asserts
@@ -9292,6 +9304,15 @@ section; ledger now **24 open / 104 closed**.**
 
 - [x] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
   Filed by the coordinator while closing `TODO.md:8533` (PR #430), which removed the two local `pkill -f`
+- [ ] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
+  Filed by the coordinator while closing `TODO.md:8454` (PR #430), which removed the two local `pkill -f`
+  calls in `scripts/compat-test.sh`: `scripts/remote-frps.sh:195` and `:339` still run
+  `pkill -f 'frps -c frps.toml'` and `:409` uses `pgrep -f` on the same text, over ssh, to manage the
+  comparison server on a remote VPS. Name-plus-argument is the same hazard the local sweep just lost — a
+  process on the remote host whose command line merely contains that text is reaped too — but the local
+  `$TEST_DIR/`-prefix baseline and baseline subtraction the new sweep relies on do not exist on the remote
+  side, so the fix needs its own design (a remote pid file, or a port-scoped `fuser` route) rather than a copy
+  of `reap_scoped_strays`. PR #430's residue table names the three call sites.
   **Done-when:** the remote helper reaps by exact pid (a pid file written where it starts the server, or a
   port-scoped lookup) instead of `pkill -f`/`pgrep -f`, or the pattern kill is recorded as required with the
   measurement that shows a pid route is impossible over that ssh path.
