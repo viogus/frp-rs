@@ -9353,7 +9353,7 @@ section; ledger now **24 open / 104 closed**.**
   four items — one whole item each for the drain error, the stale health-job comment and the dashboard
   captures, plus part (d) completing the four-residue item — and files the one residue below).
 
-- [ ] **The ported `frps` warning-capture oracle is weaker than the `frp-core` original in three ways the H2 batch did not close.**
+- [x] **The ported `frps` warning-capture oracle is weaker than the `frp-core` original in three ways the H2 batch did not close.**
   Filed by the coordinator from the H2 batch's adversarial review (`/private/tmp/rev-h2-attack.md`, measured at
   the pre-rebase code head, patch-identical to `3020174c`, on base `ed2d71a3`); all three are coverage gaps the mutant matrix did not reach, not false
   assertions. (a) An emit-site mutant that appends a *well-formed* `tracing` record — a second `warn!` rather
@@ -9367,6 +9367,35 @@ section; ledger now **24 open / 104 closed**.**
   appended well-formed record reds it, examines the bytes before the first matching record, and `frps`'s own
   `drain` distinguishes a read error from EOF the way the `frpc` one now does (or each residue is argued
   unreachable with a measurement).
+  **Done (2026-10-02, at code head `5b74bdbb` on `fix/frps-warn-oracle`, PR #TBD, based on `18bcd1ad`) — all three closed; three real emit-site mutants red the lane.**
+  (a)+(b) `assert_records_are_exactly_the_message` (`frps/tests/warn_delivery.rs:1081`) now pins the capture's
+  **total** `tracing` record count to `expected + others`, with `tracing_record_starts` (`:1040`) scanning the
+  SGR-stripped capture for record starts, so a record emitted beyond the counted ones reds no matter which side
+  of the warning it lands on; each call site passes the baseline its own config and feature produce
+  (`BOOT_RECORDS_NO_DASHBOARD` `:176` = 7, `BOOT_RECORDS_WITH_DASHBOARD` `:180` = 10 under `--features
+  dashboard`, `BOOT_RECORDS_FLAT_TLS_ENABLE` `:195` = 7, `RELOAD_EXTRA_RECORDS` `:186` = 1 — all measured
+  through the harness, not derived). Measured with three real emit-site mutants at
+  `frp-core/src/config/loader.rs` (each restored after the run): appending a second well-formed `warn!` after
+  the `web_server.tls.enable` diagnostic → `test result: FAILED. 18 passed; 6 failed` at
+  `frps/tests/warn_delivery.rs:1097:5` (six `web_server` rows, `left: 9` vs `right: 8`); appending one after the
+  flat `tls_enable` diagnostic → `20 passed; 4 failed` at `:1097:5`; emitting one **before** the web diagnostic
+  → `18 passed; 6 failed` at `:1097:5` (the prefix direction, which `records_containing` never looked at).
+  Honest tree: `24 passed; 0 failed` with **and** without `--features dashboard`. `mod record_count_tests`
+  (`:1217`) drives both directions on synthetic captures, so the count is pinned without mutating the product.
+  (c) `frps`'s `drain` (`:537`) now distinguishes a read error from EOF exactly as `frpc`'s does — only `Ok(0)`
+  ends the capture, `ErrorKind::Interrupted` retries, any other error is recorded — and every reader
+  (`Spawned::peek_stdout`/`peek_stderr`, and `snapshot`) refuses the truncated capture through
+  `check_drain_errors` (`:573`); the error is parked rather than joined because this harness reads a **live**
+  child. `mod drain_tests` (`:590`) pins it: 4 tests green, and with the old `Ok(0) | Err(_) => break` loop
+  restored `test result: FAILED. 1 passed; 3 failed` at `frps/tests/warn_delivery.rs:660:23` (`a non-EOF read
+  error must be recorded, not folded into EOF`), `:668:8` (`test did not panic as expected`) and `:693:9`
+  (`left: ""`, `right: "kept\n"`).
+  Limits: the count shares one residual with its baseline — a record **swapped** for another (a second boot
+  line, say) keeps `expected + others` and stays green, because the boot records are counted, not pinned
+  (stated at `:1058`); the `dashboard` feature shape was green at the base (`18bcd1ad`:
+  17 passed; 0 failed) and this round keeps it green (`24 passed; 0 failed`), so no gate loses coverage. `CHANGELOG.md` gets no bullet: test-only, no user-visible behaviour change (the
+  dashboard-lane repair also changes no shipped code). Ledger after this close: **12 open / 190 closed** (base
+  `18bcd1ad`: 13 open / 189 closed).
 
 - [x] **`docs/config.md:22` names `websocketPort` as the Go frp v0.71.0 spelling of `websocket_port`, but Go's `frps` has no such field.**
   Filed by the coordinator from PR #436's delta adversarial (INFO). Measured with the real v0.71.0 binary:
