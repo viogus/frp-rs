@@ -40,7 +40,7 @@
 #   9  a `ps` that fails in the exit trap does not turn a live synthetic of ours
 #      into a stranger: an unidentifiable pid we started is still killed.
 #   10 `scripts/compat-test.sh` carries no pattern kill and its XTCP pre-test
-#      sweep is the pid-exact `reap_scoped_strays` (TODO.md:8063).
+#      sweep is the pid-exact `reap_scoped_strays` (TODO.md:8115).
 #   11 that sweep, driven against three real synthetic servers: the
 #      in-`$TEST_DIR` leak started after the baseline is reaped, while the
 #      baseline server and the same-named out-of-tree peer are left alone. This
@@ -99,7 +99,7 @@ fails=0
 # A total is not a *shape* though: deleting N assertions and adding N dummy
 # `ok` lines keeps the total and still exits 0 (measured against the count as
 # the only guard — that mutant is in the batch-E record), which is residue (d)
-# of TODO.md:8146. `SHAPE` below pins the count, the order and the *label* of
+# of TODO.md:8198. `SHAPE` below pins the count, the order and the *label* of
 # every assertion, so a scenario that stops running, a check that is deleted,
 # reordered, or a dummy added anywhere, all red. It compares labels, not bodies:
 # a check whose body is gutted behind an unchanged `ok` label is not a shape
@@ -187,7 +187,7 @@ WORK=""
 # direction. A `ps` probe that cannot run leaves the pid *unidentifiable*, and
 # an unidentifiable live child we started is ours to kill — reading it as "not
 # ours" is how every live synthetic outlived a `ps` failure (residue (a) of
-# TODO.md:8146). A pid the guard already reaped can be recycled before this trap
+# TODO.md:8198). A pid the guard already reaped can be recycled before this trap
 # runs, and killing a stranger is the hazard this suite pins; the probe is what
 # tells those apart, so only a probe we can trust is allowed to *forgive*.
 reap_own_synthetic() {
@@ -247,7 +247,7 @@ enforce_shape() {
 #                Without it, replacing that body with a forged `rc=1`/`out`
 #                behind the identical labels left the suite green (SG-M1,
 #                measured by the adversarial reviewer).
-#   scenario-10  TODO.md:8063's fix: the input derivation (`compat_src=`, the
+#   scenario-10  TODO.md:8115's fix: the input derivation (`compat_src=`, the
 #                comment strip) *and* both assertion blocks. Pinning only the
 #                two verdict blocks left the line that produces the text they
 #                read unpinned, so a forged input — a literal string containing
@@ -268,12 +268,25 @@ enforce_shape() {
 # updated, and the failure text prints the value to paste. The pins add no
 # `ok`/`bad` call of their own, so they can never move the fixture count — or
 # the ci.yml literal that pins it — by themselves.
+#
+# The enforcer is pinned too (N5, adversarial round 4): the list of guarded
+# regions is derived from the `substance pin:` markers actually present and must
+# equal `PINNED_REGIONS`, the number of regions actually checksummed must equal
+# `PINNED_REGION_COUNT`, and every hash must come from *this* file (`region_sha`
+# reports the path it read and the enforcer compares it). Emptying the loop,
+# dropping or repeating a name, deleting a marker, or pointing `region_sha` at a
+# pristine copy all red instead of silently shrinking the guarded set.
 SCEN2_REGION_SHA='672f7e60063731363e7b1583a7f415cee46b5c2fc2710f82792df75f9cb18886'
-SCEN10_REGION_SHA='23ae23793f1912e7df3f3d98dec5d46b6f8fd2c771e8597ca2510233674ea356'
+SCEN10_REGION_SHA='3c1b35c6a46c35c386158e6dac143fa449df50d38cf1caf31d52ff25cb12346b'
 SCEN12_REGION_SHA='6742cb4ea68f2ecb9baa13910fd0ba250507e44368935085711b4cd68d8fa159'
 SCEN13_REGION_SHA='071ade36c23aa45df0908f633a3e2f9686574fd672c9d83796526bdf0db24a67'
+PINNED_REGIONS='scenario-2 scenario-10 scenario-12 scenario-13'
+PINNED_REGION_COUNT=4
 region_sha() {   # $1 = region name, spelled as between the `substance pin:` markers
-  local name=$1 tool
+  # Prints the path it read and the region hash on two lines, because the caller
+  # reaches it through `$( … )` — a subshell, so a variable set here could never
+  # reach the check that the *right* file was read (N5).
+  local name=$1 tool hash
   if command -v sha256sum >/dev/null 2>&1; then
     tool='sha256sum'
   elif command -v shasum >/dev/null 2>&1; then
@@ -283,19 +296,37 @@ region_sha() {   # $1 = region name, spelled as between the `substance pin:` mar
     return 1
   fi
   # shellcheck disable=SC2086  # $tool is the word-split "shasum -a 256"
-  sed -n "/^# --- substance pin: ${name} /,/^# --- end substance pin: ${name} ---/p" "$self" |
-    $tool | awk '{print $1}'
+  hash=$(sed -n "/^# --- substance pin: ${name} /,/^# --- end substance pin: ${name} ---/p" "$self" |
+    $tool | awk '{print $1}')
+  printf '%s\n%s\n' "$self" "$hash"
 }
 enforce_substance() {
-  local name const got want
-  for name in scenario-2 scenario-10 scenario-12 scenario-13; do
+  local name const got want found checked=0 expected_self=${self:-} out='' sha_file=''
+  found=$(sed -n 's/^# --- substance pin: \([^ ]*\).*/\1/p' "$self" | tr '\n' ' ')
+  found=${found% }
+  if [ "$found" != "$PINNED_REGIONS" ]; then
+    printf 'FAIL  pinned-region set changed: markers name [%s], expected [%s]\n' \
+      "$found" "$PINNED_REGIONS" >&2
+    printf '      restore the `substance pin:` markers (or move PINNED_REGIONS with them) in %s\n' \
+      "${self:-this script}" >&2
+    return 1
+  fi
+  # shellcheck disable=SC2086  # intentional word split: PINNED_REGIONS is a name list
+  for name in $PINNED_REGIONS; do
     case $name in
       scenario-2)  const=SCEN2_REGION_SHA;  want=$SCEN2_REGION_SHA ;;
       scenario-10) const=SCEN10_REGION_SHA; want=$SCEN10_REGION_SHA ;;
       scenario-12) const=SCEN12_REGION_SHA; want=$SCEN12_REGION_SHA ;;
       scenario-13) const=SCEN13_REGION_SHA; want=$SCEN13_REGION_SHA ;;
     esac
-    got=$(region_sha "$name") || return 1
+    out=$(region_sha "$name") || return 1
+    sha_file=${out%%$'\n'*}
+    got=${out#*$'\n'}
+    if [ "$sha_file" != "$expected_self" ]; then
+      printf 'FAIL  %s substance pin was checksummed from %s, expected %s — the enforcer read the wrong file\n' \
+        "$name" "${sha_file:-<unset>}" "${expected_self:-<unset>}" >&2
+      return 1
+    fi
     if [ "$got" != "$want" ]; then
       printf 'FAIL  %s region changed: sha256 %s, pinned %s\n' \
         "$name" "${got:-<none>}" "$want" >&2
@@ -303,7 +334,13 @@ enforce_substance() {
         "$const" "${self:-this script}" >&2
       return 1
     fi
+    checked=$((checked + 1))
   done
+  if [ "$checked" -ne "$PINNED_REGION_COUNT" ]; then
+    printf 'FAIL  substance check verified %s region(s), expected %s [%s]\n' \
+      "$checked" "$PINNED_REGION_COUNT" "$PINNED_REGIONS" >&2
+    return 1
+  fi
   return 0
 }
 
@@ -422,7 +459,7 @@ spawn_fake() {
 # never match. It used to be `basename` of the *resolved* script path, which the
 # child's argv does not carry when the suite is invoked through a symlink with a
 # different name — the match failed before the exec and `wait_exec` returned 0
-# (residue (b) of TODO.md:8146). Nothing here depends on the file's name, so
+# (residue (b) of TODO.md:8198). Nothing here depends on the file's name, so
 # there is no alias to get wrong.
 wait_exec() {
   local pid=$1 i=0 cmd me
@@ -659,7 +696,7 @@ case "$out" in
 esac
 
 # --- scenario 7: `wait_exec`'s anchor survives an aliased invocation ---------
-# Residue (b) of TODO.md:8146. The probe child is this same file under a
+# Residue (b) of TODO.md:8198. The probe child is this same file under a
 # different name: `wait_exec "$$"` must still see its own pre-exec fork and
 # return 1. Any anchor derived from the script's own name fails here, which is
 # exactly the latent bug CI (which calls the direct path) could not see.
@@ -678,7 +715,7 @@ else
 fi
 
 # --- scenario 8: empty `ps` output is "cannot tell", not "the image changed" -
-# Residue (c) of TODO.md:8146. A probe that exits 0 with no output used to fall
+# Residue (c) of TODO.md:8198. A probe that exits 0 with no output used to fall
 # through to the `*) return 0` arm — an empty string does not contain the anchor
 # — so "the tool told us nothing" was read as "the helper has exec-ed".
 hdr 'scenario 8: wait_exec reads empty ps output as "cannot tell"'
@@ -722,7 +759,7 @@ fi
 kill -9 "$child_victim" 2>/dev/null || true
 
 # --- scenario 9: a failed ownership probe does not forgive a live synthetic --
-# Residue (a) of TODO.md:8146. The victim is a real synthetic of this run, under
+# Residue (a) of TODO.md:8198. The victim is a real synthetic of this run, under
 # `$WORK`, so the *real* predicate would match it; the point is that a probe
 # which cannot run must not be read as "not ours" and let it outlive the suite.
 hdr 'scenario 9: a failed ps probe does not turn a live synthetic into a stranger'
@@ -758,7 +795,7 @@ else
   kill -9 "$victim9b" 2>/dev/null || true
 fi
 
-# --- scenario 10: the XTCP pre-test cleanup is pid-exact (TODO.md:8063) ------
+# --- scenario 10: the XTCP pre-test cleanup is pid-exact (TODO.md:8115) ------
 # `run_xtcp_test` used two `pkill -f "frpc -c"` / `pkill -f "frps -c"` calls,
 # which select any process on the host whose command line carries that pattern —
 # a developer's unrelated run, or a sibling worktree's compat run. The
@@ -788,9 +825,9 @@ else
   bad "compat-test.sh kills by pattern again: $(printf '%s' "$hits" | tr '\n' ' ')"
 fi
 xtcp_body=$(awk '/^run_xtcp_test\(\)/{f=1} f{print} f&&/^}/{exit}' "$WORK/compat-test.code")
-# TODO.md:8063 replaced *two* pattern kills with a pid-exact pair, so the
+# TODO.md:8115 replaced *two* pattern kills with a pid-exact pair, so the
 # scenario has to see both halves inside `run_xtcp_test`: the tracked-pid reaper
-# (`cleanup_pids`, TODO.md:8063's first replacement) and the guard's baseline-aware
+# (`cleanup_pids`, TODO.md:8115's first replacement) and the guard's baseline-aware
 # census sweep (`reap_scoped_strays`). Pinning only the latter let a mutant that
 # deleted the `cleanup_pids` call stay green (measured, reviewer 1).
 xtcp_calls=$(printf '%s\n' "$xtcp_body" | grep -cE '^[[:space:]]*cleanup_pids([[:space:]]|$)' || true)
@@ -799,7 +836,7 @@ case "$xtcp_body" in *'reap_scoped_strays'*) xtcp_sweep=true ;; esac
 if $xtcp_sweep && [ "$xtcp_calls" -ge 1 ]; then
   ok 'compat-test.sh: run_xtcp_test sweeps with cleanup_pids and reap_scoped_strays'
 else
-  bad "compat-test.sh: run_xtcp_test's pre-test cleanup is incomplete (reap_scoped_strays=$xtcp_sweep, cleanup_pids calls=$xtcp_calls) — TODO.md:8063 needs both, one per pkill -f it replaced"
+  bad "compat-test.sh: run_xtcp_test's pre-test cleanup is incomplete (reap_scoped_strays=$xtcp_sweep, cleanup_pids calls=$xtcp_calls) — TODO.md:8115 needs both, one per pkill -f it replaced"
 fi
 # --- end substance pin: scenario-10 ---
 

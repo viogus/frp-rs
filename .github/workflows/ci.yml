@@ -112,7 +112,7 @@ jobs:
         # `exec true` planted after the trap never runs it and exits 0 with no
         # output at all. So the total is pinned *outside*: this step requires the
         # suite's summary line verbatim, and 32 is what the scenarios in
-        # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:8127` round
+        # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:8179` round
         # added the in-file floor; a scenario added or removed there moves this
         # literal — restore the checks rather than lowering it). In-file,
         # `enforce_substance` also checksums the scenario-6 metric check and the
@@ -149,7 +149,7 @@ jobs:
         # *outside*, the way the `log_completion` step below pins its own 6: this
         # step requires the suite's summary line verbatim, and 40 is what the
         # scenarios in scripts/tests/compat-stray-guard.sh print (21 before the
-        # `TODO.md:8146` round added the ordered `SHAPE` anchors, the symlink
+        # `TODO.md:8198` round added the ordered `SHAPE` anchors, the symlink
         # `wait_exec` probe, the empty-`ps` branch and the failed-probe
         # kill-then-continue case; 31 after the round-2 pins exercised the loop's
         # empty-`cmd` guard, the exit-0-empty reap arm, and the second half of the

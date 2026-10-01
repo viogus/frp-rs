@@ -49,7 +49,7 @@ set -uo pipefail
 # path resolution, the two preflights and the first `ok`/`bad` — so an early
 # `exit 0` anywhere below it still has to answer to the floor. `MIN_CHECKS` is
 # the measured check count of a green run; with an exact floor, emptying any
-# scenario body drops the count below it and reds (TODO.md:8127).
+# scenario body drops the count below it and reds (TODO.md:8179).
 #
 # Three limits are stated rather than hidden:
 #   * a floor of 0 (or an unset floor, or a zero-padded all-zero floor such as
@@ -109,10 +109,23 @@ hdr() { printf '%s\n' "---------------------------------------------------------
 # their own, so they cannot move the count — or the ci.yml literal that pins it
 # — by themselves. `self` is resolved further down this file, which is fine: the
 # check only runs from the EXIT trap, after it is set.
+#
+# The enforcer is pinned too (N5, adversarial round 4): the list of guarded
+# regions is derived from the `substance pin:` markers actually present and must
+# equal `PINNED_REGIONS`, the number of regions actually checksummed must equal
+# `PINNED_REGION_COUNT`, and every hash must come from *this* file (`region_sha`
+# reports the path it read and the enforcer compares it). Emptying the loop,
+# dropping or repeating a name, deleting a marker, or pointing `region_sha` at a
+# pristine copy all red instead of silently shrinking the guarded set.
 SCEN6_REGION_SHA='7d31d2b613e1e578c7050a5328cb677f4aac2eba1c6d9a7248f0216d1dd06af7'
 SCEN7_REGION_SHA='941be4f7805b74ff79b691e463f91dd011a1b549cd17995f09542ff8d3f40500'
+PINNED_REGIONS='scenario-6 scenario-7'
+PINNED_REGION_COUNT=2
 region_sha() {   # $1 = region name, spelled as between the `substance pin:` markers
-  local name=$1 tool
+  # Prints the path it read and the region hash on two lines, because the caller
+  # reaches it through `$( … )` — a subshell, so a variable set here could never
+  # reach the check that the *right* file was read (N5).
+  local name=$1 tool hash
   if [ -z "${self:-}" ]; then
     printf 'FAIL  cannot locate %s to checksum the %s region\n' "$0" "$name" >&2
     return 1
@@ -126,25 +139,53 @@ region_sha() {   # $1 = region name, spelled as between the `substance pin:` mar
     return 1
   fi
   # shellcheck disable=SC2086  # $tool is the word-split "shasum -a 256"
-  sed -n "/^# --- substance pin: ${name} /,/^# --- end substance pin: ${name} ---/p" "$self" |
-    $tool | awk '{print $1}'
+  hash=$(sed -n "/^# --- substance pin: ${name} /,/^# --- end substance pin: ${name} ---/p" "$self" |
+    $tool | awk '{print $1}')
+  printf '%s\n%s\n' "$self" "$hash"
 }
 enforce_substance() {
-  local name const got want
-  for name in scenario-6 scenario-7; do
+  local name const got want found checked=0 expected_self=${self:-} out='' sha_file=''
+  if [ -z "${self:-}" ]; then
+    printf 'FAIL  cannot locate %s to check the substance pins\n' "$0" >&2
+    return 1
+  fi
+  found=$(sed -n 's/^# --- substance pin: \([^ ]*\).*/\1/p' "$self" | tr '\n' ' ')
+  found=${found% }
+  if [ "$found" != "$PINNED_REGIONS" ]; then
+    printf 'FAIL  pinned-region set changed: markers name [%s], expected [%s]\n' \
+      "$found" "$PINNED_REGIONS" >&2
+    printf '      restore the `substance pin:` markers (or move PINNED_REGIONS with them) in %s\n' \
+      "$self" >&2
+    return 1
+  fi
+  # shellcheck disable=SC2086  # intentional word split: PINNED_REGIONS is a name list
+  for name in $PINNED_REGIONS; do
     case $name in
       scenario-6) const=SCEN6_REGION_SHA; want=$SCEN6_REGION_SHA ;;
       scenario-7) const=SCEN7_REGION_SHA; want=$SCEN7_REGION_SHA ;;
     esac
-    got=$(region_sha "$name") || return 1
+    out=$(region_sha "$name") || return 1
+    sha_file=${out%%$'\n'*}
+    got=${out#*$'\n'}
+    if [ "$sha_file" != "$expected_self" ]; then
+      printf 'FAIL  %s region was checksummed from %s, expected %s — the enforcer read the wrong file\n' \
+        "$name" "${sha_file:-<unset>}" "${expected_self:-<unset>}" >&2
+      return 1
+    fi
     if [ "$got" != "$want" ]; then
       printf 'FAIL  %s region changed: sha256 %s, pinned %s\n' \
         "$name" "${got:-<none>}" "$want" >&2
       printf '      deliberate edit? set %s in %s to the value above\n' \
-        "$const" "${self:-this script}" >&2
+        "$const" "$self" >&2
       return 1
     fi
+    checked=$((checked + 1))
   done
+  if [ "$checked" -ne "$PINNED_REGION_COUNT" ]; then
+    printf 'FAIL  substance check verified %s region(s), expected %s [%s]\n' \
+      "$checked" "$PINNED_REGION_COUNT" "$PINNED_REGIONS" >&2
+    return 1
+  fi
   return 0
 }
 
