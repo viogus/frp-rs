@@ -289,8 +289,12 @@ jobs:
       # `bogus_type_on_a_camelcase_legacy_proxy_is_refused`) — the mirror-image
       # rows for a *typed* camelCase v1-root header, both un-gated.
       # 17 → 18 with the pin for the exclusion clause itself: +1
-      # (`typeless_port_carrying_ini_visitor_is_not_a_proxy` — a port-carrying
-      # `role = "visitor"` section, un-gated).
+      # (`typeless_ini_visitor_is_refused_like_go` — a typeless `role = "visitor"`
+      # section, port-carrying and portless, un-gated; rewritten in place from
+      # `typeless_port_carrying_ini_visitor_is_not_a_proxy`, which pinned the old
+      # lenient-drop verdict). The count is unchanged by that rename, by the
+      # added portless fixture and by the legacy-dialect strict/visitor fixes,
+      # which only edit tests in place.
       # 18 → 19 with the `--allow-unsafe` gate on the load path (#422): +1
       # (`verify_runs_the_post_load_allow_unsafe_gate_like_go`) — the file is
       # `#![cfg(any(feature = "full", feature = "tiny"))]` and the test is not

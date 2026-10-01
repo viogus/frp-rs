@@ -344,72 +344,65 @@ fn typeless_legacy_ini_proxy_verifies_in_both_modes() {
     }
 }
 
-/// A port-carrying typeless `role = "visitor"` section is **not** defaulted to a
-/// `tcp` proxy: the exclusion clause of the typeless-`.ini` rule covers it.
+/// A typeless `role = "visitor"` section is refused in **both** loader modes,
+/// with Go's own message — with proxy port keys and without them.
 ///
 /// The port-key discriminator cannot separate this shape from a typeless proxy
-/// (`local_port`/`remote_port` are the keys it tests for), so without the
-/// `role != "visitor"` clause the section would be collected and routed into
-/// `[visitors]` with a synthetic `type = "tcp"`. Measured on this head: lenient
-/// rc 0 with `Proxies: 0`/`Visitors: 0`, strict rc 1 with `unknown field "v"`.
-/// Go v0.71.0 refuses the same file in *both* modes (`failed to parse visitor v,
-/// err: type shouldn't be empty`) — the lenient half is the pre-existing
-/// divergence tracked as TODO residue, pinned here as-is so the exclusion clause
-/// itself cannot be mutated away silently.
+/// (`local_port`/`remote_port` are the keys it tests for), so the section must be
+/// kept out of `[proxies]` and refused before it can be dropped as an unknown
+/// field. The portless spelling is the one a port-key-only guard would miss
+/// entirely: it would be silently dropped in lenient mode (rc 0) where Go v0.71.0
+/// is rc 1.
 ///
-/// **Mutation teeth.** Replacing the clause with `true` makes the lenient run
-/// exit 1 with `visitor 'v': server name is required`, so the exit-code
-/// assertion below fails before the stdout one is reached.
+/// Measured on this head before the visitor refusal was added: lenient rc 0 with
+/// `Proxies: 0`/`Visitors: 0` and strict rc 1 with `unknown field "v"`; Go
+/// v0.71.0 refuses both files in *both* modes (`failed to parse visitor v, err:
+/// type shouldn't be empty`), which is what is pinned now.
+///
+/// **Mutation teeth.** Replacing the `role` clause with `true` makes `verify` fail
+/// with `visitor v: server name is required` instead of Go's message, so the
+/// stdout assertion below fails; narrowing the pre-collection refusal to
+/// port-carrying sections restores the lenient rc 0 for the second fixture, so
+/// the exit-code assertion fails.
 #[test]
-fn typeless_port_carrying_ini_visitor_is_not_a_proxy() {
+fn typeless_ini_visitor_is_refused_like_go() {
     let dir = TempDir::new();
-    let cfg = dir.write(
-        "typeless_visitor.ini",
-        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
-         [v]\nrole = \"visitor\"\nlocal_port = 1\nremote_port = 2\n",
-    );
-
-    let out = run_frpc(&["verify", "--strict-config=false", "-c", &cfg]);
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "the typeless visitor section is not collected at all; stdout={:?} stderr={:?}",
-        stdout_of(&out),
-        stderr_of(&out),
-    );
-    assert_eq!(
-        stdout_of(&out),
-        format!(
-            "frpc: the configuration file {cfg} syntax is ok\n  Server: 127.0.0.1:7000\n  \
-             Proxies: 0\n  Visitors: 0\n"
+    for (name, body) in [
+        (
+            "typeless_visitor.ini",
+            "[v]\nrole = \"visitor\"\nlocal_port = 1\nremote_port = 2\n",
         ),
-        "a typeless visitor must register as neither a proxy nor a visitor; stderr={:?}",
-        stderr_of(&out),
-    );
-    assert!(
-        stderr_of(&out).is_empty(),
-        "verify writes nothing to stderr on success; stderr={:?}",
-        stderr_of(&out),
-    );
+        (
+            "typeless_portless_visitor.ini",
+            "[v]\nrole = \"visitor\"\nserver_name = s\n",
+        ),
+    ] {
+        let cfg = dir.write(
+            name,
+            &format!("[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n{body}"),
+        );
 
-    let out = run_frpc(&["verify", "--strict-config", "-c", &cfg]);
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "strict mode refuses the uncollected section; stdout={:?} stderr={:?}",
-        stdout_of(&out),
-        stderr_of(&out),
-    );
-    assert!(
-        stdout_of(&out).contains("unknown field \"v\""),
-        "the refusal must name the uncollected section; stdout={:?}",
-        stdout_of(&out),
-    );
-    assert!(
-        stderr_of(&out).is_empty(),
-        "the refusal goes to stdout, Go-style; stderr={:?}",
-        stderr_of(&out),
-    );
+        for strict in ["--strict-config=false", "--strict-config"] {
+            let out = run_frpc(&["verify", strict, "-c", &cfg]);
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "a typeless visitor is refused in both modes ({name}, {strict}); stdout={:?} stderr={:?}",
+                stdout_of(&out),
+                stderr_of(&out),
+            );
+            assert!(
+                stdout_of(&out).contains("type shouldn't be empty"),
+                "Go's typeless-visitor message ({name}, {strict}); stdout={:?}",
+                stdout_of(&out),
+            );
+            assert!(
+                stderr_of(&out).is_empty(),
+                "the refusal goes to stdout, Go-style; stderr={:?}",
+                stderr_of(&out),
+            );
+        }
+    }
 }
 
 /// A typeless **camelCase** `[webServer]` in a client `.ini` is frpc's admin

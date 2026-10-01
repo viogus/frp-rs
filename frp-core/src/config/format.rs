@@ -204,7 +204,7 @@ fn ini_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>>
                 continue;
             }
 
-            let parsed_value = infer_ini_value(value_str);
+            let parsed_value = ini_value_for_key(value_str, &key, current, &sections);
 
             match current {
                 Some(index) => {
@@ -217,8 +217,12 @@ fn ini_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>>
         }
     }
 
+    // Go's legacy detector is a whole-file `GetSection("common")`
+    // (`DetectLegacyINIFormat`, pkg/config/load.go:65), so the dialect is known
+    // before any section is inserted, whatever the order of the headers.
+    let legacy_ini = sections.iter().any(|(name, _)| name == "common");
     for (name, table) in sections {
-        insert_ini_section(&mut root, &name, table)?;
+        insert_ini_section(&mut root, &name, table, legacy_ini)?;
     }
 
     Ok(toml::Value::Table(root))
@@ -234,6 +238,24 @@ fn ini_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>>
 /// is what the legacy dialect needs (`plugin.user-manager`, `web01`,
 /// `my.proxy`), and so does a header in the set that carries a `type` key — see
 /// [`ini_section_path`].
+///
+/// The v1 **array** roots are deliberately absent. `proxies`, `visitors` and
+/// `http_plugins` are `Vec`s in the v1 schema, and an INI header cannot nest
+/// into an array: expanding `[visitors.foo]` built
+/// `visitors = { foo = { … } }`, a map where the deserializer wants a
+/// sequence, so the file was refused with `invalid type: map, expected a
+/// sequence` in *both* loader modes where Go v0.71.0 accepts it (measured:
+/// `frpc verify` on `[visitors.foo] server_name = s` and on a port-carrying
+/// `[proxies.foo]`, and `frps verify` on a portless `[http_plugins.foo]`, are
+/// rc 0 on Go under both `--strict-config` values). Go's legacy loader does not
+/// expand at all (`gopkg.in/ini.v1` has no dotted-path notion): the section is
+/// named literally `visitors.foo` there. It is listed as a *known section* for
+/// the client by `collect_legacy_ini_proxy_sections`, which reads it as the
+/// legacy proxy section its header names — `visitors`/`proxies` are therefore
+/// in that function's array-root list. `http_plugins`/`httpPlugins` are kept
+/// here: the server has no collector, so un-nesting the header would only move
+/// the failure from a type error to `unknown field "http_plugins.foo"` without
+/// reaching Go (recorded as a residual, `TODO.md`).
 const INI_NESTED_SECTION_ROOTS: &[&str] = &[
     "common",
     "web_server",
@@ -241,8 +263,6 @@ const INI_NESTED_SECTION_ROOTS: &[&str] = &[
     "auth",
     "transport",
     "log",
-    "proxies",
-    "visitors",
     "http_plugins",
     "httpPlugins",
     "feature",
@@ -271,12 +291,12 @@ const INI_NESTED_SECTION_ROOTS: &[&str] = &[
 ///   (`pkg/config/legacy/server.go`, `section.Name()`), so `[auth.foo]` is one
 ///   section there too. Expanding it dropped the proxy in both loader modes; the
 ///   guard keeps it. (The cost, documented in `docs/config.md`: a v1 nested
-///   table that itself carries `type` — a `[visitors.plugin]`-style table in an
+///   table that itself carries `type` — an `[auth.plugin]`-style table in an
 ///   `.ini` — does not expand either, which is also what the base tree did. It is
 ///   then read as any other flat section: on the **client** the legacy collector
 ///   takes it for a proxy named after the header and proxy validation refuses it
-///   (measured: `[visitors.plugin] type = "https2http"` → rc 1, `proxy
-///   'visitors.plugin': invalid proxy_type 'https2http'`), on the **server** it is
+///   (measured: `[auth.plugin] type = "https2http"` → rc 1, `proxy
+///   'auth.plugin': invalid proxy_type 'https2http'`), on the **server** it is
 ///   an unknown strict-mode field.)
 ///
 ///   The same holds for a section that carries `local_port` or `remote_port` but
@@ -337,18 +357,38 @@ fn ini_section_path(section: &str, table: &toml::Table) -> Option<Vec<String>> {
 /// Both orders are pinned by
 /// `dotted_ini_section_headers_become_nested_tables_in_both_modes`; the asymmetry
 /// is a property of "later key wins" in the verbatim path, not of the conflict
-/// check. A **verbatim** name that collides with an existing non-table value keeps
-/// that value and drops the section's keys, which is the long-standing `or_insert`
-/// behaviour.
+/// check.
+///
+/// A **verbatim** name that collides with an already-present *non-table* value
+/// (a root scalar, e.g. `includes = 1` next to an `[includes]` section) keeps
+/// the **section** — but only in the legacy dialect, i.e. a `.ini` that has a
+/// `[common]` section. Go keeps the two namespaces apart there — a `[name]`
+/// section and a DefaultSection key `name = …` are independent in
+/// `gopkg.in/ini.v1`, and the legacy reader ignores every DefaultSection key
+/// (`LoadAllProxyConfsFromIni` skips `ini.DefaultSection`,
+/// `pkg/config/legacy/client.go:255-257`) — so the section's keys (which the
+/// collector reads) must survive the collision. On the **v1** path a
+/// `[common]`-less `.ini` is decoded into one Go struct, so the same collision
+/// is a type error Go reports (`json: cannot unmarshal string into Go value of
+/// type v1.rawClientConfig`) and the scalar has to be kept: measured rc 1 in
+/// both loader modes on Go v0.71.0, the parent and this tree, where
+/// `webServer = 1` precedes `[webServer] tls_cert_file = "x"`.
 fn insert_ini_section(
     root: &mut toml::Table,
     section: &str,
     table: toml::Table,
+    legacy_ini: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(path) = ini_section_path(section, &table) else {
         let slot = root
             .entry(section.to_string())
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        // Only the legacy dialect lets the section win (see the doc comment
+        // above): on the v1 path the colliding scalar is what Go decodes, so it
+        // survives and fails the v1 type check.
+        if legacy_ini && slot.as_table().is_none() {
+            *slot = toml::Value::Table(toml::Table::new());
+        }
         if let Some(dst) = slot.as_table_mut() {
             for (key, value) in table {
                 dst.insert(key, value);
@@ -370,6 +410,40 @@ fn insert_ini_section(
         cur.insert(key, value);
     }
     Ok(())
+}
+
+/// The value a `key = value` line contributes, applying Go's legacy-`start`
+/// text model to the one `[common] start` key.
+///
+/// `gopkg.in/ini.v1` never parses a value into a list: Go fills the legacy
+/// `Start []string` (`pkg/config/legacy/client.go:119`) through
+/// `Key.Strings(",")`, which splits the **raw value text** (key.go:492), so the
+/// field sees the text the file wrote. Everything `infer_ini_value` produces
+/// renders back to exactly that text (`ini_value_text`) except a `[a, b]`
+/// bracket literal, which is parsed into an `Array`; for this one key that loss
+/// decides which sections Go dispatches, so the literal is handed back as text.
+/// Measured on Go v0.71.0: `[common] start = ["start"]` next to a `[start]`
+/// section registers no proxy (`startProxy` is the single piece `["start"]`),
+/// while a bare `start = p1,p2` selects both sections.
+fn ini_value_for_key(
+    value_str: &str,
+    key: &str,
+    current: Option<usize>,
+    sections: &[(String, toml::Table)],
+) -> toml::Value {
+    let parsed_value = infer_ini_value(value_str);
+    let common_start = key == "start"
+        && matches!(parsed_value, toml::Value::Array(_))
+        && !round_trips(&parsed_value, value_str)
+        && current.is_some_and(|index| {
+            sections
+                .get(index)
+                .is_some_and(|(name, _)| name == "common")
+        });
+    if common_start {
+        return toml::Value::String(value_str.to_string());
+    }
+    parsed_value
 }
 
 /// Deepest legitimate nesting for infer_ini_value (array literal inside a
