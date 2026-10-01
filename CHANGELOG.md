@@ -1193,6 +1193,11 @@ User-facing release notes for frp-rs.
   that row, the empty-value rows, the position row and the measured drop branch
   are in `docs/developing.md` § `--strict-config`: the space-separated value
   form.
+- **The `frps` `-c` run path's loader doc link now names the loader it calls.** The sentence at
+  `frps/src/main.rs:332` named `load_server_config_uncompleted` where the run path calls
+  `load_server_config_uncompleted_with_presence` (`frps/src/main.rs:967`); it now states the relationship
+  (the presence-carrying form of the plain loader, i.e. the completing loader minus
+  `ServerConfig::complete`).
 
 ### CI & Tooling
 
