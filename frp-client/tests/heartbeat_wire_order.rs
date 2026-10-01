@@ -26,6 +26,12 @@
 //! 1s period would land ~1s late and must RED; rationale in the mock
 //! below); (3) a second Ping arrives ~1s after the first; (4) exactly one
 //! Login over the whole session.
+//!
+//! The file also holds the cached-snapshot pin
+//! (`ping_reuses_startup_token_snapshot_when_source_becomes_unreadable`) and
+//! the restored ping skip/re-arm pin
+//! (`skipped_ping_rearms_interval_on_two_second_backoff`); each carries its own
+//! timeline doc below.
 
 mod common;
 
@@ -516,6 +522,339 @@ async fn ping_reuses_startup_token_snapshot_when_source_becomes_unreadable() {
         login_count.load(Ordering::SeqCst),
         1,
         "client reconnected during the heartbeat snapshot session"
+    );
+
+    client.request_stop();
+    tokio::time::timeout(Duration::from_secs(8), runner)
+        .await
+        .expect("client did not shut down after request_stop")
+        .expect("client run() panicked");
+    assert_eq!(
+        login_count.load(Ordering::SeqCst),
+        1,
+        "client reconnected during the whole session"
+    );
+    std::mem::drop(mock);
+}
+
+/// The OIDC exec token source: one appended log line per invocation, so the
+/// log is the invocation counter AND the mock's observation channel for the
+/// failed tick. Invocation #3 (the SECOND heartbeat tick) exits 1, which makes
+/// `OidcClient::set_ping` fail and drives the client into the ping skip arm;
+/// every other invocation prints the token on stdout.
+#[cfg(feature = "oidc")]
+const OIDC_EXEC_SCRIPT: &str = "\
+n=$(wc -l < \"$1\")\n\
+printf 'invocation %s\\n' \"$((n + 1))\" >> \"$1\"\n\
+if [ \"$((n + 1))\" -eq 3 ]; then\n\
+printf 'simulated auth.oidc.tokenSource outage on invocation 3\\n' >&2\n\
+exit 1\n\
+fi\n\
+printf '%s' \"$2\"\n";
+
+/// Number of times the exec token source has run so far (one log line each).
+#[cfg(feature = "oidc")]
+fn exec_invocations(log: &std::path::Path) -> usize {
+    std::fs::read_to_string(log)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+/// Wait until the exec source has run at least `want` times and return the
+/// instant the invocation became observable. Polling a tiny file at 10ms is the
+/// least invasive observation channel available here: it never touches the
+/// control stream (the frame reads below stay strictly ordered) and it is
+/// event-driven — the caller measures from this instant, so no fixed sleep ever
+/// has to bracket the failure.
+#[cfg(feature = "oidc")]
+async fn wait_for_exec_invocations(
+    log: &std::path::Path,
+    want: usize,
+    within: Duration,
+) -> Instant {
+    let deadline = Instant::now() + within;
+    loop {
+        if exec_invocations(log) >= want {
+            return Instant::now();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "auth.oidc.tokenSource ran {} times, expected >= {want} within {:?}: \
+             the skipped heartbeat tick never re-ran the source, so no retry \
+             was scheduled",
+            exec_invocations(log),
+            within
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Assert `frame` is a Ping carrying the RAW OIDC token as its privilege key.
+/// Unlike the token path (`assert_ping_key` above), Go's OIDC setter fills only
+/// `PrivilegeKey` and leaves `Timestamp` unset (`pkg/auth/oidc.go` setPing), so
+/// this must not accept an md5 key and must not require a timestamp.
+#[cfg(feature = "oidc")]
+fn assert_oidc_ping_key(frame: &FrpMessage, token: &str) {
+    match frame {
+        FrpMessage::Ping(p) => {
+            assert_eq!(
+                p.privilege_key.as_deref(),
+                Some(token),
+                "Ping must carry the OIDC token as its raw privilege_key"
+            );
+            assert!(
+                p.timestamp.is_none(),
+                "Go frp's OIDC Ping setter only sets PrivilegeKey \
+                 (pkg/auth/oidc.go), so the ping timestamp stays unset"
+            );
+        }
+        other => panic!("expected Ping, got {other:?}"),
+    }
+}
+
+/// Restored e2e oracle for the heartbeat skip + fast re-arm arm
+/// (`frp-client/src/service.rs:3509-3526`, `interval.reset_after(delay)` at
+/// `:3523`). The pre-fix `auth.tokenSource` test of that arm was deleted with
+/// the single-execution fix (`cac4f52a`), and because the client's
+/// `AuthConfig.token_source` is now left unset, the token path can no longer
+/// fail: the arm is reachable ONLY through the OIDC ping branch
+/// (`frp-client/src/service.rs:3481-3491`, `oidc.set_ping` failure). Deleting
+/// `reset_after` again must therefore redden THIS test.
+///
+/// Trigger: `method = "oidc"` with `auth.oidc.tokenSource` bound to an exec
+/// command that fails on exactly its third invocation. Timeline
+/// (heartbeat_interval = 10s, heartbeat_timeout = 30s):
+///   L        LoginResp written; the source has run once (set_login);
+///   L+ε      Ping#1 — the interval's first tick fires immediately; set_ping
+///            runs invocation #2 (succeeds, token printed) and the Ping carries
+///            that raw token;
+///   T2       tick 2 (L+10s): invocation #3 exits 1 → the client logs the
+///            failure, sets `skip_ping`, sends NOTHING, and re-arms the interval
+///            at `next_ping_backoff(None, 10s)` = 2s (InitDurationIfFail 1s ×
+///            Factor 2, capped at the period);
+///   T2+2s    the re-armed tick: invocation #4 succeeds → Ping#2;
+///   +10s     Ping#3, back on the interval period.
+///
+/// Oracles (the decisive one is (3), anchored at T2 — the mock's own
+/// observation of the failed invocation, never at test start):
+///   (1) the first frame after LoginResp is Ping#1, within 3s (the first tick
+///       fires on the message loop's first poll; a first tick that waited out
+///       its full 10s period would land far outside);
+///   (2) every Ping carries the raw OIDC token and no timestamp;
+///   (3) `Ping#2 − T2 ∈ [1.0s, 6.0s]` — the re-armed tick. Nominal 2s; with
+///       `interval.reset_after(delay)` deleted the interval keeps its 10s
+///       period and the next attempt lands ~10s after T2, so the gap is ~5×
+///       the upper bound — RED. The window is centered on the 2s/10s pair with
+///       ≥4s of slack on each side, deliberately generous: under host load the
+///       measured gap can only grow, so the load-sensitive edge is the upper
+///       one and the mutant sits 4s beyond it;
+///   (4) `Ping#3 − Ping#2 ∈ [6.0s, 15.0s]` — the period cadence resumed (a
+///       backoff that kept re-arming would ping every ~2s);
+///   (5) exactly one Login.
+///
+/// A skip that sent the Ping anyway (or a teardown instead of a skip) also
+/// reddens: the frame would arrive ~0s after T2 without a valid key and/or the
+/// session would drop.
+#[cfg(feature = "oidc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skipped_ping_rearms_interval_on_two_second_backoff() {
+    use frp_core::unsafe_features::{UnsafeFeatures, TOKEN_SOURCE_EXEC};
+
+    common::init_tracing();
+    let token = "oidc-rearm-token";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script_path = dir.path().join("oidc-token-exec.sh");
+    let log_path = dir.path().join("oidc-exec-invocations.txt");
+    std::fs::write(&script_path, OIDC_EXEC_SCRIPT).expect("write exec script");
+    std::fs::write(&log_path, "").expect("create exec invocation log");
+    let script_str = script_path.to_str().unwrap().to_owned();
+    let log_str = log_path.to_str().unwrap().to_owned();
+
+    let server_port = allocate_port();
+    let listener = TcpListener::bind(("127.0.0.1", server_port)).await.unwrap();
+
+    let login_resp = FrpMessage::LoginResp(msg::LoginResp {
+        version: Some(frp_core::VERSION.into()),
+        run_id: Some("mock-server-run".into()),
+        error: None,
+        server_additional_auth_scopes: None,
+    });
+    // The OIDC config carries no `auth.token`, so `AuthConfig.token` is empty
+    // and the control-stream key is derive_key("") (service.rs:990 + :1779).
+    let enc_key = frp_core::encryption::derive_key("");
+    let pong = FrpMessage::Pong(msg::Pong { error: None });
+
+    let login_count = Arc::new(AtomicUsize::new(0));
+    let count = login_count.clone();
+    // Signals the mock verified the re-arm oracle (skipped tick + 2s backoff).
+    let (pings_ok_tx, pings_ok_rx) = tokio::sync::oneshot::channel::<()>();
+    let mock_log = log_path.clone();
+    let mock = tokio::spawn(async move {
+        let (conn, _) = listener.accept().await.expect("control conn");
+        let mut stream = IoStream::Tcp(conn);
+        let login = tokio::time::timeout(Duration::from_secs(15), stream.read_v1_frame())
+            .await
+            .expect("login timeout")
+            .expect("read Login");
+        assert!(matches!(login, FrpMessage::Login(_)));
+        count.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            exec_invocations(&mock_log),
+            1,
+            "set_login must have run auth.oidc.tokenSource exactly once before \
+             the Login reached the wire"
+        );
+
+        stream
+            .write_v1_frame(&login_resp)
+            .await
+            .expect("write LoginResp");
+        let login_resp_at = Instant::now();
+        let mut enc = stream
+            .into_encrypted(enc_key)
+            .expect("plain test stream is encryptable");
+
+        // Oracle 1: Ping#1 is the loop's immediate first tick.
+        let f1 = tokio::time::timeout(Duration::from_secs(10), enc.read_v1_frame())
+            .await
+            .expect("no first tick Ping after LoginResp")
+            .expect("read first Ping");
+        let first_ping_gap = login_resp_at.elapsed();
+        assert!(
+            matches!(f1, FrpMessage::Ping(_)),
+            "first frame after LoginResp must be a Ping, got {f1:?}"
+        );
+        assert!(
+            first_ping_gap <= Duration::from_secs(3),
+            "first Ping arrived {}ms after LoginResp (expected ~ms: tick 1 fires \
+             immediately on the message loop's first poll; a first tick that \
+             waited out its full 10s period would land ~10000ms late — RED)",
+            first_ping_gap.as_millis()
+        );
+        assert_oidc_ping_key(&f1, token);
+        enc.write_v1_frame(&pong).await.expect("write Pong");
+        assert_eq!(
+            exec_invocations(&mock_log),
+            2,
+            "Ping#1's set_ping must have run auth.oidc.tokenSource exactly once \
+             more (login + tick 1)"
+        );
+
+        // Tick 2 (~10s after LoginResp): invocation #3 exits 1, so the client
+        // skips this ping and re-arms the interval at the 2s fast backoff. The
+        // failed invocation is the observation channel for that skip moment.
+        let tick2_at = wait_for_exec_invocations(&mock_log, 3, Duration::from_secs(20)).await;
+
+        // Oracle 3 (decisive): Ping#2 is the re-armed tick, ~2s after the
+        // failure. Without `interval.reset_after(delay)` it would be ~10s.
+        let f2 = tokio::time::timeout(Duration::from_secs(15), enc.read_v1_frame())
+            .await
+            .expect("no Ping after the skipped tick: the 2s re-arm never fired")
+            .expect("read second Ping");
+        let ping2_at = Instant::now();
+        assert_oidc_ping_key(&f2, token);
+        let rearm_gap = ping2_at.duration_since(tick2_at);
+        assert!(
+            rearm_gap >= Duration::from_secs(1) && rearm_gap <= Duration::from_secs(6),
+            "Ping#2 arrived {}ms after the failed tick (expected ~2000ms: the \
+             skip arm re-arms the interval at next_ping_backoff(None, 10s) = 2s \
+             — InitDurationIfFail 1s x Factor 2, capped at the 10s period). \
+             With interval.reset_after(delay) removed the interval keeps its \
+             10s period and Ping#2 lands ~10000ms after the failed tick — RED",
+            rearm_gap.as_millis()
+        );
+        enc.write_v1_frame(&pong).await.expect("write Pong");
+
+        // Oracle 4: the period cadence resumes after the successful retry.
+        let f3 = tokio::time::timeout(Duration::from_secs(20), enc.read_v1_frame())
+            .await
+            .expect("no third Ping")
+            .expect("read third Ping");
+        let ping3_at = Instant::now();
+        assert_oidc_ping_key(&f3, token);
+        let cadence = ping3_at.duration_since(ping2_at);
+        assert!(
+            cadence >= Duration::from_secs(6) && cadence <= Duration::from_secs(15),
+            "heartbeat cadence drifted: Ping#3 came {}ms after Ping#2 (expected \
+             ~10000ms — the 10s interval period; a backoff that kept re-arming \
+             would tick at ~2000ms)",
+            cadence.as_millis()
+        );
+        enc.write_v1_frame(&pong).await.expect("write Pong");
+        let _ = pings_ok_tx.send(());
+
+        // Cadence verified: answer heartbeats until the test stops the client.
+        loop {
+            match enc.read_v1_frame().await {
+                Ok(FrpMessage::Ping(_)) => {
+                    enc.write_v1_frame(&pong).await.expect("write Pong");
+                }
+                Ok(_) => {}
+                Err(_) => break, // client closed at stop
+            }
+        }
+    });
+
+    let client_cfg = ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port,
+        // No static token: the OIDC source is the only credential.
+        token: String::new(),
+        auth: Some(frp_core::config::AuthClientConfig {
+            method: "oidc".into(),
+            oidc_client_id: "g7-r2-oidc-client".into(),
+            // With a token source, OidcClient::new sets no endpoint and skips
+            // discovery/JWKS entirely (frp-core/src/auth.rs:1333-1336), so this
+            // test needs no identity provider.
+            oidc_token_source: Some(frp_core::config::ValueSource {
+                source_type: "exec".into(),
+                file: None,
+                exec: Some(frp_core::config::ExecSource {
+                    command: "sh".into(),
+                    args: vec![script_str, log_str, token.into()],
+                    env: vec![],
+                }),
+            }),
+            additional_auth_scopes: vec!["HeartBeats".into()],
+            ..Default::default()
+        }),
+        login_fail_exit: false,
+        tcp_mux: false,
+        tls_enable: false,
+        heartbeat_interval: 10,
+        heartbeat_timeout: 30,
+        proxies: vec![],
+        ..Default::default()
+    };
+    let client = Arc::new(
+        ClientService::with_unsafe_features(
+            client_cfg,
+            None,
+            UnsafeFeatures::new(&[TOKEN_SOURCE_EXEC]),
+        )
+        .await
+        .expect(
+            "client construction must accept an exec auth.oidc.tokenSource \
+             under the TokenSourceExec allowlist",
+        ),
+    );
+    let runner = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let _ = client.run().await;
+        })
+    };
+
+    // Wall time: Ping#1 right after login + tick 2 ~10s later + re-armed Ping#2
+    // ~2s after that + Ping#3 ~10s after Ping#2, plus startup margin.
+    tokio::time::timeout(Duration::from_secs(45), pings_ok_rx)
+        .await
+        .expect("mock never verified the ping skip + 2s re-arm cadence")
+        .expect("mock task ended before verifying the re-arm cadence");
+    assert_eq!(
+        login_count.load(Ordering::SeqCst),
+        1,
+        "client reconnected during the re-arm session"
     );
 
     client.request_stop();
