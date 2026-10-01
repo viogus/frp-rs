@@ -583,8 +583,8 @@ fn or_insert_deep(dst: &mut toml::Table, src: toml::Table) {
 /// include list. Go's **client** legacy reader has the field
 /// (`IncludeConfigFiles []string \`ini:"includes"\``,
 /// `pkg/config/legacy/client.go:166`; `ParseClientConfig` renders it,
-/// `pkg/config/legacy/parse.go:50`). The **server** side has no include handling
-/// at all: `LoadServerConfig` (`pkg/config/load.go:295`) unmarshals `[common]`
+/// `pkg/config/legacy/parse.go:50`). The **server** side never reads that list:
+/// `LoadServerConfig` (`pkg/config/load.go:295`) unmarshals `[common]`
 /// into `legacy.ServerCommonConf` (`pkg/config/legacy/server.go:220`), a struct
 /// with no `includes` field, and the only expansion
 /// (`LoadAdditionalClientConfigs`, `pkg/config/load.go:381-382`) sits inside

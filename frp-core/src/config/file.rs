@@ -273,7 +273,7 @@ pub(super) fn process_includes(
     // the v1 `includes: Vec<String>` decode and refused the file
     // (`invalid type: integer \`1\`, expected a sequence`, rc 1 in both modes).
     // Scrub the scalar spellings here, while the raw dialect is still visible:
-    // after the `[common]` hoist at `frp-core/src/config/normalize.rs:1162-1166`
+    // after the `[common]` hoist at `frp-core/src/config/normalize.rs:1185-1189`
     // the two spellings are indistinguishable, and a `.ini` *without* `[common]`
     // goes down Go's v1 path too, so its type error (`includes = 1` there is rc 1
     // in both modes) must stay.
@@ -304,15 +304,15 @@ pub(super) fn process_includes(
     // `cfg.IncludeConfigFiles`, `pkg/config/legacy/parse.go:50`), so a
     // `[common] includes` has to be expanded even though it sits one table
     // below the top level. Reading it here — before the `[common]` hoist at
-    // `frp-core/src/config/normalize.rs:1162` — is what orders the walk the way
+    // `frp-core/src/config/normalize.rs:1185` — is what orders the walk the way
     // Go orders it (common first, included sections after). The section-less
     // top-level spelling below stays an frp-rs extension: Go skips
     // `ini.DefaultSection` (`pkg/config/legacy/client.go:204`) and ignores it
     // (measured: rc 0, zero proxies), which the pin
     // `legacy_ini_default_section_string_include_is_still_expanded` records.
-    //
-    // Client only. Go has no include handling on the server path:
-    // `LoadServerConfig` (`pkg/config/load.go:295`) maps `[common]` onto
+    // Client only: the legacy `[common]` include list is read on the client load
+    // alone. Go's server path never reads it: `LoadServerConfig`
+    // (`pkg/config/load.go:295`) maps `[common]` onto
     // `legacy.ServerCommonConf` (`pkg/config/legacy/server.go:220`), a struct
     // with no `includes` field, and the only expansion
     // (`LoadAdditionalClientConfigs`, `pkg/config/load.go:381-382`) is inside
@@ -326,10 +326,13 @@ pub(super) fn process_includes(
     // The spelling is Go's exactly: only the **string** key `includes`
     // (`IncludeConfigFiles []string \`ini:"includes"\``,
     // `pkg/config/legacy/client.go:166`). Measured on v0.71.0: `include =
-    // "<file>"` and `includes = ["<file>"]` both yield rc 0 with zero proxies
-    // (the singular is a key Go never maps; the array is a literal string to
-    // Go's reader, so it matches no file), while the string and a string glob
-    // (`includes = "sub*.ini"`, `getIncludeContents`'s `filepath.Match`,
+    // "<file>"` yields rc 0 with zero proxies (a key Go never maps), and
+    // `includes = ["<file>"]` does too for a *bare* relative name (the array is
+    // the literal bracketed string to Go's reader, so it matches no file) —
+    // though with a `./`-prefixed or absolute entry Go is rc 1 `include:
+    // directory of [...] not exist`, a pre-existing frp-rs divergence — while
+    // the string and a string glob (`includes = "sub*.ini"`,
+    // `getIncludeContents`'s `filepath.Match`,
     // `pkg/config/legacy/parse.go:87`) both expand. Leaving the two ignored
     // spellings in place keeps the pre-fix behaviour; the earlier `is_file_list`
     // widening let them expand where Go yields nothing.
@@ -350,14 +353,22 @@ pub(super) fn process_includes(
     } else {
         None
     };
+    // An empty pattern means "no includes", not a directory-less pattern. Go
+    // maps `includes = ""` to `[]string{""}`; `getIncludeContents` stats
+    // `filepath.Dir("")` = `.` (which exists), reads that directory, and then
+    // matches every entry against `filepath.Match(".", absFile)`, which never
+    // matches an absolute path — so the load succeeds with zero includes
+    // (`pkg/config/legacy/parse.go:68-97`, `legacy/client.go:166`). Keeping the
+    // empty string would instead join it onto the config directory and trip the
+    // missing-directory guard below with an empty `parent`.
     let mut patterns: Vec<String> = Vec::new();
     for includes in [legacy_common_includes, includes] {
         match includes {
             Some(Value::Array(arr)) => patterns.extend(arr.into_iter().filter_map(|v| match v {
-                Value::String(s) => Some(s),
+                Value::String(s) if !s.is_empty() => Some(s),
                 _ => None,
             })),
-            Some(Value::String(s)) => patterns.push(s),
+            Some(Value::String(s)) if !s.is_empty() => patterns.push(s),
             _ => {}
         }
     }
