@@ -8357,9 +8357,9 @@ section; ledger now **24 open / 104 closed**.**
   also touch that file, to avoid a literal conflict.
 
 - [x] **Rust frpc runs the `auth.tokenSource` `exec` command twice per successful login where Go runs it once.**
-  **Done (2026-10-01, at fix `61236591` / oracle `9f9cb110` on `fix/tokensource-single-exec`, PR #437, based on `ed2d71a3`; earlier heads `801a75fb` on `a0c16c83` and `b8a916a6` on `f503b4e7`, both patches `=` under `git range-diff` at each rebase.)** The source was
+  **Done (2026-10-01, at fix `663e1d38` / oracle `98166cb5` on `fix/tokensource-single-exec`, PR #437, based on `799ce048`; pre-rebase `61236591`/`9f9cb110` on `ed2d71a3` and `b8a916a6` on `f503b4e7`, originally `801a75fb` on `a0c16c83`, the patches `=` under `git range-diff` at each rebase (round 4 adds `3f705caa`).)** The source was
   resolved once at `frp-client/src/service.rs:939` but the same `ValueSource` was *also* stored in
-  `AuthConfig.token_source` at `:965`, so every Login (`frp-client/src/control.rs:369` →
+  `AuthConfig.token_source` at `:952` (pre-fix numbering; the post-fix `None` is `:965`), so every Login (`frp-client/src/control.rs:369` →
   `frp-core/src/auth.rs:427-428`), Ping (`frp-client/src/service.rs:3497`) and NewWorkConn
   (`frp-client/src/work_conn.rs:1770`) re-ran the command; Go resolves once in `NewService`
   (`client/service.go:168`, reused `:201`/`:316`) and only hashes the cached string. The stored
@@ -8384,11 +8384,12 @@ section; ledger now **24 open / 104 closed**.**
   The round-2 delta adversarial retracted F2 to LOW (coverage only) and added F5 LOW (the re-arm
   window below, now filed as its own item), F6 INFO (the comment at
   `frp-client/tests/heartbeat_wire_order.rs:644-650` says "~5x the upper bound" where the measured
-  ratio is about 1.67x), F7 INFO (the wrong line cite in this paragraph, corrected here) and F8 INFO
-  (this list). Residues recorded, not fixed: `frps` re-resolves the source per
+  ratio is about 1.67x, applied in round 4 so the comment now reads `~1.7×`), F7 INFO (the wrong line cite in this paragraph, corrected here) and F8 INFO
+  (the records row recorded only the round-1 adversarial verdict; closed by this text). Residues
+  recorded, not fixed: `frps` re-resolves the source per
   verification where Go's `BuildServerAuth` caches it (`pkg/auth/auth.go:106`); `method = "oidc"` plus `auth.tokenSource` executes once here
   and zero times in Go; `auth.oidc.tokenSource` stays per-operation (matches Go). Ledger after this
-  close: **29 open / 170 closed** (base `ed2d71a3`: 29 open / 169 closed; the residue
+  close: **25 open / 175 closed** (base `799ce048`: 25 open / 174 closed; the residue
   item below is the +1).
 
   Filed by the coordinator from the round-2 adversarial review of PR #429, which measured it and
