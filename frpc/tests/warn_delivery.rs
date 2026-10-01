@@ -80,13 +80,15 @@
 //! today: it runs only after `wait_for_exit` has reaped the child, so both pipes
 //! are at EOF and the joins return promptly — a fixture that spawned a
 //! pipe-inheriting process outliving the child would be the first to need one.
-//! [`drain`] stops on any read error, not only on EOF (`Ok(0) | Err(_) => break`
-//! in `frpc/tests/warn_delivery.rs`), so a pipe that fails for another reason
-//! truncates the capture rather than hanging it. That is fail-safe on the rows
-//! whose assertion demands a count — a truncated capture drops below the expected
-//! `1` and reds — but on the rows that assert silence it could hide a warning
-//! emitted before the error. That direction is carried, not fixed: it is LOW-4
-//! from the #441 review and is invisible to any count-based oracle.
+//! [`drain`] distinguishes a read error from EOF: `Ok(0)` ends the capture,
+//! `ErrorKind::Interrupted` retries, and any other error is returned from the
+//! reader thread so [`Spawned::join_drains`] reports it. Before this, the loop
+//! broke on `Ok(0) | Err(_)`, so a pipe that failed for another reason truncated
+//! the capture rather than hanging it — fail-safe on the rows whose assertion
+//! demands a count (a truncated capture drops below the expected `1` and reds),
+//! but on the rows that assert silence it could hide a warning emitted before
+//! the error. That was LOW-4 from the #441 review; the error is now asserted
+//! absent for both row kinds, and `drain_tests` pins the distinction directly.
 //! Counts are read **before** any signal.
 //!
 //! Gated on `full` for the same reason as `admin_cli.rs`: the `frpc` bin carries
@@ -222,8 +224,8 @@ struct Spawned {
     _guard: ChildGuard,
     stdout_buf: Arc<Mutex<String>>,
     stderr_buf: Arc<Mutex<String>>,
-    stdout_drain: Option<std::thread::JoinHandle<()>>,
-    stderr_drain: Option<std::thread::JoinHandle<()>>,
+    stdout_drain: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    stderr_drain: Option<std::thread::JoinHandle<std::io::Result<()>>>,
     stdout: String,
     stderr: String,
 }
@@ -286,13 +288,26 @@ impl Spawned {
 
     /// Join both reader threads. Called only after [`Spawned::wait_for_exit`],
     /// so both pipes are at EOF and the joins return promptly; after this the
-    /// buffers are immutable and [`Spawned::snapshot`] is a true freeze.
+    /// buffers are immutable and [`Spawned::snapshot`] is a true freeze. A reader
+    /// thread that ended on a **read error** rather than EOF makes the capture
+    /// partial, so its `Err` is surfaced here instead of being read as a quiet
+    /// stream — that is the whole point of the returned `Result`.
     fn join_drains(&mut self) {
         if let Some(handle) = self.stdout_drain.take() {
-            handle.join().expect("stdout reader thread panicked");
+            handle
+                .join()
+                .expect("stdout reader thread panicked")
+                .expect(
+                    "stdout reader thread failed before EOF — the capture is truncated, not final",
+                );
         }
         if let Some(handle) = self.stderr_drain.take() {
-            handle.join().expect("stderr reader thread panicked");
+            handle
+                .join()
+                .expect("stderr reader thread panicked")
+                .expect(
+                    "stderr reader thread failed before EOF — the capture is truncated, not final",
+                );
         }
     }
 
@@ -343,23 +358,122 @@ impl Spawned {
 /// Read a child's pipe to EOF on its own thread, appending into `sink`. The
 /// handle is kept so the caller can join it after the child exits, which is what
 /// turns "the reader has probably caught up" into "the pipe is at EOF and the
-/// buffer is final".
+/// buffer is final". Only `Ok(0)` is EOF; `ErrorKind::Interrupted` is a signal,
+/// not an end, so it retries; any other error is returned from the thread and
+/// surfaced by [`Spawned::join_drains`], because a capture that stopped on an
+/// error is **truncated**, not final — on a row that asserts silence a truncated
+/// capture would otherwise look like a quiet stream.
 fn drain<R: Read + Send + 'static>(
     mut pipe: R,
     sink: Arc<Mutex<String>>,
-) -> std::thread::JoinHandle<()> {
+) -> std::thread::JoinHandle<std::io::Result<()>> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match pipe.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => return Ok(()),
                 Ok(n) => sink
                     .lock()
                     .unwrap()
                     .push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
             }
         }
     })
+}
+
+/// Teeth for [`drain`]'s error handling. The old loop (`Ok(0) | Err(_) => break`)
+/// cannot be reached through a real child: a `frpc` pipe reaches EOF, so nothing
+/// in the spawned-binary tests distinguishes "EOF" from "a read error". These
+/// drive the reader directly with the failing shape the module header used to
+/// disclose, so removing the distinction reds *here* rather than silently
+/// weakening a silence row.
+#[cfg(test)]
+mod drain_tests {
+    use super::drain;
+    use std::io::{self, Read};
+    use std::sync::{Arc, Mutex};
+
+    fn run<R: Read + Send + 'static>(pipe: R) -> (io::Result<()>, String) {
+        let sink = Arc::new(Mutex::new(String::new()));
+        let result = drain(pipe, sink.clone())
+            .join()
+            .expect("drain thread panicked");
+        let text = sink.lock().unwrap().clone();
+        (result, text)
+    }
+
+    /// [`Read`] that hands out one record and then fails — a pipe error, not EOF.
+    struct RecordThenError {
+        data: &'static [u8],
+        sent: bool,
+    }
+
+    impl Read for RecordThenError {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.sent {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "pipe failed"));
+            }
+            self.sent = true;
+            let n = self.data.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            Ok(n)
+        }
+    }
+
+    /// [`Read`] that raises `EINTR` once, then yields a record and EOF.
+    struct InterruptedOnce {
+        state: u8,
+    }
+
+    impl Read for InterruptedOnce {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.state {
+                0 => {
+                    self.state = 1;
+                    Err(io::Error::new(io::ErrorKind::Interrupted, "EINTR"))
+                }
+                1 => {
+                    self.state = 2;
+                    buf[..5].copy_from_slice(b"kept\n");
+                    Ok(5)
+                }
+                _ => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_error_is_reported_and_not_read_as_eof() {
+        let (result, text) = run(RecordThenError {
+            data: b"partial record\n",
+            sent: false,
+        });
+        assert_eq!(
+            text, "partial record\n",
+            "bytes read before the error are still captured"
+        );
+        let err = result.expect_err("a non-EOF read error must be reported, not folded into EOF");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn interrupted_is_retried_and_does_not_end_the_capture() {
+        let (result, text) = run(InterruptedOnce { state: 0 });
+        assert!(
+            result.is_ok(),
+            "EINTR is a signal, not a failure; got {result:?}"
+        );
+        assert_eq!(text, "kept\n");
+    }
+
+    #[test]
+    fn eof_ends_the_capture_cleanly() {
+        let (result, text) = run(std::io::Cursor::new(b"one record\n".to_vec()));
+        assert!(result.is_ok(), "plain EOF is success; got {result:?}");
+        assert_eq!(text, "one record\n");
+    }
 }
 
 /// Which spelling of the nested TLS section the config uses. All three named
