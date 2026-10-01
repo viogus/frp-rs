@@ -9112,7 +9112,7 @@ section; ledger now **24 open / 104 closed**.**
   **15 open / 186 closed** (base `e4c23b2f`: 16 open / 185 closed).
 
 - [ ] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
-  Filed by the coordinator while closing `TODO.md:8359` (PR #430), which removed the two local `pkill -f`
+  Filed by the coordinator while closing `TODO.md:8425` (PR #430), which removed the two local `pkill -f`
   calls in `scripts/compat-test.sh`: `scripts/remote-frps.sh:195` and `:339` still run
   `pkill -f 'frps -c frps.toml'` and `:409` uses `pgrep -f` on the same text, over ssh, to manage the
   comparison server on a remote VPS. Name-plus-argument is the same hazard the local sweep just lost — a
