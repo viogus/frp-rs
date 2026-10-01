@@ -541,7 +541,9 @@ jobs:
           sed -e 's/\x1b\[[0-9;]*m//g' "$sabotage" > "$sabotage.plain"
           sabotaged=$(grep -E -c "^test ${expected} \.\.\. FAILED$" "$sabotage.plain" || true)
           [ "$sabotaged" = "1" ] || status=1
+          sabotage_marker=0
           if grep -q -x -F "$marker" "$sabotage.plain"; then
+            sabotage_marker=1
             status=1
           fi
           if [ "$status" != "0" ]; then
@@ -558,8 +560,16 @@ jobs:
             fi
             if [ "$sabotaged" != "1" ]; then
               echo "::error::the sabotaged run (FRP_WARNING_PIN_SABOTAGE=1) did not fail ${expected} — the resolver pin cannot be made to fail, so a body that skips its assertions, or a same-named stub that only prints the marker, passes while asserting nothing; restore the assertions"
+            elif [ "$sabotage_marker" = "1" ]; then
+              # Only reachable when the sabotaged run *did* fail, so the marker
+              # it printed cannot be the pass-path marker of a vacuous pin:
+              # the body printed it before the assertion it is meant to follow.
+              echo "::error::the sabotaged run printed the completion marker (\"$marker\") while failing ${expected} — the marker is printed before the assertions it is supposed to witness; move it back after them"
             fi
-            if [ "$(grep -c -x -F "$marker" "$log.plain" || true)" = "0" ]; then
+            # `sabotage_marker = 1` means the `elif` above already owns the
+            # diagnosis (a marker printed before the assertion it witnesses), so
+            # this branch must stay out of that case or the two contradict.
+            if [ "$sabotage_marker" = "0" ] && [ "$(grep -c -x -F "$marker" "$log.plain" || true)" = "0" ]; then
               # "No marker" and "no assertions" are different edits, and the
               # sabotaged run tells them apart: it still fails when the
               # assertions are intact, so a marker-only edit is not sent after

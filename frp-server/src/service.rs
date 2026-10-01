@@ -2639,7 +2639,20 @@ mod tests {
         // vacuous pin cannot be made to fail. Never set outside that step.
         #[cfg(debug_assertions)]
         let want = if std::env::var_os("FRP_WARNING_PIN_SABOTAGE").is_some() {
-            WebServerTlsEnableReader::from_features(true, true)
+            // Any variant *other* than the honest answer, so the hook flips the
+            // expectation in every feature shape. Hard-coding
+            // `from_features(true, true)` read as the same thing but collided
+            // with the honest answer whenever `tls` was on — e.g. if
+            // `frp-server`'s `dashboard` feature ever implied `tls`, the
+            // assertion held, the sabotaged run passed, and the guard
+            // false-reddened with "restore the assertions" while the hook was a
+            // no-op, silently disabling the guard for exactly the
+            // `dashboard`+`tls` shape this pin exists to separate.
+            if want == WebServerTlsEnableReader::WebServerTls {
+                WebServerTlsEnableReader::WebServerNoTls
+            } else {
+                WebServerTlsEnableReader::WebServerTls
+            }
         } else {
             want
         };
