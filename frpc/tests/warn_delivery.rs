@@ -39,7 +39,7 @@
 //! **Why the child exits, and why that exit is the oracle.** `[web_server] port`
 //! is a free port and `server_port` points at one with no listener, so the load
 //! succeeds, the warning is emitted, and the login attempt is refused. The
-//! configs take the default `login_fail_exit = true`, so the child then exits on
+//! configs set `login_fail_exit = true` explicitly, so the child then exits on
 //! its own; [`Spawned::run`] waits for that exit, joins both reader threads (the
 //! pipes are at EOF once the child is gone) and only then freezes the snapshot.
 //! The asserted count is therefore **final**: nothing can emit after the process
@@ -73,9 +73,13 @@
 //! crate's `cfg!` answer produced but not the text), the admin server's actual
 //! HTTP/HTTPS behaviour, and other sinks.
 //!
-//! Bounded: every wait has a deadline, every child is killed and reaped by
-//! [`ChildGuard::drop`] even on panic, and each test picks its own ports from the
-//! ephemeral range (never 7000 — held on this host by macOS Control Center).
+//! Bounded: [`Spawned::wait_for_exit`] has a deadline, every child is killed and
+//! reaped by [`ChildGuard::drop`] even on panic, and each test picks its own ports
+//! from the ephemeral range (never 7000 — held on this host by macOS Control
+//! Center). [`Spawned::join_drains`] has no deadline of its own and needs none
+//! today: it runs only after `wait_for_exit` has reaped the child, so both pipes
+//! are at EOF and the joins return promptly — a fixture that spawned a
+//! pipe-inheriting process outliving the child would be the first to need one.
 //! Counts are read **before** any signal.
 //!
 //! Gated on `full` for the same reason as `admin_cli.rs`: the `frpc` bin carries
@@ -424,7 +428,7 @@ fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
 /// so the count assertions above pass either way: a call site that hardcodes
 /// another answer still compiles and still emits one `KEY` record. The call sites
 /// this file reaches are `frpc/src/main.rs:545` (`--config-dir`), `:662` (`-c`)
-/// and `:832` (`verify`). `frp-core`'s own dispatch test passes the caller's
+/// and `:847` (`verify`). `frp-core`'s own dispatch test passes the caller's
 /// answer as an argument, so only this assertion on the captured output can see
 /// what the binary answered.
 ///

@@ -1482,27 +1482,19 @@ fn a_config_file_named_after_a_subcommand_stays_a_config_file() {
             text.contains("dial to 127.0.0.1:1") || text.contains("connect to 127.0.0.1:1"),
             "{argv:?} must load the config named `status` and dial its server port in run mode: {text:?}"
         );
-        // With the `admin` feature on, run mode also *binds* `[webServer]` and
-        // says so (`frpc admin server starting on 127.0.0.1:<port>`,
-        // `frp-client/src/service.rs`; `… listening on …` comes from
-        // `frp-client/src/admin.rs`). Those lines are the child describing its
-        // own listener, not a dial, so strike them and then require the port to
-        // be absent from everything that remains: any other mention would be a
-        // *reached* admin endpoint, which only the `status` command (or a
-        // dropped subcommand falling through to run mode) produces. The mock
-        // staying silent below is the feature-independent half of the claim.
-        let without_admin_self_lines: String = text
-            .lines()
-            .filter(|line| {
-                !line.contains("frpc admin server starting on")
-                    && !line.contains("frpc admin server listening on")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !without_admin_self_lines.contains(&port.to_string()),
-            "{argv:?} must not reach the config's admin port: {text:?}"
-        );
+        // There is deliberately **no** "the admin port appears nowhere" check
+        // next to this one. With the `admin` feature on, run mode also *binds*
+        // `[webServer]` and says so (`frpc admin server starting on
+        // 127.0.0.1:<port>`, `frp-client/src/service.rs:4414`; `… listening on …`
+        // comes from `frp-client/src/admin.rs`), so that check red on a correct
+        // child — the false positive this lane was added to catch. It could not
+        // fire on the failure it named either: measured, a `status` run that
+        // *reached* the mock prints only `NAME  TYPE  STATUS  LOCAL ADDR  REMOTE
+        // ADDR  ERR` and never the dialled address, and the address on the
+        // `frpc admin server starting on …` line is the child's own listener.
+        // The "no admin endpoint was reached" claim is carried where it is
+        // observable: the `status`-output check just below and the mock staying
+        // silent after the loop.
         assert!(
             !text.contains("Proxy Status") && !text.contains("NAME  TYPE"),
             "{argv:?} must not run the status command: {text:?}"
