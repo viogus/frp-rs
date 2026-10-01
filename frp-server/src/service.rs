@@ -27,6 +27,10 @@ use crate::lock::RwLockExt;
 // All existing `use crate::service::*` imports continue to work.
 pub use crate::state::{AppState, ControlTx, InternalMsg, ReloadableState};
 
+// The dedicated `websocket_port` listener. Its 24 `tracing` events therefore
+// report target `frp_server::service::listeners` instead of
+// `frp_server::service`; `RUST_LOG` target matching is a prefix comparison, so
+// a directive such as `RUST_LOG=frp_server::service=debug` still enables them.
 #[cfg(feature = "websocket")]
 mod listeners;
 
