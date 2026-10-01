@@ -9298,17 +9298,17 @@ section; ledger now **24 open / 104 closed**.**
   `#[cfg(feature …)]` at all, so `known_client_keys()` (`frp-core/src/config/strict.rs:131-237`) has nothing that can
   go stale, and neither `quic_options` nor `virtual_net` is gated.
   **Done-when:** a load that carries a feature-gated key the build cannot honour is either refused or warned about once per load, in every build shape, with tests pinning both a feature-enabled and a feature-disabled build.
-  **Done (2026-10-02, at code head `dc1d2e1f` (pre-rebase `5067d8c7`; patch-`=` under `git range-diff`), records `da7f7a209bba1aea4802f05cd15a1c2a68db5afb`, PR #455, based on `01fb93e3` (rebased from `f881d15e`)) — warned, once per load, for a non-zero port; the key stays accepted.**
+  **Done (2026-10-02, at code head `6445549a` (earlier `dc1d2e1f`, `5067d8c7`; patch-`=` under `git range-diff`), records `da7f7a209bba1aea4802f05cd15a1c2a68db5afb`, PR #455, based on `01fb93e3` (rebased from `f881d15e`)) — warned, once per load, for a non-zero port; the key stays accepted.**
   The new `ConfigPresence::warn_unhonoured_server_feature_keys()` (`frp-core/src/config/loader.rs`) is called from the
   three server load sites that own a log sink — the two post-`init_logging` `frps` startup branches
   (`frps/src/main.rs`) and the SIGUSR1 reload (`frp-server/src/service.rs`) — and emits one `tracing::warn!` per
   non-zero ungated port, naming both spellings and the remedy (`<key> = 0`, the documented "disabled" value, or
-  rebuild with the feature). `= 0` and absent stay silent in TOML/JSON/YAML because every build shape honours the integer `0`; the legacy-`.ini` spellings `"0"` / `+0` / `00` are **not** silent — the INI reader leaves them as strings that `ini_lenient` parses to `0` later, and the detector's value gate cannot see that (`TODO.md:9197`). Rejection was
+  rebuild with the feature). `= 0` and absent stay silent in TOML/JSON/YAML because every build shape honours the integer `0`; the legacy-`.ini` spellings `"0"` / `+0` / `00` are **not** silent — the INI reader leaves them as strings that `ini_lenient` parses to `0` later, and the detector's value gate cannot see that (`TODO.md:9229`). Rejection was
   rejected: `docs/deployment.md:779-782` names refusal the "false 400" direction this accepted-key class deliberately
   avoids, and `strict_config` defaults to true (`frp-core/src/cli.rs:139`) while the repo's own documented
   `frps.toml:21-23` writes non-zero `kcp_bind_port`/`quic_bind_port`, so rejecting would make `frps -c frps.toml`
   refuse to start in every micro/tiny build and break the `known_server_keys()` invariant at
-  `frp-core/src/config/strict.rs:123-127`. `frps verify` stays silent, exactly like the `tls_enable` diagnostic — a residue the reviewers filed as `TODO.md:9214`.
+  `frp-core/src/config/strict.rs:123-127`. `frps verify` stays silent, exactly like the `tls_enable` diagnostic — a residue the reviewers filed as `TODO.md:9246`.
   Both directions are pinned in `frp-core/src/config/tests.rs:290-580`: three `#[cfg(feature = "…")]`
   `…_enabled_honours_the_port` tests (default lane, `5 passed`), six `#[cfg(not(feature = "…"))]`
   `…_disabled_reports_the_dropped_port` / `…_disabled_is_silent_for_zero_or_absent` tests over both spellings ×
@@ -9317,17 +9317,17 @@ section; ledger now **24 open / 104 closed**.**
   `feature_gated_server_field_set_matches_the_pinned_scope` (`:559`). Neutering `fn port_requested`
   (`frp-core/src/config/loader.rs:565`) reds the three report tests at `frp-core/src/config/tests.rs:372:13`, `:428:13`,
   `:485:13`. The `+159`/`+292`/`+5`/`+10` inserted lines moved 31 `path:line` cites, repointed in the same branch
-  (`38d037e1` post-rebase, `28564342` pre-rebase; 308 live cites re-checked by content, 0 mismatches).
+  (`9343ea8d` post-rebase, `38d037e1`/`28564342` earlier; 308 live cites re-checked by content, 0 mismatches).
   Reviewed in PR #455: verification `MERGE-with-findings` (F1-F3, LOW) and adversarial `MERGE-with-findings` — its
   **MEDIUM** finding was that this item's changelog headline claimed a wider class than the three serde-dropped
   keys, so the records round narrowed the `CHANGELOG.md` sentence and the four follow-ups below were filed; its
   LOW/INFO findings (the legacy-`.ini` zero spellings, the `verify` silence, four already-wrong comment cites)
-  are `TODO.md:9175`, `:9197`, `:9214` and `:9225`. The Cross-Compat failure the branch first showed (`test_auth_r2g_reject`, a
+  are `TODO.md:9207`, `:9229`, `:9246` and `:9257`. The Cross-Compat failure the branch first showed (`test_auth_r2g_reject`, a
   data-plane reachability wait at `scripts/compat-test.sh:5399`) is a **flake, not attributable**: the compat lane
   builds default features, where the new code is compiled out, and both same-head re-runs succeeded
   (`36897123895`, `36897131548`).
-  Ledger after this close: **13 open / 190 closed** (base `18bcd1ad`: 13 open / 189 closed; the item is filed and
-  closed in the same PR, so only the closed count moves; the four follow-ups below take it to **17 open / 190
+  Ledger after this close: **14 open / 190 closed** (base `01fb93e3`: 14 open / 189 closed; the item is filed and
+  closed in the same PR, so only the closed count moves; the four follow-ups below take it to **18 open / 190
   closed** at this branch's head).
 
 - [ ] **A listener port whose *reader* is feature-gated in `frp-server` is still accepted and then silently ignored — `web_server.port` with `dashboard` off and `ssh_tunnel_gateway.bind_port` with `ssh` off.**
