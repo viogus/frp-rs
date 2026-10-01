@@ -60,6 +60,15 @@
 //! ephemeral range (never 7000 — held on this host by macOS Control Center), and
 //! the counts are read **before** any signal so no shutdown record can be
 //! mistaken for a second warning.
+//!
+//! [`drain`] distinguishes a read error from EOF, as the sibling
+//! `frpc/tests/warn_delivery.rs` one does: `Ok(0)` ends the capture,
+//! `ErrorKind::Interrupted` retries, and any other error is recorded so the
+//! readers can refuse to treat the truncated buffer as final. The shape differs
+//! — `frpc` joins its readers after the child exits, while this harness reads
+//! the pipes of a **live** child, so the error is parked instead of joined —
+//! and [`mod drain_tests`] pins both the recording and the refusal directly,
+//! because no `frps` pipe in these tests ever fails.
 
 use std::io::Read;
 use std::net::TcpStream;
@@ -211,10 +220,16 @@ impl Drop for ChildGuard {
 /// full pipe can never block the child) and snapshotted at each point the test
 /// wants a count. The child stays alive until this value is dropped, which kills
 /// and reaps it.
+///
+/// A reader that ends on a **read error** rather than EOF leaves the capture
+/// truncated, so every reader below checks that slot and panics instead of
+/// handing back what was read — see [`drain`].
 struct Spawned {
     _guard: ChildGuard,
     stdout_buf: Arc<Mutex<String>>,
     stderr_buf: Arc<Mutex<String>>,
+    stdout_failed: Arc<Mutex<Option<std::io::Error>>>,
+    stderr_failed: Arc<Mutex<Option<std::io::Error>>>,
     stdout: String,
     stderr: String,
 }
@@ -359,12 +374,24 @@ impl Spawned {
     fn from_child(mut child: Child) -> Self {
         let out = Arc::new(Mutex::new(String::new()));
         let err = Arc::new(Mutex::new(String::new()));
-        drain(child.stdout.take().expect("child stdout"), out.clone());
-        drain(child.stderr.take().expect("child stderr"), err.clone());
+        let out_failed = Arc::new(Mutex::new(None));
+        let err_failed = Arc::new(Mutex::new(None));
+        drain(
+            child.stdout.take().expect("child stdout"),
+            out.clone(),
+            out_failed.clone(),
+        );
+        drain(
+            child.stderr.take().expect("child stderr"),
+            err.clone(),
+            err_failed.clone(),
+        );
         Self {
             _guard: ChildGuard { child },
             stdout_buf: out,
             stderr_buf: err,
+            stdout_failed: out_failed,
+            stderr_failed: err_failed,
             stdout: String::new(),
             stderr: String::new(),
         }
@@ -372,6 +399,7 @@ impl Spawned {
 
     /// Freeze what the reader threads have collected so far, before any signal.
     fn snapshot(&mut self) {
+        self.assert_drains_are_healthy();
         self.stdout = self.peek_stdout();
         self.stderr = self.peek_stderr();
     }
@@ -384,11 +412,22 @@ impl Spawned {
         matches!(self._guard.child.try_wait(), Ok(None))
     }
 
+    /// Both reader threads ended at EOF — the only state in which what they
+    /// collected is the child's whole output. See [`drain`].
+    fn assert_drains_are_healthy(&self) {
+        check_drain_errors(
+            self.stdout_failed.lock().unwrap().as_ref(),
+            self.stderr_failed.lock().unwrap().as_ref(),
+        );
+    }
+
     fn peek_stdout(&self) -> String {
+        self.assert_drains_are_healthy();
         self.stdout_buf.lock().unwrap().clone()
     }
 
     fn peek_stderr(&self) -> String {
+        self.assert_drains_are_healthy();
         self.stderr_buf.lock().unwrap().clone()
     }
 
@@ -409,20 +448,179 @@ impl Spawned {
     }
 }
 
-/// Read a child's pipe to EOF on its own thread, appending into `sink`.
-fn drain<R: Read + Send + 'static>(mut pipe: R, sink: Arc<Mutex<String>>) {
+/// Read a child's pipe on its own thread, appending into `sink` until EOF.
+///
+/// Only `Ok(0)` is EOF. `ErrorKind::Interrupted` is a signal, not an end, so it
+/// retries; any other read error is recorded in `failed` and ends the thread.
+/// The old loop (`Ok(0) | Err(_) => break`) could not tell the two apart, so a
+/// pipe that failed for another reason truncated the capture and looked
+/// exactly like a quiet stream — on the rows that assert silence that would
+/// hide a warning emitted before the error.
+///
+/// The error is parked in a shared slot rather than returned from a joinable
+/// thread (the `frpc` shape) because this harness reads the pipes while the
+/// child is **still running**: joining here would block before the write end is
+/// closed. The three readers below check the slot instead, so a truncated
+/// capture is never consulted as final. [`drain_failed_before_eof`] owns the
+/// message and the teeth ([`mod drain_tests`]).
+fn drain<R: Read + Send + 'static>(
+    mut pipe: R,
+    sink: Arc<Mutex<String>>,
+    failed: Arc<Mutex<Option<std::io::Error>>>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match pipe.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => return,
                 Ok(n) => sink
                     .lock()
                     .unwrap()
                     .push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    *failed.lock().unwrap() = Some(e);
+                    return;
+                }
             }
         }
-    });
+    })
+}
+
+/// The assertion a reader thread's recorded error produces: the capture is
+/// **truncated**, not final, and the test must red rather than read the partial
+/// buffer. A free function so [`mod drain_tests`] can drive it directly.
+fn drain_failed_before_eof(stream: &str, err: &std::io::Error) -> ! {
+    panic!(
+        "the {stream} reader failed before EOF ({err}) — the capture is truncated, not final, \
+         and asserting on it would read a partial stream as a quiet one"
+    )
+}
+
+/// Red before the first stream with a recorded read error is read as final.
+/// Free of `Spawned` so [`mod drain_tests`] drives the assertion itself.
+fn check_drain_errors(stdout: Option<&std::io::Error>, stderr: Option<&std::io::Error>) {
+    if let Some(err) = stdout {
+        drain_failed_before_eof("stdout", err);
+    }
+    if let Some(err) = stderr {
+        drain_failed_before_eof("stderr", err);
+    }
+}
+
+/// Teeth for [`drain`]'s error handling. The old loop (`Ok(0) | Err(_) => break`)
+/// cannot be reached through a real child: an `frps` pipe reaches EOF, so
+/// nothing in the spawned-binary tests distinguishes "EOF" from "a read error".
+/// These drive the reader and the assertion directly with the failing shape the
+/// previous loop disclosed, so removing the distinction reds *here* rather than
+/// silently weakening a silence row — the same shape as `frpc`'s `mod
+/// drain_tests`, adapted because this harness cannot join its readers.
+#[cfg(test)]
+mod drain_tests {
+    use super::{check_drain_errors, drain};
+    use std::io::{self, Read};
+    use std::sync::{Arc, Mutex};
+
+    /// Run one [`drain`] to completion and hand back what it recorded: the
+    /// bytes, the error slot, and the assertion the readers would run.
+    fn run<R: Read + Send + 'static>(pipe: R) -> (String, Option<io::Error>) {
+        let sink = Arc::new(Mutex::new(String::new()));
+        let failed = Arc::new(Mutex::new(None));
+        drain(pipe, sink.clone(), failed.clone())
+            .join()
+            .expect("drain thread panicked");
+        let text = sink.lock().unwrap().clone();
+        let err = failed.lock().unwrap().take();
+        (text, err)
+    }
+
+    /// [`Read`] that hands out one record and then fails — a pipe error, not EOF.
+    struct RecordThenError {
+        data: &'static [u8],
+        sent: bool,
+    }
+
+    impl Read for RecordThenError {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.sent {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "pipe failed"));
+            }
+            self.sent = true;
+            let n = self.data.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            Ok(n)
+        }
+    }
+
+    /// [`Read`] that raises `EINTR` once, then yields a record and EOF.
+    struct InterruptedOnce {
+        state: u8,
+    }
+
+    impl Read for InterruptedOnce {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.state {
+                0 => {
+                    self.state = 1;
+                    Err(io::Error::new(io::ErrorKind::Interrupted, "EINTR"))
+                }
+                1 => {
+                    self.state = 2;
+                    buf[..5].copy_from_slice(b"kept\n");
+                    Ok(5)
+                }
+                _ => Ok(0),
+            }
+        }
+    }
+
+    /// The bytes read before the error are kept, and the error is **recorded**,
+    /// so a reader never mistakes the truncated capture for the final one.
+    #[test]
+    fn a_read_error_is_recorded_and_not_read_as_eof() {
+        let (text, err) = run(RecordThenError {
+            data: b"partial record\n",
+            sent: false,
+        });
+        assert_eq!(
+            text, "partial record\n",
+            "bytes read before the error are still captured"
+        );
+        let err = err.expect("a non-EOF read error must be recorded, not folded into EOF");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// ...and the recorded error is what makes a capture unusable: the readers'
+    /// assertion must red on it, with the stream name and the cause.
+    #[test]
+    #[should_panic(expected = "the stdout reader failed before EOF")]
+    fn a_recorded_read_error_is_fatal_to_the_capture() {
+        let (_text, err) = run(RecordThenError {
+            data: b"partial record\n",
+            sent: false,
+        });
+        check_drain_errors(err.as_ref(), None);
+    }
+
+    /// A clean capture passes that same assertion.
+    #[test]
+    fn a_clean_eof_capture_is_usable() {
+        let (text, err) = run(io::Cursor::new(b"one record\n".to_vec()));
+        assert!(err.is_none(), "plain EOF records no error; got {err:?}");
+        assert_eq!(text, "one record\n");
+        check_drain_errors(None, None);
+    }
+
+    /// `EINTR` is a signal, not a failure, and not the end of the capture.
+    #[test]
+    fn interrupted_is_retried_and_does_not_end_the_capture() {
+        let (text, err) = run(InterruptedOnce { state: 0 });
+        assert!(
+            err.is_none(),
+            "EINTR is a signal, not a failure; got {err:?}"
+        );
+        assert_eq!(text, "kept\n");
+    }
 }
 
 /// Which spelling of the nested TLS section the config uses. The first three all
