@@ -234,34 +234,59 @@ async fn no_ping_before_login_resp_pings_begin_after_registration() {
     std::mem::drop(mock);
 }
 
-/// Audit pin (heartbeat re-arm wiring, service.rs "skip_ping" arm): a ping
-/// whose auth setup fails must be SKIPPED (not sent, not fatal) and the
-/// interval must be re-armed at the 2s Go backoff instead of waiting out the
-/// rest of the heartbeat period (client/control.go:253-265 — wait.BackoffUntil
-/// replaces the next ticker fire).
+/// Assert `frame` is a Ping carrying the login-style key `md5(token, ts)` and
+/// return its timestamp. The key is what makes the cached-snapshot pin
+/// decisive: a client that re-resolved `auth.tokenSource` after the mock
+/// emptied the file would either skip the ping or key it with a different
+/// token, and this equality fails in both cases.
+fn assert_ping_key(frame: &FrpMessage, token: &str) -> i64 {
+    let (key, ts) = match frame {
+        FrpMessage::Ping(p) => (
+            p.privilege_key
+                .clone()
+                .expect("Ping must carry a privilege_key when HeartBeats is in auth scopes"),
+            p.timestamp.expect("Ping must carry a timestamp"),
+        ),
+        other => panic!("expected Ping, got {other:?}"),
+    };
+    assert_eq!(
+        key,
+        frp_core::auth::generate_token(token, ts),
+        "Ping key must be md5(startup token, ping timestamp): frpc must reuse \
+         the construction-time auth.tokenSource snapshot, never re-read the \
+         source (Go frp client/service.go:168 + :316 resolve once)"
+    );
+    ts
+}
+
+/// Audit pin (heartbeat auth snapshot wiring): with an `auth.tokenSource` the
+/// client resolves the source ONCE at construction and reuses that snapshot for
+/// every heartbeat — the same shape as Go frp (`client/service.go:168`
+/// `auth.BuildClientAuth` resolves inside `NewService`; `:316` hands that one
+/// runtime to every login; `pkg/auth/token.go` SetPing just calls
+/// `util.GetAuthKey(auth.token, ts)` on the cached string). A source that
+/// becomes unreadable after startup must therefore NOT skip a ping, re-arm the
+/// interval, or otherwise disturb the 6s cadence.
 ///
-/// The run loop owns its `tokio::time::Interval` (service.rs:3266-3272 polls
-/// `ctx.ping_interval.tick()`, re-armed at :3331-3335) — no unit seam exposes
-/// the re-arm, so this is a wire-timing e2e through the real client service.
+/// History: this test used to pin the opposite — a ping whose auth setup failed
+/// was SKIPPED (not sent, not fatal) and the interval re-armed at the 2s Go
+/// backoff (`client/control.go:253-265`, `wait.BackoffUntil`). That arm is now
+/// unreachable from a token source: with `AuthConfig.token_source` left unset
+/// for the client, `resolve_token()` cannot fail (`frp-core/src/auth.rs:347`)
+/// and the file is never re-read, so nothing can trigger the skip. The skip arm
+/// still exists for the OIDC ping path (`oidc_client.set_ping`), which is not
+/// exercised here — this test pins the cached-snapshot behaviour that replaced
+/// the token-source skip, and keeps the event-gated wire-timing scaffolding
+/// because the cadence bound is still what proves the source is not re-read.
 ///
 /// Trigger: heartbeat_interval = 6s with auth.additional_auth_scopes =
 /// ["HeartBeats"] (heartbeat_requires_auth fires) and a file-based
-/// auth.tokenSource. The skip is CLIENT-side and invisible on the wire — the
-/// failing ping is never sent — so the mock cannot observe it directly (and
-/// an error Pong does not engage the backoff: Go parity, service.rs:2868).
-/// The empty-token window is therefore placed CAUSALLY between two
-/// wire-visible pings: the mock empties the file only AFTER it has observed
-/// Ping#1, so the NEXT interval tick (~6s later, a known deadline) is
-/// guaranteed to find the file empty and skip. The restore is a 7s timer
-/// anchored at that same Ping#1 observation — inside (skip, skip+2s): ~1s
-/// after the skip tick, ~1s before the re-armed tick.
-///
-/// This kills the two structural corners of the earlier design (which raced
-/// a fixed 1.5s restore against the client's independent 2s re-arm timer):
-/// a delayed first tick cannot vacuous-pass (the empty window opens only
-/// after a wire event, and the first tick must have fired for the mock to
-/// see Ping#1 at all), and the mock's restore cannot double-skip unless it
-/// stalls >1s past its own timer.
+/// auth.tokenSource. The mock empties the file only AFTER it has observed
+/// Ping#1 on the wire and never restores it, so every later tick would fail if
+/// the client re-resolved the source. Each Ping also carries the login-style
+/// key `md5(token, timestamp)`, checked against the STARTUP token's value — a
+/// re-read of the emptied file could not produce it, which makes the key
+/// assertion decisive on its own (the cadence bound is the visible symptom).
 ///
 /// Mock timeline (heartbeat_interval = 6s, heartbeat_timeout = 15s):
 ///   L            LoginResp written (token file still populated);
@@ -269,53 +294,51 @@ async fn no_ping_before_login_resp_pings_begin_after_registration() {
 ///                the first frame after LoginResp (no proxies, no
 ///                registration frames). ρ₁ is the client's login→loop-start
 ///                latency, milliseconds on loopback;
-///   P1           mock observes Ping#1: records P1, Pongs, then empties the
-///                token file (the skip window opens HERE, not at LoginResp);
-///   P1+6s−ρ₁     interval tick 2 → key-gen fails on the empty file → SKIP,
-///                interval re-armed at the 2s backoff;
-///   P1+7s        mock restores the token file — after the skip, ~1s before
-///                the re-armed tick;
-///   P1+8s−ρ₁     Ping#2 — the re-armed tick's ping (the pin: without the
-///                re-arm the next interval tick fires at L+12s, ~4s later);
-///   P1+14s−ρ₁    Ping#3 — the interval cadence (6s period) is back.
+///   P1           mock observes Ping#1: checks its key, Pongs, then empties the
+///                token file and leaves it empty;
+///   P1+6s−ρ₁     Ping#2 — the normal interval tick, keyed with the startup
+///                snapshot. Pre-fix the tick's re-read of the emptied file
+///                fails, the skip arm re-arms the interval, and because the
+///                file is never restored every later tick skips too: no Ping#2
+///                ever arrives (measured pre-fix: the 10s read below times out)
+///                — RED;
+///   P1+12s−ρ₁    Ping#3 — the 6s cadence continues with the same snapshot.
 ///
 /// Oracles (all anchored at P1 — the mock's own wire observation, never at
 /// test start):
-///   (1) the first frame after LoginResp is a Ping (Ping#1), arriving
-///       within 1s of the LoginResp write (immediacy bound: the interval's
-///       first tick fires on the message loop's first poll, ms after login
-///       success — a first tick that waited out its full 6s period would
-///       land ~6000ms late, well inside the old 10s read timeout, so the
-///       absolute bound is asserted separately);
-///   (2) Ping#2 − Ping#1 ∈ [7.4s, 9.0s] — skip at ~6s + one 2s backoff. A
-///   (2) Ping#2 − Ping#1 ∈ [7.4s, 9.0s] — skip at ~6s + one 2s backoff. A
-///       tick that waited out the full interval lands at ~12s (RED), as does
-///       a second 2s doubling (the re-armed tick firing before the restore);
-///   (3) Ping#3 − Ping#2 ∈ [5.0s, 7.5s] — the 6s cadence is back (a backoff
-///       that never cleared keeps re-arming 2s ticks — RED);
-///   (4) exactly one Login.
+///   (1) the first frame after LoginResp is a Ping (Ping#1), arriving within 1s
+///       of the LoginResp write (immediacy bound: the interval's first tick
+///       fires on the message loop's first poll, ms after login success — a
+///       first tick that waited out its full 6s period would land ~6000ms
+///       late, well inside the 10s read timeout, so the absolute bound is
+///       asserted separately);
+///   (2) every Ping's privilege_key == md5(token, its own timestamp) — the
+///       startup snapshot, never a re-read of the emptied file;
+///   (3) Ping#2 − Ping#1 ∈ [5.0s, 7.5s] — the 6s period. A re-read of the
+///       emptied file fails and takes the skip arm, so pre-fix no further Ping
+///       is sent at all and the 10s read times out (measured) — RED; a tick
+///       that waited out the full 6s period would also land outside this
+///       window;
+///   (4) Ping#3 − Ping#2 ∈ [5.0s, 7.5s] — the cadence is steady (a backoff
+///       that kept re-arming would tick at ~2s);
+///   (5) exactly one Login.
 ///
-/// Documented residual: the skip moment is the client's poll of tick 2,
-/// invisible to the mock. If that poll is stalled past the P1+7s restore the
-/// tick finds the file populated and succeeds — the skip is not exercised.
-/// The stall must exceed ~1s AND land Ping#2 in the oracle window to pass
-/// silently (1.4s-3s band); the earlier design vacuous-passed on any >1.5s
-/// stall of the login→loop-start path and spuriously RED'd on a >0.5s
-/// mock-side restore stall — both bounds now sit at ≥1s and the empty window
-/// itself is event-gated, so the common failure modes are gone.
+/// Documented residual: the skip moment would be the client's poll of tick 2,
+/// invisible to the mock. It can no longer be produced by a token source (see
+/// History above), so this test no longer covers that arm at all.
 #[tokio::test]
-async fn skipped_ping_rearms_interval_on_two_second_backoff() {
+async fn ping_reuses_startup_token_snapshot_when_source_becomes_unreadable() {
     common::init_tracing();
-    let token = "heartbeat-rearm-token";
+    let token = "heartbeat-snapshot-token";
     let server_port = allocate_port();
     let listener = TcpListener::bind(("127.0.0.1", server_port)).await.unwrap();
 
     // File-based auth.tokenSource: Service::new resolves the real token from
-    // this file (the control conn encryption key derives from it). The file
-    // keeps the token through Login AND the first heartbeat tick (Ping#1);
-    // the mock empties it only after observing Ping#1 on the wire, so tick 2
-    // (~6s later) deterministically skips, and restores it 7s after Ping#1
-    // (measured from that same wire event — no test-start anchor).
+    // this file ONCE (the control conn encryption key derives from it). The
+    // file keeps the token through Login AND the first heartbeat tick (Ping#1);
+    // the mock empties it only after observing Ping#1 on the wire and never
+    // restores it, so every later tick proves the client reused the
+    // construction-time snapshot instead of re-reading.
     let dir = tempfile::tempdir().expect("tempdir");
     let token_path = dir.path().join("token.txt");
     std::fs::write(&token_path, token).expect("write initial token file");
@@ -332,7 +355,7 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
     let login_count = Arc::new(AtomicUsize::new(0));
     let count = login_count.clone();
     // Signals the mock verified all wire-timing oracles (immediacy bound +
-    // skip/re-arm cadence).
+    // cached-snapshot cadence + per-ping keys).
     let (pings_ok_tx, pings_ok_rx) = tokio::sync::oneshot::channel::<()>();
     let mock_token_path = token_path.clone();
     let mock = tokio::spawn(async move {
@@ -359,7 +382,7 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
         // at loop start, tick 1 fires immediately, and Ping#1 must reach
         // the wire ~ms after this write.
         // Bound 1s: above the ~500ms jitter envelope this file tolerates
-        // elsewhere (the [7.4s, 9.0s] / [5.0s, 7.5s] windows below), below
+        // elsewhere (the [5.0s, 7.5s] cadence windows below), below
         // the ~6000ms a first tick that waited out its full 6s period
         // (e.g. an `interval_at` arm, or an eager `tick()` consumed at arm
         // time) would land — invisible to the old 10s read timeout alone.
@@ -388,59 +411,47 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
             first_ping_gap.as_millis()
         );
         let p1_at = Instant::now();
+        assert_ping_key(&f1, token);
         enc.write_v1_frame(&pong).await.expect("write Pong");
 
-        // Arm the skip causally: empty the token file NOW, after Ping#1 was
-        // observed on the wire. The next interval tick fires ~6s later (the
-        // interval's own deadline — the client cannot tick before it), so
-        // the skip window provably covers it.
+        // The snapshot must be reused, not re-read: empty the file NOW, after
+        // Ping#1 was observed on the wire, and never restore it. Every later
+        // tick would fail if the client re-resolved the source.
         std::fs::write(&mock_token_path, "").expect("empty token file");
-        // Restore 7s after Ping#1: inside (skip, skip+2s) with ~1s margins
-        // on both sides (skip at ~6s, re-armed tick at ~8s minus the ms of
-        // client latency folded into P1).
-        tokio::time::sleep(Duration::from_secs(7)).await;
-        std::fs::write(&mock_token_path, token).expect("restore token file");
 
-        // Oracle 2: Ping#2 = the re-armed tick's ping, ~8s after Ping#1
-        // (tick-2 skip at ~6s + one 2s backoff). A tick that waited out the
-        // full 6s period would land at ~12s — RED.
+        // Oracle 2: Ping#2 is the normal interval tick (~6s after Ping#1), not
+        // a skipped tick re-armed 2s later (~8s) — and it is keyed with the
+        // STARTUP token, which the emptied file could not supply.
         let f2 = tokio::time::timeout(Duration::from_secs(10), enc.read_v1_frame())
             .await
-            .expect("no re-armed Ping after the skip")
+            .expect("no Ping after the token source was emptied")
             .expect("read second Ping");
-        assert!(
-            matches!(f2, FrpMessage::Ping(_)),
-            "expected the re-armed heartbeat to send a Ping, got {f2:?}"
-        );
+        assert_ping_key(&f2, token);
         let ping2_gap = p1_at.elapsed();
         assert!(
-            ping2_gap >= Duration::from_millis(7400) && ping2_gap <= Duration::from_millis(9000),
-            "re-armed Ping arrived {}ms after Ping#1 (expected ~8000ms: tick-2 \
-             skip at ~6000ms + one 2s backoff; a tick that waited out the 6s \
-             period, or a second 2s doubling, lands at ~12000ms)",
+            ping2_gap >= Duration::from_millis(5000) && ping2_gap <= Duration::from_millis(7500),
+            "Ping#2 arrived {}ms after Ping#1 (expected ~6000ms — the normal 6s \
+             interval). A client that re-read the emptied auth.tokenSource \
+             would skip this tick and, with the file never restored, every \
+             later one too — measured pre-fix: no Ping#2 arrives at all, the \
+             10s read above times out — RED",
             ping2_gap.as_millis()
         );
         enc.write_v1_frame(&pong).await.expect("write Pong");
 
-        // Oracle 3: Ping#3 ~6s after Ping#2 — the interval cadence is back
-        // (the successful ping cleared ping_retry_backoff; a backoff that
-        // never cleared would keep re-arming 2s ticks — RED).
+        // Oracle 3: the 6s cadence continues while the source stays
+        // unreadable, still keyed with the startup snapshot.
         let f3 = tokio::time::timeout(Duration::from_secs(10), enc.read_v1_frame())
             .await
             .expect("no third Ping")
             .expect("read third Ping");
-        assert!(
-            matches!(f3, FrpMessage::Ping(_)),
-            "expected the next interval tick to send a Ping, got {f3:?}"
-        );
-        let total_gap = p1_at.elapsed();
-        let gap_between_pings = total_gap.saturating_sub(ping2_gap);
+        assert_ping_key(&f3, token);
+        let gap_between_pings = p1_at.elapsed().saturating_sub(ping2_gap);
         assert!(
             gap_between_pings >= Duration::from_millis(5000)
                 && gap_between_pings <= Duration::from_millis(7500),
-            "heartbeat cadence not restored: Ping#3 came {}ms after Ping#2 \
-             (expected ~6000ms — the 6s interval period; a backoff that never \
-             cleared would tick at ~2s)",
+            "heartbeat cadence drifted: Ping#3 came {}ms after Ping#2 (expected \
+             ~6000ms — the 6s interval period; a skip would land at ~8000ms)",
             gap_between_pings.as_millis()
         );
         enc.write_v1_frame(&pong).await.expect("write Pong");
@@ -462,10 +473,10 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
         server_addr: "127.0.0.1".into(),
         server_port,
         token: token.into(),
-        // auth.tokenSource drives both the login key and the per-ping key
-        // (the arm reads the file again on every ping); the literal token is
-        // kept in sync so the resolved value never diverges from the mock's
-        // expectation.
+        // auth.tokenSource supplies the resolved snapshot at construction
+        // (Service::with_unsafe_features); both the login key and the per-ping
+        // key are computed from that one cached value. The literal token is
+        // kept in sync so the config's own view never diverges.
         auth: Some(frp_core::config::AuthClientConfig {
             method: "token".into(),
             token: token.into(),
@@ -495,16 +506,16 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
         })
     };
 
-    // Wall time: Ping#1 right after login + Ping#2 ~8s later + Ping#3 ~6s
+    // Wall time: Ping#1 right after login + Ping#2 ~6s later + Ping#3 ~6s
     // after that, plus startup margin.
     tokio::time::timeout(Duration::from_secs(25), pings_ok_rx)
         .await
-        .expect("mock never verified the skip/re-arm Ping cadence")
+        .expect("mock never verified the cached-snapshot Ping cadence")
         .expect("mock task ended before verifying cadence");
     assert_eq!(
         login_count.load(Ordering::SeqCst),
         1,
-        "client reconnected during the heartbeat re-arm session"
+        "client reconnected during the heartbeat snapshot session"
     );
 
     client.request_stop();
