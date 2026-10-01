@@ -144,8 +144,9 @@ jobs:
           # the total let a coordinated marker+hash+list edit drop a region
           # silently. This literal is the only record of the expected set
           # outside the guarded file, so any of those leaves it absent and reds
-          # the step.
-          grep -qF 'pinned regions verified 2/2: scenario-6 scenario-7' "$log" || status=1
+          # the step. `-x` (round 9, F4): the match must be the *whole* line, so
+          # a near-miss that merely embeds the literal — `… (SKIPPED)` — fails.
+          grep -qxF 'pinned regions verified 2/2: scenario-6 scenario-7' "$log" || status=1
           # F7 (adversarial round 5 addendum): the `pinned regions verified` line
           # above proves the loop ran, not that its *comparison* still works — a
           # one-line `got=$want`/`if false` in the enforcer made every pin compare
@@ -153,7 +154,7 @@ jobs:
           # detected a mismatch it injected on purpose: it canaries the region
           # hash, the region set and the count, and prints the literal below only
           # after all three fire. Its absence means the detection is neutered.
-          grep -qF 'enforcer canary: injected mismatch detected, injected count mismatch detected' "$log" || status=1
+          grep -qxF 'enforcer canary: injected mismatch detected, injected count mismatch detected' "$log" || status=1
           if [ "$status" != "0" ]; then
             echo "::error::repo-health fixture checks did not report 32 checks, verified pins and a live enforcer canary"
             echo "::error::scripts/tests/repo-health-fixtures.sh must print 32 '  ok' lines, end with 'RESULT: 32 fixture check(s) hold', print 'pinned regions verified 2/2: scenario-6 scenario-7' and print 'enforcer canary: injected mismatch detected, injected count mismatch detected'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped substance check or a neutered comparison means scenarios were skipped, neutered or swallowed — restore them rather than lowering this literal"
@@ -210,13 +211,15 @@ jobs:
           # repo-health step above. `trap - EXIT` or `elif false` used to keep
           # this step green while the substance check never ran, and pinning only
           # the total let three coordinated edits drop scenario-13. This literal
-          # carries the expected region set outside the guarded file.
-          grep -qF 'pinned regions verified 4/4: scenario-2 scenario-10 scenario-12 scenario-13' "$log" || status=1
+          # carries the expected region set outside the guarded file, and `-x`
+          # (round 9, F4) requires the whole line rather than a substring match, so
+          # a near-miss such as `... (SKIPPED)` fails.
+          grep -qxF 'pinned regions verified 4/4: scenario-2 scenario-10 scenario-12 scenario-13' "$log" || status=1
           # F7 (adversarial round 5 addendum): same live-canary pin as the
           # repo-health step above — the region check, the set check and the count
           # check each had a mismatch injected and each had to be recorded. A
           # `got=$want` or `if false` in the enforcer leaves this line absent.
-          grep -qF 'enforcer canary: injected mismatch detected, injected count mismatch detected' "$log" || status=1
+          grep -qxF 'enforcer canary: injected mismatch detected, injected count mismatch detected' "$log" || status=1
           if [ "$status" != "0" ]; then
             echo "::error::compat stray-guard fixture checks did not report 40 checks, verified pins and a live enforcer canary"
             echo "::error::scripts/tests/compat-stray-guard.sh must print 40 '  ok' lines, end with 'RESULT: 40 fixture check(s) hold', print 'pinned regions verified 4/4: scenario-2 scenario-10 scenario-12 scenario-13' and print 'enforcer canary: injected mismatch detected, injected count mismatch detected'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped substance check or a neutered comparison means scenarios were skipped, neutered or swallowed — restore them rather than lowering this literal"

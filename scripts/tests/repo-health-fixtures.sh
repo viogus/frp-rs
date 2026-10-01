@@ -113,35 +113,62 @@ hdr() { printf '%s\n' "---------------------------------------------------------
 # The enforcer is pinned too (N5, adversarial round 4): the list of guarded
 # regions is derived from the `substance pin:` markers actually present and must
 # equal `PINNED_REGIONS`, the number of regions actually checksummed must equal
-# `PINNED_REGION_COUNT`, and every hash must come from *this* file (`region_sha`
-# reports the path it read and the enforcer compares it). Emptying the loop,
-# dropping or repeating a name, deleting a marker, or pointing `region_sha` at a
-# pristine copy all red instead of silently shrinking the guarded set.
+# `PINNED_REGION_COUNT`, and every hash is taken from the file the enforcer was
+# started from, never from `$self`. Emptying the loop, dropping or repeating a
+# name, deleting a marker or reassigning `self` all red instead of silently
+# shrinking the guarded set.
 SCEN6_REGION_SHA='7d31d2b613e1e578c7050a5328cb677f4aac2eba1c6d9a7248f0216d1dd06af7'
 SCEN7_REGION_SHA='941be4f7805b74ff79b691e463f91dd011a1b549cd17995f09542ff8d3f40500'
 PINNED_REGIONS='scenario-6 scenario-7'
 PINNED_REGION_COUNT=2
+# Known vectors the hashing tool must reproduce, and the path the read-path
+# canary asks for (it must not exist).
+ABC_SHA256='ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+EMPTY_SHA256='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+CANARY_MISSING_PATH='/nonexistent-enforcer-canary'
+# Resolve the hashing tool to an absolute path and prove it with a known vector.
+# `command -v sha256sum` honours a shell function first and then $PATH, so a fake
+# `sha256sum` — a function defined in this file, or a directory prepended to
+# PATH — could return a pinned digest for bytes that changed while every check
+# "passed" (adversarial round 9, F3). An absolute path cannot be shadowed that
+# way, and a wrong tool fails the vector instead of being trusted.
+find_hash_tool() {
+  local cand probe
+  for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
+    [ -x "$cand" ] || continue
+    probe=$(printf 'abc' | "$cand" 2>/dev/null | awk '{print $1}')
+    [ "$probe" = "$ABC_SHA256" ] || continue
+    printf '%s\n' "$cand"
+    return 0
+  done
+  for cand in /usr/bin/shasum /bin/shasum /usr/local/bin/shasum; do
+    [ -x "$cand" ] || continue
+    probe=$(printf 'abc' | "$cand" -a 256 2>/dev/null | awk '{print $1}')
+    [ "$probe" = "$ABC_SHA256" ] || continue
+    printf '%s -a 256\n' "$cand"
+    return 0
+  done
+  return 1
+}
+HASH_TOOL=$(find_hash_tool) || HASH_TOOL=''
+
 region_sha() {   # $1 = region name, spelled as between the `substance pin:` markers
-  # Prints the path it read and the region hash on two lines, because the caller
-  # reaches it through `$( … )` — a subshell, so a variable set here could never
-  # reach the check that the *right* file was read (N5).
-  local name=$1 tool hash
-  if [ -z "${self:-}" ]; then
-    printf 'FAIL  cannot locate %s to checksum the %s region\n' "$0" "$name" >&2
+  # $2 = the file to read the region from. The *caller* chooses the path, so the
+  # callee cannot report an input of its own choosing (round 9, F3), and the
+  # read-path canary in `enforce_substance` proves the read follows it.
+  local name=$1 file=$2 hash
+  if [ -z "${HASH_TOOL:-}" ]; then
+    printf 'FAIL  no sha256 tool at an absolute path (need sha256sum or shasum); cannot check the %s region\n' "$name" >&2
     return 1
   fi
-  if command -v sha256sum >/dev/null 2>&1; then
-    tool='sha256sum'
-  elif command -v shasum >/dev/null 2>&1; then
-    tool='shasum -a 256'
-  else
-    printf 'FAIL  no sha256 tool on PATH (need sha256sum or shasum); cannot check the %s region\n' "$name" >&2
+  if [ -z "$file" ]; then
+    printf 'FAIL  no file given to checksum the %s region from\n' "$name" >&2
     return 1
   fi
-  # shellcheck disable=SC2086  # $tool is the word-split "shasum -a 256"
-  hash=$(sed -n "/^# --- substance pin: ${name} /,/^# --- end substance pin: ${name} ---/p" "$self" |
-    $tool | awk '{print $1}')
-  printf '%s\n%s\n' "$self" "$hash"
+  # shellcheck disable=SC2086  # $HASH_TOOL is the word-split "<abs path> -a 256"
+  hash=$(sed -n "/^# --- substance pin: ${name} /,/^# --- end substance pin: ${name} ---/p" "$file" |
+    $HASH_TOOL | awk '{print $1}')
+  printf '%s\n' "$hash"
 }
 # --- the enforcer's comparisons, in one place each ----------------------------
 # The real checks and the canary in `enforce_substance` both go through these,
@@ -153,18 +180,18 @@ region_set_mismatch() { [ "$1" != "$2" ]; }
 region_count_mismatch() { [ "$1" -ne "$2" ]; }
 
 # $1 = region name, $2 = pinned constant name (for the diagnostic), $3 = the
-# pinned expectation. Hashes the region from *this* file and returns 0 only if
-# the hash came from here and equals $3.
+# pinned expectation. Hashes the region the enforcer was started from: the path
+# comes from `SELF_REAL`, frozen at startup, never from `$self`, so reassigning
+# `self` after startup cannot move the bytes being read (round 9, F3) — and that
+# reassignment is itself a failure below.
 region_pin_check() {
-  local name=$1 const=$2 want=$3 out sha_file got
-  out=$(region_sha "$name") || return 1
-  sha_file=${out%%$'\n'*}
-  got=${out#*$'\n'}
-  if [ "$sha_file" != "${SELF_REAL:-}" ]; then
-    printf 'FAIL  %s region was checksummed from %s, expected %s — the enforcer read the wrong file\n' \
-      "$name" "${sha_file:-<unset>}" "${SELF_REAL:-<unset>}" >&2
+  local name=$1 const=$2 want=$3 got
+  if [ -z "${SELF_REAL:-}" ] || [ "${self:-}" != "${SELF_REAL:-}" ]; then
+    printf 'FAIL  %s region: the enforcer path changed after startup (self=%s, bound at startup=%s)\n' \
+      "$name" "${self:-<unset>}" "${SELF_REAL:-<unset>}" >&2
     return 1
   fi
+  got=$(region_sha "$name" "$SELF_REAL") || return 1
   if [ "$got" != "$want" ]; then
     printf 'FAIL  %s region changed: sha256 %s, pinned %s\n' \
       "$name" "${got:-<none>}" "$want" >&2
@@ -221,8 +248,34 @@ record_pin_check() {   # $1 = region name, $2 = constant name, $3 = expectation
   region_pin_check "$1" "$2" "$3" || PIN_FAILS=$((PIN_FAILS + 1))
 }
 
+# Shape-identical wrong value for the pin canary: shift every hex digit by one
+# (a→b, … f→0), so the injected expectation is a 64-character lowercase hex
+# digest exactly like every real pin. A comparison that whitelists the canary's
+# sentinel, or rejects anything that is not 64 hex characters, cannot satisfy
+# both of the canary's directions this way (adversarial round 9, F2).
+flip_hex() { printf '%s' "$1" | tr '0123456789abcdef' '123456789abcdef0'; }
+
+# $1 = newline-separated "name const want" entries, checked one per line. Both
+# the injected canary entry and the real pinned set go through this one loop, so
+# neutering its call to `record_pin_check` — replacing it with a bare counter
+# bump, say — leaves the canary's injected mismatch unrecorded and reds the suite
+# (adversarial round 9, F1: the canary used to call `record_pin_check` directly
+# and so never exercised this call site). A here-doc, not a pipe: `while … done |
+# …` would run the loop in a subshell and the counters would never escape.
+run_pin_checks() {
+  local name const want
+  while IFS=' ' read -r name const want; do
+    [ -n "$name" ] || continue
+    record_pin_check "$name" "$const" "$want"
+  done <<EOF
+$1
+EOF
+}
+
 enforce_substance() {
-  local name const want found canary_checked canary_fails
+  local name const want found region_entries
+  local canary_right canary_wrong canary_missing
+  local canary_checked canary_fails canary_ok_checked canary_ok_fails
   if [ -z "${self:-}" ]; then
     printf 'FAIL  cannot locate %s to check the substance pins\n' "$0" >&2
     return 1
@@ -235,23 +288,57 @@ enforce_substance() {
   # subshell so any future fatal error becomes a nonzero rc rather than exit 0.
   PIN_CHECKED=0
   PIN_FAILS=0
-  found=$(sed -n 's/^# --- substance pin: \([^ ]*\).*/\1/p' "$self" | tr '\n' ' ')
+  found=$(sed -n 's/^# --- substance pin: \([^ ]*\).*/\1/p' "${SELF_REAL:-}" | tr '\n' ' ')
   found=${found% }
-  # --- enforcer canary (F7, adversarial round 5) ------------------------------
-  # The pins only mean something while the mismatch detection itself works, and
-  # that detection lives here in the same unpinned prologue. So inject a
-  # deliberately wrong expectation and require the enforcer's own counters to
-  # record it: if a comparison has been neutered (`got=$want`, `if false`,
-  # `|| true`), the injected mismatch reads as a match, `canary_fails` stays 0
-  # and the suite reds here. The expected diagnostic is discarded.
-  record_pin_check scenario-6 SCEN6_REGION_SHA 'enforcer-canary-not-a-sha' 2>/dev/null
+  # --- the enforcer canary (round 5 F7; loop-driven, round 9 F1/F2) -----------
+  # The pins only mean something while the code that reads them works, and that
+  # code lives here in the same unpinned prologue. So the canary injects a
+  # *shape-identical* wrong expectation — the real pin with every hex digit
+  # shifted by one — through the same loop the pinned set uses, and requires both
+  # outcomes: the wrong value must be recorded as a mismatch and the real value
+  # must be accepted. Neutering the comparison (`got=$want`, `if false`),
+  # whitelisting a sentinel shape, rejecting everything, or bypassing the loop's
+  # call site all leave one of the outcomes wrong and red the suite here.
+  canary_right=${SCEN6_REGION_SHA:-}
+  canary_wrong=$(flip_hex "$canary_right")
+  PIN_CHECKED=0
+  PIN_FAILS=0
+  run_pin_checks "scenario-6 SCEN6_REGION_SHA ${canary_wrong}" 2>/dev/null
   canary_checked=$PIN_CHECKED
   canary_fails=$PIN_FAILS
   PIN_CHECKED=0
   PIN_FAILS=0
-  if [ "$canary_fails" -eq 0 ] || [ "$canary_checked" -ne 1 ]; then
-    printf 'FAIL  enforcer canary: an injected wrong pin was not recorded as a mismatch (checked=%s, fails=%s); the region comparison is neutered\n' \
+  run_pin_checks "scenario-6 SCEN6_REGION_SHA ${canary_right}" 2>/dev/null
+  canary_ok_checked=$PIN_CHECKED
+  canary_ok_fails=$PIN_FAILS
+  if [ "$canary_checked" -ne 1 ] || [ "$canary_fails" -ne 1 ]; then
+    printf 'FAIL  enforcer canary: an injected wrong pin was not recorded as a mismatch (checked=%s, fails=%s); the region comparison is neutered or the loop call site is bypassed\n' \
       "$canary_checked" "$canary_fails" >&2
+    return 1
+  fi
+  if [ "$canary_ok_checked" -ne 1 ] || [ "$canary_ok_fails" -ne 0 ]; then
+    printf 'FAIL  enforcer canary: a correct pin was not accepted (checked=%s, fails=%s); the region comparison no longer accepts matching digests\n' \
+      "$canary_ok_checked" "$canary_ok_fails" >&2
+    return 1
+  fi
+  # The same comparison probed by return status rather than by the counters the
+  # loop maintains, so asserting those counters in the prologue is not enough.
+  if region_pin_check scenario-6 SCEN6_REGION_SHA "$canary_wrong" 2>/dev/null; then
+    printf 'FAIL  enforcer canary: the region comparison accepted an injected wrong pin; it is neutered\n' >&2
+    return 1
+  fi
+  if ! region_pin_check scenario-6 SCEN6_REGION_SHA "$canary_right" 2>/dev/null; then
+    printf 'FAIL  enforcer canary: the region comparison rejected a correct pin; it rejects everything\n' >&2
+    return 1
+  fi
+  # The hashing read must follow the path it is given: a `sed` redirected to a
+  # frozen pristine copy would hash that copy and leave every pin inert while the
+  # report stayed honest (round 9, R9-2). A path that cannot exist must hash to
+  # the digest of empty input; a redirected read returns the copy's digest.
+  canary_missing=$(region_sha scenario-6 "$CANARY_MISSING_PATH" 2>/dev/null)
+  if [ "$canary_missing" != "$EMPTY_SHA256" ]; then
+    printf 'FAIL  enforcer canary: hashing does not follow the path it is given (missing-file digest %s, expected %s); a redirected read would not be detected\n' \
+      "${canary_missing:-<none>}" "$EMPTY_SHA256" >&2
     return 1
   fi
   # Same functions the real checks below call, driven with a deliberately wrong
@@ -278,6 +365,11 @@ enforce_substance() {
   # canary reds CI even when the summary looks intact.
   printf 'enforcer canary: injected mismatch detected, injected count mismatch detected\n'
   region_set_verdict "$found" "${PINNED_REGIONS:-}" || return 1
+  # The pinned set goes through the same loop the canary exercised above. The
+  # entries are built first so the region check itself stays one call site
+  # (round 9, F1): bypassing that call reds the canary, and a shortened or
+  # reordered set still reds the set verdict and the count gate.
+  region_entries=''
   # shellcheck disable=SC2086  # intentional word split: PINNED_REGIONS is a name list
   for name in ${PINNED_REGIONS:-}; do
     case $name in
@@ -288,8 +380,12 @@ enforce_substance() {
         return 1
         ;;
     esac
-    record_pin_check "$name" "$const" "$want"
+    region_entries="${region_entries}${name} ${const} ${want}
+"
   done
+  PIN_CHECKED=0
+  PIN_FAILS=0
+  run_pin_checks "$region_entries"
   if [ "$PIN_FAILS" -ne 0 ]; then
     printf 'FAIL  %s pinned region(s) changed; see the diagnostics above\n' "$PIN_FAILS" >&2
     return 1
