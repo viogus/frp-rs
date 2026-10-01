@@ -8111,7 +8111,7 @@ section; ledger now **24 open / 104 closed**.**
   the warning-pin item and files one new residue), measured with `grep -cE '^- \[ \]' TODO.md` /
   `grep -cE '^- \[x\]' TODO.md`.
 
-- [ ] **`frps/tests/warn_delivery.rs`'s TLS-enable captures count the record instead of pinning it — the gap #428 closed for the `frp-core` captures, still open on the server side.**
+- [x] **`frps/tests/warn_delivery.rs`'s TLS-enable captures count the record instead of pinning it — the gap #428 closed for the `frp-core` captures, still open on the server side.**
   Filed by the coordinator while re-deriving part (a) of the item above at `80ed6a85`. The `frp-core`
   captures now call `assert_record_is_exactly_the_message` (`frp-core/tests/common/mod.rs:88`), but the
   `frps` capture still asserts only a count (`frps/tests/warn_delivery.rs:1113` `occurrences(&out, SERVER_KEY)`,
@@ -8124,6 +8124,26 @@ section; ledger now **24 open / 104 closed**.**
   server-visible line can drift from the static unnoticed.
   Done-when: the `frps` capture asserts the emitted record's bytes (equality, or the shared helper with the
   `frps` target) and the appended-clause mutant reds it.
+
+  **Done (2026-10-01, at `a23bd305ba1720673f0f3b20eb814fb801b1bb9b` on `fix/frps-warn-record-pin`, PR #439).** The server-side capture now
+  pins the record's bytes: `frps/tests/warn_delivery.rs` carries a local port of the `frp-core` helper
+  (`WARNING_TARGET` `:573`, `strip_sgr` `:581`, `assert_record_is_exactly_the_message` `:619`,
+  `assert_server_tls_enable_records_are_exactly_the_message` `:668` — `want` read from
+  `frp_core::config::SERVER_TLS_ENABLE_INERT_WARNING` — and the count+byte wrapper
+  `assert_one_server_tls_enable_warning` `:690`), applied at `:1175`, `:1193`, `:1199`, `:1210`, `:1246` (one
+  record each) and `:1263` (two, after the SIGHUP/SIGUSR1 reload). The appended-clause mutant
+  (`frp-core/src/config/loader.rs:680` → `tracing::warn!("{} but honestly", SERVER_TLS_ENABLE_INERT_WARNING.as_str())`)
+  moved from **17 passed / 0 failed** at the base to `13 passed; 4 failed` at
+  `frps/tests/warn_delivery.rs:633:5` (`the emit site appended bytes after the message (only a trailing
+  newline is allowed); got tail: " but honestly"`). No `#[test]` was added, so `-- --list` stays 17 in both
+  feature shapes. Rounds: verification (`/private/tmp/rev439-verify.md`) and adversarial
+  (`/private/tmp/rev439-attack.md`, 20 emit-site mutants — 13 red in this lane, all four escapes caught by the
+  unchanged `frp-core` sibling lane) both **MERGE-with-findings**; their residual findings are filed as the new
+  row at the end of this file. Gates: `cargo fmt --all -- --check`, `RUSTFLAGS="-D warnings" clippy --workspace
+  --all-targets --all-features`, `bash scripts/repo-health.sh` (`RESULT: invariants hold`),
+  `cargo test -p frps --test warn_delivery` 17/0 with and without `--features dashboard`,
+  `cargo test -p frp-core --test server_tls_enable_warning` 8/0 and `--test web_server_tls_enable_warning` 6/0.
+  Ledger after this close: **31 open / 165 closed** (base `a1ae6a9d`: 31 open / 164 closed).
 - [ ] **The three CI-guard strengths the `warning-pin` round-2 adversarial measured: the guards prove the tests ran, not that they asserted anything.**
   Filed by the coordinator from the round-2 adversarial report (`/private/tmp/rev-g1r2-attack.md`); none blocks
   PR #433. (a) The resolver pin's completion marker is self-reported: deleting its three `assert_eq!`s while
@@ -8597,3 +8617,20 @@ section; ledger now **24 open / 104 closed**.**
   so "accept-and-ignore matches Go" is bounded to values `<= 0` or below the cap.
   **Done-when:** the `--config-dir` lane resolves from the loaded config, or both bounds are recorded
   at the flags with their measurements.
+
+- [ ] **The `frps` dashboard `web_server.tls.enable` captures still count their record, and the ported byte-pin helper is weaker than the `frp-core` original on two points.**
+  Filed by the coordinator from PR #439's two review rounds. (a) The dashboard `KEY` captures
+  (`frps/tests/warn_delivery.rs:471`, `:1100`, `:1113`, `:1177`, `:1224`) still assert a count plus a clause —
+  `assert_clause_matches_this_build` (`:495`) pins which build-shape clause is expected, not the record's
+  bytes — so appending a clause at the dashboard emit site (`frp-core/src/config/loader.rs:723`) leaves
+  `cargo test -p frps --test warn_delivery` green in both feature shapes while
+  `cargo test -p frp-core --test web_server_tls_enable_warning` reds (`frp-core/tests/common/mod.rs:113`).
+  (b) The port compares the level with `level.contains("WARN") && !level.contains('\n')` where the shared
+  helper uses the untrimmed `assert_eq!(level, " WARN")` (`frp-core/tests/common/mod.rs:133-141`), so
+  `target: "evil frp_core::config::loader"` and `target: " frp_core::config::loader"` stay green here.
+  (c) `clean.lines()` (`frps/tests/warn_delivery.rs:671`) makes the helper's `tail == "\n"` and
+  no-following-line guards unreachable, so a bare extra newline or an appended following line stays green,
+  while the port's doc comment (`:606-618`) still claims "the same three rejections" as the source. All three
+  are caught by the unchanged `frp-core` lanes, so no coverage is lost relative to the base.
+  **Done-when:** the `frps` dashboard captures pin the record's bytes, the level is compared untrimmed, the
+  following-line bytes are covered, and each of the three mutants reds the `frps` lane itself.
