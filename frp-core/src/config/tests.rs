@@ -3752,7 +3752,7 @@ fn test_collect_config_files_admits_a_non_regular_entry_by_extension() {
     // like a file. The tree's only non-regular filter is on the `[include]`
     // `glob_in_dir` path, and it skips *directories* by the directory entry's
     // own type — `if entry.file_type()?.is_dir()`
-    // (`frp-core/src/config/file.rs:869`) — never by `is_file()`, so it admits
+    // (`frp-core/src/config/file.rs:877`) — never by `is_file()`, so it admits
     // a FIFO just as this collector does. `collect_config_files_inner` has no
     // filter at all.
     //
@@ -11639,7 +11639,11 @@ fn test_include_glob_entries_are_processed_in_sorted_order() {
     // filesystem readdir order fail loudly: this APFS returns the six
     // `incN.toml` names in an order like inc2,inc3,inc4,inc5,inc6,inc1, which
     // is not sorted, so deleting `results.sort()` reorders the merged array and
-    // reddens this test.
+    // reddens this test. The teeth are host-filesystem-conditional, though:
+    // they hold only while readdir returns those six names out of sorted order.
+    // On a filesystem whose readdir is already name-ordered the same mutant
+    // would stay green, so this is a strong check on the hosts we run, not a
+    // portable one.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("frpc.toml"),
@@ -12451,7 +12455,7 @@ fn legacy_ini_common_include_missing_dir_refuses_like_go() {
 /// (`[p1] role = "visitor"`) beside the config, Go v0.71.0 is rc 1 in both
 /// loader modes (`failed to parse visitor p1, err: type shouldn't be empty`).
 /// frp-rs's [`process_includes`] uses the same single-`*`-per-component glob
-/// (`glob_in_dir`, `frp-core/src/config/file.rs:845`), so the matched file must
+/// (`glob_in_dir`, `frp-core/src/config/file.rs:853`), so the matched file must
 /// be merged and refused the same way.
 #[test]
 fn legacy_ini_common_include_glob_is_expanded_like_go() {
@@ -12480,9 +12484,9 @@ fn legacy_ini_common_include_glob_is_expanded_like_go() {
 /// Go builds the match pattern as `filepath.Join(absDir, filepath.Base(path))`
 /// and tests it with `filepath.Match` (`pkg/config/legacy/parse.go:87`), so
 /// everything after the `*` is a literal suffix that must still match. A test
-/// that only kept `name.starts_with(prefix)` (`frp-core/src/config/file.rs:894`)
+/// that only kept `name.starts_with(prefix)` (`frp-core/src/config/file.rs:902`)
 /// survived the whole suite because the extension pre-filter
-/// (`frp-core/src/config/file.rs:884-892`) already rejects the obvious cases
+/// (`frp-core/src/config/file.rs:892-900`) already rejects the obvious cases
 /// (e.g. `z*.ini` against `zebra.txt`, where the extensions differ). This pin
 /// uses `z*ini`: the star is followed by no `.`, so `Path::extension()` is
 /// `None` and the pre-filter is skipped — only the suffix test can reject

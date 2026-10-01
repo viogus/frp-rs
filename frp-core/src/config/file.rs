@@ -653,11 +653,15 @@ fn drop_ini_scalar_include_keys(table: &mut toml::Table) {
 // the entry's own type is not a directory; reading it then blocks forever,
 // exactly as Go's `os.ReadFile` does. Measured with `mkfifo fifo.ini` and
 // `[common] includes = "fifo.ini"` (and `"f*.ini"`): GO v0.71.0, r7 and r8 all
-// still have no exit after 4 s, whereas r6 and BASE returned rc 0 (they skipped
-// it as a non-regular file) and MID returned rc 1. Blocking is Go's behaviour,
-// so this is not a divergence — but it is an unlisted behaviour change of the
-// round-7 fix, and it means the loader has no termination bound on a tree that
-// contains such a name; a caller that needs one must impose its own timeout.
+// still have no exit after 4 s, whereas r6, MID and BASE returned rc 0 on the
+// `./c.ini` and absolute forms (r6 and BASE skipped the entry as a non-regular
+// file; MID additionally returns rc 1 on the bare `c.ini` form, but that is
+// MID's bare-name path resolution, not the pipe — with `-c c.ini` MID is rc 1
+// with no matching entry at all, with a regular `fifo.ini`, and with a FIFO
+// alike). Blocking is Go's behaviour, so this is not a divergence — but it is
+// an unlisted behaviour change of the round-7 fix, and it means the loader has
+// no termination bound on a tree that contains such a name; a caller that needs
+// one must impose its own timeout.
 
 /// Go's `filepath.Dir` (`internal/filepathlite/path.go`, `Dir`): scan back to
 /// the last path separator and `Clean` everything up to **and including** it; a
@@ -830,14 +834,18 @@ pub(super) fn go_clean(path: &str) -> String {
 /// (EILSEQ), so it is latent on this platform and can only surface on a
 /// filesystem that allows such names (e.g. Linux under a non-UTF-8 locale).
 ///
-/// The `dir` guard above is **unreachable defence in depth** in the current
-/// tree: the only caller ([`process_includes`], `file.rs:410-416`) refuses a
-/// missing or non-directory `search_dir` with Go's `include: directory of …
-/// not exist` error first, so the `Ok(Vec::new())` arm never runs. Measured by
-/// deleting the guard and running `cargo test -p frp-core --lib`: the suite
-/// stays green, including `legacy_ini_common_include_missing_dir_refuses_like_go`,
-/// which still reports the caller's message. It stays because a future second
-/// caller would otherwise silently swallow a missing directory as "no matches".
+/// The `dir` guard above is unreachable in the current tree: the only caller
+/// ([`process_includes`], `file.rs:410-416`) refuses a missing or non-directory
+/// `search_dir` with Go's `include: directory of … not exist` error first.
+/// Measured by deleting the guard and running `cargo test -p frp-core --lib`:
+/// the suite stays green (1071 passed), including
+/// `legacy_ini_common_include_missing_dir_refuses_like_go`, which still reports
+/// the caller's message. The guard is **not** a fidelity win: its
+/// `Ok(Vec::new())` → rc 0 is itself a divergence, since Go's `os.Stat` then
+/// `os.ReadDir` (`pkg/config/legacy/parse.go:75-81`) returns an error → rc 1.
+/// It is kept only as a cheap total-function backstop on the one path where it
+/// can still run — a TOCTOU race between the caller's pre-check and this
+/// enumeration — where dropping it would in fact be the more Go-faithful shape.
 ///
 /// Returns sorted list of matching file paths.
 /// (`results.sort()` mirrors `os.ReadDir`, whose entries come back ordered by
