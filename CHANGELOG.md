@@ -1240,6 +1240,11 @@ User-facing release notes for frp-rs.
 
 ### CI & Tooling
 
+- **The `warning-pin` CI guards now witness assertions rather than runs.** The resolver step pins the
+  exact `-- --list` entry, uses a variant-free completion marker, and runs the witness a second time with
+  `FRP_WARNING_PIN_SABOTAGE=1` requiring that run to fail; both count guards also require the run's own
+  `N passed; 0 failed` summary to equal the `-- --list` count, and the removal diagnostics are keyed on
+  the marker so a stripped `println!` is reported apart from deleted assertions.
 - **Two `frpc` test pitfalls are closed, and the lane that would have caught one of them now runs.** `frpc/tests/warn_delivery.rs` no longer decides a record count from a quiet window: it waits for the child to exit and joins both pipe drains, so the capture is final at EOF, and a duplicate `--config-dir` record emitted 700 ms behind the first — which the previous 500 ms quiet period let pass — now fails the test. `frpc/tests/cli_inputs.rs`'s config-file-named-after-a-subcommand test dropped an assertion that could not tell the child's own admin listener (`frpc admin server starting on 127.0.0.1:<port>`) from a dial, and a count-guarded `tests-unit` step now runs that file with the `admin` feature on.
 - **The CLI exit-code pins run in the release profile now.** `cargo test --release -p frps --test cli_exit_codes` used to fail in every release build (`41 passed; 3 failed`) because three pins drive hooks only compiled under `debug_assertions`; they now carry `#[cfg_attr(not(debug_assertions), ignore = "<reason>")]`, and a new `Tests (release profile)` job runs that file in the same release profile the `build` job uses, asserting the exact `41 passed; 0 failed; 3 ignored` summary, the three ignored names, and the 44-test list — so the release lane cannot widen its own skip set, drop a test, or lose the target and still pass.
 - **RSS soak harness and a published head-to-head series**: `scripts/rss-soak.sh` runs a 3-hour,
