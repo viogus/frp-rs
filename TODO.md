@@ -9178,29 +9178,36 @@ section; ledger now **24 open / 104 closed**.**
   argument that the module is only ever moved as a block and every move ships its own name-set diff.
   Ledger after this round: **14 open / 189 closed** (base `18bcd1ad`: 13 open / 189 closed; this round files one item).
 - [ ] **The PR #454 login auth-method split's ordering and behaviour invariants are pinned by no test.**
-  Filed by the #454 records round (verification F4, adversarial F2). The split's comments advertise
-  four ordering invariants — the pre-auth throttle gate before the login plugin hook, the gate before
-  run_id validation, run_id validation before `VerifyLogin` (`auth::verify_login_auth`), and
-  `drop(used)` before the `send_login_error` write so replay rejection happens outside the
-  `used_timestamps` lock — and a mutation round measured that most of them can be moved with every
-  lane still green. Mutants were applied to `frp-server/src/control/login.rs`,
-  `frp-server/src/control/login/auth.rs` and `frp-server/src/control/login/throttle.rs`, then run
-  against `cargo test -p frp-server --lib` plus the `login_replay_throttle` /
-  `login_run_id_and_pool_count` / `oidc_integration` / `server_reload_auth` / `work_conn_auth`
-  targets: **survived** — M1c move the gate after the plugin hook (460/0 lib, 2/0, 3/0); M1d move the
-  gate after run_id validation (same lanes green); M2 move `drop(used)` (`auth.rs:414`) after
+  Filed by the #454 records round (verification F4, adversarial F2). The split carries five ordering
+  invariants — the pre-auth throttle gate before the login plugin hook, the gate before run_id
+  validation, run_id validation before `VerifyLogin` (`auth::verify_login_auth`), the OIDC dispatch
+  after the `is_auth_bypass` short-circuit, and `drop(used)` before the `send_login_error` write so
+  replay rejection happens outside the `used_timestamps` lock — and a mutation round measured that
+  every one of them can be moved with its lanes still green. Mutants were applied to
+  `frp-server/src/control/login.rs`, `frp-server/src/control/login/auth.rs` and
+  `frp-server/src/control/login/throttle.rs`, then run against `cargo test -p frp-server --lib` plus
+  the `login_replay_throttle` / `login_run_id_and_pool_count` / `oidc_integration` /
+  `server_reload_auth` targets. **Survived** (the two reviewers both used the label `M5` for different
+  mutants, so both are named by action): M1c move the gate after the plugin hook (460/0 lib, 2/0,
+  3/0; it compiles, because `login.rs:340 let mut login = login.clone();` is unconditional); M1d move
+  the gate after run_id validation (same lanes green); M2 move `drop(used)` (`auth.rs:414`) after
   `send_login_error` (`:423`; 460/0 lib, 2/0, 7/0 oidc); M4 place the OIDC dispatch before the
-  `is_auth_bypass` short-circuit (`auth.rs:121`; 460/0 lib, 7/0 oidc, 6/0 reload-auth); M5 reword
-  `throttled_login_error`'s message (`frp-server/src/control/login/throttle.rs:53`; all lanes green).
-  **killed** — M1b invert the `!is_auth_bypass &&` guard (reds `ssh_gateway`'s exec-channel test) and
-  M3 delete the `client_id` 256-byte cap (reds `oversized_client_id_rejected_at_login`). An earlier
-  M1 that merely swapped the gate and the run_id derivation passed, because that derivation is
-  pure/infallible, and one form of M1 did not compile at all (`login` is shadowed to an owned value
-  before the plugin hook, `E0308`), so the gate-before-hook order is type-enforced while M1d, M2, M4
-  and M5 are not.
-  **Done-when:** a test reds when the throttle gate is moved after run_id validation, when `drop(used)`
-  is moved after the `send_login_error` write, and when the OIDC dispatch is placed before the
-  `is_auth_bypass` short-circuit — the LoginResp text is identical in the reordered shapes, so a
-  plugin-hook-invocation or pre-auth log-line assertion is needed, not a response-text one — and
-  `throttled_login_error`'s message text is asserted the way the gate's is in
-  `frp-server/tests/login_replay_throttle.rs`.
+  `is_auth_bypass` short-circuit (`auth.rs:121`; 460/0 lib, 7/0 oidc, 6/0 reload-auth); M5
+  (adversarial) reword `throttled_login_error`'s LoginResp message
+  (`frp-server/src/control/login/throttle.rs:58`; the lanes it ran on stayed green —
+  `oidc_integration` was red in that campaign because no `frps` binary had been built, an
+  environmental failure, not M5's); M5 (verification) move run_id validation after `auth_fut.await?`
+  (not caught). **Killed** — M1b invert the `!is_auth_bypass &&` guard (reds `ssh_gateway`'s
+  exec-channel test) and M3 delete the `client_id` 256-byte cap (reds
+  `oversized_client_id_rejected_at_login`). Two near-misses recorded so they are not re-read as
+  enforcement: an earlier M1 that merely swapped the gate and the run_id derivation survived too,
+  because that derivation is pure/infallible; and a naive M1c patch that passed owned `login` instead
+  of `&login` failed to compile (`E0308`), but that was the patch, not the order — the order itself
+  compiles and passes.
+  **Done-when:** a test reds when the throttle gate is moved after the plugin hook, when it is moved
+  after run_id validation, when run_id validation is moved after `auth_fut.await?` (i.e. after
+  `VerifyLogin`), when the OIDC dispatch is placed before the `is_auth_bypass` short-circuit, and when
+  `drop(used)` is moved after the `send_login_error` write — the LoginResp text is identical in the
+  reordered shapes, so for the gate and run_id orders a plugin-hook-invocation or pre-auth log-line
+  assertion is needed, not a response-text one — and `throttled_login_error`'s LoginResp message text
+  is asserted the way the gate's is in `frp-server/tests/login_replay_throttle.rs`.
