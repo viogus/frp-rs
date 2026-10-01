@@ -8503,7 +8503,7 @@ section; ledger now **24 open / 104 closed**.**
   `override_server_config` on `cli_overrides_enabled()`; `frps/src/main.rs:991` then calls
   `init_logging(&cli, Some(&cfg))` with the **raw** CLI values, so `frps -c frps.toml --log-level info`
   emits 11 `INFO` records where Go's `-c` lane emits 0 (`/tmp/frp-go-src/cmd/frps/root.go:67-83`),
-  contradicting the contract stated at `frp-core/src/cli.rs:3454-3461`. Same for `--log-file`,
+  contradicting the contract stated at `frp-core/src/cli.rs:3724-3731`. Same for `--log-file`,
   `--log-max-days` and `--log-format`. Verified pre-existing (`git show 3f66d823:frps/src/main.rs`
   is identical in this respect).
   **Done-when:** `init_logging` is gated on `cli_overrides_enabled()` too, or the divergence is
@@ -8511,7 +8511,7 @@ section; ledger now **24 open / 104 closed**.**
 - [ ] **R2 — The implicit-config lane (`frps --log-level ""` with an in-tree `frps.toml`) has no Go counterpart.**
   Post-#427 it keeps the file's `warn` (0 `INFO`); Go without `-c` never reads a file and emits 1
   `INFO` (`frps uses command line arguments for config`, 186 B). The lane is an frp-rs extension
-  (`FrpsArgs::config_path`, `frp-core/src/cli.rs:3448-3452`).
+  (`FrpsArgs::config_path`, `frp-core/src/cli.rs:3718-3722`).
   **Done-when:** recorded as an extension where the implicit-config behaviour is documented, or made
   argv-identical to Go's flags-only lane.
 - [ ] **R3 — `--log-format ""` still writes through, unlike the other three log flags.**
