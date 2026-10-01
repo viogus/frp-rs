@@ -12975,3 +12975,139 @@ fn legacy_ini_start_names_maps_go_text_and_nested_tables() {
         Some(HashSet::from(["p1".to_string(), "2".to_string()]))
     );
 }
+
+/// **Item 3: a `[common.foo]`-only `.ini` reaches the legacy collector in frp-rs
+/// but not in Go (recorded divergence).**
+///
+/// `q4_dotted_common_role_only.ini` (`[common.foo] role = "weird"`) measured on
+/// Go v0.71.0: strict rc 1 `json: unknown field "common"`, non-strict rc 0. Go
+/// asks `GetSection("common")` in `DetectLegacyINIFormat`
+/// (`pkg/config/load.go:65`), and a literal `common.foo` header does not satisfy
+/// it, so the file never reaches the legacy reader. frp-rs nests the dotted
+/// header under `common` (`ini_section_path`, `frp-core/src/config/format.rs:315`)
+/// and the collector's own detector (`frp-core/src/config/normalize.rs:1160`)
+/// therefore sees a `common` table, hoists its `foo` subtable and refuses it as a
+/// proxy: rc 1 in **both** modes. The strict verdict agrees with Go, the
+/// non-strict refusal is the loose-only divergence the item calls a follow-up.
+/// Recorded deliberate: making the two detectors agree would mean dropping
+/// `common` from the dotted-section roots, which the `[common.webServer.tls]`
+/// spelling pinned at `frp-core/src/config/tests.rs:6714` still needs. A mutant
+/// that forces `legacy_ini` false in the collector loads this file non-strict.
+#[test]
+fn dotted_common_only_section_is_legacy_for_the_collector_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("q4_dotted_common_role_only.ini");
+    std::fs::write(&path, "[common.foo]\nrole = \"weird\"\n").unwrap();
+    for strict in [false, true] {
+        let err = format!(
+            "{}",
+            load_client_config(path.to_str().unwrap(), strict)
+                .expect_err("the hoisted foo table is refused as a proxy role")
+        );
+        assert!(
+            err.contains("proxy foo role should be 'server' or 'visitor'"),
+            "strict={strict}: {err}"
+        );
+    }
+}
+
+/// **Item 3: a `[DEFAULT]` header is an ordinary section in frp-rs (recorded
+/// divergence).**
+///
+/// `y10`/`y11` measured on Go v0.71.0: rc 1 in both loader modes. `[DEFAULT]` is
+/// not a TOML table, so Go's first decode fails
+/// (`json: cannot unmarshal array into Go value of type v1.rawClientConfig`) and
+/// the YAML/JSON fallback that an `.ini` extension falls through to rejects it as
+/// well. frp-rs spells the header as a section literally named `DEFAULT`: strict
+/// reports `unknown field "DEFAULT"`, non-strict keeps it as an inert table and
+/// loads `[p1]` through the v1 path. Recorded deliberate — matching Go would mean
+/// routing a `[common]`-less `.ini` into the YAML/JSON fallback frp-rs does not
+/// have. Both modes pinned.
+#[test]
+fn default_section_header_is_an_ordinary_section_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("y10_default.ini");
+    std::fs::write(
+        &path,
+        "[DEFAULT]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [p1]\ntype = tcp\nlocal_port = 8080\nremote_port = 18080\n",
+    )
+    .unwrap();
+    let cfg = load_client_config(path.to_str().unwrap(), false)
+        .expect("non-strict keeps DEFAULT as an inert section");
+    assert_eq!(cfg.proxies.len(), 1);
+    assert_eq!(cfg.proxies[0].name, "p1");
+    let err = format!(
+        "{}",
+        load_client_config(path.to_str().unwrap(), true)
+            .expect_err("strict reports the DEFAULT table as unknown")
+    );
+    assert!(err.contains("unknown field \"DEFAULT\""), "{err}");
+}
+
+/// **Item 3: the `r_toml.ini` `.ini`/TOML hybrid is a v1 shape in frp-rs
+/// (recorded divergence).**
+///
+/// `server_addr` plus a `[[proxies]]` array-of-tables header measured on Go
+/// v0.71.0: rc 1 in both modes (strict `json: unknown field "server_addr"`,
+/// non-strict `decode proxy at index 0: unknown proxy type:`). frp-rs's `.ini`
+/// reader spells `[[proxies]]` as a section literally named `[proxies]`: strict
+/// reports `unknown field "[proxies]"`, non-strict keeps the scalar `server_addr`
+/// and loads zero proxies. The strict rc agrees; only the message and the
+/// non-strict verdict diverge, and matching Go's non-strict message would mean
+/// addressing the array element as `proxies[0]`, which the `.ini` reader does not
+/// do (pinned as out of scope at `frp-core/src/config/tests.rs:12117`). Both
+/// modes pinned.
+#[test]
+fn r_toml_hybrid_ini_is_a_v1_shape_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r_toml.ini");
+    std::fs::write(
+        &path,
+        "server_addr = \"127.0.0.1\"\nserver_port = 7000\n\
+         [[proxies]]\nname = \"p\"\nrole = \"weird\"\n",
+    )
+    .unwrap();
+    let cfg = load_client_config(path.to_str().unwrap(), false)
+        .expect("non-strict keeps server_addr and loads no proxy");
+    assert_eq!(cfg.server_addr, "127.0.0.1");
+    assert!(cfg.proxies.is_empty());
+    let err = format!(
+        "{}",
+        load_client_config(path.to_str().unwrap(), true)
+            .expect_err("strict reports the literal [proxies] section")
+    );
+    assert!(err.contains("unknown field \"[proxies]\""), "{err}");
+}
+
+/// **Item 3: a `[range:...]` section missing a port is skipped with a warning in
+/// frp-rs where Go fails the load (recorded divergence).**
+///
+/// `y16_default_start_masks_range_render_error.ini` (`start = p2`, `[common]`,
+/// `[range:p] local_port = 8080` with no `remote_port`, and a valid `[p2]`)
+/// measured on Go v0.71.0: rc 1 in both modes, `failed to render template for
+/// proxy range:p: local_port or remote_port is empty`
+/// (`renderRangeProxyTemplates`, `pkg/config/legacy/client.go:292`). frp-rs logs
+/// `legacy INI [range:...] section: missing or invalid remote_port; skipped`
+/// (`frp-core/src/config/normalize.rs:2308`) and loads `p2`, rc 0. Recorded
+/// deliberate: making a missing port fatal is a separate design question, and the
+/// sibling skip paths are pinned as intentional at
+/// `frp-core/src/config/tests.rs:9896` / `:9921`. Both modes pinned.
+#[test]
+fn range_section_without_remote_port_is_skipped_not_fatal_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("y16_range_render.ini");
+    std::fs::write(
+        &path,
+        "start = p2\n[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [range:p]\nlocal_port = 8080\n\
+         [p2]\ntype = tcp\nlocal_port = 8081\nremote_port = 18081\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(path.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("strict={strict}: the range section is skipped: {e}"));
+        let names: Vec<&str> = cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["p2"], "strict={strict}");
+    }
+}
