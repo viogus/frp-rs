@@ -165,17 +165,32 @@ fails=0
 # Round 14 (F1) paths, part 2: the digest *read* is PATH-free by construction —
 # `region_lines` uses `read`/`case`/`printf`, `${x%% *}` splits the hasher's
 # output and `$HASH_TOOL` is absolute and vector-proven — so a shadowed `awk` or
-# `sed` can no longer mint a region's bytes or its digest. Residues that remain,
-# measured rather than assumed: (R14-a) the *fixtures'* inspections of other files
-# (`grep`/`sed` in scenario bodies, e.g. scenario-10's read of
-# `scripts/compat-test.sh`) still resolve through PATH, so a shadowed `grep` can
-# make one scenario's assertion vacuous without editing this file — that is a
-# weakened scenario, not a defeated pin; (R14-b) `flip_hex`'s `tr` and the
-# `mktemp` probe directory are PATH-resolved, but both are fail-closed only — a
-# `tr` that returns its input makes the canary's injected "wrong" pin correct and
-# reds, and a `mktemp` that returns a directory cannot forge the ledger the caller
-# re-derives from the copies; (R14-c) a shadowed `bash` (the interpreter) or a
-# replaced absolute `/usr/bin/sha256sum` owns the process and is out of scope.
+# `sed` can no longer mint a region's bytes or its digest. Demonstrated, not
+# asserted: on the pre-fix tree an `awk` shim answering only `{print $1}` kept a
+# drifted scenario-10 green and this step exited 0; it reds now.
+#
+# What remains is the declared boundary. (R14-a) the *fixtures'* inspections of
+# other files (`grep`, `sed`, `awk` in the scenario bodies — e.g. scenario-10's
+# read of `scripts/compat-test.sh`, or the `xtcp_body` parse further down) still
+# resolve through PATH, so a shim can answer a probe the way the scenario wants:
+# with a `grep` that reports "no hits", a `pkill -f` regression in that unpinned
+# file ships while this step still prints `pins verified 4/4` and exits 0 — a
+# genuine false negative in a scenario, never in the pin. That boundary is
+# reachable, and it is the accepted one: an unpinned in-repo file such as
+# `scripts/compat-test.sh`, or the `scripts/repo-health.sh` step above, can put a
+# shim earlier on `$PATH` (GitHub's `$GITHUB_PATH` persists it into later steps).
+# (R14-b) `flip_hex`'s `tr` and the `mktemp` probe directory are PATH-resolved,
+# but both are fail-closed only — a `tr` that returns its input makes the canary's
+# injected "wrong" pin correct and reds, and a directory from `mktemp` cannot
+# forge the ledger the caller re-derives from the copies. (R14-c) a shadowed
+# `bash` (the interpreter) or a replaced absolute `/usr/bin/sha256sum` owns the
+# process and is out of scope; checking the verifier's own toolchain needs a
+# toolchain that verifier does not control. Two more L2-class fragilities are
+# declared rather than denied: `region_lines` stops at the first end marker, so a
+# decoy `# --- end substance pin: scenario-10 ---` truncates the hashed text
+# (still needs a refreshed pin to stay green), and the accept-direction line in
+# `enforce_substance` is a single unguarded command that a one-file edit can
+# neuter.
 #
 # A floor of 0 (or an unset floor) disables the guard from inside, which the
 # sibling suite learned the hard way; that is a failure here too. So is a

@@ -141,13 +141,27 @@ hdr() { printf '%s\n' "---------------------------------------------------------
 # longer mint a region's bytes or its digest. Round 14 (F3) records the copy's
 # real digest in the probe's ledger and has `enforce_substance` re-hash the copies
 # and re-run the comparison against each, so a ledger written without the work
-# reds instead of staying green. Residues that remain, measured rather than
-# assumed: (R14-a) the *fixtures'* inspections of other files still resolve
-# through PATH, so a shadowed `grep`/`sed` can make one scenario's assertion
-# vacuous without editing this file — a weakened scenario, not a defeated pin;
+# reds instead of staying green. Both are demonstrated, not asserted: on the
+# pre-fix tree an `awk` shim answering only `{print $1}` kept a drifted region
+# green and a ledger written before the work stayed green; each reds now.
+#
+# What remains is the declared boundary. (R14-a) this suite's own inspections of
+# other files (`grep`, and the two `awk` parses of `$out`) still resolve through
+# PATH, so a shim can make one scenario's assertion vacuous — a weakened scenario,
+# and a possible false negative for the regression that scenario exists to catch,
+# but never a defeated pin. It is reachable and accepted: an unpinned in-repo
+# file, or the `scripts/repo-health.sh` step that runs before this one, can put
+# a shim earlier on `$PATH` (GitHub's `$GITHUB_PATH` persists it into later
+# steps).
 # (R14-b) `flip_hex`'s `tr` and the `mktemp` probe directory are PATH-resolved but
-# fail-closed only; (R14-c) a shadowed `bash` (the interpreter) or a replaced
-# absolute `/usr/bin/sha256sum` owns the process and is out of scope.
+# fail closed: a `tr` that returns its input collapses the canary's injected wrong
+# pin onto the correct one and reds, and a directory from `mktemp` cannot forge
+# the ledger the caller re-derives from the copies. (R14-c) a shadowed `bash`
+# (the interpreter) or a replaced absolute `/usr/bin/sha256sum` owns the process
+# and is out of scope. One L2-class parser fragility is declared too:
+# `region_lines` stops at the first end marker, so a decoy
+# `# --- end substance pin: scenario-6 ---` truncates the hashed text (still needs
+# a refreshed pin to stay green).
 SCEN6_REGION_SHA='7d31d2b613e1e578c7050a5328cb677f4aac2eba1c6d9a7248f0216d1dd06af7'
 SCEN7_REGION_SHA='941be4f7805b74ff79b691e463f91dd011a1b549cd17995f09542ff8d3f40500'
 PINNED_REGIONS='scenario-6 scenario-7'

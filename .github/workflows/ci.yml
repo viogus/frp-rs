@@ -149,6 +149,10 @@ jobs:
         # The claim is that narrow — the guard catches careless single-region
         # edits; an edit here plus a refreshed `SCEN*_REGION_SHA`, or a forged
         # summary/evidence block, is still green (declared residues L1/L2).
+        # Round 14 moved the digest reads and the evidence matching to builtins
+        # only; the residues that remain — the fixture's own `grep`/`awk` over
+        # other files, `flip_hex`'s `tr`, a shadowed interpreter, a decoy end
+        # marker, a neutered accept line — are declared and worded in the suite.
         # Update `guard_pin` with the digest named in the failure message when the
         # guard legitimately changes.
         shell: bash
@@ -157,7 +161,7 @@ jobs:
           log=/tmp/frp-repo-health-fixtures.log
           status=0
           guard_file=scripts/tests/repo-health-fixtures.sh
-          guard_pin=1f45727f1dc8debf1b0dd0f7f19cc812a3d25a8b31968688597dc688891a7904
+          guard_pin=05a072275b747b3cbc0ec13f4004923dfb7dbd811d2e6431f55ddb118a395791
           # R12-2 (adversarial round 13): resolve the hasher to an absolute path
           # and prove it with a known vector — the same candidate order and the
           # same fail-closed mode as the guard's own `find_hash_tool()`.
@@ -337,14 +341,21 @@ jobs:
         # the vector proof and `verify_guard`, and `tee`/`grep`/`cat` sat between
         # the suite and the evidence checks, so a shim (or an exported function)
         # for any of them earlier on PATH could map a drifted digest back to the
-        # pin — measured: an `awk` shim left a real regression in this suite green
-        # at exit 0. Residues, named rather than denied: the fixtures' own
-        # `grep`/`sed` over *other* files are still PATH-resolved (they can weaken
-        # a scenario, never a pin); `flip_hex`'s `tr` and the `mktemp` probe
-        # directory are fail-closed only; and a shadowed `bash` interpreter or a
-        # replaced absolute candidate (`/usr/bin/sha256sum` …) is out of scope —
-        # verifying the verifier's own toolchain needs something that toolchain
-        # cannot supply.
+        # pin — demonstrated: an `awk` shim kept a real regression in this suite
+        # green at exit 0, and a hostile `tee` forged the evidence line; both red
+        # now. Residues, named rather than denied: the fixtures' own
+        # `grep`/`sed`/`awk` over *other* files are still PATH-resolved — a `grep`
+        # shim answering "no hits" is a real false negative for the scenario that
+        # watches the unpinned `scripts/compat-test.sh`, never a defeated pin —
+        # and an unpinned in-repo file (or the repo-health step above) can put such
+        # a shim ahead on `$PATH` via `$GITHUB_PATH`; `flip_hex`'s `tr` and the
+        # `mktemp` probe directory are fail-closed only; and a shadowed `bash`
+        # interpreter or a replaced absolute candidate (`/usr/bin/sha256sum` …) is
+        # out of scope — verifying the verifier's own toolchain needs something
+        # that toolchain cannot supply. Two L2-class fragilities are declared, not
+        # denied: `region_lines` stops at the first end marker (a decoy end marker
+        # truncates the hashed text) and the accept-direction line in
+        # `enforce_substance` is a single unguarded command.
         #
         # The claim stays narrow: careless single-region edits are caught; an
         # in-file edit plus a refreshed `SCEN*_REGION_SHA`, or a forged
@@ -357,7 +368,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=8e248ecef3462037065a1430c2c453551a915801cc43d7e2ba08b31e371a3ec6
+          guard_pin=fb3361d1480d509b336b2cc103a95498417965df4bc3a17ad606bd4ae5d55c12
           # R12-1 (adversarial round 13): the enforcer's *implementation* lives in
           # the library the scenarios `source` (the `LIB=` assignment at :96 only
           # names it), so pinning only the suite left the "two-file change" claim
