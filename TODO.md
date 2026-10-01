@@ -6756,7 +6756,7 @@ nothing about whether the described behaviour still holds.
   ranking, block inventory, validation bar and hazards:
   [`docs/refactor-large-modules.md`](docs/refactor-large-modules.md).
 
-  **Progress (2026-10-01, code head `174f1a02` on `refactor/extract-ws-listener`, PR #436).** The
+  **Progress (2026-10-01, code head `0f1b94c2` on `refactor/extract-ws-listener`, PR #436).** The
   first P1 seam landed: the dedicated-`websocket_port` accept loop moved byte-for-byte out of
   `frp-server/src/service.rs::run` into `frp-server/src/service/listeners.rs` as
   `pub(super) async fn start_websocket_listener(&self, rate_limiter_enabled: bool)` — 289 payload
@@ -8886,3 +8886,17 @@ section; ledger now **24 open / 104 closed**.**
   are caught by the unchanged `frp-core` lanes, so no coverage is lost relative to the base.
   **Done-when:** the `frps` dashboard captures pin the record's bytes, the level is compared untrimmed, the
   following-line bytes are covered, and each of the three mutants reds the `frps` lane itself.
+
+- [ ] **`docs/config.md:22` names `websocketPort` as the Go frp v0.71.0 spelling of `websocket_port`, but Go's `frps` has no such field.**
+  Filed by the coordinator from PR #436's delta adversarial (INFO). Measured with the real v0.71.0 binary:
+  a server config carrying `websocketPort` is refused with exactly `json: unknown field "websocketPort"`
+  and binds neither port; Go's `pkg/config/v1` server config names no WebSocket port at all, and Go's
+  server carries WebSocket upgrades on `bindPort`. `frp-core/src/config/strict.rs:105` lists the spelling in
+  `known_server_keys()`, a strict-parser acceptance set that also carries implemented keys (`bind_port`),
+  and `frp-core/src/config/server.rs:39-41` accepts it as a serde alias of the implemented, feature-gated
+  `pub websocket_port: u16` (`frp-core/src/config/tests.rs:270`/`:286` pins that the alias really drives the
+  field), so frp-rs acts on the spelling as an extension — which leaves the reference row's Go column as the
+  claim the measurement contradicts; `tls_enable`'s row (`docs/config.md:25`) already shows the shape for a
+  server key with no Go counterpart.
+  **Done-when:** `docs/config.md:22` either gets the `—` shape (`frp-rs` accepts the spelling and Go's `frps`
+  has no such option, so it is an frp-rs extension), or the Go mapping is re-measured and kept.

@@ -291,7 +291,7 @@ Block inventory, from the function's own comment landmarks:
 
 - WebSocket listener → `frp-server/src/service/listeners.rs`,
   `pub(super) async fn start_websocket_listener(&self, rate_limiter_enabled: bool)` — PR #436 at
-  code head `174f1a02` (based on `13a29d26`): 289 payload lines byte-identical, and because no test
+  code head `0f1b94c2` (based on `13a29d26`): 289 payload lines byte-identical, and because no test
   had ever reached the dedicated port the move was shipped with
   `frp-server/tests/transport_e2e_websocket_port.rs` and the `websocket`-without-`kcp` CI lane. See
   the `TODO.md` progress paragraph.
