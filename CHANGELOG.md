@@ -453,6 +453,20 @@ User-facing release notes for frp-rs.
   has been quiet for `QUIET_PERIOD` (`:110`, 500 ms; `RECORD_TIMEOUT = 10 s` at `:101`), so a loaded host
   can no longer snapshot a record still in flight — and a second emit 150 ms behind the first, which the
   removed settle missed, now reds the test.
+- **The `tls_enable` warning pins now fail when the warning they pin changes.** `frp-core/tests/common/mod.rs:132`
+  compared the tracing **level** after `trim()`, which erased exactly the bytes it was meant to detect; the whole
+  untrimmed `" WARN"` field is compared now, so an emit site that rewrites the target
+  (`x frp_core::config::loader`) or inserts a space, `\n` or `\t` in front of it reds
+  (`frp-core/tests/common/mod.rs:132:5`, `4 passed; 2 failed`) instead of leaving the web-server capture green.
+  `frp-server/src/service.rs:420`'s `web_server_tls_enable_reader()` was unwitnessed — every `frps` lane links
+  `frp-server` with `tls` on, so replacing its `cfg!(feature = "tls")` with `true` stayed green while a
+  dashboard-on/tls-off build would have named a switch it cannot honour; the new name-filtered lane
+  (`.github/workflows/ci.yml:460-514`, `cargo test -p frp-server --no-default-features --features dashboard`)
+  runs `web_server_tls_enable_reader_answers_from_this_build` (`frp-server/src/service.rs:2621`) in exactly that
+  shape and requires its completion marker. Both warning pins now carry `-- --list`-derived count guards
+  (`.github/workflows/ci.yml:551-583` and `:584-613`, expecting 8 and 6), so an added `#[ignore]` or a deleted
+  test reds the lane instead of passing quietly, and the `expected_warning` arm no test read (`NoWebServer`) is
+  exercised by the reader loop.
 - **The `web_server.tls.enable` warning no longer names a TLS acceptor a build does not have.** The text
   was chosen from the caller's `cfg!`, so `cargo build -p frpc --no-default-features --features micro,admin`
   — an `admin` build **without** `tls`, where the configured `cert_file`/`key_file` pair is discarded

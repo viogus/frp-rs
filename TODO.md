@@ -7904,7 +7904,7 @@ section; ledger now **24 open / 104 closed**.**
   fixed-settle flip moves one item open→closed and this batch files three new residues — the round-2
   TLS-enable capture item and the two the round-2 delta review measured below).
 
-- [ ] **Four residues #428's round-2 adversarial review measured in the new warning pins.** Same
+- [x] **Four residues #428's round-2 adversarial review measured in the new warning pins.** Same
   test-precision class as the item above; none blocks the fix.
   (a) The shared record helper anchors the tracing target only as a counted suffix
   (`frp-core/tests/common/mod.rs:88` checks `prefix.matches(" frp_core::config::loader: ").count() == 1`
@@ -7926,6 +7926,41 @@ section; ledger now **24 open / 104 closed**.**
   (through `Captured.expected`), so its `NoWebServer` arm is dead code — either it is exercised or the arm is
   removed.
 
+  **Done (2026-10-01, at code head `b86e3592` on `fix/warning-pin-precision`, PR #433).** All four residues
+  closed, each by a pin a mutant reds. (a) The shared helper now compares the whole tracing-level field
+  **untrimmed** against the literal: `assert_eq!(level, " WARN", …)` at `frp-core/tests/common/mod.rs:132`
+  replaces the round-1 `level.trim() == "WARN"`, which was strictly weaker because `trim()` erases exactly the
+  bytes the anchor exists to detect. Mutants at the web-server emit site (`frp-core/src/config/loader.rs:723`):
+  a target rewritten to `x frp_core::config::loader`, and three that put a space, `\n` or `\t` between the
+  level and the target — all four red at `frp-core/tests/common/mod.rs:132:5` (`4 passed; 2 failed`, exit 101,
+  lefts `" WARN x"`, `" WARN \n"`, `" WARN \t"`, `" WARN "`), and a level rewritten to `error!` reds as well.
+  The superset proof: the base accepted iff `level.contains("WARN") && !level.contains('\n')`, the head
+  accepts iff `level == " WARN"`, and every other line of the helper is byte-identical — so nothing the old
+  assertion caught is missed now. (b) `web_server_tls_enable_reader()` (`frp-server/src/service.rs:420`) is
+  witnessed by `web_server_tls_enable_reader_answers_from_this_build` (`:2621`), whose `#[cfg]`-gated
+  assertions pin which of the three answers this crate's feature pair produces, and which prints the
+  completion marker `web-server-tls-enable-reader-pin: ok, {got:?}` (`:2637`) **after** them; the
+  name-filtered lane `Run frp-server's web_server.tls.enable resolver test without TLS (count guard)`
+  (`.github/workflows/ci.yml:460-514`) runs it in the one shape no other lane builds
+  (`cargo test -p frp-server --no-default-features --features dashboard`). Executed in three states at the
+  reviewed head: real head rc 0; resolver forced to the literal `true` rc 1 with the step's `::error::` naming
+  the missing marker; assertion deleted rc 101. (c) Both pin files are count-guarded from their own
+  `-- --list`: `Run frp-core's server tls_enable warning pin (count guard)`
+  (`.github/workflows/ci.yml:551-583`, literal `8` at `:570`, `:573`, `:575`, `:577`) and
+  `Run frp-core's web-server tls_enable warning pin (count guard)` (`:584-613`, literal `6` at `:600`, `:603`,
+  `:605`, `:607`), both carrying the direction-aware failure text (a shrunken list says "restore them rather
+  than lowering this literal"); the live `-- --list` counts are 8 and 6 at this head. (d) `expected_warning`
+  (`frp-core/tests/web_server_tls_enable_warning.rs:113`) is now read back for **every** reader answer inside
+  the three-reader loop (`assert_eq!(c.expected, expected, …)` at `:473`), so the `NoWebServer` arm is
+  exercised and a wrong arm is red; the loop's own literal stays the independent witness. Gates:
+  `cargo fmt --all -- --check` rc 0; `bash scripts/repo-health.sh` → `RESULT: invariants hold`. The diff is
+  +184/−11 in four files (`.github/workflows/ci.yml` +118, `frp-core/tests/common/mod.rs` 36,
+  `frp-core/tests/web_server_tls_enable_warning.rs` +12, `frp-server/src/service.rs` +29) — tests and CI only,
+  no production behaviour change.
+  **Ledger after this batch: 26 open / 155 closed** (base `2e8b1d52`: 26 open / 154 closed; this batch closes
+  the warning-pin item and files one new residue), measured with `grep -cE '^- \[ \]' TODO.md` /
+  `grep -cE '^- \[x\]' TODO.md`.
+
 - [ ] **`frps/tests/warn_delivery.rs`'s TLS-enable captures count the record instead of pinning it — the gap #428 closed for the `frp-core` captures, still open on the server side.**
   Filed by the coordinator while re-deriving part (a) of the item above at `80ed6a85`. The `frp-core`
   captures now call `assert_record_is_exactly_the_message` (`frp-core/tests/common/mod.rs:88`), but the
@@ -7939,6 +7974,23 @@ section; ledger now **24 open / 104 closed**.**
   server-visible line can drift from the static unnoticed.
   Done-when: the `frps` capture asserts the emitted record's bytes (equality, or the shared helper with the
   `frps` target) and the appended-clause mutant reds it.
+- [ ] **The three CI-guard strengths the `warning-pin` round-2 adversarial measured: the guards prove the tests ran, not that they asserted anything.**
+  Filed by the coordinator from the round-2 adversarial report (`/private/tmp/rev-g1r2-attack.md`); none blocks
+  PR #433. (a) The resolver pin's completion marker is self-reported: deleting its three `assert_eq!`s while
+  keeping the `println!`, or hoisting the print before an early `return;`, or renaming the test and adding a
+  same-named stub that only prints the marker, all leave the step green — the shell marker cannot witness that
+  assertions exist. Done-when: the lane checks the marker's variant name against the arm the shape must take,
+  or the pin is structured so a body that skips its assertions cannot print the marker. (b) The two new count
+  guards (`.github/workflows/ci.yml:551-583`, `:584-613`) check the *count* only: deleting the
+  `assert_eq!(c.expected, expected, …)` this PR adds (`frp-core/tests/web_server_tls_enable_warning.rs:473`),
+  or a `return;` as the pinned test's first statement, still leaves the web-server guard green
+  (`6 tests listed (expected 6), 0 failed`). Done-when: each guard also requires the run's own
+  `N passed; 0 failed` summary to match the `-- --list` count, or pins the test names. (c) The marker coupling
+  produces a false red with a misleading diagnosis: removing the pin's `println!` but keeping its assertions
+  gives libtest `1 passed` and step exit 1 telling the author to "restore the assertions" — which are intact —
+  and a legitimate `WebServerTlsEnableReader` variant rename would fire the same way, because the marker
+  embeds the `Debug` spelling. Done-when: the marker and the diagnostics are keyed on something a variant
+  rename does not move, or "no marker" and "no assertions" are reported apart.
 
 - [x] **`--allow-unsafe`'s comma grammar still differs from pflag's CSV reader, and the ignored-flag twin splits nothing at all.**
   The read-path parser splits on `,` and trims each element (`frp-core/src/cli.rs:2637-2646`, inside
