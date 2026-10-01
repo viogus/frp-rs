@@ -101,7 +101,7 @@ re-running the script before acting on them.
 | `frp-client/src/visitor.rs` | 3850 | 165 | **3685** |
 | `frp-server/src/control/proxy_ops.rs` | 8044 | 4432 | **3612** |
 | `frp-server/src/control/bridge.rs` | 5445 | 2122 | **3323** |
-| `frp-server/src/vhost.rs` | 6312 | 0 ✅ | **3164** |
+| `frp-server/src/vhost.rs` | 6331 | 3151 ✅ | **3180** |
 | `frp-server/src/dashboard.rs` | 3910 | 987 | 2923 |
 | `frp-server/src/ssh_gateway.rs` | 4865 | 2123 | 2742 |
 | `frp-core/src/auth.rs` | 3791 | 1924 | 1867 |
@@ -196,14 +196,19 @@ only textual change is one level of de-indentation.
 | File | Now | After | Reduction |
 |---|---:|---:|---:|
 | `frp-server/src/control/proxy_ops.rs` | 8044 | ~3610 | **55%** |
-| `frp-server/src/vhost.rs` | 6312 | **3179** | **50%** ✅ |
+| `frp-server/src/vhost.rs` | 6331 | **3179** | **50%** ✅ |
 | `frp-server/src/control/bridge.rs` | 5445 | ~3320 | 39% |
 | `frp-server/src/ssh_gateway.rs` | 4865 | ~2740 | 44% |
 | `frp-client/src/service.rs` | 6382 | ~4930 | 23% |
 
-The `frp-server/src/vhost.rs` row is **landed** — PR #452 (branch `refactor/fileify-vhost-tests`,
-code head `35497f66`, based on `f881d15e`): the file measured 6331 lines at the base, not 6312, and
-is now **3179** with its tests in `frp-server/src/vhost/tests.rs`. See P7.
+Every row is measured on the **pre-extraction** file and follows the same convention as the other
+rows: `Total` = `Inline tests` + `Production`. The `frp-server/src/vhost.rs` row was re-measured in
+PR #452 (branch `refactor/fileify-vhost-tests`, code head `7ff46a60`, based on `f881d15e`, rebased
+onto `18bcd1ad`): its base file was **6331** lines, not 6312, split into **3151** inline-test lines
+(`vhost.rs:3180-6330`, the extracted body) and a **3180**-line remainder — 3177 production lines plus
+the 3 module-scaffolding lines (`#[cfg(test)]`, `mod tests {`, the closing `}`). The row is
+**landed**: the body now lives formatted (3144 lines) in `frp-server/src/vhost/tests.rs` and
+`frp-server/src/vhost.rs` is **3179** lines. See P7.
 
 Two things make it more than cosmetic:
 
@@ -248,7 +253,7 @@ Ranked by *risk reduction per unit of disruption*, using the measurements above.
 | **P4** | `frp-server/src/control/proxy_ops.rs` | `handle_new_proxy` 546 code lines; 2nd-highest fix density | 2–3 seams |
 | **P5** | `frp-server/src/control/login.rs::authenticate` (510) and `frp-client/src/work_conn.rs` (`spawn_work_conn` 469, `run_udp_work_conn` 419) | Surfaced only by the measurement script; not on any file-size list | 1 seam each |
 | **P6** | `frp-server/src/control/bridge.rs` | Hot data path, highest risk per line changed. Only the UDP family and the injector adapter clearly pay | 2 seams |
-| **P7** | `frp-server/src/vhost.rs` | Not urgent for production, but **a 3147-line test extraction with zero production change**, then 4 low-risk seams | 1 free step + 4 seams |
+| **P7** | `frp-server/src/vhost.rs` | Not urgent for production, but **a 3151-line test extraction with zero production change**, then 4 low-risk seams | 1 free step + 4 seams |
 | **P8** | `frp-server/src/ssh_gateway.rs` | Already decomposed (largest fn 310 code lines); the win is the test extraction plus `args.rs`, the cleanest seam in the repo | 1 free step + 6 seams |
 | — | `frp-server/src/handlers/` | The product of an earlier successful split; largest fn 463 code lines | leave alone |
 
@@ -611,19 +616,20 @@ anything on the pump path is touched (a pure move should not be).
 `vhost.rs` was going to be listed as "leave alone", because its largest production
 function (`handle_http1_request`) is only ~189 code lines and half the file is
 tests. That was half right: the *production* code does not need urgent attention,
-but there is a **free 3147-line reduction with zero production change** — and five
+but there is a **free 3151-line reduction with zero production change** — and five
 ranked seams after it.
 
-**First step — landed (PR #452, branch `refactor/fileify-vhost-tests`, code head `35497f66`, based
-on `f881d15e`):** move the inline `#[cfg(test)] mod tests` to `frp-server/src/vhost/tests.rs`. At the
-base that body was `vhost.rs:3180-6330` (3151 lines, 61 test functions) and the file measured 6331
-lines, not 6311; the committed extraction is a uniform 4-space dedent plus stock `cargo fmt`
-(`rustfmt --edition 2021` on the dedented body is `cmp`-identical to the new file, zero hand edits),
-and `vhost.rs` is now **3179** lines. Because `tests` stays a *child* of `vhost`, `use super::*`
-still reaches every private item — **no visibility edits, no production change**. Gate, verified:
-the same 765 `-- --list` names (61 under `vhost::tests::`) still run, clippy `--all-targets` is
-clean, and `vhost.rs:1-3177` is byte-identical to base with `mod tests;` its only added production
-line.
+**First step — landed (PR #452, branch `refactor/fileify-vhost-tests`, code head `7ff46a60`, based
+on `f881d15e`, rebased onto `18bcd1ad`):** move the inline `#[cfg(test)] mod tests` to
+`frp-server/src/vhost/tests.rs`. At the base that body was `vhost.rs:3180-6330` — **3151 lines**,
+measured as `git show f881d15e:frp-server/src/vhost.rs | sed -n '3180,6330p' | wc -l` — carrying 61
+test functions, and the file measured 6331 lines, not 6311; the committed extraction is a uniform
+4-space dedent plus stock `cargo fmt` (`rustfmt --edition 2021` on the dedented body is
+`cmp`-identical to the new file, zero hand edits), and `vhost.rs` is now **3179** lines. Because
+`tests` stays a *child* of `vhost`, `use super::*` still reaches every private item — **no visibility
+edits, no production change**. Gate, verified: the same 765 `-- --list` names (61 under
+`vhost::tests::`) still run, clippy `--all-targets` is clean, and `vhost.rs:1-3177` is byte-identical
+to base with `mod tests;` its only added production line.
 
 **A layout trap to know before touching this file.** `vhost.rs` declares
 `#[path = "vhost_h2c.rs"] mod vhost_h2c;` (17–19) — so the `mod vhost_h2c` inside

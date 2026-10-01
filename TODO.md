@@ -6768,17 +6768,21 @@ nothing about whether the described behaviour still holds.
   The remaining blocks (HTTP vhost, HTTPS vhost, TCPMux, SSH tunnel gateway, KCP, QUIC, dashboard,
   `tasks.rs`) are tracked in the plan doc, which now records what has landed.
 
-  **Progress (2026-10-01, code head `35497f66` on `refactor/fileify-vhost-tests`, PR #452).** The
-  P0/P7 split landed: `frp-server/src/vhost.rs`'s inline `#[cfg(test)] mod tests` moved into
-  `frp-server/src/vhost/tests.rs` as a uniform 4-space dedent plus stock `cargo fmt`
-  (`rustfmt(dedent(original body))` is byte-identical to the committed file; zero hand edits), so
-  the production file drops **6331 → 3179 lines (−49.8%)**. `vhost.rs:1-3177` are byte-identical
-  to base and the only added production line is `mod tests;`; the 7 rustfmt re-wrap sites leave the
-  string/byte/char literal-value multiset unchanged (1377 tokens), and all 765 `-- --list` names
+  **Progress (2026-10-01, code head `7ff46a60` on `refactor/fileify-vhost-tests`, PR #452, based on
+  `f881d15e`, rebased onto `18bcd1ad`).** The P0/P7 split landed: `frp-server/src/vhost.rs`'s inline
+  `#[cfg(test)] mod tests` moved into `frp-server/src/vhost/tests.rs` as a uniform 4-space dedent
+  plus stock `cargo fmt` (`rustfmt(dedent(original body))` is byte-identical to the committed file;
+  zero hand edits), so the production file drops **6331 → 3179 lines (−49.8%)**. `vhost.rs:1-3177`
+  are byte-identical to base and the only added production line is `mod tests;`; the 7 rustfmt
+  re-wrap sites leave the string/byte/char literal-value multiset unchanged (1377 tokens under a
+  Rust tokenizer — the count is lexer-defined, the *equality* is not), and all 765 `-- --list` names
   (61 under `vhost::tests::`) and every `crate::vhost::` caller are unchanged. The literal
   `git diff -U0 | grep -E '^[+-].*"'` check is non-zero (2346) **by construction** for a
   file-to-file move, so it is replaced by those byte-identity and literal-value proofs (calibrated
-  the same way on the merged pure move `771294a3`: 1520). Ledger unchanged: **19 open / 181 closed**.
+  the same way on the merged pure move `771294a3`: 1520). Both mandated reviews returned
+  MERGE-with-findings and their two doc findings are applied in the plan doc. Ledger after the
+  rebase onto `18bcd1ad`: **13 open / 189 closed**, plus the one residue item this round files →
+  **14 open / 189 closed**.
 
 - [x] **Three vendored crates are a standing maintenance liability.**
   Evidence: `vendor/rustls` (TLS, patched), `vendor/yamux` (5 patches),
@@ -9135,3 +9139,20 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** the remote helper reaps by exact pid (a pid file written where it starts the server, or a
   port-scoped lookup) instead of `pkill -f`/`pgrep -f`, or the pattern kill is recorded as required with the
   measurement that shows a pid route is impossible over that ssh path.
+
+- [ ] **A deleted test in `frp-server/src/vhost/tests.rs` leaves every suite green — no CI count guard covers `vhost::tests`.**
+  Filed by the coordinator from PR #452's adversarial review (`/private/tmp/rev452-attack.md`, attack 4, mutant M4),
+  measured at the branch head `7ff46a60`. `frp-server/src/vhost/tests.rs` is a test-only file module whose 61 cases
+  (30 `#[test]` + 31 `#[tokio::test]`) carry **no `#[cfg]` gate**, so the module compiles into every `frp-server`
+  test build and deleting one whole test neither fails compilation nor moves any count a lane asserts. Measured:
+  deleting `test_extract_sni_short_data` leaves `cargo test -p frp-server --all-features` green while
+  `-- --list` drops **765 → 764** overall and `^vhost::tests::` **61 → 60**, and `grep -n 'vhost::tests'
+  .github/workflows/ci.yml` is empty — no `--list`-count or `N passed` summary step watches this module the way the
+  other count-guarded lanes watch theirs. The name-set diff this PR ran by hand catches the class; nothing in CI
+  does, `scripts/large-functions.sh`-style source counts cannot, and `repo-health.sh` prints a whole-tree `#[test]`
+  total that no lane compares against a stored literal. Same class as the count-guard residues filed from
+  #432/#433/#444.
+  **Done-when:** either the `frp-server` job gains a step that pins the `vhost::tests` `-- --list` count behind a
+  fail-closed literal (the shape of the existing count guards), or the residue is recorded as accepted with the
+  argument that the module is only ever moved as a block and every move ships its own name-set diff.
+  Ledger after this round: **14 open / 189 closed** (base `18bcd1ad`: 13 open / 189 closed; this round files one item).
