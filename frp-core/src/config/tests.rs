@@ -13111,3 +13111,137 @@ fn range_section_without_remote_port_is_skipped_not_fatal_both_modes() {
         assert_eq!(names, vec!["p2"], "strict={strict}");
     }
 }
+
+/// **Item 1, reserved-root `type`-only sections: frp-rs keeps them as v1
+/// settings (recorded design decision).**
+///
+/// `i4c.ini` (`[common]` + `[web_server] type = "tcp"`) measured on Go v0.71.0:
+/// rc 0 in both loader modes, and the legacy collector registers a proxy named
+/// `web_server` of type `tcp` with listen port 0 — Go's
+/// `LoadAllProxyConfsFromIni` skips only the default section, `common` and
+/// `range:`, so every other header is a proxy regardless of its name. frp-rs
+/// keeps its known-settings-root guard (`KNOWN_SECTIONS` in
+/// `frp-core/src/config/normalize.rs:1919`) and reports `Proxies: 0`, rc 0 in
+/// both modes. Keying the bypass on `type` instead of the ports would also
+/// collect `[log] type = "custom" disable_print_color = true` (Go rc 1
+/// `failed to parse proxy log, err: invalid type [custom]`, frp-rs rc 0 today)
+/// and would contradict `test_legacy_ini_known_section_with_type_not_collected`
+/// (`frp-core/src/config/tests.rs:9946`). The item calls this a design question
+/// about whether frp-rs keeps supporting v1 settings roots in `.ini` at all, so
+/// the divergence is recorded deliberate rather than forced. The sibling
+/// typeless/port-less shape (`c2.ini`, `[p] custom_domains = ["a.com"]`) is
+/// pinned the same way both modes: Go collects `p` (rc 0), frp-rs keeps it a v1
+/// section (`unknown field "p"` strict, rc 0 non-strict), matching
+/// `typeless_ini_section_without_ports_stays_a_v1_section`
+/// (`frp-core/src/config/tests.rs:6967`).
+#[test]
+fn legacy_ini_reserved_root_type_only_section_is_not_collected_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let i4c = dir.path().join("i4c.ini");
+    std::fs::write(
+        &i4c,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [web_server]\ntype = \"tcp\"\n",
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let cfg = load_client_config(i4c.to_str().unwrap(), strict)
+            .unwrap_or_else(|e| panic!("i4c strict={strict}: frp-rs keeps the settings root: {e}"));
+        assert!(
+            cfg.proxies.is_empty(),
+            "i4c strict={strict}: Go registers [web_server] as a type-tcp proxy, frp-rs does not"
+        );
+    }
+
+    let c2 = dir.path().join("c2.ini");
+    std::fs::write(
+        &c2,
+        "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\
+         [p]\ncustom_domains = [\"a.com\"]\n",
+    )
+    .unwrap();
+    let lenient = load_client_config(c2.to_str().unwrap(), false).unwrap();
+    assert!(lenient.proxies.is_empty(), "c2 non-strict");
+    let err = format!(
+        "{}",
+        load_client_config(c2.to_str().unwrap(), true).unwrap_err()
+    );
+    assert!(
+        err.contains("unknown field \"p\""),
+        "c2 strict keeps the typeless, port-less section a v1 shape: {err}"
+    );
+}
+
+/// **Item 1, server side: no legacy collector means a dotted or reserved root
+/// stays a v1 key, and Go's legacy server reader simply ignores those headers.**
+///
+/// The four `frps` shapes measured on Go v0.71.0 (a `[common]` header makes the
+/// file legacy for Go, whose server reader then reads its typed `[common]`
+/// fields and ignores every other section):
+/// * `s2.ini` `[proxies.foo] type = tcp`: Go rc 0 in both loader modes; frp-rs
+///   strict rc 1 `unknown field "proxies.foo"`, non-strict rc 0.
+/// * `i6a.ini` `[http_plugins.foo] name = "u"`: Go rc 0 both; frp-rs rc 1 both
+///   `invalid type: map, expected a sequence`.
+/// * `i6b.ini` `[plugin.user] ops = login`: Go rc 1 both `invalid http plugin
+///   ops, optional values are [Login NewProxy CloseProxy Ping NewWorkConn
+///   NewUserConn]`; frp-rs rc 1 both `server config: http_plugins entry 'user'
+///   has no addr` — the refusal agrees, the message does not.
+/// * `i7.ini` `[feature.foo] x = true`: Go rc 0 both; frp-rs rc 1 both
+///   `invalid type: map, expected a boolean`.
+///
+/// frp-rs has no server-side legacy collector (the item says so explicitly), so
+/// these are recorded as deliberate divergences rather than forced to Go's
+/// verdicts: `[feature]`/`[http_plugins]` are typed v1 settings roots, and
+/// accepting an arbitrary subtable would weaken those types. Both modes pinned.
+#[test]
+fn legacy_ini_server_side_dotted_and_reserved_roots_stay_v1_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let cases: [(&str, &str, Option<&str>); 4] = [
+        (
+            "s2.ini",
+            "[common]\nbind_port = 7000\n[proxies.foo]\ntype = tcp\n",
+            Some("unknown field \"proxies.foo\""),
+        ),
+        (
+            "i6a.ini",
+            "[common]\nbind_port = 7000\n[http_plugins.foo]\nname = \"u\"\n",
+            Some("invalid type: map, expected a sequence"),
+        ),
+        (
+            "i6b.ini",
+            "[common]\nbind_port = 7000\n[plugin.user]\nops = login\n",
+            Some("http_plugins entry 'user' has no addr"),
+        ),
+        (
+            "i7.ini",
+            "[common]\nbind_port = 7000\n[feature.foo]\nx = true\n",
+            Some("invalid type: map, expected a boolean"),
+        ),
+    ];
+    for (name, body, strict_err) in cases {
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        for strict in [false, true] {
+            let outcome = load_server_config(path.to_str().unwrap(), strict);
+            match (name, strict, strict_err) {
+                // The one shape where frp-rs agrees with Go in non-strict mode.
+                ("s2.ini", false, _) => {
+                    outcome.unwrap_or_else(|e| panic!("s2 non-strict must load: {e}"));
+                }
+                (_, _, Some(fragment)) => {
+                    let err = match outcome {
+                        Err(e) => format!("{e}"),
+                        Ok(_) => panic!(
+                            "{name} strict={strict} loaded, expected an error containing {fragment:?}"
+                        ),
+                    };
+                    assert!(
+                        err.contains(fragment),
+                        "{name} strict={strict}: expected {fragment:?}, got {err}"
+                    );
+                }
+                (_, _, None) => unreachable!("every case names its strict error"),
+            }
+        }
+    }
+}
