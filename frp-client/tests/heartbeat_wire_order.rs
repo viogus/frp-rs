@@ -122,7 +122,7 @@ async fn no_ping_before_login_resp_pings_begin_after_registration() {
         // (service.rs: register_proxies Phase 4 -> run_message_loop
         // Phase 6 — pings physically cannot leave before this point, the
         // writer task is not spawned until Phase 5). The heartbeat interval
-        // is armed at login success (service.rs:1812-1815, tokio `interval()`:
+        // is armed at login success (service.rs:1830-1833, tokio `interval()`:
         // tick 1's deadline is the arm instant) and polled for the first
         // time at loop start, so tick 1 fires immediately: Ping#1 must
         // reach the wire ~ms after this write.
@@ -380,7 +380,7 @@ async fn ping_reuses_startup_token_snapshot_when_source_becomes_unreadable() {
             .expect("write LoginResp");
 
         // Oracle-1 immediacy anchor: the client arms its heartbeat interval
-        // when it processes this LoginResp (service.rs:1812-1815, tokio
+        // when it processes this LoginResp (service.rs:1830-1833, tokio
         // `interval()`: tick 1's deadline is the arm instant). This session
         // has no proxies or visitors, so the registration phase
         // (service.rs register_proxies — nothing pending) and the loop
@@ -648,15 +648,22 @@ fn assert_oidc_ping_key(frame: &FrpMessage, token: &str) {
 ///       and the value the unit test `heartbeat_ping_backoff_progression`
 ///       pins), never against a hand-written range. Nominal 2s; with
 ///       `interval.reset_after(delay)` deleted the interval keeps its 10s
-///       period and the next attempt lands ~10s after T2 (~5× the upper
+///       period and the next attempt lands ~10s after T2 (~3.3× the upper
 ///       bound) — RED; a wrong-but-in-range backoff hard-coded at the call
 ///       site — `reset_after(Duration::from_secs(5))`, the mutant the old
 ///       `[1.0s, 6.0s]` window stayed green on — lands ~5s after T2 (1.7×
 ///       the upper bound) — RED. The remaining slack absorbs host load, which
 ///       can only *grow* the measured gap, so the load-sensitive edge is the
-///       upper one, 1s above nominal. Honest limit: a wrong literal *close*
-///       to 2s (say 2.2s) is not distinguishable end-to-end at all; only the
-///       constant-vs-literal pin in the unit test is exact (TODO.md:8406);
+///       upper one, 1s above nominal. Two limits, each filed as its own item
+///       below the closed `TODO.md:8414`: (a) the window admits ANY call-site
+///       literal in its `[1s, 3s]` class — the review measured 1 s, 2.5 s and
+///       2.9 s all passing — so a wrong literal inside it is not
+///       distinguishable end-to-end, and only the constant-vs-literal pin in
+///       the unit test (`frp-client/src/service.rs:5171-5175`) is exact; (b)
+///       the oracle observes only the FIRST consecutive failure, so a
+///       call-site substitution that returns the constant itself
+///       (`let delay = PING_FIRST_BACKOFF;`) instead of consulting
+///       `next_ping_backoff` stays green too;
 ///   (4) `Ping#3 − Ping#2 ∈ [6.0s, 15.0s]` — the period cadence resumed (a
 ///       backoff that kept re-arming would ping every ~2s);
 ///   (5) exactly one Login.
@@ -690,7 +697,7 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
         server_additional_auth_scopes: None,
     });
     // The OIDC config carries no `auth.token`, so `AuthConfig.token` is empty
-    // and the control-stream key is derive_key("") (service.rs:990 + :1779).
+    // and the control-stream key is derive_key("") (service.rs:1008 + :1797).
     let enc_key = frp_core::encryption::derive_key("");
     let pong = FrpMessage::Pong(msg::Pong { error: None });
 

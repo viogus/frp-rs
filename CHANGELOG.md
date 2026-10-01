@@ -622,7 +622,7 @@ User-facing release notes for frp-rs.
   `plaintext HTTP` versus `no dashboard support`. Round 3 finished that job: three of
   the eight call sites were still unwitnessed — `frpc verify` (`frpc/src/main.rs:776`,
   whose test wrote no nested key so the record never fired), the client reload
-  (`frp-client/src/service.rs:4457`, which had no clause assertion) and the
+  (`frp-client/src/service.rs:4489`, which had no clause assertion) and the
   `frpc --config-dir` site (`frpc/src/main.rs:527`, whose pin no CI lane ran). The
   clause is now asserted on all three, a new count-guarded `frpc --features admin`
   `warn_delivery` step runs the configuration that witnesses `:527`, and the two
@@ -1177,13 +1177,13 @@ User-facing release notes for frp-rs.
   out-of-range value is still Rust's rather than Go's `strconv.ParseInt` wording (recorded in
   `TODO.md`).
 - **`frpc` ran an `auth.tokenSource` `exec` command twice per successful login; it now runs it
-  once, as Go does.** `frp-client/src/service.rs:939` already resolved the source, but `:952` (pre-fix numbering; the
-  post-fix `None` is `:965`) also stored the same `ValueSource` in `AuthConfig.token_source`, so every Login, Ping and NewWorkConn
+  once, as Go does.** `frp-client/src/service.rs:957` already resolved the source, but `:952` at pre-fix `084f7865`; the
+  post-fix `None` is `:983`) also stored the same `ValueSource` in `AuthConfig.token_source`, so every Login, Ping and NewWorkConn
   re-executed it; Go resolves once in `NewService` (`client/service.go:168`). The stored source is
   dropped and the behaviour is pinned by `frp-client/tests/token_source_single_exec.rs` (one
   execution after construction, after two logins, and after three reloads — including a refused
   `[auth]` change) and by the restored ping re-arm oracle
-  `frp-client/tests/heartbeat_wire_order.rs:660`. Measured with real binaries, one login:
+  `frp-client/tests/heartbeat_wire_order.rs:669`. Measured with real binaries, one login:
   pre-fix **2** executions, fixed **1**, Go **1**.
 
 ### Changed

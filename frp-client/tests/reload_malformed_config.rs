@@ -1,7 +1,7 @@
 //! Audit round-10 coverage gap C: the frpc reload path with a MALFORMED
 //! config must hit the Err arm and keep the old config serving.
 //!
-//! The rejected arm lives at frp-client/src/service.rs:4198-4199
+//! The rejected arm lives at frp-client/src/service.rs:4487-4488
 //! (`reload_from_sources`): `load_client_config(...).map_err(|e|
 //! format!("failed to load config: {e}"))?` — the load failure propagates
 //! BEFORE any mutation, so `self.cfg`/`self.proxies` are untouched,
@@ -10,7 +10,7 @@
 //! for a config that *loaded fine*.)
 //!
 //! Observability note: `Service::request_reload()` (the SIGUSR1 path) drops
-//! the reply oneshot (`service.rs:1097-1100`), so the Err *string* is only
+//! the reply oneshot (`service.rs:1268-1271`), so the Err *string* is only
 //! observable on the admin-API path, where the requester waits on the reply
 //! (`admin.rs reload_and_wait` → HTTP 400 with the Err text). Both sides of
 //! the gap are covered here:

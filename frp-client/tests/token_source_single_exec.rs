@@ -38,7 +38,7 @@
 //! * an accepted reload (same `[auth]`, a proxy added or moved) never rebuilds
 //!   `Service::auth_cfg`, so `auth.tokenSource` is not resolved again;
 //! * a reload that changes `[auth]` is refused before anything is applied by
-//!   `reload::auth_reload_refusal` (`frp-client/src/service.rs:4493-4496`,
+//!   `reload::auth_reload_refusal` (`frp-client/src/service.rs:4511-4514`,
 //!   `frp-client/src/reload.rs:30`/`:86`), so it cannot re-read either.
 //!
 //! Order matters: **the refused reload is last and its file is never rewritten
@@ -151,8 +151,8 @@ struct LoginSession {
 
 /// Serve one login on `listener`, complete the handshake the way the real
 /// server does (LoginResp in the clear, everything after it AES-128-CFB keyed
-/// by the resolved token — derived at `frp-client/src/service.rs:1779` and
-/// applied at `:1784-1785` via `stream.into_encrypted(enc_key)`).
+/// by the resolved token — derived at `frp-client/src/service.rs:1797` and
+/// applied at `:1802-1803` via `stream.into_encrypted(enc_key)`).
 async fn serve_one_login(listener: &TcpListener, token: &str) -> LoginSession {
     let (conn, _peer) = listener.accept().await.expect("client did not connect");
     let mut stream = IoStream::Tcp(conn);
