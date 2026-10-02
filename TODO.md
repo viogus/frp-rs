@@ -6540,7 +6540,7 @@ nothing about whether the described behaviour still holds.
   `git grep -nE '(^|[^a-zA-Z_/.-])go (build|run)' -- scripts/ .github/` finds
   nothing, and `scripts/download-go-frp.sh:29` fetches the **prebuilt** release
   tarball (`https://github.com/fatedier/frp/releases/download/v${VERSION}/…`).
-  It is a leftover of a removed path that `CHANGELOG.md:2665-2666` (0.3.1)
+  It is a leftover of a removed path that `CHANGELOG.md:2685-2686` (0.3.1)
   records — `build_go_frp_v2()` (clone + `go build`, cached to
   `/tmp/frp-source-build/`) exists nowhere in the tree, yet
   `.github/workflows/compat.yml:48` still caches that orphaned
@@ -6558,7 +6558,7 @@ nothing about whether the described behaviour still holds.
   `compat.yml:48`) are the pre-change state and no longer resolve. Re-measured at the new
   head: `git ls-files '*.go'` is still empty, `scripts/download-go-frp.sh:29` still
   fetches the prebuilt release tarball, `build_go_frp_v2()` exists nowhere, and all seven
-  workflow YAMLs parse. `actions/setup-go` survives only in records (`CHANGELOG.md:2666`,
+  workflow YAMLs parse. `actions/setup-go` survives only in records (`CHANGELOG.md:2686`,
   this file, `docs/archive/plans/2026-06-28-xtcp-testing.md`). No gate update was owed —
   `scripts/repo-health.sh`'s toolchain checks match `rustup default` and
   `setup-rust-toolchain` only, never `setup-go` — and the `compat` lane is green at the
@@ -7371,8 +7371,8 @@ nothing about whether the described behaviour still holds.
   The four precision bounds: the region's brace scan is the careful one (`frp-core/src/logging.rs` 689 is the
   witness); the name rule and `mod X;`-sibling behaviour are preserved (the classifier's existing fixtures and
   M1–M5 still pass); `#[cfg(all(test, …))]` is recognised. The fourth (`#[path]`) is closed for the one-line,
-  attribute-after-gate and path-then-one-line-gate orderings (`#[path]` then `#[cfg(test)]` reads `0 4 4`); only a
-  *wrapped* multi-line `#[cfg(all(…))]` gate under a `#[path]` still reads `4 4 0` (the wrapped-predicate residue). The only `#[cfg(test)]`-paired `#[path]` site,
+  attribute-after-gate, path-then-one-line-gate and `#[path]`-then-`#[cfg(any(test))]` orderings (the target reads `0 4 4`);
+  two shapes still leave it at `4 4 0` — a `#[path]` that does not stand alone on its line (packed with the gate) and any predicate written across lines. The only `#[cfg(test)]`-paired `#[path]` site,
   `frp-server/src/control/proxy_ops/mod.rs:3044-3046`, is in the supported order. The item's "the tree's only
   `#[path]` site" is loose: `frp-server/src/vhost.rs:24` carries a second one, paired with a
   `#[cfg(feature = "http-proxy")]` gate rather than a test gate. The two smaller conventions the item records are
@@ -10801,16 +10801,16 @@ other.
 
 - [ ] **A multiline `#[cfg(...)]` predicate is never attributed, so its item reads as production.**
 
-  Filed by the M-2 records round (PR #468). The gate locator (`CFG_OPEN`, `gate_tail_ok`, `attribute_run`) requires
-  the attribute to open and close on the lines its run walks, so a predicate that spans lines (`#[cfg(all(` /
-  `test,` / `feature = "x"` / `))]` above the decorated item) is not a gate on any revision: a 22-code-line probe
-  reads `22 22 0` production/total/test at `2833442a`, `b113b013`, `0ebbe6b1`, `05bb3b2d` and `040f567c` alike
-  (test 0; production == total). Zero in-tree test-gate triggers — the only live multi-line `#[cfg(` in the
-  script's `ROOTS` is `frp-core/src/transport/mod.rs:977`, an `any(target_os = …)` — and the limitation is recorded
-  in-tree beside `CFG_OPEN` (`scripts/large-functions.sh:65-67`), but no fixture pins the non-recognition.
+  Filed by the M-2 records round (PR #468), widened in round 3: the one-line, start-anchored gate locator
+  (`cfg_attribute` / `is_test_gate`) misses two spellings — (a) a predicate spanning lines (`#[cfg(all(` / `test,` /
+  `feature = "x"` / `))]` above the decorated item) and (b) a `#[path]` written before the gate on the gate's own
+  line (`#[path = "…"] #[cfg(test)]` above `mod x;`). Measured here, production/total/test: (a) a 22-code-line
+  probe reads `22 22 0` at `2833442a`, `b113b013`, `0ebbe6b1`, `05bb3b2d`, `040f567c`; (b) the packed line hides the
+  gate too (module file `11 11 0`, target `4 4 0`), as does the across-lines predicate (`14 14 0` / `4 4 0`). Neither
+  has an in-tree trigger (the only live multi-line `#[cfg(` under `ROOTS` is `frp-core/src/transport/mod.rs:977`);
+  neither is pinned by a fixture; only (a) is noted in-tree (`scripts/large-functions.sh:65-67`).
 
-  **Done-when:** a multiline predicate gates, or the script records it as unsupported in its own docstring and a
-  fixture pins the non-recognition.
+  **Done-when:** either spelling gates, or both are documented as unsupported in the script's own docstring and pinned by a fixture.
 
 - [ ] **`#[ cfg ( test ) ]` gates but is pinned by no fixture.**
 
