@@ -10353,6 +10353,9 @@ section; ledger now **24 open / 104 closed**.**
     ≥20 s silently replaces its 3 s retry loop with one long attempt. (`go-to-rust-quic`'s
     `send_and_expect "$proxy_port" "quic-test-data" "quic-test-data" 15` at
     `scripts/compat-test.sh:6801` was deliberately left alone for this reason.)
+  - The mechanism behind that readiness-gate signature is filed separately: **A compat scenario can hand
+    its own Go frps a port its echo listener already holds, and the readiness probe cannot tell.**
+    (`TODO.md:10419`).
 
   **Done-when:** the next red `compat` run on main is diagnosed from the logs the round-5 dump now
   prints under `$CI` (the `frps.log`/`frpc.log` tails), the lateness is attributed to runner
@@ -10412,3 +10415,45 @@ section; ledger now **24 open / 104 closed**.**
   for — a pid check against the row's recorded frps/frpc pid, not a bare LISTEN probe — proven by a
   constructed foreign-listener run that can no longer green a row. Moving the block outside
   `random_port()`'s 17000–26999 range is additional hardening only; it cannot satisfy this item by itself.
+
+- [ ] **A compat scenario can hand its own Go frps a port its echo listener already holds, and the readiness probe cannot tell.**
+
+  Filed by the coordinator from CI run `37015704902` (workflow `Cross-Compat`, job `compat`, head `5099b7f0e0eecf96cd2a31d078e6441920f00e30` = PR #463) — the first compat red that has been root-caused rather than measured, and whose mechanism has since been **reproduced by forced collision** on the base tree. That run failed one of eighty-six scenarios:
+
+  ```
+  [LOG] === rust-to-go-compression ===
+  [FAIL] rust-to-go-compression: proxy port 20180 not reachable      (21.3 s wall, 20 s floor active)
+  create server listener error, listen tcp 127.0.0.1:19510: bind: address already in use
+  frpc (Rust) v0.71.0 connecting to 127.0.0.1:19510
+  Login sent, waiting for response...
+  WARN Login failed (attempt 1): protocol error: Unexpected response to login
+  ```
+
+  The last five lines are the scenario's own Go frps and Rust frpc (`frp-client/src/control.rs:543`, the `_ =>` arm of the login-response match — a successfully decoded frp message that is **not** `LoginResp`). So the frps could not bind its control port, the frpc then spoke frp to whatever did hold it, login never completed, no proxy was registered, and the remote proxy port never listened. Those lines only survive because the `fail_test` log dump in `scripts/compat-test.sh` now runs under `$CI` as well as `$VERBOSE`; the dump prints `*.log` files, so the echo port itself — recorded in `frpc.toml` as `local_port` — still needs `--keep-tmp`.
+
+  Mechanism, all in `scripts/compat-test.sh`: `random_port()` (`:190`) picks `(RANDOM % 10000) + 17000` and rejects it only if it is listening *at pick time* (lsof, else ss, else no check at all). It keeps no memory of the ports it has already returned, and `test_r2g_compression` takes three independent picks — `frps_port`, `proxy_port`, `echo_port` — with no per-scenario uniqueness, starting the echo listener first:
+
+  ```
+  start_echo_server "$echo_port"     # python3 accept/recv/sendall/close, SO_REUSEADDR, never logs the port
+  run_go "$GO_FRPS" -c ...           # binds $frps_port
+  ```
+
+  If `echo_port == frps_port` the echo server wins the bind, the Go frps dies with `bind: address already in use`, and `wait_for_port` (`:210`) — a bare `nc -z` connect with no ownership check — succeeds against the echo server, so the harness proceeds as if the server were up.
+
+  **Reproduced by forced collision** (isolated copy of `b9af37c5`, one-line edit `echo_port="$frps_port"`, no rebuild):
+
+  | run | result |
+  | --- | --- |
+  | control, unmodified | exit 0, 1 s, `RESULTS: 1 passed, 0 failed` |
+  | `echo_port="$frps_port"` | exit 1, 11–12 s — the same three symptoms as the CI red: frps `bind: address already in use`, frpc `Login failed (attempt 1): protocol error: Unexpected response to login`, `[FAIL] rust-to-go-compression: proxy port <n> not reachable` |
+  | `echo_port="$proxy_port"` | **spurious PASS** (`RESULTS: 1 passed, 0 failed`): frps starts fine, frpc logs `Logged in` then `Failed to register proxy 'tcp-comp': port unavailable`, and both readiness probes succeed against the echo server |
+
+  An `lsof` probe inserted before the proxy wait named the holder outright: `Python <pid> cdf 3u IPv4 … TCP 127.0.0.1:<frps_port> (LISTEN)`, with `frps_port == echo_port`. On disk, the forced run's `frpc.toml` had `server_port = <p>` **and** `local_port = <p>` (same port) with a different `remote_port`. The third row is why the probe-only fix is not enough: a proxy-port collision is silently green, so only a control-port collision produces the recorded failure signature.
+
+  Arithmetic: three i.i.d. picks over 10000 give `P(any pair equal) ≈ 2.9998e-4`; `P(echo == frps) = 1e-4` per scenario, so ≈2.5% per ~85-scenario run. That matches the observation that Batch K's campaign of 120 forced scenario runs plus 20 whole-matrix repeats on an idle host produced zero failures (≈0.1 expected hits) while CI has reddened repeatedly.
+
+  This also re-reads the three reds already in the record (`go-to-rust-http-basic-auth: VHost HTTP port 19286 not reachable`, `go-to-rust-wss-plain: proxy port 24016 not reachable`, `test_auth_r2g_reject: proxy port 22335 not reachable`): a control-port collision surfaces as whichever proxy or vhost readiness gate the scenario reaches, which is why every previous fix — including the `FRP_COMPAT_READY_MIN` floor — only moved the timeout. A port that will never be listened on cannot be waited for.
+
+  Not proven for that specific CI run: that `echo_port` was in fact 19510 (the `EXIT` trap removed `TEST_DIR`, and the echo port is never printed). A listener leaked by the immediately preceding scenario has the same signature and the same cure, but it is the weaker explanation: `random_port()` skips anything already LISTENing at pick time, `cleanup_pids` never runs between scenarios (`run_test`, `:703-709`, reaps nothing), and the only process this scenario starts in the post-pick window is its own echo server. Distinguishers if it recurs: `lsof -nP -iTCP:<frps_port> -sTCP:LISTEN` naming `Python` versus an `frps`/`frpc` with another scenario's `-c` path; the frpc error text (an echo gives exactly `Unexpected response to login`; a leaked frps answers with token/protocol semantics); and `local_port == server_port` in the scenario's `frpc.toml` under `--keep-tmp`.
+
+  **Done-when:** the harness cannot give two listeners in one scenario the same port — by reserving each port for the life of the scenario, or by making the pick reject ports already allocated in that scenario — and the readiness probe fails closed when the socket that answers is not the process that was just launched; with the forced-collision run above red before the change (the same three symptoms as run `37015704902`) and green after, a forced `echo_port="$proxy_port"` collision no longer passing, and `scripts/lib/compat-stray-guard.sh` and its fixture suite unweakened. If instead the leak path is the real one, the Done-when is the same bar applied to teardown: no listener from scenario *n* may still hold a port when scenario *n+1* picks one.
