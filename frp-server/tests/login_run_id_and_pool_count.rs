@@ -202,3 +202,70 @@ async fn test_negative_pool_count_rejected_without_throttle_slot() {
         .into_encrypted(encryption::derive_key(TEST_TOKEN))
         .expect("wrap control in encryption");
 }
+
+/// Raw V1 login with a caller-supplied run_id AND privilege_key (so a test
+/// can pair an invalid run_id with a credential that must never be
+/// verified). `raw_login_custom` always signs with the real token.
+async fn raw_login_with_key(
+    addr: SocketAddr,
+    run_id: Option<String>,
+    privilege_key: String,
+) -> (IoStream, LoginResp) {
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to server");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let login = FrpMessage::Login(Box::new(msg::Login {
+        version: Some(frp_core::VERSION.into()),
+        hostname: Some("run-id-order-test".into()),
+        os: Some(std::env::consts::OS.into()),
+        arch: Some(std::env::consts::ARCH.into()),
+        user: None,
+        run_id,
+        client_id: None,
+        pool_count: Some(0),
+        timestamp: Some(ts),
+        privilege_key: Some(privilege_key),
+        metas: None,
+        client_spec: None,
+        multiplexer: None,
+    }));
+    let mut io = IoStream::Tcp(stream);
+    write_msg_v1(&mut io, &login).await.expect("send Login");
+    match read_msg_v1(&mut io).await.expect("read LoginResp") {
+        FrpMessage::LoginResp(resp) => (io, resp),
+        other => panic!("expected LoginResp, got {:?}", other.v1_type_byte()),
+    }
+}
+
+/// PR #454 invariant 3 (`TODO.md:10088`): run_id validation runs BEFORE the
+/// auth phase (`auth_fut` / `verify_login_auth`), not merely before it in the
+/// response text. An oversized run_id paired with a WRONG token must be
+/// rejected as a run_id error, never as an authentication failure.
+///
+/// Mutant: move the `if let Some(rid) = login.run_id.as_deref()` block in
+/// `frp-server/src/control/login.rs` after
+/// `let (oidc_subject, mut stream) = auth_fut.await?;` — the wrong credential
+/// is then verified first and this assertion sees the auth-failure text.
+#[tokio::test]
+async fn invalid_run_id_is_rejected_before_the_credential_is_verified() {
+    let bind_port = allocate_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _port) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
+
+    let (_io, resp) = raw_login_with_key(addr, Some("x".repeat(65)), "wrong-token".into()).await;
+    assert_eq!(
+        resp.error.as_deref(),
+        Some("invalid run id: must be at most 64 printable bytes"),
+        "an oversized run_id must be rejected before the (wrong) credential is verified"
+    );
+}

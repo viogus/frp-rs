@@ -288,6 +288,20 @@ async fn test_plugin_reject_rejects_login() {
 /// fields (user, metas) must not get unbounded pre-auth HTTP calls per IP:
 /// 5 plugin-rejected logins from one IP → the 6th is rejected pre-auth by
 /// the throttle gate and never reaches the plugin.
+///
+/// This is ALSO the only lane that pins the pre-auth throttle gate's *position*
+/// in the login sequence (`TODO.md:10088`, PR #454 auth-method split). The
+/// `assert_eq!` on the plugin request count below is an observable that the
+/// in-crate tests cannot see, because their state has no login plugins: the
+/// gate is the only thing standing between the hook and a throttled attempt.
+/// Measured: moving the gate call from `frp-server/src/control/login.rs:302`
+/// to after the plugin block, and independently to after the run_id-validation
+/// block (`:440`), both red the count assertion below with `left: 6, right: 5`
+/// — run_id validation sits after the plugin hook (`:386`), so the second
+/// placement re-opens the hook too. Any mutation campaign over `login.rs` must
+/// therefore include `--test http_plugin` in its lane set; a campaign that runs
+/// only `--lib` plus the `login_*` lanes records both mutants as SURVIVED, which
+/// is a lane-selection artifact and not a pin gap.
 #[tokio::test]
 async fn test_plugin_reject_consumes_login_throttle_slots() {
     let state = Arc::new(MockPluginState {

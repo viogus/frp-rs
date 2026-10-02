@@ -6540,7 +6540,7 @@ nothing about whether the described behaviour still holds.
   `git grep -nE '(^|[^a-zA-Z_/.-])go (build|run)' -- scripts/ .github/` finds
   nothing, and `scripts/download-go-frp.sh:29` fetches the **prebuilt** release
   tarball (`https://github.com/fatedier/frp/releases/download/v${VERSION}/…`).
-  It is a leftover of a removed path that `CHANGELOG.md:2359-2360` (0.3.1)
+  It is a leftover of a removed path that `CHANGELOG.md:2655-2656` (0.3.1)
   records — `build_go_frp_v2()` (clone + `go build`, cached to
   `/tmp/frp-source-build/`) exists nowhere in the tree, yet
   `.github/workflows/compat.yml:48` still caches that orphaned
@@ -6558,7 +6558,7 @@ nothing about whether the described behaviour still holds.
   `compat.yml:48`) are the pre-change state and no longer resolve. Re-measured at the new
   head: `git ls-files '*.go'` is still empty, `scripts/download-go-frp.sh:29` still
   fetches the prebuilt release tarball, `build_go_frp_v2()` exists nowhere, and all seven
-  workflow YAMLs parse. `actions/setup-go` survives only in records (`CHANGELOG.md:2360`,
+  workflow YAMLs parse. `actions/setup-go` survives only in records (`CHANGELOG.md:2656`,
   this file, `docs/archive/plans/2026-06-28-xtcp-testing.md`). No gate update was owed —
   `scripts/repo-health.sh`'s toolchain checks match `rustup default` and
   `setup-rust-toolchain` only, never `setup-go` — and the `compat` lane is green at the
@@ -9086,7 +9086,30 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** the e2e window is tight enough that a wrong call-site backoff reds it (or the
   assertion compares against the pinned constant rather than a range), and the NewWorkConn path is
   covered or its absence explained.
-- [ ] **The re-arm e2e oracle sees only the first consecutive failure, so a call-site rewrite that returns `PING_FIRST_BACKOFF` instead of consulting the progression stays green.**
+- [x] **The re-arm e2e oracle sees only the first consecutive failure, so a call-site rewrite that returns `PING_FIRST_BACKOFF` instead of consulting the progression stays green.**
+  **Done (2026-10-02, at `998508e1` on `dsh/test-pin-residues`, PR #464, based on `e0ebdc91`; this item's test commit is `2223e592`, rebased from `56fe74d4`).**
+  The oracle now observes the SECOND consecutive failure: the OIDC exec fixture fails invocations #3 **and #4**,
+  so the streak survives into its second step, and a new assertion reads Ping#2 against the pinned progression
+  `next_ping_backoff(Some(PING_FIRST_BACKOFF), interval)` = 4 s, window `[3 s, 5 s]`
+  (`frp-client/tests/heartbeat_wire_order.rs:855-875`). Teeth, each mutant reverted and the lane re-run green
+  afterwards: `let delay = PING_FIRST_BACKOFF;` at the call site (`frp-client/src/service.rs:3539`) is RED —
+  `frp-client/tests/heartbeat_wire_order.rs:861:9`: `Ping#2 arrived 1998ms after the SECOND failed tick
+  (expected ~4000ms ... accepted window [3000, 5000]ms)` — while oracle 3, the first-failure window, stays
+  GREEN (2 s either way), which is exactly this item's blind spot; deleting `ctx.ping_retry_backoff = Some(delay);`
+  (`frp-client/src/service.rs:3540`) is RED at the same `:861:9` (2013 ms). A sixth oracle closes the
+  streak-clear side: deleting `ctx.ping_retry_backoff = None;` (`frp-client/src/service.rs:3557`) reds
+  `frp-client/tests/heartbeat_wire_order.rs:909:9` (`Ping#3 arrived 8020ms after the post-success failed tick
+  (expected ~2000ms ... accepted window [1000, 3000]ms)`). Lane:
+  `cargo test -j 2 -p frp-client --test heartbeat_wire_order` → 3 passed / 0 failed (28.07 s).
+  **Correction to this item's framing:** the fixture must fail invocations **#3 and #4**, not #3 and #5 — the
+  successful Ping#2 at #4 clears the streak at `frp-client/src/service.rs:3557`, so failing #3 and #5 produces
+  two *isolated* first-failures that each re-arm at 2 s; that shape was measured RED at
+  `frp-client/tests/heartbeat_wire_order.rs:861:9` (Ping#2 1998 ms) before it was replaced. The constant-return
+  class is closed in practice but not structurally: the one literal both windows admit is exactly 3 s, and it
+  is RED at the first-failure oracle (`frp-client/tests/heartbeat_wire_order.rs:825:9`, `the re-armed tick
+  landed 3018ms after the first failed tick`, window `[1000, 3000]ms`) by 18 ms of harness overhead — a timer
+  margin, so the two windows still touch at 3 s and a faster host could admit it.
+
   Filed from the R2 adversarial review of PR #449 (the item above). The oracle derives its window from
   `PING_FIRST_BACKOFF` (`frp-client/tests/heartbeat_wire_order.rs:779-780`) but the OIDC exec source fails on
   exactly one tick, so only the FIRST failure's re-arm is measured. Replacing the call site's
@@ -9102,7 +9125,31 @@ section; ledger now **24 open / 104 closed**.**
   constant-returning call-site mutants red there too -- or the absence of such a test is explained with the
   measured reason.
 
-- [ ] **The NewWorkConn token path is pinned only at the `spawn_work_conn` seam -- no test drives a `ReqWorkConn` carrying a token source, so `handle_req_work_conn` is off-path.**
+- [x] **The NewWorkConn token path is pinned only at the `spawn_work_conn` seam -- no test drives a `ReqWorkConn` carrying a token source, so `handle_req_work_conn` is off-path.**
+  **Done (2026-10-02, at `998508e1` on `dsh/test-pin-residues`, PR #464, based on `e0ebdc91`; this item's test commit is `6384a0bd`, rebased from `ed487fa8`).**
+  New lane `frp-client/tests/req_work_conn_token_source.rs` drives the service's own wiring: a real
+  `ClientService` with an exec `auth.oidc.tokenSource` (under the `TokenSourceExec` allowlist) against a mock
+  server on one listener, through `ReqWorkConn` → `handle_req_work_conn` → `spawn_work_conn`, asserting on the
+  `NewWorkConn` that arrives on the encrypted control channel: `run_id == Some("mock-server-run")`,
+  `privilege_key == Some(<the exec token>)` (the raw source output, not a hash), `timestamp.is_none()`, and
+  exactly two exec invocations (login + work conn). Two tests drive the two scope threads separately —
+  client-declared (`auth.additional_auth_scopes`) and server-advertised
+  (`LoginResp.server_additional_auth_scopes`) — because either one alone satisfies `scope_requires_auth`, so a
+  single test would leave the other thread unpinned. Teeth, mutant reverted and the lane re-run green
+  afterwards: `oidc_client: None,` in place of `self.oidc_client.clone()`
+  (`frp-client/src/service.rs:4221`) makes the work conn fall through to the token branch with an empty token
+  and the frame is never sent — RED 0 passed / 2 failed, both at
+  `frp-client/tests/req_work_conn_token_source.rs:203` (`.expect("read NewWorkConn")` → `read V1 header: early
+  eof`), preceded by `WARN frp_client::work_conn: Work conn on-demand token source failed: authentication token
+  is empty`. Lanes: `--test req_work_conn_token_source` 2 passed / 0 failed; neighbours
+  `pool_replenishment`, `work_conn_reject_gate`, `token_source_single_exec` and `registration_handover` also
+  green. The call-site alternatives this item named are covered and measured: replacing
+  `server_auth_scopes: ctx.server_scopes.clone()` (`frp-client/src/service.rs:4225`) with `Vec::new()` reds only
+  `req_work_conn_uses_server_advertised_scope` (`frp-client/tests/req_work_conn_token_source.rs:110:5`, `left:
+  None`, `right: Some("req-work-conn-oidc-token")`) while the client-declared test stays green, and replacing
+  `client_auth_scopes: ctx.client_scopes.clone()` (`:4224`) with `Vec::new()` reds only the client-declared
+  test at the same `:110:5`; each mutant reverted and the lane re-run 2 passed / 0 failed.
+
   Filed from the R2 adversarial review of PR #449 (the item above).
   `oidc_token_source_fills_new_work_conn_privilege_key` (`frp-client/src/work_conn.rs:2524`) constructs
   `WorkConnConfig` itself, so the service's own wiring -- `handle_req_work_conn`
@@ -10038,7 +10085,44 @@ section; ledger now **24 open / 104 closed**.**
   summary"; delete-plus-lower (`expected` 60, floor 61) → rc 1 on the floor alone; and only the
   deliberate records bump (`expected` 60 / floor 60) passes → rc 0.
 
-- [ ] **The PR #454 login auth-method split's ordering and behaviour invariants are pinned by no test.**
+- [x] **The PR #454 login auth-method split's ordering and behaviour invariants are pinned by no test.**
+  **Done (2026-10-02, at `998508e1` on `dsh/test-pin-residues`, PR #464, based on `e0ebdc91`; this item's test commit is `998508e1` itself, rebased from `6685e737`).**
+  Four new in-crate tests (`#[cfg(test)] mod login_order_tests`, `frp-server/src/control/login.rs:2955`) plus
+  `invalid_run_id_is_rejected_before_the_credential_is_verified`
+  (`frp-server/tests/login_run_id_and_pool_count.rs:254`) and a doc note — not a duplicate test — at
+  `frp-server/tests/http_plugin.rs:292-305`. Five reds, each mutant reverted and its lanes re-run green
+  afterwards: (1) the OIDC dispatch hoisted above the `is_auth_bypass` short-circuit
+  (`frp-server/src/control/login/auth.rs:121-127`) → RED `frp-server/src/control/login.rs:3149:9`; (2) run_id
+  validation moved after `auth_fut.await?` → RED twice, `frp-server/src/control/login.rs:3093:9`
+  (`left: 1, right: 0`, the replay-table total) and
+  `frp-server/tests/login_run_id_and_pool_count.rs:268:5` (`left: Some("token in login doesn't match token from
+  configuration")`, `right: Some("invalid run id: must be at most 64 printable bytes")`); (3) `drop(used);`
+  moved into the replay branch after `send_login_error` (`frp-server/src/control/login/auth.rs:414` → `:423`)
+  → RED `frp-server/src/control/login.rs:3329:9`; (4) `throttled_login_error`'s LoginResp message reworded
+  (`frp-server/src/control/login/throttle.rs:58`) → RED `frp-server/src/control/login.rs:3179:9`, while
+  `--test login_replay_throttle` — the pre-auth gate's own copy of the same sentence at `throttle.rs:100` —
+  stayed GREEN, so the new test pins the *other* producer and is not a duplicate of that lane; and (5) the
+  M1c/M1d pair below.
+  **Correction to this item's framing (M1c/M1d).** Both gate-order mutants are caught by the EXISTING
+  plugin-invocation assertion in `frp-server/tests/http_plugin.rs:348` (`left: 6, right: 5`), not by any
+  response-text assertion: the invalid-run_id branch itself calls `throttled_login_error`
+  (`frp-server/src/control/login.rs:460`), so an already-throttled IP with an invalid run_id gets the same
+  LoginResp text in both orders — only the plugin invocation count flips, because the hook is at
+  `frp-server/src/control/login.rs:386` and run_id validation at `:440`, so moving the gate after run_id
+  validation moves it after the hook too. `--test http_plugin` must therefore be in any mutant lane set over
+  `login.rs`; the campaign that recorded both as SURVIVED ran only `--lib` (`460/0`) plus the
+  `login_replay_throttle` / `login_run_id_and_pool_count` / `oidc_integration` / `server_reload_auth` targets
+  and never listed `http_plugin`, so both labels are a lane-selection artifact, not a pin gap. The note at
+  `frp-server/tests/http_plugin.rs:292-305` records exactly that. This also matches this item's own Done-when,
+  which already said the LoginResp text is identical in the reordered shapes and asked for a plugin-hook or
+  pre-auth log-line assertion.
+  **Honest limitation:** `--test oidc_integration` was never run in this round (it needs an all-features `frps`
+  binary via `FRPS_BIN`) and is not counted as a kill anywhere; the in-crate state configures no login plugins,
+  so M1c/M1d are invisible to `--lib`. Lanes at this head: `-p frp-server --lib` 464 passed / 0 failed,
+  `--test http_plugin` 23/0, `--test login_run_id_and_pool_count` 4/0, `--test login_replay_throttle` 2/0, and
+  `--test ssh_gateway` 17/0 (the M1b positive control). **Ledger after this close: 14 open / 212 closed**
+  (base `e0ebdc91`: 17 open / 209 closed over 226 headers; this round closes the three items above and files nothing new).
+
   Filed by the #454 records round (verification F4, adversarial F2). The split carries five ordering
   invariants — the pre-auth throttle gate before the login plugin hook, the gate before run_id
   validation, run_id validation before `VerifyLogin` (`auth::verify_login_auth`), the OIDC dispatch
@@ -10093,12 +10177,12 @@ section; ledger now **24 open / 104 closed**.**
   three server load sites that own a log sink — the two post-`init_logging` `frps` startup branches
   (`frps/src/main.rs`) and the SIGUSR1 reload (`frp-server/src/service.rs`) — and emits one `tracing::warn!` per
   non-zero ungated port, naming both spellings and the remedy (`<key> = 0`, the documented "disabled" value, or
-  rebuild with the feature). `= 0` and absent stay silent in TOML/JSON/YAML because every build shape honours the integer `0`; the legacy-`.ini` spellings `"0"` / `+0` / `00` are **not** silent — the INI reader leaves them as strings that `ini_lenient` parses to `0` later, and the detector's value gate cannot see that (`TODO.md:9229`). Rejection was
+  rebuild with the feature). `= 0` and absent stay silent in TOML/JSON/YAML because every build shape honours the integer `0`; the legacy-`.ini` spellings `"0"` / `+0` / `00` are **not** silent — the INI reader leaves them as strings that `ini_lenient` parses to `0` later, and the detector's value gate cannot see that (`TODO.md:9276`). Rejection was
   rejected: `docs/deployment.md:779-782` names refusal the "false 400" direction this accepted-key class deliberately
   avoids, and `strict_config` defaults to true (`frp-core/src/cli.rs:139`) while the repo's own documented
   `frps.toml:21-23` writes non-zero `kcp_bind_port`/`quic_bind_port`, so rejecting would make `frps -c frps.toml`
   refuse to start in every micro/tiny build and break the `known_server_keys()` invariant at
-  `frp-core/src/config/strict.rs:123-127`. `frps verify` stays silent, exactly like the `tls_enable` diagnostic — a residue the reviewers filed as `TODO.md:9246`.
+  `frp-core/src/config/strict.rs:123-127`. `frps verify` stays silent, exactly like the `tls_enable` diagnostic — a residue the reviewers filed as `TODO.md:9293`.
   Both directions are pinned in `frp-core/src/config/tests.rs:290-580`: three `#[cfg(feature = "…")]`
   `…_enabled_honours_the_port` tests (default lane, `5 passed`), six `#[cfg(not(feature = "…"))]`
   `…_disabled_reports_the_dropped_port` / `…_disabled_is_silent_for_zero_or_absent` tests over both spellings ×
@@ -10112,7 +10196,7 @@ section; ledger now **24 open / 104 closed**.**
   **MEDIUM** finding was that this item's changelog headline claimed a wider class than the three serde-dropped
   keys, so the records round narrowed the `CHANGELOG.md` sentence and the four follow-ups below were filed; its
   LOW/INFO findings (the legacy-`.ini` zero spellings, the `verify` silence, four already-wrong comment cites)
-  are `TODO.md:9333`, `:9355`, `:9372` and `:9383`. The Cross-Compat failure the branch first showed (`test_auth_r2g_reject`, a
+  are `TODO.md:9380`, `:9402`, `:9419` and `:9430`. The Cross-Compat failure the branch first showed (`test_auth_r2g_reject`, a
   data-plane reachability wait at `scripts/compat-test.sh:5399`) is a **flake, not attributable**: the compat lane
   builds default features, where the new code is compiled out, and both same-head re-runs succeeded
   (`36897123895`, `36897131548`).
@@ -10243,7 +10327,7 @@ section; ledger now **24 open / 104 closed**.**
   is reworded to what the cited line says.
 
 - [x] **`scripts/tests/remote-frps-reap.sh` runs in no CI job.**
-  Filed while closing `TODO.md:9222` (PR #456). The fixture that pins the new exact-pid route is run only by
+  Filed while closing `TODO.md:9269` (PR #456). The fixture that pins the new exact-pid route is run only by
   hand: the `health` job's comment (`.github/workflows/ci.yml:87-89`) names the three fixture scripts it runs,
   and its steps run `scripts/tests/repo-health-fixtures.sh`, `scripts/tests/compat-stray-guard.sh` and
   `scripts/tests/rss-soak-run-dir.sh`. Wiring a fourth suite is a `.github/workflows/ci.yml` edit, and the
@@ -10276,7 +10360,7 @@ section; ledger now **24 open / 104 closed**.**
   `quic_bind_port` is still accepted by `known_server_keys()` and then silently dropped by the server, so
   `--strict-config` cannot see the divergence. Measured in the micro build
   (`--no-default-features --features micro`): `frps verify --strict-config` on a config writing
-  `websocket_port = 1` exits 0 with the port never bound. PR #455's items (`TODO.md:9527`, `:9574`, `:9596`,
+  `websocket_port = 1` exits 0 with the port never bound. PR #455's items (`TODO.md:9574`, `:9621`, `:9643`,
   `:9613`) cover the *warning* side; this item is the acceptance-set-vs-compiled-field divergence itself.
   **Done-when:** `known_server_keys()` (and any client-side counterpart) is derived from, or checked against,
   the compiled field set — shown by a `--no-default-features` run in which `--strict-config` refuses a key it
