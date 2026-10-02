@@ -2942,7 +2942,7 @@ mod oidc_throttle_tests {
     }
 }
 
-/// PR #454 login auth-method split: ordering pins (`TODO.md:9951`).
+/// PR #454 login auth-method split: ordering pins (`TODO.md:9998`).
 ///
 /// Each test below reds under the specific reordering it names. The two
 /// gate-order mutants (the throttle gate moved after the plugin hook, and
@@ -3150,7 +3150,7 @@ mod login_order_tests {
         );
     }
 
-    /// `TODO.md:9951` Done-when: "`throttled_login_error`'s LoginResp message
+    /// `TODO.md:9998` Done-when: "`throttled_login_error`'s LoginResp message
     /// text asserted like the gate's in `frp-server/tests/login_replay_throttle.rs`".
     /// The gate's copy of the literal is asserted end-to-end there; this pins
     /// the OTHER producer (`frp-server/src/control/login/throttle.rs:58`),

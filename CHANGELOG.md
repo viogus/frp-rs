@@ -1268,6 +1268,33 @@ User-facing release notes for frp-rs.
 
 - **The `compat` compatibility gate stops hiding its own flakes.** Every recorded red run of the `compat` job (3 of the last 100, all `RESULTS: 85 passed, 1 failed`, all left red on attempt 1) failed in a readiness gate that expired 0.5–0.7 s past its deadline, and a red run printed no logs at all: `scripts/compat-test.sh` gated its log dump on `--verbose`, while CI passes neither `--verbose` nor `--keep-tmp` and the EXIT trap deletes `TEST_DIR` immediately afterwards. Readiness timeouts are now floored at `FRP_COMPAT_READY_MIN` (default 20 s; `0` restores the previous per-call values byte for byte) and the dump also runs when `$CI` is set. `scripts/protocol-matrix.sh` compounded its own failures: rows were torn down with SIGTERM only, and the four-port blocks advanced by one port per row, so they overlapped by three and a straggler was read as the next row's own listener — a stale echo could turn a row's readiness probe green against a non-frp server, then make the next real `frps` fail to bind. Rows now drain (SIGTERM → 3 s → SIGKILL → 2 s), use disjoint `19000 + 4 * (PASS + FAIL)` blocks, probe server and proxy ports for a LISTEN socket instead of opening a real connection (the phantom-`ProxyUserConn` hazard `scripts/compat-test.sh:222-224` documents), and always print the failing row's log tails. Verified before/after on this host: 120/120 compat scenario runs and 20/20 full matrix repeats (220 row-runs) green on both sides, with deterministic mutation proofs for each fix (a SIGTERM-ignoring child is now reaped; a Go `frpc` delayed 17 s fails the old gate and passes the new one). The CI red rate itself is unmeasured and the parent item stays open.
 
+- **The re-arm e2e oracle now sees a second consecutive failed ping, so a constant-returning call site can no longer
+  pass.** `frp-client/tests/heartbeat_wire_order.rs`'s oracle only ever observed the *first* failed tick, and the
+  first re-arm and `PING_FIRST_BACKOFF` are both 2 s — so `let delay = PING_FIRST_BACKOFF;` in
+  `frp-client/src/service.rs:3539` stayed green. The fixture now fails exec invocations **#3 and #4** (not #3 and #5:
+  the successful ping at #4 clears the streak at `frp-client/src/service.rs:3557`), which is what makes the failures
+  consecutive and moves the oracle onto the pinned 2 s → 4 s progression (`Ping#2 − tick#3 ∈ [3000, 5000] ms`, nominal
+  4 s). A constant `delay`, or deleting the `ctx.ping_retry_backoff = Some(delay);` write, now reds it (`Ping#2
+  arrived 1998 ms` / `2013 ms`), and deleting the `ctx.ping_retry_backoff = None;` reset reds the new `Ping#3 arrived
+  8020 ms` assertion (window `[1000, 3000] ms`). Test-only; no user-visible behaviour changes.
+- **The NewWorkConn token path is driven end-to-end through the service's own wiring, not the `spawn_work_conn` seam.**
+  `frp-client/tests/req_work_conn_token_source.rs` has the mock server answer a `ReqWorkConn` with a `NewWorkConn`
+  that carries the raw token from an `exec://` source and no timestamp, over the real `handle_req_work_conn` path, and
+  pins the two scope threadings separately: `server_auth_scopes: Vec::new()` at `frp-client/src/service.rs:4225` reds
+  only the server-advertised case and `client_auth_scopes: Vec::new()` at `:4224` only the client-declared one, while
+  `oidc_client: None` at `:4221` reds both (`read V1 header: early eof`). Test-only; no user-visible behaviour changes.
+- **The PR #454 login auth-method ordering invariants are pinned, and where the pre-auth gate sits is now written
+  down.** Four new pins in `frp-server/src/control/login.rs` plus one in
+  `frp-server/tests/login_run_id_and_pool_count.rs` red on: OIDC dispatch hoisted above the `is_auth_bypass`
+  short-circuit; run_id validation moved below `auth_fut.await?` (caught both by the replay-table observable and by
+  the wrong-credential one); `drop(used);` moved inside the replay-reject branch, after the write; and a reworded
+  `throttled_login_error` detail literal — while `--test login_replay_throttle` stays green under that mutant, so the
+  new pin owns the producer that lane does not. Recorded with the pins: the gate's *position* is not observable in any
+  response text — the invalid-run_id branch itself calls `throttled_login_error` at
+  `frp-server/src/control/login.rs:460`, so an already-throttled IP with an invalid run_id sees the throttled message
+  in either order. What flips is the plugin-invocation count in `frp-server/tests/http_plugin.rs`, which now carries a
+  doc note that a mutant campaign over `login.rs` must include `--test http_plugin`. Test-only; no user-visible
+  behaviour changes (`--test oidc_integration` was not run: it needs an all-features `frps` binary).
 - **The `warning-pin` CI guards now witness assertions rather than runs.** The resolver step pins the
   exact `-- --list` entry, uses a variant-free completion marker, and runs the witness a second time with
   `FRP_WARNING_PIN_SABOTAGE=1` requiring that run to fail; both count guards also require the run's own
