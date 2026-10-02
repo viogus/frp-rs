@@ -538,16 +538,29 @@ async fn ping_reuses_startup_token_snapshot_when_source_becomes_unreadable() {
 }
 
 /// The OIDC exec token source: one appended log line per invocation, so the
-/// log is the invocation counter AND the mock's observation channel for the
-/// failed tick. Invocation #3 (the SECOND heartbeat tick) exits 1, which makes
-/// `OidcClient::set_ping` fail and drives the client into the ping skip arm;
-/// every other invocation prints the token on stdout.
+/// log is the invocation counter AND the mock's observation channel for each
+/// failed tick. Invocations #3, #4 and #6 exit 1: #3 and #4 make
+/// `OidcClient::set_ping` fail on TWO CONSECUTIVE heartbeat attempts
+/// (`skip_ping` never clears the streak — only a non-skipped attempt does,
+/// `frp-client/src/service.rs:3557`), and #6 is the first failure AFTER the
+/// successful retry, which is what makes the streak-clear itself observable.
+/// Every other invocation prints the token on stdout.
+///
+/// Two consecutive failures are what makes the second re-arm observable:
+/// `next_ping_backoff(None, 10s)` == `PING_FIRST_BACKOFF` (2s) for the first
+/// failure, so a call site that returns the constant instead of consulting
+/// `next_ping_backoff` is indistinguishable there; with the streak unbroken the
+/// SECOND failure re-arms at `next_ping_backoff(Some(PING_FIRST_BACKOFF), 10s)`
+/// = 4s, which that call-site substitution cannot produce (it returns 2s
+/// again). The later failure at #6 must be back at 2s, because only a
+/// non-skipped attempt clears the streak: a call site that never clears
+/// (`frp-client/src/service.rs:3557` deleted) would re-arm #6 at 8s instead.
 #[cfg(feature = "oidc")]
 const OIDC_EXEC_SCRIPT: &str = "\
 n=$(wc -l < \"$1\")\n\
 printf 'invocation %s\\n' \"$((n + 1))\" >> \"$1\"\n\
-if [ \"$((n + 1))\" -eq 3 ]; then\n\
-printf 'simulated auth.oidc.tokenSource outage on invocation 3\\n' >&2\n\
+if [ \"$((n + 1))\" -eq 3 ] || [ \"$((n + 1))\" -eq 4 ] || [ \"$((n + 1))\" -eq 6 ]; then\n\
+printf 'simulated auth.oidc.tokenSource outage on invocation %s\\n' \"$((n + 1))\" >&2\n\
 exit 1\n\
 fi\n\
 printf '%s' \"$2\"\n";
@@ -622,7 +635,10 @@ fn assert_oidc_ping_key(frame: &FrpMessage, token: &str) {
 /// `reset_after` again must therefore redden THIS test.
 ///
 /// Trigger: `method = "oidc"` with `auth.oidc.tokenSource` bound to an exec
-/// command that fails on exactly its third invocation. Timeline
+/// command that fails on exactly its third, fourth and sixth invocations — two
+/// CONSECUTIVE skipped attempts, then a successful retry, then a third failure,
+/// because only a non-skipped attempt clears `ctx.ping_retry_backoff`
+/// (`frp-client/src/service.rs:3557`). Timeline
 /// (heartbeat_interval = 10s, heartbeat_timeout = 30s):
 ///   L        LoginResp written; the source has run once (set_login);
 ///   L+ε      Ping#1 — the interval's first tick fires immediately; set_ping
@@ -632,45 +648,76 @@ fn assert_oidc_ping_key(frame: &FrpMessage, token: &str) {
 ///            failure, sets `skip_ping`, sends NOTHING, and re-arms the interval
 ///            at `next_ping_backoff(None, 10s)` = 2s (InitDurationIfFail 1s ×
 ///            Factor 2, capped at the period);
-///   T2+2s    the re-armed tick: invocation #4 succeeds → Ping#2;
-///   +10s     Ping#3, back on the interval period.
+///   T3       T2+2s, the re-armed tick: invocation #4 ALSO exits 1 → the SECOND
+///            CONSECUTIVE failure, re-armed at
+///            `next_ping_backoff(Some(PING_FIRST_BACKOFF), 10s)` = 4s;
+///   T4       T3+4s, the re-armed tick: invocation #5 succeeds → Ping#2, and
+///            `ctx.ping_retry_backoff` is reset to `None` (service.rs:3557);
+///   T5       T4+10s, back on the interval period: invocation #6 exits 1 again,
+///            but the streak is now CLEARED, so it must re-arm at
+///            `next_ping_backoff(None, 10s)` = 2s again;
+///   T6       T5+2s: invocation #7 succeeds → Ping#3.
 ///
-/// Oracles (the decisive one is (3), anchored at T2 — the mock's own
-/// observation of the failed invocation, never at test start):
+/// Oracles (the decisive ones are (3), (4) and (6), anchored at the mock's own
+/// observation of each failed invocation, never at test start):
 ///   (1) the first frame after LoginResp is Ping#1, within 3s (the first tick
 ///       fires on the message loop's first poll; a first tick that waited out
 ///       its full 10s period would land far outside);
 ///   (2) every Ping carries the raw OIDC token and no timestamp;
-///   (3) `Ping#2 − T2 ∈ [PING_FIRST_BACKOFF/2, PING_FIRST_BACKOFF × 3/2]`
-///       (= `[1.0s, 3.0s]`) — the re-armed tick, asserted against the
+///   (3) `T3 − T2 ∈ [PING_FIRST_BACKOFF/2, PING_FIRST_BACKOFF × 3/2]`
+///       (= `[1.0s, 3.0s]`) — the FIRST failure's re-arm, observed as the gap
+///       between the two failed exec invocations, asserted against the
 ///       production constant `frp_client::service::PING_FIRST_BACKOFF` (the
 ///       value `next_ping_backoff` returns for the first failure of a streak
 ///       and the value the unit test `heartbeat_ping_backoff_progression`
 ///       pins), never against a hand-written range. Nominal 2s; with
 ///       `interval.reset_after(delay)` deleted the interval keeps its 10s
-///       period and the next attempt lands ~10s after T2 (~3.3× the upper
+///       period and the second failure lands ~10s after T2 (~3.3× the upper
 ///       bound) — RED; a wrong-but-in-range backoff hard-coded at the call
 ///       site — `reset_after(Duration::from_secs(5))`, the mutant the old
 ///       `[1.0s, 6.0s]` window stayed green on — lands ~5s after T2 (1.7×
 ///       the upper bound) — RED. The remaining slack absorbs host load, which
 ///       can only *grow* the measured gap, so the load-sensitive edge is the
-///       upper one, 1s above nominal. Two limits, each filed as its own item
-///       below the closed `TODO.md:9041`: (a) the window admits ANY call-site
-///       literal in its `[1s, 3s]` class — the review measured 1 s, 2.5 s and
-///       2.9 s all passing — so a wrong literal inside it is not
-///       distinguishable end-to-end, and only the constant-vs-literal pin in
-///       the unit test (`frp-client/src/service.rs:5171-5175`) is exact; (b)
-///       the oracle observes only the FIRST consecutive failure, so a
-///       call-site substitution that returns the constant itself
-///       (`let delay = PING_FIRST_BACKOFF;`) instead of consulting
-///       `next_ping_backoff` stays green too;
-///   (4) `Ping#3 − Ping#2 ∈ [6.0s, 15.0s]` — the period cadence resumed (a
-///       backoff that kept re-arming would ping every ~2s);
-///   (5) exactly one Login.
+///       upper one, 1s above nominal;
+///   (4) `Ping#2 − T3 ∈ [2 × PING_FIRST_BACKOFF − PING_FIRST_BACKOFF/2,
+///       2 × PING_FIRST_BACKOFF + PING_FIRST_BACKOFF/2]` (= `[3.0s, 5.0s]`) —
+///       the SECOND consecutive failure's re-arm, nominal 4s =
+///       `next_ping_backoff(Some(PING_FIRST_BACKOFF), 10s)`, the value the unit
+///       test `heartbeat_ping_backoff_progression` pins at
+///       `frp-client/src/service.rs:5182-5185`. This is the oracle (3) cannot
+///       be: for the FIRST failure `next_ping_backoff(None, interval)` IS the
+///       constant, so a call site that substitutes the constant
+///       (`let delay = PING_FIRST_BACKOFF;`) instead of consulting the
+///       progression re-arms BOTH failures at 2s — (3) stays green (2s either
+///       way) and the second gap lands ~2000ms, 1s below the lower bound — RED.
+///       Deleting `reset_after` keeps the 10s period (~10s, above the upper
+///       bound);
+///   (5) `T5 − Ping#2 ∈ [6.0s, 15.0s]` — the period cadence resumed after the
+///       successful retry (a backoff that kept re-arming would tick at ~2s);
+///   (6) `Ping#3 − T5 ∈ [PING_FIRST_BACKOFF/2, PING_FIRST_BACKOFF × 3/2]`
+///       (= `[1.0s, 3.0s]`) — the first failure AFTER the successful retry is
+///       back at the first-failure constant, i.e. the success CLEARED the
+///       streak (`frp-client/src/service.rs:3557`). A call site that never
+///       clears leaves `ctx.ping_retry_backoff` at the second failure's 4s and
+///       re-arms T5 at 8s (2.7× the upper bound) — RED. This oracle is
+///       deliberately blind to the constant-vs-progression substitution (2s
+///       either way); oracle (4) is the progression pin and oracle (6) is the
+///       clear pin;
+///   (7) exactly one Login.
 ///
-/// A skip that sent the Ping anyway (or a teardown instead of a skip) also
-/// reddens: the frame would arrive ~0s after T2 without a valid key and/or the
-/// session would drop.
+/// A skip that sent the Ping anyway also reddens: the frame would be buffered
+/// before T3, so the `Ping#2 − T3` gap of oracle (4) collapses to ~0s; a
+/// teardown instead of a skip drops the session and the mock's reads fail.
+///
+/// The one remaining limit, filed as its own item below the closed
+/// `TODO.md:8951`: the windows admit ANY call-site literal in their
+/// `[1s, 3s]` / `[3s, 5s]` class — the review measured 1 s, 2.5 s and 2.9 s
+/// all passing for the first — so a wrong literal inside a class is not
+/// distinguishable end-to-end, and only the constant-vs-literal pin in the
+/// unit test (`frp-client/src/service.rs:5171-5175`) is exact. The former
+/// limit (b) — the oracle observing only the first consecutive failure — is
+/// closed by oracle (4) (the second, progression-priced re-arm), and the
+/// streak-clear the fixture's third failure exercises is pinned by oracle (6).
 #[cfg(feature = "oidc")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn skipped_ping_rearms_interval_on_two_second_backoff() {
@@ -703,7 +750,9 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
 
     let login_count = Arc::new(AtomicUsize::new(0));
     let count = login_count.clone();
-    // Signals the mock verified the re-arm oracle (skipped tick + 2s backoff).
+    // Signals the mock verified the re-arm oracles: the two consecutive failed
+    // ticks with their 2s/4s re-arms, the period cadence resuming, and the
+    // post-success failure back at the 2s first-failure backoff.
     let (pings_ok_tx, pings_ok_rx) = tokio::sync::oneshot::channel::<()>();
     let mock_log = log_path.clone();
     let mock = tokio::spawn(async move {
@@ -762,53 +811,113 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
         // failed invocation is the observation channel for that skip moment.
         let tick2_at = wait_for_exec_invocations(&mock_log, 3, Duration::from_secs(20)).await;
 
-        // Oracle 3 (decisive): Ping#2 is the re-armed tick, one
-        // `PING_FIRST_BACKOFF` after the failure. The window is DERIVED from
-        // that production constant (the same value the unit test
-        // `heartbeat_ping_backoff_progression` pins), not written by hand, so
-        // a wrong backoff hard-coded at the call site reds it: without
-        // `interval.reset_after(delay)` Ping#2 lands ~10s after the failed
-        // tick, with a 5s literal ~5s.
-        let f2 = tokio::time::timeout(Duration::from_secs(15), enc.read_v1_frame())
-            .await
-            .expect("no Ping after the skipped tick: the 2s re-arm never fired")
-            .expect("read second Ping");
-        let ping2_at = Instant::now();
-        assert_oidc_ping_key(&f2, token);
-        let rearm_gap = ping2_at.duration_since(tick2_at);
-        let rearm_min = PING_FIRST_BACKOFF / 2;
-        let rearm_max = PING_FIRST_BACKOFF + PING_FIRST_BACKOFF / 2;
+        // Oracle 3: the FIRST failure's re-arm, one `PING_FIRST_BACKOFF` after
+        // T2 — observed as the gap to invocation #4 (the re-armed tick), which
+        // ALSO exits 1. The window is DERIVED from that production constant
+        // (the same value the unit test `heartbeat_ping_backoff_progression`
+        // pins), not written by hand, so a wrong backoff hard-coded at the call
+        // site reds it: without `interval.reset_after(delay)` invocation #4
+        // lands ~10s after T2, with a 5s literal ~5s.
+        let tick3_at = wait_for_exec_invocations(&mock_log, 4, Duration::from_secs(15)).await;
+        let rearm1 = tick3_at.duration_since(tick2_at);
+        let rearm1_min = PING_FIRST_BACKOFF / 2;
+        let rearm1_max = PING_FIRST_BACKOFF + PING_FIRST_BACKOFF / 2;
         assert!(
-            rearm_gap >= rearm_min && rearm_gap <= rearm_max,
-            "Ping#2 arrived {}ms after the failed tick (expected ~{}ms = \
-             PING_FIRST_BACKOFF: the skip arm re-arms the interval at \
-             next_ping_backoff(None, 10s) — InitDurationIfFail 1s x Factor 2, \
+            rearm1 >= rearm1_min && rearm1 <= rearm1_max,
+            "the re-armed tick landed {}ms after the first failed tick (expected \
+             ~{}ms = PING_FIRST_BACKOFF: the skip arm re-arms the interval at \
+             next_ping_backoff(None, 10s) = InitDurationIfFail 1s x Factor 2, \
              capped at the 10s period; the accepted window [{}, {}]ms is \
              derived from that constant, so a call-site backoff that is wrong \
              by more than half the constant is RED: deleting \
-             interval.reset_after(delay) keeps the 10s period (~10000ms), a \
-             5s literal lands ~5000ms, and no re-arm at all never ticks)",
-            rearm_gap.as_millis(),
+             interval.reset_after(delay) keeps the 10s period (~10000ms), a 5s \
+             literal lands ~5000ms, and no re-arm at all never ticks)",
+            rearm1.as_millis(),
             PING_FIRST_BACKOFF.as_millis(),
-            rearm_min.as_millis(),
-            rearm_max.as_millis()
+            rearm1_min.as_millis(),
+            rearm1_max.as_millis()
+        );
+
+        // Invocation #4 ALSO exited 1 (the fixture fails #3 and #4), so this is
+        // the SECOND CONSECUTIVE failed attempt: the streak was never cleared
+        // (only a non-skipped attempt clears it, service.rs:3557) and the next
+        // re-arm must consult the PROGRESSION, not the first-failure constant.
+
+        // Oracle 4 (decisive for the progression, not just the constant):
+        // Ping#2 is the re-armed tick after the SECOND consecutive failure, one
+        // `next_ping_backoff(Some(PING_FIRST_BACKOFF), 10s)` = 4s after T3.
+        let f2 = tokio::time::timeout(Duration::from_secs(15), enc.read_v1_frame())
+            .await
+            .expect("no Ping after the second consecutive skipped tick: the 4s re-arm never fired")
+            .expect("read second Ping");
+        let ping2_at = Instant::now();
+        assert_oidc_ping_key(&f2, token);
+        let rearm2 = ping2_at.duration_since(tick3_at);
+        let second_backoff = PING_FIRST_BACKOFF * 2;
+        let rearm2_min = second_backoff - PING_FIRST_BACKOFF / 2;
+        let rearm2_max = second_backoff + PING_FIRST_BACKOFF / 2;
+        assert!(
+            rearm2 >= rearm2_min && rearm2 <= rearm2_max,
+            "Ping#2 arrived {}ms after the SECOND failed tick (expected ~{}ms = \
+             next_ping_backoff(Some(PING_FIRST_BACKOFF), 10s) = 2 x \
+             PING_FIRST_BACKOFF, capped at the 10s period; the accepted window \
+             [{}, {}]ms is derived from that value). A call site that returns \
+             PING_FIRST_BACKOFF itself instead of consulting next_ping_backoff \
+             re-arms this second failure at ~2000ms and is RED here while the \
+             first-failure oracle (3) stays green (2s either way); deleting \
+             interval.reset_after(delay) keeps the 10s period (~10000ms); a \
+             failed tick that still SENT its Ping buffers the frame before T3, \
+             so this gap collapses to ~0ms",
+            rearm2.as_millis(),
+            second_backoff.as_millis(),
+            rearm2_min.as_millis(),
+            rearm2_max.as_millis()
         );
         enc.write_v1_frame(&pong).await.expect("write Pong");
 
-        // Oracle 4: the period cadence resumes after the successful retry.
-        let f3 = tokio::time::timeout(Duration::from_secs(20), enc.read_v1_frame())
+        // Invocation #5 (the re-armed tick after the two consecutive failures)
+        // SUCCEEDED, which cleared the streak (`ctx.ping_retry_backoff = None`,
+        // service.rs:3557). Oracle 5: the cadence is back on the 10s interval
+        // period, so the next exec invocation — #6, which exits 1 again — lands
+        // ~10s after Ping#2.
+        let tick5_at = wait_for_exec_invocations(&mock_log, 6, Duration::from_secs(25)).await;
+        let cadence = tick5_at.duration_since(ping2_at);
+        assert!(
+            cadence >= Duration::from_secs(6) && cadence <= Duration::from_secs(15),
+            "heartbeat cadence drifted: the next tick came {}ms after Ping#2 \
+             (expected ~10000ms — the 10s interval period; a backoff that kept \
+             re-arming would tick at ~2000ms)",
+            cadence.as_millis()
+        );
+
+        // Oracle 6: that tick's invocation #6 exited 1, but the successful
+        // retry had already reset the streak, so the re-arm must be back at
+        // `next_ping_backoff(None, 10s)` = PING_FIRST_BACKOFF. A call site that
+        // never clears (service.rs:3557 deleted) still sees the second
+        // failure's 4s and re-arms here at 8s.
+        let f3 = tokio::time::timeout(Duration::from_secs(15), enc.read_v1_frame())
             .await
-            .expect("no third Ping")
+            .expect("no Ping after the post-success failed tick: the 2s re-arm never fired")
             .expect("read third Ping");
         let ping3_at = Instant::now();
         assert_oidc_ping_key(&f3, token);
-        let cadence = ping3_at.duration_since(ping2_at);
+        let rearm3 = ping3_at.duration_since(tick5_at);
+        let rearm3_min = PING_FIRST_BACKOFF / 2;
+        let rearm3_max = PING_FIRST_BACKOFF + PING_FIRST_BACKOFF / 2;
         assert!(
-            cadence >= Duration::from_secs(6) && cadence <= Duration::from_secs(15),
-            "heartbeat cadence drifted: Ping#3 came {}ms after Ping#2 (expected \
-             ~10000ms — the 10s interval period; a backoff that kept re-arming \
-             would tick at ~2000ms)",
-            cadence.as_millis()
+            rearm3 >= rearm3_min && rearm3 <= rearm3_max,
+            "Ping#3 arrived {}ms after the post-success failed tick (expected \
+             ~{}ms = PING_FIRST_BACKOFF: the successful retry reset \
+             ctx.ping_retry_backoff to None at service.rs:3557, so the next \
+             failure re-arms at the FIRST-failure value again; the accepted \
+             window [{}, {}]ms is derived from that constant). A call site that \
+             never clears the streak keeps the second failure's 4s and re-arms \
+             here at ~8000ms — RED; without interval.reset_after(delay) the \
+             interval keeps its 10s period (~10000ms)",
+            rearm3.as_millis(),
+            PING_FIRST_BACKOFF.as_millis(),
+            rearm3_min.as_millis(),
+            rearm3_max.as_millis()
         );
         enc.write_v1_frame(&pong).await.expect("write Pong");
         let _ = pings_ok_tx.send(());
@@ -875,11 +984,12 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
         })
     };
 
-    // Wall time: Ping#1 right after login + tick 2 ~10s later + re-armed Ping#2
-    // ~2s after that + Ping#3 ~10s after Ping#2, plus startup margin.
-    tokio::time::timeout(Duration::from_secs(45), pings_ok_rx)
+    // Wall time: Ping#1 right after login + tick 2 ~10s later + the 2s re-armed
+    // tick + the 4s re-armed Ping#2 + the next period tick ~10s after that
+    // (which fails) + the 2s re-armed Ping#3, plus startup margin.
+    tokio::time::timeout(Duration::from_secs(70), pings_ok_rx)
         .await
-        .expect("mock never verified the ping skip + 2s re-arm cadence")
+        .expect("mock never verified the ping skip + 2s/4s re-arm cadence")
         .expect("mock task ended before verifying the re-arm cadence");
     assert_eq!(
         login_count.load(Ordering::SeqCst),
