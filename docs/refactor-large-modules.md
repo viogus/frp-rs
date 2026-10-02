@@ -314,6 +314,22 @@ Block inventory, from the function's own comment landmarks:
   `frp-server/tests/transport_e2e_websocket_port.rs` and the `websocket`-without-`kcp` CI lane. See
   the `TODO.md` progress paragraph.
 
+- Inline tests of `frp-server/src/control/bridge.rs` → `frp-server/src/control/bridge/tests.rs`
+  (parent file kept, sibling module dir, as in the entry above) — PR #451 at code head `9f064385`
+  (based on `01fb93e3`), commit `3b57e709`: 5449 → 3324 lines. Every body line is identical apart
+  from one indent level (of the module's 2124 body lines, 1963 are de-indented exactly one level and
+  161 stay byte-verbatim — 142 blank and 19 beginning inside a multi-line literal), so the 563
+  extracted string/char literal values are identical before and after, and `-- --list` is the same 46
+  `control::bridge::tests::*` names.
+- Inline tests of `frp-server/src/ssh_gateway.rs` → `frp-server/src/ssh_gateway/tests.rs` (plus
+  `key_tests.rs`, `virtual_ctrl_tests.rs`, `preauth_tests.rs`) — PR #451 at code head `9f064385`
+  (based on `01fb93e3`), commit `9f064385`: 4864 → 2749 lines. Same invariants (of the four bodies'
+  2111 lines, 1960 are de-indented exactly one level and 151 stay byte-verbatim — 141 blank and 10
+  beginning inside a multi-line literal; 817 literal values unchanged; the same 70
+  `ssh_gateway::*` names). **Plan correction:** the P8 Step-0 table lists only `ssh_gateway/tests.rs`
+  (1992–3785, 1794 lines), but the ~2740 target stated for this file is its 2742 production lines, so
+  all four inline modules moved in the one commit.
+
 Recommended method: extract **one listener block at a time**, as an
 `async fn start_kcp_listener(&self) -> Result<()>`-shaped method, starting with
 KCP (largest) or WebSocket. No ordering change, no control-flow change, no error

@@ -730,7 +730,7 @@ VirtualNet = true
 
 #[test]
 fn test_vhost_http_timeout_is_go_signed_int64() {
-    // `TODO.md:7620`. Go's `VhostHTTPTimeout` field is `int64`
+    // `TODO.md:8012`. Go's `VhostHTTPTimeout` field is `int64`
     // (`pkg/config/v1/server.go`) and the flag is `Int64VarP`
     // (`pkg/config/flags.go:237`), so the file lane accepts a negative value and
     // refuses only what does not fit an `int64`. Measured on Go v0.71.0
@@ -9459,7 +9459,7 @@ fn test_legacy_ini_health_check_s_spellings_survive_strict_mode() {
 /// bare numeric values for string fields (`token = 12345678`,
 /// `meta_var1 = 123`) that frp-rs's INI number inference turned into TOML
 /// integers serde then rejected — a pre-existing legacy-INI gap unrelated to
-/// strict mode. That gap is fixed (`TODO.md:1359`) and the full load is pinned
+/// strict mode. That gap is fixed (`TODO.md:2556`) and the full load is pinned
 /// by `legacy_ini_go_shipped_frpc_fixture_loads_end_to_end` below; this test
 /// stays as the narrower strict-check pin.
 #[test]
@@ -9528,7 +9528,7 @@ fn legacy_ini_go_shipped_fixture_passes_strict_mode() {
 /// Go frp v0.71.0's own `conf/legacy/frpc_legacy_full.ini` (vendored
 /// byte-identically), loaded **end to end** through the real client config
 /// path with strict mode on — the assertion `legacy_ini_go_shipped_fixture_passes_strict_mode`
-/// deliberately could not make before `TODO.md:1359` was closed.
+/// deliberately could not make before `TODO.md:2556` was closed.
 ///
 /// Every expected name and count here is Go's own, measured on the real
 /// v0.71.0 binary: Go frpc + Go frps with the same file (only
@@ -9623,7 +9623,7 @@ fn legacy_ini_go_shipped_frpc_fixture_loads_end_to_end() {
     assert_eq!(xtcp_visitor.max_retries_an_hour, 8);
     assert_eq!(xtcp_visitor.min_retry_interval, 90);
 
-    // Value inference (TODO.md:1359 class 1): a bare numeric `token` and a bare
+    // Value inference (TODO.md:2556 class 1): a bare numeric `token` and a bare
     // numeric `meta_*` are text on Go, not integers — Go's `frpc verify -c`
     // exits 0 and the token is the string `12345678`.
     assert_eq!(cfg.token, "12345678");
@@ -9703,7 +9703,7 @@ fn legacy_ini_go_shipped_frps_fixture_loads_end_to_end() {
     assert_eq!(user_manager.addr, "127.0.0.1:9000");
 }
 
-/// `TODO.md:1359` class 2, on a constructed case: the trigger for the dropped
+/// `TODO.md:2556` class 2, on a constructed case: the trigger for the dropped
 /// section is the **comma list**, not the range.
 ///
 /// Measured on Go v0.71.0 (Go frps + Go frpc, `GET /api/proxy/tcp`):
@@ -9749,7 +9749,7 @@ fn test_legacy_ini_range_comma_list_expands_to_go_count() {
     assert_eq!(comma.proxies[3].remote_port, 7020);
 }
 
-/// `TODO.md:1359` class 3: Go dispatches a `[range:...]` template on `role`
+/// `TODO.md:2556` class 3: Go dispatches a `[range:...]` template on `role`
 /// **after** expanding it (`pkg/config/legacy/client.go:252-285`), so
 /// `role = visitor` builds visitors. Measured on Go v0.71.0: a `6010-6012`
 /// range with `role = visitor` logs `visitor added: [rv_0 rv_1 rv_2]`; frp-rs
@@ -9789,7 +9789,7 @@ fn test_legacy_ini_range_role_visitor_builds_visitors() {
     }
 }
 
-/// `TODO.md:1359` class 1, the smallest form: an INI value that the lossless
+/// `TODO.md:2556` class 1, the smallest form: an INI value that the lossless
 /// reader infers as a non-string is read back **as text** by a string-typed
 /// field, and the same value is still read as a number/boolean by a
 /// numeric/boolean field (the trap: a blanket "keep every INI value as a
@@ -9978,7 +9978,7 @@ fn test_legacy_ini_bool_scopes_are_ini_only() {
 /// The array spelling of the same port list — a TOML/JSON config may write the
 /// legacy-shaped section with a real array, and `[range:...]`'s
 /// `local/remote_port` must accept it just like the comma list
-/// (`TODO.md:1359`'s "let `ini_port_numbers` accept the split array").
+/// (`TODO.md:2556`'s "let `ini_port_numbers` accept the split array").
 #[test]
 fn test_legacy_ini_range_port_list_accepts_an_array() {
     let cfg = load_client_config_from_json(

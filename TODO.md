@@ -847,7 +847,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `normalize.rs` ranges rather than the new ones and corrected every live carrier: `docs/config.md:25`,
   `docs/config.md:375` and two source doc comments at `frp-core/src/config/tests.rs:2061` / `:2137` now carry the
   measured ranges (`:869-878` arm match, `:865-884` synthesis, `:652-655` `[common]` flatten, `:1429-1437` client
-  match, `:1379-1399` client fold). Older closed ledger entries (the #407 item above, `TODO.md:695`/`:696`) keep
+  match, `:1379-1399` client fold). Older closed ledger entries (the #407 item above, `TODO.md:800`/`:696`) keep
   their era's line numbers, which is why the round-1 "in every sentence" claim was dropped. `docs/config.md:375`
   was also **reworded**: both reviewers read its four-spelling list differently, and the client lift measurably
   maps **six** nested spellings (`normalize.rs:1429-1437`), so it now scopes the four to the four alias-less
@@ -2541,7 +2541,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `healthCheckHTTPHeaders`, `healthCheckIntervalS`, `healthCheckTimeoutS`, `healthCheckMaxFailed`,
     and the per-proxy `virtualNet`, which in Go is a *top-level client* key, `client.go:66`); those
     rows now name the nested Go spelling and flag the change. The report's earlier "the retracted
-    wording is not repeated anywhere" was wrong — the old closed item at `TODO.md:1140` quoted it
+    wording is not repeated anywhere" was wrong — the old closed item at `TODO.md:1127` quoted it
     verbatim and cited the deleted `strict.rs` comment; both are repaired above. The item's own
     `frp-server/src/config/server.rs` path was wrong and is corrected in place.
   * pre-existing legacy-INI gap found while using Go's fixture: a bare numeric INI value for a string
@@ -2799,7 +2799,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `join_all` teardown — work-conn, `frp-client/src/service.rs:4108` — drops its handles after a
   timeout instead of re-awaiting them; the `timeout(&mut handle)` sites only ever poll again after a
   *Pending* poll (ssh_gateway's `terminate_ssh_session`, the control writer); the `select!` arm on
-  `&mut session_task` (`frp-server/src/ssh_gateway.rs:4326`) consumes its one `Ready` and the `None`
+  `&mut session_task` (`frp-server/src/ssh_gateway.rs:2534`) consumes its one `Ready` and the `None`
   branch is the only path that polls further; and every `JoinSet` drain uses
   `join_next`/`try_join_next`, which remove the completed task from the set, so no task is polled
   twice. Details and per-site reasons: the PR body.
@@ -6781,8 +6781,8 @@ nothing about whether the described behaviour still holds.
   file-to-file move, so it is replaced by those byte-identity and literal-value proofs (calibrated
   the same way on the merged pure move `771294a3`: 1520). Both mandated reviews returned
   MERGE-with-findings and their two doc findings are applied in the plan doc. Ledger after the
-  rebase onto `18bcd1ad`: **13 open / 189 closed**, plus the one residue item this round files →
-  **14 open / 189 closed**.
+  final rebase onto `470a0cde` (the #456 merge): **20 open / 192 closed**, plus the one residue item this
+  round files → **21 open / 192 closed**.
   **Progress (2026-10-01, code head `7d95d267` on `refactor/split-login-authenticate`, PR #454).**
   `authenticate` 510 → 492 code lines (838 → 811 total, `frp-server/src/control/login.rs:645` →
   `:254`; the file 3361 → 2943), but the one-line "split `authenticate` by auth method" needs care:
@@ -6804,6 +6804,38 @@ nothing about whether the described behaviour still holds.
   of this file. `#[inline(never)]` travelled with `verify_login_auth` and was not applied to the
   three new helpers (recorded as an accepted LOW). The client half
   (`frp-client/src/work_conn.rs`) is untouched.
+
+  **Progress (2026-10-01, code head `0531827c` on `refactor/fileify-bridge-ssh-tests`, PR #451).** The
+  first P0 file-ification landed, one commit per file: `frp-server/src/control/bridge.rs` 5449 → 3324
+  (+ `frp-server/src/control/bridge/tests.rs`, 2096 lines) and `frp-server/src/ssh_gateway.rs`
+  4864 → 2749 (+ `ssh_gateway/tests.rs` 1778, `key_tests.rs` 76, `virtual_ctrl_tests.rs` 139,
+  `preauth_tests.rs` 103), commits `3b57e709` / `9f064385`. The test bodies move verbatim apart from
+  one indent level, measured per body rather than in aggregate: the bridge module's 2124 body lines
+  are 1963 de-indented exactly one level + 161 byte-verbatim (142 blank, 19 beginning inside a
+  multi-line literal), and the four ssh bodies' 2111 lines are 1960 + 151 the same way (141 blank, 10
+  in a multi-line literal); 0 lines match neither rule. The extracted literal-value multiset is
+  unchanged (563 / 817) and `-- --list` is the same 460 names (bridge 46, `ssh_gateway::*` 70). P8
+  Step 0 names only `ssh_gateway/tests.rs`, but the ~2740 target it states needs all four inline
+  modules; see [`docs/refactor-large-modules.md`](docs/refactor-large-modules.md) "Landed so far".
+  Ledger after this round: **21 open / 192 closed** (base `470a0cde`: 20 open / 192 closed — the round
+  files the item below).
+
+- [ ] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
+  Evidence: the test-module filter at `scripts/large-functions.sh:155` excludes only a file named
+  exactly `tests.rs` or one under a `tests/` directory, so three of the modules this refactor just
+  created — `frp-server/src/ssh_gateway/key_tests.rs`, `virtual_ctrl_tests.rs`, `preauth_tests.rs` —
+  are counted as **production** (verified against the predicate itself, not inferred), and nothing is
+  attributed to a `mod X;` declaration, so a parent whose tests now live in sibling files is still
+  scored as if it held them. Measured on this tree: the head reports `frp-server/src/ssh_gateway.rs` at
+  **2726 production / 2750 total / 24 test**, against the base's 2742 / 4865 / 2123 — the tool now
+  *under*-reports the very file-ification it was written to size (`frp-server/src/control/bridge.rs`
+  reads 3322 / 3325 / 3, right only because that module happens to be named `tests.rs`).
+  **Done-when:** the filter also excludes test-only modules by name pattern (`*_tests.rs`, `*_test.rs`)
+  and attributes a `mod X;`-declared sibling to tests, shown by a before/after run of the script on
+  this tree in which `frp-server/src/ssh_gateway.rs` reads its real production count again (≈2742, not
+  2726) and `key_tests.rs` / `virtual_ctrl_tests.rs` / `preauth_tests.rs` each read **0** production —
+  with the script's existing `tests.rs` / `tests/` behaviour preserved, or the change to it justified
+  in the item.
 
 - [x] **Three vendored crates are a standing maintenance liability.**
   Evidence: `vendor/rustls` (TLS, patched), `vendor/yamux` (5 patches),
@@ -8081,7 +8113,7 @@ section; ledger now **24 open / 104 closed**.**
   re-adding the two roots to `INI_NESTED_SECTION_ROOTS` reddens the first.
 
 - [x] **Four more test-precision residues the `test-precision-residue` round-2 reviews measured.**
-  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7191`): a
+  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7630`): a
   test that pins less than its name claims, so a real regression stays green.
   (a) The pinned warning bytes are the shipped static, but the **emitted** record is only
   substring-checked: `frp-core/tests/server_tls_enable_warning.rs:441` asserts
@@ -9221,13 +9253,6 @@ section; ledger now **24 open / 104 closed**.**
 
 - [x] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
   Filed by the coordinator while closing `TODO.md:8533` (PR #430), which removed the two local `pkill -f`
-  calls in `scripts/compat-test.sh`: `scripts/remote-frps.sh:195` and `:339` still run
-  `pkill -f 'frps -c frps.toml'` and `:409` uses `pgrep -f` on the same text, over ssh, to manage the
-  comparison server on a remote VPS. Name-plus-argument is the same hazard the local sweep just lost — a
-  process on the remote host whose command line merely contains that text is reaped too — but the local
-  `$TEST_DIR/`-prefix baseline and baseline subtraction the new sweep relies on do not exist on the remote
-  side, so the fix needs its own design (a remote pid file, or a port-scoped `fuser` route) rather than a copy
-  of `reap_scoped_strays`. PR #430's residue table names the three call sites.
   **Done-when:** the remote helper reaps by exact pid (a pid file written where it starts the server, or a
   port-scoped lookup) instead of `pkill -f`/`pgrep -f`, or the pattern kill is recorded as required with the
   measurement that shows a pid route is impossible over that ssh path.
