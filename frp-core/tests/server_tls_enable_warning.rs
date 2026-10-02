@@ -65,10 +65,10 @@
 //!
 //! **The two variants are covered by two different lanes, not by one run.** The
 //! `#[cfg]` split means a default-features run asserts only the `tls` text and a
-//! `--no-default-features` run only the no-TLS text: `.github/workflows/ci.yml:191-194`
-//! (`cargo test -p frp-core`, default features) covers the `tls` variant, and
-//! `.github/workflows/ci.yml:195-226` (`cargo test -p frp-core --no-default-features
-//! --all-targets`, the `run:` at `.github/workflows/ci.yml:226`) covers the no-TLS
+//! `--no-default-features` run only the no-TLS text: the `run:` at
+//! `.github/workflows/ci.yml:1719` (`cargo test -p frp-core`, default features)
+//! covers the `tls` variant, and the `run:` at `.github/workflows/ci.yml:1751`
+//! (`cargo test -p frp-core --no-default-features --all-targets`) covers the no-TLS
 //! one. A change to either text is therefore only seen by the
 //! lane whose feature set selects it.
 

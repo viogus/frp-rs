@@ -11,13 +11,19 @@
 #   Go frp v0.71.0. The annotated tag `v0.71.0` is object 40adeed73b51e7ee1766d7cfb15d02ba9431ba2b,
 #   which points at commit 4a23aa181c1d7e28eecaa8216024ed753b9d27c8.
 #   Source files read: pkg/config/v1/{server,client,common,proxy,visitor,proxy_plugin,
-#   visitor_plugin,value_source}.go (plus api.go / store.go, which hold no config fields).
+#   visitor_plugin,value_source,api,store}.go.
 #   `pkg/config/v1/decode.go` carries no alias or legacy table — it dispatches on the `type` key
 #   straight into `jsonx.UnmarshalWithOptions` — so Go accepts only the exact `json:"..."` spellings.
 #   Accept set = every dotted `json` path reachable from `ServerConfig`, `ClientConfig` and the
 #   `*ProxyConfig` / `*VisitorConfig` / `*PluginOptions` structs (embedded structs followed,
-#   `json:"-"` ignored), plus every bare `json` field name in those structs:
-#   194 dotted paths + 153 bare names = 261 distinct spellings, embedded below as `GO`.
+#   `json:"-"` ignored), plus every bare `json` field name in the `pkg/config/v1` config structs —
+#   the eight struct files above carry the dotted paths, and `api.go` (`APIMetadata.Version`) and
+#   `store.go` (`StoreConfig.Path`) contribute the bare names `version` / `path` even though neither
+#   struct is reachable from those roots:
+#   108 dotted paths + 153 bare names = 261 distinct spellings (the two sets are disjoint),
+#   embedded below as `GO`. Re-measure the split with:
+#     python3 -c 'import re;t=open("scripts/tests/docs-go-column.sh").read();g=re.search(r"GO = \{(.*?)\n\}",t,re.S).group(1);s={x for x in re.findall(r"\"([^\"]+)\"",g)};print(len([x for x in s if "." in x]),len([x for x in s if "." not in x]),len(s))'
+#   -> prints "108 153 261".
 #   (The files were fetched through the cdn.jsdelivr.net mirror of the tag because
 #   raw.githubusercontent.com is unreachable from this development box; the fetched
 #   `server.go` is 9334 bytes, matching the GitHub contents API listing for the tag.)
@@ -38,7 +44,8 @@
 # re-wording either back into a bare Go spelling reds even if someone later adds that spelling to
 # `ALIASES` or to `GO`.
 #
-# The inventory counts are deliberate: this is a curated table of the mapped rows, so a table
+# The inventory counts are deliberate: this is a spelling/membership gate over the Go column plus
+# the recorded 41-entry / 49-row `ALIASES` exemption — not a row->Go-path mapping check — so a table
 # appearing, a row being added, or a bare `—` being swapped for a token has to be recorded here in
 # the same commit instead of passing silently.
 #
@@ -647,7 +654,7 @@ expect_red 'M4 (every Go-column table dropped): the row floor reds' \
 
 M5="$WORK/m5.md"
 if mutate_go_cell "$PRISTINE" "$M5" 22 '—' && grep -Fq '| — |' "$M5"; then
-  expect_red 'M5 (websocket_port’s divergence prose stripped): the pinned row reds' \
+  expect_red "M5 (websocket_port's divergence prose stripped): the pinned row reds" \
     "$M5" 'bad docs/config.md:22' 'no longer records'
 else
   bad 'M5 mutation did not apply — anchor missing, the check would be vacuous'
