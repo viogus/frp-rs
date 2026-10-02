@@ -7372,7 +7372,7 @@ nothing about whether the described behaviour still holds.
   witness); the name rule and `mod X;`-sibling behaviour are preserved (the classifier's existing fixtures and
   M1–M5 still pass); `#[cfg(all(test, …))]` is recognised. The fourth (`#[path]`) is closed for the one-line,
   attribute-after-gate, path-then-one-line-gate and `#[path]`-then-`#[cfg(any(test))]` orderings (the target reads `0 4 4`);
-  two shapes still leave it at `4 4 0` — a `#[path]` that does not stand alone on its line (packed with the gate) and any predicate written across lines. The only `#[cfg(test)]`-paired `#[path]` site,
+  two shapes still leave it at `4 4 0` — a `#[path]` written before the gate on the gate's line (path-first packing) and any predicate written across lines. The only `#[cfg(test)]`-paired `#[path]` site,
   `frp-server/src/control/proxy_ops/mod.rs:3044-3046`, is in the supported order. The item's "the tree's only
   `#[path]` site" is loose: `frp-server/src/vhost.rs:24` carries a second one, paired with a
   `#[cfg(feature = "http-proxy")]` gate rather than a test gate. The two smaller conventions the item records are
@@ -10799,7 +10799,7 @@ other.
   **Done-when:** each row's Go cell is checked against an expected path for that row, so swapping in a real-but-wrong Go key reds;
   or the column records per row why membership is all that is being asserted.
 
-- [ ] **A multiline `#[cfg(...)]` predicate is never attributed, so its item reads as production.**
+- [ ] **The gate locator misses a multiline `#[cfg(...)]` predicate and a `#[path]` packed before the gate, so such items read as production.**
 
   Filed by the M-2 records round (PR #468), widened in round 3: the one-line, start-anchored gate locator
   (`cfg_attribute` / `is_test_gate`) misses two spellings — (a) a predicate spanning lines (`#[cfg(all(` / `test,` /
@@ -10807,7 +10807,7 @@ other.
   line (`#[path = "…"] #[cfg(test)]` above `mod x;`). Measured here, production/total/test: (a) a 22-code-line
   probe reads `22 22 0` at `2833442a`, `b113b013`, `0ebbe6b1`, `05bb3b2d`, `040f567c`; (b) the packed line hides the
   gate too (module file `11 11 0`, target `4 4 0`), as does the across-lines predicate (`14 14 0` / `4 4 0`). Neither
-  has an in-tree trigger (the only live multi-line `#[cfg(` under `ROOTS` is `frp-core/src/transport/mod.rs:977`);
+  has an in-tree trigger (the only live multi-line `#[cfg(` attribute under `ROOTS` is `frp-core/src/transport/mod.rs:977`);
   neither is pinned by a fixture; only (a) is noted in-tree (`scripts/large-functions.sh:65-67`).
 
   **Done-when:** either spelling gates, or both are documented as unsupported in the script's own docstring and pinned by a fixture.
