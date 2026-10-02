@@ -10178,7 +10178,7 @@ section; ledger now **24 open / 104 closed**.**
   summary with the pin updated, digest drift with the pin left alone, and delete-plus-lower
   (`guard_exact` 36 / `guard_floor` 37).
 
-- [ ] **`known_server_keys()` accepts a feature-gated listener-port key whose serde field is compiled out, so
+- [x] **`known_server_keys()` accepts a feature-gated listener-port key whose serde field is compiled out, so
   `--strict-config` accepts a key the server then ignores.**
   Filed by the PR #447 records round from PR #448's and PR #455's measurements. The strict parser's key set is a
   static list (`frp-core/src/config/strict.rs`) while the field it gates is `#[cfg]`-compiled
@@ -10191,6 +10191,50 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** `known_server_keys()` (and any client-side counterpart) is derived from, or checked against,
   the compiled field set — shown by a `--no-default-features` run in which `--strict-config` refuses a key it
   cannot honour, or the divergence is recorded as deliberate with a measurement on both feature shapes.
+  Done (2026-10-02, this batch). The **second** branch of the Done-when is the one taken, deliberately: the
+  coordinator ruled the first one (derive the set from the compiled fields) out, because the acceptance side is
+  itself the pinned decision — refusing a gated key would be the "false 400" direction `docs/deployment.md`
+  rules out, and the repo's own `frps.toml` writes `kcp_bind_port = 17000` + `quic_bind_port = 17001`, so
+  rejection would stop every `micro`/`tiny` build from loading the documented example. The divergence is now
+  recorded where it lives — a 22-line `///` statement above `known_server_keys()` in
+  `frp-core/src/config/strict.rs` (`:9`; the file goes 939 → 961 lines) which also notes that
+  `known_client_keys()` has no counterpart to record, because `frp-core/src/config/client.rs` carries no
+  `#[cfg(feature = …)]` at all — and in the `docs/config.md` `websocket_port` row, and it is measured in both
+  shapes by `frp-core/src/config/tests.rs:14567`
+  `feature_gated_port_keys_are_accepted_while_the_compiled_field_set_follows_the_build()` (helper
+  `feature_gated_port_field_is_compiled_in` above it at `:14530`, both appended at the end of the file so no
+  existing cite shifts). For each of the three `(snake, camel, feature)` triples and **both** spellings the pin
+  asserts that strict mode loads the config (acceptance), that `serde_json::to_value(&cfg)` carries the field as
+  `17500` exactly when the feature is compiled in, and that a feature-off load omits the field from the
+  serialized config while `ConfigPresence::unhonoured_server_feature_key_records()` names it as
+  accepted-but-unhonoured.
+  - Green: `cargo test -p frp-core -j 2 --lib -- config::tests::feature_gated` → `ok. 6 passed; 0 failed`
+    (default shape); `cargo test -p frp-core --no-default-features -j 2 --lib -- config::tests::feature_gated`
+    → `ok. 9 passed; 0 failed`. The new pin alone: `1 passed; 0 failed` in both shapes (`1095` / `841`
+    filtered out).
+  - Mutants, each red then reverted green: deleting `        "kcp_bind_port",` from `known_server_keys()` →
+    EXIT 101, `FAILED. 3 passed; 3 failed`, the new pin at `frp-core/src/config/tests.rs:319:29` (the
+    `load_server_with_presence` panic: strict mode refusing the key) plus
+    `feature_gated_server_ports_stay_known_to_strict_mode_in_every_build` at `:532:9` and
+    `feature_gated_server_port_kcp_enabled_honours_the_port` at `:319:29`; adding `#[serde(skip_serializing)]`
+    above the `kcp` field in `frp-core/src/config/server.rs` → EXIT 101, `FAILED. 5 passed; 1 failed`, **only**
+    the new pin red (`panicked at frp-core/src/config/tests.rs:14576:17`, `left: None` / `right: Some(17500)`),
+    which is exactly the coverage the class pin does not have; and no longer setting
+    `presence.server_websocket_port_unhonoured` (`frp-core/src/config/loader.rs:723-724`) →
+    `--no-default-features` EXIT 101, `FAILED. 7 passed; 2 failed`, the new pin at `:14594:17` plus the existing
+    `feature_gated_server_port_websocket_disabled_reports_the_dropped_port` at `:485:13`.
+  - Cites: the `strict.rs` doc shifts 22 lines, so the four live cites into that file were re-derived **by
+    content** — the cited base line read with `git show b9af37c5:frp-core/src/config/strict.rs`, then that same
+    text located at the head, never by offset: `docs/config.md` `strict.rs:105`→`:127` (`"websocketPort",`),
+    `docs/developing.md` `:248`→`:270` (`pub(super) const PROXY_KNOWN_KEYS: &[&str] = &[`),
+    `docs/developing.md` `:474`→`:496` and `docs/config.md` `:474`→`:496`
+    (`check_strict_in(table, known, "", config_path, Ctx::Root, false)`).
+  - Not overturned: the deliberate live pin at `frp-core/src/config/tests.rs:528` still asserts acceptance in
+    every build shape, which is the decision this item records rather than changes.
+  - Gates: `cargo fmt --all -- --check` rc 0 (no reformat was needed);
+    `RUSTFLAGS="-D warnings" cargo clippy --all-targets -j 2` rc 0 for `frp-core` in the default and
+    `--no-default-features` shapes; `bash scripts/tests/todo-cite-guard.sh` →
+    `RESULT: 88 cite(s) checked, 0 violation(s)`.
 
 - [ ] **A `path:line` cite in a live file is not machine-checked, so a change that inserts lines rots every cite into the file it touched.**
 
