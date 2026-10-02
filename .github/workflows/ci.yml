@@ -679,22 +679,30 @@ jobs:
         # is still red, and any `FAIL` line fails the step.
         #
         # This suite is itself a negative control for the classifier rule: it
-        # drives nineteen deliberate mutations of `scripts/large-functions.sh`
-        # (M1–M19) and requires each one to be misclassified. The `guard_canary`
+        # drives twenty-two deliberate mutations of `scripts/large-functions.sh`
+        # (M1–M22) and requires each one to be misclassified. The `guard_canary`
         # check below is the M1 witness, printed only by a run that actually
         # reclassified the mutated tree, so a suite whose mutation loop was
         # deleted cannot pass by keeping its count. Tying a literal to the
         # suite's wording is safe here precisely because `guard_pin` pins the
         # bytes: changing the wording is already a two-file change.
+        #
+        # `guard_lf_pin` below pins the file the suite classifies, beside the
+        # suite's own pin. Without it a regression that keeps the check count at
+        # `guard_exact` — a same-line gate tail that silently stops attributing a
+        # region, say — would move no literal in this file at all; with it, any
+        # change to either file is a reviewer-visible two-file change.
         shell: bash
         run: |
           set -o pipefail
           log=/tmp/frp-large-functions-classifier.log
           status=0
           guard_file=scripts/tests/large-functions-classifier.sh
-          guard_pin=df52adae95dfd820fc2af905e363a6248dde2cb4cbb1eb44d6bf42e0b9995c57
-          guard_exact=118
-          guard_floor=118
+          guard_pin=eacedb624e3ce9505793047e9f928351b663479a9616372a9502c1672d5ff322
+          guard_lf_file=scripts/large-functions.sh
+          guard_lf_pin=0a4c3e0d15977e1fd8d8b0944a0af4058099ade83d7b04a4101946172926bd7e
+          guard_exact=133
+          guard_floor=133
           guard_canary='M1 (name pattern removed)'
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
@@ -715,7 +723,7 @@ jobs:
             done
           fi
           if [ -z "$guard_hasher" ]; then
-            echo "::error::no sha256 tool at an absolute path reproduces the known sha256 vector; cannot verify $guard_file"
+            echo "::error::no sha256 tool at an absolute path reproduces the known sha256 vector; cannot verify $guard_file or $guard_lf_file"
             exit 1
           fi
           # shellcheck disable=SC2086  # $guard_hasher is the word-split "<abs path> [-a 256]"
@@ -724,6 +732,18 @@ jobs:
           if [ "$guard_sha" != "$guard_pin" ]; then
             echo "::error::$guard_file is not the pinned revision (sha256 ${guard_sha:-<none>}; expected $guard_pin)"
             echo "::error::a change to the classifier suite — including one that weakens its own checks — must also update guard_pin in the 'Large-functions classifier — fixture checks' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended, otherwise revert it"
+            exit 1
+          fi
+          # The suite pins its own bytes; pin the file it classifies too. A
+          # regression in the script that keeps the check total at `guard_exact`
+          # (a same-line gate tail that silently stops attributing a region, say)
+          # would otherwise move no literal in this file.
+          # shellcheck disable=SC2086  # $guard_hasher is the word-split "<abs path> [-a 256]"
+          guard_lf_out=$($guard_hasher "$guard_lf_file" 2>/dev/null) || true
+          guard_lf_sha=${guard_lf_out%% *}
+          if [ "$guard_lf_sha" != "$guard_lf_pin" ]; then
+            echo "::error::$guard_lf_file is not the pinned revision (sha256 ${guard_lf_sha:-<none>}; expected $guard_lf_pin)"
+            echo "::error::a change to the classifier's subject must also update guard_lf_pin beside guard_pin in the 'Large-functions classifier — fixture checks' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended, otherwise revert it"
             exit 1
           fi
           bash "$guard_file" > "$log" 2>&1 || status=1
@@ -767,11 +787,11 @@ jobs:
             printf '%s' "$guard_fail_text"
           fi
           if [ "$status" != "0" ]; then
-            echo "::error::the large-functions classifier fixture did not report 118 checks with no failure line"
-            echo "::error::scripts/tests/large-functions-classifier.sh must print 118 '  ok' lines, include the M1 witness, and end with 'RESULT: 118 fixture check(s) hold' (floor=$guard_floor, exact=$guard_exact), and must not print a 'FAIL' line; a smaller total, a missing witness, a failure line or no output at all (an \`exec\`) means cases were skipped or swallowed — restore them rather than lowering this literal"
+            echo "::error::the large-functions classifier fixture did not report 133 checks with no failure line"
+            echo "::error::scripts/tests/large-functions-classifier.sh must print 133 '  ok' lines, include the M1 witness, and end with 'RESULT: 133 fixture check(s) hold' (floor=$guard_floor, exact=$guard_exact), and must not print a 'FAIL' line; a smaller total, a missing witness, a failure line or no output at all (an \`exec\`) means cases were skipped or swallowed — restore them rather than lowering this literal"
             exit 1
           fi
-          echo "Large-functions classifier fixture checks ok: 118 checks hold (floor $guard_floor), M1 witness present, no failure line"
+          echo "Large-functions classifier fixture checks ok: 133 checks hold (floor $guard_floor), M1 witness present, classifier and subject pins verified, no failure line"
       - name: docs/config.md Go column — fixture checks
         # TODO.md "`docs/config.md`'s Go column has no gate.": the document
         # asserts "Every field maps 1:1 to a Go frp v0.71.0 equivalent", but no

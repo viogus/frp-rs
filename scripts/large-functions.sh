@@ -62,9 +62,17 @@ FN = re.compile(r'^(\s*)(?:pub(?:\([^)]*\))?\s+)?(?:const\s+|async\s+|unsafe\s+)
 # `#[cfg(test)] // see (a)]` and
 # `#[cfg(test)] #[path = "declared_helper.rs"] mod declared;` are all gates.
 #
-# NOTE: the opening `#[cfg(` must still close on the same line, so the wrapped
-# spelling `#[cfg(all(` / `test,` / `feature = "x"` / `))]` is not recognised.
-# No in-tree file writes one; it is filed as residue rather than special-cased.
+# Two spellings that used to be missed are gates as well, because
+# `is_test_gate_run` walks the whole attribute run rather than one leading
+# attribute on one line: a predicate that wraps (`#[cfg(all(` / `test,` /
+# `feature = "x"` / `))]`) and a gate that is not the run's first attribute
+# (`#[path = "declared_helper.rs"] #[cfg(test)]` sharing the gate's line). Both
+# pass the same `gate_tail_ok` / `cfg_implies_test` checks as `#[cfg(test)]`.
+# `attribute_span` carries the run across lines; it declines a span that would
+# have to walk through a line-spanning comment, string or raw string — the set
+# `region_flags` tracks — so `#[cfg(all(/*` … `test */` …))]` is still not
+# recognised and its lines stay production. No in-tree file writes any of these
+# spellings; both are pinned by scripts/tests/large-functions-classifier.sh.
 CFG_OPEN = re.compile(r'\s*#\s*\[\s*cfg\s*\(')
 # `r"…"`, `r#"…"#`, `r##"…"##`, `br#"…"#`: the `#`s set the terminator count,
 # and the literal may span lines.
@@ -319,6 +327,89 @@ def closing_bracket(line, i):
     return -1
 
 
+def attribute_span(lines, i, j):
+    """(line, column) just past the `#[…]` attribute at `(i, j)`, or (-1, -1).
+
+    `closing_bracket`'s cross-line sibling: an attribute may wrap onto later
+    lines (`#[cfg(all(` / `test,` / `feature = "x"` / `))]`), so the walk that
+    finds the item an attribute run decorates has to cross them.
+
+    A span that would have to walk through a line-spanning comment, string or
+    raw string is declined — those are the three constructs `region_flags`
+    tracks, and re-lexing them here would mean a second, weaker lexer beside the
+    line-local one. `(-1, -1)` then leaves the line to the line-local walk,
+    exactly as before this function existed.
+    """
+    depth = 0
+    while i < len(lines):
+        line = lines[i]
+        n = len(line)
+        while j < n:
+            if line.startswith('/*', j):
+                k = _skip_comment(line, j)
+                if k >= n:              # the comment continues past the line
+                    return -1, -1
+                j = k
+                continue
+            if line.startswith('//', j):
+                break                   # the rest of the line is a comment
+            c = line[j]
+            if c in 'brc':
+                m = RAW_OPEN.match(line, j)
+                if m:
+                    term = '"' + '#' * len(m.group(1))
+                    k = line.find(term, m.end())
+                    if k < 0:           # the raw string continues past the line
+                        return -1, -1
+                    j = k + len(term)
+                    continue
+            if c == '"':
+                j, done = _string_rest(line, j + 1)
+                if not done:            # a `\` at end of line continues it
+                    return -1, -1
+                continue
+            if c == "'":
+                j = _skip_char(line, j)
+                continue
+            if c == '[':
+                depth += 1
+            elif c == ']':
+                depth -= 1
+                if depth == 0:
+                    return i, j + 1
+            j += 1
+        i, j = i + 1, 0
+    return -1, -1
+
+
+def cfg_predicate(lines, i, j):
+    """(`predicate`, close line, column past it) for a `#[cfg(…)]` at `(i, j)`.
+
+    `cfg_attribute`'s cross-line sibling. `(None, -1, -1)` when the attribute is
+    not well formed, when `attribute_span` declines its span, or when the span's
+    text does not end in the predicate's `)`. The predicate keeps
+    `cfg_attribute`'s contract: a block comment is stripped before the argument
+    split (one spanning lines was already declined by `attribute_span`).
+    """
+    m = CFG_OPEN.match(lines[i], j)
+    if not m:
+        return None, -1, -1
+    ei, ej = attribute_span(lines, i, j)
+    if ei < 0:
+        return None, -1, -1
+    if ei == i:
+        text = lines[i][m.end():ej - 1]
+    else:
+        segs = [lines[i][m.end():]]
+        segs.extend(lines[i + 1:ei])
+        segs.append(lines[ei][:ej - 1])
+        text = '\n'.join(segs)
+    text = text.rstrip()
+    if not text.endswith(')'):
+        return None, -1, -1
+    return re.sub(r'/\*.*?\*/', '', text[:-1]), ei, ej
+
+
 def cfg_attribute(line):
     """(`predicate`, index just past the attribute) for a leading `#[cfg(…)`].
 
@@ -424,6 +515,44 @@ def is_test_gate(line):
     return gate_tail_ok(line, end) and cfg_implies_test(pred)
 
 
+def is_test_gate_run(lines, i):
+    """Is the attribute run opening on line `i` a `cfg(test)` gate?
+
+    `is_test_gate` reads one line and its first attribute, which is what most
+    gates are; this walks the whole run so the two residue spellings gate too.
+    The predicate may wrap, and the gate may not be the run's first attribute
+    (`#[path = "…"] #[cfg(test)]` sharing the gate's line). Both still have to
+    pass `gate_tail_ok` and `cfg_implies_test`.
+
+    The one-line spelling keeps going through `is_test_gate` first, so its own
+    checks stay the ones a one-line gate is tested by; the walk only accepts
+    what that path cannot see — a predicate closing on a later line, or a gate
+    that is not the run's first attribute.
+    """
+    if is_test_gate(lines[i]):
+        return True
+    li, lj = _skip_trivia(lines, i, 0)
+    if li != i:
+        return False                    # no attribute opens on this line
+    first = True
+    while li == i and lines[li].startswith('#[', lj):
+        # Only a gate that opens on line `i` makes it a candidate: an attribute
+        # on a later line is that line's candidate, which is what keeps the
+        # backward walk in `test_blocks` load-bearing for `#[path]` above a gate.
+        if CFG_OPEN.match(lines[li], lj):
+            pred, ei, ej = cfg_predicate(lines, li, lj)
+            if pred is not None and cfg_implies_test(pred) \
+                    and gate_tail_ok(lines[ei], ej) \
+                    and (ei > li or not first):
+                return True
+        ei, ej = attribute_span(lines, li, lj)
+        if ei < 0:
+            return False
+        li, lj = _skip_trivia(lines, ei, ej)
+        first = False
+    return False
+
+
 def _skip_trivia(lines, i, j):
     """Cursor `(i, j)` just past the whitespace and comments at `(i, j)`.
 
@@ -485,8 +614,18 @@ def attribute_run(lines, start):
         if not line.startswith('#[', j):
             return i, j, path_attr
         end = closing_bracket(line, j + 1)
-        if end < 0:                         # malformed — stop at the item
-            return i, j, path_attr
+        if end < 0:
+            # The attribute may wrap onto a later line; `attribute_span` crosses
+            # it and declines when the span would have to walk through a
+            # line-spanning comment, string or raw string.
+            ei, ej = attribute_span(lines, i, j)
+            if ei < 0:                      # malformed — stop at the item
+                return i, j, path_attr
+            m = PATH_ATTR.search(' '.join(lines[i:ei + 1]))
+            if m:
+                path_attr = m.group(1)
+            i, j = _skip_trivia(lines, ei, ej)
+            continue
         m = PATH_ATTR.search(line[j:end + 1])
         if m:
             path_attr = m.group(1)
@@ -621,7 +760,7 @@ def test_blocks(lines):
     blocks, out_of_line = [], []
     i, n = 0, len(lines)
     while i < n:
-        if flags[i] or not is_test_gate(lines[i]):
+        if flags[i] or not is_test_gate_run(lines, i):
             i += 1
             continue
         start = i
