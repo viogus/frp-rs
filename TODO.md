@@ -9298,7 +9298,7 @@ section; ledger now **24 open / 104 closed**.**
   `#[cfg(feature …)]` at all, so `known_client_keys()` (`frp-core/src/config/strict.rs:131-237`) has nothing that can
   go stale, and neither `quic_options` nor `virtual_net` is gated.
   **Done-when:** a load that carries a feature-gated key the build cannot honour is either refused or warned about once per load, in every build shape, with tests pinning both a feature-enabled and a feature-disabled build.
-  **Done (2026-10-02, at code head `6445549a` (earlier `dc1d2e1f`, `5067d8c7`; patch-`=` under `git range-diff`), records `da7f7a209bba1aea4802f05cd15a1c2a68db5afb`, PR #455, based on `01fb93e3` (rebased from `f881d15e`)) — warned, once per load, for a non-zero port; the key stays accepted.**
+  **Done (2026-10-02, at code head `6445549a` (earlier `dc1d2e1f`, `5067d8c7`; patch-`=` under `git range-diff`), records `2c93596c (this rebase round)` / `da7f7a2068db5afb`, PR #455, based on `5653512b` (earlier `01fb93e3`) (rebased from `f881d15e`)) — warned, once per load, for a non-zero port; the key stays accepted.**
   The new `ConfigPresence::warn_unhonoured_server_feature_keys()` (`frp-core/src/config/loader.rs`) is called from the
   three server load sites that own a log sink — the two post-`init_logging` `frps` startup branches
   (`frps/src/main.rs`) and the SIGUSR1 reload (`frp-server/src/service.rs`) — and emits one `tracing::warn!` per
@@ -9322,13 +9322,13 @@ section; ledger now **24 open / 104 closed**.**
   **MEDIUM** finding was that this item's changelog headline claimed a wider class than the three serde-dropped
   keys, so the records round narrowed the `CHANGELOG.md` sentence and the four follow-ups below were filed; its
   LOW/INFO findings (the legacy-`.ini` zero spellings, the `verify` silence, four already-wrong comment cites)
-  are `TODO.md:9207`, `:9229`, `:9246` and `:9257`. The Cross-Compat failure the branch first showed (`test_auth_r2g_reject`, a
+  are `TODO.md:9333`, `:9355`, `:9372` and `:9383`. The Cross-Compat failure the branch first showed (`test_auth_r2g_reject`, a
   data-plane reachability wait at `scripts/compat-test.sh:5399`) is a **flake, not attributable**: the compat lane
   builds default features, where the new code is compiled out, and both same-head re-runs succeeded
   (`36897123895`, `36897131548`).
-  Ledger after this close: **14 open / 190 closed** (base `01fb93e3`: 14 open / 189 closed; the item is filed and
-  closed in the same PR, so only the closed count moves; the four follow-ups below take it to **18 open / 190
-  closed** at this branch's head).
+  Ledger after this close: **16 open / 190 closed** (base `01fb93e3`: 14 open / 189 closed; the item is filed and
+  closed in the same PR, so only the closed count moves; the four follow-ups below take it to **20 open / 191
+  closed** at this branch's head, whose base is `5653512b` after the #449 merge (`16 open / 190 closed`)).
 
 - [ ] **A listener port whose *reader* is feature-gated in `frp-server` is still accepted and then silently ignored — `web_server.port` with `dashboard` off and `ssh_tunnel_gateway.bind_port` with `ssh` off.**
   Filed by PR #455's adversarial review (F-A), measured on the `frps-micro` binary at head `2aa6add8`: the
