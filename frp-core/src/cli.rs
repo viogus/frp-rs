@@ -194,7 +194,7 @@ fn go_bool_named_with_aliases(
 ///
 /// bpaf's `.switch()` implements only the first of those three, which is why
 /// argv Go accepts exited 1 here with `` `<bool>` is not expected in this
-/// context `` (`TODO.md:3445`). This expands to the `=BOOL` spelling with Go's
+/// context `` (`TODO.md:3498`). This expands to the `=BOOL` spelling with Go's
 /// grammar, and deliberately does **not** add the space-separated form:
 /// `.adjacent()` makes the value branch accept only `--flag=<value>`, so
 /// `--flag <bool>` leaves the token unconsumed and is refused exactly as
@@ -587,7 +587,7 @@ pub struct FrpsArgs {
     /// `-9223372036854775808` rc 0, `9223372036854775807` rc 0,
     /// `9223372036854775808` rc 1 `value out of range`).
     ///
-    /// **R6(b) (`TODO.md:8948`): "accept-and-ignore matches Go" is bounded.**
+    /// **R6(b) (`TODO.md:9246`): "accept-and-ignore matches Go" is bounded.**
     /// The flag surface is Go's (the full `int64` accepted above), but the value
     /// that reaches the vhost handler is clamped: `<= 0` floors at 60 s and
     /// anything above 24 h is capped, where Go has no comparable cap. So the
@@ -750,7 +750,7 @@ fn svr_config() -> impl Parser<Option<String>> {
 /// deliberately **not** part of the `verify` subcommand's surface — see
 /// [`FrpsRootSlots`].
 ///
-/// **R6(a) (`TODO.md:8948`): this lane does not read the loaded config's `[log]`
+/// **R6(a) (`TODO.md:9246`): this lane does not read the loaded config's `[log]`
 /// section.** `init_logging(&cli, None)` (`frps/src/main.rs:500`) runs before
 /// `collect_config_files` (`frps/src/main.rs:516`), so the effective log level
 /// comes from the flags alone. Measured over a config dir whose `frps.toml`
@@ -1767,7 +1767,7 @@ fn reject_pflag_shorthand_cluster_that_needs_a_value(argv: &[OsString], root: Ro
 /// value-taking flag does not count, so `frpc --help=true -c cfg` has no command
 /// word and keeps bpaf's root help — the pre-existing `--help=false -c cfg`
 /// divergence, unchanged by this pass (Go starts the client there: rc 124,
-/// `TODO.md:2326`).
+/// `TODO.md:4981`).
 ///
 /// Values go through [`parse_go_bool`], i.e. Go's `strconv.ParseBool` spellings;
 /// anything else is refused **here**, with pflag's own message and rc, rather
@@ -5069,7 +5069,7 @@ impl FrpsArgs {
     /// Config file path to load. Falls back to "frps.toml" when `-c` was
     /// not given on the command line.
     ///
-    /// **R2 (`TODO.md:8904`): this implicit-`./frps.toml` lane is an frp-rs
+    /// **R2 (`TODO.md:9202`): this implicit-`./frps.toml` lane is an frp-rs
     /// extension, not Go parity.** Go binds a server config file only through
     /// `-c`; with no `-c` its run path keeps the flags-only struct
     /// (`cmd/frps/root.go:82`) and logs `frps uses command line arguments for
@@ -6234,7 +6234,7 @@ mod tests {
 
     #[test]
     fn strict_config_help_text_states_the_extension() {
-        // The done-when for `TODO.md:1552` requires the divergence stated in
+        // The done-when for `TODO.md:3366` requires the divergence stated in
         // the flag's **help text**, not only in `docs/`.
         //
         // The two entries must be pinned **separately**, because the rendered
@@ -6371,7 +6371,7 @@ mod tests {
     // `--flag=true` / `--flag=false` parsed by `strconv.ParseBool`. bpaf's
     // `.switch()` accepted only the bare form, so `frps --tls-only=false -c
     // <valid config>` started on Go (rc 124 under a bounded runner) and exited
-    // 1 here (`TODO.md:3445`). The rows below are the parser half; the
+    // 1 here (`TODO.md:3498`). The rows below are the parser half; the
     // real-binary half is `frps/tests/cli_exit_codes.rs` and
     // `frpc/tests/cli_exit_codes.rs`.
 
@@ -8498,7 +8498,7 @@ mod hoist_tests {
         }
     }
 
-    // ── the `--help=<bool>` pass (TODO.md:4928) ─────────────────────────
+    // ── the `--help=<bool>` pass (TODO.md:4981) ─────────────────────────
     //
     // Every row in these two tests carries the Go v0.71.0 measurement it pins,
     // taken with one fresh listening socket per run on the config's
@@ -8577,7 +8577,7 @@ mod hoist_tests {
         );
         // No command word → the pass leaves the token alone: this is the
         // pre-existing root divergence (`frpc --help=false -c cfg` prints help
-        // here and starts the client on Go, rc 124, `TODO.md:2326`), and
+        // here and starts the client on Go, rc 124, `TODO.md:4981`), and
         // `--help=true notacommand` must keep bpaf's refusal rather than be
         // cleaned up into root help.
         for untouched in [

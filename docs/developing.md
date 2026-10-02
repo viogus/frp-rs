@@ -2929,7 +2929,7 @@ Pinned by `verify_valid_config_prints_go_line_and_exits_0`,
 #### `--strict-config`: the space-separated value form
 
 `--strict-config false` (a space, two argv tokens) is an **frp-rs extension**,
-kept, documented and made **loud** rather than dropped (`TODO.md:3313`). Go frp
+kept, documented and made **loud** rather than dropped (`TODO.md:3366`). Go frp
 v0.71.0 registers `strict_config` as a pflag bool on both binaries, and a pflag
 bool never consumes a following token — so the same argv behaves differently.
 The `=` spelling (`--strict-config=false`) is the **Go-faithful** one and is the
@@ -3156,7 +3156,7 @@ the rest as more shorthands, while only `-v=<bool>` is a value.
 
 frp-rs registered the ten as bpaf `.switch()`es, which implement only the bare
 form, so argv Go accepts exited 1 here with `` `false` is not expected in this
-context `` (`TODO.md:1798`). They now all go through one macro,
+context `` (`TODO.md:3498`). They now all go through one macro,
 `go_bool_flag!` (`frp-core/src/cli.rs`): a `parse_go_bool` value branch marked
 `.adjacent()` — only `--flag=<value>` is a value — plus the bare
 `.flag(true, false)` fallback, so present → `true` and absent → `false`, exactly

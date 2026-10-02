@@ -684,7 +684,7 @@ jobs:
       # `cargo test -p frps --test cli_exit_codes -- --list`.
       # 44 → 45 with the `-l`-shorthand refusal pin
       # `short_l_is_not_a_frps_shorthand_and_the_refusal_is_pinned`
-      # (`TODO.md:8954`): +1. Re-derived with the same `--list` command.
+      # (`TODO.md:9235`): +1. Re-derived with the same `--list` command.
       FRPS_CLI_TESTS: "45"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
@@ -1343,7 +1343,7 @@ jobs:
         # bin-target unit tests are covered by `Run frps bin unit tests` above),
         # and the `Lint` lane only *compiles* the test targets (`cargo clippy
         # --workspace --all-targets --all-features`). So that file — added with
-        # the CLI config-failure fix (`TODO.md:3129`) — executed in no lane, and
+        # the CLI config-failure fix (`TODO.md:3182`) — executed in no lane, and
         # the frps half of that fix had no executing pin.
         #
         # Measured warm, macOS arm64: 2.47 s wall for the package (4 tests, the
@@ -1519,7 +1519,7 @@ jobs:
         # `--log-max-days 0`, both arbited by Go's `-c` lane — see the file's own
         # section comments), and 9 → 10 with the `-c`-lane non-empty-flag pin
         # `cli_nonempty_log_level_flag_does_not_override_the_config_file`
-        # (`TODO.md:8901`). It is the count of `#[test]`s in that one file, and
+        # (`TODO.md:9182`). It is the count of `#[test]`s in that one file, and
         # it lives in exactly one place in this step — the `expected=` line — so
         # a new pin means editing one number, not hunting a duplicated one.
         #

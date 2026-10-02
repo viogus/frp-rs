@@ -178,7 +178,7 @@ User-facing release notes for frp-rs.
   prebuilt release tarball. The `/tmp/frp-source-build/` cache path also survived
   the removed builder it belonged to (`build_go_frp_v2()` exists nowhere). The
   step and the orphaned path are gone, and the cache step is named `Cache cargo`
-  again. TODO.md:6035.
+  again. TODO.md:6384.
 - **`auth.method` is now compared exactly, and a typo is a config-load error
   instead of silently selecting token auth.** Go accepts exactly `"token"` and
   `"oidc"` (`pkg/config/v1/validation/validation.go:37-40`, compared with
@@ -524,12 +524,8 @@ User-facing release notes for frp-rs.
   `[transport]`) that carries `local_port`/`remote_port` is a legacy proxy again, as Go registers
   it; and `[visitors.NAME]`/`[proxies.NAME]` are read as flat legacy sections instead of being
   expanded into a v1 sub-table and refused with `invalid type: map, expected a sequence`. The
-  section-level strict exception is `.ini`-only and documented in `docs/config.md`. TODO.md:7806,
-  :7792, :7815, :7858, :7885.
-  section-level strict exception is `.ini`-only and documented in `docs/config.md`. TODO.md:7911,
-  :7950, :7973, :8030, :8057.
-  section-level strict exception is `.ini`-only and documented in `docs/config.md`. TODO.md:7910,
-  :7949, :7972, :8029, :8056.
+  section-level strict exception is `.ini`-only and documented in `docs/config.md`. TODO.md:8045,
+  :8084, :8107, :8164, :8191.
 - **`frps --config-dir`: a panicking service task is now counted.** A task that panicked was logged and
   dropped, so a directory in which every task panicked still exited 0 with nothing served. The panic now
   joins the same all-failed decision as the typed failures, and the lane exits non-zero.
@@ -561,7 +557,7 @@ User-facing release notes for frp-rs.
   is not the file's channel or when `RUSTUP_TOOLCHAIN` overrode it. Measured:
   dropping the `COPY` or a stray `RUSTUP_TOOLCHAIN=stable` each fail the stage
   (rc 1), and a full uncached `docker buildx build` of the image succeeds and logs
-  the pinned toolchain. TODO.md:6096.
+  the pinned toolchain. TODO.md:6423.
 - **`frpc verify` prints Go's exact success sentence.** It printed
   `Config file <path> is valid` where Go prints `frpc: the configuration file <path>
   syntax is ok`, so the client and server verify subcommands disagreed with each other. The
