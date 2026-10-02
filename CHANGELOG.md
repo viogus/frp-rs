@@ -1206,6 +1206,7 @@ User-facing release notes for frp-rs.
   turn argv Go accepts into an frp-rs argv error.
 
 ### Docs
+- **Strict mode's acceptance of a feature-gated server port is recorded as a deliberate divergence, with a measurement in both build shapes.** `known_server_keys()` keeps `kcp_bind_port` / `quic_bind_port` / `websocket_port` (and their camel spellings) accepted in **every** build shape even though `frp-core/src/config/server.rs` compiles the matching serde field out, so `--strict-config` accepts a key a `micro`/`tiny` build then ignores. Refusing it would be the "false 400" direction `docs/deployment.md` rules out, and the repo's own `frps.toml` writes `kcp_bind_port` / `quic_bind_port`, so rejection would stop those builds from loading the documented example. The `websocket_port` row of `docs/config.md` now says so, `known_server_keys()` carries the same statement in its own doc, and `frp-core/src/config/tests.rs` pins both halves in both shapes: strict mode accepts the snake and the camel spelling, `serde_json::to_value(&cfg)` carries the field exactly when the feature is compiled in, and a feature-off load instead records the key as accepted-but-unhonoured (the run path warns about it; the key stays accepted). **No runtime behaviour changed.**
 - **`docs/config.md` no longer advertises four camelCase client TLS aliases that
   no loader accepts.** The four client rows named `tlsEnable`, `tlsCertFile`,
   `tlsKeyFile` and `tlsCaFile` / `tlsTrustedCaFile` in their "Go frp Equivalent"

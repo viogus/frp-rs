@@ -6,6 +6,28 @@ fn known_set_from(keys: &[&'static str]) -> std::collections::HashSet<&'static s
     set
 }
 
+/// The strict-mode acceptance set for a **server** config.
+///
+/// One divergence here is deliberate and recorded rather than fixed:
+/// `"kcp_bind_port"` / `"quic_bind_port"` / `"websocket_port"` and their camel
+/// spellings stay in this set in **every** build shape, while
+/// `frp-core/src/config/server.rs` gates the matching serde field on the
+/// `kcp`/`quic`/`websocket` feature. `--strict-config` therefore accepts a key a
+/// `micro`/`tiny` build cannot honour, and that build then ignores it (the run
+/// path warns about it; the key stays accepted). Rejecting it would be the
+/// "false 400" direction `docs/deployment.md` rules out, and the repo's own
+/// `frps.toml` writes `kcp_bind_port = 17000` + `quic_bind_port = 17001`, so
+/// rejection would stop every such build from loading the documented example.
+///
+/// Both shapes are measured by the test
+/// `crate::config::tests::feature_gated_port_keys_are_accepted_while_the_compiled_field_set_follows_the_build`:
+/// strict mode accepts the snake and the camel spelling, and
+/// `serde_json::to_value(&cfg)` carries the field exactly when the feature is
+/// compiled in (a `--no-default-features` load omits the field instead and
+/// records the accepted-but-unhonoured key). The same divergence is recorded in
+/// `docs/config.md`'s `websocket_port` row. `known_client_keys()` has no
+/// counterpart to record: `frp-core/src/config/client.rs` carries no
+/// `#[cfg(feature = ...)]` at all.
 pub(super) fn known_server_keys() -> std::collections::HashSet<&'static str> {
     known_set_from(&[
         "bind_addr",

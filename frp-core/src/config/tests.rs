@@ -14519,3 +14519,86 @@ fn legacy_ini_server_side_dotted_and_reserved_roots_stay_v1_both_modes() {
         }
     }
 }
+
+// ─── The strict acceptance set vs the compiled serde field set (item 4) ──
+
+/// Whether `feature` — one of `FEATURE_GATED_SERVER_PORTS`' names — compiled the
+/// matching field into **this** build.
+///
+/// `cfg!` cannot take a runtime name, so the three arms are written out; the
+/// catch-all keeps a typo in the table from silently answering `false`.
+fn feature_gated_port_field_is_compiled_in(feature: &str) -> bool {
+    match feature {
+        "kcp" => cfg!(feature = "kcp"),
+        "quic" => cfg!(feature = "quic"),
+        "websocket" => cfg!(feature = "websocket"),
+        other => panic!("`{other}` is not a feature-gated server port"),
+    }
+}
+
+/// **The recorded divergence, measured in both build shapes.** `known_server_keys()`
+/// is a *static* allow-list that names all three feature-gated listener ports in every
+/// build (`frp-core/src/config/strict.rs`), while the serde field each spelling writes
+/// is `#[cfg(feature = "…")]`-gated (`frp-core/src/config/server.rs`), so strict mode
+/// accepts a key this build cannot honour and the server then ignores it.
+///
+/// That is deliberate, not an oversight. Refusing the key would be the "false 400"
+/// direction `docs/deployment.md` rules out, and the repo's own `frps.toml` writes
+/// `kcp_bind_port = 17000` + `quic_bind_port = 17001`, so rejection would stop every
+/// `micro`/`tiny` build from loading the documented example — the invariant
+/// `frp-core/src/config/strict.rs` records next to `subdomain_host`. There is no
+/// client-side counterpart to record: `frp-core/src/config/client.rs` carries no
+/// `#[cfg(feature …)]` at all, so `known_client_keys()` cannot go stale.
+///
+/// What this pin adds to the class pin above is the **compiled field set** half of the
+/// measurement: `serde_json::to_value(&cfg)` is the serde field set this build actually
+/// has, so it carries `kcp_bind_port` / `quic_bind_port` / `websocket_port` exactly when
+/// the feature is compiled in.
+///
+/// * compiled in — the snake *and* the camel spelling land in the field (`17500`); the
+///   unhonoured-record list is empty by construction, so there is nothing to assert;
+/// * compiled out — strict mode **still accepts** both spellings (the divergence), the
+///   field is absent from `to_value`, and the load records the accepted-but-unhonoured
+///   key once per load.
+///
+/// One function measures both shapes: the default lanes compile all three features in,
+/// `cargo test -p frp-core --no-default-features` compiles all three out.
+#[test]
+fn feature_gated_port_keys_are_accepted_while_the_compiled_field_set_follows_the_build() {
+    for (snake, camel, feature) in FEATURE_GATED_SERVER_PORTS {
+        let compiled_in = feature_gated_port_field_is_compiled_in(feature);
+        for spelling in [snake, camel] {
+            let body = format!("bind_port = 17000\n{spelling} = 17500\n");
+            let (cfg, presence) = load_server_with_presence(&body);
+            let value = serde_json::to_value(&cfg).unwrap();
+            let serialized = value.get(snake).and_then(|port| port.as_u64());
+            if compiled_in {
+                assert_eq!(
+                    serialized,
+                    Some(17500),
+                    "{snake}: `{spelling}` must land in the field this build compiles in"
+                );
+                // No unhonoured-record assertion in this shape: every push into
+                // `unhonoured_server_feature_key_records()` is `#[cfg(not(feature = "…"))]`-gated
+                // (`frp-core/src/config/loader.rs:982-993`), so a build that honours this port
+                // compiles out the only push that could name `snake`; the assertion that used to
+                // sit here was structurally vacuous and could never fail, so it is replaced by
+                // this note. The feature-off half below still asserts the accepted-but-unhonoured
+                // record, which is the half that can actually go red.
+            } else {
+                assert!(
+                    serialized.is_none(),
+                    "{snake}: strict mode accepts `{spelling}` but this build compiles no field \
+                     for it, so the serde field set must not carry it"
+                );
+                assert!(
+                    presence
+                        .unhonoured_server_feature_key_records()
+                        .iter()
+                        .any(|record| record.contains(snake)),
+                    "{snake}: the accepted-but-unhonoured key must be recorded once per load"
+                );
+            }
+        }
+    }
+}
