@@ -66,6 +66,7 @@ which is read-only and never fails a build:
 ```bash
 bash scripts/large-functions.sh          # per-file production LOC + top 12 functions
 bash scripts/large-functions.sh --top 25
+bash scripts/large-functions.sh --all    # every classified file, test modules shown at 0
 ```
 
 Every number in this document comes from that script, and the script is
@@ -240,10 +241,12 @@ file measured 8054 lines (not 8044); it split into
 `tcp_auto_bind_retry_tests.rs` (430) — production lines 3610, i.e. the row above
 was re-measured and the stale `8044 / 4432 / 3612` corrected to
 `8054 / 4444 / 3610`. The same PR then landed seams 1 and 2, taking `mod.rs` to
-3049 lines (3040 production, same boundary). Caveat: `scripts/large-functions.sh` treats the
-sibling test files as production now that they are ordinary `.rs` files, so read
-`frp-server/src/control/proxy_ops/` as a whole rather than trusting its per-file
-table.
+3049 lines (3040 production, same boundary). Caveat at the time: `scripts/large-functions.sh`
+treated the sibling test files as production once they were ordinary `.rs` files, so
+`frp-server/src/control/proxy_ops/` had to be read as a whole rather than trusted per-file. That
+is fixed now — the script classifies a whole-file test module (`tests.rs`, `*_tests.rs`,
+`*_test.rs`, anything under a `tests/` directory) and a `#[cfg(test)] mod X;` sibling as test, and
+charges the parent only for the declaration lines.
 
 Two things make it more than cosmetic:
 

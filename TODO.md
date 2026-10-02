@@ -7056,7 +7056,7 @@ nothing about whether the described behaviour still holds.
   Ledger after this round: **21 open / 192 closed** (base `470a0cde`: 20 open / 192 closed — the round
   files the item below).
 
-- [ ] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
+- [x] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
   Evidence: the test-module filter at `scripts/large-functions.sh:155` excludes only a file named
   exactly `tests.rs` or one under a `tests/` directory, so three of the modules this refactor just
   created — `frp-server/src/ssh_gateway/key_tests.rs`, `virtual_ctrl_tests.rs`, `preauth_tests.rs` —
@@ -7090,6 +7090,75 @@ nothing about whether the described behaviour still holds.
   literal-VALUE multiset unchanged apart from one added `#[path]` value that keeps
   `subdomain_conflict_tests`' module path — and its 11 test names (12 `fn`s, one a helper) — intact. The plan's
   `8044 / 4432 / 3612` proved stale: re-measured 8054 / 4444 / 3610, and seams 3–8 re-anchored.
+
+  **Done (2026-10-02, code head `c2f63985` on `fix/large-functions-test-modules`, PR #459).** Two
+  blind spots closed in `scripts/large-functions.sh`. (1) The whole-file test-module filter
+  (`name == 'tests.rs'` or a `tests/` path component) is now `is_test_file()`: `*_tests.rs` and
+  `*_test.rs` join `tests.rs`, and the old predicate is a strict subset of the new one, so the
+  `tests.rs` / `tests/` behaviour is preserved. (2) `test_blocks()` now also returns every
+  out-of-line `#[cfg(test)] mod X;` as an out-of-line declaration: its region is the attribute
+  plus the declaration line — it is **not** brace-matched into the production code below — and the
+  sibling file it pulls in (`X.rs` beside the parent, `<parent stem>/X.rs`, and the
+  `#[path = "…"]` target) is resolved and classified as test. `pub(crate)`/`pub(super)` on the
+  declaration is recognised, which the old `MOD_LINE` (bare `pub` only) missed. `--all` is
+  additive: the default table's columns and both section headers are unchanged, and the
+  "Largest production functions" section is **byte-identical**; without `--all` a 0-production row
+  sorts below the top-14 cut and cannot be shown reading 0. Measured on this tree, before —
+  `git show origin/main:scripts/large-functions.sh | sed 's/per_file\[:14\]/per_file[:]/' > scripts/.lf-base-all.sh && bash scripts/.lf-base-all.sh`
+  (a scratch copy with only the listing widened; the file is deleted again) — and after —
+  `bash scripts/large-functions.sh --all` (production / total / test):
+  `frp-server/src/ssh_gateway.rs` **2726 / 2750 / 24 → 2742 / 2750 / 8** (its pre-move 2742
+  production restored); `frp-server/src/ssh_gateway/key_tests.rs` **77 → 0**,
+  `virtual_ctrl_tests.rs` **140 → 0**, `preauth_tests.rs` **104 → 0** production (each now
+  `0 / total / total`). The same fix corrects the other file-ified modules the item did not name:
+  `frp-server/src/control/proxy_ops/unregister_generation_tests.rs` 3791 → 0,
+  `tcp_auto_bind_retry_tests.rs` 431 → 0, `validate/subdomain_conflict_tests.rs` 156 → 0,
+  `frp-client/src/plugin/test_support.rs` 175 → 0, plus `frp-server/src/control/bridge.rs`
+  3322 → 3323, `frp-server/src/vhost.rs` 3177 → 3178 and `frp-core/src/config/mod.rs` 24 → 25
+  (a `mod tests;` at end of file: the old brace scan ran to EOF and charged the trailing empty
+  element `split('\n')` produces to tests), `frp-server/src/control/proxy_ops/mod.rs` 3040 → 3043
+  (the `pub(crate)` declaration was not matched, so its region ran on to the next declaration and
+  charged three extra lines to tests), and `frp-client/src/plugin/mod.rs` 2212 → 2237
+  (`#[cfg(test)] mod test_support;` charged 25 lines of the following production code to tests).
+  New [`scripts/tests/large-functions-classifier.sh`](scripts/tests/large-functions-classifier.sh):
+  27 self-contained checks over a throwaway fixture tree — both name patterns (declared and
+  undeclared), a declared sibling with no test-ish name, `mod.rs`, `#[path]`, `tests/`, a
+  `testsuite/` decoy and a plain-`mod` production sibling — plus three script mutations that must
+  red it (name pattern removed, sibling attribution removed, out-of-line declaration
+  brace-matched); against the base script the suite reds 16 checks. It has no `ci.yml` step (that
+  file is owned by PR #458 this round) — the missing wiring is the one thing left open here.
+  **Not fixed in this round** (same `test_blocks()` forward scan, different mechanism — it is not
+  file-ification, so it is filed as the new item below rather than bundled): a `#[cfg(test)]` on a
+  non-`mod` item (`use` / `const` / `static` / `fn`) is still attached to the next `mod` anywhere
+  below, so `frp-core/src/bridge.rs` reads 4 production / 2961 test.
+
+- [ ] **`scripts/large-functions.sh` attaches a `#[cfg(test)]` attribute to the next `mod`, not to the item it decorates.**
+  Evidence: `frp-core/src/bridge.rs:4` is `#[cfg(test)] use std::time::Duration;` and the next
+  `mod` is `mod tests {` at `frp-core/src/bridge.rs:1085`; `test_blocks()` scans forward from the
+  attribute to that line and brace-matches it, so the region becomes lines 4–2965 and the file
+  reads **4 production / 2965 total / 2961 test** (`bash scripts/large-functions.sh --all` at
+  `766ae978`). 23 `#[cfg(test)]` attributes in the four roots do not decorate a `mod` (measured;
+  e.g. `frp-core/src/auth.rs:252`, `frp-core/src/auth.rs:2830`,
+  `frp-core/src/transport/tls.rs:685`, `frp-client/src/plugin/http2http.rs:13`); a prototype that
+  attaches each region to its own item — `mod` / `fn` / `impl` / `thread_local!` brace-matched,
+  `use` / `const` / `static` ended at their `;`, with the same comment/string/lifetime skipper
+  `fn_body_end` uses — reads `frp-core/src/bridge.rs` at 1082 production / 1883 test and moves
+  `frp-server/src/dashboard.rs` 2937 → 3114, `frp-core/src/auth.rs` 494 → 2099,
+  `frp-client/src/plugin/static_file.rs` 914 → 1743, `frp-client/src/plugin/h2.rs` 872 → 1343,
+  `frp-core/src/v2_handshake.rs` 798 → 1366, `frp-core/src/transport/tls.rs` 591 → 1001,
+  `frp-core/src/kcp/session.rs` 312 → 907, `frp-core/src/encryption.rs` 592 → 698,
+  `frp-vnet/src/router.rs` 117 → 395, `frp-client/src/plugin/socks5.rs` 233 → 317,
+  `frp-client/src/plugin/http2http.rs` 13 → 104 and `frp-core/src/msg.rs` 987 → 1135 production.
+  The inverse direction exists too: a `#[cfg(test)] mod X { … }` region is closed by the naive
+  brace counter, not by `fn_body_end`'s string/comment-aware one, so `frp-core/src/logging.rs`
+  reads 737 production / 271 test where the careful scan reads 689 / 319. And
+  `#[cfg(all(test, feature = "…"))]` (10 sites in the four roots) is not recognised as a test
+  attribute at all, so those regions count as production.
+  **Done-when:** a `#[cfg(test)]` region ends at the item it decorates, the region's brace scan is
+  the careful one, and `#[cfg(all(test, …))]` is recognised — shown by before/after `--all` runs
+  in which `frp-core/src/bridge.rs` reads 1082 production and `frp-core/src/logging.rs` reads 689,
+  with the name-pattern and `mod X;`-sibling behaviour preserved and
+  `scripts/tests/large-functions-classifier.sh` extended rather than weakened.
 
 - [x] **Three vendored crates are a standing maintenance liability.**
   Evidence: `vendor/rustls` (TLS, patched), `vendor/yamux` (5 patches),
