@@ -7087,8 +7087,8 @@ nothing about whether the described behaviour still holds.
   a unit test red → green, an in-process e2e, a real `frps` + `frpc` round trip) and returned
   `MERGE-with-findings` on the two load-bearing claims that were wrong; both were fixed, along with
   a second round's precision notes, and the delta validator's final verdict at the head is
-  **MERGE** (no blocking finding). Ledger after this close: **20 open / 193 closed** (base
-  `612f7df1`: 21 open / 192 closed), both pairs counted with `grep -cE '^- \[ \]' TODO.md`
+  **MERGE** (no blocking finding). Ledger after this close: **20 open / 196 closed** (base
+  `e00ddad0` after the #435 merge: 20 open / 193 closed; the earlier base `612f7df1` was 21 open / 192 closed), both pairs counted with `grep -cE '^- \[ \]' TODO.md`
   and `grep -cE '^- \[x\]' TODO.md`. A `CHANGELOG.md` `### Docs` bullet and a
   `docs/history/development-log.md` row record it.
 
