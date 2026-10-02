@@ -10011,7 +10011,7 @@ section; ledger now **24 open / 104 closed**.**
   **15 open / 186 closed** (base `e4c23b2f`: 16 open / 185 closed).
 
 - [x] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
-  Filed by the coordinator while closing `TODO.md:8533` (PR #430), which removed the two local `pkill -f`
+  Filed by the coordinator while closing `TODO.md:8577` (PR #430), which removed the two local `pkill -f`
   **Done-when:** the remote helper reaps by exact pid (a pid file written where it starts the server, or a
   port-scoped lookup) instead of `pkill -f`/`pgrep -f`, or the pattern kill is recorded as required with the
   measurement that shows a pid route is impossible over that ssh path.
@@ -10226,7 +10226,7 @@ section; ledger now **24 open / 104 closed**.**
   avoids, and `strict_config` defaults to true (`frp-core/src/cli.rs:139`) while the repo's own documented
   `frps.toml:21-23` writes non-zero `kcp_bind_port`/`quic_bind_port`, so rejecting would make `frps -c frps.toml`
   refuse to start in every micro/tiny build and break the `known_server_keys()` invariant at
-  `frp-core/src/config/strict.rs:123-127`. `frps verify` stays silent, exactly like the `tls_enable` diagnostic — a residue the reviewers filed as `TODO.md:9293`.
+  `frp-core/src/config/strict.rs:123-127`. `frps verify` stays silent, exactly like the `tls_enable` diagnostic — a residue the reviewers filed as `TODO.md:9337`.
   Both directions are pinned in `frp-core/src/config/tests.rs:290-580`: three `#[cfg(feature = "…")]`
   `…_enabled_honours_the_port` tests (default lane, `5 passed`), six `#[cfg(not(feature = "…"))]`
   `…_disabled_reports_the_dropped_port` / `…_disabled_is_silent_for_zero_or_absent` tests over both spellings ×
@@ -10699,6 +10699,10 @@ section; ledger now **24 open / 104 closed**.**
   `` `bindPort` `` to `` `quicBindPort` `` — both real Go v0.71.0 keys, both in `GO` — leaves the suite green (exit 0,
   `RESULT: 204 fixture check(s) hold`), while `` `kcpPort` `` (not a Go v0.71.0 spelling) reds with exit 1. The gate proves each cell
   is *a* Go spelling, not that it is *the* Go spelling for that row.
+
+**Cross-reference:** the Done-when branch below that records per row why membership is all that is asserted would also settle
+residue item 2 above (the 41 alias entries' prose reasons), so whichever of the two lands first should close or narrow the
+other.
 
   **Done-when:** each row's Go cell is checked against an expected path for that row, so swapping in a real-but-wrong Go key reds;
   or the column records per row why membership is all that is being asserted.
