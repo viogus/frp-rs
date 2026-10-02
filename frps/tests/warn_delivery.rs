@@ -229,12 +229,13 @@ fn capture_floor(warning: bool, web: bool) -> usize {
 }
 
 /// [`boot_records_with_dashboard`] for the `--config-dir` startup path, which
-/// has **one record fewer** under `--all-features`: `main.rs` returns from the
-/// config-directory branch before the SIGUSR1/SIGUSR2 handlers are installed
-/// (`frps/src/main.rs`, the `return` at the end of the `cli.config_dir` arm), so
-/// the `profiling` feature's `SIGUSR2 profiling ready (pid=…)` record is never
-/// emitted on this path. Measured: 11 records for this shape under
-/// `--all-features` versus 12 for the same shape on `-c`.
+/// has **one record fewer** under `--all-features`: the config-directory branch
+/// in `frps/src/main.rs` runs its services under its **own** SIGUSR1 handler —
+/// it does emit `SIGUSR1 reload ready` — but it returns before the shared
+/// `-c`-path block installs the SIGUSR2 task, so the `profiling` feature's
+/// `SIGUSR2 profiling ready (pid=…)` record is the one this path never emits.
+/// Measured: 11 records for this shape under `--all-features` versus 12 for the
+/// same shape on `-c`.
 fn boot_records_with_dashboard_config_dir() -> usize {
     BOOT_RECORDS_BASE + DASHBOARD_EXTRA
 }
@@ -543,12 +544,15 @@ impl Spawned {
     /// spawned task and could land after a fixed deadline, so the same shape
     /// sometimes had one record more than its pin.
     ///
-    /// A capture that never reaches the floor is frozen anyway; the assertion
-    /// that wanted the missing records then reds with the real count, rather
-    /// than this wait hanging.
+    /// A floor that is never reached is a **mis-specified floor**, not a slow
+    /// child, and it is fatal: exiting here on the deadline would silently turn
+    /// the row's window into the 15 s deadline — the capture would still freeze,
+    /// but no longer at convergence — which is exactly the silent widening the
+    /// review found at three call sites. The panic names the floor, the count
+    /// and `capture_floor`, so the fix is mechanical.
     fn wait_for_capture_convergence(&mut self) {
         if self.boot_floor == 0 {
-            // The panic-hook shape reads both streams live; nothing to poll for.
+            // The live-read shape declares "no floor": settle, do not poll.
             std::thread::sleep(SETTLE);
             return;
         }
@@ -566,7 +570,15 @@ impl Spawned {
                 return;
             }
             if Instant::now() >= deadline {
-                return;
+                panic!(
+                    "the capture never reached its floor: {} record(s) after {READY_TIMEOUT:?}, \
+                     floor {} — `capture_floor(...)` at this row's `Spawned::run` names a shape \
+                     this config does not produce. Fix the floor; do not widen the window.\n\
+                     --- stdout ---\n{}",
+                    count,
+                    self.boot_floor,
+                    self.peek_stdout()
+                );
             }
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -1217,7 +1229,7 @@ fn first_record_start(clean: &str) -> Option<usize> {
 /// snapshot: a record emitted **after** `Spawned::run` froze the buffers is not
 /// in the capture at all. Both limits are pinned by the tests named in
 /// `frps/tests/warn_delivery.rs::mod record_count_tests` and by
-/// `late_records_after_the_snapshot_are_invisible`.
+/// `records_emitted_after_the_snapshot_never_reach_the_capture`.
 fn assert_records_are_exactly_the_message(
     tag: &str,
     out: &str,
@@ -1955,7 +1967,7 @@ fn no_warning_for_a_config_without_the_key() {
     let spawned = Spawned::run(
         &dir,
         &["-c", path.to_str().unwrap()],
-        capture_floor(true, false),
+        capture_floor(false, false),
     );
     // This config writes `[web_server]`, so a dashboard build logs its three
     // records; the shape has no warning at all.
@@ -2083,7 +2095,7 @@ fn server_tls_enable_warning_reaches_a_dash_c_user_for_a_written_false() {
     let spawned = Spawned::run(
         &dir,
         &["-c", path.to_str().unwrap()],
-        capture_floor(true, true),
+        capture_floor(true, false),
     );
     assert_one_server_tls_enable_warning(
         "frps -c (tls_enable = false)",
@@ -2103,7 +2115,7 @@ fn no_server_tls_enable_warning_when_it_was_synthesized_from_transport_tls() {
     let spawned = Spawned::run(
         &dir,
         &["-c", path.to_str().unwrap()],
-        capture_floor(true, true),
+        capture_floor(false, false),
     );
     assert_no_warning_for("frps -c (synthesized)", &spawned, SERVER_KEY);
     assert_eq!(
@@ -2131,7 +2143,7 @@ fn a_sigusr1_reload_delivers_the_server_tls_enable_warning_again() {
     let mut spawned = Spawned::run(
         &dir,
         &["-c", path.to_str().unwrap()],
-        capture_floor(true, true),
+        capture_floor(true, false),
     );
     assert_eq!(
         occurrences(&spawned.stdout(), SERVER_KEY),
