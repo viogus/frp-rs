@@ -112,7 +112,7 @@ jobs:
         # `exec true` planted after the trap never runs it and exits 0 with no
         # output at all. So the total is pinned *outside*: this step requires the
         # suite's summary line verbatim, and 32 is what the scenarios in
-        # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:8587` round
+        # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:8588` round
         # added the in-file floor; a scenario added or removed there moves this
         # literal — restore the checks rather than lowering it). In-file,
         # `enforce_substance` also checksums the scenario-6 metric check and the
@@ -161,7 +161,7 @@ jobs:
           log=/tmp/frp-repo-health-fixtures.log
           status=0
           guard_file=scripts/tests/repo-health-fixtures.sh
-          guard_pin=c2d0f5889e24d1d47102886ded64563ed8084f49859813c2682f996b2fe0f8c6
+          guard_pin=76622649863d1d2b3591727c190330a0461c47c417faa240f6a8f96e042519ed
           # R12-2 (adversarial round 13): resolve the hasher to an absolute path
           # and prove it with a known vector — the same candidate order and the
           # same fail-closed mode as the guard's own `find_hash_tool()`.
@@ -320,7 +320,7 @@ jobs:
         # *outside*, the way the `log_completion` step below pins its own 6: this
         # step requires the suite's summary line verbatim, and 40 is what the
         # scenarios in scripts/tests/compat-stray-guard.sh print (21 before the
-        # `TODO.md:8622` round added the ordered `SHAPE` anchors, the symlink
+        # `TODO.md:8623` round added the ordered `SHAPE` anchors, the symlink
         # `wait_exec` probe, the empty-`ps` branch and the failed-probe
         # kill-then-continue case; 31 after the round-2 pins exercised the loop's
         # empty-`cmd` guard, the exit-0-empty reap arm, and the second half of the
@@ -403,7 +403,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=63ef9805f77a1aeb33d964df65d5bd604d99ccbe4cbc6cacb27b91a975b4f8b8
+          guard_pin=a7a502e47670dc88574d7a9ecf8f7bdc17f8602d85c1b794222f432755924e5a
           # R12-1 (adversarial round 13): the enforcer's *implementation* lives in
           # the library the scenarios `source` (the `LIB=` assignment at :96 only
           # names it), so pinning only the suite left the "two-file change" claim
@@ -870,7 +870,7 @@ jobs:
       # `cargo test -p frps --test cli_exit_codes -- --list`.
       # 44 → 45 with the `-l`-shorthand refusal pin
       # `short_l_is_not_a_frps_shorthand_and_the_refusal_is_pinned`
-      # (`TODO.md:9317`): +1. Re-derived with the same `--list` command.
+      # (`TODO.md:9318`): +1. Re-derived with the same `--list` command.
       FRPS_CLI_TESTS: "45"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
@@ -1705,7 +1705,7 @@ jobs:
         # `--log-max-days 0`, both arbited by Go's `-c` lane — see the file's own
         # section comments), and 9 → 10 with the `-c`-lane non-empty-flag pin
         # `cli_nonempty_log_level_flag_does_not_override_the_config_file`
-        # (`TODO.md:9258`). It is the count of `#[test]`s in that one file, and
+        # (`TODO.md:9259`). It is the count of `#[test]`s in that one file, and
         # it lives in exactly one place in this step — the `expected=` line — so
         # a new pin means editing one number, not hunting a duplicated one.
         #

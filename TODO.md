@@ -6044,10 +6044,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `docs/refactor-large-modules.md` and everything under `docs/history/`, `docs/archive/` and `docs/audit/`,
   which keep their era's numbering. **Before: 82 `TODO.md:<n>` occurrences across 23 live files; 26
   occurrences on 25 cite lines did not land on a header** — 24 were stale numbers that resolved onto
-  mid-item prose or a blank line (including six pointing at a *different* item: `ci.yml`'s `8550`→`8587` and
-  `8582`→`8622`, the guards' `8470`/`8627`→`8483`/`8637`, `docs/developing.md`'s `2226`→`4506` and
+  mid-item prose or a blank line (including six pointing at a *different* item: `ci.yml`'s `8550`→`8588` and
+  `8582`→`8623`, the guards' `8470`/`8627`→`8484`/`8638`, `docs/developing.md`'s `2226`→`4506` and
   `2619`→`4710`), one (`frp-core/src/config/tests.rs:733`) named the wrong item outright (`8169`, a typeless
-  `.ini` visitor line, for the `--vhost-http-timeout` `int64` item at `8234`), and two were title-form cites
+  `.ini` visitor line, for the `--vhost-http-timeout` `int64` item at `8235`), and two were title-form cites
   (`TODO.md: "…"`) that now carry their item's header number. Each was repointed by locating the item its
   citing sentence names and reading the header line back — never a uniform offset; **56 occurrences on 56
   cite lines were already correct and were left byte-identical.** No cite was left intentionally pointing at
@@ -6071,9 +6071,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   digests pinned, so weakening the gate's scan is a two-file change a reviewer sees.
   **Pins bumped** (both forced by this round's edits and both proved by the suites above): `guard_pin` for
   `scripts/tests/repo-health-fixtures.sh` at `.github/workflows/ci.yml:164`
-  (`e6d23d74…`→`c2d0f588…`) and for `scripts/tests/compat-stray-guard.sh` at `:406`
-  (`4db720d6…`→`63ef9805…`); the stray guard's own `SCEN10_REGION_SHA` was also re-derived
-  (`976317f2…`→`eaab2fe9…`) because three of the repointed cites sit inside scenario-10's
+  (`e6d23d74…`→`76622649…`) and for `scripts/tests/compat-stray-guard.sh` at `:406`
+  (`4db720d6…`→`a7a502e4…`); the stray guard's own `SCEN10_REGION_SHA` was also re-derived
+  (`976317f2…`→`c10e98c7…`) because three of the repointed cites sit inside scenario-10's
   substance-pinned region. No `CHANGELOG.md` bullet: nothing
   user-visible changes — the edits are comments, doc prose, test comments and a gate — and this repo's
   changelog records behaviour, not comment bookkeeping.
@@ -6081,9 +6081,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `RESULT: invariants hold`; `bash scripts/tests/repo-health-fixtures.sh` → `RESULT: 32 fixture check(s)
   hold`; `bash scripts/tests/compat-stray-guard.sh` → `RESULT: 40 fixture check(s) hold`; the new gate green
   (`RESULT: 84 cite(s) checked, 0 violation(s)`) and its fixture suite green with its canaries red;
-  `git diff --check` rc 0. Ledger at this head: **20 open / 196 closed** — unchanged, because this round
-  closes an already-open item rather than filing or closing a new one (before: 20 open / 196 closed, counted
-  with `grep -cE '^- \[ \]' TODO.md` and `grep -cE '^- \[x\]' TODO.md`).
+  `git diff --check` rc 0. Ledger at this head: **19 open / 197 closed** — this round closes an already-open item and files no new
+  one, so its own change is 0; the pair moved from the session base's **20 open / 196 closed** with PR
+  #457's close. Both pairs counted with `grep -cE '^- \[ \]' TODO.md` and
+  `grep -cE '^- \[x\]' TODO.md`.
 
 
 ## P1 — documentation correctness
