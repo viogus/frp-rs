@@ -1297,6 +1297,23 @@ User-facing release notes for frp-rs.
   `ps` can no longer forgive a live synthetic, a symlinked invocation can no longer defeat `wait_exec`, an empty
   `ps` is an error rather than "the image changed", and the total is supplemented by an ordered per-scenario shape
   assertion.
+- **Every count guard in `ci.yml` asserts an absolute floor now, and two fixture lanes that ran nowhere run and
+  count.** The CLI-lane and `health`-fixture count literals were `=`-only, so deleting a test and lowering the
+  matching literal stayed green; each now carries a `*_FLOOR` twin (or a `guard_exact`/`guard_floor` pair) that a
+  removal has to move deliberately, and keeps the exact count *plus* the run's own `N passed; 0 failed` summary —
+  plus a `Running …` witness per target on the lanes where a target can silently compile to zero tests. The full
+  `cargo test -p frpc` lane, which counted nothing before, now pins 111 tests across its nine targets;
+  `scripts/tests/large-functions-classifier.sh` (42 checks) and `scripts/tests/remote-frps-reap.sh` (37) gained
+  pinned `health` steps, and `frp-server`'s `vhost::tests` (61) gained a count guard in the server job. The
+  release-profile job gained a second target, `frps/tests/warn_delivery.rs`, which immediately found two tests
+  that cannot pass in release (they drive `debug_assertions`-only hooks); they now carry the same
+  `cfg_attr(not(debug_assertions), ignore = "…")` shape as the `cli_exit_codes` pins, and the lane pins the
+  28-listed / 26-passed / 2-ignored shape by name. A cold `--release --workspace --all-targets` build measured
+  35m 55s at `-j 2` — over that job's 30-minute budget — so the decision to cover the pinned targets rather than
+  every target is recorded, with the measurement, in the workflow comment. The citation gate's expected count is now
+  declared once (`guard_cites` / `guard_cites_floor`) instead of three copies that had gone stale — three copies of
+  `84` left `health` red while the gate checked 87 — and the release `cli_exit_codes` lane gained the last missing
+  floor, so every count guard in the file now asserts an absolute floor beside its exact count.
 
 ## v0.71.0 — re-release (2026-09-13)
 

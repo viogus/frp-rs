@@ -7208,7 +7208,7 @@ nothing about whether the described behaviour still holds.
   `scripts/tests/large-functions-classifier.sh` extended rather than weakened; each of the four
   precision bounds above is closed or shown unreachable in-tree.
 
-- [ ] **`scripts/tests/large-functions-classifier.sh` runs in no gate.**
+- [x] **`scripts/tests/large-functions-classifier.sh` runs in no gate.**
   Evidence: the `health` job names its fixture suites explicitly — `scripts/tests/repo-health-fixtures.sh`,
   `scripts/tests/compat-stray-guard.sh` and `scripts/tests/rss-soak-run-dir.sh` each have their own step in
   `.github/workflows/ci.yml` — so a new suite under `scripts/tests/` is never executed. PR #459 added this
@@ -7216,6 +7216,20 @@ nothing about whether the described behaviour still holds.
   **Done-when:** the `health` job runs `bash scripts/tests/large-functions-classifier.sh` and asserts its
   `RESULT: <n> fixture check(s) hold` line (with the floor and pinned-region style the two guarded
   suites use), so the suite that keeps the classifier honest is itself kept honest.
+  Done (2026-10-02, this batch). `health` now has a `Large-functions classifier — fixture checks`
+  step: it sha256-pins `scripts/tests/large-functions-classifier.sh` (`489e6950…b1245`), runs it
+  to `/tmp/frp-large-functions-classifier.log`, counts the `  ok` and `FAIL` lines, requires one
+  canary from the suite's own mutation scenarios (`M1 (name pattern removed)`), and asserts
+  `RESULT: 42 fixture check(s) hold` through `guard_exact` with `guard_exact -ge guard_floor`
+  (42 and 42) and `guard_fail = 0`. The in-file `MIN_CHECKS=42` trap is kept but is not what the
+  step relies on — the out-of-file literal is the pin a mutant has to move. Green: rc 0, 42 ok,
+  0 FAIL, 0.64 s warm (macOS arm64). Mutants, all rc 1: the script replaced by `exit 0` with the
+  pin updated ("did not report 42 checks" plus the missing canary); the same replacement with the
+  pin left alone ("is not the pinned revision, sha256 …"); and one check deleted with the digest
+  recomputed and `guard_exact` lowered to 41 while `guard_floor` stayed 42 (the floor alone
+  reds). Commands: `bash scripts/tests/large-functions-classifier.sh`, then the step body as
+  extracted from `.github/workflows/ci.yml` (`bash -n` clean, `shellcheck -S warning` reports only
+  SC2148 for the missing shebang — the same single finding the pre-existing steps produce).
 
 - [x] **Three vendored crates are a standing maintenance liability.**
   Evidence: `vendor/rustls` (TLS, patched), `vendor/yamux` (5 patches),
@@ -8814,7 +8828,7 @@ section; ledger now **24 open / 104 closed**.**
   so a future narrowing of the pin cannot silently become an exact-equality check. (c) is untouched
   here and moved to the item below.
 
-- [ ] **The CLI-lane count guards in `.github/workflows/ci.yml` compare for equality, so a deleted test plus a lowered literal passes; the full `frpc` lane has no count guard at all.**
+- [x] **The CLI-lane count guards in `.github/workflows/ci.yml` compare for equality, so a deleted test plus a lowered literal passes; the full `frpc` lane has no count guard at all.**
   Filed by the coordinator when closing the `--allow-unsafe` accumulation item (its clause (c)).
   `FRPS_CLI_TESTS` (`.github/workflows/ci.yml:243`) and `FRPC_TINY_CLI_TESTS` (`:315`) hold the lane's
   expected test count and are compared for **equality** (`[ "$n" = "$FRPS_CLI_TESTS" ]`, `:567`) in
@@ -8828,6 +8842,62 @@ section; ledger now **24 open / 104 closed**.**
   `.github/workflows/ci.yml` in two places — the count literals in the `tests-unit` job (`:136`) and the
   compat-stray-guard literals in the `health` job (`:97`) — so it should land after PRs #424/#430, which
   also touch that file, to avoid a literal conflict.
+  Done (2026-10-02, this batch). All **21** count-guard lanes in
+  `.github/workflows/ci.yml` now assert an absolute floor beside their equality check (the release
+  `cli_exit_codes` lane was the last one without one), the citation gate's own expected count is
+  declared once as `guard_cites` / `guard_cites_floor` instead of the three copies that went stale at
+  `84` and left `health` red in this PR's first head, and the full
+  `frpc` lane — previously `run: cargo test -p frpc` and counting nothing — has a guard. Measured over
+  the parsed YAML: **28** steps carry a `-ge "$…` floor assertion, **30** assertion lines.
+  Job-level lanes: `FRPS_CLI_TESTS`, `FRPC_TINY_CLI_TESTS` and `FRPC_ADMIN_CLI_INPUTS_TESTS` each
+  gained a `*_FLOOR` twin (45, 24 and 34, equal at rest) which the step validates as an integer and
+  asserts with `[ "$VAR" -ge "${VAR}_FLOOR" ]`; `FRPC_CLI_TESTS` / `FRPC_CLI_TESTS_FLOOR`
+  (111/111) guards the full `frpc` package by requiring a `Running …` witness for each of its nine
+  targets, the `-- --list` count *and* the sum of the per-target `test result: ok. N passed`
+  summaries to equal the literal, and the literal to sit at or above the floor. Measured
+  decomposition: 8 `--bin frpc` + 25 `admin_cli` + 23 `cli_exit_codes` + 34 `cli_inputs` +
+  7 `cli_persistent_flags` + 2 `legacy_ini_fixture` + 1 `log_completion` + 11 `warn_delivery`
+  (+0 `admin_config_get_warning`, which compiles to no tests in this feature set) = 111; green:
+  rc 0, `frpc CLI-lane guard ok: 111 tests listed and 111 executed across 9 targets (expected 111),
+  0 failed`, 6.58 s warm. `health` fixture steps: `guard_exact` / `guard_floor` on repo-health 32,
+  compat-stray-guard 40, RSS-soak 269, large-functions-classifier 42, remote-frps-reap 37, and the
+  citation-gate fixtures 60 plus their 11 canaries. The fourteen per-target eyewitness steps each
+  gained `n_floor` 1/1/21/8/6/28/28/11/11/1 with `[ "$n" -ge "$n_floor" ]` (frps bin unit tests,
+  the `web_server.tls.enable` resolver, the help-document pins, the two `tls_enable` warning pins,
+  the four warning-delivery lanes, the admin-without-TLS lane), `expected_floor` 1/11/2 beside
+  `expected` (frpc log-completion, frps log-completion, the websocket_port e2e) and `want_floor` 5
+  for the admin config-GET lane; the vhost `:tests` lane (61) uses the same
+  `expected` / `expected_floor` pair, and the release `warn_delivery` lane carries *two* floors
+  (`FRPS_RELEASE_WARN_DELIVERY_TESTS` / `_FLOOR` 28 and `_PASSED_FLOOR` 26, the listed and the
+  executed count) plus a pinned ignored set. The delete-plus-lower mutant
+  reds in every lane; proved with a stub `cargo` replaying real captured logs on the `frpc` lane
+  (literal 110 / floor 111 over logs with one test dropped → rc 1 "below the absolute floor"; one
+  target's summary zeroed → rc 1 "lists 111 tests but the run executed 109"; a whole target block
+  dropped → rc 1 on the missing `Running` witness; literal 110 alone over honest logs → rc 1 "move
+  env.FRPC_CLI_TESTS … from 110 to 111"; all summaries stripped → rc 1 "executed 0"; no env → rc 1
+  on the literal validation), on the `frps` lane (44/45 → only the floor row; 44/44 → rc 0) and on
+  the release warn_delivery lane (delete with literals unchanged → rc 1 on the summary and the
+  listed count; one literal lowered to 27 → rc 1 on *both* floors, 27 < 28 and 25 < 26;
+  two literals lowered plus the passed floor → rc 0; a test that quietly became `ignored` with the
+  pinned set unchanged → rc 1 on the summary and the sorted-set comparison; no env → rc 1). The only
+  edit that passes is the deliberate records bump, i.e. the
+  two-literal edit. Lesson recorded: the pins' comments had called the count "the single literal",
+  but a step body mentions its lane literal many times over — the full `frpc` body 27 times on 16 of
+  its 61 lines, the `frps` lane 26 times on 15 of 39 — so a later rename or floor move has to move
+  every occurrence together, while the only occurrence pair that must move *separately* is the floor
+  and its exact count. Review round 1 (2026-10-02): the first head `46c85dc6` left the `health` job
+  red, because the citation-gate step still pinned `84` in three places (the `RESULT:` pattern, the
+  failure diagnostic, the success echo) while the gate prints 87; the count is now declared once as
+  `guard_cites` / `guard_cites_floor`, and the step re-extracted from the YAML runs rc 0
+  (`TODO.md cross-file citation gate ok: 88 live cites checked, every one on an item header`), while
+  `guard_cites` `88`→`89` reds on the RESULT mismatch and `88`→`87`/`guard_cites_floor` `88`→`999` on
+  the floor diagnostic (all rc 1). The same audit extracted and executed every count-pinning step in the file:
+  the only other one without a floor was the release `cli_exit_codes` lane, which gained
+  `FRPS_RELEASE_CLI_TESTS_FLOOR` (stub-cargo mutants: test deleted with literals unchanged → rc 1;
+  deleted plus the listed literal lowered → rc 1 on the new floor; listed literal *and* floor lowered
+  → rc 0). Gates: every extracted step body (26 of them) `bash -n` clean with
+  `shellcheck -S warning` reporting only the pre-existing SC2148 (no shebang), and each ran green
+  from a warm checkout.
 
 - [x] **Rust frpc runs the `auth.tokenSource` `exec` command twice per successful login where Go runs it once.**
   **Done (2026-10-01, at fix `42245c7f` / oracle `a2e7546f` on `fix/tokensource-single-exec`, PR #437, based on `084f7865`; pre-rebase `663e1d38`/`98166cb5` on `799ce048`, `61236591`/`9f9cb110` on `ed2d71a3` and `b8a916a6` on `f503b4e7`, originally `801a75fb` on `a0c16c83`, the code patches `=` under `git range-diff` at each rebase, though the `ed2d71a3`-era restructure also folded a cite-fix commit (`6472ab21`) into the fix while the rebases themselves stayed patch-`=`; the commits that produced these records are `e98cc53b`, `0d5f2139` and `edf11e69` (TODO/CHANGELOG) and `5847aac6` (devlog), with the cites `6c76bf8f` and the r3 fixes `74f7084c`, the records reconcile `0d5f2139`, the cite repoint `edf11e69`, and the later records review fixes.)** The source was
@@ -9242,7 +9312,7 @@ section; ledger now **24 open / 104 closed**.**
   merge only once branch protection names "Tests (release profile)" (`:1249-1252`). Cold release build: 5m07s
   at `-j 2`, 9m51s under load, inside the 30-minute cap.
 
-- [ ] **Release-mode test coverage is this one file: no CI job builds or runs any other test target in the `release` profile.**
+- [x] **Release-mode test coverage is this one file: no CI job builds or runs any other test target in the `release` profile.**
   Filed by the coordinator while closing the release-profile lane item above. `release-tests`
   (`.github/workflows/ci.yml:1253-1345`) compiles and runs `frps/tests/cli_exit_codes.rs` and nothing else, so
   every other test target — `frp-core`'s config and CLI suites, `frps/tests/warn_delivery.rs`, `frpc/tests/*` —
@@ -9252,6 +9322,47 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** the workspace's `--release --all-targets` build plus at least one more release test target
   runs in CI with its own count guard, or the decision to cover exactly the pins that need it is recorded with
   the reasoning and the measurements.
+  Done (2026-10-02, this batch): the recorded-decision branch, plus a second guarded release
+  target. Every `debug_assertions` site in first-party code was enumerated: nine attribute sites
+  in `frp-core/src/kcp/stream.rs` (`:21`, `:24`, `:167`, `:169`, `:187`, `:209`, `:211`, `:389`,
+  `:391`), four in `frp-core/src/crypto.rs` (`:530`, `:535`, `:662`, `:664`),
+  `frp-server/src/service.rs:1860`, five in `frps/src/main.rs` (`:55`, `:264`, `:656`, `:733`,
+  `:777`), the two sabotage copies in `frp-core/tests/web_server_tls_enable_warning.rs:123` and
+  `frp-core/tests/server_tls_enable_warning.rs:455`, and three `cfg!(debug_assertions)`
+  binary-path picks that are not behaviour (`frp-server/tests/reload_integration.rs:47`,
+  `frp-server/tests/visitor_multi_sigterm.rs:80`, `frp-server/tests/common/mod.rs:632`). Rejected
+  with measurements: a cold
+  `cargo build --release --workspace --all-targets -j 2` under this job's own profile overrides
+  (`lto = false`, `opt-level = 2`, but `codegen-units = 1` and `panic = "abort"` from
+  `Cargo.toml`) finished in **35m 55s** (`/usr/bin/time -p`: `real 2155.26`, `user 4191.64`,
+  `sys 70.24`; macOS arm64, -j 2), i.e. more than this job's whole `timeout-minutes: 30`, and a
+  2-core runner would be slower — that budget would buy compile-level coverage of targets whose
+  release *behaviour* is identical, and the `build` job already compiles the release binaries that
+  ship. Instead the job gained a second guarded release target,
+  `cargo test --release -p frps --test warn_delivery`, which spawns the release `frps` binary
+  through `CARGO_BIN_EXE_frps` and reads its captured `tracing` output, so the shipped profile is
+  executed rather than only its CLI pins. That lane immediately found a real release-profile
+  failure: as first written it ran 26 passed / 2 failed, because
+  `a_config_dir_sigusr1_immediately_after_the_ready_marker_reloads_everything` and
+  `a_config_dir_sigusr1_does_not_count_a_panicking_service` drive the `debug_assertions`-only
+  `FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS` (`frps/src/main.rs:656`) and `FRPS_CFGDIR_TEST_PANIC`
+  (`frps/src/main.rs:777`) hooks, so in release the barrier is absent (the ready marker appeared
+  after 6.5 µs) and the deliberate panic never fires. Those two now carry
+  `#[cfg_attr(not(debug_assertions), ignore = "<the hook it needs>")]` — the same shape, and the
+  same `ignore`-not-`#[cfg]` reasoning, as the three `cli_exit_codes` pins this job already pins by
+  name — and the lane asserts the exact release shape (`test result: ok. 26 passed; 0 failed; 2
+  ignored;`), the two ignored names as a sorted set (`FRPS_RELEASE_WARN_DELIVERY_IGNORED`), the
+  listed count (28, `FRPS_RELEASE_WARN_DELIVERY_TESTS`) and the executed count (26,
+  `FRPS_RELEASE_WARN_DELIVERY_PASSED_FLOOR`), so its skip set cannot widen silently. Measured: rc 0,
+  `28 listed, 26 passed, 2 ignored …, 0 failed`, 6.5 s warm (1m 57s including the release build of
+  `frps`'s test targets). Mutants red: the target removed → rc 1 on the `Running` witness; one test
+  deleted with the literal left at 28 → rc 1 on the summary and "the listed count DECREASED"; one
+  literal lowered to 27 → rc 1 on both floors; a test that quietly became `ignored` with the pinned
+  set unchanged → rc 1 on the summary and the sorted-set comparison; only the deliberate
+  two-literal (plus passed-floor) records bump passes. The debug lanes are untouched by the
+  attribute: `not(debug_assertions)` is false there, so it expands to nothing, and both
+  `tests-unit` `warn_delivery` lanes still pin 28 listed / 28 passed. The decision and the 35m 55s
+  measurement are recorded in the `release-tests` rationale comment in `ci.yml`, not only here.
 
 - [x] **`frps/src/main.rs:332`'s re-pointed doc link names the wrong loader for the run path it describes.**
   Filed by the coordinator from PR #431's delta adversarial (F1). The link now resolves to
@@ -9280,12 +9391,23 @@ section; ledger now **24 open / 104 closed**.**
   `:1487`, `frps/tests/cli_completion.rs:508-510`) plus the standing note that no CI job runs `cargo doc`.
   Ledger after this close: **25 open / 161 closed** (base `6420d77a`: 26 open / 160 closed).
 
-- [ ] **The RSS-soak fixture step has no outer pins.** The `health` job runs
+- [x] **The RSS-soak fixture step has no outer pins.** The `health` job runs
   `bash scripts/tests/rss-soak-run-dir.sh` bare (`.github/workflows/ci.yml:135-136`), so a step whose
   script is replaced by `exit 0`, or whose checks are skipped, still passes; the `Stray guard` step
   above it wraps the same shape with a `RESULT:` literal and an error branch. Mirror that pattern.
   **Done-when:** the step asserts the script's `RESULT: 269 fixture check(s) hold` line in both
   directions (missing and failed) rather than only its exit code.
+  Done (2026-10-02, this batch). `RSS soak — run-dir guard + summary fixture` is a pinned guard
+  step now, not a bare run: it sha256-pins `scripts/tests/rss-soak-run-dir.sh`
+  (`b3f59320…86210`), runs it to `/tmp/frp-rss-soak-run-dir.log`, counts the `  ok` and `FAIL`
+  lines, and asserts the `RESULT: 269 fixture check(s) hold` line through `guard_exact` (269),
+  `guard_exact -ge guard_floor` (`guard_floor` also 269), `guard_ok = guard_exact` and
+  `guard_fail = 0`. Both directions red: a *missing* summary — the script replaced by `exit 0`
+  with the pin updated → rc 1 "did not report 269 checks", and the same replacement with the pin
+  left alone → rc 1 "is not the pinned revision" — and a *failed* check — one `ok` print
+  suppressed, the `RESULT` printf decremented and the digest recomputed,
+  `guard_exact 268` / `guard_floor 269` → rc 1 on the floor literal alone. Green: rc 0, 269 ok,
+  0 FAIL, 6.13 s warm (macOS arm64).
 
 - [x] **Stale "two fixture scripts" comment in the health job.** `.github/workflows/ci.yml:86-88`
   still says the job reads "files with grep/find only, plus two fixture scripts"; it now runs three
@@ -9793,7 +9915,7 @@ section; ledger now **24 open / 104 closed**.**
   Ledger after this close: **20 open / 192 closed** (base `346661eb`: 20 open / 191 closed; the close and the
   item filed below cancel out).
 
-- [ ] **A deleted test in `frp-server/src/vhost/tests.rs` leaves every suite green — no CI count guard covers `vhost::tests`.**
+- [x] **A deleted test in `frp-server/src/vhost/tests.rs` leaves every suite green — no CI count guard covers `vhost::tests`.**
   Filed by the coordinator from PR #452's adversarial review (`/private/tmp/rev452-attack.md`, attack 4, mutant M4),
   measured at the branch head `7ff46a60`. `frp-server/src/vhost/tests.rs` is a test-only file module whose 61 cases
   (30 `#[test]` + 31 `#[tokio::test]`) carry **no `#[cfg]` gate**, so the module compiles into every `frp-server`
@@ -9809,6 +9931,23 @@ section; ledger now **24 open / 104 closed**.**
   fail-closed literal (the shape of the existing count guards), or the residue is recorded as accepted with the
   argument that the module is only ever moved as a block and every move ships its own name-set diff.
   Ledger after this round: **14 open / 189 closed** (base `18bcd1ad`: 13 open / 189 closed; this round files one item).
+  Done (2026-10-02, this batch): the first branch. The `tests-server` job gained `Run
+  frp-server's vhost unit tests and assert their count`, immediately after the `websocket_port`
+  e2e count guard: local `expected` / `expected_floor` both 61, it runs
+  `cargo test -p frp-server --features dashboard --lib --color never vhost::tests` and requires
+  the `Running unittests src/lib.rs` witness, the summary `test result: ok. 61 passed; 0 failed`,
+  the filtered `-- --list` count of `^vhost::tests::.*: test$` to equal the literal, and the
+  literal to sit at or above the floor. The 61 reproduces in both shapes — `--features dashboard`
+  lists 485 library tests of which 61 are `vhost::tests`, `--all-features` 513 of which 61 — so
+  the item's measurement holds in the job's own feature set. Green: rc 0,
+  `frp-server vhost::tests guard ok: 61 tests listed (expected 61, floor 61), 0 failed`, 0.77 s,
+  with `test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 424 filtered out`. Mutants
+  (stub `cargo` replaying real logs): one test deleted from both logs → rc 1 ("listed 60" plus
+  "filtered run reported 60 passed"); the filtered run zeroed while `-- --list` stays 61 → rc 1
+  "reported 0 passed"; the summary line removed → rc 1 "printed no 'test result: ok. N passed'
+  summary"; delete-plus-lower (`expected` 60, floor 61) → rc 1 on the floor alone; and only the
+  deliberate records bump (`expected` 60 / floor 60) passes → rc 0.
+
 - [ ] **The PR #454 login auth-method split's ordering and behaviour invariants are pinned by no test.**
   Filed by the #454 records round (verification F4, adversarial F2). The split carries five ordering
   invariants — the pre-auth throttle gate before the login plugin hook, the gate before run_id
@@ -9956,7 +10095,7 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** each of the three remaining cites names the line that actually supports its claim, or the claim
   is reworded to what the cited line says.
 
-- [ ] **`scripts/tests/remote-frps-reap.sh` runs in no CI job.**
+- [x] **`scripts/tests/remote-frps-reap.sh` runs in no CI job.**
   Filed while closing `TODO.md:9222` (PR #456). The fixture that pins the new exact-pid route is run only by
   hand: the `health` job's comment (`.github/workflows/ci.yml:87-89`) names the three fixture scripts it runs,
   and its steps run `scripts/tests/repo-health-fixtures.sh`, `scripts/tests/compat-stray-guard.sh` and
@@ -9967,6 +10106,20 @@ section; ledger now **24 open / 104 closed**.**
   `RESULT: 37 fixture check(s) hold` line and its 37-check total *outside* the file (the in-file
   `MIN_CHECKS=37` floor cannot survive an `exec` planted after the trap, which is why the sibling steps carry
   their totals as literals), and the job comment at `.github/workflows/ci.yml:87-89` says four fixture scripts.
+  Done (2026-10-02, this batch). `health` gained `Remote-frps reap — fixture checks`: it
+  sha256-pins `scripts/tests/remote-frps-reap.sh` (`e3d89be3…9a6b37`), runs it to
+  `/tmp/frp-remote-frps-reap.log`, and asserts the suite's own `RESULT: 37 fixture check(s) hold`
+  line and its 37-check total as an *out-of-file* literal (`guard_exact` and `guard_floor` both
+  37), so an `exec` planted after the in-file trap cannot hide a skipped check, plus
+  `guard_fail = 0` and a canary hit on
+  `reap: the decoy whose command line carries frps -c frps.toml survived`. The job comment now
+  says **six** fixture scripts and names all six (repo-health, stray-guard, RSS-soak run-dir,
+  large-functions-classifier, remote-frps-reap, TODO.md citation-gate) with their measured warm
+  timings (11.5 s + 8.1 s + 6.1 s + 0.6 s + 3.0 s + 1.1 s) — six rather than the four this item
+  asked for, because the classifier step landed in the same batch and the citation-gate fixtures
+  step already existed. Green: rc 0, 37 ok, 0 FAIL, 2.93 s warm. Mutants red as in the RSS-soak item: a missing
+  summary with the pin updated, digest drift with the pin left alone, and delete-plus-lower
+  (`guard_exact` 36 / `guard_floor` 37).
 
 - [ ] **`known_server_keys()` accepts a feature-gated listener-port key whose serde field is compiled out, so
   `--strict-config` accepts a key the server then ignores.**
