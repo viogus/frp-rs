@@ -6021,7 +6021,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   item header.** The per-round "re-derive by content" sweep produced off-by-N errors in five rounds
   (#449/#450/#451/#453/#455), and this round's rebase had to choose a side for 29 conflicted cite lines, several
   of them mid-item prose rather than headers (at that base `frps/tests/cli_exit_codes.rs:607`/`:1075`/`:1147`
-  cited `TODO.md:7999`, which is not a header; the SIGTERM/`--config-dir` item is `TODO.md:8874`). Stale
+  cited `TODO.md:8053`, which is not a header; the SIGTERM/`--config-dir` item is `TODO.md:8928`). Stale
   occurrences measured at that base: `docs/developing.md` 13, `scripts/tests/compat-stray-guard.sh` 12 (all
   `8470`/`8627`), `frps/tests/cli_exit_codes.rs` 11, `CHANGELOG.md` 10, `frp-core/src/cli.rs` 7,
   `.github/workflows/ci.yml` 3 (`:115` `8550`, `:323` `8582`, `:687` `8954`),
@@ -6540,7 +6540,7 @@ nothing about whether the described behaviour still holds.
   `git grep -nE '(^|[^a-zA-Z_/.-])go (build|run)' -- scripts/ .github/` finds
   nothing, and `scripts/download-go-frp.sh:29` fetches the **prebuilt** release
   tarball (`https://github.com/fatedier/frp/releases/download/v${VERSION}/…`).
-  It is a leftover of a removed path that `CHANGELOG.md:2655-2656` (0.3.1)
+  It is a leftover of a removed path that `CHANGELOG.md:2685-2686` (0.3.1)
   records — `build_go_frp_v2()` (clone + `go build`, cached to
   `/tmp/frp-source-build/`) exists nowhere in the tree, yet
   `.github/workflows/compat.yml:48` still caches that orphaned
@@ -6558,7 +6558,7 @@ nothing about whether the described behaviour still holds.
   `compat.yml:48`) are the pre-change state and no longer resolve. Re-measured at the new
   head: `git ls-files '*.go'` is still empty, `scripts/download-go-frp.sh:29` still
   fetches the prebuilt release tarball, `build_go_frp_v2()` exists nowhere, and all seven
-  workflow YAMLs parse. `actions/setup-go` survives only in records (`CHANGELOG.md:2656`,
+  workflow YAMLs parse. `actions/setup-go` survives only in records (`CHANGELOG.md:2686`,
   this file, `docs/archive/plans/2026-06-28-xtcp-testing.md`). No gate update was owed —
   `scripts/repo-health.sh`'s toolchain checks match `rustup default` and
   `setup-rust-toolchain` only, never `setup-go` — and the `compat` lane is green at the
@@ -7285,7 +7285,7 @@ nothing about whether the described behaviour still holds.
   `#[cfg(test)]`-on-a-non-`mod` attribution bug, the `#[path]` / attribute-order gap, the
   unconditional name rule, out-of-line `#[cfg(all(test, …))]`, and the naive brace counter.
 
-- [ ] **`scripts/large-functions.sh` attaches a `#[cfg(test)]` attribute to the next `mod`, not to the item it decorates.**
+- [x] **`scripts/large-functions.sh` attaches a `#[cfg(test)]` attribute to the next `mod`, not to the item it decorates.**
   Evidence: `frp-core/src/bridge.rs:4-5` is `#[cfg(test)]` on one line and
   `use std::time::Duration;` on the next; the next `mod` is `mod tests {` at
   `frp-core/src/bridge.rs:1085`. `test_blocks()` scans forward from the attribute to that line and
@@ -7341,6 +7341,60 @@ nothing about whether the described behaviour still holds.
   with the name-pattern and `mod X;`-sibling behaviour preserved and
   `scripts/tests/large-functions-classifier.sh` extended rather than weakened; each of the four
   precision bounds above is closed or shown unreachable in-tree.
+  **Done (2026-10-02, at `040f567c`, squash-merged as `880b1d00`, PR #468, based on `2833442a`) — the region now
+  ends where the attribute says.** `scripts/large-functions.sh` gained a structural gate locator: `CFG_OPEN =
+  re.compile(r'\s*#\s*\[\s*cfg\s*\(')`, a depth-counting `closing_bracket` that skips `"…"`, `'…'`, `//` and
+  `/* */`, `gate_tail_ok` (only whitespace, comments or further attributes may follow the attribute's `]`), and
+  `attribute_run`, which walks the attribute run one attribute at a time **across lines** and returns the line the
+  decorated item starts on. The region is the attribute plus the decorated item, with the item's extent taken from
+  the careful (string/comment/lifetime aware) scan `fn_body_end` already used — not the naive brace counter. The
+  predicate is parsed rather than regex-matched: bare `test` gates; `all(a, …)` gates when any argument does;
+  `any(a, …)` only when every argument does; `not(…)` never; a backslash escape inside the predicate string is
+  honoured. So `#[cfg(all(test, …))]` is a gate at all 13 in-tree sites in the four `ROOTS` (10 spell
+  `all(test, feature = …)`; three — `frp-client/src/service.rs:6`, `frp-client/src/service.rs:125`,
+  `frp-client/src/visitor.rs:1` — spell `all(feature = "vnet", test)`; the item counted 10 and the round-1 review
+  corrected it to 13), and a one-line `#[cfg(test)] #[path = "…"] mod X;` is attributed together with its sibling.
+  Measured with `--all` (production / total / test): `frp-core/src/bridge.rs` **4 / 2965 / 2961 → 1082 / 2965 /
+  1883** and `frp-core/src/logging.rs` **737 / 1008 / 271 → 689 / 1008 / 319** — both Done-when anchors met.
+  The arrow targets were re-measured as the item demanded: ten of the twelve reproduce exactly at this head
+  (`frp-server/src/dashboard.rs` 2937 → 3114, `frp-core/src/auth.rs` 494 → 2099,
+  `frp-client/src/plugin/static_file.rs` 914 → 1743, `frp-client/src/plugin/h2.rs` 872 → 1343,
+  `frp-core/src/transport/tls.rs` 591 → 1001, `frp-core/src/kcp/session.rs` 312 → 907,
+  `frp-core/src/encryption.rs` 592 → 698, `frp-vnet/src/router.rs` 117 → 395,
+  `frp-client/src/plugin/socks5.rs` 233 → 317 and `frp-client/src/plugin/http2http.rs` 13 → 104). The other two
+  do not: `frp-core/src/v2_handshake.rs` stays 798 (not 1366) and `frp-core/src/msg.rs` stays 987 (not 1135) —
+  those figures were the raw-string-blind inflation `b113b013` carried, removed by `0ebbe6b1`'s raw-string scan.
+  Of the item's six disagreement deltas only `frp-core/src/logging.rs`'s −48 (737 → 689) is a clean net effect of
+  the careful scan; `frp-core/src/msg.rs` +148 and `frp-core/src/v2_handshake.rs` +568 reproduce only at
+  `b113b013`, and `frp-client/src/admin.rs` / `frp-client/src/plugin/mod.rs` move by 1 (not 2) and
+  `frp-server/src/dashboard.rs` by 177 (not 353).
+  The four precision bounds: the region's brace scan is the careful one (`frp-core/src/logging.rs` 689 is the
+  witness); the name rule and `mod X;`-sibling behaviour are preserved (the classifier's existing fixtures and
+  M1–M5 still pass); `#[cfg(all(test, …))]` is recognised. The fourth (`#[path]`) is closed for the one-line,
+  attribute-after-gate, path-then-one-line-gate and `#[path]`-then-`#[cfg(any(test))]` orderings (the target reads `0 4 4`);
+  two shapes still leave it at `4 4 0` — a `#[path]` written before the gate on the gate's line (path-first packing) and any predicate written across lines. The only `#[cfg(test)]`-paired `#[path]` site,
+  `frp-server/src/control/proxy_ops/mod.rs:3044-3046`, is in the supported order. The item's "the tree's only
+  `#[path]` site" is loose: `frp-server/src/vhost.rs:24` carries a second one, paired with a
+  `#[cfg(feature = "http-proxy")]` gate rather than a test gate. The two smaller conventions the item records are
+  untouched and still hold: `frp-server/src/ssh_gateway.rs` 2742 / 2750 / 8 and `frp-core/src/config/mod.rs`
+  25 / 27 / 2.
+  `scripts/tests/large-functions-classifier.sh` is extended, never weakened: `MIN_CHECKS` 42 → 62 → 76 → 101 →
+  **118**; current sha256 `df52adae95dfd820fc2af905e363a6248dde2cb4cbb1eb44d6bf42e0b9995c57`, re-pinned at
+  `.github/workflows/ci.yml:695` with `guard_exact` / `guard_floor` 118. The suite now witnesses the same-line
+  gate spellings, multi-line block-comment attribute tails, escaped-quote predicates, the region pass, the
+  ordinary-string continuation rule and mutants M12–M19; against the base script (`d922accf`) it reds with
+  `RESULT: 88 fixture check(s), 35 failure(s) above`, against `b113b013` with 89 checks / 27 failures, and the
+  round-2 head's script (`05bb3b2d`) cannot complete it at all — under the suite's M8 mutation it loops on
+  `fs_raw_attr_above.rs` (no output, >20 s) — so that revision's figure is reported with the M8 block forced
+  vacuous (108 checks / 13 failures).
+  Records and pins: no `.rs` file touched anywhere on the branch; `TODO.md`, `CHANGELOG.md` and `docs/**` are
+  byte-identical to `2833442a` at the code head; no new `TODO.md:<n>` cite, so `guard_cites` /
+  `guard_cites_floor` stay 93 / 93; every other `guard_pin` and `SCEN10_REGION_SHA` unchanged.
+  Review: verification session `b7b79057-241d-4821-a327-5608f0ca89fc`, adversarial session
+  `dca8d9af-732a-45eb-87ec-73340d6bf07d`; four rounds (round 1 and its delta, round 2's delta and re-confirm,
+  round 3/4's delta), every finding applied or filed as residue below. `+1647 / −113` over 3 files
+  (`.github/workflows/ci.yml` 10 / 10, `scripts/large-functions.sh` 556 / 72,
+  `scripts/tests/large-functions-classifier.sh` 1081 / 31).
 
 - [x] **`scripts/tests/large-functions-classifier.sh` runs in no gate.**
   Evidence: the `health` job names its fixture suites explicitly — `scripts/tests/repo-health-fixtures.sh`,
@@ -8657,7 +8711,7 @@ section; ledger now **24 open / 104 closed**.**
   re-adding the two roots to `INI_NESTED_SECTION_ROOTS` reddens the first.
 
 - [x] **Four more test-precision residues the `test-precision-residue` round-2 reviews measured.**
-  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7753`): a
+  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7807`): a
   test that pins less than its name claims, so a real regression stays green.
   (a) The pinned warning bytes are the shipped static, but the **emitted** record is only
   substring-checked: `frp-core/tests/server_tls_enable_warning.rs:441` asserts
@@ -10011,7 +10065,7 @@ section; ledger now **24 open / 104 closed**.**
   **15 open / 186 closed** (base `e4c23b2f`: 16 open / 185 closed).
 
 - [x] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
-  Filed by the coordinator while closing `TODO.md:8577` (PR #430), which removed the two local `pkill -f`
+  Filed by the coordinator while closing `TODO.md:8631` (PR #430), which removed the two local `pkill -f`
   **Done-when:** the remote helper reaps by exact pid (a pid file written where it starts the server, or a
   port-scoped lookup) instead of `pkill -f`/`pgrep -f`, or the pattern kill is recorded as required with the
   measurement that shows a pid route is impossible over that ssh path.
@@ -10221,12 +10275,12 @@ section; ledger now **24 open / 104 closed**.**
   three server load sites that own a log sink — the two post-`init_logging` `frps` startup branches
   (`frps/src/main.rs`) and the SIGUSR1 reload (`frp-server/src/service.rs`) — and emits one `tracing::warn!` per
   non-zero ungated port, naming both spellings and the remedy (`<key> = 0`, the documented "disabled" value, or
-  rebuild with the feature). `= 0` and absent stay silent in TOML/JSON/YAML because every build shape honours the integer `0`; the legacy-`.ini` spellings `"0"` / `+0` / `00` are **not** silent — the INI reader leaves them as strings that `ini_lenient` parses to `0` later, and the detector's value gate cannot see that (`TODO.md:9276`). Rejection was
+  rebuild with the feature). `= 0` and absent stay silent in TOML/JSON/YAML because every build shape honours the integer `0`; the legacy-`.ini` spellings `"0"` / `+0` / `00` are **not** silent — the INI reader leaves them as strings that `ini_lenient` parses to `0` later, and the detector's value gate cannot see that (`TODO.md:9330`). Rejection was
   rejected: `docs/deployment.md:779-782` names refusal the "false 400" direction this accepted-key class deliberately
   avoids, and `strict_config` defaults to true (`frp-core/src/cli.rs:139`) while the repo's own documented
   `frps.toml:21-23` writes non-zero `kcp_bind_port`/`quic_bind_port`, so rejecting would make `frps -c frps.toml`
   refuse to start in every micro/tiny build and break the `known_server_keys()` invariant at
-  `frp-core/src/config/strict.rs:123-127`. `frps verify` stays silent, exactly like the `tls_enable` diagnostic — a residue the reviewers filed as `TODO.md:9337`.
+  `frp-core/src/config/strict.rs:123-127`. `frps verify` stays silent, exactly like the `tls_enable` diagnostic — a residue the reviewers filed as `TODO.md:9391`.
   Both directions are pinned in `frp-core/src/config/tests.rs:290-580`: three `#[cfg(feature = "…")]`
   `…_enabled_honours_the_port` tests (default lane, `5 passed`), six `#[cfg(not(feature = "…"))]`
   `…_disabled_reports_the_dropped_port` / `…_disabled_is_silent_for_zero_or_absent` tests over both spellings ×
@@ -10240,7 +10294,7 @@ section; ledger now **24 open / 104 closed**.**
   **MEDIUM** finding was that this item's changelog headline claimed a wider class than the three serde-dropped
   keys, so the records round narrowed the `CHANGELOG.md` sentence and the four follow-ups below were filed; its
   LOW/INFO findings (the legacy-`.ini` zero spellings, the `verify` silence, four already-wrong comment cites)
-  are `TODO.md:9380`, `:9402`, `:9419` and `:9430`. The Cross-Compat failure the branch first showed (`test_auth_r2g_reject`, a
+  are `TODO.md:9434`, `:9456`, `:9473` and `:9484`. The Cross-Compat failure the branch first showed (`test_auth_r2g_reject`, a
   data-plane reachability wait at `scripts/compat-test.sh:5399`) is a **flake, not attributable**: the compat lane
   builds default features, where the new code is compiled out, and both same-head re-runs succeeded
   (`36897123895`, `36897131548`).
@@ -10317,7 +10371,7 @@ section; ledger now **24 open / 104 closed**.**
   `port_value_requests_a_listener(&toml::Value) -> bool`: `Integer(0)` is not a request, and neither is any
   `String` that parses as `i64 == 0`, so the INI reader's own zero spellings (`"0"`, `+0`, `00`) stop warning
   while `007` / `+5` still do. The rule is unchanged for the three frp-core cfgs (`sub_port_requested` calls the
-  same helper) and for the two reader-gated `frp-server` ports added with `TODO.md:10033`.
+  same helper) and for the two reader-gated `frp-server` ports added with `TODO.md:10087`.
   `port_requested`'s doc no longer claims that only the *integer* `0` is exempt — that claim now lives with the
   helper and names the two files that create the string shapes (`frp-core/src/config/format.rs`,
   `frp-core/src/config/ini_lenient.rs`), so the old sentence is not silently falsified. Pinned by three
@@ -10400,7 +10454,7 @@ section; ledger now **24 open / 104 closed**.**
   headers).
 
 - [x] **`scripts/tests/remote-frps-reap.sh` runs in no CI job.**
-  Filed while closing `TODO.md:9269` (PR #456). The fixture that pins the new exact-pid route is run only by
+  Filed while closing `TODO.md:9323` (PR #456). The fixture that pins the new exact-pid route is run only by
   hand: the `health` job's comment (`.github/workflows/ci.yml:87-89`) names the three fixture scripts it runs,
   and its steps run `scripts/tests/repo-health-fixtures.sh`, `scripts/tests/compat-stray-guard.sh` and
   `scripts/tests/rss-soak-run-dir.sh`. Wiring a fourth suite is a `.github/workflows/ci.yml` edit, and the
@@ -10433,8 +10487,8 @@ section; ledger now **24 open / 104 closed**.**
   `quic_bind_port` is still accepted by `known_server_keys()` and then silently dropped by the server, so
   `--strict-config` cannot see the divergence. Measured in the micro build
   (`--no-default-features --features micro`): `frps verify --strict-config` on a config writing
-  `websocket_port = 1` exits 0 with the port never bound. PR #455's items (`TODO.md:9574`, `:9621`, `:9643`,
-  `:9613`) cover the *warning* side; this item is the acceptance-set-vs-compiled-field divergence itself.
+  `websocket_port = 1` exits 0 with the port never bound. PR #455's items (`TODO.md:9628`, `:9675`, `:9697`,
+  `:9667`) cover the *warning* side; this item is the acceptance-set-vs-compiled-field divergence itself.
   **Done-when:** `known_server_keys()` (and any client-side counterpart) is derived from, or checked against,
   the compiled field set — shown by a `--no-default-features` run in which `--strict-config` refuses a key it
   cannot honour, or the divergence is recorded as deliberate with a measurement on both feature shapes.
@@ -10529,7 +10583,7 @@ section; ledger now **24 open / 104 closed**.**
   - The **flag** is not. `frps --dashboard-port 7500` with no `-c` and no `--config-dir`, in a directory whose `frps.toml` carries `bind_port = 19782` + `auth.token` and no `[web_server] port`, exits 0 on SIGTERM with **zero** records (re-measured at `7fa54cf1`); the same binary and file with a bare `--bind-port 19999` starts on `0.0.0.0:19999`, not the file's `19782`, so the override lane is live and the flag really does reach `cfg.web_server.port`. What never sees it is the report: it reads `ConfigPresence`, which the loader fills from the *normalized file* (`frp-core/src/config/loader.rs:734-737`; `frp-core/src/config/normalize.rs:665`), while the overlay runs after the load (`FrpsArgs::override_server_config` sets `cfg.web_server.port = v`, `frp-core/src/cli.rs:5195`) at its only production call site (`frps/src/main.rs:1061`), so the applied port cannot re-enter the presence record. `--dashboard-port int  dashboard port` is advertised on every shape (`frp-core/src/cli.rs:9705`, `:9765`). The complementary half is exact: on a `--features dashboard` build the bare form is honoured — re-measured at `7fa54cf1`, `Dashboard web UI starting on 127.0.0.1:7599` — while the same flag with `--config-dir` logs no dashboard line at all, i.e. the same discard as the `--bind-port` control above.
   - Neither `-c` nor `--config-dir` is evidence: `cli_overrides_enabled()` is `self.config.is_none() && self.config_dir.is_none()` (`frp-core/src/cli.rs:5095-5096`), so either flag makes the overlay be skipped and the CLI config flag is never applied (Go v0.70.1 parity — `frp-core/src/cli.rs:547-548`). Measured: `frps --config-dir dir --bind-port 19999` still starts on the file's `19782`, i.e. the flag is discarded, not applied; the `--config-dir` branch returns at `frps/src/main.rs:1016` and never reaches the only production `override_server_config` call at `frps/src/main.rs:1061` (`frp-core/src/cli.rs:5993-5994` asserts `!with_dir.cli_overrides_enabled()`).
 
-  **Done-when:** either the CLI override is covered — the completion/overlay step records the unhonoured reader-gated ports it applies, and the record fires in every shape that advertises the flag — or the boundary is recorded next to `run_verify` and in `docs/config.md` and pinned in each build shape. Silently accepting a flag the build cannot honour is the same class `TODO.md:10033` closed for the file.
+  **Done-when:** either the CLI override is covered — the completion/overlay step records the unhonoured reader-gated ports it applies, and the record fires in every shape that advertises the flag — or the boundary is recorded next to `run_verify` and in `docs/config.md` and pinned in each build shape. Silently accepting a flag the build cannot honour is the same class `TODO.md:10087` closed for the file.
 - [ ] **The compat gate's residual flake is unmeasured in CI, and the round-5 harness fixes are proven only by local mutation.**
 
   **Filed by the Batch K author (round-5 measurement), base `b9af37c5`.** The parent item ("The compat
@@ -10556,7 +10610,12 @@ section; ledger now **24 open / 104 closed**.**
     `scripts/compat-test.sh:6801` was deliberately left alone for this reason.)
   - The mechanism behind that readiness-gate signature is filed separately: **A compat scenario can hand
     its own Go frps a port its echo listener already holds, and the readiness probe cannot tell.**
-    (`TODO.md:10419`).
+    (`TODO.md:10679`).
+  - The first post-round-5 CI red was diagnosed from the dump this Done-when asks for (2026-10-02, run
+    `37050182340` attempt 1, on PR #467's head whose tree is byte-identical to main `2833442a`:
+    `go-to-rust-tcpmux-subdomain`), so the first clause is met — but it is the collision class, not the lateness
+    class, so "attribute the lateness to runner contention or a stalled dial" and "compare the red rate over the
+    following ≥30 completed runs against 3/89" stay open.
 
   **Done-when:** the next red `compat` run on main is diagnosed from the logs the round-5 dump now
   prints under `$CI` (the `frps.log`/`frpc.log` tails), the lateness is attributed to runner
@@ -10661,6 +10720,39 @@ section; ledger now **24 open / 104 closed**.**
 
   Not proven for that specific CI run: that `echo_port` was in fact 19510 (the `EXIT` trap removed `TEST_DIR`, and the echo port is never printed). A listener leaked by the immediately preceding scenario has the same signature and the same cure, but it is the weaker explanation: `random_port()` skips anything already LISTENing at pick time, `cleanup_pids` never runs *between ordinary `run_test` scenarios* (`run_test`, `:703-709`, reaps nothing; the reaper runs only in the `EXIT` trap `:169`, inside `run_xtcp_test` `:4353` — function `:4331`, which all 17 `test_xtcp_*` wrappers call, and XTCP is skipped unless `RUN_XTCP=1` — and once before the KCP/QUIC phase `:7739`, none of which sits between the ordinary scenarios that bracket `test_r2g_compression` at `:7707`), and the only process this scenario starts in the post-pick window is its own echo server. Distinguishers if it recurs: `lsof -nP -iTCP:<frps_port> -sTCP:LISTEN` naming `Python` versus an `frps`/`frpc` with another scenario's `-c` path; the frpc error text (an echo gives exactly `Unexpected response to login`; a leaked frps answers with token/protocol semantics); and `local_port == server_port` in the scenario's `frpc.toml` under `--keep-tmp`.
 
+  **The class recurred in CI on the M-1 records round's own PR.** `Cross-Compat` run `37050182340`, job `compat`
+  attempt 1 (job id `110981348370`, started 2026-10-02T18:50:50Z, conclusion `failure`; attempt 2 of the same run
+  was the green re-run, so the run's published conclusion is *success*) went red at
+  `RESULTS: 85 passed, 1 failed` on `go-to-rust-tcpmux-subdomain` — a **second scenario** and a **third port
+  variable** (the tcpmux gateway port, not the control port), on a tree that already carries the round-5
+  readiness/dump fixes (`fa9f1d17`, PR #463), and it is diagnosable only because `fail_test`'s per-scenario
+  `frps.log` dump now runs under `$CI`:
+
+  ```
+  [FAIL] go-to-rust-tcpmux-subdomain: FAIL:CONNECT_RESPONSE b'CONNECT mysub.test.local:22 HTTP/1.1\r\nHost: mysub.test.local:22\r\n\r\n'
+  --- logs for go-to-rust-tcpmux-subdomain ---
+  === frps.log ===
+  INFO run{bind_addr=127.0.0.1 bind_port=17840}: frp_server::service: TCPMux HTTP CONNECT listener starting on port 25611 port=25611
+  ERROR frp_server::service: TCPMux HTTP CONNECT listener failed: Address already in use (os error 98) error=Address already in use (os error 98)
+  ```
+
+  The scenario's Rust frps bound its control listener (`127.0.0.1:17840`) fine and could not bind the tcpmux
+  gateway (the `ERROR` is the arm at `frp-server/src/service.rs:753`), while its Go frpc was healthy (`login to
+  server success`, `proxy added: [tcpmux-sub]`, `start proxy success`). The failure landed 2.49 s after the
+  `[LOG]` banner (18:58:46.1577812 → 18:58:48.6524351), i.e. **not** the 10 s/20 s readiness-timeout signature:
+  `test_g2r_tcpmux_subdomain` (`scripts/compat-test.sh:4749`) takes three independent picks — `frps_port`
+  (`:4754`), `tcpmux_port` (`:4755`), `echo_port` (`:4756`) — starts the echo server first (`:4762`) and gates on
+  `wait_for_port_safe 127.0.0.1 "$tcpmux_port" 5` (`:4793`), whose definition (`scripts/compat-test.sh:225`)
+  returns 0 the moment *any* process holds the port in LISTEN (no pid/ownership check). The echo server therefore
+  satisfies the gate, and the CONNECT probe reads **its own request bytes** back instead of an `HTTP/1.1 200`
+  head — the same wrong-socket signature as the forced `echo_port="$proxy_port"` collision above, and exactly what
+  the readiness probe failing closed on a foreign socket would have caught.
+
+  Not proven for that run: that the holder of the port was this scenario's own echo server. The echo port is never
+  printed, and a listener leaked from an earlier scenario would produce the same signature (the immediately
+  preceding scenario, `go-to-rust-tcpmux`, used tcpmux port 18574, so no cross-scenario reuse is visible in the
+  log). The distinguisher stays `lsof -nP -iTCP:<port> -sTCP:LISTEN` at failure time.
+
   **Done-when:** the harness cannot give two listeners in one scenario the same port — by reserving each port for the life of the scenario, or by making the pick reject ports already allocated in that scenario — and the readiness probe fails closed when the socket that answers is not the process that was just launched; with the forced-collision run above red before the change (the same three symptoms as attempt 1 of run `37015704902`) and green after, a forced `echo_port="$proxy_port"` collision no longer passing, and `scripts/lib/compat-stray-guard.sh` and its fixture suite unweakened. If instead the leak path is the real one, the Done-when is the same bar applied to teardown: no listener from scenario *n* may still hold a port when scenario *n+1* picks one.
 
 - [ ] **`docs/config.md:3-4` still claims a 1:1 Go mapping the gate now measures against.**
@@ -10706,3 +10798,37 @@ other.
 
   **Done-when:** each row's Go cell is checked against an expected path for that row, so swapping in a real-but-wrong Go key reds;
   or the column records per row why membership is all that is being asserted.
+
+- [ ] **The gate locator misses a multiline `#[cfg(...)]` predicate and a `#[path]` packed before the gate, so such items read as production.**
+
+  Filed by the M-2 records round (PR #468), widened in round 3: the one-line, start-anchored gate locator
+  (`cfg_attribute` / `is_test_gate`) misses two spellings — (a) a predicate spanning lines (`#[cfg(all(` / `test,` /
+  `feature = "x"` / `))]` above the decorated item) and (b) a `#[path]` written before the gate on the gate's own
+  line (`#[path = "…"] #[cfg(test)]` above `mod x;`). Measured here, production/total/test: (a) a 22-code-line
+  probe reads `22 22 0` at `2833442a`, `b113b013`, `0ebbe6b1`, `05bb3b2d`, `040f567c`; (b) the packed line hides the
+  gate too (module file `11 11 0`, target `4 4 0`), as does the across-lines predicate (`14 14 0` / `4 4 0`). Neither
+  has an in-tree trigger (the only live multi-line `#[cfg(` attribute under `ROOTS` is `frp-core/src/transport/mod.rs:977`);
+  neither is pinned by a fixture; only (a) is noted in-tree (`scripts/large-functions.sh:65-67`).
+
+  **Done-when:** either spelling gates, or both are documented as unsupported in the script's own docstring and pinned by a fixture.
+
+- [ ] **`#[ cfg ( test ) ]` gates but is pinned by no fixture.**
+
+  Filed by the M-2 records round (PR #468). `CFG_OPEN` tolerates whitespace inside the attribute, and the spaced
+  spelling is treated as a gate, but no fixture row or mutant covers it, so removing that tolerance would not red
+  `scripts/tests/large-functions-classifier.sh`. Zero in-tree sites.
+
+  **Done-when:** a fixture row asserts that the spaced spelling gates (and a mutant reds when the tolerance is
+  removed), or `CFG_OPEN` is narrowed to the spellings the fixtures do cover.
+
+- [ ] **`scripts/large-functions.sh` carries no `guard_pin`, so its own regressions move no CI guard.**
+
+  Filed by the M-2 records round (PR #468). The classifier's sha256 is pinned at
+  `.github/workflows/ci.yml:695`, but the script it exercises is not: a regression that keeps the fixture count at
+  118 — for instance round 2's "the gate's `]` must end its line" anchor (`F′-1`), which is what made a same-line
+  gate tail skip the region — reds only through whichever fixture the review round happened to add. The step's
+  `guard_exact`/count/witness literals are a review surface, not tamper-proofing: a fabricated suite reds against
+  a stale pin but passes once the pin is updated.
+
+  **Done-when:** the `health` step pins `scripts/large-functions.sh` by sha256 beside the classifier's, and the
+  fixture suite covers the attribution shapes the pin is meant to protect.
