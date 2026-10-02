@@ -104,7 +104,13 @@ const RELOAD_TIMEOUT: Duration = Duration::from_secs(20);
 const REAP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Settle time after a marker, so every record `init_logging` gates has been
 /// written before the streams are read. Counts are taken BEFORE any signal.
+/// [`Spawned::wait_for_capture_convergence`] uses it as the **quiet period**:
+/// the capture is frozen once its record count has held still this long.
 const SETTLE: Duration = Duration::from_millis(600);
+/// How long `records_emitted_after_the_snapshot_never_reach_the_capture` watches
+/// the live buffer after the freeze, sized to cover the adversarial's `+3 s`
+/// duplicate. One row, not every row: see that test's docs.
+const LATE_WINDOW: Duration = Duration::from_millis(3500);
 /// A substring of the first record `frps` emits **after** `init_logging`, so
 /// seeing it proves the load succeeded and a subscriber exists. Without it, an
 /// empty warning count would be indistinguishable from "the binary never ran".
@@ -148,63 +154,114 @@ const SERVER_KEY: &str = "tls_enable has no effect on the server";
 ///
 /// Measured (not derived) from this harness — not from a short-lived probe: the
 /// debug binary started with each test's own config, its stdout read to the
-/// point [`Spawned::run`] freezes it, and the `tracing` records listed. Two
-/// shapes exist in this file, and the count depends on the shape, not on the
-/// feature alone:
+/// point [`Spawned::run`] freezes it, and the `tracing` records listed. The
+/// count depends on **two** things, which is why the accessors below are
+/// functions rather than one constant:
 ///
-/// * [`BOOT_RECORDS_NO_DASHBOARD`] — the config writes no `[web_server]` section
-///   (every `frps_config_server_tls` shape). The seven records are the same with
-///   and without the `dashboard` feature, because no dashboard task is built:
+/// * the config's **shape** — a config that writes `[web_server]` (every
+///   `frps_config` shape) gets three dashboard records in a build that compiles
+///   the feature (`Dashboard web UI starting on …`, `Dashboard: no admin auth
+///   configured …`, `Dashboard listening on …`); one that does not (every
+///   `frps_config_server_tls` shape) gets none. The seven shared records are
 ///   `frps (Rust) v0.71.0 starting...`, `no existing store file, starting
 ///   fresh`, `frps starting on …`, `No TLS cert files configured —
 ///   auto-generating …`, `SIGUSR1 reload ready`, `TLS enabled with
-///   auto-generated …`, `frps listener started on …` — the warning a row counts
+///   auto-generated …`, `frps listener started on …`; the warning a row counts
 ///   is one more (first on `-c`; on `--config-dir` second, after the `starting 1
 ///   services from config directory` line that replaces nothing).
-/// * [`BOOT_RECORDS_WITH_DASHBOARD`] — the config writes `[web_server]` (every
-///   `frps_config` shape), so a dashboard build logs three more records
-///   (`Dashboard web UI starting on …`, `Dashboard: no admin auth configured
-///   …`, `Dashboard listening on …`) and the baseline is ten. Without the
-///   `dashboard` feature those three do not exist and
-///   [`BOOT_RECORDS_NO_DASHBOARD`] applies.
+/// * the **features compiled in** — `profiling` adds one record (the SIGUSR2
+///   handler's `SIGUSR2 profiling ready (pid=…)`, `frps/src/main.rs`), so every
+///   shape is one higher under `--all-features`.
 ///
 /// This is a boot baseline, not an invariant of the product: a change to the
 /// startup log set moves it, and the count assertion reds with the actual total
 /// and both addends in the message. That is the point — the set was previously
 /// uncounted, so an emit-site mutant that appended a **second well-formed
 /// `warn!`** left the whole lane green.
-const BOOT_RECORDS_NO_DASHBOARD: usize = 7;
-/// [`BOOT_RECORDS_NO_DASHBOARD`] for the shapes that **do** configure a
-/// dashboard, in a build that compiles one.
+const BOOT_RECORDS_BASE: usize = 7;
+/// The extra records a build that compiles `profiling` emits: the SIGUSR2
+/// handler's ready record (measured once per process, in every shape).
+#[cfg(feature = "profiling")]
+const PROFILING_EXTRA: usize = 1;
+#[cfg(not(feature = "profiling"))]
+const PROFILING_EXTRA: usize = 0;
+/// The extra records a config that writes `[web_server]` gets from a build that
+/// compiles the dashboard.
 #[cfg(feature = "dashboard")]
-const BOOT_RECORDS_WITH_DASHBOARD: usize = 10;
+const DASHBOARD_EXTRA: usize = 3;
+#[cfg(not(feature = "dashboard"))]
+const DASHBOARD_EXTRA: usize = 0;
 /// The records a SIGUSR1 reload adds on the single-config `-c` path when the
 /// config is unchanged: `main.rs` logs `SIGUSR1: config reloaded: no changes
 /// detected`. The re-emitted diagnostic a reload row counts is its own extra
 /// `want`, so it is not in here. Measured with the same harness run (the flat
 /// lane: its capture totals 8 before the signal and 9 after).
 const RELOAD_EXTRA_RECORDS: usize = 1;
-/// The baseline for a `-c` row whose counted warning is the **flat**
-/// `tls_enable` diagnostic. `frps_config_server_tls` shapes write no
-/// `[web_server]` section, so no dashboard task exists even when the feature is
-/// compiled in, and the seven are [`BOOT_RECORDS_NO_DASHBOARD`] unchanged; the
-/// flat warning the row counts is one more (capture total 8). Measured equal in
-/// both feature shapes. The one row that counts the **web** diagnostic while the
-/// flat one is present (a written `tls_enable` with no `web_server.tls.enable`)
-/// adds 1 itself, because for it the flat warning is a sibling, not the `want`.
-const BOOT_RECORDS_FLAT_TLS_ENABLE: usize = BOOT_RECORDS_NO_DASHBOARD;
+
+/// The `-c` boot baseline for tests whose config writes **no** `[web_server]`
+/// section (`frps_config_server_tls` shapes).
+fn boot_records_no_dashboard() -> usize {
+    BOOT_RECORDS_BASE + PROFILING_EXTRA
+}
 
 /// The `-c` boot baseline for tests whose config writes `[web_server]`: the
-/// dashboard build's larger baseline when there is one, the plain one otherwise.
+/// shape's three dashboard records when the feature is compiled in, plus the
+/// profiling record when that one is. The two are independent, so this is the
+/// sum, not a choice.
 fn boot_records_with_dashboard() -> usize {
-    #[cfg(feature = "dashboard")]
-    {
-        BOOT_RECORDS_WITH_DASHBOARD
+    BOOT_RECORDS_BASE + DASHBOARD_EXTRA + PROFILING_EXTRA
+}
+
+/// The record count a complete capture of this shape must reach, for
+/// [`Spawned::run`] to know it can freeze: the boot records plus the warning the
+/// shape is going to emit. `web` picks the dashboard-configured shape (which has
+/// the three dashboard records when the feature is on) over the plain one;
+/// `warning` is false only for the spawn shape that reads the streams live.
+fn capture_floor(warning: bool, web: bool) -> usize {
+    if !warning {
+        return 0;
     }
-    #[cfg(not(feature = "dashboard"))]
-    {
-        BOOT_RECORDS_NO_DASHBOARD
+    if web {
+        boot_records_with_dashboard() + 1
+    } else {
+        boot_records_flat_tls_enable() + 1
     }
+}
+
+/// [`boot_records_with_dashboard`] for the `--config-dir` startup path, which
+/// has **one record fewer** under `--all-features`: `main.rs` returns from the
+/// config-directory branch before the SIGUSR1/SIGUSR2 handlers are installed
+/// (`frps/src/main.rs`, the `return` at the end of the `cli.config_dir` arm), so
+/// the `profiling` feature's `SIGUSR2 profiling ready (pid=…)` record is never
+/// emitted on this path. Measured: 11 records for this shape under
+/// `--all-features` versus 12 for the same shape on `-c`.
+fn boot_records_with_dashboard_config_dir() -> usize {
+    BOOT_RECORDS_BASE + DASHBOARD_EXTRA
+}
+
+/// [`boot_records_flat_tls_enable`] for the `--config-dir` startup path (no
+/// profiling record — see [`boot_records_with_dashboard_config_dir`]).
+fn boot_records_flat_tls_enable_config_dir() -> usize {
+    BOOT_RECORDS_BASE
+}
+
+/// [`capture_floor`] for the `--config-dir` startup paths.
+fn capture_floor_config_dir(web: bool) -> usize {
+    if web {
+        boot_records_with_dashboard_config_dir() + 1
+    } else {
+        boot_records_flat_tls_enable_config_dir() + 1
+    }
+}
+
+/// The baseline for a `-c` row whose counted warning is the **flat**
+/// `tls_enable` diagnostic: the no-dashboard shape (no `[web_server]` is
+/// written), whose warning is the flat one. The one row that counts the **web**
+/// diagnostic while the flat one is present (a written `tls_enable` with no
+/// `web_server.tls.enable`) adds 1 itself, because for it the flat warning is a
+/// sibling, not the `want`.
+fn boot_records_flat_tls_enable() -> usize {
+    boot_records_no_dashboard()
 }
 
 fn bin() -> String {
@@ -301,6 +358,9 @@ struct Spawned {
     stderr_buf: Arc<Mutex<String>>,
     stdout_failed: Arc<Mutex<Option<std::io::Error>>>,
     stderr_failed: Arc<Mutex<Option<std::io::Error>>>,
+    /// The record count [`Spawned::run`] waits for before freezing: see
+    /// [`spawn_floor`].
+    boot_floor: usize,
     stdout: String,
     stderr: String,
 }
@@ -308,7 +368,7 @@ struct Spawned {
 impl Spawned {
     /// Spawn `frps` with `argv` from `dir`, wait (bounded) for
     /// [`STARTUP_MARKER`] on either stream, settle, and snapshot both streams.
-    fn run(dir: &TempDir, argv: &[&str]) -> Self {
+    fn run(dir: &TempDir, argv: &[&str], boot_floor: usize) -> Self {
         let child = Command::new(bin())
             .args(argv)
             .current_dir(&dir.0)
@@ -316,9 +376,9 @@ impl Spawned {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn frps");
-        let mut spawned = Self::from_child(child);
+        let mut spawned = Self::from_child(child, boot_floor);
         spawned.wait_for_marker(STARTUP_MARKER, READY_TIMEOUT);
-        std::thread::sleep(SETTLE);
+        spawned.wait_for_capture_convergence();
         spawned.snapshot();
         spawned
     }
@@ -341,8 +401,15 @@ impl Spawned {
             cmd.env(key, value);
         }
         let child = cmd.spawn().expect("spawn frps");
-        let mut spawned = Self::from_child(child);
+        // Floor 0: this lane reads both streams **live** while the registry
+        // settles, so it must not wait for a count (and its panic record is not
+        // part of any count assertion anyway).
+        let mut spawned = Self::from_child(child, 0);
         spawned.wait_for_marker(STARTUP_MARKER, READY_TIMEOUT);
+        // Deliberately **no** convergence wait: this lane is timing-sensitive
+        // (it measures how long the ready marker took to appear), so it
+        // snapshots the moment the marker does. Floor 0 already tells
+        // [`Spawned::wait_for_capture_convergence`] the same thing.
         spawned.snapshot();
         spawned
     }
@@ -442,7 +509,7 @@ impl Spawned {
         }
     }
 
-    fn from_child(mut child: Child) -> Self {
+    fn from_child(mut child: Child, boot_floor: usize) -> Self {
         let out = Arc::new(Mutex::new(String::new()));
         let err = Arc::new(Mutex::new(String::new()));
         let out_failed = Arc::new(Mutex::new(None));
@@ -463,8 +530,45 @@ impl Spawned {
             stderr_buf: err,
             stdout_failed: out_failed,
             stderr_failed: err_failed,
+            boot_floor,
             stdout: String::new(),
             stderr: String::new(),
+        }
+    }
+
+    /// Wait, bounded, until the capture has **stopped growing**: the record
+    /// count is at least [`Spawned::boot_floor`] and has been unchanged for
+    /// [`SETTLE`]. This replaces a fixed sleep, which was not enough under
+    /// `--all-features`: the `profiling` task's SIGUSR2 record is emitted from a
+    /// spawned task and could land after a fixed deadline, so the same shape
+    /// sometimes had one record more than its pin.
+    ///
+    /// A capture that never reaches the floor is frozen anyway; the assertion
+    /// that wanted the missing records then reds with the real count, rather
+    /// than this wait hanging.
+    fn wait_for_capture_convergence(&mut self) {
+        if self.boot_floor == 0 {
+            // The panic-hook shape reads both streams live; nothing to poll for.
+            std::thread::sleep(SETTLE);
+            return;
+        }
+        let deadline = Instant::now() + READY_TIMEOUT;
+        let mut last = 0usize;
+        let mut stable_since: Option<Instant> = None;
+        loop {
+            let count = tracing_record_starts(&strip_sgr(&self.peek_streams())).len();
+            if count != last {
+                last = count;
+                stable_since = Some(Instant::now());
+            } else if count >= self.boot_floor
+                && stable_since.is_some_and(|t| t.elapsed() >= SETTLE)
+            {
+                return;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 
@@ -483,8 +587,12 @@ impl Spawned {
         matches!(self._guard.child.try_wait(), Ok(None))
     }
 
-    /// Both reader threads ended at EOF — the only state in which what they
-    /// collected is the child's whole output. See [`drain`].
+    /// Neither reader thread has **recorded a read error** (see [`drain`]); a
+    /// thread that ended at EOF recorded none, and one still running has not
+    /// failed yet. What this cannot see is EOF itself: the threads are not
+    /// joined (they cannot be, the child is alive), so a *silent* truncation
+    /// would pass here — but [`drain`] never truncates silently, because every
+    /// non-EOF error is recorded and every other return is a successful read.
     fn assert_drains_are_healthy(&self) {
         check_drain_errors(
             self.stdout_failed.lock().unwrap().as_ref(),
@@ -673,6 +781,18 @@ mod drain_tests {
         check_drain_errors(err.as_ref(), None);
     }
 
+    /// The **stderr** half of the same assertion: deleting it must red here,
+    /// not stay green because every call above passes `None` for stderr.
+    #[test]
+    #[should_panic(expected = "the stderr reader failed before EOF")]
+    fn a_recorded_stderr_read_error_is_fatal_to_the_capture() {
+        let (_text, err) = run(RecordThenError {
+            data: b"partial record\n",
+            sent: false,
+        });
+        check_drain_errors(None, err.as_ref());
+    }
+
     /// A clean capture passes that same assertion.
     #[test]
     fn a_clean_eof_capture_is_usable() {
@@ -742,10 +862,11 @@ fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
     assert_one_warning_on_stdout_with_boot(tag, spawned, boot_records_with_dashboard());
 }
 
-/// [`assert_one_warning_on_stdout`] for the `--config-dir` startup path. Same
-/// baseline as `-c` (see [`BOOT_RECORDS_NO_DASHBOARD`]).
+/// [`assert_one_warning_on_stdout`] for the `--config-dir` startup path, whose
+/// boot is one record shorter under `profiling` (see
+/// [`boot_records_with_dashboard_config_dir`]).
 fn assert_one_warning_on_stdout_from_config_dir(tag: &str, spawned: &Spawned) {
-    assert_one_warning_on_stdout_with_boot(tag, spawned, boot_records_with_dashboard());
+    assert_one_warning_on_stdout_with_boot(tag, spawned, boot_records_with_dashboard_config_dir());
 }
 
 fn assert_one_warning_on_stdout_with_boot(tag: &str, spawned: &Spawned, boot: usize) {
@@ -1060,12 +1181,27 @@ fn tracing_record_starts(clean: &str) -> Vec<usize> {
     found
 }
 
+/// How many `tracing` records in `out` carry `want`, by the same extraction
+/// [`assert_records_are_exactly_the_message`] uses. Exposed for the tests that
+/// must count a **live** buffer rather than a frozen one.
+fn records_carrying(out: &str, want: &str) -> usize {
+    records_containing(&strip_sgr(out), want).len()
+}
+
+/// The byte offset at which the capture's **first** `tracing` record starts.
+/// `Some(0)` means the capture begins with a record; `None` means it carries no
+/// record at all. Used to reject bytes printed ahead of the first record.
+fn first_record_start(clean: &str) -> Option<usize> {
+    tracing_record_starts(clean).into_iter().next()
+}
+
 /// Byte-pin every record carrying `want` **and pin the total record count**:
 /// there must be exactly `expected` records carrying `want`, the capture must
 /// hold exactly `expected + others` records in total (`others` is the caller's
-/// measured boot baseline, see [`BOOT_RECORDS_NO_DASHBOARD`]), each matching record
-/// must be the message with the one-line `tracing` prefix, and nothing may
-/// follow a record but a fresh record or the end of the capture.
+/// measured boot baseline, see [`boot_records_no_dashboard()`]), each matching record
+/// must be the message with the one-line `tracing` prefix, nothing may precede
+/// the first record (so bytes printed ahead of it cannot hide there), and
+/// nothing may follow a record but a fresh record or the end of the capture.
 ///
 /// The count is the half that makes an emit-site mutant appending a **second
 /// well-formed `warn!`** red: byte-pinning the records it is handed cannot see a
@@ -1077,7 +1213,11 @@ fn tracing_record_starts(clean: &str) -> Vec<usize> {
 /// was **swapped** for a record that is not `want` (a second boot line, say)
 /// keeps `expected + others` and stays green. That shape is indistinguishable
 /// from the honest boot output by construction — the boot lines are not pinned,
-/// only counted — and it is not the shape this closes.
+/// only counted — and it is not the shape this closes. The window is also this
+/// snapshot: a record emitted **after** `Spawned::run` froze the buffers is not
+/// in the capture at all. Both limits are pinned by the tests named in
+/// `frps/tests/warn_delivery.rs::mod record_count_tests` and by
+/// `late_records_after_the_snapshot_are_invisible`.
 fn assert_records_are_exactly_the_message(
     tag: &str,
     out: &str,
@@ -1093,6 +1233,19 @@ fn assert_records_are_exactly_the_message(
         "{tag}: expected {expected} record(s) carrying `{want}`, found {}\n--- stdout ---\n{out}",
         records.len()
     );
+    // Nothing may precede the first record: `records_containing` starts each
+    // record at the previous newline, so raw bytes printed ahead of the warning
+    // would otherwise be part of no record and examined by nobody.
+    if let Some(start) = first_record_start(&clean) {
+        assert_eq!(
+            start,
+            0,
+            "{tag}: {} byte(s) precede the capture's first `tracing` record — the emit site printed \
+             them ahead of any record: {:?}",
+            start,
+            clean[..start].chars().take(120).collect::<String>()
+        );
+    }
     let total = tracing_record_starts(&clean).len();
     assert_eq!(
         total,
@@ -1172,7 +1325,11 @@ fn assert_one_server_tls_enable_warning(tag: &str, spawned: &Spawned, boot: usiz
 
 /// [`assert_one_server_tls_enable_warning`] for the `--config-dir` startup path.
 fn assert_one_server_tls_enable_warning_from_config_dir(tag: &str, spawned: &Spawned) {
-    assert_one_server_tls_enable_warning_with_boot(tag, spawned, BOOT_RECORDS_NO_DASHBOARD);
+    assert_one_server_tls_enable_warning_with_boot(
+        tag,
+        spawned,
+        boot_records_flat_tls_enable_config_dir(),
+    );
 }
 
 fn assert_one_server_tls_enable_warning_with_boot(tag: &str, spawned: &Spawned, boot: usize) {
@@ -1247,6 +1404,24 @@ mod record_count_tests {
         assert_records_are_exactly_the_message("honest", &capture, WANT, 1, 2);
     }
 
+    /// Raw non-record bytes printed **ahead** of the first record red too: the
+    /// count alone cannot see them (the record they precede is still there and
+    /// exact), which is the M7 shape the adversarial found.
+    #[test]
+    #[should_panic(expected = "byte(s) precede the capture's first `tracing` record")]
+    fn raw_bytes_before_the_first_record_red() {
+        let capture = format!("junk before any record\n{}", diagnostic(WANT));
+        assert_records_are_exactly_the_message("junk-prefix", &capture, WANT, 1, 0);
+    }
+
+    /// ...and the honest shape with a record first stays green — any record,
+    /// not only the counted one, satisfies "the capture begins with a record".
+    #[test]
+    fn a_capture_that_begins_with_a_record_is_green() {
+        let capture = format!("{}{}", boot("INFO", "starting..."), diagnostic(WANT));
+        assert_records_are_exactly_the_message("record-first", &capture, WANT, 1, 1);
+    }
+
     /// The mutant the item names: the emit site appends a **second well-formed
     /// record**. Every record it hands the byte-pin is still exact, so only the
     /// count can see it.
@@ -1310,7 +1485,11 @@ fn web_server_tls_enable_warning_reaches_a_dash_c_user() {
     let port = free_port();
     let cfg = frps_config(port, free_port(), Section::Nested);
     let path = dir.write("frps.toml", &cfg);
-    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    let spawned = Spawned::run(
+        &dir,
+        &["-c", path.to_str().unwrap()],
+        capture_floor(true, true),
+    );
     assert_one_warning_on_stdout("frps -c", &spawned);
 
     // Liveness oracle for the same shape: the pre-change binary **did** bind, so
@@ -1339,7 +1518,11 @@ fn web_server_tls_enable_warning_reaches_a_config_dir_user() {
     let sub = dir.0.join("conf.d");
     std::fs::create_dir_all(&sub).expect("create config dir");
     std::fs::write(sub.join("frps.toml"), &cfg).expect("write config");
-    let spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
+    let spawned = Spawned::run(
+        &dir,
+        &["--config-dir", sub.to_str().unwrap()],
+        capture_floor_config_dir(true),
+    );
     assert_one_warning_on_stdout_from_config_dir("frps --config-dir", &spawned);
 }
 
@@ -1352,7 +1535,11 @@ fn web_server_tls_enable_warning_reaches_a_dash_c_user_with_the_common_spelling(
     let dir = TempDir::new("dashc-common");
     let cfg = frps_config(free_port(), free_port(), Section::CommonNested);
     let path = dir.write("frps.toml", &cfg);
-    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    let spawned = Spawned::run(
+        &dir,
+        &["-c", path.to_str().unwrap()],
+        capture_floor(true, true),
+    );
     assert_one_warning_on_stdout("frps -c ([common] spelling)", &spawned);
 }
 
@@ -1363,7 +1550,11 @@ fn web_server_tls_enable_warning_reaches_a_config_dir_user_with_the_common_spell
     let sub = dir.0.join("conf.d");
     std::fs::create_dir_all(&sub).expect("create config dir");
     std::fs::write(sub.join("frps.toml"), &cfg).expect("write config");
-    let spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
+    let spawned = Spawned::run(
+        &dir,
+        &["--config-dir", sub.to_str().unwrap()],
+        capture_floor_config_dir(true),
+    );
     assert_one_warning_on_stdout_from_config_dir("frps --config-dir ([common] spelling)", &spawned);
 }
 
@@ -1386,7 +1577,11 @@ fn a_config_dir_process_survives_sigusr1_and_reloads() {
     let sub = dir.0.join("conf.d");
     std::fs::create_dir_all(&sub).expect("create config dir");
     std::fs::write(sub.join("frps.toml"), &cfg).expect("write config");
-    let mut spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
+    let mut spawned = Spawned::run(
+        &dir,
+        &["--config-dir", sub.to_str().unwrap()],
+        capture_floor_config_dir(true),
+    );
 
     assert!(
         spawned.sigusr1_and_reload(),
@@ -1422,7 +1617,11 @@ fn a_config_dir_sigusr1_reloads_every_service() {
         let cfg = frps_config(free_port(), free_port(), Section::Nested);
         std::fs::write(sub.join(name), &cfg).expect("write config");
     }
-    let mut spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
+    let mut spawned = Spawned::run(
+        &dir,
+        &["--config-dir", sub.to_str().unwrap()],
+        capture_floor_config_dir(true),
+    );
 
     let after_one = spawned.sigusr1_and_wait_for_reloads(2);
     assert_eq!(
@@ -1601,7 +1800,11 @@ fn a_config_dir_reload_keeps_the_startup_file_set() {
         format!("bindAddr = \"127.0.0.1\"\nbindPort = {}\n", free_port()),
     )
     .expect("write c.toml");
-    let mut spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
+    let mut spawned = Spawned::run(
+        &dir,
+        &["--config-dir", sub.to_str().unwrap()],
+        capture_floor_config_dir(true),
+    );
 
     let first = spawned.sigusr1_and_wait_for_reloads(2);
     assert_eq!(
@@ -1664,7 +1867,11 @@ fn a_sigusr1_reload_delivers_the_warning_again() {
     let dir = TempDir::new("reload");
     let cfg = frps_config(free_port(), free_port(), Section::CommonNested);
     let path = dir.write("frps.toml", &cfg);
-    let mut spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    let mut spawned = Spawned::run(
+        &dir,
+        &["-c", path.to_str().unwrap()],
+        capture_floor(true, true),
+    );
     assert_eq!(
         occurrences(&spawned.stdout(), KEY),
         1,
@@ -1699,6 +1906,45 @@ fn a_sigusr1_reload_delivers_the_warning_again() {
     assert_clause_matches_this_build("frps reload", &spawned);
 }
 
+/// The oracle's observation window is [`Spawned::run`]'s convergence freeze: a
+/// record emitted **after** it is not in the capture, and the count rows cannot
+/// see it. This pins that boundary — and the length of the window — by watching
+/// the **live** buffer for [`LATE_WINDOW`] (long enough to cover the
+/// adversarial's `warn!` at `+3 s`) and requiring the record count to stay put.
+///
+/// That is the honest answer to the M13b finding rather than a wider window on
+/// every row: the emitted record is invisible *by construction* once the freeze
+/// has happened, and extending the window to catch it on all 17 rows would cost
+/// seconds per row to observe a record the oracle deliberately does not read.
+/// Anything a mutant emits **before** the freeze is inside the window and does
+/// red (see the emit-site mutants in the batch's evidence).
+#[test]
+fn records_emitted_after_the_snapshot_never_reach_the_capture() {
+    let dir = TempDir::new("late");
+    let cfg = frps_config(free_port(), free_port(), Section::Nested);
+    let path = dir.write("frps.toml", &cfg);
+    let spawned = Spawned::run(
+        &dir,
+        &["-c", path.to_str().unwrap()],
+        capture_floor(true, false),
+    );
+    let frozen = records_carrying(&spawned.stdout(), KEY);
+    assert_eq!(
+        frozen,
+        1,
+        "the freeze the count rows read must see the warning\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+
+    std::thread::sleep(LATE_WINDOW);
+    let live = records_carrying(&spawned.peek_stdout(), KEY);
+    assert_eq!(
+        live, frozen,
+        "a `{KEY}` record arrived inside {LATE_WINDOW:?} of the snapshot, yet the frozen capture \
+         still reads {frozen} — the assertions read the snapshot, so anything after it is invisible"
+    );
+}
+
 /// Negative control: without the key there is no record on either stream, so the
 /// warning is presence-driven and not an unconditional startup line.
 #[test]
@@ -1706,10 +1952,13 @@ fn no_warning_for_a_config_without_the_key() {
     let dir = TempDir::new("nokey");
     let cfg = frps_config(free_port(), free_port(), Section::None);
     let path = dir.write("frps.toml", &cfg);
-    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
-    // No `[web_server]` section, so no dashboard task and the plain baseline.
-    // The config writes `[web_server]`, so a dashboard build logs its three
-    // records; the plain shape has no warning at all.
+    let spawned = Spawned::run(
+        &dir,
+        &["-c", path.to_str().unwrap()],
+        capture_floor(true, false),
+    );
+    // This config writes `[web_server]`, so a dashboard build logs its three
+    // records; the shape has no warning at all.
     assert_no_warning("frps -c (no key)", &spawned, boot_records_with_dashboard());
 }
 
@@ -1727,7 +1976,11 @@ fn warning_when_the_camelcase_tls_table_is_merged_into_the_snake_section() {
     let dir = TempDir::new("mixed");
     let cfg = frps_config(free_port(), free_port(), Section::MixedSections);
     let path = dir.write("frps.toml", &cfg);
-    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    let spawned = Spawned::run(
+        &dir,
+        &["-c", path.to_str().unwrap()],
+        capture_floor(true, false),
+    );
     assert_one_warning_on_stdout("frps -c (mixed sections)", &spawned);
 }
 
@@ -1755,11 +2008,15 @@ fn server_tls_enable_warning_reaches_a_dash_c_user() {
     let port = free_port();
     let cfg = frps_config_server_tls(port, ServerTls::WrittenTrue);
     let path = dir.write("frps.toml", &cfg);
-    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    let spawned = Spawned::run(
+        &dir,
+        &["-c", path.to_str().unwrap()],
+        capture_floor(true, false),
+    );
     assert_one_server_tls_enable_warning(
         "frps -c (tls_enable = true)",
         &spawned,
-        BOOT_RECORDS_FLAT_TLS_ENABLE,
+        boot_records_flat_tls_enable(),
     );
     assert_eq!(
         occurrences(&spawned.stdout(), KEY),
@@ -1772,14 +2029,14 @@ fn server_tls_enable_warning_reaches_a_dash_c_user() {
     // capture is not otherwise quiet.
     // This row's config writes no `[web_server]` section, but it does write
     // the flat `tls_enable`, so the capture is the plain boot plus that
-    // warning — which is what [`BOOT_RECORDS_FLAT_TLS_ENABLE`] does **not**
+    // warning — which is what [`boot_records_flat_tls_enable()`] does **not**
     // include (it is the baseline *beside* the flat warning, used by the rows
     // that count it).
     assert_web_server_tls_enable_records_are_exactly_the_message(
         "frps -c (dashboard key not written)",
         &spawned.stdout(),
         0,
-        BOOT_RECORDS_FLAT_TLS_ENABLE + 1,
+        boot_records_flat_tls_enable() + 1,
     );
 }
 
@@ -1791,7 +2048,11 @@ fn server_tls_enable_warning_reaches_a_config_dir_user_with_the_common_spelling(
     let sub = dir.0.join("conf.d");
     std::fs::create_dir_all(&sub).expect("create config dir");
     std::fs::write(sub.join("frps.toml"), &cfg).expect("write config");
-    let spawned = Spawned::run(&dir, &["--config-dir", sub.to_str().unwrap()]);
+    let spawned = Spawned::run(
+        &dir,
+        &["--config-dir", sub.to_str().unwrap()],
+        capture_floor_config_dir(false),
+    );
     assert_one_server_tls_enable_warning_from_config_dir(
         "frps --config-dir ([common] tls_enable)",
         &spawned,
@@ -1800,11 +2061,15 @@ fn server_tls_enable_warning_reaches_a_config_dir_user_with_the_common_spelling(
     let dir = TempDir::new("srv-dashc-common");
     let cfg = frps_config_server_tls(free_port(), ServerTls::CommonWritten);
     let path = dir.write("frps.toml", &cfg);
-    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    let spawned = Spawned::run(
+        &dir,
+        &["-c", path.to_str().unwrap()],
+        capture_floor(true, false),
+    );
     assert_one_server_tls_enable_warning(
         "frps -c ([common] tls_enable)",
         &spawned,
-        BOOT_RECORDS_FLAT_TLS_ENABLE,
+        boot_records_flat_tls_enable(),
     );
 }
 
@@ -1815,11 +2080,15 @@ fn server_tls_enable_warning_reaches_a_dash_c_user_for_a_written_false() {
     let dir = TempDir::new("srv-false");
     let cfg = frps_config_server_tls(free_port(), ServerTls::WrittenFalse);
     let path = dir.write("frps.toml", &cfg);
-    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    let spawned = Spawned::run(
+        &dir,
+        &["-c", path.to_str().unwrap()],
+        capture_floor(true, true),
+    );
     assert_one_server_tls_enable_warning(
         "frps -c (tls_enable = false)",
         &spawned,
-        BOOT_RECORDS_FLAT_TLS_ENABLE,
+        boot_records_flat_tls_enable(),
     );
 }
 
@@ -1831,7 +2100,11 @@ fn no_server_tls_enable_warning_when_it_was_synthesized_from_transport_tls() {
     let dir = TempDir::new("srv-synth");
     let cfg = frps_config_server_tls(free_port(), ServerTls::SynthesizedForce);
     let path = dir.write("frps.toml", &cfg);
-    let spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    let spawned = Spawned::run(
+        &dir,
+        &["-c", path.to_str().unwrap()],
+        capture_floor(true, true),
+    );
     assert_no_warning_for("frps -c (synthesized)", &spawned, SERVER_KEY);
     assert_eq!(
         occurrences(&spawned.stdout(), KEY),
@@ -1843,7 +2116,7 @@ fn no_server_tls_enable_warning_when_it_was_synthesized_from_transport_tls() {
         "frps -c (synthesized tls_enable)",
         &spawned.stdout(),
         0,
-        BOOT_RECORDS_NO_DASHBOARD,
+        boot_records_no_dashboard(),
     );
 }
 
@@ -1855,7 +2128,11 @@ fn a_sigusr1_reload_delivers_the_server_tls_enable_warning_again() {
     let dir = TempDir::new("srv-reload");
     let cfg = frps_config_server_tls(free_port(), ServerTls::WrittenTrue);
     let path = dir.write("frps.toml", &cfg);
-    let mut spawned = Spawned::run(&dir, &["-c", path.to_str().unwrap()]);
+    let mut spawned = Spawned::run(
+        &dir,
+        &["-c", path.to_str().unwrap()],
+        capture_floor(true, true),
+    );
     assert_eq!(
         occurrences(&spawned.stdout(), SERVER_KEY),
         1,
@@ -1866,7 +2143,7 @@ fn a_sigusr1_reload_delivers_the_server_tls_enable_warning_again() {
         "startup (tls_enable = true)",
         &spawned.stdout(),
         1,
-        BOOT_RECORDS_NO_DASHBOARD,
+        boot_records_no_dashboard(),
     );
 
     assert!(
@@ -1884,7 +2161,7 @@ fn a_sigusr1_reload_delivers_the_server_tls_enable_warning_again() {
         "startup + SIGUSR1 reload (tls_enable = true)",
         &out,
         2,
-        BOOT_RECORDS_FLAT_TLS_ENABLE + RELOAD_EXTRA_RECORDS,
+        boot_records_flat_tls_enable() + RELOAD_EXTRA_RECORDS,
     );
     assert_eq!(occurrences(&spawned.stderr(), SERVER_KEY), 0);
 }
