@@ -83,7 +83,7 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// Before the fix, on the config above `frps -c frps.toml --log-level info`
 /// printed 11 `INFO` records where Go prints **0**: frp-rs gated only
 /// `override_server_config` on `cli_overrides_enabled`
-/// (`frps/src/main.rs:1019-1021`), while `init_logging` (`:1024`, defined at `:395`)
+/// (`frps/src/main.rs:1025-1027`), while `init_logging` (`:1030`, defined at `:395`)
 /// still read the raw CLI value. `init_logging` now masks the four CLI log flags
 /// (`--log-level`, `--log-file`, `--log-max-days`, `--log-format`) whenever a
 /// `-c` config was loaded, so the file's `[log]` section is authoritative there

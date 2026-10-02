@@ -9282,3 +9282,115 @@ section; ledger now **24 open / 104 closed**.**
   reordered shapes, so for the gate and run_id orders a plugin-hook-invocation or pre-auth log-line
   assertion is needed, not a response-text one — and `throttled_login_error`'s LoginResp message text
   is asserted the way the gate's is in `frp-server/tests/login_replay_throttle.rs`.
+
+- [x] **A server config that writes `kcp_bind_port` / `quic_bind_port` / `websocket_port` without its feature was accepted by strict mode and then silently dropped by the run path.**
+  In a build without the feature, `known_server_keys()` (`frp-core/src/config/strict.rs:9-129`) lists all six spellings
+  (`:16`, `:17`, `:21` for the snake forms, `:100`, `:101`, `:105` for the `kcpBindPort`/`quicBindPort`/`websocketPort`
+  aliases) while the three `ServerConfig` fields are `#[cfg(feature = "…")]`-gated (`frp-core/src/config/server.rs:23-25`,
+  `:26-28`, `:39-41`, mirrored at `:201`/`:203`/`:226`/`:228`/`:344`/`:346`/`:351`), so serde drops the key during
+  `from_value` and frp-server's only readers — the three `> 0` gates at `frp-server/src/service.rs:771`, `:1275` and
+  `frp-server/src/service/listeners.rs:19` — never see it. Measured at base `f881d15e` on
+  `cargo build -p frps --no-default-features --features micro` (binary `target/debug/frps-micro`, 31 724 264 bytes):
+  a config carrying `websocketPort = 7500` gave `frps: the configuration file … syntax is ok` rc 0 from **both**
+  `verify -c` and `verify --strict-config -c`, while the control `zzzPort = 7500` was still refused with
+  `unknown field "zzzPort" in config file …` rc 1 — strict mode was live, just blind to this class; the run path
+  bound only `bindPort` and logged nothing. Scope is the server only: `frp-core/src/config/client.rs` carries no
+  `#[cfg(feature …)]` at all, so `known_client_keys()` (`frp-core/src/config/strict.rs:131-237`) has nothing that can
+  go stale, and neither `quic_options` nor `virtual_net` is gated.
+  **Done-when:** a load that carries a feature-gated key the build cannot honour is either refused or warned about once per load, in every build shape, with tests pinning both a feature-enabled and a feature-disabled build.
+  **Done (2026-10-02, at code head `6445549a` (earlier `dc1d2e1f`, `5067d8c7`; patch-`=` under `git range-diff`), records `2c93596c (this rebase round)` / `da7f7a2068db5afb`, PR #455, based on `5653512b` (earlier `01fb93e3`) (rebased from `f881d15e`)) — warned, once per load, for a non-zero port; the key stays accepted.**
+  The new `ConfigPresence::warn_unhonoured_server_feature_keys()` (`frp-core/src/config/loader.rs`) is called from the
+  three server load sites that own a log sink — the two post-`init_logging` `frps` startup branches
+  (`frps/src/main.rs`) and the SIGUSR1 reload (`frp-server/src/service.rs`) — and emits one `tracing::warn!` per
+  non-zero ungated port, naming both spellings and the remedy (`<key> = 0`, the documented "disabled" value, or
+  rebuild with the feature). `= 0` and absent stay silent in TOML/JSON/YAML because every build shape honours the integer `0`; the legacy-`.ini` spellings `"0"` / `+0` / `00` are **not** silent — the INI reader leaves them as strings that `ini_lenient` parses to `0` later, and the detector's value gate cannot see that (`TODO.md:9229`). Rejection was
+  rejected: `docs/deployment.md:779-782` names refusal the "false 400" direction this accepted-key class deliberately
+  avoids, and `strict_config` defaults to true (`frp-core/src/cli.rs:139`) while the repo's own documented
+  `frps.toml:21-23` writes non-zero `kcp_bind_port`/`quic_bind_port`, so rejecting would make `frps -c frps.toml`
+  refuse to start in every micro/tiny build and break the `known_server_keys()` invariant at
+  `frp-core/src/config/strict.rs:123-127`. `frps verify` stays silent, exactly like the `tls_enable` diagnostic — a residue the reviewers filed as `TODO.md:9246`.
+  Both directions are pinned in `frp-core/src/config/tests.rs:290-580`: three `#[cfg(feature = "…")]`
+  `…_enabled_honours_the_port` tests (default lane, `5 passed`), six `#[cfg(not(feature = "…"))]`
+  `…_disabled_reports_the_dropped_port` / `…_disabled_is_silent_for_zero_or_absent` tests over both spellings ×
+  {top level, `[common]`} (`--no-default-features` lane, `8 passed`), plus two class pins that run in every shape —
+  `feature_gated_server_ports_stay_known_to_strict_mode_in_every_build` (`:528`) and
+  `feature_gated_server_field_set_matches_the_pinned_scope` (`:559`). Neutering `fn port_requested`
+  (`frp-core/src/config/loader.rs:565`) reds the three report tests at `frp-core/src/config/tests.rs:372:13`, `:428:13`,
+  `:485:13`. The `+159`/`+292`/`+5`/`+10` inserted lines moved 31 `path:line` cites, repointed in the same branch
+  (`9343ea8d` post-rebase, `38d037e1`/`28564342` earlier; 308 live cites re-checked by content, 0 mismatches).
+  Reviewed in PR #455: verification `MERGE-with-findings` (F1-F3, LOW) and adversarial `MERGE-with-findings` — its
+  **MEDIUM** finding was that this item's changelog headline claimed a wider class than the three serde-dropped
+  keys, so the records round narrowed the `CHANGELOG.md` sentence and the four follow-ups below were filed; its
+  LOW/INFO findings (the legacy-`.ini` zero spellings, the `verify` silence, four already-wrong comment cites)
+  are `TODO.md:9333`, `:9355`, `:9372` and `:9383`. The Cross-Compat failure the branch first showed (`test_auth_r2g_reject`, a
+  data-plane reachability wait at `scripts/compat-test.sh:5399`) is a **flake, not attributable**: the compat lane
+  builds default features, where the new code is compiled out, and both same-head re-runs succeeded
+  (`36897123895`, `36897131548`).
+  Ledger after this close: **16 open / 190 closed** (base `01fb93e3`: 14 open / 189 closed; the item is filed and
+  closed in the same PR, so only the closed count moves; the four follow-ups below take it to **20 open / 191
+  closed** at this branch's head, whose base is `5653512b` after the #449 merge (`16 open / 190 closed`)).
+
+- [ ] **A listener port whose *reader* is feature-gated in `frp-server` is still accepted and then silently ignored — `web_server.port` with `dashboard` off and `ssh_tunnel_gateway.bind_port` with `ssh` off.**
+  Filed by PR #455's adversarial review (F-A), measured on the `frps-micro` binary at head `2aa6add8`: the
+  class this round warns about is the one gated in **`frp-core`** (serde drops the field, so the key is inert),
+  but these two are ordinary fields whose only *reader* sits behind a **`frp-server`** feature — they parse, strict
+  mode accepts them, and the port is simply never opened. Measured first-hand on the rebased head:
+  `bindPort = 47301` + `auth.token = "probe"` + `[webServer] port = 47500` → **0** warnings, LISTEN `*:47301`
+  only (47500 closed); `bindPort = 47311` + `[sshTunnelGateway] bindPort = 47501` → **0** warnings, LISTEN
+  `*:47311` only (47501 closed). Control in the same build: `vhostHTTPPort = 47503` and
+  `tcpmuxHTTPConnectPort = 47502` **do** bind (LISTEN 47321 + 47502 + 47503), so those two are not gaps.
+  The readers are `#[cfg(feature = "dashboard")]` (`frp-server/src/service.rs:1443`) and `#[cfg(feature = "ssh")]`
+  (`:743`); `dashboard` is off in the **default** `frps`, in `tiny` and in `micro`, and `ssh` is off in
+  `tiny`/`micro`. The same frp-core-vs-frp-server split is already recorded here:
+  `frp-core/src/config/restart_only.rs:28-30` names `cargo test -p frp-server --no-default-features --all-targets`
+  as a lane where `frp-core/kcp` is on while `frp-server/kcp` is off, and `frp-core/src/config/loader.rs:435-452`
+  calls the mixed shape "a known, unshipped one". Measured there too on the three-key config: the plain `micro`
+  build warns **3** times and opens no kcp/quic/websocket listener, while the mixed build with the three
+  `frp-core` features on (`--features "micro,frp-core/kcp,frp-core/quic,frp-core/websocket"`) warns **0** and opens none either.
+  **Done-when:** a load that names `web_server.port` (or the Go spelling `webServer.port`) in a build without
+  `frp-server/dashboard`, or `ssh_tunnel_gateway.bind_port` in a build without `frp-server/ssh`, is warned about
+  once per load, or the two `docs/config.md` rows record the reader-feature gap — either way pinned by a test in
+  each build shape.
+
+- [ ] **The gated-port detector warns for the legacy-`.ini` zero spellings (`"0"`, `+0`, `00`) that every build honours as "disabled".**
+  Filed by PR #455's adversarial review (F-B). `port_requested` (`frp-core/src/config/loader.rs:565`) treats a
+  value as a request unless `as_integer() == Some(0)`, but the `.ini` reader leaves numeric text that does not
+  round-trip as a `toml::Value::String` (`frp-core/src/config/format.rs`), which the type-directed `ini_lenient`
+  reader parses to `0` afterwards — so the record fires for a value the capable build honours as disabled.
+  Measured first-hand on the rebased head, `[common]` + `token = probe`:
+  `websocketPort = "0"` → **1** warning, `= +0` → **1**, `= 00` → **1**, control `= 0` → **0** (each binds only its
+  `bind_port`); the default `frps` (websocket on) loads all three, stays alive, prints no warning and binds only
+  the control port — rc 0. The record even advises writing `websocket_port = 0`, which is what the file already
+  says in its own dialect. PR #455's records round chose **scope the claim**, not extend the detector (the code was
+  reviewed as-is): `CHANGELOG.md` and the closed item now say "silent in TOML/JSON/YAML", while
+  `port_requested`'s own doc (`frp-core/src/config/loader.rs:559-563`) is left alone because it is literally
+  accurate — only the *integer* `0` is exempt — and adding a line to it would shift the loader line numbers the
+  round just repointed.
+  **Done-when:** `port_requested` accepts the INI reader's own zero spelling set (`0` / `+0` / `00` / `"0"`, …) as
+  "not a request", or the INI exception is recorded where the claim is asserted — with a test per spelling.
+
+- [ ] **`frps verify --strict-config` still accepts a feature-gated port silently (rc 0), so `verify` cannot see the class the run path now warns about.**
+  Filed by PR #455's verification (F2) and adversarial (F-C) reviews. Reproduced: `frps-micro verify
+  --strict-config -c ws.toml` with `websocketPort = 7500` prints `frps: the configuration file … syntax is ok` and
+  exits 0, while the `zzzPort` control is refused with rc 1. The behaviour is deliberate — `run_verify`
+  (`frps/src/main.rs`) never initialises `tracing`, so the new `tracing::warn!` is a no-op there, exactly like the
+  `tls_enable` diagnostic (recorded at `TODO.md:766`), and a record there would break the byte-exact Go-verify
+  output — but before this item the residue was prose-only: no open item tracked it.
+  **Done-when:** `verify` reports the unhonoured key to stdout without disturbing the byte-exact
+  `syntax is ok` line, or the deliberate silence is recorded next to `run_verify` and in `docs/config.md`,
+  pinned in both feature shapes.
+
+- [ ] **Four comment cites name a line that does not support the claim they make (all already wrong at the pre-#455 base).**
+  Filed by PR #455's adversarial (F-D) and verification (F1) reviews; the round's repoint was content-faithful, so
+  it preserved these rather than introducing them. Verified at the rebased head:
+  `frps/src/main.rs:788` / `:933` cite `frp-server/src/service.rs:2281` for the graceful-shutdown `Ok(())` tail,
+  but `:2281` is a bare `#[test]` — `pub async fn run` starts at `:620` and returns `Ok(())` at `:2009`;
+  `frp-core/tests/server_tls_enable_warning.rs:433` labels `frp-core/src/config/loader.rs:796` "the
+  `tracing::warn!`", but `:796` is a doc comment and the call is `:803`;
+  `frpc/tests/admin_config_get_warning.rs:725` cites `frp-core/src/config/loader.rs:446-448` as the
+  top-level-then-`[common]` fallback, but `:446-448` is the micro/no-TLS doc block — the fallback is
+  `web_server_tls_enable_set_in` (`:652`, `get(key).or_else(common…)` at `:658`). A fourth, in
+  `frps/tests/warn_delivery.rs`, was fixed for free by PR #430's rewrite of that comment (the reload site is now
+  cited as `frp-server/src/service.rs:2048`; no `service.rs:2338` cite remains).
+  **Done-when:** each of the three remaining cites names the line that actually supports its claim, or the claim
+  is reworded to what the cited line says.

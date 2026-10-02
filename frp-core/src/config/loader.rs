@@ -239,6 +239,25 @@ pub struct ConfigPresence {
     /// is not a written key and must stay silent. See
     /// [`ConfigPresence::server_tls_enable_set_in`].
     pub(super) server_tls_enable_set: bool,
+    /// `kcp_bind_port` / `kcpBindPort` — at the top level, under `[common]`
+    /// (flattened into the root by `normalize_server_config` before this is
+    /// read), in an `.ini` file, or in an `includes` file — was written with a
+    /// **non-zero** port in a build whose `kcp` feature is off, so
+    /// `ServerConfig` has no such field, serde drops the key, and
+    /// `frp-server`'s KCP listener is not compiled: the port the file names
+    /// stays closed. Only a value other than the integer `0` counts, because
+    /// `0` is the documented "disabled" value and every build shape honours it
+    /// identically (`docs/config.md`, the three gated listener rows). See
+    /// [`ConfigPresence::warn_unhonoured_server_feature_keys`].
+    #[cfg(not(feature = "kcp"))]
+    pub(super) server_kcp_bind_port_unhonoured: bool,
+    /// The `quic` twin of [`Self::server_kcp_bind_port_unhonoured`].
+    #[cfg(not(feature = "quic"))]
+    pub(super) server_quic_bind_port_unhonoured: bool,
+    /// The `websocket` twin of [`Self::server_kcp_bind_port_unhonoured`]
+    /// (`websocket_port` / `websocketPort`).
+    #[cfg(not(feature = "websocket"))]
+    pub(super) server_websocket_port_unhonoured: bool,
 }
 
 /// Which **web server** a build compiles (if any), and whether that web server
@@ -472,6 +491,85 @@ pub static SERVER_TLS_ENABLE_INERT_WARNING: std::sync::LazyLock<String> =
         clauses.join(" ")
     });
 
+/// The written-but-unhonourable `kcp_bind_port` diagnostic, as its clauses, in
+/// the only build shape that has one — `kcp` off, where `ServerConfig` has no
+/// `kcp_bind_port` field, serde drops the key, and `frp-server` never builds the
+/// KCP listener. The text is **not** the `tls_enable` wording, because the two
+/// keys fail differently: `tls_enable` is a compiled field that no code reads
+/// (inert in every build shape), while `kcp_bind_port` is a live field that this
+/// build *cannot parse at all* and would honour as soon as the feature came
+/// back. See [`SERVER_KCP_BIND_PORT_UNHONOURED_WARNING`].
+#[cfg(not(feature = "kcp"))]
+pub const SERVER_KCP_BIND_PORT_UNHONOURED_CLAUSES: [&str; 2] = [
+    "kcp_bind_port has no effect in this build: frp-core's `kcp` feature is off, \
+     so ServerConfig has no such field and frp-server never creates the KCP \
+     listener the port names.",
+    "Write `kcp_bind_port = 0` (the documented \"disabled\" value) to say so in the \
+     file, or rebuild frps with the `kcp` feature to listen on it.",
+];
+
+/// The `quic` twin of [`SERVER_KCP_BIND_PORT_UNHONOURED_CLAUSES`].
+#[cfg(not(feature = "quic"))]
+pub const SERVER_QUIC_BIND_PORT_UNHONOURED_CLAUSES: [&str; 2] = [
+    "quic_bind_port has no effect in this build: frp-core's `quic` feature is off, \
+     so ServerConfig has no such field and frp-server never creates the QUIC \
+     listener the port names.",
+    "Write `quic_bind_port = 0` (the documented \"disabled\" value) to say so in the \
+     file, or rebuild frps with the `quic` feature to listen on it.",
+];
+
+/// The `websocket` twin of [`SERVER_KCP_BIND_PORT_UNHONOURED_CLAUSES`]
+/// (`websocket_port` / the Go-inspired `websocketPort` alias).
+#[cfg(not(feature = "websocket"))]
+pub const SERVER_WEBSOCKET_PORT_UNHONOURED_CLAUSES: [&str; 2] = [
+    "websocket_port has no effect in this build: frp-core's `websocket` feature is \
+     off, so ServerConfig has no such field and frp-server never creates the \
+     WebSocket listener the port names.",
+    "Write `websocket_port = 0` (the documented \"disabled\" value) to say so in the \
+     file, or rebuild frps with the `websocket` feature to listen on it.",
+];
+
+/// The written `kcp_bind_port` diagnostic: [`SERVER_KCP_BIND_PORT_UNHONOURED_CLAUSES`]
+/// joined with a single space, so the text is defined **once** (a `&str` const
+/// cannot join, hence the one-time `LazyLock`). Exists only in a `kcp`-off build;
+/// a build that compiles the field has nothing to report, and the presence flag
+/// it would read is not compiled either.
+#[cfg(not(feature = "kcp"))]
+pub static SERVER_KCP_BIND_PORT_UNHONOURED_WARNING: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| SERVER_KCP_BIND_PORT_UNHONOURED_CLAUSES.join(" "));
+
+/// The `quic` twin of [`SERVER_KCP_BIND_PORT_UNHONOURED_WARNING`].
+#[cfg(not(feature = "quic"))]
+pub static SERVER_QUIC_BIND_PORT_UNHONOURED_WARNING: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| SERVER_QUIC_BIND_PORT_UNHONOURED_CLAUSES.join(" "));
+
+/// The `websocket` twin of [`SERVER_KCP_BIND_PORT_UNHONOURED_WARNING`].
+#[cfg(not(feature = "websocket"))]
+pub static SERVER_WEBSOCKET_PORT_UNHONOURED_WARNING: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| SERVER_WEBSOCKET_PORT_UNHONOURED_CLAUSES.join(" "));
+
+/// Did a written listener-port key ask for a listener?
+///
+/// `snake` and `camel` are the two spellings serde accepts for one field
+/// (`#[serde(alias = …)]`); both are read because `normalize_server_config`
+/// leaves them alone — it neither renames the Go spelling nor drops it — and the
+/// caller reads the **normalized** table, where `[common]` has already been
+/// flattened into the root.
+///
+/// Only the integer `0` is not a request: it is the documented "disabled" value
+/// for all three ports and every build shape honours it identically, so warning
+/// about it would be a false record. Any other value — a port, or a value serde
+/// would itself have refused had the field existed — names a listener this build
+/// will not create.
+#[cfg(not(all(feature = "kcp", feature = "quic", feature = "websocket")))]
+fn port_requested(table: &toml::Table, snake: &str, camel: &str) -> bool {
+    [snake, camel].iter().any(|key| {
+        table
+            .get(*key)
+            .is_some_and(|value| value.as_integer() != Some(0))
+    })
+}
+
 impl ConfigPresence {
     pub(super) fn from_normalized_value(value: &toml::Value) -> Self {
         let mut presence = Self::default();
@@ -490,6 +588,24 @@ impl ConfigPresence {
                     transport.contains_key("heartbeat_timeout")
                         || transport.contains_key("heartbeatTimeout")
                 });
+        // The three feature-gated listener ports: only the builds that cannot
+        // deserialize the field carry the flag, so a capable build holds no
+        // `false`-forever field (`dead_code`) and cannot emit the record.
+        #[cfg(not(feature = "kcp"))]
+        {
+            presence.server_kcp_bind_port_unhonoured =
+                port_requested(table, "kcp_bind_port", "kcpBindPort");
+        }
+        #[cfg(not(feature = "quic"))]
+        {
+            presence.server_quic_bind_port_unhonoured =
+                port_requested(table, "quic_bind_port", "quicBindPort");
+        }
+        #[cfg(not(feature = "websocket"))]
+        {
+            presence.server_websocket_port_unhonoured =
+                port_requested(table, "websocket_port", "websocketPort");
+        }
         presence
     }
 
@@ -685,6 +801,49 @@ impl ConfigPresence {
     pub fn warn_inert_server_tls_enable(&self) {
         if self.server_tls_enable_set {
             tracing::warn!("{}", SERVER_TLS_ENABLE_INERT_WARNING.as_str());
+        }
+    }
+
+    /// Emit the build-shape diagnostic for each feature-gated server listener
+    /// port the file named **and** this build cannot honour, once per load.
+    ///
+    /// A `#[cfg(feature = "kcp")]` / `quic` / `websocket` field is invisible to
+    /// this build's serde: `websocket_port = 7500` in a `--no-default-features`
+    /// build parses without error and binds nothing, so before this diagnostic
+    /// the only trace of the key was the port that never opened. Each flag is
+    /// computed where the field would have been deserialized (see
+    /// [`ConfigPresence::from_normalized_value`]), so the key is recognised in
+    /// every spelling the file may use — snake_case, the Go-inspired camelCase
+    /// alias, `[common]` (flattened before the read), `.ini`, `includes`.
+    ///
+    /// **Only a non-zero value warns.** `0` is the documented "disabled" value
+    /// for all three ports (`docs/config.md`), a capable build's reader gates on
+    /// `> 0` as well, and no build shape can tell `= 0` apart from an absent key
+    /// in its effect — so a presence-driven record would report a key that is
+    /// fully honoured. This is the one deliberate difference from
+    /// [`Self::warn_inert_server_tls_enable`], which warns on presence: that
+    /// field is inert **either way**, this one is inert only in this build shape
+    /// and only for a value that asks for a listener.
+    ///
+    /// Called by the three **server**-config load sites that have a log sink —
+    /// `frps`'s two startup paths (`-c`, `--config-dir`) and `frp-server`'s
+    /// `Service::reload` — beside the `tls_enable` call. `frps verify` stays
+    /// silent for the same reason it does there (no subscriber: the loader runs
+    /// before `init_logging`), and no `frpc`/`frp-client` site calls it, because
+    /// this is a `ServerConfig` fact only. Pinned in both build shapes by
+    /// `feature_gated_server_ports_*` in `frp-core/src/config/tests.rs`.
+    pub fn warn_unhonoured_server_feature_keys(&self) {
+        #[cfg(not(feature = "kcp"))]
+        if self.server_kcp_bind_port_unhonoured {
+            tracing::warn!("{}", SERVER_KCP_BIND_PORT_UNHONOURED_WARNING.as_str());
+        }
+        #[cfg(not(feature = "quic"))]
+        if self.server_quic_bind_port_unhonoured {
+            tracing::warn!("{}", SERVER_QUIC_BIND_PORT_UNHONOURED_WARNING.as_str());
+        }
+        #[cfg(not(feature = "websocket"))]
+        if self.server_websocket_port_unhonoured {
+            tracing::warn!("{}", SERVER_WEBSOCKET_PORT_UNHONOURED_WARNING.as_str());
         }
     }
 

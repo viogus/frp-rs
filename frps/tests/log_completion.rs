@@ -507,15 +507,15 @@ fn cli_empty_log_file_keeps_logging_on_stdout() {
 // `[web_server.tls] enable = true`: the inert-key warning is a `WARN` record
 // emitted on every build right after `init_logging`
 // (`presence.warn_inert_web_server_tls_enable`, called at
-// `frps/src/main.rs:1037`), while the startup marker is an `INFO` record
-// (`frps/src/main.rs:1043`). So
+// `frps/src/main.rs:1043`), while the startup marker is an `INFO` record
+// (`frps/src/main.rs:1053`). So
 // "`web_server.tls.enable has no effect` present **and** `frps (Rust) v` absent"
 // pins the effective level at *exactly* `warn`: `info` would add the marker,
 // `error` would drop the warning.
 //
 // Measured at head **with `--features dashboard`** (the CI feature shape — the
 // inert-key clause is longer there than on the default build,
-// `frp-core/src/config/loader.rs:337-354`), at the observation point the test
+// `frp-core/src/config/loader.rs:356-373`), at the observation point the test
 // itself uses: one loopback `TcpStream::connect` (`assert_loopback_listens`)
 // followed by [`SETTLE`], both streams read **before** the child is signalled.
 // (A run with *zero* connects gives 268 B / 235 B and **one** `WARN`; the
@@ -657,8 +657,8 @@ fn cli_empty_log_level_does_not_raise_the_files_warn() {
 // `cmd/frps/root.go:112` inits the logger from the *file's* `cfg.Log` — and
 // `frps -c frps.toml --log-level info` over a file with `[log] level = "warn"`
 // therefore prints **0** records. Pre-fix, frp-rs gated only
-// `override_server_config` on `cli_overrides_enabled` (`frps/src/main.rs:1019-1021`)
-// while `init_logging` (`frps/src/main.rs:1024`) still read the raw CLI value:
+// `override_server_config` on `cli_overrides_enabled` (`frps/src/main.rs:1025-1027`)
+// while `init_logging` (`frps/src/main.rs:1030`) still read the raw CLI value:
 // measured on that binary the same argv printed **11** `INFO` records (2434 B)
 // and `--log-level debug` printed 11 `INFO` + 3 `DEBUG` (2860 B), while the
 // no-flag control printed 231 B / 0 `INFO` / 1 `WARN` — `level_config` always
@@ -825,7 +825,7 @@ fn fresh_rotation_file(dir: &TempDir) -> Option<PathBuf> {
 }
 
 /// True when the fresh rotation file already carries the record `frps` writes
-/// **after** `init_logging` returns ([`STARTUP_MARKER`], `frps/src/main.rs:1043`).
+/// **after** `init_logging` returns ([`STARTUP_MARKER`], `frps/src/main.rs:1053`).
 ///
 /// Mere existence is not evidence that anything ran: `tracing_appender::rolling::daily`
 /// creates `logs/frps.log.<date>` eagerly when it is constructed

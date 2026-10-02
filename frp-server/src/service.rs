@@ -2050,6 +2050,11 @@ impl Service {
         // sink, so it delivers the record. Once per load — a reload adds one
         // rather than replacing the startup record.
         presence.warn_inert_server_tls_enable();
+        // The feature-gated listener ports this build has no field for report
+        // here too: a reload that adds `websocket_port = 7500` (say) to a
+        // `micro`/`tiny` config still cannot open the port, so the record is one
+        // per load — a reload adds one rather than replacing the startup record.
+        presence.warn_unhonoured_server_feature_keys();
 
         let mut changes: Vec<String> = Vec::new();
 

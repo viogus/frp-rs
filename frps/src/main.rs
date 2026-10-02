@@ -396,7 +396,7 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     // Go frp parity (TODO.md:8831): with an explicit `-c` the config file is
     // authoritative for the whole `[log]` section, exactly as it is for the
     // config flags — the `-c` branch of `main` skips `override_server_config`
-    // (`frps/src/main.rs:1019-1021`), so consulting the CLI log flags here would
+    // (`frps/src/main.rs:1025-1027`), so consulting the CLI log flags here would
     // silently re-honour the very flags that gate exists to discard. Measured
     // on Go v0.71.0: `frps -c frps.toml --log-level info` over a file with
     // `[log] level = "warn"` emits 0 `INFO` records; before this gate frp-rs
@@ -604,6 +604,12 @@ async fn run(mut cli: FrpsArgs) {
                     // The flat server `tls_enable` is inert too; same sink, same
                     // one-record-per-load rule.
                     presence.warn_inert_server_tls_enable();
+                    // And the listener ports this build's `frp-core` features
+                    // cannot deserialize (`kcp_bind_port`, `quic_bind_port`,
+                    // `websocket_port`): serde drops the key and the listener is
+                    // not compiled, so this record is the only signal that the
+                    // named port stays closed.
+                    presence.warn_unhonoured_server_feature_keys();
                     let uf = unsafe_features.clone();
                     #[cfg(unix)]
                     let registry = registry.clone();
@@ -779,10 +785,10 @@ async fn run(mut cli: FrpsArgs) {
                             if let Err(e) = service.run().await {
                                 // `Service::run` has exactly one `Ok(())`
                                 // return — its graceful-shutdown tail
-                                // (`frp-server/src/service.rs:2276`) — so this
+                                // (`frp-server/src/service.rs:2281`) — so this
                                 // arm means the service stopped for good. The
                                 // single-config path maps any `run()` error to
-                                // `EXIT_RUNTIME` (`frps/src/main.rs:1122-1125`),
+                                // `EXIT_RUNTIME` (`frps/src/main.rs:1132-1135`),
                                 // and this lane carries the same code out,
                                 // pinned on both lanes by
                                 // `config_dir_where_every_service_fails_to_run_exits_like_dash_c`
@@ -924,7 +930,7 @@ async fn run(mut cli: FrpsArgs) {
         // code out of construction, or `EXIT_RUNTIME` when `run()` failed — and
         // `Ok(())` only when the service ran to a graceful shutdown, the sole
         // `Ok` return in `Service::run`
-        // (`frp-server/src/service.rs:2276`). A **panicking** task reports
+        // (`frp-server/src/service.rs:2281`). A **panicking** task reports
         // `Err(JoinError)`; it is counted as an `EXIT_RUNTIME` failure rather
         // than merely logged, because `Service::run` cannot have returned
         // `Ok(())` on a panic and dropping it let a directory where every task
@@ -1039,6 +1045,10 @@ async fn run(mut cli: FrpsArgs) {
     // `frps` reads `ServerConfig::tls_enable`, and a restart cannot make it take
     // effect. Same sink, same one-record-per-load rule.
     presence.warn_inert_server_tls_enable();
+    // ... and for the feature-gated listener ports this build has no field for:
+    // the `--config-dir` branch above warns at its own load site, so no path
+    // double-warns here either.
+    presence.warn_unhonoured_server_feature_keys();
 
     tracing::info!(version = %frp_core::VERSION, "frps (Rust) v{} starting...", frp_core::VERSION);
     let config_path = Some(config_path);
