@@ -6977,7 +6977,7 @@ nothing about whether the described behaviour still holds.
 
 ## P3 — strategic
 
-- [ ] **Bus factor is 1.**
+- [x] **Bus factor is 1.**
   Evidence: of ~1450 commits, 1231 are one human author and 219 are an AI agent.
   No second person can currently review a protocol change.
   The documentation work removed the *reading* barrier (a 143 KB instruction file
@@ -6986,6 +6986,22 @@ nothing about whether the described behaviour still holds.
   original author — e.g. "add a client plugin" documented end-to-end and validated
   by someone else following it. (`docs/developing.md § Adding a New Proxy Type` is
   the closest existing artefact.)
+
+  **Done (2026-10-01, code head `3ca7a96b` on `feat/contributor-path`, PR #435, rebased onto `612f7df1` — the fourth base, after `f503b4e7`, `799ce048` and `084f7865`, where the pre-rebase code head was `a7ec18b9`. This rebase added its own re-derivation, `3ca7a96b`, because `612f7df1` split `frp-server/src/control/proxy_ops.rs` into `frp-server/src/control/proxy_ops/{mod,validate,vhost}.rs` and moved every line § 2 cites; this records commit refreshes the ledger. `git range-diff 084f7865..3a436fe0 612f7df1..3ca7a96b` reports the four docs commits as `1 !`, `2 =`, `3 =`, `4 =`, `6 =` and the records commits as `5 !`, `7 !` — `1` differs only on its *removed* side, because the old § 2 block it replaces is main's and main rewrote that block when it split `control/proxy_ops.rs`, while the added § 2 body is byte-identical (`diff` of the two § 2 regions is empty, 660 lines each); `5` and `7` are rewritten records commits, which is what a records rebase is).**
+  `docs/developing.md § 2 — Adding a Proxy Type or a Client Plugin` is now that path: § 2.1 reading
+  order and what to skip, § 2.2 the six config allow-lists, § 2.3 registration plus the seven
+  TCP-group predicate sites, § 2.4 listeners and bridging, § 2.5 the test ladder, § 2.6 the
+  cross-compat scenario, § 2.7 the records a contributor does not own, § 2.8 the client-plugin
+  variant and § 2.9 a new-maintainer entry point — one worked `mytcp` example throughout, indexed
+  from `docs/README.md`. It is **validated by someone else following only the document**: the
+  round-1 reviewer landed a working proxy type from § 2 alone (the config gate with the real binary,
+  a unit test red → green, an in-process e2e, a real `frps` + `frpc` round trip) and returned
+  `MERGE-with-findings` on the two load-bearing claims that were wrong; both were fixed, along with
+  a second round's precision notes, and the delta validator's final verdict at the head is
+  **MERGE** (no blocking finding). Ledger after this close: **20 open / 193 closed** (base
+  `612f7df1`: 21 open / 192 closed), both pairs counted with `grep -cE '^- \[ \]' TODO.md`
+  and `grep -cE '^- \[x\]' TODO.md`. A `CHANGELOG.md` `### Docs` bullet and a
+  `docs/history/development-log.md` row record it.
 
 - [x] **Differentiation: measured, and now argued where users read it.**
   Evidence: the pitch used to be unverifiable — the README's own table was
