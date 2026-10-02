@@ -10376,15 +10376,15 @@ section; ledger now **24 open / 104 closed**.**
   - `bash scripts/compat-test.sh --ci --test go-to-rust-tcp-plain` (the display name) → exit 0,
     ` RESULTS: 1 passed, 0 failed`.
 
-  Pre-existing and not CI-reachable: this branch's entire delta to `scripts/compat-test.sh` is 6 lines (4
-  code lines plus 2 cite comments), and no workflow passes `--test`
+  Pre-existing and not CI-reachable: this branch's entire delta to `scripts/compat-test.sh` is 6 lines (3
+  executable + 3 comment lines added, the same removed), and no workflow passes `--test`
   (`grep -c -- '--test' .github/workflows/compat.yml .github/workflows/xtcp-compat.yml` → `0` and `0`; both
   run the full suite). The trap is the cheap loop the parent item (`TODO.md:6611`) advertises —
   `compat-test.sh --test <display-name>` — for anyone who runs `--list` first.
 
-  **Done-when:** either `--list` prints display names, or a `--test` value that matches no scenario fails
-  closed (non-zero exit plus a message naming the selector), with a check proving a non-matching name can no
-  longer print ` RESULTS: 0 passed, 0 failed` and exit 0.
+  **Done-when:** a `--test` value that matches nothing must fail closed: non-zero exit, a message naming the
+  selector, and no ` RESULTS: 0 passed, 0 failed` — proven by the mismatched-name run `--ci --test
+  test_g2r_tcp_plain`. `--list` printing display names is a convenience, not sufficient on its own.
 
 - [ ] **The protocol matrix's `wait_for_listen` accepts a LISTEN socket owned by any process, so a foreign listener can green a row's readiness gate.**
 
@@ -10409,6 +10409,6 @@ section; ledger now **24 open / 104 closed**.**
     so neither harness's port space is disjoint from the other's, and neither can tell whose LISTEN it saw.
 
   **Done-when:** `wait_for_listen` confirms the listening socket belongs to the process the row is waiting
-  for (a pid check against the row's recorded frps/frpc pid, not a bare LISTEN probe), or the matrix block is
-  moved outside `random_port()`'s 17000–26999 range, with a constructed foreign-listener run proving a row
-  can no longer be greened by a socket it did not start.
+  for — a pid check against the row's recorded frps/frpc pid, not a bare LISTEN probe — proven by a
+  constructed foreign-listener run that can no longer green a row. Moving the block outside
+  `random_port()`'s 17000–26999 range is additional hardening only; it cannot satisfy this item by itself.
