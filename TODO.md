@@ -6781,8 +6781,8 @@ nothing about whether the described behaviour still holds.
   file-to-file move, so it is replaced by those byte-identity and literal-value proofs (calibrated
   the same way on the merged pure move `771294a3`: 1520). Both mandated reviews returned
   MERGE-with-findings and their two doc findings are applied in the plan doc. Ledger after the
-  rebase onto `18bcd1ad`: **13 open / 189 closed**, plus the one residue item this round files →
-  **14 open / 189 closed**.
+  final rebase onto `470a0cde` (the #456 merge): **20 open / 192 closed**, plus the one residue item this
+  round files → **21 open / 192 closed**.
   **Progress (2026-10-01, code head `7d95d267` on `refactor/split-login-authenticate`, PR #454).**
   `authenticate` 510 → 492 code lines (838 → 811 total, `frp-server/src/control/login.rs:645` →
   `:254`; the file 3361 → 2943), but the one-line "split `authenticate` by auth method" needs care:
@@ -6817,7 +6817,7 @@ nothing about whether the described behaviour still holds.
   unchanged (563 / 817) and `-- --list` is the same 460 names (bridge 46, `ssh_gateway::*` 70). P8
   Step 0 names only `ssh_gateway/tests.rs`, but the ~2740 target it states needs all four inline
   modules; see [`docs/refactor-large-modules.md`](docs/refactor-large-modules.md) "Landed so far".
-  Ledger after this round: **15 open / 189 closed** (base `01fb93e3`: 14 open / 189 closed — the round
+  Ledger after this round: **21 open / 192 closed** (base `470a0cde`: 20 open / 192 closed — the round
   files the item below).
 
 - [ ] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
@@ -9253,15 +9253,6 @@ section; ledger now **24 open / 104 closed**.**
 
 - [x] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
   Filed by the coordinator while closing `TODO.md:8533` (PR #430), which removed the two local `pkill -f`
-- [ ] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
-  Filed by the coordinator while closing `TODO.md:8473` (PR #430), which removed the two local `pkill -f`
-  calls in `scripts/compat-test.sh`: `scripts/remote-frps.sh:195` and `:339` still run
-  `pkill -f 'frps -c frps.toml'` and `:409` uses `pgrep -f` on the same text, over ssh, to manage the
-  comparison server on a remote VPS. Name-plus-argument is the same hazard the local sweep just lost — a
-  process on the remote host whose command line merely contains that text is reaped too — but the local
-  `$TEST_DIR/`-prefix baseline and baseline subtraction the new sweep relies on do not exist on the remote
-  side, so the fix needs its own design (a remote pid file, or a port-scoped `fuser` route) rather than a copy
-  of `reap_scoped_strays`. PR #430's residue table names the three call sites.
   **Done-when:** the remote helper reaps by exact pid (a pid file written where it starts the server, or a
   port-scoped lookup) instead of `pkill -f`/`pgrep -f`, or the pattern kill is recorded as required with the
   measurement that shows a pid route is impossible over that ssh path.
