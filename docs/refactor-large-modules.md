@@ -21,7 +21,7 @@ lines), yet it contains the largest production function in the repository:
 |---|---|---|---:|
 | 1 | **`run`** | **`frp-server/src/service.rs:308`** | **1291** |
 | 2 | `run_message_loop` | `frp-client/src/service.rs:2890` | 697 |
-| 3 | `handle_new_proxy` | `frp-server/src/control/proxy_ops.rs:1849` | 546 |
+| 3 | `handle_new_proxy` | `frp-server/src/control/proxy_ops/mod.rs:1279` | 546 |
 | 4 | `authenticate` | `frp-server/src/control/login.rs:617` | 510 |
 | 5 | `run_visitor_listener` | `frp-client/src/visitor.rs:1141` | 502 |
 | 6 | `spawn_work_conn` | `frp-client/src/work_conn.rs:1634` | 469 |
@@ -100,11 +100,24 @@ re-running the script before acting on them.
 
 ### Production vs inline tests
 
+> **Measurement provenance.** Every figure in this section was measured on the
+> pre-Step-0 single file `frp-server/src/control/proxy_ops.rs`, which is now the
+> `frp-server/src/control/proxy_ops/` directory (Step 0, plus seams 1 and 2 —
+> see the seam table below). Rows that name the directory carry those same
+> pre-Step-0 counts unless noted. The Step 0 figures were re-measured at
+> `a618f281` and corrected from the originally recorded `8044 / 4432 / 3612` to
+> `8054 / 4444 / 3610`. **That boundary — production = every line before the
+> first `#[cfg(test)]` — applies to the `proxy_ops` row only** (base lines
+> 1–3610; head `mod.rs` lines 1–3040). The other rows were measured at earlier
+> revisions on other files and do not all share it; PR #452's note under the
+> Step 0 table states the convention those rows use (`Total` = `Inline tests`
+> + `Production`).
+
 | File | Total | Inline tests | **Production** |
 |---|---:|---:|---:|
 | `frp-client/src/service.rs` | 6382 | 1452 | **4930** |
 | `frp-client/src/visitor.rs` | 3850 | 165 | **3685** |
-| `frp-server/src/control/proxy_ops.rs` | 8044 | 4432 | **3612** |
+| `frp-server/src/control/proxy_ops.rs` (pre-Step-0) | 8054 | 4444 | **3610** |
 | `frp-server/src/control/bridge.rs` | 5445 | 2122 | **3323** |
 | `frp-server/src/vhost.rs` | 6331 | 3151 ✅ | **3180** |
 | `frp-server/src/dashboard.rs` | 3910 | 987 | 2923 |
@@ -120,7 +133,7 @@ XTCP/STCP/SUDP/vnet data plane.
 | Function | Total | Comments | **Code** | Code % |
 |---|---:|---:|---:|---:|
 | `run_message_loop` (`service.rs`) | 1109 | 412 | **697** | 63% |
-| `handle_new_proxy` (`proxy_ops.rs`) | 771 | 225 | **546** | 71% |
+| `handle_new_proxy` (`proxy_ops/mod.rs`) | 771 | 225 | **546** | 71% |
 | `run_visitor_listener` (`visitor.rs`) | 631 | 129 | **502** | 80% |
 | `register_proxies` (`service.rs`) | 594 | 200 | **394** | 66% |
 | `reload_from_sources` (`service.rs`) | 503 | 153 | **350** | 70% |
@@ -141,7 +154,7 @@ Last 400 commits, and the subset whose subject matches
 | File | Commits touching it | Touches in fix/audit commits | Production lines |
 |---|---:|---:|---:|
 | `frp-client/src/service.rs` | **53** | **230** | **4930** |
-| `frp-server/src/control/proxy_ops.rs` | 47 | 112 | 3612 |
+| `frp-server/src/control/proxy_ops/` | 47 | 112 | 3610 |
 | `frp-server/src/vhost.rs` | 40 | 94 | 3180 |
 | `frp-server/src/control/login.rs` | 40 | — | — |
 | `frp-client/src/work_conn.rs` | 37 | 85 | — |
@@ -160,7 +173,7 @@ files — and it is why the corrected priority is `service.rs`.
 | File | functions | `pub` | pub % |
 |---|---:|---:|---:|
 | `frp-server/src/control/bridge.rs` | 94 | 2 | 2% |
-| `frp-server/src/control/proxy_ops.rs` | 123 | 11 | 9% |
+| `frp-server/src/control/proxy_ops/` | 123 | 11 | 9% |
 | `frp-server/src/vhost.rs` | 107 | 13 | 12% |
 | `frp-client/src/visitor.rs` | 54 | 8 | 15% |
 | `frp-client/src/service.rs` | 72 | 14 | 19% |
@@ -175,7 +188,7 @@ which is what keeps the risk low.
 |---|---:|
 | `frp-client/src/service.rs` | **84** |
 | `frp-client/src/visitor.rs` | 17 |
-| `frp-server/src/control/proxy_ops.rs` | 14 |
+| `frp-server/src/control/proxy_ops/` | 14 |
 | `frp-server/src/vhost.rs` | 3 |
 | `frp-server/src/control/bridge.rs` | 0 |
 
@@ -195,6 +208,7 @@ git mv frp-server/src/control/proxy_ops.rs frp-server/src/control/proxy_ops/mod.
 # declare the test modules, then move each body into a sibling file
 #   #[cfg(test)] pub(crate) mod unregister_generation_tests;
 #   #[cfg(test)] mod subdomain_conflict_tests;
+#   #[cfg(test)] mod tcp_auto_bind_retry_tests;
 ```
 
 This is **zero-risk and unusually high-yield**, because a file module and an
@@ -204,7 +218,7 @@ only textual change is one level of de-indentation.
 
 | File | Now | After | Reduction |
 |---|---:|---:|---:|
-| `frp-server/src/control/proxy_ops.rs` | 8044 | ~3610 | **55%** |
+| `frp-server/src/control/proxy_ops.rs` | 8054 | 3610 | **55%** |
 | `frp-server/src/vhost.rs` | 6331 | **3179** | **50%** ✅ |
 | `frp-server/src/control/bridge.rs` | 5445 | ~3320 | 39% |
 | `frp-server/src/ssh_gateway.rs` | 4865 | ~2740 | 44% |
@@ -219,33 +233,64 @@ the 3 module-scaffolding lines (`#[cfg(test)]`, `mod tests {`, the closing `}`).
 **landed**: the body now lives formatted (3144 lines) in `frp-server/src/vhost/tests.rs` and
 `frp-server/src/vhost.rs` is **3179** lines. See P7.
 
+**Landed** (`refactor/fileify-proxy-ops`, PR #453, commit `aae3a484`): the base
+file measured 8054 lines (not 8044); it split into
+`frp-server/src/control/proxy_ops/mod.rs` (3618 lines) plus
+`unregister_generation_tests.rs` (3790), `subdomain_conflict_tests.rs` (155) and
+`tcp_auto_bind_retry_tests.rs` (430) — production lines 3610, i.e. the row above
+was re-measured and the stale `8044 / 4432 / 3612` corrected to
+`8054 / 4444 / 3610`. The same PR then landed seams 1 and 2, taking `mod.rs` to
+3049 lines (3040 production, same boundary). Caveat: `scripts/large-functions.sh` treats the
+sibling test files as production now that they are ordinary `.rs` files, so read
+`frp-server/src/control/proxy_ops/` as a whole rather than trusting its per-file
+table.
+
 Two things make it more than cosmetic:
 
 - It **shrinks the apparent problem to its real size**, so the remaining decisions
   are made against production code rather than test code.
-- `proxy_ops.rs` and `vhost.rs` each hold a single 1800–3100-line interleaved test
+- `proxy_ops/` and `vhost.rs` each hold a single 1800–3100-line interleaved test
   suite spanning many functions. Leaving those inline keeps every production edit
   surrounded by thousands of lines of tests, which is part of why these files are
   churned so heavily.
 
-Constraints that make it safe, and the one that makes it fail:
+Constraints that make it safe:
 
-- The three test modules in `proxy_ops.rs` are referenced **by path** from seven
-  other files (`crate::control::proxy_ops::unregister_generation_tests::{proxy_info,
+- The test modules in `proxy_ops.rs` are referenced **by path** from seven other
+  files (`crate::control::proxy_ops::unregister_generation_tests::{proxy_info,
   test_state}` — `metrics/prom.rs`, `dashboard.rs`, `handlers/dispatch.rs`,
   `control/bridge.rs`, `control/proxy.rs`, `control/mod.rs`, `control/pool.rs`).
   A `mod`-declaration-based file split preserves that path; moving the module
   *content* anywhere else breaks it. Declare, do not relocate.
 - `unregister_generation_tests`'s nested `port_error_text_tests` uses
-  `use super::super::*`, which must keep resolving.
-- Renaming `proxy_ops.rs` → `proxy_ops/mod.rs` requires matching `pub(crate) use`
-  re-exports for everything external code imports (`err_msg`, `handle_new_proxy`,
-  `unregister_control`, `release_udp_port_with_owner_check`,
-  `remove_proxy_and_release_client_counts`), so no caller needs editing.
-- Validation: `cargo test --workspace --all-features` must report the same test
-  names; `git diff -M` must show moves plus whitespace only; and, as a hard check
-  for any "pure move", `git diff -U0 | grep -E '^[+-].*"'` must be **empty** — no
-  string literal may change.
+  `use super::super::*`; keeping it nested inside its parent module (rather than
+  hoisting it to a top-level file) leaves that path resolving unchanged.
+- **Measured (PR #453): no `pub(crate) use` re-export is needed.** A file module
+  and an inline module have the same module path, so `err_msg`,
+  `handle_new_proxy`, `unregister_control`,
+  `release_udp_port_with_owner_check` and
+  `remove_proxy_and_release_client_counts` keep resolving at their original
+  visibility. `git diff --name-only` for `aae3a484` lists only the five
+  `proxy_ops*` paths — no external referencing file was touched. (There is also an
+  eighth production caller, `frp-server/src/service.rs:1678`
+  `crate::control::proxy_ops::unregister_control(`, which resolves the same way.)
+- Validation: `cargo test -p frp-server --lib -- --list` must report an identical
+  test-name set; and the move must be visible in `git diff -M --name-only`.
+  **Correction (PR #453):** do *not* require `git diff -M` to report the move as a
+  rename — it does not. The `proxy_ops.rs` → `proxy_ops/mod.rs` pair measures
+  **R041 (41%)** across `01fb93e3..HEAD` and **R049 (49%)** for the Step-0 commit
+  alone, both below git's 50% default, so `--summary` reports `delete` + `create`
+  (measured: `git diff -M1% --raw 01fb93e3 HEAD`). `--name-only` is the checkable
+  form.
+- **Correction to the "empty literal grep" hard check.** `git diff -U0 |
+  grep -E '^[+-].*"'` **cannot** be empty for any file-to-file move: a move emits
+  every relocated line as both a `-` and a `+`, so every relocated string literal
+  appears twice. Calibrated on the already-merged pure move `771294a3` (PR #436):
+  the count is 1520, unchanged under `-w -M -C --find-copies-harder`. The
+  operative check is instead a **multiset of extracted string/char-literal
+  VALUES** before vs after (0 changes), plus `cmp` of
+  `rustfmt(dedent(original_body))` against the committed extracted file, with the
+  raw grep count reported as-is.
 
 ---
 
@@ -259,7 +304,7 @@ Ranked by *risk reduction per unit of disruption*, using the measurements above.
 | **P1** | `frp-server/src/service.rs::run` | Largest function in the repo (1291 code lines); **a linear startup sequence**, so extraction is mechanical and low-risk; `handlers/` already sets the precedent for this exact kind of split | ~10 listener blocks → named methods |
 | **P2** | `frp-client/src/service.rs` | #1 production file size (4930), #1 churn (53), #1 fix density (230), 84 cfg gates | 5 seams, ~1900 lines |
 | **P3** | `frp-client/src/visitor.rs` | #2 production size (3685) and **almost untested** (165 test lines) | 3–4 seams |
-| **P4** | `frp-server/src/control/proxy_ops.rs` | `handle_new_proxy` 546 code lines; 2nd-highest fix density | 2–3 seams |
+| **P4** | `frp-server/src/control/proxy_ops/` | `handle_new_proxy` 546 code lines; 2nd-highest fix density | 2–3 seams |
 | **P5** | `frp-server/src/control/login.rs::authenticate` (492) and `frp-client/src/work_conn.rs` (`spawn_work_conn` 469, `run_udp_work_conn` 419) | Surfaced only by the measurement script; not on any file-size list | 1 seam each |
 | **P6** | `frp-server/src/control/bridge.rs` | Hot data path, highest risk per line changed. Only the UDP family and the injector adapter clearly pay | 2 seams |
 | **P7** | `frp-server/src/vhost.rs` | Not urgent for production, but **a 3151-line test extraction with zero production change**, then 4 low-risk seams | 1 free step + 4 seams |
@@ -298,7 +343,7 @@ Block inventory, from the function's own comment landmarks:
 | ~1251–1417 | QUIC listener (~167) | `service/listeners.rs` |
 | ~1420–1458 | Dashboard server | `service/listeners.rs` |
 | ~1465–1484 | NAT-hole session cleanup task | `service/tasks.rs` |
-| ~1485–1490 | Port-reservation pruner (calls `spawn_port_reservation_pruner` in `proxy_ops.rs`) | `service/tasks.rs` |
+| ~1485–1490 | Port-reservation pruner (calls `spawn_port_reservation_pruner` in `proxy_ops/`) | `service/tasks.rs` |
 | ~1491–1558 | TLS cert hot-reload task | `service/tasks.rs` |
 | ~1563–1603 | SIGINT/SIGTERM handler task | `service/tasks.rs` |
 | ~1604–1768 | Stale-control reaper task | `service/tasks.rs` |
@@ -359,7 +404,7 @@ verify the module rules rather than assume them:
 So: use a `frp-client/src/service/` **directory of children** and **keep
 `SessionCtx` and `Service` in `service.rs`**. This mirrors what `frp-server`
 already does (`service.rs` + `control/*.rs` re-opening `impl Service`; see
-`control/proxy_ops.rs:3565`) — except the server's `AppState` fields happen to be
+`control/proxy_ops/mod.rs:2995`) — except the server's `AppState` fields happen to be
 `pub` already, so that precedent does not cover the privacy point.
 
 Corrected spans (the earlier table in this document used distance-to-next-`fn`,
@@ -445,12 +490,15 @@ little to catch a mistake in the moved code. Recommend doing this **after**
 (`frp-server/tests/xtcp_hole_punch.rs`, `frp-core/tests/xtcp_p2p.rs`) and the daily
 `xtcp-compat.yml` matrix.
 
-### P4 — `frp-server/src/control/proxy_ops.rs` (3612 production lines, 34 production fns)
+### P4 — `frp-server/src/control/proxy_ops/` (3610 production lines at base, 34 production fns)
 
-Production code is lines 1–3610; the remaining 4432 lines are inline tests. **So
-the first move here is [Step 0](#step-0--the-universal-first-move-file-ify-the-inline-tests)**:
-convert to `proxy_ops/mod.rs` and file-ify the three test modules, which takes the
-file from 8044 to ~3610 lines with no logic and no path change.
+At base, production code was lines 1–3610 and the remaining 4444 lines were inline
+tests. **Step 0 landed in PR #453** (`aae3a484`): `proxy_ops.rs` (8054 lines) became
+`proxy_ops/mod.rs` (3618) plus three sibling test files, taking the production file
+to 3610 lines with no logic and no path change. Re-measured figures are
+8054 / 4444 / 3610 (same boundary as the provenance note above) — not the originally
+recorded 8044 / 4432 / 3612. Seams 1 and 2 then landed as `92a454b3` and
+`a618f281`, taking `mod.rs` to 3049 lines (3040 production).
 
 Two structural facts dominate everything after that:
 
@@ -458,27 +506,32 @@ Two structural facts dominate everything after that:
 `proxy_ops::` by path — five production importers (`err_msg`, `handle_new_proxy`,
 `unregister_control`, `release_udp_port_with_owner_check`,
 `remove_proxy_and_release_client_counts`) and seven test importers of
-`crate::control::proxy_ops::unregister_generation_tests::{proxy_info, test_state}`.
-Converting to a directory with `pub(crate) use` re-exports keeps **every external
-path byte-identical**, so no caller is edited.
+`crate::control::proxy_ops::unregister_generation_tests::{proxy_info, test_state}`
+(there is also an eighth production caller, `frp-server/src/service.rs:1678`
+`crate::control::proxy_ops::unregister_control(`). Converting the file to a
+directory keeps **every external path byte-identical** *without* any
+`pub(crate) use` re-export: a file module and an inline module have the same module
+path, so the originals' visibility carries over unchanged. Measured in PR #453 —
+`git diff --name-only` for `aae3a484` lists only the five `proxy_ops*` paths.
 
 **(b) No `AppState` field is private** (only the three group controllers are
 `pub(crate)`), so **no field-visibility change is needed for any seam**. There is
 no `unsafe` in the file.
 
-Seams, in the order they should be attempted:
+Seams, in the order they should be attempted (line numbers for the remaining rows
+are current `mod.rs` positions at `a618f281`):
 
 | Order | New module | Moves | Risk |
 |---|---|---|---|
-| 0 | *(directory + test modules)* | see Step 0 | **lowest** |
-| 1 | `proxy_ops/validate.rs` | `validate_new_proxy` (891–961, pure), `duplicate_domain` (68–77) + its test module | low — zero `AppState` coupling, self-testing |
-| 2 | `proxy_ops/vhost.rs` | `register_http_vhost` (968–1213), `register_https_vhost` (1221–1441) | low — already fully extracted; no test region references them |
-| 3 | `proxy_ops/tcp_group.rs` | `tcp_group_listener` (3273–3426), `handle_tcp_group_member_registration` (3437–3547) | low — leaves, owned args |
-| 4 | `proxy_ops/registry.rs` | `build_proxy_info`, `register_sk_index`, `register_proxy_entry`, the three `rollback_*`, `remove_proxy_and_release_client_counts` | medium-low |
-| 5 | `proxy_ops/ports.rs` | `PortError`, `allocate_proxy_port` (171–409), the rollback/free helpers, the reservation pruner + its `impl AppState` | medium-low |
-| 6 | `proxy_ops/teardown.rs` | `unregister_control` (2869–3262) — one function, 394 lines | medium |
-| 7 | `proxy_ops/listener.rs` | `bind_proxy_listener`, `bind_tcp_proxy_with_retry`, `setup_proxy_listeners` (1456–1839), `listen_and_proxy` | medium — largest move, 13-arg interface |
-| 8 | `proxy_ops/tcpmux.rs` | the inline tcpmux arm (2267–2546, 276 lines) lifted out of `handle_new_proxy` | **medium — the only seam that rewrites control flow** |
+| 0 | *(directory + test modules)* — **landed `aae3a484`** | see Step 0: `mod.rs` + `unregister_generation_tests.rs`, `subdomain_conflict_tests.rs`, `tcp_auto_bind_retry_tests.rs` | **lowest** |
+| 1 | `proxy_ops/validate.rs` — **landed `92a454b3`** | `validate_new_proxy` (was 891–961, pure), `duplicate_domain` (was 68–77) + its test module (now `validate/subdomain_conflict_tests.rs`) | low — zero `AppState` coupling, self-testing |
+| 2 | `proxy_ops/vhost.rs` — **landed `a618f281`** | `register_http_vhost` (was 968–1213), `register_https_vhost` (was 1221–1441) | low — already fully extracted; no test region references them |
+| 3 | `proxy_ops/tcp_group.rs` | `tcp_group_listener` (`mod.rs:2703–2856`), `handle_tcp_group_member_registration` (`mod.rs:2867–2977`) | low — leaves, owned args |
+| 4 | `proxy_ops/registry.rs` | `build_proxy_info` (`mod.rs:404`), `register_sk_index` (`mod.rs:483`), `register_proxy_entry` (`mod.rs:784–871`), the three `rollback_*` (`mod.rs:502`, `710`, `731`, `753`), `remove_proxy_and_release_client_counts` (`mod.rs:679–699`) | medium-low |
+| 5 | `proxy_ops/ports.rs` | `PortError`, `allocate_proxy_port` (`mod.rs:161–399`), the rollback/free helpers, the reservation pruner + its `impl AppState` (`mod.rs:2984`, `2995`) | medium-low |
+| 6 | `proxy_ops/teardown.rs` | `unregister_control` (`mod.rs:2299–2692`) — one function, 394 lines | medium |
+| 7 | `proxy_ops/listener.rs` | `bind_proxy_listener` (`mod.rs:2058–2080`), `bind_tcp_proxy_with_retry` (`mod.rs:2114–2205`), `setup_proxy_listeners` (`mod.rs:886–1269`), `listen_and_proxy` (`mod.rs:2211–2289`) | medium — largest move, 13-arg interface |
+| 8 | `proxy_ops/tcpmux.rs` | the inline tcpmux arm (was 2267–2546, 276 lines) inside `handle_new_proxy` (`mod.rs:1279–2049`) | **medium — the only seam that rewrites control flow** |
 
 Notes on the hardest ones:
 
@@ -702,7 +755,7 @@ External re-export paths that must be preserved (each verified against a caller)
 `run_vhost_http_listener` / `run_vhost_https_listener` (`service.rs:660,685`),
 `count_host_headers` (`tcpmux.rs:465`), `write_not_found_response`
 (`tcpmux.rs:517,714`), `clamp_vhost_timeout` (`bridge.rs:3105`), `VhostManager`
-(`state.rs:28`, `dashboard.rs`, `control/proxy.rs`, `proxy_ops.rs`).
+(`state.rs:28`, `dashboard.rs`, `control/proxy.rs`, `proxy_ops/`).
 
 **Do not split the orchestration core** (`serve_vhost_request`,
 `handle_http1_request`, `run_vhost_http_listener`): `request_text` borrows

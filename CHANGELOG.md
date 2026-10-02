@@ -525,6 +525,10 @@ User-facing release notes for frp-rs.
   expanded into a v1 sub-table and refused with `invalid type: map, expected a sequence`. The
   section-level strict exception is `.ini`-only and documented in `docs/config.md`. TODO.md:7774,
   :7792, :7815, :7858, :7885.
+  section-level strict exception is `.ini`-only and documented in `docs/config.md`. TODO.md:7911,
+  :7950, :7973, :8030, :8057.
+  section-level strict exception is `.ini`-only and documented in `docs/config.md`. TODO.md:7910,
+  :7949, :7972, :8029, :8056.
 - **`frps --config-dir`: a panicking service task is now counted.** A task that panicked was logged and
   dropped, so a directory in which every task panicked still exited 0 with nothing served. The panic now
   joins the same all-failed decision as the typed failures, and the lane exits non-zero.

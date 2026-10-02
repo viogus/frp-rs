@@ -1563,7 +1563,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `tests/http_plugin_ping.rs` 4 failed / 1 passed (both files carried no
     `cfg(feature ...)` before this change, measured), plus the lib test
     `control::proxy_ops::unregister_generation_tests::
-    stale_unregister_keeps_fresh_user_record` (in `frp-server/src/control/proxy_ops.rs`; its
+    stale_unregister_keeps_fresh_user_record` (in `frp-server/src/control/proxy_ops/unregister_generation_tests.rs`; its
     `assert_eq!` on `plugin_manager.user_info(...)`) which expects that to be `Some` while the
     `#[cfg(not(feature = "http-proxy"))]` stub (`frp-server/src/plugin/mod.rs:8-34`) makes
     `record_login_user` a no-op (`:29`) and `user_info` return `None` (`:30-32`); the real impl
@@ -1610,10 +1610,10 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   - `frp-server/tests/http_plugin_ping.rs` — whole-file `#![cfg(feature = "http-proxy")]`.
     Ungated: 1 passed / 4 failed. Gated: 0 tests here, `--features http-proxy --test
     http_plugin_ping` 5 passed / 0 failed.
-  - `frp-server/src/control/proxy_ops.rs`
+  - `frp-server/src/control/proxy_ops/unregister_generation_tests.rs`
     `control::proxy_ops::unregister_generation_tests::stale_unregister_keeps_fresh_user_record`
     — `#[cfg(feature = "http-proxy")]`. Ungated: `--lib unregister_generation_tests` 48 passed /
-    1 failed, `assert_eq!` at `:3814`, `left: None` vs `right: Some("fresh")`. Gated:
+    1 failed, `assert_eq!` at `:202`, `left: None` vs `right: Some("fresh")`. Gated:
     `--features http-proxy` 49 passed / 0 failed.
   - `frp-server/tests/server_protocol.rs` — `#[cfg(feature = "websocket")]` on
     `test_login_via_websocket` (ungated: `WS dial: Transport(Other("WS raw connect read:
@@ -6657,10 +6657,10 @@ nothing about whether the described behaviour still holds.
   carried the authoritative version. The other **8 carry 13 `file:line` anchors
   naming the symbol**, each verified by opening that exact line in this worktree
   (`ProxyConfig` at `frp-core/src/config/client.rs:585`; `handle_new_proxy`
-  `proxy_ops.rs:1849`; `register_proxy_entry` `proxy_ops.rs:794`;
-  `allocate_port_multi` `proxy.rs:821`; `register_sk_index` `proxy_ops.rs:493`;
-  `setup_proxy_listeners` `proxy_ops.rs:1456`; `listen_and_proxy`
-  `proxy_ops.rs:2781`; `ProxyManager` `proxy.rs:116`; `VhostManager`
+  `proxy_ops/mod.rs:1279`; `register_proxy_entry` `proxy_ops/mod.rs:784`;
+  `allocate_port_multi` `proxy.rs:821`; `register_sk_index` `proxy_ops/mod.rs:483`;
+  `setup_proxy_listeners` `proxy_ops/mod.rs:886`; `listen_and_proxy`
+  `proxy_ops/mod.rs:2211`; `ProxyManager` `proxy.rs:116`; `VhostManager`
   `vhost.rs:265`; `TcpMuxManager` `tcpmux.rs:34`; `InternalMsg::ProxyUserConn`
   `state.rs:344`; `assign_work_to_proxy` `bridge.rs:3117`;
   `run_work_bridge` `bridge.rs:2430`). **Two live errors were found and fixed en
@@ -6741,7 +6741,7 @@ nothing about whether the described behaviour still holds.
   over. Measured properly (`scripts/large-functions.sh`, production code only):
   30–55% of the "large" files are inline tests and 36–77% of the "giant" functions
   are comments. By production lines the worst file is `frp-client/src/service.rs`
-  (4930), not `control/proxy_ops.rs` (3612, of which 4432 of its 8044 raw lines are
+  (4930), not `control/proxy_ops/` (3610, of which 4444 of its 8054 raw lines are
   tests). And **file size hides the real problem**: the largest production function
   in the repository is `run` in `frp-server/src/service.rs` — **1291 code lines**,
   in a file that ranks only 11th by size. Churn agrees: `frp-client/src/service.rs`
@@ -6836,6 +6836,24 @@ nothing about whether the described behaviour still holds.
   2726) and `key_tests.rs` / `virtual_ctrl_tests.rs` / `preauth_tests.rs` each read **0** production —
   with the script's existing `tests.rs` / `tests/` behaviour preserved, or the change to it justified
   in the item.
+
+  **Progress (2026-10-01, code head `a618f281` on `refactor/fileify-proxy-ops`, PR #453).** P4
+  (`frp-server/src/control/proxy_ops`) landed Step 0 plus seams 1–2 as three pure-move commits:
+  `aae3a484` file-ified the inline tests (`proxy_ops.rs` (pre-move) 8054 → `proxy_ops/mod.rs` 3618 +
+  `unregister_generation_tests.rs` 3790 / `subdomain_conflict_tests.rs` 155 /
+  `tcp_auto_bind_retry_tests.rs` 430), `92a454b3` extracted `validate_new_proxy` + `duplicate_domain`
+  into `proxy_ops/validate.rs` (108), `a618f281` extracted `register_http_vhost` +
+  `register_https_vhost` into `proxy_ops/vhost.rs` (498); `mod.rs` is now 3049 (3040 production, the
+  same boundary the plan doc's `proxy_ops` row uses — every line before the first `#[cfg(test)]`) and no file outside
+  `frp-server/src/control/proxy_ops/` was edited by the three **code** commits (the records commit
+  touches `TODO.md` + four `docs/*` files). Operator-visible delta, recorded not pinned: the six log
+  sites that moved to `vhost.rs` render `target: frp_server::control::proxy_ops::vhost` instead of
+  `...::proxy_ops` (console/logfile/JSON text; `RUST_LOG` prefix filtering unaffected). Evidence: `rustfmt(dedent(body))`
+  `cmp`-identical bodies at the code head (`unregister_generation_tests.rs` later took one comment-only
+  self-cite fix, review finding F1), identical `-- --list` name sets (68 `proxy_ops` / 460 lib), and a
+  literal-VALUE multiset unchanged apart from one added `#[path]` value that keeps
+  `subdomain_conflict_tests`' module path — and its 11 test names (12 `fn`s, one a helper) — intact. The plan's
+  `8044 / 4432 / 3612` proved stale: re-measured 8054 / 4444 / 3610, and seams 3–8 re-anchored.
 
 - [x] **Three vendored crates are a standing maintenance liability.**
   Evidence: `vendor/rustls` (TLS, patched), `vendor/yamux` (5 patches),
@@ -8114,6 +8132,9 @@ section; ledger now **24 open / 104 closed**.**
 
 - [x] **Four more test-precision residues the `test-precision-residue` round-2 reviews measured.**
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7630`): a
+  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7204`): a
+  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7617`): a
+  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7616`): a
   test that pins less than its name claims, so a real regression stays green.
   (a) The pinned warning bytes are the shipped static, but the **emitted** record is only
   substring-checked: `frp-core/tests/server_tls_enable_warning.rs:441` asserts
