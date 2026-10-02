@@ -9400,14 +9400,14 @@ section; ledger now **24 open / 104 closed**.**
   into the deadline. The four floors are now `capture_floor(false, false)` / `capture_floor(true, false)`, and
   with the wait loud the whole file is **6.1 s default / 6.3 s `dashboard` / 6.4 s `all-features`** (it was
   52.7 s / 67.3 s / 67.6 s before the fix), because no row reaches the deadline any more. The loud path is
-  demonstrated: re-specifying the no-key row as `capture_floor(true, false)` reds it in 16.3 s at `:574:17`
+  demonstrated: re-specifying the no-key row as `capture_floor(true, false)` reds it in 16.3 s at `:573:17`
   with `the capture never reached its floor: 7 record(s) after 15s, floor 8`.
   (c) `frps`'s `drain` (`:657`) now distinguishes a read error from EOF exactly as `frpc`'s does — only `Ok(0)`
   ends the capture, `ErrorKind::Interrupted` retries, any other error is recorded — and every reader
   (`Spawned::peek_stdout`/`peek_stderr`, and `snapshot`) refuses the truncated capture through
   `check_drain_errors` (`:693`); the error is parked rather than joined because this harness reads a **live**
   child, and `assert_drains_are_healthy` (`:608`) now documents exactly that (it sees recorded errors, not
-  EOF — DOC-1). `mod drain_tests` (`:711`) pins it in **both** directions: 5 tests green, and with the old
+  EOF — DOC-1). `mod drain_tests` (`:710`) pins it in **both** directions: 5 tests green, and with the old
   `Ok(0) | Err(_) => break` loop restored `test result: FAILED. 1 passed; 4 failed` at
   `frps/tests/warn_delivery.rs:768:23`, `:800:8` and `:800:8` (both `should_panic` cases) and `:825:9`
   (`left: ""` / `right: "kept\n"`); with only the **stderr** half of `check_drain_errors` deleted the stderr
@@ -9426,8 +9426,7 @@ section; ledger now **24 open / 104 closed**.**
   to 28 — both snippets now pass verbatim (`guard ok: 28 tests listed (expected 28), 0 failed`), and at a
   stale literal the step prints `::error::frps/tests/warn_delivery.rs lists 28 tests, this step expects 27:
   move the single literal in this shell step from 27 to 28`. `CHANGELOG.md` gets no bullet: test-only, no
-  user-visible behaviour change. Ledger after this close: **12 open / 190 closed** (base `18bcd1ad`: 13 open /
-  189 closed).
+  user-visible behaviour change. Ledger after this close: **19 open / 197 closed** (base `59272312` after the #435/#447 merges: 20 open / 196 closed — this close is the −1 and the PR files no new item; the earlier bases were `612f7df1` 21/192 and `18bcd1ad` 13/189).
 
 - [x] **`docs/config.md:22` names `websocketPort` as the Go frp v0.71.0 spelling of `websocket_port`, but Go's `frps` has no such field.**
   Filed by the coordinator from PR #436's delta adversarial (INFO). Measured with the real v0.71.0 binary:
