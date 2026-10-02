@@ -1272,6 +1272,16 @@ User-facing release notes for frp-rs.
 
 ### CI & Tooling
 
+- **The large-function report no longer charges a whole file to tests when a `#[cfg(test)]` decorates a `use`, a
+  `const` or a `fn`.** `scripts/large-functions.sh` attached such an attribute to the next `mod` anywhere below it,
+  so `frp-core/src/bridge.rs` read 4 production lines and `frp-core/src/logging.rs` 737. The region is now the
+  attribute plus the item it actually decorates, found by a structural `#[cfg(…)]` locator (depth-counted
+  brackets, string/comment aware) whose predicate is parsed — bare `test` gates, `all(…)` gates when any argument
+  does, `any(…)` only when every argument does, `not(…)` never — and the region's extent comes from the careful
+  string/comment-aware scan, so a brace inside a literal no longer closes a test module early. Measured:
+  `frp-core/src/bridge.rs` 4 → **1082** production and `frp-core/src/logging.rs` 737 → **689**; the per-file rows
+  move, but the default table's `Largest production functions` section is byte-identical to the base run and the
+  name / `mod X;`-sibling rules are unchanged. The fixture suite grows 42 → **118** checks.
 - **`docs/config.md`'s "Go frp Equivalent" column is now gated, so a wrong Go spelling reds instead of waiting for a
   reviewer.** A new offline, deterministic fixture suite (`scripts/tests/docs-go-column.sh`, run by the `health` job)
   parses every table whose 4th header cell is `Go frp Equivalent` and requires each row's Go cell to be an exact Go frp
