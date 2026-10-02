@@ -9274,15 +9274,6 @@ section; ledger now **24 open / 104 closed**.**
 
 - [x] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
   Filed by the coordinator while closing `TODO.md:8533` (PR #430), which removed the two local `pkill -f`
-- [ ] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
-  Filed by the coordinator while closing `TODO.md:8459` (PR #430), which removed the two local `pkill -f`
-  calls in `scripts/compat-test.sh`: `scripts/remote-frps.sh:195` and `:339` still run
-  `pkill -f 'frps -c frps.toml'` and `:409` uses `pgrep -f` on the same text, over ssh, to manage the
-  comparison server on a remote VPS. Name-plus-argument is the same hazard the local sweep just lost — a
-  process on the remote host whose command line merely contains that text is reaped too — but the local
-  `$TEST_DIR/`-prefix baseline and baseline subtraction the new sweep relies on do not exist on the remote
-  side, so the fix needs its own design (a remote pid file, or a port-scoped `fuser` route) rather than a copy
-  of `reap_scoped_strays`. PR #430's residue table names the three call sites.
   **Done-when:** the remote helper reaps by exact pid (a pid file written where it starts the server, or a
   port-scoped lookup) instead of `pkill -f`/`pgrep -f`, or the pattern kill is recorded as required with the
   measurement that shows a pid route is impossible over that ssh path.
