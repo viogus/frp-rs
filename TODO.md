@@ -348,7 +348,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
      today, so a two-line fix (require indent 2/6 with a leading `-`, or bail when the line has no
      two-space grid gap).
   3. **CI never runs the feature-split shapes**: the pins run with kcp and quic both off or both on;
-      frp-core's kcp-only shape is compiled (`.github/workflows/ci.yml:2246`) and its quic-only shape
+      frp-core's kcp-only shape is compiled (`.github/workflows/ci.yml:2355`) and its quic-only shape
       was not even compiled (the quic lane, `:2244`, reads `-p frp-client`); neither shape was executed.
   4. **An unreachable assertion**: the former vacuous pin at `frp-core/src/cli.rs:10460` could not fail with teeth.
   5. **Weakening survives**: `assert_eq!(removed, 1, ...)` (`frp-core/src/cli.rs:10246-10249`) back to
@@ -674,7 +674,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   dashboard-only config printed `kcp_bind_port: 0 -> 17001 (restart required); quic_bind_port: 0 -> 17002
   (restart required)`, and the repo's own `dashboard::v2::tests::test_serverinfo_go_shape` fails there with
   `missing Go key kcpBindPort`). The disjunction is deleted and the pin's guards are the listener features,
-  so the dashboard-only config — compiled by `ci.yml:916`'s clippy but test-run by no lane before this
+  so the dashboard-only config — compiled by `ci.yml:1025`'s clippy but test-run by no lane before this
   round — now asserts quiet and fails against the pre-fix classification.
   **Not over-reported** — a restart could not change these either, so the line would be false: the
   fields no code in `frp-server` reads (`auth.useEncryption` from the item above, `tls_server_name`,
@@ -1113,7 +1113,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   "this build has no TLS support" text. Pinned by the four cells of
   `frp-core/tests/web_server_tls_enable_warning.rs` and by the emitted **record** being compared
   byte-exactly through `frp-core/tests/common/mod.rs:88` `assert_record_is_exactly_the_message`; the
-  `micro,admin` shape gets a count-guarded lane (`.github/workflows/ci.yml:1185`, literal 1). The re-key the
+  `micro,admin` shape gets a count-guarded lane (`.github/workflows/ci.yml:1294`, literal 1). The re-key the
   filing's "Entanglement" paragraph demanded was therefore unnecessary — the condition lives in the owning
   crate, not at the sites — and `docs/config.md:192` now states the three-way rule. **Supersedes** the
   `cfg!`-passing design recorded in the item above: that paragraph's `has_dashboard` signature and its
@@ -2178,9 +2178,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   targets (lib, lib test, every `frp-core/tests/*.rs`, the bench), and neither file is in this branch's
   diff — both were last touched by `96ccca0` (#358). Why no lane sees it: the only workspace clippy lane
   is `ci.yml:84` (`cargo clippy --workspace --all-targets --all-features -- -D warnings`), which
-  **compiles both `cfg(not(…))` items out**, and the two isolated clippy steps (`ci.yml:916-917`) are
+  **compiles both `cfg(not(…))` items out**, and the two isolated clippy steps (`ci.yml:3576-3577`) are
   `-p frp-server --no-default-features --features dashboard` and `-p frp-client --no-default-features`.
-  The isolated step that *does* compile this configuration — `ci.yml:920`'s frp-core tier step — runs
+  The isolated step that *does* compile this configuration — the frp-core tier step at `ci.yml:3620` — runs
   `check`, i.e. rustc lints only, which is exactly why the `unused_mut` that the restart-only change
   introduced there fired while a `clippy::*` lint cannot. This is the **same gate gap as that CI
   failure, in the other direction**, which is why it is filed rather than quietly fixed.
@@ -7021,7 +7021,7 @@ nothing about whether the described behaviour still holds.
 
 ---
 
-- [ ] **`docs/config.md`'s Go column has no gate.**
+- [x] **`docs/config.md`'s Go column has no gate.**
   Filed by the PR #447 records round from PR #448, which reshaped one Go-column row by hand. `repo-health.sh`
   resolves backticked repo paths only, and `TODO.md` is point-in-time and out of scope, so a wrong Go spelling
   or mapping in the column is caught by a human only: PR #448 had to fix the `websocketPort` row manually, and
@@ -7029,6 +7029,50 @@ nothing about whether the described behaviour still holds.
   **Done-when:** either a check (a curated table of the Go-mapped rows, or a fixture that re-measures a sample
   against the real Go binary via `scripts/download-go-frp.sh`) or an explicit recorded exemption naming what a
   human must verify and when.
+
+  **Done (2026-10-02, at `a6de906d`, squash-merged as `74231c7e`, PR #466, based on `7234d7e3`) — gated offline and deterministically, taking the curated-table branch.**
+  New `scripts/tests/docs-go-column.sh` (667 lines, sha256
+  `b39e10c426647230b7ca9e6e8fdbc6fadde979dc1bbef1f69eebddc22c3175e0`) parses every `docs/config.md` table whose header
+  line is exactly `| Field | Type | Default | Go frp Equivalent | Description |` and classifies the 4th cell of every data
+  row: a token in the curated Go spelling table `GO`, a recorded doc alias in `ALIASES`, a qualified
+  `` `token` (start|end|nested) ``, a divergence marker (an em dash, bare or in backticks), or one of four documented
+  non-token shapes (`**Required.**`, `` `sk` / `secretKey` ``, `` `transport.wireProtocol = "v2"` ``). Anything else is a
+  violation against the canonical path, so a scan of a `DOCS_CONFIG` copy still names `docs/config.md:<line>`. Cells are split
+  with `re.split(r'(?<!\\)\|', …)`, because descriptions carry escaped `\|` and a naive split under-counts. Measured inventory:
+  17 Go-column tables, 192 data rows — 121 exact Go spellings, 8 qualified, 49 rows over 41 distinct recorded alias spellings,
+  10 divergence-marker rows, 4 documented non-token shapes, 0 unknown. `MIN_CHECKS=204`, and an `EXIT` trap installed above the
+  first check reds with `docs-go-column: only %d check(s) ran, floor %d — the suite was cut short` if the run stops early, so a
+  truncated scan cannot pass quietly. The two known-divergent rows are pinned by field name and by their `no Go server field`
+  prose (`PINS = ((22, 'websocket_port'), (25, 'tls_enable'))`), so rewording either back into a bare Go spelling reds. Five
+  mutation witnesses ride the same run — M1 rewords `docs/config.md:22` to `` `websocketPort` ``, M2 `:25` to `` `tlsEnable` ``,
+  M3 misspells a curated token (`bindAddr` → `bindAddress`), M4 drops every table (the row floor reds) and M5 strips row 22's
+  divergence prose — each asserted red by its own output and each mutant re-checked to have actually applied, so a vacuous witness
+  fails instead of passing. The M1 witness is the CI canary (`guard_canary='M1 (websocket_port reworded'`). Provenance is recorded
+  in the fixture header, not assumed: Go frp's annotated tag `v0.71.0` is object `40adeed73b51e7ee1766d7cfb15d02ba9431ba2b`,
+  pointing at commit `4a23aa181c1d7e28eecaa8216024ed753b9d27c8`, and the `GO` table built from that `pkg/config/v1` tree is
+  **108 dotted json paths + 153 bare json field names = 261 distinct spellings, disjoint**.
+  **Coverage, stated exactly:** this is a token-membership gate over the Go column plus the recorded 41-entry / 49-row `ALIASES`
+  exemption — not a row→Go-path mapping check, so a *wrong but real* Go key in a row's cell still passes, and the alias reasons are
+  accepted by inventory rather than each validated against Go. Both gaps are filed as residue below.
+  Wired into the `health` job as a new step at `.github/workflows/ci.yml:775`, immediately after the large-functions classifier step
+  and in the same shape: `guard_file=scripts/tests/docs-go-column.sh`,
+  `guard_pin=b39e10c426647230b7ca9e6e8fdbc6fadde979dc1bbef1f69eebddc22c3175e0`, `guard_exact=204` / `guard_floor=204`, the canary
+  above, an absolute-path sha256 tool probe proved against the `abc` vector, a re-count of the `  ok` / `  FAIL` lines from the
+  captured log, and a `case` on the literal `RESULT: 204 fixture check(s) hold` — so weakening the suite is a two-file change.
+  Adding it moved every `ci.yml` line at or after `:775` down by 109; the point-in-time cites carrying those numbers were
+  re-derived by content in this records round, never by applying the offset (see the PR #466 row of `docs/history/development-log.md`).
+  **The blindness it closes:** before the step existed, with `docs/config.md:22` rotted in place to `` `websocketPort` ``,
+  `bash scripts/repo-health.sh` still ended `RESULT: invariants hold` — `repo-health.sh` resolves backticked repo paths only and never
+  runs `scripts/tests/*` — while `DOCS_CONFIG=/tmp/mut-config.md bash scripts/tests/docs-go-column.sh` exits 1 with three FAIL lines
+  naming `docs/config.md:22`; the document was restored byte-identically. Gates at the reviewed head: suite
+  `RESULT: 204 fixture check(s) hold`; the canary red as above; `repo-health.sh` `RESULT: invariants hold`; `todo-cite-guard.sh` 93/0
+  over 226 headers; `todo-cite-guard-fixtures.sh` 60; `repo-health-fixtures.sh` 32; `compat-stray-guard.sh` 40;
+  `large-functions-classifier.sh` 42; `cargo fmt --all -- --check` and `cargo clippy -D warnings` rc 0; `git diff --check` rc 0.
+  Reviews: verification `MERGE-with-findings` (9/9 claim groups) and adversarial `MERGE-with-findings`, no blocker; three nits were
+  recorded as design limits (the hardcoded `204 checks hold` echo, the `guard_exact >= guard_floor` assertion shape, the exact-header
+  detection) and the delta re-confirm caught two records defects fixed in-branch (`194` arithmetic and a false `store.go` reachability
+  clause). Ledger after this close: **12 open / 214 closed** (base `7234d7e3`: 14 open / 212 closed; the four residue items appended
+  below take it to **16 open / 214 closed** over 230 item headers).
 
 
 ## P2 — structural
@@ -7952,7 +7996,7 @@ section; ledger now **24 open / 104 closed**.**
   normal-graph rustls = 11) frp-core's `tls` is on while frp-server's is off, so `frps-micro` would
   print the "refused at startup / auto-generates" text with no acceptor — exactly the round-1 F1
   defect. Measured: **no** lane produces that shape (`release.yml:100/102/108/110/159/162/210/213`
-  are workspace-root `cargo build … --no-default-features --features tiny|micro`; `ci.yml:921`/`:925`
+  are workspace-root `cargo build … --no-default-features --features tiny|micro`; `ci.yml:3427`/`:3431`
   the matching `cargo check --workspace … tiny|micro`), and frp-core cannot observe frp-server's
   features, so the constants' own doc comment correctly keys on frp-core's feature.
   **Done-when:** either the variant is gated on a cfg frp-core can actually see (or its text is
@@ -9278,7 +9322,7 @@ section; ledger now **24 open / 104 closed**.**
   `!text.contains(&port.to_string())` reds at `frpc/tests/cli_inputs.rs:1485:9` (the original failure), the head
   is 34/34, and `--features admin` and `--features full,admin` list the same 34 names. The lane half of the
   done-when shipped **scoped**: `Run frpc's CLI-input tests with the admin feature`
-  (`.github/workflows/ci.yml:1124`) runs `cargo test -p frpc --features admin --test cli_inputs`
+  (`.github/workflows/ci.yml:1233`) runs `cargo test -p frpc --features admin --test cli_inputs`
   (`:1124`-`1194`) behind a fail-closed count guard (`FRPC_ADMIN_CLI_INPUTS_TESTS: "34"` at `:363`; zero and
   non-numeric values rejected at `:1169`; the `--list` count and `test result: ok. 34 passed; 0 failed` both
   checked at `:1180-1181`; the honest lane prints `frpc admin CLI-input guard ok: 34 tests listed (expected 34),
@@ -9432,26 +9476,26 @@ section; ledger now **24 open / 104 closed**.**
   `ok. 44 passed; 0 failed; 0 ignored`; `--list` 44 in both; no profile in the workspace sets
   `debug-assertions` (`Cargo.toml:105`, `:115-117`), so `not(debug_assertions)` is exactly the axis this lane
   covers, and a fat-LTO run gives the same numbers. A new additive job, `release-tests` / `Tests (release
-  profile)` (`.github/workflows/ci.yml:1253-1345`, `timeout-minutes: 30` at `:1256`), runs
+  profile)` (`.github/workflows/ci.yml:2877-2878`, `timeout-minutes: 30` at `:2880`), runs
   `cargo test --release -p frps --test cli_exit_codes` in the same release profile the `build` job uses
-  (`lto = false`, `opt-level = 2`, `:1290-1292`) and fails closed on four things: the target was really built,
+  (`lto = false`, `opt-level = 2`, `:2942`) and fails closed on four things: the target was really built,
   the summary is exactly `test result: ok. 41 passed; 0 failed; 3 ignored;`, the ignored **names** are the
   three pins in `FRPS_RELEASE_CLI_IGNORED` (both sides sorted), and `--list` equals
-  `FRPS_RELEASE_CLI_TESTS` = 44 (`:1336-1342`, "Update both literals together"). Teeth, re-measured by both
+  `FRPS_RELEASE_CLI_TESTS` = 44 then, 45 at this head (`:2882`; the `--list` equality at `:2998`-`:3000`, "Update both literals together"). Teeth, re-measured by both
   reviewers: 9 of 11 mutants caught — 41→40 drift, a stray fourth `ignored`, the target missing, 0 tests, an
   unconditional `#[ignore]` on a fourth pin, the pins `#[cfg]`'d out, a rename, the wrong test ignored with the
   count unchanged, an extra passing test; the summary substring is not end-anchored and the reasons are never
   read back, both accepted. What the lane does **not** defend is written down rather than implied
-  (`ci.yml:1243-1248`): turning the three attributes into an unconditional `#[ignore]` gives byte-identical
+  (`ci.yml:2849-2855`): turning the three attributes into an unconditional `#[ignore]` gives byte-identical
   release output and this guard exits 0 by design, because that case belongs to the pre-existing debug lane
-  (`FRPS_CLI_TESTS: "44"` at `:278`, asserted at `:747`). The job is deliberately absent from `build`'s
-  `needs` (`ci.yml:1843`) so a cold release build cannot serialize the artifact job, which means it gates a
-  merge only once branch protection names "Tests (release profile)" (`:1249-1252`). Cold release build: 5m07s
-  at `-j 2`, 9m51s under load, inside the 30-minute cap.
+  (`FRPS_CLI_TESTS` at `:1361` — `"44"` then, `"45"` now — asserted at `:2224`-`:2225`). The job is deliberately absent from `build`'s
+  `needs` (`ci.yml:3726`) so a cold release build cannot serialize the artifact job, which means it gates a
+  merge only once branch protection names "Tests (release profile)" (`:2857`-`:2860`). Cold release build: 5m07s
+  at `-j 2`, 9m51s under load, inside the 30-minute cap. Every count in this paragraph is PR #443's measurement; at the current head the lane pins 45 listed tests (`:2882`) and its release summary is `42 passed; 0 failed; 3 ignored` (`:2845`).
 
 - [x] **Release-mode test coverage is this one file: no CI job builds or runs any other test target in the `release` profile.**
   Filed by the coordinator while closing the release-profile lane item above. `release-tests`
-  (`.github/workflows/ci.yml:1253-1345`) compiles and runs `frps/tests/cli_exit_codes.rs` and nothing else, so
+  (`.github/workflows/ci.yml:2877-2878`) compiles and runs `frps/tests/cli_exit_codes.rs` and nothing else, so
   every other test target — `frp-core`'s config and CLI suites, `frps/tests/warn_delivery.rs`, `frpc/tests/*` —
   is only ever built with `debug_assertions` on. Code a release binary compiles differently
   (`#[cfg(debug_assertions)]` hooks, `debug_assert!`, overflow checks) is therefore pinned in debug only, and
@@ -9753,7 +9797,7 @@ section; ledger now **24 open / 104 closed**.**
   whose three arms red individually under the mask-removed mutant — `--log-file console` at `:1210:5`,
   `--log-max-days 3` over `max_days = 7` at `:1231:5`, `--log-format json` over `format = "text"` at `:1253:5`
   — with the combined mutant red at `:1210:5`; the `--list` count guard moved with it
-  (`.github/workflows/ci.yml:1129`, `expected=11`).
+  (`.github/workflows/ci.yml:1238`, `expected=11`).
 - [x] **R2 — The implicit-config lane (`frps --log-level ""` with an in-tree `frps.toml`) has no Go counterpart.**
   Post-#427 it keeps the file's `warn` (0 `INFO`); Go without `-c` never reads a file and emits 1
   `INFO` (`frps uses command line arguments for config`, 186 B). The lane is an frp-rs extension
@@ -9967,7 +10011,7 @@ section; ledger now **24 open / 104 closed**.**
   **15 open / 186 closed** (base `e4c23b2f`: 16 open / 185 closed).
 
 - [x] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
-  Filed by the coordinator while closing `TODO.md:8533` (PR #430), which removed the two local `pkill -f`
+  Filed by the coordinator while closing `TODO.md:8577` (PR #430), which removed the two local `pkill -f`
   **Done-when:** the remote helper reaps by exact pid (a pid file written where it starts the server, or a
   port-scoped lookup) instead of `pkill -f`/`pgrep -f`, or the pattern kill is recorded as required with the
   measurement that shows a pid route is impossible over that ssh path.
@@ -10182,7 +10226,7 @@ section; ledger now **24 open / 104 closed**.**
   avoids, and `strict_config` defaults to true (`frp-core/src/cli.rs:139`) while the repo's own documented
   `frps.toml:21-23` writes non-zero `kcp_bind_port`/`quic_bind_port`, so rejecting would make `frps -c frps.toml`
   refuse to start in every micro/tiny build and break the `known_server_keys()` invariant at
-  `frp-core/src/config/strict.rs:123-127`. `frps verify` stays silent, exactly like the `tls_enable` diagnostic — a residue the reviewers filed as `TODO.md:9293`.
+  `frp-core/src/config/strict.rs:123-127`. `frps verify` stays silent, exactly like the `tls_enable` diagnostic — a residue the reviewers filed as `TODO.md:9337`.
   Both directions are pinned in `frp-core/src/config/tests.rs:290-580`: three `#[cfg(feature = "…")]`
   `…_enabled_honours_the_port` tests (default lane, `5 passed`), six `#[cfg(not(feature = "…"))]`
   `…_disabled_reports_the_dropped_port` / `…_disabled_is_silent_for_zero_or_absent` tests over both spellings ×
@@ -10311,7 +10355,7 @@ section; ledger now **24 open / 104 closed**.**
   `frps/tests/warn_delivery.rs:2405:5` with `left` = the success line alone; M3-B moving the same loop after the
   success `println!` reds the same `frps/tests/warn_delivery.rs:2405:5` with the two lines swapped.
 
-- [ ] **Four comment cites name a line that does not support the claim they make (all already wrong at the pre-#455 base).**
+- [x] **Four comment cites name a line that does not support the claim they make (all already wrong at the pre-#455 base).**
   Filed by PR #455's adversarial (F-D) and verification (F1) reviews; the round's repoint was content-faithful, so
   it preserved these rather than introducing them. Verified at the rebased head:
   `frps/src/main.rs:788` / `:933` cite `frp-server/src/service.rs:2281` for the graceful-shutdown `Ok(())` tail,
@@ -10325,6 +10369,35 @@ section; ledger now **24 open / 104 closed**.**
   cited as `frp-server/src/service.rs:2048`; no `service.rs:2338` cite remains).
   **Done-when:** each of the three remaining cites names the line that actually supports its claim, or the claim
   is reworded to what the cited line says.
+
+  **Done (2026-10-02, at `a6de906d`, squash-merged as `74231c7e`, PR #466, based on `7234d7e3`) — six comment cites repointed; the honest scope is four logical cites, not the three this item claims.**
+  Each row was reproduced by reading the citing sentence, then reading the new target back at `a6de906d` and checking it says what
+  the comment claims:
+
+  | cite site | before | after |
+  | --- | --- | --- |
+  | `frps/src/main.rs:823` / `:968` | `frp-server/src/service.rs:2281` (past EOF) | `frp-server/src/service.rs:1529` — the sole `Ok(())` tail |
+  | `frp-core/tests/server_tls_enable_warning.rs:433` | `frp-core/src/config/loader.rs:796` (doc comment; call at `:803`) | `frp-core/src/config/loader.rs:932` — the `tracing::warn!` call |
+  | `frpc/tests/admin_config_get_warning.rs:725` | `frp-core/src/config/loader.rs:446-448` (micro/no-TLS doc block) | `frp-core/src/config/loader.rs:787` — the `web_server_tls_enable_set_in` body line (`:781` is the `fn`) |
+  | `frps/tests/warn_delivery.rs:913` | `frp-server/src/service.rs:2048` (past EOF) | `frp-server/src/service.rs:1568` — the reload site |
+  | `frps/tests/warn_delivery.rs:914` (siblings) | `:1043` on the `-c` path, `:601` on the `--config-dir` path | `frps/src/main.rs:1078` and `frps/src/main.rs:625` |
+
+  The item's "three remaining cites" undercounts: the `frps/tests/warn_delivery.rs:914` sentence carries three rotted cites, so the
+  honest scope is **four logical cites / six occurrences**. The two `frps/src/main.rs` cites were **stale, not swapped** — at the
+  pre-#455 base `:1043` was on the `-c` path and `:601` on the `--config-dir` path, exactly the labels the comment carried; both
+  regions then grew by different amounts. The same class, pulled in with PR #466's insertion (each target read back; comments only,
+  no behaviour or assertion changed): `frp-core/tests/server_tls_enable_warning.rs:68`/`:70`/`:71` cited
+  `.github/workflows/ci.yml:191-194` / `:195-226` / `:226` (the repo-health fixture step's `guard_hasher` / `guard_abc` vector probe /
+  `return 1` internals) and now cite `.github/workflows/ci.yml:1719` (`run: cargo test -p frp-core`) and `:1751`
+  (`run: cargo test -p frp-core --no-default-features --all-targets`), the two lanes those `//!` lines describe. Two of the shifted
+  cites were **already wrong at base**: `ci.yml:916` was the cite-guard step's own comment and `:996`/`:1000` were comment lines inside
+  the cite-guard-fixtures step, so `frp-server/tests/server_reload_restart_only.rs:456` now cites `.github/workflows/ci.yml:3576`
+  (`cargo clippy -p frp-server --no-default-features --features dashboard --all-targets`) and `frp-core/src/config/loader.rs:508` cites
+  `:3427`/`:3431` (`cargo check --workspace --no-default-features --features tiny` / `micro`); `frp-server/src/service.rs:1927-1932`'s
+  four cites follow the +109 shift to `:1605`/`:3300`/`:3131`/`:1642`. All 93 live `TODO.md:<n>` cites the guard checks were re-derived
+  by header **identity** (old header text → new line), never by a constant offset. Ledger after this close: **12 open / 214 closed**
+  (base `7234d7e3`: 14 open / 212 closed; the four residue items appended below take it to **16 open / 214 closed** over 230 item
+  headers).
 
 - [x] **`scripts/tests/remote-frps-reap.sh` runs in no CI job.**
   Filed while closing `TODO.md:9269` (PR #456). The fixture that pins the new exact-pid route is run only by
@@ -10429,7 +10502,7 @@ section; ledger now **24 open / 104 closed**.**
   Evidence (measured; the two files that decide the outcome are byte-identical to the base):
   - `cargo test -p frp-server --no-default-features --features dashboard --lib -j 2` → `test result: FAILED. 358 passed; 1 failed`, with `dashboard::v2::tests::test_serverinfo_go_shape` panicking at `frp-server/src/dashboard.rs:3064:17` (`missing Go key kcpBindPort`).
   - `frp-server/src/dashboard.rs:3044-3062` demands the full Go key set including `kcpBindPort` and `quicBindPort`, while the response field at `frp-server/src/dashboard.rs:252-254` carries `#[cfg(feature = "kcp")]` (and `:1648-1650` the `quic` twin), so neither key can exist in a build without that feature; the fixture is `frp_core::config::ServerConfig::default()` (`frp-server/src/dashboard.rs:2953`).
-  - Pre-existing, measured at the base commit: `git worktree add --detach /private/tmp/batch-q-base b9af37c5` + `CARGO_TARGET_DIR=/private/tmp/tgt-basecheck cargo test -p frp-server --no-default-features --features dashboard --lib -j 2 -- dashboard::v2::tests::test_serverinfo_go_shape` → `FAILED. 0 passed; 1 failed; 356 filtered out`, the same `missing Go key kcpBindPort` panic at `frp-server/src/dashboard.rs:3064:17` (cold build, 1 m 52 s, macOS arm64, `-j 2`). The file-identity check agrees: `git diff b9af37c5 -- frp-server/src/dashboard.rs frp-core/src/config/server.rs` is empty, and `git show b9af37c5:frp-server/src/dashboard.rs` carries the same ungated key list. CI never runs the lane unfiltered — `.github/workflows/ci.yml:1533`, `:1541` and `:1559` run `-p frp-server --no-default-features --features dashboard --lib` with a `web_server_tls_enable_reader` filter, so this test is filtered out of every job that uses that shape.
+  - Pre-existing, measured at the base commit: `git worktree add --detach /private/tmp/batch-q-base b9af37c5` + `CARGO_TARGET_DIR=/private/tmp/tgt-basecheck cargo test -p frp-server --no-default-features --features dashboard --lib -j 2 -- dashboard::v2::tests::test_serverinfo_go_shape` → `FAILED. 0 passed; 1 failed; 356 filtered out`, the same `missing Go key kcpBindPort` panic at `frp-server/src/dashboard.rs:3064:17` (cold build, 1 m 52 s, macOS arm64, `-j 2`). The file-identity check agrees: `git diff b9af37c5 -- frp-server/src/dashboard.rs frp-core/src/config/server.rs` is empty, and `git show b9af37c5:frp-server/src/dashboard.rs` carries the same ungated key list. CI never runs the lane unfiltered — `.github/workflows/ci.yml:1642`, `:1541` and `:1559` run `-p frp-server --no-default-features --features dashboard --lib` with a `web_server_tls_enable_reader` filter, so this test is filtered out of every job that uses that shape.
 
   **Done-when:** that shape is green — either the test's Go-key list is `#[cfg]`-gated on the features this build compiles in (leaving the full list for the default-feature lane) or the lane is declared unsupported with the reason recorded next to it — and `.github/workflows/ci.yml` runs it without a filter at least once, so the shape is covered rather than assumed.
 
@@ -10589,3 +10662,47 @@ section; ledger now **24 open / 104 closed**.**
   Not proven for that specific CI run: that `echo_port` was in fact 19510 (the `EXIT` trap removed `TEST_DIR`, and the echo port is never printed). A listener leaked by the immediately preceding scenario has the same signature and the same cure, but it is the weaker explanation: `random_port()` skips anything already LISTENing at pick time, `cleanup_pids` never runs *between ordinary `run_test` scenarios* (`run_test`, `:703-709`, reaps nothing; the reaper runs only in the `EXIT` trap `:169`, inside `run_xtcp_test` `:4353` — function `:4331`, which all 17 `test_xtcp_*` wrappers call, and XTCP is skipped unless `RUN_XTCP=1` — and once before the KCP/QUIC phase `:7739`, none of which sits between the ordinary scenarios that bracket `test_r2g_compression` at `:7707`), and the only process this scenario starts in the post-pick window is its own echo server. Distinguishers if it recurs: `lsof -nP -iTCP:<frps_port> -sTCP:LISTEN` naming `Python` versus an `frps`/`frpc` with another scenario's `-c` path; the frpc error text (an echo gives exactly `Unexpected response to login`; a leaked frps answers with token/protocol semantics); and `local_port == server_port` in the scenario's `frpc.toml` under `--keep-tmp`.
 
   **Done-when:** the harness cannot give two listeners in one scenario the same port — by reserving each port for the life of the scenario, or by making the pick reject ports already allocated in that scenario — and the readiness probe fails closed when the socket that answers is not the process that was just launched; with the forced-collision run above red before the change (the same three symptoms as attempt 1 of run `37015704902`) and green after, a forced `echo_port="$proxy_port"` collision no longer passing, and `scripts/lib/compat-stray-guard.sh` and its fixture suite unweakened. If instead the leak path is the real one, the Done-when is the same bar applied to teardown: no listener from scenario *n* may still hold a port when scenario *n+1* picks one.
+
+- [ ] **`docs/config.md:3-4` still claims a 1:1 Go mapping the gate now measures against.**
+
+  Filed by the M-1 records round (PR #466). The page opens "Every field maps 1:1 to a Go frp v0.71.0 equivalent", but
+  `scripts/tests/docs-go-column.sh` classifies 49 rows as *recorded doc aliases* rather than Go v0.71.0 spellings and 10 rows as
+  divergence markers. The claim is not wrong for every row, and the gate keeps the column honest about which rows are which, but
+  the sentence a reader meets first still asserts a mapping the column itself qualifies.
+
+  **Done-when:** the opening sentence states what the column actually asserts, or names the alias and divergence rows it exempts —
+  and the gate's inventory (`EXPECTED_ALIAS_ROWS=49`, `EXPECTED_DIVERGENT=10`) still reds on an unrecorded row.
+
+- [ ] **The gate's 41 alias entries carry prose reasons that were never individually validated against Go frp v0.71.0.**
+
+  Filed by the M-1 records round (PR #466). `ALIASES` in `scripts/tests/docs-go-column.sh` records 41 distinct doc spellings over
+  49 rows, each with a hand-written reason; several are demonstrably extension-shaped (`webServer.tlsCertFile`,
+  `webServer.custom404Page`, the flattened `auth.oidc*` spellings), but the table as a whole ratifies its own prose — the gate
+  compares the document against the table, so a wrong alias reason is invisible to it.
+
+  **Done-when:** every one of the 41 recorded aliases is either repointed to its true Go v0.71.0 `json` path or recorded in
+  `docs/config.md` as a deliberate extension or divergence, with the check of each named.
+
+- [ ] **The gate's 261-spelling `GO` table is trusted, not measured.**
+
+  Filed by the M-1 records round (PR #466). The fixture header records the provenance (Go frp's annotated tag `v0.71.0` is object
+  `40adeed73b51e7ee1766d7cfb15d02ba9431ba2b`, pointing at commit `4a23aa181c1d7e28eecaa8216024ed753b9d27c8`), but the
+  261-spelling set built from that `pkg/config/v1` tree is embedded in the script and never re-derived: a transcription error in
+  it ratifies itself, because the suite compares the document against the table rather than against the Go source.
+
+  **Done-when:** re-deriving `GO` from the recorded tag and commit is a scripted step whose output is diffed against the embedded
+  table, and the suite reds when the two disagree.
+
+- [ ] **The Go-column gate checks token membership, not the row→Go-path mapping, so a wrong-but-real Go key passes.**
+
+  Filed by the M-1 records round (PR #466). Measured against the delivered suite: mutating `docs/config.md:15`'s Go cell from
+  `` `bindPort` `` to `` `quicBindPort` `` — both real Go v0.71.0 keys, both in `GO` — leaves the suite green (exit 0,
+  `RESULT: 204 fixture check(s) hold`), while `` `kcpPort` `` (not a Go v0.71.0 spelling) reds with exit 1. The gate proves each cell
+  is *a* Go spelling, not that it is *the* Go spelling for that row.
+
+**Cross-reference:** the Done-when branch below that records per row why membership is all that is asserted would also settle
+residue item 2 above (the 41 alias entries' prose reasons), so whichever of the two lands first should close or narrow the
+other.
+
+  **Done-when:** each row's Go cell is checked against an expected path for that row, so swapping in a real-but-wrong Go key reds;
+  or the column records per row why membership is all that is being asserted.
