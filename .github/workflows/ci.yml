@@ -772,6 +772,115 @@ jobs:
             exit 1
           fi
           echo "Large-functions classifier fixture checks ok: 42 checks hold (floor $guard_floor), M1 witness present, no failure line"
+      - name: docs/config.md Go column — fixture checks
+        # TODO.md "`docs/config.md`'s Go column has no gate.": the document
+        # asserts "Every field maps 1:1 to a Go frp v0.71.0 equivalent", but no
+        # gate measured that column, and two rows had already drifted by hand
+        # (PR #448 corrected one row, PR #455 found a second naming a Go field
+        # `frps` does not read). The 204-check suite
+        # `scripts/tests/docs-go-column.sh` landed in its own PR; it is wired
+        # here in the same shape as the classifier step above — the suite's
+        # bytes are pinned before it runs, its exact `RESULT:` total and
+        # `ok`-line count are compared, an absolute floor sits under them so a
+        # delete-a-case-then-lower-the-literal edit is still red, and any `FAIL`
+        # line fails the step.
+        #
+        # The suite is its own negative control: it drives five deliberate
+        # mutations of a throwaway copy of `docs/config.md` (M1–M5) and requires
+        # each to red at a named line — a reworded `websocket_port` divergence,
+        # a reworded `tls_enable` divergence, a misspelled curated token, every
+        # table dropped, and the `websocket_port` divergence prose stripped. The
+        # `guard_canary` check below is the M1 witness, printed only by a run
+        # whose mutation loop actually ran, so deleting that loop cannot pass by
+        # keeping the count. Tying a literal to the suite's wording is safe here
+        # because `guard_pin` pins the bytes: changing the wording is already a
+        # two-file change.
+        shell: bash
+        run: |
+          set -o pipefail
+          log=/tmp/frp-docs-go-column.log
+          status=0
+          guard_file=scripts/tests/docs-go-column.sh
+          guard_pin=0f1a8504f57a6bfb4d835587a1dffe0a7923a2a4f71d6c7f986e37a701ffb703
+          guard_exact=204
+          guard_floor=204
+          guard_canary='M1 (websocket_port reworded'
+          guard_hasher=''
+          guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+          for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
+            [ -x "$cand" ] || continue
+            guard_probe=$(printf 'abc' | "$cand" 2>/dev/null)
+            [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+            guard_hasher=$cand
+            break
+          done
+          if [ -z "$guard_hasher" ]; then
+            for cand in /usr/bin/shasum /bin/shasum /usr/local/bin/shasum; do
+              [ -x "$cand" ] || continue
+              guard_probe=$(printf 'abc' | "$cand" -a 256 2>/dev/null)
+              [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+              guard_hasher="$cand -a 256"
+              break
+            done
+          fi
+          if [ -z "$guard_hasher" ]; then
+            echo "::error::no sha256 tool at an absolute path reproduces the known sha256 vector; cannot verify $guard_file"
+            exit 1
+          fi
+          # shellcheck disable=SC2086  # $guard_hasher is the word-split "<abs path> [-a 256]"
+          guard_out=$($guard_hasher "$guard_file" 2>/dev/null) || true
+          guard_sha=${guard_out%% *}
+          if [ "$guard_sha" != "$guard_pin" ]; then
+            echo "::error::$guard_file is not the pinned revision (sha256 ${guard_sha:-<none>}; expected $guard_pin)"
+            echo "::error::a change to the docs-go-column suite — including one that weakens its own checks — must also update guard_pin in the 'docs/config.md Go column — fixture checks' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended, otherwise revert it"
+            exit 1
+          fi
+          bash "$guard_file" > "$log" 2>&1 || status=1
+          guard_log=$(<"$log")
+          printf '%s\n' "$guard_log"
+          guard_ok=0
+          guard_result=0
+          guard_canary_hit=0
+          guard_fail=0
+          guard_fail_text=''
+          while IFS= read -r guard_line; do
+            case $guard_line in
+              '  ok '*) guard_ok=$((guard_ok + 1)) ;;
+              'FAIL'*|'  FAIL'*)
+                guard_fail=$((guard_fail + 1))
+                guard_fail_text="${guard_fail_text}${guard_line}"$'\n'
+                ;;
+            esac
+          done <<< "$guard_log"
+          case $guard_log in
+            *"RESULT: $guard_exact fixture check(s) hold"*) guard_result=1 ;;
+          esac
+          case $guard_log in
+            *"$guard_canary"*) guard_canary_hit=1 ;;
+          esac
+          [ "$guard_result" = "1" ] || status=1
+          [ "$guard_ok" = "$guard_exact" ] || status=1
+          # The floor is asserted on the *declared* literal, not on the `ok`
+          # count: `guard_ok` is already required to equal `guard_exact`, so a
+          # floor on `guard_ok` could never fire alone. This is the assertion a
+          # delete-a-case-then-lower-the-literal edit trips — `guard_exact` fell
+          # but `guard_floor` did not.
+          [ "$guard_exact" -ge "$guard_floor" ] || status=1
+          [ "$guard_canary_hit" = "1" ] || status=1
+          [ "$guard_fail" = "0" ] || status=1
+          if [ "$guard_canary_hit" != "1" ]; then
+            echo "::error::the docs-go-column suite did not print its M1 witness ('$guard_canary'); its negative-control mutations did not run, or the fixture is not driving the scan over the mutated copy"
+          fi
+          if [ "$guard_fail" != "0" ]; then
+            echo "::error::the docs-go-column suite printed $guard_fail failure line(s); a run that reported a failure cannot be reported as a green step:"
+            printf '%s' "$guard_fail_text"
+          fi
+          if [ "$status" != "0" ]; then
+            echo "::error::the docs-go-column fixture did not report 204 checks with no failure line"
+            echo "::error::scripts/tests/docs-go-column.sh must print 204 '  ok' lines, include the M1 witness, and end with 'RESULT: 204 fixture check(s) hold' (floor=$guard_floor, exact=$guard_exact), and must not print a 'FAIL' line; a smaller total, a missing witness, a failure line or no output at all (an \`exec\`) means checks were skipped or swallowed — restore them rather than lowering this literal"
+            exit 1
+          fi
+          echo "docs-go-column fixture checks ok: 204 checks hold (floor $guard_floor), M1 witness present, no failure line"
       - name: Remote-frps reap — fixture checks
         # TODO.md "`scripts/tests/remote-frps-reap.sh` runs in no CI job"
         # (`:9959` when it was filed): the suite drives
