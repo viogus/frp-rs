@@ -923,7 +923,7 @@ loader modes and pinned in `frp-core/src/config/tests.rs`.
 (`pkg/config/legacy/client.go:166,172-200`): `process_includes` runs before the `[common]` hoist, so the
 client `.ini` loader takes that string key out of the raw `[common]` table while it is still visible
 (`frp-core/src/config/file.rs:353-360`) and appends it to the include walk ahead of the top-level
-spellings (`:368`). Measured with `frpc verify -c`: `x12_good.ini` (`[common] includes` naming a file that
+spellings (`frp-core/src/config/file.rs:382`). Measured with `frpc verify -c`: `x12_good.ini` (`[common] includes` naming a file that
 holds one `[p1]` proxy) is rc 0 on Go and now rc 0 with `Proxies: 1` here, where nothing was loaded
 before; `x12_missing.ini` (an include under a nonexistent directory) is Go rc 1 `include: directory of …
 not exist` and now rc 1 here, where it was rc 0. The pins are

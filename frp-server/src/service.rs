@@ -1922,10 +1922,16 @@ mod tests {
     /// `dashboard` feature reads it. A resolver that hard-coded either variant
     /// would either warn in a build that honours the port (dashboard on) or stay
     /// silent in every shipped build (dashboard off) — the two directions the
-    /// real-binary rows in `frps/tests/warn_delivery.rs` cover. The default
-    /// `-p frp-server` lane has `dashboard` off and the
-    /// `--no-default-features --features dashboard` lane has it on, so both
-    /// halves of this pin are exercised in CI.
+    /// real-binary rows in `frps/tests/warn_delivery.rs` cover. The
+    /// `dashboard`-off half runs in the default-feature `-p frp-server` lanes
+    /// (`.github/workflows/ci.yml:1496` `--features vnet --lib`, `:3191`
+    /// `--no-default-features --all-targets -j 1`; `ssh` is on in the first and
+    /// off in the second, covering the `ssh_tunnel_gateway.bind_port` twin too)
+    /// and the `dashboard`-on half in the unfiltered `:3022`
+    /// (`-p frp-server --features dashboard -j 1`). The
+    /// `--no-default-features --features dashboard --lib` lane at `:1533`
+    /// filters by `web_server_tls_enable_reader`, so it does **not** run these
+    /// pins.
     #[test]
     fn web_server_port_reader_answers_from_this_build() {
         use frp_core::config::ListenerPortReader::{Absent, Present};
