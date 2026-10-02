@@ -9219,8 +9219,6 @@ section; ledger now **24 open / 104 closed**.**
   with no warning — a real strict-parser/serde divergence left open. Ledger after this close:
   **15 open / 186 closed** (base `e4c23b2f`: 16 open / 185 closed).
 
-- [ ] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
-  Filed by the coordinator while closing `TODO.md:8533` (PR #430), which removed the two local `pkill -f`
 - [x] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
   Filed by the coordinator while closing `TODO.md:8425` (PR #430), which removed the two local `pkill -f`
   calls in `scripts/compat-test.sh`: `scripts/remote-frps.sh:195` and `:339` still run
@@ -9396,13 +9394,13 @@ section; ledger now **24 open / 104 closed**.**
   cited as `frp-server/src/service.rs:2048`; no `service.rs:2338` cite remains).
   **Done-when:** each of the three remaining cites names the line that actually supports its claim, or the claim
   is reworded to what the cited line says.
-  **Done (2026-10-01, at code head `31f72123` on `fix/remote-frps-pid`, PR #456, based on `18bcd1ad`) — all
+  **Done (2026-10-01, at code head `31f72123` on `fix/remote-frps-pid`, PR #456, based on `346661eb` (earlier `18bcd1ad`)) — all
   three named call sites are gone; the remote helper reaps by exact pid from a pid file written where the
   server is started.**
   `scripts/remote-frps.sh` now contains no `pkill -f` and no `pgrep -f` at all. The start command is
   `remote_start_snippet` (`scripts/lib/remote-frps-reap.sh:68`, called at `scripts/remote-frps.sh:279`), which
   backgrounds frps and records `$!` in the same remote command:
-  **Done (2026-10-01, at code head `31f72123` on `fix/remote-frps-pid`, PR #456, based on `18bcd1ad`; the
+  **Done (2026-10-01, at code head `31f72123` on `fix/remote-frps-pid`, PR #456, based on `346661eb` (earlier `18bcd1ad`); the
   review round's fixture and pid-guard fixes are `2aa568f1`) — all three named call sites are gone: the
   helper's own server is reaped by exact pid from a pid file written where that server is started. The claim is
   that narrow — the shard path's band sweep still kills by `ss -tlnp` port association, byte-identical to the
@@ -9479,11 +9477,11 @@ section; ledger now **24 open / 104 closed**.**
   `4f2df348b816f664d79613a7ee46417163e839450d948f82dae303996a4fe246` and `guard_lib_pin`
   `a335320e87c65f36aff05ec79d83bb51f996fdb1e9125c0c9daa12ad3b658189` for the stray-guard pair) still match
   the tree — none of those files is touched, so no coordinator edit is needed.
-  Ledger after this close: **13 open / 190 closed** (base `18bcd1ad`: 13 open / 189 closed; the close and the
+  Ledger after this close: **20 open / 192 closed** (base `346661eb`: 20 open / 191 closed; the close and the
   item filed below cancel out).
 
 - [ ] **`scripts/tests/remote-frps-reap.sh` runs in no CI job.**
-  Filed while closing `TODO.md:9114` (PR #456). The fixture that pins the new exact-pid route is run only by
+  Filed while closing `TODO.md:9222` (PR #456). The fixture that pins the new exact-pid route is run only by
   hand: the `health` job's comment (`.github/workflows/ci.yml:87-89`) names the three fixture scripts it runs,
   and its steps run `scripts/tests/repo-health-fixtures.sh`, `scripts/tests/compat-stray-guard.sh` and
   `scripts/tests/rss-soak-run-dir.sh`. Wiring a fourth suite is a `.github/workflows/ci.yml` edit, and the
