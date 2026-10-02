@@ -6036,6 +6036,55 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   job), or a convention change to title-anchored references (a stable item slug, or `TODO.md § "title"`), each
   demonstrated by before/after counts on the tree.
 
+  **Done (2026-10-02, at code head `b7739d61` on `docs/cite-sweep`, this item's branch).** The first branch:
+  the sweep plus the gate. **Classification rule** (now the gate's documented scope, and the same
+  live/point-in-time split `scripts/repo-health.sh` already applies to path cites): *live* = source comments
+  under the crate roots, `scripts/**`, `.github/workflows/*.yml`, `CLAUDE.md`, `README.md` and the top-level
+  `docs/*.md`; *point-in-time* = `TODO.md` itself, `CHANGELOG.md`, `performance-audit.md`,
+  `docs/refactor-large-modules.md` and everything under `docs/history/`, `docs/archive/` and `docs/audit/`,
+  which keep their era's numbering. **Before: 82 `TODO.md:<n>` occurrences across 23 live files; 26
+  occurrences on 25 cite lines did not land on a header** — 24 were stale numbers that resolved onto
+  mid-item prose or a blank line (including six pointing at a *different* item: `ci.yml`'s `8550`→`8587` and
+  `8582`→`8622`, the guards' `8470`/`8627`→`8483`/`8637`, `docs/developing.md`'s `2226`→`4506` and
+  `2619`→`4710`), one (`frp-core/src/config/tests.rs:733`) named the wrong item outright (`8169`, a typeless
+  `.ini` visitor line, for the `--vhost-http-timeout` `int64` item at `8234`), and two were title-form cites
+  (`TODO.md: "…"`) that now carry their item's header number. Each was repointed by locating the item its
+  citing sentence names and reading the header line back — never a uniform offset; **56 occurrences on 56
+  cite lines were already correct and were left byte-identical.** No cite was left intentionally pointing at
+  mid-item prose: where a sentence named a sub-fact inside a longer item (the `3`/`4` exit-code decision at
+  `docs/developing.md:1702`), the item header was cited and the sentence reworded to say which sub-fact it
+  means. **After: 84 live cite references checked, 0 violations** — the gate counts the 82 numbered cites
+  plus the two former title-form cites.
+  **The gate** is `scripts/tests/todo-cite-guard.sh` (a new suite rather than an extension of
+  `scripts/repo-health.sh`, whose `health` step is on a 5-minute budget and whose python scanner is already
+  the job's slowest part): fail-closed on a cite past EOF, on a blank line, on a mid-item body line, on a
+  malformed token, and on a scan that finds too few cites or a ledger with no headers; it prints
+  `RESULT: <n> cite(s) checked, <m> violation(s)` and names every offence by `file:line`. It reads the file
+  list from `git ls-files -z` (with `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_WORK_TREE`/`GIT_COMMON_DIR`/
+  `GIT_OBJECT_DIRECTORY`/`GIT_TRACE*` stripped), falling back to a filesystem walk with no `.git`, and it
+  does **not** match the cited item's title to the citing sentence — a text match cannot establish intent, so
+  the enforced property is "the cite lands on an item header, and every cite is checkable".
+  `scripts/tests/todo-cite-guard-fixtures.sh` drives it against synthetic trees: **40 checks, all green**,
+  including six red-path canaries (a mid-item cite, a past-EOF cite, a blank-line cite, a malformed cite, an
+  empty scan and a floor of 0) and a point-in-time scope pair that proves the historical documents are
+  skipped *and* a live cite beside them still reds. Both new steps are wired into the `health` job with their
+  digests pinned, so weakening the gate's scan is a two-file change a reviewer sees.
+  **Pins bumped** (both forced by this round's edits and both proved by the suites above): `guard_pin` for
+  `scripts/tests/repo-health-fixtures.sh` at `.github/workflows/ci.yml:164`
+  (`e6d23d74…`→`c2d0f588…`) and for `scripts/tests/compat-stray-guard.sh` at `:406`
+  (`4db720d6…`→`63ef9805…`); the stray guard's own `SCEN10_REGION_SHA` was also re-derived
+  (`976317f2…`→`eaab2fe9…`) because three of the repointed cites sit inside scenario-10's
+  substance-pinned region. No `CHANGELOG.md` bullet: nothing
+  user-visible changes — the edits are comments, doc prose, test comments and a gate — and this repo's
+  changelog records behaviour, not comment bookkeeping.
+  Gates at this head: `cargo fmt --all -- --check` rc 0; `bash scripts/repo-health.sh` →
+  `RESULT: invariants hold`; `bash scripts/tests/repo-health-fixtures.sh` → `RESULT: 32 fixture check(s)
+  hold`; `bash scripts/tests/compat-stray-guard.sh` → `RESULT: 40 fixture check(s) hold`; the new gate green
+  (`RESULT: 84 cite(s) checked, 0 violation(s)`) and its fixture suite green with its canaries red;
+  `git diff --check` rc 0. Ledger at this head: **20 open / 196 closed** — unchanged, because this round
+  closes an already-open item rather than filing or closing a new one (before: 20 open / 196 closed, counted
+  with `grep -cE '^- \[ \]' TODO.md` and `grep -cE '^- \[x\]' TODO.md`).
+
 
 ## P1 — documentation correctness
 

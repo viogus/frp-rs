@@ -1699,10 +1699,11 @@ that Go does not refuse at all. There is no per-class scheme to preserve, and
 `EXIT_CONFIG`/2 no longer covers a single-config or `verify` failure.
 
 **Decision (2026-09-27): `3`/`4` stay, and the kind that picks them is now a
-typed value, not a substring match.** This was the open pair `TODO.md:3366`
-(whether the codes should exist) and `TODO.md:3418` (what picks them); both are
-closed by the same change. The argument, in the order the alternatives were
-weighed:
+typed value, not a substring match.** The subclass item `TODO.md:5290` names the
+line that does not support the claim it makes — a substring match picks the
+`3`/`4` codes — and `TODO.md:3366` carries the same round's measured
+`--strict-config` table; both were filed against this change. The argument, in
+the order the alternatives were weighed:
 
 - **Collapsing `3`/`4` into Go's `1` would not have removed a compatibility
   risk, because there is none to remove.** Go's CLI is 0-or-nonzero, and every
@@ -1823,7 +1824,7 @@ Some things this table does not say, each measured:
   arm — `frps` on an occupied `bindPort` returns 1 on both sides, because the
   listener binds inside `service.run()`.
 - **The code is chosen by `InitErrorKind`, never by the message text** (the
-  change that closed `TODO.md:3418`). The constructor tags each failure where it
+  change that closed `TODO.md:5290`). The constructor tags each failure where it
   is raised (`frp_core::init_error`), and every daemon arm reads only that tag.
   The old contract was `is_token_error` → `msg.contains("token") ||
   msg.contains("auth")` over the formatted error, which embeds the config path and
@@ -1919,7 +1920,7 @@ Some things this table does not say, each measured:
   key>` exiting **0** here against Go's **1** (`decode proxy at index 0: …
   unknown field "notAKnownProxyKey"`) — **was** in this list and is now a
   like-for-like **1**: `check_strict` walks the array elements
-  (`TODO.md:1246`), so frp-rs prints `unknown field
+  (`TODO.md:1243`), so frp-rs prints `unknown field
   "proxies[0].notAKnownProxyKey"` and exits 1 exactly where Go does.
 
 Tests that pin this — real binaries, no mocks:
@@ -2069,7 +2070,7 @@ paragraph).
 
 #### CLI inputs: repeated `-c`, an empty `webServer.addr`, case-insensitive keys
 
-Three `frpc` inputs Go accepts and frp-rs used to refuse (`TODO.md:1685`). Two
+Three `frpc` inputs Go accepts and frp-rs used to refuse (`TODO.md:1605`). Two
 are now Go-faithful; the third is a **recorded divergence**, because the honest
 fix is not bounded and a partial one would be a false claim of parity. Measured
 2026-09-26 against Go frp **v0.71.0** (darwin/arm64) and the frp-rs `frpc` at
@@ -2128,7 +2129,7 @@ half-fixed, because "accept positionals" cannot be narrowed to the `--` form
 without also swallowing unknown flags: Go itself refuses `frpc tcp -c -- -foo`
 with `unknown shorthand flag: 'f' in -foo` (rc 1), so the rule is "ignore
 positionals, still reject unknown flags", which is not a bpaf positional parser
-away. It is filed with the single-proxy item in `TODO.md:2226`.
+away. It is filed with the single-proxy item in `TODO.md:4506`.
 
 **2. An empty `webServer.addr` is completed to `127.0.0.1` — on frpc and frps
 alike, and only the empty string.** Go's `ClientCommonConfig.Complete()` calls
@@ -2363,7 +2364,7 @@ and `status` differ on the same file — `verify` parses and reports, while
 The last row is the sharp edge and the reason the earlier "refused (strict) or
 silently mis-defaulted (lenient)" phrasing was wrong in **both** directions.
 That row has since **changed** with the strict-mode array recursion
-(`TODO.md:1246`): `cap-proxy.toml` is now refused in strict mode
+(`TODO.md:1243`): `cap-proxy.toml` is now refused in strict mode
 (`unknown field "proxies[0].LocalPort" …`, exit 1, alongside
 `proxies[0].RemotePort`), because `check_strict` walks the
 `[[proxies]]`/`[[visitors]]`/`[[httpPlugins]]` elements with one exact-match key
@@ -2468,7 +2469,7 @@ not register the flags on those twelve commands — the eight had none of the
 five, and the admin four lacked `--config-dir`, `--allow-unsafe` and
 `-v`/`--version` — so argv Go runs exited 1 with ``Error: `-c` is not expected
 in this context`` (the analogous message per flag) and the proxy never started
-(`TODO.md:2226`). All five are now registered and **dropped**: acceptance is the
+(`TODO.md:4506`). All five are now registered and **dropped**: acceptance is the
 parity, not the value.
 
 Measured on Go frp **v0.71.0** darwin/arm64 with a probe listener on the
@@ -2571,7 +2572,7 @@ before the child's pflag parse. bpaf instead picks a branch *before* dispatch,
 so `frpc -c pA.toml status` used to fall through to run mode and answer rc 1
 ``Error: no such command or positional: `status`, did you mean `https`?``.
 `frp-core/src/cli.rs`'s `hoist_leading_subcommand` now moves that token to the
-front of the argv before bpaf runs (`TODO.md:2619`).
+front of the argv before bpaf runs (`TODO.md:4710`).
 
 Composition, because it is load-bearing: the entry points call `cli_args`
 (which drops `argv[0]` and expands the `-v=` alias), then `prepared_cli_argv`,
@@ -3218,7 +3219,7 @@ list below is what the sweep found:
 | `--use-compression` | `frpc tcp` | Go spells it `--uc` |
 | `--json` | `frpc status` | **no Go flag at all** |
 
-One row of this sweep moved afterwards: `TODO.md:2226` registered the five
+One row of this sweep moved afterwards: `TODO.md:4506` registered the five
 persistent rootCmd flags — `-c`, `--config-dir`, `--strict-config`,
 `--allow-unsafe` and `-v`/`--version` — on all twelve `frpc` subcommands as
 accepted-and-ignored parsers, so `-v`/`--version` is no longer run-mode-only on
@@ -3233,7 +3234,7 @@ generated per row with a fresh free `bindPort` and `auth.token`; the `frpc` rows
 either point at a standing Go `frps` or carry `frpc tcp`'s own required flags
 (`--local-port`/`--remote-port`/`--proxy-name`/`--server-port`), because at that
 head frp-rs's `tcp` subcommand had no `-c` at all (it accepts and ignores it
-since `TODO.md:2226`). Every child was bounded and killed
+since `TODO.md:4506`). Every child was bounded and killed
 on the bound: **rc 124 = the process started and was killed**, which is how
 "Go starts and listens" is recorded. Rows are `Go / frp-rs before / frp-rs
 after`.
@@ -3353,7 +3354,7 @@ What the table says, precisely:
   did, which fixes the non-bool values (rc 1) and the invalid-flag row (rc 1)
   and keeps `--version` → 0.
 - **`--version` is a persistent flag on Go; it was only a run-mode flag here
-  until `TODO.md:2226` registered the persistent set.** Moving the version check
+  until `TODO.md:4506` registered the persistent set.** Moving the version check
   out of the parser changed four subcommand rows, measured Go / base head / the
   head of that branch: `frpc verify --version -c <valid>` is rc **0** on Go (the
   persistent bool parses and `verify` ignores it, then runs) and was rc 0 here
@@ -3386,7 +3387,7 @@ What the table says, precisely:
   too (the persistent flag parses, `status` ignores it and dials the admin API).
   The `--` guard keeps the rewrite honest where it would be gratuitous
   (`frps -- -v=false` names `-v=false`, byte-identical to the base head). After
-  `TODO.md:2226` there is no `frpc` row left that refuses a `-v=<bool>`
+  `TODO.md:4506` there is no `frpc` row left that refuses a `-v=<bool>`
   spelling — `frpc status -v=false -c <cfg>` dials the admin API as Go does — so
   the remaining alias-in-message case is on `frps`, a separate surface. Related
   and unchanged for `frps`: Go *accepts* `frps -p <free> -- xyz` (it starts, rc

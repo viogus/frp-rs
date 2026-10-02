@@ -1,5 +1,5 @@
 //! `frpc`'s **persistent rootCmd flags** on the subcommands that do not read
-//! them (`TODO.md:2226`).
+//! them (`TODO.md:4506`).
 //!
 //! Go registers `-c/--config`, `--config-dir`, `--strict-config`,
 //! `--allow-unsafe` and `-v/--version` on `rootCmd`

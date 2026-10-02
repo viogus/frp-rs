@@ -2,7 +2,7 @@
 //! socket-deadline pins in this module tree (`plugin::http`,
 //! `plugin::https2http`, `plugin::https2https`).
 //!
-//! Why this exists (TODO.md: "`frp-client`'s `start_paused` socket-deadline
+//! Why this exists (TODO.md:1889: "`frp-client`'s `start_paused` socket-deadline
 //! tests are flaky on this host"). Those pins used to wrap the client-side
 //! read in ONE `tokio::time::timeout(BOUND, ...)` and accept only `Ok(0)`.
 //! That was wrong in two independent ways, and a naive "step the clock

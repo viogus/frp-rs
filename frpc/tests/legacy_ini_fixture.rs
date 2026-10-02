@@ -4,7 +4,7 @@
 //! of Go's `conf/legacy/frpc_legacy_full.ini` (see that directory's README).
 //! Go's own `frpc verify -c` exits 0 on it and the file's bare numeric values
 //! are strings there (`token = 12345678` → the token `"12345678"`; measured on
-//! `frp_0.71.0_darwin_arm64`, see `TODO.md:1412`).
+//! `frp_0.71.0_darwin_arm64`, see `TODO.md:1364`).
 //!
 //! The counts are Go's own config-level counts: Go frpc v0.71.0 against a Go
 //! frps logs `proxy added: [43 names]` and `visitor added: [p2p_tcp_visitor

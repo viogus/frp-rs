@@ -1,5 +1,5 @@
 //! The three `frpc` CLI/config inputs Go frp v0.71.0 accepts and frp-rs used to
-//! reject (`TODO.md:1685`).
+//! reject (`TODO.md:1605`).
 //!
 //! Each test here runs the real `CARGO_BIN_EXE_frpc` against a one-shot
 //! loopback mock admin server and asserts on the request the mock received —
@@ -1219,7 +1219,7 @@ fn space_form_warning_fires_on_each_frpc_parser() {
     }
 }
 
-// ── a subcommand after leading root flags (`TODO.md:2619`) ──────────────────
+// ── a subcommand after leading root flags (`TODO.md:4710`) ──────────────────
 //
 // Go's cobra resolves a command that follows leading root flags: `Find`
 // (`cobra-1.8.0/command.go`) strips flags from argv and looks at the first

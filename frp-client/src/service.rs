@@ -707,7 +707,7 @@ fn reg_frame_payload_read(
 /// `frp-client/tests/heartbeat_wire_order.rs` derives its tolerance from it, so
 /// a wrong-but-in-range backoff hard-coded at the `interval.reset_after(delay)`
 /// call site (5s satisfied the old `[1.0s, 6.0s]` window) now reds the e2e test
-/// (TODO.md:8453). A duplicated literal in either place is what this constant
+/// (TODO.md:8483). A duplicated literal in either place is what this constant
 /// exists to prevent.
 pub const PING_FIRST_BACKOFF: Duration = Duration::from_secs(2);
 
@@ -5167,7 +5167,7 @@ mod tests {
         // the value of `PING_FIRST_BACKOFF`, which is what the production call
         // site and the e2e re-arm oracle both read: without this comparison a
         // drift in the constant would be silently agreed to by all three
-        // (TODO.md:8453).
+        // (TODO.md:8483).
         assert_eq!(
             PING_FIRST_BACKOFF,
             Duration::from_secs(2),
