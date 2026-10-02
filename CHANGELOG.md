@@ -1268,6 +1268,14 @@ User-facing release notes for frp-rs.
 
 - **The `compat` compatibility gate stops hiding its own flakes.** Every recorded red run of the `compat` job (3 of the last 100, all `RESULTS: 85 passed, 1 failed`, all left red on attempt 1) failed in a readiness gate that expired 0.5–0.7 s past its deadline, and a red run printed no logs at all: `scripts/compat-test.sh` gated its log dump on `--verbose`, while CI passes neither `--verbose` nor `--keep-tmp` and the EXIT trap deletes `TEST_DIR` immediately afterwards. Readiness timeouts are now floored at `FRP_COMPAT_READY_MIN` (default 20 s; `0` restores the previous per-call values byte for byte) and the dump also runs when `$CI` is set. `scripts/protocol-matrix.sh` compounded its own failures: rows were torn down with SIGTERM only, and the four-port blocks advanced by one port per row, so they overlapped by three and a straggler was read as the next row's own listener — a stale echo could turn a row's readiness probe green against a non-frp server, then make the next real `frps` fail to bind. Rows now drain (SIGTERM → 3 s → SIGKILL → 2 s), use disjoint `19000 + 4 * (PASS + FAIL)` blocks, probe server and proxy ports for a LISTEN socket instead of opening a real connection (the phantom-`ProxyUserConn` hazard `scripts/compat-test.sh:222-224` documents), and always print the failing row's log tails. Verified before/after on this host: 120/120 compat scenario runs and 20/20 full matrix repeats (220 row-runs) green on both sides, with deterministic mutation proofs for each fix (a SIGTERM-ignoring child is now reaped; a Go `frpc` delayed 17 s fails the old gate and passes the new one). The CI red rate itself is unmeasured and the parent item stays open.
 
+- **The Health job's citation-gate literal now tracks this branch's five new test cites (93 at this head).** The three
+  test commits added five live `TODO.md` cites (`frp-client/tests/heartbeat_wire_order.rs:713`,
+  `frp-client/tests/req_work_conn_token_source.rs:6`, `frp-server/src/control/login.rs:2945`/`:3153`,
+  `frp-server/tests/login_run_id_and_pool_count.rs:244`, `frp-server/tests/http_plugin.rs:293`), so the gate reports 93
+  checked cites while the step's declared `guard_cites`/`guard_cites_floor` still said 88 — the exact-match arm never
+  fired and the "TODO.md cross-file citation gate" step failed with "did not report 88 checked cites", which running the
+  bare script locally had masked. Both literals move to 93 together; the gate script and its `guard_pin` are unchanged.
+  93 is the count *at this head*, not an invariant — it is re-derived again after the #461 rebase.
 - **The re-arm e2e oracle now sees a second consecutive failed ping, so a constant-returning call site can no longer
   pass.** `frp-client/tests/heartbeat_wire_order.rs`'s oracle only ever observed the *first* failed tick, and the
   first re-arm and `PING_FIRST_BACKOFF` are both 2 s — so `let delay = PING_FIRST_BACKOFF;` in
