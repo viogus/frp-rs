@@ -10359,3 +10359,70 @@ section; ledger now **24 open / 104 closed**.**
   contention or to a stalled dial, and the `compat` job's red rate over the following ≥30 completed
   runs is compared against the 3/89 recorded here — or the readiness bound is replaced by a
   mechanism-level fix (for example re-driving the frpc start rather than waiting longer for it).
+
+- [ ] **The A/B throughput gate fires on changes with no runtime code, so a red gate on `main` is not evidence of a regression.**
+
+  Filed by the coordinator after the 2026-10-02 daily scheduled run.
+
+  Evidence (one run, primary sources):
+  - `.github/workflows/ab-matrix.yml` runs `main~1` vs `main` on the dedicated VPS (job `ab-matrix`), daily at `cron: '30 4 * * *'`; the job fails if any configuration regresses by more than `GATE_PCT` (default `5`, `.github/workflows/ab-matrix.yml:50`/`scripts/ab-matrix.sh:50`).
+  - Run `36996762744` (event `schedule`, head `ae7bf50d`) failed: `A/B GATE FAILED: one or more configs regressed more than 5% (before -> after)`, with `encrypt_compress` `18.0 -> 15.2 = -15.6% REGRESSED`. The full table from the same run: `plain 11.4 -> 18.1 +58.8 pass`, `encrypt 17.9 -> 19.8 +10.6 pass`, `compress 18.6 -> 24.2 +30.1 pass`, `encrypt_compress 18.0 -> 15.2 -15.6 REGRESSED`, `mux 19.9 -> 23.6 +18.6 pass`, `tls 8.8 -> 8.4 -4.5 pass`.
+  - The gated delta is `97a03884` (base) -> `ae7bf50d` (head) = PR #459, whose entire non-records change is `scripts/large-functions.sh` (a Python analysis script that no shipped binary loads). `git diff --name-only 97a03884 ae7bf50d -- '*.rs' 'Cargo*.toml'` is empty. So the -15.6% cannot be a real regression: the gate's noise floor exceeds its 5% threshold, in the same run that reported +58.8% on another configuration.
+  - The confirm loop does not save it: `measure_pair` re-measures up to `CONFIRM_RETRIES` (default 2) times but keeps the **most negative** delta (`scripts/ab-matrix.sh:207-219`: `if python3 -c "… ($ndelta < $delta) …"`), i.e. the worst of up to three samples. Selecting the minimum of N noisy samples is a biased estimator and inflates the false-positive rate; there is no median/mean, no variance estimate, and no per-config confidence bound.
+  - This gate also cannot block anything: PR runs are deliberately skipped (`.github/workflows/ab-matrix.yml:10-17`), the workflow has no `push` trigger, and nothing in `ci.yml`/branch protection depends on it (`gh api /repos/viogus/frp-rs/branches/main/protection` -> 404 "Branch not protected"). A red A/B gate is therefore *only* discovered after the fact, on `main`, in a scheduled run.
+  - The same noise class is already documented in-tree for the retired PR mode (`.github/workflows/ab-matrix.yml:12-14`: identical binaries measured `tls -35.1% / -27.9% / +24.5%` across three attempts), but the daily `main~1` vs `main` gate still fails on it.
+
+  **Done-when:** either (a) the gate can no longer red on a delta that contains no shipped-code change — measured, not asserted: take the recorded failure above as the reproduction and show the new rule green on it (e.g. skip/annotate when `git diff <before> <after> -- '*.rs' 'Cargo*.toml' 'crates/**'` is empty, plus a comment saying so) — or (b) the statistic is replaced by one with a quantified false-positive rate: report the per-config sample distribution (N >= 3 repeats, median and spread) and set `GATE_PCT`/the confirm rule from it, so a published measurement shows the observed -15.6%-style spread no longer reds the gate. Whatever is chosen, record in the item's Done paragraph the run id, the table, and the commands used; a run that merely "passed once" is not evidence. If the honest conclusion is that the VPS is too noisy to gate anything, say so with numbers and record the decision to demote the gate to informational (with the reason), rather than leaving a gate that turns `main` red at random.
+
+- [ ] **`scripts/compat-test.sh --list` prints `run_test` function names while `--test` selects display names, so a name taken from `--list` runs nothing and still reports success.**
+
+  Filed by the Batch K author after PR #463 review round 1. The selector compares the caller's display name
+  (`should_run_test` at `scripts/compat-test.sh:694-699`, `[[ "$SELECTED_TEST" == "$1" ]]`), while `--list`
+  prints the `run_test test_*` **function** names (`scripts/compat-test.sh:75-78`, an `awk` over the second
+  field). Nothing validates that a `--test` value matched anything.
+
+  Measured on this branch (head `80fdad8c`, release binaries under `target/release`, Go frp 0.71.0 present):
+  - `bash scripts/compat-test.sh --list | sed -n '35p'` → `test_g2r_tcp_plain`; that scenario's display name
+    is `go-to-rust-tcp-plain` (`test_g2r_tcp_plain()` at `scripts/compat-test.sh:1161`, `local name=…` at
+    `:1162`).
+  - `bash scripts/compat-test.sh --ci --test test_g2r_tcp_plain` (a name copied verbatim from `--list`) →
+    exit **0**, ` RESULTS: 0 passed, 0 failed`, `All tests passed!` — no scenario ran.
+  - `bash scripts/compat-test.sh --ci --test go-to-rust-tcp-plain` (the display name) → exit 0,
+    ` RESULTS: 1 passed, 0 failed`.
+
+  Pre-existing and not CI-reachable: this branch's entire delta to `scripts/compat-test.sh` is 6 lines (4
+  code lines plus 2 cite comments), and no workflow passes `--test`
+  (`grep -c -- '--test' .github/workflows/compat.yml .github/workflows/xtcp-compat.yml` → `0` and `0`; both
+  run the full suite). The trap is the cheap loop the parent item (`TODO.md:6611`) advertises —
+  `compat-test.sh --test <display-name>` — for anyone who runs `--list` first.
+
+  **Done-when:** either `--list` prints display names, or a `--test` value that matches no scenario fails
+  closed (non-zero exit plus a message naming the selector), with a check proving a non-matching name can no
+  longer print ` RESULTS: 0 passed, 0 failed` and exit 0.
+
+- [ ] **The protocol matrix's `wait_for_listen` accepts a LISTEN socket owned by any process, so a foreign listener can green a row's readiness gate.**
+
+  Filed by the Batch K author after PR #463 review round 1. `wait_for_listen`
+  (`scripts/protocol-matrix.sh:80-102`) returns 0 as soon as *any* process holds the port in LISTEN —
+  `lsof -iTCP:"$port" -sTCP:LISTEN -t`, or `ss -tln sport = :"$port"` — with no check that the socket
+  belongs to the row's own frps/frpc. The round-5 disjoint block
+  (`base=$((19000 + 4 * (PASS + FAIL)))`, `scripts/protocol-matrix.sh:115-118`: `srv_port=$base`,
+  `proxy_port=$base+1`, `echo_port=$base+2`) closes the row-to-row overlap — the old
+  `base=19000 + PASS + FAIL` made row 0's echo port 19002 row 1's proxy port — but it does not make the
+  gate check socket ownership.
+
+  Measured (head `80fdad8c`):
+  - The function extracted verbatim (`awk '/^wait_for_listen\(\)/,/^}/' scripts/protocol-matrix.sh`) against
+    a foreign `python3` listener on port 39010 (`lsof -iTCP:39010 -sTCP:LISTEN -t` names the python pid; no
+    frp process involved) → `wait_for_listen rc=0` after **0.041 s**. With no listener it returns `rc=1`
+    after **4.9 s** for a requested 3 s (the bound is `10 × timeout` polls, and each poll also pays an
+    `lsof` call, so the wall-clock bound exceeds the argument).
+  - The 11 rows occupy 19000–19043 (`19000 + 4 * (PASS + FAIL)` for rows 0…10), while `random_port()`
+    allocates `port=$(( (RANDOM % 10000) + 17000 ))` = 17000–26999 (`scripts/compat-test.sh:189-204`, the
+    range at `:195`). The matrix block is a subset of the range `compat-test.sh` draws its own ports from,
+    so neither harness's port space is disjoint from the other's, and neither can tell whose LISTEN it saw.
+
+  **Done-when:** `wait_for_listen` confirms the listening socket belongs to the process the row is waiting
+  for (a pid check against the row's recorded frps/frpc pid, not a bare LISTEN probe), or the matrix block is
+  moved outside `random_port()`'s 17000–26999 range, with a constructed foreign-listener run proving a row
+  can no longer be greened by a socket it did not start.
