@@ -927,7 +927,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   dashboard HTTPS server is built"; and `warn_inert_web_server_tls_enable(&self, has_dashboard: bool)`
   (`frp-core/src/config/loader.rs:590`) picks between them. All eight call sites now pass a `cfg!`:
   `frps/src/main.rs:219`/`:311` and `frp-server/src/service.rs:2315` pass `cfg!(feature = "dashboard")`;
-  `frpc/src/main.rs:527`/`:602`/`:776`, `frp-client/src/service.rs:4457` and `frp-client/src/admin.rs:771`
+  `frpc/src/main.rs:527`/`:602`/`:776`, `frp-client/src/service.rs:4489` and `frp-client/src/admin.rs:771`
   pass `cfg!(feature = "admin")`. **Measured** on the real binaries (fresh `CARGO_TARGET_DIR` per tier,
   tier-named binary, stdout and stderr captured separately, child bounded and reaped, `nc -z` run while the
   process was still alive; `/tmp/wtls-probe`): `frps-micro` (build rc 0) and `frps-tiny` now print the
@@ -994,7 +994,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   lane in CI; `:776` (`verify`) by the same helper through a new `assert_clause_matches_this_build_in(tag,
   out, err)` entry point, and its test needed the nested key added anyway — it wrote no
   `[web_server.tls]` section, so the record never fired and neither boolean was observable; and
-  `frp-client/src/service.rs:4457` (client reload) by a new `assert_clause_matches_this_build` in
+  `frp-client/src/service.rs:4489` (client reload) by a new `assert_clause_matches_this_build` in
   `frp-client/tests/reload_warning_delivery.rs`, observed by the two existing `frp-client` lanes
   (`--features admin`, and `--no-default-features --all-targets -j 1`), one branch each.
   `frp-client/src/admin.rs:771` stays covered by `frpc/tests/admin_config_get_warning.rs` (4 passed).
@@ -1029,7 +1029,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `GET /` is **401** and a credentialed `GET /api/v2/system/info` is **404**; with no credentials
   configured a bare `GET /` is **404**). That is the same class of falsehood the item above removed,
   one feature interaction further
-  in. Done-when: the admin call sites (`frp-client/src/admin.rs:771`, `frp-client/src/service.rs:4457`)
+  in. Done-when: the admin call sites (`frp-client/src/admin.rs:771`, `frp-client/src/service.rs:4489`)
   answer with `cfg!(all(feature = "admin", feature = "tls"))`, or a third text exists for "an admin server
   with no TLS" — whichever the maintainer prefers — and a test pins the emitted text in the
   `--no-default-features --features micro,admin` build, so the `admin`-without-`tls` combination names no
@@ -1039,7 +1039,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `frpc/tests/warn_delivery.rs:402`), while `frpc/tests/admin_config_get_warning.rs` is gated whole-file
   (`#![cfg(all(feature = "full", feature = "admin"))]` at `:59`) and asserts the dashboard text
   unconditionally (`:291`/`:296`), so it needs re-keying only if that gate changes. A re-key is not
-  self-witnessing at `frp-client/src/service.rs:4457`: measured there, `cfg!(feature = "tls")` and
+  self-witnessing at `frp-client/src/service.rs:4489`: measured there, `cfg!(feature = "tls")` and
   `cfg!(all(feature = "admin", feature = "tls"))` both leave both client reload lanes rc **0**, because
   `admin` and `tls` are correlated in every lane that runs that file — so whichever condition is chosen,
   that pin must be re-keyed deliberately and re-measured on a real build (the `frpc` site at
@@ -1055,7 +1055,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `admin` **and** `tls`) and `frp_server::service::web_server_tls_enable_reader()`
   (`frp-server/src/service.rs:420`, its `dashboard` **and** `tls`). All eight call sites were re-pointed
   (`frps/src/main.rs:343`/`:695`, `frp-server/src/service.rs:2333`, `frpc/src/main.rs:530`/`:647`/`:832`,
-  `frp-client/src/service.rs:4458`, `frp-client/src/admin.rs:771`), so a `micro,admin` build — an `admin`
+  `frp-client/src/service.rs:4489`, `frp-client/src/admin.rs:771`), so a `micro,admin` build — an `admin`
   server with no `tls`, the build this filing measured printing the dashboard clause — now gets the
   "this build has no TLS support" text. Pinned by the four cells of
   `frp-core/tests/web_server_tls_enable_warning.rs` and by the emitted **record** being compared
@@ -2050,7 +2050,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     → `#[cfg(all(feature = "quic", feature = "kcp"))]`, agreeing with its only consumer
     (`frp-client/src/nat_hole.rs:668`, inside the `all(quic, kcp)` data-plane arm).
   - `frp-client/src/visitor.rs:94-95`, `:375`, `:1200`, `:1251`, `:1842`, `:3728`, `:3771` and
-    `frp-client/src/service.rs:2648`, `:2717` — the whole client `quic_params` chain (the
+    `frp-client/src/service.rs:2781`, `:2850` — the whole client `quic_params` chain (the
     `VisitorListenerConfig` field, the `XtcpPunchConfig` field, both destructures, both
     punch-config test literals, and the compute/pass sites) moved from
     `#[cfg(feature = "quic")]` to `#[cfg(all(feature = "quic", feature = "kcp"))]`. The value's
@@ -2796,7 +2796,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   rc-0 assertion is never reached), and the first unit test fails on the pre-fix hunk with
   `panicked at … core.rs:427: JoinHandle polled after completion`.
   Class sweep (nothing else has the "poll to `Ready`, then poll again" shape): the only other
-  `join_all` teardown — work-conn, `frp-client/src/service.rs:4032` — drops its handles after a
+  `join_all` teardown — work-conn, `frp-client/src/service.rs:4108` — drops its handles after a
   timeout instead of re-awaiting them; the `timeout(&mut handle)` sites only ever poll again after a
   *Pending* poll (ssh_gateway's `terminate_ssh_session`, the control writer); the `select!` arm on
   `&mut session_task` (`frp-server/src/ssh_gateway.rs:4326`) consumes its one `Ready` and the `None`
@@ -7437,7 +7437,7 @@ section; ledger now **24 open / 104 closed**.**
 
   **Not filed (deliberately):** R1's N1 — doc comments cite author-local `/tmp/tls-warn-probe/*.sh`
   paths. Recording probe provenance that way is already this repository's style
-  (`frp-client/src/service.rs:1436` cites `/tmp/frp-source/client/service.go`,
+  (`frp-client/src/service.rs:1468` cites `/tmp/frp-source/client/service.go`,
   `frp-core/src/config/normalize.rs:524` cites `/tmp/ws-probe-before.txt`,
   `frp-client/tests/reload_warning_delivery.rs:11` cites `/tmp/enable-warn-probe/http_smoke.sh`), and
   both reviewers reproduced the measurements independently, so no action is needed.
@@ -8403,33 +8403,35 @@ section; ledger now **24 open / 104 closed**.**
 
 - [x] **Rust frpc runs the `auth.tokenSource` `exec` command twice per successful login where Go runs it once.**
   **Done (2026-10-01, at fix `42245c7f` / oracle `a2e7546f` on `fix/tokensource-single-exec`, PR #437, based on `084f7865`; pre-rebase `663e1d38`/`98166cb5` on `799ce048`, `61236591`/`9f9cb110` on `ed2d71a3` and `b8a916a6` on `f503b4e7`, originally `801a75fb` on `a0c16c83`, the code patches `=` under `git range-diff` at each rebase, though the `ed2d71a3`-era restructure also folded a cite-fix commit (`6472ab21`) into the fix while the rebases themselves stayed patch-`=`; the commits that produced these records are `e98cc53b`, `0d5f2139` and `edf11e69` (TODO/CHANGELOG) and `5847aac6` (devlog), with the cites `6c76bf8f` and the r3 fixes `74f7084c`, the records reconcile `0d5f2139`, the cite repoint `edf11e69`, and the later records review fixes.)** The source was
-  resolved once at `frp-client/src/service.rs:939` but the same `ValueSource` was *also* stored in
-  `AuthConfig.token_source` at `:952` (pre-fix numbering; the post-fix `None` is `:965`), so every Login (`frp-client/src/control.rs:369` →
-  `frp-core/src/auth.rs:427-428`), Ping (`frp-client/src/service.rs:3497`) and NewWorkConn
+  resolved once at `frp-client/src/service.rs:957` but the same `ValueSource` was *also* stored in
+  `AuthConfig.token_source` at `:952` (pre-fix `084f7865` numbering; the post-fix `None` is now `:983`), so every Login (`frp-client/src/control.rs:369` →
+  `frp-core/src/auth.rs:427-428`), Ping (`frp-client/src/service.rs:3515`) and NewWorkConn
   (`frp-client/src/work_conn.rs:1770`) re-ran the command; Go resolves once in `NewService`
   (`client/service.go:168`, reused `:201`/`:316`) and only hashes the cached string. The stored
-  source is now dropped (`frp-client/src/service.rs:965` `token_source: None`), with doc-only notes
+  source is now dropped (`frp-client/src/service.rs:983` `token_source: None`), with doc-only notes
   in `frp-core/src/auth.rs:96-106` and `:336-347`. Measured with real binaries on one login: pre-fix
   **2** executions (`exec\nexec\n`), fixed **1** (`exec\n`), Go **1** — the item's `base\nbase\n`
   vs `go\n` reproduced. New pin `frp-client/tests/token_source_single_exec.rs` counts through the
   real client login path: 1 after construction, 1 after two logins, and still 1 after three real
   reloads (accepted add, accepted move, refused auth change last) — reloads add **0** executions
-  because `Service::auth_cfg` is assigned only at `frp-client/src/service.rs:949` and an
-  `[auth]`-changing reload is refused (`reload::auth_reload_refusal`, `frp-client/src/service.rs:4493-4496`).
+  because `Service::auth_cfg` is assigned only at `frp-client/src/service.rs:967` and an
+  `[auth]`-changing reload is refused (`reload::auth_reload_refusal`, `frp-client/src/service.rs:4511-4514`).
   The round-1 verification's F1 (the fix's rewrite had deleted the only e2e oracle for the failed-Ping
   skip + `interval.reset_after(delay)` arm) was closed in round 2 by restoring
-  `skipped_ping_rearms_interval_on_two_second_backoff` (`frp-client/tests/heartbeat_wire_order.rs:660`,
+  `skipped_ping_rearms_interval_on_two_second_backoff` (`frp-client/tests/heartbeat_wire_order.rs:676`,
   `#[cfg(feature = "oidc")]`, event-driven): deleting `interval.reset_after(delay)`
-  (`frp-client/src/service.rs:3523`) reddens it at `heartbeat_wire_order.rs:757:9`, and the measured
-  re-arm is 2009.6 ms against `Ping#2−T2 ∈ [1.0 s, 6.0 s]` with the Ping#3 cadence back at 9997 ms.
+  (`frp-client/src/service.rs:3541`) reddens it at `heartbeat_wire_order.rs:781:9`, and the measured
+  re-arm is 2009.6 ms against `Ping#2−T2 ∈ [1.0 s, 6.0 s]` with the Ping#3 cadence back at 9997 ms
+  (#449 replaced that range with the `PING_FIRST_BACKOFF`-derived `[1 s, 3 s]`).
   Reviews: verification round 1 MERGE-with-findings (that F1), round 2 delta MERGE; adversarial
   round 1 MERGE-with-findings — F1 the same coverage regression (closed), F2 the NewWorkConn token
   path is not directly exercised (no realistic partial fix isolates it: Login/Ping/NewWorkConn share
-  one `Arc<AuthConfig>`, `frp-client/src/service.rs:1196-1202`), F3 records, F4 INFO.
+  one `Arc<AuthConfig>`, `frp-client/src/service.rs:1214-1220`), F3 records, F4 INFO.
   The round-2 delta adversarial retracted F2 to LOW (coverage only) and added F5 LOW (the re-arm
   window below, now filed as its own item), F6 INFO (the comment at
-  `frp-client/tests/heartbeat_wire_order.rs:644-650` says "~5x the upper bound" where the measured
-  ratio is about 1.67x, applied in round 4 so the comment now reads `~1.7×`), F7 INFO (the wrong line cite in this paragraph, corrected here) and F8 INFO
+  `frp-client/tests/heartbeat_wire_order.rs:652-654` says "~5x the upper bound" where the measured
+  ratio is about 1.67x, applied in round 4 so the comment now reads `~1.7×` for the 5 s mutant; #449
+  re-derived the `reset_after`-deletion ratio to `~3.3×` against its tightened 3 s bound), F7 INFO (the wrong line cite in this paragraph, corrected here) and F8 INFO
   (the records row recorded only the round-1 adversarial verdict; closed by this text). Residues
   recorded, not fixed: `frps` re-resolves the source per
   verification where Go's `BuildServerAuth` caches it (`pkg/auth/auth.go:106`); `method = "oidc"` plus `auth.tokenSource` executes once here
@@ -8448,17 +8450,86 @@ section; ledger now **24 open / 104 closed**.**
   test that counts executions across a login (and, if the reload path re-reads the source, that path
   is counted too), or the double read is documented as deliberate with the measured rows and the
   reason it cannot be de-duplicated.
-- [ ] **The restored `tokenSource` re-arm oracle cannot see a wrong-but-fast backoff, and the NewWorkConn token path is uncovered.**
+- [x] **The restored `tokenSource` re-arm oracle cannot see a wrong-but-fast backoff, and the NewWorkConn token path is uncovered.**
+  **Done (2026-10-02, at fix `cd0f92ab` on `fix/tokensource-rearm-oracle`, PR #449, based on `fed87034` after the #454 merge; rebased from `01fb93e3`, `18bcd1ad`, earlier `366bbcaa`, originally `f881d15e` — the code commit is `=` under `git range-diff` at each rebase).** Both
+  oracles now read one constant: `PING_FIRST_BACKOFF` (`frp-client/src/service.rs:712`,
+  `pub const PING_FIRST_BACKOFF: Duration = Duration::from_secs(2)`) is what `next_ping_backoff` returns for
+  `prev == None` (`frp-client/src/service.rs:730`), and the e2e oracle derives its window from it —
+  `let rearm_min = PING_FIRST_BACKOFF / 2;` / `let rearm_max = PING_FIRST_BACKOFF + PING_FIRST_BACKOFF / 2;`
+  (`frp-client/tests/heartbeat_wire_order.rs:779-780`, `assert!` at `:781:9`) — instead of the hand-written
+  `[1.0 s, 6.0 s]`, which is exactly what let a wrong-but-fast call-site backoff stay green. Teeth, measured
+  with each helper restored from git afterwards: a 5 s literal replacing the `next_ping_backoff` call at the
+  call site (`frp-client/src/service.rs:3539`) is RED — `panicked at frp-client/tests/heartbeat_wire_order.rs:781:9: Ping#2 arrived 5007ms after the failed tick` — while the SAME mutant passes the old range (`test result: ok. 1 passed; 0 failed`), reproducing this item's premise; deleting
+  `interval.reset_after(delay)` (`frp-client/src/service.rs:3541`) is still RED (9982 ms), so the tightened
+  window keeps the teeth it was created for; and a drifted constant (3 s) is RED in the unit test's new value
+  pin (`assert_eq!(PING_FIRST_BACKOFF, Duration::from_secs(2), …)` at `frp-client/src/service.rs:5171:9`,
+  `left: 3s` / `right: 2s`). The division of labour is narrower than "the unit test owns the value and the
+  e2e window owns the call site": the unit test owns the exact Go-parity value, while the e2e window owns a
+  wrong *first* failure only -- it never observes a second consecutive failure, so a call-site rewrite that
+  returns the constant itself (`let delay = PING_FIRST_BACKOFF;`) instead of consulting `next_ping_backoff`
+  stays green, residue filed as its own item below. The NewWorkConn token path is now
+  **covered, not explained**: `oidc_token_source_fills_new_work_conn_privilege_key`
+  (`frp-client/src/work_conn.rs:2524`, `#[cfg(feature = "oidc")]`) drives the real `spawn_work_conn` against a
+  loopback listener with `client_auth_scopes = ["NewWorkConns"]` and an OIDC client built on an exec
+  `tokenSource`, reads the plaintext V1 `NewWorkConn`, and asserts `privilege_key == Some("nwc-oidc-token")`
+  (the raw source output, not a hash), `timestamp.is_none()`, and exactly one exec invocation; skipping the
+  auth block (`frp-client/src/work_conn.rs:1759`) reds it at `:2599:17` with `left: None`, so the pin is the
+  key on the wire, not the frame's arrival. No user-visible behaviour changed — oracle and new test only, the
+  re-arm semantics shipped in #437 -- so no `CHANGELOG.md` bullet. Residue stated, not hidden: the window
+  `[P/2, 3P/2]` = `[1 s, 3 s]` admits ANY call-site literal in that class -- the review's measured survivors
+  1 s, 2.5 s and 2.9 s all pass -- because a tighter window is not stable against e2e tick timing. The unit
+  test's exact-value pin (`frp-client/src/service.rs:5171-5175`) covers constant drift only: it calls
+  `next_ping_backoff` directly and cannot see the call site, so an in-band call-site literal
+  (`let delay = Duration::from_secs(1);` at `frp-client/src/service.rs:3539`) leaves it green. No test
+  covers an in-band call-site literal at all; that gap is one residue with the progression bypass, filed as
+  its own item below: the oracle observes only the
+  FIRST consecutive failure, so returning the constant instead of the progression survives. Ledger after
+  this close: **16 open / 190 closed** (base `fed87034`: 15 open / 189 closed; this close is the -1 and the
+  two items filed below are the +2).
+
   Filed from the round-2 adversarial review of `fix/tokensource-single-exec` (the item above).
-  `skipped_ping_rearms_interval_on_two_second_backoff` (`frp-client/tests/heartbeat_wire_order.rs:660`)
+  `skipped_ping_rearms_interval_on_two_second_backoff` (`frp-client/tests/heartbeat_wire_order.rs:676`)
   asserts the re-arm only inside `Ping#2-T2 in [1.0 s, 6.0 s]`, so hardcoding a 5 s backoff at the
-  call site (`frp-client/src/service.rs:3521`) stays green -- the exact 2 s is pinned only by the unit
-  test at `frp-client/src/service.rs:5148-5152`. And no test drives a `ReqWorkConn` carrying a token
+  call site (`frp-client/src/service.rs:3539`) stays green -- the exact 2 s is pinned only by the unit
+  test at `frp-client/src/service.rs:5171-5175` (the literal pin; the pre-#449 block is now `:5177-5181`).
+  And no test drives a `ReqWorkConn` carrying a token
   source (`frp-client/src/work_conn.rs:1758-1780`), although no realistic partial fix isolates it
-  (Login/Ping/NewWorkConn share one `Arc<AuthConfig>`, `frp-client/src/service.rs:1196-1202`).
+  (Login/Ping/NewWorkConn share one `Arc<AuthConfig>`, `frp-client/src/service.rs:1214-1220`).
   **Done-when:** the e2e window is tight enough that a wrong call-site backoff reds it (or the
   assertion compares against the pinned constant rather than a range), and the NewWorkConn path is
   covered or its absence explained.
+- [ ] **The re-arm e2e oracle sees only the first consecutive failure, so a call-site rewrite that returns `PING_FIRST_BACKOFF` instead of consulting the progression stays green.**
+  Filed from the R2 adversarial review of PR #449 (the item above). The oracle derives its window from
+  `PING_FIRST_BACKOFF` (`frp-client/tests/heartbeat_wire_order.rs:779-780`) but the OIDC exec source fails on
+  exactly one tick, so only the FIRST failure's re-arm is measured. Replacing the call site's
+  `next_ping_backoff(ctx.ping_retry_backoff, interval.period())` (`frp-client/src/service.rs:3539`) with
+  `let delay = PING_FIRST_BACKOFF;` -- and `interval.reset_after(delay)` (`:3541`) with
+  `interval.reset_after(PING_FIRST_BACKOFF)` -- keeps it green: the first re-arm is still 2 s, while the
+  progression (2 s -> 4 s -> 8 s -> the 10 s period) is never exercised end-to-end, so a call site that
+  ignores `ctx.ping_retry_backoff` entirely is invisible here. The unit test
+  `heartbeat_ping_backoff_progression` (`frp-client/src/service.rs:5158-5208`) still pins the progression
+  (measured: a drifted constant reds `:5171:9`), so the two tests red for different mutants.
+  **Done-when:** the e2e oracle observes a SECOND consecutive failure and asserts its re-arm against the
+  pinned progression (`next_ping_backoff(Some(PING_FIRST_BACKOFF), interval)` = 4 s), so the
+  constant-returning call-site mutants red there too -- or the absence of such a test is explained with the
+  measured reason.
+
+- [ ] **The NewWorkConn token path is pinned only at the `spawn_work_conn` seam -- no test drives a `ReqWorkConn` carrying a token source, so `handle_req_work_conn` is off-path.**
+  Filed from the R2 adversarial review of PR #449 (the item above).
+  `oidc_token_source_fills_new_work_conn_privilege_key` (`frp-client/src/work_conn.rs:2524`) constructs
+  `WorkConnConfig` itself, so the service's own wiring -- `handle_req_work_conn`
+  (`frp-client/src/service.rs:4191`), which threads `oidc_client: self.oidc_client.clone()` (`:4221`),
+  `client_auth_scopes` (`:4224`) and `server_auth_scopes: ctx.server_scopes.clone()` (`:4225`) -- is never
+  exercised with the fields that matter: no existing lane gives that path a non-`None` `oidc_client` or a
+  non-empty `server_auth_scopes`, so `oidc_client: None` and `server_auth_scopes: Vec::new()` survive the new
+  test, `frp-client/tests/token_source_single_exec.rs`, and the three `ReqWorkConn`-driving lanes
+  (`frp-client/tests/work_conn_reject_gate.rs`, `frp-client/tests/pool_replenishment.rs`,
+  `frp-client/tests/stcp_visitor_reject.rs`).
+  **Done-when:** a test drives a real `ReqWorkConn` whose session carries a token source (a non-`None`
+  `oidc_client` built on an exec source, and `NewWorkConns` in the scopes) and reds when
+  `handle_req_work_conn` stops threading those fields -- or a recorded explanation of why that seam is
+  unreachable in a test.
+
 - [x] **`scripts/compat-test.sh`'s XTCP helper still kills by argument pattern — the class of kill the compat-leak item forbade for its own children.**
   Filed by the coordinator while closing the "`scripts/compat-test.sh` leaks its children" item above.
   Inside `run_xtcp_test` (`scripts/compat-test.sh:4331`), the pre-test cleanup is
@@ -8565,7 +8636,7 @@ section; ledger now **24 open / 104 closed**.**
 
   **Done (PR #441, code head `f7319c3c`).** The assertion that could not tell a dial from the child's own
   listener is deleted, with its reasoning recorded in place (`frpc/tests/cli_inputs.rs:1485-1495`, naming
-  `frpc admin server starting on 127.0.0.1:<port>` from `frp-client/src/service.rs:4414`), and the claim it
+  `frpc admin server starting on 127.0.0.1:<port>` from `frp-client/src/service.rs:4445`), and the claim it
   meant to make is carried where it is observable: `!text.contains("Proxy Status") && !text.contains("NAME  TYPE")`
   (`:1498` — a `status` run that reached the mock prints exactly those headers) plus the mock staying silent
   after the loop (`:1506`, `rx.try_recv().is_err()`). Measured: restoring the base's
@@ -9149,7 +9220,7 @@ section; ledger now **24 open / 104 closed**.**
   **15 open / 186 closed** (base `e4c23b2f`: 16 open / 185 closed).
 
 - [ ] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
-  Filed by the coordinator while closing `TODO.md:8425` (PR #430), which removed the two local `pkill -f`
+  Filed by the coordinator while closing `TODO.md:8533` (PR #430), which removed the two local `pkill -f`
   calls in `scripts/compat-test.sh`: `scripts/remote-frps.sh:195` and `:339` still run
   `pkill -f 'frps -c frps.toml'` and `:409` uses `pgrep -f` on the same text, over ssh, to manage the
   comparison server on a remote VPS. Name-plus-argument is the same hazard the local sweep just lost — a

@@ -20,7 +20,7 @@ lines), yet it contains the largest production function in the repository:
 | # | Function | Location | **Code lines** |
 |---|---|---|---:|
 | 1 | **`run`** | **`frp-server/src/service.rs:308`** | **1291** |
-| 2 | `run_message_loop` | `frp-client/src/service.rs:2752` | 697 |
+| 2 | `run_message_loop` | `frp-client/src/service.rs:2890` | 697 |
 | 3 | `handle_new_proxy` | `frp-server/src/control/proxy_ops.rs:1849` | 546 |
 | 4 | `authenticate` | `frp-server/src/control/login.rs:617` | 510 |
 | 5 | `run_visitor_listener` | `frp-client/src/visitor.rs:1141` | 502 |

@@ -2502,6 +2502,126 @@ mod tests {
         .expect("all spawned work conn tasks should start immediately");
     }
 
+    /// TODO.md:8453 — the work-conn token path was uncovered: no test drove a
+    /// work connection (`spawn_work_conn`, the `ReqWorkConn` handler's dial)
+    /// that carries a token source, so `oidc.set_new_work_conn` /
+    /// `auth_cfg.try_generate_login_key` on the NewWorkConn frame could be
+    /// swapped for anything without a red test. This drives the real handshake
+    /// end to end: a real 127.0.0.1 listener stands in for frps, the OIDC
+    /// `tokenSource` exec supplies the key, and the plaintext V1 NewWorkConn on
+    /// the wire must carry exactly what Go frp v0.71.0's `setNewWorkConn`
+    /// produces — the RAW token as `privilege_key`, no `timestamp`
+    /// (`pkg/auth/oidc.go` sets only `PrivilegeKey`), unlike the token path
+    /// which also stamps a timestamp.
+    ///
+    /// Deletion/mutation proof: drop the `requires_auth` branch and the frame's
+    /// `privilege_key` stays `None`; use `try_generate_login_key` instead of the
+    /// OIDC setter and the key becomes an md5 token (not the raw token) and the
+    /// timestamp appears — both redden here. The invocation log also proves the
+    /// source ran exactly once, i.e. the frame's key can only have come from it.
+    #[cfg(feature = "oidc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oidc_token_source_fills_new_work_conn_privilege_key() {
+        use frp_core::config::{ExecSource, ValueSource};
+
+        // Print the resolved token, and record one line per invocation.
+        const SCRIPT: &str = "\
+n=$(wc -l < \"$1\")\n\
+printf 'invocation %s\\n' \"$((n + 1))\" >> \"$1\"\n\
+printf '%s' \"$2\"\n";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script_path = dir.path().join("nwc-token-exec.sh");
+        let log_path = dir.path().join("nwc-exec-invocations.txt");
+        std::fs::write(&script_path, SCRIPT).expect("write exec script");
+        std::fs::write(&log_path, "").expect("create exec invocation log");
+
+        let token = "nwc-oidc-token";
+        let source = ValueSource {
+            source_type: "exec".to_string(),
+            file: None,
+            exec: Some(ExecSource {
+                command: "sh".to_string(),
+                args: vec![
+                    script_path.to_str().unwrap().to_owned(),
+                    log_path.to_str().unwrap().to_owned(),
+                    token.to_string(),
+                ],
+                env: Vec::new(),
+            }),
+        };
+        // A token source makes `new` skip endpoint discovery entirely (an empty
+        // endpoint is the documented tokenSource mode), so this needs no IdP.
+        let oidc = OidcClient::new(
+            "nwc-oidc-client".to_string(),
+            String::new(),
+            String::new(),
+            None,
+            String::new(),
+            None,
+            &HashMap::new(),
+            None,
+            false,
+            None,
+            Some(source),
+        )
+        .await
+        .expect("OidcClient::new with a token source needs no token endpoint");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let (xtcp_tx, _xtcp_rx) = mpsc::channel(1);
+        let session_alive = Arc::new(AtomicBool::new(true));
+        let mut cfg = test_work_conn_config(-1, xtcp_tx, session_alive, None);
+        cfg.server_port = port;
+        cfg.run_id = "nwc-oidc-run-id".to_string();
+        cfg.oidc_client = Some(Arc::new(oidc));
+        // Only an advertised NewWorkConns scope makes the client authenticate
+        // this frame at all (Go parity: scope_requires_auth).
+        cfg.client_auth_scopes = vec!["NewWorkConns".to_string()];
+
+        let handle = spawn_work_conn(cfg);
+
+        let (conn, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("work conn dial")
+            .expect("accept work conn");
+        let mut stream = IoStream::Tcp(conn);
+        let frame = tokio::time::timeout(Duration::from_secs(5), stream.read_v1_frame())
+            .await
+            .expect("NewWorkConn read timeout")
+            .expect("read NewWorkConn");
+
+        match frame {
+            FrpMessage::NewWorkConn(nwc) => {
+                assert_eq!(nwc.run_id.as_deref(), Some("nwc-oidc-run-id"));
+                assert_eq!(
+                    nwc.privilege_key.as_deref(),
+                    Some(token),
+                    "the OIDC NewWorkConn setter must put the RAW tokenSource \
+                     output on the wire as privilege_key"
+                );
+                assert!(
+                    nwc.timestamp.is_none(),
+                    "Go frp's OIDC setNewWorkConn sets only PrivilegeKey \
+                     (pkg/auth/oidc.go), so the timestamp stays unset"
+                );
+            }
+            other => panic!("expected NewWorkConn, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&log_path)
+                .map(|s| s.lines().count())
+                .unwrap_or(0),
+            1,
+            "auth.oidc.tokenSource must have run exactly once, and the frame we \
+             just read can only carry that run's output"
+        );
+
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn udp_work_reader_eof_cancels_blocked_writer() {
         let (work, peer) = tcp_pair().await;

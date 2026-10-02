@@ -122,7 +122,7 @@ async fn no_ping_before_login_resp_pings_begin_after_registration() {
         // (service.rs: register_proxies Phase 4 -> run_message_loop
         // Phase 6 — pings physically cannot leave before this point, the
         // writer task is not spawned until Phase 5). The heartbeat interval
-        // is armed at login success (service.rs:1812-1815, tokio `interval()`:
+        // is armed at login success (service.rs:1830-1833, tokio `interval()`:
         // tick 1's deadline is the arm instant) and polled for the first
         // time at loop start, so tick 1 fires immediately: Ping#1 must
         // reach the wire ~ms after this write.
@@ -380,7 +380,7 @@ async fn ping_reuses_startup_token_snapshot_when_source_becomes_unreadable() {
             .expect("write LoginResp");
 
         // Oracle-1 immediacy anchor: the client arms its heartbeat interval
-        // when it processes this LoginResp (service.rs:1812-1815, tokio
+        // when it processes this LoginResp (service.rs:1830-1833, tokio
         // `interval()`: tick 1's deadline is the arm instant). This session
         // has no proxies or visitors, so the registration phase
         // (service.rs register_proxies — nothing pending) and the loop
@@ -613,12 +613,12 @@ fn assert_oidc_ping_key(frame: &FrpMessage, token: &str) {
 }
 
 /// Restored e2e oracle for the heartbeat skip + fast re-arm arm
-/// (`frp-client/src/service.rs:3509-3526`, `interval.reset_after(delay)` at
-/// `:3523`). The pre-fix `auth.tokenSource` test of that arm was deleted with
+/// (`frp-client/src/service.rs:3527-3544`, `interval.reset_after(delay)` at
+/// `:3541`). The pre-fix `auth.tokenSource` test of that arm was deleted with
 /// the single-execution fix (`cac4f52a`), and because the client's
 /// `AuthConfig.token_source` is now left unset, the token path can no longer
 /// fail: the arm is reachable ONLY through the OIDC ping branch
-/// (`frp-client/src/service.rs:3481-3491`, `oidc.set_ping` failure). Deleting
+/// (`frp-client/src/service.rs:3499-3509`, `oidc.set_ping` failure). Deleting
 /// `reset_after` again must therefore redden THIS test.
 ///
 /// Trigger: `method = "oidc"` with `auth.oidc.tokenSource` bound to an exec
@@ -641,13 +641,29 @@ fn assert_oidc_ping_key(frame: &FrpMessage, token: &str) {
 ///       fires on the message loop's first poll; a first tick that waited out
 ///       its full 10s period would land far outside);
 ///   (2) every Ping carries the raw OIDC token and no timestamp;
-///   (3) `Ping#2 − T2 ∈ [1.0s, 6.0s]` — the re-armed tick. Nominal 2s; with
+///   (3) `Ping#2 − T2 ∈ [PING_FIRST_BACKOFF/2, PING_FIRST_BACKOFF × 3/2]`
+///       (= `[1.0s, 3.0s]`) — the re-armed tick, asserted against the
+///       production constant `frp_client::service::PING_FIRST_BACKOFF` (the
+///       value `next_ping_backoff` returns for the first failure of a streak
+///       and the value the unit test `heartbeat_ping_backoff_progression`
+///       pins), never against a hand-written range. Nominal 2s; with
 ///       `interval.reset_after(delay)` deleted the interval keeps its 10s
-///       period and the next attempt lands ~10s after T2, so the gap is ~1.7×
-///       the upper bound — RED. The window is centered on the 2s/10s pair with
-///       ≥4s of slack on each side, deliberately generous: under host load the
-///       measured gap can only grow, so the load-sensitive edge is the upper
-///       one and the mutant sits 4s beyond it;
+///       period and the next attempt lands ~10s after T2 (~3.3× the upper
+///       bound) — RED; a wrong-but-in-range backoff hard-coded at the call
+///       site — `reset_after(Duration::from_secs(5))`, the mutant the old
+///       `[1.0s, 6.0s]` window stayed green on — lands ~5s after T2 (1.7×
+///       the upper bound) — RED. The remaining slack absorbs host load, which
+///       can only *grow* the measured gap, so the load-sensitive edge is the
+///       upper one, 1s above nominal. Two limits, each filed as its own item
+///       below the closed `TODO.md:8453`: (a) the window admits ANY call-site
+///       literal in its `[1s, 3s]` class — the review measured 1 s, 2.5 s and
+///       2.9 s all passing — so a wrong literal inside it is not
+///       distinguishable end-to-end, and only the constant-vs-literal pin in
+///       the unit test (`frp-client/src/service.rs:5171-5175`) is exact; (b)
+///       the oracle observes only the FIRST consecutive failure, so a
+///       call-site substitution that returns the constant itself
+///       (`let delay = PING_FIRST_BACKOFF;`) instead of consulting
+///       `next_ping_backoff` stays green too;
 ///   (4) `Ping#3 − Ping#2 ∈ [6.0s, 15.0s]` — the period cadence resumed (a
 ///       backoff that kept re-arming would ping every ~2s);
 ///   (5) exactly one Login.
@@ -658,6 +674,7 @@ fn assert_oidc_ping_key(frame: &FrpMessage, token: &str) {
 #[cfg(feature = "oidc")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn skipped_ping_rearms_interval_on_two_second_backoff() {
+    use frp_client::service::PING_FIRST_BACKOFF;
     use frp_core::unsafe_features::{UnsafeFeatures, TOKEN_SOURCE_EXEC};
 
     common::init_tracing();
@@ -680,7 +697,7 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
         server_additional_auth_scopes: None,
     });
     // The OIDC config carries no `auth.token`, so `AuthConfig.token` is empty
-    // and the control-stream key is derive_key("") (service.rs:990 + :1779).
+    // and the control-stream key is derive_key("") (service.rs:1008 + :1797).
     let enc_key = frp_core::encryption::derive_key("");
     let pong = FrpMessage::Pong(msg::Pong { error: None });
 
@@ -745,8 +762,13 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
         // failed invocation is the observation channel for that skip moment.
         let tick2_at = wait_for_exec_invocations(&mock_log, 3, Duration::from_secs(20)).await;
 
-        // Oracle 3 (decisive): Ping#2 is the re-armed tick, ~2s after the
-        // failure. Without `interval.reset_after(delay)` it would be ~10s.
+        // Oracle 3 (decisive): Ping#2 is the re-armed tick, one
+        // `PING_FIRST_BACKOFF` after the failure. The window is DERIVED from
+        // that production constant (the same value the unit test
+        // `heartbeat_ping_backoff_progression` pins), not written by hand, so
+        // a wrong backoff hard-coded at the call site reds it: without
+        // `interval.reset_after(delay)` Ping#2 lands ~10s after the failed
+        // tick, with a 5s literal ~5s.
         let f2 = tokio::time::timeout(Duration::from_secs(15), enc.read_v1_frame())
             .await
             .expect("no Ping after the skipped tick: the 2s re-arm never fired")
@@ -754,14 +776,22 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
         let ping2_at = Instant::now();
         assert_oidc_ping_key(&f2, token);
         let rearm_gap = ping2_at.duration_since(tick2_at);
+        let rearm_min = PING_FIRST_BACKOFF / 2;
+        let rearm_max = PING_FIRST_BACKOFF + PING_FIRST_BACKOFF / 2;
         assert!(
-            rearm_gap >= Duration::from_secs(1) && rearm_gap <= Duration::from_secs(6),
-            "Ping#2 arrived {}ms after the failed tick (expected ~2000ms: the \
-             skip arm re-arms the interval at next_ping_backoff(None, 10s) = 2s \
-             — InitDurationIfFail 1s x Factor 2, capped at the 10s period). \
-             With interval.reset_after(delay) removed the interval keeps its \
-             10s period and Ping#2 lands ~10000ms after the failed tick — RED",
-            rearm_gap.as_millis()
+            rearm_gap >= rearm_min && rearm_gap <= rearm_max,
+            "Ping#2 arrived {}ms after the failed tick (expected ~{}ms = \
+             PING_FIRST_BACKOFF: the skip arm re-arms the interval at \
+             next_ping_backoff(None, 10s) — InitDurationIfFail 1s x Factor 2, \
+             capped at the 10s period; the accepted window [{}, {}]ms is \
+             derived from that constant, so a call-site backoff that is wrong \
+             by more than half the constant is RED: deleting \
+             interval.reset_after(delay) keeps the 10s period (~10000ms), a \
+             5s literal lands ~5000ms, and no re-arm at all never ticks)",
+            rearm_gap.as_millis(),
+            PING_FIRST_BACKOFF.as_millis(),
+            rearm_min.as_millis(),
+            rearm_max.as_millis()
         );
         enc.write_v1_frame(&pong).await.expect("write Pong");
 
