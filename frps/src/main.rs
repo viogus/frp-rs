@@ -3,8 +3,8 @@ use std::process;
 
 use frp_core::cli::{parse_frps_args, FrpsArgs, FrpsCmd};
 use frp_core::config::{
-    collect_config_files, load_server_config_checked, load_server_config_uncompleted_with_presence,
-    load_server_config_with_presence, ServerConfig,
+    collect_config_files, load_server_config_uncompleted_with_presence,
+    load_server_config_with_presence, load_server_config_with_presence_checked, ServerConfig,
 };
 use frp_core::logging;
 use frp_core::unsafe_features::UnsafeFeatures;
@@ -363,6 +363,17 @@ async fn main() {
 /// the one success line with stderr empty. Leaving `tracing` uninitialised drops
 /// the lenient-load warnings the run path would emit, which is what keeps that
 /// one-line shape (`tracing` records are a no-op without a subscriber).
+///
+/// **Wrong for the unhonoured-listener ports, so those are printed directly.**
+/// A config this build cannot fully honour still *loads*, and the run path tells
+/// the user so with a `tracing` record. Verify has no subscriber, so it reads
+/// the same texts from `ConfigPresence::unhonoured_*_records` and `println!`s
+/// them to stdout, one record per line, **before** the success line — the Go
+/// byte string stays exact and stays last. Silently accepting a port the build
+/// drops is the failure mode this closes (TODO.md item on `frps verify
+/// --strict-config`); the records come from the same helpers the `tracing` sites
+/// read, so the two delivery paths cannot drift. Pinned in both feature shapes
+/// by `frps/tests/cli_exit_codes.rs`.
 fn run_verify(config_path: &str, strict_config: bool, allow_unsafe: &[String]) {
     if config_path.is_empty() {
         // Go: `fmt.Println("frps: the configuration file is not specified")`,
@@ -372,8 +383,21 @@ fn run_verify(config_path: &str, strict_config: bool, allow_unsafe: &[String]) {
     }
     let refs: Vec<&str> = allow_unsafe.iter().map(|s| s.as_str()).collect();
     let unsafe_features = UnsafeFeatures::new(&refs);
-    match load_server_config_checked(config_path, strict_config, &unsafe_features) {
-        Ok(_) => {
+    match load_server_config_with_presence_checked(config_path, strict_config, &unsafe_features) {
+        Ok((_cfg, presence)) => {
+            // The two lists have different element types (`String` for the
+            // three runtime-built clause texts, `&'static str` for the two
+            // reader-gated ones), so they are printed in two loops rather than
+            // chained.
+            for record in presence.unhonoured_server_feature_key_records() {
+                println!("{record}");
+            }
+            for record in presence.unhonoured_reader_gated_port_records(
+                frp_server::service::web_server_port_reader(),
+                frp_server::service::ssh_tunnel_gateway_bind_port_reader(),
+            ) {
+                println!("{record}");
+            }
             // Go: `fmt.Printf("frps: the configuration file %s syntax is ok\n",
             // cfgFile)` (`cmd/frps/verify.go:56`).
             println!("frps: the configuration file {} syntax is ok", config_path);
@@ -610,6 +634,17 @@ async fn run(mut cli: FrpsArgs) {
                     // not compiled, so this record is the only signal that the
                     // named port stays closed.
                     presence.warn_unhonoured_server_feature_keys();
+                    // And the two listener ports whose *field* is present but
+                    // whose reader is not: `web_server.port` (this build's
+                    // `frp-server/dashboard` off) and
+                    // `ssh_tunnel_gateway.bind_port` (`frp-server/ssh` off). The
+                    // answer comes from `frp-server`, the crate that owns both
+                    // features — never from this binary's own `cfg!`.
+                    presence
+                        .warn_inert_web_server_port(frp_server::service::web_server_port_reader());
+                    presence.warn_inert_ssh_tunnel_gateway_bind_port(
+                        frp_server::service::ssh_tunnel_gateway_bind_port_reader(),
+                    );
                     let uf = unsafe_features.clone();
                     #[cfg(unix)]
                     let registry = registry.clone();
@@ -1049,6 +1084,14 @@ async fn run(mut cli: FrpsArgs) {
     // the `--config-dir` branch above warns at its own load site, so no path
     // double-warns here either.
     presence.warn_unhonoured_server_feature_keys();
+    // ... and for the two listener ports whose field this build *has* but whose
+    // reader it does not: `web_server.port` (`frp-server/dashboard` off) and
+    // `ssh_tunnel_gateway.bind_port` (`frp-server/ssh` off). Same sink, same
+    // one-record-per-load rule; the reader answer comes from `frp-server`.
+    presence.warn_inert_web_server_port(frp_server::service::web_server_port_reader());
+    presence.warn_inert_ssh_tunnel_gateway_bind_port(
+        frp_server::service::ssh_tunnel_gateway_bind_port_reader(),
+    );
 
     tracing::info!(version = %frp_core::VERSION, "frps (Rust) v{} starting...", frp_core::VERSION);
     let config_path = Some(config_path);

@@ -216,13 +216,15 @@ fn boot_records_with_dashboard() -> usize {
 /// [`Spawned::run`] to know it can freeze: the boot records plus the warning the
 /// shape is going to emit. `web` picks the dashboard-configured shape (which has
 /// the three dashboard records when the feature is on) over the plain one;
-/// `warning` is false only for the spawn shape that reads the streams live.
+/// `warning` is false only for the spawn shape that reads the streams live. A
+/// `web` shape names a non-zero `web_server.port`, so it also owes the
+/// reader-gated port record in a build without `dashboard`.
 fn capture_floor(warning: bool, web: bool) -> usize {
     if !warning {
         return 0;
     }
     if web {
-        boot_records_with_dashboard() + 1
+        boot_records_with_dashboard() + 1 + want_web_server_port_records()
     } else {
         boot_records_flat_tls_enable() + 1
     }
@@ -246,10 +248,11 @@ fn boot_records_flat_tls_enable_config_dir() -> usize {
     BOOT_RECORDS_BASE
 }
 
-/// [`capture_floor`] for the `--config-dir` startup paths.
+/// [`capture_floor`] for the `--config-dir` startup paths. The `web` shape owes
+/// the same reader-gated port record as its `-c` twin.
 fn capture_floor_config_dir(web: bool) -> usize {
     if web {
-        boot_records_with_dashboard_config_dir() + 1
+        boot_records_with_dashboard_config_dir() + 1 + want_web_server_port_records()
     } else {
         boot_records_flat_tls_enable_config_dir() + 1
     }
@@ -881,9 +884,20 @@ fn assert_one_warning_on_stdout_from_config_dir(tag: &str, spawned: &Spawned) {
     assert_one_warning_on_stdout_with_boot(tag, spawned, boot_records_with_dashboard_config_dir());
 }
 
+/// `boot` is this shape's boot baseline ([`boot_records_with_dashboard`] or its
+/// `--config-dir` twin). The reader-gated `web_server.port` record is added on
+/// top: every `[web_server]` fixture this file builds names a **non-zero**
+/// port, so a build without `dashboard` owes exactly one record for it beside
+/// the `tls_enable` one (TODO.md item 1). The term is zero in the dashboard
+/// lane, where the same port is honoured and the build must stay silent.
 fn assert_one_warning_on_stdout_with_boot(tag: &str, spawned: &Spawned, boot: usize) {
     assert_one_warning_on_stdout_for(tag, spawned, KEY);
-    assert_web_server_tls_enable_records_are_exactly_the_message(tag, &spawned.stdout(), 1, boot);
+    assert_web_server_tls_enable_records_are_exactly_the_message(
+        tag,
+        &spawned.stdout(),
+        1,
+        boot + want_web_server_port_records(),
+    );
     assert_clause_matches_this_build(tag, spawned);
 }
 
@@ -1353,9 +1367,18 @@ fn assert_one_server_tls_enable_warning_with_boot(tag: &str, spawned: &Spawned, 
 /// the silence is a decision and not a failed run. The byte-pin runs with
 /// `expected = 0` so the silence is stated in the same terms as the presence
 /// rows: no variant of this build's message, anywhere in the capture.
+/// [`assert_no_warning`] pins the `web_server.tls.enable` silence, so its
+/// `others` baseline is the shape's boot plus the reader-gated `web_server.port`
+/// record the same config owes in a build without `dashboard` (the negative
+/// control's config writes a non-zero port, it just omits the `tls` table).
 fn assert_no_warning(tag: &str, spawned: &Spawned, boot: usize) {
     assert_no_warning_for(tag, spawned, KEY);
-    assert_web_server_tls_enable_records_are_exactly_the_message(tag, &spawned.stdout(), 0, boot);
+    assert_web_server_tls_enable_records_are_exactly_the_message(
+        tag,
+        &spawned.stdout(),
+        0,
+        boot + want_web_server_port_records(),
+    );
 }
 
 /// [`assert_no_warning`] for an arbitrary key.
@@ -1915,7 +1938,7 @@ fn a_sigusr1_reload_delivers_the_warning_again() {
         "frps reload (startup)",
         &spawned.stdout(),
         1,
-        boot_records_with_dashboard(),
+        boot_records_with_dashboard() + want_web_server_port_records(),
     );
 
     assert!(
@@ -1934,7 +1957,9 @@ fn a_sigusr1_reload_delivers_the_warning_again() {
         "frps reload (startup + reload)",
         &out,
         2,
-        boot_records_with_dashboard() + RELOAD_EXTRA_RECORDS,
+        // The reload is a second load, so it owes a second reader-gated port
+        // record in a build without `dashboard` (zero in the dashboard lane).
+        boot_records_with_dashboard() + RELOAD_EXTRA_RECORDS + want_web_server_port_records() * 2,
     );
     assert_clause_matches_this_build("frps reload", &spawned);
 }
@@ -1956,10 +1981,13 @@ fn records_emitted_after_the_snapshot_never_reach_the_capture() {
     let dir = TempDir::new("late");
     let cfg = frps_config(free_port(), free_port(), Section::Nested);
     let path = dir.write("frps.toml", &cfg);
+    // `web = true`: this is a `[web_server]` shape with a non-zero port, so its
+    // complete capture is the dashboard records (when compiled) plus the
+    // `tls_enable` record plus the reader-gated port record (when it is owed).
     let spawned = Spawned::run(
         &dir,
         &["-c", path.to_str().unwrap()],
-        capture_floor(true, false),
+        capture_floor(true, true),
     );
     let frozen = records_carrying(&spawned.stdout(), KEY);
     assert_eq!(
@@ -2009,10 +2037,12 @@ fn warning_when_the_camelcase_tls_table_is_merged_into_the_snake_section() {
     let dir = TempDir::new("mixed");
     let cfg = frps_config(free_port(), free_port(), Section::MixedSections);
     let path = dir.write("frps.toml", &cfg);
+    // `web = true` for the same reason as the late-record row: `[web_server]`
+    // with a non-zero port, so the dashboard records count toward the capture.
     let spawned = Spawned::run(
         &dir,
         &["-c", path.to_str().unwrap()],
-        capture_floor(true, false),
+        capture_floor(true, true),
     );
     assert_one_warning_on_stdout("frps -c (mixed sections)", &spawned);
 }
@@ -2197,4 +2227,189 @@ fn a_sigusr1_reload_delivers_the_server_tls_enable_warning_again() {
         boot_records_flat_tls_enable() + RELOAD_EXTRA_RECORDS,
     );
     assert_eq!(occurrences(&spawned.stderr(), SERVER_KEY), 0);
+}
+
+// ─── The reader-gated listener ports ─────────────────────────────────────────
+//
+// `web_server.port` is an **unconditional** `ServerConfig` field: every build's
+// serde accepts the key. Only `frp-server`'s `dashboard` feature *reads* it, so
+// a build without the feature binds nothing and the key is silently dropped —
+// unless the caller turns the recorded presence into a record, which is what
+// these rows pin. Unlike the `tls_enable` family the key is **live** in some
+// builds, so the pin here has two directions: the no-dashboard lane must see
+// exactly one record, and the `--features dashboard` lane must see **none**. A
+// warning that fires when the feature is on is a bug, and only the second
+// direction can see it — that is the positive control.
+
+/// The one `web_server.port` record this build owes: absent reader ⇒ 1, present
+/// reader ⇒ 0 (the port is honoured, so a record would be a false report).
+fn want_web_server_port_records() -> usize {
+    if cfg!(feature = "dashboard") {
+        0
+    } else {
+        1
+    }
+}
+
+/// The `Spawned::run` floor for a `[web_server] port = N` config: the shape has
+/// the dashboard records when the feature is compiled, plus the one record this
+/// build owes for the port.
+fn capture_floor_web_server_port() -> usize {
+    boot_records_with_dashboard() + want_web_server_port_records()
+}
+
+/// Byte-pin the `web_server.port` records: exactly `expected` of them carrying
+/// the message, `others` beside them. In the dashboard lane `expected` is 0, so
+/// this is also the assertion that the live build stayed silent.
+fn assert_web_server_port_records_are_exactly_the_message(
+    tag: &str,
+    out: &str,
+    expected: usize,
+    others: usize,
+) {
+    assert_records_are_exactly_the_message(
+        tag,
+        out,
+        frp_core::config::WEB_SERVER_PORT_UNHONOURED_WARNING,
+        expected,
+        others,
+    );
+}
+
+/// A config that names `web_server.port` and nothing else gated: no
+/// `web_server.tls` table (so the `tls_enable` diagnostic is not a sibling) and
+/// no `ssh_tunnel_gateway` section.
+fn frps_config_web_server_port(bind_port: u16, dashboard_port: u16) -> String {
+    frps_config(bind_port, dashboard_port, Section::None)
+}
+
+#[test]
+fn web_server_port_warning_reaches_a_dash_c_user() {
+    let dir = TempDir::new("port-dashc");
+    let cfg = frps_config_web_server_port(free_port(), free_port());
+    let path = dir.write("frps.toml", &cfg);
+    let spawned = Spawned::run(
+        &dir,
+        &["-c", path.to_str().unwrap()],
+        capture_floor_web_server_port(),
+    );
+
+    let want = want_web_server_port_records();
+    assert_eq!(
+        occurrences(
+            &spawned.stdout(),
+            frp_core::config::WEB_SERVER_PORT_UNHONOURED_WARNING
+        ),
+        want,
+        "this build owes {want} `web_server.port` record(s)\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+    assert_web_server_port_records_are_exactly_the_message(
+        "frps -c (web_server.port)",
+        &spawned.stdout(),
+        want,
+        boot_records_with_dashboard(),
+    );
+    assert_eq!(
+        occurrences(
+            &spawned.stderr(),
+            frp_core::config::WEB_SERVER_PORT_UNHONOURED_WARNING
+        ),
+        0,
+        "the diagnostic is a stdout record"
+    );
+}
+
+/// The reload is a second in-process load through the **other** sink
+/// (`frp-server/src/service.rs`), so the one-per-load rule is pinned on both
+/// delivery sites. In the dashboard lane the same reload must stay silent.
+#[cfg(unix)]
+#[test]
+fn a_sigusr1_reload_delivers_the_web_server_port_warning_again() {
+    let dir = TempDir::new("port-reload");
+    let cfg = frps_config_web_server_port(free_port(), free_port());
+    let path = dir.write("frps.toml", &cfg);
+    let mut spawned = Spawned::run(
+        &dir,
+        &["-c", path.to_str().unwrap()],
+        capture_floor_web_server_port(),
+    );
+    let want = want_web_server_port_records();
+    assert_eq!(
+        occurrences(
+            &spawned.stdout(),
+            frp_core::config::WEB_SERVER_PORT_UNHONOURED_WARNING
+        ),
+        want,
+        "startup: one record per load\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+
+    assert!(
+        spawned.sigusr1_and_reload(),
+        "the reload never logged {RELOAD_MARKER:?}\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+    let out = spawned.stdout();
+    assert_eq!(
+        occurrences(&out, frp_core::config::WEB_SERVER_PORT_UNHONOURED_WARNING),
+        want * 2,
+        "startup + reload = one per load\n--- stdout ---\n{out}"
+    );
+    assert_web_server_port_records_are_exactly_the_message(
+        "startup + SIGUSR1 reload (web_server.port)",
+        &out,
+        want * 2,
+        boot_records_with_dashboard() + RELOAD_EXTRA_RECORDS,
+    );
+}
+
+/// `frps verify` cannot use `tracing` (the loader runs before any subscriber is
+/// installed — see the `run_verify` doc), so the same record list is printed
+/// directly. The pin is byte-exact on the **whole** stdout, because the Done-when
+/// for this item is "reports the unhonoured key **without** disturbing the
+/// byte-exact `syntax is ok` line": a record appended after the success line, or
+/// one that reformats it, reds here even though the count would still be right.
+///
+/// This row lives in the `warn_delivery` file rather than `cli_exit_codes.rs`
+/// on purpose: only this file has a `--features dashboard` lane, and the
+/// zero-record direction ([`want_web_server_port_records`] `== 0`) is the
+/// positive control that a `verify` printing unconditionally would red.
+#[test]
+fn verify_prints_the_gated_listener_port_record_before_the_go_success_line() {
+    let dir = TempDir::new("port-verify");
+    let cfg = frps_config_web_server_port(free_port(), free_port());
+    let path = dir.write("frps.toml", &cfg);
+    let out = Command::new(bin())
+        .args(["verify", "-c", path.to_str().unwrap()])
+        .current_dir(&dir.0)
+        .output()
+        .expect("spawn frps verify");
+    assert!(
+        out.status.success(),
+        "`verify` on a valid config must exit 0: status={:?} stdout={:?} stderr={:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut expected = String::new();
+    if want_web_server_port_records() == 1 {
+        expected.push_str(frp_core::config::WEB_SERVER_PORT_UNHONOURED_WARNING);
+        expected.push('\n');
+    }
+    expected.push_str(&format!(
+        "frps: the configuration file {} syntax is ok\n",
+        path.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        expected,
+        "the record (when this build owes one) goes before Go's byte-exact success line"
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "verify keeps stderr empty on a valid config: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

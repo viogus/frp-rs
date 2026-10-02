@@ -258,6 +258,24 @@ pub struct ConfigPresence {
     /// (`websocket_port` / `websocketPort`).
     #[cfg(not(feature = "websocket"))]
     pub(super) server_websocket_port_unhonoured: bool,
+    /// `web_server.port` / `webServer.port` — at the top level, under
+    /// `[common]`, in an `.ini` file, in an `includes` file, or via the legacy
+    /// top-level `dashboard_port` spelling `normalize_server_config` moves into
+    /// the section — was written with a **non-zero** port.
+    ///
+    /// Unlike the three ports above, this key's reader is **not** in `frp-core`:
+    /// `web_server` is read by `frp-server`'s `dashboard` feature, and the field
+    /// is **unconditional** in `ServerConfig`, so a dashboard-less build
+    /// deserializes the key and then never reads it. `frp-core` cannot observe
+    /// that feature, so the flag is computed in **every** build and the caller's
+    /// [`ListenerPortReader`] decides whether it is emitted. See
+    /// [`ConfigPresence::warn_inert_web_server_port`].
+    pub(super) web_server_port_unhonoured: bool,
+    /// The `ssh_tunnel_gateway.bind_port` / `sshTunnelGateway.bindPort` twin of
+    /// [`Self::web_server_port_unhonoured`]: read by `frp-server`'s `ssh`
+    /// feature, unconditional in `ServerConfig`. See
+    /// [`ConfigPresence::warn_inert_ssh_tunnel_gateway_bind_port`].
+    pub(super) ssh_tunnel_gateway_bind_port_unhonoured: bool,
 }
 
 /// Which **web server** a build compiles (if any), and whether that web server
@@ -314,6 +332,45 @@ impl WebServerTlsEnableReader {
             Self::NoWebServer => WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_DASHBOARD,
             Self::WebServerNoTls => WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS,
             Self::WebServerTls => WEB_SERVER_TLS_ENABLE_INERT_WARNING,
+        }
+    }
+}
+
+/// Whether the crate that reads a feature-gated **listener port** compiles the
+/// feature that reads it.
+///
+/// The two ports this answers for — `web_server.port` and
+/// `ssh_tunnel_gateway.bind_port` — are read only by `frp-server` (its
+/// `dashboard` and `ssh` features), and both fields are **unconditional** in
+/// `ServerConfig`, so `frp-core` always deserializes them and can never resolve
+/// this itself. Exactly like [`WebServerTlsEnableReader`], the owning crate is
+/// asked (`frp_server::service::web_server_port_reader` /
+/// `ssh_tunnel_gateway_bind_port_reader`) and the answer is passed to
+/// [`ConfigPresence::warn_inert_web_server_port`] /
+/// [`ConfigPresence::warn_inert_ssh_tunnel_gateway_bind_port`].
+///
+/// This is the deliberate difference from the three `#[cfg]`-gated kcp / quic /
+/// websocket ports: there the *field* is compiled out, so the presence flag
+/// itself carries the build shape ([`ConfigPresence::warn_unhonoured_server_feature_keys`]);
+/// here the field is always present and only the reader is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerPortReader {
+    /// The feature that reads the port is compiled: a non-zero port is honoured
+    /// and the diagnostic stays silent.
+    Present,
+    /// The feature is not compiled: the key is accepted by serde and then
+    /// silently ignored — no listener is bound.
+    Absent,
+}
+
+impl ListenerPortReader {
+    /// The owning crate's answer to its own one question: does this build
+    /// compile the feature that reads the port?
+    pub const fn from_features(has_reader: bool) -> Self {
+        if has_reader {
+            Self::Present
+        } else {
+            Self::Absent
         }
     }
 }
@@ -548,6 +605,71 @@ pub static SERVER_QUIC_BIND_PORT_UNHONOURED_WARNING: std::sync::LazyLock<String>
 pub static SERVER_WEBSOCKET_PORT_UNHONOURED_WARNING: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| SERVER_WEBSOCKET_PORT_UNHONOURED_CLAUSES.join(" "));
 
+/// The written-but-unhonoured `web_server.port` diagnostic, in one place so
+/// `frps` and `frp-server` cannot drift. Callers gate it on
+/// [`ConfigPresence::web_server_port_unhonoured`] **and** on their own
+/// [`ListenerPortReader`] being [`ListenerPortReader::Absent`]; it is emitted
+/// after `init_logging` on the run paths, and on stdout by `frps verify` (whose
+/// path has no subscriber at all).
+///
+/// `web_server.port` is **unconditional** in `ServerConfig` — unlike the three
+/// `#[cfg]`-gated kcp/quic/websocket ports — so the key always deserializes and
+/// only the reader can be missing: in a build without `frp-server`'s
+/// `dashboard` feature nothing ever reads it and the port the file names stays
+/// closed. The text therefore names the missing **reader**, not a missing field.
+pub const WEB_SERVER_PORT_UNHONOURED_WARNING: &str = "web_server.port has no effect: this \
+     build has no dashboard support, so nothing reads the key and no dashboard listener is \
+     bound";
+
+/// The `ssh_tunnel_gateway.bind_port` (`sshTunnelGateway.bindPort`) twin of
+/// [`WEB_SERVER_PORT_UNHONOURED_WARNING`].
+pub const SSH_TUNNEL_GATEWAY_BIND_PORT_UNHONOURED_WARNING: &str = "ssh_tunnel_gateway.bind_port \
+     has no effect: this build has no SSH tunnel gateway support, so nothing reads the key \
+     and no SSH listener is bound";
+
+/// Does one written value ask for a listener?
+///
+/// The documented "disabled" value is the integer `0` (`docs/config.md`, the
+/// three gated listener rows), and every build shape honours it identically, so
+/// it is not a request. A **legacy `.ini`** file can spell that same disabled
+/// request more than one way: the INI reader infers an integer only for text
+/// that round-trips through both renderers
+/// (`frp-core/src/config/format.rs`, `infer_ini_value_depth`), so `+0`, `00`
+/// and the quoted `"0"` stay `toml::Value::String`, and the lenient integer
+/// reader then parses those to zero (`frp-core/src/config/ini_lenient.rs`,
+/// `s.parse::<i64>()`). They name the disabled value just as `0` does, so
+/// reporting them would be a false record. Everything else — a non-zero
+/// integer, a string that parses to a non-zero value or does not parse at all,
+/// any other type — names a listener this build may not create.
+fn port_value_requests_a_listener(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Integer(0) => false,
+        toml::Value::String(text) => !matches!(text.parse::<i64>(), Ok(0)),
+        _ => true,
+    }
+}
+
+/// The section-scoped form of [`port_requested`]: was `section.snake` (or
+/// `section.camel`) written with a value that asks for a listener? Used by the
+/// two ports whose key lives in a sub-table (`web_server.port`,
+/// `ssh_tunnel_gateway.bind_port`) and whose **reader** is resolved by the
+/// calling crate.
+///
+/// Both key spellings are required, like [`port_requested`]:
+/// `normalize_server_config` renames the section (`sshTunnelGateway` →
+/// `ssh_tunnel_gateway`) but not the keys inside it, so `bindPort` survives
+/// normalization and is read only thanks to `SshTunnelGatewayConfig`'s serde
+/// `alias` — a presence check that knew only the snake key would record
+/// `[sshTunnelGateway] bindPort = N` as no request.
+fn sub_port_requested(table: &toml::Table, section: &str, snake: &str, camel: &str) -> bool {
+    let Some(sub) = table.get(section).and_then(toml::Value::as_table) else {
+        return false;
+    };
+    [snake, camel]
+        .iter()
+        .any(|key| sub.get(*key).is_some_and(port_value_requests_a_listener))
+}
+
 /// Did a written listener-port key ask for a listener?
 ///
 /// `snake` and `camel` are the two spellings serde accepts for one field
@@ -556,18 +678,13 @@ pub static SERVER_WEBSOCKET_PORT_UNHONOURED_WARNING: std::sync::LazyLock<String>
 /// caller reads the **normalized** table, where `[common]` has already been
 /// flattened into the root.
 ///
-/// Only the integer `0` is not a request: it is the documented "disabled" value
-/// for all three ports and every build shape honours it identically, so warning
-/// about it would be a false record. Any other value — a port, or a value serde
-/// would itself have refused had the field existed — names a listener this build
-/// will not create.
+/// The value-level rule, the `.ini` zero spellings included, is
+/// [`port_value_requests_a_listener`]'s.
 #[cfg(not(all(feature = "kcp", feature = "quic", feature = "websocket")))]
 fn port_requested(table: &toml::Table, snake: &str, camel: &str) -> bool {
-    [snake, camel].iter().any(|key| {
-        table
-            .get(*key)
-            .is_some_and(|value| value.as_integer() != Some(0))
-    })
+    [snake, camel]
+        .iter()
+        .any(|key| table.get(*key).is_some_and(port_value_requests_a_listener))
 }
 
 impl ConfigPresence {
@@ -606,6 +723,18 @@ impl ConfigPresence {
             presence.server_websocket_port_unhonoured =
                 port_requested(table, "websocket_port", "websocketPort");
         }
+        // The two listener ports whose **reader** lives in `frp-server`, not
+        // here. The field is unconditional in `ServerConfig`, so every build
+        // deserializes it and only the owning crate can say whether anything
+        // reads it: the flag is computed in every build and the caller's
+        // `ListenerPortReader` gates the record. Read from the **normalized**
+        // table, where `[webServer]` has been merged into `web_server`, the
+        // legacy `dashboard_port` has been moved into it, `[common]` has been
+        // flattened, and `sshTunnelGateway` has been renamed.
+        presence.web_server_port_unhonoured =
+            sub_port_requested(table, "web_server", "port", "port");
+        presence.ssh_tunnel_gateway_bind_port_unhonoured =
+            sub_port_requested(table, "ssh_tunnel_gateway", "bind_port", "bindPort");
         presence
     }
 
@@ -827,24 +956,42 @@ impl ConfigPresence {
     ///
     /// Called by the three **server**-config load sites that have a log sink —
     /// `frps`'s two startup paths (`-c`, `--config-dir`) and `frp-server`'s
-    /// `Service::reload` — beside the `tls_enable` call. `frps verify` stays
-    /// silent for the same reason it does there (no subscriber: the loader runs
-    /// before `init_logging`), and no `frpc`/`frp-client` site calls it, because
-    /// this is a `ServerConfig` fact only. Pinned in both build shapes by
+    /// `Service::reload` — beside the `tls_enable` call. `frps verify` does not
+    /// use this method, because it has no subscriber; it reads
+    /// [`Self::unhonoured_server_feature_key_records`] and prints the same texts
+    /// to stdout itself. No `frpc`/`frp-client` site calls it, because this is a
+    /// `ServerConfig` fact only. Pinned in both build shapes by
     /// `feature_gated_server_ports_*` in `frp-core/src/config/tests.rs`.
     pub fn warn_unhonoured_server_feature_keys(&self) {
+        for record in self.unhonoured_server_feature_key_records() {
+            tracing::warn!("{record}");
+        }
+    }
+
+    /// The `kcp`/`quic`/`websocket` unhonoured-port texts for **this** build, in
+    /// emission order — the single source both delivery paths read:
+    /// [`Self::warn_unhonoured_server_feature_keys`] logs them and `frps verify`
+    /// prints them directly (that path installs no subscriber, so a
+    /// `tracing::warn!` there would reach nobody).
+    pub fn unhonoured_server_feature_key_records(&self) -> Vec<String> {
+        // The pushes below are each `#[cfg]`-gated, so in a build that compiles
+        // all three features `mut` is genuinely unused; the allow is scoped to
+        // this binding rather than the whole function.
+        #[allow(unused_mut)]
+        let mut records: Vec<String> = Vec::new();
         #[cfg(not(feature = "kcp"))]
         if self.server_kcp_bind_port_unhonoured {
-            tracing::warn!("{}", SERVER_KCP_BIND_PORT_UNHONOURED_WARNING.as_str());
+            records.push(SERVER_KCP_BIND_PORT_UNHONOURED_WARNING.clone());
         }
         #[cfg(not(feature = "quic"))]
         if self.server_quic_bind_port_unhonoured {
-            tracing::warn!("{}", SERVER_QUIC_BIND_PORT_UNHONOURED_WARNING.as_str());
+            records.push(SERVER_QUIC_BIND_PORT_UNHONOURED_WARNING.clone());
         }
         #[cfg(not(feature = "websocket"))]
         if self.server_websocket_port_unhonoured {
-            tracing::warn!("{}", SERVER_WEBSOCKET_PORT_UNHONOURED_WARNING.as_str());
+            records.push(SERVER_WEBSOCKET_PORT_UNHONOURED_WARNING.clone());
         }
+        records
     }
 
     /// Emit the `[web_server.tls] enable` diagnostic when the key was written,
@@ -888,6 +1035,70 @@ impl ConfigPresence {
         if self.web_server_tls_enable_set {
             tracing::warn!("{}", reader.warning());
         }
+    }
+
+    /// Emit the `web_server.port` record when the file named a **non-zero** port
+    /// and the **caller's** build does not compile its reader, once per load.
+    ///
+    /// Unlike [`Self::warn_inert_server_tls_enable`], the presence flag is not
+    /// enough: `web_server.port` is live in a build that compiles `frp-server`'s
+    /// `dashboard` feature, so the record has to be **suppressed** there. `reader`
+    /// is that build answer, taken from the owning crate
+    /// (`frp_server::service::web_server_port_reader`), never from the binary's
+    /// own `cfg!` — `frps`'s `dashboard` feature is off in every default build
+    /// while the field it gates is unconditional, the same trap
+    /// [`WebServerTlsEnableReader`] documents. Pinned in both build shapes by the
+    /// reader tests in `frp-server/src/service.rs` and by the spawn tests in
+    /// `frps/tests/warn_delivery.rs`.
+    ///
+    /// Called by the load sites that have a sink: `frps`'s two startup paths
+    /// (`-c`, `--config-dir`), `frp-server`'s `Service::reload`, and — with a
+    /// direct `println!` instead, because it installs no subscriber — `frps
+    /// verify`. `frpc`/`frp-client` never call it: `web_server` on the client is
+    /// the admin server, whose reader is the `admin` feature, and no client load
+    /// site is wired to this record.
+    pub fn warn_inert_web_server_port(&self, reader: ListenerPortReader) {
+        self.warn_reader_gated_ports(reader, ListenerPortReader::Present);
+    }
+
+    /// The `ssh_tunnel_gateway.bind_port` twin of
+    /// [`Self::warn_inert_web_server_port`], resolved by
+    /// `frp_server::service::ssh_tunnel_gateway_bind_port_reader`.
+    pub fn warn_inert_ssh_tunnel_gateway_bind_port(&self, reader: ListenerPortReader) {
+        self.warn_reader_gated_ports(ListenerPortReader::Present, reader);
+    }
+
+    fn warn_reader_gated_ports(&self, web: ListenerPortReader, ssh: ListenerPortReader) {
+        for record in self.unhonoured_reader_gated_port_records(web, ssh) {
+            tracing::warn!("{record}");
+        }
+    }
+
+    /// The reader-gated listener-port texts this build cannot honour, in
+    /// emission order (`web_server.port` before `ssh_tunnel_gateway.bind_port`).
+    ///
+    /// This is the single source both delivery paths read:
+    /// [`Self::warn_inert_web_server_port`] /
+    /// [`Self::warn_inert_ssh_tunnel_gateway_bind_port`] log them, and `frps
+    /// verify` — which installs no subscriber — prints them to stdout itself.
+    /// `reader` is the **calling crate's** build answer in every case (see
+    /// [`ListenerPortReader`]); a listener the build does honour produces no
+    /// record, which is what keeps this warning off in the build shapes that
+    /// bind the port.
+    pub fn unhonoured_reader_gated_port_records(
+        &self,
+        web_server_reader: ListenerPortReader,
+        ssh_reader: ListenerPortReader,
+    ) -> Vec<&'static str> {
+        let mut records: Vec<&'static str> = Vec::new();
+        if self.web_server_port_unhonoured && web_server_reader == ListenerPortReader::Absent {
+            records.push(WEB_SERVER_PORT_UNHONOURED_WARNING);
+        }
+        if self.ssh_tunnel_gateway_bind_port_unhonoured && ssh_reader == ListenerPortReader::Absent
+        {
+            records.push(SSH_TUNNEL_GATEWAY_BIND_PORT_UNHONOURED_WARNING);
+        }
+        records
     }
 }
 

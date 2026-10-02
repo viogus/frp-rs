@@ -228,6 +228,20 @@ pub fn load_server_config_checked(
     Ok(cfg)
 }
 
+/// [`load_server_config_with_presence`], plus [`check_server_unsafe_features`] —
+/// the server half of [`load_client_config_with_presence_checked`], and the
+/// function `frps verify` now uses so it can report the feature-gated listener
+/// ports the loaded file named beside the one-line success message.
+pub fn load_server_config_with_presence_checked(
+    path: &str,
+    strict_config: bool,
+    unsafe_features: &UnsafeFeatures,
+) -> Result<(ServerConfig, ConfigPresence), Box<dyn std::error::Error>> {
+    let (cfg, presence) = load_server_config_with_presence(path, strict_config)?;
+    check_server_unsafe_features(&cfg, unsafe_features)?;
+    Ok((cfg, presence))
+}
+
 /// [`load_client_config_with_presence`], plus [`check_client_unsafe_features`].
 ///
 /// Returns the presence flags with the config because `frpc verify` — the only
