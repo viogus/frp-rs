@@ -2178,9 +2178,9 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   targets (lib, lib test, every `frp-core/tests/*.rs`, the bench), and neither file is in this branch's
   diff — both were last touched by `96ccca0` (#358). Why no lane sees it: the only workspace clippy lane
   is `ci.yml:84` (`cargo clippy --workspace --all-targets --all-features -- -D warnings`), which
-  **compiles both `cfg(not(…))` items out**, and the two isolated clippy steps (`ci.yml:1025-917`) are
+  **compiles both `cfg(not(…))` items out**, and the two isolated clippy steps (`ci.yml:3576-3577`) are
   `-p frp-server --no-default-features --features dashboard` and `-p frp-client --no-default-features`.
-  The isolated step that *does* compile this configuration — `ci.yml:1029`'s frp-core tier step — runs
+  The isolated step that *does* compile this configuration — the frp-core tier step at `ci.yml:3620` — runs
   `check`, i.e. rustc lints only, which is exactly why the `unused_mut` that the restart-only change
   introduced there fired while a `clippy::*` lint cannot. This is the **same gate gap as that CI
   failure, in the other direction**, which is why it is filed rather than quietly fixed.
@@ -7996,7 +7996,7 @@ section; ledger now **24 open / 104 closed**.**
   normal-graph rustls = 11) frp-core's `tls` is on while frp-server's is off, so `frps-micro` would
   print the "refused at startup / auto-generates" text with no acceptor — exactly the round-1 F1
   defect. Measured: **no** lane produces that shape (`release.yml:100/102/108/110/159/162/210/213`
-  are workspace-root `cargo build … --no-default-features --features tiny|micro`; `ci.yml:1030`/`:925`
+  are workspace-root `cargo build … --no-default-features --features tiny|micro`; `ci.yml:3427`/`:3431`
   the matching `cargo check --workspace … tiny|micro`), and frp-core cannot observe frp-server's
   features, so the constants' own doc comment correctly keys on frp-core's feature.
   **Done-when:** either the variant is gated on a cfg frp-core can actually see (or its text is
@@ -9476,26 +9476,26 @@ section; ledger now **24 open / 104 closed**.**
   `ok. 44 passed; 0 failed; 0 ignored`; `--list` 44 in both; no profile in the workspace sets
   `debug-assertions` (`Cargo.toml:105`, `:115-117`), so `not(debug_assertions)` is exactly the axis this lane
   covers, and a fat-LTO run gives the same numbers. A new additive job, `release-tests` / `Tests (release
-  profile)` (`.github/workflows/ci.yml:1362-1345`, `timeout-minutes: 30` at `:1256`), runs
+  profile)` (`.github/workflows/ci.yml:2877-2878`, `timeout-minutes: 30` at `:2880`), runs
   `cargo test --release -p frps --test cli_exit_codes` in the same release profile the `build` job uses
-  (`lto = false`, `opt-level = 2`, `:1290-1292`) and fails closed on four things: the target was really built,
+  (`lto = false`, `opt-level = 2`, `:2942`) and fails closed on four things: the target was really built,
   the summary is exactly `test result: ok. 41 passed; 0 failed; 3 ignored;`, the ignored **names** are the
   three pins in `FRPS_RELEASE_CLI_IGNORED` (both sides sorted), and `--list` equals
-  `FRPS_RELEASE_CLI_TESTS` = 44 (`:1336-1342`, "Update both literals together"). Teeth, re-measured by both
+  `FRPS_RELEASE_CLI_TESTS` = 44 then, 45 at this head (`:2882`; the `--list` equality at `:2998`-`:3000`, "Update both literals together"). Teeth, re-measured by both
   reviewers: 9 of 11 mutants caught — 41→40 drift, a stray fourth `ignored`, the target missing, 0 tests, an
   unconditional `#[ignore]` on a fourth pin, the pins `#[cfg]`'d out, a rename, the wrong test ignored with the
   count unchanged, an extra passing test; the summary substring is not end-anchored and the reasons are never
   read back, both accepted. What the lane does **not** defend is written down rather than implied
-  (`ci.yml:1352-1248`): turning the three attributes into an unconditional `#[ignore]` gives byte-identical
+  (`ci.yml:2849-2855`): turning the three attributes into an unconditional `#[ignore]` gives byte-identical
   release output and this guard exits 0 by design, because that case belongs to the pre-existing debug lane
-  (`FRPS_CLI_TESTS: "44"` at `:278`, asserted at `:747`). The job is deliberately absent from `build`'s
-  `needs` (`ci.yml:1952`) so a cold release build cannot serialize the artifact job, which means it gates a
-  merge only once branch protection names "Tests (release profile)" (`:1249-1252`). Cold release build: 5m07s
-  at `-j 2`, 9m51s under load, inside the 30-minute cap.
+  (`FRPS_CLI_TESTS` at `:1361` — `"44"` then, `"45"` now — asserted at `:2224`-`:2225`). The job is deliberately absent from `build`'s
+  `needs` (`ci.yml:3726`) so a cold release build cannot serialize the artifact job, which means it gates a
+  merge only once branch protection names "Tests (release profile)" (`:2857`-`:2860`). Cold release build: 5m07s
+  at `-j 2`, 9m51s under load, inside the 30-minute cap. Every count in this paragraph is PR #443's measurement; at the current head the lane pins 45 listed tests (`:2882`) and its release summary is `42 passed; 0 failed; 3 ignored` (`:2845`).
 
 - [x] **Release-mode test coverage is this one file: no CI job builds or runs any other test target in the `release` profile.**
   Filed by the coordinator while closing the release-profile lane item above. `release-tests`
-  (`.github/workflows/ci.yml:1362-1345`) compiles and runs `frps/tests/cli_exit_codes.rs` and nothing else, so
+  (`.github/workflows/ci.yml:2877-2878`) compiles and runs `frps/tests/cli_exit_codes.rs` and nothing else, so
   every other test target — `frp-core`'s config and CLI suites, `frps/tests/warn_delivery.rs`, `frpc/tests/*` —
   is only ever built with `debug_assertions` on. Code a release binary compiles differently
   (`#[cfg(debug_assertions)]` hooks, `debug_assert!`, overflow checks) is therefore pinned in debug only, and
