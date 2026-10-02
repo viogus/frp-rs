@@ -112,7 +112,7 @@ jobs:
         # `exec true` planted after the trap never runs it and exits 0 with no
         # output at all. So the total is pinned *outside*: this step requires the
         # suite's summary line verbatim, and 32 is what the scenarios in
-        # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:8550` round
+        # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:8960` round
         # added the in-file floor; a scenario added or removed there moves this
         # literal — restore the checks rather than lowering it). In-file,
         # `enforce_substance` also checksums the scenario-6 metric check and the
@@ -161,7 +161,7 @@ jobs:
           log=/tmp/frp-repo-health-fixtures.log
           status=0
           guard_file=scripts/tests/repo-health-fixtures.sh
-          guard_pin=e6d23d746bdf8f089b41d7d87cfc8033ad59bc4104216fcf87468fee9c2618ca
+          guard_pin=98216685ca801e99d64500972dc40d50c90166eb0543a6052b8a79818d4952ef
           # R12-2 (adversarial round 13): resolve the hasher to an absolute path
           # and prove it with a known vector — the same candidate order and the
           # same fail-closed mode as the guard's own `find_hash_tool()`.
@@ -320,7 +320,7 @@ jobs:
         # *outside*, the way the `log_completion` step below pins its own 6: this
         # step requires the suite's summary line verbatim, and 40 is what the
         # scenarios in scripts/tests/compat-stray-guard.sh print (21 before the
-        # `TODO.md:8582` round added the ordered `SHAPE` anchors, the symlink
+        # `TODO.md:8992` round added the ordered `SHAPE` anchors, the symlink
         # `wait_exec` probe, the empty-`ps` branch and the failed-probe
         # kill-then-continue case; 31 after the round-2 pins exercised the loop's
         # empty-`cmd` guard, the exit-0-empty reap arm, and the second half of the
@@ -403,7 +403,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=4db720d672334bb121f5f34a8f940fe217a0d7f55bae64a1c6d19a0aa8359812
+          guard_pin=24f34bd64e3f159fe676e5bd5482a4d2353ebc95233e62f8aacfc275d0db364c
           # R12-1 (adversarial round 13): the enforcer's *implementation* lives in
           # the library the scenarios `source` (the `LIB=` assignment at :96 only
           # names it), so pinning only the suite left the "two-file change" claim
@@ -540,6 +540,197 @@ jobs:
           echo "compat stray-guard fixture checks ok: 40 checks hold, pins verified 4/4, enforcer canary live"
       - name: RSS soak — run-dir guard + summary fixture
         run: bash scripts/tests/rss-soak-run-dir.sh
+      - name: TODO.md cross-file citation gate (every live cite lands on an item header)
+        # `TODO.md` is a numbered ledger: every merge that inserts or removes a
+        # line renumbers it, and a cite written as a bare line number then
+        # silently points at *prose inside another item* — which reads as
+        # plausible, which is why five rounds of the #447 train each re-derived
+        # cites by hand and each left a residue. The gate's enforced property is
+        # mechanical and deliberately weak: every **live** cite written as
+        # `TODO.md` plus a line number must land on an item header
+        # (`^- \[[ x]\]`), it must be in range, and the bare continuation form
+        # must resolve too. It does not match the cited item's title to the
+        # citing sentence — a text match cannot establish intent. Point-in-time
+        # documents (`TODO.md` itself,
+        # `CHANGELOG.md`, `performance-audit.md`,
+        # `docs/refactor-large-modules.md`, `docs/history/`, `docs/archive/`,
+        # `docs/audit/`) keep their era's numbering and are out of scope.
+        #
+        # The gate's own bytes are pinned *here*, before it runs, the same way
+        # the two steps above pin theirs: weakening the scan (an empty file
+        # list, a widened point-in-time set, a regex that stops matching) has to
+        # be a two-file change a reviewer sees. The summary line is pinned
+        # outside as well — `| tee`-free redirection plus builtins only, for the
+        # round-14 reason recorded above — and 84 is the count of live cite line
+        # references on the tree that added this gate, so a scan that stops
+        # finding cites cannot print this line.
+        shell: bash
+        run: |
+          set -o pipefail
+          log=/tmp/frp-todo-cite-guard.log
+          status=0
+          guard_file=scripts/tests/todo-cite-guard.sh
+          guard_pin=541bb4e6085f1bf94c5487761e3191413e2645b88951b27109d04d914f46e048
+          guard_hasher=''
+          guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+          for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
+            [ -x "$cand" ] || continue
+            guard_probe=$(printf 'abc' | "$cand" 2>/dev/null)
+            [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+            guard_hasher=$cand
+            break
+          done
+          if [ -z "$guard_hasher" ]; then
+            for cand in /usr/bin/shasum /bin/shasum /usr/local/bin/shasum; do
+              [ -x "$cand" ] || continue
+              guard_probe=$(printf 'abc' | "$cand" -a 256 2>/dev/null)
+              [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+              guard_hasher="$cand -a 256"
+              break
+            done
+          fi
+          if [ -z "$guard_hasher" ]; then
+            echo "::error::no sha256 tool at an absolute path reproduces the known sha256 vector; cannot verify $guard_file"
+            exit 1
+          fi
+          # shellcheck disable=SC2086  # $guard_hasher is the word-split "<abs path> [-a 256]"
+          guard_out=$($guard_hasher "$guard_file" 2>/dev/null) || true
+          guard_sha=${guard_out%% *}
+          if [ "$guard_sha" != "$guard_pin" ]; then
+            echo "::error::$guard_file is not the pinned revision (sha256 ${guard_sha:-<none>}; expected $guard_pin)"
+            echo "::error::an edit to the cite gate — including one that weakens its own scan — must also update guard_pin in the 'TODO.md cross-file citation gate' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended, otherwise revert it"
+            exit 1
+          fi
+          bash scripts/tests/todo-cite-guard.sh > "$log" 2>&1 || status=1
+          guard_log=$(<"$log")
+          printf '%s\n' "$guard_log"
+          guard_result=0
+          guard_fail=0
+          guard_fail_text=''
+          while IFS= read -r guard_line; do
+            case $guard_line in
+              'FAIL'*|'  FAIL'*)
+                guard_fail=$((guard_fail + 1))
+                guard_fail_text="${guard_fail_text}${guard_line}"$'\n'
+                ;;
+            esac
+          done <<< "$guard_log"
+          case $guard_log in
+            *'RESULT: 84 cite(s) checked, 0 violation(s)'*) guard_result=1 ;;
+          esac
+          [ "$guard_result" = "1" ] || status=1
+          [ "$guard_fail" = "0" ] || status=1
+          if [ "$guard_fail" != "0" ]; then
+            echo "::error::the cite gate printed $guard_fail failure line(s); every live cite must land on an item header:"
+            printf '%s' "$guard_fail_text"
+          fi
+          if [ "$status" != "0" ]; then
+            echo "::error::the TODO.md cross-file citation gate did not report 84 checked cites and 0 violations"
+            echo "::error::a live cite that lands on a mid-item body line, a blank line, past EOF, or that has no decimal line number must be repointed to the cited item's header — do not lower this literal or widen the point-in-time set"
+            exit 1
+          fi
+          echo "TODO.md cross-file citation gate ok: 84 live cites checked, every one on an item header"
+      - name: TODO.md citation gate — fixture checks (canary)
+        # The gate's own canary suite. In the style of the two fixture suites
+        # above it: the gate's bytes are pinned here before it runs, and the
+        # suite must *say* it drove the gate red on an injected bad cite —
+        # otherwise a gate that silently stopped scanning (an empty file list,
+        # an emptied ledger, a regex that stopped matching) would look exactly
+        # like a clean tree. 40 is the number of scenario checks in
+        # `scripts/tests/todo-cite-guard-fixtures.sh`.
+        shell: bash
+        run: |
+          set -o pipefail
+          log=/tmp/frp-todo-cite-fixtures.log
+          status=0
+          guard_file=scripts/tests/todo-cite-guard-fixtures.sh
+          guard_pin=0575080e20463c176c584dc0f26ebd7685901e86246d96add0b6450420843be4
+          guard_hasher=''
+          guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+          for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
+            [ -x "$cand" ] || continue
+            guard_probe=$(printf 'abc' | "$cand" 2>/dev/null)
+            [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+            guard_hasher=$cand
+            break
+          done
+          if [ -z "$guard_hasher" ]; then
+            for cand in /usr/bin/shasum /bin/shasum /usr/local/bin/shasum; do
+              [ -x "$cand" ] || continue
+              guard_probe=$(printf 'abc' | "$cand" -a 256 2>/dev/null)
+              [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+              guard_hasher="$cand -a 256"
+              break
+            done
+          fi
+          if [ -z "$guard_hasher" ]; then
+            echo "::error::no sha256 tool at an absolute path reproduces the known sha256 vector; cannot verify $guard_file"
+            exit 1
+          fi
+          # shellcheck disable=SC2086  # $guard_hasher is the word-split "<abs path> [-a 256]"
+          guard_out=$($guard_hasher "$guard_file" 2>/dev/null) || true
+          guard_sha=${guard_out%% *}
+          if [ "$guard_sha" != "$guard_pin" ]; then
+            echo "::error::$guard_file is not the pinned revision (sha256 ${guard_sha:-<none>}; expected $guard_pin)"
+            echo "::error::an edit to the cite-gate fixture suite must also update guard_pin in the 'TODO.md citation gate — fixture checks (canary)' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended, otherwise revert it"
+            exit 1
+          fi
+          bash scripts/tests/todo-cite-guard-fixtures.sh > "$log" 2>&1 || status=1
+          guard_log=$(<"$log")
+          printf '%s\n' "$guard_log"
+          guard_result=0
+          guard_ok=0
+          guard_fail=0
+          guard_canary=0
+          guard_fail_text=''
+          guard_canary_text=''
+          while IFS= read -r guard_line; do
+            case $guard_line in
+              '  ok '*) guard_ok=$((guard_ok + 1)) ;;
+              'FAIL'*|'  FAIL'*)
+                guard_fail=$((guard_fail + 1))
+                guard_fail_text="${guard_fail_text}${guard_line}"$'\n'
+                ;;
+            esac
+          done <<< "$guard_log"
+          case $guard_log in
+            *'RESULT: 60 fixture check(s) hold'*) guard_result=1 ;;
+          esac
+          # The red-path canaries, in the suite's own wording. Each is a
+          # scenario that must end with the gate refusing an injected bad cite;
+          # their absence means the gate stopped reding (which looks exactly
+          # like a clean tree).
+          for guard_canary_probe in \
+            'mid-item cite: gate exited 1' \
+            'past-EOF cite: gate exited 1' \
+            'blank-line cite: gate exited 1' \
+            'unparseable cite: gate exited 1' \
+            'empty scan: exits 1' \
+            'zero floor: the gate refuses TODO_CITE_MIN=0' \
+            'fenced header: a cite to a fenced header-shaped line exits 1' \
+            'missing-number cite: exits 1' \
+            'spaced-colon cite: exits 1' \
+            'wrapped-number cite: exits 1' \
+            'git rc guard: a failing ls-files exits 1'
+          do
+            case $guard_log in
+              *"$guard_canary_probe"*) guard_canary=$((guard_canary + 1)) ;;
+            esac
+          done
+          [ "$guard_result" = "1" ] || status=1
+          [ "$guard_ok" = "60" ] || status=1
+          [ "$guard_canary" = "11" ] || status=1
+          [ "$guard_fail" = "0" ] || status=1
+          if [ "$guard_fail" != "0" ]; then
+            echo "::error::the cite-gate fixture suite printed $guard_fail failure line(s); a run that reported a failure cannot be reported as a green step:"
+            printf '%s' "$guard_fail_text"
+          fi
+          if [ "$status" != "0" ]; then
+            echo "::error::the cite-gate fixture suite did not report 60 checks, all eleven red-path canaries and no failure line (canaries seen: $guard_canary/11)"
+            echo "::error::scripts/tests/todo-cite-guard-fixtures.sh must print 60 '  ok' lines, end with 'RESULT: 60 fixture check(s) hold', and prove the gate reds on an injected mid-item cite, a past-EOF cite, a blank-line cite, an unparseable cite, an empty scan, a disabled floor, a cite to a fenced header-shaped line, a missing-number cite, a spaced-colon cite, a wrapped-number cite and a failing `git ls-files`; a smaller total, a missing canary or a failure line means the gate stopped reding — restore the scenarios rather than lowering this literal"
+            exit 1
+          fi
+          echo "TODO.md citation gate fixtures ok: 60 checks hold, all 11 red-path canaries live"
 
   tests-unit:
     name: Tests (unit)
@@ -684,7 +875,7 @@ jobs:
       # `cargo test -p frps --test cli_exit_codes -- --list`.
       # 44 → 45 with the `-l`-shorthand refusal pin
       # `short_l_is_not_a_frps_shorthand_and_the_refusal_is_pinned`
-      # (`TODO.md:9271`): +1. Re-derived with the same `--list` command.
+      # (`TODO.md:9405`): +1. Re-derived with the same `--list` command.
       FRPS_CLI_TESTS: "45"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
@@ -1519,7 +1710,7 @@ jobs:
         # `--log-max-days 0`, both arbited by Go's `-c` lane — see the file's own
         # section comments), and 9 → 10 with the `-c`-lane non-empty-flag pin
         # `cli_nonempty_log_level_flag_does_not_override_the_config_file`
-        # (`TODO.md:9218`). It is the count of `#[test]`s in that one file, and
+        # (`TODO.md:9352`). It is the count of `#[test]`s in that one file, and
         # it lives in exactly one place in this step — the `expected=` line — so
         # a new pin means editing one number, not hunting a duplicated one.
         #
@@ -2612,7 +2803,7 @@ jobs:
       - name: Check the five measured-red intra-crate feature combinations (curated list, NOT the full 2^N space)
         # A CURATED, CLOSED list — these five `-p`-isolated configurations were
         # measured red under -D warnings. The first four at `846c1b9`, fixed in
-        # the change that added this step (TODO.md: "Measured `-p`
+        # the change that added this step (TODO.md:2065: "Measured `-p`
         # configurations that are red under `-D warnings`"). The frp-server
         # WebSocket one at `78d25166` — the dedicated-`websocket_port` listener
         # extraction, which left the `tokio::io::AsyncReadExt` import gate in

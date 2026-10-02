@@ -613,7 +613,7 @@ fn status_strict_config_false_tolerates_an_unknown_key() {
 }
 
 /// The **documented frp-rs extension** for the space-separated form, pinned
-/// end-to-end (`TODO.md:1666`; the contract is in `docs/developing.md`
+/// end-to-end (`TODO.md:3672`; the contract is in `docs/developing.md`
 /// § "`--strict-config`: the space-separated value form"). frp-rs consumes the
 /// next token as the value, so `--strict-config false` tolerates the unknown
 /// key and dials the config's `webServer.port` — the connection arriving at
@@ -892,7 +892,7 @@ fn stop_bad_api_timeout_is_rejected_before_any_connection() {
 /// leading root flags, so `frpc --api-timeout 1s stop …` runs `stop` with the
 /// flag (measured on Go v0.71.0: one connection to the admin port, then
 /// `Post "…/api/stop": context deadline exceeded`, rc 1). frp-rs's shared
-/// `frpc` hoist (`frp-core/src/cli.rs`, `TODO.md:2619`) resolves the same way,
+/// `frpc` hoist (`frp-core/src/cli.rs`, `TODO.md:4710`) resolves the same way,
 /// so the flag is *used* here and the deadline is what the rc reflects — this
 /// test used to pin the refusal as a divergence and now pins the connection.
 #[test]

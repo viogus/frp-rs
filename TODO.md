@@ -6011,7 +6011,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
 
 ---
 
-- [ ] **A cross-file `TODO.md:<n>` citation has no gate, so every merge that renumbers the ledger silently
+- [x] **A cross-file `TODO.md:<n>` citation has no gate, so every merge that renumbers the ledger silently
   invalidates the cites in `ci.yml`, `scripts/` and source comments.**
   Filed by the PR #447 records round, the third round in this train to re-derive cites by hand. A `TODO.md`
   cite is a bare line number with no anchor. Measured at the base `612f7df1`
@@ -6035,6 +6035,124 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   tracked file must land on an item header; canary-tested so a mutant cite reds it; wired into the `health`
   job), or a convention change to title-anchored references (a stable item slug, or `TODO.md § "title"`), each
   demonstrated by before/after counts on the tree.
+
+  **Done (2026-10-02, at code head `b33ab46b` on `docs/cite-sweep`, this item's branch; pre-rebase twin `ad89f790`, orphaned by the rebase onto `766ae978`).** The first branch:
+  the sweep plus the gate. **Classification rule** (now the gate's documented scope, and the same
+  live/point-in-time split `scripts/repo-health.sh` already applies to path cites): *live* = source comments
+  under the crate roots, `scripts/**`, `.github/workflows/*.yml`, `CLAUDE.md`, `README.md` and the top-level
+  `docs/*.md`; *point-in-time* = `TODO.md` itself, `CHANGELOG.md`, `performance-audit.md`,
+  `docs/refactor-large-modules.md` and everything under `docs/history/`, `docs/archive/` and `docs/audit/`,
+  which keep their era's numbering. **Before (the sweep's own measurement, at the session base `59272312`
+  and unchanged at `766ae978`): 82 numbered occurrences on 82 cite lines across 23 live files — 20 landed
+  on a header, 52 on mid-item prose and 10 on a blank line, i.e. 62 violations.** The measurement is
+  reproducible: run today's gate against a checkout of that revision with the point-in-time set of this
+  script, and it prints `RESULT: 82 cite(s) checked, 62 violation(s)` (the two title-form cites that
+  `TODO.md: "…"` adds are outside that count, and the head checks 84). The 62 were re-derived by locating the
+  item each citing sentence names and reading the header line back — never a uniform offset.
+  **The first re-derivation was not good enough, and both later reviews measured it: of the 65 occurrences
+  the sweep had touched, 48 landed on a header that did not *own* the citing sentence's claim** — the gate
+  checks "is a header", not "is the right header". Each was re-derived by reading the citing sentence,
+  finding the item that carries its claim and reading that header line back. Four worked examples, with the
+  owner's title rather than its line number (a line number here would be invalidated by this very
+  paragraph): `.github/workflows/ci.yml`'s in-file-floor comment was pointed at the `--allow-unsafe`
+  accumulation item and now names the `scripts/tests/repo-health-fixtures.sh` neutering hole; its
+  `SHAPE`-anchor comment was pointed at the wrong stray-guard item and now names the four
+  `wait_exec`/empty-`ps` residues; `frp-core/src/cli.rs`'s `R2` comment was pointed at `R1` and now names
+  the implicit-config lane; and `frp-server/src/control/login.rs`'s OIDC mock-accessor comment was pointed
+  at an unrelated later item and now names the `review-residue-precision` batch, part (b). The full
+  file:line → value → title table for all 49 cites that changed value is in the development-log row for
+  this round. **The counts, in one frame each:** at the base `59272312`, 82 occurrences = 62 mis-targeted +
+  20 correct; the sweep changed **65** = 62 mis-targeted at the base + 2 former title-form cites that gained
+  numbers + 1 re-target (the `docs/developing.md` `3`/`4` exit-code decision, whose first-pass cite had landed on the
+  space-form `--strict-config` item instead), with **0** "line moved, owner unchanged". **19 numbered cites are byte-identical at this head.** **After: 84 live cites checked, 0
+  violations. Untouched: 87 point-in-time occurrences at this head** (devlog 50, `TODO.md` 26,
+  `CHANGELOG.md` 10, archive plan 1) **against 84 at the base** (devlog 47 + 26 + 10 + 1 at `59272312`; the
+  rebase target `766ae978` carried 85).
+  **The gate** is `scripts/tests/todo-cite-guard.sh` (a new suite rather than an extension of
+  `scripts/repo-health.sh`, whose `health` step is on a 5-minute budget and whose python scanner is already
+  the job's slowest part): fail-closed on a cite past EOF, on a blank line, on a mid-item body line, on a
+  malformed token, and on a scan that finds too few cites or a ledger with no headers; it prints
+  `RESULT: <n> cite(s) checked, <m> violation(s)` and names every offence by `file:line`. It reads the file
+  list from `git ls-files -z` (with `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_WORK_TREE`/`GIT_COMMON_DIR`/
+  `GIT_OBJECT_DIRECTORY`/`GIT_TRACE*` stripped), falling back to a filesystem walk with no `.git`, and it
+  does **not** match the cited item's title to the citing sentence — a text match cannot establish intent, so
+  the enforced property is "the cite lands on an item header, and every cite is checkable".
+  `scripts/tests/todo-cite-guard-fixtures.sh` drives it against synthetic trees: **60 checks, all green**,
+  including eleven red-path canaries (a mid-item cite, a past-EOF cite, a blank-line cite, a malformed cite, an
+  empty scan, a floor of 0, a cite to a header-shaped **fenced** line, the three previously uncounted cite
+  shapes — missing number, space before the colon, number wrapped onto the next line — and a failing
+  `git ls-files`, which must refuse rather than fall back to a partial walk) and a point-in-time scope pair
+  that proves the historical documents are skipped *and* a live cite beside them still reds. Both new steps are wired into the `health` job with their
+  digests pinned, so weakening the gate's scan is a two-file change a reviewer sees.
+  **Pins bumped** (each forced by this round's edits and each proved by re-running the suite): `guard_pin` for
+  `scripts/tests/repo-health-fixtures.sh` at `.github/workflows/ci.yml:164`
+  (`e6d23d74…`→`98216685…`) and for `scripts/tests/compat-stray-guard.sh` at `:406`
+  (`4db720d6…`→`24f34bd6…`); the stray guard's own `SCEN10_REGION_SHA` was also re-derived
+  (`976317f2…`→`54eba753…`) because three of the repointed cites sit inside scenario-10's
+  substance-pinned region. The two new suites are pinned at `:573` (gate) and `:647` (fixtures). No `CHANGELOG.md` bullet: nothing
+  user-visible changes — the edits are comments, doc prose, test comments and a gate — and this repo's
+  changelog records behaviour, not comment bookkeeping.
+  Gates at this head: `cargo fmt --all -- --check` rc 0; `bash scripts/repo-health.sh` →
+  `RESULT: invariants hold`; `bash scripts/tests/repo-health-fixtures.sh` → `RESULT: 32 fixture check(s)
+  hold`; `bash scripts/tests/compat-stray-guard.sh` → `RESULT: 40 fixture check(s) hold`; the new gate green
+  (`RESULT: 84 cite(s) checked, 0 violation(s)`) and its fixture suite green (`RESULT: 57 fixture check(s)
+  hold`) with its eleven canaries red; `git diff --check` rc 0. **Ledger: base `766ae978` 19 open / 197
+  closed → this head 18 open / 198 closed** — this round closes this item and files no new one. Both pairs
+  counted with `grep -cE '^- \[ \]' TODO.md` and `grep -cE '^- \[x\]' TODO.md`.
+
+  **Adversarial round 1 (2026-10-02, applied on top of the code head above).** The review returned
+  MERGE-with-findings: the sweep was confirmed correct (all 84 live cites on headers, the 13 headline repoints
+  reading correctly) but three code findings and four records nits were measured. Applied here:
+  * **F1 — the header predicate was a bare line regex, so a header-shaped line inside a fenced code block was a
+    valid target.** Fences are now tracked the way CommonMark opens one (three or more backticks or tildes) and
+    only un-fenced lines can be headers; a cite whose target is a fenced header-shaped line reds with
+    `header-shaped line inside a fenced block`, and an unterminated fence is itself a hard failure (it could
+    hide live targets). `TODO.md` today has **0 fence lines**, so the live count and target set are unchanged —
+    the fixtures prove the new property with a synthetic ledger (fenced target reds; the same line un-fenced is
+    a valid target; an unterminated fence reds).
+  * **F2 — three cite shapes were scanned past silently**: a colon with no number, a space before the colon, and
+    a number wrapped onto the next line. All three are now counted; the first two red as
+    `cite with no line number` / `malformed cite (whitespace before the colon)`, and the wrapped form reds via
+    its continuation. The one deliberately exempt shape is a title-form cite (colon then a quote), which names
+    an item by text and is prose by convention; a mention of TODO.md with no colon stays prose. The gate's own
+    prose was reworded so it describes the rule without writing the scanned token, which is itself a
+    demonstration that the rule is live.
+  * **F3 — the `git ls-files` rc guard had no fixture.** Added: a `.git` whose gitdir does not exist makes git
+    exit non-zero and the gate must refuse (`git ls-files failed … refusing to certify a partial tree`), not
+    fall back to the filesystem walk. The three new groups take the fixture suite from 40 to **60 checks**, and
+    the `health` step's literals and its pinned canary list (now 11 probes) moved with it.
+  * **F4 — records said "closes" while the box was still open.** This item is now flipped to `- [x]`; the
+    ledger pair moved from the rebase base `766ae978`'s 19 open / 197 closed to **18 open / 198 closed**.
+  * **F6 — the two records disagreed on the code head.** Both now name `b33ab46b` (the pre-rebase twin
+    `ad89f790` is recorded as orphaned by the rebase).
+  * **F7 — `shellcheck` SC2034 (unused `SELF_REAL`) in both new scripts.** Removed; `shellcheck -S warning` is
+    clean on both.
+  * Records nits corrected: the point-in-time count is **86 occurrences in 4 files** (not "84 untouched"), the
+    devlog row's `login.rs` cite is the head value `9750` (the intermediate `9749` was stale), and the
+    insertion's measured shift is **+49 at the code head / +50 at this head** (not a flat +48).
+
+  **Verification review of the head (2026-10-02, REQUEST-CHANGES; applied on top of the adversarial round).**
+  Three corrections, all landed:
+  * **V1 (blocker) — 48 of the 65 repointed occurrences landed on a header that did not own the claim.** The
+    gate cannot see this (it checks "is a header", not "is the right header"), so each was re-derived by
+    reading the citing sentence, finding the item that carries its claim, and reading that header line back.
+    The worked examples and the frozen frame are in the figures block above; the gate itself is unchanged in
+    what it enforces, and the honest scope of that enforcement is now stated in the script header.
+  * **V2 — the "26 stale / 56 already correct" figures did not reproduce.** Replaced with the measurement and
+    its method: base `59272312` = 82 numbered occurrences on 82 cite lines, 20 correct / 52 mid-item / 10
+    blank = 62 violations; head = 84 checked / 0 violations; 19 numbered cites byte-identical; 65 occurrences
+    touched (48 re-derived for ownership + 17 already content-correct). The PR body text carried the same
+    wrong figures and is corrected with this commit.
+  * **V4 — point-in-time is 85 occurrences at the base and 86 at this head** (devlog 49, `TODO.md` 26,
+    `CHANGELOG.md` 10, archive plan 1), not "84 untouched".
+  * **V5 — the insertion's shift is +50 lines** (`TODO.md` diff 50 insertions / 0 deletions; the `## P1`
+    header moved `6040`→`6158`), not a flat +48.
+  * **V3/F4 (from the same review) — the item is closed and the pair is measured:** base `766ae978`
+    **19 open / 197 closed** → this head **18 open / 198 closed**, both counted with
+    `grep -cE '^- \[ \]' TODO.md` and `grep -cE '^- \[x\]' TODO.md`.
+  * **V6 —** the two guard scripts changed again this round (the re-derivation touches a cite inside
+    `compat-stray-guard.sh` and inside `repo-health-fixtures.sh`), so both `guard_pin`s and that suite's
+    `SCEN10_REGION_SHA` were re-pinned and every suite re-run.
 
 
 ## P1 — documentation correctness
