@@ -15,20 +15,22 @@
 #
 # Scenarios
 #   1  honest classification: the expected production/total/test triple for
-#      every fixture file — inline blocks, `tests.rs` / `*_tests.rs` /
-#      `*_test.rs` by name, `#[cfg(test)] mod X;` siblings (a `mod.rs`
+#      every fixture file — inline blocks, `tests.rs` / `test.rs` / `*_tests.rs`
+#      / `*_test.rs` by name, `#[cfg(test)] mod X;` siblings (a `mod.rs`
 #      declaration, a `#[path]` target, a non-name-matching sibling, a
 #      `pub(crate)` / `pub(super)` declaration and the `X/mod.rs` candidate), a
-#      `tests/` directory, and the two negative controls (a plain `mod X;`
-#      production sibling and a directory whose name merely starts with
-#      `tests`).
+#      `tests/` directory, and the three negative controls (a plain `mod X;`
+#      production sibling, a directory whose name merely starts with `tests`,
+#      and a production `collide.rs` that another module's `#[cfg(test)]
+#      mod collide;` must not claim — Rust resolves that under `attacker/`).
 #   2  the default table and `--top` are unchanged in shape, and a file the
 #      filter excluded is still not listed.
-#   3  four mutations of the script, each of which must red exactly one part of
+#   3  five mutations of the script, each of which must red exactly one part of
 #      scenario 1: drop the name pattern, drop the sibling attribution, restore
-#      brace-matching for an out-of-line declaration, and drop `pub(…)` from the
-#      declaration pattern. A green suite on a mutant would mean the fixture
-#      does not drive the code it claims to.
+#      brace-matching for an out-of-line declaration, drop `pub(…)` from the
+#      declaration pattern, and offer `dir/X.rs` for a `parent.rs`. A green
+#      suite on a mutant would mean the fixture does not drive the code it
+#      claims to.
 #
 # Usage: bash scripts/tests/large-functions-classifier.sh
 set -uo pipefail
@@ -38,7 +40,7 @@ set -uo pipefail
 # installed before the path resolution and the first check, so an early `exit 0`
 # anywhere below it still has to answer to the floor. `MIN_CHECKS` is the
 # measured check count of a green run.
-MIN_CHECKS=36
+MIN_CHECKS=42
 checks=0
 fails=0
 WORK=""
@@ -259,6 +261,38 @@ pub fn deep_prod() {
 }
 EOF
 
+# Rust resolves `mod X;` inside `parent.rs` under `parent/` — `parent/X.rs` or
+# `parent/X/mod.rs` — and never `dir/X.rs` beside it. `collide.rs` here is a
+# production module declared from the crate root; an `attacker.rs` that declares
+# a *test* `mod collide;` must not claim it.
+mkdir -p "$TREE/frp-core/src/attacker" "$TREE/frp-core/src/bare"
+cat > "$TREE/frp-core/src/lib.rs" <<'EOF'
+pub mod collide;
+EOF
+cat > "$TREE/frp-core/src/collide.rs" <<'EOF'
+pub fn collide_prod() {
+    let x = 1;
+}
+EOF
+cat > "$TREE/frp-core/src/attacker.rs" <<'EOF'
+pub fn attacker_prod() {
+    let z = 1;
+}
+
+#[cfg(test)]
+mod collide;
+EOF
+cat > "$TREE/frp-core/src/attacker/collide.rs" <<'EOF'
+pub fn attacker_collide_prod() {
+    let x = 1;
+}
+EOF
+cat > "$TREE/frp-core/src/bare/test.rs" <<'EOF'
+pub fn bare_test_prod() {
+    let x = 1;
+}
+EOF
+
 # Enough production files that the default top-14 table cannot be filled by
 # 0-production rows — otherwise the "default output excludes test modules"
 # check below would pass for the wrong reason.
@@ -346,6 +380,14 @@ expect_row "$OUT" "frp-core/src/nested.rs" 5 7 2 \
   "an out-of-line declaration before a following production fn spans only itself"
 expect_row "$OUT" "frp-core/src/nested/deep/mod.rs" 0 4 4 \
   "a \`X/mod.rs\` sibling is attributed to tests"
+expect_row "$OUT" "frp-core/src/collide.rs" 4 4 0 \
+  "a production module beside the parent is not claimed by a test \`mod X;\`"
+expect_row "$OUT" "frp-core/src/attacker.rs" 5 7 2 \
+  "the test \`mod collide;\` declaration is its own lines only"
+expect_row "$OUT" "frp-core/src/attacker/collide.rs" 0 4 4 \
+  "the \`parent/X.rs\` candidate is the one that is attributed"
+expect_row "$OUT" "frp-core/src/bare/test.rs" 0 4 4 \
+  "a file named \`test.rs\` is 0 production"
 expect_row "$OUT" "frp-core/src/tests/under_dir.rs" 0 4 4 \
   "a file under \`tests/\` is 0 production"
 expect_row "$OUT" "frp-core/src/testsuite/prod.rs" 4 4 0 \
@@ -501,6 +543,28 @@ if mutate "$REAL" "$MUT" \
   fi
 else
   bad "M4 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M5: the candidate set. Making every parent resolve "beside itself"
+# (`dir/X.rs`) is what Rust does *not* do for `parent.rs`, and it lets an
+# unrelated production module be claimed by a test declaration.
+if mutate "$REAL" "$MUT" 'if stem in (' 'if True or stem in ('; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/collide.rs")"
+  if [ "$got" = "0 4 4" ]; then
+    ok "M5 (dir/X.rs offered for a parent.rs): the production \`collide.rs\` is claimed as test"
+  else
+    bad "M5 (dir/X.rs offered for a parent.rs): expected '0 4 4', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/attacker/collide.rs")"
+  if [ "$got" = "4 4 0" ]; then
+    ok "M5: the mutation drops the real \`parent/X.rs\` candidate too (wrong in both directions)"
+  else
+    bad "M5: attacker/collide.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M5 mutation did not apply — anchor missing, the check would be vacuous"
 fi
 
 # ---------------------------------------------------------------- summary

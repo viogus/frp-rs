@@ -49,8 +49,11 @@ TEST_ATTR = re.compile(r'\s*#\[cfg\(test\)\]')
 MOD_LINE = re.compile(r'\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)')
 MOD_DECL = re.compile(r'\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*;')
 PATH_ATTR = re.compile(r'\s*#\[path\s*=\s*"([^"]+)"\s*\]')
-# `tests.rs`, `key_tests.rs`, `single_test.rs` — the whole file is a test
-# module, so it has nothing to score as production.
+# `tests.rs`, `test.rs`, `key_tests.rs`, `single_test.rs` — the whole file is a
+# test module by convention, so it has nothing to score as production. The rule
+# is deliberately name-only: without resolving the declaring `mod` the script
+# cannot tell, so a production module that happens to carry one of these names
+# would be misread as test (no in-tree instance).
 TEST_FILE = re.compile(r'(?:^|_)tests?\.rs$')
 
 
@@ -197,21 +200,23 @@ def is_test_file(path):
 def sibling_paths(path, name, path_attr):
     """Where Rust looks for an out-of-line `mod name;` declared in `path`.
 
-    All four candidates of the published module-path rules: `X.rs` and
-    `X/mod.rs` beside the parent, and — for `parent.rs` but not
-    `parent/mod.rs` — the same two under a `parent/` directory. A missing
-    candidate leaves that module's body scored as production.
+    Rust resolves `mod X;` inside `parent.rs` under a `parent/` directory —
+    `parent/X.rs` or `parent/X/mod.rs` — and never beside it; only a
+    `mod.rs` / `lib.rs` / `main.rs` parent resolves `X.rs` / `X/mod.rs` in its
+    own directory. Offering `dir/X.rs` for a `parent.rs` would mark an unrelated
+    production module as test. `#[path = "…"]` overrides all of it.
     """
     d = os.path.dirname(path)
     out = []
     if path_attr:
         out.append(os.path.join(d, path_attr))
     stem = os.path.basename(path)[:-3]        # drop the `.rs`
-    if stem != 'mod':
+    if stem in ('mod', 'lib', 'main'):
+        out.append(os.path.join(d, name + '.rs'))
+        out.append(os.path.join(d, name, 'mod.rs'))
+    else:
         out.append(os.path.join(d, stem, name + '.rs'))
         out.append(os.path.join(d, stem, name, 'mod.rs'))
-    out.append(os.path.join(d, name + '.rs'))
-    out.append(os.path.join(d, name, 'mod.rs'))
     return out
 
 
