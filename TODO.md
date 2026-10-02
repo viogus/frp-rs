@@ -6540,7 +6540,7 @@ nothing about whether the described behaviour still holds.
   `git grep -nE '(^|[^a-zA-Z_/.-])go (build|run)' -- scripts/ .github/` finds
   nothing, and `scripts/download-go-frp.sh:29` fetches the **prebuilt** release
   tarball (`https://github.com/fatedier/frp/releases/download/v${VERSION}/…`).
-  It is a leftover of a removed path that `CHANGELOG.md:2665-2656` (0.3.1)
+  It is a leftover of a removed path that `CHANGELOG.md:2665-2666` (0.3.1)
   records — `build_go_frp_v2()` (clone + `go build`, cached to
   `/tmp/frp-source-build/`) exists nowhere in the tree, yet
   `.github/workflows/compat.yml:48` still caches that orphaned
@@ -7370,9 +7370,9 @@ nothing about whether the described behaviour still holds.
   `frp-server/src/dashboard.rs` by 177 (not 353).
   The four precision bounds: the region's brace scan is the careful one (`frp-core/src/logging.rs` 689 is the
   witness); the name rule and `mod X;`-sibling behaviour are preserved (the classifier's existing fixtures and
-  M1–M5 still pass); `#[cfg(all(test, …))]` is recognised. The fourth (`#[path]`) is closed for the one-line and
-  attribute-after-gate spellings; `#[path]` *before* `#[cfg(test)]` still leaves the target at 4 / 4 / 0 and is
-  unreachable in-tree — the only `#[cfg(test)]`-paired `#[path]` site,
+  M1–M5 still pass); `#[cfg(all(test, …))]` is recognised. The fourth (`#[path]`) is closed for the one-line,
+  attribute-after-gate and path-then-one-line-gate orderings (`#[path]` then `#[cfg(test)]` reads `0 4 4`); only a
+  *wrapped* multi-line `#[cfg(all(…))]` gate under a `#[path]` still reads `4 4 0` (the wrapped-predicate residue). The only `#[cfg(test)]`-paired `#[path]` site,
   `frp-server/src/control/proxy_ops/mod.rs:3044-3046`, is in the supported order. The item's "the tree's only
   `#[path]` site" is loose: `frp-server/src/vhost.rs:24` carries a second one, paired with a
   `#[cfg(feature = "http-proxy")]` gate rather than a test gate. The two smaller conventions the item records are
@@ -10741,8 +10741,8 @@ section; ledger now **24 open / 104 closed**.**
   server success`, `proxy added: [tcpmux-sub]`, `start proxy success`). The failure landed 2.49 s after the
   `[LOG]` banner (18:58:46.1577812 → 18:58:48.6524351), i.e. **not** the 10 s/20 s readiness-timeout signature:
   `test_g2r_tcpmux_subdomain` (`scripts/compat-test.sh:4749`) takes three independent picks — `frps_port`
-  (`:4754`), `tcpmux_port` (`:4755`), `echo_port` (`:4756`) — starts the echo server first (`:4763`) and gates on
-  `wait_for_port_safe 127.0.0.1 "$tcpmux_port" 5` (`:4792`), whose definition (`scripts/compat-test.sh:225`)
+  (`:4754`), `tcpmux_port` (`:4755`), `echo_port` (`:4756`) — starts the echo server first (`:4762`) and gates on
+  `wait_for_port_safe 127.0.0.1 "$tcpmux_port" 5` (`:4793`), whose definition (`scripts/compat-test.sh:225`)
   returns 0 the moment *any* process holds the port in LISTEN (no pid/ownership check). The echo server therefore
   satisfies the gate, and the CONNECT probe reads **its own request bytes** back instead of an `HTTP/1.1 200`
   head — the same wrong-socket signature as the forced `echo_port="$proxy_port"` collision above, and exactly what
