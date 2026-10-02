@@ -6014,21 +6014,23 @@ agent commits), which matters because the *reason* for two reviewers is that no 
 - [ ] **A cross-file `TODO.md:<n>` citation has no gate, so every merge that renumbers the ledger silently
   invalidates the cites in `ci.yml`, `scripts/` and source comments.**
   Filed by the PR #447 records round, the third round in this train to re-derive cites by hand. A `TODO.md`
-  cite is a bare line number with no anchor: measured at `612f7df1`, of the 145 `TODO.md:<n>` cites outside
-  `TODO.md` itself **136 do not land on an `- [ ]`/`- [x]` item header** (scan every tracked `.rs`/`.yml`/`.sh`/
-  `.md` for `TODO.md:(\d+)` and test the target line against `^- \[[ x]\] \*\*`). The per-round
-  "re-derive by content" sweep produced off-by-N errors in five rounds (#449/#450/#451/#453/#455), and this
-  round's rebase had to choose a side for 29 conflicted cite lines, several of them mid-item prose rather than
-  headers (`frps/tests/cli_exit_codes.rs:607`/`:1075`/`:1147` cited `TODO.md:7999`, which is not a header; the
-  SIGTERM/`--config-dir` item is `TODO.md:8874`). Stale instances measured at this head:
-  `.github/workflows/ci.yml` 4 (`:115` `8550`, `:323` `8582`, `:687` `8954`, `:1522` `8901`),
-  `scripts/tests/compat-stray-guard.sh` 12 (all `8470`/`8627`), `scripts/tests/repo-health-fixtures.sh:52`
-  (`8595`), `frp-client/tests/token_source_single_exec.rs:3` (`8415`) and `:4` (`8404`), plus several in
-  `frp-core/src/cli.rs`. The bare `:NNNN` continuation form (a `(`:673`)` meaning the file named earlier on the
-  line) needs the prose read to resolve. Two of those files are sha256-pinned in `.github/workflows/ci.yml`
-  (`guard_pin` `e6d23d74…` for `scripts/tests/repo-health-fixtures.sh` at `:164`, `4db720d6…` for
-  `scripts/tests/compat-stray-guard.sh` at `:406`), so re-pointing one cite in them also needs a `guard_pin`
-  bump — a second file to edit for a one-number change.
+  cite is a bare line number with no anchor. Measured at the base `612f7df1`
+  (`git grep -n -E 'TODO\.md:[0-9]+' 612f7df1 -- '*.rs' '*.yml' '*.sh' '*.md'`, each captured number tested
+  against `^- \[[ x]\] \*\*` in `612f7df1:TODO.md` and `TODO.md`'s own cites excluded): **154 occurrences on
+  127 cite-lines, of which 122 occurrences — 96 of the 127 lines, i.e. every cite on them — do not land on an
+  item header.** The per-round "re-derive by content" sweep produced off-by-N errors in five rounds
+  (#449/#450/#451/#453/#455), and this round's rebase had to choose a side for 29 conflicted cite lines, several
+  of them mid-item prose rather than headers (at that base `frps/tests/cli_exit_codes.rs:607`/`:1075`/`:1147`
+  cited `TODO.md:7999`, which is not a header; the SIGTERM/`--config-dir` item is `TODO.md:8874`). Stale
+  occurrences measured at that base: `docs/developing.md` 13, `scripts/tests/compat-stray-guard.sh` 12 (all
+  `8470`/`8627`), `frps/tests/cli_exit_codes.rs` 11, `CHANGELOG.md` 10, `frp-core/src/cli.rs` 7,
+  `.github/workflows/ci.yml` 3 (`:115` `8550`, `:323` `8582`, `:687` `8954`),
+  `scripts/tests/repo-health-fixtures.sh` 1, `frp-client/tests/token_source_single_exec.rs` 2. The bare `:NNNN`
+  continuation form (a `(`:673`)` meaning the file named earlier on the line) needs the prose read to resolve.
+  Two of those files are sha256-pinned in `.github/workflows/ci.yml` (`guard_pin` `e6d23d74…` for
+  `scripts/tests/repo-health-fixtures.sh` at `:164`, `4db720d6…` for `scripts/tests/compat-stray-guard.sh` at
+  `:406`), so re-pointing one cite in them also needs a `guard_pin` bump — a second file to edit for a one-number
+  change.
   **Done-when:** either a repo-wide content re-derivation plus a fail-closed gate (every `TODO.md:<n>` cite in a
   tracked file must land on an item header; canary-tested so a mutant cite reds it; wired into the `health`
   job), or a convention change to title-anchored references (a stable item slug, or `TODO.md § "title"`), each
@@ -8263,7 +8265,7 @@ section; ledger now **24 open / 104 closed**.**
   re-adding the two roots to `INI_NESTED_SECTION_ROOTS` reddens the first.
 
 - [x] **Four more test-precision residues the `test-precision-residue` round-2 reviews measured.**
-  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7751`): a
+  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7753`): a
   test that pins less than its name claims, so a real regression stays green.
   (a) The pinned warning bytes are the shipped static, but the **emitted** record is only
   substring-checked: `frp-core/tests/server_tls_enable_warning.rs:441` asserts
@@ -9670,9 +9672,8 @@ section; ledger now **24 open / 104 closed**.**
   `quic_bind_port` is still accepted by `known_server_keys()` and then silently dropped by the server, so
   `--strict-config` cannot see the divergence. Measured in the micro build
   (`--no-default-features --features micro`): `frps verify --strict-config` on a config writing
-    `websocket_port = 1` exits 0 with the port never bound. PR #455's items (`TODO.md:9525`, `:9572`, `:9594`,
-    `:9611`) cover the *warning* side; this item is the acceptance-set-vs-compiled-field divergence itself.
-  `TODO.md:9611`) cover the *warning* side; this item is the acceptance-set-vs-compiled-field divergence itself.
+  `websocket_port = 1` exits 0 with the port never bound. PR #455's items (`TODO.md:9527`, `:9574`, `:9596`,
+  `:9613`) cover the *warning* side; this item is the acceptance-set-vs-compiled-field divergence itself.
   **Done-when:** `known_server_keys()` (and any client-side counterpart) is derived from, or checked against,
   the compiled field set — shown by a `--no-default-features` run in which `--strict-config` refuses a key it
   cannot honour, or the divergence is recorded as deliberate with a measurement on both feature shapes.
