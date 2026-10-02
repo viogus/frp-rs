@@ -10360,20 +10360,6 @@ section; ledger now **24 open / 104 closed**.**
   runs is compared against the 3/89 recorded here — or the readiness bound is replaced by a
   mechanism-level fix (for example re-driving the frpc start rather than waiting longer for it).
 
-- [ ] **The A/B throughput gate fires on changes with no runtime code, so a red gate on `main` is not evidence of a regression.**
-
-  Filed by the coordinator after the 2026-10-02 daily scheduled run.
-
-  Evidence (one run, primary sources):
-  - `.github/workflows/ab-matrix.yml` runs `main~1` vs `main` on the dedicated VPS (job `ab-matrix`), daily at `cron: '30 4 * * *'`; the job fails if any configuration regresses by more than `GATE_PCT` (default `5`, `.github/workflows/ab-matrix.yml:50`/`scripts/ab-matrix.sh:50`).
-  - Run `36996762744` (event `schedule`, head `ae7bf50d`) failed: `A/B GATE FAILED: one or more configs regressed more than 5% (before -> after)`, with `encrypt_compress` `18.0 -> 15.2 = -15.6% REGRESSED`. The full table from the same run: `plain 11.4 -> 18.1 +58.8 pass`, `encrypt 17.9 -> 19.8 +10.6 pass`, `compress 18.6 -> 24.2 +30.1 pass`, `encrypt_compress 18.0 -> 15.2 -15.6 REGRESSED`, `mux 19.9 -> 23.6 +18.6 pass`, `tls 8.8 -> 8.4 -4.5 pass`.
-  - The gated delta is `97a03884` (base) -> `ae7bf50d` (head) = PR #459, whose entire non-records change is `scripts/large-functions.sh` (a Python analysis script that no shipped binary loads). `git diff --name-only 97a03884 ae7bf50d -- '*.rs' 'Cargo*.toml'` is empty. So the -15.6% cannot be a real regression: the gate's noise floor exceeds its 5% threshold, in the same run that reported +58.8% on another configuration.
-  - The confirm loop does not save it: `measure_pair` re-measures up to `CONFIRM_RETRIES` (default 2) times but keeps the **most negative** delta (`scripts/ab-matrix.sh:207-219`: `if python3 -c "… ($ndelta < $delta) …"`), i.e. the worst of up to three samples. Selecting the minimum of N noisy samples is a biased estimator and inflates the false-positive rate; there is no median/mean, no variance estimate, and no per-config confidence bound.
-  - This gate also cannot block anything: PR runs are deliberately skipped (`.github/workflows/ab-matrix.yml:10-17`), the workflow has no `push` trigger, and nothing in `ci.yml`/branch protection depends on it (`gh api /repos/viogus/frp-rs/branches/main/protection` -> 404 "Branch not protected"). A red A/B gate is therefore *only* discovered after the fact, on `main`, in a scheduled run.
-  - The same noise class is already documented in-tree for the retired PR mode (`.github/workflows/ab-matrix.yml:12-14`: identical binaries measured `tls -35.1% / -27.9% / +24.5%` across three attempts), but the daily `main~1` vs `main` gate still fails on it.
-
-  **Done-when:** either (a) the gate can no longer red on a delta that contains no shipped-code change — measured, not asserted: take the recorded failure above as the reproduction and show the new rule green on it (e.g. skip/annotate when `git diff <before> <after> -- '*.rs' 'Cargo*.toml' 'crates/**'` is empty, plus a comment saying so) — or (b) the statistic is replaced by one with a quantified false-positive rate: report the per-config sample distribution (N >= 3 repeats, median and spread) and set `GATE_PCT`/the confirm rule from it, so a published measurement shows the observed -15.6%-style spread no longer reds the gate. Whatever is chosen, record in the item's Done paragraph the run id, the table, and the commands used; a run that merely "passed once" is not evidence. If the honest conclusion is that the VPS is too noisy to gate anything, say so with numbers and record the decision to demote the gate to informational (with the reason), rather than leaving a gate that turns `main` red at random.
-
 - [ ] **`scripts/compat-test.sh --list` prints `run_test` function names while `--test` selects display names, so a name taken from `--list` runs nothing and still reports success.**
 
   Filed by the Batch K author after PR #463 review round 1. The selector compares the caller's display name
