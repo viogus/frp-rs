@@ -14555,8 +14555,8 @@ fn feature_gated_port_field_is_compiled_in(feature: &str) -> bool {
 /// has, so it carries `kcp_bind_port` / `quic_bind_port` / `websocket_port` exactly when
 /// the feature is compiled in.
 ///
-/// * compiled in — the snake *and* the camel spelling land in the field (`17500`), and
-///   no unhonoured record exists (nothing was dropped);
+/// * compiled in — the snake *and* the camel spelling land in the field (`17500`); the
+///   unhonoured-record list is empty by construction, so there is nothing to assert;
 /// * compiled out — strict mode **still accepts** both spellings (the divergence), the
 ///   field is absent from `to_value`, and the load records the accepted-but-unhonoured
 ///   key once per load.
@@ -14578,13 +14578,13 @@ fn feature_gated_port_keys_are_accepted_while_the_compiled_field_set_follows_the
                     Some(17500),
                     "{snake}: `{spelling}` must land in the field this build compiles in"
                 );
-                assert!(
-                    !presence
-                        .unhonoured_server_feature_key_records()
-                        .iter()
-                        .any(|record| record.contains(snake)),
-                    "{snake}: this build honours the port, so nothing may be recorded as unhonoured"
-                );
+                // No unhonoured-record assertion in this shape: every push into
+                // `unhonoured_server_feature_key_records()` is `#[cfg(not(feature = "…"))]`-gated
+                // (`frp-core/src/config/loader.rs:982-993`), so a build that honours this port
+                // compiles out the only push that could name `snake`; the assertion that used to
+                // sit here was structurally vacuous and could never fail, so it is replaced by
+                // this note. The feature-off half below still asserts the accepted-but-unhonoured
+                // record, which is the half that can actually go red.
             } else {
                 assert!(
                     serialized.is_none(),
