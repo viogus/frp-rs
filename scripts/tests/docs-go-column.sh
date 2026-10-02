@@ -16,10 +16,7 @@
 #   straight into `jsonx.UnmarshalWithOptions` — so Go accepts only the exact `json:"..."` spellings.
 #   Accept set = every dotted `json` path reachable from `ServerConfig`, `ClientConfig` and the
 #   `*ProxyConfig` / `*VisitorConfig` / `*PluginOptions` structs (embedded structs followed,
-#   `json:"-"` ignored), plus every bare `json` field name in the `pkg/config/v1` config structs —
-#   the eight struct files above carry the dotted paths, and `api.go` (`APIMetadata.Version`) and
-#   `store.go` (`StoreConfig.Path`) contribute the bare names `version` / `path` even though neither
-#   struct is reachable from those roots:
+#   `json:"-"` ignored), plus every bare `json` field name in the `pkg/config/v1` config structs:
 #   108 dotted paths + 153 bare names = 261 distinct spellings (the two sets are disjoint),
 #   embedded below as `GO`. Re-measure the split with:
 #     python3 -c 'import re;t=open("scripts/tests/docs-go-column.sh").read();g=re.search(r"GO = \{(.*?)\n\}",t,re.S).group(1);s={x for x in re.findall(r"\"([^\"]+)\"",g)};print(len([x for x in s if "." in x]),len([x for x in s if "." not in x]),len(s))'
