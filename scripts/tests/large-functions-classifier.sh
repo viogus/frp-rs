@@ -28,8 +28,12 @@
 #      production function whose body holds one), the gate-tail cases (a trailing
 #      `/* */` or `//` comment, a `]` inside that comment, a second attribute on
 #      the gate's line, a one-line `#[cfg(test)] #[path = …] mod X;` declaration,
-#      and an ordinary string continued with a backslash at end of line) and the
-#      predicate-parse
+#      a block comment opened on the gate's line and closed on a later one, and an
+#      ordinary string continued with a backslash at end of line), the text-that-
+#      is-not-code cases (a `#[cfg(test)]` inside a block comment, inside a raw
+#      string, on a backslash-continued line, and a `#[path]`-shaped raw-string
+#      line directly above a real gate), the predicate with an escaped quote, and
+#      the predicate-parse
 #      controls (`all(not(any(test, …)))`, `all(not (test), …)`, and the true
 #      `all(test, …)` gate beside them), plus the three negative controls
 #      (a plain `mod X;` production sibling, a directory whose name merely starts
@@ -39,7 +43,7 @@
 #   2  the default table and `--top` are unchanged in shape, a file the
 #      filter excluded is still not listed, and the function table measures the
 #      raw-string fixture's function to its true end.
-#   3  fifteen mutations of the script, each of which must red exactly one part of
+#   3  nineteen mutations of the script, each of which must red exactly one part of
 #      scenario 1: drop the name pattern, drop the sibling attribution, drop
 #      declaration recognition, drop `pub(…)` from the declaration pattern,
 #      offer `dir/X.rs` for a `parent.rs`, drop the `all(…)` arm of the
@@ -47,9 +51,13 @@
 #      code, drop the paren tracking that keeps a `[&str; 2]` type's `;` from
 #      ending a `const` early, stop skipping raw strings, treat `not(…)` as
 #      implying `test`, require the gate's `]` to end its line, reject a comment
-#      tail, consume the attribute run a line at a time again, and drop the
-#      ordinary-string continuation. A green suite on a mutant would mean the
-#      fixture does not drive the code it claims to.
+#      tail, consume the attribute run a line at a time again, drop the
+#      ordinary-string continuation, skip an attribute tail within its own line
+#      only, drop the escape state in the predicate splitter, drop the region
+#      pass, and drop the backward walk's region guard. A green suite on a mutant
+#      would mean the fixture does not drive the code it claims to.
+#   4  the check floor: a run without `python3` skips by design and must still
+#      exit 0 rather than trip the short-suite guard.
 #
 # Usage: bash scripts/tests/large-functions-classifier.sh
 set -uo pipefail
@@ -58,11 +66,14 @@ set -uo pipefail
 # A suite that silently stops checking must not exit green. The trap is
 # installed before the path resolution and the first check, so an early `exit 0`
 # anywhere below it still has to answer to the floor. `MIN_CHECKS` is the
-# measured check count of a green run.
-MIN_CHECKS=101
+# measured check count of a green run. The one deliberate early exit — the
+# `python3`-absent SKIP below — sets `FLOOR_EXEMPT`, because zero checks is the
+# right answer there.
+MIN_CHECKS=118
 checks=0
 fails=0
 WORK=""
+FLOOR_EXEMPT=""
 
 # shellcheck disable=SC2329  # invoked by the EXIT trap below, not directly
 cleanup() {
@@ -70,7 +81,8 @@ cleanup() {
   if [ -n "$WORK" ] && [ -d "$WORK" ]; then
     rm -rf "$WORK"
   fi
-  if [ "$rc" -eq 0 ] && [ "$checks" -lt "$MIN_CHECKS" ]; then
+  if [ "$rc" -eq 0 ] && [ "$checks" -lt "$MIN_CHECKS" ] \
+     && [ -z "$FLOOR_EXEMPT" ]; then
     printf 'large-functions-classifier: only %d check(s) ran, floor %d — the suite was cut short\n' \
       "$checks" "$MIN_CHECKS" >&2
     exit 1
@@ -110,6 +122,7 @@ if [ ! -f "$REAL" ]; then
 fi
 if ! command -v python3 >/dev/null 2>&1; then
   printf 'SKIP  python3 not found — scripts/large-functions.sh cannot measure\n'
+  FLOOR_EXEMPT=1
   exit 0
 fi
 
@@ -694,6 +707,125 @@ mod tests {
 }
 EOF
 
+# --- trivia across lines, escapes, and text that is not code -------------------
+# Four more ways the region can be misread. Each is measured against the three
+# older revisions of the script (base `d922accf…`, `b113b013` `62f10280…`, the
+# round-2 head `a44df7f3…`), and in each case the truth is the new head's value:
+#
+#   1  an attribute's tail may open a block comment that closes on a later line:
+#      `#[cfg(test)] /* why` / `   ; } */` / `mod tests { … }` decorates the item
+#      on the third line. Trivia therefore has to be skipped across lines;
+#      stopping at the first end of line pointed the run at `; } */`, and
+#      `item_end` read that `;` as the decorated item, charging the module to
+#      production (base `9 15 6`, round-2 head `13 15 2`, truth `9 15 6`).
+#   2  a `"` inside the predicate may be escaped: `all(feature = "a\"b", test)`.
+#      A comma splitter that treats every quote as a terminator ends the string
+#      at the `\"`, so the top-level comma is never seen and the gate is lost
+#      entirely (base and round-2 head `14 14 0`, `b113b013` `9 14 5`, truth
+#      `9 14 5`).
+#   3  `#[cfg(test)]` inside a block comment, a raw string or a backslash-
+#      continued string is text, not a gate. The older revisions fabricate a test
+#      region out of it: `fs_comment_gate` reads `11 13 2` on all three,
+#      `fs_raw_gate` `12 12 0` on base but `6 12 6` / `11 12 1`, `fs_cont_gate`
+#      `11 11 0` on base but `6 11 5` / `10 11 1` (truth `13 13 0`, `12 12 0`,
+#      `11 11 0`).
+#   4  the backward walk over an attribute run must not absorb a `#[…]`-shaped
+#      line that is inside such a region: `fs_raw_attr_above.rs` ends a raw
+#      string on a line that starts with `#[path = …]` and puts a real gate
+#      directly below it (truth `11 16 5`, without the guard `10 16 6`).
+cat > "$TREE/frp-core/src/fs_cfg_mlcomment.rs" <<'EOF'
+pub fn alpha() {
+    let a = 1;
+}
+
+#[cfg(test)] /* why
+   ; } */
+mod tests {
+    #[test]
+    fn one() {}
+}
+
+pub fn omega() {
+    let b = 2;
+}
+EOF
+
+cat > "$TREE/frp-core/src/fs_cfg_escaped_quote.rs" <<'EOF'
+pub fn alpha() {
+    let a = 1;
+}
+
+#[cfg(all(feature = "a\"b", test))]
+mod tests {
+    #[test]
+    fn one() {}
+}
+
+pub fn omega() {
+    let b = 2;
+}
+EOF
+
+cat > "$TREE/frp-core/src/fs_comment_gate.rs" <<'EOF'
+pub fn alpha() {
+    let a = 1;
+}
+
+/*
+#[cfg(test)]
+mod fake;
+*/
+
+pub fn omega() {
+    let b = 2;
+}
+EOF
+
+cat > "$TREE/frp-core/src/fs_raw_gate.rs" <<'EOF'
+pub fn alpha() {
+    let a = 1;
+}
+
+pub const GREETING: &str = r#"
+#[cfg(test)] mod fake;
+"#;
+
+pub fn omega() {
+    let b = 2;
+}
+EOF
+
+cat > "$TREE/frp-core/src/fs_cont_gate.rs" <<'EOF'
+pub fn alpha() {
+    let a = 1;
+}
+
+pub const GREETING: &str = "start \
+#[cfg(test)] mod fake;";
+
+pub fn omega() {
+    let b = 2;
+}
+EOF
+
+cat > "$TREE/frp-core/src/fs_raw_attr_above.rs" <<'EOF'
+pub fn alpha() {
+    let a = 1;
+}
+
+pub const BANNER: &str = r#"
+#[path = "fs_raw_attr_above/fake.rs"]"#;
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn one() {}
+}
+
+pub fn omega() {
+    let b = 2;
+}
+EOF
+
 # --- helpers ------------------------------------------------------------------
 # row <output> <path> -> "production total test", or empty when not listed.
 row() {
@@ -853,6 +985,20 @@ expect_row "$OUT" "frp-core/src/fs_cfg_inline_path/inline_helper.rs" 0 4 4 \
   "that one-line \`#[path]\` still attributes its sibling to tests"
 expect_row "$OUT" "frp-core/src/fs_string_cont.rs" 5 17 12 \
   "a backslash at end of line continues the string, so its \`}\` is content"
+
+# --- trivia across lines, escapes, and text that is not code -------------------
+expect_row "$OUT" "frp-core/src/fs_cfg_mlcomment.rs" 9 15 6 \
+  "a block comment opened on the gate's line and closed later still takes the module"
+expect_row "$OUT" "frp-core/src/fs_cfg_escaped_quote.rs" 9 14 5 \
+  "an escaped quote in the predicate does not hide the \`test\` argument"
+expect_row "$OUT" "frp-core/src/fs_comment_gate.rs" 13 13 0 \
+  "a \`#[cfg(test)]\` inside a block comment is not a gate"
+expect_row "$OUT" "frp-core/src/fs_raw_gate.rs" 12 12 0 \
+  "a \`#[cfg(test)]\` inside a raw string is not a gate"
+expect_row "$OUT" "frp-core/src/fs_cont_gate.rs" 11 11 0 \
+  "a \`#[cfg(test)]\` on a backslash-continued string line is not a gate"
+expect_row "$OUT" "frp-core/src/fs_raw_attr_above.rs" 11 16 5 \
+  "a \`#[path]\`-shaped raw-string line does not join the region below it"
 
 # ---------------------------------------------------------------- scenario 2
 printf '\nscenario 2: default output shape\n'
@@ -1080,7 +1226,8 @@ fi
 
 # M7: the attribute run. Without the backward walk a `#[path]` written above the
 # gate is invisible, so its sibling is no longer attributed to tests.
-if mutate "$REAL" "$MUT" 'while start > 0 and ATTR_LINE.match(lines[start - 1]):' \
+if mutate "$REAL" "$MUT" \
+    'while start > 0 and ATTR_LINE.match(lines[start - 1]) and not flags[start - 1]:' \
     'while start > 0 and False:'; then
   cp "$MUT" "$TREE/scripts/large-functions.sh"
   MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
@@ -1279,11 +1426,13 @@ else
   bad "M13 mutation did not apply — anchor missing, the check would be vacuous"
 fi
 
-# M14: the attribute run, consumed one line at a time again. A one-line
-# `#[cfg(test)] #[path = …] mod X;` then looks for its declaration on the next
-# line, so `item_end` charges the production code below it to tests and the
-# sibling is never attributed — the pre-round-2 behaviour, reproduced.
-if mutate "$REAL" "$MUT" "        if k < len(line):" "        if False:"; then
+# M14: the attribute run, advanced a line at a time after each attribute again.
+# A one-line `#[cfg(test)] #[path = …] mod X;` then loses the `#[path]` (the run
+# looks for the next attribute on the following line), so `item_end` charges the
+# production code below the declaration to tests and the sibling is never
+# attributed — the pre-round-2 behaviour, reproduced.
+if mutate "$REAL" "$MUT" "        i, j = _skip_trivia(lines, i, end + 1)" \
+    "        i, j = i + 1, 0"; then
   cp "$MUT" "$TREE/scripts/large-functions.sh"
   MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
   got="$(row "$MOUT" "frp-core/src/fs_cfg_inline_path.rs")"
@@ -1338,6 +1487,135 @@ if mutate "$REAL" "$MUT" "                        if j + 1 == len(line):" \
 else
   bad "M15 mutation did not apply — anchor missing, the check would be vacuous"
 fi
+
+# M16: the attribute tail, skipped inside the gate's own line only. A trailing
+# block comment that closes on a later line then leaves the run pointing at
+# `; } */`, whose semicolon `item_end` reads as the decorated item, so the test
+# module below it is charged to production (`13 15 2` — the round-2 head's
+# measurement, reproduced).
+if mutate "$REAL" "$MUT" "            i, j = i + 1, 0
+            while i < n:" "            i, j = i + 1, 0
+            while False:"; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/fs_cfg_mlcomment.rs")"
+  if [ "$got" = "13 15 2" ]; then
+    ok "M16 (tail skipped within the line): the module below the comment's \`;\` is production again"
+  else
+    bad "M16: fs_cfg_mlcomment.rs expected '13 15 2', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/fs_cfg_block_comment.rs")"
+  if [ "$got" = "9 14 5" ]; then
+    ok "M16: a comment that closes on the gate's own line is unaffected (the mechanisms are independent)"
+  else
+    bad "M16: fs_cfg_block_comment.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M16 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M17: the escape state in the predicate splitter. Without it `\"` ends the
+# string early, the comma after `"a\"b"` never reads as top-level, and the gate
+# is not recognised at all — the module is scored production (`14 14 0`).
+if mutate "$REAL" "$MUT" "            if esc:
+                esc = False" "            if False:
+                esc = False"; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/fs_cfg_escaped_quote.rs")"
+  if [ "$got" = "14 14 0" ]; then
+    ok "M17 (no escape state): the escaped quote hides the \`test\` argument and the gate is lost"
+  else
+    bad "M17: fs_cfg_escaped_quote.rs expected '14 14 0', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/attr_all_gated.rs")"
+  if [ "$got" = "5 10 5" ]; then
+    ok "M17: a predicate without escapes is unaffected (the mechanisms are independent)"
+  else
+    bad "M17: attr_all_gated.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M17 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M18: the region pass. Without it the same-line gate spellings inside a block
+# comment, a raw string and a backslash-continued string are gates again —
+# exactly the values the round-2 head measured (`11 13 2`, `11 12 1`,
+# `10 11 1`).
+if mutate "$REAL" "$MUT" "        if flags[i] or not is_test_gate(lines[i]):" \
+    "        if not is_test_gate(lines[i]):"; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/fs_comment_gate.rs")"
+  if [ "$got" = "11 13 2" ]; then
+    ok "M18 (no region pass): a \`#[cfg(test)]\` inside a block comment is a gate again"
+  else
+    bad "M18: fs_comment_gate.rs expected '11 13 2', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/fs_raw_gate.rs")"
+  if [ "$got" = "11 12 1" ]; then
+    ok "M18: a \`#[cfg(test)]\` inside a raw string is a gate again"
+  else
+    bad "M18: fs_raw_gate.rs expected '11 12 1', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/fs_cont_gate.rs")"
+  if [ "$got" = "10 11 1" ]; then
+    ok "M18: a \`#[cfg(test)]\` on a continued line is a gate again"
+  else
+    bad "M18: fs_cont_gate.rs expected '10 11 1', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/fs_cfg_two_attrs.rs")"
+  if [ "$got" = "9 14 5" ]; then
+    ok "M18: a gate in ordinary code is unaffected (the mechanisms are independent)"
+  else
+    bad "M18: fs_cfg_two_attrs.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M18 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M19: the backward walk's region guard. The raw string in
+# `fs_raw_attr_above.rs` ends on a line that begins with `#[path = …]`, directly
+# above a real gate; without the guard that line joins the region and one
+# production line is charged to tests (`10 16 6`).
+if mutate "$REAL" "$MUT" \
+    '        while start > 0 and ATTR_LINE.match(lines[start - 1]) and not flags[start - 1]:' \
+    '        while start > 0 and ATTR_LINE.match(lines[start - 1]):'; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/fs_raw_attr_above.rs")"
+  if [ "$got" = "10 16 6" ]; then
+    ok "M19 (no region guard on the walk-back): the raw-string line joins the region"
+  else
+    bad "M19: fs_raw_attr_above.rs expected '10 16 6', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/fs_cfg_block_comment.rs")"
+  if [ "$got" = "9 14 5" ]; then
+    ok "M19: a run whose preceding line is code is unaffected (the mechanisms are independent)"
+  else
+    bad "M19: fs_cfg_block_comment.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M19 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# ---------------------------------------------------------------- the floor
+printf '\nscenario 4: the check floor and the skip path\n'
+# The floor answers a short run with a failure, which is right for a suite that
+# stopped checking and wrong for the `python3`-absent SKIP above it: that path
+# runs zero checks on purpose and sets `FLOOR_EXEMPT`. Re-run the whole suite
+# with a PATH that has no `python3` and assert the skip still exits 0 — a
+# regression here would be a red CI job on a machine without python3.
+nopy="$(mktemp -d)"
+for tool in dirname readlink; do
+  ln -s "$(command -v "$tool")" "$nopy/$tool"
+done
+if skip_out="$(PATH="$nopy" "$BASH" "$0" 2>&1)"; then
+  ok "a run without \`python3\` skips cleanly instead of tripping the check floor"
+else
+  bad "the \`python3\`-absent skip path failed the floor: $skip_out"
+fi
+rm -rf "$nopy"
 
 # ---------------------------------------------------------------- summary
 printf '\n'

@@ -205,13 +205,21 @@ def cfg_args(inner):
     """Split a `cfg` predicate's argument list on its own top-level commas.
 
     Nesting and quoted values are respected, so `all(test, feature = "a,b")`
-    is two arguments and the comma inside the string does not split it.
+    is two arguments and the comma inside the string does not split it, and a
+    backslash-escaped quote does not end a value early: with
+    `all(feature = "a\"b", test)` the `\"` used to close the string, so the
+    comma after it was read as string content, the argument list came back as
+    one item and the gate behind it was not recognised at all.
     """
-    out, cur, depth, quote = [], [], 0, None
+    out, cur, depth, quote, esc = [], [], 0, None, False
     for ch in inner:
         if quote is not None:
             cur.append(ch)
-            if ch == quote:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == quote:
                 quote = None
             continue
         if ch in '"\'':
@@ -416,6 +424,48 @@ def is_test_gate(line):
     return gate_tail_ok(line, end) and cfg_implies_test(pred)
 
 
+def _skip_trivia(lines, i, j):
+    """Cursor `(i, j)` just past the whitespace and comments at `(i, j)`.
+
+    Unlike `_skip_comment` this crosses lines: an attribute's tail may open a
+    block comment that closes on a later line, and
+
+        #[cfg(test)] /* why
+           ; } */
+        mod tests { … }
+
+    decorates the item on the third line. Stopping at the first end of line
+    left the attribute run pointing at `; } */`, so `item_end` read that
+    semicolon as the item and charged the whole test module to production.
+    """
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        if j >= len(line):
+            i, j = i + 1, 0
+            continue
+        c = line[j]
+        if c in ' \t\r':
+            j += 1
+        elif line.startswith('//', j):
+            i, j = i + 1, 0
+        elif line.startswith('/*', j):
+            k = line.find('*/', j + 2)
+            if k >= 0:
+                j = k + 2
+                continue
+            i, j = i + 1, 0
+            while i < n:
+                k = lines[i].find('*/')
+                if k >= 0:
+                    j = k + 2
+                    break
+                i += 1
+        else:
+            return i, j
+    return i, j
+
+
 def attribute_run(lines, start):
     """(item line, item column, `#[path]` value) after the run at `start`.
 
@@ -424,33 +474,110 @@ def attribute_run(lines, start):
     they decorate: `#[cfg(test)] #[path = "declared_helper.rs"] mod declared;`
     declares an out-of-line test module, and a line-at-a-time walk looked for
     the declaration on the *next* line and charged the production code below it
-    to tests. `path_attr` is the last `#[path]` of the run, or None.
+    to tests. Whitespace and comments between the attributes and the item may
+    span lines (`_skip_trivia`); `path_attr` is the last `#[path]` of the run,
+    or None.
     """
-    i, n, path_attr = start, len(lines), None
-    while True:
+    n, path_attr = len(lines), None
+    i, j = _skip_trivia(lines, start, 0)
+    while i < n:
         line = lines[i]
-        k = 0
-        while True:
-            while k < len(line) and line[k] in ' \t\r':
-                k += 1
-            if line.startswith('/*', k) or line.startswith('//', k):
-                k = _skip_comment(line, k)
-                continue
-            if not line.startswith('#[', k):
-                break
-            end = closing_bracket(line, k + 1)
-            if end < 0:                     # malformed — stop at the item
-                return i, k, path_attr
-            m = PATH_ATTR.search(line[k:end + 1])
-            if m:
-                path_attr = m.group(1)
-            k = end + 1
-        if k < len(line):
-            return i, k, path_attr
-        if i + 1 < n and ATTR_LINE.match(lines[i + 1]):
-            i += 1
+        if not line.startswith('#[', j):
+            return i, j, path_attr
+        end = closing_bracket(line, j + 1)
+        if end < 0:                         # malformed — stop at the item
+            return i, j, path_attr
+        m = PATH_ATTR.search(line[j:end + 1])
+        if m:
+            path_attr = m.group(1)
+        i, j = _skip_trivia(lines, i, end + 1)
+    return i, j, path_attr
+
+
+def _string_rest(line, j):
+    """Cursor after the `"` that closes a string already open at `j`.
+
+    `(index, done)`: `done` is False when the literal runs off the end of the
+    line, which happens exactly when a backslash sits immediately before the
+    newline — the continuation `item_end` follows onto the next line. Without
+    it, a `}` on the continuation line reads as code (that is the round-2
+    ordinary-string fix, re-used here for the region state).
+    """
+    n = len(line)
+    while j < n:
+        c = line[j]
+        if c == '\\':
+            if j + 1 == n:
+                return n, False
+            j += 2
             continue
-        return i + 1, 0, path_attr
+        if c == '"':
+            return j + 1, True
+        j += 1
+    return n, True                          # malformed — stays line-local
+
+
+def region_flags(lines):
+    """Per line: does the line *begin* inside a comment or a literal?
+
+    `is_test_gate` reads one line, so a gate-shaped line that is really part of
+    a block comment, a raw string or a backslash-continued ordinary string
+    looked like a gate and fabricated a one-line test region — the production
+    code after it was charged to tests. Only those three constructs can cross a
+    line boundary; this tracks the same state `item_end` carries while it
+    scans: `/* … */` (not nested, no `//` inside), raw strings by terminator
+    count, and ordinary strings line-local unless a backslash precedes the
+    newline.
+    """
+    n = len(lines)
+    flags = [False] * n
+    block = cont = False
+    term = None
+    for i, line in enumerate(lines):
+        flags[i] = block or cont or term is not None
+        j, L = 0, len(line)
+        while j < L:
+            if block:
+                k = line.find('*/', j)
+                if k < 0:
+                    break
+                block, j = False, k + 2
+                continue
+            if term is not None:
+                k = line.find(term, j)
+                if k < 0:
+                    break
+                term, j = None, k + len(term)
+                continue
+            if cont:
+                j, done = _string_rest(line, j)
+                cont = not done
+                continue
+            c = line[j]
+            if line.startswith('//', j):
+                break
+            if line.startswith('/*', j):
+                block, j = True, j + 2
+                continue
+            if c in 'brc':
+                m = RAW_OPEN.match(line, j)
+                if m:
+                    t = '"' + '#' * len(m.group(1))
+                    k = line.find(t, m.end())
+                    if k < 0:
+                        term, j = t, L
+                    else:
+                        j = k + len(t)
+                    continue
+            if c == '"':
+                j, done = _string_rest(line, j + 1)
+                cont = not done
+                continue
+            if c == "'":
+                j = _skip_char(line, j)
+                continue
+            j += 1
+    return flags
 
 
 def test_blocks(lines):
@@ -478,6 +605,11 @@ def test_blocks(lines):
     part of the region and is searched for `#[path]` — even when the run, the
     `#[path]` and the `mod X;` declaration all share one line.
 
+    A gate-shaped line inside a block comment, a raw string or a continued
+    ordinary string is not a gate at all: `region_flags` marks the lines that
+    begin inside one of those constructs and only the other lines are
+    candidates.
+
     An out-of-line declaration must not be brace-matched: `mod tests;` has no
     body, so scanning forward for the next `{` charges the production code that
     follows it to the test module. That is what made `ssh_gateway.rs` read 2726
@@ -485,14 +617,15 @@ def test_blocks(lines):
     16 production lines swallowed by the first braced statement after the
     `mod tests;` this file had always carried.
     """
+    flags = region_flags(lines)
     blocks, out_of_line = [], []
     i, n = 0, len(lines)
     while i < n:
-        if not is_test_gate(lines[i]):
+        if flags[i] or not is_test_gate(lines[i]):
             i += 1
             continue
         start = i
-        while start > 0 and ATTR_LINE.match(lines[start - 1]):
+        while start > 0 and ATTR_LINE.match(lines[start - 1]) and not flags[start - 1]:
             start -= 1
         j, col, path_attr = attribute_run(lines, start)
         if j >= n:
