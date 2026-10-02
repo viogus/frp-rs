@@ -161,7 +161,7 @@ jobs:
           log=/tmp/frp-repo-health-fixtures.log
           status=0
           guard_file=scripts/tests/repo-health-fixtures.sh
-          guard_pin=66d4af028e0c31a709c789d67c12415577028a73710267ceee4a466bee15fb39
+          guard_pin=e6d23d746bdf8f089b41d7d87cfc8033ad59bc4104216fcf87468fee9c2618ca
           # R12-2 (adversarial round 13): resolve the hasher to an absolute path
           # and prove it with a known vector — the same candidate order and the
           # same fail-closed mode as the guard's own `find_hash_tool()`.
@@ -403,7 +403,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=4f2df348b816f664d79613a7ee46417163e839450d948f82dae303996a4fe246
+          guard_pin=4db720d672334bb121f5f34a8f940fe217a0d7f55bae64a1c6d19a0aa8359812
           # R12-1 (adversarial round 13): the enforcer's *implementation* lives in
           # the library the scenarios `source` (the `LIB=` assignment at :96 only
           # names it), so pinning only the suite left the "two-file change" claim

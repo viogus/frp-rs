@@ -358,6 +358,13 @@ Block inventory, from the function's own comment landmarks:
   had ever reached the dedicated port the move was shipped with
   `frp-server/tests/transport_e2e_websocket_port.rs` and the `websocket`-without-`kcp` CI lane. See
   the `TODO.md` progress paragraph.
+- KCP listener → `frp-server/src/service/listeners.rs`,
+  `pub(super) async fn start_kcp_listener(&self, rate_limiter_enabled: bool)` — PR #450 at code head
+  `88da2d38` (based on `f881d15e`): 501 payload lines / 44 390 bytes byte-identical, and
+  `frp-server/src/service.rs` 2386 → 1886 lines. Unlike the WebSocket seam the KCP transport is
+  already covered end to end (`scripts/protocol-matrix.sh`'s KCP rows and
+  `scripts/compat-test.sh`'s KCP+TLS / KCP+tcpMux scenarios), so the move ships without a new test;
+  `mod listeners` is now gated on `any(websocket, kcp)`. See the `TODO.md` progress paragraph.
 
 - Inline tests of `frp-server/src/control/bridge.rs` → `frp-server/src/control/bridge/tests.rs`
   (parent file kept, sibling module dir, as in the entry above) — PR #451 at code head `9f064385`

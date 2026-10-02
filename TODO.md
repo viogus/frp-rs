@@ -413,7 +413,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
     auth, and nothing in the reload output mentions auth.
   * **Shape B — swapped without a verifier.** The same, with the token changed too →
     `SIGUSR1: auth token updated`. `reload()` then assigns the whole new `AuthConfig`
-    (`frp-server/src/service.rs:2068-2072`; the item first cited `:2057-2061`, which is the
+    (`frp-server/src/service.rs:1568-1572`; the item first cited `:2057-2061`, which is the
     `allow_ports` arm — corrected when this item was closed), so the live `auth_cfg.method`
     becomes `Oidc`, while
     `state.oidc.verifier` is built **once** at startup (`frp-server/src/service.rs:215`, `if
@@ -4632,7 +4632,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `unix_wait_status(15)`. Two mechanisms, both measured with the helper as the **only** difference
     (40 iterations of the whole file per arm): (a) the SIGTERM task is spawned from the same async
     fn as the accept loop and can be unpolled when the connection is accepted
-    (`frp-server/src/service.rs:1579-1619`); (b) **the load-bearing one** — `ephemeral_port()`
+    (`frp-server/src/service.rs:1079-1119`); (b) **the load-bearing one** — `ephemeral_port()`
     releases its port before the child binds it and tests run in parallel, so the connect witness
     can be satisfied by a *foreign* listener (every failure in both A/B arms had an **empty child
     log** although a connect had succeeded, and one reviewer failure ended in `Address already in
@@ -6767,6 +6767,35 @@ nothing about whether the described behaviour still holds.
   256 KiB then 64 KiB echo, `tcp_mux` off and on) and the `websocket`-without-`kcp` curated CI lane.
   The remaining blocks (HTTP vhost, HTTPS vhost, TCPMux, SSH tunnel gateway, KCP, QUIC, dashboard,
   `tasks.rs`) are tracked in the plan doc, which now records what has landed.
+  **Progress (2026-10-01, code head `88da2d38` on `refactor/extract-kcp-listener`, PR #450).** The
+  second P1 seam landed: `run`'s inline KCP listener block (the `// Start KCP listener if configured`
+  landmark through the block's closing brace) moved byte-for-byte into
+  `frp-server/src/service/listeners.rs` as
+  `pub(super) async fn start_kcp_listener(&self, rate_limiter_enabled: bool)` — 501 payload lines /
+  44 390 bytes `cmp`-identical (sha256
+  `349e49b2d12cede91389630dbd9b5dd9eae0e56b82f935570b82e9785a4a014d`), `frp-server/src/service.rs`
+  2386 → 1886 lines (`git diff` is four hunks: two dead-import deletions, a +5/−1 module
+  comment/gate hunk, and the 501→1 call site). Unlike the WebSocket seam the extracted block is
+  already reached by shipped lanes (`scripts/protocol-matrix.sh`'s KCP rows and
+  `scripts/compat-test.sh`'s KCP+TLS and KCP+tcpMux scenarios), so the round adds no test; the
+  evidence is the byte-identical move plus those lanes (`11 passed, 0 failed` on a quiet host).
+  `mod listeners` is now gated on `any(websocket, kcp)` with a feature gate per method, so a
+  `--no-default-features --features kcp` build still compiles. **12 `path:line` cites were
+  repointed** for this move — counted as locator occurrences whose line text changed
+  (`feature-backlog.md:51`, `server_protocol.rs:678` and the #436 development-log row each
+  contribute two); every one was re-located by content and `cmp`-checked against its base slice, and
+  the full old → new table is in the PR. Cites into `docs/archive/**` keep their era's line numbers
+  instead: that tree is point-in-time by its own README (`docs/archive/README.md`), so the three
+  archive repoints an earlier revision of this round made were reverted. The cites already stale at
+  base `f881d15e` were deliberately left alone rather than treated as regressions — the adversarial
+  counted 23, most of which now point past `service.rs`'s 1886-line end. The moved block's
+  `tracing` records now render `target: frp_server::service::listeners` instead of
+  `frp_server::service` (`module_path!()` follows the module); `RUST_LOG` target matching is a
+  prefix comparison, so `RUST_LOG=frp_server::service=debug` still enables them, and as in #436 the
+  round ships no `CHANGELOG.md` bullet for it. The remaining blocks (HTTP vhost, HTTPS vhost,
+  TCPMux, SSH tunnel gateway, QUIC, dashboard, `tasks.rs`) are tracked in the plan doc, which
+  records this seam as landed too. Ledger at this head: **14 open / 189 closed** (base `01fb93e3`:
+  14 open / 189 closed) — unchanged; its `TODO.md:<n>` cites are re-derived by content.
 
   **Progress (2026-10-01, code head `7ff46a60` on `refactor/fileify-vhost-tests`, PR #452, based on
   `f881d15e`, rebased onto `18bcd1ad`).** The P0/P7 split landed: `frp-server/src/vhost.rs`'s inline
@@ -8135,6 +8164,8 @@ section; ledger now **24 open / 104 closed**.**
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7204`): a
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7617`): a
   Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7616`): a
+  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7220`): a
+  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7236`): a
   test that pins less than its name claims, so a real regression stays green.
   (a) The pinned warning bytes are the shipped static, but the **emitted** record is only
   substring-checked: `frp-core/tests/server_tls_enable_warning.rs:441` asserts
