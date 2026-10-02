@@ -202,10 +202,10 @@ Add a field only for a genuinely new knob, and then follow the house rules:
   `frp-core/src/config/server.rs:1415`.
 
 **The type name itself is validated by an allow-list, and this is the first wall.**
-`fn validate_proxy_configs` (`frp-core/src/config/loader.rs:897`) checks
-`p.proxy_type` against `const VALID_PROXY_TYPES` (`frp-core/src/config/loader.rs:898`).
+`fn validate_proxy_configs` (`frp-core/src/config/loader.rs:1108`) checks
+`p.proxy_type` against `const VALID_PROXY_TYPES` (`frp-core/src/config/loader.rs:1109`).
 It is reached only from `fn validate_client_config`
-(`frp-core/src/config/loader.rs:1193`); the server path has no equivalent, so a
+(`frp-core/src/config/loader.rs:1404`); the server path has no equivalent, so a
 stray `[[proxies]]` block in `frps.toml` is rejected by the *parser* as
 `unknown field "proxies" in config file`, not by this allow-list. Miss the list and
 *every* frpc config file using your type fails to load. (The transcripts in §2.2–§2.6
@@ -221,7 +221,7 @@ $ echo $?
 ```
 
 Note what that demands of you: the message is a **second, hand-maintained copy of
-the list**, inline at `frp-core/src/config/loader.rs:905`. Adding the name to the
+the list**, inline at `frp-core/src/config/loader.rs:1116`. Adding the name to the
 `const` and not to the message leaves the error text lying about what is valid.
 Change both, in the same commit.
 
@@ -232,7 +232,7 @@ differently:
 
 | # | Site | What it gates | If you skip it |
 |---|---|---|---|
-| 1 | `const VALID_PROXY_TYPES` — `frp-core/src/config/loader.rs:898` (+ the message at `:905`), checked by `validate_proxy_configs` at `frp-core/src/config/loader.rs:897` | frpc config-file load | Fatal at startup: `invalid proxy_type '<type>'` (above). **The first wall, always** |
+| 1 | `const VALID_PROXY_TYPES` — `frp-core/src/config/loader.rs:1109` (+ the message at `frp-core/src/config/loader.rs:1116`), checked by `validate_proxy_configs` at `frp-core/src/config/loader.rs:1108` | frpc config-file load | Fatal at startup: `invalid proxy_type '<type>'` (above). **The first wall, always** |
 | 2 | `const VALID_PROXY_TYPES` — `frp-client/src/store.rs:16`, used by `validate_proxy` at `frp-client/src/store.rs:258` | The runtime config store behind the admin API (`/api/store/*`) | Store writes are rejected with `invalid proxy type: <type>`, and an existing store file that contains your type **fails to load** |
 | 3 | the seed list in `by_type` — `frp-client/src/admin.rs:391` (feature `admin`) | `/api/proxy/<type>` (Go parity: every known type appears, even empty) | Cosmetic: the endpoint returns no entry for your type |
 | 4 | `const VALID_PROXY_TYPES` — `frp-server/src/ssh_gateway.rs:737` (feature `ssh`) | Proxy types accepted over the SSH tunnel gateway | `invalid proxy type: <type>, support types: [tcp http https tcpmux stcp]` |
@@ -2223,7 +2223,7 @@ through and completed, so a file's `[log]` values survive a deliberately empty f
 `--log-format` still writes through on that lane because it is an frp-rs-only flag
 with no Go completion to mirror (`TODO.md` residue R2 records the remaining adjacent
 divergence — R1, the `-c`-only lane's non-empty log flag, is closed by the mask at
-`frps/src/main.rs:413`, which withholds all four log flags there).
+`frps/src/main.rs:437`, which withholds all four log flags there).
 
 Measured against Go frp **v0.71.0** (darwin/arm64) and frp-rs (base `80199f4`),
 cwd holding a `frps.toml`, one free control port and one free dashboard port per
@@ -2237,7 +2237,7 @@ with `lsof -nP -iTCP:<port> -sTCP:LISTEN`:
 | `--bind-addr ""` (`[auth] token`, `bindPort` in the file) | `frps tcp listen on 0.0.0.0:19805`; `TCP *:19805 (LISTEN)` | `frps starting on :19805` + `failed to lookup address information`, exit 1, nothing bound | `0.0.0.0:19805`; `TCP *:19805 (LISTEN)` |
 | `--bind-port 0` | `create server listener error, listen tcp 0.0.0.0:7000: bind: address already in use` (tries the default 7000) | `frps starting on 127.0.0.1:0`, binds an ephemeral port | `frps starting on 127.0.0.1:7000` |
 | `bindAddr = ""` **in the file** (no flag) | `0.0.0.0:19815` | exit 1, nothing bound | `0.0.0.0:19815` |
-| `--config-dir <dir>` with `bindAddr = ""` in the file (the lane that never overlays flags — it still resolves through the completing `load_server_config`) | *(no `frps --config-dir` on Go: `Error: unknown flag: --config-dir`, rc 1; the `-c` analogue binds `0.0.0.0`)* | **rc 0 with nothing bound** — and *not* silent: it logs `ERROR frps: frps service error for config file […]: failed to lookup address information`. The **underlying error text** is the same one `-c` reports, but the message and the disposition differ: `-c` prints `ERROR frps: frps error: failed to lookup address information` and **exits 1**, while this lane wraps it per config file and **exits 0** — the defect is that exit code. **Superseded**: the `bind_addr = ""` fill now covers this lane too (measured at `971e0fa0`: `frps --config-dir` with that file logs `listener started on 0.0.0.0:19961` and keeps running; `SIGTERM` rc 0 once the shutdown handler is installed (`frp-server/src/service.rs:1858` — a signal landing in the startup window dies with the default disposition, rc 143, on **both** lanes), so the row keeps the round's measurement and no longer describes today's behaviour | `0.0.0.0:19881` listening |
+| `--config-dir <dir>` with `bindAddr = ""` in the file (the lane that never overlays flags — it still resolves through the completing `load_server_config`) | *(no `frps --config-dir` on Go: `Error: unknown flag: --config-dir`, rc 1; the `-c` analogue binds `0.0.0.0`)* | **rc 0 with nothing bound** — and *not* silent: it logs `ERROR frps: frps service error for config file […]: failed to lookup address information`. The **underlying error text** is the same one `-c` reports, but the message and the disposition differ: `-c` prints `ERROR frps: frps error: failed to lookup address information` and **exits 1**, while this lane wraps it per config file and **exits 0** — the defect is that exit code. **Superseded**: the `bind_addr = ""` fill now covers this lane too (measured at `971e0fa0`: `frps --config-dir` with that file logs `listener started on 0.0.0.0:19961` and keeps running; `SIGTERM` rc 0 once the shutdown handler is installed (`frp-server/src/service.rs:1107` — a signal landing in the startup window dies with the default disposition, rc 143, on **both** lanes), so the row keeps the round's measurement and no longer describes today's behaviour | `0.0.0.0:19881` listening |
 | the no-auth force-bind, no flag (control case) | n/a | `127.0.0.1` | unchanged |
 
 Pinned by `frps/tests/cli_completion.rs` (`--dashboard-addr ""` with

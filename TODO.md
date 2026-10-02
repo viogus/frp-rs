@@ -10030,7 +10030,7 @@ section; ledger now **24 open / 104 closed**.**
   closed in the same PR, so only the closed count moves; the four follow-ups below take it to **20 open / 191
   closed** at this branch's head, whose base is `5653512b` after the #449 merge (`16 open / 190 closed`)).
 
-- [ ] **A listener port whose *reader* is feature-gated in `frp-server` is still accepted and then silently ignored — `web_server.port` with `dashboard` off and `ssh_tunnel_gateway.bind_port` with `ssh` off.**
+- [x] **A listener port whose *reader* is feature-gated in `frp-server` is still accepted and then silently ignored — `web_server.port` with `dashboard` off and `ssh_tunnel_gateway.bind_port` with `ssh` off.**
   Filed by PR #455's adversarial review (F-A), measured on the `frps-micro` binary at head `2aa6add8`: the
   class this round warns about is the one gated in **`frp-core`** (serde drops the field, so the key is inert),
   but these two are ordinary fields whose only *reader* sits behind a **`frp-server`** feature — they parse, strict
@@ -10051,8 +10051,35 @@ section; ledger now **24 open / 104 closed**.**
   `frp-server/dashboard`, or `ssh_tunnel_gateway.bind_port` in a build without `frp-server/ssh`, is warned about
   once per load, or the two `docs/config.md` rows record the reader-feature gap — either way pinned by a test in
   each build shape.
+  Done (2026-10-02, this batch). Chose the **warn** branch over the docs-only branch: the two load paths are the
+  only place both sinks pass through, and a docs row alone cannot be pinned per build shape the way a record can.
+  `frp-core` cannot observe `frp-server`'s features (the split already recorded at
+  `frp-core/src/config/loader.rs:435-452`), so the reader is answered by the caller: `ConfigPresence` gained
+  `web_server_port_unhonoured` / `ssh_tunnel_gateway_bind_port_unhonoured`, computed in **every** build from the
+  normalized tables (`sub_port_requested(table, "web_server", "port", "port")` and
+  `("ssh_tunnel_gateway", "bind_port", "bindPort")`), so `[webServer]`, `sshTunnelGateway` and the legacy
+  `dashboard_port` spelling are all caught; `warn_inert_web_server_port(reader)` and
+  `warn_inert_ssh_tunnel_gateway_bind_port(reader)` emit exactly one `tracing::warn!` per load when the port is
+  requested and the reader is `Absent`, and `frp-server` answers with
+  `service::web_server_port_reader()` / `ssh_tunnel_gateway_bind_port_reader()` (`cfg!(feature = "dashboard")` /
+  `cfg!(feature = "ssh")`). Both startup sinks (`-c`, `--config-dir`) and the `SIGUSR1` reload sink call them, so
+  a reload warns again — one record per load, and nothing at all when the build honours the port.
+  Pinned by `config::tests::reader_gated_*` (5 tests, `frp-core/src/config/tests.rs`), by the two resolver pins in
+  `frp-server/src/service.rs` (`web_server_port_reader_answers_from_this_build`,
+  `ssh_tunnel_gateway_bind_port_reader_answers_from_this_build`), and by three spawn tests appended to
+  `frps/tests/warn_delivery.rs` (`web_server_port_warning_reaches_a_dash_c_user`,
+  `a_sigusr1_reload_delivers_the_web_server_port_warning_again`,
+  `verify_prints_the_gated_listener_port_record_before_the_go_success_line`); that file's count guard moved 28 → 31
+  in the default, dashboard and release lanes. Mutants red, each reverted green: M1-A flipping
+  `from_features(cfg!(feature = "dashboard"))` to `!cfg!(…)` reds `frp-server/src/service.rs:1939:9`
+  (`left: Present / right: Absent`); M1-B deleting the `-c` calls reds `frps/tests/warn_delivery.rs:576:17`;
+  M1-B deleting the two reload calls reds `frps/tests/warn_delivery.rs:2354:5` (`left: 1 / right: 2`,
+  "startup + reload = one per load"); M1-C dropping the `== Absent` guard reds `frps/tests/warn_delivery.rs:2298:5`
+  (`left: 2 / right: 0`). Green afterwards: `cargo test -p frps --test warn_delivery` 31 passed / 0 failed
+  (7.13 s), `--features dashboard` 31 passed / 0 failed (7.17 s), and
+  `cargo test -p frp-server --lib -- _reader_answers_from_this_build` 3 passed / 0 failed / 459 filtered.
 
-- [ ] **The gated-port detector warns for the legacy-`.ini` zero spellings (`"0"`, `+0`, `00`) that every build honours as "disabled".**
+- [x] **The gated-port detector warns for the legacy-`.ini` zero spellings (`"0"`, `+0`, `00`) that every build honours as "disabled".**
   Filed by PR #455's adversarial review (F-B). `port_requested` (`frp-core/src/config/loader.rs:565`) treats a
   value as a request unless `as_integer() == Some(0)`, but the `.ini` reader leaves numeric text that does not
   round-trip as a `toml::Value::String` (`frp-core/src/config/format.rs`), which the type-directed `ini_lenient`
@@ -10068,8 +10095,24 @@ section; ledger now **24 open / 104 closed**.**
   round just repointed.
   **Done-when:** `port_requested` accepts the INI reader's own zero spelling set (`0` / `+0` / `00` / `"0"`, …) as
   "not a request", or the INI exception is recorded where the claim is asserted — with a test per spelling.
+  Done (2026-10-02, this batch). `port_requested` now defers to a shared value-level helper,
+  `port_value_requests_a_listener(&toml::Value) -> bool`: `Integer(0)` is not a request, and neither is any
+  `String` that parses as `i64 == 0`, so the INI reader's own zero spellings (`"0"`, `+0`, `00`) stop warning
+  while `007` / `+5` still do. The rule is unchanged for the three frp-core cfgs (`sub_port_requested` calls the
+  same helper) and for the two reader-gated `frp-server` ports added with `TODO.md:10033`.
+  `port_requested`'s doc no longer claims that only the *integer* `0` is exempt — that claim now lives with the
+  helper and names the two files that create the string shapes (`frp-core/src/config/format.rs`,
+  `frp-core/src/config/ini_lenient.rs`), so the old sentence is not silently falsified. Pinned by three
+  `--no-default-features` tests in `frp-core/src/config/tests.rs`:
+  `ini_zero_spellings_are_not_requests_for_the_reader_gated_ports`,
+  `ini_nonzero_listener_port_spellings_still_request_a_listener` (the `007` / `+5` positive control) and
+  `ini_zero_spellings_do_not_warn_for_the_gated_listener_ports`. Mutants red, reverted green: M2-A reverting the
+  helper to `value.as_integer() != Some(0)` reds `frp-core/src/config/tests.rs:731:9`; M2-B making every `String`
+  "not a request" reds `frp-core/src/config/tests.rs:754:9`. Green afterwards:
+  `cargo test -p frp-core --no-default-features --lib -j 2 -- config::tests::ini_` 3 passed / 0 failed /
+  838 filtered.
 
-- [ ] **`frps verify --strict-config` still accepts a feature-gated port silently (rc 0), so `verify` cannot see the class the run path now warns about.**
+- [x] **`frps verify --strict-config` still accepts a feature-gated port silently (rc 0), so `verify` cannot see the class the run path now warns about.**
   Filed by PR #455's verification (F2) and adversarial (F-C) reviews. Reproduced: `frps-micro verify
   --strict-config -c ws.toml` with `websocketPort = 7500` prints `frps: the configuration file … syntax is ok` and
   exits 0, while the `zzzPort` control is refused with rc 1. The behaviour is deliberate — `run_verify`
@@ -10079,6 +10122,20 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** `verify` reports the unhonoured key to stdout without disturbing the byte-exact
   `syntax is ok` line, or the deliberate silence is recorded next to `run_verify` and in `docs/config.md`,
   pinned in both feature shapes.
+  Done (2026-10-02, this batch). Chose the report-to-stdout branch over recording the silence. `run_verify` now
+  loads through the new `load_server_config_with_presence_checked` (`frp-core/src/config/file.rs`, the server half
+  of the existing client twin, so the `--allow-unsafe` gate is preserved) and, on success, prints the
+  unhonoured-key records to **stdout** in front of the byte-exact line:
+  `unhonoured_server_feature_key_records()` (the same `Vec<String>` the run path warns with, now the single source
+  both read) followed by
+  `unhonoured_reader_gated_port_records(web_server_port_reader(), ssh_tunnel_gateway_bind_port_reader())`.
+  No `tracing` initialisation is added, so the run path's `tracing::warn!` calls still do not fire here — the
+  verify output is direct `println!`, and the `syntax is ok` line keeps its bytes and its place. Pinned by
+  `verify_prints_the_gated_listener_port_record_before_the_go_success_line` in `frps/tests/warn_delivery.rs`,
+  which asserts rc 0 and the whole stdout sequence (record line, then `frps: the configuration file <path>
+  syntax is ok`) in both build shapes. Mutants red, reverted green: M3-A deleting verify's record loop reds
+  `frps/tests/warn_delivery.rs:2405:5` with `left` = the success line alone; M3-B moving the same loop after the
+  success `println!` reds the same `frps/tests/warn_delivery.rs:2405:5` with the two lines swapped.
 
 - [ ] **Four comment cites name a line that does not support the claim they make (all already wrong at the pre-#455 base).**
   Filed by PR #455's adversarial (F-D) and verification (F1) reviews; the round's repoint was content-faithful, so
@@ -10134,3 +10191,51 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** `known_server_keys()` (and any client-side counterpart) is derived from, or checked against,
   the compiled field set — shown by a `--no-default-features` run in which `--strict-config` refuses a key it
   cannot honour, or the divergence is recorded as deliberate with a measurement on both feature shapes.
+
+- [ ] **A `path:line` cite in a live file is not machine-checked, so a change that inserts lines rots every cite into the file it touched.**
+
+  Filed by the `dsh/strict-keys-gated-port-readers` author while adding the reader-gated-port records to `frp-core/src/config/loader.rs`, `frp-core/src/config/tests.rs`, `frp-core/src/config/file.rs`, `frp-server/src/service.rs`, `frps/src/main.rs` and `frps/tests/warn_delivery.rs` (PR #461).
+
+  Evidence (measured, not estimated; base `b9af37c5` against that branch's head):
+  - A content-derived scan of the 100 live `path:line` cites into those seven files reported **75 whose cited base line is no longer the cited line at the head** — `frp-core/src/config/tests.rs` 24, `frps/tests/cli_exit_codes.rs` 13, `frps/tests/log_completion.rs` 9, `docs/developing.md` 8, `frps/src/main.rs` 5, then 2 each in `frps/tests/warn_delivery.rs`, `frp-core/src/logging.rs`, `frp-core/src/config/loader.rs`, `frp-core/src/cli.rs`, `docs/refactor-large-modules.md`, and 1 each in `frpc/tests/legacy_ini_fixture.rs`, `frpc/tests/admin_config_get_warning.rs`, `frp-server/tests/vhost_https_sni.rs`, `frp-server/tests/server_protocol.rs`, `frp-core/tests/server_tls_enable_warning.rs`, `docs/config.md`. Four more could not be resolved because their cited text repeats (`frp-core/src/config/tests.rs:8018`, `:14410`, `frps/tests/cli_exit_codes.rs:565`, `:1154`).
+  - Only `TODO.md:<n>` cites are gated: `scripts/tests/todo-cite-guard.sh` skips every in-source cite, and `scripts/repo-health.sh` performs no `path:line` validation for any file, so no CI job can see this class. The inserts one PR needs for one test shifted 75 unrelated cites.
+  - The moved live-doc cites were repaired by PR #461, but one of those repairs was itself an offset: the SIGTERM-shutdown cite was repointed to `frp-server/src/service.rs:1884`, which only repeats the base's `:1858` text inside the `FRP_WARNING_PIN_SABOTAGE` comment of `web_server_tls_enable_reader` — review round 1 re-derived it by content to `frp-server/src/service.rs:1107` (`// Spawn signal listener for graceful shutdown.`, the handler running to `shutdown_token.cancel()` at `:1145`). The rest were re-derived by content, base → head: `docs/developing.md` `frp-core/src/config/loader.rs:897`→`:1108`, `:898`→`:1109` (2× each), `:1193`→`:1404`, and `frps/src/main.rs:413`→`:437`, while the one other moved doc cite, `docs/config.md` `frp-core/src/config/file.rs:339-346`→`:353-360`, had already been repaired by PR #461's own code commit and was untouched by review round 1. The other 66 were deliberately left alone: several sit inside clap doc comments that render into the byte-exact `--help` output (`frp-core/src/cli.rs:754-755`) and others inside strings the CLI golden lanes compare byte-for-byte, so rewriting them means re-pinning those expectations in the same change.
+  - Second class, demonstrated by the same PR: a **bare `:NNN` shorthand inside a parenthetical** is invisible both to the scan above and to `scripts/tests/todo-cite-guard.sh` (which checks only `TODO.md:<n>`), so a correctly repaired absolute cite can sit beside a stale shorthand. Two were found and fixed in review round 1: `docs/developing.md:235`'s `(+ the message at `:905`)` (the proxy-type message is at `frp-core/src/config/loader.rs:1116`; head `:905` is the flat-`tls_enable` doc comment) and `docs/config.md:926`'s `(:368)` beside the repaired `frp-core/src/config/file.rs:353-360` (head `:368` is `None`; the include walk is `frp-core/src/config/file.rs:382`).
+
+  **Done-when:** either (a) a guard resolves every live `path:line` cite against the tree and fails on a moved line — with a fixture showing that a one-line insert reddens it, and with the point-in-time set (`TODO.md`, `CHANGELOG.md`, `docs/history/`, `docs/archive/`, `docs/audit/`, `performance-audit.md`, `docs/refactor-large-modules.md`) excluded the way `todo-cite-guard.sh` excludes it — or (b) the remaining 66 are re-derived by content and the `--help`/golden expectations they live in are re-pinned, measured by re-running the same scan and reporting 0 moved. A constant-offset fix does not close this: it proves only that one wrong offset was applied consistently.
+
+- [ ] **`cargo test -p frp-server --no-default-features --features dashboard --lib` is red at the base commit: a test demands a Go key that this shape compiles out.**
+
+  Filed by the `dsh/strict-keys-gated-port-readers` author (PR #461) while running that shape as a gate; not caused by that PR.
+
+  Evidence (measured; the two files that decide the outcome are byte-identical to the base):
+  - `cargo test -p frp-server --no-default-features --features dashboard --lib -j 2` → `test result: FAILED. 358 passed; 1 failed`, with `dashboard::v2::tests::test_serverinfo_go_shape` panicking at `frp-server/src/dashboard.rs:3064:17` (`missing Go key kcpBindPort`).
+  - `frp-server/src/dashboard.rs:3044-3062` demands the full Go key set including `kcpBindPort` and `quicBindPort`, while the response field at `frp-server/src/dashboard.rs:252-254` carries `#[cfg(feature = "kcp")]` (and `:1648-1650` the `quic` twin), so neither key can exist in a build without that feature; the fixture is `frp_core::config::ServerConfig::default()` (`frp-server/src/dashboard.rs:2953`).
+  - Pre-existing, measured at the base commit: `git worktree add --detach /private/tmp/batch-q-base b9af37c5` + `CARGO_TARGET_DIR=/private/tmp/tgt-basecheck cargo test -p frp-server --no-default-features --features dashboard --lib -j 2 -- dashboard::v2::tests::test_serverinfo_go_shape` → `FAILED. 0 passed; 1 failed; 356 filtered out`, the same `missing Go key kcpBindPort` panic at `frp-server/src/dashboard.rs:3064:17` (cold build, 1 m 52 s, macOS arm64, `-j 2`). The file-identity check agrees: `git diff b9af37c5 -- frp-server/src/dashboard.rs frp-core/src/config/server.rs` is empty, and `git show b9af37c5:frp-server/src/dashboard.rs` carries the same ungated key list. CI never runs the lane unfiltered — `.github/workflows/ci.yml:1533`, `:1541` and `:1559` run `-p frp-server --no-default-features --features dashboard --lib` with a `web_server_tls_enable_reader` filter, so this test is filtered out of every job that uses that shape.
+
+  **Done-when:** that shape is green — either the test's Go-key list is `#[cfg]`-gated on the features this build compiles in (leaving the full list for the default-feature lane) or the lane is declared unsupported with the reason recorded next to it — and `.github/workflows/ci.yml` runs it without a filter at least once, so the shape is covered rather than assumed.
+
+- [ ] **The A/B throughput gate fires on changes with no runtime code, so a red gate on `main` is not evidence of a regression.**
+
+  Filed by the coordinator after the 2026-10-02 daily scheduled run.
+
+  Evidence (one run, primary sources):
+  - `.github/workflows/ab-matrix.yml` runs `main~1` vs `main` on the dedicated VPS (job `ab-matrix`), daily at `cron: '30 4 * * *'`; the job fails if any configuration regresses by more than `GATE_PCT` (default `5`, `.github/workflows/ab-matrix.yml:50`/`scripts/ab-matrix.sh:50`).
+  - Run `36996762744` (event `schedule`, head `ae7bf50d`) failed: `A/B GATE FAILED: one or more configs regressed more than 5% (before -> after)`, with `encrypt_compress` `18.0 -> 15.2 = -15.6% REGRESSED`. The full table from the same run: `plain 11.4 -> 18.1 +58.8 pass`, `encrypt 17.9 -> 19.8 +10.6 pass`, `compress 18.6 -> 24.2 +30.1 pass`, `encrypt_compress 18.0 -> 15.2 -15.6 REGRESSED`, `mux 19.9 -> 23.6 +18.6 pass`, `tls 8.8 -> 8.4 -4.5 pass`.
+  - The gated delta is `97a03884` (base) -> `ae7bf50d` (head) = PR #459, whose entire non-records change is `scripts/large-functions.sh` (a Python analysis script that no shipped binary loads). `git diff --name-only 97a03884 ae7bf50d -- '*.rs' 'Cargo*.toml'` is empty. So the -15.6% cannot be a real regression: the gate's noise floor exceeds its 5% threshold, in the same run that reported +58.8% on another configuration.
+  - The confirm loop does not save it: `measure_pair` re-measures up to `CONFIRM_RETRIES` (default 2) times but keeps the **most negative** delta (`scripts/ab-matrix.sh:207-219`: `if python3 -c "… ($ndelta < $delta) …"`), i.e. the worst of up to three samples. Selecting the minimum of N noisy samples is a biased estimator and inflates the false-positive rate; there is no median/mean, no variance estimate, and no per-config confidence bound.
+  - This gate also cannot block anything: PR runs are deliberately skipped (`.github/workflows/ab-matrix.yml:10-17`), the workflow has no `push` trigger, and nothing in `ci.yml`/branch protection depends on it (`gh api /repos/viogus/frp-rs/branches/main/protection` -> 404 "Branch not protected"). A red A/B gate is therefore *only* discovered after the fact, on `main`, in a scheduled run.
+  - The same noise class is already documented in-tree for the retired PR mode (`.github/workflows/ab-matrix.yml:12-14`: identical binaries measured `tls -35.1% / -27.9% / +24.5%` across three attempts), but the daily `main~1` vs `main` gate still fails on it.
+
+  **Done-when:** either (a) the gate can no longer red on a delta that contains no shipped-code change — measured, not asserted: take the recorded failure above as the reproduction and show the new rule green on it (e.g. skip/annotate when `git diff <before> <after> -- '*.rs' 'Cargo*.toml' 'crates/**'` is empty, plus a comment saying so) — or (b) the statistic is replaced by one with a quantified false-positive rate: report the per-config sample distribution (N >= 3 repeats, median and spread) and set `GATE_PCT`/the confirm rule from it, so a published measurement shows the observed -15.6%-style spread no longer reds the gate. Whatever is chosen, record in the item's Done paragraph the run id, the table, and the commands used; a run that merely "passed once" is not evidence. If the honest conclusion is that the VPS is too noisy to gate anything, say so with numbers and record the decision to demote the gate to informational (with the reason), rather than leaving a gate that turns `main` red at random.
+
+- [ ] **A listener port whose reader is compiled out is silently accepted when the flag comes from the command line instead of the file.**
+
+  Filed by the `dsh/strict-keys-gated-port-readers` author in PR #461's review round 1, from the adversarial reviewer's finding. A pre-existing scope boundary, not a regression of that PR: its Done-when is phrased over the two config *keys*, and the flag path was never in scope.
+
+  Evidence (measured at that branch's head `d3725da1`, re-measured at `7fa54cf1`, macOS arm64, `-j 2`; every row uses the default-features `frps` = `frp-server/dashboard` off unless the row says otherwise):
+  - The **file key** is reported. With `bind_port = 19732` + `auth.token = "f7-secret"` + `[web_server] port = 7500` in the file, `frps -c t_file.toml` prints exactly one record — `WARN frp_core::config::loader: web_server.port has no effect: this build has no dashboard support, so nothing reads the key and no dashboard listener is bound` — and SIGTERM exits 0.
+  - The **flag** is not. `frps --dashboard-port 7500` with no `-c` and no `--config-dir`, in a directory whose `frps.toml` carries `bind_port = 19782` + `auth.token` and no `[web_server] port`, exits 0 on SIGTERM with **zero** records (re-measured at `7fa54cf1`); the same binary and file with a bare `--bind-port 19999` starts on `0.0.0.0:19999`, not the file's `19782`, so the override lane is live and the flag really does reach `cfg.web_server.port`. What never sees it is the report: it reads `ConfigPresence`, which the loader fills from the *normalized file* (`frp-core/src/config/loader.rs:734-737`; `frp-core/src/config/normalize.rs:665`), while the overlay runs after the load (`FrpsArgs::override_server_config` sets `cfg.web_server.port = v`, `frp-core/src/cli.rs:5195`) at its only production call site (`frps/src/main.rs:1061`), so the applied port cannot re-enter the presence record. `--dashboard-port int  dashboard port` is advertised on every shape (`frp-core/src/cli.rs:9705`, `:9765`). The complementary half is exact: on a `--features dashboard` build the bare form is honoured — re-measured at `7fa54cf1`, `Dashboard web UI starting on 127.0.0.1:7599` — while the same flag with `--config-dir` logs no dashboard line at all, i.e. the same discard as the `--bind-port` control above.
+  - Neither `-c` nor `--config-dir` is evidence: `cli_overrides_enabled()` is `self.config.is_none() && self.config_dir.is_none()` (`frp-core/src/cli.rs:5095-5096`), so either flag makes the overlay be skipped and the CLI config flag is never applied (Go v0.70.1 parity — `frp-core/src/cli.rs:547-548`). Measured: `frps --config-dir dir --bind-port 19999` still starts on the file's `19782`, i.e. the flag is discarded, not applied; the `--config-dir` branch returns at `frps/src/main.rs:1016` and never reaches the only production `override_server_config` call at `frps/src/main.rs:1061` (`frp-core/src/cli.rs:5993-5994` asserts `!with_dir.cli_overrides_enabled()`).
+
+  **Done-when:** either the CLI override is covered — the completion/overlay step records the unhonoured reader-gated ports it applies, and the record fires in every shape that advertises the flag — or the boundary is recorded next to `run_verify` and in `docs/config.md` and pinned in each build shape. Silently accepting a flag the build cannot honour is the same class `TODO.md:10033` closed for the file.

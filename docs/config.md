@@ -96,7 +96,7 @@ discarded whole).
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
 | `addr` | `string` | `"127.0.0.1"` | `webServer.addr` | Dashboard bind address. An empty string is completed to `127.0.0.1` (Go's `WebServer.Complete()`); write `"0.0.0.0"` to bind every interface. |
-| `port` | `u16` | `0` | `webServer.port` | Dashboard port. 0 = disabled. |
+| `port` | `u16` | `0` | `webServer.port` | Dashboard port. 0 = disabled. **Reader-feature gap:** the field deserializes in every build, but only a `frps` built with the `frp-server/dashboard` feature binds it. In a build without that feature (`tiny`/`micro`, and the default tier — dashboard is opt-in) a non-zero port is still accepted and then **silently ignored**; the loader reports it once per load (`web_server.port has no effect: this build has no dashboard support, …`) from the `-c`/`--config-dir` startup paths and from a `SIGUSR1` reload, and `frps verify` prints the same record to stdout before its `syntax is ok` line. A build that *does* honour the port stays silent — a warning there would be a false record. `0`, an absent key and the legacy-`.ini` zero spellings (`+0`, `00`, `"0"`) are never a request. |
 | `user` | `string` | `""` | `webServer.user` | Basic Auth username for dashboard and management API. |
 | `password` | `string` | `""` | `webServer.password` | Basic Auth password for dashboard and management API. |
 | `enable_prometheus` | `bool` | `false` | `webServer.enablePrometheus` | Expose `/metrics` endpoint in Prometheus text format. |
@@ -129,7 +129,7 @@ connection is requested).
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
-| `bind_port` | `u16` | `0` | `sshTunnelGateway.bindPort` | SSH listen port. 0 = disabled. |
+| `bind_port` | `u16` | `0` | `sshTunnelGateway.bindPort` | SSH listen port. 0 = disabled. **Reader-feature gap:** the field deserializes in every build, but only a `frps` built with the `frp-server/ssh` feature binds it. In a build without that feature (`tiny`/`micro`; `ssh` is on in the default and full tiers) a non-zero port is still accepted and then **silently ignored**; the loader reports it once per load (`ssh_tunnel_gateway.bind_port has no effect: this build has no SSH tunnel gateway support, …`) from the `-c`/`--config-dir` startup paths and from a `SIGUSR1` reload, and `frps verify` prints the same record to stdout before its `syntax is ok` line. A build that *does* honour the port stays silent. `0`, an absent key and the legacy-`.ini` zero spellings (`+0`, `00`, `"0"`) are never a request. |
 | `bind_addr` | `string` | `"0.0.0.0"` | `sshTunnelGateway.bindAddr` | SSH listen address. |
 | `private_key_file` | `string` | `""` | `sshTunnelGateway.privateKeyFile` | Path to SSH host private key file. Auto-generated if empty and `auto_gen_private_key_path` does not exist. |
 | `auto_gen_private_key_path` | `string` | `"./.autogen_ssh_key"` | `sshTunnelGateway.autoGenPrivateKeyPath` | Path where auto-generated SSH host key is written. |
@@ -922,8 +922,8 @@ loader modes and pinned in `frp-core/src/config/tests.rs`.
 `[common] includes = "<file>"` **is** expanded now, as Go expands it
 (`pkg/config/legacy/client.go:166,172-200`): `process_includes` runs before the `[common]` hoist, so the
 client `.ini` loader takes that string key out of the raw `[common]` table while it is still visible
-(`frp-core/src/config/file.rs:339-346`) and appends it to the include walk ahead of the top-level
-spellings (`:368`). Measured with `frpc verify -c`: `x12_good.ini` (`[common] includes` naming a file that
+(`frp-core/src/config/file.rs:353-360`) and appends it to the include walk ahead of the top-level
+spellings (`frp-core/src/config/file.rs:382`). Measured with `frpc verify -c`: `x12_good.ini` (`[common] includes` naming a file that
 holds one `[p1]` proxy) is rc 0 on Go and now rc 0 with `Proxies: 1` here, where nothing was loaded
 before; `x12_missing.ini` (an include under a nonexistent directory) is Go rc 1 `include: directory of …
 not exist` and now rc 1 here, where it was rc 0. The pins are

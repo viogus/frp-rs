@@ -579,6 +579,215 @@ fn feature_gated_server_field_set_matches_the_pinned_scope() {
     );
 }
 
+// ─── The reader-gated listener ports (every build shape) ────────────────
+//
+// `web_server.port` and `ssh_tunnel_gateway.bind_port` are **unconditional**
+// `ServerConfig` fields, so serde accepts both keys in every build; the only
+// readers live in `frp-server` (its `dashboard` and `ssh` features). A build
+// without the reader loads the file and then silently binds nothing, so
+// `ConfigPresence` records the fact unconditionally and the **caller's**
+// [`ListenerPortReader`] decides whether a record is emitted — that split is
+// what keeps the warning off in the shapes that *do* bind the port (see
+// `frp-server/src/service.rs`, which owns both answers).
+
+/// The `.ini` twin of [`load_server_with_presence`]: same entry point, but the
+/// file is `frps.ini` so the extension selects the INI reader. Strict mode, as
+/// above.
+fn load_server_ini_with_presence(body: &str) -> (ServerConfig, ConfigPresence) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frps.ini");
+    std::fs::write(&path, body).unwrap();
+    load_server_config_uncompleted_with_presence(path.to_str().unwrap(), true)
+        .unwrap_or_else(|e| panic!("strict mode must load this:\n{e}\nbody:\n{body}"))
+}
+
+/// `web_server.port` presence, in both section spellings, through `[common]`,
+/// and via both legacy flat keys — normalize rewrites all of them into
+/// `web_server.port` (`legacy_web_server_keys` for `dashboard_port`,
+/// `flatten_to_table` for `web_server_port`, `merge_section_into` for
+/// `[webServer]`) *before* the presence read, so one check covers every
+/// spelling. A check that read the raw table would miss three of these four.
+#[test]
+fn reader_gated_web_server_port_presence_is_recorded_in_every_build() {
+    for body in [
+        "bind_port = 7000\n[web_server]\nport = 7500\n".to_string(),
+        "bind_port = 7000\n[webServer]\nport = 7501\n".to_string(),
+        "bind_port = 7000\n[common]\nweb_server_port = 7502\n".to_string(),
+        "bind_port = 7000\ndashboard_port = 7503\n".to_string(),
+    ] {
+        let (_cfg, presence) = load_server_with_presence(&body);
+        assert!(presence.web_server_port_unhonoured, "body:\n{body}");
+    }
+}
+
+/// `0` and an absent key are the documented "disabled" value in every build
+/// shape — a capable reader gates on `> 0` too — so a written zero asks for no
+/// listener and must not be recorded. (The legacy-`.ini` zero *spellings* are
+/// covered separately below.)
+#[test]
+fn reader_gated_web_server_port_zero_or_absent_is_silent_in_every_build() {
+    for body in [
+        "bind_port = 7000\n",
+        "bind_port = 7000\n[web_server]\nport = 0\n",
+        "bind_port = 7000\n[webServer]\nport = 0\n",
+        "bind_port = 7000\n[common]\nweb_server_port = 0\n",
+        "bind_port = 7000\ndashboard_port = 0\n",
+    ] {
+        let (_cfg, presence) = load_server_with_presence(body);
+        assert!(!presence.web_server_port_unhonoured, "body:\n{body}");
+    }
+}
+
+/// The `ssh_tunnel_gateway.bind_port` twin: the snake section and the
+/// `sshTunnelGateway`/`bindPort` Go spellings both reach the one normalized
+/// table (`server.rs` aliases and `normalize_server_config` rename it).
+#[test]
+fn reader_gated_ssh_tunnel_gateway_bind_port_presence_is_recorded_in_every_build() {
+    for body in [
+        "bind_port = 7000\n[ssh_tunnel_gateway]\nbind_port = 7600\n",
+        "bind_port = 7000\n[sshTunnelGateway]\nbindPort = 7601\n",
+    ] {
+        let (_cfg, presence) = load_server_with_presence(body);
+        assert!(
+            presence.ssh_tunnel_gateway_bind_port_unhonoured,
+            "body:\n{body}"
+        );
+    }
+}
+
+/// The `ssh_tunnel_gateway.bind_port` twin of
+/// [`reader_gated_web_server_port_zero_or_absent_is_silent_in_every_build`].
+#[test]
+fn reader_gated_ssh_tunnel_gateway_bind_port_zero_or_absent_is_silent_in_every_build() {
+    for body in [
+        "bind_port = 7000\n",
+        "bind_port = 7000\n[ssh_tunnel_gateway]\nbind_port = 0\n",
+        "bind_port = 7000\n[sshTunnelGateway]\nbindPort = 0\n",
+    ] {
+        let (_cfg, presence) = load_server_with_presence(body);
+        assert!(
+            !presence.ssh_tunnel_gateway_bind_port_unhonoured,
+            "body:\n{body}"
+        );
+    }
+}
+
+/// The record list is empty for a reader the build **has**, and names only the
+/// keys it cannot honour otherwise.
+///
+/// This is the frp-core half of the "warning must not fire where the feature is
+/// on" pin: `unhonoured_reader_gated_port_records(Present, Present)` is `[]`, so
+/// a list that ignored the reader (the always-warn mutation) reds the first
+/// assertion. The frp-server half is
+/// `web_server_port_reader_answers_from_this_build`.
+#[test]
+fn reader_gated_port_records_follow_the_readers_the_caller_reports() {
+    use super::ListenerPortReader::{Absent, Present};
+
+    let body = "bind_port = 7000\n[web_server]\nport = 7500\n\
+                [ssh_tunnel_gateway]\nbind_port = 7600\n";
+    let (_cfg, presence) = load_server_with_presence(body);
+
+    assert!(
+        presence
+            .unhonoured_reader_gated_port_records(Present, Present)
+            .is_empty(),
+        "a build that honours both ports must emit no record: {:?}",
+        presence.unhonoured_reader_gated_port_records(Present, Present)
+    );
+    assert_eq!(
+        presence.unhonoured_reader_gated_port_records(Absent, Absent),
+        vec![
+            WEB_SERVER_PORT_UNHONOURED_WARNING,
+            SSH_TUNNEL_GATEWAY_BIND_PORT_UNHONOURED_WARNING,
+        ]
+    );
+    assert_eq!(
+        presence.unhonoured_reader_gated_port_records(Absent, Present),
+        vec![WEB_SERVER_PORT_UNHONOURED_WARNING]
+    );
+    assert_eq!(
+        presence.unhonoured_reader_gated_port_records(Present, Absent),
+        vec![SSH_TUNNEL_GATEWAY_BIND_PORT_UNHONOURED_WARNING]
+    );
+}
+
+/// The legacy-`.ini` zero spellings, as a **request** question only (this is the
+/// reader-gated pair, which compiles in every shape — the three `frp-core`-gated
+/// ports are covered by the `#[cfg]` test below).
+///
+/// The `.ini` reader keeps a numeric literal that does not round-trip through
+/// both renderers as a string (`frp-core/src/config/format.rs`,
+/// `infer_ini_value_depth`), and `ini_lenient` reads a numeric target back as
+/// base-10 (`frp-core/src/config/ini_lenient.rs`). So `+0`, `00` and `"0"` mean
+/// the **same** "disabled" as a bare `0`: every build honours them identically,
+/// and warning about one would be a false record — the defect the widened
+/// `port_value_requests_a_listener` closes.
+#[test]
+fn ini_zero_spellings_are_not_requests_for_the_reader_gated_ports() {
+    for value in ["0", "+0", "00", "\"0\""] {
+        let web = format!("bind_port = 7000\n[web_server]\nport = {value}\n");
+        let (_cfg, presence) = load_server_ini_with_presence(&web);
+        assert!(
+            !presence.web_server_port_unhonoured,
+            "`{value}` is a zero/disabled spelling; body:\n{web}"
+        );
+
+        let ssh = format!("bind_port = 7000\n[ssh_tunnel_gateway]\nbind_port = {value}\n");
+        let (_cfg, presence) = load_server_ini_with_presence(&ssh);
+        assert!(
+            !presence.ssh_tunnel_gateway_bind_port_unhonoured,
+            "`{value}` is a zero/disabled spelling; body:\n{ssh}"
+        );
+    }
+}
+
+/// The positive control for the rule above: a value that **does** ask for a
+/// listener must still be recorded. `007` and `+5` are strings to the `.ini`
+/// reader and parse to a non-zero integer, so a rule that treated every
+/// non-integer as "not a request" would drop them and red here.
+#[test]
+fn ini_nonzero_listener_port_spellings_still_request_a_listener() {
+    for value in ["007", "+5", "7500"] {
+        let web = format!("bind_port = 7000\n[web_server]\nport = {value}\n");
+        let (_cfg, presence) = load_server_ini_with_presence(&web);
+        assert!(
+            presence.web_server_port_unhonoured,
+            "`{value}` asks for a listener; body:\n{web}"
+        );
+
+        let ssh = format!("bind_port = 7000\n[ssh_tunnel_gateway]\nbind_port = {value}\n");
+        let (_cfg, presence) = load_server_ini_with_presence(&ssh);
+        assert!(
+            presence.ssh_tunnel_gateway_bind_port_unhonoured,
+            "`{value}` asks for a listener; body:\n{ssh}"
+        );
+    }
+}
+
+/// The per-spelling pin for the three `frp-core`-gated ports themselves.
+///
+/// `port_requested` only compiles where at least one of `kcp`/`quic`/`websocket`
+/// is off, which is the `.github/workflows/ci.yml`
+/// `cargo test -p frp-core --no-default-features --all-targets` lane. The
+/// assertion goes through [`ConfigPresence::unhonoured_server_feature_key_records`]
+/// rather than the per-feature flags so it compiles in every shape where this
+/// test is enabled, including a partial `--features` selection.
+#[cfg(not(all(feature = "kcp", feature = "quic", feature = "websocket")))]
+#[test]
+fn ini_zero_spellings_do_not_warn_for_the_gated_listener_ports() {
+    for value in ["0", "+0", "00", "\"0\""] {
+        for key in ["kcp_bind_port", "quic_bind_port", "websocket_port"] {
+            let body = format!("[common]\nbind_port = 7000\n{key} = {value}\n");
+            let (_cfg, presence) = load_server_ini_with_presence(&body);
+            assert!(
+                presence.unhonoured_server_feature_key_records().is_empty(),
+                "`{key} = {value}` is a zero/disabled spelling; body:\n{body}"
+            );
+        }
+    }
+}
+
 #[test]
 fn test_go_format_client_with_plugin_toml() {
     let toml_str = r#"

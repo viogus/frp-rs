@@ -2303,7 +2303,7 @@ jobs:
         # `--config-dir` lane's own residue round grew this file to 16 tests;
         # round 3's `a_config_dir_sigusr1_does_not_count_a_panicking_service`
         # grew it to 17 (a panicking task must leave the SIGUSR1 registry), so
-        # both `frps` warn_delivery steps assert 28;
+        # both `frps` warn_delivery steps assert 31;
         # the historical 7-test falsification above is unchanged.)
         shell: bash
         run: |
@@ -2312,25 +2312,25 @@ jobs:
           cargo test -p frps --features dashboard --test warn_delivery --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           n=$(cargo test -p frps --features dashboard --test warn_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
-          n_floor=28
+          n_floor=31
           status=0
           grep -q "Running tests/warn_delivery.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 28 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "28" ] || status=1
+          grep -q "test result: ok. 31 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "31" ] || status=1
           [ "$n" -ge "$n_floor" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frps warning-delivery guard failed (status=$status, file=$n, log=$log)"
-            if [ -n "$n" ] && [ "$n" != "28" ]; then
-              if [ "$n" -lt "28" ]; then
-                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 28 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
+            if [ -n "$n" ] && [ "$n" != "31" ]; then
+              if [ "$n" -lt "31" ]; then
+                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 31 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
               else
-                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 28: move the single literal in this shell step from 28 to $n"
+                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 31: move the single literal in this shell step from 31 to $n"
               fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frps warning-delivery guard ok: $n tests listed (expected 28, floor 28), 0 failed"
+          echo "frps warning-delivery guard ok: $n tests listed (expected 31, floor 31), 0 failed"
       - name: Run frps' `web_server.tls.enable` warning-delivery tests without the dashboard feature
         # The **other direction** of the step above. `frps --features dashboard`
         # answers with the dashboard clause; the *default* `frps` artifact
@@ -2340,7 +2340,7 @@ jobs:
         # dashboard`, so without this step a call site that hardcoded the
         # dashboard answer — or the literal `true` — was green everywhere, even
         # though the binary then printed a dashboard clause for a listener it
-        # cannot build. Same 28 tests and the same count guard as the step above;
+        # cannot build. Same 31 tests and the same count guard as the step above;
         # it costs no extra build, because the `cli_exit_codes` step already
         # built this default-feature artifact.
         shell: bash
@@ -2350,25 +2350,25 @@ jobs:
           cargo test -p frps --test warn_delivery --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           n=$(cargo test -p frps --test warn_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
-          n_floor=28
+          n_floor=31
           status=0
           grep -q "Running tests/warn_delivery.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 28 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "28" ] || status=1
+          grep -q "test result: ok. 31 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "31" ] || status=1
           [ "$n" -ge "$n_floor" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frps warning-delivery guard failed without the dashboard feature (status=$status, file=$n, log=$log)"
-            if [ -n "$n" ] && [ "$n" != "28" ]; then
-              if [ "$n" -lt "28" ]; then
-                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 28 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
+            if [ -n "$n" ] && [ "$n" != "31" ]; then
+              if [ "$n" -lt "31" ]; then
+                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 31 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
               else
-                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 28: move the single literal in this shell step from 28 to $n"
+                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 31: move the single literal in this shell step from 31 to $n"
               fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frps no-dashboard warning-delivery guard ok: $n tests listed (expected 28, floor 28), 0 failed"
+          echo "frps no-dashboard warning-delivery guard ok: $n tests listed (expected 31, floor 31), 0 failed"
       - name: Run frpc's `web_server.tls.enable` warning-delivery spawn tests
         # The client half of the step above: `frpc/tests/warn_delivery.rs` pins
         # that the record reaches a `frpc -c` / `frpc --config-dir` user, in both
@@ -2758,7 +2758,7 @@ jobs:
   # 2-core GitHub runner would be slower still. So this lane does not try to
   # build every target in release. It covers the targets that *need* the shipped
   # profile instead: `cli_exit_codes` (the three `debug_assertions`-gated signal
-  # pins above) and `warn_delivery` (28 spawn tests against a release-built
+  # pins above) and `warn_delivery` (31 spawn tests against a release-built
   # `env!("CARGO_BIN_EXE_frps")` — the profile `build` uploads but never
   # executes; two of its tests drive `debug_assertions`-only hooks, so they
   # carry the same `#[cfg_attr(not(debug_assertions), ignore = "…")]` shape and
@@ -2783,19 +2783,19 @@ jobs:
       FRPS_RELEASE_CLI_IGNORED: "config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorded_request config_dir_recorded_signal_fans_out_to_an_already_registered_service config_dir_where_every_task_panics_exits_nonzero"
       # The second *guarded* release target (item `TODO.md:9315`). The debug
       # pairing lanes (`Run frps' web_server.tls.enable warning-delivery spawn
-      # tests` and its no-dashboard sibling) pin the same 28 listed tests;
+      # tests` and its no-dashboard sibling) pin the same 31 listed tests;
       # in release two of them report `ignored`, because they need the
       # `debug_assertions`-only `FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS` /
       # `FRPS_CFGDIR_TEST_PANIC` hooks in `frps/src/main.rs` and carry
       # `#[cfg_attr(not(debug_assertions), ignore = "…")]` — the same release-only
       # skip shape `FRPS_RELEASE_CLI_IGNORED` pins above. `-- --list` still lists
-      # all 28 in release, so `_TESTS` is the *listed* count while
+      # all 31 in release, so `_TESTS` is the *listed* count while
       # `_PASSED_FLOOR` guards the executed one: a delete-plus-lower edit has to
       # move the listed literal *and* the passed floor, and a test that quietly
       # became `ignored` trips the sorted-set comparison in the step.
-      FRPS_RELEASE_WARN_DELIVERY_TESTS: "28"
-      FRPS_RELEASE_WARN_DELIVERY_TESTS_FLOOR: "28"
-      FRPS_RELEASE_WARN_DELIVERY_PASSED_FLOOR: "26"
+      FRPS_RELEASE_WARN_DELIVERY_TESTS: "31"
+      FRPS_RELEASE_WARN_DELIVERY_TESTS_FLOOR: "31"
+      FRPS_RELEASE_WARN_DELIVERY_PASSED_FLOOR: "29"
       # Exactly these two and no more: the test function names, in file order
       # (the step sorts both sides), that carry the release-only skip in
       # `frps/tests/warn_delivery.rs`.

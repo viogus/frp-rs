@@ -427,6 +427,26 @@ pub const fn web_server_tls_enable_reader() -> frp_core::config::WebServerTlsEna
     )
 }
 
+/// Whether **this crate** compiles the reader of `web_server.port` — the
+/// `dashboard` feature (`frp-server/src/dashboard.rs`, spawned from
+/// `Service::new` / `Service::run` when the port is non-zero).
+///
+/// The field is unconditional in `frp-core`'s `ServerConfig`, so `frp-core`
+/// cannot tell an honoured port from an inert one; this crate can. The answer is
+/// handed to `ConfigPresence::warn_inert_web_server_port`, which emits the
+/// "nothing reads the key" record only for `Absent`. A binary-local `cfg!` would
+/// be wrong for the same reason as [`web_server_tls_enable_reader`]'s.
+pub const fn web_server_port_reader() -> frp_core::config::ListenerPortReader {
+    frp_core::config::ListenerPortReader::from_features(cfg!(feature = "dashboard"))
+}
+
+/// The `ssh_tunnel_gateway.bind_port` twin of [`web_server_port_reader`]: this
+/// crate's `ssh` feature gates the SSH gateway listener
+/// (`frp-server/src/service.rs`, `if self.cfg.ssh_tunnel_gateway.bind_port > 0`).
+pub const fn ssh_tunnel_gateway_bind_port_reader() -> frp_core::config::ListenerPortReader {
+    frp_core::config::ListenerPortReader::from_features(cfg!(feature = "ssh"))
+}
+
 /// Spawn a boxed future with type erasure. Reduces binary size by
 /// preventing monomorphization of `tokio::spawn` for every concrete
 /// future type — the unsizing coercion from `Pin<Box<ConcreteFut>>`
@@ -1555,6 +1575,12 @@ impl Service {
         // `micro`/`tiny` config still cannot open the port, so the record is one
         // per load — a reload adds one rather than replacing the startup record.
         presence.warn_unhonoured_server_feature_keys();
+        // The two listener ports whose field *is* present but whose reader is
+        // not: `web_server.port` (dashboard) and `ssh_tunnel_gateway.bind_port`
+        // (ssh). Same one-record-per-load rule; a reload that starts naming one
+        // of them adds a record rather than replacing the startup one.
+        presence.warn_inert_web_server_port(web_server_port_reader());
+        presence.warn_inert_ssh_tunnel_gateway_bind_port(ssh_tunnel_gateway_bind_port_reader());
 
         let mut changes: Vec<String> = Vec::new();
 
@@ -1887,5 +1913,62 @@ mod tests {
         // `WebServerTlsEnableReader`'s `Debug` text, so a legitimate variant
         // rename reddened the step for a reason its message could not diagnose.
         println!("web-server-tls-enable-reader-pin: assertions ran");
+    }
+
+    /// Pin which `web_server.port` answer this build's resolver gives.
+    ///
+    /// `web_server.port` is an **unconditional** field of `frp-core`'s
+    /// `ServerConfig`, so serde always accepts the key; only this crate's
+    /// `dashboard` feature reads it. A resolver that hard-coded either variant
+    /// would either warn in a build that honours the port (dashboard on) or stay
+    /// silent in every shipped build (dashboard off) — the two directions the
+    /// real-binary rows in `frps/tests/warn_delivery.rs` cover. The
+    /// `dashboard`-off half runs in the default-feature `-p frp-server` lanes
+    /// (`.github/workflows/ci.yml:1496` `--features vnet --lib`, `:3191`
+    /// `--no-default-features --all-targets -j 1`; `ssh` is on in the first and
+    /// off in the second, covering the `ssh_tunnel_gateway.bind_port` twin too)
+    /// and the `dashboard`-on half in the unfiltered `:3022`
+    /// (`-p frp-server --features dashboard -j 1`). The
+    /// `--no-default-features --features dashboard --lib` lane at `:1533`
+    /// filters by `web_server_tls_enable_reader`, so it does **not** run these
+    /// pins.
+    #[test]
+    fn web_server_port_reader_answers_from_this_build() {
+        use frp_core::config::ListenerPortReader::{Absent, Present};
+
+        let got = web_server_port_reader();
+        let want = if cfg!(feature = "dashboard") {
+            Present
+        } else {
+            Absent
+        };
+        assert_eq!(
+            got, want,
+            "web_server.port's reader is this crate's `dashboard` feature"
+        );
+        // The assertion has to be able to fail: if a rename ever made the two
+        // variants compare equal, `assert_eq!` above would hold vacuously.
+        assert_ne!(Present, Absent);
+        println!("web-server-port-reader-pin: assertions ran");
+    }
+
+    /// The `ssh_tunnel_gateway.bind_port` twin of
+    /// [`web_server_port_reader_answers_from_this_build`].
+    #[test]
+    fn ssh_tunnel_gateway_bind_port_reader_answers_from_this_build() {
+        use frp_core::config::ListenerPortReader::{Absent, Present};
+
+        let got = ssh_tunnel_gateway_bind_port_reader();
+        let want = if cfg!(feature = "ssh") {
+            Present
+        } else {
+            Absent
+        };
+        assert_eq!(
+            got, want,
+            "ssh_tunnel_gateway.bind_port's reader is this crate's `ssh` feature"
+        );
+        assert_ne!(Present, Absent);
+        println!("ssh-tunnel-gateway-bind-port-reader-pin: assertions ran");
     }
 }
