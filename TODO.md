@@ -6077,7 +6077,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `GIT_OBJECT_DIRECTORY`/`GIT_TRACE*` stripped), falling back to a filesystem walk with no `.git`, and it
   does **not** match the cited item's title to the citing sentence — a text match cannot establish intent, so
   the enforced property is "the cite lands on an item header, and every cite is checkable".
-  `scripts/tests/todo-cite-guard-fixtures.sh` drives it against synthetic trees: **57 checks, all green**,
+  `scripts/tests/todo-cite-guard-fixtures.sh` drives it against synthetic trees: **60 checks, all green**,
   including eleven red-path canaries (a mid-item cite, a past-EOF cite, a blank-line cite, a malformed cite, an
   empty scan, a floor of 0, a cite to a header-shaped **fenced** line, the three previously uncounted cite
   shapes — missing number, space before the colon, number wrapped onto the next line — and a failing
@@ -6119,7 +6119,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     demonstration that the rule is live.
   * **F3 — the `git ls-files` rc guard had no fixture.** Added: a `.git` whose gitdir does not exist makes git
     exit non-zero and the gate must refuse (`git ls-files failed … refusing to certify a partial tree`), not
-    fall back to the filesystem walk. The three new groups take the fixture suite from 40 to **57 checks**, and
+    fall back to the filesystem walk. The three new groups take the fixture suite from 40 to **60 checks**, and
     the `health` step's literals and its pinned canary list (now 11 probes) moved with it.
   * **F4 — records said "closes" while the box was still open.** This item is now flipped to `- [x]`; the
     ledger pair moved from the rebase base `766ae978`'s 19 open / 197 closed to **18 open / 198 closed**.
@@ -6146,7 +6146,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   * **V4 — point-in-time is 85 occurrences at the base and 86 at this head** (devlog 49, `TODO.md` 26,
     `CHANGELOG.md` 10, archive plan 1), not "84 untouched".
   * **V5 — the insertion's shift is +50 lines** (`TODO.md` diff 50 insertions / 0 deletions; the `## P1`
-    header moved `6040`→`6090`), not a flat +48.
+    header moved `6040`→`6158`), not a flat +48.
   * **V3/F4 (from the same review) — the item is closed and the pair is measured:** base `766ae978`
     **19 open / 197 closed** → this head **18 open / 198 closed**, both counted with
     `grep -cE '^- \[ \]' TODO.md` and `grep -cE '^- \[x\]' TODO.md`.
