@@ -1310,7 +1310,10 @@ User-facing release notes for frp-rs.
   `cfg_attr(not(debug_assertions), ignore = "…")` shape as the `cli_exit_codes` pins, and the lane pins the
   28-listed / 26-passed / 2-ignored shape by name. A cold `--release --workspace --all-targets` build measured
   35m 55s at `-j 2` — over that job's 30-minute budget — so the decision to cover the pinned targets rather than
-  every target is recorded, with the measurement, in the workflow comment.
+  every target is recorded, with the measurement, in the workflow comment. The citation gate's expected count is now
+  declared once (`guard_cites` / `guard_cites_floor`) instead of three copies that had gone stale — three copies of
+  `84` left `health` red while the gate checked 87 — and the release `cli_exit_codes` lane gained the last missing
+  floor, so every count guard in the file now asserts an absolute floor beside its exact count.
 
 ## v0.71.0 — re-release (2026-09-13)
 

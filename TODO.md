@@ -8842,9 +8842,13 @@ section; ledger now **24 open / 104 closed**.**
   `.github/workflows/ci.yml` in two places — the count literals in the `tests-unit` job (`:136`) and the
   compat-stray-guard literals in the `health` job (`:97`) — so it should land after PRs #424/#430, which
   also touch that file, to avoid a literal conflict.
-  Done (2026-10-02, this batch). All **20** count-guard steps in
-  `.github/workflows/ci.yml` now assert an absolute floor beside their equality check, and the full
-  `frpc` lane — previously `run: cargo test -p frpc` and counting nothing — has a guard.
+  Done (2026-10-02, this batch). All **21** count-guard lanes in
+  `.github/workflows/ci.yml` now assert an absolute floor beside their equality check (the release
+  `cli_exit_codes` lane was the last one without one), the citation gate's own expected count is
+  declared once as `guard_cites` / `guard_cites_floor` instead of the three copies that went stale at
+  `84` and left `health` red in this PR's first head, and the full
+  `frpc` lane — previously `run: cargo test -p frpc` and counting nothing — has a guard. Measured over
+  the parsed YAML: **28** steps carry a `-ge "$…` floor assertion, **30** assertion lines.
   Job-level lanes: `FRPS_CLI_TESTS`, `FRPC_TINY_CLI_TESTS` and `FRPC_ADMIN_CLI_INPUTS_TESTS` each
   gained a `*_FLOOR` twin (45, 24 and 34, equal at rest) which the step validates as an integer and
   asserts with `[ "$VAR" -ge "${VAR}_FLOOR" ]`; `FRPC_CLI_TESTS` / `FRPC_CLI_TESTS_FLOOR`
@@ -8881,7 +8885,17 @@ section; ledger now **24 open / 104 closed**.**
   but a step body mentions its lane literal many times over — the full `frpc` body 27 times on 16 of
   its 61 lines, the `frps` lane 26 times on 15 of 39 — so a later rename or floor move has to move
   every occurrence together, while the only occurrence pair that must move *separately* is the floor
-  and its exact count. Gates: every extracted step body (26 of them) `bash -n` clean with
+  and its exact count. Review round 1 (2026-10-02): the first head `46c85dc6` left the `health` job
+  red, because the citation-gate step still pinned `84` in three places (the `RESULT:` pattern, the
+  failure diagnostic, the success echo) while the gate prints 87; the count is now declared once as
+  `guard_cites` / `guard_cites_floor`, and the step re-extracted from the YAML runs rc 0
+  (`TODO.md cross-file citation gate ok: 88 live cites checked, every one on an item header`), while
+  `guard_cites` `88`→`89` reds on the RESULT mismatch and `88`→`87`/`guard_cites_floor` `88`→`999` on
+  the floor diagnostic (all rc 1). The same audit extracted and executed every count-pinning step in the file:
+  the only other one without a floor was the release `cli_exit_codes` lane, which gained
+  `FRPS_RELEASE_CLI_TESTS_FLOOR` (stub-cargo mutants: test deleted with literals unchanged → rc 1;
+  deleted plus the listed literal lowered → rc 1 on the new floor; listed literal *and* floor lowered
+  → rc 0). Gates: every extracted step body (26 of them) `bash -n` clean with
   `shellcheck -S warning` reporting only the pre-existing SC2148 (no shebang), and each ran green
   from a warm checkout.
 
