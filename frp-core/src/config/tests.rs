@@ -730,15 +730,8 @@ VirtualNet = true
 
 #[test]
 fn test_vhost_http_timeout_is_go_signed_int64() {
-<<<<<<< HEAD
-<<<<<<< HEAD
     // `TODO.md:8012`. Go's `VhostHTTPTimeout` field is `int64`
-=======
-    // `TODO.md:7649`. Go's `VhostHTTPTimeout` field is `int64`
->>>>>>> 198ddfc8 (docs(records): apply the #450 review findings and re-derive the shifted TODO.md cites)
-=======
     // `TODO.md:7665`. Go's `VhostHTTPTimeout` field is `int64`
->>>>>>> 332fd2f9 (docs(records): re-derive every TODO.md cite at the #452 rebase head)
     // (`pkg/config/v1/server.go`) and the flag is `Int64VarP`
     // (`pkg/config/flags.go:237`), so the file lane accepts a negative value and
     // refuses only what does not fit an `int64`. Measured on Go v0.71.0

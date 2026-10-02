@@ -1,14 +1,7 @@
 //! Regression: `frpc` must execute an `auth.tokenSource` `exec` command
 //! **once per client service**, exactly like Go frp — not a second time when it
-<<<<<<< HEAD
-<<<<<<< HEAD
 //! builds the login (`TODO.md:8415`: "Rust frpc runs the `auth.tokenSource`
-=======
-//! builds the login (`TODO.md:8388`: "Rust frpc runs the `auth.tokenSource`
->>>>>>> 198ddfc8 (docs(records): apply the #450 review findings and re-derive the shifted TODO.md cites)
-=======
 //! builds the login (`TODO.md:8404`: "Rust frpc runs the `auth.tokenSource`
->>>>>>> 332fd2f9 (docs(records): re-derive every TODO.md cite at the #452 rebase head)
 //! `exec` command twice per successful login where Go runs it once").
 //!
 //! Measured on the base commit `9b2acefb` against a live frps with this same

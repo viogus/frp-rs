@@ -2358,15 +2358,8 @@ mod oidc_throttle_tests {
     /// other `oidc` test green — measured: on the pre-pin tree all 19 `oidc`
     /// tests stayed green with the accessor body replaced by
     /// `MOCK_REQUEST_HEAD_TIMEOUT` (there are 20 at this head, this pin
-<<<<<<< HEAD
-<<<<<<< HEAD
     /// included; TODO.md:8094 (b)).
-=======
-    /// included; TODO.md:7867 (b)).
->>>>>>> 198ddfc8 (docs(records): apply the #450 review findings and re-derive the shifted TODO.md cites)
-=======
     /// included; TODO.md:7883 (b)).
->>>>>>> 332fd2f9 (docs(records): re-derive every TODO.md cite at the #452 rebase head)
     /// Three **distinct** overrides keep that mutant red three times over: a
     /// distilled accessor can return at most one of the three values, so
     /// `125 ms`, `60 s` or `31.337 ms` fails whichever value it happened to pick.
