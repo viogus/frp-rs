@@ -9219,7 +9219,7 @@ section; ledger now **24 open / 104 closed**.**
   with no warning — a real strict-parser/serde divergence left open. Ledger after this close:
   **15 open / 186 closed** (base `e4c23b2f`: 16 open / 185 closed).
 
-- [ ] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
+- [x] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
   Filed by the coordinator while closing `TODO.md:8533` (PR #430), which removed the two local `pkill -f`
   calls in `scripts/compat-test.sh`: `scripts/remote-frps.sh:195` and `:339` still run
   `pkill -f 'frps -c frps.toml'` and `:409` uses `pgrep -f` on the same text, over ssh, to manage the
@@ -9231,6 +9231,86 @@ section; ledger now **24 open / 104 closed**.**
   **Done-when:** the remote helper reaps by exact pid (a pid file written where it starts the server, or a
   port-scoped lookup) instead of `pkill -f`/`pgrep -f`, or the pattern kill is recorded as required with the
   measurement that shows a pid route is impossible over that ssh path.
+
+  **Done (2026-10-01, at code head `31f72123` on `fix/remote-frps-pid`, PR #456, based on `346661eb` (earlier `18bcd1ad`); the
+  review round's fixture and pid-guard fixes are `2aa568f1`) — all three named call sites are gone: the
+  helper's own server is reaped by exact pid from a pid file written where that server is started. The claim is
+  that narrow — the shard path's band sweep still kills by `ss -tlnp` port association, byte-identical to the
+  base tree, and that is the path the CI XTCP tests use (`compat-test.sh` always passes a shard index).**
+  `scripts/remote-frps.sh` now contains no `pkill`/`pgrep` *invocation* — the strings survive only in the
+  rationale comments, which the fixture strips before its scan. The start command is `remote_start_snippet`
+  (`scripts/lib/remote-frps-reap.sh:76`, called at `scripts/remote-frps.sh:279`), which backgrounds frps and
+  records `$!` in the same remote command:
+  `cd '<dir>' && chmod +x frps && ( nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null & echo $! > frps.pid )`
+  — `nohup … &` is a *simple* command inside the `( … )`, so `$!` is the server's own pid, where the replaced
+  shape backgrounded the whole `cd … && … &` list and made `$!` the list's subshell. Every later decision
+  reads that pid back: the shard pre-flight (`scripts/remote-frps.sh:189`) and shard stop (`:327`) interpolate
+  `remote_reap_pidfile_snippet` (`scripts/lib/remote-frps-reap.sh:90` — SIGTERM, 0.3 s, SIGKILL; a missing file,
+  a non-positive or non-numeric pid and an already-dead pid are no-ops), the two non-shard call sites (`:202`,
+  `:344`) interpolate `remote_reap_rundirs_snippet` (`scripts/lib/remote-frps-reap.sh:108` —
+  per-run-directory pid file, then `rm -rf`), and the non-shard status census (`:387`) interpolates
+  `remote_status_scan_snippet` (`scripts/lib/remote-frps-reap.sh:130`). The three replaced call sites were
+  `:195`, `:339` and `:409` in the base tree. The fragments are emitted as text, so the fixture exercises
+  exactly what crosses the ssh hop.
+  The new `scripts/tests/remote-frps-reap.sh` (37 checks, `MIN_CHECKS=37` floor enforced from an EXIT trap
+  installed above the first check) drives them against synthetic servers — a `#!/bin/bash` `frps` that
+  `exec -a "$PWD/frps -c frps.toml" sleep 120`s, so the recorded pid is one long-lived process whose command
+  line carries the text the old pattern matched. Raw green output: scenario B starts two servers the same way,
+  asserts both command lines carry `frps -c frps.toml` (so the decoy is not vacuous), reaps the one its *own*
+  pid file names — `ok reap: the helper's own server (62181) was reaped` — and asserts
+  `ok reap: the decoy whose command line carries frps -c frps.toml survived (62224)`, then reaps the decoy from
+  its own pid file to prove the survival is scoping and not a dead reaper; scenario C
+  (`stale: reaping an already-dead pid exited 0`, witness untouched); scenario D
+  (`missing: reaping with no pid file exited 0`, unrecorded server untouched); scenario E (waits for all three
+  run-directory servers to be exec-ed first — `ok rundirs: all three run-directory servers are exec-ed before
+  the sweep (rm -rf cannot rescue it)` — then reaps and removes both run directories and the legacy
+  `frp-xtcp-test` directory while a server outside those names survives); scenario F (a live pid file reports
+  `running`, a stale one `stopped (stale …)`, and a live matching process with no pid file anywhere reports
+  `stopped` — the `pgrep -f` regression); scenario G (no argument-pattern kill in either file after comment
+  stripping — the regex is structural, covering `pkill`/`killall`/`pidof`/`fuser`, any `pgrep`, an `xargs kill`,
+  a `kill` of a `$( … )`/backtick substitution and a pipeline into `kill` — the helper routes
+  start/reap/rundirs/status through the library, and the guard is driven against the reviewer's
+  `ps | grep | xargs kill` line, a `kill $(ps|grep)` line and two honest route lines); scenario H (the emitted
+  fragment tests `[ "$pid" -gt 0 ]`, and that boundary refuses `0`, `-1`, empty, non-numeric, whitespace-only
+  and multi-line pid files while accepting a positive pid).
+  Teeth, measured on the fixed tree: restoring the base `scripts/remote-frps.sh` reds scenario G naming all
+  three old call sites (`195`, `339`, `409`); replacing the library's reap fragment with
+  `pkill -f 'frps -c frps.toml'` reds 6 checks (`RESULT: 31`) including
+  `reap: the decoy (…) was reaped — the route is not scoped to the pid file`; and the review round's mutants
+  for the fixture's own teeth — `: reap-disabled` in the library with `rm -rf` kept reds 5 checks including
+  `rundirs: a run directory server survived (rd1=… alive=yes, rd2=… alive=yes)` (`RESULT: 32`), the
+  confounder scenario E now closes by waiting for exec, and the reviewer's
+  `ps -eo pid,args | grep 'frps -c frps.toml' | grep -v grep | awk '{print $1}' | xargs -r kill` added to the
+  helper reds `remote-frps.sh kills by pattern again: … | xargs -r kill` (`RESULT: 36`).
+  Two deliberate behaviour changes, both on the non-shard ("backward compat") paths: `status` can no longer
+  answer `running (no pid file)` (there is no pid on record to name it by, so it answers `stopped`), and a
+  leftover server started by a *pre-fix* helper — which wrote no pid file — is no longer reaped by
+  `start`/`stop` on that path. The shard path's port-scoped band sweep (`ss -tlnp`, 17000 + shard·100 … +99) is
+  unchanged and still covers its reserved band; that is the port-scoped route the `Done-when` sanctions, and it
+  names a listening pid rather than an argument pattern. Declared bounds, not defences: (a) a pid file names a
+  pid, not an identity, so a stale pid file whose pid has since been reused would be killed by the next
+  pre-flight — the file is removed with its directory on every stop and pre-flight, and identity-checking the
+  target would mean reading its command line, i.e. the argument-pattern match again; (b) a *multi-line* pid file
+  is refused as non-numeric, so no wrong process is signalled but the running server is missed while the
+  rundirs loop still removes its directory (the port band or a manual clean-up catches it); (c) the band
+  sweep's `$fpid` reaches the remote unquoted (pre-existing — the shellcheck SC2140 the base tree already
+  carries; `ss -tlnp` emits digits only).
+  No Rust code changed, so no cargo lane applies. Gates: `bash -n` on `scripts/remote-frps.sh`,
+  `scripts/lib/remote-frps-reap.sh` and `scripts/tests/remote-frps-reap.sh`; shellcheck 0.11.0 on all three
+  (the only new finding is the SC1091 that every lib-sourcing script in this repo already emits;
+  `scripts/remote-frps.sh`'s pre-existing SC2034/SC2086/SC2140 set is otherwise unchanged); the new fixture
+  `RESULT: 37 fixture check(s) hold`, rc 0; `bash scripts/tests/compat-stray-guard.sh` →
+  `RESULT: 40 fixture check(s) hold`, `pinned regions verified 4/4`, enforcer canary live;
+  `bash scripts/tests/repo-health-fixtures.sh` → `RESULT: 32 fixture check(s) hold`,
+  `pinned regions verified 2/2`, enforcer canary live; `bash scripts/repo-health.sh` →
+  `RESULT: invariants hold`; `git diff --check` rc 0. The three digests pinned in
+  `.github/workflows/ci.yml` (`guard_pin` `66d4af028e0c31a709c789d67c12415577028a73710267ceee4a466bee15fb39`
+  for `scripts/tests/repo-health-fixtures.sh`, `guard_pin`
+  `4f2df348b816f664d79613a7ee46417163e839450d948f82dae303996a4fe246` and `guard_lib_pin`
+  `a335320e87c65f36aff05ec79d83bb51f996fdb1e9125c0c9daa12ad3b658189` for the stray-guard pair) still match
+  the tree — none of those files is touched, so no coordinator edit is needed.
+  Ledger after this close: **20 open / 192 closed** (base `346661eb`: 20 open / 191 closed; the close and the
+  item filed below cancel out).
 
 - [ ] **A deleted test in `frp-server/src/vhost/tests.rs` leaves every suite green — no CI count guard covers `vhost::tests`.**
   Filed by the coordinator from PR #452's adversarial review (`/private/tmp/rev452-attack.md`, attack 4, mutant M4),
@@ -9394,3 +9474,15 @@ section; ledger now **24 open / 104 closed**.**
   cited as `frp-server/src/service.rs:2048`; no `service.rs:2338` cite remains).
   **Done-when:** each of the three remaining cites names the line that actually supports its claim, or the claim
   is reworded to what the cited line says.
+
+- [ ] **`scripts/tests/remote-frps-reap.sh` runs in no CI job.**
+  Filed while closing `TODO.md:9222` (PR #456). The fixture that pins the new exact-pid route is run only by
+  hand: the `health` job's comment (`.github/workflows/ci.yml:87-89`) names the three fixture scripts it runs,
+  and its steps run `scripts/tests/repo-health-fixtures.sh`, `scripts/tests/compat-stray-guard.sh` and
+  `scripts/tests/rss-soak-run-dir.sh`. Wiring a fourth suite is a `.github/workflows/ci.yml` edit, and the
+  round that added the fixture was barred from touching that file (its digest pins must not drift), so the gap
+  is recorded rather than closed.
+  **Done-when:** a `health` step runs `bash scripts/tests/remote-frps-reap.sh`, that step pins the suite's
+  `RESULT: 37 fixture check(s) hold` line and its 37-check total *outside* the file (the in-file
+  `MIN_CHECKS=37` floor cannot survive an `exec` planted after the trap, which is why the sibling steps carry
+  their totals as literals), and the job comment at `.github/workflows/ci.yml:87-89` says four fixture scripts.
