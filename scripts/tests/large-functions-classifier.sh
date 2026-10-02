@@ -25,7 +25,11 @@
 #      declaration, `#[cfg(all(not(test), …))]`, a `#[path]` written above the
 #      gate, and braces inside string literals), the raw-string cases (a
 #      multi-line literal and one with embedded quotes inside a gate's region, a
-#      production function whose body holds one) and the predicate-parse
+#      production function whose body holds one), the gate-tail cases (a trailing
+#      `/* */` or `//` comment, a `]` inside that comment, a second attribute on
+#      the gate's line, a one-line `#[cfg(test)] #[path = …] mod X;` declaration,
+#      and an ordinary string continued with a backslash at end of line) and the
+#      predicate-parse
 #      controls (`all(not(any(test, …)))`, `all(not (test), …)`, and the true
 #      `all(test, …)` gate beside them), plus the three negative controls
 #      (a plain `mod X;` production sibling, a directory whose name merely starts
@@ -35,15 +39,17 @@
 #   2  the default table and `--top` are unchanged in shape, a file the
 #      filter excluded is still not listed, and the function table measures the
 #      raw-string fixture's function to its true end.
-#   3  eleven mutations of the script, each of which must red exactly one part of
+#   3  fifteen mutations of the script, each of which must red exactly one part of
 #      scenario 1: drop the name pattern, drop the sibling attribution, drop
 #      declaration recognition, drop `pub(…)` from the declaration pattern,
 #      offer `dir/X.rs` for a `parent.rs`, drop the `all(…)` arm of the
 #      predicate parse, skip the backward attribute walk, scan string literals as
 #      code, drop the paren tracking that keeps a `[&str; 2]` type's `;` from
-#      ending a `const` early, stop skipping raw strings, and treat `not(…)` as
-#      implying `test`. A green suite on a mutant would mean the fixture does not
-#      drive the code it claims to.
+#      ending a `const` early, stop skipping raw strings, treat `not(…)` as
+#      implying `test`, require the gate's `]` to end its line, reject a comment
+#      tail, consume the attribute run a line at a time again, and drop the
+#      ordinary-string continuation. A green suite on a mutant would mean the
+#      fixture does not drive the code it claims to.
 #
 # Usage: bash scripts/tests/large-functions-classifier.sh
 set -uo pipefail
@@ -53,7 +59,7 @@ set -uo pipefail
 # installed before the path resolution and the first check, so an early `exit 0`
 # anywhere below it still has to answer to the floor. `MIN_CHECKS` is the
 # measured check count of a green run.
-MIN_CHECKS=76
+MIN_CHECKS=101
 checks=0
 fails=0
 WORK=""
@@ -551,6 +557,143 @@ mod helper {
 }
 EOF
 
+# --- the gate's tail, the item on the gate's line, string continuations --------
+# A `#[cfg(…)]` is a gate when its predicate implies `test` *and* the rest of the
+# line is only whitespace, comments and/or further `#[…]` attributes. Rust
+# allows all of these, and an end-of-line anchor that demands the `)]` be last
+# loses every one of them: the module is scored production and the gate is not
+# seen at all (measured `14 14 0` where the truth is `9 14 5`).
+#
+#   1  `#[cfg(test)] /* the inline tests */`
+#   2  `#[cfg(test)] #[allow(dead_code)]`
+#   3  `#[cfg(all(test, feature = "x"))] /* gated */`
+#   4  `#[cfg(test)] // see (a)]` — the `]` inside the comment defeats a greedy
+#      `(.*)` predicate, so the closing paren must be found by depth counting
+#   5  `#[cfg(test)] #[path = "…"] mod helper;` — the attribute run, the `#[path]`
+#      and the declaration share one line, which a line-at-a-time walk cannot see
+#      (it looks for the declaration on the next line and charges the production
+#      code below it to tests)
+cat > "$TREE/frp-core/src/fs_cfg_block_comment.rs" <<'EOF'
+pub fn alpha() {
+    let a = 1;
+}
+
+#[cfg(test)] /* the inline tests */
+mod tests {
+    #[test]
+    fn one() {}
+}
+
+pub fn omega() {
+    let b = 2;
+}
+EOF
+
+cat > "$TREE/frp-core/src/fs_cfg_comment_bracket.rs" <<'EOF'
+pub fn alpha() {
+    let a = 1;
+}
+
+#[cfg(test)] // see (a)]
+mod tests {
+    #[test]
+    fn one() {}
+}
+
+pub fn omega() {
+    let b = 2;
+}
+EOF
+
+cat > "$TREE/frp-core/src/fs_cfg_two_attrs.rs" <<'EOF'
+pub fn alpha() {
+    let a = 1;
+}
+
+#[cfg(test)] #[allow(dead_code)]
+mod tests {
+    #[test]
+    fn one() {}
+}
+
+pub fn omega() {
+    let b = 2;
+}
+EOF
+
+cat > "$TREE/frp-core/src/fs_cfg_all_comment.rs" <<'EOF'
+pub fn alpha() {
+    let a = 1;
+}
+
+#[cfg(all(test, feature = "x"))] /* gated */
+mod tests {
+    #[test]
+    fn one() {}
+}
+
+pub fn omega() {
+    let b = 2;
+}
+EOF
+
+mkdir -p "$TREE/frp-core/src/fs_cfg_inline_path"
+cat > "$TREE/frp-core/src/fs_cfg_inline_path.rs" <<'EOF'
+pub fn inline_prod() {
+    let q = 1;
+}
+
+#[cfg(test)] #[path = "fs_cfg_inline_path/inline_helper.rs"] mod inline_helper;
+
+pub fn inline_tail() {
+    let t = 2;
+}
+EOF
+cat > "$TREE/frp-core/src/fs_cfg_inline_path/inline_helper.rs" <<'EOF'
+pub fn helper_prod() {
+    let x = 1;
+}
+EOF
+
+# A backslash immediately before the newline continues an ordinary string onto
+# the next physical line, so braces there are string content. Without the
+# continuation the `}` at the start of the continuation line closes the region:
+# the module's tail is charged to production (`9 17 8` where the truth is
+# `5 17 12`) and a production function ends at the brace inside the literal
+# (`render` measures 3 code lines where the truth is 5).
+cat > "$TREE/frp-core/src/fs_string_cont.rs" <<'EOF'
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn one() {
+        let s = "closing brace follows: \
+}";
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn two() {}
+}
+
+pub fn after() {
+    let b = 2;
+}
+EOF
+
+cat > "$TREE/frp-core/src/fs_string_fn.rs" <<'EOF'
+pub fn render() -> &'static str {
+    let s = "a { \
+} b";
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn one() {}
+}
+EOF
+
 # --- helpers ------------------------------------------------------------------
 # row <output> <path> -> "production total test", or empty when not listed.
 row() {
@@ -695,6 +838,22 @@ expect_row "$OUT" "frp-core/src/attr_not_any_gated.rs" 11 11 0 \
 expect_row "$OUT" "frp-core/src/attr_not_space_gated.rs" 11 11 0 \
   "\`all(not (test), …)\` is not a gate"
 
+# --- the gate's tail, the item on the gate's own line, continuations ----------
+expect_row "$OUT" "frp-core/src/fs_cfg_block_comment.rs" 9 14 5 \
+  "a block comment after the gate leaves it a gate"
+expect_row "$OUT" "frp-core/src/fs_cfg_comment_bracket.rs" 9 14 5 \
+  "a \`]\` inside a trailing line comment does not break the predicate"
+expect_row "$OUT" "frp-core/src/fs_cfg_two_attrs.rs" 9 14 5 \
+  "a second attribute on the gate's line leaves it a gate"
+expect_row "$OUT" "frp-core/src/fs_cfg_all_comment.rs" 9 14 5 \
+  "\`all(test, …)\` with a trailing block comment is still a gate"
+expect_row "$OUT" "frp-core/src/fs_cfg_inline_path.rs" 9 10 1 \
+  "a one-line \`#[cfg(test)] #[path = …] mod X;\` spans only that line"
+expect_row "$OUT" "frp-core/src/fs_cfg_inline_path/inline_helper.rs" 0 4 4 \
+  "that one-line \`#[path]\` still attributes its sibling to tests"
+expect_row "$OUT" "frp-core/src/fs_string_cont.rs" 5 17 12 \
+  "a backslash at end of line continues the string, so its \`}\` is content"
+
 # ---------------------------------------------------------------- scenario 2
 printf '\nscenario 2: default output shape\n'
 DEF="$(bash "$TREE/scripts/large-functions.sh" 2>&1)"
@@ -747,6 +906,8 @@ fi
 TOPBIG="$(bash "$TREE/scripts/large-functions.sh" --top 200 2>&1)"
 expect_fn "$TOPBIG" "frp-core/src/attr_raw_fn.rs:7" 9 9 \
   "a fn whose raw string spans lines keeps its whole body (\`fn_body_end\`)"
+expect_fn "$TOPBIG" "frp-core/src/fs_string_fn.rs:1" 5 5 \
+  "a fn whose ordinary string continues past the newline keeps its whole body"
 
 # ---------------------------------------------------------------- scenario 3
 printf '\nscenario 3: mutations of the script must red scenario 1\n'
@@ -808,7 +969,7 @@ fi
 # 2726 production / 24 test instead of 2742 / 8.) The `parent.rs` row below
 # cannot discriminate — it holds with and without the mutation — and is kept
 # only as an independence control; the sibling row is the witness.
-if mutate "$REAL" "$MUT" 'decl = MOD_DECL.match(lines[j])' 'decl = None'; then
+if mutate "$REAL" "$MUT" 'decl = MOD_DECL.match(lines[j], col)' 'decl = None'; then
   cp "$MUT" "$TREE/scripts/large-functions.sh"
   MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
   got="$(row "$MOUT" "frp-core/src/parent/declared_helper.rs")"
@@ -1021,8 +1182,13 @@ fi
 
 # M11: the negation rule in the predicate parse. `not(…)` never implies `test`;
 # treating it as if it did turns the two negations into gates again, while the
-# true `all(test, …)` gate is untouched.
-if mutate "$REAL" "$MUT" '    return False' '    return True'; then
+# true `all(test, …)` gate is untouched. The anchor carries the preceding
+# `any(…)` arm so the replacement cannot land on a deeper-indented `return
+# False` in one of the scanner helpers.
+if mutate "$REAL" "$MUT" "        return bool(args) and all(cfg_implies_test(a) for a in args)
+    return False" \
+    "        return bool(args) and all(cfg_implies_test(a) for a in args)
+    return True"; then
   cp "$MUT" "$TREE/scripts/large-functions.sh"
   MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
   got="$(row "$MOUT" "frp-core/src/attr_not_any_gated.rs")"
@@ -1045,6 +1211,132 @@ if mutate "$REAL" "$MUT" '    return False' '    return True'; then
   fi
 else
   bad "M11 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M12: the gate's tail, restricted to the end of the line — the anchor the
+# round-1 matcher carried and the one this round removes. Every same-line tail
+# (a comment, a second attribute, a one-line `#[path]` declaration) stops being
+# a gate, so all five fixtures are scored production again.
+if mutate "$REAL" "$MUT" "                if j >= n or line[j] != ']':" \
+    "                if line[j:] != ']':"; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  for f in fs_cfg_block_comment fs_cfg_comment_bracket fs_cfg_two_attrs fs_cfg_all_comment; do
+    got="$(row "$MOUT" "frp-core/src/$f.rs")"
+    if [ "$got" = "14 14 0" ]; then
+      ok "M12 (the \`]\` must end the line): $f.rs is production again"
+    else
+      bad "M12: $f.rs expected '14 14 0', got '${got:-<absent>}'"
+    fi
+  done
+  got="$(row "$MOUT" "frp-core/src/fs_cfg_inline_path.rs")"
+  if [ "$got" = "10 10 0" ]; then
+    ok "M12: the one-line \`#[path]\` declaration stops being a gate too"
+  else
+    bad "M12: fs_cfg_inline_path.rs expected '10 10 0', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/fs_string_cont.rs")"
+  if [ "$got" = "5 17 12" ]; then
+    ok "M12: the string-continuation fixture is unaffected (the mechanisms are independent)"
+  else
+    bad "M12: fs_string_cont.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M12 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M13: the comment tail alone. Rejecting a trailing comment (the round-1
+# `(?://.*)?$` arm) drops the comment-carrying gates while the second-attribute
+# and one-line-`#[path]` fixtures stay gates — the tail rule has three
+# independent arms and this isolates one of them.
+if mutate "$REAL" "$MUT" "        elif line.startswith('/*', i) or line.startswith('//', i):
+            i = _skip_comment(line, i)" \
+    "        elif line.startswith('/*', i) or line.startswith('//', i):
+            return False"; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  for f in fs_cfg_block_comment fs_cfg_comment_bracket fs_cfg_all_comment; do
+    got="$(row "$MOUT" "frp-core/src/$f.rs")"
+    if [ "$got" = "14 14 0" ]; then
+      ok "M13 (comment tails rejected): $f.rs is production again"
+    else
+      bad "M13: $f.rs expected '14 14 0', got '${got:-<absent>}'"
+    fi
+  done
+  got="$(row "$MOUT" "frp-core/src/fs_cfg_two_attrs.rs")"
+  if [ "$got" = "9 14 5" ]; then
+    ok "M13: a second attribute is not a comment — that gate survives"
+  else
+    bad "M13: fs_cfg_two_attrs.rs became '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/fs_cfg_inline_path.rs")"
+  if [ "$got" = "9 10 1" ]; then
+    ok "M13: the one-line \`#[path]\` declaration survives too"
+  else
+    bad "M13: fs_cfg_inline_path.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M13 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M14: the attribute run, consumed one line at a time again. A one-line
+# `#[cfg(test)] #[path = …] mod X;` then looks for its declaration on the next
+# line, so `item_end` charges the production code below it to tests and the
+# sibling is never attributed — the pre-round-2 behaviour, reproduced.
+if mutate "$REAL" "$MUT" "        if k < len(line):" "        if False:"; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/fs_cfg_inline_path.rs")"
+  if [ "$got" = "5 10 5" ]; then
+    ok "M14 (run consumed per line): the region swallows the production fn below the declaration"
+  else
+    bad "M14: fs_cfg_inline_path.rs expected '5 10 5', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/fs_cfg_inline_path/inline_helper.rs")"
+  if [ "$got" = "4 4 0" ]; then
+    ok "M14: the one-line declaration's sibling is production again"
+  else
+    bad "M14: the inline sibling expected '4 4 0', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/pathed.rs")"
+  if [ "$got" = "5 8 3" ]; then
+    ok "M14: a multi-line attribute run is unaffected (the mechanisms are independent)"
+  else
+    bad "M14: pathed.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M14 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M15: the ordinary-string continuation. Without it the `\` at end of line ends
+# the literal instead of continuing it, so the `}` opening the next line is read
+# as code: the gated module ends there and a production fn's body ends at the
+# brace inside the literal.
+if mutate "$REAL" "$MUT" "                        if j + 1 == len(line):" \
+    "                        if False:"; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/fs_string_cont.rs")"
+  if [ "$got" = "9 17 8" ]; then
+    ok "M15 (no string continuation): the region ends at the \`}\` in the literal"
+  else
+    bad "M15: fs_string_cont.rs expected '9 17 8', got '${got:-<absent>}'"
+  fi
+  MTOP="$(bash "$TREE/scripts/large-functions.sh" --top 200 2>&1)"
+  got="$(fnrow "$MTOP" "frp-core/src/fs_string_fn.rs:1")"
+  if [ "$got" = "3 3" ]; then
+    ok "M15: \`fn_body_end\` ends the production fn at the brace in the literal"
+  else
+    bad "M15: fs_string_fn.rs:1 is '${got:-<absent>}', expected '3 3'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/fs_cfg_block_comment.rs")"
+  if [ "$got" = "9 14 5" ]; then
+    ok "M15: the comment-tail fixture is unaffected (the mechanisms are independent)"
+  else
+    bad "M15: fs_cfg_block_comment.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M15 mutation did not apply — anchor missing, the check would be vacuous"
 fi
 
 # ---------------------------------------------------------------- summary

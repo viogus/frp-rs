@@ -55,7 +55,17 @@ FN = re.compile(r'^(\s*)(?:pub(?:\([^)]*\))?\s+)?(?:const\s+|async\s+|unsafe\s+)
 # parsed, not pattern-matched, so the negated spellings — `all(not(test), …)`,
 # `all(not (test), …)`, `all(not(any(test, …)))` — are rejected: they compile
 # where `test` is *off*.
-CFG_ATTR = re.compile(r'\s*#\[cfg\((.*)\)\]\s*(?://.*)?$')
+#
+# The predicate is read by depth counting (`cfg_attribute`), not by a greedy
+# `(.*)`, and the attribute may be followed on its line by further attributes,
+# comments or the item it decorates (`gate_tail_ok`): `#[cfg(test)] /* why */`,
+# `#[cfg(test)] // see (a)]` and
+# `#[cfg(test)] #[path = "declared_helper.rs"] mod declared;` are all gates.
+#
+# NOTE: the opening `#[cfg(` must still close on the same line, so the wrapped
+# spelling `#[cfg(all(` / `test,` / `feature = "x"` / `))]` is not recognised.
+# No in-tree file writes one; it is filed as residue rather than special-cased.
+CFG_OPEN = re.compile(r'\s*#\s*\[\s*cfg\s*\(')
 # `r"…"`, `r#"…"#`, `r##"…"##`, `br#"…"#`: the `#`s set the terminator count,
 # and the literal may span lines.
 RAW_OPEN = re.compile(r'(?:b?r|cr)(#*)"')
@@ -140,13 +150,23 @@ def item_end(lines, start):
             if c == '"':
                 j += 1
                 while j < len(line):
+                    if line[j] == '"':
+                        j += 1
+                        break
                     if line[j] == '\\':
+                        if j + 1 == len(line):
+                            # A backslash immediately before the newline
+                            # continues the literal on the next physical line,
+                            # so braces there are string content, not code.
+                            i += 1
+                            if i >= n:
+                                break
+                            line = lines[i]
+                            j = 0
+                            continue
                         j += 2
                         continue
-                    if line[j] == '"':
-                        break
                     j += 1
-                j += 1
                 continue
             if c == "'":
                 # Rust has lifetimes (`'static`, `'a`) as well as char literals.
@@ -230,10 +250,207 @@ def cfg_implies_test(pred):
     return False
 
 
+def _skip_comment(line, i):
+    """Index just past the comment at `i`; `len(line)` when it runs to EOL."""
+    if line.startswith('//', i):
+        return len(line)
+    end = line.find('*/', i + 2)
+    return len(line) if end < 0 else end + 2
+
+
+def _skip_string(line, i):
+    """Index just past the `"…"` that opens at `i` (escape-aware)."""
+    i, n = i + 1, len(line)
+    while i < n:
+        if line[i] == '\\':
+            i += 2
+            continue
+        if line[i] == '"':
+            return i + 1
+        i += 1
+    return n
+
+
+def _skip_char(line, i):
+    """Index after the char literal at `i`; a lifetime advances one char."""
+    n = len(line)
+    if i + 2 < n and line[i + 1] == '\\':
+        return i + 3                        # '\n'-style escape
+    if i + 2 < n and line[i + 2] == "'":
+        return i + 3                        # 'x'-style literal
+    return i + 1                            # lifetime — ordinary code
+
+
+def closing_bracket(line, i):
+    """Index of the `]` matching the `[` at `i`, or -1.
+
+    Depth-counted and literal-aware, so a bracket inside a string, a char
+    literal or a comment cannot close it early. The greedy `(.*)` could not do
+    this: `#[cfg(test)] // see (a)]` parsed as a malformed predicate and the
+    line stopped being a gate.
+    """
+    depth, n = 0, len(line)
+    while i < n:
+        if line.startswith('/*', i) or line.startswith('//', i):
+            i = _skip_comment(line, i)
+            continue
+        c = line[i]
+        if c == '"':
+            i = _skip_string(line, i)
+            continue
+        if c == "'":
+            i = _skip_char(line, i)
+            continue
+        if c == '[':
+            depth += 1
+        elif c == ']':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def cfg_attribute(line):
+    """(`predicate`, index just past the attribute) for a leading `#[cfg(…)`].
+
+    `(None, -1)` when the line does not open a well-formed one. The closing
+    `)` is found by depth counting, so a `)` or `]` inside a string or a
+    trailing comment cannot end the predicate early, and the attribute's `]`
+    must follow it (`#[cfg(test) ]` is accepted; one split across lines is not
+    — see the note above `CFG_OPEN`).
+    """
+    m = CFG_OPEN.match(line)
+    if not m:
+        return None, -1
+    start, n, depth, i = m.end(), len(line), 1, m.end()
+    while i < n:
+        if line.startswith('/*', i) or line.startswith('//', i):
+            i = _skip_comment(line, i)
+            continue
+        c = line[i]
+        if c == '"':
+            i = _skip_string(line, i)
+            continue
+        if c == "'":
+            i = _skip_char(line, i)
+            continue
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0:
+                j = i + 1
+                while j < n and line[j] in ' \t\r':
+                    j += 1
+                if j >= n or line[j] != ']':
+                    return None, -1
+                # A block comment inside the predicate survives the scan but
+                # not the argument split, so drop it before parsing.
+                return re.sub(r'/\*.*?\*/', '', line[start:i]), j + 1
+        i += 1
+    return None, -1
+
+
+def item_tail_ok(line, i):
+    """Is `line[i:]` — the decorated item sharing the gate's line — sound?
+
+    Anything is accepted except an unbalanced bracket: a `)` or `]` with
+    nothing to match it means the `)]` above was not the attribute's, which is
+    the one way a mistyped gate can still look well formed.
+    """
+    depth, n = 0, len(line)
+    while i < n:
+        if line.startswith('/*', i) or line.startswith('//', i):
+            i = _skip_comment(line, i)
+            continue
+        c = line[i]
+        if c == '"':
+            i = _skip_string(line, i)
+            continue
+        if c == "'":
+            i = _skip_char(line, i)
+            continue
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+            if depth < 0:
+                return False
+        i += 1
+    return True
+
+
+def gate_tail_ok(line, i):
+    """Is `line[i:]` a legal tail for a `#[cfg(…)]` attribute?
+
+    Whitespace, `//` and `/* */` comments and further `#[…]` attributes are —
+    `#[cfg(test)] /* why */`, `#[cfg(test)] // see (a)]` and
+    `#[cfg(test)] #[allow(dead_code)]` are all gates. So is the item the
+    attribute decorates when it shares the line, which is what makes
+    `#[cfg(test)] #[path = "declared_helper.rs"] mod declared;` a gate on an
+    out-of-line test module.
+    """
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if c in ' \t\r':
+            i += 1
+        elif line.startswith('/*', i) or line.startswith('//', i):
+            i = _skip_comment(line, i)
+        elif c == '#' and i + 1 < n and line[i + 1] == '[':
+            j = closing_bracket(line, i + 1)
+            if j < 0:
+                return False
+            i = j + 1
+        else:
+            return item_tail_ok(line, i)
+    return True
+
+
 def is_test_gate(line):
     """Is this line a `#[cfg(…)]` that compiles only where `test` is set?"""
-    m = CFG_ATTR.match(line)
-    return bool(m) and cfg_implies_test(m.group(1))
+    pred, end = cfg_attribute(line)
+    if pred is None:
+        return False
+    return gate_tail_ok(line, end) and cfg_implies_test(pred)
+
+
+def attribute_run(lines, start):
+    """(item line, item column, `#[path]` value) after the run at `start`.
+
+    The run is consumed one attribute at a time rather than one line at a
+    time, because attributes may share a line with each other and with the item
+    they decorate: `#[cfg(test)] #[path = "declared_helper.rs"] mod declared;`
+    declares an out-of-line test module, and a line-at-a-time walk looked for
+    the declaration on the *next* line and charged the production code below it
+    to tests. `path_attr` is the last `#[path]` of the run, or None.
+    """
+    i, n, path_attr = start, len(lines), None
+    while True:
+        line = lines[i]
+        k = 0
+        while True:
+            while k < len(line) and line[k] in ' \t\r':
+                k += 1
+            if line.startswith('/*', k) or line.startswith('//', k):
+                k = _skip_comment(line, k)
+                continue
+            if not line.startswith('#[', k):
+                break
+            end = closing_bracket(line, k + 1)
+            if end < 0:                     # malformed — stop at the item
+                return i, k, path_attr
+            m = PATH_ATTR.search(line[k:end + 1])
+            if m:
+                path_attr = m.group(1)
+            k = end + 1
+        if k < len(line):
+            return i, k, path_attr
+        if i + 1 < n and ATTR_LINE.match(lines[i + 1]):
+            i += 1
+            continue
+        return i + 1, 0, path_attr
 
 
 def test_blocks(lines):
@@ -257,9 +474,9 @@ def test_blocks(lines):
     Any `#[cfg(…)]` that compiles only where `test` is set counts:
     `#[cfg(test)]` and `#[cfg(all(…, test, …))]` (`is_test_gate` parses the
     predicate, so the negated spellings do not). A `#[path]` may sit above or
-    below the gate:
-    attributes stack on one item, so the whole contiguous attribute run is
-    part of the region and is searched for `#[path]`.
+    below the gate: attributes stack on one item, so the whole attribute run is
+    part of the region and is searched for `#[path]` — even when the run, the
+    `#[path]` and the `mod X;` declaration all share one line.
 
     An out-of-line declaration must not be brace-matched: `mod tests;` has no
     body, so scanning forward for the next `{` charges the production code that
@@ -277,15 +494,10 @@ def test_blocks(lines):
         start = i
         while start > 0 and ATTR_LINE.match(lines[start - 1]):
             start -= 1
-        j, path_attr = start, None
-        while j < n and ATTR_LINE.match(lines[j]):
-            m = PATH_ATTR.match(lines[j])
-            if m:
-                path_attr = m.group(1)
-            j += 1
+        j, col, path_attr = attribute_run(lines, start)
         if j >= n:
             break
-        decl = MOD_DECL.match(lines[j])
+        decl = MOD_DECL.match(lines[j], col)
         if decl:
             blocks.append((start, j))
             out_of_line.append((decl.group(1), path_attr))
