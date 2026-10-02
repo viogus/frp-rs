@@ -195,7 +195,13 @@ def is_test_file(path):
 
 
 def sibling_paths(path, name, path_attr):
-    """Where Rust looks for an out-of-line `mod name;` declared in `path`."""
+    """Where Rust looks for an out-of-line `mod name;` declared in `path`.
+
+    All four candidates of the published module-path rules: `X.rs` and
+    `X/mod.rs` beside the parent, and — for `parent.rs` but not
+    `parent/mod.rs` — the same two under a `parent/` directory. A missing
+    candidate leaves that module's body scored as production.
+    """
     d = os.path.dirname(path)
     out = []
     if path_attr:
@@ -203,7 +209,9 @@ def sibling_paths(path, name, path_attr):
     stem = os.path.basename(path)[:-3]        # drop the `.rs`
     if stem != 'mod':
         out.append(os.path.join(d, stem, name + '.rs'))
+        out.append(os.path.join(d, stem, name, 'mod.rs'))
     out.append(os.path.join(d, name + '.rs'))
+    out.append(os.path.join(d, name, 'mod.rs'))
     return out
 
 
