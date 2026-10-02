@@ -9392,7 +9392,16 @@ section; ledger now **24 open / 104 closed**.**
   so those properties are pinned without mutating the product. The capture is now frozen by
   `Spawned::wait_for_capture_convergence` (`:549`) — it waits for the count to reach the shape's floor
   (`capture_floor` `:220` / `capture_floor_config_dir` `:249`) and hold still for `SETTLE`, instead of a fixed
-  sleep — which is what makes the profiling record deterministic rather than a race.
+  sleep — which is what makes the profiling record deterministic rather than a race. That wait **panics when it
+  exits on `READY_TIMEOUT` below the floor** (`:573`), naming the count, the floor and `capture_floor`: the
+  delta review found four rows whose floor their shape never reaches (the synthesized-`tls_enable` and no-key
+  rows, which emit no warning at all, plus the written-`false` and flat-reload rows, all on flat shapes), where
+  the wait span to 15 s and froze on the deadline instead of converging — silently turning those rows' window
+  into the deadline. The four floors are now `capture_floor(false, false)` / `capture_floor(true, false)`, and
+  with the wait loud the whole file is **6.1 s default / 6.3 s `dashboard` / 6.4 s `all-features`** (it was
+  52.7 s / 67.3 s / 67.6 s before the fix), because no row reaches the deadline any more. The loud path is
+  demonstrated: re-specifying the no-key row as `capture_floor(true, false)` reds it in 16.3 s at `:573:17`
+  with `the capture never reached its floor: 7 record(s) after 15s, floor 8`.
   (c) `frps`'s `drain` (`:645`) now distinguishes a read error from EOF exactly as `frpc`'s does — only `Ok(0)`
   ends the capture, `ErrorKind::Interrupted` retries, any other error is recorded — and every reader
   (`Spawned::peek_stdout`/`peek_stderr`, and `snapshot`) refuses the truncated capture through
