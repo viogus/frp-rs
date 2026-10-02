@@ -223,8 +223,8 @@ wait_for_port() {
 # nc -z triggers ProxyUserConn in Rust frps, creating phantom work connections
 # that can deadlock encrypted bridges. Use lsof instead (check LISTEN state).
 wait_for_port_safe() {
-    local host="$1" port="$2" timeout="${3:-15}"
-    local deadline=$(($(date +%s) + timeout))
+    local host="$1" port="$2" timeout="${3:-15}" ready_min="${FRP_COMPAT_READY_MIN:-20}"
+    (( timeout < ready_min )) && timeout="$ready_min"; local deadline=$(($(date +%s) + timeout))
     if command -v lsof >/dev/null 2>&1; then
         while true; do
             if lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
@@ -678,9 +678,9 @@ fail_test() {
     echo -e "${RED}[FAIL]${NC} $name: $reason"
     FAIL=$((FAIL + 1))
     FAILURES+=("$name: $reason")
-    if $VERBOSE; then
+    if $VERBOSE || $CI; then
         echo "--- logs for $name ---"
-        # Collect logs from both top-level (Go frpc) and subdirectories (Rust frpc)
+        # CI too: the EXIT trap removes TEST_DIR, so a red run's logs never survive otherwise.
         for f in "$TEST_DIR"/*.log "$TEST_DIR"/*/*.log; do
             if [[ -f "$f" ]]; then
                 echo "=== $(basename "$f") ==="
