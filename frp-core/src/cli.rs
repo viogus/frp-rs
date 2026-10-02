@@ -4774,7 +4774,7 @@ fn tcpmux_cmd() -> impl Parser<FrpcCmd> {
     let mux = long("mux").argument::<String>("MUX").optional();
     // Go registers the same domain pair here as on http/https (`custom_domain`
     // `-d`, `sd`); frp-rs's server already routes on them
-    // (`frp-server/src/control/proxy_ops.rs:2293`). Comma-joined like http.
+    // (`frp-server/src/control/proxy_ops/vhost.rs:33`). Comma-joined like http.
     let custom_domains = long("custom-domain")
         .long("custom-domains")
         .long("custom_domain")
