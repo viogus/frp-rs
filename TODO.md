@@ -9670,8 +9670,9 @@ section; ledger now **24 open / 104 closed**.**
   `quic_bind_port` is still accepted by `known_server_keys()` and then silently dropped by the server, so
   `--strict-config` cannot see the divergence. Measured in the micro build
   (`--no-default-features --features micro`): `frps verify --strict-config` on a config writing
-  `websocket_port = 1` exits 0 with the port never bound. PR #455's items (`TODO.md:9491`, `:9538`, `:9560`,
-  `:9577`) cover the *warning* side; this item is the acceptance-set-vs-compiled-field divergence itself.
+    `websocket_port = 1` exits 0 with the port never bound. PR #455's items (`TODO.md:9525`, `:9572`, `:9594`,
+    `:9611`) cover the *warning* side; this item is the acceptance-set-vs-compiled-field divergence itself.
+  `TODO.md:9611`) cover the *warning* side; this item is the acceptance-set-vs-compiled-field divergence itself.
   **Done-when:** `known_server_keys()` (and any client-side counterpart) is derived from, or checked against,
   the compiled field set — shown by a `--no-default-features` run in which `--strict-config` refuses a key it
   cannot honour, or the divergence is recorded as deliberate with a measurement on both feature shapes.
