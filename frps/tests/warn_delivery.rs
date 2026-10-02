@@ -1674,6 +1674,17 @@ fn a_config_dir_sigusr1_reloads_every_service() {
 /// later signal sees the fix and the mutant never does, so the loop is the
 /// deterministic form — it cannot pass without the guard and cannot flake with
 /// it.
+///
+/// The deliberate panic is the `debug_assertions`-only `FRPS_CFGDIR_TEST_PANIC`
+/// hook, so the release profile compiles it out and the service never panics
+/// there: this test is `#[ignore]`d in release rather than assert a fan-out
+/// shape the shipped binary cannot produce. The `warn_delivery` release lane in
+/// `.github/workflows/ci.yml` pins that skip by name
+/// (`FRPS_RELEASE_WARN_DELIVERY_IGNORED`).
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_PANIC hook (frps/src/main.rs:777)"
+)]
 #[cfg(unix)]
 #[test]
 fn a_config_dir_sigusr1_does_not_count_a_panicking_service() {
@@ -1731,6 +1742,16 @@ fn a_config_dir_sigusr1_does_not_count_a_panicking_service() {
 /// empty registry, and the count collapses to `0` — which is what this asserts
 /// against. The `> 800 ms` lower bound is the same gate seen from the timing
 /// side; slowness only widens it, so it cannot flake.
+///
+/// The barrier is a `debug_assertions`-only hook, so the release profile
+/// compiles it out and there is nothing left for this test to observe: it is
+/// `#[ignore]`d there rather than run against a barrier that is not there. The
+/// `warn_delivery` release lane in `.github/workflows/ci.yml` pins that skip by
+/// name (`FRPS_RELEASE_WARN_DELIVERY_IGNORED`).
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS hook (frps/src/main.rs:656)"
+)]
 #[cfg(unix)]
 #[test]
 fn a_config_dir_sigusr1_immediately_after_the_ready_marker_reloads_everything() {

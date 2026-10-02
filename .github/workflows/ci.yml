@@ -83,10 +83,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-  # Cheapest job in the matrix (~seconds: no Rust toolchain, no cache, reads
-  # files with grep/find only, plus three fixture scripts that drive the
-  # repo-health, stray-guard and RSS-soak run-dir rules against synthetic
-  # inputs). It turns a rule that was previously enforced by
+  # Cheapest job in the matrix (seconds, not minutes: no Rust toolchain, no
+  # cache, reads files with grep/find only, plus six fixture scripts that drive
+  # the repo-health, stray-guard, RSS-soak run-dir, large-functions-classifier,
+  # remote-frps-reap and TODO.md citation-gate rules against synthetic inputs;
+  # measured warm on macOS arm64 as 11.5 s + 8.1 s + 6.1 s + 0.6 s + 3.0 s +
+  # 1.1 s respectively). It turns a
+  # rule that was previously enforced by
   # memory into a machine gate: frp-rs versions must stay aligned with the Go frp
   # release number across 5 crates + the VERSION constant + the download script +
   # the README (see "Versioning (mandatory)" in CLAUDE.md).
@@ -112,7 +115,7 @@ jobs:
         # `exec true` planted after the trap never runs it and exits 0 with no
         # output at all. So the total is pinned *outside*: this step requires the
         # suite's summary line verbatim, and 32 is what the scenarios in
-        # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:9086` round
+        # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:9142` round
         # added the in-file floor; a scenario added or removed there moves this
         # literal — restore the checks rather than lowering it). In-file,
         # `enforce_substance` also checksums the scenario-6 metric check and the
@@ -161,7 +164,16 @@ jobs:
           log=/tmp/frp-repo-health-fixtures.log
           status=0
           guard_file=scripts/tests/repo-health-fixtures.sh
-          guard_pin=9e669e4791cf10f2674cfa76809681e03916f316dea96b4a519f16a4b3297087
+          guard_pin=65fd4e4989586ee6cb691d2c9d28f7dcf0cf5510bd301eb0ff32ca97f51d9274
+          # The declared check total and the absolute floor under it, the
+          # same pair the three steps below use: the `ok`-line count is
+          # compared for equality with `guard_exact`, so a fixture case
+          # deleted together with its literal is green unless a second,
+          # independently anchored literal has to move too. The floor is
+          # asserted on `guard_exact` (a floor on `guard_ok` would be
+          # dead once the two are equal).
+          guard_exact=32
+          guard_floor=32
           # R12-2 (adversarial round 13): resolve the hasher to an absolute path
           # and prove it with a known vector — the same candidate order and the
           # same fail-closed mode as the guard's own `find_hash_tool()`.
@@ -289,10 +301,11 @@ jobs:
             fi
           done <<< "$guard_log"
           case $guard_log in
-            *'RESULT: 32 fixture check(s) hold'*) guard_result=1 ;;
+            *"RESULT: $guard_exact fixture check(s) hold"*) guard_result=1 ;;
           esac
           [ "$guard_result" = "1" ] || status=1
-          [ "$guard_ok" = "32" ] || status=1
+          [ "$guard_ok" = "$guard_exact" ] || status=1
+          [ "$guard_exact" -ge "$guard_floor" ] || status=1
           [ "$guard_regions" = "1" ] || status=1
           [ "$guard_canary" = "1" ] || status=1
           [ "$guard_fail" = "0" ] || status=1
@@ -320,7 +333,7 @@ jobs:
         # *outside*, the way the `log_completion` step below pins its own 6: this
         # step requires the suite's summary line verbatim, and 40 is what the
         # scenarios in scripts/tests/compat-stray-guard.sh print (21 before the
-        # `TODO.md:9118` round added the ordered `SHAPE` anchors, the symlink
+        # `TODO.md:9174` round added the ordered `SHAPE` anchors, the symlink
         # `wait_exec` probe, the empty-`ps` branch and the failed-probe
         # kill-then-continue case; 31 after the round-2 pins exercised the loop's
         # empty-`cmd` guard, the exit-0-empty reap arm, and the second half of the
@@ -403,7 +416,16 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=345527ff877e573f1835596f421db8b7828dcebd5debda33c07742a238b74ae5
+          guard_pin=b5ad388b5530741c869fde02451c927d7c9e28ef1a60ee4d28301ed4ddfe73f3
+          # The declared check total and the absolute floor under it, the
+          # same pair the three steps below use: the `ok`-line count is
+          # compared for equality with `guard_exact`, so a fixture case
+          # deleted together with its literal is green unless a second,
+          # independently anchored literal has to move too. The floor is
+          # asserted on `guard_exact` (a floor on `guard_ok` would be
+          # dead once the two are equal).
+          guard_exact=40
+          guard_floor=40
           # R12-1 (adversarial round 13): the enforcer's *implementation* lives in
           # the library the scenarios `source` (the `LIB=` assignment at :96 only
           # names it), so pinning only the suite left the "two-file change" claim
@@ -521,10 +543,11 @@ jobs:
             fi
           done <<< "$guard_log"
           case $guard_log in
-            *'RESULT: 40 fixture check(s) hold'*) guard_result=1 ;;
+            *"RESULT: $guard_exact fixture check(s) hold"*) guard_result=1 ;;
           esac
           [ "$guard_result" = "1" ] || status=1
-          [ "$guard_ok" = "40" ] || status=1
+          [ "$guard_ok" = "$guard_exact" ] || status=1
+          [ "$guard_exact" -ge "$guard_floor" ] || status=1
           [ "$guard_regions" = "1" ] || status=1
           [ "$guard_canary" = "1" ] || status=1
           [ "$guard_fail" = "0" ] || status=1
@@ -539,7 +562,320 @@ jobs:
           fi
           echo "compat stray-guard fixture checks ok: 40 checks hold, pins verified 4/4, enforcer canary live"
       - name: RSS soak — run-dir guard + summary fixture
-        run: bash scripts/tests/rss-soak-run-dir.sh
+        # TODO.md "The RSS-soak fixture step has no outer pins" (`:9283` at the
+        # round that filed it): this step used to be a bare
+        # `bash scripts/tests/rss-soak-run-dir.sh`, so a script replaced by
+        # `exit 0`, or one whose scenarios were skipped, still passed. It now
+        # mirrors the two guarded steps above it.
+        #
+        # The suite floors its own check count (`MIN_CHECKS=269`, in its EXIT
+        # trap) and pins the *identity* of what ran with a per-scenario marker,
+        # so a case deleted from the middle cannot be padded back. What no
+        # in-file mechanism can survive is `exec`: `exec true` planted after the
+        # trap never runs it and exits 0 with no output at all. So the total is
+        # pinned *outside* too, and as two literals rather than one: the exact
+        # `269` the run must print, and `guard_floor=269`, an absolute floor the
+        # `ok`-line count must also satisfy. A round that deletes a case has to
+        # lower *both* to hide — that is why this is not a bare `-ge` check: the
+        # exact comparison still fails on any other total, and the floor exists
+        # only to make the delete-plus-lower edit (lower the exact literal
+        # alone) red.
+        #
+        # The suite's own bytes are pinned here before it runs, the way the two
+        # steps above pin theirs: weakening the suite — a neutered `bad()`, a
+        # shortened marker list, a skipped scenario — also requires editing
+        # `guard_pin` in this step, i.e. a two-file change a reviewer sees.
+        # Update `guard_pin` with the digest named in the failure message when
+        # the suite legitimately changes.
+        shell: bash
+        run: |
+          set -o pipefail
+          log=/tmp/frp-rss-soak-run-dir.log
+          status=0
+          guard_file=scripts/tests/rss-soak-run-dir.sh
+          guard_pin=b3f59320f8242e1430f12e9dc464db90c09efe265da5e0b5edffa010c1c86210
+          guard_exact=269
+          guard_floor=269
+          # Absolute, vector-proven hasher: `command -v sha256sum` honours a
+          # shell function and then $PATH, so a shadow planted earlier on PATH
+          # could return the pinned digest for bytes that changed. Same
+          # candidate order and fail-closed mode as the two steps above.
+          guard_hasher=''
+          guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+          for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
+            [ -x "$cand" ] || continue
+            guard_probe=$(printf 'abc' | "$cand" 2>/dev/null)
+            [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+            guard_hasher=$cand
+            break
+          done
+          if [ -z "$guard_hasher" ]; then
+            for cand in /usr/bin/shasum /bin/shasum /usr/local/bin/shasum; do
+              [ -x "$cand" ] || continue
+              guard_probe=$(printf 'abc' | "$cand" -a 256 2>/dev/null)
+              [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+              guard_hasher="$cand -a 256"
+              break
+            done
+          fi
+          if [ -z "$guard_hasher" ]; then
+            echo "::error::no sha256 tool at an absolute path reproduces the known sha256 vector; cannot verify $guard_file"
+            exit 1
+          fi
+          # shellcheck disable=SC2086  # $guard_hasher is the word-split "<abs path> [-a 256]"
+          guard_out=$($guard_hasher "$guard_file" 2>/dev/null) || true
+          guard_sha=${guard_out%% *}
+          if [ "$guard_sha" != "$guard_pin" ]; then
+            echo "::error::$guard_file is not the pinned revision (sha256 ${guard_sha:-<none>}; expected $guard_pin)"
+            echo "::error::an edit to the RSS-soak run-dir suite — including one that weakens its own checks — must also update guard_pin in the 'RSS soak — run-dir guard + summary fixture' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended, otherwise revert it"
+            exit 1
+          fi
+          bash scripts/tests/rss-soak-run-dir.sh > "$log" 2>&1 || status=1
+          guard_log=$(<"$log")
+          printf '%s\n' "$guard_log"
+          guard_ok=0
+          guard_result=0
+          guard_fail=0
+          guard_fail_text=''
+          while IFS= read -r guard_line; do
+            case $guard_line in
+              '  ok '*) guard_ok=$((guard_ok + 1)) ;;
+              'FAIL'*|'  FAIL'*)
+                guard_fail=$((guard_fail + 1))
+                guard_fail_text="${guard_fail_text}${guard_line}"$'\n'
+                ;;
+            esac
+          done <<< "$guard_log"
+          case $guard_log in
+            *"RESULT: $guard_exact fixture check(s) hold"*) guard_result=1 ;;
+          esac
+          [ "$guard_result" = "1" ] || status=1
+          [ "$guard_ok" = "$guard_exact" ] || status=1
+          # The floor is asserted on the *declared* literal, not on the `ok`
+          # count: `guard_ok` is already required to equal `guard_exact`, so a
+          # floor on `guard_ok` could never fire alone. This is the assertion a
+          # delete-a-case-then-lower-the-literal edit trips — `guard_exact` fell
+          # but `guard_floor` did not.
+          [ "$guard_exact" -ge "$guard_floor" ] || status=1
+          [ "$guard_fail" = "0" ] || status=1
+          if [ "$guard_fail" != "0" ]; then
+            echo "::error::the RSS-soak run-dir suite printed $guard_fail failure line(s); a run that reported a failure cannot be reported as a green step:"
+            printf '%s' "$guard_fail_text"
+          fi
+          if [ "$status" != "0" ]; then
+            echo "::error::the RSS-soak run-dir fixture did not report 269 checks with no failure line"
+            echo "::error::scripts/tests/rss-soak-run-dir.sh must print 269 '  ok' lines and end with 'RESULT: 269 fixture check(s) hold' (floor=$guard_floor, exact=$guard_exact), and must not print a 'FAIL' line; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap or a skipped scenario means cases were skipped or swallowed — restore them rather than lowering this literal"
+            exit 1
+          fi
+          echo "RSS-soak run-dir fixture checks ok: 269 checks hold (floor $guard_floor), no failure line"
+      - name: Large-functions classifier — fixture checks
+        # TODO.md "`scripts/tests/large-functions-classifier.sh` runs in no
+        # gate" (`:7211` when it was filed): the 42-check suite landed in its
+        # own PR but could not wire itself into this file, which the citation
+        # gate PR owned at the time. It is wired here in the same shape as the
+        # RSS-soak step above — the suite's bytes are pinned before it runs, its
+        # exact `RESULT:` total and `ok`-line count are compared, an absolute
+        # floor sits under them so a delete-a-case-then-lower-the-literal edit
+        # is still red, and any `FAIL` line fails the step.
+        #
+        # This suite is itself a negative control for the classifier rule: it
+        # drives five deliberate mutations of `scripts/large-functions.sh`
+        # (M1–M5) and requires each one to be misclassified. The `guard_canary`
+        # check below is the M1 witness, printed only by a run that actually
+        # reclassified the mutated tree, so a suite whose mutation loop was
+        # deleted cannot pass by keeping its count. Tying a literal to the
+        # suite's wording is safe here precisely because `guard_pin` pins the
+        # bytes: changing the wording is already a two-file change.
+        shell: bash
+        run: |
+          set -o pipefail
+          log=/tmp/frp-large-functions-classifier.log
+          status=0
+          guard_file=scripts/tests/large-functions-classifier.sh
+          guard_pin=489e69500d9340c65e0c738f85e8afef4e0abf0222251f85d8b22948643b1245
+          guard_exact=42
+          guard_floor=42
+          guard_canary='M1 (name pattern removed)'
+          guard_hasher=''
+          guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+          for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
+            [ -x "$cand" ] || continue
+            guard_probe=$(printf 'abc' | "$cand" 2>/dev/null)
+            [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+            guard_hasher=$cand
+            break
+          done
+          if [ -z "$guard_hasher" ]; then
+            for cand in /usr/bin/shasum /bin/shasum /usr/local/bin/shasum; do
+              [ -x "$cand" ] || continue
+              guard_probe=$(printf 'abc' | "$cand" -a 256 2>/dev/null)
+              [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+              guard_hasher="$cand -a 256"
+              break
+            done
+          fi
+          if [ -z "$guard_hasher" ]; then
+            echo "::error::no sha256 tool at an absolute path reproduces the known sha256 vector; cannot verify $guard_file"
+            exit 1
+          fi
+          # shellcheck disable=SC2086  # $guard_hasher is the word-split "<abs path> [-a 256]"
+          guard_out=$($guard_hasher "$guard_file" 2>/dev/null) || true
+          guard_sha=${guard_out%% *}
+          if [ "$guard_sha" != "$guard_pin" ]; then
+            echo "::error::$guard_file is not the pinned revision (sha256 ${guard_sha:-<none>}; expected $guard_pin)"
+            echo "::error::a change to the classifier suite — including one that weakens its own checks — must also update guard_pin in the 'Large-functions classifier — fixture checks' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended, otherwise revert it"
+            exit 1
+          fi
+          bash "$guard_file" > "$log" 2>&1 || status=1
+          guard_log=$(<"$log")
+          printf '%s\n' "$guard_log"
+          guard_ok=0
+          guard_result=0
+          guard_canary_hit=0
+          guard_fail=0
+          guard_fail_text=''
+          while IFS= read -r guard_line; do
+            case $guard_line in
+              '  ok '*) guard_ok=$((guard_ok + 1)) ;;
+              'FAIL'*|'  FAIL'*)
+                guard_fail=$((guard_fail + 1))
+                guard_fail_text="${guard_fail_text}${guard_line}"$'\n'
+                ;;
+            esac
+          done <<< "$guard_log"
+          case $guard_log in
+            *"RESULT: $guard_exact fixture check(s) hold"*) guard_result=1 ;;
+          esac
+          case $guard_log in
+            *"$guard_canary"*) guard_canary_hit=1 ;;
+          esac
+          [ "$guard_result" = "1" ] || status=1
+          [ "$guard_ok" = "$guard_exact" ] || status=1
+          # The floor is asserted on the *declared* literal, not on the `ok`
+          # count: `guard_ok` is already required to equal `guard_exact`, so a
+          # floor on `guard_ok` could never fire alone. This is the assertion a
+          # delete-a-case-then-lower-the-literal edit trips — `guard_exact` fell
+          # but `guard_floor` did not.
+          [ "$guard_exact" -ge "$guard_floor" ] || status=1
+          [ "$guard_canary_hit" = "1" ] || status=1
+          [ "$guard_fail" = "0" ] || status=1
+          if [ "$guard_canary_hit" != "1" ]; then
+            echo "::error::the classifier suite did not print its M1 witness ('$guard_canary'); its negative-control mutations did not run, or the fixture is not driving the classifier over the mutated tree"
+          fi
+          if [ "$guard_fail" != "0" ]; then
+            echo "::error::the large-functions classifier suite printed $guard_fail failure line(s); a run that reported a failure cannot be reported as a green step:"
+            printf '%s' "$guard_fail_text"
+          fi
+          if [ "$status" != "0" ]; then
+            echo "::error::the large-functions classifier fixture did not report 42 checks with no failure line"
+            echo "::error::scripts/tests/large-functions-classifier.sh must print 42 '  ok' lines, include the M1 witness, and end with 'RESULT: 42 fixture check(s) hold' (floor=$guard_floor, exact=$guard_exact), and must not print a 'FAIL' line; a smaller total, a missing witness, a failure line or no output at all (an \`exec\`) means cases were skipped or swallowed — restore them rather than lowering this literal"
+            exit 1
+          fi
+          echo "Large-functions classifier fixture checks ok: 42 checks hold (floor $guard_floor), M1 witness present, no failure line"
+      - name: Remote-frps reap — fixture checks
+        # TODO.md "`scripts/tests/remote-frps-reap.sh` runs in no CI job"
+        # (`:9959` when it was filed): the suite drives
+        # `scripts/lib/remote-frps-reap.sh` and `scripts/remote-frps.sh` with a
+        # synthetic `frps` (a bash script whose command line carries the text
+        # the old `pkill -f 'frps -c frps.toml'` route matched), so it needs no
+        # Rust toolchain and belongs in this job. Same shape as the two steps
+        # above: bytes pinned, exact total and `ok` count compared, an absolute
+        # floor underneath, a `FAIL` line fails the step.
+        #
+        # The total is pinned *outside* as well as inside on purpose: the
+        # suite's own `MIN_CHECKS=37` lives in an EXIT trap, and an `exec true`
+        # planted after that trap never runs it — it exits 0 with no output at
+        # all, which is exactly the class of edit a floor in the file cannot
+        # catch. The `guard_canary` check is the scenario-B witness (the decoy
+        # whose command line carries the old pattern survives while the pid
+        # file's own server does not), so a run that lost the scoping scenario
+        # cannot pass by keeping its count.
+        shell: bash
+        run: |
+          set -o pipefail
+          log=/tmp/frp-remote-frps-reap.log
+          status=0
+          guard_file=scripts/tests/remote-frps-reap.sh
+          guard_pin=0ee83a3e60e71395df7ba4358be860afb88011186e9e5273a1abb14d2e533f20
+          guard_exact=37
+          guard_floor=37
+          guard_canary='reap: the decoy whose command line carries frps -c frps.toml survived'
+          guard_hasher=''
+          guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+          for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
+            [ -x "$cand" ] || continue
+            guard_probe=$(printf 'abc' | "$cand" 2>/dev/null)
+            [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+            guard_hasher=$cand
+            break
+          done
+          if [ -z "$guard_hasher" ]; then
+            for cand in /usr/bin/shasum /bin/shasum /usr/local/bin/shasum; do
+              [ -x "$cand" ] || continue
+              guard_probe=$(printf 'abc' | "$cand" -a 256 2>/dev/null)
+              [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+              guard_hasher="$cand -a 256"
+              break
+            done
+          fi
+          if [ -z "$guard_hasher" ]; then
+            echo "::error::no sha256 tool at an absolute path reproduces the known sha256 vector; cannot verify $guard_file"
+            exit 1
+          fi
+          # shellcheck disable=SC2086  # $guard_hasher is the word-split "<abs path> [-a 256]"
+          guard_out=$($guard_hasher "$guard_file" 2>/dev/null) || true
+          guard_sha=${guard_out%% *}
+          if [ "$guard_sha" != "$guard_pin" ]; then
+            echo "::error::$guard_file is not the pinned revision (sha256 ${guard_sha:-<none>}; expected $guard_pin)"
+            echo "::error::a change to the remote-frps reap suite — including one that weakens its own checks — must also update guard_pin in the 'Remote-frps reap — fixture checks' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended, otherwise revert it"
+            exit 1
+          fi
+          bash "$guard_file" > "$log" 2>&1 || status=1
+          guard_log=$(<"$log")
+          printf '%s\n' "$guard_log"
+          guard_ok=0
+          guard_result=0
+          guard_canary_hit=0
+          guard_fail=0
+          guard_fail_text=''
+          while IFS= read -r guard_line; do
+            case $guard_line in
+              '  ok '*) guard_ok=$((guard_ok + 1)) ;;
+              'FAIL'*|'  FAIL'*)
+                guard_fail=$((guard_fail + 1))
+                guard_fail_text="${guard_fail_text}${guard_line}"$'\n'
+                ;;
+            esac
+          done <<< "$guard_log"
+          case $guard_log in
+            *"RESULT: $guard_exact fixture check(s) hold"*) guard_result=1 ;;
+          esac
+          case $guard_log in
+            *"$guard_canary"*) guard_canary_hit=1 ;;
+          esac
+          [ "$guard_result" = "1" ] || status=1
+          [ "$guard_ok" = "$guard_exact" ] || status=1
+          # The floor is asserted on the *declared* literal, not on the `ok`
+          # count: `guard_ok` is already required to equal `guard_exact`, so a
+          # floor on `guard_ok` could never fire alone. This is the assertion a
+          # delete-a-case-then-lower-the-literal edit trips — `guard_exact` fell
+          # but `guard_floor` did not.
+          [ "$guard_exact" -ge "$guard_floor" ] || status=1
+          [ "$guard_canary_hit" = "1" ] || status=1
+          [ "$guard_fail" = "0" ] || status=1
+          if [ "$guard_canary_hit" != "1" ]; then
+            echo "::error::the reap suite did not print its scenario-B witness ('$guard_canary ...'); the pid-file scoping scenario did not run, so the route's scoping is unproven by this lane"
+          fi
+          if [ "$guard_fail" != "0" ]; then
+            echo "::error::the remote-frps reap suite printed $guard_fail failure line(s); a run that reported a failure cannot be reported as a green step:"
+            printf '%s' "$guard_fail_text"
+          fi
+          if [ "$status" != "0" ]; then
+            echo "::error::the remote-frps reap fixture did not report 37 checks with no failure line"
+            echo "::error::scripts/tests/remote-frps-reap.sh must print 37 '  ok' lines, include the decoy witness, and end with 'RESULT: 37 fixture check(s) hold' (floor=$guard_floor, exact=$guard_exact), and must not print a 'FAIL' line; a smaller total, a missing witness, a failure line or no output at all (an \`exec\`) means cases were skipped or swallowed — restore them rather than lowering this literal"
+            exit 1
+          fi
+          echo "Remote-frps reap fixture checks ok: 37 checks hold (floor $guard_floor), decoy witness present, no failure line"
       - name: TODO.md cross-file citation gate (every live cite lands on an item header)
         # `TODO.md` is a numbered ledger: every merge that inserts or removes a
         # line renumbers it, and a cite written as a bare line number then
@@ -645,6 +981,15 @@ jobs:
           status=0
           guard_file=scripts/tests/todo-cite-guard-fixtures.sh
           guard_pin=0575080e20463c176c584dc0f26ebd7685901e86246d96add0b6450420843be4
+          # The declared check total and the absolute floor under it, the
+          # same pair the three steps below use: the `ok`-line count is
+          # compared for equality with `guard_exact`, so a fixture case
+          # deleted together with its literal is green unless a second,
+          # independently anchored literal has to move too. The floor is
+          # asserted on `guard_exact` (a floor on `guard_ok` would be
+          # dead once the two are equal).
+          guard_exact=60
+          guard_floor=60
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
@@ -694,12 +1039,14 @@ jobs:
             esac
           done <<< "$guard_log"
           case $guard_log in
-            *'RESULT: 60 fixture check(s) hold'*) guard_result=1 ;;
+            *"RESULT: $guard_exact fixture check(s) hold"*) guard_result=1 ;;
           esac
           # The red-path canaries, in the suite's own wording. Each is a
           # scenario that must end with the gate refusing an injected bad cite;
           # their absence means the gate stopped reding (which looks exactly
           # like a clean tree).
+          guard_canary_exact=11
+          guard_canary_floor=11
           for guard_canary_probe in \
             'mid-item cite: gate exited 1' \
             'past-EOF cite: gate exited 1' \
@@ -718,8 +1065,10 @@ jobs:
             esac
           done
           [ "$guard_result" = "1" ] || status=1
-          [ "$guard_ok" = "60" ] || status=1
-          [ "$guard_canary" = "11" ] || status=1
+          [ "$guard_ok" = "$guard_exact" ] || status=1
+          [ "$guard_exact" -ge "$guard_floor" ] || status=1
+          [ "$guard_canary" = "$guard_canary_exact" ] || status=1
+          [ "$guard_canary_exact" -ge "$guard_canary_floor" ] || status=1
           [ "$guard_fail" = "0" ] || status=1
           if [ "$guard_fail" != "0" ]; then
             echo "::error::the cite-gate fixture suite printed $guard_fail failure line(s); a run that reported a failure cannot be reported as a green step:"
@@ -875,8 +1224,19 @@ jobs:
       # `cargo test -p frps --test cli_exit_codes -- --list`.
       # 44 → 45 with the `-l`-shorthand refusal pin
       # `short_l_is_not_a_frps_shorthand_and_the_refusal_is_pinned`
-      # (`TODO.md:9531`): +1. Re-derived with the same `--list` command.
+      # (`TODO.md:9639`): +1. Re-derived with the same `--list` command.
       FRPS_CLI_TESTS: "45"
+      # The absolute floor under the declared count above. `FRPS_CLI_TESTS` is a
+      # *declared* literal, and the step's equality check ("the file lists what
+      # the literal says") is satisfied the moment a test and the literal are
+      # deleted together — measured on a scratch tree: deleting one `#[test]`
+      # from `frps/tests/cli_exit_codes.rs` and lowering the literal to 44 left
+      # the old assertion set green. This is the second, independently anchored
+      # literal that edit has to move as well, and moving it is the deliberate
+      # records bump `TODO.md` documents. It is asserted against the *declared*
+      # value, not the measured one, so it cannot be redundant with the equality
+      # check above.
+      FRPS_CLI_TESTS_FLOOR: "45"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
       # 11 → 13 with the one `auth.method` policy: +2
@@ -953,6 +1313,11 @@ jobs:
       # `cargo test -p frpc --no-default-features --features tiny --test
       # cli_exit_codes -- --list`.
       FRPC_TINY_CLI_TESTS: "24"
+      # Absolute floor under the declared count above, for the reason spelled
+      # out at `FRPS_CLI_TESTS_FLOOR`: the equality check cannot tell a
+      # legitimate count from a test deleted together with its literal. This
+      # independent literal is what that pair of edits has to move as well.
+      FRPC_TINY_CLI_TESTS_FLOOR: "24"
       # frpc/tests/cli_inputs.rs under `--features admin` — "Run frpc's CLI-input
       # tests with the admin feature". The `admin` flag changes the linked
       # client: the child binds its `[webServer]` and announces it
@@ -961,6 +1326,33 @@ jobs:
       # a false positive. Re-derived on this tree with
       # `cargo test -p frpc --features admin --test cli_inputs -- --list`.
       FRPC_ADMIN_CLI_INPUTS_TESTS: "34"
+      # Absolute floor under the declared count above, for the reason spelled
+      # out at `FRPS_CLI_TESTS_FLOOR`. In this lane the floor also keeps the
+      # `>= 1` property the comment above derives: a floor of at least 1 means
+      # the zero-test state (a `#[cfg]` that compiles the file to nothing) still
+      # has to move a literal that reads like a record, not a count.
+      FRPC_ADMIN_CLI_INPUTS_TESTS_FLOOR: "34"
+      # The whole `frpc` package in the default (`full`) feature set — the lane
+      # at "Run frpc CLI tests (admin address resolution)", which is the only
+      # step that runs `cargo test -p frpc` and therefore the only place a count
+      # for the package as a whole can live. Re-derived on this tree with
+      # `cargo test -p frpc -- --list` (111 `: test` lines), which decomposes as
+      # the bin's 8 inline unit tests (`cargo test -p frpc --bin frpc --
+      # --list`) plus 103 integration tests over 8 files: admin_cli.rs 25,
+      # admin_config_get_warning.rs 0 (it compiles to no tests in this feature
+      # set — its `Running` line is still required as a target witness, see the
+      # step), cli_exit_codes.rs 23, cli_inputs.rs 34,
+      # cli_persistent_flags.rs 7, legacy_ini_fixture.rs 2, log_completion.rs 1,
+      # warn_delivery.rs 11. Before this literal the step ran the package and
+      # counted nothing: deleting any of those files left the lane green, which
+      # is why the step now keeps a per-target witness list as well as the
+      # total.
+      FRPC_CLI_TESTS: "111"
+      # Absolute floor under the declared count above, for the reason spelled
+      # out at `FRPS_CLI_TESTS_FLOOR`: the equality check cannot tell a
+      # legitimate count from a test deleted together with its literal. This
+      # independent literal is the second edit a delete-plus-lower has to move.
+      FRPC_CLI_TESTS_FLOOR: "111"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
@@ -1023,11 +1415,13 @@ jobs:
           list=/tmp/frps-bin-unit-tests.list
           cargo test -p frps --bin frps --all-features --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
           n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
+          n_floor=1
           named=$(grep -E -c "^${expected}: test$" "$list" || true)
           status=0
           grep -q "Running unittests src/main.rs" "$log.plain" || status=1
           grep -q "test result: ok. 1 passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "1" ] || status=1
+          [ "$n" -ge "$n_floor" ] || status=1
           [ "$named" = "1" ] || status=1
           grep -q "$marker" "$log.plain" || status=1
           # Converse run: the pin must also be *able* to fail, or a body that
@@ -1065,7 +1459,7 @@ jobs:
             cat "$log.plain"
             exit 1
           fi
-          echo "frps bin unit-test guard ok: $n tests listed (expected 1, ${expected}), marker seen, 0 failed, sabotage reds it"
+          echo "frps bin unit-test guard ok: $n tests listed (expected 1, ${expected}, floor 1), marker seen, 0 failed, sabotage reds it"
       - name: Run vnet unit tests (nathole membership/cap guards)
         # frps/frpc default features exclude `vnet`, so the default-feature
         # `cargo test --workspace` steps never compile the nathole.rs vnet
@@ -1122,11 +1516,13 @@ jobs:
           list=/tmp/frp-server-resolver-no-tls-test.list
           cargo test -p frp-server --no-default-features --features dashboard --lib --color never web_server_tls_enable_reader -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
           n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
+          n_floor=1
           named=$(grep -E -c "^${expected}: test$" "$list" || true)
           status=0
           grep -q "Running unittests src/lib.rs" "$log.plain" || status=1
           grep -q "test result: ok. 1 passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "1" ] || status=1
+          [ "$n" -ge "$n_floor" ] || status=1
           [ "$named" = "1" ] || status=1
           # `-x` (whole line): a plain substring grep counted a marker with
           # anything appended — `... assertions ranXYZ` — as the marker.
@@ -1183,7 +1579,7 @@ jobs:
             cat "$log.plain"
             exit 1
           fi
-          echo "frp-server warning-resolver guard ok: $n tests listed (expected 1, ${expected}), marker seen, 0 failed, sabotage reds it"
+          echo "frp-server warning-resolver guard ok: $n tests listed (expected 1, ${expected}, floor 1), marker seen, 0 failed, sabotage reds it"
       - name: Run frp-core lib + integration tests (kcp/mux/xtcp_p2p/yamux_rst)
         # frp-core's tests/ are pure Rust<->Rust (no frps/frpc binaries), so
         # they belong with the unit lane and don't need the integration build.
@@ -1263,6 +1659,7 @@ jobs:
               --lib --color never -- --list help_doc_tests 2>&1 \
               | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
             n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
+            n_floor=21
             # The run's *own* summary is the other half of the count: a literal
             # taken only from `-- --list` cannot see a listed test that reported
             # nothing.
@@ -1271,6 +1668,7 @@ jobs:
             [ -n "$n_run" ] || status=1
             [ "$n_run" = "$n" ] || status=1
             [ "$n" = "21" ] || status=1
+            [ "$n" -ge "$n_floor" ] || status=1
             if [ "$status" != "0" ]; then
               echo "::error::frp-core help_doc_tests guard failed for --features $features (list=$n, run=$n_run, log=$log)"
               if [ -n "$n" ] && [ "$n" != "21" ]; then
@@ -1316,6 +1714,7 @@ jobs:
           list=/tmp/frp-core-server-tls-enable-warning-tests.list
           cargo test -p frp-core --test server_tls_enable_warning --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
           n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
+          n_floor=8
           witness="written_server_tls_enable_warns_once_and_stays_inert"
           named=$(grep -E -c "^${witness}: test$" "$list" || true)
           # The run's *own* summary is the other half of the count: a literal
@@ -1328,6 +1727,7 @@ jobs:
           [ -n "$n_run" ] || status=1
           [ "$n_run" = "$n" ] || status=1
           [ "$n" = "8" ] || status=1
+          [ "$n" -ge "$n_floor" ] || status=1
           [ "$named" = "1" ] || status=1
           # Converse run: the witness assertion must be *able* to fail, or a body
           # that deletes it — or returns before it — passes while still reporting
@@ -1361,7 +1761,7 @@ jobs:
             cat "$log.plain"
             exit 1
           fi
-          echo "frp-core server tls_enable warning guard ok: $n tests listed (expected 8), $n_run passed, 0 failed, sabotage reds it"
+          echo "frp-core server tls_enable warning guard ok: $n tests listed (expected 8, floor 8), $n_run passed, 0 failed, sabotage reds it"
       - name: Run frp-core's web-server `tls_enable` warning pin (count guard)
         # The sibling of the step above, for
         # `frp-core/tests/web_server_tls_enable_warning.rs`: same reason (no
@@ -1382,6 +1782,7 @@ jobs:
           list=/tmp/frp-core-web-server-tls-enable-warning-tests.list
           cargo test -p frp-core --test web_server_tls_enable_warning --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
           n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
+          n_floor=6
           witness="the_no_dashboard_build_names_no_dashboard_behaviour"
           named=$(grep -E -c "^${witness}: test$" "$list" || true)
           # The run's own summary must agree with the target's list; see the
@@ -1393,6 +1794,7 @@ jobs:
           [ -n "$n_run" ] || status=1
           [ "$n_run" = "$n" ] || status=1
           [ "$n" = "6" ] || status=1
+          [ "$n" -ge "$n_floor" ] || status=1
           [ "$named" = "1" ] || status=1
           # Converse run: see the sibling step. Without it, deleting the
           # witness's own assertion reads as `6 tests listed (expected 6),
@@ -1425,7 +1827,7 @@ jobs:
             cat "$log.plain"
             exit 1
           fi
-          echo "frp-core web-server tls_enable warning guard ok: $n tests listed (expected 6), $n_run passed, 0 failed, sabotage reds it"
+          echo "frp-core web-server tls_enable warning guard ok: $n tests listed (expected 6, floor 6), $n_run passed, 0 failed, sabotage reds it"
       - name: Run frpc CLI tests (admin address resolution)
         # No lane ran a `cargo test` target of the `frpc` package before this
         # step (`ab-matrix.yml` only *builds* `-p frpc`; the two `--lib` steps —
@@ -1439,10 +1841,14 @@ jobs:
         # pinned the old `127.0.0.1:7400` fallback that let
         # `frpc reload`/`status` silently ignore a config that fails to load.
         # This step executes them (8 unit tests — `cargo test -p frpc --bin frpc
-        # -- --list`) plus `frpc/tests/admin_cli.rs` (25 tests —
-        # `cargo test -p frpc --test admin_cli -- --list`; a snapshot figure,
-        # since no lane counts that file and nothing reddens when it moves),
-        # which spawns the `frpc` binary with crafted configs.
+        # -- --list`) plus the package's 8 integration files (103 tests —
+        # `cargo test -p frpc -- --list`), which spawn the `frpc` binary with
+        # crafted configs. It used to name `frpc/tests/admin_cli.rs`'s 25 tests
+        # as "a snapshot figure, since no lane counts that file and nothing
+        # reddens when it moves"; the step now counts the whole package
+        # (`env.FRPC_CLI_TESTS`, floor `env.FRPC_CLI_TESTS_FLOOR`) and requires a
+        # `Running …` witness for each of the 9 targets, so a deleted file or a
+        # lowered literal both red.
         #
         # What the `TcpListener` oracle does and does not prove. The listener is
         # bound to a port that is then written into the bad config's
@@ -1477,7 +1883,83 @@ jobs:
         # 300 ms post-exit oracle window); `--no-default-features` 11.1 s from a
         # cold no-feature graph, with the integration file compiled to 0 tests.
         # The runner was not measured.
-        run: cargo test -p frpc
+        #
+        # The count guard (the reason this is no longer a one-line `run:`). The
+        # lane ran `cargo test -p frpc` and asserted nothing about what it ran:
+        # `cargo test` exits 0 when a target compiles to 0 tests, so deleting
+        # `frpc/tests/warn_delivery.rs`, or gating any of the 8 files behind a
+        # false `#[cfg]`, left the lane green. Three independent pins close
+        # that: the `-- --list` total, the *sum* of the per-target
+        # `test result: ok. N passed; 0 failed` lines (a target that ran nothing
+        # prints `0 passed`, so a partial execution cannot pass the sum even
+        # when the list count matches), and one `Running …` witness per target.
+        # `env.FRPC_CLI_TESTS` is the declared total and
+        # `env.FRPC_CLI_TESTS_FLOOR` the independent floor, so a test deleted
+        # together with the literal still reds until both are moved in one
+        # deliberate records edit.
+        shell: bash
+        run: |
+          set -eo pipefail
+          case "${FRPC_CLI_TESTS_FLOOR}" in
+            ''|*[!0-9]*)
+              echo "::error::frpc CLI-lane guard: env.FRPC_CLI_TESTS_FLOOR must be a non-negative integer (got '${FRPC_CLI_TESTS_FLOOR}')"
+              exit 1
+              ;;
+          esac
+          case "$FRPC_CLI_TESTS" in
+            ''|*[!0-9]*)
+              echo "::error::frpc CLI-lane guard: env.FRPC_CLI_TESTS must be a non-negative integer (got '$FRPC_CLI_TESTS')"
+              exit 1
+              ;;
+          esac
+          log=/tmp/frpc-cli-tests.log
+          run_status=0
+          cargo test -p frpc --color never 2>&1 | tee "$log" || run_status=$?
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+          n=$(cargo test -p frpc --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          log_n=$(grep -E -o 'test result: ok\. [0-9]+ passed; 0 failed' "$log.plain" | awk '{s += $4} END {print s + 0}' || true)
+          witness_missing=""
+          for witness in \
+            "Running unittests src/main.rs" \
+            "Running tests/admin_cli.rs" \
+            "Running tests/admin_config_get_warning.rs" \
+            "Running tests/cli_exit_codes.rs" \
+            "Running tests/cli_inputs.rs" \
+            "Running tests/cli_persistent_flags.rs" \
+            "Running tests/legacy_ini_fixture.rs" \
+            "Running tests/log_completion.rs" \
+            "Running tests/warn_delivery.rs"
+          do
+            grep -q -F "$witness" "$log.plain" || witness_missing="$witness_missing [$witness]"
+          done
+          status=0
+          [ "$run_status" = "0" ] || status=1
+          [ -z "$witness_missing" ] || status=1
+          [ "$n" = "$FRPC_CLI_TESTS" ] || status=1
+          [ "$log_n" = "$FRPC_CLI_TESTS" ] || status=1
+          [ "$FRPC_CLI_TESTS" -ge "$FRPC_CLI_TESTS_FLOOR" ] || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::frpc CLI-lane guard failed (status=$status, cargo=$run_status, env=$FRPC_CLI_TESTS, listed=$n, ran=$log_n, log=$log)"
+            if [ -n "$witness_missing" ]; then
+              echo "::error::frpc CLI-lane guard: the run printed no 'Running' line for$witness_missing — that target did not execute, so nothing in it can red. A missing target means the file was deleted, renamed, or compiled out by a false #[cfg]; restore it rather than moving the literal."
+            fi
+            if [ "$FRPC_CLI_TESTS" -lt "$FRPC_CLI_TESTS_FLOOR" ]; then
+              echo "::error::env.FRPC_CLI_TESTS is $FRPC_CLI_TESTS, below the absolute floor env.FRPC_CLI_TESTS_FLOOR=$FRPC_CLI_TESTS_FLOOR — a count literal lowered to match a deleted test is the exact edit this floor exists to stop. Restore the test; if the removal is intended, record it in TODO.md and lower *both* literals in the same edit, because either one alone leaves this guard red."
+            fi
+            if [ -n "$log_n" ] && [ "$n" = "$FRPC_CLI_TESTS" ] && [ "$log_n" != "$n" ]; then
+              echo "::error::the frpc package lists $n tests but the run executed $log_n — at least one target compiled to 0 tests (a false #[cfg]) or did not run to completion; restore the target or its gate rather than moving the literal"
+            fi
+            if [ "$n" = "$log_n" ] && [ "$n" != "$FRPC_CLI_TESTS" ]; then
+              if [ "$n" -gt "$FRPC_CLI_TESTS" ]; then
+                echo "::error::the frpc package lists $n tests, env.FRPC_CLI_TESTS is $FRPC_CLI_TESTS: move env.FRPC_CLI_TESTS on the tests-unit job in .github/workflows/ci.yml from $FRPC_CLI_TESTS to $n. The floor stays where it is when the count rises — only a literal that FALLS has to move both."
+              else
+                echo "::error::the frpc package lists $n tests, env.FRPC_CLI_TESTS is $FRPC_CLI_TESTS — the listed count DECREASED: if you deleted tests, restore them; do not lower this value"
+              fi
+            fi
+            cat "$log.plain"
+            exit 1
+          fi
+          echo "frpc CLI-lane guard ok: $n tests listed and $log_n executed across 9 targets (expected $FRPC_CLI_TESTS), 0 failed"
       - name: Run frpc's log-completion spawn test (the client control)
         # `frpc/tests/log_completion.rs` is the **control** for the empty-CLI-value
         # rule the `frps` log-completion step below pins. The client has never
@@ -1506,6 +1988,7 @@ jobs:
         run: |
           set -eo pipefail
           expected=1
+          expected_floor=1
           log=/tmp/frpc-log-completion-tests.log
           cargo test -p frpc --test log_completion --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
@@ -1514,6 +1997,7 @@ jobs:
           grep -q "Running tests/log_completion.rs" "$log.plain" || status=1
           grep -q "test result: ok. $expected passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "$expected" ] || status=1
+          [ "$expected" -ge "$expected_floor" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frpc log-completion guard failed (status=$status, file=$n, expected=$expected, log=$log)"
             if [ -n "$n" ] && [ "$n" != "$expected" ]; then
@@ -1526,7 +2010,7 @@ jobs:
             cat "$log.plain"
             exit 1
           fi
-          echo "frpc log-completion guard ok: $n tests listed (expected $expected), 0 failed"
+          echo "frpc log-completion guard ok: $n tests listed (expected $expected, floor $expected_floor), 0 failed"
       - name: Run frps CLI tests (config-failure exit codes)
         # The `frps` sibling of the step above. No lane ran the
         # `frps/tests/cli_exit_codes.rs` *integration* target before this step:
@@ -1585,6 +2069,12 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
+          case "${FRPS_CLI_TESTS_FLOOR}" in
+            ''|*[!0-9]*)
+              echo "::error::frps CLI exit-code guard: env.FRPS_CLI_TESTS_FLOOR must be a non-negative integer (got '${FRPS_CLI_TESTS_FLOOR}')"
+              exit 1
+              ;;
+          esac
           case "$FRPS_CLI_TESTS" in
             ''|*[!0-9]*)
               echo "::error::frps CLI exit-code guard: env.FRPS_CLI_TESTS must be a non-negative integer (got '$FRPS_CLI_TESTS')"
@@ -1600,11 +2090,15 @@ jobs:
           grep -q "Running tests/cli_exit_codes.rs" "$log.plain" || status=1
           grep -q "test result: ok. $FRPS_CLI_TESTS passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "$FRPS_CLI_TESTS" ] || status=1
+          [ "$FRPS_CLI_TESTS" -ge "$FRPS_CLI_TESTS_FLOOR" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frps CLI exit-code guard failed (status=$status, env=$FRPS_CLI_TESTS, file=$n, log=$log_n)"
+            if [ "$FRPS_CLI_TESTS" -lt "$FRPS_CLI_TESTS_FLOOR" ]; then
+              echo "::error::env.FRPS_CLI_TESTS is $FRPS_CLI_TESTS, below the absolute floor env.FRPS_CLI_TESTS_FLOOR=$FRPS_CLI_TESTS_FLOOR — a count literal lowered to match a deleted test is the exact edit this floor exists to stop. Restore the test; if the removal is intended, record it in TODO.md and lower *both* literals in the same edit, because either one alone leaves this guard red."
+            fi
             if [ -n "$log_n" ] && [ "$log_n" = "$n" ] && [ "$n" != "$FRPS_CLI_TESTS" ]; then
               if [ "$n" -gt "$FRPS_CLI_TESTS" ]; then
-                echo "::error::frps/tests/cli_exit_codes.rs lists $n tests, env.FRPS_CLI_TESTS is $FRPS_CLI_TESTS: move the single env.FRPS_CLI_TESTS value on the tests-unit job in .github/workflows/ci.yml from $FRPS_CLI_TESTS to $n"
+                echo "::error::frps/tests/cli_exit_codes.rs lists $n tests, env.FRPS_CLI_TESTS is $FRPS_CLI_TESTS: move env.FRPS_CLI_TESTS on the tests-unit job in .github/workflows/ci.yml from $FRPS_CLI_TESTS to $n. The floor stays where it is when the count rises — only a literal that FALLS has to move both."
               else
                 echo "::error::frps/tests/cli_exit_codes.rs lists $n tests, env.FRPS_CLI_TESTS is $FRPS_CLI_TESTS — the listed count DECREASED: if you deleted tests, restore them; do not lower this value"
               fi
@@ -1710,7 +2204,7 @@ jobs:
         # `--log-max-days 0`, both arbited by Go's `-c` lane — see the file's own
         # section comments), and 9 → 10 with the `-c`-lane non-empty-flag pin
         # `cli_nonempty_log_level_flag_does_not_override_the_config_file`
-        # (`TODO.md:9478`). It is the count of `#[test]`s in that one file, and
+        # (`TODO.md:9586`). It is the count of `#[test]`s in that one file, and
         # it lives in exactly one place in this step — the `expected=` line — so
         # a new pin means editing one number, not hunting a duplicated one.
         #
@@ -1724,6 +2218,7 @@ jobs:
         run: |
           set -eo pipefail
           expected=11
+          expected_floor=11
           log=/tmp/frps-log-completion-tests.log
           cargo test -p frps --features dashboard --test log_completion --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
@@ -1732,6 +2227,7 @@ jobs:
           grep -q "Running tests/log_completion.rs" "$log.plain" || status=1
           grep -q "test result: ok. $expected passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "$expected" ] || status=1
+          [ "$expected" -ge "$expected_floor" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frps log-completion guard failed (status=$status, file=$n, expected=$expected, log=$log)"
             if [ -n "$n" ] && [ "$n" != "$expected" ]; then
@@ -1744,7 +2240,7 @@ jobs:
             cat "$log.plain"
             exit 1
           fi
-          echo "frps log-completion guard ok: $n tests listed (expected $expected), 0 failed"
+          echo "frps log-completion guard ok: $n tests listed (expected $expected, floor $expected_floor), 0 failed"
       - name: Run frps's `web_server.tls.enable` warning-delivery spawn tests
         # `frps/tests/warn_delivery.rs` pins what a **user** sees when a config
         # writes `[web_server.tls] enable`: the diagnostic must reach stdout on
@@ -1792,10 +2288,12 @@ jobs:
           cargo test -p frps --features dashboard --test warn_delivery --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           n=$(cargo test -p frps --features dashboard --test warn_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          n_floor=28
           status=0
           grep -q "Running tests/warn_delivery.rs" "$log.plain" || status=1
           grep -q "test result: ok. 28 passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "28" ] || status=1
+          [ "$n" -ge "$n_floor" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frps warning-delivery guard failed (status=$status, file=$n, log=$log)"
             if [ -n "$n" ] && [ "$n" != "28" ]; then
@@ -1808,7 +2306,7 @@ jobs:
             cat "$log.plain"
             exit 1
           fi
-          echo "frps warning-delivery guard ok: $n tests listed (expected 28), 0 failed"
+          echo "frps warning-delivery guard ok: $n tests listed (expected 28, floor 28), 0 failed"
       - name: Run frps' `web_server.tls.enable` warning-delivery tests without the dashboard feature
         # The **other direction** of the step above. `frps --features dashboard`
         # answers with the dashboard clause; the *default* `frps` artifact
@@ -1828,10 +2326,12 @@ jobs:
           cargo test -p frps --test warn_delivery --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           n=$(cargo test -p frps --test warn_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          n_floor=28
           status=0
           grep -q "Running tests/warn_delivery.rs" "$log.plain" || status=1
           grep -q "test result: ok. 28 passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "28" ] || status=1
+          [ "$n" -ge "$n_floor" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frps warning-delivery guard failed without the dashboard feature (status=$status, file=$n, log=$log)"
             if [ -n "$n" ] && [ "$n" != "28" ]; then
@@ -1844,7 +2344,7 @@ jobs:
             cat "$log.plain"
             exit 1
           fi
-          echo "frps no-dashboard warning-delivery guard ok: $n tests listed (expected 28), 0 failed"
+          echo "frps no-dashboard warning-delivery guard ok: $n tests listed (expected 28, floor 28), 0 failed"
       - name: Run frpc's `web_server.tls.enable` warning-delivery spawn tests
         # The client half of the step above: `frpc/tests/warn_delivery.rs` pins
         # that the record reaches a `frpc -c` / `frpc --config-dir` user, in both
@@ -1882,10 +2382,12 @@ jobs:
           cargo test -p frpc --test warn_delivery --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           n=$(cargo test -p frpc --test warn_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          n_floor=11
           status=0
           grep -q "Running tests/warn_delivery.rs" "$log.plain" || status=1
           grep -q "test result: ok. 11 passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "11" ] || status=1
+          [ "$n" -ge "$n_floor" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frpc warning-delivery guard failed (status=$status, file=$n, log=$log)"
             if [ -n "$n" ] && [ "$n" != "11" ]; then
@@ -1898,7 +2400,7 @@ jobs:
             cat "$log.plain"
             exit 1
           fi
-          echo "frpc warning-delivery guard ok: $n tests listed (expected 11), 0 failed"
+          echo "frpc warning-delivery guard ok: $n tests listed (expected 11, floor 11), 0 failed"
       - name: Run frpc's admin config-GET delivery tests
         # `frpc/tests/admin_config_get_warning.rs` is the only test that starts a
         # **real** `frpc` (built with `--features admin`), hits the real admin
@@ -1925,10 +2427,12 @@ jobs:
         run: |
           set -eo pipefail
           log=/tmp/frpc-admin-config-get-tests.log
-          # The only count literal in this guard: when
-          # `frpc/tests/admin_config_get_warning.rs` gains or loses a test, move
-          # this line and nothing else.
+          # Two count literals in this guard: `want` is the exact count the run
+          # must report, `want_floor` the absolute floor it may not drop below.
+          # When `frpc/tests/admin_config_get_warning.rs` gains or loses a test
+          # move `want`; a *falling* count has to move both.
           want=5
+          want_floor=5
           cargo test -p frpc --features admin --test admin_config_get_warning --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           n=$(cargo test -p frpc --features admin --test admin_config_get_warning --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
@@ -1936,19 +2440,20 @@ jobs:
           grep -q "Running tests/admin_config_get_warning.rs" "$log.plain" || status=1
           grep -q "test result: ok. $want passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "$want" ] || status=1
+          [ "$want" -ge "$want_floor" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frpc admin config-GET guard failed (status=$status, file=$n, log=$log)"
             if [ -n "$n" ] && [ "$n" != "$want" ]; then
               if [ "$n" -lt "$want" ]; then
                 echo "::error::frpc/tests/admin_config_get_warning.rs lists $n tests, this step expects $want — tests were deleted or the file is not being run with --features admin; restore them rather than lowering this literal"
               else
-                echo "::error::frpc/tests/admin_config_get_warning.rs lists $n tests, this step expects $want: move the single literal in this shell step from $want to $n"
+                echo "::error::frpc/tests/admin_config_get_warning.rs lists $n tests, this step expects $want: move `want` in this shell step from $want to $n (and `want_floor` too if the count fell)"
               fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frpc admin config-GET guard ok: $n tests listed (expected $want), 0 failed"
+          echo "frpc admin config-GET guard ok: $n tests listed (expected $want, floor $want_floor), 0 failed"
       - name: Run frpc's `web_server.tls.enable` warning-delivery tests with the admin feature
         # The `admin`-on half of the `frpc` warning-delivery pair, and the only
         # lane that witnesses the `--config-dir` call site (`frpc/src/main.rs:529`)
@@ -1964,10 +2469,12 @@ jobs:
           cargo test -p frpc --features admin --test warn_delivery --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           n=$(cargo test -p frpc --features admin --test warn_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          n_floor=11
           status=0
           grep -q "Running tests/warn_delivery.rs" "$log.plain" || status=1
           grep -q "test result: ok. 11 passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "11" ] || status=1
+          [ "$n" -ge "$n_floor" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frpc admin warning-delivery guard failed (status=$status, file=$n, log=$log)"
             if [ -n "$n" ] && [ "$n" != "11" ]; then
@@ -1980,7 +2487,7 @@ jobs:
             cat "$log.plain"
             exit 1
           fi
-          echo "frpc admin warning-delivery guard ok: $n tests listed (expected 11), 0 failed"
+          echo "frpc admin warning-delivery guard ok: $n tests listed (expected 11, floor 11), 0 failed"
       - name: Run frpc's CLI-input tests with the admin feature
         # The `admin`-on half of `frpc/tests/cli_inputs.rs`, and the only lane
         # that ever ran that file with `admin` on: `Run frpc CLI tests (admin
@@ -2022,10 +2529,20 @@ jobs:
         # passed 0 and exited 0 before this check was added). With the literal
         # rejected below and `n` required to equal it, `n >= 1` follows — no
         # separate check on `n` is needed, and one that could never fire alone is
-        # not written.
+        # not written. Two literals now, not one: `FRPC_ADMIN_CLI_INPUTS_TESTS`
+        # and its floor, which is what makes a test deleted together with its
+        # literal red (this comment used to say "the single literal", which was
+        # already wrong about the file it described — see the record in
+        # `TODO.md`).
         shell: bash
         run: |
           set -eo pipefail
+          case "${FRPC_ADMIN_CLI_INPUTS_TESTS_FLOOR}" in
+            ''|*[!0-9]*)
+              echo "::error::frpc admin CLI-input guard: env.FRPC_ADMIN_CLI_INPUTS_TESTS_FLOOR must be a non-negative integer (got '${FRPC_ADMIN_CLI_INPUTS_TESTS_FLOOR}')"
+              exit 1
+              ;;
+          esac
           case "$FRPC_ADMIN_CLI_INPUTS_TESTS" in
             ''|*[!0-9]*|0)
               echo "::error::frpc admin CLI-input guard: env.FRPC_ADMIN_CLI_INPUTS_TESTS must be a positive integer (got '$FRPC_ADMIN_CLI_INPUTS_TESTS')"
@@ -2041,11 +2558,15 @@ jobs:
           grep -q "Running tests/cli_inputs.rs" "$log.plain" || status=1
           grep -q "test result: ok. $FRPC_ADMIN_CLI_INPUTS_TESTS passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "$FRPC_ADMIN_CLI_INPUTS_TESTS" ] || status=1
+          [ "$FRPC_ADMIN_CLI_INPUTS_TESTS" -ge "$FRPC_ADMIN_CLI_INPUTS_TESTS_FLOOR" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frpc admin CLI-input guard failed (status=$status, env=$FRPC_ADMIN_CLI_INPUTS_TESTS, file=$n, log=$log_n)"
+            if [ "$FRPC_ADMIN_CLI_INPUTS_TESTS" -lt "$FRPC_ADMIN_CLI_INPUTS_TESTS_FLOOR" ]; then
+              echo "::error::env.FRPC_ADMIN_CLI_INPUTS_TESTS is $FRPC_ADMIN_CLI_INPUTS_TESTS, below the absolute floor env.FRPC_ADMIN_CLI_INPUTS_TESTS_FLOOR=$FRPC_ADMIN_CLI_INPUTS_TESTS_FLOOR — a count literal lowered to match a deleted test is the exact edit this floor exists to stop. Restore the test; if the removal is intended, record it in TODO.md and lower *both* literals in the same edit, because either one alone leaves this guard red."
+            fi
             if [ -n "$log_n" ] && [ "$log_n" = "$n" ] && [ "$n" != "$FRPC_ADMIN_CLI_INPUTS_TESTS" ]; then
               if [ "$n" -gt "$FRPC_ADMIN_CLI_INPUTS_TESTS" ]; then
-                echo "::error::frpc/tests/cli_inputs.rs lists $n tests, env.FRPC_ADMIN_CLI_INPUTS_TESTS is $FRPC_ADMIN_CLI_INPUTS_TESTS: move the single env.FRPC_ADMIN_CLI_INPUTS_TESTS value on the tests-unit job in .github/workflows/ci.yml from $FRPC_ADMIN_CLI_INPUTS_TESTS to $n"
+                echo "::error::frpc/tests/cli_inputs.rs lists $n tests, env.FRPC_ADMIN_CLI_INPUTS_TESTS is $FRPC_ADMIN_CLI_INPUTS_TESTS: move env.FRPC_ADMIN_CLI_INPUTS_TESTS on the tests-unit job in .github/workflows/ci.yml from $FRPC_ADMIN_CLI_INPUTS_TESTS to $n. The floor stays where it is when the count rises — only a literal that FALLS has to move both."
               else
                 echo "::error::frpc/tests/cli_inputs.rs lists $n tests, env.FRPC_ADMIN_CLI_INPUTS_TESTS is $FRPC_ADMIN_CLI_INPUTS_TESTS — the listed count DECREASED: if you deleted tests, restore them; do not lower this value"
               fi
@@ -2088,6 +2609,12 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
+          case "${FRPC_TINY_CLI_TESTS_FLOOR}" in
+            ''|*[!0-9]*)
+              echo "::error::frpc tiny CLI exit-code guard: env.FRPC_TINY_CLI_TESTS_FLOOR must be a non-negative integer (got '${FRPC_TINY_CLI_TESTS_FLOOR}')"
+              exit 1
+              ;;
+          esac
           case "$FRPC_TINY_CLI_TESTS" in
             ''|*[!0-9]*)
               echo "::error::frpc tiny CLI exit-code guard: env.FRPC_TINY_CLI_TESTS must be a non-negative integer (got '$FRPC_TINY_CLI_TESTS')"
@@ -2103,11 +2630,15 @@ jobs:
           grep -q "Running tests/cli_exit_codes.rs" "$log.plain" || status=1
           grep -q "test result: ok. $FRPC_TINY_CLI_TESTS passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "$FRPC_TINY_CLI_TESTS" ] || status=1
+          [ "$FRPC_TINY_CLI_TESTS" -ge "$FRPC_TINY_CLI_TESTS_FLOOR" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frpc tiny CLI exit-code guard failed (status=$status, env=$FRPC_TINY_CLI_TESTS, file=$n, log=$log_n)"
+            if [ "$FRPC_TINY_CLI_TESTS" -lt "$FRPC_TINY_CLI_TESTS_FLOOR" ]; then
+              echo "::error::env.FRPC_TINY_CLI_TESTS is $FRPC_TINY_CLI_TESTS, below the absolute floor env.FRPC_TINY_CLI_TESTS_FLOOR=$FRPC_TINY_CLI_TESTS_FLOOR — a count literal lowered to match a deleted test is the exact edit this floor exists to stop. Restore the test; if the removal is intended, record it in TODO.md and lower *both* literals in the same edit, because either one alone leaves this guard red."
+            fi
             if [ -n "$log_n" ] && [ "$log_n" = "$n" ] && [ "$n" != "$FRPC_TINY_CLI_TESTS" ]; then
               if [ "$n" -gt "$FRPC_TINY_CLI_TESTS" ]; then
-                echo "::error::frpc/tests/cli_exit_codes.rs lists $n tests, env.FRPC_TINY_CLI_TESTS is $FRPC_TINY_CLI_TESTS: move the single env.FRPC_TINY_CLI_TESTS value on the tests-unit job in .github/workflows/ci.yml from $FRPC_TINY_CLI_TESTS to $n"
+                echo "::error::frpc/tests/cli_exit_codes.rs lists $n tests, env.FRPC_TINY_CLI_TESTS is $FRPC_TINY_CLI_TESTS: move env.FRPC_TINY_CLI_TESTS on the tests-unit job in .github/workflows/ci.yml from $FRPC_TINY_CLI_TESTS to $n. The floor stays where it is when the count rises — only a literal that FALLS has to move both."
               else
                 echo "::error::frpc/tests/cli_exit_codes.rs lists $n tests, env.FRPC_TINY_CLI_TESTS is $FRPC_TINY_CLI_TESTS — the listed count DECREASED: if you deleted tests, restore them; do not lower this value"
               fi
@@ -2194,6 +2725,22 @@ jobs:
   # ~5m at `-j 2` and must not serialize the artifact job. A red lane here
   # blocks a merge only if branch protection names it ("Tests (release
   # profile)").
+  #
+  # Release-mode coverage decision (item `TODO.md:9301`), measured rather than
+  # assumed. A cold `cargo build --release --workspace --all-targets -j 2` in a
+  # throwaway target dir, with exactly the CI profile overrides this job writes
+  # (`lto = false`, `opt-level = 2`), finished in **35m 55s** (`real 2155.26`,
+  # macOS arm64) — more than this job's whole `timeout-minutes: 30`, and a
+  # 2-core GitHub runner would be slower still. So this lane does not try to
+  # build every target in release. It covers the targets that *need* the shipped
+  # profile instead: `cli_exit_codes` (the three `debug_assertions`-gated signal
+  # pins above) and `warn_delivery` (28 spawn tests against a release-built
+  # `env!("CARGO_BIN_EXE_frps")` — the profile `build` uploads but never
+  # executes; two of its tests drive `debug_assertions`-only hooks, so they
+  # carry the same `#[cfg_attr(not(debug_assertions), ignore = "…")]` shape and
+  # the lane pins the ignored set by name). Every other test target keeps its
+  # debug lane, and the `--release --all-targets` measurement is recorded here
+  # rather than paid for on every run.
   release-tests:
     name: Tests (release profile)
     runs-on: ubuntu-latest
@@ -2204,6 +2751,25 @@ jobs:
       # (the guard sorts both sides), that carry the release-only skip in
       # `frps/tests/cli_exit_codes.rs`.
       FRPS_RELEASE_CLI_IGNORED: "config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorded_request config_dir_recorded_signal_fans_out_to_an_already_registered_service config_dir_where_every_task_panics_exits_nonzero"
+      # The second *guarded* release target (item `TODO.md:9301`). The debug
+      # pairing lanes (`Run frps' web_server.tls.enable warning-delivery spawn
+      # tests` and its no-dashboard sibling) pin the same 28 listed tests;
+      # in release two of them report `ignored`, because they need the
+      # `debug_assertions`-only `FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS` /
+      # `FRPS_CFGDIR_TEST_PANIC` hooks in `frps/src/main.rs` and carry
+      # `#[cfg_attr(not(debug_assertions), ignore = "…")]` — the same release-only
+      # skip shape `FRPS_RELEASE_CLI_IGNORED` pins above. `-- --list` still lists
+      # all 28 in release, so `_TESTS` is the *listed* count while
+      # `_PASSED_FLOOR` guards the executed one: a delete-plus-lower edit has to
+      # move the listed literal *and* the passed floor, and a test that quietly
+      # became `ignored` trips the sorted-set comparison in the step.
+      FRPS_RELEASE_WARN_DELIVERY_TESTS: "28"
+      FRPS_RELEASE_WARN_DELIVERY_TESTS_FLOOR: "28"
+      FRPS_RELEASE_WARN_DELIVERY_PASSED_FLOOR: "26"
+      # Exactly these two and no more: the test function names, in file order
+      # (the step sorts both sides), that carry the release-only skip in
+      # `frps/tests/warn_delivery.rs`.
+      FRPS_RELEASE_WARN_DELIVERY_IGNORED: "a_config_dir_sigusr1_immediately_after_the_ready_marker_reloads_everything a_config_dir_sigusr1_does_not_count_a_panicking_service"
     steps:
       - uses: actions/checkout@v4
       # Restore only. Two lanes SAVE this cache, each under its own key
@@ -2284,6 +2850,94 @@ jobs:
           fi
 
           echo "release cli_exit_codes lane ok: $n listed, ${expected_passed} passed, ${expected_ignored} ignored (${ignored// /, }), 0 failed"
+      # The second release target (item `TODO.md:9301`): the CLI pins above prove
+      # the release profile's *skip set*; this proves the shipped profile's
+      # runtime behaviour on a target that spawns the release `frps` binary and
+      # reads its captured tracing output. It is a spawn lane, not a unit lane:
+      # `frps/tests/warn_delivery.rs` builds `env!("CARGO_BIN_EXE_frps")` in
+      # whichever profile cargo was asked for, so in release the assertions run
+      # against an `opt-level = 2`, `debug_assertions`-off, `debug_assert!`-free
+      # server — the binary the `build` job uploads but never executes.
+      - name: Run frps's warning-delivery spawn tests in the release profile
+        shell: bash
+        run: |
+          set -eo pipefail
+          case "$FRPS_RELEASE_WARN_DELIVERY_TESTS" in
+            ''|*[!0-9]*)
+              echo "::error::env.FRPS_RELEASE_WARN_DELIVERY_TESTS must be a non-negative integer (got '$FRPS_RELEASE_WARN_DELIVERY_TESTS')" >&2
+              exit 1
+              ;;
+          esac
+          case "$FRPS_RELEASE_WARN_DELIVERY_TESTS_FLOOR" in
+            ''|*[!0-9]*)
+              echo "::error::env.FRPS_RELEASE_WARN_DELIVERY_TESTS_FLOOR must be a non-negative integer (got '$FRPS_RELEASE_WARN_DELIVERY_TESTS_FLOOR')" >&2
+              exit 1
+              ;;
+          esac
+          case "$FRPS_RELEASE_WARN_DELIVERY_PASSED_FLOOR" in
+            ''|*[!0-9]*)
+              echo "::error::env.FRPS_RELEASE_WARN_DELIVERY_PASSED_FLOOR must be a non-negative integer (got '$FRPS_RELEASE_WARN_DELIVERY_PASSED_FLOOR')" >&2
+              exit 1
+              ;;
+          esac
+          if [ -z "$FRPS_RELEASE_WARN_DELIVERY_IGNORED" ]; then
+            echo "::error::env.FRPS_RELEASE_WARN_DELIVERY_IGNORED must name the release-only ignored tests (it is empty)" >&2
+            exit 1
+          fi
+          expected_ignored=$(printf '%s\n' $FRPS_RELEASE_WARN_DELIVERY_IGNORED | wc -l | tr -d ' ')
+          expected_passed=$((FRPS_RELEASE_WARN_DELIVERY_TESTS - expected_ignored))
+          log=/tmp/frps-release-warn-delivery.log
+          run_status=0
+          cargo test --release -p frps --test warn_delivery --color never 2>&1 | tee "$log" || run_status=$?
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+
+          n=$(cargo test --release -p frps --test warn_delivery --color never -- --list 2>&1 \
+            | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+
+          expected_ignored_sorted=$(printf '%s\n' $FRPS_RELEASE_WARN_DELIVERY_IGNORED \
+            | sort | tr '\n' ' ' | sed -E 's/ +$//')
+          ignored=$(sed -nE 's/^test (.*) \.\.\. ignored.*$/\1/p' "$log.plain" \
+            | sort | tr '\n' ' ' | sed -E 's/ +$//')
+
+          status=0
+          [ "$run_status" = "0" ] || status=1
+          grep -q 'Running tests/warn_delivery.rs' "$log.plain" || status=1
+          grep -q "test result: ok. ${expected_passed} passed; 0 failed; ${expected_ignored} ignored;" "$log.plain" || status=1
+          [ "$ignored" = "$expected_ignored_sorted" ] || status=1
+          [ "$n" = "$FRPS_RELEASE_WARN_DELIVERY_TESTS" ] || status=1
+          [ "$FRPS_RELEASE_WARN_DELIVERY_TESTS" -ge "$FRPS_RELEASE_WARN_DELIVERY_TESTS_FLOOR" ] || status=1
+          [ "$expected_passed" -ge "$FRPS_RELEASE_WARN_DELIVERY_PASSED_FLOOR" ] || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::the release warn_delivery lane failed (status=$status, cargo=$run_status, listed=$n, declared=$FRPS_RELEASE_WARN_DELIVERY_TESTS, floor=$FRPS_RELEASE_WARN_DELIVERY_TESTS_FLOOR, log=$log)" >&2
+            if [ "$FRPS_RELEASE_WARN_DELIVERY_TESTS" -lt "$FRPS_RELEASE_WARN_DELIVERY_TESTS_FLOOR" ]; then
+              echo "::error::env.FRPS_RELEASE_WARN_DELIVERY_TESTS was lowered below its floor $FRPS_RELEASE_WARN_DELIVERY_TESTS_FLOOR — restore the deleted test, or move *both* literals in one edit if the removal is intended and recorded in TODO.md" >&2
+            fi
+            if [ "$expected_passed" -lt "$FRPS_RELEASE_WARN_DELIVERY_PASSED_FLOOR" ]; then
+              echo "::error::the release run executes ${expected_passed} of $FRPS_RELEASE_WARN_DELIVERY_TESTS listed tests, below the absolute floor env.FRPS_RELEASE_WARN_DELIVERY_PASSED_FLOOR=$FRPS_RELEASE_WARN_DELIVERY_PASSED_FLOOR — a listed count that FELL means a test was deleted or newly ignored: restore it, or move the listed literal *and* both floors in one recorded edit" >&2
+            fi
+            if ! grep -q 'Running tests/warn_delivery.rs' "$log.plain"; then
+              echo "::error::the release run never built tests/warn_delivery.rs — the target was deleted or renamed, so this lane proves nothing until both literals and this step are updated together" >&2
+            fi
+            if ! grep -q "test result: ok. ${expected_passed} passed; 0 failed; ${expected_ignored} ignored;" "$log.plain"; then
+              echo "::error::the release run did not report 'test result: ok. ${expected_passed} passed; 0 failed; ${expected_ignored} ignored;' (listed $FRPS_RELEASE_WARN_DELIVERY_TESTS, ignored $expected_ignored). Every 'test result' line:" >&2
+              grep 'test result' "$log.plain" >&2 || true
+            fi
+            if [ "$ignored" != "$expected_ignored_sorted" ]; then
+              echo "::error::the release-ignored set is not the two debug-only hook tests" >&2
+              echo "       expected: $expected_ignored_sorted" >&2
+              echo "       actual:   $ignored" >&2
+            fi
+            if [ "$n" != "$FRPS_RELEASE_WARN_DELIVERY_TESTS" ]; then
+              if [ "$n" -lt "$FRPS_RELEASE_WARN_DELIVERY_TESTS" ]; then
+                echo "::error::release -- --list is $n tests, below the declared $FRPS_RELEASE_WARN_DELIVERY_TESTS — the listed count DECREASED: restore the deleted tests rather than lowering this value" >&2
+              else
+                echo "::error::release -- --list is $n tests, above the declared $FRPS_RELEASE_WARN_DELIVERY_TESTS — move env.FRPS_RELEASE_WARN_DELIVERY_TESTS forward (and its floor with it)" >&2
+              fi
+            fi
+            cat "$log.plain" >&2
+            exit 1
+          fi
+          echo "release warn_delivery lane ok: $n listed, ${expected_passed} passed, ${expected_ignored} ignored (${ignored// /, }), 0 failed (floors $FRPS_RELEASE_WARN_DELIVERY_TESTS_FLOOR listed / $FRPS_RELEASE_WARN_DELIVERY_PASSED_FLOOR passed)"
   tests-server:
     name: Tests (server integration)
     runs-on: ubuntu-latest
@@ -2342,6 +2996,7 @@ jobs:
         run: |
           set -eo pipefail
           expected=2
+          expected_floor=2
           log=/tmp/frp-server-ws-dedicated-port.log
           run_status=0
           cargo test -p frp-server --features dashboard --test transport_e2e_websocket_port --color never 2>&1 | tee "$log" || run_status=$?
@@ -2352,6 +3007,7 @@ jobs:
           grep -q "Running tests/transport_e2e_websocket_port.rs" "$log.plain" || status=1
           grep -q "test result: ok. $expected passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "$expected" ] || status=1
+          [ "$expected" -ge "$expected_floor" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frp-server dedicated-websocket_port guard failed (status=$status, cargo=$run_status, file=$n, expected=$expected, log=$log)"
             if [ -n "$n" ] && [ "$n" != "$expected" ]; then
@@ -2364,7 +3020,73 @@ jobs:
             cat "$log.plain"
             exit 1
           fi
-          echo "frp-server dedicated-websocket_port guard ok: $n tests listed (expected $expected), 0 failed"
+          echo "frp-server dedicated-websocket_port guard ok: $n tests listed (expected $expected, floor $expected_floor), 0 failed"
+      - name: Run frp-server's vhost unit tests and assert their count
+        # `frp-server/src/vhost/tests.rs` is a test-only module (no `#[cfg]`
+        # gate) inside the library target, so the step above *does* execute it —
+        # but nothing notices if it stops running. `cargo test` exits 0 when a
+        # module compiles to zero tests, and the library target's failures are
+        # diluted across 485 unit tests: measured, deleting
+        # `test_extract_sni_short_data` left `cargo test -p frp-server
+        # --all-features` fully green while `-- --list` dropped 765 → 764
+        # overall and `^vhost::tests::` 61 → 60. No lane named `vhost::tests`
+        # anywhere in `.github/workflows/ci.yml` before this step.
+        #
+        # The filtered run is the cheap witness (`424 filtered out` on the
+        # `--features dashboard` set, the feature set the two steps above use),
+        # and `expected`/`expected_floor` are the two literals that a
+        # delete-plus-lower edit has to move together: the equality check below
+        # reads the `-- --list` count, the floor is asserted against the
+        # *declared* literal so a count and its literal lowered in one edit
+        # still red. Re-derived with
+        # `cargo test -p frp-server --features dashboard --lib --color never --
+        # --list` (61 `^vhost::tests::` lines; the same 61 under
+        # `--all-features`), and the filtered run's summary measured as
+        # `test result: ok. 61 passed; 0 failed`.
+        shell: bash
+        run: |
+          set -eo pipefail
+          expected=61
+          expected_floor=61
+          case "$expected_floor" in
+            ''|*[!0-9]*)
+              echo "::error::frp-server vhost guard: expected_floor must be a non-negative integer (got '$expected_floor')"
+              exit 1
+              ;;
+          esac
+          log=/tmp/frp-server-vhost-tests.log
+          run_status=0
+          cargo test -p frp-server --features dashboard --lib --color never vhost::tests 2>&1 | tee "$log" || run_status=$?
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+          n=$(cargo test -p frp-server --features dashboard --lib --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^vhost::tests::.*: test$' || true)
+          ran=$(grep -E -o 'test result: ok\. [0-9]+ passed' "$log.plain" | head -1 | sed -E 's/.* ([0-9]+) passed$/\1/' || true)
+          status=0
+          [ "$run_status" = "0" ] || status=1
+          grep -q "Running unittests src/lib.rs" "$log.plain" || status=1
+          grep -q "test result: ok. $expected passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "$expected" ] || status=1
+          [ "$expected" -ge "$expected_floor" ] || status=1
+          if [ "$status" != "0" ]; then
+            echo "::error::frp-server vhost::tests guard failed (status=$status, cargo=$run_status, declared=$expected, listed=$n, filtered-run=$ran, log=$log)"
+            if [ "$expected" -lt "$expected_floor" ]; then
+              echo "::error::the frp-server vhost guard's declared count $expected is below its floor $expected_floor — a count literal lowered to match a deleted test is the exact edit this floor exists to stop. Restore the test; if the removal is intended, record it in TODO.md and lower *both* literals in the same edit, because either one alone leaves this guard red."
+            fi
+            if [ -z "$ran" ]; then
+              echo "::error::the filtered vhost::tests run printed no 'test result: ok. N passed' summary — the library target did not run to completion (a compile error, or a panic before the harness reported)"
+            elif [ "$ran" != "$expected" ]; then
+              echo "::error::the filtered vhost::tests run reported $ran passed, this step expects $expected — the module compiled to a different number of tests than -- --list reports, so a #[cfg] gate or the module wiring changed; restore it rather than lowering the literal"
+            fi
+            if [ -n "$n" ] && [ "$n" != "$expected" ]; then
+              if [ "$n" -lt "$expected" ]; then
+                echo "::error::frp-server/src/vhost/tests.rs lists $n tests, this step expects $expected — the tests were deleted, or the module stopped compiling into the library target; restore them rather than lowering the literal"
+              else
+                echo "::error::frp-server/src/vhost/tests.rs lists $n tests, this step expects $expected: move the two literals ('expected=' and 'expected_floor=') at the top of this step to $n"
+              fi
+            fi
+            cat "$log.plain"
+            exit 1
+          fi
+          echo "frp-server vhost::tests guard ok: $n tests listed (expected $expected, floor $expected_floor), 0 failed"
       - name: Run frp-server's tests with no features (runtime half of frp-server's tier gate)
         # The `verify` lane's `cargo check -p frp-server --no-default-features
         # --all-targets` is compile-only, so it cannot see a missing #[cfg] on a
@@ -2490,10 +3212,12 @@ jobs:
           cargo test -p frp-client --no-default-features --features admin --test reload_warning_delivery --color never 2>&1 | tee "$log"
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           n=$(cargo test -p frp-client --no-default-features --features admin --test reload_warning_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
+          n_floor=1
           status=0
           grep -q "Running tests/reload_warning_delivery.rs" "$log.plain" || status=1
           grep -q "test result: ok. 1 passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "1" ] || status=1
+          [ "$n" -ge "$n_floor" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frp-client admin-without-TLS warning guard failed (status=$status, file=$n, log=$log)"
             if [ -n "$n" ] && [ "$n" != "1" ]; then
@@ -2506,7 +3230,7 @@ jobs:
             cat "$log.plain"
             exit 1
           fi
-          echo "frp-client admin-without-TLS warning guard ok: $n tests listed (expected 1), 0 failed"
+          echo "frp-client admin-without-TLS warning guard ok: $n tests listed (expected 1, floor 1), 0 failed"
 
   verify:
     name: Verify (bench + feature sets)
