@@ -176,7 +176,7 @@ for path in sorted(files):
         # Test the body's LAST line, not `end`: `end` is the index just past the
         # closing brace, so when a `#[cfg(test)] mod` starts on the very next
         # line an inclusive test on `end` silently drops the function. That hid
-        # `login.rs::authenticate` (510 code lines, the 4th largest in the repo).
+        # `frp-server/src/control/login.rs::authenticate` (492 code lines, the 5th largest in the repo).
         if end is None or is_test(end - 1, blocks):
             continue
         seg = lines[st:end]

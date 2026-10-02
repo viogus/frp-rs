@@ -71,7 +71,7 @@ async fn test_v2_handshake_aead_aes256gcm_message_roundtrip() {
     );
 
     // Client writes with client-to-server key, reads with server-to-client
-    // key; server mirrors (login.rs:1066-1089 / client control.rs:478-486).
+    // key; server mirrors (frp-server/src/control/login.rs:648-671 / client control.rs:478-486).
     let (c2s, s2c) =
         derive_aead_control_keys(b"round14-token", cctx.algorithm, &cctx.transcript_hash).unwrap();
     let mut client_aead = AeadStream::new(Box::new(client_io), cctx.algorithm, &s2c, &c2s).unwrap();

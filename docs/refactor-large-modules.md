@@ -30,6 +30,11 @@ lines), yet it contains the largest production function in the repository:
 | 9 | `run_udp_work_conn` | `frp-client/src/work_conn.rs:754` | 418 |
 | 10 | `handle_websocket_connection` | `frp-server/src/handlers/transport.rs:674` | 411 |
 
+*This table is the plan-time snapshot (2026-09-17 at `9c84ada`). It is kept as written
+because the argument rests on the ranking it forced; later seams move rows.
+`authenticate` is now `frp-server/src/control/login.rs:254` (492 code lines) and ranks 5th —
+see **P5**.*
+
 `run` is **1.85× larger than the next function** and is the single best
 refactoring target in the codebase — and, unusually, also the **safest** (see
 below). It was invisible to a file-size ranking, and it was invisible to the
@@ -255,7 +260,7 @@ Ranked by *risk reduction per unit of disruption*, using the measurements above.
 | **P2** | `frp-client/src/service.rs` | #1 production file size (4930), #1 churn (53), #1 fix density (230), 84 cfg gates | 5 seams, ~1900 lines |
 | **P3** | `frp-client/src/visitor.rs` | #2 production size (3685) and **almost untested** (165 test lines) | 3–4 seams |
 | **P4** | `frp-server/src/control/proxy_ops.rs` | `handle_new_proxy` 546 code lines; 2nd-highest fix density | 2–3 seams |
-| **P5** | `frp-server/src/control/login.rs::authenticate` (510) and `frp-client/src/work_conn.rs` (`spawn_work_conn` 469, `run_udp_work_conn` 419) | Surfaced only by the measurement script; not on any file-size list | 1 seam each |
+| **P5** | `frp-server/src/control/login.rs::authenticate` (492) and `frp-client/src/work_conn.rs` (`spawn_work_conn` 469, `run_udp_work_conn` 419) | Surfaced only by the measurement script; not on any file-size list | 1 seam each |
 | **P6** | `frp-server/src/control/bridge.rs` | Hot data path, highest risk per line changed. Only the UDP family and the injector adapter clearly pay | 2 seams |
 | **P7** | `frp-server/src/vhost.rs` | Not urgent for production, but **a 3151-line test extraction with zero production change**, then 4 low-risk seams | 1 free step + 4 seams |
 | **P8** | `frp-server/src/ssh_gateway.rs` | Already decomposed (largest fn 310 code lines); the win is the test extraction plus `args.rs`, the cleanest seam in the repo | 1 free step + 6 seams |
@@ -522,12 +527,13 @@ check from Step 0. The `tcpmux_group_*` / `tcpmux_route_conflict*` /
 `tcpmux_unknown_multiplexer_rejected_empty_accepted` tests drive `handle_new_proxy`
 end-to-end and cover seam 8.
 
-### P5 — `frp-server/src/control/login.rs::authenticate` (510) and `frp-client/src/work_conn.rs`
+### P5 — `frp-server/src/control/login.rs::authenticate` (492) and `frp-client/src/work_conn.rs`
 
 Neither file appears on a file-size ranking, yet each holds a function in the
 repository's top ten by code size:
 
-- `authenticate` (`login.rs:617`, 510 code lines) — the login handshake and every
+- `authenticate` (`frp-server/src/control/login.rs:254`, 492 code lines; 510 before the
+  auth-method seam landed) — the login handshake and every
   authentication path. `login.rs` has the 2nd-highest fix density in the server
   (`40` commits touching it in the last 400). Sub-splitting by auth method
   (token / OIDC / replay+throttle) is the obvious seam; note that the *order* of
@@ -539,6 +545,25 @@ repository's top ten by code size:
 
 These are the clearest illustration of why this document exists: **file-size
 ranking would never have found them.**
+
+**Landed so far (server half — PR #454 at code head `7d95d267`, based on `18bcd1ad`; rebased from
+`f881d15e`, code commit patch-identical under `git range-diff`):** the auth-method split, stated
+precisely — the base **already** had `verify_login_auth` (base `frp-server/src/control/login.rs:245-588`,
+called from `authenticate` at base `:944`) and `throttled_login_error` (base `:210-228`) as sibling
+functions, so this seam (a) moves those two pre-existing siblings into child modules of the parent file —
+the same parent-file + child-module layout as the landed `frp-server/src/service/listeners.rs` seam, not
+`mod.rs`: `frp-server/src/control/login/throttle.rs` (`pub(super) async fn pre_auth_throttle_gate`,
+`pub(super) async fn throttled_login_error`) and `frp-server/src/control/login/auth.rs`
+(`pub(super) async fn verify_login_auth` plus `verify_oidc_login` / `verify_token_login` /
+`check_token_replay`); (b) extracts the 32-line pre-auth throttle gate out of `authenticate`; and
+(c) splits `verify_login_auth`'s inline `if/else if/else` dispatch into three early-returning functions
+— **(c) is restructuring, not a verbatim move**, backed by behaviour-preservation evidence rather than
+token identity. `authenticate` stays the ordered orchestrator at 510 → 492 code lines (838 → 811 total),
+`frp-server/src/control/login.rs:645` → `:254`; the file 3361 → 2943 lines. Purity holds for the moved
+arms: literal multiset 359 == 321 + 32 + 6 with an empty residual, no old token missing from the new
+files, and strictly-increasing order markers (see the `TODO.md` progress paragraph). The ordering
+invariants are pinned by no test yet and are filed as a new item. The client half
+(`frp-client/src/work_conn.rs`) is untouched.
 
 *Risk:* medium for `authenticate` (auth ordering, throttle/replay semantics),
 low for the work-conn pair.
