@@ -1,5 +1,5 @@
 //! The three `frpc` CLI/config inputs Go frp v0.71.0 accepts and frp-rs used to
-//! reject (`TODO.md:1605`).
+//! reject (`TODO.md:3672`).
 //!
 //! Each test here runs the real `CARGO_BIN_EXE_frpc` against a one-shot
 //! loopback mock admin server and asserts on the request the mock received —

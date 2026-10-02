@@ -27,7 +27,13 @@
 #   10 a `TODO.md` with no item headers is a hard failure, not "0 violations";
 #   11 a missing ledger is a hard failure;
 #   12 two cites on one line each name their own target;
-#   13 a tree with no cites at all fails the floor rather than certifying
+#   13 a header-shaped line inside a fenced code block is not an item header, and
+#      an unterminated fence is a hard failure;
+#   14 the three cite shapes the round-1 adversarial measured as uncounted — a
+#      missing number, a space before the colon, and a number wrapped onto the
+#      next line — are each counted, and the first two red;
+#   15 a `git ls-files` that fails is a hard failure, not a partial tree;
+#   16 a tree with no cites at all fails the floor rather than certifying
 #      "nothing to check".
 #
 # Self-contained: no network, no compat run, no repo binaries. The synthetic
@@ -55,7 +61,6 @@ while [ -L "$self" ]; do
     *)  self=$dir/$link ;;
   esac
 done
-SELF_REAL=$self
 ROOT=$(cd -P -- "$(dirname -- "$self")/../.." && pwd)
 GUARD="$ROOT/scripts/tests/todo-cite-guard.sh"
 
@@ -68,7 +73,7 @@ hdr() { printf '%s\n' "---------------------------------------------------------
 
 # The floor below is this suite's own self-defence (the same shape as the
 # sibling suites): `exit "$fail"` alone is happy with no assertions at all.
-MIN_CHECKS=40
+MIN_CHECKS=60
 
 cleanup_all() {
   local rc=$? min_raw
@@ -144,6 +149,9 @@ build_tree() {   # $1 = dir, $2 = header line, $3 = ledger body
 # the gate it drives, so a numbered token typed into these comments would be a
 # real (and wrong) cite.
 cite() { printf '%s:%s' 'TODO.md' "$1"; }
+# The bare colon token (a cite with its number missing), built from pieces so this
+# file's own bytes never carry the literal the gate scans for.
+colon() { printf '%s:' 'TODO.md'; }
 # The bare continuation token, built the same way.
 bare() { printf ':%s' "$1"; }
 
@@ -221,9 +229,10 @@ printf '//! cites %s:%s here\n' 'TODO.md' '12x' > "$tmp/t5/src/bad.rs"
 run_gate "$tmp/t5"
 if [ "$LAST_RC" -ne 0 ]; then ok "unparseable cite: gate exited $LAST_RC"; else bad 'unparseable cite: gate exited 0'; fi
 case $LAST_OUT in
-  *'src/bad.rs:1'*'unparseable'*) ok 'unparseable cite: named with the unparseable reason' ;;
+  *'src/bad.rs:1'*'unparseable'*) ok 'unparseable cite: the digit-then-letter token reds' ;;
   *) bad "unparseable cite: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
 esac
+
 
 hdr 'scenario 6 — point-in-time documents are out of scope'
 build_tree "$tmp/t6" '- [ ] **First item.**' '  body'
@@ -379,7 +388,135 @@ case $LAST_OUT in
   *) bad "nested `file:line: \"text\"`: unexpected summary: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
 esac
 
-hdr 'scenario 13 — a tree with no cites fails the floor'
+hdr 'scenario 13 — a header-shaped line inside a fence is not an item header'
+# F1 (adversarial round 1): a fenced `- [ ] **…**` line is documentation. A cite
+# to it must red, with its own reason, and an un-fenced header beside it is still
+# a legitimate target. An unterminated fence is itself a hard failure.
+build_tree "$tmp/t13" '- [ ] **Fenced item.**' '  body'
+printf -- '```\n' >> "$tmp/t13/TODO.md"
+printf -- '- [ ] **Fenced item.**\n  fenced body\n' >> "$tmp/t13/TODO.md"
+printf -- '```\n' >> "$tmp/t13/TODO.md"
+printf -- '- [ ] **Real item.**\n  body\n' >> "$tmp/t13/TODO.md"
+printf '//! fenced target: %s\n' "$(cite 13)" > "$tmp/t13/src/fenced.rs"
+run_gate "$tmp/t13"
+if [ "$LAST_RC" -ne 0 ]; then
+  ok "fenced header: a cite to a fenced header-shaped line exits $LAST_RC"
+else
+  bad 'fenced header: a cite to a fenced header-shaped line exited 0'
+fi
+case $LAST_OUT in
+  *'header-shaped line inside a fenced block'*) ok 'fenced header: the failure names the fenced block' ;;
+  *) bad "fenced header: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+# The same line outside a fence is a real header and stays green.
+printf '//! real target: %s\n' "$(cite 16)" > "$tmp/t13/src/fenced.rs"
+printf '//! the real header is at line 13 here\n' > "$tmp/t13/src/real.rs"
+run_gate "$tmp/t13"
+if [ "$LAST_RC" -eq 0 ]; then
+  ok 'fenced header: the un-fenced header is still a valid target'
+else
+  bad "fenced header: the un-fenced header was refused: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')"
+fi
+case $LAST_OUT in
+  *'src/real.rs:1'*) bad 'fenced header: the prose cite in real.rs was treated as a citation' ;;
+  *) ok 'fenced header: a line whose number is not written as a cite is not one' ;;
+esac
+# Unterminated fence: hard failure.
+build_tree "$tmp/t13u" '- [ ] **Only item.**' '  body'
+printf -- '```\n' >> "$tmp/t13u/TODO.md"
+printf -- 'never closed\n' >> "$tmp/t13u/TODO.md"
+run_gate "$tmp/t13u"
+if [ "$LAST_RC" -ne 0 ]; then
+  ok "fenced header: an unterminated fence exits $LAST_RC"
+else
+  bad 'fenced header: an unterminated fence exited 0'
+fi
+case $LAST_OUT in
+  *'unterminated fence'*) ok 'fenced header: the failure names the unterminated fence' ;;
+  *) bad "fenced header: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+
+hdr 'scenario 14 — the three uncounted cite shapes are counted (F2)'
+# (a) a colon with no number at all: counted, and red.
+build_tree "$tmp/t14" '- [ ] **First item.**' '  body'
+printf '//! attempt: %s\n' "$(colon)" > "$tmp/t14/src/missing.rs"
+run_gate "$tmp/t14"
+if [ "$LAST_RC" -ne 0 ]; then ok "missing-number cite: exits $LAST_RC"; else bad 'missing-number cite: exited 0'; fi
+case $LAST_OUT in
+  *'src/missing.rs:1'*'cite with no line number'*) ok 'missing-number cite: named with its own reason' ;;
+  *) bad "missing-number cite: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+case $LAST_OUT in
+  *'RESULT: 2 cite(s) checked'*) ok 'missing-number cite: it is counted, not skipped' ;;
+  *) bad "missing-number cite: not counted: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+# (b) a space before the colon: counted, and red.
+build_tree "$tmp/t14b" '- [ ] **First item.**' '  body'
+printf '//! attempt: %s %s %s here\n' 'TODO.md' ':' '7' > "$tmp/t14b/src/spaced.rs"
+run_gate "$tmp/t14b"
+if [ "$LAST_RC" -ne 0 ]; then ok "spaced-colon cite: exits $LAST_RC"; else bad 'spaced-colon cite: exited 0'; fi
+case $LAST_OUT in
+  *'src/spaced.rs:1'*'whitespace before the colon'*) ok 'spaced-colon cite: named as malformed' ;;
+  *) bad "spaced-colon cite: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+case $LAST_OUT in
+  *'RESULT: 2 cite(s) checked'*) ok 'spaced-colon cite: it is counted, not skipped' ;;
+  *) bad "spaced-colon cite: not counted: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+# (c) the number wrapped onto the next line: counted, and red.
+build_tree "$tmp/t14c" '- [ ] **First item.**' '  body'
+{
+  printf '//! wrapped cite: %s\n' "$(colon)"
+  printf '//!   :%s\n' '6'
+} > "$tmp/t14c/src/wrapped.rs"
+run_gate "$tmp/t14c"
+if [ "$LAST_RC" -ne 0 ]; then ok "wrapped-number cite: exits $LAST_RC"; else bad 'wrapped-number cite: exited 0'; fi
+case $LAST_OUT in
+  *'src/wrapped.rs:2'*'not an item header'*) ok 'wrapped-number cite: the continuation on the next line reds' ;;
+  *) bad "wrapped-number cite: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+case $LAST_OUT in
+  *'RESULT: 2 cite(s) checked'*) ok 'wrapped-number cite: it is counted, not skipped' ;;
+  *) bad "wrapped-number cite: not counted: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+
+hdr 'scenario 15 — a failing `git ls-files` is a hard failure'
+# F3 (adversarial round 1): the rc guard on `git ls-files` had no fixture, so
+# `if out.returncode != 0:` replaced by a constant stayed green. A `.git` whose
+# gitdir does not exist makes git exit non-zero; the gate must refuse, not walk.
+mkdir -p "$tmp/t15/src"
+printf -- '- [ ] **Only item.**\n  body\n' > "$tmp/t15/TODO.md"
+printf '//! a cite %s\n' "$(cite 1)" > "$tmp/t15/src/live.rs"
+printf 'gitdir: %s\n' "$tmp/t15/no-such-gitdir" > "$tmp/t15/.git"
+run_gate "$tmp/t15"
+if [ "$LAST_RC" -ne 0 ]; then
+  ok "git rc guard: a failing ls-files exits $LAST_RC"
+else
+  bad 'git rc guard: a failing ls-files exited 0 — a partial tree was certified'
+fi
+case $LAST_OUT in
+  *'git ls-files failed'*) ok 'git rc guard: the failure names the failing ls-files' ;;
+  *) bad "git rc guard: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+
+hdr 'scenario 16 — an indented wrapped number is a continuation'
+build_tree "$tmp/t16" '- [ ] **First item.**' '  body'
+{
+  printf '//! wrapped cite: %s\n' "$(colon)"
+  printf '//!   :%s here\n' '6'
+} > "$tmp/t16/src/wrapped_indent.rs"
+run_gate "$tmp/t16"
+if [ "$LAST_RC" -ne 0 ]; then ok "indented continuation: exits $LAST_RC"; else bad 'indented continuation: exited 0'; fi
+case $LAST_OUT in
+  *'src/wrapped_indent.rs:2'*'not an item header'*) ok 'indented continuation: the indented number is read and reds' ;;
+  *) bad "indented continuation: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+case $LAST_OUT in
+  *'RESULT: 2 cite(s) checked'*) ok 'indented continuation: it is counted, not skipped' ;;
+  *) bad "indented continuation: not counted: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+
+hdr 'scenario 17 — a tree with no cites fails the floor'
 build_tree "$tmp/t13" '- [ ] **First item.**' '  body'
 rm -f "$tmp/t13/src/live.rs"
 run_gate "$tmp/t13"
@@ -414,7 +551,7 @@ case $out in
   *) bad "zero floor: unexpected failure text: $(printf '%s' "$out" | tr '\n' ' ')" ;;
 esac
 
-hdr 'scenario 14 — the gate is self-contained and read-only'
+hdr 'scenario 18 — the gate is self-contained and read-only'
 if [ -f "$GUARD" ]; then
   ok 'the gate script exists at scripts/tests/todo-cite-guard.sh'
 else

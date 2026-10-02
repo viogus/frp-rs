@@ -45,7 +45,7 @@ byte-identical to upstream so a future Go release can be diffed against it
 The two long-standing gaps that used to stop it loading end to end — bare
 numeric values inferred as TOML integers, and `[range:...]` comma lists split
 into a TOML array that `ini_port_numbers` refused — are fixed
-(`TODO.md:1364`): `.ini` values are now read by the target field's type, with a
+(`TODO.md:2609`): `.ini` values are now read by the target field's type, with a
 lossless inference, and the range collector accepts the split array.
 
 ## `frps_legacy_full.ini`

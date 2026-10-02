@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# todo-cite-guard.sh — fail-closed gate over `TODO.md:<n>` cross-file citations.
+# todo-cite-guard.sh — fail-closed gate over TODO.md line-number citations.
 #
 # Why this exists: `TODO.md` is a numbered ledger and every merge that inserts or
 # removes a line renumbers it, so a cite written as a bare line number silently
 # points at a different item — usually at *prose inside* some other item, which
 # reads as plausible and is why five rounds of this train each re-derived cites
 # by hand and each left a residue. The enforced property is deliberately weak and
-# mechanical: **every live `TODO.md:<n>` cite must land on an item header line**
-# (`^- \[[ x]\]`), and every cite must be checkable (in range, on a real line).
-# It does not attempt to match the cited item's title to the citing sentence: a
-# text match cannot establish intent, and a gate that guessed would either miss
-# real drift or red on honest prose. What it *does* establish is that a cite
-# either resolves to an item's header or is reported by file:line.
+# mechanical: **every live cite that names TODO.md and a line number must land on
+# an item header line** (`^- \[[ x]\]`, outside any fenced code block), and every
+# cite must be checkable. It does not attempt to match the cited item's title to
+# the citing sentence: a text match cannot establish intent, and a gate that
+# guessed would either miss real drift or red on honest prose. What it *does*
+# establish is that a cite either resolves to an item's header or is reported by
+# file:line.
 #
 # Scope — the live / point-in-time classification (the same one this PR's sweep
 # used, and the one `scripts/repo-health.sh` already applies to path cites):
@@ -20,32 +21,41 @@
 #     `scripts/**`, `.github/workflows/*.yml`, `CLAUDE.md`, `README.md`, and the
 #     top-level `docs/*.md` (including `docs/developing.md` and
 #     `docs/deployment.md`), plus any nested `README.md` under a crate.
-#   * POINT-IN-TIME (skipped): `TODO.md` itself, `CHANGELOG.md`,
+#   * POINT-IN-TIME (skipped): TODO.md itself, `CHANGELOG.md`,
 #     `performance-audit.md`, `docs/refactor-large-modules.md` (the four
 #     `SKIP_FILES` of `scripts/repo-health.sh`), and everything under
 #     `docs/history/`, `docs/archive/` and `docs/audit/`. Those documents record
-#     a round's own numbering as of that round — a past devlog row that says
-#     a cite to the closed tokenSource item was *correct then*; rewriting it
-#     would falsify the record. `CLAUDE.md` is deliberately NOT in this set: it is a live
+#     a round's own numbering as of that round — a past devlog row that cited the
+#     closed tokenSource item was *correct then*, and rewriting it would falsify
+#     the record. `CLAUDE.md` is deliberately NOT in this set: it is a live
 #     instruction file loaded into every agent context, so its cites must resolve.
 #
 # The bare `:NNNN` continuation form is handled: a cite may be written as a
-# full cite followed by a comma-separated `:NNNN` (or span a wrapped line),
-# where the second number means the same ledger. A `:NNNN` is only read as a
-# continuation when it sits
-# within the same cite list — preceded on the same line, or on the previous line,
-# by a full `TODO.md:<n>` whose line ends at that cite — and when the token is not
-# itself the tail of some other `file:line` reference.
+# full cite followed by a comma-separated `:NNNN` (or span a wrapped line,
+# including a cite whose colon ends the line and whose number opens the next at
+# any indentation), where the second number means the same ledger. A `:NNNN` is
+# only read as a continuation when it sits within the same cite list — preceded
+# on the same line by a full cite, or on a line that carries nothing but the
+# `:NNNN` token (and optional trailing text) after a full or colon-only cite —
+# and when the token is not itself the tail of some other `file:line` reference.
+# A colon-only cite whose number is indented onto the next line is the same
+# shape: the colon line is not a missing number, the continuation line is.
 #
 # Fail-closed directions (each reds with the offending file:line):
-#   * a cite past EOF, before line 1, or on a blank line;
-#   * a cite on a mid-item body line (the common drift);
-#   * a cite whose digits run into another word (a malformed token with a
-#     trailing letter, say — distinct from a documentation mention written with
-#     no digits at all, which is prose; see the unparseable-cite arm below);
-#   * zero cites found at all, or a `TODO.md` with no item headers (both mean the
+#   * a cite past EOF, before line 1, on a blank line, or on a mid-item body line
+#     (the common drift);
+#   * a cite whose target is header-shaped but sits inside a fenced code block
+#     (documentation, not an item header), or a ledger with an unterminated fence;
+#   * a citation attempt with no line number — the colon with nothing after it,
+#     with whitespace before the colon, or with a non-numeric token after it.
+#     One shape is deliberately exempt: a title-form cite (colon then a quote),
+#     which names an item by text; the sweep converted the two live ones to
+#     numbers, and a new one is prose by convention. A mention of TODO.md with no
+#     colon at all is likewise prose, not an attempt;
+#   * zero cites found at all, or a ledger with no item headers (both mean the
 #     scan is broken, not that the tree is clean);
-#   * `TODO.md` missing/unreadable, or a missing python3 interpreter.
+#   * a `git ls-files` that fails (a partial tree is never certified), a missing
+#     ledger, a missing python3 interpreter, or a disabled/zero-padded floor.
 #
 # Usage:
 #   bash scripts/tests/todo-cite-guard.sh                 # gate this worktree
@@ -76,7 +86,6 @@ while [ -L "$self" ]; do
     *)  self=$dir/$link ;;
   esac
 done
-SELF_REAL=$self
 ROOT=${1:-$(cd -P -- "$(dirname -- "$self")/../.." && pwd)}
 TODO_FILE=${2:-$ROOT/TODO.md}
 
@@ -95,8 +104,8 @@ fi
 
 # A floor on the scanned cite count, so a broken file list (a git that exits 0
 # with no output, a bogus root, a truncated checkout) is a failure rather than a
-# vacuous "0 cites, 0 violations, green". Far below any real checkout (82 live
-# occurrences on the tree that added this gate) and overridable only for the
+# vacuous "0 cites, 0 violations, green". Far below any real checkout (84 live
+# cite references on the tree that added this gate) and overridable only for the
 # fixture suite's synthetic trees, which are legitimately smaller.
 min_cites=${TODO_CITE_MIN:-20}
 # Fail closed on the floor itself: a floor of 0 (or a non-numeric one, or a
@@ -129,6 +138,12 @@ bare_re = re.compile(r":(\d+)")
 # The class is spelled `\W` (not an explicit list) so this file's bytes carry no
 # stray punctuation the shell could trip on.
 trailing_re = re.compile(r"\W*$")
+# The `TODO.md` colon, with any whitespace between the name and the colon (a
+# space before the colon is one of the F2 shapes). `\x60` spells a backtick
+# without writing one: a lone backtick inside the shell heredoc starts a command
+# substitution and breaks `bash -n`.
+colon_re = re.compile("TODO\\.md\\s*:")
+fence_re = re.compile("^\\s*(\\x60{3,}|~{3,})")
 
 PIT_FILES = ("TODO.md", "CHANGELOG.md", "performance-audit.md",
              "docs/refactor-large-modules.md")
@@ -137,6 +152,13 @@ PIT_DIRS = ("docs/history/", "docs/archive/", "docs/audit/")
 
 def is_point_in_time(rel):
     return rel in PIT_FILES or rel.startswith(PIT_DIRS)
+
+
+def continuation_at(line):
+    """True when a line carries nothing but an (indented) `:NNNN` continuation,
+    optionally behind a comment marker and with trailing text."""
+    rest = re.sub(r"^\s*(//[/!]?|#|\*|/\*|--)\s*", "", line)
+    return bool(re.fullmatch(r":\d+\s*.*", rest))
 
 
 def tracked_files():
@@ -187,77 +209,132 @@ except OSError as exc:
     print("FAIL  cannot read %s: %s" % (todo_path, exc))
     sys.exit(1)
 
-headers = [i for i, l in enumerate(todo, 1) if hdr_re.match(l)]
+# A header-shaped line *inside a fenced code block* is documentation, not an
+# item header (the item anticipates a ledger-format change). Fences are tracked
+# the way CommonMark opens one (three or more backticks or tildes); only
+# un-fenced lines can be headers.
+is_header = [False] * (len(todo) + 1)
+fence = ""
+for i, l in enumerate(todo, 1):
+    fm = fence_re.match(l)
+    if fm:
+        marker = fm.group(1)[0]
+        if fence == "":
+            fence = marker
+        elif fence == marker:
+            fence = ""
+        continue
+    if fence == "" and hdr_re.match(l):
+        is_header[i] = True
+headers = [i for i in range(1, len(todo) + 1) if is_header[i]]
 if not headers:
-    print("FAIL  %s carries no item headers (^- \\[[ x]\\]) — the ledger is not the "
+    print("FAIL  %s carries no item headers (open `- [ ]` or closed `- [x]`) — the ledger is not the "
           "ledger, so no cite can resolve" % todo_path)
+    sys.exit(1)
+# Every fence must close: an unterminated fence would make the rest of the
+# ledger invisible to the scan and could hide a live cite target.
+if fence != "":
+    print("FAIL  %s has an unterminated fence; the ledger cannot be certified"
+          % todo_path)
     sys.exit(1)
 
 violations = []
 checked = 0
+
+
+def target_reason(n, raw):
+    """The failure reason for a cite to ledger line `n`, or None when it lands
+    on an item header."""
+    if not (1 <= n <= len(todo)):
+        return "past EOF (TODO.md has %d lines)" % len(todo)
+    tgt = todo[n - 1]
+    if is_header[n]:
+        return None
+    if hdr_re.match(tgt):
+        return "header-shaped line inside a fenced block"
+    if tgt.strip() == "":
+        return "blank line"
+    return "not an item header: %s" % tgt.strip()[:70]
+
 
 for rel, lines in tracked_files():
     if is_point_in_time(rel):
         continue
     for idx, line in enumerate(lines):
         lineno = idx + 1
-        # Full cites.
+        prev = lines[idx - 1] if idx > 0 else None
+        # A wrapped cite may end at the colon (the TODO.md colon alone on this
+        # line, the number on the next): the colon form is line-final, and so is
+        # a full cite whose line ends after the number.
+        prev_wraps_cite = bool(prev is not None and trailing_re.search(prev)
+                               and (full_re.search(prev)
+                                    or colon_re.search(prev)))
+        # (a) the numbered form: the name, a colon, the digits. When the digits
+        # run into another word (`12abc`) the numbered match is only a prefix,
+        # so the whole token is reported instead.
         for m in full_re.finditer(line):
-            checked += 1
-            n = int(m.group(1))
-            if not (1 <= n <= len(todo)):
-                violations.append((rel, lineno, m.group(0),
-                                   "past EOF (TODO.md has %d lines)" % len(todo)))
+            after = line[m.end():]
+            if re.match(r"\w", after):
+                checked += 1
+                violations.append((rel, lineno, m.group(0) + after[:4],
+                                   "unparseable cite (no decimal line number)"))
                 continue
-            tgt = todo[n - 1]
-            if not hdr_re.match(tgt):
-                if tgt.strip() == "":
-                    why = "blank line"
-                else:
-                    why = "not an item header: %s" % tgt.strip()[:70]
+            checked += 1
+            why = target_reason(int(m.group(1)), m.group(0))
+            if why:
                 violations.append((rel, lineno, m.group(0), why))
-        # Bare `:NNNN` continuations.
-        prev_is_cite = idx > 0 and trailing_re.search(lines[idx - 1]) \
-            and full_re.search(lines[idx - 1])
+        # (b) bare `:NNNN` continuations. A bare number is only a continuation
+        # when the line, or a wrapped cite on the previous line, introduced the
+        # list; an unrelated `file:line` and a `:N: "text"` reference stay out.
         for m in bare_re.finditer(line):
             start = m.start()
-            # Skip the `:NNNN` that belongs to a `TODO.md:` already matched.
             if start >= 8 and line[start - 8:start] == "TODO.md:":
                 continue
-            # Skip any other `file:line` reference (the char before the colon is
-            # a path/identifier character).
             if start > 0 and (line[start - 1].isalnum() or line[start - 1] in "._-/"):
                 continue
-            # Only a continuation when this line's own cite list already started
-            # (a full cite earlier on this line, or a wrapped one above).
-            if not (full_re.search(line[:start]) or (prev_is_cite and not full_re.search(line))):
+            indented_continuation = bool(prev_wraps_cite
+                                         and not full_re.search(line)
+                                         and continuation_at(line))
+            if not (full_re.search(line[:start]) or indented_continuation):
                 continue
             checked += 1
-            n = int(m.group(1))
-            if not (1 <= n <= len(todo)):
-                violations.append((rel, lineno, m.group(0),
-                                   "past EOF (TODO.md has %d lines)" % len(todo)))
-                continue
-            tgt = todo[n - 1]
-            if not hdr_re.match(tgt):
-                if tgt.strip() == "":
-                    why = "blank line"
-                else:
-                    why = "not an item header: %s" % tgt.strip()[:70]
+            why = target_reason(int(m.group(1)), m.group(0))
+            if why:
                 violations.append((rel, lineno, m.group(0), why))
-        # Unparseable cite — a citation attempt whose digits run straight into
-        # another word (a trailing letter, say). A mention written without a
-        # digit at all (a bracketed placeholder, or a word like `foo`) is prose,
-        # not a citation attempt: this repo's documentation and this gate's own
-        # comments quote that form on purpose, and a rule that red them would
-        # leave no way to describe the rule. The number that follows a cite in a
-        # `file:line: "text"` reference is not a continuation either, so the
-        # colon-number arm above skips a `:N` whose colon is preceded by a word
-        # character or a path separator.
-        for m in re.finditer(r"TODO\.md:\d+[A-Za-z_]", line):
+        # (c) the shapes that are neither (a) nor (b). Three of these used to be
+        # scanned past silently: a missing number, a space before the colon, and
+        # a number wrapped onto the next line. The first two are citation
+        # attempts and red here; the wrapped number is counted as a continuation
+        # by (b) above, and the line that carries its colon is not re-counted
+        # here. A title-form cite (colon then a quote) is prose by convention
+        # and is the one exempt shape.
+        # An indented `:N` on the next line is this cite's continuation, so the
+        # colon itself is not a missing number: the continuation is counted on
+        # that line by (b).
+        next_line = lines[idx + 1] if idx + 1 < len(lines) else None
+        wraps_forward = bool(next_line is not None and continuation_at(next_line))
+        for m in colon_re.finditer(line):
+            rest = line[m.end():]
+            tok = rest.lstrip()
+            if tok == "":
+                if prev_wraps_cite or wraps_forward:
+                    continue          # the wrapped number is counted by (b)
+                checked += 1
+                violations.append((rel, lineno, line[m.start():m.end()],
+                                   "cite with no line number"))
+                continue
+            if tok[0] == '"':
+                continue              # title-form citation, prose by convention
+            if tok[0].isdigit():
+                if m.group(0) != "TODO.md:":
+                    checked += 1
+                    violations.append((rel, lineno, m.group(0) + tok[:10],
+                                       "malformed cite (whitespace before the colon)"))
+                continue
+            # Any other token is a citation attempt whose number is missing.
             checked += 1
-            violations.append((rel, lineno, m.group(0)[:50],
-                               "unparseable cite (no decimal line number)"))
+            violations.append((rel, lineno, m.group(0) + tok[:10],
+                               "cite with no line number"))
 
 if checked < min_cites:
     print("FAIL  only %d live cite(s) found (floor %d) — the scan is broken, not the "

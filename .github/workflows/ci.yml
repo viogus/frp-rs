@@ -112,7 +112,7 @@ jobs:
         # `exec true` planted after the trap never runs it and exits 0 with no
         # output at all. So the total is pinned *outside*: this step requires the
         # suite's summary line verbatim, and 32 is what the scenarios in
-        # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:8588` round
+        # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:8960` round
         # added the in-file floor; a scenario added or removed there moves this
         # literal — restore the checks rather than lowering it). In-file,
         # `enforce_substance` also checksums the scenario-6 metric check and the
@@ -161,7 +161,7 @@ jobs:
           log=/tmp/frp-repo-health-fixtures.log
           status=0
           guard_file=scripts/tests/repo-health-fixtures.sh
-          guard_pin=76622649863d1d2b3591727c190330a0461c47c417faa240f6a8f96e042519ed
+          guard_pin=98216685ca801e99d64500972dc40d50c90166eb0543a6052b8a79818d4952ef
           # R12-2 (adversarial round 13): resolve the hasher to an absolute path
           # and prove it with a known vector — the same candidate order and the
           # same fail-closed mode as the guard's own `find_hash_tool()`.
@@ -320,7 +320,7 @@ jobs:
         # *outside*, the way the `log_completion` step below pins its own 6: this
         # step requires the suite's summary line verbatim, and 40 is what the
         # scenarios in scripts/tests/compat-stray-guard.sh print (21 before the
-        # `TODO.md:8623` round added the ordered `SHAPE` anchors, the symlink
+        # `TODO.md:8992` round added the ordered `SHAPE` anchors, the symlink
         # `wait_exec` probe, the empty-`ps` branch and the failed-probe
         # kill-then-continue case; 31 after the round-2 pins exercised the loop's
         # empty-`cmd` guard, the exit-0-empty reap arm, and the second half of the
@@ -403,7 +403,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=a7a502e47670dc88574d7a9ecf8f7bdc17f8602d85c1b794222f432755924e5a
+          guard_pin=24f34bd64e3f159fe676e5bd5482a4d2353ebc95233e62f8aacfc275d0db364c
           # R12-1 (adversarial round 13): the enforcer's *implementation* lives in
           # the library the scenarios `source` (the `LIB=` assignment at :96 only
           # names it), so pinning only the suite left the "two-file change" claim
@@ -570,7 +570,7 @@ jobs:
           log=/tmp/frp-todo-cite-guard.log
           status=0
           guard_file=scripts/tests/todo-cite-guard.sh
-          guard_pin=e06f2b5853662dedaa59b985f7107acbb6cdd2231f8473d1be255c4752923304
+          guard_pin=541bb4e6085f1bf94c5487761e3191413e2645b88951b27109d04d914f46e048
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
@@ -644,7 +644,7 @@ jobs:
           log=/tmp/frp-todo-cite-fixtures.log
           status=0
           guard_file=scripts/tests/todo-cite-guard-fixtures.sh
-          guard_pin=973c4c8a6971e278c2ab54df667d4d3fa7fb59bee139fc6e396eda0d3c67a490
+          guard_pin=0575080e20463c176c584dc0f26ebd7685901e86246d96add0b6450420843be4
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
@@ -694,7 +694,7 @@ jobs:
             esac
           done <<< "$guard_log"
           case $guard_log in
-            *'RESULT: 40 fixture check(s) hold'*) guard_result=1 ;;
+            *'RESULT: 60 fixture check(s) hold'*) guard_result=1 ;;
           esac
           # The red-path canaries, in the suite's own wording. Each is a
           # scenario that must end with the gate refusing an injected bad cite;
@@ -706,26 +706,31 @@ jobs:
             'blank-line cite: gate exited 1' \
             'unparseable cite: gate exited 1' \
             'empty scan: exits 1' \
-            'zero floor: the gate refuses TODO_CITE_MIN=0'
+            'zero floor: the gate refuses TODO_CITE_MIN=0' \
+            'fenced header: a cite to a fenced header-shaped line exits 1' \
+            'missing-number cite: exits 1' \
+            'spaced-colon cite: exits 1' \
+            'wrapped-number cite: exits 1' \
+            'git rc guard: a failing ls-files exits 1'
           do
             case $guard_log in
               *"$guard_canary_probe"*) guard_canary=$((guard_canary + 1)) ;;
             esac
           done
           [ "$guard_result" = "1" ] || status=1
-          [ "$guard_ok" = "40" ] || status=1
-          [ "$guard_canary" = "6" ] || status=1
+          [ "$guard_ok" = "60" ] || status=1
+          [ "$guard_canary" = "11" ] || status=1
           [ "$guard_fail" = "0" ] || status=1
           if [ "$guard_fail" != "0" ]; then
             echo "::error::the cite-gate fixture suite printed $guard_fail failure line(s); a run that reported a failure cannot be reported as a green step:"
             printf '%s' "$guard_fail_text"
           fi
           if [ "$status" != "0" ]; then
-            echo "::error::the cite-gate fixture suite did not report 40 checks, all six red-path canaries and no failure line (canaries seen: $guard_canary/6)"
-            echo "::error::scripts/tests/todo-cite-guard-fixtures.sh must print 40 '  ok' lines, end with 'RESULT: 40 fixture check(s) hold', and prove the gate reds on an injected mid-item cite, a past-EOF cite, a blank-line cite, an unparseable cite, an empty scan and a disabled floor; a smaller total, a missing canary or a failure line means the gate stopped reding — restore the scenarios rather than lowering this literal"
+            echo "::error::the cite-gate fixture suite did not report 60 checks, all eleven red-path canaries and no failure line (canaries seen: $guard_canary/11)"
+            echo "::error::scripts/tests/todo-cite-guard-fixtures.sh must print 60 '  ok' lines, end with 'RESULT: 60 fixture check(s) hold', and prove the gate reds on an injected mid-item cite, a past-EOF cite, a blank-line cite, an unparseable cite, an empty scan, a disabled floor, a cite to a fenced header-shaped line, a missing-number cite, a spaced-colon cite, a wrapped-number cite and a failing `git ls-files`; a smaller total, a missing canary or a failure line means the gate stopped reding — restore the scenarios rather than lowering this literal"
             exit 1
           fi
-          echo "TODO.md citation gate fixtures ok: 40 checks hold, all 6 red-path canaries live"
+          echo "TODO.md citation gate fixtures ok: 60 checks hold, all 11 red-path canaries live"
 
   tests-unit:
     name: Tests (unit)
@@ -870,7 +875,7 @@ jobs:
       # `cargo test -p frps --test cli_exit_codes -- --list`.
       # 44 → 45 with the `-l`-shorthand refusal pin
       # `short_l_is_not_a_frps_shorthand_and_the_refusal_is_pinned`
-      # (`TODO.md:9318`): +1. Re-derived with the same `--list` command.
+      # (`TODO.md:9405`): +1. Re-derived with the same `--list` command.
       FRPS_CLI_TESTS: "45"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
@@ -1705,7 +1710,7 @@ jobs:
         # `--log-max-days 0`, both arbited by Go's `-c` lane — see the file's own
         # section comments), and 9 → 10 with the `-c`-lane non-empty-flag pin
         # `cli_nonempty_log_level_flag_does_not_override_the_config_file`
-        # (`TODO.md:9259`). It is the count of `#[test]`s in that one file, and
+        # (`TODO.md:9352`). It is the count of `#[test]`s in that one file, and
         # it lives in exactly one place in this step — the `expected=` line — so
         # a new pin means editing one number, not hunting a duplicated one.
         #

@@ -839,7 +839,7 @@ What the walk does **not** reach, each cell measured on Go frp v0.71.0
   (`legacy_ini_go_shipped_fixture_passes_strict_mode` runs the shipped file
   through the strict check from
   `frp-core/src/config/fixtures/frpc_legacy_full.ini`, and since
-  `TODO.md:1364` closed the INI value-inference gap the file also loads end to
+  `TODO.md:2609` closed the INI value-inference gap the file also loads end to
   end — `legacy_ini_go_shipped_frpc_fixture_loads_end_to_end`, 43 proxies and
   2 visitors, exactly the names Go frpc v0.71.0 logs for the file). The keys Go ignores —
   `[common]`-only keys misplaced into a proxy section (`log_level`,

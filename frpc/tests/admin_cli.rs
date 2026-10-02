@@ -613,7 +613,7 @@ fn status_strict_config_false_tolerates_an_unknown_key() {
 }
 
 /// The **documented frp-rs extension** for the space-separated form, pinned
-/// end-to-end (`TODO.md:1605`; the contract is in `docs/developing.md`
+/// end-to-end (`TODO.md:3672`; the contract is in `docs/developing.md`
 /// § "`--strict-config`: the space-separated value form"). frp-rs consumes the
 /// next token as the value, so `--strict-config false` tolerates the unknown
 /// key and dials the config's `webServer.port` — the connection arriving at

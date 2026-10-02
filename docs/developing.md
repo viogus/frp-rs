@@ -1920,7 +1920,7 @@ Some things this table does not say, each measured:
   key>` exiting **0** here against Go's **1** (`decode proxy at index 0: …
   unknown field "notAKnownProxyKey"`) — **was** in this list and is now a
   like-for-like **1**: `check_strict` walks the array elements
-  (`TODO.md:1243`), so frp-rs prints `unknown field
+  (`TODO.md:2447`), so frp-rs prints `unknown field
   "proxies[0].notAKnownProxyKey"` and exits 1 exactly where Go does.
 
 Tests that pin this — real binaries, no mocks:
@@ -2070,7 +2070,7 @@ paragraph).
 
 #### CLI inputs: repeated `-c`, an empty `webServer.addr`, case-insensitive keys
 
-Three `frpc` inputs Go accepts and frp-rs used to refuse (`TODO.md:1605`). Two
+Three `frpc` inputs Go accepts and frp-rs used to refuse (`TODO.md:3672`). Two
 are now Go-faithful; the third is a **recorded divergence**, because the honest
 fix is not bounded and a partial one would be a false claim of parity. Measured
 2026-09-26 against Go frp **v0.71.0** (darwin/arm64) and the frp-rs `frpc` at
@@ -2364,7 +2364,7 @@ and `status` differ on the same file — `verify` parses and reports, while
 The last row is the sharp edge and the reason the earlier "refused (strict) or
 silently mis-defaulted (lenient)" phrasing was wrong in **both** directions.
 That row has since **changed** with the strict-mode array recursion
-(`TODO.md:1243`): `cap-proxy.toml` is now refused in strict mode
+(`TODO.md:2447`): `cap-proxy.toml` is now refused in strict mode
 (`unknown field "proxies[0].LocalPort" …`, exit 1, alongside
 `proxies[0].RemotePort`), because `check_strict` walks the
 `[[proxies]]`/`[[visitors]]`/`[[httpPlugins]]` elements with one exact-match key
