@@ -9,9 +9,11 @@
 #
 # Reports:
 #   1. per-file lines: total / test / production, where "test" covers an inline
-#      `#[cfg(test)]` region, a whole-file test module (`tests.rs`, `*_tests.rs`,
-#      `*_test.rs`, anything under a `tests/` directory) and a `#[cfg(test)]
-#      mod X;` sibling — the file-ification the refactor plan is built on
+#      test region — `#[cfg(test)]` or `#[cfg(all(test, …))]`, ending at the
+#      item the attribute decorates — a whole-file test module (`tests.rs`,
+#      `*_tests.rs`, `*_test.rs`, anything under a `tests/` directory) and a
+#      `#[cfg(test)] mod X;` sibling — the file-ification the refactor plan is
+#      built on
 #   2. the largest production functions, measured in CODE lines (comments and
 #      blanks excluded)
 #
@@ -45,8 +47,29 @@ TOP = int(sys.argv[1])
 ALL = sys.argv[2] == '1'
 ROOTS = ('frp-core/src', 'frp-server/src', 'frp-client/src', 'frp-vnet/src')
 FN = re.compile(r'^(\s*)(?:pub(?:\([^)]*\))?\s+)?(?:const\s+|async\s+|unsafe\s+)*fn\s+([A-Za-z0-9_]+)')
-TEST_ATTR = re.compile(r'\s*#\[cfg\(test\)\]')
-MOD_LINE = re.compile(r'\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)')
+# A test gate is an attribute whose `cfg` predicate can hold only where `test`
+# is set: `#[cfg(test)]`, or `#[cfg(all(…, test, …))]` — 13 in-tree sites, 10
+# of them decorating an inline `mod {` and 3 writing
+# `all(feature = "vnet", test)` over a `use`. The base script knew only
+# `#[cfg(test)]` and scored those regions as production. The predicate is
+# parsed, not pattern-matched, so the negated spellings — `all(not(test), …)`,
+# `all(not (test), …)`, `all(not(any(test, …)))` — are rejected: they compile
+# where `test` is *off*.
+#
+# The predicate is read by depth counting (`cfg_attribute`), not by a greedy
+# `(.*)`, and the attribute may be followed on its line by further attributes,
+# comments or the item it decorates (`gate_tail_ok`): `#[cfg(test)] /* why */`,
+# `#[cfg(test)] // see (a)]` and
+# `#[cfg(test)] #[path = "declared_helper.rs"] mod declared;` are all gates.
+#
+# NOTE: the opening `#[cfg(` must still close on the same line, so the wrapped
+# spelling `#[cfg(all(` / `test,` / `feature = "x"` / `))]` is not recognised.
+# No in-tree file writes one; it is filed as residue rather than special-cased.
+CFG_OPEN = re.compile(r'\s*#\s*\[\s*cfg\s*\(')
+# `r"…"`, `r#"…"#`, `r##"…"##`, `br#"…"#`: the `#`s set the terminator count,
+# and the literal may span lines.
+RAW_OPEN = re.compile(r'(?:b?r|cr)(#*)"')
+ATTR_LINE = re.compile(r'\s*#\[')
 MOD_DECL = re.compile(r'\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*;')
 PATH_ATTR = re.compile(r'\s*#\[path\s*=\s*"([^"]+)"\s*\]')
 # `tests.rs`, `test.rs`, `key_tests.rs`, `single_test.rs` — the whole file is a
@@ -57,73 +80,35 @@ PATH_ATTR = re.compile(r'\s*#\[path\s*=\s*"([^"]+)"\s*\]')
 TEST_FILE = re.compile(r'(?:^|_)tests?\.rs$')
 
 
-def test_blocks(lines):
-    """(`#[cfg(test)]` regions, out-of-line test-module declarations).
+def item_end(lines, start):
+    """(last index, kind, closed) for the item that begins at `start`.
 
-    The first element is a list of (start, end) index pairs covering each
-    `#[cfg(test)] mod` region. The second is a list of (module name, `#[path]`
-    value or None) for each `mod X;` declaration whose body lives in a sibling
-    file; those regions cover only the attribute and the declaration line.
+    The item is the thing an attribute decorates, and its first top-level
+    terminator decides how far it runs: a `;` ends a `use` / `const` /
+    `static` / expression statement (and an out-of-line `mod X;`
+    declaration), a `{` opens a body that is brace-matched to its closing
+    line. That is how a `#[cfg(test)]` region ends at its own item instead
+    of at the next `mod` in the file.
 
-    An out-of-line declaration must not be brace-matched: `mod tests;` has no
-    body, so scanning forward for the next `{` charges the production code that
-    follows it to the test module. That is what made `ssh_gateway.rs` read 2726
-    production / 24 test once its tests moved out (`2742` / `8` is the truth) —
-    16 production lines swallowed by the first braced statement after the
-    `mod tests;` this file had always carried.
+    Braces and semicolons inside `//`, `/* */`, string literals, char
+    literals, lifetimes and raw strings do not count: this is the same
+    skipper `fn_body_end` has always used, lifted out so the region walk
+    uses it too. A naive counter closed an inline test region at the first `{` or
+    `}` inside a literal — `frp-core/src/logging.rs` lost 48 production
+    lines to one. Parentheses and brackets are tracked until the body
+    opens, so the `;` in a `[&str; 2]` type does not end a `const` early.
+
+    Raw strings are skipped by terminator count, not by quote parity, and
+    may span lines: `r"…"` ends at the next `"`, `r#"…"#` at the next `"#`.
+    Scanning one as code costs `frp-core/src/v2_handshake.rs` 568 production
+    lines and `frp-core/src/msg.rs` 148 — both literals sit inside a
+    `#[cfg(test)]` region, and their braces then close it early. Ordinary
+    strings stay line-local (a backslash before the newline is a continuation).
+
+    `closed` is False only when a `{` opened and never returned to depth
+    zero; the caller decides what an unterminated body means.
     """
-    blocks, out_of_line = [], []
-    i, n = 0, len(lines)
-    while i < n:
-        if not TEST_ATTR.match(lines[i]):
-            i += 1
-            continue
-        j, path_attr = i, None
-        while j < n and not MOD_LINE.match(lines[j]):
-            m = PATH_ATTR.match(lines[j])
-            if m:
-                path_attr = m.group(1)
-            j += 1
-        if j >= n:
-            break
-        decl = MOD_DECL.match(lines[j])
-        if decl:
-            blocks.append((i, j))
-            out_of_line.append((decl.group(1), path_attr))
-            i = j + 1
-            continue
-        depth, k, started = 0, j, False
-        while k < n:
-            for ch in lines[k]:
-                if ch == '{':
-                    depth += 1
-                    started = True
-                elif ch == '}':
-                    depth -= 1
-            if started and depth <= 0:
-                break
-            k += 1
-        blocks.append((i, k))
-        i = k + 1
-    return blocks, out_of_line
-
-
-def is_test(idx, blocks):
-    return any(a <= idx <= b for a, b in blocks)
-
-
-def fn_body_end(lines, start):
-    """Index just past the `}` that closes the fn starting at `start`.
-
-    Measuring a function as "distance to the next `fn`" is wrong: type and const
-    definitions between two functions get charged to the first one. That reported
-    `health_check_monitored` (really 3 lines) as 434, and a nested 19-line
-    `record_plugin` as 212. Brace-matching the body is the honest measure.
-
-    Skips `//`, `/* */`, and string/char literals so braces inside them do not
-    count. Returns None if the body never closes.
-    """
-    depth, seen_open = 0, False
+    paren, depth, seen_open = 0, 0, False
     i, n = start, len(lines)
     in_block_comment = False
     while i < n:
@@ -144,16 +129,44 @@ def fn_body_end(lines, start):
                 in_block_comment = True
                 j += 2
                 continue
+            if c in 'brc':
+                m = RAW_OPEN.match(line, j)
+                if m:
+                    # Raw string: no escapes, and it may span lines. It ends
+                    # at the first `"` followed by exactly this many `#`.
+                    term = '"' + '#' * len(m.group(1))
+                    j = m.end()
+                    while i < n:
+                        line = lines[i]
+                        p = line.find(term, j)
+                        if p >= 0:
+                            j = p + len(term)
+                            break
+                        i += 1
+                        j = 0
+                    if i >= n:
+                        break
+                    continue
             if c == '"':
                 j += 1
                 while j < len(line):
+                    if line[j] == '"':
+                        j += 1
+                        break
                     if line[j] == '\\':
+                        if j + 1 == len(line):
+                            # A backslash immediately before the newline
+                            # continues the literal on the next physical line,
+                            # so braces there are string content, not code.
+                            i += 1
+                            if i >= n:
+                                break
+                            line = lines[i]
+                            j = 0
+                            continue
                         j += 2
                         continue
-                    if line[j] == '"':
-                        break
                     j += 1
-                j += 1
                 continue
             if c == "'":
                 # Rust has lifetimes (`'static`, `'a`) as well as char literals.
@@ -169,16 +182,487 @@ def fn_body_end(lines, start):
                     continue
                 j += 1                          # lifetime — ordinary code
                 continue
+            if not seen_open:
+                if c in '([':
+                    paren += 1
+                elif c in ')]':
+                    paren -= 1
+                elif c == ';' and paren <= 0:
+                    return i, 'stmt', True
             if c == '{':
                 depth += 1
                 seen_open = True
             elif c == '}':
                 depth -= 1
                 if seen_open and depth == 0:
-                    return i + 1
+                    return i, 'brace', True
             j += 1
         i += 1
-    return None
+    return i - 1, 'brace', False
+
+
+def cfg_args(inner):
+    """Split a `cfg` predicate's argument list on its own top-level commas.
+
+    Nesting and quoted values are respected, so `all(test, feature = "a,b")`
+    is two arguments and the comma inside the string does not split it, and a
+    backslash-escaped quote does not end a value early: with
+    `all(feature = "a\"b", test)` the `\"` used to close the string, so the
+    comma after it was read as string content, the argument list came back as
+    one item and the gate behind it was not recognised at all.
+    """
+    out, cur, depth, quote, esc = [], [], 0, None, False
+    for ch in inner:
+        if quote is not None:
+            cur.append(ch)
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in '"\'':
+            quote = ch
+        elif ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        elif ch == ',' and depth == 0:
+            out.append(''.join(cur))
+            cur = []
+            continue
+        cur.append(ch)
+    out.append(''.join(cur))
+    return [a.strip() for a in out if a.strip()]
+
+
+def cfg_implies_test(pred):
+    """Does `cfg(pred)` hold only where `test` is set?
+
+    A bare `test` does. `all(a, …)` does when any argument does — the
+    conjunction cannot hold without it. `any(a, …)` does only when every
+    argument does. `not(…)` never does, which is what rejects
+    `all(not(test), …)`, `all(not (test), …)` and `all(not(any(test, …)))`:
+    those compile where `test` is *off*.
+    """
+    pred = pred.strip()
+    m = re.match(r'([A-Za-z_][A-Za-z0-9_]*)\s*\(', pred)
+    if not m or not pred.endswith(')'):
+        return pred == 'test'
+    args = cfg_args(pred[m.end():-1])
+    if m.group(1) == 'all':
+        return any(cfg_implies_test(a) for a in args)
+    if m.group(1) == 'any':
+        return bool(args) and all(cfg_implies_test(a) for a in args)
+    return False
+
+
+def _skip_comment(line, i):
+    """Index just past the comment at `i`; `len(line)` when it runs to EOL."""
+    if line.startswith('//', i):
+        return len(line)
+    end = line.find('*/', i + 2)
+    return len(line) if end < 0 else end + 2
+
+
+def _skip_string(line, i):
+    """Index just past the `"…"` that opens at `i` (escape-aware)."""
+    i, n = i + 1, len(line)
+    while i < n:
+        if line[i] == '\\':
+            i += 2
+            continue
+        if line[i] == '"':
+            return i + 1
+        i += 1
+    return n
+
+
+def _skip_char(line, i):
+    """Index after the char literal at `i`; a lifetime advances one char."""
+    n = len(line)
+    if i + 2 < n and line[i + 1] == '\\':
+        return i + 3                        # '\n'-style escape
+    if i + 2 < n and line[i + 2] == "'":
+        return i + 3                        # 'x'-style literal
+    return i + 1                            # lifetime — ordinary code
+
+
+def closing_bracket(line, i):
+    """Index of the `]` matching the `[` at `i`, or -1.
+
+    Depth-counted and literal-aware, so a bracket inside a string, a char
+    literal or a comment cannot close it early. The greedy `(.*)` could not do
+    this: `#[cfg(test)] // see (a)]` parsed as a malformed predicate and the
+    line stopped being a gate.
+    """
+    depth, n = 0, len(line)
+    while i < n:
+        if line.startswith('/*', i) or line.startswith('//', i):
+            i = _skip_comment(line, i)
+            continue
+        c = line[i]
+        if c == '"':
+            i = _skip_string(line, i)
+            continue
+        if c == "'":
+            i = _skip_char(line, i)
+            continue
+        if c == '[':
+            depth += 1
+        elif c == ']':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def cfg_attribute(line):
+    """(`predicate`, index just past the attribute) for a leading `#[cfg(…)`].
+
+    `(None, -1)` when the line does not open a well-formed one. The closing
+    `)` is found by depth counting, so a `)` or `]` inside a string or a
+    trailing comment cannot end the predicate early, and the attribute's `]`
+    must follow it (`#[cfg(test) ]` is accepted; one split across lines is not
+    — see the note above `CFG_OPEN`).
+    """
+    m = CFG_OPEN.match(line)
+    if not m:
+        return None, -1
+    start, n, depth, i = m.end(), len(line), 1, m.end()
+    while i < n:
+        if line.startswith('/*', i) or line.startswith('//', i):
+            i = _skip_comment(line, i)
+            continue
+        c = line[i]
+        if c == '"':
+            i = _skip_string(line, i)
+            continue
+        if c == "'":
+            i = _skip_char(line, i)
+            continue
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0:
+                j = i + 1
+                while j < n and line[j] in ' \t\r':
+                    j += 1
+                if j >= n or line[j] != ']':
+                    return None, -1
+                # A block comment inside the predicate survives the scan but
+                # not the argument split, so drop it before parsing.
+                return re.sub(r'/\*.*?\*/', '', line[start:i]), j + 1
+        i += 1
+    return None, -1
+
+
+def item_tail_ok(line, i):
+    """Is `line[i:]` — the decorated item sharing the gate's line — sound?
+
+    Anything is accepted except an unbalanced bracket: a `)` or `]` with
+    nothing to match it means the `)]` above was not the attribute's, which is
+    the one way a mistyped gate can still look well formed.
+    """
+    depth, n = 0, len(line)
+    while i < n:
+        if line.startswith('/*', i) or line.startswith('//', i):
+            i = _skip_comment(line, i)
+            continue
+        c = line[i]
+        if c == '"':
+            i = _skip_string(line, i)
+            continue
+        if c == "'":
+            i = _skip_char(line, i)
+            continue
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+            if depth < 0:
+                return False
+        i += 1
+    return True
+
+
+def gate_tail_ok(line, i):
+    """Is `line[i:]` a legal tail for a `#[cfg(…)]` attribute?
+
+    Whitespace, `//` and `/* */` comments and further `#[…]` attributes are —
+    `#[cfg(test)] /* why */`, `#[cfg(test)] // see (a)]` and
+    `#[cfg(test)] #[allow(dead_code)]` are all gates. So is the item the
+    attribute decorates when it shares the line, which is what makes
+    `#[cfg(test)] #[path = "declared_helper.rs"] mod declared;` a gate on an
+    out-of-line test module.
+    """
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if c in ' \t\r':
+            i += 1
+        elif line.startswith('/*', i) or line.startswith('//', i):
+            i = _skip_comment(line, i)
+        elif c == '#' and i + 1 < n and line[i + 1] == '[':
+            j = closing_bracket(line, i + 1)
+            if j < 0:
+                return False
+            i = j + 1
+        else:
+            return item_tail_ok(line, i)
+    return True
+
+
+def is_test_gate(line):
+    """Is this line a `#[cfg(…)]` that compiles only where `test` is set?"""
+    pred, end = cfg_attribute(line)
+    if pred is None:
+        return False
+    return gate_tail_ok(line, end) and cfg_implies_test(pred)
+
+
+def _skip_trivia(lines, i, j):
+    """Cursor `(i, j)` just past the whitespace and comments at `(i, j)`.
+
+    Unlike `_skip_comment` this crosses lines: an attribute's tail may open a
+    block comment that closes on a later line, and
+
+        #[cfg(test)] /* why
+           ; } */
+        mod tests { … }
+
+    decorates the item on the third line. Stopping at the first end of line
+    left the attribute run pointing at `; } */`, so `item_end` read that
+    semicolon as the item and charged the whole test module to production.
+    """
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        if j >= len(line):
+            i, j = i + 1, 0
+            continue
+        c = line[j]
+        if c in ' \t\r':
+            j += 1
+        elif line.startswith('//', j):
+            i, j = i + 1, 0
+        elif line.startswith('/*', j):
+            k = line.find('*/', j + 2)
+            if k >= 0:
+                j = k + 2
+                continue
+            i, j = i + 1, 0
+            while i < n:
+                k = lines[i].find('*/')
+                if k >= 0:
+                    j = k + 2
+                    break
+                i += 1
+        else:
+            return i, j
+    return i, j
+
+
+def attribute_run(lines, start):
+    """(item line, item column, `#[path]` value) after the run at `start`.
+
+    The run is consumed one attribute at a time rather than one line at a
+    time, because attributes may share a line with each other and with the item
+    they decorate: `#[cfg(test)] #[path = "declared_helper.rs"] mod declared;`
+    declares an out-of-line test module, and a line-at-a-time walk looked for
+    the declaration on the *next* line and charged the production code below it
+    to tests. Whitespace and comments between the attributes and the item may
+    span lines (`_skip_trivia`); `path_attr` is the last `#[path]` of the run,
+    or None.
+    """
+    n, path_attr = len(lines), None
+    i, j = _skip_trivia(lines, start, 0)
+    while i < n:
+        line = lines[i]
+        if not line.startswith('#[', j):
+            return i, j, path_attr
+        end = closing_bracket(line, j + 1)
+        if end < 0:                         # malformed — stop at the item
+            return i, j, path_attr
+        m = PATH_ATTR.search(line[j:end + 1])
+        if m:
+            path_attr = m.group(1)
+        i, j = _skip_trivia(lines, i, end + 1)
+    return i, j, path_attr
+
+
+def _string_rest(line, j):
+    """Cursor after the `"` that closes a string already open at `j`.
+
+    `(index, done)`: `done` is False when the literal runs off the end of the
+    line, which happens exactly when a backslash sits immediately before the
+    newline — the continuation `item_end` follows onto the next line. Without
+    it, a `}` on the continuation line reads as code (that is the round-2
+    ordinary-string fix, re-used here for the region state).
+    """
+    n = len(line)
+    while j < n:
+        c = line[j]
+        if c == '\\':
+            if j + 1 == n:
+                return n, False
+            j += 2
+            continue
+        if c == '"':
+            return j + 1, True
+        j += 1
+    return n, True                          # malformed — stays line-local
+
+
+def region_flags(lines):
+    """Per line: does the line *begin* inside a comment or a literal?
+
+    `is_test_gate` reads one line, so a gate-shaped line that is really part of
+    a block comment, a raw string or a backslash-continued ordinary string
+    looked like a gate and fabricated a one-line test region — the production
+    code after it was charged to tests. Only those three constructs can cross a
+    line boundary; this tracks the same state `item_end` carries while it
+    scans: `/* … */` (not nested, no `//` inside), raw strings by terminator
+    count, and ordinary strings line-local unless a backslash precedes the
+    newline.
+    """
+    n = len(lines)
+    flags = [False] * n
+    block = cont = False
+    term = None
+    for i, line in enumerate(lines):
+        flags[i] = block or cont or term is not None
+        j, L = 0, len(line)
+        while j < L:
+            if block:
+                k = line.find('*/', j)
+                if k < 0:
+                    break
+                block, j = False, k + 2
+                continue
+            if term is not None:
+                k = line.find(term, j)
+                if k < 0:
+                    break
+                term, j = None, k + len(term)
+                continue
+            if cont:
+                j, done = _string_rest(line, j)
+                cont = not done
+                continue
+            c = line[j]
+            if line.startswith('//', j):
+                break
+            if line.startswith('/*', j):
+                block, j = True, j + 2
+                continue
+            if c in 'brc':
+                m = RAW_OPEN.match(line, j)
+                if m:
+                    t = '"' + '#' * len(m.group(1))
+                    k = line.find(t, m.end())
+                    if k < 0:
+                        term, j = t, L
+                    else:
+                        j = k + len(t)
+                    continue
+            if c == '"':
+                j, done = _string_rest(line, j + 1)
+                cont = not done
+                continue
+            if c == "'":
+                j = _skip_char(line, j)
+                continue
+            j += 1
+    return flags
+
+
+def test_blocks(lines):
+    """(`#[cfg(test)]` regions, out-of-line test-module declarations).
+
+    The first element is a list of (start, end) index pairs covering each
+    test region: the attribute lines plus the item they decorate. The second
+    is a list of (module name, `#[path]` value or None) for each `mod X;`
+    declaration whose body lives in a sibling file; those regions cover only
+    the attribute and the declaration line.
+
+    A region ends at the item the attribute decorates, not at the next `mod`
+    in the file. Scanning forward for a `mod` charged everything between the
+    attribute and that module to tests: `frp-core/src/bridge.rs` carries
+    `#[cfg(test)]` above a single `use` at line 5 while its `mod tests` is at
+    line 1085, so the file read 4 production lines. `use` / `const` /
+    `static` (and any other statement) end at their `;`; anything that opens
+    a body — `mod` / `fn` / `impl` / `thread_local!` — is brace-matched with
+    `item_end`'s literal-aware scan.
+
+    Any `#[cfg(…)]` that compiles only where `test` is set counts:
+    `#[cfg(test)]` and `#[cfg(all(…, test, …))]` (`is_test_gate` parses the
+    predicate, so the negated spellings do not). A `#[path]` may sit above or
+    below the gate: attributes stack on one item, so the whole attribute run is
+    part of the region and is searched for `#[path]` — even when the run, the
+    `#[path]` and the `mod X;` declaration all share one line.
+
+    A gate-shaped line inside a block comment, a raw string or a continued
+    ordinary string is not a gate at all: `region_flags` marks the lines that
+    begin inside one of those constructs and only the other lines are
+    candidates.
+
+    An out-of-line declaration must not be brace-matched: `mod tests;` has no
+    body, so scanning forward for the next `{` charges the production code that
+    follows it to the test module. That is what made `ssh_gateway.rs` read 2726
+    production / 24 test once its tests moved out (`2742` / `8` is the truth) —
+    16 production lines swallowed by the first braced statement after the
+    `mod tests;` this file had always carried.
+    """
+    flags = region_flags(lines)
+    blocks, out_of_line = [], []
+    i, n = 0, len(lines)
+    while i < n:
+        if flags[i] or not is_test_gate(lines[i]):
+            i += 1
+            continue
+        start = i
+        while start > 0 and ATTR_LINE.match(lines[start - 1]) and not flags[start - 1]:
+            start -= 1
+        j, col, path_attr = attribute_run(lines, start)
+        if j >= n:
+            break
+        decl = MOD_DECL.match(lines[j], col)
+        if decl:
+            blocks.append((start, j))
+            out_of_line.append((decl.group(1), path_attr))
+            i = j + 1
+            continue
+        end, _kind, closed = item_end(lines, j)
+        if not closed:
+            end = n - 1     # unterminated body — charge the rest of the file
+        blocks.append((start, end))
+        i = end + 1
+    return blocks, out_of_line
+
+
+def is_test(idx, blocks):
+    return any(a <= idx <= b for a, b in blocks)
+
+
+def fn_body_end(lines, start):
+    """Index just past the `}` that closes the fn starting at `start`.
+
+    Measuring a function as "distance to the next `fn`" is wrong: type and const
+    definitions between two functions get charged to the first one. That reported
+    `health_check_monitored` (really 3 lines) as 434, and a nested 19-line
+    `record_plugin` as 212. Brace-matching the body is the honest measure.
+
+    Skips `//`, `/* */`, and string/char literals so braces inside them do not
+    count — `item_end` is that scanner. Returns None if the body never closes.
+    """
+    end, _kind, closed = item_end(lines, start)
+    if not closed:
+        return None
+    return end + 1
 
 
 def is_test_file(path):

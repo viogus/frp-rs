@@ -670,8 +670,8 @@ jobs:
           echo "RSS-soak run-dir fixture checks ok: 269 checks hold (floor $guard_floor), no failure line"
       - name: Large-functions classifier — fixture checks
         # TODO.md "`scripts/tests/large-functions-classifier.sh` runs in no
-        # gate" (`:7211` when it was filed): the 42-check suite landed in its
-        # own PR but could not wire itself into this file, which the citation
+        # gate" (`:7211` when it was filed): the suite landed in its own PR with
+        # 42 checks but could not wire itself into this file, which the citation
         # gate PR owned at the time. It is wired here in the same shape as the
         # RSS-soak step above — the suite's bytes are pinned before it runs, its
         # exact `RESULT:` total and `ok`-line count are compared, an absolute
@@ -679,8 +679,8 @@ jobs:
         # is still red, and any `FAIL` line fails the step.
         #
         # This suite is itself a negative control for the classifier rule: it
-        # drives five deliberate mutations of `scripts/large-functions.sh`
-        # (M1–M5) and requires each one to be misclassified. The `guard_canary`
+        # drives nineteen deliberate mutations of `scripts/large-functions.sh`
+        # (M1–M19) and requires each one to be misclassified. The `guard_canary`
         # check below is the M1 witness, printed only by a run that actually
         # reclassified the mutated tree, so a suite whose mutation loop was
         # deleted cannot pass by keeping its count. Tying a literal to the
@@ -692,9 +692,9 @@ jobs:
           log=/tmp/frp-large-functions-classifier.log
           status=0
           guard_file=scripts/tests/large-functions-classifier.sh
-          guard_pin=489e69500d9340c65e0c738f85e8afef4e0abf0222251f85d8b22948643b1245
-          guard_exact=42
-          guard_floor=42
+          guard_pin=df52adae95dfd820fc2af905e363a6248dde2cb4cbb1eb44d6bf42e0b9995c57
+          guard_exact=118
+          guard_floor=118
           guard_canary='M1 (name pattern removed)'
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
@@ -767,11 +767,11 @@ jobs:
             printf '%s' "$guard_fail_text"
           fi
           if [ "$status" != "0" ]; then
-            echo "::error::the large-functions classifier fixture did not report 42 checks with no failure line"
-            echo "::error::scripts/tests/large-functions-classifier.sh must print 42 '  ok' lines, include the M1 witness, and end with 'RESULT: 42 fixture check(s) hold' (floor=$guard_floor, exact=$guard_exact), and must not print a 'FAIL' line; a smaller total, a missing witness, a failure line or no output at all (an \`exec\`) means cases were skipped or swallowed — restore them rather than lowering this literal"
+            echo "::error::the large-functions classifier fixture did not report 118 checks with no failure line"
+            echo "::error::scripts/tests/large-functions-classifier.sh must print 118 '  ok' lines, include the M1 witness, and end with 'RESULT: 118 fixture check(s) hold' (floor=$guard_floor, exact=$guard_exact), and must not print a 'FAIL' line; a smaller total, a missing witness, a failure line or no output at all (an \`exec\`) means cases were skipped or swallowed — restore them rather than lowering this literal"
             exit 1
           fi
-          echo "Large-functions classifier fixture checks ok: 42 checks hold (floor $guard_floor), M1 witness present, no failure line"
+          echo "Large-functions classifier fixture checks ok: 118 checks hold (floor $guard_floor), M1 witness present, no failure line"
       - name: docs/config.md Go column — fixture checks
         # TODO.md "`docs/config.md`'s Go column has no gate.": the document
         # asserts "Every field maps 1:1 to a Go frp v0.71.0 equivalent", but no
