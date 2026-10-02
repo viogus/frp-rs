@@ -66,6 +66,7 @@ which is read-only and never fails a build:
 ```bash
 bash scripts/large-functions.sh          # per-file production LOC + top 12 functions
 bash scripts/large-functions.sh --top 25
+bash scripts/large-functions.sh --all    # every classified file, test modules shown at 0
 ```
 
 Every number in this document comes from that script, and the script is
@@ -108,7 +109,10 @@ re-running the script before acting on them.
 > `a618f281` and corrected from the originally recorded `8044 / 4432 / 3612` to
 > `8054 / 4444 / 3610`. **That boundary — production = every line before the
 > first `#[cfg(test)]` — applies to the `proxy_ops` row only** (base lines
-> 1–3610; head `mod.rs` lines 1–3040). The other rows were measured at earlier
+> 1–3610; head `mod.rs` lines 1–3040 — the script's per-file table reads that file
+> at **3043** production, because the blank lines between the three
+> `#[cfg(test)] mod X;` declaration blocks fall outside this boundary). The other
+> rows were measured at earlier
 > revisions on other files and do not all share it; PR #452's note under the
 > Step 0 table states the convention those rows use (`Total` = `Inline tests`
 > + `Production`).
@@ -228,8 +232,8 @@ Every row is measured on the **pre-extraction** file and follows the same conven
 rows: `Total` = `Inline tests` + `Production`. The `frp-server/src/vhost.rs` row was re-measured in
 PR #452 (branch `refactor/fileify-vhost-tests`, code head `7ff46a60`, based on `f881d15e`, rebased
 onto `18bcd1ad`): its base file was **6331** lines, not 6312, split into **3151** inline-test lines
-(`vhost.rs:3180-6330`, the extracted body) and a **3180**-line remainder — 3177 production lines plus
-the 3 module-scaffolding lines (`#[cfg(test)]`, `mod tests {`, the closing `}`). The row is
+(`vhost.rs:3180-6330`, the extracted body) and a **3180**-line remainder — 3178 production lines plus
+the 2 module-scaffolding lines (`#[cfg(test)]`, `mod tests;`). The row is
 **landed**: the body now lives formatted (3144 lines) in `frp-server/src/vhost/tests.rs` and
 `frp-server/src/vhost.rs` is **3179** lines. See P7.
 
@@ -240,10 +244,12 @@ file measured 8054 lines (not 8044); it split into
 `tcp_auto_bind_retry_tests.rs` (430) — production lines 3610, i.e. the row above
 was re-measured and the stale `8044 / 4432 / 3612` corrected to
 `8054 / 4444 / 3610`. The same PR then landed seams 1 and 2, taking `mod.rs` to
-3049 lines (3040 production, same boundary). Caveat: `scripts/large-functions.sh` treats the
-sibling test files as production now that they are ordinary `.rs` files, so read
-`frp-server/src/control/proxy_ops/` as a whole rather than trusting its per-file
-table.
+3049 lines (3043 production, same boundary). Caveat at the time: `scripts/large-functions.sh`
+treated the sibling test files as production once they were ordinary `.rs` files, so
+`frp-server/src/control/proxy_ops/` had to be read as a whole rather than trusted per-file. That
+is fixed now — the script classifies a whole-file test module (`tests.rs`, `*_tests.rs`,
+`*_test.rs`, anything under a `tests/` directory) and a `#[cfg(test)] mod X;` sibling as test, and
+charges the parent only for the declaration lines.
 
 Two things make it more than cosmetic:
 
@@ -505,7 +511,7 @@ tests. **Step 0 landed in PR #453** (`aae3a484`): `proxy_ops.rs` (8054 lines) be
 to 3610 lines with no logic and no path change. Re-measured figures are
 8054 / 4444 / 3610 (same boundary as the provenance note above) — not the originally
 recorded 8044 / 4432 / 3612. Seams 1 and 2 then landed as `92a454b3` and
-`a618f281`, taking `mod.rs` to 3049 lines (3040 production).
+`a618f281`, taking `mod.rs` to 3049 lines (3043 production).
 
 Two structural facts dominate everything after that:
 
