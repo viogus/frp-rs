@@ -9388,7 +9388,7 @@ section; ledger now **24 open / 104 closed**.**
   `28 passed; 0 failed` in **all three** lanes — default, `--features dashboard` and `--all-features` (the last
   is the documented `cargo test --workspace --all-features` path; `cargo test -p frps --all-features --test
   warn_delivery` was `14 passed; 10 failed` before the profiling baseline, every count row exactly +1).
-  `mod record_count_tests` (`:1365`) drives the append, prefix and raw-bytes directions on synthetic captures,
+  `mod record_count_tests` (`:1374`) drives the append, prefix and raw-bytes directions on synthetic captures,
   so those properties are pinned without mutating the product. The capture is now frozen by
   `Spawned::wait_for_capture_convergence` (`:549`) — it waits for the count to reach the shape's floor
   (`capture_floor` `:220` / `capture_floor_config_dir` `:249`) and hold still for `SETTLE`, instead of a fixed
