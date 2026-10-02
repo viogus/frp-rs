@@ -897,9 +897,14 @@ jobs:
         # list, a widened point-in-time set, a regex that stops matching) has to
         # be a two-file change a reviewer sees. The summary line is pinned
         # outside as well — `| tee`-free redirection plus builtins only, for the
-        # round-14 reason recorded above — and 84 is the count of live cite line
-        # references on the tree that added this gate, so a scan that stops
-        # finding cites cannot print this line.
+        # round-14 reason recorded above — and the count of live cite line
+        # references is declared **once**, as `guard_cites` / `guard_cites_floor`
+        # below, so a scan that stops finding cites cannot print this line. The
+        # declared count has to be re-derived whenever a commit inserts or
+        # removes a live cite: it moved 84 → 87 with the Batch I records and
+        # 87 → 88 with this step's own new cite (the release-tests floor), and
+        # three separate copies of the old literal `84` left the health job red
+        # (`RESULT: 87 …` followed by "did not report 84 …").
         shell: bash
         run: |
           set -o pipefail
@@ -907,6 +912,15 @@ jobs:
           status=0
           guard_file=scripts/tests/todo-cite-guard.sh
           guard_pin=541bb4e6085f1bf94c5487761e3191413e2645b88951b27109d04d914f46e048
+          # The declared live-cite total and its absolute floor, both asserted
+          # once here and referenced from the three places below that used to
+          # carry their own copy of the number (the RESULT pattern, the failure
+          # diagnostic, the success echo). The gate re-derives the count from
+          # the tree, so a scan that stops finding cites prints a smaller number
+          # and reds; lowering the declared total has to move both literals, and
+          # `bash scripts/tests/todo-cite-guard.sh` prints the number to paste.
+          guard_cites=88
+          guard_cites_floor=88
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
@@ -951,21 +965,31 @@ jobs:
                 ;;
             esac
           done <<< "$guard_log"
+          case $guard_cites in
+            ''|*[!0-9]*) echo "::error::guard_cites must be a non-negative integer (got '$guard_cites')"; exit 1 ;;
+          esac
+          case $guard_cites_floor in
+            ''|*[!0-9]*) echo "::error::guard_cites_floor must be a non-negative integer (got '$guard_cites_floor')"; exit 1 ;;
+          esac
           case $guard_log in
-            *'RESULT: 84 cite(s) checked, 0 violation(s)'*) guard_result=1 ;;
+            *"RESULT: $guard_cites cite(s) checked, 0 violation(s)"*) guard_result=1 ;;
           esac
           [ "$guard_result" = "1" ] || status=1
+          [ "$guard_cites" -ge "$guard_cites_floor" ] || status=1
           [ "$guard_fail" = "0" ] || status=1
+          if [ "$guard_cites" -lt "$guard_cites_floor" ]; then
+            echo "::error::the declared cite total ($guard_cites) is below its absolute floor ($guard_cites_floor); a *falling* count has to move both literals — re-derive the count by running scripts/tests/todo-cite-guard.sh, do not lower the floor to meet it"
+          fi
           if [ "$guard_fail" != "0" ]; then
             echo "::error::the cite gate printed $guard_fail failure line(s); every live cite must land on an item header:"
             printf '%s' "$guard_fail_text"
           fi
           if [ "$status" != "0" ]; then
-            echo "::error::the TODO.md cross-file citation gate did not report 84 checked cites and 0 violations"
+            echo "::error::the TODO.md cross-file citation gate did not report $guard_cites checked cites and 0 violations"
             echo "::error::a live cite that lands on a mid-item body line, a blank line, past EOF, or that has no decimal line number must be repointed to the cited item's header — do not lower this literal or widen the point-in-time set"
             exit 1
           fi
-          echo "TODO.md cross-file citation gate ok: 84 live cites checked, every one on an item header"
+          echo "TODO.md cross-file citation gate ok: $guard_cites live cites checked, every one on an item header"
       - name: TODO.md citation gate — fixture checks (canary)
         # The gate's own canary suite. In the style of the two fixture suites
         # above it: the gate's bytes are pinned here before it runs, and the
@@ -2747,6 +2771,12 @@ jobs:
     timeout-minutes: 30
     env:
       FRPS_RELEASE_CLI_TESTS: "45"
+      # The absolute floor under the listed count: the same exact+floor pair
+      # every other count guard in this file carries (item `TODO.md:8831`), so a
+      # delete-plus-lower edit has to move both literals and the diagnostic
+      # below names which one fell. The debug lane pins the identical 45 as
+      # `env.FRPS_CLI_TESTS` on the tests-unit job.
+      FRPS_RELEASE_CLI_TESTS_FLOOR: "45"
       # Exactly these three and no more: the test function names, in file order
       # (the guard sorts both sides), that carry the release-only skip in
       # `frps/tests/cli_exit_codes.rs`.
@@ -2812,6 +2842,19 @@ jobs:
           expected_ignored=$(printf '%s\n' $FRPS_RELEASE_CLI_IGNORED | wc -l | tr -d ' ')
           expected_passed=$((FRPS_RELEASE_CLI_TESTS - expected_ignored))
 
+          case "$FRPS_RELEASE_CLI_TESTS" in
+            ''|*[!0-9]*) echo "::error::env.FRPS_RELEASE_CLI_TESTS must be a non-negative integer (got '$FRPS_RELEASE_CLI_TESTS')" >&2; exit 1 ;;
+          esac
+          case "$FRPS_RELEASE_CLI_TESTS_FLOOR" in
+            ''|*[!0-9]*) echo "::error::env.FRPS_RELEASE_CLI_TESTS_FLOOR must be a non-negative integer (got '$FRPS_RELEASE_CLI_TESTS_FLOOR')" >&2; exit 1 ;;
+          esac
+          # The exact+floor pair: the `-- --list` comparison below is the exact
+          # half, this is the floor a *falling* count must move as well.
+          [ "$FRPS_RELEASE_CLI_TESTS" -ge "$FRPS_RELEASE_CLI_TESTS_FLOOR" ] || {
+            echo "::error::env.FRPS_RELEASE_CLI_TESTS ($FRPS_RELEASE_CLI_TESTS) is below its absolute floor ($FRPS_RELEASE_CLI_TESTS_FLOOR) — a test was deleted or newly ignored; restore it, or move both literals in one recorded edit" >&2
+            exit 1
+          }
+
           if ! grep -q 'Running tests/cli_exit_codes.rs' "$log.plain"; then
             echo "error: the release run never built tests/cli_exit_codes.rs:" >&2
             cat "$log.plain" >&2
@@ -2849,7 +2892,7 @@ jobs:
             exit 1
           fi
 
-          echo "release cli_exit_codes lane ok: $n listed, ${expected_passed} passed, ${expected_ignored} ignored (${ignored// /, }), 0 failed"
+          echo "release cli_exit_codes lane ok: $n listed (floor $FRPS_RELEASE_CLI_TESTS_FLOOR), ${expected_passed} passed, ${expected_ignored} ignored (${ignored// /, }), 0 failed"
       # The second release target (item `TODO.md:9301`): the CLI pins above prove
       # the release profile's *skip set*; this proves the shipped profile's
       # runtime behaviour on a target that spawns the release `frps` binary and
