@@ -223,8 +223,8 @@ wait_for_port() {
 # nc -z triggers ProxyUserConn in Rust frps, creating phantom work connections
 # that can deadlock encrypted bridges. Use lsof instead (check LISTEN state).
 wait_for_port_safe() {
-    local host="$1" port="$2" timeout="${3:-15}"
-    local deadline=$(($(date +%s) + timeout))
+    local host="$1" port="$2" timeout="${3:-15}" ready_min="${FRP_COMPAT_READY_MIN:-20}"
+    (( timeout < ready_min )) && timeout="$ready_min"; local deadline=$(($(date +%s) + timeout))
     if command -v lsof >/dev/null 2>&1; then
         while true; do
             if lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
@@ -678,9 +678,9 @@ fail_test() {
     echo -e "${RED}[FAIL]${NC} $name: $reason"
     FAIL=$((FAIL + 1))
     FAILURES+=("$name: $reason")
-    if $VERBOSE; then
+    if $VERBOSE || $CI; then
         echo "--- logs for $name ---"
-        # Collect logs from both top-level (Go frpc) and subdirectories (Rust frpc)
+        # CI too: the EXIT trap removes TEST_DIR, so a red run's logs never survive otherwise.
         for f in "$TEST_DIR"/*.log "$TEST_DIR"/*/*.log; do
             if [[ -f "$f" ]]; then
                 echo "=== $(basename "$f") ==="
@@ -4343,7 +4343,7 @@ run_xtcp_test() {
     # stood here; they matched *any* `frpc -c …` command line on the host,
     # including a developer's unrelated run or a sibling worktree's compat run.
     # The repository's stray rules forbid a kill by name alone, and
-    # name-plus-argument is the same hazard in a weaker form (TODO.md:9031).
+    # name-plus-argument is the same hazard in a weaker form (TODO.md:9121).
     #
     # Every server a scenario leaves behind is tracked: `run_go`'s `exec` makes
     # `$!` the binary itself, not a wrapper subshell, and `start_echo_server`
@@ -4354,7 +4354,7 @@ run_xtcp_test() {
     # Belt and braces for a server that somehow escaped `track_pid`: the guard's
     # own mid-run sweep, which reaps exactly the pids its census printed and
     # honours the baseline — so it cannot reach a server that predates the run
-    # (a sibling's), and it never matches an argument pattern (TODO.md:9031).
+    # (a sibling's), and it never matches an argument pattern (TODO.md:9121).
     # The fixture suite drives this helper against real synthetic servers
     # (`scripts/tests/compat-stray-guard.sh`, "the pre-test sweep"), so it is
     # executed by CI rather than merely read. Untracked strays from this run are

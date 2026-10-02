@@ -8,11 +8,19 @@
 # like the WS-over-TLS lost-wakeup stall.
 #
 # Usage:
-#   bash scripts/protocol-matrix.sh [--verbose]
+#   bash scripts/protocol-matrix.sh [--verbose] [--keep-tmp]
 #   FRPS_BIN=/path/to/frps FRPC_BIN=/path/to/frpc bash scripts/protocol-matrix.sh
 #
 # Defaults to the local release binaries. TLS rows use the committed
 # frp-core/tests/certs. Exit code is non-zero if any row fails.
+#
+# `--keep-tmp` (or FRP_MATRIX_KEEP_TMP=1) leaves the per-row frps.log/frpc.log
+# in place; without it the EXIT trap removes $TEST_DIR, so the log paths that a
+# failed row prints with --verbose name files that no longer exist by the time
+# anyone reads the CI log. `FRP_MATRIX_TEST_DIR` overrides the run directory
+# (a per-repeat caller needs a fresh one: the same $TEST_DIR is wiped at the
+# start of every run, so an unoverridden repeat loop keeps only the last run's
+# logs).
 set -u
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,10 +28,18 @@ FRPS_BIN="${FRPS_BIN:-$PROJECT_DIR/target/release/frps}"
 FRPC_BIN="${FRPC_BIN:-$PROJECT_DIR/target/release/frpc}"
 STRESS_BIN="$PROJECT_DIR/scripts/frp-stress/target/release/frp-stress"
 CERT_DIR="$PROJECT_DIR/frp-core/tests/certs"
-TEST_DIR="/tmp/frp-protocol-matrix"
+TEST_DIR="${FRP_MATRIX_TEST_DIR:-/tmp/frp-protocol-matrix}"
 TOKEN="matrix-token"
 VERBOSE=false
-[[ "${1:-}" == "--verbose" ]] && VERBOSE=true
+KEEP_TMP=false
+[[ "${FRP_MATRIX_KEEP_TMP:-}" == "1" ]] && KEEP_TMP=true
+for arg in "$@"; do
+    case "$arg" in
+        --verbose) VERBOSE=true ;;
+        --keep-tmp) KEEP_TMP=true ;;
+        *) echo "protocol-matrix: unknown argument: $arg" >&2; exit 2 ;;
+    esac
+done
 
 PASS=0
 FAIL=0
@@ -44,7 +60,7 @@ cleanup() {
         pid="$(cat "$pid_file" 2>/dev/null)" || continue
         [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
     done
-    rm -rf "$TEST_DIR"
+    $KEEP_TMP || rm -rf "$TEST_DIR"
 }
 trap cleanup EXIT
 
@@ -56,6 +72,29 @@ wait_for_port() {
             exec 3>&- 3<&-
             return 0
         }
+        sleep 0.1
+    done
+    return 1
+}
+
+wait_for_listen() {
+    # $1=port $2=timeout_s — OBSERVE a listening socket without connecting.
+    # A real connect to a frp port creates a ProxyUserConn on the server
+    # (`scripts/compat-test.sh:222-224` documents the phantom-work-connection
+    # hazard that deadlocks encrypted bridges), so the server and proxy gates
+    # must not probe by connecting. Round 5: replaced `wait_for_port` there.
+    local port="$1" timeout="${2:-10}" i
+    for ((i = 0; i < timeout * 10; i++)); do
+        if command -v lsof >/dev/null 2>&1; then
+            lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1 && return 0
+        elif command -v ss >/dev/null 2>&1; then
+            ss -tln sport = :"$port" 2>/dev/null | grep -q LISTEN && return 0
+        else
+            (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && {
+                exec 3>&- 3<&-
+                return 0
+            }
+        fi
         sleep 0.1
     done
     return 1
@@ -73,7 +112,7 @@ start_echo() {
 run_row() {
     local name="$1" proto="$2" tls="$3" mux="$4"
     local base
-    base=$((19000 + PASS + FAIL)) # unique port block per row
+    base=$((19000 + 4 * (PASS + FAIL))) # disjoint 4-port block per row
     local srv_port=$((base))
     local proxy_port=$((base + 1))
     local echo_port=$((base + 2))
@@ -82,10 +121,21 @@ run_row() {
     mkdir -p "$row_dir"
 
     # Kill this row's processes on ANY exit path. A failed row that skips
-    # cleanup leaks frps/frpc/echo, and since the port block is derived from
-    # PASS + FAIL, the next run reuses the same ports and silently tests the
-    # leaked processes instead of its own (observed cascade: one failed row
-    # under load left stragglers that failed the same row in every later run).
+    # cleanup leaks frps/frpc/echo, and a leaked listener is this harness's worst
+    # failure mode. Round 5: the block is now `19000 + 4 * (PASS + FAIL)`, i.e.
+    # four ports wide and disjoint row to row, so a straggler can never be read
+    # as the next row's own listener. It used to advance by ONE while the block
+    # stayed four wide, so the blocks overlapped by three — this row's
+    # proxy_port was the next row's srv_port, its echo_port the next row's
+    # proxy_port, its extra_port the next row's echo_port — and a straggling
+    # echo then turned the next row's readiness probe green against a non-frp
+    # server (silently measuring nothing) or made the next row's real frps fail
+    # to bind and report "proxy port not reachable", which is the cascade shape
+    # the recorded CI failures show (and as this harness's earlier note recorded:
+    # one failed row under load left stragglers that failed the following rows).
+    # kill_row_processes still drains the row —
+    # SIGTERM, a bounded wait, SIGKILL, a second bounded wait — because a
+    # straggler must not outlive its row even with disjoint ports.
     kill_row_processes() {
         # Build the pid list from files that EXIST: the first failure path
         # runs before frpc is started (no frpc.pid yet), and bash's `kill`
@@ -97,7 +147,32 @@ run_row() {
             pid="$(cat "$f" 2>/dev/null)" || continue
             [[ -n "$pid" ]] && pids+=("$pid")
         done
-        ((${#pids[@]} > 0)) && kill "${pids[@]}" 2>/dev/null
+        ((${#pids[@]} > 0)) || return 0
+        local i alive
+        kill "${pids[@]}" 2>/dev/null
+        # SIGTERM alone was the whole teardown: no wait, no escalation. A
+        # straggler that ignores or outlives SIGTERM kept holding ports while the
+        # next row started (round 5). Give it 3 s to exit, then SIGKILL it and
+        # give that 2 s; only a process that survives SIGKILL is reported.
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+            alive=()
+            for pid in "${pids[@]}"; do
+                kill -0 "$pid" 2>/dev/null && alive+=("$pid")
+            done
+            ((${#alive[@]} == 0)) && return 0
+            sleep 0.1
+        done
+        kill -9 "${alive[@]}" 2>/dev/null
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            alive=()
+            for pid in "${pids[@]}"; do
+                kill -0 "$pid" 2>/dev/null && alive+=("$pid")
+            done
+            ((${#alive[@]} == 0)) && return 0
+            sleep 0.1
+        done
+        vlog "  WARNING: row process(es) still alive after SIGKILL: ${alive[*]}"
+        return 0
     }
 
     log "=== $name (proto=$proto tls=$tls mux=$mux) ==="
@@ -152,7 +227,7 @@ run_row() {
 
     RUST_LOG=warn "$FRPS_BIN" -c "$row_dir/frps.toml" > "$row_dir/frps.log" 2>&1 &
     echo $! > "$row_dir/frps.pid"
-    wait_for_port 127.0.0.1 "$srv_port" 20 || {
+    wait_for_listen "$srv_port" 20 || {
         kill_row_processes
         fail_row "$name" "frps did not start"
         return
@@ -163,7 +238,7 @@ run_row() {
     # Generous timeout: a contended CI runner (the parallel Tests job is CPU
     # heavy) can take tens of seconds to start frps+frpc, do the TLS
     # handshake, and register the proxy.
-    wait_for_port 127.0.0.1 "$proxy_port" 45 || {
+    wait_for_listen "$proxy_port" 45 || {
         kill_row_processes
         fail_row "$name" "proxy port not reachable"
         return
@@ -196,18 +271,25 @@ run_row() {
     fi
 
     # Clean up this row's processes (same guarded path as every failure arm).
+    # No `sleep 0.5` afterwards: kill_row_processes now waits for the pids to die.
     kill_row_processes
     rm -f "$row_dir/frpc.pid" "$row_dir/frps.pid" "$TEST_DIR/echo-$echo_port.pid"
-    sleep 0.5
 }
 
 fail_row() {
-    local name="$1" reason="$2"
+    local name="$1" reason="$2" logf
     FAIL=$((FAIL + 1))
     FAILURES+=("$name: $reason")
     log "FAIL $name: $reason"
-    vlog "  frps log: $TEST_DIR/$name/frps.log"
-    vlog "  frpc log: $TEST_DIR/$name/frpc.log"
+    # Always print the row's tails. CI runs the matrix with neither --verbose nor
+    # --keep-tmp, so a red step used to print only this FAIL line while the EXIT
+    # trap deleted the very logs it named (round 5).
+    for logf in "$TEST_DIR/$name/frps.log" "$TEST_DIR/$name/frpc.log"; do
+        [[ -f "$logf" ]] || continue
+        echo "[matrix]   --- $(basename "$logf"), last 20 lines ---"
+        tail -20 "$logf" | sed 's/^/[matrix]   | /'
+    done
+    vlog "  retained row dir: $TEST_DIR/$name"
 }
 
 main() {

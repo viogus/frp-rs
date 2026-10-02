@@ -6778,6 +6778,96 @@ nothing about whether the described behaviour still holds.
   throughput and `quic` with its proxy port not reachable — while the compat suite step itself was
   green, the same suite-green/matrix-red shape as the sweep's two extra runs above. The failed job
   was re-run (`109804152976`).
+  **Round-5 measurement (2026-10-02, this author, base `b9af37c5`) — not everything below is fixed.**
+  Re-measured on macOS arm64 (8 cores) in a dedicated worktree at `/private/tmp/batch-k`, release
+  build in `CARGO_TARGET_DIR=/private/tmp/tgt-batchK`, Go frp 0.71.0 at
+  `/tmp/frp_0.71.0_darwin_arm64`, and a **fresh `FRP_COMPAT_TEST_DIR` for every iteration** (the
+  stray guard baselines at source time, so a reused dir breaks the baseline semantics). Raw logs:
+  `/private/tmp/krunner/results/`. Commands:
+  `bash scripts/compat-test.sh --test <display-name> --keep-tmp --ci --verbose` (30 repeats per named
+  scenario before the fixes, 20 after) and `bash scripts/protocol-matrix.sh --verbose --keep-tmp`
+  (20 full repeats, 11 rows each).
+
+  The four scenarios this item names did **not** reproduce here in either round: `go-to-rust-quic`
+  30/30 PASS (8.32–8.38 s), `kcp-rust-to-rust` 30/30 PASS (0.86–0.97 s), `rust-to-go-tcp-tls`
+  30/30 PASS (0.90–0.93 s), `go-to-rust-wss-plain` 30/30 PASS (0.79–0.84 s) — 120 clean runs,
+  0 failures — and, **after** the fixes below, 20/20 PASS each (`go-to-rust-quic` 8.276–8.556 s,
+  `kcp-rust-to-rust` 0.858–0.963 s, `rust-to-go-tcp-tls` 0.869–0.954 s, `go-to-rust-wss-plain`
+  0.788–0.829 s), another 80 clean runs with 0 failures; five whole-suite runs
+  (`bash scripts/compat-test.sh --ci --verbose`) were clean too, `RESULTS: 86 passed, 0 failed` each
+  (177.6–200.9 s). Thirty clean runs rule out only `p ≳ 9.5 %` per run (95 % upper bound); twenty
+  rule out only `p ≳ 14 %`. The protocol matrix passed 20/20 full repeats (220 row-runs, 0 failures,
+  69.6–69.9 s per repeat) **before** the fixes and 20/20 after (220 row-runs, 0 failures,
+  63.7–64.3 s per repeat). So the flake is real but rare on an idle host: nothing above is
+  reproduced, and nothing here should be read as "fixed".
+
+  The live evidence that the item is still real is CI, not this host:
+  `gh run list --workflow=compat.yml --limit 100` → **86 success, 3 failure, 11 cancelled**, and all
+  three failures are the `compat` job's `Run compat tests` step, left red on attempt 1, each
+  `RESULTS: 85 passed, 1 failed`:
+  `36953419067` `[FAIL] go-to-rust-http-basic-auth: VHost HTTP port 19286 not reachable` (banner →
+  FAIL 5.49 s against the 5 s gate at `scripts/compat-test.sh:2563`);
+  `36907334189` `[FAIL] go-to-rust-wss-plain: proxy port 24016 not reachable` (15.73 s against the
+  15 s gate at `scripts/compat-test.sh:6075`);
+  `36893868474` `[FAIL] test_auth_r2g_reject: proxy port 22335 not reachable (auth rejection false
+  positive?)` (17.18 s against the 10 s gate at `scripts/compat-test.sh:5475`). Two of those
+  scenario names are new relative to the labelled set above, and the two `wait_for_port_safe` cases
+  fail 0.5–0.7 s *past* their deadline — the shape of a poll that never saw a listener, not of a
+  test that mis-read one. The newest run on current main (`37005043144`, `b9af37c5`) is green, and
+  nothing in any workflow `needs:` the `compat` job, so a red compat result blocks no other work —
+  which is exactly why it survived four rounds.
+
+  **Four harness defects found and fixed (each with a proof, not an argument):**
+  1. `scripts/compat-test.sh` readiness gates were 5 s/10 s/15 s (`wait_for_port_safe`, 79 call
+     sites, all three CI failures). Fixed by flooring every per-call timeout at
+     `FRP_COMPAT_READY_MIN` (default 20 s); `FRP_COMPAT_READY_MIN=0` restores the old per-call
+     behaviour byte for byte. Proof (function level, `wait_for_port_safe` extracted from each
+     revision and driven against a listener that binds late): base revision — 5 s gate/8 s listener
+     `rc=1 after 5.58 s`, 15 s gate/16.5 s listener `rc=1 after 15.98 s`; fixed revision with the
+     floor off — `rc=1 after 5.95 s` / `16.00 s` (identical to base); fixed revision with the floor —
+     **`rc=0 after 8.11 s` / `16.63 s`**. End-to-end proof with the failing scenario itself: a Go
+     `frpc` delayed 17 s makes the base revision print `[FAIL] go-to-rust-wss-plain: proxy port
+     25389 not reachable` (the CI string) and the fixed revision print `[PASS] go-to-rust-wss-plain`.
+     A healthy run pays nothing — each poll exits on first success, and the named scenarios' wall
+     times are unchanged before/after.
+  2. A red `compat-test.sh` run printed **no logs**: `fail_test`'s dump was gated on `--verbose`,
+     while CI passes neither `--verbose` nor `--keep-tmp`, and the EXIT trap then deletes `TEST_DIR`.
+     Fixed to dump under `$CI` too. Proof: same injected fault (`frps` refuses to start), same CI
+     flags — base revision prints only `[FAIL] go-to-rust-http-basic-auth: Rust frps did not start`;
+     fixed revision prints that plus `--- logs for go-to-rust-http-basic-auth ---` and the
+     `frps.log` tail. This is what makes the next real occurrence diagnosable.
+  3. `scripts/protocol-matrix.sh` tore a row down with **SIGTERM only** — no wait, no escalation
+     (and only the success path slept 0.5 s) — while its port blocks advanced by one port per row
+     and were four ports wide, so they **overlapped by three**: row k's `proxy_port` was row k+1's
+     `srv_port`, its `echo_port` row k+1's `proxy_port`, its `extra_port` row k+1's `echo_port`. A
+     straggler was therefore read as the next row's own listener — a stale echo on the next row's
+     proxy port turns that row's readiness probe green against a non-frp server (silently measuring
+     nothing), and a straggling `frps`/echo there makes its real `frps` fail to bind and report
+     `proxy port not reachable`. `kill_row_processes` now drains: SIGTERM, a 3 s bounded wait,
+     SIGKILL, a 2 s bounded wait; the block is now `19000 + 4 * (PASS + FAIL)`, disjoint row to row.
+     Proofs: `kill_row_processes` extracted from each revision against a process that ignores
+     SIGTERM (`trap '' TERM`) — base `took 0.02 s -> ALIVE (leaked)`, fixed `took 3.40 s -> reaped`;
+     the port arithmetic is 3-port overlap for the old base and 0 for the new.
+  4. `scripts/protocol-matrix.sh` gated the **server and proxy** ports with `wait_for_port`, i.e. a
+     real `/dev/tcp` connect, which is the phantom-`ProxyUserConn` hazard
+     `scripts/compat-test.sh:222-224` documents for exactly these ports. Replaced with a new
+     `wait_for_listen` (`lsof -sTCP:LISTEN`, else `ss`, else the connect fallback). Proof: against a
+     real listener it returns 0 in 0.07 s, with nothing listening it returns 1 after its timeout (no
+     false positive, no false negative), and the full matrix still passes 11/11 rows after the swap.
+     `fail_row` also printed its log *paths* only under `--verbose`, naming files the EXIT trap had
+     already deleted; it now always prints both tails. Proof: seeded `frps.log`/`frpc.log` markers —
+     base revision prints neither at either verbosity, fixed revision prints both
+     (`[matrix]   | bind error: injected-marker-frps-log-line`).
+
+  **Not determined (honest residue).** The underlying reason a listener is late on the CI runner —
+  CPU contention versus a stalled dial — is not established; the 0.5–0.7 s overshoot identifies the
+  *proximate* bound, not the upstream cause, and the widened bound can only convert a merely-late
+  listener into a pass, not a wedged one. The `send_and_expect` windows were left alone: its
+  `per_attempt` is `timeout if timeout >= 20 else min(timeout, 3.0)`
+  (`scripts/compat-test.sh:320`), so raising a send timeout to ≥20 s silently replaces the 3 s retry
+  with one long attempt. The fixes' effect on the *rate* of red `compat` runs in CI is unmeasured
+  (that needs many CI runs, not one); the `compat` job has no `needs:` consumer, so a red one costs
+  review time and nothing else, which is why this item has stayed open.
 
 - [x] **`Tests (server integration)` fails intermittently, and it turns `main` red.**
   Evidence: on 2026-09-17 the CI run for the merge commit `d9ca98b` failed on
@@ -10239,3 +10329,135 @@ section; ledger now **24 open / 104 closed**.**
   - Neither `-c` nor `--config-dir` is evidence: `cli_overrides_enabled()` is `self.config.is_none() && self.config_dir.is_none()` (`frp-core/src/cli.rs:5095-5096`), so either flag makes the overlay be skipped and the CLI config flag is never applied (Go v0.70.1 parity — `frp-core/src/cli.rs:547-548`). Measured: `frps --config-dir dir --bind-port 19999` still starts on the file's `19782`, i.e. the flag is discarded, not applied; the `--config-dir` branch returns at `frps/src/main.rs:1016` and never reaches the only production `override_server_config` call at `frps/src/main.rs:1061` (`frp-core/src/cli.rs:5993-5994` asserts `!with_dir.cli_overrides_enabled()`).
 
   **Done-when:** either the CLI override is covered — the completion/overlay step records the unhonoured reader-gated ports it applies, and the record fires in every shape that advertises the flag — or the boundary is recorded next to `run_verify` and in `docs/config.md` and pinned in each build shape. Silently accepting a flag the build cannot honour is the same class `TODO.md:10033` closed for the file.
+- [ ] **The compat gate's residual flake is unmeasured in CI, and the round-5 harness fixes are proven only by local mutation.**
+
+  **Filed by the Batch K author (round-5 measurement), base `b9af37c5`.** The parent item ("The compat
+  gate is flaky, which weakens the project's strongest claim", TODO.md:6611) stays open because
+  nothing was reproduced on an idle host: 120/120 scenario runs (30 each, fresh
+  `FRP_COMPAT_TEST_DIR`) and 20/20 full protocol-matrix repeats (220 row-runs) passed **before** the
+  fixes, so the measurements bound the per-run probability only at `p ≳ 9.5 %` (30 runs) and
+  `p ≳ 14 %` (20 runs). The remaining work is therefore a measurement and two unclosed mechanisms,
+  not a missing patch:
+
+  - The three live CI failures (runs `36953419067`, `36907334189`, `36893868474`; each
+    `RESULTS: 85 passed, 1 failed`, red on attempt 1) are all `wait_for_port_safe` readiness gates
+    that expired 0.5–0.7 s past their deadline. The widened bound
+    (`FRP_COMPAT_READY_MIN`, default 20 s) provably absorbs a listener that binds 16.5 s late, but a
+    *wedged* dial now merely fails at 20 s instead of 15 s. Nothing yet distinguishes "late" from
+    "wedged" on a contended runner, so the mechanism is still not established.
+  - The fixes' effect on the red rate is unmeasured: the recorded baseline is 3 red `compat` runs in
+    the last 100 (86 success / 3 failure / 11 cancelled, i.e. 3/89 of completed runs), and the one
+    green run on the new main (`37005043144`, head `b9af37c5`) says nothing about it.
+  - `scripts/compat-test.sh:320` still hides a trap for future edits: `send_and_expect` computes
+    `per_attempt = timeout if timeout >= 20 else min(timeout, 3.0)`, so raising any send timeout to
+    ≥20 s silently replaces its 3 s retry loop with one long attempt. (`go-to-rust-quic`'s
+    `send_and_expect "$proxy_port" "quic-test-data" "quic-test-data" 15` at
+    `scripts/compat-test.sh:6801` was deliberately left alone for this reason.)
+  - The mechanism behind that readiness-gate signature is filed separately: **A compat scenario can hand
+    its own Go frps a port its echo listener already holds, and the readiness probe cannot tell.**
+    (`TODO.md:10419`).
+
+  **Done-when:** the next red `compat` run on main is diagnosed from the logs the round-5 dump now
+  prints under `$CI` (the `frps.log`/`frpc.log` tails), the lateness is attributed to runner
+  contention or to a stalled dial, and the `compat` job's red rate over the following ≥30 completed
+  runs is compared against the 3/89 recorded here — or the readiness bound is replaced by a
+  mechanism-level fix (for example re-driving the frpc start rather than waiting longer for it).
+
+- [ ] **`scripts/compat-test.sh --list` prints `run_test` function names while `--test` selects display names, so a name taken from `--list` runs nothing and still reports success.**
+
+  Filed by the Batch K author after PR #463 review round 1. The selector compares the caller's display name
+  (`should_run_test` at `scripts/compat-test.sh:694-699`, `[[ "$SELECTED_TEST" == "$1" ]]`), while `--list`
+  prints the `run_test test_*` **function** names (`scripts/compat-test.sh:75-78`, an `awk` over the second
+  field). Nothing validates that a `--test` value matched anything.
+
+  Measured on this branch (head `80fdad8c`, release binaries under `target/release`, Go frp 0.71.0 present):
+  - `bash scripts/compat-test.sh --list | sed -n '35p'` → `test_g2r_tcp_plain`; that scenario's display name
+    is `go-to-rust-tcp-plain` (`test_g2r_tcp_plain()` at `scripts/compat-test.sh:1161`, `local name=…` at
+    `:1162`).
+  - `bash scripts/compat-test.sh --ci --test test_g2r_tcp_plain` (a name copied verbatim from `--list`) →
+    exit **0**, ` RESULTS: 0 passed, 0 failed`, `All tests passed!` — no scenario ran.
+  - `bash scripts/compat-test.sh --ci --test go-to-rust-tcp-plain` (the display name) → exit 0,
+    ` RESULTS: 1 passed, 0 failed`.
+
+  Pre-existing and not CI-reachable: this branch's entire delta to `scripts/compat-test.sh` is 6 lines (3
+  executable + 3 comment lines added, the same removed), and no workflow passes `--test`
+  (`grep -c -- '--test' .github/workflows/compat.yml .github/workflows/xtcp-compat.yml` → `0` and `0`; both
+  run the full suite). The trap is the cheap loop the parent item (`TODO.md:6611`) advertises —
+  `compat-test.sh --test <display-name>` — for anyone who runs `--list` first.
+
+  **Done-when:** a `--test` value that matches nothing must fail closed: non-zero exit, a message naming the
+  selector, and no ` RESULTS: 0 passed, 0 failed` — proven by the mismatched-name run `--ci --test
+  test_g2r_tcp_plain`. `--list` printing display names is a convenience, not sufficient on its own.
+
+- [ ] **The protocol matrix's `wait_for_listen` accepts a LISTEN socket owned by any process, so a foreign listener can green a row's readiness gate.**
+
+  Filed by the Batch K author after PR #463 review round 1. `wait_for_listen`
+  (`scripts/protocol-matrix.sh:80-102`) returns 0 as soon as *any* process holds the port in LISTEN —
+  `lsof -iTCP:"$port" -sTCP:LISTEN -t`, or `ss -tln sport = :"$port"` — with no check that the socket
+  belongs to the row's own frps/frpc. The round-5 disjoint block
+  (`base=$((19000 + 4 * (PASS + FAIL)))`, `scripts/protocol-matrix.sh:115-118`: `srv_port=$base`,
+  `proxy_port=$base+1`, `echo_port=$base+2`) closes the row-to-row overlap — the old
+  `base=19000 + PASS + FAIL` made row 0's echo port 19002 row 1's proxy port — but it does not make the
+  gate check socket ownership.
+
+  Measured (head `80fdad8c`):
+  - The function extracted verbatim (`awk '/^wait_for_listen\(\)/,/^}/' scripts/protocol-matrix.sh`) against
+    a foreign `python3` listener on port 39010 (`lsof -iTCP:39010 -sTCP:LISTEN -t` names the python pid; no
+    frp process involved) → `wait_for_listen rc=0` after **0.041 s**. With no listener it returns `rc=1`
+    after **4.9 s** for a requested 3 s (the bound is `10 × timeout` polls, and each poll also pays an
+    `lsof` call, so the wall-clock bound exceeds the argument).
+  - The 11 rows occupy 19000–19043 (`19000 + 4 * (PASS + FAIL)` for rows 0…10), while `random_port()`
+    allocates `port=$(( (RANDOM % 10000) + 17000 ))` = 17000–26999 (`scripts/compat-test.sh:189-204`, the
+    range at `:195`). The matrix block is a subset of the range `compat-test.sh` draws its own ports from,
+    so neither harness's port space is disjoint from the other's, and neither can tell whose LISTEN it saw.
+
+  **Done-when:** `wait_for_listen` confirms the listening socket belongs to the process the row is waiting
+  for — a pid check against the row's recorded frps/frpc pid, not a bare LISTEN probe — proven by a
+  constructed foreign-listener run that can no longer green a row. Moving the block outside
+  `random_port()`'s 17000–26999 range is additional hardening only; it cannot satisfy this item by itself.
+
+- [ ] **A compat scenario can hand its own Go frps a port its echo listener already holds, and the readiness probe cannot tell.**
+
+  Filed by the coordinator from **attempt 1** of CI run `37015704902` (workflow `Cross-Compat`, job `compat`, job id `110865907851`, failed 13:54:01Z→14:01:50Z; the run's published conclusion is *success* because attempt 2 was the green re-run at 14:25:14Z→14:35:17Z; head `5099b7f0e0eecf96cd2a31d078e6441920f00e30` = PR #463) — the first compat red that has been root-caused rather than measured, and whose mechanism has since been **reproduced by forced collision** on the base tree. That attempt failed one of eighty-six scenarios:
+
+  ```
+  [LOG] === rust-to-go-compression ===
+  [FAIL] rust-to-go-compression: proxy port 20180 not reachable
+  --- logs for rust-to-go-compression ---
+  === frpc.log ===
+  frpc (Rust) v0.71.0 connecting to 127.0.0.1:19510
+  Login sent, waiting for response...
+  WARN Login failed (attempt 1): protocol error: Unexpected response to login
+  === frps.log ===
+  create server listener error, listen tcp 127.0.0.1:19510: bind: address already in use
+  --- end logs ---
+  ```
+
+  Excerpt of **attempt 1**'s log, kept in dump order: the `[LOG]` and `[FAIL]` lines are the harness's own stdout; the `--- logs for $name ---` banner is `scripts/compat-test.sh:682`, the `=== … ===` file headers are `fail_test`'s dump loop (`scripts/compat-test.sh:684-689`), which prints this scenario's `frpc.log` before its `frps.log`, and the `--- end logs ---` marker is `:690`. Both quoted blocks are abridged: the `=== frpc.log ===` block has five content lines and shows three of them, the two omitted being the opening `INFO frpc: frpc (Rust) v0.71.0 connecting... version=0.71.0` and the closing `ERROR frpc: frpc error: protocol error: Unexpected response to login`. Because `fail_test` dumps **every** scenario's logs, the `--- end logs ---` marker does not follow this scenario's `frps.log` directly — in attempt 1 it sits 410 log lines later (log line 4299). Timestamps and the per-line tracing fields are stripped here, and the lines between the banner and the dump are omitted. The `frps.log` line and the `frpc.log` lines are the scenario's own Go frps and Rust frpc (`frp-client/src/control.rs:542-543`, the `_ =>` arm of the login-response match — a successfully decoded frp message that is **not** `LoginResp`). The readiness gate had a 20 s `FRP_COMPAT_READY_MIN` floor (`scripts/compat-test.sh:226`, raising this scenario's 10 s request at `:5743`) and the failure landed ≈21.3 s after the `[LOG]` banner (14:00:31.823Z → 14:00:53.144Z) — the floor and the elapsed figure are our own reading of the code and the log timestamps, not lines in the log. So the frps could not bind its control port, the frpc then spoke frp to whatever did hold it, login never completed, no proxy was registered, and the remote proxy port never listened. Those lines only survive because the `fail_test` log dump in `scripts/compat-test.sh` now runs under `$CI` as well as `$VERBOSE`; the dump prints `*.log` files, so the echo port itself — recorded in `frpc.toml` as `local_port` — still needs `--keep-tmp`.
+
+  Mechanism, all in `scripts/compat-test.sh`: `random_port()` (`:190`) picks `(RANDOM % 10000) + 17000` and rejects it only if it is listening *at pick time* (lsof, else ss, else no check at all). It keeps no memory of the ports it has already returned, and `test_r2g_compression` takes three independent picks — `frps_port`, `proxy_port`, `echo_port` — with no per-scenario uniqueness, starting the echo listener first:
+
+  ```
+  start_echo_server "$echo_port"     # python3 accept/recv/sendall/close, SO_REUSEADDR, never logs the port
+  run_go "$GO_FRPS" -c ...           # binds $frps_port
+  ```
+
+  If `echo_port == frps_port` the echo server wins the bind, the Go frps dies with `bind: address already in use`, and `wait_for_port` (`:210`) — a bare `nc -z` connect with no ownership check — succeeds against the echo server, so the harness proceeds as if the server were up.
+
+  **Reproduced by forced collision** (isolated copy of `b9af37c5`, one-line edit `echo_port="$frps_port"`, no rebuild):
+
+  | run | result |
+  | --- | --- |
+  | control, unmodified | exit 0, 1 s, `RESULTS: 1 passed, 0 failed` |
+  | `echo_port="$frps_port"` | exit 1, 11–12 s — the same three symptoms as the CI red: frps `bind: address already in use`, frpc `Login failed (attempt 1): protocol error: Unexpected response to login`, `[FAIL] rust-to-go-compression: proxy port <n> not reachable` |
+  | `echo_port="$proxy_port"` | **spurious PASS** (`RESULTS: 1 passed, 0 failed`): frps starts fine, frpc logs `Logged in` then `Failed to register proxy 'tcp-comp': port unavailable`, and both readiness probes succeed against the echo server |
+
+  An `lsof` probe inserted before the proxy wait named the holder outright: `Python <pid> cdf 3u IPv4 … TCP 127.0.0.1:<frps_port> (LISTEN)`, with `frps_port == echo_port`. On disk, the forced run's `frpc.toml` had `server_port = <p>` **and** `local_port = <p>` (same port) with a different `remote_port`. The third row is why the probe-only fix is not enough: a proxy-port collision is silently green, so only a control-port collision produces the recorded failure signature.
+
+  Arithmetic: `P(echo == frps) = 1e-4` per scenario, exact under any pick count because it is one specific pair — that is the failure's signature; the *any*-pair rates below are the three-i.i.d.-picks idealization's (`P(any pair equal) ≈ 2.9998e-4` per scenario). Under that idealization, over the suite's ≈86 scenarios the control-port signature is expected in ≈0.86 % of runs (86 × 1e-4), while *any*-pair collisions, which also include the silently-green `echo_port == proxy_port` case, are expected in ≈2.6 % (86 × 2.9998e-4). The real pick counts are higher and uneven: the campaign's four scenarios take 4/4/3/3 `random_port` picks (`scripts/compat-test.sh:6759-6762` `go-to-rust-quic`, `:4972-4975` `kcp-rust-to-rust`, `:6048-6050` `go-to-rust-wss-plain`, `:1663-1665` `rust-to-go-tcp-tls`), so under the exact counts the suite's any-pair expectation is ≈2.8 % (on the suite's ≈3.3 picks per scenario) and Batch K's campaign of 120 forced scenario runs (4 scenarios × 30) on an idle host — which produced zero failures — carried ≈0.054 expected any-pair hits against ≈0.012 expected control-port hits (120 × 1e-4, exact under any pick count). The campaign's 20 whole-matrix repeats (220 row-runs) cannot exhibit the class at all — `scripts/protocol-matrix.sh` calls no `random_port` (`grep -c random_port` = 0) and derives deterministic disjoint ports from `19000 + 4 * (PASS + FAIL)` (`scripts/protocol-matrix.sh:115-118`) — so they contribute nothing to that expectation.
+
+  This also re-reads the three reds already in the record (`go-to-rust-http-basic-auth: VHost HTTP port 19286 not reachable`, `go-to-rust-wss-plain: proxy port 24016 not reachable`, `test_auth_r2g_reject: proxy port 22335 not reachable`): a control-port collision surfaces as whichever proxy or vhost readiness gate the scenario reaches, which is why every previous fix — including the `FRP_COMPAT_READY_MIN` floor — only moved the timeout. A port that will never be listened on cannot be waited for.
+
+  Not proven for that specific CI run: that `echo_port` was in fact 19510 (the `EXIT` trap removed `TEST_DIR`, and the echo port is never printed). A listener leaked by the immediately preceding scenario has the same signature and the same cure, but it is the weaker explanation: `random_port()` skips anything already LISTENing at pick time, `cleanup_pids` never runs *between ordinary `run_test` scenarios* (`run_test`, `:703-709`, reaps nothing; the reaper runs only in the `EXIT` trap `:169`, inside `run_xtcp_test` `:4353` — function `:4331`, which all 17 `test_xtcp_*` wrappers call, and XTCP is skipped unless `RUN_XTCP=1` — and once before the KCP/QUIC phase `:7739`, none of which sits between the ordinary scenarios that bracket `test_r2g_compression` at `:7707`), and the only process this scenario starts in the post-pick window is its own echo server. Distinguishers if it recurs: `lsof -nP -iTCP:<frps_port> -sTCP:LISTEN` naming `Python` versus an `frps`/`frpc` with another scenario's `-c` path; the frpc error text (an echo gives exactly `Unexpected response to login`; a leaked frps answers with token/protocol semantics); and `local_port == server_port` in the scenario's `frpc.toml` under `--keep-tmp`.
+
+  **Done-when:** the harness cannot give two listeners in one scenario the same port — by reserving each port for the life of the scenario, or by making the pick reject ports already allocated in that scenario — and the readiness probe fails closed when the socket that answers is not the process that was just launched; with the forced-collision run above red before the change (the same three symptoms as attempt 1 of run `37015704902`) and green after, a forced `echo_port="$proxy_port"` collision no longer passing, and `scripts/lib/compat-stray-guard.sh` and its fixture suite unweakened. If instead the leak path is the real one, the Done-when is the same bar applied to teardown: no listener from scenario *n* may still hold a port when scenario *n+1* picks one.
