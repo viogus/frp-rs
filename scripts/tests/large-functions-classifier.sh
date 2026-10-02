@@ -23,20 +23,26 @@
 #      `tests/` directory, the attribute-attribution cases (a gate above a `use`
 #      / `const` / between two attributes, `#[cfg(all(test, …))]` inline and on a
 #      declaration, `#[cfg(all(not(test), …))]`, a `#[path]` written above the
-#      gate, and braces inside string literals), and the three negative controls
+#      gate, and braces inside string literals), the raw-string cases (a
+#      multi-line literal and one with embedded quotes inside a gate's region, a
+#      production function whose body holds one) and the predicate-parse
+#      controls (`all(not(any(test, …)))`, `all(not (test), …)`, and the true
+#      `all(test, …)` gate beside them), plus the three negative controls
 #      (a plain `mod X;` production sibling, a directory whose name merely starts
 #      with `tests`, and a production `collide.rs` that another module's
 #      `#[cfg(test)] mod collide;` must not claim — Rust resolves that under
 #      `attacker/`).
-#   2  the default table and `--top` are unchanged in shape, and a file the
-#      filter excluded is still not listed.
-#   3  nine mutations of the script, each of which must red exactly one part of
+#   2  the default table and `--top` are unchanged in shape, a file the
+#      filter excluded is still not listed, and the function table measures the
+#      raw-string fixture's function to its true end.
+#   3  eleven mutations of the script, each of which must red exactly one part of
 #      scenario 1: drop the name pattern, drop the sibling attribution, drop
 #      declaration recognition, drop `pub(…)` from the declaration pattern,
-#      offer `dir/X.rs` for a `parent.rs`, drop the `#[cfg(all(test, …))]` arm,
-#      skip the backward attribute walk, scan string literals as code, and drop
-#      the paren tracking that keeps a `[&str; 2]` type's `;` from ending a
-#      `const` early. A green suite on a mutant would mean the fixture does not
+#      offer `dir/X.rs` for a `parent.rs`, drop the `all(…)` arm of the
+#      predicate parse, skip the backward attribute walk, scan string literals as
+#      code, drop the paren tracking that keeps a `[&str; 2]` type's `;` from
+#      ending a `const` early, stop skipping raw strings, and treat `not(…)` as
+#      implying `test`. A green suite on a mutant would mean the fixture does not
 #      drive the code it claims to.
 #
 # Usage: bash scripts/tests/large-functions-classifier.sh
@@ -47,7 +53,7 @@ set -uo pipefail
 # installed before the path resolution and the first check, so an early `exit 0`
 # anywhere below it still has to answer to the floor. `MIN_CHECKS` is the
 # measured check count of a green run.
-MIN_CHECKS=62
+MIN_CHECKS=76
 checks=0
 fails=0
 WORK=""
@@ -448,6 +454,103 @@ mod tests {
 }
 EOF
 
+cat > "$TREE/frp-core/src/attr_raw_fn.rs" <<'EOF'
+//! Fixture: a production function whose body holds a multi-line raw string.
+//!
+//! The literal's closing brace is not the function's, so a scan that reads it
+//! as code ends the body early and the function measures short.
+
+/// Returns the embedded template.
+pub fn build_payload(enabled: bool) -> &'static str {
+    if enabled {
+        let template = r#"
+left } right
+"#;
+        return template.trim();
+    }
+    "{}"
+}
+EOF
+
+cat > "$TREE/frp-core/src/attr_raw_multiline.rs" <<'EOF'
+//! Fixture: a gated inline module whose body holds a multi-line raw string.
+//!
+//! A raw string spans lines and ends only at `"` + the opening `#` run, so its
+//! braces are not code. Scanned as code the closing brace closes the region
+//! early.
+
+#[cfg(test)]
+mod tests {
+    fn legacy() -> &'static str {
+        let payload = r#"
+left } right
+"#;
+        payload
+    }
+
+    #[test]
+    fn non_empty() {
+        assert!(!legacy().is_empty());
+    }
+}
+EOF
+
+cat > "$TREE/frp-core/src/attr_raw_quotes.rs" <<'EOF'
+//! Fixture: a gated inline module whose raw string contains quotes.
+//!
+//! A quote-naive scan leaves raw-string mode at the first inner `"`, so the
+//! brace after it is counted and the module closes early.
+
+#[cfg(test)]
+mod tests {
+    fn legacy() -> &'static str {
+        let payload = r#"left " right } tail"#;
+        payload
+    }
+
+    #[test]
+    fn non_empty() {
+        assert!(!legacy().is_empty());
+    }
+}
+EOF
+
+cat > "$TREE/frp-core/src/attr_all_gated_like.rs" <<'EOF'
+//! Fixture: the true gate spelling, for contrast with the two negations above.
+
+#[cfg(all(test, feature = "x"))]
+mod helper {
+    #[test]
+    fn inline() {}
+}
+EOF
+
+cat > "$TREE/frp-core/src/attr_not_any_gated.rs" <<'EOF'
+//! Fixture: a module that compiles only where `test` is OFF.
+//!
+//! `all(not(any(test, …)))` is the opposite of a gate — it must stay production.
+
+#[cfg(all(not(any(test, feature = "x"))))]
+mod helper {
+    pub fn used_in_production() -> u8 {
+        7
+    }
+}
+EOF
+
+cat > "$TREE/frp-core/src/attr_not_space_gated.rs" <<'EOF'
+//! Fixture: a module that compiles only where `test` is OFF.
+//!
+//! `not (test)` with a space is still a negation — it must stay production.
+
+#[cfg(all(not (test), feature = "x"))]
+mod helper {
+    pub fn used_in_production() -> u8 {
+        7
+    }
+}
+EOF
+
 # --- helpers ------------------------------------------------------------------
 # row <output> <path> -> "production total test", or empty when not listed.
 row() {
@@ -461,6 +564,22 @@ expect_row() { # expect_row <output> <path> <prod> <total> <test> <label>
     ok "$6"
   else
     bad "$6: $(basename "$2") is '${got:-<absent>}', expected '$3 $4 $5'"
+  fi
+}
+
+# fnrow <output> <file:line> -> "code total", or empty when not listed. The
+# function table's last field is the site, `(path:line)`.
+fnrow() {
+  printf '%s\n' "$1" | awk -v p="($2)" '$NF == p { print $1, $2; exit }'
+}
+
+expect_fn() { # expect_fn <output> <file:line> <code> <total> <label>
+  local got
+  got="$(fnrow "$1" "$2")"
+  if [ "$got" = "$3 $4" ]; then
+    ok "$5"
+  else
+    bad "$5: $2 is '${got:-<absent>}', expected '$3 $4'"
   fi
 }
 
@@ -562,6 +681,20 @@ expect_row "$OUT" "frp-core/src/attr_const.rs" 9 14 5 \
 expect_row "$OUT" "frp-core/src/attr_gate_then_attr.rs" 5 11 6 \
   "an attribute between the gate and its item stays in the region"
 
+# --- raw strings and the predicate parse --------------------------------------
+expect_row "$OUT" "frp-core/src/attr_raw_fn.rs" 16 16 0 \
+  "a production fn whose raw string spans lines is production"
+expect_row "$OUT" "frp-core/src/attr_raw_multiline.rs" 7 21 14 \
+  "a multi-line raw string does not close its test region early"
+expect_row "$OUT" "frp-core/src/attr_raw_quotes.rs" 6 18 12 \
+  "quotes inside a raw string do not end it"
+expect_row "$OUT" "frp-core/src/attr_all_gated_like.rs" 3 8 5 \
+  "the true \`all(test, …)\` gate is still a gate (contrast for the negations)"
+expect_row "$OUT" "frp-core/src/attr_not_any_gated.rs" 11 11 0 \
+  "\`all(not(any(test, …)))\` is not a gate"
+expect_row "$OUT" "frp-core/src/attr_not_space_gated.rs" 11 11 0 \
+  "\`all(not (test), …)\` is not a gate"
+
 # ---------------------------------------------------------------- scenario 2
 printf '\nscenario 2: default output shape\n'
 DEF="$(bash "$TREE/scripts/large-functions.sh" 2>&1)"
@@ -607,6 +740,13 @@ if [ "$n3" -eq 3 ]; then
 else
   bad "\`--top 3\` printed $n3 function row(s)"
 fi
+
+# The function table's own view of the raw-string fix: the production fixture's
+# body ends at its final brace, not at the `}` inside the literal. The value the
+# M10 mutant produces (`7 7`) is asserted there, so this row is the witness.
+TOPBIG="$(bash "$TREE/scripts/large-functions.sh" --top 200 2>&1)"
+expect_fn "$TOPBIG" "frp-core/src/attr_raw_fn.rs:7" 9 9 \
+  "a fn whose raw string spans lines keeps its whole body (\`fn_body_end\`)"
 
 # ---------------------------------------------------------------- scenario 3
 printf '\nscenario 3: mutations of the script must red scenario 1\n'
@@ -665,7 +805,9 @@ fi
 # on the sibling: `declared_helper.rs` matches no test-ish name, and this is the
 # only mechanism that attributes it. (Before the attribution fix the same
 # mutation brace-matched the declaration forward and made `ssh_gateway.rs` read
-# 2726 production / 24 test instead of 2742 / 8.)
+# 2726 production / 24 test instead of 2742 / 8.) The `parent.rs` row below
+# cannot discriminate — it holds with and without the mutation — and is kept
+# only as an independence control; the sibling row is the witness.
 if mutate "$REAL" "$MUT" 'decl = MOD_DECL.match(lines[j])' 'decl = None'; then
   cp "$MUT" "$TREE/scripts/large-functions.sh"
   MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
@@ -677,9 +819,9 @@ if mutate "$REAL" "$MUT" 'decl = MOD_DECL.match(lines[j])' 'decl = None'; then
   fi
   got="$(row "$MOUT" "frp-core/src/parent.rs")"
   if [ "$got" = "22 33 11" ]; then
-    ok "M3: the region still ends at the declaration's \`;\` (the mechanisms are independent)"
+    ok "M3 control (not a witness — the sibling row is): the region still ends at the declaration's \`;\`"
   else
-    bad "M3: parent.rs became '${got:-<absent>}'"
+    bad "M3 control: parent.rs became '${got:-<absent>}'"
   fi
   got="$(row "$MOUT" "frp-core/src/orphan_tests.rs")"
   if [ "$got" = "0 4 4" ]; then
@@ -694,7 +836,9 @@ fi
 # M4: the qualifier on the declaration. The base script's declaration pattern
 # accepted only a bare `pub`, so `pub(crate) mod X;` / `pub(super) mod X;` were
 # not seen as declarations at all and their siblings stayed production. The
-# region itself still ends at the declaration's `;`.
+# region itself still ends at the declaration's `;`, so the `qualified.rs` row
+# cannot discriminate and is kept as an independence control: the two sibling
+# rows are the witnesses.
 if mutate "$REAL" "$MUT" \
     '(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*;' \
     '(?:pub\s+)?mod\s+([A-Za-z0-9_]+)\s*;'; then
@@ -702,9 +846,9 @@ if mutate "$REAL" "$MUT" \
   MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
   got="$(row "$MOUT" "frp-core/src/qualified.rs")"
   if [ "$got" = "10 14 4" ]; then
-    ok "M4 (bare-\`pub\` declaration pattern): the qualified declarations still end at their \`;\`"
+    ok "M4 control (not a witness — the two sibling rows are): the qualified declarations still end at their \`;\`"
   else
-    bad "M4 (bare-\`pub\` declaration pattern): qualified.rs expected '10 14 4', got '${got:-<absent>}'"
+    bad "M4 control: qualified.rs expected '10 14 4', got '${got:-<absent>}'"
   fi
   got="$(row "$MOUT" "frp-core/src/qualified/bbb.rs")"
   if [ "$got" = "4 4 0" ]; then
@@ -744,11 +888,11 @@ else
   bad "M5 mutation did not apply — anchor missing, the check would be vacuous"
 fi
 
-# M6: the `#[cfg(all(test, …))]` arm. Dropping it leaves both the inline module
-# and the declaration's sibling as production, while the bare `#[cfg(test)]`
-# regions are untouched — the two arms are independent.
-if mutate "$REAL" "$MUT" 'TEST_ATTR.match(lines[i]) or ALL_TEST_ATTR.match(lines[i])' \
-    'TEST_ATTR.match(lines[i])'; then
+# M6: the `all(…)` arm of the predicate parse. Dropping it leaves both the inline
+# module and the declaration's sibling as production, while the bare
+# `#[cfg(test)]` regions are untouched — the two arms are independent.
+if mutate "$REAL" "$MUT" "    if m.group(1) == 'all':" \
+    "    if m.group(1) == 'allX':"; then
   cp "$MUT" "$TREE/scripts/large-functions.sh"
   MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
   got="$(row "$MOUT" "frp-core/src/attr_all_gated.rs")"
@@ -837,6 +981,70 @@ if mutate "$REAL" "$MUT" "elif c == ';' and paren <= 0:" "elif c == ';':"; then
   fi
 else
   bad "M9 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M10: the raw-string skipper. Without it a literal's braces are read as code, so
+# a gated module ends inside the literal — its tail is charged to production and
+# its test function is listed — and a function's body ends at the first brace
+# inside the string.
+if mutate "$REAL" "$MUT" 'm = RAW_OPEN.match(line, j)' 'm = None'; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/attr_raw_multiline.rs")"
+  if [ "$got" = "13 21 8" ]; then
+    ok "M10 (raw strings unscanned): the gated module ends inside the literal"
+  else
+    bad "M10 (raw strings unscanned): expected '13 21 8', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/attr_raw_quotes.rs")"
+  if [ "$got" = "12 18 6" ]; then
+    ok "M10: the quotes inside a raw string end it early"
+  else
+    bad "M10: attr_raw_quotes.rs expected '12 18 6', got '${got:-<absent>}'"
+  fi
+  MTOP="$(bash "$TREE/scripts/large-functions.sh" --top 200 2>&1)"
+  got="$(fnrow "$MTOP" "frp-core/src/attr_raw_fn.rs:7")"
+  if [ "$got" = "7 7" ]; then
+    ok "M10: \`fn_body_end\` ends the production fn at the brace inside the literal"
+  else
+    bad "M10: attr_raw_fn.rs:7 is '${got:-<absent>}', expected '7 7'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/attr_literal.rs")"
+  if [ "$got" = "9 17 8" ]; then
+    ok "M10: the ordinary-string fixture is unaffected (the mechanisms are independent)"
+  else
+    bad "M10: attr_literal.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M10 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M11: the negation rule in the predicate parse. `not(…)` never implies `test`;
+# treating it as if it did turns the two negations into gates again, while the
+# true `all(test, …)` gate is untouched.
+if mutate "$REAL" "$MUT" '    return False' '    return True'; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/attr_not_any_gated.rs")"
+  if [ "$got" = "5 11 6" ]; then
+    ok "M11 (\`not(…)\` treated as a gate): the negated \`all(not(any(test, …)))\` is excluded again"
+  else
+    bad "M11: attr_not_any_gated.rs expected '5 11 6', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/attr_not_space_gated.rs")"
+  if [ "$got" = "5 11 6" ]; then
+    ok "M11: the spaced negation \`not (test)\` is excluded again"
+  else
+    bad "M11: attr_not_space_gated.rs expected '5 11 6', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/attr_all_gated_like.rs")"
+  if [ "$got" = "3 8 5" ]; then
+    ok "M11: the true \`all(test, …)\` gate is unaffected (the mechanisms are independent)"
+  else
+    bad "M11: attr_all_gated_like.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M11 mutation did not apply — anchor missing, the check would be vacuous"
 fi
 
 # ---------------------------------------------------------------- summary

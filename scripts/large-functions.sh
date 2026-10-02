@@ -47,12 +47,18 @@ TOP = int(sys.argv[1])
 ALL = sys.argv[2] == '1'
 ROOTS = ('frp-core/src', 'frp-server/src', 'frp-client/src', 'frp-vnet/src')
 FN = re.compile(r'^(\s*)(?:pub(?:\([^)]*\))?\s+)?(?:const\s+|async\s+|unsafe\s+)*fn\s+([A-Za-z0-9_]+)')
-# A test gate is `#[cfg(test)]` or `#[cfg(all(test, …))]`. The second is just as
-# test-only (it compiles only where `test` is set), but the base script did not
-# know it and scored those regions as production — 10 in-tree sites.
-# `#[cfg(all(not(test), …))]` is the opposite and must not match.
-TEST_ATTR = re.compile(r'\s*#\[cfg\(\s*test\s*\)\]')
-ALL_TEST_ATTR = re.compile(r'\s*#\[cfg\(\s*all\(\s*(?:[^)\n]*)(?<!not\()\btest\b')
+# A test gate is an attribute whose `cfg` predicate can hold only where `test`
+# is set: `#[cfg(test)]`, or `#[cfg(all(…, test, …))]` — 13 in-tree sites, 10
+# of them decorating an inline `mod {` and 3 writing
+# `all(feature = "vnet", test)` over a `use`. The base script knew only
+# `#[cfg(test)]` and scored those regions as production. The predicate is
+# parsed, not pattern-matched, so the negated spellings — `all(not(test), …)`,
+# `all(not (test), …)`, `all(not(any(test, …)))` — are rejected: they compile
+# where `test` is *off*.
+CFG_ATTR = re.compile(r'\s*#\[cfg\((.*)\)\]\s*(?://.*)?$')
+# `r"…"`, `r#"…"#`, `r##"…"##`, `br#"…"#`: the `#`s set the terminator count,
+# and the literal may span lines.
+RAW_OPEN = re.compile(r'(?:b?r|cr)(#*)"')
 ATTR_LINE = re.compile(r'\s*#\[')
 MOD_DECL = re.compile(r'\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*;')
 PATH_ATTR = re.compile(r'\s*#\[path\s*=\s*"([^"]+)"\s*\]')
@@ -75,12 +81,19 @@ def item_end(lines, start):
     of at the next `mod` in the file.
 
     Braces and semicolons inside `//`, `/* */`, string literals, char
-    literals and lifetimes do not count: this is the same skipper
-    `fn_body_end` has always used, lifted out so the region walk uses it
-    too. A naive counter closed an inline test region at the first `{` or
+    literals, lifetimes and raw strings do not count: this is the same
+    skipper `fn_body_end` has always used, lifted out so the region walk
+    uses it too. A naive counter closed an inline test region at the first `{` or
     `}` inside a literal — `frp-core/src/logging.rs` lost 48 production
     lines to one. Parentheses and brackets are tracked until the body
     opens, so the `;` in a `[&str; 2]` type does not end a `const` early.
+
+    Raw strings are skipped by terminator count, not by quote parity, and
+    may span lines: `r"…"` ends at the next `"`, `r#"…"#` at the next `"#`.
+    Scanning one as code costs `frp-core/src/v2_handshake.rs` 568 production
+    lines and `frp-core/src/msg.rs` 148 — both literals sit inside a
+    `#[cfg(test)]` region, and their braces then close it early. Ordinary
+    strings stay line-local (a backslash before the newline is a continuation).
 
     `closed` is False only when a `{` opened and never returned to depth
     zero; the caller decides what an unterminated body means.
@@ -106,6 +119,24 @@ def item_end(lines, start):
                 in_block_comment = True
                 j += 2
                 continue
+            if c in 'brc':
+                m = RAW_OPEN.match(line, j)
+                if m:
+                    # Raw string: no escapes, and it may span lines. It ends
+                    # at the first `"` followed by exactly this many `#`.
+                    term = '"' + '#' * len(m.group(1))
+                    j = m.end()
+                    while i < n:
+                        line = lines[i]
+                        p = line.find(term, j)
+                        if p >= 0:
+                            j = p + len(term)
+                            break
+                        i += 1
+                        j = 0
+                    if i >= n:
+                        break
+                    continue
             if c == '"':
                 j += 1
                 while j < len(line):
@@ -150,6 +181,61 @@ def item_end(lines, start):
     return i - 1, 'brace', False
 
 
+def cfg_args(inner):
+    """Split a `cfg` predicate's argument list on its own top-level commas.
+
+    Nesting and quoted values are respected, so `all(test, feature = "a,b")`
+    is two arguments and the comma inside the string does not split it.
+    """
+    out, cur, depth, quote = [], [], 0, None
+    for ch in inner:
+        if quote is not None:
+            cur.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in '"\'':
+            quote = ch
+        elif ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        elif ch == ',' and depth == 0:
+            out.append(''.join(cur))
+            cur = []
+            continue
+        cur.append(ch)
+    out.append(''.join(cur))
+    return [a.strip() for a in out if a.strip()]
+
+
+def cfg_implies_test(pred):
+    """Does `cfg(pred)` hold only where `test` is set?
+
+    A bare `test` does. `all(a, …)` does when any argument does — the
+    conjunction cannot hold without it. `any(a, …)` does only when every
+    argument does. `not(…)` never does, which is what rejects
+    `all(not(test), …)`, `all(not (test), …)` and `all(not(any(test, …)))`:
+    those compile where `test` is *off*.
+    """
+    pred = pred.strip()
+    m = re.match(r'([A-Za-z_][A-Za-z0-9_]*)\s*\(', pred)
+    if not m or not pred.endswith(')'):
+        return pred == 'test'
+    args = cfg_args(pred[m.end():-1])
+    if m.group(1) == 'all':
+        return any(cfg_implies_test(a) for a in args)
+    if m.group(1) == 'any':
+        return bool(args) and all(cfg_implies_test(a) for a in args)
+    return False
+
+
+def is_test_gate(line):
+    """Is this line a `#[cfg(…)]` that compiles only where `test` is set?"""
+    m = CFG_ATTR.match(line)
+    return bool(m) and cfg_implies_test(m.group(1))
+
+
 def test_blocks(lines):
     """(`#[cfg(test)]` regions, out-of-line test-module declarations).
 
@@ -168,8 +254,10 @@ def test_blocks(lines):
     a body — `mod` / `fn` / `impl` / `thread_local!` — is brace-matched with
     `item_end`'s literal-aware scan.
 
-    Both spellings of the gate count (`#[cfg(test)]` and
-    `#[cfg(all(test, …))]`), and a `#[path]` may sit above or below the gate:
+    Any `#[cfg(…)]` that compiles only where `test` is set counts:
+    `#[cfg(test)]` and `#[cfg(all(…, test, …))]` (`is_test_gate` parses the
+    predicate, so the negated spellings do not). A `#[path]` may sit above or
+    below the gate:
     attributes stack on one item, so the whole contiguous attribute run is
     part of the region and is searched for `#[path]`.
 
@@ -183,7 +271,7 @@ def test_blocks(lines):
     blocks, out_of_line = [], []
     i, n = 0, len(lines)
     while i < n:
-        if not (TEST_ATTR.match(lines[i]) or ALL_TEST_ATTR.match(lines[i])):
+        if not is_test_gate(lines[i]):
             i += 1
             continue
         start = i
