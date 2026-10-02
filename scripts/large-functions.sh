@@ -9,9 +9,11 @@
 #
 # Reports:
 #   1. per-file lines: total / test / production, where "test" covers an inline
-#      `#[cfg(test)]` region, a whole-file test module (`tests.rs`, `*_tests.rs`,
-#      `*_test.rs`, anything under a `tests/` directory) and a `#[cfg(test)]
-#      mod X;` sibling — the file-ification the refactor plan is built on
+#      test region — `#[cfg(test)]` or `#[cfg(all(test, …))]`, ending at the
+#      item the attribute decorates — a whole-file test module (`tests.rs`,
+#      `*_tests.rs`, `*_test.rs`, anything under a `tests/` directory) and a
+#      `#[cfg(test)] mod X;` sibling — the file-ification the refactor plan is
+#      built on
 #   2. the largest production functions, measured in CODE lines (comments and
 #      blanks excluded)
 #
@@ -45,8 +47,13 @@ TOP = int(sys.argv[1])
 ALL = sys.argv[2] == '1'
 ROOTS = ('frp-core/src', 'frp-server/src', 'frp-client/src', 'frp-vnet/src')
 FN = re.compile(r'^(\s*)(?:pub(?:\([^)]*\))?\s+)?(?:const\s+|async\s+|unsafe\s+)*fn\s+([A-Za-z0-9_]+)')
-TEST_ATTR = re.compile(r'\s*#\[cfg\(test\)\]')
-MOD_LINE = re.compile(r'\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)')
+# A test gate is `#[cfg(test)]` or `#[cfg(all(test, …))]`. The second is just as
+# test-only (it compiles only where `test` is set), but the base script did not
+# know it and scored those regions as production — 10 in-tree sites.
+# `#[cfg(all(not(test), …))]` is the opposite and must not match.
+TEST_ATTR = re.compile(r'\s*#\[cfg\(\s*test\s*\)\]')
+ALL_TEST_ATTR = re.compile(r'\s*#\[cfg\(\s*all\(\s*(?:[^)\n]*)(?<!not\()\btest\b')
+ATTR_LINE = re.compile(r'\s*#\[')
 MOD_DECL = re.compile(r'\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*;')
 PATH_ATTR = re.compile(r'\s*#\[path\s*=\s*"([^"]+)"\s*\]')
 # `tests.rs`, `test.rs`, `key_tests.rs`, `single_test.rs` — the whole file is a
@@ -57,73 +64,28 @@ PATH_ATTR = re.compile(r'\s*#\[path\s*=\s*"([^"]+)"\s*\]')
 TEST_FILE = re.compile(r'(?:^|_)tests?\.rs$')
 
 
-def test_blocks(lines):
-    """(`#[cfg(test)]` regions, out-of-line test-module declarations).
+def item_end(lines, start):
+    """(last index, kind, closed) for the item that begins at `start`.
 
-    The first element is a list of (start, end) index pairs covering each
-    `#[cfg(test)] mod` region. The second is a list of (module name, `#[path]`
-    value or None) for each `mod X;` declaration whose body lives in a sibling
-    file; those regions cover only the attribute and the declaration line.
+    The item is the thing an attribute decorates, and its first top-level
+    terminator decides how far it runs: a `;` ends a `use` / `const` /
+    `static` / expression statement (and an out-of-line `mod X;`
+    declaration), a `{` opens a body that is brace-matched to its closing
+    line. That is how a `#[cfg(test)]` region ends at its own item instead
+    of at the next `mod` in the file.
 
-    An out-of-line declaration must not be brace-matched: `mod tests;` has no
-    body, so scanning forward for the next `{` charges the production code that
-    follows it to the test module. That is what made `ssh_gateway.rs` read 2726
-    production / 24 test once its tests moved out (`2742` / `8` is the truth) —
-    16 production lines swallowed by the first braced statement after the
-    `mod tests;` this file had always carried.
+    Braces and semicolons inside `//`, `/* */`, string literals, char
+    literals and lifetimes do not count: this is the same skipper
+    `fn_body_end` has always used, lifted out so the region walk uses it
+    too. A naive counter closed an inline test region at the first `{` or
+    `}` inside a literal — `frp-core/src/logging.rs` lost 48 production
+    lines to one. Parentheses and brackets are tracked until the body
+    opens, so the `;` in a `[&str; 2]` type does not end a `const` early.
+
+    `closed` is False only when a `{` opened and never returned to depth
+    zero; the caller decides what an unterminated body means.
     """
-    blocks, out_of_line = [], []
-    i, n = 0, len(lines)
-    while i < n:
-        if not TEST_ATTR.match(lines[i]):
-            i += 1
-            continue
-        j, path_attr = i, None
-        while j < n and not MOD_LINE.match(lines[j]):
-            m = PATH_ATTR.match(lines[j])
-            if m:
-                path_attr = m.group(1)
-            j += 1
-        if j >= n:
-            break
-        decl = MOD_DECL.match(lines[j])
-        if decl:
-            blocks.append((i, j))
-            out_of_line.append((decl.group(1), path_attr))
-            i = j + 1
-            continue
-        depth, k, started = 0, j, False
-        while k < n:
-            for ch in lines[k]:
-                if ch == '{':
-                    depth += 1
-                    started = True
-                elif ch == '}':
-                    depth -= 1
-            if started and depth <= 0:
-                break
-            k += 1
-        blocks.append((i, k))
-        i = k + 1
-    return blocks, out_of_line
-
-
-def is_test(idx, blocks):
-    return any(a <= idx <= b for a, b in blocks)
-
-
-def fn_body_end(lines, start):
-    """Index just past the `}` that closes the fn starting at `start`.
-
-    Measuring a function as "distance to the next `fn`" is wrong: type and const
-    definitions between two functions get charged to the first one. That reported
-    `health_check_monitored` (really 3 lines) as 434, and a nested 19-line
-    `record_plugin` as 212. Brace-matching the body is the honest measure.
-
-    Skips `//`, `/* */`, and string/char literals so braces inside them do not
-    count. Returns None if the body never closes.
-    """
-    depth, seen_open = 0, False
+    paren, depth, seen_open = 0, 0, False
     i, n = start, len(lines)
     in_block_comment = False
     while i < n:
@@ -169,16 +131,105 @@ def fn_body_end(lines, start):
                     continue
                 j += 1                          # lifetime — ordinary code
                 continue
+            if not seen_open:
+                if c in '([':
+                    paren += 1
+                elif c in ')]':
+                    paren -= 1
+                elif c == ';' and paren <= 0:
+                    return i, 'stmt', True
             if c == '{':
                 depth += 1
                 seen_open = True
             elif c == '}':
                 depth -= 1
                 if seen_open and depth == 0:
-                    return i + 1
+                    return i, 'brace', True
             j += 1
         i += 1
-    return None
+    return i - 1, 'brace', False
+
+
+def test_blocks(lines):
+    """(`#[cfg(test)]` regions, out-of-line test-module declarations).
+
+    The first element is a list of (start, end) index pairs covering each
+    test region: the attribute lines plus the item they decorate. The second
+    is a list of (module name, `#[path]` value or None) for each `mod X;`
+    declaration whose body lives in a sibling file; those regions cover only
+    the attribute and the declaration line.
+
+    A region ends at the item the attribute decorates, not at the next `mod`
+    in the file. Scanning forward for a `mod` charged everything between the
+    attribute and that module to tests: `frp-core/src/bridge.rs` carries
+    `#[cfg(test)]` above a single `use` at line 5 while its `mod tests` is at
+    line 1085, so the file read 4 production lines. `use` / `const` /
+    `static` (and any other statement) end at their `;`; anything that opens
+    a body — `mod` / `fn` / `impl` / `thread_local!` — is brace-matched with
+    `item_end`'s literal-aware scan.
+
+    Both spellings of the gate count (`#[cfg(test)]` and
+    `#[cfg(all(test, …))]`), and a `#[path]` may sit above or below the gate:
+    attributes stack on one item, so the whole contiguous attribute run is
+    part of the region and is searched for `#[path]`.
+
+    An out-of-line declaration must not be brace-matched: `mod tests;` has no
+    body, so scanning forward for the next `{` charges the production code that
+    follows it to the test module. That is what made `ssh_gateway.rs` read 2726
+    production / 24 test once its tests moved out (`2742` / `8` is the truth) —
+    16 production lines swallowed by the first braced statement after the
+    `mod tests;` this file had always carried.
+    """
+    blocks, out_of_line = [], []
+    i, n = 0, len(lines)
+    while i < n:
+        if not (TEST_ATTR.match(lines[i]) or ALL_TEST_ATTR.match(lines[i])):
+            i += 1
+            continue
+        start = i
+        while start > 0 and ATTR_LINE.match(lines[start - 1]):
+            start -= 1
+        j, path_attr = start, None
+        while j < n and ATTR_LINE.match(lines[j]):
+            m = PATH_ATTR.match(lines[j])
+            if m:
+                path_attr = m.group(1)
+            j += 1
+        if j >= n:
+            break
+        decl = MOD_DECL.match(lines[j])
+        if decl:
+            blocks.append((start, j))
+            out_of_line.append((decl.group(1), path_attr))
+            i = j + 1
+            continue
+        end, _kind, closed = item_end(lines, j)
+        if not closed:
+            end = n - 1     # unterminated body — charge the rest of the file
+        blocks.append((start, end))
+        i = end + 1
+    return blocks, out_of_line
+
+
+def is_test(idx, blocks):
+    return any(a <= idx <= b for a, b in blocks)
+
+
+def fn_body_end(lines, start):
+    """Index just past the `}` that closes the fn starting at `start`.
+
+    Measuring a function as "distance to the next `fn`" is wrong: type and const
+    definitions between two functions get charged to the first one. That reported
+    `health_check_monitored` (really 3 lines) as 434, and a nested 19-line
+    `record_plugin` as 212. Brace-matching the body is the honest measure.
+
+    Skips `//`, `/* */`, and string/char literals so braces inside them do not
+    count — `item_end` is that scanner. Returns None if the body never closes.
+    """
+    end, _kind, closed = item_end(lines, start)
+    if not closed:
+        return None
+    return end + 1
 
 
 def is_test_file(path):

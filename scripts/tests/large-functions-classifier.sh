@@ -2,12 +2,13 @@
 # large-functions-classifier.sh — fixture checks for scripts/large-functions.sh.
 #
 # Why this exists: the script decides how much of a file is production, and the
-# refactor backlog is prioritised by that number. Its two hardest cases are
+# refactor backlog is prioritised by that number. Its three hardest cases are
 # invisible on a healthy tree — a whole-file test module carries no
-# `#[cfg(test)]` inside it, and an out-of-line `#[cfg(test)] mod X;` has no body
-# to brace-match. Get either wrong and the script reports the *opposite* of the
-# truth (a 2965-line file as 4 production lines was reachable this way), while
-# still exiting 0 and printing a plausible table.
+# `#[cfg(test)]` inside it, an out-of-line `#[cfg(test)] mod X;` has no body to
+# brace-match, and a `#[cfg(test)]` attribute's region ends at the item it
+# decorates rather than at the next `mod`. Get any of them wrong and the script
+# reports the *opposite* of the truth (a 2965-line file as 4 production lines was
+# reachable this way), while still exiting 0 and printing a plausible table.
 #
 # The suite is self-contained: it builds a throwaway tree under `mktemp -d`,
 # copies the script under test into that tree's `scripts/`, and measures the
@@ -19,18 +20,24 @@
 #      / `*_test.rs` by name, `#[cfg(test)] mod X;` siblings (a `mod.rs`
 #      declaration, a `#[path]` target, a non-name-matching sibling, a
 #      `pub(crate)` / `pub(super)` declaration and the `X/mod.rs` candidate), a
-#      `tests/` directory, and the three negative controls (a plain `mod X;`
-#      production sibling, a directory whose name merely starts with `tests`,
-#      and a production `collide.rs` that another module's `#[cfg(test)]
-#      mod collide;` must not claim — Rust resolves that under `attacker/`).
+#      `tests/` directory, the attribute-attribution cases (a gate above a `use`
+#      / `const` / between two attributes, `#[cfg(all(test, …))]` inline and on a
+#      declaration, `#[cfg(all(not(test), …))]`, a `#[path]` written above the
+#      gate, and braces inside string literals), and the three negative controls
+#      (a plain `mod X;` production sibling, a directory whose name merely starts
+#      with `tests`, and a production `collide.rs` that another module's
+#      `#[cfg(test)] mod collide;` must not claim — Rust resolves that under
+#      `attacker/`).
 #   2  the default table and `--top` are unchanged in shape, and a file the
 #      filter excluded is still not listed.
-#   3  five mutations of the script, each of which must red exactly one part of
-#      scenario 1: drop the name pattern, drop the sibling attribution, restore
-#      brace-matching for an out-of-line declaration, drop `pub(…)` from the
-#      declaration pattern, and offer `dir/X.rs` for a `parent.rs`. A green
-#      suite on a mutant would mean the fixture does not drive the code it
-#      claims to.
+#   3  nine mutations of the script, each of which must red exactly one part of
+#      scenario 1: drop the name pattern, drop the sibling attribution, drop
+#      declaration recognition, drop `pub(…)` from the declaration pattern,
+#      offer `dir/X.rs` for a `parent.rs`, drop the `#[cfg(all(test, …))]` arm,
+#      skip the backward attribute walk, scan string literals as code, and drop
+#      the paren tracking that keeps a `[&str; 2]` type's `;` from ending a
+#      `const` early. A green suite on a mutant would mean the fixture does not
+#      drive the code it claims to.
 #
 # Usage: bash scripts/tests/large-functions-classifier.sh
 set -uo pipefail
@@ -40,7 +47,7 @@ set -uo pipefail
 # installed before the path resolution and the first check, so an early `exit 0`
 # anywhere below it still has to answer to the floor. `MIN_CHECKS` is the
 # measured check count of a green run.
-MIN_CHECKS=42
+MIN_CHECKS=62
 checks=0
 fails=0
 WORK=""
@@ -303,6 +310,144 @@ while [ "$n" -le 20 ]; do
   n=$((n + 1))
 done
 
+# --- attribute attribution ----------------------------------------------------
+# A `#[cfg(test)]` region belongs to the item the attribute decorates, not to
+# the next `mod` below it. The base script scanned forward for a `mod`, so a gate
+# above a `use` charged everything up to the following module to tests — the
+# 2965-line `frp-core/src/bridge.rs` read 4 production lines that way. These
+# fixtures pin the replacement: statement items end at their `;`, body items are
+# brace-matched through the literal-aware scanner, `#[cfg(all(test, …))]` counts
+# as a gate while `#[cfg(all(not(test), …))]` does not, and `#[path]` may sit
+# above or below the gate.
+mkdir -p "$TREE/frp-core/src/attr_all_decl" "$TREE/frp-core/src/attr_back"
+
+cat > "$TREE/frp-core/src/attr_item.rs" <<'EOF'
+//! A gate above a `use`: the region ends there, not at the `mod` below it.
+
+#[cfg(test)]
+use std::time::Duration;
+
+pub fn prod_between() -> u8 {
+    1
+}
+
+pub fn prod_after() -> u8 {
+    2
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn inline() {
+        let _ = Duration::from_secs(1);
+    }
+}
+EOF
+
+cat > "$TREE/frp-core/src/attr_all_gated.rs" <<'EOF'
+pub fn prod_before() -> u8 {
+    1
+}
+
+#[cfg(all(test, feature = "x"))]
+mod tests {
+    #[test]
+    fn inline() {}
+}
+EOF
+
+cat > "$TREE/frp-core/src/attr_all_decl.rs" <<'EOF'
+pub fn prod_before() -> u8 {
+    1
+}
+
+#[cfg(all(test, feature = "x"))]
+mod all_decl_helper;
+
+pub fn prod_after() -> u8 {
+    2
+}
+EOF
+cat > "$TREE/frp-core/src/attr_all_decl/all_decl_helper.rs" <<'EOF'
+pub fn all_decl_helper_prod() {
+    let x = 1;
+}
+EOF
+
+cat > "$TREE/frp-core/src/attr_not_gated.rs" <<'EOF'
+#[cfg(all(not(test), feature = "x"))]
+pub fn prod_gated_off_in_tests() -> u8 {
+    2
+}
+EOF
+
+cat > "$TREE/frp-core/src/attr_literal.rs" <<'EOF'
+pub fn prod_before() -> &'static str {
+    "}"
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn inline() {
+        let s = "{";
+        assert_eq!(s.len(), 1);
+    }
+}
+
+pub fn prod_after() -> &'static str {
+    "{"
+}
+EOF
+
+cat > "$TREE/frp-core/src/attr_back.rs" <<'EOF'
+pub fn prod_before() -> u8 {
+    1
+}
+
+#[path = "attr_back/back_impl.rs"]
+#[cfg(test)]
+mod back;
+
+pub fn prod_after() -> u8 {
+    2
+}
+EOF
+cat > "$TREE/frp-core/src/attr_back/back_impl.rs" <<'EOF'
+pub fn back_impl_prod() {
+    let x = 1;
+}
+EOF
+
+cat > "$TREE/frp-core/src/attr_const.rs" <<'EOF'
+pub fn prod_before() -> u8 {
+    1
+}
+
+#[cfg(test)]
+const FIXTURE_NAMES: [&str; 2] = [
+    "a",
+    "b",
+];
+
+pub fn prod_after() -> u8 {
+    2
+}
+EOF
+
+cat > "$TREE/frp-core/src/attr_gate_then_attr.rs" <<'EOF'
+pub fn prod_before() -> u8 {
+    1
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+mod tests {
+    #[test]
+    fn inline() {}
+}
+EOF
+
 # --- helpers ------------------------------------------------------------------
 # row <output> <path> -> "production total test", or empty when not listed.
 row() {
@@ -394,6 +539,28 @@ expect_row "$OUT" "frp-core/src/testsuite/prod.rs" 4 4 0 \
   "a \`testsuite/\` directory is not a \`tests/\` directory"
 expect_row "$OUT" "frp-core/src/plain.rs" 4 4 0 \
   "a plain production file is untouched"
+
+# --- attribute attribution ----------------------------------------------------
+expect_row "$OUT" "frp-core/src/attr_item.rs" 12 21 9 \
+  "a gate above a \`use\` ends there, not at the \`mod tests\` far below"
+expect_row "$OUT" "frp-core/src/attr_all_gated.rs" 5 10 5 \
+  "\`#[cfg(all(test, …))]\` is a test gate"
+expect_row "$OUT" "frp-core/src/attr_all_decl.rs" 9 11 2 \
+  "\`#[cfg(all(test, …))] mod X;\` spans only its attribute and declaration"
+expect_row "$OUT" "frp-core/src/attr_all_decl/all_decl_helper.rs" 0 4 4 \
+  "a \`#[cfg(all(test, …))] mod X;\` sibling is 0 production"
+expect_row "$OUT" "frp-core/src/attr_not_gated.rs" 5 5 0 \
+  "\`#[cfg(all(not(test), …))]\` is not a test gate"
+expect_row "$OUT" "frp-core/src/attr_literal.rs" 9 17 8 \
+  "braces inside string literals do not end the region early"
+expect_row "$OUT" "frp-core/src/attr_back.rs" 9 12 3 \
+  "\`#[path]\` written above the gate is still part of the region"
+expect_row "$OUT" "frp-core/src/attr_back/back_impl.rs" 0 4 4 \
+  "a \`#[path]\` above the gate still attributes its sibling to tests"
+expect_row "$OUT" "frp-core/src/attr_const.rs" 9 14 5 \
+  "a gate above a \`const\` ends at its \`;\`, past the \`[&str; 2]\`"
+expect_row "$OUT" "frp-core/src/attr_gate_then_attr.rs" 5 11 6 \
+  "an attribute between the gate and its item stays in the region"
 
 # ---------------------------------------------------------------- scenario 2
 printf '\nscenario 2: default output shape\n'
@@ -493,16 +660,26 @@ else
   bad "M2 mutation did not apply — anchor missing, the check would be vacuous"
 fi
 
-# M3: brace-matching an out-of-line declaration. This is the mutation that made
-# `ssh_gateway.rs` read 2726 production / 24 test instead of 2742 / 8.
+# M3: out-of-line declaration recognition. A declaration's region ends at its own
+# `;` whether or not the declaration pattern matches, so the observable effect is
+# on the sibling: `declared_helper.rs` matches no test-ish name, and this is the
+# only mechanism that attributes it. (Before the attribution fix the same
+# mutation brace-matched the declaration forward and made `ssh_gateway.rs` read
+# 2726 production / 24 test instead of 2742 / 8.)
 if mutate "$REAL" "$MUT" 'decl = MOD_DECL.match(lines[j])' 'decl = None'; then
   cp "$MUT" "$TREE/scripts/large-functions.sh"
   MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
-  got="$(row "$MOUT" "frp-core/src/parent.rs")"
-  if [ "$got" = "11 33 22" ]; then
-    ok "M3 (out-of-line declaration brace-matched): parent.rs swallows its production again"
+  got="$(row "$MOUT" "frp-core/src/parent/declared_helper.rs")"
+  if [ "$got" = "4 4 0" ]; then
+    ok "M3 (declaration not recognised): the non-name-matching sibling is production again"
   else
-    bad "M3 (out-of-line declaration brace-matched): expected '11 33 22', got '${got:-<absent>}'"
+    bad "M3 (declaration not recognised): expected '4 4 0', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/parent.rs")"
+  if [ "$got" = "22 33 11" ]; then
+    ok "M3: the region still ends at the declaration's \`;\` (the mechanisms are independent)"
+  else
+    bad "M3: parent.rs became '${got:-<absent>}'"
   fi
   got="$(row "$MOUT" "frp-core/src/orphan_tests.rs")"
   if [ "$got" = "0 4 4" ]; then
@@ -516,18 +693,18 @@ fi
 
 # M4: the qualifier on the declaration. The base script's declaration pattern
 # accepted only a bare `pub`, so `pub(crate) mod X;` / `pub(super) mod X;` were
-# not seen as declarations at all — the block ran on to the next braced
-# production item and the sibling stayed production.
+# not seen as declarations at all and their siblings stayed production. The
+# region itself still ends at the declaration's `;`.
 if mutate "$REAL" "$MUT" \
     '(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*;' \
     '(?:pub\s+)?mod\s+([A-Za-z0-9_]+)\s*;'; then
   cp "$MUT" "$TREE/scripts/large-functions.sh"
   MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
   got="$(row "$MOUT" "frp-core/src/qualified.rs")"
-  if [ "$got" = "5 14 9" ]; then
-    ok "M4 (bare-\`pub\` declaration pattern): qualified.rs swallows the qualified declarations"
+  if [ "$got" = "10 14 4" ]; then
+    ok "M4 (bare-\`pub\` declaration pattern): the qualified declarations still end at their \`;\`"
   else
-    bad "M4 (bare-\`pub\` declaration pattern): expected '5 14 9', got '${got:-<absent>}'"
+    bad "M4 (bare-\`pub\` declaration pattern): qualified.rs expected '10 14 4', got '${got:-<absent>}'"
   fi
   got="$(row "$MOUT" "frp-core/src/qualified/bbb.rs")"
   if [ "$got" = "4 4 0" ]; then
@@ -565,6 +742,101 @@ if mutate "$REAL" "$MUT" 'if stem in (' 'if True or stem in ('; then
   fi
 else
   bad "M5 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M6: the `#[cfg(all(test, …))]` arm. Dropping it leaves both the inline module
+# and the declaration's sibling as production, while the bare `#[cfg(test)]`
+# regions are untouched — the two arms are independent.
+if mutate "$REAL" "$MUT" 'TEST_ATTR.match(lines[i]) or ALL_TEST_ATTR.match(lines[i])' \
+    'TEST_ATTR.match(lines[i])'; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/attr_all_gated.rs")"
+  if [ "$got" = "10 10 0" ]; then
+    ok "M6 (\`all(test, …)\` gate dropped): the inline module is production again"
+  else
+    bad "M6 (\`all(test, …)\` gate dropped): expected '10 10 0', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/attr_all_decl/all_decl_helper.rs")"
+  if [ "$got" = "4 4 0" ]; then
+    ok "M6: the \`all(test, …)\` declaration's sibling is production again"
+  else
+    bad "M6: the \`all(test, …)\` sibling expected '4 4 0', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/attr_item.rs")"
+  if [ "$got" = "12 21 9" ]; then
+    ok "M6: the bare \`#[cfg(test)]\` region is unaffected (the arms are independent)"
+  else
+    bad "M6: attr_item.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M6 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M7: the attribute run. Without the backward walk a `#[path]` written above the
+# gate is invisible, so its sibling is no longer attributed to tests.
+if mutate "$REAL" "$MUT" 'while start > 0 and ATTR_LINE.match(lines[start - 1]):' \
+    'while start > 0 and False:'; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/attr_back/back_impl.rs")"
+  if [ "$got" = "4 4 0" ]; then
+    ok "M7 (attribute run not walked back): a \`#[path]\` above the gate is lost, sibling is production"
+  else
+    bad "M7 (attribute run not walked back): sibling expected '4 4 0', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/attr_back.rs")"
+  if [ "$got" = "10 12 2" ]; then
+    ok "M7: the region shrinks to the gate and its declaration line"
+  else
+    bad "M7: attr_back.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M7 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M8: the string skipper. With string literals scanned as code, the `"{"` inside
+# the fixture's test region is counted as a brace and the region runs past its
+# module to the end of the file.
+if mutate "$REAL" "$MUT" "if c == '\"':" "if False and c == '\"':"; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/attr_literal.rs")"
+  if [ "$got" = "4 17 13" ]; then
+    ok "M8 (string literals scanned as code): the region swallows the rest of the file"
+  else
+    bad "M8 (string literals scanned as code): expected '4 17 13', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/attr_item.rs")"
+  if [ "$got" = "12 21 9" ]; then
+    ok "M8: a literal-free region is unaffected"
+  else
+    bad "M8: attr_item.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M8 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M9: parenthesis tracking before the item's body opens. Without it the `;` in
+# the `[&str; 2]` type ends the `const` a line early and the rest of the
+# declaration is production.
+if mutate "$REAL" "$MUT" "elif c == ';' and paren <= 0:" "elif c == ';':"; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/attr_const.rs")"
+  if [ "$got" = "12 14 2" ]; then
+    ok "M9 (no paren tracking): the \`[&str; 2]\` semicolon ends the region early"
+  else
+    bad "M9 (no paren tracking): expected '12 14 2', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/attr_literal.rs")"
+  if [ "$got" = "9 17 8" ]; then
+    ok "M9: a region with no pre-body semicolon is unaffected"
+  else
+    bad "M9: attr_literal.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M9 mutation did not apply — anchor missing, the check would be vacuous"
 fi
 
 # ---------------------------------------------------------------- summary
