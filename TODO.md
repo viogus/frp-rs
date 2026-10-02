@@ -6540,7 +6540,7 @@ nothing about whether the described behaviour still holds.
   `git grep -nE '(^|[^a-zA-Z_/.-])go (build|run)' -- scripts/ .github/` finds
   nothing, and `scripts/download-go-frp.sh:29` fetches the **prebuilt** release
   tarball (`https://github.com/fatedier/frp/releases/download/v${VERSION}/…`).
-  It is a leftover of a removed path that `CHANGELOG.md:2394-2395` (0.3.1)
+  It is a leftover of a removed path that `CHANGELOG.md:2655-2656` (0.3.1)
   records — `build_go_frp_v2()` (clone + `go build`, cached to
   `/tmp/frp-source-build/`) exists nowhere in the tree, yet
   `.github/workflows/compat.yml:48` still caches that orphaned
@@ -6558,7 +6558,7 @@ nothing about whether the described behaviour still holds.
   `compat.yml:48`) are the pre-change state and no longer resolve. Re-measured at the new
   head: `git ls-files '*.go'` is still empty, `scripts/download-go-frp.sh:29` still
   fetches the prebuilt release tarball, `build_go_frp_v2()` exists nowhere, and all seven
-  workflow YAMLs parse. `actions/setup-go` survives only in records (`CHANGELOG.md:2395`,
+  workflow YAMLs parse. `actions/setup-go` survives only in records (`CHANGELOG.md:2656`,
   this file, `docs/archive/plans/2026-06-28-xtcp-testing.md`). No gate update was owed —
   `scripts/repo-health.sh`'s toolchain checks match `rustup default` and
   `setup-rust-toolchain` only, never `setup-go` — and the `compat` lane is green at the
@@ -9087,7 +9087,7 @@ section; ledger now **24 open / 104 closed**.**
   assertion compares against the pinned constant rather than a range), and the NewWorkConn path is
   covered or its absence explained.
 - [x] **The re-arm e2e oracle sees only the first consecutive failure, so a call-site rewrite that returns `PING_FIRST_BACKOFF` instead of consulting the progression stays green.**
-  **Done (2026-10-02, at `6685e737` on `dsh/test-pin-residues`, PR #464, based on `b9af37c5`; this item's test commit is `56fe74d4`).**
+  **Done (2026-10-02, at `998508e1` on `dsh/test-pin-residues`, PR #464, based on `e0ebdc91`; this item's test commit is `2223e592`, rebased from `56fe74d4`).**
   The oracle now observes the SECOND consecutive failure: the OIDC exec fixture fails invocations #3 **and #4**,
   so the streak survives into its second step, and a new assertion reads Ping#2 against the pinned progression
   `next_ping_backoff(Some(PING_FIRST_BACKOFF), interval)` = 4 s, window `[3 s, 5 s]`
@@ -9126,7 +9126,7 @@ section; ledger now **24 open / 104 closed**.**
   measured reason.
 
 - [x] **The NewWorkConn token path is pinned only at the `spawn_work_conn` seam -- no test drives a `ReqWorkConn` carrying a token source, so `handle_req_work_conn` is off-path.**
-  **Done (2026-10-02, at `6685e737` on `dsh/test-pin-residues`, PR #464, based on `b9af37c5`; this item's test commit is `ed487fa8`).**
+  **Done (2026-10-02, at `998508e1` on `dsh/test-pin-residues`, PR #464, based on `e0ebdc91`; this item's test commit is `6384a0bd`, rebased from `ed487fa8`).**
   New lane `frp-client/tests/req_work_conn_token_source.rs` drives the service's own wiring: a real
   `ClientService` with an exec `auth.oidc.tokenSource` (under the `TokenSourceExec` allowlist) against a mock
   server on one listener, through `ReqWorkConn` → `handle_req_work_conn` → `spawn_work_conn`, asserting on the
@@ -10086,7 +10086,7 @@ section; ledger now **24 open / 104 closed**.**
   deliberate records bump (`expected` 60 / floor 60) passes → rc 0.
 
 - [x] **The PR #454 login auth-method split's ordering and behaviour invariants are pinned by no test.**
-  **Done (2026-10-02, at `6685e737` on `dsh/test-pin-residues`, PR #464, based on `b9af37c5`; this item's test commit is `6685e737` itself).**
+  **Done (2026-10-02, at `998508e1` on `dsh/test-pin-residues`, PR #464, based on `e0ebdc91`; this item's test commit is `998508e1` itself, rebased from `6685e737`).**
   Four new in-crate tests (`#[cfg(test)] mod login_order_tests`, `frp-server/src/control/login.rs:2955`) plus
   `invalid_run_id_is_rejected_before_the_credential_is_verified`
   (`frp-server/tests/login_run_id_and_pool_count.rs:254`) and a doc note — not a duplicate test — at
@@ -10120,8 +10120,8 @@ section; ledger now **24 open / 104 closed**.**
   binary via `FRPS_BIN`) and is not counted as a kill anywhere; the in-crate state configures no login plugins,
   so M1c/M1d are invisible to `--lib`. Lanes at this head: `-p frp-server --lib` 464 passed / 0 failed,
   `--test http_plugin` 23/0, `--test login_run_id_and_pool_count` 4/0, `--test login_replay_throttle` 2/0, and
-  `--test ssh_gateway` 17/0 (the M1b positive control). **Ledger after this close: 10 open / 208 closed**
-  (base `b9af37c5`: 13 open / 205 closed; this round closes the three items above and files nothing new).
+  `--test ssh_gateway` 17/0 (the M1b positive control). **Ledger after this close: 14 open / 212 closed**
+  (base `e0ebdc91`: 17 open / 209 closed over 226 headers; this round closes the three items above and files nothing new).
 
   Filed by the #454 records round (verification F4, adversarial F2). The split carries five ordering
   invariants — the pre-auth throttle gate before the login plugin hook, the gate before run_id
