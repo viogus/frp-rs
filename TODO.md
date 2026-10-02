@@ -9353,7 +9353,7 @@ section; ledger now **24 open / 104 closed**.**
   four items — one whole item each for the drain error, the stale health-job comment and the dashboard
   captures, plus part (d) completing the four-residue item — and files the one residue below).
 
-- [ ] **The ported `frps` warning-capture oracle is weaker than the `frp-core` original in three ways the H2 batch did not close.**
+- [x] **The ported `frps` warning-capture oracle is weaker than the `frp-core` original in three ways the H2 batch did not close.**
   Filed by the coordinator from the H2 batch's adversarial review (`/private/tmp/rev-h2-attack.md`, measured at
   the pre-rebase code head, patch-identical to `3020174c`, on base `ed2d71a3`); all three are coverage gaps the mutant matrix did not reach, not false
   assertions. (a) An emit-site mutant that appends a *well-formed* `tracing` record — a second `warn!` rather
@@ -9367,6 +9367,66 @@ section; ledger now **24 open / 104 closed**.**
   appended well-formed record reds it, examines the bytes before the first matching record, and `frps`'s own
   `drain` distinguishes a read error from EOF the way the `frpc` one now does (or each residue is argued
   unreachable with a measurement).
+  **Done (2026-10-02, at code head `5b74bdbb` on `fix/frps-warn-oracle`, PR #457, based on `18bcd1ad`;
+  adversarial-requested fixes at the branch tip below) — all three closed; three real emit-site mutants red the lane.**
+  (a)+(b) `assert_records_are_exactly_the_message` (`frps/tests/warn_delivery.rs:1233`) now pins the capture's
+  **total** `tracing` record count to `expected + others`, with `tracing_record_starts` (`:1173`) scanning the
+  SGR-stripped capture for record starts, so a record emitted beyond the counted ones reds no matter which side
+  of the warning it lands on; it also requires the capture to **begin** with a record — the M7 finding, raw
+  bytes ahead of the first record, is rejected by `first_record_start` (`:1206`) rather than sliding in ahead of
+  the warning. Each call site passes the baseline its own config and feature produce, derived from
+  `BOOT_RECORDS_BASE` (`:181`, 7) plus `PROFILING_EXTRA` (`:185`, 1 under the `profiling` feature: the SIGUSR2
+  ready record) and `DASHBOARD_EXTRA` (`:191`, 3 under `dashboard`), with `boot_records_with_dashboard` (`:211`)
+  / `boot_records_flat_tls_enable` (`:264`) for the `-c` paths and the `*_config_dir` pair (`:239`/`:245`) for
+  `--config-dir`, which `main.rs` returns from before the SIGUSR2 task registers (so that path has **no**
+  profiling record — measured 11 records there under `--all-features` against 12 on `-c`). Measured with three
+  real emit-site mutants at `frp-core/src/config/loader.rs` (each restored after the run): appending a second
+  well-formed `warn!` after the `web_server.tls.enable` diagnostic → `test result: FAILED. 22 passed; 6 failed`
+  at `frps/tests/warn_delivery.rs:1262:5`; appending one after the flat `tls_enable` diagnostic →
+  `24 passed; 4 failed` at `:1262:5`; emitting one **before** the web diagnostic → `22 passed; 6 failed` at
+  `:1262:5` (the prefix direction, which `records_containing` never looked at). The honest tree is
+  `28 passed; 0 failed` in **all three** lanes — default, `--features dashboard` and `--all-features` (the last
+  is the documented `cargo test --workspace --all-features` path; `cargo test -p frps --all-features --test
+  warn_delivery` was `14 passed; 10 failed` before the profiling baseline, every count row exactly +1).
+  `mod record_count_tests` (`:1386`) drives the append, prefix and raw-bytes directions on synthetic captures,
+  so those properties are pinned without mutating the product. The capture is now frozen by
+  `Spawned::wait_for_capture_convergence` (`:553`) — it waits for the count to reach the shape's floor
+  (`capture_floor` `:220` / `capture_floor_config_dir` `:250`) and hold still for `SETTLE`, instead of a fixed
+  sleep — which is what makes the profiling record deterministic rather than a race. That wait **panics when it
+  exits on `READY_TIMEOUT` below the floor** (`:574`), naming the count, the floor and `capture_floor`: the
+  delta review found four rows whose floor their shape never reaches (the synthesized-`tls_enable` and no-key
+  rows, which emit no warning at all, plus the written-`false` and flat-reload rows, all on flat shapes), where
+  the wait span to 15 s and froze on the deadline instead of converging — silently turning those rows' window
+  into the deadline. The four floors are now `capture_floor(false, false)` / `capture_floor(true, false)`, and
+  with the wait loud the whole file is **6.1 s default / 6.3 s `dashboard` / 6.4 s `all-features`** (it was
+  52.7 s / 67.3 s / 67.6 s before the fix), because no row reaches the deadline any more. The loud path is
+  demonstrated: re-specifying the no-key row as `capture_floor(true, false)` reds it in 16.3 s at `:573:17`
+  with `the capture never reached its floor: 7 record(s) after 15s, floor 8`.
+  (c) `frps`'s `drain` (`:657`) now distinguishes a read error from EOF exactly as `frpc`'s does — only `Ok(0)`
+  ends the capture, `ErrorKind::Interrupted` retries, any other error is recorded — and every reader
+  (`Spawned::peek_stdout`/`peek_stderr`, and `snapshot`) refuses the truncated capture through
+  `check_drain_errors` (`:693`); the error is parked rather than joined because this harness reads a **live**
+  child, and `assert_drains_are_healthy` (`:608`) now documents exactly that (it sees recorded errors, not
+  EOF — DOC-1). `mod drain_tests` (`:710`) pins it in **both** directions: 5 tests green, and with the old
+  `Ok(0) | Err(_) => break` loop restored `test result: FAILED. 1 passed; 4 failed` at
+  `frps/tests/warn_delivery.rs:768:23`, `:800:8` and `:800:8` (both `should_panic` cases) and `:825:9`
+  (`left: ""` / `right: "kept\n"`); with only the **stderr** half of `check_drain_errors` deleted the stderr
+  case reds at `:800:8` (M5).
+  Limits, stated rather than implied. (1) The count's baseline is **counted, not pinned**: a record *swapped*
+  for another boot line keeps `expected + others` and stays green (`:1219`). (2) The observation window is the
+  convergence freeze: a record the child emits **after** it — the M13b shape, a second emit site at `+3 s` —
+  is not in the capture and cannot red a count row; that boundary is pinned by
+  `records_emitted_after_the_snapshot_never_reach_the_capture` (`:1934`), which watches the live buffer for
+  `LATE_WINDOW` (`:113`, 3.5 s) and requires the frozen count to hold (measured red on exactly that mutant at
+  `:1953:5`). Widening the window on every row was rejected: it costs seconds per row to observe a record the
+  oracle deliberately does not read, while anything emitted **before** the freeze is inside the window and does
+  red. (3) The `dashboard` feature shape was green at the base (`18bcd1ad`: 17 passed; 0 failed) and stays
+  green; the `--all-features` lane is the one the guards could not see.
+  CI: `.github/workflows/ci.yml`'s two `frps warn_delivery` count guards (the `tests-unit` job) moved from 17
+  to 28 — both snippets now pass verbatim (`guard ok: 28 tests listed (expected 28), 0 failed`), and at a
+  stale literal the step prints `::error::frps/tests/warn_delivery.rs lists 28 tests, this step expects 27:
+  move the single literal in this shell step from 27 to 28`. `CHANGELOG.md` gets no bullet: test-only, no
+  user-visible behaviour change. Ledger after this close: **19 open / 197 closed** (base `59272312` after the #435/#447 merges: 20 open / 196 closed — this close is the −1 and the PR files no new item; the earlier bases were `612f7df1` 21/192 and `18bcd1ad` 13/189).
 
 - [x] **`docs/config.md:22` names `websocketPort` as the Go frp v0.71.0 spelling of `websocket_port`, but Go's `frps` has no such field.**
   Filed by the coordinator from PR #436's delta adversarial (INFO). Measured with the real v0.71.0 binary:

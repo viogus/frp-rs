@@ -1592,7 +1592,7 @@ jobs:
         # `--config-dir` lane's own residue round grew this file to 16 tests;
         # round 3's `a_config_dir_sigusr1_does_not_count_a_panicking_service`
         # grew it to 17 (a panicking task must leave the SIGUSR1 registry), so
-        # both `frps` warn_delivery steps assert 17;
+        # both `frps` warn_delivery steps assert 28;
         # the historical 7-test falsification above is unchanged.)
         shell: bash
         run: |
@@ -1603,21 +1603,21 @@ jobs:
           n=$(cargo test -p frps --features dashboard --test warn_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/warn_delivery.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 17 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "17" ] || status=1
+          grep -q "test result: ok. 28 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "28" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frps warning-delivery guard failed (status=$status, file=$n, log=$log)"
-            if [ -n "$n" ] && [ "$n" != "17" ]; then
-              if [ "$n" -lt "17" ]; then
-                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 17 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
+            if [ -n "$n" ] && [ "$n" != "28" ]; then
+              if [ "$n" -lt "28" ]; then
+                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 28 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
               else
-                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 17: move the single literal in this shell step from 17 to $n"
+                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 28: move the single literal in this shell step from 28 to $n"
               fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frps warning-delivery guard ok: $n tests listed (expected 17), 0 failed"
+          echo "frps warning-delivery guard ok: $n tests listed (expected 28), 0 failed"
       - name: Run frps' `web_server.tls.enable` warning-delivery tests without the dashboard feature
         # The **other direction** of the step above. `frps --features dashboard`
         # answers with the dashboard clause; the *default* `frps` artifact
@@ -1627,7 +1627,7 @@ jobs:
         # dashboard`, so without this step a call site that hardcoded the
         # dashboard answer — or the literal `true` — was green everywhere, even
         # though the binary then printed a dashboard clause for a listener it
-        # cannot build. Same 17 tests and the same count guard as the step above;
+        # cannot build. Same 28 tests and the same count guard as the step above;
         # it costs no extra build, because the `cli_exit_codes` step already
         # built this default-feature artifact.
         shell: bash
@@ -1639,21 +1639,21 @@ jobs:
           n=$(cargo test -p frps --test warn_delivery --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E -c '^[^ ].*: test$' || true)
           status=0
           grep -q "Running tests/warn_delivery.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 17 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "17" ] || status=1
+          grep -q "test result: ok. 28 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "28" ] || status=1
           if [ "$status" != "0" ]; then
             echo "::error::frps warning-delivery guard failed without the dashboard feature (status=$status, file=$n, log=$log)"
-            if [ -n "$n" ] && [ "$n" != "17" ]; then
-              if [ "$n" -lt "17" ]; then
-                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 17 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
+            if [ -n "$n" ] && [ "$n" != "28" ]; then
+              if [ "$n" -lt "28" ]; then
+                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 28 — tests were deleted or the file was disabled; restore them rather than lowering this literal"
               else
-                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 17: move the single literal in this shell step from 17 to $n"
+                echo "::error::frps/tests/warn_delivery.rs lists $n tests, this step expects 28: move the single literal in this shell step from 28 to $n"
               fi
             fi
             cat "$log.plain"
             exit 1
           fi
-          echo "frps no-dashboard warning-delivery guard ok: $n tests listed (expected 17), 0 failed"
+          echo "frps no-dashboard warning-delivery guard ok: $n tests listed (expected 28), 0 failed"
       - name: Run frpc's `web_server.tls.enable` warning-delivery spawn tests
         # The client half of the step above: `frpc/tests/warn_delivery.rs` pins
         # that the record reaches a `frpc -c` / `frpc --config-dir` user, in both
