@@ -252,7 +252,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   the accepted socket inherited the listener's non-blocking mode (see the item below).
 - [x] **The help *document* is bpaf's, not cobra's — every `--help` surface is a different
   document from Go's, not just a different layout.** Filed by the `--help=<bool>` round
-  (`TODO.md:3274`), which matched the *behaviour* of every help argv and deliberately left the
+  (`TODO.md:3327`), which matched the *behaviour* of every help argv and deliberately left the
   rendering. Measured 2026-09-28 on Go v0.71.0 darwin/arm64 against frp-rs `b8b0ffc`, stdout and
   stderr separate, rc from the child:
   * `frpc status --help`, `frpc status -h`, `frpc --help=true status` and `frpc -hc --help=false
@@ -292,7 +292,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   `cargo test -p frp-core --no-default-features --all-targets` lane -- 749 passed / 4 failed because
   the pins baked in the kcp/quic rows -- fixed by `235ac0cc`). Residues filed below.
 
-- [ ] **frp-rs's proxy-command flag *names* differ from Go's, not just their rendered text.**
+- [x] **frp-rs's proxy-command flag *names* differ from Go's, not just their rendered text.**
   Filed by the `--help` cobra-rendering round (`TODO.md:253`), which prints the parser's own names with
   translated usage text. The proxy commands spell `--custom-domains`, `--subdomain`, `--mux-port`,
   `--server-name` where Go v0.71.0 has `--custom-domain` (shorthand `-d`), `--sd`, `--mux` (and `--sk`
@@ -300,36 +300,89 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   the old spelling as an alias), not a rendering change. **Done-when:** every proxy flag Go accepts is
   accepted here under Go's spelling, pinned by an argv probe per surface, and the rendered document
   shows Go's name.
+  **Done** (at fix `1a31ee31` with the round-2 pins `962d94c9`, on `fix/cli-flag-parity`, based on `084f7865`).
+  Go's spelling is now each flag's *primary* long: `-d`/`--custom-domain` and `--sd` on http/https/tcpmux,
+  `--sk` on stcp/xtcp/sudp, `--mux` on tcpmux (frp-rs's `--mux-port` is **not** a Go name — Go v0.71.0 answers
+  `unknown flag: --mux-port` — so it stays that row's alias, port optional, defaulting to 0 with `httpconnect`),
+  `-n`/`--proxy-name` on stcp/xtcp, and `--uc`/`--ue` on all eight with help `use compression`/`use encryption`;
+  the old spellings (`--custom-domains`, `--subdomain`, `--server-name`, `--use-compression`, `--use-encryption`)
+  stay accepted as aliases, and the rendered document shows Go's name (`FRPC_PROXY_EXTENSION_FLAGS`,
+  `frp-core/src/cli.rs:2543`, now holds one frp-rs-only row — `--mux-port`; the table held six before this
+  change). Pinned by `cli::tests::proxy_commands_accept_go_flag_names`,
+  `help_doc_tests::every_proxy_surface_renders_exactly_the_go_rows_that_surface_implements`
+  (`frp-core/src/cli.rs:11131`) and `cli::tests::every_proxy_surface_accepts_go_bool_names_and_their_frp_rs_aliases`
+  (`:6647`), plus the regenerated `FRPC_*_DOC` byte pins and the mutant that drops stcp's `("sk", None)` expectation
+  (`:11164:13`). Residuals: `--allow-users` (no per-proxy allow-list field) is in `GO_ONLY_PROXY_ROWS` (`:10929`);
+  `--tls-server-name` is absent on tcp/udp/http/https/sudp/tcpmux because it is a per-surface row for stcp/xtcp only
+  (`GO_PROXY_ROWS_PER_SURFACE`, `:11106`), with no TLS SNI field to wire; `build_single_proxy_config` (`:5219`) would need one.
 
-- [ ] **Go's proxy-command shorthands are unimplemented.**
+- [x] **Go's proxy-command shorthands are unimplemented.**
   Go v0.71.0's proxy commands carry `-i` (`--local-ip`), `-l` (`--local-port`), `-r` (`--remote-port`),
   `-s` (`--server-addr`), `-P` (`--server-port`) and `-n` (`--proxy-name`); frp-rs's parser never
   implemented them, so `frpc tcp` renders only `-t` (`--token`) and every shorthand above is rejected.
   Filed with the same round's residue (`TODO.md:253`). **Done-when:** each shorthand parses to its Go
   flag, pinned by an argv probe, and the rendered row matches Go's.
+  **Done** (at fix `1a31ee31` with the round-2 pins `018522e6`, on `fix/cli-flag-parity`, based on `084f7865`).
+  Every shorthand Go registers on a surface now parses: `-i`/`--local-ip`, `-l`/`--local-port`,
+  `-s`/`--server-addr`, `-P`/`--server-port`, `-t`/`--token` and `-n`/`--proxy-name` on the eight proxies,
+  and `-r`/`--remote-port` on tcp/udp only (Go's set per surface), pinned per surface by
+  `cli::tests::proxy_command_shorthands_parse_to_their_go_long_flag` (`frp-core/src/cli.rs:8106`) and by the
+  shorthand column of `help_doc_tests::every_proxy_surface_renders_exactly_the_go_rows_that_surface_implements`
+  (`:11131`). Measured mutants: sudp's `remote_port` regaining `.short('r')` reds the per-surface pin at
+  `:11173:21` **while the union test `parser_shorthands_agree_with_go_where_the_parser_has_one` still passes**
+  (the blind spot the per-surface pin closes), and stcp's `proxy_name` losing `.short('n')` reds the parse pin
+  at `:8249:10`. Deliberate divergence kept and recorded: Go's `frpc sudp` registers no `remote_port` at all and
+  v0.71.0 refuses both spellings, so frp-rs keeps a required long-only `--remote-port` with no `.short('r')`
+  (comment `:4684-4691`).
 
-- [ ] **Six residual weaknesses in the help-document pins.**
+- [x] **Six residual weaknesses in the help-document pins.**
   Measured by the `feat/cobra-help-rendering` round-4 adversarial review (`TODO.md:253`), all LOW/NIT
   and none blocking the render:
   1. **Inert pin data**: a bogus `GoFlagRow` in `FRPS_EXTENSION_FLAGS`
-     (`frp-core/src/cli.rs:2344`), a re-worded `allow-users` row (`:2148`), or a wrong `SURFACES`
-     Go-byte/label column (`:8540-8556`) leaves all twelve tests green -- the pins that read those
+     (`frp-core/src/cli.rs:2437`), a re-worded `allow-users` row (`:2241`), or a wrong `SURFACES`
+     Go-byte/label column (`:9670`) leaves all twelve tests green -- the pins that read those
      fields are not themselves falsified by the data they read.
-  2. **`row_long_flag` misreads cobra's footer**: `frp-core/src/cli.rs:9097-9105` returns
+  2. **`row_long_flag` misreads cobra's footer**: `frp-core/src/cli.rs:10272` returns
      `Some("--help\"")` for `Use "frps [command] --help" for more information about a command.`
-     (`FRPS_DOC:8661`, `FRPC_DOC:8698`), contradicting its own doc comment (`:9086-9089`); inert
+     (`FRPS_DOC:9791`, `FRPC_DOC:9828`), contradicting its own doc comment (`:10261-10271`); inert
      today, so a two-line fix (require indent 2/6 with a leading `-`, or bail when the line has no
      two-space grid gap).
   3. **CI never runs the feature-split shapes**: the pins run with kcp and quic both off or both on;
-     kcp-only and quic-only are compiled (`.github/workflows/ci.yml:1487`, `:1507`, `:1534`) but
-     never executed.
-  4. **An unreachable assertion**: `frp-core/src/cli.rs:9160-9167` cannot fail with teeth.
-  5. **Weakening survives**: `assert_eq!(removed, 1, ...)` (`frp-core/src/cli.rs:9079-9082`) back to
-     `>= 1`, or `:9099` `> 6` -> `> 60`, keeps all twelve tests green.
-  6. **`zip(SURFACE_DOCUMENTS)` truncates** (`frp-core/src/cli.rs:8981`, `:9006-9027`,
-     `:9175-9199`), so a sixteenth surface in one list survives.
+      frp-core's kcp-only shape is compiled (`.github/workflows/ci.yml:2246`) and its quic-only shape
+      was not even compiled (the quic lane, `:2244`, reads `-p frp-client`); neither shape was executed.
+  4. **An unreachable assertion**: the former vacuous pin at `frp-core/src/cli.rs:10460` could not fail with teeth.
+  5. **Weakening survives**: `assert_eq!(removed, 1, ...)` (`frp-core/src/cli.rs:10246-10249`) back to
+     `>= 1`, or `:10274` `start != 2 && start != 6` -> `> 6`, keeps all twelve tests green.
+  6. **`zip(SURFACE_DOCUMENTS)` truncates** (`frp-core/src/cli.rs:10131`, `:10176`,
+     `:10493`), so a sixteenth surface in one list survives.
   **Done-when:** each of the six is either fixed or shown to be unreachable, with the mutant that
   demonstrated it now red.
+  **Done** (at `6d840100` for the pins, the CI lane `025b0ec3`, hardened by the round-2 count guard `deff30eb`,
+  on `fix/cli-flag-parity`, based on `084f7865`).
+  (1) every extension-table row must be rendered by a surface that consults it
+  (`help_doc_tests::every_extension_table_row_is_rendered_by_a_surface_that_consults_it`,
+  `frp-core/src/cli.rs:10865`), and the never-rendered Go rows are pinned as an explicit set
+  (`the_go_only_proxy_rows_are_exactly_the_recorded_set`, `:11029`); (2) `row_long_flag` (`:10272`) now
+  requires indent 2 or 6, a leading `-` and a two-space grid gap, so cobra's
+  `Use "frps [command] --help" …` footer is `None` (pinned by
+  `row_long_flag_requires_a_row_indent_a_leading_dash_and_a_grid_gap`, `:10291`); (3)
+  `.github/workflows/ci.yml:626` now runs the pins in the two mixed feature shapes as well as both-on/both-off,
+  and its count guard (`:676`) requires the run's own `test result:` count to equal the `--list` count **and**
+  both to equal 21, with red proven for both rename shapes (filter renamed in `--list` only →
+  `list=0, run=21`, rc 1; renamed in both → `running 0 tests`, cargo rc 0, guard rc 1); (4) the vacuous
+  `feature_adjusted_pin` identity assertion is replaced by
+  `feature_adjusted_pin_strips_exactly_the_rows_this_build_cannot_render` (`frp-core/src/cli.rs:10460`); (5)
+  `strip_pinned_row`'s count is pinned as a panic in both directions (`:10359`, `:10368`); (6) both `zip` loops call
+  `assert_surface_tables_are_aligned()` (`:10156`), which asserts `SURFACES.len() == SURFACE_DOCUMENTS.len()`
+  first. Type pins: `type GoRowPin` (`:11087`), `GO_PROXY_ROWS_UNIVERSAL: [GoRowPin; 8]` (`:11089`),
+  `GO_PROXY_ROWS_PER_SURFACE: [(&str, &[GoRowPin]); 8]` (`:11106`); the measured mutants M2 (stcp drops the
+  `--use-encryption` alias), M3b (`GO_ONLY_PROXY_ROWS` re-adds `"uc"`) and M5 (stcp loses `.short('n')`) red.
+  Residuals: the per-surface pin covers the eight proxy surfaces only (non-proxy surfaces still rely on the
+  whole-text/byte-count pins and the union test), and `scripts/compat-test.sh`/`scripts/protocol-matrix.sh` were
+  not re-run (this batch touches CLI parsing and help text only; the new step's Linux-runner cost is unmeasured —
+  macOS arm64 only). The bodies above keep the `file:line` cites they were filed with, re-derived at this head.
+  Ledger after this batch: **22 open / 177 closed** (base `799ce048`: 25 open / 174 closed; this batch closes the
+  three proxy-flag-parity items).
 - [x] **`auth.method` parsing is inconsistent across its three sites; a typo silently selects token
   auth.** Measured 2026-09-25 by the adversarial review on this branch, with real binaries:
   - *Client*: `frp-client` compares `ac.method == "oidc"` (feature-on arm, the new refusal helper and
@@ -1128,7 +1181,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   The **client** rows at `docs/config.md:297-300` name `tlsEnable` (`tls_enable`), `tlsCertFile`
   (`tls_cert_file`), `tlsKeyFile` (`tls_key_file`) and `tlsCaFile` / `tlsTrustedCaFile`
   (`tls_ca_file`) in their "Go frp Equivalent" column — the same defect the server rows had
-  (`TODO.md:681`), in the other half of the table. None of those five spellings reaches the client
+  (`TODO.md:734`), in the other half of the table. None of those five spellings reaches the client
   loader. Measured on this head with a throwaway probe over
   `frp_core::config::load_client_config_from_str` (non-strict) and
   `frp_core::config::load_client_config(path, true)` (strict):
@@ -2340,7 +2393,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   proxy/visitor/plugin fields; frp-rs deliberately does not recurse into them — per-type keys
   would make the check a maintenance hazard, and skipping the recursion is the looser
   direction, keeping valid frp-rs configs loading."* **That quoted rationale is retracted**:
-  the key set is per *struct*, not per type, and the recursion landed below (`TODO.md:1193`),
+  the key set is per *struct*, not per type, and the recursion landed below (`TODO.md:1246`),
   which deleted the comment this quote came from. The quote is kept only as the historical
   record of what this item set out to correct. The point of this item is that the
   decision lives only in that code comment: it is absent from this known-debt list and from
@@ -2679,7 +2732,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     `router config conflict` on the other — which of the two loses varies — `subdomain is not
     supported because this feature is not enabled in server` for `web02`, and
     `tcpmux with multiplexer httpconnect not supported` for `tcpmuxhttpconnect`). `frps` has no
-    `verify` subcommand in frp-rs (pre-existing CLI divergence, `TODO.md:1632`), so the server file
+    `verify` subcommand in frp-rs (pre-existing CLI divergence, `TODO.md:1685`), so the server file
     is pinned at the same `load_server_config` entry point `frps -c` uses; the client file is also
     pinned through the CLI by `frpc/tests/legacy_ini_fixture.rs` (`frpc verify -c` -> rc 0,
     `Proxies: 43`, `Visitors: 2`, no `skipped` warning).
@@ -2873,7 +2926,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   and exits 1 (`open ./frpc.ini: no such file or directory`, measured) while frp-rs keeps `-c`
   optional and still uses `127.0.0.1:7400`; and the daemon start path uses `EXIT_CONFIG = 2` where
   Go exits 1 (now its own item below). *(The second of those two is closed since — the daemon
-  start path exits 1 as of the `TODO.md:1503` item below, measured at head; this sentence records
+  start path exits 1 as of the `TODO.md:1556` item below, measured at head; this sentence records
   the state at this item's merge, not at head.)*
 
   Pinned by `frpc/tests/admin_cli.rs` (14 tests; `#![cfg(feature = "full")]`-gated because the
@@ -3221,7 +3274,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     prints its refusal on stderr where Go uses stdout (new item below); (b) the `3`/`4`
     codes (new item below); (c) `frpc verify -c <config whose [[proxies]] block has an
     unknown key>` returns 0 while Go exits 1 — tracked by the pre-existing strict-mode
-    proxy/visitor-array item at `TODO.md:1168` (recorded by #375), which now also carries
+    proxy/visitor-array item at `TODO.md:1221` (recorded by #375), which now also carries
     this CLI-surface measurement; **not** changed or claimed here. Note for the record that
     `frpc -c <that config>` returns 1 both before and after this change, but for the *wrong*
     reason: the config is accepted and the process then fails to connect (a runtime exit),
@@ -3574,7 +3627,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     Go prints one `-v, --version` line; and at that head `frpc verify --version` was rc 1 where
     Go is rc 0 (with a valid `-c`; with no `-c` Go is rc 1 too) — one row of the
     persistent-root-flag class then tracked by the `frpc` eight-single-proxy-subcommands item
-    (`TODO.md:2173`, since closed by the persistent-rootCmd-flag work, which registers all five
+    (`TODO.md:2226`, since closed by the persistent-rootCmd-flag work, which registers all five
     flags on the twelve subcommands: `frpc verify --version -c <valid>` is rc 0 again and
     `frpc tcp --version …` starts the proxy).
     Measured for that class at that head: `frpc tcp --version --local-port … --remote-port …` was
@@ -4185,7 +4238,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   the commit messages. The old test name this PR retires,
   `max_days_zero_is_completed_to_three_on_the_cli_and_in_the_file`, becomes
   `max_days_zero_does_not_disable_cleanup_on_the_cli_or_in_the_file`
-  (`frps/tests/log_completion.rs:927`). It stood at two sites outside this item: `TODO.md:4361` at
+  (`frps/tests/log_completion.rs:1032`). It stood at two sites outside this item: `TODO.md:4414` at
   base `fdb39c6b` (this PR's insertion moved the repaired text to `:4406`), repaired here, and
   `docs/history/development-log.md:84`, repaired in the devlog commit that follows this one.
 - [x] **Two test-harness hazards: a feature swap that breaks the dashboard lane silently, and
@@ -4527,7 +4580,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
     section's recorded `--version`/`--allow-unsafe`/`--config-dir` divergences are marked matched.
     No sha.
 - [x] **The `frps` half of the `-c <dash-value>` rule: Go's pflag consumes a `-`-prefixed token as
-  `-c`'s value, frp-rs's `frps` parser does not.** `parse_frps_args` was untouched by `TODO.md:2173`
+  `-c`'s value, frp-rs's `frps` parser does not.** `parse_frps_args` was untouched by `TODO.md:2226`
   (frpc-only, as the #378 `-c` last-wins work was). Measured on Go frps v0.71.0 darwin/arm64 and
   this head's `frps`, every child bounded:
   * `frps -c --strict-config=false` → Go rc 1 `open --strict-config=false: no such file or
@@ -5841,7 +5894,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   errors above)", `:333`; the workflow scan's "a workflow file could not be read", `:1124`).
   The prose drifted because the shorthand "the gate exits 3" gives the block's
   status the whole script as its subject; it appeared in `docs/developing.md:915`/`:924` and
-  `TODO.md:1324`/`:1330` and had to be corrected in this PR (the #368 block above), while
+  `TODO.md:1377`/`:1330` and had to be corrected in this PR (the #368 block above), while
   `docs/developing.md:977` already stated the mapping correctly. Nothing prevents it drifting back:
   there is no test harness for `scripts/repo-health.sh` anywhere under `scripts/`, and CI only runs
   the gate itself (`.github/workflows/ci.yml:102`, whose comment at `:91` says
@@ -5957,6 +6010,32 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   tests") describe the runs they measured; re-measuring their wall time was not this item's scope.
 
 ---
+
+- [ ] **A cross-file `TODO.md:<n>` citation has no gate, so every merge that renumbers the ledger silently
+  invalidates the cites in `ci.yml`, `scripts/` and source comments.**
+  Filed by the PR #447 records round, the third round in this train to re-derive cites by hand. A `TODO.md`
+  cite is a bare line number with no anchor. Measured at the base `612f7df1`
+  (`git grep -n -E 'TODO\.md:[0-9]+' 612f7df1 -- '*.rs' '*.yml' '*.sh' '*.md'`, each captured number tested
+  against `^- \[[ x]\] \*\*` in `612f7df1:TODO.md` and `TODO.md`'s own cites excluded): **154 occurrences on
+  127 cite-lines, of which 122 occurrences — 96 of the 127 lines, i.e. every cite on them — do not land on an
+  item header.** The per-round "re-derive by content" sweep produced off-by-N errors in five rounds
+  (#449/#450/#451/#453/#455), and this round's rebase had to choose a side for 29 conflicted cite lines, several
+  of them mid-item prose rather than headers (at that base `frps/tests/cli_exit_codes.rs:607`/`:1075`/`:1147`
+  cited `TODO.md:7999`, which is not a header; the SIGTERM/`--config-dir` item is `TODO.md:8874`). Stale
+  occurrences measured at that base: `docs/developing.md` 13, `scripts/tests/compat-stray-guard.sh` 12 (all
+  `8470`/`8627`), `frps/tests/cli_exit_codes.rs` 11, `CHANGELOG.md` 10, `frp-core/src/cli.rs` 7,
+  `.github/workflows/ci.yml` 3 (`:115` `8550`, `:323` `8582`, `:687` `8954`),
+  `scripts/tests/repo-health-fixtures.sh` 1, `frp-client/tests/token_source_single_exec.rs` 2. The bare `:NNNN`
+  continuation form (a `(`:673`)` meaning the file named earlier on the line) needs the prose read to resolve.
+  Two of those files are sha256-pinned in `.github/workflows/ci.yml` (`guard_pin` `e6d23d74…` for
+  `scripts/tests/repo-health-fixtures.sh` at `:164`, `4db720d6…` for `scripts/tests/compat-stray-guard.sh` at
+  `:406`), so re-pointing one cite in them also needs a `guard_pin` bump — a second file to edit for a one-number
+  change.
+  **Done-when:** either a repo-wide content re-derivation plus a fail-closed gate (every `TODO.md:<n>` cite in a
+  tracked file must land on an item header; canary-tested so a mutant cite reds it; wired into the `health`
+  job), or a convention change to title-anchored references (a stable item slug, or `TODO.md § "title"`), each
+  demonstrated by before/after counts on the tree.
+
 
 ## P1 — documentation correctness
 
@@ -6734,6 +6813,16 @@ nothing about whether the described behaviour still holds.
 
 ---
 
+- [ ] **`docs/config.md`'s Go column has no gate.**
+  Filed by the PR #447 records round from PR #448, which reshaped one Go-column row by hand. `repo-health.sh`
+  resolves backticked repo paths only, and `TODO.md` is point-in-time and out of scope, so a wrong Go spelling
+  or mapping in the column is caught by a human only: PR #448 had to fix the `websocketPort` row manually, and
+  PR #455 found a second row still naming a Go field `frps` does not read.
+  **Done-when:** either a check (a curated table of the Go-mapped rows, or a fixture that re-measures a sample
+  against the real Go binary via `scripts/download-go-frp.sh`) or an explicit recorded exemption naming what a
+  human must verify and when.
+
+
 ## P2 — structural
 
 - [ ] **Very large *functions* (not files).** — **[plan written](docs/refactor-large-modules.md)**
@@ -6998,8 +7087,8 @@ nothing about whether the described behaviour still holds.
   a unit test red → green, an in-process e2e, a real `frps` + `frpc` round trip) and returned
   `MERGE-with-findings` on the two load-bearing claims that were wrong; both were fixed, along with
   a second round's precision notes, and the delta validator's final verdict at the head is
-  **MERGE** (no blocking finding). Ledger after this close: **20 open / 193 closed** (base
-  `612f7df1`: 21 open / 192 closed), both pairs counted with `grep -cE '^- \[ \]' TODO.md`
+  **MERGE** (no blocking finding). Ledger after this close: **20 open / 196 closed** (base
+  `e00ddad0` after the #435 merge: 20 open / 193 closed; the earlier base `612f7df1` was 21 open / 192 closed), both pairs counted with `grep -cE '^- \[ \]' TODO.md`
   and `grep -cE '^- \[x\]' TODO.md`. A `CHANGELOG.md` `### Docs` bullet and a
   `docs/history/development-log.md` row record it.
 
@@ -7897,7 +7986,7 @@ section; ledger now **24 open / 104 closed**.**
   visible.
 
 - [x] **The mixed init-fail + run-fail `--config-dir` exit code is a probe value, not a pinned one.**
-  Filed by the #419 round-2 review. The `TODO.md:3231` Done block records "mixed init-fail + run-fail
+  Filed by the #419 round-2 review. The `TODO.md:3284` Done block records "mixed init-fail + run-fail
   → rc 3, nothing listening", but the pinned tests (`frps/tests/cli_exit_codes.rs:581` all-init-fail,
   `:633` all-run-fail) only assert a non-zero rc with no `listener started` record; the exact `3` for
   the mixed shape comes from a one-off probe.
@@ -8176,12 +8265,7 @@ section; ledger now **24 open / 104 closed**.**
   re-adding the two roots to `INI_NESTED_SECTION_ROOTS` reddens the first.
 
 - [x] **Four more test-precision residues the `test-precision-residue` round-2 reviews measured.**
-  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7630`): a
-  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7204`): a
-  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7617`): a
-  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7616`): a
-  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7220`): a
-  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7236`): a
+  Same class as the fixture-harness nits the `repo-health-residue` reviews filed (`TODO.md:7753`): a
   test that pins less than its name claims, so a real regression stays green.
   (a) The pinned warning bytes are the shipped static, but the **emitted** record is only
   substring-checked: `frp-core/tests/server_tls_enable_warning.rs:441` asserts
@@ -9152,7 +9236,7 @@ section; ledger now **24 open / 104 closed**.**
   `override_server_config` on `cli_overrides_enabled()`; `frps/src/main.rs:994` (head `:1024`) then calls
   `init_logging(&cli, Some(&cfg))` with the **raw** CLI values, so `frps -c frps.toml --log-level info`
   emits 11 `INFO` records where Go's `-c` lane emits 0 (`/tmp/frp-go-src/cmd/frps/root.go:67-83`),
-  contradicting the contract stated at `frp-core/src/cli.rs:4792-4797`. Same for `--log-file`,
+  contradicting the contract stated at `frp-core/src/cli.rs:5090-5095`. Same for `--log-file`,
   `--log-max-days` and `--log-format`. Verified pre-existing (`git show 3f66d823:frps/src/main.rs`
   is identical in this respect).
   **Done-when:** `init_logging` is gated on `cli_overrides_enabled()` too, or the divergence is
@@ -9166,21 +9250,21 @@ section; ledger now **24 open / 104 closed**.**
   whose three arms red individually under the mask-removed mutant — `--log-file console` at `:1210:5`,
   `--log-max-days 3` over `max_days = 7` at `:1231:5`, `--log-format json` over `format = "text"` at `:1253:5`
   — with the combined mutant red at `:1210:5`; the `--list` count guard moved with it
-  (`.github/workflows/ci.yml:1060`, `expected=11`).
+  (`.github/workflows/ci.yml:1129`, `expected=11`).
 - [x] **R2 — The implicit-config lane (`frps --log-level ""` with an in-tree `frps.toml`) has no Go counterpart.**
   Post-#427 it keeps the file's `warn` (0 `INFO`); Go without `-c` never reads a file and emits 1
   `INFO` (`frps uses command line arguments for config`, 186 B). The lane is an frp-rs extension
-  (`FrpsArgs::config_path`, `frp-core/src/cli.rs:4786`).
+  (`FrpsArgs::config_path`, `frp-core/src/cli.rs:5084`).
   **Done-when:** recorded as an extension where the implicit-config behaviour is documented, or made
   argv-identical to Go's flags-only lane.
   **Done (2026-10-01, at code head `4258cabe` on `fix/cli-log-override-r1r6`, PR #446, based on `799ce048`) — recorded as an extension.**
-  The lane is frp-rs-only (`FrpsArgs::config_path`, `frp-core/src/cli.rs:4786`): with an in-tree
+  The lane is frp-rs-only (`FrpsArgs::config_path`, `frp-core/src/cli.rs:5084`): with an in-tree
   `frps.toml` and no `-c` the file is read, where Go with no `-c` reads none and logs
   `frps uses command line arguments for config`. The 186 B this item quoted is the **bind-failure** shape,
   not the healthy one: Go's flags-only lane on a free port emits **3 `[I]` records / 282 B raw stdout /
   249 B ANSI-stripped / 0 B stderr**, while 186 B is one 90 B `[I]` record plus an 83 B non-record bind-error
   line = 175 B stripped / 186 B raw (`frp-core/src/logging.rs:23-30`). Recorded at the implicit-config
-  behaviour (`frp-core/src/cli.rs:4774`) and in the `docs/config.md:84` `[log] level` row.
+  behaviour (`frp-core/src/cli.rs:5072`) and in the `docs/config.md:84` `[log] level` row.
 - [x] **R3 — `--log-format ""` still writes through, unlike the other three log flags.**
   `--log-format` is frp-rs-only (no Go answer, no `LogConfig::complete` slot), so there is nothing to
   align it with; it is kept intentional and pinned as such by #427.
@@ -9201,12 +9285,12 @@ section; ledger now **24 open / 104 closed**.**
   `` number too large to fit in target type `` against Go's 2 214 B `strconv.ParseInt` message plus the
   `Usage:` block (`frps/tests/cli_exit_codes.rs:2366`; rc assert at `:2417:13`).
 - [x] **R5 — `-l` is not a shorthand on `frps`, so its refusal wording differs from pflag's.**
-  `frp-core/src/cli.rs:1171` `VALUE_TAKING_SHORTS_FRPS_ROOT: [char; 3] = ['c', 'p', 't']`, so
+  `frp-core/src/cli.rs:1223` `VALUE_TAKING_SHORTS_FRPS_ROOT: [char; 3] = ['c', 'p', 't']`, so
   `frps -c cfg -l ""` → rc 1 ``Error: `-l` is not expected in this context`` against Go's rc 1
   `unknown shorthand flag: 'l' in -l`. rc parity; wording differs; untested.
   **Done-when:** pflag's wording is matched or rc-only parity is pinned.
   **Done (2026-10-01, at code head `4258cabe` on `fix/cli-log-override-r1r6`, PR #446, based on `799ce048`) — rc-only parity pinned.**
-  frp-rs registers no `-l` short (`VALUE_TAKING_SHORTS_FRPS_ROOT`, `frp-core/src/cli.rs:1171` =
+  frp-rs registers no `-l` short (`VALUE_TAKING_SHORTS_FRPS_ROOT`, `frp-core/src/cli.rs:1223` =
   `['c', 'p', 't']`), so `frps -c cfg -l ""` refuses with rc 1 and empty stdout against Go's rc 1
   `unknown shorthand flag: 'l' in -l`; the pin records rc and empty stdout rather than pflag's wording
   (`frps/tests/cli_exit_codes.rs:2480:5` rc, `:2487:5` empty stdout), and its doc no longer blames the
@@ -9226,7 +9310,7 @@ section; ledger now **24 open / 104 closed**.**
   `frp-core/src/logging.rs:116-120`) because the lane never reads the loaded config's `[log]`; (b) the 24 h cap
   is frp-rs-only (`VHOST_TIMEOUT_CAP_SECS`, `frp-server/src/vhost.rs:654`, applied by `clamp_vhost_timeout` at
   `:710`, no Go counterpart), so "accept-and-ignore matches Go" is bounded to values `<= 0` or below the cap.
-  Both are recorded at the flags (`frp-core/src/cli.rs:701` for (a), `:538` for (b)).
+  Both are recorded at the flags (`frp-core/src/cli.rs:753` for (a), `:590` for (b)).
   Ledger after this batch: **19 open / 180 closed** (base `799ce048`: 25 open / 174 closed; this batch closes
   the six R1–R6 log-flag residues).
 
@@ -9579,3 +9663,17 @@ section; ledger now **24 open / 104 closed**.**
   `RESULT: 37 fixture check(s) hold` line and its 37-check total *outside* the file (the in-file
   `MIN_CHECKS=37` floor cannot survive an `exec` planted after the trap, which is why the sibling steps carry
   their totals as literals), and the job comment at `.github/workflows/ci.yml:87-89` says four fixture scripts.
+
+- [ ] **`known_server_keys()` accepts a feature-gated listener-port key whose serde field is compiled out, so
+  `--strict-config` accepts a key the server then ignores.**
+  Filed by the PR #447 records round from PR #448's and PR #455's measurements. The strict parser's key set is a
+  static list (`frp-core/src/config/strict.rs`) while the field it gates is `#[cfg]`-compiled
+  (`frp-core/src/config/server.rs`): in a build without the feature, `websocket_port` / `kcp_bind_port` /
+  `quic_bind_port` is still accepted by `known_server_keys()` and then silently dropped by the server, so
+  `--strict-config` cannot see the divergence. Measured in the micro build
+  (`--no-default-features --features micro`): `frps verify --strict-config` on a config writing
+  `websocket_port = 1` exits 0 with the port never bound. PR #455's items (`TODO.md:9527`, `:9574`, `:9596`,
+  `:9613`) cover the *warning* side; this item is the acceptance-set-vs-compiled-field divergence itself.
+  **Done-when:** `known_server_keys()` (and any client-side counterpart) is derived from, or checked against,
+  the compiled field set — shown by a `--no-default-features` run in which `--strict-config` refuses a key it
+  cannot honour, or the divergence is recorded as deliberate with a measurement on both feature shapes.

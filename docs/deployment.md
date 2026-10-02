@@ -699,7 +699,7 @@ accept the underscore spelling too (measured for `--api_timeout` and
 `--strict_config`; `--admin_addr` is `unknown flag` because no such flag exists
 there). The one placement difference that used to remain here — Go's cobra also
 accepts the flag **before** the subcommand (`frpc --api-timeout 1s stop …`) —
-is gone: the shared `frpc` hoist (`frp-core/src/cli.rs`, `TODO.md:2566`) now
+is gone: the shared `frpc` hoist (`frp-core/src/cli.rs`, `TODO.md:2619`) now
 resolves a leading subcommand after root flags, so that argv dials the admin port
 on both binaries and both stop at the 1 s deadline (measured on Go v0.71.0 and
 this branch: rc 1, one connection, Go `Post "…/api/stop": context deadline
@@ -839,7 +839,7 @@ What the walk does **not** reach, each cell measured on Go frp v0.71.0
   (`legacy_ini_go_shipped_fixture_passes_strict_mode` runs the shipped file
   through the strict check from
   `frp-core/src/config/fixtures/frpc_legacy_full.ini`, and since
-  `TODO.md:1359` closed the INI value-inference gap the file also loads end to
+  `TODO.md:1412` closed the INI value-inference gap the file also loads end to
   end — `legacy_ini_go_shipped_frpc_fixture_loads_end_to_end`, 43 proxies and
   2 visitors, exactly the names Go frpc v0.71.0 logs for the file). The keys Go ignores —
   `[common]`-only keys misplaced into a proxy section (`log_level`,

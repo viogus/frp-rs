@@ -684,7 +684,7 @@ jobs:
       # `cargo test -p frps --test cli_exit_codes -- --list`.
       # 44 → 45 with the `-l`-shorthand refusal pin
       # `short_l_is_not_a_frps_shorthand_and_the_refusal_is_pinned`
-      # (`TODO.md:8954`): +1. Re-derived with the same `--list` command.
+      # (`TODO.md:9271`): +1. Re-derived with the same `--list` command.
       FRPS_CLI_TESTS: "45"
       # frpc/tests/cli_exit_codes.rs, `--no-default-features --features tiny` —
       # "Run frpc's CLI exit-code tests under `tiny` (tier runtime half)"
@@ -1029,6 +1029,75 @@ jobs:
         # 10 test targets and the bench touched (forced rebuild). The runner's
         # cost — Linux, cold cache — was not measured.
         run: cargo test -p frp-core --no-default-features --all-targets
+      - name: Run frp-core's help-document pins in the two mixed feature shapes (count guard)
+        # `frp-core/src/cli.rs`'s help-document pins are feature-sensitive:
+        # `feature_adjusted_pin` keeps `--kcp-bind-port` only when `kcp` is on
+        # and `--quic-bind-port` only when `quic` is on, so the pins have four
+        # shapes. Two were executed — default features (both on, the step
+        # above this one) and `--no-default-features` (both off, the step
+        # immediately above); kcp-only and quic-only had no lane of their own.
+        # The feature-matrix step's `cargo check` lines do not cover them for
+        # frp-core: one is `-p frp-client --no-default-features --features quic`
+        # and the other `-p frp-core --no-default-features --features kcp`, so
+        # frp-core's help pins had never been *run* under either mixed shape (and
+        # the quic-only frp-core shape had not even been compiled). A pin that
+        # reads a feature it never varies is exactly the class this closes.
+        #
+        # Measured 2026-10-01, macOS arm64: 21 passed / 0 failed in each mixed
+        # shape; 38.44 s for the first (cold, kcp-only) and 0.03 s of test time
+        # per shape. `--lib` plus the `help_doc_tests` filter keeps the step to
+        # the pins; the runner's cost on Linux is not measured. Round 2 raised the
+        # filter's own count from 19 to 20 with
+        # `every_proxy_surface_renders_exactly_the_go_rows_that_surface_implements`,
+        # and round 3 raised it from 20 to 21 with the unrendered-row witness.
+        #
+        # Count guard (round 2): the filter used to be a bare name, so renaming
+        # `help_doc_tests` (or its module) ran zero tests and the step stayed
+        # green — libtest exits 0 on an empty filter match (measured: `1053
+        # filtered out`, rc 0). Each shape now takes the filter's own `-- --list`
+        # count, requires it to equal 21, and requires the run's own
+        # `test result:` count to equal it, so a renamed filter reds here instead
+        # of passing vacuously.
+        shell: bash
+        run: |
+          set -eo pipefail
+          for features in kcp quic; do
+            echo "::group::frp-core help-document pins (--no-default-features --features $features)"
+            log="/tmp/frp-core-help-docs-$features.log"
+            cargo test -p frp-core --no-default-features --features "$features" \
+              --lib --color never -- help_doc_tests 2>&1 | tee "$log"
+            sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+            list="/tmp/frp-core-help-docs-$features.list"
+            cargo test -p frp-core --no-default-features --features "$features" \
+              --lib --color never -- --list help_doc_tests 2>&1 \
+              | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
+            n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
+            # The run's *own* summary is the other half of the count: a literal
+            # taken only from `-- --list` cannot see a listed test that reported
+            # nothing.
+            n_run=$(sed -n -e 's/^test result: ok\. \([0-9][0-9]*\) passed; 0 failed.*$/\1/p' "$log.plain" | tail -n 1)
+            status=0
+            [ -n "$n_run" ] || status=1
+            [ "$n_run" = "$n" ] || status=1
+            [ "$n" = "21" ] || status=1
+            if [ "$status" != "0" ]; then
+              echo "::error::frp-core help_doc_tests guard failed for --features $features (list=$n, run=$n_run, log=$log)"
+              if [ -n "$n" ] && [ "$n" != "21" ]; then
+                if [ "$n" -lt "21" ]; then
+                  echo "::error::the help_doc_tests filter lists $n tests under --features $features, this step expects 21 — tests were deleted, renamed, or cfg'd out; restore them rather than lowering this literal. If the *filter name* is what changed, re-point the filter (and this literal) instead."
+                else
+                  echo "::error::the help_doc_tests filter lists $n tests under --features $features, this step expects 21: move the literal in this shell step from 21 to $n"
+                fi
+              fi
+              if [ -n "$n_run" ] && [ "$n_run" != "$n" ]; then
+                echo "::error::the help_doc_tests run completed $n_run tests but -- --list reports $n under --features $features — a listed test did not run or reported nothing; restore it rather than re-pointing this count"
+              fi
+              cat "$log.plain"
+              exit 1
+            fi
+            echo "frp-core help-document guard ok ($features): $n listed, $n_run passed, 0 failed"
+            echo "::endgroup::"
+          done
       - name: Run frp-core's server `tls_enable` warning pin (count guard)
         # `frp-core/tests/server_tls_enable_warning.rs` is executed today only by
         # the two generic frp-core sweeps above, which is why the file is named
@@ -1274,7 +1343,7 @@ jobs:
         # bin-target unit tests are covered by `Run frps bin unit tests` above),
         # and the `Lint` lane only *compiles* the test targets (`cargo clippy
         # --workspace --all-targets --all-features`). So that file — added with
-        # the CLI config-failure fix (`TODO.md:3129`) — executed in no lane, and
+        # the CLI config-failure fix (`TODO.md:3182`) — executed in no lane, and
         # the frps half of that fix had no executing pin.
         #
         # Measured warm, macOS arm64: 2.47 s wall for the package (4 tests, the
@@ -1450,7 +1519,7 @@ jobs:
         # `--log-max-days 0`, both arbited by Go's `-c` lane — see the file's own
         # section comments), and 9 → 10 with the `-c`-lane non-empty-flag pin
         # `cli_nonempty_log_level_flag_does_not_override_the_config_file`
-        # (`TODO.md:8901`). It is the count of `#[test]`s in that one file, and
+        # (`TODO.md:9218`). It is the count of `#[test]`s in that one file, and
         # it lives in exactly one place in this step — the `expected=` line — so
         # a new pin means editing one number, not hunting a duplicated one.
         #

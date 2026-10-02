@@ -159,6 +159,27 @@ fn go_bool_named(
     named.help(help)
 }
 
+/// [`go_bool_named`] for a bool that frp-rs spells out but Go registers under a
+/// short name (`--uc`/`--ue`): the aliases are appended as bpaf's hidden longs,
+/// so only the first (`name`) is rendered while every spelling parses. The
+/// string flags use the same pattern for `--custom-domain`/`--sd`/`--mux`/
+/// `--tls-server-name`.
+fn go_bool_named_with_aliases(
+    name: &'static str,
+    aliases: &'static [&'static str],
+    short: Option<char>,
+    help: &'static str,
+) -> NamedArg {
+    let mut named = long(name);
+    for alias in aliases {
+        named = named.long(alias);
+    }
+    if let Some(short) = short {
+        named = named.short(short);
+    }
+    named.help(help)
+}
+
 /// A Go-parity bool flag: the generalisation of [`strict_config_parser`] to
 /// every bool both binaries register.
 ///
@@ -173,7 +194,7 @@ fn go_bool_named(
 ///
 /// bpaf's `.switch()` implements only the first of those three, which is why
 /// argv Go accepts exited 1 here with `` `<bool>` is not expected in this
-/// context `` (`TODO.md:3445`). This expands to the `=BOOL` spelling with Go's
+/// context `` (`TODO.md:3498`). This expands to the `=BOOL` spelling with Go's
 /// grammar, and deliberately does **not** add the space-separated form:
 /// `.adjacent()` makes the value branch accept only `--flag=<value>`, so
 /// `--flag <bool>` leaves the token unconsumed and is refused exactly as
@@ -206,6 +227,37 @@ macro_rules! go_bool_flag {
             concat!($meaning, " (bare form = true)")
         )
     };
+}
+
+/// [`go_bool_flag`] for a flag Go registers under a name frp-rs never
+/// implemented: `$name` is Go's spelling and becomes the parser's **primary**
+/// long (the only one bpaf renders), while `$aliases` are frp-rs's older
+/// spellings kept as hidden aliases so existing command lines still parse.
+macro_rules! go_bool_flag_with_aliases {
+    ($name:literal, $aliases:expr, $short:expr, $meaning:literal $(,)?) => {{
+        let value = go_bool_named_with_aliases(
+            $name,
+            $aliases,
+            None,
+            concat!(
+                $meaning,
+                ". The Go-faithful value spelling is --",
+                $name,
+                "=<bool>"
+            ),
+        )
+        .argument::<String>("BOOL")
+        .adjacent()
+        .parse(parse_go_bool);
+        let switch = go_bool_named_with_aliases(
+            $name,
+            $aliases,
+            $short,
+            concat!($meaning, " (bare form = true)"),
+        )
+        .flag(true, false);
+        construct!([value, switch])
+    }};
 }
 
 /// A flag frp-rs registers as a bool where **Go's flag of the same name is a
@@ -535,8 +587,7 @@ pub struct FrpsArgs {
     /// `-9223372036854775808` rc 0, `9223372036854775807` rc 0,
     /// `9223372036854775808` rc 1 `value out of range`).
     ///
-    /// **R6(b) (`TODO.md:9054`): "accept-and-ignore matches Go" is bounded.**
-    /// **R6(b) (`TODO.md:8940`): "accept-and-ignore matches Go" is bounded.**
+    /// **R6(b) (`TODO.md:9282`): "accept-and-ignore matches Go" is bounded.**
     /// The flag surface is Go's (the full `int64` accepted above), but the value
     /// that reaches the vhost handler is clamped: `<= 0` floors at 60 s and
     /// anything above 24 h is capped, where Go has no comparable cap. So the
@@ -699,8 +750,7 @@ fn svr_config() -> impl Parser<Option<String>> {
 /// deliberately **not** part of the `verify` subcommand's surface — see
 /// [`FrpsRootSlots`].
 ///
-/// **R6(a) (`TODO.md:9054`): this lane does not read the loaded config's `[log]`
-/// **R6(a) (`TODO.md:8940`): this lane does not read the loaded config's `[log]`
+/// **R6(a) (`TODO.md:9282`): this lane does not read the loaded config's `[log]`
 /// section.** `init_logging(&cli, None)` (`frps/src/main.rs:500`) runs before
 /// `collect_config_files` (`frps/src/main.rs:516`), so the effective log level
 /// comes from the flags alone. Measured over a config dir whose `frps.toml`
@@ -1392,7 +1442,8 @@ fn attach_flag_shaped_values(argv: Vec<OsString>, root: RootCommand) -> Vec<OsSt
 ///
 /// The bools are deliberately absent (`--dashboard-tls-mode`, `--disable-log-color`,
 /// `--enable-prometheus`, `--tls-only`, `--json`, `--strict-config`, `--version`,
-/// `--use-encryption`, `--use-compression`): frp-rs parses each of them with the
+/// `--uc`, `--ue` — and frp-rs's older `--use-compression`/`--use-encryption`
+/// aliases of those two): frp-rs parses each of them with the
 /// `go_bool_flag!` family, whose value branch is `.adjacent()`, so a separate
 /// token is never their value and attaching one makes the bool parser refuse it.
 ///
@@ -1432,7 +1483,9 @@ const VALUE_TAKING_LONG_FLAGS: &[&str] = &[
     "config",
     "config-dir",
     "config_dir",
+    "custom-domain",
     "custom-domains",
+    "custom_domain",
     "custom_domains",
     "dashboard-addr",
     "dashboard-port",
@@ -1469,6 +1522,7 @@ const VALUE_TAKING_LONG_FLAGS: &[&str] = &[
     "log_max_days",
     "max-ports-per-client",
     "max_ports_per_client",
+    "mux",
     "mux-port",
     "mux_port",
     "proxy-bind-addr",
@@ -1479,6 +1533,7 @@ const VALUE_TAKING_LONG_FLAGS: &[&str] = &[
     "quic_bind_port",
     "remote-port",
     "remote_port",
+    "sd",
     "server-addr",
     "server-name",
     "server-port",
@@ -1489,6 +1544,7 @@ const VALUE_TAKING_LONG_FLAGS: &[&str] = &[
     "subdomain",
     "subdomain-host",
     "subdomain_host",
+    "tls-server-name",
     "token",
     "vhost-http-port",
     "vhost-http-timeout",
@@ -1711,7 +1767,7 @@ fn reject_pflag_shorthand_cluster_that_needs_a_value(argv: &[OsString], root: Ro
 /// value-taking flag does not count, so `frpc --help=true -c cfg` has no command
 /// word and keeps bpaf's root help — the pre-existing `--help=false -c cfg`
 /// divergence, unchanged by this pass (Go starts the client there: rc 124,
-/// `TODO.md:2326`).
+/// `TODO.md:4981`).
 ///
 /// Values go through [`parse_go_bool`], i.e. Go's `strconv.ParseBool` spellings;
 /// anything else is refused **here**, with pflag's own message and rc, rather
@@ -1915,9 +1971,12 @@ fn cli_args(argv: &[OsString]) -> (Option<String>, Vec<OsString>) {
 /// pflag's ` (default …)` suffix verbatim when the flag's default is non-zero.
 ///
 /// `short` is Go's shorthand. It is **checked against** the parser's, never
-/// rendered from here: Go gives `frpc tcp` shorthands (`-i`, `-l`, `-r`, `-s`,
-/// `-P`, `-n`) that frp-rs never implemented, and advertising a shorthand the
-/// parser would reject is exactly the fake parity this layer removes.
+/// rendered from here: [`render_cobra_help`] debug-asserts that the parser's
+/// shorthand for a rendered row equals Go's, so a row whose shorthand the parser
+/// does not carry cannot silently become a rendered lie. Rows for flags frp-rs
+/// does not implement at all (Go also registers `-r`/`-n` on `stcp`/`xtcp`,
+/// `--allow-users`, `--sk` on `sudp`, and a dozen others) keep Go's shorthand
+/// but are never rendered, because no parser flag names them.
 #[derive(Clone, Copy, Debug)]
 struct GoFlagRow {
     long: &'static str,
@@ -2170,11 +2229,13 @@ const FRPC_ADMIN_GO_FLAGS: &[GoFlagRow] = &[GoFlagRow {
 /// The union of the eight single-proxy commands' own flags on Go v0.71.0
 /// (`frpc tcp --help` 2211 B and `frpc https --help` 2269 B, minus `-h`).
 ///
-/// frp-rs's proxy parsers accept a much smaller set than Go's, and only
-/// `--token` with a shorthand, so most of these rows are never looked up — the
-/// table is the *lookup* source, not the surface. The names frp-rs spells out
-/// where Go abbreviates (`--use-encryption`/`--use-compression` against Go's
-/// `--ue`/`--uc`) live in [`FRPC_PROXY_EXTENSION_FLAGS`].
+/// frp-rs's proxy parsers accept a smaller set than Go's, so many of these rows
+/// are never looked up — the table is the *lookup* source, not the surface. The
+/// rows frp-rs spells differently from Go (`--custom-domain`, `--sd`, `--mux`,
+/// `--remote-port`, `--tls-server-name`, `--uc`, `--ue`) all take **Go's**
+/// spelling as the primary now; the older frp-rs spellings survive as hidden
+/// bpaf aliases, which never render. The only row frp-rs adds of its own is
+/// tcpmux's `--mux-port`, in [`FRPC_PROXY_EXTENSION_FLAGS`].
 const FRPC_PROXY_GO_FLAGS: &[GoFlagRow] = &[
     GoFlagRow {
         long: "allow-users",
@@ -2461,48 +2522,35 @@ const FRPC_ADMIN_EXTENSION_FLAGS: &[GoFlagRow] = &[
     },
 ];
 
-/// frp-rs's names for the pair Go spells `--ue`/`--uc` on its single-proxy
-/// commands. The usage text is the parser's own `.help()` (`tcp_cmd`), so the
-/// document says what the flag does rather than what Go's abbreviation does.
+/// frp-rs's own flags on the single-proxy commands — the rows Go has no
+/// equivalent of.
+///
+/// This table used to carry frp-rs spellings for Go's `--custom-domain`,
+/// `--sd`, `--mux`, `--remote-port`, `--tls-server-name`, `--uc` and `--ue`
+/// too. None of those are needed now: the parser takes **Go's** spelling as the
+/// primary on every one of those rows (the old spellings are hidden bpaf
+/// aliases, which never render), so they come from [`FRPC_PROXY_GO_FLAGS`] —
+/// including Go's `strings` type word for `--custom-domain`, which this parser
+/// takes exactly once (the same "Go's word, narrower grammar" convention as
+/// `--locations`). What stays here is what Go has no row for: frp-rs's own
+/// tcpmux `--mux-port`.
+///
+/// Sudp's long-only `--remote-port` is the one extension that does **not** get
+/// a row here: Go has a `remote-port` row (its tcp/udp one), and the renderer
+/// takes every row's `varname`/`usage` from the table, so that row already
+/// supplies the text. What makes sudp's copy an extension is the *absence of a
+/// shorthand*, which comes from the parser (no `.short('r')`), not from a row.
 const FRPC_PROXY_EXTENSION_FLAGS: &[GoFlagRow] = &[
-    // frp-rs spellings of Go's `--custom-domain` / `--sd`, which the parser
-    // implements under different names; the parsed type is a single string, so
-    // the pflag type word is `string`, not Go's `strings`.
-    GoFlagRow {
-        long: "custom-domains",
-        short: None,
-        varname: Some("string"),
-        usage: "custom domains",
-    },
+    // frp-rs's own tcpmux port. Go's `frpc tcpmux` has no port flag at all
+    // (measured: its help has no `--remote-port` row), and frp-rs's server never
+    // reads a tcpmux proxy's `remote_port`, so this exists only for command
+    // lines written against it — hence the row, and hence `optional` in
+    // [`tcpmux_cmd`].
     GoFlagRow {
         long: "mux-port",
         short: None,
         varname: Some("int"),
         usage: "multiplexer port",
-    },
-    GoFlagRow {
-        long: "server-name",
-        short: None,
-        varname: Some("string"),
-        usage: "server name",
-    },
-    GoFlagRow {
-        long: "subdomain",
-        short: None,
-        varname: Some("string"),
-        usage: "sub domain",
-    },
-    GoFlagRow {
-        long: "use-compression",
-        short: None,
-        varname: None,
-        usage: "Use compression",
-    },
-    GoFlagRow {
-        long: "use-encryption",
-        short: None,
-        varname: None,
-        usage: "Use encryption",
     },
 ];
 
@@ -3234,7 +3282,7 @@ fn consumes_value(s: &OsStr, root: RootCommand) -> bool {
 }
 
 /// Move a **leading** subcommand token to the front of the argv, the way cobra
-/// resolves a command that follows leading root flags (`TODO.md:2566`).
+/// resolves a command that follows leading root flags (`TODO.md:4710`).
 ///
 /// [`RootCommand`] selects which root command's flag and command sets are
 /// emulated; both binaries run the same resolution, because Go's `frps` declares
@@ -3473,6 +3521,8 @@ pub struct UdpArgs {
     pub server_addr: String,
     pub server_port: u16,
     pub token: Option<String>,
+    pub use_encryption: bool,
+    pub use_compression: bool,
     pub proxy_name: Option<String>,
 }
 
@@ -3490,6 +3540,8 @@ pub struct HttpArgs {
     pub http_pwd: Option<String>,
     pub host_header_rewrite: Option<String>,
     pub proxy_name: Option<String>,
+    pub use_encryption: bool,
+    pub use_compression: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3502,6 +3554,8 @@ pub struct HttpsArgs {
     pub token: Option<String>,
     pub subdomain: Option<String>,
     pub proxy_name: Option<String>,
+    pub use_encryption: bool,
+    pub use_compression: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3513,6 +3567,12 @@ pub struct StcpArgs {
     pub server_addr: String,
     pub server_port: u16,
     pub token: Option<String>,
+    /// Go's `-n/--proxy-name`. frp-rs's `--tls-server-name` double-duties as the
+    /// proxy name here (a pre-existing mismatch with Go, where it sets the
+    /// client's TLS SNI); when both are given `--proxy-name` wins.
+    pub proxy_name: Option<String>,
+    pub use_encryption: bool,
+    pub use_compression: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3524,28 +3584,54 @@ pub struct XtcpArgs {
     pub server_addr: String,
     pub server_port: u16,
     pub token: Option<String>,
+    /// See [`StcpArgs::proxy_name`].
+    pub proxy_name: Option<String>,
+    pub use_encryption: bool,
+    pub use_compression: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct SudpArgs {
     pub local_ip: String,
     pub local_port: u16,
+    /// frp-rs extension: Go's `frpc sudp` registers **no** `remote_port` at all
+    /// (and, measured on the v0.71.0 binary, refuses both `-r` and
+    /// `--remote-port`). The long form predates this branch and stays for
+    /// command lines written against it; it carries no `-r` shorthand, so it can
+    /// never be mistaken for Go's row.
     pub remote_port: u16,
     pub server_addr: String,
     pub server_port: u16,
     pub token: Option<String>,
+    /// Go's `--sk` on this surface (`ProxyConfig::sk`, honoured by the server's
+    /// visitor sign-key path). Optional like Go's, which defaults it to "".
+    pub sk: Option<String>,
     pub proxy_name: Option<String>,
+    pub use_encryption: bool,
+    pub use_compression: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct TcpmuxArgs {
     pub local_ip: String,
     pub local_port: u16,
+    /// frp-rs extension: a port the tcpmux path never used (the server routes by
+    /// domain and reads `multiplexer`, not this). Defaults to 0 when omitted.
     pub mux_port: u16,
+    /// Go's `--mux string`: the multiplexer name. `None` means Go's default
+    /// (`httpconnect`), which is all frp-rs's server implements.
+    pub mux: Option<String>,
+    /// Go's `-d/--custom-domain strings` on this surface, comma-joined like the
+    /// http/https surfaces (Go's StringSlice, narrowed to the same grammar).
+    pub custom_domains: Option<String>,
+    /// Go's `--sd`.
+    pub subdomain: Option<String>,
     pub server_addr: String,
     pub server_port: u16,
     pub token: Option<String>,
     pub proxy_name: Option<String>,
+    pub use_encryption: bool,
+    pub use_compression: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -4173,45 +4259,52 @@ fn run_mode() -> impl Parser<FrpcRunArgs> {
 fn tcp_cmd() -> impl Parser<FrpcCmd> {
     let local_ip = long("local-ip")
         .long("local_ip")
+        .short('i')
         .argument::<String>("IP")
         .fallback("127.0.0.1".into());
     let local_port = long("local-port")
         .long("local_port")
+        .short('l')
         .argument::<u16>("PORT");
     let remote_port = long("remote-port")
         .long("remote_port")
+        .short('r')
         .argument::<u16>("PORT");
     let server_addr = long("server-addr")
         .long("server_addr")
+        .short('s')
         .argument::<String>("HOST")
         .fallback("127.0.0.1".into());
     let server_port = long("server-port")
         .long("server_port")
+        .short('P')
         .argument::<u16>("PORT")
         .fallback(7000);
     let token = long("token")
         .short('t')
         .argument::<String>("TOKEN")
         .optional();
-    // Go registers this pair on `frpc tcp` under **different names**:
-    // `--uc` ("use compression") and `--ue` ("use encryption"), both pflag
-    // bools. frp-rs has always spelled them out; the names stay divergent (the
-    // short pair is not implemented at all), but the value grammar is Go's —
+    // Go registers this pair on every proxy surface as `--uc` ("use
+    // compression") and `--ue` ("use encryption"), both pflag bools; frp-rs
+    // used to spell them out and accept neither of Go's names. Go's names are
+    // now the primary longs (the only ones rendered) and the old spellings are
+    // hidden aliases, so both command lines parse. The value grammar is Go's —
     // measured, `frpc tcp --ue=false …` is accepted by Go and the proxy runs.
-    let use_encryption = go_bool_flag!(
-        "use-encryption",
-        Some("use_encryption"),
+    let use_encryption = go_bool_flag_with_aliases!(
+        "ue",
+        &["use-encryption", "use_encryption"],
         None,
-        "Use encryption",
+        "use encryption",
     );
-    let use_compression = go_bool_flag!(
-        "use-compression",
-        Some("use_compression"),
+    let use_compression = go_bool_flag_with_aliases!(
+        "uc",
+        &["use-compression", "use_compression"],
         None,
-        "Use compression",
+        "use compression",
     );
     let proxy_name = long("proxy-name")
         .long("proxy_name")
+        .short('n')
         .argument::<String>("NAME")
         .optional();
     let args = construct!(TcpArgs {
@@ -4234,20 +4327,25 @@ fn tcp_cmd() -> impl Parser<FrpcCmd> {
 fn udp_cmd() -> impl Parser<FrpcCmd> {
     let local_ip = long("local-ip")
         .long("local_ip")
+        .short('i')
         .argument::<String>("IP")
         .fallback("127.0.0.1".into());
     let local_port = long("local-port")
         .long("local_port")
+        .short('l')
         .argument::<u16>("PORT");
     let remote_port = long("remote-port")
         .long("remote_port")
+        .short('r')
         .argument::<u16>("PORT");
     let server_addr = long("server-addr")
         .long("server_addr")
+        .short('s')
         .argument::<String>("HOST")
         .fallback("127.0.0.1".into());
     let server_port = long("server-port")
         .long("server_port")
+        .short('P')
         .argument::<u16>("PORT")
         .fallback(7000);
     let token = long("token")
@@ -4256,8 +4354,21 @@ fn udp_cmd() -> impl Parser<FrpcCmd> {
         .optional();
     let proxy_name = long("proxy-name")
         .long("proxy_name")
+        .short('n')
         .argument::<String>("NAME")
         .optional();
+    let use_encryption = go_bool_flag_with_aliases!(
+        "ue",
+        &["use-encryption", "use_encryption"],
+        None,
+        "use encryption",
+    );
+    let use_compression = go_bool_flag_with_aliases!(
+        "uc",
+        &["use-compression", "use_compression"],
+        None,
+        "use compression",
+    );
     let args = construct!(UdpArgs {
         local_ip,
         local_port,
@@ -4265,6 +4376,8 @@ fn udp_cmd() -> impl Parser<FrpcCmd> {
         server_addr,
         server_port,
         token,
+        use_encryption,
+        use_compression,
         proxy_name,
     });
     single_proxy_cmd(args, FrpcCmd::Udp)
@@ -4276,27 +4389,36 @@ fn udp_cmd() -> impl Parser<FrpcCmd> {
 fn http_cmd() -> impl Parser<FrpcCmd> {
     let local_ip = long("local-ip")
         .long("local_ip")
+        .short('i')
         .argument::<String>("IP")
         .fallback("127.0.0.1".into());
     let local_port = long("local-port")
         .long("local_port")
+        .short('l')
         .argument::<u16>("PORT");
-    let custom_domains = long("custom-domains")
-        .long("custom_domains")
+    let custom_domains = long("custom-domain")
+        .long("custom-domains")
+        .long("custom_domain")
+        .short('d')
         .argument::<String>("DOMAINS");
     let server_addr = long("server-addr")
         .long("server_addr")
+        .short('s')
         .argument::<String>("HOST")
         .fallback("127.0.0.1".into());
     let server_port = long("server-port")
         .long("server_port")
+        .short('P')
         .argument::<u16>("PORT")
         .fallback(7000);
     let token = long("token")
         .short('t')
         .argument::<String>("TOKEN")
         .optional();
-    let subdomain = long("subdomain").argument::<String>("SUB").optional();
+    let subdomain = long("sd")
+        .long("subdomain")
+        .argument::<String>("SUB")
+        .optional();
     let locations = long("locations").argument::<String>("LOCS").optional();
     let http_user = long("http-user")
         .long("http_user")
@@ -4312,8 +4434,21 @@ fn http_cmd() -> impl Parser<FrpcCmd> {
         .optional();
     let proxy_name = long("proxy-name")
         .long("proxy_name")
+        .short('n')
         .argument::<String>("NAME")
         .optional();
+    let use_encryption = go_bool_flag_with_aliases!(
+        "ue",
+        &["use-encryption", "use_encryption"],
+        None,
+        "use encryption",
+    );
+    let use_compression = go_bool_flag_with_aliases!(
+        "uc",
+        &["use-compression", "use_compression"],
+        None,
+        "use compression",
+    );
     let args = construct!(HttpArgs {
         local_ip,
         local_port,
@@ -4327,6 +4462,8 @@ fn http_cmd() -> impl Parser<FrpcCmd> {
         http_pwd,
         host_header_rewrite,
         proxy_name,
+        use_encryption,
+        use_compression,
     });
     single_proxy_cmd(args, FrpcCmd::Http)
         .to_options()
@@ -4337,31 +4474,53 @@ fn http_cmd() -> impl Parser<FrpcCmd> {
 fn https_cmd() -> impl Parser<FrpcCmd> {
     let local_ip = long("local-ip")
         .long("local_ip")
+        .short('i')
         .argument::<String>("IP")
         .fallback("127.0.0.1".into());
     let local_port = long("local-port")
         .long("local_port")
+        .short('l')
         .argument::<u16>("PORT");
-    let custom_domains = long("custom-domains")
-        .long("custom_domains")
+    let custom_domains = long("custom-domain")
+        .long("custom-domains")
+        .long("custom_domain")
+        .short('d')
         .argument::<String>("DOMAINS");
     let server_addr = long("server-addr")
         .long("server_addr")
+        .short('s')
         .argument::<String>("HOST")
         .fallback("127.0.0.1".into());
     let server_port = long("server-port")
         .long("server_port")
+        .short('P')
         .argument::<u16>("PORT")
         .fallback(7000);
     let token = long("token")
         .short('t')
         .argument::<String>("TOKEN")
         .optional();
-    let subdomain = long("subdomain").argument::<String>("SUB").optional();
+    let subdomain = long("sd")
+        .long("subdomain")
+        .argument::<String>("SUB")
+        .optional();
     let proxy_name = long("proxy-name")
         .long("proxy_name")
+        .short('n')
         .argument::<String>("NAME")
         .optional();
+    let use_encryption = go_bool_flag_with_aliases!(
+        "ue",
+        &["use-encryption", "use_encryption"],
+        None,
+        "use encryption",
+    );
+    let use_compression = go_bool_flag_with_aliases!(
+        "uc",
+        &["use-compression", "use_compression"],
+        None,
+        "use compression",
+    );
     let args = construct!(HttpsArgs {
         local_ip,
         local_port,
@@ -4371,6 +4530,8 @@ fn https_cmd() -> impl Parser<FrpcCmd> {
         token,
         subdomain,
         proxy_name,
+        use_encryption,
+        use_compression,
     });
     single_proxy_cmd(args, FrpcCmd::Https)
         .to_options()
@@ -4381,28 +4542,52 @@ fn https_cmd() -> impl Parser<FrpcCmd> {
 fn stcp_cmd() -> impl Parser<FrpcCmd> {
     let local_ip = long("local-ip")
         .long("local_ip")
+        .short('i')
         .argument::<String>("IP")
         .fallback("127.0.0.1".into());
     let local_port = long("local-port")
         .long("local_port")
+        .short('l')
         .argument::<u16>("PORT");
     let sk = long("sk").argument::<String>("SECRET");
-    let server_name = long("server-name")
+    let server_name = long("tls-server-name")
+        .long("server-name")
         .long("server_name")
         .argument::<String>("NAME")
         .optional();
     let server_addr = long("server-addr")
         .long("server_addr")
+        .short('s')
         .argument::<String>("HOST")
         .fallback("127.0.0.1".into());
     let server_port = long("server-port")
         .long("server_port")
+        .short('P')
         .argument::<u16>("PORT")
         .fallback(7000);
     let token = long("token")
         .short('t')
         .argument::<String>("TOKEN")
         .optional();
+    // Go registers `-n/--proxy-name` on every proxy surface, this one included;
+    // frp-rs's `--tls-server-name` above is where the name used to come from.
+    let proxy_name = long("proxy-name")
+        .long("proxy_name")
+        .short('n')
+        .argument::<String>("NAME")
+        .optional();
+    let use_encryption = go_bool_flag_with_aliases!(
+        "ue",
+        &["use-encryption", "use_encryption"],
+        None,
+        "use encryption",
+    );
+    let use_compression = go_bool_flag_with_aliases!(
+        "uc",
+        &["use-compression", "use_compression"],
+        None,
+        "use compression",
+    );
     let args = construct!(StcpArgs {
         sk,
         server_name,
@@ -4411,6 +4596,9 @@ fn stcp_cmd() -> impl Parser<FrpcCmd> {
         server_addr,
         server_port,
         token,
+        proxy_name,
+        use_encryption,
+        use_compression,
     });
     single_proxy_cmd(args, FrpcCmd::Stcp)
         .to_options()
@@ -4421,28 +4609,50 @@ fn stcp_cmd() -> impl Parser<FrpcCmd> {
 fn xtcp_cmd() -> impl Parser<FrpcCmd> {
     let local_ip = long("local-ip")
         .long("local_ip")
+        .short('i')
         .argument::<String>("IP")
         .fallback("127.0.0.1".into());
     let local_port = long("local-port")
         .long("local_port")
+        .short('l')
         .argument::<u16>("PORT");
     let sk = long("sk").argument::<String>("SECRET");
-    let server_name = long("server-name")
+    let server_name = long("tls-server-name")
+        .long("server-name")
         .long("server_name")
         .argument::<String>("NAME")
         .optional();
     let server_addr = long("server-addr")
         .long("server_addr")
+        .short('s')
         .argument::<String>("HOST")
         .fallback("127.0.0.1".into());
     let server_port = long("server-port")
         .long("server_port")
+        .short('P')
         .argument::<u16>("PORT")
         .fallback(7000);
     let token = long("token")
         .short('t')
         .argument::<String>("TOKEN")
         .optional();
+    let proxy_name = long("proxy-name")
+        .long("proxy_name")
+        .short('n')
+        .argument::<String>("NAME")
+        .optional();
+    let use_encryption = go_bool_flag_with_aliases!(
+        "ue",
+        &["use-encryption", "use_encryption"],
+        None,
+        "use encryption",
+    );
+    let use_compression = go_bool_flag_with_aliases!(
+        "uc",
+        &["use-compression", "use_compression"],
+        None,
+        "use compression",
+    );
     let args = construct!(XtcpArgs {
         sk,
         server_name,
@@ -4451,6 +4661,9 @@ fn xtcp_cmd() -> impl Parser<FrpcCmd> {
         server_addr,
         server_port,
         token,
+        proxy_name,
+        use_encryption,
+        use_compression,
     });
     single_proxy_cmd(args, FrpcCmd::Xtcp)
         .to_options()
@@ -4461,30 +4674,58 @@ fn xtcp_cmd() -> impl Parser<FrpcCmd> {
 fn sudp_cmd() -> impl Parser<FrpcCmd> {
     let local_ip = long("local-ip")
         .long("local_ip")
+        .short('i')
         .argument::<String>("IP")
         .fallback("127.0.0.1".into());
     let local_port = long("local-port")
         .long("local_port")
+        .short('l')
         .argument::<u16>("PORT");
+    // frp-rs extension: Go's `frpc sudp` registers **no** remote-port flag at
+    // all, and the v0.71.0 binary refuses both spellings (`unknown shorthand
+    // flag: 'r'`, `unknown flag: --remote-port`). The long form predates this
+    // branch and stays for command lines written against it; it deliberately
+    // carries no `-r`, so it can never be mistaken for Go's tcp/udp row. It is
+    // still **required** here (no fallback): that is pre-existing behaviour this
+    // round did not change, and it is recorded as a residual — a Go-shaped
+    // `frpc sudp --sk s -l 1` parses on Go but not on frp-rs.
     let remote_port = long("remote-port")
         .long("remote_port")
         .argument::<u16>("PORT");
     let server_addr = long("server-addr")
         .long("server_addr")
+        .short('s')
         .argument::<String>("HOST")
         .fallback("127.0.0.1".into());
     let server_port = long("server-port")
         .long("server_port")
+        .short('P')
         .argument::<u16>("PORT")
         .fallback(7000);
     let token = long("token")
         .short('t')
         .argument::<String>("TOKEN")
         .optional();
+    // Go registers `--sk` on this surface too; frp-rs used to leave sudp with
+    // no way to set the visitor secret key. Optional, like Go (default "").
+    let sk = long("sk").argument::<String>("SECRET").optional();
     let proxy_name = long("proxy-name")
         .long("proxy_name")
+        .short('n')
         .argument::<String>("NAME")
         .optional();
+    let use_encryption = go_bool_flag_with_aliases!(
+        "ue",
+        &["use-encryption", "use_encryption"],
+        None,
+        "use encryption",
+    );
+    let use_compression = go_bool_flag_with_aliases!(
+        "uc",
+        &["use-compression", "use_compression"],
+        None,
+        "use compression",
+    );
     let args = construct!(SudpArgs {
         local_ip,
         local_port,
@@ -4492,7 +4733,10 @@ fn sudp_cmd() -> impl Parser<FrpcCmd> {
         server_addr,
         server_port,
         token,
+        sk,
         proxy_name,
+        use_encryption,
+        use_compression,
     });
     single_proxy_cmd(args, FrpcCmd::Sudp)
         .to_options()
@@ -4503,18 +4747,52 @@ fn sudp_cmd() -> impl Parser<FrpcCmd> {
 fn tcpmux_cmd() -> impl Parser<FrpcCmd> {
     let local_ip = long("local-ip")
         .long("local_ip")
+        .short('i')
         .argument::<String>("IP")
         .fallback("127.0.0.1".into());
     let local_port = long("local-port")
         .long("local_port")
+        .short('l')
         .argument::<u16>("PORT");
-    let mux_port = long("mux-port").long("mux_port").argument::<u16>("PORT");
+    // frp-rs's own tcpmux port flag, kept for compatibility with command lines
+    // written against it. Go's `frpc tcpmux` has **no** port flag at all: its
+    // help carries neither `--remote-port` nor anything else numeric beyond
+    // `--local-port`, because the front listens on the server's
+    // `tcpmuxHTTPConnectPort`, and frp-rs's server never reads a tcpmux proxy's
+    // `remote_port` either. It is optional (Go's own command line does not carry
+    // it) and its row is an frp-rs extension.
+    let mux_port = long("mux-port")
+        .long("mux_port")
+        .argument::<u16>("PORT")
+        .fallback(0);
+    // Go's `--mux string` names the multiplexer — it is **not** the port. The
+    // same spelling means the same thing in frp-server's SSH gateway
+    // (`frp-server/src/ssh_gateway.rs:718`), and `ProxyConfig::multiplexer`
+    // (frp-core/src/config/client.rs:723) is where it lands. A literal
+    // `--mux-port`→`--mux` rename would have rendered `--mux int` and rejected
+    // Go's string value; this is the flag Go actually has.
+    let mux = long("mux").argument::<String>("MUX").optional();
+    // Go registers the same domain pair here as on http/https (`custom_domain`
+    // `-d`, `sd`); frp-rs's server already routes on them
+    // (`frp-server/src/control/proxy_ops/vhost.rs:33`). Comma-joined like http.
+    let custom_domains = long("custom-domain")
+        .long("custom-domains")
+        .long("custom_domain")
+        .short('d')
+        .argument::<String>("DOMAINS")
+        .optional();
+    let subdomain = long("sd")
+        .long("subdomain")
+        .argument::<String>("SUB")
+        .optional();
     let server_addr = long("server-addr")
         .long("server_addr")
+        .short('s')
         .argument::<String>("HOST")
         .fallback("127.0.0.1".into());
     let server_port = long("server-port")
         .long("server_port")
+        .short('P')
         .argument::<u16>("PORT")
         .fallback(7000);
     let token = long("token")
@@ -4523,16 +4801,34 @@ fn tcpmux_cmd() -> impl Parser<FrpcCmd> {
         .optional();
     let proxy_name = long("proxy-name")
         .long("proxy_name")
+        .short('n')
         .argument::<String>("NAME")
         .optional();
+    let use_encryption = go_bool_flag_with_aliases!(
+        "ue",
+        &["use-encryption", "use_encryption"],
+        None,
+        "use encryption",
+    );
+    let use_compression = go_bool_flag_with_aliases!(
+        "uc",
+        &["use-compression", "use_compression"],
+        None,
+        "use compression",
+    );
     let args = construct!(TcpmuxArgs {
         local_ip,
         local_port,
         mux_port,
+        mux,
+        custom_domains,
+        subdomain,
         server_addr,
         server_port,
         token,
         proxy_name,
+        use_encryption,
+        use_compression,
     });
     single_proxy_cmd(args, FrpcCmd::Tcpmux)
         .to_options()
@@ -4773,8 +5069,7 @@ impl FrpsArgs {
     /// Config file path to load. Falls back to "frps.toml" when `-c` was
     /// not given on the command line.
     ///
-    /// **R2 (`TODO.md:9010`): this implicit-`./frps.toml` lane is an frp-rs
-    /// **R2 (`TODO.md:8896`): this implicit-`./frps.toml` lane is an frp-rs
+    /// **R2 (`TODO.md:9238`): this implicit-`./frps.toml` lane is an frp-rs
     /// extension, not Go parity.** Go binds a server config file only through
     /// `-c`; with no `-c` its run path keeps the flags-only struct
     /// (`cmd/frps/root.go:82`) and logs `frps uses command line arguments for
@@ -4968,6 +5263,8 @@ impl UdpArgs {
             local_ip: self.local_ip.clone(),
             local_port: self.local_port,
             remote_port: self.remote_port,
+            use_encryption: self.use_encryption,
+            use_compression: self.use_compression,
             ..Default::default()
         }
     }
@@ -4998,6 +5295,8 @@ impl HttpArgs {
             http_user: self.http_user.clone().unwrap_or_default(),
             http_pwd: self.http_pwd.clone().unwrap_or_default(),
             host_header_rewrite: self.host_header_rewrite.clone().unwrap_or_default(),
+            use_encryption: self.use_encryption,
+            use_compression: self.use_compression,
             ..Default::default()
         }
     }
@@ -5020,6 +5319,8 @@ impl HttpsArgs {
             local_port: self.local_port,
             custom_domains: domains,
             subdomain: self.subdomain.clone().unwrap_or_default(),
+            use_encryption: self.use_encryption,
+            use_compression: self.use_compression,
             ..Default::default()
         }
     }
@@ -5029,13 +5330,16 @@ impl StcpArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
         crate::config::ProxyConfig {
             name: self
-                .server_name
+                .proxy_name
                 .clone()
+                .or_else(|| self.server_name.clone())
                 .unwrap_or_else(|| "stcp-proxy".into()),
             proxy_type: "stcp".into(),
             local_ip: self.local_ip.clone(),
             local_port: self.local_port,
             sk: self.sk.clone(),
+            use_encryption: self.use_encryption,
+            use_compression: self.use_compression,
             ..Default::default()
         }
     }
@@ -5045,13 +5349,16 @@ impl XtcpArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
         crate::config::ProxyConfig {
             name: self
-                .server_name
+                .proxy_name
                 .clone()
+                .or_else(|| self.server_name.clone())
                 .unwrap_or_else(|| "xtcp-proxy".into()),
             proxy_type: "xtcp".into(),
             local_ip: self.local_ip.clone(),
             local_port: self.local_port,
             sk: self.sk.clone(),
+            use_encryption: self.use_encryption,
+            use_compression: self.use_compression,
             ..Default::default()
         }
     }
@@ -5068,6 +5375,9 @@ impl SudpArgs {
             local_ip: self.local_ip.clone(),
             local_port: self.local_port,
             remote_port: self.remote_port,
+            sk: self.sk.clone().unwrap_or_default(),
+            use_encryption: self.use_encryption,
+            use_compression: self.use_compression,
             ..Default::default()
         }
     }
@@ -5083,8 +5393,16 @@ impl TcpmuxArgs {
             proxy_type: "tcpmux".into(),
             local_ip: self.local_ip.clone(),
             local_port: self.local_port,
+            custom_domains: self
+                .custom_domains
+                .clone()
+                .map(|d| d.split(',').map(|s| s.trim().to_string()).collect())
+                .unwrap_or_default(),
+            subdomain: self.subdomain.clone().unwrap_or_default(),
             remote_port: self.mux_port,
-            multiplexer: "httpconnect".into(),
+            multiplexer: self.mux.clone().unwrap_or_else(|| "httpconnect".into()),
+            use_encryption: self.use_encryption,
+            use_compression: self.use_compression,
             ..Default::default()
         }
     }
@@ -5131,13 +5449,21 @@ mod tests {
         }
     }
 
-    /// `frpc tcp` — the only surface that carries the `--ue`/`--uc` pair on Go
-    /// and `--use-encryption`/`--use-compression` here.
+    /// `frpc tcp` — used by the `GO_BOOL_SITES` rows, which exercise Go's
+    /// `--ue`/`--uc` (and their frp-rs aliases) on this one surface; every proxy
+    /// surface takes them, and that is pinned separately by
+    /// [`every_proxy_surface_accepts_go_bool_names_and_their_frp_rs_aliases`].
     fn parse_frpc_tcp(args: &[&str]) -> Result<TcpArgs, bpaf::ParseFailure> {
         match frpc_parser().to_options().run_inner(args)? {
             FrpcCmd::Tcp(a) => Ok(a),
             other => panic!("expected tcp command, got {other:?}"),
         }
+    }
+
+    /// Parse any `frpc <proxy>` command line and hand back the whole command, so
+    /// a probe can cover the surfaces that have no dedicated helper.
+    fn parse_frpc_proxy(args: &[&str]) -> Result<FrpcCmd, bpaf::ParseFailure> {
+        frpc_parser().to_options().run_inner(args)
     }
 
     fn parse_frpc_status(args: &[&str]) -> Result<StatusArgs, bpaf::ParseFailure> {
@@ -5908,7 +6234,7 @@ mod tests {
 
     #[test]
     fn strict_config_help_text_states_the_extension() {
-        // The done-when for `TODO.md:1552` requires the divergence stated in
+        // The done-when for `TODO.md:3366` requires the divergence stated in
         // the flag's **help text**, not only in `docs/`.
         //
         // The two entries must be pinned **separately**, because the rendered
@@ -6045,7 +6371,7 @@ mod tests {
     // `--flag=true` / `--flag=false` parsed by `strconv.ParseBool`. bpaf's
     // `.switch()` accepted only the bare form, so `frps --tls-only=false -c
     // <valid config>` started on Go (rc 124 under a bounded runner) and exited
-    // 1 here (`TODO.md:3445`). The rows below are the parser half; the
+    // 1 here (`TODO.md:3498`). The rows below are the parser half; the
     // real-binary half is `frps/tests/cli_exit_codes.rs` and
     // `frpc/tests/cli_exit_codes.rs`.
 
@@ -6080,16 +6406,8 @@ mod tests {
             Some("--disable_log_color"),
         ),
         ("frpc --version", "--version", None),
-        (
-            "frpc tcp --use-encryption",
-            "--use-encryption",
-            Some("--use_encryption"),
-        ),
-        (
-            "frpc tcp --use-compression",
-            "--use-compression",
-            Some("--use_compression"),
-        ),
+        ("frpc tcp --ue", "--ue", Some("--use_encryption")),
+        ("frpc tcp --uc", "--uc", Some("--use_compression")),
         ("frpc status --json", "--json", None),
     ];
 
@@ -6098,7 +6416,7 @@ mod tests {
     /// appended.
     fn parse_site(site: &str, flag_argv: &[&str]) -> Result<bool, bpaf::ParseFailure> {
         let base: &[&str] = match site {
-            "frpc tcp --use-encryption" | "frpc tcp --use-compression" => {
+            "frpc tcp --ue" | "frpc tcp --uc" => {
                 &["tcp", "--local-port", "1", "--remote-port", "2"]
             }
             "frpc status --json" => &["status"],
@@ -6117,8 +6435,8 @@ mod tests {
             "frps --version" => parse_frps(&argv).map(|a| a.show_version),
             "frpc --disable-log-color" => parse_frpc_run(&argv).map(|a| a.disable_log_color),
             "frpc --version" => parse_frpc_run(&argv).map(|a| a.show_version),
-            "frpc tcp --use-encryption" => parse_frpc_tcp(&argv).map(|a| a.use_encryption),
-            "frpc tcp --use-compression" => parse_frpc_tcp(&argv).map(|a| a.use_compression),
+            "frpc tcp --ue" => parse_frpc_tcp(&argv).map(|a| a.use_encryption),
+            "frpc tcp --uc" => parse_frpc_tcp(&argv).map(|a| a.use_compression),
             "frpc status --json" => parse_frpc_status(&argv).map(|a| a.json),
             other => panic!("unknown site {other}"),
         }
@@ -6249,13 +6567,8 @@ mod tests {
                 "go-bool",
             ),
             ("frpc", "--version", "Version of frpc", "go-bool"),
-            ("frpc tcp", "--use-encryption", "Use encryption", "go-bool"),
-            (
-                "frpc tcp",
-                "--use-compression",
-                "Use compression",
-                "go-bool",
-            ),
+            ("frpc tcp", "--ue", "use encryption", "go-bool"),
+            ("frpc tcp", "--uc", "use compression", "go-bool"),
             (
                 "frpc status",
                 "--json",
@@ -6315,6 +6628,79 @@ mod tests {
             usage.contains("(--version=BOOL|[-v])"),
             "the usage line must render the long value spelling plus the short: {usage}"
         );
+    }
+
+    /// Every proxy surface takes Go's `--ue`/`--uc` as the primary spelling and
+    /// keeps frp-rs's two older spellings on the same parser branch.
+    ///
+    /// Go registers `use-encryption`/`use-compression` on **no** command — its
+    /// pflag names are `uc`/`ue` (measured on the v0.71.0 binary) — so the older
+    /// names are frp-rs extensions, accepted so existing command lines keep
+    /// working. This test is what holds the alias half of that decision: a later
+    /// edit that dropped an alias would otherwise leave the whole suite green.
+    ///
+    /// Both frp-rs spellings are parsed **per surface** here, hyphen included:
+    /// `GO_BOOL_SITES` carries only the underscore form on `frpc tcp`, so leaving
+    /// `--use-compression` to that table would let any surface drop the hyphen
+    /// alias with the whole suite still green.
+    #[test]
+    fn every_proxy_surface_accepts_go_bool_names_and_their_frp_rs_aliases() {
+        const SURFACES: [(&str, &[&str]); 8] = [
+            ("tcp", &["--local-port", "1", "--remote-port", "2"]),
+            ("udp", &["--local-port", "1", "--remote-port", "2"]),
+            (
+                "http",
+                &["--local-port", "1", "--custom-domain", "h.example"],
+            ),
+            (
+                "https",
+                &["--local-port", "1", "--custom-domain", "h.example"],
+            ),
+            ("stcp", &["--local-port", "1", "--sk", "s"]),
+            ("xtcp", &["--local-port", "1", "--sk", "s"]),
+            ("sudp", &["--local-port", "1", "--remote-port", "1"]),
+            ("tcpmux", &["--local-port", "1"]),
+        ];
+        // `(argv spelling, read the encryption field, read the compression field)`
+        let read = |command: &FrpcCmd| -> (bool, bool) {
+            match command {
+                FrpcCmd::Tcp(a) => (a.use_encryption, a.use_compression),
+                FrpcCmd::Udp(a) => (a.use_encryption, a.use_compression),
+                FrpcCmd::Http(a) => (a.use_encryption, a.use_compression),
+                FrpcCmd::Https(a) => (a.use_encryption, a.use_compression),
+                FrpcCmd::Stcp(a) => (a.use_encryption, a.use_compression),
+                FrpcCmd::Xtcp(a) => (a.use_encryption, a.use_compression),
+                FrpcCmd::Sudp(a) => (a.use_encryption, a.use_compression),
+                FrpcCmd::Tcpmux(a) => (a.use_encryption, a.use_compression),
+                other => panic!("expected a proxy command, got {other:?}"),
+            }
+        };
+        for (surface, required) in SURFACES {
+            let mut base: Vec<&str> = vec![surface];
+            base.extend_from_slice(required);
+            for (flag, expect_encryption) in [
+                ("--ue", true),
+                ("--use-encryption", true),
+                ("--use_encryption", true),
+                ("--uc", false),
+                ("--use-compression", false),
+                ("--use_compression", false),
+            ] {
+                let mut argv = base.clone();
+                argv.push(flag);
+                let command = parse_frpc_proxy(&argv)
+                    .unwrap_or_else(|e| panic!("frpc {surface} {flag}: {e:?}"));
+                let (encryption, compression) = read(&command);
+                assert_eq!(
+                    encryption, expect_encryption,
+                    "frpc {surface} {flag} must set use_encryption={expect_encryption}"
+                );
+                assert_eq!(
+                    compression, !expect_encryption,
+                    "frpc {surface} {flag} must only set its own field"
+                );
+            }
+        }
     }
 
     #[test]
@@ -7478,6 +7864,524 @@ mod tests {
             vec!["-c", "p.toml", "--", "-c", "-x"]
         );
     }
+    /// Batch H1, **Item A**: Go frp v0.71.0's proxy flag *names* must be accepted,
+    /// and the frp-rs spellings they replace must keep parsing to the same field.
+    ///
+    /// Every probe drives the real parser, so a rename that only moved the
+    /// rendered document (the `FRPC_*_DOC` whole-text pins) reds here too. Each
+    /// `--custom-domain`/`--sd`/`--tls-server-name`/`--mux` value is deliberately
+    /// distinct from the legacy one so a probe cannot pass by aliasing the wrong
+    /// field.
+    #[test]
+    fn proxy_commands_accept_go_flag_names() {
+        // http: `-d, --custom-domain strings` and `--sd string`.
+        let FrpcCmd::Http(http) = parse_frpc_proxy(&[
+            "http",
+            "-l",
+            "80",
+            "--custom-domain",
+            "go.example",
+            "--sd",
+            "go-sub",
+        ])
+        .expect("--custom-domain / --sd must parse on frpc http") else {
+            panic!("expected the http command");
+        };
+        assert_eq!(http.custom_domains.as_str(), "go.example");
+        assert_eq!(http.subdomain.as_deref(), Some("go-sub"));
+        // The three legacy spellings are hidden aliases of the same fields.
+        for argv in [
+            &[
+                "http",
+                "-l",
+                "80",
+                "--custom-domains",
+                "old.example",
+                "--subdomain",
+                "old-sub",
+            ][..],
+            &[
+                "http",
+                "-l",
+                "80",
+                "--custom_domain",
+                "old.example",
+                "--subdomain",
+                "old-sub",
+            ][..],
+        ] {
+            let FrpcCmd::Http(legacy) = parse_frpc_proxy(argv)
+                .unwrap_or_else(|e| panic!("{argv:?} must keep parsing: {e:?}"))
+            else {
+                panic!("expected the http command");
+            };
+            assert_eq!(
+                (legacy.custom_domains.as_str(), legacy.subdomain.as_deref()),
+                ("old.example", Some("old-sub")),
+                "{argv:?} must reach custom_domains/subdomain"
+            );
+        }
+
+        // https: same two names, and `-d` is Go's shorthand.
+        let FrpcCmd::Https(https) =
+            parse_frpc_proxy(&["https", "-l", "443", "-d", "go.example", "--sd", "go-sub"])
+                .expect("-d / --custom-domain / --sd must parse on frpc https")
+        else {
+            panic!("expected the https command");
+        };
+        assert_eq!(https.custom_domains.as_str(), "go.example");
+        assert_eq!(https.subdomain.as_deref(), Some("go-sub"));
+
+        // stcp/xtcp: `--tls-server-name string`, legacy `--server-name`/`--server_name`.
+        for argv in [
+            &[
+                "stcp",
+                "--sk",
+                "s",
+                "-l",
+                "80",
+                "--tls-server-name",
+                "go.example",
+            ][..],
+            &[
+                "xtcp",
+                "--sk",
+                "s",
+                "-l",
+                "80",
+                "--tls-server-name",
+                "go.example",
+            ][..],
+        ] {
+            let (name, server_name) = match parse_frpc_proxy(argv)
+                .unwrap_or_else(|e| panic!("{argv:?} must parse: {e:?}"))
+            {
+                FrpcCmd::Stcp(a) => ("stcp", a.server_name),
+                FrpcCmd::Xtcp(a) => ("xtcp", a.server_name),
+                other => panic!("expected stcp/xtcp, got {other:?}"),
+            };
+            assert_eq!(
+                server_name.as_deref(),
+                Some("go.example"),
+                "{name} --tls-server-name must reach server_name"
+            );
+        }
+        for argv in [
+            &[
+                "stcp",
+                "--sk",
+                "s",
+                "-l",
+                "80",
+                "--server-name",
+                "old.example",
+            ][..],
+            &[
+                "xtcp",
+                "--sk",
+                "s",
+                "-l",
+                "80",
+                "--server_name",
+                "old.example",
+            ][..],
+        ] {
+            let server_name = match parse_frpc_proxy(argv)
+                .unwrap_or_else(|e| panic!("{argv:?} must keep parsing: {e:?}"))
+            {
+                FrpcCmd::Stcp(a) => a.server_name,
+                FrpcCmd::Xtcp(a) => a.server_name,
+                other => panic!("expected stcp/xtcp, got {other:?}"),
+            };
+            assert_eq!(
+                server_name.as_deref(),
+                Some("old.example"),
+                "{argv:?} must keep reaching server_name"
+            );
+        }
+
+        // tcpmux: Go's `--mux string` is the multiplexer *name*. frp-rs's own
+        // `--mux-port` (a port the tcpmux path never used) survives as an
+        // extension, and is optional because Go's command line has no port flag.
+        let FrpcCmd::Tcpmux(tcpmux) =
+            parse_frpc_proxy(&["tcpmux", "-l", "80", "--mux", "go-mux", "--mux-port", "7"])
+                .expect("--mux / --mux-port must parse on frpc tcpmux")
+        else {
+            panic!("expected the tcpmux command");
+        };
+        assert_eq!(tcpmux.mux.as_deref(), Some("go-mux"));
+        assert_eq!(tcpmux.mux_port, 7);
+        assert_eq!(tcpmux.to_proxy_config().multiplexer, "go-mux");
+        let FrpcCmd::Tcpmux(no_port) =
+            parse_frpc_proxy(&["tcpmux", "-l", "80", "--mux", "httpconnect"])
+                .expect("frpc tcpmux must parse without --mux-port, which Go has no flag for")
+        else {
+            panic!("expected the tcpmux command");
+        };
+        assert_eq!(no_port.mux_port, 0);
+        assert_eq!(no_port.to_proxy_config().multiplexer, "httpconnect");
+        let FrpcCmd::Tcpmux(bare) =
+            parse_frpc_proxy(&["tcpmux", "-l", "80"]).expect("frpc tcpmux must still parse bare")
+        else {
+            panic!("expected the tcpmux command");
+        };
+        assert_eq!(
+            bare.to_proxy_config().multiplexer,
+            "httpconnect",
+            "a bare frpc tcpmux must keep the pre-Item-A multiplexer default"
+        );
+
+        // stcp/xtcp: Go's `-n/--proxy-name`. Round 2 added the field, so this pins
+        // that it reaches both the args and the proxy's wire name; the legacy
+        // `--server-name` still lands on `server_name` (the two are separate
+        // fields, and `proxy_name` wins when both are given).
+        for argv in [
+            &["stcp", "--sk", "s", "-l", "80", "--proxy-name", "go-name"][..],
+            &["xtcp", "--sk", "s", "-l", "80", "--proxy-name", "go-name"][..],
+        ] {
+            let (name, proxy_name) = match parse_frpc_proxy(argv)
+                .unwrap_or_else(|e| panic!("{argv:?} must parse: {e:?}"))
+            {
+                FrpcCmd::Stcp(a) => (a.to_proxy_config().name, a.proxy_name),
+                FrpcCmd::Xtcp(a) => (a.to_proxy_config().name, a.proxy_name),
+                other => panic!("expected stcp/xtcp, got {other:?}"),
+            };
+            assert_eq!(proxy_name.as_deref(), Some("go-name"));
+            assert_eq!(name, "go-name", "{argv:?} must reach the proxy name");
+        }
+
+        // tcpmux: Go's `-d/--custom-domain strings` and `--sd string`. The comma
+        // grammar is frp-rs's (Go's StringSlice takes repeats); the split must
+        // reach `custom_domains` as a list.
+        let FrpcCmd::Tcpmux(tcpmux_domains) = parse_frpc_proxy(&[
+            "tcpmux",
+            "-l",
+            "80",
+            "--custom-domain",
+            "a.example,b.example",
+            "--sd",
+            "go-sub",
+        ])
+        .expect("--custom-domain / --sd must parse on frpc tcpmux") else {
+            panic!("expected the tcpmux command");
+        };
+        assert_eq!(
+            tcpmux_domains.custom_domains.as_deref(),
+            Some("a.example,b.example")
+        );
+        assert_eq!(tcpmux_domains.subdomain.as_deref(), Some("go-sub"));
+        let config = tcpmux_domains.to_proxy_config();
+        assert_eq!(
+            config.custom_domains,
+            vec!["a.example".to_string(), "b.example".to_string()]
+        );
+        assert_eq!(config.subdomain, "go-sub");
+
+        // sudp: Go's `--sk string`, optional like Go's (default ""). The long
+        // `--remote-port` is frp-rs's own and still required; `-r` is refused.
+        let FrpcCmd::Sudp(sudp) =
+            parse_frpc_proxy(&["sudp", "-l", "80", "--remote-port", "1", "--sk", "go-sk"])
+                .expect("--sk must parse on frpc sudp")
+        else {
+            panic!("expected the sudp command");
+        };
+        assert_eq!(sudp.sk.as_deref(), Some("go-sk"));
+        assert_eq!(sudp.to_proxy_config().sk, "go-sk");
+        let FrpcCmd::Sudp(no_sk) = parse_frpc_proxy(&["sudp", "-l", "80", "--remote-port", "1"])
+            .expect("--sk is optional on frpc sudp, like Go")
+        else {
+            panic!("expected the sudp command");
+        };
+        assert_eq!(no_sk.sk, None);
+        assert_eq!(no_sk.to_proxy_config().sk, "");
+    }
+
+    /// Batch H1, **Item B**: Go's proxy-command shorthands. Each `-x` must land on
+    /// the field its Go long flag names, on every surface Go registers it on:
+    /// `-i` local-ip, `-l` local-port, `-r` remote-port (tcp/udp only — Go's sudp
+    /// registers no `remote_port`, so frp-rs's long-only copy takes no shorthand
+    /// there), `-s` server-addr, `-P` server-port, `-n` proxy-name (all eight; Go
+    /// registers it on every proxy command), and `-d` custom-domain.
+    #[test]
+    fn proxy_command_shorthands_parse_to_their_go_long_flag() {
+        let FrpcCmd::Tcp(tcp) = parse_frpc_proxy(&[
+            "tcp",
+            "-i",
+            "10.1.2.3",
+            "-l",
+            "8081",
+            "-r",
+            "18081",
+            "-s",
+            "srv.example",
+            "-P",
+            "7001",
+            "-n",
+            "probe",
+        ])
+        .expect("-i -l -r -s -P -n must parse on frpc tcp") else {
+            panic!("expected the tcp command");
+        };
+        assert_eq!(
+            (
+                tcp.local_ip.as_str(),
+                tcp.local_port,
+                tcp.remote_port,
+                tcp.server_addr.as_str(),
+                tcp.server_port,
+                tcp.proxy_name.as_deref(),
+            ),
+            ("10.1.2.3", 8081, 18081, "srv.example", 7001, Some("probe")),
+            "-i/-l/-r/-s/-P/-n must be local-ip/local-port/remote-port/server-addr/server-port/proxy-name"
+        );
+
+        let FrpcCmd::Udp(udp) = parse_frpc_proxy(&[
+            "udp",
+            "-i",
+            "10.1.2.3",
+            "-l",
+            "8082",
+            "-r",
+            "18082",
+            "-s",
+            "srv.example",
+            "-P",
+            "7002",
+            "-n",
+            "probe",
+        ])
+        .expect("-i -l -r -s -P -n must parse on frpc udp") else {
+            panic!("expected the udp command");
+        };
+        assert_eq!(
+            (
+                udp.local_ip.as_str(),
+                udp.local_port,
+                udp.remote_port,
+                udp.server_addr.as_str(),
+                udp.server_port,
+                udp.proxy_name.as_deref(),
+            ),
+            ("10.1.2.3", 8082, 18082, "srv.example", 7002, Some("probe"))
+        );
+
+        // http/https also need their required `--custom-domain`.
+        let FrpcCmd::Http(http) = parse_frpc_proxy(&[
+            "http",
+            "-i",
+            "10.1.2.3",
+            "-l",
+            "8083",
+            "-s",
+            "srv.example",
+            "-P",
+            "7003",
+            "-n",
+            "probe",
+            "-d",
+            "h.example",
+        ])
+        .expect("-i -l -s -P -n -d must parse on frpc http") else {
+            panic!("expected the http command");
+        };
+        assert_eq!(
+            (
+                http.local_ip.as_str(),
+                http.local_port,
+                http.server_addr.as_str(),
+                http.server_port,
+                http.proxy_name.as_deref(),
+                http.custom_domains.as_str(),
+            ),
+            (
+                "10.1.2.3",
+                8083,
+                "srv.example",
+                7003,
+                Some("probe"),
+                "h.example"
+            )
+        );
+
+        let FrpcCmd::Https(https) = parse_frpc_proxy(&[
+            "https",
+            "-i",
+            "10.1.2.3",
+            "-l",
+            "8084",
+            "-s",
+            "srv.example",
+            "-P",
+            "7004",
+            "-n",
+            "probe",
+            "-d",
+            "h.example",
+        ])
+        .expect("-i -l -s -P -n -d must parse on frpc https") else {
+            panic!("expected the https command");
+        };
+        assert_eq!(
+            (
+                https.local_ip.as_str(),
+                https.local_port,
+                https.server_addr.as_str(),
+                https.server_port,
+                https.proxy_name.as_deref(),
+            ),
+            ("10.1.2.3", 8084, "srv.example", 7004, Some("probe"))
+        );
+
+        let FrpcCmd::Stcp(stcp) = parse_frpc_proxy(&[
+            "stcp",
+            "--sk",
+            "s",
+            "-i",
+            "10.1.2.3",
+            "-l",
+            "8085",
+            "-s",
+            "srv.example",
+            "-P",
+            "7005",
+            "-n",
+            "probe",
+        ])
+        .expect("-i -l -s -P -n --sk must parse on frpc stcp") else {
+            panic!("expected the stcp command");
+        };
+        assert_eq!(
+            (
+                stcp.local_ip.as_str(),
+                stcp.local_port,
+                stcp.server_addr.as_str(),
+                stcp.server_port,
+                stcp.proxy_name.as_deref(),
+                stcp.sk.as_str(),
+            ),
+            ("10.1.2.3", 8085, "srv.example", 7005, Some("probe"), "s"),
+            "-n must be proxy-name and --sk must be the secret key on frpc stcp"
+        );
+
+        let FrpcCmd::Xtcp(xtcp) = parse_frpc_proxy(&[
+            "xtcp",
+            "--sk",
+            "s",
+            "-i",
+            "10.1.2.3",
+            "-l",
+            "8086",
+            "-s",
+            "srv.example",
+            "-P",
+            "7006",
+            "-n",
+            "probe",
+        ])
+        .expect("-i -l -s -P -n --sk must parse on frpc xtcp") else {
+            panic!("expected the xtcp command");
+        };
+        assert_eq!(
+            (
+                xtcp.local_ip.as_str(),
+                xtcp.local_port,
+                xtcp.server_addr.as_str(),
+                xtcp.server_port,
+                xtcp.proxy_name.as_deref(),
+                xtcp.sk.as_str(),
+            ),
+            ("10.1.2.3", 8086, "srv.example", 7006, Some("probe"), "s")
+        );
+
+        // Sudp takes no `-r` at all: Go's sudp has no `remote_port`, and the
+        // v0.71.0 binary refuses both `-r` and `--remote-port` (measured). The
+        // long form is frp-rs's own, so this pins it as long-only.
+        let FrpcCmd::Sudp(sudp) = parse_frpc_proxy(&[
+            "sudp",
+            "-i",
+            "10.1.2.3",
+            "-l",
+            "8087",
+            "--remote-port",
+            "18087",
+            "-s",
+            "srv.example",
+            "-P",
+            "7007",
+            "-n",
+            "probe",
+            "--sk",
+            "s",
+        ])
+        .expect("-i -l -s -P -n --sk --remote-port must parse on frpc sudp") else {
+            panic!("expected the sudp command");
+        };
+        assert_eq!(
+            (
+                sudp.local_ip.as_str(),
+                sudp.local_port,
+                sudp.remote_port,
+                sudp.server_addr.as_str(),
+                sudp.server_port,
+                sudp.proxy_name.as_deref(),
+                sudp.sk.as_deref(),
+            ),
+            (
+                "10.1.2.3",
+                8087,
+                18087,
+                "srv.example",
+                7007,
+                Some("probe"),
+                Some("s")
+            )
+        );
+        assert!(
+            parse_frpc_proxy(&["sudp", "-l", "1", "-r", "18087"]).is_err(),
+            "frpc sudp -r must stay refused: Go registers no remote_port there"
+        );
+
+        let FrpcCmd::Tcpmux(tcpmux) = parse_frpc_proxy(&[
+            "tcpmux",
+            "-i",
+            "10.1.2.3",
+            "-l",
+            "8088",
+            "-s",
+            "srv.example",
+            "-P",
+            "7008",
+            "-n",
+            "probe",
+            "-d",
+            "t.example",
+            "--sd",
+            "sub",
+        ])
+        .expect("-i -l -s -P -n -d --sd must parse on frpc tcpmux") else {
+            panic!("expected the tcpmux command");
+        };
+        assert_eq!(
+            (
+                tcpmux.local_ip.as_str(),
+                tcpmux.local_port,
+                tcpmux.server_addr.as_str(),
+                tcpmux.server_port,
+                tcpmux.proxy_name.as_deref(),
+                tcpmux.custom_domains.as_deref(),
+                tcpmux.subdomain.as_deref(),
+            ),
+            (
+                "10.1.2.3",
+                8088,
+                "srv.example",
+                7008,
+                Some("probe"),
+                Some("t.example"),
+                Some("sub")
+            )
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7594,7 +8498,7 @@ mod hoist_tests {
         }
     }
 
-    // ── the `--help=<bool>` pass (TODO.md:4928) ─────────────────────────
+    // ── the `--help=<bool>` pass (TODO.md:4981) ─────────────────────────
     //
     // Every row in these two tests carries the Go v0.71.0 measurement it pins,
     // taken with one fresh listening socket per run on the config's
@@ -7673,7 +8577,7 @@ mod hoist_tests {
         );
         // No command word → the pass leaves the token alone: this is the
         // pre-existing root divergence (`frpc --help=false -c cfg` prints help
-        // here and starts the client on Go, rc 124, `TODO.md:2326`), and
+        // here and starts the client on Go, rc 124, `TODO.md:4981`), and
         // `--help=true notacommand` must keep bpaf's refusal rather than be
         // cleaned up into root help.
         for untouched in [
@@ -8756,20 +9660,25 @@ mod help_doc_tests {
     /// - `frpc status|reload|stop`: `--admin-addr/-port/-user/-pwd` (plus `--json`
     ///   for `status`) are frp-rs-only; Go's admin commands have only
     ///   `--api-timeout`.
-    /// - the eight proxy commands: frp-rs implements a smaller proxy flag set and
-    ///   only `--token`'s `-t` shorthand, where Go also has `-i/-l/-r/-s/-P/-n`.
+    /// - the eight proxy commands: every one prints Go's own flag **names** and
+    ///   Go's shorthand for each flag frp-rs implements, but frp-rs implements a
+    ///   smaller proxy flag set than Go (`--annotations`, `--bandwidth-limit*`,
+    ///   `--client-id`, `--dns-server`, `--metadatas`, `--protocol`, `--tls-enable`,
+    ///   `--user`, `--allow-users`, … have no frp-rs counterpart), and frp-rs adds
+    ///   one row of its own (`--mux-port` on tcpmux); sudp's long-only
+    ///   `--remote-port` is an frp-rs extension that reuses Go's tcp/udp row text.
     const SURFACES: [(&str, RootCommand, Option<&str>, usize, usize); 15] = [
         ("frps", RootCommand::Frps, None, 2467, 2394),
         ("frps verify", RootCommand::Frps, Some("verify"), 2103, 2103),
         ("frpc", RootCommand::Frpc, None, 1517, 1370),
         ("frpc tcp", RootCommand::Frpc, Some("tcp"), 992, 2211),
-        ("frpc udp", RootCommand::Frpc, Some("udp"), 903, 2211),
-        ("frpc http", RootCommand::Frpc, Some("http"), 1233, 2482),
-        ("frpc https", RootCommand::Frpc, Some("https"), 979, 2269),
-        ("frpc stcp", RootCommand::Frpc, Some("stcp"), 906, 2436),
-        ("frpc xtcp", RootCommand::Frpc, Some("xtcp"), 906, 2436),
-        ("frpc sudp", RootCommand::Frpc, Some("sudp"), 906, 2436),
-        ("frpc tcpmux", RootCommand::Frpc, Some("tcpmux"), 917, 2432),
+        ("frpc udp", RootCommand::Frpc, Some("udp"), 992, 2211),
+        ("frpc http", RootCommand::Frpc, Some("http"), 1338, 2482),
+        ("frpc https", RootCommand::Frpc, Some("https"), 1074, 2269),
+        ("frpc stcp", RootCommand::Frpc, Some("stcp"), 1117, 2436),
+        ("frpc xtcp", RootCommand::Frpc, Some("xtcp"), 1117, 2436),
+        ("frpc sudp", RootCommand::Frpc, Some("sudp"), 1035, 2436),
+        ("frpc tcpmux", RootCommand::Frpc, Some("tcpmux"), 1170, 2432),
         ("frpc verify", RootCommand::Frpc, Some("verify"), 543, 543),
         ("frpc reload", RootCommand::Frpc, Some("reload"), 801, 626),
         ("frpc status", RootCommand::Frpc, Some("status"), 859, 627),
@@ -8927,15 +9836,15 @@ Usage:
 
 Flags:
   -h, --help                 help for tcp
-      --local-ip string      local ip (default "127.0.0.1")
-      --local-port int       local port
-      --proxy-name string    proxy name
-      --remote-port int      remote port
-      --server-addr string   frp server's address (default "127.0.0.1")
-      --server-port int      frp server's port (default 7000)
+  -i, --local-ip string      local ip (default "127.0.0.1")
+  -l, --local-port int       local port
+  -n, --proxy-name string    proxy name
+  -r, --remote-port int      remote port
+  -s, --server-addr string   frp server's address (default "127.0.0.1")
+  -P, --server-port int      frp server's port (default 7000)
   -t, --token string         auth token
-      --use-compression      Use compression
-      --use-encryption       Use encryption
+      --uc                   use compression
+      --ue                   use encryption
 
 Global Flags:
       --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
@@ -8945,7 +9854,7 @@ Global Flags:
   -v, --version                version of frpc
 "#;
 
-    /// `frpc udp --help` as the built binary prints it (903 bytes).
+    /// `frpc udp --help` as the built binary prints it (992 bytes).
     const FRPC_UDP_DOC: &str = r#"Run frpc with a single udp proxy
 
 Usage:
@@ -8953,13 +9862,15 @@ Usage:
 
 Flags:
   -h, --help                 help for udp
-      --local-ip string      local ip (default "127.0.0.1")
-      --local-port int       local port
-      --proxy-name string    proxy name
-      --remote-port int      remote port
-      --server-addr string   frp server's address (default "127.0.0.1")
-      --server-port int      frp server's port (default 7000)
+  -i, --local-ip string      local ip (default "127.0.0.1")
+  -l, --local-port int       local port
+  -n, --proxy-name string    proxy name
+  -r, --remote-port int      remote port
+  -s, --server-addr string   frp server's address (default "127.0.0.1")
+  -P, --server-port int      frp server's port (default 7000)
   -t, --token string         auth token
+      --uc                   use compression
+      --ue                   use encryption
 
 Global Flags:
       --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
@@ -8969,26 +9880,28 @@ Global Flags:
   -v, --version                version of frpc
 "#;
 
-    /// `frpc http --help` as the built binary prints it (1233 bytes).
+    /// `frpc http --help` as the built binary prints it (1338 bytes).
     const FRPC_HTTP_DOC: &str = r#"Run frpc with a single http proxy
 
 Usage:
   frpc http [flags]
 
 Flags:
-      --custom-domains string        custom domains
+  -d, --custom-domain strings        custom domains
   -h, --help                         help for http
       --host-header-rewrite string   host header rewrite
       --http-pwd string              http auth password
       --http-user string             http auth user
-      --local-ip string              local ip (default "127.0.0.1")
-      --local-port int               local port
+  -i, --local-ip string              local ip (default "127.0.0.1")
+  -l, --local-port int               local port
       --locations strings            locations
-      --proxy-name string            proxy name
-      --server-addr string           frp server's address (default "127.0.0.1")
-      --server-port int              frp server's port (default 7000)
-      --subdomain string             sub domain
+  -n, --proxy-name string            proxy name
+      --sd string                    sub domain
+  -s, --server-addr string           frp server's address (default "127.0.0.1")
+  -P, --server-port int              frp server's port (default 7000)
   -t, --token string                 auth token
+      --uc                           use compression
+      --ue                           use encryption
 
 Global Flags:
       --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
@@ -8998,22 +9911,24 @@ Global Flags:
   -v, --version                version of frpc
 "#;
 
-    /// `frpc https --help` as the built binary prints it (979 bytes).
+    /// `frpc https --help` as the built binary prints it (1074 bytes).
     const FRPC_HTTPS_DOC: &str = r#"Run frpc with a single https proxy
 
 Usage:
   frpc https [flags]
 
 Flags:
-      --custom-domains string   custom domains
+  -d, --custom-domain strings   custom domains
   -h, --help                    help for https
-      --local-ip string         local ip (default "127.0.0.1")
-      --local-port int          local port
-      --proxy-name string       proxy name
-      --server-addr string      frp server's address (default "127.0.0.1")
-      --server-port int         frp server's port (default 7000)
-      --subdomain string        sub domain
+  -i, --local-ip string         local ip (default "127.0.0.1")
+  -l, --local-port int          local port
+  -n, --proxy-name string       proxy name
+      --sd string               sub domain
+  -s, --server-addr string      frp server's address (default "127.0.0.1")
+  -P, --server-port int         frp server's port (default 7000)
   -t, --token string            auth token
+      --uc                      use compression
+      --ue                      use encryption
 
 Global Flags:
       --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
@@ -9023,21 +9938,24 @@ Global Flags:
   -v, --version                version of frpc
 "#;
 
-    /// `frpc stcp --help` as the built binary prints it (906 bytes).
+    /// `frpc stcp --help` as the built binary prints it (1117 bytes).
     const FRPC_STCP_DOC: &str = r#"Run frpc with a single stcp proxy
 
 Usage:
   frpc stcp [flags]
 
 Flags:
-  -h, --help                 help for stcp
-      --local-ip string      local ip (default "127.0.0.1")
-      --local-port int       local port
-      --server-addr string   frp server's address (default "127.0.0.1")
-      --server-name string   server name
-      --server-port int      frp server's port (default 7000)
-      --sk string            secret key
-  -t, --token string         auth token
+  -h, --help                     help for stcp
+  -i, --local-ip string          local ip (default "127.0.0.1")
+  -l, --local-port int           local port
+  -n, --proxy-name string        proxy name
+  -s, --server-addr string       frp server's address (default "127.0.0.1")
+  -P, --server-port int          frp server's port (default 7000)
+      --sk string                secret key
+      --tls-server-name string   specify the custom server name of tls certificate
+  -t, --token string             auth token
+      --uc                       use compression
+      --ue                       use encryption
 
 Global Flags:
       --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
@@ -9047,21 +9965,24 @@ Global Flags:
   -v, --version                version of frpc
 "#;
 
-    /// `frpc xtcp --help` as the built binary prints it (906 bytes).
+    /// `frpc xtcp --help` as the built binary prints it (1117 bytes).
     const FRPC_XTCP_DOC: &str = r#"Run frpc with a single xtcp proxy
 
 Usage:
   frpc xtcp [flags]
 
 Flags:
-  -h, --help                 help for xtcp
-      --local-ip string      local ip (default "127.0.0.1")
-      --local-port int       local port
-      --server-addr string   frp server's address (default "127.0.0.1")
-      --server-name string   server name
-      --server-port int      frp server's port (default 7000)
-      --sk string            secret key
-  -t, --token string         auth token
+  -h, --help                     help for xtcp
+  -i, --local-ip string          local ip (default "127.0.0.1")
+  -l, --local-port int           local port
+  -n, --proxy-name string        proxy name
+  -s, --server-addr string       frp server's address (default "127.0.0.1")
+  -P, --server-port int          frp server's port (default 7000)
+      --sk string                secret key
+      --tls-server-name string   specify the custom server name of tls certificate
+  -t, --token string             auth token
+      --uc                       use compression
+      --ue                       use encryption
 
 Global Flags:
       --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
@@ -9071,7 +9992,7 @@ Global Flags:
   -v, --version                version of frpc
 "#;
 
-    /// `frpc sudp --help` as the built binary prints it (906 bytes).
+    /// `frpc sudp --help` as the built binary prints it (1035 bytes).
     const FRPC_SUDP_DOC: &str = r#"Run frpc with a single sudp proxy
 
 Usage:
@@ -9079,13 +10000,16 @@ Usage:
 
 Flags:
   -h, --help                 help for sudp
-      --local-ip string      local ip (default "127.0.0.1")
-      --local-port int       local port
-      --proxy-name string    proxy name
+  -i, --local-ip string      local ip (default "127.0.0.1")
+  -l, --local-port int       local port
+  -n, --proxy-name string    proxy name
       --remote-port int      remote port
-      --server-addr string   frp server's address (default "127.0.0.1")
-      --server-port int      frp server's port (default 7000)
+  -s, --server-addr string   frp server's address (default "127.0.0.1")
+  -P, --server-port int      frp server's port (default 7000)
+      --sk string            secret key
   -t, --token string         auth token
+      --uc                   use compression
+      --ue                   use encryption
 
 Global Flags:
       --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
@@ -9095,21 +10019,26 @@ Global Flags:
   -v, --version                version of frpc
 "#;
 
-    /// `frpc tcpmux --help` as the built binary prints it (917 bytes).
+    /// `frpc tcpmux --help` as the built binary prints it (1170 bytes).
     const FRPC_TCPMUX_DOC: &str = r#"Run frpc with a single tcpmux proxy
 
 Usage:
   frpc tcpmux [flags]
 
 Flags:
-  -h, --help                 help for tcpmux
-      --local-ip string      local ip (default "127.0.0.1")
-      --local-port int       local port
-      --mux-port int         multiplexer port
-      --proxy-name string    proxy name
-      --server-addr string   frp server's address (default "127.0.0.1")
-      --server-port int      frp server's port (default 7000)
-  -t, --token string         auth token
+  -d, --custom-domain strings   custom domains
+  -h, --help                    help for tcpmux
+  -i, --local-ip string         local ip (default "127.0.0.1")
+  -l, --local-port int          local port
+      --mux string              multiplexer
+      --mux-port int            multiplexer port
+  -n, --proxy-name string       proxy name
+      --sd string               sub domain
+  -s, --server-addr string      frp server's address (default "127.0.0.1")
+  -P, --server-port int         frp server's port (default 7000)
+  -t, --token string            auth token
+      --uc                      use compression
+      --ue                      use encryption
 
 Global Flags:
       --allow-unsafe strings   allowed unsafe features, one or more of: TokenSourceExec
@@ -9217,6 +10146,22 @@ Global Flags:
         FRPC_STOP_DOC,
     ];
 
+    /// `SURFACES` and `SURFACE_DOCUMENTS` are index-aligned, and both pairing
+    /// loops use `.zip(...)`, which **truncates to the shorter list**. A sixteenth
+    /// surface added to one table and not the other would therefore leave the new
+    /// document entirely unpinned — and, in the reverse direction, a pin added
+    /// without its surface row would never be rendered or checked. The length
+    /// equality is asserted before both zips so the truncation cannot happen
+    /// silently.
+    fn assert_surface_tables_are_aligned() {
+        assert_eq!(
+            SURFACES.len(),
+            SURFACE_DOCUMENTS.len(),
+            "SURFACES and SURFACE_DOCUMENTS must be the same length; the `zip` in both \
+             pairing loops truncates to the shorter list, leaving the extra surface unpinned"
+        );
+    }
+
     /// The whole-text pin for all 15 surfaces: the rendered document must equal
     /// the recorded stdout byte for byte. `SURFACE_DOCUMENTS` is generated
     /// mechanically from the built binaries (`frps --help`, `frpc tcp --help`,
@@ -9226,6 +10171,7 @@ Global Flags:
     /// alongside it as the cheap first check that reports the sizes.
     #[test]
     fn every_surface_matches_its_whole_text_pin() {
+        assert_surface_tables_are_aligned();
         let mut mismatched: Vec<String> = Vec::new();
         for ((label, root, command, _, _), full) in SURFACES.into_iter().zip(SURFACE_DOCUMENTS) {
             let expected = feature_adjusted_pin(root, full);
@@ -9307,22 +10253,81 @@ Global Flags:
     /// The long flag of one rendered pflag row, if `line` is a row at all:
     /// `--config` for both `  -c, --config string    config file` and
     /// `      --config string         config file`, `None` for a heading, a blank
-    /// line, or a wrapped usage continuation.
+    /// line, a wrapped usage continuation, or cobra's footer.
     ///
     /// The non-panicking sibling of [`split_row`]: rows are indented two spaces
-    /// (a shorthand is printed) or six (it is not), and the grid separates the
-    /// head from the usage text with a run of spaces, so the head is everything
-    /// before the first two-space gap. The long flag is the `--…` word of that
-    /// head, compared as a whole token — which is what keeps `--config` from
-    /// matching `--config-dir`.
+    /// (a shorthand is printed) or six (it is not) and the grid separates the head
+    /// from the usage text with a run of spaces, so the head is everything before
+    /// the first two-space gap. The long flag is the `--…` word of that head,
+    /// compared as a whole token — which is what keeps `--config` from matching
+    /// `--config-dir`.
+    ///
+    /// All three shapes are required, and each is load-bearing: the indent pins
+    /// the row grid (a wrapped continuation is indented to the usage column, far
+    /// past six), the leading `-` rejects `Usage:`/`Available Commands:` rows, and
+    /// the grid gap rejects cobra's footer
+    /// `Use "frps [command] --help" for more information about a command.` — that
+    /// sentence contains `--help` and starts in column zero, so without the indent
+    /// and gap checks it reads as a `--help` row.
     fn row_long_flag(line: &str) -> Option<&str> {
         let start = line.len() - line.trim_start().len();
-        if start > 6 {
+        if start != 2 && start != 6 {
             return None;
         }
         let trimmed = line.trim_start();
-        let head = &trimmed[..trimmed.find("  ").unwrap_or(trimmed.len())];
+        if !trimmed.starts_with('-') {
+            return None;
+        }
+        let gap = trimmed.find("  ")?;
+        let head = &trimmed[..gap];
         head.split_whitespace().find(|word| word.starts_with("--"))
+    }
+
+    /// [`row_long_flag`] is the only reader of the rendered grid, so its three
+    /// shape guards are pinned directly: the 2/6 indent, the leading `-`, and the
+    /// two-space grid gap. Each assertion is a shape that a weaker reader (the
+    /// `start > 6` this replaced, or a `> 60` weakening of it) would misread.
+    #[test]
+    fn row_long_flag_requires_a_row_indent_a_leading_dash_and_a_grid_gap() {
+        assert_eq!(
+            row_long_flag("  -c, --config string    config file of frpc\n"),
+            Some("--config")
+        );
+        assert_eq!(
+            row_long_flag("      --config string         config file of frpc\n"),
+            Some("--config")
+        );
+        // Not a row: too deep (a wrapped usage continuation), too shallow (prose),
+        // no leading dash (a `Usage:`/`Available Commands:` row), no grid gap.
+        assert_eq!(
+            row_long_flag("            --config string         config file\n"),
+            None,
+            "a 12-space indent is a wrapped continuation, not a row"
+        );
+        assert_eq!(row_long_flag("--config string    config file\n"), None);
+        assert_eq!(row_long_flag("  Usage:\n  frpc tcpmux [flags]\n"), None);
+        // The shape the leading-`-` guard rejects *by itself*: a line at a
+        // row-like indent with a two-space grid gap whose head still carries a
+        // `--…` token. The `Usage:` rows above do not red when the guard is
+        // deleted (their head ends before any flag), and neither does the footer
+        // below (column zero already fails the indent guard), so this probe is
+        // what pins the guard.
+        assert_eq!(
+            row_long_flag("  Use \"frps --help\"  for more information about a command.\n"),
+            None,
+            "prose at a row-like indent that mentions a --flag is not a row"
+        );
+        assert_eq!(row_long_flag("  -c, --config=config file\n"), None);
+        // cobra's footer, verbatim from FRPS_DOC/FRPC_DOC: it mentions `--help`
+        // but is not a row, and `strip_pinned_row(doc, "--help")` must not take it.
+        assert_eq!(
+            row_long_flag("Use \"frps [command] --help\" for more information about a command.\n"),
+            None,
+            "cobra's footer is not a flag row"
+        );
+        assert_eq!(row_long_flag("\n"), None);
+        assert_eq!(row_long_flag("Flags:\n"), None);
+        assert_eq!(row_long_flag(""), None);
     }
 
     /// A row is taken by its long-flag **token**, not by prefix, and exactly one
@@ -9339,6 +10344,31 @@ Global Flags:
         assert_eq!(
             strip_pinned_row(document, "--config-dir"),
             "      --config string         config file\n"
+        );
+    }
+
+    /// [`strip_pinned_row`] must **count**, not merely find. The two directions
+    /// fail differently, and only one of them can see the `>= 1` weakening: with
+    /// 0 matches the stronger `assert_eq!(removed, 1)` and the weaker
+    /// `assert!(removed >= 1)` both panic, so the **missing-row** pin catches only
+    /// dropping or inverting the count, while the `>= 1` weakening itself is
+    /// caught by the **duplicated-row** pin (2 matches), where it passes and
+    /// silently strips the row twice. Both directions are pinned as panics.
+    #[test]
+    #[should_panic(expected = "must carry exactly one `--config` row, found 0")]
+    fn strip_pinned_row_panics_on_a_missing_row() {
+        strip_pinned_row(
+            "      --config-dir string     config directory\n",
+            "--config",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must carry exactly one `--config` row, found 2")]
+    fn strip_pinned_row_panics_on_a_duplicated_row() {
+        strip_pinned_row(
+            "      --config string    config file\n      --config string    config file\n",
+            "--config",
         );
     }
 
@@ -9373,6 +10403,14 @@ Global Flags:
     /// shape**. The `frps` half is Go's stdout byte for byte whenever `kcp` and
     /// `quic` are both compiled in (frp-core's default), and Go's document minus
     /// exactly those two rows otherwise.
+    ///
+    /// The assertion that makes the two **oracle texts** falsifiable is the loop
+    /// below: `GO_FRPS_VERIFY` must actually carry both gated rows (or
+    /// `feature_adjusted_pin` would be stripping nothing and the feature-shape path
+    /// would be dead), and `GO_FRPC_VERIFY` must carry neither (or the frpc claim
+    /// would be an unexamined assumption rather than a fact about the data).
+    /// `feature_adjusted_pin` itself is pinned on a synthetic document by
+    /// [`feature_adjusted_pin_strips_exactly_the_rows_this_build_cannot_render`].
     #[test]
     fn verify_documents_match_the_go_oracle_after_the_feature_adjustment() {
         assert_eq!(
@@ -9381,11 +10419,27 @@ Global Flags:
             "frps verify --help must be Go's document, byte for byte, once only the rows \
              this build cannot render are removed"
         );
-        assert_eq!(
-            feature_adjusted_pin(RootCommand::Frpc, GO_FRPC_VERIFY),
-            GO_FRPC_VERIFY,
-            "frpc renders no feature-gated row, so its pin must never be adjusted"
-        );
+        for long in ["--kcp-bind-port", "--quic-bind-port"] {
+            assert!(
+                GO_FRPS_VERIFY
+                    .lines()
+                    .any(|line| row_long_flag(line) == Some(long)),
+                "frps's oracle must carry {long}, or feature_adjusted_pin strips nothing \
+                 and this test never exercises the feature-shape path"
+            );
+            assert!(
+                GO_FRPC_VERIFY
+                    .lines()
+                    .all(|line| row_long_flag(line) != Some(long)),
+                "frpc's oracle must not carry {long}: the frpc path is never adjusted"
+            );
+        }
+        // A former assertion here was `feature_adjusted_pin(Frpc, GO_FRPC_VERIFY) ==
+        // GO_FRPC_VERIFY`. It only restated the helper's first line (`if root !=
+        // RootCommand::Frps { return full.to_owned(); }`) and could not fail. The
+        // contract it was reaching for is pinned on a synthetic document, in every
+        // feature shape, by
+        // `feature_adjusted_pin_strips_exactly_the_rows_this_build_cannot_render`.
         assert_eq!(
             surface_document(RootCommand::Frpc, Some("verify")),
             GO_FRPC_VERIFY,
@@ -9393,8 +10447,47 @@ Global Flags:
         );
     }
 
+    /// `feature_adjusted_pin`'s contract, pinned on a synthetic document so the
+    /// assertion holds in every feature shape: it must drop each feature-gated row
+    /// exactly when that feature is off, must leave every unrelated row alone, and
+    /// must never touch a non-`frps` pin.
+    ///
+    /// This is what replaces the former vacuous identity. With the helper stripping
+    /// a row whose feature is *on* it fails here; in the `kcp`-less / `quic`-less
+    /// shapes (`.github/workflows/ci.yml`'s feature-split lanes) it also fails if the
+    /// helper stops stripping at all — the two mutants the identity could not see.
+    #[test]
+    fn feature_adjusted_pin_strips_exactly_the_rows_this_build_cannot_render() {
+        let synthetic = concat!(
+            "      --kcp-bind-port int          kcp bind port\n",
+            "      --quic-bind-port int         quic bind port\n",
+            "      --other string               untouched\n",
+        );
+        let adjusted = feature_adjusted_pin(RootCommand::Frps, synthetic);
+        for (enabled, long) in [
+            (cfg!(feature = "kcp"), "--kcp-bind-port"),
+            (cfg!(feature = "quic"), "--quic-bind-port"),
+        ] {
+            assert_eq!(
+                adjusted.contains(long),
+                enabled,
+                "feature_adjusted_pin must keep {long} exactly when its feature is on"
+            );
+        }
+        assert!(
+            adjusted.contains("--other"),
+            "feature_adjusted_pin must leave unrelated rows alone"
+        );
+        assert_eq!(
+            feature_adjusted_pin(RootCommand::Frpc, synthetic),
+            synthetic,
+            "frpc renders no feature-gated row, so its pin must never be adjusted"
+        );
+    }
+
     #[test]
     fn every_surface_is_pinned_by_its_byte_count() {
+        assert_surface_tables_are_aligned();
         let mut mismatched: Vec<String> = Vec::new();
         for ((label, root, command, rendered, go), full) in
             SURFACES.into_iter().zip(SURFACE_DOCUMENTS)
@@ -9717,17 +10810,417 @@ Global Flags:
                 }
             }
         }
+        // The whole `frpc tcp` short set, spelled out: Go registers `-i`, `-l`,
+        // `-r`, `-s`, `-P`, `-n` and `-t` on this command, and Go's two proxy
+        // bools (`uc`/`ue`) print no shorthand at all. This is the pin that would
+        // red if a shorthand were dropped, renamed, or attached to the wrong row;
+        // the loop above only checks rows that already print one.
         let tcp = surface_document(RootCommand::Frpc, Some("tcp"));
-        for (head, long, _) in section_rows(&tcp, "Flags:") {
-            if long == "help" {
+        let expected: Vec<(&str, Option<char>)> = vec![
+            ("local-ip", Some('i')),
+            ("local-port", Some('l')),
+            ("proxy-name", Some('n')),
+            ("remote-port", Some('r')),
+            ("server-addr", Some('s')),
+            ("server-port", Some('P')),
+            ("token", Some('t')),
+            ("uc", None),
+            ("ue", None),
+        ];
+        let rendered: Vec<(String, Option<char>)> = section_rows(&tcp, "Flags:")
+            .into_iter()
+            .filter(|(_, long, _)| long != "help")
+            .map(|(head, long, _)| (long, printed_short(&head)))
+            .collect();
+        let expected: Vec<(String, Option<char>)> = expected
+            .into_iter()
+            .map(|(name, short)| (name.to_string(), short))
+            .collect();
+        assert_eq!(
+            rendered, expected,
+            "frpc tcp must render Go's seven shorthanded rows plus the two unshorthanded bools"
+        );
+    }
+
+    /// True when `help_flag_tables` lists `key`'s table for this surface — the
+    /// tables are identified by their first row's `long`, which is unique among
+    /// them (`config-dir`, `log-file`, `admin-addr`, `mux-port`, `allow-users`,
+    /// `--allow-unsafe`'s `allow-unsafe`, …).
+    fn surface_consults(root: RootCommand, command: Option<&str>, key: &str) -> bool {
+        help_flag_tables(root, command)
+            .into_iter()
+            .any(|table| table.first().is_some_and(|row| row.long == key))
+    }
+
+    /// Every row of every **extension** table describes a flag frp-rs implements,
+    /// so it must be rendered by at least one surface that consults that table.
+    ///
+    /// This is what makes the extension tables' data *live*: before it, a bogus
+    /// `GoFlagRow` added to `FRPC_PROXY_EXTENSION_FLAGS` (or `FRPS_EXTENSION_FLAGS`)
+    /// was consulted by no assertion at all, so every test in this module stayed
+    /// green. The Go tables are the opposite case — they carry rows for flags
+    /// frp-rs has no flag for at all, which are deliberately never rendered; those
+    /// live rows are pinned by `the_go_only_proxy_rows_are_exactly_the_recorded_set`.
+    #[test]
+    fn every_extension_table_row_is_rendered_by_a_surface_that_consults_it() {
+        let rendered: Vec<(&str, std::collections::BTreeSet<String>)> = SURFACES
+            .into_iter()
+            .map(|(label, root, command, _, _)| {
+                let longs = surface_document(root, command)
+                    .lines()
+                    .filter_map(row_long_flag)
+                    .map(|long| long.trim_start_matches("--").to_owned())
+                    .collect();
+                (label, longs)
+            })
+            .collect();
+        for table in [
+            FRPS_EXTENSION_FLAGS,
+            FRPC_ROOT_EXTENSION_FLAGS,
+            FRPC_ADMIN_EXTENSION_FLAGS,
+            FRPC_PROXY_EXTENSION_FLAGS,
+        ] {
+            let rows: Vec<&str> = table.iter().map(|row| row.long).collect();
+            let key = rows[0];
+            let labels: Vec<&str> = SURFACES
+                .into_iter()
+                .filter(|(_, root, command, _, _)| surface_consults(*root, *command, key))
+                .map(|(label, ..)| label)
+                .collect();
+            assert!(
+                !labels.is_empty(),
+                "extension table {rows:?} is consulted by no surface in SURFACES"
+            );
+            for row in table {
+                assert!(
+                    SURFACES
+                        .into_iter()
+                        .filter(|(_, root, command, _, _)| surface_consults(*root, *command, key))
+                        .any(|(label, ..)| rendered
+                            .iter()
+                            .find(|(candidate, _)| *candidate == label)
+                            .is_some_and(|(_, longs)| longs.contains(row.long))),
+                    "extension table {rows:?} carries `{}`, but none of the surfaces that \
+                     consult it ({labels:?}) renders that row: the row is unreachable data",
+                    row.long
+                );
+            }
+        }
+    }
+
+    /// The `FRPC_PROXY_GO_FLAGS` rows frp-rs's eight proxies do **not** implement:
+    /// Go v0.71.0's own proxy rows that have no frp-rs flag at all. Nothing renders
+    /// them, so no other assertion in this module is falsified by editing them —
+    /// this explicit set is the only pin on their `long`s.
+    ///
+    /// This is a **union** across the eight surfaces, so on its own it is blind to
+    /// a row that one surface dropped while another still renders it (which is how
+    /// `proxy-name` once counted as implemented via sudp alone). The per-surface
+    /// complement is pinned separately by
+    /// [`every_proxy_surface_renders_exactly_the_go_rows_that_surface_implements`].
+    ///
+    /// RESIDUE: these rows render nothing, so their `long`s are pinned here and
+    /// their `short`/`varname`/`usage` cells by [`GO_ONLY_PROXY_ROW_TEXT`].
+    /// Without that table they were the "inert pin data" class: `SURFACES`
+    /// carries only Go's *byte count*, not its text, so re-wording a row's
+    /// hand-transcribed help left every test green. Every *rendered* row's text,
+    /// by contrast, is pinned byte for byte by the `FRPC_*_DOC` whole-text
+    /// constants.
+    const GO_ONLY_PROXY_ROWS: [&str; 14] = [
+        "allow-users",
+        "annotations",
+        "bandwidth-limit",
+        "bandwidth-limit-mode",
+        "client-id",
+        "disable-log-color",
+        "dns-server",
+        "log-file",
+        "log-level",
+        "log-max-days",
+        "metadatas",
+        "protocol",
+        "tls-enable",
+        "user",
+    ];
+
+    /// The byte-exact witness for the [`FRPC_PROXY_GO_FLAGS`] rows frp-rs never
+    /// renders ([`GO_ONLY_PROXY_ROWS`]) — `(long, short, varname, usage)`, in the
+    /// table's own pflag byte order.
+    ///
+    /// These cells are hand-transcribed Go v0.71.0 help text that no other
+    /// assertion reads, so this table is their only witness: it freezes the
+    /// transcription, making a change deliberate and reviewable against the Go
+    /// binary instead of a silent drift. It is *not* a parity oracle — the Go
+    /// binary stays out of the build — so a wrong transcription is preserved
+    /// here until it is re-measured.
+    const GO_ONLY_PROXY_ROW_TEXT: [(&str, Option<char>, Option<&str>, &str); 14] = [
+        ("allow-users", None, Some("strings"), "allow visitor users"),
+        (
+            "annotations",
+            None,
+            Some("stringToString"),
+            "annotation key-value pairs (e.g., key1=value1,key2=value2) (default [])",
+        ),
+        (
+            "bandwidth-limit",
+            None,
+            Some("string"),
+            "bandwidth limit (e.g. 100KB or 1MB)",
+        ),
+        (
+            "bandwidth-limit-mode",
+            None,
+            Some("string"),
+            "bandwidth limit mode (default \"client\")",
+        ),
+        (
+            "client-id",
+            None,
+            Some("string"),
+            "unique identifier for this frpc instance",
+        ),
+        (
+            "disable-log-color",
+            None,
+            None,
+            "disable log color in console",
+        ),
+        (
+            "dns-server",
+            None,
+            Some("string"),
+            "specify dns server instead of using system default one",
+        ),
+        (
+            "log-file",
+            None,
+            Some("string"),
+            "console or file path (default \"console\")",
+        ),
+        (
+            "log-level",
+            None,
+            Some("string"),
+            "log level (default \"info\")",
+        ),
+        (
+            "log-max-days",
+            None,
+            Some("int"),
+            "log file reversed days (default 3)",
+        ),
+        (
+            "metadatas",
+            None,
+            Some("stringToString"),
+            "metadata key-value pairs (e.g., key1=value1,key2=value2) (default [])",
+        ),
+        (
+            "protocol",
+            Some('p'),
+            Some("string"),
+            "optional values are [tcp kcp quic websocket wss] (default \"tcp\")",
+        ),
+        ("tls-enable", None, None, "enable frpc tls (default true)"),
+        ("user", Some('u'), Some("string"), "user"),
+    ];
+
+    #[test]
+    fn the_go_only_proxy_rows_are_exactly_the_recorded_set() {
+        let mut rendered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (_, root, command, _, _) in SURFACES {
+            if !surface_consults(root, command, "allow-users") {
                 continue;
             }
-            let expected = if long == "token" { Some('t') } else { None };
-            assert_eq!(
-                printed_short(&head),
-                expected,
-                "frpc tcp --{long}: frp-rs implements no Go shorthand for it"
-            );
+            for line in surface_document(root, command).lines() {
+                if let Some(long) = row_long_flag(line) {
+                    rendered.insert(long.trim_start_matches("--").to_owned());
+                }
+            }
         }
+        let unrendered: Vec<&str> = FRPC_PROXY_GO_FLAGS
+            .iter()
+            .map(|row| row.long)
+            .filter(|long| !rendered.contains(*long))
+            .collect();
+        assert_eq!(
+            unrendered,
+            GO_ONLY_PROXY_ROWS.to_vec(),
+            "the set of Go proxy rows frp-rs never renders changed: a row that became \
+             implemented must be dropped from `GO_ONLY_PROXY_ROWS` (and its doc pins \
+             regenerated), and a newly recorded Go row must appear in both"
+        );
+    }
+
+    #[test]
+    fn the_go_only_proxy_rows_carry_their_recorded_help_text() {
+        let actual: Vec<(&str, Option<char>, Option<&str>, &str)> = FRPC_PROXY_GO_FLAGS
+            .iter()
+            .filter(|row| GO_ONLY_PROXY_ROWS.contains(&row.long))
+            .map(|row| (row.long, row.short, row.varname, row.usage))
+            .collect();
+        assert_eq!(
+            actual,
+            GO_ONLY_PROXY_ROW_TEXT.to_vec(),
+            "an unrendered Go proxy row's recorded help text changed: these cells are \
+             never rendered, so `GO_ONLY_PROXY_ROW_TEXT` is their only witness — \
+             re-transcribe the row from Go v0.71.0 instead of editing the witness"
+        );
+    }
+
+    /// The `FRPC_PROXY_GO_FLAGS` rows every one of frp-rs's eight proxy commands
+    /// renders, with Go's shorthand for each.
+    ///
+    /// `help_flag_tables` hands all eight surfaces the same 32-row union, and
+    /// `go_flag_row` takes the first match, so a surface can pick up another
+    /// surface's row — including its **shorthand**. That is how `.short('r')` on
+    /// sudp's long-only `--remote-port` passed every other test in this module:
+    /// the union lookup returned Go's tcp/udp row, whose `short` is `Some('r')`,
+    /// and the loop in
+    /// [`parser_shorthands_agree_with_go_where_the_parser_has_one`] only compares
+    /// what that lookup returns. This per-surface pin compares each surface
+    /// against Go's set for **that surface**, longs *and* shorthands, so it reds
+    /// when a surface starts rendering a Go row it does not implement, drops one
+    /// it does, or prints a shorthand that belongs to a different surface's row.
+    /// One Go row as frp-rs renders it: the long name and the shorthand the
+    /// surface actually prints (`None` when Go's own row carries no shorthand).
+    type GoRowPin = (&'static str, Option<char>);
+
+    const GO_PROXY_ROWS_UNIVERSAL: [GoRowPin; 8] = [
+        ("local-ip", Some('i')),
+        ("local-port", Some('l')),
+        ("proxy-name", Some('n')),
+        ("server-addr", Some('s')),
+        ("server-port", Some('P')),
+        ("token", Some('t')),
+        ("uc", None),
+        ("ue", None),
+    ];
+
+    /// Measured from the Go v0.71.0 binary: `frpc <surface> --help` renders the
+    /// eight universal rows above on every proxy command, plus these. Go binds more
+    /// than this on each surface (that is `GO_ONLY_PROXY_ROWS`); this is the part
+    /// frp-rs implements. Sudp's `remote-port` is the one deliberate divergence:
+    /// Go registers the row on tcp/udp only, and frp-rs keeps the long form on sudp
+    /// as an extension, so the shorthand is `None` there where tcp/udp print `-r`.
+    const GO_PROXY_ROWS_PER_SURFACE: [(&str, &[GoRowPin]); 8] = [
+        ("frpc tcp", &[("remote-port", Some('r'))]),
+        ("frpc udp", &[("remote-port", Some('r'))]),
+        (
+            "frpc http",
+            &[
+                ("custom-domain", Some('d')),
+                ("host-header-rewrite", None),
+                ("http-pwd", None),
+                ("http-user", None),
+                ("locations", None),
+                ("sd", None),
+            ],
+        ),
+        ("frpc https", &[("custom-domain", Some('d')), ("sd", None)]),
+        ("frpc stcp", &[("sk", None), ("tls-server-name", None)]),
+        ("frpc xtcp", &[("sk", None), ("tls-server-name", None)]),
+        ("frpc sudp", &[("remote-port", None), ("sk", None)]),
+        (
+            "frpc tcpmux",
+            &[("custom-domain", Some('d')), ("mux", None), ("sd", None)],
+        ),
+    ];
+
+    #[test]
+    fn every_proxy_surface_renders_exactly_the_go_rows_that_surface_implements() {
+        let go_longs: std::collections::BTreeSet<&str> =
+            FRPC_PROXY_GO_FLAGS.iter().map(|row| row.long).collect();
+        for (label, extras) in GO_PROXY_ROWS_PER_SURFACE {
+            let (_, root, command, _, _) = SURFACES
+                .into_iter()
+                .find(|(candidate, ..)| *candidate == label)
+                .unwrap_or_else(|| panic!("`{label}` names no SURFACES row"));
+            let mut expected: std::collections::BTreeMap<&str, Option<char>> =
+                GO_PROXY_ROWS_UNIVERSAL.into_iter().collect();
+            for (long, short) in extras {
+                assert!(
+                    go_longs.contains(long),
+                    "`{label}`'s expected row `{long}` is not a Go proxy row at all"
+                );
+                assert!(
+                    expected.insert(long, *short).is_none(),
+                    "`{label}` records `{long}` twice"
+                );
+            }
+            let rendered: Vec<(String, Option<char>)> =
+                section_rows(&surface_document(root, command), "Flags:")
+                    .into_iter()
+                    .filter(|(_, long, _)| long != "help")
+                    .map(|(head, long, _)| (long, printed_short(&head)))
+                    .collect();
+            let actual_longs: std::collections::BTreeSet<&str> = rendered
+                .iter()
+                .map(|(long, _)| long.as_str())
+                .filter(|long| go_longs.contains(long))
+                .collect();
+            let expected_longs: std::collections::BTreeSet<&str> =
+                expected.keys().copied().collect();
+            assert_eq!(
+                actual_longs, expected_longs,
+                "`{label}` must render exactly Go's own rows for that surface: Go registers \
+                 them all, and every one frp-rs implements must print (a row Go has on this \
+                 surface but frp-rs does not implement, or vice versa, shows up here)"
+            );
+            for (long, short) in &rendered {
+                if let Some(expected_short) = expected.get(long.as_str()) {
+                    assert_eq!(
+                        short, expected_short,
+                        "`{label}` must print Go's own shorthand for `--{long}` on this \
+                         surface ({expected_short:?}), not another surface row's shorthand"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The two `SURFACES` columns no other assertion reads: the `label` (used only
+    /// in failure messages) and the Go byte count (read only by
+    /// `every_surface_is_pinned_by_its_byte_count`'s message). Both are derived, so
+    /// they are re-derived here — a label must name its own root/command, and the
+    /// two `verify` rows' Go column must be the byte length of the Go oracle
+    /// constant that duplicates it.
+    ///
+    /// RESIDUE: the other thirteen Go byte counts were measured from the real Go
+    /// binary in one session; `go-frp` is not a build dependency, so no in-tree
+    /// artifact can re-measure them. They stay hand-transcribed documentation.
+    #[test]
+    fn surface_labels_and_the_verify_go_byte_counts_are_derived() {
+        for (label, root, command, _, go) in SURFACES {
+            let expected = match (root, command) {
+                (RootCommand::Frps, None) => "frps".to_owned(),
+                (RootCommand::Frps, Some(name)) => format!("frps {name}"),
+                (RootCommand::Frpc, None) => "frpc".to_owned(),
+                (RootCommand::Frpc, Some(name)) => format!("frpc {name}"),
+            };
+            assert_eq!(
+                label,
+                expected.as_str(),
+                "the SURFACES label must name its own surface"
+            );
+            let oracle = match (root, command) {
+                (RootCommand::Frps, Some("verify")) => Some(GO_FRPS_VERIFY),
+                (RootCommand::Frpc, Some("verify")) => Some(GO_FRPC_VERIFY),
+                _ => None,
+            };
+            if let Some(oracle) = oracle {
+                assert_eq!(
+                    go,
+                    oracle.len(),
+                    "{label}'s Go column must be the byte length of the Go oracle it duplicates"
+                );
+            }
+            assert!(go > 0, "{label} must carry a measured Go byte count");
+        }
+        let mut labels: Vec<&str> = SURFACES.into_iter().map(|(label, ..)| label).collect();
+        let count = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), count, "every SURFACES label must be unique");
     }
 }
