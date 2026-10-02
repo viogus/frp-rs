@@ -2369,12 +2369,12 @@ That row has since **changed** with the strict-mode array recursion
 `proxies[0].RemotePort`), because `check_strict` walks the
 `[[proxies]]`/`[[visitors]]`/`[[httpPlugins]]` elements with one exact-match key
 set per **struct** (`PROXY_KNOWN_KEYS` and friends in
-`frp-core/src/config/strict.rs:248`). Non-strict mode still drops the keys
+`frp-core/src/config/strict.rs:270`). Non-strict mode still drops the keys
 (rc 0, `remote_port: 0`, `local_port: 80`).
 
 - **Strict mode does not refuse everywhere: it walks only the tables it has a
   key list for.** `section_known_keys`
-  (`frp-core/src/config/strict.rs:474`) has nine arms, plus the top level
+  (`frp-core/src/config/strict.rs:496`) has nine arms, plus the top level
   `check_strict` is entered with and, since the array recursion, the proxy /
   visitor / client-plugin / visitor-plugin / http-plugin element sets. Each
   walked position is listed here with a capitalised key measured as refused at
