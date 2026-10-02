@@ -8451,7 +8451,7 @@ section; ledger now **24 open / 104 closed**.**
   is counted too), or the double read is documented as deliberate with the measured rows and the
   reason it cannot be de-duplicated.
 - [x] **The restored `tokenSource` re-arm oracle cannot see a wrong-but-fast backoff, and the NewWorkConn token path is uncovered.**
-  **Done (2026-10-02, at fix `cd0f92ab` on `fix/tokensource-rearm-oracle`, PR #449, based on `01fb93e3`; rebased from `18bcd1ad`, earlier `366bbcaa`, originally `f881d15e` — the code commit is `=` under `git range-diff` at each rebase).** Both
+  **Done (2026-10-02, at fix `cd0f92ab` on `fix/tokensource-rearm-oracle`, PR #449, based on `fed87034` after the #454 merge; rebased from `01fb93e3`, `18bcd1ad`, earlier `366bbcaa`, originally `f881d15e` — the code commit is `=` under `git range-diff` at each rebase).** Both
   oracles now read one constant: `PING_FIRST_BACKOFF` (`frp-client/src/service.rs:712`,
   `pub const PING_FIRST_BACKOFF: Duration = Duration::from_secs(2)`) is what `next_ping_backoff` returns for
   `prev == None` (`frp-client/src/service.rs:730`), and the e2e oracle derives its window from it —
@@ -8484,7 +8484,7 @@ section; ledger now **24 open / 104 closed**.**
   covers an in-band call-site literal at all; that gap is one residue with the progression bypass, filed as
   its own item below: the oracle observes only the
   FIRST consecutive failure, so returning the constant instead of the progression survives. Ledger after
-  this close: **15 open / 190 closed** (base `01fb93e3`: 14 open / 189 closed; this close is the -1 and the
+  this close: **16 open / 190 closed** (base `fed87034`: 15 open / 189 closed; this close is the -1 and the
   two items filed below are the +2).
 
   Filed from the round-2 adversarial review of `fix/tokensource-single-exec` (the item above).
@@ -9220,7 +9220,7 @@ section; ledger now **24 open / 104 closed**.**
   **15 open / 186 closed** (base `e4c23b2f`: 16 open / 185 closed).
 
 - [ ] **`scripts/remote-frps.sh` still sweeps by argument pattern on the remote host.**
-  Filed by the coordinator while closing `TODO.md:8493` (PR #430), which removed the two local `pkill -f`
+  Filed by the coordinator while closing `TODO.md:8533` (PR #430), which removed the two local `pkill -f`
   calls in `scripts/compat-test.sh`: `scripts/remote-frps.sh:195` and `:339` still run
   `pkill -f 'frps -c frps.toml'` and `:409` uses `pgrep -f` on the same text, over ssh, to manage the
   comparison server on a remote VPS. Name-plus-argument is the same hazard the local sweep just lost — a
