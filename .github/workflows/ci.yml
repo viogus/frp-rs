@@ -1908,11 +1908,12 @@ jobs:
         # the whole lib target, with the listed and passed counts pinned exactly
         # so a test that is silently made conditional cannot shrink it.
         #
-        # The literal is the pre-existing list plus the two rows this change
-        # added (`service::tests::dashboard_port_overlay_record_follows_this_builds_reader`
-        # here, and its `frp-core` twins in that crate's own lane). It is a count,
-        # not a floor: a lower floor would let the shape quietly lose a test,
-        # which is the failure mode this step exists to close.
+        # The literal is the pre-existing list plus the one row this change added
+        # in this crate (`service::tests::dashboard_port_overlay_record_follows_this_builds_reader`):
+        # this lane went 362 at the base (361 passed + 1 failed) to 363, and the
+        # other two new tests live in `frp-core`'s and `frps`'s own lanes. It is a
+        # count, not a floor: a lower floor would let the shape quietly lose a
+        # test, which is the failure mode this step exists to close.
         shell: bash
         run: |
           set -eo pipefail
