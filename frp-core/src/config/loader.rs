@@ -403,7 +403,7 @@ impl ListenerPortReader {
 /// record, and the `kcp_bind_port` file key is silent for the same reason (the
 /// asymmetry `restart_only.rs` describes for the *field* is this one on the
 /// *flag* side). No lane builds an `frps` binary in that combination — only
-/// `frp-server`'s own `--all-targets` test build reaches it, through the
+/// `frp-server`'s own `--all-targets` build reaches it, through the
 /// `frp-client` dev-dependency — so it is the one gap this struct does not
 /// close.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
