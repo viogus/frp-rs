@@ -1400,7 +1400,7 @@ jobs:
           fi
           echo "TODO.md citation gate fixtures ok: 60 checks hold, all 11 red-path canaries live"
       - name: A/B gate — measurable-delta classifier + verdict fixture checks
-        # TODO.md:10569 ("The A/B throughput gate fires on changes with no
+        # TODO.md:10581 ("The A/B throughput gate fires on changes with no
         # runtime code, so a red gate on `main` is not evidence of a
         # regression"). This step pins the suite that guards the delta
         # classifier and the gate arithmetic, AND the three files that suite
@@ -1454,13 +1454,13 @@ jobs:
           # run (review round 3, F3).
           unset AB_MD_CLASSIFIER AB_MD_MATRIX AB_MD_REMOTE AB_MD_SABOTAGE_CHILD
           guard_file=scripts/tests/ab-measurable-delta.sh
-          guard_pin=e5984ca968c369a126ac4c8ed53a8978aa1cfec7359291b694c1279494187e59
+          guard_pin=b0fcd4d59b1b33cb855fd1a73da718506d167c1f3d8edba9c22f0b546b0bb7c0
           guard_exact=53
           guard_floor=53
           guard_cls=scripts/ab-measurable-delta.sh
-          guard_cls_pin=02550abd49dd3d772bbe076046a710687d3cb4b72a11daaa14e55c88db0b174a
+          guard_cls_pin=dd6e97f7260de532f797a62ea0b7be8c58fd44c2b7d1c71f09db027b9887586a
           guard_matrix=scripts/ab-matrix.sh
-          guard_matrix_pin=df4199b02cc64b6d903b03c0d2bf77c6d69546e24946cf4157a4b2eef0ee4139
+          guard_matrix_pin=3c1027446ad083cd7914ff89406aad6149b14517e130dded38a725563b128b04
           guard_remote=scripts/ab-remote.sh
           guard_remote_pin=6a1ba8c695f9f984e39d28b9decea3b53271f881d25c49726fe06930d5c2559c
           # Every hashed subject must actually be verified, and it must be the
@@ -1659,7 +1659,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=6a2a31645a3270e68b906cefa5ab7ad68401a709b4f9cabdc78b78ee7b3faa02
+          guard_data_pin=cd7a499d4d66660db4945c6fc67f2678b09a29e29138692214aa5d889aaef2b3
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'

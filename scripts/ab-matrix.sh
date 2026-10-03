@@ -7,7 +7,7 @@
 # delta over GATE_PCT (default 5%).
 #
 # =============================================================================
-# THE GATE IS INFORMATIONAL (TODO.md:10569) — this is a decision, not an
+# THE GATE IS INFORMATIONAL (TODO.md:10581) — this is a decision, not an
 # accident, and this header carries the numbers it rests on.
 #
 # A >GATE_PCT delta prints the table and an annotation and exits 0, with the
@@ -139,7 +139,7 @@ above_gate() {  # $1 = delta %, exit 0 when it regresses by more than GATE_PCT
 # VERDICT is REGRESSED or pass. The value is the MEDIAN of every delta sample
 # actually taken, never the minimum: the confirm loop below decides whether to
 # take another shot, but it must not be able to select a sample to publish.
-# (TODO.md:10569 — the old code replaced `delta` with any *more negative*
+# (TODO.md:10581 — the old code replaced `delta` with any *more negative*
 # re-measurement and published that, so a single noisy shot became "the"
 # regression.)
 gate_verdict() {  # gate_verdict <delta-sample>...
@@ -171,7 +171,7 @@ gate_report() {  # gate_report <label> <v_a> <v_b> <median> <samples> <verdict>
   if [[ "$verdict" == "REGRESSED" ]]; then
     FAIL=1
     GATE_FAIL_TEXT="${GATE_FAIL_TEXT}${label} ${v_a} -> ${v_b} (${median}%, median of ${samples} sample(s))"$'\n'
-    echo "::warning::A/B throughput ${label} regressed ${median}% (> ${GATE_PCT}% gate; median of ${samples} same-pair sample(s)). The gate is informational by default (TODO.md:10569); set AB_GATE_ENFORCE=1 to make a regression fail the run."
+    echo "::warning::A/B throughput ${label} regressed ${median}% (> ${GATE_PCT}% gate; median of ${samples} same-pair sample(s)). The gate is informational by default (TODO.md:10581); set AB_GATE_ENFORCE=1 to make a regression fail the run."
   fi
 }
 
@@ -444,7 +444,7 @@ except Exception: sys.exit(1)
 # the source-only guard, so gate_report is self-contained under the test seam.
 printf '%-18s %9s %9s %8s   %s\n' "config" "before" "after" "delta%" "result"
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-  printf '### A/B throughput gate (informational, TODO.md:10569)\n\n' >> "$GITHUB_STEP_SUMMARY"
+  printf '### A/B throughput gate (informational, TODO.md:10581)\n\n' >> "$GITHUB_STEP_SUMMARY"
   printf '| config | before | after | delta%% | result |\n|---|---|---|---|---|\n' >> "$GITHUB_STEP_SUMMARY"
 fi
 #            label            mux   enc   comp  tls
