@@ -50,8 +50,8 @@ fn bin() -> String {
 }
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The child's own **progress witness**: the SIGUSR1 task logs this line after
-/// its `tokio::signal::unix::signal` call returns (`frps/src/main.rs:566`/`:913`
-/// in the `--config-dir` lane, `:1123`/`:1125` on `-c`),
+/// its `tokio::signal::unix::signal` call returns (`frps/src/main.rs:568`/`:921`
+/// in the `--config-dir` lane, `:1135`/`:1137` on `-c`),
 /// which a `frps` that is still pre-init cannot have printed. It is *not* proof
 /// that SIGTERM's handler is installed — tokio registers signals per kind and
 /// lazily (`tokio-1.53.1/src/signal/unix.rs:283-300`), so the SIGTERM
@@ -562,7 +562,7 @@ fn oidc_without_an_issuer_is_refused_with_3_where_go_panics() {
 ///
 /// 1. *The install race.* `Service::run` spawns the SIGTERM task from the same
 ///    async fn that later runs the accept loop
-///    (`frp-server/src/service.rs:1107-1139`), so the listener can be accepting
+///    (`frp-server/src/service.rs:1156-1188`), so the listener can be accepting
 ///    before that task has been polled even once — and then SIGTERM takes the
 ///    default disposition.
 /// 2. *The foreign-listener false witness.* `ephemeral_port()` binds a port and
@@ -585,8 +585,8 @@ fn oidc_without_an_issuer_is_refused_with_3_where_go_panics() {
 ///
 /// So the barrier is a **child-specific progress witness**: the SIGUSR1 task
 /// logs `SIGUSR1 reload ready` after its `tokio::signal::unix::signal` call
-/// returns (`frps/src/main.rs:566` installs the handler, `frps/src/main.rs:913`
-/// logs the marker; the `-c` lane's twin is `frps/src/main.rs:1123`/`:1125`),
+/// returns (`frps/src/main.rs:568` installs the handler, `frps/src/main.rs:921`
+/// logs the marker; the `-c` lane's twin is `frps/src/main.rs:1135`/`:1137`),
 /// i.e. only after that `frps` is past its
 /// own startup logging. A foreign listener cannot fake it — only the child under
 /// test writes to that log path. If the line never appears (a platform without
@@ -1095,7 +1095,7 @@ fn sigterm_inside_the_registration_window(
 /// handoff) and the child dies by signal inside the hold, failing both.
 #[cfg(unix)]
 // The `FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS` pin this drives is
-// `#[cfg(debug_assertions)]` (`frps/src/main.rs:691`), so a release binary
+// `#[cfg(debug_assertions)]` (`frps/src/main.rs:699`), so a release binary
 // ignores it and the child outlives the SIGTERM hold the test needs. `ignore`
 // (not `#[cfg]`) keeps the test compiled and *counted* in release: the
 // `release-tests` lane in `.github/workflows/ci.yml` asserts the exact
@@ -1105,7 +1105,7 @@ fn sigterm_inside_the_registration_window(
 // tests-unit lane's `FRPS_CLI_TESTS` count.
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS hook (frps/src/main.rs:691)"
+    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS hook (frps/src/main.rs:699)"
 )]
 #[test]
 fn config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorded_request() {
@@ -1151,7 +1151,7 @@ fn config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorde
 /// The interval where that matters is narrow. From the moment
 /// `early_shutdown.watch(...)` puts a service into the fan-out list until
 /// `Service::run` installs the service's own `SIGTERM` handler
-/// (`frp-server/src/service.rs:1396-1423`), only the recorder can cancel that
+/// (`frp-server/src/service.rs:1445-1472`), only the recorder can cancel that
 /// token. The debug-only post-registration hold
 /// (`FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS=30_000` with
 /// `..._DELAY_FILES=a.toml`) parks `a.toml`'s task inside exactly that interval
@@ -1182,13 +1182,13 @@ fn config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorde
 #[cfg(unix)]
 // Same release skip as the sibling above: this pin additionally drives
 // `FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS`
-// (`#[cfg(all(unix, debug_assertions))]`, `frps/src/main.rs:768`), so in a
+// (`#[cfg(all(unix, debug_assertions))]`, `frps/src/main.rs:776`), so in a
 // release binary the fan-out service never reaches its hold and the run has
 // nothing to observe. The `release-tests` lane's expected ignored-name set is
 // what keeps this skip from spreading to tests that *can* run in release.
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS / FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS hooks (frps/src/main.rs:691,768)"
+    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS / FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS hooks (frps/src/main.rs:699,:776)"
 )]
 #[test]
 fn config_dir_recorded_signal_fans_out_to_an_already_registered_service() {
@@ -1588,14 +1588,14 @@ fn config_dir_refuses_an_empty_directory_with_2() {
 /// config itself: the task panics before `Service::run`, so no listener starts;
 /// the point is that the lane cannot report success with nothing served.
 // The `FRPS_CFGDIR_TEST_PANIC` pin this drives is `#[cfg(debug_assertions)]`
-// (`frps/src/main.rs:812`), so in a release binary the task panics at the
+// (`frps/src/main.rs:820`), so in a release binary the task panics at the
 // ordinary startup path (or not at all) and the exit code this test asserts is
 // not the code under test. The `release-tests` lane asserts that exactly these
 // three names are ignored in release; an unconditional `#[ignore]` produces the
 // same release output and is caught by the tests-unit lane's count instead.
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_PANIC hook (frps/src/main.rs:812)"
+    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_PANIC hook (frps/src/main.rs:820)"
 )]
 #[test]
 fn config_dir_where_every_task_panics_exits_nonzero() {
@@ -1886,7 +1886,7 @@ fn version_short_shorthand_clusters_and_equals_spelling_match_go() {
 /// consumed `=false` but stored `true` would still pass this test. The value
 /// actually being applied is pinned in
 /// `disable_log_color_value_spelling_is_applied`, whose flag *is* read from the
-/// CLI (`frps/src/main.rs:472`).
+/// CLI (`frps/src/main.rs:474`).
 #[test]
 fn tls_only_false_value_starts_and_listens() {
     let port = ephemeral_port();
@@ -1928,7 +1928,7 @@ fn vhost_http_timeout_flag_starts_and_listens() {
 /// carries. `--disable-log-color` is the observable one: the frps log
 /// initialiser reads it straight off the CLI
 /// (`logging::resolve_ansi(!disable)` → `with_ansi(ansi)`,
-/// `frps/src/main.rs:472`), so the child's own output shows which value won.
+/// `frps/src/main.rs:474`), so the child's own output shows which value won.
 ///
 /// Measured at this head with a valid config and a bounded runner, on the
 /// `ESC [` sequences in the child's combined output:

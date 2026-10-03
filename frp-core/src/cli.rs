@@ -751,8 +751,8 @@ fn svr_config() -> impl Parser<Option<String>> {
 /// [`FrpsRootSlots`].
 ///
 /// **R6(a) (`TODO.md:9902`): this lane does not read the loaded config's `[log]`
-/// section.** `init_logging(&cli, None)` (`frps/src/main.rs:524`) runs before
-/// `collect_config_files` (`frps/src/main.rs:540`), so the effective log level
+/// section.** `init_logging(&cli, None)` (`frps/src/main.rs:526`) runs before
+/// `collect_config_files` (`frps/src/main.rs:542`), so the effective log level
 /// comes from the flags alone. Measured over a config dir whose `frps.toml`
 /// writes `[log] level = "warn"`: `frps --config-dir cfg` and
 /// `frps --config-dir cfg --log-level ""` both log at `info` (11 `INFO` records,
@@ -5109,12 +5109,16 @@ impl FrpsArgs {
     /// Go's `util.EmptyOr` zero value and each would otherwise be filled by
     /// `LogConfig::complete` before the resolver saw it; see the log arms below.
     ///
-    /// Returns the reader-gated **listener ports** it applied, because the
+    /// Returns the listener **ports** it applied, because the
     /// overlay runs after the load that records the file's own port requests, so
     /// only the caller can merge the two into one [`ConfigPresence`]. `frps`
     /// hands the result to
     /// [`ConfigPresence::record_applied_reader_gated_ports`]; a **zero** port
-    /// counts as not supplied, matching `sub_port_requested` on the file path.
+    /// counts as not supplied, matching `port_requested` / `sub_port_requested`
+    /// on the file path. `web_server.port` is joined there by `kcp_bind_port`
+    /// and `quic_bind_port`, the two `frp-core`-gated ports this overlay can
+    /// write; the ports with no CLI flag (`ssh_tunnel_gateway.bind_port`,
+    /// `websocket_port`) have no overlay half.
     ///
     /// [`ConfigPresence`]: crate::config::ConfigPresence
     /// [`ConfigPresence::record_applied_reader_gated_ports`]:
@@ -5176,13 +5180,26 @@ impl FrpsArgs {
         }
 
         // Transport / ports
+        //
+        // The two feature-gated bind ports are also **recorded** here, like
+        // `web_server.port` below: this overlay runs after the load that records
+        // the file's own request, so the write is a second source of the same
+        // request and has to be merged back into `ConfigPresence`
+        // (`record_applied_reader_gated_ports`). Without it
+        // `frps --kcp-bind-port 7100` (no `-c`/`--config-dir`) in a build whose
+        // listener is compiled out binds nothing and says nothing, while the
+        // identical `kcp_bind_port = 7100` in a file warns. A zero port is "not
+        // supplied" on the file path too (`port_requested`), so it is not
+        // reported.
         #[cfg(feature = "kcp")]
         if let Some(v) = self.kcp_bind_port {
             cfg.kcp_bind_port = v;
+            applied.kcp_bind_port = v != 0;
         }
         #[cfg(feature = "quic")]
         if let Some(v) = self.quic_bind_port {
             cfg.quic_bind_port = v;
+            applied.quic_bind_port = v != 0;
         }
         if let Some(v) = self.vhost_http_port {
             cfg.vhost_http_port = v;
@@ -5883,6 +5900,7 @@ mod tests {
         let mut presence = ConfigPresence::default();
         presence.record_applied_reader_gated_ports(AppliedReaderGatedPorts {
             web_server_port: true,
+            ..Default::default()
         });
         assert_eq!(
             presence.unhonoured_reader_gated_port_records(
@@ -5913,6 +5931,139 @@ mod tests {
                 .is_empty(),
             "recording nothing must add nothing"
         );
+    }
+
+    /// The `--kcp-bind-port` twin of
+    /// [`dashboard_port_override_reports_the_reader_gated_request`]: the overlay
+    /// writes `kcp_bind_port` **and** reports the request, and the zero value is
+    /// not a request. Without the report,
+    /// `frps --kcp-bind-port 7100` (no `-c`) in the hand-named shape
+    /// (`tiny,frp-core/kcp`, where this crate has the flag but `frp-server` has
+    /// no listener) binds nothing and says nothing.
+    #[cfg(feature = "kcp")]
+    #[test]
+    fn kcp_bind_port_override_reports_the_reader_gated_request() {
+        for spelling in ["--kcp-bind-port", "--kcp_bind_port"] {
+            let mut cfg = crate::config::ServerConfig::default();
+            let applied = parse_frps(&[spelling, "7100"])
+                .unwrap()
+                .override_server_config(&mut cfg);
+            assert_eq!(
+                cfg.kcp_bind_port, 7100,
+                "`{spelling}` must reach the config"
+            );
+            assert!(
+                applied.kcp_bind_port,
+                "a non-zero `{spelling}` is an applied listener port"
+            );
+        }
+
+        let mut cfg = crate::config::ServerConfig::default();
+        let applied = parse_frps(&["--kcp-bind-port", "0"])
+            .unwrap()
+            .override_server_config(&mut cfg);
+        assert_eq!(cfg.kcp_bind_port, 0);
+        assert!(
+            !applied.kcp_bind_port,
+            "`--kcp-bind-port 0` is Go's zero value, exactly like `kcp_bind_port = 0` \
+             in a file: it requests no listener, so it must not warn"
+        );
+
+        let mut cfg = crate::config::ServerConfig::default();
+        let applied = parse_frps(&[]).unwrap().override_server_config(&mut cfg);
+        assert_eq!(cfg.kcp_bind_port, 0);
+        assert!(!applied.kcp_bind_port, "no flag at all is not a request");
+    }
+
+    /// The `--quic-bind-port` twin of
+    /// [`kcp_bind_port_override_reports_the_reader_gated_request`].
+    #[cfg(feature = "quic")]
+    #[test]
+    fn quic_bind_port_override_reports_the_reader_gated_request() {
+        for spelling in ["--quic-bind-port", "--quic_bind_port"] {
+            let mut cfg = crate::config::ServerConfig::default();
+            let applied = parse_frps(&[spelling, "7200"])
+                .unwrap()
+                .override_server_config(&mut cfg);
+            assert_eq!(
+                cfg.quic_bind_port, 7200,
+                "`{spelling}` must reach the config"
+            );
+            assert!(
+                applied.quic_bind_port,
+                "a non-zero `{spelling}` is an applied listener port"
+            );
+        }
+
+        let mut cfg = crate::config::ServerConfig::default();
+        let applied = parse_frps(&["--quic-bind-port", "0"])
+            .unwrap()
+            .override_server_config(&mut cfg);
+        assert_eq!(cfg.quic_bind_port, 0);
+        assert!(
+            !applied.quic_bind_port,
+            "`--quic-bind-port 0` is Go's zero value, exactly like `quic_bind_port = 0` \
+             in a file: it requests no listener, so it must not warn"
+        );
+
+        let mut cfg = crate::config::ServerConfig::default();
+        let applied = parse_frps(&[]).unwrap().override_server_config(&mut cfg);
+        assert_eq!(cfg.quic_bind_port, 0);
+        assert!(!applied.quic_bind_port, "no flag at all is not a request");
+    }
+
+    /// The `frp-core`-gated half of the overlay merge, the counterpart of
+    /// [`recorded_overlay_port_warns_only_when_the_reader_is_absent`]: an
+    /// overlay-applied `kcp_bind_port` / `quic_bind_port` becomes the same record
+    /// as the file key, and only when the caller reports no listener for it.
+    ///
+    /// `websocket_port` is deliberately absent: there is no
+    /// `--websocket-port` flag, so it has no overlay half and
+    /// `AppliedReaderGatedPorts` carries no field for it.
+    #[cfg(all(feature = "kcp", feature = "quic"))]
+    #[test]
+    fn recorded_overlay_gated_ports_warn_only_when_the_reader_is_absent() {
+        use crate::config::{
+            AppliedReaderGatedPorts, ConfigPresence, GatedListenerPortReaders, ListenerPortReader,
+        };
+
+        let applied = AppliedReaderGatedPorts {
+            kcp_bind_port: true,
+            quic_bind_port: true,
+            ..Default::default()
+        };
+        let no_readers = GatedListenerPortReaders::from_features(false, false, false);
+        let all_readers = GatedListenerPortReaders::from_features(true, true, true);
+
+        let mut presence = ConfigPresence::default();
+        presence.record_applied_reader_gated_ports(applied);
+        let records = presence.unhonoured_server_feature_key_records(no_readers);
+        assert_eq!(
+            records,
+            vec![
+                crate::config::SERVER_KCP_BIND_PORT_UNHONOURED_NO_READER_WARNING.clone(),
+                crate::config::SERVER_QUIC_BIND_PORT_UNHONOURED_NO_READER_WARNING.clone(),
+            ],
+            "an overlay-applied gated port in a build without its listener is a record"
+        );
+        assert!(
+            presence
+                .unhonoured_server_feature_key_records(all_readers)
+                .is_empty(),
+            "a build that binds both ports must stay silent"
+        );
+
+        let mut presence = ConfigPresence::default();
+        presence.record_applied_reader_gated_ports(AppliedReaderGatedPorts::default());
+        assert!(
+            presence
+                .unhonoured_server_feature_key_records(no_readers)
+                .is_empty(),
+            "recording nothing must add nothing"
+        );
+        // The assertion has to be able to fail: the two reader values must be
+        // distinguishable, or every comparison above holds vacuously.
+        assert_ne!(ListenerPortReader::Present, ListenerPortReader::Absent);
     }
 
     /// `--vhost-http-timeout` is Go's `vhost_http_timeout`, registered on the

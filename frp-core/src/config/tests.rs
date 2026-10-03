@@ -319,11 +319,14 @@ fn load_server_with_presence(body: &str) -> (ServerConfig, ConfigPresence) {
         .unwrap_or_else(|e| panic!("strict mode must load this:\n{e}\nbody:\n{body}"))
 }
 
-/// The whole-text pin for one of the three `#[cfg(not(feature = …))]`
-/// diagnostics: the text is the clause array **joined**, so it is defined once
-/// and a reworded clause cannot leave a copied literal behind in a test; the
-/// array still carries both clauses; and the record names the key it reports.
-#[cfg(not(all(feature = "kcp", feature = "quic", feature = "websocket")))]
+/// The whole-text pin for one of the six gated-listener diagnostics (three
+/// field-less, three field-present-no-reader): the text is the clause array
+/// **joined**, so it is defined once and a reworded clause cannot leave a copied
+/// literal behind in a test; the array still carries both clauses; and the record
+/// names the key it reports.
+///
+/// The two clause sets are `#[cfg]`-exclusive per port, so every build shape
+/// instantiates this helper at least once and it needs no gate of its own.
 fn assert_unhonoured_diagnostic(clauses: &[&str], warning: &str, key: &str) {
     assert_eq!(clauses.len(), 2, "{key}: clause count");
     assert!(clauses.iter().all(|c| !c.is_empty()), "{key}: empty clause");
@@ -335,23 +338,87 @@ fn assert_unhonoured_diagnostic(clauses: &[&str], warning: &str, key: &str) {
     assert!(warning.contains(key), "{key}: the record must name `{key}`");
 }
 
+/// The three feature-gated ports, all reported **Absent** — the caller shape
+/// `frp-server` built without any of the three listeners reports through
+/// `gated_listener_port_readers`.
+fn no_gated_listener_readers() -> GatedListenerPortReaders {
+    GatedListenerPortReaders::from_features(false, false, false)
+}
+
+/// The same three ports, all reported **Present** — the ordinary `frps` default
+/// build's answer.
+fn all_gated_listener_readers() -> GatedListenerPortReaders {
+    GatedListenerPortReaders::from_features(true, true, true)
+}
+
 // ─── kcp_bind_port / kcpBindPort (the `kcp` feature) ─────────────────────
 
 /// Enabled direction: the field exists, so strict mode accepting the key is
 /// *correct* and the port reaches its reader (`frp-server` creates the KCP
-/// listener when the port is `> 0`). No diagnostic can exist in this build
-/// shape — `SERVER_KCP_BIND_PORT_UNHONOURED_WARNING` and the presence flag it
-/// reads are `#[cfg(not(feature = "kcp"))]`, so "this build warns about it" is
-/// not a compilable statement, which is the strongest available form of "no
-/// warning".
+/// listener when the port is `> 0`). "This build warns about it" is now a
+/// compilable statement — the field-present diagnostic exists under
+/// `#[cfg(feature = "kcp")]` — but it must be **silent** when the caller reports
+/// the listener present. The opposite answer (the hand-named inner-feature
+/// shape) is pinned by
+/// [`feature_gated_server_port_kcp_enabled_without_a_reader_reports_the_port`].
 #[cfg(feature = "kcp")]
 #[test]
 fn feature_gated_server_port_kcp_enabled_honours_the_port() {
     for (key, expected) in [("kcp_bind_port", 7100u16), ("kcpBindPort", 7101)] {
-        let (cfg, _presence) =
+        let (cfg, presence) =
             load_server_with_presence(&format!("bind_port = 7000\n{key} = {expected}\n"));
         assert_eq!(cfg.kcp_bind_port, expected, "`{key}` must reach the field");
+        assert!(
+            presence
+                .unhonoured_server_feature_key_records(all_gated_listener_readers())
+                .is_empty(),
+            "a build whose caller reports the KCP listener must stay silent; body key `{key}`"
+        );
     }
+}
+
+/// **The hand-named inner-feature shape.** `frp-core`'s `kcp` feature is on — the
+/// field deserializes, strict mode accepts it and `frps --help` advertises
+/// `--kcp-bind-port` — while the crate that owns the listener
+/// (`frp-server/kcp`) is off, so the caller reports
+/// [`ListenerPortReader::Absent`] and the port the file names stays closed.
+///
+/// This is exactly the feature resolution of
+/// `cargo build -p frps --no-default-features --features tiny,frp-core/kcp`
+/// (and of `cargo test -p frp-server --no-default-features --all-targets`, whose
+/// `frp-client` dev-dependency turns `frp-core/kcp` on while `frp-server/kcp` is
+/// off). Before the reader was threaded through, this load was silent in both
+/// halves.
+#[cfg(feature = "kcp")]
+#[test]
+fn feature_gated_server_port_kcp_enabled_without_a_reader_reports_the_port() {
+    for (key, port) in [("kcp_bind_port", "7100"), ("kcpBindPort", "7101")] {
+        for body in [
+            format!("bind_port = 7000\n{key} = {port}\n"),
+            format!("bind_port = 7000\n[common]\n{key} = {port}\n"),
+        ] {
+            let (cfg, presence) = load_server_with_presence(&body);
+            assert_eq!(
+                cfg.kcp_bind_port,
+                port.parse::<u16>().unwrap(),
+                "body:\n{body}"
+            );
+            assert!(
+                presence.server_kcp_bind_port_unhonoured,
+                "`{key}` asks for a listener this build cannot create; body:\n{body}"
+            );
+            assert_eq!(
+                presence.unhonoured_server_feature_key_records(no_gated_listener_readers()),
+                vec![SERVER_KCP_BIND_PORT_UNHONOURED_NO_READER_WARNING.clone()],
+                "`{key}` must produce exactly the field-present record; body:\n{body}"
+            );
+        }
+    }
+    assert_unhonoured_diagnostic(
+        &SERVER_KCP_BIND_PORT_UNHONOURED_NO_READER_CLAUSES,
+        SERVER_KCP_BIND_PORT_UNHONOURED_NO_READER_WARNING.as_str(),
+        "kcp_bind_port",
+    );
 }
 
 /// Disabled direction: `ServerConfig` has no `kcp_bind_port` field, so serde
@@ -359,6 +426,12 @@ fn feature_gated_server_port_kcp_enabled_honours_the_port() {
 /// **accepts** the key — it is in `known_server_keys()` unconditionally, the
 /// deliberate "never a false 400" direction — so before this flag the load was
 /// completely silent about a port that will stay closed.
+///
+/// The reader argument is pinned **both ways** here: the field-less direction
+/// must warn even when the caller reports a listener, because no caller can
+/// conjure a field this build did not compile (`frp-server/kcp = ["frp-core/kcp"]`
+/// makes that combination unreachable in practice; the assertion is what makes
+/// "never weaken the field-less half" a compilable statement).
 #[cfg(not(feature = "kcp"))]
 #[test]
 fn feature_gated_server_port_kcp_disabled_reports_the_dropped_port() {
@@ -373,6 +446,14 @@ fn feature_gated_server_port_kcp_disabled_reports_the_dropped_port() {
                 presence.server_kcp_bind_port_unhonoured,
                 "`{key}` asks for a listener this build cannot create; body:\n{body}"
             );
+            for readers in [no_gated_listener_readers(), all_gated_listener_readers()] {
+                assert_eq!(
+                    presence.unhonoured_server_feature_key_records(readers),
+                    vec![SERVER_KCP_BIND_PORT_UNHONOURED_WARNING.clone()],
+                    "a field this build did not compile is unread whatever the caller \
+                     reports; body:\n{body}"
+                );
+            }
         }
     }
     assert_unhonoured_diagnostic(
@@ -386,7 +467,10 @@ fn feature_gated_server_port_kcp_disabled_reports_the_dropped_port() {
 /// is what the field's own default is, and a capable build's reader gates on
 /// `> 0` — so a written `0` is fully honoured in every shape and must not
 /// produce a record. An absent key is not a request either.
-#[cfg(not(feature = "kcp"))]
+///
+/// Runs in every build shape now that the presence flag is computed
+/// unconditionally: the field-present shape reads the real field, the field-less
+/// shape reads the dropped key, and neither is a request.
 #[test]
 fn feature_gated_server_port_kcp_disabled_is_silent_for_zero_or_absent() {
     for body in [
@@ -402,19 +486,63 @@ fn feature_gated_server_port_kcp_disabled_is_silent_for_zero_or_absent() {
 
 // ─── quic_bind_port / quicBindPort (the `quic` feature) ──────────────────
 
-/// The `quic` twin of `feature_gated_server_port_kcp_enabled_honours_the_port`.
+/// The `quic` twin of `feature_gated_server_port_kcp_enabled_honours_the_port`:
+/// the field exists and reaches its reader, and the caller's `Present` answer
+/// keeps the record silent.
 #[cfg(feature = "quic")]
 #[test]
 fn feature_gated_server_port_quic_enabled_honours_the_port() {
     for (key, expected) in [("quic_bind_port", 7200u16), ("quicBindPort", 7201)] {
-        let (cfg, _presence) =
+        let (cfg, presence) =
             load_server_with_presence(&format!("bind_port = 7000\n{key} = {expected}\n"));
         assert_eq!(cfg.quic_bind_port, expected, "`{key}` must reach the field");
+        assert!(
+            presence
+                .unhonoured_server_feature_key_records(all_gated_listener_readers())
+                .is_empty(),
+            "a build whose caller reports the QUIC listener must stay silent; body key `{key}`"
+        );
     }
 }
 
 /// The `quic` twin of
-/// `feature_gated_server_port_kcp_disabled_reports_the_dropped_port`.
+/// `feature_gated_server_port_kcp_enabled_without_a_reader_reports_the_port`:
+/// the hand-named `tiny,frp-core/quic` shape.
+#[cfg(feature = "quic")]
+#[test]
+fn feature_gated_server_port_quic_enabled_without_a_reader_reports_the_port() {
+    for (key, port) in [("quic_bind_port", "7200"), ("quicBindPort", "7201")] {
+        for body in [
+            format!("bind_port = 7000\n{key} = {port}\n"),
+            format!("bind_port = 7000\n[common]\n{key} = {port}\n"),
+        ] {
+            let (cfg, presence) = load_server_with_presence(&body);
+            assert_eq!(
+                cfg.quic_bind_port,
+                port.parse::<u16>().unwrap(),
+                "body:\n{body}"
+            );
+            assert!(
+                presence.server_quic_bind_port_unhonoured,
+                "`{key}` asks for a listener this build cannot create; body:\n{body}"
+            );
+            assert_eq!(
+                presence.unhonoured_server_feature_key_records(no_gated_listener_readers()),
+                vec![SERVER_QUIC_BIND_PORT_UNHONOURED_NO_READER_WARNING.clone()],
+                "`{key}` must produce exactly the field-present record; body:\n{body}"
+            );
+        }
+    }
+    assert_unhonoured_diagnostic(
+        &SERVER_QUIC_BIND_PORT_UNHONOURED_NO_READER_CLAUSES,
+        SERVER_QUIC_BIND_PORT_UNHONOURED_NO_READER_WARNING.as_str(),
+        "quic_bind_port",
+    );
+}
+
+/// The `quic` twin of
+/// `feature_gated_server_port_kcp_disabled_reports_the_dropped_port`, with the
+/// same both-ways reader pin.
 #[cfg(not(feature = "quic"))]
 #[test]
 fn feature_gated_server_port_quic_disabled_reports_the_dropped_port() {
@@ -429,6 +557,14 @@ fn feature_gated_server_port_quic_disabled_reports_the_dropped_port() {
                 presence.server_quic_bind_port_unhonoured,
                 "`{key}` asks for a listener this build cannot create; body:\n{body}"
             );
+            for readers in [no_gated_listener_readers(), all_gated_listener_readers()] {
+                assert_eq!(
+                    presence.unhonoured_server_feature_key_records(readers),
+                    vec![SERVER_QUIC_BIND_PORT_UNHONOURED_WARNING.clone()],
+                    "a field this build did not compile is unread whatever the caller \
+                     reports; body:\n{body}"
+                );
+            }
         }
     }
     assert_unhonoured_diagnostic(
@@ -439,8 +575,8 @@ fn feature_gated_server_port_quic_disabled_reports_the_dropped_port() {
 }
 
 /// The `quic` twin of
-/// `feature_gated_server_port_kcp_disabled_is_silent_for_zero_or_absent`.
-#[cfg(not(feature = "quic"))]
+/// `feature_gated_server_port_kcp_disabled_is_silent_for_zero_or_absent`, run in
+/// every shape for the same reason.
 #[test]
 fn feature_gated_server_port_quic_disabled_is_silent_for_zero_or_absent() {
     for body in [
@@ -464,14 +600,58 @@ fn feature_gated_server_port_quic_disabled_is_silent_for_zero_or_absent() {
 #[test]
 fn feature_gated_server_port_websocket_enabled_honours_the_port() {
     for (key, expected) in [("websocket_port", 7500u16), ("websocketPort", 7501)] {
-        let (cfg, _presence) =
+        let (cfg, presence) =
             load_server_with_presence(&format!("bind_port = 7000\n{key} = {expected}\n"));
         assert_eq!(cfg.websocket_port, expected, "`{key}` must reach the field");
+        assert!(
+            presence
+                .unhonoured_server_feature_key_records(all_gated_listener_readers())
+                .is_empty(),
+            "a build whose caller reports the WebSocket listener must stay silent; \
+             body key `{key}`"
+        );
     }
 }
 
 /// The `websocket` twin of
-/// `feature_gated_server_port_kcp_disabled_reports_the_dropped_port`.
+/// `feature_gated_server_port_kcp_enabled_without_a_reader_reports_the_port` —
+/// the hand-named `tiny,frp-core/websocket` shape. There is no
+/// `--websocket-port` flag, so this file key is the only half that exists here.
+#[cfg(feature = "websocket")]
+#[test]
+fn feature_gated_server_port_websocket_enabled_without_a_reader_reports_the_port() {
+    for (key, port) in [("websocket_port", "7500"), ("websocketPort", "7501")] {
+        for body in [
+            format!("bind_port = 7000\n{key} = {port}\n"),
+            format!("bind_port = 7000\n[common]\n{key} = {port}\n"),
+        ] {
+            let (cfg, presence) = load_server_with_presence(&body);
+            assert_eq!(
+                cfg.websocket_port,
+                port.parse::<u16>().unwrap(),
+                "body:\n{body}"
+            );
+            assert!(
+                presence.server_websocket_port_unhonoured,
+                "`{key}` asks for a listener this build cannot create; body:\n{body}"
+            );
+            assert_eq!(
+                presence.unhonoured_server_feature_key_records(no_gated_listener_readers()),
+                vec![SERVER_WEBSOCKET_PORT_UNHONOURED_NO_READER_WARNING.clone()],
+                "`{key}` must produce exactly the field-present record; body:\n{body}"
+            );
+        }
+    }
+    assert_unhonoured_diagnostic(
+        &SERVER_WEBSOCKET_PORT_UNHONOURED_NO_READER_CLAUSES,
+        SERVER_WEBSOCKET_PORT_UNHONOURED_NO_READER_WARNING.as_str(),
+        "websocket_port",
+    );
+}
+
+/// The `websocket` twin of
+/// `feature_gated_server_port_kcp_disabled_reports_the_dropped_port`, with the
+/// same both-ways reader pin.
 #[cfg(not(feature = "websocket"))]
 #[test]
 fn feature_gated_server_port_websocket_disabled_reports_the_dropped_port() {
@@ -486,6 +666,14 @@ fn feature_gated_server_port_websocket_disabled_reports_the_dropped_port() {
                 presence.server_websocket_port_unhonoured,
                 "`{key}` asks for a listener this build cannot create; body:\n{body}"
             );
+            for readers in [no_gated_listener_readers(), all_gated_listener_readers()] {
+                assert_eq!(
+                    presence.unhonoured_server_feature_key_records(readers),
+                    vec![SERVER_WEBSOCKET_PORT_UNHONOURED_WARNING.clone()],
+                    "a field this build did not compile is unread whatever the caller \
+                     reports; body:\n{body}"
+                );
+            }
         }
     }
     assert_unhonoured_diagnostic(
@@ -496,8 +684,8 @@ fn feature_gated_server_port_websocket_disabled_reports_the_dropped_port() {
 }
 
 /// The `websocket` twin of
-/// `feature_gated_server_port_kcp_disabled_is_silent_for_zero_or_absent`.
-#[cfg(not(feature = "websocket"))]
+/// `feature_gated_server_port_kcp_disabled_is_silent_for_zero_or_absent`, run in
+/// every shape for the same reason.
 #[test]
 fn feature_gated_server_port_websocket_disabled_is_silent_for_zero_or_absent() {
     for body in [
@@ -767,13 +955,13 @@ fn ini_nonzero_listener_port_spellings_still_request_a_listener() {
 
 /// The per-spelling pin for the three `frp-core`-gated ports themselves.
 ///
-/// `port_requested` only compiles where at least one of `kcp`/`quic`/`websocket`
-/// is off, which is the `.github/workflows/ci.yml`
-/// `cargo test -p frp-core --no-default-features --all-targets` lane. The
-/// assertion goes through [`ConfigPresence::unhonoured_server_feature_key_records`]
-/// rather than the per-feature flags so it compiles in every shape where this
-/// test is enabled, including a partial `--features` selection.
-#[cfg(not(all(feature = "kcp", feature = "quic", feature = "websocket")))]
+/// Runs in **every** build shape, because the presence flags are now computed in
+/// every shape (the field-less direction no longer compiles the flag away) — the
+/// `.github/workflows/ci.yml` `cargo test -p frp-core --no-default-features
+/// --all-targets` lane used to be the only one that reached this. The assertion
+/// goes through [`ConfigPresence::unhonoured_server_feature_key_records`] with
+/// all three readers **Absent**, the answer that turns every field-present
+/// request into a record; a zero spelling must still produce none.
 #[test]
 fn ini_zero_spellings_do_not_warn_for_the_gated_listener_ports() {
     for value in ["0", "+0", "00", "\"0\""] {
@@ -781,7 +969,9 @@ fn ini_zero_spellings_do_not_warn_for_the_gated_listener_ports() {
             let body = format!("[common]\nbind_port = 7000\n{key} = {value}\n");
             let (_cfg, presence) = load_server_ini_with_presence(&body);
             assert!(
-                presence.unhonoured_server_feature_key_records().is_empty(),
+                presence
+                    .unhonoured_server_feature_key_records(no_gated_listener_readers())
+                    .is_empty(),
                 "`{key} = {value}` is a zero/disabled spelling; body:\n{body}"
             );
         }
@@ -8015,7 +8205,7 @@ fn legacy_ini_typed_array_root_visitor_is_collected() {
 /// reserved-root bypass keys on the **port** keys and never on `type`, because
 /// keying it on `type` would collect every typed settings root and contradict
 /// `test_legacy_ini_known_section_with_type_not_collected`
-/// (`frp-core/src/config/tests.rs:10391`) and the `[web_server] type`-only v1
+/// (`frp-core/src/config/tests.rs:10581`) and the `[web_server] type`-only v1
 /// boundary. This test pins the strict verdict so the delta is measured rather
 /// than silent.
 #[test]
@@ -13764,7 +13954,7 @@ fn legacy_ini_start_comes_from_the_common_section_only() {
 /// `frp-core/src/config/format.rs:389` is therefore gated on `legacy_ini`
 /// (`frp-core/src/config/format.rs:223`); the legacy `[common]` case keeps the
 /// section (`legacy_ini_scalar_and_section_collision_keeps_the_section_like_go`,
-/// `frp-core/src/config/tests.rs:12460`).
+/// `frp-core/src/config/tests.rs:12650`).
 #[test]
 fn v1_ini_scalar_section_collision_is_still_a_type_error() {
     for (body, expected) in [
@@ -14180,7 +14370,7 @@ fn legacy_ini_empty_start_dispatches_every_section_like_go() {
 /// and that `[p2]` is rc 0 with proxy `p1`. Non-strict frp-rs matches; the strict
 /// checker still reports the leftover table (`unknown field "p2"`), the
 /// pre-existing residue of a non-candidate section documented at
-/// `frp-core/src/config/tests.rs:12655`. Without the `ini_section_started`
+/// `frp-core/src/config/tests.rs:12845`. Without the `ini_section_started`
 /// guard the role scan at `frp-core/src/config/normalize.rs:2187` refuses the
 /// file (rc 1, `proxy p2 role should be 'server' or 'visitor'`).
 #[test]
@@ -14265,7 +14455,7 @@ fn legacy_ini_start_names_maps_go_text_and_nested_tables() {
 /// non-strict refusal is the loose-only divergence the item calls a follow-up.
 /// Recorded deliberate: making the two detectors agree would mean dropping
 /// `common` from the dotted-section roots, which the `[common.webServer.tls]`
-/// spelling pinned at `frp-core/src/config/tests.rs:7215` still needs. A mutant
+/// spelling pinned at `frp-core/src/config/tests.rs:7405` still needs. A mutant
 /// that forces `legacy_ini` false in the collector loads this file non-strict.
 #[test]
 fn dotted_common_only_section_is_legacy_for_the_collector_both_modes() {
@@ -14330,7 +14520,7 @@ fn default_section_header_is_an_ordinary_section_both_modes() {
 /// and loads zero proxies. The strict rc agrees; only the message and the
 /// non-strict verdict diverge, and matching Go's non-strict message would mean
 /// addressing the array element as `proxies[0]`, which the `.ini` reader does not
-/// do (pinned as out of scope at `frp-core/src/config/tests.rs:12697`). Both
+/// do (pinned as out of scope at `frp-core/src/config/tests.rs:12887`). Both
 /// modes pinned.
 #[test]
 fn r_toml_hybrid_ini_is_a_v1_shape_both_modes() {
@@ -14366,7 +14556,7 @@ fn r_toml_hybrid_ini_is_a_v1_shape_both_modes() {
 /// (`frp-core/src/config/normalize.rs:2331`) and loads `p2`, rc 0. Recorded
 /// deliberate: making a missing port fatal is a separate design question, and the
 /// sibling skip paths are pinned as intentional at
-/// `frp-core/src/config/tests.rs:10397` / `:10422`. Both modes pinned.
+/// `frp-core/src/config/tests.rs:10587` / `:10612`. Both modes pinned.
 #[test]
 fn range_section_without_remote_port_is_skipped_not_fatal_both_modes() {
     let dir = tempfile::tempdir().unwrap();
@@ -14400,14 +14590,14 @@ fn range_section_without_remote_port_is_skipped_not_fatal_both_modes() {
 /// collect `[log] type = "custom" disable_print_color = true` (Go rc 1
 /// `failed to parse proxy log, err: invalid type [custom]`, frp-rs rc 0 today)
 /// and would contradict `test_legacy_ini_known_section_with_type_not_collected`
-/// (`frp-core/src/config/tests.rs:10447`). The item calls this a design question
+/// (`frp-core/src/config/tests.rs:10637`). The item calls this a design question
 /// about whether frp-rs keeps supporting v1 settings roots in `.ini` at all, so
 /// the divergence is recorded deliberate rather than forced. The sibling
 /// typeless/port-less shape (`c2.ini`, `[p] custom_domains = ["a.com"]`) is
 /// pinned the same way both modes: Go collects `p` (rc 0), frp-rs keeps it a v1
 /// section (`unknown field "p"` strict, rc 0 non-strict), matching
 /// `typeless_ini_section_without_ports_stays_a_v1_section`
-/// (`frp-core/src/config/tests.rs:7468`).
+/// (`frp-core/src/config/tests.rs:7658`).
 #[test]
 fn legacy_ini_reserved_root_type_only_section_is_not_collected_both_modes() {
     let dir = tempfile::tempdir().unwrap();
@@ -14555,14 +14745,16 @@ fn feature_gated_port_field_is_compiled_in(feature: &str) -> bool {
 /// has, so it carries `kcp_bind_port` / `quic_bind_port` / `websocket_port` exactly when
 /// the feature is compiled in.
 ///
-/// * compiled in — the snake *and* the camel spelling land in the field (`17500`); the
-///   unhonoured-record list is empty by construction, so there is nothing to assert;
-/// * compiled out — strict mode **still accepts** both spellings (the divergence), the
-///   field is absent from `to_value`, and the load records the accepted-but-unhonoured
-///   key once per load.
+/// * compiled in — the snake *and* the camel spelling land in the field
+///   (`17500`); with the caller reporting the listener (`Present`) the
+///   unhonoured-record list is empty, and with it reporting `Absent` — the
+///   hand-named inner-feature shape — the key is recorded;
+/// * compiled out — strict mode **still accepts** both spellings (the
+///   divergence), the field is absent from `to_value`, and the load records the
+///   accepted-but-unhonoured key once per load, whatever the caller reports.
 ///
-/// One function measures both shapes: the default lanes compile all three features in,
-/// `cargo test -p frp-core --no-default-features` compiles all three out.
+/// One function measures both shapes (`frp-core/src/config/loader.rs:1182-1205`): the default
+/// lanes compile all three features in, `cargo test -p frp-core --no-default-features` compiles all three out.
 #[test]
 fn feature_gated_port_keys_are_accepted_while_the_compiled_field_set_follows_the_build() {
     for (snake, camel, feature) in FEATURE_GATED_SERVER_PORTS {
@@ -14572,32 +14764,48 @@ fn feature_gated_port_keys_are_accepted_while_the_compiled_field_set_follows_the
             let (cfg, presence) = load_server_with_presence(&body);
             let value = serde_json::to_value(&cfg).unwrap();
             let serialized = value.get(snake).and_then(|port| port.as_u64());
+            let names_key = |readers| {
+                presence
+                    .unhonoured_server_feature_key_records(readers)
+                    .iter()
+                    .any(|record| record.contains(snake))
+            };
             if compiled_in {
                 assert_eq!(
                     serialized,
                     Some(17500),
                     "{snake}: `{spelling}` must land in the field this build compiles in"
                 );
-                // No unhonoured-record assertion in this shape: every push into
-                // `unhonoured_server_feature_key_records()` is `#[cfg(not(feature = "…"))]`-gated
-                // (`frp-core/src/config/loader.rs:1020-1031`), so a build that honours this port
-                // compiles out the only push that could name `snake`; the assertion that used to
-                // sit here was structurally vacuous and could never fail, so it is replaced by
-                // this note. The feature-off half below still asserts the accepted-but-unhonoured
-                // record, which is the half that can actually go red.
+                // The reader is the whole question in this shape: `Absent` is the
+                // hand-named inner-feature build (field compiled, listener not),
+                // and it must record; `Present` is the ordinary default build and
+                // must stay silent. Both directions are asserted, so a record list
+                // that ignored the reader reds here.
+                assert!(
+                    !names_key(all_gated_listener_readers()),
+                    "{snake}: a build whose caller reports the listener must not record \
+                     `{spelling}`"
+                );
+                assert!(
+                    names_key(no_gated_listener_readers()),
+                    "{snake}: a build that deserializes `{spelling}` without the listener \
+                     must record it"
+                );
             } else {
                 assert!(
                     serialized.is_none(),
                     "{snake}: strict mode accepts `{spelling}` but this build compiles no field \
                      for it, so the serde field set must not carry it"
                 );
-                assert!(
-                    presence
-                        .unhonoured_server_feature_key_records()
-                        .iter()
-                        .any(|record| record.contains(snake)),
-                    "{snake}: the accepted-but-unhonoured key must be recorded once per load"
-                );
+                // The field-less half ignores the caller's answer — no reader can
+                // read a field this build never compiled.
+                for readers in [no_gated_listener_readers(), all_gated_listener_readers()] {
+                    assert!(
+                        names_key(readers),
+                        "{snake}: the accepted-but-unhonoured key must be recorded once per \
+                         load, whatever the caller reports"
+                    );
+                }
             }
         }
     }
