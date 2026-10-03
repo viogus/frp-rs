@@ -60,7 +60,12 @@
 #      this configuration is told apart from a typo.
 #
 # Self-contained: no network, no repo binaries, no Go frp, and no scenario
-# reaches a real server — the stub-driven selector runs stop at the harness's
+# reaches a real server. Every stubbed selector run pins `GO_FRP_VERSION` to
+# `0.0.0-fixture.<pid>`, so the default Go directory the harness derives cannot
+# exist; the suite asserts that directory is absent (the probe is not vacuous)
+# and that the harness never printed its missing-binary error — so a real
+# `/tmp/frp_0.71.0_*` left on the host by an earlier compat run cannot stand in
+# for a stub and mask a broken seam. The stub-driven runs stop at the harness's
 # own pre-gate executable check or at the stub's first missing listener.
 # Temporary listeners and trees are removed on exit.
 #
@@ -98,7 +103,7 @@ fails=0
 # hold`, so a suite that silently stops checking must not exit green. The floor
 # and the ordered `SHAPE` below are enforced from the exit trap on every path,
 # including an early `exit 0`.
-MIN_CHECKS=57
+MIN_CHECKS=59
 # The ordered assertion anchors, one per `ok`/`bad` call in scenario order:
 # a scenario that stops running, a deleted check, a reordered check, or a dummy
 # `ok` anywhere all move `LABELS` away from this list.
@@ -150,6 +155,7 @@ SHAPE=(
   "protocol-matrix.sh: sources the port-ownership lib"
   "protocol-matrix.sh: both row gates pass the frps pid"
   "protocol-matrix.sh: main runs only when executed"
+  "selector: the stubbed default Go dir is absent"
   "selector: a function-name --test exits non-zero"
   "selector: the message names the selector"
   "selector: no RESULTS summary is printed"
@@ -160,6 +166,7 @@ SHAPE=(
   "selector --debug: the run exits non-zero for the failed scenario"
   "selector: a skipped-phase name exits non-zero"
   "selector: the skipped-phase message names the phase, not a typo"
+  "selector: no stub run needed a real binary"
 )
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/compat-port-ownership.XXXXXX")" || {
@@ -591,10 +598,24 @@ fi
 
 # The `health` job has no `target/`, so driving the real harness needs the
 # executable-path seam (`scripts/compat-test.sh`, the `FRP_COMPAT_*` overrides)
-# and four stubs that satisfy the harness's pre-gate executable check. Nothing
-# below runs a scenario against a real server: the selector values either match
-# no scenario, match one skipped in this configuration, or (scenario 12) match a
-# scenario that fails at its first server gate because the stub never listens.
+# and four stubs that satisfy the harness's pre-gate executable check. The seam
+# must also be honoured where the harness recomputes `GO_FRP_DIR` from
+# `GO_FRP_VERSION`, so every run below pins `GO_FRP_VERSION` to a version whose
+# default Go directory cannot exist. Without that, a host that happens to have
+# `/tmp/frp_0.71.0_<os>_<arch>` — which this repo's own local compat runs leave
+# behind — would satisfy the pre-gate check with the real binaries and hide a
+# seam that a clean runner cannot use. The version carries this run's pid, so
+# the derived directory is provably absent, and the absence is asserted rather
+# than assumed.
+STUB_VERSION="0.0.0-fixture.$$"
+_stub_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+_stub_arch=$(uname -m)
+case "$_stub_arch" in
+  x86_64) _stub_arch=amd64 ;;
+  aarch64|arm64) _stub_arch=arm64 ;;
+esac
+STUB_GO_DIR="/tmp/frp_${STUB_VERSION}_${_stub_os}_${_stub_arch}"
+
 STUB_DIR="$WORK/stubs"
 mkdir -p "$STUB_DIR"
 make_stub() {
@@ -608,14 +629,21 @@ make_stub rustfrpc
 
 stub_out=""
 stub_rc=0
+# Set if any stubbed run prints the harness's missing-binary error: the seam did
+# not take effect and the run fell back to the (nonexistent) default paths.
+stub_missing_binary=0
 run_stubbed() {
-  stub_out=$(FRP_COMPAT_GO_FRPS="$STUB_DIR/gofrps" \
+  stub_out=$(GO_FRP_VERSION="$STUB_VERSION" \
+    FRP_COMPAT_GO_FRPS="$STUB_DIR/gofrps" \
     FRP_COMPAT_GO_FRPC="$STUB_DIR/gofrpc" \
     FRP_COMPAT_RUST_FRPS="$STUB_DIR/rustfrps" \
     FRP_COMPAT_RUST_FRPC="$STUB_DIR/rustfrpc" \
     FRP_COMPAT_TEST_DIR="$WORK/harness-tmp" \
     bash "$COMPAT" "$@" 2>&1)
   stub_rc=$?
+  case "$stub_out" in
+    *'Binary not found or not executable'*) stub_missing_binary=1 ;;
+  esac
 }
 
 # The harness colors its ` RESULTS:` line even when redirected, so the summary
@@ -625,6 +653,14 @@ strip_ansi() {
 }
 
 hdr 'selector'
+# The run below has to be hermetic on any host. This is the default Go directory
+# the harness derives from `STUB_VERSION`; it cannot exist, and checking that is
+# what keeps the stub run from passing on the host's real Go binaries instead.
+if [ ! -e "$STUB_GO_DIR" ]; then
+  ok 'selector: the stubbed default Go dir is absent'
+else
+  bad "selector: the stubbed default Go dir is absent (found $STUB_GO_DIR)"
+fi
 run_stubbed --ci --test test_g2r_tcp_plain
 if [ "$stub_rc" -eq 2 ]; then
   ok 'selector: a function-name --test exits non-zero'
@@ -691,3 +727,13 @@ case "$stub_out" in
     ok 'selector: the skipped-phase message names the phase, not a typo' ;;
   *) bad 'selector: the skipped-phase message names the phase, not a typo' ;;
 esac
+
+# Aggregated over all three stubbed runs above. A seam that is ignored where the
+# harness recomputes `GO_FRP_DIR` falls back to the default paths, which do not
+# exist here, so the harness dies at its executable check instead of reaching the
+# selector gate — exactly what a clean CI runner saw.
+if [ "$stub_missing_binary" -eq 0 ]; then
+  ok 'selector: no stub run needed a real binary'
+else
+  bad 'selector: no stub run needed a real binary'
+fi

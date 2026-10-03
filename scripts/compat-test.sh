@@ -23,12 +23,16 @@ else
     esac
     GO_FRP_DIR="/tmp/frp_${GO_FRP_VERSION}_${_gos}_${_goa}"
 fi
-# Each binary path is overridable. Nothing in CI sets these — a real run always
-# uses the paths below — but `scripts/tests/compat-port-ownership.sh` points them
-# at stub binaries so it can drive this harness's own `--test` handling on a
-# checkout with no build, like the `health` job's. The pre-gate checks only ask
-# that each binary be executable (the certs are tracked), so a stub suffices and
-# no scenario ever runs against one.
+# Each binary path is overridable through the environment, and the override is
+# honoured in both places the Go paths are assigned: here and in the
+# recalculation block below, which re-derives `GO_FRP_DIR` when `--go-version`
+# (or `GO_FRP_VERSION`) changes the version. `scripts/tests/
+# compat-port-ownership.sh` points all four at stub binaries so it can drive this
+# harness's own `--test` handling on a checkout with no build, like the `health`
+# job's; because the seam wins in the recalculation too, that stays true whatever
+# the default Go directory is — no host's real `/tmp/frp_0.71.0_*` can stand in
+# for a stub. The pre-gate checks only ask that each binary be executable (the
+# certs are tracked), so a stub suffices and no scenario ever runs against one.
 GO_FRPS="${FRP_COMPAT_GO_FRPS:-$GO_FRP_DIR/frps}"
 GO_FRPC="${FRP_COMPAT_GO_FRPC:-$GO_FRP_DIR/frpc}"
 RUST_FRPS="${FRP_COMPAT_RUST_FRPS:-$PROJECT_DIR/target/release/frps}"
@@ -127,8 +131,12 @@ if [[ -z "$GO_FRP_DIR_USER" ]]; then
         aarch64|arm64) _goa="arm64" ;;
     esac
     GO_FRP_DIR="/tmp/frp_${GO_FRP_VERSION}_${_gos}_${_goa}"
-    GO_FRPS="$GO_FRP_DIR/frps"
-    GO_FRPC="$GO_FRP_DIR/frpc"
+    # Keep honouring the seam here: overwriting a stub with the default dir's
+    # path made a stubbed run depend on this host's `/tmp` (a real
+    # `/tmp/frp_0.71.0_*` masked it locally while a clean runner failed at the
+    # binary check).
+    GO_FRPS="${FRP_COMPAT_GO_FRPS:-$GO_FRP_DIR/frps}"
+    GO_FRPC="${FRP_COMPAT_GO_FRPC:-$GO_FRP_DIR/frpc}"
 fi
 
 # Pass the resolved Go frp version/path to remote-frps.sh for VPS XTCP runs.

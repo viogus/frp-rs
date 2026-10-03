@@ -565,7 +565,15 @@ jobs:
       # driven against real python3 listeners, a stripped `PATH` and a fake `ss`,
       # plus the harness's own `--test` handling driven with four stub binaries
       # through the `FRP_COMPAT_*` seam (no Go toolchain, no repo binary, no
-      # scenario reaching a real server). Two failures live here
+      # scenario reaching a real server). Every stubbed selector run pins
+      # `GO_FRP_VERSION` to `0.0.0-fixture.<pid>`, so the default Go directory the
+      # harness derives cannot exist; the suite asserts that directory is absent
+      # and that the harness never printed its missing-binary error — so a real
+      # `/tmp/frp_0.71.0_*` left behind by an earlier compat run cannot satisfy
+      # the pre-gate check with real binaries and hide a seam this runner would
+      # reject. The seam has to hold in both places `scripts/compat-test.sh`
+      # assigns the Go paths, including the block that recomputes `GO_FRP_DIR`
+      # from `--go-version`. Two failures live here
       # that the wider harness cannot show on a green run: one scenario being
       # handed the same port twice (its echo listener and its frps — the TODO.md
       # same-port-twice item), and a readiness gate accepting a socket this run
@@ -574,16 +582,16 @@ jobs:
       - name: Port ownership — fixture checks (compat harness readiness)
         # Same external-total argument as the stray-guard step above: the suite
         # floors its own check count (`MIN_CHECKS`, in the EXIT trap) and pins the
-        # order and labels of all 57 assertions (`SHAPE`), but `exec true` planted
+        # order and labels of all 59 assertions (`SHAPE`), but `exec true` planted
         # after the library check never runs the trap and exits 0 with no output.
         # So the summary line is pinned verbatim here and the `  ok` line count is
-        # compared against `guard_exact`. `guard_exact`/`guard_floor` are 57: the
+        # compared against `guard_exact`. `guard_exact`/`guard_floor` are 59: the
         # 9 ledger checks, the 3 ownership checks, the 5 collision checks, the 3
         # foreign checks, the 3 nobody-listening checks, the 4 cannot-tell checks,
         # the 3 fake-`ss` checks, the 6 sourced-`wait_for_listen` checks, the 11
-        # wiring checks, the 4 selector checks, the 4 `--debug` selector checks
-        # and the 2 skipped-phase checks. A scenario added or removed
-        # moves the total — restore the checks rather than lowering it.
+        # wiring checks, the 5 selector checks, the 4 `--debug` selector checks,
+        # the 2 skipped-phase checks and the 1 hermeticity check. A scenario added
+        # or removed moves the total — restore the checks rather than lowering it.
         #
         # Two files are pinned. The suite drives `scripts/lib/compat-port-
         # ownership.sh` at runtime, so one edited library could stub the
@@ -615,9 +623,9 @@ jobs:
           log="${TMPDIR:-/tmp}/frp-port-ownership-fixtures.$$.log"
           status=0
           guard_file=scripts/tests/compat-port-ownership.sh
-          guard_pin=97992cf3e4e5cb2f9761128074d2124e5e705e70ab6fe540c1e640839705893e
-          guard_exact=57
-          guard_floor=57
+          guard_pin=ffbd89776fbcc3dd078ffded52be02b846f502f5b9808935eafc79d91152c8e0
+          guard_exact=59
+          guard_floor=59
           guard_lib=scripts/lib/compat-port-ownership.sh
           guard_lib_pin=37a49936f419de3dda21766444f157ae57caa049290eb89ff0408da57480b55e
           guard_hasher=''
