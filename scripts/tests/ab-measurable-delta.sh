@@ -819,7 +819,7 @@ PY
 if [ -s "$M6" ] && ! cmp -s "$REMOTE" "$M6"; then
   mutant_red_naming "ab-remote.sh switches deleted, blessed chain left as a comment" "$CLASSIFIER" "$MATRIX" "$M6" 'splice MISSING from the run call'
 else
-  bad "mutant: ab-remote.sh switches deleted but chain kept in a comment -> the mutation was inert, so it proves nothing"
+  bad "mutant: ab-remote.sh switches deleted but chain kept in a comment -> the mutation was inert (its anchor text is stale), so it proves nothing"
 fi
 
 # converse control for #5: the same layout, unmutated, must pass. Without it the

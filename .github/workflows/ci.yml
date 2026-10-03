@@ -1421,7 +1421,7 @@ jobs:
         # with no output, and a suite that stopped running its scenarios looks
         # exactly like a clean tree. So the summary line is pinned verbatim
         # here, the `  ok` line count is compared for equality with
-        # `guard_exact`, and seventeen substantive evidence lines are matched
+        # `guard_exact`, and eighteen substantive evidence lines are matched
         # individually. guard_exact/guard_floor are 53: the 12 measured-path
         # class fixtures, the 3 nothing-measurable fixtures, the 3
         # mixed/deletion/rename fixtures, the 4 error-surface fixtures, the 5
@@ -1454,7 +1454,7 @@ jobs:
           # run (review round 3, F3).
           unset AB_MD_CLASSIFIER AB_MD_MATRIX AB_MD_REMOTE AB_MD_SABOTAGE_CHILD
           guard_file=scripts/tests/ab-measurable-delta.sh
-          guard_pin=336b7b9d33f99745f1279267a7bd9d1b33827ab1313aa4d32a3c5c60b23cba29
+          guard_pin=e5984ca968c369a126ac4c8ed53a8978aa1cfec7359291b694c1279494187e59
           guard_exact=53
           guard_floor=53
           guard_cls=scripts/ab-measurable-delta.sh
@@ -1603,7 +1603,7 @@ jobs:
           fi
           if [ "$status" != "0" ]; then
             echo "::error::the A/B measurable-delta fixture suite did not report $guard_exact checks, all $guard_evidence_exact pinned evidence lines, all $guard_pins_expected verified pins (four distinct paths) and no failure line (evidence seen: $guard_evidence/$guard_evidence_exact, pins verified: $guard_pins_verified/$guard_pins_expected)"
-            echo "::error::scripts/tests/ab-measurable-delta.sh must print $guard_exact '  ok' lines, end with 'RESULT: $guard_exact fixture check(s) hold', and prove (a) the classifier skips a docs/records-only delta with rc 1 and no output, (b) the published gate figure is the median and never the minimum, (c) a beyond-gate regression is informational by default and exits 1 only under AB_GATE_ENFORCE=1, (d) the recorded remote command is REPLAYED, so the harness must receive AB_GATE_ENFORCE=1 AB_FORCE_MEASURE=0 and the two args — a `#` comment, an extra ssh argv or an env prefix cannot satisfy that witness, while the two accepted rewrites keep it from being over-strict — and (e) each of the six mutants — classifier forced to always skip, verdict forced to always pass, median replaced by the minimum, enforce path removed, the ab-remote.sh enforce/force splice deleted, and the switches deleted with the blessed chain left behind as a `#` comment — turns the suite red for the named reason while the same tree with an unmutated transport passes and the three real scripts stay byte-identical; a smaller total, a missing evidence line or a failure line means the fixture stopped witnessing that property — restore it rather than lowering this literal"
+            echo "::error::scripts/tests/ab-measurable-delta.sh must print $guard_exact '  ok' lines, end with 'RESULT: $guard_exact fixture check(s) hold', and prove (a) the classifier skips a docs/records-only delta with rc 1 and no output, (b) the published gate figure is the median and never the minimum, (c) a beyond-gate regression is informational by default and exits 1 only under AB_GATE_ENFORCE=1, (d) the recorded remote command is REPLAYED, so the harness must receive AB_GATE_ENFORCE=1 AB_FORCE_MEASURE=0 and the two args — a `#` comment or an extra ssh argv cannot satisfy that witness, while the two accepted rewrites keep it from being over-strict — and (e) each of the six mutants — classifier forced to always skip, verdict forced to always pass, median replaced by the minimum, enforce path removed, the ab-remote.sh enforce/force splice deleted, and the switches deleted with the blessed chain left behind as a `#` comment — turns the suite red for the named reason while the same tree with an unmutated transport passes and the three real scripts stay byte-identical; a smaller total, a missing evidence line or a failure line means the fixture stopped witnessing that property — restore it rather than lowering this literal"
             exit 1
           fi
           echo "A/B measurable-delta fixture checks ok: $guard_exact checks hold, all $guard_evidence_exact evidence lines live, pins verified $guard_pins_verified/$guard_pins_expected"
