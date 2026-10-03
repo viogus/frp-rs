@@ -1911,7 +1911,7 @@ jobs:
         # The literal is the pre-existing list plus the one row this change added
         # in this crate (`service::tests::dashboard_port_overlay_record_follows_this_builds_reader`):
         # this lane went 362 at the base (361 passed + 1 failed) to 363, and the
-        # other two new tests live in `frp-core`'s and `frps`'s own lanes. It is a
+        # other three new tests live in `frp-core`'s and `frps`'s own lanes. It is a
         # count, not a floor: a lower floor would let the shape quietly lose a
         # test, which is the failure mode this step exists to close.
         shell: bash
