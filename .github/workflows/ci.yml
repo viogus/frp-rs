@@ -1194,8 +1194,9 @@ jobs:
         # declared count has to be re-derived whenever a commit inserts or
         # removes a live cite: it moved 84 → 87 with the Batch I records,
         # 87 → 88 with this step's own new cite (the release-tests floor), and
-        # 93 → 99 with Batch M-7 (the A/B-gate item cite carried in
-        # `scripts/ab-matrix.sh`, the new classifier and its fixture suite,
+        # 93 → 101 with Batch M-7 (the A/B-gate item cite carried in
+        # `scripts/ab-matrix.sh`, the new classifier and its fixture suite —
+        # two files that only join the scan once they are tracked — plus
         # `.github/workflows/ab-matrix.yml` and the A/B gate step below); three
         # separate copies of an old literal `84` once left the health job red
         # (`RESULT: 87 …` followed by "did not report 84 …").
@@ -1213,8 +1214,8 @@ jobs:
           # the tree, so a scan that stops finding cites prints a smaller number
           # and reds; lowering the declared total has to move both literals, and
           # `bash scripts/tests/todo-cite-guard.sh` prints the number to paste.
-          guard_cites=99
-          guard_cites_floor=99
+          guard_cites=101
+          guard_cites_floor=101
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
