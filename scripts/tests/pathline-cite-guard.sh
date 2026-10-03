@@ -38,9 +38,15 @@
 # Two cite classes are covered:
 #
 #   * ABSOLUTE — a token `PATH:N` or `PATH:N-M` whose PATH is path-shaped (it
-#     carries a `/`, or its basename ends in one of `EXT`). A token that is not
-#     path-shaped (`127.0.0.1:7400`, `03:17`, `7000:7000`, `docker/dockerfile:1`)
-#     names no file and is ignored by construction, not by a noise blocklist.
+#     carries a `/`, or its basename ends in one of `EXT`). A leading `.` or `/`
+#     is part of the token, so `.github/workflows/<candidate>.yml:12` (the shape
+#     a real cite of a workflow takes), `./x.rs:1` and `/tmp/x.go:2` are all
+#     visible: the workflow one resolves in tree, the other two are counted as
+#     out of tree. A token that is *not* path-shaped (`127.0.0.1:7400`, `03:17`,
+#     `7000:7000`, `docker/dockerfile:1`) names no file and is ignored by
+#     construction, not by a noise blocklist. Every example in this file is a
+#     shape the tree does not contain, so the guard's own prose adds no
+#     citations of it.
 #   * SHORTHAND — a bare `:N` or `:N-M` whose colon is not preceded by a path
 #     character, a digit or another colon (so `"::1"`, `[::1]x]:8080` and
 #     `"proxy port:8080"` are not cites). It resolves to the *nearest preceding
@@ -94,13 +100,17 @@
 #     (`PATHLINE_MIN_CITES`, default 400), so a broken file list, a bogus root
 #     or a truncated checkout is a failure rather than a vacuous green (reported
 #     beside any other violation, never instead of it),
-#   * the count of unvalidatable cites (a path that resolves to more than one
+#   * the set of unvalidatable cites (a path that resolves to more than one
 #     tracked file) or of weakly anchored cites (the cited line's normalized
 #     text is not unique in its target file, so a fingerprint match does not
 #     prove the cite still points at the intended line — the class the original
-#     scan lost four cites to) rose above its pinned count. Those pins can only
-#     shrink, so a new unverifiable or weak cite has to be written as a
-#     resolvable citation of a unique line instead of being silently certified,
+#     scan lost four cites to) changed. Those sets are pinned **by identity** in
+#     the table header, not by count, because a count can be held constant by a
+#     compensating edit (demote one cite, promote another) while a newly weak
+#     cite is certified by a fingerprint match at a duplicated line,
+#   * a new cite into the point-in-time set appeared (that count is pinned and
+#     can only shrink: those cites are validated by no gate here, and only the
+#     `TODO.md` subset has one of its own),
 #   * `git ls-files` fails (a partial tree is never certified), or python3 is
 #     absent.
 #
@@ -217,8 +227,13 @@ PIT_DIRS = ("docs/history/", "docs/archive/", "docs/audit/")
 EXT = (".rs", ".md", ".toml", ".yml", ".yaml", ".sh", ".json", ".txt", ".ini",
        ".lock", ".cfg", ".conf", ".py", ".go")
 # `PATH:N` / `PATH:N-M`. The lookbehind refuses a token that is the tail of a
-# longer path, host or word.
-TOK_RE = re.compile(r'(?<![A-Za-z0-9_./-])([A-Za-z0-9_][A-Za-z0-9_./-]*?):(\d+)(?:-(\d+))?')
+# longer path, host or word; the optional leading `.`/`/` is what makes
+# `.github/workflows/example.yml:12`, `./x.rs:1` and `/tmp/x.go:2` visible at all
+# (the first is an in-tree cite, the others resolve as out of tree).
+TOK_RE = re.compile(r'(?<![A-Za-z0-9_./-])(\.?/?[A-Za-z0-9_][A-Za-z0-9_./-]*?):(\d+)(?:-(\d+))?')
+# `PATH:N/M/O` — a slash-separated continuation of one citation list. Only a
+# `/N` that directly follows a recognised citation token continues it.
+SLASH_RE = re.compile(r'/(\d+)(?:-(\d+))?')
 # Bare `:N` / `:N-M`. The lookbehind refuses a path tail, a digit (a port or a
 # time), another colon (`"::1"`) and the two characters that make a port
 # unambiguous inside this tree's string assertions (`[::1]x]:8080`).
@@ -457,6 +472,24 @@ def scan(tracked, ordered, files):
                               int(m.group(1)),
                               int(m.group(2)) if m.group(2) else None, "shorthand")
                 recognised.append((m.end(), tok, target, verdict))
+            for m in TOK_RE.finditer(line):
+                # `path:12/13/14`: every number after the first is its own cite
+                # of the same file, so the list cannot be half-checked.
+                if not path_shaped(m.group(1)):
+                    continue
+                target, verdict = resolve(rel, m.group(1), tracked, ordered, crate)
+                pos = m.end()
+                while True:
+                    sm = SLASH_RE.match(line, pos)
+                    if sm is None:
+                        break
+                    resolve_token(rel, lineno, sm.start() + 1,
+                                  sm.group(0).lstrip("/"), m.group(1), target,
+                                  verdict, int(sm.group(1)),
+                                  int(sm.group(2)) if sm.group(2) else None,
+                                  "continuation")
+                    recognised.append((sm.end(), m.group(1), target, verdict))
+                    pos = sm.end()
             for m in COMMA_RE.finditer(line):
                 comma = m.start()
                 prev = None
@@ -471,7 +504,28 @@ def scan(tracked, ordered, files):
                               tok, target, verdict, int(m.group(1)),
                               int(m.group(2)) if m.group(2) else None, "continuation")
                 recognised.append((m.end(), tok, target, verdict))
+    # Set witnesses, computed on stable keys: a weak cite is identified by its
+    # *target* (the property belongs to the target line, so a shift inside the
+    # citing file does not move it); a skip is identified by the citing token.
+    result["weak_set"] = set_hash(
+        "%s:%d-%s" % (c["target"], c["line"], c["end"] if c["end"] else "-")
+        for c in result["weak"])
+    result["ambiguous_set"] = set_hash("%s\t%s" % (a[0], a[2])
+                                       for a in result["ambiguous"])
+    result["excluded_set"] = set_hash("%s\t%s\t%s\t%d" % (e[0], e[2], e[3], e[4])
+                                      for e in result["excluded"])
     return result
+
+
+def set_hash(items):
+    return hashlib.sha256("\n".join(sorted(set(items))).encode("utf-8")).hexdigest()[:16]
+
+
+def set_members(items, limit=6):
+    out = sorted(set(items))
+    if len(out) > limit:
+        return ", ".join(out[:limit]) + " (+%d more)" % (len(out) - limit)
+    return ", ".join(out)
 
 
 def read_data(path):
@@ -488,7 +542,7 @@ def read_data(path):
             if not line.strip():
                 continue
             if line.startswith("#"):
-                m = re.match(r"#\s*counts:\s*(.*)$", line)
+                m = re.match(r"#\s*(?:counts|pins):\s*(.*)$", line)
                 if m:
                     for part in m.group(1).split():
                         if "=" in part:
@@ -681,9 +735,18 @@ if mode == "write":
                  "#   `checked` counts fingerprint-checked cites; `weak` are checked but\n"
                  "#        their cited line's text repeats in the target file; `ambiguous`\n"
                  "#        resolve to more than one tracked path. Both pins can only shrink.\n"
-                 "#   counts: checked=%d weak=%d ambiguous=%d excluded=%d foreign=%d\n"
+                 "#   checked/weak/ambiguous/excluded are fingerprint-checked or\n"
+                 "#   skipped counts; weak_set/ambiguous_set/excluded_set pin those\n"
+                 "#   sets BY IDENTITY (a compensating edit that keeps a count\n"
+                 "#   constant still reds); foreign_reported is reported, never\n"
+                 "#   checked — an out-of-tree token names a file this tree does not\n"
+                 "#   contain, so pinning it would forbid citing Go frp by\n"
+                 "#   `file:line`, which this repo's own convention requires.\n"
+                 "#   pins: checked=%d weak=%d ambiguous=%d excluded=%d "
+                 "foreign_reported=%d weak_set=%s ambiguous_set=%s excluded_set=%s\n"
                  % (len(res["cites"]), len(res["weak"]), len(res["ambiguous"]),
-                    len(res["excluded"]), res["foreign"]))
+                    len(res["excluded"]), res["foreign"], res["weak_set"],
+                    res["ambiguous_set"], res["excluded_set"]))
         for row in sorted(rows):
             fh.write(row + "\n")
     print("write: %d expectation(s) written to %s" % (len(rows), data_path))
@@ -775,47 +838,67 @@ if checked < min_cites:
                        "the scan is broken, not the tree clean — a broken file list, a bogus "
                        "root or a truncated checkout must never read as a clean tree"))
 
-# Pinned counts: cites whose path resolves to more than one tracked file, and
-# cites whose cited line text is not unique in its target file. Both pins live
-# in the table header and can only shrink, so a new skip has to be written as a
-# resolvable citation of a unique line instead of being silently certified.
+# Pinned sets. `weak_set` and `ambiguous_set` pin those classes BY IDENTITY, so
+# an edit that keeps a count constant (demote one cite, promote another) still
+# reds; `excluded` is pinned as a count that can only shrink, because a new cite
+# into the point-in-time set is a new cite this guard does not validate. The
+# out-of-tree count is deliberately NOT pinned: those tokens name files this tree
+# does not contain, and pinning them would make citing Go frp by `file:line` — the
+# convention this repo requires — a table regeneration.
 def pin(name):
-    v = header.get(name)
-    return int(v) if v is not None and v.isdigit() else None
+    return header.get(name)
 
 
-pin_ambiguous, pin_weak = pin("ambiguous"), pin("weak")
-if pin_ambiguous is None or pin_weak is None:
-    die("%s has no pinned 'ambiguous'/'weak' count in its header; a table without the "
-        "skip pins cannot vouch for what it does not check" % data_path)
-if len(res["ambiguous"]) > pin_ambiguous:
-    violations.append(("%d ambiguous cite(s) (pinned %d)"
-                       % (len(res["ambiguous"]), pin_ambiguous),
-                       "a new cite resolves to more than one tracked file; write the "
-                       "path that resolves: " +
-                       "; ".join("%s:%d cites %s" % (a[0], a[1], a[2])
-                                 for a in res["ambiguous"][:6])))
-if len(res["weak"]) > pin_weak:
-    violations.append(("%d weakly anchored cite(s) (pinned %d)"
-                       % (len(res["weak"]), pin_weak),
-                       "a new cite points at a line whose text repeats in its file, so a "
-                       "fingerprint match cannot prove it still points at the intended "
-                       "line; cite a unique line: " +
-                       "; ".join("%s:%d cites %s" % (w["cite"], w["cite_line"], w["raw"])
-                                 for w in res["weak"][:6])))
+pin_weak_set, pin_ambiguous_set = pin("weak_set"), pin("ambiguous_set")
+pin_excluded = pin("excluded")
+if not pin_weak_set or not pin_ambiguous_set or pin_excluded is None:
+    die("%s has no pinned weak_set/ambiguous_set/excluded in its header; a table "
+        "without the skip pins cannot vouch for what it does not check" % data_path)
+if not pin_excluded.isdigit():
+    die("%s pins a non-numeric excluded count (%r)" % (data_path, pin_excluded))
+if res["weak_set"] != pin_weak_set:
+    violations.append(
+        ("the weak-anchor set changed (pinned %s, measured %s)"
+         % (pin_weak_set, res["weak_set"]),
+         "a cite points at a line whose text repeats in its file, so a fingerprint "
+         "match cannot prove it still points at the intended line — and a count pin "
+         "alone can be held constant by a compensating edit; cite a unique line and "
+         "regenerate the table with --write: "
+         + set_members("%s:%d-%s" % (w["target"], w["line"],
+                                     w["end"] if w["end"] else "-")
+                       for w in res["weak"])))
+if res["ambiguous_set"] != pin_ambiguous_set:
+    violations.append(
+        ("the ambiguous-path set changed (pinned %s, measured %s)"
+         % (pin_ambiguous_set, res["ambiguous_set"]),
+         "a cite resolves to more than one tracked file; write the path that "
+         "resolves and regenerate the table with --write: "
+         + set_members("%s:%d cites %s" % (a[0], a[1], a[2])
+                       for a in res["ambiguous"])))
+if len(res["excluded"]) > int(pin_excluded):
+    violations.append(
+        ("%d cite(s) into the point-in-time set (pinned %d)"
+         % (len(res["excluded"]), int(pin_excluded)),
+         "a new cite this guard cannot validate was added; it is validated by no "
+         "other gate unless it names TODO.md, so either point it at a live file or "
+         "regenerate the table with --write: "
+         + set_members("%s:%d cites %s" % (e[0], e[1], e[2])
+                       for e in res["excluded"])))
 
 print("pathline-cite-guard: %d cite(s) checked (%d absolute, %d shorthand) across %d "
       "citing file(s) and %d target file(s)"
       % (len(res["cites"]), len(res["cites"]) - res["shorthand"], res["shorthand"],
          len(set(c["cite"] for c in res["cites"])),
          len(set(c["target"] for c in res["cites"]))))
-print("pathline-cite-guard: unvalidatable (pinned, can only shrink): %d ambiguous "
-      "path(s) [pin %d]; %d weakly anchored cite(s) [pin %d]"
-      % (len(res["ambiguous"]), pin_ambiguous, len(res["weak"]), pin_weak))
+print("pathline-cite-guard: unvalidatable, pinned by identity: %d ambiguous "
+      "path(s) [set %s]; %d weakly anchored cite(s) [set %s]"
+      % (len(res["ambiguous"]), pin_ambiguous_set, len(res["weak"]), pin_weak_set))
 print("pathline-cite-guard: excluded/reported, never silently ignored: %d cite(s) into "
-      "the point-in-time set; %d out-of-tree token(s) (%d of them shorthand anchors) "
-      "naming files this tree does not contain"
-      % (len(res["excluded"]), res["foreign"], res["foreign_shorthand"]))
+      "the point-in-time set [pin %s, can only shrink]; %d out-of-tree token(s) "
+      "(%d of them shorthand/continuation anchors) naming files this tree does not "
+      "contain — reported, not pinned (citing Go frp by `file:line` must not require "
+      "a regeneration)"
+      % (len(res["excluded"]), pin_excluded, res["foreign"], res["foreign_shorthand"]))
 for rel, lineno, raw, why in res["ambiguous"]:
     print("  note  %s:%d cites %s — %s" % (rel, lineno, raw, why))
 for c in res["weak"]:

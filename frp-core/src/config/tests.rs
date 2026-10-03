@@ -11919,7 +11919,7 @@ fn test_server_config_defaults_pinned() {
 
 #[test]
 fn test_max_conns_per_proxy_snapshot_clamped_to_2pow20() {
-    // server.rs:197: ServerConfigSnapshot clamps max_conns_per_proxy to
+    // server.rs:233: ServerConfigSnapshot clamps max_conns_per_proxy to
     // 2^20 — a u64::MAX value would overflow the i64 normalized field
     // (u64::MAX -> -1) and truncate on 32-bit usize.
     let cfg = ServerConfig {

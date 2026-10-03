@@ -39,7 +39,14 @@
 #   18 the expectation table is never scanned as a citing file, even when it
 #      lives inside the tree;
 #   19 `--write` is idempotent and reports the added/removed delta;
-#   20 a failing `git ls-files` is a hard failure, not a partial tree.
+#   20 a failing `git ls-files` is a hard failure, not a partial tree;
+#   21 a dot-leading target path is a cite at all (`.fx/dot.rs:2`) and reds when
+#      its line moves — the class that was invisible before review round 1;
+#   22 a `path:N/M` list is checked at every number, not only the first;
+#   23 the weak-anchor set is pinned BY IDENTITY: an edit that keeps the weak
+#      count constant (one cite promoted, another demoted) still reds;
+#   24 the point-in-time count is pinned (a new cite into it reds), while an
+#      out-of-tree token is reported and deliberately NOT pinned.
 #
 # Self-contained: no network, no cargo, no compat run. Synthetic trees live
 # under `mktemp -d` and are removed on every exit path.
@@ -78,7 +85,7 @@ FLOOR_EXEMPT=""
 
 # The floor below is this suite's own self-defence (the same shape as the
 # sibling suites): `exit "$fails"` alone is happy with no assertions at all.
-MIN_CHECKS=55
+MIN_CHECKS=71
 
 # shellcheck disable=SC2329  # invoked by the EXIT trap below, not directly
 cleanup_all() {
@@ -139,6 +146,8 @@ build_tree() {   # $1 = directory
   printf 'dup one\n' > "$d/fx/two_a/dup.rs"
   printf 'dup two\n' > "$d/fx/two_b/dup.rs"
   printf 'repeat A\nrepeat A\n' > "$d/fx/repeat.rs"
+  mkdir -p "$d/.fx"
+  printf 'dot one\ndot two\ndot three\n' > "$d/.fx/dot.rs"
   printf 'TODO item one\nTODO item two\n' > "$d/TODO.md"
   printf 'changelog line\n' > "$d/CHANGELOG.md"
   printf 'history line\n' > "$d/docs/history/log.md"
@@ -465,7 +474,7 @@ case $(cat "$TABLE") in
 esac
 run_gate
 case $LAST_OUT in
-  *'1 ambiguous path(s) [pin 1]'*) ok 'ambiguous: reported with its pin' ;;
+  *'1 ambiguous path(s) [set '*) ok 'ambiguous: reported with its set witness' ;;
   *) bad "ambiguous: the skip is not reported: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
 esac
 printf '<!-- see %s -->\n' "$(cite dup.rs 1)" >> "$TREE/notes.md"
@@ -476,7 +485,7 @@ else
   bad 'ambiguous: a new unvalidatable cite was certified'
 fi
 case $LAST_OUT in
-  *'ambiguous cite(s) (pinned 1)'*) ok 'ambiguous: the pin failure names the counts' ;;
+  *'the ambiguous-path set changed'*) ok 'ambiguous: the pin failure names the set change' ;;
   *) bad "ambiguous: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
 esac
 
@@ -486,7 +495,7 @@ set_notes "$(printf '<!-- see %s -->' "$(cite fx/repeat.rs 1)")"
 write_table
 run_gate
 case $LAST_OUT in
-  *'1 weakly anchored cite(s) [pin 1]'*) ok 'weak anchor: reported with its pin' ;;
+  *'1 weakly anchored cite(s) [set '*) ok 'weak anchor: reported with its set witness' ;;
   *) bad "weak anchor: the skip is not reported: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
 esac
 printf '<!-- see %s -->\n' "$(cite fx/repeat.rs 2)" >> "$TREE/notes.md"
@@ -497,7 +506,7 @@ else
   bad 'weak anchor: a new weak cite was certified'
 fi
 case $LAST_OUT in
-  *'weakly anchored cite(s) (pinned 1)'*) ok 'weak anchor: the pin failure names the counts' ;;
+  *'the weak-anchor set changed'*) ok 'weak anchor: the pin failure names the set change' ;;
   *) bad "weak anchor: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
 esac
 
@@ -581,6 +590,119 @@ fi
 case $LAST_OUT in
   *'git ls-files failed'*) ok 'git failure: named as a partial tree' ;;
   *) bad "git failure: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+
+hdr 'scenario 21 — a dot-leading target path is scanned (review A2-1)'
+build_tree "$TREE"
+set_notes "$(printf '<!-- see %s -->' "$(cite .fx/dot.rs 2)")"
+write_table
+run_gate
+if [ "$LAST_RC" -eq 0 ]; then
+  ok 'dot-leading: the cite is visible and green when correct'
+else
+  bad "dot-leading: gate exited $LAST_RC: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')"
+fi
+case $LAST_OUT in
+  *'RESULT: 1 cite(s) checked, 0 violation(s)'*) ok 'dot-leading: counted as a cite, not dropped' ;;
+  *) bad "dot-leading: unexpected summary: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+insert_after "$TREE/.fx/dot.rs" 1 'inserted'
+run_gate
+if [ "$LAST_RC" -ne 0 ]; then
+  ok "dot-leading: a moved line reds (rc $LAST_RC)"
+else
+  bad 'dot-leading: a moved dot-leading cite was certified'
+fi
+case $LAST_OUT in
+  *'notes.md:1 cites .fx/dot.rs:2'*) ok 'dot-leading: the failure names the dot-leading cite' ;;
+  *) bad "dot-leading: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+
+hdr 'scenario 22 — a `path:N/M` list is checked at every number'
+build_tree "$TREE"
+set_notes "$(printf '<!-- see %s -->' "$(cite fx/anchor.rs '2/4')")"
+write_table
+run_gate
+if [ "$LAST_RC" -eq 0 ]; then
+  ok 'slash list: gate exited 0'
+else
+  bad "slash list: gate exited $LAST_RC: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')"
+fi
+case $LAST_OUT in
+  *'RESULT: 2 cite(s) checked, 0 violation(s)'*) ok 'slash list: both numbers are cites' ;;
+  *) bad "slash list: unexpected summary: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+insert_after "$TREE/fx/anchor.rs" 2 'inserted'
+run_gate
+case $LAST_OUT in
+  *'notes.md:1 cites 4'*) ok 'slash list: a moved non-first number reds' ;;
+  *) bad "slash list: the moved second number did not red: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+
+hdr 'scenario 23 — the weak-anchor set is pinned by identity (review A1)'
+build_tree "$TREE"
+set_notes "$(printf '<!-- see %s -->' "$(cite fx/repeat.rs 1)")"
+write_table
+run_gate
+case $LAST_OUT in
+  *'1 weakly anchored cite(s) [set '*) ok 'weak set: reported with its set witness' ;;
+  *) bad "weak set: unexpected output: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+# Promote the weak target and demote another: the COUNT stays 1, the set changes.
+printf 'repeat A\nrepeat B\n' > "$TREE/fx/repeat.rs"
+printf 'gamma\ngamma\n' > "$TREE/fx/other.rs"
+set_notes "$(printf '<!-- see %s -->' "$(cite fx/other.rs 1)")"
+run_gate
+if [ "$LAST_RC" -ne 0 ]; then
+  ok "weak set: a compensating edit that keeps the count reds (rc $LAST_RC)"
+else
+  bad 'weak set: a new weak cite was certified by holding the count constant'
+fi
+case $LAST_OUT in
+  *'the weak-anchor set changed'*) ok 'weak set: named as a set change, not a count change' ;;
+  *) bad "weak set: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+
+hdr 'scenario 24 — the point-in-time pin bites; out-of-tree tokens stay reported'
+build_tree "$TREE"
+set_notes "$(printf '<!-- see %s and %s -->' "$(cite fx/anchor.rs 2)" "$(cite TODO.md 2)")"
+write_table
+case $(cat "$TABLE") in
+  *'excluded=1'*) ok 'PIT pin: the table pins the excluded count' ;;
+  *) bad "PIT pin: the header does not pin excluded: $(head -13 "$TABLE" | tail -1)" ;;
+esac
+run_gate
+if [ "$LAST_RC" -eq 0 ]; then
+  ok 'PIT pin: one excluded cite is inside the pin'
+else
+  bad "PIT pin: gate exited $LAST_RC: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')"
+fi
+set_notes "$(printf '<!-- see %s and %s and %s -->' \
+  "$(cite fx/anchor.rs 2)" "$(cite TODO.md 1)" "$(cite TODO.md 2)")"
+run_gate
+if [ "$LAST_RC" -ne 0 ]; then
+  ok "PIT pin: a new unvalidated cite reds (rc $LAST_RC)"
+else
+  bad 'PIT pin: a brand-new cite into the point-in-time set was certified'
+fi
+case $LAST_OUT in
+  *'2 cite(s) into the point-in-time set (pinned 1)'*) ok 'PIT pin: named with the measured and pinned counts' ;;
+  *) bad "PIT pin: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+# An out-of-tree token is reported, and is deliberately not a pin.
+set_notes "$(printf '<!-- see %s and the Go source %s -->' \
+  "$(cite fx/anchor.rs 2)" "$(cite pkg/x/y.go 3)")"
+write_table
+run_gate
+if [ "$LAST_RC" -eq 0 ]; then
+  ok 'out of tree: a new out-of-tree token does not red (it is not pinned)'
+else
+  bad "out of tree: gate exited $LAST_RC: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')"
+fi
+case $LAST_OUT in
+  *'1 out-of-tree token(s)'*'reported, not pinned'*)
+    ok 'out of tree: reported as a count, with the not-pinned wording' ;;
+  *) bad "out of tree: the not-pinned wording is missing: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
 esac
 
 hdr 'summary'

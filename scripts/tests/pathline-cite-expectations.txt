@@ -12,8 +12,34 @@
 #   `checked` counts fingerprint-checked cites; `weak` are checked but
 #        their cited line's text repeats in the target file; `ambiguous`
 #        resolve to more than one tracked path. Both pins can only shrink.
-#   counts: checked=552 weak=104 ambiguous=3 excluded=101 foreign=1087
+#   checked/weak/ambiguous/excluded are fingerprint-checked or
+#   skipped counts; weak_set/ambiguous_set/excluded_set pin those
+#   sets BY IDENTITY (a compensating edit that keeps a count
+#   constant still reds); foreign_reported is reported, never
+#   checked — an out-of-tree token names a file this tree does not
+#   contain, so pinning it would forbid citing Go frp by
+#   `file:line`, which this repo's own convention requires.
+#   pins: checked=576 weak=110 ambiguous=3 excluded=101 foreign_reported=1102 weak_set=98988680286794c2 ambiguous_set=3343d4d37da5672a excluded_set=b9edd5e0be647e0f
+.github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
+.github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
+.github/workflows/ci.yml	2168	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2168	1927
+.github/workflows/ci.yml	2205	-	80e22379f5c3208f	-	shorthand	frp-server/src/service.rs	:2205	1932
+.github/workflows/ci.yml	2326	-	fb82d0696d9fd611	-	absolute	frp-core/tests/server_tls_enable_warning.rs	.github/workflows/ci.yml:2326	69
+.github/workflows/ci.yml	2358	-	1d89d0bdaa9b8255	-	absolute	frp-core/tests/server_tls_enable_warning.rs	.github/workflows/ci.yml:2358	70
+.github/workflows/ci.yml	3738	-	617352ccbe704925	-	shorthand	frp-server/src/service.rs	:3738	1930
+.github/workflows/ci.yml	3907	-	65517cd6afc07e87	-	shorthand	frp-server/src/service.rs	:3907	1927
+.github/workflows/ci.yml	4034	-	2347508c4d7d174f	-	absolute	frp-core/src/config/loader.rs	.github/workflows/ci.yml:4034	546
+.github/workflows/ci.yml	4038	-	ffcd933bf34d97ec	-	absolute	frp-core/src/config/loader.rs	.github/workflows/ci.yml:4038	546
 .github/workflows/ci.yml	4183	-	18846d75aa14e857	-	absolute	frp-server/tests/server_reload_restart_only.rs	ci.yml:4183	456
+.github/workflows/compat.yml	56	-	c41c6ce65d703821	-	absolute	docs/developing.md	.github/workflows/compat.yml:56	842
+.github/workflows/release.yml	100	-	41ad231d0c512310	-	absolute	frp-core/src/config/loader.rs	.github/workflows/release.yml:100	545
+.github/workflows/release.yml	102	-	134d494a5a310cb3	-	continuation	frp-core/src/config/loader.rs	102	545
+.github/workflows/release.yml	108	-	2fb3481479c973bc	-	continuation	frp-core/src/config/loader.rs	108	545
+.github/workflows/release.yml	110	-	546ae6068b2442a6	-	continuation	frp-core/src/config/loader.rs	110	545
+.github/workflows/release.yml	159	-	f1db6bc806bab9cb	-	continuation	frp-core/src/config/loader.rs	159	545
+.github/workflows/release.yml	162	-	7114fd8d158867fe	-	continuation	frp-core/src/config/loader.rs	162	545
+.github/workflows/release.yml	210	-	f1db6bc806bab9cb	-	continuation	frp-core/src/config/loader.rs	210	545
+.github/workflows/release.yml	213	-	7114fd8d158867fe	-	continuation	frp-core/src/config/loader.rs	213	545
 docs/config.md	14	-	c0a6027d52a52c4f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:14	1051
 docs/config.md	14	-	c0a6027d52a52c4f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:14	1052
 docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1072
@@ -29,7 +55,7 @@ docs/config.md	25	-	628fa5d96339c307	-	absolute	scripts/tests/docs-go-column.sh	
 docs/config.md	25	-	628fa5d96339c307	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:25	62
 docs/config.md	668	-	97410f5562191f30	-	absolute	docs/developing.md	docs/config.md:668	4050
 docs/deployment.md	900	-	4459a65e565615ca	-	absolute	frp-core/src/config/tests.rs	docs/deployment.md:900	11613
-docs/developing.md	3842	-	c075e32b1c3e14e7	-	absolute	scripts/repo-health.sh	docs/developing.md:3842	2476
+docs/developing.md	3858	-	b89356a83457bbb3	-	absolute	scripts/repo-health.sh	docs/developing.md:3858	2476
 frp-client/src/admin.rs	1149	-	11314c6e379da4e8	-	absolute	.github/workflows/ci.yml	frp-client/src/admin.rs:1149	3954
 frp-client/src/admin.rs	1149	-	11314c6e379da4e8	-	absolute	docs/config.md	frp-client/src/admin.rs:1149	192
 frp-client/src/admin.rs	1164	-	4c89606352d037fc	-	absolute	docs/config.md	frp-client/src/admin.rs:1164	192
@@ -173,7 +199,7 @@ frp-core/src/config/file.rs	543	-	135a528cea4dc1f6	-	absolute	frp-core/src/confi
 frp-core/src/config/file.rs	81	88	dd527f75d071e622	72f40e02ac13ab3e	absolute	docs/config.md	frp-core/src/config/file.rs:81-88	22
 frp-core/src/config/file.rs	85	-	22820fcaab15a80e	-	shorthand	docs/config.md	:85	22
 frp-core/src/config/file.rs	869	-	4d97dc999ac923fe	-	absolute	frp-core/src/config/tests.rs	frp-core/src/config/file.rs:869	12959
-frp-core/src/config/file.rs	874	-	066cef62e0af8138	-	shorthand	frps/tests/cli_exit_codes.rs	:874	1303
+frp-core/src/config/file.rs	873	-	e07ebe9eb2b3b4a7	-	shorthand	frps/tests/cli_exit_codes.rs	:873	1303
 frp-core/src/config/file.rs	893	-	88b17f4d9ffdb7da	-	absolute	frp-core/src/config/tests.rs	frp-core/src/config/file.rs:893	4256
 frp-core/src/config/file.rs	893	-	88b17f4d9ffdb7da	-	shorthand	frps/tests/cli_exit_codes.rs	:893	1303
 frp-core/src/config/file.rs	908	916	f5fb844c292f5f8c	d10b36aa74a59bcf	absolute	frp-core/src/config/tests.rs	frp-core/src/config/file.rs:908-916	12990
@@ -265,7 +291,7 @@ frp-core/src/config/normalize.rs	918	927	7390df51cbaffb1a	eb7cb68dce13aae0	absol
 frp-core/src/config/normalize.rs	918	927	7390df51cbaffb1a	eb7cb68dce13aae0	absolute	frp-core/tests/server_tls_enable_warning.rs	frp-core/src/config/normalize.rs:918-927	557
 frp-core/src/config/server.rs	1415	-	c76767988b0d75ba	-	absolute	docs/developing.md	frp-core/src/config/server.rs:1415	202
 frp-core/src/config/server.rs	165	-	044d5563c14d5e76	-	absolute	frp-core/src/config/file.rs	frp-core/src/config/server.rs:165	465
-frp-core/src/config/server.rs	197	-	52127f34d1d3dc80	-	absolute	frp-core/src/config/tests.rs	server.rs:197	11922
+frp-core/src/config/server.rs	233	-	3c9e6821c90cef0b	-	absolute	frp-core/src/config/tests.rs	server.rs:233	11922
 frp-core/src/config/server.rs	249	-	40543641219f3caa	-	absolute	frp-core/src/cli.rs	frp-core/src/config/server.rs:249	583
 frp-core/src/config/server.rs	249	-	40543641219f3caa	-	absolute	frp-core/src/cli.rs	frp-core/src/config/server.rs:249	5922
 frp-core/src/config/server.rs	39	41	7f4dc7c9a19c10f0	e8ce8b12b33170f3	absolute	docs/config.md	frp-core/src/config/server.rs:39-41	22
@@ -340,6 +366,9 @@ frp-server/src/control/nathole.rs	480	-	d16499b7d8ca47d6	-	absolute	frp-server/t
 frp-server/src/control/nathole.rs	543	-	ff8121770d1fd6b3	-	absolute	frp-server/tests/visitor_allow_users_e2e.rs	control/nathole.rs:543	12
 frp-server/src/control/nathole.rs	543	-	ff8121770d1fd6b3	-	absolute	frp-server/tests/visitor_allow_users_e2e.rs	control/nathole.rs:543	669
 frp-server/src/control/nathole.rs	543	-	ff8121770d1fd6b3	-	absolute	frp-server/tests/visitor_allow_users_e2e.rs	control/nathole.rs:543	68
+frp-server/src/control/nathole.rs	554	-	ff8121770d1fd6b3	-	continuation	frp-server/tests/visitor_allow_users_e2e.rs	554	12
+frp-server/src/control/nathole.rs	554	-	ff8121770d1fd6b3	-	continuation	frp-server/tests/visitor_allow_users_e2e.rs	554	669
+frp-server/src/control/nathole.rs	554	-	ff8121770d1fd6b3	-	continuation	frp-server/tests/visitor_allow_users_e2e.rs	554	68
 frp-server/src/control/nathole.rs	575	-	2160c39f8cd87698	-	shorthand	frp-server/src/service.rs	:575	1663
 frp-server/src/control/pool.rs	702	-	db95f7e5de8e4946	-	absolute	docs/developing.md	frp-server/src/control/pool.rs:702	361
 frp-server/src/control/pool.rs	784	-	7b6b44c8a16a0cd4	-	absolute	frp-server/tests/vhost_http_group.rs	pool.rs:784	426
@@ -385,6 +414,8 @@ frp-server/src/dashboard.rs	2151	-	d3c6ef1358a5d0fd	-	absolute	docs/developing.m
 frp-server/src/dashboard.rs	2352	-	cd3d4d6763ea83ff	-	absolute	docs/developing.md	frp-server/src/dashboard.rs:2352	1307
 frp-server/src/dashboard.rs	2690	-	cc363926b55d0695	-	shorthand	docs/developing.md	:2690	240
 frp-server/src/dashboard.rs	3670	-	2451763aee02af1c	-	absolute	frp-client/src/admin.rs	frp-server/src/dashboard.rs:3670	988
+frp-server/src/dashboard.rs	3672	-	62de99fb3c802b4f	-	continuation	frp-client/src/admin.rs	3672	988
+frp-server/src/dashboard.rs	3696	-	7b5b191d51cb0d90	-	continuation	frp-client/src/admin.rs	3696	988
 frp-server/src/dashboard.rs	3773	-	9c65b9b57fb64ebf	-	shorthand	frp-server/tests/common/mod.rs	:3773	648
 frp-server/src/dashboard.rs	3786	-	5c821f00d98f4219	-	absolute	frp-server/tests/common/mod.rs	dashboard.rs:3786	648
 frp-server/src/dashboard.rs	659	-	a89c5c6a8dc0eba2	-	absolute	docs/developing.md	frp-server/src/dashboard.rs:659	239

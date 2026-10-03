@@ -1300,7 +1300,7 @@ fn config_dir_recorded_signal_fans_out_to_an_already_registered_service() {
 /// `TODO.md:9475`, **recorded** rather than fixed: the collector admits a
 /// directory entry by lowercased extension with no regular-file check
 /// (`frp-core/src/config/file.rs:958`/`:976`; the `directory` guards live only in
-/// the include-path `glob_in_dir` at `:874`/`:893`), and the loader then does a
+/// the include-path `glob_in_dir` at `:873`/`:893`), and the loader then does a
 /// blocking `std::fs::read_to_string` (`:435`). A FIFO named `*.toml` therefore
 /// wedges the lane instead of being refused: the startup line is logged and the
 /// per-file loop never gets past the read, so no service is ever constructed.

@@ -1655,19 +1655,19 @@ jobs:
           sabotage_table=/tmp/frp-pathline-cite-sabotage.txt
           status=0
           guard_file=scripts/tests/pathline-cite-fixtures.sh
-          guard_pin=e1710e15f982add98116e0d9ee297e57c8d1042df461d3137cc534556c6124b4
+          guard_pin=de3200a26c962a1f24562e7f318d3d740e0811832c396735a9a3c29460fc3b99
           guard_subject=scripts/tests/pathline-cite-guard.sh
-          guard_subject_pin=504e1ced643c7f277be57799bb60c389556d886356d1bc14e0d99d868e22ab4a
+          guard_subject_pin=d7e4c92c31c9c97fde16522a62b74da25b3c32d5b37b0d41b4112a5469c22145
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=3b7cb01bfcbe91ae1338501b6d4ab1b89109df4263b2e283961d59d08244354a
-          guard_exact=55
-          guard_floor=55
+          guard_data_pin=8d3d1eea21d760cb01dfe50badbf20043cf79ec11faa006870da74647f200bc2
+          guard_exact=71
+          guard_floor=71
           guard_canary='witness M1: one-line insert reddened notes.md:1'
           # The measured live inventory at this head and a floor under it, the
           # `guard_cites`/`guard_cites_floor` pair the TODO.md citation step
           # uses: a *falling* count has to move both literals.
-          guard_cites=552
-          guard_cites_floor=552
+          guard_cites=576
+          guard_cites_floor=576
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
