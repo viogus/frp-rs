@@ -58,16 +58,25 @@
 #      and does not claim the name matched nothing.
 #   13 selector --skipped phase: a real display name whose phase was skipped in
 #      this configuration is told apart from a typo.
+#   14 selector --hostile GO_FRP_DIR: with `GO_FRP_DIR` exported to a directory
+#      whose `frps`/`frpc` are marker scripts that record their own execution, a
+#      stubbed run of the V2 display name still reaches its scenario with no
+#      marker executed — the `FRP_COMPAT_*` seam wins over an inherited Go
+#      directory at every assignment site, `GO_FRPS_V2`/`GO_FRPC_V2` included.
 #
 # Self-contained: no network, no repo binaries, no Go frp, and no scenario
 # reaches a real server. Every stubbed selector run pins `GO_FRP_VERSION` to
-# `0.0.0-fixture.<pid>`, so the default Go directory the harness derives cannot
-# exist; the suite asserts that directory is absent (the probe is not vacuous)
-# and that the harness never printed its missing-binary error — so a real
-# `/tmp/frp_0.71.0_*` left on the host by an earlier compat run cannot stand in
-# for a stub and mask a broken seam. The stub-driven runs stop at the harness's
-# own pre-gate executable check or at the stub's first missing listener.
-# Temporary listeners and trees are removed on exit.
+# `0.0.0-fixture.<pid>` and drops an inherited `GO_FRP_DIR`, so the default Go
+# directory the harness derives cannot exist; the suite asserts that directory is
+# absent (the probe is not vacuous) and that the harness never printed its
+# missing-binary error — so a real `/tmp/frp_0.71.0_*` left on the host by an
+# earlier compat run cannot stand in for a stub and mask a broken seam. A
+# *nonexistent* fallback cannot show that the seam beats an *existing* one, so
+# one stubbed run also runs with `GO_FRP_DIR` pointing at marker scripts and
+# asserts neither executed while the run still reached its scenario. The
+# stub-driven runs stop at the harness's own pre-gate executable check or at the
+# stub's first missing listener. Temporary listeners and trees are removed on
+# exit.
 #
 # Usage: bash scripts/tests/compat-port-ownership.sh
 set -uo pipefail
@@ -103,7 +112,7 @@ fails=0
 # hold`, so a suite that silently stops checking must not exit green. The floor
 # and the ordered `SHAPE` below are enforced from the exit trap on every path,
 # including an early `exit 0`.
-MIN_CHECKS=59
+MIN_CHECKS=61
 # The ordered assertion anchors, one per `ok`/`bad` call in scenario order:
 # a scenario that stops running, a deleted check, a reordered check, or a dummy
 # `ok` anywhere all move `LABELS` away from this list.
@@ -166,6 +175,8 @@ SHAPE=(
   "selector --debug: the run exits non-zero for the failed scenario"
   "selector: a skipped-phase name exits non-zero"
   "selector: the skipped-phase message names the phase, not a typo"
+  "selector --hostile GO_FRP_DIR: no marker binary ran"
+  "selector --hostile GO_FRP_DIR: the V2 probe reached its scenario"
   "selector: no stub run needed a real binary"
 )
 
@@ -627,13 +638,37 @@ make_stub gofrpc
 make_stub rustfrps
 make_stub rustfrpc
 
+# A directory of marker `frps`/`frpc` for the hostile-ambient case below: each
+# records its own path when executed and then answers `--version` like a stub, so
+# a probe that does reach one still terminates.
+MARKER_GO_DIR="$WORK/marker-go-dir"
+MARKER_LOG="$WORK/marker-runs.log"
+mkdir -p "$MARKER_GO_DIR"
+make_marker() {
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'printf "%%s\\n" "$0" >> %q\n' "$MARKER_LOG"
+    printf 'printf "%%s 0.71.0\\n" %q\n' "$1"
+  } > "$MARKER_GO_DIR/$1"
+  chmod +x "$MARKER_GO_DIR/$1"
+}
+make_marker frps
+make_marker frpc
+
 stub_out=""
 stub_rc=0
 # Set if any stubbed run prints the harness's missing-binary error: the seam did
-# not take effect and the run fell back to the (nonexistent) default paths.
+# not take effect and the run fell back to the default paths.
 stub_missing_binary=0
-run_stubbed() {
-  stub_out=$(GO_FRP_VERSION="$STUB_VERSION" \
+# `$1` is the `GO_FRP_DIR` the run inherits: `-` drops any ambient one so the run
+# takes the harness's own recalculation path, and therefore the derived
+# directory the absence check pins; anything else is exported as an existing Go
+# directory — the hostile case, which must still not be executed.
+run_stubbed_in() {
+  local ambient_dir="$1"; shift
+  local go_dir_env=(-u GO_FRP_DIR)
+  [ "$ambient_dir" = "-" ] || go_dir_env=(GO_FRP_DIR="$ambient_dir")
+  stub_out=$(env "${go_dir_env[@]}" GO_FRP_VERSION="$STUB_VERSION" \
     FRP_COMPAT_GO_FRPS="$STUB_DIR/gofrps" \
     FRP_COMPAT_GO_FRPC="$STUB_DIR/gofrpc" \
     FRP_COMPAT_RUST_FRPS="$STUB_DIR/rustfrps" \
@@ -645,6 +680,7 @@ run_stubbed() {
     *'Binary not found or not executable'*) stub_missing_binary=1 ;;
   esac
 }
+run_stubbed() { run_stubbed_in - "$@"; }
 
 # The harness colors its ` RESULTS:` line even when redirected, so the summary
 # is matched with the escapes stripped.
@@ -728,7 +764,28 @@ case "$stub_out" in
   *) bad 'selector: the skipped-phase message names the phase, not a typo' ;;
 esac
 
-# Aggregated over all three stubbed runs above. A seam that is ignored where the
+hdr 'selector --hostile GO_FRP_DIR'
+# The V2 aliases used to be assigned from `$GO_FRP_DIR` directly, so a
+# `GO_FRP_DIR` exported by the caller won over the seam. `ensure_go_frp_v2`
+# executes `"$GO_FRPS_V2" --version`, and its phase gate runs on every invocation
+# before the `--test` gate, so the markers below executed even while every path
+# the seam covers was a stub. The V2 display name is deliberate: it reaches both
+# the phase gate and the scenario's own `ensure_go_frp_v2`.
+rm -f "$MARKER_LOG"
+run_stubbed_in "$MARKER_GO_DIR" --ci --test go-to-rust-udp-v2
+hostile_plain=$(strip_ansi "$stub_out")
+if [ ! -s "$MARKER_LOG" ]; then
+  ok 'selector --hostile GO_FRP_DIR: no marker binary ran'
+else
+  bad "selector --hostile GO_FRP_DIR: no marker binary ran ($(wc -l < "$MARKER_LOG" | tr -d ' ') run(s): $(tr '\n' ' ' < "$MARKER_LOG"))"
+fi
+case "$hostile_plain" in
+  *'=== go-to-rust-udp-v2 ==='*)
+    ok 'selector --hostile GO_FRP_DIR: the V2 probe reached its scenario' ;;
+  *) bad 'selector --hostile GO_FRP_DIR: the V2 probe reached its scenario' ;;
+esac
+
+# Aggregated over all four stubbed runs above. A seam that is ignored where the
 # harness recomputes `GO_FRP_DIR` falls back to the default paths, which do not
 # exist here, so the harness dies at its executable check instead of reaching the
 # selector gate — exactly what a clean CI runner saw.

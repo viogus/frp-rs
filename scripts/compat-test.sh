@@ -24,14 +24,17 @@ else
     GO_FRP_DIR="/tmp/frp_${GO_FRP_VERSION}_${_gos}_${_goa}"
 fi
 # Each binary path is overridable through the environment, and the override is
-# honoured in both places the Go paths are assigned: here and in the
-# recalculation block below, which re-derives `GO_FRP_DIR` when `--go-version`
-# (or `GO_FRP_VERSION`) changes the version. `scripts/tests/
+# honoured at every place the Go paths are assigned: `GO_FRPS`/`GO_FRPC` in the
+# initial assignment just below, `GO_FRPS`/`GO_FRPC` again in the recalculation
+# block that re-derives `GO_FRP_DIR` when `--go-version` (or `GO_FRP_VERSION`)
+# changes the version, and `GO_FRPS_V2`/`GO_FRPC_V2` in the V2 section.
+# `scripts/tests/
 # compat-port-ownership.sh` points all four at stub binaries so it can drive this
 # harness's own `--test` handling on a checkout with no build, like the `health`
-# job's; because the seam wins in the recalculation too, that stays true whatever
-# the default Go directory is — no host's real `/tmp/frp_0.71.0_*` can stand in
-# for a stub. The pre-gate checks only ask that each binary be executable (the
+# job's; because the seam wins at every one of those sites, that stays true
+# whatever the default Go directory is — neither a host's real
+# `/tmp/frp_0.71.0_*` nor a `GO_FRP_DIR` exported by a developer shell can stand
+# in for a stub. The pre-gate checks only ask that each binary be executable (the
 # certs are tracked), so a stub suffices and no scenario ever runs against one.
 GO_FRPS="${FRP_COMPAT_GO_FRPS:-$GO_FRP_DIR/frps}"
 GO_FRPC="${FRP_COMPAT_GO_FRPC:-$GO_FRP_DIR/frpc}"
@@ -184,9 +187,14 @@ run_go() {
 
 # --- V2 test support ---
 # Go frp v0.70.1+ pre-built binaries include V2 protocol support.
-# V2 tests use the same pre-built binaries as V1 tests.
-GO_FRPS_V2="$GO_FRP_DIR/frps"
-GO_FRPC_V2="$GO_FRP_DIR/frpc"
+# V2 tests use the same pre-built binaries as V1 tests. Assign through the same
+# `FRP_COMPAT_*` seam as `GO_FRPS`/`GO_FRPC` above: `ensure_go_frp_v2` executes
+# `"$GO_FRPS_V2" --version` and its phase gate runs on every invocation (before
+# the fail-closed `--test` selector gate), so a `GO_FRP_DIR` inherited from the
+# caller would otherwise execute a host binary here even while the seam points
+# every other path at a stub. With no override this resolves exactly as before.
+GO_FRPS_V2="${FRP_COMPAT_GO_FRPS:-$GO_FRP_DIR/frps}"
+GO_FRPC_V2="${FRP_COMPAT_GO_FRPC:-$GO_FRP_DIR/frpc}"
 
 ensure_go_frp_v2() {
     if [[ ! -x "$GO_FRPS_V2" ]] || [[ ! -x "$GO_FRPC_V2" ]]; then
