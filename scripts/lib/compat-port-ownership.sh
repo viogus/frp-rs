@@ -291,8 +291,22 @@ cpo_ready_owned() {
 cpo_wait_ready() {
     # Poll `cpo_ready_owned` for at most $2 seconds. rc 0 = ready, 1 = never
     # became ready, 2 = cannot tell, 3 = not ours.
+    #
+    # The poll count is parsed out of the timeout string rather than computed as
+    # `$(( timeout * 10 ))`: bash has no float arithmetic, so a fractional
+    # timeout made that expansion a syntax error, which fails the assignment and
+    # aborts a `set -e` caller instead of polling. Whole seconds and one
+    # fractional digit are read; anything else falls back to the 10 s default.
     local port="$1" timeout="${2:-10}" i=0 n rc=0
-    n=$(( timeout * 10 ))
+    local _whole="${timeout%%.*}" _frac=""
+    case "$timeout" in
+        *.*) _frac="${timeout#*.}" ;;
+    esac
+    [[ "$_whole" =~ ^[0-9]+$ ]] || _whole=10
+    n=$(( _whole * 10 ))
+    case "$_frac" in
+        [0-9]*) n=$(( n + ${_frac:0:1} )) ;;
+    esac
     (( n > 0 )) || n=1
     while (( i < n )); do
         rc=0

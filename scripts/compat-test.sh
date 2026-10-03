@@ -23,10 +23,16 @@ else
     esac
     GO_FRP_DIR="/tmp/frp_${GO_FRP_VERSION}_${_gos}_${_goa}"
 fi
-GO_FRPS="$GO_FRP_DIR/frps"
-GO_FRPC="$GO_FRP_DIR/frpc"
-RUST_FRPS="$PROJECT_DIR/target/release/frps"
-RUST_FRPC="$PROJECT_DIR/target/release/frpc"
+# Each binary path is overridable. Nothing in CI sets these — a real run always
+# uses the paths below — but `scripts/tests/compat-port-ownership.sh` points them
+# at stub binaries so it can drive this harness's own `--test` handling on a
+# checkout with no build, like the `health` job's. The pre-gate checks only ask
+# that each binary be executable (the certs are tracked), so a stub suffices and
+# no scenario ever runs against one.
+GO_FRPS="${FRP_COMPAT_GO_FRPS:-$GO_FRP_DIR/frps}"
+GO_FRPC="${FRP_COMPAT_GO_FRPC:-$GO_FRP_DIR/frpc}"
+RUST_FRPS="${FRP_COMPAT_RUST_FRPS:-$PROJECT_DIR/target/release/frps}"
+RUST_FRPC="${FRP_COMPAT_RUST_FRPC:-$PROJECT_DIR/target/release/frpc}"
 CERT_DIR="$PROJECT_DIR/frp-core/tests/certs"
 # Per-run scratch directory. Overridable with FRP_COMPAT_TEST_DIR so that two
 # runs — a sibling worktree's, or a local run beside a CI job — do not share it:
@@ -734,13 +740,30 @@ should_run_test() {
 }
 
 # Wrapper that enables set -x tracing in --debug mode.
-# Uses a subshell so set -x doesn't leak across tests.
+#
+# The scenario runs in *this* shell, exactly as it does without --debug. A
+# subshell here discarded everything a scenario records: `PASS`/`FAIL`/
+# `FAILURES` (so `--debug` reported ` RESULTS: 0 passed, 0 failed` and `All
+# tests passed!` for a run that had just traced a failure), `PIDS` (so servers
+# the scenario started were never reaped and tripped the stray guard), and
+# `SELECTED_MATCHED` (so the end-of-run `--test` gate told a correct caller its
+# name had matched no scenario). Tracing is scoped by turning it off again
+# rather than by a subshell. No scenario calls bare `exit`; the ones that used
+# to be contained by the subshell are the arg/cleanup/binary/cert checks and
+# the summary block, all of which run outside this wrapper.
 run_test() {
     if $DEBUG; then
-        (set -x; "$@")
-    else
+        local was_trace=false rc=0
+        if [[ $- == *x* ]]; then
+            was_trace=true
+        fi
+        set -x
         "$@"
+        rc=$?
+        $was_trace || set +x
+        return "$rc"
     fi
+    "$@"
 }
 
 # ── Unified config writers ─────────────────────────────────
@@ -7833,12 +7856,29 @@ fi
 # looks like. Fail closed and name the selector.
 if [[ -n "$SELECTED_TEST" ]] && ! $SELECTED_MATCHED; then
     echo ""
-    if $CI; then
-        echo "::error file=scripts/compat-test.sh,title=--test selector::--test '$SELECTED_TEST' matched no scenario"
+    # A name that is in this file but did not run was skipped by the phase
+    # switch (`RUN_XTCP`, `--xtcp-only`, `--shard`), not mistyped; telling a
+    # correct caller its name matched nothing sent it looking for a typo that
+    # was not there (F-4). The two display-name shapes this file registers are a
+    # scenario's `local name="…"` and an XTCP test's first `run_xtcp_test "…"`
+    # argument.
+    _sel_self="${BASH_SOURCE[0]:-$0}"
+    if grep -qF "local name=\"$SELECTED_TEST\"" "$_sel_self" 2>/dev/null ||
+        grep -qF "run_xtcp_test \"$SELECTED_TEST\"" "$_sel_self" 2>/dev/null; then
+        if $CI; then
+            echo "::error file=scripts/compat-test.sh,title=--test selector::--test '$SELECTED_TEST' names a scenario this run did not execute (its phase was skipped)"
+        fi
+        echo "ERROR: --test '$SELECTED_TEST' names a scenario this run did not execute; no test ran." >&2
+        echo "       The name is real — the phase that owns it was skipped in this configuration:" >&2
+        echo "       the XTCP phase runs only with RUN_XTCP=1, and --xtcp-only/--shard select a subset." >&2
+    else
+        if $CI; then
+            echo "::error file=scripts/compat-test.sh,title=--test selector::--test '$SELECTED_TEST' matched no scenario"
+        fi
+        echo "ERROR: --test '$SELECTED_TEST' matched no scenario; no test ran." >&2
+        echo "       --test takes a scenario's display name (the \`local name=...\` its function sets)." >&2
+        echo "       \`--list\` prints run_test *function* names, which are not --test values." >&2
     fi
-    echo "ERROR: --test '$SELECTED_TEST' matched no scenario; no test ran." >&2
-    echo "       --test takes a scenario's display name (the \`local name=...\` its function sets)." >&2
-    echo "       \`--list\` prints run_test *function* names, which are not --test values." >&2
     exit 2
 fi
 

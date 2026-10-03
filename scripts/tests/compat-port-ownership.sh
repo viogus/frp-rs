@@ -49,9 +49,19 @@
 #      when executed.
 #   11 selector: `--test <run_test function name>` (what `--list` prints) exits
 #      non-zero, names the selector, and prints no ` RESULTS:` line — while
-#      `--list` keeps printing the function names.
+#      `--list` keeps printing the function names. The harness runs against
+#      four stub binaries (the `FRP_COMPAT_*` seam in `scripts/compat-test.sh`)
+#      and a scratch test dir, so this needs no build.
+#   12 selector --debug: a traced run of a real display name reaches its
+#      scenario, reports that scenario's own failure in the summary (the
+#      `--debug` subshell used to discard it and print `0 passed, 0 failed`),
+#      and does not claim the name matched nothing.
+#   13 selector --skipped phase: a real display name whose phase was skipped in
+#      this configuration is told apart from a typo.
 #
-# Self-contained: no network, no compat scenario, no repo binaries, no Go frp.
+# Self-contained: no network, no repo binaries, no Go frp, and no scenario
+# reaches a real server — the stub-driven selector runs stop at the harness's
+# own pre-gate executable check or at the stub's first missing listener.
 # Temporary listeners and trees are removed on exit.
 #
 # Usage: bash scripts/tests/compat-port-ownership.sh
@@ -88,7 +98,7 @@ fails=0
 # hold`, so a suite that silently stops checking must not exit green. The floor
 # and the ordered `SHAPE` below are enforced from the exit trap on every path,
 # including an early `exit 0`.
-MIN_CHECKS=51
+MIN_CHECKS=57
 # The ordered assertion anchors, one per `ok`/`bad` call in scenario order:
 # a scenario that stops running, a deleted check, a reordered check, or a dummy
 # `ok` anywhere all move `LABELS` away from this list.
@@ -144,6 +154,12 @@ SHAPE=(
   "selector: the message names the selector"
   "selector: no RESULTS summary is printed"
   "selector: --list still prints function names"
+  "selector --debug: the traced run reaches the scenario"
+  "selector --debug: no false unmatched-selector report"
+  "selector --debug: the scenario failure reaches the summary"
+  "selector --debug: the run exits non-zero for the failed scenario"
+  "selector: a skipped-phase name exits non-zero"
+  "selector: the skipped-phase message names the phase, not a typo"
 )
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/compat-port-ownership.XXXXXX")" || {
@@ -196,6 +212,13 @@ cleanup_all() {
     [ -n "$i" ] && kill "$i" 2>/dev/null
   done
   [ -z "$WORK" ] || rm -rf "$WORK"
+  # `bad()` counts a failure but leaves the exit status alone, so a red run used
+  # to reach the `rc -eq 0` branch below, satisfy the floor and the shape, and
+  # print `RESULT: … hold` with rc 0 — the failure was reported but not exited.
+  # A run that counted a failure fails, whatever its status was.
+  if [ "$rc" -eq 0 ] && [ "$fails" -gt 0 ]; then
+    rc=1
+  fi
   if [ "$rc" -eq 0 ]; then
     case ${MIN_CHECKS:-} in
       ''|0)
@@ -564,22 +587,56 @@ else
   bad 'protocol-matrix.sh: main runs only when executed'
 fi
 
-# --- scenario 11: the selector fails closed end to end -----------------------
+# --- scenarios 11-13: the harness's own --test handling ----------------------
+
+# The `health` job has no `target/`, so driving the real harness needs the
+# executable-path seam (`scripts/compat-test.sh`, the `FRP_COMPAT_*` overrides)
+# and four stubs that satisfy the harness's pre-gate executable check. Nothing
+# below runs a scenario against a real server: the selector values either match
+# no scenario, match one skipped in this configuration, or (scenario 12) match a
+# scenario that fails at its first server gate because the stub never listens.
+STUB_DIR="$WORK/stubs"
+mkdir -p "$STUB_DIR"
+make_stub() {
+  printf '#!/usr/bin/env bash\nprintf "%%s 0.71.0\\n" "%s"\n' "$1" > "$STUB_DIR/$1"
+  chmod +x "$STUB_DIR/$1"
+}
+make_stub gofrps
+make_stub gofrpc
+make_stub rustfrps
+make_stub rustfrpc
+
+stub_out=""
+stub_rc=0
+run_stubbed() {
+  stub_out=$(FRP_COMPAT_GO_FRPS="$STUB_DIR/gofrps" \
+    FRP_COMPAT_GO_FRPC="$STUB_DIR/gofrpc" \
+    FRP_COMPAT_RUST_FRPS="$STUB_DIR/rustfrps" \
+    FRP_COMPAT_RUST_FRPC="$STUB_DIR/rustfrpc" \
+    FRP_COMPAT_TEST_DIR="$WORK/harness-tmp" \
+    bash "$COMPAT" "$@" 2>&1)
+  stub_rc=$?
+}
+
+# The harness colors its ` RESULTS:` line even when redirected, so the summary
+# is matched with the escapes stripped.
+strip_ansi() {
+  sed $'s/\033\\[[0-9;]*[A-Za-z]//g' <<<"$1"
+}
 
 hdr 'selector'
-sel_out=$(bash "$COMPAT" --ci --test test_g2r_tcp_plain 2>&1)
-sel_rc=$?
-if [ "$sel_rc" -ne 0 ]; then
+run_stubbed --ci --test test_g2r_tcp_plain
+if [ "$stub_rc" -eq 2 ]; then
   ok 'selector: a function-name --test exits non-zero'
 else
-  bad 'selector: a function-name --test exits non-zero (rc=0)'
+  bad "selector: a function-name --test exits non-zero (rc=$stub_rc)"
 fi
-case "$sel_out" in
+case "$stub_out" in
   *"--test 'test_g2r_tcp_plain' matched no scenario"*)
     ok 'selector: the message names the selector' ;;
   *) bad 'selector: the message names the selector' ;;
 esac
-case "$sel_out" in
+case "$stub_out" in
   *' RESULTS:'*)
     bad 'selector: no RESULTS summary is printed' ;;
   *) ok 'selector: no RESULTS summary is printed' ;;
@@ -589,3 +646,48 @@ if bash "$COMPAT" --list 2>/dev/null | grep -qx 'test_g2r_tcp_plain'; then
 else
   bad 'selector: --list still prints function names'
 fi
+
+hdr 'selector --debug'
+# `run_test` used to run the scenario in a subshell under `--debug`, which threw
+# away `PASS`/`FAIL`, `PIDS` and the `--test` match: a traced run of a scenario
+# that had just failed still printed ` RESULTS: 0 passed, 0 failed`, and its
+# servers survived to trip the stray guard. The stub never listens, so the
+# scenario fails at its first server gate and the summary has to carry that.
+run_stubbed --ci --debug --test go-to-rust-tcp-plain
+stub_plain=$(strip_ansi "$stub_out")
+case "$stub_plain" in
+  *'=== go-to-rust-tcp-plain ==='*)
+    ok 'selector --debug: the traced run reaches the scenario' ;;
+  *) bad 'selector --debug: the traced run reaches the scenario' ;;
+esac
+case "$stub_plain" in
+  *'matched no scenario'*)
+    bad 'selector --debug: no false unmatched-selector report' ;;
+  *) ok 'selector --debug: no false unmatched-selector report' ;;
+esac
+case "$stub_plain" in
+  *' RESULTS: 0 passed, 1 failed'*)
+    ok 'selector --debug: the scenario failure reaches the summary' ;;
+  *) bad 'selector --debug: the scenario failure reaches the summary' ;;
+esac
+if [ "$stub_rc" -eq 1 ]; then
+  ok 'selector --debug: the run exits non-zero for the failed scenario'
+else
+  bad "selector --debug: the run exits non-zero for the failed scenario (rc=$stub_rc)"
+fi
+
+hdr 'selector --skipped phase'
+# `xtcp-g2g-basic` is a real display name (a `run_xtcp_test` first argument) that
+# this configuration skips. Telling that caller its name matched nothing sent it
+# looking for a typo that was not there.
+run_stubbed --ci --test xtcp-g2g-basic
+if [ "$stub_rc" -eq 2 ]; then
+  ok 'selector: a skipped-phase name exits non-zero'
+else
+  bad "selector: a skipped-phase name exits non-zero (rc=$stub_rc)"
+fi
+case "$stub_out" in
+  *'names a scenario this run did not execute'*)
+    ok 'selector: the skipped-phase message names the phase, not a typo' ;;
+  *) bad 'selector: the skipped-phase message names the phase, not a typo' ;;
+esac
