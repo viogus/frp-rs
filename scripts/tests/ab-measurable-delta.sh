@@ -18,9 +18,17 @@
 #      any worktree, build or server) and calls them.
 #   3. scripts/ab-remote.sh — the transport that carries the two gate switches
 #      to the VPS. It is run for real against a stub `ssh` that records the
-#      remote command line, because ssh forwards no environment: a deleted or
-#      reworded splice silently disables the `enforce` re-arm, and hashing the
-#      file alone would not witness that.
+#      remote command the VPS shell would receive, because ssh forwards no
+#      environment: a deleted or reworded splice silently disables the `enforce`
+#      re-arm, and hashing the file alone would not witness that.
+#
+#      The recorded command is then EXECUTED, not grepped: a stub `flock` and a
+#      probe in place of scripts/ab-matrix.sh report the environment and the two
+#      positional arguments the harness actually receives. Text matching was not
+#      enough — a `#` comment or an extra ssh argv leaves the blessed chain in
+#      the string while the remote shell never sets the variables (review round
+#      3, F1) — and it was too strict, rejecting run calls that work (round 3,
+#      F2, e.g. quoted arguments or an `env` prefix).
 #
 # It also carries a MUTANT MATRIX (the sabotage converse): each mutant copies
 # one of the three real scripts, applies exactly the mutation that would neuter
@@ -29,7 +37,13 @@
 # witness the property they claim to, and the check fails. A child that reds for
 # an unrelated reason counts as a vacuous pass, so the transport mutant lives in
 # a repo-shaped tree (ab-remote.sh resolves its root from $0), its failure has to
-# name the splice, and an unmutated control of that same tree must pass. The real
+# name the splice, and an unmutated control of that same tree must pass. A sixth
+# mutant deletes the switches from the EXECUTED command and leaves the blessed
+# chain behind as a `#` comment — the exact form that used to satisfy text
+# matching — so the replay is proved against the attack it replaced. Two
+# further controls replay the run calls those rewrites send (quoted arguments, an
+# `env` prefix): the witness must accept what
+# executes and reject only what does not. The real
 # scripts are never written to; the check "real scripts are byte-identical after
 # the mutant matrix" is the revert proof.
 #
@@ -55,7 +69,7 @@ REMOTE="${AB_MD_REMOTE:-$ROOT/scripts/ab-remote.sh}"
 # floor. Both floors count CHECKS RUN, not checks passed: a mutant run is
 # expected to fail fixtures, and the floor must not paper over an early exit.
 SABOTAGE_CHILD="${AB_MD_SABOTAGE_CHILD:-0}"
-if [ "$SABOTAGE_CHILD" = "1" ]; then MIN_CHECKS=43; else MIN_CHECKS=50; fi
+if [ "$SABOTAGE_CHILD" = "1" ]; then MIN_CHECKS=45; else MIN_CHECKS=53; fi
 
 checks=0
 fails=0
@@ -464,19 +478,30 @@ printf 'stub-key\n' > "$REMOTE_ROOT/key"
 
 cat > "$REMOTE_ROOT/bin/ssh" <<'FAKE_SSH'
 #!/usr/bin/env bash
-# Stub ssh: record the remote command (our last argument) and drain the piped
-# tarball when this call is the upload, so the local `tar` sees no broken pipe.
-# ONE DELIMITED RECORD PER CALL, with any embedded newline flattened to a space:
-# a per-call record is what lets a fixture match the run command alone. Joining
-# every call into one string is how a pattern meant for the run call could be
-# satisfied by the earlier mkdir call, which is review round 2's D-A1 — the
-# enforce switches moved off the run command while the suite stayed green.
+# Stub ssh: record the remote command and drain the piped tarball when this call
+# is the upload, so the local `tar` sees no broken pipe. What the VPS shell runs
+# is every argument after the destination, joined by single spaces — that is
+# what ssh itself does — so the record is the command, not merely our last
+# argument: with `$last` an extra trailing argv could carry the blessed chain
+# while the executed command had none (review round 3, F1b). ONE DELIMITED
+# RECORD PER CALL with embedded newlines flattened: joining every call into one
+# string is how a pattern meant for the run call could be satisfied by the
+# earlier mkdir call (review round 2, D-A1).
 last=""
 for a in "$@"; do last="$a"; done
 case "$last" in
   'tar xf'*) cat >/dev/null 2>&1 || true ;;
 esac
-flat="$(printf '%s' "$last" | tr '\n' ' ')"
+remote=""
+seen_host=0
+for a in "$@"; do
+  if [ "$seen_host" = "1" ]; then
+    remote="${remote}${remote:+ }${a}"
+    continue
+  fi
+  case "$a" in *@*) seen_host=1 ;; esac
+done
+flat="$(printf '%s' "$remote" | tr '\n' ' ')"
 printf '%s\n' "$flat" >> "$AB_MD_SSH_CAPTURE"
 case "$last" in
   *ab-matrix.sh*) exit "${AB_MD_SSH_RC:-0}" ;;
@@ -484,6 +509,34 @@ esac
 exit 0
 FAKE_SSH
 chmod +x "$REMOTE_ROOT/bin/ssh"
+
+# Stub flock for the replay below: consume the options and the lock path, then
+# run the command it was given. The recorded remote command is EXECUTED, so the
+# fake flock has to get out of the way rather than fail the probe.
+cat > "$REMOTE_ROOT/bin/flock" <<'FAKE_FLOCK'
+#!/usr/bin/env bash
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -w|-E) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+[ "$#" -gt 0 ] && shift
+exec "$@"
+FAKE_FLOCK
+chmod +x "$REMOTE_ROOT/bin/flock"
+
+# The probe that stands in for scripts/ab-matrix.sh during a replay. It reports
+# what the harness would have been handed: the two gate switches and the two
+# positional arguments (the repetitions and the duration).
+PROBE_MATRIX="$REMOTE_ROOT/probe-ab-matrix.sh"
+cat > "$PROBE_MATRIX" <<'PROBE'
+#!/usr/bin/env bash
+printf 'PROBE ENFORCE=[%s] FORCE=[%s] ARGS=[%s][%s]\n' \
+  "${AB_GATE_ENFORCE-unset}" "${AB_FORCE_MEASURE-unset}" "${1-unset}" "${2-unset}"
+PROBE
+chmod +x "$PROBE_MATRIX"
 
 # run_remote <remote-script> <capture-file> <stub-ssh-rc> [<VAR=val>...]
 # Prints the script's exit code; the recorded remote commands land in the
@@ -512,41 +565,96 @@ call_record() {
   grep -F -m1 -- "$2" "$1"
 }
 
-# run_splice_re <AB_GATE_ENFORCE> <AB_FORCE_MEASURE>: the ERE the run call's
-# record must satisfy. The switches have to sit IMMEDIATELY after
-# BEFORE_ROOT=$PWD/base (whitespace alone between) and ahead of the flock and
-# the harness, so neither a prefixed `echo `/`printf ` (text present, effect
-# gone — review round 2's V2) nor a placement on an earlier ssh call (D-A1) can
-# satisfy it. The pattern is deliberately anchored to that one literal: a bare
-# `AB_GATE_ENFORCE=…` anywhere in the line is exactly what a broken splice also
-# produces.
-run_splice_re() {
-  printf 'BEFORE_ROOT=\\$PWD/base[[:space:]]+AB_GATE_ENFORCE=%s AB_FORCE_MEASURE=%s[[:space:]]+flock -w 1800 ~/\\.ab-matrix\\.lock[[:space:]]+bash scripts/ab-matrix\\.sh '\''3'\'' '\''8'\''' "$1" "$2"
+PROBE_HOME="$WORK/probe-home"
+
+# probe_splice <capture>: EXECUTE the capture's single run call — the record that
+# names ab-matrix.sh — with the stub flock and the probe in place of the harness,
+# and print what the harness was handed. Prints nothing when the run call is
+# absent, ambiguous, or carries no `cd ~/<dir> &&` preamble to replay; each of
+# those is a failure of this witness and the caller reports it as one.
+probe_splice() {
+  local capture="$1" rec rel out
+  rec="$(call_record "$capture" 'ab-matrix.sh')"
+  [ -n "$rec" ] || return 0
+  rel="$(printf '%s' "$rec" | sed -n 's|^cd ~/\([^ ]*\) &&.*|\1|p')"
+  [ -n "$rel" ] || return 0
+  mkdir -p "$PROBE_HOME/$rel/scripts" || return 0
+  cp "$PROBE_MATRIX" "$PROBE_HOME/$rel/scripts/ab-matrix.sh" || return 0
+  out="$(cd "$WORK" && HOME="$PROBE_HOME" PATH="$REMOTE_ROOT/bin:/usr/bin:/bin" \
+         bash -c "$rec" 2>/dev/null)" || true
+  printf '%s' "$out"
+}
+
+# run_and_probe <remote-script> <enforce> <force>: ship through the transport
+# with those switches, then replay its run call. Prints the probe's one-line
+# report, or a transport-level sentence when the script never got that far (a
+# mutant that cannot start is not evidence about the splice, and the mutant
+# matrix requires the "MISSING from the run call" wording before it books a
+# caught mutant).
+run_and_probe() {
+  local rc
+  rc="$(run_remote "$1" "$cap" 0 AB_GATE_ENFORCE="$2" AB_FORCE_MEASURE="$3")"
+  if [ "$rc" != "0" ]; then
+    printf 'TRANSPORT-EXITED-%s-BEFORE-THE-RUN-CALL' "$rc"
+    return 0
+  fi
+  probe_splice "$cap"
+}
+
+# accepted_record <rel> <tail>: a one-record capture holding the remote command
+# a correctly rewritten transport would send. The acceptance controls below use
+# these instead of rewriting the tree's ab-remote.sh: under the mutant matrix
+# that file IS the mutant, so a rewrite would be inert or would test the
+# mutant's own text rather than the rewrite under discussion.
+accepted_record() {
+  local rel="$1" tail="$2" out
+  out="$WORK/accept-$rel.capture"
+  printf 'cd ~/%s && AFTER_ROOT=$PWD/after BEFORE_ROOT=$PWD/base %s\n' "$rel" "$tail" > "$out"
+  printf '%s' "$out"
 }
 
 cap="$WORK/ssh-capture"
-# Two failure modes, deliberately worded apart: a transport that never reached
-# the run call (rc != 0, nothing shipped — e.g. a mutant that cannot start) is
-# NOT evidence about the splice, and the mutant matrix below requires the
-# "MISSING from the run call" wording before it books a caught mutant.
-rc="$(run_remote "$REMOTE" "$cap" 0 AB_GATE_ENFORCE=1 AB_FORCE_MEASURE=0)"
-rec="$(call_record "$cap" 'ab-matrix.sh')"
-if [ "$rc" != "0" ]; then
-  bad "ab-remote.sh enforce=1 splice -> the transport exited $rc before the run call (run call='$rec'); this fixture needs a working transport to witness the splice"
-elif printf '%s' "$rec" | grep -Eq "$(run_splice_re 1 0)"; then
-  ok "ab-remote.sh: the gate command carries AB_GATE_ENFORCE=1 AB_FORCE_MEASURE=0 under the flock, before the harness"
+# The witness is the environment and the arguments the harness RECEIVES, not the
+# text of the command: a `#` comment or an extra ssh argv leaves the blessed
+# chain in the string while the remote shell never sets the variables (review
+# round 3, F1), so the recorded run call is replayed and the values are asserted.
+want_enforce="PROBE ENFORCE=[1] FORCE=[0] ARGS=[3][8]"
+got="$(run_and_probe "$REMOTE" 1 0)"
+if [ "$got" = "$want_enforce" ]; then
+  ok "ab-remote.sh: the replayed run command hands the harness AB_GATE_ENFORCE=1 AB_FORCE_MEASURE=0 and the args 3 8"
 else
-  bad "ab-remote.sh enforce=1 splice MISSING from the run call -> rc 0, run call='$rec' (want the switches immediately after BEFORE_ROOT=\$PWD/base, then the flock, then ab-matrix.sh)"
+  bad "ab-remote.sh enforce=1 splice MISSING from the run call -> the replayed run command reported '$got' (want '$want_enforce'); a '#' comment or an extra ssh argv satisfies text matching while the harness still falls back to the defaults"
 fi
 
-rc="$(run_remote "$REMOTE" "$cap" 0)"
-rec="$(call_record "$cap" 'ab-matrix.sh')"
-if [ "$rc" != "0" ]; then
-  bad "ab-remote.sh default splice -> the transport exited $rc before the run call (run call='$rec'); this fixture needs a working transport to witness the default"
-elif printf '%s' "$rec" | grep -Eq "$(run_splice_re 0 0)"; then
-  ok "ab-remote.sh: unset switches default to AB_GATE_ENFORCE=0 AB_FORCE_MEASURE=0 (previous behaviour)"
+want_default="PROBE ENFORCE=[0] FORCE=[0] ARGS=[3][8]"
+got="$(run_and_probe "$REMOTE" 0 0)"
+if [ "$got" = "$want_default" ]; then
+  ok "ab-remote.sh: unset switches default to AB_GATE_ENFORCE=0 AB_FORCE_MEASURE=0 in the replayed run command (previous behaviour)"
 else
-  bad "ab-remote.sh default splice MISSING from the run call -> rc 0, run call='$rec' (want both switches defaulted to 0 immediately after BEFORE_ROOT=\$PWD/base)"
+  bad "ab-remote.sh default splice MISSING from the run call -> the replayed run command reported '$got' (want '$want_default')"
+fi
+
+# Acceptance controls (review round 3, F2): the witness must accept a transport
+# rewritten in a way that still WORKS. Anchored text matching rejected both of
+# these, so a maintainer who kept the splice while quoting it would have faced a
+# red suite for correct code. Each control replays the run call that rewrite
+# would send, so it stays a statement about the witness even when the tree's own
+# ab-remote.sh is a mutant.
+ACCEPT_DQ="$(accepted_record accept-dq \
+  'AB_GATE_ENFORCE=1 AB_FORCE_MEASURE=0 flock -w 1800 ~/.ab-matrix.lock bash scripts/ab-matrix.sh "3" "8" 2>&1')"
+got="$(probe_splice "$ACCEPT_DQ")"
+if [ "$got" = "$want_enforce" ]; then
+  ok "ab-remote.sh: a rewrite that quotes the args still EXECUTES the switches (the witness accepts working code)"
+else
+  bad "ab-remote.sh quoted-args rewrite -> the replayed run command reported '$got' (want '$want_enforce'); the witness rejects a functional transport"
+fi
+ACCEPT_ENV="$(accepted_record accept-env \
+  'flock -w 1800 ~/.ab-matrix.lock env AB_GATE_ENFORCE=1 AB_FORCE_MEASURE=0 bash scripts/ab-matrix.sh '\''3'\'' '\''8'\'' 2>&1')"
+got="$(probe_splice "$ACCEPT_ENV")"
+if [ "$got" = "$want_enforce" ]; then
+  ok "ab-remote.sh: a rewrite that prefixes env still EXECUTES the switches (the witness accepts working code)"
+else
+  bad "ab-remote.sh env-prefixed rewrite -> the replayed run command reported '$got' (want '$want_enforce'); the witness rejects a functional transport"
 fi
 
 rc="$(run_remote "$REMOTE" "$cap" 0 AB_GATE_ENFORCE=2)"
@@ -684,6 +792,36 @@ else
   bad "mutant: ab-remote.sh splice deleted -> the sed mutation was inert, so it proves nothing"
 fi
 
+# 6. remote transport: the switches deleted from the EXECUTED command while the
+# blessed chain is left behind inside the same record as a `#` comment. This is
+# review round 3's F1: the witness used to match the recorded text, so this
+# mutant stayed green while the remote harness silently fell back to the `:-0`
+# defaults. It is built with python3 rather than sed because it has to edit two
+# separate places (drop the splice, append the decoy) and leave the record
+# syntactically valid.
+M6="$MUT_TREE/scripts/ab-remote-comment.sh"
+python3 - "$REMOTE" "$M6" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+splice = ("   AB_GATE_ENFORCE=$AB_GATE_ENFORCE AB_FORCE_MEASURE=$AB_FORCE_MEASURE \\\n"
+          "   flock -w 1800 ~/.ab-matrix.lock \\\n")
+decoy_tail = "bash scripts/ab-matrix.sh '$REPS' '$DUR' 2>&1\")"
+if splice not in text or decoy_tail not in text:
+    sys.exit(3)
+text = text.replace(splice, "   flock -w 1800 ~/.ab-matrix.lock \\\n")
+text = text.replace(decoy_tail,
+    "bash scripts/ab-matrix.sh '$REPS' '$DUR' 2>&1 "
+    "# AB_GATE_ENFORCE=$AB_GATE_ENFORCE AB_FORCE_MEASURE=$AB_FORCE_MEASURE "
+    "flock -w 1800 ~/.ab-matrix.lock bash scripts/ab-matrix.sh '$REPS' '$DUR'\")")
+open(dst, "w").write(text)
+PY
+if [ -s "$M6" ] && ! cmp -s "$REMOTE" "$M6"; then
+  mutant_red_naming "ab-remote.sh switches deleted, blessed chain left as a comment" "$CLASSIFIER" "$MATRIX" "$M6" 'splice MISSING from the run call'
+else
+  bad "mutant: ab-remote.sh switches deleted but chain kept in a comment -> the mutation was inert, so it proves nothing"
+fi
+
 # converse control for #5: the same layout, unmutated, must pass. Without it the
 # check above would also be satisfied by a tree that reds at startup for a
 # layout reason, which is exactly how the previous bare-$WORK mutant was
@@ -693,10 +831,10 @@ mkdir -p "$CTL_TREE/scripts"
 cp "$MATRIX" "$CTL_TREE/scripts/ab-matrix.sh"
 cp "$REMOTE" "$CTL_TREE/scripts/ab-remote.sh"
 run_suite_against "$CLASSIFIER" "$MATRIX" "$CTL_TREE/scripts/ab-remote.sh"
-if [ "$child_rc" = "0" ] && [ "$child_result" = "RESULT: 43 fixture check(s) hold" ]; then
+if [ "$child_rc" = "0" ] && [ "$child_result" = "RESULT: 45 fixture check(s) hold" ]; then
   ok "control: the mutant's tree with an unmutated ab-remote.sh passes ($child_result)"
 else
-  bad "control: the mutant's tree unmutated -> rc $child_rc, $child_result (want rc 0 and RESULT: 43 fixture check(s) hold)"
+  bad "control: the mutant's tree unmutated -> rc $child_rc, $child_result (want rc 0 and RESULT: 45 fixture check(s) hold)"
 fi
 
 # revert proof: the mutants were copies
