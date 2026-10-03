@@ -10799,7 +10799,7 @@ other.
   **Done-when:** each row's Go cell is checked against an expected path for that row, so swapping in a real-but-wrong Go key reds;
   or the column records per row why membership is all that is being asserted.
 
-- [ ] **The gate locator misses a multiline `#[cfg(...)]` predicate and a `#[path]` packed before the gate, so such items read as production.**
+- [x] **The gate locator misses a multiline `#[cfg(...)]` predicate and a `#[path]` packed before the gate, so such items read as production.**
 
   Filed by the M-2 records round (PR #468), widened in round 3: the one-line, start-anchored gate locator
   (`cfg_attribute` / `is_test_gate`) misses two spellings — (a) a predicate spanning lines (`#[cfg(all(` / `test,` /
@@ -10812,7 +10812,19 @@ other.
 
   **Done-when:** either spelling gates, or both are documented as unsupported in the script's own docstring and pinned by a fixture.
 
-- [ ] **`#[ cfg ( test ) ]` gates but is pinned by no fixture.**
+  **Done (2026-10-03, at `fed07b26` on `dsh/large-functions-locator-guard`, squash-merged as `26e7a174`, PR #470, based on `5682fe6c`) — both spellings gate.**
+  `scripts/large-functions.sh` gained a cross-line span walk (`attribute_span` / `cfg_predicate` / `is_test_gate_run`), `attribute_run` falls back to it when
+  `closing_bracket` returns −1, and `test_blocks`' candidate test became `if flags[i] or not is_test_gate_run(lines, i):`. A span that would walk through a
+  multi-line raw string, a line-spanning block comment or a backslash-continued ordinary string is **declined** (the three constructs the region scan tracks), and a span
+  that cannot be closed falls back to the line-local path, so the new reach cannot swallow a production item; `cfg_attribute` / `gate_tail_ok` / `cfg_implies_test` / `is_test_gate` are byte-identical, so every pre-existing mutant witness still binds.
+  Measured with the branch script against the base script in the same tree: the wrapped predicate reads `10 10 0` → `1 10 9`, and the packed
+  `#[path = "pk/packed_helper.rs"] #[cfg(test)]` shape reads `3 3 0` with its helper at `4 4 0` → `1 3 2` / `0 4 4`. Fixtures and mutants now cover both:
+  **M20** (wrapped-predicate acceptance dropped) and **M21** (packed-attribute acceptance dropped) red the two new acceptances, `attr_wrapped_rawstr.rs` + **M23**
+  and `attr_wrapped_contstr.rs` + **M24** pin the two string declines, and `attr_allow_first.rs` / `attr_allow_first_decl.rs` + **M25** pin the
+  non-first-attribute shape. `bash scripts/large-functions.sh --all` is byte-identical to base (**173 lines**, md5 `23a1f630fdc3d3dac645670b0ef3415f`) and the
+  anchors are unmoved (`frp-core/src/bridge.rs` `1082 2965 1883`, `frp-core/src/logging.rs` `689 1008 319`), so no in-tree row moved.
+
+- [x] **`#[ cfg ( test ) ]` gates but is pinned by no fixture.**
 
   Filed by the M-2 records round (PR #468). `CFG_OPEN` tolerates whitespace inside the attribute, and the spaced
   spelling is treated as a gate, but no fixture row or mutant covers it, so removing that tolerance would not red
@@ -10821,7 +10833,15 @@ other.
   **Done-when:** a fixture row asserts that the spaced spelling gates (and a mutant reds when the tolerance is
   removed), or `CFG_OPEN` is narrowed to the spellings the fixtures do cover.
 
-- [ ] **`scripts/large-functions.sh` carries no `guard_pin`, so its own regressions move no CI guard.**
+  **Done (2026-10-03, same head and PR) — the spaced spelling is pinned, and the related limit is documented where the walker lives.**
+  `attr_spaced_gate.rs` reads `9 14 5` at both base and head (it gated before; nothing measured it), and **M22**, which narrows `CFG_OPEN` to
+  `\s*#\[cfg\(`, makes it read `14 14 0`. The narrower reading this item offered as the alternative is the wrong branch and is rejected: the tolerance is
+  exactly what keeps `#[ cfg ( test ) ]` gating, so narrowing it would remove a gate, not tidy one. The adjacent limit is now stated in the script's own
+  docstring (`scripts/large-functions.sh:752-758`): a `#[path]` written after a spaced gate is still counted as production, because the spaced gate is not
+  walked as an attribute run; it is pinned by `attr_spaced_path.rs` (`1 4 3`, helper `4 4 0`), with the plain twin `attr_plain_gate_path` (`0 4 4`) as the
+  contrast, and **M22** reds it too.
+
+- [x] **`scripts/large-functions.sh` carries no `guard_pin`, so its own regressions move no CI guard.**
 
   Filed by the M-2 records round (PR #468). The classifier's sha256 is pinned at
   `.github/workflows/ci.yml:695`, but the script it exercises is not: a regression that keeps the fixture count at
@@ -10832,3 +10852,13 @@ other.
 
   **Done-when:** the `health` step pins `scripts/large-functions.sh` by sha256 beside the classifier's, and the
   fixture suite covers the attribution shapes the pin is meant to protect.
+
+  **Done (2026-10-03, same head and PR) — the subject script is pinned beside its suite, before the suite runs.**
+  The classifier step now carries `guard_lf_file=scripts/large-functions.sh` / `guard_lf_pin` next to the suite's own `guard_pin`, rebumped for each
+  commit of the batch (final `guard_lf_pin=5ed5b05d08b5177844951f1ea2b1a546c87f5abf59c605bbfc0e601279467d48`,
+  `guard_pin=d1c2b49d5afa18a0330a2dd5bfaf0567754a7e37c6bf8cd2950c4c73ecef8e6f`), with `guard_exact`/`guard_floor` moved 118 → 133 → 147 → **166**.
+  Both pins are checked **before** the suite runs, so a stale script fails with `::error::scripts/large-functions.sh is not the pinned revision
+  (sha256 <got>; expected <expected>)` and rc 1 rather than through whichever fixture happened to move — reproduced by appending one comment line to the
+  script. What the pin protects grew with it: the suite went 118 → 133 → 147 → **166** checks in this batch (42 → 118 was PR #468) and now covers the cross-line walk, the
+  packed `#[path]`, the string/comment declines, the non-first attribute, and a latent-hang tree whose witness is measured under a bounded watchdog (**M26**
+  reverts the progress guard the verification round's F1 required).

@@ -1272,6 +1272,16 @@ User-facing release notes for frp-rs.
 
 ### CI & Tooling
 
+- **The large-function report now credits a test module whose `#[cfg(test)]` predicate wraps across lines, or whose `#[path]` is packed
+  before the gate on the same line.** `scripts/large-functions.sh` located gated regions from a one-line, start-anchored `#[cfg(test)]`
+  match, so a `#[cfg(all(` … `test))]` predicate and a `#[path = "x.rs"] #[cfg(test)]` pair were charged to production. Both gate now,
+  through a cross-line attribute span whose text is collapsed before the predicate is parsed; a span that would run through a
+  multi-line raw string, a line-spanning block comment or a backslash-continued ordinary string is declined and stays production, so no
+  production item can be swallowed by the new reach.
+  Measured in one tree: the wrapped predicate `10 10 0` → **1 10 9**, the packed shape `3 3 0` (helper `4 4 0`) → **1 3 2** (`0 4 4`).
+  An infinite loop in the backward attribute walk — pre-existing (the batch's base commit `5682fe6c` hangs on plain same-line shapes too) and widened by
+  the newly gated shapes, with no in-tree trigger — is fixed by forcing the walk to advance. The classifier fixture suite grows 118 → **166** checks, and the step now pins
+  `scripts/large-functions.sh` by sha256 beside the classifier, so the script's own regressions move a guard.
 - **The large-function report no longer charges a whole file to tests when a `#[cfg(test)]` decorates a `use`, a
   `const` or a `fn`.** `scripts/large-functions.sh` attached such an attribute to the next `mod` anywhere below it,
   so `frp-core/src/bridge.rs` read 4 production lines and `frp-core/src/logging.rs` 737. The region is now the
