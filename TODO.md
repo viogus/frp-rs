@@ -10801,7 +10801,7 @@ section; ledger now **24 open / 104 closed**.**
   unknown, and `1 recorded row mapping(s) are unused`); an extension marker that stops naming its absent spelling reds; and a
   repoint attached to the wrong row reds (`FAIL alias \`clientId\` (repoint:bindPort): row table 8 client_id records
   'go:clientID', not the repointed path \`bindPort\``). Together with the mapping gate that landed in the same commit, this
-  settles the `TODO.md:10795-10797` cross-reference: every former alias is now either a mapped Go path (checked like any other
+  settles the cross-reference filed at `TODO.md:10795-10797` (head `:10839-10841`): every former alias is now either a mapped Go path (checked like any other
   row) or an extension marker the key set proves absent, so neither item narrows the other.
 
 - [x] **The gate's 261-spelling `GO` table is trusted, not measured.**
