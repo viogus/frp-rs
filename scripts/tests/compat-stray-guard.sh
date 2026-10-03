@@ -1467,7 +1467,7 @@ kill -9 "$baseline11" "$peer11" 2>/dev/null || true
 # --- scenario 12: a trailing-slash TEST_DIR does not empty the census --------
 # F2 (adversarial reviewer): the ownership match is the literal `"$TEST_DIR/"`,
 # so a run dir spelled with a trailing slash — `FRP_COMPAT_TEST_DIR=/tmp/x/`,
-# which `scripts/compat-test.sh:120` documents — matched `…/x//` and never a
+# which `scripts/compat-test.sh:185` documents — matched `…/x//` and never a
 # command line carrying `…/x/`: the census came back empty and
 # `assert_no_strays` returned 0 with a live stray. The library normalises the
 # spelling once at load, so this drives the real guard with `$td12/` and

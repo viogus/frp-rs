@@ -30,22 +30,28 @@
 # `.github/workflows/ci.yml` that this change has no business touching.)
 #
 # What is retried, and why that cannot mask a real failure:
-#   * only two shapes of failure reason are retryable (`is_readiness_failure`):
-#     (a) a **prose readiness gate** whose reason *ends* with `not reachable`,
-#     `did not start` or `not listening`, with an optional trailing
-#     parenthetical (the auth-reject gate appends one); and (b) a bare or
-#     labelled `FAIL:CONNECT_TIMEOUT` / `FAIL:TIMEOUT`. **Every other
-#     `FAIL:<class>` verdict is refused**, so a `FAIL:MISMATCH` whose payload
-#     merely quotes "not reachable" cannot be re-driven, and the prose phrases
-#     are end-anchored so a message that only mentions unreachability mid-string
-#     cannot either.
+#   * a failure reason is retryable in exactly two shapes (`is_readiness_failure`,
+#     which refuses before it accepts): (a) a **timeout verdict** —
+#     `FAIL:CONNECT_TIMEOUT` or `FAIL:TIMEOUT`, bare, labelled or wrapped inside
+#     a longer reason such as `expected OK: got FAIL:TIMEOUT`; or (b) a **prose
+#     readiness gate** whose reason carries ` port` before a trailing
+#     `not reachable` / `not listening` (or the auth-reject gate's literal
+#     `(auth rejection false positive?)` suffix), or ends with ` did not start`.
+#     A reason carrying `FAIL:MISMATCH` or `FAIL:CONNECT_RESPONSE` is refused
+#     before anything else is looked at — including one whose payload quotes
+#     "not reachable", and including one that also carries a genuine timeout from
+#     another proxy — and any other `FAIL:` class is refused rather than falling
+#     through to the prose test.
 #   * the re-drive re-runs the **whole** scenario, so every assertion the first
 #     attempt made is made again. A deterministic failure (a real regression)
 #     fails the second attempt too and is reported once; only a failure that
 #     does not recur on a fresh start is absorbed.
 #   * the re-drive is bounded by `FRP_COMPAT_RETRY_MAX` (default 1; `0` disables
-#     it entirely; anything above the hard cap `RETRY_MAX_CAP` = 5 is refused
-#     with rc 2). There is no unbounded loop, and a large value cannot turn a red
+#     it entirely). A non-numeric value is refused with rc 2, and so is a value
+#     above the hard cap `RETRY_MAX_CAP` = 5 — after leading zeros are stripped,
+#     because `(( ))` reads a padded value as octal and `08`/`09` would otherwise
+#     make the comparison a false condition instead of a refusal. There is no
+#     unbounded loop, and neither a large nor a zero-padded value can turn a red
 #     run into a long one.
 #   * the withdrawn attempt is printed (`[RETRY] …`) and the summary reports how
 #     many scenarios passed on a re-drive, so a green run built on retries is
@@ -209,18 +215,29 @@ fi
 export GO_FRP_VERSION
 export GO_FRP_DIR
 
-# `FRP_COMPAT_RETRY_MAX` is used in arithmetic below, and `(( ))` on a
-# non-numeric value aborts the run far from its cause; refuse the spelling up
-# front. An empty value means "use the default", which the `:-` above already
-# resolved, so it cannot reach here.
+# `FRP_COMPAT_RETRY_MAX` is used in arithmetic below, and two spellings have to
+# be handled before it is. A non-numeric one would abort `(( ))` far from its
+# cause. A *zero-padded* one is worse: `(( ))` reads a leading zero as octal, so
+# `08` and `09` are not 8 and 9 but a syntax error that makes the condition
+# false — silently defeating both this cap and the loop bound. So refuse the
+# non-numeric spelling, strip the padding (the zero-stripping the fixture
+# suites' own floor validation uses), and compare the result in decimal. An
+# empty value means "use the default", which the `:-` above already resolved, so
+# it cannot reach here; stripping `0`/`00` yields the empty string, which is
+# decimal zero and disables the re-drive.
+_raw_retry_max="$RETRY_MAX"
 case "$RETRY_MAX" in
     ''|*[!0-9]*)
-        echo "ERROR: FRP_COMPAT_RETRY_MAX must be a non-negative integer, got '$RETRY_MAX'" >&2
+        echo "ERROR: FRP_COMPAT_RETRY_MAX must be a non-negative integer, got '$_raw_retry_max'" >&2
         exit 2
         ;;
 esac
+while [ "${RETRY_MAX#0}" != "$RETRY_MAX" ]; do
+    RETRY_MAX="${RETRY_MAX#0}"
+done
+[ -n "$RETRY_MAX" ] || RETRY_MAX=0
 if (( RETRY_MAX > RETRY_MAX_CAP )); then
-    echo "ERROR: FRP_COMPAT_RETRY_MAX must be <= $RETRY_MAX_CAP, got '$RETRY_MAX'" >&2
+    echo "ERROR: FRP_COMPAT_RETRY_MAX must be <= $RETRY_MAX_CAP, got '$_raw_retry_max'" >&2
     echo "       the re-drive recovers from one flaky start; it is not a re-run-until-green knob" >&2
     exit 2
 fi
@@ -842,34 +859,41 @@ should_run_test() {
 # that never saw the listener, or a dial that never completed — rather than a
 # protocol/data assertion? Only these are re-driven.
 #
-# The rule has two halves, and both are about refusing more than they accept:
+# The rule has three steps, and all of them are about refusing more than they
+# accept — in this order, because the wrapping call sites compose verdicts:
 #
-#   1. **Any `FAIL:<class>` verdict is refused**, wherever it appears, except a
-#      bare or labelled `FAIL:CONNECT_TIMEOUT` / `FAIL:TIMEOUT`. `send_and_expect`
-#      and friends print `<label>: FAIL:MISMATCH expected=… got=…`, so a verdict
-#      can sit inside a longer reason; testing the whole reason for `FAIL:` and
-#      refusing first is what stops a `MISMATCH` whose *payload* happens to quote
-#      "not reachable" (`FAIL:MISMATCH expected='proxy port 1 not reachable' …`)
-#      from being re-driven. That case is a live peer's deterministic answer: a
-#      re-drive could only turn a real protocol regression into a coin flip.
-#   2. The prose readiness phrases are **end-anchored**, and the gate has to
+#   1. **Quarantine the live-peer verdicts first.** `send_and_expect` and
+#      friends print `<label>: FAIL:MISMATCH expected=… got=…`, and two call
+#      sites wrap the whole result (`"expected OK: got $result"`,
+#      `"proxy1=$result1 proxy2=$result2"`), so a `MISMATCH` can sit inside a
+#      longer reason — possibly beside a genuine `FAIL:TIMEOUT` from the other
+#      proxy. A reason carrying `FAIL:MISMATCH` or `FAIL:CONNECT_RESPONSE`
+#      *anywhere* is refused before anything else is considered: that verdict is
+#      a live peer's deterministic answer, and a re-drive could only turn a real
+#      protocol regression into a coin flip.
+#   2. **Any other `FAIL:<class>` token is refused unless it is one of the two
+#      timeouts**, wherever it sits in the reason — bare (`FAIL:TIMEOUT`),
+#      labelled (`tcp: FAIL:TIMEOUT`) or wrapped (`expected OK: got
+#      FAIL:TIMEOUT`). A timeout is the one `FAIL:` class that means "nothing
+#      answered in time", so it is retryable even when it has been wrapped; an
+#      unknown `FAIL:` class that also happens to quote a readiness phrase is
+#      refused here rather than falling through.
+#   3. **The prose readiness phrases are end-anchored**, and the gate has to
 #      name the thing it waited on: the reason must contain ` port` before
 #      `not reachable` / `not listening`, or end with `did not start`. So a
 #      message that merely mentions unreachability (`peer answered: not
-#      reachable`) or quotes it in the middle of a longer verdict is refused.
-#      The one trailing suffix any gate appends is allowed literally — the
-#      auth-reject gate's `(auth rejection false positive?)` — rather than by a
-#      general parenthetical rule, which would re-open the hole it closes. A
-#      new gate wording that does not match is simply not retried: refusing is
-#      the safe direction.
+#      reachable`) is refused. The one trailing suffix any gate appends is
+#      allowed literally — the auth-reject gate's `(auth rejection false
+#      positive?)` — rather than by a general parenthetical rule, which would
+#      re-open the hole it closes. A new gate wording that does not match is
+#      simply not retried: refusing is the safe direction.
 is_readiness_failure() {
     case "$1" in
-        *FAIL:*)
-            case "$1" in
-                FAIL:CONNECT_TIMEOUT|FAIL:TIMEOUT|*": FAIL:CONNECT_TIMEOUT"|*": FAIL:TIMEOUT") return 0 ;;
-                *) return 1 ;;
-            esac
-            ;;
+        *FAIL:MISMATCH*|*FAIL:CONNECT_RESPONSE*) return 1 ;;
+    esac
+    case "$1" in
+        *FAIL:CONNECT_TIMEOUT*|*FAIL:TIMEOUT*) return 0 ;;
+        *FAIL:*) return 1 ;;
     esac
     case "$1" in
         *" port"*" not reachable"|\
@@ -4601,7 +4625,7 @@ run_xtcp_test() {
     should_run_test "$name" || return 0
 
     # Reap the servers the previous scenarios started, by the exact pids this
-    # run recorded (`track_pid`, `scripts/compat-test.sh:153`) — never by
+    # run recorded (`track_pid`, `scripts/compat-test.sh:249`) — never by
     # argument pattern. Two `pkill -f "frpc -c"` / `pkill -f "frps -c"` calls
     # stood here; they matched *any* `frpc -c …` command line on the host,
     # including a developer's unrelated run or a sibling worktree's compat run.

@@ -669,15 +669,15 @@ There are two cases, and they are not the same amount of work:
   ```
 
   What you add instead is a **Rust↔Rust** scenario in the same runner
-  (`test_kcp_rust_to_rust`, `scripts/compat-test.sh:5041`, is the existing
+  (`test_kcp_rust_to_rust`, `scripts/compat-test.sh:5254`, is the existing
   template). It still drives the real `frps` and `frpc` binaries and the real wire
   protocol, and it is what a reviewer will ask for. Say in the PR that compat with
   Go frpc is *not applicable* rather than leaving the section empty.
 
 **What the harness gives you, and what it does not.** `write_frps_config`
-(`scripts/compat-test.sh:787`) is type-agnostic. `write_frpc_config`
-(`scripts/compat-test.sh:850`) is **not**: it hard-codes `type = "tcp"` in both
-the Go (`:891`) and the Rust (`:919`) branch, so a new type cannot reuse it. Either
+(`scripts/compat-test.sh:1000`) is type-agnostic. `write_frpc_config`
+(`scripts/compat-test.sh:1063`) is **not**: it hard-codes `type = "tcp"` in both
+the Go (`:1104`) and the Rust (`:1132`) branch, so a new type cannot reuse it. Either
 add a `type` parameter to the writer **and** update every existing caller, or write
 the frpc TOML inline in your scenario the way the special-case scenarios do.
 Inline is usually the smaller diff and the one to prefer.
@@ -685,12 +685,12 @@ Inline is usually the smaller diff and the one to prefer.
 **Prerequisites — and the one that costs an hour if nobody says it.** Before any
 selector runs, the runner checks (a) that all four binaries exist and are
 executable — `GO_FRPS`, `GO_FRPC`, `$PROJECT_DIR/target/release/frps`,
-`$PROJECT_DIR/target/release/frpc` (`scripts/compat-test.sh:5021-5027`), and
+`$PROJECT_DIR/target/release/frpc` (`scripts/compat-test.sh:5234-5240`), and
 (b) that `frp-core/tests/certs/` holds `ca.crt`, `server.crt` and `server.key`
-(`:43`, checked at `:5029-5035`). Three consequences:
+(`:96`, checked at `:5242-5248`). Three consequences:
 
 - The Rust paths are **hard-coded to `target/release/`**
-  (`scripts/compat-test.sh:41-42`) and are not environment-overridable. A debug
+  (`scripts/compat-test.sh:94-95`) and are not environment-overridable. A debug
   build does not satisfy them, so build release before running *any* selector,
   including the Rust↔Rust one:
   ```bash
@@ -704,7 +704,7 @@ executable — `GO_FRPS`, `GO_FRPC`, `$PROJECT_DIR/target/release/frps`,
 
 Add your scenario function beside the existing ones and register it with the other
 `run_test` lines at the bottom of the file (`run_test test_g2r_tcp_plain` is at
-`scripts/compat-test.sh:5657`). This is the Rust↔Rust shape:
+`scripts/compat-test.sh:5870`). This is the Rust↔Rust shape:
 
 ```bash
 test_r2r_mytcp_plain() {
@@ -775,7 +775,7 @@ One config trap worth repeating, because it fails with an unreadable error:
 `tcp_mux` must agree on both sides. The `rust` branch of `write_frps_config`
 writes `tcp_mux = false`, so the inline client config must too — the working
 spelling is the snake_case `tcp_mux` of the Rust `write_frpc_config` branch
-(`scripts/compat-test.sh:850-926`). What *is* dropped, silently, is the **top-level**
+(`scripts/compat-test.sh:1063-1139`). What *is* dropped, silently, is the **top-level**
 camelCase key: `tcpMux = false` written at the top level is accepted by the
 config parser whether or not a `[transport]` table is present, but it has no serde
 alias on `tcp_mux` (`frp-core/src/config/client.rs:321-322`), so the client keeps the default
@@ -790,8 +790,8 @@ under a `[transport]` table is **not** dropped — `normalize_client_config`
 spelling logs in and registers fine.
 
 Helper line numbers for orientation: `start_echo_server`
-`scripts/compat-test.sh:323`, `send_and_expect` `:350`, `log` `:706`,
-`should_run_test` `:741`. `run_go` (`:182`) is only for the Go-driving scenarios;
+`scripts/compat-test.sh:419`, `send_and_expect` `:446`, `log` `:802`,
+`should_run_test` `:841`. `run_go` (`:278`) is only for the Go-driving scenarios;
 a Rust↔Rust scenario invokes `"$RUST_FRPS"` / `"$RUST_FRPC"` directly, as above.
 
 **What a passing run prints.** Use the display name and paste the `N passed` line
@@ -812,8 +812,8 @@ $ echo $?
 
 **`--test` takes the display name; `--list` prints the function name. They do not
 match, and the mismatch exits 0.** `should_run_test`
-(`scripts/compat-test.sh:741`) compares the selector against the `local name=`
-inside the function, while `--list` (`scripts/compat-test.sh:103`) prints the
+(`scripts/compat-test.sh:841`) compares the selector against the `local name=`
+inside the function, while `--list` (`scripts/compat-test.sh:168`) prints the
 function names:
 
 ```console
@@ -1490,24 +1490,28 @@ original assertion kept) instead of learning to ignore it.
 
 The harness now absorbs that class instead of failing on it.
 `scripts/compat-test.sh` re-drives a scenario **once** (`FRP_COMPAT_RETRY_MAX`,
-default `1`; `0` disables it; anything above the hard cap `5` is refused with rc
-2) when — and only when — every failure the attempt recorded was a readiness
-gate: a prose reason ending in `not reachable` / `not listening` after the port
-it waited on, or `did not start`, or a bare/labelled `FAIL:CONNECT_TIMEOUT` /
-`FAIL:TIMEOUT`. **Any other `FAIL:<class>` verdict is refused**, so a
-`FAIL:MISMATCH` whose payload merely quotes "not reachable" is never re-driven —
-that verdict is a *deterministic* answer from a live peer, and re-running it
-would only turn a real protocol regression into a coin flip. The re-drive starts
-from a clean slate (the attempt's servers reaped, its scratch directory removed)
-and re-asserts the whole scenario, so a deterministic failure fails the second
-attempt too and is reported once. A green run that leaned on the re-drive says
-so: `[RETRY]` at the scenario and `RETRIED:` in the summary. The classification,
-the bound and the bookkeeping are driven in the `health` job by
-`scripts/tests/compat-scenario-retry.sh`, because none of them is visible from a
-green run. **This is a bounded recovery, not an identified cause**: the named
-subset was looped 210 times on an idle host with no flake reproduced, so what is
-established is that a run no longer fails on the readiness class — nothing about
-*why* a listener is late, and nothing that closes the compat-gate item.
+default `1`; `0` disables it; a non-numeric value, or one above the hard cap `5`
+once leading zeros are stripped — `(( ))` would read a padded value as octal —
+is refused with rc 2) when — and only when — every failure the attempt recorded
+was a readiness gate: a prose reason carrying ` port` before a trailing
+`not reachable` / `not listening`, or ending in `did not start`, or a
+`FAIL:CONNECT_TIMEOUT` / `FAIL:TIMEOUT` verdict, bare, labelled or wrapped in a
+longer reason. A reason carrying `FAIL:MISMATCH` or `FAIL:CONNECT_RESPONSE` is
+refused first, wherever it sits — so a `FAIL:MISMATCH` whose payload merely
+quotes "not reachable" is never re-driven, even when it arrives beside a genuine
+timeout from another proxy: that verdict is a *deterministic* answer from a live
+peer, and re-running it would only turn a real protocol regression into a coin
+flip. The re-drive starts from a clean slate (the attempt's servers reaped, its
+scratch directory removed) and re-asserts the whole scenario, so a deterministic
+failure fails the second attempt too and is reported once. A green run that
+leaned on the re-drive says so: `[RETRY]` at the scenario and `RETRIED:` in the
+summary. The classification, the bound and the bookkeeping are driven in the
+`health` job by `scripts/tests/compat-scenario-retry.sh`, because none of them is
+visible from a green run. **This is a bounded recovery, not an identified
+cause**: the named subset was looped 210 times on an idle host with no flake
+reproduced, so what is established is that a run no longer fails on the
+readiness class — nothing about *why* a listener is late, and nothing that closes
+the compat-gate item.
 
 **The practical rules:**
 

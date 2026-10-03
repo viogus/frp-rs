@@ -727,7 +727,7 @@ jobs:
         # hard ceiling (`RETRY_MAX_CAP` = 5) so a large value cannot turn a red
         # run into a long — or cancelled — one that no red-rate metric counts.
         #
-        # The suite floors its own count (`MIN_CHECKS=25`) and fails closed from an
+        # The suite floors its own count (`MIN_CHECKS=34`) and fails closed from an
         # EXIT trap, so a script replaced by `exit 0`, a skipped scenario, or an
         # extraction that silently matched nothing reds here instead of passing on
         # an empty census. This file's sha256 is the outer pin: weakening the
@@ -747,9 +747,9 @@ jobs:
           log="${TMPDIR:-/tmp}/frp-scenario-retry-fixtures.$$.log"
           status=0
           guard_file=scripts/tests/compat-scenario-retry.sh
-          guard_pin=816648671ad8e854dc2addd052d9c3b0f26bda1d869bd231e2b9c0835cb2a4da
-          guard_exact=25
-          guard_floor=25
+          guard_pin=70fab0ec0c639c88efa6fdc5e2b06fcd8bec8e9a91ab4e4681d1244f0bad1620
+          guard_exact=34
+          guard_floor=34
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=cd7a499d4d66660db4945c6fc67f2678b09a29e29138692214aa5d889aaef2b3
+          guard_data_pin=873ad3f477bed7afd556e2790238af4c381e46f88a5160cc02d39f129fa548fa
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'

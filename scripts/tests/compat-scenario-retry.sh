@@ -16,40 +16,48 @@
 # counters, the failure ledger and the withdrawal are the shipped ones. Each
 # extraction is asserted (`command -v`), so a renamed or reshaped function reds
 # here instead of silently testing nothing — a fixture whose subject vanished
-# must not pass vacuously.
+# must not pass vacuously. The knob's own validation is not extractable (it runs
+# at load), so those checks drive the real file with a hostile `GO_FRP_DIR` that
+# stops it at the binary check.
 #
-# The classification rule this pins (review round 1, finding A1): a
-# `FAIL:<class>` verdict is refused **wherever it appears** except a bare or
-# labelled `FAIL:CONNECT_TIMEOUT`/`FAIL:TIMEOUT`, so a `FAIL:MISMATCH` whose
-# payload *quotes* "not reachable" is not re-driven; and the prose readiness
-# phrases are end-anchored, so a message that merely mentions unreachability
-# mid-string is not either.
+# The classification rule this pins (review round 1 A1 + round 2 D2-F3, in this
+# order): a reason carrying `FAIL:MISMATCH`/`FAIL:CONNECT_RESPONSE` anywhere is
+# refused first — even beside a genuine timeout from the other proxy; then a
+# wrapped or bare `FAIL:CONNECT_TIMEOUT`/`FAIL:TIMEOUT` is retryable and any
+# other `FAIL:` class is refused; and the prose readiness phrases are
+# end-anchored and port-qualified, so a message that merely mentions
+# unreachability is refused.
 #
-# Scenarios (the classification table is thirteen checks; the rest are one each):
-#   1..13 classification: prose readiness gates (`not reachable`, `did not
-#         start`, `not listening`, with and without a trailing parenthetical)
-#         and the two timeout verdicts are re-drivable; a `FAIL:MISMATCH` whose
-#         payload quotes "not reachable", a `FAIL:CONNECT_RESPONSE`, a
-#         mid-string mention of unreachability and other assertions are not.
-#   14    a readiness failure that does not recur: 2 attempts, 1 passed,
+# Scenarios (the classification table is eighteen checks; the rest are one each):
+#   1..18 classification: prose readiness gates (with and without the auth-reject
+#         suffix), the two timeout verdicts bare/labelled/wrapped, and the
+#         refusals — a `FAIL:MISMATCH` quoting "not reachable", the same beside a
+#         timeout, a `FAIL:CONNECT_RESPONSE`, a mid-string mention and other
+#         assertions.
+#   19    a readiness failure that does not recur: 2 attempts, 1 passed,
 #         0 failed, RETRIED_PASS=1 and no leftover failure record.
-#   15    a readiness failure that recurs on the clean re-drive: bounded to
+#   20    a readiness failure that recurs on the clean re-drive: bounded to
 #         2 attempts and reported exactly once — the bound, and no double count.
-#   16    the adversarial case end-to-end: a scenario failing with
+#   21    the round-1 A1 case end-to-end: a scenario failing with
 #         `FAIL:MISMATCH expected='proxy port 1 not reachable'` is **not**
 #         re-driven — 1 attempt, 1 failure, RETRIED_PASS=0.
-#   17    FAIL:CONNECT_RESPONSE is never re-driven.
-#   18    FAIL:CONNECT_TIMEOUT is still re-driven and absorbed.
-#   19    FAIL:TIMEOUT is still re-driven and absorbed.
-#   20    FRP_COMPAT_RETRY_MAX=0 disables the re-drive.
-#   21    a clean pass runs once and is not marked as retried.
-#   22    a withdrawn attempt's `pass_test` is withdrawn with it (no double
+#   22    FAIL:CONNECT_RESPONSE is never re-driven.
+#   23    FAIL:CONNECT_TIMEOUT is still re-driven and absorbed.
+#   24    FAIL:TIMEOUT is still re-driven and absorbed.
+#   25    round-2 D2-F3: a *wrapped* timeout verdict (`expected OK: got
+#         FAIL:TIMEOUT`) is still re-driven.
+#   26    FRP_COMPAT_RETRY_MAX=0 disables the re-drive.
+#   27    a clean pass runs once and is not marked as retried.
+#   28    a withdrawn attempt's `pass_test` is withdrawn with it (no double
 #         count on PASS).
-#   23    an attempt with *any* non-readiness failure among its reasons is not
+#   29    an attempt with *any* non-readiness failure among its reasons is not
 #         re-driven, even when another reason is readiness-class.
-#   24    the harness refuses a non-numeric `FRP_COMPAT_RETRY_MAX` up front,
-#         driving the real file rather than an extraction.
-#   25    the harness refuses a value over the hard cap up front, too.
+#   30    the harness refuses a non-numeric `FRP_COMPAT_RETRY_MAX` up front.
+#   31    the harness refuses a value over the hard cap up front.
+#   32    round-2 D2-F2: a zero-padded `08` is refused, not read as octal.
+#   33    the same hole with more padding (`0008`) is refused too.
+#   34    a padded value that is *under* the cap (`05`) is accepted, so the
+#         stripping does not over-reject.
 #
 # Residue, declared rather than denied: `scripts/compat-test.sh` is unpinned
 # (the port-ownership step records the same for its structural probes), so a
@@ -74,7 +82,7 @@ checks=0
 fails=0
 # Pinned total: `exit "$fails"` alone is happy with a suite that silently stops
 # checking, so the floor is enforced from the exit trap on every path.
-MIN_CHECKS=25
+MIN_CHECKS=34
 
 ok()  { checks=$((checks + 1)); printf '  ok    %s\n' "$1"; }
 bad() { checks=$((checks + 1)); fails=$((fails + 1)); printf '  FAIL  %s\n' "$1"; }
@@ -147,6 +155,14 @@ reset_run() {
   ATTEMPTS=0
 }
 
+# The knob's validation runs at load, so it cannot be extracted; drive the real
+# file with a Go directory that cannot exist, so a run that gets past the
+# validation stops at the binary check instead of starting the suite.
+run_harness_with_retry_max() {
+  env GO_FRP_DIR=/nonexistent-frp-fixture GO_FRP_VERSION=0.0.0-fixture \
+    FRP_COMPAT_RETRY_MAX="$1" bash "$COMPAT" 2>&1
+}
+
 # --- classification ----------------------------------------------------------
 while IFS='|' read -r want reason; do
   if is_readiness_failure "$reason"; then got=yes; else got=no; fi
@@ -165,13 +181,18 @@ yes|Go frps did not start
 yes|Go frps WSS port 22001 not listening
 yes|FAIL:CONNECT_TIMEOUT
 yes|FAIL:TIMEOUT
+yes|tcp: FAIL:CONNECT_TIMEOUT
+yes|expected OK: got FAIL:TIMEOUT
+yes|proxy1=FAIL:TIMEOUT proxy2=FAIL:CONNECT_TIMEOUT
 no|FAIL:MISMATCH expected='proxy port 1 not reachable' got='b'
 no|FAIL:CONNECT_RESPONSE b'CONNECT x:22 HTTP/1.1\r\n'
+no|expected OK: got FAIL:MISMATCH expected='a' got='b'
+no|proxy1=FAIL:MISMATCH expected='a' got='b' proxy2=FAIL:TIMEOUT
 no|peer answered: not reachable
 no|expected SSH banner starting with 'SSH-', got: BANNER_ERROR
 CASES
 
-# 14. readiness failure, clean on the re-drive.
+# 19. readiness failure, clean on the re-drive.
 scn_late_once() {
   ATTEMPTS=$((ATTEMPTS + 1))
   if (( ATTEMPTS == 1 )); then
@@ -189,7 +210,7 @@ else
   bad "readiness re-drive bookkeeping (attempts=$ATTEMPTS pass=$PASS fail=$FAIL retried=$RETRIED_PASS failures=${#FAILURES[@]})"
 fi
 
-# 15. readiness failure on both attempts: bounded, reported once.
+# 20. readiness failure on both attempts: bounded, reported once.
 scn_late_always() {
   ATTEMPTS=$((ATTEMPTS + 1))
   fail_test late-always "proxy port 1 not reachable"
@@ -203,7 +224,7 @@ else
   bad "recurring readiness failure (attempts=$ATTEMPTS pass=$PASS fail=$FAIL failures=${#FAILURES[@]})"
 fi
 
-# 16. review round 1, A1: a deterministic MISMATCH whose payload quotes the
+# 21. review round 1, A1: a deterministic MISMATCH whose payload quotes the
 #     retryable phrase must not be re-driven, and must not be counted twice.
 scn_mismatch_quoting_readiness() {
   ATTEMPTS=$((ATTEMPTS + 1))
@@ -218,7 +239,7 @@ else
   bad "MISMATCH quoting readiness was re-driven (attempts=$ATTEMPTS pass=$PASS fail=$FAIL retried=$RETRIED_PASS)!"
 fi
 
-# 17. a live peer's CONNECT answer is never re-driven.
+# 22. a live peer's CONNECT answer is never re-driven.
 scn_connectres() {
   ATTEMPTS=$((ATTEMPTS + 1))
   fail_test connres "FAIL:CONNECT_RESPONSE b'CONNECT x:22 HTTP/1.1'"
@@ -231,7 +252,7 @@ else
   bad "CONNECT_RESPONSE re-driven ($ATTEMPTS attempts)"
 fi
 
-# 18. FAIL:CONNECT_TIMEOUT is still the retryable class.
+# 23. FAIL:CONNECT_TIMEOUT is still the retryable class.
 scn_connect_timeout() {
   ATTEMPTS=$((ATTEMPTS + 1))
   if (( ATTEMPTS == 1 )); then
@@ -248,7 +269,7 @@ else
   bad "FAIL:CONNECT_TIMEOUT (attempts=$ATTEMPTS pass=$PASS fail=$FAIL retried=$RETRIED_PASS)"
 fi
 
-# 19. FAIL:TIMEOUT is still the retryable class.
+# 24. FAIL:TIMEOUT is still the retryable class.
 scn_timeout() {
   ATTEMPTS=$((ATTEMPTS + 1))
   if (( ATTEMPTS == 1 )); then
@@ -265,7 +286,26 @@ else
   bad "FAIL:TIMEOUT (attempts=$ATTEMPTS pass=$PASS fail=$FAIL retried=$RETRIED_PASS)"
 fi
 
-# 20. the bound is a knob: 0 disables the re-drive.
+# 25. review round 2, D2-F3: the two wrapping call sites build
+#     `expected OK: got $result`, so a genuine timeout arrives embedded in a
+#     longer reason and must still be re-driven.
+scn_wrapped_timeout() {
+  ATTEMPTS=$((ATTEMPTS + 1))
+  if (( ATTEMPTS == 1 )); then
+    fail_test wrapped-timeout "expected OK: got FAIL:TIMEOUT"
+  else
+    pass_test wrapped-timeout
+  fi
+}
+reset_run 1
+run_test scn_wrapped_timeout >/dev/null 2>&1
+if [ "$ATTEMPTS" = 2 ] && [ "$PASS" = 1 ] && [ "$FAIL" = 0 ] && [ "$RETRIED_PASS" = 1 ]; then
+  ok 'a wrapped timeout verdict is still re-driven and absorbed'
+else
+  bad "wrapped FAIL:TIMEOUT (attempts=$ATTEMPTS pass=$PASS fail=$FAIL retried=$RETRIED_PASS)"
+fi
+
+# 26. the bound is a knob: 0 disables the re-drive.
 reset_run 0
 run_test scn_late_once >/dev/null 2>&1
 if [ "$ATTEMPTS" = 1 ] && [ "$FAIL" = 1 ] && [ "$RETRIED_PASS" = 0 ]; then
@@ -274,7 +314,7 @@ else
   bad "RETRY_MAX=0 (attempts=$ATTEMPTS fail=$FAIL)"
 fi
 
-# 21. a clean pass is untouched.
+# 27. a clean pass is untouched.
 scn_clean() {
   ATTEMPTS=$((ATTEMPTS + 1))
   pass_test clean
@@ -287,7 +327,7 @@ else
   bad "clean pass (attempts=$ATTEMPTS pass=$PASS retried=$RETRIED_PASS)"
 fi
 
-# 22. a withdrawn attempt's pass is withdrawn with it. The synthetic scenario
+# 28. a withdrawn attempt's pass is withdrawn with it. The synthetic scenario
 #     mirrors a real one: mutually exclusive branches per attempt.
 scn_pass_then_late() {
   ATTEMPTS=$((ATTEMPTS + 1))
@@ -306,7 +346,7 @@ else
   bad "withdrawn pass double counted (attempts=$ATTEMPTS pass=$PASS fail=$FAIL)"
 fi
 
-# 23. one readiness reason among several, one of them a protocol answer: no
+# 29. one readiness reason among several, one of them a protocol answer: no
 #     re-drive at all — the class check is "every reason", not "any reason".
 scn_mixed() {
   ATTEMPTS=$((ATTEMPTS + 1))
@@ -321,11 +361,9 @@ else
   bad "mixed failure re-driven (attempts=$ATTEMPTS fail=$FAIL)"
 fi
 
-# 24. a non-numeric bound is refused before it can reach `(( ))`. This drives
-#     the real file, not an extraction: the guard sits between arg parsing and
-#     the binary checks, so no Go frp and no Rust build are needed.
+# 30. a non-numeric bound is refused before it can reach `(( ))`.
 bad_rc=0
-bad_out=$(FRP_COMPAT_RETRY_MAX='seven' bash "$COMPAT" 2>&1) || bad_rc=$?
+bad_out=$(run_harness_with_retry_max 'seven') || bad_rc=$?
 case "$bad_out" in
   *"FRP_COMPAT_RETRY_MAX must be a non-negative integer"*) bad_msg=1 ;;
   *) bad_msg=0 ;;
@@ -336,10 +374,9 @@ else
   bad "non-numeric FRP_COMPAT_RETRY_MAX (rc=$bad_rc, message $( [ "$bad_msg" = 1 ] && echo present || echo missing ))"
 fi
 
-# 25. review round 1, A4: the knob has a hard ceiling, so a large value cannot
-#     turn a red run into a long (or cancelled) one. Also drives the real file.
+# 31. review round 1, A4: the knob has a hard ceiling.
 cap_rc=0
-cap_out=$(FRP_COMPAT_RETRY_MAX="$((RETRY_MAX_CAP + 1))" bash "$COMPAT" 2>&1) || cap_rc=$?
+cap_out=$(run_harness_with_retry_max "$((RETRY_MAX_CAP + 1))") || cap_rc=$?
 case "$cap_out" in
   *"FRP_COMPAT_RETRY_MAX must be <= $RETRY_MAX_CAP"*) cap_msg=1 ;;
   *) cap_msg=0 ;;
@@ -348,4 +385,47 @@ if [ "$cap_rc" = 2 ] && [ "$cap_msg" = 1 ]; then
   ok "a FRP_COMPAT_RETRY_MAX above the cap ($RETRY_MAX_CAP) exits 2 and names the cap"
 else
   bad "over-cap FRP_COMPAT_RETRY_MAX (rc=$cap_rc, message $( [ "$cap_msg" = 1 ] && echo present || echo missing ))"
+fi
+
+# 32. review round 2, D2-F2: `08` is digits-only, so the spelling check used to
+#     accept it — and `(( ))` then read it as octal, making the cap comparison a
+#     false condition instead of an abort. It must be refused like any other
+#     over-cap value.
+zero_rc=0
+zero_out=$(run_harness_with_retry_max '08') || zero_rc=$?
+case "$zero_out" in
+  *"FRP_COMPAT_RETRY_MAX must be <= $RETRY_MAX_CAP"*) zero_msg=1 ;;
+  *) zero_msg=0 ;;
+esac
+if [ "$zero_rc" = 2 ] && [ "$zero_msg" = 1 ]; then
+  ok 'a zero-padded over-cap value (08) exits 2 and names the cap'
+else
+  bad "zero-padded 08 (rc=$zero_rc, message $( [ "$zero_msg" = 1 ] && echo present || echo missing ))"
+fi
+
+# 33. the same hole with more padding.
+pad_rc=0
+pad_out=$(run_harness_with_retry_max '0008') || pad_rc=$?
+case "$pad_out" in
+  *"FRP_COMPAT_RETRY_MAX must be <= $RETRY_MAX_CAP"*) pad_msg=1 ;;
+  *) pad_msg=0 ;;
+esac
+if [ "$pad_rc" = 2 ] && [ "$pad_msg" = 1 ]; then
+  ok 'a longer zero-padded over-cap value (0008) is refused too'
+else
+  bad "zero-padded 0008 (rc=$pad_rc, message $( [ "$pad_msg" = 1 ] && echo present || echo missing ))"
+fi
+
+# 34. a padded value under the cap is *accepted* (it gets past validation to the
+#     binary check), so the stripping does not over-reject.
+ok_rc=0
+ok_out=$(run_harness_with_retry_max '05') || ok_rc=$?
+case "$ok_out" in
+  *"FRP_COMPAT_RETRY_MAX must be"*) ok_refused=1 ;;
+  *) ok_refused=0 ;;
+esac
+if [ "$ok_rc" != 2 ] && [ "$ok_refused" = 0 ]; then
+  ok 'a zero-padded under-cap value (05) passes validation and reaches the binary check'
+else
+  bad "zero-padded 05 was refused (rc=$ok_rc, refusal message $( [ "$ok_refused" = 1 ] && echo present || echo absent ))"
 fi
