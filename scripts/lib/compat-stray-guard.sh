@@ -48,7 +48,7 @@ PIDS="${PIDS:-}"
 # Normalise trailing slashes away *before* the refusals below. Every ownership
 # match is the literal `"$TEST_DIR/"` (see `scenario_strays`), so a run dir
 # spelled with a trailing slash — `FRP_COMPAT_TEST_DIR=/tmp/x/`, which
-# `scripts/compat-test.sh:120` documents and shell tab-completion produces —
+# `scripts/compat-test.sh:185` documents and shell tab-completion produces —
 # became `…/x//` and never matched a command line carrying `…/x/`: the census
 # came back empty, the sweep was a no-op, and `assert_no_strays` returned 0 with
 # the stray still alive (F2, measured by the adversarial reviewer).

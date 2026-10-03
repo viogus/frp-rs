@@ -3,6 +3,59 @@
 # frp-rs Cross-Compatibility Test Suite
 # Tests Go frp v0.71.0 <-> Rust frp-rs interoperability
 # =============================================================================
+#
+# Bounded re-drive of a timing-sensitive scenario
+# -----------------------------------------------
+# The compat gate's residual flake is a *readiness* failure: a scenario's
+# frps/frpc binds its port a little later than the gate's deadline, or a dial
+# never completes inside `send_and_expect`'s window, and the scenario reports
+# `… not reachable` / `FAIL:CONNECT_TIMEOUT` although nothing on the data plane
+# is wrong. The round-5 harness round widened every readiness gate to at least
+# `FRP_COMPAT_READY_MIN` (default 20 s) and made a red run dump the
+# `frps.log`/`frpc.log` tails under `$CI`; that absorbs a *late* listener, but
+# a *wedged* one still fails, and waiting longer cannot tell the two apart.
+#
+# So a failing attempt whose failures are **all** of that class is re-driven
+# once, from a clean slate: the attempt's servers are reaped and its scratch
+# directory is removed, so the second attempt starts the same binaries on fresh
+# ports exactly as the first did. This is the mechanism the second branch of the
+# "residual flake is unmeasured in CI" Done-when describes — re-driving the frpc
+# start rather than waiting longer for it — and it is the bounded retry the
+# "compat gate is flaky" Done-when asks for. It is a bounded *recovery*, not an
+# identified cause: the named subset was looped 210 times on an idle host with
+# no flake reproduced, so nothing here says why a listener is late, and neither
+# item is closed by it. (Both items live in TODO.md; they are named by title
+# rather than by line number, because the cross-file citation gate's
+# checked-cite total is pinned and a new cite would move a literal in
+# `.github/workflows/ci.yml` that this change has no business touching.)
+#
+# What is retried, and why that cannot mask a real failure:
+#   * a failure reason is retryable in exactly two shapes (`is_readiness_failure`,
+#     which refuses before it accepts): (a) a **timeout verdict** —
+#     `FAIL:CONNECT_TIMEOUT` or `FAIL:TIMEOUT`, bare, labelled or wrapped inside
+#     a longer reason such as `expected OK: got FAIL:TIMEOUT`; or (b) a **prose
+#     readiness gate** whose reason carries ` port` before a trailing
+#     `not reachable` / `not listening` (or the auth-reject gate's literal
+#     `(auth rejection false positive?)` suffix), or ends with ` did not start`.
+#     A reason carrying `FAIL:MISMATCH` or `FAIL:CONNECT_RESPONSE` is refused
+#     before anything else is looked at — including one whose payload quotes
+#     "not reachable", and including one that also carries a genuine timeout from
+#     another proxy — and any other `FAIL:` class is refused rather than falling
+#     through to the prose test.
+#   * the re-drive re-runs the **whole** scenario, so every assertion the first
+#     attempt made is made again. A deterministic failure (a real regression)
+#     fails the second attempt too and is reported once; only a failure that
+#     does not recur on a fresh start is absorbed.
+#   * the re-drive is bounded by `FRP_COMPAT_RETRY_MAX` (default 1; `0` disables
+#     it entirely). A non-numeric value is refused with rc 2, and so is a value
+#     above the hard cap `RETRY_MAX_CAP` = 5 — after leading zeros are stripped,
+#     because `(( ))` reads a padded value as octal and `08`/`09` would otherwise
+#     make the comparison a false condition instead of a refusal. There is no
+#     unbounded loop, and neither a large nor a zero-padded value can turn a red
+#     run into a long one.
+#   * the withdrawn attempt is printed (`[RETRY] …`) and the summary reports how
+#     many scenarios passed on a re-drive, so a green run built on retries is
+#     visible rather than silent.
 set -euo pipefail
 
 # --- Paths ---
@@ -53,6 +106,18 @@ TEST_DIR="${FRP_COMPAT_TEST_DIR:-/tmp/frp-compat-test}"
 PASS=0
 FAIL=0
 FAILURES=()
+# Bounded re-drive of a readiness-class failure (see "Bounded re-drive" at the
+# top). `RETRY_MAX` is validated right after arg parsing; `_ATTEMPT_FAILURES`
+# holds `"<name>: <reason>"` for the attempt `run_test` is currently executing,
+# and `RETRIED_PASS` counts the scenarios a re-drive turned green.
+RETRY_MAX="${FRP_COMPAT_RETRY_MAX:-1}"
+# Hard cap on the knob, not a knob itself. The re-drive is a bounded recovery
+# from one flaky start, not a re-run-until-green button: a large bound would
+# absorb a genuinely intermittent regression, and a big enough one turns a red
+# run into a *cancelled* one that no red-rate metric counts.
+RETRY_MAX_CAP=5
+RETRIED_PASS=0
+_ATTEMPT_FAILURES=()
 VERBOSE=false
 SELECTED_TEST=""
 # Set by `should_run_test` when `--test`'s value matches a scenario. `--test`
@@ -119,6 +184,10 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Env: FRP_COMPAT_TEST_DIR  Scratch dir (default: /tmp/frp-compat-test)."
             echo "     Set it per run so concurrent compat runs never share a scratch dir."
+            echo "     FRP_COMPAT_RETRY_MAX  Re-drives of a readiness-class scenario"
+            echo "                          failure (default 1, 0 disables, max $RETRY_MAX_CAP)."
+            echo "                          Bounded, and only readiness/timeout reasons"
+            echo "                          are retried."
             exit 0
             ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
@@ -145,6 +214,82 @@ fi
 # Pass the resolved Go frp version/path to remote-frps.sh for VPS XTCP runs.
 export GO_FRP_VERSION
 export GO_FRP_DIR
+
+# `FRP_COMPAT_RETRY_MAX` is used in arithmetic below, and two spellings have to
+# be handled before it is. A non-numeric one would abort `(( ))` far from its
+# cause. A *zero-padded* one is worse: `(( ))` reads a leading zero as octal, so
+# `08` and `09` are not 8 and 9 but a syntax error that makes the condition
+# false — silently defeating both this cap and the loop bound. So refuse the
+# non-numeric spelling, strip the padding (the zero-stripping the fixture
+# suites' own floor validation uses), and compare the result in decimal. An
+# empty value means "use the default", which the `:-` above already resolved, so
+# it cannot reach here; stripping `0`/`00` yields the empty string, which is
+# decimal zero and disables the re-drive.
+_raw_retry_max="$RETRY_MAX"
+case "$RETRY_MAX" in
+    ''|*[!0-9]*)
+        echo "ERROR: FRP_COMPAT_RETRY_MAX must be a non-negative integer, got '$_raw_retry_max'" >&2
+        exit 2
+        ;;
+esac
+while [ "${RETRY_MAX#0}" != "$RETRY_MAX" ]; do
+    RETRY_MAX="${RETRY_MAX#0}"
+done
+[ -n "$RETRY_MAX" ] || RETRY_MAX=0
+if (( RETRY_MAX > RETRY_MAX_CAP )); then
+    echo "ERROR: FRP_COMPAT_RETRY_MAX must be <= $RETRY_MAX_CAP, got '$_raw_retry_max'" >&2
+    echo "       the re-drive recovers from one flaky start; it is not a re-run-until-green knob" >&2
+    exit 2
+fi
+
+# `FRP_COMPAT_READY_MIN` reaches the one comparison inside `wait_for_port_safe`,
+# so it had both of the failure modes above: a non-numeric value is an unbound
+# variable there under `set -u`, and a *zero-padded* one is read as octal, which
+# makes the comparison false and silently drops the readiness floor — the gate
+# then falls back to the caller's (shorter) timeout, i.e. the safety net fails
+# open exactly when it is needed. Refuse the non-numeric spelling and strip the
+# padding here, so the value the gate reads is always a decimal one; the gate
+# re-checks it as well, because a function that is only ever called with a
+# validated value is one refactor away from being called without one. An empty
+# value means "use the default" (`:-20` at the use site).
+_raw_ready_min="${FRP_COMPAT_READY_MIN:-20}"
+case "$_raw_ready_min" in
+    ''|*[!0-9]*)
+        echo "ERROR: FRP_COMPAT_READY_MIN must be a non-negative integer, got '$_raw_ready_min'" >&2
+        exit 2
+        ;;
+esac
+FRP_COMPAT_READY_MIN="$_raw_ready_min"
+while [ "${FRP_COMPAT_READY_MIN#0}" != "$FRP_COMPAT_READY_MIN" ]; do
+    FRP_COMPAT_READY_MIN="${FRP_COMPAT_READY_MIN#0}"
+done
+[ -n "$FRP_COMPAT_READY_MIN" ] || FRP_COMPAT_READY_MIN=0
+
+# `XTCP_SHARD` (`--shard INDEX/TOTAL`) is split into two halves that reach
+# arithmetic in the XTCP phase (`(( _i % _xtcp_total == _xtcp_idx ))`), and both
+# have the same two failure modes: `0/08` is an octal syntax error there and
+# `0/0` is a division by zero, each of which makes the condition false — the
+# shard then runs no test at all and reports `0 test(s) completed` as a success.
+# Validate the shape and normalise both halves to decimal here, where the flag is
+# parsed, so the phase cannot be handed a value that reaches `(( ))`.
+if [ -n "${XTCP_SHARD:-}" ]; then
+    case "$XTCP_SHARD" in
+        *[!0-9/]*|/*|*/|*/*/*)
+            echo "ERROR: --shard/XTCP_SHARD must be INDEX/TOTAL in decimal, got '$XTCP_SHARD'" >&2
+            exit 2
+            ;;
+    esac
+    _shard_idx="${XTCP_SHARD%%/*}"
+    _shard_total="${XTCP_SHARD##*/}"
+    while [ "${_shard_idx#0}" != "$_shard_idx" ]; do _shard_idx="${_shard_idx#0}"; done
+    while [ "${_shard_total#0}" != "$_shard_total" ]; do _shard_total="${_shard_total#0}"; done
+    _shard_idx="${_shard_idx:-0}"
+    if [ -z "$_shard_total" ] || [ "$_shard_total" -lt 1 ] || [ "$_shard_idx" -ge "$_shard_total" ]; then
+        echo "ERROR: --shard/XTCP_SHARD needs 0 <= INDEX < TOTAL with TOTAL >= 1, got '$XTCP_SHARD'" >&2
+        exit 2
+    fi
+    XTCP_SHARD="$_shard_idx/$_shard_total"
+fi
 
 # =============================================================================
 # Helpers
@@ -297,6 +442,22 @@ wait_for_port() {
 # environment where ownership cannot be checked fails the gate.
 wait_for_port_safe() {
     local host="$1" port="$2" timeout="${3:-15}" ready_min="${FRP_COMPAT_READY_MIN:-20}"
+    # The floor is arithmetic input, and `(( ))` reads a leading zero as octal:
+    # with `FRP_COMPAT_READY_MIN=08` the comparison below errored and read
+    # *false*, so the gate silently fell back to the caller's shorter timeout —
+    # the one case where the floor exists for a reason. Normalise it here as well
+    # as at load (`FRP_COMPAT_READY_MIN` is also validated there), and refuse a
+    # value that is not a decimal integer rather than letting `(( ))` abort.
+    case "$ready_min" in
+        ''|*[!0-9]*)
+            echo "ERROR: wait_for_port_safe: FRP_COMPAT_READY_MIN must be a non-negative integer, got '$ready_min'; failing closed" >&2
+            return 1
+            ;;
+    esac
+    while [ "${ready_min#0}" != "$ready_min" ]; do
+        ready_min="${ready_min#0}"
+    done
+    [ -n "$ready_min" ] || ready_min=0
     (( timeout < ready_min )) && timeout="$ready_min"
     case "$host" in
         127.0.0.1|localhost|::1)
@@ -725,6 +886,10 @@ fail_test() {
     echo -e "${RED}[FAIL]${NC} $name: $reason"
     FAIL=$((FAIL + 1))
     FAILURES+=("$name: $reason")
+    # Recorded per attempt for `run_test`'s bounded re-drive: a failure whose
+    # reason is the readiness class can be re-driven, and this is the only place
+    # a scenario's failure reason is available.
+    _ATTEMPT_FAILURES+=("$name: $reason")
     if $VERBOSE || $CI; then
         echo "--- logs for $name ---"
         # CI too: the EXIT trap removes TEST_DIR, so a red run's logs never survive otherwise.
@@ -755,6 +920,55 @@ should_run_test() {
     return 1
 }
 
+# Is a scenario's failure reason the timing-sensitive class — a readiness gate
+# that never saw the listener, or a dial that never completed — rather than a
+# protocol/data assertion? Only these are re-driven.
+#
+# The rule has three steps, and all of them are about refusing more than they
+# accept — in this order, because the wrapping call sites compose verdicts:
+#
+#   1. **Quarantine the live-peer verdicts first.** `send_and_expect` and
+#      friends print `<label>: FAIL:MISMATCH expected=… got=…`, and two call
+#      sites wrap the whole result (`"expected OK: got $result"`,
+#      `"proxy1=$result1 proxy2=$result2"`), so a `MISMATCH` can sit inside a
+#      longer reason — possibly beside a genuine `FAIL:TIMEOUT` from the other
+#      proxy. A reason carrying `FAIL:MISMATCH` or `FAIL:CONNECT_RESPONSE`
+#      *anywhere* is refused before anything else is considered: that verdict is
+#      a live peer's deterministic answer, and a re-drive could only turn a real
+#      protocol regression into a coin flip.
+#   2. **Any other `FAIL:<class>` token is refused unless it is one of the two
+#      timeouts**, wherever it sits in the reason — bare (`FAIL:TIMEOUT`),
+#      labelled (`tcp: FAIL:TIMEOUT`) or wrapped (`expected OK: got
+#      FAIL:TIMEOUT`). A timeout is the one `FAIL:` class that means "nothing
+#      answered in time", so it is retryable even when it has been wrapped; an
+#      unknown `FAIL:` class that also happens to quote a readiness phrase is
+#      refused here rather than falling through.
+#   3. **The prose readiness phrases are end-anchored**, and the gate has to
+#      name the thing it waited on: the reason must contain ` port` before
+#      `not reachable` / `not listening`, or end with `did not start`. So a
+#      message that merely mentions unreachability (`peer answered: not
+#      reachable`) is refused. The one trailing suffix any gate appends is
+#      allowed literally — the auth-reject gate's `(auth rejection false
+#      positive?)` — rather than by a general parenthetical rule, which would
+#      re-open the hole it closes. A new gate wording that does not match is
+#      simply not retried: refusing is the safe direction.
+is_readiness_failure() {
+    case "$1" in
+        *FAIL:MISMATCH*|*FAIL:CONNECT_RESPONSE*) return 1 ;;
+    esac
+    case "$1" in
+        *FAIL:CONNECT_TIMEOUT*|*FAIL:TIMEOUT*) return 0 ;;
+        *FAIL:*) return 1 ;;
+    esac
+    case "$1" in
+        *" port"*" not reachable"|\
+        *" port"*" not reachable (auth rejection false positive?)"|\
+        *" port"*" not listening"|\
+        *" did not start") return 0 ;;
+    esac
+    return 1
+}
+
 # Wrapper that enables set -x tracing in --debug mode.
 #
 # The scenario runs in *this* shell, exactly as it does without --debug. A
@@ -767,19 +981,83 @@ should_run_test() {
 # rather than by a subshell. No scenario calls bare `exit`; the ones that used
 # to be contained by the subshell are the arg/cleanup/binary/cert checks and
 # the summary block, all of which run outside this wrapper.
+#
+# The wrapper also owns the bounded re-drive documented at the top of this file
+# ("Bounded re-drive of a timing-sensitive scenario"): an attempt whose every
+# recorded failure is readiness-class is withdrawn whole and re-run once.
 run_test() {
-    if $DEBUG; then
-        local was_trace=false rc=0
-        if [[ $- == *x* ]]; then
-            was_trace=true
+    local attempt=0
+    local fail_from pass_from failures_len
+    while :; do
+        fail_from=$FAIL
+        pass_from=$PASS
+        failures_len=${#FAILURES[@]}
+        _ATTEMPT_FAILURES=()
+
+        local rc=0
+        if $DEBUG; then
+            local was_trace=false
+            if [[ $- == *x* ]]; then
+                was_trace=true
+            fi
+            set -x
+            "$@" || rc=$?
+            $was_trace || set +x
+        else
+            "$@" || rc=$?
         fi
-        set -x
-        "$@"
-        rc=$?
-        $was_trace || set +x
-        return "$rc"
-    fi
-    "$@"
+
+        # Nothing failed in this attempt: the scenario passed (or selected
+        # itself out), so there is nothing to withdraw.
+        if (( FAIL == fail_from )); then
+            if (( attempt > 0 )); then
+                # Counted so the summary can say a green run leaned on a
+                # re-drive; a silent retry is the thing this must not become.
+                RETRIED_PASS=$(( RETRIED_PASS + 1 ))
+            fi
+            return "$rc"
+        fi
+
+        # Re-drive only when *every* failure this attempt recorded is the
+        # readiness class, and only while the bound allows it.
+        local retryable=1 rec
+        for rec in "${_ATTEMPT_FAILURES[@]}"; do
+            if ! is_readiness_failure "${rec#*: }"; then
+                retryable=0
+                break
+            fi
+        done
+        if (( retryable == 0 )) || (( attempt >= RETRY_MAX )); then
+            return "$rc"
+        fi
+
+        attempt=$(( attempt + 1 ))
+        # Withdraw the attempt whole: its failure records, and any `pass_test`
+        # it counted, belong to the attempt being thrown away.
+        FAIL=$fail_from
+        PASS=$pass_from
+        if (( failures_len == 0 )); then
+            FAILURES=()
+        else
+            FAILURES=("${FAILURES[@]:0:failures_len}")
+        fi
+        log "[RETRY] $*: attempt $attempt failed only at a readiness gate (${_ATTEMPT_FAILURES[*]}); the [FAIL] line above is withdrawn and the scenario is re-driven from a clean slate (bound FRP_COMPAT_RETRY_MAX=$RETRY_MAX)"
+        # Reap this attempt's servers before the re-drive, exactly as the
+        # phase boundaries do, so the second attempt binds fresh ports.
+        cleanup_pids
+        reap_scoped_strays
+        # A fresh scratch dir per attempt: at least one scenario appends to a
+        # config it wrote, and a re-drive must not read the failed attempt's
+        # files. The scenario dir is `$TEST_DIR/<display name>` and the display
+        # name is the part of the failure record before ": "; a name that is
+        # empty, a dot entry or contains a slash is refused rather than
+        # recursive-deleted.
+        local scn="${_ATTEMPT_FAILURES[0]%%: *}"
+        case "$scn" in
+            ""|.|..|*/*) ;;
+            *) rm -rf -- "${TEST_DIR:?}/$scn" ;;
+        esac
+    done
 }
 
 # ── Unified config writers ─────────────────────────────────
@@ -4412,12 +4690,12 @@ run_xtcp_test() {
     should_run_test "$name" || return 0
 
     # Reap the servers the previous scenarios started, by the exact pids this
-    # run recorded (`track_pid`, `scripts/compat-test.sh:153`) — never by
+    # run recorded (`track_pid`, `scripts/compat-test.sh:298`) — never by
     # argument pattern. Two `pkill -f "frpc -c"` / `pkill -f "frps -c"` calls
     # stood here; they matched *any* `frpc -c …` command line on the host,
     # including a developer's unrelated run or a sibling worktree's compat run.
     # The repository's stray rules forbid a kill by name alone, and
-    # name-plus-argument is the same hazard in a weaker form (TODO.md:9266).
+    # name-plus-argument is the same hazard in a weaker form (TODO.md:9269).
     #
     # Every server a scenario leaves behind is tracked: `run_go`'s `exec` makes
     # `$!` the binary itself, not a wrapper subshell, and `start_echo_server`
@@ -4428,7 +4706,7 @@ run_xtcp_test() {
     # Belt and braces for a server that somehow escaped `track_pid`: the guard's
     # own mid-run sweep, which reaps exactly the pids its census printed and
     # honours the baseline — so it cannot reach a server that predates the run
-    # (a sibling's), and it never matches an argument pattern (TODO.md:9266).
+    # (a sibling's), and it never matches an argument pattern (TODO.md:9269).
     # The fixture suite drives this helper against real synthetic servers
     # (`scripts/tests/compat-stray-guard.sh`, "the pre-test sweep"), so it is
     # executed by CI rather than merely read. Untracked strays from this run are
@@ -7903,6 +8181,11 @@ echo ""
 echo "============================================="
 echo -e " RESULTS: ${GREEN}$PASS passed${NC}, ${RED}$FAIL failed${NC}"
 echo "============================================="
+# A green summary that leaned on the bounded re-drive says so: the run is still
+# a pass, but a reviewer must be able to tell it from a clean one.
+if (( RETRIED_PASS > 0 )); then
+    echo -e "${YELLOW}RETRIED:${NC} $RETRIED_PASS scenario(s) passed only after a re-drive (readiness-class failure; see the [RETRY] lines above)"
+fi
 
 if [[ $FAIL -gt 0 ]]; then
     echo ""

@@ -144,6 +144,24 @@ cpo_pick_port() {
     # one sweep of the range, then a loud failure naming the range (the old loop
     # had no bound and no memory).
     local min="${CPO_PORT_MIN:-17000}" max="${CPO_PORT_MAX:-26999}"
+    # The two seams are fixture inputs, but they are still arithmetic input: a
+    # zero-padded value is read as octal by `(( ))` (`08` is a syntax error, not
+    # 8) and a non-numeric one is an unbound variable under `set -u`. Both used
+    # to surface as a syntax error inside the span computation and a misleading
+    # "empty port range" report, so validate and normalise them the way the
+    # harness does for its own environment knobs: refuse a non-decimal spelling
+    # loudly, strip the padding, then do the arithmetic in decimal.
+    case "$min$max" in
+        ''|*[!0-9]*)
+            printf 'ERROR: compat-port-ownership: CPO_PORT_MIN/CPO_PORT_MAX must be non-negative integers, got %s/%s\n' \
+                "${CPO_PORT_MIN:-<unset>}" "${CPO_PORT_MAX:-<unset>}" >&2
+            return 2
+            ;;
+    esac
+    while [ "${min#0}" != "$min" ]; do min="${min#0}"; done
+    while [ "${max#0}" != "$max" ]; do max="${max#0}"; done
+    [ -n "$min" ] || min=0
+    [ -n "$max" ] || max=0
     local span=$(( max - min + 1 )) tries port i st=0
     if (( span <= 0 )); then
         printf 'ERROR: compat-port-ownership: empty port range %s-%s\n' "$min" "$max" >&2
