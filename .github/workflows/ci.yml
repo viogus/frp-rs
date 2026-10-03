@@ -2399,12 +2399,12 @@ jobs:
         # the whole lib target, with the listed and passed counts pinned exactly
         # so a test that is silently made conditional cannot shrink it.
         #
-        # The literal is the pre-existing list plus the one row this change added
-        # in this crate (`service::tests::dashboard_port_overlay_record_follows_this_builds_reader`):
-        # this lane went 362 at the base (361 passed + 1 failed) to 363, and the
-        # other three new tests live in `frp-core`'s and `frps`'s own lanes. It is a
-        # count, not a floor: a lower floor would let the shape quietly lose a
-        # test, which is the failure mode this step exists to close.
+        # The literal is the pre-existing list plus this series' rows in this
+        # crate: `dashboard_port_overlay_record_follows_this_builds_reader` took
+        # it 362 at the base (361 passed + 1 failed) to 363; the four
+        # `*_reader_answers_from_this_build` pins and the gated-listener records
+        # test took it to 368, all five gated only by this crate's own features
+        # (still a count, not a floor: a floor would let this shape quietly lose one).
         shell: bash
         run: |
           set -eo pipefail
@@ -2419,7 +2419,7 @@ jobs:
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           cargo test -p frp-server --no-default-features --features dashboard --lib --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
           n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
-          n_expected=363
+          n_expected=368
           status=0
           [ "$run_status" = "0" ] || status=1
           grep -q "test result: ok. $n_expected passed; 0 failed" "$log.plain" || status=1

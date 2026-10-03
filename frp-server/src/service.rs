@@ -2175,6 +2175,14 @@ mod tests {
     /// reaches the `Absent` half with `frp-core/kcp` **on**
     /// (`frp-core/src/config/tests.rs` pins the same split from the other side,
     /// where `cfg!(feature = "kcp")` is visible).
+    ///
+    /// **The shape is asserted, not only the invariant.** The record rule alone
+    /// also holds when `frp-core` compiled the field *out* (`!field_present`
+    /// implies a record), so a lane that stopped resolving to the hand-named
+    /// shape would lose the absent-listener coverage without reddening. Each
+    /// port therefore also asserts `field_present || has_listener` — this lane
+    /// must keep `frp-core`'s field present while **this** crate's listener is
+    /// off — which is the Done-when's "a test builds that shape and asserts it".
     #[test]
     fn gated_listener_port_records_follow_this_builds_readers() {
         use frp_core::config::ListenerPortReader::{Absent, Present};
@@ -2200,13 +2208,46 @@ mod tests {
         // `field_present && reader == Absent`.
         let value = serde_json::to_value(&cfg).unwrap();
         let records = presence.unhonoured_server_feature_key_records(gated_listener_port_readers());
-        for (key, reader) in [
-            ("kcp_bind_port", kcp_bind_port_reader()),
-            ("quic_bind_port", quic_bind_port_reader()),
-            ("websocket_port", websocket_port_reader()),
+        for (key, reader, has_listener) in [
+            (
+                "kcp_bind_port",
+                kcp_bind_port_reader(),
+                cfg!(feature = "kcp"),
+            ),
+            (
+                "quic_bind_port",
+                quic_bind_port_reader(),
+                cfg!(feature = "quic"),
+            ),
+            (
+                "websocket_port",
+                websocket_port_reader(),
+                cfg!(feature = "websocket"),
+            ),
         ] {
             let field_present = value.get(key).and_then(|port| port.as_u64()).is_some();
             let recorded = records.iter().any(|record| record.contains(key));
+            // The reader is this crate's own gate, so the per-port pin tests'
+            // answer and the literal `cfg!` have to agree here too.
+            assert_eq!(
+                reader,
+                frp_core::config::ListenerPortReader::from_features(has_listener),
+                "`{key}`: the reader must be this crate's own feature"
+            );
+            // **The shape itself, not only the invariant it produces.** This
+            // lane's feature resolution must stay the hand-named shape:
+            // `frp-core` compiled the field (through the `frp-client`
+            // dev-dependency) while `frp-server`'s listener is off. Without this
+            // assertion a future change that turned `frp-core`'s feature off
+            // here would silently drop the only absent-listener coverage — the
+            // record invariant below would still hold, because
+            // `!field_present` also implies a record.
+            assert!(
+                field_present || has_listener,
+                "this lane must remain the hand-named shape for `{key}`: frp-core's field \
+                 present (field_present={field_present}) while frp-server's listener is \
+                 absent (has_listener={has_listener})"
+            );
             assert_eq!(
                 recorded,
                 reader == Absent || !field_present,
@@ -2216,7 +2257,7 @@ mod tests {
             );
             println!(
                 "gated-listener-port-record-pin: {key} field_present={field_present} \
-                 reader={reader:?} record={recorded}"
+                 reader={reader:?} has_listener={has_listener} record={recorded}"
             );
         }
         assert_ne!(Present, Absent);
