@@ -106,15 +106,25 @@ async fn test_dashboard_serverinfo() {
     assert_eq!(resp.status(), 200);
 
     let json: serde_json::Value = resp.json().await.unwrap();
-    // Full Go key set, correct camelCase names.
-    for key in [
+    // Full Go key set, correct camelCase names. `kcpBindPort`/`quicBindPort`
+    // come from fields that only exist in a build that compiles those
+    // transports (`frp-server/src/dashboard.rs`), so this list gates them the
+    // same way `dashboard::v2::tests::test_serverinfo_go_shape` does: the
+    // `--no-default-features --features dashboard` shape compiles this test
+    // target (and its clippy lane) with `kcp`/`quic` off, and the
+    // default-feature lanes still check the whole set.
+    let mut go_keys = vec![
         "version",
         "bindPort",
         "vhostHTTPPort",
         "vhostHTTPSPort",
         "tcpmuxHTTPConnectPort",
-        "kcpBindPort",
-        "quicBindPort",
+    ];
+    #[cfg(feature = "kcp")]
+    go_keys.push("kcpBindPort");
+    #[cfg(feature = "quic")]
+    go_keys.push("quicBindPort");
+    go_keys.extend_from_slice(&[
         "subdomainHost",
         "maxPoolCount",
         "maxPortsPerClient",
@@ -124,7 +134,8 @@ async fn test_dashboard_serverinfo() {
         "curConns",
         "clientCounts",
         "proxyTypeCount",
-    ] {
+    ]);
+    for key in go_keys {
         assert!(json.get(key).is_some(), "missing Go key {key}");
     }
     // No Rust-native /api/status keys may leak into the Go-shaped payload.

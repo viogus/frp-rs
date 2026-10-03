@@ -1924,12 +1924,12 @@ mod tests {
     /// silent in every shipped build (dashboard off) — the two directions the
     /// real-binary rows in `frps/tests/warn_delivery.rs` cover. The
     /// `dashboard`-off half runs in the default-feature `-p frp-server` lanes
-    /// (`.github/workflows/ci.yml:1605` `--features vnet --lib`, `:3300`
+    /// (`.github/workflows/ci.yml:1787` `--features vnet --lib`, `:3526`
     /// `--no-default-features --all-targets -j 1`; `ssh` is on in the first and
     /// off in the second, covering the `ssh_tunnel_gateway.bind_port` twin too)
-    /// and the `dashboard`-on half in the unfiltered `:3131`
+    /// and the `dashboard`-on half in the unfiltered `:3357`
     /// (`-p frp-server --features dashboard -j 1`). The
-    /// `--no-default-features --features dashboard --lib` lane at `:1642`
+    /// `--no-default-features --features dashboard --lib` lane at `:1824`
     /// filters by `web_server_tls_enable_reader`, so it does **not** run these
     /// pins.
     #[test]
@@ -1970,5 +1970,50 @@ mod tests {
         );
         assert_ne!(Present, Absent);
         println!("ssh-tunnel-gateway-bind-port-reader-pin: assertions ran");
+    }
+
+    /// The **CLI-overlay** half of the same question.
+    ///
+    /// `frps --dashboard-port <non-zero>` with no `-c`/`--config-dir` writes
+    /// `web_server.port` through `override_server_config`, *after* the load that
+    /// records the config file's own request, so the value has to be merged back
+    /// into `ConfigPresence` by hand (`frp-core`'s `AppliedReaderGatedPorts` /
+    /// `ConfigPresence::record_applied_reader_gated_ports`). This pins that the
+    /// merged request produces the same record as the file key, using **this
+    /// build's** reader — so the dashboard-off lanes
+    /// (`--no-default-features --all-targets -j 1`, `--features vnet --lib`)
+    /// assert a record and the dashboard-on lanes (`--features dashboard -j 1`
+    /// and the `--no-default-features --features dashboard --lib` lane) assert
+    /// silence, with no `cfg!` that could be right for the wrong reason.
+    /// `frp-core`'s `cli` tests pin the merge itself, and
+    /// `frps/tests/warn_delivery.rs` pins the spawned binary.
+    #[test]
+    fn dashboard_port_overlay_record_follows_this_builds_reader() {
+        use frp_core::config::ListenerPortReader::{Absent, Present};
+        use frp_core::config::{AppliedReaderGatedPorts, ConfigPresence};
+
+        let mut presence = ConfigPresence::default();
+        presence.record_applied_reader_gated_ports(AppliedReaderGatedPorts {
+            web_server_port: true,
+        });
+        let records = presence.unhonoured_reader_gated_port_records(
+            web_server_port_reader(),
+            ssh_tunnel_gateway_bind_port_reader(),
+        );
+        let want = if web_server_port_reader() == Absent {
+            vec![frp_core::config::WEB_SERVER_PORT_UNHONOURED_WARNING]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            records, want,
+            "an overlay-applied web_server.port owes a record exactly when this build has no \
+             reader for it"
+        );
+        // The assertion has to be able to fail in both directions: if a rename
+        // ever made the two variants compare equal, or a reader returned one
+        // variant everywhere, the comparison above would hold vacuously.
+        assert_ne!(Present, Absent);
+        println!("dashboard-port-overlay-record-pin: assertions ran");
     }
 }

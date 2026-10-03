@@ -3043,14 +3043,27 @@ mod v2 {
             let obj = obj.as_object().unwrap();
 
             // Full Go key set, correct camelCase names (types.go:21-40).
-            for key in [
+            //
+            // The two transport keys are gated exactly the way
+            // `ServerInfoResp` gates the fields that carry them: a build
+            // without `kcp`/`quic` compiles `kcpBindPort`/`quicBindPort` out
+            // of the struct, so demanding them here made
+            // `--no-default-features --features dashboard` red on a shape
+            // that structurally cannot produce them (the feature-shape
+            // honesty item). The default-feature lane still checks the full
+            // Go set, because there both features are on.
+            let mut go_keys = vec![
                 "version",
                 "bindPort",
                 "vhostHTTPPort",
                 "vhostHTTPSPort",
                 "tcpmuxHTTPConnectPort",
-                "kcpBindPort",
-                "quicBindPort",
+            ];
+            #[cfg(feature = "kcp")]
+            go_keys.push("kcpBindPort");
+            #[cfg(feature = "quic")]
+            go_keys.push("quicBindPort");
+            go_keys.extend_from_slice(&[
                 "subdomainHost",
                 "maxPoolCount",
                 "maxPortsPerClient",
@@ -3060,7 +3073,8 @@ mod v2 {
                 "curConns",
                 "clientCounts",
                 "proxyTypeCount",
-            ] {
+            ]);
+            for key in go_keys {
                 assert!(obj.contains_key(key), "missing Go key {key}");
             }
             // No Rust-native status keys may leak into the Go-shaped payload.

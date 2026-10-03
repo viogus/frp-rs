@@ -2413,3 +2413,67 @@ fn verify_prints_the_gated_listener_port_record_before_the_go_success_line() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// The **CLI** half of the same item: `frps --dashboard-port <N>` with **no**
+/// `-c`/`--config-dir` reaches `web_server.port` through
+/// `FrpsArgs::override_server_config`, which runs *after* the loader already
+/// recorded (or declined to record) the config file's own request. Before this
+/// item the overlay wrote the field without telling `ConfigPresence`, so a flag
+/// user in a build with no dashboard got a port nothing bound and **no
+/// diagnostic at all** — silently, while `[web_server] port = <N>` in a file
+/// warned. The row pins the flag against the file's record set: the same
+/// message, on stdout, once, in a build that owes it and never in a build that
+/// binds the port.
+///
+/// The floor is the no-`[web_server]` boot baseline plus this build's `want`,
+/// not [`capture_floor_web_server_port`]: a flag-only spawn writes no
+/// `[web_server]` table, so in the dashboard lane it is the *lower* of the two
+/// and still a true minimum (the running dashboard's own records sit above it).
+/// The count assertions below are what pin the behaviour; the floor only lets
+/// [`Spawned::run`] freeze a settled capture.
+///
+/// This is the spawn half. The per-shape half — which reader this build's
+/// binary actually carries — is pinned by `frp-server/src/service.rs`'s
+/// `dashboard_port_overlay_record_follows_this_builds_reader`, which runs in the
+/// dashboard-off and dashboard-on `frp-server` suites alike, and the merge
+/// itself by `frp-core`'s `cli` tests.
+#[test]
+fn web_server_port_warning_reaches_a_flag_user_without_a_config() {
+    let dir = TempDir::new("port-flag");
+    let port = free_port();
+    let flag = port.to_string();
+    // The file has to exist — `frps` resolves an absent `-c` to `./frps.toml`
+    // and refuses to start when it cannot read it — but it must **not** request
+    // the port, so the flag is the only source of `web_server.port` and the
+    // loader's own presence record stays silent (proved by the floor below,
+    // which is the no-`[web_server]` baseline, not the file's).
+    dir.write(
+        "frps.toml",
+        &format!("bind_port = {}\ntoken = \"t\"\n", free_port()),
+    );
+    let spawned = Spawned::run(
+        &dir,
+        &["--dashboard-port", flag.as_str()],
+        boot_records_no_dashboard() + want_web_server_port_records(),
+    );
+
+    let want = want_web_server_port_records();
+    assert_eq!(
+        occurrences(
+            &spawned.stdout(),
+            frp_core::config::WEB_SERVER_PORT_UNHONOURED_WARNING
+        ),
+        want,
+        "`--dashboard-port {port}` without `-c` owes the same {want} record(s) as \
+         `[web_server] port = {port}` in a file\n--- stdout ---\n{}",
+        spawned.stdout()
+    );
+    assert_eq!(
+        occurrences(
+            &spawned.stderr(),
+            frp_core::config::WEB_SERVER_PORT_UNHONOURED_WARNING
+        ),
+        0,
+        "the diagnostic is a stdout record"
+    );
+}

@@ -375,6 +375,44 @@ impl ListenerPortReader {
     }
 }
 
+/// The reader-gated listener **ports** a CLI overlay actually applied.
+///
+/// The config-file path resolves the same question inside
+/// [`ConfigPresence::from_normalized_value`] (`sub_port_requested`, which counts
+/// only a **non-zero** port). The CLI overlay, however, runs *after* that load —
+/// `FrpsArgs::override_server_config` writes `cfg.web_server.port` directly — so
+/// its writes are a second source of the same request and have to be merged into
+/// the same presence flag. Without that, `frps --dashboard-port 7500` (with no
+/// `-c`/`--config-dir`) binds no dashboard and says nothing, while the identical
+/// `[web_server] port = 7500` in a file warns.
+///
+/// **The whole family, enumerated**, because `web_server.port` is not obviously
+/// alone: `web_server.port` is reachable from the overlay through
+/// `--dashboard-port`, which `svr_dashboard` registers on **every** shape, so
+/// flag and warning are always reachable together. The other reader-gated ports
+/// cannot be applied by the overlay at all — `ssh_tunnel_gateway.bind_port` and
+/// `websocket_port` have no CLI flag, and `--kcp-bind-port`/`--quic-bind-port`
+/// exist only under **this crate's** `cfg(feature = "kcp")`/`cfg(feature =
+/// "quic")`. Every shape `frps`'s own feature names produce moves that feature
+/// in step with `frp-server`'s listener (`frps/kcp = ["frp-server/kcp"]` and
+/// `frp-server/kcp = ["frp-core/kcp"]`, one way each), so there the flag is an
+/// unknown-flag error rather than a silent ignore. A caller who names the inner
+/// feature by hand — `cargo build -p frps --no-default-features --features
+/// tiny,frp-core/kcp` — gets the parser without the listener: `--help`
+/// advertises `--kcp-bind-port`, running it binds no UDP socket and prints no
+/// record, and the `kcp_bind_port` file key is silent for the same reason (the
+/// asymmetry `restart_only.rs` describes for the *field* is this one on the
+/// *flag* side). No lane builds an `frps` binary in that combination — only
+/// `frp-server`'s own `--all-targets` build reaches it, through the
+/// `frp-client` dev-dependency — so it is the one gap this struct does not
+/// close.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AppliedReaderGatedPorts {
+    /// A **non-zero** `--dashboard-port` wrote `web_server.port`, whose only
+    /// reader is `frp-server`'s `dashboard` feature.
+    pub web_server_port: bool,
+}
+
 /// The `[web_server.tls] enable` diagnostic for a build that **compiles a
 /// dashboard**, in one place so `frps` and `frpc` cannot drift. Callers gate it
 /// on [`ConfigPresence::web_server_tls_enable_set`]; it is emitted **after**
@@ -505,7 +543,7 @@ pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS: &str = "web_server.tls.ena
 /// describe a path it cannot take. Every lane builds at the
 /// workspace root with `tiny`/`micro`
 /// (`.github/workflows/release.yml:100/102/108/110/159/162/210/213` and
-/// `.github/workflows/ci.yml:3427`/`.github/workflows/ci.yml:3431`), where the
+/// `.github/workflows/ci.yml:3653`/`.github/workflows/ci.yml:3657`), where the
 /// two crates' `tls` agree, so the mixed shape is a known, unshipped one.
 #[cfg(feature = "tls")]
 pub const SERVER_TLS_ENABLE_INERT_TLS_CLAUSES: [&str; 2] = [
@@ -1035,6 +1073,19 @@ impl ConfigPresence {
         if self.web_server_tls_enable_set {
             tracing::warn!("{}", reader.warning());
         }
+    }
+
+    /// Record the reader-gated listener ports a **CLI overlay** applied, so the
+    /// overlay's writes are reported by the same
+    /// [`Self::warn_inert_web_server_port`] path as the config file's.
+    ///
+    /// The caller is `frps`, between the `cli.cli_overrides_enabled()` overlay
+    /// and the `warn_inert_*` calls (see `frps/src/main.rs`), and the argument is
+    /// what `FrpsArgs::override_server_config` reports it wrote — never a value
+    /// derived from the overlay's absence. See [`AppliedReaderGatedPorts`] for
+    /// why `web_server.port` is the only port this can carry.
+    pub fn record_applied_reader_gated_ports(&mut self, applied: AppliedReaderGatedPorts) {
+        self.web_server_port_unhonoured |= applied.web_server_port;
     }
 
     /// Emit the `web_server.port` record when the file named a **non-zero** port

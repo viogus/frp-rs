@@ -5108,7 +5108,22 @@ impl FrpsArgs {
     /// treated as *not supplied*, so the file's `[log]` value survives. Each is
     /// Go's `util.EmptyOr` zero value and each would otherwise be filled by
     /// `LogConfig::complete` before the resolver saw it; see the log arms below.
-    pub fn override_server_config(&self, cfg: &mut crate::config::ServerConfig) {
+    ///
+    /// Returns the reader-gated **listener ports** it applied, because the
+    /// overlay runs after the load that records the file's own port requests, so
+    /// only the caller can merge the two into one [`ConfigPresence`]. `frps`
+    /// hands the result to
+    /// [`ConfigPresence::record_applied_reader_gated_ports`]; a **zero** port
+    /// counts as not supplied, matching `sub_port_requested` on the file path.
+    ///
+    /// [`ConfigPresence`]: crate::config::ConfigPresence
+    /// [`ConfigPresence::record_applied_reader_gated_ports`]:
+    ///     crate::config::ConfigPresence::record_applied_reader_gated_ports
+    pub fn override_server_config(
+        &self,
+        cfg: &mut crate::config::ServerConfig,
+    ) -> crate::config::AppliedReaderGatedPorts {
+        let mut applied = crate::config::AppliedReaderGatedPorts::default();
         if let Some(ref v) = self.token {
             cfg.auth.token = v.clone();
         }
@@ -5194,6 +5209,10 @@ impl FrpsArgs {
         }
         if let Some(v) = self.dashboard_port {
             cfg.web_server.port = v;
+            // A zero port is "not supplied" on the file path too
+            // (`sub_port_requested`); only a real request is reported, so
+            // `--dashboard-port 0` stays as silent as `port = 0`.
+            applied.web_server_port = v != 0;
         }
         if let Some(ref v) = self.dashboard_user {
             cfg.web_server.user = v.clone();
@@ -5212,6 +5231,7 @@ impl FrpsArgs {
         }
         // dashboard_tls_mode: no config field needed — TLS activates when both
         // cert_file and key_file are non-empty (implicit detection, matching Go frp).
+        applied
     }
 }
 
@@ -5802,6 +5822,97 @@ mod tests {
         let mut cfg = crate::config::ServerConfig::default();
         args.override_server_config(&mut cfg);
         assert_eq!(cfg.web_server.addr, "1.2.3.4");
+    }
+
+    /// `--dashboard-port` is the one reader-gated listener port the CLI overlay
+    /// can write, so its request has to travel back to the caller on
+    /// [`AppliedReaderGatedPorts`] — `web_server.port` is unconditional in
+    /// `ServerConfig`, and the overlay runs after the load that records the
+    /// *file's* request, so a returned value is the only way `frps` can hand it
+    /// to the same warn path.
+    ///
+    /// The zero case matters as much as the non-zero one: the file path counts
+    /// only a **non-zero** port (`sub_port_requested`), so `--dashboard-port 0`
+    /// must not manufacture a record the file form would never produce. Pinned
+    /// on the real binary by
+    /// `frps/tests/warn_delivery.rs::web_server_port_warning_reaches_a_flag_user_without_a_config`.
+    ///
+    /// [`AppliedReaderGatedPorts`]: crate::config::AppliedReaderGatedPorts
+    #[test]
+    fn dashboard_port_override_reports_the_reader_gated_request() {
+        let mut cfg = crate::config::ServerConfig::default();
+        let applied = parse_frps(&["--dashboard-port", "7500"])
+            .unwrap()
+            .override_server_config(&mut cfg);
+        assert_eq!(
+            cfg.web_server.port, 7500,
+            "the flag still reaches the config"
+        );
+        assert!(
+            applied.web_server_port,
+            "a non-zero --dashboard-port is an applied reader-gated port"
+        );
+
+        let mut cfg = crate::config::ServerConfig::default();
+        let applied = parse_frps(&["--dashboard-port", "0"])
+            .unwrap()
+            .override_server_config(&mut cfg);
+        assert_eq!(cfg.web_server.port, 0);
+        assert!(
+            !applied.web_server_port,
+            "`--dashboard-port 0` is Go's zero value, exactly like `port = 0` in a file: \
+             it requests no listener, so it must not warn"
+        );
+
+        let mut cfg = crate::config::ServerConfig::default();
+        let applied = parse_frps(&[]).unwrap().override_server_config(&mut cfg);
+        assert_eq!(cfg.web_server.port, 0);
+        assert!(!applied.web_server_port, "no flag at all is not a request");
+    }
+
+    /// The merge `frps` performs at startup: an overlay-applied
+    /// `web_server.port` becomes the same record as the file key, and only in a
+    /// build whose reader is absent. The per-shape half of this claim is pinned
+    /// by `frp-server/src/service.rs::dashboard_port_overlay_record_follows_this_builds_reader`
+    /// (which uses the owning crate's real reader) and on the binary by
+    /// `frps/tests/warn_delivery.rs`.
+    #[test]
+    fn recorded_overlay_port_warns_only_when_the_reader_is_absent() {
+        use crate::config::{AppliedReaderGatedPorts, ConfigPresence, ListenerPortReader};
+
+        let mut presence = ConfigPresence::default();
+        presence.record_applied_reader_gated_ports(AppliedReaderGatedPorts {
+            web_server_port: true,
+        });
+        assert_eq!(
+            presence.unhonoured_reader_gated_port_records(
+                ListenerPortReader::Absent,
+                ListenerPortReader::Present
+            ),
+            vec![crate::config::WEB_SERVER_PORT_UNHONOURED_WARNING],
+            "an overlay-applied port in a build without the reader is a record"
+        );
+        assert!(
+            presence
+                .unhonoured_reader_gated_port_records(
+                    ListenerPortReader::Present,
+                    ListenerPortReader::Present
+                )
+                .is_empty(),
+            "a build that binds the port must stay silent"
+        );
+
+        let mut presence = ConfigPresence::default();
+        presence.record_applied_reader_gated_ports(AppliedReaderGatedPorts::default());
+        assert!(
+            presence
+                .unhonoured_reader_gated_port_records(
+                    ListenerPortReader::Absent,
+                    ListenerPortReader::Absent
+                )
+                .is_empty(),
+            "recording nothing must add nothing"
+        );
     }
 
     /// `--vhost-http-timeout` is Go's `vhost_http_timeout`, registered on the
