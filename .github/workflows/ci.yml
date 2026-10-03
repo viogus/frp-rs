@@ -808,7 +808,8 @@ jobs:
         # against the re-derived artifact (a transcription error in either reds),
         # every row is checked against the Go cell recorded for it (a real but
         # wrong key reds), and the 41 recorded aliases are resolved to a Go path
-        # or to an extension marker the artifact proves absent. Wiring is the same
+        # (checked against the cells of the rows that carried them) or to an
+        # extension marker the artifact proves absent. Wiring is the same
         # shape as the classifier step above — the suite's
         # bytes are pinned before it runs, its exact `RESULT:` total and
         # `ok`-line count are compared, an absolute floor sits under them so a
@@ -833,7 +834,7 @@ jobs:
           log=/tmp/frp-docs-go-column.log
           status=0
           guard_file=scripts/tests/docs-go-column.sh
-          guard_pin=415836e01da6821fc262affcc941387b5029a2d6a4c6a6b952d424c6729df0d3
+          guard_pin=adaa8f7e92986897f207770a717aae663086db99214a1ff71e29627af5e0c38c
           guard_exact=257
           guard_floor=257
           guard_canary='M1 (websocket_port reworded'

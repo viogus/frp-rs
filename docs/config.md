@@ -1,7 +1,7 @@
 # Configuration Reference
 
 Complete field reference for frp-rs `frps.toml` and `frpc.toml`. Each row's **Go frp Equivalent** cell names the Go frp v0.71.0 `json` key
-that field corresponds to, or carries a `—` marker recording that frp-rs extends or diverges from Go; `scripts/tests/docs-go-column.sh` checks the column row by row against a key set re-derived from `pkg/config/v1` (`scripts/tests/docs-go-column-go-keys.txt`).
+that field corresponds to, or a `—` marker recording that frp-rs extends or diverges from Go, or one of the documented non-token shapes `**Required.**`, `` `sk` / `secretKey` `` and `` `transport.wireProtocol = "v2"` ``. `scripts/tests/docs-go-column.sh` checks the column row by row against a key set re-derived from `pkg/config/v1` (`scripts/tests/docs-go-column-go-keys.txt`).
 
 ---
 

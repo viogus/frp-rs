@@ -25,12 +25,12 @@
 #                non-token shape. A cell holding another real Go key (the recorded
 #                falsification was `bindPort` -> `quicBindPort`) is a violation, not a pass.
 #   the aliases  the 41 doc spellings the M-1 round recorded in `ALIASES` are resolved in
-#                `ALIAS_RESOLUTION`: each is either repointed to the Go path it should have
-#                named (checked against `GO` and against the row's recorded cell) or recorded
-#                in docs/config.md as an extension whose absent spelling the marker names and
-#                the recorded key set proves absent. `ALIASES` itself is now empty — no
-#                accepted alias remains — but the mechanism stays, so a new one has to be
-#                recorded here (and the inventory reds on an unused entry).
+#                `ALIAS_RESOLUTION`, which also names the rows that carried each old spelling:
+#                a `repoint:<path>` is checked against `GO` and against those rows' recorded
+#                cells, and an `extension` is checked against the recorded key set and against
+#                those rows' divergence markers. `ALIASES` itself is now empty — no accepted
+#                alias remains — but the mechanism stays, so a new one has to be recorded here
+#                (and the inventory reds on an unused entry).
 #
 # Provenance of the recorded key set
 #   Go frp v0.71.0. The annotated tag `v0.71.0` is object 40adeed73b51e7ee1766d7cfb15d02ba9431ba2b,
@@ -448,54 +448,55 @@ GO = {
 ALIASES = {}
 
 # --- the 41 recorded aliases, resolved ----------------------------------------------
-# old doc spelling -> 'repoint:<the Go v0.71.0 json path it should have named>'
-#                  |  'extension'
-# `repoint` means the field does have a Go key and the document now names it (the path must be
-# in `GO` and the row's expected cell in `ROW_GO_PATHS`); `extension` means no Go v0.71.0 json
-# key carries that name at all, and the document records a divergence marker naming the absent
-# spelling. Both halves are checked mechanically against the recorded key set.
+# old doc spelling -> ('repoint:<the Go v0.71.0 json path it should have named>'
+#                     | 'extension', [(table ordinal, field), …] the rows that carried it)
+# `repoint` means the field does have a Go key and the document now names it: the path must be
+# in `GO`, and every recorded row's cell in `ROW_GO_PATHS` must be exactly that path — not just
+# some row's. `extension` means no Go v0.71.0 json key carries that name at all, and the rows
+# that carried the old spelling must be exactly the rows carrying the extension marker naming
+# it. Both halves are checked mechanically against the recorded key set.
 ALIAS_RESOLUTION = {
-    'auth.additionalAuthScopes': 'repoint:auth.additionalScopes',
-    'auth.additionalEndpointParams': 'repoint:auth.oidc.additionalEndpointParams',
-    'auth.authenticationTimeout': 'extension',
-    'auth.insecureSkipVerify': 'repoint:auth.oidc.insecureSkipVerify',
-    'auth.oidcAdditionalAudience': 'extension',
-    'auth.oidcAudience': 'repoint:auth.oidc.audience',
-    'auth.oidcClientId': 'repoint:auth.oidc.clientID',
-    'auth.oidcClientSecret': 'repoint:auth.oidc.clientSecret',
-    'auth.oidcIssuer': 'repoint:auth.oidc.issuer',
-    'auth.oidcProxyURL': 'repoint:auth.oidc.proxyURL',
-    'auth.oidcScope': 'repoint:auth.oidc.scope',
-    'auth.oidcSkipAudience': 'extension',
-    'auth.oidcSkipExpiry': 'repoint:auth.oidc.skipExpiryCheck',
-    'auth.oidcSkipIssuer': 'repoint:auth.oidc.skipIssuerCheck',
-    'auth.oidcSkipNbf': 'extension',
-    'auth.oidcTLSTrustedCAFile': 'repoint:auth.oidc.trustedCaFile',
-    'auth.oidcTokenEndpoint': 'repoint:auth.oidc.tokenEndpointURL',
-    'auth.oidcTokenSource': 'repoint:auth.oidc.tokenSource',
-    'auth.tlsTrustedCaFile': 'repoint:auth.oidc.trustedCaFile',
-    'auth.tokenAuthTimeout': 'extension',
-    'clientId': 'repoint:clientID',
-    'enableControl': 'extension',
-    'headers': 'extension',
-    'httpPwd': 'repoint:httpPassword',
-    'localIp': 'repoint:localIP',
-    'maxConnsPerProxy': 'extension',
-    'maxProxiesPerClient': 'extension',
-    'metas': 'repoint:metadatas',
-    'pluginCrtPath': 'repoint:crtPath',
-    'pluginKeyPath': 'repoint:keyPath',
-    'sk': 'repoint:secretKey',
-    'sshTunnelGateway.bindAddr': 'extension',
-    'sudpPort': 'extension',
-    'tcpMuxPassthrough': 'repoint:tcpmuxPassthrough',
-    'timeout': 'extension',
-    'tlsServerName': 'repoint:transport.tls.serverName',
-    'url': 'extension',
-    'webServer.custom404Page': 'repoint:custom404Page',
-    'webServer.enablePrometheus': 'repoint:enablePrometheus',
-    'webServer.tlsCertFile': 'repoint:webServer.tls.certFile',
-    'webServer.tlsKeyFile': 'repoint:webServer.tls.keyFile',
+    'auth.additionalAuthScopes': ('repoint:auth.additionalScopes', [(2, 'additional_auth_scopes'), (9, 'additional_auth_scopes')]),
+    'auth.additionalEndpointParams': ('repoint:auth.oidc.additionalEndpointParams', [(9, 'additional_endpoint_params')]),
+    'auth.authenticationTimeout': ('extension', [(2, 'authentication_timeout'), (9, 'authentication_timeout')]),
+    'auth.insecureSkipVerify': ('repoint:auth.oidc.insecureSkipVerify', [(9, 'oidc_tls_insecure_skip_verify')]),
+    'auth.oidcAdditionalAudience': ('extension', [(2, 'oidc_additional_audience')]),
+    'auth.oidcAudience': ('repoint:auth.oidc.audience', [(2, 'oidc_audience'), (9, 'oidc_audience')]),
+    'auth.oidcClientId': ('repoint:auth.oidc.clientID', [(9, 'oidc_client_id')]),
+    'auth.oidcClientSecret': ('repoint:auth.oidc.clientSecret', [(9, 'oidc_client_secret')]),
+    'auth.oidcIssuer': ('repoint:auth.oidc.issuer', [(2, 'oidc_issuer'), (9, 'oidc_issuer')]),
+    'auth.oidcProxyURL': ('repoint:auth.oidc.proxyURL', [(2, 'oidc_proxy_url'), (9, 'oidc_proxy_url')]),
+    'auth.oidcScope': ('repoint:auth.oidc.scope', [(9, 'oidc_scope')]),
+    'auth.oidcSkipAudience': ('extension', [(2, 'oidc_skip_audience')]),
+    'auth.oidcSkipExpiry': ('repoint:auth.oidc.skipExpiryCheck', [(2, 'oidc_skip_expiry')]),
+    'auth.oidcSkipIssuer': ('repoint:auth.oidc.skipIssuerCheck', [(2, 'oidc_skip_issuer')]),
+    'auth.oidcSkipNbf': ('extension', [(2, 'oidc_skip_nbf')]),
+    'auth.oidcTLSTrustedCAFile': ('repoint:auth.oidc.trustedCaFile', [(2, 'oidc_tls_trusted_ca_file')]),
+    'auth.oidcTokenEndpoint': ('repoint:auth.oidc.tokenEndpointURL', [(2, 'oidc_token_endpoint'), (9, 'oidc_token_endpoint')]),
+    'auth.oidcTokenSource': ('repoint:auth.oidc.tokenSource', [(9, 'oidc_token_source')]),
+    'auth.tlsTrustedCaFile': ('repoint:auth.oidc.trustedCaFile', [(9, 'oidc_tls_trusted_ca_file')]),
+    'auth.tokenAuthTimeout': ('extension', [(2, 'token_auth_timeout')]),
+    'clientId': ('repoint:clientID', [(8, 'client_id')]),
+    'enableControl': ('extension', [(7, 'enable_control')]),
+    'headers': ('extension', [(13, 'headers')]),
+    'httpPwd': ('repoint:httpPassword', [(13, 'http_pwd')]),
+    'localIp': ('repoint:localIP', [(11, 'local_ip')]),
+    'maxConnsPerProxy': ('extension', [(1, 'max_conns_per_proxy')]),
+    'maxProxiesPerClient': ('extension', [(1, 'max_proxies_per_client')]),
+    'metas': ('repoint:metadatas', [(15, 'metas')]),
+    'pluginCrtPath': ('repoint:crtPath', [(16, 'crt_file')]),
+    'pluginKeyPath': ('repoint:keyPath', [(16, 'key_file')]),
+    'sk': ('repoint:secretKey', [(14, 'sk'), (16, 'secret_key')]),
+    'sshTunnelGateway.bindAddr': ('extension', [(6, 'bind_addr')]),
+    'sudpPort': ('extension', [(1, 'sudp_port')]),
+    'tcpMuxPassthrough': ('repoint:tcpmuxPassthrough', [(1, 'tcp_mux_passthrough')]),
+    'timeout': ('extension', [(7, 'timeout')]),
+    'tlsServerName': ('repoint:transport.tls.serverName', [(8, 'tls_server_name')]),
+    'url': ('extension', [(7, 'url')]),
+    'webServer.custom404Page': ('repoint:custom404Page', [(4, 'custom_404_page')]),
+    'webServer.enablePrometheus': ('repoint:enablePrometheus', [(4, 'enable_prometheus'), (10, 'enable_prometheus')]),
+    'webServer.tlsCertFile': ('repoint:webServer.tls.certFile', [(4, 'tls_cert_file')]),
+    'webServer.tlsKeyFile': ('repoint:webServer.tls.keyFile', [(4, 'tls_key_file')]),
 }
 
 # --- the Go cell each data row must carry -------------------------------------------
@@ -872,7 +873,7 @@ count_check('recorded alias resolution(s)', len(ALIAS_RESOLUTION), EXPECTED_RESO
 # --- every alias resolution is grounded in both tables and the document -------------
 doc_tokens = set(c[5] for c in classified if c[5] is not None)
 for tok in sorted(ALIAS_RESOLUTION):
-    res = ALIAS_RESOLUTION[tok]
+    res, res_rows = ALIAS_RESOLUTION[tok]
     problems = []
     if tok in GO:
         problems.append('`%s` is a Go v0.71.0 key, so it needed no resolution' % tok)
@@ -882,13 +883,20 @@ for tok in sorted(ALIAS_RESOLUTION):
         target = res.split(':', 1)[1]
         if target not in GO:
             problems.append('the recorded Go path `%s` is not in the key set' % target)
-        if not any(e in ('go:%s' % target, 'qualified:%s' % target)
-                   or e.startswith('qualified:%s:' % target)
-                   for e in ROW_GO_PATHS.values()):
-            problems.append('no row records `%s` as its Go path' % target)
+        for key in res_rows:
+            got = ROW_GO_PATHS.get(key)
+            if got is None:
+                problems.append('the recorded row table %d %s is not in ROW_GO_PATHS' % key)
+            elif got not in ('go:%s' % target, 'qualified:%s' % target) \
+                    and not got.startswith('qualified:%s:' % target):
+                problems.append('row table %d %s records %r, not the repointed path `%s`'
+                                % (key[0], key[1], got, target))
     elif res == 'extension':
-        if not any(e == 'extension:%s' % tok for e in ROW_GO_PATHS.values()):
-            problems.append('no row records the extension marker for it')
+        carrying = sorted(k for k, e in ROW_GO_PATHS.items() if e == 'extension:%s' % tok)
+        if carrying != sorted(res_rows):
+            problems.append('the rows carrying the extension marker are %s, but the rows '
+                            'recorded as carrying `%s` are %s'
+                            % (carrying or 'none', tok, sorted(res_rows)))
     else:
         problems.append('unknown resolution %r' % res)
     if problems:

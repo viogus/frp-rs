@@ -31,8 +31,12 @@
 #   --source DIR            a checkout of pkg/config/v1
 #   GO_FRP_CONFIG_V1_DIR=…  the same, via the environment
 #   --fetch                 download the pinned commit (needs curl + network)
-# No source: the script prints SKIP and exits 0 — it never silently passes, and
-# `--write` never clobbers the artifact without a derived set to write.
+# Exit codes
+#   no source at all (no --source, no GO_FRP_CONFIG_V1_DIR, no --fetch)  SKIP, rc 0
+#   a --fetch that cannot download (no curl, no network)                 SKIP, rc 0
+#   a source was supplied/fetched but yields no json keys                FAIL, rc 1,
+#       naming the directory — an explicit source with no keys is a mistake, not
+#       "no source", and --write must not clobber the artifact with an empty set.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -66,6 +70,11 @@ fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+source_kind=''
+if [ -n "$source_dir" ]; then
+  source_kind='--source/GO_FRP_CONFIG_V1_DIR'
+fi
+
 if [ -z "$source_dir" ] && [ "$do_fetch" = 1 ]; then
   if ! command -v curl >/dev/null 2>&1; then
     printf 'SKIP  --fetch needs curl, which is not installed; pass --source DIR instead\n'
@@ -83,11 +92,17 @@ if [ -z "$source_dir" ] && [ "$do_fetch" = 1 ]; then
     fi
   done
   source_dir="$tmp/v1"
+  source_kind='--fetch'
 fi
 
-if [ -z "$source_dir" ] || [ ! -d "$source_dir" ]; then
+if [ -z "$source_kind" ]; then
   printf 'SKIP  no Go frp v0.71.0 source; pass --source DIR, set GO_FRP_CONFIG_V1_DIR, or use --fetch\n'
   exit 0
+fi
+if [ ! -d "$source_dir" ]; then
+  printf 'FAIL  the %s directory %s does not exist; nothing to derive from\n' \
+    "$source_kind" "$source_dir" >&2
+  exit 1
 fi
 
 python3 -B - "$source_dir" >"$tmp/derived.txt" <<'PY'
@@ -186,8 +201,9 @@ PY
 
 derived_count="$(wc -l <"$tmp/derived.txt" | tr -d ' ')"
 if [ "$derived_count" = 0 ]; then
-  printf 'SKIP  the source at %s yielded no json keys\n' "$source_dir"
-  exit 0
+  printf 'FAIL  the %s source %s yielded no json keys — looked for `json:"..."` struct fields in %s/*.go; refusing to check or write an empty key set\n' \
+    "$source_kind" "$source_dir" "$source_dir" >&2
+  exit 1
 fi
 
 case "$mode" in
@@ -209,6 +225,10 @@ case "$mode" in
     exit 1
     ;;
   write)
+    if [ ! -s "$tmp/derived.txt" ]; then
+      printf 'FAIL  refusing to rewrite %s from an empty key set\n' "$ARTIFACT" >&2
+      exit 1
+    fi
     if [ ! -f "$ARTIFACT" ]; then
       printf 'FAIL  %s is missing; cannot preserve its provenance header\n' "$ARTIFACT" >&2
       exit 1
