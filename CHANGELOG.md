@@ -1272,6 +1272,19 @@ User-facing release notes for frp-rs.
 
 ### CI & Tooling
 
+- **`docs/config.md`'s Go column is now checked row by row against a measured Go frp key set, so a real-but-wrong Go key reds.**
+  The gate proved each cell was *a* Go frp v0.71.0 spelling, not that it was *the* spelling for that row: swapping
+  `bindPort` for the equally real `quicBindPort` on the `bind_port` row left it green. The expected cell is now recorded for
+  every one of the 192 rows (`ROW_GO_PATHS`, keyed by table and field so a line shift cannot silently re-point it), every
+  recorded path must exist in the key set, and a row with no entry or an entry with no row reds. The 261-spelling `GO` table
+  itself is no longer trusted: it is diffed against a committed, byte-stable derivation artifact
+  (`scripts/tests/docs-go-column-go-keys.txt`, 261 = 108 dotted `json` paths + 153 bare field names) whose provenance is the
+  `v0.71.0` tag object `40adeed7…` → commit `4a23aa18…`, and a new offline-safe script re-derives it from that tag or from a
+  checkout (`--fetch` / `--source`, skipping cleanly when no source is given, failing when an explicit source yields no keys).
+  The 41 recorded aliases are resolved — 28 repointed to their true Go `json` paths and 13 recorded in the document as
+  extensions whose marker names the spelling the key set proves absent — so the alias table is empty and each resolution is
+  checked against the rows that carried it. The page's opening sentence now says what the column actually asserts, and the
+  suite grows 204 → **257** checks with two new mutants (M6/M7) covering the mapping and the membership paths.
 - **The large-function report now credits a test module whose `#[cfg(test)]` predicate wraps across lines, or whose `#[path]` is packed
   before the gate on the same line.** `scripts/large-functions.sh` located gated regions from a one-line, start-anchored `#[cfg(test)]`
   match, so a `#[cfg(all(` … `test))]` predicate and a `#[path = "x.rs"] #[cfg(test)]` pair were charged to production. Both gate now,
