@@ -749,6 +749,23 @@ def test_blocks(lines):
     begin inside one of those constructs and only the other lines are
     candidates.
 
+    The gate's spelling tolerates whitespace (`# [ cfg ( test ) ]` is a gate,
+    `CFG_OPEN`), but `attribute_run` only walks a run whose cursor carries the
+    literal `#[`. A `#[path]` / out-of-line `mod X;` that follows a *spaced*
+    gate is therefore not registered and stays production — a known
+    limitation, not desired behaviour, pinned by `attr_spaced_path.rs` in
+    `scripts/tests/large-functions-classifier.sh`; the plain spelling
+    attributes normally.
+
+    The backward walk stops at the gate line when the line above it already
+    carries a complete item: `ATTR_LINE` matches `#[cfg(test)] mod t;` as
+    readily as a bare attribute, and taking such a line as the run's start
+    would attribute an item that was already measured — and would leave the
+    loop index unchanged when the candidate line is itself such a line. The
+    candidate is skipped instead. No file in the tree has this shape, so the
+    guard is latent; the hang it prevents is pinned by the classifier's
+    separate hang tree.
+
     An out-of-line declaration must not be brace-matched: `mod tests;` has no
     body, so scanning forward for the next `{` charges the production code that
     follows it to the test module. That is what made `ssh_gateway.rs` read 2726
@@ -767,6 +784,20 @@ def test_blocks(lines):
         while start > 0 and ATTR_LINE.match(lines[start - 1]) and not flags[start - 1]:
             start -= 1
         j, col, path_attr = attribute_run(lines, start)
+        if j < i and not flags[start]:
+            # The backward walk can start the run on an earlier line that
+            # itself carries a complete item (`ATTR_LINE` matches a full
+            # `#[cfg(test)] #[path = "x.rs"] mod t;` line). The run then ends
+            # before the gate we started from: that item was already measured,
+            # and advancing to `j + 1` would leave `i` unchanged and spin
+            # forever. Skip the candidate. `flags[start]` is False here for
+            # every candidate the region guard admits — it only steps onto
+            # unflagged lines — so this is the "walk-back landed on a real
+            # item" case; a run that begins inside a comment or string (which
+            # needs the region guard itself removed) keeps the historical path
+            # so that mutation still shows the region it loses.
+            i += 1
+            continue
         if j >= n:
             break
         decl = MOD_DECL.match(lines[j], col)

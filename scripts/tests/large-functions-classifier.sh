@@ -25,7 +25,8 @@
 #      declaration, `#[cfg(all(not(test), …))]`, a `#[path]` written above the
 #      gate, and braces inside string literals, a predicate wrapped across
 #      lines, a `#[path]` or `#[allow(…)]` sharing the gate's line, a spaced
-#      `#[ cfg ( test ) ]`, and wrapped predicates declined because their payload
+#      `#[ cfg ( test ) ]` (whose following `#[path]` is a known limitation and
+#      stays unattributed), and wrapped predicates declined because their payload
 #      crosses a raw string, an ordinary continued string or a block comment), the
 #      raw-string cases (a
 #      multi-line literal and one with embedded quotes inside a gate's region, a
@@ -43,12 +44,15 @@
 #      (a plain `mod X;` production sibling, a directory whose name merely starts
 #      with `tests`, and a production `collide.rs` that another module's
 #      `#[cfg(test)] mod collide;` must not claim — Rust resolves that under
-#      `attacker/`).
+#      `attacker/`), and a separate latent-hang tree: a gate whose backward walk
+#      lands on a line that already carries a complete declaration. That tree is
+#      measured under a watchdog (a regression must fail the suite, not hang it)
+#      and its rows are asserted against the base script's output.
 #   2  the default table and `--top` are unchanged in shape, a file the
 #      filter excluded is still not listed, and the function table measures the
 #      raw-string fixture's function to its true end.
-#   3  twenty-five mutations of the script, each of which must red exactly one part of
-#      scenario 1: drop the name pattern, drop the sibling attribution, drop
+#   3  twenty-six mutations of the script, each of which must red exactly one part
+#      of the fixture suite: drop the name pattern, drop the sibling attribution, drop
 #      declaration recognition, drop `pub(…)` from the declaration pattern,
 #      offer `dir/X.rs` for a `parent.rs`, drop the `all(…)` arm of the
 #      predicate parse, skip the backward attribute walk, scan string literals as
@@ -61,7 +65,9 @@
 #      pass, and drop the backward walk's region guard, drop the wrapped-predicate
 #      and packed-attribute acceptances, remove `CFG_OPEN`'s whitespace
 #      tolerance, drop the multi-line raw-string and continued-string declines,
-#      and never clear the non-first-attribute flag. A green suite on a mutant
+#      never clear the non-first-attribute flag, and drop the backward walk's
+#      progress guard (which reds the latent-hang tree's timeout witness rather
+#      than a row in scenario 1). A green suite on a mutant
 #      would mean the fixture does not drive the code it claims to.
 #   4  the check floor: a run without `python3` skips by design and must still
 #      exit 0 rather than trip the short-suite guard.
@@ -76,7 +82,7 @@ set -uo pipefail
 # measured check count of a green run. The one deliberate early exit — the
 # `python3`-absent SKIP below — sets `FLOOR_EXEMPT`, because zero checks is the
 # right answer there.
-MIN_CHECKS=147
+MIN_CHECKS=166
 checks=0
 fails=0
 WORK=""
@@ -593,6 +599,33 @@ pub fn prod_after() -> u8 {
 }
 EOF
 
+# The spaced spelling's known limit: the gate is recognised, but `attribute_run`
+# only continues on a literal `#[`, so the `#[path]` and the out-of-line
+# `mod t;` that follow a spaced gate are never joined to it and the target stays
+# production (`4 4 0`) where the plain spelling attributes it (`0 4 4`). This
+# pins a limitation, not desired behaviour.
+mkdir -p "$TREE/frp-core/src/attr_spaced_path" "$TREE/frp-core/src/attr_plain_gate_path"
+cat > "$TREE/frp-core/src/attr_spaced_path.rs" <<'EOF'
+# [ cfg ( test ) ]
+#[path = "attr_spaced_path/h.rs"]
+mod t;
+EOF
+cat > "$TREE/frp-core/src/attr_spaced_path/h.rs" <<'EOF'
+pub fn h_prod() -> u8 {
+    1
+}
+EOF
+cat > "$TREE/frp-core/src/attr_plain_gate_path.rs" <<'EOF'
+#[cfg(test)]
+#[path = "attr_plain_gate_path/h.rs"]
+mod t;
+EOF
+cat > "$TREE/frp-core/src/attr_plain_gate_path/h.rs" <<'EOF'
+pub fn h_prod() -> u8 {
+    1
+}
+EOF
+
 # The non-first attribute does not have to carry a `#[path]`: `#[allow(…)]`
 # before the gate on the same line is the same acceptance (base: `14 14 0`,
 # head `9 14 5`). The declaration variant also has to walk back to the
@@ -1106,6 +1139,35 @@ open(dst, 'w', encoding='utf8').write(text.replace(old, new, 1))
 PY
 }
 
+# bounded_run <outfile> <tree> — run the subject with a watchdog. `test_blocks`
+# can be made to spin forever by a gate whose backward walk lands on a line that
+# already carries a complete declaration, and a hung CI job is worse than a
+# failed one: kill the run after BOUND_SECS (generous, so a loaded host cannot
+# flake) and return 124 so the caller can FAIL on the timeout. The subject is a
+# bash wrapper around `python3`, so the watchdog kills the wrapper's children
+# too — a killed wrapper would otherwise leave `python3` spinning.
+BOUND_SECS=30
+bounded_run() { # bounded_run <outfile> <tree>; rc 124 on timeout
+  local out="$1" tree="$2" pid wpid rc=0
+  bash "$tree/scripts/large-functions.sh" --all >"$out" 2>&1 &
+  pid=$!
+  (
+    sleep "$BOUND_SECS"
+    if command -v pkill >/dev/null 2>&1; then
+      pkill -9 -P "$pid" 2>/dev/null
+    fi
+    kill -9 "$pid" 2>/dev/null
+  ) >/dev/null 2>&1 &
+  wpid=$!
+  wait "$pid" || rc=$?
+  kill "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  if [ "$rc" -gt 128 ]; then
+    return 124
+  fi
+  return "$rc"
+}
+
 printf 'large-functions.sh classifier fixtures\n\n'
 
 cp "$REAL" "$TREE/scripts/large-functions.sh"
@@ -1201,6 +1263,12 @@ expect_row "$OUT" "frp-core/src/attr_path_first_any.rs" 9 11 2 \
   "the packed spelling gates with \`any(test)\` too"
 expect_row "$OUT" "frp-core/src/attr_spaced_gate.rs" 9 14 5 \
   "a spaced \`#[ cfg ( test ) ]\` is a gate"
+expect_row "$OUT" "frp-core/src/attr_spaced_path.rs" 1 4 3 \
+  "a spaced gate still opens its own region"
+expect_row "$OUT" "frp-core/src/attr_spaced_path/h.rs" 4 4 0 \
+  "a \`#[path]\` after a spaced gate is a known limitation and stays production"
+expect_row "$OUT" "frp-core/src/attr_plain_gate_path/h.rs" 0 4 4 \
+  "the plain spelling of the same shape attributes its sibling (the contrast)"
 expect_row "$OUT" "frp-core/src/attr_path_first_any/path_first_any_helper.rs" 0 4 4 \
   "the packed \`any(test)\` \`#[path]\` still attributes its sibling to tests"
 expect_row "$OUT" "frp-core/src/attr_allow_first.rs" 9 14 5 \
@@ -1261,6 +1329,130 @@ expect_row "$OUT" "frp-core/src/fs_cont_gate.rs" 11 11 0 \
   "a \`#[cfg(test)]\` on a backslash-continued string line is not a gate"
 expect_row "$OUT" "frp-core/src/fs_raw_attr_above.rs" 11 16 5 \
   "a \`#[path]\`-shaped raw-string line does not join the region below it"
+
+# --- the latent-hang tree (the backward walk must always advance) --------------
+# `ATTR_LINE` matches a full `#[cfg(test)] #[path = "x.rs"] mod t;` line, not just
+# a bare attribute, so the backward walk can start the attribute run on an
+# earlier item and `i = j + 1` then leaves the loop state unchanged. Base is
+# vulnerable too (v7/v8 hang at `5682fe6c`); the wrapped and packed gates this
+# branch added widen the reachable set (v1/v2/v5/v9 hang only on the pre-fix
+# head). The tree is separate from `$TREE` on purpose: scenario 3's mutations run
+# the subject over `$TREE`, and a mutant that reopens the hang must be caught by
+# a bounded run (M26), never by the plain run. Rows for v1/v2/v5/v9 are the base
+# script's own output, measured per shape; v7/v8 hang at base, so their rows are
+# new. The wrapped gate v3 sits first in its file, where no walk-back happens:
+# head and fixed agree on `6 10 4` there and base's `9 10 1` is the round-1
+# wrapped-predicate feature, not this guard.
+HANG="$WORK/hang"
+mkdir -p "$HANG/scripts" "$HANG/frp-core/src" \
+  "$HANG/frp-core/src/hang_v1" "$HANG/frp-core/src/hang_v2" \
+  "$HANG/frp-core/src/hang_v3" "$HANG/frp-core/src/hang_v7" \
+  "$HANG/frp-core/src/hang_v8" "$HANG/frp-core/src/hang_v9"
+cp "$REAL" "$HANG/scripts/large-functions.sh"
+cat > "$HANG/frp-core/src/hang_v1.rs" <<'EOF'
+#[cfg(test)] #[path = "hang_v1/h.rs"] mod t;
+#[cfg(all(feature = "x",
+    test))]
+mod w;
+
+pub fn v1_prod() -> u8 {
+    1
+}
+EOF
+cat > "$HANG/frp-core/src/hang_v2.rs" <<'EOF'
+#[cfg(test)] #[path = "hang_v2/h.rs"] mod t;
+#[path = "hang_v2/h.rs"] #[cfg(test)]
+mod w;
+
+pub fn v2_prod() -> u8 {
+    1
+}
+EOF
+cat > "$HANG/frp-core/src/hang_v5.rs" <<'EOF'
+#[cfg(feature = "y")] mod t;
+#[cfg(all(feature = "x",
+    test))]
+mod w;
+
+pub fn v5_prod() -> u8 {
+    1
+}
+EOF
+cat > "$HANG/frp-core/src/hang_v7.rs" <<'EOF'
+#[cfg(test)] #[path = "hang_v7/h.rs"] mod t;
+#[cfg(test)] #[path = "hang_v7/h.rs"] mod u;
+EOF
+cat > "$HANG/frp-core/src/hang_v8.rs" <<'EOF'
+#[cfg(test)] #[path = "hang_v8/h.rs"] mod t;
+#[cfg(test)]
+mod u;
+EOF
+cat > "$HANG/frp-core/src/hang_v9.rs" <<'EOF'
+#[cfg(test)] #[path = "hang_v9/h.rs"] mod t;
+#[cfg(all(feature = "x",
+    test))]
+mod w {
+    pub fn inner() -> u8 {
+        1
+    }
+}
+
+pub fn v9_prod() -> u8 {
+    1
+}
+EOF
+cat > "$HANG/frp-core/src/hang_v3.rs" <<'EOF'
+#[cfg(all(feature = "x",
+    test))]
+mod w;
+
+#[cfg(test)] #[path = "hang_v3/h.rs"] mod t;
+
+pub fn v3_prod() -> u8 {
+    1
+}
+EOF
+for v in v1 v2 v3 v7 v8 v9; do
+  cat > "$HANG/frp-core/src/hang_$v/h.rs" <<'EOF'
+pub fn h_prod() -> u8 {
+    1
+}
+EOF
+done
+HOUT="$WORK/hang.out"
+if bounded_run "$HOUT" "$HANG"; then
+  ok "the latent-hang tree terminates (bounded run exits 0)"
+else
+  bad "the latent-hang tree did not terminate (rc $?, expected 0)"
+fi
+# `row` takes the subject's output as TEXT, not a path (see its `printf | awk`).
+HOUT="$(cat "$WORK/hang.out")"
+expect_row "$HOUT" "frp-core/src/hang_v1.rs" 8 9 1 \
+  "a wrapped gate under a same-line declaration keeps the base reading"
+expect_row "$HOUT" "frp-core/src/hang_v1/h.rs" 0 4 4 \
+  "that same-line declaration's sibling stays attributed"
+expect_row "$HOUT" "frp-core/src/hang_v2.rs" 7 8 1 \
+  "a packed \`#[path]\` gate under a same-line declaration keeps the base reading"
+expect_row "$HOUT" "frp-core/src/hang_v2/h.rs" 0 4 4 \
+  "that packed shape's sibling stays attributed"
+expect_row "$HOUT" "frp-core/src/hang_v5.rs" 9 9 0 \
+  "a non-test declaration above a wrapped gate keeps the base reading"
+expect_row "$HOUT" "frp-core/src/hang_v7.rs" 2 3 1 \
+  "two same-line gate declarations terminate (base hangs)"
+expect_row "$HOUT" "frp-core/src/hang_v7/h.rs" 0 4 4 \
+  "the first of the two declarations still attributes its sibling"
+expect_row "$HOUT" "frp-core/src/hang_v8.rs" 3 4 1 \
+  "a same-line declaration then a bare gate terminates (base hangs)"
+expect_row "$HOUT" "frp-core/src/hang_v8/h.rs" 0 4 4 \
+  "that declaration still attributes its sibling"
+expect_row "$HOUT" "frp-core/src/hang_v9.rs" 12 13 1 \
+  "a wrapped gate over a braced module under a declaration keeps the base reading"
+expect_row "$HOUT" "frp-core/src/hang_v9/h.rs" 0 4 4 \
+  "the braced case's sibling stays attributed"
+expect_row "$HOUT" "frp-core/src/hang_v3.rs" 6 10 4 \
+  "a wrapped gate first in its file is unaffected (head and fixed agree)"
+expect_row "$HOUT" "frp-core/src/hang_v3/h.rs" 0 4 4 \
+  "the wrapped-first control's sibling is attributed"
 
 # ---------------------------------------------------------------- scenario 2
 printf '\nscenario 2: default output shape\n'
@@ -2032,6 +2224,36 @@ if mutate "$REAL" "$MUT" \
   fi
 else
   bad "M25 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M26: the progress guard itself. Reverting it (`if j < i and not flags[start]:`
+# → `if False:`) makes
+# the backward walk spin again on the latent-hang tree; the witness is the
+# watchdog's 124, so the round that reopens the hang FAILS instead of hanging.
+# The main tree has no trigger shape, so a control row there must still measure.
+if mutate "$REAL" "$MUT" \
+    "        if j < i and not flags[start]:" \
+    "        if False:"; then
+  cp "$MUT" "$HANG/scripts/large-functions.sh"
+  m26rc=0
+  bounded_run "$WORK/m26.out" "$HANG" || m26rc=$?
+  if [ "$m26rc" -eq 124 ]; then
+    ok "M26 (no progress guard): the watchdog killed the non-terminating subject"
+  else
+    bad "M26: the hang tree returned rc $m26rc under the reverted guard, expected the 124 timeout"
+  fi
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/attr_back.rs")"
+  if [ "$got" = "9 12 3" ]; then
+    ok "M26: the main tree is unaffected — the guard is load-bearing only on the trigger shape"
+  else
+    bad "M26: attr_back.rs expected '9 12 3', got '${got:-<absent>}'"
+  fi
+  cp "$REAL" "$HANG/scripts/large-functions.sh"
+  cp "$REAL" "$TREE/scripts/large-functions.sh"
+else
+  bad "M26 mutation did not apply — anchor missing, the check would be vacuous"
 fi
 
 # ---------------------------------------------------------------- the floor
