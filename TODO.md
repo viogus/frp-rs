@@ -11004,8 +11004,8 @@ other.
   `frp-core/websocket` has no CLI flag at all (there is no `--websocket-port`), so only its `websocket_port`
   file key is silent there — the flag half of the residue is two spellings, the file-key half three. It is
   unreachable from any `frps` build the project's own feature names produce, and no CI lane builds an `frps`
-  binary in those combinations: only `frp-server`'s own `--all-targets` and `--lib` lanes reach the shape,
-  through their `frp-client` dev-dependency (`.github/workflows/ci.yml:3526`, `:3751`, `:3764`, `:3802`,
+  binary in those combinations: only `frp-server`'s own `--all-targets` and dashboard-only `--lib` runs reach
+  the shape, through their `frp-client` dev-dependency (`.github/workflows/ci.yml:3526`, `:3751`, `:3764`, `:3802`,
   `:3941`, `:3942`, plus the five dashboard-only lib runs at `:1824`, `:1832`, `:1850`, `:1927`, `:1929`) —
   which is why the M-6 fix landed as recorded wording (the reader
   rule and the `AppliedReaderGatedPorts` doc both name the gap) rather than as a gate.
