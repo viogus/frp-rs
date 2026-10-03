@@ -47,6 +47,21 @@
 #     construction, not by a noise blocklist. Every example in this file is a
 #     shape the tree does not contain, so the guard's own prose adds no
 #     citations of it.
+#
+# Spellings that are NOT citations, stated so nothing is silently ignored:
+#   * `path : N` (whitespace before the colon). Not scanned as a cite; counted in
+#     the run's `spaced` report when the token is path-shaped, and a **violation**
+#     when the path resolves to one of this tree's files — the citation convention
+#     is `path:N`, and a near-miss on a real file must not be invisible,
+#   * a cite split across a line break (`path:` then `N` on the next line) — no
+#     live instance, not scanned,
+#   * a token that is not path-shaped: `v0.71.0:12`, `1.2.3.4:8080`, `7000:7000`,
+#     `https://example.com:8080`, `.gitignore:1` (a bare dotfile name carries no
+#     `/` and no known extension, so it is not a path here),
+#   * a citing file over 2 MB or not decodable as UTF-8 is skipped before
+#     scanning; the two counts are printed (`skipped_binary`, `skipped_large`) so
+#     a future large or binary citing file is visible in the log rather than
+#     silently dropped.
 #   * SHORTHAND — a bare `:N` or `:N-M` whose colon is not preceded by a path
 #     character, a digit or another colon (so `"::1"`, `[::1]x]:8080` and
 #     `"proxy port:8080"` are not cites). It resolves to the *nearest preceding
@@ -230,7 +245,13 @@ EXT = (".rs", ".md", ".toml", ".yml", ".yaml", ".sh", ".json", ".txt", ".ini",
 # longer path, host or word; the optional leading `.`/`/` is what makes
 # `.github/workflows/example.yml:12`, `./x.rs:1` and `/tmp/x.go:2` visible at all
 # (the first is an in-tree cite, the others resolve as out of tree).
-TOK_RE = re.compile(r'(?<![A-Za-z0-9_./-])(\.?/?[A-Za-z0-9_][A-Za-z0-9_./-]*?):(\d+)(?:-(\d+))?')
+TOK_RE = re.compile(r'(?<![A-Za-z0-9_./-])((?:\.\.?/)*\.?[A-Za-z0-9_][A-Za-z0-9_./-]*?)'
+                    r':(\d+)(?:-(\d+))?')
+# `path : N` — a citation attempt with whitespace before the colon. It is not a
+# cite (`path:N` is the convention), but it must not be invisible: it is counted
+# in `spaced_reported`, and when the path resolves in tree it is a violation.
+SPACED_RE = re.compile(r'(?<![A-Za-z0-9_./-])((?:\.\.?/)*\.?[A-Za-z0-9_][A-Za-z0-9_./-]*?)'
+                       r'[ \t]+:[ \t]*(\d+)')
 # `PATH:N/M/O` — a slash-separated continuation of one citation list. Only a
 # `/N` that directly follows a recognised citation token continues it.
 SLASH_RE = re.compile(r'/(\d+)(?:-(\d+))?')
@@ -286,19 +307,23 @@ def tracked_files():
             for fn in filenames:
                 rels.append(os.path.relpath(os.path.join(dirpath, fn), root))
     files = []
+    skipped_large = []
+    skipped_binary = []
     for rel in rels:
         full = os.path.join(root, rel)
         if not os.path.isfile(full):
             continue
         if os.path.getsize(full) > 2_000_000:
+            skipped_large.append(rel)
             continue
         try:
             with open(full, encoding="utf-8") as fh:
                 text = fh.read()
         except (UnicodeDecodeError, OSError):
+            skipped_binary.append(rel)
             continue
         files.append((rel, text.split("\n")))
-    return set(rels), sorted(rels), files
+    return set(rels), sorted(rels), files, skipped_large, skipped_binary
 
 
 def crate_root(rel):
@@ -344,7 +369,7 @@ def fingerprint(text):
     return hashlib.sha256(" ".join(text.split()).encode("utf-8")).hexdigest()[:16]
 
 
-def scan(tracked, ordered, files):
+def scan(tracked, ordered, files, skipped_large, skipped_binary):
     """The whole cite inventory of the tree."""
     lines_of = {}
     counts_of = {}
@@ -368,7 +393,7 @@ def scan(tracked, ordered, files):
         return 0 if c is None else c.get(norm, 0)
 
     result = dict(cites=[], excluded=[], ambiguous=[], weak=[], foreign=0,
-                  shorthand=0, foreign_shorthand=0)
+                  shorthand=0, foreign_shorthand=0, spaced=0, spaced_malformed=[])
 
     for rel, lines in files:
         if point_in_time(rel):
@@ -447,6 +472,23 @@ def scan(tracked, ordered, files):
                 return True
             return False
 
+        def slash_walk(tok, target, verdict, pos):
+            """`path:12/13/14` — every number after the first is its own cite of
+            the same file, so a list can never be half-checked. The walk runs
+            after *any* recognised token (absolute, `, N` continuation or `:N`
+            shorthand), not only after an absolute one."""
+            while True:
+                sm = SLASH_RE.match(line, pos)
+                if sm is None:
+                    return
+                resolve_token(rel, lineno, sm.start() + 1,
+                              sm.group(0).lstrip("/"), tok, target, verdict,
+                              int(sm.group(1)),
+                              int(sm.group(2)) if sm.group(2) else None,
+                              "continuation")
+                recognised.append((sm.end(), tok, target, verdict))
+                pos = sm.end()
+
         for idx, line in enumerate(lines):
             lineno = idx + 1
             # (end column, token, target, verdict) of every citation recognised so
@@ -472,24 +514,26 @@ def scan(tracked, ordered, files):
                               int(m.group(1)),
                               int(m.group(2)) if m.group(2) else None, "shorthand")
                 recognised.append((m.end(), tok, target, verdict))
+                slash_walk(tok, target, verdict, m.end())
             for m in TOK_RE.finditer(line):
-                # `path:12/13/14`: every number after the first is its own cite
-                # of the same file, so the list cannot be half-checked.
                 if not path_shaped(m.group(1)):
                     continue
                 target, verdict = resolve(rel, m.group(1), tracked, ordered, crate)
-                pos = m.end()
-                while True:
-                    sm = SLASH_RE.match(line, pos)
-                    if sm is None:
-                        break
-                    resolve_token(rel, lineno, sm.start() + 1,
-                                  sm.group(0).lstrip("/"), m.group(1), target,
-                                  verdict, int(sm.group(1)),
-                                  int(sm.group(2)) if sm.group(2) else None,
-                                  "continuation")
-                    recognised.append((sm.end(), m.group(1), target, verdict))
-                    pos = sm.end()
+                slash_walk(m.group(1), target, verdict, m.end())
+            for m in SPACED_RE.finditer(line):
+                # Not a citation (`path:N` is the convention) but never silent:
+                # counted when the token is path-shaped, and a violation when the
+                # path is one of ours. Prose like `at :96` or `port :7499` names
+                # no file and stays out, exactly as for the absolute class.
+                if not path_shaped(m.group(1)):
+                    continue
+                result["spaced"] += 1
+                target, verdict = resolve(rel, m.group(1), tracked, ordered, crate)
+                if verdict in ("exact", "crate-suffix", "suffix"):
+                    result["spaced_malformed"].append(
+                        (rel, lineno, m.group(0),
+                         "whitespace before the colon; the citation convention is "
+                         "`path:N` and this one is not machine-checked"))
             for m in COMMA_RE.finditer(line):
                 comma = m.start()
                 prev = None
@@ -504,6 +548,7 @@ def scan(tracked, ordered, files):
                               tok, target, verdict, int(m.group(1)),
                               int(m.group(2)) if m.group(2) else None, "continuation")
                 recognised.append((m.end(), tok, target, verdict))
+                slash_walk(tok, target, verdict, m.end())
     # Set witnesses, computed on stable keys: a weak cite is identified by its
     # *target* (the property belongs to the target line, so a shift inside the
     # citing file does not move it); a skip is identified by the citing token.
@@ -514,6 +559,8 @@ def scan(tracked, ordered, files):
                                        for a in result["ambiguous"])
     result["excluded_set"] = set_hash("%s\t%s\t%s\t%d" % (e[0], e[2], e[3], e[4])
                                       for e in result["excluded"])
+    result["skipped_large"] = len(skipped_large)
+    result["skipped_binary"] = len(skipped_binary)
     return result
 
 
@@ -568,7 +615,7 @@ def die(msg):
     sys.exit(1)
 
 
-tracked, ordered, files = tracked_files()
+tracked, ordered, files, skipped_large, skipped_binary = tracked_files()
 # The expectation table is not a citing file: its own records carry the raw cite
 # tokens verbatim, so scanning it would read every expectation as a citation.
 data_rel = os.path.relpath(data_path, root) if os.path.isabs(data_path) else data_path
@@ -577,7 +624,7 @@ if data_rel.startswith(".."):
 files = [(rel, lines) for rel, lines in files if rel != data_rel]
 if not files:
     die("no scannable file in %s — refusing to certify an empty tree" % root)
-res = scan(tracked, ordered, files)
+res = scan(tracked, ordered, files, skipped_large, skipped_binary)
 
 if mode == "derive":
     env = clean_env()
@@ -743,16 +790,20 @@ if mode == "write":
                  "#   contain, so pinning it would forbid citing Go frp by\n"
                  "#   `file:line`, which this repo's own convention requires.\n"
                  "#   pins: checked=%d weak=%d ambiguous=%d excluded=%d "
-                 "foreign_reported=%d weak_set=%s ambiguous_set=%s excluded_set=%s\n"
+                 "foreign_reported=%d spaced_reported=%d skipped_large=%d "
+                 "skipped_binary=%d weak_set=%s ambiguous_set=%s excluded_set=%s\n"
                  % (len(res["cites"]), len(res["weak"]), len(res["ambiguous"]),
-                    len(res["excluded"]), res["foreign"], res["weak_set"],
+                    len(res["excluded"]), res["foreign"], res["spaced"],
+                    res["skipped_large"], res["skipped_binary"], res["weak_set"],
                     res["ambiguous_set"], res["excluded_set"]))
         for row in sorted(rows):
             fh.write(row + "\n")
     print("write: %d expectation(s) written to %s" % (len(rows), data_path))
-    print("write: checked=%d weak=%d ambiguous=%d excluded=%d foreign=%d"
+    print("write: checked=%d weak=%d ambiguous=%d excluded=%d foreign=%d spaced=%d "
+          "skipped_large=%d skipped_binary=%d"
           % (len(res["cites"]), len(res["weak"]), len(res["ambiguous"]),
-             len(res["excluded"]), res["foreign"]))
+             len(res["excluded"]), res["foreign"], res["spaced"],
+             res["skipped_large"], res["skipped_binary"]))
     if old_rows is not None:
         added, removed = new_rows - old_rows, old_rows - new_rows
         print("write: vs the previous table: %d added, %d removed, %d unchanged"
@@ -845,15 +896,23 @@ if checked < min_cites:
 # out-of-tree count is deliberately NOT pinned: those tokens name files this tree
 # does not contain, and pinning them would make citing Go frp by `file:line` — the
 # convention this repo requires — a table regeneration.
+#
+# Known limit, stated rather than implied: two weak cites whose target lines carry
+# byte-identical text can still be co-swapped (the fingerprint matches at either
+# occurrence). The set pin catches an add, a demote or a line shift, not a swap
+# between identical texts; a `--write` re-bake shows the two changed records.
 def pin(name):
     return header.get(name)
 
 
 pin_weak_set, pin_ambiguous_set = pin("weak_set"), pin("ambiguous_set")
 pin_excluded = pin("excluded")
-if not pin_weak_set or not pin_ambiguous_set or pin_excluded is None:
-    die("%s has no pinned weak_set/ambiguous_set/excluded in its header; a table "
-        "without the skip pins cannot vouch for what it does not check" % data_path)
+pin_excluded_set = pin("excluded_set")
+if (not pin_weak_set or not pin_ambiguous_set or pin_excluded is None
+        or not pin_excluded_set):
+    die("%s has no pinned weak_set/ambiguous_set/excluded/excluded_set in its header; "
+        "a table without the skip pins cannot vouch for what it does not check"
+        % data_path)
 if not pin_excluded.isdigit():
     die("%s pins a non-numeric excluded count (%r)" % (data_path, pin_excluded))
 if res["weak_set"] != pin_weak_set:
@@ -875,15 +934,33 @@ if res["ambiguous_set"] != pin_ambiguous_set:
          "resolves and regenerate the table with --write: "
          + set_members("%s:%d cites %s" % (a[0], a[1], a[2])
                        for a in res["ambiguous"])))
+if res["excluded_set"] != pin_excluded_set:
+    # The identity pin, exactly like weak_set/ambiguous_set: a *removal* of one
+    # point-in-time cite compensated by the addition of another leaves the count
+    # at its pin, so a count ceiling alone certified a brand-new unvalidated cite
+    # (measured end-to-end in delta review round 2).
+    violations.append(
+        ("the point-in-time cite set changed (pinned %s, measured %s)"
+         % (pin_excluded_set, res["excluded_set"]),
+         "these cites are not content-validated here, so the set — not just its "
+         "size — has to stay put; either point the new cite at a live file or "
+         "regenerate the table with --write: "
+         + set_members("%s:%d cites %s" % (e[0], e[1], e[2])
+                       for e in res["excluded"])))
 if len(res["excluded"]) > int(pin_excluded):
     violations.append(
         ("%d cite(s) into the point-in-time set (pinned %d)"
          % (len(res["excluded"]), int(pin_excluded)),
-         "a new cite this guard cannot validate was added; it is validated by no "
-         "other gate unless it names TODO.md, so either point it at a live file or "
-         "regenerate the table with --write: "
+         "a new cite this guard cannot validate was added (a duplicate of an "
+         "existing one keeps the set hash, so the count is checked too); it is "
+         "validated by no other gate unless it names TODO.md, so either point it "
+         "at a live file or regenerate the table with --write: "
          + set_members("%s:%d cites %s" % (e[0], e[1], e[2])
                        for e in res["excluded"])))
+for rel, lineno, raw, why in res["spaced_malformed"]:
+    violations.append(("%s:%d cites %s" % (rel, lineno, raw),
+                       why + " — it resolves to one of this tree's files, so it "
+                       "must be written `path:N`"))
 
 print("pathline-cite-guard: %d cite(s) checked (%d absolute, %d shorthand) across %d "
       "citing file(s) and %d target file(s)"
@@ -894,11 +971,15 @@ print("pathline-cite-guard: unvalidatable, pinned by identity: %d ambiguous "
       "path(s) [set %s]; %d weakly anchored cite(s) [set %s]"
       % (len(res["ambiguous"]), pin_ambiguous_set, len(res["weak"]), pin_weak_set))
 print("pathline-cite-guard: excluded/reported, never silently ignored: %d cite(s) into "
-      "the point-in-time set [pin %s, can only shrink]; %d out-of-tree token(s) "
+      "the point-in-time set [set %s]; %d out-of-tree token(s) "
       "(%d of them shorthand/continuation anchors) naming files this tree does not "
       "contain — reported, not pinned (citing Go frp by `file:line` must not require "
-      "a regeneration)"
-      % (len(res["excluded"]), pin_excluded, res["foreign"], res["foreign_shorthand"]))
+      "a regeneration); %d spaced `path : N` spelling(s) reported (%d of them naming "
+      "one of this tree's files and there a violation); %d tracked file(s) skipped "
+      "before scanning (non-UTF-8) and %d skipped as over 2 MB"
+      % (len(res["excluded"]), pin_excluded_set, res["foreign"],
+         res["foreign_shorthand"], res["spaced"], len(res["spaced_malformed"]),
+         res["skipped_binary"], res["skipped_large"]))
 for rel, lineno, raw, why in res["ambiguous"]:
     print("  note  %s:%d cites %s — %s" % (rel, lineno, raw, why))
 for c in res["weak"]:

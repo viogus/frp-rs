@@ -46,7 +46,13 @@
 #   23 the weak-anchor set is pinned BY IDENTITY: an edit that keeps the weak
 #      count constant (one cite promoted, another demoted) still reds;
 #   24 the point-in-time count is pinned (a new cite into it reds), while an
-#      out-of-tree token is reported and deliberately NOT pinned.
+#      out-of-tree token is reported and deliberately NOT pinned;
+#   25 the point-in-time *set* is pinned by identity, so removing one such cite
+#      and adding a different one (count constant) still reds;
+#   26 a `../`-prefixed relative citation is scanned and reds when it moves;
+#   27 a `path : N` spelling that names one of the tree's files is a violation,
+#      while a spaced form naming nothing (`Go : 817`) is not a cite at all;
+#   28 a `/N` after a shorthand or after a `, N` continuation is checked too.
 #
 # Self-contained: no network, no cargo, no compat run. Synthetic trees live
 # under `mktemp -d` and are removed on every exit path.
@@ -85,7 +91,7 @@ FLOOR_EXEMPT=""
 
 # The floor below is this suite's own self-defence (the same shape as the
 # sibling suites): `exit "$fails"` alone is happy with no assertions at all.
-MIN_CHECKS=71
+MIN_CHECKS=86
 
 # shellcheck disable=SC2329  # invoked by the EXIT trap below, not directly
 cleanup_all() {
@@ -703,6 +709,118 @@ case $LAST_OUT in
   *'1 out-of-tree token(s)'*'reported, not pinned'*)
     ok 'out of tree: reported as a count, with the not-pinned wording' ;;
   *) bad "out of tree: the not-pinned wording is missing: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+
+hdr 'scenario 25 — the point-in-time set is pinned by identity'
+build_tree "$TREE"
+set_notes "$(printf '<!-- see %s and %s and %s -->' \
+  "$(cite fx/anchor.rs 2)" "$(cite TODO.md 1)" "$(cite TODO.md 2)")"
+write_table
+case $(cat "$TABLE") in
+  *'excluded=2'*) ok 'PIT set: the table pins two excluded cites' ;;
+  *) bad "PIT set: unexpected header: $(sed -n '/pins:/p' "$TABLE")" ;;
+esac
+run_gate
+if [ "$LAST_RC" -eq 0 ]; then
+  ok 'PIT set: both cites are inside the pin'
+else
+  bad "PIT set: gate exited $LAST_RC: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')"
+fi
+# Swap one point-in-time cite for a different one: the COUNT stays 2.
+printf '<!-- see %s and %s and %s -->\n' "$(cite fx/anchor.rs 2)" "$(cite TODO.md 1)" \
+  "$(cite CHANGELOG.md 99)" > "$TREE/notes.md"
+run_gate
+if [ "$LAST_RC" -ne 0 ]; then
+  ok "PIT set: a compensated swap reds (rc $LAST_RC)"
+else
+  bad 'PIT set: a brand-new unvalidated cite entered with the count held constant'
+fi
+case $LAST_OUT in
+  *'the point-in-time cite set changed'*) ok 'PIT set: named as a set change' ;;
+  *) bad "PIT set: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+
+hdr 'scenario 26 — a `../`-prefixed relative citation is scanned'
+build_tree "$TREE"
+mkdir -p "$TREE/sub"
+printf '<!-- see %s -->\n' "$(cite ../fx/anchor.rs 2)" > "$TREE/sub/notes.md"
+printf 'nothing here\n' > "$TREE/notes.md"
+write_table
+run_gate
+if [ "$LAST_RC" -eq 0 ]; then
+  ok 'dotdot: the ../ cite is visible and green when correct'
+else
+  bad "dotdot: gate exited $LAST_RC: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')"
+fi
+case $LAST_OUT in
+  *'RESULT: 1 cite(s) checked, 0 violation(s)'*) ok 'dotdot: counted as a cite' ;;
+  *) bad "dotdot: unexpected summary: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+insert_after "$TREE/fx/anchor.rs" 1 'inserted'
+run_gate
+case $LAST_OUT in
+  *'sub/notes.md:1 cites ../fx/anchor.rs:2'*) ok 'dotdot: a moved line reds and names the ../ cite' ;;
+  *) bad "dotdot: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+
+hdr 'scenario 27 — spaced `path : N` spellings are visible, not silent'
+build_tree "$TREE"
+# The spaced token is built from pieces so this file's own bytes do not carry
+# the shape it tests.
+set_notes "$(printf '<!-- see %s and %s : 3 -->' "$(cite fx/anchor.rs 2)" 'fx/anchor.rs')"
+write_table
+run_gate
+if [ "$LAST_RC" -ne 0 ]; then
+  ok "spaced: a spaced spelling naming a real file reds (rc $LAST_RC)"
+else
+  bad 'spaced: a malformed citation of a real file was certified'
+fi
+case $LAST_OUT in
+  *'whitespace before the colon'*) ok 'spaced: named as whitespace before the colon' ;;
+  *) bad "spaced: unexpected failure text: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+# A spaced form that names nothing is prose, not a cite.
+set_notes "$(printf '<!-- see %s and the Go hook Go : 817 -->' "$(cite fx/anchor.rs 2)")"
+write_table
+run_gate
+if [ "$LAST_RC" -eq 0 ]; then
+  ok 'spaced: a spaced form naming nothing stays prose'
+else
+  bad "spaced: gate exited $LAST_RC: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')"
+fi
+case $LAST_OUT in
+  *'0 spaced `path : N` spelling(s) reported'*) ok 'spaced: the reported count stays at zero' ;;
+  *) bad "spaced: unexpected spaced report: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+
+hdr 'scenario 28 — a `/N` after a shorthand or a comma continuation is checked'
+build_tree "$TREE"
+set_notes "$(printf '<!-- see %s and %s -->' "$(cite fx/anchor.rs 2)" "$(shorthand '4/5')")"
+write_table
+run_gate
+case $LAST_OUT in
+  *'RESULT: 3 cite(s) checked, 0 violation(s)'*) ok 'slash after shorthand: all three numbers are cites' ;;
+  *) bad "slash after shorthand: unexpected summary: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+insert_after "$TREE/fx/anchor.rs" 4 'inserted'
+run_gate
+case $LAST_OUT in
+  *'notes.md:1 cites 5'*) ok 'slash after shorthand: the trailing number reds when it moves' ;;
+  *) bad "slash after shorthand: the trailing number was not checked: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+build_tree "$TREE"
+set_notes "$(printf '<!-- see %s -->' "$(cite fx/anchor.rs '1,2/3')")"
+write_table
+run_gate
+case $LAST_OUT in
+  *'RESULT: 3 cite(s) checked, 0 violation(s)'*) ok 'slash after comma: all three numbers are cites' ;;
+  *) bad "slash after comma: unexpected summary: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+insert_after "$TREE/fx/anchor.rs" 2 'inserted'
+run_gate
+case $LAST_OUT in
+  *'notes.md:1 cites 3'*) ok 'slash after comma: the trailing number reds when it moves' ;;
+  *) bad "slash after comma: the trailing number was not checked: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
 esac
 
 hdr 'summary'
