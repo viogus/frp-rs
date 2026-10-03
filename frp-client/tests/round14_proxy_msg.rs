@@ -65,7 +65,7 @@ fn test_new_proxy_msg_tcp_maps_full_config() {
             .map(String::as_str),
         Some("prod")
     );
-    // local_str is deliberately stripped (proxy.rs:150-157) so the wire
+    // local_str is deliberately stripped (proxy.rs:154-161) so the wire
     // JSON is byte-identical to Go frpc, which has no such field.
     assert!(
         np.local_str.is_none(),

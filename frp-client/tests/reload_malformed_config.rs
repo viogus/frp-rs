@@ -6,7 +6,7 @@
 //! format!("failed to load config: {e}"))?` — the load failure propagates
 //! BEFORE any mutation, so `self.cfg`/`self.proxies` are untouched,
 //! `reload::do_reload` never runs, and the previously running proxies keep
-//! serving. (reload.rs:205-217 is a DIFFERENT arm: the no-changes shortcut
+//! serving. (reload.rs:416-428 is a DIFFERENT arm: the no-changes shortcut
 //! for a config that *loaded fine*.)
 //!
 //! Observability note: `Service::request_reload()` (the SIGUSR1 path) drops
@@ -130,7 +130,7 @@ fn write_malformed_toml(path: &std::path::Path) {
 }
 
 /// Parseable TOML, semantically invalid: `type = "bogus-proxy-type"` is
-/// rejected by `validate_proxy_configs` (loader.rs:222-228) inside
+/// rejected by `validate_proxy_configs` (loader.rs:1164-1170) inside
 /// `load_client_config` — this is the failure `validate_client_config`
 /// reports, independent of the `strict` flag. Carries `remote_port` so a
 /// buggy partial-apply would be observable (the proxy would move ports).

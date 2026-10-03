@@ -94,7 +94,7 @@ impl Drop for DirRegistryEntry {
 /// Main-task ownership of `SIGTERM`/`SIGINT` for the `--config-dir` lane.
 ///
 /// The Unix `SIGTERM` handler lives inside `Service::run` — it is installed by a
-/// task `run()` spawns at its top (`frp-server/src/service.rs:1854-1893`, the
+/// task `run()` spawns at its top (`frp-server/src/service.rs:1107-1139`, the
 /// same task that also takes `ctrl_c()`) — so a `SIGTERM` that lands between the
 /// startup line and that registration takes the kernel's default disposition
 /// and kills `frps` (`rc = -15`) instead of draining. The measured window is
@@ -420,7 +420,7 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     // Go frp parity (TODO.md:9835): with an explicit `-c` the config file is
     // authoritative for the whole `[log]` section, exactly as it is for the
     // config flags — the `-c` branch of `main` skips `override_server_config`
-    // (`frps/src/main.rs:1025-1027`), so consulting the CLI log flags here would
+    // (`frps/src/main.rs:1060-1062`), so consulting the CLI log flags here would
     // silently re-honour the very flags that gate exists to discard. Measured
     // on Go v0.71.0: `frps -c frps.toml --log-level info` over a file with
     // `[log] level = "warn"` emits 0 `INFO` records; before this gate frp-rs
@@ -429,10 +429,10 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     // The predicate is `cli.config.is_none() || cli.config_dir.is_some()`, not
     // `!cli.cli_overrides_enabled()`: `--config-dir` is an frp-rs-only extension
     // whose lane *does* honour the CLI log flags — its `init_logging(&cli, None)`
-    // call (`frps/src/main.rs:500`) has no config to defer to, so masking there
+    // call (`frps/src/main.rs:524`) has no config to defer to, so masking there
     // would silently drop the flag to the built-in default. When `-c` and
     // `--config-dir` are given together it is the config-dir branch
-    // (`frps/src/main.rs:499`) that runs, so `cli.config_dir.is_some()` must
+    // (`frps/src/main.rs:523`) that runs, so `cli.config_dir.is_some()` must
     // override `cli.config.is_some()`.
     let cli_log_flags_apply = cli.config.is_none() || cli.config_dir.is_some();
     let (cli_level, cli_file, cli_max_days, cli_format) = if cli_log_flags_apply {
@@ -823,7 +823,7 @@ async fn run(mut cli: FrpsArgs) {
                                 // (`frp-server/src/service.rs:1529`) — so this
                                 // arm means the service stopped for good. The
                                 // single-config path maps any `run()` error to
-                                // `EXIT_RUNTIME` (`frps/src/main.rs:1132-1135`),
+                                // `EXIT_RUNTIME` (`frps/src/main.rs:1182-1185`),
                                 // and this lane carries the same code out,
                                 // pinned on both lanes by
                                 // `config_dir_where_every_service_fails_to_run_exits_like_dash_c`

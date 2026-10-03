@@ -354,7 +354,7 @@ async fn test_new_proxy_duplicate_name_fails() {
             // Explicit allocated port: remote_port=0 would make the server
             // scan the whole 1..65535 range with probe-binds, racing
             // parallel test servers for the same low port (EADDRINUSE flake
-            // observed in this test at server_protocol.rs:370).
+            // observed in this test at server_protocol.rs:393).
             remote_port: Some(allocate_port() as i32),
             use_encryption: None,
             use_compression: None,
@@ -670,13 +670,13 @@ Connection: close\r\n\
 // -p frp-server --no-default-features --test server_protocol` exits 101 with
 // `WS dial: Transport(Other("WS raw connect read: Connection reset by peer
 // (os error 54)"))` from the `expect("WS dial")` this gate guards
-// (frp-server/tests/server_protocol.rs:691 in this tree). The gate is on
+// (frp-server/tests/server_protocol.rs:700 in this tree). The gate is on
 // frp-server's own `websocket`: frp-core's is ON in this graph (frp-server's
 // dev-dependency on frp-client pulls it in), so `detect_and_strip_magic`
 // returns `ConnectionType::WebSocket` and the `not(feature = "websocket")` arm
 // warns `WebSocket connection from {} but WebSocket feature not enabled,
-// dropping` and drops the connection (frp-server/src/service.rs:1433, arm at
-// :1400). With `--no-default-features --features websocket`, this case is
+// dropping` and drops the connection (frp-server/src/service.rs:1453, arm at
+// :1420). With `--no-default-features --features websocket`, this case is
 // 1 passed / 0 failed.
 #[cfg(feature = "websocket")]
 #[tokio::test]
@@ -747,8 +747,8 @@ async fn test_login_via_websocket() {
 // --no-default-features --test server_protocol` exits 101 with `TLS dial:
 // Transport(Other("TLS connect: Connection reset by peer (os error 54)"))`
 // from the `expect("TLS dial")` this gate guards
-// (frp-server/tests/server_protocol.rs:773 in this tree), because frp-server's
-// `tls` feature is what builds the acceptor (frp-server/src/service.rs:312) and
+// (frp-server/tests/server_protocol.rs:782 in this tree), because frp-server's
+// `tls` feature is what builds the acceptor (frp-server/src/service.rs:644) and
 // the `not(feature = "tls")` handler only warns `TLS connection from {} but TLS
 // feature not enabled` and drops (frp-server/src/handlers/transport.rs:669).
 // With `--no-default-features --features tls`, this case is 1 passed / 0

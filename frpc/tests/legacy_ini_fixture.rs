@@ -135,7 +135,7 @@ fn verify_dot_spelling_includes_from_a_relative_config_path() {
     // A *missing* directory spelled with a trailing separator must refuse, not
     // silently match nothing: Go's `filepath.Dir("nonexistent/")` is
     // `nonexistent`, so `os.Stat` fails and the load is rc 1
-    // (`include: directory of ... not exist`, `frp-core/src/config/file.rs:410`).
+    // (`include: directory of ... not exist`, `frp-core/src/config/file.rs:424`).
     // Before round 5 the `./` form was rc 0 here, because the old rule took the
     // parent of the join result (`./nonexistent/` → `.`, which exists).
     let dir = TempDir::new("dot-missing-dir");

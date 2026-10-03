@@ -116,7 +116,7 @@ fn file_auth_body(path: &str) -> String {
 /// in the Go-dialect spelling the loader normalizes (`[transport] tcpMux`,
 /// `heartbeatInterval`). No token key appears anywhere: the token comes from
 /// `auth.tokenSource`, and the loader refuses `auth.token` + `auth.tokenSource`
-/// together (`frp-core/src/config/loader.rs:1048-1050`).
+/// together (`frp-core/src/config/loader.rs:1311-1312`).
 fn write_config(path: &Path, server_port: u16, auth_body: &str, probes: &[(&str, u16)]) {
     let mut body = format!(
         "serverAddr = \"127.0.0.1\"\n\

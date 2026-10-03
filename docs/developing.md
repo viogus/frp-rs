@@ -202,10 +202,10 @@ Add a field only for a genuinely new knob, and then follow the house rules:
   `frp-core/src/config/server.rs:1415`.
 
 **The type name itself is validated by an allow-list, and this is the first wall.**
-`fn validate_proxy_configs` (`frp-core/src/config/loader.rs:1108`) checks
-`p.proxy_type` against `const VALID_PROXY_TYPES` (`frp-core/src/config/loader.rs:1109`).
+`fn validate_proxy_configs` (`frp-core/src/config/loader.rs:1159`) checks
+`p.proxy_type` against `const VALID_PROXY_TYPES` (`frp-core/src/config/loader.rs:1160`).
 It is reached only from `fn validate_client_config`
-(`frp-core/src/config/loader.rs:1404`); the server path has no equivalent, so a
+(`frp-core/src/config/loader.rs:1455`); the server path has no equivalent, so a
 stray `[[proxies]]` block in `frps.toml` is rejected by the *parser* as
 `unknown field "proxies" in config file`, not by this allow-list. Miss the list and
 *every* frpc config file using your type fails to load. (The transcripts in §2.2–§2.6
@@ -221,7 +221,7 @@ $ echo $?
 ```
 
 Note what that demands of you: the message is a **second, hand-maintained copy of
-the list**, inline at `frp-core/src/config/loader.rs:1116`. Adding the name to the
+the list**, inline at `frp-core/src/config/loader.rs:1167`. Adding the name to the
 `const` and not to the message leaves the error text lying about what is valid.
 Change both, in the same commit.
 
@@ -232,7 +232,7 @@ differently:
 
 | # | Site | What it gates | If you skip it |
 |---|---|---|---|
-| 1 | `const VALID_PROXY_TYPES` — `frp-core/src/config/loader.rs:1109` (+ the message at `frp-core/src/config/loader.rs:1116`), checked by `validate_proxy_configs` at `frp-core/src/config/loader.rs:1108` | frpc config-file load | Fatal at startup: `invalid proxy_type '<type>'` (above). **The first wall, always** |
+| 1 | `const VALID_PROXY_TYPES` — `frp-core/src/config/loader.rs:1160` (+ the message at `frp-core/src/config/loader.rs:1167`), checked by `validate_proxy_configs` at `frp-core/src/config/loader.rs:1159` | frpc config-file load | Fatal at startup: `invalid proxy_type '<type>'` (above). **The first wall, always** |
 | 2 | `const VALID_PROXY_TYPES` — `frp-client/src/store.rs:16`, used by `validate_proxy` at `frp-client/src/store.rs:258` | The runtime config store behind the admin API (`/api/store/*`) | Store writes are rejected with `invalid proxy type: <type>`, and an existing store file that contains your type **fails to load** |
 | 3 | the seed list in `by_type` — `frp-client/src/admin.rs:391` (feature `admin`) | `/api/proxy/<type>` (Go parity: every known type appears, even empty) | Cosmetic: the endpoint returns no entry for your type |
 | 4 | `const VALID_PROXY_TYPES` — `frp-server/src/ssh_gateway.rs:737` (feature `ssh`) | Proxy types accepted over the SSH tunnel gateway | `invalid proxy type: <type>, support types: [tcp http https tcpmux stcp]` |
@@ -263,7 +263,7 @@ mytcp must be an accepted store proxy type: Err(InvalidArgument("invalid proxy t
 Two neighbouring lists are **not** on this path, and it is worth knowing why so
 you do not hunt them: `const VALID_VISITOR_TYPES` (`frp-client/src/store.rs:19`,
 `["stcp", "sudp", "xtcp"]`) enumerates *visitor* types, and `const
-FRPC_SUBCOMMANDS` (`frp-core/src/cli.rs:3109`, a `[&str; 12]` pinned in both
+FRPC_SUBCOMMANDS` (`frp-core/src/cli.rs:3157`, a `[&str; 12]` pinned in both
 directions by the tests beside it) enumerates `frpc <subcommand>` names — it needs
 your type only if you are also adding an `frpc <type>` subcommand, which the
 minimal path does not.
@@ -669,15 +669,15 @@ There are two cases, and they are not the same amount of work:
   ```
 
   What you add instead is a **Rust↔Rust** scenario in the same runner
-  (`test_kcp_rust_to_rust`, `scripts/compat-test.sh:4967`, is the existing
+  (`test_kcp_rust_to_rust`, `scripts/compat-test.sh:5041`, is the existing
   template). It still drives the real `frps` and `frpc` binaries and the real wire
   protocol, and it is what a reviewer will ask for. Say in the PR that compat with
   Go frpc is *not applicable* rather than leaving the section empty.
 
 **What the harness gives you, and what it does not.** `write_frps_config`
-(`scripts/compat-test.sh:713`) is type-agnostic. `write_frpc_config`
-(`scripts/compat-test.sh:776`) is **not**: it hard-codes `type = "tcp"` in both
-the Go (`:817`) and the Rust (`:845`) branch, so a new type cannot reuse it. Either
+(`scripts/compat-test.sh:787`) is type-agnostic. `write_frpc_config`
+(`scripts/compat-test.sh:850`) is **not**: it hard-codes `type = "tcp"` in both
+the Go (`:891`) and the Rust (`:919`) branch, so a new type cannot reuse it. Either
 add a `type` parameter to the writer **and** update every existing caller, or write
 the frpc TOML inline in your scenario the way the special-case scenarios do.
 Inline is usually the smaller diff and the one to prefer.
@@ -685,12 +685,12 @@ Inline is usually the smaller diff and the one to prefer.
 **Prerequisites — and the one that costs an hour if nobody says it.** Before any
 selector runs, the runner checks (a) that all four binaries exist and are
 executable — `GO_FRPS`, `GO_FRPC`, `$PROJECT_DIR/target/release/frps`,
-`$PROJECT_DIR/target/release/frpc` (`scripts/compat-test.sh:4947-4953`), and
+`$PROJECT_DIR/target/release/frpc` (`scripts/compat-test.sh:5021-5027`), and
 (b) that `frp-core/tests/certs/` holds `ca.crt`, `server.crt` and `server.key`
-(`:30`, checked at `:4955-4961`). Three consequences:
+(`:43`, checked at `:5029-5035`). Three consequences:
 
 - The Rust paths are **hard-coded to `target/release/`**
-  (`scripts/compat-test.sh:28-29`) and are not environment-overridable. A debug
+  (`scripts/compat-test.sh:41-42`) and are not environment-overridable. A debug
   build does not satisfy them, so build release before running *any* selector,
   including the Rust↔Rust one:
   ```bash
@@ -704,7 +704,7 @@ executable — `GO_FRPS`, `GO_FRPC`, `$PROJECT_DIR/target/release/frps`,
 
 Add your scenario function beside the existing ones and register it with the other
 `run_test` lines at the bottom of the file (`run_test test_g2r_tcp_plain` is at
-`scripts/compat-test.sh:5583`). This is the Rust↔Rust shape:
+`scripts/compat-test.sh:5657`). This is the Rust↔Rust shape:
 
 ```bash
 test_r2r_mytcp_plain() {
@@ -775,7 +775,7 @@ One config trap worth repeating, because it fails with an unreadable error:
 `tcp_mux` must agree on both sides. The `rust` branch of `write_frps_config`
 writes `tcp_mux = false`, so the inline client config must too — the working
 spelling is the snake_case `tcp_mux` of the Rust `write_frpc_config` branch
-(`scripts/compat-test.sh:776-852`). What *is* dropped, silently, is the **top-level**
+(`scripts/compat-test.sh:850-926`). What *is* dropped, silently, is the **top-level**
 camelCase key: `tcpMux = false` written at the top level is accepted by the
 config parser whether or not a `[transport]` table is present, but it has no serde
 alias on `tcp_mux` (`frp-core/src/config/client.rs:321-322`), so the client keeps the default
@@ -790,8 +790,8 @@ under a `[transport]` table is **not** dropped — `normalize_client_config`
 spelling logs in and registers fine.
 
 Helper line numbers for orientation: `start_echo_server`
-`scripts/compat-test.sh:277`, `send_and_expect` `:304`, `log` `:659`,
-`should_run_test` `:694`. `run_go` (`:137`) is only for the Go-driving scenarios;
+`scripts/compat-test.sh:323`, `send_and_expect` `:350`, `log` `:706`,
+`should_run_test` `:741`. `run_go` (`:182`) is only for the Go-driving scenarios;
 a Rust↔Rust scenario invokes `"$RUST_FRPS"` / `"$RUST_FRPC"` directly, as above.
 
 **What a passing run prints.** Use the display name and paste the `N passed` line
@@ -812,8 +812,8 @@ $ echo $?
 
 **`--test` takes the display name; `--list` prints the function name. They do not
 match, and the mismatch exits 0.** `should_run_test`
-(`scripts/compat-test.sh:694`) compares the selector against the `local name=`
-inside the function, while `--list` (`scripts/compat-test.sh:75`) prints the
+(`scripts/compat-test.sh:741`) compares the selector against the `local name=`
+inside the function, while `--list` (`scripts/compat-test.sh:103`) prints the
 function names:
 
 ```console
@@ -1304,7 +1304,7 @@ of the workspace.** `oidc` — one of the nine features named just above — has
 live sibling of exactly this class: `AuthMethod::Oidc` is gated in `frp-core`
 and matched in `frp-server`, so
 `cargo check -p frp-server --no-default-features --features dashboard --all-targets`
-still fails with `E0004` at `frp-server/src/dashboard.rs:2344`. [`../TODO.md`](../TODO.md)
+still fails with `E0004` at `frp-server/src/dashboard.rs:2352`. [`../TODO.md`](../TODO.md)
 records it; the fix here was per-variant, not a guarantee that no other
 feature-gated variant exists.
 
@@ -1461,7 +1461,7 @@ This is not hypothetical. The project's own history records it, repeatedly:
   `net/ipsock.go:216` was actually read.
 - **Round 16**: "two round-14/15-era tests that pinned the trim behaviour [were]
   flipped".
-- **Round 6**: a stale pin in `server_protocol.rs:81` — a target-only test run
+- **Round 6**: a stale pin in `server_protocol.rs:101` — a target-only test run
   was blind to the integration file that held the real expectation.
 - **Round 7**: a round-9-era "established reject policy" pin turned out to rest
   on a false premise; the expectation was flipped after probing the real
@@ -1890,7 +1890,7 @@ Some things this table does not say, each measured:
     and all 3 at the head. `frpc`'s OIDC path is where the flip is real: with
     `[auth] method = "oidc"` and **no** `oidc.tokenEndpointURL`, `OidcClient::new`
     fetches `<issuer>/.well-known/openid-configuration`
-    (`frp-core/src/auth.rs:1232-1247`) and the error embeds that URL, so at the
+    (`frp-core/src/auth.rs:1333-1348`) and the error embeds that URL, so at the
     base commit an issuer path containing `auth` gave **3** while four auth-free
     paths (`zzz`, `plain`, `nope`, `x`) gave **4** — each of the five repeated
     four times, one fresh config and one fresh closed port per run, rc read
@@ -4001,7 +4001,7 @@ is default-on (`frp-server/Cargo.toml:44`). The `http-proxy` feature is
 than a build gate — the frozen code still compiles into the default and tiny
 tiers, and splitting the feature is not part of this policy. Finally, one of
 the 10 client plugins, `virtual_net`, is the TUN-backed path with no listener
-of its own (`frp-client/src/plugin/mod.rs:331`), so it follows the opt-in
+of its own (`frp-client/src/plugin/mod.rs:333`), so it follows the opt-in
 `vnet` tier: it is named in the Opt-in row above and is the one client plugin
 not counted in Keep.
 
@@ -4033,7 +4033,7 @@ would lift it. Unfreezing moves the surface to **Keep** and resumes full parity
 work; a bug fix on a frozen surface never needs an unfreeze.
 
 - **SUDP** (`type = "sudp"`) — a distinct proxy type, not a UDP variant
-  (`frp-core/src/config/loader.rs:219`), with frp-rs-specific shared-port
+  (`frp-core/src/config/loader.rs:1161`), with frp-rs-specific shared-port
   handling. Unfreeze if a deployment is shown to use it (a user report — the
   repo carries no usage telemetry) or if Go frp changes its SUDP/VisitorManager
   behaviour and compat breaks beyond what a fix can cover.
@@ -4046,8 +4046,8 @@ work; a bug fix on a frozen surface never needs an unfreeze.
   Wintun (`wintun.dll`) integration *and* can test on a Windows host; this
   repo's CI does not exercise vnet on Windows.
 - **Non-default XTCP data plane (KCP+yamux)** — selected by `protocol = "kcp"`;
-  the default is QUIC (`frp-core/src/config/client.rs:823`,
-  `docs/config.md:659`). Unfreeze if a case is reported that the QUIC plane
+  the default is QUIC (`frp-core/src/config/client.rs:912`,
+  `docs/config.md:668`). Unfreeze if a case is reported that the QUIC plane
   cannot serve (for example a hole punch where the QUIC handshake never
   completes but KCP does).
 

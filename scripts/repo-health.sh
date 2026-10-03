@@ -1724,7 +1724,7 @@ def normalize(span):
         return None
     s = re.sub(r'::[A-Za-z_][A-Za-z0-9_:]*$', '', s)           # file.rs::symbol
     s = re.sub(r'#[A-Za-z0-9_.-]+$', '', s)                    # file.md#anchor
-    s = re.sub(r':~?\d+([-\u2013]\d+)?([/,]\d+)*\+?$', '', s)  # file.rs:12-20,30
+    s = re.sub(r':~?\d+([-\u2013]\d+)?([/,]\d+)*\+?$', '', s)  # file.rs:20-28,30
     return s or None
 
 def nearest_manifest_dir(base):
@@ -2473,7 +2473,7 @@ CLAIMS = [
     #   vendor/rustls/README-FRP-RS.md:93  — crates.io `max_stable_version` /
     #                                        `newest_version`, which move
     #                                        independently of this vendored copy
-    #   docs/developing.md:612             — the same crates.io fact
+    #   docs/developing.md:3842             — the same crates.io fact
     ('vendor/rustls/README-FRP-RS.md', r'(?:Vendored|vendors|crates\.io)\s+`?rustls`?\s*([0-9]+\.[0-9]+\.[0-9]+)', v_rustls, 'vendor/rustls/Cargo.toml'),
     ('vendor/yamux/README-FRP-RS.md',  r'(?:Vendored|vendors|crates\.io)\s+`?yamux`?\s*([0-9]+\.[0-9]+\.[0-9]+)',  v_yamux,  'vendor/yamux/Cargo.toml'),
     ('vendor/russh/README-FRP-RS.md',  r'(?:Vendored|vendors|crates\.io)\s+`?russh`?\s*([0-9]+\.[0-9]+\.[0-9]+)',  v_russh,  'vendor/russh/Cargo.toml'),

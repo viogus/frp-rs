@@ -396,7 +396,7 @@ impl ServerConfig {
     /// `svrCfg = &v1.ServerConfig{}` (`pkg/config/load.go:313`), unmarshals the
     /// file into that, and completes **it** (`load.go:318-321`); the
     /// pflag-bound `serverCfg` is never completed and is dropped, which is why
-    /// Go ignores the flags in that lane (`frp-core/src/cli.rs:3454-3461` records the
+    /// Go ignores the flags in that lane (`frp-core/src/cli.rs:6093-6095` records the
     /// same rule: flags apply only when `cfgFile == ""`). frp-rs mirrors both
     /// lanes — on `-c` it also ignores the flags, and on its override lane it
     /// overlays and *then* completes: the same **order** as Go's flags-only path,

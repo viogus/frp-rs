@@ -645,7 +645,7 @@ pub fn frps_binary() -> String {
 }
 
 /// The listener line `frp-server/src/dashboard.rs` emits **after** its
-/// `TcpListener::bind` succeeds (`dashboard.rs:3772` plain, `:3759` TLS). It is
+/// `TcpListener::bind` succeeds (`dashboard.rs:3786` plain, `:3773` TLS). It is
 /// a plain byte string in a `--features dashboard` artifact and absent from a
 /// no-dashboard one — measured at the head of `fix/harness-hazards` across
 /// `cargo test -p frps`: `grep -ac` 1 → 0 and `strings | grep -c` 2 → 0 (the

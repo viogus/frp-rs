@@ -822,10 +822,10 @@ What the walk does **not** reach, each cell measured on Go frp v0.71.0
   `local_port`/`remote_port` is legacy-shaped too, in the one format whose
   loader passes the dialect down (`normalize_client_config` takes a
   `ConfigFormat`, and the file path hands it `Ini` —
-  `frp-core/src/config/file.rs:123` passes it to `load_config_from_file`, which
-  detects the extension at `frp-core/src/config/normalize.rs:600` and applies it
-  at `:631`; the TOML-from-string path passes `ConfigFormat::Toml`,
-  `frp-core/src/config/loader.rs:180`) — is fed through the
+  `frp-core/src/config/file.rs:127` passes it to `load_config_from_file`, which
+  detects the extension at `frp-core/src/config/normalize.rs:630` and applies it
+  at `:664`; the TOML-from-string path passes `ConfigFormat::Toml`,
+  `frp-core/src/config/loader.rs:186`) — is fed through the
   same check, but with Go's accept-and-ignore semantics rather than the v1
   surface's rejection: the legacy collector folds the prefix mechanisms Go reads
   (`meta_*` → `metadatas`, `header_*` → `headers` for `type = "http"`,

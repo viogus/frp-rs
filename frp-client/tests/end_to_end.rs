@@ -117,7 +117,7 @@ async fn test_e2e_tcp_proxy_encrypted() {
 /// `websocket` gates the `WebSocket`/`Wss` arms of `propose_mux_for_transport`
 /// (frp-client/src/control.rs:39-42) and of the V2 `transport_name` maps
 /// (frp-client/src/control.rs:309-311, :401-403, :429-431). This test leaves
-/// `tcp_mux` at its default, on (frp-core/src/config/client.rs:566). Gated, the
+/// `tcp_mux` at its default, on (frp-core/src/config/client.rs:655). Gated, the
 /// target is 6 passed / 0 failed with no features, and 7 passed / 0 failed with
 /// default features.
 #[cfg(feature = "websocket")]

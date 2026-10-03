@@ -7,7 +7,7 @@
 //! - KCP dead link detection
 //!
 //! The real `frp_core::xtcp_p2p` module only exists under frp-core's `kcp`
-//! feature (frp-core/src/lib.rs:101); the feature-off stub (lib.rs:114)
+//! feature (frp-core/src/lib.rs:102); the feature-off stub (lib.rs:115)
 //! provides none of `punch_udp_hole`, `xtcp_p2p_connect`,
 //! `punch_udp_hole_makehole_owned` or `xtcp_p2p_connect_quic`, and its
 //! `conv_from_sid` returns 0, which the two `test_conv_from_sid_*`

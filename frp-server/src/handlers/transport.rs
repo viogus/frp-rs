@@ -15,7 +15,7 @@ use frp_core::transport::accept_websocket;
 use frp_core::transport::{IoStream, PreReadStream};
 // Round 6 (feature-matrix cleanup): split cfg — `accept_websocket` is used
 // only from `handle_websocket_connection` (cfg websocket), while
-// `accept_websocket_from_peeked` (TLS+WS upgrade, transport.rs:297) and
+// `accept_websocket_from_peeked` (TLS+WS upgrade, transport.rs:227) and
 // `RwLockExt` (read_ok in `handle_tls_connection`, cfg tls) live inside the
 // TLS handler. The old `any(tls, websocket)` gates warned unused on a
 // websocket-only build (no tls → whole TLS handler configured out); the
@@ -1568,7 +1568,7 @@ where
 /// (already logged). `addr` is `None` for listeners that don't capture peer addr.
 ///
 /// Round 6 (LOW B4): the gate was websocket-only, but the QUIC accept path
-/// (transport.rs:1729) and all 8 KCP accept paths (service.rs) call this —
+/// (transport.rs:1670) and all 8 KCP accept paths (service.rs) call this —
 /// `cargo check -p frp-server --no-default-features --features quic` failed
 /// to compile (E0425). Gate covers every calling transport.
 #[cfg(any(feature = "websocket", feature = "kcp", feature = "quic"))]

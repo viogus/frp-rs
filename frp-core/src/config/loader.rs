@@ -509,7 +509,7 @@ pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS: &str = "web_server.tls.ena
 ///
 /// **Two variants, selected by the `tls` feature**, because the certificate
 /// clauses are false in a build with no TLS: `frp-server`'s whole acceptor block
-/// is `#[cfg(feature = "tls")]` (`frp-server/src/service.rs:603`) while this
+/// is `#[cfg(feature = "tls")]` (`frp-server/src/service.rs:644`) while this
 /// warning is not, and `release.yml` ships `frps-micro` / `frps-tiny` (tiny keeps
 /// `tls`; **micro does not**). Measured on a real `frps-micro`
 /// (`/tmp/tls-warn-probe/run-micro.sh`): `tls_enable = true` + only
@@ -538,8 +538,8 @@ pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS: &str = "web_server.tls.ena
 /// "tls" (command-line)` → `frp-client feature "tls"`); the same command with
 /// `-i frp-server` shows frp-server's only branch as `frps feature "micro"
 /// (command-line)`, with no `tls` feature. That binary gates the acceptor off
-/// (`frp-server/src/service.rs:603` is `#[cfg(feature = "tls")]`, with the
-/// no-acceptor branch at `:635`), so this variant's certificate clauses would
+/// (`frp-server/src/service.rs:644` is `#[cfg(feature = "tls")]`, with the
+/// no-acceptor branch at `:676`), so this variant's certificate clauses would
 /// describe a path it cannot take. Every lane builds at the
 /// workspace root with `tiny`/`micro`
 /// (`.github/workflows/release.yml:100/102/108/110/159/162/210/213` and
@@ -864,20 +864,20 @@ impl ConfigPresence {
     /// `normalize_server_config` flattens `[common]` into the top level and then
     /// *synthesizes* `tls_enable = true` from the legacy `[transport.tls]`
     /// section when it carries `force = true`, `certFile` or `keyFile`
-    /// (`frp-core/src/config/normalize.rs:865-884`, `table.entry(…).or_insert(…)`),
+    /// (`frp-core/src/config/normalize.rs:914-933`, `table.entry(…).or_insert(…)`),
     /// so after normalization a written key and a synthesized one are
     /// indistinguishable.
     ///
     /// Three spellings count, one of them conditionally (see the next
     /// paragraph). `[common]`'s flatten is
     /// `table.entry(k).or_insert(v)` **on the whole value**
-    /// (`frp-core/src/config/normalize.rs:652-655`), so a written top-level key
+    /// (`frp-core/src/config/normalize.rs:701-704`), so a written top-level key
     /// wins over a written `[common]` one — either way the key was **written**
     /// and the flag is `true`. An `includes` file counts too:
     /// `process_includes` deep-merges before this runs. The `[transport.tls]`
     /// lift renames five Go keys
     /// (`force`/`certFile`/`keyFile`/`trustedCaFile`/`serverName`, the match at
-    /// `frp-core/src/config/normalize.rs:869-878`) and passes every other key
+    /// `frp-core/src/config/normalize.rs:918-927`) and passes every other key
     /// through unchanged, so a literal `tls_enable` written *inside* that section
     /// is hoisted onto the same inert field — a third written spelling, measured
     /// on the v0.71.0 `frps`: `tls_enable = "yes"` there fails with
@@ -904,8 +904,8 @@ impl ConfigPresence {
     /// `known_server_keys()`, so the lenient loader silently drops the key and
     /// the strict one refuses it. `[transport.tls] enable` never matches either:
     /// the **server** lift has no `"enable"` arm
-    /// (`frp-core/src/config/normalize.rs:869-878`; only the **client** lift maps
-    /// it, at `frp-core/src/config/normalize.rs:1429-1437`), so it stays a
+    /// (`frp-core/src/config/normalize.rs:918-927`; only the **client** lift maps
+    /// it, at `frp-core/src/config/normalize.rs:1486-1494`), so it stays a
     /// top-level key literally named `enable`. Neither is a documented spelling.
     pub(super) fn server_tls_enable_set_in(value: &toml::Value) -> bool {
         let Some(table) = value.as_table() else {

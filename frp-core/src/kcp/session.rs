@@ -749,7 +749,7 @@ impl KcpSession {
                     // `recv_buf[..n].to_vec()` copy is gone. The channel
                     // message owns the allocation. `size` is bounded by the
                     // reassembly window (`(KCP_WND_RCV-1) * mss`, see
-                    // session.rs:364), so a hostile peer cannot inflate it.
+                    // session.rs:416), so a hostile peer cannot inflate it.
                     //
                     // Read-side pool (M4): the buffer is drawn from the
                     // shared chunk pool (the same pool KcpWriter draws
