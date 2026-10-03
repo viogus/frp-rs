@@ -10555,7 +10555,7 @@ section; ledger now **24 open / 104 closed**.**
 
   Evidence (measured; the two files that decide the outcome are byte-identical to the base):
   - `cargo test -p frp-server --no-default-features --features dashboard --lib -j 2` → `test result: FAILED. 358 passed; 1 failed`, with `dashboard::v2::tests::test_serverinfo_go_shape` panicking at `frp-server/src/dashboard.rs:3064:17` (`missing Go key kcpBindPort`).
-  - `frp-server/src/dashboard.rs:3044-3062` demands the full Go key set including `kcpBindPort` and `quicBindPort`, while the response field at `frp-server/src/dashboard.rs:252-254` carries `#[cfg(feature = "kcp")]` (and `:1648-1650` the `quic` twin), so neither key can exist in a build without that feature; the fixture is `frp_core::config::ServerConfig::default()` (`frp-server/src/dashboard.rs:2953`).
+  - `frp-server/src/dashboard.rs:3044-3062` demands the full Go key set including `kcpBindPort` and `quicBindPort`, while the response field at `frp-server/src/dashboard.rs:252-254` carries `#[cfg(feature = "kcp")]` (and `:1651-1653` the `quic` twin), so neither key can exist in a build without that feature; the fixture is `frp_core::config::ServerConfig::default()` (`frp-server/src/dashboard.rs:2953`).
   - Pre-existing, measured at the base commit: `git worktree add --detach /private/tmp/batch-q-base b9af37c5` + `CARGO_TARGET_DIR=/private/tmp/tgt-basecheck cargo test -p frp-server --no-default-features --features dashboard --lib -j 2 -- dashboard::v2::tests::test_serverinfo_go_shape` → `FAILED. 0 passed; 1 failed; 356 filtered out`, the same `missing Go key kcpBindPort` panic at `frp-server/src/dashboard.rs:3064:17` (cold build, 1 m 52 s, macOS arm64, `-j 2`). The file-identity check agrees: `git diff b9af37c5 -- frp-server/src/dashboard.rs frp-core/src/config/server.rs` is empty, and `git show b9af37c5:frp-server/src/dashboard.rs` carries the same ungated key list. CI never runs the lane unfiltered — `.github/workflows/ci.yml:1642`, `:1541` and `:1559` run `-p frp-server --no-default-features --features dashboard --lib` with a `web_server_tls_enable_reader` filter, so this test is filtered out of every job that uses that shape.
 
   **Done-when:** that shape is green — either the test's Go-key list is `#[cfg]`-gated on the features this build compiles in (leaving the full list for the default-feature lane) or the lane is declared unsupported with the reason recorded next to it — and `.github/workflows/ci.yml` runs it without a filter at least once, so the shape is covered rather than assumed.
@@ -11000,11 +11000,13 @@ other.
   started` never appears; the flag prints 0 records and the file key 0 records; a default-features `frps`
   control shows the same probe does find its listener (`KCP listener started on 0.0.0.0:<p>`, one UDP socket);
   and `--no-default-features --features tiny` alone rejects the flag with `Error: --kcp-bind-port is not
-  expected in this context` while still warning on the file key (1 record). The same holds for `frp-core/quic`
-  and `frp-core/websocket`, so the residue is three spellings, not one. It is unreachable from any `frps` build
-  the project's own feature names produce, and no CI lane builds an `frps` binary in those combinations: only
-  `frp-server`'s own `--all-targets` lanes reach the shape (`.github/workflows/ci.yml:3526`, `:3751`, `:3802`,
-  through their `frp-client` dev-dependency) — which is why the M-6 fix landed as recorded wording (the reader
+  expected in this context` while still warning on the file key (1 record). The same holds for `frp-core/quic`;
+  `frp-core/websocket` has no CLI flag at all (there is no `--websocket-port`), so only its `websocket_port`
+  file key is silent there — the flag half of the residue is two spellings, the file-key half three. It is
+  unreachable from any `frps` build the project's own feature names produce, and no CI lane builds an `frps`
+  binary in those combinations: only `frp-server`'s own `--all-targets` lanes reach the shape
+  (`.github/workflows/ci.yml:3526`, `:3751`, `:3764`, `:3802`, `:3941`, `:3942`, through their `frp-client`
+  dev-dependency) — which is why the M-6 fix landed as recorded wording (the reader
   rule and the `AppliedReaderGatedPorts` doc both name the gap) rather than as a gate.
 
   **Done-when:** the answer to "does this build read the port" comes from the crate that owns the listener — a
