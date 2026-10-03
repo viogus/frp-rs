@@ -10815,7 +10815,7 @@ other.
   **Done (2026-10-03, at `fed07b26` on `dsh/large-functions-locator-guard`, squash-merged as `26e7a174`, PR #470, based on `5682fe6c`) — both spellings gate.**
   `scripts/large-functions.sh` gained a cross-line span walk (`attribute_span` / `cfg_predicate` / `is_test_gate_run`), `attribute_run` falls back to it when
   `closing_bracket` returns −1, and `test_blocks`' candidate test became `if flags[i] or not is_test_gate_run(lines, i):`. A span that would walk through a
-  line-spanning block comment, a raw string or a backslash-continued ordinary string is **declined** (the three constructs the region scan tracks), and a span
+  multi-line raw string, a line-spanning block comment or a backslash-continued ordinary string is **declined** (the three constructs the region scan tracks), and a span
   that cannot be closed falls back to the line-local path, so the new reach cannot swallow a production item; `cfg_attribute` / `gate_tail_ok` / `cfg_implies_test` / `is_test_gate` are byte-identical, so every pre-existing mutant witness still binds.
   Measured with the branch script against the base script in the same tree: the wrapped predicate reads `10 10 0` → `1 10 9`, and the packed
   `#[path = "pk/packed_helper.rs"] #[cfg(test)]` shape reads `3 3 0` with its helper at `4 4 0` → `1 3 2` / `0 4 4`. Fixtures and mutants now cover both:
