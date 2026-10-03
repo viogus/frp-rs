@@ -375,6 +375,33 @@ impl ListenerPortReader {
     }
 }
 
+/// The reader-gated listener **ports** a CLI overlay actually applied.
+///
+/// The config-file path resolves the same question inside
+/// [`ConfigPresence::from_normalized_value`] (`sub_port_requested`, which counts
+/// only a **non-zero** port). The CLI overlay, however, runs *after* that load —
+/// `FrpsArgs::override_server_config` writes `cfg.web_server.port` directly — so
+/// its writes are a second source of the same request and have to be merged into
+/// the same presence flag. Without that, `frps --dashboard-port 7500` (with no
+/// `-c`/`--config-dir`) binds no dashboard and says nothing, while the identical
+/// `[web_server] port = 7500` in a file warns.
+///
+/// **The whole family, enumerated**, because `web_server.port` is not obviously
+/// alone: `web_server.port` is reachable from the overlay through
+/// `--dashboard-port`, which `svr_dashboard` registers on **every** shape, so
+/// flag and warning are always reachable together. The other reader-gated ports
+/// cannot be applied by the overlay at all — `ssh_tunnel_gateway.bind_port` and
+/// `websocket_port` have no CLI flag, and `--kcp-bind-port`/`--quic-bind-port`
+/// exist only under `cfg(feature = "kcp")`/`cfg(feature = "quic")`, so in the
+/// shapes whose reader is compiled out they are an unknown-flag error rather
+/// than a silent ignore.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AppliedReaderGatedPorts {
+    /// A **non-zero** `--dashboard-port` wrote `web_server.port`, whose only
+    /// reader is `frp-server`'s `dashboard` feature.
+    pub web_server_port: bool,
+}
+
 /// The `[web_server.tls] enable` diagnostic for a build that **compiles a
 /// dashboard**, in one place so `frps` and `frpc` cannot drift. Callers gate it
 /// on [`ConfigPresence::web_server_tls_enable_set`]; it is emitted **after**
@@ -1035,6 +1062,19 @@ impl ConfigPresence {
         if self.web_server_tls_enable_set {
             tracing::warn!("{}", reader.warning());
         }
+    }
+
+    /// Record the reader-gated listener ports a **CLI overlay** applied, so the
+    /// overlay's writes are reported by the same
+    /// [`Self::warn_inert_web_server_port`] path as the config file's.
+    ///
+    /// The caller is `frps`, between the `cli.cli_overrides_enabled()` overlay
+    /// and the `warn_inert_*` calls (see `frps/src/main.rs`), and the argument is
+    /// what `FrpsArgs::override_server_config` reports it wrote — never a value
+    /// derived from the overlay's absence. See [`AppliedReaderGatedPorts`] for
+    /// why `web_server.port` is the only port this can carry.
+    pub fn record_applied_reader_gated_ports(&mut self, applied: AppliedReaderGatedPorts) {
+        self.web_server_port_unhonoured |= applied.web_server_port;
     }
 
     /// Emit the `web_server.port` record when the file named a **non-zero** port

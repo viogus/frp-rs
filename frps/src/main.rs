@@ -1034,7 +1034,7 @@ async fn run(mut cli: FrpsArgs) {
     // `--bind-addr`; measured end to end in `docs/developing.md` § CLI inputs
     // § 2b).
     let config_path = cli.config_path();
-    let (mut cfg, presence) =
+    let (mut cfg, mut presence) =
         match load_server_config_uncompleted_with_presence(&config_path, cli.strict_config) {
             Ok(loaded) => loaded,
             Err(e) => {
@@ -1058,7 +1058,14 @@ async fn run(mut cli: FrpsArgs) {
     // Without `-c`, CLI flags override the default frps.toml (frp-rs
     // extension; Go frps would use only flags in that mode).
     if cli.cli_overrides_enabled() {
-        cli.override_server_config(&mut cfg);
+        let applied = cli.override_server_config(&mut cfg);
+        // The load above recorded the *file's* reader-gated port requests; the
+        // overlay just wrote `cfg.web_server.port` directly, which no loader can
+        // see. Merge that second source into the same presence flags, otherwise
+        // `frps --dashboard-port 7500` (no `-c`/`--config-dir`) binds no
+        // dashboard and says nothing while the same key in a file warns. The
+        // record is emitted below, after `init_logging`, like every other one.
+        presence.record_applied_reader_gated_ports(applied);
     }
     // Completion runs on the merged config, never before it (Go order).
     cfg.complete();
