@@ -18,24 +18,38 @@
 # here instead of silently testing nothing — a fixture whose subject vanished
 # must not pass vacuously.
 #
-# Scenarios (the classification table is ten checks; the rest are one each):
-#   1..10 classification: readiness/timeout reasons are re-drivable; a protocol
-#         answer from a live peer (MISMATCH, CONNECT_RESPONSE) and any other
-#         assertion are not.
-#   11    a readiness failure that does not recur: 2 attempts, 1 passed,
+# The classification rule this pins (review round 1, finding A1): a
+# `FAIL:<class>` verdict is refused **wherever it appears** except a bare or
+# labelled `FAIL:CONNECT_TIMEOUT`/`FAIL:TIMEOUT`, so a `FAIL:MISMATCH` whose
+# payload *quotes* "not reachable" is not re-driven; and the prose readiness
+# phrases are end-anchored, so a message that merely mentions unreachability
+# mid-string is not either.
+#
+# Scenarios (the classification table is thirteen checks; the rest are one each):
+#   1..13 classification: prose readiness gates (`not reachable`, `did not
+#         start`, `not listening`, with and without a trailing parenthetical)
+#         and the two timeout verdicts are re-drivable; a `FAIL:MISMATCH` whose
+#         payload quotes "not reachable", a `FAIL:CONNECT_RESPONSE`, a
+#         mid-string mention of unreachability and other assertions are not.
+#   14    a readiness failure that does not recur: 2 attempts, 1 passed,
 #         0 failed, RETRIED_PASS=1 and no leftover failure record.
-#   12    a readiness failure that recurs on the clean re-drive: bounded to
+#   15    a readiness failure that recurs on the clean re-drive: bounded to
 #         2 attempts and reported exactly once — the bound, and no double count.
-#   13    FAIL:MISMATCH is never re-driven.
-#   14    FAIL:CONNECT_RESPONSE is never re-driven.
-#   15    FRP_COMPAT_RETRY_MAX=0 disables the re-drive.
-#   16    a clean pass runs once and is not marked as retried.
-#   17    a withdrawn attempt's `pass_test` is withdrawn with it (no double
+#   16    the adversarial case end-to-end: a scenario failing with
+#         `FAIL:MISMATCH expected='proxy port 1 not reachable'` is **not**
+#         re-driven — 1 attempt, 1 failure, RETRIED_PASS=0.
+#   17    FAIL:CONNECT_RESPONSE is never re-driven.
+#   18    FAIL:CONNECT_TIMEOUT is still re-driven and absorbed.
+#   19    FAIL:TIMEOUT is still re-driven and absorbed.
+#   20    FRP_COMPAT_RETRY_MAX=0 disables the re-drive.
+#   21    a clean pass runs once and is not marked as retried.
+#   22    a withdrawn attempt's `pass_test` is withdrawn with it (no double
 #         count on PASS).
-#   18    an attempt with *any* non-readiness failure among its reasons is not
+#   23    an attempt with *any* non-readiness failure among its reasons is not
 #         re-driven, even when another reason is readiness-class.
-#   19    the harness refuses a non-numeric `FRP_COMPAT_RETRY_MAX` up front,
+#   24    the harness refuses a non-numeric `FRP_COMPAT_RETRY_MAX` up front,
 #         driving the real file rather than an extraction.
+#   25    the harness refuses a value over the hard cap up front, too.
 #
 # Residue, declared rather than denied: `scripts/compat-test.sh` is unpinned
 # (the port-ownership step records the same for its structural probes), so a
@@ -60,7 +74,7 @@ checks=0
 fails=0
 # Pinned total: `exit "$fails"` alone is happy with a suite that silently stops
 # checking, so the floor is enforced from the exit trap on every path.
-MIN_CHECKS=19
+MIN_CHECKS=25
 
 ok()  { checks=$((checks + 1)); printf '  ok    %s\n' "$1"; }
 bad() { checks=$((checks + 1)); fails=$((fails + 1)); printf '  FAIL  %s\n' "$1"; }
@@ -99,6 +113,7 @@ PASS=0
 FAIL=0
 FAILURES=()
 RETRY_MAX=1
+RETRY_MAX_CAP=5
 RETRIED_PASS=0
 _ATTEMPT_FAILURES=()
 CI=false
@@ -144,16 +159,19 @@ done <<'CASES'
 yes|proxy port 20403 not reachable
 yes|tcpmux port 22001 not reachable
 yes|VHost HTTP port 19286 not reachable
+yes|proxy port 22335 not reachable (auth rejection false positive?)
 yes|Rust frps did not start
 yes|Go frps did not start
+yes|Go frps WSS port 22001 not listening
 yes|FAIL:CONNECT_TIMEOUT
 yes|FAIL:TIMEOUT
-no|FAIL:MISMATCH expected='a' got='b'
+no|FAIL:MISMATCH expected='proxy port 1 not reachable' got='b'
 no|FAIL:CONNECT_RESPONSE b'CONNECT x:22 HTTP/1.1\r\n'
+no|peer answered: not reachable
 no|expected SSH banner starting with 'SSH-', got: BANNER_ERROR
 CASES
 
-# 11. readiness failure, clean on the re-drive.
+# 14. readiness failure, clean on the re-drive.
 scn_late_once() {
   ATTEMPTS=$((ATTEMPTS + 1))
   if (( ATTEMPTS == 1 )); then
@@ -171,7 +189,7 @@ else
   bad "readiness re-drive bookkeeping (attempts=$ATTEMPTS pass=$PASS fail=$FAIL retried=$RETRIED_PASS failures=${#FAILURES[@]})"
 fi
 
-# 12. readiness failure on both attempts: bounded, reported once.
+# 15. readiness failure on both attempts: bounded, reported once.
 scn_late_always() {
   ATTEMPTS=$((ATTEMPTS + 1))
   fail_test late-always "proxy port 1 not reachable"
@@ -185,20 +203,22 @@ else
   bad "recurring readiness failure (attempts=$ATTEMPTS pass=$PASS fail=$FAIL failures=${#FAILURES[@]})"
 fi
 
-# 13. a protocol assertion is never re-driven.
-scn_mismatch() {
+# 16. review round 1, A1: a deterministic MISMATCH whose payload quotes the
+#     retryable phrase must not be re-driven, and must not be counted twice.
+scn_mismatch_quoting_readiness() {
   ATTEMPTS=$((ATTEMPTS + 1))
-  fail_test mismatch "FAIL:MISMATCH expected='a' got='b'"
+  fail_test mismatch "FAIL:MISMATCH expected='proxy port 1 not reachable' got='b'"
 }
 reset_run 1
-run_test scn_mismatch >/dev/null 2>&1
-if [ "$ATTEMPTS" = 1 ] && [ "$FAIL" = 1 ] && [ "$RETRIED_PASS" = 0 ]; then
-  ok 'FAIL:MISMATCH is not re-driven: 1 attempt'
+run_test scn_mismatch_quoting_readiness >/dev/null 2>&1
+if [ "$ATTEMPTS" = 1 ] && [ "$FAIL" = 1 ] && [ "$PASS" = 0 ] &&
+   [ "$RETRIED_PASS" = 0 ] && [ "${#FAILURES[@]}" = 1 ]; then
+  ok "a MISMATCH quoting 'not reachable' is not re-driven: 1 attempt, 1 failure"
 else
-  bad "MISMATCH re-driven (attempts=$ATTEMPTS fail=$FAIL)"
+  bad "MISMATCH quoting readiness was re-driven (attempts=$ATTEMPTS pass=$PASS fail=$FAIL retried=$RETRIED_PASS)!"
 fi
 
-# 14. a live peer's CONNECT answer is never re-driven.
+# 17. a live peer's CONNECT answer is never re-driven.
 scn_connectres() {
   ATTEMPTS=$((ATTEMPTS + 1))
   fail_test connres "FAIL:CONNECT_RESPONSE b'CONNECT x:22 HTTP/1.1'"
@@ -211,7 +231,41 @@ else
   bad "CONNECT_RESPONSE re-driven ($ATTEMPTS attempts)"
 fi
 
-# 15. the bound is a knob: 0 disables the re-drive.
+# 18. FAIL:CONNECT_TIMEOUT is still the retryable class.
+scn_connect_timeout() {
+  ATTEMPTS=$((ATTEMPTS + 1))
+  if (( ATTEMPTS == 1 )); then
+    fail_test connect-timeout "FAIL:CONNECT_TIMEOUT"
+  else
+    pass_test connect-timeout
+  fi
+}
+reset_run 1
+run_test scn_connect_timeout >/dev/null 2>&1
+if [ "$ATTEMPTS" = 2 ] && [ "$PASS" = 1 ] && [ "$FAIL" = 0 ] && [ "$RETRIED_PASS" = 1 ]; then
+  ok 'FAIL:CONNECT_TIMEOUT is still re-driven and absorbed'
+else
+  bad "FAIL:CONNECT_TIMEOUT (attempts=$ATTEMPTS pass=$PASS fail=$FAIL retried=$RETRIED_PASS)"
+fi
+
+# 19. FAIL:TIMEOUT is still the retryable class.
+scn_timeout() {
+  ATTEMPTS=$((ATTEMPTS + 1))
+  if (( ATTEMPTS == 1 )); then
+    fail_test timeout "FAIL:TIMEOUT"
+  else
+    pass_test timeout
+  fi
+}
+reset_run 1
+run_test scn_timeout >/dev/null 2>&1
+if [ "$ATTEMPTS" = 2 ] && [ "$PASS" = 1 ] && [ "$FAIL" = 0 ] && [ "$RETRIED_PASS" = 1 ]; then
+  ok 'FAIL:TIMEOUT is still re-driven and absorbed'
+else
+  bad "FAIL:TIMEOUT (attempts=$ATTEMPTS pass=$PASS fail=$FAIL retried=$RETRIED_PASS)"
+fi
+
+# 20. the bound is a knob: 0 disables the re-drive.
 reset_run 0
 run_test scn_late_once >/dev/null 2>&1
 if [ "$ATTEMPTS" = 1 ] && [ "$FAIL" = 1 ] && [ "$RETRIED_PASS" = 0 ]; then
@@ -220,7 +274,7 @@ else
   bad "RETRY_MAX=0 (attempts=$ATTEMPTS fail=$FAIL)"
 fi
 
-# 16. a clean pass is untouched.
+# 21. a clean pass is untouched.
 scn_clean() {
   ATTEMPTS=$((ATTEMPTS + 1))
   pass_test clean
@@ -233,7 +287,7 @@ else
   bad "clean pass (attempts=$ATTEMPTS pass=$PASS retried=$RETRIED_PASS)"
 fi
 
-# 17. a withdrawn attempt's pass is withdrawn with it. The synthetic scenario
+# 22. a withdrawn attempt's pass is withdrawn with it. The synthetic scenario
 #     mirrors a real one: mutually exclusive branches per attempt.
 scn_pass_then_late() {
   ATTEMPTS=$((ATTEMPTS + 1))
@@ -252,7 +306,7 @@ else
   bad "withdrawn pass double counted (attempts=$ATTEMPTS pass=$PASS fail=$FAIL)"
 fi
 
-# 18. one readiness reason among several, one of them a protocol answer: no
+# 23. one readiness reason among several, one of them a protocol answer: no
 #     re-drive at all — the class check is "every reason", not "any reason".
 scn_mixed() {
   ATTEMPTS=$((ATTEMPTS + 1))
@@ -267,17 +321,31 @@ else
   bad "mixed failure re-driven (attempts=$ATTEMPTS fail=$FAIL)"
 fi
 
-# 19. a non-numeric bound is refused before it can reach `(( ))`. This drives
+# 24. a non-numeric bound is refused before it can reach `(( ))`. This drives
 #     the real file, not an extraction: the guard sits between arg parsing and
 #     the binary checks, so no Go frp and no Rust build are needed.
-bad_missing=0
+bad_rc=0
 bad_out=$(FRP_COMPAT_RETRY_MAX='seven' bash "$COMPAT" 2>&1) || bad_rc=$?
-bad_rc=${bad_rc:-0}
 case "$bad_out" in
-  *"FRP_COMPAT_RETRY_MAX must be a non-negative integer"*) bad_missing=1 ;;
+  *"FRP_COMPAT_RETRY_MAX must be a non-negative integer"*) bad_msg=1 ;;
+  *) bad_msg=0 ;;
 esac
-if [ "$bad_rc" = 2 ] && [ "$bad_missing" = 1 ]; then
+if [ "$bad_rc" = 2 ] && [ "$bad_msg" = 1 ]; then
   ok 'a non-numeric FRP_COMPAT_RETRY_MAX exits 2 and names the variable'
 else
-  bad "non-numeric FRP_COMPAT_RETRY_MAX (rc=$bad_rc, message $( [ "$bad_missing" = 1 ] && echo present || echo missing ))"
+  bad "non-numeric FRP_COMPAT_RETRY_MAX (rc=$bad_rc, message $( [ "$bad_msg" = 1 ] && echo present || echo missing ))"
+fi
+
+# 25. review round 1, A4: the knob has a hard ceiling, so a large value cannot
+#     turn a red run into a long (or cancelled) one. Also drives the real file.
+cap_rc=0
+cap_out=$(FRP_COMPAT_RETRY_MAX="$((RETRY_MAX_CAP + 1))" bash "$COMPAT" 2>&1) || cap_rc=$?
+case "$cap_out" in
+  *"FRP_COMPAT_RETRY_MAX must be <= $RETRY_MAX_CAP"*) cap_msg=1 ;;
+  *) cap_msg=0 ;;
+esac
+if [ "$cap_rc" = 2 ] && [ "$cap_msg" = 1 ]; then
+  ok "a FRP_COMPAT_RETRY_MAX above the cap ($RETRY_MAX_CAP) exits 2 and names the cap"
+else
+  bad "over-cap FRP_COMPAT_RETRY_MAX (rc=$cap_rc, message $( [ "$cap_msg" = 1 ] && echo present || echo missing ))"
 fi

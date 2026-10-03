@@ -312,16 +312,21 @@ async fn exec_token_source_runs_once_across_logins_and_reloads() {
     let dir = tempfile::tempdir().expect("tempdir");
     let script_path = unique_token_script_path(dir.path());
     std::fs::write(&script_path, EXEC_SCRIPT).expect("write exec script");
-    // Robustness to a *busy* script file, asserted rather than assumed: on
-    // Linux `execve` refuses a file that another process holds open for
-    // writing (ETXTBSY, the flake this test's unit twin hit). The token source
-    // here runs `sh <script>`, so the script is only ever opened for reading
-    // and a writer elsewhere must not matter. Holding this file open for
-    // writing for the whole test is that condition made deterministic: if frpc
-    // ever execs the script itself instead of `command = "sh"`, the first
-    // resolution fails with ETXTBSY and the "exactly once" assertions below
-    // fail loudly. The handle is deliberately kept alive past the last
-    // assertion, so it covers every resolution the test drives.
+    // A *busy* script file, held open for writing for the whole test: on Linux
+    // `execve` refuses a file another process holds open for writing (ETXTBSY,
+    // the flake this test's unit twin hit), so the writer is that class's real
+    // precondition. The disclosure is exact, because the tooth is not this
+    // handle: this test resolves the token by running `command = "sh"` with the
+    // script as an *argument*, and at this file's 0644 mode a source that exec'd
+    // the script itself fails with EACCES on either platform (measured on this
+    // tree's dev host), whatever the writer is doing. So the busy handle is a
+    // condition this path tolerates, not the detection — and macOS does not
+    // enforce ETXTBSY at all (same measurement: a 0755 script with a live writer
+    // execs fine). A regression that execs the script instead of `sh` still
+    // reds, via EACCES, on both platforms; the ETXTBSY window itself is
+    // Linux-only and is covered by the errno-driven unit twin in
+    // `frp-core/src/auth.rs`. The handle is deliberately kept alive past the
+    // last assertion, so it spans every resolution the test drives.
     let _busy_writer = std::fs::OpenOptions::new()
         .write(true)
         .open(&script_path)

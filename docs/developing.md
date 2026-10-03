@@ -1488,19 +1488,26 @@ A flaky test is a bug in the test's timing assumptions, not a re-run button:
 fix it (per-invocation names, a retry bounded to the specific transient, the
 original assertion kept) instead of learning to ignore it.
 
-That fix now exists for the readiness class. `scripts/compat-test.sh` re-drives a
-scenario **once** (`FRP_COMPAT_RETRY_MAX`, default `1`; `0` disables it) when —
-and only when — every failure the attempt recorded was a readiness gate or a
-timed-out dial (`is_readiness_failure`: `not reachable`, `did not start`,
-`not listening`, `FAIL:CONNECT_TIMEOUT`, `FAIL:TIMEOUT`). The re-drive starts
+The harness now absorbs that class instead of failing on it.
+`scripts/compat-test.sh` re-drives a scenario **once** (`FRP_COMPAT_RETRY_MAX`,
+default `1`; `0` disables it; anything above the hard cap `5` is refused with rc
+2) when — and only when — every failure the attempt recorded was a readiness
+gate: a prose reason ending in `not reachable` / `not listening` after the port
+it waited on, or `did not start`, or a bare/labelled `FAIL:CONNECT_TIMEOUT` /
+`FAIL:TIMEOUT`. **Any other `FAIL:<class>` verdict is refused**, so a
+`FAIL:MISMATCH` whose payload merely quotes "not reachable" is never re-driven —
+that verdict is a *deterministic* answer from a live peer, and re-running it
+would only turn a real protocol regression into a coin flip. The re-drive starts
 from a clean slate (the attempt's servers reaped, its scratch directory removed)
-and re-asserts the whole scenario, so a real regression fails the second attempt
-too and is reported once. A `FAIL:MISMATCH` or a `FAIL:CONNECT_RESPONSE` — an
-answer from a live peer — is never re-driven. A green run that leaned on the
-re-drive says so: `[RETRY]` at the scenario and `RETRIED:` in the summary. The
-classification, the bound and the bookkeeping are driven in the `health` job by
+and re-asserts the whole scenario, so a deterministic failure fails the second
+attempt too and is reported once. A green run that leaned on the re-drive says
+so: `[RETRY]` at the scenario and `RETRIED:` in the summary. The classification,
+the bound and the bookkeeping are driven in the `health` job by
 `scripts/tests/compat-scenario-retry.sh`, because none of them is visible from a
-green run.
+green run. **This is a bounded recovery, not an identified cause**: the named
+subset was looped 210 times on an idle host with no flake reproduced, so what is
+established is that a run no longer fails on the readiness class — nothing about
+*why* a listener is late, and nothing that closes the compat-gate item.
 
 **The practical rules:**
 
