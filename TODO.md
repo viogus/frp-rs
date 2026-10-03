@@ -10755,7 +10755,7 @@ section; ledger now **24 open / 104 closed**.**
 
   **Done-when:** the harness cannot give two listeners in one scenario the same port — by reserving each port for the life of the scenario, or by making the pick reject ports already allocated in that scenario — and the readiness probe fails closed when the socket that answers is not the process that was just launched; with the forced-collision run above red before the change (the same three symptoms as attempt 1 of run `37015704902`) and green after, a forced `echo_port="$proxy_port"` collision no longer passing, and `scripts/lib/compat-stray-guard.sh` and its fixture suite unweakened. If instead the leak path is the real one, the Done-when is the same bar applied to teardown: no listener from scenario *n* may still hold a port when scenario *n+1* picks one.
 
-- [ ] **`docs/config.md:3-4` still claims a 1:1 Go mapping the gate now measures against.**
+- [x] **`docs/config.md:3-4` still claims a 1:1 Go mapping the gate now measures against.**
 
   Filed by the M-1 records round (PR #466). The page opens "Every field maps 1:1 to a Go frp v0.71.0 equivalent", but
   `scripts/tests/docs-go-column.sh` classifies 49 rows as *recorded doc aliases* rather than Go v0.71.0 spellings and 10 rows as
@@ -10764,8 +10764,19 @@ section; ledger now **24 open / 104 closed**.**
 
   **Done-when:** the opening sentence states what the column actually asserts, or names the alias and divergence rows it exempts —
   and the gate's inventory (`EXPECTED_ALIAS_ROWS=49`, `EXPECTED_DIVERGENT=10`) still reds on an unrecorded row.
+  **Done (2026-10-03, at `0c7e7796` on `dsh/go-column-measured`, squash-merged as `d2c296cc`, PR #472, based on `cc4337da`) — the opening states what the column asserts.**
+  `docs/config.md:3-4` now reads that each row's **Go frp Equivalent** cell names the Go frp v0.71.0 `json` key the field
+  corresponds to, or carries a `—` marker recording that frp-rs extends or diverges from Go (or one of the three documented
+  non-token shapes `**Required.**`, `` `sk` / `secretKey` ``, `` `transport.wireProtocol = "v2"` ``), and that
+  `scripts/tests/docs-go-column.sh` checks the column row by row against a key set re-derived from `pkg/config/v1`. The
+  replacement is exactly two lines, so the document stays **1071 lines** and every `docs/config.md:<line>` cite — including this
+  item's own `:15` and the two `PINS` at `:22`/`:25` — is unchanged. The Done-when's own inventory literals are superseded by
+  the same commit: validating the aliases emptied the alias table, so `EXPECTED_ALIAS_ROWS` is **49 → 0** and
+  `EXPECTED_DIVERGENT` **10 → 24** (13 recorded extensions plus the direction-split `headers`); it still reds on an unrecorded
+  row (one inserted bogus row → `FAIL inventory: the file under test carries 193 data row(s), expected 192` plus
+  `FAIL docs/config.md:16 row \`bogus_field\` has no recorded Go mapping in ROW_GO_PATHS`, with the `PINS` catching the shift).
 
-- [ ] **The gate's 41 alias entries carry prose reasons that were never individually validated against Go frp v0.71.0.**
+- [x] **The gate's 41 alias entries carry prose reasons that were never individually validated against Go frp v0.71.0.**
 
   Filed by the M-1 records round (PR #466). `ALIASES` in `scripts/tests/docs-go-column.sh` records 41 distinct doc spellings over
   49 rows, each with a hand-written reason; several are demonstrably extension-shaped (`webServer.tlsCertFile`,
@@ -10774,8 +10785,26 @@ section; ledger now **24 open / 104 closed**.**
 
   **Done-when:** every one of the 41 recorded aliases is either repointed to its true Go v0.71.0 `json` path or recorded in
   `docs/config.md` as a deliberate extension or divergence, with the check of each named.
+  **Done (2026-10-03, same head and PR) — all 41 aliases resolved, each with its check named in the document or proved by the key set.**
+  28 aliases are repointed to their true Go `json` paths (`auth.oidcIssuer` → `auth.oidc.issuer`, `auth.oidcClientId` →
+  `auth.oidc.clientID`, `webServer.tlsCertFile` → `webServer.tls.certFile`, `metas` → `metadatas`, `sk`/`secret_key` →
+  `secretKey`, `clientId` → `clientID`, `localIp` → `localIP`, `httpPwd` → `httpPassword`, `tcpMuxPassthrough` →
+  `tcpmuxPassthrough`, `pluginCrtPath` → `crtPath`, `tlsServerName` → `transport.tls.serverName`, …; every target proved
+  present in the re-derived key set). The other 13 (`sudpPort`, `maxConnsPerProxy`, `maxProxiesPerClient`,
+  `auth.authenticationTimeout`, `auth.tokenAuthTimeout`, `auth.oidcSkipAudience`, `auth.oidcSkipNbf`,
+  `auth.oidcAdditionalAudience`, `sshTunnelGateway.bindAddr`, `url`, `timeout`, `enableControl`, the direction-split
+  `headers`) are recorded in `docs/config.md` as extensions whose `—` marker **names the absent spelling** the recorded key set
+  proves absent, so the document itself names the check. `ALIASES` is now empty (the mechanism and its unused-entry check stay)
+  and `ALIAS_RESOLUTION` carries the 41 resolutions as `(resolution, [(table ordinal, field), …])`, each checked against `GO`
+  and against **those rows'** recorded cells. Falsifications that bite: re-appearing an alias spelling reds three ways
+  (`alias \`auth.oidcIssuer\` (repoint:auth.oidc.issuer): the document still carries … as a row cell`, the membership
+  unknown, and `1 recorded row mapping(s) are unused`); an extension marker that stops naming its absent spelling reds; and a
+  repoint attached to the wrong row reds (`FAIL alias \`clientId\` (repoint:bindPort): row table 8 client_id records
+  'go:clientID', not the repointed path \`bindPort\``). Together with the mapping gate that landed in the same commit, this
+  settles the cross-reference filed at `TODO.md:10795-10797` (head `:10839-10841`): every former alias is now either a mapped Go path (checked like any other
+  row) or an extension marker the key set proves absent, so neither item narrows the other.
 
-- [ ] **The gate's 261-spelling `GO` table is trusted, not measured.**
+- [x] **The gate's 261-spelling `GO` table is trusted, not measured.**
 
   Filed by the M-1 records round (PR #466). The fixture header records the provenance (Go frp's annotated tag `v0.71.0` is object
   `40adeed73b51e7ee1766d7cfb15d02ba9431ba2b`, pointing at commit `4a23aa181c1d7e28eecaa8216024ed753b9d27c8`), but the
@@ -10784,8 +10813,23 @@ section; ledger now **24 open / 104 closed**.**
 
   **Done-when:** re-deriving `GO` from the recorded tag and commit is a scripted step whose output is diffed against the embedded
   table, and the suite reds when the two disagree.
+  **Done (2026-10-03, same head and PR) — `GO` is measured against a recorded, re-derivable key set.**
+  The 261 spellings now live in `scripts/tests/docs-go-column-go-keys.txt` (sha256
+  `5399ab1fe55f146cf52e0451cadda556302d44930a5f76302189db54fd50645e`, 283 lines) in a byte-stable sorted format, with a
+  provenance header naming the annotated tag `v0.71.0` = object `40adeed73b51e7ee1766d7cfb15d02ba9431ba2b` → commit
+  `4a23aa181c1d7e28eecaa8216024ed753b9d27c8`, the 11 `pkg/config/v1` files scanned, the accept-set definition and the format
+  rule. The scan diffs its embedded `GO` against it. Falsifications that bite: an artifact missing `bindPort` reds three ways
+  (inventory 260/261, bare 152/153, and `the embedded GO table disagrees with the recorded key set (only in GO: \`bindPort\`;
+  only in the artifact: -)`); `GO` gaining `bogusTranscriptionKey` reds `only in GO: …`; a hand-sorted artifact reds "the
+  recorded Go key set is not sorted and duplicate-free". New `scripts/tests/docs-go-column-derive-go-keys.sh`
+  (`8ed27810…`) re-derives the artifact from the pinned tag (`--fetch`) or a checkout (`--source DIR` /
+  `GO_FRP_CONFIG_V1_DIR`) with `--check`/`--write`; with no source it prints `SKIP  no Go frp v0.71.0 source; …` and exits 0,
+  so CI stays offline, while an explicitly supplied source that yields no keys **fails** rc 1 naming the directory, and a
+  key-less `--write` refuses with the artifact unchanged. Re-derived from the real v0.71.0 sources: set-equal
+  (**261 = 108 dotted + 153 bare**), `--fetch --check` → `OK  261 derived key(s) match`, and `--fetch --write` reproduced the
+  committed artifact **byte-for-byte** (`5399ab1f…` before and after).
 
-- [ ] **The Go-column gate checks token membership, not the row→Go-path mapping, so a wrong-but-real Go key passes.**
+- [x] **The Go-column gate checks token membership, not the row→Go-path mapping, so a wrong-but-real Go key passes.**
 
   Filed by the M-1 records round (PR #466). Measured against the delivered suite: mutating `docs/config.md:15`'s Go cell from
   `` `bindPort` `` to `` `quicBindPort` `` — both real Go v0.71.0 keys, both in `GO` — leaves the suite green (exit 0,
@@ -10798,6 +10842,22 @@ other.
 
   **Done-when:** each row's Go cell is checked against an expected path for that row, so swapping in a real-but-wrong Go key reds;
   or the column records per row why membership is all that is being asserted.
+  **Done (2026-10-03, same head and PR) — the row→Go-path mapping is gated, so a wrong-but-real key now reds.**
+  `ROW_GO_PATHS` records the cell each of the 192 rows must carry, keyed by `(table ordinal, field)` (0 collisions, stable
+  under line shifts): `go:<path>`, `qualified:<path>:<shape>`, `divergent`, `extension:<spelling>`, `nontoken:<shape>`. A row
+  with no entry, an entry with no row, and any disagreement each red; every recorded path must also exist in the re-derived key
+  set. The item's recorded falsification now reds: mutating `docs/config.md:15`'s cell from `` `bindPort` `` to
+  `` `quicBindPort` `` was green on the pre-change suite (`RESULT: 204 fixture check(s) hold`, rc 0) and here reports
+  `FAIL  docs/config.md:15 row \`bind_port\`: expected the recorded Go path \`bindPort\`, found \`quicBindPort\``
+  (`RESULT: 257 fixture check(s), 1 failure(s) above`), while `` `kcpPort` ``, a non-key, still reds membership — in-suite
+  **M6** pins the swap and **M7** the membership red, so the two checks are independent. `MIN_CHECKS` 204 → **257** (the suite
+  sha `415836e0…` → `adaa8f7e…` → `f3158f1d…`, pinned as `guard_pin` at `.github/workflows/ci.yml:837`); the new
+  `EXPECTED_GO_KEYS=261` / `EXPECTED_GO_DOTTED=108` / `EXPECTED_GO_BARE=153` / `EXPECTED_ROW_PATHS=192` /
+  `EXPECTED_RESOLUTIONS=41` pin the artifact and the mapping. Disclosed residual (in the commit body): `ROW_GO_PATHS` is
+  recorded assertion data, not a second derivation — a name-normalisation rule was measured against the column and disagrees
+  on 32–73 rows depending on the rule where the column is right (`file` → `log.to`,
+  `bind_port` → `sshTunnelGateway.bindPort`), so the mapping is reviewable data; what is mechanical is that every recorded
+  path must exist in the re-derived key set and that any single-sided edit reds.
 
 - [x] **The gate locator misses a multiline `#[cfg(...)]` predicate and a `#[path]` packed before the gate, so such items read as production.**
 
