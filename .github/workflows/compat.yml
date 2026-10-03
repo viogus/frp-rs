@@ -64,6 +64,61 @@ jobs:
       - name: Run compat tests
         run: bash scripts/compat-test.sh --ci --go-version "$GO_FRP_VERSION"
 
+      # `--list` prints `run_test` **function** names (`test_g2r_tcp_plain`)
+      # while `--test` selects a scenario's **display** name
+      # (`go-to-rust-tcp-plain`), so the value most likely to be pasted — the
+      # first one — used to match nothing: the run selected zero scenarios and
+      # still printed ` RESULTS: 0 passed, 0 failed` and `All tests passed!`
+      # (the TODO.md `--test` selector item). Both controls below are the item's
+      # own measured runs.
+      # This is the one workflow with the Go and Rust binaries the selector
+      # needs, which is why the gate is exercised here and not in the fixture
+      # suite (that suite pins the same two runs with no binaries, so they only
+      # reach the argument/selection path).
+      - name: Selector gate — an unmatched --test fails closed
+        run: |
+          set -o pipefail
+          out=$(mktemp)
+          rc=0
+          bash scripts/compat-test.sh --ci --go-version "$GO_FRP_VERSION" \
+            --test test_g2r_tcp_plain >"$out" 2>&1 || rc=$?
+          cat "$out"
+          status=0
+          if [ "$rc" = "0" ]; then
+            echo "::error::--test test_g2r_tcp_plain exited 0; an unmatched selector must fail closed"
+            status=1
+          fi
+          if ! grep -q 'test_g2r_tcp_plain' "$out"; then
+            echo "::error::the failure message does not name the unmatched selector"
+            status=1
+          fi
+          if grep -q ' RESULTS:' "$out"; then
+            echo "::error::an unmatched selector still printed a ' RESULTS:' summary line"
+            status=1
+          fi
+          if grep -q 'All tests passed!' "$out"; then
+            echo "::error::an unmatched selector still printed 'All tests passed!'"
+            status=1
+          fi
+          [ "$status" = "0" ] || exit 1
+          echo "selector gate ok: unmatched --test exits $rc and names the selector"
+
+      - name: Selector gate — a matching display name still runs one scenario
+        run: |
+          set -o pipefail
+          out=$(mktemp)
+          if ! bash scripts/compat-test.sh --ci --go-version "$GO_FRP_VERSION" \
+              --test go-to-rust-tcp-plain >"$out" 2>&1; then
+            cat "$out"
+            echo "::error::the matching display name go-to-rust-tcp-plain did not pass"
+            exit 1
+          fi
+          tail -5 "$out"
+          if ! grep -q ' RESULTS: 1 passed, 0 failed' "$out"; then
+            echo "::error::a matching --test must run exactly the one selected scenario"
+            exit 1
+          fi
+
       - name: Protocol connectivity matrix
         run: |
           cargo build --release --manifest-path scripts/frp-stress/Cargo.toml
