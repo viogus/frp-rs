@@ -10623,7 +10623,7 @@ section; ledger now **24 open / 104 closed**.**
   runs is compared against the 3/89 recorded here — or the readiness bound is replaced by a
   mechanism-level fix (for example re-driving the frpc start rather than waiting longer for it).
 
-- [ ] **`scripts/compat-test.sh --list` prints `run_test` function names while `--test` selects display names, so a name taken from `--list` runs nothing and still reports success.**
+- [x] **`scripts/compat-test.sh --list` prints `run_test` function names while `--test` selects display names, so a name taken from `--list` runs nothing and still reports success.**
 
   Filed by the Batch K author after PR #463 review round 1. The selector compares the caller's display name
   (`should_run_test` at `scripts/compat-test.sh:694-699`, `[[ "$SELECTED_TEST" == "$1" ]]`), while `--list`
@@ -10649,7 +10649,21 @@ section; ledger now **24 open / 104 closed**.**
   selector, and no ` RESULTS: 0 passed, 0 failed` — proven by the mismatched-name run `--ci --test
   test_g2r_tcp_plain`. `--list` printing display names is a convenience, not sufficient on its own.
 
-- [ ] **The protocol matrix's `wait_for_listen` accepts a LISTEN socket owned by any process, so a foreign listener can green a row's readiness gate.**
+  **Done (2026-10-03, at `7c5233e4` on `dsh/m5-harness-fail-closed`, squash-merged as `0a4761a8`, PR #474, based on
+  `8099b954`) — `--test` now fails closed at `scripts/compat-test.sh:7873-7895`: an unmatched display name exits **2**
+  with `::error file=scripts/compat-test.sh,title=--test selector::--test '<name>' matched no scenario` (and `ERROR:
+  --test '<name>' matched no scenario; no test ran.` on stderr) and prints neither a ` RESULTS:` line nor `All tests
+  passed!`; the item's own falsification `--ci --test test_g2r_tcp_plain` (a function name copied from `--list`) went
+  from exit 0 / ` RESULTS: 0 passed, 0 failed` / `All tests passed!` to exit 2 with the message, while the display-name
+  form `--ci --test go-to-rust-tcp-plain` still runs (` RESULTS: 1 passed, 0 failed`, rc 0). A display name whose phase
+  the run did not execute is reported distinctly (`names a scenario this run did not execute (its phase was skipped)`),
+  not as a typo, and `--debug` no longer reports a name that ran as unmatched (`scripts/compat-test.sh:746-766`: the
+  scenario runs in the current shell with tracing scoped, so `SELECTED_MATCHED` survives the run).
+  `.github/workflows/compat.yml:72-147` drives the control end-to-end (mismatched name exits non-zero, the message names
+  the selector, no summary line, no `All tests passed!`, `--debug` truthfulness); no live caller passed a function name
+  (`docs/developing.md:822` already labelled that form `# WRONG`), so the stricter gate breaks nothing documented.
+
+- [x] **The protocol matrix's `wait_for_listen` accepts a LISTEN socket owned by any process, so a foreign listener can green a row's readiness gate.**
 
   Filed by the Batch K author after PR #463 review round 1. `wait_for_listen`
   (`scripts/protocol-matrix.sh:80-102`) returns 0 as soon as *any* process holds the port in LISTEN —
@@ -10676,7 +10690,18 @@ section; ledger now **24 open / 104 closed**.**
   constructed foreign-listener run that can no longer green a row. Moving the block outside
   `random_port()`'s 17000–26999 range is additional hardening only; it cannot satisfy this item by itself.
 
-- [ ] **A compat scenario can hand its own Go frps a port its echo listener already holds, and the readiness probe cannot tell.**
+  **Done (2026-10-03, at `7c5233e4` on `dsh/m5-harness-fail-closed`, squash-merged as `0a4761a8`, PR #474, based on
+  `8099b954`) — `wait_for_listen` (`scripts/protocol-matrix.sh:83`) now takes `$3=expected_pid` and refuses to call a
+  port ready unless **that** pid owns the LISTEN socket: the census comes from `scripts/lib/compat-port-ownership.sh`
+  (`cpo_listen_owner`) and the function returns 0 only when the owner list contains the pid the row launched, so the old
+  bare-LISTEN acceptance and the `lsof`/`ss`-only fallback are gone; omitting the pid is refused loudly (`ERROR:
+  protocol-matrix: wait_for_listen needs the pid it is waiting for (port N); refusing to call the port ready`, rc 1,
+  `scripts/protocol-matrix.sh:101-105`). The constructed foreign-listener proof is the port-ownership fixture suite
+  (`scripts/tests/compat-port-ownership.sh:151-152` — `matrix: a foreign socket does not green wait_for_listen` and
+  `matrix: the diagnostic names the foreign pid and the expected one`), which reds when the ownership comparison is
+  relaxed; the callback sites pass the row's recorded frps/frpc pid.
+
+- [x] **A compat scenario can hand its own Go frps a port its echo listener already holds, and the readiness probe cannot tell.**
 
   Filed by the coordinator from **attempt 1** of CI run `37015704902` (workflow `Cross-Compat`, job `compat`, job id `110865907851`, failed 13:54:01Z→14:01:50Z; the run's published conclusion is *success* because attempt 2 was the green re-run at 14:25:14Z→14:35:17Z; head `5099b7f0e0eecf96cd2a31d078e6441920f00e30` = PR #463) — the first compat red that has been root-caused rather than measured, and whose mechanism has since been **reproduced by forced collision** on the base tree. That attempt failed one of eighty-six scenarios:
 
@@ -10754,6 +10779,30 @@ section; ledger now **24 open / 104 closed**.**
   log). The distinguisher stays `lsof -nP -iTCP:<port> -sTCP:LISTEN` at failure time.
 
   **Done-when:** the harness cannot give two listeners in one scenario the same port — by reserving each port for the life of the scenario, or by making the pick reject ports already allocated in that scenario — and the readiness probe fails closed when the socket that answers is not the process that was just launched; with the forced-collision run above red before the change (the same three symptoms as attempt 1 of run `37015704902`) and green after, a forced `echo_port="$proxy_port"` collision no longer passing, and `scripts/lib/compat-stray-guard.sh` and its fixture suite unweakened. If instead the leak path is the real one, the Done-when is the same bar applied to teardown: no listener from scenario *n* may still hold a port when scenario *n+1* picks one.
+
+  **Done (2026-10-03, at `7c5233e4` on `dsh/m5-harness-fail-closed`, squash-merged as `0a4761a8`, PR #474, based on
+  `8099b954`) — the harness cannot hand two listeners in one scenario the same port. `cpo_pick_port`
+  (`scripts/lib/compat-port-ownership.sh:142`) records every port it hands out in a per-run ledger
+  (`$TEST_DIR/allocated-ports.$$`, a file rather than a shell variable because callers use `$(random_port)`, a
+  subshell), sweeps a bounded range and refuses to reuse a port for the life of the scenario, and exits 1 loudly on
+  exhaustion; `cpo_wait_port_ready` (`:325`, via `cpo_wait_ready` `:291` and the aux-listener registration with pid/port
+  plus `AUX_LAUNCH_GEN`) replaces the bare `nc -z` / `sleep "$timeout"; return 0` readiness probe with a
+  listener-identity and launch-generation check, so a socket this run did not start is never ready. The item's forced
+  collisions: `echo_port="$frps_port"` was red before (11–12 s, the CI symptoms) and is now red **in about 1 s** naming
+  the holder (`ERROR: compat-port-ownership: port N is held by the echo listener this run started (pid P), but a process
+  launched after it (generation G) was meant to take this port`), and `echo_port="$proxy_port"` — a spurious PASS before
+  — now fails closed. The new suite `scripts/tests/compat-port-ownership.sh` scores ownership, both collisions, the
+  foreign listener and the matrix `wait_for_listen` cases (51 checks in round 1 → **61** at this head, `MIN_CHECKS=61`,
+  sha256 `b76f5188175a3c86f80804193ad5d33935bdd8874bf4928b807251b1b173c8b9`), gated by the `Port ownership — fixture
+  checks (compat harness readiness)` step (`.github/workflows/ci.yml:587`, `guard_exact`/`guard_floor=61` at
+  `:631-636`); `scripts/lib/compat-stray-guard.sh` and its 40-check suite are unweakened (pinned regions 4/4, canary
+  live). The first CI run caught a real defect in the fix — the harness's `GO_FRP_DIR` recalculation overwrote the
+  `FRP_COMPAT_*` binary-path seam, so the "binary-less" proof silently used real Go binaries on a developer host and the
+  step exited 1 on the runner (`Health`, run `37113551658`, six FAILs) — and the final head makes the suite *prove*
+  hermeticity: every stubbed run pins a `GO_FRP_VERSION` whose default directory cannot exist, asserts that directory is
+  absent and that no run printed `Binary not found or not executable`, and the V2 aliases derive through the same seam,
+  pinned by a hostile-`GO_FRP_DIR` marker scenario that asserts no marker ran while the V2 probe still reached its
+  scenario. CI at `7c5233e4`: 15 pass / 2 skipping / 0 fail (the `Health` job green).
 
 - [x] **`docs/config.md:3-4` still claims a 1:1 Go mapping the gate now measures against.**
 

@@ -1272,6 +1272,17 @@ User-facing release notes for frp-rs.
 
 ### CI & Tooling
 
+- **`scripts/compat-test.sh` now fails closed on a `--test` value that matches nothing, and a compat
+  scenario can no longer hand two of its own listeners the same port.**
+  The selector compared display names while `--list` printed `run_test` function names, so a name copied
+  from `--list` exited 0 with ` RESULTS: 0 passed, 0 failed`; an unmatched name now exits 2 naming the
+  selector, prints no summary line, and a name whose phase was skipped is reported separately. The
+  protocol matrix's `wait_for_listen` accepted any process's LISTEN socket, so a foreign listener greened
+  a row; it now requires the pid the row launched. `random_port()` could return a port an earlier listener
+  in the same scenario still held and the readiness probe was a bare connect; each port is now reserved
+  for the life of the scenario and readiness verifies the owner, with a 61-check fixture suite (up from
+  51) proving the collisions, the foreign-listener refusal and the hermeticity of its own stub seam.
+
 - **`docs/config.md`'s Go column is now checked row by row against a measured Go frp key set, so a real-but-wrong Go key reds.**
   The gate proved each cell was *a* Go frp v0.71.0 spelling, not that it was *the* spelling for that row: swapping
   `bindPort` for the equally real `quicBindPort` on the `bind_port` row left it green. The expected cell is now recorded for
