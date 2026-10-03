@@ -27,9 +27,14 @@
 #   AB_VPS_SSH_KEY  local path to the SSH private key; falls back to
 #                XTCP_VPS_SSH_KEY (content) written to a temp file.
 #   AB_VPS_USER  SSH user on the VPS (default: frp-test).
+#   AB_GATE_ENFORCE  forwarded to the VPS (0/1, default 0). 0 keeps the gate
+#                informational as ab-matrix.sh documents; 1 restores exit 1 on
+#                a >GATE_PCT regression.
+#   AB_FORCE_MEASURE forwarded to the VPS (0/1, default 0).
 #
-# Exit code mirrors the gate: 0 = PASS (all configs within GATE_PCT),
-# 1 = REGRESSED, 2+ = setup/ssh error.
+# Exit code mirrors the gate: 0 = PASS (all configs within GATE_PCT), or a
+# regression while the gate is informational (the default);
+# 1 = REGRESSED with AB_GATE_ENFORCE=1; 2+ = setup/ssh error.
 # =============================================================================
 set -euo pipefail
 
@@ -45,6 +50,22 @@ if [[ -z "${BEFORE_ROOT:-}" ]]; then
   echo "ERROR: BEFORE_ROOT is required (points at the 'before'/base binary root)" >&2
   exit 2
 fi
+
+# The gate's two switches are read by scripts/ab-matrix.sh *on the VPS*, and
+# ssh does not forward the caller's environment, so they must be spliced into
+# the remote command line explicitly. Default 0 reproduces the previous
+# behaviour exactly. Validated first: the value is interpolated into a remote
+# shell command string, so it must not be able to carry anything else.
+AB_GATE_ENFORCE="${AB_GATE_ENFORCE:-0}"
+AB_FORCE_MEASURE="${AB_FORCE_MEASURE:-0}"
+case "$AB_GATE_ENFORCE" in
+  0|1) ;;
+  *) echo "ERROR: AB_GATE_ENFORCE must be 0 or 1 (got '$AB_GATE_ENFORCE')" >&2; exit 2 ;;
+esac
+case "$AB_FORCE_MEASURE" in
+  0|1) ;;
+  *) echo "ERROR: AB_FORCE_MEASURE must be 0 or 1 (got '$AB_FORCE_MEASURE')" >&2; exit 2 ;;
+esac
 
 # Resolve VPS connection (reuse XTCP secrets by default)
 USER="${AB_VPS_USER:-frp-test}"
@@ -129,6 +150,7 @@ echo "Running A/B matrix gate on ${USER}@${HOST}" >&2
 set +e
 OUT=$(ssh "${SSH_COMMON[@]}" "$USER@$HOST" \
   "cd ~/$REMOTE_BASE && AFTER_ROOT=\$PWD/after BEFORE_ROOT=\$PWD/base \
+   AB_GATE_ENFORCE=$AB_GATE_ENFORCE AB_FORCE_MEASURE=$AB_FORCE_MEASURE \
    flock -w 1800 ~/.ab-matrix.lock \
    bash scripts/ab-matrix.sh '$REPS' '$DUR' 2>&1")
 RC=$?

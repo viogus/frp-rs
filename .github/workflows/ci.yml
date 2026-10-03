@@ -1192,9 +1192,12 @@ jobs:
         # references is declared **once**, as `guard_cites` / `guard_cites_floor`
         # below, so a scan that stops finding cites cannot print this line. The
         # declared count has to be re-derived whenever a commit inserts or
-        # removes a live cite: it moved 84 → 87 with the Batch I records and
+        # removes a live cite: it moved 84 → 87 with the Batch I records,
         # 87 → 88 with this step's own new cite (the release-tests floor), and
-        # three separate copies of the old literal `84` left the health job red
+        # 93 → 99 with Batch M-7 (the A/B-gate item cite carried in
+        # `scripts/ab-matrix.sh`, the new classifier and its fixture suite,
+        # `.github/workflows/ab-matrix.yml` and the A/B gate step below); three
+        # separate copies of an old literal `84` once left the health job red
         # (`RESULT: 87 …` followed by "did not report 84 …").
         shell: bash
         run: |
@@ -1210,8 +1213,8 @@ jobs:
           # the tree, so a scan that stops finding cites prints a smaller number
           # and reds; lowering the declared total has to move both literals, and
           # `bash scripts/tests/todo-cite-guard.sh` prints the number to paste.
-          guard_cites=93
-          guard_cites_floor=93
+          guard_cites=99
+          guard_cites_floor=99
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
@@ -1395,6 +1398,151 @@ jobs:
             exit 1
           fi
           echo "TODO.md citation gate fixtures ok: 60 checks hold, all 11 red-path canaries live"
+      - name: A/B gate — measurable-delta classifier + verdict fixture checks
+        # TODO.md:10569 ("The A/B throughput gate fires on changes with no
+        # runtime code, so a red gate on `main` is not evidence of a
+        # regression"). This step pins the suite that guards the delta
+        # classifier and the gate arithmetic, AND the two files that suite
+        # drives at runtime: an edit to either script alone could stub the
+        # behaviour while the suite stayed byte-identical, so weakening either
+        # half is a two-file change a reviewer sees.
+        #
+        # Why an external count at all: the suite floors its own check count in
+        # its EXIT trap, but `exec true` planted before the trap arms exits 0
+        # with no output, and a suite that stopped running its scenarios looks
+        # exactly like a clean tree. So the summary line is pinned verbatim
+        # here, the `  ok` line count is compared for equality with
+        # `guard_exact`, and nine substantive evidence lines are matched
+        # individually. guard_exact/guard_floor are 37: the 12 measured-path
+        # class fixtures, the 3 nothing-measurable fixtures, the 3
+        # mixed/deletion/rename fixtures, the 4 error-surface fixtures, the 5
+        # gate-arithmetic fixtures, the 5 gate-reporting fixtures, the 4
+        # sabotage converses and the 1 revert proof. A scenario added or
+        # removed moves the total — restore the checks rather than lowering it.
+        #
+        # Residues, named rather than denied: the suite shells out to `git`,
+        # `sed`, `cmp` and `python3` from `$PATH`, so a shim planted earlier on
+        # `$PATH` by an unpinned in-repo file can answer a probe the way a
+        # scenario wants. That is a false negative in a scenario, never a
+        # defeated pin: all three subjects are hashed with an absolute,
+        # vector-proven hasher before anything runs.
+        shell: bash
+        run: |
+          # One log file per invocation, for the port-ownership step's reason: a
+          # fixed path lets a retry truncate the file while the first run is
+          # still reading it, which the pinned-count checks would call red.
+          log="${TMPDIR:-/tmp}/frp-ab-measurable-delta-fixtures.$$.log"
+          status=0
+          guard_file=scripts/tests/ab-measurable-delta.sh
+          guard_pin=f1ebe92fa486ff9a98716760102ca78ece616569654c290b81b5f1019f958508
+          guard_exact=42
+          guard_floor=42
+          guard_cls=scripts/ab-measurable-delta.sh
+          guard_cls_pin=f1d292b925e13df4acfb574807c3246a7323d34e960db1a3fd1b56bd2ebaea7c
+          guard_matrix=scripts/ab-matrix.sh
+          guard_matrix_pin=9e4dca769a4926c6a7f85686f6a9c0a2dac32af83b2099186d87de5a7ea0b4e5
+          guard_hasher=''
+          guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+          for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
+            [ -x "$cand" ] || continue
+            guard_probe=$(printf 'abc' | "$cand" 2>/dev/null)
+            [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+            guard_hasher=$cand
+            break
+          done
+          if [ -z "$guard_hasher" ]; then
+            for cand in /usr/bin/shasum /bin/shasum /usr/local/bin/shasum; do
+              [ -x "$cand" ] || continue
+              guard_probe=$(printf 'abc' | "$cand" -a 256 2>/dev/null)
+              [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+              guard_hasher="$cand -a 256"
+              break
+            done
+          fi
+          if [ -z "$guard_hasher" ]; then
+            echo "::error::no sha256 tool at an absolute path reproduces the known sha256 vector (need sha256sum or shasum); cannot verify $guard_file"
+            exit 1
+          fi
+          # $1 = file, $2 = its expected digest, $3 = the variable holding that
+          # digest (named in the failure message).
+          # shellcheck disable=SC2086  # $guard_hasher is the word-split "<abs path> [-a 256]"
+          verify_guard() {
+            local out sha
+            out=$($guard_hasher "$1" 2>/dev/null) || true
+            sha=${out%% *}
+            if [ "$sha" != "$2" ]; then
+              echo "::error::$1 is not the pinned revision (sha256 ${sha:-<none>}; expected $2)"
+              echo "::error::an edit to the A/B measurable-delta check — including one that weakens its own assertions — must also update $3 in the 'A/B gate — measurable-delta classifier + verdict fixture checks' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended, otherwise revert it"
+              return 1
+            fi
+            return 0
+          }
+          verify_guard "$guard_file" "$guard_pin" guard_pin || exit 1
+          verify_guard "$guard_cls" "$guard_cls_pin" guard_cls_pin || exit 1
+          verify_guard "$guard_matrix" "$guard_matrix_pin" guard_matrix_pin || exit 1
+          bash scripts/tests/ab-measurable-delta.sh > "$log" 2>&1 || status=1
+          guard_log=$(<"$log")
+          printf '%s\n' "$guard_log"
+          guard_ok=0
+          guard_result=0
+          guard_fail=0
+          guard_evidence=0
+          guard_fail_text=''
+          while IFS= read -r guard_line; do
+            case $guard_line in
+              '  ok '*) guard_ok=$((guard_ok + 1)) ;;
+              'FAIL'*|'  FAIL'*)
+                guard_fail=$((guard_fail + 1))
+                guard_fail_text="${guard_fail_text}${guard_line}"$'\n'
+                ;;
+            esac
+          done <<< "$guard_log"
+          case $guard_log in
+            *"RESULT: $guard_exact fixture check(s) hold"*) guard_result=1 ;;
+          esac
+          # The substantive evidence, in the suite's own wording, so a suite that
+          # still prints 42 `  ok` lines while no longer witnessing the property
+          # cannot pass. The first five are the sabotage converse (each mutation
+          # must turn the child red, and the mutations must only ever have
+          # written copies); the last five pin the behaviour this round is
+          # about — the skip on a docs/records-only delta, the published figure
+          # being the median rather than the minimum (both the arithmetic and
+          # the real measurement loop that produces it), and the informational
+          # default with its AB_GATE_ENFORCE re-arm.
+          guard_evidence_exact=10
+          guard_evidence_floor=10
+          for guard_evidence_probe in \
+            'mutant: classifier forced to always skip -> child red' \
+            'mutant: gate_verdict forced to always pass -> child red' \
+            'mutant: gate_median forced to min -> child red' \
+            'mutant: AB_GATE_ENFORCE path removed -> child red' \
+            'real scripts are byte-identical after the mutant matrix' \
+            'classifier: CHANGELOG.md + TODO.md + docs/history/development-log.md -> rc 1, no output' \
+            'gate_median(18.0 15.2 19.5) = 18.0 (not the minimum 15.2)' \
+            'measure_pair_deltas: 3 samples published as median -25.0, not the minimum -40.0' \
+            'gate_report REGRESSED without enforce -> rc 0' \
+            'gate_report REGRESSED with AB_GATE_ENFORCE=1 -> rc 1 (hard failure restored)'
+          do
+            case $guard_log in
+              *"$guard_evidence_probe"*) guard_evidence=$((guard_evidence + 1)) ;;
+            esac
+          done
+          [ "$guard_result" = "1" ] || status=1
+          [ "$guard_ok" = "$guard_exact" ] || status=1
+          [ "$guard_exact" -ge "$guard_floor" ] || status=1
+          [ "$guard_evidence" = "$guard_evidence_exact" ] || status=1
+          [ "$guard_evidence_exact" -ge "$guard_evidence_floor" ] || status=1
+          [ "$guard_fail" = "0" ] || status=1
+          if [ "$guard_fail" != "0" ]; then
+            echo "::error::the A/B measurable-delta fixture suite printed $guard_fail failure line(s); a run that reported a failure cannot be reported as a green step:"
+            printf '%s' "$guard_fail_text"
+          fi
+          if [ "$status" != "0" ]; then
+            echo "::error::the A/B measurable-delta fixture suite did not report $guard_exact checks, all $guard_evidence_exact pinned evidence lines and no failure line (evidence seen: $guard_evidence/$guard_evidence_exact)"
+            echo "::error::scripts/tests/ab-measurable-delta.sh must print $guard_exact '  ok' lines, end with 'RESULT: $guard_exact fixture check(s) hold', and prove (a) the classifier skips a docs/records-only delta with rc 1 and no output, (b) the published gate figure is the median and never the minimum, (c) a beyond-gate regression is informational by default and exits 1 only under AB_GATE_ENFORCE=1, and (d) each of the four mutants — classifier forced to always skip, verdict forced to always pass, median replaced by the minimum, enforce path removed — turns the suite red while the three real scripts stay byte-identical; a smaller total, a missing evidence line or a failure line means the fixture stopped witnessing that property — restore it rather than lowering this literal"
+            exit 1
+          fi
+          echo "A/B measurable-delta fixture checks ok: $guard_exact checks hold, all $guard_evidence_exact evidence lines live, pins verified 3/3"
 
   tests-unit:
     name: Tests (unit)
