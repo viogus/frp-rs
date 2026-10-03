@@ -10549,7 +10549,7 @@ section; ledger now **24 open / 104 closed**.**
 
   **Done-when:** either (a) a guard resolves every live `path:line` cite against the tree and fails on a moved line — with a fixture showing that a one-line insert reddens it, and with the point-in-time set (`TODO.md`, `CHANGELOG.md`, `docs/history/`, `docs/archive/`, `docs/audit/`, `performance-audit.md`, `docs/refactor-large-modules.md`) excluded the way `todo-cite-guard.sh` excludes it — or (b) the remaining 66 are re-derived by content and the `--help`/golden expectations they live in are re-pinned, measured by re-running the same scan and reporting 0 moved. A constant-offset fix does not close this: it proves only that one wrong offset was applied consistently.
 
-- [ ] **`cargo test -p frp-server --no-default-features --features dashboard --lib` is red at the base commit: a test demands a Go key that this shape compiles out.**
+- [x] **`cargo test -p frp-server --no-default-features --features dashboard --lib` is red at the base commit: a test demands a Go key that this shape compiles out.**
 
   Filed by the `dsh/strict-keys-gated-port-readers` author (PR #461) while running that shape as a gate; not caused by that PR.
 
@@ -10559,6 +10559,12 @@ section; ledger now **24 open / 104 closed**.**
   - Pre-existing, measured at the base commit: `git worktree add --detach /private/tmp/batch-q-base b9af37c5` + `CARGO_TARGET_DIR=/private/tmp/tgt-basecheck cargo test -p frp-server --no-default-features --features dashboard --lib -j 2 -- dashboard::v2::tests::test_serverinfo_go_shape` → `FAILED. 0 passed; 1 failed; 356 filtered out`, the same `missing Go key kcpBindPort` panic at `frp-server/src/dashboard.rs:3064:17` (cold build, 1 m 52 s, macOS arm64, `-j 2`). The file-identity check agrees: `git diff b9af37c5 -- frp-server/src/dashboard.rs frp-core/src/config/server.rs` is empty, and `git show b9af37c5:frp-server/src/dashboard.rs` carries the same ungated key list. CI never runs the lane unfiltered — `.github/workflows/ci.yml:1642`, `:1541` and `:1559` run `-p frp-server --no-default-features --features dashboard --lib` with a `web_server_tls_enable_reader` filter, so this test is filtered out of every job that uses that shape.
 
   **Done-when:** that shape is green — either the test's Go-key list is `#[cfg]`-gated on the features this build compiles in (leaving the full list for the default-feature lane) or the lane is declared unsupported with the reason recorded next to it — and `.github/workflows/ci.yml` runs it without a filter at least once, so the shape is covered rather than assumed.
+
+  **Done (2026-10-03, at `e6c2156c` on `dsh/m6-feature-honesty`, PR #476, based on `2c70aa76`) — both demand sites are gated on the features the build compiles, and the shape now runs unfiltered in CI.**
+
+  The unit test's key list gates the two transport keys exactly as `ServerInfoResp` gates the fields that carry them (`frp-server/src/dashboard.rs:3047-3053` states the rule; the `#[cfg(feature = "kcp")]`/`quic` pushes sit at `:3062`/`:3064` ahead of the still-ungated `extend_from_slice` at `:3066`, asserted at `:3078`), and the integration twin does the same (`frp-server/tests/dashboard_integration.rs:109`, gated pushes `:123`/`:125`, assert `:139`). Measured: `cargo test -p frp-server --no-default-features --features dashboard --lib -j 2` is `FAILED. 361 passed; 1 failed` at `2c70aa76` — the same `frp-server/src/dashboard.rs:3064:17` `missing Go key kcpBindPort` panic the item recorded at `b9af37c5` (that base's `358 passed` is a different tree) — and `ok. 363 passed; 0 failed` at the head. The gate moved rather than weakened: the default-feature lane still demands the whole Go set, and un-gating `kcpBindPort` again leaves that lane green (the filtered run reports `1 passed`) while it reds only where the listener is compiled out.
+
+  The unfiltered run is now a step of its own — `Run frp-server's whole lib target without TLS, unfiltered (shape floor)` (`.github/workflows/ci.yml:1898`, body `:1918-1941`) — running the entire `--lib` target with no name filter and pinning the exact listed and passed counts (`n_expected=363`, `:1931`; the `::error::` at `:1937` names it), so a test silently made conditional cannot shrink the shape. The step reads the pipeline's status before failing (`run_status=0` / `|| run_status=$?`, `:1926-1927`), so a failing row still prints the annotation and the log tail — the M6-N1 finding, where the first version exited 101 with zero annotations. Sabotage, each reverted and the step re-run green: `#[ignore]` on the new row → rc 1 with the annotation; deleting it → rc 1 naming 362 listed; un-gating `kcpBindPort` → `FAILED. 362 passed; 1 failed`. The item's alternative branch (declare the lane unsupported) was not needed.
 
 - [ ] **The A/B throughput gate fires on changes with no runtime code, so a red gate on `main` is not evidence of a regression.**
 
@@ -10574,7 +10580,7 @@ section; ledger now **24 open / 104 closed**.**
 
   **Done-when:** either (a) the gate can no longer red on a delta that contains no shipped-code change — measured, not asserted: take the recorded failure above as the reproduction and show the new rule green on it (e.g. skip/annotate when `git diff <before> <after> -- '*.rs' 'Cargo*.toml' 'crates/**'` is empty, plus a comment saying so) — or (b) the statistic is replaced by one with a quantified false-positive rate: report the per-config sample distribution (N >= 3 repeats, median and spread) and set `GATE_PCT`/the confirm rule from it, so a published measurement shows the observed -15.6%-style spread no longer reds the gate. Whatever is chosen, record in the item's Done paragraph the run id, the table, and the commands used; a run that merely "passed once" is not evidence. If the honest conclusion is that the VPS is too noisy to gate anything, say so with numbers and record the decision to demote the gate to informational (with the reason), rather than leaving a gate that turns `main` red at random.
 
-- [ ] **A listener port whose reader is compiled out is silently accepted when the flag comes from the command line instead of the file.**
+- [x] **A listener port whose reader is compiled out is silently accepted when the flag comes from the command line instead of the file.**
 
   Filed by the `dsh/strict-keys-gated-port-readers` author in PR #461's review round 1, from the adversarial reviewer's finding. A pre-existing scope boundary, not a regression of that PR: its Done-when is phrased over the two config *keys*, and the flag path was never in scope.
 
@@ -10584,6 +10590,13 @@ section; ledger now **24 open / 104 closed**.**
   - Neither `-c` nor `--config-dir` is evidence: `cli_overrides_enabled()` is `self.config.is_none() && self.config_dir.is_none()` (`frp-core/src/cli.rs:5095-5096`), so either flag makes the overlay be skipped and the CLI config flag is never applied (Go v0.70.1 parity — `frp-core/src/cli.rs:547-548`). Measured: `frps --config-dir dir --bind-port 19999` still starts on the file's `19782`, i.e. the flag is discarded, not applied; the `--config-dir` branch returns at `frps/src/main.rs:1016` and never reaches the only production `override_server_config` call at `frps/src/main.rs:1061` (`frp-core/src/cli.rs:5993-5994` asserts `!with_dir.cli_overrides_enabled()`).
 
   **Done-when:** either the CLI override is covered — the completion/overlay step records the unhonoured reader-gated ports it applies, and the record fires in every shape that advertises the flag — or the boundary is recorded next to `run_verify` and in `docs/config.md` and pinned in each build shape. Silently accepting a flag the build cannot honour is the same class `TODO.md:10087` closed for the file.
+
+  **Done (2026-10-03, at `e6c2156c` on `dsh/m6-feature-honesty`, PR #476, based on `2c70aa76`) — the overlay reports the reader-gated port it applies, so the flag warns in every shape the file key does.**
+
+  `FrpsArgs::override_server_config` (`frp-core/src/cli.rs:5122`) now returns an `AppliedReaderGatedPorts` (`frp-core/src/config/loader.rs:410`) naming the reader-gated ports it actually wrote — filled at the one such arm, `applied.web_server_port = v != 0` (`frp-core/src/cli.rs:5215`) — and its only production caller merges that into the presence record before the warn block (`frps/src/main.rs:1037`, `:1061`, `:1068`), through `ConfigPresence::record_applied_reader_gated_ports` (`frp-core/src/config/loader.rs:1087`), consumed by `:1139` beside the file-key records. Measured on the real binaries: `frps --dashboard-port 7500` with no `-c` and no `--config-dir`, in a directory whose `frps.toml` requests no port, now prints the same one `web_server.port has no effect: …` record the file lane prints, where the base binary printed **zero**; `--dashboard-port 0` and an absent flag print zero; `-c <file>` prints the file's record; a `--features dashboard` build honours the flag and prints no record. The two paths that apply no overlay stay silent and are recorded as precedence rather than gates: `--config-dir` (a named config source is authoritative; `cli_overrides_enabled()` is `self.config.is_none() && self.config_dir.is_none()`) and `frps verify`, which accepts `--dashboard-port` and ignores it — 0 records — while a file that requests the port prints its record before `syntax is ok` (`docs/config.md:194`, where the reader rule now carries the `--config-dir`/`verify` boundary).
+
+  Pinned: the record-capture floor `frps/tests/warn_delivery.rs:577` (the new spawn test takes that lane 31 → 32, asserted in both `frps` warn_delivery steps at `.github/workflows/ci.yml:2647-2700` and by the release lane's `FRPS_RELEASE_WARN_DELIVERY_TESTS`/`_TESTS_FLOOR` = `"32"` at `:3131-3132`, with `_PASSED_FLOOR` staying `"29"` at `:3133` because the release run ignores two), plus `frp-core/src/cli.rs:5842` and `:5880`. Not closed: a hand-named inner feature (`cargo build -p frps --no-default-features --features tiny,frp-core/kcp`) advertises the flag, binds no UDP socket and prints zero records, because the flag parser and the presence flag are gated on **frp-core**'s features while the listener is **frp-server**'s; that residue is filed as the item this records round appends at the end of the ledger.
+
 - [ ] **The compat gate's residual flake is unmeasured in CI, and the round-5 harness fixes are proven only by local mutation.**
 
   **Filed by the Batch K author (round-5 measurement), base `b9af37c5`.** The parent item ("The compat
@@ -10971,3 +10984,32 @@ other.
   script. What the pin protects grew with it: the suite went 118 → 133 → 147 → **166** checks in this batch (42 → 118 was PR #468) and now covers the cross-line walk, the
   packed `#[path]`, the string/comment declines, the non-first attribute, and a latent-hang tree whose witness is measured under a bounded watchdog (**M26**
   reverts the progress guard the verification round's F1 required).
+
+- [ ] **A hand-named inner feature advertises `--kcp-bind-port`/`--quic-bind-port` with no listener in the binary, so the port is accepted and silently ignored.**
+
+  Filed by the M-6 records round (PR #476) from the adversarial review's M6-F1, which falsified the
+  "unknown-flag error in every shape" wording the item then carried: the flags exist under **frp-core**'s
+  `#[cfg(feature = "kcp")]`/`quic` (`frp-core/src/config/loader.rs:246-258`, `frp-core/src/cli.rs:958-1012`)
+  while the listener that reads the port belongs to **frp-server** (`frp-server/src/service.rs:397-410`), and
+  `frp-server/Cargo.toml`'s `kcp = ["frp-core/kcp"]` (with `frps`'s `kcp = ["frp-server/kcp"]`) moves the two
+  together in one direction only. A shape that names the inner feature directly —
+  `cargo build -p frps --no-default-features --features tiny,frp-core/kcp` — advertises `--kcp-bind-port` in its
+  `--help` and accepts it, binds no UDP socket and prints **zero** records, while the same `kcp_bind_port` file
+  key is silent there too. Measured independently in review, then re-measured by the coordinator: the flag is
+  advertised; the process runs; `lsof -nP -a -p <pid> -iUDP` and `netstat` find no socket; `KCP listener
+  started` never appears; the flag prints 0 records and the file key 0 records; a default-features `frps`
+  control shows the same probe does find its listener (`KCP listener started on 0.0.0.0:<p>`, one UDP socket);
+  and `--no-default-features --features tiny` alone rejects the flag with `Error: --kcp-bind-port is not
+  expected in this context` while still warning on the file key (1 record). The same holds for `frp-core/quic`
+  and `frp-core/websocket`, so the residue is three spellings, not one. It is unreachable from any `frps` build
+  the project's own feature names produce, and no CI lane builds an `frps` binary in those combinations: only
+  `frp-server`'s own `--all-targets` lanes reach the shape (`.github/workflows/ci.yml:3526`, `:3751`, `:3802`,
+  through their `frp-client` dev-dependency) — which is why the M-6 fix landed as recorded wording (the reader
+  rule and the `AppliedReaderGatedPorts` doc both name the gap) rather than as a gate.
+
+  **Done-when:** the answer to "does this build read the port" comes from the crate that owns the listener — a
+  `frp-server`-resolved reader threaded into the presence flags and the flag parsers the way
+  `frp_server::service::web_server_tls_enable_reader()` already answers the dashboard/TLS pair — so the
+  hand-named inner-feature shape either warns (flag and file key) or rejects the flag, and a test builds that
+  shape and asserts it. Making the closed item's "the record fires in every shape that advertises the flag"
+  literally true is the same work.
