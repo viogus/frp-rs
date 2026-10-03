@@ -130,7 +130,7 @@ fn write_malformed_toml(path: &std::path::Path) {
 }
 
 /// Parseable TOML, semantically invalid: `type = "bogus-proxy-type"` is
-/// rejected by `validate_proxy_configs` (loader.rs:1164-1170) inside
+/// rejected by `validate_proxy_configs` (loader.rs:1344-1350) inside
 /// `load_client_config` — this is the failure `validate_client_config`
 /// reports, independent of the `strict` flag. Carries `remote_port` so a
 /// buggy partial-apply would be observable (the proxy would move ports).

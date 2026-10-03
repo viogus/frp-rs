@@ -447,6 +447,55 @@ pub const fn ssh_tunnel_gateway_bind_port_reader() -> frp_core::config::Listener
     frp_core::config::ListenerPortReader::from_features(cfg!(feature = "ssh"))
 }
 
+/// Whether **this crate** compiles the reader of `kcp_bind_port` — its own `kcp`
+/// feature, which gates the KCP listener (`frp-server/src/service/listeners.rs`).
+///
+/// The field is `#[cfg(feature = "kcp")]`-gated in `frp-core`'s `ServerConfig`,
+/// and Cargo unifies the two crate features independently: `frp-server/kcp =
+/// ["frp-core/kcp"]` moves them together one way, so a caller who names the
+/// inner feature by hand
+/// (`cargo build -p frps --no-default-features --features tiny,frp-core/kcp`)
+/// gets the parser and the field without this crate's listener. `frp-core`
+/// cannot observe this crate's feature, so the answer is resolved here and handed
+/// to `ConfigPresence::warn_unhonoured_server_feature_keys`. A binary-local
+/// `cfg!` would be wrong for the same reason as
+/// [`web_server_tls_enable_reader`]'s (`frps/kcp` forwards
+/// `frp-server/kcp`, so the binary's own flag is a third, independently
+/// forwarded switch).
+pub const fn kcp_bind_port_reader() -> frp_core::config::ListenerPortReader {
+    frp_core::config::ListenerPortReader::from_features(cfg!(feature = "kcp"))
+}
+
+/// The `quic_bind_port` twin of [`kcp_bind_port_reader`]: this crate's `quic`
+/// feature gates the QUIC listener.
+pub const fn quic_bind_port_reader() -> frp_core::config::ListenerPortReader {
+    frp_core::config::ListenerPortReader::from_features(cfg!(feature = "quic"))
+}
+
+/// The `websocket_port` twin of [`kcp_bind_port_reader`]: this crate's
+/// `websocket` feature gates the WebSocket listener. There is no
+/// `--websocket-port` flag, so this reader is only ever consulted for the file
+/// key.
+pub const fn websocket_port_reader() -> frp_core::config::ListenerPortReader {
+    frp_core::config::ListenerPortReader::from_features(cfg!(feature = "websocket"))
+}
+
+/// All three feature-gated listener-port answers at once, from **this crate's**
+/// gates — the value `frps` and this crate's reload path hand to
+/// `ConfigPresence::warn_unhonoured_server_feature_keys`.
+///
+/// One combined constructor rather than three call sites so the three cannot be
+/// swapped: `kcp_bind_port` and `quic_bind_port` have the same type, and a
+/// `kcp_bind_port_reader()` passed where the QUIC reader was meant would be a
+/// silent, shape-dependent wrong answer.
+pub const fn gated_listener_port_readers() -> frp_core::config::GatedListenerPortReaders {
+    frp_core::config::GatedListenerPortReaders::from_features(
+        cfg!(feature = "kcp"),
+        cfg!(feature = "quic"),
+        cfg!(feature = "websocket"),
+    )
+}
+
 /// Spawn a boxed future with type erasure. Reduces binary size by
 /// preventing monomorphization of `tokio::spawn` for every concrete
 /// future type — the unsizing coercion from `Pin<Box<ConcreteFut>>`
@@ -1570,11 +1619,15 @@ impl Service {
         // sink, so it delivers the record. Once per load — a reload adds one
         // rather than replacing the startup record.
         presence.warn_inert_server_tls_enable();
-        // The feature-gated listener ports this build has no field for report
+        // The feature-gated listener ports this build has no field for, **or**
+        // has a field for while this crate's listener is compiled out, report
         // here too: a reload that adds `websocket_port = 7500` (say) to a
-        // `micro`/`tiny` config still cannot open the port, so the record is one
-        // per load — a reload adds one rather than replacing the startup record.
-        presence.warn_unhonoured_server_feature_keys();
+        // `micro`/`tiny` config still cannot open the port, and the hand-named
+        // inner-feature shape (`tiny,frp-core/websocket`) deserializes the key
+        // without a listener. The reader answer is this crate's own
+        // (`gated_listener_port_readers`), never the binary's. One per load — a
+        // reload adds one rather than replacing the startup record.
+        presence.warn_unhonoured_server_feature_keys(gated_listener_port_readers());
         // The two listener ports whose field *is* present but whose reader is
         // not: `web_server.port` (dashboard) and `ssh_tunnel_gateway.bind_port`
         // (ssh). Same one-record-per-load rule; a reload that starts naming one
@@ -1995,6 +2048,7 @@ mod tests {
         let mut presence = ConfigPresence::default();
         presence.record_applied_reader_gated_ports(AppliedReaderGatedPorts {
             web_server_port: true,
+            ..Default::default()
         });
         let records = presence.unhonoured_reader_gated_port_records(
             web_server_port_reader(),
@@ -2015,5 +2069,157 @@ mod tests {
         // variant everywhere, the comparison above would hold vacuously.
         assert_ne!(Present, Absent);
         println!("dashboard-port-overlay-record-pin: assertions ran");
+    }
+
+    /// Pin which `kcp_bind_port` answer this build's resolver gives.
+    ///
+    /// `kcp_bind_port` is `#[cfg(feature = "kcp")]`-gated in `frp-core`'s
+    /// `ServerConfig`, but **this crate's** `kcp` feature is what compiles the
+    /// listener, and Cargo unifies the two independently: the
+    /// `-p frp-server --no-default-features --all-targets` lane turns
+    /// `frp-core/kcp` on through the `frp-client` dev-dependency while this
+    /// crate's `kcp` is off, so that lane is the hand-named inner-feature shape
+    /// (`cargo build -p frps --no-default-features --features tiny,frp-core/kcp`)
+    /// at the unit level. A resolver that hard-coded either variant would either
+    /// warn in a build that binds the port or stay silent in exactly the shape
+    /// this reader exists for.
+    #[test]
+    fn kcp_bind_port_reader_answers_from_this_build() {
+        use frp_core::config::ListenerPortReader::{Absent, Present};
+
+        let got = kcp_bind_port_reader();
+        let want = if cfg!(feature = "kcp") {
+            Present
+        } else {
+            Absent
+        };
+        assert_eq!(
+            got, want,
+            "kcp_bind_port's reader is this crate's `kcp` feature"
+        );
+        assert_ne!(Present, Absent);
+        println!("kcp-bind-port-reader-pin: assertions ran");
+    }
+
+    /// The `quic_bind_port` twin of [`kcp_bind_port_reader_answers_from_this_build`].
+    #[test]
+    fn quic_bind_port_reader_answers_from_this_build() {
+        use frp_core::config::ListenerPortReader::{Absent, Present};
+
+        let got = quic_bind_port_reader();
+        let want = if cfg!(feature = "quic") {
+            Present
+        } else {
+            Absent
+        };
+        assert_eq!(
+            got, want,
+            "quic_bind_port's reader is this crate's `quic` feature"
+        );
+        assert_ne!(Present, Absent);
+        println!("quic-bind-port-reader-pin: assertions ran");
+    }
+
+    /// The `websocket_port` twin of
+    /// [`kcp_bind_port_reader_answers_from_this_build`]. There is no
+    /// `--websocket-port` flag, so this reader is only consulted for the file
+    /// key.
+    #[test]
+    fn websocket_port_reader_answers_from_this_build() {
+        use frp_core::config::ListenerPortReader::{Absent, Present};
+
+        let got = websocket_port_reader();
+        let want = if cfg!(feature = "websocket") {
+            Present
+        } else {
+            Absent
+        };
+        assert_eq!(
+            got, want,
+            "websocket_port's reader is this crate's `websocket` feature"
+        );
+        assert_ne!(Present, Absent);
+        println!("websocket-port-reader-pin: assertions ran");
+    }
+
+    /// The combined constructor must agree with the three individual readers —
+    /// the three fields are the same type, so a swapped pair would otherwise be
+    /// invisible.
+    #[test]
+    fn gated_listener_port_readers_answers_from_this_build() {
+        let got = gated_listener_port_readers();
+        assert_eq!(got.kcp, kcp_bind_port_reader());
+        assert_eq!(got.quic, quic_bind_port_reader());
+        assert_eq!(got.websocket, websocket_port_reader());
+        println!("gated-listener-port-readers-pin: assertions ran");
+    }
+
+    /// **The hand-named inner-feature shape, end to end through the loader.**
+    ///
+    /// A file naming all three ports is loaded exactly as `frps` loads it and the
+    /// record list is taken with **this build's** readers
+    /// (`gated_listener_port_readers`). The property asserted is shape-agnostic
+    /// and therefore holds in every lane:
+    ///
+    /// * this crate compiles the listener (`Present`) — `frp-server/kcp =
+    ///   ["frp-core/kcp"]` guarantees the field also exists, so nothing is
+    ///   unread and the key must be **silent**;
+    /// * this crate does not (`Absent`) — either `frp-core` dropped the key or it
+    ///   deserialized the field with no listener behind it (the hand-named
+    ///   shape), and the key must be **recorded** either way.
+    ///
+    /// That "either way" is what makes the field-present-without-a-listener case
+    /// assertable from this crate at all: only `frp-core` can see its own
+    /// feature, so the reader's answer is the only honest input here. The
+    /// `-p frp-server --no-default-features --all-targets` lane is the one that
+    /// reaches the `Absent` half with `frp-core/kcp` **on**
+    /// (`frp-core/src/config/tests.rs` pins the same split from the other side,
+    /// where `cfg!(feature = "kcp")` is visible).
+    #[test]
+    fn gated_listener_port_records_follow_this_builds_readers() {
+        use frp_core::config::ListenerPortReader::{Absent, Present};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frps.toml");
+        std::fs::write(
+            &path,
+            "bind_port = 7000\nkcp_bind_port = 7100\nquic_bind_port = 7200\n\
+             websocket_port = 7500\n",
+        )
+        .unwrap();
+        // Lenient, because in a build that compiles a field out the key is only
+        // *tolerated*; strict mode accepts it too
+        // (`frp-core/src/config/tests.rs` pins that), but lenient is the load
+        // `frps` performs unless asked otherwise.
+        let (cfg, presence) =
+            frp_core::config::load_server_config_with_presence(path.to_str().unwrap(), false)
+                .expect("the port keys load in every shape");
+        // The serde field set is the one fact about `frp-core`'s features that is
+        // observable from here, so it is measured rather than assumed: the
+        // field-present half of the hand-named shape is exactly
+        // `field_present && reader == Absent`.
+        let value = serde_json::to_value(&cfg).unwrap();
+        let records = presence.unhonoured_server_feature_key_records(gated_listener_port_readers());
+        for (key, reader) in [
+            ("kcp_bind_port", kcp_bind_port_reader()),
+            ("quic_bind_port", quic_bind_port_reader()),
+            ("websocket_port", websocket_port_reader()),
+        ] {
+            let field_present = value.get(key).and_then(|port| port.as_u64()).is_some();
+            let recorded = records.iter().any(|record| record.contains(key));
+            assert_eq!(
+                recorded,
+                reader == Absent || !field_present,
+                "`{key}` must be recorded exactly when this build has no listener for it \
+                 (reader {reader:?}, frp-core field present: {field_present}); \
+                 records: {records:?}"
+            );
+            println!(
+                "gated-listener-port-record-pin: {key} field_present={field_present} \
+                 reader={reader:?} record={recorded}"
+            );
+        }
+        assert_ne!(Present, Absent);
+        println!("gated-listener-port-record-pin: assertions ran");
     }
 }

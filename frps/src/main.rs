@@ -94,7 +94,7 @@ impl Drop for DirRegistryEntry {
 /// Main-task ownership of `SIGTERM`/`SIGINT` for the `--config-dir` lane.
 ///
 /// The Unix `SIGTERM` handler lives inside `Service::run` — it is installed by a
-/// task `run()` spawns at its top (`frp-server/src/service.rs:1107-1139`, the
+/// task `run()` spawns at its top (`frp-server/src/service.rs:1156-1188`, the
 /// same task that also takes `ctrl_c()`) — so a `SIGTERM` that lands between the
 /// startup line and that registration takes the kernel's default disposition
 /// and kills `frps` (`rc = -15`) instead of draining. The measured window is
@@ -389,7 +389,9 @@ fn run_verify(config_path: &str, strict_config: bool, allow_unsafe: &[String]) {
             // three runtime-built clause texts, `&'static str` for the two
             // reader-gated ones), so they are printed in two loops rather than
             // chained.
-            for record in presence.unhonoured_server_feature_key_records() {
+            for record in presence.unhonoured_server_feature_key_records(
+                frp_server::service::gated_listener_port_readers(),
+            ) {
                 println!("{record}");
             }
             for record in presence.unhonoured_reader_gated_port_records(
@@ -420,7 +422,7 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     // Go frp parity (TODO.md:9838): with an explicit `-c` the config file is
     // authoritative for the whole `[log]` section, exactly as it is for the
     // config flags — the `-c` branch of `main` skips `override_server_config`
-    // (`frps/src/main.rs:1060-1062`), so consulting the CLI log flags here would
+    // (`frps/src/main.rs:1068-1070`), so consulting the CLI log flags here would
     // silently re-honour the very flags that gate exists to discard. Measured
     // on Go v0.71.0: `frps -c frps.toml --log-level info` over a file with
     // `[log] level = "warn"` emits 0 `INFO` records; before this gate frp-rs
@@ -429,10 +431,10 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     // The predicate is `cli.config.is_none() || cli.config_dir.is_some()`, not
     // `!cli.cli_overrides_enabled()`: `--config-dir` is an frp-rs-only extension
     // whose lane *does* honour the CLI log flags — its `init_logging(&cli, None)`
-    // call (`frps/src/main.rs:524`) has no config to defer to, so masking there
+    // call (`frps/src/main.rs:526`) has no config to defer to, so masking there
     // would silently drop the flag to the built-in default. When `-c` and
     // `--config-dir` are given together it is the config-dir branch
-    // (`frps/src/main.rs:523`) that runs, so `cli.config_dir.is_some()` must
+    // (`frps/src/main.rs:525`) that runs, so `cli.config_dir.is_some()` must
     // override `cli.config.is_some()`.
     let cli_log_flags_apply = cli.config.is_none() || cli.config_dir.is_some();
     let (cli_level, cli_file, cli_max_days, cli_format) = if cli_log_flags_apply {
@@ -628,12 +630,18 @@ async fn run(mut cli: FrpsArgs) {
                     // The flat server `tls_enable` is inert too; same sink, same
                     // one-record-per-load rule.
                     presence.warn_inert_server_tls_enable();
-                    // And the listener ports this build's `frp-core` features
-                    // cannot deserialize (`kcp_bind_port`, `quic_bind_port`,
-                    // `websocket_port`): serde drops the key and the listener is
-                    // not compiled, so this record is the only signal that the
-                    // named port stays closed.
-                    presence.warn_unhonoured_server_feature_keys();
+                    // And the listener ports this build cannot honour
+                    // (`kcp_bind_port`, `quic_bind_port`, `websocket_port`).
+                    // Either `frp-core` has no field for the key — serde drops
+                    // it — or the field exists and `frp-server` was built
+                    // without the listener (the hand-named inner-feature shape);
+                    // the record is the only signal that the named port stays
+                    // closed. The reader answer comes from `frp-server`, the
+                    // crate that owns the listeners — never from this binary's
+                    // own `cfg!`.
+                    presence.warn_unhonoured_server_feature_keys(
+                        frp_server::service::gated_listener_port_readers(),
+                    );
                     // And the two listener ports whose *field* is present but
                     // whose reader is not: `web_server.port` (this build's
                     // `frp-server/dashboard` off) and
@@ -820,10 +828,10 @@ async fn run(mut cli: FrpsArgs) {
                             if let Err(e) = service.run().await {
                                 // `Service::run` has exactly one `Ok(())`
                                 // return — its graceful-shutdown tail
-                                // (`frp-server/src/service.rs:1529`) — so this
+                                // (`frp-server/src/service.rs:1578`) — so this
                                 // arm means the service stopped for good. The
                                 // single-config path maps any `run()` error to
-                                // `EXIT_RUNTIME` (`frps/src/main.rs:1182-1185`),
+                                // `EXIT_RUNTIME` (`frps/src/main.rs:1194-1197`),
                                 // and this lane carries the same code out,
                                 // pinned on both lanes by
                                 // `config_dir_where_every_service_fails_to_run_exits_like_dash_c`
@@ -965,7 +973,7 @@ async fn run(mut cli: FrpsArgs) {
         // code out of construction, or `EXIT_RUNTIME` when `run()` failed — and
         // `Ok(())` only when the service ran to a graceful shutdown, the sole
         // `Ok` return in `Service::run`
-        // (`frp-server/src/service.rs:1529`). A **panicking** task reports
+        // (`frp-server/src/service.rs:1578`). A **panicking** task reports
         // `Err(JoinError)`; it is counted as an `EXIT_RUNTIME` failure rather
         // than merely logged, because `Service::run` cannot have returned
         // `Ok(())` on a panic and dropping it let a directory where every task
@@ -1087,10 +1095,14 @@ async fn run(mut cli: FrpsArgs) {
     // `frps` reads `ServerConfig::tls_enable`, and a restart cannot make it take
     // effect. Same sink, same one-record-per-load rule.
     presence.warn_inert_server_tls_enable();
-    // ... and for the feature-gated listener ports this build has no field for:
-    // the `--config-dir` branch above warns at its own load site, so no path
-    // double-warns here either.
-    presence.warn_unhonoured_server_feature_keys();
+    // ... and for the feature-gated listener ports this build cannot honour —
+    // either this `frp-core` has no field for the key, or the field exists and
+    // `frp-server` has no listener for it (the hand-named inner-feature shape;
+    // `cli_overrides_enabled` above merged any `--kcp-bind-port` /
+    // `--quic-bind-port` overlay into the same flags). The `--config-dir` branch
+    // above warns at its own load site, so no path double-warns here either.
+    presence
+        .warn_unhonoured_server_feature_keys(frp_server::service::gated_listener_port_readers());
     // ... and for the two listener ports whose field this build *has* but whose
     // reader it does not: `web_server.port` (`frp-server/dashboard` off) and
     // `ssh_tunnel_gateway.bind_port` (`frp-server/ssh` off). Same sink, same

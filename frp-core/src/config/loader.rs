@@ -242,21 +242,34 @@ pub struct ConfigPresence {
     /// `kcp_bind_port` / `kcpBindPort` — at the top level, under `[common]`
     /// (flattened into the root by `normalize_server_config` before this is
     /// read), in an `.ini` file, or in an `includes` file — was written with a
-    /// **non-zero** port in a build whose `kcp` feature is off, so
-    /// `ServerConfig` has no such field, serde drops the key, and
-    /// `frp-server`'s KCP listener is not compiled: the port the file names
-    /// stays closed. Only a value other than the integer `0` counts, because
-    /// `0` is the documented "disabled" value and every build shape honours it
-    /// identically (`docs/config.md`, the three gated listener rows). See
+    /// **non-zero** port this build may not honour. Only a value other than the
+    /// integer `0` counts, because `0` is the documented "disabled" value and
+    /// every build shape honours it identically (`docs/config.md`, the three
+    /// gated listener rows).
+    ///
+    /// Computed in **every** build, like [`Self::web_server_port_unhonoured`],
+    /// because "does this build read the port" has two holes and this crate can
+    /// answer only the first:
+    ///
+    /// * this crate's `kcp` feature is off — `ServerConfig` has no such field,
+    ///   serde drops the key, and nothing can read it;
+    /// * this crate's `kcp` feature is **on** but the crate that owns the
+    ///   listener (`frp-server`, its `kcp` feature) is off — the hand-named
+    ///   shape `cargo build -p frps --no-default-features --features
+    ///   tiny,frp-core/kcp`, where the field deserializes and no listener is
+    ///   compiled.
+    ///
+    /// The caller's [`GatedListenerPortReaders`] supplies the second fact: the
+    /// field-less direction warns regardless of the reader (nothing can read a
+    /// field that does not exist), the field-present direction warns only for
+    /// [`ListenerPortReader::Absent`]. See
     /// [`ConfigPresence::warn_unhonoured_server_feature_keys`].
-    #[cfg(not(feature = "kcp"))]
     pub(super) server_kcp_bind_port_unhonoured: bool,
     /// The `quic` twin of [`Self::server_kcp_bind_port_unhonoured`].
-    #[cfg(not(feature = "quic"))]
     pub(super) server_quic_bind_port_unhonoured: bool,
     /// The `websocket` twin of [`Self::server_kcp_bind_port_unhonoured`]
-    /// (`websocket_port` / `websocketPort`).
-    #[cfg(not(feature = "websocket"))]
+    /// (`websocket_port` / `websocketPort`). It has no CLI flag, so only this
+    /// file-key half reaches the hand-named shape.
     pub(super) server_websocket_port_unhonoured: bool,
     /// `web_server.port` / `webServer.port` — at the top level, under
     /// `[common]`, in an `.ini` file, in an `includes` file, or via the legacy
@@ -349,10 +362,11 @@ impl WebServerTlsEnableReader {
 /// [`ConfigPresence::warn_inert_web_server_port`] /
 /// [`ConfigPresence::warn_inert_ssh_tunnel_gateway_bind_port`].
 ///
-/// This is the deliberate difference from the three `#[cfg]`-gated kcp / quic /
-/// websocket ports: there the *field* is compiled out, so the presence flag
-/// itself carries the build shape ([`ConfigPresence::warn_unhonoured_server_feature_keys`]);
-/// here the field is always present and only the reader is missing.
+/// The three `#[cfg]`-gated kcp / quic / websocket ports answer the same
+/// question the same way, through [`GatedListenerPortReaders`]: for them the
+/// *field* can additionally be compiled out, so `frp-core` folds that fact in
+/// and the caller's answer decides only the field-present half
+/// ([`ConfigPresence::warn_unhonoured_server_feature_keys`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListenerPortReader {
     /// The feature that reads the port is compiled: a non-zero port is honoured
@@ -375,42 +389,101 @@ impl ListenerPortReader {
     }
 }
 
-/// The reader-gated listener **ports** a CLI overlay actually applied.
+/// The three `#[cfg]`-gated listener ports' "does this build read the port"
+/// answers, resolved by the crate that owns the listeners.
+///
+/// `kcp_bind_port`, `quic_bind_port` and `websocket_port` are `#[cfg]`-gated on
+/// **`frp-core`'s** features in `ServerConfig`, while the only code that reads
+/// them is `frp-server`'s (`frp-server/Cargo.toml`: `kcp = ["frp-core/kcp"]`,
+/// and the same one-way implication for `quic` / `websocket`). The implication
+/// runs one way, so a caller can name the inner feature by hand and get the
+/// field without the listener:
+///
+/// ```text
+/// cargo build -p frps --no-default-features --features tiny,frp-core/kcp
+/// ```
+///
+/// There this crate compiles the field and emits `--kcp-bind-port` in `--help`,
+/// while `frp-server/kcp` is off and no listener reads the port. `frp-core`
+/// cannot observe the outer feature, so the binary asks the owning crate —
+/// `frp_server::service::kcp_bind_port_reader()` and its two twins, or
+/// `gated_listener_port_readers()` for all three — and passes the answer to
+/// [`ConfigPresence::warn_unhonoured_server_feature_keys`], never a `cfg!` of
+/// its own (`frps`'s `kcp` feature is off in every default `full` build, so a
+/// binary-local `cfg!(feature = "kcp")` would answer for a different crate).
+///
+/// The field-less half needs no reader: when **this** crate's feature is off the
+/// key is dropped before serde sees it and the port is unread whatever the
+/// caller reports (see
+/// [`ConfigPresence::unhonoured_server_feature_key_records`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatedListenerPortReaders {
+    /// `frp-server`'s `kcp` feature — its KCP listener is the port's only
+    /// reader.
+    pub kcp: ListenerPortReader,
+    /// The `quic` twin: `frp-server`'s `quic` feature.
+    pub quic: ListenerPortReader,
+    /// The `websocket` twin: `frp-server`'s `websocket` feature. There is no
+    /// `--websocket-port` flag, so this reader is only ever consulted for the
+    /// file key.
+    pub websocket: ListenerPortReader,
+}
+
+impl GatedListenerPortReaders {
+    /// The owning crate's answers from its own three feature gates — the shape
+    /// `frp_server::service::gated_listener_port_readers()` returns.
+    pub const fn from_features(has_kcp: bool, has_quic: bool, has_websocket: bool) -> Self {
+        Self {
+            kcp: ListenerPortReader::from_features(has_kcp),
+            quic: ListenerPortReader::from_features(has_quic),
+            websocket: ListenerPortReader::from_features(has_websocket),
+        }
+    }
+}
+
+/// The listener **ports** a CLI overlay actually applied.
 ///
 /// The config-file path resolves the same question inside
-/// [`ConfigPresence::from_normalized_value`] (`sub_port_requested`, which counts
-/// only a **non-zero** port). The CLI overlay, however, runs *after* that load —
-/// `FrpsArgs::override_server_config` writes `cfg.web_server.port` directly — so
-/// its writes are a second source of the same request and have to be merged into
-/// the same presence flag. Without that, `frps --dashboard-port 7500` (with no
-/// `-c`/`--config-dir`) binds no dashboard and says nothing, while the identical
-/// `[web_server] port = 7500` in a file warns.
+/// [`ConfigPresence::from_normalized_value`] (`port_requested` /
+/// `sub_port_requested`, which count only a **non-zero** port). The CLI overlay,
+/// however, runs *after* that load — `FrpsArgs::override_server_config` writes
+/// `cfg.web_server.port` / `cfg.kcp_bind_port` / `cfg.quic_bind_port` directly —
+/// so its writes are a second source of the same request and have to be merged
+/// into the same presence flag. Without that, `frps --dashboard-port 7500` (with
+/// no `-c`/`--config-dir`) binds no dashboard and says nothing, while the
+/// identical `[web_server] port = 7500` in a file warns.
 ///
-/// **The whole family, enumerated**, because `web_server.port` is not obviously
-/// alone: `web_server.port` is reachable from the overlay through
-/// `--dashboard-port`, which `svr_dashboard` registers on **every** shape, so
-/// flag and warning are always reachable together. The other reader-gated ports
-/// cannot be applied by the overlay at all — `ssh_tunnel_gateway.bind_port` and
-/// `websocket_port` have no CLI flag, and `--kcp-bind-port`/`--quic-bind-port`
-/// exist only under **this crate's** `cfg(feature = "kcp")`/`cfg(feature =
-/// "quic")`. Every shape `frps`'s own feature names produce moves that feature
-/// in step with `frp-server`'s listener (`frps/kcp = ["frp-server/kcp"]` and
-/// `frp-server/kcp = ["frp-core/kcp"]`, one way each), so there the flag is an
-/// unknown-flag error rather than a silent ignore. A caller who names the inner
-/// feature by hand — `cargo build -p frps --no-default-features --features
-/// tiny,frp-core/kcp` — gets the parser without the listener: `--help`
-/// advertises `--kcp-bind-port`, running it binds no UDP socket and prints no
-/// record, and the `kcp_bind_port` file key is silent for the same reason (the
-/// asymmetry `restart_only.rs` describes for the *field* is this one on the
-/// *flag* side). No lane builds an `frps` binary in that combination — only
-/// `frp-server`'s own `--all-targets` build reaches it, through the
-/// `frp-client` dev-dependency — so it is the one gap this struct does not
-/// close.
+/// **The whole family, enumerated.**
+///
+/// * `web_server.port` — reachable through `--dashboard-port`, which
+///   `svr_dashboard` registers on **every** shape, so flag and warning are
+///   always reachable together.
+/// * `kcp_bind_port` / `quic_bind_port` — reachable through
+///   `--kcp-bind-port` / `--quic-bind-port`, which exist only under **this
+///   crate's** `cfg(feature = "kcp")`/`cfg(feature = "quic")`. Every shape
+///   `frps`'s own feature names produce moves that feature in step with
+///   `frp-server`'s listener (`frps/kcp = ["frp-server/kcp"]` and
+///   `frp-server/kcp = ["frp-core/kcp"]`, one way each). A caller who names the
+///   inner feature by hand — `cargo build -p frps --no-default-features
+///   --features tiny,frp-core/kcp` — gets the parser without the listener, so
+///   the flag is accepted and must be recorded here; that is the half this
+///   struct closes ([`GatedListenerPortReaders`] carries the reader answer that
+///   turns the record on).
+/// * `ssh_tunnel_gateway.bind_port` and `websocket_port` — **not** in this
+///   struct because they have no CLI flag at all, so the overlay can never be
+///   their second source; their file-key half is recorded by
+///   [`ConfigPresence::from_normalized_value`] and gated by
+///   [`ListenerPortReader`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AppliedReaderGatedPorts {
     /// A **non-zero** `--dashboard-port` wrote `web_server.port`, whose only
     /// reader is `frp-server`'s `dashboard` feature.
     pub web_server_port: bool,
+    /// A **non-zero** `--kcp-bind-port` wrote `kcp_bind_port`, whose only
+    /// reader is `frp-server`'s `kcp` feature.
+    pub kcp_bind_port: bool,
+    /// The `quic` twin of [`Self::kcp_bind_port`].
+    pub quic_bind_port: bool,
 }
 
 /// The `[web_server.tls] enable` diagnostic for a build that **compiles a
@@ -509,7 +582,7 @@ pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS: &str = "web_server.tls.ena
 ///
 /// **Two variants, selected by the `tls` feature**, because the certificate
 /// clauses are false in a build with no TLS: `frp-server`'s whole acceptor block
-/// is `#[cfg(feature = "tls")]` (`frp-server/src/service.rs:644`) while this
+/// is `#[cfg(feature = "tls")]` (`frp-server/src/service.rs:693`) while this
 /// warning is not, and `release.yml` ships `frps-micro` / `frps-tiny` (tiny keeps
 /// `tls`; **micro does not**). Measured on a real `frps-micro`
 /// (`/tmp/tls-warn-probe/run-micro.sh`): `tls_enable = true` + only
@@ -538,8 +611,8 @@ pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS: &str = "web_server.tls.ena
 /// "tls" (command-line)` → `frp-client feature "tls"`); the same command with
 /// `-i frp-server` shows frp-server's only branch as `frps feature "micro"
 /// (command-line)`, with no `tls` feature. That binary gates the acceptor off
-/// (`frp-server/src/service.rs:644` is `#[cfg(feature = "tls")]`, with the
-/// no-acceptor branch at `:676`), so this variant's certificate clauses would
+/// (`frp-server/src/service.rs:693` is `#[cfg(feature = "tls")]`, with the
+/// no-acceptor branch at `:725`), so this variant's certificate clauses would
 /// describe a path it cannot take. Every lane builds at the
 /// workspace root with `tiny`/`micro`
 /// (`.github/workflows/release.yml:100/102/108/110/159/162/210/213` and
@@ -586,14 +659,17 @@ pub static SERVER_TLS_ENABLE_INERT_WARNING: std::sync::LazyLock<String> =
         clauses.join(" ")
     });
 
-/// The written-but-unhonourable `kcp_bind_port` diagnostic, as its clauses, in
-/// the only build shape that has one — `kcp` off, where `ServerConfig` has no
+/// The written-but-unhonourable `kcp_bind_port` diagnostic for the **field-less**
+/// shape, as its clauses — `kcp` off, where `ServerConfig` has no
 /// `kcp_bind_port` field, serde drops the key, and `frp-server` never builds the
 /// KCP listener. The text is **not** the `tls_enable` wording, because the two
 /// keys fail differently: `tls_enable` is a compiled field that no code reads
-/// (inert in every build shape), while `kcp_bind_port` is a live field that this
+/// (inert in every build shape), while `kcp_bind_port` here is a field this
 /// build *cannot parse at all* and would honour as soon as the feature came
-/// back. See [`SERVER_KCP_BIND_PORT_UNHONOURED_WARNING`].
+/// back. The field-present shape (`frp-core/kcp` on, `frp-server/kcp` off) has
+/// its own text, [`SERVER_KCP_BIND_PORT_UNHONOURED_NO_READER_CLAUSES`], because
+/// there the field deserializes and only the listener is missing. See
+/// [`SERVER_KCP_BIND_PORT_UNHONOURED_WARNING`].
 #[cfg(not(feature = "kcp"))]
 pub const SERVER_KCP_BIND_PORT_UNHONOURED_CLAUSES: [&str; 2] = [
     "kcp_bind_port has no effect in this build: frp-core's `kcp` feature is off, \
@@ -601,6 +677,25 @@ pub const SERVER_KCP_BIND_PORT_UNHONOURED_CLAUSES: [&str; 2] = [
      listener the port names.",
     "Write `kcp_bind_port = 0` (the documented \"disabled\" value) to say so in the \
      file, or rebuild frps with the `kcp` feature to listen on it.",
+];
+
+/// The written-but-unhonourable `kcp_bind_port` diagnostic for the **hand-named
+/// inner-feature** shape: `frp-core`'s `kcp` feature is on, so `ServerConfig`
+/// deserializes the key and `frps --help` advertises `--kcp-bind-port`, while
+/// `frp-server`'s `kcp` feature is off, so nothing in the binary creates the
+/// listener the port names. The port is therefore neither rejected nor honoured —
+/// it is accepted and unread, which is the failure mode this text names.
+///
+/// Clauses because the field-less sibling is written that way and the two are
+/// joined identically; see [`SERVER_KCP_BIND_PORT_UNHONOURED_CLAUSES`] for why
+/// this wording differs from the `tls_enable` one.
+#[cfg(feature = "kcp")]
+pub const SERVER_KCP_BIND_PORT_UNHONOURED_NO_READER_CLAUSES: [&str; 2] = [
+    "kcp_bind_port has no effect in this build: frp-core compiled the field, but \
+     frp-server was built without its `kcp` feature, so nothing in this binary \
+     creates the KCP listener the port names.",
+    "Write `kcp_bind_port = 0` (the documented \"disabled\" value) to say so in the \
+     file, or rebuild frps with frp-server's `kcp` feature to listen on it.",
 ];
 
 /// The `quic` twin of [`SERVER_KCP_BIND_PORT_UNHONOURED_CLAUSES`].
@@ -611,6 +706,16 @@ pub const SERVER_QUIC_BIND_PORT_UNHONOURED_CLAUSES: [&str; 2] = [
      listener the port names.",
     "Write `quic_bind_port = 0` (the documented \"disabled\" value) to say so in the \
      file, or rebuild frps with the `quic` feature to listen on it.",
+];
+
+/// The `quic` twin of [`SERVER_KCP_BIND_PORT_UNHONOURED_NO_READER_CLAUSES`].
+#[cfg(feature = "quic")]
+pub const SERVER_QUIC_BIND_PORT_UNHONOURED_NO_READER_CLAUSES: [&str; 2] = [
+    "quic_bind_port has no effect in this build: frp-core compiled the field, but \
+     frp-server was built without its `quic` feature, so nothing in this binary \
+     creates the QUIC listener the port names.",
+    "Write `quic_bind_port = 0` (the documented \"disabled\" value) to say so in the \
+     file, or rebuild frps with frp-server's `quic` feature to listen on it.",
 ];
 
 /// The `websocket` twin of [`SERVER_KCP_BIND_PORT_UNHONOURED_CLAUSES`]
@@ -624,24 +729,57 @@ pub const SERVER_WEBSOCKET_PORT_UNHONOURED_CLAUSES: [&str; 2] = [
      file, or rebuild frps with the `websocket` feature to listen on it.",
 ];
 
-/// The written `kcp_bind_port` diagnostic: [`SERVER_KCP_BIND_PORT_UNHONOURED_CLAUSES`]
-/// joined with a single space, so the text is defined **once** (a `&str` const
-/// cannot join, hence the one-time `LazyLock`). Exists only in a `kcp`-off build;
-/// a build that compiles the field has nothing to report, and the presence flag
-/// it would read is not compiled either.
+/// The `websocket` twin of
+/// [`SERVER_KCP_BIND_PORT_UNHONOURED_NO_READER_CLAUSES`]. There is no
+/// `--websocket-port` flag, so this text reaches only the file-key half of the
+/// hand-named shape.
+#[cfg(feature = "websocket")]
+pub const SERVER_WEBSOCKET_PORT_UNHONOURED_NO_READER_CLAUSES: [&str; 2] = [
+    "websocket_port has no effect in this build: frp-core compiled the field, but \
+     frp-server was built without its `websocket` feature, so nothing in this \
+     binary creates the WebSocket listener the port names.",
+    "Write `websocket_port = 0` (the documented \"disabled\" value) to say so in the \
+     file, or rebuild frps with frp-server's `websocket` feature to listen on it.",
+];
+
+/// The written `kcp_bind_port` diagnostic for the field-less shape:
+/// [`SERVER_KCP_BIND_PORT_UNHONOURED_CLAUSES`] joined with a single space, so the
+/// text is defined **once** (a `&str` const cannot join, hence the one-time
+/// `LazyLock`). Exists only in a `kcp`-off build; a build that compiles the field
+/// uses [`SERVER_KCP_BIND_PORT_UNHONOURED_NO_READER_WARNING`] when its listener
+/// is missing and stays silent otherwise.
 #[cfg(not(feature = "kcp"))]
 pub static SERVER_KCP_BIND_PORT_UNHONOURED_WARNING: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| SERVER_KCP_BIND_PORT_UNHONOURED_CLAUSES.join(" "));
+
+/// The field-present sibling of [`SERVER_KCP_BIND_PORT_UNHONOURED_WARNING`]:
+/// [`SERVER_KCP_BIND_PORT_UNHONOURED_NO_READER_CLAUSES`] joined with a single
+/// space. Emitted only when the caller reports
+/// [`ListenerPortReader::Absent`] for `frp-server`'s `kcp` feature.
+#[cfg(feature = "kcp")]
+pub static SERVER_KCP_BIND_PORT_UNHONOURED_NO_READER_WARNING: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| SERVER_KCP_BIND_PORT_UNHONOURED_NO_READER_CLAUSES.join(" "));
 
 /// The `quic` twin of [`SERVER_KCP_BIND_PORT_UNHONOURED_WARNING`].
 #[cfg(not(feature = "quic"))]
 pub static SERVER_QUIC_BIND_PORT_UNHONOURED_WARNING: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| SERVER_QUIC_BIND_PORT_UNHONOURED_CLAUSES.join(" "));
 
+/// The `quic` twin of [`SERVER_KCP_BIND_PORT_UNHONOURED_NO_READER_WARNING`].
+#[cfg(feature = "quic")]
+pub static SERVER_QUIC_BIND_PORT_UNHONOURED_NO_READER_WARNING: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| SERVER_QUIC_BIND_PORT_UNHONOURED_NO_READER_CLAUSES.join(" "));
+
 /// The `websocket` twin of [`SERVER_KCP_BIND_PORT_UNHONOURED_WARNING`].
 #[cfg(not(feature = "websocket"))]
 pub static SERVER_WEBSOCKET_PORT_UNHONOURED_WARNING: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| SERVER_WEBSOCKET_PORT_UNHONOURED_CLAUSES.join(" "));
+
+/// The `websocket` twin of
+/// [`SERVER_KCP_BIND_PORT_UNHONOURED_NO_READER_WARNING`].
+#[cfg(feature = "websocket")]
+pub static SERVER_WEBSOCKET_PORT_UNHONOURED_NO_READER_WARNING: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| SERVER_WEBSOCKET_PORT_UNHONOURED_NO_READER_CLAUSES.join(" "));
 
 /// The written-but-unhonoured `web_server.port` diagnostic, in one place so
 /// `frps` and `frp-server` cannot drift. Callers gate it on
@@ -718,7 +856,6 @@ fn sub_port_requested(table: &toml::Table, section: &str, snake: &str, camel: &s
 ///
 /// The value-level rule, the `.ini` zero spellings included, is
 /// [`port_value_requests_a_listener`]'s.
-#[cfg(not(all(feature = "kcp", feature = "quic", feature = "websocket")))]
 fn port_requested(table: &toml::Table, snake: &str, camel: &str) -> bool {
     [snake, camel]
         .iter()
@@ -743,24 +880,20 @@ impl ConfigPresence {
                     transport.contains_key("heartbeat_timeout")
                         || transport.contains_key("heartbeatTimeout")
                 });
-        // The three feature-gated listener ports: only the builds that cannot
-        // deserialize the field carry the flag, so a capable build holds no
-        // `false`-forever field (`dead_code`) and cannot emit the record.
-        #[cfg(not(feature = "kcp"))]
-        {
-            presence.server_kcp_bind_port_unhonoured =
-                port_requested(table, "kcp_bind_port", "kcpBindPort");
-        }
-        #[cfg(not(feature = "quic"))]
-        {
-            presence.server_quic_bind_port_unhonoured =
-                port_requested(table, "quic_bind_port", "quicBindPort");
-        }
-        #[cfg(not(feature = "websocket"))]
-        {
-            presence.server_websocket_port_unhonoured =
-                port_requested(table, "websocket_port", "websocketPort");
-        }
+        // The three feature-gated listener ports: the flag is computed in
+        // **every** build, like `web_server_port_unhonoured` below, because the
+        // "nothing reads this port" fact has two sources — this crate's feature
+        // compiled the field out, or the owning crate's feature compiled the
+        // listener out — and only the caller can report the second. `frp-core`
+        // folds in the first (see
+        // `unhonoured_server_feature_key_records`), so a capable build still
+        // carries the flags rather than compiling them away.
+        presence.server_kcp_bind_port_unhonoured =
+            port_requested(table, "kcp_bind_port", "kcpBindPort");
+        presence.server_quic_bind_port_unhonoured =
+            port_requested(table, "quic_bind_port", "quicBindPort");
+        presence.server_websocket_port_unhonoured =
+            port_requested(table, "websocket_port", "websocketPort");
         // The two listener ports whose **reader** lives in `frp-server`, not
         // here. The field is unconditional in `ServerConfig`, so every build
         // deserializes it and only the owning crate can say whether anything
@@ -974,8 +1107,8 @@ impl ConfigPresence {
     /// Emit the build-shape diagnostic for each feature-gated server listener
     /// port the file named **and** this build cannot honour, once per load.
     ///
-    /// A `#[cfg(feature = "kcp")]` / `quic` / `websocket` field is invisible to
-    /// this build's serde: `websocket_port = 7500` in a `--no-default-features`
+    /// A `#[cfg(feature = "kcp")]` / `quic` / `websocket` field may be invisible
+    /// to this build's serde: `websocket_port = 7500` in a `--no-default-features`
     /// build parses without error and binds nothing, so before this diagnostic
     /// the only trace of the key was the port that never opened. Each flag is
     /// computed where the field would have been deserialized (see
@@ -983,25 +1116,38 @@ impl ConfigPresence {
     /// every spelling the file may use — snake_case, the Go-inspired camelCase
     /// alias, `[common]` (flattened before the read), `.ini`, `includes`.
     ///
+    /// **Two inert shapes, and `readers` is the caller's answer for the second.**
+    ///
+    /// * this crate's feature is off — `ServerConfig` has no field, serde drops
+    ///   the key, and no listener can read it. Reported whatever the caller says,
+    ///   because no call to `ListenerPortReader` can create a field;
+    /// * this crate's feature is **on** but the owning crate's listener is off —
+    ///   the hand-named inner-feature shape
+    ///   (`cargo build -p frps --no-default-features --features tiny,frp-core/kcp`),
+    ///   where the key deserializes, `--help` advertises the flag, and nothing
+    ///   reads the port. Reported when the caller answers
+    ///   [`ListenerPortReader::Absent`] for that port.
+    ///
     /// **Only a non-zero value warns.** `0` is the documented "disabled" value
     /// for all three ports (`docs/config.md`), a capable build's reader gates on
     /// `> 0` as well, and no build shape can tell `= 0` apart from an absent key
     /// in its effect — so a presence-driven record would report a key that is
     /// fully honoured. This is the one deliberate difference from
     /// [`Self::warn_inert_server_tls_enable`], which warns on presence: that
-    /// field is inert **either way**, this one is inert only in this build shape
-    /// and only for a value that asks for a listener.
+    /// field is inert **either way**, this one is inert only in these build
+    /// shapes and only for a value that asks for a listener.
     ///
     /// Called by the three **server**-config load sites that have a log sink —
     /// `frps`'s two startup paths (`-c`, `--config-dir`) and `frp-server`'s
-    /// `Service::reload` — beside the `tls_enable` call. `frps verify` does not
-    /// use this method, because it has no subscriber; it reads
+    /// `Service::reload` — beside the `tls_enable` call, each handing over
+    /// `frp_server::service::gated_listener_port_readers()`. `frps verify` does
+    /// not use this method, because it has no subscriber; it reads
     /// [`Self::unhonoured_server_feature_key_records`] and prints the same texts
     /// to stdout itself. No `frpc`/`frp-client` site calls it, because this is a
     /// `ServerConfig` fact only. Pinned in both build shapes by
     /// `feature_gated_server_ports_*` in `frp-core/src/config/tests.rs`.
-    pub fn warn_unhonoured_server_feature_keys(&self) {
-        for record in self.unhonoured_server_feature_key_records() {
+    pub fn warn_unhonoured_server_feature_keys(&self, readers: GatedListenerPortReaders) {
+        for record in self.unhonoured_server_feature_key_records(readers) {
             tracing::warn!("{record}");
         }
     }
@@ -1011,7 +1157,22 @@ impl ConfigPresence {
     /// [`Self::warn_unhonoured_server_feature_keys`] logs them and `frps verify`
     /// prints them directly (that path installs no subscriber, so a
     /// `tracing::warn!` there would reach nobody).
-    pub fn unhonoured_server_feature_key_records(&self) -> Vec<String> {
+    ///
+    /// `readers` is the **caller's** answer from the crate that owns the
+    /// listeners (`frp_server::service::gated_listener_port_readers`), never the
+    /// binary's own `cfg!` — `frps`'s `kcp` feature is off in every default
+    /// `full` build while the field it gates is `frp-core`'s. It decides only
+    /// the field-present half; a feature this crate compiled out warns
+    /// regardless, because nothing can read a field that does not exist (and
+    /// `frp-server/kcp = ["frp-core/kcp"]` makes the opposite combination
+    /// unreachable anyway).
+    pub fn unhonoured_server_feature_key_records(
+        &self,
+        readers: GatedListenerPortReaders,
+    ) -> Vec<String> {
+        // `readers` is read only inside the `#[cfg(feature = …)]` arms below, so
+        // a build that compiles all three features out would leave it unused.
+        let _ = readers;
         // The pushes below are each `#[cfg]`-gated, so in a build that compiles
         // all three features `mut` is genuinely unused; the allow is scoped to
         // this binding rather than the whole function.
@@ -1021,13 +1182,26 @@ impl ConfigPresence {
         if self.server_kcp_bind_port_unhonoured {
             records.push(SERVER_KCP_BIND_PORT_UNHONOURED_WARNING.clone());
         }
+        #[cfg(feature = "kcp")]
+        if self.server_kcp_bind_port_unhonoured && readers.kcp == ListenerPortReader::Absent {
+            records.push(SERVER_KCP_BIND_PORT_UNHONOURED_NO_READER_WARNING.clone());
+        }
         #[cfg(not(feature = "quic"))]
         if self.server_quic_bind_port_unhonoured {
             records.push(SERVER_QUIC_BIND_PORT_UNHONOURED_WARNING.clone());
         }
+        #[cfg(feature = "quic")]
+        if self.server_quic_bind_port_unhonoured && readers.quic == ListenerPortReader::Absent {
+            records.push(SERVER_QUIC_BIND_PORT_UNHONOURED_NO_READER_WARNING.clone());
+        }
         #[cfg(not(feature = "websocket"))]
         if self.server_websocket_port_unhonoured {
             records.push(SERVER_WEBSOCKET_PORT_UNHONOURED_WARNING.clone());
+        }
+        #[cfg(feature = "websocket")]
+        if self.server_websocket_port_unhonoured && readers.websocket == ListenerPortReader::Absent
+        {
+            records.push(SERVER_WEBSOCKET_PORT_UNHONOURED_NO_READER_WARNING.clone());
         }
         records
     }
@@ -1075,17 +1249,23 @@ impl ConfigPresence {
         }
     }
 
-    /// Record the reader-gated listener ports a **CLI overlay** applied, so the
-    /// overlay's writes are reported by the same
-    /// [`Self::warn_inert_web_server_port`] path as the config file's.
+    /// Record the listener ports a **CLI overlay** applied, so the overlay's
+    /// writes are reported by the same delivery paths as the config file's:
+    /// `web_server.port` through [`Self::warn_inert_web_server_port`], the two
+    /// `frp-core`-gated ports through [`Self::warn_unhonoured_server_feature_keys`].
     ///
     /// The caller is `frps`, between the `cli.cli_overrides_enabled()` overlay
     /// and the `warn_inert_*` calls (see `frps/src/main.rs`), and the argument is
     /// what `FrpsArgs::override_server_config` reports it wrote — never a value
     /// derived from the overlay's absence. See [`AppliedReaderGatedPorts`] for
-    /// why `web_server.port` is the only port this can carry.
+    /// why `--kcp-bind-port` / `--quic-bind-port` are here (they exist only under
+    /// this crate's feature gates, and the hand-named inner-feature shape can
+    /// reach them without the listener) and why
+    /// `ssh_tunnel_gateway.bind_port` / `websocket_port` are not (no CLI flag).
     pub fn record_applied_reader_gated_ports(&mut self, applied: AppliedReaderGatedPorts) {
         self.web_server_port_unhonoured |= applied.web_server_port;
+        self.server_kcp_bind_port_unhonoured |= applied.kcp_bind_port;
+        self.server_quic_bind_port_unhonoured |= applied.quic_bind_port;
     }
 
     /// Emit the `web_server.port` record when the file named a **non-zero** port
