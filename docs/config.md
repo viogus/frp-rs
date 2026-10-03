@@ -1,7 +1,7 @@
 # Configuration Reference
 
-Complete field reference for frp-rs `frps.toml` and `frpc.toml`. Every field maps
-1:1 to a Go frp v0.71.0 equivalent.
+Complete field reference for frp-rs `frps.toml` and `frpc.toml`. Each row's **Go frp Equivalent** cell names the Go frp v0.71.0 `json` key
+that field corresponds to, or a `—` marker recording that frp-rs extends or diverges from Go, or one of the documented non-token shapes `**Required.**`, `` `sk` / `secretKey` `` and `` `transport.wireProtocol = "v2"` ``. `scripts/tests/docs-go-column.sh` checks the column row by row against a key set re-derived from `pkg/config/v1` (`scripts/tests/docs-go-column-go-keys.txt`).
 
 ---
 
@@ -20,7 +20,7 @@ Complete field reference for frp-rs `frps.toml` and `frpc.toml`. Every field map
 | `kcp_bind_port` | `u16` | `0` | `kcpBindPort` | KCP transport listener port. 0 = disabled. Requires `kcp` feature. |
 | `quic_bind_port` | `u16` | `0` | `quicBindPort` | QUIC transport listener port. 0 = disabled. Requires `quic` feature. |
 | `websocket_port` | `u16` | `0` | `—` (no Go server field; Go's `frps` carries WebSocket upgrades on `bindPort`, and Go's `pkg/config/v1` server config names no WebSocket port at all) | WebSocket transport listener port. 0 = disabled. Requires the `websocket` feature — this is an **frp-rs extension**: Go frp v0.71.0's `frps` has no such option, and a server config carrying the camelCase spelling `websocketPort` is refused with exactly `json: unknown field "websocketPort"` and binds neither port (re-measured against the real v0.71.0 binary: `frps verify -c <cfg>` prints that line and exits 1, while the same config without the key prints `frps: the configuration file <cfg> syntax is ok` and exits 0). frp-rs does accept the spelling, in two places: as a serde alias of this feature-gated field (`#[serde(default, alias = "websocketPort")]` immediately above `#[cfg(feature = "websocket")] pub websocket_port: u16`, `frp-core/src/config/server.rs:39-41`), and as an entry in the strict parser's acceptance set `known_server_keys()` (`frp-core/src/config/strict.rs:127`); the **serde alias** path is pinned by `frp-core/src/config/tests.rs:270` (the `websocketPort = 7500` input line) and `:286` (the `assert_eq!(cfg.websocket_port, 7500, "websocketPort")` that reads the field back), while the **strict allow-list entry** had no strict-mode test before this change — the test that anchors the serde alias loads through `load_server_config_from_str` (`frp-core/src/config/loader.rs:145-175`, TOML → normalize → `serde_json::from_value`) and never consults `known_server_keys()` — and this change adds one: `frp-core/src/config/tests.rs:14567` loads through the strict path (`frp-core/src/config/file.rs:81-88`, which passes `known_server_keys` as the acceptance set at `:85`), so the allow-list entry is now consulted by a test that also pins the accepted spellings and the compiled field set. **That divergence is deliberate and unchanged — now measured, not fixed:** strict mode keeps accepting the snake and the camel spelling in every build shape — refusing it would be the "false 400" direction `docs/deployment.md` rules out, and the repo's own `frps.toml` writes `kcp_bind_port`/`quic_bind_port`/`websocket_port` — while `frp-core/src/config/tests.rs:14567` pins both shapes: strict mode accepts both spellings, and `serde_json::to_value(&cfg)` carries the field exactly when the feature is compiled in, so a `--no-default-features` load omits the field and instead records the accepted-but-unhonoured key (the run path warns about it; the key stays accepted). The same statement is recorded next to `known_server_keys()` in `frp-core/src/config/strict.rs`. |
-| `sudp_port` | `u16` | `0` | `sudpPort` | Shared UDP port for all SUDP proxies. When > 0, SUDP proxies share this port instead of allocating individual ports. |
+| `sudp_port` | `u16` | `0` | — (frp-rs extension: Go v0.71.0's server config names no SUDP port — `sudpPort` is absent from the recorded `pkg/config/v1` key set, `scripts/tests/docs-go-column-go-keys.txt`) | Shared UDP port for all SUDP proxies. When > 0, SUDP proxies share this port instead of allocating individual ports. |
 | `sub_domain_host` | `string` | `""` | `subDomainHost` | Base domain for sub-domain proxy routing (e.g. `"example.com"`). A proxy with `subdomain = "web"` will be reachable at `web.example.com`. |
 | `tls_enable` | `bool` | `false` | `—` (no Go server field; Go's `TLS.Enable` is client-only, `transport.tls.enable`) | Declared by frp-rs's own `ServerConfig` for historical reasons: it has no counterpart in Go v0.71.0's server config at all, and the one place frp-rs's own code sets it from a Go-shaped input is the `[transport.tls]` flatten, which inserts it as `true` when that section carries `force = true`, `certFile` or `keyFile` (`frp-core/src/config/normalize.rs:865-884`) — but **read by nothing** on the server: the field is inert, so the reload neither applies it nor names it as restart-required, and a restart cannot make it take effect. The real server switch is `tls_only` below (Go's server-side `TLS.Force`); in a build that includes the `tls` feature the acceptor uses `tls_cert_file` / `tls_key_file` — with neither set the server auto-generates a self-signed pair, a half-written (only one of the two) or unreadable pair is refused at startup, and a SIGUSR1 reload that introduces one reports the failure and keeps the running acceptor — while a build without `tls` (the `micro` tier) never builds an acceptor and its warning says so instead. A load that **writes** it (flat, under `[common]`, or as a literal `tls_enable` inside `[transport.tls]`) is no longer silent: it emits one warning per load at each server load site that has a log sink (`tls_enable has no effect on the server: …`) — see the inert-fields note below. |
 | `tls_only` | `bool` | `false` | `transport.tls.force` | When true, the main `bind_port` only accepts TLS connections. Plain TCP and WebSocket upgrades are rejected. Clients must also have `tls_enable = true`. |
@@ -31,12 +31,12 @@ Complete field reference for frp-rs `frps.toml` and `frpc.toml`. Every field map
 | `allow_port_end` | `u16` | `65535` | `allowPorts` (end) | End of auto-assigned port range (inclusive). Used when `allow_ports` is empty. |
 | `allow_ports` | `string` | `""` | `allowPorts` | Comma-separated port ranges, e.g. `"10000-20000,30000-40000"`. Each range is inclusive on both ends. When non-empty, takes precedence over `allow_port_start`/`allow_port_end`. |
 | `max_ports_per_client` | `u64` | `0` | `maxPortsPerClient` | Maximum number of proxies a single client can register. 0 = unlimited. **Restart-only** (not reloadable). |
-| `max_conns_per_proxy` | `u64` | `0` | `maxConnsPerProxy` | Maximum concurrent connections per proxy. 0 = unlimited. **Restart-only**. |
-| `max_proxies_per_client` | `u64` | `0` | `maxProxiesPerClient` | Maximum number of proxy registrations per client (distinct from `max_ports_per_client`). 0 = unlimited. **Restart-only**. |
+| `max_conns_per_proxy` | `u64` | `0` | — (frp-rs extension: no Go v0.71.0 config field (Go has `maxPortsPerClient` only) — `maxConnsPerProxy` is absent from the recorded `pkg/config/v1` key set, `scripts/tests/docs-go-column-go-keys.txt`) | Maximum concurrent connections per proxy. 0 = unlimited. **Restart-only**. |
+| `max_proxies_per_client` | `u64` | `0` | — (frp-rs extension: no Go v0.71.0 config field — `maxProxiesPerClient` is absent from the recorded `pkg/config/v1` key set, `scripts/tests/docs-go-column-go-keys.txt`) | Maximum number of proxy registrations per client (distinct from `max_ports_per_client`). 0 = unlimited. **Restart-only**. |
 | `vhost_http_timeout` | `i64` | `60` | `vhostHTTPTimeout` | Timeout in seconds for backend HTTP response in VHost handler. Go's `--vhost-http-timeout` is registered with `Int64VarP` (`pkg/config/flags.go:237`) and its field is `int64`, so a negative value is accepted and means "no timeout"; the internal clamp caps positive values at 24 h (`VHOST_TIMEOUT_CAP_SECS`, `frp-server/src/vhost.rs:654`, applied by `clamp_vhost_timeout` at `:710`) — a cap Go does not have (residue R6 in `TODO.md`). |
 | `user_conn_timeout` | `u64` | `10` | `userConnTimeout` | Idle timeout in seconds on user-facing proxy connections. |
 | `detailed_errors_to_client` | `bool` | `true` | `detailedErrorsToClient` | When true (default), full Rust error details are included in client-facing error responses. When false, internal errors are replaced with generic messages. |
-| `tcp_mux_passthrough` | `bool` | `false` | `tcpMuxPassthrough` | When `tcp_mux` is enabled and yamux init fails, forward raw bytes to the VHost handler instead of closing the connection. |
+| `tcp_mux_passthrough` | `bool` | `false` | `tcpmuxPassthrough` | When `tcp_mux` is enabled and yamux init fails, forward raw bytes to the VHost handler instead of closing the connection. |
 | `udp_packet_size` | `usize` | `1500` | `udpPacketSize` | UDP packet buffer size in bytes. Controls the receive buffer for UDP proxy datagrams. Clamped to **[0, 65507]** at load (hostile values rejected — a 2^31 value would otherwise allocate multi-GiB UDP buffers). |
 | `nat_hole_analysis_data_reserve_hours` | `u64` | `168` | `natholeAnalysisDataReserveHours` | How long historical NAT behavior records are kept (in hours). Used by XTCP NAT analysis. |
 | `includes` | `string[]` | `[]` | `includes` | Glob patterns for additional config files to merge (`.toml`, `.ini`, `.json`, `.yaml`, `.yml`). Relative to the main config file directory. |
@@ -50,19 +50,19 @@ Authentication configuration for control connections.
 | `method` | `string` | `"token"` | `auth.method` | Authentication method: exactly `"token"` or `"oidc"`. An empty value completes to `"token"` (Go's `Auth.Complete()`); any other spelling is a **config-load error** with Go's text (`invalid auth method, optional values are [token oidc]`) on stdout and exit 1 — no lower-casing, no trimming. |
 | `token` | `string` | `""` | `auth.token` | Shared secret token for MD5-based authentication. Must match the client's token. |
 | `token_source` | `table` | `null` | `auth.tokenSource` | Dynamic token source. Mutually exclusive with `token`. |
-| `oidc_issuer` | `string` | `""` | `auth.oidcIssuer` | OIDC issuer URL. Used when `method = "oidc"`. |
-| `oidc_audience` | `string` | `""` | `auth.oidcAudience` | OIDC expected audience claim. |
-| `oidc_token_endpoint` | `string` | `""` | `auth.oidcTokenEndpoint` | OIDC token verification endpoint URL. |
-| `oidc_skip_expiry` | `bool` | `false` | `auth.oidcSkipExpiry` | Skip OIDC token expiry validation. For development only. |
-| `oidc_skip_issuer` | `bool` | `false` | `auth.oidcSkipIssuer` | Skip OIDC issuer validation. For development only. |
-| `oidc_skip_audience` | `bool` | `false` | `auth.oidcSkipAudience` | Skip OIDC audience (`"aud"` claim) validation entirely. When true, any validly-signed JWT is accepted regardless of audience. For development only. |
-| `oidc_additional_audience` | `string[]` | `[]` | `auth.oidcAdditionalAudience` | Additional accepted audiences. A token is accepted when its `"aud"` claim matches `oidc_audience` OR any entry of this list (union). |
-| `oidc_tls_trusted_ca_file` | `string` | `""` | `auth.oidcTLSTrustedCAFile` | Path to a custom CA certificate PEM file used to verify the OIDC provider's TLS certificate (openid-configuration / JWKS fetches). Extends the default root store with the file's certificates. |
-| `oidc_proxy_url` | `string` | `""` | `auth.oidcProxyURL` | HTTP/SOCKS5 proxy URL for OIDC provider HTTP requests. |
-| `oidc_skip_nbf` | `bool` | `false` | `auth.oidcSkipNbf` | Skip the `"nbf"` (not-before) claim validation. For development only. |
-| `authentication_timeout` | `i64` | `90` | `auth.authenticationTimeout` | Login timestamp freshness window in seconds (replay protection; `0` = disabled, Go frp default). |
-| `token_auth_timeout` | `bool` | `true` | `auth.tokenAuthTimeout` | Apply the freshness window to token (MD5) auth logins. |
-| `additional_auth_scopes` | `string[]` | `[]` | `auth.additionalAuthScopes` | Extra auth scopes: `"HeartBeats"`, `"NewWorkConns"`. When listed, those message types require authentication in addition to `Login`. |
+| `oidc_issuer` | `string` | `""` | `auth.oidc.issuer` | OIDC issuer URL. Used when `method = "oidc"`. |
+| `oidc_audience` | `string` | `""` | `auth.oidc.audience` | OIDC expected audience claim. |
+| `oidc_token_endpoint` | `string` | `""` | `auth.oidc.tokenEndpointURL` | OIDC token verification endpoint URL. |
+| `oidc_skip_expiry` | `bool` | `false` | `auth.oidc.skipExpiryCheck` | Skip OIDC token expiry validation. For development only. |
+| `oidc_skip_issuer` | `bool` | `false` | `auth.oidc.skipIssuerCheck` | Skip OIDC issuer validation. For development only. |
+| `oidc_skip_audience` | `bool` | `false` | — (frp-rs extension: Go's server OIDC has no audience skip — `auth.oidcSkipAudience` is absent from the recorded `pkg/config/v1` key set, `scripts/tests/docs-go-column-go-keys.txt`) | Skip OIDC audience (`"aud"` claim) validation entirely. When true, any validly-signed JWT is accepted regardless of audience. For development only. |
+| `oidc_additional_audience` | `string[]` | `[]` | — (frp-rs extension: Go v0.71.0 has no additional-audience key — `auth.oidcAdditionalAudience` is absent from the recorded `pkg/config/v1` key set, `scripts/tests/docs-go-column-go-keys.txt`) | Additional accepted audiences. A token is accepted when its `"aud"` claim matches `oidc_audience` OR any entry of this list (union). |
+| `oidc_tls_trusted_ca_file` | `string` | `""` | `auth.oidc.trustedCaFile` | Path to a custom CA certificate PEM file used to verify the OIDC provider's TLS certificate (openid-configuration / JWKS fetches). Extends the default root store with the file's certificates. |
+| `oidc_proxy_url` | `string` | `""` | `auth.oidc.proxyURL` | HTTP/SOCKS5 proxy URL for OIDC provider HTTP requests. |
+| `oidc_skip_nbf` | `bool` | `false` | — (frp-rs extension: Go v0.71.0 has no not-before skip — `auth.oidcSkipNbf` is absent from the recorded `pkg/config/v1` key set, `scripts/tests/docs-go-column-go-keys.txt`) | Skip the `"nbf"` (not-before) claim validation. For development only. |
+| `authentication_timeout` | `i64` | `90` | — (frp-rs extension: Go v0.71.0's `auth` section has no authentication timeout — `auth.authenticationTimeout` is absent from the recorded `pkg/config/v1` key set, `scripts/tests/docs-go-column-go-keys.txt`) | Login timestamp freshness window in seconds (replay protection; `0` = disabled, Go frp default). |
+| `token_auth_timeout` | `bool` | `true` | — (frp-rs extension: Go v0.71.0's `auth` section has no token-auth timeout — `auth.tokenAuthTimeout` is absent from the recorded `pkg/config/v1` key set, `scripts/tests/docs-go-column-go-keys.txt`) | Apply the freshness window to token (MD5) auth logins. |
+| `additional_auth_scopes` | `string[]` | `[]` | `auth.additionalScopes` | Extra auth scopes: `"HeartBeats"`, `"NewWorkConns"`. When listed, those message types require authentication in addition to `Login`. |
 
 `auth.tokenSource` supports two source types:
 
@@ -99,10 +99,10 @@ discarded whole).
 | `port` | `u16` | `0` | `webServer.port` | Dashboard port. 0 = disabled. **Reader-feature gap:** the field deserializes in every build, but only a `frps` built with the `frp-server/dashboard` feature binds it. In a build without that feature (`tiny`/`micro`, and the default tier — dashboard is opt-in) a non-zero port is still accepted and then **silently ignored**; the loader reports it once per load (`web_server.port has no effect: this build has no dashboard support, …`) from the `-c`/`--config-dir` startup paths and from a `SIGUSR1` reload, and `frps verify` prints the same record to stdout before its `syntax is ok` line. A build that *does* honour the port stays silent — a warning there would be a false record. `0`, an absent key and the legacy-`.ini` zero spellings (`+0`, `00`, `"0"`) are never a request. |
 | `user` | `string` | `""` | `webServer.user` | Basic Auth username for dashboard and management API. |
 | `password` | `string` | `""` | `webServer.password` | Basic Auth password for dashboard and management API. |
-| `enable_prometheus` | `bool` | `false` | `webServer.enablePrometheus` | Expose `/metrics` endpoint in Prometheus text format. |
-| `tls_cert_file` | `string` | `""` | `webServer.tlsCertFile` | TLS certificate for dashboard HTTPS. When both `tls_cert_file` and `tls_key_file` are non-empty, dashboard serves HTTPS. Four spellings reach this one field, and the first **non-empty** one wins: nested `[web_server.tls] cert_file`, nested `certFile` (`[webServer.tls]` is the same table), the parent-level `tls_cert_file`, then the parent-level alias `certFile`. An explicitly **empty** nested value means *unset* and falls through to the flat value — it does not clear it. `.ini` supports the nested section too (`[webServer.tls]`, `[web_server.tls]`), and the whole file may write both `[webServer]` and `[web_server]` (merged per key, `[web_server]` winning each shared key). One `.ini`-only boundary: a legacy **proxy** section whose name starts with one of these roots (`[auth.foo]`, `[store.frontend]`, `[log.svc]`) is *not* split — a section carrying `type` is still a proxy name exactly as before, and since the typeless-`.ini` rule a `type`-less section carrying `local_port`/`remote_port` is collected as a `tcp` proxy instead of being dropped (that second half is the new behaviour, not a preserved one); the cost is that a v1 nested table which itself carries `type` (a `[visitors.plugin]`-style table) does not expand either — it stays a flat section, so on the client the legacy collector reads it as a proxy named after the header and proxy validation refuses it (`[visitors.plugin] type = "https2http"` → `proxy 'visitors.plugin': invalid proxy_type 'https2http'`), and on the server strict mode reports it as an unknown field (`unknown field "visitors.plugin"`, exit 1, measured identical before and after this change; with `--strict-config=false` it loads, because the server has no legacy collector — only the client-side one reads that header as a proxy). |
-| `tls_key_file` | `string` | `""` | `webServer.tlsKeyFile` | TLS private key for dashboard HTTPS. Same nested spellings, precedence and empty-value rule as `tls_cert_file`. |
-| `custom_404_page` | `string` | `""` | `webServer.custom404Page` | Custom HTML body for 404 responses from VHost and TCPMux handlers. Content-Type is set to `text/html`. |
+| `enable_prometheus` | `bool` | `false` | `enablePrometheus` | Expose `/metrics` endpoint in Prometheus text format. |
+| `tls_cert_file` | `string` | `""` | `webServer.tls.certFile` | TLS certificate for dashboard HTTPS. When both `tls_cert_file` and `tls_key_file` are non-empty, dashboard serves HTTPS. Four spellings reach this one field, and the first **non-empty** one wins: nested `[web_server.tls] cert_file`, nested `certFile` (`[webServer.tls]` is the same table), the parent-level `tls_cert_file`, then the parent-level alias `certFile`. An explicitly **empty** nested value means *unset* and falls through to the flat value — it does not clear it. `.ini` supports the nested section too (`[webServer.tls]`, `[web_server.tls]`), and the whole file may write both `[webServer]` and `[web_server]` (merged per key, `[web_server]` winning each shared key). One `.ini`-only boundary: a legacy **proxy** section whose name starts with one of these roots (`[auth.foo]`, `[store.frontend]`, `[log.svc]`) is *not* split — a section carrying `type` is still a proxy name exactly as before, and since the typeless-`.ini` rule a `type`-less section carrying `local_port`/`remote_port` is collected as a `tcp` proxy instead of being dropped (that second half is the new behaviour, not a preserved one); the cost is that a v1 nested table which itself carries `type` (a `[visitors.plugin]`-style table) does not expand either — it stays a flat section, so on the client the legacy collector reads it as a proxy named after the header and proxy validation refuses it (`[visitors.plugin] type = "https2http"` → `proxy 'visitors.plugin': invalid proxy_type 'https2http'`), and on the server strict mode reports it as an unknown field (`unknown field "visitors.plugin"`, exit 1, measured identical before and after this change; with `--strict-config=false` it loads, because the server has no legacy collector — only the client-side one reads that header as a proxy). |
+| `tls_key_file` | `string` | `""` | `webServer.tls.keyFile` | TLS private key for dashboard HTTPS. Same nested spellings, precedence and empty-value rule as `tls_cert_file`. |
+| `custom_404_page` | `string` | `""` | `custom404Page` | Custom HTML body for 404 responses from VHost and TCPMux handlers. Content-Type is set to `text/html`. |
 | `assets_dir` | `string` | `""` | `webServer.assetsDir` | Directory containing a custom dashboard `index.html`; read once at startup (empty = built-in page). |
 | `pprof_enable` | `bool` | `false` | `webServer.pprofEnable` | Serve `/debug/pprof/*` placeholder routes (frp-rs does not expose Go-style pprof profiles). |
 
@@ -130,7 +130,7 @@ connection is requested).
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
 | `bind_port` | `u16` | `0` | `sshTunnelGateway.bindPort` | SSH listen port. 0 = disabled. **Reader-feature gap:** the field deserializes in every build, but only a `frps` built with the `frp-server/ssh` feature binds it. In a build without that feature (`tiny`/`micro`; `ssh` is on in the default and full tiers) a non-zero port is still accepted and then **silently ignored**; the loader reports it once per load (`ssh_tunnel_gateway.bind_port has no effect: this build has no SSH tunnel gateway support, …`) from the `-c`/`--config-dir` startup paths and from a `SIGUSR1` reload, and `frps verify` prints the same record to stdout before its `syntax is ok` line. A build that *does* honour the port stays silent. `0`, an absent key and the legacy-`.ini` zero spellings (`+0`, `00`, `"0"`) are never a request. |
-| `bind_addr` | `string` | `"0.0.0.0"` | `sshTunnelGateway.bindAddr` | SSH listen address. |
+| `bind_addr` | `string` | `"0.0.0.0"` | — (frp-rs extension: Go's `SSHTunnelGateway` carries `bindPort` but no bind address — `sshTunnelGateway.bindAddr` is absent from the recorded `pkg/config/v1` key set, `scripts/tests/docs-go-column-go-keys.txt`) | SSH listen address. |
 | `private_key_file` | `string` | `""` | `sshTunnelGateway.privateKeyFile` | Path to SSH host private key file. Auto-generated if empty and `auto_gen_private_key_path` does not exist. |
 | `auto_gen_private_key_path` | `string` | `"./.autogen_ssh_key"` | `sshTunnelGateway.autoGenPrivateKeyPath` | Path where auto-generated SSH host key is written. |
 | `authorized_keys_file` | `string` | `""` | `sshTunnelGateway.authorizedKeysFile` | Path to SSH `authorized_keys` for optional public key auth. Empty = password auth only. |
@@ -151,10 +151,10 @@ Server-side HTTP plugins. Each entry is an external HTTP service called on lifec
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
 | `name` | `string` | `""` | `name` | Plugin name for logging. |
-| `url` | `string` | **required** | `url` | URL of the plugin server (e.g. `"http://127.0.0.1:4000/handler"`). |
+| `url` | `string` | **required** | — (frp-rs extension: not a Go v0.71.0 config key — `url` is absent from the recorded `pkg/config/v1` key set, `scripts/tests/docs-go-column-go-keys.txt`) | URL of the plugin server (e.g. `"http://127.0.0.1:4000/handler"`). |
 | `ops` | `string[]` | `[]` | `ops` | Operations this plugin handles: `"login"`, `"new_proxy"`, `"close_proxy"`. Empty = all operations. |
-| `timeout` | `u64` | `5` | `timeout` | Timeout in seconds for HTTP calls to the plugin. |
-| `enable_control` | `bool` | `false` | `enableControl` | When true, the plugin response determines approve/reject. When false, the plugin is notify-only. |
+| `timeout` | `u64` | `5` | — (frp-rs extension: not a Go v0.71.0 config key — `timeout` is absent from the recorded `pkg/config/v1` key set, `scripts/tests/docs-go-column-go-keys.txt`) | Timeout in seconds for HTTP calls to the plugin. |
+| `enable_control` | `bool` | `false` | — (frp-rs extension: not a Go v0.71.0 config key — `enableControl` is absent from the recorded `pkg/config/v1` key set, `scripts/tests/docs-go-column-go-keys.txt`) | When true, the plugin response determines approve/reject. When false, the plugin is notify-only. |
 
 ### `[feature]` Section
 
@@ -290,7 +290,7 @@ enable_control = true
 | `transport_protocol` | `string` | `"tcp"` | `protocol` | Transport protocol: `"tcp"`, `"websocket"` / `"ws"`, `"wss"`, `"quic"`, `"kcp"`. |
 | `token` | `string` | `""` | `auth.token` | Authentication token. Must match the server's token. This is a convenience field; for full auth config use `[auth]` section. |
 | `user` | `string` | `""` | `user` | User identity string for multi-tenant setups. Sent in the Login message. |
-| `client_id` | `string` | `""` | `clientId` | Unique client identifier. When empty, no ID is sent — Login sends `None` (not auto-generated). |
+| `client_id` | `string` | `""` | `clientID` | Unique client identifier. When empty, no ID is sent — Login sends `None` (not auto-generated). |
 | `metas` | `map<string,string>` | `{}` | `metadatas` | Client-level metadata key-value pairs sent in the Login message. Available to server plugins. |
 | `proxy_url` | `string` | `""` | `transport.proxyURL` | Upstream HTTP/SOCKS5 proxy for the client-to-server control connection. Supports `http://` and `socks5://` schemes. Empty = direct connection. |
 | `nat_hole_stun_server` | `string` | `"stun.easyvoip.com:3478"` | `natHoleStunServer` | Custom STUN server address for NAT traversal. Format: `"stun:host:port"`. |
@@ -300,7 +300,7 @@ enable_control = true
 | `tls_cert_file` | `string` | `""` | `transport.tls.certFile` | Client TLS certificate PEM file (for mTLS). |
 | `tls_key_file` | `string` | `""` | `transport.tls.keyFile` | Client TLS private key PEM file (for mTLS). |
 | `tls_ca_file` | `string` | `""` | `transport.tls.trustedCaFile` | CA certificate PEM file for verifying the server's TLS certificate. |
-| `tls_server_name` | `string` | `""` | `tlsServerName` | Server name for TLS SNI. Empty = use `server_addr`. |
+| `tls_server_name` | `string` | `""` | `transport.tls.serverName` | Server name for TLS SNI. Empty = use `server_addr`. |
 | `disable_custom_tls_first_byte` | `bool` | `true` | `disableCustomTLSFirstByte` | When true, the client skips the Go frp protocol marker byte (`0x17`) and starts TLS directly. Set this when connecting to a non-frp TLS endpoint. |
 | `login_fail_exit` | `bool` | `true` | `loginFailExit` | When true, the client exits on login failure. When false, it keeps retrying. |
 | `pool_count` | `i32` | `1` | `poolCount` | Number of pre-established work connections kept in the server-side pool. Higher values reduce latency for new proxy connections. Negative values are rejected at config load (fail-fast divergence — Go frp has no client-side check and the server rejects at login instead). |
@@ -321,19 +321,19 @@ Full OIDC authentication configuration. When `method = "oidc"`, the client obtai
 | `method` | `string` | `"token"` | `auth.method` | Authentication method: exactly `"token"` or `"oidc"`. An empty value completes to `"token"` (Go's `Auth.Complete()`); any other spelling is a **config-load error** with Go's text (`invalid auth method, optional values are [token oidc]`) on stdout and exit 1 — no lower-casing, no trimming. |
 | `token` | `string` | `""` | `auth.token` | Shared secret token (when `method = "token"`). |
 | `token_source` | `table` | `null` | `auth.tokenSource` | Dynamic token source. Mutually exclusive with `token`. |
-| `oidc_client_id` | `string` | `""` | `auth.oidcClientId` | OIDC client ID for the token endpoint. |
-| `oidc_client_secret` | `string` | `""` | `auth.oidcClientSecret` | OIDC client secret for the token endpoint. |
-| `oidc_audience` | `string` | `""` | `auth.oidcAudience` | OIDC audience claim to request. |
-| `oidc_token_endpoint` | `string` | `""` | `auth.oidcTokenEndpoint` | OIDC token endpoint URL. |
-| `oidc_scope` | `string` | `""` | `auth.oidcScope` | OIDC scope string (e.g. `"openid profile"`). |
-| `oidc_issuer` | `string` | `""` | `auth.oidcIssuer` | OIDC issuer URL. |
-| `additional_endpoint_params` | `table` | `{}` | `auth.additionalEndpointParams` | Extra key/value parameters appended to the token endpoint request (map). |
-| `oidc_token_source` | `table` | `null` | `auth.oidcTokenSource` | Dynamic OIDC token source (`type = "file"`/`"exec"`), same shape as `tokenSource`. |
-| `authentication_timeout` | `i64` | `90` | `auth.authenticationTimeout` | Login timestamp freshness window in seconds (replay protection; `0` = disabled, Go frp default). |
-| `oidc_tls_trusted_ca_file` | `string` | `""` | `auth.tlsTrustedCaFile` | Custom CA certificate PEM file for OIDC provider TLS verification. |
-| `oidc_tls_insecure_skip_verify` | `bool` | `false` | `auth.insecureSkipVerify` | Skip TLS certificate verification for OIDC provider. For development only. |
-| `oidc_proxy_url` | `string` | `""` | `auth.oidcProxyURL` | HTTP/SOCKS5 proxy URL for OIDC provider HTTP requests. |
-| `additional_auth_scopes` | `string[]` | `[]` | `auth.additionalAuthScopes` | Client-side auth scopes. Unioned with the server's scopes. Values: `"HeartBeats"`, `"NewWorkConns"`. |
+| `oidc_client_id` | `string` | `""` | `auth.oidc.clientID` | OIDC client ID for the token endpoint. |
+| `oidc_client_secret` | `string` | `""` | `auth.oidc.clientSecret` | OIDC client secret for the token endpoint. |
+| `oidc_audience` | `string` | `""` | `auth.oidc.audience` | OIDC audience claim to request. |
+| `oidc_token_endpoint` | `string` | `""` | `auth.oidc.tokenEndpointURL` | OIDC token endpoint URL. |
+| `oidc_scope` | `string` | `""` | `auth.oidc.scope` | OIDC scope string (e.g. `"openid profile"`). |
+| `oidc_issuer` | `string` | `""` | `auth.oidc.issuer` | OIDC issuer URL. |
+| `additional_endpoint_params` | `table` | `{}` | `auth.oidc.additionalEndpointParams` | Extra key/value parameters appended to the token endpoint request (map). |
+| `oidc_token_source` | `table` | `null` | `auth.oidc.tokenSource` | Dynamic OIDC token source (`type = "file"`/`"exec"`), same shape as `tokenSource`. |
+| `authentication_timeout` | `i64` | `90` | — (frp-rs extension: Go v0.71.0's `auth` section has no authentication timeout — `auth.authenticationTimeout` is absent from the recorded `pkg/config/v1` key set, `scripts/tests/docs-go-column-go-keys.txt`) | Login timestamp freshness window in seconds (replay protection; `0` = disabled, Go frp default). |
+| `oidc_tls_trusted_ca_file` | `string` | `""` | `auth.oidc.trustedCaFile` | Custom CA certificate PEM file for OIDC provider TLS verification. |
+| `oidc_tls_insecure_skip_verify` | `bool` | `false` | `auth.oidc.insecureSkipVerify` | Skip TLS certificate verification for OIDC provider. For development only. |
+| `oidc_proxy_url` | `string` | `""` | `auth.oidc.proxyURL` | HTTP/SOCKS5 proxy URL for OIDC provider HTTP requests. |
+| `additional_auth_scopes` | `string[]` | `[]` | `auth.additionalScopes` | Client-side auth scopes. Unioned with the server's scopes. Values: `"HeartBeats"`, `"NewWorkConns"`. |
 
 The client `auth.tokenSource` table has the same shape as the server version: `type = "file"` with `file.path`, or `type = "exec"` with `exec.command`, `exec.args`, and `exec.env`. Exec sources require `--allow-unsafe TokenSourceExec`.
 
@@ -347,7 +347,7 @@ Admin REST API for the client. Same fields as the server `[web_server]` section 
 | `port` | `u16` | `0` | `webServer.port` | Admin API port. 0 = disabled. |
 | `user` | `string` | `""` | `webServer.user` | Basic Auth username for the admin API. |
 | `password` | `string` | `""` | `webServer.password` | Basic Auth password for the admin API. |
-| `enable_prometheus` | `bool` | `false` | `webServer.enablePrometheus` | Expose `/metrics` in Prometheus format. |
+| `enable_prometheus` | `bool` | `false` | `enablePrometheus` | Expose `/metrics` in Prometheus format. |
 | `tls_cert_file` | `string` | `""` | — | TLS certificate for admin API HTTPS. |
 | `tls_key_file` | `string` | `""` | — | TLS private key for admin API HTTPS. |
 | `custom_404_page` | `string` | `""` | — | Custom 404 page HTML content. |
@@ -472,7 +472,7 @@ Each `[[proxies]]` entry defines a proxy that the client registers with the serv
 |-------|------|---------|-------------------|-------------|
 | `name` | `string` | — | **Required.** | Unique proxy name. Used as identifier in logs, admin API, and routing. |
 | `type` | `string` | — | **Required.** | Proxy type: `"tcp"`, `"udp"`, `"http"`, `"https"`, `"stcp"`, `"xtcp"`, `"tcpmux"`, `"sudp"`, `"vnet"`. |
-| `local_ip` | `string` | `"127.0.0.1"` | `localIp` | Local service IP address. |
+| `local_ip` | `string` | `"127.0.0.1"` | `localIP` | Local service IP address. |
 | `local_port` | `u16` | `0` | `localPort` | Local service port. |
 | `remote_port` | `u16` | `0` | `remotePort` | Remote port to expose on the server. 0 = auto-assign from server's port range. |
 | `use_encryption` | `bool` | `false` | `useEncryption` | Encrypt proxy traffic with AES-128-CFB (derived from auth token for TCP/UDP/HTTP; from `sk` for STCP/XTCP). |
@@ -503,9 +503,9 @@ Each `[[proxies]]` entry defines a proxy that the client registers with the serv
 | `subdomain` | `string` | `""` | `subdomain` | Sub-domain name. Combined with the server's `sub_domain_host` to form the full domain (e.g. `web` + `example.com` = `web.example.com`). |
 | `http_user` | `string` | `""` | `httpUser` | HTTP Basic Auth username required to access the proxy. |
 | `http_password` | `string` | `""` | `httpPassword` | HTTP Basic Auth password. Alias: `http_pwd`. |
-| `http_pwd` | `string` | `""` | `httpPwd` | Alias for `http_password`. Both are accepted; `http_password` takes precedence. |
+| `http_pwd` | `string` | `""` | `httpPassword` | Alias for `http_password`. Both are accepted; `http_password` takes precedence. |
 | `host_header_rewrite` | `string` | `""` | `hostHeaderRewrite` | Rewrite the `Host` header to this value before forwarding to the local service. |
-| `headers` | `map<string,string>` | `{}` | `headers` | Custom HTTP request headers injected into proxied requests. |
+| `headers` | `map<string,string>` | `{}` | — (frp-rs divergence: Go splits proxy headers by direction into `requestHeaders` / `responseHeaders` and has no bare headers key — `headers` is absent from the recorded `pkg/config/v1` key set, `scripts/tests/docs-go-column-go-keys.txt`) | Custom HTTP request headers injected into proxied requests. |
 | `response_headers` | `map<string,string>` | `{}` | `responseHeaders` | Custom HTTP response headers injected into proxied responses. |
 | `locations` | `string[]` | `[]` | `locations` | URL path prefixes for HTTP routing. Only requests matching these paths are routed to this proxy. |
 | `route_by_http_user` | `string` | `""` | `routeByHTTPUser` | Route requests to this proxy based on HTTP Basic Auth username. |
@@ -515,7 +515,7 @@ Each `[[proxies]]` entry defines a proxy that the client registers with the serv
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
-| `sk` | `string` | `""` | `sk` | **Secret key.** Required for STCP/XTCP. The visitor must present the same key to connect. Also used as the encryption key when `use_encryption = true`. |
+| `sk` | `string` | `""` | `secretKey` | **Secret key.** Required for STCP/XTCP. The visitor must present the same key to connect. Also used as the encryption key when `use_encryption = true`. |
 | `virtual_net` | `string` | `""` | — (frp-rs proxy extension) | Virtual network name for proxy isolation. Proxies in different virtual nets cannot reach each other. Empty = default (global) network. Go has no per-proxy field for this: its `virtualNet` is a **top-level client** section (`pkg/config/v1/client.go:66`, frp-rs's top-level `[virtualNet]`/`[virtual_net]`), so the flat per-proxy `virtualNet` is not a Go name. |
 
 ### Proxy Metadata and Misc Fields
@@ -523,7 +523,7 @@ Each `[[proxies]]` entry defines a proxy that the client registers with the serv
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
 | `annotations` | `map<string,string>` | `{}` | `annotations` | Arbitrary key-value annotations (e.g. `{ owner = "team-a" }`). |
-| `metas` | `map<string,string>` | `{}` | `metas` | Key-value metadata sent to server plugins for this proxy. |
+| `metas` | `map<string,string>` | `{}` | `metadatas` | Key-value metadata sent to server plugins for this proxy. |
 | `proxy_protocol_version` | `string` | `""` | `proxyProtocolVersion` | HAProxy PROXY protocol version: `"v1"`, `"v2"`, or `""` (disabled). When set, the client prepends a PROXY protocol header to each connection to the local service. |
 
 ### `[proxies.plugin]` Section
@@ -541,10 +541,10 @@ Per-proxy client plugin configuration. The plugin runs on the client side and ha
 | `host_header_rewrite` | `string` | `""` | `hostHeaderRewrite` | Rewrite the `Host` header for the plugin (http_proxy, static_file). |
 | `username` | `string` | `""` | `username` | Username for upstream proxy auth (http_proxy, socks5 plugins). |
 | `password` | `string` | `""` | `password` | Password for upstream proxy auth (http_proxy, socks5 plugins). |
-| `crt_file` | `string` | `""` | `pluginCrtPath` | TLS certificate file for plugin listener (https2http, https2https). |
-| `key_file` | `string` | `""` | `pluginKeyPath` | TLS key file for plugin listener (https2http, https2https). |
+| `crt_file` | `string` | `""` | `crtPath` | TLS certificate file for plugin listener (https2http, https2https). |
+| `key_file` | `string` | `""` | `keyPath` | TLS key file for plugin listener (https2http, https2https). |
 | `server_name` | `string` | `""` | `serverName` | Server name for STCP/XTCP visitor plugin. |
-| `secret_key` | `string` | `""` | `sk` | Secret key for STCP/XTCP visitor plugin auth. |
+| `secret_key` | `string` | `""` | `secretKey` | Secret key for STCP/XTCP visitor plugin auth. |
 | `bind_addr` | `string` | `""` | `bindAddr` | Local address for the visitor plugin listener. |
 | `bind_port` | `i32` | `0` | `bindPort` | Local port for the visitor plugin listener. `-1` disables binding. |
 

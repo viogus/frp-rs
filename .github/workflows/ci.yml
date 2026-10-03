@@ -802,19 +802,27 @@ jobs:
         # asserts "Every field maps 1:1 to a Go frp v0.71.0 equivalent", but no
         # gate measured that column, and two rows had already drifted by hand
         # (PR #448 corrected one row, PR #455 found a second naming a Go field
-        # `frps` does not read). The 204-check suite
-        # `scripts/tests/docs-go-column.sh` landed in its own PR; it is wired
-        # here in the same shape as the classifier step above — the suite's
+        # `frps` does not read). The 257-check suite
+        # `scripts/tests/docs-go-column.sh` landed in its own PR and now measures
+        # the column three ways: the embedded 261-spelling key set is diffed
+        # against the re-derived artifact (a transcription error in either reds),
+        # every row is checked against the Go cell recorded for it (a real but
+        # wrong key reds), and the 41 recorded aliases are resolved to a Go path
+        # (checked against the cells of the rows that carried them) or to an
+        # extension marker the artifact proves absent. Wiring is the same
+        # shape as the classifier step above — the suite's
         # bytes are pinned before it runs, its exact `RESULT:` total and
         # `ok`-line count are compared, an absolute floor sits under them so a
         # delete-a-case-then-lower-the-literal edit is still red, and any `FAIL`
         # line fails the step.
         #
-        # The suite is its own negative control: it drives five deliberate
-        # mutations of a throwaway copy of `docs/config.md` (M1–M5) and requires
+        # The suite is its own negative control: it drives seven deliberate
+        # mutations of a throwaway copy of `docs/config.md` (M1–M7) and requires
         # each to red at a named line — a reworded `websocket_port` divergence,
         # a reworded `tls_enable` divergence, a misspelled curated token, every
-        # table dropped, and the `websocket_port` divergence prose stripped. The
+        # table dropped, the `websocket_port` divergence prose stripped, a real
+        # Go key swapped into the wrong row (`bindPort` -> `quicBindPort`), and a
+        # spelling Go does not carry (`bindPort` -> `kcpPort`). The
         # `guard_canary` check below is the M1 witness, printed only by a run
         # whose mutation loop actually ran, so deleting that loop cannot pass by
         # keeping the count. Tying a literal to the suite's wording is safe here
@@ -826,9 +834,9 @@ jobs:
           log=/tmp/frp-docs-go-column.log
           status=0
           guard_file=scripts/tests/docs-go-column.sh
-          guard_pin=b39e10c426647230b7ca9e6e8fdbc6fadde979dc1bbef1f69eebddc22c3175e0
-          guard_exact=204
-          guard_floor=204
+          guard_pin=f3158f1d3a49db0dd89e12b5bedc448358e46a78146c01845f735a56d7cfcf22
+          guard_exact=257
+          guard_floor=257
           guard_canary='M1 (websocket_port reworded'
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
@@ -901,11 +909,11 @@ jobs:
             printf '%s' "$guard_fail_text"
           fi
           if [ "$status" != "0" ]; then
-            echo "::error::the docs-go-column fixture did not report 204 checks with no failure line"
-            echo "::error::scripts/tests/docs-go-column.sh must print 204 '  ok' lines, include the M1 witness, and end with 'RESULT: 204 fixture check(s) hold' (floor=$guard_floor, exact=$guard_exact), and must not print a 'FAIL' line; a smaller total, a missing witness, a failure line or no output at all (an \`exec\`) means checks were skipped or swallowed — restore them rather than lowering this literal"
+            echo "::error::the docs-go-column fixture did not report 257 checks with no failure line"
+            echo "::error::scripts/tests/docs-go-column.sh must print 257 '  ok' lines, include the M1 witness, and end with 'RESULT: 257 fixture check(s) hold' (floor=$guard_floor, exact=$guard_exact), and must not print a 'FAIL' line; a smaller total, a missing witness, a failure line or no output at all (an \`exec\`) means checks were skipped or swallowed — restore them rather than lowering this literal"
             exit 1
           fi
-          echo "docs-go-column fixture checks ok: 204 checks hold (floor $guard_floor), M1 witness present, no failure line"
+          echo "docs-go-column fixture checks ok: 257 checks hold (floor $guard_floor), M1 witness present, no failure line"
       - name: Remote-frps reap — fixture checks
         # TODO.md "`scripts/tests/remote-frps-reap.sh` runs in no CI job"
         # (`:9959` when it was filed): the suite drives
