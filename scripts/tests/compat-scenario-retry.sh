@@ -58,6 +58,19 @@
 #   33    the same hole with more padding (`0008`) is refused too.
 #   34    a padded value that is *under* the cap (`05`) is accepted, so the
 #         stripping does not over-reject.
+#   35    round-3 F-D3-2: `FRP_COMPAT_READY_MIN=abc` is refused at load, naming
+#         the variable.
+#   36    the readiness floor survives zero padding: `FRP_COMPAT_READY_MIN=08` is
+#         applied as decimal 8 by the gate, not read as octal and dropped.
+#   37    a valid floor is actually used: the gate hands the ownership wait the
+#         floor value when the caller's timeout is smaller.
+#   38    the gate refuses a non-decimal floor itself, instead of letting `(( ))`
+#         abort — fails closed, with the variable named.
+#   39    round-3 audit: `--shard 0/0` is refused at load rather than becoming a
+#         division by zero (and `0/08` is normalised to a decimal `0/8`) in the
+#         XTCP shard arithmetic, which otherwise runs nothing and reports zero
+#         tests as a success.
+#   40    a non-decimal `--shard` (1/x) is refused at load too.
 #
 # Residue, declared rather than denied: `scripts/compat-test.sh` is unpinned
 # (the port-ownership step records the same for its structural probes), so a
@@ -82,7 +95,7 @@ checks=0
 fails=0
 # Pinned total: `exit "$fails"` alone is happy with a suite that silently stops
 # checking, so the floor is enforced from the exit trap on every path.
-MIN_CHECKS=34
+MIN_CHECKS=40
 
 ok()  { checks=$((checks + 1)); printf '  ok    %s\n' "$1"; }
 bad() { checks=$((checks + 1)); fails=$((fails + 1)); printf '  FAIL  %s\n' "$1"; }
@@ -138,7 +151,7 @@ cleanup_pids() { :; }
 reap_scoped_strays() { :; }
 
 # --- extract the functions under test, verbatim ------------------------------
-for fn in is_readiness_failure pass_test fail_test run_test; do
+for fn in is_readiness_failure pass_test fail_test run_test wait_for_port_safe; do
   body=$(sed -n "/^$fn()/,/^}/p" "$COMPAT")
   [ -n "$body" ] || { printf 'FAIL  %s() is not extractable from %s\n' "$fn" "$COMPAT" >&2; exit 1; }
   eval "$body"
@@ -158,9 +171,14 @@ reset_run() {
 # The knob's validation runs at load, so it cannot be extracted; drive the real
 # file with a Go directory that cannot exist, so a run that gets past the
 # validation stops at the binary check instead of starting the suite.
-run_harness_with_retry_max() {
+run_harness_with_env() {
   env GO_FRP_DIR=/nonexistent-frp-fixture GO_FRP_VERSION=0.0.0-fixture \
-    FRP_COMPAT_RETRY_MAX="$1" bash "$COMPAT" 2>&1
+    "$@" bash "$COMPAT" 2>&1
+}
+run_harness_with_retry_max() { run_harness_with_env "FRP_COMPAT_RETRY_MAX=$1"; }
+run_harness_args() {   # args passed straight through to the harness
+  env GO_FRP_DIR=/nonexistent-frp-fixture GO_FRP_VERSION=0.0.0-fixture \
+    bash "$COMPAT" "$@" 2>&1
 }
 
 # --- classification ----------------------------------------------------------
@@ -428,4 +446,89 @@ if [ "$ok_rc" != 2 ] && [ "$ok_refused" = 0 ]; then
   ok 'a zero-padded under-cap value (05) passes validation and reaches the binary check'
 else
   bad "zero-padded 05 was refused (rc=$ok_rc, refusal message $( [ "$ok_refused" = 1 ] && echo present || echo absent ))"
+fi
+
+# --- the readiness floor (review round 3, F-D3-2) ----------------------------
+# `wait_for_port_safe` is the only consumer of `FRP_COMPAT_READY_MIN`, so drive
+# the extracted gate against a stub ownership wait that records the timeout it is
+# handed. `08` is the adversarial value: `(( timeout < 08 ))` is a bash syntax
+# error, which reads false and silently drops the floor.
+WAIT_SEEN=""
+cpo_wait_port_ready() { WAIT_SEEN="$2"; return 1; }
+gate_with_floor() {  # $1 = FRP_COMPAT_READY_MIN, $2 = caller timeout
+  WAIT_SEEN=""
+  FRP_COMPAT_READY_MIN="$1" wait_for_port_safe 127.0.0.1 1 "$2" >/dev/null 2>&1
+}
+
+# 35. a non-decimal floor is refused at load, naming the variable.
+floor_rc=0
+floor_out=$(run_harness_with_env 'FRP_COMPAT_READY_MIN=abc') || floor_rc=$?
+case "$floor_out" in
+  *"FRP_COMPAT_READY_MIN must be a non-negative integer"*) floor_msg=1 ;;
+  *) floor_msg=0 ;;
+esac
+if [ "$floor_rc" = 2 ] && [ "$floor_msg" = 1 ]; then
+  ok 'a non-numeric FRP_COMPAT_READY_MIN exits 2 and names the variable'
+else
+  bad "non-numeric FRP_COMPAT_READY_MIN (rc=$floor_rc, message $( [ "$floor_msg" = 1 ] && echo present || echo missing ))"
+fi
+
+# 36. the floor survives zero padding: `08` is decimal 8 here, not an octal
+#     syntax error that leaves the caller's shorter timeout in place.
+gate_with_floor '08' 1
+if [ "$WAIT_SEEN" = 8 ]; then
+  ok 'a zero-padded FRP_COMPAT_READY_MIN (08) floors the gate to decimal 8'
+else
+  bad "zero-padded readiness floor: the gate handed the ownership wait '${WAIT_SEEN:-<none>}', wanted 8 (octal dropped the floor)"
+fi
+
+# 37. a valid floor is actually in use.
+gate_with_floor '9' 1
+if [ "$WAIT_SEEN" = 9 ]; then
+  ok 'a valid FRP_COMPAT_READY_MIN (9) floors the gate to 9'
+else
+  bad "valid readiness floor: the gate handed the ownership wait '${WAIT_SEEN:-<none>}', wanted 9"
+fi
+
+# 38. the gate itself refuses a non-decimal floor rather than reaching `(( ))`.
+gate_rc=0
+gate_out=$(FRP_COMPAT_READY_MIN=abc wait_for_port_safe 127.0.0.1 1 1 2>&1) || gate_rc=$?
+case "$gate_out" in
+  *"FRP_COMPAT_READY_MIN must be a non-negative integer"*) gate_msg=1 ;;
+  *) gate_msg=0 ;;
+esac
+if [ "$gate_rc" = 1 ] && [ "$gate_msg" = 1 ]; then
+  ok 'the gate refuses a non-decimal floor itself and fails closed'
+else
+  bad "gate-level floor refusal (rc=$gate_rc, message $( [ "$gate_msg" = 1 ] && echo present || echo missing ))"
+fi
+
+# 39. review round 3 audit: the XTCP shard's two halves reach `(( ))` too, where
+#     a zero TOTAL is a division by zero and a padded one is an octal error.
+#     Both are refused at load, before the phase can report "0 test(s) completed"
+#     as a success. (`0/08` normalises to `0/8` instead of erroring; the strip is
+#     the same one check 36 pins for the readiness floor.)
+shard_rc=0
+shard_out=$(run_harness_args --shard 0/0) || shard_rc=$?
+case "$shard_out" in
+  *"XTCP_SHARD needs 0 <= INDEX < TOTAL"*) shard_msg=1 ;;
+  *) shard_msg=0 ;;
+esac
+if [ "$shard_rc" = 2 ] && [ "$shard_msg" = 1 ]; then
+  ok 'a --shard whose TOTAL is 0 (a division by zero in the phase) is refused at load'
+else
+  bad "zero-TOTAL --shard (rc=$shard_rc, message $( [ "$shard_msg" = 1 ] && echo present || echo missing ))"
+fi
+
+# 40. a malformed shard is refused too, rather than reaching `(( ))`.
+bad_shard_rc=0
+bad_shard_out=$(run_harness_args --shard 1/x) || bad_shard_rc=$?
+case "$bad_shard_out" in
+  *"XTCP_SHARD must be INDEX/TOTAL"*) bad_shard_msg=1 ;;
+  *) bad_shard_msg=0 ;;
+esac
+if [ "$bad_shard_rc" = 2 ] && [ "$bad_shard_msg" = 1 ]; then
+  ok 'a non-decimal --shard (1/x) is refused at load too'
+else
+  bad "malformed --shard (rc=$bad_shard_rc, message $( [ "$bad_shard_msg" = 1 ] && echo present || echo missing ))"
 fi

@@ -242,6 +242,55 @@ if (( RETRY_MAX > RETRY_MAX_CAP )); then
     exit 2
 fi
 
+# `FRP_COMPAT_READY_MIN` reaches the one comparison inside `wait_for_port_safe`,
+# so it had both of the failure modes above: a non-numeric value is an unbound
+# variable there under `set -u`, and a *zero-padded* one is read as octal, which
+# makes the comparison false and silently drops the readiness floor — the gate
+# then falls back to the caller's (shorter) timeout, i.e. the safety net fails
+# open exactly when it is needed. Refuse the non-numeric spelling and strip the
+# padding here, so the value the gate reads is always a decimal one; the gate
+# re-checks it as well, because a function that is only ever called with a
+# validated value is one refactor away from being called without one. An empty
+# value means "use the default" (`:-20` at the use site).
+_raw_ready_min="${FRP_COMPAT_READY_MIN:-20}"
+case "$_raw_ready_min" in
+    ''|*[!0-9]*)
+        echo "ERROR: FRP_COMPAT_READY_MIN must be a non-negative integer, got '$_raw_ready_min'" >&2
+        exit 2
+        ;;
+esac
+FRP_COMPAT_READY_MIN="$_raw_ready_min"
+while [ "${FRP_COMPAT_READY_MIN#0}" != "$FRP_COMPAT_READY_MIN" ]; do
+    FRP_COMPAT_READY_MIN="${FRP_COMPAT_READY_MIN#0}"
+done
+[ -n "$FRP_COMPAT_READY_MIN" ] || FRP_COMPAT_READY_MIN=0
+
+# `XTCP_SHARD` (`--shard INDEX/TOTAL`) is split into two halves that reach
+# arithmetic in the XTCP phase (`(( _i % _xtcp_total == _xtcp_idx ))`), and both
+# have the same two failure modes: `0/08` is an octal syntax error there and
+# `0/0` is a division by zero, each of which makes the condition false — the
+# shard then runs no test at all and reports `0 test(s) completed` as a success.
+# Validate the shape and normalise both halves to decimal here, where the flag is
+# parsed, so the phase cannot be handed a value that reaches `(( ))`.
+if [ -n "${XTCP_SHARD:-}" ]; then
+    case "$XTCP_SHARD" in
+        *[!0-9/]*|/*|*/|*/*/*)
+            echo "ERROR: --shard/XTCP_SHARD must be INDEX/TOTAL in decimal, got '$XTCP_SHARD'" >&2
+            exit 2
+            ;;
+    esac
+    _shard_idx="${XTCP_SHARD%%/*}"
+    _shard_total="${XTCP_SHARD##*/}"
+    while [ "${_shard_idx#0}" != "$_shard_idx" ]; do _shard_idx="${_shard_idx#0}"; done
+    while [ "${_shard_total#0}" != "$_shard_total" ]; do _shard_total="${_shard_total#0}"; done
+    _shard_idx="${_shard_idx:-0}"
+    if [ -z "$_shard_total" ] || [ "$_shard_total" -lt 1 ] || [ "$_shard_idx" -ge "$_shard_total" ]; then
+        echo "ERROR: --shard/XTCP_SHARD needs 0 <= INDEX < TOTAL with TOTAL >= 1, got '$XTCP_SHARD'" >&2
+        exit 2
+    fi
+    XTCP_SHARD="$_shard_idx/$_shard_total"
+fi
+
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -393,6 +442,22 @@ wait_for_port() {
 # environment where ownership cannot be checked fails the gate.
 wait_for_port_safe() {
     local host="$1" port="$2" timeout="${3:-15}" ready_min="${FRP_COMPAT_READY_MIN:-20}"
+    # The floor is arithmetic input, and `(( ))` reads a leading zero as octal:
+    # with `FRP_COMPAT_READY_MIN=08` the comparison below errored and read
+    # *false*, so the gate silently fell back to the caller's shorter timeout —
+    # the one case where the floor exists for a reason. Normalise it here as well
+    # as at load (`FRP_COMPAT_READY_MIN` is also validated there), and refuse a
+    # value that is not a decimal integer rather than letting `(( ))` abort.
+    case "$ready_min" in
+        ''|*[!0-9]*)
+            echo "ERROR: wait_for_port_safe: FRP_COMPAT_READY_MIN must be a non-negative integer, got '$ready_min'; failing closed" >&2
+            return 1
+            ;;
+    esac
+    while [ "${ready_min#0}" != "$ready_min" ]; do
+        ready_min="${ready_min#0}"
+    done
+    [ -n "$ready_min" ] || ready_min=0
     (( timeout < ready_min )) && timeout="$ready_min"
     case "$host" in
         127.0.0.1|localhost|::1)
@@ -4625,7 +4690,7 @@ run_xtcp_test() {
     should_run_test "$name" || return 0
 
     # Reap the servers the previous scenarios started, by the exact pids this
-    # run recorded (`track_pid`, `scripts/compat-test.sh:249`) — never by
+    # run recorded (`track_pid`, `scripts/compat-test.sh:298`) — never by
     # argument pattern. Two `pkill -f "frpc -c"` / `pkill -f "frps -c"` calls
     # stood here; they matched *any* `frpc -c …` command line on the host,
     # including a developer's unrelated run or a sibling worktree's compat run.

@@ -416,7 +416,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=aad684200b13e68ebfebae34df5c5bf5fa9abbaab22503a3512288a95b422870
+          guard_pin=fb61e2d97443dcc622b7adf6c0d571c8fa98563b9e7da9a01f95100b54679ca6
           # The declared check total and the absolute floor under it, the
           # same pair the three steps below use: the `ok`-line count is
           # compared for equality with `guard_exact`, so a fixture case
@@ -433,7 +433,7 @@ jobs:
           # evidence literals while the suite stayed byte-identical. Both files are
           # pinned here.
           guard_lib=scripts/lib/compat-stray-guard.sh
-          guard_lib_pin=1461036f92d3f03fd0e9ef24dda271c363c4af7011da3cf7c73a8ec250bc4a28
+          guard_lib_pin=dffe9f3bedb37440678bd0dcbe2956681d42e924acc3ec8041f4d0c2e6a0453e
           # R12-2 (adversarial round 13): resolve the hasher to an absolute path
           # and prove it with a known vector — the same candidate order and the
           # same fail-closed mode as the guard's own `find_hash_tool()`.
@@ -633,7 +633,7 @@ jobs:
           guard_exact=61
           guard_floor=61
           guard_lib=scripts/lib/compat-port-ownership.sh
-          guard_lib_pin=37a49936f419de3dda21766444f157ae57caa049290eb89ff0408da57480b55e
+          guard_lib_pin=f431135d9ea9744249767404fb8969f24f44e87f2f4454b6541edb086be808f9
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
@@ -727,7 +727,7 @@ jobs:
         # hard ceiling (`RETRY_MAX_CAP` = 5) so a large value cannot turn a red
         # run into a long — or cancelled — one that no red-rate metric counts.
         #
-        # The suite floors its own count (`MIN_CHECKS=34`) and fails closed from an
+        # The suite floors its own count (`MIN_CHECKS=40`) and fails closed from an
         # EXIT trap, so a script replaced by `exit 0`, a skipped scenario, or an
         # extraction that silently matched nothing reds here instead of passing on
         # an empty census. This file's sha256 is the outer pin: weakening the
@@ -747,9 +747,9 @@ jobs:
           log="${TMPDIR:-/tmp}/frp-scenario-retry-fixtures.$$.log"
           status=0
           guard_file=scripts/tests/compat-scenario-retry.sh
-          guard_pin=70fab0ec0c639c88efa6fdc5e2b06fcd8bec8e9a91ab4e4681d1244f0bad1620
-          guard_exact=34
-          guard_floor=34
+          guard_pin=7ac2bde46164cf7d6c072ace3c718a53d482e884662fed5e085974a6c1c30806
+          guard_exact=40
+          guard_floor=40
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=873ad3f477bed7afd556e2790238af4c381e46f88a5160cc02d39f129fa548fa
+          guard_data_pin=b75f07a5d86b080cdf16484390aedd2d2c8bc7f4f687083af4ce8b6af0dde95c
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'

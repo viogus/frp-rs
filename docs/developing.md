@@ -669,15 +669,15 @@ There are two cases, and they are not the same amount of work:
   ```
 
   What you add instead is a **Rust↔Rust** scenario in the same runner
-  (`test_kcp_rust_to_rust`, `scripts/compat-test.sh:5254`, is the existing
+  (`test_kcp_rust_to_rust`, `scripts/compat-test.sh:5319`, is the existing
   template). It still drives the real `frps` and `frpc` binaries and the real wire
   protocol, and it is what a reviewer will ask for. Say in the PR that compat with
   Go frpc is *not applicable* rather than leaving the section empty.
 
 **What the harness gives you, and what it does not.** `write_frps_config`
-(`scripts/compat-test.sh:1000`) is type-agnostic. `write_frpc_config`
-(`scripts/compat-test.sh:1063`) is **not**: it hard-codes `type = "tcp"` in both
-the Go (`:1104`) and the Rust (`:1132`) branch, so a new type cannot reuse it. Either
+(`scripts/compat-test.sh:1065`) is type-agnostic. `write_frpc_config`
+(`scripts/compat-test.sh:1128`) is **not**: it hard-codes `type = "tcp"` in both
+the Go (`:1169`) and the Rust (`:1197`) branch, so a new type cannot reuse it. Either
 add a `type` parameter to the writer **and** update every existing caller, or write
 the frpc TOML inline in your scenario the way the special-case scenarios do.
 Inline is usually the smaller diff and the one to prefer.
@@ -685,9 +685,9 @@ Inline is usually the smaller diff and the one to prefer.
 **Prerequisites — and the one that costs an hour if nobody says it.** Before any
 selector runs, the runner checks (a) that all four binaries exist and are
 executable — `GO_FRPS`, `GO_FRPC`, `$PROJECT_DIR/target/release/frps`,
-`$PROJECT_DIR/target/release/frpc` (`scripts/compat-test.sh:5234-5240`), and
+`$PROJECT_DIR/target/release/frpc` (`scripts/compat-test.sh:5299-5305`), and
 (b) that `frp-core/tests/certs/` holds `ca.crt`, `server.crt` and `server.key`
-(`:96`, checked at `:5242-5248`). Three consequences:
+(`:96`, checked at `:5307-5313`). Three consequences:
 
 - The Rust paths are **hard-coded to `target/release/`**
   (`scripts/compat-test.sh:94-95`) and are not environment-overridable. A debug
@@ -704,7 +704,7 @@ executable — `GO_FRPS`, `GO_FRPC`, `$PROJECT_DIR/target/release/frps`,
 
 Add your scenario function beside the existing ones and register it with the other
 `run_test` lines at the bottom of the file (`run_test test_g2r_tcp_plain` is at
-`scripts/compat-test.sh:5870`). This is the Rust↔Rust shape:
+`scripts/compat-test.sh:5935`). This is the Rust↔Rust shape:
 
 ```bash
 test_r2r_mytcp_plain() {
@@ -775,7 +775,7 @@ One config trap worth repeating, because it fails with an unreadable error:
 `tcp_mux` must agree on both sides. The `rust` branch of `write_frps_config`
 writes `tcp_mux = false`, so the inline client config must too — the working
 spelling is the snake_case `tcp_mux` of the Rust `write_frpc_config` branch
-(`scripts/compat-test.sh:1063-1139`). What *is* dropped, silently, is the **top-level**
+(`scripts/compat-test.sh:1128-1204`). What *is* dropped, silently, is the **top-level**
 camelCase key: `tcpMux = false` written at the top level is accepted by the
 config parser whether or not a `[transport]` table is present, but it has no serde
 alias on `tcp_mux` (`frp-core/src/config/client.rs:321-322`), so the client keeps the default
@@ -790,8 +790,8 @@ under a `[transport]` table is **not** dropped — `normalize_client_config`
 spelling logs in and registers fine.
 
 Helper line numbers for orientation: `start_echo_server`
-`scripts/compat-test.sh:419`, `send_and_expect` `:446`, `log` `:802`,
-`should_run_test` `:841`. `run_go` (`:278`) is only for the Go-driving scenarios;
+`scripts/compat-test.sh:484`, `send_and_expect` `:511`, `log` `:867`,
+`should_run_test` `:906`. `run_go` (`:327`) is only for the Go-driving scenarios;
 a Rust↔Rust scenario invokes `"$RUST_FRPS"` / `"$RUST_FRPC"` directly, as above.
 
 **What a passing run prints.** Use the display name and paste the `N passed` line
@@ -812,7 +812,7 @@ $ echo $?
 
 **`--test` takes the display name; `--list` prints the function name. They do not
 match, and the mismatch exits 0.** `should_run_test`
-(`scripts/compat-test.sh:841`) compares the selector against the `local name=`
+(`scripts/compat-test.sh:906`) compares the selector against the `local name=`
 inside the function, while `--list` (`scripts/compat-test.sh:168`) prints the
 function names:
 
