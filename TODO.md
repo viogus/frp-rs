@@ -10660,8 +10660,8 @@ section; ledger now **24 open / 104 closed**.**
   not as a typo, and `--debug` no longer reports a name that ran as unmatched (`scripts/compat-test.sh:746-766`: the
   scenario runs in the current shell with tracing scoped, so `SELECTED_MATCHED` survives the run).
   `.github/workflows/compat.yml:72-147` drives the control end-to-end (mismatched name exits non-zero, the message names
-  the selector, no summary line, no `All tests passed!`, `--debug` truthfulness); no live caller passed a function name
-  (`docs/developing.md:822` already labelled that form `# WRONG`), so the stricter gate breaks nothing documented.
+  the selector, no summary line, no `All tests passed!`, `--debug` truthfulness); no live caller relied on a function name
+  (`docs/developing.md:822` already labelled that form `# WRONG`) — the function-name callers at this head assert the red on purpose (`.github/workflows/compat.yml:85`, `scripts/tests/compat-port-ownership.sh:700`) — so the stricter gate breaks nothing documented.
 
 - [x] **The protocol matrix's `wait_for_listen` accepts a LISTEN socket owned by any process, so a foreign listener can green a row's readiness gate.**
 
@@ -10791,7 +10791,7 @@ section; ledger now **24 open / 104 closed**.**
   collisions: `echo_port="$frps_port"` was red before (11–12 s, the CI symptoms) and is now red **in about 1 s** naming
   the holder (`ERROR: compat-port-ownership: port N is held by the echo listener this run started (pid P), but a process
   launched after it (generation G) was meant to take this port`), and `echo_port="$proxy_port"` — a spurious PASS before
-  — now fails closed. The new suite `scripts/tests/compat-port-ownership.sh` scores ownership, both collisions, the
+  — now fails closed. The Done-when's "green after" half is the ordinary scenario, not the forced edit: the forced line bypasses the picker, so that run stays red by design (fail-closed in about 1 s, naming the holder), and the green half holds because no unmodified scenario can be handed a port the ledger already gave out. The new suite `scripts/tests/compat-port-ownership.sh` scores ownership, both collisions, the
   foreign listener and the matrix `wait_for_listen` cases (51 checks in round 1 → **61** at this head, `MIN_CHECKS=61`,
   sha256 `b76f5188175a3c86f80804193ad5d33935bdd8874bf4928b807251b1b173c8b9`), gated by the `Port ownership — fixture
   checks (compat harness readiness)` step (`.github/workflows/ci.yml:587`, `guard_exact`/`guard_floor=61` at

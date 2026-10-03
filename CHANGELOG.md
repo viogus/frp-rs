@@ -1280,8 +1280,8 @@ User-facing release notes for frp-rs.
   protocol matrix's `wait_for_listen` accepted any process's LISTEN socket, so a foreign listener greened
   a row; it now requires the pid the row launched. `random_port()` could return a port an earlier listener
   in the same scenario still held and the readiness probe was a bare connect; each port is now reserved
-  for the life of the scenario and readiness verifies the owner, with a 61-check fixture suite (up from
-  51) proving the collisions, the foreign-listener refusal and the hermeticity of its own stub seam.
+  for the life of the scenario and readiness verifies the owner, with a 61-check fixture suite (51 when the
+  suite landed in round 1, 61 at this head) proving the collisions, the foreign-listener refusal and the hermeticity of its own stub seam.
 
 - **`docs/config.md`'s Go column is now checked row by row against a measured Go frp key set, so a real-but-wrong Go key reds.**
   The gate proved each cell was *a* Go frp v0.71.0 spelling, not that it was *the* spelling for that row: swapping
