@@ -2,10 +2,40 @@ name: A/B Matrix (throughput gate)
 
 # Detects throughput regressions against a dedicated VPS (exclusive CPU).
 #
-# The gate is the scheduled/manual run: main~1 vs main on the VPS, FAILS on
-# any >GATE_PCT regression. The measurement is shipped to and executed on the
-# VPS (reusing the XTCP VPS + frp-test user) rather than on this runner, so
-# the numbers are stable and comparable.
+# THE GATE IS INFORMATIONAL (TODO.md:10569). A >GATE_PCT delta prints the table
+# and a ::warning:: and the job stays GREEN; set AB_GATE_ENFORCE=1 (the
+# `enforce` dispatch input) to restore the hard failure. The decision rests on
+# these numbers, and the script header repeats them:
+#   * Run 36996762744 measured a docs-comment-only delta (merged as #459,
+#     `97a03884..ae7bf50d`, whose 40 changed `.rs` lines — 20 added, 20 removed,
+#     across 10 files — are all citation re-points inside doc comments; the
+#     recorded item moved, so each reference to it was renumbered and no
+#     executable line changed) at +58.8% on `plain` and -15.6% on
+#     `encrypt_compress` in the SAME run, in opposite directions.
+#   * Identical binaries (the docs-only #280) measured tls
+#     -35.1% / -27.9% / +24.5% across three attempts before the PR mode was
+#     retired (2026-09-02).
+# 5% therefore sits an order of magnitude below the gate's own noise floor: a
+# red gate is not evidence of a regression, in either direction.
+#
+# Two independent mechanisms, neither redundant with the other:
+#   1. A delta with nothing measurable in it is SKIPPED before spending
+#      anything. Step "Classify measurable delta" runs
+#      `scripts/ab-measurable-delta.sh` and, when the delta contains no path
+#      that can change the measured numbers (docs/records-only), emits a
+#      ::notice:: naming both revisions and gates the base checkout, both
+#      builds and the VPS run. The job stays green and does NOT report as
+#      skipped — the classification step did run, and its notice is the
+#      evidence. A records-only daily delta has provably nothing to measure.
+#      `force_measure: true` (dispatch) bypasses this to measure a same-code
+#      pair deliberately (a noise study).
+#   2. The gate demotion above covers the deltas the classifier cannot refuse
+#      (the #459 pair is path-measurable: 10 `.rs` files) yet still semantics-
+#      free; it publishes the numbers and lets a human decide.
+#
+# The measurement itself is shipped to and executed on the VPS (reusing the
+# XTCP VPS + frp-test user) rather than on this runner, so the numbers are
+# stable and comparable.
 #
 # Pull requests do NOT trigger the measurement (2026-09-02): the old PR mode
 # ran base-vs-head on the VPS with continue-on-error for information only,
@@ -14,7 +44,7 @@ name: A/B Matrix (throughput gate)
 # first attempt "failed" the same way. Each PR attempt burned VPS time and
 # produced a red check to hand-rerun. If a PR needs numbers, dispatch this
 # workflow with commit_ref = the PR's merge commit; the daily VPS run remains
-# the authoritative gate.
+# the authoritative measurement.
 #
 # Requires GitHub Secrets (same VPS as XTCP compat):
 #   XTCP_VPS_HOST     - VPS public IP or hostname
@@ -32,6 +62,16 @@ on:
         description: 'Commit to gate: compare commit~1 (before) vs commit (after)'
         required: false
         default: 'main'
+      force_measure:
+        description: 'Measure even a delta with nothing measurable in it (same-code noise study)'
+        required: false
+        type: boolean
+        default: false
+      enforce:
+        description: 'Restore the hard failure: a >GATE_PCT regression reds the job (AB_GATE_ENFORCE=1)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -55,13 +95,74 @@ jobs:
           fetch-depth: 0
 
       # after = user-supplied commit_ref for dispatch, or main for the
-      # scheduled run. before = base parent.
+      # scheduled run. before = that commit's parent.
+      #
+      # Fail CLOSED on either ref. `echo "before=$(git rev-parse "$COMMIT~1")"`
+      # discards git's exit status — `echo` succeeds — so an unresolvable `~1`
+      # used to write a bogus non-empty ref and leave the step green; the only
+      # signal was the classifier's ::warning:: several steps later, and the
+      # failure then surfaced as a confusing `Checkout before` error. The
+      # comparison is commit-vs-parent, so a ref without a resolvable parent
+      # (a shallow checkout, a root commit) is an input error, not a skip.
       - name: Resolve before/after refs
         id: refs
         run: |
           COMMIT="${{ inputs.commit_ref || 'main' }}"
-          echo "after=$COMMIT" >> "$GITHUB_OUTPUT"
-          echo "before=$(git rev-parse "$COMMIT~1")" >> "$GITHUB_OUTPUT"
+          if ! after="$(git rev-parse --verify --quiet "${COMMIT}^{commit}")"; then
+            echo "::error::cannot resolve commit_ref '$COMMIT' to a commit in this checkout; pass a commit/branch/tag that exists here (a tag is peeled to its commit)"
+            exit 1
+          fi
+          if ! before="$(git rev-parse --verify --quiet "${after}~1^{commit}")"; then
+            echo "::error::cannot resolve the parent of '$COMMIT' (${after}~1): the A/B gate compares a commit against its parent, so the ref must have one and the checkout needs full history (fetch-depth: 0; a shallow checkout cannot resolve a parent)"
+            exit 1
+          fi
+          echo "after=$after" >> "$GITHUB_OUTPUT"
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          echo "A/B pair: $before (before) -> $after (after)"
+
+      # Runs BEFORE the base checkout, so a delta with nothing measurable in it
+      # costs one `git diff` and no VPS time. Always succeeds: rc 1 ("nothing
+      # measurable") is a result, not a failure, so the job goes green rather
+      # than being reported as skipped. An unresolvable/missing classifier
+      # fails OPEN (measure anyway) — a skip must be a positive finding, never
+      # the side effect of an unresolved input.
+      - name: Classify measurable delta
+        id: delta
+        env:
+          BEFORE_REF: ${{ steps.refs.outputs.before }}
+          AFTER_REF: ${{ steps.refs.outputs.after }}
+          AB_FORCE_MEASURE: ${{ inputs.force_measure && '1' || '0' }}
+        run: |
+          measure=true
+          reason=""
+          if [[ "$AB_FORCE_MEASURE" == "1" ]]; then
+            reason="force_measure=true"
+            echo "Delta classification bypassed (force_measure=true): measuring $BEFORE_REF..$AFTER_REF"
+          elif [[ ! -f scripts/ab-measurable-delta.sh ]]; then
+            reason="scripts/ab-measurable-delta.sh is absent at this checkout"
+          else
+            rc=0
+            paths="$(bash scripts/ab-measurable-delta.sh "$BEFORE_REF" "$AFTER_REF")" || rc=$?
+            case "$rc" in
+              0)
+                echo "Measurable delta $BEFORE_REF..$AFTER_REF:"
+                printf '%s\n' "$paths"
+                ;;
+              1)
+                measure=false
+                reason="no path in $BEFORE_REF..$AFTER_REF can change the measured numbers (docs/records-only)"
+                ;;
+              *)
+                reason="scripts/ab-measurable-delta.sh exited $rc on $BEFORE_REF..$AFTER_REF"
+                ;;
+            esac
+          fi
+          echo "measure=$measure" >> "$GITHUB_OUTPUT"
+          if [[ "$measure" == "false" ]]; then
+            echo "::notice::A/B matrix gate SKIPPED (informational): $BEFORE_REF..$AFTER_REF has nothing measurable — $reason. No base checkout, build or VPS run was started. Dispatch with force_measure=true to measure this pair anyway."
+          elif [[ -n "$reason" ]]; then
+            echo "::warning::A/B delta $BEFORE_REF..$AFTER_REF was not classified ($reason) — measuring anyway rather than skipping on an unresolved input."
+          fi
 
       - name: Check VPS secrets
         id: vps
@@ -79,8 +180,12 @@ jobs:
 
       # The "before" state lives in ./base; the "after" state is built at the
       # workspace root (HEAD for PR, main/dispatch-commit otherwise).
+      #
+      # Every step from here to the VPS run is gated on BOTH the VPS secrets
+      # and the delta classifier: when nothing is measurable there is no base
+      # to check out, nothing to build and nothing to measure.
       - name: Checkout before (base or parent)
-        if: steps.vps.outputs.available == 'true'
+        if: steps.vps.outputs.available == 'true' && steps.delta.outputs.measure == 'true'
         uses: actions/checkout@v4
         with:
           path: base
@@ -89,10 +194,10 @@ jobs:
 
       # Toolchain from the repo-root `rust-toolchain.toml` (no `toolchain:` input).
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-        if: steps.vps.outputs.available == 'true'
+        if: steps.vps.outputs.available == 'true' && steps.delta.outputs.measure == 'true'
 
       - name: Cache cargo builds
-        if: steps.vps.outputs.available == 'true'
+        if: steps.vps.outputs.available == 'true' && steps.delta.outputs.measure == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -104,7 +209,7 @@ jobs:
           restore-keys: ${{ runner.os }}-abmatrix-
 
       - name: Checkout after into workspace
-        if: steps.vps.outputs.available == 'true'
+        if: steps.vps.outputs.available == 'true' && steps.delta.outputs.measure == 'true'
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.refs.outputs.after }}
@@ -123,7 +228,7 @@ jobs:
       # is a pure code comparison. Configured after the checkout steps so
       # actions/checkout does not wipe the workspace-local .cargo/config.toml.
       - name: Configure fast CI release profile
-        if: steps.vps.outputs.available == 'true'
+        if: steps.vps.outputs.available == 'true' && steps.delta.outputs.measure == 'true'
         run: |
           for d in . base; do
             mkdir -p "$d/.cargo"
@@ -131,26 +236,30 @@ jobs:
           done
 
       - name: Build after (PR head / target commit) binaries
-        if: steps.vps.outputs.available == 'true'
+        if: steps.vps.outputs.available == 'true' && steps.delta.outputs.measure == 'true'
         run: |
           cargo build --release -p frps -p frpc
           (cd scripts/frp-stress && cargo build --release)
 
       - name: Build before (base / parent) binaries
-        if: steps.vps.outputs.available == 'true'
+        if: steps.vps.outputs.available == 'true' && steps.delta.outputs.measure == 'true'
         run: |
           (cd base && cargo build --release -p frps -p frpc)
           (cd base/scripts/frp-stress && cargo build --release)
 
+      # AB_GATE_ENFORCE (the `enforce` input) is forwarded by ab-remote.sh to
+      # the VPS: ssh does not forward the caller's environment, and the switch
+      # is read by scripts/ab-matrix.sh *on the VPS*.
       - name: Run A/B matrix gate on VPS
-        if: steps.vps.outputs.available == 'true'
+        if: steps.vps.outputs.available == 'true' && steps.delta.outputs.measure == 'true'
         env:
           BEFORE_ROOT: ${{ github.workspace }}/base
           GATE_PCT: "5"
+          AB_GATE_ENFORCE: ${{ inputs.enforce && '1' || '0' }}
           XTCP_VPS_HOST: ${{ secrets.XTCP_VPS_HOST }}
           XTCP_VPS_SSH_KEY: ${{ secrets.XTCP_VPS_SSH_KEY }}
         run: bash scripts/ab-remote.sh 3 8
 
       - name: Clean up base checkout
-        if: always()
+        if: always() && steps.delta.outputs.measure == 'true'
         run: rm -rf base
