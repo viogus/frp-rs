@@ -257,11 +257,18 @@ check_udp_present() {
 }
 
 # The flag half + file-key half + no-socket checks for one hand-named shape.
+# `filekey` is the config key the file half writes; its port is a fresh
+# `fileudp`, so the "no UDP socket" check names the same port the file does —
+# not the flag half's port.
 probe_flagged_shape() {
-  local label=$1 key=$2 flag=$3 fileline=$4
-  local bin="$work/$label" port udp
+  local label=$1 key=$2 flag=$3 filekey=$4
+  local bin="$work/$label" port udp fileudp
   port=$(free_tcp_port)
   udp=$(free_udp_port)
+  fileudp=$(free_udp_port)
+  while [ "$fileudp" = "$udp" ]; do
+    fileudp=$(free_udp_port)
+  done
 
   check "$label: --help advertises $flag" 1 \
     "$("$bin" --help 2>&1 | grep -c -- "$flag")"
@@ -274,25 +281,26 @@ probe_flagged_shape() {
   check_udp_absent "$label: flag run binds no UDP socket on its port" "$udp"
 
   run_snapshot "$bin" "bind_port = $port
-$fileline"
+$filekey = $fileudp"
   check "$label: file key prints exactly one $key record" 1 \
     "$(printf '%s' "$LAST_OUT" | grep -c -- "$key" || true)"
   check "$label: file-key record names the missing frp-server feature" 1 \
     "$(printf '%s' "$LAST_OUT" | grep -c 'frp-core compiled the field' || true)"
-  check_udp_absent "$label: file-key run binds no UDP socket on its port" "$udp"
+  check_udp_absent "$label: file-key run binds no UDP socket on its port" "$fileudp"
+  printf '  info  %s: flag port %s, file-key port %s\n' "$label" "$udp" "$fileudp"
 }
 
 printf '== hand-named `tiny,frp-core/kcp` ==\n'
 build_shape "tiny,frp-core/kcp" tiny kcp frps-tiny frps-tiny-kcp
-probe_flagged_shape frps-tiny-kcp kcp_bind_port --kcp-bind-port "kcp_bind_port = 41701"
+probe_flagged_shape frps-tiny-kcp kcp_bind_port --kcp-bind-port kcp_bind_port
 
 printf '== hand-named `tiny,frp-core/quic` ==\n'
 build_shape "tiny,frp-core/quic" tiny quic frps-tiny frps-tiny-quic
-probe_flagged_shape frps-tiny-quic quic_bind_port --quic-bind-port "quic_bind_port = 41703"
+probe_flagged_shape frps-tiny-quic quic_bind_port --quic-bind-port quic_bind_port
 
 printf '== hand-named `micro,frp-core/kcp` ==\n'
 build_shape "micro,frp-core/kcp" micro kcp frps-micro frps-micro-kcp
-probe_flagged_shape frps-micro-kcp kcp_bind_port --kcp-bind-port "kcp_bind_port = 41705"
+probe_flagged_shape frps-micro-kcp kcp_bind_port --kcp-bind-port kcp_bind_port
 
 printf '== hand-named `tiny,frp-core/websocket` (file key only: no flag) ==\n'
 build_shape "tiny,frp-core/websocket" tiny websocket frps-tiny frps-tiny-ws
