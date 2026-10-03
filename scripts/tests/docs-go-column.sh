@@ -51,7 +51,7 @@
 #   qualified  `` `tok` (start|end|nested) `` with `tok` the recorded Go frp v0.71.0 spelling
 #   divergent  the recorded em-dash divergence marker (`—`, `` `—` ``, optionally with prose)
 #   extension  an em-dash marker naming a spelling the recorded key set proves Go does not have
-#   nontoken   one of the four documented non-token shapes: `**Required.**`,
+#   nontoken   one of the three documented non-token shapes: `**Required.**`,
 #              `` `sk` / `secretKey` ``, `` `transport.wireProtocol = "v2"` ``
 #   alias      a spelling in the accepted `ALIASES` table (currently empty)
 # Anything else is a violation. The `ALIASES` table is the recorded exemption for spellings a
