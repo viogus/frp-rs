@@ -23,7 +23,11 @@
 #      `tests/` directory, the attribute-attribution cases (a gate above a `use`
 #      / `const` / between two attributes, `#[cfg(all(test, …))]` inline and on a
 #      declaration, `#[cfg(all(not(test), …))]`, a `#[path]` written above the
-#      gate, and braces inside string literals), the raw-string cases (a
+#      gate, and braces inside string literals, a predicate wrapped across
+#      lines, a `#[path]` or `#[allow(…)]` sharing the gate's line, a spaced
+#      `#[ cfg ( test ) ]`, and wrapped predicates declined because their payload
+#      crosses a raw string, an ordinary continued string or a block comment), the
+#      raw-string cases (a
 #      multi-line literal and one with embedded quotes inside a gate's region, a
 #      production function whose body holds one), the gate-tail cases (a trailing
 #      `/* */` or `//` comment, a `]` inside that comment, a second attribute on
@@ -43,7 +47,7 @@
 #   2  the default table and `--top` are unchanged in shape, a file the
 #      filter excluded is still not listed, and the function table measures the
 #      raw-string fixture's function to its true end.
-#   3  nineteen mutations of the script, each of which must red exactly one part of
+#   3  twenty-five mutations of the script, each of which must red exactly one part of
 #      scenario 1: drop the name pattern, drop the sibling attribution, drop
 #      declaration recognition, drop `pub(…)` from the declaration pattern,
 #      offer `dir/X.rs` for a `parent.rs`, drop the `all(…)` arm of the
@@ -54,7 +58,10 @@
 #      tail, consume the attribute run a line at a time again, drop the
 #      ordinary-string continuation, skip an attribute tail within its own line
 #      only, drop the escape state in the predicate splitter, drop the region
-#      pass, and drop the backward walk's region guard. A green suite on a mutant
+#      pass, and drop the backward walk's region guard, drop the wrapped-predicate
+#      and packed-attribute acceptances, remove `CFG_OPEN`'s whitespace
+#      tolerance, drop the multi-line raw-string and continued-string declines,
+#      and never clear the non-first-attribute flag. A green suite on a mutant
 #      would mean the fixture does not drive the code it claims to.
 #   4  the check floor: a run without `python3` skips by design and must still
 #      exit 0 rather than trip the short-suite guard.
@@ -69,7 +76,7 @@ set -uo pipefail
 # measured check count of a green run. The one deliberate early exit — the
 # `python3`-absent SKIP below — sets `FLOOR_EXEMPT`, because zero checks is the
 # right answer there.
-MIN_CHECKS=133
+MIN_CHECKS=147
 checks=0
 fails=0
 WORK=""
@@ -349,11 +356,14 @@ done
 # missed are gates too (each reads all-production at base `5682fe6c`, measured):
 # a predicate that wraps (`#[cfg(all(` / `test,` / `feature = "x"` / `))]`) and a
 # `#[path]` that shares the gate's line. A span that would have to walk through a
-# line-spanning comment, string or raw string stays unsupported — pinned by
-# `attr_wrapped_comment.rs`, which reads production on purpose.
+# line-spanning comment, string or raw string stays unsupported — pinned by `attr_wrapped_comment.rs`, `attr_wrapped_rawstr.rs` and
+# `attr_wrapped_contstr.rs`, which all read production on purpose. The
+# non-first attribute need not be a `#[path]`: `#[allow(dead_code)] #[cfg(test)]`
+# is the same acceptance, pinned by `attr_allow_first.rs` and its declaration
+# variant.
 mkdir -p "$TREE/frp-core/src/attr_all_decl" "$TREE/frp-core/src/attr_back" \
   "$TREE/frp-core/src/attr_wrapped_decl" "$TREE/frp-core/src/attr_path_first" \
-  "$TREE/frp-core/src/attr_path_first_any"
+  "$TREE/frp-core/src/attr_path_first_any" "$TREE/frp-core/src/attr_allow_first_decl"
 
 cat > "$TREE/frp-core/src/attr_item.rs" <<'EOF'
 //! A gate above a `use`: the region ends there, not at the `mod` below it.
@@ -573,6 +583,91 @@ pub fn prod_before() -> u8 {
 }
 
 #[ cfg ( test ) ]
+mod tests {
+    #[test]
+    fn inline() {}
+}
+
+pub fn prod_after() -> u8 {
+    2
+}
+EOF
+
+# The non-first attribute does not have to carry a `#[path]`: `#[allow(…)]`
+# before the gate on the same line is the same acceptance (base: `14 14 0`,
+# head `9 14 5`). The declaration variant also has to walk back to the
+# `#[path]` line and attribute that sibling, which only works if the gate line
+# itself is the candidate (base: `12 12 0` / sibling `4 4 0`).
+cat > "$TREE/frp-core/src/attr_allow_first.rs" <<'EOF'
+pub fn prod_before() -> u8 {
+    1
+}
+
+#[allow(dead_code)] #[cfg(test)]
+mod tests {
+    #[test]
+    fn inline() {}
+}
+
+pub fn prod_after() -> u8 {
+    2
+}
+EOF
+cat > "$TREE/frp-core/src/attr_allow_first_decl.rs" <<'EOF'
+pub fn prod_before() -> u8 {
+    1
+}
+
+#[path = "attr_allow_first_decl/allow_first_decl_helper.rs"]
+#[allow(dead_code)] #[cfg(test)]
+mod allow_first_decl;
+
+pub fn prod_after() -> u8 {
+    2
+}
+EOF
+cat > "$TREE/frp-core/src/attr_allow_first_decl/allow_first_decl_helper.rs" <<'EOF'
+pub fn allow_first_decl_helper_prod() {
+    let x = 1;
+}
+EOF
+
+# A wrapped predicate whose payload contains a raw string that runs past the
+# line: `attribute_span` declines the span, so the module stays production.
+# M23 removes that decline.
+cat > "$TREE/frp-core/src/attr_wrapped_rawstr.rs" <<'EOF'
+pub fn prod_before() -> u8 {
+    1
+}
+
+#[cfg(all(
+    test,
+    feature = r#"x
+"#
+))]
+mod tests {
+    #[test]
+    fn inline() {}
+}
+
+pub fn prod_after() -> u8 {
+    2
+}
+EOF
+
+# The ordinary-string analogue: the payload's `"` opens a string that ends its
+# line with a backslash, which `_string_rest` flags as continued; the span is
+# declined. M24 removes that decline.
+cat > "$TREE/frp-core/src/attr_wrapped_contstr.rs" <<'EOF'
+pub fn prod_before() -> u8 {
+    1
+}
+
+#[cfg(all(
+    test,
+    feature = "x \
+y"
+))]
 mod tests {
     #[test]
     fn inline() {}
@@ -1106,6 +1201,18 @@ expect_row "$OUT" "frp-core/src/attr_path_first_any.rs" 9 11 2 \
   "the packed spelling gates with \`any(test)\` too"
 expect_row "$OUT" "frp-core/src/attr_spaced_gate.rs" 9 14 5 \
   "a spaced \`#[ cfg ( test ) ]\` is a gate"
+expect_row "$OUT" "frp-core/src/attr_path_first_any/path_first_any_helper.rs" 0 4 4 \
+  "the packed \`any(test)\` \`#[path]\` still attributes its sibling to tests"
+expect_row "$OUT" "frp-core/src/attr_allow_first.rs" 9 14 5 \
+  "a gate preceded by \`#[allow(…)]\` on its line is a gate"
+expect_row "$OUT" "frp-core/src/attr_allow_first_decl.rs" 9 12 3 \
+  "an \`#[allow(…)]\`-preceded gate still spans its \`#[path]\` and declaration"
+expect_row "$OUT" "frp-core/src/attr_allow_first_decl/allow_first_decl_helper.rs" 0 4 4 \
+  "the \`#[allow(…)]\`-preceded gate's \`#[path]\` sibling is attributed to tests"
+expect_row "$OUT" "frp-core/src/attr_wrapped_rawstr.rs" 18 18 0 \
+  "a wrapped predicate crossing a multi-line raw string stays unsupported"
+expect_row "$OUT" "frp-core/src/attr_wrapped_contstr.rs" 18 18 0 \
+  "a wrapped predicate crossing a backslash-continued string stays unsupported"
 expect_row "$OUT" "frp-core/src/attr_const.rs" 9 14 5 \
   "a gate above a \`const\` ends at its \`;\`, past the \`[&str; 2]\`"
 expect_row "$OUT" "frp-core/src/attr_gate_then_attr.rs" 5 11 6 \
@@ -1832,6 +1939,99 @@ if mutate "$REAL" "$MUT" \
   fi
 else
   bad "M22 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M23: the multi-line raw-string decline in `attribute_span`. Dropping it lets
+# the span walk past the line into the rest of the wrapped predicate, so
+# `attr_wrapped_rawstr.rs` becomes a gate and its test module stops counting as
+# production. `attr_wrapped_contstr.rs` is the control: it is declined by the
+# ordinary-string branch, a different check in the same scanner.
+if mutate "$REAL" "$MUT" \
+    "                    if k < 0:           # the raw string continues past the line
+                        return -1, -1" \
+    "                    if k < 0:
+                        j = n
+                        continue"; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/attr_wrapped_rawstr.rs")"
+  if [ "$got" = "9 18 9" ]; then
+    ok "M23 (no multi-line raw-string decline): the wrapped predicate gates again"
+  else
+    bad "M23: attr_wrapped_rawstr.rs expected '9 18 9', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/attr_wrapped_contstr.rs")"
+  if [ "$got" = "18 18 0" ]; then
+    ok "M23: a backslash-continued string is still declined (an independent branch)"
+  else
+    bad "M23: attr_wrapped_contstr.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M23 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M24: the backslash-continued-string decline. Same mechanism on the
+# ordinary-string branch, with the raw-string fixture as the control.
+if mutate "$REAL" "$MUT" \
+    "                if not done:            # a \`\\\` at end of line continues it
+                    return -1, -1" \
+    '                if not done:
+                    j = n
+                    continue'; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/attr_wrapped_contstr.rs")"
+  if [ "$got" = "9 18 9" ]; then
+    ok "M24 (no continued-string decline): the wrapped predicate gates again"
+  else
+    bad "M24: attr_wrapped_contstr.rs expected '9 18 9', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/attr_wrapped_rawstr.rs")"
+  if [ "$got" = "18 18 0" ]; then
+    ok "M24: a multi-line raw string is still declined (an independent branch)"
+  else
+    bad "M24: attr_wrapped_rawstr.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M24 mutation did not apply — anchor missing, the check would be vacuous"
+fi
+
+# M25: the `first` flag that the non-first acceptance reads. Never clearing it
+# reduces the clause to `ei > li`, so a gate that is not the run's first
+# attribute is missed — both `#[allow(dead_code)] #[cfg(test)]` fixtures red,
+# including the `#[path]` sibling's attribution. The wrapped fixtures are the
+# controls: they are accepted on `ei > li`, so the flag is irrelevant to them.
+if mutate "$REAL" "$MUT" \
+    "        first = False" \
+    "        first = True"; then
+  cp "$MUT" "$TREE/scripts/large-functions.sh"
+  MOUT="$(bash "$TREE/scripts/large-functions.sh" --all 2>&1)"
+  got="$(row "$MOUT" "frp-core/src/attr_allow_first.rs")"
+  if [ "$got" = "14 14 0" ]; then
+    ok "M25 (non-first gate never accepted): \`#[allow(…)] #[cfg(test)]\` is production again"
+  else
+    bad "M25: attr_allow_first.rs expected '14 14 0', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/attr_allow_first_decl.rs")"
+  if [ "$got" = "12 12 0" ]; then
+    ok "M25: the \`#[allow(…)]\`-preceded gate no longer spans its declaration"
+  else
+    bad "M25: attr_allow_first_decl.rs expected '12 12 0', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/attr_allow_first_decl/allow_first_decl_helper.rs")"
+  if [ "$got" = "4 4 0" ]; then
+    ok "M25: the \`#[path]\` sibling is no longer attributed to tests"
+  else
+    bad "M25: attr_allow_first_decl/allow_first_decl_helper.rs expected '4 4 0', got '${got:-<absent>}'"
+  fi
+  got="$(row "$MOUT" "frp-core/src/attr_wrapped_gate.rs")"
+  if [ "$got" = "9 17 8" ]; then
+    ok "M25: a wrapped predicate is unaffected (accepted on its closing line)"
+  else
+    bad "M25: attr_wrapped_gate.rs became '${got:-<absent>}'"
+  fi
+else
+  bad "M25 mutation did not apply — anchor missing, the check would be vacuous"
 fi
 
 # ---------------------------------------------------------------- the floor
