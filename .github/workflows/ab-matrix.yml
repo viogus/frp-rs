@@ -7,11 +7,11 @@ name: A/B Matrix (throughput gate)
 # `enforce` dispatch input) to restore the hard failure. The decision rests on
 # these numbers, and the script header repeats them:
 #   * Run 36996762744 measured a docs-comment-only delta (merged as #459,
-#     `97a03884..ae7bf50d`, whose 20 changed `.rs` lines are all citation
-#     re-points inside doc comments — the recorded item moved, so each
-#     reference to it was renumbered; no executable line changed) at +58.8% on
-#     `plain` and -15.6% on `encrypt_compress` in the SAME run, in opposite
-#     directions.
+#     `97a03884..ae7bf50d`, whose 40 changed `.rs` lines — 20 added, 20 removed,
+#     across 10 files — are all citation re-points inside doc comments; the
+#     recorded item moved, so each reference to it was renumbered and no
+#     executable line changed) at +58.8% on `plain` and -15.6% on
+#     `encrypt_compress` in the SAME run, in opposite directions.
 #   * Identical binaries (the docs-only #280) measured tls
 #     -35.1% / -27.9% / +24.5% across three attempts before the PR mode was
 #     retired (2026-09-02).
@@ -95,13 +95,30 @@ jobs:
           fetch-depth: 0
 
       # after = user-supplied commit_ref for dispatch, or main for the
-      # scheduled run. before = base parent.
+      # scheduled run. before = that commit's parent.
+      #
+      # Fail CLOSED on either ref. `echo "before=$(git rev-parse "$COMMIT~1")"`
+      # discards git's exit status — `echo` succeeds — so an unresolvable `~1`
+      # used to write a bogus non-empty ref and leave the step green; the only
+      # signal was the classifier's ::warning:: several steps later, and the
+      # failure then surfaced as a confusing `Checkout before` error. The
+      # comparison is commit-vs-parent, so a ref without a resolvable parent
+      # (a shallow checkout, a root commit) is an input error, not a skip.
       - name: Resolve before/after refs
         id: refs
         run: |
           COMMIT="${{ inputs.commit_ref || 'main' }}"
-          echo "after=$COMMIT" >> "$GITHUB_OUTPUT"
-          echo "before=$(git rev-parse "$COMMIT~1")" >> "$GITHUB_OUTPUT"
+          if ! after="$(git rev-parse --verify --quiet "${COMMIT}^{commit}")"; then
+            echo "::error::cannot resolve commit_ref '$COMMIT' to a commit in this checkout; pass a commit/branch/tag that exists here (a tag is peeled to its commit)"
+            exit 1
+          fi
+          if ! before="$(git rev-parse --verify --quiet "${after}~1^{commit}")"; then
+            echo "::error::cannot resolve the parent of '$COMMIT' (${after}~1): the A/B gate compares a commit against its parent, so the ref must have one and the checkout needs full history (fetch-depth: 0; a shallow checkout cannot resolve a parent)"
+            exit 1
+          fi
+          echo "after=$after" >> "$GITHUB_OUTPUT"
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          echo "A/B pair: $before (before) -> $after (after)"
 
       # Runs BEFORE the base checkout, so a delta with nothing measurable in it
       # costs one `git diff` and no VPS time. Always succeeds: rc 1 ("nothing

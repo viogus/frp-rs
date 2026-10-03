@@ -13,12 +13,17 @@
 #      asserted. Each measured-set class gets its own fixture with a path that
 #      belongs to that class and no other.
 #   2. scripts/ab-matrix.sh — the gate arithmetic. `AB_MATRIX_LIB_ONLY=1`
-#      sources the real gate_median / gate_verdict / gate_report definitions
-#      (the source-only guard at the top of the script stops before any
-#      worktree, build or server) and calls them.
+#      sources the real gate_median / gate_verdict / gate_report / gate_final
+#      definitions (the source-only guard at the top of the script stops before
+#      any worktree, build or server) and calls them.
+#   3. scripts/ab-remote.sh — the transport that carries the two gate switches
+#      to the VPS. It is run for real against a stub `ssh` that records the
+#      remote command line, because ssh forwards no environment: a deleted or
+#      reworded splice silently disables the `enforce` re-arm, and hashing the
+#      file alone would not witness that.
 #
 # It also carries a MUTANT MATRIX (the sabotage converse): each mutant copies
-# one of the two real scripts, applies exactly the mutation that would neuter
+# one of the three real scripts, applies exactly the mutation that would neuter
 # one property, and re-runs THIS SUITE as a child process against the mutant.
 # The suite must then go red. A green child means the fixtures do not actually
 # witness the property they claim to, and the check fails. The real scripts are
@@ -40,13 +45,14 @@ esac
 ROOT="$(cd -P -- "$(dirname -- "$self")/../.." && pwd)"
 CLASSIFIER="${AB_MD_CLASSIFIER:-$ROOT/scripts/ab-measurable-delta.sh}"
 MATRIX="${AB_MD_MATRIX:-$ROOT/scripts/ab-matrix.sh}"
+REMOTE="${AB_MD_REMOTE:-$ROOT/scripts/ab-remote.sh}"
 
 # The child runs invoked by the mutant matrix run every fixture EXCEPT the
 # mutant matrix itself (which would recurse forever), so they have their own
 # floor. Both floors count CHECKS RUN, not checks passed: a mutant run is
 # expected to fail fixtures, and the floor must not paper over an early exit.
 SABOTAGE_CHILD="${AB_MD_SABOTAGE_CHILD:-0}"
-if [ "$SABOTAGE_CHILD" = "1" ]; then MIN_CHECKS=37; else MIN_CHECKS=42; fi
+if [ "$SABOTAGE_CHILD" = "1" ]; then MIN_CHECKS=43; else MIN_CHECKS=49; fi
 
 checks=0
 fails=0
@@ -68,13 +74,14 @@ cleanup_all() {
 }
 trap cleanup_all EXIT
 
-for tool in git sed cmp tr cut grep mktemp; do
+for tool in git sed cmp tr cut grep mktemp tar env; do
   command -v "$tool" >/dev/null 2>&1 || { echo "FATAL: $tool not found" >&2; exit 1; }
 done
 python3 -c 'pass' 2>/dev/null || { echo "FATAL: python3 not found (the gate uses it)" >&2; exit 1; }
 
 [ -f "$CLASSIFIER" ] || { echo "FATAL: classifier not found: $CLASSIFIER" >&2; exit 1; }
 [ -f "$MATRIX" ]     || { echo "FATAL: gate script not found: $MATRIX" >&2; exit 1; }
+[ -f "$REMOTE" ]     || { echo "FATAL: remote transport not found: $REMOTE" >&2; exit 1; }
 
 hasher() {  # hasher <file> -> hex digest (portable)
   if command -v sha256sum >/dev/null 2>&1; then
@@ -330,11 +337,26 @@ else
   bad "gate_report within gate -> rc $rc, output='$out' (want rc 0 + FAIL=0, no ::warning::)"
 fi
 
-rc=0; probe 1 'gate_report plain 100.0 82.0 -18.0 3 REGRESSED' >/dev/null 2>&1 || rc=$?
-if [ "$rc" = "1" ]; then
-  ok "gate_report REGRESSED with AB_GATE_ENFORCE=1 -> rc 1 (hard failure restored)"
+# The enforcement site is gate_final — gate_report only records the verdict and
+# never ends the run — so the re-arm is proved by driving the function the
+# script itself ends with, through the same `if gate_final; then … else …`
+# shape (the sourced script runs under `set -e`, so a bare `gate_final` at rc 1
+# would abort the probe exactly as it would abort the script). A demoted gate
+# whose re-arm is unreachable would be a promise nothing witnesses.
+rc=0; out="$(probe 1 'FAIL=1; if gate_final; then echo "inner=0"; else echo "inner=1"; fi')" || rc=$?
+if [ "$rc" = "0" ] && printf '%s' "$out" | grep -q 'A/B GATE FAILED' \
+   && printf '%s' "$out" | grep -q 'inner=1'; then
+  ok "gate_final: FAIL=1 under AB_GATE_ENFORCE=1 -> rc 1 (hard failure restored)"
 else
-  bad "gate_report REGRESSED with AB_GATE_ENFORCE=1 -> expected rc 1, got rc $rc"
+  bad "gate_final under AB_GATE_ENFORCE=1 -> rc $rc, output='$out' (want the FAILED line and the rc-1 branch)"
+fi
+
+rc=0; out="$(probe 0 'FAIL=1; if gate_final; then echo "inner=0"; else echo "inner=1"; fi')" || rc=$?
+if [ "$rc" = "0" ] && printf '%s' "$out" | grep -q 'A/B GATE REGRESSED (informational' \
+   && printf '%s' "$out" | grep -q 'inner=0'; then
+  ok "gate_final: FAIL=1 without enforce -> rc 0 and the informational tail"
+else
+  bad "gate_final informational -> rc $rc, output='$out' (want the REGRESSED (informational) tail and the rc-0 branch)"
 fi
 
 rc=0; out="$(probe 0 'echo ran')" || rc=$?
@@ -417,6 +439,97 @@ else
   bad "measure_pair_deltas with an empty side -> got '$got' (want '[] [0] [0]')"
 fi
 
+hdr "remote transport: the gate switches reach the VPS command line"
+
+# scripts/ab-remote.sh forwards the two switches because ssh carries no
+# environment and ab-matrix.sh reads them *on the VPS*. The suite runs the real
+# script against a stub `ssh` that records each remote command instead of
+# connecting: no network, no VPS, but the splice is exercised rather than
+# grepped, so a deleted/reworded splice fails a fixture (and the mutant matrix
+# below proves the step would notice).
+REMOTE_ROOT="$WORK/remote"
+mkdir -p "$REMOTE_ROOT/bin" "$REMOTE_ROOT/bundle"
+for side in after before; do
+  for b in "target/release/frps" "target/release/frpc" \
+           "scripts/frp-stress/target/release/frp-stress"; do
+    mkdir -p "$REMOTE_ROOT/$side/$(dirname -- "$b")"
+    printf '#!/bin/sh\nexit 0\n' > "$REMOTE_ROOT/$side/$b"
+    chmod +x "$REMOTE_ROOT/$side/$b"
+  done
+done
+printf 'stub-key\n' > "$REMOTE_ROOT/key"
+
+cat > "$REMOTE_ROOT/bin/ssh" <<'FAKE_SSH'
+#!/usr/bin/env bash
+# Stub ssh: record the remote command (our last argument) and drain the piped
+# tarball when this call is the upload, so the local `tar` sees no broken pipe.
+last=""
+for a in "$@"; do last="$a"; done
+case "$last" in
+  'tar xf'*) cat >/dev/null 2>&1 || true ;;
+esac
+printf '%s\n' "$last" >> "$AB_MD_SSH_CAPTURE"
+case "$last" in
+  *ab-matrix.sh*) exit "${AB_MD_SSH_RC:-0}" ;;
+esac
+exit 0
+FAKE_SSH
+chmod +x "$REMOTE_ROOT/bin/ssh"
+
+# run_remote <remote-script> <capture-file> <stub-ssh-rc> [<VAR=val>...]
+# Prints the script's exit code; the recorded remote commands land in the
+# capture file (one line per line of each command).
+run_remote() {
+  local remote="$1" capture="$2" ssh_rc="$3"; shift 3
+  local rc=0
+  : > "$capture"
+  env -i PATH="$REMOTE_ROOT/bin:/usr/bin:/bin" HOME="$HOME" \
+      AB_MD_SSH_CAPTURE="$capture" AB_MD_SSH_RC="$ssh_rc" \
+      AB_VPS_HOST=stub.invalid AB_VPS_SSH_KEY="$REMOTE_ROOT/key" \
+      AFTER_ROOT="$REMOTE_ROOT/after" BEFORE_ROOT="$REMOTE_ROOT/before" \
+      "$@" \
+      bash "$remote" 3 8 "$REMOTE_ROOT/bundle" >/dev/null 2>&1 || rc=$?
+  printf '%s' "$rc"
+}
+
+cap="$WORK/ssh-capture"
+rc="$(run_remote "$REMOTE" "$cap" 0 AB_GATE_ENFORCE=1 AB_FORCE_MEASURE=0)"
+flat="$(tr '\n' ' ' < "$cap")"
+if [ "$rc" = "0" ] && printf '%s' "$flat" | grep -Eq "AB_GATE_ENFORCE=1 AB_FORCE_MEASURE=0.*flock -w 1800 ~/\.ab-matrix\.lock.*bash scripts/ab-matrix\.sh '3' '8'"; then
+  ok "ab-remote.sh: the gate command carries AB_GATE_ENFORCE=1 AB_FORCE_MEASURE=0 under the flock, before the harness"
+else
+  bad "ab-remote.sh enforce=1 splice -> rc $rc, captured='$flat' (want the switches, then the flock, then ab-matrix.sh)"
+fi
+
+rc="$(run_remote "$REMOTE" "$cap" 0)"
+flat="$(tr '\n' ' ' < "$cap")"
+if [ "$rc" = "0" ] && printf '%s' "$flat" | grep -Eq "AB_GATE_ENFORCE=0 AB_FORCE_MEASURE=0.*bash scripts/ab-matrix\.sh"; then
+  ok "ab-remote.sh: unset switches default to AB_GATE_ENFORCE=0 AB_FORCE_MEASURE=0 (previous behaviour)"
+else
+  bad "ab-remote.sh default splice -> rc $rc, captured='$flat' (want both switches defaulted to 0)"
+fi
+
+rc="$(run_remote "$REMOTE" "$cap" 0 AB_GATE_ENFORCE=2)"
+if [ "$rc" = "2" ] && [ ! -s "$cap" ]; then
+  ok "ab-remote.sh: refuses AB_GATE_ENFORCE=2 with rc 2 before shipping anything"
+else
+  bad "ab-remote.sh AB_GATE_ENFORCE=2 -> rc $rc, capture $(wc -l < "$cap" | tr -d ' ') line(s) (want rc 2 and no ssh call)"
+fi
+
+rc="$(run_remote "$REMOTE" "$cap" 0 AB_FORCE_MEASURE=maybe)"
+if [ "$rc" = "2" ] && [ ! -s "$cap" ]; then
+  ok "ab-remote.sh: refuses AB_FORCE_MEASURE=maybe with rc 2 before shipping anything"
+else
+  bad "ab-remote.sh AB_FORCE_MEASURE=maybe -> rc $rc, capture $(wc -l < "$cap" | tr -d ' ') line(s) (want rc 2 and no ssh call)"
+fi
+
+rc="$(run_remote "$REMOTE" "$cap" 7)"
+if [ "$rc" = "7" ]; then
+  ok "ab-remote.sh: the VPS exit code is propagated (remote rc 7 -> local rc 7)"
+else
+  bad "ab-remote.sh exit-code propagation -> rc $rc (want the stub's rc 7)"
+fi
+
 if [ "$SABOTAGE_CHILD" = "1" ]; then
   exit 0
 fi
@@ -425,8 +538,9 @@ hdr "mutant matrix: neutering a property must turn this suite red"
 
 ORIG_CLASSIFIER_HASH="$(hasher "$CLASSIFIER")"
 ORIG_MATRIX_HASH="$(hasher "$MATRIX")"
+ORIG_REMOTE_HASH="$(hasher "$REMOTE")"
 
-# run_suite_against <classifier> <matrix>: sets child_rc / child_result.
+# run_suite_against <classifier> <matrix> [<remote>]: sets child_rc / child_result.
 # The child's own log is captured (never echoed: its "FAIL" lines would be
 # counted by the CI guard that watches THIS run) and only its RESULT line is
 # kept for diagnostics. Globals rather than a printed return value: a command
@@ -437,18 +551,19 @@ child_result=""
 run_suite_against() {
   child_rc=0
   AB_MD_SABOTAGE_CHILD=1 AB_MD_CLASSIFIER="$1" AB_MD_MATRIX="$2" \
+    AB_MD_REMOTE="${3:-$REMOTE}" \
     bash "$self" >"$WORK/child.log" 2>&1 || child_rc=$?
   child_result="$(grep -m1 '^RESULT: ' "$WORK/child.log" 2>/dev/null || true)"
 }
 
-# mutant_red <label> <classifier> <matrix>
+# mutant_red <label> <classifier> <matrix> [<remote>]
 # The child must go red AND reach its own summary line. A child that dies on
 # line 3 — an unusable mutant, a missing tool, a syntax error introduced by the
 # sed — also exits non-zero, and booking that as "the mutant was caught" is
 # exactly the vacuous pass this matrix exists to prevent.
 mutant_red() {
   local label="$1"
-  run_suite_against "$2" "$3"
+  run_suite_against "$2" "$3" "${4:-$REMOTE}"
   if [ "$child_rc" != "0" ] && [ -n "$child_result" ]; then
     ok "mutant: $label -> child red ($child_result)"
   else
@@ -494,9 +609,21 @@ else
   bad "mutant: AB_GATE_ENFORCE path removed -> the sed mutation was inert, so it proves nothing"
 fi
 
+# 5. remote transport: the enforce/force splice deleted. ab-remote.sh is driven
+# at runtime and carries the switches to the VPS, so a hash pin alone would not
+# witness that they are still forwarded — the child reds on the transport
+# fixtures instead.
+M5="$(mutant "$REMOTE" 's/AB_GATE_ENFORCE=\$AB_GATE_ENFORCE AB_FORCE_MEASURE=\$AB_FORCE_MEASURE //' "$WORK/mutant-remote-no-splice.sh")"
+if [ -n "$M5" ]; then
+  mutant_red "ab-remote.sh enforce/force splice deleted" "$CLASSIFIER" "$MATRIX" "$M5"
+else
+  bad "mutant: ab-remote.sh splice deleted -> the sed mutation was inert, so it proves nothing"
+fi
+
 # revert proof: the mutants were copies
 if [ "$(hasher "$CLASSIFIER")" = "$ORIG_CLASSIFIER_HASH" ] \
-   && [ "$(hasher "$MATRIX")" = "$ORIG_MATRIX_HASH" ]; then
+   && [ "$(hasher "$MATRIX")" = "$ORIG_MATRIX_HASH" ] \
+   && [ "$(hasher "$REMOTE")" = "$ORIG_REMOTE_HASH" ]; then
   ok "real scripts are byte-identical after the mutant matrix (mutants were copies)"
 else
   bad "a real script changed during the mutant matrix — mutants must only ever write copies"

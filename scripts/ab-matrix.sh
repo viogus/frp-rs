@@ -22,14 +22,14 @@
 # change is not evidence of a regression either:
 #
 #   * Run 36996762744 measured a docs-comment-only delta — merged as #459,
-#     `97a03884..ae7bf50d`, a diff whose 20 changed `.rs` lines are entirely
-#     citation re-points inside doc comments (the recorded item moved, so each
-#     reference to it was renumbered; no executable line changed) — at +58.8%
-#     on `plain` and -15.6% on `encrypt_compress` in the same run, in opposite
-#     directions.
+#     `97a03884..ae7bf50d`, a diff whose 40 changed `.rs` lines (20 added, 20
+#     removed) are entirely citation re-points inside doc comments (the
+#     recorded item moved, so each reference to it was renumbered; no
+#     executable line changed) — at +58.8% on `plain` and -15.6% on
+#     `encrypt_compress` in the same run, in opposite directions.
 #   * Before the PR mode was retired, *identical* binaries (the docs-only
 #     #280) measured tls -35.1% / -27.9% / +24.5% across three attempts
-#     (`.github/workflows/ab-matrix.yml:12-14`).
+#     (`.github/workflows/ab-matrix.yml:15-17`).
 #
 # The recorded pair is why the demotion is not redundant with the delta
 # classifier below: its diff is NOT empty under `'*.rs' 'Cargo*.toml'` (10
@@ -158,9 +158,9 @@ gate_verdict() {  # gate_verdict <delta-sample>...
 # Publish one table row / annotation. The row is also appended to
 # $GITHUB_STEP_SUMMARY when the runner set that variable, so a red-or-not
 # verdict is visible on the job page; a local run (variable unset) just prints.
-# Sets FAIL=1 when the verdict regressed. With AB_GATE_ENFORCE=1 a regression
-# also ends the whole run with rc 1; by default it stays informational and the
-# run continues to the end (so one run reports every config, as it always did).
+# Sets FAIL=1 when the verdict regressed, so that ONE run still reports every
+# config. This function never ends the run: enforcement lives in gate_final
+# below, which is the only site that decides the exit code.
 gate_report() {  # gate_report <label> <v_a> <v_b> <median> <samples> <verdict>
   local label="$1" v_a="$2" v_b="$3" median="$4" samples="$5" verdict="$6"
   printf '%-18s %9s %9s %8s   %s\n' "$label" "$v_a" "$v_b" "${median}%" "$verdict (n=$samples)"
@@ -171,12 +171,37 @@ gate_report() {  # gate_report <label> <v_a> <v_b> <median> <samples> <verdict>
   if [[ "$verdict" == "REGRESSED" ]]; then
     FAIL=1
     GATE_FAIL_TEXT="${GATE_FAIL_TEXT}${label} ${v_a} -> ${v_b} (${median}%, median of ${samples} sample(s))"$'\n'
-    echo "::warning::A/B throughput ${label} regressed ${median}% (> ${GATE_PCT}% gate; median of ${samples} same-pair sample(s)). The gate is informational (TODO.md:10569): this run will not fail. Re-run to confirm, or set AB_GATE_ENFORCE=1."
-    if [[ "$AB_GATE_ENFORCE" == "1" ]]; then
-      echo "A/B GATE FAILED (enforced): ${label} regressed ${median}% (> ${GATE_PCT}%)."
-      exit 1
-    fi
+    echo "::warning::A/B throughput ${label} regressed ${median}% (> ${GATE_PCT}% gate; median of ${samples} same-pair sample(s)). The gate is informational by default (TODO.md:10569); set AB_GATE_ENFORCE=1 to make a regression fail the run."
   fi
+}
+
+# The single enforcement site, and therefore the only place the run's exit code
+# is decided: 1 only when a config regressed AND AB_GATE_ENFORCE=1, else 0. It
+# reads the FAIL/GATE_FAIL_TEXT globals gate_report accumulated and prints the
+# final verdict block; the script ends with `if gate_final; then exit 0; else
+# exit 1; fi`.
+#
+# A function rather than inline code so the fixture suite can drive the real
+# decision through the AB_MATRIX_LIB_ONLY seam: a demoted gate whose re-arm
+# could not be exercised would be a promise no test witnesses. (It also means
+# there is exactly one reachable exit path; the base had the enforce exit
+# inside gate_report, which made the caller's rc propagation and this block
+# dead code.)
+gate_final() {  # gate_final: prints the verdict, returns 0 (or 1 under enforce)
+  if [[ "$FAIL" != "1" ]]; then
+    echo "A/B GATE PASSED: all configs within ${GATE_PCT}% of the before baseline (median of the samples taken)."
+    return 0
+  fi
+  if [[ "$AB_GATE_ENFORCE" == "1" ]]; then
+    echo "A/B GATE FAILED: one or more configs regressed more than ${GATE_PCT}% (before -> after) with AB_GATE_ENFORCE=1."
+    return 1
+  fi
+  echo "A/B GATE REGRESSED (informational; gate demoted — see the header)"
+  echo "  regressed:"
+  printf '%s' "$GATE_FAIL_TEXT"
+  echo "  threshold ${GATE_PCT}% is below this gate's measured noise floor (identical binaries: -35.1% / -27.9% / +24.5%);"
+  echo "  set AB_GATE_ENFORCE=1 to restore the hard failure (exit 1)."
+  return 0
 }
 
 # A/B noise mitigation for shared runners: a single before/after shot is
@@ -437,13 +462,10 @@ while IFS= read -r l; do
     printf '%-18s %9s %9s %8s   %s\n' "$label" "$v_a" "$v_b" "-" "SKIP(no data)"
     continue
   fi
-  set +e
+  # gate_report never ends the run (gate_final does, once, below), so it is
+  # called plainly: the base wrapped it in `set +e … rc=$?` for an exit that
+  # could not happen here.
   gate_report "$label" "$v_a" "$v_b" "$median" "$samples" "$verdict"
-  rc=$?
-  set -e
-  if [[ "$rc" != "0" ]]; then
-    exit "$rc"
-  fi
 done <<'EOF'
 false  false false false  plain
 false  true  false false  encrypt
@@ -454,17 +476,11 @@ false  false false true   tls
 EOF
 
 echo ""
-if [[ "$FAIL" == "1" ]]; then
-  if [[ "$AB_GATE_ENFORCE" == "1" ]]; then
-    echo "A/B GATE FAILED: one or more configs regressed more than ${GATE_PCT}% (before -> after) with AB_GATE_ENFORCE=1."
-    exit 1
-  fi
-  echo "A/B GATE REGRESSED (informational; gate demoted — see the header)"
-  echo "  regressed:"
-  printf '%s' "$GATE_FAIL_TEXT"
-  echo "  threshold ${GATE_PCT}% is below this gate's measured noise floor (identical binaries: -35.1% / -27.9% / +24.5%);"
-  echo "  set AB_GATE_ENFORCE=1 to restore the hard failure (exit 1)."
+# The one place the run's exit code is decided (gate_final's comment). In an
+# `if` condition so `set -e` does not abort on its deliberate rc 1: the else
+# branch *is* the enforcement.
+if gate_final; then
   exit 0
+else
+  exit 1
 fi
-echo "A/B GATE PASSED: all configs within ${GATE_PCT}% of the before baseline (median of the samples taken)."
-exit 0

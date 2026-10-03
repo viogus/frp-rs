@@ -17,7 +17,7 @@
 # measured a docs-comment-only delta at +58.8% (`plain`) and -15.6%
 # (`encrypt_compress`) in the same run, and the retired PR mode measured
 # *identical* binaries at -35.1% / -27.9% / +24.5% across three attempts
-# (`.github/workflows/ab-matrix.yml:12-14`). A classifier cannot fix that noise
+# (`.github/workflows/ab-matrix.yml:15-17`). A classifier cannot fix that noise
 # floor, but it stops the gate from spending VPS time (and publishing a delta)
 # on a delta that provably cannot move the numbers at all.
 #
