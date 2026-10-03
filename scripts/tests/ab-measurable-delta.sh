@@ -26,9 +26,12 @@
 # one of the three real scripts, applies exactly the mutation that would neuter
 # one property, and re-runs THIS SUITE as a child process against the mutant.
 # The suite must then go red. A green child means the fixtures do not actually
-# witness the property they claim to, and the check fails. The real scripts are
-# never written to; the check "real scripts are byte-identical after the mutant
-# matrix" is the revert proof.
+# witness the property they claim to, and the check fails. A child that reds for
+# an unrelated reason counts as a vacuous pass, so the transport mutant lives in
+# a repo-shaped tree (ab-remote.sh resolves its root from $0), its failure has to
+# name the splice, and an unmutated control of that same tree must pass. The real
+# scripts are never written to; the check "real scripts are byte-identical after
+# the mutant matrix" is the revert proof.
 #
 # Scope: no network, no VPS, no cargo, no servers — synthetic repos and pure
 # functions only; the whole suite is seconds, not minutes.
@@ -52,7 +55,7 @@ REMOTE="${AB_MD_REMOTE:-$ROOT/scripts/ab-remote.sh}"
 # floor. Both floors count CHECKS RUN, not checks passed: a mutant run is
 # expected to fail fixtures, and the floor must not paper over an early exit.
 SABOTAGE_CHILD="${AB_MD_SABOTAGE_CHILD:-0}"
-if [ "$SABOTAGE_CHILD" = "1" ]; then MIN_CHECKS=43; else MIN_CHECKS=49; fi
+if [ "$SABOTAGE_CHILD" = "1" ]; then MIN_CHECKS=43; else MIN_CHECKS=50; fi
 
 checks=0
 fails=0
@@ -463,12 +466,18 @@ cat > "$REMOTE_ROOT/bin/ssh" <<'FAKE_SSH'
 #!/usr/bin/env bash
 # Stub ssh: record the remote command (our last argument) and drain the piped
 # tarball when this call is the upload, so the local `tar` sees no broken pipe.
+# ONE DELIMITED RECORD PER CALL, with any embedded newline flattened to a space:
+# a per-call record is what lets a fixture match the run command alone. Joining
+# every call into one string is how a pattern meant for the run call could be
+# satisfied by the earlier mkdir call, which is review round 2's D-A1 — the
+# enforce switches moved off the run command while the suite stayed green.
 last=""
 for a in "$@"; do last="$a"; done
 case "$last" in
   'tar xf'*) cat >/dev/null 2>&1 || true ;;
 esac
-printf '%s\n' "$last" >> "$AB_MD_SSH_CAPTURE"
+flat="$(printf '%s' "$last" | tr '\n' ' ')"
+printf '%s\n' "$flat" >> "$AB_MD_SSH_CAPTURE"
 case "$last" in
   *ab-matrix.sh*) exit "${AB_MD_SSH_RC:-0}" ;;
 esac
@@ -478,7 +487,7 @@ chmod +x "$REMOTE_ROOT/bin/ssh"
 
 # run_remote <remote-script> <capture-file> <stub-ssh-rc> [<VAR=val>...]
 # Prints the script's exit code; the recorded remote commands land in the
-# capture file (one line per line of each command).
+# capture file, one line per ssh call.
 run_remote() {
   local remote="$1" capture="$2" ssh_rc="$3"; shift 3
   local rc=0
@@ -492,21 +501,52 @@ run_remote() {
   printf '%s' "$rc"
 }
 
+# call_record <capture> <needle>: the ONE recorded ssh call whose remote command
+# mentions <needle>. Empty when none matches (the run call is gone) and empty
+# when several do (the needle no longer identifies a single call) — both are
+# failures of the witness, so neither may fall through to a looser match.
+call_record() {
+  local n
+  n="$(grep -cF -- "$2" "$1")" || true
+  [ "$n" = "1" ] || return 0
+  grep -F -m1 -- "$2" "$1"
+}
+
+# run_splice_re <AB_GATE_ENFORCE> <AB_FORCE_MEASURE>: the ERE the run call's
+# record must satisfy. The switches have to sit IMMEDIATELY after
+# BEFORE_ROOT=$PWD/base (whitespace alone between) and ahead of the flock and
+# the harness, so neither a prefixed `echo `/`printf ` (text present, effect
+# gone — review round 2's V2) nor a placement on an earlier ssh call (D-A1) can
+# satisfy it. The pattern is deliberately anchored to that one literal: a bare
+# `AB_GATE_ENFORCE=…` anywhere in the line is exactly what a broken splice also
+# produces.
+run_splice_re() {
+  printf 'BEFORE_ROOT=\\$PWD/base[[:space:]]+AB_GATE_ENFORCE=%s AB_FORCE_MEASURE=%s[[:space:]]+flock -w 1800 ~/\\.ab-matrix\\.lock[[:space:]]+bash scripts/ab-matrix\\.sh '\''3'\'' '\''8'\''' "$1" "$2"
+}
+
 cap="$WORK/ssh-capture"
+# Two failure modes, deliberately worded apart: a transport that never reached
+# the run call (rc != 0, nothing shipped — e.g. a mutant that cannot start) is
+# NOT evidence about the splice, and the mutant matrix below requires the
+# "MISSING from the run call" wording before it books a caught mutant.
 rc="$(run_remote "$REMOTE" "$cap" 0 AB_GATE_ENFORCE=1 AB_FORCE_MEASURE=0)"
-flat="$(tr '\n' ' ' < "$cap")"
-if [ "$rc" = "0" ] && printf '%s' "$flat" | grep -Eq "AB_GATE_ENFORCE=1 AB_FORCE_MEASURE=0.*flock -w 1800 ~/\.ab-matrix\.lock.*bash scripts/ab-matrix\.sh '3' '8'"; then
+rec="$(call_record "$cap" 'ab-matrix.sh')"
+if [ "$rc" != "0" ]; then
+  bad "ab-remote.sh enforce=1 splice -> the transport exited $rc before the run call (run call='$rec'); this fixture needs a working transport to witness the splice"
+elif printf '%s' "$rec" | grep -Eq "$(run_splice_re 1 0)"; then
   ok "ab-remote.sh: the gate command carries AB_GATE_ENFORCE=1 AB_FORCE_MEASURE=0 under the flock, before the harness"
 else
-  bad "ab-remote.sh enforce=1 splice -> rc $rc, captured='$flat' (want the switches, then the flock, then ab-matrix.sh)"
+  bad "ab-remote.sh enforce=1 splice MISSING from the run call -> rc 0, run call='$rec' (want the switches immediately after BEFORE_ROOT=\$PWD/base, then the flock, then ab-matrix.sh)"
 fi
 
 rc="$(run_remote "$REMOTE" "$cap" 0)"
-flat="$(tr '\n' ' ' < "$cap")"
-if [ "$rc" = "0" ] && printf '%s' "$flat" | grep -Eq "AB_GATE_ENFORCE=0 AB_FORCE_MEASURE=0.*bash scripts/ab-matrix\.sh"; then
+rec="$(call_record "$cap" 'ab-matrix.sh')"
+if [ "$rc" != "0" ]; then
+  bad "ab-remote.sh default splice -> the transport exited $rc before the run call (run call='$rec'); this fixture needs a working transport to witness the default"
+elif printf '%s' "$rec" | grep -Eq "$(run_splice_re 0 0)"; then
   ok "ab-remote.sh: unset switches default to AB_GATE_ENFORCE=0 AB_FORCE_MEASURE=0 (previous behaviour)"
 else
-  bad "ab-remote.sh default splice -> rc $rc, captured='$flat' (want both switches defaulted to 0)"
+  bad "ab-remote.sh default splice MISSING from the run call -> rc 0, run call='$rec' (want both switches defaulted to 0 immediately after BEFORE_ROOT=\$PWD/base)"
 fi
 
 rc="$(run_remote "$REMOTE" "$cap" 0 AB_GATE_ENFORCE=2)"
@@ -571,6 +611,23 @@ mutant_red() {
   fi
 }
 
+# mutant_red_naming <label> <classifier> <matrix> <remote> <needle>
+# As mutant_red, but the child must also have red for the STATED reason: its log
+# has to name <needle>. Without this, a mutant whose copy cannot start at all
+# (wrong directory layout, missing sibling file) reds anyway and the check would
+# book a vacuous pass — review round 2's V1, where a *pristine* copy outside the
+# repo produced the very same "child red" the mutant was credited with.
+mutant_red_naming() {
+  local label="$1" needle="$5" hits=0
+  run_suite_against "$2" "$3" "$4"
+  hits="$(grep -cF -- "$needle" "$WORK/child.log" 2>/dev/null)" || true
+  if [ "$child_rc" != "0" ] && [ -n "$child_result" ] && [ "$hits" != "0" ]; then
+    ok "mutant: $label -> child red for the stated reason ($child_result)"
+  else
+    bad "mutant: $label -> rc $child_rc, $child_result, '$needle' seen ${hits}x (want a red child whose log names the splice as missing from a completed run)"
+  fi
+}
+
 # mutant <src> <sed-expr> <dst>: prints dst, or empty when the mutation did not
 # change the file (an inert mutation must not be mistaken for a passing check).
 mutant() {
@@ -612,12 +669,34 @@ fi
 # 5. remote transport: the enforce/force splice deleted. ab-remote.sh is driven
 # at runtime and carries the switches to the VPS, so a hash pin alone would not
 # witness that they are still forwarded — the child reds on the transport
-# fixtures instead.
-M5="$(mutant "$REMOTE" 's/AB_GATE_ENFORCE=\$AB_GATE_ENFORCE AB_FORCE_MEASURE=\$AB_FORCE_MEASURE //' "$WORK/mutant-remote-no-splice.sh")"
+# fixtures instead. The mutant must live in a tree that LOOKS like the repo
+# (scripts/ next to the script): ab-remote.sh resolves ROOT from $0 and copies
+# "$SCRIPT_DIR/ab-matrix.sh", so a bare copy under $WORK dies at that cp and a
+# child would red for the wrong reason. Hence the named-reason check and the
+# unmutated control right after it.
+MUT_TREE="$WORK/mutant-tree"
+mkdir -p "$MUT_TREE/scripts"
+cp "$MATRIX" "$MUT_TREE/scripts/ab-matrix.sh"
+M5="$(mutant "$REMOTE" 's/AB_GATE_ENFORCE=\$AB_GATE_ENFORCE AB_FORCE_MEASURE=\$AB_FORCE_MEASURE //' "$MUT_TREE/scripts/ab-remote.sh")"
 if [ -n "$M5" ]; then
-  mutant_red "ab-remote.sh enforce/force splice deleted" "$CLASSIFIER" "$MATRIX" "$M5"
+  mutant_red_naming "ab-remote.sh enforce/force splice deleted" "$CLASSIFIER" "$MATRIX" "$M5" 'splice MISSING from the run call'
 else
   bad "mutant: ab-remote.sh splice deleted -> the sed mutation was inert, so it proves nothing"
+fi
+
+# converse control for #5: the same layout, unmutated, must pass. Without it the
+# check above would also be satisfied by a tree that reds at startup for a
+# layout reason, which is exactly how the previous bare-$WORK mutant was
+# vacuous.
+CTL_TREE="$WORK/control-tree"
+mkdir -p "$CTL_TREE/scripts"
+cp "$MATRIX" "$CTL_TREE/scripts/ab-matrix.sh"
+cp "$REMOTE" "$CTL_TREE/scripts/ab-remote.sh"
+run_suite_against "$CLASSIFIER" "$MATRIX" "$CTL_TREE/scripts/ab-remote.sh"
+if [ "$child_rc" = "0" ] && [ "$child_result" = "RESULT: 43 fixture check(s) hold" ]; then
+  ok "control: the mutant's tree with an unmutated ab-remote.sh passes ($child_result)"
+else
+  bad "control: the mutant's tree unmutated -> rc $child_rc, $child_result (want rc 0 and RESULT: 43 fixture check(s) hold)"
 fi
 
 # revert proof: the mutants were copies

@@ -1418,15 +1418,15 @@ jobs:
         # with no output, and a suite that stopped running its scenarios looks
         # exactly like a clean tree. So the summary line is pinned verbatim
         # here, the `  ok` line count is compared for equality with
-        # `guard_exact`, and thirteen substantive evidence lines are matched
-        # individually. guard_exact/guard_floor are 49: the 12 measured-path
+        # `guard_exact`, and fourteen substantive evidence lines are matched
+        # individually. guard_exact/guard_floor are 50: the 12 measured-path
         # class fixtures, the 3 nothing-measurable fixtures, the 3
         # mixed/deletion/rename fixtures, the 4 error-surface fixtures, the 5
         # gate-arithmetic fixtures, the 6 gate-reporting fixtures, the 5
-        # measurement-loop fixtures, the 5 remote-transport fixtures and the 6
-        # sabotage-converse checks (five mutants plus the revert proof). A
-        # scenario added or removed moves the total — restore the checks rather
-        # than lowering it.
+        # measurement-loop fixtures, the 5 remote-transport fixtures and the 7
+        # sabotage-converse checks (five mutants, the splice-reason control and
+        # the revert proof). A scenario added or removed moves the total —
+        # restore the checks rather than lowering it.
         #
         # Residues, named rather than denied: the suite shells out to `git`,
         # `sed`, `cmp`, `tar`, `env` and `python3` from `$PATH`, and runs
@@ -1443,15 +1443,22 @@ jobs:
           log="${TMPDIR:-/tmp}/frp-ab-measurable-delta-fixtures.$$.log"
           status=0
           guard_file=scripts/tests/ab-measurable-delta.sh
-          guard_pin=9899f59e13640b142dcacb6bfdff7f389b96d8a108cdbc466aa744e344e22d2c
-          guard_exact=49
-          guard_floor=49
+          guard_pin=0e7c108a67742f0191deee857c3aaf7907d75db3f89d5c3990ae3d196ac71735
+          guard_exact=50
+          guard_floor=50
           guard_cls=scripts/ab-measurable-delta.sh
           guard_cls_pin=02550abd49dd3d772bbe076046a710687d3cb4b72a11daaa14e55c88db0b174a
           guard_matrix=scripts/ab-matrix.sh
           guard_matrix_pin=df4199b02cc64b6d903b03c0d2bf77c6d69546e24946cf4157a4b2eef0ee4139
           guard_remote=scripts/ab-remote.sh
           guard_remote_pin=6a1ba8c695f9f984e39d28b9decea3b53271f881d25c49726fe06930d5c2559c
+          # Every hashed subject must actually be verified: the closing summary
+          # used to assert "pins verified 4/4" as a literal, so deleting one
+          # verify_guard call kept the step green while that subject went
+          # unchecked (review round 2, V3). The count is now taken from the
+          # verifications that ran.
+          guard_pins_verified=0
+          guard_pins_expected=4
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
@@ -1486,6 +1493,7 @@ jobs:
               echo "::error::an edit to the A/B measurable-delta check — including one that weakens its own assertions — must also update $3 in the 'A/B gate — measurable-delta classifier + verdict fixture checks' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended, otherwise revert it"
               return 1
             fi
+            guard_pins_verified=$((guard_pins_verified + 1))
             return 0
           }
           verify_guard "$guard_file" "$guard_pin" guard_pin || exit 1
@@ -1513,23 +1521,26 @@ jobs:
             *"RESULT: $guard_exact fixture check(s) hold"*) guard_result=1 ;;
           esac
           # The substantive evidence, in the suite's own wording, so a suite that
-          # still prints 49 `  ok` lines while no longer witnessing the property
-          # cannot pass. The first six are the sabotage converse (each of the
-          # five mutations must turn the child red, and the mutations must only
-          # ever have written copies); the last seven pin the behaviour this
-          # round is about — the skip on a docs/records-only delta, the
-          # published figure being the median rather than the minimum (both the
-          # arithmetic and the real measurement loop that produces it), the
-          # informational default with its AB_GATE_ENFORCE re-arm, and the
-          # remote transport actually carrying both switches to the VPS.
-          guard_evidence_exact=13
-          guard_evidence_floor=13
+          # still prints 50 `  ok` lines while no longer witnessing the property
+          # cannot pass. The first seven are the sabotage converse (each of the
+          # five mutations must turn the child red, the splice deletion must red
+          # *for the named reason* while the same tree with an unmutated
+          # transport passes, and the mutations must only ever have written
+          # copies); the last seven pin the behaviour this round is about — the
+          # skip on a docs/records-only delta, the published figure being the
+          # median rather than the minimum (both the arithmetic and the real
+          # measurement loop that produces it), the informational default with
+          # its AB_GATE_ENFORCE re-arm, and the remote transport actually
+          # carrying both switches to the VPS.
+          guard_evidence_exact=14
+          guard_evidence_floor=14
           for guard_evidence_probe in \
             'mutant: classifier forced to always skip -> child red' \
             'mutant: gate_verdict forced to always pass -> child red' \
             'mutant: gate_median forced to min -> child red' \
             'mutant: AB_GATE_ENFORCE path removed -> child red' \
-            'mutant: ab-remote.sh enforce/force splice deleted -> child red' \
+            'mutant: ab-remote.sh enforce/force splice deleted -> child red for the stated reason' \
+            'control: the mutant'"'"'s tree with an unmutated ab-remote.sh passes' \
             'real scripts are byte-identical after the mutant matrix' \
             'classifier: CHANGELOG.md + TODO.md + docs/history/development-log.md -> rc 1, no output' \
             'gate_median(18.0 15.2 19.5) = 18.0 (not the minimum 15.2)' \
@@ -1549,16 +1560,20 @@ jobs:
           [ "$guard_evidence" = "$guard_evidence_exact" ] || status=1
           [ "$guard_evidence_exact" -ge "$guard_evidence_floor" ] || status=1
           [ "$guard_fail" = "0" ] || status=1
+          [ "$guard_pins_verified" = "$guard_pins_expected" ] || status=1
           if [ "$guard_fail" != "0" ]; then
             echo "::error::the A/B measurable-delta fixture suite printed $guard_fail failure line(s); a run that reported a failure cannot be reported as a green step:"
             printf '%s' "$guard_fail_text"
           fi
+          if [ "$guard_pins_verified" != "$guard_pins_expected" ]; then
+            echo "::error::only $guard_pins_verified of $guard_pins_expected guarded files were verified against their pinned sha256 — a verify_guard call is missing from the 'A/B gate — measurable-delta classifier + verdict fixture checks' step of .github/workflows/ci.yml; this step must hash the suite and every file the suite drives"
+          fi
           if [ "$status" != "0" ]; then
-            echo "::error::the A/B measurable-delta fixture suite did not report $guard_exact checks, all $guard_evidence_exact pinned evidence lines and no failure line (evidence seen: $guard_evidence/$guard_evidence_exact)"
-            echo "::error::scripts/tests/ab-measurable-delta.sh must print $guard_exact '  ok' lines, end with 'RESULT: $guard_exact fixture check(s) hold', and prove (a) the classifier skips a docs/records-only delta with rc 1 and no output, (b) the published gate figure is the median and never the minimum, (c) a beyond-gate regression is informational by default and exits 1 only under AB_GATE_ENFORCE=1, and (d) each of the five mutants — classifier forced to always skip, verdict forced to always pass, median replaced by the minimum, enforce path removed, and the ab-remote.sh enforce/force splice deleted — turns the suite red while the four real scripts stay byte-identical; a smaller total, a missing evidence line or a failure line means the fixture stopped witnessing that property — restore it rather than lowering this literal"
+            echo "::error::the A/B measurable-delta fixture suite did not report $guard_exact checks, all $guard_evidence_exact pinned evidence lines, all $guard_pins_expected verified pins and no failure line (evidence seen: $guard_evidence/$guard_evidence_exact, pins verified: $guard_pins_verified/$guard_pins_expected)"
+            echo "::error::scripts/tests/ab-measurable-delta.sh must print $guard_exact '  ok' lines, end with 'RESULT: $guard_exact fixture check(s) hold', and prove (a) the classifier skips a docs/records-only delta with rc 1 and no output, (b) the published gate figure is the median and never the minimum, (c) a beyond-gate regression is informational by default and exits 1 only under AB_GATE_ENFORCE=1, and (d) each of the five mutants — classifier forced to always skip, verdict forced to always pass, median replaced by the minimum, enforce path removed, and the ab-remote.sh enforce/force splice deleted — turns the suite red for the named reason while the same tree with an unmutated transport passes and the three real scripts stay byte-identical; a smaller total, a missing evidence line or a failure line means the fixture stopped witnessing that property — restore it rather than lowering this literal"
             exit 1
           fi
-          echo "A/B measurable-delta fixture checks ok: $guard_exact checks hold, all $guard_evidence_exact evidence lines live, pins verified 4/4"
+          echo "A/B measurable-delta fixture checks ok: $guard_exact checks hold, all $guard_evidence_exact evidence lines live, pins verified $guard_pins_verified/$guard_pins_expected"
 
   tests-unit:
     name: Tests (unit)
