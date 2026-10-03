@@ -23,7 +23,11 @@
 # logs).
 set -u
 
-PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# Resolve through BASH_SOURCE, not $0: `scripts/tests/compat-port-ownership.sh`
+# sources this file to drive `wait_for_listen` in isolation, and a sourced
+# script's `$0` is the caller's.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FRPS_BIN="${FRPS_BIN:-$PROJECT_DIR/target/release/frps}"
 FRPC_BIN="${FRPC_BIN:-$PROJECT_DIR/target/release/frpc}"
 STRESS_BIN="$PROJECT_DIR/scripts/frp-stress/target/release/frp-stress"
@@ -33,13 +37,13 @@ TOKEN="matrix-token"
 VERBOSE=false
 KEEP_TMP=false
 [[ "${FRP_MATRIX_KEEP_TMP:-}" == "1" ]] && KEEP_TMP=true
-for arg in "$@"; do
-    case "$arg" in
-        --verbose) VERBOSE=true ;;
-        --keep-tmp) KEEP_TMP=true ;;
-        *) echo "protocol-matrix: unknown argument: $arg" >&2; exit 2 ;;
-    esac
-done
+
+# `wait_for_listen` gets the LISTEN census from the port-ownership lib — the
+# same one `scripts/compat-test.sh` uses. This script does not use the lib's
+# ledger: each row records its own pids under `$TEST_DIR/<row>/*.pid` and passes
+# the pid it is waiting for into `wait_for_listen`.
+# shellcheck source=scripts/lib/compat-port-ownership.sh
+source "$PROJECT_DIR/scripts/lib/compat-port-ownership.sh"
 
 PASS=0
 FAIL=0
@@ -62,7 +66,6 @@ cleanup() {
     done
     $KEEP_TMP || rm -rf "$TEST_DIR"
 }
-trap cleanup EXIT
 
 wait_for_port() {
     # $1=host $2=port $3=timeout_s — poll with bash /dev/tcp.
@@ -78,22 +81,41 @@ wait_for_port() {
 }
 
 wait_for_listen() {
-    # $1=port $2=timeout_s — OBSERVE a listening socket without connecting.
+    # $1=port $2=timeout_s $3=expected_pid — OBSERVE a listening socket without
+    # connecting, and require it to belong to the pid this row launched.
     # A real connect to a frp port creates a ProxyUserConn on the server
-    # (`scripts/compat-test.sh:222-224` documents the phantom-work-connection
-    # hazard that deadlocks encrypted bridges), so the server and proxy gates
-    # must not probe by connecting. Round 5: replaced `wait_for_port` there.
-    local port="$1" timeout="${2:-10}" i
+    # (`scripts/compat-test.sh` documents the phantom-work-connection hazard
+    # that deadlocks encrypted bridges), so the server and proxy gates must not
+    # probe by connecting. Round 5: replaced `wait_for_port` there.
+    #
+    # The census alone was not enough: `lsof -iTCP:"$port" -sTCP:LISTEN -t`
+    # returning ANY pid greened the gate, so a foreign process — or a leftover
+    # echo from an aborted row — holding the port made the row look ready while
+    # its own frps had failed to bind. Now the socket must be owned by
+    # `$expected_pid`; a port already held by somebody else fails the gate
+    # immediately with a message naming both pids, and an environment where the
+    # owner cannot be determined at all (no lsof and no ss) fails closed rather
+    # than falling back to a connect.
+    local port="$1" timeout="${2:-10}" expected="${3:-}"
+    local i owner rc
+    if [[ -z "$expected" ]]; then
+        echo "ERROR: protocol-matrix: wait_for_listen needs the pid it is waiting for (port $port); refusing to call the port ready" >&2
+        return 1
+    fi
     for ((i = 0; i < timeout * 10; i++)); do
-        if command -v lsof >/dev/null 2>&1; then
-            lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1 && return 0
-        elif command -v ss >/dev/null 2>&1; then
-            ss -tln sport = :"$port" 2>/dev/null | grep -q LISTEN && return 0
-        else
-            (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && {
-                exec 3>&- 3<&-
-                return 0
-            }
+        owner=$(cpo_listen_owner "$port")
+        rc=$?
+        if ((rc == 0)); then
+            local p
+            while read -r p; do
+                [[ "$p" == "$expected" ]] && return 0
+            done <<<"$owner"
+            echo "ERROR: protocol-matrix: port $port is already LISTENing under pid(s) ${owner//$'\n'/, } — not this row's pid $expected; refusing to call it ready" >&2
+            return 1
+        fi
+        if ((rc == 2)); then
+            echo "ERROR: protocol-matrix: cannot determine the owner of port $port (neither lsof nor ss available); failing closed" >&2
+            return 1
         fi
         sleep 0.1
     done
@@ -102,10 +124,12 @@ wait_for_listen() {
 
 start_echo() {
     local port="$1"
+    local pid
     "$STRESS_BIN" --scenario echo --port "$port" >/dev/null 2>&1 &
-    echo $! > "$TEST_DIR/echo-$port.pid"
+    pid=$!
+    echo "$pid" > "$TEST_DIR/echo-$port.pid"
     sleep 0.5
-    wait_for_port 127.0.0.1 "$port" 5
+    wait_for_listen "$port" 5 "$pid"
 }
 
 # run_row <name> <proto> <tls:on|off> <mux:on|off>
@@ -225,9 +249,11 @@ run_row() {
         printf 'local_port = %s\nremote_port = %s\n' "$echo_port" "$proxy_port"
     } > "$row_dir/frpc.toml"
 
+    local frps_pid
     RUST_LOG=warn "$FRPS_BIN" -c "$row_dir/frps.toml" > "$row_dir/frps.log" 2>&1 &
-    echo $! > "$row_dir/frps.pid"
-    wait_for_listen "$srv_port" 20 || {
+    frps_pid=$!
+    echo "$frps_pid" > "$row_dir/frps.pid"
+    wait_for_listen "$srv_port" 20 "$frps_pid" || {
         kill_row_processes
         fail_row "$name" "frps did not start"
         return
@@ -237,8 +263,9 @@ run_row() {
     # QUIC: the TCP proxy port only opens after the control conn registers.
     # Generous timeout: a contended CI runner (the parallel Tests job is CPU
     # heavy) can take tens of seconds to start frps+frpc, do the TLS
-    # handshake, and register the proxy.
-    wait_for_listen "$proxy_port" 45 || {
+    # handshake, and register the proxy. The proxy port is bound by **frps**
+    # (`remote_port`), so `frps_pid` is the owner the gate must see.
+    wait_for_listen "$proxy_port" 45 "$frps_pid" || {
         kill_row_processes
         fail_row "$name" "proxy port not reachable"
         return
@@ -293,6 +320,20 @@ fail_row() {
 }
 
 main() {
+    # Argument parsing and the EXIT trap moved in here (they used to run at
+    # source time) so `scripts/tests/compat-port-ownership.sh` can source this
+    # file to drive `wait_for_listen` without parsing the fixture's argv or
+    # arming a cleanup trap against the fixture's directory.
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --verbose) VERBOSE=true ;;
+            --keep-tmp) KEEP_TMP=true ;;
+            *) echo "protocol-matrix: unknown argument: $arg" >&2; exit 2 ;;
+        esac
+    done
+    trap cleanup EXIT
+
     [[ -x "$FRPS_BIN" ]] || { echo "frps not found: $FRPS_BIN (build or set FRPS_BIN)"; exit 2; }
     [[ -x "$FRPC_BIN" ]] || { echo "frpc not found: $FRPC_BIN (build or set FRPC_BIN)"; exit 2; }
     [[ -x "$STRESS_BIN" ]] || { echo "frp-stress not found: $STRESS_BIN (cargo build --release -p frp-stress)"; exit 2; }
@@ -323,4 +364,7 @@ main() {
     [[ $FAIL -eq 0 ]]
 }
 
-main
+# Only run when executed, not when sourced by the fixture suite.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

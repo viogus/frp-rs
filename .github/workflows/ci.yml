@@ -561,6 +561,155 @@ jobs:
             exit 1
           fi
           echo "compat stray-guard fixture checks ok: 40 checks hold, pins verified 4/4, enforcer canary live"
+      # The compat harness's port ledger and LISTEN-socket ownership checks,
+      # driven against real python3 listeners, a stripped `PATH` and a fake `ss`,
+      # plus the harness's own `--test` handling driven with four stub binaries
+      # through the `FRP_COMPAT_*` seam (no Go toolchain, no repo binary, no
+      # scenario reaching a real server). Every stubbed selector run pins
+      # `GO_FRP_VERSION` to `0.0.0-fixture.<pid>` and drops an inherited
+      # `GO_FRP_DIR`, so the default Go directory the harness derives cannot
+      # exist; the suite asserts that directory is absent and that the harness
+      # never printed its missing-binary error — so a real `/tmp/frp_0.71.0_*`
+      # left behind by an earlier compat run cannot satisfy the pre-gate check
+      # with real binaries and hide a seam this runner would reject. Because a
+      # nonexistent fallback cannot show that the seam beats an existing one, one
+      # stubbed run also exports `GO_FRP_DIR` to a directory of marker
+      # `frps`/`frpc` scripts and asserts that neither executed. The seam has to
+      # hold at all three places `scripts/compat-test.sh` assigns the Go paths:
+      # the initial assignment, the block that recomputes `GO_FRP_DIR` from
+      # `--go-version`, and the `GO_FRPS_V2`/`GO_FRPC_V2` aliases that
+      # `ensure_go_frp_v2` executes on every invocation. Two failures live here
+      # that the wider harness cannot show on a green run: one scenario being
+      # handed the same port twice (its echo listener and its frps — the TODO.md
+      # same-port-twice item), and a readiness gate accepting a socket this run
+      # did not start (the TODO.md readiness-ownership item). The suite is the
+      # only thing that pins either, so this step runs it and pins its total.
+      - name: Port ownership — fixture checks (compat harness readiness)
+        # Same external-total argument as the stray-guard step above: the suite
+        # floors its own check count (`MIN_CHECKS`, in the EXIT trap) and pins the
+        # order and labels of all 61 assertions (`SHAPE`), but `exec true` planted
+        # after the library check never runs the trap and exits 0 with no output.
+        # So the summary line is pinned verbatim here and the `  ok` line count is
+        # compared against `guard_exact`. `guard_exact`/`guard_floor` are 61: the
+        # 9 ledger checks, the 3 ownership checks, the 5 collision checks, the 3
+        # foreign checks, the 3 nobody-listening checks, the 4 cannot-tell checks,
+        # the 3 fake-`ss` checks, the 6 sourced-`wait_for_listen` checks, the 11
+        # wiring checks, the 5 selector checks, the 4 `--debug` selector checks,
+        # the 2 skipped-phase checks, the 1 hermeticity check and the 2
+        # hostile-`GO_FRP_DIR` checks. A scenario added or removed moves the
+        # total — restore the checks rather than lowering it.
+        #
+        # Two files are pinned. The suite drives `scripts/lib/compat-port-
+        # ownership.sh` at runtime, so one edited library could stub the
+        # assertions while the suite stayed byte-identical; pinning both makes
+        # weakening either half a two-file change a reviewer sees. The digests are
+        # taken with an absolute, vector-proven hasher and the evidence is matched
+        # with shell builtins only, for the round-12/14 reasons recorded in the
+        # stray-guard step: `command -v sha256sum` honours a shell function and
+        # then `$PATH`, and a shimmed `awk`/`grep`/`tee` between the suite and the
+        # evidence checks can vouch for a log the suite never wrote.
+        #
+        # Residues, named rather than denied: the suite *reads* the two callers it
+        # guards (`scripts/compat-test.sh` and `scripts/protocol-matrix.sh`) with
+        # PATH-resolved `grep`, and runs the selector checks against
+        # `scripts/compat-test.sh` as a subprocess with stub binaries —
+        # both callers are unpinned (as the stray-guard step records for
+        # `scripts/compat-test.sh`), so a shim planted earlier on `$PATH` by an
+        # unpinned in-repo file can answer a structural probe the way the scenario
+        # wants. That is a false negative in a scenario, never a defeated pin: the
+        # library and the assertions that read its return codes are both pinned
+        # here. A shadowed `bash` interpreter or a replaced absolute hasher is out
+        # of scope, as there.
+        shell: bash
+        run: |
+          # One log file per invocation: a fixed path lets a second run of this
+          # step (a retry, or a local re-run) truncate the file while the first
+          # is still reading it and interleave writes, which the pinned-count
+          # checks below would correctly report as a red run.
+          log="${TMPDIR:-/tmp}/frp-port-ownership-fixtures.$$.log"
+          status=0
+          guard_file=scripts/tests/compat-port-ownership.sh
+          guard_pin=b76f5188175a3c86f80804193ad5d33935bdd8874bf4928b807251b1b173c8b9
+          guard_exact=61
+          guard_floor=61
+          guard_lib=scripts/lib/compat-port-ownership.sh
+          guard_lib_pin=37a49936f419de3dda21766444f157ae57caa049290eb89ff0408da57480b55e
+          guard_hasher=''
+          guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+          for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
+            [ -x "$cand" ] || continue
+            guard_probe=$(printf 'abc' | "$cand" 2>/dev/null)
+            [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+            guard_hasher=$cand
+            break
+          done
+          if [ -z "$guard_hasher" ]; then
+            for cand in /usr/bin/shasum /bin/shasum /usr/local/bin/shasum; do
+              [ -x "$cand" ] || continue
+              guard_probe=$(printf 'abc' | "$cand" -a 256 2>/dev/null)
+              [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+              guard_hasher="$cand -a 256"
+              break
+            done
+          fi
+          if [ -z "$guard_hasher" ]; then
+            echo "::error::no sha256 tool at an absolute path reproduces the known sha256 vector (need sha256sum or shasum); cannot verify $guard_file"
+            exit 1
+          fi
+          # $1 = file, $2 = its expected digest, $3 = the variable holding that
+          # digest (named in the failure message).
+          # shellcheck disable=SC2086  # $guard_hasher is the word-split "<abs path> [-a 256]"
+          verify_guard() {
+            local out sha
+            out=$($guard_hasher "$1" 2>/dev/null) || true
+            sha=${out%% *}
+            if [ "$sha" != "$2" ]; then
+              echo "::error::$1 is not the pinned revision (sha256 ${sha:-<none>}; expected $2)"
+              echo "::error::an edit to the port-ownership check — including one that weakens its own assertions — must also update $3 in the 'Port ownership — fixture checks (compat harness readiness)' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended, otherwise revert it"
+              return 1
+            fi
+            return 0
+          }
+          verify_guard "$guard_file" "$guard_pin" guard_pin || exit 1
+          verify_guard "$guard_lib" "$guard_lib_pin" guard_lib_pin || exit 1
+          bash scripts/tests/compat-port-ownership.sh > "$log" 2>&1 || status=1
+          guard_log=$(<"$log")
+          printf '%s\n' "$guard_log"
+          # The positive-evidence pin, the builtin-only matching and the
+          # failure-line rejection are the stray-guard step's, for the same
+          # reasons: a disabled trap or a skipped scenario must not be reportable
+          # as a green step, and a run that printed a failure line may not be
+          # reported as green even when its summary looks intact.
+          guard_ok=0
+          guard_result=0
+          guard_fail=0
+          guard_fail_text=''
+          while IFS= read -r guard_line; do
+            case $guard_line in
+              '  ok '*) guard_ok=$((guard_ok + 1)) ;;
+              'FAIL'*|'  FAIL'*)
+                guard_fail=$((guard_fail + 1))
+                guard_fail_text="${guard_fail_text}${guard_line}"$'\n'
+                ;;
+            esac
+          done <<< "$guard_log"
+          case $guard_log in
+            *"RESULT: $guard_exact fixture check(s) hold"*) guard_result=1 ;;
+          esac
+          [ "$guard_result" = "1" ] || status=1
+          [ "$guard_ok" = "$guard_exact" ] || status=1
+          [ "$guard_exact" -ge "$guard_floor" ] || status=1
+          [ "$guard_fail" = "0" ] || status=1
+          if [ "$guard_fail" != "0" ]; then
+            echo "::error::the port-ownership fixture suite printed $guard_fail failure line(s); a run that reported a failure cannot be reported as a green step:"
+            printf '%s' "$guard_fail_text"
+          fi
+          if [ "$status" != "0" ]; then
+            echo "::error::compat port-ownership fixture checks did not report $guard_exact checks"
+            echo "::error::scripts/tests/compat-port-ownership.sh must print $guard_exact '  ok' lines and end with 'RESULT: $guard_exact fixture check(s) hold'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap or a skipped scenario means the ledger/ownership checks were skipped, neutered or swallowed — restore them rather than lowering this literal"
+            exit 1
+          fi
+          echo "compat port-ownership fixture checks ok: $guard_exact checks hold, pins verified 2/2"
       - name: RSS soak — run-dir guard + summary fixture
         # TODO.md "The RSS-soak fixture step has no outer pins" (`:9283` at the
         # round that filed it): this step used to be a bare

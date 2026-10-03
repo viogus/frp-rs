@@ -23,10 +23,23 @@ else
     esac
     GO_FRP_DIR="/tmp/frp_${GO_FRP_VERSION}_${_gos}_${_goa}"
 fi
-GO_FRPS="$GO_FRP_DIR/frps"
-GO_FRPC="$GO_FRP_DIR/frpc"
-RUST_FRPS="$PROJECT_DIR/target/release/frps"
-RUST_FRPC="$PROJECT_DIR/target/release/frpc"
+# Each binary path is overridable through the environment, and the override is
+# honoured at every place the Go paths are assigned: `GO_FRPS`/`GO_FRPC` in the
+# initial assignment just below, `GO_FRPS`/`GO_FRPC` again in the recalculation
+# block that re-derives `GO_FRP_DIR` when `--go-version` (or `GO_FRP_VERSION`)
+# changes the version, and `GO_FRPS_V2`/`GO_FRPC_V2` in the V2 section.
+# `scripts/tests/
+# compat-port-ownership.sh` points all four at stub binaries so it can drive this
+# harness's own `--test` handling on a checkout with no build, like the `health`
+# job's; because the seam wins at every one of those sites, that stays true
+# whatever the default Go directory is — neither a host's real
+# `/tmp/frp_0.71.0_*` nor a `GO_FRP_DIR` exported by a developer shell can stand
+# in for a stub. The pre-gate checks only ask that each binary be executable (the
+# certs are tracked), so a stub suffices and no scenario ever runs against one.
+GO_FRPS="${FRP_COMPAT_GO_FRPS:-$GO_FRP_DIR/frps}"
+GO_FRPC="${FRP_COMPAT_GO_FRPC:-$GO_FRP_DIR/frpc}"
+RUST_FRPS="${FRP_COMPAT_RUST_FRPS:-$PROJECT_DIR/target/release/frps}"
+RUST_FRPC="${FRP_COMPAT_RUST_FRPC:-$PROJECT_DIR/target/release/frpc}"
 CERT_DIR="$PROJECT_DIR/frp-core/tests/certs"
 # Per-run scratch directory. Overridable with FRP_COMPAT_TEST_DIR so that two
 # runs — a sibling worktree's, or a local run beside a CI job — do not share it:
@@ -42,10 +55,25 @@ FAIL=0
 FAILURES=()
 VERBOSE=false
 SELECTED_TEST=""
+# Set by `should_run_test` when `--test`'s value matches a scenario. `--test`
+# used to be a silent no-op for an unknown name: the run printed
+# ` RESULTS: 0 passed, 0 failed` and `All tests passed!` and exited 0, so a
+# typo — or a name copied from `--list`, which prints the `run_test` *function*
+# name rather than the display name a selection matches — looked like success.
+# The summary block below fails closed when this never became true.
+SELECTED_MATCHED=false
 KEEP_TMP=false
 CI=false
 DEBUG=false
 PIDS=""
+# How many non-auxiliary processes this run has launched (frps/frpc binaries it
+# started); bumped by `track_pid`, not by `track_aux_pid`. It is the launch
+# generation an auxiliary listener is registered under, and
+# `scripts/lib/compat-port-ownership.sh` accepts that listener as a port's owner
+# only while no later process has been launched — so a scenario that hands its
+# own echo listener the port frps/frpc was meant to take is caught at the later
+# process's readiness gate instead of passing on the echo's socket.
+AUX_LAUNCH_GEN=0
 XTCP_FRPS_REMOTE=""
 XTCP_ONLY=false
 XTCP_SHARD=""   # "INDEX/TOTAL" e.g. "1/4"
@@ -106,8 +134,12 @@ if [[ -z "$GO_FRP_DIR_USER" ]]; then
         aarch64|arm64) _goa="arm64" ;;
     esac
     GO_FRP_DIR="/tmp/frp_${GO_FRP_VERSION}_${_gos}_${_goa}"
-    GO_FRPS="$GO_FRP_DIR/frps"
-    GO_FRPC="$GO_FRP_DIR/frpc"
+    # Keep honouring the seam here: overwriting a stub with the default dir's
+    # path made a stubbed run depend on this host's `/tmp` (a real
+    # `/tmp/frp_0.71.0_*` masked it locally while a clean runner failed at the
+    # binary check).
+    GO_FRPS="${FRP_COMPAT_GO_FRPS:-$GO_FRP_DIR/frps}"
+    GO_FRPC="${FRP_COMPAT_GO_FRPC:-$GO_FRP_DIR/frpc}"
 fi
 
 # Pass the resolved Go frp version/path to remote-frps.sh for VPS XTCP runs.
@@ -120,6 +152,19 @@ export GO_FRP_DIR
 
 track_pid() {
     PIDS="$PIDS $1"
+    AUX_LAUNCH_GEN=$(( AUX_LAUNCH_GEN + 1 ))
+}
+
+# Record an auxiliary listener this run started (the echo/http/udp/tls servers
+# in `start_echo_server` and friends). It belongs in `PIDS` so `cleanup_pids`
+# reaps it, and its port is registered under the current launch generation:
+# `scripts/lib/compat-port-ownership.sh` stops accepting it as the port's owner
+# once a non-auxiliary process has been launched, which is what makes a
+# duplicated port fail at the later process's readiness gate.
+track_aux_pid() {
+    local role="$1" port="$2" pid="$3"
+    PIDS="$PIDS $pid"
+    cpo_register_listener "$role" "$port" "$pid" "$AUX_LAUNCH_GEN"
 }
 
 # Run Go binary with proxy env vars cleared
@@ -142,9 +187,14 @@ run_go() {
 
 # --- V2 test support ---
 # Go frp v0.70.1+ pre-built binaries include V2 protocol support.
-# V2 tests use the same pre-built binaries as V1 tests.
-GO_FRPS_V2="$GO_FRP_DIR/frps"
-GO_FRPC_V2="$GO_FRP_DIR/frpc"
+# V2 tests use the same pre-built binaries as V1 tests. Assign through the same
+# `FRP_COMPAT_*` seam as `GO_FRPS`/`GO_FRPC` above: `ensure_go_frp_v2` executes
+# `"$GO_FRPS_V2" --version` and its phase gate runs on every invocation (before
+# the fail-closed `--test` selector gate), so a `GO_FRP_DIR` inherited from the
+# caller would otherwise execute a host binary here even while the seam points
+# every other path at a stub. With no override this resolves exactly as before.
+GO_FRPS_V2="${FRP_COMPAT_GO_FRPS:-$GO_FRP_DIR/frps}"
+GO_FRPC_V2="${FRP_COMPAT_GO_FRPC:-$GO_FRP_DIR/frpc}"
 
 ensure_go_frp_v2() {
     if [[ ! -x "$GO_FRPS_V2" ]] || [[ ! -x "$GO_FRPC_V2" ]]; then
@@ -185,30 +235,49 @@ cleanup() {
 # shellcheck source=scripts/lib/compat-stray-guard.sh
 source "$SCRIPT_DIR/lib/compat-stray-guard.sh"
 
+# The port ledger and the LISTEN-socket ownership checks. `random_port` hands
+# out a port only once per run, and every readiness gate proves the socket that
+# answered belongs to the process this run launched — not to a scenario's own
+# echo listener, a leftover from an earlier scenario, or an unrelated process.
+# The contract and the fail-closed rules are documented in the lib; the fixture
+# suite `scripts/tests/compat-port-ownership.sh` drives it against real
+# listeners. It needs `TEST_DIR`, `PIDS` and `AUX_LAUNCH_GEN` (all above).
+# shellcheck source=scripts/lib/compat-port-ownership.sh
+source "$SCRIPT_DIR/lib/compat-port-ownership.sh"
+
 trap cleanup EXIT
 
 random_port() {
-    # Find an unused port in range (TCP + UDP).
-    # Tries lsof first, then ss, then assumes port is free.
-    local port check_tcp check_udp
-    while true; do
-        port=$(( (RANDOM % 10000) + 17000 ))
-        check_tcp=false
-        check_udp=false
-        if command -v lsof >/dev/null 2>&1; then
-            lsof -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | grep -q LISTEN && continue
-            lsof -iUDP:"$port" 2>/dev/null | grep -q . && continue
-        elif command -v ss >/dev/null 2>&1; then
-            ss -tln sport = :"$port" 2>/dev/null | grep -q ":$port " && continue
-            ss -uln sport = :"$port" 2>/dev/null | grep -q ":$port " && continue
-        fi
-        echo "$port"
-        return
-    done
+    # Find a port nothing is using (TCP + UDP) **and that this run has not
+    # handed out before**. The old body drew `(RANDOM % 10000) + 17000` and
+    # rejected only a port that was LISTENing at pick time, so one scenario
+    # could be given the same port twice — its echo listener and its frps, say —
+    # and the readiness gates could not tell which of the two answered.
+    #
+    # The pick is bounded (one sweep of the range, then a loud failure naming
+    # it) and the ledger lives in `$TEST_DIR/allocated-ports.$$`, so the memory
+    # survives the `$(random_port)` subshell every caller uses. See
+    # `scripts/lib/compat-port-ownership.sh`. `CPO_PORT_MIN`/`CPO_PORT_MAX`
+    # override 17000/26999 — a fixture seam, not a scenario knob.
+    cpo_pick_port
 }
 
 wait_for_port() {
+    # Wait for `host:$port` to be reachable — and, on the loopback addresses
+    # every scenario waits on, for the LISTEN socket to be owned by a process
+    # this run launched (`scripts/lib/compat-port-ownership.sh`). A socket held
+    # by anything else (a foreign server, a leftover, or the scenario's own echo
+    # listener when the port was meant for the process launched after it) fails
+    # the gate instead of passing it, and a gate whose owner cannot be
+    # determined at all also fails closed. A non-loopback host keeps the old
+    # reachability-only probe, since its LISTEN owner is not observable locally.
     local host="$1" port="$2" timeout="${3:-10}"
+    case "$host" in
+        127.0.0.1|localhost|::1)
+            cpo_wait_port_ready "$port" "$timeout"
+            return $?
+            ;;
+    esac
     local deadline=$(($(date +%s) + timeout))
     while ! nc -z "$host" "$port" 2>/dev/null; do
         if [[ $(date +%s) -gt $deadline ]]; then
@@ -221,45 +290,22 @@ wait_for_port() {
 
 # Wait for a proxy port to be listening WITHOUT connecting to it.
 # nc -z triggers ProxyUserConn in Rust frps, creating phantom work connections
-# that can deadlock encrypted bridges. Use lsof instead (check LISTEN state).
+# that can deadlock encrypted bridges. `cpo_wait_port_ready` reads the LISTEN
+# socket through lsof/ss (never a connect) and requires its owner to be a
+# process this run launched; the old ladder ended with `sleep "$timeout"; return
+# 0`, i.e. a gate that passed without a listener. That vacuous pass is gone: an
+# environment where ownership cannot be checked fails the gate.
 wait_for_port_safe() {
     local host="$1" port="$2" timeout="${3:-15}" ready_min="${FRP_COMPAT_READY_MIN:-20}"
-    (( timeout < ready_min )) && timeout="$ready_min"; local deadline=$(($(date +%s) + timeout))
-    if command -v lsof >/dev/null 2>&1; then
-        while true; do
-            if lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
-                return 0
-            fi
-            if [[ $(date +%s) -gt $deadline ]]; then
-                return 1
-            fi
-            sleep 0.1
-        done
-    elif command -v ss >/dev/null 2>&1; then
-        while true; do
-            if ss -tln sport = :"$port" 2>/dev/null | grep -q ":$port "; then
-                return 0
-            fi
-            if [[ $(date +%s) -gt $deadline ]]; then
-                return 1
-            fi
-            sleep 0.1
-        done
-    elif command -v nc >/dev/null 2>&1; then
-        while true; do
-            if nc -z "$host" "$port" 2>/dev/null; then
-                return 0
-            fi
-            if [[ $(date +%s) -gt $deadline ]]; then
-                return 1
-            fi
-            sleep 0.1
-        done
-    else
-        echo "WARNING: neither lsof, ss, nor nc available; sleeping ${timeout}s" >&2
-        sleep "$timeout"
-        return 0
-    fi
+    (( timeout < ready_min )) && timeout="$ready_min"
+    case "$host" in
+        127.0.0.1|localhost|::1)
+            cpo_wait_port_ready "$port" "$timeout"
+            return $?
+            ;;
+    esac
+    echo "ERROR: wait_for_port_safe: cannot check LISTEN ownership for non-loopback host '$host' (port $port); failing closed" >&2
+    return 1
 }
 
 wait_for_port_gone() {
@@ -298,7 +344,7 @@ while True:
     except:
         break
 " &
-    track_pid $!
+    track_aux_pid echo "$port" $!
 }
 
 send_and_expect() {
@@ -372,7 +418,7 @@ while True:
     except:
         break
 ' &
-    track_pid $!
+    track_aux_pid udp "$port" $!
 }
 
 send_and_expect_udp() {
@@ -455,7 +501,7 @@ while True:
     except:
         break
 ' &
-    track_pid $!
+    track_aux_pid http "$port" $!
 }
 
 send_http_test() {
@@ -527,14 +573,15 @@ while True:
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
         conn.close()
     except Exception:
-        # Non-TLS probes (e.g. wait_for_port nc -z) fail the handshake;
+        # Non-TLS probes (health checks that open the socket, TLS
+        # handshake failures) must not kill the server;
         # keep serving rather than exiting.
         try:
             conn.close()
         except Exception:
             pass
 ' &
-    track_pid $!
+    track_aux_pid tls "$port" $!
 }
 
 send_https_test() {
@@ -692,20 +739,47 @@ fail_test() {
 }
 
 should_run_test() {
+    # $1 is the scenario's **display** name (`local name="go-to-rust-tcp-plain"`);
+    # `--list` prints `run_test` function names instead, so a name copied from
+    # `--list` matches nothing here. That is deliberate — `--test test_g2r_tcp_plain`
+    # must fail closed rather than silently run nothing — and
+    # `SELECTED_MATCHED` is what the summary block below uses to tell a matched
+    # selection from an unmatched one.
     if [[ -z "$SELECTED_TEST" ]]; then
         return 0
     fi
-    [[ "$SELECTED_TEST" == "$1" ]]
+    if [[ "$SELECTED_TEST" == "$1" ]]; then
+        SELECTED_MATCHED=true
+        return 0
+    fi
+    return 1
 }
 
 # Wrapper that enables set -x tracing in --debug mode.
-# Uses a subshell so set -x doesn't leak across tests.
+#
+# The scenario runs in *this* shell, exactly as it does without --debug. A
+# subshell here discarded everything a scenario records: `PASS`/`FAIL`/
+# `FAILURES` (so `--debug` reported ` RESULTS: 0 passed, 0 failed` and `All
+# tests passed!` for a run that had just traced a failure), `PIDS` (so servers
+# the scenario started were never reaped and tripped the stray guard), and
+# `SELECTED_MATCHED` (so the end-of-run `--test` gate told a correct caller its
+# name had matched no scenario). Tracing is scoped by turning it off again
+# rather than by a subshell. No scenario calls bare `exit`; the ones that used
+# to be contained by the subshell are the arg/cleanup/binary/cert checks and
+# the summary block, all of which run outside this wrapper.
 run_test() {
     if $DEBUG; then
-        (set -x; "$@")
-    else
+        local was_trace=false rc=0
+        if [[ $- == *x* ]]; then
+            was_trace=true
+        fi
+        set -x
         "$@"
+        rc=$?
+        $was_trace || set +x
+        return "$rc"
     fi
+    "$@"
 }
 
 # ── Unified config writers ─────────────────────────────────
@@ -7789,6 +7863,39 @@ run_test test_ssh_gateway_banner
 run_test test_ssh_gateway_auth_rejection
 run_test test_ssh_gateway_go_frps_compat
 
+fi
+
+# A `--test` value that matched no scenario used to be a silent no-op: the run
+# printed ` RESULTS: 0 passed, 0 failed` and `All tests passed!` and exited 0,
+# which is exactly what a typo — or a name copied from `--list`, which prints
+# `run_test` *function* names rather than the display names `--test` matches —
+# looks like. Fail closed and name the selector.
+if [[ -n "$SELECTED_TEST" ]] && ! $SELECTED_MATCHED; then
+    echo ""
+    # A name that is in this file but did not run was skipped by the phase
+    # switch (`RUN_XTCP`, `--xtcp-only`, `--shard`), not mistyped; telling a
+    # correct caller its name matched nothing sent it looking for a typo that
+    # was not there (F-4). The two display-name shapes this file registers are a
+    # scenario's `local name="…"` and an XTCP test's first `run_xtcp_test "…"`
+    # argument.
+    _sel_self="${BASH_SOURCE[0]:-$0}"
+    if grep -qF "local name=\"$SELECTED_TEST\"" "$_sel_self" 2>/dev/null ||
+        grep -qF "run_xtcp_test \"$SELECTED_TEST\"" "$_sel_self" 2>/dev/null; then
+        if $CI; then
+            echo "::error file=scripts/compat-test.sh,title=--test selector::--test '$SELECTED_TEST' names a scenario this run did not execute (its phase was skipped)"
+        fi
+        echo "ERROR: --test '$SELECTED_TEST' names a scenario this run did not execute; no test ran." >&2
+        echo "       The name is real — the phase that owns it was skipped in this configuration:" >&2
+        echo "       the XTCP phase runs only with RUN_XTCP=1, and --xtcp-only/--shard select a subset." >&2
+    else
+        if $CI; then
+            echo "::error file=scripts/compat-test.sh,title=--test selector::--test '$SELECTED_TEST' matched no scenario"
+        fi
+        echo "ERROR: --test '$SELECTED_TEST' matched no scenario; no test ran." >&2
+        echo "       --test takes a scenario's display name (the \`local name=...\` its function sets)." >&2
+        echo "       \`--list\` prints run_test *function* names, which are not --test values." >&2
+    fi
+    exit 2
 fi
 
 # --- Summary ---
