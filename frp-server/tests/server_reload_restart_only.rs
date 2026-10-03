@@ -453,7 +453,7 @@ async fn unset_limits_are_not_reported_as_a_restart() {
 ///
 /// This is the arm that runs in `--no-default-features` **and** in
 /// `--no-default-features --features dashboard` — the second is compiled by
-/// `ci.yml:3576`'s clippy lane but no lane test-ran it before this round — where
+/// `ci.yml:3802`'s clippy lane but no lane test-ran it before this round — where
 /// the `frp-client` dev-dependency turns `frp-core`'s `kcp`/`quic`/`websocket` on
 /// while `frp-server`'s stay off: the fields exist and are parsed, nothing reads
 /// them, and a line here is a false "restart required".
