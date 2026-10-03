@@ -392,9 +392,20 @@ impl ListenerPortReader {
 /// flag and warning are always reachable together. The other reader-gated ports
 /// cannot be applied by the overlay at all — `ssh_tunnel_gateway.bind_port` and
 /// `websocket_port` have no CLI flag, and `--kcp-bind-port`/`--quic-bind-port`
-/// exist only under `cfg(feature = "kcp")`/`cfg(feature = "quic")`, so in the
-/// shapes whose reader is compiled out they are an unknown-flag error rather
-/// than a silent ignore.
+/// exist only under **this crate's** `cfg(feature = "kcp")`/`cfg(feature =
+/// "quic")`. Every shape `frps`'s own feature names produce moves that feature
+/// in step with `frp-server`'s listener (`frps/kcp = ["frp-server/kcp"]` and
+/// `frp-server/kcp = ["frp-core/kcp"]`, one way each), so there the flag is an
+/// unknown-flag error rather than a silent ignore. A caller who names the inner
+/// feature by hand — `cargo build -p frps --no-default-features --features
+/// tiny,frp-core/kcp` — gets the parser without the listener: `--help`
+/// advertises `--kcp-bind-port`, running it binds no UDP socket and prints no
+/// record, and the `kcp_bind_port` file key is silent for the same reason (the
+/// asymmetry `restart_only.rs` describes for the *field* is this one on the
+/// *flag* side). No lane builds an `frps` binary in that combination — only
+/// `frp-server`'s own `--all-targets` test build reaches it, through the
+/// `frp-client` dev-dependency — so it is the one gap this struct does not
+/// close.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AppliedReaderGatedPorts {
     /// A **non-zero** `--dashboard-port` wrote `web_server.port`, whose only

@@ -1919,12 +1919,18 @@ jobs:
           set -eo pipefail
           log=/tmp/frp-server-no-tls-lib.log
           list=/tmp/frp-server-no-tls-lib.list
-          cargo test -p frp-server --no-default-features --features dashboard --lib --color never 2>&1 | tee "$log"
+          # A bare `cargo test … | tee` aborts the script on a test failure under
+          # `set -eo pipefail`, so the `::error::` annotation and the log tail
+          # written for exactly that case never ran. Capture the status first, as
+          # the vhost guard below does.
+          run_status=0
+          cargo test -p frp-server --no-default-features --features dashboard --lib --color never 2>&1 | tee "$log" || run_status=$?
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           cargo test -p frp-server --no-default-features --features dashboard --lib --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
           n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
           n_expected=363
           status=0
+          [ "$run_status" = "0" ] || status=1
           grep -q "test result: ok. $n_expected passed; 0 failed" "$log.plain" || status=1
           [ "$n" = "$n_expected" ] || status=1
           if [ "$status" != "0" ]; then
